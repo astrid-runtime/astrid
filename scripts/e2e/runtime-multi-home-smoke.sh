@@ -82,7 +82,10 @@ run_multi_home_smoke() {
   secondary_port="$(pick_loopback_port)"
   secondary_gateway="http://$GATEWAY_HOST:$secondary_port"
 
-  mkdir -p "$secondary_home/etc" "$secondary_artifacts"
+  mkdir -p "$secondary_artifacts"
+  multi_run_cli "$secondary_home" "$secondary_artifacts" start
+  multi_run_cli "$secondary_home" "$secondary_artifacts" stop
+  mkdir -p "$secondary_home/etc"
   cat > "$secondary_home/etc/gateway-http.toml" <<EOF
 enabled = true
 listen = "$GATEWAY_HOST:$secondary_port"
@@ -100,7 +103,8 @@ EOF
   local secondary_capsules="${ASTRID_E2E_SECONDARY_CAPSULES:-astrid-capsule-cli astrid-capsule-registry astrid-capsule-openai-compat}"
   local capsule
   for capsule in $secondary_capsules; do
-    multi_run_cli "$secondary_home" "$secondary_artifacts" capsule install "$CAPSULES_DIR/$capsule"
+    multi_run_cli "$secondary_home" "$secondary_artifacts" capsule install \
+      "$CAPSULES_DIR/$capsule" --approve-untrusted
   done
 
   printf '$ ASTRID_HOME=%s astrid capsule config astrid-capsule-openai-compat --set base_url=<fake> --set model=fake-echo\n' \
@@ -122,6 +126,9 @@ EOF
     > "$secondary_artifacts/openai-secret.out" \
     2> "$secondary_artifacts/openai-secret.err"
 
+  # Capsule installs auto-start a persistent daemon. Stop it before launching
+  # the harness-owned process so cleanup cannot leave an untracked second home.
+  multi_run_cli "$secondary_home" "$secondary_artifacts" stop
   env ASTRID_HOME="$secondary_home" HOME="$POISON_HOME" \
     "$CORE_DIR/target/debug/astrid-daemon" >> "$secondary_artifacts/daemon.log" 2>&1 &
   SECONDARY_DAEMON_PID=$!
@@ -129,6 +136,12 @@ EOF
     tail -n 200 "$secondary_artifacts/daemon.log" >&2 || true
     fail "secondary daemon did not become healthy"
   }
+  if ! kill -0 "$SECONDARY_DAEMON_PID" 2>/dev/null; then
+    wait "$SECONDARY_DAEMON_PID" 2>/dev/null || true
+    SECONDARY_DAEMON_PID=""
+    tail -n 200 "$secondary_artifacts/daemon.log" >&2 || true
+    fail "secondary daemon exited while another process answered health checks"
+  fi
 
   local status
   status="$(multi_http_status "$secondary_gateway" GET /api/auth/me "$primary_bearer" "" \

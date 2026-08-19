@@ -6,6 +6,8 @@
 //! history.
 
 use std::collections::BTreeMap;
+#[cfg(feature = "legacy-surrealkv")]
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -22,6 +24,9 @@ use crate::kv::migrate_legacy_avl;
 #[cfg(feature = "legacy-surrealkv")]
 use crate::kv::{KvPrincipalResolver, SurrealKvStore};
 use astrid_core::dirs::AstridHome;
+
+#[cfg(feature = "legacy-surrealkv")]
+const LEGACY_SNAPSHOT_DIR: &str = "legacy-state-db.snapshot";
 
 pub(super) const MIGRATION_MARKER_FILE: &str = "migration.complete";
 #[cfg(feature = "legacy-surrealkv")]
@@ -52,7 +57,7 @@ const MIGRATION_HISTORY: &[MigrationDescriptor] = &[
         id: "surrealkv-to-principal-store",
         from: "legacy",
         to: 1,
-        rollback: "legacy source preserved; post-cutover writes require export",
+        rollback: "legacy source retained until verified cutover; rollback afterward requires export",
     },
     MigrationDescriptor {
         id: "flat-content-catalog-to-radix-tree",
@@ -201,8 +206,14 @@ async fn migrate_legacy(
     principals: &PrincipalDirectory,
 ) -> StorageResult<()> {
     let legacy_path = legacy_path.to_path_buf();
+    let snapshot_path = home.migrations_dir().join(LEGACY_SNAPSHOT_DIR);
+    let snapshot_source = legacy_path.clone();
+    let snapshot_target = snapshot_path.clone();
+    run_blocking_migration(move || prepare_legacy_snapshot(&snapshot_source, &snapshot_target))
+        .await?;
+    let open_snapshot = snapshot_path.clone();
     let legacy =
-        run_blocking_migration(move || SurrealKvStore::open(legacy_path).map(Arc::new)).await?;
+        run_blocking_migration(move || SurrealKvStore::open(open_snapshot).map(Arc::new)).await?;
     let legacy_kv: Arc<dyn crate::KvStore> = legacy.clone();
     owner_migration::populate_directory(home, principals, legacy_kv).await?;
     let migration_legacy = Arc::clone(&legacy);
@@ -217,7 +228,75 @@ async fn migrate_legacy(
         StateOwnerResolver::new(principals.clone()),
     ));
     owner_migration::backfill_principal_identities(home, principals, migrated).await?;
-    legacy.close().await
+    legacy.close().await?;
+    run_blocking_migration(move || cleanup_legacy_snapshot(&snapshot_path)).await
+}
+
+#[cfg(feature = "legacy-surrealkv")]
+fn prepare_legacy_snapshot(source: &Path, destination: &Path) -> StorageResult<()> {
+    if destination.exists() {
+        super::native_io::quarantine_directory(destination, "interrupted")?;
+    }
+    astrid_core::platform_fs::ensure_private_directory(destination).map_err(|error| {
+        StorageError::Connection(format!(
+            "create private legacy migration snapshot {}: {error}",
+            destination.display()
+        ))
+    })?;
+    let source = super::native_io::PrivateDirectory::open(source)?;
+    let destination = super::native_io::PrivateDirectory::open(destination)?;
+    copy_legacy_tree(&source, &destination)
+}
+
+#[cfg(feature = "legacy-surrealkv")]
+fn copy_legacy_tree(
+    source: &super::native_io::PrivateDirectory,
+    destination: &super::native_io::PrivateDirectory,
+) -> StorageResult<()> {
+    let mut entries = source.entries()?;
+    entries.sort();
+    for name in entries {
+        let relative = Path::new(&name);
+        if source.entry_is_directory(relative)? {
+            let source_child = source.open_child(relative)?;
+            let destination_child = destination.ensure_child(relative)?;
+            copy_legacy_tree(&source_child, &destination_child)?;
+            destination_child.sync()?;
+        } else {
+            let mut input = source.open_file(relative)?;
+            let mut output = destination.create_file(relative)?;
+            io::copy(&mut input, &mut output).map_err(|error| {
+                StorageError::Connection(format!(
+                    "copy legacy migration entry {}: {error}",
+                    name.to_string_lossy()
+                ))
+            })?;
+            output.sync_all().map_err(|error| {
+                StorageError::Connection(format!(
+                    "flush legacy migration entry {}: {error}",
+                    name.to_string_lossy()
+                ))
+            })?;
+        }
+    }
+    destination.sync()
+}
+
+#[cfg(feature = "legacy-surrealkv")]
+fn cleanup_legacy_snapshot(snapshot: &Path) -> StorageResult<()> {
+    std::fs::remove_dir_all(snapshot).map_err(|error| {
+        StorageError::Connection(format!(
+            "remove consumed legacy migration snapshot {}: {error}",
+            snapshot.display()
+        ))
+    })?;
+    let parent = snapshot.parent().ok_or_else(|| {
+        StorageError::Connection(format!(
+            "legacy migration snapshot {} has no parent",
+            snapshot.display()
+        ))
+    })?;
+    super::native_io::sync_directory(parent)
 }
 
 #[cfg(feature = "legacy-surrealkv")]
@@ -368,7 +447,11 @@ mod tests {
         assert_eq!(MIGRATION_HISTORY[1].to, 2);
         assert_eq!(MIGRATION_HISTORY[2].from, "2");
         assert_eq!(MIGRATION_HISTORY[2].to, CURRENT_STORE_VERSION);
-        assert!(MIGRATION_HISTORY[0].rollback.contains("source preserved"));
+        assert!(
+            MIGRATION_HISTORY[0]
+                .rollback
+                .contains("retained until verified cutover")
+        );
         assert!(MIGRATION_HISTORY[1].rollback.contains("commit lineage"));
         assert!(MIGRATION_HISTORY[2].rollback.contains("commit lineage"));
     }
@@ -404,5 +487,24 @@ mod tests {
         .await
         .unwrap();
         release_after_entry.await.unwrap();
+    }
+
+    #[cfg(all(unix, feature = "legacy-surrealkv"))]
+    #[test]
+    fn legacy_snapshot_copy_rejects_redirected_entries() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, source.join("redirect")).unwrap();
+
+        let error = prepare_legacy_snapshot(&source, &destination).unwrap_err();
+
+        assert!(error.to_string().contains("redirected"));
+        assert_eq!(std::fs::read(outside).unwrap(), b"outside");
     }
 }

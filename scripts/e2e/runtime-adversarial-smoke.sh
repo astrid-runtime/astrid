@@ -87,18 +87,6 @@ def profile(principal: str) -> dict[str, list[str]]:
         "capsules": profile_array(path, "capsules"),
     }
 
-def env(principal: str) -> dict:
-    path = home / "home" / principal / ".config" / "env" / f"{capsule}.env.json"
-    if not path.exists():
-        raise SystemExit(f"missing env file for {principal}: {path}")
-    return json.loads(path.read_text(encoding="utf-8"))
-
-def secret(principal: str) -> str:
-    path = home / "secrets" / principal / capsule / "api_key"
-    if not path.exists():
-        raise SystemExit(f"missing secret file for {principal}: {path}")
-    return path.read_text(encoding="utf-8")
-
 source_profile = profile(source)
 inherited_profile = profile(inherited)
 cloned_profile = profile(cloned)
@@ -121,13 +109,27 @@ if cloned_profile.get("groups") != source_profile.get("groups"):
     raise SystemExit(f"clone missed source groups: source={source_profile!r} clone={cloned_profile!r}")
 
 for principal in (inherited, cloned):
-    principal_env = env(principal)
-    if principal_env.get("model") != "fake-slow":
-        raise SystemExit(f"{principal} did not inherit source env model: {principal_env!r}")
-    found_secret = secret(principal)
-    if found_secret != expected_secret:
-        raise SystemExit(f"{principal} secret did not match copied source sentinel")
+    env_path = home / "home" / principal / ".config" / "env" / f"{capsule}.env.json"
+    secret_path = home / "secrets" / principal / capsule / "api_key"
+    if env_path.exists() or secret_path.exists():
+        raise SystemExit(f"{principal} clone state escaped governed storage")
 PY
+
+  local principal output
+  for principal in "$inherited" "$cloned"; do
+    output="$ARTIFACTS/${principal}-inherited-config.json"
+    "$CORE_DIR/target/debug/astrid" capsule config "$capsule" \
+      --agent "$principal" --show --format json > "$output"
+    "$PYTHON" - "$output" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+for key in ("model", "api_key"):
+    if data.get(key) != "<redacted>":
+        raise SystemExit(f"inherited governed config is missing {key!r}: {data!r}")
+PY
+  done
 }
 
 json_assert_http_create_did_not_inherit_or_clone() {
@@ -588,6 +590,7 @@ run_adversarial_principal_smoke() {
   local ops_bearer=$3
   local ops_principal=$4
   local user_secret=$5
+  local fake_base_url=$6
 
   note "checking adversarial principal create and wildcard escalation paths"
 
@@ -801,31 +804,49 @@ run_adversarial_principal_smoke() {
   assert_status "invalid principal id hidden with bounded error" "$status" 404
 
   run_adversarial_principal_postcondition_smoke "$user_bearer" "$user_principal" \
-    "$ops_principal" "$admin_bearer"
+    "$ops_bearer" "$ops_principal" "$admin_bearer" "$fake_base_url"
 }
 
 run_adversarial_principal_postcondition_smoke() {
   local user_bearer=$1
   local user_principal=$2
-  local ops_principal=$3
-  local admin_bearer=$4
+  local ops_bearer=$3
+  local ops_principal=$4
+  local admin_bearer=$5
+  local fake_base_url=$6
   local status body
 
   note "checking spoofed principal fields cannot mutate foreign env or quota state"
+
+  status="$(http_status POST /api/capsules/astrid-capsule-openai-compat/env/base_url \
+    "$user_bearer" \
+    "{\"value\":\"$fake_base_url/empty-models\"}" \
+    "$ARTIFACTS/adversarial-env-empty-model-base-url.json")"
+  assert_status "agent empty model catalog setup" "$status" 204
 
   status="$(http_status POST "/api/capsules/astrid-capsule-openai-compat/env/model?principal=$ops_principal" \
     "$user_bearer" \
     "{\"value\":\"fake-spoof-query\",\"principal\":\"$ops_principal\"}" \
     "$ARTIFACTS/adversarial-env-query-body-spoof.json")"
   assert_status "agent env query and body principal spoof ignored" "$status" 204
-  json_assert_capsule_env_models "$ASTRID_HOME" astrid-capsule-openai-compat default \
-    "$user_principal" "$ops_principal" fake-echo fake-spoof-query fake-toolish
+  assert_user_only_model_fallback_in_storage astrid-capsule-openai-compat default \
+    "$user_principal" "$ops_principal" "$admin_bearer" "$user_bearer" "$ops_bearer" \
+    fake-spoof-query user-only
   status="$(http_status POST /api/capsules/astrid-capsule-openai-compat/env/model "$user_bearer" \
     '{"value":"fake-slow"}' \
     "$ARTIFACTS/adversarial-env-query-body-spoof-restore.json")"
   assert_status "agent env restore after query and body spoof" "$status" 204
-  json_assert_capsule_env_models "$ASTRID_HOME" astrid-capsule-openai-compat default \
-    "$user_principal" "$ops_principal" fake-echo fake-slow fake-toolish
+  assert_user_only_model_fallback_in_storage astrid-capsule-openai-compat default \
+    "$user_principal" "$ops_principal" "$admin_bearer" "$user_bearer" "$ops_bearer" \
+    fake-spoof-query absent
+  assert_user_only_model_fallback_in_storage astrid-capsule-openai-compat default \
+    "$user_principal" "$ops_principal" "$admin_bearer" "$user_bearer" "$ops_bearer" \
+    fake-slow user-present
+  status="$(http_status POST /api/capsules/astrid-capsule-openai-compat/env/base_url \
+    "$user_bearer" \
+    "{\"value\":\"$fake_base_url\"}" \
+    "$ARTIFACTS/adversarial-env-base-url-restore.json")"
+  assert_status "agent model catalog base URL restore" "$status" 204
 
   status="$(http_status GET "/api/sys/principals/$ops_principal/quotas" "$admin_bearer" "" \
     "$ARTIFACTS/adversarial-ops-quota-before-spoof.json")"

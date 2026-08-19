@@ -83,13 +83,29 @@ impl HostState {
         self.invocation_tmp.as_ref().or(self.tmp.as_ref())
     }
 
-    /// Owned copy of the effective home root path.
+    /// Return the effective authoritative workspace branch for this call.
     ///
-    /// Convenience for host fs functions that need to pass the principal
-    /// home into a security-gate check running inside an `async move` block.
+    /// Shared runtimes install `invocation_workspace` from the authenticated
+    /// caller; principal runtimes use their load-time branch.
+    #[must_use]
+    pub fn effective_workspace(&self) -> Option<&PrincipalMount> {
+        self.invocation_workspace
+            .as_ref()
+            .or(self.workspace.as_ref())
+    }
+
+    /// Return an owned native home root when the effective mount has one.
+    ///
+    /// Durable AstridFilesystem home mounts are logical and deliberately return
+    /// `None`; this helper exists only for native scratch/lifecycle and process
+    /// compatibility paths.
     #[must_use]
     pub fn effective_home_root_buf(&self) -> Option<PathBuf> {
-        self.effective_home().map(|m| m.root.clone())
+        self.effective_home()
+            .and_then(|mount| match &mount.location {
+                PrincipalMountLocation::Native(root) => Some(root.clone()),
+                PrincipalMountLocation::AstridFilesystem => None,
+            })
     }
 
     /// Return the effective secret store for the current invocation.

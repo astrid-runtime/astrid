@@ -19,8 +19,9 @@
 //! * **Linux** — `OverlayfsCow`: an unprivileged `overlayfs` mount (with
 //!   `fuse-overlayfs` as the fallback).
 //! * **everywhere / fallback** — [`NoCow`]: writes go direct to the pristine
-//!   workspace, no rollback. This is the *fail-closed* default whenever a real
-//!   backend cannot be established — never a silently faked copy-on-write.
+//!   workspace, with no rollback. This is an explicit non-isolated capability
+//!   result, never a silently faked copy-on-write. Callers that promise guarded
+//!   promote/rollback semantics must reject it.
 //!
 //! # Security: masking the upper from children
 //!
@@ -92,8 +93,9 @@ pub trait WorkspaceCow: Send + Sync {
     ///
     /// # Errors
     /// Returns an error if the mount/clone cannot be established. The caller
-    /// (see [`prepare_workspace_cow`]) treats any error as a signal to
-    /// fail closed to [`NoCow`] — it never proceeds with a half-built backend.
+    /// (see [`prepare_workspace_cow`]) treats any error as a signal to return
+    /// [`NoCow`] — it never proceeds with a half-built backend. A guarded
+    /// caller must reject that non-isolated result.
     fn prepare(&self, pristine: &Path) -> io::Result<PreparedWorkspace>;
 
     /// Commit the working changes into the pristine workspace (the gate's
@@ -168,8 +170,8 @@ impl WorkspaceCow for NoCow {
 }
 
 /// Construct the preferred copy-on-write backend for this host, storing its
-/// working trees under `cow_root` (normally
-/// [`AstridHome::cow_dir`](astrid_core::dirs::AstridHome::cow_dir)).
+/// working trees under caller-selected disposable scratch (the capsule runtime
+/// uses the boot-cleaned `run/hosted-workspace-cow` tree).
 ///
 /// The factory only *selects* a backend; the mount/clone happens in
 /// [`prepare`](WorkspaceCow::prepare). Selection order:
@@ -179,7 +181,7 @@ impl WorkspaceCow for NoCow {
 /// * any other platform → [`NoCow`], with a `warn` naming the reason.
 ///
 /// This never returns a backend that fakes copy-on-write: an unsupported
-/// platform (or, at prepare time, a failed mount) fails closed to [`NoCow`].
+/// platform returns the explicit, non-isolated [`NoCow`] capability.
 #[must_use]
 pub fn detect_cow_backend(cow_root: &Path) -> Box<dyn WorkspaceCow> {
     #[cfg(target_os = "macos")]
@@ -202,15 +204,15 @@ pub fn detect_cow_backend(cow_root: &Path) -> Box<dyn WorkspaceCow> {
 }
 
 /// Detect the preferred backend and [`prepare`](WorkspaceCow::prepare) it over
-/// `pristine`, **failing closed to [`NoCow`]** — with a loud `warn` naming the
-/// reason — if the mount/clone cannot be established.
+/// `pristine`, returning [`NoCow`] — with a loud `warn` naming the reason — if
+/// the mount/clone cannot be established.
 ///
 /// This is the single entry point the capsule load path uses: it returns the
 /// backend to keep alive for promote/rollback/teardown together with the
 /// [`PreparedWorkspace`] (merged path + child masks) to wire into the VFS,
-/// the spawn root, and the sandbox. It never surfaces an error, because a
-/// copy-on-write that cannot be established must degrade to direct writes, not
-/// abort the capsule.
+/// the spawn root, and the sandbox. It never surfaces an error itself; callers
+/// that require isolation must inspect [`WorkspaceCow::capability`] and reject
+/// [`CowCapability::None`] before exposing the returned pristine path.
 #[must_use]
 pub fn prepare_workspace_cow(
     cow_root: &Path,
@@ -219,12 +221,9 @@ pub fn prepare_workspace_cow(
     prepare_with_fallback(detect_cow_backend(cow_root), pristine)
 }
 
-/// The fail-closed [`NoCow`] result for `pristine`: writes go direct to the
-/// workspace, no rollback, no masks. Use this whenever a copy-on-write root
-/// cannot even be established (e.g. the Astrid home is unresolvable) — it keeps
-/// writes on the real workspace instead of scattering a clone into a
-/// world-writable location where a sibling child could reach another
-/// workspace's clone and smuggle changes past its promote gate.
+/// The explicit non-isolated [`NoCow`] result for `pristine`: writes go direct
+/// to the workspace, with no rollback or masks. Guarded callers must reject it;
+/// compatibility callers may deliberately accept direct host-portal writes.
 #[must_use]
 pub fn no_cow_workspace(pristine: &Path) -> (Box<dyn WorkspaceCow>, PreparedWorkspace) {
     (
@@ -236,8 +235,8 @@ pub fn no_cow_workspace(pristine: &Path) -> (Box<dyn WorkspaceCow>, PreparedWork
     )
 }
 
-/// Prepare `primary`, degrading to [`NoCow`] on any error. Split out so the
-/// fail-closed path is unit-testable with an injected backend that fails
+/// Prepare `primary`, returning [`NoCow`] on any error. Split out so the
+/// non-isolated fallback is unit-testable with an injected backend that fails
 /// (no dependency on the host platform or `$ASTRID_HOME`).
 fn prepare_with_fallback(
     primary: Box<dyn WorkspaceCow>,
@@ -250,8 +249,8 @@ fn prepare_with_fallback(
                 capability = ?primary.capability(),
                 error = %e,
                 pristine = %pristine.display(),
-                "workspace CoW: prepare failed; failing closed to No-CoW \
-                 (writes go direct to the workspace, no rollback)"
+                "workspace CoW: prepare failed; returning non-isolated No-CoW \
+                 (guarded callers must reject direct workspace writes)"
             );
             no_cow_workspace(pristine)
         },

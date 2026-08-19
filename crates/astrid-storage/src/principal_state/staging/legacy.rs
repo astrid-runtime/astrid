@@ -48,24 +48,7 @@ pub(super) fn inspect_migration_intents(root: &Path) -> StorageResult<Option<Vec
                     writing.display()
                 ))
             })?;
-            let path = entry.path();
-            if !stage_entry_is_directory(&path)? {
-                continue;
-            }
-            validate_stage_directory(&path)?;
-            let Some(id) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| Uuid::parse_str(name).ok())
-                .map(StagedContentId)
-            else {
-                continue;
-            };
-            if let Ok(intent) = load_intent(&path.join(INTENT_FILE))
-                && intent.id == id
-                && validate_private_regular_file(&path.join(CONTENT_FILE))
-                    .is_ok_and(|length| length == intent.logical_bytes)
-            {
+            if let Some(intent) = inspect_writing_intent(&entry)? {
                 intents.push(intent);
             }
         }
@@ -91,6 +74,25 @@ pub(super) fn inspect_migration_intents(root: &Path) -> StorageResult<Option<Vec
                             directory.display()
                         )));
                     }
+                    let content_path = directory.join(CONTENT_FILE);
+                    match std::fs::symlink_metadata(&content_path) {
+                        Ok(_) => {
+                            let logical_bytes = validate_private_regular_file(&content_path)?;
+                            if logical_bytes != intent.logical_bytes {
+                                return Err(connection(format!(
+                                    "legacy staged content length changed after seal in {}",
+                                    directory.display()
+                                )));
+                            }
+                        },
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                        Err(error) => {
+                            return Err(connection(format!(
+                                "inspect legacy staged content {}: {error}",
+                                content_path.display()
+                            )));
+                        },
+                    }
                     intents.push(intent);
                 },
                 Err(error)
@@ -112,6 +114,49 @@ pub(super) fn inspect_migration_intents(root: &Path) -> StorageResult<Option<Vec
         }
     }
     Ok(Some(intents))
+}
+
+fn inspect_writing_intent(entry: &std::fs::DirEntry) -> StorageResult<Option<StagingIntent>> {
+    let path = entry.path();
+    if !stage_entry_is_directory(&path)? {
+        return Ok(None);
+    }
+    validate_stage_directory(&path)?;
+    let Some(id) = entry
+        .file_name()
+        .to_str()
+        .and_then(|name| Uuid::parse_str(name).ok())
+        .map(StagedContentId)
+    else {
+        return Ok(None);
+    };
+    let intent_path = path.join(INTENT_FILE);
+    match std::fs::symlink_metadata(&intent_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(connection(format!(
+                "inspect legacy staged intent {}: {error}",
+                intent_path.display()
+            )));
+        },
+        Ok(_) => {},
+    }
+    let intent = load_intent(&intent_path)?;
+    if intent.id != id {
+        return Err(connection(format!(
+            "legacy staged intent does not match writing directory {}",
+            path.display()
+        )));
+    }
+    let content_path = path.join(CONTENT_FILE);
+    let logical_bytes = validate_private_regular_file(&content_path)?;
+    if logical_bytes != intent.logical_bytes {
+        return Err(connection(format!(
+            "legacy staged content length changed after seal in {}",
+            path.display()
+        )));
+    }
+    Ok(Some(intent))
 }
 
 pub(super) fn recover(

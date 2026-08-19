@@ -2,11 +2,12 @@
 
 use super::{
     Arc, ArenaReader, BTreeMap, CommitGroup, DurableEngine, DurableEnginePolicy, DurableError,
-    DurableInner, EngineOpenOptions, FaultInjector, FileExt, GroupCommitPolicy, LIFECYCLE_USABLE,
-    LOCK_FILE, Mutex, NoFaults, ObjectCache, ObjectCacheConfig, Path, PersistentObjectIdentity,
-    PrincipalCodec, RecoveryLimits, RecoveryRetryPolicy, RwLock, io, io_error, open_rw_capability,
-    recover_store,
+    DurableInner, EngineOpenOptions, FaultInjector, File, FileExt, GroupCommitPolicy,
+    LIFECYCLE_USABLE, LOCK_FILE, Mutex, NoFaults, ObjectCache, ObjectCacheConfig, Path,
+    PersistentObjectIdentity, PrincipalCodec, RecoveryLimits, RecoveryRetryPolicy, RwLock,
+    StoreLock, io, io_error, open_rw_capability, recover_store, recover_volume,
 };
+use crate::volume::AstridVolume;
 
 impl<P, I, C> DurableEngine<P, I, C>
 where
@@ -162,6 +163,40 @@ where
         )
     }
 
+    /// Open the durable engine over an Astrid-owned volume.
+    ///
+    /// Unlike [`Self::open`], this entry point has no host path or directory
+    /// semantics. Region creation, exact-offset I/O, durability barriers, and
+    /// exclusive media ownership are supplied by the volume implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same frame, identity, recovery, and I/O errors as
+    /// [`Self::open`].
+    pub fn open_volume(
+        volume: Arc<dyn AstridVolume>,
+        identity: I,
+        principal_codec: C,
+        limits: RecoveryLimits,
+        policy: DurableEnginePolicy<P>,
+    ) -> Result<Self, DurableError> {
+        let recovered = recover_volume(&volume, &principal_codec, &identity, limits)?;
+        Ok(Self::from_recovered(
+            None,
+            None,
+            Some(volume),
+            StoreLock::Volume,
+            identity,
+            principal_codec,
+            limits,
+            EngineOpenOptions {
+                policy,
+                faults: Arc::new(NoFaults),
+            },
+            recovered,
+        ))
+    }
+
     /// Open or create a durable store with an explicit fault injector.
     ///
     /// # Errors
@@ -199,6 +234,11 @@ where
         let directory_capability = Arc::new(super::representations::open_store_root(&path)?);
         let lock_path = path.join(LOCK_FILE);
         let lock = open_rw_capability(&directory_capability, Path::new(LOCK_FILE), true)?;
+        let File::Native(lock) = lock else {
+            return Err(DurableError::InvalidRepresentationState(
+                "host store lock did not open as a native file",
+            ));
+        };
         if let Err(source) = lock.try_lock_exclusive() {
             if source.kind() == io::ErrorKind::WouldBlock {
                 return Err(DurableError::LockHeld(lock_path));
@@ -214,9 +254,35 @@ where
             limits,
         )?;
 
-        Ok(Self {
-            directory: path,
+        Ok(Self::from_recovered(
+            Some(path),
+            Some(directory_capability),
+            None,
+            StoreLock::Native(lock),
+            identity,
+            principal_codec,
+            limits,
+            options,
+            recovered,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_recovered(
+        directory: Option<std::path::PathBuf>,
+        directory_capability: Option<Arc<cap_std::fs::Dir>>,
+        volume: Option<Arc<dyn AstridVolume>>,
+        lock: StoreLock,
+        identity: I,
+        principal_codec: C,
+        limits: RecoveryLimits,
+        options: EngineOpenOptions<P>,
+        recovered: super::RecoveredStore<P>,
+    ) -> Self {
+        Self {
+            directory,
             directory_capability,
+            volume: RwLock::new(volume),
             identity,
             principal_codec,
             limits,
@@ -243,6 +309,6 @@ where
                 poisoned: false,
                 arena_generation: 0,
             }),
-        })
+        }
     }
 }

@@ -726,6 +726,35 @@ async fn checkpoint_collapses_deltas_without_changing_the_projection() {
 }
 
 #[tokio::test]
+async fn delta_totals_do_not_poison_checkpoint_validation_across_writers() {
+    let engine = Arc::new(InMemoryEngine::new(TestIdentity));
+    let first: Store = TreeKvStore::from_engine(Arc::clone(&engine), Resolver);
+    first
+        .set("alice:capsule:test", "checkpoint", b"one".to_vec())
+        .await
+        .unwrap();
+    assert!(first.checkpoint_for_test("alice".to_owned()).unwrap());
+
+    first
+        .set("alice:capsule:test", "first-delta", b"two".to_vec())
+        .await
+        .unwrap();
+    let second: Store = TreeKvStore::from_engine(engine, Resolver);
+    second
+        .set("alice:capsule:test", "second-delta", b"three".to_vec())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        first
+            .get("alice:capsule:test", "second-delta")
+            .await
+            .unwrap(),
+        Some(b"three".to_vec())
+    );
+}
+
+#[tokio::test]
 async fn checkpoint_rebases_a_mutation_that_lands_during_the_build() {
     let store = fixture();
     for value in 0..128_u32 {

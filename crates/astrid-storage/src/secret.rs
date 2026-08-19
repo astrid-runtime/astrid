@@ -1,19 +1,26 @@
 //! Secure secret storage abstraction for capsule credentials.
 //!
-//! Provides a [`SecretStore`] trait with two implementations:
+//! Provides a [`SecretStore`] trait with KV storage always available and an
+//! explicitly selected keychain backend:
 //!
 //! - **[`KeychainSecretStore`]** (behind the `keychain` feature): Uses the OS
 //!   keychain (macOS Keychain, Linux secret-service) via the `keyring` crate.
 //! - **[`KvSecretStore`]**: Falls back to the existing [`ScopedKvStore`] with a
 //!   `__secret:` key prefix. Suitable for headless/CI environments.
 //!
-//! Production code should use [`FallbackSecretStore`], which tries the keychain
-//! first and degrades to KV storage when the keychain is unavailable.
+//! [`build_secret_store`] is deliberately KV-only, even when the `keychain`
+//! feature is compiled. A signed distribution that explicitly opts into OS
+//! keychain probing may call [`build_keychain_secret_store`].
 
 use std::fmt;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(not(target_family = "wasm"))]
+use std::sync::OnceLock;
+
+use crate::error::StorageResult;
 use crate::kv::ScopedKvStore;
 
 // ---------------------------------------------------------------------------
@@ -45,8 +52,8 @@ pub enum SecretStoreError {
 ///
 /// Implementations must be `Send + Sync` for use in WASM host function
 /// `UserData<HostState>`. All methods are synchronous because they are called
-/// from synchronous Extism host functions that bridge to async via
-/// `runtime_handle.block_on()`.
+/// from synchronous Extism host functions; KV-backed implementations bridge to
+/// async without re-entering a Tokio runtime.
 pub trait SecretStore: Send + Sync + fmt::Debug {
     /// Store a secret value for the given key.
     ///
@@ -254,6 +261,74 @@ pub struct KvSecretStore {
     runtime_handle: tokio::runtime::Handle,
 }
 
+#[cfg(not(target_family = "wasm"))]
+const SYNC_KV_BRIDGE_QUEUE_CAPACITY: usize = 64;
+
+#[cfg(not(target_family = "wasm"))]
+type SyncKvBridgeJob = Box<dyn FnOnce(&tokio::runtime::Runtime) + Send + 'static>;
+
+/// Bounded bridge for synchronous secret calls made from a Tokio runtime.
+///
+/// The [`SecretStore`] trait is intentionally synchronous because host
+/// functions call it synchronously. A current-thread Tokio runtime cannot be
+/// re-entered with `Handle::block_on`, so those calls are sent through this
+/// single worker instead of spawning one unbounded thread per operation.
+#[cfg(not(target_family = "wasm"))]
+struct SyncKvBridge {
+    sender: std::sync::mpsc::SyncSender<SyncKvBridgeJob>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl SyncKvBridge {
+    fn new() -> Result<Self, String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("create secret KV bridge runtime: {error}"))?;
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<SyncKvBridgeJob>(SYNC_KV_BRIDGE_QUEUE_CAPACITY);
+        std::thread::Builder::new()
+            .name("astrid-secret-kv".to_owned())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    job(&runtime);
+                }
+            })
+            .map_err(|error| format!("spawn secret KV bridge worker: {error}"))?;
+        Ok(Self { sender })
+    }
+
+    fn execute<T, F>(&self, future: F) -> Result<StorageResult<T>, SecretStoreError>
+    where
+        T: Send + 'static,
+        F: Future<Output = StorageResult<T>> + Send + 'static,
+    {
+        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+        self.sender
+            .send(Box::new(move |runtime| {
+                let result = runtime.block_on(future);
+                let _ = result_sender.send(result);
+            }))
+            .map_err(|error| {
+                SecretStoreError::Internal(format!("secret KV bridge closed: {error}"))
+            })?;
+        result_receiver.recv().map_err(|error| {
+            SecretStoreError::Internal(format!("secret KV bridge worker stopped: {error}"))
+        })
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+static SYNC_KV_BRIDGE: OnceLock<Result<SyncKvBridge, String>> = OnceLock::new();
+
+#[cfg(not(target_family = "wasm"))]
+fn sync_kv_bridge() -> Result<&'static SyncKvBridge, SecretStoreError> {
+    match SYNC_KV_BRIDGE.get_or_init(SyncKvBridge::new) {
+        Ok(bridge) => Ok(bridge),
+        Err(error) => Err(SecretStoreError::Internal(error.clone())),
+    }
+}
+
 impl fmt::Debug for KvSecretStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KvSecretStore")
@@ -280,25 +355,26 @@ impl SecretStore for KvSecretStore {
         validate_key(key)?;
         validate_value(value)?;
         let prefixed = Self::prefixed_key(key);
-        self.runtime_handle
-            .block_on(self.kv.set(&prefixed, value.as_bytes().to_vec()))
+        let value = value.as_bytes().to_vec();
+        let kv = self.kv.clone();
+        self.run_sync(async move { kv.set(&prefixed, value).await })
             .map_err(|e| SecretStoreError::Internal(format!("KV set failed: {e}")))
     }
 
     fn exists(&self, key: &str) -> Result<bool, SecretStoreError> {
         validate_key(key)?;
         let prefixed = Self::prefixed_key(key);
-        self.runtime_handle
-            .block_on(self.kv.exists(&prefixed))
+        let kv = self.kv.clone();
+        self.run_sync(async move { kv.exists(&prefixed).await })
             .map_err(|e| SecretStoreError::Internal(format!("KV exists failed: {e}")))
     }
 
     fn get(&self, key: &str) -> Result<Option<String>, SecretStoreError> {
         validate_key(key)?;
         let prefixed = Self::prefixed_key(key);
+        let kv = self.kv.clone();
         let bytes = self
-            .runtime_handle
-            .block_on(self.kv.get(&prefixed))
+            .run_sync(async move { kv.get(&prefixed).await })
             .map_err(|e| SecretStoreError::Internal(format!("KV get failed: {e}")))?;
         match bytes {
             Some(b) => {
@@ -313,9 +389,32 @@ impl SecretStore for KvSecretStore {
     fn delete(&self, key: &str) -> Result<bool, SecretStoreError> {
         validate_key(key)?;
         let prefixed = Self::prefixed_key(key);
-        self.runtime_handle
-            .block_on(self.kv.delete(&prefixed))
+        let kv = self.kv.clone();
+        self.run_sync(async move { kv.delete(&prefixed).await })
             .map_err(|e| SecretStoreError::Internal(format!("KV delete failed: {e}")))
+    }
+}
+
+impl KvSecretStore {
+    fn run_sync<T, F>(&self, future: F) -> StorageResult<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = StorageResult<T>> + Send + 'static,
+    {
+        #[cfg(not(target_family = "wasm"))]
+        let result = if tokio::runtime::Handle::try_current().is_ok() {
+            sync_kv_bridge()
+                .map_err(|error| crate::error::StorageError::Internal(error.to_string()))?
+                .execute(future)
+                .map_err(|error| crate::error::StorageError::Internal(error.to_string()))?
+        } else {
+            self.runtime_handle.block_on(future)
+        };
+
+        #[cfg(target_family = "wasm")]
+        let result = self.runtime_handle.block_on(future);
+
+        result
     }
 }
 
@@ -372,6 +471,13 @@ impl FileSecretStore {
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
+    }
+
+    /// Return the legacy root path for an explicit migration or diagnostic.
+    /// Runtime secret resolution must use [`KvSecretStore`] instead.
+    #[must_use]
+    pub fn root_path(&self) -> &std::path::Path {
+        &self.root
     }
 
     /// Resolve a key to its on-disk path. Rejects keys that contain
@@ -802,33 +908,38 @@ pub use fallback_impl::FallbackSecretStore;
 // Convenience constructor
 // ---------------------------------------------------------------------------
 
-/// Create the best available [`SecretStore`] for production use.
+/// Create the default [`SecretStore`] for runtime use.
 ///
-/// With the `keychain` feature enabled, returns a [`FallbackSecretStore`] that
-/// tries the OS keychain first. Without the feature, returns a [`KvSecretStore`].
+/// This constructor is always KV-backed. It never probes the OS keychain,
+/// including when the storage crate is compiled with `--all-features`.
 #[must_use]
 pub fn build_secret_store(
     capsule_id: &str,
     kv: ScopedKvStore,
     runtime_handle: tokio::runtime::Handle,
 ) -> Arc<dyn SecretStore> {
-    // capsule_id scopes the keychain service name when the keychain feature is
-    // enabled. Without the feature it is unused, but we keep the parameter for
-    // a consistent API surface.
-    #[cfg(not(feature = "keychain"))]
+    // Keep the capsule identifier in the stable constructor signature. The
+    // explicit keychain constructor below uses it for service scoping.
     let _ = capsule_id;
+    Arc::new(KvSecretStore::new(kv, runtime_handle))
+}
+
+/// Create the explicitly opted-in keychain-backed [`SecretStore`].
+///
+/// This API is available only with the `keychain` feature and probes the OS
+/// keychain during construction. Normal runtime and test code must use
+/// [`build_secret_store`] instead; signed distributions may call this function
+/// when their packaging policy explicitly enables keychain access.
+#[cfg(feature = "keychain")]
+#[must_use]
+pub fn build_keychain_secret_store(
+    capsule_id: &str,
+    kv: ScopedKvStore,
+    runtime_handle: tokio::runtime::Handle,
+) -> Arc<dyn SecretStore> {
+    let keychain = KeychainSecretStore::new(capsule_id);
     let kv_store = KvSecretStore::new(kv, runtime_handle);
-
-    #[cfg(feature = "keychain")]
-    {
-        let keychain = KeychainSecretStore::new(capsule_id);
-        Arc::new(FallbackSecretStore::new(keychain, kv_store))
-    }
-
-    #[cfg(not(feature = "keychain"))]
-    {
-        Arc::new(kv_store)
-    }
+    Arc::new(FallbackSecretStore::new(keychain, kv_store))
 }
 
 // ---------------------------------------------------------------------------

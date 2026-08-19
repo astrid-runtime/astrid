@@ -16,6 +16,24 @@ where
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
+    #[cfg(test)]
+    pub(crate) fn durable_region_len(&self, name: &str) -> Result<u64, DurableError> {
+        let inner = self.lock_usable()?;
+        let files = inner.files.as_ref().ok_or(DurableError::Closed)?;
+        let file = match name {
+            ARENA_FILE => &files.arena,
+            ROOT_FILE => &files.roots,
+            _ => {
+                return Err(DurableError::InvalidRepresentationState(
+                    "unknown durable test region",
+                ));
+            },
+        };
+        file.metadata()
+            .map(|metadata| metadata.len())
+            .map_err(|source| io_error("read durable test region metadata", source))
+    }
+
     /// Compute the logical identity of a canonical object.
     #[must_use]
     pub fn identify(&self, record: &ObjectRecord) -> ObjectId {

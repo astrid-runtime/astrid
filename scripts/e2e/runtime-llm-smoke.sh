@@ -190,6 +190,8 @@ import sys
 log_file = sys.argv[1]
 prompt_text = sys.argv[2]
 expected_model = sys.argv[3]
+# The provider-qualified ID is an Astrid catalog key. The upstream
+# OpenAI-compatible request must carry the provider-native model name.
 matches = []
 
 with open(log_file, encoding="utf-8") as handle:

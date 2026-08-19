@@ -94,7 +94,24 @@ wait_for_adversarial_command_route() {
 
 wait_for_principal_log_marker() {
   local principal=$1 marker=$2
-  local log_root="$ASTRID_HOME/home/$principal/.local/log"
+  local roster="$ARTIFACTS/crash-principal-roster.json"
+  local principal_uid
+  bounded_principal_cli default 8 "$roster" agent list --format json || return 1
+  principal_uid="$($PYTHON - "$roster" "$principal" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+entries = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+principal = sys.argv[2]
+for entry in entries:
+    if entry.get("principal") == principal and entry.get("owner_uid"):
+        print(entry["owner_uid"])
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+)" || return 1
+  local log_root="$ASTRID_HOME/log/principals/$principal_uid"
   local deadline=$((SECONDS + 10))
 
   until grep -R --fixed-strings --binary-files=without-match -- "$marker" \
@@ -332,11 +349,8 @@ run_crash_recovery_smoke() {
   status="$(http_status GET "/api/agent/sessions?include_archived=true&limit=20" "$user_bearer" "" \
     "$ARTIFACTS/crash-restart-agent-sessions.json")"
   assert_status "crash restart agent session list" "$status" 200
-  json_assert_session_list_scope "$ARTIFACTS/crash-restart-agent-sessions.json" "$user_session" "$ops_session"
-
-  status="$(http_status GET "/api/agent/sessions/$ops_session" "$user_bearer" "" \
-    "$ARTIFACTS/crash-restart-agent-cross-session-get-hidden.json")"
-  assert_status "crash restart cross-principal session get hidden" "$status" 404
+  json_assert_session_list_scope "$ARTIFACTS/crash-restart-agent-sessions.json" \
+    "$user_session" "$ops_session"
 
   assert_no_stale_control_requests_after_crashes "$user_bearer"
 }

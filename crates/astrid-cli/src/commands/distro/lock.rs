@@ -1,17 +1,22 @@
-//! Distro lockfile types and management.
+//! Distro provenance types and the authenticated control-plane adapter.
 //!
-//! The lockfile (`Distro.lock`) pins exact resolved versions and BLAKE3 hashes
-//! for reproducible installs. Lives at `home/{principal}/.config/distro.lock`.
+//! The durable record is owned by the kernel in a UID-scoped control KV
+//! namespace. The TOML helpers remain only for signed `.shuttle` payloads and
+//! migration fixtures; runtime reads/writes use the typed admin API below.
 
 use std::path::Path;
 
 use anyhow::Context;
+use astrid_core::PrincipalId;
+use astrid_core::kernel_api::{
+    AdminRequestKind, AdminResponseBody, DistroCapsuleProvenance, DistroProvenance,
+};
 use serde::{Deserialize, Serialize};
 
 use super::manifest::DistroManifest;
 
 /// A resolved distro lockfile.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) struct DistroLock {
     /// Schema version (must match the manifest).
@@ -30,7 +35,7 @@ pub(crate) struct DistroLock {
 }
 
 /// Distro identity in the lockfile.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) struct DistroLockMeta {
     /// Distro ID (must match `distro.id` in the manifest).
@@ -42,7 +47,7 @@ pub(crate) struct DistroLockMeta {
 }
 
 /// A resolved capsule entry in the lockfile.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LockedCapsule {
     /// Capsule package name.
     pub(crate) name: String,
@@ -86,6 +91,116 @@ pub(crate) fn write_lock(path: &Path, lock: &DistroLock) -> anyhow::Result<()> {
     tmp.persist(path)
         .map_err(|e| anyhow::anyhow!("failed to persist {}: {e}", path.display()))?;
     Ok(())
+}
+
+/// Convert a parsed lock payload to the bounded daemon control-plane shape.
+pub(crate) fn to_provenance(lock: &DistroLock) -> DistroProvenance {
+    DistroProvenance {
+        schema_version: lock.schema_version,
+        distro_id: lock.distro.id.clone(),
+        distro_version: lock.distro.version.clone(),
+        resolved_at: lock.distro.resolved_at.clone(),
+        capsules: lock
+            .capsules
+            .iter()
+            .map(|capsule| DistroCapsuleProvenance {
+                name: capsule.name.clone(),
+                version: capsule.version.clone(),
+                source: capsule.source.clone(),
+                hash: capsule.hash.clone(),
+                resolved_ref: capsule.resolved_ref.clone(),
+            })
+            .collect(),
+        manifest_hash: lock.manifest_hash.clone(),
+    }
+}
+
+/// Convert an authenticated daemon record back to the CLI lock shape.
+pub(crate) fn from_provenance(provenance: DistroProvenance) -> DistroLock {
+    DistroLock {
+        schema_version: provenance.schema_version,
+        distro: DistroLockMeta {
+            id: provenance.distro_id,
+            version: provenance.distro_version,
+            resolved_at: provenance.resolved_at,
+        },
+        capsules: provenance
+            .capsules
+            .into_iter()
+            .map(|capsule| LockedCapsule {
+                name: capsule.name,
+                version: capsule.version,
+                source: capsule.source,
+                hash: capsule.hash,
+                resolved_ref: capsule.resolved_ref,
+            })
+            .collect(),
+        manifest_hash: provenance.manifest_hash,
+    }
+}
+
+/// Compute the optimistic-concurrency digest used by the kernel `DistroLock`
+/// API. JSON field order is fixed by the typed struct declaration.
+pub(crate) fn provenance_digest(provenance: &DistroProvenance) -> anyhow::Result<String> {
+    let bytes = serde_json::to_vec(provenance).context("encode distro provenance")?;
+    Ok(format!("blake3:{}", blake3::hash(&bytes).to_hex()))
+}
+
+/// Read the target principal's durable distro record through the daemon.
+pub(crate) async fn load_lock_from_daemon(
+    principal: &PrincipalId,
+) -> anyhow::Result<Option<DistroLock>> {
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
+    let response = client
+        .request(AdminRequestKind::DistroLockGet {
+            principal: principal.clone(),
+        })
+        .await?;
+    match response {
+        AdminResponseBody::DistroLock(lock) => Ok((*lock).map(from_provenance)),
+        AdminResponseBody::Error(error) => Err(anyhow::anyhow!(error)),
+        other => Err(anyhow::anyhow!(
+            "unexpected distro lock response: {other:?}"
+        )),
+    }
+}
+
+/// Replace the target principal's durable distro record with an optimistic
+/// compare-and-swap. A missing current record is an intentional create.
+pub(crate) async fn write_lock_to_daemon(
+    principal: &PrincipalId,
+    lock: &DistroLock,
+) -> anyhow::Result<()> {
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
+    let current = client
+        .request(AdminRequestKind::DistroLockGet {
+            principal: principal.clone(),
+        })
+        .await?;
+    let current = match current {
+        AdminResponseBody::DistroLock(lock) => *lock,
+        AdminResponseBody::Error(error) => return Err(anyhow::anyhow!(error)),
+        other => {
+            return Err(anyhow::anyhow!(
+                "unexpected distro lock response: {other:?}"
+            ));
+        },
+    };
+    let expected_hash = current.as_ref().map(provenance_digest).transpose()?;
+    let response = client
+        .request(AdminRequestKind::DistroLockSet {
+            principal: principal.clone(),
+            lock: to_provenance(lock),
+            expected_hash,
+        })
+        .await?;
+    match response {
+        AdminResponseBody::Success(_) => Ok(()),
+        AdminResponseBody::Error(error) => Err(anyhow::anyhow!(error)),
+        other => Err(anyhow::anyhow!(
+            "unexpected distro lock response: {other:?}"
+        )),
+    }
 }
 
 /// Check if a lockfile is fresh (name and version match the manifest).
@@ -238,5 +353,32 @@ role = "uplink"
             manifest_hash: None,
         };
         assert!(!is_lock_fresh(&lock, &manifest));
+    }
+
+    #[test]
+    fn daemon_provenance_roundtrip_preserves_lock_identity() {
+        let lock = DistroLock {
+            schema_version: 1,
+            distro: DistroLockMeta {
+                id: "example-distro".into(),
+                version: "1.2.3".into(),
+                resolved_at: "2026-01-01T00:00:00Z".into(),
+            },
+            capsules: vec![LockedCapsule {
+                name: "cli".into(),
+                version: "2.0.0".into(),
+                source: "https://example.invalid/cli.capsule".into(),
+                hash: format!("blake3:{}", "a".repeat(64)),
+                resolved_ref: Some("v2.0.0".into()),
+            }],
+            manifest_hash: Some(format!("blake3:{}", "b".repeat(64))),
+        };
+        let provenance = to_provenance(&lock);
+        assert_eq!(from_provenance(provenance.clone()), lock);
+        assert!(
+            provenance_digest(&provenance)
+                .expect("digest")
+                .starts_with("blake3:")
+        );
     }
 }

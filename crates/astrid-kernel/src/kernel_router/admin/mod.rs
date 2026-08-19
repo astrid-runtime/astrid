@@ -24,7 +24,9 @@
 mod agent_create_helpers;
 mod agent_delete;
 mod agent_derive;
+mod audit_handlers;
 mod caps_tokens;
+mod distro_handlers;
 #[cfg(test)]
 mod enforcement_tests;
 mod group;
@@ -55,6 +57,7 @@ mod state_tests_caps_tokens;
 mod state_tests_group;
 #[cfg(test)]
 mod state_tests_usage;
+mod storage_mount_handlers;
 #[cfg(test)]
 mod tests;
 
@@ -227,11 +230,20 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         AdminRequestKind::QuotaGet { principal }
         | AdminRequestKind::QuotaSet { principal, .. }
         | AdminRequestKind::UsageGet { principal }
+        | AdminRequestKind::EnvSet { principal, .. }
+        | AdminRequestKind::EnvList { principal, .. }
+        | AdminRequestKind::EnvDelete { principal, .. }
+        | AdminRequestKind::DistroLockGet { principal }
+        | AdminRequestKind::DistroLockSet { principal, .. }
         // Device management is self-scoped when the target IS the caller —
         // a principal lists / revokes its own devices with `self:auth:pair`;
         // operating on another principal's devices needs the global form.
         | AdminRequestKind::PairDeviceList { principal }
-        | AdminRequestKind::PairDeviceRevoke { principal, .. } => {
+        | AdminRequestKind::PairDeviceRevoke { principal, .. }
+        | AdminRequestKind::StorageMountIssue {
+            view: astrid_core::storage_provider::StorageProviderViewV1::Principal(principal),
+            ..
+        } => {
             if principal == caller {
                 AuthorityScope::Self_
             } else {
@@ -252,7 +264,16 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         // `AuthorityScope::Global` below, so this widening is read-only.
         AdminRequestKind::AgentList
         | AdminRequestKind::GroupList
-        | AdminRequestKind::PairDeviceIssue { .. } => AuthorityScope::Self_,
+        // EnvList is self-scoped when the target is the caller; the target
+        // arm above handles cross-principal admin reads.
+        | AdminRequestKind::PairDeviceIssue { .. }
+        | AdminRequestKind::StorageMountStatus { .. }
+        | AdminRequestKind::StorageMountSync { .. }
+        | AdminRequestKind::StorageMountRevoke { .. }
+        | AdminRequestKind::StorageMountIssue {
+            view: astrid_core::storage_provider::StorageProviderViewV1::Fleet(_),
+            ..
+        } => AuthorityScope::Self_,
         AdminRequestKind::AgentCreate { .. }
         | AdminRequestKind::AgentDelete { .. }
         | AdminRequestKind::AgentEnable { .. }
@@ -270,7 +291,14 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         | AdminRequestKind::InviteRedeem { .. }
         | AdminRequestKind::InviteList
         | AdminRequestKind::InviteRevoke { .. }
-        | AdminRequestKind::PairDeviceRedeem { .. } => AuthorityScope::Global,
+        | AdminRequestKind::PairDeviceRedeem { .. }
+        | AdminRequestKind::AuditStats
+        | AdminRequestKind::AuditPrune { .. }
+        | AdminRequestKind::AuditHealth
+        | AdminRequestKind::StorageMountIssue {
+            view: astrid_core::storage_provider::StorageProviderViewV1::Admin,
+            ..
+        } => AuthorityScope::Global,
         // Note: PairDeviceIssue is intrinsically self-scoped — the
         // kernel binds the token to the caller's own principal
         // regardless of any wire-level hint. Folded into the Self_
@@ -316,6 +344,24 @@ pub fn required_capability_for_admin_request(
         (AdminRequestKind::AgentList, AuthorityScope::Global) => "agent:list",
         (AdminRequestKind::QuotaSet { .. }, AuthorityScope::Self_) => "self:quota:set",
         (AdminRequestKind::QuotaSet { .. }, AuthorityScope::Global) => "quota:set",
+        (
+            AdminRequestKind::EnvSet { .. } | AdminRequestKind::EnvDelete { .. },
+            AuthorityScope::Self_,
+        ) => "self:env:write",
+        (
+            AdminRequestKind::EnvSet { .. } | AdminRequestKind::EnvDelete { .. },
+            AuthorityScope::Global,
+        ) => "env:write",
+        (AdminRequestKind::EnvList { .. }, AuthorityScope::Self_) => "self:env:read",
+        (AdminRequestKind::EnvList { .. }, AuthorityScope::Global) => "env:read",
+        (
+            AdminRequestKind::DistroLockGet { .. } | AdminRequestKind::DistroLockSet { .. },
+            AuthorityScope::Self_,
+        ) => "self:capsule:install",
+        (
+            AdminRequestKind::DistroLockGet { .. } | AdminRequestKind::DistroLockSet { .. },
+            AuthorityScope::Global,
+        ) => "capsule:install",
         // Usage is a read over the same quota surface; reuse the quota:get
         // capability so no new grant is minted (a principal that can read its
         // quota can read its usage).
@@ -374,6 +420,67 @@ pub fn required_capability_for_admin_request(
             AdminRequestKind::PairDeviceList { .. } | AdminRequestKind::PairDeviceRevoke { .. },
             AuthorityScope::Global,
         ) => "auth:pair",
+        (AdminRequestKind::AuditStats, _) => "audit:stats",
+        (AdminRequestKind::AuditPrune { .. }, _) => "audit:prune",
+        (AdminRequestKind::AuditHealth, _) => "audit:health",
+        (
+            request @ (AdminRequestKind::StorageMountIssue { .. }
+            | AdminRequestKind::StorageMountStatus { .. }
+            | AdminRequestKind::StorageMountSync { .. }
+            | AdminRequestKind::StorageMountRevoke { .. }),
+            scope,
+        ) => storage_mount_required_capability(request, scope),
+    }
+}
+
+fn storage_mount_required_capability(
+    request: &AdminRequestKind,
+    scope: AuthorityScope,
+) -> &'static str {
+    use astrid_core::storage_provider::{StorageProviderAccessV1, StorageProviderViewV1};
+
+    match (request, scope) {
+        (
+            AdminRequestKind::StorageMountIssue {
+                view: StorageProviderViewV1::Admin,
+                access: StorageProviderAccessV1::ReadOnly,
+                ..
+            },
+            _,
+        ) => "storage:mount:system:read",
+        (
+            AdminRequestKind::StorageMountIssue {
+                view: StorageProviderViewV1::Admin,
+                access: StorageProviderAccessV1::ReadWrite,
+                ..
+            },
+            _,
+        ) => "storage:mount:system:write",
+        (
+            AdminRequestKind::StorageMountIssue {
+                access: StorageProviderAccessV1::ReadOnly,
+                ..
+            },
+            AuthorityScope::Self_,
+        ) => "self:storage:mount:read",
+        (
+            AdminRequestKind::StorageMountIssue {
+                access: StorageProviderAccessV1::ReadWrite,
+                ..
+            },
+            AuthorityScope::Self_,
+        ) => "self:storage:mount:write",
+        (
+            AdminRequestKind::StorageMountIssue {
+                access: StorageProviderAccessV1::ReadOnly,
+                ..
+            },
+            AuthorityScope::Global,
+        ) => "storage:mount:read",
+        (AdminRequestKind::StorageMountIssue { .. }, AuthorityScope::Global) => {
+            "storage:mount:write"
+        },
+        _ => "self:storage:mount",
     }
 }
 
@@ -391,6 +498,11 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::QuotaSet { .. } => "admin.quota.set",
         AdminRequestKind::QuotaGet { .. } => "admin.quota.get",
         AdminRequestKind::UsageGet { .. } => "admin.usage.get",
+        AdminRequestKind::EnvSet { .. } => "admin.env.set",
+        AdminRequestKind::EnvList { .. } => "admin.env.list",
+        AdminRequestKind::EnvDelete { .. } => "admin.env.delete",
+        AdminRequestKind::DistroLockGet { .. } => "admin.distro.lock.get",
+        AdminRequestKind::DistroLockSet { .. } => "admin.distro.lock.set",
         AdminRequestKind::GroupCreate { .. } => "admin.group.create",
         AdminRequestKind::GroupDelete { .. } => "admin.group.delete",
         AdminRequestKind::GroupModify { .. } => "admin.group.modify",
@@ -408,6 +520,13 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::PairDeviceRedeem { .. } => "admin.auth.pair.redeem",
         AdminRequestKind::PairDeviceList { .. } => "admin.auth.pair.list",
         AdminRequestKind::PairDeviceRevoke { .. } => "admin.auth.pair.revoke",
+        AdminRequestKind::AuditStats => "admin.audit.stats",
+        AdminRequestKind::AuditPrune { .. } => "admin.audit.prune",
+        AdminRequestKind::AuditHealth => "admin.audit.health",
+        AdminRequestKind::StorageMountIssue { .. } => "admin.storage.mount.issue",
+        AdminRequestKind::StorageMountStatus { .. } => "admin.storage.mount.status",
+        AdminRequestKind::StorageMountSync { .. } => "admin.storage.mount.sync",
+        AdminRequestKind::StorageMountRevoke { .. } => "admin.storage.mount.revoke",
     }
 }
 
@@ -481,6 +600,13 @@ fn sanitize_admin_audit_params(req: &AdminRequestKind) -> Option<serde_json::Val
                 serde_json::Value::String(crate::pair_token::hash_token(token)),
             );
         },
+        AdminRequestKind::EnvSet { .. } => {
+            params.remove("value");
+            params.insert(
+                "value".to_string(),
+                serde_json::Value::String("<redacted>".to_owned()),
+            );
+        },
         _ => {},
     }
     Some(val)
@@ -508,6 +634,11 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         | AdminRequestKind::QuotaSet { principal, .. }
         | AdminRequestKind::QuotaGet { principal }
         | AdminRequestKind::UsageGet { principal }
+        | AdminRequestKind::EnvSet { principal, .. }
+        | AdminRequestKind::EnvList { principal, .. }
+        | AdminRequestKind::EnvDelete { principal, .. }
+        | AdminRequestKind::DistroLockGet { principal }
+        | AdminRequestKind::DistroLockSet { principal, .. }
         | AdminRequestKind::CapsGrant { principal, .. }
         | AdminRequestKind::CapsRevoke { principal, .. }
         | AdminRequestKind::CapsTokenMint { principal, .. }
@@ -528,7 +659,14 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         | AdminRequestKind::InviteList
         | AdminRequestKind::InviteRevoke { .. }
         | AdminRequestKind::PairDeviceIssue { .. }
-        | AdminRequestKind::PairDeviceRedeem { .. } => None,
+        | AdminRequestKind::PairDeviceRedeem { .. }
+        | AdminRequestKind::AuditStats
+        | AdminRequestKind::AuditPrune { .. }
+        | AdminRequestKind::AuditHealth
+        | AdminRequestKind::StorageMountIssue { .. }
+        | AdminRequestKind::StorageMountStatus { .. }
+        | AdminRequestKind::StorageMountSync { .. }
+        | AdminRequestKind::StorageMountRevoke { .. } => None,
     }
 }
 

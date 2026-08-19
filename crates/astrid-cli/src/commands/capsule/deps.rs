@@ -1,8 +1,11 @@
 //! `astrid capsule tree` - visualize the capsule imports/exports dependency graph.
 
+use std::collections::HashMap;
+
+use anyhow::bail;
+use astrid_core::kernel_api::{KernelRequest, KernelResponse};
 use colored::Colorize;
 
-use super::meta::{InstalledCapsule, scan_installed_capsules_in_home_for_with_layout};
 use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
@@ -52,13 +55,22 @@ struct Unsatisfied<'a> {
     version: &'a str,
 }
 
+#[derive(Debug)]
+struct CapsuleDependencyMetadata {
+    name: String,
+    imports: HashMap<String, HashMap<String, String>>,
+    exports: HashMap<String, HashMap<String, String>>,
+}
+
 /// Build the dependency graph from installed capsule metadata.
 ///
 /// For each capsule's imports, finds ALL capsules whose exports match
 /// the namespace and interface name. Returns the per-capsule tree
 /// (exports + resolved imports) and any imports that no installed capsule
 /// satisfies.
-fn build_dep_graph(capsules: &[InstalledCapsule]) -> (Vec<CapsuleTree<'_>>, Vec<Unsatisfied<'_>>) {
+fn build_dep_graph(
+    capsules: &[CapsuleDependencyMetadata],
+) -> (Vec<CapsuleTree<'_>>, Vec<Unsatisfied<'_>>) {
     let mut all_trees = Vec::new();
     let mut unsatisfied = Vec::new();
 
@@ -66,17 +78,8 @@ fn build_dep_graph(capsules: &[InstalledCapsule]) -> (Vec<CapsuleTree<'_>>, Vec<
         let mut exports = Vec::new();
         let mut imports = Vec::new();
 
-        let Some(ref meta) = cap.meta else {
-            all_trees.push(CapsuleTree {
-                name: &cap.name,
-                exports,
-                imports,
-            });
-            continue;
-        };
-
         // Collect exports.
-        for (ns, ifaces) in &meta.exports {
+        for (ns, ifaces) in &cap.exports {
             for (iface_name, version) in ifaces {
                 exports.push(ExportEntry {
                     namespace: ns,
@@ -87,16 +90,15 @@ fn build_dep_graph(capsules: &[InstalledCapsule]) -> (Vec<CapsuleTree<'_>>, Vec<
         }
 
         // Collect imports and resolve providers.
-        for (ns, ifaces) in &meta.imports {
+        for (ns, ifaces) in &cap.imports {
             for (iface_name, version) in ifaces {
                 let mut providers = Vec::new();
 
                 for other in capsules {
-                    if other.name == cap.name && other.location == cap.location {
+                    if other.name == cap.name {
                         continue;
                     }
-                    if let Some(ref other_meta) = other.meta
-                        && let Some(other_ns) = other_meta.exports.get(ns.as_str())
+                    if let Some(other_ns) = other.exports.get(ns.as_str())
                         && let Some(exported_ver) = other_ns.get(iface_name.as_str())
                     {
                         providers.push(ProviderMatch {
@@ -139,14 +141,20 @@ fn build_dep_graph(capsules: &[InstalledCapsule]) -> (Vec<CapsuleTree<'_>>, Vec<
 // ---------------------------------------------------------------------------
 
 /// Show the capsule dependency tree (imports/exports graph).
-pub(crate) fn show_tree() -> anyhow::Result<()> {
-    let home = astrid_core::dirs::AstridHome::resolve()?;
-    let principal = crate::principal::current();
-    let capsules = scan_installed_capsules_in_home_for_with_layout(
-        &home,
-        &principal,
-        crate::workspace_layout::current(),
-    )?;
+pub(crate) async fn show_tree() -> anyhow::Result<()> {
+    let mut client = crate::socket_client::connect_kernel_for_workspace(None).await?;
+    let capsules = match client.request(KernelRequest::GetCapsuleMetadata).await? {
+        KernelResponse::CapsuleMetadata(entries) => entries
+            .into_iter()
+            .map(|entry| CapsuleDependencyMetadata {
+                name: entry.name,
+                imports: entry.imports,
+                exports: entry.exports,
+            })
+            .collect::<Vec<_>>(),
+        KernelResponse::Error(error) => bail!("daemon metadata lookup failed: {error}"),
+        other => bail!("unexpected daemon metadata response: {other:?}"),
+    };
 
     if capsules.is_empty() {
         println!("{}", Theme::info("No capsules installed."));
@@ -210,14 +218,12 @@ pub(crate) fn show_tree() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::capsule::meta::{CapsuleLocation, CapsuleMeta, InstalledCapsule};
-    use std::collections::HashMap;
 
     fn make_capsule(
         name: &str,
         exports: &[(&str, &str, &str)],
         imports: &[(&str, &str, &str)],
-    ) -> InstalledCapsule {
+    ) -> CapsuleDependencyMetadata {
         let mut export_map: HashMap<String, HashMap<String, String>> = HashMap::new();
         for (ns, iface, ver) in exports {
             export_map
@@ -232,20 +238,10 @@ mod tests {
                 .or_default()
                 .insert(iface.to_string(), ver.to_string());
         }
-        InstalledCapsule {
+        CapsuleDependencyMetadata {
             name: name.to_string(),
-            meta: Some(CapsuleMeta {
-                version: "1.0.0".to_string(),
-                installed_at: "2026-01-01T00:00:00Z".to_string(),
-                updated_at: "2026-01-01T00:00:00Z".to_string(),
-                source: None,
-                imports: import_map,
-                exports: export_map,
-                wasm_hash: None,
-                wit_files: std::collections::HashMap::new(),
-                ..Default::default()
-            }),
-            location: CapsuleLocation::User,
+            imports: import_map,
+            exports: export_map,
         }
     }
 
@@ -323,11 +319,11 @@ mod tests {
     }
 
     #[test]
-    fn test_build_dep_graph_no_meta() {
-        let capsules = vec![InstalledCapsule {
+    fn test_build_dep_graph_no_interfaces() {
+        let capsules = vec![CapsuleDependencyMetadata {
             name: "legacy".to_string(),
-            meta: None,
-            location: CapsuleLocation::User,
+            imports: HashMap::new(),
+            exports: HashMap::new(),
         }];
         let (trees, unsatisfied) = build_dep_graph(&capsules);
 

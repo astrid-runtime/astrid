@@ -847,9 +847,9 @@ impl CapsuleRegistry {
     /// Like [`cloned_values_with_principal`](Self::cloned_values_with_principal)
     /// but also carries the [`WasmHash`] each view resolves to. A capsule id can
     /// legitimately map to TWO distinct hashes at once — e.g. `default` on
-    /// `foo@1.0` and `alice` on `foo@2.0`, since installs are per-principal
-    /// (`~/.astrid/home/{principal}/.local/capsules/{id}`) and each derives its
-    /// own content hash. The health monitor keys dedup and restart by
+    /// `foo@1.0` and `alice` on `foo@2.0`, since installs are owned by each
+    /// principal's immutable UID and each derives its own content hash. The
+    /// health monitor keys dedup and restart by
     /// `(id, hash)` off this snapshot so two distinct runtimes for one id are each
     /// probed and restarted independently rather than collapsed to one.
     #[must_use]

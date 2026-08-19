@@ -31,7 +31,7 @@ class MuslReleaseManifestTests(unittest.TestCase):
         self.artifacts = pathlib.Path(self.temp.name)
         b3_lines = []
         sha_lines = []
-        for target in (*release_manifest.TARGETS, *release_manifest.MUSL_TARGETS):
+        for target in (*release_manifest.TARGETS, *release_manifest.EXTENSION_TARGETS):
             name = release_manifest.expected_asset(VERSION, target)
             path = self.artifacts / name
             path.write_bytes(f"archive:{target}".encode())
@@ -134,7 +134,7 @@ class MuslReleaseManifestTests(unittest.TestCase):
     def test_rejects_partial_combined_checksums(self) -> None:
         lines = (self.artifacts / "BLAKE3SUMS.txt").read_text().splitlines()
         (self.artifacts / "BLAKE3SUMS.txt").write_text("\n".join(lines[:-1]) + "\n")
-        with self.assertRaisesRegex(ValueError, "four legacy|all six"):
+        with self.assertRaisesRegex(ValueError, "four fixed|all seven"):
             self.manifest()
 
     def test_validate_command_requires_and_checks_the_legacy_manifest(self) -> None:

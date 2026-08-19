@@ -165,10 +165,26 @@ pub(in crate::engine::durable::representations) fn open_component(
     }
 }
 
+/// Synchronize directory metadata where the host exposes a usable flush operation.
+///
+/// Windows rejects `sync_all` on the directory handles available through `cap-std`
+/// with `ERROR_ACCESS_DENIED`. File contents are synchronized before publication,
+/// and Windows atomic replacement uses write-through rename semantics, so there is
+/// no additional portable directory flush to perform there.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 pub(in crate::engine::durable::representations) fn sync_directory(
     directory: &Dir,
 ) -> io::Result<()> {
-    directory.open(Path::new("."))?.into_std().sync_all()
+    #[cfg(unix)]
+    {
+        directory.open(Path::new("."))?.into_std().sync_all()
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = directory;
+        Ok(())
+    }
 }
 
 pub(in crate::engine::durable::representations) fn reject_redirect(
@@ -284,4 +300,18 @@ pub(super) fn opened_file_identity(_file: &File) -> io::Result<FileIdentity> {
         io::ErrorKind::Unsupported,
         "stable private file identity is unavailable",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_sync_portability_contract_accepts_a_directory_capability() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory =
+            Dir::open_ambient_dir(temporary.path(), cap_std::ambient_authority()).unwrap();
+
+        sync_directory(&directory).unwrap();
+    }
 }

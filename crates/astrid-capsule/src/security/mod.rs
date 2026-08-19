@@ -81,11 +81,10 @@ pub trait CapsuleSecurityGate: Send + Sync {
 
     /// Check whether the capsule is allowed to read a file.
     ///
-    /// `principal_home` overrides the construction-time `home_root` for
-    /// per-invocation scoping. When `Some`, any `home://` pattern in the
-    /// manifest allow-list resolves against that path instead. When `None`,
-    /// the construction-time `home_root` (if any) is used — this is the
-    /// single-tenant / boot-time path.
+    /// Logical `home://` paths are authorized by their canonical namespace
+    /// spelling and the manifest suffix; they do not resolve a host path.
+    /// `principal_home` is retained for legacy native/lifecycle callers and
+    /// applies only when a caller supplies a physical home spelling.
     async fn check_file_read(
         &self,
         capsule_id: &str,
@@ -96,7 +95,7 @@ pub trait CapsuleSecurityGate: Send + Sync {
     /// Check whether the capsule is allowed to write a file.
     ///
     /// See [`check_file_read`](CapsuleSecurityGate::check_file_read) for
-    /// the `principal_home` semantics.
+    /// the logical `home://` and legacy `principal_home` semantics.
     async fn check_file_write(
         &self,
         capsule_id: &str,

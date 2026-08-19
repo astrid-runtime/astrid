@@ -1,11 +1,11 @@
 //! Windows named-pipe backend for the host-local transport seam.
 //!
-//! The filesystem-shaped argument accepted by the portable API is deliberately
-//! ignored here. Windows endpoint authority comes from the current process
-//! token SID, not a working directory, profile path, display name, or
-//! environment variable. The pipe namespace is protected twice: the first
-//! instance must own the name, and every instance carries an exact protected
-//! DACL for the current user plus Local System.
+//! The filesystem-shaped argument accepted by the portable API is reduced to a
+//! path digest and combined with the current process token SID. Authority never
+//! comes from a working directory, profile path, display name, or environment
+//! variable. The pipe namespace is protected twice: the first instance must own
+//! the name, and every instance carries an exact protected DACL for the current
+//! user plus Local System.
 
 use std::ffi::{OsStr, OsString, c_void};
 use std::io;
@@ -49,10 +49,13 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use self::acl::{ValidatedAce, ValidatedAcl, validate_descriptor_control};
+use self::helpers::{last_error, wide_nul};
 use super::ConnectOutcome;
 
 #[path = "windows/acl.rs"]
 mod acl;
+#[path = "windows/helpers.rs"]
+mod helpers;
 
 const PIPE_PREFIX: &str = r"\\.\pipe\astrid-local-";
 const CONNECT_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -372,6 +375,10 @@ pub(super) fn peer_is_current_user(stream: &LocalStream) -> io::Result<bool> {
     Ok(matches)
 }
 
+pub(super) fn current_user_sddl() -> io::Result<String> {
+    current_user_sid()?.to_sddl()
+}
+
 fn peer_process_id(stream: &LocalStream) -> io::Result<u32> {
     let mut process_id = 0_u32;
     let ok = unsafe {
@@ -562,12 +569,23 @@ fn create_server_with_security(
 }
 
 fn pipe_name(path: &Path) -> io::Result<OsString> {
-    let _ = path;
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "named-pipe endpoint path must not contain a parent component",
+        ));
+    }
+    let absolute = std::path::absolute(path)?;
     let sid = current_user_sid()?;
+    let endpoint = blake3::hash(absolute.as_os_str().as_encoded_bytes());
     let digest = blake3::hash(sid.as_bytes());
     Ok(OsString::from(format!(
-        "{PIPE_PREFIX}{}",
-        &digest.to_hex()[..32]
+        "{PIPE_PREFIX}{}{}",
+        &digest.to_hex()[..24],
+        &endpoint.to_hex()[..40]
     )))
 }
 
@@ -969,16 +987,6 @@ fn is_canonical_pipe_full_control(mask: u32) -> bool {
     // mask when attaching a descriptor to a named pipe. Accept the exact SDDL
     // source form and its exact mapped form, but no weaker or augmented mask.
     mask == GENERIC_ALL || mask == FILE_ALL_ACCESS
-}
-
-fn wide_nul(value: &OsStr) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-    value.encode_wide().chain(std::iter::once(0)).collect()
-}
-
-fn last_error(context: &str) -> io::Error {
-    let source = io::Error::last_os_error();
-    io::Error::new(source.kind(), format!("{context}: {source}"))
 }
 
 #[cfg(test)]

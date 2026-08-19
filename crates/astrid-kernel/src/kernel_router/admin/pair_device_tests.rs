@@ -16,9 +16,11 @@
 //! crate's `tests/router.rs`; the socket/kernel half is here plus the existing
 //! `enforcement_tests` device-scope cases.
 
+use std::fs;
 use std::sync::Arc;
 
 use astrid_core::dirs::AstridHome;
+use astrid_core::identity::PrincipalUid;
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::{
     AuthMethod, DeviceKey, DeviceScope, PrincipalProfile, device_key_id_fingerprint,
@@ -28,7 +30,7 @@ use tempfile::TempDir;
 
 use super::handlers;
 use crate::Kernel;
-use crate::pair_token::PairTokenStore;
+use crate::pair_token::DurablePairTokenStore;
 
 async fn fixture() -> (TempDir, Arc<Kernel>) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -66,6 +68,11 @@ fn seed_policy(
     let path = PrincipalProfile::path_for(&kernel.astrid_home, principal);
     profile.save_to_path(&path).expect("seed profile");
     kernel.profile_cache.invalidate(principal);
+    let uid = PrincipalUid::from_bytes(*blake3::hash(principal.as_str().as_bytes()).as_bytes());
+    kernel
+        .principal_directory
+        .register(principal.clone(), uid)
+        .expect("register seeded principal identity");
 }
 
 /// Read a principal's profile back from disk (post-mutation assertions).
@@ -414,9 +421,20 @@ async fn malformed_explicit_patterns_are_rejected_before_persistence() {
         }
     }
 
-    let store = PairTokenStore::new(PairTokenStore::path_for(&kernel.astrid_home));
+    let store = DurablePairTokenStore::new(
+        kernel
+            .principal_store
+            .as_ref()
+            .expect("principal store")
+            .kv(),
+    )
+    .expect("pair-token storage");
     assert!(
-        store.load().expect("load pair-token store").is_empty(),
+        store
+            .list()
+            .await
+            .expect("load pair-token store")
+            .is_empty(),
         "invalid allow or deny patterns must never be persisted"
     );
 }
@@ -498,6 +516,79 @@ async fn valid_explicit_allow_and_deny_survive_issue_and_redeem() {
             .device_by_key_id(&redeemed_key_id)
             .is_none(),
         "revoked redeemed device must no longer authorize"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_pair_provisioning_does_not_burn_the_token() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("retryable-pair");
+    seed(&kernel, &caller, &["self:*"], vec![]);
+
+    let issued =
+        handlers::dispatch_with_device(&kernel, &caller, None, issue(PairScopeArg::Full)).await;
+    let token = match issued {
+        AdminResponseBody::PairToken(value) => value.token,
+        other => panic!("pair-token issue must succeed: {other:?}"),
+    };
+
+    // Leave the valid profile in place for issuance, then corrupt it before
+    // redeem. This exercises fallible preparation after the token has been
+    // claimed, but before the claim is committed or released.
+    let profile_path = PrincipalProfile::path_for(&kernel.astrid_home, &caller);
+    let original = fs::read(&profile_path).expect("read seeded profile");
+    fs::write(&profile_path, b"not valid profile toml").expect("inject profile failure");
+    let public_key = "d".repeat(64);
+    let failed = handlers::dispatch(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::PairDeviceRedeem {
+            token: token.clone(),
+            public_key: public_key.clone(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(failed, AdminResponseBody::Error(_)),
+        "profile load failure must fail the first redeem: {failed:?}"
+    );
+
+    let store = DurablePairTokenStore::new(
+        kernel
+            .principal_store
+            .as_ref()
+            .expect("principal store")
+            .kv(),
+    )
+    .expect("pair-token storage");
+    assert_eq!(
+        store
+            .list()
+            .await
+            .expect("read pair token after failure")
+            .len(),
+        1,
+        "a provisioning failure must leave the pair token available for retry"
+    );
+
+    fs::write(&profile_path, original).expect("restore profile after injected failure");
+    let retried = handlers::dispatch(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::PairDeviceRedeem { token, public_key },
+    )
+    .await;
+    assert!(
+        matches!(retried, AdminResponseBody::PairTokenRedeemed(_)),
+        "the same pair token must remain retryable after provisioning failure: {retried:?}"
+    );
+    assert!(
+        store
+            .list()
+            .await
+            .expect("read consumed pair token")
+            .is_empty(),
+        "successful retry consumes the pair token exactly once"
     );
 }
 

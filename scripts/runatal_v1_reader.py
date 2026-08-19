@@ -8,18 +8,14 @@ import sys
 from pathlib import Path
 
 from runatal_v1_blake3 import derive_key
-from runatal_v1_fastcdc import (
-    ASTRID_V1,
-    cut,
-    is_canonical_boundary,
-    validate_profile,
-    verify_golden_vectors,
-)
-from runatal_v1_frames import frames
+from runatal_v1_fastcdc import ASTRID_V1, cut, is_canonical_boundary
+from runatal_v1_fastcdc import validate_profile, verify_golden_vectors
+from runatal_v1_frames import frames, frames_bytes
 from runatal_v1_kv import validate_principal_kv
 from runatal_v1_physical import decode_store as decode_physical_store, identity_bytes
 from runatal_v1_sha384 import verify_cross_hash_attestations
 from runatal_v1_sketch import verify_bottom_k_sketches
+from runatal_v1_volume import VolumeFormatError, recover_volume
 
 OBJECT_CONTEXT = "astrid principal store object identity v1"
 ARENA_MAGIC = b"ASTOBJ1\0"
@@ -44,12 +40,13 @@ KIND_NAMES = (
     "DerivationEvidence",
     "GcPlanEvidence",
     "GcCommitEvidence",
+    "WorkspaceBranch",
 )
 REFERENCE_NAMES = ("Owns", "Evidence", "Lineage", "Derived")
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("9d701dc87360e634b25b7b7f5d5e79315f9f27bcf4d50e09c2181e439b0c7d75"),
+    bytes.fromhex("58726b3c243c30ebc0941f656427520094a6bb10e7b2190be732b5a61300144d"),
 )
 CONTENT_CATALOG_SPECIFICATION = (
     1,
@@ -59,6 +56,7 @@ CONTENT_CATALOG_SPECIFICATION = (
 LEGACY_FORMAT_SPECIFICATIONS = {
     (1, 1, bytes.fromhex(digest))
     for digest in (
+        "f9b17fa5e6b4ac4562c7e4ab2da1f0c756da07945d808794ad75544a132b0d91",
         "62cded9a5b01fe75d7781b66303f5ffe8ced55a43025a0389eefaea5a0c58fe2",
         "35b446fbd19ca4ad0b1343b40c1a32b2eed8eef795034261a4092a0a2ae806fe",
         "d8f2cb250736799fd8b26f307e20c4d949d6cea1836614a5547210e82bbfcec1",
@@ -71,13 +69,12 @@ LEGACY_FORMAT_SPECIFICATIONS = {
         "c3fd6c43a5b6a05ffe11c339502ce35090f6643ee3070177e5802fc155d2b8c0",
         "82e46f53ba9bb2f52d6b942088d5965eaa17c2720e61ce842ed9d5e3c0d1219d",
         "900d1eface3294bc9e47369c0fcb64dca56ff334dfbc1288f349090e10c09e6f",
+        "9d701dc87360e634b25b7b7f5d5e79315f9f27bcf4d50e09c2181e439b0c7d75",
     )
 }
 CHUNK_TREE_FANOUT = 128
 CONTENT_LABEL = b"content"
 U64_MAX = (1 << 64) - 1
-
-
 class FormatError(Exception):
     pass
 
@@ -755,7 +752,9 @@ def principal_text(principal):
         return "system"
     if len(principal) == 33 and principal[:1] == b"\1":
         return principal[1:].hex()
-    raise FormatError("invalid principal-uid encoding")
+    if len(principal) == 33 and principal[:1] == b"\2":
+        return f"fleet:{principal[1:].hex()}"
+    raise FormatError("invalid state-owner-v2 encoding")
 
 
 def parse_metadata(path):
@@ -770,7 +769,7 @@ def parse_metadata(path):
         "identity": "blake3-object-identity-v1",
         "identity-wire": "tagged-identity-v1",
         "representations": "authoritative-direct-v1",
-        "principal-codec": "principal-uid-v1",
+        "principal-codec": "state-owner-v2",
         "projection": "kv-transition-bplus-v4",
     }
     for key, value in required.items():
@@ -837,17 +836,37 @@ def validate_closure(objects, root):
 def recover(store, include_payloads):
     verify_golden_vectors()
     verify_content_summary_vectors()
-    specification, catalog_specification = parse_metadata(store / "store.meta")
+    volume = store.is_file()
+    if volume:
+        try:
+            regions = recover_volume(store)
+        except VolumeFormatError as error:
+            raise FormatError(str(error)) from error
+        try:
+            arena_bytes = regions["objects.arena"]
+            root_bytes = regions["roots.journal"]
+        except KeyError as error:
+            raise FormatError(f"Astrid volume omits {error.args[0]}") from error
+        specification = FORMAT_SPECIFICATION
+        catalog_specification = CONTENT_CATALOG_SPECIFICATION
+    else:
+        specification, catalog_specification = parse_metadata(store / "store.meta")
     bootstrap_objects = {
         identity_bytes(identifier)
         for identifier in LEGACY_FORMAT_SPECIFICATIONS | {specification}
     }
     if catalog_specification is not None:
         bootstrap_objects.add(identity_bytes(catalog_specification))
-    decode_physical_store(store, bootstrap_objects)
+    if not volume:
+        decode_physical_store(store, bootstrap_objects)
     objects = {}
     offsets = {}
-    for offset, payload in frames(store / "objects.arena", ARENA_MAGIC):
+    arena_frames = (
+        frames_bytes(arena_bytes, ARENA_MAGIC, "Astrid volume objects.arena")
+        if volume
+        else frames(store / "objects.arena", ARENA_MAGIC)
+    )
+    for offset, payload in arena_frames:
         object_id, record = decode_object(payload)
         key = identity_text(object_id)
         if key in objects and objects[key] != record:
@@ -882,7 +901,12 @@ def recover(store, include_payloads):
     verify_bottom_k_sketches(objects, validate_file)
 
     roots = {}
-    for offset, payload in frames(store / "roots.journal", ROOT_MAGIC):
+    root_frames = (
+        frames_bytes(root_bytes, ROOT_MAGIC, "Astrid volume roots.journal")
+        if volume
+        else frames(store / "roots.journal", ROOT_MAGIC)
+    )
+    for offset, payload in root_frames:
         record = decode_root(payload)
         if record[0] == "snapshot":
             if offset != 0 or roots:

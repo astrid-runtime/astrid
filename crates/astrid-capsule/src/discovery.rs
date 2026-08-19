@@ -97,9 +97,9 @@ fn validate_cli_verb_name(name: &str) -> Result<(), String> {
 /// **Deduplication:** When the same `package.name` appears in multiple
 /// sources, the first occurrence wins (highest priority). Lower-priority
 /// duplicates are logged as warnings and skipped. The kernel passes paths
-/// in order: system (`~/.astrid/capsules/`), principal
-/// (`~/.astrid/home/{id}/.local/capsules/`), then workspace is scanned
-/// last.
+/// in order: verified materializations from the UID-owned durable registry,
+/// then explicit workspace project portals. Native principal-home capsule
+/// trees are migration input only and are never live discovery authority.
 ///
 /// Returns `(manifest, capsule_dir)` pairs where `capsule_dir` is the
 /// directory containing the manifest.

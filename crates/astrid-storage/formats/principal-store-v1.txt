@@ -51,7 +51,7 @@ The format-1 metadata entries are:
   format-spec-object=1:1:32:<64 lowercase hexadecimal digits>
   content-catalog-spec-object=1:1:32:<64 lowercase hexadecimal digits>
   representations=authoritative-direct-v1
-  principal-codec=principal-uid-v1
+  principal-codec=state-owner-v2
   projection=kv-transition-bplus-v4
 
 The four colon-separated format-spec-object fields are identity algorithm,
@@ -213,6 +213,7 @@ Stable object_kind codes:
   14  DerivationEvidence
   15  GcPlanEvidence
   16  GcCommitEvidence
+ 17  WorkspaceBranch
 
 Only Owns references enter a principal's default reconstruction closure.
 Evidence, Lineage, and Derived targets survive only when independently rooted,
@@ -266,8 +267,8 @@ record.
 
 A transition record is exactly:
 
-  u64            principal_length
-  u8[]           principal[principal_length]
+  u64            owner_length
+  u8[]           owner[owner_length]
   u8             expected_tag
   RootState?      expected, present only when expected_tag = 1
   RootState       replacement
@@ -288,27 +289,48 @@ A root-snapshot record is exactly:
   u64            root_count
 
   repeated root_count times:
-      u64        principal_length
-      u8[]       principal[principal_length]
+      u64        owner_length
+      u8[]       owner[owner_length]
       RootState  current
 
-Snapshot principals MUST be in strictly increasing unsigned bytewise
+Snapshot owners MUST be in strictly increasing unsigned bytewise
 lexicographic order. Duplicates, unknown snapshot_record values, and trailing
 bytes are invalid. A snapshot MUST be the first physical journal frame. Later
 transition frames replay against the snapshot exactly as they replay against
 prior transitions. The sentinel cannot collide with a valid transition:
-principal bytes of that declared length cannot fit inside the containing
+owner bytes of that declared length cannot fit inside the containing
 physical frame.
 
-The principal-uid-v1 principal codec is:
+The state-owner-v2 principal codec is:
 
   00                           system owner
   01 <32-byte principal UID>   principal owner
+  02 <32-byte fleet UID>       fleet owner
 
 The system encoding is exactly one byte. A principal encoding is exactly 33
 bytes: tag 01 followed by the 32-byte, domain-separated BLAKE3 digest of its
 canonical genesis identity record. A display name, alias, current public key,
 or UUID text is never stored in the root journal.
+
+A fleet encoding is exactly 33 bytes: tag 02 followed by the 32-byte,
+domain-separated BLAKE3 digest of its canonical fleet identity record. Fleet
+ownership is distinct from principal and system ownership; readers MUST NOT
+reinterpret one owner domain as another.
+
+The fleet genesis identity record hashed by BLAKE3 derive-key context "astrid
+fleet uid v1" is exactly 64 bytes:
+
+  u16     genesis_format_version = 1
+  u16     reserved = 0
+  u8[16]  identity UUID bytes
+  i64     creation Unix seconds
+  u32     creation nanoseconds
+  u8[32]  creating user UID
+
+Integers are little-endian. creation_nanoseconds MUST be below 1000000000.
+The identity UUID and creation time are the values in the authoritative
+FleetIdentity record. The creating user UID binds fleet ownership to a human
+tenant without making that user the fleet's durable storage owner.
 
 The principal genesis identity record hashed by BLAKE3 derive-key context
 "astrid principal uid v1" is exactly 68 bytes:
@@ -1383,12 +1405,12 @@ is the following exact bytes:
   u64    logical_bytes
   u8[32] checksum
 
-The owner bytes use principal-uid-v1: System is one zero byte; a principal is
-one byte value 1 followed by its 32-byte PrincipalUid. The name is non-empty
-UTF-8 containing no NUL and remains an opaque content name. The chunk profile
-must satisfy the section 7.2 grammar. The checksum is BLAKE3 derive-key under
-the exact context "astrid native content staging intent v2" over every
-preceding intent byte.
+The owner bytes use state-owner-v2: System is one zero byte; a principal is one
+byte value 1 followed by its 32-byte PrincipalUid; a fleet is one byte value 2
+followed by its 32-byte FleetUid. The name is non-empty UTF-8 containing no NUL
+and remains an opaque content name. The chunk profile must satisfy the section
+7.2 grammar. The checksum is BLAKE3 derive-key under the exact context "astrid
+native content staging intent v2" over every preceding intent byte.
 
 content.bin is flushed before the checksummed intent is atomically published.
 The ready-directory transition does not change the intent bytes. A version-1

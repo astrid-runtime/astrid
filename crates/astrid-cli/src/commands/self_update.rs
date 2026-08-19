@@ -37,7 +37,31 @@ const MAX_RELEASE_ASSETS: usize = 1_024;
 const MAX_BUNDLE_BYTES: usize = 256 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 
-const MANAGED_BINARIES: &[&str] = &["astrid", "astrid-daemon"];
+/// Return every executable managed by an authenticated target's update set.
+fn managed_binaries_for_target(target: &str) -> Vec<&'static str> {
+    let mut names = vec!["astrid", "astrid-daemon", "astrid-build", "astrid-emit"];
+    if target == "x86_64-pc-windows-msvc" {
+        return vec![
+            "astrid.exe",
+            "astrid-daemon.exe",
+            "astrid-build.exe",
+            "astrid-emit.exe",
+            "astrid-storage-provider-winfsp.exe",
+            "winfsp-x64.dll",
+            "winfsp-2.1.25156.msi",
+            "install-windows.ps1",
+            "uninstall-windows.ps1",
+        ];
+    }
+    if target.contains("-unknown-linux-") {
+        names.push("astrid-storage-provider-fuse");
+    } else if target.contains("-apple-darwin") {
+        names.push("astrid-storage-provider-fskit");
+        names.push("manage-macos-fskit.sh");
+        names.push("validate-macos-fskit.sh");
+    }
+    names
+}
 
 /// GitHub API base URL. `ASTRID_UPDATE_API` overrides it so the flow can be
 /// rehearsed against a local/staging mock server.
@@ -99,6 +123,8 @@ fn platform_target_for(os: &str, arch: &str, target_env: &str) -> anyhow::Result
         ("linux", "x86_64" | "aarch64", env) => {
             bail!("Unsupported Linux target environment: {env}")
         },
+        ("windows", "x86_64", _) => Ok("x86_64-pc-windows-msvc"),
+        ("windows", arch, _) => bail!("Unsupported Windows architecture: {arch}"),
         _ => bail!("Unsupported platform: {os}/{arch}"),
     }
 }
@@ -366,11 +392,133 @@ fn backup_and_swap(install_dir: &Path, extract_dir: &Path, names: &[&str]) -> an
     astrid_core::platform_fs::replace_executable_set(install_dir, extract_dir, names)
         .context("failed to replace authenticated Astrid executables")
 }
-
+fn prepare_macos_update_assets(extract_dir: &Path, target: &str) -> anyhow::Result<()> {
+    if !target.contains("-apple-darwin") {
+        return Ok(());
+    }
+    let app = extract_dir.join("AstridFS.app");
+    let app_metadata = std::fs::symlink_metadata(&app)
+        .with_context(|| format!("authenticated macOS release is missing {}", app.display()))?;
+    anyhow::ensure!(
+        app_metadata.is_dir() && !app_metadata.file_type().is_symlink(),
+        "authenticated AstridFS.app is redirected or not a directory"
+    );
+    for name in ["manage-macos-fskit.sh", "validate-macos-fskit.sh"] {
+        let source = extract_dir.join("macos").join(name);
+        let metadata = std::fs::symlink_metadata(&source).with_context(|| {
+            format!(
+                "authenticated macOS release is missing {}",
+                source.display()
+            )
+        })?;
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "authenticated macOS lifecycle tool is redirected or not regular: {name}"
+        );
+        std::fs::copy(&source, extract_dir.join(name))?;
+    }
+    Ok(())
+}
+fn restore_managed_set(
+    install_dir: &Path,
+    names: &[&str],
+    previously_present: &[bool],
+) -> anyhow::Result<()> {
+    let rollback = tempfile::tempdir_in(install_dir)?;
+    let mut staged = Vec::new();
+    for (name, present) in names.iter().zip(previously_present) {
+        if *present {
+            let temporary = rollback.path().join(name);
+            std::fs::copy(install_dir.join(format!("{name}.bak")), &temporary)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))?;
+            }
+            staged.push((temporary, install_dir.join(name)));
+        }
+    }
+    for (temporary, live) in &staged {
+        if let Err(error) = std::fs::rename(temporary, live) {
+            return Err(error.into());
+        }
+    }
+    for (name, present) in names.iter().zip(previously_present) {
+        if !present {
+            match std::fs::remove_file(install_dir.join(name)) {
+                Ok(()) => {},
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
+}
+fn install_authenticated_macos_assets(
+    extract_dir: &Path,
+    install_dir: &Path,
+) -> anyhow::Result<()> {
+    let manager = extract_dir.join("macos/manage-macos-fskit.sh");
+    let status = std::process::Command::new("/bin/bash")
+        .arg(&manager)
+        .arg("update")
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("ASTRID_FSKIT_BIN_DIR", install_dir)
+        .status()
+        .with_context(|| {
+            format!(
+                "run authenticated FSKit lifecycle tool {}",
+                manager.display()
+            )
+        })?;
+    anyhow::ensure!(
+        status.success(),
+        "authenticated FSKit lifecycle update failed with {status}"
+    );
+    Ok(())
+}
+fn apply_authenticated_update<F>(
+    install_dir: &Path,
+    extract_dir: &Path,
+    target: &str,
+    install_native_assets: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&Path, &Path) -> anyhow::Result<()>,
+{
+    prepare_macos_update_assets(extract_dir, target)?;
+    let managed = managed_binaries_for_target(target);
+    let previously_present = managed
+        .iter()
+        .map(
+            |name| match std::fs::symlink_metadata(install_dir.join(name)) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    Ok(true)
+                },
+                Ok(_) => bail!("managed install entry is redirected or not regular: {name}"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error.into()),
+            },
+        )
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    backup_and_swap(install_dir, extract_dir, &managed)?;
+    if target.contains("-apple-darwin")
+        && let Err(native_error) = install_native_assets(extract_dir, install_dir)
+    {
+        return match restore_managed_set(install_dir, &managed, &previously_present) {
+            Ok(()) => Err(native_error.context(
+                "macOS app update failed; the prior managed Astrid set was restored",
+            )),
+            Err(rollback_error) => Err(native_error.context(format!(
+                "macOS app update failed and managed-set rollback also failed ({rollback_error}); restore the retained *.bak files manually"
+            ))),
+        };
+    }
+    Ok(())
+}
 /// Best-effort writability check for a directory: create and drop a uniquely
 /// named temp file in it. A fixed probe name could collide with (and clobber) a
-/// real file or another concurrent updater; `tempfile` picks a random suffix and
-/// removes the file on drop.
+/// real file; `tempfile` picks a random suffix and removes it on drop.
 fn is_writable_dir(dir: &Path) -> bool {
     tempfile::Builder::new()
         .prefix(".astrid-write-probe")
@@ -398,18 +546,11 @@ fn confirm(prompt: &str, assume_yes: bool) -> anyhow::Result<bool> {
 }
 
 /// Run the self-update command — flag → stage → finish:
-/// resolve the signed channel, (for self-managed installs) verify + atomically
-/// swap the binary in place with rollback, restart the daemon, then update
-/// capsules. Distro refresh requires explicit recorded source provenance and is
-/// deliberately skipped by this path. Homebrew installs are deferred to `brew upgrade`.
-#[cfg(windows)]
-pub(crate) async fn run_self_update(_args: UpdateArgs) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "Astrid self-update is not enabled on Windows; native packaging and code-signing support are not complete"
-    )
-}
-
-#[cfg(not(windows))]
+/// resolve the signed channel, (for self-managed installs) verify and replace
+/// the managed set with rollback, install native platform assets with explicit
+/// compensation, restart the daemon, then update capsules. Distro refresh
+/// requires explicit recorded source provenance and is deliberately skipped by
+/// this path. Homebrew installs are deferred to `brew upgrade`.
 pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
     let target = platform_target()?;
     let (owner, repo) = resolve_repo(args.source.as_deref())?;
@@ -503,7 +644,12 @@ pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
     .await
     .map_err(anyhow::Error::new)?;
 
-    backup_and_swap(&install_dir, &extract_dir, MANAGED_BINARIES)?;
+    apply_authenticated_update(
+        &install_dir,
+        &extract_dir,
+        target,
+        install_authenticated_macos_assets,
+    )?;
     println!(
         "{}",
         Theme::success(&format!(
@@ -617,17 +763,12 @@ async fn sync_distro_and_capsules() -> anyhow::Result<()> {
     println!();
     println!("{}", Theme::info("Checking distro and capsule updates..."));
 
-    let home = astrid_core::dirs::AstridHome::resolve()?;
-    let principal = astrid_core::PrincipalId::default();
-    let lock_path = home
-        .principal_home(&principal)
-        .config_dir()
-        .join("distro.lock");
+    let principal = crate::principal::current();
 
     // A lock records the installed distro identity, not its canonical source.
     // Do not turn that identity into an organization-qualified network fetch:
     // the runtime has no product source default and must not invent provenance.
-    let lock = super::distro::lock::load_lock(&lock_path)?;
+    let lock = super::distro::lock::load_lock_from_daemon(&principal).await?;
     match distro_refresh_action(lock.is_some()) {
         DistroRefreshAction::SkipNoProvenance => {
             println!(

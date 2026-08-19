@@ -1,11 +1,13 @@
 /// Admin management API dispatcher (issue #672, Layer 6).
 pub mod admin;
 mod caller;
+mod connection_tracker;
 mod device_scope;
 /// `KernelRequest::InstallCapsule` handler — delegates to the
 /// `astrid-capsule-install` library so the daemon and the CLI reach
 /// disk through the same code path.
 mod install;
+mod inventory;
 mod projection_names;
 mod rate_limit;
 /// Kernel-response publishing envelope + the long-request keepalive pinger.
@@ -15,7 +17,6 @@ mod visibility;
 pub(crate) use rate_limit::{ManagementRateLimiter, rate_limit_for_request};
 pub(crate) use response::{KeepalivePinger, publish_response, workspace_commit_response};
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -29,9 +30,13 @@ use astrid_events::kernel_api::{KernelRequest, KernelResponse};
 use tracing::{debug, info, warn};
 
 #[cfg(test)]
-use caller::CallerResolutionError;
-use caller::{MANAGEMENT_CALLER_REQUIRED, resolve_caller, resolve_connection_principal};
+use caller::{CallerResolutionError, resolve_connection_principal};
+use caller::{MANAGEMENT_CALLER_REQUIRED, resolve_caller};
+use connection_tracker::register_connection_tracker;
+#[cfg(test)]
+use connection_tracker::{ConnectionSignal, connection_signal};
 use device_scope::resolve_device_scope;
+use inventory::{durable_package_details, visible_inventory_manifests};
 use visibility::CapsuleVisibility;
 
 #[cfg(test)]
@@ -52,7 +57,8 @@ mod test_util;
 /// accepted / closed; the tracker adjusts `active_connections` accordingly.
 /// Because the SDK exposes no typed-payload publish (only JSON), the tracker
 /// keys off the **topic** as well as the typed `IpcPayload::Connect` /
-/// `Disconnect` that native producers emit — see [`connection_signal`].
+/// `Disconnect` that native producers emit — see
+/// [`connection_tracker::connection_signal`].
 #[must_use]
 pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> astrid_runtime::JoinHandle<()> {
     // Lease accounting is synchronous so bounded broadcast lag cannot hide a
@@ -140,97 +146,6 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> astrid_runtime:
     })
 }
 
-/// Whether a `client.v1.*` message opens or closes a connection.
-#[derive(Debug, PartialEq, Eq)]
-enum ConnectionSignal {
-    Opened,
-    /// Carries the disconnect reason when present — the typed
-    /// `IpcPayload::Disconnect { reason }`, or a `"reason"` string in a JSON
-    /// payload — so the tracker can preserve it in the diagnostic log.
-    Closed {
-        reason: Option<String>,
-    },
-}
-
-/// Classifies a `client.v1.*` message as a connection open/close.
-///
-/// Recognises **both** the typed [`IpcPayload::Connect`]/[`IpcPayload::Disconnect`]
-/// that native producers emit, **and** the `client.v1.connect` /
-/// `client.v1.disconnect` topics carrying any payload. Uplink capsules can only
-/// reach the bus through the JSON-only SDK publish surface (no typed-payload
-/// publish exists), so the topic is the only signal they can produce — without
-/// the topic arm, the per-principal connection counter is never populated and
-/// the idle monitor / `astrid who` see zero connections regardless of reality.
-///
-/// Typed payloads take precedence over the topic, so a mismatched topic can
-/// never suppress a real connection event.
-fn connection_signal(topic: &str, payload: &IpcPayload) -> Option<ConnectionSignal> {
-    match payload {
-        IpcPayload::Disconnect { reason } => Some(ConnectionSignal::Closed {
-            reason: reason.clone(),
-        }),
-        IpcPayload::Connect => Some(ConnectionSignal::Opened),
-        // Uplink capsules can only publish JSON; the topic is the signal, and
-        // the reason (if any) rides along under the `"reason"` key.
-        IpcPayload::RawJson(val) if topic == "client.v1.disconnect" => {
-            let reason = val.get("reason").and_then(|r| r.as_str().map(String::from));
-            Some(ConnectionSignal::Closed { reason })
-        },
-        _ if topic == "client.v1.disconnect" => Some(ConnectionSignal::Closed { reason: None }),
-        _ if topic == "client.v1.connect" => Some(ConnectionSignal::Opened),
-        _ => None,
-    }
-}
-
-/// Register non-lossy client connection lifecycle accounting.
-///
-/// Connection leases control ephemeral process lifetime, so they cannot ride
-/// the bounded broadcast receiver used for ordinary event consumers. This
-/// synchronous observer performs only atomic bookkeeping and captures a weak
-/// kernel reference to avoid an `EventBus` → `Kernel` → `EventBus` cycle.
-fn register_connection_tracker(kernel: &Arc<crate::Kernel>) {
-    let weak_kernel = Arc::downgrade(kernel);
-    kernel
-        .event_bus
-        .observe_permanently("connection_tracker", move |event| {
-            let astrid_events::AstridEvent::Ipc { message, .. } = event else {
-                return;
-            };
-            let Some(signal) = connection_signal(&message.topic, &message.payload) else {
-                return;
-            };
-            // Lifecycle messages without a principal belong to the explicit
-            // no-authority identity. A malformed principal is not a lifecycle
-            // identity at all, so ignore it rather than crediting the bootstrap
-            // `default` principal with a connection it never authenticated.
-            let principal = match resolve_connection_principal(message) {
-                Ok(principal) => principal,
-                Err(error) => {
-                    warn!(
-                        security_event = true,
-                        topic = %message.topic,
-                        reason = error.reason(),
-                        "Ignored connection lifecycle event with malformed principal"
-                    );
-                    return;
-                },
-            };
-            let Some(kernel) = weak_kernel.upgrade() else {
-                return;
-            };
-            match signal {
-                ConnectionSignal::Closed { reason } => {
-                    kernel.connection_closed(&principal);
-                    debug!(%principal, topic = %message.topic, ?reason, "Client disconnected");
-                },
-                ConnectionSignal::Opened => {
-                    kernel.connection_opened(&principal);
-                    debug!(%principal, topic = %message.topic, "New client connection accepted");
-                },
-            }
-        });
-}
-
 /// Map a kernel request topic (`astrid.v1.request.<suffix>`) to its correlated
 /// response topic (`astrid.v1.response.<suffix>`), so a reply lands on the
 /// channel the client is waiting on. A topic that is not a kernel request topic
@@ -258,6 +173,7 @@ async fn handle_request(
     // below is reached without `authorize_request` returning Ok.
     let method = kernel_request_method(&req);
     let scope = resolve_scope(&req, &caller);
+    let requested_target = request_target_principal(&req, &caller);
     let required_cap = required_capability(&req, scope);
     let authorization =
         match authorize_request(kernel, &caller, device_key_id.as_deref(), required_cap) {
@@ -277,7 +193,7 @@ async fn handle_request(
                         method,
                         required_cap,
                         device_key_id: device_key_id.as_deref(),
-                        target_principal: None,
+                        target_principal: requested_target.clone(),
                         params: None,
                         authorization: AuthorizationProof::Denied {
                             reason: e.to_string(),
@@ -318,7 +234,7 @@ async fn handle_request(
                 method,
                 required_cap,
                 device_key_id: device_key_id.as_deref(),
-                target_principal: None,
+                target_principal: requested_target.clone(),
                 params: None,
                 authorization: authorization_proof,
                 outcome: AuditOutcome::failure(reason.clone()),
@@ -341,7 +257,7 @@ async fn handle_request(
             method,
             required_cap,
             device_key_id: device_key_id.as_deref(),
-            target_principal: None,
+            target_principal: requested_target,
             params: None,
             authorization: authorization_proof,
             outcome: AuditOutcome::success(),
@@ -366,9 +282,33 @@ async fn handle_request(
     );
 
     let res = match req {
-        KernelRequest::InstallCapsule { source, workspace } => {
-            info!(source = %source, workspace, "Kernel received install request");
-            install::handle_install_capsule(kernel, &caller, &source, workspace).await
+        KernelRequest::InstallCapsule {
+            source,
+            workspace,
+            target_principal,
+            provenance,
+            authority,
+            env,
+        } => {
+            info!(
+                source = %source,
+                workspace,
+                target = ?target_principal,
+                "Kernel received install request"
+            );
+            install::handle_install_capsule(
+                kernel,
+                install::InstallCapsuleRequest {
+                    caller: &caller,
+                    requested_target: target_principal.as_ref(),
+                    source: &source,
+                    workspace,
+                    provenance: provenance.as_ref(),
+                    authority,
+                    env: &env,
+                },
+            )
+            .await
         },
         KernelRequest::ApproveCapability {
             request_id,
@@ -460,6 +400,22 @@ async fn handle_request(
                 Err(e) => KernelResponse::Error(format!("invalid capsule id '{id}': {e}")),
             }
         },
+        KernelRequest::RemoveCapsule { id, force: _ } => {
+            match astrid_capsule::capsule::CapsuleId::new(id.clone()) {
+                Ok(cap_id) => match kernel.remove_one_capsule(&cap_id, &caller).await {
+                    Ok(true) => KernelResponse::Success(
+                        serde_json::json!({"status": "removed", "capsule": id}),
+                    ),
+                    Ok(false) => KernelResponse::Error(format!(
+                        "capsule '{id}' is not installed for principal '{caller}'"
+                    )),
+                    Err(error) => {
+                        KernelResponse::Error(format!("remove of capsule '{id}' failed: {error}"))
+                    },
+                },
+                Err(error) => KernelResponse::Error(format!("invalid capsule id '{id}': {error}")),
+            }
+        },
         KernelRequest::PromoteWorkspace { id } => {
             workspace_commit_response(kernel, &caller, &id, true).await
         },
@@ -515,18 +471,78 @@ async fn handle_request(
         },
         KernelRequest::GetCapsuleMetadata => {
             let visibility = CapsuleVisibility::new(&authorization);
+            let manifests = visible_inventory_manifests(kernel, &visibility).await;
+            let registry = kernel.capsules.read().await;
+            let owner_uid = kernel.principal_directory.uid_for(&caller).ok();
             let mut entries = Vec::new();
-            for manifest in visible_inventory_manifests(kernel, &visibility).await {
+            for manifest in manifests {
+                let source_id =
+                    astrid_capsule::capsule::CapsuleId::new(manifest.package.name.clone())
+                        .ok()
+                        .and_then(|id| registry.source_id_for(&caller, &id));
+                let env = manifest
+                    .env
+                    .iter()
+                    .map(|(name, def)| {
+                        (
+                            name.clone(),
+                            astrid_events::kernel_api::CapsuleEnvMetadata {
+                                env_type: def.env_type.clone(),
+                                request: def.request.clone(),
+                                description: def.description.clone(),
+                                default: def.default.clone(),
+                                enum_values: def.enum_values.clone(),
+                                placeholder: def.placeholder.clone(),
+                            },
+                        )
+                    })
+                    .collect();
+                let (wit_hashes, wasm_hash, update_source) =
+                    durable_package_details(kernel, owner_uid, &manifest.package.name);
                 entries.push(astrid_events::kernel_api::CapsuleMetadataEntry {
                     name: manifest.package.name.clone(),
                     capabilities: serde_json::to_value(&manifest.capabilities)
                         .unwrap_or(serde_json::Value::Null),
+                    version: manifest.package.version.clone(),
+                    description: manifest.package.description.clone(),
                     interceptor_events: manifest
                         .subscribes
                         .iter()
                         .filter(|(_, def)| def.handler.is_some())
                         .map(|(topic, _)| topic.clone())
                         .collect(),
+                    imports: manifest
+                        .imports
+                        .iter()
+                        .map(|(namespace, interfaces)| {
+                            (
+                                namespace.clone(),
+                                interfaces
+                                    .iter()
+                                    .map(|(name, def)| (name.clone(), def.version.to_string()))
+                                    .collect(),
+                            )
+                        })
+                        .collect(),
+                    exports: manifest
+                        .exports
+                        .iter()
+                        .map(|(namespace, interfaces)| {
+                            (
+                                namespace.clone(),
+                                interfaces
+                                    .iter()
+                                    .map(|(name, def)| (name.clone(), def.version.to_string()))
+                                    .collect(),
+                            )
+                        })
+                        .collect(),
+                    env,
+                    wit_hashes,
+                    wasm_hash,
+                    update_source,
+                    source_id,
+                    owner_uid,
                 });
             }
             KernelResponse::CapsuleMetadata(entries)
@@ -549,59 +565,6 @@ async fn handle_request(
         device_key_id.as_deref(),
         res,
     );
-}
-
-async fn inventory_manifest_map(
-    kernel: &crate::Kernel,
-    visibility: &CapsuleVisibility,
-) -> BTreeMap<String, astrid_capsule::manifest::CapsuleManifest> {
-    let paths = crate::capsule_discovery_paths_for(
-        &kernel.astrid_home,
-        &kernel.workspace_root,
-        &visibility.principal,
-        &kernel.workspace_layout,
-    );
-    let workspace_layout = kernel.workspace_layout.clone();
-    let workspace_root = kernel.workspace_root.clone();
-    let discovered = match tokio::task::spawn_blocking(move || {
-        astrid_capsule::discovery::discover_manifests_in_workspace(
-            Some(&paths),
-            Some(&workspace_root),
-            &workspace_layout,
-        )
-    })
-    .await
-    {
-        Ok(discovered) => discovered,
-        Err(err) => {
-            warn!(error = %err, "Capsule inventory discovery task failed");
-            Vec::new()
-        },
-    };
-
-    discovered
-        .into_iter()
-        .filter_map(|(manifest, _)| {
-            let id = astrid_capsule::capsule::CapsuleId::new(manifest.package.name.clone()).ok()?;
-            visibility.allows(&id).then_some((id.to_string(), manifest))
-        })
-        .collect()
-}
-
-async fn visible_inventory_manifests(
-    kernel: &crate::Kernel,
-    visibility: &CapsuleVisibility,
-) -> Vec<astrid_capsule::manifest::CapsuleManifest> {
-    let mut manifests = inventory_manifest_map(kernel, visibility).await;
-    let registry = kernel.capsules.read().await;
-    for capsule in visibility.capsules(&registry) {
-        if visibility.allows(capsule.id()) {
-            manifests
-                .entry(capsule.id().to_string())
-                .or_insert_with(|| capsule.manifest().clone());
-        }
-    }
-    manifests.into_values().collect()
 }
 
 fn schedule_reload_capsules(kernel: Arc<crate::Kernel>) -> bool {
@@ -669,19 +632,31 @@ pub enum AuthorityScope {
 
 /// Return the authority scope the caller is exercising for `req`.
 ///
-/// A daemon-side capsule install with `workspace = false` mutates the daemon's
-/// configured install target, so it requires the global install capability even
-/// though it does not grant any principal visibility by itself. Workspace
-/// installs remain self-scoped; the daemon rejects them later because it has no
-/// meaningful current workspace.
+/// A daemon-side capsule install defaults to the authenticated caller's
+/// principal. Selecting another principal is a global operation and therefore
+/// requires the global install capability. Workspace installs remain
+/// self-scoped; the daemon rejects them later because it has no meaningful
+/// current workspace.
 #[must_use]
-pub fn resolve_scope(req: &KernelRequest, _caller: &PrincipalId) -> AuthorityScope {
+pub fn resolve_scope(req: &KernelRequest, caller: &PrincipalId) -> AuthorityScope {
     match req {
-        KernelRequest::ReloadCapsules
-        | KernelRequest::InstallCapsule {
-            workspace: false, ..
-        } => AuthorityScope::Global,
+        KernelRequest::ReloadCapsules => AuthorityScope::Global,
+        KernelRequest::InstallCapsule {
+            target_principal: Some(target),
+            ..
+        } if target != caller => AuthorityScope::Global,
         _ => AuthorityScope::Self_,
+    }
+}
+
+/// Return an explicit cross-principal target for audit records.
+fn request_target_principal(req: &KernelRequest, caller: &PrincipalId) -> Option<PrincipalId> {
+    match req {
+        KernelRequest::InstallCapsule {
+            target_principal: Some(target),
+            ..
+        } if target != caller => Some(target.clone()),
+        _ => None,
     }
 }
 
@@ -703,8 +678,13 @@ pub fn required_capability(req: &KernelRequest, scope: AuthorityScope) -> &'stat
         (KernelRequest::ReloadCapsules | KernelRequest::ReloadCapsule { .. }, _) => {
             "capsule:reload"
         },
-        (KernelRequest::UnloadCapsule { .. }, AuthorityScope::Self_) => "self:capsule:remove",
-        (KernelRequest::UnloadCapsule { .. }, _) => "capsule:remove",
+        (
+            KernelRequest::UnloadCapsule { .. } | KernelRequest::RemoveCapsule { .. },
+            AuthorityScope::Self_,
+        ) => "self:capsule:remove",
+        (KernelRequest::UnloadCapsule { .. } | KernelRequest::RemoveCapsule { .. }, _) => {
+            "capsule:remove"
+        },
         // Promote/rollback are self-scoped (no target-principal field), so
         // `resolve_scope` always yields `Self_`; the `_` arm is for exhaustiveness.
         (KernelRequest::PromoteWorkspace { .. }, _) => "self:workspace:promote",
@@ -737,6 +717,7 @@ pub fn kernel_request_method(req: &KernelRequest) -> &'static str {
         KernelRequest::ReloadCapsules => "ReloadCapsules",
         KernelRequest::ReloadCapsule { .. } => "ReloadCapsule",
         KernelRequest::UnloadCapsule { .. } => "UnloadCapsule",
+        KernelRequest::RemoveCapsule { .. } => "RemoveCapsule",
         KernelRequest::PromoteWorkspace { .. } => "PromoteWorkspace",
         KernelRequest::RollbackWorkspace { .. } => "RollbackWorkspace",
         KernelRequest::InstallCapsule { .. } => "InstallCapsule",
@@ -962,6 +943,5 @@ async fn record_admin_audit(kernel: &crate::Kernel, entry: AdminAuditEntry<'_>) 
         message: msg,
     });
 }
-
 #[cfg(test)]
 mod tests;

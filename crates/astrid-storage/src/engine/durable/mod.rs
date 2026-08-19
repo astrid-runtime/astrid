@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::File;
+use std::fs::File as NativeFile;
 #[cfg(test)]
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 use std::time::Duration;
+
+use crate::volume::{AstridVolume, VolumeFile, VolumeMetadata, VolumeRegion};
 
 use crate::content_dag::ContentError;
 use crate::storage_model::{
@@ -435,7 +437,7 @@ struct DurableInner<P: Ord> {
     validated: BTreeSet<ObjectId>,
     files: Option<DurableFiles>,
     representations: Option<representations::RepresentationStore>,
-    lock: Option<File>,
+    lock: Option<StoreLock>,
     poisoned: bool,
     arena_generation: u64,
 }
@@ -476,8 +478,9 @@ struct EngineOpenOptions<P> {
 /// identity, while `C` owns the canonical persistent representation of `P`.
 /// Neither principal authority nor quota policy is inferred by this engine.
 pub struct DurableEngine<P: Ord, I, C> {
-    directory: PathBuf,
-    directory_capability: Arc<cap_std::fs::Dir>,
+    directory: Option<PathBuf>,
+    directory_capability: Option<Arc<cap_std::fs::Dir>>,
+    volume: RwLock<Option<Arc<dyn AstridVolume>>>,
     identity: I,
     principal_codec: C,
     limits: RecoveryLimits,
@@ -518,8 +521,198 @@ impl<P: Ord, I, C> Drop for DurableEngine<P, I, C> {
         {
             let _ = cache.sync_data();
         }
-        if let Some(lock) = inner.lock.take() {
+        if let Some(lock) = inner.lock.take()
+            && let StoreLock::Native(lock) = lock
+        {
             let _ = fs2::FileExt::unlock(&lock);
+        }
+    }
+}
+
+#[derive(Debug)]
+enum StoreLock {
+    Native(NativeFile),
+    Volume,
+}
+
+/// Byte-stream handle used by the durable engine.
+///
+/// Native files remain available for legacy import and format tests. Runtime
+/// layout two opens the same engine over [`VolumeFile`], so object and root
+/// authority no longer depends on a host directory namespace.
+#[derive(Debug)]
+enum File {
+    Native(NativeFile),
+    Volume(VolumeFile),
+}
+
+/// Common random-access durable byte stream used by both legacy host files and
+/// Astrid volume regions.
+///
+/// Keeping framing generic over this interface is important: the frozen store
+/// format is independent of whichever media provider owns the bytes.
+trait DurableIo: Read + Write + Seek {
+    fn durable_metadata(&self) -> io::Result<StoreMetadata>;
+    fn durable_set_len(&self, length: u64) -> io::Result<()>;
+    fn durable_sync_data(&self) -> io::Result<()>;
+    fn durable_read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize>;
+}
+
+impl File {
+    fn native(file: NativeFile) -> Self {
+        Self::Native(file)
+    }
+
+    fn volume(
+        volume: Arc<dyn AstridVolume>,
+        name: &str,
+        create: bool,
+    ) -> Result<Self, DurableError> {
+        let region =
+            VolumeRegion::new(name).map_err(|source| io_error("validate volume region", source))?;
+        VolumeFile::open(volume, region, create)
+            .map(Self::Volume)
+            .map_err(|source| io_error("open volume region", source))
+    }
+
+    fn try_clone(&self) -> io::Result<Self> {
+        match self {
+            Self::Native(file) => file.try_clone().map(Self::Native),
+            Self::Volume(file) => file.try_clone().map(Self::Volume),
+        }
+    }
+
+    fn sync_data(&self) -> io::Result<()> {
+        match self {
+            Self::Native(file) => file.sync_data(),
+            Self::Volume(file) => file.sync_data(),
+        }
+    }
+
+    fn set_len(&self, length: u64) -> io::Result<()> {
+        match self {
+            Self::Native(file) => file.set_len(length),
+            Self::Volume(file) => file.set_len(length),
+        }
+    }
+
+    fn metadata(&self) -> io::Result<StoreMetadata> {
+        match self {
+            Self::Native(file) => file.metadata().map(StoreMetadata::Native),
+            Self::Volume(file) => file.metadata().map(StoreMetadata::Volume),
+        }
+    }
+
+    fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+        match self {
+            #[cfg(unix)]
+            Self::Native(file) => std::os::unix::fs::FileExt::read_at(file, buffer, offset),
+            #[cfg(windows)]
+            Self::Native(file) => std::os::windows::fs::FileExt::seek_read(file, buffer, offset),
+            #[cfg(not(any(unix, windows)))]
+            Self::Native(file) => {
+                let mut reader = file.try_clone()?;
+                reader.seek(SeekFrom::Start(offset))?;
+                reader.read(buffer)
+            },
+            Self::Volume(file) => file.read_at(buffer, offset),
+        }
+    }
+}
+
+impl std::io::Read for File {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Native(file) => file.read(buffer),
+            Self::Volume(file) => file.read(buffer),
+        }
+    }
+}
+
+impl std::io::Write for File {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Native(file) => file.write(bytes),
+            Self::Volume(file) => file.write(bytes),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Native(file) => file.flush(),
+            Self::Volume(file) => file.flush(),
+        }
+    }
+}
+
+impl std::io::Seek for File {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        match self {
+            Self::Native(file) => file.seek(position),
+            Self::Volume(file) => file.seek(position),
+        }
+    }
+}
+
+impl DurableIo for File {
+    fn durable_metadata(&self) -> io::Result<StoreMetadata> {
+        self.metadata()
+    }
+
+    fn durable_set_len(&self, length: u64) -> io::Result<()> {
+        self.set_len(length)
+    }
+
+    fn durable_sync_data(&self) -> io::Result<()> {
+        self.sync_data()
+    }
+
+    fn durable_read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.read_at(buffer, offset)
+    }
+}
+
+impl DurableIo for NativeFile {
+    fn durable_metadata(&self) -> io::Result<StoreMetadata> {
+        self.metadata().map(StoreMetadata::Native)
+    }
+
+    fn durable_set_len(&self, length: u64) -> io::Result<()> {
+        self.set_len(length)
+    }
+
+    fn durable_sync_data(&self) -> io::Result<()> {
+        self.sync_data()
+    }
+
+    fn durable_read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::FileExt::read_at(self, buffer, offset)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::FileExt::seek_read(self, buffer, offset)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let mut reader = self.try_clone()?;
+            reader.seek(SeekFrom::Start(offset))?;
+            reader.read(buffer)
+        }
+    }
+}
+
+enum StoreMetadata {
+    Native(std::fs::Metadata),
+    Volume(VolumeMetadata),
+}
+
+impl StoreMetadata {
+    fn len(&self) -> u64 {
+        match self {
+            Self::Native(metadata) => metadata.len(),
+            Self::Volume(metadata) => metadata.len(),
         }
     }
 }
@@ -555,10 +748,61 @@ fn live_files_mut(files: &mut Option<DurableFiles>) -> Result<&mut DurableFiles,
     files.as_mut().ok_or(DurableError::Closed)
 }
 
+impl<P: Ord, I, C> DurableEngine<P, I, C> {
+    /// Return backend-reported free capacity and the active arena length.
+    ///
+    /// The result is media-native: volume-backed engines ask the
+    /// [`AstridVolume`] implementation, while legacy hosted-directory engines
+    /// inspect their private arena directory. A `None` result means the media
+    /// provider cannot report capacity and destructive compaction must fail
+    /// closed rather than infer it from an unrelated host path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a durable I/O or invalid-media error when capacity cannot be
+    /// read from the selected backend.
+    pub fn compaction_capacity(&self) -> Result<Option<(u64, u64)>, DurableError> {
+        if let Some(volume) = self.volume.read().as_ref().cloned() {
+            let region = VolumeRegion::new(ARENA_FILE)
+                .map_err(|source| io_error("validate compaction arena region", source))?;
+            let arena_bytes = volume
+                .region_len(&region)
+                .map_err(|source| io_error("read compaction arena length", source))?;
+            return volume
+                .available_space()
+                .map(|available| available.map(|available| (available, arena_bytes)))
+                .map_err(|source| io_error("read volume compaction capacity", source));
+        }
+        let directory = self.hosted_path()?;
+        let arena = directory.join(ARENA_FILE);
+        let arena_bytes = std::fs::metadata(&arena)
+            .map_err(|source| io_error("read hosted compaction arena length", source))?
+            .len();
+        fs2::available_space(directory)
+            .map(|available| Some((available, arena_bytes)))
+            .map_err(|source| io_error("read hosted compaction capacity", source))
+    }
+
+    fn hosted_directory(&self) -> Result<&cap_std::fs::Dir, DurableError> {
+        self.directory_capability
+            .as_deref()
+            .ok_or(DurableError::InvalidRepresentationState(
+                "operation requires a hosted directory media provider",
+            ))
+    }
+
+    fn hosted_path(&self) -> Result<&Path, DurableError> {
+        self.directory
+            .as_deref()
+            .ok_or(DurableError::InvalidRepresentationState(
+                "operation requires a hosted directory media provider",
+            ))
+    }
+}
+
 mod staging;
 
-#[path = "../durable_cache.rs"]
-mod cache;
+use crate::engine::durable_cache as cache;
 mod compaction;
 mod faults;
 mod format;
@@ -582,7 +826,8 @@ pub use cache::{
 use compaction::recover_interrupted_compaction;
 pub use compaction::{
     CompactionEvidenceBundle, CompactionFacts, CompactionProofVerifier, CompactionReport,
-    CompactionRetainedRoot, CompactionRetention, CompactionRootKind, VerifiedCompactionPlan,
+    CompactionRetainedRoot, CompactionRetention, CompactionRootKind,
+    DeterministicCompactionProofVerifier, VerifiedCompactionPlan, deterministic_compaction_proof,
 };
 pub use faults::{FaultInjector, FaultPoint, NoFaults};
 use format::{
@@ -593,12 +838,12 @@ use format::{
 };
 #[cfg(test)]
 use format::{frame_checksum, last_batch_spans, open_rw};
-use index::{IndexState, recover_index, replace_index};
+use index::{IndexState, recover_index, replace_index, replace_volume_index};
 use native_io::{
     create_private as create_private_file_capability, open_directory as open_directory_capability,
     open_rw as open_rw_capability, sync_directory as sync_store_directory_capability,
 };
-use recovery::{RecoveryScope, recover_store};
+use recovery::{RecoveryScope, recover_store, recover_volume};
 use roots::{encode_root_record, encode_root_snapshot, recover_roots};
 use validation::{
     ClosureObjects, materialize_closure, recovery_closure_error, usage_from_closure,

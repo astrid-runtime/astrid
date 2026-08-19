@@ -25,6 +25,9 @@ use async_trait::async_trait;
 
 use crate::error::{StorageError, StorageResult};
 
+mod batch;
+#[cfg(test)]
+mod batch_tests;
 mod memory;
 mod principal;
 mod scoped;
@@ -35,6 +38,10 @@ mod tree_error;
 #[cfg(test)]
 mod tree_tests;
 
+pub use batch::{
+    KvBatchCondition, KvBatchMutation, KvBatchOutcome, KvConditionResult, KvEntryKey,
+    KvMutationBatch, MAX_KV_BATCH_OPERATIONS, MAX_KV_BATCH_PAYLOAD_BYTES,
+};
 pub use memory::MemoryKvStore;
 pub use principal::{KvPrincipalResolver, KvQuotaResolver, PrincipalKvStore};
 pub use scoped::ScopedKvStore;
@@ -208,6 +215,27 @@ pub trait KvStore: Send + Sync {
         Ok(all.into_iter().filter(|k| k.starts_with(prefix)).collect())
     }
 
+    /// List at most `limit` keys after an exclusive lexical cursor.
+    ///
+    /// Durable range backends override this to avoid materializing an entire
+    /// namespace. The default preserves compatibility for small/in-memory
+    /// implementations.
+    async fn list_keys_with_prefix_page(
+        &self,
+        namespace: &str,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<Vec<String>> {
+        let mut keys = self.list_keys_with_prefix(namespace, prefix).await?;
+        keys.sort_unstable();
+        Ok(keys
+            .into_iter()
+            .filter(|key| after.is_none_or(|cursor| key.as_str() > cursor))
+            .take(limit)
+            .collect())
+    }
+
     /// Atomically replace `key` with `new` iff its current value
     /// matches `expected`.
     ///
@@ -233,6 +261,27 @@ pub trait KvStore: Send + Sync {
         expected: Option<&[u8]>,
         new: Vec<u8>,
     ) -> StorageResult<bool>;
+
+    /// Atomically evaluate all conditions and apply all mutations in one
+    /// backend transaction.
+    ///
+    /// Backends that cannot provide an atomic transaction return an
+    /// unsupported-operation error. A condition mismatch is a successful
+    /// operation with `applied == false`; it does not partially apply any
+    /// mutation.
+    async fn apply_batch(&self, _batch: &KvMutationBatch) -> StorageResult<KvBatchOutcome> {
+        Err(StorageError::Internal(
+            "atomic conditional batches are unsupported by this KV backend".to_owned(),
+        ))
+    }
+
+    /// Whether this backend implements [`Self::apply_batch`] atomically.
+    ///
+    /// Legacy adapters retain the default `false`; callers can choose a
+    /// correctness-preserving CAS fallback without parsing error strings.
+    fn supports_atomic_batch(&self) -> bool {
+        false
+    }
 
     /// Delete all keys in a namespace.
     async fn clear_namespace(&self, namespace: &str) -> StorageResult<u64>;

@@ -37,7 +37,9 @@ The `SecretStore` trait provides synchronous credential storage (called from syn
 - `KeychainSecretStore` (`keychain` feature) uses the OS keychain via the `keyring` crate. Per-capsule isolation via service name scoping.
 - `FallbackSecretStore` (`keychain` feature) probes the keychain once at construction. If accessible, all operations go to keychain. If not, all go to KV. No per-operation fallback that could scatter secrets across both backends.
 
-The `build_secret_store` convenience constructor picks the best available backend.
+The `build_secret_store` convenience constructor is always KV-backed and never
+probes the OS keychain. Signed distributions that explicitly opt into the
+`keychain` feature may call `build_keychain_secret_store` instead.
 
 ## Identity
 

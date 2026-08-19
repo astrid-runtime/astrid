@@ -163,6 +163,7 @@ mod tests {
         "config",
         "wit",
         "gc",
+        "storage",
         "start",
         "status",
         "stop",

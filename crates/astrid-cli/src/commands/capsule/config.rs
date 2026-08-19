@@ -1,21 +1,15 @@
-//! `astrid capsule config` — view and edit a capsule's env config.
+//! `astrid capsule config` — view and edit a capsule's typed env config.
 //!
-//! Mirrors the `.env.json` shape the installer writes, scoped per-
-//! principal under `<principal_home>/.config/env/<capsule>.env.json`.
-//! No kernel IPC: capsules read this file directly when the kernel
-//! injects per-invocation env into the WASM guest, so editing it on
-//! disk is sufficient. The capsule must be reloaded for changes to
-//! take effect.
+//! All reads and writes go through the daemon admin API. Native `.env.json`
+//! files are legacy migration input only and are never consulted here.
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use astrid_core::PrincipalId;
-use astrid_core::dirs::AstridHome;
+use astrid_core::kernel_api::{EnvStorageScope, EnvValueKind};
 use clap::Args;
 use colored::Colorize;
-use serde_json::{Map, Value};
 
 use crate::context;
 use crate::theme::Theme;
@@ -39,68 +33,22 @@ pub(crate) struct ConfigArgs {
     pub format: String,
 }
 
-fn env_path(principal: &PrincipalId, capsule: &str) -> Result<PathBuf> {
-    let home = AstridHome::resolve().context("Failed to resolve Astrid home directory")?;
-    let dir = home.principal_home(principal).env_dir();
-    Ok(dir.join(format!("{capsule}.env.json")))
-}
-
-fn read_env(path: &std::path::Path) -> Result<Map<String, Value>> {
-    if !path.exists() {
-        return Ok(Map::new());
-    }
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    if contents.trim().is_empty() {
-        return Ok(Map::new());
-    }
-    let value: Value = serde_json::from_str(&contents)
-        .with_context(|| format!("{} is not valid JSON", path.display()))?;
-    match value {
-        Value::Object(map) => Ok(map),
-        _ => anyhow::bail!("{} is not a JSON object", path.display()),
-    }
-}
-
-fn write_env(path: &std::path::Path, env: &Map<String, Value>) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}", parent.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o700);
-            let _ = std::fs::set_permissions(parent, perms);
-        }
-    }
-    let contents = serde_json::to_string_pretty(env).context("Failed to serialize env JSON")?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &contents)
-        .with_context(|| format!("Failed to write {}", tmp.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(&tmp, perms)
-            .with_context(|| format!("Failed to chmod {}", tmp.display()))?;
-    }
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("Failed to rename {} to {}", tmp.display(), path.display()))?;
-    Ok(())
+fn entries(
+    principal: &PrincipalId,
+    capsule: &str,
+) -> Result<Vec<astrid_core::kernel_api::EnvEntry>> {
+    super::install_headless::list_env_entries(principal, capsule)
 }
 
 /// Entry point for `astrid capsule config`.
 pub(crate) fn run(args: &ConfigArgs) -> Result<ExitCode> {
     let principal = context::resolve_agent(args.agent.as_deref())?;
-    let path = env_path(&principal, &args.name)?;
+    let existing = entries(&principal, &args.name)?;
 
     if !args.set.is_empty() {
-        let mut env = read_env(&path)?;
-        // Collected so the local-egress pre-bless prompt runs AFTER the env file
-        // is written (a write failure should not orphan a prompt).
-        let mut set_values: Vec<String> = Vec::new();
+        let mut set_values = Vec::new();
         for pair in &args.set {
-            let Some((k, v)) = pair.split_once('=') else {
+            let Some((key, value)) = pair.split_once('=') else {
                 eprintln!(
                     "{}",
                     Theme::error(&format!(
@@ -109,40 +57,57 @@ pub(crate) fn run(args: &ConfigArgs) -> Result<ExitCode> {
                 );
                 return Ok(ExitCode::from(1));
             };
-            env.insert(k.trim().to_string(), Value::String(v.to_string()));
-            set_values.push(v.to_string());
-        }
-        write_env(&path, &env)?;
-
-        // Guided pre-bless: if any value the operator just set is a local
-        // provider endpoint, offer to add the SSRF-airlock exemption so the
-        // capsule can reach it. Operator is unambiguously local here (this is
-        // the CLI process), so a plain stdin prompt is safe — not the daemon's
-        // runtime elicitation. Non-local / free-text values are skipped.
-        if let Ok(home) = AstridHome::resolve() {
-            let config_path = home.config_path();
-            for v in &set_values {
-                super::local_egress::maybe_prompt_local_egress(&args.name, v, &config_path);
+            let key = key.trim();
+            if key.is_empty() {
+                eprintln!("{}", Theme::error("environment key must not be empty"));
+                return Ok(ExitCode::from(1));
             }
+            // Preserve an existing secret declaration; new keys default to
+            // text until the capsule manifest declares them secret.
+            let kind = existing
+                .iter()
+                .find(|entry| entry.key == key)
+                .map_or(EnvValueKind::Text, |entry| entry.kind);
+            super::install_headless::set_env_entry(
+                &principal,
+                &args.name,
+                key,
+                value,
+                kind,
+                EnvStorageScope::Agent,
+            )?;
+            set_values.push(value.to_owned());
+        }
+
+        let config_path = astrid_core::dirs::AstridHome::resolve()?.config_path();
+        for value in &set_values {
+            super::local_egress::maybe_prompt_local_egress(&args.name, value, &config_path);
         }
         println!(
             "{}",
             Theme::success(&format!(
-                "Updated config for capsule '{}' (agent '{}'). Reload the capsule for changes to take effect.",
+                "Updated config for capsule '{}' (agent '{}').",
                 args.name, principal
             ))
         );
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Default to showing.
-    let env = read_env(&path)?;
+    // The admin list intentionally contains metadata only. Values, including
+    // secret values, are never emitted by this command.
+    let mut redacted = serde_json::Map::new();
+    for entry in existing {
+        redacted.insert(
+            entry.key,
+            serde_json::Value::String("<redacted>".to_owned()),
+        );
+    }
     let format = ValueFormat::parse(&args.format);
     if !format.is_pretty() {
-        emit_structured(&env, format)?;
+        emit_structured(&redacted, format)?;
         return Ok(ExitCode::SUCCESS);
     }
-    if env.is_empty() {
+    if redacted.is_empty() {
         println!(
             "{}",
             Theme::info(&format!(
@@ -159,48 +124,14 @@ pub(crate) fn run(args: &ConfigArgs) -> Result<ExitCode> {
         "(agent".bold(),
         format!("{principal})").cyan()
     );
-    let mut keys: Vec<&String> = env.keys().collect();
+    let mut keys: Vec<&String> = redacted.keys().collect();
     keys.sort();
-    for k in keys {
-        // Redact values — `set` is the write path; `show` should not
-        // leak secrets to a shoulder-surfer.
-        println!("  {} = {}", k, "<redacted>".dimmed());
+    for key in keys {
+        println!("  {} = {}", key, "<redacted>".dimmed());
     }
     println!(
         "\n{}",
-        Theme::info(&format!(
-            "Config file: {} (values redacted in pretty output — use --format json to dump)",
-            path.display()
-        ))
+        Theme::info("Configuration is stored in the daemon control namespace (values redacted).")
     );
     Ok(ExitCode::SUCCESS)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn invalid_set_value_returns_error_exit() {
-        // Smoke test: parsing `--set` without `=` is a soft error
-        // surfaced via stderr + exit code 1, not a panic.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.env.json");
-        let mut env = Map::new();
-        env.insert("KEY".into(), Value::String("v".into()));
-        write_env(&path, &env).unwrap();
-        let read = read_env(&path).unwrap();
-        assert_eq!(read.get("KEY").and_then(|v| v.as_str()), Some("v"));
-    }
-
-    #[test]
-    fn round_trip_set_then_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.env.json");
-        let mut env = Map::new();
-        env.insert("KEY".into(), Value::String("v".into()));
-        write_env(&path, &env).unwrap();
-        let read = read_env(&path).unwrap();
-        assert_eq!(read.get("KEY").and_then(|v| v.as_str()), Some("v"));
-    }
 }

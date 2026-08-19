@@ -1,28 +1,7 @@
-//! `astrid capsule install` — source resolution, then hand off to the install lib.
+//! `astrid capsule install` source resolution and daemon hand-off.
 //!
-//! This file owns the **source-resolution** side of installing a capsule:
-//! GitHub release-asset download with clone-and-build fallback, archive
-//! (`*.capsule`) detection, local Cargo-source auto-build, and the
-//! dispatcher that routes `@org/repo`, `github.com/…`, and `./local`
-//! shapes to the right pathway.
-//!
-//! The **post-resolution** install machinery (file layout, content
-//! addressing of WASM/WIT into `bin/<hash>.wasm` / `wit/<hash>.wit`,
-//! lifecycle hooks, topic baking, `meta.json` writes) lives in the
-//! [`astrid_capsule_install`] crate so the kernel-side admin install
-//! handler reaches disk through the same code path the CLI does.
-//!
-//! ## What the lib changed (versus the previous CLI-inline version)
-//!
-//! The previous install copied the entire capsule tree into the target
-//! directory, then read the `.wasm` back out, BLAKE3-hashed it, wrote
-//! `bin/<hash>.wasm`, and deleted the per-capsule copy. Same dance for
-//! `wit/`. The new lib hashes from the **source** directly, writes to
-//! the content store once, and the per-capsule directory copy excludes
-//! `*.wasm` and the top-level `wit/` by construction — no transient
-//! staging copy. The runtime contract is unchanged (loader still reads
-//! by hash via `resolve_content_addressed_wasm`); only the install
-//! path is cleaner.
+//! Shared post-resolution layout and lifecycle work lives in
+//! [`astrid_capsule_install`].
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -30,15 +9,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, bail};
 use astrid_capsule::capsule::CapsuleId;
+#[cfg(test)]
+use astrid_capsule_install::AuthorityDecision;
 use astrid_capsule_install::github_source::{
     capsule_assets, extract_github_org_repo, parse_github_source, pick_capsule,
 };
 use astrid_capsule_install::{
-    ArtifactProvenance, AuthorityDecision, InstallInspection, InstallOptions,
-    inspect_archive_for_principal_with_layout, inspect_directory_for_principal_with_layout,
-    resolve_target_dir_for_with_layout,
+    InstallOptions, inspect_archive_for_principal_with_layout,
+    inspect_directory_for_principal_with_layout, resolve_target_dir_for_with_layout,
 };
-use astrid_capsule_types::capability_presentation::semantic_expansion;
 use astrid_core::dirs::AstridHome;
 
 use super::install_finish::{finish_install, run_with_elicit};
@@ -47,6 +26,10 @@ pub(crate) use super::install_batch::{
     BatchInstallOutcome, InstalledCapsuleOutcome, RefSpec, install_capsule_batch,
 };
 use super::install_github::{github_api_client, release_tag_url, resolve_github_ref};
+
+mod authority;
+
+use authority::{authority_decision, daemon_install_authority};
 
 #[derive(Clone, Copy)]
 struct ExpectedCapsule<'a> {
@@ -57,6 +40,8 @@ struct ExpectedCapsule<'a> {
 #[derive(Clone, Copy)]
 struct InstallContext<'a> {
     workspace: bool,
+    /// Route non-workspace installs through the authenticated daemon writer.
+    daemon: bool,
     home: &'a AstridHome,
     original_source: Option<&'a str>,
     principal: &'a astrid_core::PrincipalId,
@@ -102,11 +87,8 @@ pub(crate) struct OfflineCapsuleProvenance<'a> {
     pub(crate) signature: Option<&'a str>,
 }
 
-/// Re-exported so sibling CLI modules (`init.rs`, `shuttle_install.rs`)
-/// keep the `super::install::resolve_target_dir_for` import path. The
-/// `_for` variant scopes the target to a specific principal — the
-/// init/distro path uses it to read back a capsule it installed under a
-/// non-`default` principal's home.
+/// Legacy native-layout test fixture helper.
+#[cfg(test)]
 pub(crate) use astrid_capsule_install::resolve_target_dir_for;
 
 /// Re-exported so the `update` subcommand in [`super::install_update`]
@@ -118,12 +100,7 @@ pub(crate) use super::install_update::update_capsule;
 /// distro handles env config and all capsules are installed together.
 pub(super) static BATCH_MODE: AtomicBool = AtomicBool::new(false);
 
-// ---------------------------------------------------------------------------
-// Top-level install dispatch
-// ---------------------------------------------------------------------------
-
 /// Split a trailing `@version` suffix off a `@org/repo@version` source.
-///
 /// Returns `(base_source, Some(version))` when a version pin is present,
 /// `(source, None)` otherwise. The pin is the substring after the
 /// **second** `@` (the first introduces the `@org/repo` alias). Only
@@ -146,7 +123,6 @@ pub(super) fn split_version_suffix(source: &str) -> (&str, Option<&str>) {
 }
 
 /// Install a capsule from `source` (the manual `astrid capsule install` path).
-///
 /// `capsule` is the optional `--capsule <name>` selector. When `Some`, a
 /// multi-capsule release installs only `<name>.capsule`; when `None` (the
 /// default), a release ships every `.capsule` asset and all of them are
@@ -168,8 +144,8 @@ pub(crate) async fn install_capsule_with_options(
     approve_untrusted: bool,
     vars: &[String],
 ) -> anyhow::Result<()> {
-    let principal = crate::principal::current();
     let prompt = ManualInstallOptions::from_cli(yes, approve_untrusted, vars)?;
+    let principal = crate::principal::current();
     let (installed, _resolved) = install_capsule_inner(
         source,
         capsule,
@@ -193,7 +169,6 @@ pub(crate) async fn install_capsule_with_options(
 }
 
 /// Install dispatch shared by the CLI and distro-batch paths.
-///
 /// `name_hint` is the `--capsule <name>` / distro capsule `name` selector
 /// used to pick the right archive when a release ships several. Returns
 /// `(installed_capsule_ids, resolved_ref)`: the ids of every capsule
@@ -236,7 +211,8 @@ pub(super) async fn install_capsule_inner(
             principal,
             expected,
             prompt,
-        )?;
+        )
+        .await?;
         return Ok((ids, None));
     }
 
@@ -250,6 +226,7 @@ pub(super) async fn install_capsule_inner(
             tag.as_deref(),
             InstallContext {
                 workspace,
+                daemon: !workspace,
                 home: &home,
                 original_source: Some(base),
                 principal,
@@ -269,6 +246,7 @@ pub(super) async fn install_capsule_inner(
             tag.as_deref(),
             InstallContext {
                 workspace,
+                daemon: !workspace,
                 home: &home,
                 original_source: Some(base),
                 principal,
@@ -288,7 +266,8 @@ pub(super) async fn install_capsule_inner(
         principal,
         expected,
         prompt,
-    )?;
+    )
+    .await?;
     Ok((ids, None))
 }
 
@@ -411,26 +390,23 @@ async fn install_from_github(
 
     // Priority 2: clone + build from source via astrid-build — reached only
     // when nothing was pinned (a pin would have bailed above).
-    let id = clone_and_build(url, repo, name_hint, context)?;
+    let id = clone_and_build(url, repo, name_hint, context).await?;
     Ok((vec![id], None))
 }
 
 /// Download a `.capsule` file to `dest_path` WITHOUT installing it,
 /// returning the concrete git ref that was actually resolved.
-///
 /// This is the seal pipeline's source-resolution primitive: it mirrors
 /// the release-asset download half of [`install_from_github`] but stops
 /// before handing off to the install lib. Clone-and-build is *not* a
 /// fallback here — a sealable distro must ship pre-built `.capsule`
 /// release assets, so a missing asset is a hard error the maintainer
 /// must resolve.
-///
 /// `name_hint` is the distro capsule `name`, used to pick the right
 /// archive when one source ships several (a monorepo builds/releases one
 /// `.capsule` per capsule crate) — the same `capsule_assets`/`pick_capsule`
 /// selection [`install_from_github`] uses. A single-asset release installs
 /// that one regardless of the hint.
-///
 /// The returned ref is the single source of truth the seal records in
 /// the lock's `resolved_ref`: it is whatever GitHub reported as the
 /// release `tag_name`, never an optimistic guess from the manifest.
@@ -511,6 +487,22 @@ async fn download_and_unpack(
         );
     }
     std::fs::write(&download_path, &bytes)?;
+    if context.daemon {
+        return super::install_daemon::install_local_via_daemon_outcome(
+            download_path
+                .to_str()
+                .context("invalid downloaded archive path")?,
+            context.prompt,
+            daemon_install_authority(
+                download_path
+                    .to_str()
+                    .context("invalid downloaded archive path")?,
+                context.principal,
+                context.prompt,
+            )?,
+        )
+        .await;
+    }
     unpack_via_lib(
         &download_path,
         context.workspace,
@@ -523,7 +515,6 @@ async fn download_and_unpack(
 }
 
 /// Install every `.capsule` asset in a release (the manual-install default).
-///
 /// Best-effort: each failure is reported with the asset name, but the loop
 /// continues so one bad archive doesn't block the rest. Returns an error if
 /// **any** asset failed, naming all that did — failures are surfaced, never
@@ -565,7 +556,7 @@ async fn install_all_capsules(
 
 /// Clone a GitHub repository and build the capsule from source using
 /// `astrid-build`. Returns the installed capsule id.
-fn clone_and_build(
+async fn clone_and_build(
     url: &str,
     repo: &str,
     name_hint: Option<&str>,
@@ -623,6 +614,22 @@ fn clone_and_build(
         .map(|p| p.file_name().and_then(|n| n.to_str()).unwrap_or(""))
         .collect();
     if let Some(idx) = pick_capsule(&names, name_hint)? {
+        if context.daemon {
+            return super::install_daemon::install_local_via_daemon_outcome(
+                produced[idx]
+                    .to_str()
+                    .context("invalid built archive path")?,
+                context.prompt,
+                daemon_install_authority(
+                    produced[idx]
+                        .to_str()
+                        .context("invalid built archive path")?,
+                    context.principal,
+                    context.prompt,
+                )?,
+            )
+            .await;
+        }
         return unpack_via_lib(
             &produced[idx],
             context.workspace,
@@ -637,11 +644,7 @@ fn clone_and_build(
     bail!("astrid-build produced no .capsule archive.");
 }
 
-// ---------------------------------------------------------------------------
-// Local-source dispatcher — archive vs directory vs Rust-source autobuild.
-// ---------------------------------------------------------------------------
-
-fn install_from_local(
+async fn install_from_local(
     source: &str,
     workspace: bool,
     home: &AstridHome,
@@ -657,6 +660,15 @@ fn install_from_local(
 
     // Unpack `.capsule` archive when source is a file.
     if source_path.is_file() && source.ends_with(".capsule") {
+        if !workspace {
+            let installed = super::install_daemon::install_local_via_daemon_outcome(
+                source,
+                prompt,
+                daemon_install_authority(source, principal, prompt)?,
+            )
+            .await?;
+            return Ok(vec![installed]);
+        }
         return unpack_via_lib(
             source_path,
             workspace,
@@ -693,6 +705,19 @@ fn install_from_local(
         for entry in std::fs::read_dir(&output_dir)? {
             let entry = entry?;
             if entry.path().extension().and_then(|s| s.to_str()) == Some("capsule") {
+                if !workspace {
+                    let archive = entry.path();
+                    let archive = archive
+                        .to_str()
+                        .context("built capsule archive path is not UTF-8")?;
+                    let installed = super::install_daemon::install_local_via_daemon_outcome(
+                        archive,
+                        prompt,
+                        daemon_install_authority(archive, principal, prompt)?,
+                    )
+                    .await?;
+                    return Ok(vec![installed]);
+                }
                 return unpack_via_lib(
                     &entry.path(),
                     workspace,
@@ -708,6 +733,16 @@ fn install_from_local(
         bail!("Failed to auto-build capsule from Cargo project.");
     }
 
+    if !workspace {
+        let installed = super::install_daemon::install_local_via_daemon_outcome(
+            source,
+            prompt,
+            daemon_install_authority(source, principal, prompt)?,
+        )
+        .await?;
+        return Ok(vec![installed]);
+    }
+
     install_from_local_path_for_principal(
         source_path,
         workspace,
@@ -720,12 +755,7 @@ fn install_from_local(
     .map(|installed| vec![installed])
 }
 
-// ---------------------------------------------------------------------------
-// CLI wrappers around the install lib.
-// ---------------------------------------------------------------------------
-
 /// Install a capsule from a directory containing `Capsule.toml`.
-///
 /// CLI-facing wrapper that wires up an in-process event bus with a
 /// stdin elicit handler subscribed (so capsules can prompt for
 /// `[env]` values during their install lifecycle hook), runs the
@@ -777,6 +807,9 @@ fn install_from_local_path_for_principal(
         original_source: original_source.map(String::from),
         skip_import_check: BATCH_MODE.load(Ordering::Relaxed),
         lifecycle_bus: None,
+        storage: None,
+        provenance_distro: None,
+        provenance_source_digest: None,
     };
     let output = run_with_elicit(opts, prompt, |opts, bus| {
         let opts = InstallOptions {
@@ -812,7 +845,6 @@ fn install_from_local_path_for_principal(
 /// Install a capsule from a local `.capsule` file in batch (offline)
 /// mode, recording `original_source` and signing provenance in
 /// `meta.json`.
-///
 /// Used by the `.shuttle` offline-install path: the file already lives
 /// in the verified mirror, so no network is touched. `original_source`
 /// is the distro's canonical `@org/repo` (NOT the mirror path) so a
@@ -888,6 +920,9 @@ fn unpack_via_lib(
         original_source: original_source.map(String::from),
         skip_import_check: BATCH_MODE.load(Ordering::Relaxed),
         lifecycle_bus: None,
+        storage: None,
+        provenance_distro: None,
+        provenance_source_digest: None,
     };
     let output = run_with_elicit(opts, prompt, |opts, bus| {
         let opts = InstallOptions {
@@ -920,77 +955,8 @@ fn unpack_via_lib(
     finish_install(&output, home, principal, prompt)
 }
 
-fn authority_decision(
-    inspection: &InstallInspection,
-    prompt: &ManualInstallOptions,
-) -> anyhow::Result<AuthorityDecision> {
-    if matches!(
-        inspection.provenance,
-        ArtifactProvenance::LocalRuntime { .. }
-    ) {
-        return Ok(AuthorityDecision::Automatic);
-    }
-    if BATCH_MODE.load(Ordering::Relaxed) {
-        return Ok(AuthorityDecision::OperatorDistribution {
-            content_digest: inspection.content_digest.clone(),
-        });
-    }
-    if prompt.approve_untrusted {
-        return Ok(AuthorityDecision::ExplicitApproval {
-            content_digest: inspection.content_digest.clone(),
-        });
-    }
-    if prompt.yes {
-        bail!(
-            "capsule '{}' is {}; --yes configures values but does not approve install authority. Re-run with --approve-untrusted after reviewing the artifact",
-            inspection.capsule_id,
-            inspection.provenance.label()
-        );
-    }
-
-    eprintln!();
-    eprintln!(
-        "Capsule {} {} is {}.",
-        inspection.capsule_id,
-        inspection.version,
-        inspection.provenance.label()
-    );
-    if let Some(signer) = inspection.provenance.signer() {
-        eprintln!("  Signer: {signer}");
-    }
-    eprintln!("  Content: {}", inspection.content_digest);
-    if inspection.capability_expansions.is_empty() {
-        eprintln!("  New authority beyond the current install: none");
-    } else {
-        eprintln!("  NEW AUTHORITY REQUESTED");
-        for expansion in &inspection.capability_expansions {
-            let semantic = semantic_expansion(expansion);
-            eprintln!("    - {}", semantic.action);
-            if !semantic.scope.is_empty() {
-                eprintln!("      Scope: {}", semantic.scope.join("; "));
-            }
-            eprintln!("      Impact: {}", semantic.impact);
-        }
-    }
-    eprint!("Approve this exact install once? [y/N] ");
-    std::io::Write::flush(&mut std::io::stderr())?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-        Ok(AuthorityDecision::ExplicitApproval {
-            content_digest: inspection.content_digest.clone(),
-        })
-    } else {
-        bail!("capsule install authority was not approved")
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tests — source-resolution helpers only. Install-machinery tests live
-// in `astrid-capsule-install`; `update`/`check_remote_version` tests
-// live in `install_update`.
-// ---------------------------------------------------------------------------
-
+// Source-resolution tests live here; install machinery is tested in
+// `astrid-capsule-install` and `install_update`.
 #[cfg(test)]
 #[path = "install_tests.rs"]
 mod tests;

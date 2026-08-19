@@ -6,29 +6,72 @@
 //! inside `astrid-cli/src/commands/capsule/install.rs`; they followed
 //! the install machinery into this crate when it was extracted.
 
+use std::sync::Arc;
+
 #[cfg(windows)]
 use astrid_capsule_install::{
     AuthorityDecision, inspect_directory_for_principal_in_workspace,
     install_from_local_path_authorized_for_principal_in_workspace,
 };
 use astrid_capsule_install::{
-    InstallOptions, copy_capsule_dir, install_from_local_path, read_meta,
+    InstallOptions, VerifiedDurableCapsulePackage, copy_capsule_dir, install_from_local_path,
+    read_durable_meta, read_verified_durable_package,
 };
 #[cfg(windows)]
 use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
 #[cfg(windows)]
 use astrid_core::dirs::WorkspaceLayout;
+use astrid_core::identity::PrincipalUid;
+use astrid_storage::{
+    KvQuotaResolver, PrincipalDirectory, RuntimePrincipalStore, StateOwner,
+    open_runtime_principal_store_with_directory,
+};
 
-/// Resolve the `home://wit/` mirror directory for the install principal.
-///
-/// Uses [`astrid_capsule_install::paths::install_principal`] — the same
-/// single source of truth the mirror writer resolves against — so the test
-/// stays aligned if the install principal ever changes.
-fn wit_mirror_dir(home: &AstridHome) -> std::path::PathBuf {
-    home.principal_home(&astrid_capsule_install::paths::install_principal())
-        .root()
-        .join("wit")
+fn install_store(home: &AstridHome) -> Arc<RuntimePrincipalStore> {
+    let principal = astrid_capsule_install::paths::install_principal();
+    let directory = PrincipalDirectory::default();
+    let uid = PrincipalUid::from_bytes([0x44; 32]);
+    directory.register(principal.clone(), uid).unwrap();
+    let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
+        Ok(match owner {
+            StateOwner::System => None,
+            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+        })
+    });
+    let store = Arc::new(
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(open_runtime_principal_store_with_directory(
+                home, quota, directory,
+            ))
+            .unwrap(),
+    );
+    store
+        .principal_directory()
+        .register(principal, uid)
+        .unwrap();
+    store
+}
+
+fn install_options(storage: &Arc<RuntimePrincipalStore>) -> InstallOptions {
+    InstallOptions {
+        storage: Some(Arc::clone(storage)),
+        ..Default::default()
+    }
+}
+
+fn durable_package(
+    storage: &RuntimePrincipalStore,
+    capsule_id: &str,
+) -> VerifiedDurableCapsulePackage {
+    let uid = storage
+        .principal_directory()
+        .uid_for(&astrid_capsule_install::paths::install_principal())
+        .unwrap();
+    read_verified_durable_package(storage, uid, capsule_id)
+        .unwrap()
+        .unwrap_or_else(|| panic!("durable package {capsule_id} is missing"))
 }
 
 fn write_minimal_capsule(base: &std::path::Path, name: &str, version: &str) {
@@ -53,10 +96,8 @@ impl FreshWindowsHome {
             .parent()
             .and_then(std::path::Path::parent)
             .expect("Astrid runtime root is below Windows LocalAppData");
-        let path = local_app_data.join(format!(
-            "AstridCapsuleInstallTest-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let path = local_app_data.join(format!("AstTest-{}", &suffix[..16]));
         assert!(!path.exists(), "fresh test home must not exist");
         Self { path }
     }
@@ -71,28 +112,31 @@ impl Drop for FreshWindowsHome {
 
 #[cfg(windows)]
 #[test]
-fn user_install_provisions_fresh_private_windows_home() {
+fn user_install_uses_initialized_fresh_private_windows_home() {
     let capsule_dir = tempfile::tempdir().unwrap();
     write_minimal_capsule(capsule_dir.path(), "fresh-windows-home-test", "1.0.0");
     let fresh = FreshWindowsHome::new();
     let home = AstridHome::from_path(&fresh.path);
+    home.ensure()
+        .expect("fresh Windows install home should be initialized before storage opens");
+    let storage = install_store(&home);
 
-    install_from_local_path(capsule_dir.path(), &home, InstallOptions::default())
-        .expect("fresh Windows user install should provision its private home");
+    let output = install_from_local_path(capsule_dir.path(), &home, install_options(&storage))
+        .expect("fresh Windows user install should use its private home");
 
-    let principal = home.principal_home(&astrid_core::PrincipalId::default());
-    let installed = principal.capsules_dir().join("fresh-windows-home-test");
-    assert!(installed.join("Capsule.toml").is_file());
-    let capsules_dir = principal.capsules_dir();
-    for path in [home.root(), principal.root(), capsules_dir.as_path()] {
-        astrid_core::platform_fs::ensure_private_directory(path)
-            .expect("installed home boundary must retain its exact private ACL");
-    }
+    assert!(output.target_dir.join("Capsule.toml").is_file());
+    assert!(
+        durable_package(&storage, "fresh-windows-home-test")
+            .manifest()
+            .package
+            .name
+            == "fresh-windows-home-test"
+    );
 }
 
 #[cfg(windows)]
 #[test]
-fn inspected_user_install_provisions_fresh_private_windows_home() {
+fn inspected_user_install_uses_initialized_fresh_private_windows_home() {
     let capsule_dir = tempfile::tempdir().unwrap();
     std::fs::write(
         capsule_dir.path().join("Capsule.toml"),
@@ -102,6 +146,9 @@ fn inspected_user_install_provisions_fresh_private_windows_home() {
     .unwrap();
     let fresh = FreshWindowsHome::new();
     let home = AstridHome::from_path(&fresh.path);
+    home.ensure()
+        .expect("fresh Windows inspection home should be initialized before storage opens");
+    let storage = install_store(&home);
     let principal = PrincipalId::default();
     let layout = WorkspaceLayout::default();
     // This regression targets fresh user-home provisioning. Workspace-root
@@ -116,14 +163,14 @@ fn inspected_user_install_provisions_fresh_private_windows_home() {
         workspace_root,
         &layout,
     )
-    .expect("inspection should provision the private runtime identity");
+    .expect("inspection should use the private runtime identity");
     let decision = AuthorityDecision::ExplicitApproval {
         content_digest: inspection.content_digest,
     };
-    install_from_local_path_authorized_for_principal_in_workspace(
+    let output = install_from_local_path_authorized_for_principal_in_workspace(
         capsule_dir.path(),
         &home,
-        InstallOptions::default(),
+        install_options(&storage),
         &principal,
         workspace_root,
         &decision,
@@ -131,21 +178,14 @@ fn inspected_user_install_provisions_fresh_private_windows_home() {
     )
     .expect("authorized install should scan and provision the private principal home");
 
-    let principal_home = home.principal_home(&principal);
-    let capsules_dir = principal_home.capsules_dir();
-    let installed = capsules_dir.join("fresh-inspected-home-test");
-    assert!(installed.join("Capsule.toml").is_file());
-    for path in [
-        home.root(),
-        home.keys_dir().as_path(),
-        principal_home.root(),
-        capsules_dir.as_path(),
-    ] {
-        astrid_core::platform_fs::ensure_private_directory(path)
-            .expect("inspected install directory must retain its exact private ACL");
-    }
-    astrid_core::platform_fs::validate_private_file(&home.runtime_key_path())
-        .expect("inspected install runtime key must retain its exact private ACL");
+    assert!(output.target_dir.join("Capsule.toml").is_file());
+    assert_eq!(
+        durable_package(&storage, "fresh-inspected-home-test")
+            .manifest()
+            .package
+            .name,
+        "fresh-inspected-home-test"
+    );
 }
 
 #[test]
@@ -176,17 +216,19 @@ fn install_preserves_node_modules() {
 
     let home_dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(home_dir.path());
-    install_from_local_path(base, &home, InstallOptions::default())
+    let storage = install_store(&home);
+    let output = install_from_local_path(base, &home, install_options(&storage))
         .expect("install should succeed");
 
-    let installed = home
-        .principal_home(&astrid_core::PrincipalId::default())
-        .capsules_dir()
-        .join("install-test");
+    let installed = output.target_dir;
     assert!(installed.join("Capsule.toml").exists());
     assert!(installed.join("node_modules/got/index.js").exists());
     assert!(installed.join("package.json").exists());
     assert!(installed.join("src/index.js").exists());
+    assert!(
+        !home.etc_dir().join("capsule-authority").exists(),
+        "storage-backed installs keep authority only in the durable package"
+    );
 }
 
 #[test]
@@ -338,13 +380,11 @@ fn install_dereferences_node_modules_bin_symlinks() {
 
     let home_dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(home_dir.path());
-    install_from_local_path(base, &home, InstallOptions::default())
+    let storage = install_store(&home);
+    let output = install_from_local_path(base, &home, install_options(&storage))
         .expect("install must not bail on symlinks");
 
-    let installed = home
-        .principal_home(&astrid_core::PrincipalId::default())
-        .capsules_dir()
-        .join("symlink-test");
+    let installed = output.target_dir;
     let bin_file = installed.join("node_modules/.bin/somepkg");
     assert!(bin_file.exists());
     assert!(!bin_file.is_symlink());
@@ -360,23 +400,20 @@ fn install_writes_meta_json() {
 
     let home_dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(home_dir.path());
-    install_from_local_path(base, &home, InstallOptions::default())
+    let storage = install_store(&home);
+    let output = install_from_local_path(base, &home, install_options(&storage))
         .expect("install should succeed");
 
-    let installed = home
-        .principal_home(&astrid_core::PrincipalId::default())
-        .capsules_dir()
-        .join("meta-test");
-    let meta = read_meta(&installed).expect("meta.json should exist after install");
+    let package = durable_package(&storage, "meta-test");
+    let meta = package.metadata();
     assert_eq!(meta.version, "2.0.0");
+    assert!(output.target_dir.join("meta.json").is_file());
 }
 
 #[test]
 fn install_materializes_home_wit_mirror() {
-    // The system capsule's list_interfaces / read_interface tools read
-    // `home://wit/<basename>`, which resolves to <principal_home>/wit/.
-    // Install must mirror the content-addressed WIT blobs there, keyed
-    // by basename (read_interface rejects names containing '/').
+    // WIT is authoritative in the UID-owned durable package. The native
+    // cache is only a disposable materialization and must not be consulted.
     let capsule_dir = tempfile::tempdir().unwrap();
     let base = capsule_dir.path();
     write_minimal_capsule(base, "wit-mirror-test", "1.0.0");
@@ -394,27 +431,15 @@ fn install_materializes_home_wit_mirror() {
 
     let home_dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(home_dir.path());
-    install_from_local_path(base, &home, InstallOptions::default())
+    let storage = install_store(&home);
+    install_from_local_path(base, &home, install_options(&storage))
         .expect("install should succeed");
 
-    let mirror = wit_mirror_dir(&home);
-    let broker = mirror.join("broker.wit");
-    let contracts = mirror.join("astrid-contracts.wit");
-
-    assert!(
-        broker.exists(),
-        "broker.wit must be mirrored to home://wit/"
-    );
-    assert!(
-        contracts.exists(),
-        "nested astrid-contracts.wit must be flattened to its basename in home://wit/"
-    );
-    assert_eq!(std::fs::read_to_string(&broker).unwrap(), broker_src);
-    assert_eq!(std::fs::read_to_string(&contracts).unwrap(), contracts_src);
-    // No nested directory should be created in the mirror — basename only.
-    assert!(
-        !mirror.join("deps").exists(),
-        "mirror must be flat (basename), not a nested tree"
+    let package = durable_package(&storage, "wit-mirror-test");
+    assert_eq!(package.wit_file("broker.wit"), Some(broker_src.as_bytes()));
+    assert_eq!(
+        package.wit_file("deps/astrid-contracts/astrid-contracts.wit"),
+        Some(contracts_src.as_bytes())
     );
 }
 
@@ -432,25 +457,18 @@ fn install_wit_mirror_is_idempotent() {
 
     let home_dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(home_dir.path());
+    let storage = install_store(&home);
 
-    install_from_local_path(base, &home, InstallOptions::default()).expect("first install");
-    let mirrored = wit_mirror_dir(&home).join("idem.wit");
-    assert_eq!(std::fs::read_to_string(&mirrored).unwrap(), src);
+    install_from_local_path(base, &home, install_options(&storage)).expect("first install");
+    let first = durable_package(&storage, "wit-idem-test");
+    assert_eq!(first.wit_file("idem.wit"), Some(src.as_bytes()));
 
     // Second install (same bytes) must not error and must leave the same
-    // content. Also confirm no stray temp files leak into the mirror.
-    install_from_local_path(base, &home, InstallOptions::default()).expect("re-install");
-    assert_eq!(std::fs::read_to_string(&mirrored).unwrap(), src);
-
-    let entries: Vec<String> = std::fs::read_dir(wit_mirror_dir(&home))
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(
-        entries,
-        vec!["idem.wit".to_string()],
-        "mirror must contain exactly the one file, no temp leftovers"
-    );
+    // durable package content.
+    install_from_local_path(base, &home, install_options(&storage)).expect("re-install");
+    let second = durable_package(&storage, "wit-idem-test");
+    assert_eq!(second.wit_file("idem.wit"), Some(src.as_bytes()));
+    assert_eq!(first.archive(), second.archive());
 }
 
 #[test]
@@ -474,14 +492,12 @@ fn install_retains_wit_blobs_in_content_store() {
 
     let home_dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(home_dir.path());
-    install_from_local_path(base, &home, InstallOptions::default())
+    let storage = install_store(&home);
+    install_from_local_path(base, &home, install_options(&storage))
         .expect("install should succeed");
 
-    let installed = home
-        .principal_home(&astrid_core::PrincipalId::default())
-        .capsules_dir()
-        .join("wit-store-test");
-    let meta = read_meta(&installed).expect("meta.json exists after install");
+    let package = durable_package(&storage, "wit-store-test");
+    let meta = package.metadata();
     assert!(
         !meta.wit_files.is_empty(),
         "install must record wit_files pins"
@@ -531,18 +547,16 @@ fn install_succeeds_when_wit_store_unwritable() {
 
     let home_dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(home_dir.path());
+    let storage = install_store(&home);
     // Make wit/ a regular file so wit/store/ can never be created — a
     // portable stand-in for "the store is unwritable".
     std::fs::write(home.wit_dir(), b"not a directory").unwrap();
 
-    install_from_local_path(base, &home, InstallOptions::default())
+    install_from_local_path(base, &home, install_options(&storage))
         .expect("install must succeed even when the WIT store is unwritable");
 
-    let installed = home
-        .principal_home(&astrid_core::PrincipalId::default())
-        .capsules_dir()
-        .join("store-ro-test");
-    let meta = read_meta(&installed).expect("meta.json exists after install");
+    let package = durable_package(&storage, "store-ro-test");
+    let meta = package.metadata();
     assert!(
         !meta.wit_files.is_empty(),
         "pins must be recorded even when blob retention fails"
@@ -550,11 +564,10 @@ fn install_succeeds_when_wit_store_unwritable() {
 }
 
 #[test]
-fn install_seeds_canonical_contracts_first_writer_wins() {
-    use astrid_capsule_install::{ContractsSkew, canonical_contracts_path, contracts_skew};
-
+fn install_persists_contracts_in_the_durable_registry() {
     let home_dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(home_dir.path());
+    let storage = install_store(&home);
 
     // First capsule vendoring contracts seeds the daemon canonical.
     let cap_a = tempfile::tempdir().unwrap();
@@ -568,14 +581,14 @@ fn install_seeds_canonical_contracts_first_writer_wins() {
         contracts_a,
     )
     .unwrap();
-    install_from_local_path(cap_a.path(), &home, InstallOptions::default())
+    install_from_local_path(cap_a.path(), &home, install_options(&storage))
         .expect("first install should succeed");
 
-    let canonical = canonical_contracts_path(&home);
+    let package_a = durable_package(&storage, "contracts-a");
     assert_eq!(
-        std::fs::read_to_string(&canonical).unwrap(),
-        contracts_a,
-        "first install must seed the daemon canonical astrid-contracts.wit"
+        package_a.wit_file("deps/astrid-contracts/astrid-contracts.wit"),
+        Some(contracts_a.as_bytes()),
+        "the first package must retain its exact contracts bytes"
     );
 
     // A second capsule pinning DIFFERENT contracts must not overwrite the
@@ -591,39 +604,26 @@ fn install_seeds_canonical_contracts_first_writer_wins() {
         contracts_b,
     )
     .unwrap();
-    install_from_local_path(cap_b.path(), &home, InstallOptions::default())
+    install_from_local_path(cap_b.path(), &home, install_options(&storage))
         .expect("second install should still succeed despite skew");
 
-    assert_eq!(
-        std::fs::read_to_string(&canonical).unwrap(),
-        contracts_a,
-        "canonical must stay first-writer-wins across later installs"
-    );
-    // The ahead-of-canonical capsule reads as skewed against the baseline.
-    let meta_b = read_meta(
-        &home
-            .principal_home(&astrid_core::PrincipalId::default())
-            .capsules_dir()
-            .join("contracts-b"),
-    )
-    .unwrap();
+    let package_b = durable_package(&storage, "contracts-b");
     assert!(
-        contracts_skew(&home, &meta_b.wit_files).is_mismatch(),
-        "the ahead-of-canonical capsule must read as skewed against the baseline"
+        package_b
+            .wit_file("deps/astrid-contracts/astrid-contracts.wit")
+            .is_some_and(|bytes| bytes == contracts_b.as_bytes()),
+        "the second package must retain its own contracts bytes"
     );
-
-    // And the first capsule still reads as aligned.
-    let meta_a = read_meta(
-        &home
-            .principal_home(&astrid_core::PrincipalId::default())
-            .capsules_dir()
-            .join("contracts-a"),
-    )
-    .unwrap();
-    assert!(matches!(
-        contracts_skew(&home, &meta_a.wit_files),
-        ContractsSkew::Match { .. }
-    ));
+    assert_ne!(
+        package_a.snapshot().package().archive,
+        package_b.snapshot().package().archive
+    );
+    assert!(
+        !home
+            .principal_home(&astrid_capsule_install::paths::install_principal())
+            .root()
+            .exists()
+    );
 }
 
 #[test]
@@ -634,27 +634,28 @@ fn install_detects_upgrade_preserves_installed_at() {
 
     let home_dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(home_dir.path());
+    let storage = install_store(&home);
 
-    install_from_local_path(base, &home, InstallOptions::default()).expect("first install");
-    let meta1 = read_meta(
-        &home
-            .principal_home(&astrid_core::PrincipalId::default())
-            .capsules_dir()
-            .join("upgrade-test"),
+    install_from_local_path(base, &home, install_options(&storage)).expect("first install");
+    let meta1 = read_durable_meta(
+        &storage,
+        &astrid_capsule_install::paths::install_principal(),
+        "upgrade-test",
     )
+    .unwrap()
     .unwrap();
     assert_eq!(meta1.version, "1.0.0");
     let original_installed_at = meta1.installed_at.clone();
 
     write_minimal_capsule(base, "upgrade-test", "2.0.0");
-    install_from_local_path(base, &home, InstallOptions::default()).expect("upgrade");
+    install_from_local_path(base, &home, install_options(&storage)).expect("upgrade");
 
-    let meta2 = read_meta(
-        &home
-            .principal_home(&astrid_core::PrincipalId::default())
-            .capsules_dir()
-            .join("upgrade-test"),
+    let meta2 = read_durable_meta(
+        &storage,
+        &astrid_capsule_install::paths::install_principal(),
+        "upgrade-test",
     )
+    .unwrap()
     .unwrap();
     assert_eq!(meta2.version, "2.0.0");
     assert_eq!(

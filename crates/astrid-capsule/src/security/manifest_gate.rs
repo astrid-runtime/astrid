@@ -11,9 +11,10 @@ use crate::manifest::CapsuleManifest;
 ///
 /// The `cwd://` scheme prefix is resolved to a physical path at construction
 /// time so that runtime path checks use simple `starts_with` matching. The
-/// `home://` scheme is resolved dynamically at check time so that shared
-/// capsules can route file access to the invoking principal's home directory
-/// (see `principal_home` parameter on `check_file_read` / `check_file_write`).
+/// durable `home://` scheme is a logical namespace and is checked against the
+/// manifest suffix directly; it never resolves or canonicalizes a host path.
+/// The `principal_home` parameter remains only for legacy native/lifecycle
+/// callers and is ignored for logical `home://` gate spellings.
 #[derive(Debug, Clone)]
 pub(crate) struct ManifestSecurityGate {
     /// The original manifest. `net` and `host_process` fields are queried
@@ -26,9 +27,12 @@ pub(crate) struct ManifestSecurityGate {
     resolved_static_read: Vec<String>,
     /// Non-`home://` fs_write patterns, fully resolved at construction time.
     resolved_static_write: Vec<String>,
-    /// Suffix strings from `home://<suffix>` fs_read entries. Resolved at
-    /// check time against the invocation principal's home root (or the
-    /// construction-time `default_home_root` fallback).
+    /// Original workspace declarations used for logical read/write matching.
+    logical_read_patterns: Vec<String>,
+    logical_write_patterns: Vec<String>,
+    /// Suffix strings from `home://<suffix>` fs_read entries. Logical paths are
+    /// checked directly against these suffixes; legacy native callers may still
+    /// resolve them against a supplied home root.
     home_suffixes_read: Vec<String>,
     /// Suffix strings from `home://<suffix>` fs_write entries.
     home_suffixes_write: Vec<String>,
@@ -42,6 +46,8 @@ pub(crate) struct ManifestSecurityGate {
     /// Stored as `PathBuf` so that `Path::starts_with` handles component-boundary
     /// matching correctly (e.g. `/workspace-evil` does NOT match `/workspace`).
     workspace_root_path: std::path::PathBuf,
+    /// Whether the workspace is the path-free AstridFilesystem namespace.
+    logical_workspace: bool,
 }
 
 impl ManifestSecurityGate {
@@ -60,6 +66,8 @@ impl ManifestSecurityGate {
             .as_ref()
             .map(|g| g.canonicalize().unwrap_or_else(|_| g.clone()));
 
+        let logical_read_patterns = manifest.capabilities.fs_read.clone();
+        let logical_write_patterns = manifest.capabilities.fs_write.clone();
         let (resolved_static_read, home_suffixes_read) =
             Self::partition_schemes(&manifest.capabilities.fs_read, &canonical_ws);
         let (resolved_static_write, home_suffixes_write) =
@@ -68,11 +76,24 @@ impl ManifestSecurityGate {
             manifest,
             resolved_static_read,
             resolved_static_write,
+            logical_read_patterns,
+            logical_write_patterns,
             home_suffixes_read,
             home_suffixes_write,
             default_home_root: canonical_home,
             workspace_root_path: canonical_ws,
+            logical_workspace: false,
         }
+    }
+
+    /// Mark this gate as serving the path-free Astrid workspace namespace.
+    ///
+    /// The ordinary constructor remains path-backed for explicit hosted
+    /// portals. Logical workspace paths are matched against the manifest's
+    /// `cwd://`/`*` declarations without consulting a host `PathBuf`.
+    pub(crate) fn with_logical_workspace(mut self) -> Self {
+        self.logical_workspace = true;
+        self
     }
 
     /// Split VFS scheme prefixes into static (resolved at construction) and
@@ -108,8 +129,9 @@ impl ManifestSecurityGate {
         (statics, home_suffixes)
     }
 
-    /// Check a filesystem path against a list of resolved static patterns plus
-    /// a list of `home://` suffixes resolved against the given principal_home.
+    /// Check a filesystem path against resolved static patterns or logical
+    /// `home://` suffixes. Legacy physical home paths may still use the
+    /// supplied `principal_home` fallback.
     ///
     /// Rejects paths containing `..` (ParentDir) components to prevent traversal
     /// attacks like `/workspace/../../etc/passwd` which would pass a naive
@@ -120,16 +142,59 @@ impl ManifestSecurityGate {
     /// canonical workspace root — preventing escape to global paths
     /// (e.g. `~/.astrid/keys/`).
     ///
-    /// If `principal_home` is `Some`, it supersedes `default_home_root` for
-    /// resolving `home://` suffixes. If both are `None` and the manifest has
-    /// `home://` entries, those entries do not match anything.
+    /// For logical `home://` spellings, `principal_home` is deliberately not
+    /// consulted. For legacy physical paths, `principal_home` supersedes
+    /// `default_home_root`; if both are `None`, home entries do not match.
     fn check_fs_permission(
         &self,
         path: &str,
         statics: &[String],
         home_suffixes: &[String],
         principal_home: Option<&std::path::Path>,
+        logical_patterns: &[String],
     ) -> bool {
+        // AstridFilesystem-backed home mounts have no physical host path.
+        // Their gate/audit spelling is the canonical logical namespace, so
+        // authorize the manifest's home suffix directly and never ask the
+        // host filesystem to canonicalize or inspect it.
+        if let Some(home_path) = path.strip_prefix("home://") {
+            if !home_path.is_empty()
+                && home_path
+                    .split('/')
+                    .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+            {
+                return false;
+            }
+            return home_suffixes.iter().any(|suffix| {
+                let suffix = suffix.trim_end_matches('/');
+                suffix.is_empty()
+                    || home_path == suffix
+                    || home_path.starts_with(&format!("{suffix}/"))
+            });
+        }
+        if self.logical_workspace
+            && let Some(workspace_path) = path.strip_prefix("workspace://")
+        {
+            if !workspace_path.is_empty()
+                && workspace_path
+                    .split('/')
+                    .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+            {
+                return false;
+            }
+            return logical_patterns.iter().any(|entry| {
+                if entry == "*" {
+                    return true;
+                }
+                let Some(suffix) = entry.strip_prefix("cwd://") else {
+                    return false;
+                };
+                let suffix = suffix.trim_matches('/');
+                suffix.is_empty()
+                    || workspace_path == suffix
+                    || workspace_path.starts_with(&format!("{suffix}/"))
+            });
+        }
         let path_obj = std::path::Path::new(path);
 
         // Reject paths with '..' components — these can bypass starts_with checks
@@ -202,6 +267,7 @@ impl CapsuleSecurityGate for ManifestSecurityGate {
             &self.resolved_static_read,
             &self.home_suffixes_read,
             principal_home,
+            &self.logical_read_patterns,
         ) {
             Ok(())
         } else {
@@ -222,6 +288,7 @@ impl CapsuleSecurityGate for ManifestSecurityGate {
             &self.resolved_static_write,
             &self.home_suffixes_write,
             principal_home,
+            &self.logical_write_patterns,
         ) {
             Ok(())
         } else {

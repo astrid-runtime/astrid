@@ -286,6 +286,11 @@ jobs:
           # ambiguous edits. It is a tool to help whoever (or whatever) is
           # working in this repo, not bureaucracy.
           #
+          # When a source file crosses the cap, split it by functional
+          # responsibility into named modules with typed interfaces. Keep each
+          # invariant and its focused tests with the code that owns it, so the
+          # resulting files are independently understandable and verifiable.
+          #
           # Source files keep the tight cap. TEST files (`*_tests.rs`,
           # `tests/**`) get 2x headroom: they grow linearly with coverage, are
           # read top-to-bottom, and hold no invariants in the reader's head, so
@@ -331,7 +336,8 @@ jobs:
               [ -n "$line" ] && echo "::error::$line"
             done
             echo ""
-            echo "Split large files, or add the 'large-file-ok' label if this is a maintainer refactor."
+            echo "Split each reported source by functional responsibility into named modules with typed interfaces, preserving behavior and focused tests."
+            echo "Use the 'large-file-ok' label only when a maintainer has approved an intentionally indivisible file."
             exit 1
           fi
 

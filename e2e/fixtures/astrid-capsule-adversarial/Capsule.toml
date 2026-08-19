@@ -20,6 +20,14 @@ type = "executable"
 
 [capabilities]
 uplink = true
+fs_read = ["home://adversarial-lifecycle-home-mounted"]
+fs_write = ["home://adversarial-lifecycle-home-mounted"]
+
+[env.adversarial_lifecycle_probe]
+type = "text"
+request = "Enter the runtime E2E lifecycle probe value"
+description = "runtime E2E lifecycle probe"
+default = "runtime-lifecycle-default"
 
 [[command]]
 name = "adversarial"
@@ -35,6 +43,11 @@ description = "Run a bounded slow command for runtime crash-recovery probes"
 name = "adversarial-ready"
 kind = "cli"
 description = "Confirm the adversarial capsule command route is live"
+
+[[command]]
+name = "adversarial-home-ready"
+kind = "cli"
+description = "Confirm the lifecycle install home marker is visible"
 
 [[command]]
 name = "adversarial-approval"

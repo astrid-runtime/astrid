@@ -170,6 +170,9 @@ async fn ensure_derived_target_clean(
         .astrid_home
         .keys_dir()
         .join(format!("{principal}.key"));
+    // Legacy file-secret roots are only collision evidence during migration.
+    // Use no-follow metadata so a dangling or malicious symlink cannot make a
+    // released legacy source appear absent.
     let secrets = kernel.astrid_home.secrets_dir().join(principal.as_str());
     let identity = kernel
         .identity_store
@@ -180,7 +183,7 @@ async fn ensure_derived_target_clean(
         || profile_path.exists()
         || home.exists()
         || key.exists()
-        || secrets.exists()
+        || std::fs::symlink_metadata(&secrets).is_ok()
     {
         return Err(err_bad_input(format!(
             "derived principal '{principal}' has residual identity or filesystem state"
@@ -233,17 +236,28 @@ fn validate_derived_capsule_install(
     source: &PrincipalId,
     capsule: &str,
 ) -> Result<(), AdminResponseBody> {
-    let source_install = kernel
-        .astrid_home
-        .principal_home(source)
-        .capsules_dir()
-        .join(capsule);
-    if !source_install.is_dir() {
-        return Err(err_bad_input(format!(
-            "source capsule install '{capsule}' is missing at {}",
-            source_install.display()
-        )));
-    }
+    let Some(store) = kernel.principal_store.as_ref() else {
+        return Err(err_internal(
+            "authoritative principal store is unavailable".to_owned(),
+        ));
+    };
+    let uid = kernel
+        .principal_directory
+        .uid_for(source)
+        .map_err(|error| err_bad_input(format!("resolve source principal UID: {error}")))?;
+    let owner = astrid_storage::StateOwner::Principal(uid);
+    let snapshot = store
+        .capsules()
+        .get_snapshot(&owner, capsule)
+        .map_err(|error| err_internal(format!("read source capsule package: {error}")))?
+        .ok_or_else(|| err_bad_input(format!("source capsule '{capsule}' is not installed")))?;
+    let temporary = tempfile::tempdir()
+        .map_err(|error| err_internal(format!("create source capsule inspection root: {error}")))?;
+    let source_install = temporary.path().join(capsule);
+    astrid_capsule_install::materialize_capsule_package(snapshot.package(), &source_install)
+        .map_err(|error| {
+            err_bad_input(format!("source capsule '{capsule}' is invalid: {error:#}"))
+        })?;
     let manifest = astrid_capsule::discovery::load_manifest(&source_install.join("Capsule.toml"))
         .map_err(|e| {
         err_bad_input(format!(
@@ -313,6 +327,12 @@ async fn rollback_derived_principal(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
 ) -> Result<(), String> {
+    crate::legacy_migration_barrier::ensure_principal_delete_allowed(
+        &kernel.astrid_home,
+        principal,
+    )
+    .map_err(|error| format!("legacy migration barrier blocked rollback: {error}"))?;
+    ensure_legacy_secret_rollback_allowed(kernel, principal)?;
     let pending = super::agent_delete::prepare_identity_removal(kernel, principal)
         .await
         .map_err(|response| format!("identity removal preparation returned {response:?}"))?;
@@ -333,22 +353,30 @@ async fn rollback_derived_principal(
     if let Err(error) = kernel.unload_principal_capsules(principal).await {
         cleanup_errors.push(format!("capsule retirement failed: {error}"));
     }
-    let capsule_dir = kernel.astrid_home.principal_home(principal).capsules_dir();
-    if let Ok(entries) = std::fs::read_dir(capsule_dir) {
-        for capsule in entries.flatten().filter_map(|entry| {
-            entry
-                .file_type()
-                .ok()
-                .filter(std::fs::FileType::is_dir)
-                .and_then(|_| entry.file_name().into_string().ok())
-        }) {
-            if let Err(error) = kernel
-                .kv
-                .clear_namespace(&format!("{principal}:capsule:{capsule}"))
-                .await
-            {
-                cleanup_errors.push(format!("KV namespace for capsule '{capsule}': {error}"));
-            }
+    let capsule_ids = pending
+        .principal_uid()
+        .and_then(|uid| kernel.principal_store.as_ref().map(|store| (store, uid)))
+        .map(|(store, uid)| {
+            store
+                .capsules()
+                .list(&astrid_storage::StateOwner::Principal(uid))
+                .map(|summaries| {
+                    summaries
+                        .into_iter()
+                        .map(|summary| summary.id().to_owned())
+                        .collect::<Vec<String>>()
+                })
+        })
+        .transpose()
+        .map_err(|error| format!("list durable capsule packages: {error}"))?
+        .unwrap_or_default();
+    for capsule in capsule_ids {
+        if let Err(error) = kernel
+            .kv
+            .clear_namespace(&format!("{principal}:capsule:{capsule}"))
+            .await
+        {
+            cleanup_errors.push(format!("KV namespace for capsule '{capsule}': {error}"));
         }
     }
     collect_remove_file(
@@ -369,11 +397,24 @@ async fn rollback_derived_principal(
         "principal key",
         &mut cleanup_errors,
     );
-    collect_remove_dir(
-        &kernel.astrid_home.secrets_dir().join(principal.as_str()),
-        "principal secrets",
-        &mut cleanup_errors,
-    );
+    let legacy_secrets = kernel.astrid_home.secrets_dir().join(principal.as_str());
+    let secret_source_must_be_absent = match pending.principal_uid() {
+        Some(uid) => crate::legacy_migration_barrier::legacy_secret_source_must_be_absent(
+            &kernel.astrid_home,
+            uid,
+        )
+        .map_err(|error| format!("legacy secret migration provenance: {error}"))?,
+        None => false,
+    };
+    if let Err(error) = super::agent_delete::reclaim_legacy_secret_root(
+        &legacy_secrets,
+        secret_source_must_be_absent,
+    ) {
+        cleanup_errors.push(format!(
+            "principal secrets {}: {error}",
+            legacy_secrets.display()
+        ));
+    }
     kernel.profile_cache.invalidate(principal);
     if !cleanup_errors.is_empty() {
         // Dropping `pending` intentionally retains its durable ownership
@@ -387,6 +428,24 @@ async fn rollback_derived_principal(
         .map_err(|response| format!("identity removal completion returned {response:?}"))
 }
 
+fn ensure_legacy_secret_rollback_allowed(
+    kernel: &crate::Kernel,
+    principal: &PrincipalId,
+) -> Result<(), String> {
+    if let Ok(uid) = kernel.principal_directory().uid_for(principal)
+        && let Err(error) = crate::legacy_migration_barrier::ensure_legacy_secret_deletion_allowed(
+            &kernel.astrid_home,
+            principal,
+            uid,
+        )
+    {
+        return Err(format!(
+            "legacy secret provenance blocked rollback: {error}"
+        ));
+    }
+    Ok(())
+}
+
 fn collect_remove_file(path: &Path, label: &str, errors: &mut Vec<String>) {
     if let Err(error) = std::fs::remove_file(path)
         && error.kind() != std::io::ErrorKind::NotFound
@@ -396,9 +455,7 @@ fn collect_remove_file(path: &Path, label: &str, errors: &mut Vec<String>) {
 }
 
 fn collect_remove_dir(path: &Path, label: &str, errors: &mut Vec<String>) {
-    if let Err(error) = std::fs::remove_dir_all(path)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
+    if let Err(error) = super::agent_delete::reclaim_empty_dir(path) {
         errors.push(format!("{label} {}: {error}", path.display()));
     }
 }
@@ -492,20 +549,9 @@ pub(super) async fn provision_new_principal(
         return err_internal(format!("profile save failed: {e}"));
     }
 
-    // Provision the per-principal home tree so per-invocation KV, log,
-    // tmp, secrets, audit, and capability tokens have a place to land.
-    //
-    // Fail-closed: if the home tree cannot be created, downstream
-    // per-invocation lookups silently fall back to the `default`
-    // principal's namespace — a confidentiality break across tenants.
-    // Roll back identity + profile so the agent isn't left in a state
-    // where future invocations would leak into someone else's data.
-    if let Err(e) = kernel.astrid_home.principal_home(&principal).ensure() {
-        rollback_created_identity(kernel, &principal, user.id, &profile_path, true).await;
-        return err_internal(format!(
-            "principal home tree provisioning failed (rolled back): {e}"
-        ));
-    }
+    // Principal KV/content roots are UID-bound and provision lazily by the
+    // authoritative runtime store. Do not recreate the released native
+    // `~/.astrid/home/{alias}` tree here; that path is migration input only.
 
     if let Some(source) = clone_from.as_ref()
         && let Err(e) =
@@ -517,12 +563,13 @@ pub(super) async fn provision_new_principal(
 
     // State inheritance is OPT-IN. By default the new principal inherits
     // NOTHING — least privilege, and no silent leak of `default`'s env
-    // JSON, KV namespaces, or (critically) secret files / API keys into
+    // typed env/secret control namespaces, KV namespaces, or (critically)
+    // API keys into
     // every created agent. When the operator names a source — `inherit_from`
     // (state only) or `clone_from` (which copied the profile above and now
     // takes the same state copy) — we perform a full copy from THAT
-    // principal: env JSON (non-secret config), per-capsule KV namespaces, and
-    // per-capsule secret files. The two are mutually exclusive, so at most one
+    // principal: typed env control values, per-capsule KV namespaces, and
+    // typed secret control values. The two are mutually exclusive, so at most one
     // is set. Best-effort — a copy failure logs a warn and leaves the agent in
     // a "needs manual setup" state but doesn't roll back the profile or the
     // home tree (those already succeeded; the confidentiality boundary holds
@@ -556,7 +603,16 @@ async fn rollback_created_identity(
     let _ = kernel.identity_store.delete_user(user_id).await;
     let _ = std::fs::remove_file(profile_path);
     if remove_home {
-        let _ = std::fs::remove_dir_all(kernel.astrid_home.principal_home(principal).root());
+        if crate::legacy_migration_barrier::ensure_principal_delete_allowed(
+            &kernel.astrid_home,
+            principal,
+        )
+        .is_ok()
+        {
+            let _ = std::fs::remove_dir(kernel.astrid_home.principal_home(principal).root());
+        } else {
+            tracing::warn!(%principal, "preserving principal home during rollback because legacy migration is incomplete");
+        }
     }
     remove_principal_key(kernel, principal);
 }
@@ -584,42 +640,43 @@ fn materialize_cloned_capsule_installs(
     target: &PrincipalId,
     capsules: &[String],
 ) -> Result<(), String> {
-    let source_capsules = kernel.astrid_home.principal_home(source).capsules_dir();
-    let target_capsules = kernel.astrid_home.principal_home(target).capsules_dir();
-
+    let store = kernel
+        .principal_store
+        .as_ref()
+        .ok_or_else(|| "authoritative principal store is unavailable".to_owned())?;
+    let source_uid = kernel
+        .principal_directory
+        .uid_for(source)
+        .map_err(|error| format!("resolve source principal UID: {error}"))?;
+    let target_uid = kernel
+        .principal_directory
+        .uid_for(target)
+        .map_err(|error| format!("resolve target principal UID: {error}"))?;
+    let source_owner = astrid_storage::StateOwner::Principal(source_uid);
+    let target_owner = astrid_storage::StateOwner::Principal(target_uid);
     for capsule in capsules {
-        let source = source_capsules.join(capsule);
-        let target = target_capsules.join(capsule);
-        if target.exists() {
+        if store
+            .capsules()
+            .get_snapshot(&target_owner, capsule)
+            .map_err(|error| format!("read target capsule '{capsule}': {error}"))?
+            .is_some()
+        {
             continue;
         }
-        if !source.exists() {
-            return Err(format!(
-                "source capsule install '{}' is missing at {}",
+        let snapshot = store
+            .capsules()
+            .get_snapshot(&source_owner, capsule)
+            .map_err(|error| format!("read source capsule '{capsule}': {error}"))?
+            .ok_or_else(|| format!("source capsule '{capsule}' is not installed"))?;
+        store
+            .capsules()
+            .install(
+                &target_owner,
                 capsule,
-                source.display()
-            ));
-        }
-        if let Some(parent) = target.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            return Err(format!("create capsule install parent: {e}"));
-        }
-        astrid_capsule_install::copy_capsule_dir(&source, &target).map_err(|e| {
-            format!(
-                "materialize capsule '{capsule}' for {}: {e:#}",
-                target.display()
+                snapshot.package(),
+                astrid_storage::CapsuleInstallExpectation::Absent,
             )
-        })?;
-        let target_env = target.join(".env.json");
-        if target_env.exists()
-            && let Err(e) = std::fs::remove_file(&target_env)
-        {
-            return Err(format!(
-                "remove copied capsule env for '{capsule}' under {}: {e}",
-                target.display()
-            ));
-        }
+            .map_err(|error| format!("copy durable capsule '{capsule}' to target: {error}"))?;
     }
     Ok(())
 }

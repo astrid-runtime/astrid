@@ -1,0 +1,33 @@
+profile_version = 1
+enabled = true
+groups = ["admin"]
+grants = []
+revokes = []
+capsules = []
+
+[auth]
+methods = ["keypair"]
+
+[[auth.public_keys]]
+key_id = "394a054c03371ee4"
+pubkey = "05f36ae444d2b36e17169455d8b9ee7cb1003aaa90faa90db420b7226870d7ca"
+created_at = 1786763747
+
+[auth.public_keys.scope]
+type = "full"
+
+[network]
+egress = []
+
+[network.capsule_egress]
+
+[process]
+allow = []
+
+[quotas]
+max_memory_bytes = 67108864
+max_timeout_secs = 300
+max_ipc_throughput_bytes = 10485760
+max_background_processes = 8
+max_storage_bytes = 1073741824
+max_cpu_fuel_per_sec = 2000000000

@@ -14,6 +14,7 @@ astrid-core = { workspace = true }
 astrid-crypto = { workspace = true }
 astrid-storage = { workspace = true, features = ["legacy-surrealkv"] }
 async-trait = { workspace = true }
+blake3 = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

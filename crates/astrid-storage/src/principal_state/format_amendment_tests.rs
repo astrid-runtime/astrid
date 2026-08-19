@@ -26,7 +26,7 @@ use super::format_amendment::{
     STORE_METADATA_FILE, format_spec_record, pre_representation_store_metadata,
     representation_bootstrap_objects, store_metadata,
 };
-use super::{Blake3ObjectIdentityV1, RuntimeEngine, StateOwnerCodecV1};
+use super::{Blake3ObjectIdentityV1, RuntimeEngine, StateOwnerCodecV2};
 
 fn id(value: u8) -> ObjectId {
     ObjectId::new([value; 32])
@@ -44,7 +44,7 @@ fn open_fixture_store(path: &Path) -> RuntimeEngine {
     let engine = RuntimeEngine::open(
         path,
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
+        StateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
     )
     .unwrap();

@@ -236,15 +236,20 @@ where
             let transaction = context.finish_projection(header, &projection)?;
             match self.engine.commit_kv_root(transaction) {
                 Ok(_) => {
-                    self.validation.trees.lock().insert(
-                        owner.clone(),
-                        TreeValidation {
-                            root: tree,
-                            entries: projection.totals.entries,
-                            logical_bytes,
-                            quota_bytes: projection_used,
-                        },
-                    );
+                    // A delta projection keeps the checkpoint tree unchanged;
+                    // its totals include the overlay and therefore must never
+                    // be cached as validation for that checkpoint tree.
+                    if projection.depth == 0 {
+                        self.validation.trees.lock().insert(
+                            owner.clone(),
+                            TreeValidation {
+                                root: tree,
+                                entries: projection.totals.entries,
+                                logical_bytes,
+                                quota_bytes: projection_used,
+                            },
+                        );
+                    }
                     self.validation
                         .projections
                         .lock()

@@ -5,10 +5,27 @@ on:
     branches: [main, stream-*]
     paths:
       - '**.rs'
+      - 'scripts/install-windows.ps1'
+      - 'scripts/uninstall-windows.ps1'
+      - 'scripts/windows_release_manifest.py'
+      - 'scripts/test_windows_release_manifest.py'
       - 'scripts/release_manifest.py'
       - 'scripts/test_release_manifest.py'
       - 'scripts/musl_release_manifest.py'
       - 'scripts/test_musl_release_manifest.py'
+      - 'scripts/package_release_archive.py'
+      - 'scripts/test_validate_release_archive.py'
+      - 'scripts/validate_release_archive.py'
+      - 'scripts/build-macos-fskit.sh'
+      - 'scripts/check-macos-fskit.sh'
+      - 'scripts/manage-macos-fskit.sh'
+      - 'scripts/test_manage_macos_fskit.sh'
+      - 'scripts/validate-macos-fskit.sh'
+      - 'scripts/validate_macos_release.py'
+      - 'scripts/test_macos_release_packaging.py'
+      - 'scripts/test_v0104_linux_upgrade.sh'
+      - 'scripts/ci/**'
+      - 'scripts/fixtures/windows-release-extension.toml'
       - 'scripts/check_glibc.py'
       - 'scripts/test_check_glibc.py'
       - 'scripts/check_dco.py'
@@ -29,17 +46,38 @@ on:
       - 'scripts/nightly_version.py'
       - 'scripts/test_nightly_version.py'
       - 'release/nightly.toml'
+      - 'crates/astrid-storage-provider-fskit/**'
+      - 'native/macos/**'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - '.github/workflows/ci.yml'
+      - '.github/workflows/native-storage-certification.yml'
+      - '.github/workflows/release.yml'
   pull_request:
     branches: [main]
     paths:
       - '**.rs'
+      - 'scripts/install-windows.ps1'
+      - 'scripts/uninstall-windows.ps1'
+      - 'scripts/windows_release_manifest.py'
+      - 'scripts/test_windows_release_manifest.py'
       - 'scripts/release_manifest.py'
       - 'scripts/test_release_manifest.py'
       - 'scripts/musl_release_manifest.py'
       - 'scripts/test_musl_release_manifest.py'
+      - 'scripts/package_release_archive.py'
+      - 'scripts/test_validate_release_archive.py'
+      - 'scripts/validate_release_archive.py'
+      - 'scripts/build-macos-fskit.sh'
+      - 'scripts/check-macos-fskit.sh'
+      - 'scripts/manage-macos-fskit.sh'
+      - 'scripts/test_manage_macos_fskit.sh'
+      - 'scripts/validate-macos-fskit.sh'
+      - 'scripts/validate_macos_release.py'
+      - 'scripts/test_macos_release_packaging.py'
+      - 'scripts/test_v0104_linux_upgrade.sh'
+      - 'scripts/ci/**'
+      - 'scripts/fixtures/windows-release-extension.toml'
       - 'scripts/check_glibc.py'
       - 'scripts/test_check_glibc.py'
       - 'scripts/check_dco.py'
@@ -60,9 +98,13 @@ on:
       - 'scripts/nightly_version.py'
       - 'scripts/test_nightly_version.py'
       - 'release/nightly.toml'
+      - 'crates/astrid-storage-provider-fskit/**'
+      - 'native/macos/**'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - '.github/workflows/ci.yml'
+      - '.github/workflows/native-storage-certification.yml'
+      - '.github/workflows/release.yml'
 
 permissions:
   contents: read
@@ -140,7 +182,8 @@ jobs:
                 --locked \
                 --target "$TARGET" \
                 --target-dir target/glibc-2.31 \
-                -p astrid
+                -p astrid \
+                -p astrid-storage-provider-fuse
             '
 
       - name: Enforce the Linux glibc compatibility ceiling
@@ -153,7 +196,8 @@ jobs:
             "$BINARY_ROOT/astrid" \
             "$BINARY_ROOT/astrid-daemon" \
             "$BINARY_ROOT/astrid-build" \
-            "$BINARY_ROOT/astrid-emit"
+            "$BINARY_ROOT/astrid-emit" \
+            "$BINARY_ROOT/astrid-storage-provider-fuse"
 
       - name: Build in the native Linux musl environment
         if: matrix.libc == 'musl'
@@ -181,14 +225,16 @@ jobs:
                 --locked \
                 --target "$TARGET" \
                 --target-dir target/musl \
-                -p astrid
+                -p astrid \
+                -p astrid-storage-provider-fuse
               BINARY_ROOT="target/musl/$TARGET/release"
               ARCHITECTURE="${TARGET%%-*}"
               python3 scripts/check_static_elf.py --architecture "$ARCHITECTURE" \
                 "$BINARY_ROOT/astrid" \
                 "$BINARY_ROOT/astrid-daemon" \
                 "$BINARY_ROOT/astrid-build" \
-                "$BINARY_ROOT/astrid-emit"
+                "$BINARY_ROOT/astrid-emit" \
+                "$BINARY_ROOT/astrid-storage-provider-fuse"
             '
 
       - name: Exercise the Linux musl binaries
@@ -209,6 +255,81 @@ jobs:
                 "target/musl/$TARGET/release/$binary" --version
               done
             '
+
+  linux-v0104-upgrade:
+    name: Published v0.10.4 Linux upgrade
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95.0"
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: ${{ runner.os }}-${{ github.job }}
+          cache-on-failure: true
+
+      - name: Build the current upgrade binaries
+        run: cargo build --locked -p astrid --bins
+
+      - name: Upgrade the pinned published Linux release
+        run: scripts/test_v0104_linux_upgrade.sh
+
+  linux-fuse-e2e:
+    name: Linux native FUSE E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      ASTRID_FUSE_E2E: "1"
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95.0"
+
+      - name: Install and require native FUSE support
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fuse3 libfuse3-dev
+          if [[ ! -c /dev/fuse ]]; then
+            sudo modprobe fuse
+          fi
+          [[ -c /dev/fuse ]] || { echo "::error::hosted runner has no Linux FUSE device" >&2; exit 1; }
+          command -v fusermount3 >/dev/null || { echo "::error::hosted runner has no fusermount3" >&2; exit 1; }
+          sudo chmod 0666 /dev/fuse
+
+      - name: Exercise the real Linux mount
+        run: >
+          cargo test --locked -p astrid-storage-provider-fuse
+          linux_native_fuse_mount_supports_all_required_operations --
+          --ignored --nocapture
 
   check:
     name: Check
@@ -242,19 +363,7 @@ jobs:
         run: cargo check --workspace --all-features --locked
 
       - name: Test release manifest contract
-        run: |
-          python3 scripts/test_release_manifest.py
-          python3 scripts/test_musl_release_manifest.py
-          python3 scripts/test_check_glibc.py
-          python3 scripts/test_check_dco.py
-          python3 scripts/test_check_static_elf.py
-          python3 scripts/test_release_publication.py
-          python3 scripts/test_release_draft_recovery.py
-          python3 scripts/test_crate_publication.py
-          python3 scripts/test_channel_metadata.py
-          python3 scripts/test_channel_publication.py
-          python3 scripts/test_nightly_version.py
-          bash scripts/test_channel_workflow_contract.sh
+        run: scripts/ci/test-release-contracts.sh
 
   wasm-portability:
     name: Wasm portability
@@ -320,6 +429,158 @@ jobs:
       - name: Run the filesystem prerequisite tests natively
         shell: pwsh
         run: cargo test --locked --target ${{ matrix.target }} -p astrid-core platform_fs -- --nocapture
+
+      - name: Parse the Windows install scripts
+        shell: pwsh
+        run: |
+          $contents = @{}
+          foreach ($script in "scripts/install-windows.ps1", "scripts/uninstall-windows.ps1") {
+            $contents[$script] = Get-Content -LiteralPath $script -Raw
+            $null = [scriptblock]::Create($contents[$script])
+          }
+          foreach ($variable in "WinFspMsi", "WinFspSha256") {
+            $pattern = '(?m)^\${0} = "([^"]+)"\r?$' -f [regex]::Escape($variable)
+            $installPin = [regex]::Match($contents["scripts/install-windows.ps1"], $pattern)
+            $uninstallPin = [regex]::Match($contents["scripts/uninstall-windows.ps1"], $pattern)
+            if (-not $installPin.Success -or -not $uninstallPin.Success -or
+                $installPin.Groups[1].Value -ne $uninstallPin.Groups[1].Value) {
+              throw "Windows install and uninstall scripts disagree on $variable"
+            }
+          }
+
+      - name: Reject a tampered Windows uninstall marker
+        shell: pwsh
+        run: |
+          $install = Join-Path $env:RUNNER_TEMP "astrid-uninstall-marker-test"
+          New-Item -ItemType Directory -Path $install -Force | Out-Null
+          @{ product = "astrid"; winfsp_installed_by_astrid = $false; winfsp_installer = "..\outside.txt" } |
+            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $install "astrid-install.json")
+          $outside = Join-Path $env:RUNNER_TEMP "outside.txt"
+          Set-Content -LiteralPath $outside -Value "keep"
+          try {
+            & scripts/uninstall-windows.ps1 -InstallDir $install
+            throw "tampered uninstall marker was accepted"
+          } catch {
+            if ($_.Exception.Message -eq "tampered uninstall marker was accepted") { throw }
+          }
+          if (-not (Test-Path -LiteralPath $outside -PathType Leaf)) {
+            throw "tampered uninstall marker removed an external file"
+          }
+
+      - name: Reject a tampered cached WinFsp installer
+        shell: pwsh
+        run: |
+          $install = Join-Path $env:RUNNER_TEMP "astrid-uninstall-msi-test"
+          New-Item -ItemType Directory -Path $install -Force | Out-Null
+          @{ product = "astrid"; winfsp_installed_by_astrid = $true; winfsp_installer = "winfsp-2.1.25156.msi" } |
+            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $install "astrid-install.json")
+          $msi = Join-Path $install "winfsp-2.1.25156.msi"
+          Set-Content -LiteralPath $msi -Value "not the pinned WinFsp installer"
+          try {
+            & scripts/uninstall-windows.ps1 -InstallDir $install -RemoveWinFsp
+            throw "tampered cached WinFsp installer was accepted"
+          } catch {
+            if ($_.Exception.Message -eq "tampered cached WinFsp installer was accepted") { throw }
+            if ($_.Exception.Message -notlike "Cached WinFsp installer digest mismatch:*") { throw }
+          }
+          if (-not (Test-Path -LiteralPath $msi -PathType Leaf) -or
+              -not (Test-Path -LiteralPath (Join-Path $install "astrid-install.json") -PathType Leaf)) {
+            throw "tampered MSI rejection mutated the installation"
+          }
+
+      - name: Install pinned WinFsp runtime
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP "winfsp-2.1.25156.msi"
+          Invoke-WebRequest `
+            -Uri "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi" `
+            -OutFile $msi
+          $hash = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash
+          if ($hash -ne "073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A") {
+            throw "WinFsp MSI digest mismatch: $hash"
+          }
+          $exitCode = (Start-Process -FilePath "msiexec.exe" `
+            -ArgumentList @("/i", "`"$msi`"", "ADDLOCAL=F.Developer", "/qn", "/norestart") `
+            -Wait -PassThru).ExitCode
+          if ($exitCode -ne 0 -and $exitCode -ne 3010) {
+            throw "WinFsp installation failed with exit code $exitCode"
+          }
+          $importLibrary = Join-Path ${env:ProgramFiles(x86)} "WinFsp\lib\winfsp-x64.lib"
+          if (-not (Test-Path -LiteralPath $importLibrary -PathType Leaf)) {
+            throw "WinFsp Developer import library was not installed: $importLibrary"
+          }
+          $registry = Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\WOW6432Node\WinFsp" -ErrorAction Stop
+          if ([string]::IsNullOrWhiteSpace($registry.InstallDir)) {
+            throw "WinFsp installation did not publish InstallDir"
+          }
+          $runtimeLibrary = Join-Path $registry.InstallDir "bin\winfsp-x64.dll"
+          if (-not (Test-Path -LiteralPath $runtimeLibrary -PathType Leaf)) {
+            throw "WinFsp x64 runtime DLL was not installed: $runtimeLibrary"
+          }
+
+      - name: Lint the Windows provider
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: >-
+          cargo clippy --locked --target ${{ matrix.target }}
+          -p astrid-storage-provider-winfsp --all-targets -- -D warnings
+
+      - name: Lint the Windows CLI updater
+        shell: pwsh
+        run: >-
+          cargo clippy --locked --target ${{ matrix.target }} -p astrid
+          --bin astrid -- -D warnings
+
+      - name: Run portable WinFsp provider tests natively
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: cargo test --locked --target ${{ matrix.target }} -p astrid-storage-provider-winfsp -- --nocapture
+
+      - name: Run Windows updater tests natively
+        shell: pwsh
+        run: >-
+          cargo test --locked --target ${{ matrix.target }} -p astrid
+          --bin astrid commands::self_update -- --nocapture
+
+      - name: Run local transport security tests natively
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: >-
+          cargo test --locked --target ${{ matrix.target }} -p astrid-core
+          local_transport -- --nocapture --test-threads=1
+
+      - name: Run storage callback transport tests natively
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: >-
+          cargo test --locked --target ${{ matrix.target }} -p astrid-kernel
+          storage_mount -- --nocapture --test-threads=1
+
+      - name: Run the native WinFsp filesystem round trip
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        env:
+          ASTRID_WINFSP_NATIVE_TEST: "1"
+        shell: pwsh
+        run: >-
+          cargo test --locked --target ${{ matrix.target }}
+          -p astrid-storage-provider-winfsp -- --nocapture --test-threads=1
+
+      - name: Run layout migration policy tests natively
+        shell: pwsh
+        run: cargo test --locked --target ${{ matrix.target }} -p astrid-core dirs::tests -- --nocapture
+
+      - name: Check the typed storage-provider handoff natively
+        shell: pwsh
+        run: >-
+          cargo test
+          --locked
+          --target ${{ matrix.target }}
+          -p astrid
+          --bin astrid
+          commands::storage::tests
+          --
+          --nocapture
 
       - name: Run fresh runtime signing provisioning natively
         shell: pwsh
@@ -432,58 +693,32 @@ jobs:
           key: ${{ runner.os }}-${{ github.job }}
           cache-on-failure: true
 
+      - name: Validate the native macOS FSKit provider
+        if: matrix.os == 'macos-latest'
+        env:
+          ASTRID_FSKIT_VALIDATE_PROJECT: "1"
+        run: scripts/check-macos-fskit.sh
+
+      - name: Validate macOS packaging and lifecycle scripts
+        if: matrix.os == 'macos-latest'
+        run: |
+          bash -n scripts/build-macos-fskit.sh \
+            scripts/check-macos-fskit.sh \
+            scripts/manage-macos-fskit.sh \
+            scripts/test_manage_macos_fskit.sh \
+            scripts/validate-macos-fskit.sh
+          python3 -m unittest scripts/test_macos_release_packaging.py
+          scripts/test_manage_macos_fskit.sh
+
       - name: Run tests
         if: matrix.os != 'macos-latest'
         run: cargo test --workspace --locked
 
       - name: Run tests (macOS serial)
         if: matrix.os == 'macos-latest'
-        shell: bash
         env:
           RUST_BACKTRACE: full
-        run: |
-          set -o pipefail
-
-          set +e
-          cargo test --workspace --locked -- --test-threads=1
-          status=$?
-          set -e
-
-          if [[ $status -ne 0 ]]; then
-            echo "::group::macOS failure diagnostics"
-            echo "exit_status=$status"
-            uname -a || true
-            sw_vers || true
-            sysctl -n hw.optional.arm64 hw.memsize hw.ncpu || true
-            ulimit -a || true
-
-            echo "::group::Recent relevant processes"
-            ps -axo pid,ppid,pgid,stat,comm,args \
-              | grep -E 'astrid_capsule|cargo|rustc|sleep| sh ' \
-              | grep -v grep || true
-            echo "::endgroup::"
-
-            echo "::group::Recent macOS abort/crash log entries"
-            log show --last 10m --style compact --info --debug \
-              --predicate 'eventMessage CONTAINS[c] "SIGABRT" OR eventMessage CONTAINS[c] "abort" OR eventMessage CONTAINS[c] "crash" OR eventMessage CONTAINS[c] "killed" OR eventMessage CONTAINS[c] "terminated" OR process CONTAINS[c] "astrid_capsule" OR process CONTAINS[c] "sleep"' \
-              || true
-            echo "::endgroup::"
-
-            echo "::group::Diagnostic reports"
-            for dir in "$HOME/Library/Logs/DiagnosticReports" "/Library/Logs/DiagnosticReports"; do
-              [[ -d "$dir" ]] || continue
-              echo "Reports in $dir"
-              find "$dir" -maxdepth 1 -type f \( -name '*astrid*' -o -name '*cargo*' -o -name '*rustc*' -o -name '*sleep*' \) -print \
-                | while read -r report; do
-                    echo "--- $report"
-                    sed -n '1,220p' "$report" || true
-                  done
-            done
-            echo "::endgroup::"
-            echo "::endgroup::"
-          fi
-
-          exit "$status"
+        run: scripts/ci/test-workspace-macos.sh
 
   msrv:
     name: MSRV
@@ -586,40 +821,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           INTERNAL_EXCLUDES: ${{ steps.api-inputs.outputs.internal-excludes }}
           CARGO_TARGET_DIR: semver-checks/target
-        run: |
-          set -o pipefail
-
-          IFS=',' read -ra excludes <<< "$INTERNAL_EXCLUDES"
-          exclude_args=()
-          for package in "${excludes[@]}"; do
-            if [ -n "$package" ]; then
-              exclude_args+=(--exclude "$package")
-            fi
-          done
-
-          set +e
-          cargo semver-checks check-release \
-            --manifest-path Cargo.toml \
-            --baseline-rev "$BASE_SHA" \
-            --all-features \
-            "${exclude_args[@]}" 2>&1 | tee internal-semver-checks.log
-          status=${PIPESTATUS[0]}
-          set -e
-
-          case "$status" in
-            0)
-              echo "result=success" >> "$GITHUB_OUTPUT"
-              ;;
-            100)
-              echo "result=findings" >> "$GITHUB_OUTPUT"
-              echo "::warning title=Core Rust API change::Review the advisory cargo-semver-checks findings. Core library compatibility requires maintainer judgment and is not a merge blocker."
-              ;;
-            *)
-              echo "result=error" >> "$GITHUB_OUTPUT"
-              echo "::error title=Internal Rust API check failed::cargo-semver-checks could not complete (exit $status); this is a tool, build, or infrastructure failure, not an advisory API finding."
-              exit "$status"
-              ;;
-          esac
+        run: scripts/ci/report-core-api-compatibility.sh
 
       - name: Summarize Rust API compatibility policy
         if: always() && steps.api-inputs.outputs.run == 'true'
@@ -692,38 +894,7 @@ jobs:
         if: steps.api-inputs.outputs.run == 'true'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
-          ### Core Rust API item diff
-
-          Core library diffs are report-only because these crates are implementation details whose compatibility requires maintainer judgment. Tool, compiler, and workflow failures remain blocking.
-          EOF
-
-          packages=$(cargo metadata --locked --format-version 1 --no-deps \
-            | jq -r '.packages[]
-              | select(.publish == null)
-              | select(any(.targets[]; any(.kind[]; . == "lib")))
-              | [.name, .manifest_path] | @tsv')
-
-          while IFS=$'\t' read -r package manifest_path; do
-            # A crate introduced by this PR has no manifest at the base SHA;
-            # cargo-public-api cannot diff against a baseline where the
-            # package does not exist, and the entire API is additive anyway.
-            rel_manifest="${manifest_path#"$GITHUB_WORKSPACE/"}"
-            if ! git cat-file -e "$BASE_SHA:$rel_manifest" 2>/dev/null; then
-              echo "$package is new in this PR (no baseline at $BASE_SHA); skipping diff."
-              continue
-            fi
-            echo "::group::cargo public-api $package"
-            cargo +nightly-2026-06-29 public-api \
-              --package "$package" \
-              --all-features \
-              -ss \
-              diff \
-              --force \
-              "$BASE_SHA..HEAD"
-            echo "::endgroup::"
-          done <<< "$packages"
+        run: scripts/ci/report-public-rust-api-diff.sh
 
   gateway-openapi-contract:
     name: Gateway OpenAPI contract
@@ -794,39 +965,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           OPENAPI_CONTRACT_CHANGE: ${{ steps.openapi-contract-change.outputs.found }}
-        run: |
-          mkdir -p /tmp/astrid-openapi
-          cp crates/astrid-gateway/examples/print-openapi.rs /tmp/astrid-openapi/print-openapi.rs
-          cp Cargo.lock /tmp/astrid-openapi/Cargo.lock
-
-          generate_spec() {
-            local ref="$1"
-            local out="$2"
-
-            git reset --hard
-            git clean -fd -e .openapi-target
-            git checkout "$ref"
-            mkdir -p crates/astrid-gateway/examples
-            cp /tmp/astrid-openapi/print-openapi.rs crates/astrid-gateway/examples/print-openapi.rs
-            if [ ! -f Cargo.lock ]; then
-              cp /tmp/astrid-openapi/Cargo.lock Cargo.lock
-            fi
-
-            cargo run --locked -p astrid-gateway --example print-openapi > "$out"
-          }
-
-          generate_spec "$BASE_SHA" /tmp/astrid-openapi/base.json
-          generate_spec "$HEAD_SHA" /tmp/astrid-openapi/head.json
-
-          if diff -u /tmp/astrid-openapi/base.json /tmp/astrid-openapi/head.json; then
-            exit 0
-          fi
-          if [ "$OPENAPI_CONTRACT_CHANGE" = "true" ]; then
-            echo "OpenAPI contract changed and was acknowledged by commit marker."
-            exit 0
-          fi
-          echo "::error::OpenAPI contract changed without an API-CONTRACT-CHANGE: marker in a commit message."
-          exit 1
+        run: scripts/ci/diff-gateway-openapi.sh
 
   audit:
     name: Security Audit

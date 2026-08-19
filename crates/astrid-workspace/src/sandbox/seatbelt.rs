@@ -414,7 +414,9 @@ mod tests {
             const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
             let mut child = self.spawn()?;
-            let deadline = Instant::now() + TIMEOUT;
+            let deadline = Instant::now()
+                .checked_add(TIMEOUT)
+                .expect("bounded test timeout fits Instant");
             loop {
                 if let Some(status) = child.try_wait()? {
                     return Ok(Some(status));

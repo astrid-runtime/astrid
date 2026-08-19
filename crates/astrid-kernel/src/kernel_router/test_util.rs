@@ -14,6 +14,10 @@ pub(crate) fn all_kernel_request_variants() -> Vec<KernelRequest> {
         KernelRequest::InstallCapsule {
             source: "x".into(),
             workspace: false,
+            target_principal: None,
+            provenance: None,
+            authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
+            env: Vec::new(),
         },
         KernelRequest::ListCapsules,
         KernelRequest::GetCommands,
@@ -70,6 +74,21 @@ fn identity_and_policy_variants(principal: &PrincipalId) -> Vec<AdminRequestKind
         },
         AdminRequestKind::UsageGet {
             principal: principal.clone(),
+        },
+        AdminRequestKind::DistroLockGet {
+            principal: principal.clone(),
+        },
+        AdminRequestKind::DistroLockSet {
+            principal: principal.clone(),
+            lock: astrid_core::kernel_api::DistroProvenance {
+                schema_version: 1,
+                distro_id: "test".into(),
+                distro_version: "1.0.0".into(),
+                resolved_at: "2026-01-01T00:00:00Z".into(),
+                capsules: Vec::new(),
+                manifest_hash: None,
+            },
+            expected_hash: None,
         },
         AdminRequestKind::GroupCreate {
             name: "group".into(),

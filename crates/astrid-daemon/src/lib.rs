@@ -10,11 +10,15 @@
 #![deny(unreachable_pub)]
 #![deny(clippy::unwrap_used)]
 
-use anyhow::{Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
 use clap::Parser;
 
+#[cfg(unix)]
 mod signal;
 
+#[cfg(unix)]
 const DAEMON_LOG_TARGET_ENV: &str = "ASTRID_DAEMON_LOG_TARGET";
 
 /// Astrid Daemon - Background kernel process
@@ -70,6 +74,7 @@ fn parse_nonzero_concurrency(s: &str) -> Result<usize, String> {
     }
 }
 
+#[cfg(unix)]
 fn daemon_log_config(
     verbose: bool,
     unified_cfg: Option<&astrid_config::Config>,
@@ -106,23 +111,31 @@ fn daemon_log_config(
     Ok(log_config)
 }
 
-fn init_logging(
-    verbose: bool,
-    unified_cfg: Option<&astrid_config::Config>,
-    astrid_home: &astrid_core::dirs::AstridHome,
-    target_override: Option<&std::ffi::OsStr>,
-) -> Result<()> {
-    let log_config = daemon_log_config(verbose, unified_cfg, astrid_home, target_override)?;
-
-    if let Err(e) = astrid_telemetry::setup_logging(&log_config) {
+#[cfg(unix)]
+fn init_logging(log_config: &astrid_telemetry::LogConfig) {
+    if let Err(e) = astrid_telemetry::setup_logging(log_config) {
         eprintln!("Failed to initialize logging: {e}");
     }
-    Ok(())
+}
+
+#[cfg(unix)]
+fn defer_file_logging_until_kernel_admission(
+    astrid_home: &astrid_core::dirs::AstridHome,
+    log_config: &astrid_telemetry::LogConfig,
+) -> Result<bool> {
+    Ok(
+        matches!(log_config.target, astrid_telemetry::LogTarget::File(_))
+            && astrid_home
+                .layout_version()
+                .context("failed to inspect Astrid home layout before logging")?
+                .is_none(),
+    )
 }
 
 /// Resolve the capsule host-call concurrency ceilings from CLI flags, the
 /// loaded config (which already folded in `ASTRID_CAPSULE_*` env), and the
 /// host-derived defaults. Precedence: CLI flag > config file > env > host.
+#[cfg(unix)]
 fn resolve_capsule_limits(
     args: &Args,
     cfg: Option<&astrid_config::Config>,
@@ -148,6 +161,7 @@ fn resolve_capsule_limits(
 /// `HttpSection::default`, which equals the host's historical hardcoded
 /// constants — so this resolution changes nothing unless the operator set
 /// explicit `[http]` values.
+#[cfg(unix)]
 fn resolve_http_limits(cfg: Option<&astrid_config::Config>) -> astrid_capsule::HttpLimits {
     let http = cfg.map(|c| c.http.clone()).unwrap_or_default();
     astrid_capsule::HttpLimits::from_config_values(
@@ -161,6 +175,7 @@ fn resolve_http_limits(cfg: Option<&astrid_config::Config>) -> astrid_capsule::H
     )
 }
 
+#[cfg(unix)]
 fn write_readiness_then_arm_ephemeral<T, E>(
     ephemeral: bool,
     write_readiness: impl FnOnce() -> Result<T, E>,
@@ -182,6 +197,7 @@ fn write_readiness_then_arm_ephemeral<T, E>(
 ///
 /// Returns an error if the kernel fails to boot, the native local uplink cannot
 /// claim its listener, or the readiness file cannot be written.
+#[cfg(unix)]
 #[expect(
     clippy::too_many_lines,
     reason = "boot sequence: sequential config resolution + kernel/capsule setup that does not benefit from splitting"
@@ -214,12 +230,16 @@ pub async fn run() -> Result<()> {
     .map(|r| r.config);
 
     let daemon_log_target = std::env::var_os(DAEMON_LOG_TARGET_ENV);
-    init_logging(
+    let log_config = daemon_log_config(
         args.verbose,
         unified_cfg.as_ref(),
         &astrid_home,
         daemon_log_target.as_deref(),
     )?;
+    let defer_logging = defer_file_logging_until_kernel_admission(&astrid_home, &log_config)?;
+    if !defer_logging {
+        init_logging(&log_config);
+    }
 
     let session_id = astrid_core::SessionId::from_uuid(
         uuid::Uuid::parse_str(&args.session)
@@ -252,6 +272,9 @@ pub async fn run() -> Result<()> {
     )
     .await
     .map_err(|e| anyhow::anyhow!("Failed to boot Kernel: {e}"))?;
+    if defer_logging {
+        init_logging(&log_config);
+    }
     kernel
         .set_system_capsules(
             unified_cfg
@@ -287,18 +310,40 @@ pub async fn run() -> Result<()> {
     // wait on every agent's capsule view.
     kernel.load_boot_capsules().await;
 
-    // Refresh the daemon-canonical contracts baseline (#1165). The daemon is
-    // authoritative for `wit/astrid-contracts.wit`: rewrite it from the
-    // daemon's own system fleet so an already-installed fleet gets
-    // contracts-skew visibility immediately at boot — no install required and
-    // no dependence on which capsule installed first. Best-effort: a failure
-    // only degrades warn-only skew reporting, it must never break boot.
-    if let Err(e) = astrid_capsule_install::refresh_canonical_contracts(&astrid_home) {
-        tracing::warn!(
-            error = %format!("{e:#}"),
-            "failed to refresh canonical astrid-contracts.wit at boot; \
-             contracts skew checks may lack a current baseline"
-        );
+    // Refresh the daemon-canonical contracts baseline (#1165) from the
+    // authenticated UID-owned package registry. The extracted native cache is
+    // disposable and cannot supply authority. Best-effort: a failure only
+    // degrades warn-only skew reporting, it must never break boot.
+    let install_principal = astrid_capsule_install::paths::install_principal();
+    match (
+        kernel.principal_store(),
+        kernel.principal_directory().uid_for(&install_principal),
+    ) {
+        (Some(store), Ok(owner)) => {
+            if let Err(error) = astrid_capsule_install::refresh_canonical_contracts_from_registry(
+                &astrid_home,
+                store,
+                owner,
+            ) {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "failed to refresh canonical astrid-contracts.wit from durable registry; \
+                     contracts skew checks may lack a current baseline"
+                );
+            }
+        },
+        (None, _) => {
+            tracing::warn!(
+                "durable principal store unavailable; canonical astrid-contracts.wit was not refreshed"
+            );
+        },
+        (_, Err(error)) => {
+            tracing::warn!(
+                error = %error,
+                principal = %install_principal,
+                "install principal is not admitted; canonical astrid-contracts.wit was not refreshed"
+            );
+        },
     }
 
     // Signal readiness AFTER the default CLI/system view is loaded and
@@ -405,8 +450,27 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+/// Report that native daemon startup is unavailable on this platform.
+///
+/// The Windows filesystem and local-transport substrates compile and test
+/// independently, but daemon composition still requires the Unix socket
+/// listener and readiness-file implementation.
+///
+/// # Errors
+///
+/// Always returns an explicit unsupported-platform error.
+#[cfg(not(unix))]
+#[expect(
+    clippy::unused_async,
+    reason = "the cross-platform daemon entry point remains async even when startup is unsupported"
+)]
+pub async fn run() -> Result<()> {
+    anyhow::bail!("native Astrid daemon startup is not yet supported on this platform")
+}
+
 /// Load `etc/gateway-http.toml`. Returns `Ok(None)` when the file
 /// doesn't exist (single-tenant default).
+#[cfg(unix)]
 async fn load_gateway_config() -> Result<Option<astrid_gateway::GatewayConfig>> {
     let home = astrid_core::dirs::AstridHome::resolve()
         .map_err(|e| anyhow::anyhow!("resolve AstridHome: {e}"))?;
@@ -422,6 +486,7 @@ async fn load_gateway_config() -> Result<Option<astrid_gateway::GatewayConfig>> 
     Ok(Some(cfg))
 }
 
+#[cfg(unix)]
 fn spawn_gateway(
     cfg: astrid_gateway::GatewayConfig,
     kernel: &std::sync::Arc<astrid_kernel::Kernel>,
@@ -444,12 +509,14 @@ fn spawn_gateway(
     let audit_log = std::sync::Arc::clone(&kernel.audit_log);
     let session_id = kernel.session_id.clone();
     let capability_kernel = std::sync::Arc::clone(kernel);
+    let storage_kv = std::sync::Arc::clone(&kernel.kv);
     let readiness_probe = kernel.agent_readiness_probe();
     let topic_probe = kernel.capsule_topic_probe_with_warm();
     let workspace_root = kernel.workspace_root.clone();
     let workspace_layout = kernel.workspace_layout().clone();
     let state = astrid_gateway::GatewayState::new(
         cfg,
+        Some(storage_kv),
         Some(bus),
         Some(audit_log),
         Some(session_id),
@@ -483,9 +550,12 @@ fn spawn_gateway(
     Ok(notify)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
-    use super::{DAEMON_LOG_TARGET_ENV, daemon_log_config, write_readiness_then_arm_ephemeral};
+    use super::{
+        DAEMON_LOG_TARGET_ENV, daemon_log_config, defer_file_logging_until_kernel_admission,
+        write_readiness_then_arm_ephemeral,
+    };
     use std::sync::Mutex;
 
     #[test]
@@ -539,6 +609,37 @@ mod tests {
                 "{DAEMON_LOG_TARGET_ENV} must be exactly 'file' or 'stderr'"
             )),
             "unexpected target error: {error}"
+        );
+    }
+
+    #[test]
+    fn fresh_home_defers_file_logging_until_kernel_admission() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "astrid-daemon-fresh-home-{}-{unique}",
+            std::process::id()
+        ));
+        assert!(!root.exists(), "test path must start absent");
+        let home = astrid_core::dirs::AstridHome::from_path(&root);
+        let file_config = daemon_log_config(false, None, &home, None).expect("file config");
+        let stderr_config =
+            daemon_log_config(false, None, &home, Some(std::ffi::OsStr::new("stderr")))
+                .expect("stderr config");
+
+        assert!(
+            defer_file_logging_until_kernel_admission(&home, &file_config)
+                .expect("fresh layout inspection")
+        );
+        assert!(
+            !defer_file_logging_until_kernel_admission(&home, &stderr_config)
+                .expect("fresh layout inspection")
+        );
+        assert!(
+            !root.exists(),
+            "logging selection must not create content before kernel admission"
         );
     }
 

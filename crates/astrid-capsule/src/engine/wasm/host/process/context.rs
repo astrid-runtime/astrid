@@ -13,12 +13,17 @@ pub(super) struct PreparedSpawnContext {
     pub(super) write_paths: Vec<PathBuf>,
 }
 
-/// Resolve the guest-controlled context after filesystem policy approves the
-/// requested `home://` paths. The spawned child receives their physical paths;
-/// no physical path is added to the process host-call response.
-pub(super) fn prepare_spawn_context(
+/// Prepare a process context against kernel-issued native projection roots.
+///
+/// `workspace_root` and `home_root` are private provider mountpoints. When
+/// omitted, the legacy hosted-portal path policy is used. Pathless Astrid
+/// mounts must pass both roots so no host directory is inferred from config.
+pub(super) fn prepare_spawn_context_with_roots(
     state: &HostState,
     request: &SpawnRequest,
+    workspace_root_override: Option<&Path>,
+    home_root_override: Option<&Path>,
+    shared_root_override: Option<&Path>,
 ) -> Result<PreparedSpawnContext, ErrorCode> {
     const PASSTHROUGH: &[&str] = &["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ"];
     const MAX_ENV_VARS: usize = 256;
@@ -50,9 +55,14 @@ pub(super) fn prepare_spawn_context(
         }
 
         let value = if key == "HOME" && item.value.starts_with("home://") {
-            let physical = super::super::fs::authorize_process_read_path(state, &item.value)
-                .map_err(map_fs_path_error)?;
-            add_home_process_paths(state, &physical, &mut read_paths, &mut write_paths)?;
+            let physical = resolve_home_path(state, &item.value, home_root_override)?;
+            add_home_process_paths(
+                state,
+                &physical,
+                home_root_override,
+                &mut read_paths,
+                &mut write_paths,
+            )?;
             physical.to_string_lossy().into_owned()
         } else {
             item.value.clone()
@@ -62,13 +72,32 @@ pub(super) fn prepare_spawn_context(
 
     let cwd = match request.cwd.as_deref() {
         Some(path) if path.starts_with("home://") => {
-            let physical = super::super::fs::authorize_process_read_path(state, path)
-                .map_err(map_fs_path_error)?;
-            add_home_process_paths(state, &physical, &mut read_paths, &mut write_paths)?;
+            let physical = resolve_home_path(state, path, home_root_override)?;
+            add_home_process_paths(
+                state,
+                &physical,
+                home_root_override,
+                &mut read_paths,
+                &mut write_paths,
+            )?;
             physical
         },
-        Some(path) => resolve_workspace_cwd(&state.workspace_root, path)?,
-        None => state.workspace_root.clone(),
+        Some(path) if path.starts_with("shared://") => {
+            let Some(shared_root) = shared_root_override else {
+                return Err(ErrorCode::CapabilityDenied);
+            };
+            let physical = resolve_shared_override(shared_root, path)?;
+            read_paths.push(shared_root.to_path_buf());
+            write_paths.push(shared_root.to_path_buf());
+            physical
+        },
+        Some(path) => resolve_workspace_cwd(
+            workspace_root_override.unwrap_or(&state.workspace_root),
+            path,
+        )?,
+        None => workspace_root_override
+            .unwrap_or(&state.workspace_root)
+            .to_path_buf(),
     };
 
     read_paths.sort();
@@ -86,10 +115,25 @@ pub(super) fn prepare_spawn_context(
 fn add_home_process_paths(
     state: &HostState,
     requested: &Path,
+    home_root_override: Option<&Path>,
     read_paths: &mut Vec<PathBuf>,
     write_paths: &mut Vec<PathBuf>,
 ) -> Result<(), ErrorCode> {
     read_paths.push(requested.to_path_buf());
+    if let Some(home_root) = home_root_override {
+        let root = home_root
+            .canonicalize()
+            .unwrap_or_else(|_| home_root.to_path_buf());
+        if !requested.starts_with(&root) {
+            return Err(ErrorCode::BoundaryEscape);
+        }
+        // The private provider mount is already owner/branch-authorized by the
+        // kernel lease. Grant the child the whole mounted home subtree; the
+        // sandbox still confines it to this exact native root.
+        read_paths.push(root.clone());
+        write_paths.push(root);
+        return Ok(());
+    }
     let Some(home) = state.effective_home_root_buf() else {
         return Err(ErrorCode::CapabilityDenied);
     };
@@ -106,6 +150,34 @@ fn add_home_process_paths(
         write_paths.push(path);
     }
     Ok(())
+}
+
+fn resolve_home_path(
+    state: &HostState,
+    requested: &str,
+    home_root_override: Option<&Path>,
+) -> Result<PathBuf, ErrorCode> {
+    if let Some(root) = home_root_override {
+        return resolve_storage_home_override(root, requested);
+    }
+    super::super::fs::authorize_process_read_path(state, requested).map_err(map_fs_path_error)
+}
+
+/// Resolve a logical `home://` path against the provider's fixed owner-home
+/// subtree mountpoint. The lease target already selects the `home` subtree, so
+/// the mountpoint itself is the logical root; no second `home/` component may
+/// be introduced by the process adapter.
+fn resolve_storage_home_override(root: &Path, requested: &str) -> Result<PathBuf, ErrorCode> {
+    let relative = requested.strip_prefix("home://").unwrap_or_default();
+    resolve_workspace_cwd(root, relative)
+}
+
+/// Resolve a logical `shared://` path against the explicitly authorized Fleet
+/// shared-subtree mountpoint. Like the private HOME projection, this target is
+/// fixed before provider launch and the mountpoint itself is the logical root.
+fn resolve_shared_override(root: &Path, requested: &str) -> Result<PathBuf, ErrorCode> {
+    let relative = requested.strip_prefix("shared://").unwrap_or_default();
+    resolve_workspace_cwd(root, relative)
 }
 
 fn map_fs_path_error(
@@ -227,5 +299,27 @@ mod tests {
             resolve_workspace_cwd(&workspace, "escape"),
             Err(ErrorCode::BoundaryEscape)
         ));
+    }
+
+    #[test]
+    fn storage_home_override_uses_mountpoint_as_logical_root() {
+        let root = tempfile::tempdir().expect("root");
+        std::fs::write(root.path().join("file"), b"home").expect("file");
+
+        let resolved = resolve_storage_home_override(root.path(), "home://file")
+            .expect("home path resolves inside the fixed subtree mount");
+        assert_eq!(resolved, root.path().canonicalize().unwrap().join("file"));
+        assert!(!resolved.starts_with(root.path().join("home")));
+    }
+
+    #[test]
+    fn fleet_shared_override_uses_mountpoint_as_logical_root() {
+        let root = tempfile::tempdir().expect("root");
+        std::fs::write(root.path().join("cookie"), b"shared").expect("cookie");
+
+        let resolved = resolve_shared_override(root.path(), "shared://cookie")
+            .expect("shared path resolves inside the fixed Fleet subtree mount");
+        assert_eq!(resolved, root.path().canonicalize().unwrap().join("cookie"));
+        assert!(!resolved.starts_with(root.path().join("shared")));
     }
 }

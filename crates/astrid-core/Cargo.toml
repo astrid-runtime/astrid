@@ -38,6 +38,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 [target.'cfg(target_family = "wasm")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }
 
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+fs2 = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 tokio = { workspace = true, features = ["net"] }

@@ -107,21 +107,12 @@ pub(super) fn finish_install(
 
     if !batch {
         if prompt.yes {
-            write_headless_env_fields(
-                &manifest.env,
-                &output.env_path,
-                capsule_id.as_str(),
-                home,
-                principal,
-                &prompt.vars,
-            )?;
+            write_headless_env_fields(&manifest.env, capsule_id.as_str(), principal, &prompt.vars)?;
         } else if output.env_needs_prompt {
             prompt_env_fields(
                 &manifest.env,
-                &output.env_path,
                 capsule_id.as_str(),
                 &home.config_path(),
-                home,
                 principal,
             )?;
         }

@@ -16,7 +16,8 @@ use crate::commands::{
     completions::CompletionsArgs, doctor::DoctorArgs, gc::GcArgs, group::GroupCommand,
     invite::InviteCommand, keypair::KeypairCommand, logs::LogsArgs, pair_device::PairDeviceCommand,
     ps::PsArgs, quota::QuotaCommand, run::RunArgs, secret::SecretCommand, setup::SetupArgs,
-    top::TopArgs, trust::TrustCommand, version::VersionArgs, voucher::VoucherCommand, who::WhoArgs,
+    storage::StorageCommand, top::TopArgs, trust::TrustCommand, version::VersionArgs,
+    voucher::VoucherCommand, who::WhoArgs,
 };
 
 /// Astrid - Secure Agent Runtime
@@ -184,7 +185,7 @@ pub(crate) enum Commands {
         command: TrustCommand,
     },
 
-    /// Audit trail inspection (deferred — see #675).
+    /// Inspect system audit accounting, ingestion health, and retention.
     Audit(AuditArgs),
 
     /// Per-agent budget allocation and accounting (deferred — see #653/#656).
@@ -292,6 +293,12 @@ pub(crate) enum Commands {
 
     /// Restart the Astrid daemon (graceful stop + start).
     Restart,
+
+    /// Mount and manage admitted filesystem views.
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommand,
+    },
 
     /// Tail kernel or per-capsule logs.
     Logs(LogsArgs),

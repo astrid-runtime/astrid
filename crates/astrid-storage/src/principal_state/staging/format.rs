@@ -13,7 +13,7 @@ use crate::error::StorageResult;
 use crate::principal_state::native_io::{
     PrivateFileIdentity, open_private_file, validate_private_regular_file,
 };
-use crate::principal_state::{StateOwner, StateOwnerCodecV1};
+use crate::principal_state::{StateOwner, StateOwnerCodecV2};
 
 const INTENT_MAGIC: &[u8; 16] = b"ASTRID-STAGE-V2\0";
 const INTENT_VERSION: u16 = 2;
@@ -57,7 +57,7 @@ pub(super) struct LegacyStagingIntent {
 }
 
 pub(super) fn encode_intent(intent: &StagingIntent) -> StorageResult<Vec<u8>> {
-    let owner = StateOwnerCodecV1.encode(&intent.owner);
+    let owner = StateOwnerCodecV2.encode(&intent.owner);
     encode_fields(
         INTENT_MAGIC,
         INTENT_VERSION,
@@ -333,7 +333,7 @@ pub(super) fn decode_intent(bytes: &[u8]) -> Result<StagingIntent, &'static str>
         "astrid native content staging intent v2",
         true,
     )?;
-    let owner = StateOwnerCodecV1
+    let owner = StateOwnerCodecV2
         .decode(&fields.owner)
         .ok_or("invalid staged owner")?;
     Ok(StagingIntent {

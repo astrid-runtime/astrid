@@ -296,9 +296,9 @@ impl RepresentationStore {
         Ok(activation::direct_profile(frozen_specification)?.1)
     }
 
-    pub(super) fn rebase_compacted_arena<I: PersistentObjectIdentity>(
+    pub(super) fn rebase_compacted_arena<I: PersistentObjectIdentity, F: super::DurableIo>(
         &mut self,
-        arena: &File,
+        arena: &F,
         index: &BTreeMap<ObjectId, ArenaLocation>,
         identity: &I,
         limits: RecoveryLimits,

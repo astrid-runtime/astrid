@@ -40,6 +40,9 @@ pub struct ManagedProcess {
     /// drop — no logic needed in `ManagedProcess::Drop`.
     #[allow(dead_code)] // Held purely for its Drop; never read after spawn.
     pub(super) injection_guard: Option<super::inject::InjectionGuard>,
+    /// Kernel-issued native storage projection, kept until child teardown.
+    #[allow(dead_code)]
+    pub(super) process_storage_mount: Option<crate::context::ProcessStorageMount>,
 }
 
 /// Synchronously kill a child process group on Unix and start the kill

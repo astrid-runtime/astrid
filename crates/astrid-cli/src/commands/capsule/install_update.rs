@@ -1,4 +1,4 @@
-//! `astrid capsule update` and post-update Distro.lock regeneration.
+//! `astrid capsule update` and post-update daemon distro-provenance refresh.
 //!
 //! Update flow: read every installed capsule's recorded `source`,
 //! ask the source's host (GitHub releases today) for the latest
@@ -6,9 +6,9 @@
 //! reinstall when strictly newer. Local-path sources are reported as
 //! "skipped" rather than treated as errors.
 //!
-//! `regenerate_distro_lock` re-emits `Distro.lock` from the current
-//! on-disk state after a successful update batch so the lockfile
-//! never drifts from reality.
+//! `regenerate_distro_lock` re-emits the authenticated daemon-owned distro
+//! record from the current installed state after a successful update batch so
+//! provenance never drifts from reality.
 
 use anyhow::{Context, bail};
 use astrid_capsule_install::github_source::{parse_github_source, strip_version_prefix};
@@ -16,6 +16,7 @@ use astrid_capsule_install::{
     CapsuleLocation, InstalledCapsule, scan_installed_capsules_in_home_for_with_layout,
 };
 use astrid_core::dirs::AstridHome;
+use astrid_core::kernel_api::{CapsuleMetadataEntry, KernelRequest, KernelResponse};
 
 use super::install::install_capsule_with_options;
 use super::meta::{CapsuleMeta, read_meta};
@@ -120,6 +121,10 @@ pub(crate) async fn update_capsule(
     let home = AstridHome::resolve()?;
     let principal = crate::principal::current();
 
+    if !workspace {
+        return update_daemon_capsules(target, &principal, approve_untrusted).await;
+    }
+
     if let Some(name) = target {
         let target_dir = astrid_capsule_install::resolve_target_dir_for_with_layout(
             &home,
@@ -163,6 +168,126 @@ pub(crate) async fn update_capsule(
     } else {
         update_all_capsules(&home, &principal, workspace, approve_untrusted).await
     }
+}
+
+async fn daemon_capsule_metadata() -> anyhow::Result<Vec<CapsuleMetadataEntry>> {
+    let mut client = crate::socket_client::connect_kernel_for_workspace(None).await?;
+    match client.request(KernelRequest::GetCapsuleMetadata).await? {
+        KernelResponse::CapsuleMetadata(entries) => Ok(entries),
+        KernelResponse::Error(message) => {
+            bail!("daemon rejected capsule metadata request: {message}")
+        },
+        other => bail!("unexpected daemon response: {other:?}"),
+    }
+}
+
+async fn update_daemon_capsules(
+    target: Option<&str>,
+    principal: &astrid_core::PrincipalId,
+    approve_untrusted: bool,
+) -> anyhow::Result<()> {
+    let entries = daemon_capsule_metadata().await?;
+    if let Some(name) = target {
+        let entry = entries
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| anyhow::anyhow!("Capsule '{name}' is not installed."))?;
+        let Some(source) = entry.update_source else {
+            eprintln!(
+                "Capsule '{name}' has no remotely updateable source; its durable package is unchanged."
+            );
+            return Ok(());
+        };
+        eprintln!("Updating {name} from {source}...");
+        install_capsule_with_options(&source, Some(name), false, false, approve_untrusted, &[])
+            .await?;
+        regenerate_distro_lock(principal).await
+    } else {
+        update_all_daemon_capsules(entries, principal, approve_untrusted).await
+    }
+}
+
+async fn update_all_daemon_capsules(
+    entries: Vec<CapsuleMetadataEntry>,
+    principal: &astrid_core::PrincipalId,
+    approve_untrusted: bool,
+) -> anyhow::Result<()> {
+    if entries.is_empty() {
+        eprintln!("No capsules installed.");
+        return Ok(());
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent("astrid-cli")
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    eprintln!(
+        "Checking {} installed capsule(s) for updates...",
+        entries.len()
+    );
+
+    let mut to_update = Vec::new();
+    let mut up_to_date = 0u32;
+    let mut check_failed = 0u32;
+    let mut skipped = 0u32;
+    for entry in entries {
+        let Some(source) = entry.update_source else {
+            eprintln!("  {}: skipped (no remote source recorded)", entry.name);
+            skipped = skipped.saturating_add(1);
+            continue;
+        };
+        match check_remote_version(&client, &source, &entry.version).await {
+            UpdateCheck::Available { latest } => {
+                eprintln!(
+                    "  {}: {} -> {latest} (update available)",
+                    entry.name, entry.version
+                );
+                to_update.push((entry.name, source));
+            },
+            UpdateCheck::UpToDate { latest } => {
+                eprintln!(
+                    "  {}: {} (up to date, latest: {latest})",
+                    entry.name, entry.version
+                );
+                up_to_date = up_to_date.saturating_add(1);
+            },
+            UpdateCheck::Failed { reason } => {
+                eprintln!(
+                    "  {}: {} (check failed: {reason})",
+                    entry.name, entry.version
+                );
+                check_failed = check_failed.saturating_add(1);
+            },
+            UpdateCheck::Skipped { reason } => {
+                eprintln!("  {}: skipped ({reason})", entry.name);
+                skipped = skipped.saturating_add(1);
+            },
+        }
+    }
+
+    let mut updated = 0u32;
+    let mut install_failed = 0u32;
+    for (name, source) in &to_update {
+        eprintln!("Updating {name} from {source}...");
+        if let Err(error) =
+            install_capsule_with_options(source, Some(name), false, false, approve_untrusted, &[])
+                .await
+        {
+            eprintln!("  Failed to update {name}: {error}");
+            install_failed = install_failed.saturating_add(1);
+        } else {
+            updated = updated.saturating_add(1);
+        }
+    }
+
+    eprintln!(
+        "Done: {updated} updated, {up_to_date} up-to-date, {check_failed} check-failed, \
+         {skipped} skipped, {install_failed} install-failed."
+    );
+    if updated > 0 {
+        regenerate_distro_lock(principal).await?;
+    }
+    Ok(())
 }
 
 /// Check all installed capsules for updates and install those with newer versions.
@@ -265,7 +390,7 @@ async fn update_all_capsules(
     );
 
     if updated > 0 {
-        regenerate_distro_lock(home, principal)?;
+        regenerate_distro_lock(principal).await?;
     }
 
     Ok(())
@@ -283,60 +408,36 @@ fn filter_update_scope(capsules: Vec<InstalledCapsule>, workspace: bool) -> Vec<
         .collect()
 }
 
-/// Regenerate the Distro.lock from currently installed capsules.
+/// Regenerate the daemon-owned distro provenance from currently installed capsules.
 ///
-/// Scans all installed capsules, reads their `meta.json`, and writes
-/// a new lockfile with current versions and BLAKE3 hashes. Called
-/// after `update` to keep the lock in sync.
-fn regenerate_distro_lock(
-    home: &AstridHome,
-    principal: &astrid_core::PrincipalId,
-) -> anyhow::Result<()> {
-    use crate::commands::distro::lock::{DistroLock, DistroLockMeta, LockedCapsule, write_lock};
+/// Reads the authenticated daemon registry and writes a new record with
+/// current versions and BLAKE3 hashes. Native install paths never participate.
+async fn regenerate_distro_lock(principal: &astrid_core::PrincipalId) -> anyhow::Result<()> {
+    use crate::commands::distro::lock::{
+        DistroLock, DistroLockMeta, LockedCapsule, load_lock_from_daemon, write_lock_to_daemon,
+    };
 
-    let lock_path = home
-        .principal_home(principal)
-        .config_dir()
-        .join("distro.lock");
-
-    let Some(existing) = crate::commands::distro::lock::load_lock(&lock_path)? else {
+    let Some(existing) = load_lock_from_daemon(principal).await? else {
         return Ok(());
     };
 
-    let all = scan_installed_capsules_in_home_for_with_layout(
-        home,
-        principal,
-        crate::workspace_layout::current(),
-    )?;
-    let capsules: Vec<LockedCapsule> = all
+    let prior_refs: std::collections::HashMap<_, _> = existing
+        .capsules
         .iter()
-        .map(|c| {
-            let (version, source, hash) = c.meta.as_ref().map_or_else(
-                || {
-                    eprintln!(
-                        "  Warning: {} has no meta.json, locked with empty version",
-                        c.name,
-                    );
-                    (String::new(), String::new(), String::new())
-                },
-                |meta| {
-                    (
-                        meta.version.clone(),
-                        meta.source.clone().unwrap_or_default(),
-                        meta.wasm_hash
-                            .as_ref()
-                            .map(|h| format!("blake3:{h}"))
-                            .unwrap_or_default(),
-                    )
-                },
-            );
-            LockedCapsule {
-                name: c.name.clone(),
-                version,
-                source,
-                hash,
-                resolved_ref: c.meta.as_ref().and_then(|m| m.resolved_ref.clone()),
-            }
+        .map(|capsule| (capsule.name.clone(), capsule.resolved_ref.clone()))
+        .collect();
+    let capsules: Vec<LockedCapsule> = daemon_capsule_metadata()
+        .await?
+        .into_iter()
+        .map(|entry| LockedCapsule {
+            resolved_ref: prior_refs.get(&entry.name).cloned().flatten(),
+            name: entry.name,
+            version: entry.version,
+            source: entry.update_source.unwrap_or_default(),
+            hash: entry
+                .wasm_hash
+                .map(|hash| format!("blake3:{hash}"))
+                .unwrap_or_default(),
         })
         .collect();
 
@@ -354,8 +455,8 @@ fn regenerate_distro_lock(
         manifest_hash: existing.manifest_hash,
     };
 
-    write_lock(&lock_path, &lock)?;
-    eprintln!("Distro.lock updated.");
+    write_lock_to_daemon(principal, &lock).await?;
+    eprintln!("Distro provenance updated in the daemon.");
     Ok(())
 }
 

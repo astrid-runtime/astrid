@@ -114,33 +114,60 @@ use crate::security::CapsuleSecurityGate;
 pub type PrincipalCancelTokens =
     Arc<std::sync::Mutex<HashMap<astrid_core::principal::PrincipalId, CancellationToken>>>;
 
-/// A principal-scoped filesystem mount: physical root, VFS, and capability handle.
+/// Location authority for a principal-scoped filesystem mount.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum PrincipalMountLocation {
+    /// Authoritative path-free AstridFilesystem namespace.
+    AstridFilesystem,
+    /// Ephemeral/native host directory (currently only the private `/tmp`
+    /// scratch projection; lifecycle `home://` never uses this location).
+    Native(PathBuf),
+}
+
+/// A principal-scoped filesystem mount: location, VFS, and capability handle.
 ///
-/// The three are bound together — the [`DirHandle`](astrid_capabilities::DirHandle)
-/// is confined to the specific [`Vfs`](astrid_vfs::Vfs) instance, and both are rooted
-/// at `root`. They must always be installed and cleared as a unit, so callers
-/// cannot accidentally pair an invocation-scoped VFS with a load-time handle
-/// (which would break capability confinement).
+/// The capability handle is confined to the specific [`Vfs`](astrid_vfs::Vfs)
+/// instance. AstridFilesystem mounts are logical and therefore carry no host
+/// path; native mounts carry their canonical path only for `/tmp`. The fields
+/// must always be installed and
+/// cleared as a unit, so callers cannot accidentally pair an
+/// invocation-scoped VFS with a load-time handle (which would break capability
+/// confinement).
 ///
-/// `Clone` so the Store pool can hand the same principal mount to each of a
-/// capsule's N pooled instances — all fields (`PathBuf`, `Arc<dyn Vfs>`,
-/// `DirHandle`) share or copy cheaply (issue #816).
+/// `Clone` lets the Store pool hand the same principal mount to each of a
+/// capsule's pooled instances; the VFS is shared and the capability handle is
+/// cheap to copy.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct PrincipalMount {
-    /// Canonical physical directory this mount is rooted at.
-    pub root: PathBuf,
-    /// VFS wrapping `root`. Direct [`HostVfs`](astrid_vfs::HostVfs) —
-    /// writes are permanent (no OverlayVfs CoW layer).
+    /// Authority location. AstridFilesystem mounts carry no host path.
+    pub location: PrincipalMountLocation,
+    /// VFS bound to the mount's capability handle. Native scratch mounts use
+    /// [`HostVfs`](astrid_vfs::HostVfs); durable home mounts use the
+    /// path-free AstridFilesystem adapter.
     pub vfs: Arc<dyn astrid_vfs::Vfs>,
     /// Capability handle that confines access to `root`.
     pub handle: astrid_capabilities::DirHandle,
 }
 
+/// Resolver for an invocation's authoritative workspace branch.
+///
+/// Shared/SystemResident runtimes use this to bind the authenticated caller
+/// to one durable branch without exposing a caller-selected owner or path.
+#[async_trait::async_trait]
+pub trait WorkspaceMountResolver: Send + Sync {
+    /// Resolve (or create) the caller's branch mount, or fail closed.
+    async fn resolve(
+        &self,
+        principal: &astrid_core::principal::PrincipalId,
+    ) -> Result<PrincipalMount, String>;
+}
+
 impl std::fmt::Debug for PrincipalMount {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrincipalMount")
-            .field("root", &self.root)
+            .field("location", &self.location)
             .field("handle", &self.handle)
             .finish_non_exhaustive()
     }
@@ -229,7 +256,8 @@ pub struct HostState {
     pub system_runtime: bool,
     /// The plugin this state belongs to.
     pub capsule_id: CapsuleId,
-    /// Per-capsule log file at `home/{principal}/.local/log/{capsule}.log`.
+    /// Per-capsule native operational log under
+    /// `log/principals/<immutable-uid>/<capsule>/<date>.log`.
     /// Capsule `astrid_log` output writes here instead of the system tracing
     /// subscriber. `None` if the log file couldn't be opened.
     pub capsule_log: Option<Arc<std::sync::Mutex<std::fs::File>>>,
@@ -267,11 +295,28 @@ pub struct HostState {
     pub vfs: Arc<dyn astrid_vfs::Vfs>,
     /// The root capability handle for the VFS.
     pub vfs_root_handle: astrid_capabilities::DirHandle,
-    /// Load-time principal home mount (`home://` paths). `None` if the
-    /// principal's home directory does not exist on disk.
+    /// Load-time canonical Astrid workspace branch for this runtime owner.
+    /// `None` is intentional for neutral SystemResident state.
+    pub workspace: Option<PrincipalMount>,
+    /// Resolver used to install an authenticated caller's branch on a shared
+    /// SystemResident runtime.
+    pub workspace_mount_resolver: Option<Arc<dyn WorkspaceMountResolver>>,
+    /// Kernel-owned native projection broker for spawned processes over
+    /// path-free Astrid storage. Hosted portals leave this unset.
+    #[cfg(not(target_family = "wasm"))]
+    pub process_storage_mount_broker: Option<Arc<dyn crate::context::ProcessStorageMountBroker>>,
+    /// Load-time principal home mount (`home://` paths), bound to the
+    /// principal's immutable storage UID. `None` when no durable identity is
+    /// admitted.
     pub home: Option<PrincipalMount>,
-    /// Load-time principal tmp mount (`/tmp/` paths, backed by
-    /// `~/.astrid/home/{principal}/.local/tmp/`). `None` if unavailable.
+    /// Live alias-to-UID directory used to bind invocation home views.
+    pub principal_directory: astrid_storage::PrincipalDirectory,
+    /// Authoritative store used to construct invocation home views.  This is
+    /// cloned into each pooled state so recv-path principal switches never
+    /// consult native principal-home directories.
+    pub principal_store: Option<astrid_storage::RuntimePrincipalStore>,
+    /// Load-time principal tmp mount (`/tmp/` paths), backed by private
+    /// runtime scratch keyed by immutable principal UID. `None` if unavailable.
     pub tmp: Option<PrincipalMount>,
     /// Load-time authority-scoped KV. Principal runtimes receive their owner's
     /// namespace; SystemResident runtimes receive an explicit system namespace.
@@ -295,6 +340,9 @@ pub struct HostState {
     /// principal differs from `self.principal`. When set, overrides `home`
     /// for scheme resolution and security gate checks. Cleared on exit.
     pub invocation_home: Option<PrincipalMount>,
+    /// Per-invocation authoritative workspace branch for the authenticated
+    /// caller. Cleared when the invocation returns to the pool.
+    pub invocation_workspace: Option<PrincipalMount>,
     /// Per-invocation tmp mount for the calling principal. Same lifecycle
     /// as `invocation_home`.
     pub invocation_tmp: Option<PrincipalMount>,
@@ -308,9 +356,8 @@ pub struct HostState {
     /// Per-invocation capsule log file scoped to the calling principal.
     ///
     /// Same lifecycle as [`invocation_secret_store`](Self::invocation_secret_store).
-    /// When set, `astrid_log` writes to the invoking principal's
-    /// `~/.astrid/home/{principal}/.local/log/{capsule}/{date}.log` instead
-    /// of the capsule owner's.
+    /// When set, `astrid_log` writes to the invoking principal's UID-scoped
+    /// native operational log instead of the capsule owner's.
     pub invocation_capsule_log: Option<Arc<std::sync::Mutex<std::fs::File>>>,
     /// Per-invocation quota profile for the invoking principal.
     ///
@@ -353,24 +400,10 @@ pub struct HostState {
     /// resolves through this handle. `None` in tests / single-tenant — the
     /// per-principal quota fields then fall back to the default profile.
     pub profile_cache: Option<Arc<crate::profile_cache::PrincipalProfileCache>>,
-    /// Per-invocation env overlay for the invoking principal.
-    ///
-    /// Loaded from
-    /// `$ASTRID_HOME/home/{principal}/.config/env/{capsule_id}.env.json`
-    /// when the dispatcher or recv path establishes a per-invocation context.
-    /// `get_config` checks this overlay before falling back to
-    /// [`config`](Self::config) (the manifest defaults loaded at
-    /// capsule boot).
-    ///
-    /// Without this overlay, the gateway's
-    /// `POST /api/capsules/{id}/env/{field}` route — which writes to
-    /// the per-principal path above — was effectively write-only for
-    /// already-loaded capsules: the capsule's `env::var(...)` reads still
-    /// returned the manifest's load-time default. Most visibly, an operator
-    /// setting
-    /// `base_url = http://localhost:1234` on the openai-compat
-    /// capsule for a gateway-minted bearer would see their LLM
-    /// request still hit `api.openai.com` (the manifest default).
+    /// Per-invocation env overlay for the invoking principal, loaded from the
+    /// host-only typed KV projection when a dispatcher or recv path establishes
+    /// a per-invocation context. `get_config` checks this overlay before the
+    /// manifest defaults in [`config`](Self::config).
     pub invocation_env_overlay: Option<HashMap<String, String>>,
     /// System Event Bus for IPC publish/subscribe.
     pub event_bus: astrid_events::EventBus,
@@ -391,10 +424,8 @@ pub struct HostState {
     /// in `Capsule.toml` whose `type` is not `"secret"` — base URLs,
     /// model names, log levels, etc.). Secret-typed keys are
     /// resolved live in [`crate::engine::wasm::host::sys`] through
-    /// `resolve_secret` (file-per-secret store, see
-    /// [`astrid_storage::FileSecretStore`]) instead of being preloaded
-    /// here, so plaintext secret material never sits in
-    /// `wasm_config`'s hot memory.
+    /// `resolve_secret` and the host-only typed SecretStore projection instead
+    /// of being preloaded here.
     pub config: HashMap<String, serde_json::Value>,
     /// Manifest-declared secret-typed env keys. Populated at load
     /// time from `manifest.env` entries with `type = "secret"`. Used
@@ -406,14 +437,9 @@ pub struct HostState {
     /// first and falls through to host-wide regardless of where the
     /// operator stored the value.
     pub secret_env: std::collections::HashSet<String>,
-    /// Injected root for file-per-secret env resolution.
-    ///
-    /// Lifecycle execution sets this from the caller-supplied [`AstridHome`]
-    /// rather than resolving process-global environment. Ordinary shared
-    /// runtimes leave it `None` and retain the existing environment-resolved
-    /// lookup until their load context carries the system home explicitly.
-    ///
-    /// [`AstridHome`]: astrid_core::dirs::AstridHome
+    /// Legacy secret-root context retained for migration compatibility.
+    /// Runtime secret lookup never reads this path; released homes must be
+    /// imported explicitly with [`astrid_storage::env::import_legacy_scope`].
     pub file_secret_root: Option<std::path::PathBuf>,
     /// IPC topic patterns this capsule is allowed to publish to.
     /// Empty means DENY ALL (fail-closed).

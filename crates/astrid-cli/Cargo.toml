@@ -39,7 +39,7 @@ blake3 = { workspace = true }
 astrid-events = { workspace = true }
 astrid-types = { workspace = true }
 astrid-daemon = { workspace = true }
-astrid-storage = { workspace = true, features = ["keychain"] }
+astrid-storage = { workspace = true }
 astrid-telemetry = { workspace = true, features = ["config"] }
 astrid-uplink = { workspace = true }
 base64 = { workspace = true }

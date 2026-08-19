@@ -437,8 +437,23 @@ mod tests {
 
         // Releasing the lock lets a fresh boot acquire it (no wedged restart).
         drop(first);
-        let _second = acquire_boot_singleton_lock(&home)
-            .expect("lock is re-acquirable after the holder exits");
+        let mut second = None;
+        for _ in 0..100 {
+            match acquire_boot_singleton_lock(&home) {
+                Ok(lock) => {
+                    second = Some(lock);
+                    break;
+                },
+                Err(error) if error.to_string().contains("already running") => {
+                    // Another test may be between fork and exec and briefly
+                    // retain this CLOEXEC descriptor. Wait for that bounded OS
+                    // transition; never bypass a lock that remains held.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                },
+                Err(error) => panic!("lock reacquisition failed unexpectedly: {error}"),
+            }
+        }
+        let _second = second.expect("lock remained held after the holder exited");
     }
 
     #[test]

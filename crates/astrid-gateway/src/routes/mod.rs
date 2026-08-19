@@ -586,6 +586,7 @@ mod tests {
     fn test_state() -> Arc<GatewayState> {
         Arc::new(GatewayState {
             config: crate::config::GatewayConfig::default(),
+            storage_kv: None,
             signing: SigningMaterial::fresh(),
             event_bus: None,
             distribution: Arc::new(crate::routes::distribution::DistributionInfo::single_tenant()),

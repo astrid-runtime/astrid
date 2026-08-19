@@ -6,19 +6,13 @@
 //! funcs**, so a capsule pinning a stale (or ahead-of-daemon) snapshot
 //! never fails at component link time; it fails silently at runtime the
 //! moment a record shape moves. This module surfaces that skew.
-//!
 //! The "daemon canonical" is the named copy at the top of `wit/`
 //! ([`canonical_contracts_path`]), kept out of the content-addressed
 //! `wit/store/` so the `wit gc` sweep never prunes it. The **daemon owns
-//! it**: at boot, [`refresh_canonical_contracts`] rewrites it from the
-//! daemon's own system fleet (the [`install_principal`](crate::paths::install_principal)'s
-//! retained contracts), so the baseline always tracks the running daemon —
-//! an already-installed fleet gets skew visibility with no install required
-//! and no dependence on which capsule happens to install first.
-//! [`seed_canonical_contracts_if_absent`] is a first-writer-wins bootstrap
-//! fallback for CLI-only flows where no daemon has ever booted; the daemon's
-//! boot refresh is authoritative and supersedes it.
-//!
+//! it**: at boot, [`refresh_canonical_contracts_from_registry`] rewrites it
+//! from the authenticated UID-owned package registry. The legacy
+//! [`seed_canonical_contracts_if_absent`] helper remains a first-writer-wins
+//! bootstrap for CLI-only flows where no daemon has booted.
 //! Everything here is **warn-only**. Side-loading an ahead-of-daemon dev
 //! build is legitimate, so skew is a signal, never a failure: install and
 //! every read path succeed regardless. When no canonical exists (fresh
@@ -29,10 +23,14 @@ use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use astrid_core::dirs::AstridHome;
+use astrid_storage::{RuntimePrincipalStore, StateOwner};
 
-use crate::meta::{InstalledCapsule, read_meta};
+use crate::meta::InstalledCapsule;
+#[cfg(test)]
+use crate::meta::read_meta;
+use crate::storage::read_verified_durable_package_for_owner;
 
 /// Basename of the shared data-shape contracts WIT file every SDK-built
 /// capsule vendors and the daemon links against.
@@ -50,7 +48,6 @@ pub fn short_hash(hash: &str) -> &str {
 }
 
 /// Path to the daemon's canonical `astrid-contracts.wit` copy.
-///
 /// Lives at the top of `wit/` (NOT the content-addressed `wit/store/`),
 /// so `wit gc` never mistakes it for a prunable blob. May be absent on a
 /// fresh home whose daemon has never installed a capsule.
@@ -61,7 +58,6 @@ pub fn canonical_contracts_path(home: &AstridHome) -> PathBuf {
 
 /// The capsule's pinned `astrid-contracts.wit` BLAKE3 hex, if it vendors
 /// one.
-///
 /// `wit_files` keys are paths relative to the capsule's `wit/` source
 /// (e.g. `deps/astrid-contracts/astrid-contracts.wit`); we match on the
 /// basename so the nested layout doesn't matter. Should two entries ever
@@ -80,9 +76,130 @@ pub fn contracts_pin<S: BuildHasher>(wit_files: &HashMap<String, String, S>) -> 
         .map(|(_, hash)| hash)
 }
 
+/// Return the plurality of the daemon fleet's contracts pins from its authoritative owner-root registry.
+/// The package metadata and archive are read from one durable snapshot per
+/// capsule; no native `.local/capsules` directory or cache is consulted.
+pub fn durable_contracts_pin(
+    store: &RuntimePrincipalStore,
+    owner: &StateOwner,
+) -> anyhow::Result<Option<String>> {
+    let registry = store.capsules();
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for summary in registry.list(owner)? {
+        let Some(package) = read_verified_durable_package_for_owner(store, owner, summary.id())?
+        else {
+            bail!(
+                "capsule {} disappeared during durable contracts scan",
+                summary.id()
+            );
+        };
+        let Some(pin) = contracts_pin(&package.metadata().wit_files) else {
+            continue;
+        };
+        if !is_blake3_pin(pin) {
+            bail!(
+                "durable capsule {} has malformed contracts pin",
+                summary.id()
+            );
+        }
+        let Some(relative) = package
+            .metadata()
+            .wit_files
+            .keys()
+            .filter(|relative| {
+                Path::new(relative.as_str())
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    == Some(CONTRACTS_WIT_BASENAME)
+            })
+            .min()
+        else {
+            bail!(
+                "durable capsule {} is missing its pinned contracts blob",
+                summary.id()
+            );
+        };
+        let Some(blob) = package.wit_file(relative) else {
+            bail!(
+                "durable capsule {} is missing its pinned contracts blob",
+                summary.id()
+            );
+        };
+        if blake3::hash(blob).to_hex().as_str() != pin {
+            bail!(
+                "durable capsule {} contracts blob digest mismatch",
+                summary.id()
+            );
+        }
+        let count = counts.entry(pin.clone()).or_default();
+        *count = count.saturating_add(1);
+    }
+    Ok(counts
+        .into_iter()
+        .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
+        .map(|(pin, _)| pin))
+}
+
+/// Refresh the daemon canonical contracts bytes from one durable UID-owned
+/// package registry. This is the storage-backed replacement for the legacy
+/// native fleet scan; it is safe on a fresh home and leaves the canonical
+/// untouched when no retained package contains the shared contracts WIT.
+///
+/// # Errors
+///
+/// Returns an error when the registry snapshot is malformed, a retained
+/// package fails verification, or the canonical file cannot be atomically
+/// written. A missing contracts pin is a successful no-op.
+pub fn refresh_canonical_contracts_from_registry(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+    owner_uid: astrid_core::identity::PrincipalUid,
+) -> anyhow::Result<()> {
+    let owner = StateOwner::Principal(owner_uid);
+    let Some(pin) = durable_contracts_pin(store, &owner)? else {
+        return Ok(());
+    };
+    let registry = store.capsules();
+    let summaries = registry.list(&owner)?;
+    let mut blob = None;
+    for summary in summaries {
+        let Some(package) = read_verified_durable_package_for_owner(store, &owner, summary.id())?
+        else {
+            continue;
+        };
+        if contracts_pin(&package.metadata().wit_files) != Some(&pin) {
+            continue;
+        }
+        let Some(relative) = package
+            .metadata()
+            .wit_files
+            .keys()
+            .filter(|relative| {
+                Path::new(relative.as_str())
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    == Some(CONTRACTS_WIT_BASENAME)
+            })
+            .min()
+        else {
+            continue;
+        };
+        blob = package.wit_file(relative).map(ToOwned::to_owned);
+        if blob.is_some() {
+            break;
+        }
+    }
+    let content = blob.ok_or_else(|| anyhow::anyhow!("durable contracts blob disappeared"))?;
+    let canonical = canonical_contracts_path(home);
+    if std::fs::read(&canonical).is_ok_and(|existing| existing == content) {
+        return Ok(());
+    }
+    write_canonical_atomic(&canonical, &content)
+        .with_context(|| format!("failed to write canonical {}", canonical.display()))
+}
+
 /// BLAKE3 hex of the daemon canonical `astrid-contracts.wit`, or `None`
 /// when the canonical file is absent or unreadable.
-///
 /// Absent canonical is a normal state (fresh home, daemon never booted) —
 /// the caller degrades silently rather than treating it as an error.
 #[must_use]
@@ -225,18 +342,9 @@ pub fn seed_canonical_contracts_if_absent<S: BuildHasher>(
         .with_context(|| format!("failed to write canonical {}", canonical.display()))
 }
 
-/// Rewrite the daemon canonical `astrid-contracts.wit` from the daemon's
-/// own system fleet — the daemon-authoritative baseline refresh run once at
-/// boot (issue #1165).
-///
-/// Source: [`daemon_fleet_contracts_pin`] dereferenced from the retained
-/// content-addressed store (`wit/store/<pin>.wit`) — the same bytes the
-/// installer wrote when it provisioned that fleet's per-principal
-/// `home://wit/` copies. The canonical is taken from the store, never from a
-/// per-principal `home/<principal>/wit/astrid-contracts.wit` copy: that
-/// mirror is last-writer-wins across all of a principal's installs, so
-/// sourcing from it would reintroduce the install-order dependence this
-/// refresh exists to remove.
+/// Legacy test fixture for rewriting the canonical contracts file from a
+/// native system-fleet cache. Production daemon boot uses
+/// [`refresh_canonical_contracts_from_registry`] instead.
 ///
 /// Refresh semantics — daemon-authoritative:
 /// - canonical absent -> write it;
@@ -244,12 +352,12 @@ pub fn seed_canonical_contracts_if_absent<S: BuildHasher>(
 ///   legitimately moves the baseline; skew is measured versus the RUNNING
 ///   daemon);
 /// - byte-identical -> no-op (the file's mtime is left untouched);
-/// - no retained system-fleet contracts (fresh home, or only pre-retention
-///   installs) -> no-op `Ok(())`.
+/// - no retained system-fleet contracts -> no-op `Ok(())`.
 ///
 /// Best-effort: the caller (daemon boot) logs any error and continues — a
 /// canonical write failure only degrades warn-only skew reporting, it must
 /// never break boot.
+#[cfg(test)]
 pub fn refresh_canonical_contracts(home: &AstridHome) -> anyhow::Result<()> {
     let Some(pin) = daemon_fleet_contracts_pin(home)? else {
         return Ok(());
@@ -302,6 +410,7 @@ fn is_blake3_pin(pin: &str) -> bool {
 ///
 /// Reads only the injected `home`, never process environment or project state,
 /// so it is safe on the fail-closed daemon boot path.
+#[cfg(test)]
 fn daemon_fleet_contracts_pin(home: &AstridHome) -> anyhow::Result<Option<String>> {
     let principal = crate::paths::install_principal();
     let capsules_dir = home.principal_home(&principal).capsules_dir();

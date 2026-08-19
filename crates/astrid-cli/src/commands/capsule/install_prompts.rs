@@ -3,8 +3,7 @@
 //! Three pieces live here:
 //!
 //! * `prompt_env_fields` — fill in any `[env]` keys the manifest
-//!   declares that don't already have a value on disk. Writes
-//!   `~/.astrid/<principal>/.config/env/<id>.env.json` with 0o600.
+//!   declares that don't already have a value in daemon storage.
 //! * `cli_elicit_handler` — subscribed to `astrid.v1.elicit` during a
 //!   lifecycle hook so capsules can call `elicit("api_key")` at
 //!   install time and the user can answer on stdin.
@@ -15,17 +14,18 @@
 //! handler runs without an elicit subscriber attached — the dashboard
 //! collects configuration through a separate gateway endpoint.
 
+use astrid_capsule::manifest::EnvDef;
+use astrid_core::PrincipalId;
+use astrid_core::kernel_api::{
+    AdminRequestKind, AdminResponseBody, EnvEntry, EnvStorageScope, EnvValueKind,
+};
+use astrid_events::{AstridEvent, EventBus, EventMetadata, EventReceiver};
+use astrid_types::Topic;
+use astrid_types::ipc::{IpcMessage, IpcPayload, OnboardingFieldType};
 use std::collections::HashMap;
 use std::path::Path;
 
-use astrid_capsule::manifest::EnvDef;
-use astrid_core::PrincipalId;
-use astrid_core::dirs::AstridHome;
-use astrid_events::{AstridEvent, EventBus, EventMetadata, EventReceiver};
-use astrid_storage::{FileSecretStore, SecretStore};
-use astrid_types::Topic;
-use astrid_types::ipc::{IpcMessage, IpcPayload, OnboardingFieldType};
-
+use super::install_headless::{headless_env_key, json_value_string};
 use super::model_discovery::fetch_options_blocking;
 
 /// Order `[env]` keys so that fields are prompted after any field listed
@@ -82,6 +82,134 @@ pub(crate) fn order_env_keys(env_defs: &HashMap<String, EnvDef>) -> Vec<String> 
     emitted
 }
 
+fn admin_block_on<F, T>(future: F) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = anyhow::Result<T>>,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(future))
+    } else {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(future)
+    }
+}
+
+fn list_env_entries(principal: &PrincipalId, capsule: &str) -> anyhow::Result<Vec<EnvEntry>> {
+    admin_block_on(async {
+        let mut client = crate::admin_client::connect_as_active_agent().await?;
+        let response = client
+            .request(AdminRequestKind::EnvList {
+                principal: principal.clone(),
+                capsule: Some(capsule.to_owned()),
+            })
+            .await?;
+        let response = crate::admin_client::into_result(response)?;
+        let AdminResponseBody::EnvList(entries) = response else {
+            anyhow::bail!("unexpected env list response: {response:?}");
+        };
+        Ok(entries)
+    })
+}
+
+fn set_env_entry(
+    principal: &PrincipalId,
+    capsule: &str,
+    key: &str,
+    value: &str,
+    kind: EnvValueKind,
+    scope: EnvStorageScope,
+) -> anyhow::Result<()> {
+    admin_block_on(async {
+        let mut client = crate::admin_client::connect_as_active_agent().await?;
+        let response = client
+            .request(AdminRequestKind::EnvSet {
+                principal: principal.clone(),
+                capsule: capsule.to_owned(),
+                key: key.to_owned(),
+                value: value.to_owned(),
+                kind,
+                scope,
+                append: false,
+            })
+            .await?;
+        crate::admin_client::into_result(response)?;
+        Ok(())
+    })
+}
+
+/// Collect declared configuration before a daemon-owned install transaction.
+///
+/// The returned `KEY=VALUE` records are sent in the typed install request so
+/// the kernel can stage them before invoking the lifecycle hook and roll them
+/// back if installation fails. Existing daemon values are left untouched
+/// unless the operator supplied an explicit replacement.
+pub(super) fn collect_install_env_fields(
+    env_defs: &HashMap<String, EnvDef>,
+    capsule_id: &str,
+    existing_keys: &std::collections::HashSet<String>,
+    supplied: &HashMap<String, String>,
+    headless: bool,
+    config_path: &Path,
+) -> anyhow::Result<Vec<String>> {
+    for key in supplied.keys() {
+        if !env_defs.contains_key(key) {
+            anyhow::bail!("--var names no [env] field in {capsule_id}: {key}");
+        }
+    }
+
+    let mut collected = serde_json::Map::new();
+    for key in existing_keys {
+        collected.insert(key.clone(), serde_json::Value::String(String::new()));
+    }
+
+    let mut prompted = false;
+    let mut values = Vec::new();
+    for key in order_env_keys(env_defs) {
+        let def = &env_defs[&key];
+        let value = if let Some(value) = supplied.get(&key) {
+            value.clone()
+        } else if existing_keys.contains(&key) {
+            continue;
+        } else if headless {
+            let env_key = headless_env_key(&key);
+            std::env::var(&env_key)
+                .ok()
+                .or_else(|| def.default.as_ref().map(json_value_string))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "required value is missing for {capsule_id}.{key} \
+                         (use --var {key}=… or set {env_key})"
+                    )
+                })?
+        } else {
+            if !prompted {
+                eprintln!("\nThis capsule requires configuration:");
+                prompted = true;
+            }
+            prompt_single_field(&key, def, &collected)
+        };
+
+        if !def.enum_values.is_empty() && !def.enum_values.iter().any(|item| item == &value) {
+            anyhow::bail!(
+                "invalid value for {capsule_id}.{key}: expected one of {}, got {value:?}",
+                def.enum_values.join(", ")
+            );
+        }
+        if def.env_type != "secret" && !value.is_empty() {
+            super::local_egress::maybe_prompt_local_egress(capsule_id, &value, config_path);
+        }
+        collected.insert(key.clone(), serde_json::Value::String(value.clone()));
+        values.push(format!("{key}={value}"));
+    }
+
+    if prompted {
+        eprintln!("  Configuration will be applied by the daemon.\n");
+    }
+    Ok(values)
+}
+
 /// Prompt the user for missing environment-variable values defined in `[env]`.
 ///
 /// Reads existing env config if present, skips fields that already have
@@ -94,47 +222,19 @@ pub(crate) fn order_env_keys(env_defs: &HashMap<String, EnvDef>) -> Vec<String> 
 /// the install is never blocked on a discovery miss.
 pub(crate) fn prompt_env_fields(
     env_defs: &HashMap<String, EnvDef>,
-    env_path: &Path,
     capsule_id: &str,
     config_path: &Path,
-    home: &AstridHome,
     principal: &PrincipalId,
 ) -> anyhow::Result<()> {
-    let mut values: serde_json::Map<String, serde_json::Value> = if env_path.exists() {
-        let content = std::fs::read_to_string(env_path)?;
-        serde_json::from_str(&content).unwrap_or_default()
-    } else {
-        serde_json::Map::new()
-    };
-
-    let secret_store =
-        FileSecretStore::new(home.secrets_dir().join(principal.as_str()).join(capsule_id));
+    let mut values = serde_json::Map::new();
+    for entry in list_env_entries(principal, capsule_id)? {
+        values.insert(entry.key, serde_json::Value::String(String::new()));
+    }
     let mut prompted = false;
-    let mut changed = false;
     let keys = order_env_keys(env_defs);
 
     for key in &keys {
         let def = &env_defs[key];
-        if def.env_type == "secret" {
-            if secret_store.exists(key)? {
-                if values.get(key).and_then(serde_json::Value::as_str) != Some("") {
-                    values.insert(key.clone(), serde_json::Value::String(String::new()));
-                    changed = true;
-                }
-                continue;
-            }
-            if let Some(legacy) = values
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-            {
-                secret_store.set(key, &legacy)?;
-                values.insert(key.clone(), serde_json::Value::String(String::new()));
-                changed = true;
-                continue;
-            }
-        }
         if !should_prompt_for_key(&values, key) {
             continue;
         }
@@ -148,10 +248,16 @@ pub(crate) fn prompt_env_fields(
 
         if def.env_type == "secret" {
             if !value.is_empty() {
-                secret_store.set(key, &value)?;
+                set_env_entry(
+                    principal,
+                    capsule_id,
+                    key,
+                    &value,
+                    EnvValueKind::Secret,
+                    EnvStorageScope::Agent,
+                )?;
             }
             values.insert(key.clone(), serde_json::Value::String(String::new()));
-            changed = true;
         } else if !value.is_empty() {
             // Guided pre-bless: if the operator just entered a provider endpoint
             // pointing at a local/private address (e.g. an LM Studio / Ollama
@@ -161,41 +267,32 @@ pub(crate) fn prompt_env_fields(
             // this is NOT the daemon's runtime elicitation. A non-local /
             // free-text value is a silent no-op.
             super::local_egress::maybe_prompt_local_egress(capsule_id, &value, config_path);
+            set_env_entry(
+                principal,
+                capsule_id,
+                key,
+                &value,
+                EnvValueKind::Text,
+                EnvStorageScope::Agent,
+            )?;
             values.insert(key.clone(), serde_json::Value::String(value));
-            changed = true;
         }
     }
 
-    if changed {
-        if let Some(parent) = env_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let json = serde_json::to_string_pretty(&values)?;
-        std::fs::write(env_path, &json)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(env_path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        if prompted {
-            eprintln!("  Configuration saved.\n");
-        }
+    if prompted {
+        eprintln!("  Configuration saved to daemon storage.\n");
     }
 
     Ok(())
 }
 
-/// Decide whether to prompt the user for `key`, given the env values already
-/// on disk.
+/// Decide whether to prompt the user for `key`, given the env keys already in
+/// daemon storage.
 ///
 /// We prompt **only** when the key is absent (UNSET). A key that is already
 /// present is skipped even when its value is the empty string:
-/// `write_env_files` deliberately writes an empty string to mean "use the
-/// capsule's built-in default" for fields the distro pre-configured, so
-/// re-prompting for a present-but-empty field would nag the user for a
-/// blank-as-default value they never had to supply. Distinguishing UNSET
-/// (absent → prompt) from EXPLICITLY-EMPTY (present `""` → skip) preserves
-/// that contract.
+/// Values themselves are intentionally not read by the metadata-only admin
+/// list endpoint; presence is sufficient to preserve an explicit empty value.
 fn should_prompt_for_key(values: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
     !values.contains_key(key)
 }
@@ -506,74 +603,6 @@ mod tests {
     }
 
     #[test]
-    fn fully_preconfigured_env_file_is_left_untouched() {
-        // End-to-end: an env file whose keys are all present (one of them
-        // explicitly empty) must not trigger any prompt — so `prompt_env_fields`
-        // returns Ok without reading stdin and without rewriting the file.
-        let defs = env(r#"
-[model]
-type = "text"
-
-[base_url]
-type = "text"
-"#);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let env_path = dir.path().join("cap.env.json");
-        // `model` explicitly empty (blank-as-default), `base_url` populated.
-        std::fs::write(&env_path, r#"{"model":"","base_url":"https://h"}"#).expect("write");
-
-        let config_path = dir.path().join("config.toml");
-        let home = AstridHome::from_path(dir.path());
-        prompt_env_fields(
-            &defs,
-            &env_path,
-            "cap",
-            &config_path,
-            &home,
-            &PrincipalId::default(),
-        )
-        .expect("no prompt → Ok");
-
-        // Untouched: still exactly what we wrote (the function only rewrites
-        // when it actually prompted).
-        let after = std::fs::read_to_string(&env_path).expect("read");
-        assert_eq!(after, r#"{"model":"","base_url":"https://h"}"#);
-    }
-
-    #[test]
-    fn interactive_env_migrates_legacy_plaintext_secret() {
-        let defs = env(r#"
-[api_key]
-type = "secret"
-"#);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let home = AstridHome::from_path(dir.path());
-        let principal = PrincipalId::new("agent").expect("principal");
-        let env_path = dir.path().join("cap.env.json");
-        std::fs::write(&env_path, r#"{"api_key":"legacy-secret"}"#).expect("legacy env");
-
-        prompt_env_fields(
-            &defs,
-            &env_path,
-            "cap",
-            &dir.path().join("config.toml"),
-            &home,
-            &principal,
-        )
-        .expect("migrate secret");
-
-        assert_eq!(
-            std::fs::read_to_string(&env_path).expect("env marker"),
-            "{\n  \"api_key\": \"\"\n}"
-        );
-        let secrets = FileSecretStore::new(home.secrets_dir().join(principal.as_str()).join("cap"));
-        assert_eq!(
-            secrets.get("api_key").expect("secret read").as_deref(),
-            Some("legacy-secret")
-        );
-    }
-
-    #[test]
     fn order_places_dynamic_select_after_dependencies() {
         // `model` depends on base_url + api_key; both must precede it.
         let defs = env(r#"
@@ -670,6 +699,82 @@ type = "text"
         let pos = |k: &str| order.iter().position(|x| x == k).unwrap();
         assert!(pos("a") < pos("b"));
         assert!(pos("b") < pos("c"));
+    }
+
+    #[test]
+    fn install_collection_replaces_explicit_existing_and_preserves_other_existing() {
+        let defs = env(r#"
+[api_key]
+type = "secret"
+
+[base_url]
+type = "text"
+
+[model]
+type = "text"
+default = "fallback-model"
+"#);
+        let existing = ["api_key".to_string(), "base_url".to_string()]
+            .into_iter()
+            .collect();
+        let supplied = [("base_url".to_string(), "https://example.com".to_string())]
+            .into_iter()
+            .collect();
+
+        let values = collect_install_env_fields(
+            &defs,
+            "provider",
+            &existing,
+            &supplied,
+            true,
+            Path::new("unused.toml"),
+        )
+        .expect("declared values collect");
+
+        assert_eq!(
+            values,
+            vec![
+                "base_url=https://example.com".to_string(),
+                "model=fallback-model".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn install_collection_rejects_undeclared_and_invalid_enum_values() {
+        let defs = env(r#"
+[model]
+type = "select"
+enum_values = ["small", "large"]
+"#);
+        let empty = std::collections::HashSet::new();
+        let unknown = [("spoof".to_string(), "value".to_string())]
+            .into_iter()
+            .collect();
+        let error = collect_install_env_fields(
+            &defs,
+            "provider",
+            &empty,
+            &unknown,
+            true,
+            Path::new("unused.toml"),
+        )
+        .expect_err("undeclared field must fail");
+        assert!(error.to_string().contains("names no [env] field"));
+
+        let invalid = [("model".to_string(), "medium".to_string())]
+            .into_iter()
+            .collect();
+        let error = collect_install_env_fields(
+            &defs,
+            "provider",
+            &empty,
+            &invalid,
+            true,
+            Path::new("unused.toml"),
+        )
+        .expect_err("invalid enum must fail");
+        assert!(error.to_string().contains("expected one of small, large"));
     }
 
     /// REGRESSION: the in-process install answerer must echo the request's

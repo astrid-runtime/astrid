@@ -74,10 +74,10 @@ def build_manifest(
     )
     expected_all = {
         release_manifest.expected_asset(version, target)
-        for target in (*release_manifest.TARGETS, *release_manifest.MUSL_TARGETS)
+        for target in (*release_manifest.TARGETS, *release_manifest.EXTENSION_TARGETS)
     }
     if set(blake3) != expected_all or set(sha256) != expected_all:
-        fail("musl metadata requires checksums for exactly all six release archives")
+        fail("musl metadata requires checksums for exactly all seven release archives")
 
     targets = []
     for target in release_manifest.MUSL_TARGETS:

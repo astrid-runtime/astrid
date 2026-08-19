@@ -320,41 +320,9 @@ fn headless_collect_errors_on_missing_required_var() {
     assert!(msg.contains("ASTRID_VAR_API_KEY"), "got: {msg}");
 }
 
-// ---- Issue #1095: per-principal provisioning ----
-
-/// Regression: `write_env_files` must write under the principal it is
-/// given, NOT a hardcoded `default`. Before the fix, env files always
-/// landed in `home/default/.config/env/`, so a scoped principal (e.g.
-/// `claude-code`) got an empty env view. This test fails without the
-/// principal-aware fix (the file appears under `default`, not the scope).
-#[test]
-fn write_env_files_targets_the_given_principal() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
-    let scope = astrid_core::PrincipalId::new("claude-code").unwrap();
-    let default = astrid_core::PrincipalId::default();
-    assert_ne!(scope.as_str(), default.as_str(), "scope must differ");
-
-    let selected = vec![cap_with_env("cli", "TOKEN", "{{ tok }}")];
-    let mut vars = HashMap::new();
-    vars.insert("tok".to_string(), "abc123".to_string());
-
-    write_env_files(&home, &scope, &selected, &vars).unwrap();
-
-    // Lands under the scoped principal's home...
-    let scoped_path = home.principal_home(&scope).env_dir().join("cli.env.json");
-    assert!(
-        scoped_path.exists(),
-        "env file must be under the scoped principal's home"
-    );
-
-    // ...and NOT under `default` (the pre-fix hardcoded target).
-    let default_path = home.principal_home(&default).env_dir().join("cli.env.json");
-    assert!(
-        !default_path.exists(),
-        "env file must NOT be written under `default` for a scoped principal"
-    );
-}
+// Durable env writes are exercised through the daemon admin API and the
+// storage-control namespace tests.  No test creates or inspects a native
+// `.env.json` path: those files are now an explicit migration input only.
 
 /// A `Distro.lock` is written ONLY on a full success (or an empty
 /// selection). A partial or wholly-failed run writes no lock so a re-run

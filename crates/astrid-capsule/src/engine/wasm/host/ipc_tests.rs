@@ -177,7 +177,7 @@ async fn interceptor_created_waiter_keeps_same_principal_delivery() {
     assert_eq!(drained_principals(&mut alice, &waiter), ["alice", "alice"]);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn host_subscription_uses_shared_runtime_publication_gate() {
     let rt = tokio::runtime::Handle::current();
     let mut state = host_state_for(rt, "alice", false, &[AUDIT_TOPIC]);
@@ -198,7 +198,7 @@ async fn host_subscription_uses_shared_runtime_publication_gate() {
     assert_eq!(drained_principals(&mut state, &sub), ["alice"]);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persistent_subscription_drops_foreign_principal_messages() {
     let rt = tokio::runtime::Handle::current();
     // Principal runtimes are isolated per owner: a persistent run-loop
@@ -296,7 +296,7 @@ async fn persistent_subscription_delivers_and_stamps_owner_principal() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subscribe_audit_default_is_scoped_regression() {
     // THE bug regression. A capsule with audit_firehose=false and the
     // audit topic in its ACL, owner=alice, must receive ONLY alice's
@@ -323,7 +323,7 @@ async fn subscribe_audit_default_is_scoped_regression() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subscribe_wildcard_superset_is_scoped() {
     // A broad `astrid.v1.*` subscription (covers audit) by a
     // non-firehose capsule is still scoped — closes the wildcard bypass.
@@ -345,7 +345,7 @@ async fn subscribe_wildcard_superset_is_scoped() {
     assert_eq!(got.len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subscribe_firehose_holder_unscoped() {
     // audit_firehose=true ⇒ unscoped: both alice and bob delivered.
     let rt = tokio::runtime::Handle::current();
@@ -382,7 +382,7 @@ async fn audit_firehose_holder_remains_unscoped_during_interceptor() {
     assert!(got.iter().any(|principal| principal == "bob"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn principal_route_admits_owner_and_system_but_rejects_peer() {
     // Principal runtimes scope every route to their immutable owner, not only
     // audit routes. Cross-principal fan-in belongs to an explicit System
@@ -424,7 +424,7 @@ async fn principal_route_admits_owner_and_system_but_rejects_peer() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subscription_poll_returns_single_principal_envelope() {
     // HostState installs one invocation context per returned envelope. If a
     // single poll batches messages from different principals, the later

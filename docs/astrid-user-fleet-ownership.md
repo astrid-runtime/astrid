@@ -3,6 +3,10 @@
 Status: implemented foundation. CLI and HTTP management surfaces are not yet
 exposed. AOS is not part of this change.
 
+The proposed filesystem, desktop, team, and optional Linux Realm composition built on this
+foundation is described in [Astrid fleet computer and principal
+views](astrid-fleet-computer.md).
+
 ## Model
 
 Astrid now separates identity, ownership, execution, and permission:

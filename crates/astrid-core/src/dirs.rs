@@ -4,15 +4,16 @@
 //!
 //! - [`AstridHome`]: Global state at `~/.astrid/` (or `$ASTRID_HOME`).
 //!   Linux FHS-aligned layout with `etc/`, `var/`, `run/`, `log/`, `keys/`,
-//!   `bin/`, `lib/`, and `home/` for multi-principal isolation.
+//!   `bin/`, and `lib/`. Principal content is stored in the authoritative
+//!   `AstridFilesystem`; a native `home/` tree is only a legacy import source.
 //!
 //! - [`WorkspaceDir`]: Selected per-project state directory.
 //!   Holds project configuration, capsules, hooks, and instructions.
 //!   Contains a `workspace-id` UUID that links the project to its global state.
 //!
-//! - [`PrincipalHome`]: Per-principal home directory under `~/.astrid/home/{id}/`.
-//!   Each principal gets isolated capsules, KV data, audit chain, tokens, and
-//!   config — portable across deployments.
+//! - [`PrincipalHome`]: Legacy per-principal import source under
+//!   `~/.astrid/home/{id}/`. It remains addressable for no-follow migration,
+//!   but normal v2 boot does not create or use it as runtime authority.
 //!
 //! # Layout
 //!
@@ -25,28 +26,23 @@
 //! │   ├── hooks/                         system hooks
 //! │   └── layout-version                 layout version sentinel
 //! ├── var/
-//! │   ├── principal-store/               authoritative typed principal state
-//! │   └── state.db/                      read-only legacy SurrealKV import source
+//! │   ├── astrid.volume                  hosted Astrid-owned storage volume
+//! │   ├── content-staging/                private acknowledged-write staging
+//! │   ├── migrations/                     durable layout intents and receipts
+//! │   └── state.db/                      temporary legacy import source (removed after verification)
 //! ├── run/                               ephemeral runtime state
 //! │   ├── system.sock
 //! │   ├── system.token
 //! │   ├── system.ready
-//! │   └── deferred.db/                   deferred queue (ephemeral)
+//! │   ├── deferred.db/                   deferred queue (ephemeral)
+//! │   └── principals/                    disposable UID-scoped process scratch
 //! ├── log/                               system logs
 //! ├── keys/                              runtime signing key
 //! ├── bin/                               content-addressed compiled WASM binaries
-//! ├── lib/                               shared WASM component libraries (WIT, future)
-//! └── home/
-//!     └── {principal}/                   per-principal home
-//!         ├── .local/
-//!         │   ├── capsules/              user-installed capsules
-//!         │   ├── kv/                    capsule KV data
-//!         │   ├── log/                   capsule logs
-//!         │   ├── audit/                 user's audit chain
-//!         │   ├── tokens/                capability tokens
-//!         │   └── tmp/                   VFS mounts as /tmp
-//!         └── .config/
-//!             └── env/                   capsule config overrides
+//! └── lib/                               shared WASM component libraries (WIT, future)
+//!
+//! Principal `home/` content is projected from the durable owner catalog and
+//! is not represented by a native directory in a fresh v2 layout.
 //!
 //! <project>/<selected-state-dir>/      (WorkspaceDir)
 //! ├── workspace-id                       UUID linking project to global state
@@ -61,13 +57,16 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
+use crate::principal::PrincipalId;
 use uuid::Uuid;
 
-use crate::principal::PrincipalId;
-
 /// Current layout version. Written to `etc/layout-version` on first boot.
-pub const LAYOUT_VERSION: &str = "1";
-
+pub const LAYOUT_VERSION: &str = "2";
+/// Latest released layout accepted for an in-place upgrade.
+pub const LEGACY_LAYOUT_VERSION: &str = "1";
+#[path = "dirs_layout.rs"]
+mod dirs_layout;
+pub use dirs_layout::{LayoutMigrationTarget, retire_legacy_source_tree};
 /// Default per-project runtime state directory.
 pub const DEFAULT_WORKSPACE_STATE_DIR: &str = ".astrid";
 
@@ -76,14 +75,12 @@ pub const DEFAULT_WORKSPACE_STATE_DIR: &str = ".astrid";
 pub struct WorkspaceLayout {
     state_dir_name: String,
 }
-
 #[path = "workspace_security.rs"]
 mod workspace_security;
 
 pub use workspace_security::{
     WorkspaceSelection, checked_workspace_selection_fingerprint, workspace_selection_fingerprint,
 };
-
 impl WorkspaceLayout {
     /// Create a layout from one portable relative directory name.
     ///
@@ -141,7 +138,6 @@ impl WorkspaceLayout {
             state_dir_name: name,
         })
     }
-
     /// Relative directory name used for project state.
     #[must_use]
     pub fn state_dir_name(&self) -> &str {
@@ -253,10 +249,10 @@ fn reject_parent_traversal(path: &Path, var_name: &str) -> io::Result<()> {
 /// Global Astrid home directory (`~/.astrid/`, Windows `LocalAppData`, or
 /// `$ASTRID_HOME`).
 ///
-/// FHS-aligned system layout. Contains config (`etc/`), persistent state
-/// (`var/`), ephemeral runtime (`run/`), logs (`log/`), keys (`keys/`),
-/// shared WASM modules (`lib/`), system capsules (`capsules/`), and
-/// per-principal home directories (`home/`).
+/// FHS-aligned system layout with config (`etc/`), persistent state (`var/`),
+/// runtime (`run/`), logs (`log/`), keys (`keys/`), and shared modules (`lib/`).
+/// Principal content is authoritative in `AstridFilesystem`; native `home/` is
+/// retained only as a legacy migration source.
 #[derive(Debug, Clone)]
 pub struct AstridHome {
     root: PathBuf,
@@ -331,18 +327,56 @@ impl AstridHome {
 
     /// Ensure the system directory structure exists with secure permissions.
     ///
-    /// Creates `etc/`, `var/`, `run/`, `log/`, `keys/`, `secrets/`, `lib/`, and `home/`.
-    /// Writes `etc/layout-version` with the current version.
-    /// Sets all directories to `0o700` on Unix.
-    ///
-    /// Note: `capsules/` (system/distro capsules) is NOT created eagerly.
-    /// Nothing writes there yet — user installs go to principal home.
-    /// It will be created when an operator install mechanism lands.
+    /// Creates the common private skeleton. New homes initialize at the current
+    /// layout; released v1 homes remain there until the kernel verifies durable
+    /// migration and calls [`Self::complete_layout_v2`]. Directories are `0o700`
+    /// on Unix. `capsules/` is not created eagerly; user installs use principal
+    /// storage until an operator install mechanism exists.
     ///
     /// # Errors
     ///
     /// Returns an error if directory creation or permission setting fails.
     pub fn ensure(&self) -> io::Result<()> {
+        let existing_layout = self.layout_version()?;
+        if let Some(version) = existing_layout.as_deref()
+            && version != LEGACY_LAYOUT_VERSION
+            && version != LAYOUT_VERSION
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported Astrid home layout version {version:?}"),
+            ));
+        }
+        if existing_layout.is_none() {
+            match std::fs::symlink_metadata(self.root()) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Astrid home without a layout sentinel is redirected or not a directory: {}",
+                            self.root().display()
+                        ),
+                    ));
+                },
+                Ok(_)
+                    if std::fs::read_dir(self.root())?
+                        .next()
+                        .transpose()?
+                        .is_some() =>
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "refusing to initialize non-empty Astrid home without etc/layout-version: {}",
+                            self.root().display()
+                        ),
+                    ));
+                },
+                Ok(_) => {},
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+                Err(error) => return Err(error),
+            }
+        }
         let dirs = [
             self.etc_dir(),
             self.hooks_dir(),
@@ -350,30 +384,36 @@ impl AstridHome {
             self.run_dir(),
             self.log_dir(),
             self.keys_dir(),
-            self.secrets_dir(),
             self.bin_dir(),
             self.wit_dir(),
             self.wit_store_dir(),
-            self.home_dir(),
         ];
 
         #[cfg(windows)]
         crate::platform_fs::ensure_private_directory(self.root())?;
 
         for dir in &dirs {
-            #[cfg(windows)]
             crate::platform_fs::ensure_private_directory(dir)?;
-            #[cfg(not(windows))]
-            std::fs::create_dir_all(dir)?;
         }
 
-        // Write layout version sentinel (idempotent).
-        let version_path = self.etc_dir().join("layout-version");
-        if !version_path.exists() {
-            std::fs::write(&version_path, LAYOUT_VERSION)?;
+        match existing_layout.as_deref() {
+            None => {
+                self.ensure_layout_v2_dirs()?;
+                self.write_layout_version(LAYOUT_VERSION)?;
+            },
+            Some(LEGACY_LAYOUT_VERSION) => {},
+            Some(LAYOUT_VERSION) => {
+                self.ensure_layout_v2_dirs()?;
+                // Before the singleton-owned migration barrier, v2 boot only
+                // validates legacy paths (redirects/special entries fail closed).
+                // The barrier owns source admission/receipts; complete_layout_v2
+                // is the only retirement entry point.
+                self.validate_layout_v2_legacy_sources()?;
+            },
+            Some(_) => unreachable!("layout version was validated before directory creation"),
         }
         #[cfg(windows)]
-        crate::platform_fs::restrict_private_file(&version_path)?;
+        crate::platform_fs::restrict_private_file(&self.layout_version_path())?;
 
         #[cfg(unix)]
         {
@@ -395,8 +435,6 @@ impl AstridHome {
         }
         Ok(())
     }
-
-    // ── Path accessors ───────────────────────────────────────────────
 
     /// Root directory path (`~/.astrid/`).
     #[must_use]
@@ -469,12 +507,6 @@ impl AstridHome {
         self.var_dir().join("state.db")
     }
 
-    /// Path to the typed durable principal store (`var/principal-store/`).
-    #[must_use]
-    pub fn principal_store_path(&self) -> PathBuf {
-        self.var_dir().join("principal-store")
-    }
-
     /// Private native write-staging area for principal content (`var/content-staging/`).
     ///
     /// Filesystem providers acknowledge writes from this area before content
@@ -485,24 +517,12 @@ impl AstridHome {
         self.var_dir().join("content-staging")
     }
 
-    /// Root directory for OS-level copy-on-write workspace clones (`cow/`).
+    /// Legacy path for the retired OS-level workspace copy-on-write tree.
     ///
-    /// Each non-git capsule workspace gets a per-workspace subdirectory here
-    /// holding the copy-on-write working tree (an APFS `clonefile` clone on
-    /// macOS, an `overlayfs` upper/work/merged triple on Linux). This tree is
-    /// the directory a spawned process and the fs host both write to; the
-    /// pristine workspace is only touched by an explicit promote.
-    ///
-    /// One workspace's clone is kept from reaching another's by the OS
-    /// sandbox's default-deny-write: only a child's own `merged` tree is a
-    /// writable root, so sibling clones under this `cow/` root are unwritable.
-    /// This depends on `cow/` living under `~/.astrid` (not a world-writable
-    /// location) — which is why the capsule loader fails closed to No-CoW
-    /// rather than clone into a temp dir when the home is unresolvable. (The
-    /// `cow/` root itself is NOT added to the sandbox mask: on macOS Seatbelt a
-    /// mask that is an ancestor of the writable `merged` root is dropped; the
-    /// mask instead covers the pristine workspace / overlay upper dirs.) See
-    /// `astrid_vfs::workspace_cow`.
+    /// Layout v2 does not create this directory. During upgrade/re-entry, any
+    /// existing tree is validated and retired before the home is served. The
+    /// accessor remains temporarily for callers migrating away from the old
+    /// workspace backend; it is not part of the canonical Astrid-home layout.
     #[must_use]
     pub fn cow_dir(&self) -> PathBuf {
         self.root.join("cow")
@@ -512,6 +532,22 @@ impl AstridHome {
     #[must_use]
     pub fn run_dir(&self) -> PathBuf {
         self.root.join("run")
+    }
+
+    /// Clear stale per-principal runtime scratch from a prior daemon process.
+    ///
+    /// Only the disposable `run/principals/` subtree is touched. The complete
+    /// tree is validated without following redirects before anything is
+    /// removed; symlinks, mount boundaries, and special entries fail closed.
+    /// The subtree root is retained and private UID scratch directories are
+    /// recreated on demand by the capsule runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error and leaves the subtree untouched when a redirect,
+    /// mount boundary, or special entry is present.
+    pub fn clear_runtime_principal_scratch(&self) -> io::Result<()> {
+        crate::runtime_scratch::clear_principal_scratch(&self.run_dir().join("principals"))
     }
 
     /// Portable endpoint token for the kernel's host-local transport.
@@ -566,13 +602,11 @@ impl AstridHome {
         self.root.join("log")
     }
 
-    /// Secrets directory (`secrets/`).
+    /// Legacy file-secret directory (`secrets/`).
     ///
-    /// File-per-secret store keyed by
-    /// `secrets/<scope>/<capsule>/<key>`. `<scope>` is either an
-    /// agent principal name (per-agent override) or `__host__` (the
-    /// shared / operator-wide value the kernel's secret-resolve path
-    /// falls back to). Files are written `0600`, parent dirs `0700`.
+    /// This accessor exists only for explicit released-home migration and
+    /// retirement. Runtime secret resolution uses the authoritative storage
+    /// control namespace; fresh homes never create this directory.
     #[must_use]
     pub fn secrets_dir(&self) -> PathBuf {
         self.root.join("secrets")
@@ -646,10 +680,11 @@ impl AstridHome {
 
 // ── PrincipalHome (per-user) ─────────────────────────────────────────────
 
-/// Per-principal home directory (`~/.astrid/home/{principal}/`).
+/// Legacy per-principal home source (`~/.astrid/home/{principal}/`).
 ///
-/// Each principal gets isolated storage following the XDG-like convention:
-/// `.local/` for data and `.config/` for configuration.
+/// This accessor exists for no-follow migration and explicit legacy fixtures.
+/// Runtime capsule home access is the UID-bound `AstridFilesystem` `home/`
+/// subtree, not this host path.
 #[derive(Debug, Clone)]
 pub struct PrincipalHome {
     root: PathBuf,
@@ -662,7 +697,10 @@ impl PrincipalHome {
         Self { root: root.into() }
     }
 
-    /// Ensure the full principal directory tree exists with secure permissions.
+    /// Ensure the legacy principal directory tree exists with secure permissions.
+    ///
+    /// Normal v2 boot must not call this method; it is retained for explicit
+    /// legacy fixtures and dedicated native migrations.
     ///
     /// # Errors
     ///
@@ -675,7 +713,6 @@ impl PrincipalHome {
             self.audit_dir(),
             self.tokens_dir(),
             self.tmp_dir(),
-            self.env_dir(),
         ];
 
         #[cfg(windows)]
@@ -698,7 +735,22 @@ impl PrincipalHome {
             std::fs::set_permissions(&self.root, perms.clone())?;
             // Secure the two top-level dot-dirs.
             std::fs::set_permissions(self.root.join(".local"), perms.clone())?;
-            std::fs::set_permissions(self.root.join(".config"), perms)?;
+            // `.config/` is retained only when a legacy migration left it in
+            // place. Fresh homes do not create it merely for env storage.
+            let config_dir = self.config_dir();
+            match std::fs::symlink_metadata(&config_dir) {
+                Ok(metadata) if metadata.is_dir() => {
+                    std::fs::set_permissions(config_dir, perms)?;
+                },
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "principal .config path is not a regular directory",
+                    ));
+                },
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }
@@ -741,7 +793,8 @@ impl PrincipalHome {
         self.root.join(".local").join("tokens")
     }
 
-    /// Temporary files, VFS-mounted as `/tmp` (`.local/tmp/`).
+    /// Legacy temporary source path (`.local/tmp/`). Runtime `/tmp` uses the
+    /// disposable UID-scoped `run/principals/<uid>/tmp` tree instead.
     #[must_use]
     pub fn tmp_dir(&self) -> PathBuf {
         self.root.join(".local").join("tmp")
@@ -753,7 +806,8 @@ impl PrincipalHome {
         self.root.join(".config")
     }
 
-    /// Capsule environment config overrides (`.config/env/`).
+    /// Legacy capsule environment path (`.config/env/`), used only by an
+    /// explicit layout migration. Principal creation never creates it.
     #[must_use]
     pub fn env_dir(&self) -> PathBuf {
         self.root.join(".config").join("env")

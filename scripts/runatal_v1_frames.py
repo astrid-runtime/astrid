@@ -48,8 +48,7 @@ def valid_frame_follows(data, magic, offset):
     return False
 
 
-def frames(path, magic):
-    data = path.read_bytes()
+def frames_bytes(data, magic, label="byte stream"):
     offset = 0
     while offset < len(data):
         frame = physical_frame(data, magic, offset)
@@ -58,9 +57,13 @@ def frames(path, magic):
         if frame is False:
             if valid_frame_follows(data, magic, offset):
                 raise FrameFormatError(
-                    f"corrupt interior frame at byte {offset} in {path}"
+                    f"corrupt interior frame at byte {offset} in {label}"
                 )
             break
         end, payload = frame
         yield offset, payload
         offset = end
+
+
+def frames(path, magic):
+    yield from frames_bytes(path.read_bytes(), magic, str(path))

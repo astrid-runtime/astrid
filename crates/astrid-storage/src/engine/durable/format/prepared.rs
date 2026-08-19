@@ -3,8 +3,8 @@
 use std::io::{IoSlice, Write};
 
 use super::{
-    ArenaLocation, CHECKSUM_START, DurableError, FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE,
-    FRAME_VERSION, File, Seek, SeekFrom, frame_checksum, io, io_error,
+    ArenaLocation, CHECKSUM_START, DurableError, DurableIo, FRAME_HEADER_LEN,
+    FRAME_HEADER_LEN_USIZE, FRAME_VERSION, SeekFrom, frame_checksum, io, io_error,
 };
 
 // Deliberately below every supported platform's practical iovec ceiling. A
@@ -57,8 +57,8 @@ impl PreparedFrame {
 }
 
 /// Append already-framed payloads without hashing or coalescing under lock.
-pub(in crate::engine::durable) fn append_prepared_frames(
-    file: &mut File,
+pub(in crate::engine::durable) fn append_prepared_frames<F: DurableIo>(
+    file: &mut F,
     frames: &[PreparedFrame],
 ) -> Result<Vec<ArenaLocation>, DurableError> {
     let base = file
@@ -125,6 +125,7 @@ fn write_all_vectored<W: Write + ?Sized>(
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
     use std::io::{Read, Seek, SeekFrom};
 
     use super::*;

@@ -1,12 +1,12 @@
 //! Capability-relative access to authoritative principal-store files.
 
-use std::fs::File;
+use std::fs::File as NativeFile;
 use std::io;
 use std::path::Path;
 
 use cap_std::fs::{Dir, OpenOptions};
 
-use super::{DurableError, io_error};
+use super::{DurableError, File, io_error};
 
 pub(super) fn open_rw(directory: &Dir, name: &Path, create: bool) -> Result<File, DurableError> {
     let mut options = OpenOptions::new();
@@ -26,7 +26,7 @@ pub(super) fn open_rw(directory: &Dir, name: &Path, create: bool) -> Result<File
         .map(cap_std::fs::File::into_std)
         .map_err(|source| io_error("open principal-store capability file", source))?;
     validate_regular(&file)?;
-    Ok(file)
+    Ok(File::native(file))
 }
 
 pub(super) fn create_private(directory: &Dir, name: &Path) -> Result<File, DurableError> {
@@ -43,7 +43,7 @@ pub(super) fn create_private(directory: &Dir, name: &Path) -> Result<File, Durab
         .map(cap_std::fs::File::into_std)
         .map_err(|source| io_error("create principal-store capability file", source))?;
     validate_regular(&file)?;
-    Ok(file)
+    Ok(File::native(file))
 }
 
 pub(super) fn open_directory(
@@ -121,14 +121,14 @@ fn directory_identity(directory: &Dir) -> io::Result<(u64, u64)> {
 }
 
 #[cfg(unix)]
-fn file_identity(file: &File) -> io::Result<(u64, u64)> {
+fn file_identity(file: &NativeFile) -> io::Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt as _;
     let metadata = file.metadata()?;
     Ok((metadata.dev(), metadata.ino()))
 }
 
 #[cfg(windows)]
-fn file_identity(file: &File) -> io::Result<(u64, u64)> {
+fn file_identity(file: &NativeFile) -> io::Result<(u64, u64)> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
@@ -147,7 +147,7 @@ fn file_identity(file: &File) -> io::Result<(u64, u64)> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn file_identity(_file: &File) -> io::Result<(u64, u64)> {
+fn file_identity(_file: &NativeFile) -> io::Result<(u64, u64)> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "stable private directory identity is unavailable",
@@ -168,7 +168,7 @@ fn configure_no_follow(options: &mut OpenOptions) {
     }
 }
 
-fn validate_regular(file: &File) -> Result<(), DurableError> {
+fn validate_regular(file: &NativeFile) -> Result<(), DurableError> {
     let metadata = file
         .metadata()
         .map_err(|source| io_error("inspect principal-store capability file", source))?;
@@ -197,6 +197,7 @@ const fn file_is_redirected(_metadata: &std::fs::Metadata) -> bool {
     false
 }
 
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 pub(super) fn sync_directory(directory: &Dir) -> Result<(), DurableError> {
     #[cfg(unix)]
     {

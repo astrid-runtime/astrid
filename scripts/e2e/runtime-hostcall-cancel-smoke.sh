@@ -1,58 +1,5 @@
 #!/usr/bin/env bash
 
-adversarial_capsule_install_dir() {
-  local principal=${1:-default}
-  printf '%s/home/%s/.local/capsules/astrid-capsule-adversarial\n' "$ASTRID_HOME" "$principal"
-}
-
-adversarial_capsule_backup_dir() {
-  printf '%s/adversarial-capsule-install-backup\n' "$ARTIFACTS"
-}
-
-backup_adversarial_capsule_install() {
-  local source_dir
-  local backup_dir
-  source_dir="$(adversarial_capsule_install_dir)"
-  backup_dir="$(adversarial_capsule_backup_dir)"
-  [[ -d "$source_dir" ]] || fail "cannot back up adversarial capsule install; missing $source_dir"
-  rm -rf "$backup_dir"
-  cp -R "$source_dir" "$backup_dir"
-}
-
-restore_adversarial_capsule_install() {
-  local ops_bearer=$1
-  local user_bearer=$2
-  local user_principal=${3:-}
-  local target_dir
-  local backup_dir
-  local status
-  target_dir="$(adversarial_capsule_install_dir)"
-  backup_dir="$(adversarial_capsule_backup_dir)"
-  [[ -d "$backup_dir" ]] || fail "cannot restore adversarial capsule install; missing $backup_dir"
-  rm -rf "$target_dir"
-  mkdir -p "$(dirname "$target_dir")"
-  cp -R "$backup_dir" "$target_dir"
-  if [[ -n "$user_principal" ]]; then
-    target_dir="$(adversarial_capsule_install_dir "$user_principal")"
-    rm -rf "$target_dir"
-    mkdir -p "$(dirname "$target_dir")"
-    cp -R "$backup_dir" "$target_dir"
-  fi
-
-  status="$(http_status POST /api/sys/capsules/reload "$ops_bearer" "" \
-    "$ARTIFACTS/adversarial-capsule-restore-reload.json")"
-  assert_status "adversarial capsule restore reload" "$status" 204
-  if [[ -n "$user_principal" ]]; then
-    wait_for_readiness_capsules adversarial-capsule-restore "$user_bearer" \
-      astrid-capsule-adversarial
-  fi
-  status="$(http_status GET /api/capsules "$user_bearer" "" \
-    "$ARTIFACTS/adversarial-capsule-restore-capsules.json")"
-  assert_status "adversarial capsule list after restore" "$status" 200
-  json_assert_capsule_list_state "$ARTIFACTS/adversarial-capsule-restore-capsules.json" \
-    astrid-capsule-adversarial present
-}
-
 run_live_approval_cancel_smoke() {
   local user_bearer=$1
   local user_principal=$2

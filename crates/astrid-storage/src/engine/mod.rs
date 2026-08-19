@@ -28,6 +28,8 @@ use parking_lot::RwLock;
 pub mod crash_replay;
 #[cfg(not(target_family = "wasm"))]
 mod durable;
+#[cfg(not(target_family = "wasm"))]
+mod durable_cache;
 mod kv;
 mod muninn;
 mod projection;
@@ -36,12 +38,13 @@ mod refinery;
 #[cfg(not(target_family = "wasm"))]
 pub use durable::{
     CompactionEvidenceBundle, CompactionFacts, CompactionProofVerifier, CompactionReport,
-    CompactionRetainedRoot, CompactionRetention, CompactionRootKind, DurableEngine,
-    DurableEnginePolicy, DurableError, FaultInjector, FaultPoint, GroupCommitPolicy,
-    IdentityScheme, NoFaults, ObjectCacheCapacity, ObjectCacheConfig, ObjectCacheController,
-    ObjectCacheMemoryBudget, ObjectCacheStats, PersistentObjectIdentity, PreparedContiguousFile,
-    PrincipalCodec, PrincipalObjectCacheBudget, PublishedContiguousFile, RecoveryLimits,
-    RecoveryRetryPolicy, VerifiedCompactionPlan,
+    CompactionRetainedRoot, CompactionRetention, CompactionRootKind,
+    DeterministicCompactionProofVerifier, DurableEngine, DurableEnginePolicy, DurableError,
+    FaultInjector, FaultPoint, GroupCommitPolicy, IdentityScheme, NoFaults, ObjectCacheCapacity,
+    ObjectCacheConfig, ObjectCacheController, ObjectCacheMemoryBudget, ObjectCacheStats,
+    PersistentObjectIdentity, PreparedContiguousFile, PrincipalCodec, PrincipalObjectCacheBudget,
+    PublishedContiguousFile, RecoveryLimits, RecoveryRetryPolicy, VerifiedCompactionPlan,
+    deterministic_compaction_proof,
 };
 pub use kv::{
     KvProjectionEngine, KvProjectionError, KvState, KvStateSnapshot, commit_kv_with_engine,
@@ -51,6 +54,7 @@ pub use muninn::{
     InMemoryMuninnIndex, MuninnAdmission, MuninnHit, MuninnTrustState, MuninnVerificationError,
     VerifiedDerivationEvidence, verify_derivation_evidence,
 };
+pub(crate) use projection::object_record_retained_bytes;
 pub use projection::{
     PreparedProjectionBatch, PrincipalProjectionEngine, PrincipalProjectionError,
     ProjectionCacheEntry, ProjectionCacheKey, ProjectionCachePayload, ProjectionObserver,

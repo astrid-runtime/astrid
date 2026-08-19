@@ -12,16 +12,19 @@ use std::time::{Duration, Instant};
 use crate::engine::{ProjectionObserver, ProjectionPhase};
 use parking_lot::Mutex;
 
-use super::projection::{BatchAdmission, StagedObjectBatch, admit_object_batch_observed};
+use super::projection::{
+    BatchAdmission, DeferredAdmission, StagedObjectBatch, admit_object_batch_observed,
+};
 use super::{
-    CatalogSummary, CatalogValidation, CatalogValue, EngineSink, ModelError, ObjectReference,
-    PrincipalContentStore, PrincipalProjectionEngine, PrincipalProjectionError, ReferenceKind,
-    VerifiedContent, build_content_streaming, insert, invalid, lookup, map_stream_error,
+    CatalogSummary, CatalogValidation, CatalogValue, EngineSink, ModelError, ObjectId,
+    ObjectRecord, ObjectReference, PrincipalContentStore, PrincipalProjectionEngine,
+    PrincipalProjectionError, ReferenceKind, VerifiedContent, build_content_streaming, insert,
+    invalid, lookup, map_stream_error,
 };
 use crate::content::{
     BulkIngestDiagnostics, BulkIngestPhaseDurations, BulkIngestPolicy, ChunkingProfile,
-    ContentBatchEntry, ContentBatchWriteOutcome, ContentChangeCache, ContentIngest, ContentName,
-    ContentObservation, PrincipalContentError, SourceObservation,
+    ContentBatchEntry, ContentBatchExpectation, ContentBatchWriteOutcome, ContentChangeCache,
+    ContentIngest, ContentName, ContentObservation, PrincipalContentError, SourceObservation,
 };
 
 type PendingIngest<R> = (ContentName, (R, ChunkingProfile, Option<SourceObservation>));
@@ -100,7 +103,44 @@ where
         if completed.is_empty() {
             return Err(PrincipalContentError::EmptyBatch);
         }
-        self.publish_batch(principal, &completed, staged_objects_inserted, None)
+        self.publish_batch(
+            principal,
+            &completed,
+            staged_objects_inserted,
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn publish_verified_batch_deferred(
+        &self,
+        principal: &P,
+        entries: impl IntoIterator<Item = (ContentName, VerifiedContent, Vec<ObjectRecord>)>,
+    ) -> Result<ContentBatchWriteOutcome, PrincipalContentError> {
+        let mut completed = BTreeMap::new();
+        let mut records = BTreeMap::new();
+        for (name, verified, deferred) in entries {
+            if completed
+                .insert(
+                    name.clone(),
+                    PreparedContent {
+                        verified,
+                        observation: ContentObservation::BytesObserved,
+                    },
+                )
+                .is_some()
+            {
+                return Err(PrincipalContentError::DuplicateBatchName(name));
+            }
+            for record in deferred {
+                self.insert(&mut records, record)?;
+            }
+        }
+        if completed.is_empty() {
+            return Err(PrincipalContentError::EmptyBatch);
+        }
+        self.publish_batch(principal, &completed, 0, None, Some(&records), None)
     }
 
     /// Stream and atomically publish several names under one principal root.
@@ -131,6 +171,7 @@ where
             BulkIngestPolicy::default(),
             None,
             false,
+            None,
         )
         .map(|execution| execution.outcome)
     }
@@ -155,8 +196,38 @@ where
         R: Read + Send,
         I: IntoIterator<Item = ContentIngest<R>>,
     {
-        self.put_streaming_batch_internal(principal, ingests, policy, None, false)
+        self.put_streaming_batch_internal(principal, ingests, policy, None, false, None)
             .map(|execution| execution.outcome)
+    }
+
+    /// Stream and atomically publish a batch only when its admitted names
+    /// still satisfy `expectation`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same source, content, quota, and projection errors as
+    /// [`Self::put_streaming_batch`], plus
+    /// [`PrincipalContentError::BatchPreconditionFailed`] when the owner
+    /// catalog changed before publication.
+    pub fn put_streaming_batch_with_expectation<R, I>(
+        &self,
+        principal: &P,
+        ingests: I,
+        expectation: &ContentBatchExpectation,
+    ) -> Result<ContentBatchWriteOutcome, PrincipalContentError>
+    where
+        R: Read + Send,
+        I: IntoIterator<Item = ContentIngest<R>>,
+    {
+        self.put_streaming_batch_internal(
+            principal,
+            ingests,
+            BulkIngestPolicy::default(),
+            None,
+            false,
+            Some(expectation),
+        )
+        .map(|execution| execution.outcome)
     }
 
     /// Stream a batch with trusted change-token reuse and explicit policy.
@@ -180,7 +251,7 @@ where
         R: Read + Send,
         I: IntoIterator<Item = ContentIngest<R>>,
     {
-        self.put_streaming_batch_internal(principal, ingests, policy, Some(cache), false)
+        self.put_streaming_batch_internal(principal, ingests, policy, Some(cache), false, None)
             .map(|execution| execution.outcome)
     }
 
@@ -205,7 +276,7 @@ where
         R: Read + Send,
         I: IntoIterator<Item = ContentIngest<R>>,
     {
-        self.put_streaming_batch_internal(principal, ingests, policy, cache, true)
+        self.put_streaming_batch_internal(principal, ingests, policy, cache, true, None)
             .map(|execution| (execution.outcome, execution.diagnostics))
     }
 
@@ -216,6 +287,7 @@ where
         policy: BulkIngestPolicy,
         cache: Option<&ContentChangeCache>,
         observe: bool,
+        expectation: Option<&ContentBatchExpectation>,
     ) -> Result<BulkExecution, PrincipalContentError>
     where
         R: Read + Send,
@@ -223,18 +295,54 @@ where
     {
         let ordered = ordered_ingests(ingests)?;
         let phase_observer = observe.then(|| Arc::new(BulkPhaseObserver::default()));
-        let (mut completed, pending) = self.partition_cached_ingests(principal, ordered, cache)?;
+        let (completed, pending) = self.partition_cached_ingests(principal, ordered, cache)?;
+        if let Some((bound, limit)) = self.quota_staging_bound(principal)? {
+            return self.put_streaming_batch_deferred(
+                principal,
+                completed,
+                pending,
+                bound,
+                limit,
+                cache,
+                phase_observer.as_ref(),
+                expectation,
+            );
+        }
+        self.put_streaming_batch_direct(
+            principal,
+            completed,
+            pending,
+            policy,
+            cache,
+            phase_observer.as_ref(),
+            expectation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn put_streaming_batch_direct<R>(
+        &self,
+        principal: &P,
+        mut completed: BTreeMap<ContentName, PreparedContent>,
+        pending: VecDeque<PendingIngest<R>>,
+        policy: BulkIngestPolicy,
+        cache: Option<&ContentChangeCache>,
+        phase_observer: Option<&Arc<BulkPhaseObserver>>,
+        expectation: Option<&ContentBatchExpectation>,
+    ) -> Result<BulkExecution, PrincipalContentError>
+    where
+        R: Read + Send,
+    {
         let pipeline_started = Instant::now();
         if pending.is_empty() {
-            return self.publish_cached_batch(principal, &completed, phase_observer.as_ref());
+            return self.publish_cached_batch(principal, &completed, phase_observer, expectation);
         }
-
         let worker_count = policy.worker_threads().get().min(pending.len());
         let (results, staged_objects_inserted, peak_pending_bytes, admission_elapsed) =
             if worker_count == 1 {
                 let queue = Mutex::new(pending);
                 let cancelled = AtomicBool::new(false);
-                let build = match phase_observer.as_deref() {
+                let build = match phase_observer.map(Arc::as_ref) {
                     Some(observer) => build_worker_observed(self, &queue, &cancelled, observer)?,
                     None => build_worker(self, &queue, &cancelled)?,
                 };
@@ -250,12 +358,8 @@ where
                 ));
                 #[cfg(not(target_family = "wasm"))]
                 {
-                    let parallel = admission::build_parallel(
-                        self,
-                        pending,
-                        worker_count,
-                        phase_observer.as_ref(),
-                    )?;
+                    let parallel =
+                        admission::build_parallel(self, pending, worker_count, phase_observer)?;
                     (
                         parallel
                             .entries
@@ -273,7 +377,6 @@ where
                 }
             };
         let pipeline_elapsed = pipeline_started.elapsed();
-
         let mut objects_inserted = staged_objects_inserted;
         let mut source_build_elapsed = Duration::ZERO;
         for build in results {
@@ -283,8 +386,6 @@ where
             source_build_elapsed = source_build_elapsed.saturating_add(build.source_build_elapsed);
             for (name, verified, observation) in build.entries {
                 if let Some((cache, observation)) = cache.zip(observation.as_ref()) {
-                    // A token can only become reusable after every pending
-                    // record from this worker was admitted successfully.
                     cache.record(observation, verified);
                 }
                 completed.insert(
@@ -301,7 +402,9 @@ where
             principal,
             &completed,
             objects_inserted,
-            phase_observer.as_ref(),
+            phase_observer,
+            None,
+            expectation,
         )?;
         Ok(BulkExecution {
             outcome,
@@ -311,7 +414,102 @@ where
                 admission_elapsed,
                 publication_started.elapsed(),
                 peak_pending_bytes,
-                phase_durations(phase_observer.as_deref()),
+                phase_durations(phase_observer.map(Arc::as_ref)),
+            ),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn put_streaming_batch_deferred<R>(
+        &self,
+        principal: &P,
+        mut completed: BTreeMap<ContentName, PreparedContent>,
+        mut pending: VecDeque<PendingIngest<R>>,
+        bound: u64,
+        limit: u64,
+        cache: Option<&ContentChangeCache>,
+        observer: Option<&Arc<BulkPhaseObserver>>,
+        expectation: Option<&ContentBatchExpectation>,
+    ) -> Result<BulkExecution, PrincipalContentError>
+    where
+        R: Read + Send,
+    {
+        if pending.is_empty() {
+            return self.publish_cached_batch(principal, &completed, observer, expectation);
+        }
+
+        let pipeline_started = Instant::now();
+        let mut remaining = bound;
+        let mut sink = EngineSink::<P, E, _>::with_admission(
+            self.engine.as_ref(),
+            DeferredAdmission::default(),
+        );
+        let mut cache_updates = Vec::new();
+        while let Some((name, (source, profile, observation))) = pending.pop_front() {
+            let probe = remaining
+                .checked_add(1)
+                .ok_or(PrincipalContentError::AccountingOverflow)?;
+            let streamed = build_content_streaming(profile, source.take(probe), &mut sink)
+                .map_err(map_stream_error)?;
+            let verified = streamed.verified_content();
+            let logical_bytes = verified.descriptor().logical_bytes();
+            if logical_bytes > remaining {
+                return Err(PrincipalContentError::QuotaExceeded {
+                    used: bound
+                        .checked_add(1)
+                        .ok_or(PrincipalContentError::AccountingOverflow)?,
+                    limit,
+                });
+            }
+            remaining = remaining
+                .checked_sub(logical_bytes)
+                .ok_or(PrincipalContentError::AccountingOverflow)?;
+            if let Some(observation) = observation.as_ref() {
+                cache_updates.push((observation.clone(), verified));
+            }
+            completed.insert(
+                name,
+                PreparedContent {
+                    verified,
+                    observation: ContentObservation::BytesObserved,
+                },
+            );
+        }
+        sink.finish()?;
+        let peak_pending_bytes = sink
+            .admission()
+            .peak_retained_bytes()
+            .saturating_add(sink.peak_pending_bytes());
+        let records = sink
+            .admission_mut()
+            .take_records()
+            .into_iter()
+            .map(|record| (self.engine.identify_object(&record), record))
+            .collect::<BTreeMap<_, _>>();
+        let pipeline_elapsed = pipeline_started.elapsed();
+        let publication_started = Instant::now();
+        let outcome = self.publish_batch(
+            principal,
+            &completed,
+            0,
+            observer,
+            Some(&records),
+            expectation,
+        )?;
+        if let Some(cache) = cache {
+            for (observation, verified) in cache_updates {
+                cache.record(&observation, verified);
+            }
+        }
+        Ok(BulkExecution {
+            outcome,
+            diagnostics: BulkIngestDiagnostics::new(
+                pipeline_elapsed,
+                pipeline_elapsed,
+                Duration::ZERO,
+                publication_started.elapsed(),
+                peak_pending_bytes,
+                phase_durations(observer.map(Arc::as_ref)),
             ),
         })
     }
@@ -321,9 +519,10 @@ where
         principal: &P,
         completed: &BTreeMap<ContentName, PreparedContent>,
         observer: Option<&Arc<BulkPhaseObserver>>,
+        expectation: Option<&ContentBatchExpectation>,
     ) -> Result<BulkExecution, PrincipalContentError> {
         let publication_started = Instant::now();
-        let outcome = self.publish_batch(principal, completed, 0, observer)?;
+        let outcome = self.publish_batch(principal, completed, 0, observer, None, expectation)?;
         Ok(BulkExecution {
             outcome,
             diagnostics: BulkIngestDiagnostics::new(
@@ -405,9 +604,12 @@ where
         completed: &BTreeMap<ContentName, PreparedContent>,
         staged_objects_inserted: u64,
         observer: Option<&Arc<BulkPhaseObserver>>,
+        deferred_records: Option<&BTreeMap<ObjectId, ObjectRecord>>,
+        expectation: Option<&ContentBatchExpectation>,
     ) -> Result<ContentBatchWriteOutcome, PrincipalContentError> {
         loop {
             let mut header = self.header(principal)?.as_ref().clone();
+            self.check_batch_expectation(principal, &header, expectation)?;
             let mut catalog_records = BTreeMap::new();
             let mut changed = false;
             for (name, prepared) in completed {
@@ -462,6 +664,11 @@ where
 
             self.enforce_quota(principal, &header)?;
             let catalog = header.catalog;
+            if let Some(deferred_records) = deferred_records {
+                for record in deferred_records.values() {
+                    self.insert(&mut catalog_records, record.clone())?;
+                }
+            }
             retain_final_catalog_records(catalog, &mut catalog_records);
             let transaction =
                 self.encode_transaction(principal.clone(), header, None, catalog_records)?;

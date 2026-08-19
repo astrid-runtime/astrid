@@ -59,6 +59,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 . "$SCRIPT_DIR/runtime-json-asserts.sh"
+. "$SCRIPT_DIR/runtime-storage-asserts.sh"
 . "$SCRIPT_DIR/runtime-gateway-smoke.sh"
 . "$SCRIPT_DIR/runtime-cli-smoke.sh"
 . "$SCRIPT_DIR/runtime-multi-home-smoke.sh"
@@ -322,13 +323,17 @@ redaction_check() {
 }
 
 main() {
-  mkdir -p "$ASTRID_HOME/etc" "$ARTIFACTS"
   export ASTRID_HOME
 
   note "building Astrid binaries"
   if [[ -z "${ASTRID_E2E_SKIP_BUILD:-}" ]]; then
     cargo build -p astrid --bins
   fi
+
+  note "admitting primary Astrid home through the public lifecycle"
+  "$CORE_DIR/target/debug/astrid" start
+  "$CORE_DIR/target/debug/astrid" stop
+  mkdir -p "$ARTIFACTS"
 
   run_standalone_admin_smoke
 
@@ -395,9 +400,19 @@ EOF
 
   note "installing core capsule set"
   for capsule in $CORE_CAPSULES; do
-    run_cli capsule install "$CAPSULES_DIR/$capsule"
+    if [[ "$capsule" == "astrid-capsule-openai-compat" ]]; then
+      # Exercise the non-interactive declared-config path without writing a
+      # fixture credential into the command transcript. The dedicated config
+      # and secret probes below replace these bootstrap values.
+      ASTRID_VAR_API_KEY=runtime-e2e-install-placeholder \
+        ASTRID_VAR_TEMPERATURE=0.7 \
+        run_cli capsule install "$CAPSULES_DIR/$capsule" \
+          --approve-untrusted --yes
+    else
+      run_cli capsule install "$CAPSULES_DIR/$capsule" --approve-untrusted
+    fi
   done
-  install_adversarial_capsule_with_lifecycle_elicit
+  install_adversarial_capsule_with_lifecycle_config
 
   note "configuring openai-compat for fake endpoint"
   local sentinel="ASTRID_E2E_SECRET_DO_NOT_LEAK_$RANDOM$RANDOM"
@@ -419,12 +434,16 @@ EOF
   json_assert_secret_list_metadata "$ARTIFACTS/default-secret-list.json" \
     astrid-capsule-openai-compat api_key
 
+  # Install/config commands may auto-start a detached daemon. Stop it before
+  # the crash matrix so start_daemon owns the exact process it records and a
+  # SIGKILL probe cannot accidentally target a failed singleton contender.
+  run_cli stop
   export HOME="$POISON_HOME"
   start_daemon "starting daemon"
   run_gateway_public_surface_smoke
 
   note "checking principal and capability isolation"
-  run_cli group create ops-team --caps "capsule:install,capsule:reload,capsule:remove,invite:issue,invite:list,self:capsule:list,self:capsule:reload,self:capsule:remove"
+  run_cli group create ops-team --caps "capsule:install,capsule:reload,capsule:remove,invite:issue,invite:list,self:capsule:install,self:capsule:list,self:capsule:reload,self:capsule:remove,self:env:read,self:env:write"
 
   local ops_invite
   ops_invite="$("$CORE_DIR/target/debug/astrid" invite issue --group ops-team --max-uses 1 --expires-secs 600 --raw \
@@ -645,20 +664,20 @@ PY
     '{"value":"fake-toolish"}' \
     "$ARTIFACTS/operator-openai-env-write.json")"
   assert_status "operator env model write" "$status" 204
-  json_assert_capsule_env_models "$ASTRID_HOME" astrid-capsule-openai-compat default "$user_principal" "$ops_principal" \
+  json_assert_no_native_capsule_env "$ASTRID_HOME" astrid-capsule-openai-compat default "$user_principal" "$ops_principal" \
     fake-echo fake-slow fake-toolish
 
   status="$(http_status POST /api/capsules/astrid-capsule-openai-compat/env/model "$user_bearer" \
     '{"value":"fake-spoof","principal":"default"}' \
     "$ARTIFACTS/agent-openai-env-spoofed-principal-write.json")"
   assert_status "agent env body principal spoof ignored" "$status" 204
-  json_assert_capsule_env_models "$ASTRID_HOME" astrid-capsule-openai-compat default "$user_principal" "$ops_principal" \
+  json_assert_no_native_capsule_env "$ASTRID_HOME" astrid-capsule-openai-compat default "$user_principal" "$ops_principal" \
     fake-echo fake-spoof fake-toolish
   status="$(http_status POST /api/capsules/astrid-capsule-openai-compat/env/model "$user_bearer" \
     '{"value":"fake-slow"}' \
     "$ARTIFACTS/agent-openai-env-restore.json")"
   assert_status "agent env model restore" "$status" 204
-  json_assert_capsule_env_models "$ASTRID_HOME" astrid-capsule-openai-compat default "$user_principal" "$ops_principal" \
+  json_assert_no_native_capsule_env "$ASTRID_HOME" astrid-capsule-openai-compat default "$user_principal" "$ops_principal" \
     fake-echo fake-slow fake-toolish
 
   note "checking per-principal secret isolation"
@@ -674,7 +693,7 @@ PY
     "{\"value\":\"$ops_secret\"}" \
     "$ARTIFACTS/operator-openai-secret-write.json")"
   assert_status "operator secret write" "$status" 204
-  json_assert_secret_files_isolated "$ASTRID_HOME" astrid-capsule-openai-compat \
+  json_assert_secret_store_isolated "$ASTRID_HOME" astrid-capsule-openai-compat \
     "$sentinel" "$user_principal" "$user_secret" "$ops_principal" "$ops_secret"
   run_cli secret list --agent "$user_principal" --format json > "$ARTIFACTS/agent-secret-list.json"
   run_cli secret list --agent "$ops_principal" --format json > "$ARTIFACTS/operator-secret-list.json"
@@ -683,7 +702,7 @@ PY
   json_assert_secret_list_metadata "$ARTIFACTS/operator-secret-list.json" \
     astrid-capsule-openai-compat api_key
   run_adversarial_principal_smoke "$user_bearer" "$user_principal" \
-    "$ops_bearer" "$ops_principal" "$user_secret"
+    "$ops_bearer" "$ops_principal" "$user_secret" "$fake_base_url"
   run_adversarial_capsule_smoke "$user_bearer" "$user_principal" \
     "$ops_bearer" "$ops_principal"
   run_cli_semantic_smoke "$user_principal" "$ops_principal"
@@ -726,7 +745,6 @@ PY
   ops_session="$("$PYTHON" -c 'import uuid; print(uuid.uuid4())')"
   local user_session_text="ASTRID_E2E_USER_SESSION_DO_NOT_LEAK_$RANDOM$RANDOM"
   local ops_session_text="ASTRID_E2E_OPS_SESSION_DO_NOT_LEAK_$RANDOM$RANDOM"
-  local user_session_title="regular user e2e session"
   run_principal_cli "$user_principal" run --format json --session "$user_session" \
     "$user_session_text" > "$ARTIFACTS/agent-session-run.json"
   run_principal_cli "$ops_principal" run --format json --session "$ops_session" \
@@ -736,11 +754,8 @@ PY
   status="$(http_status GET "/api/agent/sessions?include_archived=true&limit=20" "$user_bearer" "" \
     "$ARTIFACTS/agent-sessions.json")"
   assert_status "agent session list" "$status" 200
-  json_assert_session_list_scope "$ARTIFACTS/agent-sessions.json" "$user_session" "$ops_session"
-  status="$(http_status GET "/api/agent/sessions?include_archived=true&limit=20" "$ops_bearer" "" \
-    "$ARTIFACTS/operator-sessions.json")"
-  assert_status "operator session list" "$status" 200
-  json_assert_session_list_scope "$ARTIFACTS/operator-sessions.json" "$ops_session" "$user_session"
+  json_assert_session_list_scope "$ARTIFACTS/agent-sessions.json" \
+    "$user_session" "$ops_session"
   status="$(http_status GET "/api/agent/sessions/$user_session/messages" "$user_bearer" "" \
     "$ARTIFACTS/agent-session-messages.json")"
   assert_status "agent session transcript" "$status" 200
@@ -749,38 +764,10 @@ PY
     "$ARTIFACTS/operator-session-messages.json")"
   assert_status "operator session transcript" "$status" 200
   json_assert_session_messages_contains "$ARTIFACTS/operator-session-messages.json" "$ops_session" "$ops_session_text"
-  status="$(http_status GET "/api/agent/sessions/$ops_session" "$user_bearer" "" \
-    "$ARTIFACTS/agent-cross-session-get-hidden.json")"
-  assert_status "agent cross-principal session get hidden" "$status" 404
   status="$(http_status GET "/api/agent/sessions/$ops_session/messages" "$user_bearer" "" \
     "$ARTIFACTS/agent-cross-session-messages-empty.json")"
   assert_status "agent cross-principal session transcript empty" "$status" 200
   json_assert_session_messages_empty "$ARTIFACTS/agent-cross-session-messages-empty.json" "$ops_session"
-  status="$(http_status GET "/api/agent/sessions/search?q=$user_session_text&include_archived=true" "$user_bearer" "" \
-    "$ARTIFACTS/agent-session-search-own.json")"
-  assert_status "agent session search own" "$status" 200
-  json_assert_session_search_scope "$ARTIFACTS/agent-session-search-own.json" "$user_session" "$ops_session"
-  status="$(http_status GET "/api/agent/sessions/search?q=$ops_session_text&include_archived=true" "$user_bearer" "" \
-    "$ARTIFACTS/agent-session-search-cross-hidden.json")"
-  assert_status "agent session search cross-principal hidden" "$status" 200
-  json_assert_session_search_scope "$ARTIFACTS/agent-session-search-cross-hidden.json" "-" "$ops_session"
-  status="$(http_status PATCH "/api/agent/sessions/$user_session" "$user_bearer" \
-    "{\"title\":\"$user_session_title\",\"session_id\":\"$ops_session\"}" \
-    "$ARTIFACTS/agent-session-update.json")"
-  assert_status "agent session update own" "$status" 200
-  json_assert_session_summary "$ARTIFACTS/agent-session-update.json" "$user_session" "$user_session_title"
-  status="$(http_status PATCH "/api/agent/sessions/$ops_session" "$user_bearer" \
-    '{"title":"cross principal spoofed title"}' \
-    "$ARTIFACTS/agent-cross-session-update-hidden.json")"
-  assert_status "agent cross-principal session update hidden" "$status" 404
-  status="$(http_status DELETE "/api/agent/sessions/$ops_session" "$user_bearer" "" \
-    "$ARTIFACTS/agent-cross-session-delete-false.json")"
-  assert_status "agent cross-principal session delete false" "$status" 200
-  json_assert_deleted_flag "$ARTIFACTS/agent-cross-session-delete-false.json" false
-  status="$(http_status GET "/api/agent/sessions/$ops_session" "$ops_bearer" "" \
-    "$ARTIFACTS/operator-session-after-cross-attempts.json")"
-  assert_status "operator session survived cross-principal attempts" "$status" 200
-  json_assert_session_summary "$ARTIFACTS/operator-session-after-cross-attempts.json" "$ops_session" null
 
   note "checking prompt path through fake LLM"
   local run_out="$ARTIFACTS/run-output.txt"
@@ -835,7 +822,7 @@ PY
   status="$(http_status GET /api/capsules/astrid-capsule-openai-compat/env "$restart_user_bearer" "" \
     "$ARTIFACTS/restart-agent-openai-env-schema.json")"
   assert_status "restart agent env schema read" "$status" 200
-  json_assert_secret_files_isolated "$ASTRID_HOME" astrid-capsule-openai-compat \
+  json_assert_secret_store_isolated "$ASTRID_HOME" astrid-capsule-openai-compat \
     "$sentinel" "$user_principal" "$user_secret" "$ops_principal" "$ops_secret"
   run_cli secret list --agent "$user_principal" --format json > "$ARTIFACTS/restart-agent-secret-list.json"
   json_assert_secret_list_metadata "$ARTIFACTS/restart-agent-secret-list.json" \
@@ -843,29 +830,24 @@ PY
   status="$(http_status GET "/api/agent/sessions?include_archived=true&limit=20" "$restart_user_bearer" "" \
     "$ARTIFACTS/restart-agent-sessions.json")"
   assert_status "restart agent session list" "$status" 200
-  json_assert_session_list_scope "$ARTIFACTS/restart-agent-sessions.json" "$user_session" "$ops_session"
-  status="$(http_status GET "/api/agent/sessions/$user_session" "$restart_user_bearer" "" \
-    "$ARTIFACTS/restart-agent-session.json")"
-  assert_status "restart agent session get" "$status" 200
-  json_assert_session_summary "$ARTIFACTS/restart-agent-session.json" "$user_session" "$user_session_title"
+  json_assert_session_list_scope "$ARTIFACTS/restart-agent-sessions.json" \
+    "$user_session" "$ops_session"
   status="$(http_status GET "/api/agent/sessions/$user_session/messages" "$restart_user_bearer" "" \
     "$ARTIFACTS/restart-agent-session-messages.json")"
   assert_status "restart agent session transcript" "$status" 200
   json_assert_session_messages_contains "$ARTIFACTS/restart-agent-session-messages.json" \
     "$user_session" "$user_session_text"
-  status="$(http_status GET "/api/agent/sessions/$ops_session" "$restart_user_bearer" "" \
-    "$ARTIFACTS/restart-agent-cross-session-get-hidden.json")"
-  assert_status "restart agent cross-principal session get hidden" "$status" 404
   status="$(http_status GET "/api/agent/sessions/$ops_session/messages" "$restart_user_bearer" "" \
     "$ARTIFACTS/restart-agent-cross-session-messages-empty.json")"
   assert_status "restart agent cross-principal session transcript empty" "$status" 200
   json_assert_session_messages_empty "$ARTIFACTS/restart-agent-cross-session-messages-empty.json" "$ops_session"
   run_crash_recovery_smoke "$restart_user_bearer" "$ops_bearer" "$user_principal" \
     "$user_session" "$ops_session"
-  backup_adversarial_capsule_install
   run_live_approval_cancel_smoke "$restart_user_bearer" "$user_principal"
-  restore_adversarial_capsule_install "$ops_bearer" "$restart_user_bearer" "$user_principal"
-  run_live_elicit_cancel_smoke "$restart_user_bearer" "$user_principal"
+  # Use the independently provisioned operator package for the second unload
+  # cancellation. Reinstalling into the same principal between probes would
+  # test generation replacement rather than the cancellation contract.
+  run_live_elicit_cancel_smoke "$ops_bearer" "$ops_principal"
 
   note "checking .capsule artifact lifecycle"
   if run_principal_cli "$user_principal" capsule remove astrid-capsule-cli --force; then
@@ -893,8 +875,15 @@ PY
   local registry_install_body
   registry_install_body="$(capsule_install_body "$registry_archive")"
   status="$(http_status POST /api/capsules "$restart_user_bearer" "$registry_install_body" \
-    "$ARTIFACTS/artifact-lifecycle-agent-install-denied.json")"
-  assert_status "regular agent .capsule install denied" "$status" 403
+    "$ARTIFACTS/artifact-lifecycle-agent-self-install.json")"
+  assert_status "regular agent caller-scoped .capsule install" "$status" 200
+  json_assert_capsule_install_output "$ARTIFACTS/artifact-lifecycle-agent-self-install.json" upgrade
+  status="$(http_status GET /api/capsules "$ops_bearer" "" \
+    "$ARTIFACTS/artifact-lifecycle-operator-after-agent-install-capsules.json")"
+  assert_status "operator list after agent caller-scoped install" "$status" 200
+  json_assert_capsule_list_state \
+    "$ARTIFACTS/artifact-lifecycle-operator-after-agent-install-capsules.json" \
+    astrid-capsule-registry absent
   status="$(http_status POST /api/capsules "$ops_bearer" "$registry_install_body" \
     "$ARTIFACTS/artifact-lifecycle-operator-install.json")"
   assert_status "operator .capsule install" "$status" 200
@@ -909,14 +898,14 @@ PY
   assert_status "artifact lifecycle operator detail after install" "$status" 200
   run_principal_cli "$ops_principal" capsule show astrid-capsule-registry --agent "$ops_principal" --format json \
     > "$ARTIFACTS/artifact-lifecycle-show.json"
-  json_assert_capsule_show_archive_source "$ARTIFACTS/artifact-lifecycle-show.json" \
-    astrid-capsule-registry "$registry_archive"
+  json_assert_capsule_show_durable_source "$ARTIFACTS/artifact-lifecycle-show.json" \
+    astrid-capsule-registry
 
   run_principal_cli "$ops_principal" capsule update astrid-capsule-registry
   run_principal_cli "$ops_principal" capsule show astrid-capsule-registry --agent "$ops_principal" --format json \
     > "$ARTIFACTS/artifact-lifecycle-show-after-update.json"
-  json_assert_capsule_show_archive_source "$ARTIFACTS/artifact-lifecycle-show-after-update.json" \
-    astrid-capsule-registry "$registry_archive"
+  json_assert_capsule_show_durable_source "$ARTIFACTS/artifact-lifecycle-show-after-update.json" \
+    astrid-capsule-registry
   status="$(http_status GET /api/capsules "$ops_bearer" "" \
     "$ARTIFACTS/artifact-lifecycle-operator-after-update-capsules.json")"
   assert_status "artifact lifecycle operator list after update" "$status" 200

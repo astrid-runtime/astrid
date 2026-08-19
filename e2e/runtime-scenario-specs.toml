@@ -51,6 +51,16 @@ denial = ["regular caller cannot read cross-principal firehose entries"]
 state = ["audit log remains append-only"]
 evidence = ["agent-audit.json and operator-audit.json artifacts"]
 
+[scenarios.audit_operator_controls]
+status = "mapped"
+surfaces = ["cli"]
+auth = ["admin CLI with audit operator authority"]
+success = ["stats and health report bounded accounting and ingestion state; prune returns a signed retention receipt"]
+denial = ["regular principals cannot inspect global audit accounting or prune retained history"]
+state = ["stats and health are read-only; prune removes only an eligible sealed segment and preserves the retained suffix"]
+evidence = ["structured stats and health output, signed prune receipt, and retained-chain verification artifacts"]
+remaining = ["exercise healthy and degraded stats and health, authorized prune, and denied non-operator calls in the runtime CLI harness"]
+
 [scenarios.bearer_session]
 status = "covered"
 surfaces = ["http"]
@@ -159,6 +169,16 @@ success = ["gc reports/removes only temp-home content eligible for collection"]
 denial = ["invalid or inaccessible temp content path fails safely"]
 state = ["content store remains internally consistent"]
 evidence = ["gc transcript and post-gc content listing"]
+
+[scenarios.storage_mount_lifecycle]
+status = "mapped"
+surfaces = ["cli"]
+auth = ["authenticated acting principal plus provider lease admission"]
+success = ["mount selects exactly one principal, fleet, or admin view; sync publishes acknowledged dirty state; status reports the lease; unmount revokes it"]
+denial = ["unauthorized view selection, writable admin access without explicit request, stale lease, and missing native provider fail closed"]
+state = ["mount does not provision storage; acknowledged writes remain staged until generation-checked publication; unmount revokes only the selected lease"]
+evidence = ["platform provider transcript, lease and staging receipts, canonical path walk, and post-unmount access denial"]
+remaining = ["kernel mount leases, durable staging and publication, and native FSKit, libfuse, and WinFsp provider companions are not implemented"]
 
 [scenarios.core_capsule_install]
 status = "covered"

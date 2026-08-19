@@ -3,6 +3,57 @@
 
 use super::*;
 
+fn migration_target() -> LayoutMigrationTarget {
+    LayoutMigrationTarget::new("test-store/3;state-owner-codec/2", "test-binary/1").unwrap()
+}
+
+#[cfg(not(windows))]
+fn write_released_legacy_store(home: &AstridHome, bytes: &[u8]) -> PathBuf {
+    let manifest = home.state_db_path().join("manifest");
+    std::fs::create_dir_all(&manifest).unwrap();
+    let file = manifest.join("00000000000000000001.manifest");
+    std::fs::write(&file, bytes).unwrap();
+    file
+}
+
+#[cfg(not(windows))]
+fn write_test_storage_volume(home: &AstridHome, bytes: &[u8]) {
+    std::fs::write(home.storage_volume_path(), bytes).unwrap();
+}
+
+fn test_home_root(dir: &tempfile::TempDir) -> PathBuf {
+    #[cfg(windows)]
+    {
+        dir.path().join("astrid-home")
+    }
+    #[cfg(not(windows))]
+    {
+        dir.path().to_path_buf()
+    }
+}
+
+fn parent_traversal_path() -> String {
+    #[cfg(windows)]
+    {
+        r"C:\tmp\..\etc".to_owned()
+    }
+    #[cfg(not(windows))]
+    {
+        "/tmp/../etc".to_owned()
+    }
+}
+
+fn absolute_test_home() -> String {
+    #[cfg(windows)]
+    {
+        r"C:\Users\astrid-test".to_owned()
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned())
+    }
+}
+
 // ── AstridHome resolution ────────────────────────────────────────
 
 #[test]
@@ -17,7 +68,7 @@ fn test_astrid_home_resolve_with_env() {
 
 #[test]
 fn test_astrid_home_resolve_default() {
-    let home_val = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let home_val = absolute_test_home();
     let home = AstridHome::resolve_with_env(None, Some(home_val.clone())).unwrap();
     let expected = PathBuf::from(home_val).join(".astrid");
     assert_eq!(home.root(), expected);
@@ -25,7 +76,7 @@ fn test_astrid_home_resolve_default() {
 
 #[test]
 fn test_astrid_home_rejects_traversal_in_astrid_home() {
-    let result = AstridHome::resolve_with_env(Some("/tmp/../etc".to_string()), None);
+    let result = AstridHome::resolve_with_env(Some(parent_traversal_path()), None);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
@@ -36,7 +87,7 @@ fn test_astrid_home_rejects_traversal_in_astrid_home() {
 
 #[test]
 fn test_astrid_home_rejects_traversal_in_home() {
-    let result = AstridHome::resolve_with_env(None, Some("/tmp/../etc".to_string()));
+    let result = AstridHome::resolve_with_env(None, Some(parent_traversal_path()));
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
@@ -70,7 +121,7 @@ fn test_astrid_home_rejects_relative_home() {
 #[test]
 fn test_astrid_home_ensure_creates_dirs() {
     let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
+    let home = AstridHome::from_path(test_home_root(&dir));
     home.ensure().unwrap();
 
     assert!(home.etc_dir().exists());
@@ -79,15 +130,21 @@ fn test_astrid_home_ensure_creates_dirs() {
     assert!(home.run_dir().exists());
     assert!(home.log_dir().exists());
     assert!(home.keys_dir().exists());
-    assert!(home.secrets_dir().exists());
+    assert!(!home.secrets_dir().exists());
     assert!(home.bin_dir().exists());
-    assert!(home.home_dir().exists());
+    // `home/` is a legacy import source and is not recreated on a fresh v2
+    // boot. It is created only when an upgrade fixture explicitly provides it.
+    assert!(!home.home_dir().exists());
+    assert!(home.content_staging_path().exists());
+    assert!(home.migrations_dir().exists());
+    assert!(!home.cow_dir().exists());
+    assert!(!home.root().join("srv").exists());
 }
 
 #[test]
 fn test_astrid_home_ensure_writes_layout_version() {
     let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
+    let home = AstridHome::from_path(test_home_root(&dir));
     home.ensure().unwrap();
 
     let version_path = home.etc_dir().join("layout-version");
@@ -99,9 +156,500 @@ fn test_astrid_home_ensure_writes_layout_version() {
 #[test]
 fn test_astrid_home_ensure_idempotent() {
     let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
+    let home = AstridHome::from_path(test_home_root(&dir));
     home.ensure().unwrap();
     home.ensure().unwrap(); // second call should not fail
+}
+
+#[test]
+fn test_fresh_home_restart_does_not_recreate_legacy_secret_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    home.ensure().unwrap();
+    assert!(!home.secrets_dir().exists());
+    home.ensure().unwrap();
+    assert!(!home.secrets_dir().exists());
+}
+
+#[test]
+fn test_nonempty_home_without_layout_sentinel_is_refused_without_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    let legacy = home.var_dir().join("state.db");
+    crate::platform_fs::ensure_private_directory(&legacy).unwrap();
+    std::fs::write(legacy.join("legacy"), b"preserve-me").unwrap();
+
+    let error = home.ensure().unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(!home.layout_version_path().exists());
+    assert_eq!(
+        std::fs::read(legacy.join("legacy")).unwrap(),
+        b"preserve-me"
+    );
+    assert!(!home.root().join("srv").exists());
+}
+
+#[test]
+fn test_layout_version_requires_canonical_exact_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), b"1\n").unwrap();
+
+    let error = home.ensure().unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(!home.var_dir().exists());
+}
+
+#[test]
+fn test_astrid_home_rejects_unknown_layout_before_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), "999").unwrap();
+
+    let error = home.ensure().unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(!home.var_dir().exists());
+    assert_eq!(
+        std::fs::read_to_string(home.layout_version_path()).unwrap(),
+        "999"
+    );
+}
+
+#[test]
+fn test_layout_v1_is_not_committed_until_store_and_ownership_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
+
+    home.ensure().unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(home.layout_version_path()).unwrap(),
+        LEGACY_LAYOUT_VERSION
+    );
+    assert!(!home.root().join("srv").exists());
+    assert!(!home.migrations_dir().exists());
+}
+
+#[cfg(not(windows))]
+#[test]
+fn test_layout_v1_completion_preserves_private_home_without_served_projections() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
+    home.ensure().unwrap();
+    let preserved = home
+        .principal_home(&PrincipalId::default())
+        .root()
+        .join("note");
+    std::fs::create_dir_all(preserved.parent().unwrap()).unwrap();
+    std::fs::write(&preserved, b"released-home-bytes").unwrap();
+    home.begin_layout_v2_migration(&migration_target()).unwrap();
+    write_test_storage_volume(&home, b"test-volume");
+    home.complete_layout_v2(&migration_target()).unwrap();
+
+    assert_eq!(std::fs::read(&preserved).unwrap(), b"released-home-bytes");
+    assert!(!home.root().join("srv").exists());
+    assert!(
+        home.migrations_dir()
+            .join("layout-v1-to-v2.intent")
+            .is_file()
+    );
+    assert!(
+        home.migrations_dir()
+            .join("layout-v1-to-v2.complete")
+            .is_file()
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.layout_version_path()).unwrap(),
+        LAYOUT_VERSION
+    );
+    home.complete_layout_v2(&migration_target()).unwrap();
+}
+
+#[cfg(not(windows))]
+#[test]
+fn test_layout_migration_records_are_canonical_and_content_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
+    home.ensure().unwrap();
+    write_released_legacy_store(&home, b"legacy-bytes");
+    std::fs::create_dir_all(home.principal_store_path()).unwrap();
+    home.begin_layout_v2_migration(&migration_target()).unwrap();
+    write_test_storage_volume(&home, b"test-volume");
+    home.complete_layout_v2(&migration_target()).unwrap();
+
+    let intent_path = home.migrations_dir().join("layout-v1-to-v2.intent");
+    let receipt_path = home.migrations_dir().join("layout-v1-to-v2.complete");
+    let intent = std::fs::read(&intent_path).unwrap();
+    let receipt = std::fs::read(&receipt_path).unwrap();
+    assert_eq!(intent.last(), Some(&b'\n'));
+    let value: serde_json::Value = serde_json::from_slice(&intent).unwrap();
+    let receipt_value: serde_json::Value = serde_json::from_slice(&receipt).unwrap();
+    assert_eq!(value["schema"], 1);
+    assert_eq!(value["material"]["source"]["entries"], 2);
+    assert_eq!(value["material"]["source"]["bytes"], 12);
+    assert_eq!(
+        value["material"]["target_store_format"],
+        "test-store/3;state-owner-codec/2"
+    );
+    assert_eq!(value["transaction_id"].as_str().unwrap().len(), 64);
+    assert_eq!(receipt_value["intent"], value);
+    assert_eq!(receipt_value["transaction_id"], value["transaction_id"]);
+    assert!(receipt_value.get("fleet_uids").is_none());
+    assert!(!home.state_db_path().exists());
+
+    home.complete_layout_v2(&migration_target()).unwrap();
+    assert_eq!(std::fs::read(intent_path).unwrap(), intent);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_layout_migration_rejects_redirected_destination_before_intent() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
+    home.ensure().unwrap();
+    symlink(outside.path(), home.principal_store_path()).unwrap();
+
+    let error = home
+        .begin_layout_v2_migration(&migration_target())
+        .unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(!home.migrations_dir().exists());
+    assert_eq!(
+        std::fs::read_to_string(home.layout_version_path()).unwrap(),
+        LEGACY_LAYOUT_VERSION
+    );
+    assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+}
+
+#[cfg(not(windows))]
+#[test]
+fn test_layout_migration_rejects_unreleased_legacy_shape_before_intent() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
+    home.ensure().unwrap();
+    std::fs::create_dir_all(home.state_db_path()).unwrap();
+    let unexpected = home.state_db_path().join("operator-notes.txt");
+    std::fs::write(&unexpected, b"do-not-delete").unwrap();
+
+    let error = home
+        .begin_layout_v2_migration(&migration_target())
+        .unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("unexpected entry"), "{error}");
+    assert_eq!(std::fs::read(&unexpected).unwrap(), b"do-not-delete");
+    assert!(!home.migrations_dir().exists());
+    assert_eq!(
+        std::fs::read_to_string(home.layout_version_path()).unwrap(),
+        LEGACY_LAYOUT_VERSION
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn test_windows_layout_one_requires_explicit_developer_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
+    home.ensure().unwrap();
+
+    let error = home
+        .begin_layout_v2_migration(&migration_target())
+        .unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    assert!(!home.migrations_dir().exists());
+    assert_eq!(
+        std::fs::read_to_string(home.layout_version_path()).unwrap(),
+        LEGACY_LAYOUT_VERSION
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_layout_v1_completion_removes_verified_legacy_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
+    home.ensure().unwrap();
+    let legacy_file = write_released_legacy_store(&home, b"legacy");
+
+    home.begin_layout_v2_migration(&migration_target()).unwrap();
+    write_test_storage_volume(&home, b"test-volume");
+    home.complete_layout_v2(&migration_target()).unwrap();
+
+    assert!(!legacy_file.exists());
+    assert!(!home.state_db_path().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_layout_v2_startup_defers_interrupted_legacy_retirement_to_kernel_barrier() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
+    home.ensure().unwrap();
+    write_released_legacy_store(&home, b"legacy");
+    home.begin_layout_v2_migration(&migration_target()).unwrap();
+    write_test_storage_volume(&home, b"test-volume");
+    home.complete_layout_v2(&migration_target()).unwrap();
+
+    // Recreate the exact post-sentinel/pre-retirement crash shape. The
+    // directory bootstrap must retain both sources because only the kernel's
+    // global component ledger can authorize post-barrier retirement.
+    write_released_legacy_store(&home, b"legacy");
+    let legacy_cow_file = home.cow_dir().join("workspace").join("merged");
+    std::fs::create_dir_all(legacy_cow_file.parent().unwrap()).unwrap();
+    std::fs::write(&legacy_cow_file, b"disposable-cow-bytes").unwrap();
+    home.ensure().unwrap();
+
+    assert!(home.state_db_path().exists());
+    assert!(home.cow_dir().exists());
+    home.ensure().unwrap();
+    assert!(home.state_db_path().exists());
+    assert!(home.cow_dir().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_layout_v2_ensure_retains_reappeared_legacy_cow_for_barrier() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    home.ensure().unwrap();
+    assert!(!home.cow_dir().exists());
+
+    std::fs::create_dir(home.cow_dir()).unwrap();
+    home.ensure().unwrap();
+    assert!(home.cow_dir().exists());
+
+    let nested_file = home.cow_dir().join("capsule").join("merged").join("file");
+    std::fs::create_dir_all(nested_file.parent().unwrap()).unwrap();
+    std::fs::write(&nested_file, b"legacy workspace bytes").unwrap();
+    home.ensure().unwrap();
+    assert_eq!(
+        std::fs::read(&nested_file).unwrap(),
+        b"legacy workspace bytes"
+    );
+    home.ensure().unwrap();
+    assert!(home.cow_dir().exists());
+
+    // A v2 home without a cut-over receipt cannot authorize source deletion,
+    // even through the explicit finalizer. The barrier must publish its
+    // component ledger before CoW retirement is allowed.
+    let error = home.complete_layout_v2(&migration_target()).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("without a completion receipt"));
+    assert!(nested_file.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_layout_v2_ensure_rejects_but_does_not_delete_legacy_cow_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_file = outside.path().join("must-survive");
+    std::fs::write(&outside_file, b"outside bytes").unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    home.ensure().unwrap();
+    symlink(outside.path(), home.cow_dir()).unwrap();
+
+    let error = home.ensure().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("redirect"));
+    assert_eq!(std::fs::read(outside_file).unwrap(), b"outside bytes");
+    assert!(
+        std::fs::symlink_metadata(home.cow_dir())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_layout_v2_ensure_rejects_but_does_not_delete_legacy_cow_special_entry() {
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    home.ensure().unwrap();
+    let retained = home.cow_dir().join("workspace").join("retained");
+    std::fs::create_dir_all(retained.parent().unwrap()).unwrap();
+    std::fs::write(&retained, b"must survive rejection").unwrap();
+    let fifo = home.cow_dir().join("workspace").join("unsafe.fifo");
+    mkfifo(&fifo, Mode::from_bits_truncate(0o600)).unwrap();
+
+    let error = home.ensure().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("special file"));
+    assert_eq!(std::fs::read(retained).unwrap(), b"must survive rejection");
+    assert!(fifo.exists());
+    assert!(home.cow_dir().exists());
+}
+
+#[test]
+fn runtime_principal_scratch_is_cleared_on_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    home.ensure().unwrap();
+    let stale = home.run_dir().join("principals").join("uid-a").join("tmp");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("leftover"), b"ephemeral").unwrap();
+
+    home.clear_runtime_principal_scratch().unwrap();
+
+    assert!(home.run_dir().join("principals").is_dir());
+    assert!(!stale.parent().unwrap().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_principal_scratch_rejects_redirects_without_following_or_deleting() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    home.ensure().unwrap();
+    let principals = home.run_dir().join("principals");
+    std::fs::create_dir_all(&principals).unwrap();
+    let outside_file = outside.path().join("survive");
+    std::fs::write(&outside_file, b"outside").unwrap();
+    let redirect = principals.join("uid-a");
+    symlink(outside.path(), &redirect).unwrap();
+
+    let error = home.clear_runtime_principal_scratch().unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("redirect"));
+    assert_eq!(std::fs::read(outside_file).unwrap(), b"outside");
+    assert!(
+        std::fs::symlink_metadata(redirect)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_principal_scratch_rejects_special_entries_without_partial_delete() {
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    home.ensure().unwrap();
+    let principal = home.run_dir().join("principals").join("uid-a");
+    std::fs::create_dir_all(&principal).unwrap();
+    let retained = principal.join("retained");
+    std::fs::write(&retained, b"must survive").unwrap();
+    let fifo = principal.join("unsafe.fifo");
+    mkfifo(&fifo, Mode::from_bits_truncate(0o600)).unwrap();
+
+    let error = home.clear_runtime_principal_scratch().unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("special file"));
+    assert_eq!(std::fs::read(retained).unwrap(), b"must survive");
+    assert!(fifo.exists());
+}
+
+#[cfg(not(windows))]
+#[test]
+fn test_layout_v2_startup_accepts_live_volume_changes_after_retirement() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
+    home.ensure().unwrap();
+    write_released_legacy_store(&home, b"legacy");
+    home.begin_layout_v2_migration(&migration_target()).unwrap();
+    write_test_storage_volume(&home, b"cutover-volume");
+    home.complete_layout_v2(&migration_target()).unwrap();
+    assert!(!home.state_db_path().exists());
+
+    // The completion receipt records the cutover point, not an immutable
+    // identity for the live volume after Astrid begins serving writes.
+    write_test_storage_volume(&home, b"live-post-cutover-write");
+
+    home.ensure().unwrap();
+    assert_eq!(
+        std::fs::read(home.storage_volume_path()).unwrap(),
+        b"live-post-cutover-write"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn test_layout_v2_startup_rejects_corrupt_receipt_without_retiring_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
+    home.ensure().unwrap();
+    home.begin_layout_v2_migration(&migration_target()).unwrap();
+    write_test_storage_volume(&home, b"test-volume");
+    home.complete_layout_v2(&migration_target()).unwrap();
+    let surviving = write_released_legacy_store(&home, b"");
+    std::fs::write(
+        home.migrations_dir().join("layout-v1-to-v2.complete"),
+        b"not-json\n",
+    )
+    .unwrap();
+
+    let error = home.complete_layout_v2(&migration_target()).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(surviving.exists());
+    assert!(home.state_db_path().exists());
+}
+
+#[cfg(not(windows))]
+#[test]
+fn test_layout_v2_startup_rejects_changed_volume_without_retiring_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
+    home.ensure().unwrap();
+    home.begin_layout_v2_migration(&migration_target()).unwrap();
+    write_test_storage_volume(&home, b"test-volume");
+    home.complete_layout_v2(&migration_target()).unwrap();
+    let surviving = write_released_legacy_store(&home, b"");
+    write_test_storage_volume(&home, b"changed-volume");
+
+    let error = home.complete_layout_v2(&migration_target()).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("destination"), "{error}");
+    assert!(surviving.exists());
+    assert!(home.state_db_path().exists());
 }
 
 #[cfg(unix)]
@@ -110,7 +658,7 @@ fn test_astrid_home_ensure_sets_permissions() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
+    let home = AstridHome::from_path(test_home_root(&dir));
     home.ensure().unwrap();
 
     let root_perms = std::fs::metadata(home.root()).unwrap().permissions();
@@ -122,12 +670,14 @@ fn test_astrid_home_ensure_sets_permissions() {
 
 #[cfg(unix)]
 #[test]
-fn test_astrid_home_ensure_repairs_secrets_permissions_without_touching_contents() {
+fn test_astrid_home_ensure_leaves_legacy_secrets_untouched() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
+    let home = AstridHome::from_path(test_home_root(&dir));
     std::fs::create_dir_all(home.secrets_dir()).unwrap();
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), LAYOUT_VERSION).unwrap();
     let secret = home.secrets_dir().join("existing-secret");
     let bytes = b"preserve-these-secret-bytes";
     std::fs::write(&secret, bytes).unwrap();
@@ -136,7 +686,9 @@ fn test_astrid_home_ensure_repairs_secrets_permissions_without_touching_contents
     home.ensure().unwrap();
 
     let permissions = std::fs::metadata(home.secrets_dir()).unwrap().permissions();
-    assert_eq!(permissions.mode() & 0o777, 0o700);
+    // Legacy file-secret roots are an explicit migration source only; a
+    // steady-state ensure must not recreate or rewrite their permissions.
+    assert_eq!(permissions.mode() & 0o777, 0o755);
     assert_eq!(std::fs::read(secret).unwrap(), bytes);
 }
 
@@ -164,6 +716,10 @@ fn test_astrid_home_fhs_paths() {
     assert_eq!(home.hooks_dir(), PathBuf::from(format!("{r}/etc/hooks")));
     assert_eq!(home.var_dir(), PathBuf::from(format!("{r}/var")));
     assert_eq!(
+        home.layout_version_path(),
+        PathBuf::from(format!("{r}/etc/layout-version"))
+    );
+    assert_eq!(
         home.state_db_path(),
         PathBuf::from(format!("{r}/var/state.db"))
     );
@@ -174,6 +730,10 @@ fn test_astrid_home_fhs_paths() {
     assert_eq!(
         home.content_staging_path(),
         PathBuf::from(format!("{r}/var/content-staging"))
+    );
+    assert_eq!(
+        home.migrations_dir(),
+        PathBuf::from(format!("{r}/var/migrations"))
     );
     assert_eq!(home.run_dir(), PathBuf::from(format!("{r}/run")));
     assert_eq!(
@@ -243,7 +803,7 @@ fn test_principal_home_ensure_creates_dirs() {
     assert!(ph.audit_dir().exists());
     assert!(ph.tokens_dir().exists());
     assert!(ph.tmp_dir().exists());
-    assert!(ph.env_dir().exists());
+    assert!(!ph.env_dir().exists());
 }
 
 #[cfg(unix)]
@@ -263,10 +823,10 @@ fn test_principal_home_ensure_sets_permissions() {
         .permissions();
     assert_eq!(local_perms.mode() & 0o777, 0o700);
 
-    let config_perms = std::fs::metadata(ph.root().join(".config"))
-        .unwrap()
-        .permissions();
-    assert_eq!(config_perms.mode() & 0o777, 0o700);
+    assert!(
+        !ph.root().join(".config").exists(),
+        "fresh principal homes must not recreate the legacy config/env tree"
+    );
 }
 
 #[test]
@@ -571,8 +1131,15 @@ fn test_workspace_id_adopts_existing() {
     let dir = tempfile::tempdir().unwrap();
     let ws = WorkspaceDir::from_path(dir.path());
 
-    std::fs::create_dir_all(ws.dot_astrid()).unwrap();
+    crate::platform_fs::ensure_private_directory(&ws.dot_astrid()).unwrap();
     let pre_id = uuid::Uuid::new_v4();
+    #[cfg(windows)]
+    crate::platform_fs::atomic_write_private_file(
+        &ws.workspace_id_path(),
+        pre_id.to_string().as_bytes(),
+    )
+    .unwrap();
+    #[cfg(not(windows))]
     std::fs::write(ws.workspace_id_path(), pre_id.to_string()).unwrap();
 
     let id = ws.workspace_id().unwrap();

@@ -119,10 +119,7 @@ pub fn default_astrid_home_root() -> io::Result<PathBuf> {
 pub fn ensure_private_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        std::fs::create_dir_all(path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        ensure_private_directory_unix(path)
     }
 
     #[cfg(windows)]
@@ -133,6 +130,40 @@ pub fn ensure_private_directory(path: &Path) -> io::Result<()> {
     #[cfg(not(any(unix, windows)))]
     {
         std::fs::create_dir_all(path)
+    }
+}
+
+/// Validate an existing directory against the platform's private-access policy.
+///
+/// Unix requires a current-user-owned directory with exactly owner-only mode
+/// bits and rejects redirects in every existing path component. Windows uses
+/// the same protected-DACL contract as creation.
+///
+/// # Errors
+///
+/// Returns an error when the directory is missing, redirected, not owned by the
+/// current user, or does not satisfy the platform private-access policy.
+pub fn validate_private_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        validate_private_directory_unix(path)
+    }
+
+    #[cfg(windows)]
+    {
+        windows::ensure_private_directory(path)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "private path is not a directory",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -181,10 +212,18 @@ pub fn restrict_private_file(path: &Path) -> io::Result<()> {
         windows::restrict_private_file(path)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        restrict_private_file_unix(path)
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
-        Ok(())
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private host-file permissions are unavailable on this target",
+        ))
     }
 }
 
@@ -203,7 +242,37 @@ pub fn validate_private_file(path: &Path) -> io::Result<()> {
         windows::validate_private_file(path)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        validate_private_file_unix(path)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private host-file validation is unavailable on this target",
+        ))
+    }
+}
+
+/// Reject a native path carrying an extended access-control list.
+///
+/// macOS ACL entries can grant access beyond owner-only POSIX mode bits, so
+/// security-sensitive paths must satisfy both checks. Platforms without this
+/// additional ACL surface accept the path unchanged.
+///
+/// # Errors
+///
+/// Returns an error when the ACL cannot be inspected or contains any entry.
+pub fn validate_no_extended_acl(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        validate_no_extended_acl_macos(path)
+    }
+
+    #[cfg(not(target_os = "macos"))]
     {
         let _ = path;
         Ok(())
@@ -228,13 +297,21 @@ pub(crate) fn read_private_file_to_string(path: &Path) -> io::Result<String> {
         windows::read_private_file_to_string(path)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        if validate_private_file(path).is_err() {
+            restrict_private_file(path)?;
+        }
+        std::fs::read_to_string(path)
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         std::fs::read_to_string(path)
     }
 }
 
-/// Atomically write one private file on Windows.
+/// Atomically write one private file.
 ///
 /// The temporary is created exclusively beside the destination, secured before
 /// it becomes visible under the live name, flushed through the supported file
@@ -255,7 +332,12 @@ pub fn atomic_write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
         windows::atomic_write_private_file(path, bytes)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        atomic_write_private_file_unix(path, bytes)
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (path, bytes);
         Err(io::Error::new(
@@ -270,12 +352,13 @@ pub fn atomic_write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// Windows checks the reparse attribute on every existing component, covering
 /// symlinks, junctions, and mount points. It also rejects parent owners or ACLs
 /// that let untrusted principals replace checked components, and identity-locks
-/// the chain while validating it. Existing Unix call sites retain their current
-/// `symlink_metadata` and canonical-path checks.
+/// the chain while validating it. Unix opens the nearest existing directory
+/// authority and rejects a redirect at the requested or nearest-existing path;
+/// callers retain directory capabilities across multi-step mutations.
 ///
 /// # Errors
 ///
-/// Returns an error if an existing Windows path component is a reparse point,
+/// Returns an error if an existing security-sensitive path is redirected,
 /// changes identity, or belongs to an untrusted parent chain.
 pub fn verify_no_redirects(path: &Path) -> io::Result<()> {
     #[cfg(windows)]
@@ -283,11 +366,373 @@ pub fn verify_no_redirects(path: &Path) -> io::Result<()> {
         windows::verify_no_redirects(path)
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        verify_no_redirects_unix(path)
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn verify_no_redirects_unix(path: &Path) -> io::Result<()> {
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("private path is redirected: {}", path.display()),
+        )),
+        Ok(metadata) if metadata.is_dir() => open_directory_no_follow_unix(path).map(drop),
+        Ok(_) => {
+            let parent = path.parent().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("private path has no parent: {}", path.display()),
+                )
+            })?;
+            let name = path.file_name().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("private path has no file name: {}", path.display()),
+                )
+            })?;
+            let directory = open_directory_no_follow_unix(parent)?;
+            let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK;
+            openat(&directory, name, flags, Mode::empty())
+                .map(std::fs::File::from)
+                .map(drop)
+                .map_err(nix_io_error)
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            open_directory_no_follow_unix(path).map(drop)
+        },
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn ensure_private_directory_unix(path: &Path) -> io::Result<()> {
+    use nix::errno::Errno;
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::{Mode, fchmod, mkdirat};
+
+    let (mut directory, components) = unix_directory_walk(path)?;
+    for component in components {
+        let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+        let next = match openat(&directory, component.as_os_str(), flags, Mode::empty()) {
+            Ok(next) => next,
+            Err(Errno::ENOENT) => {
+                match mkdirat(
+                    &directory,
+                    component.as_os_str(),
+                    Mode::from_bits_truncate(0o700),
+                ) {
+                    Ok(()) | Err(Errno::EEXIST) => {},
+                    Err(error) => return Err(nix_io_error(error)),
+                }
+                openat(&directory, component.as_os_str(), flags, Mode::empty())
+                    .map_err(nix_io_error)?
+            },
+            Err(error) => return Err(nix_io_error(error)),
+        };
+        directory = std::fs::File::from(next);
+    }
+    fchmod(&directory, Mode::from_bits_truncate(0o700)).map_err(nix_io_error)?;
+    #[cfg(target_os = "macos")]
+    remove_extended_acl_macos(path)?;
+    validate_private_directory_unix(path)
+}
+
+#[cfg(unix)]
+fn validate_private_directory_unix(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let directory = open_directory_no_follow_unix(path)?;
+    let metadata = directory.metadata()?;
+    if metadata.uid() != nix::unistd::getuid().as_raw() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "private directory is not owned by the current user: {}",
+                path.display()
+            ),
+        ));
+    }
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("private directory is not owner-only: {}", path.display()),
+        ));
+    }
+    validate_no_extended_acl(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_private_file_unix(path: &Path) -> io::Result<()> {
+    use nix::sys::stat::{Mode, fchmod, fstat};
+
+    let file = open_file_no_follow_unix(path)?;
+    let metadata = fstat(&file).map_err(nix_io_error)?;
+    if metadata.st_mode & 0o170_000 != 0o100_000 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("private path is not a regular file: {}", path.display()),
+        ));
+    }
+    fchmod(&file, Mode::from_bits_truncate(0o600)).map_err(nix_io_error)?;
+    file.sync_all()?;
+    drop(file);
+    #[cfg(target_os = "macos")]
+    remove_extended_acl_macos(path)?;
+    validate_private_file_unix(path)
+}
+
+#[cfg(unix)]
+fn validate_private_file_unix(path: &Path) -> io::Result<()> {
+    use nix::sys::stat::fstat;
+
+    let file = open_file_no_follow_unix(path)?;
+    let metadata = fstat(&file).map_err(nix_io_error)?;
+    if metadata.st_mode & 0o170_000 != 0o100_000 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("private path is not a regular file: {}", path.display()),
+        ));
+    }
+    if metadata.st_uid != nix::unistd::getuid().as_raw() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "private file is not owned by the current user: {}",
+                path.display()
+            ),
+        ));
+    }
+    if metadata.st_mode & 0o777 != 0o600 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("private file is not owner-only: {}", path.display()),
+        ));
+    }
+    validate_no_extended_acl(path)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn remove_extended_acl_macos(path: &Path) -> io::Result<()> {
+    let path = absolute_command_path(path)?;
+    let status = std::process::Command::new("/bin/chmod")
+        .arg("-N")
+        .arg(path)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "failed to remove extended access-control list",
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn validate_no_extended_acl_macos(path: &Path) -> io::Result<()> {
+    let path = absolute_command_path(path)?;
+    let output = std::process::Command::new("/bin/ls")
+        .arg("-lde")
+        .arg(path)
+        .env("LC_ALL", "C")
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            "failed to inspect extended access-control list",
+        ));
+    }
+    let listing = String::from_utf8(output.stdout)
+        .map_err(|_| io::Error::other("access-control listing is not UTF-8"))?;
+    let has_acl_entry = listing.lines().skip(1).any(|line| {
+        line.trim_start()
+            .split_once(':')
+            .is_some_and(|(index, _)| index.parse::<usize>().is_ok())
+    });
+    if has_acl_entry {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private path has an extended access-control list",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn absolute_command_path(path: &Path) -> io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+#[cfg(unix)]
+fn open_file_no_follow_unix(path: &Path) -> io::Result<std::fs::File> {
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
+
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("private file has no parent: {}", path.display()),
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("private file has no name: {}", path.display()),
+        )
+    })?;
+    let directory = open_directory_no_follow_unix(parent)?;
+    let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    openat(&directory, name, flags, Mode::from_bits_truncate(0o600))
+        .map(std::fs::File::from)
+        .map_err(nix_io_error)
+}
+
+#[cfg(unix)]
+fn atomic_write_private_file_unix(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("private atomic file has no parent: {}", path.display()),
+        )
+    })?;
+    ensure_private_directory(parent)?;
+    let temporary = parent.join(format!(".astrid-private-{}", uuid::Uuid::new_v4().simple()));
+    let write = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    })();
+    if let Err(error) = write {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = rename_with_write_through(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Ok(parent_handle) = open_directory_no_follow_unix(parent) {
+        parent_handle.sync_all()?;
+    }
+    validate_private_file(path)
+}
+
+#[cfg(unix)]
+fn open_directory_no_follow_unix(path: &Path) -> io::Result<std::fs::File> {
+    let (directory, _) = unix_directory_walk(path)?;
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn unix_directory_walk(path: &Path) -> io::Result<(std::fs::File, Vec<std::ffi::OsString>)> {
+    use nix::errno::Errno;
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
+    use std::path::Component;
+
+    let components = path.components().collect::<Vec<_>>();
+    if components
+        .iter()
+        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("private directory contains traversal: {}", path.display()),
+        ));
+    }
+
+    let absolute = normalize_unix_system_alias(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    });
+    let mut directory = if absolute
+        .components()
+        .next()
+        .is_some_and(|component| matches!(component, Component::RootDir))
+    {
+        std::fs::File::open("/")
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("private directory has no Unix root: {}", path.display()),
+        ));
+    }?;
+    let mut missing = Vec::new();
+    for component in absolute
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_os_string()),
+            _ => None,
+        })
+    {
+        if missing.is_empty() {
+            let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+            match openat(&directory, component.as_os_str(), flags, Mode::empty()) {
+                Ok(next) => directory = std::fs::File::from(next),
+                Err(Errno::ENOENT) => missing.push(component),
+                Err(error) => return Err(nix_io_error(error)),
+            }
+        } else {
+            missing.push(component);
+        }
+    }
+
+    if directory.metadata()?.is_dir() {
+        Ok((directory, missing))
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("private directory is not a directory: {}", path.display()),
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_unix_system_alias(path: PathBuf) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let bytes = path.as_os_str().as_bytes();
+    if bytes == b"/tmp" || bytes.starts_with(b"/tmp/") {
+        return PathBuf::from("/private/tmp").join(path.strip_prefix("/tmp").expect("prefix"));
+    }
+    if bytes == b"/var" || bytes.starts_with(b"/var/") {
+        return PathBuf::from("/private/var").join(path.strip_prefix("/var").expect("prefix"));
+    }
+    path
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn normalize_unix_system_alias(path: PathBuf) -> PathBuf {
+    path
+}
+
+#[cfg(unix)]
+fn nix_io_error(error: nix::errno::Errno) -> io::Error {
+    io::Error::from_raw_os_error(error as i32)
 }
 
 /// Back up and replace a complete set of authenticated executables.
@@ -392,11 +837,24 @@ fn replace_executable_set_by_rename(
     let mut staged = Vec::new();
     for name in names {
         let temporary = install_dir.join(format!(".{name}.new"));
-        std::fs::copy(extract_dir.join(name), &temporary)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))?;
+        let stage_result = (|| -> io::Result<()> {
+            std::fs::copy(extract_dir.join(name), &temporary)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = stage_result {
+            let _ = std::fs::remove_file(&temporary);
+            for (staged_temporary, _) in &staged {
+                let _ = std::fs::remove_file(staged_temporary);
+            }
+            return Err(io::Error::new(
+                error.kind(),
+                format!("failed to stage {}: {error}", temporary.display()),
+            ));
         }
         staged.push((temporary, install_dir.join(name)));
     }
@@ -404,9 +862,17 @@ fn replace_executable_set_by_rename(
     for (index, (temporary, live)) in staged.iter().enumerate() {
         if let Err(error) = std::fs::rename(temporary, live) {
             let mut rollback_errors = Vec::new();
-            for (backup_live, backup) in &backups {
-                if let Err(rollback_error) = std::fs::rename(backup, backup_live) {
-                    rollback_errors.push(format!("{}: {rollback_error}", backup_live.display()));
+            for (_, installed_live) in &staged[..index] {
+                if let Some((_, backup)) = backups
+                    .iter()
+                    .find(|(backup_live, _)| backup_live == installed_live)
+                {
+                    if let Err(rollback_error) = std::fs::rename(backup, installed_live) {
+                        rollback_errors
+                            .push(format!("{}: {rollback_error}", installed_live.display()));
+                    }
+                } else if let Err(rollback_error) = std::fs::remove_file(installed_live) {
+                    rollback_errors.push(format!("{}: {rollback_error}", installed_live.display()));
                 }
             }
             for (remaining, _) in &staged[index..] {

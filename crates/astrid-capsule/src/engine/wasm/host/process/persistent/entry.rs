@@ -90,6 +90,12 @@ pub(super) struct PersistentEntry {
     /// `reap_entry`. `None` when the spawn had no injections.
     #[allow(dead_code)] // Held purely for its Drop; never read after spawn.
     pub(super) injection_guard: Option<super::super::inject::InjectionGuard>,
+    /// Kernel-issued native storage projection kept until process reap.
+    /// The guard's `Drop` revokes the private leases and removes the
+    /// disposable projection, so a persistent child cannot outlive its
+    /// authorized workspace view.
+    #[allow(dead_code)]
+    pub(super) process_storage_mount: Option<crate::context::ProcessStorageMount>,
 }
 
 impl PersistentEntry {

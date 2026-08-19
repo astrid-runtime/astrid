@@ -9,6 +9,17 @@ pub enum AuditError {
     #[error("storage error: {0}")]
     StorageError(String),
 
+    /// The configured global retention cap requires pruning before appending.
+    #[error("audit retention cap reached")]
+    RetentionCapReached,
+
+    /// The selected backend does not expose a bounded operation.
+    #[error("audit backend does not support {operation}")]
+    UnsupportedOperation {
+        /// Stable operation name for callers that need a capability fallback.
+        operation: &'static str,
+    },
+
     /// Serialization error.
     #[error("serialization error: {0}")]
     SerializationError(String),

@@ -262,6 +262,8 @@ fn normalized_file_mode(metadata: &fs::Metadata, file: &mut File) -> Result<u32>
             return Ok(0o755);
         }
     }
+    #[cfg(not(unix))]
+    let _ = metadata;
 
     // Windows has no Unix execute bits. Preserve executable intent from
     // self-describing file formats so a checked-out script or native binary

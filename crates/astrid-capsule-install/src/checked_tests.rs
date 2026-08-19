@@ -1,8 +1,14 @@
 use std::fs::File;
+use std::sync::Arc;
 
 use astrid_capsule::capsule::CapsuleId;
 use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
+use astrid_core::identity::PrincipalUid;
+use astrid_storage::{
+    KvQuotaResolver, PrincipalDirectory, RuntimePrincipalStore, StateOwner,
+    open_runtime_principal_store_with_directory,
+};
 
 use crate::{
     InstallOptions, install_from_local_path_checked_for_principal, resolve_target_dir_for,
@@ -25,11 +31,38 @@ fn existing_target(home: &AstridHome, principal: &PrincipalId, name: &str) -> st
     target
 }
 
+fn install_store(home: &AstridHome, principal: &PrincipalId) -> Arc<RuntimePrincipalStore> {
+    let directory = PrincipalDirectory::default();
+    directory
+        .register(principal.clone(), PrincipalUid::from_bytes([0x22; 32]))
+        .unwrap();
+    let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
+        Ok(match owner {
+            StateOwner::System => None,
+            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+        })
+    });
+    let store = Arc::new(
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(open_runtime_principal_store_with_directory(
+                home, quota, directory,
+            ))
+            .unwrap(),
+    );
+    store
+        .principal_directory()
+        .register(principal.clone(), PrincipalUid::from_bytes([0x22; 32]))
+        .unwrap();
+    store
+}
+
 #[test]
 fn checked_local_rejects_identity_before_target_mutation() {
     let temp = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(temp.path().join("home"));
     let principal = PrincipalId::new("alice").unwrap();
+    let storage = install_store(&home, &principal);
     let expected = CapsuleId::new("expected").unwrap();
     let source = temp.path().join("source");
     write_manifest(&source, "unexpected", "1.0.0");
@@ -38,7 +71,10 @@ fn checked_local_rejects_identity_before_target_mutation() {
     let err = install_from_local_path_checked_for_principal(
         &source,
         &home,
-        InstallOptions::default(),
+        InstallOptions {
+            storage: Some(storage),
+            ..Default::default()
+        },
         &principal,
         &expected,
         Some("1.0.0"),
@@ -59,6 +95,7 @@ fn checked_archive_rejects_version_before_replacing_existing_install() {
     let temp = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(temp.path().join("home"));
     let principal = PrincipalId::new("alice").unwrap();
+    let storage = install_store(&home, &principal);
     let expected = CapsuleId::new("expected").unwrap();
     let source = temp.path().join("source");
     write_manifest(&source, expected.as_str(), "2.0.0");
@@ -78,7 +115,10 @@ fn checked_archive_rejects_version_before_replacing_existing_install() {
     let err = unpack_and_install_checked_for_principal(
         &archive_path,
         &home,
-        InstallOptions::default(),
+        InstallOptions {
+            storage: Some(storage),
+            ..Default::default()
+        },
         &principal,
         &expected,
         Some("1.0.0"),

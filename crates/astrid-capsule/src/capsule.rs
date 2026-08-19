@@ -140,15 +140,19 @@ pub trait Capsule: Send + Sync {
     /// Promote this capsule's OS-level copy-on-write workspace changes into the
     /// pristine workspace (the gate's "approve"). Returns `Ok(true)` if a
     /// copy-on-write workspace was committed, `Ok(false)` if the capsule has
-    /// none (git-managed or No-CoW). Default: `Ok(false)`.
-    async fn promote_workspace(&self) -> CapsuleResult<bool> {
+    /// none (git-managed or a runtime without a hosted CoW portal). A hosted
+    /// portal that cannot provide isolation is rejected during load. Default:
+    /// `Ok(false)`.
+    async fn promote_workspace(&self, caller: &astrid_core::PrincipalId) -> CapsuleResult<bool> {
+        let _ = caller;
         Ok(false)
     }
 
     /// Discard this capsule's OS-level copy-on-write workspace changes (the
     /// gate's "reject"). Returns `Ok(true)` if a copy-on-write workspace was
     /// rolled back, `Ok(false)` if the capsule has none. Default: `Ok(false)`.
-    async fn rollback_workspace(&self) -> CapsuleResult<bool> {
+    async fn rollback_workspace(&self, caller: &astrid_core::PrincipalId) -> CapsuleResult<bool> {
+        let _ = caller;
         Ok(false)
     }
 
@@ -372,18 +376,18 @@ impl Capsule for CompositeCapsule {
         }
     }
 
-    async fn promote_workspace(&self) -> CapsuleResult<bool> {
+    async fn promote_workspace(&self, caller: &astrid_core::PrincipalId) -> CapsuleResult<bool> {
         let mut promoted = false;
         for engine in &self.engines {
-            promoted |= engine.promote_workspace().await?;
+            promoted |= engine.promote_workspace(caller).await?;
         }
         Ok(promoted)
     }
 
-    async fn rollback_workspace(&self) -> CapsuleResult<bool> {
+    async fn rollback_workspace(&self, caller: &astrid_core::PrincipalId) -> CapsuleResult<bool> {
         let mut rolled_back = false;
         for engine in &self.engines {
-            rolled_back |= engine.rollback_workspace().await?;
+            rolled_back |= engine.rollback_workspace(caller).await?;
         }
         Ok(rolled_back)
     }

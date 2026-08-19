@@ -547,8 +547,11 @@ async fn kernel_and_gateway_boot_against_shared_home() {
     let home_dir = tempfile::tempdir().expect("tempdir");
     set_astrid_home(&home_dir);
 
-    let workspace = home_dir.path().join("workspace");
-    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    // Keep workspace content outside the empty Astrid home. The kernel must
+    // observe that empty root itself so it can admit a genuinely fresh layout
+    // and durably write the component-migration ledger before later boots.
+    let workspace_dir = tempfile::tempdir().expect("workspace tempdir");
+    let workspace = workspace_dir.path().to_path_buf();
 
     let session_id = astrid_core::SessionId::new();
     let kernel = match astrid_kernel::Kernel::new(
@@ -601,6 +604,7 @@ async fn kernel_and_gateway_boot_against_shared_home() {
     };
     let state = GatewayState::new(
         gateway_config,
+        None,
         Some(Arc::clone(&kernel.event_bus)),
         Some(Arc::clone(&kernel.audit_log)),
         Some(kernel.session_id.clone()),

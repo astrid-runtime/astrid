@@ -123,6 +123,19 @@ impl PrincipalDirectory {
         self.inner.read().principals.contains_key(&uid)
     }
 
+    /// Snapshot every admitted alias-to-UID binding in deterministic order.
+    #[must_use]
+    pub fn bindings(&self) -> Vec<(PrincipalId, PrincipalUid)> {
+        let state = self.inner.read();
+        let mut bindings = state
+            .aliases
+            .iter()
+            .map(|(alias, uid)| (alias.clone(), *uid))
+            .collect::<Vec<_>>();
+        bindings.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+        bindings
+    }
+
     /// Rebind one existing UID to a new validated alias.
     ///
     /// The old alias must currently name `uid`, and the replacement alias must

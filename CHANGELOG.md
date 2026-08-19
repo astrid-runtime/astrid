@@ -22,6 +22,65 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   support stack are updated without changing rmcp, Wasmtime/WASM tooling,
   TOML, base64, or other dependencies that require dedicated migration review.
   Closes #1529.
+### Added
+
+- **Astrid storage now exposes authoritative principal, fleet, and system-owner
+  filesystem views without a host-directory projection.** Regular files remain
+  immutable content DAGs, directories live in the same owner catalog, and
+  acknowledged create, write, truncate, remove, rename, and sync operations
+  atomically publish through the typed store. Kernel-issued leases bind owner,
+  access, expiry, and a private callback secret. Native mounted views ship through
+  the macOS 26 FSKit app and lifecycle companion, Linux FUSE companion, and
+  Windows WinFsp companion. All three adapters use the same bounded V2 callback
+  contract while the kernel retains V1 decoding compatibility. Mounting exposes
+  an already-authorized owner root; it never provisions a user, principal, fleet,
+  store, or allocation. Refs #1391 and #1534.
+- **macOS storage mounts now ship as a complete governed release surface.**
+  The archive includes the signed Developer ID AstridFS app and FSKit
+  extension, the Rust companion, deterministic metadata, notarization and staple
+  validation, and install/update/enable/status/uninstall lifecycle tooling.
+  Mount resources and registries use current-owner `0700`/`0600` entries,
+  reject redirected paths, and refuse public or foreign mountpoints unless the
+  provider creates an owner-private governed entry.
+- **The authoritative principal store now opens through a path-free Astrid
+  volume contract.** Hosted systems keep all arena, root, index, cutover, and
+  GC-outbox regions in one locked `var/astrid.volume` container; bare-metal
+  storage can implement the same exact-offset and transactional contract over a
+  device without inheriting host-directory semantics. Volume metadata commits
+  atomically bind a compacted arena replacement to its ready audit receipt, and
+  recovery rejects interior corruption while retiring only incomplete tails.
+  The verified directory-backed store is now migration input and is deleted
+  after exact owner snapshots reopen from the volume.
+- **Astrid home layout version two now has a crash-resumable release upgrade
+  boundary and canonical fleet-served paths.** New homes create
+  `srv/fleets/{fleet_uid}/{shared,workspaces}` and durable migration records;
+  released layout-one homes keep their sentinel until the principal store and
+  ownership graph have migrated, adopt otherwise-unowned legacy principals
+  into the operator's home fleet, preserve principal and system files, retain
+  `var/state.db` read-only on Unix, and write layout `2` last. Canonical
+  content-bound intent/receipt records, exact sentinel admission, redirected
+  path rejection, and the separate fleet-aware owner codec fail closed. The new
+  `astrid storage mount|sync|status|unmount` grammar uses a versioned typed
+  exchange with a co-installed FSKit, libfuse, or WinFsp provider, including
+  capability validation and stable mount IDs, without provisioning storage.
+  Refs #1391.
+  boundary.** Released layout-one homes keep their sentinel until the principal
+  store and ownership graph have migrated, adopt otherwise-unowned legacy
+  principals into the operator's home fleet, and preserve private runtime
+  configuration. After the content-bound receipt and layout `2` sentinel are
+  durable, the verified `var/state.db` import source is deleted. No physical
+  `srv/fleets/...` or other served copy is created. Exact sentinel admission,
+  redirected-path rejection, and the separate fleet-aware owner codec fail
+  closed.
+
+### Changed
+
+- **Reviewed semver-compatible Rust dependencies were refreshed independently
+  of migration-sensitive upgrades.** Routine fixes and additive releases for
+  the async runtime, serialization, TLS, storage, CLI, matching, and platform
+  support stack are updated without changing rmcp, Wasmtime/WASM tooling,
+  TOML, base64, or other dependencies that require dedicated migration review.
+  Closes #1529.
 
 ### Fixed
 

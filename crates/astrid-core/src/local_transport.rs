@@ -8,10 +8,10 @@
 //!
 //! On Unix, the stream, listener, and owned-half aliases are the exact Tokio
 //! types used before this seam was introduced. On Windows, the caller's path
-//! is only a portable API token: endpoint naming comes exclusively from the
-//! current process token SID. Backends own endpoint presence checks, stale
-//! cleanup, connection probing, and same-user peer verification so callers do
-//! not assume filesystem sockets.
+//! is a portable API token combined with the current process token SID to form
+//! a private, path-scoped pipe name. Backends own endpoint presence checks,
+//! stale cleanup, connection probing, and same-user peer verification so
+//! callers do not assume filesystem sockets and unrelated endpoints stay independent.
 
 use std::io;
 use std::path::Path;
@@ -206,6 +206,15 @@ pub fn peer_is_current_user(stream: &LocalStream) -> io::Result<bool> {
     backend::peer_is_current_user(stream)
 }
 
+/// Resolve the current process user's SID in SDDL form.
+///
+/// Native filesystem providers use this identifier to synthesize fixed
+/// owner-bound descriptors without embedding an operating-system identity.
+#[cfg(windows)]
+pub fn current_user_security_identifier() -> io::Result<String> {
+    backend::current_user_sddl()
+}
+
 /// Resolve the backend-owned endpoint name for native security harnesses.
 #[cfg(all(windows, feature = "test-support"))]
 #[doc(hidden)]
@@ -233,7 +242,7 @@ pub async fn listener_rejects_remote_clients_for_test(
 #[cfg(unix)]
 mod backend {
     use std::io;
-    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt as _};
     use std::path::Path;
 
     use super::{ConnectOutcome, LocalListener, LocalReadHalf, LocalStream, LocalWriteHalf};
@@ -260,7 +269,16 @@ mod backend {
 
     pub(super) fn bind(path: &Path) -> io::Result<LocalListener> {
         prepare_endpoint_for_bind(path)?;
-        tokio::net::UnixListener::bind(path)
+        let listener = tokio::net::UnixListener::bind(path);
+        let listener = listener.inspect_err(|_error| {
+            let _ = std::fs::remove_file(path);
+        })?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).inspect_err(
+            |_error| {
+                let _ = std::fs::remove_file(path);
+            },
+        )?;
+        Ok(listener)
     }
 
     pub(super) async fn accept(listener: &LocalListener) -> io::Result<LocalStream> {
@@ -468,6 +486,8 @@ impl AsyncWrite for LocalStream {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::time::Duration;
+
     use super::{
         ConnectOutcome, accept, bind, connect, connect_outcome, endpoint_is_present,
         peer_is_current_user, probe, remove_endpoint, split, unsupported_backend_error,
@@ -506,16 +526,32 @@ mod tests {
         ));
 
         let listener = bind(&endpoint).unwrap();
-        assert!(matches!(
-            connect_outcome(&endpoint).await.unwrap(),
-            ConnectOutcome::Connected(_)
-        ));
+        let ConnectOutcome::Connected(client) = connect_outcome(&endpoint).await.unwrap() else {
+            panic!("live listener must accept a connection");
+        };
+        let server = accept(&listener).await.unwrap();
+        drop(client);
+        drop(server);
         drop(listener);
+        // Tokio's reactor may retain the registered descriptor briefly while
+        // unrelated tests are active. Build the stale-state fixture with an
+        // unregistered standard listener so the assertion is deterministic.
+        remove_endpoint(&endpoint).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&endpoint).unwrap());
 
-        assert!(matches!(
-            connect_outcome(&endpoint).await.unwrap(),
-            ConnectOutcome::Stale
-        ));
+        let mut observed_stale = false;
+        for _ in 0..100 {
+            match connect_outcome(&endpoint).await.unwrap() {
+                ConnectOutcome::Stale => {
+                    observed_stale = true;
+                    break;
+                },
+                ConnectOutcome::Connected(stream) => drop(stream),
+                ConnectOutcome::Absent => panic!("bound stale socket must remain present"),
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(observed_stale, "stale endpoint remained transiently live");
         assert!(endpoint_is_present(&endpoint).unwrap());
     }
 
@@ -527,9 +563,28 @@ mod tests {
 
         let error = bind(&endpoint).unwrap_err();
         assert!(error.to_string().contains("already running"));
+        // The live-listener probe established a real queued connection. Drain
+        // it before closing the listener so the kernel cannot transiently
+        // report that queued socket as live during the stale-endpoint check.
+        drop(accept(&listener).await.unwrap());
         drop(listener);
+        remove_endpoint(&endpoint).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&endpoint).unwrap());
 
-        let replacement = bind(&endpoint).expect("stale endpoint should be replaced");
+        let mut replacement = None;
+        for _ in 0..100 {
+            match bind(&endpoint) {
+                Ok(listener) => {
+                    replacement = Some(listener);
+                    break;
+                },
+                Err(error) if error.to_string().contains("already running") => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                },
+                Err(error) => panic!("stale endpoint should be replaced: {error}"),
+            }
+        }
+        let replacement = replacement.expect("stale endpoint remained transiently live");
         drop(replacement);
         remove_endpoint(&endpoint).unwrap();
     }

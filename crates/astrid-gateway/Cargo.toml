@@ -63,6 +63,7 @@ hex = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 metrics-process = { workspace = true }
+nix = { workspace = true }
 rand = { workspace = true }
 # GitHub-source resolution for `POST /api/capsules`: the gateway (an uplink)
 # downloads a `.capsule` release asset to a temp file, then hands the kernel a
@@ -87,6 +88,7 @@ utoipa = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 astrid-crypto = { workspace = true }
 tempfile = { workspace = true }
 

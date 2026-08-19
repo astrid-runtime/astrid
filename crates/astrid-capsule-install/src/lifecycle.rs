@@ -30,6 +30,7 @@ use astrid_capsule::manifest::CapsuleManifest;
 use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
 use astrid_events::EventBus;
+use astrid_storage::RuntimePrincipalStore;
 
 /// Resolve operator `astrid:http` host policy from the global `[http]` config
 /// section into the typed [`HttpLimits`](astrid_capsule::HttpLimits) for the
@@ -92,6 +93,8 @@ pub fn run_lifecycle(
         manifest,
         home.as_ref(),
         &principal,
+        None,
+        None,
         phase,
         previous_version,
         external_bus,
@@ -101,8 +104,10 @@ pub fn run_lifecycle(
 /// Run the capsule's lifecycle hook for an explicit principal and injected
 /// Astrid home.
 ///
-/// This is the principal-aware install path. The hook's `home://` mount, KV
-/// namespace, secret store, and IPC identity are scoped to `target_principal`.
+/// This is the principal-aware install path. The hook's KV namespace, secret
+/// store, and IPC identity are scoped to `target_principal`; `home://` is
+/// available only when an authorized durable principal store is threaded into
+/// the engine context.
 /// Lifecycle resource limits remain the engine's finite one-shot defaults; no
 /// kernel profile or persistent quota ledger is available on this path.
 #[allow(clippy::too_many_arguments)]
@@ -122,6 +127,42 @@ pub fn run_lifecycle_for_principal(
         manifest,
         Some(home),
         target_principal,
+        None,
+        None,
+        phase,
+        previous_version,
+        external_bus,
+    )
+}
+
+/// Run a lifecycle hook with the authoritative principal store and alias
+/// directory. The immutable UID is resolved before any secret scope is built;
+/// callers that only have a mutable alias must use this entry point rather
+/// than deriving a namespace from alias text.
+#[allow(clippy::too_many_arguments)]
+pub fn run_lifecycle_for_principal_with_storage(
+    target_dir: &Path,
+    wasm_bytes: Vec<u8>,
+    manifest: &CapsuleManifest,
+    home: &AstridHome,
+    target_principal: &PrincipalId,
+    storage: &RuntimePrincipalStore,
+    phase: LifecyclePhase,
+    previous_version: Option<&str>,
+    external_bus: Option<EventBus>,
+) -> anyhow::Result<()> {
+    let directory = storage.principal_directory();
+    let uid = directory
+        .uid_for(target_principal)
+        .map_err(|error| anyhow::anyhow!("resolve durable principal UID: {error}"))?;
+    run_lifecycle_in_scope(
+        target_dir,
+        wasm_bytes,
+        manifest,
+        Some(home),
+        target_principal,
+        Some(uid),
+        Some(storage.clone()),
         phase,
         previous_version,
         external_bus,
@@ -133,16 +174,26 @@ fn run_lifecycle_in_scope(
     target_dir: &Path,
     wasm_bytes: Vec<u8>,
     manifest: &CapsuleManifest,
-    home: Option<&AstridHome>,
+    _home: Option<&AstridHome>,
     target_principal: &PrincipalId,
+    principal_uid: Option<astrid_core::identity::PrincipalUid>,
+    principal_storage: Option<RuntimePrincipalStore>,
     phase: LifecyclePhase,
     previous_version: Option<&str>,
     external_bus: Option<EventBus>,
 ) -> anyhow::Result<()> {
-    let kv_store = Arc::new(astrid_storage::MemoryKvStore::new());
+    if principal_storage.is_none() && !manifest.env.is_empty() {
+        anyhow::bail!(
+            "lifecycle manifest declares environment state but no durable principal UID binding was supplied"
+        );
+    }
+    let kv_store: Arc<dyn astrid_storage::KvStore> = principal_storage.as_ref().map_or_else(
+        || Arc::new(astrid_storage::MemoryKvStore::new()) as Arc<dyn astrid_storage::KvStore>,
+        |store| store.kv(),
+    );
     let capsule_id = manifest.package.name.clone();
     let kv = astrid_storage::ScopedKvStore::new(
-        kv_store,
+        Arc::clone(&kv_store),
         lifecycle_kv_namespace(target_principal, &capsule_id),
     )
     .context("failed to create scoped KV store")?;
@@ -164,35 +215,48 @@ fn run_lifecycle_in_scope(
 
     let capsule_id_owned = astrid_capsule::capsule::CapsuleId::new(capsule_id.clone())
         .map_err(|e| anyhow::anyhow!("invalid capsule ID: {e}"))?;
+    let secret_namespace = if let Some(uid) = principal_uid {
+        astrid_storage::env::principal_secret_namespace(uid, &capsule_id)
+    } else {
+        // A no-env preview lifecycle may use an isolated host-only scope. It
+        // is never an authority source and cannot be selected for manifests
+        // that declare environment state (the guard above fails closed).
+        astrid_storage::env::system_secret_namespace("lifecycle-ephemeral")
+    };
+    let secret_scope = astrid_storage::ScopedKvStore::new(Arc::clone(&kv_store), secret_namespace)
+        .context("failed to create lifecycle secret control scope")?;
     let secret_store = astrid_storage::build_secret_store(
-        &lifecycle_secret_scope(&capsule_id, target_principal),
-        kv.clone(),
+        &format!("{capsule_id}:{target_principal}"),
+        secret_scope,
         handle.clone(),
     );
-    let secret_store = if let Some(legacy_scope) =
-        legacy_lifecycle_secret_scope(&capsule_id, target_principal)
-    {
-        let legacy = astrid_storage::build_secret_store(&legacy_scope, kv.clone(), handle.clone());
-        Arc::new(astrid_storage::ReadThroughSecretStore::new(
-            secret_store,
-            legacy,
-        )) as Arc<dyn astrid_storage::SecretStore>
-    } else {
-        secret_store
-    };
-    let home_root = lifecycle_home_root(home, target_principal)?;
+    // Lifecycle hooks use the same host-owned typed environment projection as
+    // steady-state invocations.  Loading this snapshot here is what makes
+    // daemon-staged `--var` values visible before an install/upgrade hook
+    // executes; no native `.env` or PrincipalHome path is consulted.
+    let config = lifecycle_config_values(
+        principal_uid,
+        &kv_store,
+        &capsule_id,
+        owned_rt.as_ref(),
+        &handle,
+    )?;
+    let home_root = lifecycle_home_root();
     let secret_env = manifest
         .env
         .iter()
         .filter(|(_, declaration)| declaration.env_type.eq_ignore_ascii_case("secret"))
         .map(|(key, _)| key.clone())
         .collect();
-    let mut principal_context =
+    let principal_context =
         astrid_capsule::engine::wasm::LifecyclePrincipalContext::new(target_principal.clone())
             .with_secret_env(secret_env);
-    if let Some(home) = home {
-        principal_context = principal_context.with_file_secret_root(home.secrets_dir());
-    }
+    let principal_context = if let Some(storage) = principal_storage {
+        let directory = storage.principal_directory();
+        principal_context.with_principal_storage(storage, directory)
+    } else {
+        principal_context
+    };
 
     let cfg = astrid_capsule::engine::wasm::LifecycleConfig {
         wasm_bytes,
@@ -201,7 +265,7 @@ fn run_lifecycle_in_scope(
         home_root,
         kv,
         event_bus: event_bus.clone(),
-        config: std::collections::HashMap::new(),
+        config,
         secret_store,
         // Resolve operator `[http]` host policy so a lifecycle hook's HTTP calls
         // honour the same limits as the live runtime. `[http]` is operator-only
@@ -244,26 +308,36 @@ fn lifecycle_kv_namespace(principal: &PrincipalId, capsule_id: &str) -> String {
     format!("{principal}:capsule:{capsule_id}")
 }
 
-fn lifecycle_secret_scope(capsule_id: &str, principal: &PrincipalId) -> String {
-    format!("{capsule_id}:{principal}")
+fn lifecycle_home_root() -> Option<std::path::PathBuf> {
+    // Native PrincipalHome is a released import source, never a lifecycle
+    // authority. The engine mounts home:// only when its principal context
+    // carries the UID-bound AstridFilesystem store.
+    None
 }
 
-fn legacy_lifecycle_secret_scope(capsule_id: &str, principal: &PrincipalId) -> Option<String> {
-    (*principal == PrincipalId::default()).then(|| capsule_id.to_owned())
-}
-
-fn lifecycle_home_root(
-    home: Option<&AstridHome>,
-    principal: &PrincipalId,
-) -> anyhow::Result<Option<std::path::PathBuf>> {
-    let Some(home) = home else {
-        return Ok(None);
+fn lifecycle_config_values(
+    principal_uid: Option<astrid_core::identity::PrincipalUid>,
+    kv_store: &Arc<dyn astrid_storage::KvStore>,
+    capsule_id: &str,
+    owned_rt: Option<&tokio::runtime::Runtime>,
+    handle: &tokio::runtime::Handle,
+) -> anyhow::Result<std::collections::HashMap<String, serde_json::Value>> {
+    let Some(uid) = principal_uid else {
+        return Ok(std::collections::HashMap::new());
     };
-    let principal_home = home.principal_home(principal);
-    principal_home
-        .ensure()
-        .with_context(|| format!("failed to provision lifecycle home for principal {principal}"))?;
-    Ok(Some(principal_home.root().to_path_buf()))
+    let env_scope = astrid_storage::env::principal_env_store(Arc::clone(kv_store), uid, capsule_id)
+        .context("failed to create lifecycle environment control scope")?;
+    let read_env = astrid_storage::env::read_env(&env_scope);
+    let values = if let Some(runtime) = owned_rt {
+        runtime.block_on(read_env)
+    } else {
+        tokio::task::block_in_place(|| handle.block_on(read_env))
+    }
+    .context("failed to read lifecycle environment control scope")?;
+    Ok(values
+        .into_iter()
+        .map(|(key, value)| (key, serde_json::Value::String(value)))
+        .collect())
 }
 
 #[cfg(test)]
@@ -280,34 +354,7 @@ mod tests {
             lifecycle_kv_namespace(&principal, "astrid-capsule-example"),
             "agent-alice:capsule:astrid-capsule-example"
         );
-        assert_eq!(
-            lifecycle_secret_scope("astrid-capsule-example", &principal),
-            "astrid-capsule-example:agent-alice"
-        );
-        assert_eq!(
-            lifecycle_home_root(Some(&home), &principal).unwrap(),
-            Some(home.principal_home(&principal).root().to_path_buf())
-        );
-        assert_ne!(
-            lifecycle_home_root(Some(&home), &principal).unwrap(),
-            Some(
-                home.principal_home(&PrincipalId::default())
-                    .root()
-                    .to_path_buf()
-            )
-        );
-        assert!(
-            home.principal_home(&principal).root().is_dir(),
-            "fresh workspace installs must provision the target principal before mounting home://"
-        );
-        assert_eq!(
-            legacy_lifecycle_secret_scope("astrid-capsule-example", &PrincipalId::default()),
-            Some("astrid-capsule-example".into())
-        );
-        assert_eq!(
-            legacy_lifecycle_secret_scope("astrid-capsule-example", &principal),
-            None,
-            "a non-default principal must never receive the legacy unscoped keychain"
-        );
+        assert_eq!(lifecycle_home_root(), None);
+        assert!(!home.principal_home(&principal).root().exists());
     }
 }

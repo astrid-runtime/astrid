@@ -29,35 +29,47 @@ impl HostProcessHandle for HostState {
     fn read_logs(&mut self, self_: Resource<ProcessHandle>) -> Result<ReadLogsResult, ErrorCode> {
         self.ensure_process_handle_authority()?;
         let principal = self.effective_principal();
-        let proc = self
-            .resource_table
-            .get_mut::<ManagedProcess>(&Resource::new_borrow(self_.rep()))
-            .map_err(|_| ErrorCode::Closed)?;
-        if proc.creator != principal {
-            return Err(ErrorCode::CapabilityDenied);
-        }
-
-        // `tokio::process::Child::try_wait` is non-blocking and
-        // returns the exit status if the child has exited. Same
-        // semantics as std::process::Child::try_wait.
-        let (running, exit_code) = if let Some(child) = proc.child.as_mut() {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    proc.child.take();
-                    (false, status.code())
-                },
-                Ok(None) => (true, None),
-                Err(_) => {
-                    proc.child.take();
-                    (false, Some(-1))
-                },
+        let (running, exit_code, stdout, stderr, process_mount) = {
+            let proc = self
+                .resource_table
+                .get_mut::<ManagedProcess>(&Resource::new_borrow(self_.rep()))
+                .map_err(|_| ErrorCode::Closed)?;
+            if proc.creator != principal {
+                return Err(ErrorCode::CapabilityDenied);
             }
-        } else {
-            (false, None)
-        };
 
-        let stdout = drain_buffer(&proc.stdout_buf);
-        let stderr = drain_buffer(&proc.stderr_buf);
+            // `tokio::process::Child::try_wait` is non-blocking and returns the
+            // exit status if the child has exited.
+            let (running, exit_code, process_mount) = if let Some(child) = proc.child.as_mut() {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        proc.child.take();
+                        (false, status.code(), proc.process_storage_mount.take())
+                    },
+                    Ok(None) => (true, None, None),
+                    Err(_) => {
+                        proc.child.take();
+                        (false, Some(-1), proc.process_storage_mount.take())
+                    },
+                }
+            } else {
+                (false, None, proc.process_storage_mount.take())
+            };
+            (
+                running,
+                exit_code,
+                drain_buffer(&proc.stdout_buf),
+                drain_buffer(&proc.stderr_buf),
+                process_mount,
+            )
+        };
+        if let Some(mount) = process_mount {
+            crate::engine::wasm::host::util::bounded_block_on(
+                &self.runtime_handle,
+                &self.io_semaphore,
+                mount.close_async(),
+            );
+        }
 
         Ok(ReadLogsResult {
             stdout,
@@ -141,22 +153,36 @@ impl HostProcessHandle for HostState {
     fn kill(&mut self, self_: Resource<ProcessHandle>) -> Result<KillResult, ErrorCode> {
         self.ensure_process_handle_authority()?;
         let principal = self.effective_principal();
-        let proc = self
-            .resource_table
-            .get_mut::<ManagedProcess>(&Resource::new_borrow(self_.rep()))
-            .map_err(|_| ErrorCode::Closed)?;
-        if proc.creator != principal {
-            return Err(ErrorCode::CapabilityDenied);
-        }
-        let (killed, exit_code) = match proc.child.take() {
-            Some(mut child) => {
-                let code = kill_and_reap(&mut child);
-                (true, code)
-            },
-            None => (false, None),
+        let (killed, exit_code, process_mount, stdout, stderr) = {
+            let proc = self
+                .resource_table
+                .get_mut::<ManagedProcess>(&Resource::new_borrow(self_.rep()))
+                .map_err(|_| ErrorCode::Closed)?;
+            if proc.creator != principal {
+                return Err(ErrorCode::CapabilityDenied);
+            }
+            let (killed, exit_code, process_mount) = match proc.child.take() {
+                Some(mut child) => {
+                    let code = kill_and_reap(&mut child);
+                    (true, code, proc.process_storage_mount.take())
+                },
+                None => (false, None, proc.process_storage_mount.take()),
+            };
+            (
+                killed,
+                exit_code,
+                process_mount,
+                drain_buffer(&proc.stdout_buf),
+                drain_buffer(&proc.stderr_buf),
+            )
         };
-        let stdout = drain_buffer(&proc.stdout_buf);
-        let stderr = drain_buffer(&proc.stderr_buf);
+        if let Some(mount) = process_mount {
+            crate::engine::wasm::host::util::bounded_block_on(
+                &self.runtime_handle,
+                &self.io_semaphore,
+                mount.close_async(),
+            );
+        }
         Ok(KillResult {
             killed,
             exit: Some(ExitInfo {
@@ -185,48 +211,61 @@ impl HostProcessHandle for HostState {
         // and `kill` / `read-logs` / Drop continue to work; the
         // previous std::Child + spawn_blocking pattern stranded the
         // handle inside the blocking task (Gemini #752 finding).
-        let proc = self
-            .resource_table
-            .get_mut::<ManagedProcess>(&Resource::new_borrow(self_.rep()))
-            .map_err(|_| ErrorCode::Closed)?;
-        if proc.creator != principal {
-            return Err(ErrorCode::CapabilityDenied);
-        }
-        let child = match proc.child.as_mut() {
-            Some(c) => c,
-            None => return Err(ErrorCode::Closed),
+        let (result, process_mount) = {
+            let proc = self
+                .resource_table
+                .get_mut::<ManagedProcess>(&Resource::new_borrow(self_.rep()))
+                .map_err(|_| ErrorCode::Closed)?;
+            if proc.creator != principal {
+                return Err(ErrorCode::CapabilityDenied);
+            }
+            let child = match proc.child.as_mut() {
+                Some(c) => c,
+                None => return Err(ErrorCode::Closed),
+            };
+
+            let result = crate::engine::wasm::host::util::bounded_block_on_cancellable(
+                &rt,
+                &sem,
+                &tok,
+                async move {
+                    match timeout_ms {
+                        Some(ms) => match tokio::time::timeout(
+                            std::time::Duration::from_millis(ms),
+                            child.wait(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(status)) => Ok(status.code()),
+                            Ok(Err(e)) => Err(ErrorCode::Unknown(format!("wait: {e}"))),
+                            Err(_) => Err(ErrorCode::WaitTimeout),
+                        },
+                        None => match child.wait().await {
+                            Ok(status) => Ok(status.code()),
+                            Err(e) => Err(ErrorCode::Unknown(format!("wait: {e}"))),
+                        },
+                    }
+                },
+            );
+
+            // On a successful wait, the child has been reaped — clear the
+            // slot so a subsequent `wait` doesn't observe a stale Child
+            // that the OS no longer knows about.
+            let succeeded = matches!(result, Some(Ok(_)));
+            let process_mount = if succeeded {
+                proc.child.take();
+                proc.process_storage_mount.take()
+            } else {
+                None
+            };
+            (result, process_mount)
         };
-
-        let result = crate::engine::wasm::host::util::bounded_block_on_cancellable(
-            &rt,
-            &sem,
-            &tok,
-            async move {
-                match timeout_ms {
-                    Some(ms) => match tokio::time::timeout(
-                        std::time::Duration::from_millis(ms),
-                        child.wait(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(status)) => Ok(status.code()),
-                        Ok(Err(e)) => Err(ErrorCode::Unknown(format!("wait: {e}"))),
-                        Err(_) => Err(ErrorCode::WaitTimeout),
-                    },
-                    None => match child.wait().await {
-                        Ok(status) => Ok(status.code()),
-                        Err(e) => Err(ErrorCode::Unknown(format!("wait: {e}"))),
-                    },
-                }
-            },
-        );
-
-        // On a successful wait, the child has been reaped — clear the
-        // slot so a subsequent `wait` doesn't observe a stale Child
-        // that the OS no longer knows about.
-        let succeeded = matches!(result, Some(Ok(_)));
-        if succeeded {
-            proc.child.take();
+        if let Some(mount) = process_mount {
+            crate::engine::wasm::host::util::bounded_block_on(
+                &self.runtime_handle,
+                &self.io_semaphore,
+                mount.close_async(),
+            );
         }
 
         match result {
@@ -297,7 +336,7 @@ impl HostProcessHandle for HostState {
         // tracker can be updated *before* `ManagedProcess::Drop` kills
         // the child — otherwise a `tool.v1.request.cancel` event
         // landing simultaneously would chase a freshly-reused PID.
-        if let Ok(managed) = self
+        if let Ok(mut managed) = self
             .resource_table
             .delete::<ManagedProcess>(Resource::new_own(rep.rep()))
         {
@@ -311,9 +350,17 @@ impl HostProcessHandle for HostState {
                     self.process_count_by_principal.remove(&managed.creator);
                 }
             }
+            let process_mount = managed.process_storage_mount.take();
             // Dropping `managed` here kills and reaps any still-live
             // child via `Drop for ManagedProcess`.
             drop(managed);
+            if let Some(mount) = process_mount {
+                crate::engine::wasm::host::util::bounded_block_on(
+                    &self.runtime_handle,
+                    &self.io_semaphore,
+                    mount.close_async(),
+                );
+            }
         }
         Ok(())
     }
@@ -350,6 +397,7 @@ mod tests {
                 command: "fixture".into(),
                 creator: alice,
                 injection_guard: None,
+                process_storage_mount: None,
             })
             .expect("process resource");
         let handle = Resource::<ProcessHandle>::new_borrow(resource.rep());

@@ -15,7 +15,7 @@ use super::native_io::{atomic_write, rename_private_entry, sync_directory};
 use super::staging;
 use super::{
     Blake3ObjectIdentityV1, PrincipalDirectory, RuntimeEngine, RuntimeStore, StateOwner,
-    StateOwnerCodecV1, StateOwnerResolver,
+    StateOwnerCodecV2, StateOwnerResolver,
 };
 use crate::error::{StorageError, StorageResult};
 use crate::identity::{IdentityStore, KvIdentityStore};
@@ -190,7 +190,7 @@ async fn resume_uid_store(
     let Ok(engine) = RuntimeEngine::open(
         store,
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
+        StateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
     ) else {
         return Ok(false);
@@ -260,7 +260,7 @@ async fn migrate_alias_store(
         RuntimeEngine::open(
             store,
             Blake3ObjectIdentityV1,
-            StateOwnerCodecV1,
+            StateOwnerCodecV2,
             RecoveryLimits::process_addressable(),
         )
         .map_err(|error| {
@@ -305,7 +305,7 @@ fn write_uid_root_snapshot(
 ) -> StorageResult<()> {
     let replacement = store.join(REPLACEMENT_ROOT_FILE);
     legacy
-        .write_mapped_root_snapshot(&replacement, &StateOwnerCodecV1, |owner| match owner {
+        .write_mapped_root_snapshot(&replacement, &StateOwnerCodecV2, |owner| match owner {
             AliasStateOwner::System => Ok(StateOwner::System),
             AliasStateOwner::Principal(alias) => {
                 let uid = by_alias
@@ -589,7 +589,7 @@ mod tests {
     use crate::kv::{KvQuotaResolver, ScopedKvStore};
     use crate::principal_state::bootstrap;
     use crate::principal_state::format_amendment::{
-        PRE_PRINCIPAL_UID_FORMAT_SPEC_ID, legacy_store_metadata, store_metadata,
+        PRE_PRINCIPAL_UID_FORMAT_SPEC_ID, legacy_store_metadata,
     };
     use crate::principal_state::migrations::{CATALOG_TREE_MARKER, MIGRATION_MARKER_FILE};
     use crate::principal_state::{StateOwner, open_runtime_principal_store_with_directory};
@@ -598,12 +598,13 @@ mod tests {
         Arc::new(|owner: &StateOwner| {
             Ok(match owner {
                 StateOwner::System => None,
-                StateOwner::Principal(_) => Some(u64::MAX),
+                StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
             })
         })
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn alias_roots_migrate_without_changing_generation_or_commit() {
         let directory = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(directory.path());
@@ -696,17 +697,24 @@ mod tests {
             identity.genesis.created_at_seconds,
             user.created_at.timestamp()
         );
-        assert!(store_path.join(PREVIOUS_ROOT_FILE).exists());
-        assert!(!store_path.join(MIGRATION_INTENT_FILE).exists());
+        assert!(store_path.is_dir());
+        assert!(home.storage_volume_path().is_file());
 
         let format_spec = bootstrap::format_specification().unwrap();
         let catalog_spec = bootstrap::content_catalog_format_specification().unwrap();
         assert_eq!(
-            std::fs::read(store_path.join(STORE_METADATA_FILE)).unwrap(),
-            store_metadata(
-                Blake3ObjectIdentityV1.identify(&format_spec),
-                Blake3ObjectIdentityV1.identify(&catalog_spec),
-            )
+            migrated
+                .engine
+                .object(Blake3ObjectIdentityV1.identify(&format_spec))
+                .unwrap(),
+            Some(format_spec)
+        );
+        assert_eq!(
+            migrated
+                .engine
+                .object(Blake3ObjectIdentityV1.identify(&catalog_spec))
+                .unwrap(),
+            Some(catalog_spec)
         );
         migrated.kv().close().await.unwrap();
     }

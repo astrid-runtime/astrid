@@ -42,8 +42,6 @@ fn seed_footprint(kernel: &Kernel, principal: &PrincipalId) -> (PathBuf, PathBuf
         .keys_dir()
         .join(format!("{principal}.key"));
     let secrets = kernel.astrid_home.secrets_dir().join(principal.as_str());
-    std::fs::create_dir_all(home.join(".local/kv")).unwrap();
-    std::fs::write(home.join(".local/kv/state.db"), b"kv").unwrap();
     std::fs::create_dir_all(key.parent().unwrap()).unwrap();
     std::fs::write(&key, b"signing-key").unwrap();
     std::fs::create_dir_all(&secrets).unwrap();
@@ -78,14 +76,6 @@ async fn agent_delete_reclaims_home_key_and_secrets_and_reports_them() {
     let principal = PrincipalId::new("ghost").unwrap();
     create(&kernel, &principal).await;
     let (home, key, secrets) = seed_footprint(&kernel, &principal);
-    std::fs::create_dir_all(
-        kernel
-            .astrid_home
-            .principal_home(&principal)
-            .capsules_dir()
-            .join("session"),
-    )
-    .unwrap();
     kernel
         .kv
         .set("ghost:capsule:session", "history", b"private".to_vec())
@@ -144,6 +134,68 @@ async fn agent_delete_closes_authz_before_reclaiming() {
 
     assert!(kernel.profile_cache.resolve(&principal).is_err());
     assert!(!home.exists() && !key.exists() && !secrets.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_delete_rejects_reappeared_legacy_secret_after_completed_ledger() {
+    let (_dir, kernel) = fixture().await;
+    let principal = PrincipalId::new("reappeared-secret").unwrap();
+    create(&kernel, &principal).await;
+    let principal_uid = kernel
+        .principal_directory
+        .uid_for(&principal)
+        .expect("principal UID");
+    crate::legacy_migration_barrier::record_absent_legacy_secret_for_test(
+        &kernel.astrid_home,
+        principal_uid,
+    )
+    .expect("absent legacy-secret ledger component");
+
+    // The completion ledger records that this participating alias had no
+    // legacy secret source. Recreating one after cut-over models a stale
+    // operator copy before deletion, not ordinary post-cutover state.
+    let secret_root = kernel.astrid_home.secrets_dir();
+    astrid_core::platform_fs::ensure_private_directory(&secret_root).expect("legacy secrets root");
+    let reappeared = secret_root.join(principal.as_str());
+    astrid_core::platform_fs::ensure_private_directory(&reappeared)
+        .expect("reappeared legacy secret scope");
+    let secret = reappeared.join("api_key");
+    std::fs::write(&secret, b"must-survive").expect("reappeared secret");
+
+    let retried = handlers::dispatch(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentDelete {
+            principal: principal.clone(),
+        },
+    )
+    .await;
+
+    assert!(
+        matches!(retried, AdminResponseBody::Error(_)),
+        "agent.delete must fail closed when a completed-ledger secret source reappears"
+    );
+    assert!(
+        kernel
+            .identity_store
+            .resolve("cli", principal.as_str())
+            .await
+            .expect("identity lookup")
+            .is_some(),
+        "a blocked deletion must not unlink the principal identity"
+    );
+    assert!(
+        PrincipalProfile::path_for(&kernel.astrid_home, &principal).exists(),
+        "a blocked deletion must preserve the principal profile"
+    );
+    assert!(
+        secret.exists(),
+        "reappeared legacy secret must be preserved"
+    );
+    assert!(
+        reappeared.is_dir(),
+        "reappeared legacy scope must be preserved"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -227,13 +279,11 @@ async fn failed_reclamation_keeps_alias_reserved_until_retry_succeeds() {
     let (_dir, kernel) = fixture().await;
     let principal = PrincipalId::new("retry-delete").unwrap();
     create(&kernel, &principal).await;
-    let homes = kernel
-        .astrid_home
-        .principal_home(&principal)
-        .root()
-        .parent()
-        .unwrap()
-        .to_path_buf();
+    // Exercise a failed native-control cleanup without creating a legacy
+    // principal home. The key directory is system-owned and is still
+    // retired by deletion; denying its parent keeps the alias reserved until
+    // the retry, while the migration barrier remains satisfied.
+    let homes = kernel.astrid_home.keys_dir().clone();
     let original_mode = std::fs::metadata(&homes).unwrap().permissions().mode();
     std::fs::set_permissions(&homes, std::fs::Permissions::from_mode(0o500)).unwrap();
 

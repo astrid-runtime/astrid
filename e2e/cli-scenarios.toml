@@ -352,10 +352,22 @@ status = "covered"
 mode = "deferred"
 principal = "admin"
 
-[commands."audit"]
-scenario = "audit_history"
-status = "covered"
-mode = "deferred"
+[commands."audit stats"]
+scenario = "audit_operator_controls"
+status = "mapped"
+mode = "read"
+principal = "admin"
+
+[commands."audit health"]
+scenario = "audit_operator_controls"
+status = "mapped"
+mode = "read"
+principal = "admin"
+
+[commands."audit prune"]
+scenario = "audit_operator_controls"
+status = "mapped"
+mode = "mutating"
 principal = "admin"
 
 [commands."budget show"]
@@ -534,6 +546,30 @@ scenario = "content_store_gc"
 status = "covered"
 mode = "filesystem"
 principal = "local_cli"
+
+[commands."storage mount"]
+scenario = "storage_mount_lifecycle"
+status = "mapped"
+mode = "process"
+principal = "agent_and_admin"
+
+[commands."storage sync"]
+scenario = "storage_mount_lifecycle"
+status = "mapped"
+mode = "process"
+principal = "agent_and_admin"
+
+[commands."storage status"]
+scenario = "storage_mount_lifecycle"
+status = "mapped"
+mode = "process"
+principal = "agent_and_admin"
+
+[commands."storage unmount"]
+scenario = "storage_mount_lifecycle"
+status = "mapped"
+mode = "process"
+principal = "agent_and_admin"
 
 [commands."start"]
 scenario = "daemon_lifecycle"

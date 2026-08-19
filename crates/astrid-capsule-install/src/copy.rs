@@ -1,7 +1,7 @@
 //! Per-capsule directory copy.
 //!
 //! The destination ends up holding only what the runtime actually
-//! reads per-capsule: `Capsule.toml`, `meta.json`, `.env.json`, plus
+//! reads per-capsule: `Capsule.toml`, `meta.json`, plus
 //! tier-2 resources (`dist/`, `node_modules/`, MCP command scripts).
 //! The capsule's `.wasm` binary and `wit/` directory are
 //! deliberately excluded — those live in the shared content-addressed
@@ -46,6 +46,8 @@ use anyhow::{Context, bail};
 /// Recursively copy a capsule source tree to its install target.
 ///
 /// Excludes:
+/// * `.env.json` legacy native configuration (durable env lives in daemon
+///   control storage).
 /// * `*.wasm` files at any depth (the binary lives in `bin/`,
 ///   content-addressed).
 /// * The top-level `wit/` directory (content-addressed in `wit/`).
@@ -83,6 +85,13 @@ fn copy_capsule_dir_inner(
         let src_path = entry.path();
         let name = entry.file_name();
         let dst_path = dst.join(&name);
+
+        // Native env files are legacy migration input only. Never copy one
+        // into a newly installed capsule tree where it could be mistaken for
+        // authoritative state by an older component.
+        if is_root && name == ".env.json" {
+            continue;
+        }
 
         if file_type.is_dir() {
             // Always skip .git and target. Skip dist at the top level only —

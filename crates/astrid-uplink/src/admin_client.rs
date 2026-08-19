@@ -55,6 +55,11 @@ pub const fn topic_suffix(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::QuotaSet { .. } => "quota.set",
         AdminRequestKind::QuotaGet { .. } => "quota.get",
         AdminRequestKind::UsageGet { .. } => "usage.get",
+        AdminRequestKind::EnvSet { .. } => "env.set",
+        AdminRequestKind::EnvList { .. } => "env.list",
+        AdminRequestKind::EnvDelete { .. } => "env.delete",
+        AdminRequestKind::DistroLockGet { .. } => "distro.lock.get",
+        AdminRequestKind::DistroLockSet { .. } => "distro.lock.set",
         AdminRequestKind::GroupCreate { .. } => "group.create",
         AdminRequestKind::GroupDelete { .. } => "group.delete",
         AdminRequestKind::GroupModify { .. } => "group.modify",
@@ -72,6 +77,13 @@ pub const fn topic_suffix(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::PairDeviceRedeem { .. } => "auth.pair.redeem",
         AdminRequestKind::PairDeviceList { .. } => "auth.pair.list",
         AdminRequestKind::PairDeviceRevoke { .. } => "auth.pair.revoke",
+        AdminRequestKind::AuditStats => "audit.stats",
+        AdminRequestKind::AuditPrune { .. } => "audit.prune",
+        AdminRequestKind::AuditHealth => "audit.health",
+        AdminRequestKind::StorageMountIssue { .. } => "storage.mount.issue",
+        AdminRequestKind::StorageMountStatus { .. } => "storage.mount.status",
+        AdminRequestKind::StorageMountSync { .. } => "storage.mount.sync",
+        AdminRequestKind::StorageMountRevoke { .. } => "storage.mount.revoke",
     }
 }
 

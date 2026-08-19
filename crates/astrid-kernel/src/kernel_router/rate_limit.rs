@@ -115,6 +115,7 @@ fn rate_limit_max(req: &KernelRequest) -> Option<u32> {
         KernelRequest::ReloadCapsules
         | KernelRequest::ReloadCapsule { .. }
         | KernelRequest::UnloadCapsule { .. }
+        | KernelRequest::RemoveCapsule { .. }
         | KernelRequest::PromoteWorkspace { .. }
         | KernelRequest::RollbackWorkspace { .. } => Some(5),
         KernelRequest::InstallCapsule { .. } | KernelRequest::ApproveCapability { .. } => Some(10),

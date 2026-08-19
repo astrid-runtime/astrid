@@ -107,15 +107,15 @@ pub(crate) struct CreateArgs {
     /// Non-interactive mode (accept defaults).
     #[arg(short = 'y', long)]
     pub yes: bool,
-    /// Copy env, KV, and secrets from this principal (default: inherit
-    /// nothing). The named principal's `.config/env/`, per-capsule KV
-    /// namespaces, and per-capsule secret files are copied into the new
+    /// Copy typed env/secret control state and KV from this principal
+    /// (default: inherit nothing). The named principal's host-only control
+    /// namespaces and per-capsule KV namespaces are copied into the new
     /// agent. Omit to provision a clean, least-privilege agent.
     #[arg(long = "inherit-from", value_name = "PRINCIPAL")]
     pub inherit_from: Option<String>,
     /// Clone an existing principal: a full replica of its capability profile
     /// (groups, grants, revokes, egress, process allow-list, quotas) AND its
-    /// state (env/KV/secrets, exactly as `--inherit-from`). An exact copy —
+    /// state (typed env/secrets/KV, exactly as `--inherit-from`). An exact copy —
     /// customize afterward with `caps grant` / `quota set` / `agent modify`.
     /// Mutually exclusive with the profile/quota-shaping flags. Cloning a
     /// source that confers admin (`*`) requires `--unsafe-admin`.
@@ -942,6 +942,7 @@ mod tests {
     fn agent_record_roundtrips_through_json() {
         let summary = AgentSummary {
             principal: PrincipalId::new("alice").unwrap(),
+            owner_uid: None,
             enabled: true,
             groups: vec!["agent".into()],
             grants: vec![],

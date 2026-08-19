@@ -1,11 +1,14 @@
+#[cfg(test)]
 use std::collections::HashSet;
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 
-use astrid_core::PrincipalId;
-use astrid_core::dirs::{AstridHome, WorkspaceLayout};
+#[cfg(test)]
 use serde::Deserialize;
+#[cfg(test)]
 use uuid::Uuid;
 
+#[cfg(test)]
 const CAPSULE_ID_NAMESPACE: Uuid = Uuid::from_u128(0x310714d5_9c6d_4c94_8187_75258f393bb6);
 
 /// Derive the trusted `source_id` a shared capsule runtime stamps on its IPC
@@ -18,40 +21,13 @@ const CAPSULE_ID_NAMESPACE: Uuid = Uuid::from_u128(0x310714d5_9c6d_4c94_8187_752
 /// routing to the requesting principal is handled by the principal-scoped routed
 /// subscription plus the body correlation id; this id is only an authenticity
 /// gate, so it needs only to match the runtime's stamped id.
+#[cfg(test)]
 pub(super) fn capsule_source_id_v1(capsule_id: &str, content_hash: &str) -> Uuid {
     let seed = format!("{capsule_id}\0{content_hash}");
     Uuid::new_v5(&CAPSULE_ID_NAMESPACE, seed.as_bytes())
 }
 
-fn trusted_capsule_source_ids_in_home(
-    capsule_id: &str,
-    caller: &PrincipalId,
-    workspace_root: &Path,
-    workspace_layout: &WorkspaceLayout,
-    home: &AstridHome,
-) -> Vec<Uuid> {
-    // The `caller` selects WHICH install set to read the content hash from (a
-    // principal may have its own installed version); it no longer contributes to
-    // the derived source id, which is content-addressed and shared across
-    // principals (issue #1069).
-    let mut dirs = vec![home.principal_home(caller).capsules_dir().join(capsule_id)];
-    let workspace = workspace_layout.resolve(workspace_root).ok();
-    if let Some(workspace) = &workspace
-        && let Ok(capsules) = workspace.verify_tree("capsules")
-    {
-        dirs.push(capsules.join(capsule_id));
-    }
-
-    let ids = trusted_capsule_source_ids_from_dirs(capsule_id, dirs);
-    if workspace
-        .as_ref()
-        .is_some_and(|workspace| workspace.verify_tree("capsules").is_err())
-    {
-        return Vec::new();
-    }
-    ids
-}
-
+#[cfg(test)]
 fn trusted_capsule_source_ids_from_dirs(
     capsule_id: &str,
     dirs: impl IntoIterator<Item = PathBuf>,
@@ -76,6 +52,7 @@ fn trusted_capsule_source_ids_from_dirs(
     ids
 }
 
+#[cfg(test)]
 fn installed_content_hash(capsule_id: &str, dir: &Path) -> Option<String> {
     if let Some(hash) = read_meta_wasm_hash(dir) {
         return Some(hash);
@@ -85,20 +62,10 @@ fn installed_content_hash(capsule_id: &str, dir: &Path) -> Option<String> {
         .map(|package| synthetic_content_hash(&package.name, &package.version))
 }
 
+#[cfg(test)]
 fn read_meta_wasm_hash(dir: &Path) -> Option<String> {
     let meta_path = dir.join("meta.json");
-    let data = match std::fs::read_to_string(&meta_path) {
-        Ok(data) => data,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(e) => {
-            tracing::warn!(
-                path = %meta_path.display(),
-                error = %e,
-                "failed to read meta.json for capsule source-id derivation"
-            );
-            return None;
-        },
-    };
+    let data = read_regular_file(&meta_path, "meta.json")?;
     match serde_json::from_str::<serde_json::Value>(&data) {
         Ok(meta) => meta
             .get("wasm_hash")
@@ -116,6 +83,7 @@ fn read_meta_wasm_hash(dir: &Path) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn synthetic_content_hash(name: &str, version: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"synthetic-capsule-instance:");
@@ -125,31 +93,23 @@ fn synthetic_content_hash(name: &str, version: &str) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct CapsuleManifestPackageOnly {
     package: CapsuleManifestPackage,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct CapsuleManifestPackage {
     name: String,
     version: String,
 }
 
+#[cfg(test)]
 fn read_manifest_package(dir: &Path) -> Option<CapsuleManifestPackage> {
     let manifest_path = dir.join("Capsule.toml");
-    let data = match std::fs::read_to_string(&manifest_path) {
-        Ok(data) => data,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(e) => {
-            tracing::warn!(
-                path = %manifest_path.display(),
-                error = %e,
-                "failed to read Capsule.toml for capsule source-id derivation"
-            );
-            return None;
-        },
-    };
+    let data = read_regular_file(&manifest_path, "Capsule.toml")?;
     match toml::from_str::<CapsuleManifestPackageOnly>(&data) {
         Ok(manifest) => Some(manifest.package),
         Err(e) => {
@@ -163,14 +123,57 @@ fn read_manifest_package(dir: &Path) -> Option<CapsuleManifestPackage> {
     }
 }
 
+/// Test-only source discovery must retain the production workspace boundary:
+/// metadata and manifests are trusted only when they are regular, non-
+/// redirected files.  `read_to_string` alone follows a symlink, so make the
+/// no-follow check explicit before parsing either identity source.
+#[cfg(test)]
+fn read_regular_file(path: &Path, label: &str) -> Option<String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to inspect {label} for capsule source-id derivation"
+            );
+            return None;
+        },
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        tracing::warn!(
+            path = %path.display(),
+            "refusing redirected or non-regular {label} for capsule source-id derivation"
+        );
+        return None;
+    }
+    if let Err(error) = astrid_core::platform_fs::verify_no_redirects(path) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "refusing redirected {label} for capsule source-id derivation"
+        );
+        return None;
+    }
+    match std::fs::read_to_string(path) {
+        Ok(data) => Some(data),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to read {label} for capsule source-id derivation"
+            );
+            None
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         capsule_source_id_v1, synthetic_content_hash, trusted_capsule_source_ids_from_dirs,
-        trusted_capsule_source_ids_in_home,
     };
-    use astrid_core::PrincipalId;
-    use astrid_core::dirs::{AstridHome, WorkspaceLayout};
     use serde_json::json;
     use uuid::Uuid;
 
@@ -316,7 +319,6 @@ mod tests {
 
         for name in ["meta.json", "Capsule.toml"] {
             let workspace = tempfile::tempdir().unwrap();
-            let home_dir = tempfile::tempdir().unwrap();
             let outside = tempfile::tempdir().unwrap();
             let capsule = workspace.path().join(".astrid/capsules/example");
             std::fs::create_dir_all(&capsule).unwrap();
@@ -324,13 +326,7 @@ mod tests {
             std::fs::write(&target, r#"{"wasm_hash":"outside"}"#).unwrap();
             symlink(target, capsule.join(name)).unwrap();
 
-            let ids = trusted_capsule_source_ids_in_home(
-                "example",
-                &PrincipalId::default(),
-                workspace.path(),
-                &WorkspaceLayout::default(),
-                &AstridHome::from_path(home_dir.path()),
-            );
+            let ids = trusted_capsule_source_ids_from_dirs("example", [capsule]);
             assert!(ids.is_empty(), "accepted redirected {name}");
         }
     }

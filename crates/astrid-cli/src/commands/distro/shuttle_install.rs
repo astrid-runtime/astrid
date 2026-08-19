@@ -18,13 +18,14 @@
 //! the install before (or without) writing anything to the user's
 //! capsule store.
 
+use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, bail};
-use astrid_capsule::capsule::CapsuleId;
 use astrid_core::dirs::AstridHome;
+use astrid_core::kernel_api::CapsuleInstallProvenance;
 
-use super::lock::{DistroLock, DistroLockMeta, LockedCapsule, manifest_hash, write_lock};
+use super::lock::{DistroLock, DistroLockMeta, LockedCapsule, manifest_hash, write_lock_to_daemon};
 use super::manifest::parse_manifest;
 use super::{shuttle, trust};
 use crate::commands::init::InitOpts;
@@ -32,15 +33,17 @@ use crate::theme::Theme;
 
 /// Install a distro from a `.shuttle` archive.
 ///
-/// Synchronous: every step (unpack, verify, install from local files)
-/// is offline and blocking. The caller awaits the surrounding init
-/// future, but no `.await` happens inside.
+/// Archive verification remains offline and local; package publication is
+/// delegated to the authenticated daemon for the explicit target principal.
 #[allow(
     clippy::too_many_lines,
     reason = "intentional linear unpack→verify→install→lock pipeline; \
               the security ordering is clearer kept in one place"
 )]
-pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyhow::Result<()> {
+pub(crate) async fn install_from_shuttle(
+    shuttle_path: &Path,
+    opts: &InitOpts,
+) -> anyhow::Result<()> {
     let home = AstridHome::resolve()?;
     home.ensure()?;
 
@@ -75,33 +78,32 @@ pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyh
 
     // 3. Trust gate. A sealed `.shuttle` is a remote-origin artifact:
     //    a missing signature is refused unless --allow-unsigned.
-    let (signer, signature) =
-        if let (Some(signing), Some(sig_hex)) = (&manifest.distro.signing, &sig) {
-            let outcome = trust::verify_and_pin(
-                &home,
-                &distro_id,
-                &signing.pubkey,
-                sig_hex,
-                &lock,
-                opts.accept_new_key,
-            )?;
-            report_trust(&outcome);
-            (Some(outcome.key_str), Some(sig_hex.trim().to_string()))
-        } else {
-            if !opts.allow_unsigned {
-                bail!(
-                    "shuttle for '{distro_id}' is unsigned (no [distro.signing] or Distro.sig) — \
+    let signer = if let (Some(signing), Some(sig_hex)) = (&manifest.distro.signing, &sig) {
+        let outcome = trust::verify_and_pin(
+            &home,
+            &distro_id,
+            &signing.pubkey,
+            sig_hex,
+            &lock,
+            opts.accept_new_key,
+        )?;
+        report_trust(&outcome);
+        Some(outcome.key_str)
+    } else {
+        if !opts.allow_unsigned {
+            bail!(
+                "shuttle for '{distro_id}' is unsigned (no [distro.signing] or Distro.sig) — \
                  refusing. Re-run with --allow-unsigned to install anyway."
-                );
-            }
-            eprintln!(
-                "{}",
-                Theme::warning(&format!(
-                    "installing UNSIGNED distro '{distro_id}' (--allow-unsigned)"
-                ))
             );
-            (None, None)
-        };
+        }
+        eprintln!(
+            "{}",
+            Theme::warning(&format!(
+                "installing UNSIGNED distro '{distro_id}' (--allow-unsigned)"
+            ))
+        );
+        None
+    };
 
     // 4. Manifest-hash integrity. The signature covers the *lock*, not
     //    `Distro.toml`; `manifest_hash` is the ONLY thing binding the
@@ -143,7 +145,7 @@ pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyh
     let selected = crate::commands::init::select_capsules(manifest.capsules.clone(), opts.yes)?;
     let vars =
         crate::commands::init::collect_variables(&variables, &selected, opts.yes, &opts.vars)?;
-    crate::commands::init::write_env_files(&home, &principal, &selected, &vars)?;
+    crate::commands::init::write_env_files(&home, &principal, &selected, &variables, &vars)?;
 
     // 6. Install each selected capsule from the verified mirror. The
     //    sealed lock IS the resolved truth offline — no resolution
@@ -154,21 +156,11 @@ pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyh
     //    the install does not re-read and re-hash every capsule.
     let sealed_capsules: std::collections::HashMap<&str, &LockedCapsule> =
         lock.capsules.iter().map(|c| (c.name.as_str(), c)).collect();
-    let locked = install_selected_capsules(
-        &home,
-        &principal,
-        mirror,
-        &selected,
-        &sealed_capsules,
-        signer.as_deref(),
-        signature.as_deref(),
-    )?;
+    let locked =
+        install_selected_capsules(&principal, mirror, &selected, &sealed_capsules, &distro_id)
+            .await?;
 
     // 7. Write the user's Distro.lock, carrying the sealed manifest hash.
-    let lock_path = home
-        .principal_home(&principal)
-        .config_dir()
-        .join("distro.lock");
     let user_lock = DistroLock {
         schema_version: manifest.schema_version,
         distro: DistroLockMeta {
@@ -179,7 +171,7 @@ pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyh
         capsules: locked,
         manifest_hash: lock.manifest_hash,
     };
-    write_lock(&lock_path, &user_lock)?;
+    write_lock_to_daemon(&principal, &user_lock).await?;
 
     eprintln!();
     eprintln!("{}", Theme::success("Offline installation complete."));
@@ -192,14 +184,12 @@ pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyh
 /// Capsule archive bytes were already validated against the sealed lock up
 /// front by [`verify_capsule_hashes`]. The user's lock records the version and
 /// content-addressed WASM hash reported by the checked install itself.
-fn install_selected_capsules(
-    home: &AstridHome,
+async fn install_selected_capsules(
     principal: &astrid_core::PrincipalId,
     mirror: &Path,
     selected: &[super::manifest::DistroCapsule],
     sealed_capsules: &std::collections::HashMap<&str, &LockedCapsule>,
-    signer: Option<&str>,
-    signature: Option<&str>,
+    distro_id: &str,
 ) -> anyhow::Result<Vec<LockedCapsule>> {
     let mut locked: Vec<LockedCapsule> = Vec::with_capacity(selected.len());
     for cap in selected {
@@ -215,22 +205,21 @@ fn install_selected_capsules(
         // resolved or guessed during offline installation.
         let sealed = sealed_capsules.get(cap.name.as_str());
         let resolved_ref = sealed.and_then(|c| c.resolved_ref.clone());
-        let expected = CapsuleId::new(cap.name.clone())?;
-        let expected_version = (!cap.version.trim().is_empty()).then_some(cap.version.trim());
-        let installed = crate::commands::capsule::install::install_offline_capsule(
-            &file,
-            home,
-            &expected,
-            expected_version,
-            crate::commands::capsule::install::OfflineCapsuleProvenance {
-                original_source: &cap.source,
-                resolved_ref: resolved_ref.as_deref(),
-                signer,
-                signature,
-            },
-            principal,
-        )
-        .with_context(|| format!("failed to install capsule {}", cap.name))?;
+        let source_digest = source_digest(&file)
+            .with_context(|| format!("hash capsule {} for provenance", cap.name))?;
+        let installed =
+            crate::commands::capsule::install_daemon::install_local_via_daemon_for_target(
+                &file.to_string_lossy(),
+                &[],
+                principal,
+                Some(CapsuleInstallProvenance {
+                    distro: Some(distro_id.to_owned()),
+                    source_digest: Some(source_digest),
+                }),
+                astrid_core::kernel_api::CapsuleInstallAuthority::OperatorDistribution,
+            )
+            .await
+            .with_context(|| format!("failed to install capsule {}", cap.name))?;
 
         locked.push(LockedCapsule {
             name: cap.name.clone(),
@@ -310,6 +299,21 @@ fn verify_capsule_hashes(mirror: &Path, lock: &DistroLock) -> anyhow::Result<()>
         }
     }
     Ok(())
+}
+
+fn source_digest(path: &Path) -> anyhow::Result<String> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open capsule source {}", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; 1024 * 1024].into_boxed_slice();
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
 }
 
 /// Report a trust outcome to the operator.

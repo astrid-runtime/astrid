@@ -563,6 +563,11 @@ fn seed_principal_with_devices(kernel: &Arc<Kernel>, principal: &PrincipalId) ->
 async fn device_scope_denies_pair_issue_but_full_device_and_none_allow() {
     let (_dir, kernel) = fixture().await;
     let caller = pid("paired_user");
+    kernel
+        .identity_store
+        .create_principal(caller.clone(), [0x41; 32])
+        .await
+        .expect("seed paired user durable identity");
     let (full_id, scoped_id) = seed_principal_with_devices(&kernel, &caller);
 
     // Full PairDeviceIssue is gated by pair-admin, which `self:*` admits.
@@ -797,6 +802,11 @@ async fn malformed_pair_scope_audits_bad_input_not_permission_denial() {
 async fn successful_full_pair_mint_audits_pair_admin_allow() {
     let (_dir, kernel) = fixture().await;
     let caller = pid("unattenuated_pair_admin");
+    kernel
+        .identity_store
+        .create_principal(caller.clone(), [0x42; 32])
+        .await
+        .expect("seed pair admin durable identity");
     seed_profile(
         &kernel,
         &caller,

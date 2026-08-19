@@ -1,7 +1,9 @@
 //! Path resolution for the `astrid:fs@1.0.0` host: turn a raw guest
 //! path (with possible `cwd://`, `home://`, `/tmp/`, or implicit
-//! workspace scheme) into a `(physical, relative, target VFS)` triple
-//! that the security gate and the VFS layer can use.
+//! workspace scheme) into a gate spelling, optional physical path, relative
+//! VFS path, and target.  Workspace/tmp retain physical canonicalization;
+//! storage-backed `home://` is a logical namespace and never touches host
+//! paths.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -13,6 +15,8 @@ pub(super) const HOME_SCHEME: &str = "home://";
 
 /// URI scheme prefix for the daemon's current working directory.
 pub(super) const CWD_SCHEME: &str = "cwd://";
+/// Logical scheme used for the path-free canonical Astrid workspace.
+pub(super) const WORKSPACE_SCHEME: &str = "workspace://";
 
 /// Path prefix that maps to the principal's tmp directory.
 pub(super) const TMP_PREFIX: &str = "/tmp/";
@@ -107,7 +111,11 @@ pub(super) enum VfsTarget {
 /// Phase-1 resolution: physical path for the security gate + VFS-relative
 /// path + which VFS bundle to use.
 pub(super) struct ResolvedPath {
-    pub(super) physical: PathBuf,
+    /// Stable spelling passed to the manifest gate and audit sink.
+    pub(super) gate_path: String,
+    /// Host path for workspace/tmp and legacy physical home mounts. `None`
+    /// for AstridFilesystem-backed home namespaces.
+    pub(super) physical: Option<PathBuf>,
     pub(super) relative: PathBuf,
     pub(super) target: VfsTarget,
 }
@@ -126,6 +134,14 @@ pub(super) struct ResolvedVfsPath {
 /// the right tree.
 pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<ResolvedPath, String> {
     if let Some(stripped) = raw_path.strip_prefix(CWD_SCHEME) {
+        if state.effective_workspace().is_some_and(|mount| {
+            matches!(
+                &mount.location,
+                crate::engine::wasm::host_state::PrincipalMountLocation::AstridFilesystem
+            )
+        }) {
+            return resolve_logical_workspace(stripped);
+        }
         let resolved = resolve_physical_absolute(&state.workspace_root, stripped)?;
         let relative = resolved
             .physical
@@ -133,7 +149,8 @@ pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<Resolved
             .map_err(|_| "resolved cwd path escaped canonical root".to_string())?
             .to_path_buf();
         Ok(ResolvedPath {
-            physical: resolved.physical,
+            gate_path: resolved.physical.to_string_lossy().into_owned(),
+            physical: Some(resolved.physical),
             relative,
             target: VfsTarget::Workspace,
         })
@@ -141,14 +158,37 @@ pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<Resolved
         let home = state
             .effective_home()
             .ok_or_else(|| "home:// scheme is not available for this principal".to_string())?;
-        let resolved = resolve_physical_absolute(&home.root, stripped)?;
+        if matches!(
+            &home.location,
+            crate::engine::wasm::host_state::PrincipalMountLocation::AstridFilesystem
+        ) {
+            let path = astrid_storage::FilesystemPath::new(stripped.to_owned())
+                .map_err(|error| error.to_string())?;
+            let gate_path = if path.as_str().is_empty() {
+                HOME_SCHEME.to_owned()
+            } else {
+                format!("{HOME_SCHEME}{}", path.as_str())
+            };
+            return Ok(ResolvedPath {
+                gate_path,
+                physical: None,
+                relative: PathBuf::from(path.as_str()),
+                target: VfsTarget::Home,
+            });
+        }
+        let crate::engine::wasm::host_state::PrincipalMountLocation::Native(root) = &home.location
+        else {
+            return Err("home:// storage mount did not resolve logically".to_owned());
+        };
+        let resolved = resolve_physical_absolute(root, stripped)?;
         let relative = resolved
             .physical
             .strip_prefix(&resolved.canonical_root)
             .map_err(|_| "resolved home path escaped canonical root".to_string())?
             .to_path_buf();
         Ok(ResolvedPath {
-            physical: resolved.physical,
+            gate_path: resolved.physical.to_string_lossy().into_owned(),
+            physical: Some(resolved.physical),
             relative,
             target: VfsTarget::Home,
         })
@@ -160,18 +200,32 @@ pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<Resolved
             .strip_prefix(TMP_PREFIX)
             .or_else(|| raw_path.strip_prefix("/tmp"))
             .unwrap_or("");
-        let resolved = resolve_physical_absolute(&tmp_mount.root, stripped)?;
+        let crate::engine::wasm::host_state::PrincipalMountLocation::Native(root) =
+            &tmp_mount.location
+        else {
+            return Err("/tmp mount is not a native scratch directory".to_owned());
+        };
+        let resolved = resolve_physical_absolute(root, stripped)?;
         let relative = resolved
             .physical
             .strip_prefix(&resolved.canonical_root)
             .map_err(|_| "resolved /tmp path escaped canonical root".to_string())?
             .to_path_buf();
         Ok(ResolvedPath {
-            physical: resolved.physical,
+            gate_path: resolved.physical.to_string_lossy().into_owned(),
+            physical: Some(resolved.physical),
             relative,
             target: VfsTarget::Tmp,
         })
     } else {
+        if state.effective_workspace().is_some_and(|mount| {
+            matches!(
+                &mount.location,
+                crate::engine::wasm::host_state::PrincipalMountLocation::AstridFilesystem
+            )
+        }) {
+            return resolve_logical_workspace(raw_path);
+        }
         let resolved = resolve_physical_absolute(&state.workspace_root, raw_path)?;
         let relative = resolved
             .physical
@@ -179,11 +233,29 @@ pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<Resolved
             .map_err(|_| "resolved path escaped canonical root".to_string())?
             .to_path_buf();
         Ok(ResolvedPath {
-            physical: resolved.physical,
+            gate_path: resolved.physical.to_string_lossy().into_owned(),
+            physical: Some(resolved.physical),
             relative,
             target: VfsTarget::Workspace,
         })
     }
+}
+
+fn resolve_logical_workspace(raw_path: &str) -> Result<ResolvedPath, String> {
+    let relative = raw_path.trim_start_matches('/');
+    let path = astrid_storage::FilesystemPath::new(relative.to_owned())
+        .map_err(|error| error.to_string())?;
+    let gate_path = if path.as_str().is_empty() {
+        WORKSPACE_SCHEME.to_owned()
+    } else {
+        format!("{WORKSPACE_SCHEME}{}", path.as_str())
+    };
+    Ok(ResolvedPath {
+        gate_path,
+        physical: None,
+        relative: PathBuf::from(path.as_str()),
+        target: VfsTarget::Workspace,
+    })
 }
 
 /// Phase 2: pick the VFS instance + capability handle for `resolved`.
@@ -204,7 +276,12 @@ pub(super) fn resolve_vfs(
                 .ok_or_else(|| "/tmp VFS is not mounted".to_string())?;
             (m.vfs.clone(), m.handle.clone())
         },
-        VfsTarget::Workspace => (state.vfs.clone(), state.vfs_root_handle.clone()),
+        VfsTarget::Workspace => {
+            let mount = state
+                .effective_workspace()
+                .ok_or_else(|| "workspace VFS is not mounted".to_owned())?;
+            (mount.vfs.clone(), mount.handle.clone())
+        },
     };
     Ok(ResolvedVfsPath {
         relative: resolved.relative.clone(),

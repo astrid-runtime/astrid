@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 
-install_adversarial_capsule_with_lifecycle_elicit() {
+install_adversarial_capsule_with_lifecycle_config() {
   local stdout="$ARTIFACTS/adversarial-install.out"
   local stderr="$ARTIFACTS/adversarial-install.err"
 
-  note "checking lifecycle elicit during adversarial capsule install"
+  note "checking typed lifecycle configuration during adversarial capsule install"
   printf '$ astrid capsule install e2e/fixtures/astrid-capsule-adversarial\n' \
     >> "$ARTIFACTS/cli-transcript.log"
   if ! printf 'runtime-lifecycle-ok\n' \
@@ -15,12 +15,12 @@ install_adversarial_capsule_with_lifecycle_elicit() {
     cat "$stderr" >&2 || true
     fail "adversarial capsule lifecycle install failed"
   fi
-  grep -q 'runtime E2E lifecycle probe' "$stdout" \
-    || fail "adversarial install did not surface lifecycle elicit prompt"
+  grep -q 'runtime E2E lifecycle probe' "$stdout" "$stderr" \
+    || fail "adversarial install did not surface declared lifecycle configuration prompt"
 
-  # This regression deliberately removes one principal home to prove the
-  # lifecycle install path provisions it again before mounting `home://`.
-  # Never do that against an operator-supplied ASTRID_E2E_HOME.
+  # This regression proves a newly admitted nondefault principal receives a
+  # UID-bound storage home during lifecycle execution. No alias-keyed native
+  # PrincipalHome may be created as a side effect.
   if [[ "$ASTRID_HOME_GENERATED" -ne 1 ]]; then
     note "skipping fresh principal-home lifecycle probe for supplied ASTRID_E2E_HOME"
     return
@@ -30,9 +30,9 @@ install_adversarial_capsule_with_lifecycle_elicit() {
   local principal_home="$ASTRID_HOME/home/$principal"
 
   note "checking fresh nondefault lifecycle home mount"
-  [[ "$principal_home" == "$ASTRID_HOME/home/e2e-lifecycle-home" ]] \
-    || fail "refusing to remove lifecycle home outside the generated ASTRID_HOME"
-  rm -rf "$principal_home"
+  run_cli agent create "$principal" --group agent -y
+  [[ ! -e "$principal_home" ]] \
+    || fail "agent admission unexpectedly created a native principal home"
   if ! printf 'runtime-lifecycle-ok\n' \
     | ASTRID_PRINCIPAL="$principal" "$CORE_DIR/target/debug/astrid" \
       --principal "$principal" capsule install \
@@ -43,10 +43,16 @@ install_adversarial_capsule_with_lifecycle_elicit() {
     cat "$ARTIFACTS/adversarial-principal-install.err" >&2 || true
     fail "fresh nondefault lifecycle install failed"
   fi
-  [[ -f "$principal_home/adversarial-lifecycle-home-mounted" ]] \
-    || fail "lifecycle guest did not mount the fresh target principal home"
-  [[ "$(cat "$principal_home/adversarial-lifecycle-home-mounted")" == "mounted" ]] \
-    || fail "lifecycle guest wrote an unexpected home marker"
+  [[ ! -e "$principal_home" ]] \
+    || fail "lifecycle install escaped into a native alias-keyed principal home"
+  run_cli agent modify "$principal" --add-capsule astrid-capsule-adversarial
+  bounded_principal_cli "$principal" 12 \
+    "$ARTIFACTS/adversarial-principal-home-read.out" \
+    capsule run astrid-capsule-adversarial adversarial-home-ready \
+    || fail "principal could not read its lifecycle marker through home://"
+  grep -q 'lifecycle home mounted' \
+    "$ARTIFACTS/adversarial-principal-home-read.out" \
+    || fail "principal runtime did not observe the storage-backed lifecycle home marker"
   ASTRID_PRINCIPAL="$principal" "$CORE_DIR/target/debug/astrid" \
     --principal "$principal" capsule remove astrid-capsule-adversarial --force \
     > "$ARTIFACTS/adversarial-principal-remove.out" \

@@ -35,6 +35,7 @@ fn state_with_origins(origins: Vec<&str>) -> Arc<GatewayState> {
     cfg.validate().expect("test config must validate");
     Arc::new(GatewayState {
         config: cfg,
+        storage_kv: None,
         signing: SigningMaterial::fresh(),
         distribution: Arc::new(DistributionInfo::single_tenant()),
         onboarding: Arc::new(OnboardingFields::default()),

@@ -1,4 +1,4 @@
-//! Synchronous host-audit sink: the seam by which sensitive per-action
+//! Bounded asynchronous host-audit sink: the seam by which sensitive per-action
 //! host calls (fs read/write/delete, net connect/bind, process spawn)
 //! reach the kernel's durable, signed, hash-chained audit log.
 //!
@@ -12,14 +12,15 @@
 //! implements the trait (it holds both the audit log and the key), maps the
 //! event onto its internal `AuditAction`, and appends + signs it.
 //!
-//! # Why synchronous
+//! # Why bounded asynchronous
 //!
-//! The sink call happens inside the host fn's existing blocking context —
-//! the fs/net/process security gates already run on `bounded_block_on`, so a
-//! synchronous append on the same thread is correct and adds no new
-//! concurrency class. Per-action audit deliberately does NOT route over the
-//! event bus: the bus is broadcast-with-lag-drop, and a droppable record is
-//! not a provable one. The chain append is the system of record.
+//! Host calls enqueue a bounded, host-owned record and return without waiting
+//! for an individual storage commit. A dedicated kernel writer coalesces
+//! accepted records and acknowledges persistence through operator health. A
+//! full queue applies explicit backpressure; a dead writer or failed commit is
+//! visible as degraded health. Per-action audit deliberately does NOT route
+//! over the event bus: the bus is broadcast-with-lag-drop, and a droppable
+//! record is not a provable one. The chain append remains the system of record.
 
 /// A sensitive host-call action being reported to the audit sink.
 ///
@@ -88,9 +89,12 @@ pub enum HostAuditOutcome<'a> {
 ///
 /// # Implementation contract
 ///
-/// Implementations **MUST** persist the entry synchronously before
-/// returning — the report path holds no retry queue, so an asynchronous or
-/// best-effort-dropped append would silently lose the record.
+/// Implementations **MUST** enqueue a bounded, owned copy before returning.
+/// They may decouple host-call latency from storage commit, but must not drop
+/// an accepted record. Queue saturation supplies bounded backpressure, and a
+/// worker or persistence failure must be exposed through the implementation's
+/// operator health surface. Graceful shutdown must drain accepted records
+/// before closing the authoritative audit projection.
 ///
 /// Implementations **MUST** stamp the `principal` argument exactly as
 /// passed. The host fn derives that principal from trusted, host-populated
@@ -98,10 +102,10 @@ pub enum HostAuditOutcome<'a> {
 /// never from guest-supplied data; an implementation that re-derived the
 /// principal from the event payload would reintroduce a forgery seam.
 ///
-/// A persistence failure must not propagate as a panic or block the host
-/// call — audit degrades to "continue + alert", matching the admin-audit
-/// path. The host fn has already decided allow/deny by the time it reports;
-/// the audit record is a side effect, never a gate.
+/// A persistence failure must not panic the host call; it degrades to
+/// "continue + alert" and remains visible in health. The host fn has already
+/// decided allow/deny by the time it reports; the audit record is a side
+/// effect, never a gate.
 pub trait HostAuditSink: Send + Sync {
     /// Record one sensitive host call against `principal`'s audit chain.
     fn record(

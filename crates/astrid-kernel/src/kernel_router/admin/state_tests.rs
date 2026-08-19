@@ -12,12 +12,17 @@
 
 use std::sync::Arc;
 
+use astrid_capsule::capsule::{Capsule, CapsuleId, CapsuleState};
+use astrid_capsule::context::CapsuleContext;
+use astrid_capsule::error::CapsuleResult;
+use astrid_capsule::manifest::CapsuleManifest;
 use astrid_core::dirs::AstridHome;
 use astrid_core::groups::{BUILTIN_ADMIN, BUILTIN_AGENT, BUILTIN_RESTRICTED, GroupConfig};
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope, PrincipalProfile, Quotas};
 use astrid_core::{FleetGenesis, FleetIdentity, PrincipalOwnership, UserGenesis, UserIdentity};
 use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody, AgentSummary, GroupSummary};
+use astrid_storage::env::{get_env, principal_env_store, set_env};
 use tempfile::TempDir;
 
 use super::handlers;
@@ -51,6 +56,47 @@ fn pid(name: &str) -> PrincipalId {
     PrincipalId::new(name).unwrap()
 }
 
+struct InheritanceCapsule {
+    id: CapsuleId,
+    manifest: CapsuleManifest,
+}
+
+#[async_trait::async_trait]
+impl Capsule for InheritanceCapsule {
+    fn id(&self) -> &CapsuleId {
+        &self.id
+    }
+
+    fn manifest(&self) -> &CapsuleManifest {
+        &self.manifest
+    }
+
+    fn state(&self) -> CapsuleState {
+        CapsuleState::Ready
+    }
+
+    async fn load(&mut self, _ctx: &CapsuleContext) -> CapsuleResult<()> {
+        Ok(())
+    }
+
+    async fn unload(&mut self) -> CapsuleResult<()> {
+        Ok(())
+    }
+}
+
+async fn seed_loaded_capsule(kernel: &Arc<Kernel>, name: &str) {
+    let id = CapsuleId::new(name).expect("valid inheritance capsule id");
+    let mut manifest = CapsuleManifest::default();
+    manifest.package.name = name.to_owned();
+    manifest.package.version = "1.0.0".to_owned();
+    kernel
+        .capsules
+        .write()
+        .await
+        .register(Box::new(InheritanceCapsule { id, manifest }))
+        .expect("register inheritance capsule fixture");
+}
+
 fn assert_success(res: &AdminResponseBody) {
     match res {
         AdminResponseBody::Success(_)
@@ -64,6 +110,12 @@ fn assert_success(res: &AdminResponseBody) {
         | AdminResponseBody::PairToken(_)
         | AdminResponseBody::PairTokenRedeemed(_)
         | AdminResponseBody::PairDeviceListed(_)
+        | AdminResponseBody::StorageMountLease(_)
+        | AdminResponseBody::EnvList(_)
+        | AdminResponseBody::AuditStats(_)
+        | AdminResponseBody::AuditPruned(_)
+        | AdminResponseBody::AuditHealth(_)
+        | AdminResponseBody::DistroLock(_)
         | AdminResponseBody::PairDeviceRevoked { .. } => {},
         AdminResponseBody::Error(msg) => panic!("expected success, got Error: {msg}"),
     }
@@ -189,17 +241,16 @@ async fn agent_create_writes_profile_and_links_identity() {
     let user = kernel.identity_store.resolve("cli", "alice").await.unwrap();
     assert!(user.is_some());
 
-    // Per-principal home tree provisioned. Capsule WASM stays shared
-    // (loaded once from default's home), but every per-invocation
-    // namespace — KV, log, audit, tmp, tokens, env — needs a place to
-    // land before the first interceptor scoped to this principal fires.
+    // Principal state is UID-bound in the runtime store. Agent creation must
+    // not recreate the released native home tree; typed env and all durable
+    // content are provisioned through storage projections on first use.
     let ph = kernel.astrid_home.principal_home(&pid("alice"));
-    assert!(ph.kv_dir().is_dir(), "kv_dir not provisioned");
-    assert!(ph.log_dir().is_dir(), "log_dir not provisioned");
-    assert!(ph.audit_dir().is_dir(), "audit_dir not provisioned");
-    assert!(ph.tmp_dir().is_dir(), "tmp_dir not provisioned");
-    assert!(ph.tokens_dir().is_dir(), "tokens_dir not provisioned");
-    assert!(ph.env_dir().is_dir(), "env_dir not provisioned");
+    assert!(
+        !ph.root().exists(),
+        "agent create must not recreate legacy home"
+    );
+    assert!(kernel.principal_directory.uid_for(&pid("alice")).is_ok());
+    assert!(kernel.principal_store.is_some());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -290,16 +341,14 @@ async fn agent_create_rejects_reserved_names() {
 async fn agent_create_without_inherit_copies_nothing() {
     let (_dir, kernel) = fixture().await;
 
-    // Seed an env file under `default`'s env dir. If the old
-    // unconditional inheritance were still in place, this file would be
-    // copied into every new agent.
-    let default_env = kernel
-        .astrid_home
-        .principal_home(&PrincipalId::default())
-        .env_dir();
-    std::fs::create_dir_all(&default_env).expect("default env dir");
-    std::fs::write(default_env.join("openai.json"), br#"{"base_url":"x"}"#)
-        .expect("seed default env file");
+    // Seed the default principal's host-only control scope. If accidental
+    // default inheritance were still enabled, this would leak into alice.
+    let default_uid = kernel
+        .principal_directory
+        .uid_for(&PrincipalId::default())
+        .unwrap();
+    let default_env = principal_env_store(Arc::clone(&kernel.kv), default_uid, "openai").unwrap();
+    set_env(&default_env, "BASE_URL", "x").await.unwrap();
 
     let res = handlers::dispatch(
         &kernel,
@@ -316,19 +365,16 @@ async fn agent_create_without_inherit_copies_nothing() {
     .await;
     assert_success(&res);
 
-    // The new principal's env dir was provisioned (empty) but inherited
-    // NOTHING from `default`. The seeded file must not be present.
-    let alice_env = kernel.astrid_home.principal_home(&pid("alice")).env_dir();
+    // The new principal's control scope inherited NOTHING from `default`.
+    let alice_uid = kernel.principal_directory.uid_for(&pid("alice")).unwrap();
+    let alice_env = principal_env_store(Arc::clone(&kernel.kv), alice_uid, "openai").unwrap();
+    assert!(get_env(&alice_env, "BASE_URL").await.unwrap().is_none());
     assert!(
-        !alice_env.join("openai.json").exists(),
-        "default's env file leaked into a non-inheriting agent"
-    );
-    let leaked: Vec<_> = std::fs::read_dir(&alice_env)
-        .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
-        .unwrap_or_default();
-    assert!(
-        leaked.is_empty(),
-        "non-inheriting agent's env dir is not empty: {leaked:?}"
+        !kernel
+            .astrid_home
+            .principal_home(&pid("alice"))
+            .env_dir()
+            .exists()
     );
 }
 
@@ -341,6 +387,7 @@ async fn agent_create_without_inherit_copies_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_create_with_inherit_copies_from_source() {
     let (_dir, kernel) = fixture().await;
+    seed_loaded_capsule(&kernel, "openai").await;
 
     // Create the source principal first so its profile + home tree exist.
     let res = handlers::dispatch(
@@ -358,11 +405,10 @@ async fn agent_create_with_inherit_copies_from_source() {
     .await;
     assert_success(&res);
 
-    // Seed an env file under the source's env dir.
-    let source_env = kernel.astrid_home.principal_home(&pid("source")).env_dir();
-    std::fs::create_dir_all(&source_env).expect("source env dir");
-    std::fs::write(source_env.join("openai.json"), br#"{"base_url":"src"}"#)
-        .expect("seed source env file");
+    // Seed the source's host-only control scope.
+    let source_uid = kernel.principal_directory.uid_for(&pid("source")).unwrap();
+    let source_env = principal_env_store(Arc::clone(&kernel.kv), source_uid, "openai").unwrap();
+    set_env(&source_env, "BASE_URL", "src").await.unwrap();
 
     // Create the inheriting agent.
     let res = handlers::dispatch(
@@ -380,11 +426,21 @@ async fn agent_create_with_inherit_copies_from_source() {
     .await;
     assert_success(&res);
 
-    // The source's env file landed in the child verbatim.
-    let child_env = kernel.astrid_home.principal_home(&pid("child")).env_dir();
-    let copied = std::fs::read(child_env.join("openai.json"))
-        .expect("source env file should have been copied into the child");
-    assert_eq!(copied, br#"{"base_url":"src"}"#);
+    // The source's typed env landed in the child verbatim, without a native
+    // env path being created.
+    let child_uid = kernel.principal_directory.uid_for(&pid("child")).unwrap();
+    let child_env = principal_env_store(Arc::clone(&kernel.kv), child_uid, "openai").unwrap();
+    assert_eq!(
+        get_env(&child_env, "BASE_URL").await.unwrap().as_deref(),
+        Some("src")
+    );
+    assert!(
+        !kernel
+            .astrid_home
+            .principal_home(&pid("child"))
+            .env_dir()
+            .exists()
+    );
 }
 
 /// A named-but-nonexistent inheritance source must fail loudly rather
@@ -435,20 +491,8 @@ async fn agent_create_rejects_self_inherit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn agent_create_rolls_back_when_home_provisioning_fails() {
-    // Confidentiality boundary: if the per-principal home tree cannot be
-    // created, downstream per-invocation lookups fall back to the
-    // default principal's namespace — a cross-tenant leak. The handler
-    // must roll back the identity + profile rather than leave the agent
-    // in a half-provisioned state.
+async fn agent_create_does_not_recreate_legacy_home_tree() {
     let (_dir, kernel) = fixture().await;
-
-    // Force `principal_home(&blocked).ensure()` to fail by placing a
-    // regular file where the principal home directory would live. The
-    // `create_dir_all` call inside `ensure()` returns NotADirectory.
-    std::fs::create_dir_all(kernel.astrid_home.home_dir()).expect("home_dir");
-    let blocked_path = kernel.astrid_home.home_dir().join("blocked");
-    std::fs::write(&blocked_path, b"sentinel").expect("write blocker file");
 
     let res = handlers::dispatch(
         &kernel,
@@ -463,29 +507,13 @@ async fn agent_create_rolls_back_when_home_provisioning_fails() {
         },
     )
     .await;
-    assert_error_contains(&res, "home tree provisioning failed");
-
-    // Rollback assertions: identity link gone, user record gone,
-    // profile file gone. The blocker file we placed stays.
-    let resolved = kernel
-        .identity_store
-        .resolve("cli", "blocked")
-        .await
-        .unwrap();
+    assert_success(&res);
     assert!(
-        resolved.is_none(),
-        "identity link must be unlinked on rollback"
-    );
-
-    let profile_path = PrincipalProfile::path_for(&kernel.astrid_home, &pid("blocked"));
-    assert!(
-        !profile_path.exists(),
-        "profile file must be removed on rollback"
-    );
-
-    assert!(
-        blocked_path.is_file(),
-        "rollback must not touch the unrelated sentinel"
+        !kernel
+            .astrid_home
+            .principal_home(&pid("blocked"))
+            .root()
+            .exists()
     );
 }
 

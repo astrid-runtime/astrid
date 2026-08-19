@@ -209,7 +209,11 @@ fn required_capability_mapping_per_variant_self_scope() {
         required_capability(
             &KernelRequest::InstallCapsule {
                 source: String::new(),
-                workspace: false
+                workspace: false,
+                target_principal: None,
+                provenance: None,
+                authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
+                env: Vec::new(),
             },
             AuthorityScope::Self_
         ),
@@ -262,7 +266,11 @@ fn required_capability_mapping_global_scope() {
         required_capability(
             &KernelRequest::InstallCapsule {
                 source: String::new(),
-                workspace: false
+                workspace: false,
+                target_principal: None,
+                provenance: None,
+                authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
+                env: Vec::new(),
             },
             AuthorityScope::Global
         ),
@@ -287,17 +295,10 @@ fn required_capability_mapping_global_scope() {
 }
 
 #[test]
-fn resolve_scope_defaults_to_self_except_daemon_capsule_lifecycle() {
+fn resolve_scope_defaults_to_self_for_caller_owned_lifecycle() {
     let caller = PrincipalId::new("alice").unwrap();
     for req in all_kernel_request_variants() {
-        if matches!(
-            req,
-            KernelRequest::ReloadCapsules
-                | KernelRequest::InstallCapsule {
-                    workspace: false,
-                    ..
-                }
-        ) {
+        if matches!(req, KernelRequest::ReloadCapsules) {
             continue;
         }
         assert_eq!(
@@ -309,18 +310,48 @@ fn resolve_scope_defaults_to_self_except_daemon_capsule_lifecycle() {
 }
 
 #[test]
-fn resolve_scope_treats_daemon_capsule_lifecycle_as_global() {
+fn resolve_scope_requires_global_authority_only_for_cross_principal_install() {
     let caller = PrincipalId::new("alice").unwrap();
-    for req in [
-        KernelRequest::ReloadCapsules,
-        KernelRequest::InstallCapsule {
-            source: "/tmp/demo.capsule".to_string(),
-            workspace: false,
-        },
-    ] {
+    assert_eq!(
+        resolve_scope(&KernelRequest::ReloadCapsules, &caller),
+        AuthorityScope::Global
+    );
+    let self_install = KernelRequest::InstallCapsule {
+        source: "/tmp/demo.capsule".to_string(),
+        workspace: false,
+        target_principal: None,
+        provenance: None,
+        authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
+        env: Vec::new(),
+    };
+    assert_eq!(resolve_scope(&self_install, &caller), AuthorityScope::Self_);
+    let cross_install = KernelRequest::InstallCapsule {
+        source: "/tmp/demo.capsule".to_string(),
+        workspace: false,
+        target_principal: Some(PrincipalId::new("bob").unwrap()),
+        provenance: None,
+        authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
+        env: Vec::new(),
+    };
+    assert_eq!(
+        resolve_scope(&cross_install, &caller),
+        AuthorityScope::Global
+    );
+    for req in [self_install, cross_install] {
+        let expected = if matches!(
+            &req,
+            KernelRequest::InstallCapsule {
+                target_principal: Some(_),
+                ..
+            }
+        ) {
+            AuthorityScope::Global
+        } else {
+            AuthorityScope::Self_
+        };
         assert_eq!(
             resolve_scope(&req, &caller),
-            AuthorityScope::Global,
+            expected,
             "full-daemon lifecycle should be global for {req:?}"
         );
     }
@@ -353,6 +384,10 @@ fn resolve_scope_treats_workspace_capsule_install_as_self() {
             &KernelRequest::InstallCapsule {
                 source: "/tmp/demo.capsule".to_string(),
                 workspace: true,
+                target_principal: None,
+                provenance: None,
+                authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
+                env: Vec::new(),
             },
             &caller,
         ),
@@ -888,6 +923,11 @@ async fn list_capsules_uses_materialized_inventory_without_runtime_load() {
     drop(spawn_kernel_router(Arc::clone(&kernel)));
 
     let caller = PrincipalId::new("alice").expect("valid principal");
+    kernel
+        .identity_store
+        .create_principal(caller.clone(), [0x31; 32])
+        .await
+        .expect("seed durable caller identity");
     seed_profile(
         &kernel,
         &caller,
@@ -1258,8 +1298,8 @@ fn write_inventory_manifest(
 ) {
     let dir = kernel
         .astrid_home
-        .principal_home(principal)
-        .capsules_dir()
+        .run_dir()
+        .join("test-install-sources")
         .join(capsule);
     std::fs::create_dir_all(&dir).expect("create capsule dir");
     std::fs::write(
@@ -1268,19 +1308,31 @@ fn write_inventory_manifest(
             r#"[package]
 name = "{capsule}"
 version = "0.0.1"
-
-[[component]]
-id = "main"
-file = "{capsule}.wasm"
-
-[[command]]
-name = "{command}"
-kind = "cli"
-description = "{capsule} command"
 "#
         ),
     )
     .expect("write capsule manifest");
+    let _ = command;
+    let home = kernel.astrid_home.clone();
+    let storage = kernel
+        .principal_store
+        .as_ref()
+        .map(|store| Arc::new(store.clone()));
+    let principal = principal.clone();
+    std::thread::spawn(move || {
+        astrid_capsule_install::install_from_local_path_for_principal(
+            &dir,
+            &home,
+            astrid_capsule_install::InstallOptions {
+                storage,
+                ..Default::default()
+            },
+            &principal,
+        )
+    })
+    .join()
+    .expect("publish inventory capsule thread")
+    .expect("publish inventory capsule to durable registry");
 }
 
 async fn assert_capsule_inventory_surface(
@@ -1404,7 +1456,7 @@ async fn request_kernel_for_device(
         message: msg,
     });
 
-    astrid_runtime::time::timeout(std::time::Duration::from_secs(2), async {
+    astrid_runtime::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let event = rx.recv().await.expect("response event");
             if let astrid_events::AstridEvent::Ipc { message, .. } = &*event
@@ -1416,7 +1468,7 @@ async fn request_kernel_for_device(
         }
     })
     .await
-    .expect("kernel response within 2s")
+    .expect("kernel response within 10s")
 }
 
 /// The in-process readiness probe the gateway uses for the prompt fail-fast

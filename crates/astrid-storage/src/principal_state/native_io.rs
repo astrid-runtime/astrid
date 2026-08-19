@@ -131,6 +131,19 @@ impl PrivateDirectory {
                     self.path.join(name).display()
                 ))
             })?;
+            #[cfg(unix)]
+            {
+                use cap_std::fs::PermissionsExt as _;
+
+                self.directory
+                    .set_permissions(name, cap_std::fs::Permissions::from_mode(0o700))
+                    .map_err(|error| {
+                        connection(format!(
+                            "restrict private directory {}: {error}",
+                            self.path.join(name).display()
+                        ))
+                    })?;
+            }
             self.sync()?;
         }
         self.open_child(name)
@@ -409,6 +422,7 @@ impl PrivateDirectory {
         Ok(installed)
     }
 
+    #[cfg_attr(not(unix), allow(clippy::unnecessary_wraps, clippy::unused_self))]
     pub(super) fn sync(&self) -> StorageResult<()> {
         #[cfg(unix)]
         {
@@ -885,6 +899,7 @@ pub(super) fn rename_private_entry(source: &Path, destination: &Path) -> Storage
     })
 }
 
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 pub(super) fn sync_directory(path: &Path) -> StorageResult<()> {
     #[cfg(unix)]
     {

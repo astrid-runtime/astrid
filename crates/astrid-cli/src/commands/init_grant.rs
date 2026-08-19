@@ -12,6 +12,7 @@ use std::future::Future;
 
 use anyhow::{Context, bail};
 use astrid_capsule::capsule::CapsuleId;
+#[cfg(test)]
 use astrid_capsule::manifest::CapsuleManifest;
 use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
@@ -126,20 +127,24 @@ where
 }
 
 /// Owner-private, non-blocking lock serializing distro provisioning for one
-/// `(AstridHome, target principal)` pair. The file remains in place after
-/// unlock so concurrent processes always contend on the same inode.
+/// target principal. This is disposable coordination state, not principal
+/// content: it lives under `run/principals`, which the daemon clears on boot,
+/// and never creates the legacy `home/<principal>/.config` tree.
 pub(super) struct ProvisioningLock {
     _file: File,
 }
 
 impl ProvisioningLock {
     pub(super) fn acquire(home: &AstridHome, target: &PrincipalId) -> anyhow::Result<Self> {
-        let config_dir = home.principal_home(target).config_dir();
-        std::fs::create_dir_all(&config_dir)
-            .with_context(|| format!("failed to create {}", config_dir.display()))?;
-        set_owner_private_dir(&config_dir)?;
+        let lock_dir = home
+            .run_dir()
+            .join("principals")
+            .join(target.as_str())
+            .join("locks");
+        astrid_core::platform_fs::ensure_private_directory(&lock_dir)
+            .with_context(|| format!("failed to secure {}", lock_dir.display()))?;
 
-        let path = config_dir.join("distro.init.lock");
+        let path = lock_dir.join("distro.init.lock");
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
         #[cfg(unix)]
@@ -150,7 +155,8 @@ impl ProvisioningLock {
         let file = options
             .open(&path)
             .with_context(|| format!("failed to open {}", path.display()))?;
-        set_owner_private_file(&path)?;
+        astrid_core::platform_fs::restrict_private_file(&path)
+            .with_context(|| format!("failed to secure {}", path.display()))?;
         FileExt::try_lock_exclusive(&file).with_context(|| {
             format!("another distro provision is already running for target principal '{target}'")
         })?;
@@ -160,6 +166,7 @@ impl ProvisioningLock {
 
 /// Prove that every fresh-lock entry still describes an installed capsule for
 /// the target before those names become an authorization grant set.
+#[cfg(test)]
 pub(super) fn validate_locked_capsules(
     home: &AstridHome,
     target: &PrincipalId,
@@ -225,12 +232,56 @@ pub(super) fn validate_locked_capsules(
 /// Reuse a fresh lock only when its installed state still verifies. A current
 /// distro id/version with stale or incomplete install provenance falls through
 /// to the normal checked install path so init can regenerate the lock.
-pub(super) fn validated_grant_set_for_reuse(
-    home: &AstridHome,
+pub(super) async fn validated_grant_set_for_reuse(
     target: &PrincipalId,
     locked: &[super::LockedCapsule],
 ) -> Option<Vec<String>> {
-    match validate_locked_capsules(home, target, locked) {
+    if target != &crate::principal::current() {
+        return None;
+    }
+    let result = async {
+        let mut client = crate::socket_client::connect_kernel_for_workspace(None).await?;
+        let entries = match client
+            .request(astrid_core::kernel_api::KernelRequest::GetCapsuleMetadata)
+            .await?
+        {
+            astrid_core::kernel_api::KernelResponse::CapsuleMetadata(entries) => entries,
+            astrid_core::kernel_api::KernelResponse::Error(message) => bail!(message),
+            other => bail!("unexpected capsule metadata response: {other:?}"),
+        };
+        let mut installed = Vec::with_capacity(locked.len());
+        for capsule in locked {
+            let expected = CapsuleId::new(capsule.name.clone())?;
+            let entry = entries
+                .iter()
+                .find(|entry| entry.name == capsule.name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Distro.lock capsule '{}' is absent from the daemon registry",
+                        capsule.name
+                    )
+                })?;
+            if !capsule.version.is_empty() && entry.version != capsule.version {
+                bail!(
+                    "Distro.lock capsule '{}' expects version {}, but the daemon registry reports {}",
+                    capsule.name,
+                    capsule.version,
+                    entry.version
+                );
+            }
+            let expected_hash = capsule.hash.strip_prefix("blake3:");
+            if expected_hash != entry.wasm_hash.as_deref() {
+                bail!(
+                    "Distro.lock capsule '{}' hash disagrees with the daemon registry",
+                    capsule.name
+                );
+            }
+            installed.push(expected.as_str().to_owned());
+        }
+        Ok::<_, anyhow::Error>(installed)
+    }
+    .await;
+    match result {
         Ok(installed) => Some(installed),
         Err(error) => {
             eprintln!(
@@ -244,6 +295,7 @@ pub(super) fn validated_grant_set_for_reuse(
     }
 }
 
+#[cfg(test)]
 fn validate_locked_wasm(
     home: &AstridHome,
     capsule: &CapsuleId,
@@ -287,6 +339,7 @@ fn validate_locked_wasm(
     Ok(())
 }
 
+#[cfg(test)]
 fn parse_locked_blake3(capsule: &CapsuleId, value: &str) -> anyhow::Result<blake3::Hash> {
     let Some(hex) = value.strip_prefix("blake3:") else {
         bail!("Distro.lock capsule '{capsule}' requires a canonical blake3:<hex> WASM hash");
@@ -300,35 +353,12 @@ fn parse_locked_blake3(capsule: &CapsuleId, value: &str) -> anyhow::Result<blake
     Ok(hash)
 }
 
+#[cfg(test)]
 fn manifest_declares_wasm(manifest: &CapsuleManifest) -> bool {
     manifest
         .components
         .iter()
         .any(|component| component.path.extension().and_then(|ext| ext.to_str()) == Some("wasm"))
-}
-
-#[cfg(unix)]
-fn set_owner_private_dir(path: &std::path::Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_owner_private_dir(_path: &std::path::Path) -> anyhow::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_owner_private_file(path: &std::path::Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_owner_private_file(_path: &std::path::Path) -> anyhow::Result<()> {
-    Ok(())
 }
 
 /// Apply capsule-access grants for the installed set (opt-in), or print
@@ -641,7 +671,6 @@ mod tests {
 
         let err = validate_locked_capsules(&home, &target, &locked).unwrap_err();
         assert!(err.to_string().contains("blob bytes do not match"));
-        assert!(validated_grant_set_for_reuse(&home, &target, &locked).is_none());
         std::fs::remove_file(blob).unwrap();
         let err = validate_locked_capsules(&home, &target, &locked).unwrap_err();
         assert!(err.to_string().contains("missing or unreadable"));
@@ -724,10 +753,14 @@ mod tests {
         let home = AstridHome::from_path(dir.path());
         let target = PrincipalId::new("alice").unwrap();
         let _lock = ProvisioningLock::acquire(&home, &target).unwrap();
-        let config_dir = home.principal_home(&target).config_dir();
-        let lock_path = config_dir.join("distro.init.lock");
+        let lock_dir = home
+            .run_dir()
+            .join("principals")
+            .join(target.as_str())
+            .join("locks");
+        let lock_path = lock_dir.join("distro.init.lock");
         assert_eq!(
-            std::fs::metadata(config_dir).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(lock_dir).unwrap().permissions().mode() & 0o777,
             0o700
         );
         assert_eq!(

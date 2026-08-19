@@ -87,6 +87,10 @@ jobs:
             os: macos-latest
             archive: tar.gz
             libc: native
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: tar.gz
+            libc: native
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
@@ -174,9 +178,60 @@ jobs:
         if: matrix.libc == 'native'
         run: cargo build --release --target ${{ matrix.target }} -p astrid --locked
 
+      - name: Build and validate the macOS FSKit companion
+        if: contains(matrix.target, 'apple-darwin')
+        env:
+          ASTRID_FSKIT_VALIDATE_PROJECT: "1"
+          ASTRID_FSKIT_ARCHS: ${{ matrix.target == 'x86_64-apple-darwin' && 'x86_64' || 'arm64' }}
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            -p astrid-storage-provider-fskit --locked
+          scripts/check-macos-fskit.sh
+
+      - name: Build, sign, and notarize AstridFS
+        if: contains(matrix.target, 'apple-darwin')
+        env:
+          ASTRID_FSKIT_DEVELOPMENT_TEAM: ${{ secrets.ASTRID_MACOS_DEVELOPMENT_TEAM_ID }}
+          ASTRID_FSKIT_CODE_SIGN_IDENTITY: ${{ vars.ASTRID_MACOS_DEVELOPER_ID_IDENTITY || 'Developer ID Application' }}
+          ASTRID_FSKIT_ARCHS: ${{ matrix.target == 'x86_64-apple-darwin' && 'x86_64' || 'arm64' }}
+          ASTRID_FSKIT_NOTARIZE: "1"
+          ASTRID_FSKIT_NOTARY_KEY_ID: ${{ secrets.ASTRID_MACOS_NOTARY_KEY_ID }}
+          ASTRID_FSKIT_NOTARY_ISSUER_ID: ${{ secrets.ASTRID_MACOS_NOTARY_ISSUER_ID }}
+          ASTRID_FSKIT_NOTARY_KEY: ${{ secrets.ASTRID_MACOS_NOTARY_KEY }}
+        run: |
+          NOTARY_KEY_PATH="$RUNNER_TEMP/astrid-notary.p8"
+          printf '%s' "$ASTRID_FSKIT_NOTARY_KEY" > "$NOTARY_KEY_PATH"
+          chmod 0600 "$NOTARY_KEY_PATH"
+          export ASTRID_FSKIT_NOTARY_KEY_PATH="$NOTARY_KEY_PATH"
+          trap 'rm -f "$NOTARY_KEY_PATH"' EXIT
+          scripts/build-macos-fskit.sh
+          echo "ASTRID_FSKIT_APP=$PWD/target/macos-fskit/DerivedData/Build/Products/Release/AstridFS.app" >> "$GITHUB_ENV"
+
       - name: Select native binary root
         if: matrix.libc == 'native'
         run: echo "BINARY_ROOT=target/${{ matrix.target }}/release" >> "$GITHUB_ENV"
+
+      - name: Build the Windows WinFsp provider
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo build --release --target ${{ matrix.target }} -p astrid-storage-provider-winfsp --locked
+
+      - name: Stage the pinned Windows WinFsp runtime
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP "winfsp-2.1.25156.msi"
+          Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi" -OutFile $msi
+          $hash = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash
+          if ($hash -ne "073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A") {
+            throw "WinFsp MSI digest mismatch: $hash"
+          }
+          $exitCode = (Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i", "`"$msi`"", "/qn", "/norestart") -Wait -PassThru).ExitCode
+          if ($exitCode -ne 0 -and $exitCode -ne 3010) {
+            throw "WinFsp installation failed with exit code $exitCode"
+          }
+          $installRoot = (Get-ItemProperty -Path "HKLM:\SOFTWARE\WOW6432Node\WinFsp").InstallDir
+          "WINFSP_MSI=$msi" | Add-Content -Encoding ascii -Path $env:GITHUB_ENV
+          "WINFSP_ROOT=$installRoot" | Add-Content -Encoding ascii -Path $env:GITHUB_ENV
 
       - name: Build Linux binaries against the glibc 2.31 baseline
         if: matrix.libc == 'gnu'
@@ -209,7 +264,8 @@ jobs:
                 --locked \
                 --target "$TARGET" \
                 --target-dir target/glibc-2.31 \
-                -p astrid
+                -p astrid \
+                -p astrid-storage-provider-fuse
             '
           echo "BINARY_ROOT=target/glibc-2.31/${TARGET}/release" >> "$GITHUB_ENV"
 
@@ -220,7 +276,8 @@ jobs:
             "$BINARY_ROOT/astrid" \
             "$BINARY_ROOT/astrid-daemon" \
             "$BINARY_ROOT/astrid-build" \
-            "$BINARY_ROOT/astrid-emit"
+            "$BINARY_ROOT/astrid-emit" \
+            "$BINARY_ROOT/astrid-storage-provider-fuse"
 
       - name: Build in the native Linux musl environment
         if: matrix.libc == 'musl'
@@ -248,14 +305,16 @@ jobs:
                 --locked \
                 --target "$TARGET" \
                 --target-dir target/musl \
-                -p astrid
+                -p astrid \
+                -p astrid-storage-provider-fuse
               BINARY_ROOT="target/musl/$TARGET/release"
               ARCHITECTURE="${TARGET%%-*}"
               python3 scripts/check_static_elf.py --architecture "$ARCHITECTURE" \
                 "$BINARY_ROOT/astrid" \
                 "$BINARY_ROOT/astrid-daemon" \
                 "$BINARY_ROOT/astrid-build" \
-                "$BINARY_ROOT/astrid-emit"
+                "$BINARY_ROOT/astrid-emit" \
+                "$BINARY_ROOT/astrid-storage-provider-fuse"
             '
           echo "BINARY_ROOT=target/musl/${TARGET}/release" >> "$GITHUB_ENV"
 
@@ -278,16 +337,52 @@ jobs:
             '
 
       - name: Package binaries
+        shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          TARGET="${{ matrix.target }}"
           DIR="astrid-${VERSION}-${{ matrix.target }}"
           mkdir "$DIR"
-          cp "$BINARY_ROOT/astrid" "$DIR/"
-          cp "$BINARY_ROOT/astrid-daemon" "$DIR/"
-          cp "$BINARY_ROOT/astrid-build" "$DIR/"
-          cp "$BINARY_ROOT/astrid-emit" "$DIR/"
+          EXE=""
+          if [[ "$TARGET" == x86_64-pc-windows-msvc ]]; then
+            EXE=".exe"
+            cp "$BINARY_ROOT/astrid-storage-provider-winfsp.exe" "$DIR/"
+            cp "$WINFSP_ROOT/bin/winfsp-x64.dll" "$DIR/"
+            cp "$WINFSP_MSI" "$DIR/winfsp-2.1.25156.msi"
+            cp scripts/install-windows.ps1 scripts/uninstall-windows.ps1 "$DIR/"
+          fi
+          cp "$BINARY_ROOT/astrid$EXE" "$DIR/"
+          cp "$BINARY_ROOT/astrid-daemon$EXE" "$DIR/"
+          cp "$BINARY_ROOT/astrid-build$EXE" "$DIR/"
+          cp "$BINARY_ROOT/astrid-emit$EXE" "$DIR/"
           cp LICENSE* README.md "$DIR/" 2>/dev/null || true
-          tar czf "${DIR}.tar.gz" "$DIR"
+          if [[ "$TARGET" == *-apple-darwin ]]; then
+            cp "$BINARY_ROOT/astrid-storage-provider-fskit" "$DIR/"
+            ditto "$ASTRID_FSKIT_APP" "$DIR/AstridFS.app"
+            mkdir "$DIR/macos"
+            cp scripts/manage-macos-fskit.sh "$DIR/macos/"
+            cp scripts/validate-macos-fskit.sh "$DIR/macos/"
+            cp LICENSE* README.md "$DIR/" 2>/dev/null || true
+            SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+            python3 scripts/package_release_archive.py \
+              --root "$DIR" \
+              --output "${DIR}.tar.gz" \
+              --mtime "$SOURCE_DATE_EPOCH"
+            python3 scripts/validate_macos_release.py "${DIR}.tar.gz" \
+              --mtime "$SOURCE_DATE_EPOCH"
+            EXTRACTION="$RUNNER_TEMP/validate-astrid-release"
+            rm -rf "$EXTRACTION"
+            mkdir -p "$EXTRACTION"
+            tar -xzf "${DIR}.tar.gz" -C "$EXTRACTION"
+            scripts/validate-macos-fskit.sh "$EXTRACTION/$DIR/AstridFS.app"
+          else
+            if [[ "$TARGET" == *-unknown-linux-* ]]; then
+              cp "$BINARY_ROOT/astrid-storage-provider-fuse" "$DIR/"
+            fi
+            tar czf "${DIR}.tar.gz" "$DIR"
+            python3 scripts/validate_release_archive.py "${DIR}.tar.gz" \
+              --target "$TARGET"
+          fi
           echo "ASSET=${DIR}.tar.gz" >> "$GITHUB_ENV"
 
       - name: Upload artifact
@@ -392,11 +487,30 @@ jobs:
 
           cat >> "$NOTES" <<'INSTALL'
 
-          **Pre-built binaries:**
-          Download the archive for your platform, extract, and add to PATH:
+          **Linux pre-built archive:**
           ```
-          tar xzf astrid-*-$(uname -m)-*.tar.gz
-          sudo mv astrid-*/astrid astrid-*/astrid-daemon astrid-*/astrid-build astrid-*/astrid-emit /usr/local/bin/
+          tar xzf astrid-*-$(uname -m)-unknown-linux-*.tar.gz
+          sudo install -m 0755 astrid-*/astrid astrid-*/astrid-daemon \
+            astrid-*/astrid-build astrid-*/astrid-emit \
+            astrid-*/astrid-storage-provider-fuse /usr/local/bin/
+          ```
+
+          **macOS pre-built archive and signed AstridFS app:**
+          ```
+          ARCH=$(uname -m); [[ "$ARCH" == arm64 ]] && ARCH=aarch64
+          tar xzf astrid-*-${ARCH}-apple-darwin.tar.gz
+          sudo install -m 0755 astrid-*/astrid astrid-*/astrid-daemon \
+            astrid-*/astrid-build astrid-*/astrid-emit /usr/local/bin/
+          astrid-*/macos/manage-macos-fskit.sh install
+          astrid-*/macos/manage-macos-fskit.sh enable
+          ```
+
+          **Windows pre-built archive (PowerShell):**
+          ```powershell
+          tar -xzf astrid-*-x86_64-pc-windows-msvc.tar.gz
+          $release = Get-ChildItem -Directory "astrid-*-x86_64-pc-windows-msvc" |
+            Select-Object -First 1
+          & (Join-Path $release.FullName "install-windows.ps1")
           ```
 
           Astrid Runtime does not bundle a product distro. To compose it with a
@@ -469,6 +583,15 @@ jobs:
             --output "artifacts/astrid-${VERSION}-musl-release.toml"
           python3 scripts/musl_release_manifest.py validate \
             "artifacts/astrid-${VERSION}-musl-release.toml" \
+            --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
+            --artifacts artifacts \
+            --verify-artifacts
+          python3 scripts/windows_release_manifest.py generate \
+            --artifacts artifacts \
+            --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
+            --output "artifacts/astrid-${VERSION}-windows-release.toml"
+          python3 scripts/windows_release_manifest.py validate \
+            "artifacts/astrid-${VERSION}-windows-release.toml" \
             --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
             --artifacts artifacts \
             --verify-artifacts
@@ -673,6 +796,28 @@ jobs:
               exit 1
             fi
           fi
+
+      - name: Require native FSKit mount certification for the tagged source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CERTIFICATION_CHECK: Native FSKit mount certification
+        run: |
+          CHECKS="$RUNNER_TEMP/native-fskit-certification.json"
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/commits/$SOURCE_COMMIT/check-runs?per_page=100" \
+            > "$CHECKS"
+          jq -e \
+            --arg name "$CERTIFICATION_CHECK" \
+            --arg source "$SOURCE_COMMIT" \
+            '[.[] | .check_runs[] |
+              select(.name == $name and .head_sha == $source and
+                     .app.slug == "github-actions")] |
+             sort_by(.started_at) | last |
+             .status == "completed" and .conclusion == "success"' \
+            "$CHECKS" >/dev/null || {
+              echo "the tagged source lacks a successful native FSKit mount certification" >&2
+              exit 1
+            }
 
       - name: Require the release tag to remain unused before draft creation
         if: env.EXISTING_RELEASE != '1'

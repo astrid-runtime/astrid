@@ -107,6 +107,9 @@ pub(in crate::engine::wasm::host::process) struct SpawnParams {
     /// the entry by value on every reap path, so the guard's drop fires then).
     pub(in crate::engine::wasm::host::process) injection_guard:
         Option<super::inject::InjectionGuard>,
+    /// Kernel-issued native storage projection kept until process reap.
+    pub(in crate::engine::wasm::host::process) process_storage_mount:
+        Option<crate::context::ProcessStorageMount>,
 }
 
 /// Host-owned registry of a capsule's persistent processes. Cloned (`Arc`)
@@ -232,6 +235,7 @@ impl PersistentProcessRegistry {
         let (exit_tx, exit_rx) = watch::channel::<Option<entry::ExitRecord>>(None);
         let monitor = spawn_monitor(&self.runtime, p.child, Arc::clone(&core), exit_tx);
         let injection_guard = p.injection_guard;
+        let process_storage_mount = p.process_storage_mount;
 
         let mut id = mint_id();
         let mut key = self.key_of(&id);
@@ -265,6 +269,7 @@ impl PersistentProcessRegistry {
                 exit_rx,
                 monitor,
                 injection_guard,
+                process_storage_mount,
             },
         );
         Ok(id)
@@ -516,7 +521,10 @@ impl PersistentProcessRegistry {
         // Remove under the lock, reap (killpg + abort) OUTSIDE it so the
         // syscall never stalls other registry ops.
         let removed = self.lock().remove(&r.key);
-        if let Some(entry) = removed {
+        if let Some(mut entry) = removed {
+            if let Some(mount) = entry.process_storage_mount.take() {
+                mount.close_async().await;
+            }
             reap_entry(entry);
         }
         Ok(exit.into())

@@ -7,19 +7,20 @@
 //! from the root journal and identity-checked arena objects.
 
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::path::Path;
 
 use crate::storage_model::ObjectId;
 
 use super::{
-    ARENA_FILE, ArenaLocation, DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN,
+    ARENA_FILE, ArenaLocation, DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN, File,
     INDEX_FILE, INDEX_MAGIC, IdentityScheme, PersistentObjectIdentity, PrincipalCodec,
     RecoveryLimits, append_frame, create_private_file_capability, live_files_mut,
     open_rw_capability, scan_frames, sync_store_directory_capability, verify_indexed_location,
     verify_indexed_tail,
 };
+use crate::volume::AstridVolume;
+use std::sync::Arc;
 
 const SNAPSHOT_RECORD: u8 = 1;
 const DELTA_RECORD: u8 = 2;
@@ -181,6 +182,21 @@ pub(super) fn replace_index(
     let mut reopened = open_rw_capability(directory, Path::new(INDEX_FILE), false).ok()?;
     reopened.seek(SeekFrom::End(0)).ok()?;
     Some(reopened)
+}
+
+pub(super) fn replace_volume_index(
+    volume: Arc<dyn AstridVolume>,
+    state: &IndexState,
+    scheme: IdentityScheme,
+) -> Option<File> {
+    let payload = encode_snapshot(state, scheme).ok()?;
+    let mut file = File::volume(volume, INDEX_FILE, true).ok()?;
+    file.set_len(0).ok()?;
+    file.seek(SeekFrom::Start(0)).ok()?;
+    append_frame(&mut file, INDEX_MAGIC, &payload).ok()?;
+    file.sync_data().ok()?;
+    file.seek(SeekFrom::End(0)).ok()?;
+    Some(file)
 }
 
 #[cfg(not(windows))]

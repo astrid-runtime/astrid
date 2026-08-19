@@ -17,6 +17,7 @@ description = "Astrid micro-kernel, the core of the Astrid OS"
 # `wasm32-unknown-unknown`.
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 arc-swap = { workspace = true }
 astrid-approval = { workspace = true }
 astrid-audit = { workspace = true }
@@ -30,6 +31,8 @@ astrid-events = { workspace = true }
 astrid-runtime = { workspace = true }
 astrid-storage = { workspace = true, features = ["legacy-surrealkv"] }
 base64 = { workspace = true }
+blake3 = { workspace = true }
+nix = { workspace = true }
 # Used to build the `chrono::Duration` TTL passed to `CapabilityToken::create`
 # in the admin token-mint handler (issue #929). The token API takes a signed
 # chrono duration; `default-features = false` (workspace) is sufficient —
@@ -65,6 +68,15 @@ astrid-capsule-install = { workspace = true }
 astrid-mcp = { workspace = true }
 astrid-vfs = { workspace = true }
 tokio = { workspace = true, features = ["full", "signal"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = "0.14.11"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 async-trait = { workspace = true }

@@ -26,6 +26,10 @@ fn platform_target_selects_linux_libc_at_compile_time_boundary() {
         platform_target_for("macos", "aarch64", "").unwrap(),
         "aarch64-apple-darwin"
     );
+    assert_eq!(
+        platform_target_for("windows", "x86_64", "").unwrap(),
+        "x86_64-pc-windows-msvc"
+    );
     for unsupported in ["", "uclibc", "newlib"] {
         assert!(
             platform_target_for("linux", "x86_64", unsupported)
@@ -395,26 +399,134 @@ fn backup_and_swap_replaces_and_keeps_backup() {
     std::fs::create_dir_all(&install).unwrap();
     std::fs::create_dir_all(&extract).unwrap();
 
-    std::fs::write(install.join("astrid"), b"OLD").unwrap();
-    std::fs::write(install.join("astrid-daemon"), b"OLD-D").unwrap();
-    std::fs::write(extract.join("astrid"), b"NEW").unwrap();
-    std::fs::write(extract.join("astrid-daemon"), b"NEW-D").unwrap();
+    let managed = super::managed_binaries_for_target("x86_64-unknown-linux-gnu");
+    for name in &managed {
+        std::fs::write(install.join(name), format!("OLD-{name}")).unwrap();
+        std::fs::write(extract.join(name), format!("NEW-{name}")).unwrap();
+    }
 
-    backup_and_swap(&install, &extract, MANAGED_BINARIES).unwrap();
+    backup_and_swap(&install, &extract, &managed).unwrap();
 
-    assert_eq!(std::fs::read(install.join("astrid")).unwrap(), b"NEW");
-    assert_eq!(
-        std::fs::read(install.join("astrid-daemon")).unwrap(),
-        b"NEW-D"
-    );
-    // Previous binaries preserved for manual rollback.
-    assert_eq!(std::fs::read(install.join("astrid.bak")).unwrap(), b"OLD");
-    assert_eq!(
-        std::fs::read(install.join("astrid-daemon.bak")).unwrap(),
-        b"OLD-D"
-    );
+    for name in &managed {
+        assert_eq!(
+            std::fs::read_to_string(install.join(name)).unwrap(),
+            format!("NEW-{name}")
+        );
+        // Previous binaries are preserved for manual rollback.
+        assert_eq!(
+            std::fs::read_to_string(install.join(format!("{name}.bak"))).unwrap(),
+            format!("OLD-{name}")
+        );
+    }
     // No staging temps left behind.
     assert!(!install.join(".astrid.new").exists());
+}
+
+#[test]
+fn macos_self_update_keeps_native_provider_and_lifecycle_tools_in_the_managed_set() {
+    let managed = super::managed_binaries_for_target("aarch64-apple-darwin");
+    assert_eq!(
+        managed,
+        vec![
+            "astrid",
+            "astrid-daemon",
+            "astrid-build",
+            "astrid-emit",
+            "astrid-storage-provider-fskit",
+            "manage-macos-fskit.sh",
+            "validate-macos-fskit.sh",
+        ]
+    );
+}
+
+#[test]
+fn macos_native_failure_restores_the_prior_managed_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let install = dir.path().join("bin");
+    let extract = dir.path().join("release");
+    std::fs::create_dir_all(&install).unwrap();
+    std::fs::create_dir_all(extract.join("macos")).unwrap();
+    std::fs::create_dir_all(extract.join("AstridFS.app")).unwrap();
+    let managed = super::managed_binaries_for_target("aarch64-apple-darwin");
+    for name in &managed[..5] {
+        std::fs::write(install.join(name), format!("OLD-{name}")).unwrap();
+        std::fs::write(extract.join(name), format!("NEW-{name}")).unwrap();
+    }
+    for name in &managed[5..] {
+        std::fs::write(extract.join("macos").join(name), format!("NEW-{name}")).unwrap();
+    }
+
+    let error =
+        super::apply_authenticated_update(&install, &extract, "aarch64-apple-darwin", |_, _| {
+            anyhow::bail!("injected app failure")
+        })
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("prior managed Astrid set was restored")
+    );
+    for name in &managed[..5] {
+        assert_eq!(
+            std::fs::read_to_string(install.join(name)).unwrap(),
+            format!("OLD-{name}")
+        );
+    }
+    for name in &managed[5..] {
+        assert!(!install.join(name).exists());
+    }
+}
+
+#[test]
+fn macos_assets_are_required_before_any_managed_file_is_mutated() {
+    let dir = tempfile::tempdir().unwrap();
+    let install = dir.path().join("bin");
+    let extract = dir.path().join("release");
+    std::fs::create_dir_all(&install).unwrap();
+    std::fs::create_dir_all(&extract).unwrap();
+    std::fs::write(install.join("astrid"), b"OLD").unwrap();
+
+    assert!(
+        super::apply_authenticated_update(
+            &install,
+            &extract,
+            "aarch64-apple-darwin",
+            |_, _| Ok(())
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::read(install.join("astrid")).unwrap(), b"OLD");
+    assert!(!install.join("astrid.bak").exists());
+}
+
+#[test]
+fn macos_success_retains_authenticated_lifecycle_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let install = dir.path().join("bin");
+    let extract = dir.path().join("release");
+    std::fs::create_dir_all(&install).unwrap();
+    std::fs::create_dir_all(extract.join("macos")).unwrap();
+    std::fs::create_dir_all(extract.join("AstridFS.app")).unwrap();
+    for name in super::managed_binaries_for_target("aarch64-apple-darwin") {
+        let source = if std::path::Path::new(name)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("sh"))
+        {
+            extract.join("macos").join(name)
+        } else {
+            extract.join(name)
+        };
+        std::fs::write(source, format!("NEW-{name}")).unwrap();
+    }
+
+    super::apply_authenticated_update(&install, &extract, "aarch64-apple-darwin", |_, _| Ok(()))
+        .unwrap();
+    for name in ["manage-macos-fskit.sh", "validate-macos-fskit.sh"] {
+        assert_eq!(
+            std::fs::read_to_string(install.join(name)).unwrap(),
+            format!("NEW-{name}")
+        );
+    }
 }
 
 #[test]
@@ -425,20 +537,80 @@ fn backup_and_swap_bails_when_archive_missing_a_binary() {
     std::fs::create_dir_all(&install).unwrap();
     std::fs::create_dir_all(&extract).unwrap();
 
-    std::fs::write(install.join("astrid"), b"OLD").unwrap();
-    std::fs::write(install.join("astrid-daemon"), b"OLD-D").unwrap();
-    // Archive only ships `astrid`; `astrid-daemon` is absent.
+    let managed = super::managed_binaries_for_target("x86_64-unknown-linux-gnu");
+    for name in &managed {
+        std::fs::write(install.join(name), format!("OLD-{name}")).unwrap();
+    }
+    // Archive only ships `astrid`; the remaining managed binaries are absent.
     std::fs::write(extract.join("astrid"), b"NEW").unwrap();
 
-    assert!(backup_and_swap(&install, &extract, MANAGED_BINARIES).is_err());
+    assert!(backup_and_swap(&install, &extract, &managed).is_err());
 
     // The completeness check runs before anything is touched: live binaries
     // are unchanged and no backups or staging temps were created.
-    assert_eq!(std::fs::read(install.join("astrid")).unwrap(), b"OLD");
-    assert_eq!(
-        std::fs::read(install.join("astrid-daemon")).unwrap(),
-        b"OLD-D"
-    );
-    assert!(!install.join("astrid.bak").exists());
+    for name in &managed {
+        assert_eq!(
+            std::fs::read_to_string(install.join(name)).unwrap(),
+            format!("OLD-{name}")
+        );
+        assert!(!install.join(format!("{name}.bak")).exists());
+    }
     assert!(!install.join(".astrid.new").exists());
+}
+
+#[test]
+fn linux_managed_updates_introduce_the_fuse_provider() {
+    let managed = super::managed_binaries_for_target("x86_64-unknown-linux-musl");
+    assert_eq!(
+        managed,
+        vec![
+            "astrid",
+            "astrid-daemon",
+            "astrid-build",
+            "astrid-emit",
+            "astrid-storage-provider-fuse",
+        ]
+    );
+    assert!(
+        !super::managed_binaries_for_target("x86_64-apple-darwin")
+            .contains(&"astrid-storage-provider-fuse")
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let install = dir.path().join("bin");
+    let extract = dir.path().join("new");
+    std::fs::create_dir_all(&install).unwrap();
+    std::fs::create_dir_all(&extract).unwrap();
+    std::fs::write(install.join("astrid"), b"OLD").unwrap();
+    std::fs::write(install.join("astrid-daemon"), b"OLD-D").unwrap();
+    std::fs::write(extract.join("astrid"), b"NEW").unwrap();
+    std::fs::write(extract.join("astrid-daemon"), b"NEW-D").unwrap();
+    std::fs::write(extract.join("astrid-build"), b"NEW-BUILD").unwrap();
+    std::fs::write(extract.join("astrid-emit"), b"NEW-EMIT").unwrap();
+    std::fs::write(extract.join("astrid-storage-provider-fuse"), b"NEW-FUSE").unwrap();
+
+    super::backup_and_swap(&install, &extract, &managed).unwrap();
+
+    assert_eq!(
+        std::fs::read(install.join("astrid-storage-provider-fuse")).unwrap(),
+        b"NEW-FUSE"
+    );
+}
+
+#[test]
+fn windows_managed_updates_include_the_native_provider_and_installer() {
+    assert_eq!(
+        super::managed_binaries_for_target("x86_64-pc-windows-msvc"),
+        vec![
+            "astrid.exe",
+            "astrid-daemon.exe",
+            "astrid-build.exe",
+            "astrid-emit.exe",
+            "astrid-storage-provider-winfsp.exe",
+            "winfsp-x64.dll",
+            "winfsp-2.1.25156.msi",
+            "install-windows.ps1",
+            "uninstall-windows.ps1",
+        ]
+    );
 }

@@ -1,0 +1,16 @@
+{
+  "release": "v0.10.4",
+  "asset": "astrid-0.10.4-aarch64-apple-darwin.tar.gz",
+  "asset_sha256": "f03fda82dd7c0396b613a91e02624e28c84d422a2cc5cf918503b0e2b4bae849",
+  "generated_by": "ASTRID_HOME=<empty-tempdir> ./astrid start",
+  "observed_version": "astrid 0.10.4",
+  "observed_exit": "daemon boot reached persisted identity and state creation, then refused the absent distro-provided CLI socket uplink",
+  "captured_files": [
+    "etc/layout-version",
+    "etc/profiles/default.toml",
+    "var/state.db/LOCK",
+    "var/state.db/manifest/00000000000000000000.manifest",
+    "var/state.db/wal/00000000000000000000.wal"
+  ],
+  "omitted": "runtime and principal private keys, tokens, logs, update cache, empty directories, and ephemeral run files"
+}

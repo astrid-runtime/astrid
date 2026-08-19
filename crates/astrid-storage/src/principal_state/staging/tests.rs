@@ -16,7 +16,13 @@ use super::journal::{
 };
 use super::recovery::{read_directory, retired_generation_name};
 use super::*;
-use crate::principal_state::native_io::{atomic_write, sync_directory};
+use crate::principal_state::native_io::{atomic_write, create_private_file, sync_directory};
+
+fn write_private_file(path: &Path, bytes: &[u8]) {
+    let mut file = create_private_file(path).unwrap();
+    file.write_all(bytes).unwrap();
+    file.sync_all().unwrap();
+}
 
 fn uid() -> PrincipalUid {
     let digest = blake3::Hasher::new_derive_key("astrid staging owner test fixture v1")
@@ -439,11 +445,10 @@ fn alias_intent_migration_is_crash_idempotent_and_reaches_the_flat_journal() {
     let id = StagedContentId(Uuid::new_v4());
     let staging_directory = writing.join(id.to_string());
     std::fs::create_dir(&staging_directory).unwrap();
-    std::fs::write(
-        staging_directory.join(legacy::CONTENT_FILE),
+    write_private_file(
+        &staging_directory.join(legacy::CONTENT_FILE),
         b"durable staged bytes",
-    )
-    .unwrap();
+    );
     let legacy_intent = LegacyStagingIntent {
         sequence: 4,
         id,
@@ -1464,7 +1469,7 @@ fn legacy_pending_published_and_unsealed_entries_migrate_without_loss() {
     let unsealed_id = StagedContentId(Uuid::new_v4());
     let unsealed = writing.join(unsealed_id.to_string());
     std::fs::create_dir(&unsealed).unwrap();
-    std::fs::write(unsealed.join(legacy::CONTENT_FILE), b"never acknowledged").unwrap();
+    write_private_file(&unsealed.join(legacy::CONTENT_FILE), b"never acknowledged");
     let malformed_id = StagedContentId(Uuid::new_v4());
     std::fs::write(writing.join(malformed_id.to_string()), b"not a directory").unwrap();
     sync_directory(&writing).unwrap();
@@ -1694,6 +1699,44 @@ fn disagreeing_legacy_intents_for_one_key_fail_before_migration_mutates() {
 
 #[cfg(unix)]
 #[test]
+fn unsafe_legacy_candidate_fails_before_migration_mutates() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let ready = root.join(legacy::READY_DIRECTORY);
+    let writing = root.join(legacy::WRITING_DIRECTORY);
+    std::fs::create_dir_all(&ready).unwrap();
+    std::fs::create_dir_all(&writing).unwrap();
+    let id = StagedContentId(Uuid::new_v4());
+    let ready_intent = legacy_entry_with_id(&ready, 42, id, "ready", b"ready", false);
+    let writing_intent = legacy_writing_entry_with_id(&writing, 42, id, "writing", b"writing");
+    let ready_directory = ready.join(format!("{:020}-{}", ready_intent.sequence, ready_intent.id));
+    let writing_directory = writing.join(writing_intent.id.to_string());
+    let unsafe_content = writing_directory.join(legacy::CONTENT_FILE);
+    std::fs::set_permissions(&unsafe_content, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let error = open_area_result(root).unwrap_err();
+    assert!(error.to_string().contains("not owner-only"), "{error}");
+    assert_eq!(std::fs::metadata(root.join(JOURNAL_FILE)).unwrap().len(), 0);
+    assert!(ready_directory.join(legacy::CONTENT_FILE).exists());
+    assert!(writing_directory.join(legacy::CONTENT_FILE).exists());
+    assert!(
+        read_directory(&root.join(GENERATIONS_DIRECTORY))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert!(
+        read_directory(&root.join(QUARANTINE_DIRECTORY))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn legacy_ready_symlink_is_rejected_before_published_cleanup() {
     use std::os::unix::fs::symlink;
 
@@ -1769,8 +1812,7 @@ fn legacy_entry_with_id(
     let directory = ready.join(format!("{sequence:020}-{id}"));
     std::fs::create_dir(&directory).unwrap();
     let content_path = directory.join(legacy::CONTENT_FILE);
-    std::fs::write(&content_path, content).unwrap();
-    File::open(&content_path).unwrap().sync_all().unwrap();
+    write_private_file(&content_path, content);
     let intent = StagingIntent {
         sequence,
         id,
@@ -1815,8 +1857,7 @@ fn legacy_writing_entry_with_id(
     let directory = writing.join(id.to_string());
     std::fs::create_dir(&directory).unwrap();
     let content_path = directory.join(legacy::CONTENT_FILE);
-    std::fs::write(&content_path, content).unwrap();
-    File::open(&content_path).unwrap().sync_all().unwrap();
+    write_private_file(&content_path, content);
     let intent = StagingIntent {
         sequence,
         id,

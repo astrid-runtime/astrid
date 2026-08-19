@@ -26,7 +26,7 @@ astrid-core = { workspace = true }
 astrid-crypto = { workspace = true }
 astrid-events = { workspace = true }
 astrid-runtime = { workspace = true }
-astrid-storage = { workspace = true, features = ["keychain"] }
+astrid-storage = { workspace = true }
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
@@ -64,6 +64,7 @@ uuid = { workspace = true }
 nix = { workspace = true }
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+chrono = { workspace = true }
 astrid-mcp = { workspace = true }
 # `astrid-vfs` is native-only (it uses `cap-std` and tokio's filesystem
 # surface). Only `context.rs`'s `overlay_registry` field references it, behind

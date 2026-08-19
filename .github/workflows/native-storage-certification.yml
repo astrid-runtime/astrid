@@ -1,0 +1,251 @@
+name: Native storage certification
+run-name: Native FSKit certification ${{ inputs.source_commit }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Exact 40-character source commit selected for this workflow run
+        required: true
+        type: string
+      runner_contract_acknowledged:
+        description: The runner is macOS 26+, GUI-logged-in, can write /Applications, and has pre-approved AstridFS
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-fskit-certification
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  ASTRID_FSKIT_APP_DEST: /Applications/AstridFS.app
+
+jobs:
+  native-fskit:
+    name: Native FSKit mount certification
+    runs-on: [self-hosted, macOS, fskit]
+    timeout-minutes: 60
+    environment: native-storage-certification
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Establish isolated certification paths
+        run: |
+          set -euo pipefail
+          CERT_ROOT="$RUNNER_TEMP/astrid-fskit-cert-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          {
+            echo "CERT_ROOT=$CERT_ROOT"
+            echo "CARGO_TARGET_DIR=$CERT_ROOT/cargo-target"
+            echo "ASTRID_HOME=$CERT_ROOT/home"
+            echo "CERT_BIN=$CERT_ROOT/bin"
+            echo "RELEASE_STAGE=$CERT_ROOT/release"
+            echo "MOUNTPOINT_INITIAL=$CERT_ROOT/mount-initial"
+            echo "MOUNTPOINT_IGNORED_TEST=$CERT_ROOT/mount-ignored-test"
+            echo "ASTRID_FSKIT_OUTPUT_ROOT=$CERT_ROOT/macos-fskit"
+            echo "ASTRID_FSKIT_BIN_DIR=$CERT_ROOT/bin"
+          } >> "$GITHUB_ENV"
+
+      - name: Bind certification to the check-run commit
+        env:
+          ACKNOWLEDGED: ${{ inputs.runner_contract_acknowledged }}
+          REQUESTED_SOURCE: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          [[ "$ACKNOWLEDGED" == true ]] || {
+            echo "the dedicated FSKit runner contract was not acknowledged" >&2
+            exit 1
+          }
+          [[ "$REQUESTED_SOURCE" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "source_commit must be an exact lowercase 40-character commit" >&2
+            exit 1
+          }
+          EVENT_SOURCE=$(git rev-parse "${GITHUB_SHA}^{commit}")
+          CHECKED_OUT_SOURCE=$(git rev-parse 'HEAD^{commit}')
+          [[ "$REQUESTED_SOURCE" == "$EVENT_SOURCE" ]]
+          [[ "$CHECKED_OUT_SOURCE" == "$EVENT_SOURCE" ]]
+          git diff --exit-code
+          git diff --cached --exit-code
+
+      - name: Require the dedicated native runner
+        env:
+          ASTRID_FSKIT_CODE_SIGN_IDENTITY: ${{ secrets.ASTRID_FSKIT_CODE_SIGN_IDENTITY }}
+          ASTRID_FSKIT_DEVELOPMENT_TEAM: ${{ secrets.ASTRID_FSKIT_DEVELOPMENT_TEAM }}
+          ASTRID_FSKIT_NOTARY_PROFILE: ${{ secrets.ASTRID_FSKIT_NOTARY_PROFILE }}
+        run: |
+          set -euo pipefail
+          [[ "$(uname -s)" == Darwin ]]
+          [[ "$(sw_vers -productVersion | cut -d. -f1)" -ge 26 ]]
+          [[ "$(id -u)" -ne 0 ]] || {
+            echo "FSKit certification must run in the pre-approved GUI user session" >&2
+            exit 1
+          }
+          [[ -w "$(dirname "$ASTRID_FSKIT_APP_DEST")" ]] || {
+            echo "the GUI runner cannot install into /Applications" >&2
+            exit 1
+          }
+          : "${ASTRID_FSKIT_DEVELOPMENT_TEAM:?missing signing-team environment secret}"
+          : "${ASTRID_FSKIT_NOTARY_PROFILE:?missing notary keychain-profile environment secret}"
+          if /sbin/mount | grep -Fq astridfs; then
+            echo "the dedicated runner has an unexpected active astridfs mount" >&2
+            /sbin/mount | grep -F astridfs >&2
+            exit 1
+          fi
+          if [[ -e "$ASTRID_FSKIT_APP_DEST" ]]; then
+            echo "the dedicated runner has an unexpected installed AstridFS app" >&2
+            exit 1
+          fi
+          if [[ -z "$ASTRID_FSKIT_CODE_SIGN_IDENTITY" ]]; then
+            ASTRID_FSKIT_CODE_SIGN_IDENTITY="Developer ID Application"
+          fi
+          security find-identity -v -p codesigning \
+            | grep -F "$ASTRID_FSKIT_CODE_SIGN_IDENTITY" >/dev/null
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95.0"
+
+      - name: Build the kernel, CLI, and FSKit companion
+        run: |
+          set -euo pipefail
+          install -d -m 0700 \
+            "$CERT_ROOT" "$CERT_BIN" "$ASTRID_HOME" \
+            "$RELEASE_STAGE/macos" "$MOUNTPOINT_INITIAL" "$MOUNTPOINT_IGNORED_TEST"
+          chmod -N "$CERT_ROOT" "$CERT_BIN" "$ASTRID_HOME" \
+            "$RELEASE_STAGE" "$RELEASE_STAGE/macos" \
+            "$MOUNTPOINT_INITIAL" "$MOUNTPOINT_IGNORED_TEST" 2>/dev/null || true
+          cargo build --locked --release \
+            -p astrid --bins \
+            -p astrid-storage-provider-fskit
+          install -m 0755 "$CARGO_TARGET_DIR/release/astrid" "$CERT_BIN/astrid"
+          install -m 0755 "$CARGO_TARGET_DIR/release/astrid-daemon" "$CERT_BIN/astrid-daemon"
+          install -m 0755 \
+            "$CARGO_TARGET_DIR/release/astrid-storage-provider-fskit" \
+            "$RELEASE_STAGE/astrid-storage-provider-fskit"
+
+      - name: Build, sign, and notarize the FSKit app
+        env:
+          ASTRID_FSKIT_CODE_SIGN_IDENTITY: ${{ secrets.ASTRID_FSKIT_CODE_SIGN_IDENTITY }}
+          ASTRID_FSKIT_DEVELOPMENT_TEAM: ${{ secrets.ASTRID_FSKIT_DEVELOPMENT_TEAM }}
+          ASTRID_FSKIT_NOTARY_PROFILE: ${{ secrets.ASTRID_FSKIT_NOTARY_PROFILE }}
+          ASTRID_FSKIT_NOTARIZE: "1"
+        run: |
+          set -euo pipefail
+          if [[ -z "$ASTRID_FSKIT_CODE_SIGN_IDENTITY" ]]; then
+            ASTRID_FSKIT_CODE_SIGN_IDENTITY="Developer ID Application"
+            export ASTRID_FSKIT_CODE_SIGN_IDENTITY
+          fi
+          scripts/build-macos-fskit.sh
+          APP_PATH="$ASTRID_FSKIT_OUTPUT_ROOT/DerivedData/Build/Products/Release/AstridFS.app"
+          [[ -d "$APP_PATH" ]]
+          ditto "$APP_PATH" "$RELEASE_STAGE/AstridFS.app"
+          install -m 0755 \
+            scripts/manage-macos-fskit.sh \
+            "$RELEASE_STAGE/macos/manage-macos-fskit.sh"
+          install -m 0755 \
+            scripts/validate-macos-fskit.sh \
+            "$RELEASE_STAGE/macos/validate-macos-fskit.sh"
+          "$RELEASE_STAGE/macos/validate-macos-fskit.sh" "$RELEASE_STAGE/AstridFS.app"
+
+      - name: Install and activate the signed extension
+        run: |
+          set -euo pipefail
+          ASTRID_FSKIT_APP_DEST="$ASTRID_FSKIT_APP_DEST" \
+          ASTRID_FSKIT_BIN_DIR="$ASTRID_FSKIT_BIN_DIR" \
+            "$RELEASE_STAGE/macos/manage-macos-fskit.sh" install
+          "$RELEASE_STAGE/macos/manage-macos-fskit.sh" validate
+          "$RELEASE_STAGE/macos/manage-macos-fskit.sh" enable
+          for _ in {1..30}; do
+            pgrep -x AstridFS >/dev/null && break
+            sleep 1
+          done
+          pgrep -x AstridFS >/dev/null || {
+            echo "AstridFS did not launch in the runner's GUI session" >&2
+            exit 1
+          }
+
+      - name: Exercise a real mount and the ignored native round-trip
+        run: |
+          set -euo pipefail
+          "$CERT_BIN/astrid" --principal default start
+
+          MOUNT_OUTPUT=$("$CERT_BIN/astrid" --principal default storage mount \
+            --as default "$MOUNTPOINT_INITIAL")
+          printf '%s\n' "$MOUNT_OUTPUT"
+          MOUNT_ID=$(printf '%s\n' "$MOUNT_OUTPUT" \
+            | sed -nE 's/^mounted ([0-9a-f-]{36}) at .*/\1/p')
+          [[ "$MOUNT_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+          [[ "$(stat -f %T "$MOUNTPOINT_INITIAL")" == astridfs ]]
+
+          SENTINEL="native-fskit-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          printf '%s\n' "$SENTINEL" > "$MOUNTPOINT_INITIAL/certification.txt"
+          mv "$MOUNTPOINT_INITIAL/certification.txt" "$MOUNTPOINT_INITIAL/certified.txt"
+          [[ "$(cat "$MOUNTPOINT_INITIAL/certified.txt")" == "$SENTINEL" ]]
+          "$CERT_BIN/astrid" --principal default storage sync "$MOUNTPOINT_INITIAL"
+          rm "$MOUNTPOINT_INITIAL/certified.txt"
+          "$CERT_BIN/astrid" --principal default storage sync "$MOUNTPOINT_INITIAL"
+
+          RESOURCE="/private/tmp/astrid-mounts-$(id -u)/$MOUNT_ID"
+          [[ -d "$RESOURCE" && -f "$RESOURCE/lease.json" && -S "$RESOURCE/control.sock" ]]
+          LEASE_TOKEN=$(plutil -extract lease_token raw "$RESOURCE/lease.json")
+          [[ -n "$LEASE_TOKEN" ]]
+          echo "::add-mask::$LEASE_TOKEN"
+
+          /sbin/umount "$MOUNTPOINT_INITIAL"
+          [[ "$(stat -f %T "$MOUNTPOINT_INITIAL")" != astridfs ]]
+
+          ASTRID_FSKIT_ACTUAL_RESOURCE="$RESOURCE" \
+          ASTRID_FSKIT_ACTUAL_MOUNTPOINT="$MOUNTPOINT_IGNORED_TEST" \
+          ASTRID_FSKIT_ACTUAL_TOKEN="$LEASE_TOKEN" \
+            cargo test --locked --release \
+              -p astrid-storage-provider-fskit \
+              tests::actual_fskit_mount_and_unmount_round_trip -- \
+              --ignored --exact --nocapture --test-threads=1
+          [[ "$(stat -f %T "$MOUNTPOINT_IGNORED_TEST")" != astridfs ]]
+
+          "$CERT_BIN/astrid" --principal default storage unmount "$MOUNTPOINT_INITIAL"
+          [[ ! -e "$RESOURCE" ]]
+          "$CERT_BIN/astrid" --principal default stop
+
+      - name: Uninstall and clean the dedicated runner
+        if: always()
+        run: |
+          set +e
+          cleanup_status=0
+          for mountpoint in "$MOUNTPOINT_IGNORED_TEST" "$MOUNTPOINT_INITIAL"; do
+            if [[ -d "$mountpoint" && "$(stat -f %T "$mountpoint" 2>/dev/null)" == astridfs ]]; then
+              /sbin/umount "$mountpoint" || cleanup_status=1
+            fi
+          done
+          if [[ -x "$CERT_BIN/astrid" ]]; then
+            "$CERT_BIN/astrid" --principal default storage unmount "$MOUNTPOINT_INITIAL" \
+              >/dev/null 2>&1 || true
+            "$CERT_BIN/astrid" --principal default stop >/dev/null 2>&1 || true
+          fi
+          pkill -x AstridFS >/dev/null 2>&1 || true
+          if [[ -d "$ASTRID_FSKIT_APP_DEST" && -x "$RELEASE_STAGE/macos/manage-macos-fskit.sh" ]]; then
+            ASTRID_FSKIT_APP_DEST="$ASTRID_FSKIT_APP_DEST" \
+            ASTRID_FSKIT_BIN_DIR="$ASTRID_FSKIT_BIN_DIR" \
+              "$RELEASE_STAGE/macos/manage-macos-fskit.sh" uninstall \
+              || cleanup_status=1
+          fi
+          case "$CERT_ROOT" in
+            "$RUNNER_TEMP"/astrid-fskit-cert-*) rm -rf "$CERT_ROOT" || cleanup_status=1 ;;
+            *) echo "refusing to clean unexpected certification root: $CERT_ROOT" >&2; cleanup_status=1 ;;
+          esac
+          exit "$cleanup_status"

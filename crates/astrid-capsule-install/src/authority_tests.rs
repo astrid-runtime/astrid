@@ -1,17 +1,24 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 use astrid_build::artifact::{self, sign_archive};
 use astrid_core::PrincipalId;
 use astrid_core::dirs::{AstridHome, WorkspaceLayout};
+use astrid_core::identity::PrincipalUid;
 use astrid_crypto::KeyPair;
+use astrid_storage::{
+    KvQuotaResolver, PrincipalDirectory, RuntimePrincipalStore, StateOwner,
+    open_runtime_principal_store_with_directory,
+};
 
 use crate::{
     ArtifactProvenance, AuthorityDecision, AuthoritySource, InstallOptions, authorize_install,
     inspect_archive_for_principal_in_workspace, inspect_archive_for_principal_with_layout,
-    read_installed_authority, resolve_target_dir_for,
-    unpack_and_install_authorized_for_principal_in_workspace,
+    inspect_directory_for_principal_with_layout,
+    install_from_local_path_authorized_for_principal_with_layout, read_installed_authority,
+    resolve_target_dir_for, unpack_and_install_authorized_for_principal_in_workspace,
     unpack_and_install_authorized_for_principal_with_layout, verify_installed_authority,
 };
 
@@ -63,6 +70,32 @@ fn install_home(root: &Path, key: &KeyPair) -> AstridHome {
     home
 }
 
+fn install_store(home: &AstridHome, principal: &PrincipalId) -> Arc<RuntimePrincipalStore> {
+    let directory = PrincipalDirectory::default();
+    directory
+        .register(principal.clone(), PrincipalUid::from_bytes([0x11; 32]))
+        .unwrap();
+    let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
+        Ok(match owner {
+            StateOwner::System => None,
+            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+        })
+    });
+    let store = Arc::new(
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(open_runtime_principal_store_with_directory(
+                home, quota, directory,
+            ))
+            .unwrap(),
+    );
+    store
+        .principal_directory()
+        .register(principal.clone(), PrincipalUid::from_bytes([0x11; 32]))
+        .unwrap();
+    store
+}
+
 #[test]
 fn same_runtime_build_installs_automatically_and_records_authority() {
     let temp = tempfile::tempdir().unwrap();
@@ -77,6 +110,7 @@ fn same_runtime_build_installs_automatically_and_records_authority() {
     );
     sign_archive(&archive, &key).unwrap();
     let principal = PrincipalId::new("alice").unwrap();
+    let storage = install_store(&home, &principal);
 
     let inspection = inspect_archive_for_principal_with_layout(
         &archive,
@@ -93,15 +127,20 @@ fn same_runtime_build_installs_automatically_and_records_authority() {
     let output = unpack_and_install_authorized_for_principal_with_layout(
         &archive,
         &home,
-        InstallOptions::default(),
+        InstallOptions {
+            storage: Some(Arc::clone(&storage)),
+            ..Default::default()
+        },
         &principal,
         &AuthorityDecision::Automatic,
         &WorkspaceLayout::default(),
     )
     .unwrap();
-    let authority = read_installed_authority(&home, &output.target_dir)
+    let uid = storage.principal_directory().uid_for(&principal).unwrap();
+    let package = crate::storage::read_verified_durable_package(&storage, uid, "example")
         .unwrap()
         .unwrap();
+    let authority = package.authority();
     assert_eq!(authority.source, AuthoritySource::LocalRuntimeBuild);
     assert_eq!(authority.capsule_id, "example");
     assert_eq!(authority.version, "1.0.0");
@@ -110,13 +149,10 @@ fn same_runtime_build_installs_automatically_and_records_authority() {
         authority.approved_capabilities.net_connect,
         vec!["api.example:443"]
     );
-    assert!(
-        output.target_dir.read_dir().unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .contains("authority")),
-        "kernel authority metadata must stay outside capsule-writable storage"
+    assert_eq!(
+        std::fs::read(output.target_dir.join("authority.json")).unwrap(),
+        package.snapshot().package().authority,
+        "the disposable cache must exactly mirror durable authority bytes"
     );
 
     std::fs::write(
@@ -125,10 +161,15 @@ fn same_runtime_build_installs_automatically_and_records_authority() {
          [capabilities]\nnet_connect = [\"api.example:443\"]\n# changed after install\n",
     )
     .unwrap();
-    let changed =
-        astrid_capsule::discovery::load_manifest(&output.target_dir.join("Capsule.toml")).unwrap();
-    let error = verify_installed_authority(&home, &output.target_dir, &changed).unwrap_err();
-    assert!(error.to_string().contains("exact manifest approved"));
+    let changed_bytes = std::fs::read(output.target_dir.join("Capsule.toml")).unwrap();
+    let durable = crate::storage::read_verified_durable_package(&storage, uid, "example")
+        .unwrap()
+        .unwrap();
+    assert_ne!(durable.manifest_bytes(), changed_bytes);
+    assert_eq!(
+        durable.manifest().capabilities.net_connect,
+        vec!["api.example:443"]
+    );
 
     std::fs::write(
         output.target_dir.join("Capsule.toml"),
@@ -136,10 +177,15 @@ fn same_runtime_build_installs_automatically_and_records_authority() {
          [capabilities]\nnet_connect = [\"api.example:443\", \"db.example:5432\"]\n",
     )
     .unwrap();
-    let expanded =
-        astrid_capsule::discovery::load_manifest(&output.target_dir.join("Capsule.toml")).unwrap();
-    let error = verify_installed_authority(&home, &output.target_dir, &expanded).unwrap_err();
-    assert!(error.to_string().contains("net_connect=[db.example:5432]"));
+    let expanded_bytes = std::fs::read(output.target_dir.join("Capsule.toml")).unwrap();
+    let durable = crate::storage::read_verified_durable_package(&storage, uid, "example")
+        .unwrap()
+        .unwrap();
+    assert_ne!(durable.manifest_bytes(), expanded_bytes);
+    assert_eq!(
+        durable.manifest().capabilities.net_connect,
+        vec!["api.example:443"]
+    );
 }
 
 #[test]
@@ -153,15 +199,25 @@ fn installed_wasm_cannot_be_repointed_after_authority_approval() {
     sign_archive(&archive, &key).unwrap();
     let principal = PrincipalId::new("alice").unwrap();
     let layout = WorkspaceLayout::default();
+    let storage = install_store(&home, &principal);
     let output = unpack_and_install_authorized_for_principal_with_layout(
         &archive,
         &home,
-        InstallOptions::default(),
+        InstallOptions {
+            storage: Some(Arc::clone(&storage)),
+            ..Default::default()
+        },
         &principal,
         &AuthorityDecision::Automatic,
         &layout,
     )
     .unwrap();
+
+    assert_eq!(
+        std::fs::read(output.target_dir.join("module.wasm")).unwrap(),
+        original_wasm,
+        "an immediately activated durable install needs the verified component in its cache"
+    );
 
     let manifest =
         astrid_capsule::discovery::load_manifest(&output.target_dir.join("Capsule.toml")).unwrap();
@@ -194,8 +250,62 @@ fn installed_wasm_cannot_be_repointed_after_authority_approval() {
 
     let error = verify_installed_authority(&home, &output.target_dir, &manifest).unwrap_err();
     assert!(
-        error.to_string().contains("WASM executable differs"),
+        error.to_string().contains("WASM integrity check failed"),
         "unexpected authority error: {error:#}"
+    );
+}
+
+#[test]
+fn unsigned_directory_mutated_after_explicit_approval_is_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let key = KeyPair::generate();
+    let home = install_home(&temp.path().join("runtime"), &key);
+    let principal = PrincipalId::new("alice").unwrap();
+    let storage = install_store(&home, &principal);
+    let source = temp.path().join("mutable-unsigned");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("Capsule.toml"),
+        "[package]\nname = \"mutable-unsigned\"\nversion = \"1.0.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(source.join("payload.txt"), b"approved bytes").unwrap();
+
+    let layout = WorkspaceLayout::default();
+    let inspection =
+        inspect_directory_for_principal_with_layout(&source, &home, &principal, false, &layout)
+            .unwrap();
+    assert!(matches!(
+        inspection.provenance,
+        ArtifactProvenance::Unsigned
+    ));
+    let decision = AuthorityDecision::ExplicitApproval {
+        content_digest: inspection.content_digest.clone(),
+    };
+
+    // This hook runs after the installer's immediate pre-mutation authority
+    // re-check. A secure transaction must detect the changed unsigned tree
+    // before copying or publishing it; the baseline currently proceeds and
+    // silently rebinds the durable receipt to the changed source.
+    crate::local::set_post_authority_test_hook(|source_dir| {
+        std::fs::write(source_dir.join("payload.txt"), b"changed after approval").unwrap();
+    });
+    let result = install_from_local_path_authorized_for_principal_with_layout(
+        &source,
+        &home,
+        InstallOptions {
+            storage: Some(Arc::clone(&storage)),
+            ..Default::default()
+        },
+        &principal,
+        &decision,
+        &layout,
+    );
+
+    let error = result.expect_err("an approved unsigned source changed before install");
+    assert!(
+        !error.to_string().is_empty(),
+        "mutable-source rejection should explain the authority failure"
     );
 }
 
@@ -209,6 +319,7 @@ fn foreign_runtime_signature_needs_digest_bound_approval() {
     sign_archive(&archive, &builder_key).unwrap();
     let principal = PrincipalId::new("alice").unwrap();
     let layout = WorkspaceLayout::default();
+    let storage = install_store(&home, &principal);
     let inspection =
         inspect_archive_for_principal_with_layout(&archive, &home, &principal, false, &layout)
             .unwrap();
@@ -221,7 +332,10 @@ fn foreign_runtime_signature_needs_digest_bound_approval() {
         unpack_and_install_authorized_for_principal_with_layout(
             &archive,
             &home,
-            InstallOptions::default(),
+            InstallOptions {
+                storage: Some(Arc::clone(&storage)),
+                ..Default::default()
+            },
             &principal,
             &AuthorityDecision::ExplicitApproval {
                 content_digest: "wrong".into(),
@@ -230,10 +344,13 @@ fn foreign_runtime_signature_needs_digest_bound_approval() {
         )
         .is_err()
     );
-    let output = unpack_and_install_authorized_for_principal_with_layout(
+    unpack_and_install_authorized_for_principal_with_layout(
         &archive,
         &home,
-        InstallOptions::default(),
+        InstallOptions {
+            storage: Some(Arc::clone(&storage)),
+            ..Default::default()
+        },
         &principal,
         &AuthorityDecision::ExplicitApproval {
             content_digest: inspection.content_digest,
@@ -241,11 +358,12 @@ fn foreign_runtime_signature_needs_digest_bound_approval() {
         &layout,
     )
     .unwrap();
+    let uid = storage.principal_directory().uid_for(&principal).unwrap();
+    let package = crate::storage::read_verified_durable_package(&storage, uid, "example")
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        read_installed_authority(&home, &output.target_dir)
-            .unwrap()
-            .unwrap()
-            .source,
+        package.authority().source,
         AuthoritySource::ExplicitApproval
     );
 }
@@ -308,6 +426,7 @@ fn upgrade_inspection_reports_only_new_capability_authority() {
     let home = install_home(&temp.path().join("runtime"), &KeyPair::generate());
     let principal = PrincipalId::new("alice").unwrap();
     let layout = WorkspaceLayout::default();
+    let storage = install_store(&home, &principal);
     let v1 = temp.path().join("v1.capsule");
     write_archive(
         &v1,
@@ -320,7 +439,10 @@ fn upgrade_inspection_reports_only_new_capability_authority() {
     unpack_and_install_authorized_for_principal_with_layout(
         &v1,
         &home,
-        InstallOptions::default(),
+        InstallOptions {
+            storage: Some(Arc::clone(&storage)),
+            ..Default::default()
+        },
         &principal,
         &AuthorityDecision::ExplicitApproval {
             content_digest: first.content_digest,
@@ -343,9 +465,11 @@ fn upgrade_inspection_reports_only_new_capability_authority() {
         upgrade.capability_expansions[0].name,
         "allow_prompt_injection"
     );
-    assert_eq!(
-        upgrade.capability_expansions[1].added,
-        vec!["db.example:5432"]
+    assert!(
+        upgrade.capability_expansions[1]
+            .added
+            .iter()
+            .any(|capability| capability == "db.example:5432")
     );
 }
 

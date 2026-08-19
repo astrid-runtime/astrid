@@ -1,8 +1,9 @@
 //! Explicit flush and close lifecycle for the durable engine.
 
 use super::{
-    DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN, IndexState, LIFECYCLE_CLOSED,
-    PersistentObjectIdentity, PrincipalCodec, io_error, live_files_mut, replace_index,
+    DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE, File,
+    IndexState, LIFECYCLE_CLOSED, PersistentObjectIdentity, PrincipalCodec, StoreLock, io_error,
+    live_files_mut, replace_index, replace_volume_index,
 };
 
 impl<P, I, C> DurableEngine<P, I, C>
@@ -64,10 +65,11 @@ where
         self.lifecycle
             .store(LIFECYCLE_CLOSED, std::sync::atomic::Ordering::Release);
         let unlock = match inner.lock.take() {
-            Some(lock) => fs2::FileExt::unlock(&lock)
+            Some(StoreLock::Native(lock)) => fs2::FileExt::unlock(&lock)
                 .map_err(|source| io_error("unlock principal store while closing", source)),
-            None => Ok(()),
+            Some(StoreLock::Volume) | None => Ok(()),
         };
+        drop(self.volume.write().take());
         result.and(unlock)
     }
 
@@ -96,6 +98,18 @@ where
     }
 
     fn checkpoint_index(&self, inner: &mut DurableInner<P>) {
+        if inner.pending_index_locations.is_empty() && inner.pending_direct_objects.is_empty() {
+            let Ok(files) = live_files_mut(&mut inner.files) else {
+                return;
+            };
+            if files
+                .index_cache
+                .as_mut()
+                .is_some_and(index_cache_has_one_frame)
+            {
+                return;
+            }
+        }
         let arena_tail = inner
             .index
             .values()
@@ -118,11 +132,37 @@ where
             return;
         };
         drop(files.index_cache.take());
-        files.index_cache =
-            replace_index(&self.directory_capability, &state, self.identity.scheme());
+        let volume = self.volume.read();
+        files.index_cache = match (self.directory_capability.as_deref(), volume.as_ref()) {
+            (Some(directory), None) => replace_index(directory, &state, self.identity.scheme()),
+            (None, Some(volume)) => replace_volume_index(
+                std::sync::Arc::clone(volume),
+                &state,
+                self.identity.scheme(),
+            ),
+            _ => None,
+        };
         files.arena_len = arena_len;
         files.arena_tail = arena_tail;
         inner.pending_index_locations.clear();
         inner.pending_direct_objects.clear();
     }
+}
+
+fn index_cache_has_one_frame(file: &mut File) -> bool {
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return false;
+    };
+    if length < FRAME_HEADER_LEN {
+        return false;
+    }
+    let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
+    let read_len = file.read_at(&mut header, 0);
+    if !matches!(read_len, Ok(read) if read == FRAME_HEADER_LEN_USIZE) {
+        return false;
+    }
+    let payload_len = u64::from_le_bytes(header[12..20].try_into().unwrap_or([0; 8]));
+    FRAME_HEADER_LEN
+        .checked_add(payload_len)
+        .is_some_and(|frame_end| frame_end == length)
 }

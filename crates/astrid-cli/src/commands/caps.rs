@@ -598,6 +598,7 @@ mod tests {
     fn record_round_trips_to_json() {
         let summary = AgentSummary {
             principal: PrincipalId::new("alice").unwrap(),
+            owner_uid: None,
             enabled: true,
             groups: vec!["agent".into()],
             grants: vec!["self:capsule:install".into()],

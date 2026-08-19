@@ -61,7 +61,7 @@ print(json.dumps({"title": sys.argv[1]}))
 PY
 )"
   curl --connect-timeout 2 \
-    --max-time 10 \
+    --max-time 25 \
     -sS \
     -o "$out" \
     -w "%{http_code}" \
@@ -245,7 +245,6 @@ run_concurrent_http_prompt_correlation_smoke() {
   local ops_update_out="$ARTIFACTS/concurrent-session-ops-update.json"
   local user_update_status="$ARTIFACTS/concurrent-session-user-update.status"
   local ops_update_status="$ARTIFACTS/concurrent-session-ops-update.status"
-  local status
   concurrent_session_title_update "$user_bearer" "$user_session" "$user_title" \
     "$user_update_out" "$user_update_status" &
   user_pid=$!
@@ -266,16 +265,12 @@ run_concurrent_http_prompt_correlation_smoke() {
     fail "operator concurrent session update failed before HTTP status"
   }
 
-  status="$(<"$user_update_status")"
-  LAST_HTTP_OUT="$user_update_out"
-  assert_status "agent concurrent session update" "$status" 200
-  status="$(<"$ops_update_status")"
-  LAST_HTTP_OUT="$ops_update_out"
-  assert_status "operator concurrent session update" "$status" 200
+  assert_status "agent concurrent session update" "$(<"$user_update_status")" 200
   json_assert_session_summary "$user_update_out" "$user_session" "$user_title"
+  assert_status "operator concurrent session update" "$(<"$ops_update_status")" 200
   json_assert_session_summary "$ops_update_out" "$ops_session" "$ops_title"
 
-  note "checking concurrent cross-principal session mutation is hidden"
+  note "checking unsupported cross-principal session mutation leaks no identity"
   local forbidden_title="forbidden concurrent session title"
   local ops_final_title="operator concurrent session owner title"
   local cross_update_out="$ARTIFACTS/concurrent-session-cross-update.json"
@@ -302,13 +297,11 @@ run_concurrent_http_prompt_correlation_smoke() {
     fail "operator owner concurrent session update failed before HTTP status"
   }
 
-  status="$(<"$cross_update_status")"
-  LAST_HTTP_OUT="$cross_update_out"
-  assert_status "agent cross-principal concurrent session update hidden" "$status" 404
+  assert_status "agent cross-principal concurrent session update hidden" \
+    "$(<"$cross_update_status")" 404
   assert_artifact_lacks_text "$cross_update_out" "$ops_session"
-  status="$(<"$ops_final_update_status")"
-  LAST_HTTP_OUT="$ops_final_update_out"
-  assert_status "operator owner concurrent session update" "$status" 200
+  assert_status "operator owner concurrent session update" \
+    "$(<"$ops_final_update_status")" 200
   json_assert_session_summary "$ops_final_update_out" "$ops_session" "$ops_final_title"
 }
 

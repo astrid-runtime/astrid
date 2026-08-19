@@ -17,10 +17,10 @@ use crate::theme;
 
 /// Ensure `~/.astrid/` exists without selecting product composition.
 #[allow(clippy::unused_async)]
-pub(crate) async fn ensure_global_config() {
-    if let Ok(home) = AstridHome::resolve() {
-        let _ = home.ensure();
-    }
+pub(crate) async fn ensure_global_config() -> Result<()> {
+    let home = AstridHome::resolve().context("failed to resolve Astrid home")?;
+    home.ensure()
+        .context("failed to validate Astrid home layout")
 }
 
 /// Configure tracing/logging for this CLI invocation.
@@ -97,6 +97,25 @@ pub(crate) fn find_companion_binary(name: &str) -> Result<std::path::PathBuf> {
     anyhow::bail!(
         "{name} not found. Ensure it is installed alongside the astrid CLI \
          or available in PATH."
+    )
+}
+
+/// Locate a security-sensitive companion only in the authenticated install set.
+///
+/// Unlike developer-oriented companion discovery, this deliberately refuses a
+/// `PATH` fallback. A storage provider controls what filesystem the operator
+/// sees, so the executable must be co-installed beside this CLI.
+pub(crate) fn find_coinstalled_companion_binary(name: &str) -> Result<std::path::PathBuf> {
+    let executable = std::env::current_exe().context("resolve the Astrid CLI executable")?;
+    let directory = executable
+        .parent()
+        .context("the Astrid CLI executable has no installation directory")?;
+    let candidate = directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    if candidate.is_file() {
+        return Ok(candidate);
+    }
+    anyhow::bail!(
+        "{name} is not installed beside the Astrid CLI; refusing a PATH provider for a security-sensitive mount"
     )
 }
 

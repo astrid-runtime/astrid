@@ -124,7 +124,16 @@ mod tests {
         let ctx = CapsuleContext {
             principal: astrid_core::PrincipalId::default(),
             workspace_root: std::path::PathBuf::from("/"),
+            workspace_source: crate::context::WorkspaceSource::HostedPortal(
+                std::path::PathBuf::from("/"),
+            ),
             home_root: None,
+            principal_directory: astrid_storage::PrincipalDirectory::default(),
+            principal_store: None,
+            #[cfg(not(target_family = "wasm"))]
+            workspace_branches: None,
+            #[cfg(not(target_family = "wasm"))]
+            process_storage_mount_broker: None,
             event_bus: bus,
             kv,
             cli_socket_listener: None,
@@ -192,7 +201,16 @@ mod tests {
         let ctx = CapsuleContext {
             principal: astrid_core::PrincipalId::default(),
             workspace_root: std::path::PathBuf::from("/"),
+            workspace_source: crate::context::WorkspaceSource::HostedPortal(
+                std::path::PathBuf::from("/"),
+            ),
             home_root: None,
+            principal_directory: astrid_storage::PrincipalDirectory::default(),
+            principal_store: None,
+            #[cfg(not(target_family = "wasm"))]
+            workspace_branches: None,
+            #[cfg(not(target_family = "wasm"))]
+            process_storage_mount_broker: None,
             event_bus: bus,
             kv,
             cli_socket_listener: None,
@@ -274,7 +292,16 @@ mod tests {
         let ctx = CapsuleContext {
             principal: astrid_core::PrincipalId::default(),
             workspace_root: std::path::PathBuf::from("/"),
+            workspace_source: crate::context::WorkspaceSource::HostedPortal(
+                std::path::PathBuf::from("/"),
+            ),
             home_root: None,
+            principal_directory: astrid_storage::PrincipalDirectory::default(),
+            principal_store: None,
+            #[cfg(not(target_family = "wasm"))]
+            workspace_branches: None,
+            #[cfg(not(target_family = "wasm"))]
+            process_storage_mount_broker: None,
             event_bus: bus,
             kv,
             cli_socket_listener: None,

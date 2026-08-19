@@ -4,8 +4,6 @@ use std::num::NonZeroU64;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-#[cfg(not(target_os = "windows"))]
-use crate::engine::crash_replay::{CrashTrace, CrashTraceRecorder, TraceEffect, TraceFileId};
 use crate::engine::{ObjectCacheCapacity, ObjectCacheController, RootTransaction};
 use crate::resources::ResidentMemoryAuthority;
 use crate::storage_model::{
@@ -13,12 +11,14 @@ use crate::storage_model::{
     PhysicalIdentity, ProfileKind, ReconstructionBounds, ReferenceLabel, RepresentationProfile,
     RootGeneration, RootState,
 };
+use crate::volume::AstridVolume as _;
+use crate::{AstridFilesystem, FilesystemPath};
 #[cfg(feature = "legacy-surrealkv")]
 use astrid_core::profile::{DeviceKey, DeviceScope, PrincipalProfile};
 
 use super::*;
 use crate::content::{CONTENT_COMPONENT_LABEL, CatalogValue, LegacyCatalog, encode_legacy_catalog};
-use crate::{ChunkingProfile, ContentName};
+use crate::{ChunkingProfile, ContentIngest, ContentName};
 
 mod staging_batch_tests;
 
@@ -26,7 +26,7 @@ fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
     Arc::new(|owner: &StateOwner| {
         Ok(match owner {
             StateOwner::System => None,
-            StateOwner::Principal(_) => Some(u64::MAX),
+            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
         })
     })
 }
@@ -69,91 +69,6 @@ async fn create_test_principal(store: &RuntimePrincipalStore, alias: &str) -> Pr
         .unwrap()
         .unwrap()
         .uid
-}
-
-#[cfg(not(target_os = "windows"))]
-struct DurablePrefixTrace {
-    recorder: CrashTraceRecorder,
-    arena: TraceFileId,
-    roots: TraceFileId,
-    representation_metadata: TraceFileId,
-    representation_journal: TraceFileId,
-}
-
-#[cfg(not(target_os = "windows"))]
-impl DurablePrefixTrace {
-    fn begin(store_path: &Path) -> (Self, u64) {
-        let arena = TraceFileId::new("objects.arena").unwrap();
-        let roots = TraceFileId::new("roots.journal").unwrap();
-        let representation_metadata =
-            TraceFileId::new("representations/generations/0000000000000001/metadata.arena")
-                .unwrap();
-        let representation_journal =
-            TraceFileId::new("representations/generations/0000000000000001/state.journal").unwrap();
-        let files = [
-            arena.clone(),
-            roots.clone(),
-            TraceFileId::new(STORE_METADATA_FILE).unwrap(),
-            TraceFileId::new(migrations::MIGRATION_MARKER_FILE).unwrap(),
-            TraceFileId::new("representations/CURRENT").unwrap(),
-            representation_metadata.clone(),
-            representation_journal.clone(),
-        ];
-        let initial_root_len = std::fs::metadata(store_path.join(roots.as_str()))
-            .unwrap()
-            .len();
-        let recorder = CrashTraceRecorder::from_paths(
-            files
-                .into_iter()
-                .map(|file| (file.clone(), store_path.join(file.as_str()))),
-            ["initial".to_owned()],
-        )
-        .unwrap();
-        (
-            Self {
-                recorder,
-                arena,
-                roots,
-                representation_metadata,
-                representation_journal,
-            },
-            initial_root_len,
-        )
-    }
-
-    fn capture_commit(&self, store_path: &Path, initial_root_len: u64) {
-        self.recorder
-            .capture(&self.arena, &store_path.join(self.arena.as_str()))
-            .unwrap();
-        self.recorder.barrier(&self.arena).unwrap();
-        self.recorder
-            .capture(
-                &self.representation_metadata,
-                &store_path.join(self.representation_metadata.as_str()),
-            )
-            .unwrap();
-        self.recorder
-            .capture(
-                &self.representation_journal,
-                &store_path.join(self.representation_journal.as_str()),
-            )
-            .unwrap();
-        self.recorder
-            .capture(&self.roots, &store_path.join(self.roots.as_str()))
-            .unwrap();
-        self.recorder.barrier(&self.roots).unwrap();
-        let final_root_len = std::fs::metadata(store_path.join(self.roots.as_str()))
-            .unwrap()
-            .len();
-        self.recorder
-            .root_publication(
-                &self.roots,
-                initial_root_len,
-                final_root_len.checked_sub(initial_root_len).unwrap(),
-            )
-            .unwrap();
-        self.recorder.acknowledge("updated").unwrap();
-    }
 }
 
 fn chunker_golden_source(length: usize) -> Vec<u8> {
@@ -325,98 +240,14 @@ async fn closing_a_governed_cache_releases_physical_and_logical_leases() {
     authority.remove_principal(&owner).unwrap();
 }
 
-#[cfg(not(target_os = "windows"))]
-fn assert_reader_rejects_substituted_format_specification(home: &AstridHome, script: &Path) {
-    let format_spec_id =
-        Blake3ObjectIdentityV1.identify(&bootstrap::format_specification().unwrap());
-    let catalog_spec_id = Blake3ObjectIdentityV1
-        .identify(&bootstrap::content_catalog_format_specification().unwrap());
-    let engine = RuntimeEngine::open(
-        home.principal_store_path(),
-        Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
-        RecoveryLimits::process_addressable(),
-    )
-    .unwrap();
-    let replacement_spec = ObjectRecord::new(
-        ObjectKind::Evidence,
-        ObjectFormatVersion::V1,
-        b"self-consistent replacement format specification".to_vec(),
-        Vec::new(),
-        0,
-        ObjectClass::Metadata,
-    )
-    .unwrap();
-    let (replacement_id, inserted) = engine.persist_standalone_object(&replacement_spec).unwrap();
-    assert_eq!(inserted, crate::storage_model::InsertOutcome::Inserted);
-    engine.close().unwrap();
-
-    let metadata = home.principal_store_path().join(STORE_METADATA_FILE);
-    std::fs::write(&metadata, store_metadata(replacement_id, catalog_spec_id)).unwrap();
-    let substituted = std::process::Command::new("python3")
-        .arg(script)
-        .arg(home.principal_store_path())
-        .output()
-        .unwrap();
-    assert!(
-        !substituted.status.success(),
-        "independent reader accepted a substituted format specification"
-    );
-    std::fs::write(metadata, store_metadata(format_spec_id, catalog_spec_id)).unwrap();
-}
-
-#[cfg(not(target_os = "windows"))]
-fn assert_reader_requires_catalog_specification(home: &AstridHome, script: &Path) {
-    let metadata = home.principal_store_path().join(STORE_METADATA_FILE);
-    let current = std::fs::read_to_string(&metadata).unwrap();
-    let without_catalog = current
-        .lines()
-        .filter(|line| !line.starts_with("content-catalog-spec-object="))
-        .collect::<Vec<_>>()
-        .join("\n");
-    std::fs::write(&metadata, format!("{without_catalog}\n")).unwrap();
-    let rejected = std::process::Command::new("python3")
-        .arg(script)
-        .arg(home.principal_store_path())
-        .output()
-        .unwrap();
-    assert!(
-        !rejected.status.success(),
-        "independent reader accepted metadata without its catalog specification"
-    );
-
-    let leading_zero = current.replacen(
-        "content-catalog-spec-object=1:1:32:",
-        "content-catalog-spec-object=01:1:32:",
-        1,
-    );
-    let catalog_id = object_id_hex(
-        Blake3ObjectIdentityV1
-            .identify(&bootstrap::content_catalog_format_specification().unwrap()),
-    );
-    let uppercase_digest = current.replacen(&catalog_id, &catalog_id.to_ascii_uppercase(), 1);
-    for (description, malformed) in [
-        ("leading-zero algorithm tag", leading_zero),
-        ("uppercase digest", uppercase_digest),
-    ] {
-        std::fs::write(&metadata, malformed).unwrap();
-        let rejected = std::process::Command::new("python3")
-            .arg(script)
-            .arg(home.principal_store_path())
-            .output()
-            .unwrap();
-        assert!(
-            !rejected.status.success(),
-            "independent reader accepted a {description}"
-        );
-    }
-    std::fs::write(metadata, current).unwrap();
-}
-
 #[test]
 fn owner_codec_round_trips_only_canonical_values() {
-    let codec = StateOwnerCodecV1;
-    let owners = [StateOwner::System, test_owner("alice")];
+    let codec = StateOwnerCodecV2;
+    let owners = [
+        StateOwner::System,
+        test_owner("alice"),
+        StateOwner::Fleet(astrid_core::FleetUid::from_bytes([7; 32])),
+    ];
     for owner in owners {
         let encoded = codec.encode(&owner);
         assert_eq!(codec.decode(&encoded), Some(owner));
@@ -499,7 +330,7 @@ fn format_specification_has_a_tagged_metadata_identity() {
     assert!(record.references().is_empty());
     assert_eq!(
         object_id_hex(id),
-        "9d701dc87360e634b25b7b7f5d5e79315f9f27bcf4d50e09c2181e439b0c7d75"
+        "58726b3c243c30ebc0941f656427520094a6bb10e7b2190be732b5a61300144d"
     );
     assert_eq!(
         object_id_hex(catalog_id),
@@ -510,10 +341,10 @@ fn format_specification_has_a_tagged_metadata_identity() {
         "format=astrid-principal-store-v1\n\
          identity=blake3-object-identity-v1\n\
          identity-wire=tagged-identity-v1\n\
-         format-spec-object=1:1:32:9d701dc87360e634b25b7b7f5d5e79315f9f27bcf4d50e09c2181e439b0c7d75\n\
+         format-spec-object=1:1:32:58726b3c243c30ebc0941f656427520094a6bb10e7b2190be732b5a61300144d\n\
          content-catalog-spec-object=1:1:32:8f3999b066b666396259c4a92f9de7c5b8e67df9d38a69fb4fb824968b56ecdb\n\
          representations=authoritative-direct-v1\n\
-         principal-codec=principal-uid-v1\n\
+         principal-codec=state-owner-v2\n\
          projection=kv-transition-bplus-v4\n"
     );
 }
@@ -526,7 +357,7 @@ fn pre_derivation_v1_runatal_upgrade_is_idempotent_and_preserves_history() {
     let engine = RuntimeEngine::open(
         &store_path,
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
+        StateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
     )
     .unwrap();
@@ -608,7 +439,7 @@ fn prior_metadata_that_declared_a_catalog_specification_requires_it() {
     let engine = RuntimeEngine::open(
         directory.path(),
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
+        StateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
     )
     .unwrap();
@@ -633,9 +464,7 @@ fn prior_metadata_that_declared_a_catalog_specification_requires_it() {
 async fn completed_pre_derivation_v1_store_is_selected_for_runatal_amendment() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
-    let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
-    store.close().await.unwrap();
-    drop(store);
+    super::format_migration_tests::seed_current_directory_store(&home);
 
     let store_path = home.principal_store_path();
     std::fs::write(
@@ -668,51 +497,109 @@ async fn completed_pre_derivation_v1_store_is_selected_for_runatal_amendment() {
 async fn new_store_persists_and_verifies_the_in_band_specification() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
-    let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
-    store.close().await.unwrap();
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
 
     let record = bootstrap::format_specification().unwrap();
     let id = Blake3ObjectIdentityV1.identify(&record);
-    let arena = std::fs::read(home.principal_store_path().join("objects.arena")).unwrap();
-    let metadata =
-        std::fs::read_to_string(home.principal_store_path().join(STORE_METADATA_FILE)).unwrap();
-    assert!(metadata.contains("representations=authoritative-direct-v1\n"));
-    assert!(
-        home.principal_store_path()
-            .join("representations/CURRENT")
-            .is_file()
-    );
-    assert_eq!(&arena[52..54], &1_u16.to_le_bytes());
-    assert_eq!(&arena[54..56], &1_u16.to_le_bytes());
-    assert_eq!(&arena[56..60], &32_u32.to_le_bytes());
-    assert_eq!(&arena[60..92], id.as_bytes());
-
-    let engine = RuntimeEngine::open(
-        home.principal_store_path(),
-        Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
-        RecoveryLimits::process_addressable(),
-    )
-    .unwrap();
-    assert_eq!(engine.object(id).unwrap(), Some(record));
+    assert_eq!(store.engine.object(id).unwrap(), Some(record.clone()));
+    assert!(home.storage_volume_path().is_file());
+    assert!(home.principal_store_path().is_dir());
+    store.engine.close().unwrap();
     drop(store);
+
+    let reopened = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    assert_eq!(reopened.engine.object(id).unwrap(), Some(record));
+    assert!(home.principal_store_path().is_dir());
+    reopened
+        .retire_verified_legacy_directory_store(&home)
+        .unwrap();
+    assert!(!home.principal_store_path().exists());
 }
 
 #[tokio::test]
-async fn representation_activation_without_its_metadata_marker_resumes() {
+async fn explicit_close_releases_the_hosted_volume_while_store_references_remain() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let retained_engine = Arc::clone(&store.engine);
+    retained_engine.close().unwrap();
+
+    let reopened = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    reopened.engine.close().unwrap();
+    drop(reopened);
+    drop(store);
+    drop(retained_engine);
+}
+
+#[tokio::test]
+async fn volume_without_its_cutover_receipt_fails_closed() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
     let store = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
     store.close().await.unwrap();
     drop(store);
 
-    let metadata = home.principal_store_path().join(STORE_METADATA_FILE);
-    std::fs::remove_file(&metadata).unwrap();
-    let reopened = open_runtime_kv(&home, unlimited_quota()).await.unwrap();
-    reopened.close().await.unwrap();
+    let volume = crate::volume::HostedFileVolume::open(home.storage_volume_path()).unwrap();
+    let receipt =
+        crate::volume::VolumeRegion::new("system/migrations/directory-store-to-volume-v1").unwrap();
+    volume.remove_region(&receipt).unwrap();
+    volume.sync().unwrap();
+    drop(volume);
 
-    let restored = std::fs::read_to_string(metadata).unwrap();
-    assert!(restored.contains("representations=authoritative-direct-v1\n"));
+    let Err(error) = open_runtime_kv(&home, unlimited_quota()).await else {
+        panic!("volume without a cutover receipt unexpectedly reopened");
+    };
+    assert!(error.to_string().contains("cutover receipt"), "{error}");
+}
+
+#[tokio::test]
+async fn changed_surviving_directory_store_is_rejected_by_post_barrier_retirement() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    super::format_migration_tests::seed_current_directory_store(&home);
+    let migrated = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    migrated.engine.close().unwrap();
+    drop(migrated);
+    assert!(home.principal_store_path().is_dir());
+    let source = Arc::new(
+        RuntimeEngine::open(
+            home.principal_store_path(),
+            Blake3ObjectIdentityV1,
+            StateOwnerCodecV2,
+            RecoveryLimits::process_addressable(),
+        )
+        .unwrap(),
+    );
+    let changed = RuntimeStore::from_engine(
+        Arc::clone(&source),
+        StateOwnerResolver::new(test_directory(&["alice"])),
+    );
+    changed
+        .set("alice:capsule:shell", "drift", b"changed".to_vec())
+        .await
+        .unwrap();
+    source.close().unwrap();
+    drop(changed);
+    drop(source);
+
+    let reopened = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let error = reopened
+        .retire_verified_legacy_directory_store(&home)
+        .expect_err("changed surviving source must not be retired");
+    assert!(error.to_string().contains("cutover receipt"), "{error}");
+    assert!(home.principal_store_path().exists());
 }
 
 fn replace_catalog_with_legacy(
@@ -794,38 +681,37 @@ fn mark_store_as_legacy(home: &AstridHome) {
     .unwrap();
 }
 
-async fn install_legacy_catalog_fixtures(
+fn install_legacy_catalog_fixtures(
     home: &AstridHome,
     fixtures: &[(&StateOwner, &ContentName, &[u8])],
 ) -> BTreeMap<StateOwner, RootState> {
-    let store = open_runtime_principal_store(home, unlimited_quota())
-        .await
-        .unwrap();
+    super::format_migration_tests::seed_current_directory_store(home);
+    let engine = Arc::new(
+        RuntimeEngine::open(
+            home.principal_store_path(),
+            Blake3ObjectIdentityV1,
+            StateOwnerCodecV2,
+            RecoveryLimits::process_addressable(),
+        )
+        .unwrap(),
+    );
+    let store = NativePrincipalContentStore::from_engine(Arc::clone(&engine));
     let published: Vec<_> = fixtures
         .iter()
         .map(|(owner, name, bytes)| {
             (
                 **owner,
                 (*name).clone(),
-                store.content().put(owner, name, bytes).unwrap(),
+                store.put(owner, name, bytes).unwrap(),
             )
         })
         .collect();
-    drop(store);
-
-    let engine = RuntimeEngine::open(
-        home.principal_store_path(),
-        Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
-        RecoveryLimits::process_addressable(),
-    )
-    .unwrap();
     let legacy_roots = published
         .into_iter()
         .map(|(owner, name, outcome)| {
             let descriptor = outcome.descriptor();
             let root = replace_catalog_with_legacy(
-                &engine,
+                engine.as_ref(),
                 &owner,
                 &name,
                 descriptor.file(),
@@ -834,20 +720,11 @@ async fn install_legacy_catalog_fixtures(
             (owner, root)
         })
         .collect();
+    drop(store);
     engine.close().unwrap();
+    drop(engine);
     mark_store_as_legacy(home);
     legacy_roots
-}
-
-fn assert_current_migration_marker(home: &AstridHome) {
-    assert_eq!(
-        std::fs::read(
-            home.principal_store_path()
-                .join(migrations::MIGRATION_MARKER_FILE)
-        )
-        .unwrap(),
-        migrations::KV_TRANSITION_CHECKPOINT_MARKER
-    );
 }
 
 #[derive(Debug)]
@@ -859,19 +736,12 @@ struct CatalogWorkloadMetrics {
     reopen_time: Duration,
 }
 
-fn durable_file_len(home: &AstridHome, name: &str) -> u64 {
-    std::fs::metadata(home.principal_store_path().join(name))
-        .unwrap()
-        .len()
+fn durable_file_len(store: &RuntimePrincipalStore, name: &str) -> u64 {
+    store.engine.durable_region_len(name).unwrap()
 }
 
-fn representation_metadata_len(home: &AstridHome) -> u64 {
-    std::fs::metadata(
-        home.principal_store_path()
-            .join("representations/generations/0000000000000001/metadata.arena"),
-    )
-    .unwrap()
-    .len()
+fn volume_file_len(home: &AstridHome) -> u64 {
+    std::fs::metadata(home.storage_volume_path()).unwrap().len()
 }
 
 async fn measure_catalog_publications(unique_content: bool) -> CatalogWorkloadMetrics {
@@ -888,9 +758,9 @@ async fn measure_catalog_publications(unique_content: bool) -> CatalogWorkloadMe
     )
     .await
     .unwrap();
-    let arena_before = durable_file_len(&home, "objects.arena");
-    let roots_before = durable_file_len(&home, "roots.journal");
-    let representation_metadata_before = representation_metadata_len(&home);
+    let arena_before = durable_file_len(&store, "objects.arena");
+    let roots_before = durable_file_len(&store, "roots.journal");
+    let volume_before = volume_file_len(&home);
     let started = Instant::now();
     for index in 0..PUBLICATIONS {
         let name = ContentName::new(format!("workspace/fixture/{index:04}")).unwrap();
@@ -901,15 +771,13 @@ async fn measure_catalog_publications(unique_content: bool) -> CatalogWorkloadMe
         store.content().put(&owner, &name, &bytes).unwrap();
     }
     let publication_time = started.elapsed();
-    let arena_bytes = durable_file_len(&home, "objects.arena")
+    let arena_bytes = durable_file_len(&store, "objects.arena")
         .checked_sub(arena_before)
         .unwrap();
-    let root_journal_bytes = durable_file_len(&home, "roots.journal")
+    let root_journal_bytes = durable_file_len(&store, "roots.journal")
         .checked_sub(roots_before)
         .unwrap();
-    let representation_metadata_bytes = representation_metadata_len(&home)
-        .checked_sub(representation_metadata_before)
-        .unwrap();
+    let representation_metadata_bytes = volume_file_len(&home).checked_sub(volume_before).unwrap();
     drop(store);
 
     let reopen_started = Instant::now();
@@ -980,14 +848,13 @@ async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
             (&alice, &alice_name, alice_bytes),
             (&bob, &bob_name, bob_bytes),
         ],
-    )
-    .await;
+    );
 
     let engine = Arc::new(
         RuntimeEngine::open(
             home.principal_store_path(),
             Blake3ObjectIdentityV1,
-            StateOwnerCodecV1,
+            StateOwnerCodecV2,
             RecoveryLimits::process_addressable(),
         )
         .unwrap(),
@@ -1003,7 +870,6 @@ async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
     let migrated = open_runtime_principal_store(&home, unlimited_quota())
         .await
         .unwrap();
-    assert_eq!(migrated.validated_catalog_count(), 2);
     assert_eq!(
         migrated.content().read(&alice, &alice_name).unwrap(),
         Some(alice_bytes.to_vec())
@@ -1012,16 +878,8 @@ async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
         migrated.content().read(&bob, &bob_name).unwrap(),
         Some(bob_bytes.to_vec())
     );
-    drop(migrated);
-    let migrated_engine = RuntimeEngine::open(
-        home.principal_store_path(),
-        Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
-        RecoveryLimits::process_addressable(),
-    )
-    .unwrap();
-    let migrated_alice_root = migrated_engine.root(&alice).unwrap().unwrap();
-    let migrated_bob_root = migrated_engine.root(&bob).unwrap().unwrap();
+    let migrated_alice_root = migrated.engine.root(&alice).unwrap().unwrap();
+    let migrated_bob_root = migrated.engine.root(&bob).unwrap().unwrap();
     assert_eq!(migrated_alice_root, partially_migrated_alice_root);
     assert_eq!(
         migrated_bob_root.generation,
@@ -1032,17 +890,10 @@ async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
             .checked_next()
             .unwrap()
     );
-    migrated_engine.close().unwrap();
-    assert_current_migration_marker(&home);
-    let migrated_metadata =
-        std::fs::read_to_string(home.principal_store_path().join(STORE_METADATA_FILE)).unwrap();
-    assert!(migrated_metadata.contains("content-catalog-spec-object="));
-    std::fs::write(
-        home.principal_store_path()
-            .join(migrations::MIGRATION_MARKER_FILE),
-        migrations::LEGACY_TO_V1_MARKER,
-    )
-    .unwrap();
+    migrated.engine.close().unwrap();
+    drop(migrated);
+    assert!(home.storage_volume_path().is_file());
+    assert!(home.principal_store_path().is_dir());
 
     let reopened = open_runtime_principal_store(&home, unlimited_quota())
         .await
@@ -1055,20 +906,11 @@ async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
         reopened.content().read(&bob, &bob_name).unwrap(),
         Some(bob_bytes.to_vec())
     );
-    drop(reopened);
-    let reopened_engine = RuntimeEngine::open(
-        home.principal_store_path(),
-        Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
-        RecoveryLimits::process_addressable(),
-    )
-    .unwrap();
     assert_eq!(
-        reopened_engine.root(&alice).unwrap(),
+        reopened.engine.root(&alice).unwrap(),
         Some(migrated_alice_root)
     );
-    assert_eq!(reopened_engine.root(&bob).unwrap(), Some(migrated_bob_root));
-    assert_current_migration_marker(&home);
+    assert_eq!(reopened.engine.root(&bob).unwrap(), Some(migrated_bob_root));
 }
 
 #[tokio::test]
@@ -1270,8 +1112,8 @@ async fn staged_publication_retries_after_root_commit_before_cleanup() {
     assert_eq!(retried.principal_root(), first.principal_root());
     assert_eq!(
         retried.objects_inserted(),
-        1,
-        "unchanged logical publication still reports newly admitted physical evidence"
+        0,
+        "retry must not count immutable objects admitted by the first publication"
     );
     assert!(store.staging().ready().unwrap().is_empty());
 }
@@ -1310,7 +1152,82 @@ async fn staged_publication_enforces_close_order_for_the_same_name() {
 
 #[cfg(not(target_os = "windows"))]
 #[tokio::test]
-async fn independent_reader_accepts_a_rust_produced_store() {
+async fn hosted_volume_retires_a_torn_tail_and_reopens_committed_roots() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let alice_uid = create_test_principal(&store, "alice").await;
+    store
+        .kv()
+        .set("alice:capsule:shell", "cwd", b"/workspace".to_vec())
+        .await
+        .unwrap();
+    store
+        .kv()
+        .set("alice:capsule:shell", "theme", b"raven".to_vec())
+        .await
+        .unwrap();
+    store.engine.close().unwrap();
+    drop(store);
+
+    let path = home.storage_volume_path();
+    let committed_len = std::fs::metadata(&path).unwrap().len();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    file.write_all(&[0xA5; 17]).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let reopened = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), committed_len);
+    assert_eq!(
+        reopened
+            .engine
+            .root(&StateOwner::Principal(alice_uid))
+            .unwrap()
+            .unwrap()
+            .generation,
+        RootGeneration::new(1)
+    );
+    assert_eq!(
+        reopened
+            .kv()
+            .get("alice:capsule:shell", "theme")
+            .await
+            .unwrap(),
+        Some(b"raven".to_vec())
+    );
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tokio::test]
+async fn hosted_volume_rejects_interior_container_corruption() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    store.engine.close().unwrap();
+    drop(store);
+
+    let path = home.storage_volume_path();
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[8] ^= 0x80;
+    std::fs::write(&path, bytes).unwrap();
+    let Err(error) = open_runtime_principal_store(&home, unlimited_quota()).await else {
+        panic!("corrupt Astrid volume unexpectedly reopened");
+    };
+    assert!(error.to_string().contains("record magic"), "{error}");
+}
+
+#[tokio::test]
+async fn independent_reader_accepts_a_rust_produced_volume() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
     let store = open_runtime_principal_store(&home, unlimited_quota())
@@ -1334,7 +1251,7 @@ async fn independent_reader_accepts_a_rust_produced_store() {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/runatal_v1_reader.py");
     let output = std::process::Command::new("python3")
         .arg(&script)
-        .arg(home.principal_store_path())
+        .arg(home.storage_volume_path())
         .output()
         .unwrap();
     assert!(
@@ -1387,191 +1304,44 @@ async fn independent_reader_accepts_a_rust_produced_store() {
         )
     );
 
-    assert_reader_requires_catalog_specification(&home, &script);
-    assert_reader_rejects_substituted_format_specification(&home, &script);
-
-    let arena_path = home.principal_store_path().join("objects.arena");
-    let mut arena = std::fs::read(&arena_path).unwrap();
-    arena[100] ^= 0x80;
-    std::fs::write(&arena_path, arena).unwrap();
+    let volume_path = home.storage_volume_path();
+    let mut volume = std::fs::read(&volume_path).unwrap();
+    volume[43] ^= 0x80;
+    std::fs::write(&volume_path, volume).unwrap();
     let rejected = std::process::Command::new("python3")
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/runatal_v1_reader.py"))
-        .arg(home.principal_store_path())
+        .arg(volume_path)
         .output()
         .unwrap();
     assert!(
         !rejected.status.success(),
-        "independent reader accepted a corrupt Rust-produced store"
+        "independent reader accepted a corrupt Rust-produced volume"
     );
 }
 
-#[cfg(not(target_os = "windows"))]
-#[tokio::test]
-async fn independent_reader_accepts_a_replayed_durable_prefix() {
-    let directory = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(directory.path());
-    let store = open_runtime_principal_store(&home, unlimited_quota())
-        .await
-        .unwrap();
-    let alice_uid = create_test_principal(&store, "alice").await;
-    store
-        .kv()
-        .set("alice:capsule:shell", "cwd", b"/workspace".to_vec())
-        .await
-        .unwrap();
-
-    let store_path = home.principal_store_path();
-    let (trace, initial_root_len) = DurablePrefixTrace::begin(&store_path);
-
-    store
-        .kv()
-        .set("alice:capsule:shell", "theme", b"raven".to_vec())
-        .await
-        .unwrap();
-    trace.capture_commit(&store_path, initial_root_len);
-    drop(store);
-
-    let recorded = trace.recorder.trace().unwrap();
-    assert!(
-        recorded.effects().iter().any(
-            |effect| matches!(effect, TraceEffect::Append { file, .. } if file == &trace.arena)
-        ),
-        "traced commit did not append object frames"
-    );
-    assert!(
-        recorded.effects().iter().any(
-            |effect| matches!(effect, TraceEffect::Append { file, .. } if file == &trace.roots)
-        ),
-        "traced commit did not append a root frame"
-    );
-    let final_files = trace_final_files(&recorded);
-    let replay = tempfile::tempdir().unwrap();
-    let replay_home = AstridHome::from_path(replay.path());
-    let replay_store = replay_home.principal_store_path();
-    for (file, bytes) in recorded.initial_files() {
-        let destination = replay_store.join(file.as_str());
-        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
-        std::fs::write(destination, bytes).unwrap();
-    }
-    for file in [&trace.arena, &trace.representation_journal, &trace.roots] {
-        std::fs::write(replay_store.join(file.as_str()), &final_files[file]).unwrap();
-    }
-
-    let recovered_engine = RuntimeEngine::open(
-        &replay_store,
-        Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
-        RecoveryLimits::process_addressable(),
-    )
-    .unwrap();
-    assert_eq!(
-        recovered_engine
-            .root(&StateOwner::Principal(alice_uid))
-            .unwrap()
-            .unwrap()
-            .generation,
-        RootGeneration::new(1)
-    );
-    drop(recovered_engine);
-
-    let repaired = open_runtime_principal_store(&replay_home, unlimited_quota())
-        .await
-        .unwrap();
-    drop(repaired);
-    let repaired_once = representation_snapshot(&replay_store);
-    let reopened = open_runtime_principal_store(&replay_home, unlimited_quota())
-        .await
-        .unwrap();
-    drop(reopened);
-    assert_eq!(repaired_once, representation_snapshot(&replay_store));
-
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/runatal_v1_reader.py");
+#[test]
+fn independent_volume_validator_rejects_the_full_unicode_control_set() {
+    let script_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts");
     let output = std::process::Command::new("python3")
-        .arg(script)
-        .arg(&replay_store)
+        .current_dir(script_directory)
+        .arg("-c")
+        .arg(
+            r#"from runatal_v1_volume import VolumeFormatError, volume_region_name
+for codepoint in range(0x80, 0xa0):
+    try:
+        volume_region_name(chr(codepoint).encode())
+    except VolumeFormatError:
+        continue
+    raise AssertionError(f"U+{codepoint:04X} was accepted")
+assert volume_region_name(" Astrid ".encode()) == " Astrid ""#,
+        )
         .output()
         .unwrap();
     assert!(
         output.status.success(),
-        "independent reader rejected replayed prefix: {}",
+        "independent validator failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let decoded: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let alice = alice_uid.to_string();
-    assert_eq!(
-        decoded["roots"][alice.as_str()]["generation"],
-        1,
-        "unexpected repaired reader output: {decoded}"
-    );
-    assert_eq!(
-        decoded["roots"][alice.as_str()]["kv"]["entries"],
-        2,
-        "unexpected repaired reader output: {decoded}"
-    );
-}
-
-#[cfg(not(target_os = "windows"))]
-fn representation_snapshot(store: &Path) -> BTreeMap<String, Vec<u8>> {
-    let root = store.join("representations");
-    let mut snapshot = BTreeMap::new();
-    let mut pending = vec![root.clone()];
-    while let Some(directory) = pending.pop() {
-        for entry in std::fs::read_dir(directory).unwrap() {
-            let entry = entry.unwrap();
-            let metadata = entry.metadata().unwrap();
-            if metadata.is_dir() {
-                pending.push(entry.path());
-            } else if metadata.is_file() {
-                let relative = entry
-                    .path()
-                    .strip_prefix(&root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned();
-                snapshot.insert(relative, std::fs::read(entry.path()).unwrap());
-            }
-        }
-    }
-    snapshot
-}
-
-#[cfg(not(target_os = "windows"))]
-fn trace_final_files(trace: &CrashTrace) -> BTreeMap<TraceFileId, Vec<u8>> {
-    let mut files = trace.initial_files().clone();
-    for effect in trace.effects() {
-        match effect {
-            TraceEffect::Append {
-                file,
-                pre_len,
-                bytes,
-            } => {
-                let current = files.get_mut(file).unwrap();
-                assert_eq!(u64::try_from(current.len()).unwrap(), *pre_len);
-                current.extend_from_slice(bytes);
-            },
-            TraceEffect::Write {
-                file,
-                offset,
-                previous,
-                bytes,
-            } => {
-                let current = files.get_mut(file).unwrap();
-                let start = usize::try_from(*offset).unwrap();
-                let end = start.checked_add(bytes.len()).unwrap();
-                assert_eq!(&current[start..end], previous);
-                current[start..end].copy_from_slice(bytes);
-            },
-            TraceEffect::Truncate { file, pre_len, len } => {
-                let current = files.get_mut(file).unwrap();
-                assert_eq!(u64::try_from(current.len()).unwrap(), *pre_len);
-                current.truncate(usize::try_from(*len).unwrap());
-            },
-            TraceEffect::Barrier { .. }
-            | TraceEffect::RootPublication { .. }
-            | TraceEffect::AcknowledgedCommit { .. } => {},
-        }
-    }
-    files
 }
 
 #[tokio::test]
@@ -1593,7 +1363,7 @@ async fn completed_store_does_not_self_heal_a_missing_runatal_object() {
         RuntimeEngine::open(
             &path,
             Blake3ObjectIdentityV1,
-            StateOwnerCodecV1,
+            StateOwnerCodecV2,
             RecoveryLimits::process_addressable(),
         )
         .unwrap(),
@@ -1632,7 +1402,7 @@ async fn current_metadata_does_not_self_heal_a_missing_catalog_specification() {
     let engine = RuntimeEngine::open(
         &path,
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV1,
+        StateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
     )
     .unwrap();
@@ -1669,6 +1439,52 @@ fn namespace_owner_fails_closed_at_the_host_stamped_boundary() {
         resolver.resolve("alice:capsule:"),
         Err(StorageError::InvalidKey(message))
             if message.contains("empty capsule identifier")
+    ));
+}
+
+#[test]
+fn control_namespaces_require_admitted_immutable_uids() {
+    let directory = test_directory(&["alice"]);
+    let resolver = StateOwnerResolver::new(directory.clone());
+    let uid = test_uid("alice");
+    let namespace = format!("principal-uid:{uid}:control:env:runner");
+    assert_eq!(
+        resolver.resolve(&namespace).unwrap(),
+        StateOwner::Principal(uid)
+    );
+    assert_eq!(
+        resolver
+            .resolve(&format!("principal-uid:{uid}:control:secret:runner"))
+            .unwrap(),
+        StateOwner::Principal(uid)
+    );
+    assert!(matches!(
+        resolver.resolve("alice:control:env:runner"),
+        Err(StorageError::InvalidKey(message))
+            if message.contains("immutable principal-uid")
+    ));
+    let unknown = PrincipalUid::from_bytes([0xa5; 32]);
+    assert!(matches!(
+        resolver.resolve(&format!("principal-uid:{unknown}:control:env:runner")),
+        Err(StorageError::InvalidKey(message))
+            if message.contains("not an admitted durable identity")
+    ));
+    assert_eq!(
+        resolver.resolve("system:control:audit").unwrap(),
+        StateOwner::System
+    );
+    assert_eq!(
+        resolver.resolve("system:control:invites").unwrap(),
+        StateOwner::System
+    );
+    assert_eq!(
+        resolver.resolve("system:control:pair-tokens").unwrap(),
+        StateOwner::System
+    );
+    assert!(matches!(
+        resolver.resolve("system:control:unknown"),
+        Err(StorageError::InvalidKey(message))
+            if message.contains("env or secret")
     ));
 }
 
@@ -1729,11 +1545,8 @@ async fn first_boot_migrates_verifies_and_preserves_legacy_state() {
         store.get("bob:capsule:build", "toolchain").await.unwrap(),
         Some(b"rust".to_vec())
     );
-    assert!(
-        home.principal_store_path()
-            .join(migrations::MIGRATION_MARKER_FILE)
-            .exists()
-    );
+    assert!(home.storage_volume_path().is_file());
+    assert!(home.principal_store_path().is_dir());
     store.close().await.unwrap();
     drop(store);
 
@@ -1769,7 +1582,7 @@ async fn live_quota_blocks_growth_but_allows_recovery_and_system_state() {
     let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
         Ok(match owner {
             StateOwner::System => None,
-            StateOwner::Principal(_) => Some(27),
+            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(27),
         })
     });
     let store = open_runtime_principal_store(&home, quota).await.unwrap();
@@ -1807,6 +1620,100 @@ async fn live_quota_blocks_growth_but_allows_recovery_and_system_state() {
         .unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_streaming_writes_do_not_grow_the_physical_volume() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
+        Ok(match owner {
+            StateOwner::System => None,
+            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(27),
+        })
+    });
+    let store = open_runtime_principal_store(&home, quota).await.unwrap();
+    let uid = create_test_principal(&store, "alice").await;
+    let owner = StateOwner::Principal(uid);
+    let filesystem = AstridFilesystem::new(store.content(), owner);
+    let accepted = FilesystemPath::new("accepted").unwrap();
+    filesystem
+        .write_streaming(&accepted, std::io::Cursor::new(b"first".to_vec()))
+        .unwrap();
+    filesystem.sync().unwrap();
+
+    filesystem
+        .write_streaming(&accepted, std::io::Cursor::new(b"first".to_vec()))
+        .unwrap();
+    filesystem.sync().unwrap();
+    let warmup = FilesystemPath::new("rejected-warmup").unwrap();
+    let error = filesystem
+        .write_streaming(&warmup, std::io::Cursor::new(vec![7_u8; 64]))
+        .unwrap_err();
+    assert!(error.to_string().contains("quota exceeded"));
+    filesystem.sync().unwrap();
+    let bounded_len = std::fs::metadata(home.storage_volume_path()).unwrap().len();
+
+    for index in 0..8 {
+        let name = FilesystemPath::new(format!("rejected-{index}")).unwrap();
+        let error = filesystem
+            .write_streaming(&name, std::io::Cursor::new(vec![7_u8; 64]))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("quota exceeded"),
+            "unexpected error: {error}"
+        );
+        filesystem.sync().unwrap();
+        assert_eq!(
+            std::fs::metadata(home.storage_volume_path()).unwrap().len(),
+            bounded_len
+        );
+    }
+
+    let mut workers = Vec::new();
+    for index in 0..8 {
+        let content = store.content();
+        let name = ContentName::new(format!("concurrent-{index}")).unwrap();
+        workers.push(tokio::task::spawn_blocking(move || {
+            content.put_streaming(&owner, &name, std::io::Cursor::new(vec![9_u8; 64]))
+        }));
+    }
+    for worker in workers {
+        let error = worker.await.unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("quota exceeded"),
+            "unexpected concurrent error: {error}"
+        );
+    }
+    filesystem.sync().unwrap();
+    assert_eq!(
+        std::fs::metadata(home.storage_volume_path()).unwrap().len(),
+        bounded_len
+    );
+
+    for index in 0..4 {
+        let first = ContentIngest::new(
+            ContentName::new(format!("batch-{index}-first")).unwrap(),
+            std::io::Cursor::new(vec![3_u8; 64]),
+        );
+        let second = ContentIngest::new(
+            ContentName::new(format!("batch-{index}-second")).unwrap(),
+            std::io::Cursor::new(vec![4_u8; 64]),
+        );
+        let error = store
+            .content()
+            .put_streaming_batch(&owner, [first, second])
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("quota exceeded"),
+            "unexpected batch error: {error}"
+        );
+        filesystem.sync().unwrap();
+        assert_eq!(
+            std::fs::metadata(home.storage_volume_path()).unwrap().len(),
+            bounded_len
+        );
+    }
+}
+
 #[tokio::test]
 async fn incomplete_destination_is_quarantined_before_reimport() {
     let directory = tempfile::tempdir().unwrap();
@@ -1821,11 +1728,8 @@ async fn incomplete_destination_is_quarantined_before_reimport() {
             .join("partial")
             .exists()
     );
-    assert!(
-        home.principal_store_path()
-            .join(migrations::MIGRATION_MARKER_FILE)
-            .exists()
-    );
+    assert!(home.storage_volume_path().is_file());
+    assert!(home.principal_store_path().is_dir());
     drop(store);
 }
 
@@ -1854,7 +1758,7 @@ async fn durable_point_update_has_height_bounded_write_amplification() {
         RuntimeEngine::open(
             directory.path(),
             Blake3ObjectIdentityV1,
-            StateOwnerCodecV1,
+            StateOwnerCodecV2,
             limits,
         )
         .unwrap(),
@@ -1892,7 +1796,7 @@ async fn durable_point_update_has_height_bounded_write_amplification() {
         RuntimeEngine::open(
             directory.path(),
             Blake3ObjectIdentityV1,
-            StateOwnerCodecV1,
+            StateOwnerCodecV2,
             limits,
         )
         .unwrap(),
@@ -1919,7 +1823,7 @@ async fn native_kv_group_commit_scale_probe() {
             RuntimeEngine::open(
                 directory.path(),
                 Blake3ObjectIdentityV1,
-                StateOwnerCodecV1,
+                StateOwnerCodecV2,
                 RecoveryLimits::process_addressable(),
             )
             .unwrap(),

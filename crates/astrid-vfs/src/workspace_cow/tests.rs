@@ -1,6 +1,6 @@
 //! Unit tests for the workspace copy-on-write backends.
 //!
-//! No-CoW and the fail-closed degrade path run everywhere. The APFS clone /
+//! No-CoW and the explicit non-isolated fallback run everywhere. The APFS clone /
 //! promote / rollback test runs on macOS. The overlayfs mount test is
 //! `#[cfg(target_os = "linux")]` + `#[ignore]` — it needs a Linux runtime with
 //! unprivileged user namespaces (validated in CI, not on the macOS dev host).
@@ -9,7 +9,7 @@ use super::*;
 use std::io;
 use std::path::Path;
 
-/// A backend whose `prepare` always fails — drives the fail-closed path in a
+/// A backend whose `prepare` always fails — drives the non-isolated fallback in a
 /// platform-independent way.
 #[derive(Debug)]
 struct AlwaysFailCow;
@@ -48,7 +48,7 @@ fn nocow_merges_to_pristine_and_refuses_promote() {
 }
 
 #[test]
-fn prepare_fails_closed_to_nocow_on_backend_error() {
+fn prepare_returns_explicit_nocow_on_backend_error() {
     // A backend that cannot establish CoW must degrade to No-CoW (merged ==
     // pristine, no masks) rather than abort or fake copy-on-write.
     let pristine = Path::new("/some/workspace");
