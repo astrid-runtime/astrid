@@ -7,7 +7,7 @@ use astrid_core::dirs::AstridHome;
 use astrid_core::identity::PrincipalUid;
 use astrid_core::principal::PrincipalId;
 
-use super::fs_support::read_bounded_file;
+use super::host_fs::read_bounded_file;
 use super::ledger::{MigrationLedger, decode_canonical};
 use super::{MAX_BYTES, ledger_path, reject_incomplete_layout_v2};
 

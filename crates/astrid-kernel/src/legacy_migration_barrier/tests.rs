@@ -664,7 +664,7 @@ fn retirement_rejects_same_uid_symlink_swap_before_unlink() {
     let outside_file = outside.path().join("outside");
     fs::write(&outside_file, b"outside").expect("outside file");
     let outside_target = outside_file.clone();
-    fs_support::set_test_retire_leaf_hook(
+    super::host_fs::set_test_retire_leaf_hook(
         source.clone(),
         Box::new(move |path| {
             fs::remove_file(path).expect("replace source");
@@ -703,7 +703,7 @@ fn retirement_rejects_same_uid_fifo_swap_before_unlink() {
     fs::write(&source, b"source").expect("source");
     make_private_file(&source);
     let expected = snapshot_path(root.path()).expect("source identity");
-    fs_support::set_test_retire_leaf_hook(
+    super::host_fs::set_test_retire_leaf_hook(
         source.clone(),
         Box::new(move |path| {
             fs::remove_file(path).expect("replace source");
@@ -735,7 +735,7 @@ fn retirement_rejects_same_uid_reparse_swap_before_unlink() {
     let outside = tempfile::tempdir().expect("outside target");
     let outside_file = outside.path().join("outside");
     fs::write(&outside_file, b"outside").expect("outside file");
-    fs_support::set_test_retire_leaf_hook(
+    super::host_fs::set_test_retire_leaf_hook(
         source.clone(),
         Box::new(move |path| {
             fs::remove_file(path).expect("replace source");
@@ -755,7 +755,7 @@ fn retirement_rejects_same_uid_reparse_swap_before_unlink() {
 #[test]
 fn macos_source_root_is_recognized_as_a_mounted_volume() {
     assert!(
-        fs_support::test_active_mountpoint(Path::new("/")).expect("inspect macOS mount table"),
+        super::host_fs::test_active_mountpoint(Path::new("/")).expect("inspect macOS mount table"),
         "the source-root mount must be treated as an active volume boundary"
     );
 }

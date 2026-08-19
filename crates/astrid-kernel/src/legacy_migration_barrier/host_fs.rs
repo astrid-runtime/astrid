@@ -10,11 +10,9 @@ use std::path::PathBuf;
 
 use super::{AstridHome, MAX_BYTES, MAX_ENTRIES, PrincipalId, PrincipalUid, SourceIdentity};
 
-#[path = "legacy_migration_barrier_fs_hooks.rs"]
-mod hooks;
-use hooks::run_test_retire_leaf_hook;
+use super::fs_hooks::run_test_retire_leaf_hook;
 #[cfg(test)]
-pub(super) use hooks::set_test_retire_leaf_hook;
+pub(super) use super::fs_hooks::set_test_retire_leaf_hook;
 
 pub(super) fn add_source(
     sources: &mut BTreeMap<String, SourceIdentity>,

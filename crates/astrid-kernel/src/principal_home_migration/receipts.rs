@@ -8,7 +8,7 @@ use astrid_core::dirs::AstridHome;
 use astrid_core::identity::PrincipalUid;
 use serde::{Deserialize, Serialize};
 
-use super::migration_paths::{invalid_source, page_path_in};
+use super::paths::{invalid_source, page_path_in};
 use super::{
     MAX_RECEIPT_INDEX_BYTES, MAX_RECEIPT_PAGE_BYTES, PAGE_ENTRY_LIMIT, RECEIPT_PAGE_MARKER,
     RECEIPT_PREFIX, RECEIPT_SCHEMA, RECEIPT_SUFFIX,

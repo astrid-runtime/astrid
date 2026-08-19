@@ -3,10 +3,11 @@
 use super::{
     AstridHome, BTreeMap, CAPSULE_AUTHORITY_RECEIPT_NAME, HOST_SECRET_RECEIPT_NAME, LEDGER_SCHEMA,
     MAX_BYTES, PrincipalDirectory, PrincipalId, PrincipalUid, REVOCATION_NAMESPACE,
-    REVOCATION_RECEIPT_KEY, RuntimePrincipalStore, fs, io, path_exists, read_bounded_file,
+    REVOCATION_RECEIPT_KEY, RuntimePrincipalStore, io, path_exists, read_bounded_file,
     retire_empty_directory, snapshot_path, storage_io,
 };
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::Path;
 use std::str::FromStr;
 

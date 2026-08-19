@@ -25,28 +25,25 @@ use astrid_core::identity::PrincipalUid;
 use astrid_core::principal::PrincipalId;
 use astrid_storage::{KvStore, PrincipalDirectory, RuntimePrincipalStore};
 
-#[path = "legacy_migration_barrier_fs.rs"]
-mod fs_support;
-#[path = "legacy_migration_barrier_hooks.rs"]
+mod fs_hooks;
 mod hooks;
-#[path = "legacy_migration_barrier_ledger.rs"]
+mod host_fs;
 mod ledger;
-#[path = "legacy_migration_barrier_secret.rs"]
 mod secret;
 #[cfg(unix)]
 use crate::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
-use fs_support::retire_tree;
-use fs_support::{
+#[cfg(test)]
+pub(crate) use hooks::inject_tmp_retirement_interruption_once;
+pub(crate) use hooks::interrupt_after_tmp_retirement_if_requested;
+use host_fs::retire_tree;
+use host_fs::{
     add_principal_scope_sources, add_source, collect_workspace_targets,
     ensure_legacy_secret_aliases, path_exists, read_bounded_file, require_layout_provenance,
     retire_empty_directory, snapshot_owner_controlled_path, snapshot_path, storage_io, sync_parent,
     validate_source_path,
 };
 #[cfg(not(unix))]
-use fs_support::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
-#[cfg(test)]
-pub(crate) use hooks::inject_tmp_retirement_interruption_once;
-pub(crate) use hooks::interrupt_after_tmp_retirement_if_requested;
+use host_fs::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
 #[cfg(test)]
 use ledger::{MigrationComponent, canonical_json};
 use ledger::{
@@ -990,5 +987,4 @@ fn ensure_no_unretired_component_sources(
 }
 
 #[cfg(test)]
-#[path = "legacy_migration_barrier_tests.rs"]
 mod tests;

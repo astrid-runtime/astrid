@@ -34,18 +34,16 @@ const MAX_RECEIPT_PAGE_BYTES: usize = 8 * 1024 * 1024;
 const READBACK_CHUNK_BYTES: u64 = 1024 * 1024;
 const MAX_RELATIVE_PATH_BYTES: usize = 4096;
 
-#[path = "principal_home_migration_paths.rs"]
-mod migration_paths;
-#[path = "principal_home_migration_receipts.rs"]
-mod migration_receipts;
-use migration_paths::{
+mod paths;
+mod receipts;
+use paths::{
     append_relative, conflict_fs, conflict_path, destination_name, invalid_source,
     is_dedicated_path, logical_relative, receipt_path_for_display, receipt_uid_for_alias,
     source_exists, storage_error,
 };
 #[cfg(test)]
-use migration_receipts::page_path;
-use migration_receipts::{
+use receipts::page_path;
+use receipts::{
     EntryKind, MigrationEntry, MigrationReceipt, PageWriter, read_page, read_receipt, receipt_path,
     remove_stale_pages, validate_receipt_pages, write_receipt,
 };
@@ -927,5 +925,4 @@ fn validate_regular_file(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(test)]
-#[path = "principal_home_migration_tests.rs"]
 mod tests;
