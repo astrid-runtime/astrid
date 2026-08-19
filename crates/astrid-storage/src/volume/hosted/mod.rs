@@ -14,9 +14,7 @@ use parking_lot::Mutex;
 
 use super::{AstridVolume, MAX_REGION_NAME_BYTES, VolumeMetadataMutation, VolumeRegion};
 
-#[path = "hosted_open.rs"]
 mod open;
-#[path = "hosted_reclaim.rs"]
 mod reclaim;
 
 const VOLUME_MAGIC: [u8; 8] = *b"ASTVOL2\0";
@@ -927,5 +925,4 @@ fn truncate_extents(extents: &mut BTreeMap<u64, Extent>, length: u64) {
 }
 
 #[cfg(test)]
-#[path = "hosted_tests.rs"]
 mod tests;
