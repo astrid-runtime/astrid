@@ -275,7 +275,8 @@ fn existing_layout_requires_receipts_for_live_immutable_components() {
             super::source::SourceCount::new(1),
         )
         .expect("present source"),
-        destination_proof: DestinationProof::parse(format!("blake3:{}", "b".repeat(64))).expect("proof"),
+        destination_proof: DestinationProof::parse(format!("blake3:{}", "b".repeat(64)))
+            .expect("proof"),
     };
     let ledger = MigrationLedger {
         schema: LEDGER_SCHEMA,
@@ -431,7 +432,11 @@ fn empty_secret_root_requires_an_exact_source_bound_proof() {
         },
         MigrationComponent {
             name: format!("principal:{uid}:secrets"),
-            destination_proof: DestinationProof::parse(format!("verified-empty-v1:source-digest={}", source.digest)).expect("proof"),
+            destination_proof: DestinationProof::parse(format!(
+                "verified-empty-v1:source-digest={}",
+                source.digest
+            ))
+            .expect("proof"),
             source,
         },
     ]);
@@ -820,7 +825,10 @@ fn prefixed_distro_init_digest_still_binds_discard_proof() {
     ledger.components.push(MigrationComponent {
         name: format!("principal:{uid}:distro-init"),
         source,
-        destination_proof: DestinationProof::parse(format!("verified-discard-v1:source-digest={digest}")).expect("proof"),
+        destination_proof: DestinationProof::parse(format!(
+            "verified-discard-v1:source-digest={digest}"
+        ))
+        .expect("proof"),
     });
     ledger
         .components
@@ -831,10 +839,7 @@ fn prefixed_distro_init_digest_still_binds_discard_proof() {
 #[test]
 fn destination_proof_rejects_unknown_prefix() {
     assert!(DestinationProof::parse("not-a-proof").is_err());
-    assert!(
-        serde_json::from_str::<DestinationProof>(r#""mystery:value""#)
-            .is_err()
-    );
+    assert!(serde_json::from_str::<DestinationProof>(r#""mystery:value""#).is_err());
 }
 
 #[test]
@@ -847,10 +852,7 @@ fn destination_proof_rejects_newline() {
 fn destination_proof_accepts_absent_and_canonical_blake3() {
     let absent = DestinationProof::parse("absent").expect("absent");
     assert_eq!(absent.as_ref(), "absent");
-    assert_eq!(
-        serde_json::to_string(&absent).expect("json"),
-        r#""absent""#
-    );
+    assert_eq!(serde_json::to_string(&absent).expect("json"), r#""absent""#);
     assert_eq!(
         serde_json::from_str::<DestinationProof>(r#""absent""#).expect("parse"),
         absent

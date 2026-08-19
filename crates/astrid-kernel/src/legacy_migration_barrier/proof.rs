@@ -67,8 +67,7 @@ impl DestinationProof {
     }
 
     pub(super) fn from_stored(value: impl Into<String>) -> io::Result<Self> {
-        Self::parse(value)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        Self::parse(value).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
     pub(super) fn is_absent(&self) -> bool {
