@@ -802,8 +802,7 @@ impl<P: Ord, I, C> DurableEngine<P, I, C> {
 
 mod staging;
 
-#[path = "../durable_cache.rs"]
-mod cache;
+use crate::engine::durable_cache as cache;
 mod compaction;
 mod faults;
 mod format;

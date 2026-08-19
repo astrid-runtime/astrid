@@ -38,7 +38,6 @@ use tracing::{info, warn};
 
 use crate::kernel_router::AuthorizedRequest;
 
-#[path = "env_handlers.rs"]
 mod env_handlers;
 use env_handlers::{EnvSetRequest, env_delete, env_list, env_set};
 

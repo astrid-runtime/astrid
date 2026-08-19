@@ -1,7 +1,6 @@
 use super::*;
 
 #[cfg(any(unix, windows))]
-#[path = "process_identity.rs"]
 mod process_identity;
 #[cfg(any(unix, windows))]
 use process_identity::parent_start_identity;

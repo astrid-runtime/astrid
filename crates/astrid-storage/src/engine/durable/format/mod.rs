@@ -19,11 +19,8 @@ const CURRENT_DIGEST_BYTES_USIZE: usize = 32;
 const MIN_REFERENCE_WIRE_BYTES: usize =
     std::mem::size_of::<u64>() + IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE + 1;
 
-#[path = "format/indexed.rs"]
 mod indexed;
-#[path = "format/prepared.rs"]
 mod prepared;
-#[path = "format/reader.rs"]
 mod reader;
 
 #[cfg(test)]

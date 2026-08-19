@@ -28,6 +28,8 @@ use parking_lot::RwLock;
 pub mod crash_replay;
 #[cfg(not(target_family = "wasm"))]
 mod durable;
+#[cfg(not(target_family = "wasm"))]
+mod durable_cache;
 mod kv;
 mod muninn;
 mod projection;

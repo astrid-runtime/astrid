@@ -15,7 +15,6 @@ use crate::engine::{ProjectionCacheEntry, ProjectionCacheKey};
 use crate::storage_model::{ObjectId, ObjectRecord};
 use parking_lot::Mutex;
 
-#[path = "durable_cache/policy.rs"]
 mod policy;
 
 pub use policy::{
@@ -984,5 +983,4 @@ fn projection_cache_weight(payload: u64) -> u64 {
 }
 
 #[cfg(test)]
-#[path = "durable_cache/tests.rs"]
 mod tests;
