@@ -425,10 +425,8 @@ pub(super) fn preflight_legacy_audit_sources(
             .next()
             .transpose()
             .map_err(io::Error::other)?
-            .is_none()
+            .is_some()
         {
-            continue;
-        } else {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!(
