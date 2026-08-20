@@ -8,6 +8,7 @@ python3 scripts/test_windows_release_manifest.py
 python3 scripts/test_validate_release_archive.py
 python3 scripts/test_check_glibc.py
 python3 scripts/test_check_dco.py
+python3 scripts/test_changelog.py
 python3 scripts/test_check_static_elf.py
 python3 scripts/test_release_publication.py
 python3 scripts/test_release_draft_recovery.py

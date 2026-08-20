@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   check:
-    name: Changelog updated
+    name: Changelog fragment
     runs-on: ubuntu-latest
     steps:
       - name: Harden Runner
@@ -26,8 +26,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: dangoslen/changelog-enforcer@8b5e9dc3121363bb7c0115f8533404d92af382de # v3.7.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          changeLogPath: CHANGELOG.md
-          skipLabels: "skip-changelog"
-          missingUpdateErrorMessage: "Every PR must include a CHANGELOG.md entry under [Unreleased]."
+          python-version: '3.12'
+
+      - name: Require a changelog fragment
+        env:
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, '\n') }}
+        run: |
+          python3 scripts/changelog.py check \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head HEAD \
+            --labels "$PR_LABELS"

@@ -45,7 +45,13 @@ also when a maintainer evaluates whether the task is a good fit for a first cont
 - Follow existing code style and patterns
 - Individual files must not exceed 1000 lines. Split large files into modules
 - Run `cargo test --workspace` and `cargo clippy -- -D warnings` before submitting
-- Update `CHANGELOG.md` under the `[Unreleased]` section
+- Add a changelog fragment under `changes/{issue}.{kind}.md`. `kind` is one of
+  `added`, `changed`, `deprecated`, `removed`, `fixed`, or `security`. The body
+  is the Keep a Changelog entry prose (include `Closes #N` when applicable).
+  Do not edit `CHANGELOG.md` on ordinary PRs; that file is rolled at release.
+  Docs/CI-only changes may skip. Use the `skip-changelog` label when a code PR
+  should skip, including release PRs that roll `CHANGELOG.md` and bump crate
+  versions. Release PRs run `python3 scripts/changelog.py roll --version X.Y.Z --date YYYY-MM-DD`.
 
 ### 5. Open a pull request
 
