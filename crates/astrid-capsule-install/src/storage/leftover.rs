@@ -39,7 +39,11 @@ fn leftover_id_counts(paths: &[PathBuf]) -> anyhow::Result<BTreeMap<String, usiz
     for path in paths {
         if let Some((receipt, _)) = parse_legacy_authority_receipt(path)? {
             let id = receipt.capsule_id;
-            let next = counts.get(&id).copied().unwrap_or(0_usize).saturating_add(1);
+            let next = counts
+                .get(&id)
+                .copied()
+                .unwrap_or(0_usize)
+                .saturating_add(1);
             counts.insert(id, next);
         }
     }
