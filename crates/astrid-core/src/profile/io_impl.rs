@@ -38,7 +38,7 @@ impl PrincipalProfile {
     /// # Errors
     ///
     /// Returns [`ProfileError::Io`] on IO failure other than `NotFound`,
-    /// [`ProfileError::Parse`] on malformed or unknown-field TOML, and
+    /// [`ProfileError::Parse`] on malformed TOML, and
     /// [`ProfileError::Invalid`] on semantic validation failure.
     pub fn load(home: &AstridHome, principal: &PrincipalId) -> ProfileResult<Self> {
         Self::load_from_path(&Self::path_for(home, principal))
@@ -60,7 +60,8 @@ impl PrincipalProfile {
         let path = Self::path_for(home, principal);
         let content =
             crate::platform_fs::read_private_file_to_string(&path).map_err(ProfileError::Io)?;
-        let profile: Self = toml::from_str(&content)?;
+        let mut profile: Self = toml::from_str(&content)?;
+        profile.quotas.coerce_legacy_zero_cpu_fuel();
         profile.validate()?;
         Ok(profile)
     }
@@ -79,7 +80,8 @@ impl PrincipalProfile {
             },
             Err(e) => return Err(ProfileError::Io(e)),
         };
-        let profile: Self = toml::from_str(&content)?;
+        let mut profile: Self = toml::from_str(&content)?;
+        profile.quotas.coerce_legacy_zero_cpu_fuel();
         profile.validate()?;
         Ok(profile)
     }
@@ -224,12 +226,12 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_unknown_top_level_field() {
+    fn load_ignores_unknown_top_level_field() {
         let (_d, home, principal) = scratch_home();
         let path = PrincipalProfile::path_for(&home, &principal);
         fs::write(&path, "enabled = true\nenableed = true\n").unwrap();
-        let err = PrincipalProfile::load(&home, &principal).unwrap_err();
-        assert!(matches!(err, ProfileError::Parse(_)), "got: {err:?}");
+        let loaded = PrincipalProfile::load(&home, &principal).unwrap();
+        assert!(loaded.enabled);
     }
 
     #[test]
@@ -288,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_unknown_nested_field() {
+    fn load_ignores_unknown_nested_field() {
         let (_d, home, principal) = scratch_home();
         let path = PrincipalProfile::path_for(&home, &principal);
         fs::write(
@@ -296,8 +298,34 @@ mod tests {
             "[quotas]\nmax_memory_bytes = 1048576\ntypo_field = 42\n",
         )
         .unwrap();
-        let err = PrincipalProfile::load(&home, &principal).unwrap_err();
-        assert!(matches!(err, ProfileError::Parse(_)), "got: {err:?}");
+        let loaded = PrincipalProfile::load(&home, &principal).unwrap();
+        assert_eq!(loaded.quotas.max_memory_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn load_path_ignores_unknown_quota_key_then_validates() {
+        let (_d, home, principal) = scratch_home();
+        let path = PrincipalProfile::path_for(&home, &principal);
+        fs::write(
+            &path,
+            "[quotas]\nmax_memory_bytes = 4294967296\nmax_compute_workers = 0\nmax_cpu_fuel_per_sec = 2000000000\n",
+        )
+        .unwrap();
+        let loaded = PrincipalProfile::load(&home, &principal).unwrap();
+        assert_eq!(loaded.quotas.max_memory_bytes, 4_294_967_296);
+        assert_eq!(loaded.quotas.max_cpu_fuel_per_sec, 2_000_000_000);
+    }
+
+    #[test]
+    fn load_coerces_zero_cpu_fuel_to_default() {
+        let (_d, home, principal) = scratch_home();
+        let path = PrincipalProfile::path_for(&home, &principal);
+        fs::write(&path, "[quotas]\nmax_cpu_fuel_per_sec = 0\n").unwrap();
+        let loaded = PrincipalProfile::load(&home, &principal).unwrap();
+        assert_eq!(
+            loaded.quotas.max_cpu_fuel_per_sec,
+            crate::profile::DEFAULT_MAX_CPU_FUEL_PER_SEC
+        );
     }
 
     #[test]
@@ -314,7 +342,7 @@ mod tests {
     fn load_quotas_missing_cpu_fuel_uses_default() {
         // A pre-existing profile.toml that predates the field still loads,
         // with `max_cpu_fuel_per_sec` falling back to the serde default
-        // (deny_unknown_fields rejects UNKNOWN fields, not missing ones).
+        // (unknown keys are ignored; missing keys use serde defaults).
         let (_d, home, principal) = scratch_home();
         let path = PrincipalProfile::path_for(&home, &principal);
         fs::write(&path, "[quotas]\nmax_memory_bytes = 1048576\n").unwrap();

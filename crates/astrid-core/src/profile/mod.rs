@@ -16,8 +16,10 @@
 //! - Missing file → [`PrincipalProfile::default`]. Fresh principals without a
 //!   profile on disk get the permissive-ish defaults below (egress and
 //!   process spawn default to empty → fail-closed).
-//! - Malformed TOML, unknown fields, failed validation, or a future
-//!   `profile_version` → hard error. The operator must correct the file.
+//! - Malformed TOML, failed validation, or a future `profile_version` → hard
+//!   error. The operator must correct the file.
+//! - Unknown keys are ignored so upgrade and rollback across binaries do not
+//!   brick a home. `profile_version` is the breaking-change gate.
 //! - Save is atomic on Unix (write to `.tmp` with `0o600`, then `rename`).
 //!
 //! # Defaults
@@ -129,7 +131,7 @@ pub enum ProfileError {
     /// Filesystem IO failed (read, write, rename, `create_dir_all`).
     #[error("profile io error: {0}")]
     Io(#[from] io::Error),
-    /// Profile TOML failed to deserialize (syntax or `deny_unknown_fields`).
+    /// Profile TOML failed to deserialize (syntax error).
     #[error("profile parse error: {0}")]
     Parse(#[from] toml::de::Error),
     /// Profile failed to serialize back to TOML.
@@ -146,7 +148,6 @@ pub enum ProfileError {
 /// file yields [`PrincipalProfile::default`]. A malformed, invalid, or
 /// future-versioned file is a hard error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PrincipalProfile {
     /// Schema version. Bumped on breaking field changes.
     ///
@@ -233,7 +234,6 @@ pub enum AuthMethod {
 
 /// Authentication configuration for a principal.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     /// Accepted authentication methods. Serde rejects unknown variants.
     #[serde(default)]
@@ -290,7 +290,6 @@ impl AuthConfig {
 ///
 /// Empty `egress` means no outbound traffic is permitted (fail-closed).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     /// Egress allow-list patterns.
     ///
@@ -320,7 +319,6 @@ pub struct NetworkConfig {
 ///
 /// Empty `allow` means the principal cannot spawn external processes.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProcessConfig {
     /// Executables permitted for process spawn.
     ///
@@ -336,7 +334,6 @@ pub struct ProcessConfig {
 /// Enforcement happens in Layer 3. This struct only carries the values and
 /// rejects nonsense on load/save.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Quotas {
     /// Maximum resident memory in bytes. Must be > 0.
     #[serde(default = "default_max_memory_bytes")]
@@ -520,6 +517,36 @@ mod tests {
         let s = toml::to_string_pretty(&p).unwrap();
         let back: PrincipalProfile = toml::from_str(&s).unwrap();
         assert_eq!(p, back);
+    }
+
+    #[test]
+    fn live_aos_codex_profile_with_max_compute_workers_loads() {
+        let toml_src = concat!(
+            "profile_version = 1\n",
+            "enabled = true\n",
+            "groups = [\"codex\"]\n",
+            "grants = []\n",
+            "revokes = []\n",
+            "capsules = [\"aos-mcp\"]\n",
+            "\n[auth]\nmethods = [\"keypair\"]\n",
+            "\n[network]\negress = []\n",
+            "\n[process]\nallow = []\n",
+            "\n[quotas]\n",
+            "max_memory_bytes = 4294967296\n",
+            "max_timeout_secs = 86400\n",
+            "max_ipc_throughput_bytes = 10485760\n",
+            "max_background_processes = 64\n",
+            "max_compute_workers = 0\n",
+            "max_storage_bytes = 17179869184\n",
+            "max_cpu_fuel_per_sec = 2000000000\n",
+        );
+        let profile: PrincipalProfile = toml::from_str(toml_src).unwrap();
+        assert_eq!(profile.quotas.max_background_processes, 64);
+        let emitted = toml::to_string(&profile).unwrap();
+        assert!(
+            !emitted.contains("max_compute_workers"),
+            "unknown keys must not be rewritten: {emitted}"
+        );
     }
 
     #[test]

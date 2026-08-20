@@ -8,8 +8,8 @@ use crate::capability_grammar::validate_capability;
 
 use super::{
     AuthConfig, BACKGROUND_PROCESSES_UPPER_BOUND, CURRENT_PROFILE_VERSION,
-    IN_FLIGHT_CALLS_UPPER_BOUND, NetworkConfig, PrincipalProfile, ProcessConfig, ProfileError,
-    ProfileResult, Quotas, TIMEOUT_SECS_UPPER_BOUND,
+    DEFAULT_MAX_CPU_FUEL_PER_SEC, IN_FLIGHT_CALLS_UPPER_BOUND, NetworkConfig, PrincipalProfile,
+    ProcessConfig, ProfileError, ProfileResult, Quotas, TIMEOUT_SECS_UPPER_BOUND,
 };
 
 impl PrincipalProfile {
@@ -36,6 +36,17 @@ impl PrincipalProfile {
 }
 
 impl Quotas {
+    /// Replace a persisted `0` CPU rate with the documented default.
+    ///
+    /// Some 0.10.x profiles stored `0`. That value is not a valid rate
+    /// (and is not an unlimited sentinel). Coerce on load so the home
+    /// boots; the next save writes the default.
+    pub(crate) fn coerce_legacy_zero_cpu_fuel(&mut self) {
+        if self.max_cpu_fuel_per_sec == 0 {
+            self.max_cpu_fuel_per_sec = DEFAULT_MAX_CPU_FUEL_PER_SEC;
+        }
+    }
+
     /// Validate quota bounds.
     ///
     /// # Errors
