@@ -60,7 +60,8 @@ impl PrincipalProfile {
         let path = Self::path_for(home, principal);
         let content =
             crate::platform_fs::read_private_file_to_string(&path).map_err(ProfileError::Io)?;
-        let profile: Self = toml::from_str(&content)?;
+        let mut profile: Self = toml::from_str(&content)?;
+        profile.quotas.coerce_legacy_zero_cpu_fuel();
         profile.validate()?;
         Ok(profile)
     }
@@ -79,7 +80,8 @@ impl PrincipalProfile {
             },
             Err(e) => return Err(ProfileError::Io(e)),
         };
-        let profile: Self = toml::from_str(&content)?;
+        let mut profile: Self = toml::from_str(&content)?;
+        profile.quotas.coerce_legacy_zero_cpu_fuel();
         profile.validate()?;
         Ok(profile)
     }
@@ -312,6 +314,18 @@ mod tests {
         let loaded = PrincipalProfile::load(&home, &principal).unwrap();
         assert_eq!(loaded.quotas.max_memory_bytes, 4_294_967_296);
         assert_eq!(loaded.quotas.max_cpu_fuel_per_sec, 2_000_000_000);
+    }
+
+    #[test]
+    fn load_coerces_zero_cpu_fuel_to_default() {
+        let (_d, home, principal) = scratch_home();
+        let path = PrincipalProfile::path_for(&home, &principal);
+        fs::write(&path, "[quotas]\nmax_cpu_fuel_per_sec = 0\n").unwrap();
+        let loaded = PrincipalProfile::load(&home, &principal).unwrap();
+        assert_eq!(
+            loaded.quotas.max_cpu_fuel_per_sec,
+            crate::profile::DEFAULT_MAX_CPU_FUEL_PER_SEC
+        );
     }
 
     #[test]
