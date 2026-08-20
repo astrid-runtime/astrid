@@ -1,6 +1,6 @@
-//! Classify native FSKit mount failures without treating every error as a gap.
+//! Classify native `FSKit` mount failures without treating every error as a gap.
 
-/// Stable sentinel for "the Astrid FSKit extension is not installed or enabled".
+/// Stable sentinel for "the Astrid `FSKit` extension is not installed or enabled".
 ///
 /// Upgrade proofs and CI may record a named gap only when this exact token is
 /// present. Generic mount, permission, lease, and rollback failures must not
@@ -28,9 +28,9 @@ pub(crate) enum NativeMountFailure {
 
 /// Decide whether a native mount failure is an unavailable extension.
 ///
-/// macOS reports missing FSKit filesystem types as exit status 72. Other
+/// macOS reports missing `FSKit` filesystem types as exit status 72. Other
 /// signals are exact extension-path or filesystem-type text. Generic
-/// "FSKit mount failed" and rollback strings are not sufficient.
+/// "`FSKit` mount failed" and rollback strings are not sufficient.
 pub(crate) fn classify_native_mount_failure(
     code: Option<i32>,
     stderr: &str,

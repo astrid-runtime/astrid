@@ -1,0 +1,56 @@
+name: Published v0.10.4 macOS upgrade
+
+on:
+  push:
+    branches: [main, stream-*]
+    paths:
+      - 'scripts/test_v0104_macos_upgrade.sh'
+      - 'crates/astrid-storage-provider-fskit/**'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/macos-v0104-upgrade.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'scripts/test_v0104_macos_upgrade.sh'
+      - 'crates/astrid-storage-provider-fskit/**'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/macos-v0104-upgrade.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  macos-v0104-upgrade:
+    name: Published v0.10.4 macOS upgrade
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95.0"
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: ${{ runner.os }}-${{ github.job }}
+          cache-on-failure: true
+
+      - name: Build the current upgrade binaries
+        run: cargo build --locked -p astrid --bins -p astrid-storage-provider-fskit
+
+      - name: Upgrade the pinned published macOS release
+        run: scripts/test_v0104_macos_upgrade.sh

@@ -715,6 +715,12 @@ attempt_mount_round_trip() {
     # Generic "FSKit mount failed", rollback, or permission errors must fail.
     if grep -Fq 'FSKIT_EXTENSION_UNAVAILABLE' \
       "${TEST_ROOT}/mount.log"; then
+      if grep -Eqi 'mount rollback incomplete|rollback left the lease' \
+        "${TEST_ROOT}/mount.log"; then
+        cat "${TEST_ROOT}/mount.log" >&2
+        dump_daemon_logs
+        fail "FSKit extension unavailable but mount rollback also failed"
+      fi
       {
         printf 'GAP: live FSKit enable/unsigned unavailable; skipped native mount round-trip\n'
         cat "${TEST_ROOT}/mount.log"

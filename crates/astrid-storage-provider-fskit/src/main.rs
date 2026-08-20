@@ -21,9 +21,11 @@ use astrid_core::storage_provider::{
 use astrid_uplink::admin_client::AdminClient;
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(test, target_os = "macos"))]
 mod mount_failure;
 mod service;
 
+#[cfg(target_os = "macos")]
 use mount_failure::{classify_native_mount_failure, native_mount_failure_message};
 
 const PROVIDER_NAME: &str = "astrid-storage-provider-fskit";
