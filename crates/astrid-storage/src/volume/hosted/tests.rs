@@ -452,7 +452,13 @@ fn read_region_at_copies_overlapping_extents_only() {
         volume.write_region_at(&region, index, &byte).unwrap();
     }
     volume.sync().unwrap();
+    REGION_STATE_CLONES.with(|count| count.set(0));
     let mut bytes = [0_u8; 4];
     assert_eq!(volume.read_region_at(&region, 10, &mut bytes).unwrap(), 4);
     assert_eq!(&bytes, &[10, 11, 12, 13]);
+    assert_eq!(
+        REGION_STATE_CLONES.with(std::cell::Cell::get),
+        0,
+        "read_region_at cloned RegionState"
+    );
 }

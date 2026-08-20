@@ -1,5 +1,7 @@
 //! Hosted single-container implementation of the Astrid volume contract.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
@@ -32,10 +34,26 @@ struct Extent {
     physical_offset: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[cfg(test)]
+thread_local! {
+    static REGION_STATE_CLONES: Cell<usize> = const { Cell::new(0) };
+}
+
+#[derive(Debug, Default)]
 struct RegionState {
     length: u64,
     extents: BTreeMap<u64, Extent>,
+}
+
+impl Clone for RegionState {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        REGION_STATE_CLONES.with(|count| count.set(count.get().saturating_add(1)));
+        Self {
+            length: self.length,
+            extents: self.extents.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]

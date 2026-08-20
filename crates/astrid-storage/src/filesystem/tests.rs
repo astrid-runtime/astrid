@@ -1,4 +1,3 @@
-
 use std::sync::Arc;
 
 use astrid_core::PrincipalUid;
