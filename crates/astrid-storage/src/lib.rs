@@ -121,10 +121,10 @@ pub use engine::{
 pub use kv::SurrealKvStore;
 #[cfg(not(target_family = "wasm"))]
 pub use principal_state::{
-    Blake3ObjectIdentityV1, Blake3PhysicalIdentityV1, NativeContentStagingArea,
-    NativePrincipalContentStore, RUNTIME_STORE_FORMAT_ID, ReadyStagedContent,
-    RuntimePrincipalStore, StagedContentId, StagedContentWriter, StateOwner, StateOwnerCodecV1,
-    StateOwnerCodecV2, StateOwnerResolver, StateOwnerV1, open_runtime_kv,
+    Blake3ObjectIdentityV1, Blake3PhysicalIdentityV1, ContiguousFileIngest,
+    NativeContentStagingArea, NativePrincipalContentStore, RUNTIME_STORE_FORMAT_ID,
+    ReadyStagedContent, RuntimePrincipalStore, StagedContentId, StagedContentWriter, StateOwner,
+    StateOwnerCodecV1, StateOwnerCodecV2, StateOwnerResolver, StateOwnerV1, open_runtime_kv,
     open_runtime_kv_with_directory, open_runtime_principal_store,
     open_runtime_principal_store_with_directory, open_runtime_principal_store_with_object_cache,
     open_runtime_principal_store_with_policy,

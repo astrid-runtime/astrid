@@ -40,6 +40,7 @@ use crate::kv::{KvPrincipalResolver, KvQuotaResolver, KvStore, ScopedKvStore, Tr
 mod bootstrap;
 #[cfg(test)]
 mod compaction_tests;
+mod contiguous_ingest;
 mod format_amendment;
 #[cfg(test)]
 mod format_amendment_tests;
@@ -59,6 +60,7 @@ mod volume_migration;
 pub const RUNTIME_STORE_FORMAT_ID: &str =
     "astrid-principal-store-v1;state-owner-v2;workspace-branch-v1";
 
+pub use contiguous_ingest::ContiguousFileIngest;
 #[cfg(test)]
 use format_amendment::{
     DestinationFormat, PRE_DERIVATION_FORMAT_SPEC_ID, STORE_FORMAT_SPEC, legacy_store_metadata,
@@ -788,6 +790,28 @@ async fn assemble_runtime_store(
     engine: Arc<RuntimeEngine>,
     directory_cutover_receipt: String,
 ) -> StorageResult<RuntimePrincipalStore> {
+    let format_spec = bootstrap::format_specification()?;
+    let format_spec_id = engine.identify(&format_spec);
+    let catalog_spec = bootstrap::content_catalog_format_specification()?;
+    let catalog_spec_id = engine.identify(&catalog_spec);
+    let bootstrap_objects = representation_bootstrap_objects(format_spec_id, catalog_spec_id);
+    let catalogue_engine = Arc::clone(&engine);
+    tokio::task::spawn_blocking(move || {
+        catalogue_engine.ensure_direct_representation_catalogue_compatible_with(
+            format_spec_id,
+            &[PRE_DENSE_RADIX_FORMAT_SPEC_ID],
+            &bootstrap_objects,
+        )
+    })
+    .await
+    .map_err(|error| {
+        StorageError::Connection(format!(
+            "volume representation-catalogue worker failed: {error}"
+        ))
+    })?
+    .map_err(|error| {
+        StorageError::Connection(format!("activate volume representation catalogue: {error}"))
+    })?;
     let validated_catalogs = Arc::new(Mutex::new(BTreeMap::<StateOwner, CatalogValidation>::new()));
     let validated_kv = Arc::new(crate::kv::KvValidationCache::default());
 

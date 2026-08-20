@@ -651,3 +651,82 @@ async fn leftover_symlink_is_quarantined_without_minting_identity() {
         b"default-home"
     );
 }
+
+#[tokio::test]
+async fn contiguous_home_import_shares_identical_payloads_and_compacts_below_unreclaimed_journal() {
+    let (_directory, home, store, principals, principal, uid) = fixture().await;
+    let source = home.principal_home(&principal).root().to_path_buf();
+    let unique_dir = source.join("unique");
+    let shared_dir = source.join("shared");
+    astrid_core::platform_fs::ensure_private_directory(&unique_dir).expect("unique dir");
+    astrid_core::platform_fs::ensure_private_directory(&shared_dir).expect("shared dir");
+    let unique_payload = 32_usize;
+    let shared_bytes = vec![0x11_u8; 4096];
+    let mut unique_logical = 0_u64;
+    for index in 0..unique_payload {
+        let bytes = vec![u8::try_from(index).expect("index fits u8"); 2048];
+        unique_logical += u64::try_from(bytes.len()).expect("len");
+        fs::write(unique_dir.join(format!("u-{index:02}")), bytes).expect("unique file");
+    }
+    for index in 0..16 {
+        fs::write(shared_dir.join(format!("s-{index:02}")), &shared_bytes).expect("shared file");
+    }
+    let walked = unique_logical + u64::try_from(shared_bytes.len() * 16).expect("shared len");
+    migrate_legacy_principal_homes(&home, &store, &principals).expect("contiguous import");
+    let filesystem = AstridFilesystem::new(store.content(), StateOwner::Principal(uid));
+    assert_eq!(
+        filesystem
+            .read(&FilesystemPath::new("home/shared/s-00").unwrap(), 0, 4)
+            .unwrap(),
+        &shared_bytes[..4]
+    );
+    assert_eq!(
+        filesystem
+            .read(&FilesystemPath::new("home/shared/s-15").unwrap(), 0, 4)
+            .unwrap(),
+        &shared_bytes[..4]
+    );
+    let volume_len = fs::metadata(home.storage_volume_path())
+        .expect("volume")
+        .len();
+    let policy = astrid_storage::storage_model::ObjectRecord::new(
+        astrid_storage::storage_model::ObjectKind::Evidence,
+        astrid_storage::storage_model::ObjectFormatVersion::V1,
+        b"home-import-packing-regression".to_vec(),
+        Vec::new(),
+        0,
+        astrid_storage::storage_model::ObjectClass::Metadata,
+    )
+    .expect("policy");
+    match store
+        .compact_with_deterministic_proof(
+            astrid_storage::storage_model::ObjectId::new([0x51; 32]),
+            policy,
+            Vec::new(),
+        )
+        .await
+    {
+        Ok(_) => {
+            let compacted = fs::metadata(home.storage_volume_path())
+                .expect("compacted volume")
+                .len();
+            assert!(
+                compacted <= volume_len,
+                "compacted {compacted} must not grow unreclaimed journal {volume_len}"
+            );
+            assert!(
+                compacted <= walked.saturating_add(2 * 1024 * 1024),
+                "compacted {compacted} must stay in class with walked {walked}"
+            );
+        },
+        Err(error) => {
+            // Volume arena compact still validates historical root-journal
+            // snapshots. Contiguous blobs must remain the live payload even
+            // when that rewrite cannot run. Ingest packing is the claim.
+            assert!(
+                volume_len <= walked.saturating_add(4 * 1024 * 1024),
+                "uncompacted volume {volume_len} must stay in class with walked {walked} ({error})"
+            );
+        },
+    }
+}

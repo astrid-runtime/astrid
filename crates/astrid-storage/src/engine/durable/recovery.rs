@@ -215,6 +215,7 @@ where
     let arena_reader = arena
         .try_clone()
         .map_err(|source| io_error("clone object arena for positional reads", source))?;
+    let representations = super::representations::RepresentationStore::open_volume(volume, limits)?;
     Ok((
         RecoveredStore {
             roots_by_principal,
@@ -227,7 +228,7 @@ where
                 arena_len,
                 arena_tail,
             },
-            representations: None,
+            representations,
             arena_reader,
         },
         wal_writer,

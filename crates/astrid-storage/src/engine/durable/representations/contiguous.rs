@@ -105,40 +105,48 @@ impl RepresentationStore {
     pub(in crate::engine::durable) fn open_contiguous_read(
         &self,
         object: ObjectId,
-    ) -> Result<Option<(File, ContiguousLocation)>, DurableError> {
+    ) -> Result<Option<(super::super::File, ContiguousLocation)>, DurableError> {
         let Some(location) = self.contiguous.get(&object).copied() else {
             return Ok(None);
         };
-        let directory = LooseBlobDirectory::open(
-            &self.root_directory,
-            &self.root,
-            location.namespace_generation,
-            false,
-        )?;
+        if let Some(volume) = self.volume_media() {
+            let file = super::volume::open_volume_blob(
+                volume,
+                location.blob,
+                location.namespace_generation,
+            )?;
+            return Ok(Some((file, location)));
+        }
+        let (root, root_directory) = self.directory_media()?;
+        let directory =
+            LooseBlobDirectory::open(root_directory, root, location.namespace_generation, false)?;
         let file = open_authoritative_regular(
             &directory,
             &loose_blob_name(location.blob),
             "contiguous blob is missing, redirected, or not a regular file",
         )?;
-        Ok(Some((file, location)))
+        Ok(Some((super::super::File::native(file), location)))
     }
 
     pub(in crate::engine::durable) fn open_loose_blob(
         &self,
         blob: crate::storage_model::BlobId,
         namespace_generation: u64,
-    ) -> Result<File, DurableError> {
+    ) -> Result<super::super::File, DurableError> {
+        if let Some(volume) = self.volume_media() {
+            return super::volume::open_volume_blob(volume, blob, namespace_generation);
+        }
         let directory = LooseBlobDirectory::open(
-            &self.root_directory,
-            &self.root,
+            self.directory_media()?.1,
+            self.directory_media()?.0,
             namespace_generation,
             false,
         )?;
-        open_authoritative_regular(
+        Ok(super::super::File::native(open_authoritative_regular(
             &directory,
             &loose_blob_name(blob),
             "contiguous blob is missing, redirected, or not a regular file",
-        )
+        )?))
     }
 
     pub(in crate::engine::durable) fn contains_contiguous(&self, object: ObjectId) -> bool {
@@ -164,7 +172,7 @@ impl RepresentationStore {
     /// Retire loose payloads only after active authority contains direct arena
     /// placements for the complete live object set.
     pub(in crate::engine::durable) fn retire_loose_blobs(&self) -> Result<(), DurableError> {
-        retire_loose_blob_tree(&self.root_directory)
+        retire_loose_blob_tree(self.directory_media()?.1)
     }
 
     pub(in crate::engine::durable) fn rebuild_contiguous_index<
@@ -183,8 +191,8 @@ impl RepresentationStore {
         for (record_id, record, namespace_generation) in active {
             let profile = self.profile(record.profile())?;
             let (reverse, locations) = recovery.recover_contiguous_record(
-                &self.root_directory,
-                &self.root,
+                self.directory_media()?.1,
+                self.directory_media()?.0,
                 record_id,
                 &record,
                 &profile,
@@ -201,7 +209,11 @@ impl RepresentationStore {
         blob: crate::storage_model::BlobId,
         namespace_generation: u64,
     ) -> PathBuf {
-        loose_blob_path_from_representation_root(&self.root, blob, namespace_generation)
+        loose_blob_path_from_representation_root(
+            self.directory_media().expect("directory media").0,
+            blob,
+            namespace_generation,
+        )
     }
 
     fn install_contiguous_indexes(
@@ -593,7 +605,7 @@ fn verify_linked_identity(
     Ok(())
 }
 
-fn encode_loose_metadata(
+pub(super) fn encode_loose_metadata(
     profile: crate::storage_model::RepresentationProfileId,
     blob: crate::storage_model::BlobId,
     logical_bytes: u64,
@@ -699,16 +711,20 @@ fn loose_blob_path_from_representation_root(
         .join(loose_blob_name(blob))
 }
 
-fn loose_blob_name(blob: crate::storage_model::BlobId) -> PathBuf {
+pub(super) fn loose_blob_name(blob: crate::storage_model::BlobId) -> PathBuf {
     PathBuf::from(format!("{}.blob", tagged_blob_hex(blob)))
 }
 
-pub(in crate::engine::durable) fn read_contiguous_object<I: PersistentObjectIdentity>(
-    mut file: File,
+pub(in crate::engine::durable) fn read_contiguous_object<I, F>(
+    mut file: F,
     location: ContiguousLocation,
     expected: ObjectId,
     identity: &I,
-) -> Result<ObjectRecord, DurableError> {
+) -> Result<ObjectRecord, DurableError>
+where
+    I: PersistentObjectIdentity,
+    F: Read + Seek,
+{
     file.seek(SeekFrom::Start(location.offset))
         .map_err(|source| io_error("seek contiguous chunk", source))?;
     let length = usize::try_from(location.length).map_err(|_| DurableError::EncodingOverflow)?;
@@ -840,7 +856,7 @@ fn open_authoritative_regular(
     }
 }
 
-fn blob_hasher(
+pub(super) fn blob_hasher(
     profile: crate::storage_model::RepresentationProfileId,
     logical_bytes: u64,
 ) -> blake3::Hasher {

@@ -1,8 +1,9 @@
 //! Recovery and closed-world validation for physical representation authority.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::SeekFrom;
+
+use super::super::DurableIo;
 
 use crate::storage_model::{
     CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapKey, PhysicalMapNode, PlacementEntry,
@@ -63,8 +64,8 @@ impl MetadataIndex {
     }
 }
 
-pub(super) fn recover_metadata(
-    file: &mut File,
+pub(super) fn recover_metadata<F: DurableIo>(
+    file: &mut F,
     limits: RecoveryLimits,
 ) -> Result<MetadataIndex, DurableError> {
     let mut index = MetadataIndex::default();
@@ -78,8 +79,8 @@ pub(super) fn recover_metadata(
     Ok(index)
 }
 
-pub(super) fn recover_journal(
-    file: &mut File,
+pub(super) fn recover_journal<F: DurableIo>(
+    file: &mut F,
     current: CurrentPointer,
     metadata: &MetadataIndex,
     limits: RecoveryLimits,
@@ -247,10 +248,13 @@ fn map_closure_complete(
     true
 }
 
-fn truncate_repairable_journal_tail(file: &mut File, offset: u64) -> Result<(), DurableError> {
-    file.set_len(offset)
+fn truncate_repairable_journal_tail<F: DurableIo>(
+    file: &mut F,
+    offset: u64,
+) -> Result<(), DurableError> {
+    file.durable_set_len(offset)
         .map_err(|source| io_error("truncate uncommitted representation state", source))?;
-    file.sync_data()
+    file.durable_sync_data()
         .map_err(|source| io_error("flush repaired representation journal", source))?;
     file.seek(SeekFrom::End(0))
         .map_err(|source| io_error("seek repaired representation journal", source))?;
@@ -473,8 +477,8 @@ pub(super) fn active_entries(
     Ok(entries)
 }
 
-pub(super) fn read_current_file(
-    mut file: File,
+pub(super) fn read_current_file<F: DurableIo>(
+    mut file: F,
     limits: RecoveryLimits,
 ) -> Result<CurrentPointer, DurableError> {
     let mut current = None;
@@ -498,7 +502,7 @@ pub(super) fn read_current_file(
     ))
 }
 
-fn first_frame_end(file: &mut File) -> Result<usize, DurableError> {
+fn first_frame_end<F: DurableIo>(file: &mut F) -> Result<usize, DurableError> {
     file.seek(SeekFrom::Start(12))
         .map_err(|source| io_error("seek representation checkpoint header", source))?;
     let mut length = [0_u8; 8];
