@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt as _;
 
 use astrid_core::{PrincipalProfile, PrincipalUid};
 use astrid_storage::{
-    IdentityStore, KvIdentityStore, KvQuotaResolver, MemoryKvStore, ScopedKvStore,
+    IdentityStore, KvIdentityStore, KvQuotaResolver, MemoryKvStore, OwnershipStore, ScopedKvStore,
     open_runtime_principal_store_with_directory,
 };
 
@@ -452,11 +452,7 @@ fn verify_fails_closed_on_unbound_leftover_home() {
     let error = verify_migrated_legacy_principal_sources_retired(&home, &principals)
         .expect_err("unbound leftover must fail closed after cut-over");
     let message = error.to_string();
-    assert!(
-        message.contains("no current alias binding")
-            || message.contains("no registered durable identity"),
-        "{message}"
-    );
+    assert!(message.contains("no current alias binding"), "{message}");
     assert!(home.principal_home(&leftover).root().is_dir());
 }
 
@@ -480,4 +476,85 @@ async fn leftover_local_alias_does_not_claim_cli_root_link() {
     );
     assert!(principals.uid_for(&leftover).is_ok());
     migrate_legacy_principal_homes(&home, &store, &principals).expect("migration after admit");
+}
+
+#[tokio::test]
+async fn leftover_file_is_quarantined_without_minting_identity() {
+    let (_directory, home, store, principals, principal, uid) = fixture().await;
+    write_ordinary_legacy_file(&home, &principal, b"default-home");
+    let leftover = PrincipalId::new("legacy-agent").expect("valid leftover name");
+    let leftover_path = home.home_dir().join(leftover.as_str());
+    fs::write(&leftover_path, b"not-a-directory").expect("leftover file");
+    let identity = identity_store(&principals);
+    admit_unbound_legacy_principal_homes(&home, &principals, &identity)
+        .await
+        .expect("quarantine leftover file");
+    assert!(!leftover_path.exists());
+    assert!(principals.uid_for(&leftover).is_err());
+    let quarantined = fs::read_dir(home.migrations_dir().join("unbound-legacy-homes"))
+        .expect("quarantine dir")
+        .map(|entry| entry.expect("entry").path())
+        .collect::<Vec<_>>();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(
+        fs::read(&quarantined[0]).expect("preserved"),
+        b"not-a-directory"
+    );
+    migrate_legacy_principal_homes(&home, &store, &principals)
+        .expect("admitted homes still migrate");
+    let filesystem = AstridFilesystem::new(store.content(), StateOwner::Principal(uid));
+    assert_eq!(
+        filesystem
+            .read(
+                &FilesystemPath::new("home/documents/note.txt").unwrap(),
+                0,
+                12
+            )
+            .unwrap(),
+        b"default-home"
+    );
+}
+
+#[tokio::test]
+async fn unbound_leftover_is_adopted_into_the_operator_fleet() {
+    let (_directory, home, _store, principals, principal, uid) = fixture().await;
+    write_ordinary_legacy_file(&home, &principal, b"default-home");
+    let leftover = PrincipalId::new("legacy-agent").expect("leftover");
+    write_ordinary_legacy_file(&home, &leftover, b"leftover-home");
+    let identity = identity_store(&principals);
+    admit_unbound_legacy_principal_homes(&home, &principals, &identity)
+        .await
+        .expect("admit leftover");
+    let leftover_uid = principals.uid_for(&leftover).expect("minted leftover");
+    let bindings = principals.bindings();
+    assert!(
+        bindings
+            .iter()
+            .any(|(alias, bound)| *alias == leftover && *bound == leftover_uid),
+        "barrier snapshot must see the minted leftover"
+    );
+
+    let backend: Arc<dyn astrid_storage::KvStore> = Arc::new(MemoryKvStore::new());
+    let ownership = OwnershipStore::new(backend, principals.clone()).expect("ownership");
+    let root_identity =
+        astrid_core::PrincipalIdentity::from_genesis(astrid_core::PrincipalGenesis::from_parts(
+            uuid::Uuid::from_u128(2),
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            [2; 32],
+        ))
+        .expect("root identity");
+    let root_user = astrid_core::AstridUserId {
+        id: uuid::Uuid::from_u128(1),
+        principal: principal.clone(),
+        public_key: None,
+        display_name: None,
+        created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+    };
+    crate::bootstrap_cli_root_ownership(&ownership, &principals, root_user, root_identity, true)
+        .await
+        .expect("adopt unowned principals");
+    let graph = ownership.load().await.expect("ownership graph");
+    let default_owner = graph.principal_owner(uid).expect("default owned");
+    let leftover_owner = graph.principal_owner(leftover_uid).expect("leftover owned");
+    assert_eq!(default_owner.fleet_uid, leftover_owner.fleet_uid);
 }
