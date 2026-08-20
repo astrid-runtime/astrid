@@ -11,6 +11,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **`astrid status` and `astrid mcp serve` no longer treat an unlinked
+  `system.sock` as a stopped daemon.** If the recorded PID is still alive,
+  status fails closed and MCP refuses to spawn a second kernel onto the
+  singleton lock. Run `astrid restart`. Closes #1572.
 - **Capsule restart budget now survives runtime generation replacement.**
   Health-monitor restart trackers are keyed by generation-independent runtime
   identity so a persistently failing run loop reaches the five-attempt cap
