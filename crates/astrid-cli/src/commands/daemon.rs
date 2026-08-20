@@ -10,18 +10,12 @@ use crate::bootstrap::find_companion_binary;
 use crate::commands::daemon_control;
 use crate::{socket_client, theme};
 
-const DAEMON_READY_TIMEOUT_SECS: u64 = 60;
-const DAEMON_READY_POLL_MILLIS: u64 = 50;
-const DAEMON_READY_POLL: Duration = Duration::from_millis(DAEMON_READY_POLL_MILLIS);
-const DAEMON_READY_ATTEMPTS: u64 =
-    readiness_attempts(DAEMON_READY_TIMEOUT_SECS, DAEMON_READY_POLL_MILLIS);
-
-const fn readiness_attempts(timeout_secs: u64, poll_millis: u64) -> u64 {
-    let Some(timeout_millis) = timeout_secs.checked_mul(1_000) else {
-        panic!("daemon readiness timeout overflow")
-    };
-    timeout_millis.div_ceil(poll_millis)
-}
+mod ready;
+pub(crate) use ready::disown_if_still_running;
+use ready::{
+    DAEMON_READY_POLL, ReadyWaitOutcome, daemon_ready_timeout_secs, readiness_attempts,
+    wait_for_ready,
+};
 
 /// Build a hint string pointing the user to the daemon log directory.
 fn log_hint() -> String {
@@ -117,31 +111,22 @@ async fn spawn_daemon_inner(
     // The readiness file is written only after load_all_capsules()
     // completes (including await_capsule_readiness()), so the accept
     // loop is guaranteed to be running by the time we connect.
-    let mut ready = false;
-    for _ in 0..DAEMON_READY_ATTEMPTS {
-        tokio::time::sleep(DAEMON_READY_POLL).await;
-        if ready_path.exists() {
-            ready = true;
-            break;
-        }
-        // If the daemon has already exited, stop polling immediately
-        // instead of waiting the full readiness timeout.
-        if let Ok(Some(status)) = child.try_wait() {
+    let timeout_secs = daemon_ready_timeout_secs();
+    match wait_for_ready(ready_path, &mut child, timeout_secs).await {
+        ReadyWaitOutcome::Ready => Ok(child),
+        ReadyWaitOutcome::ChildExited(status) => {
             anyhow::bail!("Daemon exited prematurely ({status}).{}", log_hint());
-        }
+        },
+        ReadyWaitOutcome::StillRunning => {
+            // Do not SIGKILL a live first cutover (layout-1 audit import
+            // can outlive the wait). Disown and tell the operator.
+            disown_if_still_running(child);
+            anyhow::bail!(
+                "Daemon is still starting after {timeout_secs} seconds; it was left running. Check logs or run `astrid status` / retry later.{}",
+                log_hint()
+            );
+        },
     }
-    if !ready {
-        // Kill the child to prevent an orphan daemon that lingers
-        // until its idle timeout expires.
-        let _ = child.kill();
-        let _ = child.wait();
-        anyhow::bail!(
-            "Daemon failed to become ready within {} seconds.{}",
-            DAEMON_READY_TIMEOUT_SECS,
-            log_hint()
-        );
-    }
-    Ok(child)
 }
 
 fn ephemeral_daemon_command(daemon_bin: &Path, workspace_root: &Path) -> std::process::Command {
@@ -234,7 +219,9 @@ pub(crate) async fn ensure_daemon_workspace_matches(workspace_root: Option<&Path
     let expected = expected_workspace_fingerprint(workspace_root)?;
     let ready_path = socket_client::readiness_path();
 
-    for _ in 0..DAEMON_READY_ATTEMPTS {
+    let timeout_secs = daemon_ready_timeout_secs();
+    let attempts = readiness_attempts(timeout_secs, ready::DAEMON_READY_POLL_MILLIS);
+    for _ in 0..attempts {
         match std::fs::read_to_string(&ready_path) {
             Ok(metadata) => return validate_daemon_workspace_metadata(&metadata, &expected),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -247,7 +234,7 @@ pub(crate) async fn ensure_daemon_workspace_matches(workspace_root: Option<&Path
     }
 
     anyhow::bail!(
-        "daemon workspace metadata was not available within {DAEMON_READY_TIMEOUT_SECS} seconds; run `astrid restart`"
+        "daemon workspace metadata was not available within {timeout_secs} seconds; run `astrid restart`"
     )
 }
 
@@ -312,35 +299,32 @@ pub(crate) async fn spawn_persistent_daemon() -> Result<()> {
 
     let mut child = cmd.spawn().context("Failed to spawn Astrid daemon")?;
 
-    let mut ready = false;
-    for _ in 0..DAEMON_READY_ATTEMPTS {
-        tokio::time::sleep(DAEMON_READY_POLL).await;
-        if ready_path.exists() {
-            ready = true;
-            break;
-        }
-        if let Ok(Some(status)) = child.try_wait() {
+    let timeout_secs = daemon_ready_timeout_secs();
+    match wait_for_ready(&ready_path, &mut child, timeout_secs).await {
+        ReadyWaitOutcome::Ready => {
+            // Disown the child — it runs independently.
+            drop(child);
+            println!(
+                "{}",
+                theme::Theme::success("Astrid daemon started (persistent mode).")
+            );
+            Ok(())
+        },
+        ReadyWaitOutcome::ChildExited(status) => {
             anyhow::bail!("Daemon exited prematurely ({status}).{}", log_hint());
-        }
+        },
+        ReadyWaitOutcome::StillRunning => {
+            // First cutover can outlive the wait. Never SIGKILL a live migrator.
+            disown_if_still_running(child);
+            println!(
+                "{}",
+                theme::Theme::warning(&format!(
+                    "Astrid daemon is still starting after {timeout_secs} seconds (first cutover can outlive this wait). It was left running. Check logs or run `astrid status` later."
+                ))
+            );
+            Ok(())
+        },
     }
-    if !ready {
-        let _ = child.kill();
-        let _ = child.wait();
-        anyhow::bail!(
-            "Daemon failed to become ready within {} seconds.{}",
-            DAEMON_READY_TIMEOUT_SECS,
-            log_hint()
-        );
-    }
-
-    // Disown the child — it runs independently.
-    drop(child);
-
-    println!(
-        "{}",
-        theme::Theme::success("Astrid daemon started (persistent mode).")
-    );
-    Ok(())
 }
 
 pub(crate) fn recorded_daemon_pid_is_alive() -> bool {
@@ -791,20 +775,6 @@ mod tests {
         assert!(
             !root.exists(),
             "boot-log capture must not create content before kernel admission"
-        );
-    }
-
-    #[test]
-    fn daemon_ready_attempts_match_timeout_window() {
-        assert_eq!(
-            DAEMON_READY_ATTEMPTS,
-            readiness_attempts(DAEMON_READY_TIMEOUT_SECS, DAEMON_READY_POLL_MILLIS)
-        );
-        assert_eq!(
-            DAEMON_READY_ATTEMPTS
-                .checked_mul(DAEMON_READY_POLL_MILLIS)
-                .expect("readiness window fits"),
-            60_000
         );
     }
 

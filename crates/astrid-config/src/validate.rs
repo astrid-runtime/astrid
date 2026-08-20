@@ -250,6 +250,13 @@ fn validate_timeouts(config: &Config) -> ConfigResult<()> {
         });
     }
 
+    if t.daemon_ready_secs == 0 {
+        return Err(ConfigError::ValidationError {
+            field: "timeouts.daemon_ready_secs".to_owned(),
+            message: "daemon_ready_secs must be greater than 0".to_owned(),
+        });
+    }
+
     Ok(())
 }
 
@@ -496,6 +503,13 @@ mod tests {
     fn test_invalid_timeout_zero() {
         let mut config = Config::default();
         config.timeouts.request_secs = 0;
+        assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_invalid_daemon_ready_timeout_zero() {
+        let mut config = Config::default();
+        config.timeouts.daemon_ready_secs = 0;
         assert!(validate(&config).is_err());
     }
 

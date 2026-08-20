@@ -235,9 +235,10 @@ pub(crate) async fn run_or_connect(
             c
         },
         Err(e) => {
-            if let Some(mut child) = daemon_child {
-                let _ = child.kill();
-                let _ = child.wait();
+            if let Some(child) = daemon_child {
+                // A live first cutover must not be SIGKILL'd because connect
+                // raced the ready sentinel.
+                commands::daemon::disown_if_still_running(child);
             }
             let log_hint = astrid_core::dirs::AstridHome::resolve().map_or_else(
                 |_| "Failed to connect to daemon".to_string(),

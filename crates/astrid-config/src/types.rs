@@ -723,6 +723,12 @@ pub struct TimeoutsSection {
     pub approval_secs: u64,
     /// Time after which an idle session is automatically closed.
     pub idle_secs: u64,
+    /// How long `astrid start` and companion spawn wait for the daemon ready
+    /// sentinel. First layout-1 cutover can import audit and outlive a 60s
+    /// wait; when this budget expires the CLI disowns a still-running child
+    /// instead of SIGKILL. Unlike `idle_secs` / `approval_secs`, workspace
+    /// config may raise this value.
+    pub daemon_ready_secs: u64,
 }
 
 impl Default for TimeoutsSection {
@@ -734,6 +740,9 @@ impl Default for TimeoutsSection {
             mcp_connect_secs: 10,
             approval_secs: 300,
             idle_secs: 3600,
+            // 10 minutes: layout-1 audit import on a multi-principal home
+            // exceeds the old hardcoded 60s CLI killer.
+            daemon_ready_secs: std::time::Duration::from_mins(10).as_secs(),
         }
     }
 }
