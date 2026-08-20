@@ -202,6 +202,28 @@ pub(in crate::engine::durable) fn open_volume_blob(
     )
 }
 
+pub(in crate::engine::durable) fn verify_installed_volume_blob(
+    volume: &Arc<dyn AstridVolume>,
+    blob: BlobId,
+    profile: RepresentationProfileId,
+    logical_bytes: u64,
+    namespace_generation: u64,
+) -> Result<(), DurableError> {
+    let name = blob_region(blob, namespace_generation);
+    let meta_region = format!("{name}.meta");
+    let expected = super::contiguous::encode_loose_metadata(profile, blob, logical_bytes)?;
+    let mut meta = DurableFile::volume(Arc::clone(volume), &meta_region, false)?;
+    let mut actual = Vec::new();
+    meta.read_to_end(&mut actual)
+        .map_err(|source| io_error("read volume contiguous blob metadata", source))?;
+    if actual != expected {
+        return Err(DurableError::InvalidRepresentationState(
+            "volume contiguous blob metadata disagrees with its profile",
+        ));
+    }
+    verify_volume_blob(volume, &name, profile, blob, logical_bytes)
+}
+
 fn verify_volume_blob(
     volume: &Arc<dyn AstridVolume>,
     region: &str,

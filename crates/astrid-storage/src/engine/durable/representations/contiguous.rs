@@ -208,6 +208,13 @@ impl RepresentationStore {
                         "contiguous representation has a different recipe",
                     ));
                 };
+                super::volume::verify_installed_volume_blob(
+                    &volume,
+                    *blob,
+                    record.profile(),
+                    *logical_bytes,
+                    namespace_generation,
+                )?;
                 let blob_file =
                     super::volume::open_volume_blob(&volume, *blob, namespace_generation)?;
                 let (reverse, locations) = recovery::recover_contiguous_opened_blob(
