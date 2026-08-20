@@ -24,6 +24,7 @@ on:
       - 'scripts/validate_macos_release.py'
       - 'scripts/test_macos_release_packaging.py'
       - 'scripts/test_v0104_linux_upgrade.sh'
+      - 'scripts/test_v0104_macos_upgrade.sh'
       - 'scripts/ci/**'
       - 'scripts/fixtures/windows-release-extension.toml'
       - 'scripts/check_glibc.py'
@@ -76,6 +77,7 @@ on:
       - 'scripts/validate_macos_release.py'
       - 'scripts/test_macos_release_packaging.py'
       - 'scripts/test_v0104_linux_upgrade.sh'
+      - 'scripts/test_v0104_macos_upgrade.sh'
       - 'scripts/ci/**'
       - 'scripts/fixtures/windows-release-extension.toml'
       - 'scripts/check_glibc.py'
@@ -706,7 +708,8 @@ jobs:
             scripts/check-macos-fskit.sh \
             scripts/manage-macos-fskit.sh \
             scripts/test_manage_macos_fskit.sh \
-            scripts/validate-macos-fskit.sh
+            scripts/validate-macos-fskit.sh \
+            scripts/test_v0104_macos_upgrade.sh
           python3 -m unittest scripts/test_macos_release_packaging.py
           scripts/test_manage_macos_fskit.sh
 

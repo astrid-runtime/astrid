@@ -14,14 +14,20 @@ use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
 use astrid_core::storage_filesystem::StorageMountLeaseV1;
 use astrid_core::storage_provider::{
     STORAGE_PROVIDER_PROTOCOL_V1, StorageMountId, StorageMountSelectorV1,
-    StorageProviderCapabilityV1, StorageProviderFailureV1, StorageProviderIdentityV1,
-    StorageProviderOperationV1, StorageProviderOutcomeV1, StorageProviderRequestV1,
-    StorageProviderResponseV1, StorageProviderSuccessV1,
+    StorageProviderCapabilityV1, StorageProviderIdentityV1, StorageProviderOperationV1,
+    StorageProviderOutcomeV1, StorageProviderRequestV1, StorageProviderResponseV1,
+    StorageProviderSuccessV1,
 };
 use astrid_uplink::admin_client::AdminClient;
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(test, target_os = "macos"))]
+mod mount_failure;
+mod provider_failure;
 mod service;
+
+#[cfg(target_os = "macos")]
+use mount_failure::{classify_native_mount_failure, native_mount_failure_message};
 
 const PROVIDER_NAME: &str = "astrid-storage-provider-fskit";
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
@@ -88,10 +94,7 @@ async fn run() -> Result<StorageProviderResponseV1> {
     let request_id = request.request_id;
     let outcome = match execute(request).await {
         Ok(success) => StorageProviderOutcomeV1::Success(success),
-        Err(error) => StorageProviderOutcomeV1::Failure(StorageProviderFailureV1 {
-            code: "provider-operation".to_owned(),
-            message: error.to_string().chars().take(4096).collect(),
-        }),
+        Err(error) => StorageProviderOutcomeV1::Failure(provider_failure::provider_failure(&error)),
     };
     Ok(StorageProviderResponseV1 {
         protocol_version: STORAGE_PROVIDER_PROTOCOL_V1,
@@ -200,21 +203,24 @@ async fn mount(
         };
     }
     if let Err(error) = native_mount(&lease, &mountpoint).await {
-        let rollback = rollback_after_native_failure(
-            client,
-            &lease.mount_id,
-            &mountpoint,
-            auto_created,
-            false,
-        )
-        .await;
-        return Err(error).context(rollback);
+        return with_native_rollback(
+            error,
+            rollback_after_native_failure(
+                client,
+                &lease.mount_id,
+                &mountpoint,
+                auto_created,
+                false,
+            )
+            .await,
+        );
     }
     if let Err(error) = validate_mounted_mountpoint(&mountpoint) {
-        let rollback =
+        return with_native_rollback(
+            error,
             rollback_after_native_failure(client, &lease.mount_id, &mountpoint, auto_created, true)
-                .await;
-        return Err(error).context(rollback);
+                .await,
+        );
     }
     Ok(StorageProviderSuccessV1::Mounted {
         mount_id: lease.mount_id,
@@ -319,13 +325,36 @@ async fn revoke_after_registry_failure(client: &mut AdminClient, mount_id: Stora
         .await;
 }
 
+fn with_native_rollback(
+    error: anyhow::Error,
+    rollback: Result<()>,
+) -> Result<StorageProviderSuccessV1> {
+    match rollback {
+        Ok(()) => Err(error),
+        Err(rollback) => Err(error).context(rollback),
+    }
+}
+
+fn rollback_outcome(native_unmounted: bool, errors: &[String]) -> Result<()> {
+    if !native_unmounted {
+        bail!(
+            "mount rollback left the lease registered for recovery; {}",
+            errors.join("; ")
+        );
+    }
+    if errors.is_empty() {
+        return Ok(());
+    }
+    bail!("mount rollback incomplete: {}", errors.join("; "))
+}
+
 async fn rollback_after_native_failure(
     client: &mut AdminClient,
     mount_id: &StorageMountId,
     mountpoint: &Path,
     auto_created: bool,
     native_mount_command_succeeded: bool,
-) -> anyhow::Error {
+) -> Result<()> {
     let mut errors = Vec::new();
     let native_unmounted = if native_mount_command_succeeded {
         match native_unmount(mountpoint).await {
@@ -352,10 +381,7 @@ async fn rollback_after_native_failure(
         }
     };
     if !native_unmounted {
-        return anyhow::anyhow!(
-            "mount rollback left the lease registered for recovery; {}",
-            errors.join("; ")
-        );
+        return rollback_outcome(false, &errors);
     }
     if let Err(error) = client
         .request(AdminRequestKind::StorageMountRevoke {
@@ -378,7 +404,7 @@ async fn rollback_after_native_failure(
     {
         errors.push(format!("cleanup: {error:#}"));
     }
-    anyhow::anyhow!("mount rollback incomplete: {}", errors.join("; "))
+    rollback_outcome(true, &errors)
 }
 
 fn cleanup_created_mountpoint(mountpoint: &Path, auto_created: bool) -> Result<()> {
@@ -516,18 +542,20 @@ fn validate_mountpoint_layout(mountpoint: &Path) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 pub(crate) async fn native_mount(lease: &StorageMountLeaseV1, mountpoint: &Path) -> Result<()> {
-    let status = tokio::process::Command::new("/sbin/mount")
+    let output = tokio::process::Command::new("/sbin/mount")
         .arg("-t")
         .arg("astridfs")
         .arg(&lease.resource_path)
         .arg(mountpoint)
-        .status()
+        .output()
         .await
         .context("invoke macOS FSKit mount")?;
-    if !status.success() {
-        bail!(
-            "macOS FSKit mount failed with {status}; install and enable the Astrid file-system extension"
-        );
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(native_mount_failure_message(
+            &classify_native_mount_failure(output.status.code(), &stderr, &stdout,)
+        ));
     }
     Ok(())
 }
@@ -696,6 +724,46 @@ fn path_key(path: &Path) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn complete_rollback_preserves_the_original_error() {
+        assert!(rollback_outcome(true, &[]).is_ok());
+        let original = anyhow::anyhow!("FSKIT_EXTENSION_UNAVAILABLE: missing extension");
+        let wrapped = with_native_rollback(original, Ok(()));
+        let error = wrapped.expect_err("successful rollback must preserve the mount error");
+        assert!(
+            error.to_string().contains("FSKIT_EXTENSION_UNAVAILABLE"),
+            "outermost error lost the sentinel: {error:#}"
+        );
+        assert!(!error.to_string().contains("mount rollback incomplete"));
+    }
+
+    #[test]
+    fn failed_rollback_is_the_outermost_error() {
+        let original = anyhow::anyhow!("FSKIT_EXTENSION_UNAVAILABLE: missing extension");
+        let wrapped = with_native_rollback(
+            original,
+            Err(anyhow::anyhow!(
+                "mount rollback incomplete: revoke: kernel refused"
+            )),
+        );
+        let error = wrapped.expect_err("failed rollback must wrap the mount error");
+        assert!(
+            error.to_string().contains("mount rollback incomplete"),
+            "rollback failure must be visible: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("FSKIT_EXTENSION_UNAVAILABLE"),
+            "chain must still include the sentinel: {error:#}"
+        );
+    }
+
+    #[test]
+    fn leftover_native_mount_is_not_a_complete_rollback() {
+        let error = rollback_outcome(false, &["unmount: busy".to_owned()])
+            .expect_err("a live mount after rollback must fail");
+        assert!(error.to_string().contains("left the lease registered"));
+    }
 
     #[test]
     fn prepare_mountpoint_creates_an_empty_directory() {
