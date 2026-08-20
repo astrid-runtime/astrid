@@ -53,14 +53,10 @@ where
             ));
         }
         let file = path.file_name()?;
-        let entries = self.branches.list(&self.owner, self.branch)?;
-        let file_entry = entries
-            .iter()
-            .find(|entry| entry.name().as_str() == file.as_str());
-        let prefix = path.directory_prefix();
-        let directory = entries
-            .iter()
-            .any(|entry| entry.name().as_str().starts_with(&prefix));
+        let file_entry = self
+            .branches
+            .describe_name(&self.owner, self.branch, &file)?;
+        let directory = self.directory_exists(path)?;
         match (file_entry, directory) {
             (Some(_), true) => Err(FilesystemError::NamespaceConflict(path.clone()).into()),
             (Some(entry), false) => Ok(FilesystemEntry::new(
@@ -87,7 +83,13 @@ where
         }
         let prefix = path.directory_prefix();
         let mut children = BTreeMap::<String, FilesystemEntry>::new();
-        for entry in self.branches.list(&self.owner, self.branch)? {
+        let entries = if prefix.is_empty() {
+            self.branches.list(&self.owner, self.branch)?
+        } else {
+            self.branches
+                .list_prefix(&self.owner, self.branch, &prefix)?
+        };
+        for entry in entries {
             let name = entry.name().as_str();
             let Some(rest) = name.strip_prefix(&prefix) else {
                 continue;
@@ -276,7 +278,7 @@ where
                     return Err(FilesystemError::InvalidPath(to.as_str().to_owned()).into());
                 }
                 self.branches
-                    .list(&self.owner, self.branch)?
+                    .list_prefix(&self.owner, self.branch, &from_prefix)?
                     .into_iter()
                     .filter_map(|entry| {
                         let source = entry.name().clone();
@@ -308,12 +310,15 @@ where
         if path.as_str().is_empty() {
             return Ok(true);
         }
-        let prefix = path.directory_prefix();
-        Ok(self
+        if self
             .branches
-            .list(&self.owner, self.branch)?
-            .iter()
-            .any(|entry| entry.name().as_str().starts_with(&prefix)))
+            .describe_name(&self.owner, self.branch, &path.directory_marker()?)?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        self.branches
+            .prefix_exists(&self.owner, self.branch, &path.directory_prefix())
     }
 }
 

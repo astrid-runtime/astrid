@@ -205,6 +205,73 @@ fn lookup_and_mutation_are_bounded_by_the_key_bits() {
 }
 
 #[test]
+fn prefix_exists_does_not_load_every_prefixed_leaf() {
+    let identity = TestIdentity;
+    let mut entries = BTreeMap::new();
+    for index in 0..4096_u64 {
+        entries.insert(
+            ContentName::new(format!("workspace/{index:08x}")).unwrap(),
+            value((index % 251) as u8, index),
+        );
+    }
+    entries.insert(ContentName::new("other/file").unwrap(), value(7, 1));
+    let (root, objects) = build_catalog(&entries, &|record| identity.identify(record)).unwrap();
+    let root = root.unwrap();
+    let prefix = ContentName::new("workspace/").unwrap();
+    let load = |counter: &mut usize, object: ObjectId| {
+        *counter = counter.saturating_add(1);
+        objects
+            .get(&object)
+            .cloned()
+            .ok_or_else(|| invalid(object, "test object is missing"))
+    };
+
+    let mut list_loads = 0_usize;
+    let listed = list(Some(root), &mut |object| load(&mut list_loads, object)).unwrap();
+    assert_eq!(listed.len(), 4097);
+
+    let mut prefix_list_loads = 0_usize;
+    let prefixed = list_prefix(Some(root), &prefix, &mut |object| {
+        load(&mut prefix_list_loads, object)
+    })
+    .unwrap();
+    assert_eq!(prefixed.len(), 4096);
+
+    let mut exists_loads = 0_usize;
+    assert!(
+        prefix_exists(Some(root), &prefix, &mut |object| load(
+            &mut exists_loads,
+            object
+        ))
+        .unwrap()
+    );
+    let bound = prefix.as_str().len().saturating_add(1).saturating_mul(8);
+    assert!(
+        exists_loads <= bound,
+        "prefix_exists loaded {exists_loads} nodes, bound {bound}"
+    );
+    assert!(
+        exists_loads < list_loads,
+        "prefix_exists loaded {exists_loads}, list loaded {list_loads}"
+    );
+    assert!(
+        exists_loads < prefix_list_loads,
+        "prefix_exists loaded {exists_loads}, list_prefix loaded {prefix_list_loads}"
+    );
+
+    let missing = ContentName::new("missing/").unwrap();
+    let mut missing_loads = 0_usize;
+    assert!(
+        !prefix_exists(Some(root), &missing, &mut |object| load(
+            &mut missing_loads,
+            object
+        ))
+        .unwrap()
+    );
+    assert!(missing_loads <= bound);
+}
+
+#[test]
 fn deletion_matches_a_fresh_canonical_build() {
     let identity = TestIdentity;
     let mut entries = BTreeMap::from([

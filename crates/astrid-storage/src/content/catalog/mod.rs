@@ -10,5 +10,5 @@ pub(crate) use legacy::decode_catalog as decode_legacy_catalog;
 pub(crate) use legacy::{LegacyCatalog, encode_catalog as encode_legacy_catalog};
 pub(crate) use tree::{
     CatalogRoot, CatalogSummary, CatalogValidation, CatalogValue, build_catalog, delete, insert,
-    list, list_prefix, lookup, root_from_record, validate_catalog,
+    list, list_prefix, lookup, prefix_exists, root_from_record, validate_catalog,
 };

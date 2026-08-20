@@ -439,3 +439,20 @@ fn corrupt_record_checksum_cannot_hide_a_valid_successor() {
     assert!(error.to_string().contains("interior"), "{error}");
     assert!(error.to_string().contains("checksum"), "{error}");
 }
+
+#[test]
+fn read_region_at_copies_overlapping_extents_only() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let region = VolumeRegion::new("objects").unwrap();
+    let volume = HostedFileVolume::open(&path).unwrap();
+    volume.create_region(&region, true).unwrap();
+    for index in 0..256_u64 {
+        let byte = [u8::try_from(index % 251).unwrap()];
+        volume.write_region_at(&region, index, &byte).unwrap();
+    }
+    volume.sync().unwrap();
+    let mut bytes = [0_u8; 4];
+    assert_eq!(volume.read_region_at(&region, 10, &mut bytes).unwrap(), 4);
+    assert_eq!(&bytes, &[10, 11, 12, 13]);
+}

@@ -27,6 +27,8 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             validated_catalogs: Arc::new(Mutex::new(BTreeMap::new())),
             validated_kv: Arc::new(KvValidationCache::default()),
             read_leases: Arc::new(ContentReadLeaseRegistry::default()),
+            #[cfg(test)]
+            list_invocations: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -42,6 +44,8 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             validated_catalogs,
             validated_kv,
             read_leases: Arc::new(ContentReadLeaseRegistry::default()),
+            #[cfg(test)]
+            list_invocations: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -55,6 +59,8 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             validated_catalogs,
             validated_kv: Arc::new(KvValidationCache::default()),
             read_leases: Arc::new(ContentReadLeaseRegistry::default()),
+            #[cfg(test)]
+            list_invocations: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }

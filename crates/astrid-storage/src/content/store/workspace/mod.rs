@@ -49,6 +49,7 @@ use super::{
     build_catalog, delete, insert, list, lookup,
 };
 use crate::content::ContentName;
+use crate::content::catalog::{list_prefix, prefix_exists};
 use crate::engine::PrincipalProjectionError;
 use crate::filesystem::{FilesystemEntry, FilesystemEntryKind, FilesystemError, FilesystemPath};
 use crate::storage_model::{ModelError, ObjectClass, ObjectKind, ReferenceLabel};

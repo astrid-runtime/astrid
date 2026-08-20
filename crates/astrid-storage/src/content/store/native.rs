@@ -20,6 +20,8 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             ),
             validated_kv: Arc::new(crate::kv::KvValidationCache::default()),
             read_leases: Arc::new(super::ContentReadLeaseRegistry::default()),
+            #[cfg(test)]
+            list_invocations: std::sync::atomic::AtomicU64::new(0),
         }
     }
 

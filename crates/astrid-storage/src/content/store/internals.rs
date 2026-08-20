@@ -9,6 +9,7 @@ use super::{
     STATE_LABEL, invalid, lookup, owned_target, require_structural, root_from_record,
     validate_catalog, validated_projection_quota,
 };
+use crate::content::catalog::prefix_exists as catalog_prefix_exists;
 
 impl<P, E> PrincipalContentStore<P, E>
 where
@@ -301,6 +302,41 @@ where
             commit,
             records.into_iter().collect(),
         ))
+    }
+
+    /// Return whether any catalog name begins with `prefix`.
+    ///
+    /// This is the existence form of [`Self::list_prefix`]: it uses the same
+    /// Patricia skip, but stops at the first matching leaf so a parent-directory
+    /// check does not materialize every child.
+    ///
+    /// # Errors
+    ///
+    /// Returns a principal graph or projection error when the owner catalog
+    /// cannot be decoded.
+    pub fn prefix_exists(
+        &self,
+        principal: &P,
+        prefix: &str,
+    ) -> Result<bool, PrincipalContentError> {
+        if prefix.is_empty() {
+            let header = self.header(principal)?;
+            return Ok(header
+                .catalog
+                .is_some_and(|catalog| catalog.summary.entries > 0));
+        }
+        let prefix =
+            ContentName::new(prefix.to_owned()).map_err(PrincipalContentError::InvalidName)?;
+        let header = self.header(principal)?;
+        catalog_prefix_exists(header.catalog, &prefix, &mut |object| {
+            self.load_required_for(principal, object)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn list_invocations(&self) -> u64 {
+        self.list_invocations
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(super) fn catalog_lookup(

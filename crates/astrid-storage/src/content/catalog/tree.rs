@@ -238,6 +238,45 @@ pub(crate) fn list_prefix(
     Ok(entries)
 }
 
+/// Return whether any catalog name begins with `prefix` without materializing
+/// the matching leaves. The walk is the same Patricia skip as [`list_prefix`],
+/// but it stops at the first hit so parent-exists checks stay O(log N).
+pub(crate) fn prefix_exists(
+    root: Option<CatalogRoot>,
+    prefix: &ContentName,
+    load: &mut impl FnMut(ObjectId) -> Result<ObjectRecord, PrincipalContentError>,
+) -> Result<bool, PrincipalContentError> {
+    let Some(root) = root else {
+        return Ok(false);
+    };
+    let prefix_bits = u64::try_from(prefix.as_str().len())
+        .map_err(|_| PrincipalContentError::AccountingOverflow)?
+        .checked_mul(8)
+        .ok_or(PrincipalContentError::AccountingOverflow)?;
+    let mut stack = vec![root];
+    while let Some(current) = stack.pop() {
+        match decode_node(current.object, &load(current.object)?)? {
+            Node::Leaf { name, .. } => {
+                if name.as_str().starts_with(prefix.as_str()) {
+                    return Ok(true);
+                }
+            },
+            Node::Branch { bit, left, right } if bit < prefix_bits => {
+                if key_bit(prefix, bit)? {
+                    stack.push(right);
+                } else {
+                    stack.push(left);
+                }
+            },
+            Node::Branch { left, right, .. } => {
+                stack.push(right);
+                stack.push(left);
+            },
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn insert(
     root: Option<CatalogRoot>,
     name: &ContentName,

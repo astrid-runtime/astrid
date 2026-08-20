@@ -6,9 +6,11 @@
 //! implicit. Mutations publish through the same owner-root compare-and-swap as
 //! content and KV state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::Mutex;
 
 use crate::content::{ContentName, PrincipalContentError, PrincipalContentStore};
 use crate::engine::PrincipalProjectionEngine;
@@ -162,17 +164,31 @@ pub enum FilesystemError {
 }
 
 /// A typed-owner filesystem view over one Astrid content store.
-#[derive(Clone)]
 pub struct AstridFilesystem<P: Ord, E> {
     content: Arc<PrincipalContentStore<P, E>>,
     owner: P,
+    confirmed_directories: OnceLock<Mutex<HashSet<String>>>,
+}
+
+impl<P: Clone + Ord, E> Clone for AstridFilesystem<P, E> {
+    fn clone(&self) -> Self {
+        Self {
+            content: Arc::clone(&self.content),
+            owner: self.owner.clone(),
+            confirmed_directories: OnceLock::new(),
+        }
+    }
 }
 
 impl<P: Ord, E> AstridFilesystem<P, E> {
     /// Bind a filesystem view to one already-authorized owner.
     #[must_use]
     pub const fn new(content: Arc<PrincipalContentStore<P, E>>, owner: P) -> Self {
-        Self { content, owner }
+        Self {
+            content,
+            owner,
+            confirmed_directories: OnceLock::new(),
+        }
     }
 
     /// Bind the kernel-fixed Fleet shared subtree (`shared/`).
@@ -425,7 +441,12 @@ where
         }
         let prefix = path.directory_prefix();
         let mut children = BTreeMap::<String, FilesystemEntry>::new();
-        for entry in self.content.list(&self.owner)? {
+        let entries = if prefix.is_empty() {
+            self.content.list(&self.owner)?
+        } else {
+            self.content.list_prefix(&self.owner, &prefix)?
+        };
+        for entry in entries {
             let name = entry.name().as_str();
             let Some(rest) = name.strip_prefix(&prefix) else {
                 continue;
@@ -493,6 +514,7 @@ where
             return Err(FilesystemError::IsDirectory(path.clone()));
         }
         self.content.put(&self.owner, &path.file_name()?, bytes)?;
+        self.remember_directory(&path.parent());
         Ok(())
     }
 
@@ -516,6 +538,7 @@ where
         }
         self.content
             .put_streaming(&self.owner, &path.file_name()?, source)?;
+        self.remember_directory(&path.parent());
         Ok(())
     }
 
@@ -534,6 +557,7 @@ where
         }
         self.content
             .put(&self.owner, &path.directory_marker()?, &[])?;
+        self.remember_directory(path);
         Ok(())
     }
 
@@ -568,6 +592,7 @@ where
                 }
             },
         }
+        self.invalidate_directory_cache();
         Ok(())
     }
 
@@ -647,7 +672,7 @@ where
                     return Err(FilesystemError::InvalidPath(to.as_str().to_owned()));
                 }
                 self.content
-                    .list(&self.owner)?
+                    .list_prefix(&self.owner, &from_prefix)?
                     .into_iter()
                     .filter_map(|entry| {
                         let source = entry.name().clone();
@@ -664,6 +689,7 @@ where
         {
             return Err(FilesystemError::AlreadyExists(to.clone()));
         }
+        self.invalidate_directory_cache();
         Ok(())
     }
 
@@ -688,7 +714,10 @@ where
             FilesystemEntry {
                 kind: FilesystemEntryKind::Directory,
                 ..
-            } => Ok(()),
+            } => {
+                self.remember_directory(&parent);
+                Ok(())
+            },
             _ => Err(FilesystemError::NotDirectory(parent)),
         }
     }
@@ -705,12 +734,45 @@ where
         if path.as_str().is_empty() {
             return Ok(true);
         }
-        let prefix = path.directory_prefix();
-        Ok(self
+        if self.cached_directory(path) {
+            return Ok(true);
+        }
+        if self
             .content
-            .list(&self.owner)?
-            .iter()
-            .any(|entry| entry.name().as_str().starts_with(&prefix)))
+            .describe(&self.owner, &path.directory_marker()?)?
+            .is_some()
+        {
+            self.remember_directory(path);
+            return Ok(true);
+        }
+        let prefix = path.directory_prefix();
+        if self.content.prefix_exists(&self.owner, &prefix)? {
+            self.remember_directory(path);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn cached_directory(&self, path: &FilesystemPath) -> bool {
+        self.confirmed_directories
+            .get()
+            .is_some_and(|cache| cache.lock().contains(path.as_str()))
+    }
+
+    fn remember_directory(&self, path: &FilesystemPath) {
+        if path.as_str().is_empty() {
+            return;
+        }
+        self.confirmed_directories
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .insert(path.as_str().to_owned());
+    }
+
+    fn invalidate_directory_cache(&self) {
+        if let Some(cache) = self.confirmed_directories.get() {
+            cache.lock().clear();
+        }
     }
 }
 
@@ -730,197 +792,4 @@ fn joined(parent: &FilesystemPath, name: &str) -> Result<FilesystemPath, Filesys
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
-mod tests {
-    use std::sync::Arc;
-
-    use astrid_core::PrincipalUid;
-
-    use super::*;
-    use crate::{KvQuotaResolver, StateOwner, open_runtime_principal_store};
-
-    async fn filesystem() -> (
-        tempfile::TempDir,
-        AstridFilesystem<
-            StateOwner,
-            crate::engine::DurableEngine<
-                StateOwner,
-                crate::Blake3ObjectIdentityV1,
-                crate::StateOwnerCodecV2,
-            >,
-        >,
-    ) {
-        let directory = tempfile::tempdir().unwrap();
-        let home = astrid_core::dirs::AstridHome::from_path(directory.path());
-        home.ensure().unwrap();
-        let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
-            Ok(match owner {
-                StateOwner::System => None,
-                StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
-            })
-        });
-        let store = open_runtime_principal_store(&home, quota).await.unwrap();
-        let owner = StateOwner::Principal(PrincipalUid::from_bytes([7; 32]));
-        (directory, AstridFilesystem::new(store.content(), owner))
-    }
-
-    #[tokio::test]
-    async fn directories_are_namespace_entries_not_host_directories() {
-        let (directory, filesystem) = filesystem().await;
-        let projects = FilesystemPath::new("projects").unwrap();
-        let note = FilesystemPath::new("projects/note.txt").unwrap();
-
-        filesystem.create_dir(&projects).unwrap();
-        filesystem.write(&note, b"astrid").unwrap();
-
-        assert_eq!(
-            filesystem.read_dir(&FilesystemPath::root()).unwrap(),
-            vec![FilesystemEntry {
-                name: "projects".to_owned(),
-                kind: FilesystemEntryKind::Directory,
-                logical_bytes: 0,
-            }]
-        );
-        assert_eq!(filesystem.read(&note, 1, 4).unwrap(), b"stri");
-        assert!(!directory.path().join("projects").exists());
-    }
-
-    #[tokio::test]
-    async fn owner_views_are_isolated_over_one_physical_store() {
-        let (directory, first) = filesystem().await;
-        let home = astrid_core::dirs::AstridHome::from_path(directory.path());
-        let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
-            Ok(match owner {
-                StateOwner::System => None,
-                StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
-            })
-        });
-        drop(first);
-        let store = open_runtime_principal_store(&home, quota).await.unwrap();
-        let first = AstridFilesystem::new(
-            store.content(),
-            StateOwner::Principal(PrincipalUid::from_bytes([7; 32])),
-        );
-        let second = AstridFilesystem::new(
-            store.content(),
-            StateOwner::Principal(PrincipalUid::from_bytes([8; 32])),
-        );
-        let path = FilesystemPath::new("shared-name.txt").unwrap();
-
-        first.write(&path, b"first").unwrap();
-        second.write(&path, b"second").unwrap();
-
-        assert_eq!(first.read(&path, 0, 5).unwrap(), b"first");
-        assert_eq!(second.read(&path, 0, 6).unwrap(), b"second");
-    }
-
-    #[tokio::test]
-    async fn fleet_shared_view_cannot_escape_fixed_prefix() {
-        let (_directory, filesystem) = filesystem().await;
-        let shared = FilesystemPath::new("shared").unwrap();
-        let inside = FilesystemPath::new("shared/inside.txt").unwrap();
-        let outside = FilesystemPath::new("private.txt").unwrap();
-        filesystem.create_dir(&shared).unwrap();
-        filesystem.write(&inside, b"shared bytes").unwrap();
-        filesystem.write(&outside, b"private bytes").unwrap();
-
-        let scoped =
-            AstridFilesystem::new_fleet_shared(Arc::clone(&filesystem.content), filesystem.owner);
-        assert_eq!(
-            scoped.read_dir(&FilesystemPath::root()).unwrap()[0].name(),
-            "inside.txt"
-        );
-        assert_eq!(
-            scoped
-                .read(&FilesystemPath::new("inside.txt").unwrap(), 0, 12)
-                .unwrap(),
-            b"shared bytes"
-        );
-        assert!(matches!(
-            scoped.stat(&FilesystemPath::new("private.txt").unwrap()),
-            Err(FilesystemError::NotFound(_))
-        ));
-        assert!(matches!(
-            scoped.remove(&FilesystemPath::root()),
-            Err(FilesystemError::AlreadyExists(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn empty_directory_removal_is_explicit_and_non_recursive() {
-        let (_directory, filesystem) = filesystem().await;
-        let directory = FilesystemPath::new("dir").unwrap();
-        let child = FilesystemPath::new("dir/child").unwrap();
-        filesystem.create_dir(&directory).unwrap();
-        filesystem.write(&child, b"x").unwrap();
-
-        assert!(matches!(
-            filesystem.remove(&directory),
-            Err(FilesystemError::DirectoryNotEmpty(_))
-        ));
-        filesystem.remove(&child).unwrap();
-        filesystem.remove(&directory).unwrap();
-        assert!(matches!(
-            filesystem.stat(&directory),
-            Err(FilesystemError::NotFound(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn directory_rename_publishes_the_subtree_as_one_owner_transition() {
-        let (_directory, filesystem) = filesystem().await;
-        let from = FilesystemPath::new("from").unwrap();
-        let nested = FilesystemPath::new("from/nested").unwrap();
-        let file = FilesystemPath::new("from/nested/file").unwrap();
-        let to = FilesystemPath::new("to").unwrap();
-        filesystem.create_dir(&from).unwrap();
-        filesystem.create_dir(&nested).unwrap();
-        filesystem.write(&file, b"value").unwrap();
-
-        filesystem.rename(&from, &to).unwrap();
-
-        assert!(matches!(
-            filesystem.stat(&from),
-            Err(FilesystemError::NotFound(_))
-        ));
-        assert_eq!(
-            filesystem
-                .read(&FilesystemPath::new("to/nested/file").unwrap(), 0, 5)
-                .unwrap(),
-            b"value"
-        );
-    }
-
-    #[tokio::test]
-    async fn replace_rename_supports_atomic_editor_saves() {
-        let (_directory, filesystem) = filesystem().await;
-        let temporary = FilesystemPath::new("note.txt.tmp").unwrap();
-        let target = FilesystemPath::new("note.txt").unwrap();
-        filesystem.write(&target, b"old").unwrap();
-        filesystem.write(&temporary, b"new contents").unwrap();
-
-        filesystem.rename_replacing(&temporary, &target).unwrap();
-
-        assert_eq!(filesystem.read(&target, 0, 12).unwrap(), b"new contents");
-        assert!(matches!(
-            filesystem.stat(&temporary),
-            Err(FilesystemError::NotFound(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn directory_replace_requires_an_empty_compatible_destination() {
-        let (_directory, filesystem) = filesystem().await;
-        let source = FilesystemPath::new("source").unwrap();
-        let destination = FilesystemPath::new("destination").unwrap();
-        filesystem.create_dir(&source).unwrap();
-        filesystem.create_dir(&destination).unwrap();
-        filesystem
-            .write(&FilesystemPath::new("destination/occupied").unwrap(), b"x")
-            .unwrap();
-
-        assert!(matches!(
-            filesystem.rename_replacing(&source, &destination),
-            Err(FilesystemError::DirectoryNotEmpty(_))
-        ));
-    }
-}
+mod tests;

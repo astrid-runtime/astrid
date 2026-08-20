@@ -3,6 +3,8 @@ use std::fmt;
 use std::io::Read;
 use std::marker::PhantomData;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::content_dag::{
     BuiltContent, ChunkingProfile, ContentDescriptor, ContentError, ContentObjectSink,
@@ -67,6 +69,8 @@ pub struct PrincipalContentStore<P: Ord, E> {
     validated_catalogs: Arc<Mutex<BTreeMap<P, CatalogValidation>>>,
     validated_kv: Arc<KvValidationCache<P>>,
     read_leases: Arc<ContentReadLeaseRegistry<P>>,
+    #[cfg(test)]
+    list_invocations: AtomicU64,
 }
 
 impl<P: Ord, E> fmt::Debug for PrincipalContentStore<P, E> {
@@ -707,6 +711,8 @@ where
     /// Returns a principal-graph or projection error when the authoritative
     /// catalog cannot be decoded.
     pub fn list(&self, principal: &P) -> Result<Vec<ContentEntry>, PrincipalContentError> {
+        #[cfg(test)]
+        self.list_invocations.fetch_add(1, Ordering::Relaxed);
         let header = self.header(principal)?;
         list(header.catalog, &mut |object| {
             self.load_required_for(principal, object)
