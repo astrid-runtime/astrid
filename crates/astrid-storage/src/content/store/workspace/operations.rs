@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use astrid_core::PrincipalUid;
 
-use crate::content::{ContentEntry, ContentName};
+use crate::content::{ContentEntry, ContentName, PrincipalContentError};
 use crate::content_dag::{
     build_content, open_content, read_opened_content, read_opened_content_range,
 };
@@ -14,10 +14,10 @@ use crate::storage_model::{ModelError, ObjectReference};
 use super::{
     EngineIdentity, EngineSource, MAX_WORKSPACE_BRANCHES, WorkspaceBindingLifecycle,
     WorkspaceBranchBinding, WorkspaceBranchDescriptor, WorkspaceBranchError, WorkspaceBranchStore,
-    WorkspaceFilesystem, WorkspaceUid, list, lookup, make_branch_record,
-    make_branch_record_for_uid, make_promotion_receipt_for_uid, map_read_error,
-    parse_workspace_receipt_uid, parse_workspace_uid, selected_catalog, validate_target_prefix,
-    workspace_receipt_label, workspace_ref_label,
+    WorkspaceFilesystem, WorkspaceUid, list, list_prefix as catalog_list_prefix, lookup,
+    make_branch_record, make_branch_record_for_uid, make_promotion_receipt_for_uid, map_read_error,
+    parse_workspace_receipt_uid, parse_workspace_uid, prefix_exists as catalog_prefix_exists,
+    selected_catalog, validate_target_prefix, workspace_receipt_label, workspace_ref_label,
 };
 
 impl<P: Ord, E> WorkspaceBranchStore<P, E> {
@@ -438,6 +438,65 @@ where
         let header = self.content.header(owner)?;
         let branch = self.branch(owner, &header, id)?;
         list(branch.working, &mut |object| {
+            self.content.load_required_for(owner, object)
+        })
+        .map_err(Into::into)
+    }
+
+    /// Describe one named value in a branch without listing the catalog.
+    pub fn describe_name(
+        &self,
+        owner: &P,
+        id: WorkspaceUid,
+        name: &ContentName,
+    ) -> Result<Option<ContentEntry>, WorkspaceBranchError> {
+        let header = self.content.header(owner)?;
+        let branch = self.branch(owner, &header, id)?;
+        Ok(lookup(branch.working, name, &mut |object| {
+            self.content.load_required_for(owner, object)
+        })?
+        .map(|value| ContentEntry::new(name.clone(), value.file, value.logical_bytes)))
+    }
+
+    /// List names in a branch that begin with `prefix`.
+    pub fn list_prefix(
+        &self,
+        owner: &P,
+        id: WorkspaceUid,
+        prefix: &str,
+    ) -> Result<Vec<ContentEntry>, WorkspaceBranchError> {
+        if prefix.is_empty() {
+            return self.list(owner, id);
+        }
+        let prefix =
+            ContentName::new(prefix.to_owned()).map_err(PrincipalContentError::InvalidName)?;
+        let header = self.content.header(owner)?;
+        let branch = self.branch(owner, &header, id)?;
+        catalog_list_prefix(branch.working, &prefix, &mut |object| {
+            self.content.load_required_for(owner, object)
+        })
+        .map_err(Into::into)
+    }
+
+    /// Return whether any branch name begins with `prefix`.
+    pub fn prefix_exists(
+        &self,
+        owner: &P,
+        id: WorkspaceUid,
+        prefix: &str,
+    ) -> Result<bool, WorkspaceBranchError> {
+        if prefix.is_empty() {
+            let header = self.content.header(owner)?;
+            let branch = self.branch(owner, &header, id)?;
+            return Ok(branch
+                .working
+                .is_some_and(|catalog| catalog.summary.entries > 0));
+        }
+        let prefix =
+            ContentName::new(prefix.to_owned()).map_err(PrincipalContentError::InvalidName)?;
+        let header = self.content.header(owner)?;
+        let branch = self.branch(owner, &header, id)?;
+        catalog_prefix_exists(branch.working, &prefix, &mut |object| {
             self.content.load_required_for(owner, object)
         })
         .map_err(Into::into)

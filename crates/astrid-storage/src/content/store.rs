@@ -3,6 +3,8 @@ use std::fmt;
 use std::io::Read;
 use std::marker::PhantomData;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::content_dag::{
     BuiltContent, ChunkingProfile, ContentDescriptor, ContentError, ContentObjectSink,
@@ -65,8 +67,19 @@ pub struct PrincipalContentStore<P: Ord, E> {
     engine: Arc<E>,
     quota: Option<Arc<dyn KvQuotaResolver<P>>>,
     validated_catalogs: Arc<Mutex<BTreeMap<P, CatalogValidation>>>,
+    /// Last decoded header for the current principal root. One entry per
+    /// principal, replaced on catalog commit, never a second cache budget.
+    decoded_headers: Arc<Mutex<BTreeMap<P, Arc<ContentHeader>>>>,
     validated_kv: Arc<KvValidationCache<P>>,
     read_leases: Arc<ContentReadLeaseRegistry<P>>,
+    #[cfg(test)]
+    list_invocations: AtomicU64,
+    #[cfg(test)]
+    list_prefix_invocations: AtomicU64,
+    #[cfg(test)]
+    prefix_exists_invocations: AtomicU64,
+    #[cfg(test)]
+    decode_header_invocations: AtomicU64,
 }
 
 impl<P: Ord, E> fmt::Debug for PrincipalContentStore<P, E> {
@@ -163,16 +176,10 @@ where
                 preserved_commit,
             };
             let transaction =
-                self.encode_transaction(principal.clone(), header, None, catalog_records)?;
+                self.encode_transaction(principal.clone(), header.clone(), None, catalog_records)?;
             match self.engine.commit_root(transaction) {
-                Ok(_) => {
-                    self.validated_catalogs.lock().insert(
-                        principal.clone(),
-                        CatalogValidation {
-                            root: catalog.map(|root| root.object),
-                            summary: catalog.map_or(CatalogSummary::default(), |root| root.summary),
-                        },
-                    );
+                Ok(outcome) => {
+                    self.finish_catalog_commit(principal, header, outcome.root());
                     return Ok(true);
                 },
                 Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
@@ -346,18 +353,15 @@ where
             )?;
             header.catalog = mutation.root;
             self.enforce_quota(principal, &header)?;
-            let catalog = header.catalog;
-            let transaction =
-                self.encode_transaction(principal.clone(), header, built, mutation.records)?;
+            let transaction = self.encode_transaction(
+                principal.clone(),
+                header.clone(),
+                built,
+                mutation.records,
+            )?;
             match self.engine.commit_root(transaction) {
                 Ok(outcome) => {
-                    self.validated_catalogs.lock().insert(
-                        principal.clone(),
-                        CatalogValidation {
-                            root: catalog.map(|root| root.object),
-                            summary: catalog.map_or(CatalogSummary::default(), |root| root.summary),
-                        },
-                    );
+                    self.finish_catalog_commit(principal, header, outcome.root());
                     self.mark_verified(principal, verified);
                     let objects_inserted = staged_objects_inserted
                         .checked_add(outcome.objects_inserted())
@@ -415,17 +419,11 @@ where
             for (_, record) in mutation.records {
                 self.insert(&mut records, record)?;
             }
-            let catalog = header.catalog;
-            let transaction = self.encode_transaction(principal.clone(), header, None, records)?;
+            let transaction =
+                self.encode_transaction(principal.clone(), header.clone(), None, records)?;
             match self.engine.commit_root(transaction) {
                 Ok(outcome) => {
-                    self.validated_catalogs.lock().insert(
-                        principal.clone(),
-                        CatalogValidation {
-                            root: catalog.map(|root| root.object),
-                            summary: catalog.map_or(CatalogSummary::default(), |root| root.summary),
-                        },
-                    );
+                    self.finish_catalog_commit(principal, header, outcome.root());
                     self.mark_verified(principal, verified);
                     return Ok(ContentWriteOutcome::new(
                         descriptor,
@@ -461,18 +459,11 @@ where
                 return Ok(false);
             };
             header.catalog = mutation.root;
-            let catalog = header.catalog;
             let transaction =
-                self.encode_transaction(principal.clone(), header, None, mutation.records)?;
+                self.encode_transaction(principal.clone(), header.clone(), None, mutation.records)?;
             match self.engine.commit_root(transaction) {
-                Ok(_) => {
-                    self.validated_catalogs.lock().insert(
-                        principal.clone(),
-                        CatalogValidation {
-                            root: catalog.map(|root| root.object),
-                            summary: catalog.map_or(CatalogSummary::default(), |root| root.summary),
-                        },
-                    );
+                Ok(outcome) => {
+                    self.finish_catalog_commit(principal, header, outcome.root());
                     return Ok(true);
                 },
                 Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
@@ -549,17 +540,11 @@ where
             if !changed {
                 return Ok(false);
             }
-            let catalog = header.catalog;
-            let transaction = self.encode_transaction(principal.clone(), header, None, records)?;
+            let transaction =
+                self.encode_transaction(principal.clone(), header.clone(), None, records)?;
             match self.engine.commit_root(transaction) {
-                Ok(_) => {
-                    self.validated_catalogs.lock().insert(
-                        principal.clone(),
-                        CatalogValidation {
-                            root: catalog.map(|root| root.object),
-                            summary: catalog.map_or(CatalogSummary::default(), |root| root.summary),
-                        },
-                    );
+                Ok(outcome) => {
+                    self.finish_catalog_commit(principal, header, outcome.root());
                     return Ok(true);
                 },
                 Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
@@ -681,17 +666,11 @@ where
                 records.extend(mutation.records);
             }
             self.enforce_quota(principal, &header)?;
-            let catalog = header.catalog;
-            let transaction = self.encode_transaction(principal.clone(), header, None, records)?;
+            let transaction =
+                self.encode_transaction(principal.clone(), header.clone(), None, records)?;
             match self.engine.commit_root(transaction) {
-                Ok(_) => {
-                    self.validated_catalogs.lock().insert(
-                        principal.clone(),
-                        CatalogValidation {
-                            root: catalog.map(|root| root.object),
-                            summary: catalog.map_or(CatalogSummary::default(), |root| root.summary),
-                        },
-                    );
+                Ok(outcome) => {
+                    self.finish_catalog_commit(principal, header, outcome.root());
                     return Ok(true);
                 },
                 Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
@@ -707,6 +686,8 @@ where
     /// Returns a principal-graph or projection error when the authoritative
     /// catalog cannot be decoded.
     pub fn list(&self, principal: &P) -> Result<Vec<ContentEntry>, PrincipalContentError> {
+        #[cfg(test)]
+        self.list_invocations.fetch_add(1, Ordering::Relaxed);
         let header = self.header(principal)?;
         list(header.catalog, &mut |object| {
             self.load_required_for(principal, object)
@@ -729,6 +710,8 @@ where
         principal: &P,
         prefix: &str,
     ) -> Result<Vec<ContentEntry>, PrincipalContentError> {
+        #[cfg(test)]
+        self.list_prefix_invocations.fetch_add(1, Ordering::Relaxed);
         if prefix.is_empty() {
             return self.list(principal);
         }
@@ -920,31 +903,38 @@ where
     fn header(&self, principal: &P) -> Result<Arc<ContentHeader>, PrincipalContentError> {
         let root = self.engine.current_root(principal)?;
         if let Some(root) = root
+            && let Some(header) = self.decoded_headers.lock().get(principal).cloned()
+            && header.root == Some(root)
+        {
+            return Ok(header);
+        }
+        if let Some(root) = root
             && let Some(header) = self
                 .engine
                 .load_projection_cache(principal, root.commit, DECODED_HEADER_CACHE_KEY)
                 .and_then(|entry| entry.downcast::<ContentHeader>())
             && header.root == Some(root)
         {
+            self.decoded_headers
+                .lock()
+                .insert(principal.clone(), Arc::clone(&header));
             return Ok(header);
         }
         let header = self.decode_header(principal, root)?;
         let Some(root) = root else {
             return Ok(Arc::new(header));
         };
-        if self.engine.retain_projection_cache(
+        let header = Arc::new(header);
+        self.decoded_headers
+            .lock()
+            .insert(principal.clone(), Arc::clone(&header));
+        let _ = self.engine.retain_projection_cache(
             principal,
             root.commit,
             DECODED_HEADER_CACHE_KEY,
-            ProjectionCacheEntry::new(header.clone()),
-        ) && let Some(retained) = self
-            .engine
-            .load_projection_cache(principal, root.commit, DECODED_HEADER_CACHE_KEY)
-            .and_then(|entry| entry.downcast::<ContentHeader>())
-        {
-            return Ok(retained);
-        }
-        Ok(Arc::new(header))
+            ProjectionCacheEntry::new(header.as_ref().clone()),
+        );
+        Ok(header)
     }
 }
 

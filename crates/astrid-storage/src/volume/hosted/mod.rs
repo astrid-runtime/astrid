@@ -1,5 +1,7 @@
 //! Hosted single-container implementation of the Astrid volume contract.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
@@ -26,16 +28,33 @@ const COMMIT_REGION: &str = "system/volume-commit";
 const RECOVERY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_METADATA_PAYLOAD_BYTES: u64 = 2 * 1024 * 1024;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct Extent {
     logical_end: u64,
     physical_offset: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[cfg(test)]
+thread_local! {
+    static REGION_STATE_CLONES: Cell<usize> = const { Cell::new(0) };
+    static EXTENT_VISITS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[derive(Debug, Default)]
 struct RegionState {
     length: u64,
     extents: BTreeMap<u64, Extent>,
+}
+
+impl Clone for RegionState {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        REGION_STATE_CLONES.with(|count| count.set(count.get().saturating_add(1)));
+        Self {
+            length: self.length,
+            extents: self.extents.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -178,33 +197,31 @@ impl AstridVolume for HostedFileVolume {
         buffer: &mut [u8],
     ) -> io::Result<usize> {
         let mut state = self.state.lock();
-        let region_state = state
-            .regions
-            .get(region)
-            .cloned()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, region.as_str()))?;
+        let Some(region_state) = state.regions.get(region) else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, region.as_str()));
+        };
         if offset >= region_state.length || buffer.is_empty() {
             return Ok(0);
         }
         let available = region_state.length.saturating_sub(offset);
         let wanted = usize::try_from(available.min(buffer.len() as u64))
             .map_err(|_| io::Error::other("volume read length overflow"))?;
-        buffer[..wanted].fill(0);
         let read_end = offset
             .checked_add(wanted as u64)
             .ok_or_else(|| io::Error::other("volume read range overflow"))?;
-        for (start, extent) in region_state.extents.range(..read_end) {
-            if extent.logical_end <= offset {
-                continue;
-            }
-            let copy_start = (*start).max(offset);
+        // Copy only extents that overlap the requested range. Cloning the whole
+        // region map on every read made catalog lookups quadratic in extents.
+        let overlaps = overlapping_extents(region_state, offset, read_end);
+        buffer[..wanted].fill(0);
+        for (start, extent) in overlaps {
+            let copy_start = start.max(offset);
             let copy_end = extent.logical_end.min(read_end);
             if copy_start >= copy_end {
                 continue;
             }
             let physical = extent
                 .physical_offset
-                .checked_add(copy_start.saturating_sub(*start))
+                .checked_add(copy_start.saturating_sub(start))
                 .ok_or_else(|| io::Error::other("volume extent offset overflow"))?;
             let destination = usize::try_from(copy_start.saturating_sub(offset))
                 .map_err(|_| io::Error::other("volume destination offset overflow"))?;
@@ -275,11 +292,9 @@ impl AstridVolume for HostedFileVolume {
                 destination.as_str(),
             ));
         }
-        let source_state = state
-            .regions
-            .get(source)
-            .cloned()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, source.as_str()))?;
+        if !state.regions.contains_key(source) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, source.as_str()));
+        }
         Self::append(
             &mut state,
             Operation::Rename,
@@ -287,18 +302,19 @@ impl AstridVolume for HostedFileVolume {
             0,
             destination.as_str().as_bytes(),
         )?;
-        state.regions.remove(source);
+        let source_state = state
+            .regions
+            .remove(source)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, source.as_str()))?;
         state.regions.insert(destination.clone(), source_state);
         Ok(())
     }
 
     fn replace_region(&self, source: &VolumeRegion, destination: &VolumeRegion) -> io::Result<()> {
         let mut state = self.state.lock();
-        let source_state = state
-            .regions
-            .get(source)
-            .cloned()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, source.as_str()))?;
+        if !state.regions.contains_key(source) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, source.as_str()));
+        }
         if !state.regions.contains_key(destination) {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -312,7 +328,10 @@ impl AstridVolume for HostedFileVolume {
             0,
             destination.as_str().as_bytes(),
         )?;
-        state.regions.remove(source);
+        let source_state = state
+            .regions
+            .remove(source)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, source.as_str()))?;
         state.regions.insert(destination.clone(), source_state);
         Ok(())
     }
@@ -863,6 +882,28 @@ fn invalid_transition(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+fn overlapping_extents(
+    region_state: &RegionState,
+    offset: u64,
+    read_end: u64,
+) -> Vec<(u64, Extent)> {
+    let start_key = region_state
+        .extents
+        .range(..=offset)
+        .next_back()
+        .and_then(|(start, extent)| (extent.logical_end > offset).then_some(*start))
+        .unwrap_or(offset);
+    let mut overlaps = Vec::new();
+    for (start, extent) in region_state.extents.range(start_key..read_end) {
+        #[cfg(test)]
+        EXTENT_VISITS.with(|count| count.set(count.get().saturating_add(1)));
+        if extent.logical_end > offset {
+            overlaps.push((*start, *extent));
+        }
+    }
+    overlaps
+}
+
 fn overlay_extent(extents: &mut BTreeMap<u64, Extent>, start: u64, end: u64, physical_offset: u64) {
     if start >= end {
         return;
@@ -870,7 +911,7 @@ fn overlay_extent(extents: &mut BTreeMap<u64, Extent>, start: u64, end: u64, phy
     let overlapping = extents
         .range(..end)
         .filter(|(_, extent)| extent.logical_end > start)
-        .map(|(offset, extent)| (*offset, extent.clone()))
+        .map(|(offset, extent)| (*offset, *extent))
         .collect::<Vec<_>>();
     for (offset, extent) in overlapping {
         extents.remove(&offset);
@@ -908,7 +949,7 @@ fn truncate_extents(extents: &mut BTreeMap<u64, Extent>, length: u64) {
     let affected = extents
         .range(..)
         .filter(|(start, extent)| **start >= length || extent.logical_end > length)
-        .map(|(start, extent)| (*start, extent.clone()))
+        .map(|(start, extent)| (*start, *extent))
         .collect::<Vec<_>>();
     for (start, extent) in affected {
         extents.remove(&start);
