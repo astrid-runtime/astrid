@@ -20,9 +20,22 @@ where
     /// Returns a recovery error when authoritative reopen cannot complete.
     pub fn object_count(&self) -> Result<usize, DurableError> {
         let inner = self.lock_usable()?;
+        let overlay_only = inner
+            .pending_wal
+            .objects()
+            .filter(|(id, _)| {
+                !inner.index.contains_key(id)
+                    && !inner
+                        .representations
+                        .as_ref()
+                        .is_some_and(|store| store.contains_contiguous(**id))
+            })
+            .count();
         inner
             .index
             .len()
+            .checked_add(overlay_only)
+            .ok_or(DurableError::EncodingOverflow)?
             .checked_add(
                 inner
                     .representations
@@ -42,6 +55,9 @@ where
         loop {
             let (location, contiguous, generation) = {
                 let inner = self.lock_usable_with(&mut recovery)?;
+                if let Some(object) = inner.pending_wal.get_object(&id) {
+                    return Ok(Some(object.record().clone()));
+                }
                 let contiguous = match inner.representations.as_ref() {
                     Some(store) => store.open_contiguous_read(id)?,
                     None => None,

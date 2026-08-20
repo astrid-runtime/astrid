@@ -7,17 +7,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::File as NativeFile;
 #[cfg(test)]
 use std::fs::OpenOptions;
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::num::NonZeroU32;
+use std::io::{self, BufWriter, Seek, SeekFrom};
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 use std::time::Duration;
 
-use crate::volume::{AstridVolume, VolumeFile, VolumeMetadata, VolumeRegion};
+use crate::volume::{AstridVolume, VolumeRegion};
 
 use crate::content_dag::ContentError;
 use crate::storage_model::{
@@ -25,6 +24,7 @@ use crate::storage_model::{
     ObjectKind, ObjectRecord, ObjectReference, PhysicalModelError, PrincipalUsage, ReferenceKind,
     ReferenceLabel, RootGeneration, RootState,
 };
+use arc_swap::ArcSwap;
 use fs2::FileExt;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -36,6 +36,8 @@ const ARENA_FILE: &str = "objects.arena";
 const ROOT_FILE: &str = "roots.journal";
 const INDEX_FILE: &str = "objects.index";
 const LOCK_FILE: &str = "store.lock";
+const WAL_FILE: &str = "transactions.wal";
+const WAL_WRITE_BUFFER_BYTES: usize = 64 * 1024;
 const ARENA_MAGIC: [u8; 8] = *b"ASTOBJ1\0";
 const ROOT_MAGIC: [u8; 8] = *b"ASTROOT\0";
 const INDEX_MAGIC: [u8; 8] = *b"ASTIDX1\0";
@@ -149,6 +151,7 @@ pub struct DurableEnginePolicy<P> {
     group_commit: GroupCommitPolicy,
     recovery: RecoveryRetryPolicy,
     object_cache: ObjectCacheConfig<P>,
+    transaction_wal: TransactionWalPolicy,
 }
 
 impl<P> DurableEnginePolicy<P> {
@@ -163,7 +166,55 @@ impl<P> DurableEnginePolicy<P> {
             group_commit,
             recovery,
             object_cache,
+            transaction_wal: TransactionWalPolicy::disabled(),
         }
+    }
+
+    /// Select whether new root transactions publish through the single-sync
+    /// transaction WAL. Recovery always replays an existing WAL regardless of
+    /// this setting so disabling new WAL writes cannot hide durable state.
+    #[must_use]
+    pub const fn with_transaction_wal(mut self, policy: TransactionWalPolicy) -> Self {
+        self.transaction_wal = policy;
+        self
+    }
+}
+
+/// Publication policy for new durable root transactions.
+///
+/// This is an operating policy only. It does not change object identity,
+/// principal authority, quota accounting, or the canonical object/root
+/// formats produced after checkpointing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TransactionWalPolicy {
+    checkpoint_bytes: Option<NonZeroU64>,
+}
+
+impl TransactionWalPolicy {
+    /// Preserve the legacy ordered arena-sync then root-sync publication path.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            checkpoint_bytes: None,
+        }
+    }
+
+    /// Publish complete root transactions with one transaction-WAL sync,
+    /// then checkpoint prior committed contents once their physical length
+    /// reaches `checkpoint_bytes`.
+    #[must_use]
+    pub const fn enabled(checkpoint_bytes: NonZeroU64) -> Self {
+        Self {
+            checkpoint_bytes: Some(checkpoint_bytes),
+        }
+    }
+
+    pub(in crate::engine::durable) const fn is_enabled(self) -> bool {
+        self.checkpoint_bytes.is_some()
+    }
+
+    const fn checkpoint_bytes(self) -> Option<NonZeroU64> {
+        self.checkpoint_bytes
     }
 }
 
@@ -237,6 +288,65 @@ impl IdentityScheme {
 pub trait PersistentObjectIdentity: ObjectIdentity {
     /// Return the durable algorithm and construction-version tag.
     fn scheme(&self) -> IdentityScheme;
+}
+
+struct SharedPrincipalCodec<C>(Arc<C>);
+
+impl<C> Clone for SharedPrincipalCodec<C> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<C> SharedPrincipalCodec<C> {
+    fn new(codec: C) -> Self {
+        Self(Arc::new(codec))
+    }
+}
+
+impl<P, C> PrincipalCodec<P> for SharedPrincipalCodec<C>
+where
+    C: PrincipalCodec<P>,
+{
+    fn encode(&self, principal: &P) -> Vec<u8> {
+        self.0.encode(principal)
+    }
+
+    fn decode(&self, bytes: &[u8]) -> Option<P> {
+        self.0.decode(bytes)
+    }
+}
+
+struct SharedIdentity<I>(Arc<I>);
+
+impl<I> Clone for SharedIdentity<I> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<I> SharedIdentity<I> {
+    fn new(identity: I) -> Self {
+        Self(Arc::new(identity))
+    }
+}
+
+impl<I> ObjectIdentity for SharedIdentity<I>
+where
+    I: ObjectIdentity,
+{
+    fn identify(&self, record: &ObjectRecord) -> ObjectId {
+        self.0.identify(record)
+    }
+}
+
+impl<I> PersistentObjectIdentity for SharedIdentity<I>
+where
+    I: PersistentObjectIdentity,
+{
+    fn scheme(&self) -> IdentityScheme {
+        self.0.scheme()
+    }
 }
 
 /// Failure to open, recover, or update a durable principal store.
@@ -432,6 +542,7 @@ struct ArenaLocation {
 struct DurableInner<P: Ord> {
     roots_by_principal: BTreeMap<P, RootState>,
     index: BTreeMap<ObjectId, ArenaLocation>,
+    pending_wal: wal::PendingWalOverlay<P>,
     pending_index_locations: Vec<(ObjectId, ArenaLocation)>,
     pending_direct_objects: BTreeMap<ObjectId, representations::DirectArenaObject>,
     validated: BTreeSet<ObjectId>,
@@ -457,6 +568,62 @@ struct ArenaReader {
     generation: u64,
 }
 
+struct PublishedRoot {
+    value: ArcSwap<RootState>,
+}
+
+impl PublishedRoot {
+    fn new(value: RootState) -> Self {
+        Self {
+            value: ArcSwap::from_pointee(value),
+        }
+    }
+}
+
+struct PublishedRoots<P: Ord> {
+    entries: ArcSwap<BTreeMap<P, Arc<PublishedRoot>>>,
+}
+
+impl<P> PublishedRoots<P>
+where
+    P: Clone + Ord,
+{
+    fn new(roots: &BTreeMap<P, RootState>) -> Self {
+        Self {
+            entries: ArcSwap::from_pointee(Self::entries(roots)),
+        }
+    }
+
+    fn entries(roots: &BTreeMap<P, RootState>) -> BTreeMap<P, Arc<PublishedRoot>> {
+        roots
+            .iter()
+            .map(|(principal, root)| (principal.clone(), Arc::new(PublishedRoot::new(*root))))
+            .collect()
+    }
+
+    fn get(&self, principal: &P) -> Option<RootState> {
+        self.entries
+            .load()
+            .get(principal)
+            .map(|root| **root.value.load())
+    }
+
+    fn publish(&self, principal: &P, root: RootState) {
+        let current = self.entries.load();
+        if let Some(published) = current.get(principal) {
+            published.value.store(Arc::new(root));
+            return;
+        }
+        let mut next = (**current).clone();
+        next.insert(principal.clone(), Arc::new(PublishedRoot::new(root)));
+        self.entries.store(Arc::new(next));
+    }
+
+    fn replace(&self, roots: &BTreeMap<P, RootState>) {
+        self.entries.store(Arc::new(Self::entries(roots)));
+    }
+}
+
 #[derive(Debug)]
 struct RecoveredStore<P: Ord> {
     roots_by_principal: BTreeMap<P, RootState>,
@@ -472,7 +639,10 @@ struct EngineOpenOptions<P> {
     faults: Arc<dyn FaultInjector>,
 }
 
-/// Host-file durable principal-store engine.
+type DurableWal<P, I, C> =
+    wal::WalWriter<BufWriter<File>, SharedIdentity<I>, SharedPrincipalCodec<C>, P>;
+
+/// Durable principal-store engine over host files or an Astrid volume.
 ///
 /// `P` remains a domain-bearing integration type. `I` computes logical object
 /// identity, while `C` owns the canonical persistent representation of `P`.
@@ -481,18 +651,21 @@ pub struct DurableEngine<P: Ord, I, C> {
     directory: Option<PathBuf>,
     directory_capability: Option<Arc<cap_std::fs::Dir>>,
     volume: RwLock<Option<Arc<dyn AstridVolume>>>,
-    identity: I,
-    principal_codec: C,
+    identity: SharedIdentity<I>,
+    principal_codec: SharedPrincipalCodec<C>,
     limits: RecoveryLimits,
     faults: Arc<dyn FaultInjector>,
     group_policy: GroupCommitPolicy,
     commit_group: Mutex<CommitGroup<P>>,
+    transaction_wal: TransactionWalPolicy,
+    wal: Mutex<Option<DurableWal<P, I, C>>>,
     lifecycle: AtomicU8,
     arena_reader: RwLock<Option<ArenaReader>>,
     object_cache: ObjectCache<P>,
     recovery_policy: RecoveryRetryPolicy,
     preparation_authority: Arc<()>,
     inner: Mutex<DurableInner<P>>,
+    published_roots: PublishedRoots<P>,
 }
 
 impl<P: Ord, I, C> fmt::Debug for DurableEngine<P, I, C> {
@@ -529,193 +702,8 @@ impl<P: Ord, I, C> Drop for DurableEngine<P, I, C> {
     }
 }
 
-#[derive(Debug)]
-enum StoreLock {
-    Native(NativeFile),
-    Volume,
-}
-
-/// Byte-stream handle used by the durable engine.
-///
-/// Native files remain available for legacy import and format tests. Runtime
-/// layout two opens the same engine over [`VolumeFile`], so object and root
-/// authority no longer depends on a host directory namespace.
-#[derive(Debug)]
-enum File {
-    Native(NativeFile),
-    Volume(VolumeFile),
-}
-
-/// Common random-access durable byte stream used by both legacy host files and
-/// Astrid volume regions.
-///
-/// Keeping framing generic over this interface is important: the frozen store
-/// format is independent of whichever media provider owns the bytes.
-trait DurableIo: Read + Write + Seek {
-    fn durable_metadata(&self) -> io::Result<StoreMetadata>;
-    fn durable_set_len(&self, length: u64) -> io::Result<()>;
-    fn durable_sync_data(&self) -> io::Result<()>;
-    fn durable_read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize>;
-}
-
-impl File {
-    fn native(file: NativeFile) -> Self {
-        Self::Native(file)
-    }
-
-    fn volume(
-        volume: Arc<dyn AstridVolume>,
-        name: &str,
-        create: bool,
-    ) -> Result<Self, DurableError> {
-        let region =
-            VolumeRegion::new(name).map_err(|source| io_error("validate volume region", source))?;
-        VolumeFile::open(volume, region, create)
-            .map(Self::Volume)
-            .map_err(|source| io_error("open volume region", source))
-    }
-
-    fn try_clone(&self) -> io::Result<Self> {
-        match self {
-            Self::Native(file) => file.try_clone().map(Self::Native),
-            Self::Volume(file) => file.try_clone().map(Self::Volume),
-        }
-    }
-
-    fn sync_data(&self) -> io::Result<()> {
-        match self {
-            Self::Native(file) => file.sync_data(),
-            Self::Volume(file) => file.sync_data(),
-        }
-    }
-
-    fn set_len(&self, length: u64) -> io::Result<()> {
-        match self {
-            Self::Native(file) => file.set_len(length),
-            Self::Volume(file) => file.set_len(length),
-        }
-    }
-
-    fn metadata(&self) -> io::Result<StoreMetadata> {
-        match self {
-            Self::Native(file) => file.metadata().map(StoreMetadata::Native),
-            Self::Volume(file) => file.metadata().map(StoreMetadata::Volume),
-        }
-    }
-
-    fn read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
-        match self {
-            #[cfg(unix)]
-            Self::Native(file) => std::os::unix::fs::FileExt::read_at(file, buffer, offset),
-            #[cfg(windows)]
-            Self::Native(file) => std::os::windows::fs::FileExt::seek_read(file, buffer, offset),
-            #[cfg(not(any(unix, windows)))]
-            Self::Native(file) => {
-                let mut reader = file.try_clone()?;
-                reader.seek(SeekFrom::Start(offset))?;
-                reader.read(buffer)
-            },
-            Self::Volume(file) => file.read_at(buffer, offset),
-        }
-    }
-}
-
-impl std::io::Read for File {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::Native(file) => file.read(buffer),
-            Self::Volume(file) => file.read(buffer),
-        }
-    }
-}
-
-impl std::io::Write for File {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        match self {
-            Self::Native(file) => file.write(bytes),
-            Self::Volume(file) => file.write(bytes),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Self::Native(file) => file.flush(),
-            Self::Volume(file) => file.flush(),
-        }
-    }
-}
-
-impl std::io::Seek for File {
-    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
-        match self {
-            Self::Native(file) => file.seek(position),
-            Self::Volume(file) => file.seek(position),
-        }
-    }
-}
-
-impl DurableIo for File {
-    fn durable_metadata(&self) -> io::Result<StoreMetadata> {
-        self.metadata()
-    }
-
-    fn durable_set_len(&self, length: u64) -> io::Result<()> {
-        self.set_len(length)
-    }
-
-    fn durable_sync_data(&self) -> io::Result<()> {
-        self.sync_data()
-    }
-
-    fn durable_read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
-        self.read_at(buffer, offset)
-    }
-}
-
-impl DurableIo for NativeFile {
-    fn durable_metadata(&self) -> io::Result<StoreMetadata> {
-        self.metadata().map(StoreMetadata::Native)
-    }
-
-    fn durable_set_len(&self, length: u64) -> io::Result<()> {
-        self.set_len(length)
-    }
-
-    fn durable_sync_data(&self) -> io::Result<()> {
-        self.sync_data()
-    }
-
-    fn durable_read_at(&self, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::FileExt::read_at(self, buffer, offset)
-        }
-        #[cfg(windows)]
-        {
-            std::os::windows::fs::FileExt::seek_read(self, buffer, offset)
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let mut reader = self.try_clone()?;
-            reader.seek(SeekFrom::Start(offset))?;
-            reader.read(buffer)
-        }
-    }
-}
-
-enum StoreMetadata {
-    Native(std::fs::Metadata),
-    Volume(VolumeMetadata),
-}
-
-impl StoreMetadata {
-    fn len(&self) -> u64 {
-        match self {
-            Self::Native(metadata) => metadata.len(),
-            Self::Volume(metadata) => metadata.len(),
-        }
-    }
-}
+mod media;
+pub(in crate::engine::durable) use media::{DurableIo, File, StoreLock};
 
 #[derive(Debug)]
 struct Persisted {
@@ -726,6 +714,7 @@ struct Persisted {
 #[derive(Debug)]
 struct Prepared<P: Ord> {
     principal: P,
+    expected: Option<RootState>,
     root: RootState,
     objects_inserted: u64,
     objects: Vec<(ObjectId, Arc<[u8]>)>,
@@ -816,6 +805,7 @@ mod representations;
 mod restore;
 mod roots;
 mod validation;
+mod wal;
 
 use crate::engine::{ProjectionCacheEntry, ProjectionCacheKey};
 use cache::ObjectCache;
@@ -844,7 +834,7 @@ use native_io::{
     open_rw as open_rw_capability, sync_directory as sync_store_directory_capability,
 };
 use recovery::{RecoveryScope, recover_store, recover_volume};
-use roots::{encode_root_record, encode_root_snapshot, recover_roots};
+use roots::{encode_root_record, encode_root_snapshot, recover_root_history, recover_roots};
 use validation::{
     ClosureObjects, materialize_closure, recovery_closure_error, usage_from_closure,
     validate_commit_closure, validate_incremental_closure,

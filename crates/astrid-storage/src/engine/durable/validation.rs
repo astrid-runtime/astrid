@@ -4,24 +4,29 @@ use crate::storage_model::{ModelError, ObjectId, ObjectKind, ObjectRecord, Princ
 
 use super::format::read_indexed_object;
 use super::representations::{RepresentationStore, read_contiguous_object};
+use super::wal::PendingWalOverlay;
 use super::{
     ArenaLocation, BTreeMap, BTreeSet, DurableError, File, PersistentObjectIdentity, ROOT_FILE,
     RecoveryLimits,
 };
 
-pub(super) struct ClosureObjects<'a, I> {
+pub(super) struct ClosureObjects<'a, I, P: Ord> {
     pub(super) arena: &'a mut File,
     pub(super) index: &'a BTreeMap<ObjectId, ArenaLocation>,
     pub(super) incoming: &'a BTreeMap<ObjectId, ObjectRecord>,
+    pub(super) pending: Option<&'a PendingWalOverlay<P>>,
     pub(super) representations: Option<&'a RepresentationStore>,
     pub(super) identity: &'a I,
     pub(super) limits: RecoveryLimits,
 }
 
-impl<I: PersistentObjectIdentity> ClosureObjects<'_, I> {
+impl<I: PersistentObjectIdentity, P: Ord> ClosureObjects<'_, I, P> {
     fn load(&mut self, id: ObjectId) -> Result<ObjectRecord, DurableError> {
         if let Some(record) = self.incoming.get(&id) {
             return Ok(record.clone());
+        }
+        if let Some(record) = self.pending.and_then(|pending| pending.get_object(&id)) {
+            return Ok(record.record().clone());
         }
         if let Some(location) = self.index.get(&id).copied() {
             return read_indexed_object(self.arena, id, location, self.identity, self.limits);
@@ -38,8 +43,8 @@ impl<I: PersistentObjectIdentity> ClosureObjects<'_, I> {
     }
 }
 
-pub(super) fn materialize_closure<I: PersistentObjectIdentity>(
-    source: &mut ClosureObjects<'_, I>,
+pub(super) fn materialize_closure<I: PersistentObjectIdentity, P: Ord>(
+    source: &mut ClosureObjects<'_, I, P>,
     root: ObjectId,
 ) -> Result<Vec<(ObjectId, ObjectRecord)>, DurableError> {
     let mut records = BTreeMap::new();
@@ -77,8 +82,8 @@ pub(super) fn validate_commit_closure(
     Ok(())
 }
 
-pub(super) fn validate_incremental_closure<I: PersistentObjectIdentity>(
-    source: &mut ClosureObjects<'_, I>,
+pub(super) fn validate_incremental_closure<I: PersistentObjectIdentity, P: Ord>(
+    source: &mut ClosureObjects<'_, I, P>,
     validated: &BTreeSet<ObjectId>,
     root: ObjectId,
 ) -> Result<BTreeSet<ObjectId>, DurableError> {

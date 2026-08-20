@@ -1,9 +1,11 @@
 //! Explicit flush and close lifecycle for the durable engine.
 
+use super::wal::durable_error as wal_durable_error;
 use super::{
-    DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN, FRAME_HEADER_LEN_USIZE, File,
-    IndexState, LIFECYCLE_CLOSED, PersistentObjectIdentity, PrincipalCodec, StoreLock, io_error,
-    live_files_mut, replace_index, replace_volume_index,
+    ARENA_MAGIC, DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN,
+    FRAME_HEADER_LEN_USIZE, File, IndexState, LIFECYCLE_CLOSED, PersistentObjectIdentity,
+    PrincipalCodec, ROOT_MAGIC, StoreLock, append_frames, io_error, live_files_mut,
+    read_indexed_object_with_payload, replace_index, replace_volume_index,
 };
 
 impl<P, I, C> DurableEngine<P, I, C>
@@ -58,6 +60,7 @@ where
         if result.is_ok() && inner.files.is_some() {
             self.checkpoint_index(&mut inner);
         }
+        drop(self.wal.lock().take());
         drop(inner.representations.take());
         drop(inner.files.take());
         drop(self.arena_reader.write().take());
@@ -74,6 +77,9 @@ where
     }
 
     fn flush_authority(&self, inner: &mut DurableInner<P>) -> Result<(), DurableError> {
+        if self.transaction_wal.is_enabled() {
+            return self.checkpoint_transaction_wal(inner);
+        }
         let representation_update = self.append_pending_direct_update(inner, &[])?;
         let DurableInner {
             files,
@@ -95,6 +101,105 @@ where
             .roots
             .sync_data()
             .map_err(|source| io_error("flush root journal", source))
+    }
+
+    pub(in crate::engine::durable) fn checkpoint_transaction_wal(
+        &self,
+        inner: &mut DurableInner<P>,
+    ) -> Result<(), DurableError> {
+        let result = (|| {
+            self.fold_pending_wal(inner)?;
+            let mut wal = self.wal.lock();
+            if let Some(writer) = wal.as_mut() {
+                writer.checkpoint().map_err(wal_durable_error)?;
+            }
+            self.checkpoint_index(inner);
+            Ok(())
+        })();
+        if result.is_err() {
+            self.mark_requires_recovery(inner);
+        }
+        result
+    }
+
+    fn fold_pending_wal(&self, inner: &mut DurableInner<P>) -> Result<(), DurableError> {
+        let pending = inner.pending_wal.take();
+        let mut new_ids = Vec::new();
+        let mut new_payloads = Vec::new();
+        {
+            let files = live_files_mut(&mut inner.files)?;
+            for (id, object) in pending.objects() {
+                if object.location().is_some() {
+                    continue;
+                }
+                if let Some(location) = inner.index.get(id).copied() {
+                    let (_, payload) = read_indexed_object_with_payload(
+                        &files.arena,
+                        *id,
+                        location,
+                        &self.identity,
+                        self.limits,
+                    )?;
+                    if payload.as_slice() != object.payload() {
+                        return Err(crate::storage_model::ModelError::ObjectCollision(*id).into());
+                    }
+                    continue;
+                }
+                new_ids.push(*id);
+                new_payloads.push(object.payload());
+            }
+            if !new_payloads.is_empty() {
+                let appended = append_frames(&mut files.arena, ARENA_MAGIC, &new_payloads)?;
+                if appended.len() != new_ids.len() {
+                    return Err(DurableError::Corrupt {
+                        file: super::ARENA_FILE,
+                        offset: 0,
+                        detail: "WAL overlay fold returned the wrong object count",
+                    });
+                }
+                for (id, location) in new_ids.iter().copied().zip(appended) {
+                    inner.index.insert(id, location);
+                    inner.pending_index_locations.push((id, location));
+                }
+            }
+            let journals = pending
+                .roots()
+                .iter()
+                .map(super::wal::PendingWalRoot::journal)
+                .collect::<Vec<_>>();
+            if !journals.is_empty() {
+                append_frames(&mut files.roots, ROOT_MAGIC, &journals)?;
+            }
+        }
+
+        let staged_direct = pending
+            .objects()
+            .filter_map(|(_, object)| object.direct().cloned())
+            .collect::<Vec<_>>();
+        let representation_update = self.append_pending_direct_update(inner, &staged_direct)?;
+        {
+            let DurableInner {
+                files,
+                representations,
+                ..
+            } = inner;
+            let files = live_files_mut(files)?;
+            files
+                .arena
+                .sync_data()
+                .map_err(|source| io_error("flush WAL checkpoint object arena", source))?;
+            if let Some(representations) = representations {
+                if let Some(update) = representation_update {
+                    representations.publish_direct_update(update)?;
+                }
+                representations.flush()?;
+            }
+            files
+                .roots
+                .sync_data()
+                .map_err(|source| io_error("flush WAL checkpoint root journal", source))?;
+        }
+        Ok(())
     }
 
     fn checkpoint_index(&self, inner: &mut DurableInner<P>) {

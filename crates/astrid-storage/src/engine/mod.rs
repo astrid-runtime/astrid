@@ -43,12 +43,12 @@ pub use durable::{
     FaultInjector, FaultPoint, GroupCommitPolicy, IdentityScheme, NoFaults, ObjectCacheCapacity,
     ObjectCacheConfig, ObjectCacheController, ObjectCacheMemoryBudget, ObjectCacheStats,
     PersistentObjectIdentity, PreparedContiguousFile, PrincipalCodec, PrincipalObjectCacheBudget,
-    PublishedContiguousFile, RecoveryLimits, RecoveryRetryPolicy, VerifiedCompactionPlan,
-    deterministic_compaction_proof,
+    PublishedContiguousFile, RecoveryLimits, RecoveryRetryPolicy, TransactionWalPolicy,
+    VerifiedCompactionPlan, deterministic_compaction_proof,
 };
 pub use kv::{
-    KvProjectionEngine, KvProjectionError, KvState, KvStateSnapshot, commit_kv_with_engine,
-    kv_snapshot_with_engine,
+    KvProjectionEngine, KvProjectionError, KvState, KvStateSnapshot, ReadyKvRoot,
+    commit_kv_with_engine, kv_snapshot_with_engine,
 };
 pub use muninn::{
     InMemoryMuninnIndex, MuninnAdmission, MuninnHit, MuninnTrustState, MuninnVerificationError,

@@ -9,6 +9,7 @@ use super::{
     read_indexed_objects, usage_from_closure, validate_incremental_closure,
 };
 use crate::engine::{ProjectionObserver, ProjectionPhase};
+use crate::storage_model::ObjectIdentity;
 
 impl<P, I, C> DurableEngine<P, I, C>
 where
@@ -82,18 +83,39 @@ where
             if let Some(record) = self.object_cache.get(principal, id) {
                 return Ok(Some(record));
             }
-            let (location, contiguous, generation) = {
+            let (pending, location, contiguous, generation) = {
                 let inner = self.lock_usable_with(&mut recovery)?;
-                let contiguous = match inner.representations.as_ref() {
-                    Some(store) => store.open_contiguous_read(id)?,
-                    None => None,
+                let pending = inner
+                    .pending_wal
+                    .get_object(&id)
+                    .map(|object| Arc::new(object.record().clone()));
+                let contiguous = if pending.is_none() {
+                    match inner.representations.as_ref() {
+                        Some(store) => store.open_contiguous_read(id)?,
+                        None => None,
+                    }
+                } else {
+                    None
                 };
                 (
+                    pending,
                     inner.index.get(&id).copied(),
                     contiguous,
                     inner.arena_generation,
                 )
             };
+            if let Some(record) = pending {
+                if let Some(record) = self.retain_loaded_object_if_current_with(
+                    principal,
+                    id,
+                    generation,
+                    record.as_ref().clone(),
+                    &mut recovery,
+                )? {
+                    return Ok(Some(record));
+                }
+                continue;
+            }
             if location.is_none()
                 && let Some((file, location)) = contiguous
             {
@@ -561,6 +583,15 @@ where
         Ok(inner.roots_by_principal.get(principal).copied())
     }
 
+    pub(crate) fn root_if_ready(&self, principal: &P) -> Option<crate::engine::ReadyKvRoot> {
+        if self.lifecycle.load(std::sync::atomic::Ordering::Acquire) != LIFECYCLE_USABLE {
+            return None;
+        }
+        Some(crate::engine::ReadyKvRoot::new(
+            self.published_roots.get(principal),
+        ))
+    }
+
     /// Return a consistent copy of every current principal root.
     ///
     /// This is a privileged maintenance surface for ordered store migrations,
@@ -593,6 +624,7 @@ where
             files,
             index,
             representations,
+            pending_wal,
             ..
         } = &mut *inner;
         let files = live_files_mut(files)?;
@@ -601,6 +633,7 @@ where
                 arena: &mut files.arena,
                 index,
                 incoming: &BTreeMap::new(),
+                pending: Some(pending_wal),
                 representations: representations.as_ref(),
                 identity: &self.identity,
                 limits: self.limits,
@@ -627,6 +660,7 @@ where
             files,
             index,
             representations,
+            pending_wal,
             ..
         } = &mut *inner;
         let files = live_files_mut(files)?;
@@ -635,6 +669,7 @@ where
                 arena: &mut files.arena,
                 index,
                 incoming: &BTreeMap::new(),
+                pending: Some(pending_wal),
                 representations: representations.as_ref(),
                 identity: &self.identity,
                 limits: self.limits,
@@ -712,6 +747,12 @@ where
             if !reachable.contains(&id) {
                 continue;
             }
+            if let Some(existing) = inner.pending_wal.get_object(&id) {
+                if existing.record() != &record {
+                    return Err(ModelError::ObjectCollision(id).into());
+                }
+                continue;
+            }
             if let Some(location) = inner.index.get(&id).copied() {
                 let files = live_files_mut(&mut inner.files)?;
                 let existing =
@@ -736,6 +777,7 @@ where
 
         Ok(Prepared {
             principal,
+            expected,
             root,
             objects_inserted: u64::try_from(objects.len())
                 .map_err(|_| ModelError::ArithmeticOverflow)?
@@ -754,6 +796,7 @@ where
         incoming: &BTreeMap<ObjectId, ObjectRecord>,
         commit: ObjectId,
     ) -> Result<BTreeSet<ObjectId>, DurableError> {
+        let pending_wal = &inner.pending_wal;
         let DurableInner {
             files,
             index,
@@ -767,6 +810,7 @@ where
                 arena: &mut files.arena,
                 index,
                 incoming,
+                pending: Some(pending_wal),
                 representations: representations.as_ref(),
                 identity: &self.identity,
                 limits: self.limits,

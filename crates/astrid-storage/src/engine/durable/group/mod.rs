@@ -18,6 +18,8 @@ use super::{
 };
 use crate::engine::{ProjectionObserver, ProjectionPhase};
 
+mod wal;
+
 const DEFAULT_INITIAL_DELAY: Duration = Duration::from_micros(250);
 const DEFAULT_BUSY_EXTENSION: Duration = Duration::from_micros(250);
 
@@ -373,6 +375,11 @@ where
         let mut accepted = Vec::new();
         let mut pending_roots = BTreeMap::new();
         let mut pending_frames = BTreeMap::<ObjectId, Arc<[u8]>>::new();
+        Self::seed_pending_wal_frames(
+            self.transaction_wal.is_enabled(),
+            &inner,
+            &mut pending_frames,
+        );
         for request in batch {
             match self.prepare(
                 &mut inner,
@@ -414,13 +421,16 @@ where
                         inner.index.insert(location.0, location.1);
                         inner.pending_index_locations.push(location);
                     }
-                    debug_assert_eq!(
-                        previous_arena_len,
+                    debug_assert!(
                         live_files_mut(&mut inner.files)
-                            .map_or(previous_arena_len, |files| files.arena_len)
+                            .map_or(true, |files| files.arena_len >= previous_arena_len)
                     );
-                    if let Err(error) = self.advance_index_frontier(&mut inner, persisted.arena_len)
-                    {
+                    let frontier = if self.transaction_wal.is_enabled() {
+                        Self::advance_wal_arena_frontier(&mut inner, persisted.arena_len)
+                    } else {
+                        self.advance_index_frontier(&mut inner, persisted.arena_len)
+                    };
+                    if let Err(error) = frontier {
                         self.mark_requires_recovery(&mut inner);
                         complete_failed_group(&mut completions, accepted, error);
                     } else {
@@ -432,6 +442,8 @@ where
                                 accepted.prepared.principal.clone(),
                                 accepted.prepared.root,
                             );
+                            self.published_roots
+                                .publish(&accepted.prepared.principal, accepted.prepared.root);
                             completions.push((
                                 accepted.receipt,
                                 Ok(CommitOutcome {
@@ -455,6 +467,19 @@ where
     }
 
     fn persist_group(
+        &self,
+        inner: &mut DurableInner<P>,
+        accepted: &[AcceptedCommit<P>],
+    ) -> Result<Persisted, DurableError> {
+        if self.transaction_wal.is_enabled() {
+            self.maybe_checkpoint_transaction_wal(inner)?;
+            self.persist_group_wal(inner, accepted)
+        } else {
+            self.persist_group_legacy(inner, accepted)
+        }
+    }
+
+    fn persist_group_legacy(
         &self,
         inner: &mut DurableInner<P>,
         accepted: &[AcceptedCommit<P>],

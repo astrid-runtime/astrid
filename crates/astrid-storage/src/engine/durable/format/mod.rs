@@ -771,6 +771,21 @@ pub(super) fn encode_object_frame(
     Ok(bytes)
 }
 
+/// Check the fixed identity prefix of a canonical object frame without
+/// decoding or allocating its record body.
+pub(super) fn object_frame_declares_identity(
+    frame_payload: &[u8],
+    scheme: IdentityScheme,
+    id: ObjectId,
+) -> bool {
+    const IDENTITY_BYTES: usize = IDENTITY_PREFIX_BYTES + CURRENT_DIGEST_BYTES_USIZE;
+    frame_payload.len() >= IDENTITY_BYTES
+        && frame_payload[..2] == scheme.algorithm().to_le_bytes()
+        && frame_payload[2..4] == scheme.construction().to_le_bytes()
+        && frame_payload[4..8] == CURRENT_DIGEST_BYTES.to_le_bytes()
+        && frame_payload[8..IDENTITY_BYTES] == *id.as_bytes()
+}
+
 pub(super) fn canonical_record_bytes(
     frame_payload: &[u8],
     scheme: IdentityScheme,

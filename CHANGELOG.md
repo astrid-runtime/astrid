@@ -31,6 +31,21 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   Closes #1529.
 ### Added
 
+- **Owner-scoped KV updates can now publish bounded conditional batches through
+  one durable root transition.** The native principal store adds governed hot
+  reads and a single-sync transaction WAL on the Astrid volume, serves published
+  state from a recovery-safe pending overlay, and folds canonical arena/root/index
+  state at explicit durability and maintenance boundaries. WAL bytes live in the
+  `transactions.wal` volume region rather than a host PathBuf. The KV hot cache
+  stays disabled until an embedding supplies a reserved or governed budget;
+  `KvReadCacheConfig::default()` retains nothing. Recovery still replays an
+  existing WAL when `TransactionWalPolicy` is later disabled. Existing backends
+  retain their explicit unsupported fallback, while canonical object/root formats,
+  quota accounting, and one-owner rejection remain unchanged. Closes #1561.
+  Public recovery/hot-cache surfaces added with this work: `ReadyKvRoot`,
+  `KvProjectionEngine::current_kv_root_if_ready`, and
+  `FaultPoint::AfterWalPublication`.
+
 - **Astrid storage now exposes authoritative principal, fleet, and system-owner
   filesystem views without a host-directory projection.** Regular files remain
   immutable content DAGs, directories live in the same owner catalog, and

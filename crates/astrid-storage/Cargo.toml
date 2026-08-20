@@ -20,11 +20,13 @@ full = ["kv", "legacy-surrealkv"]
 
 [dependencies]
 astrid-core = { workspace = true }
+arc-swap = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
 fastcdc = { workspace = true }
 hex = { workspace = true }
+lz4_flex = { workspace = true }
 keyring = { workspace = true, optional = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }

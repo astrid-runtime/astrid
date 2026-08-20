@@ -1,13 +1,18 @@
 //! Authoritative startup and in-process recovery for the durable engine.
 
+use super::wal::{durable_error as wal_durable_error, recover_wal};
 use super::{
-    ARENA_FILE, ArenaReader, DurableEngine, DurableError, DurableFiles, DurableInner,
+    ARENA_FILE, ArenaReader, DurableEngine, DurableError, DurableFiles, DurableInner, DurableWal,
     FaultInjector, FaultPoint, INDEX_FILE, IndexState, LIFECYCLE_CLOSED, LIFECYCLE_USABLE,
     MutexGuard, PersistentObjectIdentity, PrincipalCodec, ROOT_FILE, RecoveredStore,
-    RecoveryLimits, Seek, SeekFrom, io, io_error, open_rw_capability, recover_arena, recover_index,
-    recover_interrupted_compaction, recover_roots, replace_index, sync_store_directory_capability,
+    RecoveryLimits, Seek, SeekFrom, SharedIdentity, SharedPrincipalCodec, WAL_FILE, io, io_error,
+    open_rw_capability, recover_arena, recover_index, recover_interrupted_compaction,
+    recover_root_history, recover_roots, replace_index, sync_store_directory_capability,
 };
 use crate::volume::AstridVolume;
+use std::collections::BTreeSet;
+
+type RecoveredWal<P, I, C> = (RecoveredStore<P>, Option<DurableWal<P, I, C>>);
 use std::path::Path;
 use std::sync::Arc;
 
@@ -29,10 +34,11 @@ impl RecoveryScope {
 pub(super) fn recover_store<P, I, C>(
     path: &Path,
     store_root: &cap_std::fs::Dir,
-    principal_codec: &C,
-    identity: &I,
+    principal_codec: &SharedPrincipalCodec<C>,
+    identity: &SharedIdentity<I>,
     limits: RecoveryLimits,
-) -> Result<RecoveredStore<P>, DurableError>
+    create_wal: bool,
+) -> Result<RecoveredWal<P, I, C>, DurableError>
 where
     P: Clone + Ord,
     I: PersistentObjectIdentity,
@@ -49,6 +55,10 @@ where
     let mut roots = open_rw_capability(store_root, Path::new(ROOT_FILE), true)?;
     let mut index_cache = open_rw_capability(store_root, Path::new(INDEX_FILE), true).ok();
     sync_store_directory_capability(store_root)?;
+    let wal_file = open_optional_native_wal(store_root, create_wal)?;
+    if wal_file.is_some() {
+        sync_store_directory_capability(store_root)?;
+    }
     let scheme = identity.scheme();
     let arena_len = arena
         .metadata()
@@ -77,6 +87,21 @@ where
         representations.validate_generation_zero_index(&index)?;
         representations.rebuild_contiguous_index(&mut arena, &index, identity, limits)?;
     }
+    let mut index = index;
+    let wal_writer = if let Some(wal_file) = wal_file {
+        Some(replay_transaction_wal(
+            wal_file,
+            &mut arena,
+            &mut roots,
+            &mut index,
+            representations.as_mut(),
+            identity,
+            principal_codec,
+            limits,
+        )?)
+    } else {
+        None
+    };
     let (roots_by_principal, validated) = recover_roots(
         &mut roots,
         &mut arena,
@@ -99,28 +124,32 @@ where
     let arena_reader = arena
         .try_clone()
         .map_err(|source| io_error("clone object arena for positional reads", source))?;
-    Ok(RecoveredStore {
-        roots_by_principal,
-        index,
-        validated,
-        files: DurableFiles {
-            arena,
-            roots,
-            index_cache,
-            arena_len,
-            arena_tail,
+    Ok((
+        RecoveredStore {
+            roots_by_principal,
+            index,
+            validated,
+            files: DurableFiles {
+                arena,
+                roots,
+                index_cache,
+                arena_len,
+                arena_tail,
+            },
+            representations,
+            arena_reader,
         },
-        representations,
-        arena_reader,
-    })
+        wal_writer,
+    ))
 }
 
 pub(super) fn recover_volume<P, I, C>(
     volume: &Arc<dyn AstridVolume>,
-    principal_codec: &C,
-    identity: &I,
+    principal_codec: &SharedPrincipalCodec<C>,
+    identity: &SharedIdentity<I>,
     limits: RecoveryLimits,
-) -> Result<RecoveredStore<P>, DurableError>
+    create_wal: bool,
+) -> Result<RecoveredWal<P, I, C>, DurableError>
 where
     P: Clone + Ord,
     I: PersistentObjectIdentity,
@@ -129,6 +158,7 @@ where
     let mut arena = super::File::volume(Arc::clone(volume), ARENA_FILE, true)?;
     let mut roots = super::File::volume(Arc::clone(volume), ROOT_FILE, true)?;
     let mut index_cache = super::File::volume(Arc::clone(volume), INDEX_FILE, true).ok();
+    let wal_file = open_optional_volume_wal(volume, create_wal)?;
     volume
         .sync()
         .map_err(|source| io_error("flush Astrid volume namespace", source))?;
@@ -147,6 +177,21 @@ where
         // ordinary future admissions to repopulate the cache region.
         drop(index_cache.take());
         recover_arena(&mut arena, identity, limits, 0)?
+    };
+    let mut index = index;
+    let wal_writer = if let Some(wal_file) = wal_file {
+        Some(replay_transaction_wal(
+            wal_file,
+            &mut arena,
+            &mut roots,
+            &mut index,
+            None,
+            identity,
+            principal_codec,
+            limits,
+        )?)
+    } else {
+        None
     };
     let (roots_by_principal, validated) = recover_roots(
         &mut roots,
@@ -170,20 +215,89 @@ where
     let arena_reader = arena
         .try_clone()
         .map_err(|source| io_error("clone object arena for positional reads", source))?;
-    Ok(RecoveredStore {
-        roots_by_principal,
-        index,
-        validated,
-        files: DurableFiles {
-            arena,
-            roots,
-            index_cache,
-            arena_len,
-            arena_tail,
+    Ok((
+        RecoveredStore {
+            roots_by_principal,
+            index,
+            validated,
+            files: DurableFiles {
+                arena,
+                roots,
+                index_cache,
+                arena_len,
+                arena_tail,
+            },
+            representations: None,
+            arena_reader,
         },
-        representations: None,
-        arena_reader,
-    })
+        wal_writer,
+    ))
+}
+
+fn open_optional_native_wal(
+    store_root: &cap_std::fs::Dir,
+    create_wal: bool,
+) -> Result<Option<super::File>, DurableError> {
+    if create_wal {
+        return open_rw_capability(store_root, Path::new(WAL_FILE), true).map(Some);
+    }
+    match open_rw_capability(store_root, Path::new(WAL_FILE), false) {
+        Ok(file) => Ok(Some(file)),
+        Err(DurableError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None)
+        },
+        Err(error) => Err(error),
+    }
+}
+
+fn open_optional_volume_wal(
+    volume: &Arc<dyn AstridVolume>,
+    create_wal: bool,
+) -> Result<Option<super::File>, DurableError> {
+    let region = crate::volume::VolumeRegion::new(WAL_FILE)
+        .map_err(|source| io_error("validate WAL volume region", source))?;
+    let exists = volume
+        .region_exists(&region)
+        .map_err(|source| io_error("probe WAL volume region", source))?;
+    if !exists && !create_wal {
+        return Ok(None);
+    }
+    super::File::volume(Arc::clone(volume), WAL_FILE, true).map(Some)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_transaction_wal<P, I, C>(
+    wal_file: super::File,
+    arena: &mut super::File,
+    roots: &mut super::File,
+    index: &mut std::collections::BTreeMap<crate::storage_model::ObjectId, super::ArenaLocation>,
+    representations: Option<&mut super::representations::RepresentationStore>,
+    identity: &SharedIdentity<I>,
+    codec: &SharedPrincipalCodec<C>,
+    limits: RecoveryLimits,
+) -> Result<DurableWal<P, I, C>, DurableError>
+where
+    P: Clone + Ord,
+    I: PersistentObjectIdentity,
+    C: PrincipalCodec<P>,
+{
+    let mut wal_validated = BTreeSet::new();
+    let mut root_history =
+        recover_root_history::<P, _, _>(roots, codec, identity.scheme(), limits)?;
+    let mut wal_writer = recover_wal(
+        wal_file,
+        arena,
+        roots,
+        index,
+        &mut wal_validated,
+        &mut root_history,
+        representations,
+        identity.clone(),
+        codec.clone(),
+        limits,
+    )?;
+    wal_writer.checkpoint().map_err(wal_durable_error)?;
+    Ok(wal_writer)
 }
 
 fn stabilize_recovered_store<P: Ord>(
@@ -261,6 +375,7 @@ where
             return Err(DurableError::Closed);
         }
 
+        drop(self.wal.lock().take());
         drop(inner.files.take());
         drop(inner.representations.take());
         drop(self.arena_reader.write().take());
@@ -278,20 +393,23 @@ where
                     io::Error::other("injected recovery I/O failure"),
                 ))
             } else {
-                self.recover_media().and_then(|mut recovered| {
+                self.recover_media().and_then(|(mut recovered, wal)| {
                     stabilize_recovered_store(&mut recovered, self.faults.as_ref())?;
-                    Ok(recovered)
+                    Ok((recovered, wal))
                 })
             };
             match recovered {
-                Ok(recovered) => {
+                Ok((recovered, wal)) => {
                     inner.roots_by_principal = recovered.roots_by_principal;
+                    self.published_roots.replace(&inner.roots_by_principal);
                     inner.index = recovered.index;
                     inner.pending_index_locations.clear();
                     inner.pending_direct_objects.clear();
+                    inner.pending_wal = super::wal::PendingWalOverlay::default();
                     inner.validated = recovered.validated;
                     inner.files = Some(recovered.files);
                     inner.representations = recovered.representations;
+                    *self.wal.lock() = wal;
                     inner.poisoned = false;
                     inner.arena_generation = next_generation;
                     *self.arena_reader.write() = Some(ArenaReader {
@@ -317,7 +435,7 @@ where
         Err(last_error.unwrap_or(DurableError::RequiresRecovery))
     }
 
-    fn recover_media(&self) -> Result<RecoveredStore<P>, DurableError> {
+    fn recover_media(&self) -> Result<RecoveredWal<P, I, C>, DurableError> {
         let volume = self.volume.read();
         match (
             self.directory.as_deref(),
@@ -330,10 +448,15 @@ where
                 &self.principal_codec,
                 &self.identity,
                 self.limits,
+                self.transaction_wal.is_enabled(),
             ),
-            (None, None, Some(volume)) => {
-                recover_volume(volume, &self.principal_codec, &self.identity, self.limits)
-            },
+            (None, None, Some(volume)) => recover_volume(
+                volume,
+                &self.principal_codec,
+                &self.identity,
+                self.limits,
+                self.transaction_wal.is_enabled(),
+            ),
             _ => Err(DurableError::InvalidRepresentationState(
                 "durable engine media configuration is inconsistent",
             )),

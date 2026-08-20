@@ -1,5 +1,6 @@
 //! Concurrency, failure-isolation, and recovery tests for group commit.
 
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
@@ -740,4 +741,78 @@ fn group_commit_scale_probe() {
             elapsed.as_millis(),
         );
     }
+}
+
+fn wal_policy() -> DurableEnginePolicy<String> {
+    DurableEnginePolicy::new(
+        GroupCommitPolicy::immediate(),
+        RecoveryRetryPolicy::immediate(),
+        ObjectCacheConfig::disabled(),
+    )
+    .with_transaction_wal(TransactionWalPolicy::enabled(
+        NonZeroU64::new(u64::MAX).unwrap(),
+    ))
+}
+
+#[test]
+fn transaction_wal_serves_committed_state_before_canonical_fold() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = DurableEngine::open_with_policy(
+        directory.path(),
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        wal_policy(),
+    )
+    .unwrap();
+    let (commit, transaction) = transaction("alice", None, b"wal-overlay");
+    engine.commit(transaction).unwrap();
+    assert_eq!(
+        engine.root(&"alice".to_owned()).unwrap().unwrap().commit,
+        commit
+    );
+    assert!(engine.object(commit).unwrap().is_some());
+    engine.close().unwrap();
+
+    let engine = DurableEngine::open_with_policy(
+        directory.path(),
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        wal_policy(),
+    )
+    .unwrap();
+    assert_eq!(
+        engine.root(&"alice".to_owned()).unwrap().unwrap().commit,
+        commit
+    );
+    assert!(engine.object(commit).unwrap().is_some());
+}
+
+#[test]
+fn transaction_wal_lives_on_an_astrid_volume_region() {
+    let directory = tempfile::tempdir().unwrap();
+    let volume_path = directory.path().join("astrid.volume");
+    let volume: std::sync::Arc<dyn crate::volume::AstridVolume> =
+        crate::volume::HostedFileVolume::open(&volume_path).unwrap();
+    let engine =
+        DurableEngine::open_volume(volume, TestIdentity, Utf8Codec, limits(), wal_policy())
+            .unwrap();
+    let (commit, transaction) = transaction("alice", None, b"volume-wal");
+    engine.commit(transaction).unwrap();
+    assert_eq!(
+        engine.root(&"alice".to_owned()).unwrap().unwrap().commit,
+        commit
+    );
+    engine.close().unwrap();
+
+    let volume: std::sync::Arc<dyn crate::volume::AstridVolume> =
+        crate::volume::HostedFileVolume::open(&volume_path).unwrap();
+    let engine =
+        DurableEngine::open_volume(volume, TestIdentity, Utf8Codec, limits(), wal_policy())
+            .unwrap();
+    assert_eq!(
+        engine.root(&"alice".to_owned()).unwrap().unwrap().commit,
+        commit
+    );
 }

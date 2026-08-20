@@ -191,6 +191,7 @@ impl FaultInjector for EngineTraceFaults {
                 *previous = current;
             },
             FaultPoint::AfterCommitFlush
+            | FaultPoint::AfterWalPublication
             | FaultPoint::BeforeRootCas
             | FaultPoint::AfterCompactionFilesFlush
             | FaultPoint::AfterCompactionEvidencePrepare

@@ -801,6 +801,7 @@ dependencies = [
 name = "astrid-storage"
 version = "0.10.4"
 dependencies = [
+ "arc-swap",
  "astrid-core",
  "async-trait",
  "base64 0.23.1",
@@ -815,6 +816,7 @@ dependencies = [
  "hex",
  "keyring",
  "libc",
+ "lz4_flex",
  "parking_lot",
  "serde",
  "serde_json",
