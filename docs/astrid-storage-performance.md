@@ -8,18 +8,25 @@ of copying results.
 Selected raw outputs are preserved in
 [`benchmarks/storage-io/`](benchmarks/storage-io/README.md).
 
-The manually dispatched `Storage benchmark evidence` workflow runs the same
-content-bound harness on GitHub-hosted Linux x86-64, macOS arm64, and Windows
-x86-64 runners and uploads one content-bound JSON artifact per platform.
-Comparisons are valid only within a run or between reports whose recorded
-revision, arguments, runner image, and environment are intentionally matched.
-Device-local results below remain historical diagnostics; they are not copied
-into crate-facing documentation as portable performance claims.
+Two published profiles exist for other people to reproduce. Anything else is
+a historical diagnostic, not a published profile.
+
+| Profile | Where | Surface | Harness |
+|---|---|---|---|
+| `linux-ext4-gh` | GitHub-hosted `ubuntu-latest` VM workspace disk | typically ext4, host path | workflow_dispatch `Storage benchmark evidence` |
+| `macos-apfs-local` | operator Mac, local APFS volume | APFS host path | commands below |
+
+The workflow is not a CI gate. It has no `container:` key; Docker/OCI overlay
+is a lie for storage I/O unless the measured `--root` is a documented host
+path. GitHub macOS/Windows runner artifacts are unpublished. Comparisons are
+valid only within a run or between reports whose recorded revision, arguments,
+host, filesystem, volume kind, and executable hash match.
 
 Status: convergence and native-path baselines recorded; mounted-provider
-measurements pending
+measurements still pending as a separate matrix. Native microbenchmarks are
+never quoted as end-to-end.
 
-Last reviewed: 2026-08-05
+Last reviewed: 2026-08-20
 
 Tracking:
 [#1398](https://github.com/astrid-runtime/astrid/issues/1398),
@@ -38,8 +45,10 @@ measurements.
 
 - The FastCDC corpus sweep measures unique bytes and object counts.
 - `storage_io` measures the native staging and principal-store paths that exist.
-- No mounted filesystem provider exists yet, so these results are not mount
-  throughput, metadata latency, `mmap` behavior, or open-handle evidence.
+- Mounted filesystem providers exist after #1535 (FSKit, FUSE, WinFsp). Those
+  results are a different matrix. `storage_io` and the ignored KV comparisons
+  are not mount throughput, metadata latency, `mmap` behavior, or open-handle
+  evidence. A native microbenchmark is never an end-to-end product number.
 
 On a hosted platform, Astrid's arena and staging files are themselves stored by
 APFS, NTFS/ReFS, or the host Linux filesystem. For the same bytes and durability
@@ -176,7 +185,75 @@ file length appended, not filesystem-allocated block count.
 and verification cache. It is disabled when omitted. The example's 1 GiB is
 an explicit experiment budget, not a daemon default or a recommendation for
 production policy; the runtime must obtain its cache budget from the operator's
-resource authority.
+resource authority. This is not the KV hot cache (`KvReadCacheConfig`); that
+cache stays disabled unless an embedding supplies a reserved or governed
+budget. Temporary stores use a throwaway directory. Never
+`ASTRID_HOME=$HOME/.astrid`.
+
+### Published profiles
+
+`linux-ext4-gh` (GitHub-hosted evidence workflow):
+
+```console
+# Actions: workflow_dispatch "Storage benchmark evidence"
+# inputs: bytes=67108864 samples=3 kv_compare=false
+# Records ASTRID_BENCH_MACHINE_CLASS=github-hosted:linux-ext4-gh
+# Rust 1.95.0. Typical runner FS is ext4 on the VM disk, not overlay.
+```
+
+`macos-apfs-local` (this is the local recipe; do not confuse it with
+`macos-latest` GitHub runners):
+
+```console
+export ASTRID_BENCH_MACHINE_CLASS='local:macos-apfs:Apple-M2-Ultra-24c-192GiB'
+cargo +1.95 bench -p astrid-storage --bench storage_io -- \
+  --bytes 536870912 \
+  --block-bytes 4194304 \
+  --range-bytes 1048576 \
+  --samples 3 \
+  --small-files 64 \
+  --small-file-bytes 4096 \
+  --concurrent-principals 4 \
+  --bulk-workers 8 \
+  --bulk-files 100 \
+  --object-cache-bytes 1073741824 \
+  --output /tmp/astrid-storage-io.json
+```
+
+v2 envelopes now record `provenance.host.{machine_class,filesystem,volume_kind,uname}`
+in addition to Git SHA, dirty tree, argv, and executable hash.
+
+### #1535 / #1562 watch surfaces
+
+| Surface | What changed | Existing measurement | Envelope gap |
+|---|---|---|---|
+| Group publish | durable group commit on AstridVolume | `storage_io` unique/duplicate/bulk publish; historical `group-commit-main-vs-candidate.txt` | `storage_io` does not enable `TransactionWalPolicy`; group-commit probe is a transcript |
+| Overlay reads | committed WAL state served before arena/root fold | `group_tests` correctness (`transaction_wal_serves_committed_state_before_canonical_fold`) | no rate envelope; hot-read tests are cache, not overlay |
+| Cache opt-in | KV cache default retains nothing; object cache remains `--object-cache-bytes` | `storage_io` object cache; ignored KV tests use `reserved_64_mib` | object-cache bytes are in `storage_io` config; KV cache policy is in the kv-microbench envelope |
+| Volume-region WAL | `transactions.wal` region, not a host PathBuf | `volume_crash_tests`, group_tests region check | no `wal_policy` field on `storage_io` v2 |
+| Batch KV | reuse `KvMutationBatch` | ignored `strict_same_owner_batch_commits_compare_with_surrealkv` | kv-microbench v1 sidecar when `ASTRID_STORAGE_PERF_OUTPUT` is set |
+
+### WAL/cache vs SurrealKV
+
+Ignored release-mode tests under `crates/astrid-storage/src/kv/tree/performance_tests.rs`.
+Not a CI gate. Set `ASTRID_STORAGE_PERF_OUTPUT` to a directory to write
+`astrid-storage-kv-microbench-v1` JSON per test.
+
+```console
+export ASTRID_BENCH_MACHINE_CLASS='local:macos-apfs:Apple-M2-Ultra-24c-192GiB'
+export ASTRID_STORAGE_PERF_OUTPUT=/tmp/kv-microbench
+mkdir -p "$ASTRID_STORAGE_PERF_OUTPUT"
+cargo +1.95 test -p astrid-storage --release --features legacy-surrealkv --lib performance_tests -- --ignored --nocapture --test-threads=1
+```
+
+On `macos-apfs-local` at clean `6066bca197abf6e7352b2625e59b707980779f0f`,
+WAL-off hot point reads were faster than SurrealKV (median ratio 1.754).
+That does not replace the old 0.947x number and is not an end-to-end claim.
+The WAL-on batch comparison did not finish: 88 CPU-minutes still inside
+native `apply_batch` / `load_kv_object_for` before any SurrealKV sample
+printed. Transcript:
+[`benchmarks/storage-io/wal-cache-vs-surrealkv-6066bca-macos-apfs.txt`](benchmarks/storage-io/wal-cache-vs-surrealkv-6066bca-macos-apfs.txt).
+
 
 `--bulk-workers` is the explicit worker grant used by the bulk-ingest
 workload; library defaults remain serial because a storage crate cannot infer
@@ -796,6 +873,7 @@ catalog.
 | `astrid-storage-publication-cache-after.json` | code `97df6492`, harness `09318a04` |
 | `astrid-storage-postcompaction.json` | `79d980d2` |
 | `astrid-storage-main-404a9d69.json` | clean `404a9d69`; storage tree equals main `2855d440` plus evidence-only harness changes |
+| `wal-cache-vs-surrealkv-6066bca-macos-apfs.txt` | clean `6066bca1` on `macos-apfs-local`; WAL-off hot reads vs SurrealKV; WAL-on batch incomplete |
 
 The historical report schema omitted Git revision and executable arguments.
 Those associations are reconstructed from dedicated worktrees, ancestry,

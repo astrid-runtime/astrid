@@ -11,6 +11,11 @@ on:
         description: Samples per repeatable workload
         required: true
         default: '3'
+      kv_compare:
+        description: Also run ignored WAL/cache vs SurrealKV microbenchmarks (not a gate)
+        required: true
+        default: 'false'
+        type: boolean
 
 permissions:
   contents: read
@@ -22,16 +27,17 @@ jobs:
   benchmark:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    env:
+      ASTRID_BENCH_MACHINE_CLASS: github-hosted:${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: linux-x86_64
+          # Published profile linux-ext4-gh. ubuntu-latest is a GitHub-hosted VM
+          # workspace disk (typically ext4). This job has no container: key, so
+          # the measured path is a host path, not a Docker overlay.
+          - name: linux-ext4-gh
             os: ubuntu-latest
-          - name: macos-arm64
-            os: macos-latest
-          - name: windows-x86_64
-            os: windows-latest
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
@@ -42,7 +48,16 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.95.0
+        with:
+          toolchain: 1.95.0
+
+      - name: Record host filesystem
+        shell: bash
+        run: |
+          uname -a
+          df -T .
+          stat -f -c %T . || true
 
       - name: Capture storage evidence
         shell: bash
@@ -62,5 +77,24 @@ jobs:
         with:
           name: storage-benchmark-${{ github.sha }}-${{ matrix.name }}
           path: storage-benchmark-${{ matrix.name }}.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Capture KV microbenchmark evidence
+        if: ${{ inputs.kv_compare }}
+        shell: bash
+        env:
+          ASTRID_STORAGE_PERF_OUTPUT: kv-microbench
+        run: |
+          mkdir -p kv-microbench
+          cargo test -p astrid-storage --release --features legacy-surrealkv --lib performance_tests -- \
+            --ignored --nocapture --test-threads=1
+
+      - name: Upload KV microbenchmark evidence
+        if: ${{ inputs.kv_compare }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: storage-kv-microbench-${{ github.sha }}-${{ matrix.name }}
+          path: kv-microbench
           if-no-files-found: error
           retention-days: 30

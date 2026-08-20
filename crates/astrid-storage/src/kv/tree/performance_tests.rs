@@ -18,6 +18,7 @@ use crate::principal_state::Blake3ObjectIdentityV1;
 use crate::{StorageError, StorageResult};
 
 use super::TreeKvStore;
+use super::performance_evidence::{EvidenceRecorder, WorkloadPolicy};
 
 #[derive(Clone, Copy)]
 struct Resolver;
@@ -59,6 +60,7 @@ fn native_fixture() -> (tempfile::TempDir, Arc<NativeEngine>, NativeStore) {
         )
         .unwrap(),
     );
+    // Hot reads deliberately pair the disposable cache with WAL-off commits.
     let store = TreeKvStore::from_engine(Arc::clone(&engine), Resolver)
         .with_read_cache(KvReadCacheConfig::reserved_64_mib());
     (directory, engine, store)
@@ -84,6 +86,7 @@ fn native_wal_fixture() -> (tempfile::TempDir, Arc<NativeEngine>, NativeStore) {
         )
         .unwrap(),
     );
+    // Strict writes and batches deliberately use WAL-on publication.
     let store = TreeKvStore::from_engine(Arc::clone(&engine), Resolver)
         .with_read_cache(KvReadCacheConfig::reserved_64_mib());
     (directory, engine, store)
@@ -185,7 +188,12 @@ async fn hot_point_reads_outpace_legacy_surrealkv() {
     const READS: usize = 500_000;
     const SAMPLES: usize = 5;
 
-    let (_native_directory, _native_engine, native) = native_fixture();
+    let (native_directory, _native_engine, native) = native_fixture();
+    let mut evidence = EvidenceRecorder::new(
+        "hot_point_reads_outpace_legacy_surrealkv",
+        native_directory.path(),
+        WorkloadPolicy::HotReads,
+    );
     let legacy_directory = tempfile::tempdir().unwrap();
     let legacy = SurrealKvStore::open(legacy_directory.path()).unwrap();
     let namespace = "alice:capsule:bench";
@@ -222,17 +230,28 @@ async fn hot_point_reads_outpace_legacy_surrealkv() {
              surrealkv_reads_per_second={legacy_rate:.0} ratio={:.3}",
             native_rate / legacy_rate
         );
+        evidence.sample(
+            "point_reads",
+            sample,
+            &[],
+            &[
+                ("astrid_reads_per_second", native_rate),
+                ("surrealkv_reads_per_second", legacy_rate),
+            ],
+        );
         native_rates.push(native_rate);
         legacy_rates.push(legacy_rate);
     }
     native_rates.sort_by(f64::total_cmp);
     legacy_rates.sort_by(f64::total_cmp);
-    eprintln!(
-        "median_ratio={:.3}",
-        native_rates[SAMPLES / 2] / legacy_rates[SAMPLES / 2]
-    );
+    let native_median = native_rates[SAMPLES / 2];
+    let legacy_median = legacy_rates[SAMPLES / 2];
+    let median_ratio = native_median / legacy_median;
+    eprintln!("median_ratio={median_ratio:.3}");
+    evidence.ratio("median_throughput", native_median, legacy_median);
     native.close().await.unwrap();
     legacy.close().await.unwrap();
+    evidence.finish();
 }
 
 async fn concurrent_rate(store: Arc<dyn KvStore>, readers: usize, reads_per_reader: usize) -> f64 {
@@ -268,7 +287,12 @@ async fn concurrent_hot_point_reads_outpace_legacy_surrealkv() {
     const NAMESPACE: &str = "alice:capsule:bench";
     const KEY: &str = "hot";
 
-    let (_native_directory, _native_engine, native) = native_fixture();
+    let (native_directory, _native_engine, native) = native_fixture();
+    let mut evidence = EvidenceRecorder::new(
+        "concurrent_hot_point_reads_outpace_legacy_surrealkv",
+        native_directory.path(),
+        WorkloadPolicy::HotReads,
+    );
     let native = Arc::new(native);
     let legacy_directory = tempfile::tempdir().unwrap();
     let legacy = Arc::new(SurrealKvStore::open(legacy_directory.path()).unwrap());
@@ -298,18 +322,30 @@ async fn concurrent_hot_point_reads_outpace_legacy_surrealkv() {
                  surrealkv_reads_per_second={legacy_rate:.0} ratio={:.3}",
                 native_rate / legacy_rate
             );
+            evidence.sample(
+                "concurrent_point_reads",
+                sample,
+                &[("readers", readers.to_string())],
+                &[
+                    ("astrid_reads_per_second", native_rate),
+                    ("surrealkv_reads_per_second", legacy_rate),
+                ],
+            );
             native_rates.push(native_rate);
             legacy_rates.push(legacy_rate);
         }
         native_rates.sort_by(f64::total_cmp);
         legacy_rates.sort_by(f64::total_cmp);
-        eprintln!(
-            "readers={readers} median_ratio={:.3}",
-            native_rates[SAMPLES / 2] / legacy_rates[SAMPLES / 2]
-        );
+        let native_median = native_rates[SAMPLES / 2];
+        let legacy_median = legacy_rates[SAMPLES / 2];
+        let median_ratio = native_median / legacy_median;
+        eprintln!("readers={readers} median_ratio={median_ratio:.3}");
+        let ratio_name = format!("median_throughput_readers_{readers}");
+        evidence.ratio(&ratio_name, native_median, legacy_median);
     }
     native.close().await.unwrap();
     legacy.close().await.unwrap();
+    evidence.finish();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -320,7 +356,12 @@ async fn hot_working_set_reads_outpace_legacy_surrealkv() {
     const SAMPLES: usize = 3;
     const NAMESPACE: &str = "alice:capsule:bench";
 
-    let (_native_directory, _native_engine, native) = native_fixture();
+    let (native_directory, _native_engine, native) = native_fixture();
+    let mut evidence = EvidenceRecorder::new(
+        "hot_working_set_reads_outpace_legacy_surrealkv",
+        native_directory.path(),
+        WorkloadPolicy::HotReads,
+    );
     native
         .seed_sorted_for_test(
             "alice".to_owned(),
@@ -391,17 +432,28 @@ async fn hot_working_set_reads_outpace_legacy_surrealkv() {
              surrealkv_reads_per_second={legacy_rate:.0} ratio={:.3}",
             native_rate / legacy_rate
         );
+        evidence.sample(
+            "working_set_reads",
+            sample,
+            &[("keys", KEYS.to_string())],
+            &[
+                ("astrid_reads_per_second", native_rate),
+                ("surrealkv_reads_per_second", legacy_rate),
+            ],
+        );
         native_rates.push(native_rate);
         legacy_rates.push(legacy_rate);
     }
     native_rates.sort_by(f64::total_cmp);
     legacy_rates.sort_by(f64::total_cmp);
-    eprintln!(
-        "working_set={KEYS} median_ratio={:.3}",
-        native_rates[SAMPLES / 2] / legacy_rates[SAMPLES / 2]
-    );
+    let native_median = native_rates[SAMPLES / 2];
+    let legacy_median = legacy_rates[SAMPLES / 2];
+    let median_ratio = native_median / legacy_median;
+    eprintln!("working_set={KEYS} median_ratio={median_ratio:.3}");
+    evidence.ratio("median_throughput", native_median, legacy_median);
     native.close().await.unwrap();
     legacy.close().await.unwrap();
+    evidence.finish();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -412,13 +464,20 @@ async fn strict_single_owner_writes_compare_with_surrealkv() {
     const NAMESPACE: &str = "alice:capsule:audit";
     const KEY: &str = "head";
 
-    let (_native_directory, _native_engine, native) = native_wal_fixture();
+    let (native_directory, _native_engine, native) = native_wal_fixture();
+    let mut evidence = EvidenceRecorder::new(
+        "strict_single_owner_writes_compare_with_surrealkv",
+        native_directory.path(),
+        WorkloadPolicy::StrictWrites,
+    );
     let legacy_directory = tempfile::tempdir().unwrap();
     let legacy = surrealkv::TreeBuilder::new()
         .with_path(legacy_directory.path().to_path_buf())
         .build()
         .unwrap();
     let legacy_key = composite_key(NAMESPACE, KEY);
+    let mut native_rates = Vec::with_capacity(SAMPLES);
+    let mut legacy_rates = Vec::with_capacity(SAMPLES);
 
     for sample in 0..SAMPLES {
         let native_started = Instant::now();
@@ -452,9 +511,28 @@ async fn strict_single_owner_writes_compare_with_surrealkv() {
              surrealkv_strict_writes_per_second={legacy_rate:.1} ratio={:.3}",
             native_rate / legacy_rate
         );
+        evidence.sample(
+            "strict_writes",
+            sample,
+            &[],
+            &[
+                ("astrid_strict_writes_per_second", native_rate),
+                ("surrealkv_strict_writes_per_second", legacy_rate),
+            ],
+        );
+        native_rates.push(native_rate);
+        legacy_rates.push(legacy_rate);
     }
+    native_rates.sort_by(f64::total_cmp);
+    legacy_rates.sort_by(f64::total_cmp);
+    evidence.ratio(
+        "median_throughput",
+        native_rates[SAMPLES / 2],
+        legacy_rates[SAMPLES / 2],
+    );
     native.close().await.unwrap();
     legacy.close().await.unwrap();
+    evidence.finish();
 }
 
 async fn measure_native_audit_sample(
@@ -554,10 +632,48 @@ async fn assert_legacy_audit_reopen(directory: &tempfile::TempDir, batches: &[Au
     reopened.close().await.unwrap();
 }
 
+fn record_batch_sample_evidence(
+    evidence: &mut EvidenceRecorder,
+    sample: usize,
+    batches: &[AuditBatch],
+    native_elapsed: Duration,
+    legacy_elapsed: Duration,
+) {
+    evidence.sample(
+        "batch_commits",
+        sample,
+        &[
+            ("batches", batches.len().to_string()),
+            (
+                "entries",
+                batches
+                    .len()
+                    .saturating_mul(AUDIT_BATCH_ENTRIES)
+                    .to_string(),
+            ),
+        ],
+        &[
+            (
+                "astrid_batches_per_second",
+                operations_per_second(batches.len(), native_elapsed),
+            ),
+            (
+                "surrealkv_batches_per_second",
+                operations_per_second(batches.len(), legacy_elapsed),
+            ),
+        ],
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "release-mode strict-durability same-owner KvMutationBatch evidence"]
 async fn strict_same_owner_batch_commits_compare_with_surrealkv() {
     let (native_directory, native_engine, native) = native_wal_fixture();
+    let mut evidence = EvidenceRecorder::new(
+        "strict_same_owner_batch_commits_compare_with_surrealkv",
+        native_directory.path(),
+        WorkloadPolicy::StrictWrites,
+    );
     let legacy_directory = tempfile::tempdir().unwrap();
     let legacy = surrealkv::TreeBuilder::new()
         .with_path(legacy_directory.path().to_path_buf())
@@ -600,6 +716,13 @@ async fn strict_same_owner_batch_commits_compare_with_surrealkv() {
             legacy_sample_elapsed,
             legacy_sample_latencies,
         );
+        record_batch_sample_evidence(
+            &mut evidence,
+            sample,
+            &batches,
+            native_sample_elapsed,
+            legacy_sample_elapsed,
+        );
         all_batches.extend(batches);
     }
 
@@ -626,6 +749,12 @@ async fn strict_same_owner_batch_commits_compare_with_surrealkv() {
         operations_per_second(total_entries, native_elapsed)
             / operations_per_second(total_entries, legacy_elapsed),
     );
+    evidence.ratio(
+        "entries_per_second",
+        operations_per_second(total_entries, native_elapsed),
+        operations_per_second(total_entries, legacy_elapsed),
+    );
+    evidence.finish();
 
     native.close().await.unwrap();
     drop(native);

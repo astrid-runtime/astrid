@@ -28,7 +28,14 @@ type BenchResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> BenchResult<()> {
     let config = Config::from_args()?;
-    let provenance = RunProvenance::capture()?;
+    let temporary = config.root.is_none().then(tempfile::tempdir).transpose()?;
+    let root = match (&config.root, &temporary) {
+        (Some(root), _) => root.clone(),
+        (None, Some(directory)) => directory.path().to_path_buf(),
+        (None, None) => return Err("benchmark root was not selected".into()),
+    };
+    prepare_root(&root)?;
+    let provenance = RunProvenance::capture_for_root(&root)?;
     println!(
         "revision: {} ({})",
         provenance.revision(),
@@ -38,13 +45,7 @@ async fn main() -> BenchResult<()> {
             "dirty"
         }
     );
-    let temporary = config.root.is_none().then(tempfile::tempdir).transpose()?;
-    let root = match (&config.root, &temporary) {
-        (Some(root), _) => root.clone(),
-        (None, Some(directory)) => directory.path().to_path_buf(),
-        (None, None) => return Err("benchmark root was not selected".into()),
-    };
-    prepare_root(&root)?;
+    println!("{}", provenance.describe_host());
     println!("benchmark root: {}", root.display());
     println!(
         "corpus: {} bytes; block: {} bytes; range: {} bytes; object cache: {}",

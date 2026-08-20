@@ -37,6 +37,8 @@ mod legacy_avl;
 mod node;
 mod overlay;
 #[cfg(all(test, feature = "legacy-surrealkv"))]
+mod performance_evidence;
+#[cfg(all(test, feature = "legacy-surrealkv"))]
 mod performance_tests;
 mod validation;
 

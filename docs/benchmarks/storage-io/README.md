@@ -22,6 +22,20 @@ amplification, measure final-node-only batch admission, and finish with the
 audited work-conserving and denser canonical implementations under an
 otherwise identical workload.
 
+## WAL/cache vs SurrealKV after #1562
+
+Native KV microbenchmark at clean `6066bca1` on profile `macos-apfs-local`
+(Apple M2 Ultra / APFS host path). Not end-to-end. Not a CI gate. Do not
+copy the pre-rewrite 0.947x figure.
+
+WAL-off hot point reads were faster than SurrealKV (median ratio 1.754).
+WAL-on batch comparison did not complete after 88 CPU-minutes still in
+native `apply_batch`. Transcript:
+`wal-cache-vs-surrealkv-6066bca-macos-apfs.txt`.
+
+How to run and what the numbers mean is in
+[`../../astrid-storage-performance.md`](../../astrid-storage-performance.md).
+
 ## Current headline result
 
 Clean commit `ce756e1e` used a deterministic 512 MiB incompressible corpus,
