@@ -6,7 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import changelog
-from changelog import check_pr, entry_from_fragment, extract_notes, roll_changelog
+from changelog import check_pr, entry_from_fragment, extract_notes, fragment_body_errors, roll_changelog
 
 
 SAMPLE = """# Changelog
@@ -91,8 +91,41 @@ class CheckPrTests(unittest.TestCase):
         )
         self.assertTrue(errors)
 
+    def test_code_plus_changelog_and_fragment_still_fails(self):
+        errors = check_pr(
+            labels=[],
+            changed_paths=["CHANGELOG.md", "crates/astrid-kernel/src/lib.rs", "changes/9.fixed.md"],
+            added_paths=["changes/9.fixed.md"],
+        )
+        self.assertTrue(errors)
+        self.assertIn("must not edit CHANGELOG.md", errors[0])
+
+    def test_release_skip_allows_changelog_and_cargo(self):
+        self.assertEqual(
+            check_pr(
+                labels=["skip-changelog"],
+                changed_paths=["CHANGELOG.md", "Cargo.toml", "Cargo.lock"],
+                added_paths=[],
+            ),
+            [],
+        )
+
+
+    def test_empty_fragment_body_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fragment = root / "9.fixed.md"
+            fragment.write_text("\n", encoding="utf-8")
+            errors = fragment_body_errors(
+                [str(fragment)],
+                changes_dir=str(root),
+            )
+            self.assertTrue(errors)
+            self.assertIn("empty", errors[0])
+
 
 class RollNotesTests(unittest.TestCase):
+
     def test_entry_wraps_prose_as_bullet(self):
         self.assertEqual(
             entry_from_fragment("**New API.**\nMore detail. Closes #9.\n"),

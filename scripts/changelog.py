@@ -102,7 +102,16 @@ def check_pr(
         return errors
     if has_skip_changelog(labels):
         return []
-    if not any(is_code_path(path) for path in changed_paths):
+    code_changed = any(is_code_path(path) for path in changed_paths)
+    changelog_changed = any(Path(path).name == "CHANGELOG.md" for path in changed_paths)
+    if code_changed and changelog_changed:
+        errors.append(
+            "Ordinary code PRs must not edit CHANGELOG.md; add "
+            f"{changes_dir}/{{issue}}.{{kind}}.md instead. Release PRs that "
+            f"roll CHANGELOG.md should use the {SKIP_LABEL} label."
+        )
+        return errors
+    if not code_changed:
         return []
     if added_fragments:
         return []
@@ -257,6 +266,19 @@ def extract_notes(text: str, version: str) -> str:
     return "".join(collected).strip("\n") + ("\n" if collected else "")
 
 
+def fragment_body_errors(added_paths: Sequence[str], *, changes_dir: str = "changes") -> list[str]:
+    errors: list[str] = []
+    prefix = changes_dir.rstrip("/") + "/"
+    for path in added_paths:
+        if not path.startswith(prefix) or not FRAGMENT_NAME.fullmatch(Path(path).name):
+            continue
+        try:
+            entry_from_fragment(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            errors.append(f"{path}: {error}")
+    return errors
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     labels = parse_labels(args.labels or os.environ.get("PR_LABELS", ""))
     try:
@@ -268,6 +290,7 @@ def cmd_check(args: argparse.Namespace) -> int:
             added_paths=added,
             changes_dir=args.changes_dir,
         )
+        errors.extend(fragment_body_errors(added, changes_dir=args.changes_dir))
     except (OSError, RuntimeError, ValueError) as error:
         print(f"::error::Unable to validate changelog fragments: {error}")
         return 1

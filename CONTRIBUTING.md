@@ -50,7 +50,8 @@ also when a maintainer evaluates whether the task is a good fit for a first cont
   is the Keep a Changelog entry prose (include `Closes #N` when applicable).
   Do not edit `CHANGELOG.md` on ordinary PRs; that file is rolled at release.
   Docs/CI-only changes may skip. Use the `skip-changelog` label when a code PR
-  should skip. Release PRs run `python3 scripts/changelog.py roll --version X.Y.Z --date YYYY-MM-DD`.
+  should skip, including release PRs that roll `CHANGELOG.md` and bump crate
+  versions. Release PRs run `python3 scripts/changelog.py roll --version X.Y.Z --date YYYY-MM-DD`.
 
 ### 5. Open a pull request
 
