@@ -38,7 +38,7 @@ impl PrincipalProfile {
     /// # Errors
     ///
     /// Returns [`ProfileError::Io`] on IO failure other than `NotFound`,
-    /// [`ProfileError::Parse`] on malformed or unknown-field TOML, and
+    /// [`ProfileError::Parse`] on malformed TOML, and
     /// [`ProfileError::Invalid`] on semantic validation failure.
     pub fn load(home: &AstridHome, principal: &PrincipalId) -> ProfileResult<Self> {
         Self::load_from_path(&Self::path_for(home, principal))
@@ -298,6 +298,20 @@ mod tests {
         .unwrap();
         let loaded = PrincipalProfile::load(&home, &principal).unwrap();
         assert_eq!(loaded.quotas.max_memory_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn load_path_ignores_unknown_quota_key_then_validates() {
+        let (_d, home, principal) = scratch_home();
+        let path = PrincipalProfile::path_for(&home, &principal);
+        fs::write(
+            &path,
+            "[quotas]\nmax_memory_bytes = 4294967296\nmax_compute_workers = 0\nmax_cpu_fuel_per_sec = 2000000000\n",
+        )
+        .unwrap();
+        let loaded = PrincipalProfile::load(&home, &principal).unwrap();
+        assert_eq!(loaded.quotas.max_memory_bytes, 4_294_967_296);
+        assert_eq!(loaded.quotas.max_cpu_fuel_per_sec, 2_000_000_000);
     }
 
     #[test]

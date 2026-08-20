@@ -538,7 +538,7 @@ mod tests {
             "max_background_processes = 64\n",
             "max_compute_workers = 0\n",
             "max_storage_bytes = 17179869184\n",
-            "max_cpu_fuel_per_sec = 0\n",
+            "max_cpu_fuel_per_sec = 2000000000\n",
         );
         let profile: PrincipalProfile = toml::from_str(toml_src).unwrap();
         assert_eq!(profile.quotas.max_background_processes, 64);
