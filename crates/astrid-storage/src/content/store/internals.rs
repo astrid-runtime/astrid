@@ -1,6 +1,6 @@
 use super::workspace::{is_workspace_branch_label, workspace_branch_quota};
 use super::{
-    BTreeMap, BuiltContent, CONTENT_COMPONENT_LABEL, CatalogRoot, CatalogValue,
+    BTreeMap, BuiltContent, CONTENT_COMPONENT_LABEL, CatalogRoot, CatalogSummary, CatalogValue,
     ContentBatchExpectation, ContentError, ContentHeader, ContentName, KV_COMPONENT_LABEL,
     LEGACY_PRINCIPAL_GRAPH_VERSION, ModelError, ObjectClass, ObjectFormatVersion, ObjectId,
     ObjectKind, ObjectRecord, ObjectReference, PARENT_LABEL, PRINCIPAL_GRAPH_VERSION,
@@ -10,17 +10,52 @@ use super::{
     validate_catalog, validated_projection_quota,
 };
 use crate::content::catalog::prefix_exists as catalog_prefix_exists;
+use crate::engine::ProjectionCacheEntry;
 
 impl<P, E> PrincipalContentStore<P, E>
 where
     P: Clone + Ord + Send + Sync,
     E: PrincipalProjectionEngine<P>,
 {
+    pub(super) fn finish_catalog_commit(
+        &self,
+        principal: &P,
+        mut header: ContentHeader,
+        root: RootState,
+    ) {
+        self.validated_catalogs.lock().insert(
+            principal.clone(),
+            crate::content::catalog::CatalogValidation {
+                root: header.catalog.map(|catalog| catalog.object),
+                summary: header
+                    .catalog
+                    .map_or(CatalogSummary::default(), |catalog| catalog.summary),
+            },
+        );
+        header.root = Some(root);
+        header.previous_catalog_quota_bytes = header
+            .catalog
+            .map_or(0, |catalog| catalog.summary.quota_bytes);
+        let header = std::sync::Arc::new(header);
+        self.decoded_headers
+            .lock()
+            .insert(principal.clone(), std::sync::Arc::clone(&header));
+        let _ = self.engine.retain_projection_cache(
+            principal,
+            root.commit,
+            super::DECODED_HEADER_CACHE_KEY,
+            ProjectionCacheEntry::new(header.as_ref().clone()),
+        );
+    }
+
     pub(super) fn decode_header(
         &self,
         principal: &P,
         root: Option<RootState>,
     ) -> Result<ContentHeader, PrincipalContentError> {
+        #[cfg(test)]
+        self.decode_header_invocations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(root) = root else {
             return Ok(ContentHeader::empty());
         };
@@ -319,6 +354,9 @@ where
         principal: &P,
         prefix: &str,
     ) -> Result<bool, PrincipalContentError> {
+        #[cfg(test)]
+        self.prefix_exists_invocations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if prefix.is_empty() {
             let header = self.header(principal)?;
             return Ok(header
@@ -336,6 +374,24 @@ where
     #[cfg(test)]
     pub(crate) fn list_invocations(&self) -> u64 {
         self.list_invocations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn list_prefix_invocations(&self) -> u64 {
+        self.list_prefix_invocations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prefix_exists_invocations(&self) -> u64 {
+        self.prefix_exists_invocations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decode_header_invocations(&self) -> u64 {
+        self.decode_header_invocations
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

@@ -196,17 +196,68 @@ async fn parent_exists_does_not_list_the_owner_catalog() {
     let (_directory, filesystem) = filesystem().await;
     let directory = FilesystemPath::new("blobs").unwrap();
     filesystem.create_dir(&directory).unwrap();
+    let header_decodes = filesystem.content.decode_header_invocations();
+    let prefix_exists = filesystem.content.prefix_exists_invocations();
     for index in 0..64_u32 {
         let path = FilesystemPath::new(format!("blobs/{index:04}")).unwrap();
         filesystem.write(&path, b"x").unwrap();
     }
     assert_eq!(filesystem.content.list_invocations(), 0);
+    assert_eq!(filesystem.content.list_prefix_invocations(), 0);
+    assert_eq!(
+        filesystem.content.prefix_exists_invocations(),
+        prefix_exists,
+        "confirmed-parent writes still probed file-is-directory"
+    );
+    assert_eq!(
+        filesystem.content.decode_header_invocations(),
+        header_decodes,
+        "each file write re-decoded the catalog header"
+    );
 
     let extra = FilesystemPath::new("blobs/extra").unwrap();
     filesystem.write(&extra, b"y").unwrap();
     assert_eq!(filesystem.content.list_invocations(), 0);
+    assert_eq!(filesystem.content.list_prefix_invocations(), 0);
+    assert_eq!(
+        filesystem.content.prefix_exists_invocations(),
+        prefix_exists
+    );
     assert_eq!(filesystem.read(&extra, 0, 1).unwrap(), b"y");
     assert_eq!(filesystem.content.list_invocations(), 0);
+    assert_eq!(filesystem.content.list_prefix_invocations(), 0);
+}
+
+#[tokio::test]
+async fn removed_directory_is_not_cached_as_still_present() {
+    let (_directory, filesystem) = filesystem().await;
+    let directory = FilesystemPath::new("gone").unwrap();
+    let child = FilesystemPath::new("gone/child").unwrap();
+    filesystem.create_dir(&directory).unwrap();
+    filesystem.write(&child, b"x").unwrap();
+    filesystem.remove(&child).unwrap();
+    filesystem.remove(&directory).unwrap();
+    assert!(matches!(
+        filesystem.write(&child, b"y"),
+        Err(FilesystemError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn renamed_directory_is_not_cached_under_the_old_name() {
+    let (_directory, filesystem) = filesystem().await;
+    let from = FilesystemPath::new("from").unwrap();
+    let to = FilesystemPath::new("to").unwrap();
+    let old_child = FilesystemPath::new("from/file").unwrap();
+    let new_child = FilesystemPath::new("to/file").unwrap();
+    filesystem.create_dir(&from).unwrap();
+    filesystem.write(&old_child, b"x").unwrap();
+    filesystem.rename(&from, &to).unwrap();
+    assert_eq!(filesystem.read(&new_child, 0, 1).unwrap(), b"x");
+    assert!(matches!(
+        filesystem.write(&old_child, b"y"),
+        Err(FilesystemError::NotFound(_))
+    ));
 }
 
 #[tokio::test]

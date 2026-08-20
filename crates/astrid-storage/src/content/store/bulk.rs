@@ -16,10 +16,9 @@ use super::projection::{
     BatchAdmission, DeferredAdmission, StagedObjectBatch, admit_object_batch_observed,
 };
 use super::{
-    CatalogSummary, CatalogValidation, CatalogValue, EngineSink, ModelError, ObjectId,
-    ObjectRecord, ObjectReference, PrincipalContentStore, PrincipalProjectionEngine,
-    PrincipalProjectionError, ReferenceKind, VerifiedContent, build_content_streaming, insert,
-    invalid, lookup, map_stream_error,
+    CatalogValue, EngineSink, ModelError, ObjectId, ObjectRecord, ObjectReference,
+    PrincipalContentStore, PrincipalProjectionEngine, PrincipalProjectionError, ReferenceKind,
+    VerifiedContent, build_content_streaming, insert, invalid, lookup, map_stream_error,
 };
 use crate::content::{
     BulkIngestDiagnostics, BulkIngestPhaseDurations, BulkIngestPolicy, ChunkingProfile,
@@ -671,7 +670,7 @@ where
             }
             retain_final_catalog_records(catalog, &mut catalog_records);
             let transaction =
-                self.encode_transaction(principal.clone(), header, None, catalog_records)?;
+                self.encode_transaction(principal.clone(), header.clone(), None, catalog_records)?;
             let commit = match observer {
                 Some(observer) => self.engine.commit_root_observed(
                     transaction,
@@ -681,13 +680,7 @@ where
             };
             match commit {
                 Ok(outcome) => {
-                    self.validated_catalogs.lock().insert(
-                        principal.clone(),
-                        CatalogValidation {
-                            root: catalog.map(|root| root.object),
-                            summary: catalog.map_or(CatalogSummary::default(), |root| root.summary),
-                        },
-                    );
+                    self.finish_catalog_commit(principal, header, outcome.root());
                     for prepared in completed.values() {
                         self.mark_verified(principal, prepared.verified);
                     }

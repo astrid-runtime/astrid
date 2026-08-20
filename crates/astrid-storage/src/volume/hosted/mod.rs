@@ -37,6 +37,7 @@ struct Extent {
 #[cfg(test)]
 thread_local! {
     static REGION_STATE_CLONES: Cell<usize> = const { Cell::new(0) };
+    static EXTENT_VISITS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[derive(Debug, Default)]
@@ -886,12 +887,23 @@ fn overlapping_extents(
     offset: u64,
     read_end: u64,
 ) -> Vec<(u64, Extent)> {
-    region_state
+    let start_key = region_state
         .extents
-        .range(..read_end)
+        .range(..=offset)
+        .next_back()
+        .and_then(|(start, extent)| (extent.logical_end > offset).then_some(*start))
+        .unwrap_or(offset);
+    let overlaps = region_state
+        .extents
+        .range(start_key..read_end)
         .filter(|(_, extent)| extent.logical_end > offset)
         .map(|(start, extent)| (*start, *extent))
-        .collect()
+        .collect::<Vec<_>>();
+    #[cfg(test)]
+    EXTENT_VISITS.with(|count| {
+        count.set(count.get().saturating_add(overlaps.len()));
+    });
+    overlaps
 }
 
 fn overlay_extent(extents: &mut BTreeMap<u64, Extent>, start: u64, end: u64, physical_offset: u64) {

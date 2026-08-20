@@ -18,10 +18,17 @@ impl<P: Ord, E> PrincipalContentStore<P, E> {
             validated_catalogs: Arc::new(
                 parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             ),
+            decoded_headers: Arc::new(parking_lot::Mutex::new(std::collections::BTreeMap::new())),
             validated_kv: Arc::new(crate::kv::KvValidationCache::default()),
             read_leases: Arc::new(super::ContentReadLeaseRegistry::default()),
             #[cfg(test)]
             list_invocations: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            list_prefix_invocations: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            prefix_exists_invocations: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            decode_header_invocations: std::sync::atomic::AtomicU64::new(0),
         }
     }
 

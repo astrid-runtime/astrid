@@ -453,6 +453,7 @@ fn read_region_at_copies_overlapping_extents_only() {
     }
     volume.sync().unwrap();
     REGION_STATE_CLONES.with(|count| count.set(0));
+    EXTENT_VISITS.with(|count| count.set(0));
     let mut bytes = [0_u8; 4];
     assert_eq!(volume.read_region_at(&region, 10, &mut bytes).unwrap(), 4);
     assert_eq!(&bytes, &[10, 11, 12, 13]);
@@ -461,4 +462,16 @@ fn read_region_at_copies_overlapping_extents_only() {
         0,
         "read_region_at cloned RegionState"
     );
+    let visited = EXTENT_VISITS.with(std::cell::Cell::get);
+    assert!(
+        visited <= 4,
+        "tail-overlapping read visited {visited} extents"
+    );
+
+    EXTENT_VISITS.with(|count| count.set(0));
+    let mut tail = [0_u8; 4];
+    assert_eq!(volume.read_region_at(&region, 252, &mut tail).unwrap(), 4);
+    assert_eq!(&tail, &[252 % 251, 253 % 251, 254 % 251, 255 % 251]);
+    let visited = EXTENT_VISITS.with(std::cell::Cell::get);
+    assert!(visited <= 4, "tail read visited {visited} earlier extents");
 }

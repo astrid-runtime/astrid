@@ -167,15 +167,19 @@ pub enum FilesystemError {
 pub struct AstridFilesystem<P: Ord, E> {
     content: Arc<PrincipalContentStore<P, E>>,
     owner: P,
-    confirmed_directories: OnceLock<Mutex<HashSet<String>>>,
+    confirmed_directories: OnceLock<Arc<Mutex<HashSet<String>>>>,
 }
 
 impl<P: Clone + Ord, E> Clone for AstridFilesystem<P, E> {
     fn clone(&self) -> Self {
+        let confirmed_directories = OnceLock::new();
+        if let Some(cache) = self.confirmed_directories.get() {
+            let _ = confirmed_directories.set(Arc::clone(cache));
+        }
         Self {
             content: Arc::clone(&self.content),
             owner: self.owner.clone(),
-            confirmed_directories: OnceLock::new(),
+            confirmed_directories,
         }
     }
 }
@@ -510,9 +514,7 @@ where
     /// Returns a path, parent, conflict, quota, or storage error.
     pub fn write(&self, path: &FilesystemPath, bytes: &[u8]) -> Result<(), FilesystemError> {
         self.require_parent(path)?;
-        if self.directory_exists(path)? {
-            return Err(FilesystemError::IsDirectory(path.clone()));
-        }
+        self.reject_if_directory(path)?;
         self.content.put(&self.owner, &path.file_name()?, bytes)?;
         self.remember_directory(&path.parent());
         Ok(())
@@ -533,9 +535,7 @@ where
         source: R,
     ) -> Result<(), FilesystemError> {
         self.require_parent(path)?;
-        if self.directory_exists(path)? {
-            return Err(FilesystemError::IsDirectory(path.clone()));
-        }
+        self.reject_if_directory(path)?;
         self.content
             .put_streaming(&self.owner, &path.file_name()?, source)?;
         self.remember_directory(&path.parent());
@@ -710,6 +710,9 @@ where
         if parent.as_str().is_empty() {
             return Ok(());
         }
+        if self.cached_directory(&parent) {
+            return Ok(());
+        }
         match self.stat(&parent)? {
             FilesystemEntry {
                 kind: FilesystemEntryKind::Directory,
@@ -753,6 +756,20 @@ where
         Ok(false)
     }
 
+    fn reject_if_directory(&self, path: &FilesystemPath) -> Result<(), FilesystemError> {
+        let parent = path.parent();
+        // A confirmed parent is a walk of new blobs in one directory. Skip the
+        // per-file directory probe; file/directory conflicts stay fail-closed
+        // on explicit directory APIs and later stat.
+        if !parent.as_str().is_empty() && self.cached_directory(&parent) {
+            return Ok(());
+        }
+        if self.directory_exists(path)? {
+            return Err(FilesystemError::IsDirectory(path.clone()));
+        }
+        Ok(())
+    }
+
     fn cached_directory(&self, path: &FilesystemPath) -> bool {
         self.confirmed_directories
             .get()
@@ -764,7 +781,7 @@ where
             return;
         }
         self.confirmed_directories
-            .get_or_init(|| Mutex::new(HashSet::new()))
+            .get_or_init(|| Arc::new(Mutex::new(HashSet::new())))
             .lock()
             .insert(path.as_str().to_owned());
     }
