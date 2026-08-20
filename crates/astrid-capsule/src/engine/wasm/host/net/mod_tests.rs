@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 
 use super::*;
 use crate::engine::wasm::bindings::astrid::net::host::{Host as _, HostTcpListener};
+use crate::engine::wasm::host_state::HostState;
 use crate::engine::wasm::test_fixtures::minimal_host_state;
 
 #[test]
@@ -56,12 +57,20 @@ fn free_port() -> u16 {
     port
 }
 
+/// Load-path N>1 worker Stores set `share_tcp_listeners` so a concrete port
+/// is cloned from the shared registry instead of racing the OS bind.
+fn worker_host_state(handle: tokio::runtime::Handle) -> HostState {
+    let mut state = minimal_host_state(handle);
+    state.share_tcp_listeners = true;
+    state
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn worker_stores_dedupe_onto_one_bound_socket() {
     let port = free_port();
     let handle = tokio::runtime::Handle::current();
-    let mut worker_a = minimal_host_state(handle.clone());
-    let mut worker_b = minimal_host_state(handle);
+    let mut worker_a = worker_host_state(handle.clone());
+    let mut worker_b = worker_host_state(handle);
     // Same capsule ⇒ shared registry and shared quota counter.
     worker_b.shared_listeners = Arc::clone(&worker_a.shared_listeners);
     worker_b.tcp_listener_count = Arc::clone(&worker_a.tcp_listener_count);
@@ -100,8 +109,8 @@ async fn worker_stores_dedupe_onto_one_bound_socket() {
 async fn localhost_and_loopback_literal_share_one_registry_entry() {
     let port = free_port();
     let handle = tokio::runtime::Handle::current();
-    let mut worker_a = minimal_host_state(handle.clone());
-    let mut worker_b = minimal_host_state(handle);
+    let mut worker_a = worker_host_state(handle.clone());
+    let mut worker_b = worker_host_state(handle);
     worker_b.shared_listeners = Arc::clone(&worker_a.shared_listeners);
     worker_b.tcp_listener_count = Arc::clone(&worker_a.tcp_listener_count);
 
@@ -135,7 +144,7 @@ async fn last_slot_drop_closes_os_socket_so_rebind_succeeds() {
     assert_eq!(
         state.shared_listeners.len(),
         0,
-        "N=1 must evict the registry on drop"
+        "N=1 never enters the shared registry"
     );
     assert_eq!(state.tcp_listener_count.load(Ordering::Acquire), 0);
     let rebound = state
@@ -148,8 +157,8 @@ async fn last_slot_drop_closes_os_socket_so_rebind_succeeds() {
 async fn binder_first_drop_keeps_quota_until_last_live_slot() {
     let port = free_port();
     let handle = tokio::runtime::Handle::current();
-    let mut binder = minimal_host_state(handle.clone());
-    let mut sibling = minimal_host_state(handle.clone());
+    let mut binder = worker_host_state(handle.clone());
+    let mut sibling = worker_host_state(handle.clone());
     sibling.shared_listeners = Arc::clone(&binder.shared_listeners);
     sibling.tcp_listener_count = Arc::clone(&binder.tcp_listener_count);
 
@@ -179,6 +188,30 @@ async fn binder_first_drop_keeps_quota_until_last_live_slot() {
         .bind_tcp("127.0.0.1".into(), port)
         .expect("port is free after last live slot drops");
     HostTcpListener::drop(&mut outsider, rebound).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn n1_double_bind_on_same_host_state_is_address_in_use() {
+    let port = free_port();
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    assert!(
+        !state.share_tcp_listeners,
+        "minimal_host_state models N=1 / interceptor HostState"
+    );
+    let first = state.bind_tcp("127.0.0.1".into(), port).unwrap();
+    assert_eq!(
+        state.shared_listeners.len(),
+        0,
+        "N=1 must not insert into shared_listeners"
+    );
+    assert!(
+        matches!(
+            state.bind_tcp("127.0.0.1".into(), port),
+            Err(ErrorCode::AddressInUse)
+        ),
+        "N=1 must attempt a real OS bind; a second bind on the same HostState must not clone the socket"
+    );
+    HostTcpListener::drop(&mut state, first).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

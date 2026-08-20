@@ -520,7 +520,9 @@ impl net::Host for HostState {
         //
         // Interceptor / non-worker pool instances each have a fresh
         // `shared_listeners` map, so a concrete-port bind is not cloned across
-        // pooled HostStates. Worker Stores (`bind_workers > 1`) share one map.
+        // pooled HostStates. Worker Stores (`bind_workers > 1`) share one map
+        // AND set `share_tcp_listeners`. N=1 keeps the map private *and*
+        // skips the Occupied clone, so a second bind is AddressInUse.
         //
         // `localhost` is accepted for ergonomics but never handed to the
         // resolver: local name service is mutable host configuration and may
@@ -532,12 +534,14 @@ impl net::Host for HostState {
         } else {
             host
         };
-        // Port 0 means "any ephemeral port", so two such requests are NOT the
-        // same address and must never dedupe — each is a distinct socket. Only
-        // a CONCRETE port can be shared, which is what a run-loop capsule's
-        // workers bind: the port declared in `net_bind`. Without this, a pooled
-        // capsule binding port 0 four times would get one socket four times.
-        let shareable = port != 0;
+        // Sharing is a worker-Store feature (`share_tcp_listeners`), not a
+        // property of the port. N=1 and interceptor HostStates must attempt a
+        // real OS bind so a second bind_tcp on the same state is AddressInUse
+        // — byte-identical to pre-bind_workers. Port 0 still never shares:
+        // two ephemeral requests are different addresses. Concrete-port
+        // sharing is what a run-loop capsule's workers bind: the port
+        // declared in `net_bind`.
+        let shareable = self.share_tcp_listeners && port != 0;
         let mut share = None;
         let mut listener_count = None;
         let listener: Arc<tokio::net::TcpListener> = if !shareable {

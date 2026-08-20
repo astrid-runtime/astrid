@@ -32,10 +32,11 @@ impl HostState {
     /// Build a fresh, empty shared-listener registry.
     ///
     /// Run-loop worker Stores (`bind_workers > 1`) clone ONE registry so they
-    /// dedupe onto a single bound `TcpListener`. Interceptor / non-worker pool
-    /// instances each get a fresh map so a concrete-port bind stays private.
-    /// Out-of-pool constructors use this so they do not have to name the
-    /// `dashmap` type.
+    /// dedupe onto a single bound `TcpListener`. Sharing is gated by
+    /// `share_tcp_listeners`; N=1 never consults this map. Interceptor /
+    /// non-worker pool instances each get a fresh map so a concrete-port bind
+    /// stays private. Out-of-pool constructors use this so they do not have
+    /// to name the `dashmap` type.
     #[must_use]
     pub fn new_shared_listeners() -> Arc<dashmap::DashMap<(String, u16), super::SharedTcpListener>>
     {

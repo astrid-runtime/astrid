@@ -51,7 +51,8 @@ pub struct CapabilitiesDef {
     /// is an independent Store running `run()` and accepting on the shared bound
     /// listener, so N workers serve N connections concurrently. None/1 = today's
     /// single-instance behavior. Only honored for run-loop capsules that declare
-    /// net_bind and no host_process.
+    /// a TCP `net_bind` (unix-only `unix:*` does not qualify) and no
+    /// `host_process`. Interceptors force the count back to 1.
     #[serde(default)]
     pub bind_workers: Option<usize>,
     /// Outbound TCP destinations the capsule is allowed to connect to.

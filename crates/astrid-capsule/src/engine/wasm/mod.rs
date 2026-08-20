@@ -10,8 +10,8 @@ use wasmtime::component::{Component, Linker};
 use crate::context::{CapsuleContext, WorkspaceCommitOp};
 use crate::engine::ExecutionEngine;
 use crate::engine::wasm::host_state::{
-    ConnectionIdentity, HostState, LifecyclePhase, PrincipalCancelTokens, PrincipalMount,
-    PrincipalMountLocation, WorkspaceMountResolver,
+    HostState, LifecyclePhase, PrincipalCancelTokens, PrincipalMount, PrincipalMountLocation,
+    WorkspaceMountResolver,
 };
 use crate::engine::wasm::limits::CapsuleRuntimeLimitsExt;
 use crate::error::{CapsuleError, CapsuleResult};
@@ -43,6 +43,7 @@ impl WorkspaceMountResolver for WorkspaceBranchResolver {
     }
 }
 
+mod bind_workers;
 #[allow(unreachable_pub)]
 pub(crate) mod bindings;
 pub mod host;
@@ -2556,52 +2557,34 @@ impl ExecutionEngine for WasmEngine {
             let st_owner_secret_store = owner_secret_store.clone();
             let st_owner_capsule_log = owner_capsule_log.clone();
             let kv_backend_for_state = kv_backend.clone();
-            // Shared across the whole pool so a verified per-connection
-            // principal (issue #45/#852) bound on the accepting instance is
-            // visible to whichever pooled instance later serves that
-            // connection — same Arc-sharing rationale as `process_tracker`.
-            let connection_principals: Arc<dashmap::DashMap<u32, ConnectionIdentity>> =
-                Arc::new(dashmap::DashMap::new());
-            // Lifecycle-tracking registry for the kernel connection counter:
-            // an accept inserts and emits `client.v1.connect`, the matching
-            // drop removes and emits `client.v1.disconnect`. Shared across the
-            // pool for the same reason as `connection_principals` (drop may
-            // land on a different instance than the accept).
-            let client_connections: Arc<
-                dashmap::DashMap<u32, astrid_core::principal::PrincipalId>,
-            > = Arc::new(dashmap::DashMap::new());
             // Concurrent run-loop workers (Approach B, shared listener). Only a
-            // loopback TCP server capsule (run-loop + `net_bind`, no
-            // `host_process`) is eligible; everyone else stays single-instance.
-            // Clamp to [1, instance_pool_size]. `None`/1 ⇒ today's
-            // single-worker behavior. Interceptors + workers>1 is forced to 1:
-            // N auto-subscribed interceptor sets would double-process events.
-            let worker_count = if has_run_export
-                && manifest.capabilities.host_process.is_empty()
-                && !manifest.capabilities.net_bind.is_empty()
-            {
-                let requested = manifest
-                    .capabilities
-                    .bind_workers
-                    .unwrap_or(1)
-                    .clamp(1, self.runtime_limits.instance_pool_size);
-                if requested > 1 && !manifest.effective_interceptors().is_empty() {
-                    tracing::warn!(
-                        capsule = %manifest.package.name,
-                        requested,
-                        "bind_workers > 1 ignored: capsule declares interceptors (N subscriptions would double-process events); using 1 worker"
-                    );
-                    1
-                } else {
-                    requested
-                }
-            } else {
-                1
-            };
+            // loopback TCP server capsule (run-loop + TCP `net_bind`, no
+            // `host_process`) is eligible; unix-only `net_bind` stays at one
+            // worker. Clamp to [1, instance_pool_size] — that ceiling is the
+            // interceptor pool max, reused until a dedicated knob exists.
+            // `None`/1 ⇒ today's single-worker behavior. Interceptors +
+            // workers>1 is forced to 1: N auto-subscribed interceptor sets
+            // would double-process events.
+            let worker_count = bind_workers::resolve_run_loop_worker_count(
+                manifest.package.name.as_str(),
+                has_run_export,
+                &manifest.capabilities,
+                !manifest.effective_interceptors().is_empty(),
+                self.runtime_limits.instance_pool_size,
+            );
+            let share_tcp_listeners = worker_count > 1;
             // Share the listener registry only across run-loop worker Stores.
             // Interceptor / non-worker pool instances each get a fresh map so a
             // concrete-port bind is not cloned across pooled HostStates.
-            let shared_listeners = (worker_count > 1).then(HostState::new_shared_listeners);
+            let shared_listeners = share_tcp_listeners.then(HostState::new_shared_listeners);
+            // Interceptor pools share identity maps: accept and drop may land
+            // on different Stores. Run-loop workers must NOT share them —
+            // each worker has its own Wasmtime ResourceTable, so u32 reps
+            // collide (two unix accepts can overwrite identity).
+            let share_identity_maps = !has_run_export;
+            let connection_principals =
+                share_identity_maps.then(HostState::new_connection_principals);
+            let client_connections = share_identity_maps.then(HostState::new_client_connections);
             let tcp_listener_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let capsule_net_stream_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let st_route_admission_gate = self.route_admission_gate.clone();
@@ -2723,11 +2706,16 @@ impl ExecutionEngine for WasmEngine {
                 subscription_count: 0,
                 process_count_total: 0,
                 process_count_by_principal: std::collections::HashMap::new(),
-                connection_principals: connection_principals.clone(),
-                client_connections: client_connections.clone(),
+                connection_principals: connection_principals
+                    .clone()
+                    .unwrap_or_else(HostState::new_connection_principals),
+                client_connections: client_connections
+                    .clone()
+                    .unwrap_or_else(HostState::new_client_connections),
                 shared_listeners: shared_listeners
                     .clone()
                     .unwrap_or_else(HostState::new_shared_listeners),
+                share_tcp_listeners,
                 // No frame in flight at construction; both the ingress
                 // principal and its authenticating device key_id are set per
                 // framed read.
@@ -4054,6 +4042,8 @@ async fn build_lifecycle_host_state(
         // Lifecycle hooks never bind a listener; a throwaway registry satisfies
         // the field.
         shared_listeners: HostState::new_shared_listeners(),
+        // Lifecycle hooks never share TCP listeners across Stores.
+        share_tcp_listeners: false,
         // Lifecycle hooks never forward client frames; no in-flight principal
         // or authenticating device.
         ingress_principal: None,

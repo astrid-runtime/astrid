@@ -152,6 +152,7 @@ impl HostState {
             // Hooks never bind a listener; a throwaway empty registry satisfies
             // the field.
             shared_listeners: Self::new_shared_listeners(),
+            share_tcp_listeners: false,
             // No client frame in flight; hooks never forward over publish-as, so
             // neither the ingress principal nor its device id / origin is set.
             ingress_principal: None,
