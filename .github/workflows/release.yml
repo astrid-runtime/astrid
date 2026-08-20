@@ -458,8 +458,9 @@ jobs:
           NOTES=release-notes.md
           # Exact-prefix match on the version header — the version goes in as a
           # string, never a regex, so dots (or any metacharacter in a tag name)
-          # cannot widen the match.
-          awk -v ver="$VERSION" 'index($0, "## [" ver "]") == 1 {found=1; next} /^## \[/{if(found) exit} found' CHANGELOG.md > "$NOTES"
+          # cannot widen the match. Fragments must already be rolled into
+          # CHANGELOG.md; this step refuses leftover files in changes/.
+          python3 scripts/changelog.py notes --version "$VERSION" --require-rolled > "$NOTES"
           if [ ! -s "$NOTES" ]; then
             echo "See [CHANGELOG.md](https://github.com/astrid-runtime/astrid/blob/${GITHUB_REF_NAME}/CHANGELOG.md) for details." > "$NOTES"
           fi

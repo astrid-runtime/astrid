@@ -18,7 +18,7 @@ Closes #<!-- issue number -->
 
 <!-- How was this PR validated? Pick what applies:
      - Code: `cargo test --workspace` passes, no new clippy warnings, new/updated tests for the change.
-     - Release: CI green on the version bump + changelog roll; no code changes.
+     - Release: CI green on the version bump + `scripts/changelog.py roll`; no code changes.
      - Docs / CI / chore: how you checked the result (rendered output, workflow run, dry-run, etc.).
      Include manual verification steps for a reviewer where they add signal. -->
 
@@ -31,7 +31,7 @@ None
 ## Checklist
 
 - [ ] Linked to an issue
-- [ ] CHANGELOG.md updated (entry under `[Unreleased]` — or `[Unreleased]` rolled into a version section for a release PR; not applicable to docs/CI-only changes)
+- [ ] Changelog fragment added under `changes/{issue}.{kind}.md` (docs/CI-only may skip; release PRs roll fragments into the version section instead of adding one)
 - [ ] I understand every change in this PR and can explain its design, risks, and validation.
 - [ ] I reviewed and tested any meaningful tool-generated output included in this PR.
 - [ ] Every non-bot, non-merge commit has a matching `Signed-off-by` trailer.
