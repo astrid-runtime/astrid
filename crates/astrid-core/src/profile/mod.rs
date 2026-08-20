@@ -16,8 +16,10 @@
 //! - Missing file → [`PrincipalProfile::default`]. Fresh principals without a
 //!   profile on disk get the permissive-ish defaults below (egress and
 //!   process spawn default to empty → fail-closed).
-//! - Malformed TOML, unknown fields, failed validation, or a future
-//!   `profile_version` → hard error. The operator must correct the file.
+//! - Malformed TOML, failed validation, or a future `profile_version` → hard
+//!   error. The operator must correct the file.
+//! - Unknown keys are ignored so upgrade and rollback across binaries do not
+//!   brick a home. `profile_version` is the breaking-change gate.
 //! - Save is atomic on Unix (write to `.tmp` with `0o600`, then `rename`).
 //!
 //! # Defaults
@@ -129,7 +131,7 @@ pub enum ProfileError {
     /// Filesystem IO failed (read, write, rename, `create_dir_all`).
     #[error("profile io error: {0}")]
     Io(#[from] io::Error),
-    /// Profile TOML failed to deserialize (syntax or `deny_unknown_fields`).
+    /// Profile TOML failed to deserialize (syntax error).
     #[error("profile parse error: {0}")]
     Parse(#[from] toml::de::Error),
     /// Profile failed to serialize back to TOML.
@@ -146,7 +148,6 @@ pub enum ProfileError {
 /// file yields [`PrincipalProfile::default`]. A malformed, invalid, or
 /// future-versioned file is a hard error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PrincipalProfile {
     /// Schema version. Bumped on breaking field changes.
     ///
@@ -233,7 +234,6 @@ pub enum AuthMethod {
 
 /// Authentication configuration for a principal.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     /// Accepted authentication methods. Serde rejects unknown variants.
     #[serde(default)]
@@ -290,7 +290,6 @@ impl AuthConfig {
 ///
 /// Empty `egress` means no outbound traffic is permitted (fail-closed).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     /// Egress allow-list patterns.
     ///
@@ -320,7 +319,6 @@ pub struct NetworkConfig {
 ///
 /// Empty `allow` means the principal cannot spawn external processes.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProcessConfig {
     /// Executables permitted for process spawn.
     ///
@@ -336,7 +334,6 @@ pub struct ProcessConfig {
 /// Enforcement happens in Layer 3. This struct only carries the values and
 /// rejects nonsense on load/save.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Quotas {
     /// Maximum resident memory in bytes. Must be > 0.
     #[serde(default = "default_max_memory_bytes")]
@@ -356,12 +353,6 @@ pub struct Quotas {
     /// `<=` [`BACKGROUND_PROCESSES_UPPER_BOUND`].
     #[serde(default = "default_max_background_processes")]
     pub max_background_processes: u32,
-
-    /// Persisted by unreleased compute-admission builds onto live homes.
-    /// Not enforced. Accepted so layout-2 upgrade can load those profiles;
-    /// omitted on the next save.
-    #[serde(default, skip_serializing)]
-    pub max_compute_workers: u32,
 
     /// Maximum persistent storage in bytes. Must be > 0.
     #[serde(default = "default_max_storage_bytes")]
@@ -470,7 +461,6 @@ impl Default for Quotas {
             max_timeout_secs: DEFAULT_MAX_TIMEOUT_SECS,
             max_ipc_throughput_bytes: DEFAULT_MAX_IPC_THROUGHPUT_BYTES,
             max_background_processes: DEFAULT_MAX_BACKGROUND_PROCESSES,
-            max_compute_workers: 0,
             max_storage_bytes: DEFAULT_MAX_STORAGE_BYTES,
             max_cpu_fuel_per_sec: DEFAULT_MAX_CPU_FUEL_PER_SEC,
             max_in_flight_calls: DEFAULT_MAX_IN_FLIGHT_CALLS,
@@ -551,12 +541,11 @@ mod tests {
             "max_cpu_fuel_per_sec = 0\n",
         );
         let profile: PrincipalProfile = toml::from_str(toml_src).unwrap();
-        assert_eq!(profile.quotas.max_compute_workers, 0);
         assert_eq!(profile.quotas.max_background_processes, 64);
         let emitted = toml::to_string(&profile).unwrap();
         assert!(
             !emitted.contains("max_compute_workers"),
-            "compatibility field must not be rewritten: {emitted}"
+            "unknown keys must not be rewritten: {emitted}"
         );
     }
 
@@ -585,7 +574,6 @@ mod tests {
                 max_timeout_secs: 600,
                 max_ipc_throughput_bytes: 5 * 1024 * 1024,
                 max_background_processes: 16,
-                max_compute_workers: 0,
                 max_storage_bytes: 2 * 1024 * 1024 * 1024,
                 max_cpu_fuel_per_sec: 4_000_000_000,
                 max_in_flight_calls: 6,

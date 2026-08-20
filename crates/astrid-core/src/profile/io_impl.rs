@@ -314,7 +314,7 @@ mod tests {
     fn load_quotas_missing_cpu_fuel_uses_default() {
         // A pre-existing profile.toml that predates the field still loads,
         // with `max_cpu_fuel_per_sec` falling back to the serde default
-        // (deny_unknown_fields rejects UNKNOWN fields, not missing ones).
+        // (unknown keys are ignored; missing keys use serde defaults).
         let (_d, home, principal) = scratch_home();
         let path = PrincipalProfile::path_for(&home, &principal);
         fs::write(&path, "[quotas]\nmax_memory_bytes = 1048576\n").unwrap();
