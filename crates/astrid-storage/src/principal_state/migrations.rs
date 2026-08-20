@@ -215,6 +215,11 @@ async fn migrate_legacy(
     let legacy =
         run_blocking_migration(move || SurrealKvStore::open(open_snapshot).map(Arc::new)).await?;
     let legacy_kv: Arc<dyn crate::KvStore> = legacy.clone();
+    let scan_legacy = Arc::clone(&legacy);
+    let capsule_aliases =
+        run_blocking_migration(move || collect_legacy_capsule_aliases(&scan_legacy)).await?;
+    owner_migration::admit_unbound_legacy_aliases(home, Arc::clone(&legacy_kv), &capsule_aliases)
+        .await?;
     owner_migration::populate_directory(home, principals, legacy_kv).await?;
     let migration_legacy = Arc::clone(&legacy);
     let migration_engine = Arc::clone(engine);
@@ -297,6 +302,35 @@ fn cleanup_legacy_snapshot(snapshot: &Path) -> StorageResult<()> {
         ))
     })?;
     super::native_io::sync_directory(parent)
+}
+
+#[cfg(feature = "legacy-surrealkv")]
+fn collect_legacy_capsule_aliases(
+    legacy: &crate::kv::SurrealKvStore,
+) -> StorageResult<Vec<astrid_core::principal::PrincipalId>> {
+    use std::collections::HashSet;
+
+    let mut aliases = HashSet::new();
+    let mut cursor = None;
+    loop {
+        let (entries, next) = legacy.migration_page(cursor.as_deref(), MIGRATION_PAGE_ENTRIES)?;
+        if entries.is_empty() {
+            break;
+        }
+        for entry in &entries {
+            let Some((principal, capsule)) = entry.namespace.split_once(":capsule:") else {
+                continue;
+            };
+            if capsule.is_empty() || capsule.contains(':') {
+                continue;
+            }
+            if let Ok(alias) = astrid_core::principal::PrincipalId::new(principal.to_owned()) {
+                aliases.insert(alias);
+            }
+        }
+        cursor = next;
+    }
+    Ok(aliases.into_iter().collect())
 }
 
 #[cfg(feature = "legacy-surrealkv")]

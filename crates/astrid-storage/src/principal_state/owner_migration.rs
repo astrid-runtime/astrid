@@ -28,6 +28,12 @@ const PREVIOUS_ROOT_FILE: &str = "roots.alias.previous";
 const MIGRATION_INTENT: &[u8] =
     b"migration=state-owner-alias-to-principal-uid\nfrom=state-owner-v1\nto=principal-uid-v1\n";
 
+#[cfg(feature = "legacy-surrealkv")]
+#[path = "unbound_legacy.rs"]
+mod unbound_legacy;
+#[cfg(feature = "legacy-surrealkv")]
+pub(super) use unbound_legacy::admit_unbound_legacy_aliases;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AliasStateOwner {
     System,
@@ -490,7 +496,10 @@ async fn derive_bindings(
     Ok(bindings)
 }
 
-fn load_initial_public_key(home: &AstridHome, alias: &PrincipalId) -> StorageResult<[u8; 32]> {
+pub(super) fn load_initial_public_key(
+    home: &AstridHome,
+    alias: &PrincipalId,
+) -> StorageResult<[u8; 32]> {
     let profile = astrid_core::PrincipalProfile::load(home, alias).map_err(|error| {
         StorageError::Connection(format!("load profile for principal {alias}: {error}"))
     })?;

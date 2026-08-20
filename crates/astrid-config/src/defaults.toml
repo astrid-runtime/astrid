@@ -386,6 +386,13 @@ approval_secs = 300
 # Set to 0 to disable idle timeout.
 idle_secs = 3600  # 1 hour
 
+# Wait budget for `astrid start` / companion spawn to observe the daemon
+# ready sentinel (seconds). First layout-1 cutover can import audit and
+# exceed 60s. When this budget expires the CLI does not SIGKILL a live
+# daemon; it disowns the child and tells the operator to check status.
+# Workspace config may raise this (not decrease-only like idle_secs).
+daemon_ready_secs = 600
+
 # ============================================================================
 # Session Management
 # ============================================================================

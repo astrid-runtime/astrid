@@ -36,6 +36,7 @@ const MAX_RELATIVE_PATH_BYTES: usize = 4096;
 mod paths;
 mod receipts;
 mod types;
+mod unbound;
 use paths::{
     append_relative, conflict_fs, conflict_path, destination_name, invalid_source,
     is_dedicated_path, logical_relative, receipt_path_for_display, receipt_uid_for_alias,
@@ -48,6 +49,7 @@ use receipts::{
     remove_stale_pages, validate_receipt_pages, write_receipt,
 };
 use types::{ByteCount, ContentDigest, EntryCount, InventoryDigest, PageCount, ReceiptSchema};
+pub(crate) use unbound::admit_unbound_legacy_principal_homes;
 
 /// Copy ordinary files for every admitted legacy principal.
 pub(crate) fn migrate_legacy_principal_homes(

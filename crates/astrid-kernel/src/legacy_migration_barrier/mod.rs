@@ -22,13 +22,18 @@ use astrid_capsule_install::{
 use astrid_core::dirs::{AstridHome, LAYOUT_VERSION, WorkspaceLayout};
 use astrid_core::identity::PrincipalUid;
 use astrid_core::principal::PrincipalId;
-use astrid_storage::{KvStore, PrincipalDirectory, RuntimePrincipalStore};
+use astrid_storage::{IdentityStore, KvStore, PrincipalDirectory, RuntimePrincipalStore};
 
 mod env_import;
 mod fs_hooks;
 mod hooks;
 mod host_fs;
 mod ledger;
+mod legacy_audit;
+use legacy_audit::handle_non_default_audit_source;
+mod legacy_tmp;
+#[cfg(test)]
+pub(super) use legacy_tmp::tighten_legacy_dedicated_directories;
 mod proof;
 mod secret;
 mod source;
@@ -143,10 +148,15 @@ pub(crate) fn reject_incomplete_layout_v2(home: &AstridHome) -> io::Result<()> {
 /// The origin is captured before `AstridHome::ensure` changes a fresh home to
 /// layout two. Fresh homes receive an explicit initialization ledger; released
 /// homes perform the full import before the caller commits the layout receipt.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "boot passes the singleton-owned cutover context explicitly"
+)]
 pub(crate) async fn run(
     home: &AstridHome,
     store: &RuntimePrincipalStore,
     directory: &PrincipalDirectory,
+    identity: &dyn IdentityStore,
     audit: &Arc<AuditLog>,
     layout_origin: LayoutOrigin,
     workspace_root: &Path,
@@ -176,6 +186,14 @@ pub(crate) async fn run(
             io::ErrorKind::InvalidData,
             "layout v2 has no complete component migration ledger; refusing to serve",
         ));
+    }
+
+    if matches!(layout_origin, LayoutOrigin::Legacy) {
+        crate::principal_home_migration::admit_unbound_legacy_principal_homes(
+            home, directory, identity,
+        )
+        .await?;
+        legacy_tmp::tighten_legacy_dedicated_directories(home, directory)?;
     }
 
     let bindings = directory.bindings();

@@ -961,6 +961,36 @@ fn test_idle_secs_can_decrease() {
 }
 
 #[test]
+fn test_daemon_ready_secs_can_increase() {
+    let baseline: toml::Value = toml::from_str(
+        r"
+        [timeouts]
+        daemon_ready_secs = 600
+    ",
+    )
+    .unwrap();
+
+    let workspace: toml::Value = toml::from_str(
+        r"
+        [timeouts]
+        daemon_ready_secs = 3600
+    ",
+    )
+    .unwrap();
+
+    let mut merged = baseline.clone();
+    deep_merge(&mut merged, &workspace);
+    enforce_restrictions(&mut merged, &baseline, &workspace);
+
+    assert_eq!(
+        merged["timeouts"]["daemon_ready_secs"]
+            .as_integer()
+            .unwrap(),
+        3600
+    );
+}
+
+#[test]
 fn test_allow_http_hooks_cannot_enable() {
     let baseline: toml::Value = toml::from_str(
         r"

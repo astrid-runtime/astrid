@@ -1117,6 +1117,7 @@ impl Kernel {
                         )
                     })?,
                     &principal_directory,
+                    identity_store.as_ref(),
                     &audit_log,
                     layout_origin,
                     &workspace_root,
@@ -3914,6 +3915,13 @@ pub(crate) fn preflight_legacy_audit_sources(
             validate_audit_tree(&audit_source, audit_tree_device(&audit_metadata))?;
             continue;
         }
+        if std::fs::read_dir(&audit_source)?
+            .next()
+            .transpose()?
+            .is_none()
+        {
+            continue;
+        }
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!(
@@ -5105,7 +5113,7 @@ async fn bootstrap_cli_root_user(
     Ok((user, identity))
 }
 
-async fn bootstrap_cli_root_ownership(
+pub(crate) async fn bootstrap_cli_root_ownership(
     store: &astrid_storage::OwnershipStore,
     principal_directory: &astrid_storage::PrincipalDirectory,
     root_user: astrid_core::AstridUserId,

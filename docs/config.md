@@ -224,6 +224,7 @@ subagent_secs = 300
 mcp_connect_secs = 10
 approval_secs = 300
 idle_secs = 3600
+daemon_ready_secs = 600
 ```
 
 ## Sessions

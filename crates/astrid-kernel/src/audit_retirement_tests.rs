@@ -70,16 +70,37 @@ fn audit_boot_rejects_unhandled_non_default_source() {
     let other = astrid_core::PrincipalId::new("other".to_owned()).expect("principal id");
     let other_home = home.principal_home(&other);
     other_home.ensure().expect("legacy principal layout");
+    std::fs::write(other_home.audit_dir().join("entry"), b"audit").expect("non-empty audit");
     let default_source = home
         .principal_home(&astrid_core::PrincipalId::default())
         .audit_dir();
 
     let error = preflight_legacy_audit_sources(&home, &default_source)
-        .expect_err("unhandled source must block boot");
+        .expect_err("unhandled non-empty source must block boot");
     assert!(
         error
             .to_string()
             .contains("only the default principal source")
     );
+    assert!(other_home.audit_dir().exists());
+    assert_eq!(
+        std::fs::read(other_home.audit_dir().join("entry")).expect("preserved"),
+        b"audit"
+    );
+}
+
+#[test]
+fn audit_boot_allows_empty_non_default_audit_directory() {
+    let directory = tempfile::tempdir().expect("temporary home");
+    let home = AstridHome::from_path(directory.path().join(".astrid"));
+    home.ensure().expect("home layout");
+    let other = astrid_core::PrincipalId::new("other".to_owned()).expect("principal id");
+    let other_home = home.principal_home(&other);
+    other_home.ensure().expect("legacy principal layout");
+    let default_source = home
+        .principal_home(&astrid_core::PrincipalId::default())
+        .audit_dir();
+    preflight_legacy_audit_sources(&home, &default_source)
+        .expect("empty non-default audit must not refuse cutover");
     assert!(other_home.audit_dir().exists());
 }

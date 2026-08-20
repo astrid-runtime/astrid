@@ -803,6 +803,7 @@ version = "0.10.4"
 dependencies = [
  "arc-swap",
  "astrid-core",
+ "astrid-crypto",
  "async-trait",
  "base64 0.23.1",
  "blake3",
