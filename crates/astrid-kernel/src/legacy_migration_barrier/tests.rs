@@ -881,3 +881,37 @@ fn destination_proof_keeps_prefixed_source_digest_in_verified_discard() {
     assert_eq!(proof.as_ref(), stored);
     assert!(proof.contains(&format!("source-digest={digest}")));
 }
+
+#[cfg(unix)]
+#[test]
+fn layout1_tmp_scratch_dirs_are_tightened_to_owner_only() {
+    let (_root, home) = test_home();
+    let alias = PrincipalId::default();
+    let uid = PrincipalUid::from_bytes([0x71; 32]);
+    let directory = PrincipalDirectory::default();
+    directory.register(alias.clone(), uid).expect("binding");
+    let principal_root = home.principal_home(&alias).root().to_path_buf();
+    astrid_core::platform_fs::ensure_private_directory(&principal_root)
+        .expect("private principal home");
+    let tmp = home.principal_home(&alias).tmp_dir();
+    fs::create_dir_all(&tmp).expect("tmp");
+    let scratch = tmp.join("scratch");
+    fs::create_dir_all(&scratch).expect("scratch");
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).expect("0755 tmp");
+    fs::set_permissions(&scratch, fs::Permissions::from_mode(0o755)).expect("0755 scratch");
+    assert_eq!(
+        fs::metadata(&scratch).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+
+    tighten_legacy_tmp_directories(&home, &directory).expect("tighten layout-1 tmp");
+    assert_eq!(
+        fs::metadata(&tmp).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&scratch).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    snapshot_path(&tmp).expect("private tmp snapshot after tighten");
+}

@@ -29,6 +29,9 @@ mod fs_hooks;
 mod hooks;
 mod host_fs;
 mod ledger;
+mod legacy_tmp;
+#[cfg(test)]
+pub(super) use legacy_tmp::tighten_legacy_tmp_directories;
 mod proof;
 mod secret;
 mod source;
@@ -188,6 +191,7 @@ pub(crate) async fn run(
             home, directory, identity,
         )
         .await?;
+        legacy_tmp::tighten_legacy_tmp_directories(home, directory)?;
     }
 
     let bindings = directory.bindings();
