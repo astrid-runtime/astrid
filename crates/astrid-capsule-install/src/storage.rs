@@ -594,8 +594,10 @@ fn reject_symlink_ancestors(root: &Path, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+mod leftover;
 mod migration;
 
+pub use leftover::retire_unmatched_legacy_authority_receipts;
 pub use migration::{
     LegacyCapsuleAuthorityReceipt, LegacyCapsuleMigrationReport, LegacyEnvSecretImportStatus,
     legacy_capsule_authority_status, legacy_env_secret_import_status, migrate_all_native_capsules,

@@ -20,7 +20,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths::resolve_target_dir_for_in_workspace;
 
+mod leftover;
 mod status;
+pub(crate) use leftover::{
+    parse_legacy_authority_receipt, quarantine_legacy_authority_receipt,
+    rebind_relocated_legacy_authority_receipt, retire_unmatched_authority_receipt_file,
+    unmatched_active_receipts,
+};
 pub use status::{LegacyAuthorityReceiptStatus, legacy_authority_receipt_status};
 
 const AUTHORITY_RECEIPT_DIR: &str = "capsule-authority";
@@ -456,14 +462,17 @@ impl Drop for AuthorityReceiptTransaction {
     }
 }
 
-struct AuthorityPaths {
-    directory: PathBuf,
-    active: PathBuf,
-    pending: PathBuf,
-    previous: PathBuf,
+pub(crate) struct AuthorityPaths {
+    pub(crate) directory: PathBuf,
+    pub(crate) active: PathBuf,
+    pub(crate) pending: PathBuf,
+    pub(crate) previous: PathBuf,
 }
 
-fn authority_paths(home: &AstridHome, target_dir: &Path) -> anyhow::Result<AuthorityPaths> {
+pub(crate) fn authority_paths(
+    home: &AstridHome,
+    target_dir: &Path,
+) -> anyhow::Result<AuthorityPaths> {
     let target = if target_dir.is_absolute() {
         target_dir.to_path_buf()
     } else {
