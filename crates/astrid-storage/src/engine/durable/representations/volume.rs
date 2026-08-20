@@ -231,6 +231,16 @@ fn verify_volume_blob(
     blob: BlobId,
     logical_bytes: u64,
 ) -> Result<(), DurableError> {
+    let named = crate::volume::VolumeRegion::new(region)
+        .map_err(|source| io_error("validate volume contiguous blob region", source))?;
+    let stored = volume
+        .region_len(&named)
+        .map_err(|source| io_error("read volume contiguous blob length", source))?;
+    if stored != logical_bytes {
+        return Err(DurableError::InvalidRepresentationState(
+            "volume contiguous blob length disagrees with its logical prefix",
+        ));
+    }
     let mut file = DurableFile::volume(Arc::clone(volume), region, false)?;
     let mut hasher = super::contiguous::blob_hasher(profile, logical_bytes);
     let mut remaining = logical_bytes;
