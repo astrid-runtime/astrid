@@ -236,6 +236,7 @@ fn quarantine_entry(
     let quarantine_root = home.migrations_dir().join(QUARANTINE_DIR);
     astrid_core::platform_fs::ensure_private_directory(&quarantine_root)?;
     let destination = unique_quarantine_path(&quarantine_root, file_name)?;
+    let source_parent = source.parent().map(Path::to_path_buf);
     fs::rename(source, &destination).map_err(|error| {
         io::Error::new(
             error.kind(),
@@ -246,7 +247,17 @@ fn quarantine_entry(
             ),
         )
     })?;
+    if let Some(parent) = source_parent.as_deref() {
+        sync_directory(parent)?;
+    }
     sync_parent(&destination)?;
+    let sidecar = destination.with_file_name(format!(
+        "{}.original-name",
+        destination
+            .file_name()
+            .map_or("leftover", |name| name.to_str().unwrap_or("leftover"))
+    ));
+    astrid_core::platform_fs::atomic_write_private_file(&sidecar, &os_str_bytes(file_name))?;
     tracing::warn!(
         leftover = %file_name.to_string_lossy(),
         reason,
@@ -276,9 +287,11 @@ fn unique_quarantine_path(root: &Path, file_name: &OsStr) -> io::Result<PathBuf>
 }
 
 fn encoded_file_name(name: &OsStr) -> String {
+    const MAX_SAFE_NAME: usize = 64;
     match name.to_str() {
         Some(text)
             if !text.is_empty()
+                && text.len() <= MAX_SAFE_NAME
                 && text != "."
                 && text != ".."
                 && text
@@ -287,30 +300,33 @@ fn encoded_file_name(name: &OsStr) -> String {
         {
             text.to_owned()
         },
-        Some(text) => format!("invalid-{}", hex::encode(text.as_bytes())),
-        None => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::ffi::OsStrExt as _;
-                format!("non-utf8-{}", hex::encode(name.as_bytes()))
-            }
-            #[cfg(not(unix))]
-            {
-                format!(
-                    "non-utf8-{}",
-                    hex::encode(name.to_string_lossy().as_bytes())
-                )
-            }
-        },
+        _ => format!("invalid-{}", blake3::hash(&os_str_bytes(name)).to_hex()),
     }
 }
 
-#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
-fn sync_parent(path: &Path) -> io::Result<()> {
+fn os_str_bytes(name: &OsStr) -> Vec<u8> {
     #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        fs::File::open(parent)?.sync_all()?;
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        name.as_bytes().to_vec()
     }
+    #[cfg(not(unix))]
+    {
+        name.to_string_lossy().as_bytes().to_vec()
+    }
+}
+
+fn sync_parent(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    fs::File::open(path)?.sync_all()?;
     #[cfg(not(unix))]
     let _ = path;
     Ok(())

@@ -340,6 +340,18 @@ fn identity_store(principals: &PrincipalDirectory) -> KvIdentityStore {
     )
 }
 
+fn quarantined_payloads(home: &AstridHome) -> Vec<std::path::PathBuf> {
+    fs::read_dir(home.migrations_dir().join("unbound-legacy-homes"))
+        .expect("quarantine dir")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_none_or(|name| !name.ends_with(".original-name"))
+        })
+        .collect()
+}
+
 fn write_ordinary_legacy_file(home: &AstridHome, alias: &PrincipalId, contents: &[u8]) {
     let source = home.principal_home(alias).root().to_path_buf();
     astrid_core::platform_fs::ensure_private_directory(&source).expect("legacy leftover home");
@@ -412,10 +424,7 @@ async fn invalid_legacy_home_name_is_quarantined_out_of_home() {
         .await
         .expect("quarantine invalid leftover");
     assert!(!invalid.exists());
-    let quarantined = fs::read_dir(home.migrations_dir().join("unbound-legacy-homes"))
-        .expect("quarantine dir")
-        .map(|entry| entry.expect("entry").path())
-        .collect::<Vec<_>>();
+    let quarantined = quarantined_payloads(&home);
     assert_eq!(quarantined.len(), 1);
     assert_eq!(
         fs::read(quarantined[0].join("keep-me.txt")).expect("preserved"),
@@ -491,10 +500,7 @@ async fn leftover_file_is_quarantined_without_minting_identity() {
         .expect("quarantine leftover file");
     assert!(!leftover_path.exists());
     assert!(principals.uid_for(&leftover).is_err());
-    let quarantined = fs::read_dir(home.migrations_dir().join("unbound-legacy-homes"))
-        .expect("quarantine dir")
-        .map(|entry| entry.expect("entry").path())
-        .collect::<Vec<_>>();
+    let quarantined = quarantined_payloads(&home);
     assert_eq!(quarantined.len(), 1);
     assert_eq!(
         fs::read(&quarantined[0]).expect("preserved"),
@@ -557,4 +563,91 @@ async fn unbound_leftover_is_adopted_into_the_operator_fleet() {
     let default_owner = graph.principal_owner(uid).expect("default owned");
     let leftover_owner = graph.principal_owner(leftover_uid).expect("leftover owned");
     assert_eq!(default_owner.fleet_uid, leftover_owner.fleet_uid);
+}
+
+#[tokio::test]
+async fn long_invalid_leftover_name_uses_bounded_quarantine_encoding() {
+    let (_directory, home, store, principals, principal, uid) = fixture().await;
+    write_ordinary_legacy_file(&home, &principal, b"default-home");
+    let long_name = "a".repeat(200);
+    let leftover = home.home_dir().join(&long_name);
+    astrid_core::platform_fs::ensure_private_directory(&leftover).expect("long leftover");
+    fs::write(leftover.join("keep-me.txt"), b"preserved").expect("long leftover file");
+    let identity = identity_store(&principals);
+    admit_unbound_legacy_principal_homes(&home, &principals, &identity)
+        .await
+        .expect("quarantine long leftover");
+    assert!(!leftover.exists());
+    let quarantine = home.migrations_dir().join("unbound-legacy-homes");
+    let names = fs::read_dir(&quarantine)
+        .expect("quarantine dir")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    let dest = names
+        .iter()
+        .find(|name| name.starts_with("invalid-") && !name.ends_with(".original-name"))
+        .expect("bounded quarantine name");
+    assert!(
+        dest.len() <= 80,
+        "quarantine component must stay well under ENAMETOOLONG: {dest}"
+    );
+    let dest_path = quarantine.join(dest);
+    assert_eq!(
+        fs::read(dest_path.join("keep-me.txt")).expect("preserved"),
+        b"preserved"
+    );
+    assert_eq!(
+        fs::read(quarantine.join(format!("{dest}.original-name"))).expect("sidecar"),
+        long_name.as_bytes()
+    );
+    migrate_legacy_principal_homes(&home, &store, &principals).expect("valid homes still migrate");
+    let filesystem = AstridFilesystem::new(store.content(), StateOwner::Principal(uid));
+    assert_eq!(
+        filesystem
+            .read(
+                &FilesystemPath::new("home/documents/note.txt").unwrap(),
+                0,
+                12
+            )
+            .unwrap(),
+        b"default-home"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn leftover_symlink_is_quarantined_without_minting_identity() {
+    let (_directory, home, store, principals, principal, uid) = fixture().await;
+    write_ordinary_legacy_file(&home, &principal, b"default-home");
+    let leftover = PrincipalId::new("legacy-agent").expect("valid leftover name");
+    let leftover_path = home.home_dir().join(leftover.as_str());
+    let target = home.root().join("symlink-target");
+    fs::write(&target, b"target-bytes").expect("symlink target");
+    std::os::unix::fs::symlink(&target, &leftover_path).expect("leftover symlink");
+    let identity = identity_store(&principals);
+    admit_unbound_legacy_principal_homes(&home, &principals, &identity)
+        .await
+        .expect("quarantine leftover symlink");
+    assert!(!leftover_path.exists() || leftover_path.symlink_metadata().is_err());
+    assert!(leftover_path.symlink_metadata().is_err());
+    assert!(principals.uid_for(&leftover).is_err());
+    migrate_legacy_principal_homes(&home, &store, &principals)
+        .expect("admitted homes still migrate");
+    let filesystem = AstridFilesystem::new(store.content(), StateOwner::Principal(uid));
+    assert_eq!(
+        filesystem
+            .read(
+                &FilesystemPath::new("home/documents/note.txt").unwrap(),
+                0,
+                12
+            )
+            .unwrap(),
+        b"default-home"
+    );
 }
