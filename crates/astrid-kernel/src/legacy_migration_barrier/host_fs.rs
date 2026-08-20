@@ -420,6 +420,14 @@ pub(super) fn preflight_legacy_audit_sources(
         if audit_source == default_source {
             default_source_present = true;
             validate_audit_tree(&audit_source, device_id(&audit_metadata))?;
+        } else if fs::read_dir(&audit_source)
+            .map_err(io::Error::other)?
+            .next()
+            .transpose()
+            .map_err(io::Error::other)?
+            .is_none()
+        {
+            continue;
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,

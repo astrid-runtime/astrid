@@ -915,3 +915,75 @@ fn layout1_tmp_scratch_dirs_are_tightened_to_owner_only() {
     );
     snapshot_path(&tmp).expect("private tmp snapshot after tighten");
 }
+
+#[test]
+fn empty_non_default_audit_is_retired_instead_of_refusing_cutover() {
+    let (_root, home) = test_home();
+    let default = PrincipalId::default();
+    let extra = PrincipalId::new("legacy-agent").expect("extra alias");
+    let default_uid = PrincipalUid::from_bytes([0x71; 32]);
+    let extra_uid = PrincipalUid::from_bytes([0x72; 32]);
+    let directory = PrincipalDirectory::default();
+    directory
+        .register(default.clone(), default_uid)
+        .expect("default binding");
+    directory
+        .register(extra.clone(), extra_uid)
+        .expect("extra binding");
+    for alias in [&default, &extra] {
+        let root = home.principal_home(alias).root().to_path_buf();
+        astrid_core::platform_fs::ensure_private_directory(&root).expect("principal home");
+        let audit = home.principal_home(alias).audit_dir();
+        fs::create_dir_all(&audit).expect("audit");
+        make_private_dir(&audit);
+    }
+    let extra_audit = home.principal_home(&extra).audit_dir();
+    let extra_snapshot = snapshot_path(&extra_audit).expect("empty extra audit snapshot");
+    assert!(extra_snapshot.present);
+    assert_eq!(extra_snapshot.entries, super::source::SourceCount::ZERO);
+    let mut snapshots = BTreeMap::new();
+    snapshots.insert(format!("principal:{extra_uid}:audit"), extra_snapshot);
+    reject_unsupported_sources(&home, &directory, &snapshots)
+        .expect("empty non-default audit must not refuse cutover");
+    assert!(
+        !extra_audit.exists(),
+        "empty non-default audit must be retired"
+    );
+}
+
+#[test]
+fn non_empty_non_default_audit_is_quarantined_with_bytes_preserved() {
+    let (_root, home) = test_home();
+    let extra = PrincipalId::new("legacy-agent").expect("extra alias");
+    let extra_uid = PrincipalUid::from_bytes([0x72; 32]);
+    let directory = PrincipalDirectory::default();
+    directory
+        .register(PrincipalId::default(), PrincipalUid::from_bytes([0x71; 32]))
+        .expect("default binding");
+    directory
+        .register(extra.clone(), extra_uid)
+        .expect("extra binding");
+    let extra_root = home.principal_home(&extra).root().to_path_buf();
+    astrid_core::platform_fs::ensure_private_directory(&extra_root).expect("principal home");
+    let extra_audit = home.principal_home(&extra).audit_dir();
+    fs::create_dir_all(&extra_audit).expect("audit");
+    make_private_dir(&extra_audit);
+    fs::write(extra_audit.join("entry"), b"keep-me").expect("audit bytes");
+    make_private_file(&extra_audit.join("entry"));
+    let extra_snapshot = snapshot_owner_controlled_path(&extra_audit).expect("audit snapshot");
+    assert!(extra_snapshot.present);
+    assert_ne!(extra_snapshot.entries, super::source::SourceCount::ZERO);
+    let mut snapshots = BTreeMap::new();
+    snapshots.insert(format!("principal:{extra_uid}:audit"), extra_snapshot);
+    reject_unsupported_sources(&home, &directory, &snapshots)
+        .expect("non-empty leftover audit is quarantined, not refused");
+    assert!(!extra_audit.exists());
+    let quarantined = home
+        .migrations_dir()
+        .join("unbound-legacy-audit")
+        .join("legacy-agent");
+    assert_eq!(
+        fs::read(quarantined.join("entry")).expect("preserved"),
+        b"keep-me"
+    );
+}

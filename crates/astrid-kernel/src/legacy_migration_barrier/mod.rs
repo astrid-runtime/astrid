@@ -29,6 +29,8 @@ mod fs_hooks;
 mod hooks;
 mod host_fs;
 mod ledger;
+mod legacy_audit;
+use legacy_audit::handle_non_default_audit_source;
 mod legacy_tmp;
 #[cfg(test)]
 pub(super) use legacy_tmp::tighten_legacy_tmp_directories;

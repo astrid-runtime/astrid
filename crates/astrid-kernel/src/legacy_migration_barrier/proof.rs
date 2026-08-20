@@ -48,6 +48,7 @@ impl DestinationProof {
             return Ok(Self(value));
         }
         let known_prefix = value.starts_with("verified-empty-v1:")
+            || value.starts_with("verified-quarantine-v1:")
             || value.starts_with("verified-discard-v1:")
             || value.starts_with("verified-capsule-authority-v1:")
             || value.starts_with("verified-system-env-v1:")

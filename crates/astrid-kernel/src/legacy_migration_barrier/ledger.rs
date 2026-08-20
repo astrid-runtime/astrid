@@ -5,8 +5,8 @@ pub(super) use super::source::{SourceCount, SourceDigest, SourceIdentity};
 use super::{
     AstridHome, BTreeMap, CAPSULE_AUTHORITY_RECEIPT_NAME, HOST_SECRET_RECEIPT_NAME, LEDGER_SCHEMA,
     MAX_BYTES, PrincipalDirectory, PrincipalId, PrincipalUid, REVOCATION_NAMESPACE,
-    REVOCATION_RECEIPT_KEY, RuntimePrincipalStore, io, path_exists, read_bounded_file,
-    retire_empty_directory, snapshot_path, storage_io,
+    REVOCATION_RECEIPT_KEY, RuntimePrincipalStore, handle_non_default_audit_source, io,
+    path_exists, read_bounded_file, retire_empty_directory, snapshot_path, storage_io,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -212,13 +212,7 @@ pub(super) async fn collect_destination_proofs(
             if alias == PrincipalId::default() {
                 audit_proof.clone()
             } else {
-                match sources.get(&format!("principal:{uid}:audit")) {
-                    Some(source) if source.present => DestinationProof::from_stored(format!(
-                        "verified-empty-v1:source-digest={}",
-                        source.digest
-                    ))?,
-                    _ => DestinationProof::absent(),
-                }
+                non_default_audit_proof(sources.get(&format!("principal:{uid}:audit")))?
             },
         );
         proofs.insert(
@@ -285,14 +279,13 @@ pub(super) async fn collect_destination_proofs(
                 let source = sources.get(name).ok_or_else(|| {
                     io::Error::other("migration source inventory is missing audit")
                 })?;
-                if source.present {
-                    // The barrier rejects non-default audit sources before
-                    // migration, so a historical present audit component is
-                    // necessarily the shared system chain and uses its
-                    // durable audit receipt proof.
+                if directory.uid_for(&PrincipalId::default()).is_err()
+                    && source.present
+                    && source.entries != SourceCount::ZERO
+                {
                     audit_proof.clone()
                 } else {
-                    DestinationProof::absent()
+                    non_default_audit_proof(Some(source))?
                 }
             },
             ("env" | "secret", Some(capsule)) => {
@@ -475,6 +468,22 @@ pub(super) fn validate_existing_proofs(
     Ok(())
 }
 
+fn non_default_audit_proof(source: Option<&SourceIdentity>) -> io::Result<DestinationProof> {
+    match source {
+        Some(source) if source.present && source.entries == SourceCount::ZERO => {
+            DestinationProof::from_stored(format!(
+                "verified-empty-v1:source-digest={}",
+                source.digest
+            ))
+        },
+        Some(source) if source.present => DestinationProof::from_stored(format!(
+            "verified-quarantine-v1:source-digest={}",
+            source.digest
+        )),
+        _ => Ok(DestinationProof::absent()),
+    }
+}
+
 fn principal_component_uid(name: &str) -> Option<PrincipalUid> {
     name.strip_prefix("principal:")
         .and_then(|rest| rest.split(':').next())
@@ -491,23 +500,22 @@ pub(super) fn reject_unsupported_sources(
     snapshots: &BTreeMap<String, SourceIdentity>,
 ) -> io::Result<()> {
     for (alias, uid) in directory.bindings() {
-        if alias != PrincipalId::default()
-            && snapshots
-                .get(&format!("principal:{uid}:audit"))
-                .is_some_and(|source| source.present)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "legacy audit source for non-default principal {alias} has no importer; refusing cutover"
-                ),
-            ));
+        if alias != PrincipalId::default() {
+            handle_non_default_audit_source(
+                home,
+                &alias,
+                snapshots.get(&format!("principal:{uid}:audit")),
+            )?;
         }
         for (name, path) in [
             ("kv", home.principal_home(&alias).kv_dir()),
             ("tokens", home.principal_home(&alias).tokens_dir()),
         ] {
-            if path_exists(&path)? && snapshot_path(&path)?.entries != 0 {
+            if !path_exists(&path)? {
+                continue;
+            }
+            let snapshot = snapshot_path(&path)?;
+            if snapshot.entries != SourceCount::ZERO {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     format!(

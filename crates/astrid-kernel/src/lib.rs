@@ -3915,6 +3915,13 @@ pub(crate) fn preflight_legacy_audit_sources(
             validate_audit_tree(&audit_source, audit_tree_device(&audit_metadata))?;
             continue;
         }
+        if std::fs::read_dir(&audit_source)?
+            .next()
+            .transpose()?
+            .is_none()
+        {
+            continue;
+        }
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!(
