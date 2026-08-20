@@ -13,8 +13,8 @@ use crate::{socket_client, theme};
 mod ready;
 pub(crate) use ready::disown_if_still_running;
 use ready::{
-    DAEMON_READY_POLL, ReadyWaitOutcome, daemon_ready_timeout_secs, readiness_attempts,
-    wait_for_ready,
+    DAEMON_READY_POLL, ReadyWaitOutcome, configured_spawn_timeout_secs, default_daemon_ready_secs,
+    readiness_attempts, wait_for_ready,
 };
 
 /// Build a hint string pointing the user to the daemon log directory.
@@ -112,7 +112,7 @@ async fn spawn_daemon_inner(
     // The readiness file is written only after load_all_capsules()
     // completes (including await_capsule_readiness()), so the accept
     // loop is guaranteed to be running by the time we connect.
-    let timeout_secs = daemon_ready_timeout_secs(workspace_root);
+    let timeout_secs = configured_spawn_timeout_secs(workspace_root);
     match wait_for_ready(ready_path, &mut child, timeout_secs).await {
         ReadyWaitOutcome::Ready => Ok(child),
         ReadyWaitOutcome::ChildExited(status) => {
@@ -220,7 +220,11 @@ pub(crate) async fn ensure_daemon_workspace_matches(workspace_root: Option<&Path
     let expected = expected_workspace_fingerprint(workspace_root)?;
     let ready_path = socket_client::readiness_path();
 
-    let timeout_secs = daemon_ready_timeout_secs(workspace_root);
+    // Default wait only: do not load operator config here. Every admin
+    // command including `agent list --format json` hits this path after
+    // logging is live; Config::load_with_layout would trace to stderr and
+    // poison merged stdout JSON in the crash-recovery smoke.
+    let timeout_secs = default_daemon_ready_secs();
     let attempts = readiness_attempts(timeout_secs, ready::DAEMON_READY_POLL_MILLIS);
     for _ in 0..attempts {
         match std::fs::read_to_string(&ready_path) {
@@ -300,7 +304,7 @@ pub(crate) async fn spawn_persistent_daemon() -> Result<()> {
 
     let mut child = cmd.spawn().context("Failed to spawn Astrid daemon")?;
 
-    let timeout_secs = daemon_ready_timeout_secs(Some(&ws));
+    let timeout_secs = configured_spawn_timeout_secs(Some(&ws));
     match wait_for_ready(&ready_path, &mut child, timeout_secs).await {
         ReadyWaitOutcome::Ready => {
             // Disown the child — it runs independently.

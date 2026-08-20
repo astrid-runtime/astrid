@@ -21,8 +21,17 @@ pub(super) const fn readiness_attempts(timeout_secs: u64, poll_millis: u64) -> u
     }
 }
 
-pub(super) fn daemon_ready_timeout_secs(workspace_root: Option<&Path>) -> u64 {
-    let default = astrid_config::TimeoutsSection::default().daemon_ready_secs;
+pub(super) fn default_daemon_ready_secs() -> u64 {
+    astrid_config::TimeoutsSection::default().daemon_ready_secs
+}
+
+/// Wait budget for `astrid start` / companion spawn. Loads operator config.
+///
+/// Must not run on the `agent list --format json` path: `Config::load_with_layout`
+/// emits tracing on stderr after logging is live, and callers that merge
+/// stderr into stdout (the crash-recovery smoke) then fail JSON parse.
+pub(super) fn configured_spawn_timeout_secs(workspace_root: Option<&Path>) -> u64 {
+    let default = default_daemon_ready_secs();
     let workspace_root = workspace_root
         .map(Path::to_path_buf)
         .or_else(|| std::env::current_dir().ok());
@@ -81,6 +90,7 @@ mod tests {
 
     #[test]
     fn default_ready_wait_is_ten_minutes() {
+        assert_eq!(default_daemon_ready_secs(), 600);
         assert_eq!(
             astrid_config::TimeoutsSection::default().daemon_ready_secs,
             600
@@ -101,6 +111,12 @@ mod tests {
                 .expect("legacy window fits"),
             60_000
         );
+    }
+
+    #[test]
+    fn ready_probe_timeout_does_not_depend_on_config_load() {
+        // agent list / workspace-match must use the default, not load_with_layout.
+        assert_eq!(default_daemon_ready_secs(), 600);
     }
 
     #[test]
