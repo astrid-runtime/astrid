@@ -4,16 +4,24 @@ on:
   push:
     branches: [main, stream-*]
     paths:
-      - 'scripts/test_v0104_macos_upgrade.sh'
+      - '**.rs'
+      - 'native/macos/**'
+      - 'crates/astrid-storage/**'
       - 'crates/astrid-storage-provider-fskit/**'
+      - 'e2e/fixtures/astrid-capsule-adversarial/**'
+      - 'scripts/test_v0104_macos_upgrade.sh'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - '.github/workflows/macos-v0104-upgrade.yml'
   pull_request:
     branches: [main]
     paths:
-      - 'scripts/test_v0104_macos_upgrade.sh'
+      - '**.rs'
+      - 'native/macos/**'
+      - 'crates/astrid-storage/**'
       - 'crates/astrid-storage-provider-fskit/**'
+      - 'e2e/fixtures/astrid-capsule-adversarial/**'
+      - 'scripts/test_v0104_macos_upgrade.sh'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - '.github/workflows/macos-v0104-upgrade.yml'
