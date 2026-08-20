@@ -197,7 +197,6 @@ async fn parent_exists_does_not_list_the_owner_catalog() {
     let directory = FilesystemPath::new("blobs").unwrap();
     filesystem.create_dir(&directory).unwrap();
     let header_decodes = filesystem.content.decode_header_invocations();
-    let prefix_exists = filesystem.content.prefix_exists_invocations();
     for index in 0..64_u32 {
         let path = FilesystemPath::new(format!("blobs/{index:04}")).unwrap();
         filesystem.write(&path, b"x").unwrap();
@@ -205,27 +204,41 @@ async fn parent_exists_does_not_list_the_owner_catalog() {
     assert_eq!(filesystem.content.list_invocations(), 0);
     assert_eq!(filesystem.content.list_prefix_invocations(), 0);
     assert_eq!(
-        filesystem.content.prefix_exists_invocations(),
-        prefix_exists,
-        "confirmed-parent writes still probed file-is-directory"
-    );
-    assert_eq!(
         filesystem.content.decode_header_invocations(),
         header_decodes,
         "each file write re-decoded the catalog header"
     );
 
     let extra = FilesystemPath::new("blobs/extra").unwrap();
+    let prefix_exists = filesystem.content.prefix_exists_invocations();
     filesystem.write(&extra, b"y").unwrap();
     assert_eq!(filesystem.content.list_invocations(), 0);
     assert_eq!(filesystem.content.list_prefix_invocations(), 0);
-    assert_eq!(
-        filesystem.content.prefix_exists_invocations(),
-        prefix_exists
+    assert!(
+        filesystem.content.prefix_exists_invocations() <= prefix_exists.saturating_add(1),
+        "extra write listed children instead of one prefix_exists"
     );
     assert_eq!(filesystem.read(&extra, 0, 1).unwrap(), b"y");
     assert_eq!(filesystem.content.list_invocations(), 0);
     assert_eq!(filesystem.content.list_prefix_invocations(), 0);
+}
+
+#[tokio::test]
+async fn write_still_rejects_a_directory_name_in_a_confirmed_parent() {
+    let (_directory, filesystem) = filesystem().await;
+    let parent = FilesystemPath::new("blobs").unwrap();
+    let nested = FilesystemPath::new("blobs/foo").unwrap();
+    let nested_file = FilesystemPath::new("blobs/foo/child").unwrap();
+    filesystem.create_dir(&parent).unwrap();
+    filesystem.create_dir(&nested).unwrap();
+    filesystem.write(&nested_file, b"x").unwrap();
+    filesystem
+        .write(&FilesystemPath::new("blobs/other").unwrap(), b"y")
+        .unwrap();
+    assert!(matches!(
+        filesystem.write(&nested, b"nope"),
+        Err(FilesystemError::IsDirectory(_))
+    ));
 }
 
 #[tokio::test]

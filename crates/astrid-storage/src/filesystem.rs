@@ -514,7 +514,9 @@ where
     /// Returns a path, parent, conflict, quota, or storage error.
     pub fn write(&self, path: &FilesystemPath, bytes: &[u8]) -> Result<(), FilesystemError> {
         self.require_parent(path)?;
-        self.reject_if_directory(path)?;
+        if self.directory_exists(path)? {
+            return Err(FilesystemError::IsDirectory(path.clone()));
+        }
         self.content.put(&self.owner, &path.file_name()?, bytes)?;
         self.remember_directory(&path.parent());
         Ok(())
@@ -535,7 +537,9 @@ where
         source: R,
     ) -> Result<(), FilesystemError> {
         self.require_parent(path)?;
-        self.reject_if_directory(path)?;
+        if self.directory_exists(path)? {
+            return Err(FilesystemError::IsDirectory(path.clone()));
+        }
         self.content
             .put_streaming(&self.owner, &path.file_name()?, source)?;
         self.remember_directory(&path.parent());
@@ -754,20 +758,6 @@ where
             return Ok(true);
         }
         Ok(false)
-    }
-
-    fn reject_if_directory(&self, path: &FilesystemPath) -> Result<(), FilesystemError> {
-        let parent = path.parent();
-        // A confirmed parent is a walk of new blobs in one directory. Skip the
-        // per-file directory probe; file/directory conflicts stay fail-closed
-        // on explicit directory APIs and later stat.
-        if !parent.as_str().is_empty() && self.cached_directory(&parent) {
-            return Ok(());
-        }
-        if self.directory_exists(path)? {
-            return Err(FilesystemError::IsDirectory(path.clone()));
-        }
-        Ok(())
     }
 
     fn cached_directory(&self, path: &FilesystemPath) -> bool {
