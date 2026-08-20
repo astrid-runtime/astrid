@@ -357,6 +357,12 @@ pub struct Quotas {
     #[serde(default = "default_max_background_processes")]
     pub max_background_processes: u32,
 
+    /// Persisted by unreleased compute-admission builds onto live homes.
+    /// Not enforced. Accepted so layout-2 upgrade can load those profiles;
+    /// omitted on the next save.
+    #[serde(default, skip_serializing)]
+    pub max_compute_workers: u32,
+
     /// Maximum persistent storage in bytes. Must be > 0.
     #[serde(default = "default_max_storage_bytes")]
     pub max_storage_bytes: u64,
@@ -464,6 +470,7 @@ impl Default for Quotas {
             max_timeout_secs: DEFAULT_MAX_TIMEOUT_SECS,
             max_ipc_throughput_bytes: DEFAULT_MAX_IPC_THROUGHPUT_BYTES,
             max_background_processes: DEFAULT_MAX_BACKGROUND_PROCESSES,
+            max_compute_workers: 0,
             max_storage_bytes: DEFAULT_MAX_STORAGE_BYTES,
             max_cpu_fuel_per_sec: DEFAULT_MAX_CPU_FUEL_PER_SEC,
             max_in_flight_calls: DEFAULT_MAX_IN_FLIGHT_CALLS,
@@ -523,6 +530,37 @@ mod tests {
     }
 
     #[test]
+    fn live_aos_codex_profile_with_max_compute_workers_loads() {
+        let toml_src = concat!(
+            "profile_version = 1\n",
+            "enabled = true\n",
+            "groups = [\"codex\"]\n",
+            "grants = []\n",
+            "revokes = []\n",
+            "capsules = [\"aos-mcp\"]\n",
+            "\n[auth]\nmethods = [\"keypair\"]\n",
+            "\n[network]\negress = []\n",
+            "\n[process]\nallow = []\n",
+            "\n[quotas]\n",
+            "max_memory_bytes = 4294967296\n",
+            "max_timeout_secs = 86400\n",
+            "max_ipc_throughput_bytes = 10485760\n",
+            "max_background_processes = 64\n",
+            "max_compute_workers = 0\n",
+            "max_storage_bytes = 17179869184\n",
+            "max_cpu_fuel_per_sec = 0\n",
+        );
+        let profile: PrincipalProfile = toml::from_str(toml_src).unwrap();
+        assert_eq!(profile.quotas.max_compute_workers, 0);
+        assert_eq!(profile.quotas.max_background_processes, 64);
+        let emitted = toml::to_string(&profile).unwrap();
+        assert!(
+            !emitted.contains("max_compute_workers"),
+            "compatibility field must not be rewritten: {emitted}"
+        );
+    }
+
+    #[test]
     fn roundtrip_populated() {
         let p = PrincipalProfile {
             profile_version: 1,
@@ -547,6 +585,7 @@ mod tests {
                 max_timeout_secs: 600,
                 max_ipc_throughput_bytes: 5 * 1024 * 1024,
                 max_background_processes: 16,
+                max_compute_workers: 0,
                 max_storage_bytes: 2 * 1024 * 1024 * 1024,
                 max_cpu_fuel_per_sec: 4_000_000_000,
                 max_in_flight_calls: 6,
