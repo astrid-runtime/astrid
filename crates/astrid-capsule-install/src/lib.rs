@@ -136,6 +136,7 @@ pub use storage::{
     migrate_all_native_capsules_with_report, migrate_native_capsules,
     migrate_native_capsules_with_report, publish_directory_package, publish_package,
     read_durable_meta, read_verified_durable_package, read_verified_durable_package_for_owner,
+    retire_unmatched_legacy_authority_receipts,
 };
 pub use wit::content_address_wit;
 

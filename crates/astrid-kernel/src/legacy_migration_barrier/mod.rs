@@ -18,6 +18,7 @@ use std::sync::Arc;
 use astrid_audit::AuditLog;
 use astrid_capsule_install::{
     legacy_capsule_authority_status, migrate_all_native_capsules_with_report,
+    retire_unmatched_legacy_authority_receipts,
 };
 use astrid_core::dirs::{AstridHome, LAYOUT_VERSION, WorkspaceLayout};
 use astrid_core::identity::PrincipalUid;
@@ -361,11 +362,16 @@ async fn migrate_legacy_layout(
         crate::migrate_legacy_profile_path(home, alias)?;
     }
     crate::principal_home_migration::migrate_legacy_principal_homes(home, store, directory)?;
-    let capsule_report =
-        migrate_all_native_capsules_with_report(&Arc::new(store.clone()), home, directory)
-            .map_err(|error| {
-                io::Error::other(format!("legacy capsule migration failed: {error}"))
-            })?;
+    let store_arc = Arc::new(store.clone());
+    let capsule_report = migrate_all_native_capsules_with_report(&store_arc, home, directory)
+        .map_err(|error| io::Error::other(format!("legacy capsule migration failed: {error}")))?;
+    let workspace_targets = workspace_portal_targets(workspace_root, workspace_layout)?;
+    retire_unmatched_legacy_authority_receipts(&store_arc, home, directory, &workspace_targets)
+        .map_err(|error| {
+            io::Error::other(format!(
+                "legacy leftover capsule authority retirement failed: {error}"
+            ))
+        })?;
     for (alias, uid) in &bindings {
         let owner = astrid_storage::StateOwner::Principal(*uid);
         let capsule_ids = store
