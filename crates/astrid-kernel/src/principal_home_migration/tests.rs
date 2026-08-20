@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt as _;
 
 use astrid_core::{PrincipalProfile, PrincipalUid};
 use astrid_storage::{
-    KvIdentityStore, KvQuotaResolver, MemoryKvStore, ScopedKvStore,
+    IdentityStore, KvIdentityStore, KvQuotaResolver, MemoryKvStore, ScopedKvStore,
     open_runtime_principal_store_with_directory,
 };
 
@@ -458,4 +458,26 @@ fn verify_fails_closed_on_unbound_leftover_home() {
         "{message}"
     );
     assert!(home.principal_home(&leftover).root().is_dir());
+}
+
+#[tokio::test]
+async fn leftover_local_alias_does_not_claim_cli_root_link() {
+    let (_directory, home, store, principals, principal, _uid) = fixture().await;
+    write_ordinary_legacy_file(&home, &principal, b"default-home");
+    let leftover = PrincipalId::new("local").expect("valid leftover alias");
+    write_ordinary_legacy_file(&home, &leftover, b"local-home");
+    let identity = identity_store(&principals);
+    admit_unbound_legacy_principal_homes(&home, &principals, &identity)
+        .await
+        .expect("admit leftover local");
+    assert!(
+        identity
+            .resolve("cli", "local")
+            .await
+            .expect("resolve cli/local")
+            .is_none(),
+        "leftover alias must not occupy the CLI root identity link"
+    );
+    assert!(principals.uid_for(&leftover).is_ok());
+    migrate_legacy_principal_homes(&home, &store, &principals).expect("migration after admit");
 }

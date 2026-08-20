@@ -18,8 +18,6 @@ use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope, PrincipalProfile}
 use astrid_storage::{IdentityError, IdentityStore, PrincipalDirectory};
 
 const QUARANTINE_DIR: &str = "unbound-legacy-homes";
-const IDENTITY_PLATFORM: &str = "cli";
-const IDENTITY_METHOD: &str = "system";
 
 /// Mint identities for leftover valid aliases and quarantine invalid names.
 ///
@@ -71,6 +69,15 @@ async fn admit_or_quarantine_entry(
     path: PathBuf,
     file_name: &OsStr,
 ) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(&path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return quarantine_entry(
+            home,
+            &path,
+            file_name,
+            "legacy principal home entry is not a regular directory",
+        );
+    }
     let Some(alias_text) = file_name.to_str() else {
         return quarantine_entry(
             home,
@@ -95,40 +102,17 @@ async fn admit_or_quarantine_entry(
     if directory.uid_for(&alias).is_ok() {
         return Ok(());
     }
-    mint_valid_leftover(home, directory, identity, &alias).await
+    mint_valid_leftover(home, identity, &alias).await
 }
 
 async fn mint_valid_leftover(
     home: &AstridHome,
-    directory: &PrincipalDirectory,
     identity: &dyn IdentityStore,
     alias: &PrincipalId,
 ) -> io::Result<()> {
     ensure_profile_with_genesis_key(home, alias)?;
     let public_key = genesis_public_key_bytes(home, alias)?;
-    let user = ensure_durable_identity(directory, identity, alias, public_key).await?;
-    match identity
-        .resolve(IDENTITY_PLATFORM, alias.as_str())
-        .await
-        .map_err(|error| identity_io(&error))?
-    {
-        Some(existing) if existing.id == user.id => {},
-        Some(existing) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "legacy principal {alias} identity link already points at {}",
-                    existing.id
-                ),
-            ));
-        },
-        None => {
-            identity
-                .link(IDENTITY_PLATFORM, alias.as_str(), user.id, IDENTITY_METHOD)
-                .await
-                .map_err(|error| identity_io(&error))?;
-        },
-    }
+    let user = ensure_durable_identity(identity, alias, public_key).await?;
     tracing::info!(
         principal = %alias,
         user_id = %user.id,
@@ -138,20 +122,10 @@ async fn mint_valid_leftover(
 }
 
 async fn ensure_durable_identity(
-    directory: &PrincipalDirectory,
     identity: &dyn IdentityStore,
     alias: &PrincipalId,
     public_key: [u8; 32],
 ) -> io::Result<astrid_core::AstridUserId> {
-    if directory.uid_for(alias).is_ok() {
-        let users = identity
-            .list_users()
-            .await
-            .map_err(|error| identity_io(&error))?;
-        if let Some(user) = users.into_iter().find(|user| user.principal == *alias) {
-            return Ok(user);
-        }
-    }
     let users = identity
         .list_users()
         .await
