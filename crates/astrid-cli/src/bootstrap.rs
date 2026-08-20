@@ -180,17 +180,28 @@ pub(crate) async fn run_or_connect(
     let socket_path = socket_client::proxy_socket_path();
     let ready_path = socket_client::readiness_path();
 
-    let needs_boot = match astrid_core::local_transport::connect_outcome(&socket_path).await {
-        Ok(astrid_core::local_transport::ConnectOutcome::Connected(stream)) => {
-            drop(stream);
+    let outcome = astrid_core::local_transport::connect_outcome(&socket_path)
+        .await
+        .context("Failed to check socket")?;
+    let action = commands::daemon::decide_ensure_action(
+        &outcome,
+        commands::daemon::recorded_daemon_pid_is_alive(),
+    );
+    let needs_boot = match action {
+        commands::daemon::EnsureAction::UseExisting => {
+            if let astrid_core::local_transport::ConnectOutcome::Connected(stream) = outcome {
+                drop(stream);
+            }
             println!(
                 "{}",
                 theme::Theme::info("Connecting to existing Astrid daemon...")
             );
             false
         },
-        Ok(astrid_core::local_transport::ConnectOutcome::Absent) => true,
-        Ok(astrid_core::local_transport::ConnectOutcome::Stale) => {
+        commands::daemon::EnsureAction::RefuseSecondBoot => {
+            anyhow::bail!(commands::daemon::unreachable_uplink_message());
+        },
+        commands::daemon::EnsureAction::CleanStaleAndSpawn => {
             println!(
                 "{}",
                 theme::Theme::warning("Found dead socket. Cleaning up and restarting daemon...")
@@ -200,7 +211,7 @@ pub(crate) async fn run_or_connect(
             let _ = std::fs::remove_file(&ready_path);
             true
         },
-        Err(error) => anyhow::bail!("Failed to check socket: {error}"),
+        commands::daemon::EnsureAction::Spawn => true,
     };
 
     let mut daemon_child: Option<std::process::Child> = None;
