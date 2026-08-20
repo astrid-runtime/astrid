@@ -330,7 +330,7 @@ fn storage_identity(error: &crate::identity::IdentityError) -> StorageError {
 mod tests {
     use super::*;
     use crate::PrincipalDirectory;
-    use crate::kv::{KvQuotaResolver, SurrealKvStore};
+    use crate::kv::{KvQuotaResolver, MemoryKvStore, SurrealKvStore};
     use crate::principal_state::{StateOwner, open_runtime_principal_store_with_directory};
     use astrid_core::profile::{DeviceKey, DeviceScope};
 
@@ -440,5 +440,93 @@ mod tests {
         );
         assert_eq!(users.len(), 2);
         store.kv().close().await.unwrap();
+    }
+
+    fn memory_identity_kv() -> Arc<dyn KvStore> {
+        Arc::new(MemoryKvStore::new())
+    }
+
+    fn quarantined_payloads(home: &AstridHome) -> Vec<PathBuf> {
+        fs::read_dir(home.migrations_dir().join("unbound-legacy-homes"))
+            .expect("quarantine dir")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_none_or(|name| !name.ends_with(".original-name"))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn storage_quarantines_invalid_leftover_home_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(directory.path());
+        astrid_core::platform_fs::ensure_private_directory(&home.home_dir()).unwrap();
+
+        let invalid = home.home_dir().join("not.valid");
+        astrid_core::platform_fs::ensure_private_directory(&invalid).unwrap();
+        fs::write(invalid.join("keep-me.txt"), b"preserved").unwrap();
+
+        let long_name = "a".repeat(200);
+        let long_path = home.home_dir().join(&long_name);
+        astrid_core::platform_fs::ensure_private_directory(&long_path).unwrap();
+        fs::write(long_path.join("keep-me.txt"), b"long-preserved").unwrap();
+
+        let file_path = home.home_dir().join("legacy-agent");
+        fs::write(&file_path, b"not-a-directory").unwrap();
+
+        #[cfg(unix)]
+        let symlink_path = {
+            let target = home.root().join("symlink-target");
+            fs::write(&target, b"target-bytes").unwrap();
+            let path = home.home_dir().join("symlink-agent");
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            path
+        };
+
+        admit_unbound_legacy_aliases(&home, memory_identity_kv(), &[])
+            .await
+            .expect("quarantine invalid leftovers");
+        assert!(!invalid.exists());
+        assert!(!long_path.exists());
+        assert!(!file_path.exists());
+        #[cfg(unix)]
+        assert!(symlink_path.symlink_metadata().is_err());
+
+        let payloads = quarantined_payloads(&home);
+        assert_eq!(payloads.len(), {
+            #[cfg(unix)]
+            {
+                4
+            }
+            #[cfg(not(unix))]
+            {
+                3
+            }
+        });
+        let names = payloads
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            names.iter().all(|name| name.len() <= 80),
+            "quarantine names must stay bounded: {names:?}"
+        );
+        let sidecars = fs::read_dir(home.migrations_dir().join("unbound-legacy-homes"))
+            .expect("quarantine dir")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".original-name"))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            sidecars
+                .iter()
+                .any(|path| fs::read(path).ok().as_deref() == Some(long_name.as_bytes())),
+            "original long name must be preserved beside the bounded payload"
+        );
     }
 }
