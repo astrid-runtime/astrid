@@ -180,6 +180,30 @@ where
         limits: RecoveryLimits,
         policy: DurableEnginePolicy<P>,
     ) -> Result<Self, DurableError> {
+        Self::open_volume_with_faults(
+            volume,
+            identity,
+            principal_codec,
+            limits,
+            policy,
+            Arc::new(NoFaults),
+        )
+    }
+
+    /// Open the durable engine over an Astrid-owned volume with an explicit
+    /// fault injector.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::open_volume`].
+    pub(in crate::engine::durable) fn open_volume_with_faults(
+        volume: Arc<dyn AstridVolume>,
+        identity: I,
+        principal_codec: C,
+        limits: RecoveryLimits,
+        policy: DurableEnginePolicy<P>,
+        faults: Arc<dyn FaultInjector>,
+    ) -> Result<Self, DurableError> {
         let identity = super::SharedIdentity::new(identity);
         let principal_codec = super::SharedPrincipalCodec::new(principal_codec);
         let (recovered, wal) = recover_volume(
@@ -197,10 +221,7 @@ where
             identity,
             principal_codec,
             limits,
-            EngineOpenOptions {
-                policy,
-                faults: Arc::new(NoFaults),
-            },
+            EngineOpenOptions { policy, faults },
             recovered,
             wal,
         ))

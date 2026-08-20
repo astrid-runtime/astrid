@@ -23,6 +23,12 @@ const PARENT_LABEL: &[u8] = b"parent";
 const STATE_LABEL: &[u8] = b"state";
 
 /// A root that is already resident without taking the engine writer lock.
+///
+/// Durable engines publish this from an in-process snapshot used by the
+/// disposable KV hot cache. It is not recovery authority: WAL replay and
+/// writer-locked [`KvProjectionEngine::current_kv_root`] remain the source of
+/// committed truth. Embeddings may see `None` while the engine is recovering
+/// or closed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadyKvRoot(Option<RootState>);
 

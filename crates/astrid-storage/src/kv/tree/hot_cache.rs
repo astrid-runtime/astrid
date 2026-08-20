@@ -69,6 +69,25 @@ pub trait KvReadCacheBudget<P>: Send + Sync {
     fn release(&self);
 }
 
+struct DisabledReadCacheBudget;
+
+impl<P> KvReadCacheBudget<P> for DisabledReadCacheBudget {
+    fn ensure_capacity(
+        &self,
+        _owner: &P,
+        _requested_total: usize,
+        _requested_owner: usize,
+    ) -> KvReadCacheCapacity {
+        KvReadCacheCapacity::Disabled
+    }
+
+    fn reconcile(&self, _resident_total: usize, _resident_by_owner: &BTreeMap<P, usize>) {}
+
+    fn release_owner(&self, _owner: &P) {}
+
+    fn release(&self) {}
+}
+
 struct FixedReadCacheBudget {
     capacity_bytes: NonZeroUsize,
     owner_capacity_bytes: NonZeroUsize,
@@ -153,16 +172,34 @@ impl<P> KvReadCacheConfig<P> {
             entries_per_owner,
         }
     }
-}
 
-impl<P> Default for KvReadCacheConfig<P> {
-    fn default() -> Self {
+    /// Do not retain point reads until a bounded or governed budget is supplied.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            budget: Arc::new(DisabledReadCacheBudget),
+            owner_limit: NonZeroUsize::MIN,
+            entries_per_owner: NonZeroUsize::MIN,
+        }
+    }
+
+    /// Opt-in fixed budget using the documented 64 MiB / 4 MiB-per-owner ceilings.
+    ///
+    /// Callers must reserve that memory. [`Default`] never selects this budget.
+    #[must_use]
+    pub fn reserved_64_mib() -> Self {
         Self::bounded(
             NonZeroUsize::new(DEFAULT_CACHE_BYTES).expect("non-zero cache size"),
             NonZeroUsize::new(DEFAULT_OWNER_BYTES).expect("non-zero owner cache size"),
             NonZeroUsize::new(DEFAULT_OWNER_LIMIT).expect("non-zero owner limit"),
             NonZeroUsize::new(DEFAULT_ENTRIES_PER_OWNER).expect("non-zero entry limit"),
         )
+    }
+}
+
+impl<P> Default for KvReadCacheConfig<P> {
+    fn default() -> Self {
+        Self::disabled()
     }
 }
 
@@ -641,6 +678,23 @@ mod tests {
         assert!(matches!(
             cache.get(&"bob", Some(root(1)), b"key"),
             HotRead::Hit(Some(value)) if value == vec![2; 100]
+        ));
+    }
+
+    #[test]
+    fn default_config_retains_nothing_until_governed_capacity_is_supplied() {
+        let cache = KvHotCache::new(KvReadCacheConfig::default());
+        cache.insert(&"alice", Some(root(1)), b"key".to_vec(), Some(b"value"));
+        assert!(matches!(
+            cache.get(&"alice", Some(root(1)), b"key"),
+            HotRead::Miss
+        ));
+
+        let cache = KvHotCache::new(KvReadCacheConfig::reserved_64_mib());
+        cache.insert(&"alice", Some(root(1)), b"key".to_vec(), Some(b"value"));
+        assert!(matches!(
+            cache.get(&"alice", Some(root(1)), b"key"),
+            HotRead::Hit(Some(value)) if value == b"value"
         ));
     }
 

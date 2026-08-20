@@ -168,7 +168,11 @@ impl<P: Ord, I, R, E> TreeKvStore<P, I, R, E> {
         }
     }
 
-    /// Enable bounded, disposable point-read acceleration.
+    /// Enable disposable point-read acceleration under `config`.
+    ///
+    /// [`KvReadCacheConfig::default`] retains nothing. Supply
+    /// [`KvReadCacheConfig::bounded`], [`KvReadCacheConfig::reserved_64_mib`],
+    /// or [`KvReadCacheConfig::governed`] after reserving the charged bytes.
     #[must_use]
     pub fn with_read_cache(mut self, config: KvReadCacheConfig<P>) -> Self {
         self.hot_cache = Some(Arc::new(KvHotCache::new(config)));

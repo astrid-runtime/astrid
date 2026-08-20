@@ -60,7 +60,7 @@ fn native_fixture() -> (tempfile::TempDir, Arc<NativeEngine>, NativeStore) {
         .unwrap(),
     );
     let store = TreeKvStore::from_engine(Arc::clone(&engine), Resolver)
-        .with_read_cache(KvReadCacheConfig::default());
+        .with_read_cache(KvReadCacheConfig::reserved_64_mib());
     (directory, engine, store)
 }
 
@@ -85,7 +85,7 @@ fn native_wal_fixture() -> (tempfile::TempDir, Arc<NativeEngine>, NativeStore) {
         .unwrap(),
     );
     let store = TreeKvStore::from_engine(Arc::clone(&engine), Resolver)
-        .with_read_cache(KvReadCacheConfig::default());
+        .with_read_cache(KvReadCacheConfig::reserved_64_mib());
     (directory, engine, store)
 }
 
@@ -540,7 +540,7 @@ async fn assert_native_audit_reopen(directory: &tempfile::TempDir, batches: &[Au
         .unwrap(),
     );
     let reopened = TreeKvStore::from_engine(Arc::clone(&reopened_engine), Resolver)
-        .with_read_cache(KvReadCacheConfig::default());
+        .with_read_cache(KvReadCacheConfig::reserved_64_mib());
     assert_native_audit_values(&reopened, batches).await;
     reopened.close().await.unwrap();
 }

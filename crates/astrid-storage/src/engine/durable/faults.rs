@@ -115,6 +115,7 @@ mod tests {
             FaultPoint::AfterContiguousStatePublish,
             FaultPoint::AfterCompactionRepresentationRebase,
             FaultPoint::AfterCompactionBlobRetirement,
+            FaultPoint::AfterWalPublication,
         ];
 
         for (expected, point) in points.into_iter().enumerate() {

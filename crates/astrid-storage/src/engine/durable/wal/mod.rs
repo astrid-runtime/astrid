@@ -85,3 +85,6 @@ pub(super) fn durable_error(error: WalError) -> DurableError {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod volume_crash_tests;

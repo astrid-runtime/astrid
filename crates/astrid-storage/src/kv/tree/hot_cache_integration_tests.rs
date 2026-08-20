@@ -85,7 +85,7 @@ async fn repeated_point_read_uses_root_scoped_hot_value() {
         Arc::clone(&engine),
         Resolver,
     )
-    .with_read_cache(KvReadCacheConfig::default());
+    .with_read_cache(KvReadCacheConfig::reserved_64_mib());
     store
         .set("alice:capsule:test", "answer", vec![42; 128])
         .await
@@ -121,7 +121,7 @@ async fn hot_value_never_crosses_root_or_principal_boundaries() {
         Arc::clone(&engine),
         Resolver,
     )
-    .with_read_cache(KvReadCacheConfig::default());
+    .with_read_cache(KvReadCacheConfig::reserved_64_mib());
     let independent_writer =
         TreeKvStore::<String, Blake3ObjectIdentityV1, Resolver, _>::from_engine(
             Arc::clone(&engine),
@@ -167,7 +167,7 @@ async fn owner_purge_reclaims_only_that_owners_hot_entries() {
         Arc::clone(&engine),
         Resolver,
     )
-    .with_read_cache(KvReadCacheConfig::default());
+    .with_read_cache(KvReadCacheConfig::reserved_64_mib());
 
     store
         .set("alice:capsule:test", "key", b"alice".to_vec())
@@ -195,4 +195,33 @@ async fn owner_purge_reclaims_only_that_owners_hot_entries() {
     assert_eq!(engine.object_loads(), loads_after_purge);
     assert_eq!(store.get("alice:capsule:test", "key").await.unwrap(), None);
     assert!(engine.object_loads() > loads_after_purge);
+}
+
+#[tokio::test]
+async fn default_with_read_cache_retains_nothing_until_governed_capacity_is_supplied() {
+    let engine = Arc::new(CountingEngine::new());
+    let store = TreeKvStore::<String, Blake3ObjectIdentityV1, Resolver, _>::from_engine(
+        Arc::clone(&engine),
+        Resolver,
+    )
+    .with_read_cache(KvReadCacheConfig::default());
+    store
+        .set("alice:capsule:test", "answer", vec![42; 128])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.get("alice:capsule:test", "answer").await.unwrap(),
+        Some(vec![42; 128])
+    );
+    let first_loads = engine.object_loads();
+    assert!(first_loads > 0);
+    assert_eq!(
+        store.get("alice:capsule:test", "answer").await.unwrap(),
+        Some(vec![42; 128])
+    );
+    assert!(
+        engine.object_loads() > first_loads,
+        "Default read cache must not retain values without a reserved or governed budget"
+    );
 }
