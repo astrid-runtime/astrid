@@ -13,15 +13,19 @@ pub(super) const DAEMON_READY_POLL_MILLIS: u64 = 50;
 pub(super) const DAEMON_READY_POLL: Duration = Duration::from_millis(DAEMON_READY_POLL_MILLIS);
 
 pub(super) const fn readiness_attempts(timeout_secs: u64, poll_millis: u64) -> u64 {
-    let Some(timeout_millis) = timeout_secs.checked_mul(1_000) else {
-        panic!("daemon readiness timeout overflow")
-    };
-    timeout_millis.div_ceil(poll_millis)
+    match timeout_secs.checked_mul(1_000) {
+        Some(timeout_millis) => timeout_millis.div_ceil(poll_millis),
+        // Operator-settable u64; do not panic after spawn. Overflow means
+        // "wait while the child lives".
+        None => u64::MAX,
+    }
 }
 
-pub(super) fn daemon_ready_timeout_secs() -> u64 {
+pub(super) fn daemon_ready_timeout_secs(workspace_root: Option<&Path>) -> u64 {
     let default = astrid_config::TimeoutsSection::default().daemon_ready_secs;
-    let workspace_root = std::env::current_dir().ok();
+    let workspace_root = workspace_root
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok());
     astrid_config::Config::load_with_layout(
         workspace_root.as_deref(),
         crate::workspace_layout::current(),
@@ -96,6 +100,14 @@ mod tests {
                 .checked_mul(DAEMON_READY_POLL_MILLIS)
                 .expect("legacy window fits"),
             60_000
+        );
+    }
+
+    #[test]
+    fn max_daemon_ready_secs_does_not_overflow_attempt_count() {
+        assert_eq!(
+            readiness_attempts(u64::MAX, DAEMON_READY_POLL_MILLIS),
+            u64::MAX
         );
     }
 

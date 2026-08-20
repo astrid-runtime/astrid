@@ -62,11 +62,12 @@ fn boot_log_stderr() -> std::process::Stdio {
 /// Spawn the daemon process and wait for it to signal readiness.
 ///
 /// Returns the child process handle on success. The caller must `drop()` it
-/// after a successful handshake (to disown), or `kill()` + `wait()` on failure.
+/// after a successful handshake (to disown). If the daemon is still starting
+/// after the wait budget, this disowns the live child instead of SIGKILL.
 ///
 /// # Errors
-/// Returns an error if the daemon binary is not found, fails to spawn, or
-/// doesn't become ready within the bounded startup window.
+/// Returns an error if the daemon binary is not found, fails to spawn, exits
+/// before ready, or is still starting after `timeouts.daemon_ready_secs`.
 pub(crate) async fn spawn_daemon(
     ready_path: &std::path::Path,
     workspace_root: Option<&Path>,
@@ -111,7 +112,7 @@ async fn spawn_daemon_inner(
     // The readiness file is written only after load_all_capsules()
     // completes (including await_capsule_readiness()), so the accept
     // loop is guaranteed to be running by the time we connect.
-    let timeout_secs = daemon_ready_timeout_secs();
+    let timeout_secs = daemon_ready_timeout_secs(workspace_root);
     match wait_for_ready(ready_path, &mut child, timeout_secs).await {
         ReadyWaitOutcome::Ready => Ok(child),
         ReadyWaitOutcome::ChildExited(status) => {
@@ -219,7 +220,7 @@ pub(crate) async fn ensure_daemon_workspace_matches(workspace_root: Option<&Path
     let expected = expected_workspace_fingerprint(workspace_root)?;
     let ready_path = socket_client::readiness_path();
 
-    let timeout_secs = daemon_ready_timeout_secs();
+    let timeout_secs = daemon_ready_timeout_secs(workspace_root);
     let attempts = readiness_attempts(timeout_secs, ready::DAEMON_READY_POLL_MILLIS);
     for _ in 0..attempts {
         match std::fs::read_to_string(&ready_path) {
@@ -299,7 +300,7 @@ pub(crate) async fn spawn_persistent_daemon() -> Result<()> {
 
     let mut child = cmd.spawn().context("Failed to spawn Astrid daemon")?;
 
-    let timeout_secs = daemon_ready_timeout_secs();
+    let timeout_secs = daemon_ready_timeout_secs(Some(&ws));
     match wait_for_ready(&ready_path, &mut child, timeout_secs).await {
         ReadyWaitOutcome::Ready => {
             // Disown the child — it runs independently.
