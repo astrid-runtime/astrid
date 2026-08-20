@@ -1,0 +1,24 @@
+# Runtime E2E fixture for astrid#1231: concurrent run-loop workers.
+#
+# Serves a loopback TCP port and deliberately BLOCKS for a fixed interval per
+# request, simulating a capsule waiting on upstream I/O. With one worker the
+# requests serialize; with N they do not. The blocking is the whole point — a
+# fast handler would not distinguish the two.
+#
+# `bind_workers` is overridden per-run by the harness via `--var`, so one
+# fixture proves both the serial baseline and the concurrent result.
+[package]
+name = "astrid-capsule-concurrency"
+version = "0.0.0"
+description = "Runtime E2E fixture that serves a slow loopback TCP port"
+authors = ["Unicity Labs <info@unicity-labs.com>"]
+astrid-version = ">=0.10.4"
+
+[[component]]
+id = "concurrency"
+file = "astrid_capsule_concurrency.wasm"
+type = "executable"
+
+[capabilities]
+net_bind = ["127.0.0.1:18231"]
+bind_workers = 5

@@ -39,7 +39,7 @@ use crate::engine::wasm::bindings::astrid::net::host::{
 };
 use crate::engine::wasm::host::http::is_safe_ip;
 use crate::engine::wasm::host::util;
-use crate::engine::wasm::host_state::{HostState, NetStream, TcpStreamSlot};
+use crate::engine::wasm::host_state::{HostState, NetStream, SharedTcpListener, TcpStreamSlot};
 
 mod client_lifecycle;
 pub(crate) mod handshake;
@@ -111,7 +111,50 @@ pub(super) struct TcpListenerSlot {
     pub(super) listener: Arc<tokio::net::TcpListener>,
     pub(super) pending: Arc<PendingTcpConnection>,
     pub(super) cancel_token: tokio_util::sync::CancellationToken,
-    pub(super) listener_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Concrete-port registry lease. Last drop evicts the entry (closing the
+    /// OS socket) and releases the listener quota. `None` for an unshareable
+    /// (port 0) bind, which charges and releases quota on this slot alone.
+    pub(super) share: Option<TcpListenerShare>,
+    /// Quota release for an unshareable bind. Concrete-port quota tracks the
+    /// live socket via [`TcpListenerShare`], not the binder slot.
+    pub(super) listener_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+/// Lease on a `shared_listeners` registry entry for one guest slot.
+pub(super) struct TcpListenerShare {
+    key: (String, u16),
+    registry: Arc<dashmap::DashMap<(String, u16), SharedTcpListener>>,
+    quota: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl TcpListenerShare {
+    fn release(self) {
+        match self.registry.entry(self.key) {
+            dashmap::mapref::entry::Entry::Occupied(occupied) => {
+                let previous = occupied.get().holders.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |count| count.checked_sub(1),
+                );
+                match previous {
+                    Ok(1) => {
+                        occupied.remove();
+                        let released =
+                            self.quota
+                                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                                    count.checked_sub(1)
+                                });
+                        debug_assert!(released.is_ok(), "TCP listener quota underflow");
+                    },
+                    Ok(_) => {},
+                    Err(_) => debug_assert!(false, "TCP listener holder underflow"),
+                }
+            },
+            dashmap::mapref::entry::Entry::Vacant(_) => {
+                debug_assert!(false, "shared listener missing on slot drop");
+            },
+        }
+    }
 }
 
 pub(super) struct PendingTcpConnection {
@@ -147,11 +190,17 @@ impl Drop for PendingTcpConnection {
 
 impl Drop for TcpListenerSlot {
     fn drop(&mut self) {
+        if let Some(share) = self.share.take() {
+            share.release();
+            return;
+        }
+        let Some(listener_count) = self.listener_count.as_ref() else {
+            return;
+        };
         let decremented =
-            self.listener_count
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                    count.checked_sub(1)
-                });
+            listener_count.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            });
         debug_assert!(decremented.is_ok(), "TCP listener quota underflow");
     }
 }
@@ -457,68 +506,185 @@ impl net::Host for HostState {
             return Err(ErrorCode::AirlockRejected);
         }
 
-        // Bind a fresh tokio listener on the daemon runtime. Quick op — the
-        // non-cancellable bounded_block_on is fine (accept, which blocks
-        // indefinitely, uses the cancellable variant instead).
-        let rt = self.runtime_handle.clone();
-        let sem = self.blocking_semaphore.clone();
-        // `localhost` is accepted for ergonomics, but never handed back to the
+        // Resolve the listener via the shared registry so a run-loop capsule's
+        // N worker Stores dedupe onto ONE bound socket (Approach B): the first
+        // worker binds, the rest observe the Occupied entry and clone its
+        // `Arc<TcpListener>`. All N then block on `accept()` against the single
+        // OS accept queue, which load-balances (SO_REUSEPORT does NOT on macOS:
+        // it delivers every connection to the most-recent bind).
+        //
+        // The bind runs UNDER the shard lock so racing workers serialize here —
+        // without it a second concurrent bind fails EADDRINUSE (macOS sets no
+        // SO_REUSEADDR). Quick op, so the non-cancellable bounded_block_on is
+        // fine; accept, which blocks indefinitely, uses the cancellable variant.
+        //
+        // Interceptor / non-worker pool instances each have a fresh
+        // `shared_listeners` map, so a concrete-port bind is not cloned across
+        // pooled HostStates. Worker Stores (`bind_workers > 1`) share one map
+        // AND set `share_tcp_listeners`. N=1 keeps the map private *and*
+        // skips the Occupied clone, so a second bind is AddressInUse.
+        //
+        // `localhost` is accepted for ergonomics but never handed to the
         // resolver: local name service is mutable host configuration and may
         // map it to a non-loopback address. Bind a concrete loopback literal.
-        let host_owned = if host.eq_ignore_ascii_case("localhost") {
+        // Normalized BEFORE the registry key so `localhost` and `127.0.0.1`
+        // dedupe onto one entry rather than racing for the same OS port.
+        let host = if host.eq_ignore_ascii_case("localhost") {
             "127.0.0.1".to_string()
         } else {
-            host.clone()
+            host
         };
-        let bind_result: Result<tokio::net::TcpListener, std::io::Error> =
-            util::bounded_block_on(&rt, &sem, async move {
-                tokio::net::TcpListener::bind((host_owned.as_str(), port)).await
+        // Sharing is a worker-Store feature (`share_tcp_listeners`), not a
+        // property of the port. N=1 and interceptor HostStates must attempt a
+        // real OS bind so a second bind_tcp on the same state is AddressInUse
+        // — byte-identical to pre-bind_workers. Port 0 still never shares:
+        // two ephemeral requests are different addresses. Concrete-port
+        // sharing is what a run-loop capsule's workers bind: the port
+        // declared in `net_bind`.
+        let shareable = self.share_tcp_listeners && port != 0;
+        let mut share = None;
+        let mut listener_count = None;
+        let listener: Arc<tokio::net::TcpListener> = if !shareable {
+            let rt = self.runtime_handle.clone();
+            let sem = self.blocking_semaphore.clone();
+            let host_owned = host.clone();
+            let bind_result: Result<tokio::net::TcpListener, std::io::Error> =
+                util::bounded_block_on(&rt, &sem, async move {
+                    tokio::net::TcpListener::bind((host_owned.as_str(), port)).await
+                });
+            match bind_result {
+                Ok(l) => {
+                    if self
+                        .tcp_listener_count
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                            (count < MAX_ACTIVE_TCP_LISTENERS).then_some(count + 1)
+                        })
+                        .is_err()
+                    {
+                        let reason = "inbound TCP listener quota exceeded";
+                        audit_net_bind(self, &bind_addr, HostAuditOutcome::Failed(reason));
+                        return Err(ErrorCode::Quota);
+                    }
+                    listener_count = Some(Arc::clone(&self.tcp_listener_count));
+                    Arc::new(l)
+                },
+                Err(e) => {
+                    let mapped = map_io_err(e);
+                    let reason = format!("{mapped:?}");
+                    audit_net_bind(self, &bind_addr, HostAuditOutcome::Failed(&reason));
+                    return Err(mapped);
+                },
+            }
+        } else {
+            enum SharedBind {
+                Listener(Arc<tokio::net::TcpListener>),
+                Io(ErrorCode),
+                Quota,
+            }
+            let outcome = match self.shared_listeners.entry((host.clone(), port)) {
+                dashmap::mapref::entry::Entry::Occupied(existing) => {
+                    let previous = existing.get().holders.fetch_add(1, Ordering::AcqRel);
+                    debug_assert!(
+                        previous > 0,
+                        "occupied shared listener must have a live holder"
+                    );
+                    SharedBind::Listener(Arc::clone(&existing.get().listener))
+                },
+                dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                    let rt = self.runtime_handle.clone();
+                    let sem = self.blocking_semaphore.clone();
+                    let host_owned = host.clone();
+                    let bind_result: Result<tokio::net::TcpListener, std::io::Error> =
+                        util::bounded_block_on(&rt, &sem, async move {
+                            tokio::net::TcpListener::bind((host_owned.as_str(), port)).await
+                        });
+                    match bind_result {
+                        Ok(l) => {
+                            // Charge quota before insert so a racing sibling cannot
+                            // clone a socket that then fails the quota gate.
+                            if self
+                                .tcp_listener_count
+                                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                                    (count < MAX_ACTIVE_TCP_LISTENERS).then_some(count + 1)
+                                })
+                                .is_err()
+                            {
+                                SharedBind::Quota
+                            } else {
+                                let listener = Arc::new(l);
+                                vacant.insert(SharedTcpListener {
+                                    listener: Arc::clone(&listener),
+                                    holders: std::sync::atomic::AtomicUsize::new(1),
+                                });
+                                SharedBind::Listener(listener)
+                            }
+                        },
+                        Err(e) => SharedBind::Io(map_io_err(e)),
+                    }
+                },
+            };
+            match outcome {
+                SharedBind::Listener(listener) => listener,
+                SharedBind::Quota => {
+                    let reason = "inbound TCP listener quota exceeded";
+                    audit_net_bind(self, &bind_addr, HostAuditOutcome::Failed(reason));
+                    return Err(ErrorCode::Quota);
+                },
+                SharedBind::Io(mapped) => {
+                    let reason = format!("{mapped:?}");
+                    audit_net_bind(self, &bind_addr, HostAuditOutcome::Failed(&reason));
+                    return Err(mapped);
+                },
+            }
+        };
+        if shareable {
+            share = Some(TcpListenerShare {
+                key: (host.clone(), port),
+                registry: Arc::clone(&self.shared_listeners),
+                quota: Arc::clone(&self.tcp_listener_count),
             });
-        let listener = match bind_result {
-            Ok(l) => l,
-            Err(e) => {
-                let mapped = map_io_err(e);
-                let reason = format!("{mapped:?}");
-                audit_net_bind(self, &bind_addr, HostAuditOutcome::Failed(&reason));
-                return Err(mapped);
-            },
-        };
+        }
         let actual_addr = match listener.local_addr() {
             Ok(addr) if addr.ip().is_loopback() => format!("tcp:{addr}"),
             Ok(addr) => {
                 let reason = format!("resolved bind escaped loopback: {addr}");
                 audit_net_bind(self, &bind_addr, HostAuditOutcome::Failed(&reason));
+                if let Some(share) = share {
+                    share.release();
+                } else if let Some(listener_count) = listener_count.as_ref() {
+                    let _ =
+                        listener_count.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                            count.checked_sub(1)
+                        });
+                }
                 return Err(ErrorCode::AirlockRejected);
             },
             Err(e) => {
                 let mapped = map_io_err(e);
                 let reason = format!("{mapped:?}");
                 audit_net_bind(self, &bind_addr, HostAuditOutcome::Failed(&reason));
+                if let Some(share) = share {
+                    share.release();
+                } else if let Some(listener_count) = listener_count.as_ref() {
+                    let _ =
+                        listener_count.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                            count.checked_sub(1)
+                        });
+                }
                 return Err(mapped);
             },
         };
 
-        if self
-            .tcp_listener_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                (count < MAX_ACTIVE_TCP_LISTENERS).then_some(count + 1)
-            })
-            .is_err()
-        {
-            let reason = "inbound TCP listener quota exceeded";
-            audit_net_bind(self, &actual_addr, HostAuditOutcome::Failed(reason));
-            return Err(ErrorCode::Quota);
-        }
-
         let slot = TcpListenerSlot {
-            listener: Arc::new(listener),
+            listener,
             pending: Arc::new(PendingTcpConnection {
                 connection: tokio::sync::Mutex::new(None),
                 stream_count: Arc::clone(&self.capsule_net_stream_count),
                 local_stream_count: Arc::clone(&self.local_net_stream_count),
             }),
             cancel_token: self.effective_cancel_token(),
-            listener_count: Arc::clone(&self.tcp_listener_count),
+            share,
+            listener_count,
         };
         let res = match self.resource_table.push(slot) {
             Ok(res) => res,
@@ -711,137 +877,5 @@ impl net::Host for HostState {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::engine::wasm::bindings::astrid::net::host::{Host as _, HostTcpListener};
-    use crate::engine::wasm::test_fixtures::minimal_host_state;
-
-    #[test]
-    fn max_active_streams_pinned() {
-        assert_eq!(MAX_ACTIVE_STREAMS, 8);
-        assert_eq!(MAX_ACTIVE_TCP_LISTENERS, 4);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn tcp_listener_quota_is_independent_and_released_on_drop() {
-        let mut state = minimal_host_state(tokio::runtime::Handle::current());
-        let mut listeners = Vec::new();
-        for _ in 0..MAX_ACTIVE_TCP_LISTENERS {
-            listeners.push(state.bind_tcp("127.0.0.1".into(), 0).unwrap());
-        }
-        assert!(matches!(
-            state.bind_tcp("127.0.0.1".into(), 0),
-            Err(ErrorCode::Quota)
-        ));
-
-        let released = listeners.pop().unwrap();
-        HostTcpListener::drop(&mut state, released).unwrap();
-        let replacement = state.bind_tcp("127.0.0.1".into(), 0).unwrap();
-        HostTcpListener::drop(&mut state, replacement).unwrap();
-        for listener in listeners {
-            HostTcpListener::drop(&mut state, listener).unwrap();
-        }
-        assert_eq!(state.tcp_listener_count.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn public_store_count_excludes_other_pending_reservations() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut state = minimal_host_state(runtime.handle().clone());
-
-        assert!(state.reserve_net_stream());
-        state
-            .capsule_net_stream_count
-            .fetch_add(1, Ordering::AcqRel);
-        state.local_net_stream_count.fetch_add(1, Ordering::AcqRel);
-        assert_eq!(state.net_stream_count, 1);
-
-        state.release_net_stream();
-        assert_eq!(state.net_stream_count, 0);
-        state.claim_reserved_net_stream();
-        assert_eq!(state.net_stream_count, 1);
-        assert_eq!(state.capsule_net_stream_count.load(Ordering::Acquire), 1);
-        assert_eq!(state.local_net_stream_count.load(Ordering::Acquire), 1);
-    }
-
-    #[test]
-    fn public_store_count_excludes_existing_pending_on_direct_reserve() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut state = minimal_host_state(runtime.handle().clone());
-
-        state
-            .capsule_net_stream_count
-            .fetch_add(1, Ordering::AcqRel);
-        state.local_net_stream_count.fetch_add(1, Ordering::AcqRel);
-        assert_eq!(state.net_stream_count, 0);
-
-        assert!(state.reserve_net_stream());
-        assert_eq!(state.net_stream_count, 1);
-        state.claim_reserved_net_stream();
-        assert_eq!(state.net_stream_count, 2);
-        assert_eq!(state.capsule_net_stream_count.load(Ordering::Acquire), 2);
-        assert_eq!(state.local_net_stream_count.load(Ordering::Acquire), 2);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn localhost_binds_a_concrete_loopback_address() {
-        let mut state = minimal_host_state(tokio::runtime::Handle::current());
-        let listener = state.bind_tcp("localhost".into(), 0).unwrap();
-        let local = state
-            .local_addr(Resource::new_borrow(listener.rep()))
-            .unwrap();
-        let addr: std::net::SocketAddr = local.parse().unwrap();
-        assert!(addr.ip().is_loopback());
-        HostTcpListener::drop(&mut state, listener).unwrap();
-    }
-
-    #[test]
-    fn validate_host_accepts_normal_names() {
-        assert!(validate_host("example.com").is_ok());
-        assert!(validate_host("fulcrum.unicity.network").is_ok());
-        assert!(validate_host("127.0.0.1").is_ok());
-        assert!(validate_host("::1").is_ok());
-    }
-
-    #[test]
-    fn validate_host_rejects_empty() {
-        assert!(validate_host("").is_err());
-    }
-
-    #[test]
-    fn validate_host_rejects_null_bytes() {
-        assert!(validate_host("evil\0.com").is_err());
-    }
-
-    #[test]
-    fn validate_host_rejects_overlength() {
-        let long = "a".repeat(256);
-        assert!(validate_host(&long).is_err());
-    }
-
-    #[test]
-    fn validate_host_accepts_max_length() {
-        let max = "a".repeat(255);
-        assert!(validate_host(&max).is_ok());
-    }
-
-    #[test]
-    fn loopback_bind_host_accepts_loopback() {
-        assert!(is_loopback_bind_host("127.0.0.1"));
-        assert!(is_loopback_bind_host("127.0.0.5"));
-        assert!(is_loopback_bind_host("::1"));
-        assert!(is_loopback_bind_host("localhost"));
-        assert!(is_loopback_bind_host("LOCALHOST"));
-    }
-
-    #[test]
-    fn loopback_bind_host_rejects_non_loopback() {
-        assert!(!is_loopback_bind_host("0.0.0.0"));
-        assert!(!is_loopback_bind_host("192.168.1.10"));
-        assert!(!is_loopback_bind_host("8.8.8.8"));
-        assert!(!is_loopback_bind_host("::"));
-        // A hostname other than localhost is refused (not resolved).
-        assert!(!is_loopback_bind_host("example.com"));
-        assert!(!is_loopback_bind_host(""));
-    }
-}
+#[path = "mod_tests.rs"]
+mod tests;

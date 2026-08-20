@@ -23,6 +23,22 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   bounded to 4096 bytes so `astrid storage` can render them instead of rejecting
   the provider as an invalid structured error. Generic mount, permission, lease,
   and rollback failures stay `provider-operation` hard errors. Closes #1567.
+### Added
+
+- **A run-loop capsule serving a loopback TCP port can now handle connections
+  concurrently.** A `#[astrid::run]` capsule that declares a TCP `net_bind` and
+  no `host_process` may set `bind_workers = N` to run N worker Stores, each
+  executing `run()` against ONE shared bound listener — the OS accept queue
+  load-balances. Previously a single Store served every connection serially, so
+  a client fanning out parallel requests queued behind itself. Unix-only
+  `net_bind` stays at one worker (per-Store Wasmtime reps would collide in a
+  shared identity map). `N = 1` is unchanged behaviour: a second `bind_tcp` on
+  the same HostState is AddressInUse, identity maps are not cloned across
+  workers, and interceptors are held at one worker because N subscriptions
+  would double-process every event. Last slot drop evicts the shared listener
+  so the OS socket actually closes and quota tracks the live socket rather
+  than the binder slot; interceptor pool instances do not share that
+  registry. Closes #1231.
 
 ### Changed
 

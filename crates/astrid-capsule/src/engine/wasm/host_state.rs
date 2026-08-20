@@ -57,6 +57,14 @@ pub struct TcpStreamSlot {
     pub write_timeout: Option<std::time::Duration>,
 }
 
+/// One bound loopback TCP listener plus the number of live guest slots
+/// holding it. The last slot drop evicts the registry entry so the OS
+/// socket actually closes.
+pub struct SharedTcpListener {
+    pub listener: Arc<tokio::net::TcpListener>,
+    pub holders: std::sync::atomic::AtomicUsize,
+}
+
 /// The lifecycle phase a capsule is currently executing in.
 ///
 /// Set on [`HostState`] during `#[install]` or `#[upgrade]` dispatch.
@@ -663,9 +671,11 @@ pub struct HostState {
     /// stream resource drops.
     ///
     /// `Arc<DashMap>` so the binding is SHARED across a capsule's pooled
-    /// `HostState` instances exactly like [`process_tracker`](Self::process_tracker):
+    /// interceptor `HostState` instances exactly like [`process_tracker`](Self::process_tracker):
     /// the same socket-owning capsule may serve a connection from a
-    /// different pooled instance than the one that accepted it. Each entry
+    /// different pooled instance than the one that accepted it. Run-loop
+    /// workers do not share this map: each worker owns a ResourceTable, so
+    /// Wasmtime `u32` reps collide across workers. Each entry
     /// carries the verified principal AND the `key_id` of the device that
     /// authenticated it ([`ConnectionIdentity`]) so the cap-gate can apply the
     /// device's scope as an attenuation floor on the principal's authority.
@@ -744,6 +754,21 @@ pub struct HostState {
     /// anonymous fallback). `Arc<DashMap>` so the binding survives drop landing
     /// on a different pooled instance than the one that accepted.
     pub client_connections: Arc<dashmap::DashMap<u32, astrid_core::principal::PrincipalId>>,
+    /// Bound loopback TCP listeners shared across a run-loop capsule's worker
+    /// Stores, keyed by `(host, port)`. When `bind_workers > 1`, each of the N
+    /// worker Stores runs `run()` and calls `bind_tcp` for the same address;
+    /// the first worker binds the socket and the rest dedupe onto its
+    /// listener here, so all N block on `accept()` against ONE OS accept
+    /// queue. Holder count lives on the entry: last slot drop evicts it so
+    /// the OS socket closes. Cloned into worker Stores only when
+    /// `bind_workers > 1`; interceptor / non-worker pool instances each get
+    /// a fresh map so a concrete-port bind is not accidentally shared.
+    pub shared_listeners: Arc<dashmap::DashMap<(String, u16), SharedTcpListener>>,
+    /// Whether `bind_tcp` may clone a concrete-port socket from
+    /// [`shared_listeners`](Self::shared_listeners). True only for
+    /// `bind_workers > 1` worker Stores. N=1 (and interceptor/lifecycle
+    /// HostStates) keep the historical AddressInUse on a second bind.
+    pub share_tcp_listeners: bool,
     /// Bound run-loop CPU-bound signal: set `true` by the ipc `recv` host fn
     /// each time the guest blocks on recv, read + cleared by the run-loop's
     /// epoch-deadline callback once per window.

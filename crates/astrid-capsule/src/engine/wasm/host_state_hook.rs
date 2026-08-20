@@ -149,6 +149,10 @@ impl HostState {
             // the field. Keyed by the verified principal directly (distinct from
             // the device-aware `connection_principals` registry).
             client_connections: Self::new_client_connections(),
+            // Hooks never bind a listener; a throwaway empty registry satisfies
+            // the field.
+            shared_listeners: Self::new_shared_listeners(),
+            share_tcp_listeners: false,
             // No client frame in flight; hooks never forward over publish-as, so
             // neither the ingress principal nor its device id / origin is set.
             ingress_principal: None,

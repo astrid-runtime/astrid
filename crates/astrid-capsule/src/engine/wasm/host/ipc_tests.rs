@@ -931,3 +931,23 @@ async fn unresolved_invocation_profile_cannot_publish() {
         Err(ErrorCode::CapabilityDenied)
     ));
 }
+
+#[tokio::test]
+async fn worker_stores_fan_out_guest_subscribe() {
+    // N run-loop workers each call ipc::subscribe on the same topic. The bus
+    // keys routes by subscription_rep, so a publish must reach every worker
+    // rather than being stolen by the first.
+    let rt = tokio::runtime::Handle::current();
+    let mut worker_a = host_state_for(rt.clone(), "owner", false, &["worker.v1.event"]);
+    let mut worker_b = host_state_for(rt, "owner", false, &["worker.v1.event"]);
+    worker_b.event_bus = worker_a.event_bus.clone();
+    worker_b.capsule_uuid = worker_a.capsule_uuid;
+    worker_b.route_admission_gate = worker_a.route_admission_gate.clone();
+
+    let a = IpcHost::subscribe(&mut worker_a, "worker.v1.event".to_string()).expect("worker a");
+    let b = IpcHost::subscribe(&mut worker_b, "worker.v1.event".to_string()).expect("worker b");
+    publish_response(&worker_a.event_bus, "worker.v1.event", "owner");
+
+    assert_eq!(drained_principals(&mut worker_a, &a), ["owner"]);
+    assert_eq!(drained_principals(&mut worker_b, &b), ["owner"]);
+}
