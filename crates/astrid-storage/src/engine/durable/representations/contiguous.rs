@@ -188,6 +188,46 @@ impl RepresentationStore {
         self.contiguous.clear();
         let active = recovery::active_contiguous_records(self)?;
         let mut recovery = recovery::RecoveryStore::new(arena, index, identity, limits);
+        if let Some(volume) = self.volume_media().cloned() {
+            for (record_id, record, namespace_generation) in active {
+                let profile = self.profile(record.profile())?;
+                let crate::storage_model::Coverage::CanonicalFileChunks {
+                    file,
+                    content_root,
+                    logical_bytes,
+                    chunk_count,
+                    chunking_profile,
+                } = record.coverage()
+                else {
+                    return Err(DurableError::InvalidRepresentationState(
+                        "contiguous representation has non-file coverage",
+                    ));
+                };
+                let crate::storage_model::Recipe::ContiguousFile { blob } = record.recipe() else {
+                    return Err(DurableError::InvalidRepresentationState(
+                        "contiguous representation has a different recipe",
+                    ));
+                };
+                let blob_file =
+                    super::volume::open_volume_blob(&volume, *blob, namespace_generation)?;
+                let (reverse, locations) = recovery::recover_contiguous_opened_blob(
+                    blob_file,
+                    record_id,
+                    &record,
+                    &profile,
+                    namespace_generation,
+                    &mut recovery,
+                    *file,
+                    *content_root,
+                    *logical_bytes,
+                    *chunk_count,
+                    chunking_profile,
+                    *blob,
+                )?;
+                self.install_contiguous_indexes(&reverse, &locations);
+            }
+            return Ok(());
+        }
         for (record_id, record, namespace_generation) in active {
             let profile = self.profile(record.profile())?;
             let (reverse, locations) = recovery.recover_contiguous_record(

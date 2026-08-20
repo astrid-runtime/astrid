@@ -104,3 +104,58 @@ fn ingest_one(
         })?;
     Ok((published.verified_content(), published.objects_inserted()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::content::ContentName;
+    use crate::{KvQuotaResolver, open_runtime_principal_store};
+    use astrid_core::PrincipalUid;
+    use astrid_core::dirs::AstridHome;
+    use std::sync::Arc;
+
+    fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
+        Arc::new(|owner: &StateOwner| {
+            Ok(match owner {
+                StateOwner::System => None,
+                StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn packed_volume_reopens_contiguous_payloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(directory.path());
+        home.ensure().unwrap();
+        let store = open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+        let owner = StateOwner::Principal(PrincipalUid::from_bytes([0x44; 32]));
+        let source = directory.path().join("note.bin");
+        let bytes = vec![0x42_u8; 4096];
+        std::fs::write(&source, &bytes).unwrap();
+        store
+            .put_contiguous_files(
+                owner,
+                [ContiguousFileIngest::new(
+                    ContentName::new("note.bin").unwrap(),
+                    source,
+                    u64::try_from(bytes.len()).unwrap(),
+                )],
+            )
+            .unwrap();
+        store.engine.close().unwrap();
+        drop(store);
+        let reopened = open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .expect("reopen packed volume");
+        let filesystem = crate::AstridFilesystem::new(reopened.content(), owner);
+        assert_eq!(
+            filesystem
+                .read(&crate::FilesystemPath::new("note.bin").unwrap(), 0, 4)
+                .unwrap(),
+            &bytes[..4]
+        );
+    }
+}

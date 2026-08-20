@@ -7,8 +7,8 @@ use std::os::unix::fs::PermissionsExt as _;
 
 use astrid_core::{PrincipalProfile, PrincipalUid};
 use astrid_storage::{
-    IdentityStore, KvIdentityStore, KvQuotaResolver, MemoryKvStore, OwnershipStore, ScopedKvStore,
-    open_runtime_principal_store_with_directory,
+    ContentName, IdentityStore, KvIdentityStore, KvQuotaResolver, MemoryKvStore, OwnershipStore,
+    ScopedKvStore, open_runtime_principal_store_with_directory,
 };
 
 async fn fixture() -> (
@@ -729,4 +729,20 @@ async fn contiguous_home_import_shares_identical_payloads_and_compacts_below_unr
             );
         },
     }
+    let owner = StateOwner::Principal(uid);
+    let first = store
+        .content()
+        .describe(&owner, &ContentName::new("home/shared/s-00").expect("name"))
+        .expect("describe first")
+        .expect("first file");
+    let sixteenth = store
+        .content()
+        .describe(&owner, &ContentName::new("home/shared/s-15").expect("name"))
+        .expect("describe sixteenth")
+        .expect("sixteenth file");
+    assert_eq!(
+        first.file(),
+        sixteenth.file(),
+        "identical payloads must share one File object"
+    );
 }

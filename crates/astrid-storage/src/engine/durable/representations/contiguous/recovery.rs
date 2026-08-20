@@ -1,7 +1,6 @@
 //! Recovery of virtual chunk objects from authoritative contiguous blobs.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
 use std::io::Read;
 #[cfg(not(any(unix, windows)))]
 use std::io::{Seek, SeekFrom};
@@ -173,14 +172,51 @@ fn recover_contiguous_record_with_store<
             "contiguous representation has a different recipe",
         ));
     };
-    let blob_file = verify_published_blob(
+    let blob_file = crate::engine::durable::File::native(verify_published_blob(
         representation_directory,
         representation_root,
         namespace_generation,
         *blob,
         record.profile(),
         *logical_bytes,
-    )?;
+    )?);
+    recover_contiguous_opened_blob(
+        blob_file,
+        record_id,
+        record,
+        profile,
+        namespace_generation,
+        store,
+        *file,
+        *content_root,
+        *logical_bytes,
+        *chunk_count,
+        chunking_profile,
+        *blob,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "opened-blob recovery keeps coverage, recipe, and arena handles explicit"
+)]
+pub(super) fn recover_contiguous_opened_blob<
+    I: PersistentObjectIdentity,
+    F: super::super::super::DurableIo,
+>(
+    blob_file: crate::engine::durable::File,
+    record_id: crate::storage_model::RepresentationRecordId,
+    record: &RepresentationRecord,
+    profile: &RepresentationProfile,
+    namespace_generation: u64,
+    store: &mut RecoveryStore<'_, I, F>,
+    file: ObjectId,
+    content_root: Option<ObjectId>,
+    logical_bytes: u64,
+    chunk_count: u64,
+    chunking_profile: &crate::storage_model::CanonicalChunkingProfile,
+    blob: crate::storage_model::BlobId,
+) -> Result<ContiguousIndexes, DurableError> {
     let sink_file = blob_file
         .try_clone()
         .map_err(|source| io_error("clone contiguous loose blob", source))?;
@@ -202,13 +238,13 @@ fn recover_contiguous_record_with_store<
         canonical_output_bytes: 0,
     };
     let streamed =
-        build_content_streaming(logical_profile, blob_file.take(*logical_bytes), &mut sink)
+        build_content_streaming(logical_profile, blob_file.take(logical_bytes), &mut sink)
             .map_err(map_recovery_stream_error)?;
     let descriptor = streamed.descriptor();
-    if descriptor.file() != *file
-        || streamed.verified_content().opened_content().content_root() != *content_root
-        || descriptor.logical_bytes() != *logical_bytes
-        || descriptor.chunk_count() != *chunk_count
+    if descriptor.file() != file
+        || streamed.verified_content().opened_content().content_root() != content_root
+        || descriptor.logical_bytes() != logical_bytes
+        || descriptor.chunk_count() != chunk_count
         || descriptor.profile() != logical_profile
         || sink.canonical_output_bytes != record.canonical_output_bytes()
     {
@@ -219,10 +255,10 @@ fn recover_contiguous_record_with_store<
     let observations = std::mem::take(&mut sink.observations);
     let slices = std::mem::take(&mut sink.slices);
     drop(sink);
-    verify_admission_evidence(store, profile, record, *blob, *logical_bytes, &observations)?;
+    verify_admission_evidence(store, profile, record, blob, logical_bytes, &observations)?;
     Ok(contiguous_index_additions(
         record_id,
-        *blob,
+        blob,
         namespace_generation,
         &slices,
     ))
@@ -317,7 +353,7 @@ struct RecoverySink<'a, I, F: super::super::super::DurableIo> {
     index: &'a BTreeMap<ObjectId, ArenaLocation>,
     identity: &'a I,
     limits: RecoveryLimits,
-    blob: File,
+    blob: crate::engine::durable::File,
     offset: u64,
     slices: BTreeMap<ObjectId, ContiguousSlice>,
     observations: Vec<RepresentationOutputObservation>,
@@ -374,12 +410,16 @@ impl<I: PersistentObjectIdentity, F: super::super::super::DurableIo> ContentObje
     }
 }
 
-fn read_contiguous_object_from_file<I: PersistentObjectIdentity>(
-    file: &File,
+fn read_contiguous_object_from_file<I, F>(
+    file: &F,
     location: ContiguousSlice,
     expected: ObjectId,
     identity: &I,
-) -> Result<ObjectRecord, DurableError> {
+) -> Result<ObjectRecord, DurableError>
+where
+    I: PersistentObjectIdentity,
+    F: crate::engine::durable::DurableIo,
+{
     let length = usize::try_from(location.length).map_err(|_| DurableError::EncodingOverflow)?;
     let mut bytes = vec![0; length];
     read_exact_at(file, &mut bytes, location.offset)
@@ -393,19 +433,13 @@ fn read_contiguous_object_from_file<I: PersistentObjectIdentity>(
     Ok(record)
 }
 
-#[cfg(unix)]
-fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt as _;
-
-    file.read_exact_at(bytes, offset)
-}
-
-#[cfg(windows)]
-fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> std::io::Result<()> {
-    use std::os::windows::fs::FileExt as _;
-
+fn read_exact_at<F: crate::engine::durable::DurableIo>(
+    file: &F,
+    mut bytes: &mut [u8],
+    mut offset: u64,
+) -> std::io::Result<()> {
     while !bytes.is_empty() {
-        let read = file.seek_read(bytes, offset)?;
+        let read = file.durable_read_at(bytes, offset)?;
         if read == 0 {
             return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
         }
@@ -415,17 +449,6 @@ fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> std::io:
         bytes = &mut bytes[read..];
     }
     Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
-    let mut cursor = file.try_clone()?;
-    let original = cursor.stream_position()?;
-    let result = cursor
-        .seek(SeekFrom::Start(offset))
-        .and_then(|_| cursor.read_exact(bytes));
-    let restore = cursor.seek(SeekFrom::Start(original)).map(drop);
-    result.and(restore)
 }
 
 fn map_recovery_stream_error(

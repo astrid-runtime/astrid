@@ -167,17 +167,25 @@ where
         .metadata()
         .map_err(|source| io_error("read object-arena metadata", source))?
         .len();
+    let mut representations =
+        super::representations::RepresentationStore::open_volume(volume, limits)?;
+    let protected_arena_len = representations.as_ref().map_or(
+        Ok(0),
+        super::representations::RepresentationStore::generation_zero_protected_len,
+    )?;
     let cached = index_cache
         .as_mut()
         .and_then(|file| recover_index(file, &mut arena, scheme, limits, arena_len));
     let (index, arena_tail) = if let Some(state) = cached {
         (state.objects, state.arena_tail)
     } else {
-        // The index is disposable. Rebuild authority from the arena and allow
-        // ordinary future admissions to repopulate the cache region.
         drop(index_cache.take());
-        recover_arena(&mut arena, identity, limits, 0)?
+        recover_arena(&mut arena, identity, limits, protected_arena_len)?
     };
+    if let Some(store) = &mut representations {
+        store.validate_generation_zero_index(&index)?;
+        store.rebuild_contiguous_index(&mut arena, &index, identity, limits)?;
+    }
     let mut index = index;
     let wal_writer = if let Some(wal_file) = wal_file {
         Some(replay_transaction_wal(
@@ -185,7 +193,7 @@ where
             &mut arena,
             &mut roots,
             &mut index,
-            None,
+            representations.as_mut(),
             identity,
             principal_codec,
             limits,
@@ -197,7 +205,7 @@ where
         &mut roots,
         &mut arena,
         &index,
-        None,
+        representations.as_ref(),
         principal_codec,
         identity,
         limits,
@@ -215,7 +223,6 @@ where
     let arena_reader = arena
         .try_clone()
         .map_err(|source| io_error("clone object arena for positional reads", source))?;
-    let representations = super::representations::RepresentationStore::open_volume(volume, limits)?;
     Ok((
         RecoveredStore {
             roots_by_principal,
