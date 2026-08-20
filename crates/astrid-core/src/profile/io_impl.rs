@@ -224,12 +224,12 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_unknown_top_level_field() {
+    fn load_ignores_unknown_top_level_field() {
         let (_d, home, principal) = scratch_home();
         let path = PrincipalProfile::path_for(&home, &principal);
         fs::write(&path, "enabled = true\nenableed = true\n").unwrap();
-        let err = PrincipalProfile::load(&home, &principal).unwrap_err();
-        assert!(matches!(err, ProfileError::Parse(_)), "got: {err:?}");
+        let loaded = PrincipalProfile::load(&home, &principal).unwrap();
+        assert!(loaded.enabled);
     }
 
     #[test]
@@ -288,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_unknown_nested_field() {
+    fn load_ignores_unknown_nested_field() {
         let (_d, home, principal) = scratch_home();
         let path = PrincipalProfile::path_for(&home, &principal);
         fs::write(
@@ -296,8 +296,8 @@ mod tests {
             "[quotas]\nmax_memory_bytes = 1048576\ntypo_field = 42\n",
         )
         .unwrap();
-        let err = PrincipalProfile::load(&home, &principal).unwrap_err();
-        assert!(matches!(err, ProfileError::Parse(_)), "got: {err:?}");
+        let loaded = PrincipalProfile::load(&home, &principal).unwrap();
+        assert_eq!(loaded.quotas.max_memory_bytes, 1_048_576);
     }
 
     #[test]
