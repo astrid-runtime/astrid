@@ -197,7 +197,9 @@ mod tests {
         let blob = regions
             .iter()
             .find(|region| {
-                region.as_str().ends_with(".blob") && !region.as_str().ends_with(".blob.meta")
+                std::path::Path::new(region.as_str())
+                    .extension()
+                    .is_some_and(|ext| ext == "blob")
             })
             .expect("blob region")
             .clone();
@@ -205,9 +207,8 @@ mod tests {
         crate::volume::AstridVolume::set_region_len(volume.as_ref(), &blob, len + 1).unwrap();
         crate::volume::AstridVolume::write_region_at(volume.as_ref(), &blob, len, &[0xff]).unwrap();
         drop(volume);
-        let error = match open_runtime_principal_store(&home, unlimited_quota()).await {
-            Ok(_) => panic!("trailing blob bytes must fail closed"),
-            Err(error) => error,
+        let Err(error) = open_runtime_principal_store(&home, unlimited_quota()).await else {
+            panic!("trailing blob bytes must fail closed");
         };
         assert!(
             error.to_string().contains("contiguous blob length"),
