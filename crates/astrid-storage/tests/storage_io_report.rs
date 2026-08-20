@@ -123,4 +123,16 @@ fn evidence_envelope_binds_the_complete_payload() {
         envelope["payload"]
     );
     assert_eq!(envelope["payload"]["provenance"]["git_revision"], revision);
+    assert_eq!(
+        envelope["payload"]["provenance"]["host"]["volume_kind"],
+        "unknown"
+    );
+    assert_eq!(
+        envelope["payload"]["provenance"]["host"]["filesystem"],
+        "unknown"
+    );
+    assert_eq!(
+        envelope["payload"]["provenance"]["host"]["machine_class"],
+        "unknown"
+    );
 }

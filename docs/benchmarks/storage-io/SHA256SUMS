@@ -26,3 +26,4 @@ aae74125e0b814f2820e74a32f1132f16d074a0315fe16dbc29d5a93aeddf4a5  astrid-storage
 969fb064ed437d528c549316a7ad21c5ce460f5adb09bab76a54514149355b47  astrid-storage-verified-64k.json
 7c8fc41d856d6b379dc7134c194d5c19f626af997ae85c781f4938e1e04e0623  group-commit-main-vs-candidate.txt
 c79950ab9dbd385deeaf3a6e2c73c5722e90bd8abedc3abf466e3b628b85d7b6  seal-journal-main-vs-candidate.txt
+f496231fa89ff737dacd9163266f8d90c52346088bbf051447265963480bdb48  wal-cache-vs-surrealkv-6066bca-macos-apfs.txt

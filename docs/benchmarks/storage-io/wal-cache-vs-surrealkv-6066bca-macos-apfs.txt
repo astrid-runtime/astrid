@@ -1,0 +1,87 @@
+Astrid WAL/cache vs SurrealKV microbenchmark
+============================================
+
+This is a native KV microbenchmark. It is not end-to-end throughput, not
+mount throughput, and not a CI gate. Do not copy these ratios onto
+storage_io or crate-facing product claims.
+
+Recorded: 2026-08-20
+Profile: macos-apfs-local
+Host: Apple M2 Ultra, 24 logical CPUs, 192 GiB RAM, macOS 26.2 (25C56)
+Filesystem: APFS (host path; /private/tmp on the Data volume)
+Machine class: local:macos-apfs:Apple-M2-Ultra-24c-192GiB
+Rust: 1.95.0
+Revision: 6066bca197abf6e7352b2625e59b707980779f0f
+Git tree at compile: clean (codex/1562-volume-wal-cache)
+Executable: /private/tmp/astrid-storage-bench-target/release/deps/astrid_storage-673b68a444d3dbfe
+Executable bytes: 18511712
+Executable sha256: 1a078c7626a13c78599517e4992200346f1f3c60b34fab90f14b885a97638006
+Command:
+  cargo test -p astrid-storage --release --features legacy-surrealkv --lib performance_tests -- --ignored --nocapture --test-threads=1
+Stores: tempfile only. Never ASTRID_HOME=$HOME/.astrid.
+
+Workload mapping
+----------------
+hot_point / concurrent / working_set:
+  KvReadCacheConfig::reserved_64_mib, TransactionWalPolicy disabled
+  (cache/read path; not WAL overlay-before-fold)
+strict_single_owner_writes / strict_same_owner_batch_commits:
+  TransactionWalPolicy enabled (256 MiB checkpoint), reserved_64_mib cache
+  (volume-region WAL + overlay publication path)
+Overlay-before-fold remains group_tests correctness, not a rate claim.
+
+Hot-read results (completed)
+----------------------------
+test kv::tree::performance_tests::concurrent_hot_point_reads_outpace_legacy_surrealkv
+readers=1 sample=0 astrid_reads_per_second=3892540 surrealkv_reads_per_second=2196380 ratio=1.772
+readers=1 sample=1 astrid_reads_per_second=4257992 surrealkv_reads_per_second=2418543 ratio=1.761
+readers=1 sample=2 astrid_reads_per_second=4297725 surrealkv_reads_per_second=2401321 ratio=1.790
+readers=1 median_ratio=1.773
+readers=2 sample=0 astrid_reads_per_second=4265836 surrealkv_reads_per_second=2461122 ratio=1.733
+readers=2 sample=1 astrid_reads_per_second=4274954 surrealkv_reads_per_second=2496923 ratio=1.712
+readers=2 sample=2 astrid_reads_per_second=4273371 surrealkv_reads_per_second=2432889 ratio=1.757
+readers=2 median_ratio=1.736
+readers=4 sample=0 astrid_reads_per_second=6859632 surrealkv_reads_per_second=1410558 ratio=4.863
+readers=4 sample=1 astrid_reads_per_second=5878898 surrealkv_reads_per_second=1233966 ratio=4.764
+readers=4 sample=2 astrid_reads_per_second=7204800 surrealkv_reads_per_second=1580633 ratio=4.558
+readers=4 median_ratio=4.863
+readers=8 sample=0 astrid_reads_per_second=13509216 surrealkv_reads_per_second=1084460 ratio=12.457
+readers=8 sample=1 astrid_reads_per_second=12947699 surrealkv_reads_per_second=1081368 ratio=11.973
+readers=8 sample=2 astrid_reads_per_second=15314559 surrealkv_reads_per_second=1084259 ratio=14.124
+readers=8 median_ratio=12.459
+ok
+
+test kv::tree::performance_tests::hot_point_reads_outpace_legacy_surrealkv
+sample=0 astrid_reads_per_second=4150556 surrealkv_reads_per_second=2359542 ratio=1.759
+sample=1 astrid_reads_per_second=4049640 surrealkv_reads_per_second=2318203 ratio=1.747
+sample=2 astrid_reads_per_second=4094722 surrealkv_reads_per_second=2311635 ratio=1.771
+sample=3 astrid_reads_per_second=4023217 surrealkv_reads_per_second=2339044 ratio=1.720
+sample=4 astrid_reads_per_second=4070342 surrealkv_reads_per_second=2320865 ratio=1.754
+median_ratio=1.754
+ok
+
+test kv::tree::performance_tests::hot_working_set_reads_outpace_legacy_surrealkv
+working_set=4096 sample=0 astrid_reads_per_second=2314180 surrealkv_reads_per_second=1356689 ratio=1.706
+working_set=4096 sample=1 astrid_reads_per_second=2316056 surrealkv_reads_per_second=1438436 ratio=1.610
+working_set=4096 sample=2 astrid_reads_per_second=2229494 surrealkv_reads_per_second=1431933 ratio=1.557
+working_set=4096 median_ratio=1.616
+ok
+
+Headline (this profile, this binary only)
+-----------------------------------------
+WAL-off hot point reads were faster than SurrealKV: median ratio 1.754
+(about 4.07e6 vs 2.32e6 reads/s). Concurrent 8-reader ratio 12.459 is a
+scaling observation, not a promise. Working-set (4096 keys) median ratio
+1.616. Do not reuse the pre-rewrite 0.947x figure.
+
+WAL-on write/batch comparison
+-----------------------------
+strict_same_owner_batch_commits_compare_with_surrealkv did not complete.
+After 88 CPU-minutes the process was still inside the first native sample
+in apply_batch_blocking -> decode_header -> load_kv_object_for (stack
+sample 2026-08-20 14:51 +0400). No SurrealKV batch rates were printed.
+That is evidence the current WAL batch path is expensive on this profile,
+not a numeric ratio.
+
+strict_single_owner_writes_compare_with_surrealkv was started separately
+on the same binary after aborting the batch run.

@@ -24,6 +24,14 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   Closes #1529.
 ### Added
 
+- **Storage I/O evidence envelopes now record the measured host and
+  filesystem.** v2 reports include machine class, filesystem type, volume kind
+  (`host_path` / `container_overlay` / `unknown`), and uname beside the existing
+  Git SHA, dirty tree, argv, and executable hash. The ignored WAL/cache vs
+  SurrealKV comparisons can write `astrid-storage-kv-microbench-v1` sidecars.
+  These remain evidence, not a CI gate. Native microbenchmarks are never
+  end-to-end.
+
 - **Owner-scoped KV updates can now publish bounded conditional batches through
   one durable root transition.** The native principal store adds governed hot
   reads and a single-sync transaction WAL on the Astrid volume, serves published
