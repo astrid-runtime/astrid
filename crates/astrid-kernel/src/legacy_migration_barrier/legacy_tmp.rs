@@ -1,9 +1,11 @@
-//! Layout-1 tightening of disposable principal tmp/scratch directories.
+//! Layout-1 tightening of dedicated `.local/{kv,tokens,tmp}` directories.
 //!
-//! Released 0.10.4 allowed `0755` children under an otherwise private
-//! `.local/tmp`. Layout-2 inventory still requires owner-only directories.
-//! On first cut-over, chmod owner-owned tmp trees to `0700` rather than
-//! aborting the kernel. Layout-2 serving remains fail-closed.
+//! Released 0.10.4 allowed `0755` dedicated children under an otherwise
+//! private principal home. Layout-2 inventory still requires owner-only
+//! directories, so first cut-over chmods owner-owned kv/tokens/tmp trees to
+//! `0700` rather than aborting. Non-empty kv/tokens still have no importer
+//! and remain fail-closed after the mode repair. Layout-2 serving stays
+//! fail-closed.
 
 use std::fs;
 use std::io;
@@ -12,18 +14,25 @@ use std::path::Path;
 use astrid_core::dirs::AstridHome;
 use astrid_storage::PrincipalDirectory;
 
-/// Tighten admitted principals' layout-1 tmp trees before private snapshot.
+/// Tighten admitted principals' layout-1 dedicated local trees before snapshot.
 pub(crate) fn tighten_legacy_tmp_directories(
     home: &AstridHome,
     directory: &PrincipalDirectory,
 ) -> io::Result<()> {
     for (alias, _) in directory.bindings() {
-        tighten_tmp_tree(&home.principal_home(&alias).tmp_dir())?;
+        let principal = home.principal_home(&alias);
+        for path in [
+            principal.kv_dir(),
+            principal.tokens_dir(),
+            principal.tmp_dir(),
+        ] {
+            tighten_dedicated_tree(&path)?;
+        }
     }
     Ok(())
 }
 
-fn tighten_tmp_tree(path: &Path) -> io::Result<()> {
+fn tighten_dedicated_tree(path: &Path) -> io::Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -33,7 +42,7 @@ fn tighten_tmp_tree(path: &Path) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "legacy tmp source is not a regular directory: {}",
+                "legacy dedicated source is not a regular directory: {}",
                 path.display()
             ),
         ));
@@ -46,7 +55,7 @@ fn tighten_tmp_tree(path: &Path) -> io::Result<()> {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
-                    "legacy tmp source is not owned by the current user: {}",
+                    "legacy dedicated source is not owned by the current user: {}",
                     path.display()
                 ),
             ));
@@ -60,12 +69,61 @@ fn tighten_tmp_tree(path: &Path) -> io::Result<()> {
         if child_metadata.file_type().is_symlink() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("legacy tmp source contains a redirect: {}", child.display()),
+                format!(
+                    "legacy dedicated source contains a redirect: {}",
+                    child.display()
+                ),
             ));
         }
         if child_metadata.is_dir() {
-            tighten_tmp_tree(&child)?;
+            tighten_dedicated_tree(&child)?;
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use astrid_core::PrincipalId;
+    use astrid_core::identity::PrincipalUid;
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn layout1_empty_kv_dir_is_tightened_instead_of_failing_snapshot() {
+        let root = tempfile::tempdir().expect("temporary home");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private root");
+        let home = AstridHome::from_path(root.path());
+        std::fs::create_dir_all(home.etc_dir()).expect("etc");
+        std::fs::create_dir_all(home.migrations_dir()).expect("migrations");
+        let extra = PrincipalId::new("legacy-agent").expect("extra alias");
+        let directory = PrincipalDirectory::default();
+        directory
+            .register(PrincipalId::default(), PrincipalUid::from_bytes([0x71; 32]))
+            .expect("default binding");
+        directory
+            .register(extra.clone(), PrincipalUid::from_bytes([0x72; 32]))
+            .expect("extra binding");
+        let principal_root = home.principal_home(&extra).root().to_path_buf();
+        astrid_core::platform_fs::ensure_private_directory(&principal_root)
+            .expect("private principal home");
+        let kv = home.principal_home(&extra).kv_dir();
+        std::fs::create_dir_all(&kv).expect("kv");
+        std::fs::set_permissions(&kv, std::fs::Permissions::from_mode(0o755)).expect("0755 kv");
+        assert_eq!(
+            std::fs::metadata(&kv).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+
+        tighten_legacy_tmp_directories(&home, &directory).expect("tighten layout-1 dedicated dirs");
+        assert_eq!(
+            std::fs::metadata(&kv).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        super::super::snapshot_path(&kv).expect("private kv snapshot after tighten");
+        super::super::reject_unsupported_sources(&home, &directory, &BTreeMap::new())
+            .expect("empty kv must not refuse cutover after tighten");
+    }
 }
