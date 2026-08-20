@@ -192,33 +192,31 @@ async fn ensure_daemon_inner(
 ) -> Result<()> {
     let socket_path = socket_client::proxy_socket_path();
     let ready_path = socket_client::readiness_path();
-    let recorded_pid_alive = recorded_daemon_pid_is_alive();
-
-    let needs_boot = match astrid_core::local_transport::connect_outcome(&socket_path).await {
-        Ok(astrid_core::local_transport::ConnectOutcome::Connected(stream)) => {
-            drop(stream);
+    let outcome = astrid_core::local_transport::connect_outcome(&socket_path)
+        .await
+        .context("failed to probe daemon endpoint")?;
+    let action = decide_ensure_action(&outcome, recorded_daemon_pid_is_alive());
+    let needs_boot = match action {
+        EnsureAction::UseExisting => {
+            if let astrid_core::local_transport::ConnectOutcome::Connected(stream) = outcome {
+                drop(stream);
+            }
             ensure_daemon_workspace_matches(None).await?;
             if announce {
                 eprintln!("[{label}] Connected to existing daemon");
             }
             false
         },
-        Ok(
-            astrid_core::local_transport::ConnectOutcome::Absent
-            | astrid_core::local_transport::ConnectOutcome::Stale,
-        ) if recorded_pid_alive => {
-            anyhow::bail!(
-                "an Astrid daemon is recorded as running (PID file) but its uplink is unreachable;                  run `astrid restart` instead of starting a second kernel onto the singleton lock"
-            );
+        EnsureAction::RefuseSecondBoot => {
+            anyhow::bail!(unreachable_uplink_message());
         },
-        Ok(astrid_core::local_transport::ConnectOutcome::Absent) => true,
-        Ok(astrid_core::local_transport::ConnectOutcome::Stale) => {
+        EnsureAction::CleanStaleAndSpawn => {
             astrid_core::local_transport::remove_stale_endpoint(&socket_path)
                 .context("failed to clean up stale daemon endpoint")?;
             let _ = std::fs::remove_file(&ready_path);
             true
         },
-        Err(error) => return Err(error).context("failed to probe daemon endpoint"),
+        EnsureAction::Spawn => true,
     };
     if needs_boot {
         match spawn_mode {
@@ -348,6 +346,35 @@ pub(crate) async fn spawn_persistent_daemon() -> Result<()> {
 pub(crate) fn recorded_daemon_pid_is_alive() -> bool {
     daemon_control::read_pid_file(&socket_client::pid_path())
         .is_some_and(|(pid, _)| daemon_control::is_process_alive(pid))
+}
+
+pub(crate) fn unreachable_uplink_message() -> &'static str {
+    "an Astrid daemon is recorded as running (PID file) but its uplink is unreachable;      run `astrid restart` instead of starting a second kernel onto the singleton lock"
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnsureAction {
+    UseExisting,
+    RefuseSecondBoot,
+    CleanStaleAndSpawn,
+    Spawn,
+}
+
+pub(crate) fn decide_ensure_action(
+    outcome: &astrid_core::local_transport::ConnectOutcome,
+    recorded_pid_alive: bool,
+) -> EnsureAction {
+    match outcome {
+        astrid_core::local_transport::ConnectOutcome::Connected(_) => EnsureAction::UseExisting,
+        astrid_core::local_transport::ConnectOutcome::Absent
+        | astrid_core::local_transport::ConnectOutcome::Stale
+            if recorded_pid_alive =>
+        {
+            EnsureAction::RefuseSecondBoot
+        },
+        astrid_core::local_transport::ConnectOutcome::Stale => EnsureAction::CleanStaleAndSpawn,
+        astrid_core::local_transport::ConnectOutcome::Absent => EnsureAction::Spawn,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -897,6 +924,27 @@ mod tests {
         let action = decide_start_action(false, true);
         assert_eq!(action, StartAction::RunningButUnreachable);
         assert!(!start_clears_sentinels(action));
+    }
+
+    #[test]
+    fn ensure_unlinked_or_stale_sock_with_live_pid_refuses_second_boot() {
+        use astrid_core::local_transport::ConnectOutcome;
+        assert_eq!(
+            decide_ensure_action(&ConnectOutcome::Absent, true),
+            EnsureAction::RefuseSecondBoot
+        );
+        assert_eq!(
+            decide_ensure_action(&ConnectOutcome::Stale, true),
+            EnsureAction::RefuseSecondBoot
+        );
+        assert_eq!(
+            decide_ensure_action(&ConnectOutcome::Absent, false),
+            EnsureAction::Spawn
+        );
+        assert_eq!(
+            decide_ensure_action(&ConnectOutcome::Stale, false),
+            EnsureAction::CleanStaleAndSpawn
+        );
     }
 
     #[test]
