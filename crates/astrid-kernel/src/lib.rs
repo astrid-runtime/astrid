@@ -1117,6 +1117,7 @@ impl Kernel {
                         )
                     })?,
                     &principal_directory,
+                    identity_store.as_ref(),
                     &audit_log,
                     layout_origin,
                     &workspace_root,

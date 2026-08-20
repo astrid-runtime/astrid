@@ -5,8 +5,11 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 
-use astrid_core::PrincipalUid;
-use astrid_storage::{KvQuotaResolver, open_runtime_principal_store_with_directory};
+use astrid_core::{PrincipalProfile, PrincipalUid};
+use astrid_storage::{
+    KvIdentityStore, KvQuotaResolver, MemoryKvStore, ScopedKvStore,
+    open_runtime_principal_store_with_directory,
+};
 
 async fn fixture() -> (
     tempfile::TempDir,
@@ -327,4 +330,132 @@ fn receipt_json_rejects_noncanonical_digest_and_schema() {
         "page_count": 1
     });
     assert!(serde_json::from_value::<MigrationReceipt>(old_schema).is_err());
+}
+
+fn identity_store(principals: &PrincipalDirectory) -> KvIdentityStore {
+    let backend: Arc<dyn astrid_storage::KvStore> = Arc::new(MemoryKvStore::new());
+    KvIdentityStore::with_principal_directory(
+        ScopedKvStore::new(backend, "system:identity").expect("identity kv"),
+        principals.clone(),
+    )
+}
+
+fn write_ordinary_legacy_file(home: &AstridHome, alias: &PrincipalId, contents: &[u8]) {
+    let source = home.principal_home(alias).root().to_path_buf();
+    astrid_core::platform_fs::ensure_private_directory(&source).expect("legacy leftover home");
+    astrid_core::platform_fs::ensure_private_directory(&source.join("documents"))
+        .expect("documents");
+    fs::write(source.join("documents/note.txt"), contents).expect("leftover file");
+}
+
+#[tokio::test]
+async fn unbound_valid_alias_is_minted_and_other_principals_still_load() {
+    let (_directory, home, store, principals, principal, uid) = fixture().await;
+    write_ordinary_legacy_file(&home, &principal, b"default-home");
+    let leftover = PrincipalId::new("legacy-agent").expect("leftover alias");
+    write_ordinary_legacy_file(&home, &leftover, b"leftover-home");
+    assert!(
+        !PrincipalProfile::path_for(&home, &leftover).is_file(),
+        "leftover must start with no profile"
+    );
+
+    let error = migrate_legacy_principal_homes(&home, &store, &principals)
+        .expect_err("unbound leftover must fail before admit");
+    assert!(error.to_string().contains("has no durable UID"), "{error}");
+
+    let identity = identity_store(&principals);
+    admit_unbound_legacy_principal_homes(&home, &principals, &identity)
+        .await
+        .expect("admit leftover");
+    assert!(principals.uid_for(&principal).is_ok());
+    let leftover_uid = principals
+        .uid_for(&leftover)
+        .expect("minted leftover identity");
+    assert_ne!(leftover_uid, uid);
+    assert!(PrincipalProfile::path_for(&home, &leftover).is_file());
+    migrate_legacy_principal_homes(&home, &store, &principals).expect("migration after admit");
+
+    let default_fs = AstridFilesystem::new(store.content(), StateOwner::Principal(uid));
+    assert_eq!(
+        default_fs
+            .read(
+                &FilesystemPath::new("home/documents/note.txt").unwrap(),
+                0,
+                12
+            )
+            .unwrap(),
+        b"default-home"
+    );
+    let leftover_fs = AstridFilesystem::new(store.content(), StateOwner::Principal(leftover_uid));
+    assert_eq!(
+        leftover_fs
+            .read(
+                &FilesystemPath::new("home/documents/note.txt").unwrap(),
+                0,
+                13
+            )
+            .unwrap(),
+        b"leftover-home"
+    );
+}
+
+#[tokio::test]
+async fn invalid_legacy_home_name_is_quarantined_out_of_home() {
+    let (_directory, home, store, principals, principal, uid) = fixture().await;
+    write_ordinary_legacy_file(&home, &principal, b"default-home");
+    let invalid = home.home_dir().join("not.valid");
+    astrid_core::platform_fs::ensure_private_directory(&invalid).expect("invalid leftover");
+    fs::write(invalid.join("keep-me.txt"), b"preserved").expect("invalid leftover file");
+
+    let identity = identity_store(&principals);
+    admit_unbound_legacy_principal_homes(&home, &principals, &identity)
+        .await
+        .expect("quarantine invalid leftover");
+    assert!(!invalid.exists());
+    let quarantined = fs::read_dir(home.migrations_dir().join("unbound-legacy-homes"))
+        .expect("quarantine dir")
+        .map(|entry| entry.expect("entry").path())
+        .collect::<Vec<_>>();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(
+        fs::read(quarantined[0].join("keep-me.txt")).expect("preserved"),
+        b"preserved"
+    );
+    migrate_legacy_principal_homes(&home, &store, &principals).expect("valid homes still migrate");
+    let filesystem = AstridFilesystem::new(store.content(), StateOwner::Principal(uid));
+    assert_eq!(
+        filesystem
+            .read(
+                &FilesystemPath::new("home/documents/note.txt").unwrap(),
+                0,
+                12
+            )
+            .unwrap(),
+        b"default-home"
+    );
+}
+
+#[test]
+fn verify_fails_closed_on_unbound_leftover_home() {
+    let directory = tempfile::tempdir().expect("verify root");
+    let home = AstridHome::from_path(directory.path());
+    home.ensure().expect("home layout");
+    let admitted = PrincipalId::new("default").expect("principal");
+    let uid = PrincipalUid::from_bytes([0x71; 32]);
+    let principals = PrincipalDirectory::default();
+    principals
+        .register(admitted.clone(), uid)
+        .expect("register admitted");
+    let leftover = PrincipalId::new("legacy-agent").expect("leftover");
+    astrid_core::platform_fs::ensure_private_directory(home.principal_home(&leftover).root())
+        .expect("unbound leftover home");
+    let error = verify_migrated_legacy_principal_sources_retired(&home, &principals)
+        .expect_err("unbound leftover must fail closed after cut-over");
+    let message = error.to_string();
+    assert!(
+        message.contains("no current alias binding")
+            || message.contains("no registered durable identity"),
+        "{message}"
+    );
+    assert!(home.principal_home(&leftover).root().is_dir());
 }
