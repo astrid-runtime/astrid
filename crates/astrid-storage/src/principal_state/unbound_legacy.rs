@@ -23,13 +23,20 @@ use crate::kv::{KvStore, ScopedKvStore};
 const QUARANTINE_DIR: &str = "unbound-legacy-homes";
 
 /// Mint leftover valid aliases from `home/*` and unmatched capsule namespaces.
+///
+/// Aliases already assigned by [`super::derive_bindings`] are left alone.
+/// `home/default` is the admitted principal home, not a leftover.
 pub(crate) async fn admit_unbound_legacy_aliases(
     home: &AstridHome,
     identity_kv: Arc<dyn KvStore>,
     capsule_aliases: &[PrincipalId],
 ) -> StorageResult<()> {
+    let claimed = super::derive_bindings(home, Arc::clone(&identity_kv))
+        .await?
+        .into_iter()
+        .map(|binding| binding.alias)
+        .collect::<HashSet<_>>();
     let identities = KvIdentityStore::new(ScopedKvStore::new(identity_kv, "system:identity")?);
-    let known = known_aliases(&identities).await?;
     let mut leftovers = HashSet::new();
     collect_home_leftovers(home, &mut leftovers)?;
     leftovers.extend(
@@ -39,38 +46,12 @@ pub(crate) async fn admit_unbound_legacy_aliases(
             .cloned(),
     );
     for alias in leftovers {
-        if known.contains(&alias) {
+        if claimed.contains(&alias) {
             continue;
         }
         mint_leftover_identity(home, &identities, &alias).await?;
     }
     Ok(())
-}
-
-async fn known_aliases(identities: &KvIdentityStore) -> StorageResult<HashSet<PrincipalId>> {
-    let mut known = HashSet::new();
-    for user in identities
-        .list_users()
-        .await
-        .map_err(|error| storage_identity(&error))?
-    {
-        known.insert(user.principal.clone());
-        let links = identities
-            .list_links(user.id)
-            .await
-            .map_err(|error| storage_identity(&error))?;
-        for link in links {
-            if link.platform != "astrid-agent"
-                && !(link.platform == "cli" && link.platform_user_id != "local")
-            {
-                continue;
-            }
-            if let Ok(alias) = PrincipalId::new(link.platform_user_id) {
-                known.insert(alias);
-            }
-        }
-    }
-    Ok(known)
 }
 
 fn collect_home_leftovers(
@@ -383,6 +364,8 @@ mod tests {
         write_admitted_profile(&home, &admitted, [0x11; 32]);
         let leftover = PrincipalId::new("legacy-agent").unwrap();
         astrid_core::platform_fs::ensure_private_directory(&home.home_dir()).unwrap();
+        astrid_core::platform_fs::ensure_private_directory(home.principal_home(&admitted).root())
+            .unwrap();
         let leftover_home = home.principal_home(&leftover).root().to_path_buf();
         astrid_core::platform_fs::ensure_private_directory(&leftover_home).unwrap();
         astrid_core::platform_fs::ensure_private_directory(&leftover_home.join("documents"))
@@ -395,10 +378,9 @@ mod tests {
         let identities = KvIdentityStore::new(
             ScopedKvStore::new(Arc::clone(&legacy_kv), "system:identity").unwrap(),
         );
-        let user = identities
-            .create_principal(admitted.clone(), [0x11; 32])
-            .await
-            .unwrap();
+        // 0.10.4 CLI root is linked at cli/local; its user record principal
+        // need not already be `default`. derive_bindings still claims default.
+        let user = identities.create_user(Some("cli-root")).await.unwrap();
         identities
             .link("cli", "local", user.id, "system")
             .await
@@ -445,6 +427,18 @@ mod tests {
         );
         assert!(home.profile_path(&leftover).is_file());
         assert_ne!(leftover_uid, principals.uid_for(&admitted).unwrap());
+        let migrated =
+            KvIdentityStore::new(ScopedKvStore::new(store.kv(), "system:identity").unwrap());
+        let users = migrated.list_users().await.unwrap();
+        let default_users = users
+            .iter()
+            .filter(|user| user.principal == admitted)
+            .count();
+        assert_eq!(
+            default_users, 1,
+            "default must not be reminted when derive_bindings already claims it"
+        );
+        assert_eq!(users.len(), 2);
         store.kv().close().await.unwrap();
     }
 }
