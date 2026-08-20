@@ -70,12 +70,15 @@ pub fn migrate_native_capsules(
     store: &Arc<RuntimePrincipalStore>,
     home: &astrid_core::dirs::AstridHome,
     principal: &PrincipalId,
+    workspace_targets: &[std::path::PathBuf],
 ) -> anyhow::Result<Vec<String>> {
-    Ok(migrate_native_capsules_with_report(store, home, principal)?
-        .retired_authorities
-        .into_iter()
-        .map(|receipt| receipt.capsule_id)
-        .collect())
+    Ok(
+        migrate_native_capsules_with_report(store, home, principal, workspace_targets)?
+            .retired_authorities
+            .into_iter()
+            .map(|receipt| receipt.capsule_id)
+            .collect(),
+    )
 }
 
 /// Migrate one principal's native capsule packages and return the exact
@@ -88,6 +91,7 @@ pub fn migrate_native_capsules_with_report(
     store: &Arc<RuntimePrincipalStore>,
     home: &astrid_core::dirs::AstridHome,
     principal: &PrincipalId,
+    workspace_targets: &[std::path::PathBuf],
 ) -> anyhow::Result<LegacyCapsuleMigrationReport> {
     let uid = store
         .principal_directory()
@@ -144,7 +148,7 @@ pub fn migrate_native_capsules_with_report(
         // capabilities, and executable before any durable publication.
         // Relocated homes keep receipts hashed from a previous absolute
         // path; rebind a unique leftover onto this target first.
-        rebind_relocated_legacy_authority_receipt(home, &target, &manifest)
+        rebind_relocated_legacy_authority_receipt(home, &target, &manifest, workspace_targets)
             .with_context(|| format!("rebind relocated leftover authority for {id}"))?;
         verify_installed_authority(home, &target, &manifest)
             .with_context(|| format!("verify legacy capsule authority {id}"))?;
@@ -232,8 +236,10 @@ pub fn migrate_all_native_capsules(
     store: &Arc<RuntimePrincipalStore>,
     home: &astrid_core::dirs::AstridHome,
     directory: &astrid_storage::PrincipalDirectory,
+    workspace_targets: &[std::path::PathBuf],
 ) -> anyhow::Result<Vec<(astrid_core::identity::PrincipalUid, Vec<String>)>> {
-    let report = migrate_all_native_capsules_with_report(store, home, directory)?;
+    let report =
+        migrate_all_native_capsules_with_report(store, home, directory, workspace_targets)?;
     let mut migrated =
         std::collections::BTreeMap::<astrid_core::identity::PrincipalUid, Vec<String>>::new();
     for receipt in report.retired_authorities {
@@ -251,6 +257,7 @@ pub fn migrate_all_native_capsules_with_report(
     store: &Arc<RuntimePrincipalStore>,
     home: &astrid_core::dirs::AstridHome,
     directory: &astrid_storage::PrincipalDirectory,
+    workspace_targets: &[std::path::PathBuf],
 ) -> anyhow::Result<LegacyCapsuleMigrationReport> {
     const MAX_PRINCIPALS_PER_PASS: usize = 4096;
     let bindings = directory.bindings();
@@ -261,7 +268,8 @@ pub fn migrate_all_native_capsules_with_report(
     }
     let mut report = LegacyCapsuleMigrationReport::default();
     for (alias, _uid) in bindings {
-        let principal_report = migrate_native_capsules_with_report(store, home, &alias)?;
+        let principal_report =
+            migrate_native_capsules_with_report(store, home, &alias, workspace_targets)?;
         report
             .retired_authorities
             .extend(principal_report.retired_authorities);
@@ -405,7 +413,7 @@ mod tests {
         .unwrap();
         assert!(read_installed_authority(&home, &target).unwrap().is_none());
 
-        let report = migrate_native_capsules_with_report(&store, &home, &principal).unwrap();
+        let report = migrate_native_capsules_with_report(&store, &home, &principal, &[]).unwrap();
 
         assert_eq!(report.retired_authorities.len(), 1);
         assert_eq!(report.retired_authorities[0].uid, uid);
@@ -529,7 +537,7 @@ mod tests {
             .unwrap();
         let ghost_bytes = fs::read(authority_paths(&home, &ghost_target).unwrap().active).unwrap();
 
-        let report = migrate_native_capsules_with_report(&store, &home, &principal).unwrap();
+        let report = migrate_native_capsules_with_report(&store, &home, &principal, &[]).unwrap();
         assert_eq!(report.retired_authorities.len(), 1);
         assert_eq!(report.retired_authorities[0].capsule_id, "released-capsule");
         retire_unmatched_legacy_authority_receipts(&store, &home, &directory, &[]).unwrap();

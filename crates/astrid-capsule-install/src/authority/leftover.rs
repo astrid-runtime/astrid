@@ -4,6 +4,7 @@
 //! barrier. Unique matches are rebound onto the current target; remaining
 //! leftovers are quarantined with their original bytes.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -26,11 +27,13 @@ pub(crate) fn rebind_relocated_legacy_authority_receipt(
     home: &AstridHome,
     target_dir: &Path,
     manifest: &CapsuleManifest,
+    workspace_targets: &[PathBuf],
 ) -> anyhow::Result<()> {
     if read_installed_authority(home, target_dir)?.is_some() {
         return Ok(());
     }
-    let Some(receipt) = unique_relocated_receipt(home, target_dir, manifest)? else {
+    let Some(receipt) = unique_relocated_receipt(home, target_dir, manifest, workspace_targets)?
+    else {
         return Ok(());
     };
     AuthorityReceiptTransaction::stage(home, target_dir, &receipt)?.commit()?;
@@ -185,14 +188,19 @@ fn unique_relocated_receipt(
     home: &AstridHome,
     target_dir: &Path,
     manifest: &CapsuleManifest,
+    workspace_targets: &[PathBuf],
 ) -> anyhow::Result<Option<InstalledAuthority>> {
     let current = authority_paths(home, target_dir)?.active;
+    let mut permitted = BTreeSet::new();
+    for target in workspace_targets {
+        permitted.insert(authority_paths(home, target)?.active);
+    }
     let manifest_bytes = fs::read(target_dir.join("Capsule.toml"))
         .context("failed to read installed capsule manifest")?;
     let manifest_digest = digest_manifest(&manifest_bytes);
     let mut matches = Vec::new();
     for path in active_receipt_files(home)? {
-        if path == current {
+        if path == current || permitted.contains(&path) {
             continue;
         }
         let Some((receipt, _bytes)) = parse_legacy_authority_receipt(&path)? else {

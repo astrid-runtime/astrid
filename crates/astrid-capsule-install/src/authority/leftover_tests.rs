@@ -3,7 +3,10 @@ use std::fs;
 use astrid_capsule::manifest::{CapabilitiesDef, CapsuleManifest};
 use astrid_core::dirs::AstridHome;
 
-use super::{quarantine_legacy_authority_receipt, rebind_relocated_legacy_authority_receipt};
+use super::{
+    quarantine_legacy_authority_receipt, rebind_relocated_legacy_authority_receipt,
+    unmatched_active_receipts,
+};
 use crate::authority::{
     AuthorityDecision, AuthorityReceiptTransaction, AuthoritySource, InstallInspection,
     InstalledAuthority, authority_paths, authorize_install, digest_manifest,
@@ -53,7 +56,7 @@ fn rebind_copies_unique_path_hashed_leftover_onto_current_target() {
     assert!(!current_paths.active.exists());
     assert_ne!(previous_paths.active, current_paths.active);
 
-    rebind_relocated_legacy_authority_receipt(&home, &current, &manifest).unwrap();
+    rebind_relocated_legacy_authority_receipt(&home, &current, &manifest, &[]).unwrap();
 
     assert!(
         current_paths.active.exists(),
@@ -99,7 +102,7 @@ fn duplicate_capsule_id_leftovers_are_not_rebound() {
     .commit()
     .unwrap();
 
-    rebind_relocated_legacy_authority_receipt(&home, &current, &manifest).unwrap();
+    rebind_relocated_legacy_authority_receipt(&home, &current, &manifest, &[]).unwrap();
 
     let current_paths = authority_paths(&home, &current).unwrap();
     assert!(
@@ -132,4 +135,69 @@ fn quarantine_preserves_original_receipt_bytes() {
 
     assert!(!paths.active.exists());
     assert_eq!(fs::read(&quarantined).unwrap(), original);
+}
+
+#[test]
+fn workspace_portal_receipt_does_not_block_native_leftover_rebind() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(temp.path().join("home"));
+    let previous = temp.path().join("previous-prefix/released-capsule");
+    let current = temp.path().join("current-prefix/released-capsule");
+    let workspace = temp
+        .path()
+        .join("project/.astrid/capsules/released-capsule");
+    let (manifest, manifest_digest) = write_manifest(&current, "released-capsule");
+    let authority = authorize_install(
+        &inspection("released-capsule", "abc", &manifest_digest),
+        &AuthorityDecision::ExplicitApproval {
+            content_digest: "abc".into(),
+        },
+    )
+    .unwrap();
+    AuthorityReceiptTransaction::stage(&home, &previous, &authority)
+        .unwrap()
+        .commit()
+        .unwrap();
+    AuthorityReceiptTransaction::stage(&home, &workspace, &authority)
+        .unwrap()
+        .commit()
+        .unwrap();
+
+    rebind_relocated_legacy_authority_receipt(
+        &home,
+        &current,
+        &manifest,
+        std::slice::from_ref(&workspace),
+    )
+    .unwrap();
+
+    let current_paths = authority_paths(&home, &current).unwrap();
+    let workspace_paths = authority_paths(&home, &workspace).unwrap();
+    let previous_paths = authority_paths(&home, &previous).unwrap();
+    assert!(current_paths.active.exists());
+    assert!(workspace_paths.active.exists());
+    assert!(previous_paths.active.exists());
+    let rebound: InstalledAuthority =
+        serde_json::from_slice(&fs::read(&current_paths.active).unwrap()).unwrap();
+    assert_eq!(rebound.source, AuthoritySource::ExplicitApproval);
+}
+
+#[test]
+fn leftover_pending_artifact_blocks_sweep_and_is_preserved() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(temp.path().join("home"));
+    let previous = temp.path().join("previous-prefix/ghost-capsule");
+    let authority = authorize_install(
+        &inspection("ghost-capsule", "abc", "manifest"),
+        &AuthorityDecision::ExplicitApproval {
+            content_digest: "abc".into(),
+        },
+    )
+    .unwrap();
+    let transaction = AuthorityReceiptTransaction::stage(&home, &previous, &authority).unwrap();
+    let paths = authority_paths(&home, &previous).unwrap();
+    let error = unmatched_active_receipts(&home, &[]).unwrap_err();
+    assert!(error.to_string().contains("pending"));
+    assert!(paths.pending.exists());
+    drop(transaction);
 }

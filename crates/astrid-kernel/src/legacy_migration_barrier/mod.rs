@@ -363,9 +363,12 @@ async fn migrate_legacy_layout(
     }
     crate::principal_home_migration::migrate_legacy_principal_homes(home, store, directory)?;
     let store_arc = Arc::new(store.clone());
-    let capsule_report = migrate_all_native_capsules_with_report(&store_arc, home, directory)
-        .map_err(|error| io::Error::other(format!("legacy capsule migration failed: {error}")))?;
     let workspace_targets = workspace_portal_targets(workspace_root, workspace_layout)?;
+    let capsule_report =
+        migrate_all_native_capsules_with_report(&store_arc, home, directory, &workspace_targets)
+            .map_err(|error| {
+                io::Error::other(format!("legacy capsule migration failed: {error}"))
+            })?;
     retire_unmatched_legacy_authority_receipts(&store_arc, home, directory, &workspace_targets)
         .map_err(|error| {
             io::Error::other(format!(
