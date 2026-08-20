@@ -14,11 +14,19 @@ use parking_lot::Mutex;
 
 use crate::storage_model::RootState;
 
-const DEFAULT_CACHE_BYTES: usize = 64 * 1024 * 1024;
-const DEFAULT_OWNER_BYTES: usize = 4 * 1024 * 1024;
-const DEFAULT_OWNER_LIMIT: usize = 4_096;
-const DEFAULT_ENTRIES_PER_OWNER: usize = 4_096;
 const ENTRY_ACCOUNTING_BYTES: usize = 128;
+
+const fn nonzero_or_min(value: usize) -> NonZeroUsize {
+    match NonZeroUsize::new(value) {
+        Some(value) => value,
+        None => NonZeroUsize::MIN,
+    }
+}
+
+const DEFAULT_CACHE_BYTES: NonZeroUsize = nonzero_or_min(64 * 1024 * 1024);
+const DEFAULT_OWNER_BYTES: NonZeroUsize = nonzero_or_min(4 * 1024 * 1024);
+const DEFAULT_OWNER_LIMIT: NonZeroUsize = nonzero_or_min(4_096);
+const DEFAULT_ENTRIES_PER_OWNER: NonZeroUsize = nonzero_or_min(4_096);
 
 /// Explicit charged-retention bounds for disposable, root-scoped point-read
 /// acceleration.
@@ -183,16 +191,17 @@ impl<P> KvReadCacheConfig<P> {
         }
     }
 
-    /// Opt-in fixed budget using the documented 64 MiB / 4 MiB-per-owner ceilings.
+    /// Opt-in fixed budget using the documented 64 `MiB` / 4 `MiB`-per-owner
+    /// ceilings.
     ///
     /// Callers must reserve that memory. [`Default`] never selects this budget.
     #[must_use]
     pub fn reserved_64_mib() -> Self {
         Self::bounded(
-            NonZeroUsize::new(DEFAULT_CACHE_BYTES).expect("non-zero cache size"),
-            NonZeroUsize::new(DEFAULT_OWNER_BYTES).expect("non-zero owner cache size"),
-            NonZeroUsize::new(DEFAULT_OWNER_LIMIT).expect("non-zero owner limit"),
-            NonZeroUsize::new(DEFAULT_ENTRIES_PER_OWNER).expect("non-zero entry limit"),
+            DEFAULT_CACHE_BYTES,
+            DEFAULT_OWNER_BYTES,
+            DEFAULT_OWNER_LIMIT,
+            DEFAULT_ENTRIES_PER_OWNER,
         )
     }
 }
@@ -369,10 +378,10 @@ where
         entries_per_owner: usize,
     ) -> Self {
         Self::new(KvReadCacheConfig::bounded(
-            NonZeroUsize::new(capacity_bytes).expect("non-zero cache size"),
-            NonZeroUsize::new(owner_capacity_bytes).expect("non-zero owner cache size"),
-            NonZeroUsize::new(owner_limit).expect("non-zero owner limit"),
-            NonZeroUsize::new(entries_per_owner).expect("non-zero entry limit"),
+            nonzero_or_min(capacity_bytes),
+            nonzero_or_min(owner_capacity_bytes),
+            nonzero_or_min(owner_limit),
+            nonzero_or_min(entries_per_owner),
         ))
     }
 
