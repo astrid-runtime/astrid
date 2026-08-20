@@ -345,7 +345,7 @@ pub(crate) async fn spawn_persistent_daemon() -> Result<()> {
     Ok(())
 }
 
-fn recorded_daemon_pid_is_alive() -> bool {
+pub(crate) fn recorded_daemon_pid_is_alive() -> bool {
     daemon_control::read_pid_file(&socket_client::pid_path())
         .is_some_and(|(pid, _)| daemon_control::is_process_alive(pid))
 }

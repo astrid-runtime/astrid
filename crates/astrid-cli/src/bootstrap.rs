@@ -180,6 +180,7 @@ pub(crate) async fn run_or_connect(
     let socket_path = socket_client::proxy_socket_path();
     let ready_path = socket_client::readiness_path();
 
+    let recorded_pid_alive = commands::daemon::recorded_daemon_pid_is_alive();
     let needs_boot = match astrid_core::local_transport::connect_outcome(&socket_path).await {
         Ok(astrid_core::local_transport::ConnectOutcome::Connected(stream)) => {
             drop(stream);
@@ -188,6 +189,14 @@ pub(crate) async fn run_or_connect(
                 theme::Theme::info("Connecting to existing Astrid daemon...")
             );
             false
+        },
+        Ok(
+            astrid_core::local_transport::ConnectOutcome::Absent
+            | astrid_core::local_transport::ConnectOutcome::Stale,
+        ) if recorded_pid_alive => {
+            anyhow::bail!(
+                "an Astrid daemon is recorded as running (PID file) but its uplink is unreachable;                  run `astrid restart` instead of starting a second kernel onto the singleton lock"
+            );
         },
         Ok(astrid_core::local_transport::ConnectOutcome::Absent) => true,
         Ok(astrid_core::local_transport::ConnectOutcome::Stale) => {
