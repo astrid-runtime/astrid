@@ -74,7 +74,7 @@ astrid-workspace = { path = "crates/astrid-workspace", version = "0.10.4" }
 anyhow = "1.0"
 arboard = "3"
 arc-swap = "1.7"
-lz4_flex = "0.12"
+lz4_flex = "0.14"
 # Streaming + HTTP-server deps (async-stream, axum, tokio-stream,
 # tower, tower-http, utoipa) all back the new `astrid-gateway` crate
 # and have no in-workspace substitute. They are scoped to
@@ -232,7 +232,7 @@ thiserror = "2.0"
 # `rt-multi-thread`).
 tokio = { version = "1.49", features = ["sync", "macros", "time", "rt", "io-util"] }
 tokio-util = "0.7"
-toml = "0.9"
+toml = "1.1"
 # Middleware substrate axum is built on (`Service` trait composition,
 # request-id, trace, CORS, body-size limit, response-header injection).
 # Dropping `tower-http` means re-implementing each middleware by hand;
