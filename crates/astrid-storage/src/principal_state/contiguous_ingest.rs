@@ -158,4 +158,60 @@ mod tests {
             &bytes[..4]
         );
     }
+
+    async fn packed_home(bytes: &[u8]) -> (tempfile::TempDir, AstridHome, StateOwner) {
+        let directory = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(directory.path());
+        home.ensure().unwrap();
+        let store = open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+        let owner = StateOwner::Principal(PrincipalUid::from_bytes([0x44; 32]));
+        let source = directory.path().join("note.bin");
+        std::fs::write(&source, bytes).unwrap();
+        store
+            .put_contiguous_files(
+                owner,
+                [ContiguousFileIngest::new(
+                    ContentName::new("note.bin").unwrap(),
+                    source,
+                    u64::try_from(bytes.len()).unwrap(),
+                )],
+            )
+            .unwrap();
+        store.engine.close().unwrap();
+        drop(store);
+        (directory, home, owner)
+    }
+
+    #[tokio::test]
+    async fn packed_volume_rejects_a_lengthened_blob_region() {
+        let bytes = vec![0x42_u8; 4096];
+        let (_directory, home, _owner) = packed_home(&bytes).await;
+        let volume = crate::volume::HostedFileVolume::open(home.storage_volume_path()).unwrap();
+        let regions = crate::volume::AstridVolume::list_regions(
+            volume.as_ref(),
+            "representations/blobs/loose",
+        )
+        .unwrap();
+        let blob = regions
+            .iter()
+            .find(|region| {
+                region.as_str().ends_with(".blob") && !region.as_str().ends_with(".blob.meta")
+            })
+            .expect("blob region")
+            .clone();
+        let len = crate::volume::AstridVolume::region_len(volume.as_ref(), &blob).unwrap();
+        crate::volume::AstridVolume::set_region_len(volume.as_ref(), &blob, len + 1).unwrap();
+        crate::volume::AstridVolume::write_region_at(volume.as_ref(), &blob, len, &[0xff]).unwrap();
+        drop(volume);
+        let error = match open_runtime_principal_store(&home, unlimited_quota()).await {
+            Ok(_) => panic!("trailing blob bytes must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("contiguous blob length"),
+            "{error}"
+        );
+    }
 }
