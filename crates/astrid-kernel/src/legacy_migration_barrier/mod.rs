@@ -33,7 +33,7 @@ mod legacy_audit;
 use legacy_audit::handle_non_default_audit_source;
 mod legacy_tmp;
 #[cfg(test)]
-pub(super) use legacy_tmp::tighten_legacy_tmp_directories;
+pub(super) use legacy_tmp::tighten_legacy_dedicated_directories;
 mod proof;
 mod secret;
 mod source;
@@ -193,7 +193,7 @@ pub(crate) async fn run(
             home, directory, identity,
         )
         .await?;
-        legacy_tmp::tighten_legacy_tmp_directories(home, directory)?;
+        legacy_tmp::tighten_legacy_dedicated_directories(home, directory)?;
     }
 
     let bindings = directory.bindings();

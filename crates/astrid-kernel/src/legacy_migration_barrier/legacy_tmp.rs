@@ -15,7 +15,7 @@ use astrid_core::dirs::AstridHome;
 use astrid_storage::PrincipalDirectory;
 
 /// Tighten admitted principals' layout-1 dedicated local trees before snapshot.
-pub(crate) fn tighten_legacy_tmp_directories(
+pub(crate) fn tighten_legacy_dedicated_directories(
     home: &AstridHome,
     directory: &PrincipalDirectory,
 ) -> io::Result<()> {
@@ -89,9 +89,14 @@ mod tests {
     use astrid_core::identity::PrincipalUid;
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::path::PathBuf;
 
-    #[test]
-    fn layout1_empty_kv_dir_is_tightened_instead_of_failing_snapshot() {
+    fn fixture_extra_principal() -> (
+        tempfile::TempDir,
+        AstridHome,
+        PrincipalDirectory,
+        PrincipalId,
+    ) {
         let root = tempfile::tempdir().expect("temporary home");
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
             .expect("private root");
@@ -109,21 +114,66 @@ mod tests {
         let principal_root = home.principal_home(&extra).root().to_path_buf();
         astrid_core::platform_fs::ensure_private_directory(&principal_root)
             .expect("private principal home");
-        let kv = home.principal_home(&extra).kv_dir();
-        std::fs::create_dir_all(&kv).expect("kv");
-        std::fs::set_permissions(&kv, std::fs::Permissions::from_mode(0o755)).expect("0755 kv");
-        assert_eq!(
-            std::fs::metadata(&kv).unwrap().permissions().mode() & 0o777,
-            0o755
-        );
+        (root, home, directory, extra)
+    }
 
-        tighten_legacy_tmp_directories(&home, &directory).expect("tighten layout-1 dedicated dirs");
-        assert_eq!(
-            std::fs::metadata(&kv).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        super::super::snapshot_path(&kv).expect("private kv snapshot after tighten");
+    fn make_0755_dir(path: &PathBuf) {
+        std::fs::create_dir_all(path).expect("dedicated dir");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("0755");
+    }
+
+    #[test]
+    fn layout1_empty_kv_and_tokens_dirs_are_tightened_instead_of_failing_snapshot() {
+        let (_root, home, directory, extra) = fixture_extra_principal();
+        let principal = home.principal_home(&extra);
+        for path in [principal.kv_dir(), principal.tokens_dir()] {
+            make_0755_dir(&path);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+        tighten_legacy_dedicated_directories(&home, &directory).expect("tighten");
+        for path in [principal.kv_dir(), principal.tokens_dir()] {
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            super::super::snapshot_path(&path).expect("private snapshot after tighten");
+        }
         super::super::reject_unsupported_sources(&home, &directory, &BTreeMap::new())
-            .expect("empty kv must not refuse cutover after tighten");
+            .expect("empty kv/tokens must not refuse cutover after tighten");
+    }
+
+    #[test]
+    fn layout1_non_empty_kv_and_tokens_stay_fail_closed_after_tighten() {
+        let (_root, home, directory, extra) = fixture_extra_principal();
+        let principal = home.principal_home(&extra);
+        for (path, name) in [
+            (principal.kv_dir(), "kv"),
+            (principal.tokens_dir(), "tokens"),
+        ] {
+            make_0755_dir(&path);
+            let file = path.join("entry");
+            std::fs::write(&file, b"keep-me").expect("bytes");
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("0600");
+            tighten_legacy_dedicated_directories(&home, &directory).expect("tighten");
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            let error =
+                super::super::reject_unsupported_sources(&home, &directory, &BTreeMap::new())
+                    .expect_err("non-empty dedicated state has no importer");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unsupported {name} state")),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&file).expect("preserved"), b"keep-me");
+            std::fs::remove_file(&file).expect("reset file");
+            std::fs::remove_dir_all(&path).expect("reset dir");
+        }
     }
 }

@@ -904,7 +904,7 @@ fn layout1_tmp_scratch_dirs_are_tightened_to_owner_only() {
         0o755
     );
 
-    tighten_legacy_tmp_directories(&home, &directory).expect("tighten layout-1 tmp");
+    tighten_legacy_dedicated_directories(&home, &directory).expect("tighten layout-1 tmp");
     assert_eq!(
         fs::metadata(&tmp).unwrap().permissions().mode() & 0o777,
         0o700
