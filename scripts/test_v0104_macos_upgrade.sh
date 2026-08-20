@@ -711,7 +711,9 @@ attempt_mount_round_trip() {
     run_current storage unmount "${MOUNTPOINT}"
     printf 'native FSKit mount round-trip succeeded after layout-2\n'
   else
-    if grep -Eqi 'install and enable the Astrid file-system extension|FSKit mount failed|unsigned|not installed beside|mount_astridfs|astridfs\.fs|failed with 72|mount rollback incomplete' \
+    # Only the provider's exact sentinel may become a named FSKit gap.
+    # Generic "FSKit mount failed", rollback, or permission errors must fail.
+    if grep -Fq 'FSKIT_EXTENSION_UNAVAILABLE' \
       "${TEST_ROOT}/mount.log"; then
       {
         printf 'GAP: live FSKit enable/unsigned unavailable; skipped native mount round-trip\n'

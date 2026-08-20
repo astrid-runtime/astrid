@@ -21,7 +21,10 @@ use astrid_core::storage_provider::{
 use astrid_uplink::admin_client::AdminClient;
 use serde::{Deserialize, Serialize};
 
+mod mount_failure;
 mod service;
+
+use mount_failure::{classify_native_mount_failure, native_mount_failure_message};
 
 const PROVIDER_NAME: &str = "astrid-storage-provider-fskit";
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
@@ -516,18 +519,20 @@ fn validate_mountpoint_layout(mountpoint: &Path) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 pub(crate) async fn native_mount(lease: &StorageMountLeaseV1, mountpoint: &Path) -> Result<()> {
-    let status = tokio::process::Command::new("/sbin/mount")
+    let output = tokio::process::Command::new("/sbin/mount")
         .arg("-t")
         .arg("astridfs")
         .arg(&lease.resource_path)
         .arg(mountpoint)
-        .status()
+        .output()
         .await
         .context("invoke macOS FSKit mount")?;
-    if !status.success() {
-        bail!(
-            "macOS FSKit mount failed with {status}; install and enable the Astrid file-system extension"
-        );
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(native_mount_failure_message(
+            &classify_native_mount_failure(output.status.code(), &stderr, &stdout,)
+        ));
     }
     Ok(())
 }

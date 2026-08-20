@@ -15,6 +15,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   Health-monitor restart trackers are keyed by generation-independent runtime
   identity so a persistently failing run loop reaches the five-attempt cap
   instead of resetting on every replacement. Refs #1541.
+- **macOS upgrade proof no longer treats every FSKit mount failure as an
+  allowed gap.** The FSKit provider emits a stable `FSKIT_EXTENSION_UNAVAILABLE`
+  sentinel only for missing/disabled extension signals (including mount status
+  72). Generic mount, permission, lease, and rollback failures stay hard
+  errors. Closes #1567.
 
 ### Changed
 
