@@ -893,16 +893,14 @@ fn overlapping_extents(
         .next_back()
         .and_then(|(start, extent)| (extent.logical_end > offset).then_some(*start))
         .unwrap_or(offset);
-    let overlaps = region_state
-        .extents
-        .range(start_key..read_end)
-        .filter(|(_, extent)| extent.logical_end > offset)
-        .map(|(start, extent)| (*start, *extent))
-        .collect::<Vec<_>>();
-    #[cfg(test)]
-    EXTENT_VISITS.with(|count| {
-        count.set(count.get().saturating_add(overlaps.len()));
-    });
+    let mut overlaps = Vec::new();
+    for (start, extent) in region_state.extents.range(start_key..read_end) {
+        #[cfg(test)]
+        EXTENT_VISITS.with(|count| count.set(count.get().saturating_add(1)));
+        if extent.logical_end > offset {
+            overlaps.push((*start, *extent));
+        }
+    }
     overlaps
 }
 

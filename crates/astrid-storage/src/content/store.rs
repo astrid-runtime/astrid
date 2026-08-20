@@ -67,6 +67,8 @@ pub struct PrincipalContentStore<P: Ord, E> {
     engine: Arc<E>,
     quota: Option<Arc<dyn KvQuotaResolver<P>>>,
     validated_catalogs: Arc<Mutex<BTreeMap<P, CatalogValidation>>>,
+    /// Last decoded header for the current principal root. One entry per
+    /// principal, replaced on catalog commit, never a second cache budget.
     decoded_headers: Arc<Mutex<BTreeMap<P, Arc<ContentHeader>>>>,
     validated_kv: Arc<KvValidationCache<P>>,
     read_leases: Arc<ContentReadLeaseRegistry<P>>,
