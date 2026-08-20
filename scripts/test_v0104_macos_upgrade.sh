@@ -713,7 +713,7 @@ attempt_mount_round_trip() {
   else
     # Only the provider's exact sentinel may become a named FSKit gap.
     # Generic "FSKit mount failed", rollback, or permission errors must fail.
-    if grep -Fq 'FSKIT_EXTENSION_UNAVAILABLE' \
+    if grep -Eq 'FSKIT_EXTENSION_UNAVAILABLE|\[fskit-extension-unavailable\]' \
       "${TEST_ROOT}/mount.log"; then
       if grep -Eqi 'mount rollback incomplete|rollback left the lease' \
         "${TEST_ROOT}/mount.log"; then

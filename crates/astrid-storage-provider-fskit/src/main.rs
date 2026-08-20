@@ -14,15 +14,16 @@ use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
 use astrid_core::storage_filesystem::StorageMountLeaseV1;
 use astrid_core::storage_provider::{
     STORAGE_PROVIDER_PROTOCOL_V1, StorageMountId, StorageMountSelectorV1,
-    StorageProviderCapabilityV1, StorageProviderFailureV1, StorageProviderIdentityV1,
-    StorageProviderOperationV1, StorageProviderOutcomeV1, StorageProviderRequestV1,
-    StorageProviderResponseV1, StorageProviderSuccessV1,
+    StorageProviderCapabilityV1, StorageProviderIdentityV1, StorageProviderOperationV1,
+    StorageProviderOutcomeV1, StorageProviderRequestV1, StorageProviderResponseV1,
+    StorageProviderSuccessV1,
 };
 use astrid_uplink::admin_client::AdminClient;
 use serde::{Deserialize, Serialize};
 
 #[cfg(any(test, target_os = "macos"))]
 mod mount_failure;
+mod provider_failure;
 mod service;
 
 #[cfg(target_os = "macos")]
@@ -93,10 +94,7 @@ async fn run() -> Result<StorageProviderResponseV1> {
     let request_id = request.request_id;
     let outcome = match execute(request).await {
         Ok(success) => StorageProviderOutcomeV1::Success(success),
-        Err(error) => StorageProviderOutcomeV1::Failure(StorageProviderFailureV1 {
-            code: "provider-operation".to_owned(),
-            message: error.to_string().chars().take(4096).collect(),
-        }),
+        Err(error) => StorageProviderOutcomeV1::Failure(provider_failure::provider_failure(&error)),
     };
     Ok(StorageProviderResponseV1 {
         protocol_version: STORAGE_PROVIDER_PROTOCOL_V1,

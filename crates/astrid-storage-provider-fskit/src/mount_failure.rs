@@ -71,7 +71,7 @@ fn combined_output(stderr: &str, stdout: &str) -> String {
         (true, true) => String::new(),
         (false, true) => stderr.trim().to_owned(),
         (true, false) => stdout.trim().to_owned(),
-        (false, false) => format!("{}\n{}", stderr.trim(), stdout.trim()),
+        (false, false) => format!("{}; {}", stderr.trim(), stdout.trim()),
     }
 }
 
@@ -133,5 +133,21 @@ mod tests {
             NativeMountFailure::ExtensionUnavailable { .. }
         ));
         assert!(native_mount_failure_message(&failure).contains(FSKIT_EXTENSION_UNAVAILABLE));
+    }
+
+    #[test]
+    fn combined_output_does_not_insert_a_newline() {
+        let failure = classify_native_mount_failure(Some(72), "stderr hint", "stdout hint");
+        let NativeMountFailure::ExtensionUnavailable { ref detail, .. } = failure else {
+            panic!("exit 72 must classify as extension unavailable");
+        };
+        assert_eq!(detail, "stderr hint; stdout hint");
+        assert!(
+            !detail.contains('\n'),
+            "joined helper output must stay on one line: {detail:?}"
+        );
+        let message = native_mount_failure_message(&failure);
+        assert!(message.contains(FSKIT_EXTENSION_UNAVAILABLE));
+        assert!(!message.contains('\n'));
     }
 }

@@ -358,11 +358,11 @@ mod tests {
 
     use crate::cli::{Cli, Commands};
 
-    use super::{MountView, StorageCommand, validate_response};
+    use super::{MountView, StorageCommand, render_response, validate_response};
     use astrid_core::storage_provider::{
-        StorageMountId, StorageProviderCapabilityV1, StorageProviderIdentityV1,
-        StorageProviderOperationV1, StorageProviderOutcomeV1, StorageProviderRequestV1,
-        StorageProviderResponseV1, StorageProviderSuccessV1,
+        StorageMountId, StorageProviderCapabilityV1, StorageProviderFailureV1,
+        StorageProviderIdentityV1, StorageProviderOperationV1, StorageProviderOutcomeV1,
+        StorageProviderRequestV1, StorageProviderResponseV1, StorageProviderSuccessV1,
     };
 
     fn mount(arguments: &[&str]) -> super::MountArgs {
@@ -512,6 +512,48 @@ mod tests {
                 ],
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn fskit_gap_json_renders_instead_of_invalid_structured_error() {
+        let json = r#"{"code":"fskit-extension-unavailable","message":"FSKIT_EXTENSION_UNAVAILABLE: macOS FSKit extension is not installed or enabled (mount status Some(72)): stderr hint; stdout hint"}"#;
+        let failure: StorageProviderFailureV1 =
+            serde_json::from_str(json).expect("decode provider JSON failure");
+        render_response(StorageProviderOutcomeV1::Failure(failure))
+            .expect("named FSKit gap must be a valid structured error");
+    }
+
+    #[test]
+    fn newline_in_provider_json_is_an_invalid_structured_error() {
+        let json = r#"{"code":"provider-operation","message":"FSKIT_EXTENSION_UNAVAILABLE: first\nsecond"}"#;
+        let failure: StorageProviderFailureV1 =
+            serde_json::from_str(json).expect("decode newline JSON failure");
+        let error = render_response(StorageProviderOutcomeV1::Failure(failure))
+            .expect_err("control characters must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("native provider returned an invalid structured error"),
+            "CLI must surface the dedicated invalid-error job, got {error}"
+        );
+    }
+
+    #[test]
+    fn oversize_provider_json_is_an_invalid_structured_error() {
+        let failure = StorageProviderFailureV1 {
+            code: "provider-operation".to_owned(),
+            message: "x".repeat(4097),
+        };
+        let json = serde_json::to_string(&failure).expect("encode oversize failure");
+        let decoded: StorageProviderFailureV1 =
+            serde_json::from_str(&json).expect("decode oversize failure");
+        let error = render_response(StorageProviderOutcomeV1::Failure(decoded))
+            .expect_err("messages over 4096 bytes must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("native provider returned an invalid structured error")
         );
     }
 }

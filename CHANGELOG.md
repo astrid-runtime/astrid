@@ -16,10 +16,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   identity so a persistently failing run loop reaches the five-attempt cap
   instead of resetting on every replacement. Refs #1541.
 - **macOS upgrade proof no longer treats every FSKit mount failure as an
-  allowed gap.** The FSKit provider emits a stable `FSKIT_EXTENSION_UNAVAILABLE`
-  sentinel only for missing/disabled extension signals (including mount status
-  72). Generic mount, permission, lease, and rollback failures stay hard
-  errors. Closes #1567.
+  allowed gap.** The FSKit provider emits a CLI-valid structured failure with
+  machine code `fskit-extension-unavailable` and keeps `FSKIT_EXTENSION_UNAVAILABLE`
+  in the sanitized message only for missing/disabled extension signals
+  (including mount status 72). Messages are stripped of control characters and
+  bounded to 4096 bytes so `astrid storage` can render them instead of rejecting
+  the provider as an invalid structured error. Generic mount, permission, lease,
+  and rollback failures stay `provider-operation` hard errors. Closes #1567.
 
 ### Changed
 
