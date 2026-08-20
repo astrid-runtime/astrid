@@ -10,7 +10,6 @@ use super::{
     validate_catalog, validated_projection_quota,
 };
 use crate::content::catalog::prefix_exists as catalog_prefix_exists;
-use crate::engine::ProjectionCacheEntry;
 
 impl<P, E> PrincipalContentStore<P, E>
 where
@@ -36,16 +35,9 @@ where
         header.previous_catalog_quota_bytes = header
             .catalog
             .map_or(0, |catalog| catalog.summary.quota_bytes);
-        let header = std::sync::Arc::new(header);
         self.decoded_headers
             .lock()
-            .insert(principal.clone(), std::sync::Arc::clone(&header));
-        let _ = self.engine.retain_projection_cache(
-            principal,
-            root.commit,
-            super::DECODED_HEADER_CACHE_KEY,
-            ProjectionCacheEntry::new(header.as_ref().clone()),
-        );
+            .insert(principal.clone(), std::sync::Arc::new(header));
     }
 
     pub(super) fn decode_header(
