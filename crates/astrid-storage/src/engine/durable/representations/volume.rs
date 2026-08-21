@@ -172,22 +172,41 @@ pub(in crate::engine::durable) fn install_volume_blob_copy<R: Read>(
         verify_volume_blob(volume, &blob_region, profile, blob, logical_bytes)?;
         return Ok(());
     }
-    let mut output = DurableFile::volume(Arc::clone(volume), &blob_region, true)?;
-    let copied = std::io::copy(&mut source.take(logical_bytes), &mut output)
-        .map_err(|source| io_error("copy volume contiguous blob", source))?;
-    if copied != logical_bytes {
-        return Err(DurableError::InvalidRepresentationState(
-            "volume contiguous blob source ended before its declared length",
-        ));
+    let named = crate::volume::VolumeRegion::new(&blob_region)
+        .map_err(|source| io_error("validate volume contiguous blob region", source))?;
+    volume
+        .create_region(&named, true)
+        .map_err(|source| io_error("create volume contiguous blob", source))?;
+    let mut source = source.take(logical_bytes);
+    if let Err(error) = volume.write_region_from(&named, 0, logical_bytes, &mut source) {
+        let _ = volume.remove_region(&named);
+        return Err(map_blob_copy_error(error));
     }
-    output
-        .sync_data()
-        .map_err(|source| io_error("flush volume contiguous blob", source))?;
-    verify_volume_blob(volume, &blob_region, profile, blob, logical_bytes)?;
+    if let Err(error) = volume
+        .sync()
+        .map_err(|source| io_error("flush volume contiguous blob", source))
+    {
+        let _ = volume.remove_region(&named);
+        return Err(error);
+    }
+    if let Err(error) = verify_volume_blob(volume, &blob_region, profile, blob, logical_bytes) {
+        let _ = volume.remove_region(&named);
+        return Err(error);
+    }
     volume
         .sync()
         .map_err(|source| io_error("flush volume blob namespace", source))?;
     Ok(())
+}
+
+fn map_blob_copy_error(source: std::io::Error) -> DurableError {
+    if source.kind() == std::io::ErrorKind::UnexpectedEof {
+        DurableError::InvalidRepresentationState(
+            "volume contiguous blob source ended before its declared length",
+        )
+    } else {
+        io_error("copy volume contiguous blob", source)
+    }
 }
 
 pub(in crate::engine::durable) fn open_volume_blob(

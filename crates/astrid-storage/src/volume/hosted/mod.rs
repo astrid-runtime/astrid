@@ -18,6 +18,7 @@ use super::{AstridVolume, MAX_REGION_NAME_BYTES, VolumeMetadataMutation, VolumeR
 
 mod open;
 mod reclaim;
+mod stream;
 
 const VOLUME_MAGIC: [u8; 8] = *b"ASTVOL2\0";
 const RECORD_MAGIC: [u8; 8] = *b"ASTREG2\0";
@@ -257,6 +258,16 @@ impl AstridVolume for HostedFileVolume {
         overlay_extent(&mut region_state.extents, offset, end, physical);
         region_state.length = region_state.length.max(end);
         Ok(())
+    }
+
+    fn write_region_from(
+        &self,
+        region: &VolumeRegion,
+        offset: u64,
+        payload_len: u64,
+        payload: &mut dyn Read,
+    ) -> io::Result<()> {
+        stream::write_region_from(self, region, offset, payload_len, payload)
     }
 
     fn set_region_len(&self, region: &VolumeRegion, length: u64) -> io::Result<()> {
@@ -964,6 +975,9 @@ fn truncate_extents(extents: &mut BTreeMap<u64, Extent>, length: u64) {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) use stream::write_record_payloads;
 
 #[cfg(test)]
 mod tests;

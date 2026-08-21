@@ -15,6 +15,9 @@ mod hosted;
 #[cfg(not(target_family = "wasm"))]
 pub use hosted::HostedFileVolume;
 
+#[cfg(all(test, not(target_family = "wasm")))]
+pub(crate) use hosted::write_record_payloads;
+
 const MAX_REGION_NAME_BYTES: usize = 512;
 
 /// Validated, portable name of one byte-addressable volume region.
@@ -118,6 +121,51 @@ pub trait AstridVolume: fmt::Debug + Send + Sync {
     ///
     /// Returns `NotFound`, an overflow error, or an underlying media error.
     fn write_region_at(&self, region: &VolumeRegion, offset: u64, bytes: &[u8]) -> io::Result<()>;
+
+    /// Write `payload_len` bytes from `payload` at an exact logical offset.
+    ///
+    /// Hosted ASTVOL2 volumes must persist this as one `Write` record of that
+    /// payload length (or a bounded handful of large extents), not one record
+    /// per copy-buffer `write()`. The default implementation loops
+    /// [`Self::write_region_at`] and is only for backends whose native write is
+    /// already a single media extent.
+    ///
+    /// The payload is streamed. Callers with a known length must not assemble
+    /// all of `payload_len` in RAM solely to call this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotFound`, `UnexpectedEof` when the source ends early, an
+    /// overflow error, or an underlying media error.
+    fn write_region_from(
+        &self,
+        region: &VolumeRegion,
+        offset: u64,
+        payload_len: u64,
+        payload: &mut dyn Read,
+    ) -> io::Result<()> {
+        const BUFFER_BYTES: usize = 64 * 1024;
+        if payload_len == 0 {
+            return Ok(());
+        }
+        let mut buffer = vec![0_u8; BUFFER_BYTES];
+        let mut remaining = payload_len;
+        let mut cursor = offset;
+        while remaining != 0 {
+            let want = usize::try_from(remaining.min(BUFFER_BYTES as u64))
+                .map_err(|_| io::Error::other("volume stream copy length overflow"))?;
+            payload.read_exact(&mut buffer[..want])?;
+            self.write_region_at(region, cursor, &buffer[..want])?;
+            let copied = want as u64;
+            cursor = cursor
+                .checked_add(copied)
+                .ok_or_else(|| io::Error::other("volume stream copy offset overflow"))?;
+            remaining = remaining
+                .checked_sub(copied)
+                .ok_or_else(|| io::Error::other("volume stream copy length overflow"))?;
+        }
+        Ok(())
+    }
 
     /// Set a region's logical length.
     ///

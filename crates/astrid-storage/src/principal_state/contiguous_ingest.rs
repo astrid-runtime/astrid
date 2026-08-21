@@ -185,6 +185,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn contiguous_volume_blob_is_one_payload_record_and_shared() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(directory.path());
+        home.ensure().unwrap();
+        let store = open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+        let owner = StateOwner::Principal(PrincipalUid::from_bytes([0x44; 32]));
+        let bytes = vec![0x5A_u8; 256 * 1024];
+        let first = directory.path().join("one.bin");
+        let second = directory.path().join("two.bin");
+        std::fs::write(&first, &bytes).unwrap();
+        std::fs::write(&second, &bytes).unwrap();
+        store
+            .put_contiguous_files(
+                owner,
+                [ContiguousFileIngest::new(
+                    ContentName::new("one.bin").unwrap(),
+                    first,
+                    u64::try_from(bytes.len()).unwrap(),
+                )],
+            )
+            .unwrap();
+        let volume_path = home.storage_volume_path();
+        let after_first = std::fs::metadata(&volume_path).unwrap().len();
+        store
+            .put_contiguous_files(
+                owner,
+                [ContiguousFileIngest::new(
+                    ContentName::new("two.bin").unwrap(),
+                    second,
+                    u64::try_from(bytes.len()).unwrap(),
+                )],
+            )
+            .unwrap();
+        let after_second = std::fs::metadata(&volume_path).unwrap().len();
+        assert!(
+            after_second.saturating_sub(after_first) < u64::try_from(bytes.len()).unwrap(),
+            "identical second file recopied payload: {after_first} -> {after_second}"
+        );
+        store.engine.close().unwrap();
+        drop(store);
+        let payload_writes = crate::volume::write_record_payloads(&volume_path)
+            .unwrap()
+            .into_iter()
+            .filter(|(name, len)| {
+                *len == u64::try_from(bytes.len()).unwrap()
+                    && name.contains("representations/blobs/loose")
+                    && std::path::Path::new(name)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("blob"))
+            })
+            .count();
+        assert_eq!(
+            payload_writes, 1,
+            "blob payload was shredded into journal writes"
+        );
+        let reopened = open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .expect("reopen packed volume");
+        let filesystem = crate::AstridFilesystem::new(reopened.content(), owner);
+        assert_eq!(
+            filesystem
+                .read(
+                    &crate::FilesystemPath::new("one.bin").unwrap(),
+                    0,
+                    u64::try_from(bytes.len()).unwrap(),
+                )
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(
+            filesystem
+                .read(
+                    &crate::FilesystemPath::new("two.bin").unwrap(),
+                    0,
+                    u64::try_from(bytes.len()).unwrap(),
+                )
+                .unwrap(),
+            bytes
+        );
+    }
+
+    #[tokio::test]
     async fn packed_volume_rejects_a_lengthened_blob_region() {
         let bytes = vec![0x42_u8; 4096];
         let (_directory, home, _owner) = packed_home(&bytes).await;
