@@ -440,3 +440,23 @@ async fn legacy_move_does_not_recertify_historical_signatures() {
     assert_eq!(report.source_entries, 2);
     assert_eq!(report.imported_entries, 2);
 }
+
+#[tokio::test]
+async fn legacy_move_fails_closed_when_destination_cannot_reopen() {
+    let directory = tempfile::tempdir().expect("temporary legacy directory");
+    let path = directory.path().join("audit-db");
+    let key = Arc::new(KeyPair::generate());
+    let session = SessionId::new();
+    let source = AuditLog::open_legacy_source(&path, Arc::clone(&key)).expect("open legacy source");
+    append_test_entries(&source, &session, 2).await;
+    source.close().await.expect("close source");
+
+    let destination =
+        AuditLog::in_memory(key).with_capacity_oracle(Arc::new(FixedAuditCapacity(Some(u64::MAX))));
+    let error = destination
+        .import_legacy_audit(&path, "test-system-audit")
+        .await
+        .expect_err("move must fail closed without a reopenable destination");
+    assert!(error.to_string().contains("cannot be reopened"));
+    assert_eq!(destination.count().await.unwrap(), 2);
+}

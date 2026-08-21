@@ -8,6 +8,7 @@ use super::{
     AuditError, AuditLog, AuditResult, AuditStorage, KvAuditStorage, LegacyAuditImportReport,
 };
 use std::path::Path;
+use std::sync::Arc;
 
 impl AuditLog {
     pub(super) async fn import_legacy_audit_impl(
@@ -47,12 +48,8 @@ impl AuditLog {
             ));
         }
         self.storage.flush().await?;
-        let destination = digest_storage(self.storage.as_ref(), destination_identity).await?;
-        if !payload_matches(&receipt, &destination) {
-            return Err(AuditError::StorageError(
-                "native audit reconstruction does not match the source payload digest".to_owned(),
-            ));
-        }
+        self.prove_reopened_destination(destination_identity, &receipt)
+            .await?;
         source.close().await?;
         self.storage.clear_migration_temp().await?;
         validate_destination(&receipt, destination_identity)?;
@@ -67,6 +64,26 @@ impl AuditLog {
             marker_installed,
             source_digest: receipt.source_digest,
         })
+    }
+
+    async fn prove_reopened_destination(
+        &self,
+        destination_identity: &str,
+        expected: &super::migration::LegacyAuditReceipt,
+    ) -> AuditResult<()> {
+        let kv = self.destination_kv.as_ref().ok_or_else(|| {
+            AuditError::StorageError("native audit destination cannot be reopened".to_owned())
+        })?;
+        let reopened = AuditLog::open_with_kv_store(Arc::clone(kv), Arc::clone(&self.runtime_key))?;
+        reopened.storage.flush().await?;
+        let destination = digest_storage(reopened.storage.as_ref(), destination_identity).await?;
+        if !payload_matches(expected, &destination) {
+            return Err(AuditError::StorageError(
+                "reopened native audit reconstruction does not match the source payload digest"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     async fn report_missing_legacy_source(

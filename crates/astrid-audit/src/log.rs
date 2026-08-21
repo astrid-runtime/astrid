@@ -135,6 +135,8 @@ pub struct AuditLog {
     append_coordinator: Arc<Mutex<()>>,
     /// Optional media-capacity oracle used only by legacy migration.
     migration_capacity: Option<Arc<dyn AuditCapacityProvider>>,
+    /// Original KV handle so cutover can freshly reopen the destination.
+    destination_kv: Option<Arc<dyn KvStore>>,
 }
 impl AuditLog {
     /// Open a legacy native audit source for migration only.
@@ -160,6 +162,7 @@ impl AuditLog {
             chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
             append_coordinator: Arc::new(Mutex::new(())),
             migration_capacity: None,
+            destination_kv: None,
         })
     }
 
@@ -198,6 +201,7 @@ impl AuditLog {
         runtime_key: impl Into<Arc<KeyPair>>,
         migration_capacity: Option<Arc<dyn AuditCapacityProvider>>,
     ) -> AuditResult<Self> {
+        let destination_kv = Arc::clone(&store);
         let storage = KvAuditStorage::from_kv_store(store)?;
         Ok(Self {
             storage: Box::new(storage),
@@ -205,6 +209,7 @@ impl AuditLog {
             chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
             append_coordinator: Arc::new(Mutex::new(())),
             migration_capacity,
+            destination_kv: Some(destination_kv),
         })
     }
 
@@ -225,7 +230,17 @@ impl AuditLog {
             chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
             append_coordinator: Arc::new(Mutex::new(())),
             migration_capacity: None,
+            destination_kv: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_capacity_oracle(
+        mut self,
+        migration_capacity: Arc<dyn AuditCapacityProvider>,
+    ) -> Self {
+        self.migration_capacity = Some(migration_capacity);
+        self
     }
 
     #[cfg(test)]
@@ -239,6 +254,7 @@ impl AuditLog {
             chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
             append_coordinator: Arc::new(Mutex::new(())),
             migration_capacity: None,
+            destination_kv: None,
         }
     }
 
