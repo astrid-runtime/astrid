@@ -40,7 +40,7 @@ fn audit_retirement_rejects_redirects_before_removal() {
 }
 
 #[test]
-fn audit_boot_integrity_barrier_rejects_tampered_history() {
+fn derived_audit_recertify_helper_rejects_invalid_history() {
     let valid = vec![(
         SessionId::new(),
         ChainVerificationResult {
@@ -49,7 +49,7 @@ fn audit_boot_integrity_barrier_rejects_tampered_history() {
             issues: Vec::new(),
         },
     )];
-    require_audit_integrity(&valid).expect("valid history permits boot");
+    require_audit_integrity(&valid).expect("valid history is accepted by the derived helper");
 
     let invalid = vec![(
         SessionId::new(),

@@ -38,12 +38,15 @@ impl AuditLog {
         }
 
         let imported_entries = import_legacy_graph(self, &source, &graph).await?;
+        // Payload digest only: prove the source tree did not change during the
+        // bulk write. This is not signature or chain recertify.
         let source_after = digest_legacy_source(&source, destination_identity).await?;
         if !payload_matches(&receipt, &source_after) {
             return Err(AuditError::StorageError(
                 "legacy audit source changed during native volume move".to_owned(),
             ));
         }
+        self.storage.flush().await?;
         let destination = digest_storage(self.storage.as_ref(), destination_identity).await?;
         if !payload_matches(&receipt, &destination) {
             return Err(AuditError::StorageError(

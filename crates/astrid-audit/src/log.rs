@@ -242,21 +242,18 @@ impl AuditLog {
         }
     }
 
-    /// Import a legacy `SurrealKV` audit directory into the system-owned
-    /// projection and return a content-bound receipt.
+    /// Blind-move a legacy `SurrealKV` audit directory into native [`AuditLog`].
     ///
-    /// The source is opened read-only in the logical sense (the legacy engine
-    /// itself is closed without mutation). Every source byte is required to be
-    /// canonical JSON, every signature and chain link is verified, and every
-    /// destination conflict fails closed. The operation is resumable: entries
-    /// already committed with identical bytes are accepted, while a durable
-    /// marker records the exact source digest, chain terminal hashes, counts,
-    /// and destination identity before the caller retires the native source.
+    /// Cutover hashes canonical stored entry bytes, bulk-writes them into the
+    /// destination, reconstructs the destination, and fail-closes unless the
+    /// payload digests match. Historical signatures and chains are not
+    /// recertified. Optional recertify is a derived observer job after layout 2.
     ///
     /// # Errors
     ///
-    /// Returns an error when source bytes, signatures, chain links, or the
-    /// destination receipt are invalid or conflicting.
+    /// Returns an error when the source cannot be read, destination capacity is
+    /// unproven, the native reconstruction digest differs, or the destination
+    /// cannot be flushed and reread.
     pub async fn import_legacy_audit(
         &self,
         legacy_path: impl AsRef<Path>,
@@ -266,13 +263,11 @@ impl AuditLog {
             .await
     }
 
-    /// Re-read and verify the legacy source digest immediately before source
-    /// retirement.
+    /// Re-hash canonical source payload bytes immediately before retirement.
     ///
-    /// The import itself performs source-only, preflight, and post-copy digest
-    /// passes. The kernel calls this final read-back under its boot singleton
-    /// barrier so a source mutation between import completion and native-tree
-    /// retirement leaves the source in place and fails closed.
+    /// This is a MOVE proof, not signature or chain recertify. The kernel calls
+    /// it under the boot singleton so a source mutation between ingest and
+    /// native-tree retirement leaves the source in place and fails closed.
     ///
     /// # Errors
     ///

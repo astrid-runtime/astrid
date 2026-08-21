@@ -3797,11 +3797,10 @@ impl AuditCapacityProvider for RuntimeAuditCapacityProvider {
     }
 }
 
-/// Opens the system-owned audit projection over the runtime principal store and
-/// verifies already-published destination chains before serving. Released
-/// native sources are migrated by [`legacy_migration_barrier::run`] so audit
-/// retirement is covered by the same completion ledger as every other legacy
-/// component. Any integrity failure blocks boot.
+/// Opens the system-owned audit projection over the runtime principal store.
+/// Released native sources are migrated by [`legacy_migration_barrier::run`]
+/// so audit retirement is covered by the same completion ledger as every other
+/// legacy component. Historical chain recertify is not a boot gate.
 /// Takes the caller's already-resolved [`AstridHome`](astrid_core::dirs::AstridHome)
 /// so every resource acquired by the native composition root is rooted in the
 /// same home — re-resolving from the environment here could split the audit
@@ -3825,15 +3824,9 @@ async fn open_audit_log(
     let audit_log =
         AuditLog::open_with_kv_store_and_capacity(audit_store, runtime_key, Some(capacity))
             .map_err(|e| std::io::Error::other(format!("cannot open audit log: {e}")))?;
-
-    // Verify all historical chains on boot. Audit is authoritative compliance
-    // state: serving with a tampered or unverifiable chain would silently
-    // bless an untrusted history.
-    let results = audit_log.verify_all().await.map_err(|error| {
-        std::io::Error::other(format!("audit chain verification failed: {error}"))
+    audit_log.flush().await.map_err(|error| {
+        std::io::Error::other(format!("native audit log could not reopen: {error}"))
     })?;
-    require_audit_integrity(&results)?;
-
     Ok(Arc::new(audit_log))
 }
 
@@ -3933,6 +3926,9 @@ pub(crate) fn preflight_legacy_audit_sources(
     Ok(default_source_present)
 }
 
+/// Derived observer helper for optional post-cutover recertify.
+/// Layout-2 boot and legacy cutover do not call this.
+#[allow(dead_code, reason = "Refinery/observer recertify; not a boot gate")]
 pub(crate) fn require_audit_integrity(
     results: &[(
         astrid_core::SessionId,
