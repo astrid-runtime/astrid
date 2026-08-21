@@ -27,13 +27,11 @@ where
         live: &BTreeSet<ObjectId>,
         volume: &Arc<dyn AstridVolume>,
     ) -> Result<CompactionReport, DurableError> {
-        if inner.representations.is_some() {
-            return Err(DurableError::InvalidCompactionEvidence(
-                "Astrid volume cannot contain a host representation catalogue",
-            ));
-        }
-        let objects_before = u64::try_from(Self::object_universe(inner).len())
-            .map_err(|_| DurableError::EncodingOverflow)?;
+        // ContiguousFile blobs are volume regions, not host files. Arena
+        // compaction must not materialize those payloads as DirectCanonical
+        // frames. Count and copy only arena-resident objects.
+        let objects_before =
+            u64::try_from(inner.index.len()).map_err(|_| DurableError::EncodingOverflow)?;
         let (arena_bytes_before, root_bytes, root_digest) = {
             let files = live_files_mut(&mut inner.files)?;
             let arena_bytes = files
@@ -63,6 +61,9 @@ where
         let mut arena = File::volume(Arc::clone(volume), ARENA_COMPACTING, true)?;
         let mut new_index = BTreeMap::new();
         for id in live {
+            if !inner.index.contains_key(id) {
+                continue;
+            }
             let record = self.read_compaction_object(inner, *id)?;
             let payload = encode_object_frame(self.identity.scheme(), *id, &record)?;
             ensure_payload_limit(ARENA_FILE, 0, payload.len(), self.limits)?;
@@ -80,6 +81,7 @@ where
             &mut arena,
             &mut roots,
             &new_index,
+            inner.representations.as_ref(),
             &self.principal_codec,
             &self.identity,
             self.limits,
@@ -143,6 +145,15 @@ where
             self.limits,
         )?;
         self.install_volume_replacement(inner, replacement, Arc::clone(volume))?;
+        if let Some(representations) = inner.representations.as_mut() {
+            let files = live_files_mut(&mut inner.files)?;
+            representations.rebase_compacted_arena(
+                &files.arena,
+                &inner.index,
+                &self.identity,
+                self.limits,
+            )?;
+        }
         volume
             .reclaim()
             .map_err(|source| io_error("physically reclaim compacted volume", source))?;

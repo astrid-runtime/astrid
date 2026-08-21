@@ -1,7 +1,7 @@
 //! Engine-bound preparation of contiguous file representations.
 
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::sync::Arc;
 
 use crate::content_dag::{
@@ -220,14 +220,24 @@ where
         self.flush()?;
         self.fail_if(FaultPoint::AfterContiguousStructuralFlush)?;
         let logical_bytes = prepared.verified.descriptor().logical_bytes();
-        super::representations::install_loose_blob_copy(
-            self.hosted_directory()?,
-            self.hosted_path()?,
-            prepared.payload.blob,
-            prepared.payload.profile_id,
-            logical_bytes,
-            source,
-        )?;
+        if let Some(volume) = self.volume.read().as_ref().cloned() {
+            super::representations::install_volume_blob_copy(
+                &volume,
+                prepared.payload.blob,
+                prepared.payload.profile_id,
+                logical_bytes,
+                source,
+            )?;
+        } else {
+            super::representations::install_loose_blob_copy(
+                self.hosted_directory()?,
+                self.hosted_path()?,
+                prepared.payload.blob,
+                prepared.payload.profile_id,
+                logical_bytes,
+                source,
+            )?;
+        }
         self.fail_if(FaultPoint::AfterContiguousBlobInstall)?;
         self.publish_installed_contiguous(prepared)
     }
@@ -270,14 +280,30 @@ where
         self.flush()?;
         self.fail_if(FaultPoint::AfterContiguousStructuralFlush)?;
         let logical_bytes = prepared.verified.descriptor().logical_bytes();
-        super::representations::install_loose_blob_from_file(
-            self.hosted_directory()?,
-            self.hosted_path()?,
-            prepared.payload.blob,
-            prepared.payload.profile_id,
-            logical_bytes,
-            source,
-        )?;
+        if let Some(volume) = self.volume.read().as_ref().cloned() {
+            let mut source = source
+                .try_clone()
+                .map_err(|source| io_error("clone volume contiguous adoption source", source))?;
+            source
+                .seek(std::io::SeekFrom::Start(0))
+                .map_err(|source| io_error("rewind volume contiguous adoption source", source))?;
+            super::representations::install_volume_blob_copy(
+                &volume,
+                prepared.payload.blob,
+                prepared.payload.profile_id,
+                logical_bytes,
+                source,
+            )?;
+        } else {
+            super::representations::install_loose_blob_from_file(
+                self.hosted_directory()?,
+                self.hosted_path()?,
+                prepared.payload.blob,
+                prepared.payload.profile_id,
+                logical_bytes,
+                source,
+            )?;
+        }
         self.fail_if(FaultPoint::AfterContiguousBlobInstall)?;
         self.publish_installed_contiguous(prepared)
     }

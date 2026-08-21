@@ -111,13 +111,22 @@ where
                     Ok(())
                 },
             )?;
-            RepresentationStore::activate(
-                self.hosted_path()?,
-                self.hosted_directory()?,
-                self.limits,
-                frozen_specification,
-                objects.into_iter().map(Ok),
-            )?
+            if let Some(volume) = self.volume.read().as_ref().cloned() {
+                RepresentationStore::activate_volume(
+                    &volume,
+                    self.limits,
+                    frozen_specification,
+                    objects.into_iter().map(Ok),
+                )?
+            } else {
+                RepresentationStore::activate(
+                    self.hosted_path()?,
+                    self.hosted_directory()?,
+                    self.limits,
+                    frozen_specification,
+                    objects.into_iter().map(Ok),
+                )?
+            }
         };
         let active = representations.active();
         inner.representations = Some(representations);

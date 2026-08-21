@@ -794,6 +794,7 @@ where
             &mut arena,
             &mut journal,
             &new_index,
+            None,
             &self.principal_codec,
             &self.identity,
             self.limits,
@@ -880,6 +881,7 @@ fn validate_replacement<P, I, C>(
     arena: &mut File,
     roots: &mut File,
     expected_index: &BTreeMap<ObjectId, ArenaLocation>,
+    representations: Option<&super::representations::RepresentationStore>,
     codec: &C,
     identity: &I,
     limits: RecoveryLimits,
@@ -895,8 +897,15 @@ where
             "replacement arena index changed during verification",
         ));
     }
-    let (roots_by_principal, validated) =
-        recover_roots(roots, arena, &recovered, None, codec, identity, limits)?;
+    let (roots_by_principal, validated) = recover_roots(
+        roots,
+        arena,
+        &recovered,
+        representations,
+        codec,
+        identity,
+        limits,
+    )?;
     let arena_len = arena
         .metadata()
         .map_err(|source| io_error("read replacement arena metadata", source))?

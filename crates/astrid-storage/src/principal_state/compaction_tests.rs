@@ -186,10 +186,14 @@ async fn runtime_retention_pins_volume_bootstrap_dependencies() {
         .engine
         .capture_compaction_facts(&raw_retention)
         .unwrap();
-    assert!(facts.condemned().contains(&format_spec_id));
-    // The volume has no separate host-file representation catalogue. Runtime
-    // composition therefore owns the only bootstrap retention boundary and
-    // adds every registered System root before a destructive plan is minted.
+    assert!(
+        !facts.condemned().contains(&format_spec_id),
+        "the volume representation catalogue must pin the frozen specification"
+    );
+    // Volume media now hosts the representation catalogue. The frozen
+    // specification is a profile dependency, so engine-neutral facts keep it
+    // live. Runtime composition still adds registered System roots before a
+    // destructive plan is minted.
 
     let policy = evidence(b"subsequent-runtime-retention");
     let retention = store

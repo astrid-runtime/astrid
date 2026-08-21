@@ -34,9 +34,19 @@ const READBACK_CHUNK_BYTES: u64 = 1024 * 1024;
 const MAX_RELATIVE_PATH_BYTES: usize = 4096;
 
 mod paths;
+mod publish;
 mod receipts;
 mod types;
 mod unbound;
+
+pub(super) type HomeFilesystem = AstridFilesystem<
+    StateOwner,
+    astrid_storage::engine::DurableEngine<
+        StateOwner,
+        astrid_storage::Blake3ObjectIdentityV1,
+        astrid_storage::StateOwnerCodecV2,
+    >,
+>;
 use paths::{
     append_relative, conflict_fs, conflict_path, destination_name, invalid_source,
     is_dedicated_path, logical_relative, receipt_path_for_display, receipt_uid_for_alias,
@@ -406,20 +416,13 @@ fn migrate_one_principal(
 
     let mut published = InventorySummary::default();
     let mut pages = PageWriter::new(home, uid);
+    let mut entries = Vec::new();
     walk_inventory(source, |entry| {
         published.update(&entry)?;
-        let destination = FilesystemPath::new(entry.destination.clone()).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid logical destination {}: {error}", entry.destination),
-            )
-        })?;
-        match entry.kind {
-            EntryKind::Directory => ensure_directory(&filesystem, &destination)?,
-            EntryKind::File => copy_file(&filesystem, source, &entry, &destination)?,
-        }
+        entries.push(entry.clone());
         pages.push(entry)
     })?;
+    publish::publish_inventory(store, &filesystem, uid, source, entries)?;
     let page_count = pages.finish()?;
     let published = published.finish();
     if published != preflight {
@@ -677,50 +680,6 @@ fn preflight_entry(
         source_parent = source_parent.and_then(|path| path.parent().map(Path::to_path_buf));
     }
     Ok(())
-}
-
-fn copy_file(
-    filesystem: &AstridFilesystem<
-        StateOwner,
-        astrid_storage::engine::DurableEngine<
-            StateOwner,
-            astrid_storage::Blake3ObjectIdentityV1,
-            astrid_storage::StateOwnerCodecV2,
-        >,
-    >,
-    source_root: &Path,
-    entry: &MigrationEntry,
-    destination: &FilesystemPath,
-) -> io::Result<()> {
-    let source = source_root.join(&entry.source);
-    let (bytes, digest) = digest_file(&source)?;
-    if bytes != entry.bytes || digest != entry.digest {
-        return Err(conflict_path(
-            &source,
-            "legacy source changed during migration",
-        ));
-    }
-    match filesystem.stat(destination) {
-        Ok(existing) => {
-            if existing.kind() != FilesystemEntryKind::File {
-                return Err(conflict_fs(
-                    destination,
-                    "destination kind conflicts with source file",
-                ));
-            }
-            verify_file_content(filesystem, destination, entry)
-        },
-        Err(FilesystemError::NotFound(_)) => {
-            astrid_core::platform_fs::verify_no_redirects(&source)?;
-            validate_regular_file(&source)?;
-            let mut file = File::open(&source)?;
-            filesystem
-                .write_streaming(destination, &mut file)
-                .map_err(|error| storage_error(&error))?;
-            verify_file_content(filesystem, destination, entry)
-        },
-        Err(error) => Err(storage_error(&error)),
-    }
 }
 
 fn ensure_directory(

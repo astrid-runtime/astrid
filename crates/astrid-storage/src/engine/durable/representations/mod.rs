@@ -1,8 +1,7 @@
 //! Authoritative physical representation catalogue and placement state.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::SeekFrom;
 use std::path::Path;
 
 use crate::storage_model::{
@@ -13,11 +12,12 @@ use crate::storage_model::{
     StorageNodeId,
 };
 
+use super::File as DurableFile;
 #[cfg(test)]
 use super::open_rw;
 use super::{
-    ArenaLocation, DurableError, FRAME_HEADER_LEN, PersistentObjectIdentity, RecoveryLimits,
-    append_frame, append_frames, canonical_record_bytes, io_error,
+    ArenaLocation, DurableError, DurableIo, FRAME_HEADER_LEN, PersistentObjectIdentity,
+    RecoveryLimits, append_frame, append_frames, canonical_record_bytes, io_error,
     read_indexed_object_with_payload,
 };
 pub(in crate::engine::durable) use format::Blake3PhysicalIdentity as PhysicalIdentityV1;
@@ -38,6 +38,8 @@ use recovery::{
 };
 
 mod contiguous;
+mod volume;
+pub(in crate::engine::durable) use volume::install_volume_blob_copy;
 mod direct;
 use authority::{create_file as create_cap_file, open_file as open_cap_file, quarantine_entry};
 pub(super) use contiguous::{
@@ -95,11 +97,16 @@ pub(super) fn append_legacy_profile_frame(
 }
 
 #[derive(Debug)]
+enum RepresentationMedia {
+    Directory(PinnedRepresentationRoot),
+    Volume(std::sync::Arc<dyn crate::volume::AstridVolume>),
+}
+
+#[derive(Debug)]
 pub(super) struct RepresentationStore {
-    root: std::path::PathBuf,
-    root_directory: cap_std::fs::Dir,
-    metadata: File,
-    journal: File,
+    media: RepresentationMedia,
+    metadata: DurableFile,
+    journal: DurableFile,
     journal_generation: u64,
     active: RepresentationStateId,
     state: RepresentationState,
@@ -115,7 +122,7 @@ pub(super) struct RepresentationStore {
 }
 
 #[derive(Debug)]
-struct PinnedRepresentationRoot {
+pub(super) struct PinnedRepresentationRoot {
     path: std::path::PathBuf,
     directory: cap_std::fs::Dir,
 }
@@ -179,15 +186,16 @@ impl RepresentationStore {
         let generations = open_component(&root_directory, Path::new(GENERATIONS_DIRECTORY), false)?;
         let generation_name = generation_name(current.journal_generation);
         let generation = open_component(&generations, Path::new(&generation_name), false)?;
-        let mut metadata = open_cap_file(&generation, Path::new(METADATA_PATH))?;
-        let mut journal = open_cap_file(&generation, Path::new(JOURNAL_PATH))?;
+        let mut metadata =
+            DurableFile::native(open_cap_file(&generation, Path::new(METADATA_PATH))?);
+        let mut journal = DurableFile::native(open_cap_file(&generation, Path::new(JOURNAL_PATH))?);
         let index = recover_metadata(&mut metadata, limits)?;
         let (active, state) = recover_journal(&mut journal, current, &index, limits)?;
         let recovered = Self::from_recovered(
-            PinnedRepresentationRoot {
+            RepresentationMedia::Directory(PinnedRepresentationRoot {
                 path: root,
                 directory: root_directory,
-            },
+            }),
             metadata,
             journal,
             current.journal_generation,
@@ -832,9 +840,9 @@ impl RepresentationStore {
     }
 
     fn from_recovered(
-        root: PinnedRepresentationRoot,
-        metadata: File,
-        journal: File,
+        media: RepresentationMedia,
+        metadata: DurableFile,
+        journal: DurableFile,
         journal_generation: u64,
         active: RepresentationStateId,
         state: RepresentationState,
@@ -881,8 +889,7 @@ impl RepresentationStore {
             ));
         }
         Ok(Self {
-            root: root.path,
-            root_directory: root.directory,
+            media,
             metadata,
             journal,
             journal_generation,
@@ -898,6 +905,22 @@ impl RepresentationStore {
             reverse,
             contiguous: BTreeMap::new(),
         })
+    }
+
+    fn directory_media(&self) -> Result<(&std::path::Path, &cap_std::fs::Dir), DurableError> {
+        match &self.media {
+            RepresentationMedia::Directory(root) => Ok((root.path.as_path(), &root.directory)),
+            RepresentationMedia::Volume(_) => Err(DurableError::InvalidRepresentationState(
+                "operation requires hosted-directory physical media",
+            )),
+        }
+    }
+
+    fn volume_media(&self) -> Option<&std::sync::Arc<dyn crate::volume::AstridVolume>> {
+        match &self.media {
+            RepresentationMedia::Volume(volume) => Some(volume),
+            RepresentationMedia::Directory(_) => None,
+        }
     }
 }
 
@@ -916,7 +939,7 @@ fn bulk_rebuild_is_cheaper(existing: u64, additions: usize) -> Result<bool, Dura
     Ok(estimated_path_nodes > final_tree_nodes)
 }
 
-fn read_all(file: &mut File, operation: &'static str) -> Result<Vec<u8>, DurableError> {
+fn read_all<F: DurableIo>(file: &mut F, operation: &'static str) -> Result<Vec<u8>, DurableError> {
     file.seek(SeekFrom::Start(0))
         .map_err(|source| io_error(operation, source))?;
     let mut bytes = Vec::new();
