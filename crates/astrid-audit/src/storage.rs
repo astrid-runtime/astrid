@@ -206,16 +206,19 @@ pub(crate) trait AuditStorage: Send + Sync {
         ))
     }
 
+    #[allow(dead_code, reason = "kept for backend tests and marker cleanup paths")]
     async fn migration_temp_get(&self, _key: &str) -> AuditResult<Option<Vec<u8>>> {
         Ok(None)
     }
 
+    #[allow(dead_code, reason = "kept for backend tests and marker cleanup paths")]
     async fn migration_temp_put(&self, _key: &str, _value: Vec<u8>) -> AuditResult<()> {
         Err(AuditError::StorageError(
             "audit backend does not support migration scratch state".to_owned(),
         ))
     }
 
+    #[allow(dead_code, reason = "kept for backend tests and marker cleanup paths")]
     async fn migration_temp_cas(
         &self,
         _key: &str,
@@ -227,6 +230,7 @@ pub(crate) trait AuditStorage: Send + Sync {
         ))
     }
 
+    #[allow(dead_code, reason = "kept for backend tests and marker cleanup paths")]
     async fn migration_temp_keys_page(
         &self,
         _prefix: &str,
@@ -516,6 +520,7 @@ impl AuditStorage for KvAuditStorage {
             .ok_or_else(|| AuditError::StorageError("migration scratch CAS lost".to_owned()))
     }
 
+    #[allow(dead_code, reason = "kept for backend tests and marker cleanup paths")]
     async fn migration_temp_cas(
         &self,
         key: &str,
@@ -528,6 +533,7 @@ impl AuditStorage for KvAuditStorage {
             .map_err(|e| AuditError::StorageError(e.to_string()))
     }
 
+    #[allow(dead_code, reason = "kept for backend tests and marker cleanup paths")]
     async fn migration_temp_keys_page(
         &self,
         prefix: &str,

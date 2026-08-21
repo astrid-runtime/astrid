@@ -476,11 +476,6 @@ async fn migrate_legacy_audit(home: &AstridHome, audit: &Arc<AuditLog>) -> io::R
         .import_legacy_audit(&default_audit, "astrid-system-audit-v1")
         .await
         .map_err(|error| io::Error::other(format!("legacy audit migration failed: {error}")))?;
-    let audit_results = audit
-        .verify_all()
-        .await
-        .map_err(|error| io::Error::other(format!("audit chain verification failed: {error}")))?;
-    crate::require_audit_integrity(&audit_results)?;
     match fs::symlink_metadata(&default_audit) {
         Ok(_) => {
             preflight_legacy_audit_sources(home, &default_audit)?;

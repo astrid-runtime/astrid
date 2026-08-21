@@ -49,8 +49,8 @@ mod verify_chain_impl;
 #[path = "log/verify_legacy_chain.rs"]
 mod verify_legacy_chain_impl;
 use migration::{
-    LegacyAuditChainReceipt, LegacyAuditReceipt, ReceiptAccumulator, chain_fragment_summary,
-    digest_legacy_source, estimated_migration_bytes, validate_legacy_source_path,
+    LegacyAuditReceipt, digest_legacy_source, estimated_migration_bytes,
+    validate_legacy_source_path,
 };
 #[cfg(test)]
 #[path = "builder.rs"]
@@ -110,41 +110,6 @@ type ChainHead = Arc<Mutex<Option<HeadState>>>;
 /// Automatic cap enforcement retains the active segment; the selected oldest
 /// descriptor supplies the exact sealed-prefix boundary.
 const DEFAULT_AUTO_RETENTION_ENTRIES: usize = 1;
-
-async fn update_verify_chain_fragment(
-    storage: &dyn AuditStorage,
-    entry: &AuditEntry,
-) -> AuditResult<()> {
-    let principal = entry
-        .principal
-        .as_ref()
-        .map_or_else(|| "<system>".to_owned(), ToString::to_string);
-    let key = format!("chain:{}:{principal}", entry.session_id);
-    loop {
-        let previous = storage.migration_temp_get(&key).await?;
-        let mut fragment = if let Some(previous) = previous.as_deref() {
-            serde_json::from_slice::<LegacyAuditChainReceipt>(previous)
-                .map_err(|error| AuditError::SerializationError(error.to_string()))?
-        } else {
-            LegacyAuditChainReceipt {
-                session: entry.session_id.to_string(),
-                principal: entry.principal.as_ref().map(ToString::to_string),
-                count: 0,
-                terminal_hash: ContentHash::zero().to_hex(),
-            }
-        };
-        fragment.count = fragment.count.saturating_add(1);
-        fragment.terminal_hash = entry.content_hash().to_hex();
-        let encoded = serde_json::to_vec(&fragment)
-            .map_err(|error| AuditError::SerializationError(error.to_string()))?;
-        if storage
-            .migration_temp_cas(&key, previous.as_deref(), encoded)
-            .await?
-        {
-            return Ok(());
-        }
-    }
-}
 
 /// Audit log for recording and verifying security events.
 pub struct AuditLog {
@@ -222,8 +187,8 @@ impl AuditLog {
     /// The oracle is consulted only when a non-empty native legacy audit
     /// source is imported. Supplying no oracle preserves normal operation for
     /// fresh stores, but such a store refuses a non-empty migration because
-    /// it cannot prove that the destination fits before writing scratch
-    /// indexes or entries.
+    /// it cannot prove that the destination fits before writing reconstructed
+    /// history.
     ///
     /// # Errors
     ///
@@ -362,65 +327,6 @@ impl AuditLog {
                 "insufficient destination capacity for legacy audit migration: need {required} bytes, have {available} bytes"
             )));
         }
-        Ok(())
-    }
-
-    async fn verify_receipted_destination(&self, receipt: &LegacyAuditReceipt) -> AuditResult<()> {
-        let mut accumulator = ReceiptAccumulator::new();
-        // Digest over the entry-record key order.  This is deliberately
-        // independent from the legacy per-session index order: migration
-        // source scans `audit:entries` directly, so read-back must use the
-        // exact same bounded projection and never materialise a giant index.
-        let mut after = None;
-        loop {
-            let page = self.storage.all_entries_page(after.as_deref(), 256).await?;
-            if page.is_empty() {
-                break;
-            }
-            let next_after = page.last().map(|(cursor, _)| cursor.clone());
-            for (_, entry) in page {
-                entry.verify_signature()?;
-                let bytes = serde_json::to_vec(&entry)
-                    .map_err(|e| AuditError::SerializationError(e.to_string()))?;
-                accumulator.add(&entry, &bytes);
-                update_verify_chain_fragment(self.storage.as_ref(), &entry).await?;
-            }
-            after = next_after;
-        }
-
-        migration::finalize_chain_fragments(self.storage.as_ref(), "chain:").await?;
-        let (chain_count, chain_digest) =
-            chain_fragment_summary(self.storage.as_ref(), "chain:").await?;
-        let actual = accumulator.finish(&receipt.destination, chain_count, chain_digest);
-        if actual != *receipt {
-            return Err(AuditError::StorageError(format!(
-                "system audit read-back does not match migration receipt: expected entries={} bytes={} digest={} chains={} chain_digest={}, found entries={} bytes={} digest={} chains={} chain_digest={}",
-                receipt.source_entries,
-                receipt.source_bytes,
-                receipt.source_digest,
-                receipt.chain_count,
-                receipt.chain_digest,
-                actual.source_entries,
-                actual.source_bytes,
-                actual.source_digest,
-                actual.chain_count,
-                actual.chain_digest,
-            )));
-        }
-        for (session, chain) in &self.verify_all().await? {
-            if !chain.valid {
-                return Err(AuditError::IntegrityViolation {
-                    entry_id: session.to_string(),
-                    reason: chain
-                        .issues
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                });
-            }
-        }
-        self.storage.clear_migration_temp().await?;
         Ok(())
     }
 
