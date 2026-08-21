@@ -157,7 +157,7 @@ impl RepresentationStore {
     }
 }
 
-pub(in crate::engine::durable) fn install_volume_blob_copy<R: Read>(
+pub(in crate::engine::durable) fn write_projected_contiguous_blob<R: Read>(
     volume: &Arc<dyn AstridVolume>,
     blob: BlobId,
     profile: RepresentationProfileId,

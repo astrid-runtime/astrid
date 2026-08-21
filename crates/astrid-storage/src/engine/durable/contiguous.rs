@@ -220,24 +220,12 @@ where
         self.flush()?;
         self.fail_if(FaultPoint::AfterContiguousStructuralFlush)?;
         let logical_bytes = prepared.verified.descriptor().logical_bytes();
-        if let Some(volume) = self.volume.read().as_ref().cloned() {
-            super::representations::install_volume_blob_copy(
-                &volume,
-                prepared.payload.blob,
-                prepared.payload.profile_id,
-                logical_bytes,
-                source,
-            )?;
-        } else {
-            super::representations::install_loose_blob_copy(
-                self.hosted_directory()?,
-                self.hosted_path()?,
-                prepared.payload.blob,
-                prepared.payload.profile_id,
-                logical_bytes,
-                source,
-            )?;
-        }
+        self.project_contiguous_blob(
+            prepared.payload.blob,
+            prepared.payload.profile_id,
+            logical_bytes,
+            source,
+        )?;
         self.fail_if(FaultPoint::AfterContiguousBlobInstall)?;
         self.publish_installed_contiguous(prepared)
     }
@@ -280,32 +268,76 @@ where
         self.flush()?;
         self.fail_if(FaultPoint::AfterContiguousStructuralFlush)?;
         let logical_bytes = prepared.verified.descriptor().logical_bytes();
+        self.project_contiguous_blob_from_file(
+            prepared.payload.blob,
+            prepared.payload.profile_id,
+            logical_bytes,
+            source,
+        )?;
+        self.fail_if(FaultPoint::AfterContiguousBlobInstall)?;
+        self.publish_installed_contiguous(prepared)
+    }
+
+    fn project_contiguous_blob<R: Read>(
+        &self,
+        blob: crate::storage_model::BlobId,
+        profile: crate::storage_model::RepresentationProfileId,
+        logical_bytes: u64,
+        source: R,
+    ) -> Result<(), DurableError> {
+        if let Some(volume) = self.volume.read().as_ref().cloned() {
+            super::representations::write_projected_contiguous_blob(
+                &volume,
+                blob,
+                profile,
+                logical_bytes,
+                source,
+            )
+        } else {
+            super::representations::install_loose_blob_copy(
+                self.hosted_directory()?,
+                self.hosted_path()?,
+                blob,
+                profile,
+                logical_bytes,
+                source,
+            )
+            .map(|_| ())
+        }
+    }
+
+    fn project_contiguous_blob_from_file(
+        &self,
+        blob: crate::storage_model::BlobId,
+        profile: crate::storage_model::RepresentationProfileId,
+        logical_bytes: u64,
+        source: &std::fs::File,
+    ) -> Result<(), DurableError> {
         if let Some(volume) = self.volume.read().as_ref().cloned() {
             let mut source = source
                 .try_clone()
-                .map_err(|source| io_error("clone volume contiguous adoption source", source))?;
+                .map_err(|source| io_error("clone projected blob source", source))?;
             source
                 .seek(std::io::SeekFrom::Start(0))
-                .map_err(|source| io_error("rewind volume contiguous adoption source", source))?;
-            super::representations::install_volume_blob_copy(
+                .map_err(|source| io_error("rewind projected blob source", source))?;
+            super::representations::write_projected_contiguous_blob(
                 &volume,
-                prepared.payload.blob,
-                prepared.payload.profile_id,
+                blob,
+                profile,
                 logical_bytes,
                 source,
-            )?;
+            )
         } else {
             super::representations::install_loose_blob_from_file(
                 self.hosted_directory()?,
                 self.hosted_path()?,
-                prepared.payload.blob,
-                prepared.payload.profile_id,
+                blob,
+                profile,
                 logical_bytes,
                 source,
-            )?;
+            )
+            .map(|_| ())
         }
-        self.fail_if(FaultPoint::AfterContiguousBlobInstall)?;
-        self.publish_installed_contiguous(prepared)
     }
 
     fn validate_contiguous_preparation(

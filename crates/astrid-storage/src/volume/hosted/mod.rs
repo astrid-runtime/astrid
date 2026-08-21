@@ -239,27 +239,6 @@ impl AstridVolume for HostedFileVolume {
         Ok(wanted)
     }
 
-    fn write_region_at(&self, region: &VolumeRegion, offset: u64, bytes: &[u8]) -> io::Result<()> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        let mut state = self.state.lock();
-        if !state.regions.contains_key(region) {
-            return Err(io::Error::new(io::ErrorKind::NotFound, region.as_str()));
-        }
-        let end = offset
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| io::Error::other("volume write range overflow"))?;
-        let (physical, _) = Self::append(&mut state, Operation::Write, region, offset, bytes)?;
-        let region_state = state
-            .regions
-            .get_mut(region)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, region.as_str()))?;
-        overlay_extent(&mut region_state.extents, offset, end, physical);
-        region_state.length = region_state.length.max(end);
-        Ok(())
-    }
-
     fn write_region_from(
         &self,
         region: &VolumeRegion,
