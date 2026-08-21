@@ -1070,6 +1070,7 @@ async fn blocked_principal_store_does_not_block_another_principal() {
         chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
         append_coordinator: Arc::new(Mutex::new(())),
         migration_capacity: None,
+        destination_kv: None,
     });
     let session_id = SessionId::new();
 
@@ -1172,6 +1173,7 @@ async fn verification_uses_append_order_when_wall_clock_moves_backward() {
         chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
         append_coordinator: Arc::new(Mutex::new(())),
         migration_capacity: None,
+        destination_kv: None,
     };
 
     let result = log.verify_chain(&session_id).await.unwrap();

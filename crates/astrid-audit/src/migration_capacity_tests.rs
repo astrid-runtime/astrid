@@ -1,5 +1,5 @@
 use super::*;
-use astrid_storage::KvStore;
+use astrid_storage::{KvStore, MemoryKvStore};
 
 struct FixedAuditCapacity(Option<u64>);
 
@@ -234,4 +234,229 @@ async fn legacy_import_refuses_insufficient_capacity_before_destination_mutation
             .unwrap()
             .is_empty()
     );
+}
+
+struct CountingKvStore {
+    inner: MemoryKvStore,
+    publishes: std::sync::atomic::AtomicU64,
+}
+
+impl CountingKvStore {
+    fn new() -> Self {
+        Self {
+            inner: MemoryKvStore::new(),
+            publishes: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn publishes(&self) -> u64 {
+        self.publishes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn record_publish(&self) {
+        self.publishes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl KvStore for CountingKvStore {
+    fn supports_atomic_batch(&self) -> bool {
+        true
+    }
+
+    async fn get(
+        &self,
+        namespace: &str,
+        key: &str,
+    ) -> astrid_storage::StorageResult<Option<Vec<u8>>> {
+        self.inner.get(namespace, key).await
+    }
+
+    async fn set(
+        &self,
+        namespace: &str,
+        key: &str,
+        value: Vec<u8>,
+    ) -> astrid_storage::StorageResult<()> {
+        self.inner.set(namespace, key, value).await
+    }
+
+    async fn delete(&self, namespace: &str, key: &str) -> astrid_storage::StorageResult<bool> {
+        self.inner.delete(namespace, key).await
+    }
+
+    async fn exists(&self, namespace: &str, key: &str) -> astrid_storage::StorageResult<bool> {
+        self.inner.exists(namespace, key).await
+    }
+
+    async fn list_keys(&self, namespace: &str) -> astrid_storage::StorageResult<Vec<String>> {
+        self.inner.list_keys(namespace).await
+    }
+
+    async fn list_keys_with_prefix(
+        &self,
+        namespace: &str,
+        prefix: &str,
+    ) -> astrid_storage::StorageResult<Vec<String>> {
+        self.inner.list_keys_with_prefix(namespace, prefix).await
+    }
+
+    async fn compare_and_swap(
+        &self,
+        namespace: &str,
+        key: &str,
+        expected: Option<&[u8]>,
+        new: Vec<u8>,
+    ) -> astrid_storage::StorageResult<bool> {
+        self.record_publish();
+        self.inner
+            .compare_and_swap(namespace, key, expected, new)
+            .await
+    }
+
+    async fn apply_batch(
+        &self,
+        batch: &astrid_storage::KvMutationBatch,
+    ) -> astrid_storage::StorageResult<astrid_storage::KvBatchOutcome> {
+        self.record_publish();
+        self.inner.apply_batch(batch).await
+    }
+
+    async fn clear_namespace(&self, namespace: &str) -> astrid_storage::StorageResult<u64> {
+        self.inner.clear_namespace(namespace).await
+    }
+
+    async fn clear_prefix(
+        &self,
+        namespace: &str,
+        prefix: &str,
+    ) -> astrid_storage::StorageResult<u64> {
+        self.inner.clear_prefix(namespace, prefix).await
+    }
+}
+
+#[tokio::test]
+async fn legacy_move_batches_destination_publishes_by_page_not_entry() {
+    const ENTRIES: u32 = 400;
+    let directory = tempfile::tempdir().expect("temporary legacy directory");
+    let path = directory.path().join("audit-db");
+    let key = Arc::new(KeyPair::generate());
+    let session = SessionId::new();
+    let source = AuditLog::open_legacy_source(&path, Arc::clone(&key)).expect("open legacy source");
+    append_test_entries(&source, &session, ENTRIES).await;
+    source.close().await.expect("close source");
+
+    let backend = Arc::new(CountingKvStore::new());
+    let destination = AuditLog::open_with_kv_store_and_capacity(
+        Arc::clone(&backend) as Arc<dyn KvStore>,
+        Arc::clone(&key),
+        Some(Arc::new(FixedAuditCapacity(Some(u64::MAX)))),
+    )
+    .expect("open destination");
+    let report = destination
+        .import_legacy_audit(&path, "test-system-audit")
+        .await
+        .expect("native bulk move");
+    assert_eq!(report.source_entries, u64::from(ENTRIES));
+    assert_eq!(report.imported_entries, u64::from(ENTRIES));
+    assert_eq!(
+        destination.count_session(&session).await.unwrap(),
+        ENTRIES as usize
+    );
+
+    let pages = u64::from(ENTRIES).div_ceil(256);
+    let publishes = backend.publishes();
+    assert!(
+        publishes <= pages.saturating_mul(8).saturating_add(16),
+        "destination publishes {publishes} must stay O(pages) ({pages} pages), not O(entries)"
+    );
+    assert!(
+        publishes < u64::from(ENTRIES) / 4,
+        "destination publishes {publishes} scaled with entry count"
+    );
+
+    let smoke = destination
+        .append(
+            session.clone(),
+            AuditAction::McpToolCall {
+                server: "test".to_owned(),
+                tool: "post-move".to_owned(),
+                args_hash: ContentHash::zero(),
+            },
+            AuthorizationProof::NotRequired {
+                reason: "test".to_owned(),
+            },
+            AuditOutcome::success(),
+        )
+        .await
+        .expect("native append after move");
+    let reopened = AuditLog::open_with_kv_store(Arc::clone(&backend) as Arc<dyn KvStore>, key)
+        .expect("reopen destination");
+    assert!(reopened.storage().get(&smoke).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn legacy_move_does_not_recertify_historical_signatures() {
+    let directory = tempfile::tempdir().expect("temporary legacy directory");
+    let path = directory.path().join("audit-db");
+    let key = Arc::new(KeyPair::generate());
+    let session = SessionId::new();
+    let source = AuditLog::open_legacy_source(&path, Arc::clone(&key)).expect("open legacy source");
+    append_test_entries(&source, &session, 2).await;
+    source.close().await.expect("close source");
+
+    let store = astrid_storage::SurrealKvStore::open(&path).expect("open source kv");
+    let keys = store
+        .list_keys("audit:entries")
+        .await
+        .expect("list source entries");
+    let key_name = keys.first().cloned().expect("source entry");
+    let raw = store
+        .get("audit:entries", &key_name)
+        .await
+        .expect("load entry")
+        .expect("entry bytes");
+    let mut entry: AuditEntry = serde_json::from_slice(&raw).expect("decode entry");
+    entry.signature = astrid_crypto::Signature::from_bytes([0x11; 64]);
+    let rewritten = serde_json::to_vec(&entry).expect("encode entry");
+    store
+        .set("audit:entries", &key_name, rewritten)
+        .await
+        .expect("rewrite unsigned historical bytes");
+    store.close().await.expect("close source kv");
+
+    let destination_backend: Arc<dyn KvStore> = Arc::new(astrid_storage::MemoryKvStore::new());
+    let destination = AuditLog::open_with_kv_store_and_capacity(
+        destination_backend,
+        key,
+        Some(Arc::new(FixedAuditCapacity(Some(u64::MAX)))),
+    )
+    .expect("open destination");
+    let report = destination
+        .import_legacy_audit(&path, "test-system-audit")
+        .await
+        .expect("historical bytes move without signature recertification");
+    assert_eq!(report.source_entries, 2);
+    assert_eq!(report.imported_entries, 2);
+}
+
+#[tokio::test]
+async fn legacy_move_fails_closed_when_destination_cannot_reopen() {
+    let directory = tempfile::tempdir().expect("temporary legacy directory");
+    let path = directory.path().join("audit-db");
+    let key = Arc::new(KeyPair::generate());
+    let session = SessionId::new();
+    let source = AuditLog::open_legacy_source(&path, Arc::clone(&key)).expect("open legacy source");
+    append_test_entries(&source, &session, 2).await;
+    source.close().await.expect("close source");
+
+    let destination =
+        AuditLog::in_memory(key).with_capacity_oracle(Arc::new(FixedAuditCapacity(Some(u64::MAX))));
+    let error = destination
+        .import_legacy_audit(&path, "test-system-audit")
+        .await
+        .expect_err("move must fail closed without a reopenable destination");
+    assert!(error.to_string().contains("cannot be reopened"));
+    assert_eq!(destination.count().await.unwrap(), 2);
 }

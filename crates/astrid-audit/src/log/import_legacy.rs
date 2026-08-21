@@ -1,13 +1,14 @@
-//! Legacy native audit import implementation.
+//! Native bulk move of a legacy `SurrealKV` audit tree into [`AuditLog`].
 
 use super::migration::{
-    LegacyAuditReceipt, decode_receipt, digest_legacy_source, import_legacy_chains,
-    scan_legacy_source, validate_destination, validate_legacy_source_path,
+    decode_receipt, digest_legacy_source, digest_storage, import_legacy_graph, index_legacy_source,
+    payload_matches, validate_destination, validate_legacy_source_path,
 };
 use super::{
     AuditError, AuditLog, AuditResult, AuditStorage, KvAuditStorage, LegacyAuditImportReport,
 };
 use std::path::Path;
+use std::sync::Arc;
 
 impl AuditLog {
     pub(super) async fn import_legacy_audit_impl(
@@ -25,40 +26,35 @@ impl AuditLog {
         }
 
         let source = KvAuditStorage::open_legacy_source(&legacy_path)?;
-        // Estimate capacity before creating migration scratch keys. The source
-        // remains authoritative until all digest/read-back checks complete.
-        let source_estimate = digest_legacy_source(&source, destination_identity).await?;
-        self.ensure_migration_capacity(&source_estimate)?;
-        let receipt =
-            scan_legacy_source(&source, self.storage.as_ref(), destination_identity).await?;
-        let marker = serde_json::to_vec(&receipt)
-            .map_err(|error| AuditError::SerializationError(error.to_string()))?;
-        if marker_before
-            .as_deref()
-            .is_some_and(|existing| existing != marker)
-        {
-            return Err(AuditError::StorageError(
-                "legacy audit migration receipt conflicts with source or destination".to_owned(),
-            ));
+        let (receipt, graph) = index_legacy_source(&source, destination_identity).await?;
+        self.ensure_migration_capacity(&receipt)?;
+        if let Some(existing) = marker_before.as_deref() {
+            let prior = decode_receipt(existing)?;
+            if !payload_matches(&prior, &receipt) {
+                return Err(AuditError::StorageError(
+                    "legacy audit migration receipt conflicts with source or destination"
+                        .to_owned(),
+                ));
+            }
         }
 
-        let second_receipt = digest_legacy_source(&source, destination_identity).await?;
-        require_matching_receipt(
-            &receipt,
-            &second_receipt,
-            "legacy audit source changed during streaming import",
-        )?;
-        let imported_entries = import_legacy_chains(self, &source).await?;
-        let final_receipt = digest_legacy_source(&source, destination_identity).await?;
-        require_matching_receipt(
-            &receipt,
-            &final_receipt,
-            "legacy audit source changed during forward import",
-        )?;
+        let imported_entries = import_legacy_graph(self, &source, &graph).await?;
+        // Payload digest only: prove the source tree did not change during the
+        // bulk write. This is not signature or chain recertify.
+        let source_after = digest_legacy_source(&source, destination_identity).await?;
+        if !payload_matches(&receipt, &source_after) {
+            return Err(AuditError::StorageError(
+                "legacy audit source changed during native volume move".to_owned(),
+            ));
+        }
+        self.storage.flush().await?;
+        self.prove_reopened_destination(destination_identity, &receipt)
+            .await?;
         source.close().await?;
         self.storage.clear_migration_temp().await?;
-
-        self.verify_receipted_destination(&receipt).await?;
+        validate_destination(&receipt, destination_identity)?;
+        let marker = serde_json::to_vec(&receipt)
+            .map_err(|error| AuditError::SerializationError(error.to_string()))?;
         let marker_installed = self
             .install_migration_marker(marker_before.as_deref(), marker)
             .await?;
@@ -68,6 +64,26 @@ impl AuditLog {
             marker_installed,
             source_digest: receipt.source_digest,
         })
+    }
+
+    async fn prove_reopened_destination(
+        &self,
+        destination_identity: &str,
+        expected: &super::migration::LegacyAuditReceipt,
+    ) -> AuditResult<()> {
+        let kv = self.destination_kv.as_ref().ok_or_else(|| {
+            AuditError::StorageError("native audit destination cannot be reopened".to_owned())
+        })?;
+        let reopened = AuditLog::open_with_kv_store(Arc::clone(kv), Arc::clone(&self.runtime_key))?;
+        reopened.storage.flush().await?;
+        let destination = digest_storage(reopened.storage.as_ref(), destination_identity).await?;
+        if !payload_matches(expected, &destination) {
+            return Err(AuditError::StorageError(
+                "reopened native audit reconstruction does not match the source payload digest"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     async fn report_missing_legacy_source(
@@ -85,7 +101,13 @@ impl AuditLog {
         };
         let receipt = decode_receipt(&marker_bytes)?;
         validate_destination(&receipt, destination_identity)?;
-        self.verify_receipted_destination(&receipt).await?;
+        let destination = digest_storage(self.storage.as_ref(), destination_identity).await?;
+        if !payload_matches(&receipt, &destination) {
+            return Err(AuditError::StorageError(
+                "native audit reconstruction does not match the stored migration receipt"
+                    .to_owned(),
+            ));
+        }
         Ok(LegacyAuditImportReport {
             source_entries: receipt.source_entries,
             imported_entries: 0,
@@ -121,20 +143,4 @@ impl AuditLog {
         }
         Ok(false)
     }
-}
-
-fn require_matching_receipt(
-    expected: &LegacyAuditReceipt,
-    actual: &LegacyAuditReceipt,
-    error: &str,
-) -> AuditResult<()> {
-    if actual.schema != expected.schema
-        || actual.destination != expected.destination
-        || actual.source_entries != expected.source_entries
-        || actual.source_bytes != expected.source_bytes
-        || actual.source_digest != expected.source_digest
-    {
-        return Err(AuditError::StorageError(error.to_owned()));
-    }
-    Ok(())
 }

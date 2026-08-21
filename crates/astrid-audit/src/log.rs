@@ -49,8 +49,8 @@ mod verify_chain_impl;
 #[path = "log/verify_legacy_chain.rs"]
 mod verify_legacy_chain_impl;
 use migration::{
-    LegacyAuditChainReceipt, LegacyAuditReceipt, ReceiptAccumulator, chain_fragment_summary,
-    digest_legacy_source, estimated_migration_bytes, validate_legacy_source_path,
+    LegacyAuditReceipt, digest_legacy_source, estimated_migration_bytes,
+    validate_legacy_source_path,
 };
 #[cfg(test)]
 #[path = "builder.rs"]
@@ -111,41 +111,6 @@ type ChainHead = Arc<Mutex<Option<HeadState>>>;
 /// descriptor supplies the exact sealed-prefix boundary.
 const DEFAULT_AUTO_RETENTION_ENTRIES: usize = 1;
 
-async fn update_verify_chain_fragment(
-    storage: &dyn AuditStorage,
-    entry: &AuditEntry,
-) -> AuditResult<()> {
-    let principal = entry
-        .principal
-        .as_ref()
-        .map_or_else(|| "<system>".to_owned(), ToString::to_string);
-    let key = format!("chain:{}:{principal}", entry.session_id);
-    loop {
-        let previous = storage.migration_temp_get(&key).await?;
-        let mut fragment = if let Some(previous) = previous.as_deref() {
-            serde_json::from_slice::<LegacyAuditChainReceipt>(previous)
-                .map_err(|error| AuditError::SerializationError(error.to_string()))?
-        } else {
-            LegacyAuditChainReceipt {
-                session: entry.session_id.to_string(),
-                principal: entry.principal.as_ref().map(ToString::to_string),
-                count: 0,
-                terminal_hash: ContentHash::zero().to_hex(),
-            }
-        };
-        fragment.count = fragment.count.saturating_add(1);
-        fragment.terminal_hash = entry.content_hash().to_hex();
-        let encoded = serde_json::to_vec(&fragment)
-            .map_err(|error| AuditError::SerializationError(error.to_string()))?;
-        if storage
-            .migration_temp_cas(&key, previous.as_deref(), encoded)
-            .await?
-        {
-            return Ok(());
-        }
-    }
-}
-
 /// Audit log for recording and verifying security events.
 pub struct AuditLog {
     /// Storage backend.
@@ -170,6 +135,8 @@ pub struct AuditLog {
     append_coordinator: Arc<Mutex<()>>,
     /// Optional media-capacity oracle used only by legacy migration.
     migration_capacity: Option<Arc<dyn AuditCapacityProvider>>,
+    /// Original KV handle so cutover can freshly reopen the destination.
+    destination_kv: Option<Arc<dyn KvStore>>,
 }
 impl AuditLog {
     /// Open a legacy native audit source for migration only.
@@ -195,6 +162,7 @@ impl AuditLog {
             chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
             append_coordinator: Arc::new(Mutex::new(())),
             migration_capacity: None,
+            destination_kv: None,
         })
     }
 
@@ -222,8 +190,8 @@ impl AuditLog {
     /// The oracle is consulted only when a non-empty native legacy audit
     /// source is imported. Supplying no oracle preserves normal operation for
     /// fresh stores, but such a store refuses a non-empty migration because
-    /// it cannot prove that the destination fits before writing scratch
-    /// indexes or entries.
+    /// it cannot prove that the destination fits before writing reconstructed
+    /// history.
     ///
     /// # Errors
     ///
@@ -233,6 +201,7 @@ impl AuditLog {
         runtime_key: impl Into<Arc<KeyPair>>,
         migration_capacity: Option<Arc<dyn AuditCapacityProvider>>,
     ) -> AuditResult<Self> {
+        let destination_kv = Arc::clone(&store);
         let storage = KvAuditStorage::from_kv_store(store)?;
         Ok(Self {
             storage: Box::new(storage),
@@ -240,6 +209,7 @@ impl AuditLog {
             chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
             append_coordinator: Arc::new(Mutex::new(())),
             migration_capacity,
+            destination_kv: Some(destination_kv),
         })
     }
 
@@ -260,7 +230,17 @@ impl AuditLog {
             chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
             append_coordinator: Arc::new(Mutex::new(())),
             migration_capacity: None,
+            destination_kv: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_capacity_oracle(
+        mut self,
+        migration_capacity: Arc<dyn AuditCapacityProvider>,
+    ) -> Self {
+        self.migration_capacity = Some(migration_capacity);
+        self
     }
 
     #[cfg(test)]
@@ -274,24 +254,22 @@ impl AuditLog {
             chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
             append_coordinator: Arc::new(Mutex::new(())),
             migration_capacity: None,
+            destination_kv: None,
         }
     }
 
-    /// Import a legacy `SurrealKV` audit directory into the system-owned
-    /// projection and return a content-bound receipt.
+    /// Blind-move a legacy `SurrealKV` audit directory into native [`AuditLog`].
     ///
-    /// The source is opened read-only in the logical sense (the legacy engine
-    /// itself is closed without mutation). Every source byte is required to be
-    /// canonical JSON, every signature and chain link is verified, and every
-    /// destination conflict fails closed. The operation is resumable: entries
-    /// already committed with identical bytes are accepted, while a durable
-    /// marker records the exact source digest, chain terminal hashes, counts,
-    /// and destination identity before the caller retires the native source.
+    /// Cutover hashes canonical stored entry bytes, bulk-writes them into the
+    /// destination, reconstructs the destination, and fail-closes unless the
+    /// payload digests match. Historical signatures and chains are not
+    /// recertified. Optional recertify is a derived observer job after layout 2.
     ///
     /// # Errors
     ///
-    /// Returns an error when source bytes, signatures, chain links, or the
-    /// destination receipt are invalid or conflicting.
+    /// Returns an error when the source cannot be read, destination capacity is
+    /// unproven, the native reconstruction digest differs, or the destination
+    /// cannot be flushed and reread.
     pub async fn import_legacy_audit(
         &self,
         legacy_path: impl AsRef<Path>,
@@ -301,13 +279,11 @@ impl AuditLog {
             .await
     }
 
-    /// Re-read and verify the legacy source digest immediately before source
-    /// retirement.
+    /// Re-hash canonical source payload bytes immediately before retirement.
     ///
-    /// The import itself performs source-only, preflight, and post-copy digest
-    /// passes. The kernel calls this final read-back under its boot singleton
-    /// barrier so a source mutation between import completion and native-tree
-    /// retirement leaves the source in place and fails closed.
+    /// This is a MOVE proof, not signature or chain recertify. The kernel calls
+    /// it under the boot singleton so a source mutation between ingest and
+    /// native-tree retirement leaves the source in place and fails closed.
     ///
     /// # Errors
     ///
@@ -362,65 +338,6 @@ impl AuditLog {
                 "insufficient destination capacity for legacy audit migration: need {required} bytes, have {available} bytes"
             )));
         }
-        Ok(())
-    }
-
-    async fn verify_receipted_destination(&self, receipt: &LegacyAuditReceipt) -> AuditResult<()> {
-        let mut accumulator = ReceiptAccumulator::new();
-        // Digest over the entry-record key order.  This is deliberately
-        // independent from the legacy per-session index order: migration
-        // source scans `audit:entries` directly, so read-back must use the
-        // exact same bounded projection and never materialise a giant index.
-        let mut after = None;
-        loop {
-            let page = self.storage.all_entries_page(after.as_deref(), 256).await?;
-            if page.is_empty() {
-                break;
-            }
-            let next_after = page.last().map(|(cursor, _)| cursor.clone());
-            for (_, entry) in page {
-                entry.verify_signature()?;
-                let bytes = serde_json::to_vec(&entry)
-                    .map_err(|e| AuditError::SerializationError(e.to_string()))?;
-                accumulator.add(&entry, &bytes);
-                update_verify_chain_fragment(self.storage.as_ref(), &entry).await?;
-            }
-            after = next_after;
-        }
-
-        migration::finalize_chain_fragments(self.storage.as_ref(), "chain:").await?;
-        let (chain_count, chain_digest) =
-            chain_fragment_summary(self.storage.as_ref(), "chain:").await?;
-        let actual = accumulator.finish(&receipt.destination, chain_count, chain_digest);
-        if actual != *receipt {
-            return Err(AuditError::StorageError(format!(
-                "system audit read-back does not match migration receipt: expected entries={} bytes={} digest={} chains={} chain_digest={}, found entries={} bytes={} digest={} chains={} chain_digest={}",
-                receipt.source_entries,
-                receipt.source_bytes,
-                receipt.source_digest,
-                receipt.chain_count,
-                receipt.chain_digest,
-                actual.source_entries,
-                actual.source_bytes,
-                actual.source_digest,
-                actual.chain_count,
-                actual.chain_digest,
-            )));
-        }
-        for (session, chain) in &self.verify_all().await? {
-            if !chain.valid {
-                return Err(AuditError::IntegrityViolation {
-                    entry_id: session.to_string(),
-                    reason: chain
-                        .issues
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                });
-            }
-        }
-        self.storage.clear_migration_temp().await?;
         Ok(())
     }
 
