@@ -1,6 +1,7 @@
 use super::{AuditEntry, AuditEntryId, AuditError, AuditResult, KvAuditStorage, NS_ENTRIES};
 
 impl KvAuditStorage {
+    #[allow(dead_code, reason = "implements AuditStorage::all_entries_page")]
     pub(super) async fn load_all_entries_page(
         &self,
         after: Option<&str>,

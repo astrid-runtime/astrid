@@ -1,8 +1,8 @@
 //! Native bulk move of a legacy `SurrealKV` audit tree into [`AuditLog`].
 
 use super::migration::{
-    decode_receipt, digest_legacy_source, digest_storage, import_legacy_graph, index_legacy_source,
-    payload_matches, validate_destination, validate_legacy_source_path,
+    copy_legacy_projection, decode_receipt, digest_legacy_source, digest_storage, payload_matches,
+    validate_destination, validate_legacy_source_path,
 };
 use super::{
     AuditError, AuditLog, AuditResult, AuditStorage, KvAuditStorage, LegacyAuditImportReport,
@@ -26,7 +26,7 @@ impl AuditLog {
         }
 
         let source = KvAuditStorage::open_legacy_source(&legacy_path)?;
-        let (receipt, graph) = index_legacy_source(&source, destination_identity).await?;
+        let receipt = digest_legacy_source(&source, destination_identity).await?;
         self.ensure_migration_capacity(&receipt)?;
         if let Some(existing) = marker_before.as_deref() {
             let prior = decode_receipt(existing)?;
@@ -38,7 +38,12 @@ impl AuditLog {
             }
         }
 
-        let imported_entries = import_legacy_graph(self, &source, &graph).await?;
+        let Some(destination) = self.storage.as_kv_audit_storage() else {
+            return Err(AuditError::StorageError(
+                "native audit destination cannot accept raw payload MOVE".to_owned(),
+            ));
+        };
+        let imported_entries = copy_legacy_projection(&source, destination).await?;
         // Payload digest only: prove the source tree did not change during the
         // bulk write. This is not signature or chain recertify.
         let source_after = digest_legacy_source(&source, destination_identity).await?;

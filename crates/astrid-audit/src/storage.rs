@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 mod append;
 mod append_batch;
+pub(crate) mod blind_move;
 mod global;
 mod helpers;
 mod key_types;
@@ -36,6 +37,10 @@ use system::AuditSystemNamespace;
 #[async_trait]
 pub(crate) trait AuditStorage: Send + Sync {
     async fn store(&self, entry: &AuditEntry) -> AuditResult<()>;
+
+    fn as_kv_audit_storage(&self) -> Option<&KvAuditStorage> {
+        None
+    }
 
     async fn append_if_head(
         &self,
@@ -152,6 +157,7 @@ pub(crate) trait AuditStorage: Send + Sync {
             .collect())
     }
 
+    #[allow(dead_code, reason = "paged dest observer after blind MOVE")]
     async fn all_entries_page(
         &self,
         after: Option<&str>,
@@ -196,6 +202,10 @@ pub(crate) trait AuditStorage: Send + Sync {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "O(1) committed lookup retained for dest resume tests"
+    )]
     async fn is_entry_committed(&self, _id: &AuditEntryId) -> AuditResult<bool> {
         Ok(false)
     }
@@ -315,6 +325,10 @@ impl KvAuditStorage {
         })
     }
 
+    pub(crate) fn kv_store(&self) -> &Arc<dyn KvStore> {
+        &self.store
+    }
+
     #[cfg(test)]
     pub(crate) async fn test_set_legacy_session_index(
         &self,
@@ -338,8 +352,7 @@ impl KvAuditStorage {
             .await
             .map_err(|e| AuditError::StorageError(e.to_string()))?;
         match data {
-            Some(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|e| AuditError::SerializationError(e.to_string())),
+            Some(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_default()),
             None => Ok(Vec::new()),
         }
     }
@@ -556,6 +569,11 @@ impl AuditStorage for KvAuditStorage {
             .collect())
     }
 
+    fn as_kv_audit_storage(&self) -> Option<&KvAuditStorage> {
+        Some(self)
+    }
+
+    #[allow(dead_code, reason = "paged dest observer after blind MOVE")]
     async fn all_entries_page(
         &self,
         after: Option<&str>,
@@ -899,11 +917,19 @@ impl AuditStorage for KvAuditStorage {
     }
 
     async fn count(&self) -> AuditResult<usize> {
-        let mut count = 0usize;
-        for session in self.list_sessions().await? {
-            count = count.saturating_add(self.count_session(&session).await?);
+        let committed = self
+            .store
+            .list_keys(NS_COMMITTED_ENTRIES)
+            .await
+            .map_err(|e| AuditError::StorageError(e.to_string()))?;
+        if !committed.is_empty() {
+            return Ok(committed.len());
         }
-        Ok(count)
+        self.store
+            .list_keys(NS_ENTRIES)
+            .await
+            .map(|keys| keys.len())
+            .map_err(|e| AuditError::StorageError(e.to_string()))
     }
 
     async fn count_session(&self, session_id: &SessionId) -> AuditResult<usize> {
@@ -953,17 +979,16 @@ impl AuditStorage for KvAuditStorage {
             .list_keys(NS_SESSION_ENTRIES)
             .await
             .map_err(|e| AuditError::StorageError(e.to_string()))?;
+        let head_keys = self
+            .store
+            .list_keys(NS_CHAIN_HEADS)
+            .await
+            .map_err(|e| AuditError::StorageError(e.to_string()))?;
 
         let mut sessions = HashSet::new();
-        for key in legacy_keys {
-            if let Ok(uuid) = uuid::Uuid::parse_str(&key) {
-                sessions.insert(SessionId::from_uuid(uuid));
-            }
-        }
-        for key in new_keys {
-            if let Some(session) = key.split(':').next()
-                && let Ok(uuid) = uuid::Uuid::parse_str(session)
-            {
+        for key in legacy_keys.into_iter().chain(new_keys).chain(head_keys) {
+            let session = key.split(':').next().unwrap_or(key.as_str());
+            if let Ok(uuid) = uuid::Uuid::parse_str(session) {
                 sessions.insert(SessionId::from_uuid(uuid));
             }
         }
