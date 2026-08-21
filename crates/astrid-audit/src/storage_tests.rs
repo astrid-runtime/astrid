@@ -1,7 +1,7 @@
 use super::*;
 use crate::entry::{AuditAction, AuditOutcome, AuthorizationProof};
 use astrid_crypto::{ContentHash, KeyPair};
-use astrid_storage::{StorageError, StorageResult};
+use astrid_storage::{KvBatchOutcome, KvMutationBatch, StorageError, StorageResult};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 struct FailOneMutationStore {
@@ -873,4 +873,115 @@ async fn test_concurrent_stores_multi_thread() {
     // All 8 sessions should be visible.
     let sessions = storage.list_sessions().await.unwrap();
     assert_eq!(sessions.len(), 8);
+}
+
+struct ListKeysCounter {
+    inner: MemoryKvStore,
+    lists: AtomicUsize,
+}
+
+#[async_trait]
+impl KvStore for ListKeysCounter {
+    fn supports_atomic_batch(&self) -> bool {
+        true
+    }
+
+    async fn get(&self, namespace: &str, key: &str) -> StorageResult<Option<Vec<u8>>> {
+        self.inner.get(namespace, key).await
+    }
+
+    async fn set(&self, namespace: &str, key: &str, value: Vec<u8>) -> StorageResult<()> {
+        self.inner.set(namespace, key, value).await
+    }
+
+    async fn delete(&self, namespace: &str, key: &str) -> StorageResult<bool> {
+        self.inner.delete(namespace, key).await
+    }
+
+    async fn exists(&self, namespace: &str, key: &str) -> StorageResult<bool> {
+        self.inner.exists(namespace, key).await
+    }
+
+    async fn list_keys(&self, namespace: &str) -> StorageResult<Vec<String>> {
+        self.lists.fetch_add(1, Ordering::SeqCst);
+        self.inner.list_keys(namespace).await
+    }
+
+    async fn list_keys_with_prefix(
+        &self,
+        namespace: &str,
+        prefix: &str,
+    ) -> StorageResult<Vec<String>> {
+        self.lists.fetch_add(1, Ordering::SeqCst);
+        self.inner.list_keys_with_prefix(namespace, prefix).await
+    }
+
+    async fn compare_and_swap(
+        &self,
+        namespace: &str,
+        key: &str,
+        expected: Option<&[u8]>,
+        new: Vec<u8>,
+    ) -> StorageResult<bool> {
+        self.inner
+            .compare_and_swap(namespace, key, expected, new)
+            .await
+    }
+
+    async fn apply_batch(&self, batch: &KvMutationBatch) -> StorageResult<KvBatchOutcome> {
+        self.inner.apply_batch(batch).await
+    }
+
+    async fn clear_namespace(&self, namespace: &str) -> StorageResult<u64> {
+        self.inner.clear_namespace(namespace).await
+    }
+}
+
+#[tokio::test]
+async fn is_entry_committed_does_not_materialize_sessions() {
+    let backend = Arc::new(ListKeysCounter {
+        inner: MemoryKvStore::new(),
+        lists: AtomicUsize::new(0),
+    });
+    let storage = KvAuditStorage::from_test_store(Arc::clone(&backend) as Arc<dyn KvStore>);
+    let keypair = test_keypair();
+    let session_id = SessionId::new();
+    let mut previous = ContentHash::zero();
+    let mut expected: Option<AuditEntryId> = None;
+    let mut last_id = None;
+    for i in 0..32_u32 {
+        let entry = AuditEntry::create(
+            session_id.clone(),
+            AuditAction::SessionStarted {
+                user_id: keypair.key_id(),
+                platform: format!("cli-{i}"),
+            },
+            AuthorizationProof::System {
+                reason: "test".to_string(),
+            },
+            AuditOutcome::success(),
+            previous,
+            &keypair,
+        );
+        previous = entry.content_hash();
+        assert!(
+            storage
+                .append_if_head(&entry, expected.as_ref())
+                .await
+                .unwrap(),
+            "append {i} must CAS against the current head"
+        );
+        expected = Some(entry.id.clone());
+        last_id = Some(entry.id);
+    }
+    let last_id = last_id.expect("appended");
+    backend.lists.store(0, Ordering::SeqCst);
+    assert!(storage.is_entry_committed(&last_id).await.unwrap());
+    let missing = AuditEntryId::new();
+    assert!(!storage.is_entry_committed(&missing).await.unwrap());
+    let lists = backend.lists.load(Ordering::SeqCst);
+    assert_eq!(
+        lists, 0,
+        "committed lookup must not list sessions or entries, got {lists} list_keys calls"
+    );
 }

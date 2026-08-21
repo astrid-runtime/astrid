@@ -586,34 +586,13 @@ impl AuditStorage for KvAuditStorage {
     }
 
     async fn is_entry_committed(&self, id: &AuditEntryId) -> AuditResult<bool> {
-        if self
-            .store
+        // Presence in the committed-entries namespace is the durable proof.
+        // Do not fall back to materializing every session: layout-1 import
+        // calls this once per source row, and that scan is O(n^2).
+        self.store
             .exists(NS_COMMITTED_ENTRIES, &id.0.to_string())
             .await
-            .map_err(|e| AuditError::StorageError(e.to_string()))?
-        {
-            return Ok(true);
-        }
-        if let Some(entry) = self.get(id).await?
-            && self
-                .store
-                .exists(NS_SESSION_SEQUENCE, &entry.session_id.0.to_string())
-                .await
-                .map_err(|e| AuditError::StorageError(e.to_string()))?
-        {
-            return Ok(false);
-        }
-        for session in self.list_sessions().await? {
-            if self
-                .get_session_entries(&session)
-                .await?
-                .into_iter()
-                .any(|entry| entry.id == *id)
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+            .map_err(|e| AuditError::StorageError(e.to_string()))
     }
 
     async fn get_session_entries_page(
