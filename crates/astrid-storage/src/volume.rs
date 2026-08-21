@@ -361,6 +361,24 @@ impl VolumeFile {
     pub fn region(&self) -> &VolumeRegion {
         &self.region
     }
+
+    /// Write `payload_len` streamed bytes at the cursor as one payload write.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotFound`, `UnexpectedEof`, overflow, or an underlying volume error.
+    pub fn write_from(&mut self, payload_len: u64, payload: &mut dyn Read) -> io::Result<()> {
+        if payload_len == 0 {
+            return Ok(());
+        }
+        self.volume
+            .write_region_from(&self.region, self.cursor, payload_len, payload)?;
+        self.cursor = self
+            .cursor
+            .checked_add(payload_len)
+            .ok_or_else(|| io::Error::other("volume cursor overflow"))?;
+        Ok(())
+    }
 }
 
 impl Read for VolumeFile {
@@ -378,12 +396,11 @@ impl Read for VolumeFile {
 
 impl Write for VolumeFile {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.volume
-            .write_region_at(&self.region, self.cursor, bytes)?;
-        self.cursor = self
-            .cursor
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| io::Error::other("volume cursor overflow"))?;
+        self.write_from(
+            u64::try_from(bytes.len())
+                .map_err(|_| io::Error::other("volume write length overflow"))?,
+            &mut &bytes[..],
+        )?;
         Ok(bytes.len())
     }
 

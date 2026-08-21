@@ -220,7 +220,7 @@ where
         self.flush()?;
         self.fail_if(FaultPoint::AfterContiguousStructuralFlush)?;
         let logical_bytes = prepared.verified.descriptor().logical_bytes();
-        self.project_contiguous_blob(
+        self.persist_contiguous_blob(
             prepared.payload.blob,
             prepared.payload.profile_id,
             logical_bytes,
@@ -268,7 +268,7 @@ where
         self.flush()?;
         self.fail_if(FaultPoint::AfterContiguousStructuralFlush)?;
         let logical_bytes = prepared.verified.descriptor().logical_bytes();
-        self.project_contiguous_blob_from_file(
+        self.persist_contiguous_blob_from_file(
             prepared.payload.blob,
             prepared.payload.profile_id,
             logical_bytes,
@@ -278,7 +278,7 @@ where
         self.publish_installed_contiguous(prepared)
     }
 
-    fn project_contiguous_blob<R: Read>(
+    fn persist_contiguous_blob<R: Read>(
         &self,
         blob: crate::storage_model::BlobId,
         profile: crate::storage_model::RepresentationProfileId,
@@ -286,7 +286,7 @@ where
         source: R,
     ) -> Result<(), DurableError> {
         if let Some(volume) = self.volume.read().as_ref().cloned() {
-            super::representations::write_projected_contiguous_blob(
+            super::representations::persist_store_blob(
                 &volume,
                 blob,
                 profile,
@@ -306,7 +306,7 @@ where
         }
     }
 
-    fn project_contiguous_blob_from_file(
+    fn persist_contiguous_blob_from_file(
         &self,
         blob: crate::storage_model::BlobId,
         profile: crate::storage_model::RepresentationProfileId,
@@ -316,11 +316,11 @@ where
         if let Some(volume) = self.volume.read().as_ref().cloned() {
             let mut source = source
                 .try_clone()
-                .map_err(|source| io_error("clone projected blob source", source))?;
+                .map_err(|source| io_error("clone store blob source", source))?;
             source
                 .seek(std::io::SeekFrom::Start(0))
-                .map_err(|source| io_error("rewind projected blob source", source))?;
-            super::representations::write_projected_contiguous_blob(
+                .map_err(|source| io_error("rewind store blob source", source))?;
+            super::representations::persist_store_blob(
                 &volume,
                 blob,
                 profile,
