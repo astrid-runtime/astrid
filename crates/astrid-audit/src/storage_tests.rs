@@ -804,8 +804,7 @@ async fn get_chain_head_does_not_scan_session_entries() {
     for i in 0..32 {
         let previous = last
             .as_ref()
-            .map(AuditEntry::content_hash)
-            .unwrap_or_else(ContentHash::zero);
+            .map_or_else(ContentHash::zero, AuditEntry::content_hash);
         let entry = AuditEntry::create(
             session_id.clone(),
             AuditAction::ConfigReloaded,
