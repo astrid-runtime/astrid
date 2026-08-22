@@ -9,7 +9,6 @@ use std::io::{Seek, SeekFrom};
 use std::path::Path;
 
 use crate::content::{ChunkingProfile, ContentName};
-use crate::content_dag::VerifiedContent;
 use crate::error::{StorageError, StorageResult};
 
 use super::{RuntimePrincipalStore, StateOwner};
@@ -48,18 +47,33 @@ impl RuntimePrincipalStore {
         owner: StateOwner,
         files: impl IntoIterator<Item = ContiguousFileIngest>,
     ) -> StorageResult<()> {
-        let mut entries = Vec::new();
+        let mut names = Vec::new();
+        let mut prepared = Vec::new();
         let mut objects_inserted = 0_u64;
         for file in files {
-            let published = ingest_one(&self.engine, &file)?;
-            objects_inserted = objects_inserted.checked_add(published.1).ok_or_else(|| {
-                StorageError::Internal("contiguous object count overflow".to_owned())
-            })?;
-            entries.push((file.name, published.0));
+            let item = prepare_installed_blob(&self.engine, &file)?;
+            objects_inserted = objects_inserted
+                .checked_add(item.objects_inserted())
+                .ok_or_else(|| {
+                    StorageError::Internal("contiguous object count overflow".to_owned())
+                })?;
+            names.push(file.name);
+            prepared.push(item);
         }
-        if entries.is_empty() {
+        if prepared.is_empty() {
             return Ok(());
         }
+        let published = self
+            .engine
+            .publish_installed_contiguous_batch(prepared)
+            .map_err(|error| {
+                StorageError::Connection(format!("publish contiguous batch: {error}"))
+            })?;
+        let entries = names
+            .into_iter()
+            .zip(published)
+            .map(|(name, item)| (name, item.verified_content()))
+            .collect::<Vec<_>>();
         self.content
             .publish_verified_batch(&owner, entries, objects_inserted)
             .map_err(|error| {
@@ -69,10 +83,10 @@ impl RuntimePrincipalStore {
     }
 }
 
-fn ingest_one(
+fn prepare_installed_blob(
     engine: &super::RuntimeEngine,
     file: &ContiguousFileIngest,
-) -> StorageResult<(VerifiedContent, u64)> {
+) -> StorageResult<crate::engine::PreparedContiguousFile> {
     let path = Path::new(&file.path);
     let mut source = File::open(path).map_err(|error| {
         StorageError::Connection(format!(
@@ -94,15 +108,15 @@ fn ingest_one(
             path.display()
         ))
     })?;
-    let published = engine
-        .publish_contiguous_from_file(prepared, &source)
+    engine
+        .install_prepared_contiguous_blob(&prepared, &source)
         .map_err(|error| {
             StorageError::Connection(format!(
-                "publish contiguous blob {}: {error}",
+                "install contiguous blob {}: {error}",
                 path.display()
             ))
         })?;
-    Ok((published.verified_content(), published.objects_inserted()))
+    Ok(prepared)
 }
 
 #[cfg(test)]
@@ -297,6 +311,96 @@ mod tests {
         assert!(
             error.to_string().contains("contiguous blob length"),
             "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn volume_flush_does_not_journal_a_full_index_snapshot_per_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(directory.path());
+        home.ensure().unwrap();
+        let store = open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+        let owner = StateOwner::Principal(PrincipalUid::from_bytes([0x51; 32]));
+        let unique_dir = directory.path().join("unique");
+        std::fs::create_dir(&unique_dir).unwrap();
+        let file_count = 512_usize;
+        let mut files = Vec::with_capacity(file_count);
+        let mut unique_bytes = 0_u64;
+        for index in 0..file_count {
+            let mut bytes = vec![0xA5_u8; 256];
+            bytes[0] = u8::try_from(index % 256).unwrap();
+            bytes[1] = u8::try_from(index / 256).unwrap();
+            let path = unique_dir.join(format!("{index:04}.bin"));
+            std::fs::write(&path, &bytes).unwrap();
+            unique_bytes += u64::try_from(bytes.len()).unwrap();
+            files.push(ContiguousFileIngest::new(
+                ContentName::new(format!("u/{index:04}.bin")).unwrap(),
+                path,
+                u64::try_from(bytes.len()).unwrap(),
+            ));
+        }
+        store.put_contiguous_files(owner, files).unwrap();
+        store.engine.close().unwrap();
+        drop(store);
+        let volume_path = home.storage_volume_path();
+        let volume_len = std::fs::metadata(&volume_path).unwrap().len();
+        let mut index_payload = 0_u64;
+        let mut index_writes = 0_u32;
+        let mut metadata_writes = 0_u32;
+        let mut blob_payload = 0_u64;
+        let mut buckets = std::collections::BTreeMap::<String, (u32, u64)>::new();
+        for (name, len) in crate::volume::write_record_payloads(&volume_path).unwrap() {
+            let bucket = if name == "objects.index" {
+                index_payload += len;
+                index_writes += 1;
+                name
+            } else if name.ends_with("metadata.arena") {
+                metadata_writes += 1;
+                "metadata.arena".to_owned()
+            } else if name.contains("representations/blobs/loose")
+                && std::path::Path::new(&name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("blob"))
+            {
+                blob_payload += len;
+                "blob.payload".to_owned()
+            } else if name.contains("blobs/loose")
+                && std::path::Path::new(&name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("meta"))
+            {
+                "blob.meta".to_owned()
+            } else {
+                name.rsplit_once('/')
+                    .map_or(name.clone(), |(_, tail)| tail.to_owned())
+            };
+            let entry = buckets.entry(bucket).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += len;
+        }
+        let census = buckets
+            .iter()
+            .map(|(name, (count, bytes))| format!("{bytes} n={count} {name}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert_eq!(blob_payload, unique_bytes, "{census}");
+        assert!(
+            index_payload < unique_bytes.saturating_add(2 * 1024 * 1024),
+            "objects.index journaled {index_payload} bytes across {index_writes} writes; {census}"
+        );
+        assert!(
+            index_writes <= 16,
+            "objects.index snapshot-per-file still journaled {index_writes} writes; {census}"
+        );
+        assert!(
+            metadata_writes <= 16,
+            "metadata.arena snapshot-per-file still journaled {metadata_writes} writes; {census}"
+        );
+        assert!(
+            volume_len <= unique_bytes.saturating_add(8 * 1024 * 1024),
+            "volume {volume_len} unique {unique_bytes}; {census}"
         );
     }
 }

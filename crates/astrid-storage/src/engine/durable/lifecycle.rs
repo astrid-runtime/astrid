@@ -26,7 +26,7 @@ where
             self.mark_requires_recovery(&mut inner);
             return Err(error);
         }
-        self.checkpoint_index(&mut inner);
+        self.checkpoint_index(&mut inner, VolumeIndexPersist::RetainDeltas);
         Ok(())
     }
 
@@ -58,7 +58,7 @@ where
             Err(DurableError::Closed)
         };
         if result.is_ok() && inner.files.is_some() {
-            self.checkpoint_index(&mut inner);
+            self.checkpoint_index(&mut inner, VolumeIndexPersist::CompactSnapshot);
         }
         drop(self.wal.lock().take());
         drop(inner.representations.take());
@@ -100,7 +100,27 @@ where
         files
             .roots
             .sync_data()
-            .map_err(|source| io_error("flush root journal", source))
+            .map_err(|source| io_error("flush root journal", source))?;
+        self.sync_volume()
+    }
+
+    pub(super) fn sync_volume(&self) -> Result<(), DurableError> {
+        let Some(volume) = self.volume.read().as_ref().cloned() else {
+            return Ok(());
+        };
+        volume
+            .sync()
+            .map_err(|source| io_error("flush volume container", source))
+    }
+
+    pub(super) fn compact_volume_index(&self) -> Result<(), DurableError> {
+        if !self.on_volume_media() {
+            return Ok(());
+        }
+        let mut inner = self.lock_usable()?;
+        self.checkpoint_index(&mut inner, VolumeIndexPersist::CompactSnapshot);
+        drop(inner);
+        self.sync_volume()
     }
 
     pub(in crate::engine::durable) fn checkpoint_transaction_wal(
@@ -113,7 +133,7 @@ where
             if let Some(writer) = wal.as_mut() {
                 writer.checkpoint().map_err(wal_durable_error)?;
             }
-            self.checkpoint_index(inner);
+            self.checkpoint_index(inner, VolumeIndexPersist::RetainDeltas);
             Ok(())
         })();
         if result.is_err() {
@@ -199,10 +219,10 @@ where
                 .sync_data()
                 .map_err(|source| io_error("flush WAL checkpoint root journal", source))?;
         }
-        Ok(())
+        self.sync_volume()
     }
 
-    fn checkpoint_index(&self, inner: &mut DurableInner<P>) {
+    fn checkpoint_index(&self, inner: &mut DurableInner<P>, persist: VolumeIndexPersist) {
         if inner.pending_index_locations.is_empty() && inner.pending_direct_objects.is_empty() {
             let Ok(files) = live_files_mut(&mut inner.files) else {
                 return;
@@ -211,6 +231,11 @@ where
                 .index_cache
                 .as_mut()
                 .is_some_and(index_cache_has_one_frame)
+            {
+                return;
+            }
+            if persist == VolumeIndexPersist::RetainDeltas
+                && volume_index_cache_present(self, files)
             {
                 return;
             }
@@ -228,6 +253,12 @@ where
                     .checked_add(location.payload_len)
             })
             .unwrap_or(0);
+        if persist == VolumeIndexPersist::RetainDeltas
+            && self.on_volume_media()
+            && retain_volume_index_deltas(self, inner, arena_len, arena_tail)
+        {
+            return;
+        }
         let state = IndexState {
             arena_len,
             arena_tail,
@@ -252,6 +283,58 @@ where
         inner.pending_index_locations.clear();
         inner.pending_direct_objects.clear();
     }
+
+    fn on_volume_media(&self) -> bool {
+        self.volume.read().is_some() && self.directory_capability.is_none()
+    }
+}
+
+/// POSIX index replace is a rename. ASTVOL2 replace journals another full snapshot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VolumeIndexPersist {
+    RetainDeltas,
+    CompactSnapshot,
+}
+
+fn volume_index_cache_present<P, I, C>(
+    engine: &DurableEngine<P, I, C>,
+    files: &super::DurableFiles,
+) -> bool
+where
+    P: Clone + Ord,
+    I: PersistentObjectIdentity,
+    C: PrincipalCodec<P>,
+{
+    engine.on_volume_media() && files.index_cache.is_some()
+}
+
+fn retain_volume_index_deltas<P, I, C>(
+    engine: &DurableEngine<P, I, C>,
+    inner: &mut DurableInner<P>,
+    arena_len: u64,
+    arena_tail: Option<super::ArenaLocation>,
+) -> bool
+where
+    P: Clone + Ord,
+    I: PersistentObjectIdentity,
+    C: PrincipalCodec<P>,
+{
+    {
+        let Ok(files) = live_files_mut(&mut inner.files) else {
+            return false;
+        };
+        if files.index_cache.is_none() {
+            return false;
+        }
+    }
+    if !inner.pending_index_locations.is_empty() {
+        let _ = engine.advance_index_frontier(inner, arena_len);
+    } else if let Ok(files) = live_files_mut(&mut inner.files) {
+        files.arena_len = arena_len;
+        files.arena_tail = arena_tail;
+    }
+    inner.pending_direct_objects.clear();
+    true
 }
 
 fn index_cache_has_one_frame(file: &mut File) -> bool {

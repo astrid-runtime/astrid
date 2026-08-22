@@ -44,6 +44,43 @@ impl RepresentationStore {
         representation: &RepresentationRecord,
         slices: &BTreeMap<crate::storage_model::ObjectId, ContiguousSlice>,
     ) -> Result<Option<PendingRepresentationUpdate>, DurableError> {
+        self.append_contiguous_updates(std::iter::once((profile, representation, slices)))
+    }
+
+    pub(in crate::engine::durable) fn append_contiguous_updates<'a>(
+        &mut self,
+        updates: impl IntoIterator<
+            Item = (
+                &'a RepresentationProfile,
+                &'a RepresentationRecord,
+                &'a BTreeMap<ObjectId, ContiguousSlice>,
+            ),
+        >,
+    ) -> Result<Option<PendingRepresentationUpdate>, DurableError> {
+        let mut reverse = Vec::new();
+        let mut contiguous = Vec::new();
+        let mut changed = false;
+        for (profile, representation, slices) in updates {
+            let ((next_reverse, next_contiguous), next_changed) =
+                self.ingest_contiguous_record(profile, representation, slices)?;
+            reverse.extend(next_reverse);
+            contiguous.extend(next_contiguous);
+            changed |= next_changed;
+        }
+        if changed {
+            self.append_contiguous_authority(reverse, contiguous)
+        } else {
+            self.install_contiguous_indexes(&reverse, &contiguous);
+            Ok(None)
+        }
+    }
+
+    fn ingest_contiguous_record(
+        &mut self,
+        profile: &RepresentationProfile,
+        representation: &RepresentationRecord,
+        slices: &BTreeMap<ObjectId, ContiguousSlice>,
+    ) -> Result<(ContiguousIndexes, bool), DurableError> {
         let profile_id = profile.identify(&Blake3PhysicalIdentity)?;
         if profile_id != representation.profile() {
             return Err(DurableError::InvalidRepresentationState(
@@ -74,7 +111,6 @@ impl RepresentationStore {
                 },
             )?],
         )?;
-
         let mut changed = false;
         changed |= self.profiles.insert(
             &Blake3PhysicalIdentity,
@@ -91,15 +127,9 @@ impl RepresentationStore {
             PhysicalMapKey::from(blob),
             placement.encode()?,
         )?;
-
         let (reverse_additions, contiguous_additions) =
             contiguous_index_additions(representation_id, blob, LOOSE_NAMESPACE_GENERATION, slices);
-        if !changed {
-            self.install_contiguous_indexes(&reverse_additions, &contiguous_additions);
-            return Ok(None);
-        }
-
-        self.append_contiguous_authority(reverse_additions, contiguous_additions)
+        Ok(((reverse_additions, contiguous_additions), changed))
     }
 
     pub(in crate::engine::durable) fn open_contiguous_read(
