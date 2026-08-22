@@ -210,6 +210,20 @@ pub(super) async fn copy_non_secret_env_from_principal(
     }
 }
 
+/// Copy the default principal's non-secret environment for an `agent.modify`
+/// capsule assignment, preserving the handler's internal-error context.
+pub(super) async fn copy_modify_env(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    capsules: &[String],
+) -> Result<(), String> {
+    copy_non_secret_env_from_principal(kernel, &PrincipalId::default(), principal, capsules)
+        .await
+        .map_err(|error| {
+            format!("copy default capsule environment for {principal} failed: {error}")
+        })
+}
+
 async fn copy_env_namespaces(
     kernel: &Arc<crate::Kernel>,
     source: &PrincipalId,
