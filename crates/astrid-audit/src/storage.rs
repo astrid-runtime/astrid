@@ -365,6 +365,36 @@ impl KvAuditStorage {
             .map(|_| ())
     }
 
+    #[cfg(test)]
+    pub(crate) async fn test_set_chain_head(
+        &self,
+        session_id: &SessionId,
+        principal: Option<&astrid_core::PrincipalId>,
+        bytes: Vec<u8>,
+    ) -> AuditResult<()> {
+        self.store
+            .set(
+                NS_CHAIN_HEADS,
+                &chain_head_key(session_id, principal),
+                bytes,
+            )
+            .await
+            .map_err(|error| AuditError::StorageError(error.to_string()))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn test_drop_chain_metadata(
+        &self,
+        session_id: &SessionId,
+        principal: Option<&astrid_core::PrincipalId>,
+    ) -> AuditResult<()> {
+        self.store
+            .delete(NS_CHAIN_METADATA, &chain_head_key(session_id, principal))
+            .await
+            .map_err(|error| AuditError::StorageError(error.to_string()))
+            .map(|_| ())
+    }
+
     async fn get_legacy_session_entry_ids(
         &self,
         session_id: &SessionId,

@@ -250,10 +250,10 @@ async fn handle_request(
         );
         return;
     }
-    // GetStatus is the liveness probe used by `aos status`, `astrid status`,
-    // and MCP reconnect. Writing a durable admin-audit row for every probe
-    // made layout-2 homes miss the 5s client timeout. Denies stay audited.
-    if !matches!(req, KernelRequest::GetStatus) {
+    // Liveness probes (`aos status`, `astrid status`/`doctor`, gateway
+    // `/api/sys/readiness`, MCP reconnect) must not mill the admin chain.
+    // Denies stay audited. Mutating admin methods stay durable on success.
+    if !omit_success_admin_audit(&req) {
         record_admin_audit(
             kernel,
             AdminAuditEntry {
@@ -712,6 +712,19 @@ pub fn required_capability(req: &KernelRequest, scope: AuthorityScope) -> &'stat
         ) => "capsule:list",
         (KernelRequest::ApproveCapability { .. }, _) => "self:approval:respond",
     }
+}
+
+/// Successful liveness probes are not durable admin rows.
+///
+/// `GetStatus` is `aos status` / `astrid status` / doctor roundtrip.
+/// `GetAgentReadiness` is doctor + gateway `/api/sys/readiness`.
+/// `GetCapsuleMetadata`, `Shutdown`, install/reload, and `admin.group.*`
+/// stay audited on success.
+fn omit_success_admin_audit(req: &KernelRequest) -> bool {
+    matches!(
+        req,
+        KernelRequest::GetStatus | KernelRequest::GetAgentReadiness
+    )
 }
 
 /// Short identifier for a [`KernelRequest`] variant, used for rate-limit
