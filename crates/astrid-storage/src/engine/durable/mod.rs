@@ -230,14 +230,14 @@ impl<P> Default for DurableEnginePolicy<P> {
 
 /// Working-set for decoded volume objects after layout-2.
 ///
-/// One eighth of physical RAM, never below 256 MiB and never above 4 GiB.
-/// The floor exists because a large moved audit tree is visited on every
-/// host-call audit; a small cache keeps the volume in a checksum loop.
+/// One gibibyte. Large enough that a moved audit tree's hot nodes stay
+/// decoded. A smaller default keeps every host-call audit on the volume
+/// checksum path.
 fn default_decoded_object_cache_bytes() -> NonZeroU64 {
-    // 1 GiB: large enough that a moved audit tree's hot nodes stay decoded
-    // after layout-2. Smaller defaults keep every host-call audit on the
-    // volume checksum path.
-    NonZeroU64::new(1024 * 1024 * 1024).expect("1 GiB is non-zero")
+    // One gibibyte: large enough that a moved audit tree's hot nodes stay
+    // decoded after layout-2. Smaller defaults keep every host-call audit
+    // on the volume checksum path.
+    NonZeroU64::new(1024 * 1024 * 1024).expect("one gibibyte is non-zero")
 }
 
 /// Canonical persistent representation of a domain-bearing principal value.

@@ -35,7 +35,9 @@ use crate::error::{StorageError, StorageResult};
 use crate::identity::{IdentityStore, KvIdentityStore};
 #[cfg(all(test, feature = "legacy-surrealkv"))]
 use crate::kv::SurrealKvStore;
-use crate::kv::{KvPrincipalResolver, KvQuotaResolver, KvReadCacheConfig, KvStore, ScopedKvStore, TreeKvStore};
+use crate::kv::{
+    KvPrincipalResolver, KvQuotaResolver, KvReadCacheConfig, KvStore, ScopedKvStore, TreeKvStore,
+};
 use std::num::NonZeroUsize;
 
 mod bootstrap;

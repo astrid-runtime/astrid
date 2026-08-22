@@ -145,16 +145,36 @@ async fn alias_reuse_never_remaps_a_receipted_source() {
 }
 
 #[tokio::test]
-async fn migration_rejects_redirected_special_and_non_private_sources() {
-    let (_directory, home, store, principals, principal, _uid) = fixture().await;
+async fn migration_repairs_non_private_sources() {
+    let (_directory, home, store, principals, principal, uid) = fixture().await;
     let source = home.principal_home(&principal).root().to_path_buf();
     astrid_core::platform_fs::ensure_private_directory(&source.join("documents"))
         .expect("documents");
     fs::write(source.join("documents/note.txt"), b"private").expect("file");
     #[cfg(unix)]
-    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).expect("permissions");
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).expect("permissions");
+    migrate_legacy_principal_homes(&home, &store, &principals)
+        .expect("cutover repairs leftover world-readable directories");
     #[cfg(unix)]
-    assert!(migrate_legacy_principal_homes(&home, &store, &principals).is_err());
+    {
+        let mode = std::fs::metadata(&source)
+            .expect("source metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "source must be owner-only after repair");
+    }
+    let filesystem = AstridFilesystem::new(store.content(), StateOwner::Principal(uid));
+    assert_eq!(
+        filesystem
+            .read(
+                &FilesystemPath::new("home/documents/note.txt").unwrap(),
+                0,
+                7
+            )
+            .unwrap(),
+        b"private"
+    );
 }
 
 #[tokio::test]
