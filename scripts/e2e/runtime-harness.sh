@@ -436,7 +436,7 @@ EOF
     2> "$ARTIFACTS/openai-secret.err"
   run_cli secret list --agent default --format json > "$ARTIFACTS/default-secret-list.json"
   json_assert_secret_list_metadata "$ARTIFACTS/default-secret-list.json" \
-    astrid-capsule-openai-compat api_key
+    astrid-capsule-openai-compat api_key agent
 
   # Install/config commands may auto-start a detached daemon. Stop it before
   # the crash matrix so start_daemon owns the exact process it records and a
@@ -702,9 +702,9 @@ PY
   run_cli secret list --agent "$user_principal" --format json > "$ARTIFACTS/agent-secret-list.json"
   run_cli secret list --agent "$ops_principal" --format json > "$ARTIFACTS/operator-secret-list.json"
   json_assert_secret_list_metadata "$ARTIFACTS/agent-secret-list.json" \
-    astrid-capsule-openai-compat api_key
+    astrid-capsule-openai-compat api_key agent
   json_assert_secret_list_metadata "$ARTIFACTS/operator-secret-list.json" \
-    astrid-capsule-openai-compat api_key
+    astrid-capsule-openai-compat api_key agent
   run_adversarial_principal_smoke "$user_bearer" "$user_principal" \
     "$ops_bearer" "$ops_principal" "$user_secret" "$fake_base_url"
   run_adversarial_capsule_smoke "$user_bearer" "$user_principal" \
@@ -830,7 +830,7 @@ PY
     "$sentinel" "$user_principal" "$user_secret" "$ops_principal" "$ops_secret"
   run_cli secret list --agent "$user_principal" --format json > "$ARTIFACTS/restart-agent-secret-list.json"
   json_assert_secret_list_metadata "$ARTIFACTS/restart-agent-secret-list.json" \
-    astrid-capsule-openai-compat api_key
+    astrid-capsule-openai-compat api_key agent
   status="$(http_status GET "/api/agent/sessions?include_archived=true&limit=20" "$restart_user_bearer" "" \
     "$ARTIFACTS/restart-agent-sessions.json")"
   assert_status "restart agent session list" "$status" 200
