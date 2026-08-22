@@ -273,7 +273,10 @@ async fn bounded_writer_durably_acks_concurrent_reports() {
         "persisted rows {} should be a handful of collapsed windows",
         health.persisted
     );
-    assert_eq!(u64::try_from(log.count_session(&session).await.unwrap()).unwrap(), health.persisted);
+    assert_eq!(
+        u64::try_from(log.count_session(&session).await.unwrap()).unwrap(),
+        health.persisted
+    );
     assert!(health.collapsed_repeats >= 250);
     assert!(log.verify_chain(&session).await.unwrap().valid);
 }

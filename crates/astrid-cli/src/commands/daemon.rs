@@ -153,10 +153,7 @@ pub(crate) async fn ensure_daemon(label: &str) -> Result<()> {
 /// Ensure the daemon is running without writing to stdout.
 ///
 /// Used by `astrid mcp serve`, whose stdout is the MCP JSON-RPC transport.
-pub(crate) async fn ensure_daemon_quiet(
-    label: &str,
-    workspace_root: Option<&Path>,
-) -> Result<()> {
+pub(crate) async fn ensure_daemon_quiet(label: &str, workspace_root: Option<&Path>) -> Result<()> {
     ensure_daemon_inner(label, false, DaemonSpawnMode::Ephemeral, workspace_root).await
 }
 

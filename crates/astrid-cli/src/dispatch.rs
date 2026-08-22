@@ -449,9 +449,10 @@ async fn dispatch_capsule_remove(
 
 async fn dispatch_mcp(command: McpCommands) -> Result<ExitCode> {
     match command {
-        McpCommands::Serve { workspace, request_timeout: _ } => {
-            commands::mcp::serve(None, workspace.as_deref()).await
-        },
+        McpCommands::Serve {
+            workspace,
+            request_timeout: _,
+        } => commands::mcp::serve(None, workspace.as_deref()).await,
     }
 }
 

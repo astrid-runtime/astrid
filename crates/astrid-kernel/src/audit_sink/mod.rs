@@ -329,7 +329,6 @@ impl AuditQueue {
         }
     }
 
-
     fn omit_path_probe(&self) {
         if let Ok(mut health) = self.health.lock() {
             health.omitted_path_probes = health.omitted_path_probes.saturating_add(1);

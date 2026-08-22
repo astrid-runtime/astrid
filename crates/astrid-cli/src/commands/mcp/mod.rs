@@ -132,7 +132,10 @@ pub(crate) async fn serve(
     // so attach here before they spawn.
     if let Some(root) = workspace {
         std::env::set_current_dir(root).with_context(|| {
-            format!("failed to attach MCP session to workspace {}", root.display())
+            format!(
+                "failed to attach MCP session to workspace {}",
+                root.display()
+            )
         })?;
     }
 
@@ -141,9 +144,10 @@ pub(crate) async fn serve(
     // not a chat session; the kernel attributes work via the per-message
     // `principal`, not the session.
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let mut client = crate::socket_client::connect_for_workspace(session, caller.clone(), workspace)
-        .await
-        .context("Failed to connect to the Astrid daemon socket")?;
+    let mut client =
+        crate::socket_client::connect_for_workspace(session, caller.clone(), workspace)
+            .await
+            .context("Failed to connect to the Astrid daemon socket")?;
 
     // The uplink connected, but a non-`anonymous` principal with no keypair is
     // silently stamped `anonymous` by the daemon — every tool call would then
