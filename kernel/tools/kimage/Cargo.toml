@@ -1,0 +1,19 @@
+[package]
+name = "kimage"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "kimage"
+test = false
+bench = false
+
+[dependencies]
+# The builder counterpart to the kernel's `bootloader_api` (versions must
+# match). UEFI only — the frozen machine contract boots via EDK2, never BIOS.
+# NOTE: bootloader 0.11's build.rs runs `cargo install ... -Zbuild-std`, which
+# requires a nightly toolchain; the host tools are therefore built under
+# nightly while the ring-0 kernel stays on the spec-pinned stable 1.95.0.
+bootloader = { version = "=0.11.16", default-features = false, features = ["uefi"] }
+anyhow = "=1.0.104"
