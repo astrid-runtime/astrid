@@ -175,6 +175,13 @@ pub fn enforce_restrictions(
         &["rate_limits", "max_pending_requests"],
         "rate_limits.max_pending_requests",
     );
+    clamp_max_int(
+        merged,
+        baseline,
+        workspace_layer,
+        &["rate_limits", "capsule_reload_per_min"],
+        "rate_limits.capsule_reload_per_min",
+    );
 
     // budget.warn_at_percent: can only decrease.
     clamp_max_int(

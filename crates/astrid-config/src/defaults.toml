@@ -168,6 +168,14 @@ elicitation_per_server_per_min = 10
 # Prevents queue exhaustion.
 max_pending_requests = 50
 
+# Per-principal cap for ReloadCapsule / ReloadCapsules and related
+# lifecycle verbs (UnloadCapsule, RemoveCapsule, PromoteWorkspace,
+# RollbackWorkspace). Derived from the first-party core set (7 capsules)
+# plus a same-minute retry/upgrade of that set. A silent 5/min cap fails
+# the 6th live reload as a note and the 7th core-set install as a hard
+# live-activation error.
+capsule_reload_per_min = 14
+
 # ============================================================================
 # MCP Server Configuration
 # ============================================================================
