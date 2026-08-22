@@ -302,6 +302,26 @@ impl KvAuditStorage {
         sequences.insert(session_key.to_owned(), SequenceState { expected, next });
         Ok(sequence)
     }
+
+    #[cfg(test)]
+    async fn test_zero_chain_head_hash(
+        &self,
+        session_id: &astrid_core::SessionId,
+        principal: Option<&astrid_core::PrincipalId>,
+    ) -> AuditResult<()> {
+        let key = chain_head_key(session_id, principal);
+        let (_, metadata) = self.load_chain_metadata(session_id, principal).await?;
+        let mut metadata = metadata.ok_or_else(|| {
+            AuditError::StorageError("missing chain metadata to zero head_hash".to_owned())
+        })?;
+        metadata.head_hash = astrid_crypto::ContentHash::zero();
+        let bytes = serde_json::to_vec(&metadata)
+            .map_err(|error| AuditError::SerializationError(error.to_string()))?;
+        self.store
+            .set(NS_CHAIN_METADATA, &key, bytes)
+            .await
+            .map_err(|error| AuditError::StorageError(error.to_string()))
+    }
 }
 
 fn validate_unique_entry(seen: &mut HashSet<uuid::Uuid>, entry: &AuditEntry) -> AuditResult<()> {
@@ -740,6 +760,54 @@ mod tests {
             committed,
             vec![true],
             "stored head must reconstruct missing chain metadata"
+        );
+        assert_eq!(
+            storage
+                .get_chain_head(&session, Some(&principal))
+                .await
+                .expect("restored head"),
+            Some(second.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn append_heals_zeroed_metadata_head_hash() {
+        let storage = KvAuditStorage::in_memory();
+        let keypair = KeyPair::generate();
+        let session = SessionId::new();
+        let principal = PrincipalId::new("alice").expect("principal");
+        let first = sample_entry(&session, &principal, "/a", ContentHash::zero(), &keypair);
+        assert_eq!(
+            storage
+                .append_batch_if_heads(&[(&first, None)])
+                .await
+                .expect("first append"),
+            vec![true]
+        );
+
+        storage
+            .test_zero_chain_head_hash(&session, Some(&principal))
+            .await
+            .expect("zero stored head_hash");
+        let metadata = storage
+            .chain_metadata(&session, Some(&principal))
+            .await
+            .expect("load zeroed metadata");
+        assert_eq!(
+            metadata.expect("chain metadata").head_hash,
+            ContentHash::zero(),
+            "falsifier requires a committed parent with a zeroed head_hash"
+        );
+
+        let second = sample_entry(&session, &principal, "/b", first.content_hash(), &keypair);
+        let committed = storage
+            .append_batch_if_heads(&[(&second, Some(&first.id))])
+            .await
+            .expect("healed zeroed head_hash");
+        assert_eq!(
+            committed,
+            vec![true],
+            "zeroed metadata.head_hash must not fail closed as a CAS miss"
         );
         assert_eq!(
             storage
