@@ -425,7 +425,7 @@ async fn collapse_keeps_principals_and_exact_denials() {
     let entries = log.get_session_entries(&session).await.expect("read");
     let principals: Vec<_> = entries
         .iter()
-        .filter_map(|e| e.principal.as_ref().map(|p| p.as_str()))
+        .filter_map(|e| e.principal.as_ref().map(astrid_core::PrincipalId::as_str))
         .collect();
     assert!(principals.contains(&"alice"), "{principals:?}");
     assert!(principals.contains(&"bob"), "{principals:?}");

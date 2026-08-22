@@ -614,7 +614,7 @@ mod capsule_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, InviteCommand, McpCommands};
+    use super::{Cli, Commands, InviteCommand};
     use clap::{CommandFactory, Parser};
     use std::collections::BTreeSet;
 
