@@ -20,8 +20,8 @@ mod open;
 mod reclaim;
 mod stream;
 
-const VOLUME_MAGIC: [u8; 8] = *b"ASTVOL2\0";
-const RECORD_MAGIC: [u8; 8] = *b"ASTREG2\0";
+const VOLUME_MAGIC: [u8; 8] = *b"ASTVOL1\0";
+const RECORD_MAGIC: [u8; 8] = *b"ASTREG1\0";
 const RECORD_FIXED_BYTES: usize = 8 + 8 + 8 + 1 + 2 + 8 + 8 + 32;
 const MAX_METADATA_MUTATIONS: usize = 1_024;
 const METADATA_TRANSACTION_REGION: &str = "system/volume-metadata-transaction";
@@ -105,7 +105,7 @@ impl HostedFileVolume {
             .and_then(|fixed| fixed.checked_add(u64::from(name_len)))
             .and_then(|total| total.checked_add(payload_len))
             .ok_or_else(|| io::Error::other("volume record length overflow"))?;
-        let mut hasher = blake3::Hasher::new_derive_key("astrid volume record v2");
+        let mut hasher = blake3::Hasher::new_derive_key("astrid volume record v1");
         hasher.update(&next_sequence.to_le_bytes());
         hasher.update(&[operation as u8]);
         hasher.update(&name_len.to_le_bytes());
@@ -500,7 +500,7 @@ fn recover_container(
             0
         };
         let mut payload = Vec::with_capacity(payload_capacity);
-        let mut hasher = blake3::Hasher::new_derive_key("astrid volume record v2");
+        let mut hasher = blake3::Hasher::new_derive_key("astrid volume record v1");
         hasher.update(&record_sequence.to_le_bytes());
         hasher.update(&[operation as u8]);
         let name_len = u16::try_from(name_length)
@@ -637,7 +637,7 @@ fn physically_valid_record_at(file: &mut File, offset: u64, end: u64) -> io::Res
     {
         return Ok(false);
     }
-    let mut hasher = blake3::Hasher::new_derive_key("astrid volume record v2");
+    let mut hasher = blake3::Hasher::new_derive_key("astrid volume record v1");
     hasher.update(&fixed[16..24]);
     hasher.update(&fixed[24..25]);
     hasher.update(&fixed[25..27]);

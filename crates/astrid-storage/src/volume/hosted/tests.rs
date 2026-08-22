@@ -11,7 +11,7 @@ fn append_valid_uncommitted_write(path: &std::path::Path, sequence: u64, payload
         .checked_add(u64::from(name_len))
         .and_then(|value| value.checked_add(payload_len))
         .unwrap();
-    let mut hasher = blake3::Hasher::new_derive_key("astrid volume record v2");
+    let mut hasher = blake3::Hasher::new_derive_key("astrid volume record v1");
     hasher.update(&sequence.to_le_bytes());
     hasher.update(&[Operation::Write as u8]);
     hasher.update(&name_len.to_le_bytes());
@@ -34,6 +34,19 @@ fn append_valid_uncommitted_write(path: &std::path::Path, sequence: u64, payload
     let mut file = OpenOptions::new().append(true).open(path).unwrap();
     file.write_all(&record).unwrap();
     file.sync_all().unwrap();
+}
+
+#[test]
+fn hosted_volume_rejects_astvol2_header() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("astrid.volume");
+    std::fs::write(&path, b"ASTVOL2\0").unwrap();
+    let error = HostedFileVolume::open(&path).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        error.to_string().contains("invalid Astrid volume header"),
+        "{error}"
+    );
 }
 
 #[test]

@@ -289,7 +289,7 @@ where
     }
 }
 
-/// POSIX index replace is a rename. ASTVOL2 replace journals another full snapshot.
+/// POSIX index replace is a rename. ASTVOL1 replace journals another full snapshot.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VolumeIndexPersist {
     RetainDeltas,

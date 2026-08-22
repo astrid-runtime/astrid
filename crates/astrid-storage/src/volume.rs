@@ -117,7 +117,7 @@ pub trait AstridVolume: fmt::Debug + Send + Sync {
 
     /// Write `payload_len` bytes from `payload` at an exact logical offset.
     ///
-    /// This is the payload write. Hosted ASTVOL2 persists it as one `Write`
+    /// This is the payload write. Hosted ASTVOL1 persists it as one `Write`
     /// record of that length. Stream; do not assemble `payload_len` in RAM
     /// solely to call this.
     ///

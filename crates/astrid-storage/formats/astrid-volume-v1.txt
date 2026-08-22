@@ -1,4 +1,4 @@
-ASTRID HOSTED VOLUME FORMAT 2
+ASTRID HOSTED VOLUME FORMAT 1
 =============================
 
 Status: hosted-media recovery specification
@@ -12,12 +12,12 @@ implementing the same region, transaction, and durability contract.
 
 The hosted container starts with these exact eight bytes:
 
-  41 53 54 56 4f 4c 32 00        ASCII "ASTVOL2" followed by NUL
+  41 53 54 56 4f 4c 31 00        ASCII "ASTVOL1" followed by NUL
 
 Every following record is:
 
   offset  size  field
-  0     8  magic = 41 53 54 52 45 47 32 00 ("ASTREG2" + NUL)
+  0     8  magic = 41 53 54 52 45 47 31 00 ("ASTREG1" + NUL)
        8     8  total_record_length, including this header, name, and payload
       16     8  sequence, starting at 1 and increasing exactly by 1
       24     1  operation
@@ -33,7 +33,7 @@ Region names are relative, slash-separated UTF-8. They are non-empty, at most
 backslashes, control characters, leading slashes, and trailing slashes.
 
 The checksum is the 32-byte output of a BLAKE3 derive-key hasher using context
-"astrid volume record v2" over this exact concatenation:
+"astrid volume record v1" over this exact concatenation:
 
   sequence[8]
   operation[1]
@@ -57,7 +57,7 @@ Operation codes are:
       logical_offset is zero, and payload is empty
 
 A mutation record is recoverable data but is not a durability boundary by
-itself. Version two admits records only after the most recent operation-8
+itself. Version one admits records only after the most recent operation-8
 boundary. A physically short final record after the last boundary is an
 uncommitted tail. Complete records without a later boundary are also an
 uncommitted tail, including a terminal checksum-damaged record. A damaged
