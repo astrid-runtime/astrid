@@ -227,6 +227,20 @@ fn admin_response_topic(input_topic: &str) -> Topic {
 #[must_use]
 pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> AuthorityScope {
     match req {
+        // Host-wide shared env/secret namespaces are not principal-scoped
+        // storage: the `principal` field is ignored for `Shared` writes and
+        // every capsule falls back to `system:control:*` on miss. Require the
+        // global `env:write` form even when the caller names themselves —
+        // otherwise `self:*` (builtin agent) can poison every principal's
+        // shared secret resolution for a capsule.
+        AdminRequestKind::EnvSet {
+            scope: astrid_events::kernel_api::EnvStorageScope::Shared,
+            ..
+        }
+        | AdminRequestKind::EnvDelete {
+            scope: astrid_events::kernel_api::EnvStorageScope::Shared,
+            ..
+        } => AuthorityScope::Global,
         AdminRequestKind::QuotaGet { principal }
         | AdminRequestKind::QuotaSet { principal, .. }
         | AdminRequestKind::UsageGet { principal }

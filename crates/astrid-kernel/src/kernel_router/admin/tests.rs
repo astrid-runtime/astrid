@@ -17,7 +17,9 @@ use std::sync::Arc;
 use astrid_capabilities::CapabilityCheck;
 use astrid_core::principal::PrincipalId;
 use astrid_core::{GroupConfig, PrincipalProfile};
-use astrid_events::kernel_api::{AdminRequestKind, PairScopeArg};
+use astrid_events::kernel_api::{
+    AdminRequestKind, EnvStorageScope, EnvValueKind, PairScopeArg,
+};
 
 use super::{
     AuthorityScope, admin_request_method, admin_response_topic, admin_target_principal,
@@ -231,6 +233,68 @@ fn resolve_admin_scope_global_when_target_differs() {
         quotas: astrid_core::profile::Quotas::default(),
     };
     assert_eq!(resolve_admin_scope(&req, &caller), AuthorityScope::Global);
+}
+
+#[test]
+fn shared_env_mutations_are_always_global_authority() {
+    let caller = pid("alice");
+    let shared_set = AdminRequestKind::EnvSet {
+        principal: caller.clone(),
+        capsule: "provider".into(),
+        key: "api_key".into(),
+        value: "secret".into(),
+        kind: EnvValueKind::Secret,
+        scope: EnvStorageScope::Shared,
+        append: false,
+    };
+    let shared_delete = AdminRequestKind::EnvDelete {
+        principal: caller.clone(),
+        capsule: "provider".into(),
+        key: "api_key".into(),
+        kind: EnvValueKind::Secret,
+        scope: EnvStorageScope::Shared,
+    };
+    let agent_set = AdminRequestKind::EnvSet {
+        principal: caller.clone(),
+        capsule: "provider".into(),
+        key: "api_key".into(),
+        value: "secret".into(),
+        kind: EnvValueKind::Secret,
+        scope: EnvStorageScope::Agent,
+        append: false,
+    };
+
+    assert_eq!(
+        resolve_admin_scope(&shared_set, &caller),
+        AuthorityScope::Global,
+        "Shared env write is host-wide even when principal == caller"
+    );
+    assert_eq!(
+        resolve_admin_scope(&shared_delete, &caller),
+        AuthorityScope::Global,
+        "Shared env delete is host-wide even when principal == caller"
+    );
+    assert_eq!(
+        resolve_admin_scope(&agent_set, &caller),
+        AuthorityScope::Self_,
+        "Agent-scoped env write stays self when principal == caller"
+    );
+    assert_eq!(
+        required_capability_for_admin_request(&shared_set, AuthorityScope::Global),
+        "env:write"
+    );
+    assert!(!authorize_with(
+        &agent_profile(),
+        &GroupConfig::builtin_only(),
+        &caller,
+        "env:write"
+    ));
+    assert!(authorize_with(
+        &agent_profile(),
+        &GroupConfig::builtin_only(),
+        &caller,
+        "self:env:write"
+    ));
 }
 
 #[test]
