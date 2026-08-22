@@ -13,6 +13,7 @@ mod append;
 mod append_batch;
 pub(crate) mod blind_move;
 mod census;
+mod frozen;
 mod global;
 mod helpers;
 mod key_types;
@@ -301,6 +302,15 @@ pub(crate) struct KvAuditStorage {
 
 impl KvAuditStorage {
     pub(crate) fn open_legacy_source(path: impl AsRef<Path>) -> AuditResult<Self> {
+        let store =
+            SurrealKvStore::open(path).map_err(|e| AuditError::StorageError(e.to_string()))?;
+        Ok(Self {
+            store: Arc::new(frozen::FrozenKvStore::new(Arc::new(store))),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_legacy_source_writable(path: impl AsRef<Path>) -> AuditResult<Self> {
         let store =
             SurrealKvStore::open(path).map_err(|e| AuditError::StorageError(e.to_string()))?;
         Ok(Self {

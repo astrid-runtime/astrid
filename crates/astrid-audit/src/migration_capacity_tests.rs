@@ -76,7 +76,8 @@ async fn legacy_import_ignores_unusable_oversized_session_index() {
     // malformed value. A migration that deserializes that array would either
     // fail or allocate the entire legacy projection; streaming uses paged
     // `audit:entries` records and chain heads instead.
-    let source_store = KvAuditStorage::open_legacy_source(&path).expect("reopen source store");
+    let source_store =
+        KvAuditStorage::open_legacy_source_writable(&path).expect("reopen source store");
     source_store
         .test_set_legacy_session_index(&session, vec![b'['; 4 * 1024 * 1024])
         .await
@@ -616,4 +617,23 @@ async fn local_blind_move_reopen_and_append() {
             .is_some()
     );
     store.kv().close().await.expect("close store");
+}
+
+#[tokio::test]
+async fn legacy_move_source_rejects_writes() {
+    let directory = tempfile::tempdir().expect("temporary legacy directory");
+    let path = directory.path().join("audit-db");
+    let key = std::sync::Arc::new(KeyPair::generate());
+    let session = SessionId::new();
+    let writable = AuditLog::open_legacy_source(&path, std::sync::Arc::clone(&key)).expect("seed");
+    append_test_entries(&writable, &session, 1).await;
+    writable.close().await.expect("close seed");
+
+    let frozen = KvAuditStorage::open_legacy_source(&path).expect("frozen source");
+    let error = frozen
+        .kv_store()
+        .set("audit:entries", "nope", b"x".to_vec())
+        .await
+        .expect_err("frozen source must refuse writes");
+    assert!(error.to_string().contains("frozen"));
 }
