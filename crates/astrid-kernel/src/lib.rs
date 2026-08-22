@@ -1200,6 +1200,13 @@ impl Kernel {
             })?;
         }
 
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let host_audit_policy =
+            astrid_config::Config::load_with_layout(Some(&workspace_root), &workspace_layout)
+                .ok()
+                .map(|resolved| crate::audit_sink::HostAuditPolicy::from(&resolved.config.audit))
+                .unwrap_or_default();
+
         let kernel = Arc::new(Self {
             session_id: session_id.clone(),
             event_bus,
@@ -1229,9 +1236,10 @@ impl Kernel {
             process_storage_mount_broker: OnceLock::new(),
             audit_log: Arc::clone(&audit_log),
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-            audit_sink: Arc::new(crate::audit_sink::KernelAuditSink::new(
+            audit_sink: Arc::new(crate::audit_sink::KernelAuditSink::with_policy(
                 Arc::clone(&audit_log),
                 session_id.clone(),
+                host_audit_policy,
             )),
             runtime_key,
             active_connections: DashMap::new(),
@@ -4649,6 +4657,12 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHand
                 });
             }
 
+            let ready_this_tick: std::collections::HashSet<astrid_capsule::registry::RuntimeKey> =
+                ready_capsules
+                    .iter()
+                    .map(|(_principal, runtime_id, _)| restart_tracker_key(runtime_id))
+                    .collect();
+
             // Drop all Arc clones so restart_capsule's Arc::get_mut can
             // obtain exclusive access for calling unload().
             drop(ready_capsules);
@@ -4658,6 +4672,12 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHand
                     .iter()
                     .map(|(_principal, _id, runtime_id, _)| restart_tracker_key(runtime_id))
                     .collect();
+            let recovered_this_tick: std::collections::HashSet<
+                astrid_capsule::registry::RuntimeKey,
+            > = ready_this_tick
+                .difference(&failed_this_tick)
+                .cloned()
+                .collect();
 
             for (principal, id_str, runtime_id, _reason) in &failures {
                 let tracker = restart_trackers
@@ -4667,21 +4687,13 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHand
                 attempt_capsule_restart(&kernel, id_str, principal, runtime_id, tracker).await;
             }
 
-            // Prune trackers on RECOVERY — the sole tracker-removal path. A
-            // tracker is dropped only when its capsule is healthy again (absent
-            // from `failed_this_tick`) AND past its backoff window. This is what
-            // decouples the retry cap from the restart-call outcome: a restart is
-            // never treated as "success" that resets the budget; instead the
-            // budget resets only when the capsule genuinely recovers. So a
-            // transient hiccup (one failing tick, then healthy) prunes cleanly
-            // and never approaches the cap, while a capsule that keeps failing
-            // across ticks accumulates attempts until the cap engages — for both
-            // clean and lingering restarts alike. Exhausted trackers are kept so
-            // an exhausted capsule stays down; within-backoff trackers are kept
-            // because a failed reload can drop the capsule from the registry so
-            // it won't appear in `ready_capsules` next tick.
+            // Prune trackers only on observed RECOVERY: Ready this tick and
+            // not failed. Absence from the Ready snapshot is not recovery — a
+            // crash-looping extra often unloads itself, then extra-discovery
+            // reloads it, and treating that gap as health reset the budget
+            // to attempt 1 forever.
             restart_trackers.retain(|tracker_key, tracker| {
-                tracker_should_be_retained(tracker, failed_this_tick.contains(tracker_key))
+                tracker_should_be_retained(tracker, recovered_this_tick.contains(tracker_key))
             });
         }
     })
@@ -4700,14 +4712,14 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHand
 /// (a lingering old instance is not a failure) is what stops a busy capsule from
 /// exhausting the cap on transient hiccups.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-fn tracker_should_be_retained(tracker: &RestartTracker, failed_this_tick: bool) -> bool {
+fn tracker_should_be_retained(tracker: &RestartTracker, recovered_this_tick: bool) -> bool {
     if tracker.exhausted() {
         return true;
     }
     if tracker.last_attempt.elapsed() < tracker.backoff {
         return true;
     }
-    failed_this_tick
+    !recovered_this_tick
 }
 
 /// Collect failed runtime generations from the health-monitor snapshot.
@@ -6971,7 +6983,7 @@ mod tests {
                     .checked_sub(RestartTracker::MAX_BACKOFF)
                     .unwrap_or_else(astrid_runtime::time::Instant::now);
             }
-            trackers.retain(|_, tracker| tracker_should_be_retained(tracker, failing));
+            trackers.retain(|_, tracker| tracker_should_be_retained(tracker, !failing));
         }
 
         let disabled = trackers.get(KEY).is_some_and(RestartTracker::exhausted);
@@ -6992,6 +7004,26 @@ mod tests {
             "persistent failures must stop at the cap, not thrash forever"
         );
         assert!(disabled, "a persistently-failing capsule ends up capped");
+    }
+
+    #[test]
+    fn retry_budget_survives_ready_gap_after_crash_unload() {
+        // After a health restart the new instance often exits before the next
+        // 10s tick, so it is absent from `ready_capsules`. That gap is not
+        // recovery; pruning here reset live claude-runner/aos-cli to attempt 1.
+        let mut tracker = RestartTracker::new();
+        tracker.record_attempt();
+        tracker.last_attempt = astrid_runtime::time::Instant::now()
+            .checked_sub(RestartTracker::MAX_BACKOFF)
+            .expect("backdate");
+        assert!(
+            tracker_should_be_retained(&tracker, false),
+            "absence after a crash must keep the tracker"
+        );
+        assert!(
+            !tracker_should_be_retained(&tracker, true),
+            "Ready-and-healthy after backoff is the recovery prune"
+        );
     }
 
     #[test]
@@ -7028,7 +7060,7 @@ mod tests {
                 .into_iter()
                 .collect::<std::collections::HashSet<_>>();
             trackers.retain(|key, tracker| {
-                tracker_should_be_retained(tracker, failed_keys.contains(key))
+                tracker_should_be_retained(tracker, !failed_keys.contains(key))
             });
         }
 

@@ -278,6 +278,19 @@ impl<P> ObjectCacheConfig<P> {
             Arc::new(DisabledPrincipalBudget),
         )
     }
+
+    /// Retain decoded objects up to `bytes` for every principal.
+    ///
+    /// Layout-2 volume-backed trees re-verify frames on every miss. A disabled
+    /// cache turns host-call audit into a permanent volume checksum loop.
+    #[must_use]
+    pub fn bounded(bytes: NonZeroU64) -> Self {
+        let capacity = ObjectCacheCapacity::Bounded(bytes);
+        Self::new(
+            ObjectCacheController::new(capacity),
+            Arc::new(move |_: &P| capacity),
+        )
+    }
 }
 
 /// Privileged cache diagnostics.

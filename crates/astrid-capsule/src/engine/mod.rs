@@ -279,20 +279,11 @@ pub(crate) async fn resolve_env(
             .collect::<Vec<_>>()
             .join(", ");
 
-        tracing::info!(
+        tracing::warn!(
             capsule = %manifest.package.name,
             missing = %missing_display,
-            "Capsule has unconfigured env fields — loading with empty defaults"
+            "Capsule has unconfigured env fields — not starting until configured"
         );
-
-        // Fill missing fields with empty strings BEFORE publishing the
-        // onboarding event (which moves onboarding_fields). Uplink capsules
-        // load at daemon boot before any client connects, so the onboarding
-        // event would be lost. The install-time CLI prompts are the primary
-        // mechanism; this is the fallback.
-        for field in &onboarding_fields {
-            resolved.entry(field.key.clone()).or_default();
-        }
 
         let msg = astrid_events::ipc::IpcMessage::new(
             astrid_events::ipc::Topic::from_raw("astrid.v1.onboarding.required"),
@@ -307,6 +298,12 @@ pub(crate) async fn resolve_env(
             metadata: astrid_events::EventMetadata::new(source),
             message: msg,
         });
+        return Err(astrid_capsule_types::CapsuleError::ExecutionFailed(
+            format!(
+                "capsule '{}' is not configured ({missing_display})",
+                manifest.package.name
+            ),
+        ));
     }
 
     Ok(resolved)

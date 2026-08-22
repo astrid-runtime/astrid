@@ -250,20 +250,25 @@ async fn handle_request(
         );
         return;
     }
-    record_admin_audit(
-        kernel,
-        AdminAuditEntry {
-            caller: &caller,
-            method,
-            required_cap,
-            device_key_id: device_key_id.as_deref(),
-            target_principal: requested_target,
-            params: None,
-            authorization: authorization_proof,
-            outcome: AuditOutcome::success(),
-        },
-    )
-    .await;
+    // Liveness probes (`aos status`, `astrid status`/`doctor`, gateway
+    // `/api/sys/readiness`, MCP reconnect) must not mill the admin chain.
+    // Denies stay audited. Mutating admin methods stay durable on success.
+    if !omit_success_admin_audit(&req) {
+        record_admin_audit(
+            kernel,
+            AdminAuditEntry {
+                caller: &caller,
+                method,
+                required_cap,
+                device_key_id: device_key_id.as_deref(),
+                target_principal: requested_target,
+                params: None,
+                authorization: authorization_proof,
+                outcome: AuditOutcome::success(),
+            },
+        )
+        .await;
+    }
 
     // Keepalive pinger: from here until the terminal response is published, emit
     // a `KernelResponse::Working` frame every `KEEPALIVE_INTERVAL` so a waiting
@@ -709,6 +714,19 @@ pub fn required_capability(req: &KernelRequest, scope: AuthorityScope) -> &'stat
     }
 }
 
+/// Successful liveness probes are not durable admin rows.
+///
+/// `GetStatus` is `aos status` / `astrid status` / doctor roundtrip.
+/// `GetAgentReadiness` is doctor + gateway `/api/sys/readiness`.
+/// `GetCapsuleMetadata`, `Shutdown`, install/reload, and `admin.group.*`
+/// stay audited on success.
+fn omit_success_admin_audit(req: &KernelRequest) -> bool {
+    matches!(
+        req,
+        KernelRequest::GetStatus | KernelRequest::GetAgentReadiness
+    )
+}
+
 /// Short identifier for a [`KernelRequest`] variant, used for rate-limit
 /// labels and audit method names.
 #[must_use]
@@ -943,5 +961,7 @@ async fn record_admin_audit(kernel: &crate::Kernel, entry: AdminAuditEntry<'_>) 
         message: msg,
     });
 }
+#[cfg(test)]
+mod get_status_audit_tests;
 #[cfg(test)]
 mod tests;

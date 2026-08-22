@@ -98,8 +98,9 @@ fn fs_event_for_op<'a>(op: &str, path: &'a str) -> Option<HostAuditEvent<'a>> {
     // forms classify identically.
     let verb = op.rsplit('.').next().unwrap_or(op);
     match verb {
-        "read-file" | "fs-readdir" | "readdir" | "fs-stat" | "stat" | "fs-exists" | "exists" => {
-            Some(HostAuditEvent::FileRead { path })
+        "read-file" => Some(HostAuditEvent::FileRead { path }),
+        "fs-readdir" | "readdir" | "fs-stat" | "stat" | "fs-exists" | "exists" => {
+            Some(HostAuditEvent::FileProbe { path })
         },
         "write-file" | "fs-mkdir" | "mkdir" | "fs-mkdir-all" => {
             Some(HostAuditEvent::FileWrite { path })

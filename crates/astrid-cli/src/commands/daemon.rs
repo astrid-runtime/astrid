@@ -147,14 +147,14 @@ fn ephemeral_daemon_command(daemon_bin: &Path, workspace_root: &Path) -> std::pr
 /// Checks the socket path, cleans up stale sockets, and spawns a fresh
 /// daemon when no live daemon is reachable.
 pub(crate) async fn ensure_daemon(label: &str) -> Result<()> {
-    ensure_daemon_inner(label, true, DaemonSpawnMode::Ephemeral).await
+    ensure_daemon_inner(label, true, DaemonSpawnMode::Ephemeral, None).await
 }
 
 /// Ensure the daemon is running without writing to stdout.
 ///
 /// Used by `astrid mcp serve`, whose stdout is the MCP JSON-RPC transport.
-pub(crate) async fn ensure_daemon_quiet(label: &str) -> Result<()> {
-    ensure_daemon_inner(label, false, DaemonSpawnMode::Ephemeral).await
+pub(crate) async fn ensure_daemon_quiet(label: &str, workspace_root: Option<&Path>) -> Result<()> {
+    ensure_daemon_inner(label, false, DaemonSpawnMode::Ephemeral, workspace_root).await
 }
 
 /// Ensure a persistent daemon is running for a multi-request workflow.
@@ -162,7 +162,7 @@ pub(crate) async fn ensure_daemon_quiet(label: &str) -> Result<()> {
 /// Unlike [`ensure_daemon`], a daemon started here remains alive between the
 /// workflow's independent admin connections.
 pub(crate) async fn ensure_persistent_daemon(label: &str) -> Result<()> {
-    ensure_daemon_inner(label, true, DaemonSpawnMode::Persistent).await
+    ensure_daemon_inner(label, true, DaemonSpawnMode::Persistent, None).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +175,7 @@ async fn ensure_daemon_inner(
     label: &str,
     announce: bool,
     spawn_mode: DaemonSpawnMode,
+    workspace_root: Option<&Path>,
 ) -> Result<()> {
     let socket_path = socket_client::proxy_socket_path();
     let ready_path = socket_client::readiness_path();
@@ -187,7 +188,7 @@ async fn ensure_daemon_inner(
             if let astrid_core::local_transport::ConnectOutcome::Connected(stream) = outcome {
                 drop(stream);
             }
-            ensure_daemon_workspace_matches(None).await?;
+            ensure_daemon_workspace_matches(workspace_root).await?;
             if announce {
                 eprintln!("[{label}] Connected to existing daemon");
             }
@@ -211,7 +212,7 @@ async fn ensure_daemon_inner(
             },
             DaemonSpawnMode::Persistent => spawn_persistent_daemon().await?,
         }
-        ensure_daemon_workspace_matches(None).await?;
+        ensure_daemon_workspace_matches(workspace_root).await?;
     }
     Ok(())
 }

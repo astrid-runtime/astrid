@@ -34,7 +34,7 @@ pub(super) async fn run(principal: astrid_core::PrincipalId) {
 async fn hold_guard_uplink(
     principal: &astrid_core::PrincipalId,
 ) -> Result<std::convert::Infallible> {
-    daemon::ensure_daemon_quiet("mcp-session-guard").await?;
+    daemon::ensure_daemon_quiet("mcp-session-guard", None).await?;
 
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
     let c = crate::socket_client::connect_for_workspace(session, principal.clone(), None)

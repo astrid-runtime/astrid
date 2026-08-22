@@ -108,7 +108,10 @@ fn broker_readiness_required(caller: &astrid_core::PrincipalId) -> bool {
 ///
 /// Returns an error if the daemon socket is unreachable, the principal
 /// is invalid, or the MCP transport fails to initialize.
-pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
+pub(crate) async fn serve(
+    principal: Option<&str>,
+    workspace: Option<&std::path::Path>,
+) -> Result<ExitCode> {
     // The subcommand `--principal` is an explicit per-invocation
     // override; when absent, fall back to the process-wide principal
     // (the global `--principal` / `ASTRID_PRINCIPAL`, already validated
@@ -121,18 +124,30 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
     };
 
     // `mcp serve` owns stdout for JSON-RPC, so daemon bootstrap must be quiet.
-    crate::commands::daemon::ensure_daemon_quiet("mcp-serve")
+    crate::commands::daemon::ensure_daemon_quiet("mcp-serve", workspace)
         .await
         .context("failed to ensure Astrid daemon for `astrid mcp serve`")?;
+    // AOS host plugins `cd` into the runtime home, then pass the project as
+    // `--workspace`. Session-guard and the hot-reload watcher fingerprint cwd,
+    // so attach here before they spawn.
+    if let Some(root) = workspace {
+        std::env::set_current_dir(root).with_context(|| {
+            format!(
+                "failed to attach MCP session to workspace {}",
+                root.display()
+            )
+        })?;
+    }
 
     // The shim holds ONE uplink connection for its whole lifetime. The
     // session id is ephemeral — it only scopes this transport's frames,
     // not a chat session; the kernel attributes work via the per-message
     // `principal`, not the session.
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let mut client = crate::socket_client::connect_for_workspace(session, caller.clone(), None)
-        .await
-        .context("Failed to connect to the Astrid daemon socket")?;
+    let mut client =
+        crate::socket_client::connect_for_workspace(session, caller.clone(), workspace)
+            .await
+            .context("Failed to connect to the Astrid daemon socket")?;
 
     // The uplink connected, but a non-`anonymous` principal with no keypair is
     // silently stamped `anonymous` by the daemon — every tool call would then

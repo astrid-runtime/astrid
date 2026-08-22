@@ -452,12 +452,9 @@ impl net::Host for HostState {
             }
         }
 
-        if self.cli_socket_listener.is_none() {
-            let reason = "no pre-bound Unix listener configured";
-            audit_net_bind(self, bind_addr, HostAuditOutcome::Failed(reason));
-            return Err(ErrorCode::Unknown(reason.to_string()));
-        }
-
+        // Native astrid-daemon claims the control socket first. Capsules that
+        // still call bind_unix (aos-cli) must not fail the run loop: accept()
+        // on this handle returns Closed and the capsule backs off.
         let res = match self.resource_table.push(UnixListenerSlot) {
             Ok(res) => res,
             Err(e) => {

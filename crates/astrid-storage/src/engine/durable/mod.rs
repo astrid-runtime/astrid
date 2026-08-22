@@ -223,9 +223,21 @@ impl<P> Default for DurableEnginePolicy<P> {
         Self::new(
             GroupCommitPolicy::default(),
             RecoveryRetryPolicy::default(),
-            ObjectCacheConfig::disabled(),
+            ObjectCacheConfig::bounded(default_decoded_object_cache_bytes()),
         )
     }
+}
+
+/// Working-set for decoded volume objects after layout-2.
+///
+/// One gibibyte. Large enough that a moved audit tree's hot nodes stay
+/// decoded. A smaller default keeps every host-call audit on the volume
+/// checksum path.
+fn default_decoded_object_cache_bytes() -> NonZeroU64 {
+    // One gibibyte: large enough that a moved audit tree's hot nodes stay
+    // decoded after layout-2. Smaller defaults keep every host-call audit
+    // on the volume checksum path.
+    NonZeroU64::new(1024 * 1024 * 1024).expect("one gibibyte is non-zero")
 }
 
 /// Canonical persistent representation of a domain-bearing principal value.

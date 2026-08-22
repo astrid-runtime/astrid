@@ -30,9 +30,18 @@
 /// enum, so this engine never names an `astrid-audit` type.
 #[derive(Debug, Clone, Copy)]
 pub enum HostAuditEvent<'a> {
-    /// A filesystem read (content read or metadata probe).
+    /// A filesystem content read (`read-file`).
     FileRead {
         /// The path that was read (logical or physical, per the call site).
+        path: &'a str,
+    },
+    /// A filesystem metadata probe (`stat` / `exists` / `readdir`).
+    ///
+    /// Distinct from [`FileRead`] so the kernel can omit allowed probes from
+    /// the signed chain (POSIX path probes are not OS-level security events)
+    /// while still recording denials.
+    FileProbe {
+        /// The path that was probed.
         path: &'a str,
     },
     /// A filesystem mutation (write or directory creation).

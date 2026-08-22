@@ -133,6 +133,44 @@ pub fn ensure_private_directory(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Make `path` and every nested real directory owner-only.
+///
+/// Layout-1 leftovers often have `0755` children (COW slots, unpacked homes).
+/// Cutover must repair those itself; a user should not have to chmod first.
+///
+/// # Errors
+///
+/// Returns an error when any real directory cannot be made private. Symlinks
+/// are skipped and not followed.
+pub fn ensure_private_directory_tree(path: &Path) -> io::Result<()> {
+    ensure_private_directory(path)?;
+    #[cfg(unix)]
+    {
+        ensure_private_children_unix(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_private_children_unix(path: &Path) -> io::Result<()> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let child = entry.path();
+        let metadata = std::fs::symlink_metadata(&child)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        ensure_private_directory(&child)?;
+        ensure_private_children_unix(&child)?;
+    }
+    Ok(())
+}
+
 /// Validate an existing directory against the platform's private-access policy.
 ///
 /// Unix requires a current-user-owned directory with exactly owner-only mode
