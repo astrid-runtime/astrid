@@ -6,10 +6,10 @@ import unicodedata
 
 from runatal_v1_blake3 import derive_key
 
-VOLUME_MAGIC = b"ASTVOL2\0"
-VOLUME_RECORD_MAGIC = b"ASTREG2\0"
+VOLUME_MAGIC = b"ASTVOL1\0"
+VOLUME_RECORD_MAGIC = b"ASTREG1\0"
 VOLUME_RECORD_BYTES = 75
-VOLUME_CONTEXT = "astrid volume record v2"
+VOLUME_CONTEXT = "astrid volume record v1"
 VOLUME_TRANSACTION_REGION = "system/volume-metadata-transaction"
 VOLUME_COMMIT_REGION = "system/volume-commit"
 

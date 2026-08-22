@@ -1,4 +1,4 @@
-//! Stream a known-length payload as one ASTVOL2 Write record.
+//! Stream a known-length payload as one ASTVOL1 Write record.
 //!
 //! Checksum lives in the record header. This hashes while copying, then
 //! patches the checksum slot. The on-disk grammar is unchanged.
@@ -95,7 +95,7 @@ fn append_from_inner(
         .and_then(|fixed| fixed.checked_add(u64::from(name_len)))
         .and_then(|total| total.checked_add(payload_len))
         .ok_or_else(|| io::Error::other("volume record length overflow"))?;
-    let mut hasher = blake3::Hasher::new_derive_key("astrid volume record v2");
+    let mut hasher = blake3::Hasher::new_derive_key("astrid volume record v1");
     hasher.update(&next_sequence.to_le_bytes());
     hasher.update(&[operation as u8]);
     hasher.update(&name_len.to_le_bytes());
