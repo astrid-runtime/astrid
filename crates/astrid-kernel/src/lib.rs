@@ -2858,6 +2858,16 @@ impl Kernel {
             drop(view_guard);
             // Build or refresh this principal's view from its installed set.
             self.ensure_principal_loaded(principal).await;
+            if self.capsules.read().await.get_for(principal, id).is_none()
+                && let Some((_, dir)) = self
+                    .sorted_principal_capsules(principal)
+                    .into_iter()
+                    .find(|(manifest, _)| manifest.package.name == id.as_str())
+            {
+                self.load_capsule(dir, principal)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("capsule '{id}' failed to load: {error:#}"))?;
+            }
             if self.capsules.read().await.get_for(principal, id).is_none() {
                 return Err(anyhow::anyhow!(
                     "capsule '{id}' was not found in the install directories or failed to load"

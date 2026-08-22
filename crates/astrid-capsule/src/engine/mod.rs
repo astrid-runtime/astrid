@@ -24,13 +24,10 @@ pub(crate) use static_engine::StaticEngine;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) use wasm::WasmEngine;
 
-use std::collections::HashMap;
-
 use async_trait::async_trait;
 
 use crate::context::CapsuleContext;
 use crate::error::CapsuleResult;
-use crate::manifest::{CapsuleManifest, EnvDef};
 
 /// A runtime environment capable of executing capsule logic.
 ///
@@ -166,145 +163,7 @@ pub(crate) trait ExecutionEngine: Send + Sync {
     }
 }
 
-/// Build an [`OnboardingField`] from a manifest [`EnvDef`].
-///
-/// Shared between `WasmEngine` and `McpHostEngine` so both resolve
-/// field types identically.
-pub(crate) fn build_onboarding_field(
-    key: &str,
-    def: &EnvDef,
-) -> astrid_events::ipc::OnboardingField {
-    use astrid_events::ipc::OnboardingFieldType;
-
-    let field_type = if def.env_type == "secret" {
-        if !def.enum_values.is_empty() {
-            tracing::warn!(
-                key = %key,
-                "Secret field has enum_values - ignoring enum and using masked input"
-            );
-        }
-        OnboardingFieldType::Secret
-    } else if def.env_type == "array" {
-        OnboardingFieldType::Array
-    } else if def.enum_values.len() > 1 {
-        OnboardingFieldType::Enum(def.enum_values.clone())
-    } else {
-        OnboardingFieldType::Text
-    };
-
-    let mut default = def.default.as_ref().and_then(|d| match d {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Null => None,
-        other => Some(other.to_string()),
-    });
-
-    // Single-choice enums degrade to text - auto-fill the sole valid value.
-    if def.enum_values.len() == 1 && default.is_none() {
-        default = Some(def.enum_values[0].clone());
-    }
-
-    let prompt = def
-        .request
-        .clone()
-        .unwrap_or_else(|| format!("Please enter value for {key}"));
-
-    astrid_events::ipc::OnboardingField {
-        key: key.to_string(),
-        prompt,
-        description: def.description.clone(),
-        field_type,
-        default,
-        placeholder: def.placeholder.clone(),
-    }
-}
-
-/// Resolve manifest `[env]` entries against the KV store.
-///
-/// Returns `Ok(resolved_env)` if all required values are satisfied (from KV
-/// or defaults). Returns `Err` if any fields need onboarding, after
-/// publishing `OnboardingRequired` on the event bus.
-pub(crate) async fn resolve_env(
-    manifest: &CapsuleManifest,
-    ctx: &CapsuleContext,
-    reserved_keys: &[String],
-    source: &str,
-) -> CapsuleResult<HashMap<String, String>> {
-    let mut resolved = HashMap::new();
-    let mut onboarding_fields = Vec::new();
-
-    for (key, def) in &manifest.env {
-        if reserved_keys.iter().any(|k| k == key) {
-            tracing::warn!(
-                capsule = %manifest.package.name,
-                key = %key,
-                "Capsule manifest [env] declares reserved key - ignoring"
-            );
-            continue;
-        }
-
-        if let Ok(Some(val_bytes)) = ctx.kv.get(key).await {
-            match String::from_utf8(val_bytes) {
-                Ok(val) => {
-                    resolved.insert(key.clone(), val);
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        capsule = %manifest.package.name,
-                        key = %key,
-                        error = %e,
-                        "Value from KV store is not valid UTF-8; requiring onboarding"
-                    );
-                    onboarding_fields.push(build_onboarding_field(key, def));
-                },
-            }
-        } else if def.enum_values.len() > 1 {
-            // Multi-choice enum fields always go through onboarding.
-            onboarding_fields.push(build_onboarding_field(key, def));
-        } else if let Some(default_val) = &def.default {
-            let val = match default_val {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Null => String::new(),
-                other => other.to_string(),
-            };
-            resolved.insert(key.clone(), val);
-        } else {
-            onboarding_fields.push(build_onboarding_field(key, def));
-        }
-    }
-
-    if !onboarding_fields.is_empty() {
-        let missing_display: String = onboarding_fields
-            .iter()
-            .map(|f| f.key.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        tracing::warn!(
-            capsule = %manifest.package.name,
-            missing = %missing_display,
-            "Capsule has unconfigured env fields — not starting until configured"
-        );
-
-        let msg = astrid_events::ipc::IpcMessage::new(
-            astrid_events::ipc::Topic::from_raw("astrid.v1.onboarding.required"),
-            astrid_events::ipc::IpcPayload::OnboardingRequired {
-                capsule_id: manifest.package.name.clone(),
-                fields: onboarding_fields,
-            },
-            uuid::Uuid::nil(),
-        )
-        .with_principal(ctx.principal.to_string());
-        let _ = ctx.event_bus.publish(astrid_events::AstridEvent::Ipc {
-            metadata: astrid_events::EventMetadata::new(source),
-            message: msg,
-        });
-        return Err(astrid_capsule_types::CapsuleError::ExecutionFailed(
-            format!(
-                "capsule '{}' is not configured ({missing_display})",
-                manifest.package.name
-            ),
-        ));
-    }
-
-    Ok(resolved)
-}
+mod env;
+#[cfg(test)]
+pub(crate) use env::build_onboarding_field;
+pub(crate) use env::resolve_env;
