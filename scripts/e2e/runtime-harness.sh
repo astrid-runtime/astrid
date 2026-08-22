@@ -385,6 +385,10 @@ default_timeout_secs = 5
 stream_connect_timeout_secs = 5
 stream_read_timeout_secs = 3
 header_deadline_secs = 5
+[rate_limits]
+# Core-set live install sends one ReloadCapsule per capsule (currently 7).
+# Pin the operator knob so a silent 5/min cap cannot fail openai-compat.
+capsule_reload_per_min = 14
 [security.capsule_local_egress]
 "astrid-capsule-openai-compat" = ["127.0.0.1:$fake_port"]
 "openai-compat" = ["127.0.0.1:$fake_port"]
