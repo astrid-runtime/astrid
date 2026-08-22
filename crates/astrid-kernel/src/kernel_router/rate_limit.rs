@@ -38,12 +38,12 @@ struct RateLimitKey {
 pub(crate) struct ManagementRateLimiter {
     buckets: HashMap<RateLimitKey, VecDeque<Instant>>,
     last_global_prune: Instant,
-    // Read by from_kernel/limit_for. spawn_kernel_router still uses new()
-    // plus the 1-arg rate_limit_for_request default until that wiring lands.
+    // Operator knobs. spawn_kernel_router loads them via from_kernel + limit_for.
     limits: RateLimitsConfig,
 }
 
 impl ManagementRateLimiter {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::with_limits(RateLimitsConfig::default())
     }
@@ -59,10 +59,6 @@ impl ManagementRateLimiter {
     /// Load operator rate-limit knobs from the kernel home. Invalid or
     /// missing config falls back to the derived core-set default, not a
     /// silent `5/min` cap.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "operator-knob handle for spawn_kernel_router")
-    )]
     pub(crate) fn from_kernel(kernel: &crate::Kernel) -> Self {
         let limits = astrid_config::Config::load_with_home_and_layout(
             Some(&kernel.workspace_root),
@@ -83,10 +79,6 @@ impl ManagementRateLimiter {
     }
 
     /// Look up the per-method cap using this limiter's operator knobs.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "operator-knob handle for spawn_kernel_router")
-    )]
     pub(crate) fn limit_for(&self, req: &KernelRequest) -> (&'static str, Option<u32>) {
         rate_limit_for_request_with_limits(req, &self.limits)
     }
@@ -150,9 +142,10 @@ impl ManagementRateLimiter {
 /// Return the rate limit label and max-per-minute for a request type.
 /// Returns `None` for the limit if the request type is not rate-limited.
 ///
-/// Uses the derived core-set default. The router still calls this 1-arg
-/// form; wire [`ManagementRateLimiter::from_kernel`] plus [`ManagementRateLimiter::limit_for`]
-/// so a non-default `[rate_limits].capsule_reload_per_min` is honored.
+/// Uses the derived core-set default. Production dispatch uses
+/// [`ManagementRateLimiter::limit_for`] so a non-default
+/// `[rate_limits].capsule_reload_per_min` is honored.
+#[cfg(test)]
 pub(crate) fn rate_limit_for_request(req: &KernelRequest) -> (&'static str, Option<u32>) {
     rate_limit_for_request_with_limits(req, &RateLimitsConfig::default())
 }

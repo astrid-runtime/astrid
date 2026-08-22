@@ -14,7 +14,9 @@ mod rate_limit;
 mod response;
 mod visibility;
 
-pub(crate) use rate_limit::{ManagementRateLimiter, rate_limit_for_request};
+pub(crate) use rate_limit::ManagementRateLimiter;
+#[cfg(test)]
+pub(crate) use rate_limit::rate_limit_for_request;
 pub(crate) use response::{KeepalivePinger, publish_response, workspace_commit_response};
 
 use std::sync::Arc;
@@ -77,7 +79,7 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> astrid_runtime:
         .subscribe_topic_as("astrid.v1.request.*", "kernel_router");
 
     astrid_runtime::spawn(async move {
-        let mut rate_limiter = ManagementRateLimiter::new();
+        let mut rate_limiter = ManagementRateLimiter::from_kernel(&kernel);
 
         while let Some(event) = receiver.recv().await {
             let astrid_events::AstridEvent::Ipc { message, .. } = &*event else {
@@ -216,7 +218,7 @@ async fn handle_request(
     let authorization_proof = AuthorizationProof::System {
         reason: format!("policy allow: {caller} holds {required_cap}"),
     };
-    let (rate_method, limit) = rate_limit_for_request(&req);
+    let (rate_method, limit) = rate_limiter.limit_for(&req);
     if let Some(max) = limit
         && !rate_limiter.check(&caller, rate_method, max)
     {
