@@ -155,7 +155,7 @@ impl AuditLog {
         path: impl AsRef<Path>,
         runtime_key: impl Into<Arc<KeyPair>>,
     ) -> AuditResult<Self> {
-        let storage = KvAuditStorage::open_legacy_source(path)?;
+        let storage = KvAuditStorage::open_legacy_source_writable(path)?;
         Ok(Self {
             storage: Box::new(storage),
             runtime_key: runtime_key.into(),

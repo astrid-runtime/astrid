@@ -1108,6 +1108,8 @@ impl Kernel {
             // barrier before identity bootstrap can mutate the default
             // profile. The durable directory loaded above already contains
             // every released principal needed by the importers.
+            // Migrate-only until this returns: no audit_sink, dispatcher,
+            // router, or listen. The CLI socket is bound but not accepted.
             if let Some(layout_origin) = layout_origin {
                 legacy_migration_barrier::run(
                     &home,
