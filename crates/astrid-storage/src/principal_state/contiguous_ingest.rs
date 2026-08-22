@@ -79,6 +79,9 @@ impl RuntimePrincipalStore {
             .map_err(|error| {
                 StorageError::Internal(format!("publish contiguous catalog batch: {error}"))
             })?;
+        self.engine.flush().map_err(|error| {
+            StorageError::Connection(format!("flush contiguous catalog batch: {error}"))
+        })?;
         Ok(())
     }
 }
