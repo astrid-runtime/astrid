@@ -11,6 +11,8 @@ use std::path::Path;
 use std::sync::Arc;
 mod append;
 mod append_batch;
+pub(crate) mod blind_move;
+mod census;
 mod global;
 mod helpers;
 mod key_types;
@@ -36,6 +38,10 @@ use system::AuditSystemNamespace;
 #[async_trait]
 pub(crate) trait AuditStorage: Send + Sync {
     async fn store(&self, entry: &AuditEntry) -> AuditResult<()>;
+
+    fn as_kv_audit_storage(&self) -> Option<&KvAuditStorage> {
+        None
+    }
 
     async fn append_if_head(
         &self,
@@ -152,6 +158,7 @@ pub(crate) trait AuditStorage: Send + Sync {
             .collect())
     }
 
+    #[allow(dead_code, reason = "paged dest observer after blind MOVE")]
     async fn all_entries_page(
         &self,
         after: Option<&str>,
@@ -196,6 +203,10 @@ pub(crate) trait AuditStorage: Send + Sync {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "O(1) committed lookup retained for dest resume tests"
+    )]
     async fn is_entry_committed(&self, _id: &AuditEntryId) -> AuditResult<bool> {
         Ok(false)
     }
@@ -315,6 +326,10 @@ impl KvAuditStorage {
         })
     }
 
+    pub(crate) fn kv_store(&self) -> &Arc<dyn KvStore> {
+        &self.store
+    }
+
     #[cfg(test)]
     pub(crate) async fn test_set_legacy_session_index(
         &self,
@@ -338,8 +353,7 @@ impl KvAuditStorage {
             .await
             .map_err(|e| AuditError::StorageError(e.to_string()))?;
         match data {
-            Some(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|e| AuditError::SerializationError(e.to_string())),
+            Some(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_default()),
             None => Ok(Vec::new()),
         }
     }
@@ -556,6 +570,11 @@ impl AuditStorage for KvAuditStorage {
             .collect())
     }
 
+    fn as_kv_audit_storage(&self) -> Option<&KvAuditStorage> {
+        Some(self)
+    }
+
+    #[allow(dead_code, reason = "paged dest observer after blind MOVE")]
     async fn all_entries_page(
         &self,
         after: Option<&str>,
@@ -899,78 +918,15 @@ impl AuditStorage for KvAuditStorage {
     }
 
     async fn count(&self) -> AuditResult<usize> {
-        let mut count = 0usize;
-        for session in self.list_sessions().await? {
-            count = count.saturating_add(self.count_session(&session).await?);
-        }
-        Ok(count)
+        self.record_count().await
     }
 
     async fn count_session(&self, session_id: &SessionId) -> AuditResult<usize> {
-        let session_key = session_id.0.to_string();
-        let mut keys = self
-            .store
-            .list_keys_with_prefix(NS_CHAIN_METADATA, &format!("{session_key}:"))
-            .await
-            .map_err(|e| AuditError::StorageError(e.to_string()))?;
-        if self
-            .store
-            .exists(NS_CHAIN_METADATA, &session_key)
-            .await
-            .map_err(|e| AuditError::StorageError(e.to_string()))?
-        {
-            keys.push(session_key);
-        }
-        if keys.is_empty() {
-            return Ok(self.get_session_entry_ids(session_id).await?.len());
-        }
-        let mut total = 0usize;
-        for key in keys {
-            let bytes = self
-                .store
-                .get(NS_CHAIN_METADATA, &key)
-                .await
-                .map_err(|e| AuditError::StorageError(e.to_string()))?
-                .ok_or_else(|| {
-                    AuditError::StorageError("audit chain metadata disappeared".into())
-                })?;
-            let metadata: ChainMetadata = serde_json::from_slice(&bytes)
-                .map_err(|e| AuditError::SerializationError(e.to_string()))?;
-            total = total.saturating_add(usize::try_from(metadata.count).unwrap_or(usize::MAX));
-        }
-        Ok(total)
+        self.session_record_count(session_id).await
     }
 
     async fn list_sessions(&self) -> AuditResult<Vec<SessionId>> {
-        let legacy_keys = self
-            .store
-            .list_keys(NS_SESSION_INDEX)
-            .await
-            .map_err(|e| AuditError::StorageError(e.to_string()))?;
-
-        let new_keys = self
-            .store
-            .list_keys(NS_SESSION_ENTRIES)
-            .await
-            .map_err(|e| AuditError::StorageError(e.to_string()))?;
-
-        let mut sessions = HashSet::new();
-        for key in legacy_keys {
-            if let Ok(uuid) = uuid::Uuid::parse_str(&key) {
-                sessions.insert(SessionId::from_uuid(uuid));
-            }
-        }
-        for key in new_keys {
-            if let Some(session) = key.split(':').next()
-                && let Ok(uuid) = uuid::Uuid::parse_str(session)
-            {
-                sessions.insert(SessionId::from_uuid(uuid));
-            }
-        }
-
-        let mut sessions: Vec<_> = sessions.into_iter().collect();
-        sessions.sort_by_key(|session| session.0);
-        Ok(sessions)
+        self.session_ids().await
     }
 
     async fn flush(&self) -> AuditResult<()> {

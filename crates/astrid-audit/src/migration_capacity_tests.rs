@@ -439,6 +439,12 @@ async fn legacy_move_does_not_recertify_historical_signatures() {
         .expect("historical bytes move without signature recertification");
     assert_eq!(report.source_entries, 2);
     assert_eq!(report.imported_entries, 2);
+    let page = destination
+        .storage()
+        .all_entries_page(None, 10)
+        .await
+        .expect("page dest entries without recertify");
+    assert_eq!(page.len(), 2);
 }
 
 #[tokio::test]
@@ -459,4 +465,155 @@ async fn legacy_move_fails_closed_when_destination_cannot_reopen() {
         .expect_err("move must fail closed without a reopenable destination");
     assert!(error.to_string().contains("cannot be reopened"));
     assert_eq!(destination.count().await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn legacy_move_refuses_nonempty_destination() {
+    let directory = tempfile::tempdir().expect("temporary legacy directory");
+    let path = directory.path().join("audit-db");
+    let key = std::sync::Arc::new(astrid_crypto::KeyPair::generate());
+    let session = SessionId::new();
+    let source =
+        AuditLog::open_legacy_source(&path, std::sync::Arc::clone(&key)).expect("open source");
+    append_test_entries(&source, &session, 1).await;
+    source.close().await.expect("close source");
+
+    let destination_backend: std::sync::Arc<dyn KvStore> =
+        std::sync::Arc::new(astrid_storage::MemoryKvStore::new());
+    let destination = AuditLog::open_with_kv_store_and_capacity(
+        std::sync::Arc::clone(&destination_backend),
+        std::sync::Arc::clone(&key),
+        Some(std::sync::Arc::new(FixedAuditCapacity(Some(u64::MAX)))),
+    )
+    .expect("open destination");
+    append_test_entries(&destination, &session, 1).await;
+    let error = destination
+        .import_legacy_audit(&path, "test-system-audit")
+        .await
+        .expect_err("occupied destination must fail closed");
+    assert!(error.to_string().contains("not empty"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "local frozen Surreal copy; set ASTRID_AUDIT_MOVE_SRC"]
+async fn local_blind_move_onto_volume() {
+    use astrid_core::dirs::AstridHome;
+    use astrid_storage::{KvQuotaResolver, StateOwner, open_runtime_principal_store};
+    use std::time::Instant;
+
+    let source = std::env::var("ASTRID_AUDIT_MOVE_SRC").expect("ASTRID_AUDIT_MOVE_SRC");
+    let dest_root = std::env::var("ASTRID_AUDIT_MOVE_DEST")
+        .unwrap_or_else(|_| "/private/tmp/astrid-audit-blind-dest".to_owned());
+    let _ = std::fs::remove_dir_all(&dest_root);
+    std::fs::create_dir_all(&dest_root).expect("dest root");
+    let home = AstridHome::from_path(&dest_root);
+    home.ensure().expect("ensure throwaway home");
+
+    let quota: std::sync::Arc<dyn KvQuotaResolver<StateOwner>> =
+        std::sync::Arc::new(|owner: &StateOwner| {
+            Ok(match owner {
+                StateOwner::System => None,
+                StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+            })
+        });
+    let store = open_runtime_principal_store(&home, quota)
+        .await
+        .expect("open throwaway principal store");
+    let audit_store = store
+        .system_control_kv("audit")
+        .expect("audit projection")
+        .backend();
+    let key = std::sync::Arc::new(KeyPair::generate());
+    let destination = AuditLog::open_with_kv_store_and_capacity(
+        audit_store,
+        key,
+        Some(std::sync::Arc::new(FixedAuditCapacity(Some(u64::MAX)))),
+    )
+    .expect("open dest audit");
+
+    let started = Instant::now();
+    let report = destination
+        .import_legacy_audit(&source, "astrid-system-audit-v1")
+        .await
+        .expect("blind MOVE");
+    let elapsed = started.elapsed();
+    destination.flush().await.expect("flush dest");
+    store.kv().close().await.expect("close store");
+
+    let report_path = std::path::Path::new("/private/tmp/astrid-audit-blind-move-report.txt");
+    let body = format!(
+        "source={source}\n dest={dest_root}\n entries={}\n imported={}\n digest={}\n elapsed_ms={}\n",
+        report.source_entries,
+        report.imported_entries,
+        report.source_digest,
+        elapsed.as_millis()
+    );
+    std::fs::write(report_path, body).expect("write report");
+    assert_eq!(report.source_entries, report.imported_entries);
+    assert!(report.imported_entries > 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "reopen throwaway volume dest from local_blind_move_onto_volume"]
+async fn local_blind_move_reopen_and_append() {
+    use astrid_core::dirs::AstridHome;
+    use astrid_storage::{KvQuotaResolver, StateOwner, open_runtime_principal_store};
+
+    let dest_root = std::env::var("ASTRID_AUDIT_MOVE_DEST")
+        .unwrap_or_else(|_| "/private/tmp/astrid-audit-blind-dest2".to_owned());
+    let home = AstridHome::from_path(&dest_root);
+    let quota: std::sync::Arc<dyn KvQuotaResolver<StateOwner>> =
+        std::sync::Arc::new(|owner: &StateOwner| {
+            Ok(match owner {
+                StateOwner::System => None,
+                StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+            })
+        });
+    let store = open_runtime_principal_store(&home, quota)
+        .await
+        .expect("reopen throwaway principal store");
+    let audit_store = store
+        .system_control_kv("audit")
+        .expect("audit projection")
+        .backend();
+    let key = std::sync::Arc::new(KeyPair::generate());
+    let log = AuditLog::open_with_kv_store_and_capacity(
+        std::sync::Arc::clone(&audit_store),
+        std::sync::Arc::clone(&key),
+        Some(std::sync::Arc::new(FixedAuditCapacity(Some(u64::MAX)))),
+    )
+    .expect("reopen dest audit");
+    let before = log.count().await.expect("count after MOVE");
+    assert_eq!(before, 250_282, "reopen must see the moved entries");
+    let session = SessionId::new();
+    let id = log
+        .append(
+            session.clone(),
+            AuditAction::McpToolCall {
+                server: "test".to_owned(),
+                tool: "post-move".to_owned(),
+                args_hash: ContentHash::zero(),
+            },
+            AuthorizationProof::NotRequired {
+                reason: "post-move".to_owned(),
+            },
+            AuditOutcome::success(),
+        )
+        .await
+        .expect("append after MOVE");
+    log.flush().await.expect("flush append");
+    let after = log.count().await.expect("count after append");
+    assert_eq!(after, before + 1);
+    drop(log);
+    let reopened = AuditLog::open_with_kv_store(audit_store, key).expect("second reopen");
+    assert_eq!(reopened.count().await.expect("reopen count"), after);
+    assert!(
+        reopened
+            .storage()
+            .get(&id)
+            .await
+            .expect("load appended")
+            .is_some()
+    );
+    store.kv().close().await.expect("close store");
 }
