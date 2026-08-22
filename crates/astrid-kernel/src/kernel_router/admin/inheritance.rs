@@ -186,6 +186,30 @@ async fn copy_capsule_state(
     errors
 }
 
+/// Copy only non-secret host-control env for capsules newly assigned to a
+/// principal. Capsule package assignment uses the default principal as the
+/// trusted install source, but secrets remain principal-owned and are never
+/// copied by this path.
+pub(super) async fn copy_non_secret_env_from_principal(
+    kernel: &Arc<crate::Kernel>,
+    source: &PrincipalId,
+    principal: &PrincipalId,
+    capsules: &[String],
+) -> Result<(), String> {
+    let mut capsule_ids = Vec::with_capacity(capsules.len());
+    for name in capsules {
+        let id = astrid_capsule::capsule::CapsuleId::new(name.clone())
+            .map_err(|error| format!("invalid capsule id '{name}': {error}"))?;
+        capsule_ids.push(id);
+    }
+    let (_, errors) = copy_env_namespaces(kernel, source, principal, &capsule_ids).await;
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 async fn copy_env_namespaces(
     kernel: &Arc<crate::Kernel>,
     source: &PrincipalId,

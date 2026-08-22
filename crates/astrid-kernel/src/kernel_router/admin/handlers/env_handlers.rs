@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use astrid_capsule::capsule::CapsuleId;
 use astrid_core::principal::PrincipalId;
 use astrid_events::kernel_api::{AdminResponseBody, EnvEntry, EnvStorageScope, EnvValueKind};
 
@@ -63,6 +64,43 @@ pub(super) struct EnvSetRequest {
     pub(super) append: bool,
 }
 
+/// Refresh only the target principal's runtime after a durable env mutation.
+///
+/// A principal that has not loaded this capsule yet has no stale in-memory
+/// state to repair; its next load reads the newly persisted control value.
+/// Once a runtime is live, however, a failed refresh must be visible to the
+/// caller rather than returning success while the old configuration remains
+/// active.
+async fn reload_after_env_change(
+    kernel: &Arc<Kernel>,
+    principal: &PrincipalId,
+    capsule: &str,
+) -> Result<(), String> {
+    let id = CapsuleId::new(capsule.to_owned())
+        .map_err(|error| format!("invalid capsule id: {error}"))?;
+    let was_loaded = kernel
+        .capsules
+        .read()
+        .await
+        .get_for(principal, &id)
+        .is_some();
+    match kernel.reload_one_capsule(&id, principal).await {
+        Ok(()) => Ok(()),
+        Err(error) if !was_loaded => {
+            tracing::debug!(
+                %principal,
+                capsule = %id,
+                error = %error,
+                "environment changed before capsule was loaded; next load will use the new value"
+            );
+            Ok(())
+        },
+        Err(error) => Err(format!(
+            "reload of capsule '{id}' for principal '{principal}' failed: {error:#}"
+        )),
+    }
+}
+
 pub(super) async fn env_set(kernel: &Arc<Kernel>, request: EnvSetRequest) -> AdminResponseBody {
     let EnvSetRequest {
         principal,
@@ -83,6 +121,7 @@ pub(super) async fn env_set(kernel: &Arc<Kernel>, request: EnvSetRequest) -> Adm
     if value.len() > limit {
         return AdminResponseBody::Error(format!("environment value exceeds {limit}-byte limit"));
     }
+    let _guard = kernel.admin_write_lock.lock().await;
     let scope_store = match env_scope(kernel, &principal, &capsule, kind, scope) {
         Ok(store) => store,
         Err(error) => return AdminResponseBody::Error(error),
@@ -107,7 +146,10 @@ pub(super) async fn env_set(kernel: &Arc<Kernel>, request: EnvSetRequest) -> Adm
         },
     };
     match result {
-        Ok(()) => AdminResponseBody::Success(serde_json::json!({"stored": true})),
+        Ok(()) => match reload_after_env_change(kernel, &principal, &capsule).await {
+            Ok(()) => AdminResponseBody::Success(serde_json::json!({"stored": true})),
+            Err(error) => AdminResponseBody::Error(error),
+        },
         Err(error) => AdminResponseBody::Error(error),
     }
 }
@@ -123,6 +165,7 @@ pub(super) async fn env_delete(
     if let Err(error) = validate_env_request(&capsule, &key, kind) {
         return AdminResponseBody::Error(error);
     }
+    let _guard = kernel.admin_write_lock.lock().await;
     let scope_store = match env_scope(kernel, &principal, &capsule, kind, scope) {
         Ok(store) => store,
         Err(error) => return AdminResponseBody::Error(error),
@@ -138,7 +181,10 @@ pub(super) async fn env_delete(
         },
     };
     match deleted {
-        Ok(deleted) => AdminResponseBody::Success(serde_json::json!({"deleted": deleted})),
+        Ok(deleted) => match reload_after_env_change(kernel, &principal, &capsule).await {
+            Ok(()) => AdminResponseBody::Success(serde_json::json!({"deleted": deleted})),
+            Err(error) => AdminResponseBody::Error(error),
+        },
         Err(error) => AdminResponseBody::Error(error),
     }
 }
