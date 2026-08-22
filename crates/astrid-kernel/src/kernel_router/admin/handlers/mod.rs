@@ -39,6 +39,7 @@ use tracing::{info, warn};
 use crate::kernel_router::AuthorizedRequest;
 
 mod env_handlers;
+use super::inheritance::copy_modify_env;
 use env_handlers::{EnvSetRequest, env_delete, env_list, env_set};
 
 /// Platform label used by the identity store for agent principals
@@ -575,7 +576,6 @@ async fn agent_modify_from_req(
         kernel.profile_cache.invalidate(&principal);
         return modify_response(&principal, &profile, false);
     }
-
     // Validate before saving: re-runs the profile invariants (group
     // names match groups.toml, grants/revokes still well-formed, capsule
     // grants well-formed, etc.). Without this an operator could
@@ -589,18 +589,8 @@ async fn agent_modify_from_req(
     {
         return err_bad_input(e);
     }
-    if capsules_changed
-        && let Err(e) = super::inheritance::copy_non_secret_env_from_principal(
-            kernel,
-            &PrincipalId::default(),
-            &principal,
-            &add_capsules,
-        )
-        .await
-    {
-        return err_internal(format!(
-            "copy default capsule environment for {principal} failed: {e}"
-        ));
+    if capsules_changed && let Err(e) = copy_modify_env(kernel, &principal, &add_capsules).await {
+        return err_internal(e);
     }
     if let Err(e) = profile.save_to_path(&path) {
         return err_profile(&principal, &e);
@@ -609,7 +599,6 @@ async fn agent_modify_from_req(
     if capsules_changed {
         warm_principal_capsules(kernel, principal.clone());
     }
-
     info!(
         %principal,
         added_groups = ?add_groups,
