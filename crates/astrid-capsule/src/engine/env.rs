@@ -63,9 +63,12 @@ pub(crate) fn build_onboarding_field(
 
 /// Read one staged install value from the host-only control projection.
 ///
-/// Secrets use `principal-uid:{uid}:control:secret:{capsule}` / `__secret:`.
-/// Text uses `principal-uid:{uid}:control:env:{capsule}` / `__env:`. Neither
-/// namespace is the guest `{principal}:capsule:{id}` store.
+/// Principal control namespaces are tried first:
+/// `principal-uid:{uid}:control:secret:{capsule}` / `__secret:` and
+/// `principal-uid:{uid}:control:env:{capsule}` / `__env:`. Missing values
+/// fall back to the Shared site credential in `system:control:secret:{capsule}`
+/// / `system:control:env:{capsule}`. Guest `{principal}:capsule:{id}` keys
+/// never satisfy this lookup.
 async fn host_control_env_value(
     ctx: &CapsuleContext,
     capsule: &str,
@@ -74,21 +77,44 @@ async fn host_control_env_value(
 ) -> Option<String> {
     let uid = ctx.principal_directory.uid_for(&ctx.principal).ok()?;
     let backend = ctx.kv.backend();
-    let result = if def.env_type.eq_ignore_ascii_case("secret") {
-        let store = astrid_storage::env::principal_secret_store(backend, uid, capsule).ok()?;
+    let is_secret = def.env_type.eq_ignore_ascii_case("secret");
+    let principal = if is_secret {
+        let store =
+            astrid_storage::env::principal_secret_store(backend.clone(), uid, capsule).ok()?;
         astrid_storage::env::get_secret(&store, key).await
     } else {
-        let store = astrid_storage::env::principal_env_store(backend, uid, capsule).ok()?;
+        let store = astrid_storage::env::principal_env_store(backend.clone(), uid, capsule).ok()?;
         astrid_storage::env::get_env(&store, key).await
     };
-    match result {
+    match principal {
+        Ok(Some(value)) => return Some(value),
+        Ok(None) => {},
+        Err(error) => {
+            tracing::warn!(
+                capsule,
+                key,
+                error = %error,
+                "principal host control environment value could not be read; requiring onboarding"
+            );
+            return None;
+        },
+    }
+
+    let shared = if is_secret {
+        let store = astrid_storage::env::system_secret_store(backend, capsule).ok()?;
+        astrid_storage::env::get_secret(&store, key).await
+    } else {
+        let store = astrid_storage::env::system_env_store(backend, capsule).ok()?;
+        astrid_storage::env::get_env(&store, key).await
+    };
+    match shared {
         Ok(value) => value,
         Err(error) => {
             tracing::warn!(
                 capsule,
                 key,
                 error = %error,
-                "host control environment value could not be read; requiring onboarding"
+                "shared host control environment value could not be read; requiring onboarding"
             );
             None
         },
@@ -208,9 +234,18 @@ type = "string"
         directory: PrincipalDirectory,
         guest_namespace: &str,
     ) -> CapsuleContext {
+        context_for_principal(backend, directory, PrincipalId::default(), guest_namespace)
+    }
+
+    fn context_for_principal(
+        backend: Arc<dyn astrid_storage::KvStore>,
+        directory: PrincipalDirectory,
+        principal: PrincipalId,
+        guest_namespace: &str,
+    ) -> CapsuleContext {
         let kv = ScopedKvStore::new(backend, guest_namespace).expect("guest namespace");
         CapsuleContext::new(
-            PrincipalId::default(),
+            principal,
             std::path::PathBuf::from("/"),
             None,
             kv,
@@ -328,5 +363,105 @@ type = "string"
             .expect_err("missing api_key must onboarding");
         let msg = err.to_string();
         assert!(msg.contains("api_key"), "got {msg}");
+    }
+
+    #[tokio::test]
+    async fn new_principal_resolves_shared_install_secret() {
+        let backend = Arc::new(MemoryKvStore::new());
+        let assigned = PrincipalId::new("assigned-agent").unwrap();
+        let assigned_uid = uid("assigned-agent");
+        let directory = PrincipalDirectory::default();
+        directory.register(assigned.clone(), assigned_uid).unwrap();
+
+        let shared_secret = astrid_storage::env::system_secret_store(
+            backend.clone(),
+            "astrid-capsule-openai-compat",
+        )
+        .unwrap();
+        shared_secret
+            .set(&format!("{SECRET_KEY_PREFIX}api_key"), b"sk-site".to_vec())
+            .await
+            .unwrap();
+        let assigned_env = astrid_storage::env::principal_env_store(
+            backend.clone(),
+            assigned_uid,
+            "astrid-capsule-openai-compat",
+        )
+        .unwrap();
+        set_env(&assigned_env, "temperature", "0.7").await.unwrap();
+        let assigned_secret = astrid_storage::env::principal_secret_store(
+            backend.clone(),
+            assigned_uid,
+            "astrid-capsule-openai-compat",
+        )
+        .unwrap();
+        assert!(
+            assigned_secret
+                .get(&format!("{SECRET_KEY_PREFIX}api_key"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let ctx = context_for_principal(
+            backend,
+            directory,
+            assigned.clone(),
+            &format!("{assigned}:capsule:astrid-capsule-openai-compat"),
+        );
+        let resolved = resolve_env(&openai_compat_manifest(), &ctx, &[], "test")
+            .await
+            .expect("shared install secret must satisfy a principal with no Agent api_key");
+        assert_eq!(resolved.get("api_key").map(String::as_str), Some("sk-site"));
+        assert_eq!(resolved.get("temperature").map(String::as_str), Some("0.7"));
+    }
+
+    #[tokio::test]
+    async fn agent_secret_overrides_shared_install_secret() {
+        let backend = Arc::new(MemoryKvStore::new());
+        let principal = PrincipalId::default();
+        let uid = uid("default");
+        let directory = PrincipalDirectory::default();
+        directory.register(principal.clone(), uid).unwrap();
+
+        let shared_secret = astrid_storage::env::system_secret_store(
+            backend.clone(),
+            "astrid-capsule-openai-compat",
+        )
+        .unwrap();
+        shared_secret
+            .set(&format!("{SECRET_KEY_PREFIX}api_key"), b"sk-site".to_vec())
+            .await
+            .unwrap();
+        let agent_secret = astrid_storage::env::principal_secret_store(
+            backend.clone(),
+            uid,
+            "astrid-capsule-openai-compat",
+        )
+        .unwrap();
+        agent_secret
+            .set(&format!("{SECRET_KEY_PREFIX}api_key"), b"sk-agent".to_vec())
+            .await
+            .unwrap();
+        let env_store = astrid_storage::env::principal_env_store(
+            backend.clone(),
+            uid,
+            "astrid-capsule-openai-compat",
+        )
+        .unwrap();
+        set_env(&env_store, "temperature", "0.2").await.unwrap();
+
+        let ctx = context_with_directory(
+            backend,
+            directory,
+            &format!("{principal}:capsule:astrid-capsule-openai-compat"),
+        );
+        let resolved = resolve_env(&openai_compat_manifest(), &ctx, &[], "test")
+            .await
+            .expect("agent secret must win over shared");
+        assert_eq!(
+            resolved.get("api_key").map(String::as_str),
+            Some("sk-agent")
+        );
     }
 }

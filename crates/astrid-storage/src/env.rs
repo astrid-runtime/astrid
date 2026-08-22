@@ -159,6 +159,18 @@ pub fn system_env_store(backend: Arc<dyn KvStore>, capsule: &str) -> StorageResu
     ScopedKvStore::new(backend, system_capsule_namespace(capsule))
 }
 
+/// Create a host-only scoped view for one host/system capsule secret.
+///
+/// # Errors
+///
+/// Returns a storage error when the namespace is invalid.
+pub fn system_secret_store(
+    backend: Arc<dyn KvStore>,
+    capsule: &str,
+) -> StorageResult<ScopedKvStore> {
+    ScopedKvStore::new(backend, system_secret_namespace(capsule))
+}
+
 /// Read all non-secret environment fields from one typed scope.
 ///
 /// # Errors

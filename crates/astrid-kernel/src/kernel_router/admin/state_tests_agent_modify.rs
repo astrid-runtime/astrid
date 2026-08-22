@@ -19,6 +19,7 @@ use astrid_core::profile::PrincipalProfile;
 use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody};
 use astrid_storage::env::{
     SECRET_KEY_PREFIX, get_env, principal_env_store, principal_secret_store, set_env,
+    system_secret_store,
 };
 use tempfile::TempDir;
 
@@ -532,6 +533,14 @@ async fn assigning_capsule_copies_non_secret_install_env_only() {
         )
         .await
         .unwrap();
+    let shared_secret = system_secret_store(Arc::clone(&kernel.kv), capsule).unwrap();
+    shared_secret
+        .set(
+            &format!("{SECRET_KEY_PREFIX}api_key"),
+            b"site-secret-must-not-copy".to_vec(),
+        )
+        .await
+        .unwrap();
 
     let principal = pid("assigned-agent");
     let created = handlers::dispatch(
@@ -582,4 +591,75 @@ async fn assigning_capsule_copies_non_secret_install_env_only() {
             .is_none(),
         "assignment must not copy source secrets"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn env_set_unloaded_capsule_accepts_sequential_writes() {
+    let (_dir, kernel) = fixture().await;
+    let capsule = "sequential-env";
+    let dir = kernel
+        .astrid_home
+        .run_dir()
+        .join("test-install-sources")
+        .join(capsule);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Capsule.toml"),
+        format!(
+            "[package]\nname = \"{capsule}\"\nversion = \"1.0.0\"\n\n[env.base_url]\ntype = \"string\"\n\n[env.model]\ntype = \"string\"\n"
+        ),
+    )
+    .unwrap();
+    let home = kernel.astrid_home.clone();
+    let storage = kernel
+        .principal_store
+        .as_ref()
+        .map(|store| Arc::new(store.clone()));
+    let source = PrincipalId::default();
+    std::thread::spawn(move || {
+        astrid_capsule_install::install_from_local_path_for_principal(
+            &dir,
+            &home,
+            astrid_capsule_install::InstallOptions {
+                storage,
+                ..Default::default()
+            },
+            &source,
+        )
+    })
+    .join()
+    .unwrap()
+    .unwrap();
+
+    let principal = PrincipalId::default();
+    let first = handlers::dispatch(
+        &kernel,
+        &principal,
+        AdminRequestKind::EnvSet {
+            principal: principal.clone(),
+            capsule: capsule.into(),
+            key: "base_url".into(),
+            value: "https://example.test".into(),
+            kind: astrid_events::kernel_api::EnvValueKind::Text,
+            scope: astrid_events::kernel_api::EnvStorageScope::Agent,
+            append: false,
+        },
+    )
+    .await;
+    assert_success(&first);
+    let second = handlers::dispatch(
+        &kernel,
+        &principal,
+        AdminRequestKind::EnvSet {
+            principal: principal.clone(),
+            capsule: capsule.into(),
+            key: "model".into(),
+            value: "gpt-test".into(),
+            kind: astrid_events::kernel_api::EnvValueKind::Text,
+            scope: astrid_events::kernel_api::EnvStorageScope::Agent,
+            append: false,
+        },
+    )
+    .await;
+    assert_success(&second);
 }
