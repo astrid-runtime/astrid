@@ -406,3 +406,45 @@ file = "missing.wasm"
             .exists()
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reload_capsule_preserves_inner_not_configured_error() {
+    let (_dir, kernel) = fixture().await;
+    let source = PrincipalId::default();
+    let install = kernel
+        .astrid_home
+        .run_dir()
+        .join("test-install-sources/openai-compat-reload");
+    std::fs::create_dir_all(&install).unwrap();
+    std::fs::write(
+        install.join("Capsule.toml"),
+        r#"[package]
+name = "astrid-capsule-openai-compat"
+version = "1.0.0"
+
+[[component]]
+id = "main"
+file = "main.wasm"
+
+[env.temperature]
+type = "string"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        install.join("main.wasm"),
+        [0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00],
+    )
+    .unwrap();
+    crate::capsule_adversarial_tests::publish_without_running_lifecycle(&kernel, &source, &install)
+        .expect("publish configuredness regression fixture");
+
+    let id = CapsuleId::new("astrid-capsule-openai-compat").unwrap();
+    let error = kernel
+        .reload_one_capsule(&id, &source)
+        .await
+        .expect_err("missing required temperature must reject reload")
+        .to_string();
+    assert!(error.contains("failed to load:"), "got: {error}");
+    assert!(error.contains("not configured"), "got: {error}");
+}

@@ -589,6 +589,19 @@ async fn agent_modify_from_req(
     {
         return err_bad_input(e);
     }
+    if capsules_changed
+        && let Err(e) = super::inheritance::copy_non_secret_env_from_principal(
+            kernel,
+            &PrincipalId::default(),
+            &principal,
+            &add_capsules,
+        )
+        .await
+    {
+        return err_internal(format!(
+            "copy default capsule environment for {principal} failed: {e}"
+        ));
+    }
     if let Err(e) = profile.save_to_path(&path) {
         return err_profile(&principal, &e);
     }
