@@ -478,3 +478,53 @@ fn read_region_at_copies_overlapping_extents_only() {
         "tail read must not scan extents from 0"
     );
 }
+
+#[test]
+fn stream_write_of_known_length_is_one_payload_record() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let region = VolumeRegion::new("blob").unwrap();
+    let payload = vec![0xA5_u8; 256 * 1024];
+    {
+        let volume = HostedFileVolume::open(&path).unwrap();
+        volume.create_region(&region, true).unwrap();
+        volume
+            .write_region_from(
+                &region,
+                0,
+                u64::try_from(payload.len()).unwrap(),
+                &mut payload.as_slice(),
+            )
+            .unwrap();
+        volume.sync().unwrap();
+        let mut out = vec![0_u8; payload.len()];
+        assert_eq!(
+            volume.read_region_at(&region, 0, &mut out).unwrap(),
+            payload.len()
+        );
+        assert_eq!(out, payload);
+    }
+    let writes = crate::volume::write_record_payloads(&path).unwrap();
+    let blob_writes = writes
+        .into_iter()
+        .filter(|(name, _)| name == "blob")
+        .collect::<Vec<_>>();
+    assert_eq!(blob_writes, vec![("blob".to_owned(), 256 * 1024)]);
+}
+
+#[test]
+fn short_stream_write_does_not_publish_a_torn_record() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let region = VolumeRegion::new("blob").unwrap();
+    let volume = HostedFileVolume::open(&path).unwrap();
+    volume.create_region(&region, true).unwrap();
+    volume.sync().unwrap();
+    let before = std::fs::metadata(&path).unwrap().len();
+    let error = volume
+        .write_region_from(&region, 0, 256 * 1024, &mut &b"short"[..])
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    assert_eq!(volume.region_len(&region).unwrap(), 0);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+}

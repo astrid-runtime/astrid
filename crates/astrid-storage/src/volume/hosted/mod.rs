@@ -18,6 +18,7 @@ use super::{AstridVolume, MAX_REGION_NAME_BYTES, VolumeMetadataMutation, VolumeR
 
 mod open;
 mod reclaim;
+mod stream;
 
 const VOLUME_MAGIC: [u8; 8] = *b"ASTVOL2\0";
 const RECORD_MAGIC: [u8; 8] = *b"ASTREG2\0";
@@ -238,25 +239,14 @@ impl AstridVolume for HostedFileVolume {
         Ok(wanted)
     }
 
-    fn write_region_at(&self, region: &VolumeRegion, offset: u64, bytes: &[u8]) -> io::Result<()> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        let mut state = self.state.lock();
-        if !state.regions.contains_key(region) {
-            return Err(io::Error::new(io::ErrorKind::NotFound, region.as_str()));
-        }
-        let end = offset
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| io::Error::other("volume write range overflow"))?;
-        let (physical, _) = Self::append(&mut state, Operation::Write, region, offset, bytes)?;
-        let region_state = state
-            .regions
-            .get_mut(region)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, region.as_str()))?;
-        overlay_extent(&mut region_state.extents, offset, end, physical);
-        region_state.length = region_state.length.max(end);
-        Ok(())
+    fn write_region_from(
+        &self,
+        region: &VolumeRegion,
+        offset: u64,
+        payload_len: u64,
+        payload: &mut dyn Read,
+    ) -> io::Result<()> {
+        stream::write_region_from(self, region, offset, payload_len, payload)
     }
 
     fn set_region_len(&self, region: &VolumeRegion, length: u64) -> io::Result<()> {
@@ -964,6 +954,9 @@ fn truncate_extents(extents: &mut BTreeMap<u64, Extent>, length: u64) {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) use stream::write_record_payloads;
 
 #[cfg(test)]
 mod tests;

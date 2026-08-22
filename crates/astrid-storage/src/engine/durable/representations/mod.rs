@@ -39,7 +39,7 @@ use recovery::{
 
 mod contiguous;
 mod volume;
-pub(in crate::engine::durable) use volume::install_volume_blob_copy;
+pub(in crate::engine::durable) use volume::persist_store_blob;
 mod direct;
 use authority::{create_file as create_cap_file, open_file as open_cap_file, quarantine_entry};
 pub(super) use contiguous::{
