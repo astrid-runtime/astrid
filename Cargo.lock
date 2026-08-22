@@ -291,7 +291,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
- "toml",
+ "toml 1.1.4+spec-1.1.0",
  "toml_edit",
  "tracing",
  "unicode-width",
@@ -423,7 +423,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
- "toml",
+ "toml 1.1.4+spec-1.1.0",
  "tracing",
  "url",
  "uuid",
@@ -456,7 +456,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
- "toml",
+ "toml 1.1.4+spec-1.1.0",
  "tracing",
  "uuid",
  "wat",
@@ -474,7 +474,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
- "toml",
+ "toml 1.1.4+spec-1.1.0",
  "web-time",
 ]
 
@@ -488,7 +488,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
- "toml",
+ "toml 1.1.4+spec-1.1.0",
  "tracing",
 ]
 
@@ -512,7 +512,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
- "toml",
+ "toml 1.1.4+spec-1.1.0",
  "uuid",
  "windows-sys 0.61.2",
 ]
@@ -552,7 +552,7 @@ dependencies = [
  "nix 0.31.3",
  "signal-hook 0.4.4",
  "tokio",
- "toml",
+ "toml 1.1.4+spec-1.1.0",
  "tracing",
  "uuid",
 ]
@@ -631,7 +631,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
- "toml",
+ "toml 1.1.4+spec-1.1.0",
  "tower",
  "tower-http 0.7.0",
  "tracing",
@@ -661,7 +661,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
- "toml",
+ "toml 1.1.4+spec-1.1.0",
  "tracing",
  "uuid",
  "wasmtime",
@@ -741,7 +741,7 @@ dependencies = [
  "subtle",
  "tempfile",
  "tokio",
- "toml",
+ "toml 1.1.4+spec-1.1.0",
  "tracing",
  "uuid",
  "windows-sys 0.61.2",
@@ -765,7 +765,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
- "toml",
+ "toml 1.1.4+spec-1.1.0",
  "tracing",
  "uuid",
  "which",
@@ -817,7 +817,7 @@ dependencies = [
  "hex",
  "keyring",
  "libc",
- "lz4_flex",
+ "lz4_flex 0.14.0",
  "parking_lot",
  "serde",
  "serde_json",
@@ -4323,6 +4323,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lz4_flex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "mac_address"
 version = "1.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6786,7 +6795,7 @@ dependencies = [
  "guardian",
  "integer-encoding",
  "log",
- "lz4_flex",
+ "lz4_flex 0.12.2",
  "parking_lot",
  "quick_cache",
  "rand 0.9.5",
@@ -7207,6 +7216,21 @@ dependencies = [
  "toml_parser",
  "toml_writer",
  "winnow 0.7.15",
+]
+
+[[package]]
+name = "toml"
+version = "1.1.4+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3aace63f4bbcdfc2c965b059de67119c89c4017a70d633be6c104910f67056f5"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime 1.1.1+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 1.0.4",
 ]
 
 [[package]]
@@ -7892,7 +7916,7 @@ dependencies = [
  "serde",
  "serde_derive",
  "sha2 0.10.9",
- "toml",
+ "toml 0.9.12+spec-1.1.0",
  "wasmtime-environ",
  "windows-sys 0.61.2",
  "zstd",
