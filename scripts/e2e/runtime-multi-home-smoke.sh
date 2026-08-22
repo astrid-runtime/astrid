@@ -103,8 +103,17 @@ EOF
   local secondary_capsules="${ASTRID_E2E_SECONDARY_CAPSULES:-astrid-capsule-cli astrid-capsule-registry astrid-capsule-openai-compat}"
   local capsule
   for capsule in $secondary_capsules; do
-    multi_run_cli "$secondary_home" "$secondary_artifacts" capsule install \
-      "$CAPSULES_DIR/$capsule" --approve-untrusted
+    if [[ "$capsule" == "astrid-capsule-openai-compat" ]]; then
+      # Match the primary harness' non-interactive declared-config install so
+      # the Shared api_key is staged before live activation on this home.
+      ASTRID_VAR_API_KEY=runtime-e2e-install-placeholder \
+        ASTRID_VAR_TEMPERATURE=0.7 \
+        multi_run_cli "$secondary_home" "$secondary_artifacts" capsule install \
+          "$CAPSULES_DIR/$capsule" --approve-untrusted --yes
+    else
+      multi_run_cli "$secondary_home" "$secondary_artifacts" capsule install \
+        "$CAPSULES_DIR/$capsule" --approve-untrusted
+    fi
   done
 
   printf '$ ASTRID_HOME=%s astrid capsule config astrid-capsule-openai-compat --set base_url=<fake> --set model=fake-echo\n' \
