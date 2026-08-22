@@ -76,7 +76,7 @@ pub(crate) fn migrate_legacy_principal_homes(
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(invalid_source(&source_root, "not a regular directory"));
     }
-    astrid_core::platform_fs::validate_private_directory(&source_root)?;
+    astrid_core::platform_fs::ensure_private_directory_tree(&source_root)?;
     astrid_core::platform_fs::verify_no_redirects(&source_root)?;
     astrid_core::platform_fs::ensure_private_directory(&home.migrations_dir())?;
 
@@ -478,7 +478,7 @@ fn walk_inventory(
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(invalid_source(source, "not a regular directory"));
     }
-    astrid_core::platform_fs::validate_private_directory(source)?;
+    astrid_core::platform_fs::ensure_private_directory_tree(source)?;
     astrid_core::platform_fs::verify_no_redirects(source)?;
     walk_directory(source, Path::new(""), &mut callback)
 }

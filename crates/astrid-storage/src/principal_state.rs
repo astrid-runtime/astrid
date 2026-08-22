@@ -35,7 +35,8 @@ use crate::error::{StorageError, StorageResult};
 use crate::identity::{IdentityStore, KvIdentityStore};
 #[cfg(all(test, feature = "legacy-surrealkv"))]
 use crate::kv::SurrealKvStore;
-use crate::kv::{KvPrincipalResolver, KvQuotaResolver, KvStore, ScopedKvStore, TreeKvStore};
+use crate::kv::{KvPrincipalResolver, KvQuotaResolver, KvReadCacheConfig, KvStore, ScopedKvStore, TreeKvStore};
+use std::num::NonZeroUsize;
 
 mod bootstrap;
 #[cfg(test)]
@@ -815,13 +816,21 @@ async fn assemble_runtime_store(
     let validated_catalogs = Arc::new(Mutex::new(BTreeMap::<StateOwner, CatalogValidation>::new()));
     let validated_kv = Arc::new(crate::kv::KvValidationCache::default());
 
-    let runtime_kv = Arc::new(RuntimeStore::from_engine_with_quota_and_content_validation(
-        Arc::clone(&engine),
-        StateOwnerResolver::new(principals.clone()),
-        Arc::clone(&quota),
-        Arc::clone(&validated_kv),
-        Arc::clone(&validated_catalogs),
-    ));
+    let runtime_kv = Arc::new(
+        RuntimeStore::from_engine_with_quota_and_content_validation(
+            Arc::clone(&engine),
+            StateOwnerResolver::new(principals.clone()),
+            Arc::clone(&quota),
+            Arc::clone(&validated_kv),
+            Arc::clone(&validated_catalogs),
+        )
+        .with_read_cache(KvReadCacheConfig::bounded(
+            NonZeroUsize::new(256 * 1024 * 1024).expect("256 MiB"),
+            NonZeroUsize::new(64 * 1024 * 1024).expect("64 MiB"),
+            NonZeroUsize::new(4_096).expect("owner limit"),
+            NonZeroUsize::new(65_536).expect("entries per owner"),
+        )),
+    );
     let kv: Arc<dyn KvStore> = runtime_kv.clone();
     KvIdentityStore::with_principal_directory(
         ScopedKvStore::new(Arc::clone(&kv), "system:identity")?,

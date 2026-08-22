@@ -161,7 +161,7 @@ fn inventory(source: &Path, source_device: u64) -> io::Result<Vec<LogEntry>> {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(invalid(source, "legacy log root is not a directory"));
     }
-    astrid_core::platform_fs::validate_private_directory(source)?;
+    astrid_core::platform_fs::ensure_private_directory_tree(source)?;
     astrid_core::platform_fs::verify_no_redirects(source)?;
     let mut entries = Vec::new();
     let mut total = 0_u64;

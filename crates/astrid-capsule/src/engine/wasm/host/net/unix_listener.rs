@@ -26,11 +26,22 @@ impl HostUnixListener for HostState {
             return Err(ErrorCode::Quota);
         }
 
-        let listener_arc = self.cli_socket_listener.clone().ok_or(ErrorCode::Closed)?;
         let rt_handle = self.runtime_handle.clone();
         let cancel_token = self.effective_cancel_token();
         let session_token = self.session_token.clone();
         let blocking_semaphore = self.blocking_semaphore.clone();
+        let Some(listener_arc) = self.cli_socket_listener.clone() else {
+            // Native daemon already claimed the control socket. Park until
+            // teardown so aos-cli stays Ready instead of trapping on Closed.
+            let parked = util::bounded_block_on_cancellable(
+                &rt_handle,
+                &blocking_semaphore,
+                &cancel_token,
+                std::future::pending::<()>(),
+            );
+            let _ = parked;
+            return Err(ErrorCode::Closed);
+        };
 
         // Resolved once and reused for every accept iteration: where a claimed
         // principal's profile/keys load from during the handshake challenge
@@ -161,11 +172,22 @@ impl HostUnixListener for HostState {
         _self_: Resource<UnixListener>,
         timeout_ms: u64,
     ) -> Result<Option<Resource<TcpStream>>, ErrorCode> {
-        let listener_arc = self.cli_socket_listener.clone().ok_or(ErrorCode::Closed)?;
         let rt_handle = self.runtime_handle.clone();
         let cancel_token = self.effective_cancel_token();
         let session_token = self.session_token.clone();
         let blocking_semaphore = self.blocking_semaphore.clone();
+        let Some(listener_arc) = self.cli_socket_listener.clone() else {
+            // Native daemon already claimed the control socket. Park until
+            // teardown so aos-cli stays Ready instead of trapping on Closed.
+            let parked = util::bounded_block_on_cancellable(
+                &rt_handle,
+                &blocking_semaphore,
+                &cancel_token,
+                std::future::pending::<()>(),
+            );
+            let _ = parked;
+            return Err(ErrorCode::Closed);
+        };
 
         if self.capsule_net_stream_count.load(Ordering::Acquire) >= MAX_ACTIVE_STREAMS {
             return Ok(None);

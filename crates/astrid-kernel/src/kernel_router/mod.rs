@@ -250,20 +250,25 @@ async fn handle_request(
         );
         return;
     }
-    record_admin_audit(
-        kernel,
-        AdminAuditEntry {
-            caller: &caller,
-            method,
-            required_cap,
-            device_key_id: device_key_id.as_deref(),
-            target_principal: requested_target,
-            params: None,
-            authorization: authorization_proof,
-            outcome: AuditOutcome::success(),
-        },
-    )
-    .await;
+    // GetStatus is the liveness probe used by `aos status`, `astrid status`,
+    // and MCP reconnect. Writing a durable admin-audit row for every probe
+    // made layout-2 homes miss the 5s client timeout. Denies stay audited.
+    if !matches!(req, KernelRequest::GetStatus) {
+        record_admin_audit(
+            kernel,
+            AdminAuditEntry {
+                caller: &caller,
+                method,
+                required_cap,
+                device_key_id: device_key_id.as_deref(),
+                target_principal: requested_target,
+                params: None,
+                authorization: authorization_proof,
+                outcome: AuditOutcome::success(),
+            },
+        )
+        .await;
+    }
 
     // Keepalive pinger: from here until the terminal response is published, emit
     // a `KernelResponse::Working` frame every `KEEPALIVE_INTERVAL` so a waiting

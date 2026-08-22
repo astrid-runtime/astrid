@@ -25,6 +25,7 @@ pub fn validate(config: &Config) -> ConfigResult<()> {
     validate_subagents(config)?;
     validate_capsule(config)?;
     validate_retry(config)?;
+    validate_audit(config)?;
     Ok(())
 }
 
@@ -362,6 +363,38 @@ fn validate_logging(config: &Config) -> ConfigResult<()> {
         });
     }
 
+    Ok(())
+}
+
+fn validate_audit(config: &Config) -> ConfigResult<()> {
+    let audit = &config.audit;
+    if !(10..=60_000).contains(&audit.host_coalesce_ms) {
+        return Err(ConfigError::ValidationError {
+            field: "audit.host_coalesce_ms".to_owned(),
+            message: format!(
+                "host_coalesce_ms {} is out of range; must be between 10 and 60000",
+                audit.host_coalesce_ms
+            ),
+        });
+    }
+    if !(8..=128).contains(&audit.host_batch_max) {
+        return Err(ConfigError::ValidationError {
+            field: "audit.host_batch_max".to_owned(),
+            message: format!(
+                "host_batch_max {} is out of range; must be between 8 and 128 (durable atomic batch cap)",
+                audit.host_batch_max
+            ),
+        });
+    }
+    if !(64..=65_536).contains(&audit.host_queue_capacity) {
+        return Err(ConfigError::ValidationError {
+            field: "audit.host_queue_capacity".to_owned(),
+            message: format!(
+                "host_queue_capacity {} is out of range; must be between 64 and 65536",
+                audit.host_queue_capacity
+            ),
+        });
+    }
     Ok(())
 }
 

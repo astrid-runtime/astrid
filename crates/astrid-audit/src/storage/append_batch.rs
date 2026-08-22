@@ -171,20 +171,24 @@ impl KvAuditStorage {
             .await
             .map_err(|error| AuditError::StorageError(error.to_string()))?;
         let stored_head = parse_stored_head(stored_head.as_deref())?;
-        if stored_head.as_ref() != expected {
-            return Ok(false);
-        }
         let (metadata_expected, metadata) = self
             .load_chain_metadata(&entry.session_id, entry.principal.as_ref())
             .await?;
         let metadata = metadata.unwrap_or_default();
+        // `get_chain_head` prefers metadata.head. After a payload MOVE the
+        // heads key can be missing while metadata still names a real parent.
+        // A Some stored head that disagrees is a true conflict. A missing
+        // heads key is healed by CAS-creating it in this batch.
         if metadata.head.as_ref() != expected {
+            return Ok(false);
+        }
+        if stored_head.is_some() && stored_head.as_ref() != expected {
             return Ok(false);
         }
         prepared.chains.insert(
             chain_key.to_owned(),
             ChainState {
-                head_expected: expected.cloned(),
+                head_expected: stored_head,
                 metadata_expected,
                 metadata,
                 segment_index: Vec::new(),
@@ -468,4 +472,81 @@ fn append_global_change(
 
 fn kv_key(namespace: &str, value: &str) -> AuditResult<KvEntryKey> {
     KvEntryKey::new(namespace, value).map_err(|error| AuditError::StorageError(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{AuditStorage, KvAuditStorage};
+    use crate::entry::{AuditAction, AuditEntry, AuditOutcome, AuthorizationProof};
+    use astrid_core::{PrincipalId, SessionId};
+    use astrid_crypto::{ContentHash, KeyPair};
+
+    #[tokio::test]
+    async fn append_heals_missing_chain_heads_after_metadata_move() {
+        let storage = KvAuditStorage::in_memory();
+        let keypair = KeyPair::generate();
+        let session = SessionId::new();
+        let principal = PrincipalId::new("alice").expect("principal");
+        let first = AuditEntry::create_with_principal(
+            session.clone(),
+            principal.clone(),
+            AuditAction::FileRead {
+                path: "/a".to_owned(),
+            },
+            AuthorizationProof::System {
+                reason: "test".to_owned(),
+            },
+            AuditOutcome::success(),
+            ContentHash::zero(),
+            &keypair,
+        );
+        let committed = storage
+            .append_batch_if_heads(&[(&first, None)])
+            .await
+            .expect("first append");
+        assert_eq!(committed, vec![true]);
+
+        storage
+            .test_drop_chain_head(&session, Some(&principal))
+            .await
+            .expect("drop heads key");
+        assert!(
+            storage
+                .get_chain_head(&session, Some(&principal))
+                .await
+                .expect("head via metadata")
+                .is_some(),
+            "metadata still names the parent"
+        );
+
+        let second = AuditEntry::create_with_principal(
+            session.clone(),
+            principal.clone(),
+            AuditAction::FileRead {
+                path: "/b".to_owned(),
+            },
+            AuthorizationProof::System {
+                reason: "test".to_owned(),
+            },
+            AuditOutcome::success(),
+            first.content_hash(),
+            &keypair,
+        );
+        let committed = storage
+            .append_batch_if_heads(&[(&second, Some(&first.id))])
+            .await
+            .expect("healed append");
+        assert_eq!(
+            committed,
+            vec![true],
+            "missing heads key must not fail closed as a CAS miss"
+        );
+        assert_eq!(
+            storage
+                .get_chain_head(&session, Some(&principal))
+                .await
+                .expect("restored head"),
+            Some(second.id)
+        );
+    }
 }

@@ -352,6 +352,19 @@ impl KvAuditStorage {
             .map_err(|error| AuditError::StorageError(error.to_string()))
     }
 
+    #[cfg(test)]
+    pub(crate) async fn test_drop_chain_head(
+        &self,
+        session_id: &SessionId,
+        principal: Option<&astrid_core::PrincipalId>,
+    ) -> AuditResult<()> {
+        self.store
+            .delete(NS_CHAIN_HEADS, &chain_head_key(session_id, principal))
+            .await
+            .map_err(|error| AuditError::StorageError(error.to_string()))
+            .map(|_| ())
+    }
+
     async fn get_legacy_session_entry_ids(
         &self,
         session_id: &SessionId,
@@ -615,34 +628,10 @@ impl AuditStorage for KvAuditStorage {
     }
 
     async fn is_entry_committed(&self, id: &AuditEntryId) -> AuditResult<bool> {
-        if self
-            .store
+        self.store
             .exists(NS_COMMITTED_ENTRIES, &id.0.to_string())
             .await
-            .map_err(|e| AuditError::StorageError(e.to_string()))?
-        {
-            return Ok(true);
-        }
-        if let Some(entry) = self.get(id).await?
-            && self
-                .store
-                .exists(NS_SESSION_SEQUENCE, &entry.session_id.0.to_string())
-                .await
-                .map_err(|e| AuditError::StorageError(e.to_string()))?
-        {
-            return Ok(false);
-        }
-        for session in self.list_sessions().await? {
-            if self
-                .get_session_entries(&session)
-                .await?
-                .into_iter()
-                .any(|entry| entry.id == *id)
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+            .map_err(|e| AuditError::StorageError(e.to_string()))
     }
 
     async fn get_session_entries_page(
@@ -835,6 +824,15 @@ impl AuditStorage for KvAuditStorage {
             .set(NS_SESSION_ENTRIES, &index_key, vec![1])
             .await
             .map_err(|e| AuditError::StorageError(e.to_string()))?;
+        let head_key = chain_head_key(&entry.session_id, entry.principal.as_ref());
+        self.store
+            .set(
+                NS_CHAIN_HEADS,
+                &head_key,
+                entry.id.0.to_string().into_bytes(),
+            )
+            .await
+            .map_err(|e| AuditError::StorageError(e.to_string()))?;
         Ok(())
     }
 
@@ -869,21 +867,6 @@ impl AuditStorage for KvAuditStorage {
             })
         {
             return Ok(Some(head));
-        }
-
-        for id in self
-            .get_committed_session_entry_ids(session_id)
-            .await?
-            .into_iter()
-            .rev()
-        {
-            if self
-                .get(&id)
-                .await?
-                .is_some_and(|entry| entry.principal.as_ref() == principal)
-            {
-                return Ok(Some(id));
-            }
         }
 
         let key = chain_head_key(session_id, principal);

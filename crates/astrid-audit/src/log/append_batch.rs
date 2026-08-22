@@ -34,8 +34,19 @@ impl AuditLog {
         }
         let _append_guard = self.append_coordinator.lock().await;
         let mut handles = HashMap::new();
+        let mut cas_attempts = 0_u32;
 
         loop {
+            cas_attempts = cas_attempts.saturating_add(1);
+            if cas_attempts > super::MAX_HEAD_CAS_ATTEMPTS {
+                return batch_error(
+                    entries.len(),
+                    &format!(
+                        "audit batch head CAS exhausted after {} attempts",
+                        super::MAX_HEAD_CAS_ATTEMPTS
+                    ),
+                );
+            }
             let signed = match self.build_signed_batch(&entries, &mut handles).await {
                 Ok(signed) => signed,
                 Err(error) => return batch_error(entries.len(), &error),

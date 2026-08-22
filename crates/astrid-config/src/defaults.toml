@@ -217,6 +217,18 @@ max_pending_requests = 50
 # Maximum size of audit database in MB before rotation/archival
 max_size_mb = 100
 
+# Host-call audit writer. Signing + volume persist is on-CPU with WAL off.
+# 250ms lets concurrent capsule host calls share one persist; 50ms pinned a
+# 27-capsule layout-2 home at 100% CPU and starved the 5s GetStatus probe.
+host_coalesce_ms = 5000
+# One flush stays at the durable audit atomic-batch cap (128 entries).
+host_batch_max = 128
+# Overflow folds identical events; producers never block tokio workers.
+host_queue_capacity = 4096
+# Allowed stat/exists/readdir are not signed FileRead rows. Denied path
+# probes still persist. Set true to record every allowed probe.
+host_path_probes = false
+
 # ============================================================================
 # Cryptographic Keys
 # ============================================================================

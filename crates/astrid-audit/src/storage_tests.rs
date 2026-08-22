@@ -795,6 +795,43 @@ async fn test_chain_head() {
     assert_eq!(head, entry2.id);
 }
 
+#[tokio::test]
+async fn get_chain_head_does_not_scan_session_entries() {
+    let storage = KvAuditStorage::in_memory();
+    let keypair = test_keypair();
+    let session_id = SessionId::new();
+    let mut last = None;
+    for i in 0..32 {
+        let previous = last
+            .as_ref()
+            .map(AuditEntry::content_hash)
+            .unwrap_or_else(ContentHash::zero);
+        let entry = AuditEntry::create(
+            session_id.clone(),
+            AuditAction::ConfigReloaded,
+            AuthorizationProof::System {
+                reason: format!("scan-{i}"),
+            },
+            AuditOutcome::success(),
+            previous,
+            &keypair,
+        );
+        storage.store(&entry).await.unwrap();
+        last = Some(entry);
+    }
+    let expected = last.unwrap().id;
+    let head = storage
+        .get_chain_head(&session_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(head, expected);
+    assert!(
+        !storage.is_entry_committed(&expected).await.unwrap(),
+        "store() does not mint committed-entry seals; lookup must not session-scan to true"
+    );
+}
+
 /// Exercises the `block_in_place` branch that only fires under a
 /// multi-threaded runtime (the production path fixed by #305).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

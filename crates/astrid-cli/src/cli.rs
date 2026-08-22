@@ -488,7 +488,19 @@ pub(crate) enum McpCommands {
     /// Long-running: serves on stdin/stdout until the client closes the
     /// stream (EOF) or the process is killed. Stdout carries the MCP
     /// JSON-RPC protocol only — all diagnostics go to stderr.
-    Serve,
+    Serve {
+        /// Project directory this MCP session attaches to.
+        ///
+        /// AOS host plugins pass the client's `$PWD` here. Distinct from
+        /// `--workspace-state-dir`, which names the per-project state folder.
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        /// Host-plugin compatibility flag. Tool deadlines are owned by the MCP
+        /// client (`tool_timeout_sec`); this value is accepted and ignored so
+        /// `aos mcp serve --request-timeout 1d5m` does not fail clap.
+        #[arg(long = "request-timeout", value_name = "DURATION")]
+        request_timeout: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -603,7 +615,7 @@ mod capsule_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, InviteCommand};
+    use super::{Cli, Commands, InviteCommand, McpCommands};
     use clap::{CommandFactory, Parser};
     use std::collections::BTreeSet;
 
@@ -623,6 +635,35 @@ mod tests {
             alternate.workspace_state_dir.state_dir_name(),
             ".alternate-runtime"
         );
+    }
+
+    #[test]
+    fn mcp_serve_accepts_aos_host_plugin_flags() {
+        let parsed = Cli::try_parse_from([
+            "astrid",
+            "--principal",
+            "codex-code",
+            "mcp",
+            "serve",
+            "--workspace",
+            "/tmp/project",
+            "--request-timeout",
+            "1d5m",
+        ])
+        .expect("AOS plugin argv must parse");
+        match parsed.command {
+            Some(Commands::Mcp {
+                command:
+                    McpCommands::Serve {
+                        workspace,
+                        request_timeout,
+                    },
+            }) => {
+                assert_eq!(workspace.as_deref(), Some(std::path::Path::new("/tmp/project")));
+                assert_eq!(request_timeout.as_deref(), Some("1d5m"));
+            },
+            _ => panic!("expected mcp serve"),
+        }
     }
 
     #[test]
