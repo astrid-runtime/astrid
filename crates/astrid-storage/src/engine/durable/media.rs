@@ -74,7 +74,8 @@ impl File {
     pub(in crate::engine::durable) fn sync_data(&self) -> io::Result<()> {
         match self {
             Self::Native(file) => file.sync_data(),
-            Self::Volume(file) => file.sync_data(),
+            // ASTVOL2 durability is one container fsync via AstridVolume::sync.
+            Self::Volume(_) => Ok(()),
         }
     }
 

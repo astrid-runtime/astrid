@@ -194,9 +194,6 @@ pub(in crate::engine::durable) fn persist_store_blob<R: Read>(
         let _ = volume.remove_region(&named);
         return Err(error);
     }
-    volume
-        .sync()
-        .map_err(|source| io_error("flush store blob namespace", source))?;
     Ok(())
 }
 

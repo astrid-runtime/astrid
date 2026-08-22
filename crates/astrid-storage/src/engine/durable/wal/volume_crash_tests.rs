@@ -186,3 +186,39 @@ fn disabled_wal_policy_still_replays_published_volume_wal() {
         next
     );
 }
+
+#[test]
+fn disabled_wal_volume_commit_survives_reopen_from_on_disk_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let volume_path = directory.path().join("astrid.volume");
+    let volume: Arc<dyn AstridVolume> = HostedFileVolume::open(&volume_path).unwrap();
+    let engine = DurableEngine::open_volume(
+        Arc::clone(&volume),
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        disabled_wal_policy(),
+    )
+    .unwrap();
+    let (commit, tx) = kv_transaction("alice", None, b"legacy-barrier");
+    engine.commit(tx).unwrap();
+    let snapshot = directory.path().join("snapshot.volume");
+    std::fs::copy(&volume_path, &snapshot).unwrap();
+    drop(engine);
+    drop(volume);
+
+    let volume: Arc<dyn AstridVolume> = HostedFileVolume::open(&snapshot).unwrap();
+    let engine = DurableEngine::open_volume(
+        volume,
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        disabled_wal_policy(),
+    )
+    .unwrap();
+    assert_eq!(
+        engine.root(&"alice".to_owned()).unwrap().unwrap().commit,
+        commit
+    );
+    assert!(engine.object(commit).unwrap().is_some());
+}

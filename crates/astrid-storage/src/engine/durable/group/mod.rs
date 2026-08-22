@@ -570,6 +570,7 @@ where
         self.fail_if(FaultPoint::BeforeRootCas)?;
 
         self.publish_group_roots(files, accepted)?;
+        self.sync_volume()?;
         let arena_len = files
             .arena
             .metadata()

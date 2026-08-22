@@ -155,6 +155,9 @@ where
             )?;
         }
         volume
+            .sync()
+            .map_err(|source| io_error("flush compacted volume before reclaim", source))?;
+        volume
             .reclaim()
             .map_err(|source| io_error("physically reclaim compacted volume", source))?;
         Ok(CompactionReport {

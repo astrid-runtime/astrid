@@ -340,6 +340,23 @@ where
         }
     }
 
+    pub(crate) fn install_prepared_contiguous_blob(
+        &self,
+        prepared: &PreparedContiguousFile,
+        source: &std::fs::File,
+    ) -> Result<(), DurableError> {
+        self.validate_contiguous_preparation(prepared)?;
+        let logical_bytes = prepared.verified.descriptor().logical_bytes();
+        self.persist_contiguous_blob_from_file(
+            prepared.payload.blob,
+            prepared.payload.profile_id,
+            logical_bytes,
+            source,
+        )?;
+        self.fail_if(FaultPoint::AfterContiguousBlobInstall)?;
+        Ok(())
+    }
+
     fn validate_contiguous_preparation(
         &self,
         prepared: &PreparedContiguousFile,
@@ -405,7 +422,8 @@ where
                     representations.publish_direct_update(update)?;
                 }
                 self.fail_if(FaultPoint::AfterContiguousStatePublish)?;
-                representations.flush()
+                representations.flush()?;
+                self.sync_volume()
             })();
         if let Err(error) = publication {
             self.mark_requires_recovery(&mut inner);
@@ -415,6 +433,66 @@ where
             verified,
             objects_inserted,
         })
+    }
+
+    pub(crate) fn publish_installed_contiguous_batch(
+        &self,
+        prepared: Vec<PreparedContiguousFile>,
+    ) -> Result<Vec<PublishedContiguousFile>, DurableError> {
+        if prepared.is_empty() {
+            return Ok(Vec::new());
+        }
+        for item in &prepared {
+            self.validate_contiguous_preparation(item)?;
+        }
+        self.flush()?;
+        self.fail_if(FaultPoint::AfterContiguousStructuralFlush)?;
+        let mut inner = self.lock_usable()?;
+        for item in &prepared {
+            self.validate_installed_contiguous_collisions(&inner, &item.payload)?;
+            let evidence_id = self.identify(&item.payload.evidence);
+            if !inner.index.contains_key(&evidence_id) {
+                return Err(DurableError::InvalidRepresentationState(
+                    "contiguous evidence is not durable in the object arena",
+                ));
+            }
+        }
+        let publication =
+            (|| {
+                let representations = inner.representations.as_mut().ok_or(
+                    DurableError::InvalidRepresentationState(
+                        "contiguous publication requires active physical authority",
+                    ),
+                )?;
+                let update =
+                    representations.append_contiguous_updates(prepared.iter().map(|item| {
+                        (
+                            &item.payload.profile,
+                            &item.payload.representation,
+                            &item.payload.slices,
+                        )
+                    }))?;
+                self.fail_if(FaultPoint::AfterContiguousMetadataAppend)?;
+                if let Some(update) = update {
+                    representations.publish_direct_update(update)?;
+                }
+                self.fail_if(FaultPoint::AfterContiguousStatePublish)?;
+                representations.flush()?;
+                self.sync_volume()
+            })();
+        if let Err(error) = publication {
+            self.mark_requires_recovery(&mut inner);
+            return Err(error);
+        }
+        drop(inner);
+        self.compact_volume_index()?;
+        Ok(prepared
+            .into_iter()
+            .map(|item| PublishedContiguousFile {
+                verified: item.verified,
+                objects_inserted: item.objects_inserted,
+            })
+            .collect())
     }
 
     fn validate_installed_contiguous_collisions(
