@@ -347,3 +347,97 @@ async fn allowed_path_probes_are_omitted_denied_probes_persist() {
         ) if path == "/etc/shadow"
     ));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_queue_capacity_drops_new_unique_keys() {
+    let log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+    let session = SessionId::from_uuid(uuid::Uuid::from_u128(0x09a1));
+    let sink = KernelAuditSink::with_policy(
+        Arc::clone(&log),
+        session.clone(),
+        HostAuditPolicy::from(&astrid_config::types::AuditConfig {
+            host_coalesce_ms: 10,
+            host_batch_max: 128,
+            host_queue_capacity: 1,
+            host_path_probes: false,
+            ..astrid_config::types::AuditConfig::default()
+        }),
+    );
+    let p = principal();
+    for i in 0..64 {
+        sink.record(
+            &p,
+            HostAuditEvent::FileProbe {
+                path: &format!("/denied-{i}"),
+            },
+            HostAuditOutcome::Denied("not in host_fs allowlist"),
+        );
+    }
+    sink.record(
+        &p,
+        HostAuditEvent::FileProbe {
+            path: "/denied-overflow",
+        },
+        HostAuditOutcome::Denied("not in host_fs allowlist"),
+    );
+    let health = sink.health();
+    assert_eq!(
+        health.accepted, 64,
+        "unique denials stop at host_queue_capacity"
+    );
+    assert!(health.queue_full >= 1, "capacity must be a real bound");
+    sink.shutdown();
+    assert_eq!(log.count_session(&session).await.unwrap_or_default(), 64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn collapse_keeps_principals_and_exact_denials() {
+    let log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+    let session = SessionId::from_uuid(uuid::Uuid::from_u128(0x09a2));
+    let sink = test_sink(Arc::clone(&log), session.clone());
+    let alice = PrincipalId::new("alice").expect("alice");
+    let bob = PrincipalId::new("bob").expect("bob");
+    sink.record(
+        &alice,
+        HostAuditEvent::FileRead { path: "/a" },
+        HostAuditOutcome::Allowed,
+    );
+    sink.record(
+        &bob,
+        HostAuditEvent::FileRead { path: "/b" },
+        HostAuditOutcome::Allowed,
+    );
+    sink.record(
+        &alice,
+        HostAuditEvent::FileProbe {
+            path: "/etc/shadow",
+        },
+        HostAuditOutcome::Denied("not in host_fs allowlist"),
+    );
+    sink.record(
+        &alice,
+        HostAuditEvent::FileProbe {
+            path: "/etc/passwd",
+        },
+        HostAuditOutcome::Denied("not in host_fs allowlist"),
+    );
+    sink.shutdown();
+    let entries = log.get_session_entries(&session).await.expect("read");
+    let principals: Vec<_> = entries
+        .iter()
+        .filter_map(|e| e.principal.as_ref().map(|p| p.as_str()))
+        .collect();
+    assert!(principals.contains(&"alice"), "{principals:?}");
+    assert!(principals.contains(&"bob"), "{principals:?}");
+    let denied_paths: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match (&e.action, &e.authorization) {
+            (AuditAction::FileRead { path }, AuthorizationProof::Denied { .. }) => {
+                Some(path.as_str())
+            },
+            _ => None,
+        })
+        .collect();
+    assert!(denied_paths.contains(&"/etc/shadow"), "{denied_paths:?}");
+    assert!(denied_paths.contains(&"/etc/passwd"), "{denied_paths:?}");
+}

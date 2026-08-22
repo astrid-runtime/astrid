@@ -85,10 +85,10 @@ struct AuditWork {
 
 impl AuditWork {
     fn collapse_key(&self) -> String {
-        // Allowed host calls with distinct payloads (paths, hosts, commands)
-        // still pin ed25519 if each row is unique. Fold by action class per
-        // principal/session in the window; the first payload is kept and
-        // `repeats=N` records volume. Denials stay exact.
+        // Allowed host calls with distinct payloads still pin ed25519 if
+        // each row is unique. Fold allowed File/Net/Process by class per
+        // principal and session; keep the first payload and stamp
+        // `repeats=N`. Denials stay exact (principal + path/host/command).
         let kind = match &self.action {
             AuditAction::FileRead { .. } => Some("fileread"),
             AuditAction::FileWrite { .. } => Some("filewrite"),
@@ -100,12 +100,17 @@ impl AuditWork {
             _ => None,
         };
         if let Some(kind) = kind {
-            // Ignore path/host/command AND principal: 27 capsules otherwise
-            // still mint hundreds of unique signed rows per window.
+            if matches!(self.authorization, AuthorizationProof::Denied { .. }) {
+                return format!(
+                    "{kind}|fail|{:?}|{}|{:?}",
+                    self.session_id, self.principal, self.action
+                );
+            }
             return format!(
-                "{kind}|{}|{:?}",
+                "{kind}|{}|{:?}|{}",
                 outcome_class(&self.outcome),
-                self.session_id
+                self.session_id,
+                self.principal
             );
         }
         format!(
@@ -241,6 +246,7 @@ struct AuditQueue {
     pending: Arc<Mutex<HashMap<String, Box<AuditWork>>>>,
     health: Arc<Mutex<AuditHealthState>>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    capacity: usize,
 }
 
 impl AuditQueue {
@@ -267,6 +273,7 @@ impl AuditQueue {
             pending,
             health,
             worker: Mutex::new(worker),
+            capacity: policy.queue_capacity,
         });
         if queue
             .worker
@@ -301,6 +308,13 @@ impl AuditQueue {
     fn fold_overflow(&self, work: Box<AuditWork>) {
         let repeats = work.repeats;
         if let Ok(mut pending) = self.pending.lock() {
+            let key = work.collapse_key();
+            if !pending.contains_key(&key) && pending.len() >= self.capacity {
+                if let Ok(mut health) = self.health.lock() {
+                    health.queue_full = health.queue_full.saturating_add(1);
+                }
+                return;
+            }
             let extra = fold_work(&mut pending, work);
             self.note_accepted(u64::from(repeats));
             if extra > 0
@@ -497,7 +511,7 @@ fn audit_writer(
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
-        let batch = take_pending(pending, policy.max_batch.min(16));
+        let batch = take_pending(pending, policy.max_batch);
         if !batch.is_empty() {
             persist_batch(&runtime, audit_log, health, batch);
         }
