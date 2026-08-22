@@ -84,6 +84,16 @@ async fn rollback_imported_secrets(store: &ScopedKvStore, entries: &[(String, St
     }
 }
 
+/// Read one secret from a host-only control scope.
+///
+/// # Errors
+///
+/// Returns a storage or serialization error when the value cannot be read or
+/// decoded as UTF-8.
+pub async fn get_secret(store: &ScopedKvStore, key: &str) -> StorageResult<Option<String>> {
+    get_control_secret(store, key).await
+}
+
 async fn get_control_secret(store: &ScopedKvStore, key: &str) -> StorageResult<Option<String>> {
     let prefixed = format!("{SECRET_KEY_PREFIX}{key}");
     store
@@ -125,6 +135,19 @@ pub fn principal_env_store(
     capsule: &str,
 ) -> StorageResult<ScopedKvStore> {
     ScopedKvStore::new(backend, principal_capsule_namespace(principal, capsule))
+}
+
+/// Create a host-only scoped view for one principal's capsule secrets.
+///
+/// # Errors
+///
+/// Returns a storage error when the namespace is invalid.
+pub fn principal_secret_store(
+    backend: Arc<dyn KvStore>,
+    principal: PrincipalUid,
+    capsule: &str,
+) -> StorageResult<ScopedKvStore> {
+    ScopedKvStore::new(backend, principal_secret_namespace(principal, capsule))
 }
 
 /// Create a host-only scoped view for one host/system capsule environment.
@@ -469,6 +492,30 @@ mod tests {
                 .is_empty()
         );
         assert!(guest.get(&env_key("OWNER")).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn control_secrets_are_principal_isolated_from_guest_kv() {
+        let backend = Arc::new(MemoryKvStore::new());
+        let alice = principal("agent-alice");
+        let scope = principal_secret_store(backend.clone(), alice, "runner").unwrap();
+        scope
+            .set(&format!("{SECRET_KEY_PREFIX}api_key"), b"sk".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            get_secret(&scope, "api_key").await.unwrap().as_deref(),
+            Some("sk")
+        );
+        let guest = ScopedKvStore::new(backend, "agent-alice:capsule:runner").unwrap();
+        assert!(guest.get("api_key").await.unwrap().is_none());
+        assert!(
+            guest
+                .get(&format!("{SECRET_KEY_PREFIX}api_key"))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
