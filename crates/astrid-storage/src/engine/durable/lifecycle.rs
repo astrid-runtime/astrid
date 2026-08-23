@@ -113,16 +113,6 @@ where
             .map_err(|source| io_error("flush volume container", source))
     }
 
-    pub(super) fn compact_volume_index(&self) -> Result<(), DurableError> {
-        if !self.on_volume_media() {
-            return Ok(());
-        }
-        let mut inner = self.lock_usable()?;
-        self.checkpoint_index(&mut inner, VolumeIndexPersist::CompactSnapshot);
-        drop(inner);
-        self.sync_volume()
-    }
-
     pub(in crate::engine::durable) fn checkpoint_transaction_wal(
         &self,
         inner: &mut DurableInner<P>,
