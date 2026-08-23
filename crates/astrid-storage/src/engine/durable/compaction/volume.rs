@@ -153,6 +153,9 @@ where
                 &self.identity,
                 self.limits,
             )?;
+            if representations.contiguous_object_ids().next().is_none() {
+                representations.retire_volume_loose_blobs()?;
+            }
         }
         volume
             .sync()

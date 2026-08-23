@@ -49,6 +49,9 @@ mod format_amendment;
 mod format_amendment_tests;
 #[cfg(test)]
 mod format_migration_tests;
+mod loose_pack;
+#[cfg(test)]
+mod loose_pack_tests;
 mod migrations;
 mod native_io;
 mod owner_migration;
@@ -854,7 +857,7 @@ async fn assemble_runtime_store(
         ),
     );
     let staging = Arc::new(NativeContentStagingArea::open(home.content_staging_path())?);
-    Ok(RuntimePrincipalStore {
+    let store = RuntimePrincipalStore {
         engine,
         directory_cutover_receipt: Arc::from(directory_cutover_receipt),
         runtime_kv,
@@ -862,7 +865,16 @@ async fn assemble_runtime_store(
         content,
         staging,
         principals,
-    })
+    };
+    {
+        let worker = store.clone();
+        tokio::task::spawn_blocking(move || worker.pack_contiguous_home_payloads())
+            .await
+            .map_err(|error| {
+                StorageError::Connection(format!("pack contiguous home worker failed: {error}"))
+            })??;
+    }
+    Ok(store)
 }
 
 /// Open the native kernel's authoritative KV store.

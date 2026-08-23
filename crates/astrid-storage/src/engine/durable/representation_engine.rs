@@ -7,7 +7,7 @@ use crate::storage_model::{ObjectId, RepresentationStateId};
 use super::representations::{DirectArenaObject, PendingRepresentationUpdate, RepresentationStore};
 use super::{
     DurableEngine, DurableError, DurableInner, PersistentObjectIdentity, PrincipalCodec,
-    canonical_record_bytes, live_files_mut, read_indexed_object_with_payload,
+    canonical_record_bytes, io_error, live_files_mut, read_indexed_object_with_payload,
     visit_indexed_objects,
 };
 
@@ -275,5 +275,113 @@ where
             )?);
         }
         representations.append_direct_update(&direct)
+    }
+
+    /// Contiguous object ids that still have no arena frame.
+    pub(crate) fn contiguous_ids_missing_from_arena(&self) -> Result<Vec<ObjectId>, DurableError> {
+        let inner = self.lock_usable()?;
+        let Some(store) = inner.representations.as_ref() else {
+            return Ok(Vec::new());
+        };
+        Ok(store
+            .contiguous_object_ids()
+            .filter(|id| !inner.index.contains_key(id))
+            .collect())
+    }
+
+    /// True when recovered physical state still names `LooseBlob` payloads.
+    pub(crate) fn has_contiguous_payloads(&self) -> Result<bool, DurableError> {
+        let inner = self.lock_usable()?;
+        Ok(inner
+            .representations
+            .as_ref()
+            .is_some_and(|store| store.contiguous_object_ids().next().is_some()))
+    }
+
+    /// Fail closed when a `LooseBlob` object is still absent from the arena.
+    pub(crate) fn require_contiguous_payloads_in_arena(&self) -> Result<(), DurableError> {
+        let inner = self.lock_usable()?;
+        let Some(store) = inner.representations.as_ref() else {
+            return Ok(());
+        };
+        for id in store.contiguous_object_ids() {
+            if !inner.index.contains_key(&id) {
+                return Err(DurableError::InvalidRepresentationState(
+                    "unnamed loose payload not in catalog",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop packed `LooseBlob` indexes and physically retire their volume regions.
+    ///
+    /// Named payloads must already be `DirectCanonical` arena objects. Unnamed
+    /// blobs stay on disk. After region removal the volume is synced
+    /// (`Operation::Commit`) and reclaimed.
+    pub(crate) fn retire_packed_contiguous_payloads(&self) -> Result<(), DurableError> {
+        let mut inner = self.lock_usable()?;
+        let volume = self.volume.read().as_ref().cloned();
+        let pending = match inner.representations.as_ref() {
+            Some(store) => {
+                let pending: Vec<_> = store.contiguous_object_ids().collect();
+                for id in &pending {
+                    if !inner.index.contains_key(id) || !store.contains_direct(*id) {
+                        return Err(DurableError::InvalidRepresentationState(
+                            "unnamed loose payload not in catalog",
+                        ));
+                    }
+                }
+                pending
+            },
+            None => return Ok(()),
+        };
+        if !pending.is_empty() {
+            let DurableInner {
+                files,
+                index,
+                representations,
+                ..
+            } = &mut *inner;
+            let representations =
+                representations
+                    .as_mut()
+                    .ok_or(DurableError::InvalidRepresentationState(
+                        "unnamed loose payload not in catalog",
+                    ))?;
+            let files = live_files_mut(files)?;
+            representations.rebase_dropping_contiguous_payloads(
+                &files.arena,
+                index,
+                &self.identity,
+                self.limits,
+            )?;
+        }
+        let representations =
+            inner
+                .representations
+                .as_mut()
+                .ok_or(DurableError::InvalidRepresentationState(
+                    "unnamed loose payload not in catalog",
+                ))?;
+        if representations.contiguous_object_ids().next().is_some() {
+            return Err(DurableError::InvalidRepresentationState(
+                "unnamed loose payload not in catalog",
+            ));
+        }
+        if let Some(volume) = volume {
+            let removed = representations.retire_volume_loose_blobs()?;
+            if removed {
+                volume.sync().map_err(|source| {
+                    io_error("flush packed volume after loose-blob retirement", source)
+                })?;
+                volume.reclaim().map_err(|source| {
+                    io_error("reclaim packed volume after loose-blob retirement", source)
+                })?;
+            }
+        } else if !pending.is_empty() {
+            representations.retire_loose_blobs()?;
+        }
+        Ok(())
     }
 }
