@@ -27,9 +27,7 @@ where
         live: &BTreeSet<ObjectId>,
         volume: &Arc<dyn AstridVolume>,
     ) -> Result<CompactionReport, DurableError> {
-        // ContiguousFile blobs are volume regions, not host files. Arena
-        // compaction must not materialize those payloads as DirectCanonical
-        // frames. Count and copy only arena-resident objects.
+        // The packed arena is the sole source of live logical objects.
         let objects_before =
             u64::try_from(inner.index.len()).map_err(|_| DurableError::EncodingOverflow)?;
         let (arena_bytes_before, root_bytes, root_digest) = {
@@ -81,7 +79,6 @@ where
             &mut arena,
             &mut roots,
             &new_index,
-            inner.representations.as_ref(),
             &self.principal_codec,
             &self.identity,
             self.limits,

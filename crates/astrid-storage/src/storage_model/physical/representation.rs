@@ -138,7 +138,9 @@ pub enum Coverage {
         /// Complete canonical `ObjectRecord` byte length.
         canonical_record_bytes: u64,
     },
-    /// Canonical chunk records reconstructed from one contiguous file stream.
+    /// Legacy canonical chunk records from a contiguous file stream.
+    ///
+    /// Recovery rejects this coverage when it appears in durable metadata.
     CanonicalFileChunks {
         /// Canonical File object whose DAG fixes chunk order and lengths.
         file: ObjectId,
@@ -298,7 +300,9 @@ pub enum Recipe {
         /// Non-zero canonical record byte length.
         length: u64,
     },
-    /// One raw blob is a canonical File's contiguous payload stream.
+    /// Legacy raw blob for a canonical File's contiguous payload stream.
+    ///
+    /// The durable engine rejects this recipe instead of reconstructing it.
     ContiguousFile {
         /// Profile-bound raw file blob.
         blob: BlobId,

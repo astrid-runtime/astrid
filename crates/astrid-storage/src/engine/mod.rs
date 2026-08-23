@@ -42,9 +42,9 @@ pub use durable::{
     DeterministicCompactionProofVerifier, DurableEngine, DurableEnginePolicy, DurableError,
     FaultInjector, FaultPoint, GroupCommitPolicy, IdentityScheme, NoFaults, ObjectCacheCapacity,
     ObjectCacheConfig, ObjectCacheController, ObjectCacheMemoryBudget, ObjectCacheStats,
-    PersistentObjectIdentity, PreparedContiguousFile, PrincipalCodec, PrincipalObjectCacheBudget,
-    PublishedContiguousFile, RecoveryLimits, RecoveryRetryPolicy, TransactionWalPolicy,
-    VerifiedCompactionPlan, deterministic_compaction_proof,
+    PersistentObjectIdentity, PrincipalCodec, PrincipalObjectCacheBudget, RecoveryLimits,
+    RecoveryRetryPolicy, TransactionWalPolicy, VerifiedCompactionPlan,
+    deterministic_compaction_proof,
 };
 pub use kv::{
     KvProjectionEngine, KvProjectionError, KvState, KvStateSnapshot, ReadyKvRoot,

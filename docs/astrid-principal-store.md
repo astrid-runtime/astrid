@@ -276,11 +276,11 @@ BlobId = TaggedIdentity(1, 2, 32,
 Compression, encryption, erasure coding, or a future encoding migration may
 produce a new `BlobId` for the same `ObjectId`. Logical roots do not change.
 
-The exact profile-bound BlobId grammar, many-object contiguous coverage,
-representation catalogue, recovery leases, accounting, and staged-file
-adoption protocol are specified in [Exact Physical
-Representations](astrid-physical-representations.md). Semantic equivalence
-remains a separate layer.
+The exact profile-bound BlobId grammar, representation catalogue, recovery
+leases, and accounting are specified in [Exact Physical
+Representations](astrid-physical-representations.md). Its contiguous/loose
+sections are historical decode-only notes; current content writes use packed
+arena ingest. Semantic equivalence remains a separate layer.
 
 ### 6.3 `SemanticId`
 

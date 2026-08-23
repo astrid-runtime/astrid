@@ -354,7 +354,6 @@ where
         &mut replacement,
         &mut files.arena,
         index,
-        None,
         destination_codec,
         &engine.identity,
         engine.limits,

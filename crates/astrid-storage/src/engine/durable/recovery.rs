@@ -32,7 +32,6 @@ impl RecoveryScope {
 }
 
 pub(super) fn recover_store<P, I, C>(
-    path: &Path,
     store_root: &cap_std::fs::Dir,
     principal_codec: &SharedPrincipalCodec<C>,
     identity: &SharedIdentity<I>,
@@ -44,9 +43,9 @@ where
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
-    recover_interrupted_compaction(path, store_root, principal_codec, identity, limits)?;
+    recover_interrupted_compaction(store_root, principal_codec, identity, limits)?;
     let mut representations =
-        super::representations::RepresentationStore::open(path, store_root, limits)?;
+        super::representations::RepresentationStore::open(store_root, limits)?;
     let protected_arena_len = representations.as_ref().map_or(
         Ok(0),
         super::representations::RepresentationStore::generation_zero_protected_len,
@@ -85,7 +84,6 @@ where
     };
     if let Some(representations) = &mut representations {
         representations.validate_generation_zero_index(&index)?;
-        representations.rebuild_contiguous_index(&mut arena, &index, identity, limits)?;
     }
     let mut index = index;
     let wal_writer = if let Some(wal_file) = wal_file {
@@ -106,7 +104,6 @@ where
         &mut roots,
         &mut arena,
         &index,
-        representations.as_ref(),
         principal_codec,
         identity,
         limits,
@@ -184,7 +181,6 @@ where
     };
     if let Some(store) = &mut representations {
         store.validate_generation_zero_index(&index)?;
-        store.rebuild_contiguous_index(&mut arena, &index, identity, limits)?;
     }
     let mut index = index;
     let wal_writer = if let Some(wal_file) = wal_file {
@@ -205,7 +201,6 @@ where
         &mut roots,
         &mut arena,
         &index,
-        representations.as_ref(),
         principal_codec,
         identity,
         limits,
@@ -450,8 +445,7 @@ where
             self.directory_capability.as_deref(),
             volume.as_ref(),
         ) {
-            (Some(path), Some(directory), None) => recover_store(
-                path,
+            (Some(_), Some(directory), None) => recover_store(
                 directory,
                 &self.principal_codec,
                 &self.identity,

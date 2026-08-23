@@ -1,14 +1,20 @@
 # Astrid Exact Physical Representations
 
-Status: design contract; no capsule or WIT surface is activated
+Status: historical design reference; no capsule or WIT surface is activated
+
+The contiguous-file and `LooseBlob` material below is retained only to explain
+the frozen format tags. That path was never released: current runtime writes
+use packed arena ingest, and durable recovery rejects legacy contiguous recipes
+and loose locators before they can serve content. Do not implement a new writer
+or reader from the historical sections.
 
 Tracks: [#1396](https://github.com/astrid-runtime/astrid/issues/1396)
 
 This document defines the physical seam between a logical `ObjectId` and the
-bytes from which that object can be recovered. It covers the current arena,
-adopted contiguous staging files, packed and compressed bytes, exact deltas,
-and deterministic generator recipes without turning any of them into a second
-logical object model.
+bytes from which that object can be recovered. The current durable path is the
+packed arena; the contiguous, compressed, delta, and generator sections below
+are frozen design grammar or historical experiments, not enabled writers or
+readers.
 
 The deterministic `export_closure` bundle remains the archival authority. The
 live engine, its representation catalogue, placement records, and indexes are
@@ -526,7 +532,7 @@ ReplicaV1 {
     storage_node: StorageNodeId,      // canonical wire is u32
     locator: ArenaFrame { arena_generation: u64, offset: u64,
                           payload_length: u64, frame_checksum: [u8; 32] }
-           | LooseBlob { namespace_generation: u64 }
+           | LooseBlob { namespace_generation: u64 } // legacy decode-only tag
            | PackFrame { pack_generation: u64, offset: u64,
                          frame_length: u64, frame_checksum: [u8; 32] },
 }
@@ -543,7 +549,7 @@ root, locator paths are canonical ASCII and never supplied by an index:
 ```text
 ArenaFrame generation 0:  objects.arena
 ArenaFrame generation N:  representations/blobs/arenas/<N:016x>.arena
-LooseBlob generation N:   representations/blobs/loose/<N:016x>/<BlobId>.blob
+LooseBlob generation N:   (legacy; no current runtime path)
 PackFrame generation N:   representations/blobs/packs/<N:016x>.pack
 ```
 
@@ -573,28 +579,10 @@ must equal the `PlacementEntryV1`; the encoded bytes reproduce the BlobId.
 Generation-zero arena locators instead read the existing `ASTOBJ1\0` object
 frame grammar. Pack ranges are in-bounds and non-overlapping.
 
-A `LooseBlob` keeps encoded bytes raw for zero-copy adoption and requires the
-sibling `<BlobId>.meta` beside `<BlobId>.blob`. The metadata is one common
-format-one frame with magic `ASTBLM1\0` and payload:
-
-```text
-LooseBlobMetaV1 = version:u16 = 1 || blob:BlobId
-    || profile:RepresentationProfileId || encoded_length:u64
-```
-
-Metadata publishes first via exclusive `<BlobId>.meta.tmp`, file flush,
-reopen verification, no-replace rename, and directory flush; only then may the
-raw blob install no-replace. Equal occupied metadata is reusable after exact
-frame comparison; unequal metadata is a fatal collision. A raw blob without
-valid metadata is unattributed and never reused. The placement CAS follows
-verification of both files. Thus a crash before the CAS retains the original
-profile preimage, and admission can stream the exact raw length to collision-
-compare and rederive the BlobId. Adoption recovery additionally binds this
-metadata to its durable intent.
-
-Locators agree with frame headers; profile and length reproduce the BlobId
-preimage. Counts never trust a disposable index. Tags are arena `0`, loose `1`,
-and pack `2`.
+`LooseBlob` and its sidecar metadata are historical, decode-only grammar. The
+durable runtime rejects any placement carrying this locator; it never creates,
+opens, verifies, or retires loose blob regions. Current writes use the packed
+arena path and its ordinary `ArenaFrame` placements.
 
 The catalogue and placement roots become authoritative only as one pair:
 
@@ -693,7 +681,11 @@ representation failure; neither is an untyped "candidate" failure.
 The operator policy, bounded search, and measurement contract are normative in
 [astrid-storage-performance.md](astrid-storage-performance.md#representation-selection-cost-model).
 
-## Publication and replacement
+## Historical publication model (not runtime)
+
+The following sequence records an unshipped alternate-representation design.
+Current content publication uses packed arena ingest, and no LooseBlob or
+contiguous replacement/retirement operation is available.
 
 General representation publication uses this order:
 
@@ -741,11 +733,9 @@ through the existing recovery path before another mutation.
 
 ## Contiguous staged-file adoption
 
-The byte-exact intent grammar, crash protocol, and one-write adoption path are
-normative in
-[astrid-contiguous-staged-file-adoption.md](astrid-contiguous-staged-file-adoption.md).
-Adoption is a consumer of this representation contract, never a second
-publication path.
+The proposed staged-file/`LooseBlob` adoption path was retired before release.
+`put_streaming_batch` is the sole home ingest path; legacy contiguous metadata
+fails closed during recovery and is never reconstructed as content.
 
 ## Liveness, GC, and compaction
 
@@ -764,9 +754,9 @@ recoverable.
 
 Logical reachability and representation reachability are separate fact
 families. The existing format-one `GcFactSnapshotId` continues to describe the
-logical object universe and root/pin reachability. Representation selection and
-blob retirement use a separate canonical representation-placement snapshot;
-they do not reinterpret historical GC snapshots or receipts.
+logical object universe and root/pin reachability. Any future representation
+placement would use a separate canonical snapshot; current packed arena
+collection does not expose a LooseBlob retirement operation.
 
 The native collector enforces both proofs while holding the mutation fence.
 Tensor Logic may explain or audit the relations, but it cannot authorize
@@ -781,16 +771,11 @@ Two races receive explicit fences:
   placement epoch. Compaction may install a new path but cannot remove the
   leased path until the handle closes.
 
-A contiguous blob can retain far more bytes than the surviving slices need.
-Compaction measures this amplification. It may keep the blob for hot sequential
-reads, materialize independent live chunks, or add a compressed representation
-before retiring it. It must never delete the blob while it is the final path
-for any live covered object.
-
-Compaction is the preferred representation-migration window because it already
-streams live bytes. Reverification, sketches, reordering, recompression, and
-contiguous materialization may share that traversal, while their CPU,
-metadata, and writes remain measured rather than called free.
+Historical contiguous blobs could retain more bytes than surviving slices
+needed; that design is archived and has no compaction or retirement path.
+Current compaction streams live packed arena bytes and preserves canonical
+chunk identities. Reverification, sketches, reordering, and any future
+transform remain measured experiments rather than implicit writers.
 
 ## Accounting and privacy
 
@@ -913,8 +898,8 @@ Arena-only stores require no principal migration:
 2. Creating an explicit representation catalogue is additive. Until the amended
    `format-spec-object` marker is durable, the arena remains the required recovery path.
 3. Alternate representations may be populated without changing roots.
-4. Compaction may remove the final arena copy only after `store.meta` atomically
-   names the amended RÚNATAL `format-spec-object` that defines the catalogue.
+4. Compaction preserves the final packed arena copy; no alternate representation
+   may replace it through this compatibility path.
 5. Downgrade materializes, flushes, and verifies canonical arena records before
    atomically restoring the predecessor `format-spec-object`; only then may it reclaim representation state.
 
@@ -922,11 +907,10 @@ The format-spec marker, catalogue, and placement formats are engine-local
 recovery state. They receive the same torn-tail and byte-prefix crash testing
 as the arena. Before activation, the store's in-band RÚNATAL specification and
 independent reader must learn their byte-exact grammar and be able to enumerate
-every representation. Direct and contiguous materialized profiles must be
-recoverable without Astrid code. Transform recipes may remain an optional live
-economy only because their complete archived closure is retained and full
-export materializes their outputs; they do not weaken RÚNATAL's canonical
-materialized-export promise.
+every packed representation. Legacy contiguous/LooseBlob profiles are rejected
+before reconstruction. Transform recipes may remain archived model grammar
+only because full export materializes canonical records; they do not weaken
+RÚNATAL's canonical materialized-export promise.
 
 ## Lifecycle summary
 
@@ -935,9 +919,9 @@ admission
     untrusted candidate -> bounded reconstruction -> identity comparison
     -> durable staging -> catalogue/placement publication
 
-adoption
-    durable sealed file -> one-pass DAG and BlobId -> durable rename intent
-    -> blob placement -> representation publication -> principal root CAS
+ingest
+    staged home files -> packed arena frames -> representation publication
+    -> principal root CAS
 
 selection
     authorized ObjectId -> constrained candidates -> lease -> reconstruct

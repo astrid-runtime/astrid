@@ -118,7 +118,10 @@ pub enum RepresentationAdmissionMethod {
     Direct,
     /// Canonical object bytes in a pack slice.
     PackedSlice,
-    /// Raw contiguous file bytes reconstructed as canonical chunks.
+    /// Legacy raw contiguous file reconstruction (decode-only).
+    ///
+    /// Durable recovery rejects this method; it is retained solely for the
+    /// frozen evidence grammar.
     ContiguousFile,
     /// Compressed canonical object bytes.
     Compressed,

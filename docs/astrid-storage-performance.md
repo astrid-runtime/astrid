@@ -17,7 +17,8 @@ Device-local results below remain historical diagnostics; they are not copied
 into crate-facing documentation as portable performance claims.
 
 Status: convergence and native-path baselines recorded; mounted-provider
-measurements pending
+measurements pending. Contiguous/LooseBlob measurements below are archived
+pre-release experiments and do not describe current runtime behavior.
 
 Last reviewed: 2026-08-05
 
@@ -669,21 +670,20 @@ admitted. The channel is bounded, source and appender failures publish no root,
 worker schedules preserve the canonical batch root, and diagnostics remain
 operator-only so physical dedup does not become a principal-visible oracle.
 
-### Contiguous staged-file adoption
+### Retired contiguous-adoption benchmark (archived)
 
-Clean commit `da8e3cd0` integrates the native staging path with contiguous
-physical representations. The sealed staging generation stays unchanged as
-the retry witness; APFS or Linux reflink cloning publishes a source-preserving
-whole-file representation, while unsupported filesystems take the verified
-copy fallback. File and ChunkTree objects remain canonical arena records, and
-snapshot/export materializes every virtual Chunk record so archives never
-depend on the live representation engine.
+The following measurements describe a pre-release experiment that was removed
+before LooseBlob shipped. They are retained only as historical evidence for the
+issue work that led to the packed arena design. The sealed staging generation,
+reflink/copy publication, and contiguous read path are not current runtime
+behavior; `put_streaming_batch` is the sole content writer and recovery rejects
+legacy contiguous metadata.
 
 The run used the same deterministic 512 MiB incompressible corpus, three
 samples, one-MiB ranges, four principals, eight bulk workers, and a governed
 one-GiB object cache on M2 Ultra/APFS.
 
-| Workload | Dense-catalogue checkpoint | Contiguous adoption | Change |
+| Workload | Dense-catalogue checkpoint | Archived contiguous experiment | Change |
 | --- | ---: | ---: | ---: |
 | Unique publication | 179.5 MiB/s | 271.3 MiB/s | +51.1% |
 | Duplicate publication | 256.5 MiB/s | 388.2 MiB/s | +51.3% |
@@ -707,11 +707,10 @@ the logical representation length. The source-preserving protocol proves one
 application write plus reflink publication on supported filesystems, while
 exact physical-allocation attribution remains filesystem-specific.
 
-Populated reopen is 1.531 seconds because ordinary recovery currently
-revalidates the full contiguous blob before rebuilding its disposable slice
-index. That is honest recovery work, not a mounted-read cost, but it remains a
-scale target for the already-recorded verified-checkpoint/demand-paged-index
-work. No startup result here is extrapolated to terabyte scale.
+The archived populated-reopen result was 1.531 seconds because that experiment
+revalidated its full contiguous blob before rebuilding a disposable slice
+index. It is not a current startup or mounted-read claim and must not guide a
+new writer or reader implementation.
 
 Clean commit `6384aaec` adds adversarial source-reuse and no-follow hardening.
 An occupied canonical blob is reused only after a byte-exact comparison with
@@ -826,17 +825,16 @@ descriptor and traversal state, bounded read-ahead, and a representation-aware
 fast path. It must not implement each VFS read callback as an independent
 high-level named-content lookup.
 
-The contiguous-representation design in #1396 is the route for hot large-file
-reads. The canonical chunk DAG remains the logical identity and transfer form;
-a verified contiguous representation lets the provider serve ordinary
-sequential and `mmap`-compatible reads without rebuilding the file for every
-request.
+The retired contiguous-representation design in #1396 is historical only. The
+canonical chunk DAG remains the logical identity and transfer form, and the
+current packed arena path is the only runtime placement for hot large-file
+reads. Legacy contiguous metadata is rejected rather than used as a read
+fallback.
 
 The exact contract is documented in [Exact Physical
-Representations](astrid-physical-representations.md). A contiguous staging file
-covers the canonical Chunk records selected by its File DAG while the small
-File and ChunkTree records remain materialized. This avoids both a second full
-data write and one persistent slice record per chunk.
+Representations](astrid-physical-representations.md). Its contiguous sections
+are historical format notes; current staging covers canonical Chunk records via
+packed arena ingest and keeps the File and ChunkTree records materialized.
 
 ## Current bottleneck map
 
@@ -852,8 +850,8 @@ inferred from throughput alone:
   below is the direct signature of this fixed ceremony. The first corrective
   sequence is an immutable decoded-object cache, positional reads outside the
   engine mutex, and an open-content handle that pins root/descriptor/traversal
-  state (#1399); contiguous representations then remove gather I/O for hot
-  large objects.
+  state (#1399); packed arena placements remain the current path for hot large
+  objects.
 - **Publication is serial and copy-heavy, but identity encoding is no longer
   under the mutex.** Streaming currently copies each chunk into an
   `ObjectRecord`; the sink identifies it, the durable admission boundary
@@ -894,7 +892,7 @@ The first-ever one-TiB ingest target of minutes is therefore not met by the
 current serial implementation. The measurement supports the existing work:
 parallel reader/chunker/hasher execution, a single coalesced appender,
 persistent indexing and compaction, a path-copy catalog, bounded builder
-metadata, group publication, and representation adoption. The benchmark must
+metadata, group publication, and packed direct placement. The benchmark must
 be rerun after each change instead of treating the projection as a promise.
 
 ## Representation selection cost model

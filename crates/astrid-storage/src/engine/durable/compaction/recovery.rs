@@ -100,7 +100,6 @@ pub(super) fn cleanup_without_intent(directory: &cap_std::fs::Dir) -> Result<(),
 }
 
 pub(super) fn recover_interrupted_compaction<P, I, C>(
-    directory: &Path,
     store_root: &cap_std::fs::Dir,
     codec: &C,
     identity: &I,
@@ -149,7 +148,7 @@ where
             "recovered compaction placement differs from its durable intent",
         ));
     }
-    rebase_representation_authority(directory, store_root, identity, limits)?;
+    rebase_representation_authority(store_root, identity, limits)?;
     remove_capability_file_if_exists(store_root, INDEX_FILE)?;
     let ready = outbox::mark_ready(store_root, intent_model.commit, identity, limits)?;
     if ready != bundle {
@@ -161,20 +160,17 @@ where
 }
 
 fn rebase_representation_authority<I: PersistentObjectIdentity>(
-    directory: &Path,
     store_root: &cap_std::fs::Dir,
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<(), DurableError> {
-    let Some(mut representations) = RepresentationStore::open(directory, store_root, limits)?
-    else {
+    let Some(mut representations) = RepresentationStore::open(store_root, limits)? else {
         return Ok(());
     };
     let mut arena = open_rw_capability(store_root, Path::new(ARENA_FILE), false)?;
     let (index, _) = recover_arena(&mut arena, identity, limits, 0)?;
-    representations.rebuild_contiguous_index(&mut arena, &index, identity, limits)?;
     representations.rebase_compacted_arena(&arena, &index, identity, limits)?;
-    representations.retire_loose_blobs()
+    Ok(())
 }
 
 fn validate_intent<I: PersistentObjectIdentity>(
@@ -359,9 +355,8 @@ where
     let mut arena = open_rw_capability(directory, Path::new(arena_name), false)?;
     let mut roots = open_rw_capability(directory, Path::new(root_name), false)?;
     let (index, _) = recover_arena(&mut arena, identity, limits, 0)?;
-    let (roots_by_principal, _) = recover_roots(
-        &mut roots, &mut arena, &index, None, codec, identity, limits,
-    )?;
+    let (roots_by_principal, _) =
+        recover_roots(&mut roots, &mut arena, &index, codec, identity, limits)?;
     let arena_bytes = arena
         .metadata()
         .map_err(|source| io_error("read candidate arena metadata", source))?

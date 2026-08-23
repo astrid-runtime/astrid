@@ -28,7 +28,10 @@ pub enum ReplicaLocator {
         /// Exact checksum copied from the frame header.
         frame_checksum: [u8; 32],
     },
-    /// One raw blob under a generation-scoped namespace.
+    /// Legacy raw blob under a generation-scoped namespace.
+    ///
+    /// Decoding retains this tag so recovery can reject unreleased metadata;
+    /// the durable engine never reads or writes this locator.
     LooseBlob {
         /// Namespace generation containing the blob and its metadata sibling.
         namespace_generation: u64,

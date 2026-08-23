@@ -279,7 +279,6 @@ where
         let identity = super::SharedIdentity::new(identity);
         let principal_codec = super::SharedPrincipalCodec::new(principal_codec);
         let (recovered, wal) = recover_store(
-            &path,
             &directory_capability,
             &principal_codec,
             &identity,

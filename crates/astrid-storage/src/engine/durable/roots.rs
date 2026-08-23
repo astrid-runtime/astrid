@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::storage_model::{ModelError, ObjectId, RootGeneration, RootState};
 
-use super::representations::RepresentationStore;
 use super::{
     ArenaLocation, DurableError, DurableIo, File, IdentityScheme, PersistentObjectIdentity,
     PrincipalCodec, ROOT_FILE, ROOT_MAGIC, RecoveryLimits, corrupt, materialize_closure,
@@ -39,7 +38,6 @@ pub(super) fn recover_roots<P, I, C, R>(
     roots: &mut R,
     arena: &mut File,
     index: &BTreeMap<ObjectId, ArenaLocation>,
-    representations: Option<&RepresentationStore>,
     codec: &C,
     identity: &I,
     limits: RecoveryLimits,
@@ -51,14 +49,13 @@ where
     R: DurableIo,
 {
     let recovered = recover_root_history(roots, codec, identity.scheme(), limits)?;
-    validate_recovered_roots(recovered, arena, index, representations, identity, limits)
+    validate_recovered_roots(recovered, arena, index, identity, limits)
 }
 
 fn validate_recovered_roots<P, I>(
     recovered: BTreeMap<P, (RootState, u64)>,
     arena: &mut File,
     index: &BTreeMap<ObjectId, ArenaLocation>,
-    representations: Option<&RepresentationStore>,
     identity: &I,
     limits: RecoveryLimits,
 ) -> Result<(BTreeMap<P, RootState>, BTreeSet<ObjectId>), DurableError>
@@ -74,7 +71,6 @@ where
                 index,
                 incoming: &BTreeMap::new(),
                 pending: None,
-                representations,
                 identity,
                 limits,
             },

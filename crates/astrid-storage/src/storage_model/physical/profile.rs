@@ -153,7 +153,9 @@ pub enum ProfileKind {
     DirectCanonical,
     /// Canonical object bytes held as a slice of a pack blob.
     PackedCanonical,
-    /// One contiguous file byte stream covering canonical chunk objects.
+    /// Legacy contiguous-file profile retained for decode-and-reject recovery.
+    ///
+    /// The durable engine does not admit or reconstruct this profile family.
     ContiguousFile,
     /// A pinned deterministic transform reconstructs canonical bytes.
     Transform,

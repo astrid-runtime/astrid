@@ -1,8 +1,8 @@
 //! Home-file ingest for owner-named content on volume media.
 //!
 //! New files use the same canonical streaming arena path as capsule content.
-//! The lower-level contiguous representation remains available to read old
-//! ASTVOL1 volumes, but new home imports never create loose blob regions.
+//! Legacy contiguous-file metadata is rejected during representation recovery;
+//! new home imports never create loose blob regions.
 
 use std::fs::File;
 
@@ -35,8 +35,8 @@ impl RuntimePrincipalStore {
     ///
     /// Files are chunked into `Chunk`/`ChunkTree`/`File` records in the shared
     /// object arena, then all names publish under one principal-root CAS and
-    /// durability boundary. Existing contiguous representations remain a
-    /// read-only compatibility path during ASTVOL1 recovery.
+    /// durability boundary. Legacy loose representations are not a readable
+    /// home-content format and fail closed during recovery.
     ///
     /// # Errors
     ///
@@ -104,7 +104,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn packed_volume_reopens_contiguous_payloads() {
+    async fn packed_volume_reopens_home_payloads() {
         let directory = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(directory.path());
         home.ensure().unwrap();
@@ -137,30 +137,6 @@ mod tests {
                 .unwrap(),
             &bytes[..4]
         );
-    }
-
-    async fn legacy_packed_home(bytes: &[u8]) -> (tempfile::TempDir, AstridHome) {
-        let directory = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(directory.path());
-        home.ensure().unwrap();
-        let store = open_runtime_principal_store(&home, unlimited_quota())
-            .await
-            .unwrap();
-        let prepared = store
-            .engine
-            .prepare_contiguous_file(
-                crate::content::ChunkingProfile::ASTRID_V1,
-                u64::try_from(bytes.len()).unwrap(),
-                std::io::Cursor::new(bytes),
-            )
-            .unwrap();
-        store
-            .engine
-            .publish_contiguous_copy(prepared, std::io::Cursor::new(bytes))
-            .unwrap();
-        store.engine.close().unwrap();
-        drop(store);
-        (directory, home)
     }
 
     #[tokio::test]
@@ -246,38 +222,6 @@ mod tests {
                 )
                 .unwrap(),
             bytes
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_loose_blob_read_rejects_a_lengthened_region() {
-        let bytes = vec![0x42_u8; 4096];
-        let (_directory, home) = legacy_packed_home(&bytes).await;
-        let volume = crate::volume::HostedFileVolume::open(home.storage_volume_path()).unwrap();
-        let regions = crate::volume::AstridVolume::list_regions(
-            volume.as_ref(),
-            "representations/blobs/loose",
-        )
-        .unwrap();
-        let blob = regions
-            .iter()
-            .find(|region| {
-                std::path::Path::new(region.as_str())
-                    .extension()
-                    .is_some_and(|ext| ext == "blob")
-            })
-            .expect("blob region")
-            .clone();
-        let len = crate::volume::AstridVolume::region_len(volume.as_ref(), &blob).unwrap();
-        crate::volume::AstridVolume::set_region_len(volume.as_ref(), &blob, len + 1).unwrap();
-        crate::volume::AstridVolume::write_region_at(volume.as_ref(), &blob, len, &[0xff]).unwrap();
-        drop(volume);
-        let Err(error) = open_runtime_principal_store(&home, unlimited_quota()).await else {
-            panic!("trailing blob bytes must fail closed");
-        };
-        assert!(
-            error.to_string().contains("contiguous blob length"),
-            "{error}"
         );
     }
 

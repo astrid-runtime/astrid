@@ -23,25 +23,12 @@ where
         let overlay_only = inner
             .pending_wal
             .objects()
-            .filter(|(id, _)| {
-                !inner.index.contains_key(id)
-                    && !inner
-                        .representations
-                        .as_ref()
-                        .is_some_and(|store| store.contains_contiguous(**id))
-            })
+            .filter(|(id, _)| !inner.index.contains_key(id))
             .count();
         inner
             .index
             .len()
             .checked_add(overlay_only)
-            .ok_or(DurableError::EncodingOverflow)?
-            .checked_add(
-                inner
-                    .representations
-                    .as_ref()
-                    .map_or(0, |store| store.contiguous_count_excluding(&inner.index)),
-            )
             .ok_or(DurableError::EncodingOverflow)
     }
 
@@ -53,32 +40,13 @@ where
     pub fn object(&self, id: ObjectId) -> Result<Option<ObjectRecord>, DurableError> {
         let mut recovery = RecoveryScope::default();
         loop {
-            let (location, contiguous, generation) = {
+            let (location, generation) = {
                 let inner = self.lock_usable_with(&mut recovery)?;
                 if let Some(object) = inner.pending_wal.get_object(&id) {
                     return Ok(Some(object.record().clone()));
                 }
-                let contiguous = match inner.representations.as_ref() {
-                    Some(store) => store.open_contiguous_read(id)?,
-                    None => None,
-                };
-                (
-                    inner.index.get(&id).copied(),
-                    contiguous,
-                    inner.arena_generation,
-                )
+                (inner.index.get(&id).copied(), inner.arena_generation)
             };
-            if location.is_none()
-                && let Some((file, location)) = contiguous
-            {
-                return super::representations::read_contiguous_object(
-                    file,
-                    location,
-                    id,
-                    &self.identity,
-                )
-                .map(Some);
-            }
             let Some(location) = location else {
                 return Ok(None);
             };

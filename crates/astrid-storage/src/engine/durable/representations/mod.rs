@@ -20,7 +20,6 @@ use super::{
     RecoveryLimits, append_frame, append_frames, canonical_record_bytes, io_error,
     read_indexed_object_with_payload,
 };
-pub(in crate::engine::durable) use format::Blake3PhysicalIdentity as PhysicalIdentityV1;
 use format::{
     Blake3PhysicalIdentity, CurrentPointer, JOURNAL_MAGIC, JournalEntry, METADATA_MAGIC,
     MetadataFrame, MetadataKind, journal_digest,
@@ -38,14 +37,10 @@ use recovery::{
 };
 
 mod contiguous;
-mod volume;
-pub(in crate::engine::durable) use volume::persist_store_blob;
 mod direct;
+mod volume;
 use authority::{create_file as create_cap_file, open_file as open_cap_file, quarantine_entry};
-pub(super) use contiguous::{
-    install_loose_blob_copy, install_loose_blob_from_file, open_regular_read, open_store_root,
-    read_contiguous_object,
-};
+pub(super) use contiguous::open_store_root;
 use contiguous::{open_component, sync_directory};
 
 pub(super) use direct::{DirectArenaObject, PreparedDirectArenaObject};
@@ -97,14 +92,7 @@ pub(super) fn append_legacy_profile_frame(
 }
 
 #[derive(Debug)]
-enum RepresentationMedia {
-    Directory(PinnedRepresentationRoot),
-    Volume(std::sync::Arc<dyn crate::volume::AstridVolume>),
-}
-
-#[derive(Debug)]
 pub(super) struct RepresentationStore {
-    media: RepresentationMedia,
     metadata: DurableFile,
     journal: DurableFile,
     journal_generation: u64,
@@ -118,13 +106,6 @@ pub(super) struct RepresentationStore {
     persisted_map_nodes: BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     direct_profile: RepresentationProfileId,
     reverse: BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
-    contiguous: BTreeMap<ObjectId, ContiguousLocation>,
-}
-
-#[derive(Debug)]
-pub(super) struct PinnedRepresentationRoot {
-    path: std::path::PathBuf,
-    directory: cap_std::fs::Dir,
 }
 
 pub(super) struct PendingRepresentationUpdate {
@@ -133,16 +114,7 @@ pub(super) struct PendingRepresentationUpdate {
     catalogue: RepresentationCatalogueRoot,
     placements: PlacementSet,
     reverse_additions: Vec<(ObjectId, RepresentationRecordId)>,
-    contiguous_additions: Vec<(ObjectId, ContiguousLocation)>,
     replacement_reverse: Option<BTreeMap<ObjectId, Vec<RepresentationRecordId>>>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct ContiguousLocation {
-    pub(super) blob: crate::storage_model::BlobId,
-    pub(super) namespace_generation: u64,
-    pub(super) offset: u64,
-    pub(super) length: u64,
 }
 
 struct DirectMapEntry {
@@ -154,11 +126,9 @@ struct DirectMapEntry {
 
 impl RepresentationStore {
     pub(super) fn open(
-        store: &Path,
         store_root: &cap_std::fs::Dir,
         limits: RecoveryLimits,
     ) -> Result<Option<Self>, DurableError> {
-        let root = store.join(DIRECTORY);
         let root_directory = match contiguous::open_representation_root(store_root) {
             Ok(root) => root,
             Err(DurableError::Io { source, .. })
@@ -192,10 +162,6 @@ impl RepresentationStore {
         let index = recover_metadata(&mut metadata, limits)?;
         let (active, state) = recover_journal(&mut journal, current, &index, limits)?;
         let recovered = Self::from_recovered(
-            RepresentationMedia::Directory(PinnedRepresentationRoot {
-                path: root,
-                directory: root_directory,
-            }),
             metadata,
             journal,
             current.journal_generation,
@@ -207,13 +173,12 @@ impl RepresentationStore {
     }
 
     pub(super) fn activate(
-        store: &Path,
         store_root: &cap_std::fs::Dir,
         limits: RecoveryLimits,
         frozen_specification: ObjectId,
         objects: impl IntoIterator<Item = Result<DirectArenaObject, DurableError>>,
     ) -> Result<Self, DurableError> {
-        if let Some(existing) = Self::open(store, store_root, limits)? {
+        if let Some(existing) = Self::open(store_root, limits)? {
             return Ok(existing);
         }
         quarantine_entry(store_root, DIRECTORY, &format!("{DIRECTORY}.incomplete"))?;
@@ -293,7 +258,7 @@ impl RepresentationStore {
             .map_err(|source| io_error("flush representation root", source))?;
         drop(metadata);
         drop(journal);
-        Self::open(store, store_root, limits)?.ok_or(DurableError::InvalidRepresentationState(
+        Self::open(store_root, limits)?.ok_or(DurableError::InvalidRepresentationState(
             "published representation state did not reopen",
         ))
     }
@@ -315,12 +280,7 @@ impl RepresentationStore {
         // (the in-band specification and other bootstrap records) remain
         // recoverable through store.meta. Compaction must not silently pull
         // those independent roots into the representation catalogue.
-        let previously_authoritative = self
-            .reverse
-            .keys()
-            .chain(self.contiguous.keys())
-            .copied()
-            .collect::<BTreeSet<_>>();
+        let previously_authoritative = self.reverse.keys().copied().collect::<BTreeSet<_>>();
         let direct = index
             .iter()
             .filter(|(id, _)| previously_authoritative.contains(id))
@@ -382,15 +342,6 @@ impl RepresentationStore {
 
     pub(super) const fn direct_profile(&self) -> RepresentationProfileId {
         self.direct_profile
-    }
-
-    fn profile(&self, id: RepresentationProfileId) -> Result<RepresentationProfile, DurableError> {
-        self.profiles
-            .get(PhysicalMapKey::from(id))
-            .ok_or(DurableError::InvalidRepresentationState(
-                "representation profile disappeared",
-            ))
-            .and_then(|bytes| RepresentationProfile::decode(bytes).map_err(Into::into))
     }
 
     pub(super) const fn active(&self) -> RepresentationStateId {
@@ -510,15 +461,12 @@ impl RepresentationStore {
             catalogue,
             placements,
             reverse_additions,
-            contiguous_additions: Vec::new(),
             replacement_reverse: None,
         }))
     }
 
     /// Replace every active physical representation with the supplied direct
-    /// arena placement. This is the compaction handoff: all represented live
-    /// objects have already been materialized into the replacement arena, so
-    /// no retired loose blob remains authoritative after this state CAS.
+    /// arena placement after compaction has materialized all live objects.
     pub(super) fn rebase_all_direct(
         &mut self,
         objects: &[DirectArenaObject],
@@ -589,7 +537,6 @@ impl RepresentationStore {
             catalogue,
             placements,
             reverse_additions: Vec::new(),
-            contiguous_additions: Vec::new(),
             replacement_reverse: Some(replacement_reverse),
         };
         self.publish_direct_update(update)?;
@@ -708,12 +655,10 @@ impl RepresentationStore {
         self.placements = update.placements;
         if let Some(replacement) = update.replacement_reverse {
             self.reverse = replacement;
-            self.contiguous.clear();
         } else {
             for (object, representation) in update.reverse_additions {
                 self.reverse.entry(object).or_default().push(representation);
             }
-            self.contiguous.extend(update.contiguous_additions);
         }
         Ok(())
     }
@@ -840,7 +785,6 @@ impl RepresentationStore {
     }
 
     fn from_recovered(
-        media: RepresentationMedia,
         metadata: DurableFile,
         journal: DurableFile,
         journal_generation: u64,
@@ -889,7 +833,6 @@ impl RepresentationStore {
             ));
         }
         Ok(Self {
-            media,
             metadata,
             journal,
             journal_generation,
@@ -903,24 +846,7 @@ impl RepresentationStore {
             persisted_map_nodes: index.nodes.keys().copied().collect(),
             direct_profile,
             reverse,
-            contiguous: BTreeMap::new(),
         })
-    }
-
-    fn directory_media(&self) -> Result<(&std::path::Path, &cap_std::fs::Dir), DurableError> {
-        match &self.media {
-            RepresentationMedia::Directory(root) => Ok((root.path.as_path(), &root.directory)),
-            RepresentationMedia::Volume(_) => Err(DurableError::InvalidRepresentationState(
-                "operation requires hosted-directory physical media",
-            )),
-        }
-    }
-
-    fn volume_media(&self) -> Option<&std::sync::Arc<dyn crate::volume::AstridVolume>> {
-        match &self.media {
-            RepresentationMedia::Volume(volume) => Some(volume),
-            RepresentationMedia::Directory(_) => None,
-        }
     }
 }
 

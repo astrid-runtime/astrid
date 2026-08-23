@@ -86,26 +86,6 @@ impl File {
         }
     }
 
-    pub(in crate::engine::durable) fn write_from(
-        &mut self,
-        payload_len: u64,
-        payload: &mut dyn Read,
-    ) -> io::Result<()> {
-        match self {
-            Self::Native(file) => {
-                let copied = std::io::copy(&mut payload.take(payload_len), file)?;
-                if copied != payload_len {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "durable file source ended before its declared length",
-                    ));
-                }
-                Ok(())
-            },
-            Self::Volume(file) => file.write_from(payload_len, payload),
-        }
-    }
-
     pub(in crate::engine::durable) fn metadata(&self) -> io::Result<StoreMetadata> {
         match self {
             Self::Native(file) => file.metadata().map(StoreMetadata::Native),

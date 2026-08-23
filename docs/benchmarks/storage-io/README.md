@@ -15,6 +15,11 @@ This directory contains evidence only:
   host, and workload; and
 - `SHA256SUMS`, which fixes the imported result bytes.
 
+Any result named `contiguous` or `LooseBlob` below is an archived pre-release
+experiment. It describes code that never shipped and must not be used as a
+runtime or performance contract. Current content publication uses packed arena
+ingest (`put_streaming_batch`); recovery rejects legacy contiguous metadata.
+
 The `94e7cea7` main, `d6bc3d06`/`0d5a42b3`/`603d260b`
 physical-catalogue, and `ce756e1e` dense-radix envelopes form one lineage. They
 establish the pre-change baseline, expose the initial physical-metadata
@@ -93,6 +98,8 @@ to another publication phase. Median eight-worker pending memory rises from
 58,853,269 to 67,303,811 bytes and remains bounded by the configured worker
 window. The evidence is in
 `astrid-storage-closure-after-a4a492b.json`.
+
+## Archived contiguous-adoption artifacts
 
 The contiguous-adoption checkpoint at clean commit `da8e3cd0` keeps the sealed
 staging generation as the retry witness and publishes a verified whole-file

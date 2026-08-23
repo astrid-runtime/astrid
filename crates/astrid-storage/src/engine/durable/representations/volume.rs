@@ -1,13 +1,11 @@
-//! Physical representation catalogue and loose blobs on Astrid volume media.
+//! Physical representation catalogue on Astrid volume media.
 //!
 //! Volume regions are placement, not identity. Catalogue files keep the same
-//! frame grammar as the directory store; file payloads use `ContiguousFile`
-//! blobs instead of `DirectCanonical` chunk frames.
+//! frame grammar as the directory store.
 
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
-use crate::storage_model::{BlobId, ObjectId, RepresentationProfileId};
+use crate::storage_model::ObjectId;
 use crate::volume::AstridVolume;
 
 use super::super::{File as DurableFile, RecoveryLimits};
@@ -19,7 +17,7 @@ use super::format::{
 use super::recovery::{read_current_file, recover_journal, recover_metadata};
 use super::{
     DIRECTORY, DurableError, FIRST_JOURNAL_GENERATION, GENERATIONS_DIRECTORY, JOURNAL_PATH,
-    METADATA_PATH, RepresentationMedia, RepresentationStore, append_frame, append_frames, io_error,
+    METADATA_PATH, RepresentationStore, append_frame, append_frames, io_error,
 };
 
 const CURRENT_REGION: &str = "representations/CURRENT";
@@ -49,7 +47,6 @@ impl RepresentationStore {
         let index = recover_metadata(&mut metadata, limits)?;
         let (active, state) = recover_journal(&mut journal, current, &index, limits)?;
         let recovered = Self::from_recovered(
-            RepresentationMedia::Volume(Arc::clone(volume)),
             metadata,
             journal,
             current.journal_generation,
@@ -157,178 +154,8 @@ impl RepresentationStore {
     }
 }
 
-/// Persist a store blob through `DurableFile`. Not a POSIX ingest.
-pub(in crate::engine::durable) fn persist_store_blob<R: Read>(
-    volume: &Arc<dyn AstridVolume>,
-    blob: BlobId,
-    profile: RepresentationProfileId,
-    logical_bytes: u64,
-    source: R,
-) -> Result<(), DurableError> {
-    let blob_region = blob_region(blob, super::contiguous::LOOSE_NAMESPACE_GENERATION);
-    let meta_region = format!("{blob_region}.meta");
-    let expected_meta = super::contiguous::encode_loose_metadata(profile, blob, logical_bytes)?;
-    write_exact_region(volume, &meta_region, &expected_meta, true)?;
-    if region_exists(volume, &blob_region)? {
-        verify_volume_blob(volume, &blob_region, profile, blob, logical_bytes)?;
-        return Ok(());
-    }
-    let named = crate::volume::VolumeRegion::new(&blob_region)
-        .map_err(|source| io_error("validate volume contiguous blob region", source))?;
-    let mut file = crate::volume::VolumeFile::create_new(Arc::clone(volume), named.clone())
-        .map(DurableFile::Volume)
-        .map_err(|source| io_error("create store blob file", source))?;
-    let mut source = source.take(logical_bytes);
-    if let Err(error) = file.write_from(logical_bytes, &mut source) {
-        let _ = volume.remove_region(&named);
-        return Err(map_blob_copy_error(error));
-    }
-    if let Err(error) = file
-        .sync_data()
-        .map_err(|source| io_error("flush store blob file", source))
-    {
-        let _ = volume.remove_region(&named);
-        return Err(error);
-    }
-    if let Err(error) = verify_volume_blob(volume, &blob_region, profile, blob, logical_bytes) {
-        let _ = volume.remove_region(&named);
-        return Err(error);
-    }
-    Ok(())
-}
-
-fn map_blob_copy_error(source: std::io::Error) -> DurableError {
-    if source.kind() == std::io::ErrorKind::UnexpectedEof {
-        DurableError::InvalidRepresentationState(
-            "volume contiguous blob source ended before its declared length",
-        )
-    } else {
-        io_error("copy volume contiguous blob", source)
-    }
-}
-
-pub(in crate::engine::durable) fn open_volume_blob(
-    volume: &Arc<dyn AstridVolume>,
-    blob: BlobId,
-    namespace_generation: u64,
-) -> Result<DurableFile, DurableError> {
-    DurableFile::volume(
-        Arc::clone(volume),
-        &blob_region(blob, namespace_generation),
-        false,
-    )
-}
-
-pub(in crate::engine::durable) fn verify_installed_volume_blob(
-    volume: &Arc<dyn AstridVolume>,
-    blob: BlobId,
-    profile: RepresentationProfileId,
-    logical_bytes: u64,
-    namespace_generation: u64,
-) -> Result<(), DurableError> {
-    let name = blob_region(blob, namespace_generation);
-    let meta_region = format!("{name}.meta");
-    let expected = super::contiguous::encode_loose_metadata(profile, blob, logical_bytes)?;
-    let mut meta = DurableFile::volume(Arc::clone(volume), &meta_region, false)?;
-    let mut actual = Vec::new();
-    meta.read_to_end(&mut actual)
-        .map_err(|source| io_error("read volume contiguous blob metadata", source))?;
-    if actual != expected {
-        return Err(DurableError::InvalidRepresentationState(
-            "volume contiguous blob metadata disagrees with its profile",
-        ));
-    }
-    verify_volume_blob(volume, &name, profile, blob, logical_bytes)
-}
-
-fn verify_volume_blob(
-    volume: &Arc<dyn AstridVolume>,
-    region: &str,
-    profile: RepresentationProfileId,
-    blob: BlobId,
-    logical_bytes: u64,
-) -> Result<(), DurableError> {
-    let named = crate::volume::VolumeRegion::new(region)
-        .map_err(|source| io_error("validate volume contiguous blob region", source))?;
-    let stored = volume
-        .region_len(&named)
-        .map_err(|source| io_error("read volume contiguous blob length", source))?;
-    if stored != logical_bytes {
-        return Err(DurableError::InvalidRepresentationState(
-            "volume contiguous blob length disagrees with its logical prefix",
-        ));
-    }
-    let mut file = DurableFile::volume(Arc::clone(volume), region, false)?;
-    let mut hasher = super::contiguous::blob_hasher(profile, logical_bytes);
-    let mut remaining = logical_bytes;
-    let mut buffer = vec![0_u8; 64 * 1024];
-    file.seek(SeekFrom::Start(0))
-        .map_err(|source| io_error("rewind volume contiguous blob", source))?;
-    while remaining > 0 {
-        let want = usize::try_from(remaining.min(u64::try_from(buffer.len()).unwrap_or(u64::MAX)))
-            .map_err(|_| DurableError::EncodingOverflow)?;
-        let read = file
-            .read(&mut buffer[..want])
-            .map_err(|source| io_error("read volume contiguous blob", source))?;
-        if read == 0 {
-            return Err(DurableError::InvalidRepresentationState(
-                "volume contiguous blob is truncated",
-            ));
-        }
-        hasher.update(&buffer[..read]);
-        remaining = remaining
-            .checked_sub(u64::try_from(read).map_err(|_| DurableError::EncodingOverflow)?)
-            .ok_or(DurableError::EncodingOverflow)?;
-    }
-    let computed = hasher.finalize();
-    if computed.as_bytes() != blob.as_bytes() {
-        return Err(DurableError::InvalidRepresentationState(
-            "volume contiguous blob identity mismatch",
-        ));
-    }
-    Ok(())
-}
-
-fn write_exact_region(
-    volume: &Arc<dyn AstridVolume>,
-    name: &str,
-    bytes: &[u8],
-    replace_equal: bool,
-) -> Result<(), DurableError> {
-    if region_exists(volume, name)? {
-        let mut existing = DurableFile::volume(Arc::clone(volume), name, false)?;
-        let mut actual = Vec::new();
-        existing
-            .read_to_end(&mut actual)
-            .map_err(|source| io_error("read existing volume blob metadata", source))?;
-        if actual.as_slice() == bytes {
-            return Ok(());
-        }
-        if !replace_equal {
-            return Err(DurableError::InvalidRepresentationState(
-                "occupied volume blob metadata has a different preimage",
-            ));
-        }
-        return Err(DurableError::InvalidRepresentationState(
-            "occupied volume blob metadata has a different preimage",
-        ));
-    }
-    let mut file = DurableFile::volume(Arc::clone(volume), name, true)?;
-    file.write_all(bytes)
-        .map_err(|source| io_error("write volume blob metadata", source))?;
-    file.sync_data()
-        .map_err(|source| io_error("flush volume blob metadata", source))
-}
-
 fn generation_region(generation: &str, file: &str) -> String {
     format!("{DIRECTORY}/{GENERATIONS_DIRECTORY}/{generation}/{file}")
-}
-
-fn blob_region(blob: BlobId, namespace_generation: u64) -> String {
-    format!(
-        "{DIRECTORY}/blobs/loose/{namespace_generation:016x}/{}",
-        super::contiguous::loose_blob_name(blob).display()
-    )
 }
 
 fn region_exists(volume: &Arc<dyn AstridVolume>, name: &str) -> Result<bool, DurableError> {

@@ -14,7 +14,7 @@ stream live stored bytes:
 - locality reordering;
 - representation migration;
 - future recompression; and
-- optional contiguous representation materialization.
+- packed arena compaction and direct-placement rebasing.
 
 The representation records, liveness rules, and selector that these passes
 consume are defined in [Exact Physical
@@ -168,8 +168,8 @@ state. During that traversal it may also:
 - order objects and index pages for observed stream locality;
 - replace a physical representation with a better verified encoding;
 - recompress cold data under a pinned representation contract; and
-- materialize a contiguous whole-file representation for measured hot
-  projection workloads.
+- retain the packed arena as the sole live physical source for projection
+  workloads.
 
 The design promise is zero additional full traversal of live source bytes, not
 zero marginal cost. Hashing, compression, Evidence objects, alternate
@@ -179,14 +179,11 @@ At least one recoverable representation of every live ObjectId remains
 reachable throughout publication. Compaction never exposes a window where the
 new placement is authoritative before its complete closure is durable.
 
-The current native compactor takes the conservative form of that rule. It
-materializes every live object, including chunks served only from a contiguous
-blob, into the replacement arena. It then publishes a direct-placement
-catalogue for that complete represented set before retiring the loose-blob
-namespace. The durable compaction intent makes both steps replayable after a
-crash. A future selection policy may preserve or create alternate
-representations during the same traversal, but it cannot weaken this authority
-handoff or make a loose blob disappear first.
+The current native compactor materializes every live object into the replacement
+arena and publishes a direct-placement catalogue for that complete represented
+set. The durable compaction intent makes the authority handoff replayable after
+a crash. Legacy contiguous/loose metadata is rejected during recovery rather
+than converted or retired.
 
 ## Evidence shape
 
