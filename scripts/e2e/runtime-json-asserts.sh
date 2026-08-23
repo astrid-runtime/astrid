@@ -319,27 +319,46 @@ json_assert_secret_list_metadata() {
   local file=$1
   local capsule=$2
   local key=$3
-  "$PYTHON" - "$file" "$capsule" "$key" <<'PY'
+  local required_scope=${4:-agent}
+  "$PYTHON" - "$file" "$capsule" "$key" "$required_scope" <<'PY'
 import json
 import sys
 
 data = json.load(open(sys.argv[1], encoding="utf-8"))
 capsule = sys.argv[2]
 key = sys.argv[3]
+required_scope = sys.argv[4]
 matches = [
     entry for entry in data
     if entry.get("capsule") == capsule and entry.get("key") == key
 ]
-if len(matches) != 1:
-    raise SystemExit(f"expected one secret metadata entry for {capsule}/{key}, got {matches!r}")
-entry = matches[0]
-if entry.get("storage") != "secret-store":
-    raise SystemExit(f"secret metadata did not report governed secret storage: {entry!r}")
-if entry.get("scope") != "agent":
-    raise SystemExit(f"secret metadata did not report agent scope: {entry!r}")
-for forbidden in ("value", "secret"):
-    if forbidden in entry:
-        raise SystemExit(f"secret metadata leaked {forbidden!r}: {entry!r}")
+if not matches:
+    raise SystemExit(f"missing secret metadata entry for {capsule}/{key}")
+if required_scope not in ("agent", "shared"):
+    raise SystemExit(f"invalid required secret metadata scope: {required_scope!r}")
+
+scopes = [entry.get("scope") for entry in matches]
+if required_scope not in scopes:
+    raise SystemExit(
+        f"secret metadata did not report required {required_scope!r} scope for "
+        f"{capsule}/{key}: {matches!r}"
+    )
+for scope in scopes:
+    if scope not in ("agent", "shared"):
+        raise SystemExit(f"secret metadata reported unexpected scope: {matches!r}")
+for scope in ("agent", "shared"):
+    count = scopes.count(scope)
+    if count > 1:
+        raise SystemExit(
+            f"secret metadata reported duplicate {scope!r} rows for "
+            f"{capsule}/{key}: {matches!r}"
+        )
+for entry in matches:
+    if entry.get("storage") != "secret-store":
+        raise SystemExit(f"secret metadata did not report governed secret storage: {entry!r}")
+    for forbidden in ("value", "secret"):
+        if forbidden in entry:
+            raise SystemExit(f"secret metadata leaked {forbidden!r}: {entry!r}")
 PY
 }
 

@@ -59,6 +59,12 @@ mod builder;
 mod log_debug;
 #[cfg(test)]
 pub(crate) use builder::AuditBuilder;
+
+/// Durable head CAS attempts per append/batch. Unbounded retry re-signed
+/// entries forever when metadata.head and `audit:chain_heads` disagreed,
+/// pinning CPU and ballooning RSS.
+pub(super) const MAX_HEAD_CAS_ATTEMPTS: u32 = 8;
+
 /// Result of importing a legacy principal-home audit database.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LegacyAuditImportReport {
@@ -558,7 +564,14 @@ impl AuditLog {
         // Resolve the parent hash from the head cache we already hold (falling
         // back to storage), NOT via a fresh lock — re-locking would reopen the
         // fork window between the read and the head advance below.
+        let mut cas_attempts = 0_u32;
         loop {
+            cas_attempts = cas_attempts.saturating_add(1);
+            if cas_attempts > MAX_HEAD_CAS_ATTEMPTS {
+                return Err(AuditError::StorageError(format!(
+                    "audit head CAS exhausted after {MAX_HEAD_CAS_ATTEMPTS} attempts"
+                )));
+            }
             let (expected_head, previous_hash) =
                 self.previous_hash_locked(&chain_key, head.as_ref()).await?;
 

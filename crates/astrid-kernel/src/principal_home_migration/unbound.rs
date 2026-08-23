@@ -43,7 +43,7 @@ pub(crate) async fn admit_unbound_legacy_principal_homes(
             ),
         ));
     }
-    astrid_core::platform_fs::validate_private_directory(&source_root)?;
+    astrid_core::platform_fs::ensure_private_directory_tree(&source_root)?;
     astrid_core::platform_fs::verify_no_redirects(&source_root)?;
 
     let mut entries = Vec::new();

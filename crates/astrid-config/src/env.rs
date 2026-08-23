@@ -85,6 +85,10 @@ const ENV_MAPPINGS: &[EnvMapping] = &[
         var_name: "ASTRID_RETRY_MCP_MAX_ATTEMPTS",
         field_path: "retry.mcp_max_attempts",
     },
+    EnvMapping {
+        var_name: "ASTRID_RATE_LIMITS_CAPSULE_RELOAD_PER_MIN",
+        field_path: "rate_limits.capsule_reload_per_min",
+    },
     // Standard Anthropic SDK env vars.
     EnvMapping {
         var_name: "ANTHROPIC_API_KEY",
@@ -290,6 +294,7 @@ fn coerce_to_toml_value(path: &str, val: &str) -> toml::Value {
             | "budget.warn_at_percent"
             | "rate_limits.elicitation_per_server_per_min"
             | "rate_limits.max_pending_requests"
+            | "rate_limits.capsule_reload_per_min"
             | "subagents.max_concurrent"
             | "subagents.max_depth"
             | "subagents.timeout_secs"

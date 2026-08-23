@@ -488,7 +488,14 @@ pub(crate) enum McpCommands {
     /// Long-running: serves on stdin/stdout until the client closes the
     /// stream (EOF) or the process is killed. Stdout carries the MCP
     /// JSON-RPC protocol only — all diagnostics go to stderr.
-    Serve,
+    Serve {
+        /// Project directory AOS host plugins pass as `$PWD`.
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        /// Accepted and ignored; MCP hosts own `tool_timeout_sec`.
+        #[arg(long = "request-timeout", value_name = "DURATION")]
+        request_timeout: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -596,6 +603,10 @@ pub(crate) enum DistroCommands {
 #[cfg(test)]
 #[path = "cli_distro_tests.rs"]
 mod distro_tests;
+
+#[cfg(test)]
+#[path = "cli_mcp_tests.rs"]
+mod mcp_tests;
 
 #[cfg(test)]
 #[path = "cli_capsule_tests.rs"]

@@ -1,9 +1,9 @@
 use super::key_types::SessionSequence;
 use super::{
-    ChainMetadata, DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SEGMENT_MAX_ENTRIES, DURABLE_APPEND_LOCK,
-    GlobalMetadata, KvAuditStorage, NS_CHAIN_HEADS, NS_CHAIN_METADATA, NS_COMMITTED_ENTRIES,
-    NS_ENTRIES, NS_GLOBAL_METADATA, NS_SEGMENT_INDEX, NS_SESSION_ENTRIES, NS_SESSION_SEQUENCE,
-    chain_head_key, parse_sequence,
+    AuditStorage, ChainMetadata, DEFAULT_SEGMENT_MAX_BYTES, DEFAULT_SEGMENT_MAX_ENTRIES,
+    DURABLE_APPEND_LOCK, GlobalMetadata, KvAuditStorage, NS_CHAIN_HEADS, NS_CHAIN_METADATA,
+    NS_COMMITTED_ENTRIES, NS_ENTRIES, NS_GLOBAL_METADATA, NS_SEGMENT_INDEX, NS_SESSION_ENTRIES,
+    NS_SESSION_SEQUENCE, chain_head_key, parse_sequence,
 };
 use crate::entry::AuditEntry;
 use crate::error::{AuditError, AuditResult};
@@ -16,7 +16,10 @@ const MAX_ATOMIC_BATCH_ENTRIES: usize = 128;
 type StoredValue = (String, Vec<u8>);
 
 struct ChainState {
-    head_expected: Option<AuditEntryId>,
+    /// Raw `audit:chain_heads` bytes currently stored, or `None` if absent.
+    /// Conditions must match these bytes, not a re-serialized UUID, or a
+    /// MOVE leftover encoding never commits and retries until CAS exhausts.
+    head_expected: Option<Vec<u8>>,
     metadata_expected: Option<Vec<u8>>,
     metadata: ChainMetadata,
     segment_index: Vec<StoredValue>,
@@ -165,32 +168,83 @@ impl KvAuditStorage {
                 .as_ref()
                 .is_some_and(|head| expected == Some(head)));
         }
-        let stored_head = self
+        let stored_head_bytes = self
             .store
             .get(NS_CHAIN_HEADS, chain_key)
             .await
             .map_err(|error| AuditError::StorageError(error.to_string()))?;
-        let stored_head = parse_stored_head(stored_head.as_deref())?;
-        if stored_head.as_ref() != expected {
-            return Ok(false);
-        }
+        let stored_head = parse_stored_head(stored_head_bytes.as_deref())?;
         let (metadata_expected, metadata) = self
             .load_chain_metadata(&entry.session_id, entry.principal.as_ref())
             .await?;
-        let metadata = metadata.unwrap_or_default();
-        if metadata.head.as_ref() != expected {
+        let Some(metadata) = self
+            .parent_metadata_for_append(metadata, expected, stored_head.as_ref())
+            .await?
+        else {
             return Ok(false);
-        }
+        };
         prepared.chains.insert(
             chain_key.to_owned(),
             ChainState {
-                head_expected: expected.cloned(),
+                head_expected: stored_head_bytes,
                 metadata_expected,
                 metadata,
                 segment_index: Vec::new(),
             },
         );
         Ok(true)
+    }
+
+    /// Align chain metadata with the parent `append_batch_if_heads` signed.
+    ///
+    /// `get_chain_head` prefers `metadata.head`. A missing heads key is
+    /// created in this batch. A stored heads value that disagrees in ID or
+    /// encoding is overwritten in the same commit using the raw stored
+    /// bytes as the CAS expected value. Missing metadata with a live stored
+    /// head is reconstructed from that parent entry so retries do not mill.
+    async fn parent_metadata_for_append(
+        &self,
+        metadata: Option<ChainMetadata>,
+        expected: Option<&AuditEntryId>,
+        stored_head: Option<&AuditEntryId>,
+    ) -> AuditResult<Option<ChainMetadata>> {
+        let mut metadata = metadata.unwrap_or_default();
+        if metadata.head.as_ref() != expected {
+            return self
+                .metadata_from_stored_parent(metadata, expected, stored_head)
+                .await;
+        }
+        if let Some(head) = expected
+            && let Some(parent) = self.get(head).await?
+            && metadata.head_hash != parent.content_hash()
+        {
+            metadata.head_hash = parent.content_hash();
+        }
+        Ok(Some(metadata))
+    }
+
+    async fn metadata_from_stored_parent(
+        &self,
+        mut metadata: ChainMetadata,
+        expected: Option<&AuditEntryId>,
+        stored_head: Option<&AuditEntryId>,
+    ) -> AuditResult<Option<ChainMetadata>> {
+        if metadata.head.is_some() || stored_head != expected {
+            return Ok(None);
+        }
+        let Some(head) = expected else {
+            return Ok(Some(metadata));
+        };
+        let Some(parent) = self.get(head).await? else {
+            return Ok(None);
+        };
+        metadata.head = Some(head.clone());
+        metadata.head_hash = parent.content_hash();
+        if metadata.count == 0 {
+            metadata.count = 1;
+            metadata.bytes = entry_byte_len(&parent)?;
+        }
+        Ok(Some(metadata))
     }
 
     async fn accumulate_entry(
@@ -247,6 +301,26 @@ impl KvAuditStorage {
         })?;
         sequences.insert(session_key.to_owned(), SequenceState { expected, next });
         Ok(sequence)
+    }
+
+    #[cfg(test)]
+    async fn test_zero_chain_head_hash(
+        &self,
+        session_id: &astrid_core::SessionId,
+        principal: Option<&astrid_core::PrincipalId>,
+    ) -> AuditResult<()> {
+        let key = chain_head_key(session_id, principal);
+        let (_, metadata) = self.load_chain_metadata(session_id, principal).await?;
+        let mut metadata = metadata.ok_or_else(|| {
+            AuditError::StorageError("missing chain metadata to zero head_hash".to_owned())
+        })?;
+        metadata.head_hash = astrid_crypto::ContentHash::zero();
+        let bytes = serde_json::to_vec(&metadata)
+            .map_err(|error| AuditError::SerializationError(error.to_string()))?;
+        self.store
+            .set(NS_CHAIN_METADATA, &key, bytes)
+            .await
+            .map_err(|error| AuditError::StorageError(error.to_string()))
     }
 }
 
@@ -387,10 +461,7 @@ fn append_chain_changes(
     for (chain_key, state) in chains {
         conditions.push(KvBatchCondition::ValueEquals {
             key: kv_key(NS_CHAIN_HEADS, &chain_key)?,
-            expected: state
-                .head_expected
-                .as_ref()
-                .map(|head| head.0.to_string().into_bytes()),
+            expected: state.head_expected,
         });
         conditions.push(KvBatchCondition::ValueEquals {
             key: kv_key(NS_CHAIN_METADATA, &chain_key)?,
@@ -468,4 +539,282 @@ fn append_global_change(
 
 fn kv_key(namespace: &str, value: &str) -> AuditResult<KvEntryKey> {
     KvEntryKey::new(namespace, value).map_err(|error| AuditError::StorageError(error.to_string()))
+}
+
+fn entry_byte_len(entry: &AuditEntry) -> AuditResult<u64> {
+    let bytes = serde_json::to_vec(entry)
+        .map_err(|error| AuditError::SerializationError(error.to_string()))?;
+    Ok(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{AuditStorage, KvAuditStorage};
+    use crate::entry::{AuditAction, AuditEntry, AuditOutcome, AuthorizationProof};
+    use astrid_core::{PrincipalId, SessionId};
+    use astrid_crypto::{ContentHash, KeyPair};
+
+    #[tokio::test]
+    async fn append_heals_missing_chain_heads_after_metadata_move() {
+        let storage = KvAuditStorage::in_memory();
+        let keypair = KeyPair::generate();
+        let session = SessionId::new();
+        let principal = PrincipalId::new("alice").expect("principal");
+        let first = AuditEntry::create_with_principal(
+            session.clone(),
+            principal.clone(),
+            AuditAction::FileRead {
+                path: "/a".to_owned(),
+            },
+            AuthorizationProof::System {
+                reason: "test".to_owned(),
+            },
+            AuditOutcome::success(),
+            ContentHash::zero(),
+            &keypair,
+        );
+        let committed = storage
+            .append_batch_if_heads(&[(&first, None)])
+            .await
+            .expect("first append");
+        assert_eq!(committed, vec![true]);
+
+        storage
+            .test_drop_chain_head(&session, Some(&principal))
+            .await
+            .expect("drop heads key");
+        assert!(
+            storage
+                .get_chain_head(&session, Some(&principal))
+                .await
+                .expect("head via metadata")
+                .is_some(),
+            "metadata still names the parent"
+        );
+
+        let second = AuditEntry::create_with_principal(
+            session.clone(),
+            principal.clone(),
+            AuditAction::FileRead {
+                path: "/b".to_owned(),
+            },
+            AuthorizationProof::System {
+                reason: "test".to_owned(),
+            },
+            AuditOutcome::success(),
+            first.content_hash(),
+            &keypair,
+        );
+        let committed = storage
+            .append_batch_if_heads(&[(&second, Some(&first.id))])
+            .await
+            .expect("healed append");
+        assert_eq!(
+            committed,
+            vec![true],
+            "missing heads key must not fail closed as a CAS miss"
+        );
+        assert_eq!(
+            storage
+                .get_chain_head(&session, Some(&principal))
+                .await
+                .expect("restored head"),
+            Some(second.id)
+        );
+    }
+
+    fn sample_entry(
+        session: &SessionId,
+        principal: &PrincipalId,
+        path: &str,
+        previous: ContentHash,
+        keypair: &KeyPair,
+    ) -> AuditEntry {
+        AuditEntry::create_with_principal(
+            session.clone(),
+            principal.clone(),
+            AuditAction::FileRead {
+                path: path.to_owned(),
+            },
+            AuthorizationProof::System {
+                reason: "test".to_owned(),
+            },
+            AuditOutcome::success(),
+            previous,
+            keypair,
+        )
+    }
+
+    #[tokio::test]
+    async fn append_heals_noncanonical_chain_heads_bytes() {
+        let storage = KvAuditStorage::in_memory();
+        let keypair = KeyPair::generate();
+        let session = SessionId::new();
+        let principal = PrincipalId::new("alice").expect("principal");
+        let first = sample_entry(&session, &principal, "/a", ContentHash::zero(), &keypair);
+        assert_eq!(
+            storage
+                .append_batch_if_heads(&[(&first, None)])
+                .await
+                .expect("first append"),
+            vec![true]
+        );
+
+        storage
+            .test_set_chain_head(
+                &session,
+                Some(&principal),
+                first.id.0.to_string().to_ascii_uppercase().into_bytes(),
+            )
+            .await
+            .expect("overwrite heads encoding");
+
+        let second = sample_entry(&session, &principal, "/b", first.content_hash(), &keypair);
+        let committed = storage
+            .append_batch_if_heads(&[(&second, Some(&first.id))])
+            .await
+            .expect("healed encoding");
+        assert_eq!(
+            committed,
+            vec![true],
+            "canonical UUID CAS expected must not miss leftover heads bytes"
+        );
+        assert_eq!(
+            storage
+                .get_chain_head(&session, Some(&principal))
+                .await
+                .expect("restored head"),
+            Some(second.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn append_heals_stale_chain_heads_id_when_metadata_matches() {
+        let storage = KvAuditStorage::in_memory();
+        let keypair = KeyPair::generate();
+        let session = SessionId::new();
+        let principal = PrincipalId::new("alice").expect("principal");
+        let first = sample_entry(&session, &principal, "/a", ContentHash::zero(), &keypair);
+        assert_eq!(
+            storage
+                .append_batch_if_heads(&[(&first, None)])
+                .await
+                .expect("first append"),
+            vec![true]
+        );
+
+        storage
+            .test_set_chain_head(
+                &session,
+                Some(&principal),
+                uuid::Uuid::new_v4().to_string().into_bytes(),
+            )
+            .await
+            .expect("stale heads id");
+
+        let second = sample_entry(&session, &principal, "/b", first.content_hash(), &keypair);
+        let committed = storage
+            .append_batch_if_heads(&[(&second, Some(&first.id))])
+            .await
+            .expect("healed stale id");
+        assert_eq!(
+            committed,
+            vec![true],
+            "metadata-matching parent must overwrite a leftover heads id"
+        );
+        assert_eq!(
+            storage
+                .get_chain_head(&session, Some(&principal))
+                .await
+                .expect("restored head"),
+            Some(second.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn append_heals_missing_metadata_from_stored_head() {
+        let storage = KvAuditStorage::in_memory();
+        let keypair = KeyPair::generate();
+        let session = SessionId::new();
+        let principal = PrincipalId::new("alice").expect("principal");
+        let first = sample_entry(&session, &principal, "/a", ContentHash::zero(), &keypair);
+        assert_eq!(
+            storage
+                .append_batch_if_heads(&[(&first, None)])
+                .await
+                .expect("first append"),
+            vec![true]
+        );
+
+        storage
+            .test_drop_chain_metadata(&session, Some(&principal))
+            .await
+            .expect("drop metadata");
+
+        let second = sample_entry(&session, &principal, "/b", first.content_hash(), &keypair);
+        let committed = storage
+            .append_batch_if_heads(&[(&second, Some(&first.id))])
+            .await
+            .expect("healed metadata");
+        assert_eq!(
+            committed,
+            vec![true],
+            "stored head must reconstruct missing chain metadata"
+        );
+        assert_eq!(
+            storage
+                .get_chain_head(&session, Some(&principal))
+                .await
+                .expect("restored head"),
+            Some(second.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn append_heals_zeroed_metadata_head_hash() {
+        let storage = KvAuditStorage::in_memory();
+        let keypair = KeyPair::generate();
+        let session = SessionId::new();
+        let principal = PrincipalId::new("alice").expect("principal");
+        let first = sample_entry(&session, &principal, "/a", ContentHash::zero(), &keypair);
+        assert_eq!(
+            storage
+                .append_batch_if_heads(&[(&first, None)])
+                .await
+                .expect("first append"),
+            vec![true]
+        );
+
+        storage
+            .test_zero_chain_head_hash(&session, Some(&principal))
+            .await
+            .expect("zero stored head_hash");
+        let metadata = storage
+            .chain_metadata(&session, Some(&principal))
+            .await
+            .expect("load zeroed metadata");
+        assert_eq!(
+            metadata.expect("chain metadata").head_hash,
+            ContentHash::zero(),
+            "falsifier requires a committed parent with a zeroed head_hash"
+        );
+
+        let second = sample_entry(&session, &principal, "/b", first.content_hash(), &keypair);
+        let committed = storage
+            .append_batch_if_heads(&[(&second, Some(&first.id))])
+            .await
+            .expect("healed zeroed head_hash");
+        assert_eq!(
+            committed,
+            vec![true],
+            "zeroed metadata.head_hash must not fail closed as a CAS miss"
+        );
+        assert_eq!(
+            storage
+                .get_chain_head(&session, Some(&principal))
+                .await
+                .expect("restored head"),
+            Some(second.id)
+        );
+    }
 }

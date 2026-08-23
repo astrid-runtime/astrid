@@ -47,6 +47,7 @@ mod server;
 mod session_guard;
 mod watch;
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -96,6 +97,15 @@ fn broker_readiness_required(caller: &astrid_core::PrincipalId) -> bool {
     *caller != astrid_core::PrincipalId::anonymous()
 }
 
+/// Daemon identity for `mcp serve` is the process cwd at invocation.
+///
+/// AOS host plugins `cd` into the product runtime home, then pass the host
+/// project as `--workspace`. The live daemon is that runtime-home process.
+/// `--workspace` is project context after attach, not a second daemon.
+pub(crate) fn mcp_serve_daemon_root(cwd: &Path, _workspace: Option<&Path>) -> PathBuf {
+    cwd.to_path_buf()
+}
+
 /// Run the MCP stdio server until the client closes stdin (EOF), its launching
 /// session dies (parent-death reaping), or the process is signalled.
 ///
@@ -108,7 +118,10 @@ fn broker_readiness_required(caller: &astrid_core::PrincipalId) -> bool {
 ///
 /// Returns an error if the daemon socket is unreachable, the principal
 /// is invalid, or the MCP transport fails to initialize.
-pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
+pub(crate) async fn serve(
+    principal: Option<&str>,
+    workspace: Option<&std::path::Path>,
+) -> Result<ExitCode> {
     // The subcommand `--principal` is an explicit per-invocation
     // override; when absent, fall back to the process-wide principal
     // (the global `--principal` / `ASTRID_PRINCIPAL`, already validated
@@ -121,18 +134,34 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
     };
 
     // `mcp serve` owns stdout for JSON-RPC, so daemon bootstrap must be quiet.
-    crate::commands::daemon::ensure_daemon_quiet("mcp-serve")
+    // Attach to the daemon for *this* cwd (runtime home after the plugin `cd`),
+    // not `--workspace` (the host project).
+    let cwd = std::env::current_dir().context("failed to read mcp serve cwd")?;
+    let daemon_root = mcp_serve_daemon_root(&cwd, workspace);
+    crate::commands::daemon::ensure_daemon_quiet("mcp-serve", Some(&daemon_root))
         .await
         .context("failed to ensure Astrid daemon for `astrid mcp serve`")?;
+    // AOS host plugins `cd` into the runtime home, then pass the project as
+    // `--workspace`. Session-guard and the hot-reload watcher fingerprint cwd,
+    // so chdir here before they spawn. Daemon attach already used runtime home.
+    if let Some(root) = workspace {
+        std::env::set_current_dir(root).with_context(|| {
+            format!(
+                "failed to attach MCP session to workspace {}",
+                root.display()
+            )
+        })?;
+    }
 
     // The shim holds ONE uplink connection for its whole lifetime. The
     // session id is ephemeral — it only scopes this transport's frames,
     // not a chat session; the kernel attributes work via the per-message
     // `principal`, not the session.
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let mut client = crate::socket_client::connect_for_workspace(session, caller.clone(), None)
-        .await
-        .context("Failed to connect to the Astrid daemon socket")?;
+    let mut client =
+        crate::socket_client::connect_for_workspace(session, caller.clone(), Some(&daemon_root))
+            .await
+            .context("Failed to connect to the Astrid daemon socket")?;
 
     // The uplink connected, but a non-`anonymous` principal with no keypair is
     // silently stamped `anonymous` by the daemon — every tool call would then
@@ -156,9 +185,13 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
         "astrid mcp serve: uplink established, starting MCP stdio transport"
     );
 
-    tokio::spawn(session_guard::run(caller.clone()));
+    tokio::spawn(session_guard::run(caller.clone(), daemon_root.clone()));
 
-    let server = AstridMcpServer::new(Arc::new(Mutex::new(client)), caller.clone());
+    let server = AstridMcpServer::new(
+        Arc::new(Mutex::new(client)),
+        caller.clone(),
+        daemon_root.clone(),
+    );
 
     // `rmcp::transport::stdio()` yields the (stdin, stdout) pair the MCP
     // transport drives. `serve` performs the MCP handshake and spawns the
@@ -178,7 +211,7 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
     // if the watch uplink dies, tool-list pushes simply stop, but the server
     // keeps serving `tools/list`/`tools/call` on demand.
     let peer = running.peer().clone();
-    tokio::spawn(watch::run(peer, caller.to_string()));
+    tokio::spawn(watch::run(peer, caller.to_string(), daemon_root));
 
     // Race the normal stdin-EOF quit against parent-death. `waiting()` only
     // returns when the client closes stdin; an MCP client that DIES without
@@ -249,5 +282,20 @@ mod fail_loud_tests {
     fn named_principal_must_prove_broker_readiness() {
         let principal = PrincipalId::new("codex-code").expect("principal");
         assert!(broker_readiness_required(&principal));
+    }
+}
+
+#[cfg(test)]
+mod daemon_root_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn mcp_serve_daemon_root_is_cwd_not_host_project() {
+        let runtime = Path::new("/tmp/aos-runtime");
+        let project = Path::new("/tmp/host-project");
+        let daemon_root = mcp_serve_daemon_root(runtime, Some(project));
+        assert_eq!(daemon_root.as_path(), runtime);
+        assert_ne!(daemon_root.as_path(), project);
     }
 }

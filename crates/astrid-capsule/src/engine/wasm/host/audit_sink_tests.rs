@@ -18,6 +18,7 @@ use crate::engine::wasm::test_fixtures::minimal_host_state;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CapturedEvent {
     FileRead(String),
+    FileProbe(String),
     FileWrite(String),
     FileDelete(String),
     NetConnect(String, u16),
@@ -30,6 +31,7 @@ impl CapturedEvent {
     fn from(event: HostAuditEvent<'_>) -> Self {
         match event {
             HostAuditEvent::FileRead { path } => Self::FileRead(path.to_owned()),
+            HostAuditEvent::FileProbe { path } => Self::FileProbe(path.to_owned()),
             HostAuditEvent::FileWrite { path } => Self::FileWrite(path.to_owned()),
             HostAuditEvent::FileDelete { path } => Self::FileDelete(path.to_owned()),
             HostAuditEvent::NetConnect { host, port } => Self::NetConnect(host.to_owned(), port),

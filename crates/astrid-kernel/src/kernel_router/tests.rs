@@ -8,6 +8,7 @@ use astrid_capsule::context::CapsuleContext;
 use astrid_capsule::error::CapsuleResult;
 use astrid_capsule::manifest::{CapsuleManifest, CommandDef, ExportDef, PackageDef, SubscribeDef};
 use astrid_capsule::registry::WasmHash;
+use astrid_config::types::RateLimitsConfig;
 use astrid_core::kernel_api::CommandKind;
 use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope, PrincipalProfile};
 use astrid_events::kernel_api::{PROJECTION_NAME_DIAGNOSTIC_METHOD, ProjectionNamePolicyPreset};
@@ -161,11 +162,30 @@ fn full_reload_guard_coalesces_until_finished() {
 fn rate_limit_for_request_returns_correct_limits() {
     let (name, limit) = rate_limit_for_request(&KernelRequest::ReloadCapsules);
     assert_eq!(name, "ReloadCapsules");
-    assert_eq!(limit, Some(5));
+    assert_eq!(
+        limit,
+        Some(RateLimitsConfig::DEFAULT_CAPSULE_RELOAD_PER_MIN)
+    );
+    assert!(
+        limit.expect("reload is limited") >= RateLimitsConfig::CORE_SET_CAPSULE_COUNT,
+        "silent Some(5) cannot cover a core-set live install burst"
+    );
+
+    let (name, limit) = rate_limit_for_request(&KernelRequest::ReloadCapsule {
+        id: "astrid-capsule-openai-compat".into(),
+    });
+    assert_eq!(name, "ReloadCapsule");
+    assert_eq!(
+        limit,
+        Some(RateLimitsConfig::DEFAULT_CAPSULE_RELOAD_PER_MIN)
+    );
 
     let (name, limit) = rate_limit_for_request(&KernelRequest::ListCapsules);
     assert_eq!(name, "ListCapsules");
     assert_eq!(limit, None);
+
+    let (_, shutdown) = rate_limit_for_request(&KernelRequest::Shutdown { reason: None });
+    assert_eq!(shutdown, Some(1));
 }
 
 // ── Capability mapping (issue #670) ──────────────────────────────

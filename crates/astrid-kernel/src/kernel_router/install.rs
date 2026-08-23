@@ -37,6 +37,7 @@ use astrid_core::kernel_api::{
 use astrid_events::kernel_api::KernelResponse;
 use astrid_storage::{KvBatchCondition, KvBatchMutation, KvEntryKey, KvMutationBatch};
 
+#[derive(Clone)]
 struct EnvSnapshot {
     kind: EnvValueKind,
     scope: EnvStorageScope,
@@ -53,49 +54,9 @@ struct EnvTransaction {
 
 impl EnvTransaction {
     async fn rollback(self, kernel: &Arc<crate::Kernel>) {
-        let mut conditions = Vec::with_capacity(self.snapshots.len());
-        let mut mutations = Vec::with_capacity(self.snapshots.len());
-        for snapshot in self.snapshots {
-            let namespace = env_namespace(self.uid, &self.capsule, snapshot.kind, snapshot.scope);
-            let Ok(key) = KvEntryKey::new(namespace, snapshot.key) else {
-                tracing::error!(capsule = %self.capsule, "invalid environment rollback key");
-                return;
-            };
-            conditions.push(KvBatchCondition::ValueEquals {
-                key: key.clone(),
-                expected: snapshot.staged,
-            });
-            mutations.push(match snapshot.previous {
-                Some(value) => KvBatchMutation::Set { key, value },
-                None => KvBatchMutation::Delete { key },
-            });
-        }
-        if conditions.is_empty() {
-            return;
-        }
-        let batch = match KvMutationBatch::new(conditions, mutations) {
-            Ok(batch) => batch,
-            Err(error) => {
-                tracing::error!(
-                    capsule = %self.capsule,
-                    error = %error,
-                    "failed to construct atomic environment rollback"
-                );
-                return;
-            },
-        };
-        match kernel.kv.apply_batch(&batch).await {
-            Ok(outcome) if outcome.applied => {},
-            Ok(_) => tracing::warn!(
-                capsule = %self.capsule,
-                "environment rollback skipped after a concurrent value change"
-            ),
-            Err(error) => tracing::error!(
-                capsule = %self.capsule,
-                error = %error,
-                "failed to restore pre-install environment values atomically"
-            ),
-        }
+        let (agent, shared) = partition_env_snapshots(self.snapshots);
+        rollback_env_snapshot_group(kernel, self.uid, &self.capsule, agent).await;
+        rollback_env_snapshot_group(kernel, self.uid, &self.capsule, shared).await;
     }
 }
 
@@ -388,10 +349,14 @@ async fn stage_env_values(
     validate_env_values(&manifest, values)?;
 
     let mut snapshots = Vec::with_capacity(values.len());
-    let mut conditions = Vec::with_capacity(values.len());
-    let mut mutations = Vec::with_capacity(values.len());
     for value in values {
-        let scope = EnvStorageScope::Agent;
+        // Install secrets are the site credential. Every assigned principal
+        // reads them via Shared fallback unless they set their own Agent secret.
+        // Non-secret values stay Agent-scoped so AgentModify can copy `__env:`.
+        let scope = match value.kind {
+            EnvValueKind::Secret => EnvStorageScope::Shared,
+            EnvValueKind::Text => EnvStorageScope::Agent,
+        };
         let namespace = env_namespace(uid, &capsule, value.kind, scope);
         let key = env_storage_key(value);
         let previous = kernel
@@ -407,19 +372,6 @@ async fn stage_env_values(
         if previous == staged {
             continue;
         }
-        let entry_key = KvEntryKey::new(namespace, key.clone())
-            .map_err(|error| format!("create environment batch key: {error}"))?;
-        conditions.push(KvBatchCondition::ValueEquals {
-            key: entry_key.clone(),
-            expected: previous.clone(),
-        });
-        mutations.push(match staged.clone() {
-            Some(value) => KvBatchMutation::Set {
-                key: entry_key,
-                value,
-            },
-            None => KvBatchMutation::Delete { key: entry_key },
-        });
         snapshots.push(EnvSnapshot {
             kind: value.kind,
             scope,
@@ -431,19 +383,29 @@ async fn stage_env_values(
     if snapshots.is_empty() {
         return Ok(None);
     }
-    let batch = KvMutationBatch::new(conditions, mutations)
-        .map_err(|error| format!("construct environment mutation batch: {error}"))?;
-    let outcome = kernel
-        .kv
-        .apply_batch(&batch)
-        .await
-        .map_err(|error| format!("stage install environment values atomically: {error}"))?;
-    if !outcome.applied {
+    let (agent, shared) = partition_env_snapshots(snapshots);
+    if !apply_env_snapshot_group(kernel, uid, &capsule, &agent, false).await? {
         return Err(
             "stage install environment values lost a concurrent update; retry the install"
                 .to_owned(),
         );
     }
+    match apply_env_snapshot_group(kernel, uid, &capsule, &shared, false).await {
+        Ok(true) => {},
+        Ok(false) => {
+            rollback_env_snapshot_group(kernel, uid, &capsule, agent.clone()).await;
+            return Err(
+                "stage install environment values lost a concurrent update; retry the install"
+                    .to_owned(),
+            );
+        },
+        Err(error) => {
+            rollback_env_snapshot_group(kernel, uid, &capsule, agent.clone()).await;
+            return Err(error);
+        },
+    }
+    let mut snapshots = agent;
+    snapshots.extend(shared);
     Ok(Some(EnvTransaction {
         uid,
         capsule,
@@ -527,6 +489,78 @@ fn env_storage_key(value: &CapsuleInstallEnv) -> String {
     match value.kind {
         EnvValueKind::Text => astrid_storage::env::env_key(&value.key),
         EnvValueKind::Secret => format!("{}{}", astrid_storage::env::SECRET_KEY_PREFIX, value.key),
+    }
+}
+
+fn partition_env_snapshots(snapshots: Vec<EnvSnapshot>) -> (Vec<EnvSnapshot>, Vec<EnvSnapshot>) {
+    let mut agent = Vec::new();
+    let mut shared = Vec::new();
+    for snapshot in snapshots {
+        match snapshot.scope {
+            EnvStorageScope::Agent => agent.push(snapshot),
+            EnvStorageScope::Shared => shared.push(snapshot),
+        }
+    }
+    (agent, shared)
+}
+
+async fn apply_env_snapshot_group(
+    kernel: &Arc<crate::Kernel>,
+    uid: astrid_core::identity::PrincipalUid,
+    capsule: &str,
+    snapshots: &[EnvSnapshot],
+    rollback: bool,
+) -> Result<bool, String> {
+    if snapshots.is_empty() {
+        return Ok(true);
+    }
+    let mut conditions = Vec::with_capacity(snapshots.len());
+    let mut mutations = Vec::with_capacity(snapshots.len());
+    for snapshot in snapshots {
+        let namespace = env_namespace(uid, capsule, snapshot.kind, snapshot.scope);
+        let key = KvEntryKey::new(namespace, snapshot.key.clone())
+            .map_err(|error| format!("create environment batch key: {error}"))?;
+        let (expected, replacement) = if rollback {
+            (snapshot.staged.clone(), snapshot.previous.clone())
+        } else {
+            (snapshot.previous.clone(), snapshot.staged.clone())
+        };
+        conditions.push(KvBatchCondition::ValueEquals {
+            key: key.clone(),
+            expected,
+        });
+        mutations.push(match replacement {
+            Some(value) => KvBatchMutation::Set { key, value },
+            None => KvBatchMutation::Delete { key },
+        });
+    }
+    let batch = KvMutationBatch::new(conditions, mutations)
+        .map_err(|error| format!("construct environment mutation batch: {error}"))?;
+    let outcome = kernel
+        .kv
+        .apply_batch(&batch)
+        .await
+        .map_err(|error| format!("stage install environment values atomically: {error}"))?;
+    Ok(outcome.applied)
+}
+
+async fn rollback_env_snapshot_group(
+    kernel: &Arc<crate::Kernel>,
+    uid: astrid_core::identity::PrincipalUid,
+    capsule: &str,
+    snapshots: Vec<EnvSnapshot>,
+) {
+    match apply_env_snapshot_group(kernel, uid, capsule, &snapshots, true).await {
+        Ok(true) => {},
+        Ok(false) => tracing::warn!(
+            capsule = %capsule,
+            "environment rollback skipped after a concurrent value change"
+        ),
+        Err(error) => tracing::error!(
+            capsule = %capsule,
+            error = %error,
+            "failed to restore pre-install environment values atomically"
+        ),
     }
 }
 
@@ -619,7 +653,7 @@ mod tests {
             .unwrap();
         let secret = astrid_storage::ScopedKvStore::new(
             Arc::clone(&kernel.kv),
-            astrid_storage::env::principal_secret_namespace(uid, "fixture"),
+            astrid_storage::env::system_secret_namespace("fixture"),
         )
         .unwrap();
         secret
@@ -713,7 +747,7 @@ mod tests {
         let uid = kernel.principal_directory.uid_for(&principal).unwrap();
         let plain_namespace = astrid_storage::env::principal_capsule_namespace(uid, "fixture");
         let plain_key = astrid_storage::env::env_key("PLAIN");
-        let secret_namespace = astrid_storage::env::principal_secret_namespace(uid, "fixture");
+        let secret_namespace = astrid_storage::env::system_secret_namespace("fixture");
         let secret_key = format!("{}SECRET", astrid_storage::env::SECRET_KEY_PREFIX);
         kernel
             .kv
@@ -753,8 +787,8 @@ mod tests {
         );
         assert_eq!(
             kernel.kv.get(&secret_namespace, &secret_key).await.unwrap(),
-            Some(b"staged-secret".to_vec()),
-            "one atomic rollback must not partially overwrite another key"
+            Some(b"old-secret".to_vec()),
+            "Shared secret rollback is a separate owner batch from Agent text"
         );
     }
 
@@ -769,5 +803,88 @@ mod tests {
         };
         let error = validate_install_provenance(&source, Some(&provenance)).unwrap_err();
         assert!(error.contains("source_digest mismatch"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn install_secret_is_staged_in_system_secret_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let home = astrid_core::dirs::AstridHome::from_path(root.path());
+        let kernel = crate::test_kernel_with_home(home.clone()).await;
+        let principal = PrincipalId::new("install-shared-secret").unwrap();
+        kernel
+            .principal_directory
+            .register(
+                principal.clone(),
+                astrid_core::identity::PrincipalUid::from_bytes([9; 32]),
+            )
+            .unwrap();
+        astrid_core::profile::PrincipalProfile::default()
+            .save_to_path(&astrid_core::profile::PrincipalProfile::path_for(
+                &home, &principal,
+            ))
+            .unwrap();
+        let source = root.path().join("fixture");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("Capsule.toml"),
+            r#"
+                [package]
+                name = "fixture"
+                version = "1.0.0"
+                [env.PLAIN]
+                type = "text"
+                [env.SECRET]
+                type = "secret"
+            "#,
+        )
+        .unwrap();
+        let values = vec![
+            CapsuleInstallEnv {
+                key: "PLAIN".into(),
+                value: "site-text".into(),
+                kind: EnvValueKind::Text,
+            },
+            CapsuleInstallEnv {
+                key: "SECRET".into(),
+                value: "site-secret".into(),
+                kind: EnvValueKind::Secret,
+            },
+        ];
+        stage_env_values(&kernel, &principal, &source, &values)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let uid = kernel.principal_directory.uid_for(&principal).unwrap();
+        let shared_secret = kernel
+            .kv
+            .get(
+                &astrid_storage::env::system_secret_namespace("fixture"),
+                &format!("{}SECRET", astrid_storage::env::SECRET_KEY_PREFIX),
+            )
+            .await
+            .unwrap();
+        assert_eq!(shared_secret.as_deref(), Some(b"site-secret".as_slice()));
+        let installer_secret = kernel
+            .kv
+            .get(
+                &astrid_storage::env::principal_secret_namespace(uid, "fixture"),
+                &format!("{}SECRET", astrid_storage::env::SECRET_KEY_PREFIX),
+            )
+            .await
+            .unwrap();
+        assert!(
+            installer_secret.is_none(),
+            "install secrets must not land in the installer principal secret namespace"
+        );
+        let installer_text = kernel
+            .kv
+            .get(
+                &astrid_storage::env::principal_capsule_namespace(uid, "fixture"),
+                &astrid_storage::env::env_key("PLAIN"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(installer_text.as_deref(), Some(b"site-text".as_slice()));
     }
 }

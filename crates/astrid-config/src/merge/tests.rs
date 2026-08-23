@@ -603,6 +603,7 @@ fn test_rate_limits_cannot_increase() {
         [rate_limits]
         elicitation_per_server_per_min = 10
         max_pending_requests = 50
+        capsule_reload_per_min = 14
     ",
     )
     .unwrap();
@@ -612,6 +613,7 @@ fn test_rate_limits_cannot_increase() {
         [rate_limits]
         elicitation_per_server_per_min = 100
         max_pending_requests = 500
+        capsule_reload_per_min = 120
     ",
     )
     .unwrap();
@@ -631,6 +633,12 @@ fn test_rate_limits_cannot_increase() {
             .as_integer()
             .unwrap(),
         50
+    );
+    assert_eq!(
+        merged["rate_limits"]["capsule_reload_per_min"]
+            .as_integer()
+            .unwrap(),
+        14
     );
 }
 

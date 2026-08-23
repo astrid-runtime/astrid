@@ -33,7 +33,8 @@ pub struct Config {
     pub http: HttpSection,
     /// Budget limits for sessions and individual actions.
     pub budget: BudgetSection,
-    /// Rate-limiting knobs for elicitation and pending requests.
+    /// Rate-limiting knobs for elicitation, pending requests, and
+    /// management capsule reload/lifecycle bursts.
     pub rate_limits: RateLimitsConfig,
     /// Named MCP server definitions.
     pub servers: HashMap<String, ServerSection>,
@@ -359,6 +360,30 @@ pub struct RateLimitsConfig {
     /// Maximum number of pending (unanswered) approval requests across all
     /// servers.
     pub max_pending_requests: u32,
+    /// Per-principal sliding-window cap for `ReloadCapsule`, `ReloadCapsules`,
+    /// and related lifecycle verbs (`UnloadCapsule`, `RemoveCapsule`,
+    /// `PromoteWorkspace`, `RollbackWorkspace`).
+    ///
+    /// Derived from a supported operator burst: the first-party core set
+    /// ([`Self::CORE_SET_CAPSULE_COUNT`]) plus a same-minute retry/upgrade of
+    /// that set. A silent `5/min` cap fails the 6th live reload as a note and
+    /// the 7th core-set install as a hard live-activation error.
+    pub capsule_reload_per_min: u32,
+}
+
+impl RateLimitsConfig {
+    /// First-party core set installed together by Runtime E2E and distro
+    /// bootstrap: cli, registry, session, identity, prompt-builder, react,
+    /// openai-compat.
+    pub const CORE_SET_CAPSULE_COUNT: u32 = 7;
+
+    /// Derived default: one core-set live reload burst plus one same-minute
+    /// retry/upgrade of that set.
+    pub const DEFAULT_CAPSULE_RELOAD_PER_MIN: u32 = Self::CORE_SET_CAPSULE_COUNT.saturating_mul(2);
+
+    /// WASM reload denial-of-service ceiling. User config may raise up to this bound;
+    /// workspace config can only decrease.
+    pub const MAX_CAPSULE_RELOAD_PER_MIN: u32 = 120;
 }
 
 impl Default for RateLimitsConfig {
@@ -366,6 +391,7 @@ impl Default for RateLimitsConfig {
         Self {
             elicitation_per_server_per_min: 10,
             max_pending_requests: 50,
+            capsule_reload_per_min: Self::DEFAULT_CAPSULE_RELOAD_PER_MIN,
         }
     }
 }
@@ -479,6 +505,22 @@ pub struct AuditConfig {
     pub path: Option<String>,
     /// Maximum size of the audit log in megabytes before rotation.
     pub max_size_mb: u64,
+    /// Wait after the first queued host-audit event so concurrent host
+    /// calls share one volume persist. Layout-2 signing plus `sync_volume`
+    /// is on-CPU; 50ms left a 27-capsule home at 100% and starved `GetStatus`.
+    pub host_coalesce_ms: u64,
+    /// Max signed host-audit entries per writer flush. Capped at the
+    /// durable audit atomic-batch size (128) so one persist stays one
+    /// `apply_batch` instead of falling back to per-entry CAS.
+    pub host_batch_max: u64,
+    /// In-memory host-audit queue. Producers never block the WASM/tokio
+    /// workers: overflow folds into a pending count instead of `send()`.
+    pub host_queue_capacity: u64,
+    /// Persist allowed `stat`/`exists`/`readdir` as signed `FileRead`
+    /// entries. Default off: POSIX path probes are not OS-level security
+    /// events, and aos-fs issues thousands per second. Denied probes still
+    /// persist as FileRead-Denied.
+    pub host_path_probes: bool,
 }
 
 impl Default for AuditConfig {
@@ -486,6 +528,10 @@ impl Default for AuditConfig {
         Self {
             path: None,
             max_size_mb: 100,
+            host_coalesce_ms: 5_000,
+            host_batch_max: 128,
+            host_queue_capacity: 4096,
+            host_path_probes: false,
         }
     }
 }

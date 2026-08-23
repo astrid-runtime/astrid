@@ -25,6 +25,8 @@ pub fn validate(config: &Config) -> ConfigResult<()> {
     validate_subagents(config)?;
     validate_capsule(config)?;
     validate_retry(config)?;
+    validate_audit(config)?;
+    validate_rate_limits(config)?;
     Ok(())
 }
 
@@ -365,6 +367,59 @@ fn validate_logging(config: &Config) -> ConfigResult<()> {
     Ok(())
 }
 
+fn validate_audit(config: &Config) -> ConfigResult<()> {
+    let audit = &config.audit;
+    if !(10..=60_000).contains(&audit.host_coalesce_ms) {
+        return Err(ConfigError::ValidationError {
+            field: "audit.host_coalesce_ms".to_owned(),
+            message: format!(
+                "host_coalesce_ms {} is out of range; must be between 10 and 60000",
+                audit.host_coalesce_ms
+            ),
+        });
+    }
+    if !(8..=128).contains(&audit.host_batch_max) {
+        return Err(ConfigError::ValidationError {
+            field: "audit.host_batch_max".to_owned(),
+            message: format!(
+                "host_batch_max {} is out of range; must be between 8 and 128 (durable atomic batch cap)",
+                audit.host_batch_max
+            ),
+        });
+    }
+    if !(64..=65_536).contains(&audit.host_queue_capacity) {
+        return Err(ConfigError::ValidationError {
+            field: "audit.host_queue_capacity".to_owned(),
+            message: format!(
+                "host_queue_capacity {} is out of range; must be between 64 and 65536",
+                audit.host_queue_capacity
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_rate_limits(config: &Config) -> ConfigResult<()> {
+    let limits = &config.rate_limits;
+    if limits.capsule_reload_per_min == 0 {
+        return Err(ConfigError::ValidationError {
+            field: "rate_limits.capsule_reload_per_min".to_owned(),
+            message: "capsule_reload_per_min must be greater than 0".to_owned(),
+        });
+    }
+    if limits.capsule_reload_per_min > crate::types::RateLimitsConfig::MAX_CAPSULE_RELOAD_PER_MIN {
+        return Err(ConfigError::ValidationError {
+            field: "rate_limits.capsule_reload_per_min".to_owned(),
+            message: format!(
+                "capsule_reload_per_min {} exceeds the WASM-reload ceiling of {}",
+                limits.capsule_reload_per_min,
+                crate::types::RateLimitsConfig::MAX_CAPSULE_RELOAD_PER_MIN
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,6 +642,41 @@ mod tests {
     fn test_max_tokens_upper_bound() {
         let mut config = Config::default();
         config.model.max_tokens = 100_000_000;
+        assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_default_capsule_reload_covers_core_set_burst() {
+        let config = Config::default();
+        assert!(validate(&config).is_ok());
+        assert!(
+            config.rate_limits.capsule_reload_per_min
+                >= crate::types::RateLimitsConfig::CORE_SET_CAPSULE_COUNT
+        );
+        assert_eq!(
+            config.rate_limits.capsule_reload_per_min,
+            crate::types::RateLimitsConfig::DEFAULT_CAPSULE_RELOAD_PER_MIN
+        );
+    }
+
+    #[test]
+    fn test_zero_capsule_reload_rejected() {
+        let mut config = Config::default();
+        config.rate_limits.capsule_reload_per_min = 0;
+        let err = validate(&config).unwrap_err();
+        match err {
+            ConfigError::ValidationError { field, .. } => {
+                assert_eq!(field, "rate_limits.capsule_reload_per_min");
+            },
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_capsule_reload_above_ceiling_rejected() {
+        let mut config = Config::default();
+        config.rate_limits.capsule_reload_per_min =
+            crate::types::RateLimitsConfig::MAX_CAPSULE_RELOAD_PER_MIN.saturating_add(1);
         assert!(validate(&config).is_err());
     }
 }

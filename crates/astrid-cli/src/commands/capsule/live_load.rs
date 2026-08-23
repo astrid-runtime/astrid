@@ -21,7 +21,9 @@
 /// Best-effort and non-fatal by design. The on-disk install is standalone, so a
 /// missing/unreachable daemon is silent (the capsule activates on the next daemon
 /// start) and a declined/timed-out reload only prints a note. Never changes the
-/// install's exit status.
+/// install's exit status. A `ReloadCapsule` rate-limit is one such note; the
+/// operator cap lives in `[rate_limits].capsule_reload_per_min` and must cover
+/// a core-set live-install burst.
 pub(crate) async fn nudge_daemon_reload(capsule_ids: &[String]) {
     use astrid_core::kernel_api::{KernelRequest, KernelResponse};
 
