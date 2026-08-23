@@ -1,19 +1,17 @@
-//! Contiguous-file ingest for owner-named content on volume media.
+//! Home-file ingest for owner-named content on volume media.
 //!
-//! File payloads become `ContiguousFile` blobs. Catalog names still publish
-//! through one principal-root transaction. Chunk DAG identity is preserved;
-//! chunk frames are not stored.
+//! New files use the same canonical streaming arena path as capsule content.
+//! The lower-level contiguous representation remains available to read old
+//! ASTVOL1 volumes, but new home imports never create loose blob regions.
 
 use std::fs::File;
-use std::io::{Seek, SeekFrom};
-use std::path::Path;
 
-use crate::content::{ChunkingProfile, ContentName};
+use crate::content::{ContentIngest, ContentName};
 use crate::error::{StorageError, StorageResult};
 
 use super::{RuntimePrincipalStore, StateOwner};
 
-/// One sealed regular file ready for contiguous publication.
+/// One sealed regular file ready for packed home publication.
 pub struct ContiguousFileIngest {
     name: ContentName,
     path: std::path::PathBuf,
@@ -33,93 +31,58 @@ impl ContiguousFileIngest {
 }
 
 impl RuntimePrincipalStore {
-    /// Publish several files as contiguous physical payloads, then one catalog CAS.
+    /// Publish several files through the canonical packed content path.
     ///
-    /// Identical source bytes share one blob identity. Structural File and
-    /// `ChunkTree` records remain in the object arena; raw chunk frames do not.
+    /// Files are chunked into `Chunk`/`ChunkTree`/`File` records in the shared
+    /// object arena, then all names publish under one principal-root CAS and
+    /// durability boundary. Existing contiguous representations remain a
+    /// read-only compatibility path during ASTVOL1 recovery.
     ///
     /// # Errors
     ///
-    /// Returns a storage error if preparation, blob installation, or catalog
+    /// Returns a storage error if source validation or catalog
     /// publication fails. A failed batch does not publish a partial catalog.
     pub fn put_contiguous_files(
         &self,
         owner: StateOwner,
         files: impl IntoIterator<Item = ContiguousFileIngest>,
     ) -> StorageResult<()> {
-        let mut names = Vec::new();
-        let mut prepared = Vec::new();
-        let mut objects_inserted = 0_u64;
+        let mut ingests = Vec::new();
         for file in files {
-            let item = prepare_installed_blob(&self.engine, &file)?;
-            objects_inserted = objects_inserted
-                .checked_add(item.objects_inserted())
-                .ok_or_else(|| {
-                    StorageError::Internal("contiguous object count overflow".to_owned())
-                })?;
-            names.push(file.name);
-            prepared.push(item);
+            let source = open_home_source(&file)?;
+            ingests.push(ContentIngest::new(file.name, source));
         }
-        if prepared.is_empty() {
+        if ingests.is_empty() {
             return Ok(());
         }
-        let published = self
-            .engine
-            .publish_installed_contiguous_batch(prepared)
-            .map_err(|error| {
-                StorageError::Connection(format!("publish contiguous batch: {error}"))
-            })?;
-        let entries = names
-            .into_iter()
-            .zip(published)
-            .map(|(name, item)| (name, item.verified_content()))
-            .collect::<Vec<_>>();
         self.content
-            .publish_verified_batch(&owner, entries, objects_inserted)
+            .put_streaming_batch(&owner, ingests)
             .map_err(|error| {
-                StorageError::Internal(format!("publish contiguous catalog batch: {error}"))
+                StorageError::Internal(format!("publish packed home batch: {error}"))
             })?;
-        self.engine.flush().map_err(|error| {
-            StorageError::Connection(format!("flush contiguous catalog batch: {error}"))
-        })?;
         Ok(())
     }
 }
 
-fn prepare_installed_blob(
-    engine: &super::RuntimeEngine,
-    file: &ContiguousFileIngest,
-) -> StorageResult<crate::engine::PreparedContiguousFile> {
-    let path = Path::new(&file.path);
-    let mut source = File::open(path).map_err(|error| {
-        StorageError::Connection(format!(
-            "open contiguous source {}: {error}",
-            path.display()
-        ))
+fn open_home_source(file: &ContiguousFileIngest) -> StorageResult<File> {
+    let source = File::open(&file.path).map_err(|error| {
+        StorageError::Connection(format!("open home source {}: {error}", file.path.display()))
     })?;
-    let prepared = engine
-        .prepare_contiguous_file(ChunkingProfile::ASTRID_V1, file.logical_bytes, &mut source)
+    let actual_bytes = source
+        .metadata()
         .map_err(|error| {
-            StorageError::Connection(format!(
-                "prepare contiguous file {}: {error}",
-                path.display()
-            ))
-        })?;
-    source.seek(SeekFrom::Start(0)).map_err(|error| {
-        StorageError::Connection(format!(
-            "rewind contiguous source {}: {error}",
-            path.display()
-        ))
-    })?;
-    engine
-        .install_prepared_contiguous_blob(&prepared, &source)
-        .map_err(|error| {
-            StorageError::Connection(format!(
-                "install contiguous blob {}: {error}",
-                path.display()
-            ))
-        })?;
-    Ok(prepared)
+            StorageError::Connection(format!("stat home source {}: {error}", file.path.display()))
+        })?
+        .len();
+    if actual_bytes != file.logical_bytes {
+        return Err(StorageError::Connection(format!(
+            "home source {} changed length (expected {}, found {})",
+            file.path.display(),
+            file.logical_bytes,
+            actual_bytes
+        )));
+    }
+    Ok(source)
 }
 
 #[cfg(test)]
@@ -176,33 +139,32 @@ mod tests {
         );
     }
 
-    async fn packed_home(bytes: &[u8]) -> (tempfile::TempDir, AstridHome, StateOwner) {
+    async fn legacy_packed_home(bytes: &[u8]) -> (tempfile::TempDir, AstridHome) {
         let directory = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(directory.path());
         home.ensure().unwrap();
         let store = open_runtime_principal_store(&home, unlimited_quota())
             .await
             .unwrap();
-        let owner = StateOwner::Principal(PrincipalUid::from_bytes([0x44; 32]));
-        let source = directory.path().join("note.bin");
-        std::fs::write(&source, bytes).unwrap();
-        store
-            .put_contiguous_files(
-                owner,
-                [ContiguousFileIngest::new(
-                    ContentName::new("note.bin").unwrap(),
-                    source,
-                    u64::try_from(bytes.len()).unwrap(),
-                )],
+        let prepared = store
+            .engine
+            .prepare_contiguous_file(
+                crate::content::ChunkingProfile::ASTRID_V1,
+                u64::try_from(bytes.len()).unwrap(),
+                std::io::Cursor::new(bytes),
             )
+            .unwrap();
+        store
+            .engine
+            .publish_contiguous_copy(prepared, std::io::Cursor::new(bytes))
             .unwrap();
         store.engine.close().unwrap();
         drop(store);
-        (directory, home, owner)
+        (directory, home)
     }
 
     #[tokio::test]
-    async fn contiguous_volume_blob_is_one_payload_record_and_shared() {
+    async fn packed_home_deduplicates_repeated_chunks_without_loose_regions() {
         let directory = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(directory.path());
         home.ensure().unwrap();
@@ -242,26 +204,28 @@ mod tests {
             after_second.saturating_sub(after_first) < u64::try_from(bytes.len()).unwrap(),
             "identical second file recopied payload: {after_first} -> {after_second}"
         );
+        let copy_directory = tempfile::tempdir().unwrap();
+        let copy_home = AstridHome::from_path(copy_directory.path());
+        copy_home.ensure().unwrap();
+        std::fs::copy(&volume_path, copy_home.storage_volume_path()).unwrap();
+
         store.engine.close().unwrap();
         drop(store);
-        let payload_writes = crate::volume::write_record_payloads(&volume_path)
+        let volume = crate::volume::HostedFileVolume::open(&volume_path).unwrap();
+        assert!(
+            crate::volume::AstridVolume::list_regions(
+                volume.as_ref(),
+                "representations/blobs/loose"
+            )
             .unwrap()
-            .into_iter()
-            .filter(|(name, len)| {
-                *len == u64::try_from(bytes.len()).unwrap()
-                    && name.contains("representations/blobs/loose")
-                    && std::path::Path::new(name)
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("blob"))
-            })
-            .count();
-        assert_eq!(
-            payload_writes, 1,
-            "blob payload was shredded into journal writes"
+            .is_empty(),
+            "new home ingest created a loose representation"
         );
-        let reopened = open_runtime_principal_store(&home, unlimited_quota())
+        drop(volume);
+
+        let reopened = open_runtime_principal_store(&copy_home, unlimited_quota())
             .await
-            .expect("reopen packed volume");
+            .expect("reopen packed volume copied before source close");
         let filesystem = crate::AstridFilesystem::new(reopened.content(), owner);
         assert_eq!(
             filesystem
@@ -286,9 +250,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn packed_volume_rejects_a_lengthened_blob_region() {
+    async fn legacy_loose_blob_read_rejects_a_lengthened_region() {
         let bytes = vec![0x42_u8; 4096];
-        let (_directory, home, _owner) = packed_home(&bytes).await;
+        let (_directory, home) = legacy_packed_home(&bytes).await;
         let volume = crate::volume::HostedFileVolume::open(home.storage_volume_path()).unwrap();
         let regions = crate::volume::AstridVolume::list_regions(
             volume.as_ref(),
@@ -330,14 +294,14 @@ mod tests {
         std::fs::create_dir(&unique_dir).unwrap();
         let file_count = 512_usize;
         let mut files = Vec::with_capacity(file_count);
-        let mut unique_bytes = 0_u64;
+        let mut logical_bytes = 0_u64;
         for index in 0..file_count {
             let mut bytes = vec![0xA5_u8; 256];
             bytes[0] = u8::try_from(index % 256).unwrap();
             bytes[1] = u8::try_from(index / 256).unwrap();
             let path = unique_dir.join(format!("{index:04}.bin"));
             std::fs::write(&path, &bytes).unwrap();
-            unique_bytes += u64::try_from(bytes.len()).unwrap();
+            logical_bytes += u64::try_from(bytes.len()).unwrap();
             files.push(ContiguousFileIngest::new(
                 ContentName::new(format!("u/{index:04}.bin")).unwrap(),
                 path,
@@ -352,7 +316,7 @@ mod tests {
         let mut index_payload = 0_u64;
         let mut index_writes = 0_u32;
         let mut metadata_writes = 0_u32;
-        let mut blob_payload = 0_u64;
+        let mut loose_payload = 0_u64;
         let mut buckets = std::collections::BTreeMap::<String, (u32, u64)>::new();
         for (name, len) in crate::volume::write_record_payloads(&volume_path).unwrap() {
             let bucket = if name == "objects.index" {
@@ -367,7 +331,7 @@ mod tests {
                     .extension()
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("blob"))
             {
-                blob_payload += len;
+                loose_payload += len;
                 "blob.payload".to_owned()
             } else if name.contains("blobs/loose")
                 && std::path::Path::new(&name)
@@ -388,9 +352,12 @@ mod tests {
             .map(|(name, (count, bytes))| format!("{bytes} n={count} {name}"))
             .collect::<Vec<_>>()
             .join("; ");
-        assert_eq!(blob_payload, unique_bytes, "{census}");
+        assert_eq!(
+            loose_payload, 0,
+            "new home ingest wrote loose payloads; {census}"
+        );
         assert!(
-            index_payload < unique_bytes.saturating_add(2 * 1024 * 1024),
+            index_payload < logical_bytes.saturating_add(2 * 1024 * 1024),
             "objects.index journaled {index_payload} bytes across {index_writes} writes; {census}"
         );
         assert!(
@@ -402,8 +369,8 @@ mod tests {
             "metadata.arena snapshot-per-file still journaled {metadata_writes} writes; {census}"
         );
         assert!(
-            volume_len <= unique_bytes.saturating_add(8 * 1024 * 1024),
-            "volume {volume_len} unique {unique_bytes}; {census}"
+            volume_len <= logical_bytes.saturating_add(8 * 1024 * 1024),
+            "volume {volume_len} logical {logical_bytes}; {census}"
         );
     }
 }
