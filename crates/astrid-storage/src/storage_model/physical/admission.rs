@@ -435,6 +435,54 @@ mod tests {
     }
 
     #[test]
+    fn admission_method_reserved_tag_is_unknown() {
+        let identity = TestIdentity;
+        let bounds = ReconstructionBounds::new(1, 3, 1024, 1024, 1, 1024, 1).unwrap();
+        let profile = RepresentationProfile::new_builtin(
+            super::super::ProfileKind::PackedCanonical,
+            bounds,
+            object(1),
+        )
+        .unwrap();
+        let profile_id = profile.identify(&identity).unwrap();
+        let blob = BlobId::identify(&identity, profile_id, b"content bytes").unwrap();
+        let representation = RepresentationRecord::new(
+            profile_id,
+            Coverage::exact(object(2), 32).unwrap(),
+            Recipe::PackedSlice {
+                blob,
+                offset: 0,
+                length: 32,
+            },
+            32,
+            32,
+            Some(object(4)),
+        )
+        .unwrap();
+        let outputs = [RepresentationOutputObservation::new(object(2), 32)];
+        let evidence = RepresentationAdmissionEvidence::new(
+            &identity,
+            &profile,
+            &representation,
+            blob,
+            32,
+            &outputs,
+        )
+        .unwrap();
+        let mut encoded = evidence.encode();
+        let method_offset = 8 + 2 + 2 + 2 + 4 + 32;
+        assert_eq!(encoded[method_offset], 1);
+        encoded[method_offset] = 2;
+        assert_eq!(
+            RepresentationAdmissionEvidence::decode(&encoded),
+            Err(PhysicalModelError::UnknownTag(
+                "representation-admission method",
+                2
+            ))
+        );
+    }
+
+    #[test]
     fn evidence_rejects_a_different_primary_blob() {
         let identity = TestIdentity;
         let bounds = ReconstructionBounds::new(1, 3, 1024, 1024, 1, 1024, 1).unwrap();
