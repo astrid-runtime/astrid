@@ -157,6 +157,34 @@ impl RepresentationStore {
     }
 }
 
+impl RepresentationStore {
+    /// Remove retired `representations/blobs/loose` regions from volume media.
+    ///
+    /// Directory stores are a no-op here; they use [`Self::retire_loose_blobs`].
+    /// Callers must prove the contiguous index is empty before invoking this,
+    /// then `AstridVolume::sync` and `reclaim`.
+    pub(in crate::engine::durable) fn retire_volume_loose_blobs(
+        &self,
+    ) -> Result<bool, DurableError> {
+        let Some(volume) = self.volume_media().cloned() else {
+            return Ok(false);
+        };
+        let prefix = format!("{DIRECTORY}/blobs/loose");
+        let regions = volume
+            .list_regions(&prefix)
+            .map_err(|source| io_error("list volume loose blob regions", source))?;
+        if regions.is_empty() {
+            return Ok(false);
+        }
+        for region in regions {
+            volume
+                .remove_region(&region)
+                .map_err(|source| io_error("remove volume loose blob region", source))?;
+        }
+        Ok(true)
+    }
+}
+
 /// Persist a store blob through `DurableFile`. Not a POSIX ingest.
 pub(in crate::engine::durable) fn persist_store_blob<R: Read>(
     volume: &Arc<dyn AstridVolume>,
