@@ -311,35 +311,6 @@ impl RepresentationStore {
         identity: &I,
         limits: RecoveryLimits,
     ) -> Result<(), DurableError> {
-        self.rebase_compacted_arena_with(arena, index, identity, limits, false)
-    }
-
-    /// Rebuild `DirectCanonical` authority and drop leftover contiguous indexes.
-    ///
-    /// Conversion must pass `drop_contiguous` only after every remaining
-    /// contiguous object is already present in the arena index. Compaction
-    /// keeps the default path so live `LooseBlob` payloads are not deleted.
-    pub(in crate::engine::durable) fn rebase_dropping_contiguous_payloads<
-        I: PersistentObjectIdentity,
-        F: super::DurableIo,
-    >(
-        &mut self,
-        arena: &F,
-        index: &BTreeMap<ObjectId, ArenaLocation>,
-        identity: &I,
-        limits: RecoveryLimits,
-    ) -> Result<(), DurableError> {
-        self.rebase_compacted_arena_with(arena, index, identity, limits, true)
-    }
-
-    fn rebase_compacted_arena_with<I: PersistentObjectIdentity, F: super::DurableIo>(
-        &mut self,
-        arena: &F,
-        index: &BTreeMap<ObjectId, ArenaLocation>,
-        identity: &I,
-        limits: RecoveryLimits,
-        drop_contiguous: bool,
-    ) -> Result<(), DurableError> {
         // Objects deliberately excluded when physical authority was activated
         // (the in-band specification and other bootstrap records) remain
         // recoverable through store.meta. Compaction must not silently pull
@@ -363,7 +334,7 @@ impl RepresentationStore {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        self.rebase_all_direct(&direct, drop_contiguous)
+        self.rebase_all_direct(&direct)
     }
 
     pub(super) fn logical_liveness_roots(&self) -> Result<BTreeSet<ObjectId>, DurableError> {
@@ -551,11 +522,8 @@ impl RepresentationStore {
     pub(super) fn rebase_all_direct(
         &mut self,
         objects: &[DirectArenaObject],
-        drop_contiguous: bool,
     ) -> Result<(), DurableError> {
-        if self.direct_authority_matches(objects)?
-            && (!drop_contiguous || self.contiguous.is_empty())
-        {
+        if self.direct_authority_matches(objects)? {
             return Ok(());
         }
         let profile = RepresentationProfile::decode(
