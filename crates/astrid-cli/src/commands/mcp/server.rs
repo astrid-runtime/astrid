@@ -31,6 +31,7 @@
 //! reply frame is never consumed by the wrong waiter.
 
 use std::borrow::Cow;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -108,6 +109,8 @@ pub(crate) struct AstridMcpServer {
     client: Arc<Mutex<SocketClient>>,
     /// Principal stamped on every outbound IPC message.
     principal: PrincipalId,
+    /// Runtime-home daemon identity. Host `--workspace` is the project, not this.
+    daemon_root: PathBuf,
     /// Set when a prior round trip ended in a connection-loss condition (a
     /// failed send, or a reply read that hit EOF / reset). The NEXT round trip
     /// re-handshakes (`reconnect()`) before sending, so a request never goes
@@ -125,10 +128,15 @@ pub(crate) struct AstridMcpServer {
 
 impl AstridMcpServer {
     /// Build a new shim over an established uplink and resolved principal.
-    pub(crate) fn new(client: Arc<Mutex<SocketClient>>, principal: PrincipalId) -> Self {
+    pub(crate) fn new(
+        client: Arc<Mutex<SocketClient>>,
+        principal: PrincipalId,
+        daemon_root: PathBuf,
+    ) -> Self {
         Self {
             client,
             principal,
+            daemon_root,
             needs_reconnect: AtomicBool::new(false),
             mrtr: MrtrBridge::new(),
         }
@@ -143,7 +151,7 @@ impl AstridMcpServer {
         let result = crate::socket_client::reconnect_for_workspace(
             client,
             principal.clone(),
-            None,
+            Some(&self.daemon_root),
             |replacement| {
                 super::require_authenticated_unless_anonymous(
                     &principal,

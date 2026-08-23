@@ -5,6 +5,7 @@
 //! normal idle timer can shut the daemon down. While this process is alive,
 //! though, the daemon should see an authenticated client and should not age out.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -17,10 +18,10 @@ const INITIAL_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Run until the MCP process exits and Tokio drops this task.
-pub(super) async fn run(principal: astrid_core::PrincipalId) {
+pub(super) async fn run(principal: astrid_core::PrincipalId, daemon_root: PathBuf) {
     let mut retry_backoff = INITIAL_RETRY_BACKOFF;
     loop {
-        match hold_guard_uplink(&principal).await {
+        match hold_guard_uplink(&principal, &daemon_root).await {
             Ok(never) => match never {},
             Err(e) => {
                 warn!(error = %e, %principal, "MCP session guard: daemon connection unavailable");
@@ -33,13 +34,15 @@ pub(super) async fn run(principal: astrid_core::PrincipalId) {
 
 async fn hold_guard_uplink(
     principal: &astrid_core::PrincipalId,
+    daemon_root: &Path,
 ) -> Result<std::convert::Infallible> {
-    daemon::ensure_daemon_quiet("mcp-session-guard", None).await?;
+    daemon::ensure_daemon_quiet("mcp-session-guard", Some(daemon_root)).await?;
 
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let c = crate::socket_client::connect_for_workspace(session, principal.clone(), None)
-        .await
-        .context("failed to connect guard uplink to daemon")?;
+    let c =
+        crate::socket_client::connect_for_workspace(session, principal.clone(), Some(daemon_root))
+            .await
+            .context("failed to connect guard uplink to daemon")?;
 
     validate_guard_auth(principal, c.is_authenticated())?;
 
