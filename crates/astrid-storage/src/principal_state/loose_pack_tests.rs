@@ -4,6 +4,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use crate::content::{ChunkingProfile, ContentName};
+use crate::volume::{AstridVolume, HostedFileVolume, VolumeFile, VolumeRegion};
 use crate::{KvQuotaResolver, open_runtime_principal_store};
 use astrid_core::PrincipalUid;
 use astrid_core::dirs::AstridHome;
@@ -160,4 +161,48 @@ async fn convert_refuses_unnamed_loose_payload_and_does_not_delete_it() {
         loose_blob_payload_bytes(&home) > 0,
         "fail-closed conversion deleted unnamed loose payload"
     );
+}
+
+#[tokio::test]
+async fn empty_contiguous_index_still_retires_leftover_loose_regions() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    home.ensure().unwrap();
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let owner = StateOwner::Principal(PrincipalUid::from_bytes([0x62; 32]));
+    let bytes = vec![0x5A_u8; 256 * 1024];
+    seed_identical_loose_names(&store, owner, &bytes);
+    store.pack_contiguous_home_payloads().unwrap();
+    store.engine.close().unwrap();
+    drop(store);
+    assert_eq!(loose_blob_payload_bytes(&home), 0);
+
+    let volume: Arc<dyn AstridVolume> = HostedFileVolume::open(home.storage_volume_path()).unwrap();
+    let region = VolumeRegion::new("representations/blobs/loose/orphan.blob").unwrap();
+    let mut file = VolumeFile::create_new(Arc::clone(&volume), region).unwrap();
+    let orphan = vec![0xA5_u8; 4096];
+    file.write_from(
+        u64::try_from(orphan.len()).unwrap(),
+        &mut Cursor::new(orphan),
+    )
+    .unwrap();
+    drop(file);
+    volume.sync().unwrap();
+    drop(volume);
+    assert!(
+        loose_blob_payload_bytes(&home) > 0,
+        "orphan loose region must exist before reopen convert"
+    );
+
+    let reopened = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .expect("empty-index leftover loose regions must not fail open");
+    assert_eq!(
+        loose_blob_payload_bytes(&home),
+        0,
+        "empty contiguous index left orphan loose regions on volume"
+    );
+    reopened.engine.close().unwrap();
 }

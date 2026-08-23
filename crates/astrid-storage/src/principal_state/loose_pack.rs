@@ -35,6 +35,9 @@ impl RuntimePrincipalStore {
             .has_contiguous_payloads()
             .map_err(|error| map_engine(&error))?
         {
+            self.engine
+                .retire_packed_contiguous_payloads()
+                .map_err(|error| map_engine(&error))?;
             return Ok(());
         }
         self.republish_named_contiguous_payloads()?;
