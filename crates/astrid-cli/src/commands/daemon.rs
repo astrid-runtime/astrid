@@ -11,11 +11,13 @@ use crate::commands::daemon_control;
 use crate::{socket_client, theme};
 
 mod ready;
+mod workspace_fingerprint;
 pub(crate) use ready::disown_if_still_running;
 use ready::{
     DAEMON_READY_POLL, ReadyWaitOutcome, configured_spawn_timeout_secs, default_daemon_ready_secs,
     readiness_attempts, wait_for_ready,
 };
+use workspace_fingerprint::{expected_workspace_fingerprints, validate_daemon_workspace_metadata};
 
 /// Build a hint string pointing the user to the daemon log directory.
 fn log_hint() -> String {
@@ -218,7 +220,7 @@ async fn ensure_daemon_inner(
 }
 
 pub(crate) async fn ensure_daemon_workspace_matches(workspace_root: Option<&Path>) -> Result<()> {
-    let expected = expected_workspace_fingerprint(workspace_root)?;
+    let expected = expected_workspace_fingerprints(workspace_root)?;
     let ready_path = socket_client::readiness_path();
 
     // Default wait only: do not load operator config here. Every admin
@@ -242,32 +244,6 @@ pub(crate) async fn ensure_daemon_workspace_matches(workspace_root: Option<&Path
     anyhow::bail!(
         "daemon workspace metadata was not available within {timeout_secs} seconds; run `astrid restart`"
     )
-}
-
-fn expected_workspace_fingerprint(workspace_root: Option<&Path>) -> Result<String> {
-    let root = workspace_root.map_or_else(
-        || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        Path::to_path_buf,
-    );
-    astrid_core::dirs::checked_workspace_selection_fingerprint(
-        &root,
-        crate::workspace_layout::current(),
-    )
-    .context("selected workspace state path is unsafe")
-}
-
-fn validate_daemon_workspace_metadata(metadata: &str, expected: &str) -> Result<()> {
-    let Some(actual) = metadata.trim().strip_prefix("v1:") else {
-        anyhow::bail!(
-            "running daemon does not expose workspace selection metadata; run `astrid restart`"
-        );
-    };
-    if actual != expected {
-        anyhow::bail!(
-            "running daemon belongs to another project or workspace layout; run `astrid restart` from this project"
-        );
-    }
-    Ok(())
 }
 
 /// Spawn a persistent (non-ephemeral) daemon and wait for readiness.
@@ -786,13 +762,13 @@ mod tests {
 
     #[test]
     fn daemon_workspace_metadata_rejects_unknown_or_different_selection() {
-        let expected = "a".repeat(64);
+        let expected = vec!["a".repeat(64)];
         assert!(validate_daemon_workspace_metadata("", &expected).is_err());
         assert!(
             validate_daemon_workspace_metadata(&format!("v1:{}", "b".repeat(64)), &expected)
                 .is_err()
         );
-        validate_daemon_workspace_metadata(&format!("v1:{expected}\n"), &expected).unwrap();
+        validate_daemon_workspace_metadata(&format!("v1:{}\n", expected[0]), &expected).unwrap();
     }
 
     #[test]
@@ -801,21 +777,25 @@ mod tests {
         let explicit = tempfile::tempdir().expect("explicit workspace");
         assert_ne!(explicit.path(), current);
 
-        assert_eq!(
-            expected_workspace_fingerprint(Some(explicit.path())).unwrap(),
-            astrid_core::dirs::checked_workspace_selection_fingerprint(
-                explicit.path(),
-                crate::workspace_layout::current(),
-            )
-            .unwrap()
+        let explicit_fingerprint = astrid_core::dirs::checked_workspace_selection_fingerprint(
+            explicit.path(),
+            crate::workspace_layout::current(),
+        )
+        .unwrap();
+        assert!(
+            expected_workspace_fingerprints(Some(explicit.path()))
+                .unwrap()
+                .contains(&explicit_fingerprint)
         );
-        assert_eq!(
-            expected_workspace_fingerprint(None).unwrap(),
-            astrid_core::dirs::checked_workspace_selection_fingerprint(
-                &current,
-                crate::workspace_layout::current(),
-            )
-            .unwrap()
+        let current_fingerprint = astrid_core::dirs::checked_workspace_selection_fingerprint(
+            &current,
+            crate::workspace_layout::current(),
+        )
+        .unwrap();
+        assert!(
+            expected_workspace_fingerprints(None)
+                .unwrap()
+                .contains(&current_fingerprint)
         );
     }
 
