@@ -17,8 +17,7 @@ Device-local results below remain historical diagnostics; they are not copied
 into crate-facing documentation as portable performance claims.
 
 Status: convergence and native-path baselines recorded; mounted-provider
-measurements pending. Contiguous/LooseBlob measurements below are archived
-pre-release experiments and do not describe current runtime behavior.
+measurements pending.
 
 Last reviewed: 2026-08-05
 
@@ -670,88 +669,6 @@ admitted. The channel is bounded, source and appender failures publish no root,
 worker schedules preserve the canonical batch root, and diagnostics remain
 operator-only so physical dedup does not become a principal-visible oracle.
 
-### Retired contiguous-adoption benchmark (archived)
-
-The following measurements describe a pre-release experiment that was removed
-before LooseBlob shipped. They are retained only as historical evidence for the
-issue work that led to the packed arena design. The sealed staging generation,
-reflink/copy publication, and contiguous read path are not current runtime
-behavior; `put_streaming_batch` is the sole content writer and recovery rejects
-legacy contiguous metadata.
-
-The run used the same deterministic 512 MiB incompressible corpus, three
-samples, one-MiB ranges, four principals, eight bulk workers, and a governed
-one-GiB object cache on M2 Ultra/APFS.
-
-| Workload | Dense-catalogue checkpoint | Archived contiguous experiment | Change |
-| --- | ---: | ---: | ---: |
-| Unique publication | 179.5 MiB/s | 271.3 MiB/s | +51.1% |
-| Duplicate publication | 256.5 MiB/s | 388.2 MiB/s | +51.3% |
-| Eight-worker first ingest | 1,251.0 MiB/s | 1,556.4 MiB/s | +24.4% |
-| Four-principal shared publication | 380.9 MiB/s | 928.6 MiB/s | 2.44× |
-| First verified read | 518.2 MiB/s | 648.1 MiB/s | +25.1% |
-| Post-reopen verified read | 404.3 MiB/s | 485.0 MiB/s | +20.0% |
-| Warm verified read | 1,778.5 MiB/s | 1,754.4 MiB/s | same regime; 0.991× same-run native elapsed |
-| Four-principal warm verified read | 6,285.1 MiB/s | 6,485.4 MiB/s | +3.2% |
-
-Unique publication appends 537,392,427 authoritative bytes for 536,870,912
-logical bytes: 1.000971×, so non-payload overhead is 0.0971%. Publishing the
-same 512 MiB again appends 8,387 bytes, or 0.001562% of the logical input. The
-representation-metadata diagnostic excludes `.blob` payloads and records
-61,042 bytes for the unique publication (1,034.6 bytes per inserted object).
-
-The acknowledgement boundary is substrate-speed in the same run: staging
-takes 1.001× native write elapsed time. The result does not claim that APFS
-shared extents consume zero unique blocks; the authoritative-byte ratio counts
-the logical representation length. The source-preserving protocol proves one
-application write plus reflink publication on supported filesystems, while
-exact physical-allocation attribution remains filesystem-specific.
-
-The archived populated-reopen result was 1.531 seconds because that experiment
-revalidated its full contiguous blob before rebuilding a disposable slice
-index. It is not a current startup or mounted-read claim and must not guide a
-new writer or reader implementation.
-
-Clean commit `6384aaec` adds adversarial source-reuse and no-follow hardening.
-An occupied canonical blob is reused only after a byte-exact comparison with
-the supplied complete preimage, and authoritative blob access rejects symlink
-and reparse-point substitution through handle-first platform checks. Its clean
-rerun measures the forced non-clone copy fallback separately at 674.7 MiB/s.
-Unique publication remains 270.4 MiB/s; duplicate publication is 295.8 MiB/s
-because it now pays the required full-preimage verification; warm verified
-reads reach 1,774.6 MiB/s; and four-principal shared publication reaches 935.8
-MiB/s. The benchmark reports application-level copy behavior and authoritative
-bytes, not APFS device-block allocation.
-
-The #1388 port was remeasured against its exact current-main parent
-`0ba1181c`. Each cell is the median of three release-mode runs with 64 strict
-128-byte KV updates per principal through the complete async `TreeKvStore`
-path:
-
-| Principals | Main ops/s | Grouped ops/s | Throughput scaling | Main p95 | Grouped p95 |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 123.0 | 121.0 | 0.98× | 9.02 ms | 9.04 ms |
-| 2 | 122.8 | 220.7 | 1.80× | 17.30 ms | 9.32 ms |
-| 4 | 120.3 | 439.7 | 3.66× | 49.22 ms | 10.01 ms |
-| 8 | 123.2 | 870.3 | 7.06× | 104.98 ms | 10.04 ms |
-
-The isolated writer pays the intentional 250-microsecond gather delay and
-remains in the same one-flush-round regime. At eight principals, one arena
-flush and one root-journal flush are shared per observed group: aggregate
-throughput rises 7.06 times while p95 latency falls 10.46 times. Staging uses
-the same gather-policy abstraction but a separate durability journal. Its
-exact-parent result in `ca1f72d8` raises strict 4 KiB seals from 45.6 to 74.4
-seals/s for one writer and from 76.7 to 234.1 seals/s for eight.
-
-Recovery-required is no longer a daemon-lifetime failure. The next engine
-operation reopens the authoritative files in place under the retained store
-lock and retries only the recovery scan, never the ambiguous failed mutation.
-Before serving the selected root, live recovery re-flushes the recovered arena
-and then its root journal; recovery is exceptional work, but it cannot turn
-readable bytes from a failed flush into an unstably visible root.
-Each foreground call has a configurable attempt count and backoff; later calls
-may try again after an operator clears ENOSPC or another transient I/O fault.
-
 ### Catalog scaling
 
 The path-copy catalog replaced the linear flat catalog in `d9a1463a`.
@@ -786,7 +703,7 @@ catalog.
 | `astrid-storage-pipeline-before-279c9342.json` | clean exact parent for the prepared-admission pipeline comparison |
 | `astrid-storage-pipeline-after-0296819.json` | clean `02968196`; engine-bound bounded pipeline, exact phase timing, and single/eight-worker memory peaks |
 | `astrid-storage-closure-after-a4a492b.json` | clean `a4a492b5`; staging-earned closure evidence with exact phase timing and bounded memory peaks |
-| `astrid-storage-contiguous-da8e3cd.json` | clean `da8e3cd0`; contiguous staged-file adoption, corrected metadata accounting, and source-bound evidence envelope |
+| `astrid-storage-contiguous-da8e3cd.json` | clean `da8e3cd0`; ingest metadata accounting and source-bound evidence envelope |
 | `astrid-storage-contiguous-6384aae.json` | clean `6384aaec`; adversarial reuse hardening, no-follow authoritative reads, and forced copy-fallback measurement |
 | `astrid-storage-governed-hot-64k.json`, `astrid-storage-governed-hot-1m.json` | `e0bf4217` |
 | `astrid-storage-publication-before.json` | code `3d44cbd6`, harness `ee6990d4` |
@@ -825,16 +742,13 @@ descriptor and traversal state, bounded read-ahead, and a representation-aware
 fast path. It must not implement each VFS read callback as an independent
 high-level named-content lookup.
 
-The retired contiguous-representation design in #1396 is historical only. The
-canonical chunk DAG remains the logical identity and transfer form, and the
-current packed arena path is the only runtime placement for hot large-file
-reads. Legacy contiguous metadata is rejected rather than used as a read
-fallback.
+The canonical chunk DAG remains the logical identity and transfer form, and the
+packed arena path is the only runtime placement for hot large-file reads.
 
 The exact contract is documented in [Exact Physical
-Representations](astrid-physical-representations.md). Its contiguous sections
-are historical format notes; current staging covers canonical Chunk records via
-packed arena ingest and keeps the File and ChunkTree records materialized.
+Representations](astrid-physical-representations.md). Current staging covers
+canonical Chunk records via packed arena ingest and keeps the File and
+ChunkTree records materialized.
 
 ## Current bottleneck map
 

@@ -77,7 +77,12 @@ pub(super) const PRE_WORKSPACE_BRANCH_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
     249, 177, 127, 165, 230, 180, 172, 69, 98, 199, 228, 171, 45, 161, 240, 199, 86, 218, 7, 148,
     93, 128, 135, 148, 173, 117, 84, 74, 19, 43, 13, 145,
 ]);
-const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 13] = [
+/// Format-spec identity before reserved representation tags were invalidated.
+pub(super) const PRE_RESERVED_REPRESENTATION_TAG_FORMAT_SPEC_ID: ObjectId = ObjectId::new([
+    88, 114, 107, 60, 36, 60, 48, 235, 192, 148, 31, 101, 100, 39, 82, 0, 148, 166, 187, 16, 231,
+    178, 25, 11, 231, 50, 181, 166, 19, 0, 20, 77,
+]);
+const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 14] = [
     PRE_DERIVATION_FORMAT_SPEC_ID,
     PRE_COMPACTION_FORMAT_SPEC_ID,
     PRE_GC_OUTBOX_FORMAT_SPEC_ID,
@@ -91,6 +96,7 @@ const PRIOR_V1_FORMAT_SPEC_IDS: [ObjectId; 13] = [
     PRE_DENSE_RADIX_FORMAT_SPEC_ID,
     PRE_FLEET_OWNER_FORMAT_SPEC_ID,
     PRE_WORKSPACE_BRANCH_FORMAT_SPEC_ID,
+    PRE_RESERVED_REPRESENTATION_TAG_FORMAT_SPEC_ID,
 ];
 
 pub(super) fn format_spec_record() -> StorageResult<ObjectRecord> {

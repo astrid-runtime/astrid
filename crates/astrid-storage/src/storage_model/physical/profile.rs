@@ -153,10 +153,6 @@ pub enum ProfileKind {
     DirectCanonical,
     /// Canonical object bytes held as a slice of a pack blob.
     PackedCanonical,
-    /// Legacy contiguous-file profile retained for decode-and-reject recovery.
-    ///
-    /// The durable engine does not admit or reconstruct this profile family.
-    ContiguousFile,
     /// A pinned deterministic transform reconstructs canonical bytes.
     Transform,
 }
@@ -166,7 +162,6 @@ impl ProfileKind {
         match self {
             Self::DirectCanonical => 0,
             Self::PackedCanonical => 1,
-            Self::ContiguousFile => 2,
             Self::Transform => 3,
         }
     }
@@ -175,7 +170,6 @@ impl ProfileKind {
         match code {
             0 => Ok(Self::DirectCanonical),
             1 => Ok(Self::PackedCanonical),
-            2 => Ok(Self::ContiguousFile),
             3 => Ok(Self::Transform),
             _ => Err(PhysicalModelError::UnknownTag("profile-kind", code)),
         }

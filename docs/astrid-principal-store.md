@@ -278,9 +278,8 @@ produce a new `BlobId` for the same `ObjectId`. Logical roots do not change.
 
 The exact profile-bound BlobId grammar, representation catalogue, recovery
 leases, and accounting are specified in [Exact Physical
-Representations](astrid-physical-representations.md). Its contiguous/loose
-sections are historical decode-only notes; current content writes use packed
-arena ingest. Semantic equivalence remains a separate layer.
+Representations](astrid-physical-representations.md). Current content writes
+use packed arena ingest. Semantic equivalence remains a separate layer.
 
 ### 6.3 `SemanticId`
 

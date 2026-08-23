@@ -7,7 +7,7 @@ use super::super::DurableIo;
 
 use crate::storage_model::{
     CanonicalPhysicalMap, Coverage, ObjectId, PhysicalMapKey, PhysicalMapNode, PlacementEntry,
-    PlacementSet, Recipe, ReplicaLocator, RepresentationCatalogueRoot, RepresentationProfile,
+    PlacementSet, Recipe, RepresentationCatalogueRoot, RepresentationProfile,
     RepresentationProfileId, RepresentationRecord, RepresentationRecordId, RepresentationState,
     RepresentationStateId,
 };
@@ -351,11 +351,6 @@ pub(super) fn validate_profiles(
                 "profile leaf key does not match its value",
             ));
         }
-        if profile.kind() == crate::storage_model::ProfileKind::ContiguousFile {
-            return Err(DurableError::InvalidRepresentationState(
-                "contiguous physical representations are unsupported",
-            ));
-        }
         if profile.kind() == crate::storage_model::ProfileKind::DirectCanonical
             && direct.replace(id).is_some()
         {
@@ -391,15 +386,6 @@ pub(super) fn validate_representations(
                 "placement profile is missing",
             ));
         }
-        if entry
-            .replicas()
-            .iter()
-            .any(|replica| matches!(replica.locator(), ReplicaLocator::LooseBlob { .. }))
-        {
-            return Err(DurableError::InvalidRepresentationState(
-                "loose blob placements are unsupported",
-            ));
-        }
         extent_count = extent_count
             .checked_add(
                 u64::try_from(entry.replicas().len())
@@ -422,11 +408,6 @@ pub(super) fn validate_representations(
         )?;
         let profile = RepresentationProfile::decode(profile_bytes)?;
         record.validate_against_profile(&Blake3PhysicalIdentity, &profile)?;
-        if matches!(record.recipe(), Recipe::ContiguousFile { .. }) {
-            return Err(DurableError::InvalidRepresentationState(
-                "contiguous physical representations are unsupported",
-            ));
-        }
         let (object, blob, canonical_length) = match (record.coverage(), record.recipe()) {
             (
                 Coverage::Exact {

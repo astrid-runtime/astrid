@@ -118,11 +118,6 @@ pub enum RepresentationAdmissionMethod {
     Direct,
     /// Canonical object bytes in a pack slice.
     PackedSlice,
-    /// Legacy raw contiguous file reconstruction (decode-only).
-    ///
-    /// Durable recovery rejects this method; it is retained solely for the
-    /// frozen evidence grammar.
-    ContiguousFile,
     /// Compressed canonical object bytes.
     Compressed,
     /// Delta reconstruction against a logical base.
@@ -134,7 +129,6 @@ impl RepresentationAdmissionMethod {
         match self {
             Self::Direct => 0,
             Self::PackedSlice => 1,
-            Self::ContiguousFile => 2,
             Self::Compressed => 3,
             Self::Delta => 4,
         }
@@ -144,7 +138,6 @@ impl RepresentationAdmissionMethod {
         match code {
             0 => Ok(Self::Direct),
             1 => Ok(Self::PackedSlice),
-            2 => Ok(Self::ContiguousFile),
             3 => Ok(Self::Compressed),
             4 => Ok(Self::Delta),
             other => Err(PhysicalModelError::UnknownTag(
@@ -163,7 +156,6 @@ impl RepresentationAdmissionMethod {
         match recipe {
             Recipe::DirectCanonical { .. } => Ok(Self::Direct),
             Recipe::PackedSlice { .. } => Ok(Self::PackedSlice),
-            Recipe::ContiguousFile { .. } => Ok(Self::ContiguousFile),
             Recipe::Compressed { .. } => Ok(Self::Compressed),
             Recipe::Delta { .. } => Ok(Self::Delta),
             Recipe::Generated { .. } => Err(PhysicalModelError::InvalidRecipe(
@@ -209,7 +201,6 @@ impl RepresentationAdmissionEvidence {
         let recipe_blob = match representation.recipe() {
             Recipe::DirectCanonical { blob }
             | Recipe::PackedSlice { blob, .. }
-            | Recipe::ContiguousFile { blob }
             | Recipe::Compressed { blob, .. } => *blob,
             Recipe::Delta { patch, .. } => *patch,
             Recipe::Generated { .. } => {
@@ -368,8 +359,7 @@ impl RepresentationAdmissionEvidence {
 mod tests {
     use super::*;
     use crate::storage_model::{
-        CanonicalChunkingProfile, Coverage, Recipe, ReconstructionBounds, RepresentationProfile,
-        RepresentationRecord,
+        Coverage, Recipe, ReconstructionBounds, RepresentationProfile, RepresentationRecord,
     };
 
     struct TestIdentity;
@@ -391,25 +381,22 @@ mod tests {
         let identity = TestIdentity;
         let bounds = ReconstructionBounds::new(1, 3, 1024, 1024, 1, 1024, 1).unwrap();
         let profile = RepresentationProfile::new_builtin(
-            super::super::ProfileKind::ContiguousFile,
+            super::super::ProfileKind::PackedCanonical,
             bounds,
             object(1),
         )
         .unwrap();
         let profile_id = profile.identify(&identity).unwrap();
         let blob = BlobId::identify(&identity, profile_id, b"content bytes").unwrap();
-        let coverage = Coverage::canonical_file_chunks(
-            object(2),
-            Some(object(3)),
-            13,
-            1,
-            CanonicalChunkingProfile::ASTRID_V1,
-        )
-        .unwrap();
+        let coverage = Coverage::exact(object(2), 32).unwrap();
         let first = RepresentationRecord::new(
             profile_id,
             coverage.clone(),
-            Recipe::ContiguousFile { blob },
+            Recipe::PackedSlice {
+                blob,
+                offset: 0,
+                length: 32,
+            },
             32,
             32,
             Some(object(4)),
@@ -418,7 +405,11 @@ mod tests {
         let second = RepresentationRecord::new(
             profile_id,
             coverage,
-            Recipe::ContiguousFile { blob },
+            Recipe::PackedSlice {
+                blob,
+                offset: 0,
+                length: 32,
+            },
             32,
             32,
             Some(object(5)),
@@ -429,9 +420,9 @@ mod tests {
             RepresentationAdmissionSubjectId::identify(&identity, &second).unwrap()
         );
 
-        let outputs = [RepresentationOutputObservation::new(object(6), 32)];
+        let outputs = [RepresentationOutputObservation::new(object(2), 32)];
         let evidence =
-            RepresentationAdmissionEvidence::new(&identity, &profile, &first, blob, 13, &outputs)
+            RepresentationAdmissionEvidence::new(&identity, &profile, &first, blob, 32, &outputs)
                 .unwrap();
         let encoded = evidence.encode();
         assert_eq!(
@@ -448,7 +439,7 @@ mod tests {
         let identity = TestIdentity;
         let bounds = ReconstructionBounds::new(1, 3, 1024, 1024, 1, 1024, 1).unwrap();
         let profile = RepresentationProfile::new_builtin(
-            super::super::ProfileKind::ContiguousFile,
+            super::super::ProfileKind::PackedCanonical,
             bounds,
             object(1),
         )
@@ -457,15 +448,12 @@ mod tests {
         let blob = BlobId::identify(&identity, profile_id, b"content bytes").unwrap();
         let representation = RepresentationRecord::new(
             profile_id,
-            Coverage::canonical_file_chunks(
-                object(2),
-                Some(object(3)),
-                13,
-                1,
-                CanonicalChunkingProfile::ASTRID_V1,
-            )
-            .unwrap(),
-            Recipe::ContiguousFile { blob },
+            Coverage::exact(object(2), 32).unwrap(),
+            Recipe::PackedSlice {
+                blob,
+                offset: 0,
+                length: 32,
+            },
             32,
             32,
             Some(object(4)),
@@ -488,7 +476,7 @@ mod tests {
     fn evidence_rejects_encoded_bytes_above_the_pinned_profile_bound() {
         let identity = TestIdentity;
         let profile = RepresentationProfile::new_builtin(
-            super::super::ProfileKind::ContiguousFile,
+            super::super::ProfileKind::PackedCanonical,
             ReconstructionBounds::new(1, 3, 64, 1024, 1, 1024, 1).unwrap(),
             object(1),
         )
@@ -497,15 +485,12 @@ mod tests {
         let blob = BlobId::identify(&identity, profile_id, b"content bytes").unwrap();
         let representation = RepresentationRecord::new(
             profile_id,
-            Coverage::canonical_file_chunks(
-                object(2),
-                Some(object(3)),
-                13,
-                1,
-                CanonicalChunkingProfile::ASTRID_V1,
-            )
-            .unwrap(),
-            Recipe::ContiguousFile { blob },
+            Coverage::exact(object(2), 32).unwrap(),
+            Recipe::PackedSlice {
+                blob,
+                offset: 0,
+                length: 32,
+            },
             32,
             32,
             Some(object(4)),

@@ -1,8 +1,6 @@
 //! Home-file ingest for owner-named content on volume media.
 //!
-//! New files use the same canonical streaming arena path as capsule content.
-//! Legacy contiguous-file metadata is rejected during representation recovery;
-//! new home imports never create loose blob regions.
+//! Files use the same canonical streaming arena path as capsule content.
 
 use std::fs::File;
 
@@ -35,8 +33,7 @@ impl RuntimePrincipalStore {
     ///
     /// Files are chunked into `Chunk`/`ChunkTree`/`File` records in the shared
     /// object arena, then all names publish under one principal-root CAS and
-    /// durability boundary. Legacy loose representations are not a readable
-    /// home-content format and fail closed during recovery.
+    /// durability boundary.
     ///
     /// # Errors
     ///

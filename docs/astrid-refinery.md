@@ -182,8 +182,8 @@ new placement is authoritative before its complete closure is durable.
 The current native compactor materializes every live object into the replacement
 arena and publishes a direct-placement catalogue for that complete represented
 set. The durable compaction intent makes the authority handoff replayable after
-a crash. Legacy contiguous/loose metadata is rejected during recovery rather
-than converted or retired.
+a crash. Unknown recipe, coverage, profile-kind, and replica-locator tags
+fail closed during recovery.
 
 ## Evidence shape
 

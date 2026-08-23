@@ -28,14 +28,6 @@ pub enum ReplicaLocator {
         /// Exact checksum copied from the frame header.
         frame_checksum: [u8; 32],
     },
-    /// Legacy raw blob under a generation-scoped namespace.
-    ///
-    /// Decoding retains this tag so recovery can reject unreleased metadata;
-    /// the durable engine never reads or writes this locator.
-    LooseBlob {
-        /// Namespace generation containing the blob and its metadata sibling.
-        namespace_generation: u64,
-    },
     /// One complete frame within an immutable pack.
     PackFrame {
         /// Pack generation containing the frame.
@@ -53,7 +45,6 @@ impl ReplicaLocator {
     const fn code(self) -> u8 {
         match self {
             Self::ArenaFrame { .. } => 0,
-            Self::LooseBlob { .. } => 1,
             Self::PackFrame { .. } => 2,
         }
     }
@@ -86,9 +77,6 @@ impl ReplicaLocator {
                 encoder.u64(payload_length);
                 encoder.raw(&frame_checksum);
             },
-            Self::LooseBlob {
-                namespace_generation,
-            } => encoder.u64(namespace_generation),
             Self::PackFrame {
                 pack_generation,
                 offset,
@@ -113,9 +101,6 @@ impl ReplicaLocator {
                     .take(32)?
                     .try_into()
                     .map_err(|_| PhysicalModelError::Truncated)?,
-            },
-            1 => Self::LooseBlob {
-                namespace_generation: decoder.u64()?,
             },
             2 => Self::PackFrame {
                 pack_generation: decoder.u64()?,
