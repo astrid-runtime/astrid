@@ -1,6 +1,7 @@
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 
+use super::filesystem::CallbackFilesystem;
 use super::*;
 
 async fn callback(
@@ -1352,6 +1353,7 @@ async fn dirty_tracks_only_successfully_acknowledged_unsynced_mutations() {
         MountOwnerScope::CrossOwnerWrite,
         lease.mount_id,
     )
+    .await
     .unwrap();
     assert_eq!(status["dirty"], false);
     assert_eq!(status["in_flight_mutations"], 0);

@@ -7,16 +7,19 @@ use std::sync::atomic::Ordering;
 use astrid_capabilities::CapabilityCheck;
 use astrid_core::PrincipalId;
 use astrid_core::profile::DeviceScope;
+use astrid_core::storage_filesystem::StorageFilesystemTargetV1;
 use astrid_core::storage_provider::{
     StorageMountId, StorageProviderAccessV1, StorageProviderViewV1,
 };
 use astrid_core::{FleetUid, PrincipalUid, WorkspaceUid};
-use astrid_storage::{StateOwner, WorkspaceBranchStore};
+use astrid_storage::{AstridFilesystem, StateOwner, WorkspaceBranchStore};
+use serde_json::json;
 
 use super::StorageMountLeaseState;
 #[cfg(test)]
 use super::cleanup::MountCleanupStage;
 use super::cleanup::{MountCleanupError, cleanup_error, cleanup_resource_paths};
+use super::filesystem::{CallbackFilesystem, PrefixedFilesystem};
 use crate::Kernel;
 
 const PUBLICATION_CLOSED: &str = "cannot issue a storage mount lease for a retiring principal";
@@ -131,6 +134,9 @@ impl MountAdmission {
         self.owner_scope
     }
 }
+
+/// UID-bound mount grant consumed by Issue/Status/Sync/Revoke handlers.
+pub(crate) type MountGrant = MountAdmission;
 
 /// Reconstruct the cross-owner grant implied by a capability check.
 pub(crate) fn mount_owner_scope_from_check(check: &CapabilityCheck<'_>) -> MountOwnerScope {
@@ -339,8 +345,36 @@ pub(crate) async fn revoke_lease(
     owner_scope: MountOwnerScope,
     mount_id: StorageMountId,
 ) -> Result<(), String> {
-    let state = mapped_owned_lease(kernel, caller, owner_scope.allows_foreign_write(), mount_id)?;
+    revoke_from_grant(
+        kernel,
+        &MountGrant::capture(kernel, caller, owner_scope)?,
+        mount_id,
+    )
+    .await
+}
+
+/// Revoke using a UID-bound grant. Alias equality is never ownership.
+pub(crate) async fn revoke_from_grant(
+    kernel: &Kernel,
+    grant: &MountGrant,
+    mount_id: StorageMountId,
+) -> Result<(), String> {
+    revalidate_live_grant(kernel, grant).await?;
+    let state = mapped_owned_lease(
+        kernel,
+        grant.caller().uid(),
+        grant.owner_scope().allows_foreign_write(),
+        mount_id,
+    )?;
     force_revoke_lease(kernel, &state).await
+}
+
+pub(super) async fn revalidate_live_grant(
+    kernel: &Kernel,
+    grant: &MountGrant,
+) -> Result<(), String> {
+    refuse_live_binding(kernel, grant.caller()).await?;
+    confirm_mount_grant(kernel, grant)
 }
 
 /// Revoke every live or stale mount that can still name `principal`.
@@ -402,6 +436,9 @@ fn lease_covers_principal(
     principal: &PrincipalId,
     uid: Option<astrid_storage::PrincipalUid>,
 ) -> bool {
+    if uid.is_some_and(|uid| state.requested_by_uid == uid) {
+        return true;
+    }
     if &state.requested_by == principal {
         return true;
     }
@@ -435,11 +472,11 @@ fn revoke_visible(states: &[Arc<StorageMountLeaseState>]) {
 
 pub(super) fn owned_lease(
     kernel: &Kernel,
-    caller: &PrincipalId,
+    requester_uid: PrincipalUid,
     allow_foreign: bool,
     mount_id: StorageMountId,
 ) -> Result<Arc<StorageMountLeaseState>, String> {
-    let state = mapped_owned_lease(kernel, caller, allow_foreign, mount_id)?;
+    let state = mapped_owned_lease(kernel, requester_uid, allow_foreign, mount_id)?;
     if !state.is_live() {
         return Err("storage mount lease is expired or revoked".to_owned());
     }
@@ -448,7 +485,7 @@ pub(super) fn owned_lease(
 
 fn mapped_owned_lease(
     kernel: &Kernel,
-    caller: &PrincipalId,
+    requester_uid: PrincipalUid,
     allow_foreign: bool,
     mount_id: StorageMountId,
 ) -> Result<Arc<StorageMountLeaseState>, String> {
@@ -457,7 +494,7 @@ fn mapped_owned_lease(
         .get(&mount_id)
         .map(|entry| Arc::clone(entry.value()))
         .ok_or_else(|| format!("storage mount lease {mount_id} was not found"))?;
-    if !state.is_owned_by(caller) && !allow_foreign {
+    if !state.is_owned_by(requester_uid) && !allow_foreign {
         return Err("storage mount lease belongs to another principal".to_owned());
     }
     Ok(state)
@@ -493,4 +530,115 @@ pub(crate) fn clear_cleanup_fault_for_test(state: &StorageMountLeaseState) {
         .cleanup_fault
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+#[cfg(test)]
+pub(crate) async fn lease_status(
+    kernel: &Kernel,
+    caller: &PrincipalId,
+    owner_scope: MountOwnerScope,
+    mount_id: StorageMountId,
+) -> Result<serde_json::Value, String> {
+    lease_status_from_grant(
+        kernel,
+        &MountGrant::capture(kernel, caller, owner_scope)?,
+        mount_id,
+    )
+    .await
+}
+
+pub(crate) async fn lease_status_from_grant(
+    kernel: &Kernel,
+    grant: &MountGrant,
+    mount_id: StorageMountId,
+) -> Result<serde_json::Value, String> {
+    revalidate_live_grant(kernel, grant).await?;
+    let state = owned_lease(
+        kernel,
+        grant.caller().uid(),
+        grant.owner_scope().allows_foreign_read(),
+        mount_id,
+    )?;
+    state.renew();
+    Ok(json!({
+        "mount_id": state.mount_id,
+        "view": state.view,
+        "target": state.target,
+        "access": state.access,
+        "provider": state.provider,
+        "mountpoint": state.mountpoint,
+        "resource_path": state.resource_path,
+        "callback_path": state.callback_path,
+        "dirty": state.dirty.load(Ordering::Acquire),
+        "in_flight_mutations": state.in_flight_mutations.load(Ordering::Acquire),
+        "expires_at_epoch_secs": state.expires_at_epoch_secs.load(Ordering::Acquire),
+    }))
+}
+
+#[cfg(test)]
+pub(crate) async fn sync_lease(
+    kernel: &Kernel,
+    caller: &PrincipalId,
+    owner_scope: MountOwnerScope,
+    mount_id: StorageMountId,
+) -> Result<(), String> {
+    sync_lease_from_grant(
+        kernel,
+        &MountGrant::capture(kernel, caller, owner_scope)?,
+        mount_id,
+    )
+    .await
+}
+
+pub(crate) async fn sync_lease_from_grant(
+    kernel: &Kernel,
+    grant: &MountGrant,
+    mount_id: StorageMountId,
+) -> Result<(), String> {
+    revalidate_live_grant(kernel, grant).await?;
+    let state = owned_lease(
+        kernel,
+        grant.caller().uid(),
+        grant.owner_scope().allows_foreign_write(),
+        mount_id,
+    )?;
+    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
+    if !state.is_live() {
+        return Err("storage mount lease is expired or revoked".to_owned());
+    }
+    let store = kernel
+        .principal_store
+        .clone()
+        .ok_or_else(|| "native principal store is unavailable".to_owned())?;
+    let owner = state.owner;
+    let target = state.target.clone();
+    tokio::task::spawn_blocking(move || match target {
+        StorageFilesystemTargetV1::OwnerRoot => AstridFilesystem::new(store.content(), owner)
+            .sync()
+            .map_err(|error| error.to_string()),
+        StorageFilesystemTargetV1::WorkspaceBranch { workspace } => {
+            WorkspaceBranchStore::new(store.content())
+                .filesystem(owner, workspace)
+                .sync()
+                .map_err(|error| error.to_string())
+        },
+        StorageFilesystemTargetV1::OwnerSubtree { prefix } => {
+            if prefix == "shared" {
+                AstridFilesystem::new_fleet_shared(store.content(), owner)
+                    .sync()
+                    .map_err(|error| error.to_string())
+            } else {
+                let filesystem = PrefixedFilesystem {
+                    inner: AstridFilesystem::new(store.content(), owner),
+                    prefix,
+                };
+                filesystem.sync().map_err(|error| error.to_string())
+            }
+        },
+    })
+    .await
+    .map_err(|error| format!("mount sync worker failed: {error}"))??;
+    state.dirty.store(false, Ordering::Release);
+    state.renew();
+    Ok(())
 }

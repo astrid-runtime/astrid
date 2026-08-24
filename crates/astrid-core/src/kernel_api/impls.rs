@@ -53,3 +53,20 @@ impl AdminKernelResponse {
         Self { request_id, body }
     }
 }
+
+impl AdminRequestKind {
+    /// Host-internal fact: this request must bind alias+`PrincipalUid` at
+    /// admin ingress before profile or capability lookup.
+    ///
+    /// Not a wire field. Connection identity remains `PrincipalId`.
+    #[must_use]
+    pub const fn requires_principal_identity(&self) -> bool {
+        matches!(
+            self,
+            Self::StorageMountIssue { .. }
+                | Self::StorageMountStatus { .. }
+                | Self::StorageMountSync { .. }
+                | Self::StorageMountRevoke { .. }
+        )
+    }
+}

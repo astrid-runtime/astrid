@@ -31,7 +31,6 @@ use astrid_storage::{
 };
 use base64::Engine as _;
 use rand::{TryRng as _, rngs::SysRng};
-use serde_json::json;
 use subtle::ConstantTimeEq as _;
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::watch;
@@ -39,7 +38,7 @@ use tokio::sync::watch;
 use crate::Kernel;
 
 mod filesystem;
-use filesystem::{CallbackFilesystem, PrefixedFilesystem, execute_blocking};
+use filesystem::{PrefixedFilesystem, execute_blocking};
 #[cfg(test)]
 mod admission;
 mod cleanup;
@@ -52,17 +51,20 @@ pub(crate) use admission::last_authorized_caller_uid;
 pub(crate) use cleanup::MountCleanupStage;
 use cleanup::cleanup_resource_paths;
 pub(crate) use lifecycle::{
-    MountAdmission, MountOwnerScope, PrincipalBinding, mount_owner_scope_from_check,
-    revoke_all_leases_for_principal, revoke_lease,
+    MountAdmission, MountGrant, MountOwnerScope, PrincipalBinding, lease_status_from_grant,
+    mount_owner_scope_from_check, revoke_all_leases_for_principal, revoke_from_grant, revoke_lease,
+    sync_lease_from_grant,
 };
 use lifecycle::{
-    PublicationProof, cleanup_unpublished, expire_idle_mapped_lease, owned_lease,
-    refuse_if_retiring, revalidate_publication,
+    PublicationProof, cleanup_unpublished, expire_idle_mapped_lease, refuse_if_retiring,
+    revalidate_publication,
 };
 #[cfg(test)]
 pub(crate) use lifecycle::{
     clear_cleanup_fault_for_test, expire_lease_for_test, inject_cleanup_fault_for_test,
 };
+#[cfg(test)]
+pub(crate) use lifecycle::{lease_status, sync_lease};
 #[cfg(any(unix, windows))]
 mod process_broker;
 #[cfg(any(unix, windows))]
@@ -96,6 +98,7 @@ enum CallbackResponse {
 pub(crate) struct StorageMountLeaseState {
     mount_id: StorageMountId,
     requested_by: PrincipalId,
+    requested_by_uid: astrid_core::PrincipalUid,
     owner: StateOwner,
     view: StorageProviderViewV1,
     target: StorageFilesystemTargetV1,
@@ -142,8 +145,8 @@ struct MutationTestGate {
 }
 
 impl StorageMountLeaseState {
-    fn is_owned_by(&self, caller: &PrincipalId) -> bool {
-        &self.requested_by == caller
+    fn is_owned_by(&self, caller: astrid_core::PrincipalUid) -> bool {
+        self.requested_by_uid == caller
     }
 
     fn is_live(&self) -> bool {
@@ -201,7 +204,7 @@ pub(crate) async fn issue_lease(
     revalidate_publication(kernel, admission, owner, &proof).await?;
     publish_issued_lease(
         kernel,
-        admission.alias().clone(),
+        admission.caller(),
         owner,
         view,
         target,
@@ -233,7 +236,7 @@ fn validate_issue_request(provider: &str, mountpoint: &Path) -> Result<(), Strin
 #[allow(clippy::too_many_arguments)]
 fn publish_issued_lease(
     kernel: &Arc<Kernel>,
-    caller: PrincipalId,
+    caller: &PrincipalBinding,
     owner: StateOwner,
     view: StorageProviderViewV1,
     target: StorageFilesystemTargetV1,
@@ -260,7 +263,8 @@ fn publish_issued_lease(
     let callback_path = resource_path.join("control.endpoint");
     let state = Arc::new(StorageMountLeaseState {
         mount_id,
-        requested_by: caller,
+        requested_by: caller.alias().clone(),
+        requested_by_uid: caller.uid(),
         owner,
         view,
         target,
@@ -314,79 +318,6 @@ fn publish_issued_lease(
         astrid_runtime::spawn(serve_listener(weak_kernel, state, listener, shutdown_rx));
     }
     Ok(lease)
-}
-
-/// Return non-secret status for a lease owned by the caller.
-pub(crate) fn lease_status(
-    kernel: &Kernel,
-    caller: &PrincipalId,
-    owner_scope: MountOwnerScope,
-    mount_id: StorageMountId,
-) -> Result<serde_json::Value, String> {
-    let state = owned_lease(kernel, caller, owner_scope.allows_foreign_read(), mount_id)?;
-    state.renew();
-    Ok(json!({
-        "mount_id": state.mount_id,
-        "view": state.view,
-        "target": state.target,
-        "access": state.access,
-        "provider": state.provider,
-        "mountpoint": state.mountpoint,
-        "resource_path": state.resource_path,
-        "callback_path": state.callback_path,
-        "dirty": state.dirty.load(Ordering::Acquire),
-        "in_flight_mutations": state.in_flight_mutations.load(Ordering::Acquire),
-        "expires_at_epoch_secs": state.expires_at_epoch_secs.load(Ordering::Acquire),
-    }))
-}
-
-/// Flush one lease's authoritative owner store.
-pub(crate) async fn sync_lease(
-    kernel: &Kernel,
-    caller: &PrincipalId,
-    owner_scope: MountOwnerScope,
-    mount_id: StorageMountId,
-) -> Result<(), String> {
-    let state = owned_lease(kernel, caller, owner_scope.allows_foreign_write(), mount_id)?;
-    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
-    if !state.is_live() {
-        return Err("storage mount lease is expired or revoked".to_owned());
-    }
-    let store = kernel
-        .principal_store
-        .clone()
-        .ok_or_else(|| "native principal store is unavailable".to_owned())?;
-    let owner = state.owner;
-    let target = state.target.clone();
-    tokio::task::spawn_blocking(move || match target {
-        StorageFilesystemTargetV1::OwnerRoot => AstridFilesystem::new(store.content(), owner)
-            .sync()
-            .map_err(|error| error.to_string()),
-        StorageFilesystemTargetV1::WorkspaceBranch { workspace } => {
-            WorkspaceBranchStore::new(store.content())
-                .filesystem(owner, workspace)
-                .sync()
-                .map_err(|error| error.to_string())
-        },
-        StorageFilesystemTargetV1::OwnerSubtree { prefix } => {
-            if prefix == "shared" {
-                AstridFilesystem::new_fleet_shared(store.content(), owner)
-                    .sync()
-                    .map_err(|error| error.to_string())
-            } else {
-                let filesystem = PrefixedFilesystem {
-                    inner: AstridFilesystem::new(store.content(), owner),
-                    prefix,
-                };
-                filesystem.sync().map_err(|error| error.to_string())
-            }
-        },
-    })
-    .await
-    .map_err(|error| format!("mount sync worker failed: {error}"))??;
-    state.dirty.store(false, Ordering::Release);
-    state.renew();
-    Ok(())
 }
 
 async fn resolve_owner(
