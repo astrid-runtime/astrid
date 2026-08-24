@@ -56,6 +56,7 @@ mod owner_migration;
 mod projection_name_tests;
 #[cfg(all(test, feature = "legacy-surrealkv"))]
 mod release_fixture_tests;
+mod runtime_tree;
 mod staging;
 mod volume_migration;
 
@@ -493,6 +494,26 @@ impl RuntimePrincipalStore {
     #[must_use]
     pub fn content(&self) -> Arc<NativePrincipalContentStore> {
         Arc::clone(&self.content)
+    }
+
+    /// Admit the durable native runtime tree into the system-owned catalog.
+    ///
+    /// The source is walked without following redirects. Runtime sockets,
+    /// locks, PID/readiness/token sentinels, the volume itself, and bootstrap
+    /// host binaries remain POSIX-owned; every other regular file is published
+    /// under its slash-separated relative path through the packed content
+    /// arena. This is an explicit admission operation, never an open-time
+    /// conversion of existing volume regions.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the source tree contains a redirect or
+    /// special entry, cannot be read, or packed publication fails.
+    pub fn admit_runtime_tree(
+        &self,
+        runtime_root: impl AsRef<std::path::Path>,
+    ) -> StorageResult<()> {
+        runtime_tree::admit(self, runtime_root.as_ref())
     }
 
     /// Return the durable per-principal installed-capsule registry.
