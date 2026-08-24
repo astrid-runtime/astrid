@@ -13,7 +13,10 @@ use astrid_core::storage_filesystem::{
     StorageFilesystemSuccessV1, StorageFilesystemTargetV1, StorageMountLeaseV1,
 };
 use astrid_core::storage_provider::{StorageProviderAccessV1, StorageProviderViewV1};
-use astrid_core::{Permission, types::Timestamp};
+use astrid_core::{
+    FleetGenesis, FleetIdentity, Permission, PrincipalOwnership, PrincipalUid, UserGenesis,
+    UserIdentity, UserUid, types::Timestamp,
+};
 use astrid_crypto::KeyPair;
 use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -21,7 +24,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 #[cfg(any(unix, windows))]
 use crate::storage_mount::{
     MountCleanupStage, arm_issue_admission_gate, clear_cleanup_fault_for_test,
-    expire_lease_for_test, inject_cleanup_fault_for_test, issue_lease,
+    expire_lease_for_test, inject_cleanup_fault_for_test, issue_lease, last_authorized_caller_uid,
 };
 
 use super::handlers;
@@ -718,4 +721,220 @@ async fn agent_delete_preserves_identity_when_mount_cleanup_fails_then_retries()
         )
         .await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(any(unix, windows))]
+async fn paused_issue_after_owner_resolve_cannot_publish_after_admin_caller_drain() {
+    let (dir, kernel) = fixture().await;
+    let principal = PrincipalId::new("paused-admin").unwrap();
+    create_with_groups(&kernel, &principal, vec![BUILTIN_ADMIN.to_string()]).await;
+    let gate = arm_issue_admission_gate(&kernel);
+    let issue_kernel = Arc::clone(&kernel);
+    let issue_principal = principal.clone();
+    let mountpoint = dir.path().join("paused-admin-mount");
+    let issue = tokio::spawn(async move {
+        issue_lease(
+            &issue_kernel,
+            issue_principal,
+            true,
+            StorageProviderViewV1::Admin,
+            StorageFilesystemTargetV1::OwnerRoot,
+            StorageProviderAccessV1::ReadWrite,
+            "test-provider".to_owned(),
+            mountpoint,
+        )
+        .await
+    });
+    gate.gate().wait_until_entered().await;
+    let deleted = handlers::dispatch(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentDelete {
+            principal: principal.clone(),
+        },
+    )
+    .await;
+    gate.gate().release();
+    let issued = issue.await.expect("paused admin issue task");
+    assert!(
+        matches!(deleted, AdminResponseBody::Success(_)),
+        "admin drain must complete while admission is paused: {deleted:?}"
+    );
+    let error = issued.expect_err("paused admin issue must not publish after drain");
+    assert!(
+        error.contains("retiring"),
+        "expected retirement fail-closed, got {error}"
+    );
+    assert!(
+        kernel.storage_mounts.is_empty(),
+        "paused admin admission must not leave a map entry after drain"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(any(unix, windows))]
+async fn paused_issue_after_owner_resolve_cannot_publish_after_self_fleet_alias_recycle() {
+    let (dir, kernel) = fixture().await;
+    let manager = PrincipalId::new("fleet-manager").unwrap();
+    create(&kernel, &manager).await;
+    let (fleet, assigned_by) = assign_current_uid_to_new_fleet(&kernel, &manager).await;
+    let caller = PrincipalId::new("fleet-self").unwrap();
+    create(&kernel, &caller).await;
+    let uid_x = kernel.principal_directory.uid_for(&caller).unwrap();
+    assign_uid_to_fleet(&kernel, uid_x, fleet, assigned_by).await;
+    let gate = arm_issue_admission_gate(&kernel);
+    let issue_kernel = Arc::clone(&kernel);
+    let issue_caller = caller.clone();
+    let mountpoint = dir.path().join("paused-fleet-mount");
+    let issue = tokio::spawn(async move {
+        issue_lease(
+            &issue_kernel,
+            issue_caller,
+            false,
+            StorageProviderViewV1::Fleet(fleet),
+            StorageFilesystemTargetV1::OwnerRoot,
+            StorageProviderAccessV1::ReadWrite,
+            "test-provider".to_owned(),
+            mountpoint,
+        )
+        .await
+    });
+    gate.gate().wait_until_entered().await;
+    drop_principal_ownership_for_test(&kernel, uid_x).await;
+    delete_principal(&kernel, &caller).await;
+    create(&kernel, &caller).await;
+    let uid_y = kernel.principal_directory.uid_for(&caller).unwrap();
+    assert_ne!(uid_x, uid_y);
+    assign_uid_to_fleet(&kernel, uid_y, fleet, assigned_by).await;
+    gate.gate().release();
+    let issued = issue.await.expect("paused fleet issue task");
+    let error = issued.expect_err("paused fleet issue must not publish after alias recycle");
+    assert!(
+        error.contains("retiring"),
+        "expected captured-UID fail-closed, got {error}"
+    );
+    assert_eq!(last_authorized_caller_uid(&kernel), Some(uid_x));
+    assert!(
+        kernel.storage_mounts.is_empty(),
+        "recycled alias must not receive a Y lease or callback"
+    );
+}
+
+#[cfg(any(unix, windows))]
+async fn create_with_groups(kernel: &Arc<Kernel>, principal: &PrincipalId, groups: Vec<String>) {
+    let response = handlers::dispatch(
+        kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentCreate {
+            name: principal.to_string(),
+            groups,
+            grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
+        },
+    )
+    .await;
+    assert!(
+        matches!(response, AdminResponseBody::Success(_)),
+        "agent create failed: {response:?}"
+    );
+}
+
+#[cfg(any(unix, windows))]
+async fn assign_current_uid_to_new_fleet(
+    kernel: &Kernel,
+    principal: &PrincipalId,
+) -> (astrid_core::FleetUid, UserUid) {
+    let user = kernel
+        .identity_store
+        .resolve("cli", principal.as_str())
+        .await
+        .unwrap()
+        .unwrap();
+    let principal_identity = kernel
+        .identity_store
+        .get_principal_identity(user.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let owner = UserIdentity::from_genesis(UserGenesis::from_parts(
+        user.id,
+        user.created_at,
+        principal_identity.genesis.initial_public_key,
+    ))
+    .unwrap();
+    let fleet = FleetIdentity::from_genesis(FleetGenesis::from_parts(
+        user.id,
+        user.created_at,
+        owner.uid,
+    ))
+    .unwrap();
+    kernel
+        .ownership_store
+        .create_user(owner.clone())
+        .await
+        .unwrap();
+    kernel
+        .ownership_store
+        .create_fleet(fleet.clone())
+        .await
+        .unwrap();
+    assign_uid_to_fleet(kernel, principal_identity.uid, fleet.uid, owner.uid).await;
+    (fleet.uid, owner.uid)
+}
+
+#[cfg(any(unix, windows))]
+async fn assign_uid_to_fleet(
+    kernel: &Kernel,
+    principal_uid: PrincipalUid,
+    fleet_uid: astrid_core::FleetUid,
+    assigned_by: UserUid,
+) {
+    kernel
+        .ownership_store
+        .assign_principal(PrincipalOwnership {
+            principal_uid,
+            fleet_uid,
+            assigned_by,
+        })
+        .await
+        .unwrap();
+}
+
+#[cfg(any(unix, windows))]
+async fn drop_principal_ownership_for_test(kernel: &Kernel, uid: PrincipalUid) {
+    const NAMESPACE: &str = "system:ownership";
+    const KEY: &str = "graph-v1";
+    let current = kernel
+        .kv
+        .get(NAMESPACE, KEY)
+        .await
+        .expect("load ownership graph")
+        .expect("ownership graph present");
+    let mut graph: serde_json::Value = serde_json::from_slice(&current).expect("ownership json");
+    let removed = graph
+        .get_mut("principal_ownership")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|map| map.remove(&uid.to_string()));
+    assert!(removed.is_some(), "expected fleet assignment for {uid}");
+    let encoded = serde_json::to_vec(&graph).expect("encode ownership graph");
+    assert!(
+        kernel
+            .kv
+            .compare_and_swap(NAMESPACE, KEY, Some(current.as_slice()), encoded)
+            .await
+            .expect("cas ownership graph"),
+        "ownership graph cas must apply"
+    );
+    assert!(
+        kernel
+            .ownership_store()
+            .load()
+            .await
+            .unwrap()
+            .principal_owner(uid)
+            .is_none()
+    );
 }

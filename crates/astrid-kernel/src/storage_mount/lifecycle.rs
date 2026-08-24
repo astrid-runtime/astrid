@@ -6,7 +6,8 @@ use std::sync::atomic::Ordering;
 
 use astrid_core::PrincipalId;
 use astrid_core::storage_provider::{StorageMountId, StorageProviderViewV1};
-use astrid_storage::StateOwner;
+use astrid_core::{FleetUid, PrincipalUid, WorkspaceUid};
+use astrid_storage::{StateOwner, WorkspaceBranchStore};
 
 use super::StorageMountLeaseState;
 #[cfg(test)]
@@ -15,6 +16,68 @@ use super::cleanup::{MountCleanupError, cleanup_error, cleanup_resource_paths};
 use crate::Kernel;
 
 const PUBLICATION_CLOSED: &str = "cannot issue a storage mount lease for a retiring principal";
+
+/// Alias plus the immutable UID captured before any admission await.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PrincipalBinding {
+    alias: PrincipalId,
+    uid: PrincipalUid,
+}
+
+impl PrincipalBinding {
+    pub(super) fn capture(kernel: &Kernel, alias: &PrincipalId) -> Result<Self, String> {
+        let uid = kernel.principal_directory.uid_for(alias).map_err(|error| {
+            format!("principal `{alias}` has no immutable storage identity: {error}")
+        })?;
+        Ok(Self {
+            alias: alias.clone(),
+            uid,
+        })
+    }
+
+    pub(super) const fn uid(&self) -> PrincipalUid {
+        self.uid
+    }
+
+    pub(super) fn alias(&self) -> &PrincipalId {
+        &self.alias
+    }
+}
+
+/// Authorization facts resolved against the captured caller UID.
+#[derive(Clone, Debug, Default)]
+pub(super) struct PublicationProof {
+    viewed: Option<PrincipalBinding>,
+    fleet_membership: Option<FleetUid>,
+    workspace: Option<WorkspaceUid>,
+}
+
+impl PublicationProof {
+    pub(super) fn principal(viewed: PrincipalBinding) -> Self {
+        Self {
+            viewed: Some(viewed),
+            fleet_membership: None,
+            workspace: None,
+        }
+    }
+
+    pub(super) fn fleet(membership: Option<FleetUid>) -> Self {
+        Self {
+            viewed: None,
+            fleet_membership: membership,
+            workspace: None,
+        }
+    }
+
+    pub(super) fn admin() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn with_workspace(mut self, workspace: WorkspaceUid) -> Self {
+        self.workspace = Some(workspace);
+        self
+    }
+}
 
 pub(super) async fn refuse_if_retiring(
     kernel: &Kernel,
@@ -32,37 +95,81 @@ pub(super) async fn refuse_if_retiring(
     Ok(())
 }
 
-/// `AgentDelete` finishes the in-memory retirement tombstone after unlink.
-/// A paused issuer that already passed the fast-path check must still fail
-/// closed if the caller or viewed principal binding disappeared or drifted.
-pub(super) fn refuse_if_identity_reclaimed(
+/// Recheck captured caller/viewed/owner facts in the publication critical section.
+pub(super) async fn revalidate_publication(
     kernel: &Kernel,
-    caller: &PrincipalId,
-    view: &StorageProviderViewV1,
+    caller: &PrincipalBinding,
     owner: StateOwner,
-    caller_uid: Option<astrid_storage::PrincipalUid>,
+    proof: &PublicationProof,
 ) -> Result<(), String> {
-    if let Some(uid) = caller_uid
-        && !binding_still_matches(kernel, caller, uid)
-    {
-        return Err(PUBLICATION_CLOSED.to_owned());
-    }
-    if let StorageProviderViewV1::Principal(viewed) = view {
-        let StateOwner::Principal(uid) = owner else {
-            return Err(PUBLICATION_CLOSED.to_owned());
-        };
-        if !binding_still_matches(kernel, viewed, uid) {
+    refuse_live_binding(kernel, caller).await?;
+    if let Some(viewed) = &proof.viewed {
+        refuse_live_binding(kernel, viewed).await?;
+        if owner != StateOwner::Principal(viewed.uid) {
             return Err(PUBLICATION_CLOSED.to_owned());
         }
+    }
+    if let Some(fleet) = proof.fleet_membership {
+        confirm_fleet_membership(kernel, caller.uid, fleet, owner).await?;
+    }
+    if let Some(workspace) = proof.workspace {
+        confirm_workspace_binding(kernel, caller.uid, owner, workspace)?;
     }
     Ok(())
 }
 
-fn binding_still_matches(
+async fn refuse_live_binding(kernel: &Kernel, binding: &PrincipalBinding) -> Result<(), String> {
+    if kernel
+        .capabilities
+        .is_principal_retiring(&binding.alias)
+        .await
+        || !binding_still_matches(kernel, &binding.alias, binding.uid)
+    {
+        return Err(PUBLICATION_CLOSED.to_owned());
+    }
+    Ok(())
+}
+
+async fn confirm_fleet_membership(
     kernel: &Kernel,
-    principal: &PrincipalId,
-    expected: astrid_storage::PrincipalUid,
-) -> bool {
+    caller_uid: PrincipalUid,
+    fleet: FleetUid,
+    owner: StateOwner,
+) -> Result<(), String> {
+    let ownership = kernel
+        .ownership_store()
+        .load()
+        .await
+        .map_err(|error| format!("read fleet ownership graph: {error}"))?;
+    let admitted = ownership
+        .principal_owner(caller_uid)
+        .is_some_and(|owned| owned.fleet_uid == fleet);
+    if !admitted || owner != StateOwner::Fleet(fleet) {
+        return Err(PUBLICATION_CLOSED.to_owned());
+    }
+    Ok(())
+}
+
+fn confirm_workspace_binding(
+    kernel: &Kernel,
+    caller_uid: PrincipalUid,
+    owner: StateOwner,
+    workspace: WorkspaceUid,
+) -> Result<(), String> {
+    let store = kernel
+        .principal_store
+        .clone()
+        .ok_or_else(|| "native principal store is unavailable".to_owned())?;
+    let descriptor = WorkspaceBranchStore::new(store.content())
+        .describe(&owner, workspace)
+        .map_err(|error| format!("resolve workspace branch: {error}"))?;
+    if descriptor.binding_uid() != Some(caller_uid) {
+        return Err(PUBLICATION_CLOSED.to_owned());
+    }
+    Ok(())
+}
+
+fn binding_still_matches(kernel: &Kernel, principal: &PrincipalId, expected: PrincipalUid) -> bool {
     kernel
         .principal_directory
         .uid_for(principal)

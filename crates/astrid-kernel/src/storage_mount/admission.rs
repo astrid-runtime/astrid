@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, LazyLock};
 
+use astrid_core::PrincipalUid;
 use dashmap::DashMap;
 
 use crate::Kernel;
@@ -54,6 +55,7 @@ impl Drop for IssueAdmissionGateGuard {
 
 static ISSUE_GATES: LazyLock<DashMap<usize, Arc<IssueAdmissionTestGate>>> =
     LazyLock::new(DashMap::new);
+static AUTHORIZED_CALLERS: LazyLock<DashMap<usize, PrincipalUid>> = LazyLock::new(DashMap::new);
 
 /// Install a deterministic pause before lease publication for `kernel`.
 #[must_use]
@@ -78,6 +80,20 @@ pub(super) async fn pause_issue_admission_for_test(kernel: &Arc<Kernel>) {
     }
 }
 
+pub(super) fn record_authorized_caller(kernel: &Kernel, uid: PrincipalUid) {
+    AUTHORIZED_CALLERS.insert(kernel_key(kernel), uid);
+}
+
+pub(crate) fn last_authorized_caller_uid(kernel: &Kernel) -> Option<PrincipalUid> {
+    AUTHORIZED_CALLERS
+        .get(&kernel_key(kernel))
+        .map(|entry| *entry.value())
+}
+
+fn kernel_key(kernel: &Kernel) -> usize {
+    std::ptr::from_ref(kernel) as usize
+}
+
 fn arc_key(kernel: &Arc<Kernel>) -> usize {
-    Arc::as_ptr(kernel) as usize
+    kernel_key(kernel)
 }

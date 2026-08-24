@@ -47,11 +47,13 @@ mod lifecycle;
 #[cfg(test)]
 pub(crate) use admission::arm_issue_admission_gate;
 #[cfg(test)]
+pub(crate) use admission::last_authorized_caller_uid;
+#[cfg(test)]
 pub(crate) use cleanup::MountCleanupStage;
 use cleanup::cleanup_resource_paths;
 use lifecycle::{
-    cleanup_unpublished, expire_idle_mapped_lease, owned_lease, refuse_if_identity_reclaimed,
-    refuse_if_retiring,
+    PrincipalBinding, PublicationProof, cleanup_unpublished, expire_idle_mapped_lease, owned_lease,
+    refuse_if_retiring, revalidate_publication,
 };
 #[cfg(test)]
 pub(crate) use lifecycle::{
@@ -184,18 +186,18 @@ pub(crate) async fn issue_lease(
     mountpoint: PathBuf,
 ) -> Result<StorageMountLeaseV1, String> {
     validate_issue_request(&provider, &mountpoint)?;
+    let caller_binding = PrincipalBinding::capture(kernel, &caller)?;
     refuse_if_retiring(kernel, &caller, &view).await?;
-    let (owner, target) = resolve_owner(kernel, &caller, allow_cross_owner, &view, target).await?;
-    let caller_uid = kernel.principal_directory.uid_for(&caller).ok();
+    let (owner, target, proof) =
+        resolve_owner(kernel, &caller_binding, allow_cross_owner, &view, target).await?;
     #[cfg(test)]
     admission::pause_issue_admission_for_test(kernel).await;
-    // Publication and drain share this lock. Recheck retirement and the
-    // resolved directory bindings here so an issue either inserts before
-    // drain snapshots or sees retirement/reclamation and inserts nothing.
-    // The test barrier stays above this lock.
+    // Publication and drain share this lock. Recheck captured bindings and
+    // authorization facts here so an issue either inserts before drain or
+    // sees retirement/reclamation/drift and inserts nothing. The test
+    // barrier stays above this lock, immediately after resolve_owner.
     let _publication = kernel.storage_mount_mutations.lock().await;
-    refuse_if_retiring(kernel, &caller, &view).await?;
-    refuse_if_identity_reclaimed(kernel, &caller, &view, owner, caller_uid)?;
+    revalidate_publication(kernel, &caller_binding, owner, &proof).await?;
     publish_issued_lease(
         kernel, caller, owner, view, target, access, provider, mountpoint,
     )
@@ -372,39 +374,50 @@ pub(crate) async fn sync_lease(
 
 async fn resolve_owner(
     kernel: &Kernel,
-    caller: &PrincipalId,
+    caller: &PrincipalBinding,
     allow_cross_owner: bool,
     view: &StorageProviderViewV1,
     target: StorageFilesystemTargetV1,
-) -> Result<(StateOwner, StorageFilesystemTargetV1), String> {
-    let owner = match view {
+) -> Result<(StateOwner, StorageFilesystemTargetV1, PublicationProof), String> {
+    #[cfg(test)]
+    admission::record_authorized_caller(kernel, caller.uid());
+    let (owner, mut proof) = authorize_view(kernel, caller, allow_cross_owner, view).await?;
+    if let StorageFilesystemTargetV1::WorkspaceBranch { workspace } = &target {
+        confirm_workspace_target(kernel, caller, allow_cross_owner, owner, *workspace)?;
+        if !allow_cross_owner {
+            proof = proof.with_workspace(*workspace);
+        }
+    }
+    confirm_subtree_target(owner, &target)?;
+    Ok((owner, target, proof))
+}
+
+async fn authorize_view(
+    kernel: &Kernel,
+    caller: &PrincipalBinding,
+    allow_cross_owner: bool,
+    view: &StorageProviderViewV1,
+) -> Result<(StateOwner, PublicationProof), String> {
+    Ok(match view {
         StorageProviderViewV1::Principal(principal) => {
-            if principal != caller && !allow_cross_owner {
+            if principal != caller.alias() && !allow_cross_owner {
                 return Err("principal filesystem view belongs to another principal".to_owned());
             }
-            kernel
-                .principal_directory
-                .uid_for(principal)
-                .map(StateOwner::Principal)
-                .map_err(|error| {
-                    format!("principal `{principal}` has no immutable storage identity: {error}")
-                })?
+            let viewed = PrincipalBinding::capture(kernel, principal)?;
+            (
+                StateOwner::Principal(viewed.uid()),
+                PublicationProof::principal(viewed),
+            )
         },
         StorageProviderViewV1::Fleet(fleet) => {
             if !allow_cross_owner {
-                let caller_uid = kernel
-                    .principal_directory
-                    .uid_for(caller)
-                    .map_err(|error| {
-                        format!("principal `{caller}` has no immutable storage identity: {error}")
-                    })?;
                 let ownership = kernel
                     .ownership_store()
                     .load()
                     .await
                     .map_err(|error| format!("read fleet ownership graph: {error}"))?;
                 let admitted = ownership
-                    .principal_owner(caller_uid)
+                    .principal_owner(caller.uid())
                     .is_some_and(|owner| owner.fleet_uid == *fleet);
                 if !admitted {
                     return Err(
@@ -412,57 +425,64 @@ async fn resolve_owner(
                     );
                 }
             }
-            StateOwner::Fleet(*fleet)
+            (
+                StateOwner::Fleet(*fleet),
+                PublicationProof::fleet((!allow_cross_owner).then_some(*fleet)),
+            )
         },
         StorageProviderViewV1::Admin => {
             if !allow_cross_owner {
                 return Err("system filesystem view requires global storage authority".to_owned());
             }
-            StateOwner::System
+            (StateOwner::System, PublicationProof::admin())
         },
+    })
+}
+
+fn confirm_workspace_target(
+    kernel: &Kernel,
+    caller: &PrincipalBinding,
+    allow_cross_owner: bool,
+    owner: StateOwner,
+    workspace: astrid_core::WorkspaceUid,
+) -> Result<(), String> {
+    let store = kernel
+        .principal_store
+        .clone()
+        .ok_or_else(|| "native principal store is unavailable".to_owned())?;
+    let descriptor = WorkspaceBranchStore::new(store.content())
+        .describe(&owner, workspace)
+        .map_err(|error| format!("resolve workspace branch: {error}"))?;
+    // A caller-scoped branch lease may only target the branch that the
+    // kernel's durable workspace binding assigned to that immutable UID.
+    // Fleet membership authorizes the shared base owner, not another
+    // principal's divergent branch. Global storage authority may inspect
+    // an explicitly selected branch through the administrative path.
+    if !allow_cross_owner && descriptor.binding_uid() != Some(caller.uid()) {
+        return Err("workspace branch is not bound to the authenticated principal".to_owned());
+    }
+    Ok(())
+}
+
+fn confirm_subtree_target(
+    owner: StateOwner,
+    target: &StorageFilesystemTargetV1,
+) -> Result<(), String> {
+    let StorageFilesystemTargetV1::OwnerSubtree { prefix } = target else {
+        return Ok(());
     };
-
-    if let StorageFilesystemTargetV1::WorkspaceBranch { workspace } = &target {
-        let store = kernel
-            .principal_store
-            .clone()
-            .ok_or_else(|| "native principal store is unavailable".to_owned())?;
-        let branches = WorkspaceBranchStore::new(store.content());
-        let descriptor = branches
-            .describe(&owner, *workspace)
-            .map_err(|error| format!("resolve workspace branch: {error}"))?;
-        // A caller-scoped branch lease may only target the branch that the
-        // kernel's durable workspace binding assigned to that immutable UID.
-        // Fleet membership authorizes the shared base owner, not another
-        // principal's divergent branch. Global storage authority may inspect
-        // an explicitly selected branch through the administrative path.
-        if !allow_cross_owner {
-            let caller_uid = kernel
-                .principal_directory
-                .uid_for(caller)
-                .map_err(|error| format!("resolve workspace branch caller UID: {error}"))?;
-            if descriptor.binding_uid() != Some(caller_uid) {
-                return Err(
-                    "workspace branch is not bound to the authenticated principal".to_owned(),
-                );
-            }
-        }
+    if prefix != "home" && prefix != "shared" {
+        return Err("owner subtree prefix is not a kernel-admitted attachment".to_owned());
     }
-    if let StorageFilesystemTargetV1::OwnerSubtree { prefix } = &target {
-        if prefix != "home" && prefix != "shared" {
-            return Err("owner subtree prefix is not a kernel-admitted attachment".to_owned());
-        }
-        if prefix == "home" && !matches!(owner, StateOwner::Principal(_)) {
-            return Err("principal HOME must resolve to the principal owner".to_owned());
-        }
-        if prefix == "shared" && !matches!(owner, StateOwner::Fleet(_)) {
-            return Err("Fleet shared attachment requires a Fleet owner".to_owned());
-        }
-        FilesystemPath::new(prefix.clone())
-            .map_err(|error| format!("resolve owner subtree prefix: {error}"))?;
+    if prefix == "home" && !matches!(owner, StateOwner::Principal(_)) {
+        return Err("principal HOME must resolve to the principal owner".to_owned());
     }
-
-    Ok((owner, target))
+    if prefix == "shared" && !matches!(owner, StateOwner::Fleet(_)) {
+        return Err("Fleet shared attachment requires a Fleet owner".to_owned());
+    }
+    FilesystemPath::new(prefix.clone())
+        .map_err(|error| format!("resolve owner subtree prefix: {error}"))?;
+    Ok(())
 }
 
 #[cfg(any(unix, windows))]
