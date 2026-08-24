@@ -1111,7 +1111,8 @@ than asserted from architecture. The benchmark suite records:
 - storage write amplification, compaction, reclamation, and backup cost;
 - Realm execution overhead versus native Linux and a conventional container;
 - portal latency for files, network, secrets, and tools;
-- scale-to-zero recovery time and first-token latency for Hermes;
+- scale-to-zero recovery time and first-token latency for each selected
+  or claimed application fixture;
 - update download size and rollback time; and
 - operator effort for install, upgrade, recovery, migration, and incident
   inspection.
