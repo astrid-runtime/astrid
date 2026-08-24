@@ -259,6 +259,8 @@ pub struct HostState {
     pub store_meter: crate::memory_ledger::StoreMemoryMeter,
     /// The principal this capsule is running on behalf of.
     pub principal: astrid_core::principal::PrincipalId,
+    /// Host-only UID stamp for the current invocation, when available.
+    pub stamped_invocation: Option<crate::stamp::StampedInvocation>,
     /// Explicit kernel-service scope. When false, every long-lived IPC route
     /// is restricted to `principal`; default-principal is still a principal.
     pub system_runtime: bool,

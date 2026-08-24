@@ -456,6 +456,7 @@ impl Drop for PoolCheckout {
 /// ctx, whose sole content is the inherited-stderr stdio config.
 fn clear_on_return(state: &mut HostState, reset_resources: bool) {
     state.caller_context = None;
+    state.stamped_invocation = None;
     state.interceptor_active = false;
     state.invocation_kv = None;
     state.invocation_home = None;

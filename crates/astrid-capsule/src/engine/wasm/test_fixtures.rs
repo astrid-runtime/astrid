@@ -103,6 +103,7 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
             crate::MemoryLedger::default(),
         ),
         principal: astrid_core::PrincipalId::default(),
+        stamped_invocation: None,
         system_runtime: false,
         capsule_uuid: uuid::Uuid::new_v4(),
         caller_context: None,

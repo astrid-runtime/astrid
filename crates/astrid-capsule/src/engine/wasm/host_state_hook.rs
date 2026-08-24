@@ -48,6 +48,7 @@ impl HostState {
             resource_table: wasmtime::component::ResourceTable::new(),
             store_meter,
             principal: astrid_core::PrincipalId::default(),
+            stamped_invocation: None,
             system_runtime: false,
             capsule_uuid: uuid::Uuid::new_v4(),
             caller_context: None,

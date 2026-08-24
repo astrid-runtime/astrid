@@ -58,6 +58,15 @@ impl HostState {
                 self.capsule_id
             )));
         }
+        let crate::registry::RuntimeScope::Principal(owner_uid) = runtime_id.key().scope() else {
+            return Err(crate::error::CapsuleError::ExecutionFailed(format!(
+                "runtime '{}' is not the principal owner of capsule '{}'",
+                runtime_id.key().capsule_id(),
+                self.capsule_id
+            )));
+        };
+        self.stamped_invocation =
+            Some(crate::stamp::StampedInvocation::from_trusted_uid(owner_uid));
         self.invocation_kv = Some(self.kv.clone());
         self.invocation_home = self.home.clone();
         self.invocation_tmp = self.tmp.clone();
@@ -231,6 +240,30 @@ impl HostState {
             .principal
             .as_deref()
             .and_then(|p| astrid_core::PrincipalId::new(p).ok());
+        let previous_principal = self
+            .caller_context
+            .as_ref()
+            .and_then(|context| context.principal.as_deref());
+        let owner_context =
+            previous_principal.is_none_or(|principal| principal == self.principal.as_str());
+        let trusted_uid = self
+            .stamped_invocation
+            .as_ref()
+            .map(|stamp| stamp.principal())
+            .filter(|_| {
+                owner_context
+                    && (publisher
+                        .as_ref()
+                        .is_some_and(|principal| principal == &self.principal)
+                        || publisher.is_none())
+            });
+        self.stamped_invocation = crate::stamp::IngressIdentity::from_host_context(
+            &self.principal_directory,
+            publisher.as_ref(),
+            trusted_uid,
+        )
+        .trusted_stamp()
+        .cloned();
         if !self.system_runtime
             && publisher
                 .as_ref()
