@@ -41,12 +41,14 @@
 //! This task never touches stdout — that channel belongs to the MCP
 //! transport. Every diagnostic goes through `tracing` (stderr).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rmcp::service::{Peer, RoleServer};
 use serde_json::{Value, json};
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -181,6 +183,93 @@ pub(super) async fn run(peer: Peer<RoleServer>, principal: String, daemon_root: 
             "MCP hot-reload watcher: tool set changed; pushed tools/list_changed"
         );
         last_known = names;
+    }
+}
+
+/// Gateway variant of [`run`] that shares one watcher uplink across all
+/// attached MCP sessions.  The list is intentionally kept behind a mutex so a
+/// newly accepted client can register its peer without opening another daemon
+/// connection; dead peers are removed when notification delivery fails.
+pub(super) async fn run_many(
+    peers: Arc<Mutex<HashMap<String, Peer<RoleServer>>>>,
+    principal: String,
+    daemon_root: PathBuf,
+) {
+    let caller = match astrid_core::PrincipalId::new(&principal) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, %principal, "MCP gateway watcher: invalid principal; live tool-reload pushes disabled");
+            return;
+        },
+    };
+    let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
+    let mut watch_client = match crate::socket_client::connect_for_workspace(
+        session,
+        caller,
+        Some(daemon_root.as_path()),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "MCP gateway watcher: failed to open watch uplink");
+            return;
+        },
+    };
+    let mut last_known = match enumerate_on(&mut watch_client, &principal).await {
+        Ok(names) => names,
+        Err(e) => {
+            warn!(error = %e, "MCP gateway watcher: baseline seed failed");
+            BTreeSet::new()
+        },
+    };
+
+    loop {
+        let frame = match watch_client.read_raw_frame().await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return,
+            Err(e) => {
+                warn!(error = %e, "MCP gateway watcher: watch uplink read failed");
+                return;
+            },
+        };
+        let Ok(raw) = serde_json::from_slice::<Value>(&frame) else {
+            continue;
+        };
+        if raw.get("topic").and_then(Value::as_str) != Some(CAPSULES_LOADED_TOPIC) {
+            continue;
+        }
+        let names = tool_names_from_capsules_loaded(unwrap_reply_payload_ref(&raw), &principal);
+        if names == last_known {
+            continue;
+        }
+        notify_peers(&peers).await;
+        last_known = names;
+    }
+}
+
+async fn notify_peers(peers: &Arc<Mutex<HashMap<String, Peer<RoleServer>>>>) {
+    // Do not hold the map lock across network notifications. Snapshot the
+    // keyed peers, notify independently, then remove only sessions whose
+    // transport has closed. An attach that reaches stdin EOF is therefore
+    // unregistered on the next reload signal without disturbing other peers.
+    let snapshot = peers
+        .lock()
+        .await
+        .iter()
+        .map(|(id, peer)| (id.clone(), peer.clone()))
+        .collect::<Vec<_>>();
+    let mut closed = Vec::new();
+    for (id, peer) in snapshot {
+        if peer.notify_tool_list_changed().await.is_err() {
+            closed.push(id);
+        }
+    }
+    if !closed.is_empty() {
+        let mut guard = peers.lock().await;
+        for id in closed {
+            guard.remove(&id);
+        }
     }
 }
 

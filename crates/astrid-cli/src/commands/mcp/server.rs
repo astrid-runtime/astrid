@@ -111,6 +111,9 @@ pub(crate) struct AstridMcpServer {
     principal: PrincipalId,
     /// Runtime-home daemon identity. Host `--workspace` is the project, not this.
     daemon_root: PathBuf,
+    /// Host project root used by broker requests that resolve `cwd://` paths.
+    /// This is supplied by `mcp attach` and is never used as the daemon root.
+    workspace: PathBuf,
     /// Set when a prior round trip ended in a connection-loss condition (a
     /// failed send, or a reply read that hit EOF / reset). The NEXT round trip
     /// re-handshakes (`reconnect()`) before sending, so a request never goes
@@ -132,11 +135,13 @@ impl AstridMcpServer {
         client: Arc<Mutex<SocketClient>>,
         principal: PrincipalId,
         daemon_root: PathBuf,
+        workspace: PathBuf,
     ) -> Self {
         Self {
             client,
             principal,
             daemon_root,
+            workspace,
             needs_reconnect: AtomicBool::new(false),
             mrtr: MrtrBridge::new(),
         }
@@ -179,6 +184,7 @@ impl AstridMcpServer {
         body: Value,
     ) -> Result<Value, McpError> {
         let reply_topic = astrid_types::Topic::kernel_response(req_id);
+        let body = self.with_workspace(body);
 
         let msg = astrid_types::ipc::IpcMessage::new(
             astrid_types::Topic::from_raw(request_topic),
@@ -300,6 +306,19 @@ impl AstridMcpServer {
                 ))
             },
         }
+    }
+
+    /// Add host project context to each broker request without changing the
+    /// existing request envelope. The broker can ignore this field on older
+    /// versions; newer `cwd://` handlers use it as the explicit project root.
+    fn with_workspace(&self, mut body: Value) -> Value {
+        if let Value::Object(object) = &mut body {
+            object.insert(
+                "workspace".to_owned(),
+                Value::String(self.workspace.to_string_lossy().into_owned()),
+            );
+        }
+        body
     }
 }
 

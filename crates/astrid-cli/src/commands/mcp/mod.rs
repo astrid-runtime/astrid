@@ -33,10 +33,13 @@
 //! for `mcp serve` (to the log file, else stderr) regardless of operator
 //! config, so a stray diagnostic can never corrupt the protocol stream.
 
+mod attach;
 mod elicit;
 mod form_elicitation;
+mod gateway;
 mod grant;
 mod ingress;
+mod lifecycle;
 mod mrtr;
 // Parent-death detection reads `getppid()` (Unix-only); the module and its use
 // site are target-gated so the CLI still compiles on non-Unix targets.
@@ -46,6 +49,13 @@ mod readiness;
 mod server;
 mod session_guard;
 mod watch;
+
+#[allow(unused_imports)]
+pub(crate) use attach::run as attach;
+#[allow(unused_imports)]
+pub(crate) use gateway::run as gateway;
+#[allow(unused_imports)]
+pub(crate) use lifecycle::{gc, ready};
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -138,6 +148,16 @@ pub(crate) async fn serve(
     // not `--workspace` (the host project).
     let cwd = std::env::current_dir().context("failed to read mcp serve cwd")?;
     let daemon_root = mcp_serve_daemon_root(&cwd, workspace);
+    let workspace_context = workspace
+        .map(std::fs::canonicalize)
+        .transpose()
+        .with_context(|| {
+            workspace.map_or_else(
+                || "failed to resolve MCP workspace".to_owned(),
+                |path| format!("failed to resolve MCP workspace {}", path.display()),
+            )
+        })?
+        .unwrap_or_else(|| cwd.clone());
     crate::commands::daemon::ensure_daemon_quiet("mcp-serve", Some(&daemon_root))
         .await
         .context("failed to ensure Astrid daemon for `astrid mcp serve`")?;
@@ -191,6 +211,7 @@ pub(crate) async fn serve(
         Arc::new(Mutex::new(client)),
         caller.clone(),
         daemon_root.clone(),
+        workspace_context,
     );
 
     // `rmcp::transport::stdio()` yields the (stdin, stdout) pair the MCP
