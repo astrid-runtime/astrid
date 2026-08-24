@@ -76,6 +76,7 @@ use format_amendment::{
     store_metadata,
 };
 use native_io::atomic_write;
+pub use runtime_tree::RuntimeTreeEntry;
 pub use staging::{
     NativeContentStagingArea, ReadyStagedContent, StagedContentId, StagedContentWriter,
 };
@@ -514,6 +515,23 @@ impl RuntimePrincipalStore {
         runtime_root: impl AsRef<std::path::Path>,
     ) -> StorageResult<()> {
         runtime_tree::admit(self, runtime_root.as_ref())
+    }
+
+    /// Scan the native runtime tree without reading file payloads.
+    ///
+    /// The scan uses the exact exclusions and path validation applied by
+    /// [`Self::admit_runtime_tree`]. Kernel migration receipts therefore do
+    /// not maintain a second, drifting definition of the packed tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the source tree contains a redirect or
+    /// special entry, cannot be read, or has an unrepresentable timestamp.
+    pub fn scan_runtime_tree(
+        &self,
+        runtime_root: impl AsRef<std::path::Path>,
+    ) -> StorageResult<Vec<RuntimeTreeEntry>> {
+        runtime_tree::scan(runtime_root.as_ref())
     }
 
     /// Return the durable per-principal installed-capsule registry.

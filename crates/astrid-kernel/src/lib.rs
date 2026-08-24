@@ -58,6 +58,8 @@ mod principal_home_migration;
 mod principal_log_migration;
 #[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
 mod runtime_policy_tests;
+#[cfg(not(target_family = "wasm"))]
+mod runtime_tree_admit;
 /// The Unix Domain Socket manager. Unix-only: binds the `UnixListener` and
 /// acquires the singleton advisory lock.
 #[cfg(unix)]
@@ -1126,6 +1128,15 @@ impl Kernel {
                     &workspace_layout,
                 )
                 .await?;
+            }
+
+            // The host runtime tree crosses the same singleton-owned
+            // migrate-only window as the released layout sources. Admission
+            // runs for fresh, legacy, and existing-v2 homes; a matching
+            // receipt avoids payload reads and catalog publication on boot.
+            #[cfg(not(target_family = "wasm"))]
+            if let Some(store) = principal_store.as_ref() {
+                runtime_tree_admit::admit(&home, store).await?;
             }
 
             // The released profile, when present, is now represented by the

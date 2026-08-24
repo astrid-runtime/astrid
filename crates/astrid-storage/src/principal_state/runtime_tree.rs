@@ -11,8 +11,10 @@ use crate::error::{StorageError, StorageResult};
 
 use super::{ContiguousFileIngest, RuntimePrincipalStore, StateOwner};
 
-const EXCLUDED_PATHS: [&str; 6] = [
+const EXCLUDED_PATHS: [&str; 8] = [
+    "etc/layout-version",
     "var/astrid.volume",
+    "keys/runtime.key",
     "run/system.sock",
     "run/system.lock",
     "run/system.pid",
@@ -20,9 +22,41 @@ const EXCLUDED_PATHS: [&str; 6] = [
     "run/system.token",
 ];
 
-/// Walk `runtime_root` and publish its durable regular files as one packed
-/// system-owned content batch.
-pub(super) fn admit(store: &RuntimePrincipalStore, runtime_root: &Path) -> StorageResult<()> {
+/// One regular file discovered in the native runtime tree.
+///
+/// The source path is retained only for the immediate packed admission. The
+/// name, length, and modification time form the host-side receipt identity
+/// used by the kernel to skip an unchanged tree on later boots.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeTreeEntry {
+    name: ContentName,
+    source_path: PathBuf,
+    logical_bytes: u64,
+    modified_nanos: i128,
+}
+
+impl RuntimeTreeEntry {
+    /// Borrow the slash-separated catalog name.
+    #[must_use]
+    pub const fn name(&self) -> &ContentName {
+        &self.name
+    }
+
+    /// Return the source file length captured by the scan.
+    #[must_use]
+    pub const fn logical_bytes(&self) -> u64 {
+        self.logical_bytes
+    }
+
+    /// Return the source modification time as signed Unix nanoseconds.
+    #[must_use]
+    pub const fn modified_nanos(&self) -> i128 {
+        self.modified_nanos
+    }
+}
+
+/// Scan the native runtime tree without reading file payloads.
+pub(super) fn scan(runtime_root: &Path) -> StorageResult<Vec<RuntimeTreeEntry>> {
     let metadata = std::fs::symlink_metadata(runtime_root)
         .map_err(|error| tree_error(runtime_root, format!("inspect source root: {error}")))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -35,18 +69,35 @@ pub(super) fn admit(store: &RuntimePrincipalStore, runtime_root: &Path) -> Stora
     let mut files = Vec::new();
     collect_files(runtime_root, runtime_root, &mut files)?;
     files.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut validated = Vec::new();
-    for (_, path, logical_bytes) in files {
-        let name = content_name_from_relative(&path, runtime_root)?;
-        validated.push(ContiguousFileIngest::new(name, path, logical_bytes));
-    }
+    files
+        .into_iter()
+        .map(|(_, path, metadata)| {
+            let name = content_name_from_relative(&path, runtime_root)?;
+            let modified_nanos = modified_nanos(&metadata, &path)?;
+            Ok(RuntimeTreeEntry {
+                name,
+                source_path: path,
+                logical_bytes: metadata.len(),
+                modified_nanos,
+            })
+        })
+        .collect()
+}
+
+/// Walk `runtime_root` and publish its durable regular files as one packed
+/// system-owned content batch.
+pub(super) fn admit(store: &RuntimePrincipalStore, runtime_root: &Path) -> StorageResult<()> {
+    let entries = scan(runtime_root)?;
+    let validated = entries
+        .into_iter()
+        .map(|entry| ContiguousFileIngest::new(entry.name, entry.source_path, entry.logical_bytes));
     store.put_contiguous_files(StateOwner::System, validated)
 }
 
 fn collect_files(
     root: &Path,
     directory: &Path,
-    files: &mut Vec<(String, PathBuf, u64)>,
+    files: &mut Vec<(String, PathBuf, std::fs::Metadata)>,
 ) -> StorageResult<()> {
     let mut entries = std::fs::read_dir(directory)
         .map_err(|error| tree_error(directory, format!("read directory: {error}")))?
@@ -81,7 +132,7 @@ fn collect_files(
             files.push((
                 relative_text.replace(std::path::MAIN_SEPARATOR, "/"),
                 path,
-                metadata.len(),
+                metadata,
             ));
         } else {
             return Err(tree_error(
@@ -91,6 +142,35 @@ fn collect_files(
         }
     }
     Ok(())
+}
+
+fn modified_nanos(metadata: &std::fs::Metadata, path: &Path) -> StorageResult<i128> {
+    let modified = metadata
+        .modified()
+        .map_err(|error| tree_error(path, format!("read source modification time: {error}")))?;
+    let duration = match modified.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => i128::try_from(duration.as_nanos()).map_err(|_| {
+            tree_error(
+                path,
+                "source modification time exceeds receipt range".to_owned(),
+            )
+        })?,
+        Err(error) => {
+            let nanos = i128::try_from(error.duration().as_nanos()).map_err(|_| {
+                tree_error(
+                    path,
+                    "source modification time exceeds receipt range".to_owned(),
+                )
+            })?;
+            nanos.checked_neg().ok_or_else(|| {
+                tree_error(
+                    path,
+                    "source modification time exceeds receipt range".to_owned(),
+                )
+            })?
+        },
+    };
+    Ok(duration)
 }
 
 fn content_name_from_relative(path: &Path, root: &Path) -> StorageResult<ContentName> {
@@ -123,6 +203,12 @@ fn content_name_from_relative(path: &Path, root: &Path) -> StorageResult<Content
 
 fn is_excluded(relative: &str) -> bool {
     EXCLUDED_PATHS.contains(&relative)
+        || relative == "var/migrations"
+        || relative.starts_with("var/migrations/")
+        || relative == "var/content-staging"
+        || relative.starts_with("var/content-staging/")
+        || relative == "var/principal-store"
+        || relative.starts_with("var/principal-store/")
         || matches!(
             relative,
             "astrid" | "astrid-daemon" | "bin/astrid" | "bin/astrid-daemon"
@@ -259,7 +345,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         symlink(outside.path(), root.path().join("redirect")).unwrap();
-        let error = collect_files(root.path(), root.path(), &mut Vec::new()).unwrap_err();
+        let error = scan(root.path()).unwrap_err();
         assert!(error.to_string().contains("symbolic link"));
     }
 }
