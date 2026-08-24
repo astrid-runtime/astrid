@@ -1,33 +1,43 @@
-# Astrid native-kernel — M1
+# Astrid native-kernel — M1 plus dual-closure stub
 
 Recovered isolated `kernel/` workspace. M1 boots to Rust ring 0 on the
 experimental emulator machine, emits structured serial evidence, runs
 negative-first self-tests, and halts with a machine-checkable outcome.
+This child adds a dual-closure stub: the loader signs a kernel/bootstrap
+closure and a distinct empty System Generation as separate artifacts;
+ring 0 verifies the table and binds the measured identities.
 
 This workspace is isolated from `crates/astrid-kernel`. Nested
 `[workspace]` membership keeps core CI from ingesting these crates.
 
 ## Citation (do not rename)
 
-Quote the architecture freeze; do not invent a TCG-named machine:
+Quote architecture freeze `ad3162492c47515f83f3e5230c9cec4d3b269ccd`.
+Do not invent a TCG-named machine:
 
-- Experimental contract: x86-64 QEMU/KVM with UEFI, fixed memory, one CPU,
-  serial diagnostics, APIC timer, and an explicit virtio/IOMMU topology.
+- One experimental machine-contract fixture is x86-64 QEMU/KVM with
+  UEFI, fixed memory, one CPU, serial diagnostics, APIC timer, and an
+  explicit virtio/IOMMU topology.
 - QEMU, TCG, and KVM runs establish only the named emulator
   machine-contract enforcement boundary. They are functional and
   conformance evidence for that emulator contract.
 - They never establish bare-metal, no-host, or hypervisor machine
   authority, DMA containment against a malicious hypervisor, or
-  physical-machine ownership.
-- First-owner remains unresolved and is not an M1 gate.
+  physical-machine ownership. Standalone machine-authority claims are
+  reserved for named physical board, firmware, and device evidence.
+- First-owner remains section 14.5 and is not the Stage B emulator gate.
 
 M1 evidence class is **TCG** (`-accel tcg`). This child does not select
 KVM, virtio, or IOMMU, and therefore does not prove that topology.
 
 ## Layout
 
+- `crates/astrid-native-closure/` — `#![no_std]` dual-closure codec,
+  verify, and loader-only signing.
 - `crates/astrid-native-kernel/` — `#![no_std] #![no_main]` ring-0 binary.
-- `tools/kimage/` — wraps a kernel ELF into a bootable UEFI disk image.
+- `tools/kimage/` — wraps a kernel ELF into a bootable UEFI disk image
+  and embeds the dual-closure table as a bootloader ramdisk (memory
+  table, not a guest filesystem).
 - `tools/ktest/` — QEMU serial-assertion harness and host unit tests.
 
 ## Run
@@ -39,7 +49,8 @@ KVM, virtio, or IOMMU, and therefore does not prove that topology.
 The harness builds the kernel, builds the UEFI image twice (determinism
 measurement), boots QEMU (`q35`, explicit `tcg`, UEFI pflash, 1 CPU,
 256 MiB, COM1, `-display none`, `isa-debug-exit`), captures JSONL serial,
-and asserts M1 evidence. QEMU is killed after two minutes.
+and asserts M1 evidence separately from dual-closure binding. QEMU is
+killed after two minutes.
 
 Firmware discovery used on this host: executable-relative QEMU share,
 package prefixes (Homebrew is one), well-known OVMF paths, and env
@@ -76,20 +87,35 @@ the parent target lock.
 - any `test.fail` fails the run, including unknown names such as
   `future_gate`.
 - `halt` with `outcome:"ok"` and QEMU exit code 33.
+- host `verify_table` accepts the ramdisk table; kernel serial
+  `closure.kernel` / `closure.sysgen` / `closure.bound` match the
+  measured ELF identity and the empty System Generation identity.
+- `boot.entry` precedes the closure events, which precede `halt`.
+- missing, swapped, stale/below-floor, and cross-bound tables are
+  rejected by `verify_table` (host unit tests).
 
 ## What is NOT claimed
 
-No KVM, virtio/IOMMU, DMA, bare-metal/no-host, physical ownership,
-dual-closure, A/B, first-owner, Wasmtime, filesystem, Linux, or Hermes
-claim. Timing is not evidence. Image determinism is reported honestly:
-`DETERMINISM: FAIL` does not fail boot assertions and is not coerced to
-PASS.
+No KVM, virtio/IOMMU, DMA, bare-metal/no-host, physical ownership, A/B
+persistence, first-owner, services, Wasmtime, filesystem, Linux, or
+Hermes claim. Timing is not evidence. Image determinism is reported
+honestly: `DETERMINISM: FAIL` does not fail boot assertions and is not
+coerced to PASS.
+
+Ramdisk keys are loader-supplied fixture keys. This child does **not**
+prove firmware authenticated the loader, and it does not prove ring 0
+re-hashed the in-memory kernel image. Dual-closure here is a distinct
+pair of signed artifacts plus identity binding, not a supported machine
+or an owner ceremony.
 
 ## Checks
 
 `./check.sh` is the supported host sequence. It does **not** run
 `cargo clippy --workspace`.
 
+- stable `astrid-native-closure`: `cargo test -p astrid-native-closure --locked`,
+  host `cargo clippy -p astrid-native-closure --all-targets --all-features --locked -- -D warnings`,
+  and `x86_64-unknown-none` lib clippy (no `--all-targets` on none)
 - stable `ktest`: `cargo test -p ktest --locked` and
   `cargo clippy -p ktest --all-targets --locked -- -D warnings`
 - stable `astrid-native-kernel` for `x86_64-unknown-none`:
@@ -105,3 +131,7 @@ and remains FAIL.
 
 Pinned to stable Rust 1.95.0. Interrupt handlers use stable naked-function
 ISR stubs via `x86_64`'s `Entry::set_handler_addr`.
+
+`x86_64-unknown-none` builds set `curve25519_dalek_backend="serial"` so
+ring-0 Ed25519 does not take the x86 SIMD codegen path. That is a compile
+choice, not a cryptography or timing claim.

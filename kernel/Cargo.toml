@@ -4,7 +4,12 @@
 # auto-excluded from the parent, so core/ never ingests these crates.
 [workspace]
 resolver = "2"
-members = ["crates/astrid-native-kernel", "tools/kimage", "tools/ktest"]
+members = [
+    "crates/astrid-native-closure",
+    "crates/astrid-native-kernel",
+    "tools/kimage",
+    "tools/ktest",
+]
 
 [profile.dev]
 panic = "abort"

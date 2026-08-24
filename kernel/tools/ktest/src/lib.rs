@@ -1,4 +1,6 @@
-//! Host-side M1 ktest helpers. Ring 0 stays in `astrid-native-kernel`.
+//! Host-side M1 and dual-closure ktest helpers. Ring 0 stays in
+//! `astrid-native-kernel`. Signing stays in `astrid-native-closure` on the
+//! loader path.
 
 pub mod determinism;
 pub mod events;

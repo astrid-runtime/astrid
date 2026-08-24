@@ -16,3 +16,4 @@ bench = false
 # therefore built under nightly while the ring-0 kernel stays on 1.95.0.
 bootloader = { version = "=0.11.16", default-features = false, features = ["uefi"] }
 anyhow = "=1.0.104"
+astrid-native-closure = { path = "../../crates/astrid-native-closure", features = ["sign"] }

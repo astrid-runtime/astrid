@@ -148,6 +148,30 @@ pub fn ev_test(name: &'static str, pass: bool) {
     emit(format_args!("\"ev\":\"{ev}\",\"name\":\"{name}\""));
 }
 
+pub fn ev_closure_kernel(floor: u64, id: &str) {
+    emit(format_args!(
+        "\"ev\":\"closure.kernel\",\"kind\":\"kernel-bootstrap\",\"floor\":{floor},\"id\":\"{id}\""
+    ));
+}
+
+pub fn ev_closure_sysgen(floor: u64, id: &str) {
+    emit(format_args!(
+        "\"ev\":\"closure.sysgen\",\"kind\":\"system-generation\",\"floor\":{floor},\"id\":\"{id}\",\"empty\":true"
+    ));
+}
+
+pub fn ev_closure_bound(kernel_id: &str, sysgen_id: &str) {
+    emit(format_args!(
+        "\"ev\":\"closure.bound\",\"kernel_id\":\"{kernel_id}\",\"sysgen_id\":\"{sysgen_id}\""
+    ));
+}
+
+pub fn ev_closure_reject(reason: &str) {
+    emit(format_args!(
+        "\"ev\":\"closure.reject\",\"reason\":\"{reason}\""
+    ));
+}
+
 pub fn ev_halt(ok: bool) {
     let outcome = if ok { "ok" } else { "fault" };
     emit(format_args!("\"ev\":\"halt\",\"outcome\":\"{outcome}\""));

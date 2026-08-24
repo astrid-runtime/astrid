@@ -1,0 +1,5 @@
+# Fiat/serial backends keep ring-0 Ed25519 off the x86 SIMD codegen path.
+# SIMD curve25519-dalek is a compile-time hazard on this host and is not an
+# M1 or dual-closure claim.
+[target.x86_64-unknown-none]
+rustflags = ['--cfg', 'curve25519_dalek_backend="serial"']

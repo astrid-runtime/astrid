@@ -3,6 +3,7 @@
 //! Sequence numbers must be contiguous and strictly increasing from 0.
 //! `halt` is terminal. Any `test.fail`, including unknown future names, fails.
 //! Required M1 events must appear exactly once.
+//! Dual-closure binding is a separate assertion (`assert_dual_closure`).
 
 use serde_json::Value;
 
@@ -171,6 +172,68 @@ fn self_tests_hold(events: &[Value]) -> bool {
     ok
 }
 
+/// Assert dual-closure serial evidence against loader-measured identities.
+pub fn assert_dual_closure(events: &[Value], kernel_id_hex: &str, sysgen_id_hex: &str) -> bool {
+    let mut ok = true;
+    println!("\n== dual-closure assertions ==");
+    ok &= check(
+        "exactly one closure.kernel",
+        count_named(events, "closure.kernel") == 1,
+    );
+    ok &= check(
+        "exactly one closure.sysgen",
+        count_named(events, "closure.sysgen") == 1,
+    );
+    ok &= check(
+        "exactly one closure.bound",
+        count_named(events, "closure.bound") == 1,
+    );
+    ok &= check(
+        "no closure.reject",
+        count_named(events, "closure.reject") == 0,
+    );
+    ok &= check(
+        "boot.entry<closure.kernel<closure.sysgen<closure.bound<halt",
+        ordered(
+            events,
+            &[
+                "boot.entry",
+                "closure.kernel",
+                "closure.sysgen",
+                "closure.bound",
+                "halt",
+            ],
+        ),
+    );
+    let kernel_ev = events.iter().find(|e| ev_name(e) == "closure.kernel");
+    let sysgen_ev = events.iter().find(|e| ev_name(e) == "closure.sysgen");
+    let bound_ev = events.iter().find(|e| ev_name(e) == "closure.bound");
+    ok &= check(
+        "closure.kernel kind=kernel-bootstrap and id matches loader",
+        kernel_ev.is_some_and(|e| {
+            e.get("kind").and_then(Value::as_str) == Some("kernel-bootstrap")
+                && e.get("id").and_then(Value::as_str) == Some(kernel_id_hex)
+        }),
+    );
+    ok &= check(
+        "closure.sysgen empty=true and id matches empty sysgen",
+        sysgen_ev.is_some_and(|e| {
+            e.get("kind").and_then(Value::as_str) == Some("system-generation")
+                && e.get("empty") == Some(&Value::Bool(true))
+                && e.get("id").and_then(Value::as_str) == Some(sysgen_id_hex)
+        }),
+    );
+    ok &= check(
+        "closure.bound identities match and are distinct",
+        bound_ev.is_some_and(|e| {
+            e.get("kernel_id").and_then(Value::as_str) == Some(kernel_id_hex)
+                && e.get("sysgen_id").and_then(Value::as_str) == Some(sysgen_id_hex)
+                && kernel_id_hex != sysgen_id_hex
+        }),
+    );
+    ok
+}
+
 fn ordered(events: &[Value], names: &[&str]) -> bool {
     let mut last = -1i64;
     for name in names {
@@ -297,5 +360,61 @@ mod tests {
         );
         assert!(!assert_m1(&parse_events(&duplicate_boot), Some(33), 33));
         assert!(!assert_m1(&parse_events(&missing_map), Some(33), 33));
+    }
+
+    fn dual_serial(kernel_id: &str, sysgen_id: &str) -> String {
+        let mut out = String::new();
+        out.push_str("{\"seq\":0,\"ev\":\"boot.entry\"}\n");
+        out.push_str(&format!(
+            "{{\"seq\":1,\"ev\":\"closure.kernel\",\"kind\":\"kernel-bootstrap\",\"floor\":1,\"id\":\"{kernel_id}\"}}\n"
+        ));
+        out.push_str(&format!(
+            "{{\"seq\":2,\"ev\":\"closure.sysgen\",\"kind\":\"system-generation\",\"floor\":1,\"id\":\"{sysgen_id}\",\"empty\":true}}\n"
+        ));
+        out.push_str(&format!(
+            "{{\"seq\":3,\"ev\":\"closure.bound\",\"kernel_id\":\"{kernel_id}\",\"sysgen_id\":\"{sysgen_id}\"}}\n"
+        ));
+        out.push_str("{\"seq\":4,\"ev\":\"mem.map\",\"usable_regions\":1,\"usable_bytes\":1}\n");
+        out.push_str("{\"seq\":5,\"ev\":\"paging.wx\",\"rodata_nx_w\":false,\"text_w\":false}\n");
+        out.push_str("{\"seq\":6,\"ev\":\"heap.ready\",\"bytes\":1}\n");
+        out.push_str("{\"seq\":7,\"ev\":\"idt.ready\",\"vectors\":32}\n");
+        out.push_str("{\"seq\":8,\"ev\":\"halt\",\"outcome\":\"ok\"}\n");
+        out
+    }
+
+    #[test]
+    fn dual_closure_binding_matches_loader_identities() {
+        let kernel = "aa".repeat(32);
+        let sysgen = "bb".repeat(32);
+        let events = parse_events(&dual_serial(&kernel, &sysgen));
+        assert!(assert_dual_closure(&events, &kernel, &sysgen));
+    }
+
+    #[test]
+    fn dual_closure_reject_or_mismatch_fails() {
+        let kernel = "aa".repeat(32);
+        let sysgen = "bb".repeat(32);
+        let events = parse_events(&dual_serial(&kernel, &sysgen));
+        assert!(!assert_dual_closure(&events, &sysgen, &kernel));
+        let mut rejected = dual_serial(&kernel, &sysgen);
+        rejected = rejected.replace("closure.bound", "closure.reject");
+        assert!(!assert_dual_closure(
+            &parse_events(&rejected),
+            &kernel,
+            &sysgen
+        ));
+    }
+
+    #[test]
+    fn dual_closure_missing_bound_fails() {
+        let kernel = "aa".repeat(32);
+        let sysgen = "bb".repeat(32);
+        let serial = dual_serial(&kernel, &sysgen)
+            .replace("\"ev\":\"closure.bound\"", "\"ev\":\"closure.kernel\"");
+        assert!(!assert_dual_closure(
+            &parse_events(&serial),
+            &kernel,
+            &sysgen
+        ));
     }
 }

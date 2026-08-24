@@ -1,8 +1,10 @@
-//! Host QEMU serial-assertion harness for the M1 experimental machine.
+//! Host QEMU serial-assertion harness for the M1 experimental machine
+//! plus the dual-closure stub.
 //!
 //! Builds the ring-0 kernel, wraps it into a UEFI image twice (determinism
-//! measurement), boots under explicit TCG, and asserts M1 serial evidence.
-//! Determinism FAIL is reported and does not gate boot assertions.
+//! measurement), boots under explicit TCG, and asserts M1 serial evidence
+//! separately from dual-closure binding. Determinism FAIL is reported and
+//! does not gate boot assertions.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -10,8 +12,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 
 use anyhow::{Context, Result, bail};
+use astrid_native_closure::{MeasuredIdentity, verify_table};
 use ktest::determinism::{Determinism, compare_images};
-use ktest::events::{assert_m1, parse_events};
+use ktest::events::{assert_dual_closure, assert_m1, parse_events};
 use ktest::firmware;
 use ktest::image::KimageInvocation;
 use ktest::machine::{self, EXPECT_EXIT_CODE, QEMU_BIN, TIMEOUT};
@@ -54,6 +57,7 @@ fn main() -> Result<()> {
     build_image(&root, &kernel_elf, &image_b)?;
 
     let determinism = compare_images(&image_a, &image_b)?;
+    let (kernel_hex, sysgen_hex) = loader_identities(&image_a, &image_b, &kernel_elf)?;
 
     let firmware = firmware::discover()?;
     println!(
@@ -73,24 +77,10 @@ fn main() -> Result<()> {
         println!("  {ev}");
     }
 
-    let assertions_ok = assert_m1(&events, run.exit_code, EXPECT_EXIT_CODE);
-
-    println!("\n== summary ==");
-    println!("DETERMINISM: {}", determinism.as_str());
-    println!(
-        "QEMU exit code: {} (expected {EXPECT_EXIT_CODE})",
-        run.exit_code
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "signaled/none".to_string())
-    );
-    println!(
-        "ASSERTIONS: {}",
-        if assertions_ok { "PASS" } else { "FAIL" }
-    );
-    println!("ACCEL: tcg (explicit). KVM/virtio/IOMMU were not selected.");
-    if determinism == Determinism::Fail {
-        println!("determinism FAIL is reported, not a boot-assertion gate");
-    }
+    let m1_ok = assert_m1(&events, run.exit_code, EXPECT_EXIT_CODE);
+    let dual_ok = assert_dual_closure(&events, &kernel_hex, &sysgen_hex);
+    let assertions_ok = m1_ok && dual_ok;
+    print_summary(determinism, run.exit_code, assertions_ok);
 
     if assertions_ok {
         Ok(())
@@ -115,6 +105,68 @@ fn tools_toolchain() -> String {
 fn build_image(root: &Path, kernel_elf: &Path, output: &Path) -> Result<()> {
     let inv = KimageInvocation::new(root, tools_toolchain());
     run_inherited(&mut inv.command(root, kernel_elf, output), "kimage")
+}
+
+fn identity_hex(id: MeasuredIdentity) -> String {
+    let mut buf = [0u8; 64];
+    id.write_hex(&mut buf);
+    String::from_utf8(buf.to_vec()).expect("hex digits are ascii")
+}
+
+fn loader_identities(
+    image_a: &Path,
+    image_b: &Path,
+    kernel_elf: &Path,
+) -> Result<(String, String)> {
+    let closures_a = image_a.with_extension("closures");
+    let closures_b = image_b.with_extension("closures");
+    let bytes_a = std::fs::read(&closures_a)
+        .with_context(|| format!("reading dual-closure table {}", closures_a.display()))?;
+    let bytes_b = std::fs::read(&closures_b)
+        .with_context(|| format!("reading dual-closure table {}", closures_b.display()))?;
+    if bytes_a != bytes_b {
+        bail!("dual-closure tables differ across kimage invocations");
+    }
+    let bound = verify_table(&bytes_a)
+        .map_err(|err| anyhow::anyhow!("host verify_table rejected: {}", err.as_reason()))?;
+    let elf = std::fs::read(kernel_elf)
+        .with_context(|| format!("reading kernel ELF {}", kernel_elf.display()))?;
+    let kernel_id = MeasuredIdentity::from_payload(&elf);
+    let sysgen_id = MeasuredIdentity::empty_sysgen();
+    if bound.kernel_bootstrap != kernel_id {
+        bail!("loader kernel identity does not match measured ELF");
+    }
+    if bound.system_generation != sysgen_id {
+        bail!("loader sysgen identity is not the empty System Generation");
+    }
+    if !bound.distinct() {
+        bail!("loader identities are not distinct");
+    }
+    let kernel_hex = identity_hex(kernel_id);
+    let sysgen_hex = identity_hex(sysgen_id);
+    println!("== dual-closure host verify_table OK ==");
+    println!("kernel-bootstrap id: {kernel_hex}");
+    println!("system-generation id: {sysgen_hex}");
+    Ok((kernel_hex, sysgen_hex))
+}
+
+fn print_summary(determinism: Determinism, exit_code: Option<i32>, assertions_ok: bool) {
+    println!("\n== summary ==");
+    println!("DETERMINISM: {}", determinism.as_str());
+    println!(
+        "QEMU exit code: {} (expected {EXPECT_EXIT_CODE})",
+        exit_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signaled/none".to_string())
+    );
+    println!(
+        "ASSERTIONS: {}",
+        if assertions_ok { "PASS" } else { "FAIL" }
+    );
+    println!("ACCEL: tcg (explicit). KVM/virtio/IOMMU were not selected.");
+    if determinism == Determinism::Fail {
+        println!("determinism FAIL is reported, not a boot-assertion gate");
+    }
 }
 
 struct QemuRun {
