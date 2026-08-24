@@ -115,17 +115,14 @@ fn collect_files(
         // Ignore them so a stale endpoint cannot fail admission of the
         // regular files that make up the runtime snapshot.
         if let Some(relative_text) = relative.to_str() {
-            if is_excluded(relative_text) {
+            let relative_text = normalize_relative_path(relative_text);
+            if is_excluded(&relative_text) {
                 continue;
             }
             if metadata.is_dir() {
                 collect_files(root, &path, files)?;
             } else if metadata.is_file() {
-                files.push((
-                    relative_text.replace(std::path::MAIN_SEPARATOR, "/"),
-                    path,
-                    metadata,
-                ));
+                files.push((relative_text, path, metadata));
             }
         } else if metadata.is_dir() || metadata.is_file() {
             return Err(tree_error(
@@ -194,6 +191,10 @@ fn content_name_from_relative(path: &Path, root: &Path) -> StorageResult<Content
     })
 }
 
+fn normalize_relative_path(relative: &str) -> String {
+    relative.replace('\\', "/")
+}
+
 fn is_excluded(relative: &str) -> bool {
     relative.starts_with(VOLUME_PATH_PREFIX) || relative == SOCKET_PATH
 }
@@ -221,6 +222,22 @@ mod tests {
                 StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
             })
         })
+    }
+
+    #[test]
+    fn excludes_windows_separator_paths() {
+        for path in [
+            "var\\astrid.volume",
+            "var\\astrid.volume.compacting",
+            "run\\system.sock",
+        ] {
+            let normalized = normalize_relative_path(path);
+            assert!(is_excluded(&normalized), "path was not excluded: {path}");
+        }
+        assert_eq!(
+            normalize_relative_path("run\\system.ready"),
+            "run/system.ready"
+        );
     }
 
     fn durable_files(wasm_hash: &str, wasm: &[u8], nested_wasm: &[u8]) -> Vec<(String, Vec<u8>)> {
