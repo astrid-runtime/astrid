@@ -164,6 +164,14 @@ pub(crate) async fn issue_lease(
     if !mountpoint.is_absolute() {
         return Err("native storage mountpoint must be absolute".to_owned());
     }
+    if kernel.capabilities.is_principal_retiring(&caller).await {
+        return Err("cannot issue a storage mount lease for a retiring principal".to_owned());
+    }
+    if let StorageProviderViewV1::Principal(viewed) = &view
+        && kernel.capabilities.is_principal_retiring(viewed).await
+    {
+        return Err("cannot issue a storage mount lease for a retiring principal".to_owned());
+    }
     let (owner, target) = resolve_owner(kernel, &caller, allow_cross_owner, &view, target).await?;
     let mount_id = StorageMountId::new();
     #[cfg(unix)]
@@ -305,12 +313,75 @@ pub(crate) async fn revoke_lease(
     mount_id: StorageMountId,
 ) -> Result<(), String> {
     let state = owned_lease(kernel, caller, allow_cross_owner, mount_id)?;
+    force_revoke_lease(kernel, &state).await;
+    Ok(())
+}
+
+/// Revoke every live or stale mount that can still name `principal`.
+///
+/// Matches leases requested by the principal, leases whose admitted view is
+/// that principal, and leases whose typed owner is the principal's immutable
+/// UID. Expired map entries are included so a stale callback cannot outlive
+/// identity deletion. Fail closed if any matching lease remains afterwards.
+pub(crate) async fn revoke_all_leases_for_principal(
+    kernel: &Kernel,
+    principal: &PrincipalId,
+) -> Result<(), String> {
+    let uid = kernel.principal_directory.uid_for(principal).ok();
+    let matched: Vec<Arc<StorageMountLeaseState>> = kernel
+        .storage_mounts
+        .iter()
+        .filter(|entry| lease_covers_principal(entry.value(), principal, uid))
+        .map(|entry| Arc::clone(entry.value()))
+        .collect();
+    for state in &matched {
+        state.revoked.store(true, Ordering::Release);
+        let _ = state.shutdown_tx.send(true);
+    }
+    {
+        let _mutation_guard = kernel.storage_mount_mutations.lock().await;
+        for state in &matched {
+            kernel.storage_mounts.remove(&state.mount_id);
+            cleanup_resource(&state.resource_path, &state.callback_path);
+        }
+    }
+    if kernel
+        .storage_mounts
+        .iter()
+        .any(|entry| lease_covers_principal(entry.value(), principal, uid))
+    {
+        return Err("storage mount lease survived principal deletion drain".to_owned());
+    }
+    Ok(())
+}
+
+async fn force_revoke_lease(kernel: &Kernel, state: &StorageMountLeaseState) {
     state.revoked.store(true, Ordering::Release);
     let _ = state.shutdown_tx.send(true);
     let _mutation_guard = kernel.storage_mount_mutations.lock().await;
-    kernel.storage_mounts.remove(&mount_id);
+    kernel.storage_mounts.remove(&state.mount_id);
     cleanup_resource(&state.resource_path, &state.callback_path);
-    Ok(())
+}
+
+fn lease_covers_principal(
+    state: &StorageMountLeaseState,
+    principal: &PrincipalId,
+    uid: Option<astrid_storage::PrincipalUid>,
+) -> bool {
+    if &state.requested_by == principal {
+        return true;
+    }
+    if let StorageProviderViewV1::Principal(viewed) = &state.view
+        && viewed == principal
+    {
+        return true;
+    }
+    uid.is_some_and(|uid| matches!(state.owner, StateOwner::Principal(owner) if owner == uid))
+}
+
+#[cfg(test)]
+pub(crate) fn expire_lease_for_test(state: &StorageMountLeaseState) {
+    state.expires_at_epoch_secs.store(0, Ordering::Release);
 }
 
 fn owned_lease(

@@ -7,9 +7,19 @@ use astrid_core::dirs::AstridHome;
 use astrid_core::groups::{BUILTIN_ADMIN, BUILTIN_AGENT};
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::PrincipalProfile;
+use astrid_core::storage_filesystem::{
+    STORAGE_FILESYSTEM_PROTOCOL_V1, StorageFilesystemEntryKindV1, StorageFilesystemOperationV1,
+    StorageFilesystemOutcomeV1, StorageFilesystemRequestV1, StorageFilesystemResponseV1,
+    StorageFilesystemSuccessV1, StorageFilesystemTargetV1, StorageMountLeaseV1,
+};
+use astrid_core::storage_provider::{StorageProviderAccessV1, StorageProviderViewV1};
 use astrid_core::{Permission, types::Timestamp};
 use astrid_crypto::KeyPair;
 use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+#[cfg(any(unix, windows))]
+use crate::storage_mount::{expire_lease_for_test, issue_lease};
 
 use super::handlers;
 use crate::Kernel;
@@ -321,4 +331,180 @@ async fn failed_reclamation_keeps_alias_reserved_until_retry_succeeds() {
     )
     .await;
     assert!(matches!(retried, AdminResponseBody::Success(_)));
+}
+
+#[cfg(any(unix, windows))]
+async fn mount_callback(
+    lease: &StorageMountLeaseV1,
+    operation: StorageFilesystemOperationV1,
+) -> StorageFilesystemOutcomeV1 {
+    let mut stream = astrid_core::local_transport::connect(&lease.callback_path)
+        .await
+        .expect("mount callback connect");
+    let request = StorageFilesystemRequestV1 {
+        protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V1,
+        request_id: "agent-delete-mount".to_owned(),
+        lease_token: lease.lease_token.clone(),
+        operation,
+    };
+    let bytes = serde_json::to_vec(&request).unwrap();
+    stream
+        .write_all(&u32::try_from(bytes.len()).unwrap().to_be_bytes())
+        .await
+        .unwrap();
+    stream.write_all(&bytes).await.unwrap();
+    let mut response_length = [0_u8; 4];
+    stream.read_exact(&mut response_length).await.unwrap();
+    let mut response = vec![0_u8; u32::from_be_bytes(response_length) as usize];
+    stream.read_exact(&mut response).await.unwrap();
+    let response: StorageFilesystemResponseV1 = serde_json::from_slice(&response).unwrap();
+    response.outcome
+}
+
+#[cfg(any(unix, windows))]
+fn create_file(path: &str) -> StorageFilesystemOperationV1 {
+    StorageFilesystemOperationV1::Create {
+        path: path.to_owned(),
+        kind: StorageFilesystemEntryKindV1::File,
+    }
+}
+
+#[cfg(any(unix, windows))]
+async fn issue_principal_mount(
+    kernel: &std::sync::Arc<Kernel>,
+    principal: &PrincipalId,
+    mountpoint: std::path::PathBuf,
+) -> Result<StorageMountLeaseV1, String> {
+    issue_lease(
+        kernel,
+        principal.clone(),
+        false,
+        StorageProviderViewV1::Principal(principal.clone()),
+        StorageFilesystemTargetV1::OwnerRoot,
+        StorageProviderAccessV1::ReadWrite,
+        "test-provider".to_owned(),
+        mountpoint,
+    )
+    .await
+}
+
+#[cfg(any(unix, windows))]
+async fn delete_principal(kernel: &std::sync::Arc<Kernel>, principal: &PrincipalId) {
+    let response = handlers::dispatch(
+        kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentDelete {
+            principal: principal.clone(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(response, AdminResponseBody::Success(_)),
+        "agent delete failed: {response:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(any(unix, windows))]
+async fn issue_lease_fails_closed_once_principal_retirement_begins() {
+    let (dir, kernel) = fixture().await;
+    let principal = PrincipalId::new("retiring-mount").unwrap();
+    create(&kernel, &principal).await;
+    kernel
+        .capabilities
+        .begin_principal_retirement(principal.clone())
+        .await;
+
+    let viewed = issue_principal_mount(&kernel, &principal, dir.path().join("retiring-self-mount"))
+        .await
+        .expect_err("self-issued lease must fail after retirement begins");
+    assert!(
+        viewed.contains("retiring"),
+        "expected retirement fail-closed, got {viewed}"
+    );
+
+    let cross = issue_lease(
+        &kernel,
+        PrincipalId::default(),
+        true,
+        StorageProviderViewV1::Principal(principal.clone()),
+        StorageFilesystemTargetV1::OwnerRoot,
+        StorageProviderAccessV1::ReadWrite,
+        "test-provider".to_owned(),
+        dir.path().join("retiring-view-mount"),
+    )
+    .await
+    .expect_err("viewed-principal lease must fail after retirement begins");
+    assert!(
+        cross.contains("retiring"),
+        "expected viewed-principal retirement fail-closed, got {cross}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(any(unix, windows))]
+async fn agent_delete_drains_live_mount_and_refuses_resurrection() {
+    let (dir, kernel) = fixture().await;
+    let principal = PrincipalId::new("mount-live").unwrap();
+    create(&kernel, &principal).await;
+    let lease = issue_principal_mount(&kernel, &principal, dir.path().join("live-mount"))
+        .await
+        .expect("issue live mount");
+    assert_eq!(
+        mount_callback(&lease, create_file("keep.txt")).await,
+        StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done)
+    );
+
+    delete_principal(&kernel, &principal).await;
+
+    assert!(
+        kernel.storage_mounts.get(&lease.mount_id).is_none(),
+        "live mount must not survive agent_delete"
+    );
+    assert!(!lease.callback_path.exists());
+    assert!(!lease.resource_path.exists());
+    assert!(
+        astrid_core::local_transport::connect(&lease.callback_path)
+            .await
+            .is_err()
+    );
+    assert!(
+        issue_principal_mount(&kernel, &principal, dir.path().join("resurrect-mount"))
+            .await
+            .is_err(),
+        "deleted principal must not resurrect a mount lease"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(any(unix, windows))]
+async fn agent_delete_drains_expired_mount_still_mapped() {
+    let (dir, kernel) = fixture().await;
+    let principal = PrincipalId::new("mount-stale").unwrap();
+    create(&kernel, &principal).await;
+    let lease = issue_principal_mount(&kernel, &principal, dir.path().join("stale-mount"))
+        .await
+        .expect("issue stale mount");
+    let state = std::sync::Arc::clone(
+        kernel
+            .storage_mounts
+            .get(&lease.mount_id)
+            .expect("mapped lease")
+            .value(),
+    );
+    expire_lease_for_test(&state);
+    assert!(kernel.storage_mounts.contains_key(&lease.mount_id));
+
+    delete_principal(&kernel, &principal).await;
+
+    assert!(
+        kernel.storage_mounts.get(&lease.mount_id).is_none(),
+        "expired mapped mount must not survive agent_delete"
+    );
+    assert!(!lease.callback_path.exists());
+    assert!(
+        astrid_core::local_transport::connect(&lease.callback_path)
+            .await
+            .is_err()
+    );
 }
