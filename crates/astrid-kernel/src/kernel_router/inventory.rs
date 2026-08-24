@@ -27,8 +27,26 @@ pub(super) fn durable_package_details(
     let mut hashes: Vec<String> = package.metadata().wit_files.values().cloned().collect();
     hashes.sort();
     hashes.dedup();
+    let wasm_hash = package
+        .metadata()
+        .wasm_hash
+        .as_deref()
+        .and_then(|expected| {
+            match astrid_capsule_install::wasm::catalog_wasm_hash(store, expected) {
+                Ok(hash) => Some(hash),
+                Err(error) => {
+                    warn!(
+                        capsule,
+                        expected_hash = expected,
+                        error = %error,
+                        "durable capsule WASM is absent or invalid in the system catalog"
+                    );
+                    None
+                },
+            }
+        });
     let update_source = verified_remote_update_source(package.metadata().source.as_deref());
-    (hashes, package.metadata().wasm_hash.clone(), update_source)
+    (hashes, wasm_hash, update_source)
 }
 
 fn verified_remote_update_source(source: Option<&str>) -> Option<String> {

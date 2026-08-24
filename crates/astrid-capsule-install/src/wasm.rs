@@ -123,7 +123,9 @@ pub(crate) fn read_catalog_wasm(
         .ok_or_else(|| anyhow::anyhow!("WASM catalog entry has no readable bytes: bin/{hash}.wasm"))
 }
 
-pub(crate) fn catalog_wasm_hash(
+/// Verify that the system catalog entry for `expected` exists and hashes to
+/// its content-addressed name.
+pub fn catalog_wasm_hash(
     storage: &RuntimePrincipalStore,
     expected: &str,
 ) -> anyhow::Result<String> {

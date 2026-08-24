@@ -87,8 +87,8 @@ pub(crate) struct OfflineCapsuleProvenance<'a> {
     pub(crate) signature: Option<&'a str>,
 }
 
-/// Legacy native-layout test fixture helper.
-#[cfg(test)]
+/// Resolve a principal capsule's installed materialization directory for
+/// lockfile verification.
 pub(crate) use astrid_capsule_install::resolve_target_dir_for;
 
 /// Re-exported so the `update` subcommand in [`super::install_update`]

@@ -12,7 +12,6 @@ use std::future::Future;
 
 use anyhow::{Context, bail};
 use astrid_capsule::capsule::CapsuleId;
-#[cfg(test)]
 use astrid_capsule::manifest::CapsuleManifest;
 use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
@@ -166,7 +165,6 @@ impl ProvisioningLock {
 
 /// Prove that every fresh-lock entry still describes an installed capsule for
 /// the target before those names become an authorization grant set.
-#[cfg(test)]
 pub(super) fn validate_locked_capsules(
     home: &AstridHome,
     target: &PrincipalId,
@@ -175,7 +173,6 @@ pub(super) fn validate_locked_capsules(
     validate_locked_capsules_with_store(home, target, locked, None)
 }
 
-#[cfg(test)]
 fn validate_locked_capsules_with_store(
     home: &AstridHome,
     target: &PrincipalId,
@@ -306,7 +303,6 @@ pub(super) async fn validated_grant_set_for_reuse(
     }
 }
 
-#[cfg(test)]
 fn validate_locked_wasm(
     home: &AstridHome,
     capsule: &CapsuleId,
@@ -378,7 +374,6 @@ fn validate_locked_wasm(
     Ok(())
 }
 
-#[cfg(test)]
 fn parse_locked_blake3(capsule: &CapsuleId, value: &str) -> anyhow::Result<blake3::Hash> {
     let Some(hex) = value.strip_prefix("blake3:") else {
         bail!("Distro.lock capsule '{capsule}' requires a canonical blake3:<hex> WASM hash");
@@ -392,7 +387,6 @@ fn parse_locked_blake3(capsule: &CapsuleId, value: &str) -> anyhow::Result<blake
     Ok(hash)
 }
 
-#[cfg(test)]
 fn manifest_declares_wasm(manifest: &CapsuleManifest) -> bool {
     manifest
         .components

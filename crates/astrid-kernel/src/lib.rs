@@ -1505,13 +1505,26 @@ impl Kernel {
                     manifest.package.name
                 );
             }
-            astrid_capsule_install::verify_installed_authority(&self.astrid_home, &dir, &manifest)
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "capsule '{}' exceeds or cannot prove its installed authority: {error:#}",
-                        manifest.package.name
-                    )
-                })?;
+            let verify = if let Some(store) = self.principal_store.as_ref() {
+                astrid_capsule_install::verify_installed_authority_with_store(
+                    &self.astrid_home,
+                    &dir,
+                    &manifest,
+                    store,
+                )
+            } else {
+                astrid_capsule_install::verify_installed_authority(
+                    &self.astrid_home,
+                    &dir,
+                    &manifest,
+                )
+            };
+            verify.map_err(|error| {
+                anyhow::anyhow!(
+                    "capsule '{}' exceeds or cannot prove its installed authority: {error:#}",
+                    manifest.package.name
+                )
+            })?;
         }
         self.verify_workspace_component_paths(&dir, &manifest)?;
         let id = astrid_capsule_types::CapsuleId::from_static(&manifest.package.name);
@@ -1805,11 +1818,20 @@ impl Kernel {
                     "capsule replacement source is outside the explicit workspace portal and has no durable registry authority"
                 );
             }
-            astrid_capsule_install::verify_installed_authority(
-                &self.astrid_home,
-                source_dir,
-                &manifest,
-            )?;
+            if let Some(store) = self.principal_store.as_ref() {
+                astrid_capsule_install::verify_installed_authority_with_store(
+                    &self.astrid_home,
+                    source_dir,
+                    &manifest,
+                    store,
+                )?;
+            } else {
+                astrid_capsule_install::verify_installed_authority(
+                    &self.astrid_home,
+                    source_dir,
+                    &manifest,
+                )?;
+            }
         }
         self.verify_workspace_component_paths(source_dir, &manifest)?;
         if !manifest.mcp_servers.is_empty() {

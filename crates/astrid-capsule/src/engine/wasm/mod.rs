@@ -46,6 +46,9 @@ impl WorkspaceMountResolver for WorkspaceBranchResolver {
 mod bind_workers;
 #[allow(unreachable_pub)]
 pub(crate) mod bindings;
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "catalog_load_tests.rs"]
+mod catalog_load_tests;
 mod content_source;
 pub mod host;
 pub mod host_state;
