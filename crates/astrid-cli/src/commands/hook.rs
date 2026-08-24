@@ -214,7 +214,7 @@ mod tests {
         let test_exe = std::env::current_exe().expect("locate hook test binary");
         let root = tempfile::Builder::new()
             .prefix("astrid-hook-policy-")
-            .tempdir_in("/private/tmp")
+            .tempdir()
             .expect("create throwaway hook test home");
         let home = root.path().join("home");
         let astrid_home = root.path().join("astrid");

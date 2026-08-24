@@ -33,13 +33,57 @@
 //! for `mcp serve` (to the log file, else stderr) regardless of operator
 //! config, so a stray diagnostic can never corrupt the protocol stream.
 
+// The persistent gateway uses Unix-domain sockets. Keep those implementations
+// out of non-Unix builds while preserving the CLI command surface with an
+// actionable unsupported-target error.
+#[cfg(unix)]
 mod attach;
+#[cfg(not(unix))]
+mod attach {
+    use std::path::Path;
+    use std::process::ExitCode;
+
+    use anyhow::Result;
+
+    pub(crate) async fn run(
+        _principal: Option<&str>,
+        _workspace: Option<&Path>,
+    ) -> Result<ExitCode> {
+        anyhow::bail!("MCP gateway attach is only supported on Unix hosts")
+    }
+}
 mod elicit;
 mod form_elicitation;
+#[cfg(unix)]
 mod gateway;
+#[cfg(not(unix))]
+mod gateway {
+    use std::process::ExitCode;
+
+    use anyhow::Result;
+
+    pub(crate) async fn run(_principal: Option<&str>) -> Result<ExitCode> {
+        anyhow::bail!("MCP gateway is only supported on Unix hosts")
+    }
+}
 mod grant;
 mod ingress;
+#[cfg(unix)]
 mod lifecycle;
+#[cfg(not(unix))]
+mod lifecycle {
+    use std::process::ExitCode;
+
+    use anyhow::Result;
+
+    pub(crate) async fn ready(_principal: Option<&str>, _format: &str) -> Result<ExitCode> {
+        anyhow::bail!("MCP gateway readiness is only supported on Unix hosts")
+    }
+
+    pub(crate) fn gc() -> Result<ExitCode> {
+        anyhow::bail!("MCP gateway cleanup is only supported on Unix hosts")
+    }
+}
 mod mrtr;
 // Parent-death detection reads `getppid()` (Unix-only); the module and its use
 // site are target-gated so the CLI still compiles on non-Unix targets.
