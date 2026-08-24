@@ -290,27 +290,33 @@ where
     /// Execute one proof-audited compaction after re-reading live read-handle
     /// roots inside the mutation fence.
     ///
-    /// `live_handles` runs only after [`Self::lock_usable`] succeeds. The live
+    /// `observe` runs only after [`Self::lock_usable`] succeeds. It must return
+    /// a snapshot of registered handle roots plus a guard that keeps compaction
+    /// visible to in-flight openers until this method returns. The live
     /// object-id set is compared with the plan's `ReadHandle` additional roots.
     /// Retention deduplicates, so comparison is by set identity rather than
-    /// handle count. Drift fails closed with
+    /// handle count. Drift, or an opener already in flight, fails closed with
     /// [`DurableError::CompactionSnapshotChanged`].
+    ///
+    /// `observe` must not take the engine lock: compaction already holds it.
     ///
     /// # Errors
     ///
-    /// Fails closed if live handle roots drifted from the verified plan, or if
-    /// the remaining compaction fence refuses the rewrite.
-    pub fn compact_with_live_read_handles<Handles, Roots>(
+    /// Fails closed if live handle roots drifted from the verified plan, an
+    /// in-flight open was already announced, or the remaining compaction fence
+    /// refuses the rewrite.
+    pub fn compact_with_live_read_handles<Observe, Roots, Guard>(
         &self,
         authorization: &VerifiedCompactionPlan,
-        live_handles: Handles,
+        observe: Observe,
     ) -> Result<CompactionReport, DurableError>
     where
-        Handles: FnOnce() -> Roots,
+        Observe: FnOnce() -> Result<(Roots, Guard), DurableError>,
         Roots: IntoIterator<Item = ObjectId>,
     {
         let mut inner = self.lock_usable()?;
-        let live_roots = live_handles().into_iter().collect::<BTreeSet<_>>();
+        let (live_roots, _observation) = observe()?;
+        let live_roots = live_roots.into_iter().collect::<BTreeSet<_>>();
         let planned_roots = authorization
             .retention
             .additional_roots()

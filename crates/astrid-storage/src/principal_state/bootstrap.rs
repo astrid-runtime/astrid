@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use crate::engine::{
     CompactionEvidenceBundle, CompactionReport, CompactionRetainedRoot, CompactionRetention,
-    CompactionRootKind, DeterministicCompactionProofVerifier, deterministic_compaction_proof,
+    CompactionRootKind, DeterministicCompactionProofVerifier, DurableError,
+    deterministic_compaction_proof,
 };
 use crate::storage_model::{
     GcCommitId, ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord,
@@ -198,10 +199,10 @@ impl RuntimePrincipalStore {
                 })?;
             engine
                 .compact_with_live_read_handles(&plan, || {
-                    content
-                        .compaction_read_handle_roots()
-                        .into_iter()
-                        .map(|(_, object)| object)
+                    let observation = content
+                        .begin_compaction_observation()
+                        .map_err(|_| DurableError::CompactionSnapshotChanged)?;
+                    Ok((observation.live_object_ids(), observation))
                 })
                 .map_err(|error| {
                     StorageError::Connection(format!("compact durable store: {error}"))
