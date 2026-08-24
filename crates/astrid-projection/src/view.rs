@@ -1,5 +1,7 @@
 //! Lookup-only projection view. There is no catalog dump.
 
+use core::fmt;
+
 use astrid_resource_types::ResourceTypeId;
 
 use crate::error::ProjectionError;
@@ -13,7 +15,9 @@ use crate::snapshot::{ProjectionSnapshot, ProjectionUpdate};
 /// Lookup requires the exact [`SemanticObjectId`]. Listing by type, label, or
 /// "all" is refused. Existing objects are never overwritten in place: the
 /// initial insert is unique, and later states go through [`Self::apply`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Debug` is intentionally opaque. Formatting a view is not a catalog dump.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProjectionView<const N: usize> {
     slots: [Option<ProjectionSnapshot>; N],
 }
@@ -134,6 +138,13 @@ impl<const N: usize> ProjectionView<N> {
     }
 }
 
+impl<const N: usize> fmt::Debug for ProjectionView<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = self;
+        formatter.write_str("ProjectionView")
+    }
+}
+
 impl<const N: usize> Default for ProjectionView<N> {
     fn default() -> Self {
         Self::new()
@@ -142,8 +153,11 @@ impl<const N: usize> Default for ProjectionView<N> {
 
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
+
     use super::*;
     use crate::presentation::{PresentationLabel, PresentationMetadata};
+    use alloc::format;
     use astrid_resource_types::{ResourceId, ResourceTypeId};
 
     fn snap(byte: u8, label: &str) -> ProjectionSnapshot {
@@ -188,5 +202,36 @@ mod tests {
             view.insert_initial(snap(2, "b")),
             Err(ProjectionError::ViewFull)
         );
+    }
+
+    #[test]
+    fn debug_does_not_enumerate_slots() {
+        let mut view = ProjectionView::<2>::new();
+        let mut alpha = snap(1, "alpha");
+        alpha = ProjectionSnapshot::new(
+            alpha.object(),
+            alpha.type_id(),
+            alpha.revision(),
+            alpha.label(),
+            PresentationMetadata::try_from_pairs(&[("invoke", "true"), ("rights", "root")])
+                .unwrap(),
+        );
+        view.insert_initial(alpha).unwrap();
+        view.insert_initial(snap(2, "beta")).unwrap();
+        let rendered = format!("{view:?}");
+        let pretty = format!("{view:#?}");
+        for dump in [rendered.as_str(), pretty.as_str()] {
+            assert_eq!(dump, "ProjectionView");
+            assert!(!dump.contains("alpha"));
+            assert!(!dump.contains("beta"));
+            assert!(!dump.contains("SemanticObjectId"));
+            assert!(!dump.contains("ResourceId"));
+            assert!(!dump.contains("ResourceTypeId"));
+            assert!(!dump.contains("PresentationLabel"));
+            assert!(!dump.contains("PresentationMetadata"));
+            assert!(!dump.contains("invoke"));
+            assert!(!dump.contains("rights"));
+            assert!(!dump.contains("slots"));
+        }
     }
 }
