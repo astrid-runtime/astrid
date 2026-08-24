@@ -23,22 +23,43 @@ pub const fn bob_principal() -> HostPrincipal {
     host_principal_from_stamp_uid([0xB2; 32])
 }
 
+/// Application-generation bytes for the non-normative `true`/`echo` falsifier.
+pub(crate) const ARGV_FALSIFIER_APPLICATION: [u8; 32] = [0x21; 32];
+
 #[cfg(test)]
 pub(crate) fn instance_for(principal: HostPrincipal) -> astrid_provider::AdmittedInstance {
+    instance_with_application(
+        principal,
+        astrid_resource_types::ApplicationGenerationRef::from_bytes(ARGV_FALSIFIER_APPLICATION),
+        astrid_resource_types::ObjectGeneration::INITIAL,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn instance_for_image(
+    principal: HostPrincipal,
+    image: &crate::image::GuestImage,
+) -> astrid_provider::AdmittedInstance {
+    instance_with_application(
+        principal,
+        image.id().application_generation(),
+        astrid_resource_types::ObjectGeneration::INITIAL,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn instance_with_application(
+    principal: HostPrincipal,
+    application: astrid_resource_types::ApplicationGenerationRef,
+    generation: astrid_resource_types::ObjectGeneration,
+) -> astrid_provider::AdmittedInstance {
     use crate::interpreter::{COMPAT_PROVIDER_GENERATION, COMPAT_PROVIDER_ID};
     use astrid_provider::{AdmittedInstance, ApplicationClosure, InstanceId};
-    use astrid_resource_types::{ApplicationGenerationRef, ObjectGeneration, OwnerId, ResourceId};
+    use astrid_resource_types::{OwnerId, ResourceId};
 
     AdmittedInstance::new(
-        InstanceId::new(
-            ResourceId::from_bytes([0x31; 32]),
-            ObjectGeneration::INITIAL,
-        ),
-        ApplicationClosure::new(
-            ApplicationGenerationRef::from_bytes([0x21; 32]),
-            COMPAT_PROVIDER_ID,
-            COMPAT_PROVIDER_GENERATION,
-        ),
+        InstanceId::new(ResourceId::from_bytes([0x31; 32]), generation),
+        ApplicationClosure::new(application, COMPAT_PROVIDER_ID, COMPAT_PROVIDER_GENERATION),
         OwnerId::principal(*principal.as_bytes()),
     )
 }
@@ -48,12 +69,21 @@ pub(crate) fn job_for(
     principal: HostPrincipal,
     argv: &[&[u8]],
 ) -> Result<astrid_provider::Job, astrid_provider::ProviderError> {
+    job_against(&instance_for(principal), principal, argv)
+}
+
+#[cfg(test)]
+pub(crate) fn job_against(
+    instance: &astrid_provider::AdmittedInstance,
+    principal: HostPrincipal,
+    argv: &[&[u8]],
+) -> Result<astrid_provider::Job, astrid_provider::ProviderError> {
     use astrid_provider::{AttachmentSet, Job, JobArgv, StreamSet};
     use astrid_resource_types::{CausalRequestId, OperationId};
 
     Ok(Job::for_instance(
         OperationId::from_bytes([0x41; 16]),
-        &instance_for(principal),
+        instance,
         &JobArgv::try_from_args(argv)?,
         &AttachmentSet::EMPTY,
         &StreamSet::EMPTY,

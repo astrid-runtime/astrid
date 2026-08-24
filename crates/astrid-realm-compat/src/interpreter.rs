@@ -6,6 +6,9 @@ use astrid_provider::{
 };
 use astrid_resource_types::{ProviderGeneration, ProviderId};
 
+use crate::fixtures::ARGV_FALSIFIER_APPLICATION;
+use crate::image::known_image;
+use crate::machine::{DEFAULT_INSTRUCTION_FUEL, PortableMachine};
 use crate::ramfs::EphemeralRamfs;
 
 /// Well-known compatibility provider identity. Not a named guest runtime.
@@ -73,6 +76,8 @@ impl ReferenceInterpreter {
 /// Interpret structured argv against the ephemeral namespace.
 ///
 /// Unknown programs and non-empty attachments or streams fail closed.
+/// This path is the non-normative `true`/`echo` falsifier. It does not
+/// execute guest instructions.
 ///
 /// # Errors
 ///
@@ -91,6 +96,28 @@ pub fn interpret_status(job: &Job) -> Result<u8, ProviderError> {
     }
 }
 
+fn execute_status(job: &Job) -> Result<u8, ProviderError> {
+    if !job.attachments().is_empty() || !job.streams().is_empty() {
+        return Err(ProviderError::NotSupported);
+    }
+    if job.argv().iter().next().is_none() {
+        return Err(ProviderError::EmptyArgv);
+    }
+    let application = job.closure().application();
+    if application.as_bytes() == &ARGV_FALSIFIER_APPLICATION {
+        return interpret_status(job);
+    }
+    let image = known_image(application)?;
+    if image.id().application_generation() != application {
+        return Err(ProviderError::TypeMismatch);
+    }
+    let mut machine = PortableMachine::for_owner(job.principal(), &image, DEFAULT_INSTRUCTION_FUEL)
+        .map_err(crate::machine::MachineError::as_provider_error)?;
+    machine
+        .run(job.principal())
+        .map_err(crate::machine::MachineError::as_provider_error)
+}
+
 impl ExecutionProvider for ReferenceInterpreter {
     fn identity(&self) -> ProviderIdentity {
         Self::identity_value()
@@ -104,7 +131,7 @@ impl ExecutionProvider for ReferenceInterpreter {
         check_start(&self.identity(), instance, job)?;
         let namespace = self.activate_namespace(instance, job.principal())?;
         namespace.touch(job.principal())?;
-        let _status = interpret_status(job)?;
+        let _status = execute_status(job)?;
         Ok(self.receipt(job, instance, ExecutionOutcome::Started))
     }
 
@@ -116,7 +143,7 @@ impl ExecutionProvider for ReferenceInterpreter {
         check_start(&self.identity(), instance, job)?;
         let namespace = self.activate_namespace(instance, job.principal())?;
         namespace.touch(job.principal())?;
-        let status = interpret_status(job)?;
+        let status = execute_status(job)?;
         Ok(self.receipt(job, instance, ExecutionOutcome::Exited { status }))
     }
 
@@ -138,8 +165,9 @@ mod tests {
     use crate::ramfs::EphemeralRamfs;
     use astrid_projection::SemanticObjectId;
     use astrid_provider::{
-        AttachmentDescriptor, AttachmentSet, CapsuleAdapter, ExecutionOutcome, ExecutionProvider,
-        Job, JobArgv, ProviderError, StreamDescriptor, StreamSet, check_receipt, honest_closure,
+        AdmittedInstance, AttachmentDescriptor, AttachmentSet, CapsuleAdapter, ExecutionOutcome,
+        ExecutionProvider, ExecutionReceipt, Job, JobArgv, ProviderError, StreamDescriptor,
+        StreamSet, check_receipt, honest_closure,
     };
     use astrid_resource_types::{CausalRequestId, ObjectGeneration, OperationId, ResourceId};
 
@@ -298,6 +326,100 @@ mod tests {
         );
         assert_eq!(
             EphemeralRamfs::for_owner(alice_principal()).touch(bob_principal()),
+            Err(ProviderError::PrincipalMismatch)
+        );
+    }
+
+    fn image_job(image_bytes: &[u8]) -> (AdmittedInstance, Job) {
+        use crate::fixtures::{instance_for_image, job_against};
+        use crate::image::GuestImage;
+
+        let image = GuestImage::admit(image_bytes).expect("synthetic image admits");
+        let instance = instance_for_image(alice_principal(), &image);
+        let job = job_against(&instance, alice_principal(), &[b"guest"]).expect("argv in range");
+        (instance, job)
+    }
+
+    #[test]
+    fn synthetic_guest_executes_instructions_and_binds_receipts() {
+        use crate::image::{SYNTHETIC_EXIT_SEVEN, SYNTHETIC_EXIT_ZERO};
+
+        let provider = ReferenceInterpreter::new();
+        let (instance, job) = image_job(&SYNTHETIC_EXIT_ZERO);
+        let started = provider.start(&instance, &job).unwrap();
+        assert_eq!(started.outcome(), ExecutionOutcome::Started);
+        check_receipt(&provider.identity(), &instance, &job, &started).unwrap();
+        let exited = provider.exit(&instance, &job).unwrap();
+        assert_eq!(exited.outcome(), ExecutionOutcome::Exited { status: 0 });
+        check_receipt(&provider.identity(), &instance, &job, &exited).unwrap();
+
+        let (seven_instance, seven_job) = image_job(&SYNTHETIC_EXIT_SEVEN);
+        let exited = provider.exit(&seven_instance, &seven_job).unwrap();
+        assert_eq!(exited.outcome(), ExecutionOutcome::Exited { status: 7 });
+        let mismatched = ExecutionReceipt::for_request(
+            provider.identity(),
+            &seven_job,
+            &seven_instance,
+            ExecutionOutcome::Exited { status: 0 },
+        );
+        assert_ne!(exited.outcome(), mismatched.outcome());
+        let foreign_receipt = ExecutionReceipt::new(
+            provider.identity(),
+            OperationId::from_bytes([0x99; 16]),
+            seven_job.causal(),
+            seven_instance.id(),
+            exited.outcome(),
+        );
+        assert_eq!(
+            check_receipt(
+                &provider.identity(),
+                &seven_instance,
+                &seven_job,
+                &foreign_receipt,
+            ),
+            Err(ProviderError::TypeMismatch)
+        );
+    }
+
+    #[test]
+    fn unknown_image_identity_stale_generation_and_cross_principal_fail_closed() {
+        use crate::fixtures::{instance_for_image, instance_with_application, job_against};
+        use crate::image::{GuestImage, SYNTHETIC_EXIT_ZERO};
+        use astrid_resource_types::{ApplicationGenerationRef, ObjectGeneration};
+
+        let provider = ReferenceInterpreter::new();
+        let unknown = instance_with_application(
+            alice_principal(),
+            ApplicationGenerationRef::from_bytes([0xEE; 32]),
+            ObjectGeneration::INITIAL,
+        );
+        let unknown_job =
+            job_against(&unknown, alice_principal(), &[b"guest"]).expect("argv in range");
+        assert_eq!(
+            provider.start(&unknown, &unknown_job),
+            Err(ProviderError::TypeMismatch)
+        );
+
+        let image = GuestImage::admit(&SYNTHETIC_EXIT_ZERO).unwrap();
+        let current = instance_for_image(alice_principal(), &image);
+        let stale = instance_with_application(
+            alice_principal(),
+            image.id().application_generation(),
+            ObjectGeneration::from_raw(2).expect("generation 2"),
+        );
+        let current_job =
+            job_against(&current, alice_principal(), &[b"guest"]).expect("argv in range");
+        assert!(matches!(
+            provider.start(&stale, &current_job),
+            Err(ProviderError::StaleGeneration {
+                found: 2,
+                requested: 1
+            })
+        ));
+
+        let bob_instance = instance_for_image(bob_principal(), &image);
+        assert_eq!(
+            provider.start(&bob_instance, &current_job),
             Err(ProviderError::PrincipalMismatch)
         );
     }
