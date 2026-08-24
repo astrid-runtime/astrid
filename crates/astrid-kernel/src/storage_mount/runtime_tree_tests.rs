@@ -31,13 +31,7 @@ fn assert_entry_kind(
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admin_mount_projects_packed_runtime_tree_without_host_endpoints() {
-    let temporary = tempfile::tempdir().unwrap();
-    let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
-    let kernel = crate::test_kernel_with_home(home.clone()).await;
-    let store = kernel.principal_store.clone().unwrap();
-
+fn seed_packed_runtime_tree(home: &astrid_core::dirs::AstridHome) -> String {
     let wasm = b"\0asm\x01\0\0\0runtime-mount-test";
     let wasm_hash = blake3::hash(wasm).to_hex().to_string();
     std::fs::write(home.bin_dir().join(format!("{wasm_hash}.wasm")), wasm).unwrap();
@@ -80,6 +74,132 @@ async fn admin_mount_projects_packed_runtime_tree_without_host_endpoints() {
         std::fs::write(sentinel, b"host-only").unwrap();
     }
 
+    wasm_hash
+}
+
+async fn assert_root_entries(lease: &StorageMountLeaseV1) {
+    let root_entries = read_directory_entries(lease, "").await;
+    for name in ["bin", "etc", "home", "keys", "log", "run", "var", "wit"] {
+        assert_entry_kind(&root_entries, name, StorageFilesystemEntryKindV1::Directory);
+    }
+    for excluded in ["astrid", "astrid-daemon"] {
+        assert!(!root_entries.iter().any(|entry| entry.name == excluded));
+    }
+}
+
+async fn assert_packed_files(lease: &StorageMountLeaseV1, wasm_hash: &str) {
+    let bin_entries = read_directory_entries(lease, "bin").await;
+    assert_entry_kind(
+        &bin_entries,
+        &format!("{wasm_hash}.wasm"),
+        StorageFilesystemEntryKindV1::File,
+    );
+
+    let run_entries = read_directory_entries(lease, "run").await;
+    assert_entry_kind(
+        &run_entries,
+        "capsules",
+        StorageFilesystemEntryKindV1::Directory,
+    );
+    let example_capsule_files = read_directory_entries(lease, "run/capsules/example").await;
+    assert_entry_kind(
+        &example_capsule_files,
+        "component.wasm",
+        StorageFilesystemEntryKindV1::File,
+    );
+    let capsules_dir_entries = read_directory_entries(lease, "run/capsules").await;
+    assert_entry_kind(
+        &capsules_dir_entries,
+        "example",
+        StorageFilesystemEntryKindV1::Directory,
+    );
+
+    let wit_entries = read_directory_entries(lease, "wit").await;
+    assert_entry_kind(
+        &wit_entries,
+        "runtime.wit",
+        StorageFilesystemEntryKindV1::File,
+    );
+
+    let etc_entries = read_directory_entries(lease, "etc").await;
+    assert_entry_kind(
+        &etc_entries,
+        "config.toml",
+        StorageFilesystemEntryKindV1::File,
+    );
+
+    let home_root_entries = read_directory_entries(lease, "home").await;
+    assert_entry_kind(
+        &home_root_entries,
+        "default",
+        StorageFilesystemEntryKindV1::Directory,
+    );
+    let home_entries = read_directory_entries(lease, "home/default").await;
+    assert_entry_kind(
+        &home_entries,
+        "profile.json",
+        StorageFilesystemEntryKindV1::File,
+    );
+
+    let log_entries = read_directory_entries(lease, "log").await;
+    assert_entry_kind(
+        &log_entries,
+        "runtime.log",
+        StorageFilesystemEntryKindV1::File,
+    );
+
+    let keys_entries = read_directory_entries(lease, "keys").await;
+    assert_entry_kind(
+        &keys_entries,
+        "operator.pub",
+        StorageFilesystemEntryKindV1::File,
+    );
+
+    let var_entries = read_directory_entries(lease, "var").await;
+    assert_entry_kind(
+        &var_entries,
+        "config.json",
+        StorageFilesystemEntryKindV1::File,
+    );
+}
+
+async fn assert_host_endpoints_absent(lease: &StorageMountLeaseV1) {
+    let run_entries = read_directory_entries(lease, "run").await;
+    assert!(!run_entries.iter().any(|entry| entry.name == "system.sock"));
+    for sentinel in ["system.lock", "system.pid", "system.ready", "system.token"] {
+        assert!(!run_entries.iter().any(|entry| entry.name == sentinel));
+    }
+
+    let etc_entries = read_directory_entries(lease, "etc").await;
+    assert!(
+        !etc_entries
+            .iter()
+            .any(|entry| entry.name == "layout-version")
+    );
+
+    let keys_entries = read_directory_entries(lease, "keys").await;
+    assert!(!keys_entries.iter().any(|entry| entry.name == "runtime.key"));
+
+    let var_entries = read_directory_entries(lease, "var").await;
+    for excluded in [
+        "astrid.volume",
+        "content-staging",
+        "migrations",
+        "principal-store",
+    ] {
+        assert!(!var_entries.iter().any(|entry| entry.name == excluded));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_mount_projects_packed_runtime_tree_without_host_endpoints() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
+    let kernel = crate::test_kernel_with_home(home.clone()).await;
+    let store = kernel.principal_store.clone().unwrap();
+
+    let wasm_hash = seed_packed_runtime_tree(&home);
+
     store.admit_runtime_tree(home.root()).unwrap();
 
     let lease = issue_lease(
@@ -95,106 +215,9 @@ async fn admin_mount_projects_packed_runtime_tree_without_host_endpoints() {
     .await
     .unwrap();
 
-    let root_entries = read_directory_entries(&lease, "").await;
-    for name in ["bin", "etc", "home", "keys", "log", "run", "var", "wit"] {
-        assert_entry_kind(&root_entries, name, StorageFilesystemEntryKindV1::Directory);
-    }
-    for excluded in ["astrid", "astrid-daemon"] {
-        assert!(!root_entries.iter().any(|entry| entry.name == excluded));
-    }
-
-    let bin_entries = read_directory_entries(&lease, "bin").await;
-    assert_entry_kind(
-        &bin_entries,
-        &format!("{wasm_hash}.wasm"),
-        StorageFilesystemEntryKindV1::File,
-    );
-
-    let run_entries = read_directory_entries(&lease, "run").await;
-    assert_entry_kind(
-        &run_entries,
-        "capsules",
-        StorageFilesystemEntryKindV1::Directory,
-    );
-    assert!(!run_entries.iter().any(|entry| entry.name == "system.sock"));
-    for sentinel in ["system.lock", "system.pid", "system.ready", "system.token"] {
-        assert!(!run_entries.iter().any(|entry| entry.name == sentinel));
-    }
-
-    let capsule_entries = read_directory_entries(&lease, "run/capsules/example").await;
-    assert_entry_kind(
-        &capsule_entries,
-        "component.wasm",
-        StorageFilesystemEntryKindV1::File,
-    );
-    let capsules_entries = read_directory_entries(&lease, "run/capsules").await;
-    assert_entry_kind(
-        &capsules_entries,
-        "example",
-        StorageFilesystemEntryKindV1::Directory,
-    );
-
-    let wit_entries = read_directory_entries(&lease, "wit").await;
-    assert_entry_kind(
-        &wit_entries,
-        "runtime.wit",
-        StorageFilesystemEntryKindV1::File,
-    );
-
-    let etc_entries = read_directory_entries(&lease, "etc").await;
-    assert_entry_kind(
-        &etc_entries,
-        "config.toml",
-        StorageFilesystemEntryKindV1::File,
-    );
-    assert!(
-        !etc_entries
-            .iter()
-            .any(|entry| entry.name == "layout-version")
-    );
-
-    let home_root_entries = read_directory_entries(&lease, "home").await;
-    assert_entry_kind(
-        &home_root_entries,
-        "default",
-        StorageFilesystemEntryKindV1::Directory,
-    );
-    let home_entries = read_directory_entries(&lease, "home/default").await;
-    assert_entry_kind(
-        &home_entries,
-        "profile.json",
-        StorageFilesystemEntryKindV1::File,
-    );
-
-    let log_entries = read_directory_entries(&lease, "log").await;
-    assert_entry_kind(
-        &log_entries,
-        "runtime.log",
-        StorageFilesystemEntryKindV1::File,
-    );
-
-    let keys_entries = read_directory_entries(&lease, "keys").await;
-    assert_entry_kind(
-        &keys_entries,
-        "operator.pub",
-        StorageFilesystemEntryKindV1::File,
-    );
-    assert!(!keys_entries.iter().any(|entry| entry.name == "runtime.key"));
-
-    let var_entries = read_directory_entries(&lease, "var").await;
-    assert_entry_kind(
-        &var_entries,
-        "config.json",
-        StorageFilesystemEntryKindV1::File,
-    );
-    for excluded in [
-        "astrid.volume",
-        "content-staging",
-        "migrations",
-        "principal-store",
-    ] {
-        assert!(!var_entries.iter().any(|entry| entry.name == excluded));
-    }
+    assert_root_entries(&lease).await;
+    assert_packed_files(&lease, &wasm_hash).await;
+    assert_host_endpoints_absent(&lease).await;
 
     revoke_lease(&kernel, &PrincipalId::default(), true, lease.mount_id)
         .await
