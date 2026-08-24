@@ -89,6 +89,8 @@ fn admit_blocking(home: &AstridHome, store: &RuntimePrincipalStore) -> io::Resul
     store
         .admit_runtime_tree(home.root())
         .map_err(storage_error)?;
+    #[cfg(test)]
+    run_source_mutation_hook(home)?;
     let after = scan(store, home.root())?;
     if !RuntimeTreeReceipt::from_entries(&entries).matches_entries(&after) {
         return Err(io::Error::new(
@@ -156,6 +158,38 @@ fn read_receipt(path: &Path) -> io::Result<Option<RuntimeTreeReceipt>> {
 
 fn storage_error(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
     io::Error::other(error)
+}
+
+#[cfg(test)]
+type SourceMutationHook = Box<dyn FnOnce(&Path) -> io::Result<()> + Send + 'static>;
+
+#[cfg(test)]
+static SOURCE_MUTATION_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<(std::path::PathBuf, SourceMutationHook)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn inject_source_mutation_once(home: &AstridHome, hook: SourceMutationHook) {
+    *SOURCE_MUTATION_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("runtime-tree test hook lock") = Some((home.root().to_path_buf(), hook));
+}
+
+#[cfg(test)]
+fn run_source_mutation_hook(home: &AstridHome) -> io::Result<()> {
+    let mut requested = SOURCE_MUTATION_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("runtime-tree test hook lock");
+    if requested
+        .as_ref()
+        .is_some_and(|(target, _)| target == home.root())
+    {
+        let (_, hook) = requested.take().expect("runtime-tree test hook present");
+        return hook(home.root());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -245,5 +279,42 @@ mod tests {
             "fresh home admitted generated files: {names:?}"
         );
         assert!(fs::read_to_string(home.migrations_dir().join(RECEIPT_NAME)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn source_mutation_during_admission_fails_closed_without_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(directory.path());
+        home.ensure().unwrap();
+        let wasm = b"\0asm\x01\0\0\0mutation-check".to_vec();
+        let hash = blake3::hash(&wasm).to_hex().to_string();
+        let wasm_path = home.bin_dir().join(format!("{hash}.wasm"));
+        fs::write(&wasm_path, &wasm).unwrap();
+        let receipt_path = home.migrations_dir().join(RECEIPT_NAME);
+        let store = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+
+        let mutation_path = wasm_path.clone();
+        inject_source_mutation_once(
+            &home,
+            Box::new(move |_| {
+                let mut bytes = fs::read(&mutation_path)?;
+                let last = bytes.last_mut().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "test wasm is empty")
+                })?;
+                *last ^= 0xff;
+                fs::write(mutation_path, bytes)
+            }),
+        );
+
+        let error = admit(&home, &store)
+            .await
+            .expect_err("admission must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            !receipt_path.exists(),
+            "changed source must not mint a receipt"
+        );
     }
 }
