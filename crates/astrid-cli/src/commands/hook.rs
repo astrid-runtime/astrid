@@ -7,8 +7,10 @@
 use std::process::ExitCode;
 
 use anyhow::Result;
-use astrid_emit::{DEFAULT_POLICY_TIMEOUT_MS, HookEnvValues};
+use astrid_emit::{DEFAULT_POLICY_TIMEOUT_MS, HostHookEnvValues};
 use clap::Args;
+
+const FAIL_CLOSED_ENV: &str = "ASTRID_CODEX_HOOK_FAIL_CLOSED";
 
 /// Publish one host hook envelope without starting a second daemon/client.
 #[derive(Debug, Args)]
@@ -25,20 +27,19 @@ pub(crate) struct HookArgs {
     #[arg(long, value_name = "EVENT")]
     pub event: String,
 
-    /// Host workspace identifier. The hook payload remains opaque; this flag
-    /// is accepted so host adapters can keep one stable invocation shape.
+    /// Host workspace identifier forwarded as top-level envelope metadata.
     #[arg(long, value_name = "WORKSPACE")]
     pub workspace: Option<String>,
 
-    /// Maximum transport wait in milliseconds. `0` is fire-and-forget for
-    /// observation hooks; policy hooks default to a bounded 1000 ms wait.
+    /// Maximum transport wait in milliseconds. When omitted, observation
+    /// events use `0` (fire-and-forget) and policy events use a bounded
+    /// 1000 ms wait. Policy events must stay within 200-2000 ms.
     #[arg(
         long = "timeout-ms",
         value_name = "MILLISECONDS",
-        default_value_t = DEFAULT_POLICY_TIMEOUT_MS,
         value_parser = parse_timeout_ms,
     )]
-    pub timeout_ms: u64,
+    pub timeout_ms: Option<u64>,
 }
 
 fn parse_timeout_ms(value: &str) -> std::result::Result<u64, String> {
@@ -52,31 +53,80 @@ fn parse_timeout_ms(value: &str) -> std::result::Result<u64, String> {
     }
 }
 
+/// Codex hooks that can gate an operation need a bounded transport wait.
+/// Everything else is observation-only and defaults to connect/write/close
+/// without an outer timer.
+fn is_policy_event(event: &str) -> bool {
+    matches!(event, "pre_tool_use" | "permission_request")
+}
+
+fn default_timeout_ms(event: &str) -> u64 {
+    if is_policy_event(event) {
+        DEFAULT_POLICY_TIMEOUT_MS
+    } else {
+        0
+    }
+}
+
+fn timeout_for_event(event: &str, requested: Option<u64>) -> Result<u64> {
+    let timeout_ms = requested.unwrap_or_else(|| default_timeout_ms(event));
+    if is_policy_event(event) && timeout_ms == 0 {
+        anyhow::bail!("policy hook {event} requires a timeout from 200 to 2000 milliseconds");
+    }
+    Ok(timeout_ms)
+}
+
+/// Whether a hook transport failure should be surfaced to the host as a
+/// failing command. The default is deliberately fail-open so a missing or
+/// temporarily unavailable runtime cannot wedge an agent session.
+pub(crate) fn fail_closed_requested() -> bool {
+    std::env::var(FAIL_CLOSED_ENV).is_ok_and(|value| value == "1")
+}
+
+/// Convert a hook-side failure to the host process status according to the
+/// explicit fail-closed opt-in.
+pub(crate) fn failure_exit_code() -> ExitCode {
+    if fail_closed_requested() {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn report_failure(error: impl std::fmt::Display) -> ExitCode {
+    astrid_emit::write_continue_line();
+    eprintln!("astrid hook: {error}");
+    failure_exit_code()
+}
+
 /// Resolve the topic and publish one hook event.
 pub(crate) async fn run(args: HookArgs) -> Result<ExitCode> {
+    let timeout_ms = match timeout_for_event(&args.event, args.timeout_ms) {
+        Ok(timeout_ms) => timeout_ms,
+        Err(error) => return Ok(report_failure(error)),
+    };
     let topic = match astrid_emit::hook_topic(&args.host, &args.session, &args.event) {
         Ok(topic) => topic,
-        Err(error) => {
-            astrid_emit::write_continue_line();
-            eprintln!("astrid hook: {error}");
-            return Ok(ExitCode::from(1));
-        },
+        Err(error) => return Ok(report_failure(error)),
     };
     let token = match astrid_emit::hook_token_from_env() {
         Ok(token) => token,
-        Err(error) => {
-            astrid_emit::write_continue_line();
-            eprintln!("astrid hook: {error}");
-            return Ok(ExitCode::from(1));
-        },
+        Err(error) => return Ok(report_failure(error)),
     };
     let principal = crate::principal::current().to_string();
-    let env = HookEnvValues {
+    let env = HostHookEnvValues {
         principal_id: &principal,
         session_id: &args.session,
         token: &token,
+        event: Some(&args.event),
+        workspace_id: args.workspace.as_deref(),
     };
-    Ok(astrid_emit::run_topic(&topic, &env, args.timeout_ms).await)
+    let exit = astrid_emit::run_host_topic(&topic, &env, timeout_ms).await;
+    if fail_closed_requested() {
+        Ok(exit)
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
 }
 
 #[cfg(test)]
@@ -125,6 +175,37 @@ mod tests {
         assert_eq!(cli.args.session, "s1");
         assert_eq!(cli.args.event, "pre_tool_use");
         assert_eq!(cli.args.workspace.as_deref(), Some("cwd-1"));
-        assert_eq!(cli.args.timeout_ms, 0);
+        assert_eq!(cli.args.timeout_ms, Some(0));
+    }
+
+    #[test]
+    fn omitted_timeout_defaults_by_hook_kind() {
+        assert_eq!(
+            default_timeout_ms("pre_tool_use"),
+            DEFAULT_POLICY_TIMEOUT_MS
+        );
+        assert_eq!(
+            default_timeout_ms("permission_request"),
+            DEFAULT_POLICY_TIMEOUT_MS
+        );
+        assert_eq!(default_timeout_ms("session_start"), 0);
+        assert_eq!(default_timeout_ms("post_tool_use"), 0);
+        assert_eq!(
+            timeout_for_event("pre_tool_use", None).expect("policy default"),
+            1000
+        );
+        assert_eq!(
+            timeout_for_event("session_start", None).expect("observe default"),
+            0
+        );
+    }
+
+    #[test]
+    fn policy_hooks_reject_unbounded_zero_timeout() {
+        assert!(timeout_for_event("pre_tool_use", Some(0)).is_err());
+        assert_eq!(
+            timeout_for_event("session_start", Some(0)).expect("observe timeout"),
+            0
+        );
     }
 }

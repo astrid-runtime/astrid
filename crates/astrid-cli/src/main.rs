@@ -61,7 +61,7 @@ async fn main() -> ExitCode {
             }
             let _ = error.print();
             if hook_invocation && usage_error {
-                return ExitCode::from(1);
+                return commands::hook::failure_exit_code();
             }
             return ExitCode::from(u8::try_from(exit_code.clamp(0, 255)).unwrap_or(1));
         },
@@ -87,7 +87,11 @@ async fn main() -> ExitCode {
                 astrid_emit::write_continue_line();
             }
             eprintln!("{}", theme::Theme::error(&format!("error: {e:#}")));
-            return ExitCode::from(1);
+            return if hook_invocation {
+                commands::hook::failure_exit_code()
+            } else {
+                ExitCode::from(1)
+            };
         },
     }
 
@@ -98,7 +102,11 @@ async fn main() -> ExitCode {
                 astrid_emit::write_continue_line();
             }
             eprintln!("{}", theme::Theme::error(&format!("error: {e:#}")));
-            ExitCode::from(1)
+            if hook_invocation {
+                commands::hook::failure_exit_code()
+            } else {
+                ExitCode::from(1)
+            }
         },
     }
 }
