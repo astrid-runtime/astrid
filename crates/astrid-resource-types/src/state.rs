@@ -159,4 +159,71 @@ mod tests {
             Err(EncodingError::WrongTypeTag { .. })
         ));
     }
+
+    #[test]
+    fn same_width_closed_enums_reject_each_others_bytes() {
+        macro_rules! rejects_as {
+            ($bytes:expr, $($target:ty),+ $(,)?) => {
+                $(assert!(matches!(
+                    <$target>::decode_canonical(&$bytes),
+                    Err(EncodingError::WrongTypeTag { .. })
+                ));)+
+            };
+        }
+
+        let mut resource_kind = [0_u8; 5];
+        ResourceKind::Storage
+            .encode_canonical(&mut resource_kind)
+            .unwrap();
+        let mut lifecycle = [0_u8; 5];
+        ResourceLifecycleState::Declared
+            .encode_canonical(&mut lifecycle)
+            .unwrap();
+        let mut transfer = [0_u8; 5];
+        TransferClass::None.encode_canonical(&mut transfer).unwrap();
+        let mut error = [0_u8; 5];
+        ResourceErrorCode::InvalidDescriptor
+            .encode_canonical(&mut error)
+            .unwrap();
+        let mut outcome = [0_u8; 5];
+        ResourceOutcomeCode::Succeeded
+            .encode_canonical(&mut outcome)
+            .unwrap();
+
+        rejects_as!(
+            resource_kind,
+            ResourceLifecycleState,
+            TransferClass,
+            ResourceErrorCode,
+            ResourceOutcomeCode
+        );
+        rejects_as!(
+            lifecycle,
+            ResourceKind,
+            TransferClass,
+            ResourceErrorCode,
+            ResourceOutcomeCode
+        );
+        rejects_as!(
+            transfer,
+            ResourceKind,
+            ResourceLifecycleState,
+            ResourceErrorCode,
+            ResourceOutcomeCode
+        );
+        rejects_as!(
+            error,
+            ResourceKind,
+            ResourceLifecycleState,
+            TransferClass,
+            ResourceOutcomeCode
+        );
+        rejects_as!(
+            outcome,
+            ResourceKind,
+            ResourceLifecycleState,
+            TransferClass,
+            ResourceErrorCode
+        );
+    }
 }
