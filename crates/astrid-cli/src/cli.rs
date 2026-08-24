@@ -14,10 +14,10 @@ use crate::commands::{
     agent::AgentCommand, audit::AuditArgs, budget::BudgetCommand, caps::CapsCommand,
     capsule::config::ConfigArgs as CapsuleConfigArgs, capsule::show::ShowArgs as CapsuleShowArgs,
     completions::CompletionsArgs, doctor::DoctorArgs, gc::GcArgs, group::GroupCommand,
-    invite::InviteCommand, keypair::KeypairCommand, logs::LogsArgs, pair_device::PairDeviceCommand,
-    ps::PsArgs, quota::QuotaCommand, run::RunArgs, secret::SecretCommand, setup::SetupArgs,
-    storage::StorageCommand, top::TopArgs, trust::TrustCommand, version::VersionArgs,
-    voucher::VoucherCommand, who::WhoArgs,
+    hook::HookArgs, invite::InviteCommand, keypair::KeypairCommand, logs::LogsArgs,
+    pair_device::PairDeviceCommand, ps::PsArgs, quota::QuotaCommand, run::RunArgs,
+    secret::SecretCommand, setup::SetupArgs, storage::StorageCommand, top::TopArgs,
+    trust::TrustCommand, version::VersionArgs, voucher::VoucherCommand, who::WhoArgs,
 };
 
 /// Astrid - Secure Agent Runtime
@@ -187,6 +187,10 @@ pub(crate) enum Commands {
 
     /// Inspect system audit accounting, ingestion health, and retention.
     Audit(AuditArgs),
+
+    /// Publish one host hook through the tiny authenticated emitter client.
+    #[command(hide = true)]
+    Hook(HookArgs),
 
     /// Per-agent budget allocation and accounting (deferred — see #653/#656).
     Budget {

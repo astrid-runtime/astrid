@@ -83,6 +83,45 @@ pub struct Args {
     pub topic_flag: Option<String>,
 }
 
+/// Default wait for a policy hook that needs the broker to accept its frame.
+/// Observation hooks pass `0` to make the transport fire-and-forget.
+pub const DEFAULT_POLICY_TIMEOUT_MS: u64 = 1_000;
+
+/// Validate a host/session/event segment before putting it in a bus topic.
+///
+/// These values originate in a host hook payload or command line. Keeping
+/// the check at this boundary prevents a caller from smuggling additional
+/// topic segments into the fixed hook route.
+fn validate_topic_segment(name: &str, value: &str) -> Result<()> {
+    if value.is_empty() || value.len() > 64 {
+        anyhow::bail!("{name} must be 1-64 ASCII characters");
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        anyhow::bail!("{name} must contain only ASCII letters, digits, '_' or '-'");
+    }
+    Ok(())
+}
+
+/// Derive the host hook topic used by the thin `astrid hook` command.
+///
+/// Every host route carries the session as a topic segment. Codex and the
+/// other host runners subscribe to their own `{host}.v1.hook.*.*` namespace;
+/// the envelope itself remains the six-field [`build_envelope`] contract.
+///
+/// # Errors
+/// Returns an error when any segment is empty, too long, or contains a topic
+/// separator/control character.
+pub fn hook_topic(host: &str, session: &str, event: &str) -> Result<String> {
+    validate_topic_segment("host", host)?;
+    validate_topic_segment("session", session)?;
+    validate_topic_segment("event", event)?;
+
+    Ok(format!("{host}.v1.hook.{session}.{event}"))
+}
+
 impl Args {
     /// Resolve the single topic from whichever form was supplied.
     ///
@@ -272,6 +311,19 @@ fn env_lookup(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
+/// Read the hook token supplied by the host runner.
+///
+/// The runner mints and persists this token once per session. Hook events only
+/// echo it; this helper deliberately never generates a replacement token.
+///
+/// # Errors
+/// Returns an error when `ASTRID_HOOK_TOKEN` is missing or empty.
+pub fn hook_token_from_env() -> Result<String> {
+    env_lookup("ASTRID_HOOK_TOKEN").ok_or_else(|| {
+        anyhow::anyhow!("required environment variable ASTRID_HOOK_TOKEN is missing or empty")
+    })
+}
+
 /// Core, testable logic: given a topic, stdin payload, the three env
 /// values, and an [`Emitter`], build the envelope and publish it.
 ///
@@ -338,6 +390,41 @@ fn write_continue() {
     let mut out = std::io::stdout();
     let _ = writeln!(out, "{CONTINUE_LINE}");
     let _ = out.flush();
+}
+
+/// Write the hook protocol's unconditional continue response.
+///
+/// The CLI's `hook` wrapper uses this when argument/environment validation
+/// fails before it can invoke [`run_topic`].
+pub fn write_continue_line() {
+    write_continue();
+}
+
+/// Read stdin, publish one hook envelope, and emit the fixed continue line.
+///
+/// A timeout of `0` means fire-and-forget: the client still performs the
+/// connect/write/flush sequence, but does not wait on an outer timer. A
+/// non-zero timeout bounds that sequence for policy hooks. Every outcome is
+/// fail-soft and writes `{"continue":true}` before returning.
+pub async fn run_topic(topic: &str, env: &HookEnvValues<'_>, timeout_ms: u64) -> ExitCode {
+    let stdin_payload = read_stdin_lossy();
+    let publish = emit(&SocketEmitter, topic, &stdin_payload, env);
+    let outcome = if timeout_ms == 0 {
+        publish.await
+    } else {
+        match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), publish).await {
+            Ok(outcome) => outcome,
+            Err(_) => Outcome::fail(format!(
+                "astrid-emit: timed out after {timeout_ms} ms publishing on {topic}"
+            )),
+        }
+    };
+
+    write_continue();
+    if let Some(msg) = outcome.stderr {
+        eprintln!("{msg}");
+    }
+    outcome.exit
 }
 
 /// Process entry point. Parses args, reads env + stdin, publishes via the
@@ -474,6 +561,28 @@ mod tests {
         );
         assert_eq!(derive_hook("sage.v1.hook.session_end"), "session_end");
         assert_eq!(derive_hook("notification"), "notification");
+    }
+
+    #[test]
+    fn hook_topic_uses_codex_session_route() {
+        assert_eq!(
+            hook_topic("codex", "session-1", "pre_tool_use").expect("valid hook route"),
+            "codex.v1.hook.session-1.pre_tool_use"
+        );
+    }
+
+    #[test]
+    fn hook_topic_includes_session_for_every_host() {
+        assert_eq!(
+            hook_topic("claude", "session-1", "after_tool_use").expect("valid hook route"),
+            "claude.v1.hook.session-1.after_tool_use"
+        );
+    }
+
+    #[test]
+    fn hook_topic_rejects_topic_injection() {
+        let error = hook_topic("codex", "session.bad", "event").expect_err("dot is invalid");
+        assert!(error.to_string().contains("session"));
     }
 
     #[test]
