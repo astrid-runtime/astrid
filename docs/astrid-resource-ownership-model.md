@@ -10,7 +10,7 @@ authority.
 
 Implementation epic: [astrid#1564](https://github.com/astrid-runtime/astrid/issues/1564)
 
-Last reviewed: 2026-08-24
+Last reviewed: 2026-08-25
 
 Evidence snapshot: `astrid-runtime/astrid` `origin/main`
 `6e43da5f68f4ca10899236598988fe3ebadd7a39`.
@@ -31,8 +31,17 @@ no pull request. Independent local quality evidence on that SHA is 17 tests,
 `no_std`/`wasm32` checks, `clippy -D warnings`, and `fmt`. It is not merged
 and is not a behavior change.
 
-First Realm semantic backend: recoverable RV64-in-WASM oracle plus BusyBox
-argv fixture.
+Named systems such as Hermes, BusyBox, Linux Realm, QEMU/q35, NVIDIA, and
+other workloads, vendors, or devices are non-normative fixtures or
+falsifiers. They are not canonical product identity, dependencies, or
+sequencing authority. No provider, resource, device, or application
+contract specializes to them. Fixture ordering does not order architecture
+tracks. Linux Realm is one compatibility personality, not the native OS
+or the application model. A machine or device example proves only its
+named conformance boundary.
+
+A recoverable RV64-in-WASM oracle plus a BusyBox argv fixture is one
+compatibility-backend falsifier, not the definition of Realm.
 [unicity-aos/aos-ce#77](https://github.com/unicity-aos/aos-ce/pull/77)
 (`b64d8d94`, draft, conflicting) is inventory only.
 
@@ -96,6 +105,12 @@ mechanisms, but it must not reverse these decisions:
     authority is absent. Hosted success is the same class of functional
     evidence. First-owner enrollment is the unresolved ceremony in
     substrate section 14.5.
+14. Named systems such as Hermes, BusyBox, Linux Realm, QEMU/q35, NVIDIA,
+    and other workloads, vendors, or devices are non-normative fixtures or
+    falsifiers. No provider, resource, device, or application contract
+    specializes to them. Fixture ordering does not order architecture
+    tracks. Linux Realm is one compatibility personality, not the native
+    OS or the application model.
 
 Changing one of these decisions requires a focused ADR or RFC that identifies
 the violated invariant, supplies adversarial evidence, and explains why a less
@@ -763,8 +778,10 @@ Consequential effects are classified before implementation:
 
 The current audit path can continue after some persistence failures and some
 host effects record only manifest-gated system proof. That behavior is not
-sufficient for Hermes H1 or a general “every effect receipted” claim. The
-transactional effect-journal boundary must be implemented before those claims.
+sufficient for a named application-fixture claim such as Hermes H1, or for a
+general “every effect receipted” claim. The transactional effect-journal
+boundary must be implemented before those claims. Fixture claim gates do not
+specialize the receipt contract.
 
 If a process crashes after a non-transactional external effect but before its
 completion record, recovery records `outcome_unknown`. It reconciles through a
@@ -917,21 +934,26 @@ tracks. Neither waits for the other. The substrate Track N/Track R split and
 this Step 6/Step 7 split are the same two tracks, not a native-then-Realm or
 Realm-then-native total order.
 
-### Step 6: first Realm semantic backend, then Linux/Hermes
+### Step 6: compatibility-Realm semantics
 
-Track R starts with a recoverable RV64-in-WASM oracle and a BusyBox argv
-fixture. That oracle is functional and conformance evidence for Realm
-semantics. It does not prove native machine authority or absence of host or
-hypervisor authority.
+Track R proves portable execution-provider, portal, isolation, accounting,
+and recovery contracts for guest ABIs. A recoverable RV64-in-WASM oracle
+and a BusyBox argv fixture is one falsifier for those contracts. It does
+not define Realm, does not order Linux Realm, Hermes, hardware
+virtualization, or Track N, and does not prove native machine authority or
+absence of host or hypervisor authority.
 [unicity-aos/aos-ce#77](https://github.com/unicity-aos/aos-ce/pull/77) remains
-inventory only. Do not merge it as the first backend.
+inventory only. Do not merge it as the Realm backend.
 
 1. Define the internal execution-provider contract using the common context,
-   resource table, lifecycle generations, and portal handles.
-2. Prove the RV64-in-WASM oracle and BusyBox argv fixture against that
-   contract.
-3. Inventory the preserved principal-owned Linux Realm; do not rebuild it as
-   an ambient sidecar and do not treat AOS-CE PR #77 as landed.
+   resource table, lifecycle generations, and portal handles. The contract
+   is workload-neutral and does not specialize to Linux, Hermes, BusyBox,
+   NVIDIA, or any named vendor or device.
+2. Prove one named compatibility-backend falsifier, such as the RV64-in-WASM
+   oracle and BusyBox argv fixture, against that contract.
+3. Inventory the preserved principal-owned Linux Realm as one compatibility
+   personality; do not rebuild it as an ambient sidecar, do not treat AOS-CE
+   PR #77 as landed, and do not wait on BusyBox to inventory it.
 4. Map virtual/block filesystem, network, secrets, clock, entropy, terminal,
    ingress, and tool access to admitted portals. Linux retains its internal
    fork/exec, PID, UID, thread, signal, pipe, and descriptor semantics; Astrid
@@ -940,20 +962,24 @@ inventory only. Do not merge it as the first backend.
    not Realm execution.
 5. Bind Realm system image and application closure independently of principal
    state.
-6. Run Linux/POSIX gates for advertised semantics. Hermes is later than the
-   oracle/BusyBox fixture and is not a native-kernel completion claim.
+6. Run advertised Linux/POSIX gates as personality fixtures. Hermes, if
+   selected, is a named application fixture and is not a native-kernel
+   completion claim.
 
-Hermes's SQLite/WAL-bearing state must use a block-local filesystem or another
-provider that passes the required POSIX durability and locking corpus. 9P is
-limited to workspace/import-export and other semantics it proves. The first
-filesystem implementation remains a measured provider choice; no filesystem
-is promoted into the native authority model.
+A SQLite/WAL-bearing application fixture such as Hermes must use a
+block-local filesystem or another provider that passes the required POSIX
+durability and locking corpus. That requirement is a falsifier for the
+advertised filesystem profile; it does not specialize the storage or
+provider contract to Hermes. 9P is limited to workspace/import-export and
+other semantics it proves. Filesystem implementation remains a measured
+provider choice; no filesystem is promoted into the native authority model.
 
-Exit gate for the first backend: the RV64-in-WASM oracle plus BusyBox argv
-fixture recovers and executes without host-process fallback. The later Hermes
-gate remains: two hostile principals use the same immutable Hermes closure
-with isolated state, authority, lifecycle, and accounting, with no host
-fallback.
+Exit gate: a named compatibility-backend falsifier recovers and executes
+without host-process fallback. A later named application fixture such as
+Hermes, if claimed, still requires two hostile principals using the same
+immutable closure with isolated state, authority, lifecycle, and accounting,
+and with no host fallback. Those fixture gates do not order architecture
+tracks.
 
 ### Step 7: native `no_std` host
 
@@ -1006,7 +1032,7 @@ and source material, not merge instructions.
 | Standalone local administration | Astrid PR #1473 | Retain as admin-provider seed |
 | Host-independent storage and mounts | Astrid PRs #1535, #1562, #1601 on current main | Landed; consume as media/projection, not a second ingest |
 | Portable resource types | Astrid issue #1565 / `codex/resource-types-foundation` `800cee5a` | Quality-clean types foundation, not merged; rebase as Step 1 |
-| Actual principal Linux Realm | Preserved draft unicity-aos/aos-ce PR #77 / `b64d8d94` | Inventory only; first semantic backend is RV64-in-WASM oracle plus BusyBox argv |
+| Actual principal Linux Realm | Preserved draft unicity-aos/aos-ce PR #77 / `b64d8d94` | Inventory only; Linux Realm is one compatibility personality; RV64-in-WASM plus BusyBox argv is one falsifier |
 | Distro compatibility validation | Astrid PR #1024 | Retain as validation floor, not generation architecture |
 | Package `supersedes` | Closed Astrid PR #583 and issue #1184 | Reject as system-generation mechanism |
 | Remote CLI/contexts | Astrid issues #658 and #688 | Defer as consumers of stamped sessions |
@@ -1038,8 +1064,9 @@ the proof a production kernel.
 
 ### Preserved Linux Realm and `origin/feat/linux-realm-runtime`
 
-**Decision: inventory only as a merge unit; first semantic backend is the
-RV64-in-WASM oracle plus BusyBox argv fixture.**
+**Decision: inventory only as a merge unit. Linux Realm is one compatibility
+personality, not the native OS. RV64-in-WASM plus BusyBox argv is one
+falsifier, not the Realm definition and not a sequencing gate.**
 
 The authoritative preserved source/artifact work remains in its owning
 repository/bundle, including draft unicity-aos/aos-ce PR #77 (`b64d8d94`).
@@ -1136,10 +1163,10 @@ The following ideas conflict with the locked direction:
 16. **Treat all audit events as durable receipts.** Best-effort observability
     and transactionally ordered effect evidence are separate contracts.
 17. **Use the interpreted RV64 Realm as the only production backend.** It is
-    the first semantic oracle and a portable recovery lane, plus the BusyBox
-    argv fixture. Hardware virtualization or native-architecture providers may
-    later serve production workloads behind the same contract and conformance
-    suite.
+    one semantic oracle and a portable recovery lane, plus a BusyBox argv
+    fixture. Hardware virtualization or native-architecture providers may
+    serve production workloads behind the same contract and conformance
+    suite; the fixture does not order them.
 18. **Persist or serialize raw live handles as authority.** Cross-domain or
     cross-machine use requires re-admission or an explicit signed delegation;
     table slot values are local implementation details.
@@ -1153,7 +1180,7 @@ The following ideas conflict with the locked direction:
 21. **Treat a default root account, local console, or first network caller as
     machine owner.** First-owner enrollment is an unresolved ceremony and is
     not implied by firmware, loader, distribution, or recovery.
-22. **Merge AOS-CE PR #77 as the first Realm backend.** It is inventory only.
+22. **Merge AOS-CE PR #77 as the Realm backend.** It is inventory only.
 
 ## 9. Required conformance corpus
 
@@ -1193,13 +1220,14 @@ The following ideas conflict with the locked direction:
 - filesystem feature profile including rename, durability, locks, mapping,
   open-after-unlink, links, modes, and attributes where claimed;
 - Linux syscall/POSIX differential cases for advertised Realm semantics;
-- Hermes SQLite, sessions, skills, subprocess, MCP, network, streaming,
-  cancellation, and service recovery; and
+- named application-fixture cases such as Hermes SQLite, sessions, skills,
+  subprocess, MCP, network, streaming, cancellation, and service recovery,
+  when that fixture is claimed; and
 - absence of host filesystem, process, credential, network, and device escape;
 - old mount callback after principal deletion cannot recreate the owner root;
 - SQLite WAL/crash, atomic rename plus fsync, advisory locking, memory mapping,
   open-after-unlink, sparse file, link, and corruption-recovery behavior for
-  any provider advertised to Hermes; and
+  any provider advertised to a SQLite/WAL application fixture; and
 - guest UID 0 remains Realm-local and cannot imply Astrid operator, principal,
   owner, or host authority.
 
@@ -1284,18 +1312,19 @@ preserved Linux Realm bundle, and the draft plan on 2026-08-18.
 - **Amend:** require POSIX behavior rather than freezing ext4 or another
   filesystem before measurement; keep execution-provider Rust contracts
   private until a second implementation establishes the abstraction.
-- **Reject:** 9P for Hermes SQLite/WAL, `astrid:process` host execution as Realm
-  execution, guest UID 0 as Astrid authority, one mutable cross-principal
-  Realm, and the preserved RV64 interpreter as the only production backend.
+- **Reject:** 9P for a SQLite/WAL application fixture, `astrid:process` host
+  execution as Realm execution, guest UID 0 as Astrid authority, one mutable
+  cross-principal Realm, and the preserved RV64 interpreter as the only
+  production backend.
 
 ### Prior-work archaeology review
 
 - **Accept:** consume landed storage; rebase #1565 types; reuse current
   mainline ownership, memory, runtime-generation, authority, and admin work;
   split and forward-port compute and workspace contracts; take AOS-CE PR #77
-  as inventory; first Realm backend is RV64-in-WASM oracle plus BusyBox argv;
-  native machine authority is a parallel track, not a later hidden
-  prerequisite.
+  as inventory; Linux Realm is one compatibility personality; RV64-in-WASM
+  plus BusyBox argv is one falsifier, not a sequencing gate; native machine
+  authority is a parallel track, not a later hidden prerequisite.
 - **Supersede:** old reference/KV stores, old Core Linux-Realm scaffolding,
   broad workspace/compute and kernel branches as merge units, package-level
   `supersedes`, and host CoW as canonical workspace state.

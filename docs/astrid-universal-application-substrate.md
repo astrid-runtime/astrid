@@ -9,7 +9,7 @@ authority.
 
 Implementation epic: [astrid#1564](https://github.com/astrid-runtime/astrid/issues/1564)
 
-Last reviewed: 2026-08-24
+Last reviewed: 2026-08-25
 
 Evidence snapshot: `astrid-runtime/astrid` `origin/main`
 `6e43da5f68f4ca10899236598988fe3ebadd7a39`. Historical branch snapshots and
@@ -31,9 +31,18 @@ exists on `codex/resource-types-foundation`
 local quality evidence on that SHA is 17 tests, `no_std`/`wasm32` checks,
 `clippy -D warnings`, and `fmt`. It is not merged and is not a behavior change.
 
-The first Linux Realm semantic backend is a recoverable RV64-in-WASM oracle
-plus a BusyBox argv fixture. Hermes and native hardware virtualization are
-later. [unicity-aos/aos-ce#77](https://github.com/unicity-aos/aos-ce/pull/77)
+Named systems such as Hermes, BusyBox, Linux Realm, QEMU/q35, NVIDIA, and
+other workloads, vendors, or devices are non-normative fixtures or
+falsifiers. They are not canonical product identity, dependencies, or
+sequencing authority. No provider, resource, device, or application
+contract specializes to them. Fixture ordering does not order architecture
+tracks. Linux Realm is one compatibility personality, not the native OS
+or the application model. A machine or device example proves only its
+named conformance boundary.
+
+A recoverable RV64-in-WASM oracle plus a BusyBox argv fixture is one
+compatibility-backend falsifier, not the definition of Realm.
+[unicity-aos/aos-ce#77](https://github.com/unicity-aos/aos-ce/pull/77)
 (`b64d8d94`, draft, conflicting) is inventory only.
 
 Related documents:
@@ -86,11 +95,11 @@ stdout/stderr/logging           bounded streams, audit, and receipts
 service discovery              principal capability namespace
 ```
 
-Linux is the first broad compatibility personality because it admits existing
-software with the least rewriting. It is replaceable. A principal's identity,
-authority, state, applications, and history must survive replacement of the
-Linux distribution, runtime backend, host operating system, or physical
-machine.
+Linux is one compatibility personality because it admits existing software
+with little rewriting. It is replaceable and is not the native OS or the
+application model. A principal's identity, authority, state, applications,
+and history must survive replacement of the Linux distribution, runtime
+backend, host operating system, or physical machine.
 
 The system therefore follows this rule:
 
@@ -98,8 +107,9 @@ The system therefore follows this rule:
 > principal-scoped Astrid resources.
 
 This specification is the joining contract for the hosted runtime, Principal
-Store, Linux Realm, native component kernel, remote administration, distros,
-and the first universal-application proof using Hermes Agent.
+Store, compatibility Realms, native component kernel, remote administration,
+and distributions. Named application proofs such as Hermes are fixtures,
+not the joining identity of the architecture.
 
 The resource ownership model defines the locked native semantics beneath this
 product architecture. Where this document describes an application-facing
@@ -149,9 +159,13 @@ This specification does not:
   layout;
 - treat QEMU, TCG, or KVM success as bare-metal, no-host, or hypervisor
   machine authority, or as proof that host or hypervisor authority is
-  absent; or
+  absent;
 - treat hosted success as evidence that Astrid itself boots, owns the machine,
-  contains hardware effects, or satisfies a product release gate.
+  contains hardware effects, or satisfies a product release gate; or
+- make Hermes, BusyBox, Linux Realm, QEMU/q35, NVIDIA, or any named
+  workload, vendor, or device an architectural dependency, sequencing
+  authority, or the specialization target of a provider, resource, device,
+  or application contract.
 
 ### 2.3 Terminology
 
@@ -164,8 +178,8 @@ This specification does not:
   Astrid services, application closures, compatibility images, and policy
   inputs. It excludes secrets and principal-writable state.
 - **Realm:** a principal-owned compatibility environment implementing a guest
-  ABI over Astrid resources. Linux Realm is the first implementation, not the
-  definition.
+  ABI over Astrid resources. Linux Realm is one compatibility personality,
+  not the definition of Realm, the native OS, or the application model.
 - **Execution provider:** a typed service that admits, runs, supervises, and
   accounts for a workload without widening the caller's authority.
 - **Portal:** a typed boundary that maps a guest-visible effect to an
@@ -364,8 +378,9 @@ and infer authority from whatever files remain there.
 
 ## 7. Execution-provider contract
 
-The first internal execution-provider contract must be Linux-neutral even when
-Linux Realm is its first consumer. It requires at least:
+The internal execution-provider contract is workload-neutral. Linux Realm
+may be one consumer; the contract does not specialize to Linux, Hermes,
+BusyBox, NVIDIA, or any named vendor or device. It requires at least:
 
 ```text
 inspect(provider, stamped_context) -> capabilities and limits
@@ -621,7 +636,7 @@ only when its required semantics are a subset of those supplied by the selected
 provider. Provider names such as `linux`, `posix`, `filesystem`, or `std` are not
 sufficient evidence; executable conformance cases establish the claim.
 
-## 11. Agents are applications; Hermes is one reference workload
+## 11. Agents are applications
 
 Astrid does not make the agent. An agent may run inside Astrid as:
 
@@ -643,25 +658,30 @@ through reviewed generation replacement. Hackable and frozen are policies over
 the same composition format; neither requires a second runtime or authority
 model. Mutable principal state remains separate in both cases.
 
-Hermes is the first forcing workload because it combines Python, native wheels,
-HTTP model access, MCP, subprocesses, skills, persistent memory, SQLite,
-long-lived gateway operation, messaging ingress, and human terminal UX.
+Hermes is a non-normative fixture and falsifier because it combines Python,
+native wheels, HTTP model access, MCP, subprocesses, skills, persistent
+memory, SQLite, long-lived gateway operation, messaging ingress, and human
+terminal UX. That combination does not make Hermes product identity, a
+required dependency, or sequencing authority for provider, resource,
+device, or application contracts. Fixture slices below do not order
+Track N, Track R, or any other architecture track.
 
-Hermes is not the Astrid agent, a mandatory system service, or the template every
-native agent must copy. It is one compatibility and economics conformance
-workload.
+Hermes is not the Astrid agent, a mandatory system service, or the template
+every native agent must copy.
 
 ### 11.1 Sharing and isolation
 
-Astrid stores one immutable Hermes closure and one or more compatible Realm
-system generations. Each authorized principal receives a separate Hermes
-service instance and private `HERMES_HOME`. Immutable Python packages and image
-pages may be reused; configuration, sessions, databases, memory, skills,
-credentials, processes, and workspaces may not.
+When a distribution selects a Hermes fixture, Astrid stores one immutable
+Hermes closure and one or more compatible Realm system generations. Each
+authorized principal receives a separate Hermes service instance and private
+`HERMES_HOME`. Immutable Python packages and image pages may be reused;
+configuration, sessions, databases, memory, skills, credentials, processes,
+and workspaces may not. The same share-bytes-not-authority rule applies to
+any other application closure; the contract does not specialize to Hermes.
 
 ### 11.2 Initial compatibility closure
 
-The first Hermes closure must contain:
+A Hermes fixture closure, if selected, must contain:
 
 - an exact upstream Hermes revision;
 - Python within Hermes's declared supported range;
@@ -725,6 +745,9 @@ standalone Astrid System Generation. It may claim “Hermes is an Astrid service
 only when H3 passes natively. It may claim “multi-principal Hermes” only after
 the concurrent hostile isolation, accounting, restart, and revocation corpus
 passes on standalone Astrid. Hosted results remain differential evidence.
+Those gates falsify Hermes claims only. They do not gate portable provider,
+resource, device, or application contracts, and they do not order architecture
+tracks.
 
 ## 12. Human and operator access
 
@@ -946,12 +969,13 @@ The freestanding system uses:
 - the same principal namespace, execution-provider, portal, and receipt
   semantics.
 
-Linux runs as a Realm in user space. The first semantic backend is a
-recoverable RV64-in-WASM oracle plus a BusyBox argv fixture. A later
-hardware-virtualized backend may replace interpretation where available, but
-it must reproduce the same authority, storage, portal, lifecycle, checkpoint,
-and accounting contract. Neither QEMU nor a hosted Realm proves native machine
-authority.
+Linux runs as a Realm in user space. It is one compatibility personality,
+not the native OS. A recoverable RV64-in-WASM oracle plus a BusyBox argv
+fixture is one compatibility-backend falsifier for that personality. A
+hardware-virtualized backend may implement the same portable contract where
+available; BusyBox does not order that choice. Either backend must reproduce
+the same authority, storage, portal, lifecycle, checkpoint, and accounting
+contract. Neither QEMU nor a hosted Realm proves native machine authority.
 
 ### 14.3 Conformance corpus
 
@@ -989,9 +1013,11 @@ firmware / UEFI
 
 The sealed boot bundle contains enough authenticated provider artifacts to
 reach storage and recovery without conventional device-specific code in ring
-0. The initial experimental machine contract is x86-64 QEMU/KVM with UEFI,
+0. One experimental machine-contract fixture is x86-64 QEMU/KVM with UEFI,
 fixed memory, one CPU, serial diagnostics, APIC timer, and an explicit
-virtio/IOMMU topology. QEMU, TCG, and KVM runs establish only the named
+virtio/IOMMU topology. That named emulator example does not specialize
+portable provider, resource, or device contracts, and it does not order
+architecture tracks. QEMU, TCG, and KVM runs establish only the named
 emulator machine-contract enforcement boundary. They are functional and
 conformance evidence for that emulator contract. They never establish
 bare-metal, no-host, or hypervisor machine authority, DMA containment
@@ -1123,10 +1149,11 @@ current main. Historical storage-branch hashes are not merge instructions.
 Recover the preserved Linux Realm source and installable artifact from its
 owning repository/branch as inventory, not as a merge unit.
 [unicity-aos/aos-ce#77](https://github.com/unicity-aos/aos-ce/pull/77)
-(`b64d8d94`, draft, conflicting) is inventory only. The first semantic backend
-is a recoverable RV64-in-WASM oracle plus a BusyBox argv fixture, before Hermes
-and before native hardware virtualization. Inventory each capability and test
-against the execution-provider and portal contracts above. Preserve
+(`b64d8d94`, draft, conflicting) is inventory only. A recoverable
+RV64-in-WASM oracle plus a BusyBox argv fixture is one compatibility-backend
+falsifier; it does not order Hermes, hardware virtualization, or Track N.
+Inventory each capability and test against the execution-provider and portal
+contracts above. Preserve
 principal-resident, no-`host_process`, bounded `realm_shell`, durable home,
 workspace, signed worker, and intersection-authority properties.
 
@@ -1204,12 +1231,15 @@ independent tracks. Neither is a hidden prerequisite that freezes the other.
 
 - **Track N, native machine authority:** Stages B and C. Boot, protection,
   DMA mediation, recovery, and one Capsule on the freestanding kernel.
-- **Track R, first Realm semantic backend:** a recoverable RV64-in-WASM
-  oracle plus a BusyBox argv fixture, before Hermes and before native
-  hardware virtualization. AOS-CE PR #77 is inventory only.
+- **Track R, compatibility-Realm semantics:** portable execution-provider,
+  portal, isolation, accounting, and recovery contracts for guest ABIs.
+  A recoverable RV64-in-WASM oracle plus a BusyBox argv fixture is one
+  falsifier for those contracts, not the definition of Realm and not a
+  prerequisite for Track N, Hermes, or hardware virtualization. AOS-CE
+  PR #77 is inventory only.
 
-Hermes on standalone Astrid (Stage E) consumes both tracks. It is not the
-first Realm proof and not a native-kernel completion claim.
+Named application or device fixtures such as Hermes or NVIDIA do not order
+these tracks. Stage E is a fixture campaign, not architecture sequencing.
 
 ### Stage B: standalone boot and machine authority
 
@@ -1263,35 +1293,41 @@ principal Capsule operation without relying on a host daemon.
 - Prove the projection/action boundary with non-graphical fixtures; graphical
   presentation remains distribution/consumer-owned. Action handles are
   Astrid-issued; host presentation cannot mint or widen them.
-- On Track R, the first compatibility proof is the recoverable RV64-in-WASM
-  oracle plus BusyBox argv fixture; it does not wait for native HV or Hermes.
+- On Track R, prove the portable compatibility contracts. A recoverable
+  RV64-in-WASM oracle plus BusyBox argv fixture is one falsifier; it does
+  not wait for native HV or Hermes, and those fixtures do not wait for it.
 
 Exit gate: two principals run one immutable application closure on standalone
 Astrid with isolated state and resources; revocation and replacement fail
 closed.
 
-### Stage E: Linux Realm and Hermes on standalone Astrid
+### Stage E: named compatibility and application fixtures
 
-Hermes is a later forcing workload, not the first Realm semantic backend and
+Linux Realm and Hermes are fixtures, not architecture tracks. They do not
+order Track N or Track R, and those tracks do not wait on them. Hermes is
 not a native-kernel completion claim.
 
 - Supply compute, storage, clock, entropy, and portal providers from native
   domains.
-- Boot the Linux Realm as a principal-owned compatibility provider after the
-  Track R oracle and BusyBox fixture.
-- Produce the hermetic Hermes closure and execute H0/H1 through that Realm.
+- Boot Linux Realm as one principal-owned compatibility personality against
+  the portable Track R contract. BusyBox argv is a separate falsifier, not
+  a prerequisite for that personality.
+- If a distribution selects the Hermes fixture, produce its hermetic closure
+  and execute H0/H1 through an admitted compatibility provider.
 - Store, crash, recover, and receipt the resulting principal state.
 - Run the application conformance corpus and record exact cost evidence.
 
 Exit gate: released native artifacts and a reproducible standalone test prove
-the narrow “Hermes runs on standalone Astrid” claim. Hosted Hermes may
-separately satisfy an explicitly hosted-Astrid claim. That claim still does
-not prove native machine authority or first-owner enrollment.
+only the named fixture claim, such as “Hermes runs on standalone Astrid.”
+Hosted Hermes may separately satisfy an explicitly hosted-Astrid claim. That
+claim still does not prove native machine authority or first-owner
+enrollment, and it does not specialize portable contracts to Hermes.
 
 ### Stage F: services, administration, distribution, and recovery
 
-- Add Hermes tools, supervision, scale-to-zero, attachment, reconnect, and
-  current-authority refresh.
+- Add application-service tools, supervision, scale-to-zero, attachment,
+  reconnect, and current-authority refresh. Hermes may be one fixture for
+  those paths; the contracts do not specialize to it.
 - Complete authenticated CLI contexts, principal shell/attach, storage mounts,
   and optional SSH/SFTP adapters.
 - Let distributions and consuming hosts select product composition and
@@ -1382,9 +1418,13 @@ evidence, and a non-claim:
   Evidence: crash/reopen, quota, mount revocation, migration from released
   state. Non-claim: host path or `PathBuf` placement is not owner authority;
   volume is not a second ingest.
-- **Realm.** Claim: recovers the RV64-in-WASM oracle and BusyBox argv fixture.
-  Evidence: exact artifact digest and oracle/argv tests. Non-claim: Hermes,
-  native hardware virtualization, or AOS-CE PR #77 is not this proof.
+- **Realm.** Claim: a named compatibility backend enforces the portable
+  execution-provider, portal, isolation, accounting, and recovery contracts.
+  Evidence: exact artifact digest and tests on that named backend. A
+  recoverable RV64-in-WASM oracle plus BusyBox argv fixture is one such
+  falsifier and proves only that named conformance boundary. Non-claim:
+  Hermes, NVIDIA, native hardware virtualization, or AOS-CE PR #77 is not
+  this proof, and the fixture is not the Realm definition.
 
 ## 21. Open decisions
 
@@ -1397,8 +1437,8 @@ ruling. Frozen ceilings in this document are not reopened by the list:
 3. the network portal boundary: virtual NIC, socket proxy, protocol connector,
    or a measured combination;
 4. checkpoint granularity and application-consistency hooks;
-5. the first hardware-virtualized Realm backend and its conformance envelope,
-   which remains later than the RV64-in-WASM oracle and BusyBox argv fixture;
+5. which hardware-virtualized Realm backend, if any, is proven against the
+   portable contract; BusyBox argv does not order that choice;
 6. remaining measurements of physical-sharing implementations under the
    section 5.1 privacy ceiling; the ceiling itself is frozen; logical charges
    remain separate and do not close the named leakage classes;
@@ -1407,7 +1447,9 @@ ruling. Frozen ceilings in this document are not reopened by the list:
    schemas change;
 9. whether an Astrid Rust `std` target provides enough value after the native
    ABI stabilizes;
-10. which Hermes feature subset constitutes the first released closure;
+10. which Hermes feature subset, if a distribution selects that fixture,
+    constitutes a released closure; that choice does not specialize the
+    application contract;
 11. the minimum host-neutral object/action projection contract needed by
     presentation owners without adopting their component grammar; and
 12. the first-owner enrollment ceremony. Until it is specified and proven,
