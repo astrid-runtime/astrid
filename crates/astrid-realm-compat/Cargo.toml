@@ -14,6 +14,7 @@ default = []
 [dependencies]
 astrid-provider = { workspace = true }
 astrid-resource-types = { workspace = true }
+blake3 = { version = "1.5", default-features = false, features = ["pure"] }
 
 [dev-dependencies]
 astrid-projection = { workspace = true }
