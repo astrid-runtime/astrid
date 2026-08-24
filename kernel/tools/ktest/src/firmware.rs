@@ -1,8 +1,12 @@
-//! Portable firmware discovery for the M1 UEFI pflash pair.
+//! Firmware discovery for the M1 UEFI pflash pair.
 //!
-//! Homebrew paths are one candidate among several. Operators may override with
-//! `ASTRID_QEMU_FIRMWARE_CODE` / `ASTRID_QEMU_FIRMWARE_VARS`, or a directory via
-//! `ASTRID_QEMU_FIRMWARE_DIR`.
+//! Evidence on this host is executable-relative share, package-prefix (Homebrew
+//! is one prefix), well-known OVMF paths, and env overrides. QEMU 11.0.2 does
+//! not support `-print-datadir`; that probe is used only when the binary
+//! accepts it. This run does not claim datadir portability.
+//!
+//! Operators may override with `ASTRID_QEMU_FIRMWARE_CODE` /
+//! `ASTRID_QEMU_FIRMWARE_VARS`, or a directory via `ASTRID_QEMU_FIRMWARE_DIR`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -87,7 +91,7 @@ fn require_pair(code: PathBuf, vars: PathBuf) -> Result<Firmware> {
 /// Default search directories. Homebrew is included, never exclusive.
 pub fn lookup_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(dir) = qemu_print_datadir() {
+    if let Some(dir) = qemu_print_datadir_if_supported() {
         dirs.push(dir);
     }
     if let Some(dir) = qemu_share_next_to_binary() {
@@ -113,19 +117,25 @@ pub fn lookup_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-fn qemu_print_datadir() -> Option<PathBuf> {
-    let out = Command::new(crate::machine::QEMU_BIN)
-        .arg("-print-datadir")
-        .output()
-        .ok()?;
-    if !out.status.success() {
+/// Parse `-print-datadir` output. Unsupported binaries (QEMU 11.0.2 prints
+/// "invalid option") must yield `None`; that is not an error.
+pub fn datadir_from_qemu_output(success: bool, stdout: &str) -> Option<PathBuf> {
+    if !success {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let text = stdout.trim();
     if text.is_empty() {
         return None;
     }
     Some(PathBuf::from(text))
+}
+
+fn qemu_print_datadir_if_supported() -> Option<PathBuf> {
+    let out = Command::new(crate::machine::QEMU_BIN)
+        .arg("-print-datadir")
+        .output()
+        .ok()?;
+    datadir_from_qemu_output(out.status.success(), &String::from_utf8_lossy(&out.stdout))
 }
 
 fn qemu_share_next_to_binary() -> Option<PathBuf> {
@@ -256,6 +266,22 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("could not find a UEFI firmware pair")
+        );
+    }
+
+    #[test]
+    fn unsupported_print_datadir_is_skipped() {
+        assert_eq!(
+            datadir_from_qemu_output(
+                false,
+                "qemu-system-x86_64: -print-datadir: invalid option\n"
+            ),
+            None
+        );
+        assert_eq!(datadir_from_qemu_output(true, "   \n"), None);
+        assert_eq!(
+            datadir_from_qemu_output(true, "/usr/share/qemu\n"),
+            Some(PathBuf::from("/usr/share/qemu"))
         );
     }
 }
