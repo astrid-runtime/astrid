@@ -1,10 +1,10 @@
 //! Persistent per-user MCP gateway.
 //!
 //! The gateway owns one private Unix listener and one authenticated broker
-//! uplink per principal. Short-lived `mcp attach` processes register their
-//! principal, host project, and host-session id on that listener, then stream
-//! raw MCP bytes. The listener stays alive after an attach EOF; only the
-//! gateway process owns the daemon lifetime.
+//! uplink for the principal that minted its attach capability. Short-lived
+//! `mcp attach` processes register their host, project, and host-session id on
+//! that listener, then stream raw MCP bytes. The listener stays alive after an
+//! attach EOF; only the gateway process owns the daemon lifetime.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -17,6 +17,7 @@ use rmcp::service::{Peer, RoleServer};
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::time::timeout;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -31,12 +32,18 @@ use super::server::AstridMcpServer;
 /// an unbounded number of broker sessions.
 const MAX_ATTACHES: usize = 16;
 const MAX_REGISTRATION_BYTES: usize = 16 * 1024;
+/// A client must finish its tiny registration preface promptly. This is a
+/// protocol `DoS` ceiling, not an operator tuning knob: half-open sockets must
+/// not retain listener tasks indefinitely.
+const REGISTRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 type Client = Arc<Mutex<crate::socket_client::SocketClient>>;
 type Peers = Arc<Mutex<HashMap<String, Peer<RoleServer>>>>;
 
 struct GatewayState {
     daemon_root: PathBuf,
+    principal: astrid_core::PrincipalId,
+    hook_token: String,
     clients: Mutex<HashMap<String, Client>>,
     peers: Mutex<HashMap<String, Peers>>,
     permits: Mutex<HashMap<String, Arc<Semaphore>>>,
@@ -44,9 +51,11 @@ struct GatewayState {
 }
 
 impl GatewayState {
-    fn new(daemon_root: PathBuf) -> Self {
+    fn new(daemon_root: PathBuf, principal: astrid_core::PrincipalId, hook_token: String) -> Self {
         Self {
             daemon_root,
+            principal,
+            hook_token,
             clients: Mutex::new(HashMap::new()),
             peers: Mutex::new(HashMap::new()),
             permits: Mutex::new(HashMap::new()),
@@ -138,9 +147,14 @@ pub(crate) async fn run(principal: Option<&str>) -> Result<ExitCode> {
         .await
         .context("failed to ensure persistent Astrid daemon for MCP gateway")?;
 
-    let state = Arc::new(GatewayState::new(daemon_root));
-    // Warm the principal selected by `ready`/`gateway`; additional principals
-    // are opened lazily when their first attach registration arrives.
+    let hook_token = mint_hook_token();
+    let state = Arc::new(GatewayState::new(
+        daemon_root,
+        caller.clone(),
+        hook_token.clone(),
+    ));
+    // Warm the authenticated principal selected by `ready`/`gateway` before
+    // accepting any attach registration.
     state.client_for(&caller).await?;
 
     let socket_path = prepare_gateway_socket().await?;
@@ -149,11 +163,11 @@ pub(crate) async fn run(principal: Option<&str>) -> Result<ExitCode> {
     set_socket_mode(&socket_path)?;
     let ready = GatewayReady {
         version: 1,
-        // This is the bootstrap principal, not an allow-list. Attach
-        // registrations are independently validated and may select another
-        // principal channel on this same per-user gateway.
+        // The readiness record binds every attach to the authenticated
+        // process principal that bootstrapped this gateway.
         principal: caller.to_string(),
         pid: std::process::id(),
+        hook_token,
     };
     write_gateway_ready(&ready)?;
     info!(
@@ -187,7 +201,7 @@ async fn serve_attach(stream: UnixStream, state: Arc<GatewayState>) -> Result<()
     let (read_half, write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let registration = read_registration(&mut reader).await?;
-    let principal = super::lifecycle::resolve_principal(Some(&registration.principal))?;
+    let principal = authenticate_registration(&registration, &state)?;
     let workspace = validate_workspace(&registration.workspace_abs)?;
     let principal_key = principal.to_string();
     let host_session_id = registration.host_session_id.clone();
@@ -223,6 +237,15 @@ async fn read_registration<R>(reader: &mut BufReader<R>) -> Result<AttachRegistr
 where
     R: AsyncRead + Unpin,
 {
+    timeout(REGISTRATION_TIMEOUT, read_registration_inner(reader))
+        .await
+        .context("timed out reading MCP attach registration")?
+}
+
+async fn read_registration_inner<R>(reader: &mut BufReader<R>) -> Result<AttachRegistration>
+where
+    R: AsyncRead + Unpin,
+{
     let mut line = Vec::new();
     let mut terminated = false;
     for _ in 0..=MAX_REGISTRATION_BYTES {
@@ -248,10 +271,43 @@ where
         );
     }
     super::lifecycle::resolve_principal(Some(&registration.principal))?;
+    if registration.host.trim().is_empty() {
+        anyhow::bail!("MCP attach registration has an empty host");
+    }
+    if registration.host_session_id.trim().is_empty() {
+        anyhow::bail!("MCP attach registration has an empty host_session_id");
+    }
+    if registration.hook_token.trim().is_empty() {
+        anyhow::bail!("MCP attach registration is missing hook_token");
+    }
     validate_workspace(&registration.workspace_abs)?;
-    Uuid::parse_str(&registration.host_session_id)
-        .context("MCP attach registration has an invalid host_session_id")?;
     Ok(registration)
+}
+
+fn authenticate_registration(
+    registration: &AttachRegistration,
+    state: &GatewayState,
+) -> Result<astrid_core::PrincipalId> {
+    let principal = super::lifecycle::resolve_principal(Some(&registration.principal))?;
+    if principal != state.principal {
+        anyhow::bail!(
+            "MCP attach registration principal '{}' is not the authenticated gateway principal '{}'",
+            principal,
+            state.principal
+        );
+    }
+    if registration.hook_token != state.hook_token {
+        anyhow::bail!("MCP attach registration hook_token is invalid");
+    }
+    Ok(principal)
+}
+
+fn mint_hook_token() -> String {
+    format!(
+        "{}{}",
+        Uuid::new_v4().as_simple(),
+        Uuid::new_v4().as_simple()
+    )
 }
 
 fn validate_workspace(value: &str) -> Result<PathBuf> {
@@ -262,7 +318,8 @@ fn validate_workspace(value: &str) -> Result<PathBuf> {
     if !path.is_absolute() {
         anyhow::bail!("MCP attach workspace must be absolute: {value}");
     }
-    Ok(path)
+    std::fs::canonicalize(&path)
+        .with_context(|| format!("failed to resolve MCP attach workspace {value}"))
 }
 
 fn set_socket_mode(path: &Path) -> Result<()> {
@@ -276,17 +333,95 @@ fn set_socket_mode(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_ATTACHES, validate_workspace};
+    use std::path::PathBuf;
+
+    use super::{
+        GatewayState, MAX_ATTACHES, authenticate_registration, mint_hook_token, validate_workspace,
+    };
+    use crate::commands::mcp::lifecycle::AttachRegistration;
 
     #[test]
     fn attach_cap_is_bounded_per_principal_channel() {
         assert_eq!(MAX_ATTACHES, 16);
     }
 
+    #[tokio::test]
+    async fn attach_cap_rejects_the_seventeenth_live_session() {
+        let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
+        let state = GatewayState::new(
+            PathBuf::from("/runtime-home"),
+            principal,
+            "gateway-token".into(),
+        );
+        let mut permits = Vec::with_capacity(MAX_ATTACHES);
+        for _ in 0..MAX_ATTACHES {
+            permits.push(state.acquire("codex-code").await.expect("attach permit"));
+        }
+        assert!(state.acquire("codex-code").await.is_err());
+        drop(permits);
+        assert!(state.acquire("codex-code").await.is_ok());
+    }
+
     #[test]
     fn registration_workspace_must_be_absolute() {
-        assert!(validate_workspace("/tmp/project").is_ok());
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        assert!(validate_workspace(&workspace.path().to_string_lossy()).is_ok());
         assert!(validate_workspace("project").is_err());
         assert!(validate_workspace("").is_err());
+    }
+
+    #[test]
+    fn forged_principal_cannot_select_another_gateway_uplink() {
+        let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
+        let forged = astrid_core::PrincipalId::new("other-agent").expect("principal");
+        let state = GatewayState::new(
+            PathBuf::from("/runtime-home"),
+            principal,
+            "gateway-token".into(),
+        );
+        let registration = AttachRegistration {
+            version: super::ATTACH_REGISTRATION_VERSION,
+            principal: forged.to_string(),
+            host: "codex".into(),
+            workspace_abs: "/tmp".into(),
+            host_session_id: "thread-1".into(),
+            hook_token: "gateway-token".into(),
+        };
+        let error = authenticate_registration(&registration, &state)
+            .expect_err("forged principal must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("authenticated gateway principal")
+        );
+    }
+
+    #[test]
+    fn missing_hook_token_is_rejected_before_uplink_selection() {
+        let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
+        let state = GatewayState::new(
+            PathBuf::from("/runtime-home"),
+            principal.clone(),
+            "gateway-token".into(),
+        );
+        let registration = AttachRegistration {
+            version: super::ATTACH_REGISTRATION_VERSION,
+            principal: principal.to_string(),
+            host: "codex".into(),
+            workspace_abs: "/tmp".into(),
+            host_session_id: "thread-1".into(),
+            hook_token: String::new(),
+        };
+        let error = authenticate_registration(&registration, &state)
+            .expect_err("missing token must be rejected");
+        assert!(error.to_string().contains("hook_token is invalid"));
+    }
+
+    #[test]
+    fn hook_token_is_minted_with_each_gateway_start() {
+        let first = mint_hook_token();
+        let second = mint_hook_token();
+        assert_eq!(first.len(), 64);
+        assert_ne!(first, second);
     }
 }

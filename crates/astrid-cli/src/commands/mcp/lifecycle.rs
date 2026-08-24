@@ -21,17 +21,19 @@ pub(crate) const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const READY_POLL: Duration = Duration::from_millis(100);
 
 /// Versioned preface sent by every short-lived `mcp attach` process before it
-/// starts speaking MCP. The gateway uses this host-owned context to select
-/// the principal channel and preserve the project's `cwd://` root; it is not
-/// inferred from the gateway process cwd (which is the runtime home).
+/// starts speaking MCP. The gateway uses this host-owned context to preserve
+/// the project's `cwd://` root; it is not inferred from the gateway process
+/// cwd (which is the runtime home).
 pub(crate) const ATTACH_REGISTRATION_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AttachRegistration {
     pub version: u8,
     pub principal: String,
+    pub host: String,
     pub workspace_abs: String,
     pub host_session_id: String,
+    pub hook_token: String,
 }
 
 /// Ready metadata written atomically by the gateway.
@@ -40,6 +42,7 @@ pub(crate) struct GatewayReady {
     pub version: u8,
     pub principal: String,
     pub pid: u32,
+    pub hook_token: String,
 }
 
 /// Resolve a principal once at the command boundary.
@@ -82,7 +85,11 @@ pub(crate) fn read_gateway_ready() -> Result<Option<GatewayReady>> {
             path.display()
         )
     })?;
-    if record.version != 1 || record.pid == 0 || record.principal.is_empty() {
+    if record.version != 1
+        || record.pid == 0
+        || record.principal.is_empty()
+        || record.hook_token.is_empty()
+    {
         anyhow::bail!(
             "invalid MCP gateway readiness metadata at {}",
             path.display()
@@ -170,10 +177,16 @@ pub(crate) async fn wait_for_gateway(principal: &PrincipalId, format: &str) -> R
     let mut spawned = false;
     loop {
         if let Some(record) = read_gateway_ready()? {
-            // A gateway is one per user, not one per principal. Its ready
-            // record identifies the process that bootstrapped it, while each
-            // attach registration selects (and authenticates) its own
-            // principal channel.
+            // A gateway is bound to the principal that minted its ready
+            // record. Each attach must present that same process principal
+            // and the gateway's token before an uplink is selected.
+            if record.principal != principal.to_string() {
+                anyhow::bail!(
+                    "MCP gateway is already bound to principal '{}', not '{}'",
+                    record.principal,
+                    principal
+                );
+            }
             if UnixStream::connect(&socket).await.is_ok() {
                 emit_ready(format, &record)?;
                 return Ok(ExitCode::SUCCESS);
@@ -350,6 +363,7 @@ mod tests {
             version: 1,
             principal: "codex-code".into(),
             pid: 42,
+            hook_token: "test-hook-token".into(),
         };
         let body = serde_json::to_string(&record).expect("record json");
         assert_eq!(serde_json::from_str::<GatewayReady>(&body).unwrap(), record);
