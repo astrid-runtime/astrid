@@ -1,0 +1,89 @@
+//! Astrid native-kernel M1: boot to Rust ring 0 on the experimental QEMU
+//! machine contract, emit structured serial evidence, run negative-first
+//! self-tests, and halt with a machine-checkable outcome.
+//!
+//! The boot loader (`bootloader` crate) is replaceable scaffolding outside the
+//! covenant: paging-audit and self-test evidence check its output. This crate
+//! carries the charter §9 reserved name `astrid-native-kernel` and is distinct
+//! from the user-space `astrid-kernel` supervisor.
+//!
+//! M1 claims: UEFI q35 TCG boot, W^X of the kernel image, APIC timer delivery,
+//! fallible heap/frame pools. M1 does not claim KVM, virtio, IOMMU, DMA,
+//! dual-closure, A/B, first-owner, host-absence, or physical ownership.
+
+#![no_std]
+#![no_main]
+
+mod apic;
+mod entropy;
+mod gdt;
+mod interrupts;
+mod memory;
+mod serial;
+mod tests;
+mod trap;
+
+use bootloader_api::config::Mapping;
+use bootloader_api::{BootInfo, BootloaderConfig, entry_point};
+
+/// Fixed physical-memory mapping + 128 KiB kernel stack.
+static BOOTLOADER_CONFIG: BootloaderConfig = {
+    let mut config = BootloaderConfig::new_default();
+    config.mappings.physical_memory = Some(Mapping::FixedAddress(0xffff_8000_0000_0000));
+    config.kernel_stack_size = 128 * 1024;
+    config
+};
+
+entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
+
+fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    serial::init();
+    serial::ev_boot_entry();
+
+    let phys_offset = boot_info
+        .physical_memory_offset
+        .into_option()
+        .expect("bootloader did not provide a physical-memory offset");
+    memory::set_phys_offset(phys_offset);
+
+    let (regions, bytes) = memory::summarize(&boot_info.memory_regions);
+    serial::ev_mem_map(regions, bytes);
+    memory::init_frames(&boot_info.memory_regions);
+
+    let (rodata_nx_w, text_w, data_exec) = memory::audit_wx();
+    serial::ev_paging_wx(rodata_nx_w, text_w);
+
+    memory::init_heap();
+    serial::ev_heap_ready(memory::HEAP_SIZE);
+
+    gdt::init();
+    interrupts::init_idt();
+    serial::ev_idt_ready(interrupts::EXCEPTION_VECTORS);
+
+    apic::init(phys_offset);
+    serial::ev_apic_timer_start();
+
+    x86_64::instructions::interrupts::enable();
+    while interrupts::tick_count() < 8 {
+        x86_64::instructions::hlt();
+    }
+    x86_64::instructions::interrupts::disable();
+    apic::mask_timer();
+
+    serial::ev_entropy(entropy::seed());
+
+    let wx_ok = !rodata_nx_w && !text_w && !data_exec;
+    let tests_ok = tests::run_all(data_exec);
+    serial::ev_halt(wx_ok && tests_ok);
+    serial::exit_qemu(wx_ok && tests_ok);
+}
+
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    if let Some(location) = info.location() {
+        serial::ev_panic(format_args!("{}:{}", location.file(), location.line()));
+    } else {
+        serial::ev_panic(format_args!("unknown"));
+    }
+    serial::exit_qemu(false);
+}

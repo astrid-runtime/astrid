@@ -1,0 +1,169 @@
+//! COM1 serial writer and the machine-readable event bus.
+//!
+//! Every kernel event is exactly one JSON line over COM1 by polled TX. A single
+//! spinlock guards both the monotonic `seq` counter and the UART. Emission runs
+//! with interrupts disabled so an ISR can emit without deadlocking.
+
+use core::fmt::{self, Write};
+
+use spin::Mutex;
+use x86_64::instructions::interrupts::without_interrupts;
+use x86_64::instructions::port::Port;
+
+const COM1_BASE: u16 = 0x3F8;
+const DEBUG_EXIT_PORT: u16 = 0xF4;
+
+struct SerialPort {
+    base: u16,
+}
+
+impl SerialPort {
+    const fn new(base: u16) -> Self {
+        Self { base }
+    }
+
+    /// Program the UART for 115200 8N1, FIFOs on, interrupts off.
+    ///
+    /// # Safety
+    /// Touches COM1 I/O ports directly; must run once during early boot.
+    unsafe fn init(&self) {
+        let mut ier: Port<u8> = Port::new(self.base + 1);
+        let mut lcr: Port<u8> = Port::new(self.base + 3);
+        let mut dll: Port<u8> = Port::new(self.base);
+        let mut dlm: Port<u8> = Port::new(self.base + 1);
+        let mut fcr: Port<u8> = Port::new(self.base + 2);
+        let mut mcr: Port<u8> = Port::new(self.base + 4);
+        unsafe {
+            ier.write(0x00);
+            lcr.write(0x80);
+            dll.write(0x01);
+            dlm.write(0x00);
+            lcr.write(0x03);
+            fcr.write(0xC7);
+            mcr.write(0x0B);
+        }
+    }
+
+    #[inline]
+    fn write_byte(&self, byte: u8) {
+        let mut lsr: Port<u8> = Port::new(self.base + 5);
+        let mut thr: Port<u8> = Port::new(self.base);
+        unsafe {
+            while lsr.read() & 0x20 == 0 {}
+            thr.write(byte);
+        }
+    }
+}
+
+impl Write for SerialPort {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for &b in s.as_bytes() {
+            self.write_byte(b);
+        }
+        Ok(())
+    }
+}
+
+struct Emitter {
+    seq: u64,
+    port: SerialPort,
+}
+
+static EMITTER: Mutex<Emitter> = Mutex::new(Emitter {
+    seq: 0,
+    port: SerialPort::new(COM1_BASE),
+});
+
+pub fn init() {
+    without_interrupts(|| {
+        unsafe { EMITTER.lock().port.init() };
+    });
+}
+
+fn emit(args: fmt::Arguments) {
+    without_interrupts(|| {
+        let mut e = EMITTER.lock();
+        let seq = e.seq;
+        e.seq = seq.wrapping_add(1);
+        let _ = writeln!(e.port, "{{\"seq\":{seq},{args}}}");
+    });
+}
+
+pub fn ev_boot_entry() {
+    emit(format_args!("\"ev\":\"boot.entry\""));
+}
+
+pub fn ev_mem_map(usable_regions: usize, usable_bytes: u64) {
+    emit(format_args!(
+        "\"ev\":\"mem.map\",\"usable_regions\":{usable_regions},\"usable_bytes\":{usable_bytes}"
+    ));
+}
+
+pub fn ev_mem_truncated(ignored_frames: u64) {
+    emit(format_args!(
+        "\"ev\":\"mem.truncated\",\"ignored_frames\":{ignored_frames}"
+    ));
+}
+
+pub fn ev_paging_wx(rodata_nx_w: bool, text_w: bool) {
+    emit(format_args!(
+        "\"ev\":\"paging.wx\",\"rodata_nx_w\":{rodata_nx_w},\"text_w\":{text_w}"
+    ));
+}
+
+pub fn ev_heap_ready(bytes: usize) {
+    emit(format_args!("\"ev\":\"heap.ready\",\"bytes\":{bytes}"));
+}
+
+pub fn ev_idt_ready(vectors: u32) {
+    emit(format_args!("\"ev\":\"idt.ready\",\"vectors\":{vectors}"));
+}
+
+pub fn ev_apic_timer_start() {
+    emit(format_args!("\"ev\":\"apic.timer.start\""));
+}
+
+pub fn ev_apic_timer_tick(n: u32) {
+    emit(format_args!("\"ev\":\"apic.timer.tick\",\"n\":{n}"));
+}
+
+pub fn ev_entropy(seeded: bool) {
+    if seeded {
+        emit(format_args!(
+            "\"ev\":\"entropy.seeded\",\"source\":\"rdrand\""
+        ));
+    } else {
+        emit(format_args!("\"ev\":\"entropy.unavailable\""));
+    }
+}
+
+pub fn ev_fault(vector: u8, code: u64, rip: u64) {
+    emit(format_args!(
+        "\"ev\":\"fault\",\"vector\":{vector},\"code\":{code},\"rip\":\"{rip:#x}\""
+    ));
+}
+
+pub fn ev_test(name: &'static str, pass: bool) {
+    let ev = if pass { "test.pass" } else { "test.fail" };
+    emit(format_args!("\"ev\":\"{ev}\",\"name\":\"{name}\""));
+}
+
+pub fn ev_halt(ok: bool) {
+    let outcome = if ok { "ok" } else { "fault" };
+    emit(format_args!("\"ev\":\"halt\",\"outcome\":\"{outcome}\""));
+}
+
+pub fn ev_panic(args: fmt::Arguments) {
+    emit(format_args!("\"ev\":\"panic\",\"where\":\"{args}\""));
+}
+
+/// Write the isa-debug-exit port and hlt forever. QEMU maps written value `v`
+/// to process exit code `(v << 1) | 1`: 0x10 -> 33 (success), 0x11 -> 35.
+pub fn exit_qemu(success: bool) -> ! {
+    let value: u32 = if success { 0x10 } else { 0x11 };
+    let mut port: Port<u32> = Port::new(DEBUG_EXIT_PORT);
+    unsafe { port.write(value) };
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
