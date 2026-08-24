@@ -795,6 +795,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "astrid-provider"
+version = "0.10.4"
+dependencies = [
+ "astrid-projection",
+ "astrid-resource-types",
+]
+
+[[package]]
 name = "astrid-resource-types"
 version = "0.10.4"
 dependencies = [
