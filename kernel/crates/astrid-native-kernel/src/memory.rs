@@ -191,6 +191,14 @@ extern "C" fn text_probe() {
     core::hint::black_box(());
 }
 
+/// True if `page` is a canonical address whose leaf is present (readable).
+pub fn page_present_readable(page: u64) -> bool {
+    let Ok(addr) = VirtAddr::try_new(page) else {
+        return false;
+    };
+    leaf_flags(addr).is_some_and(|f| f.contains(PageTableFlags::PRESENT))
+}
+
 fn leaf_flags(addr: VirtAddr) -> Option<PageTableFlags> {
     let (l4_frame, _) = Cr3::read();
     let mut table_phys = l4_frame.start_address().as_u64();

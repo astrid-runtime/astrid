@@ -160,9 +160,9 @@ pub fn ev_closure_sysgen(floor: u64, id: &str) {
     ));
 }
 
-pub fn ev_closure_bound(kernel_id: &str, sysgen_id: &str) {
+pub fn ev_closure_bound(kernel_floor: u64, sysgen_floor: u64, kernel_id: &str, sysgen_id: &str) {
     emit(format_args!(
-        "\"ev\":\"closure.bound\",\"kernel_id\":\"{kernel_id}\",\"sysgen_id\":\"{sysgen_id}\""
+        "\"ev\":\"closure.bound\",\"kernel_floor\":{kernel_floor},\"sysgen_floor\":{sysgen_floor},\"kernel_id\":\"{kernel_id}\",\"sysgen_id\":\"{sysgen_id}\""
     ));
 }
 

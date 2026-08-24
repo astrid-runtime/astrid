@@ -4,6 +4,9 @@
 pub const EMPTY_SYSGEN: &[u8] = b"astrid.sysgen.empty.v1";
 
 /// Current emulator-stub generation floor. Not an A/B selector.
+///
+/// This value is the emulator [`crate::TrustedPolicy`] minimum for both
+/// closures. Verification uses the policy minima, never the table header.
 pub const CURRENT_FLOOR: GenerationFloor = GenerationFloor(1);
 
 pub const MAGIC: &[u8; 8] = b"ASTRIDDC";
@@ -110,7 +113,8 @@ pub struct ClosureArtifact {
     pub signature: [u8; 64],
 }
 
-/// Distinct verifying keys bound to each closure kind.
+/// Untrusted key advertisement in the table header. Verification ignores this
+/// and uses [`crate::TrustedPolicy`] instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DualClosureKeys {
     pub kernel_bootstrap: [u8; 32],
@@ -118,6 +122,9 @@ pub struct DualClosureKeys {
 }
 
 /// Decoded table before cryptographic acceptance.
+///
+/// `min_floor` and `keys` are untrusted header copies. They must not choose
+/// verifying keys or rollback policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DualClosureTable {
     pub min_floor: GenerationFloor,
@@ -126,12 +133,13 @@ pub struct DualClosureTable {
     pub sysgen: ClosureArtifact,
 }
 
-/// Identities accepted after verification.
+/// Identities accepted after verification. Floors stay independent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BoundIdentities {
     pub kernel_bootstrap: MeasuredIdentity,
     pub system_generation: MeasuredIdentity,
-    pub floor: GenerationFloor,
+    pub kernel_floor: GenerationFloor,
+    pub sysgen_floor: GenerationFloor,
 }
 
 impl BoundIdentities {

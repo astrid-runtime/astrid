@@ -1,12 +1,14 @@
 //! Host tool: wrap a kernel ELF into a bootable UEFI disk image.
 //!
 //! Usage: `kimage <kernel-elf> <output-image>`. Signs a kernel/bootstrap
-//! closure and a distinct empty System Generation, embeds them as a bootloader
-//! ramdisk (memory table, not a guest filesystem), and writes the same bytes
-//! next to the image as `<output>.closures`.
+//! closure and a distinct empty System Generation with host-only fixture
+//! *private* keys, embeds them as a bootloader ramdisk (memory table, not a
+//! guest filesystem), and writes the same bytes next to the image as
+//! `<output>.closures`.
 //!
-//! The boot loader is replaceable scaffolding outside the covenant. Dual-closure
-//! authentication is this tool plus ring-0 verify, not firmware ownership.
+//! The boot loader is replaceable scaffolding outside the covenant. Ring 0
+//! verifies against compiled fixture public keys. This is not firmware
+//! ownership, self-measurement, or authenticated loader handoff.
 
 use std::path::PathBuf;
 

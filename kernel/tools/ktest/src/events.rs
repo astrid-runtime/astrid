@@ -1,18 +1,34 @@
-//! Parse JSONL serial events and assert the M1 evidence contract.
+//! Parse JSONL serial events and assert the combined boot evidence contract.
 //!
-//! Sequence numbers must be contiguous and strictly increasing from 0.
-//! `halt` is terminal. Any `test.fail`, including unknown future names, fails.
-//! Required M1 events must appear exactly once.
-//! Dual-closure binding is a separate assertion (`assert_dual_closure`).
+//! One sequence covers boot, both closure identities/floors, bound, M1
+//! milestones, and terminal halt. Sequence numbers must be contiguous and
+//! strictly increasing from 0. `halt` is terminal. Any `test.fail`, including
+//! unknown future names, fails. Required events must appear exactly once.
+//! Reordered closure/M1 events fail.
 
 use serde_json::Value;
 
 const REQUIRED_ONCE: &[&str] = &[
     "boot.entry",
+    "idt.ready",
+    "closure.kernel",
+    "closure.sysgen",
+    "closure.bound",
     "mem.map",
     "paging.wx",
     "heap.ready",
+    "halt",
+];
+
+const COMBINED_ORDER: &[&str] = &[
+    "boot.entry",
     "idt.ready",
+    "closure.kernel",
+    "closure.sysgen",
+    "closure.bound",
+    "mem.map",
+    "paging.wx",
+    "heap.ready",
     "halt",
 ];
 
@@ -24,6 +40,14 @@ const REQUIRED_PASSES: &[&str] = &[
     "frame_unique",
     "frame_exhaustion",
 ];
+
+/// Loader-measured identities and independent floors expected on serial.
+pub struct ExpectedClosures<'a> {
+    pub kernel_id_hex: &'a str,
+    pub sysgen_id_hex: &'a str,
+    pub kernel_floor: u64,
+    pub sysgen_floor: u64,
+}
 
 pub fn parse_events(serial: &str) -> Vec<Value> {
     serial
@@ -95,16 +119,21 @@ fn test_pass_count(events: &[Value], name: &str) -> usize {
         .count()
 }
 
-/// Assert M1 boot/W^X/timer/self-test evidence. Returns true iff all pass.
-pub fn assert_m1(events: &[Value], exit_code: Option<i32>, expect_exit: i32) -> bool {
-    let mut ok = true;
+/// Combined boot + dual-closure + M1 assertion. Returns true iff all pass.
+pub fn assert_boot(
+    events: &[Value],
+    exit_code: Option<i32>,
+    expect_exit: i32,
+    closures: &ExpectedClosures<'_>,
+) -> bool {
     println!("\n== assertions ==");
+    let mut ok = true;
     ok &= check(
         "seq contiguous strictly increasing from 0",
         contiguous_seq_from_zero(events),
     );
     ok &= check(
-        "required M1 events present exactly once",
+        "required events present exactly once",
         required_events_once(events),
     );
     ok &= check(
@@ -112,18 +141,8 @@ pub fn assert_m1(events: &[Value], exit_code: Option<i32>, expect_exit: i32) -> 
         events.first().map(ev_name) == Some("boot.entry"),
     );
     ok &= check(
-        "boot.entry<mem.map<paging.wx<heap.ready<idt.ready<halt",
-        ordered(
-            events,
-            &[
-                "boot.entry",
-                "mem.map",
-                "paging.wx",
-                "heap.ready",
-                "idt.ready",
-                "halt",
-            ],
-        ),
+        "boot.entry<idt.ready<closure.kernel<closure.sysgen<closure.bound<mem.map<paging.wx<heap.ready<halt",
+        ordered(events, COMBINED_ORDER),
     );
     ok &= check("halt is terminal", halt_is_terminal(events));
     ok &= check(
@@ -144,6 +163,47 @@ pub fn assert_m1(events: &[Value], exit_code: Option<i32>, expect_exit: i32) -> 
     ok &= check(
         &format!("QEMU exit code == {expect_exit}"),
         exit_code == Some(expect_exit),
+    );
+    ok &= closure_holds(events, closures);
+    ok
+}
+
+fn closure_holds(events: &[Value], closures: &ExpectedClosures<'_>) -> bool {
+    let mut ok = true;
+    ok &= check(
+        "no closure.reject",
+        count_named(events, "closure.reject") == 0,
+    );
+    let kernel_ev = events.iter().find(|e| ev_name(e) == "closure.kernel");
+    let sysgen_ev = events.iter().find(|e| ev_name(e) == "closure.sysgen");
+    let bound_ev = events.iter().find(|e| ev_name(e) == "closure.bound");
+    ok &= check(
+        "closure.kernel kind, floor, and id match loader",
+        kernel_ev.is_some_and(|e| {
+            e.get("kind").and_then(Value::as_str) == Some("kernel-bootstrap")
+                && e.get("floor").and_then(Value::as_u64) == Some(closures.kernel_floor)
+                && e.get("id").and_then(Value::as_str) == Some(closures.kernel_id_hex)
+        }),
+    );
+    ok &= check(
+        "closure.sysgen empty, floor, and id match empty sysgen",
+        sysgen_ev.is_some_and(|e| {
+            e.get("kind").and_then(Value::as_str) == Some("system-generation")
+                && e.get("empty") == Some(&Value::Bool(true))
+                && e.get("floor").and_then(Value::as_u64) == Some(closures.sysgen_floor)
+                && e.get("id").and_then(Value::as_str) == Some(closures.sysgen_id_hex)
+        }),
+    );
+    ok &= check(
+        "closure.bound keeps independent floors and distinct identities",
+        bound_ev.is_some_and(|e| {
+            e.get("kernel_floor").and_then(Value::as_u64) == Some(closures.kernel_floor)
+                && e.get("sysgen_floor").and_then(Value::as_u64) == Some(closures.sysgen_floor)
+                && e.get("kernel_id").and_then(Value::as_str) == Some(closures.kernel_id_hex)
+                && e.get("sysgen_id").and_then(Value::as_str) == Some(closures.sysgen_id_hex)
+                && closures.kernel_id_hex != closures.sysgen_id_hex
+                && e.get("floor").is_none()
+        }),
     );
     ok
 }
@@ -172,68 +232,6 @@ fn self_tests_hold(events: &[Value]) -> bool {
     ok
 }
 
-/// Assert dual-closure serial evidence against loader-measured identities.
-pub fn assert_dual_closure(events: &[Value], kernel_id_hex: &str, sysgen_id_hex: &str) -> bool {
-    let mut ok = true;
-    println!("\n== dual-closure assertions ==");
-    ok &= check(
-        "exactly one closure.kernel",
-        count_named(events, "closure.kernel") == 1,
-    );
-    ok &= check(
-        "exactly one closure.sysgen",
-        count_named(events, "closure.sysgen") == 1,
-    );
-    ok &= check(
-        "exactly one closure.bound",
-        count_named(events, "closure.bound") == 1,
-    );
-    ok &= check(
-        "no closure.reject",
-        count_named(events, "closure.reject") == 0,
-    );
-    ok &= check(
-        "boot.entry<closure.kernel<closure.sysgen<closure.bound<halt",
-        ordered(
-            events,
-            &[
-                "boot.entry",
-                "closure.kernel",
-                "closure.sysgen",
-                "closure.bound",
-                "halt",
-            ],
-        ),
-    );
-    let kernel_ev = events.iter().find(|e| ev_name(e) == "closure.kernel");
-    let sysgen_ev = events.iter().find(|e| ev_name(e) == "closure.sysgen");
-    let bound_ev = events.iter().find(|e| ev_name(e) == "closure.bound");
-    ok &= check(
-        "closure.kernel kind=kernel-bootstrap and id matches loader",
-        kernel_ev.is_some_and(|e| {
-            e.get("kind").and_then(Value::as_str) == Some("kernel-bootstrap")
-                && e.get("id").and_then(Value::as_str) == Some(kernel_id_hex)
-        }),
-    );
-    ok &= check(
-        "closure.sysgen empty=true and id matches empty sysgen",
-        sysgen_ev.is_some_and(|e| {
-            e.get("kind").and_then(Value::as_str) == Some("system-generation")
-                && e.get("empty") == Some(&Value::Bool(true))
-                && e.get("id").and_then(Value::as_str) == Some(sysgen_id_hex)
-        }),
-    );
-    ok &= check(
-        "closure.bound identities match and are distinct",
-        bound_ev.is_some_and(|e| {
-            e.get("kernel_id").and_then(Value::as_str) == Some(kernel_id_hex)
-                && e.get("sysgen_id").and_then(Value::as_str) == Some(sysgen_id_hex)
-                && kernel_id_hex != sysgen_id_hex
-        }),
-    );
-    ok
-}
-
 fn ordered(events: &[Value], names: &[&str]) -> bool {
     let mut last = -1i64;
     for name in names {
@@ -249,36 +247,60 @@ fn ordered(events: &[Value], names: &[&str]) -> bool {
 mod tests {
     use super::*;
 
+    fn kernel_id() -> String {
+        "aa".repeat(32)
+    }
+
+    fn sysgen_id() -> String {
+        "bb".repeat(32)
+    }
+
+    fn expected() -> ExpectedClosures<'static> {
+        ExpectedClosures {
+            kernel_id_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            sysgen_id_hex: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            kernel_floor: 1,
+            sysgen_floor: 1,
+        }
+    }
+
     fn passing_serial() -> String {
-        let mut out = String::from(
-            r#"{"seq":0,"ev":"boot.entry"}
-{"seq":1,"ev":"mem.map","usable_regions":1,"usable_bytes":1}
-{"seq":2,"ev":"paging.wx","rodata_nx_w":false,"text_w":false}
-{"seq":3,"ev":"heap.ready","bytes":1048576}
-{"seq":4,"ev":"idt.ready","vectors":32}
-"#,
-        );
-        for n in 1..=8 {
-            out.push_str(&format!(
-                "{{\"seq\":{},\"ev\":\"apic.timer.tick\",\"n\":{n}}}\n",
-                4 + n
-            ));
-        }
-        let mut seq = 13u64;
-        for name in REQUIRED_PASSES {
-            out.push_str(&format!(
-                "{{\"seq\":{seq},\"ev\":\"test.pass\",\"name\":\"{name}\"}}\n"
-            ));
+        passing_serial_with(&kernel_id(), &sysgen_id(), 1, 1)
+    }
+
+    fn passing_serial_with(kernel: &str, sysgen: &str, kfloor: u64, sfloor: u64) -> String {
+        let mut seq = 0u64;
+        let mut out = String::new();
+        let mut ev = |payload: String| {
+            out.push_str(&format!("{{\"seq\":{seq},{payload}}}\n"));
             seq += 1;
-        }
-        out.push_str(&format!(
-            "{{\"seq\":{seq},\"ev\":\"halt\",\"outcome\":\"ok\"}}\n"
+        };
+        ev("\"ev\":\"boot.entry\"".into());
+        ev("\"ev\":\"idt.ready\",\"vectors\":32".into());
+        ev(format!(
+            "\"ev\":\"closure.kernel\",\"kind\":\"kernel-bootstrap\",\"floor\":{kfloor},\"id\":\"{kernel}\""
         ));
+        ev(format!(
+            "\"ev\":\"closure.sysgen\",\"kind\":\"system-generation\",\"floor\":{sfloor},\"id\":\"{sysgen}\",\"empty\":true"
+        ));
+        ev(format!(
+            "\"ev\":\"closure.bound\",\"kernel_floor\":{kfloor},\"sysgen_floor\":{sfloor},\"kernel_id\":\"{kernel}\",\"sysgen_id\":\"{sysgen}\""
+        ));
+        ev("\"ev\":\"mem.map\",\"usable_regions\":1,\"usable_bytes\":1".into());
+        ev("\"ev\":\"paging.wx\",\"rodata_nx_w\":false,\"text_w\":false".into());
+        ev("\"ev\":\"heap.ready\",\"bytes\":1048576".into());
+        for n in 1..=8 {
+            ev(format!("\"ev\":\"apic.timer.tick\",\"n\":{n}"));
+        }
+        for name in REQUIRED_PASSES {
+            ev(format!("\"ev\":\"test.pass\",\"name\":\"{name}\""));
+        }
+        ev("\"ev\":\"halt\",\"outcome\":\"ok\"".into());
         out
     }
 
-    fn passing_events() -> Vec<Value> {
-        parse_events(&passing_serial())
+    fn assert_ok(serial: &str) -> bool {
+        assert_boot(&parse_events(serial), Some(33), 33, &expected())
     }
 
     #[test]
@@ -290,20 +312,35 @@ mod tests {
     }
 
     #[test]
-    fn m1_fixture_passes() {
-        assert!(assert_m1(&passing_events(), Some(33), 33));
+    fn combined_fixture_passes() {
+        assert!(assert_ok(&passing_serial()));
+    }
+
+    #[test]
+    fn mixed_floors_on_bound_are_independent() {
+        let kernel = kernel_id();
+        let sysgen = sysgen_id();
+        let serial = passing_serial_with(&kernel, &sysgen, 1, 2);
+        let closures = ExpectedClosures {
+            kernel_id_hex: &kernel,
+            sysgen_id_hex: &sysgen,
+            kernel_floor: 1,
+            sysgen_floor: 2,
+        };
+        assert!(assert_boot(&parse_events(&serial), Some(33), 33, &closures));
+    }
+
+    #[test]
+    fn collapsed_bound_floor_fails() {
+        let serial =
+            passing_serial().replace("\"kernel_floor\":1,\"sysgen_floor\":1", "\"floor\":1");
+        assert!(!assert_ok(&serial));
     }
 
     #[test]
     fn wx_violation_fails() {
-        let serial = r#"{"seq":0,"ev":"boot.entry"}
-{"seq":1,"ev":"mem.map","usable_regions":1,"usable_bytes":1}
-{"seq":2,"ev":"paging.wx","rodata_nx_w":true,"text_w":false}
-{"seq":3,"ev":"heap.ready","bytes":1}
-{"seq":4,"ev":"idt.ready","vectors":32}
-{"seq":5,"ev":"halt","outcome":"ok"}"#;
-        let events = parse_events(serial);
-        assert!(!assert_m1(&events, Some(33), 33));
+        let serial = passing_serial().replace("\"rodata_nx_w\":false", "\"rodata_nx_w\":true");
+        assert!(!assert_ok(&serial));
     }
 
     #[test]
@@ -312,109 +349,72 @@ mod tests {
         let duplicate = passing_serial().replacen("\"seq\":5,", "\"seq\":4,", 1);
         let reorder = passing_serial().replacen("\"seq\":5,", "\"seq\":7,", 1);
         let reorder = reorder.replacen("\"seq\":6,", "\"seq\":5,", 1);
-        assert!(
-            !assert_m1(&parse_events(&gap), Some(33), 33),
-            "gap must fail"
-        );
-        assert!(
-            !assert_m1(&parse_events(&duplicate), Some(33), 33),
-            "duplicate seq must fail"
-        );
-        assert!(
-            !assert_m1(&parse_events(&reorder), Some(33), 33),
-            "reordered seq must fail"
-        );
+        assert!(!assert_ok(&gap), "gap must fail");
+        assert!(!assert_ok(&duplicate), "duplicate seq must fail");
+        assert!(!assert_ok(&reorder), "reordered seq must fail");
     }
 
     #[test]
     fn post_halt_event_fails() {
         let mut serial = passing_serial();
-        serial.push_str(r#"{"seq":20,"ev":"apic.timer.tick","n":9}"#);
+        serial.push_str(r#"{"seq":99,"ev":"apic.timer.tick","n":9}"#);
         serial.push('\n');
-        assert!(!assert_m1(&parse_events(&serial), Some(33), 33));
+        assert!(!assert_ok(&serial));
     }
 
     #[test]
     fn test_fail_future_gate_fails() {
-        let halt = "{\"seq\":19,\"ev\":\"halt\",\"outcome\":\"ok\"}\n";
-        let injected = concat!(
-            "{\"seq\":19,\"ev\":\"test.fail\",\"name\":\"future_gate\"}\n",
-            "{\"seq\":20,\"ev\":\"halt\",\"outcome\":\"ok\"}\n",
+        let serial = passing_serial().replace(
+            "\"ev\":\"halt\",\"outcome\":\"ok\"",
+            "\"ev\":\"test.fail\",\"name\":\"future_gate\"}\n{\"seq\":99,\"ev\":\"halt\",\"outcome\":\"ok\"",
         );
-        let serial = passing_serial().replace(halt, injected);
         assert!(serial.contains("future_gate"));
-        assert!(!assert_m1(&parse_events(&serial), Some(33), 33));
+        assert!(!assert_ok(&serial));
     }
 
     #[test]
     fn duplicate_or_missing_required_event_fails() {
-        let duplicate_boot = passing_serial().replacen(
-            "{\"seq\":1,\"ev\":\"mem.map\"",
-            "{\"seq\":1,\"ev\":\"boot.entry\"",
-            1,
-        );
-        let missing_map = passing_serial().replacen(
-            "{\"seq\":1,\"ev\":\"mem.map\",\"usable_regions\":1,\"usable_bytes\":1}",
-            "{\"seq\":1,\"ev\":\"apic.timer.start\"}",
-            1,
-        );
-        assert!(!assert_m1(&parse_events(&duplicate_boot), Some(33), 33));
-        assert!(!assert_m1(&parse_events(&missing_map), Some(33), 33));
-    }
-
-    fn dual_serial(kernel_id: &str, sysgen_id: &str) -> String {
-        let mut out = String::new();
-        out.push_str("{\"seq\":0,\"ev\":\"boot.entry\"}\n");
-        out.push_str(&format!(
-            "{{\"seq\":1,\"ev\":\"closure.kernel\",\"kind\":\"kernel-bootstrap\",\"floor\":1,\"id\":\"{kernel_id}\"}}\n"
-        ));
-        out.push_str(&format!(
-            "{{\"seq\":2,\"ev\":\"closure.sysgen\",\"kind\":\"system-generation\",\"floor\":1,\"id\":\"{sysgen_id}\",\"empty\":true}}\n"
-        ));
-        out.push_str(&format!(
-            "{{\"seq\":3,\"ev\":\"closure.bound\",\"kernel_id\":\"{kernel_id}\",\"sysgen_id\":\"{sysgen_id}\"}}\n"
-        ));
-        out.push_str("{\"seq\":4,\"ev\":\"mem.map\",\"usable_regions\":1,\"usable_bytes\":1}\n");
-        out.push_str("{\"seq\":5,\"ev\":\"paging.wx\",\"rodata_nx_w\":false,\"text_w\":false}\n");
-        out.push_str("{\"seq\":6,\"ev\":\"heap.ready\",\"bytes\":1}\n");
-        out.push_str("{\"seq\":7,\"ev\":\"idt.ready\",\"vectors\":32}\n");
-        out.push_str("{\"seq\":8,\"ev\":\"halt\",\"outcome\":\"ok\"}\n");
-        out
+        let duplicate_boot =
+            passing_serial().replacen("\"ev\":\"mem.map\"", "\"ev\":\"boot.entry\"", 1);
+        let missing_map =
+            passing_serial().replacen("\"ev\":\"mem.map\"", "\"ev\":\"apic.timer.start\"", 1);
+        assert!(!assert_ok(&duplicate_boot));
+        assert!(!assert_ok(&missing_map));
     }
 
     #[test]
-    fn dual_closure_binding_matches_loader_identities() {
-        let kernel = "aa".repeat(32);
-        let sysgen = "bb".repeat(32);
-        let events = parse_events(&dual_serial(&kernel, &sysgen));
-        assert!(assert_dual_closure(&events, &kernel, &sysgen));
+    fn reordered_closure_and_m1_events_fail() {
+        let serial = passing_serial().replace("closure.bound", "tmp.bound");
+        let serial = serial.replace("mem.map", "closure.bound");
+        let serial = serial.replace("tmp.bound", "mem.map");
+        assert!(!assert_ok(&serial), "closure.bound after mem.map must fail");
+        let serial = passing_serial().replace("closure.kernel", "tmp.kernel");
+        let serial = serial.replace("paging.wx", "closure.kernel");
+        let serial = serial.replace("tmp.kernel", "paging.wx");
+        assert!(
+            !assert_ok(&serial),
+            "closure.kernel after paging.wx must fail"
+        );
     }
 
     #[test]
     fn dual_closure_reject_or_mismatch_fails() {
-        let kernel = "aa".repeat(32);
-        let sysgen = "bb".repeat(32);
-        let events = parse_events(&dual_serial(&kernel, &sysgen));
-        assert!(!assert_dual_closure(&events, &sysgen, &kernel));
-        let mut rejected = dual_serial(&kernel, &sysgen);
-        rejected = rejected.replace("closure.bound", "closure.reject");
-        assert!(!assert_dual_closure(
-            &parse_events(&rejected),
-            &kernel,
-            &sysgen
-        ));
+        let events = parse_events(&passing_serial());
+        let swapped = ExpectedClosures {
+            kernel_id_hex: expected().sysgen_id_hex,
+            sysgen_id_hex: expected().kernel_id_hex,
+            kernel_floor: 1,
+            sysgen_floor: 1,
+        };
+        assert!(!assert_boot(&events, Some(33), 33, &swapped));
+        let rejected = passing_serial().replace("closure.bound", "closure.reject");
+        assert!(!assert_ok(&rejected));
     }
 
     #[test]
     fn dual_closure_missing_bound_fails() {
-        let kernel = "aa".repeat(32);
-        let sysgen = "bb".repeat(32);
-        let serial = dual_serial(&kernel, &sysgen)
-            .replace("\"ev\":\"closure.bound\"", "\"ev\":\"closure.kernel\"");
-        assert!(!assert_dual_closure(
-            &parse_events(&serial),
-            &kernel,
-            &sysgen
-        ));
+        let serial =
+            passing_serial().replace("\"ev\":\"closure.bound\"", "\"ev\":\"closure.kernel\"");
+        assert!(!assert_ok(&serial));
     }
 }

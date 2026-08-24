@@ -2,9 +2,9 @@
 //! plus the dual-closure stub.
 //!
 //! Builds the ring-0 kernel, wraps it into a UEFI image twice (determinism
-//! measurement), boots under explicit TCG, and asserts M1 serial evidence
-//! separately from dual-closure binding. Determinism FAIL is reported and
-//! does not gate boot assertions.
+//! measurement), boots under explicit TCG, and asserts one combined serial
+//! sequence (boot, both closure floors/identities, bound, M1, halt).
+//! Determinism FAIL is reported and does not gate boot assertions.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -12,9 +12,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 
 use anyhow::{Context, Result, bail};
-use astrid_native_closure::{MeasuredIdentity, verify_table};
+use astrid_native_closure::{CURRENT_FLOOR, MeasuredIdentity, TrustedPolicy, verify_table};
 use ktest::determinism::{Determinism, compare_images};
-use ktest::events::{assert_dual_closure, assert_m1, parse_events};
+use ktest::events::{ExpectedClosures, assert_boot, parse_events};
 use ktest::firmware;
 use ktest::image::KimageInvocation;
 use ktest::machine::{self, EXPECT_EXIT_CODE, QEMU_BIN, TIMEOUT};
@@ -77,9 +77,13 @@ fn main() -> Result<()> {
         println!("  {ev}");
     }
 
-    let m1_ok = assert_m1(&events, run.exit_code, EXPECT_EXIT_CODE);
-    let dual_ok = assert_dual_closure(&events, &kernel_hex, &sysgen_hex);
-    let assertions_ok = m1_ok && dual_ok;
+    let closures = ExpectedClosures {
+        kernel_id_hex: &kernel_hex,
+        sysgen_id_hex: &sysgen_hex,
+        kernel_floor: CURRENT_FLOOR.get(),
+        sysgen_floor: CURRENT_FLOOR.get(),
+    };
+    let assertions_ok = assert_boot(&events, run.exit_code, EXPECT_EXIT_CODE, &closures);
     print_summary(determinism, run.exit_code, assertions_ok);
 
     if assertions_ok {
@@ -127,8 +131,11 @@ fn loader_identities(
     if bytes_a != bytes_b {
         bail!("dual-closure tables differ across kimage invocations");
     }
-    let bound = verify_table(&bytes_a)
+    let bound = verify_table(&bytes_a, &TrustedPolicy::emulator_fixture())
         .map_err(|err| anyhow::anyhow!("host verify_table rejected: {}", err.as_reason()))?;
+    if bound.kernel_floor != CURRENT_FLOOR || bound.sysgen_floor != CURRENT_FLOOR {
+        bail!("loader floors are not the emulator CURRENT_FLOOR minima");
+    }
     let elf = std::fs::read(kernel_elf)
         .with_context(|| format!("reading kernel ELF {}", kernel_elf.display()))?;
     let kernel_id = MeasuredIdentity::from_payload(&elf);

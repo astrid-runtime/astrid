@@ -1,33 +1,33 @@
 //! Accept only a distinct, in-floor, correctly bound dual-closure pair.
+//!
+//! Trust keys and minimum floors come from [`TrustedPolicy`], never from the
+//! untrusted table header.
 
 use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::codec::decode_table;
 use crate::error::ClosureError;
+use crate::policy::TrustedPolicy;
 use crate::types::{
-    BoundIdentities, ClosureArtifact, ClosureKind, DualClosureKeys, DualClosureTable,
-    signed_message,
+    BoundIdentities, ClosureArtifact, ClosureKind, DualClosureTable, signed_message,
 };
 
-pub fn verify_table(bytes: &[u8]) -> Result<BoundIdentities, ClosureError> {
+/// Verify `bytes` against an external trusted policy.
+pub fn verify_table(bytes: &[u8], policy: &TrustedPolicy) -> Result<BoundIdentities, ClosureError> {
+    if policy.kernel_verify() == policy.sysgen_verify() {
+        return Err(ClosureError::SameKey);
+    }
     let table = decode_table(bytes)?;
-    check_distinct_keys(table.keys)?;
     check_slot_kinds(&table)?;
-    check_floors(&table)?;
+    check_floors(&table, policy)?;
     check_identities(&table)?;
-    check_signatures(&table)?;
+    check_signatures(&table, policy)?;
     Ok(BoundIdentities {
         kernel_bootstrap: table.kernel.identity,
         system_generation: table.sysgen.identity,
-        floor: table.kernel.floor,
+        kernel_floor: table.kernel.floor,
+        sysgen_floor: table.sysgen.floor,
     })
-}
-
-fn check_distinct_keys(keys: DualClosureKeys) -> Result<(), ClosureError> {
-    if keys.kernel_bootstrap == keys.system_generation {
-        return Err(ClosureError::SameKey);
-    }
-    Ok(())
 }
 
 fn check_slot_kinds(table: &DualClosureTable) -> Result<(), ClosureError> {
@@ -39,8 +39,8 @@ fn check_slot_kinds(table: &DualClosureTable) -> Result<(), ClosureError> {
     Ok(())
 }
 
-fn check_floors(table: &DualClosureTable) -> Result<(), ClosureError> {
-    if table.kernel.floor < table.min_floor || table.sysgen.floor < table.min_floor {
+fn check_floors(table: &DualClosureTable, policy: &TrustedPolicy) -> Result<(), ClosureError> {
+    if table.kernel.floor < policy.kernel_min() || table.sysgen.floor < policy.sysgen_min() {
         return Err(ClosureError::Stale);
     }
     Ok(())
@@ -56,17 +56,11 @@ fn check_identities(table: &DualClosureTable) -> Result<(), ClosureError> {
     Ok(())
 }
 
-fn check_signatures(table: &DualClosureTable) -> Result<(), ClosureError> {
-    bind_artifact(
-        &table.kernel,
-        &table.keys.kernel_bootstrap,
-        &table.keys.system_generation,
-    )?;
-    bind_artifact(
-        &table.sysgen,
-        &table.keys.system_generation,
-        &table.keys.kernel_bootstrap,
-    )
+fn check_signatures(table: &DualClosureTable, policy: &TrustedPolicy) -> Result<(), ClosureError> {
+    let kernel_key = policy.kernel_verify();
+    let sysgen_key = policy.sysgen_verify();
+    bind_artifact(&table.kernel, &kernel_key, &sysgen_key)?;
+    bind_artifact(&table.sysgen, &sysgen_key, &kernel_key)
 }
 
 fn bind_artifact(

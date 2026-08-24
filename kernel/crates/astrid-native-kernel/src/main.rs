@@ -8,8 +8,8 @@
 //! from the user-space `astrid-kernel` supervisor.
 //!
 //! M1 claims: UEFI q35 TCG boot, W^X of the kernel image, APIC timer delivery,
-//! fallible heap/frame pools. Dual-closure stub: ring 0 binds loader-verified
-//! kernel/bootstrap and empty System Generation identities. This crate does
+//! fallible heap/frame pools. Dual-closure stub: ring 0 binds kernel/bootstrap and empty
+//! System Generation identities against a compiled fixture public-key policy. This crate does
 //! not claim KVM, virtio, IOMMU, DMA, A/B, first-owner, services, filesystem,
 //! Linux, host-absence, or physical ownership.
 
@@ -49,6 +49,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         .expect("bootloader did not provide a physical-memory offset");
     memory::set_phys_offset(phys_offset);
 
+    // Safe handlers before any ramdisk touch. Invalid ranges reject in
+    // software; a residual fault uses this IDT rather than an undefined
+    // pre-IDT dereference.
+    gdt::init();
+    interrupts::init_idt();
+    serial::ev_idt_ready(interrupts::EXCEPTION_VECTORS);
+
     match closure::accept(boot_info) {
         Ok(bound) => emit_bound(bound),
         Err(err) => {
@@ -67,10 +74,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     memory::init_heap();
     serial::ev_heap_ready(memory::HEAP_SIZE);
-
-    gdt::init();
-    interrupts::init_idt();
-    serial::ev_idt_ready(interrupts::EXCEPTION_VECTORS);
 
     apic::init(phys_offset);
     serial::ev_apic_timer_start();
@@ -97,9 +100,14 @@ fn emit_bound(bound: astrid_native_closure::BoundIdentities) {
     bound.system_generation.write_hex(&mut sysgen_hex);
     let kernel_hex = core::str::from_utf8(&kernel_hex).expect("hex digits are ascii");
     let sysgen_hex = core::str::from_utf8(&sysgen_hex).expect("hex digits are ascii");
-    serial::ev_closure_kernel(bound.floor.get(), kernel_hex);
-    serial::ev_closure_sysgen(bound.floor.get(), sysgen_hex);
-    serial::ev_closure_bound(kernel_hex, sysgen_hex);
+    serial::ev_closure_kernel(bound.kernel_floor.get(), kernel_hex);
+    serial::ev_closure_sysgen(bound.sysgen_floor.get(), sysgen_hex);
+    serial::ev_closure_bound(
+        bound.kernel_floor.get(),
+        bound.sysgen_floor.get(),
+        kernel_hex,
+        sysgen_hex,
+    );
 }
 
 #[panic_handler]

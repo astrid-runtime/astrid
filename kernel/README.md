@@ -7,6 +7,12 @@ This child adds a dual-closure stub: the loader signs a kernel/bootstrap
 closure and a distinct empty System Generation as separate artifacts;
 ring 0 verifies the table and binds the measured identities.
 
+Ring 0 verifies the table against a compiled emulator-fixture public-key
+policy with independent kernel and System Generation floors. The table
+cannot choose trust keys or rollback policy. Authenticated loader handoff
+is not available: fixture *private* keys stay in `kimage` (`sign` feature).
+This is not firmware root of trust and not self-measurement.
+
 This workspace is isolated from `crates/astrid-kernel`. Nested
 `[workspace]` membership keeps core CI from ingesting these crates.
 
@@ -33,7 +39,8 @@ KVM, virtio, or IOMMU, and therefore does not prove that topology.
 ## Layout
 
 - `crates/astrid-native-closure/` — `#![no_std]` dual-closure codec,
-  verify, and loader-only signing.
+  external `TrustedPolicy`, ramdisk region validator, verify, and
+  loader-only signing.
 - `crates/astrid-native-kernel/` — `#![no_std] #![no_main]` ring-0 binary.
 - `tools/kimage/` — wraps a kernel ELF into a bootable UEFI disk image
   and embeds the dual-closure table as a bootloader ramdisk (memory
@@ -49,8 +56,9 @@ KVM, virtio, or IOMMU, and therefore does not prove that topology.
 The harness builds the kernel, builds the UEFI image twice (determinism
 measurement), boots QEMU (`q35`, explicit `tcg`, UEFI pflash, 1 CPU,
 256 MiB, COM1, `-display none`, `isa-debug-exit`), captures JSONL serial,
-and asserts M1 evidence separately from dual-closure binding. QEMU is
-killed after two minutes.
+and asserts one combined serial sequence (boot, both closure
+identities/floors, bound, M1 milestones, halt). QEMU is killed after two
+minutes.
 
 Firmware discovery used on this host: executable-relative QEMU share,
 package prefixes (Homebrew is one), well-known OVMF paths, and env
@@ -75,10 +83,12 @@ the parent target lock.
 ## What is asserted
 
 - `seq` values are contiguous and strictly increasing from 0.
-- required M1 events appear exactly once.
+- required events appear exactly once.
 - `boot.entry` is the first kernel event.
-- `mem.map`, `paging.wx`, `heap.ready`, `idt.ready`, `halt` appear in
-  order.
+- combined order: `boot.entry`, `idt.ready`, `closure.kernel`,
+  `closure.sysgen`, `closure.bound`, `mem.map`, `paging.wx`,
+  `heap.ready`, `halt`.
+- GDT/IDT are installed before any ramdisk copy.
 - `halt` is terminal (`halt` is the last event).
 - `paging.wx` reports `rodata_nx_w=false`, `text_w=false`.
 - at least 8 `apic.timer.tick` events.
@@ -87,12 +97,15 @@ the parent target lock.
 - any `test.fail` fails the run, including unknown names such as
   `future_gate`.
 - `halt` with `outcome:"ok"` and QEMU exit code 33.
-- host `verify_table` accepts the ramdisk table; kernel serial
-  `closure.kernel` / `closure.sysgen` / `closure.bound` match the
-  measured ELF identity and the empty System Generation identity.
-- `boot.entry` precedes the closure events, which precede `halt`.
-- missing, swapped, stale/below-floor, and cross-bound tables are
-  rejected by `verify_table` (host unit tests).
+- host `verify_table(bytes, TrustedPolicy::emulator_fixture())` accepts
+  the ramdisk table. Serial `closure.kernel` / `closure.sysgen` /
+  `closure.bound` carry independent `kernel_floor` and `sysgen_floor`
+  and match the measured ELF identity and the empty System Generation
+  identity.
+- `verify_table` rejects arbitrary self-signed keys, a lowered mutable
+  header floor used to admit stale artifacts, independently stale kernel
+  or sysgen, swapped keys/artifacts, and missing/truncated/unmapped
+  regions (host unit tests).
 
 ## What is NOT claimed
 
@@ -102,11 +115,15 @@ Hermes claim. Timing is not evidence. Image determinism is reported
 honestly: `DETERMINISM: FAIL` does not fail boot assertions and is not
 coerced to PASS.
 
-Ramdisk keys are loader-supplied fixture keys. This child does **not**
-prove firmware authenticated the loader, and it does not prove ring 0
-re-hashed the in-memory kernel image. Dual-closure here is a distinct
-pair of signed artifacts plus identity binding, not a supported machine
-or an owner ceremony.
+Ring 0 compiles emulator-fixture **public** keys and `CURRENT_FLOOR` as
+independent minima. Fixture **private** keys are host-only (`kimage`,
+`feature = "sign"`) and are not present in ring 0. This child does
+**not** prove firmware authenticated the loader, does not prove ring 0
+re-hashed the in-memory kernel image, and does not claim a firmware root
+of trust or self-measurement. Dual-closure here is a distinct pair of
+signed artifacts plus identity binding against an external policy, not a
+supported machine or an owner ceremony. Table header keys and
+`min_floor` are untrusted advertisements.
 
 ## Checks
 

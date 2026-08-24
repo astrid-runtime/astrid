@@ -49,17 +49,17 @@ pub fn sign_empty_sysgen(signing_key: &SigningKey, floor: GenerationFloor) -> Cl
 pub fn signed_table(
     kernel_key: &SigningKey,
     sysgen_key: &SigningKey,
-    min_floor: GenerationFloor,
-    floor: GenerationFloor,
+    kernel_floor: GenerationFloor,
+    sysgen_floor: GenerationFloor,
     kernel_elf: &[u8],
 ) -> DualClosureTable {
     DualClosureTable {
-        min_floor,
+        min_floor: core::cmp::min(kernel_floor, sysgen_floor),
         keys: DualClosureKeys {
             kernel_bootstrap: kernel_key.verifying_key().to_bytes(),
             system_generation: sysgen_key.verifying_key().to_bytes(),
         },
-        kernel: sign_kernel_bootstrap(kernel_key, floor, kernel_elf),
-        sysgen: sign_empty_sysgen(sysgen_key, floor),
+        kernel: sign_kernel_bootstrap(kernel_key, kernel_floor, kernel_elf),
+        sysgen: sign_empty_sysgen(sysgen_key, sysgen_floor),
     }
 }
