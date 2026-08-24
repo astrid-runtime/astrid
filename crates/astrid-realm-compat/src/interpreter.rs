@@ -1,8 +1,8 @@
 //! Reference interpreter over structured argv. Not a guest OS.
 
 use astrid_provider::{
-    AdmittedInstance, Checkpoint, ExecutionOutcome, ExecutionProvider, ExecutionReceipt, Job,
-    ProviderError, ProviderIdentity, check_provider, check_start,
+    AdmittedInstance, Checkpoint, ExecutionOutcome, ExecutionProvider, ExecutionReceipt,
+    HostPrincipal, Job, ProviderError, ProviderIdentity, check_provider, check_start,
 };
 use astrid_resource_types::{ProviderGeneration, ProviderId};
 
@@ -13,21 +13,19 @@ pub const COMPAT_PROVIDER_ID: ProviderId = ProviderId::from_bytes([0xC1; 32]);
 /// Compatibility provider incarnation.
 pub const COMPAT_PROVIDER_GENERATION: ProviderGeneration = ProviderGeneration::INITIAL;
 
-/// Workload-neutral reference interpreter with an ephemeral ramfs.
+/// Workload-neutral reference interpreter.
 ///
-/// `true` and `echo` are non-normative falsifier tokens, not ABI.
+/// Each execution receives a fresh owner-bound ramfs. There is no shared
+/// unowned namespace and no global table. `true` and `echo` are non-normative
+/// falsifier tokens, not ABI.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ReferenceInterpreter {
-    ramfs: EphemeralRamfs,
-}
+pub struct ReferenceInterpreter;
 
 impl ReferenceInterpreter {
-    /// Construct an interpreter with an empty ephemeral ramfs.
+    /// Construct an interpreter with no retained execution state.
     #[must_use]
     pub const fn new() -> Self {
-        Self {
-            ramfs: EphemeralRamfs::new(),
-        }
+        Self
     }
 
     /// Well-known identity for this provider.
@@ -36,10 +34,30 @@ impl ReferenceInterpreter {
         ProviderIdentity::new(COMPAT_PROVIDER_ID, COMPAT_PROVIDER_GENERATION)
     }
 
-    /// Borrow the ephemeral namespace. Never a host directory.
+    /// Fresh owner-bound namespace. Guest argv, paths, and payloads cannot select it.
     #[must_use]
-    pub const fn ramfs(&self) -> &EphemeralRamfs {
-        &self.ramfs
+    pub const fn namespace_for(self, owner: HostPrincipal) -> EphemeralRamfs {
+        let _ = self;
+        EphemeralRamfs::for_owner(owner)
+    }
+
+    /// Bind a namespace to the instance owner and require `caller`.
+    ///
+    /// This is independent of [`check_start`]: a mismatched caller cannot
+    /// observe or mutate the owner's namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::TypeMismatch`] when the instance owner is not
+    /// a principal, or [`ProviderError::PrincipalMismatch`] when `caller` is
+    /// not that owner.
+    pub fn activate_namespace(
+        self,
+        instance: &AdmittedInstance,
+        caller: HostPrincipal,
+    ) -> Result<EphemeralRamfs, ProviderError> {
+        let owner = HostPrincipal::try_from_owner(instance.owner())?;
+        self.namespace_for(owner).require_owner(caller)
     }
 
     fn receipt(
@@ -84,6 +102,8 @@ impl ExecutionProvider for ReferenceInterpreter {
         job: &Job,
     ) -> Result<ExecutionReceipt, ProviderError> {
         check_start(&self.identity(), instance, job)?;
+        let namespace = self.activate_namespace(instance, job.principal())?;
+        namespace.touch(job.principal())?;
         let _status = interpret_status(job)?;
         Ok(self.receipt(job, instance, ExecutionOutcome::Started))
     }
@@ -94,6 +114,8 @@ impl ExecutionProvider for ReferenceInterpreter {
         job: &Job,
     ) -> Result<ExecutionReceipt, ProviderError> {
         check_start(&self.identity(), instance, job)?;
+        let namespace = self.activate_namespace(instance, job.principal())?;
+        namespace.touch(job.principal())?;
         let status = interpret_status(job)?;
         Ok(self.receipt(job, instance, ExecutionOutcome::Exited { status }))
     }
@@ -113,6 +135,7 @@ impl ExecutionProvider for ReferenceInterpreter {
 mod tests {
     use super::{ReferenceInterpreter, interpret_status};
     use crate::fixtures::{alice_principal, bob_principal, instance_for, job_for};
+    use crate::ramfs::EphemeralRamfs;
     use astrid_projection::SemanticObjectId;
     use astrid_provider::{
         AttachmentDescriptor, AttachmentSet, CapsuleAdapter, ExecutionOutcome, ExecutionProvider,
@@ -168,7 +191,12 @@ mod tests {
         let exited = provider.exit(&instance, &job).unwrap();
         assert_eq!(exited.outcome(), ExecutionOutcome::Exited { status: 0 });
         assert_eq!(exited.as_live_handle(), Err(ProviderError::NotALiveHandle));
-        assert!(provider.ramfs().as_host_path().is_none());
+        assert!(
+            provider
+                .namespace_for(alice_principal())
+                .as_host_path()
+                .is_none()
+        );
     }
 
     #[test]
@@ -235,6 +263,42 @@ mod tests {
         assert_eq!(
             provider.checkpoint(&instance),
             Err(ProviderError::NotSupported)
+        );
+    }
+
+    #[test]
+    fn compatible_descriptors_cannot_select_foreign_namespace() {
+        let provider = ReferenceInterpreter::new();
+        let alice_instance = instance_for(alice_principal());
+        let bob_instance = instance_for(bob_principal());
+        assert_eq!(alice_instance.id(), bob_instance.id());
+        assert_eq!(alice_instance.closure(), bob_instance.closure());
+        assert_eq!(
+            provider.activate_namespace(&alice_instance, bob_principal()),
+            Err(ProviderError::PrincipalMismatch)
+        );
+        assert_eq!(
+            provider.activate_namespace(&bob_instance, alice_principal()),
+            Err(ProviderError::PrincipalMismatch)
+        );
+        let alice_ns = provider
+            .activate_namespace(&alice_instance, alice_principal())
+            .unwrap();
+        let bob_ns = provider
+            .activate_namespace(&bob_instance, bob_principal())
+            .unwrap();
+        assert_ne!(alice_ns, bob_ns);
+        assert_eq!(
+            alice_ns.observe(bob_principal()),
+            Err(ProviderError::PrincipalMismatch)
+        );
+        assert_eq!(
+            bob_ns.touch(alice_principal()),
+            Err(ProviderError::PrincipalMismatch)
+        );
+        assert_eq!(
+            EphemeralRamfs::for_owner(alice_principal()).touch(bob_principal()),
+            Err(ProviderError::PrincipalMismatch)
         );
     }
 }
