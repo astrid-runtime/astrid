@@ -1572,3 +1572,50 @@ async fn internal_workspace_branch_lease_fixes_branch_target() {
         None
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_retries_after_injected_cleanup_failure() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
+    let kernel = Arc::new(crate::test_kernel_with_home(home).await);
+    let caller = PrincipalId::default();
+    let lease = issue_lease(
+        &kernel,
+        caller.clone(),
+        true,
+        StorageProviderViewV1::Admin,
+        astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
+        StorageProviderAccessV1::ReadWrite,
+        "test-provider".to_owned(),
+        temporary.path().join("cleanup-fault-mount"),
+    )
+    .await
+    .unwrap();
+    let state = Arc::clone(kernel.storage_mounts.get(&lease.mount_id).unwrap().value());
+    inject_cleanup_fault_for_test(&state, MountCleanupStage::Manifest);
+    let error = revoke_lease(&kernel, &caller, true, lease.mount_id)
+        .await
+        .expect_err("injected manifest cleanup must fail closed");
+    assert!(
+        error.contains("manifest"),
+        "expected manifest cleanup diagnostic, got {error}"
+    );
+    assert!(
+        kernel.storage_mounts.contains_key(&lease.mount_id),
+        "failed cleanup must keep the revoked lease mapped"
+    );
+    assert!(state.is_revoked_for_test());
+    assert!(
+        lease
+            .resource_path
+            .join(super::LEASE_MANIFEST_NAME)
+            .exists()
+    );
+    clear_cleanup_fault_for_test(&state);
+    revoke_lease(&kernel, &caller, true, lease.mount_id)
+        .await
+        .expect("retry after clearing cleanup fault");
+    assert!(!kernel.storage_mounts.contains_key(&lease.mount_id));
+    assert!(!lease.callback_path.exists());
+    assert!(!lease.resource_path.exists());
+}

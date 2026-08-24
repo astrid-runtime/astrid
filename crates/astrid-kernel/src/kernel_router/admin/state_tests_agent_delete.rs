@@ -19,7 +19,10 @@ use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 #[cfg(any(unix, windows))]
-use crate::storage_mount::{expire_lease_for_test, issue_lease};
+use crate::storage_mount::{
+    MountCleanupStage, arm_issue_admission_gate, clear_cleanup_fault_for_test,
+    expire_lease_for_test, inject_cleanup_fault_for_test, issue_lease,
+};
 
 use super::handlers;
 use crate::Kernel;
@@ -507,4 +510,212 @@ async fn agent_delete_drains_expired_mount_still_mapped() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(any(unix, windows))]
+async fn paused_issue_after_owner_resolve_cannot_publish_after_caller_drain() {
+    let (dir, kernel) = fixture().await;
+    let principal = PrincipalId::new("paused-self").unwrap();
+    create(&kernel, &principal).await;
+    let gate = arm_issue_admission_gate(&kernel);
+    let issue_kernel = Arc::clone(&kernel);
+    let issue_principal = principal.clone();
+    let mountpoint = dir.path().join("paused-self-mount");
+    let issue = tokio::spawn(async move {
+        issue_principal_mount(&issue_kernel, &issue_principal, mountpoint).await
+    });
+    gate.gate().wait_until_entered().await;
+    let deleted = handlers::dispatch(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentDelete {
+            principal: principal.clone(),
+        },
+    )
+    .await;
+    gate.gate().release();
+    let issued = issue.await.expect("paused issue task");
+    assert!(
+        matches!(deleted, AdminResponseBody::Success(_)),
+        "caller drain must complete while admission is paused: {deleted:?}"
+    );
+    let error = issued.expect_err("paused issue must not publish after caller drain");
+    assert!(
+        error.contains("retiring"),
+        "expected retirement fail-closed, got {error}"
+    );
+    assert!(
+        kernel.storage_mounts.is_empty(),
+        "paused admission must not leave a map entry after drain"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(any(unix, windows))]
+async fn paused_issue_after_owner_resolve_cannot_publish_after_viewed_principal_drain() {
+    let (dir, kernel) = fixture().await;
+    let principal = PrincipalId::new("paused-view").unwrap();
+    create(&kernel, &principal).await;
+    let gate = arm_issue_admission_gate(&kernel);
+    let issue_kernel = Arc::clone(&kernel);
+    let viewed = principal.clone();
+    let mountpoint = dir.path().join("paused-view-mount");
+    let issue = tokio::spawn(async move {
+        issue_lease(
+            &issue_kernel,
+            PrincipalId::default(),
+            true,
+            StorageProviderViewV1::Principal(viewed),
+            StorageFilesystemTargetV1::OwnerRoot,
+            StorageProviderAccessV1::ReadWrite,
+            "test-provider".to_owned(),
+            mountpoint,
+        )
+        .await
+    });
+    gate.gate().wait_until_entered().await;
+    let deleted = handlers::dispatch(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentDelete {
+            principal: principal.clone(),
+        },
+    )
+    .await;
+    gate.gate().release();
+    let issued = issue.await.expect("paused cross-owner issue task");
+    assert!(
+        matches!(deleted, AdminResponseBody::Success(_)),
+        "viewed-principal drain must complete while admission is paused: {deleted:?}"
+    );
+    let error = issued.expect_err("paused issue must not publish after viewed drain");
+    assert!(
+        error.contains("retiring"),
+        "expected viewed-principal retirement fail-closed, got {error}"
+    );
+    assert!(
+        kernel.storage_mounts.is_empty(),
+        "paused cross-owner admission must not leave a map entry after drain"
+    );
+}
+
+#[cfg(any(unix, windows))]
+async fn delete_fails_closed_on_cleanup_fault_then_retries(
+    kernel: &Arc<Kernel>,
+    mountpoint: PathBuf,
+    label: &str,
+    fault: MountCleanupStage,
+) {
+    let principal = PrincipalId::new(label).unwrap();
+    create(kernel, &principal).await;
+    let lease = issue_principal_mount(kernel, &principal, mountpoint)
+        .await
+        .expect("issue mount for cleanup fault");
+    let state = Arc::clone(
+        kernel
+            .storage_mounts
+            .get(&lease.mount_id)
+            .expect("mapped lease")
+            .value(),
+    );
+    inject_cleanup_fault_for_test(&state, fault);
+    let failed = handlers::dispatch(
+        kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentDelete {
+            principal: principal.clone(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(failed, AdminResponseBody::Error(_)),
+        "{label}: agent.delete must fail closed on mount cleanup: {failed:?}"
+    );
+    assert!(
+        kernel
+            .identity_store
+            .resolve("cli", principal.as_str())
+            .await
+            .expect("identity lookup")
+            .is_some(),
+        "{label}: failed drain must not unlink identity"
+    );
+    assert!(
+        PrincipalProfile::path_for(&kernel.astrid_home, &principal).exists(),
+        "{label}: failed drain must preserve the principal profile"
+    );
+    {
+        let mapped = kernel
+            .storage_mounts
+            .get(&lease.mount_id)
+            .unwrap_or_else(|| {
+                panic!("{label}: failed cleanup must keep the revoked lease mapped")
+            });
+        assert!(
+            mapped.value().is_revoked_for_test(),
+            "{label}: leftover map entry must be revoked"
+        );
+    }
+    match fault {
+        MountCleanupStage::Callback => {
+            assert!(
+                lease.callback_path.exists(),
+                "{label}: callback cleanup fault must leave the endpoint"
+            );
+        },
+        MountCleanupStage::Manifest => {
+            assert!(
+                lease.resource_path.join("lease.json").exists(),
+                "{label}: manifest cleanup fault must leave the manifest"
+            );
+        },
+        MountCleanupStage::Directory => unreachable!("directory fault is not injected"),
+    }
+    clear_cleanup_fault_for_test(&state);
+    let retried = handlers::dispatch(
+        kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentDelete {
+            principal: principal.clone(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(retried, AdminResponseBody::Success(_)),
+        "{label}: retry after clearing cleanup fault must succeed: {retried:?}"
+    );
+    assert!(
+        kernel
+            .identity_store
+            .resolve("cli", principal.as_str())
+            .await
+            .expect("identity lookup")
+            .is_none(),
+        "{label}: successful retry must unlink identity"
+    );
+    assert!(
+        kernel.storage_mounts.get(&lease.mount_id).is_none(),
+        "{label}: successful retry must remove the map entry"
+    );
+    assert!(!lease.callback_path.exists());
+    assert!(!lease.resource_path.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(any(unix, windows))]
+async fn agent_delete_preserves_identity_when_mount_cleanup_fails_then_retries() {
+    let (dir, kernel) = fixture().await;
+    for (label, fault) in [
+        ("cleanup-callback", MountCleanupStage::Callback),
+        ("cleanup-manifest", MountCleanupStage::Manifest),
+    ] {
+        delete_fails_closed_on_cleanup_fault_then_retries(
+            &kernel,
+            dir.path().join(format!("{label}-mount")),
+            label,
+            fault,
+        )
+        .await;
+    }
 }

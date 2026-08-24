@@ -40,6 +40,24 @@ use crate::Kernel;
 
 mod filesystem;
 use filesystem::{CallbackFilesystem, PrefixedFilesystem, execute_blocking};
+#[cfg(test)]
+mod admission;
+mod cleanup;
+mod lifecycle;
+#[cfg(test)]
+pub(crate) use admission::arm_issue_admission_gate;
+#[cfg(test)]
+pub(crate) use cleanup::MountCleanupStage;
+use cleanup::cleanup_resource_paths;
+use lifecycle::{
+    cleanup_unpublished, expire_idle_mapped_lease, owned_lease, refuse_if_identity_reclaimed,
+    refuse_if_retiring,
+};
+#[cfg(test)]
+pub(crate) use lifecycle::{
+    clear_cleanup_fault_for_test, expire_lease_for_test, inject_cleanup_fault_for_test,
+};
+pub(crate) use lifecycle::{revoke_all_leases_for_principal, revoke_lease};
 #[cfg(any(unix, windows))]
 mod process_broker;
 #[cfg(any(unix, windows))]
@@ -89,6 +107,8 @@ pub(crate) struct StorageMountLeaseState {
     shutdown_tx: watch::Sender<bool>,
     #[cfg(test)]
     mutation_test_gate: std::sync::Mutex<Option<Arc<MutationTestGate>>>,
+    #[cfg(test)]
+    cleanup_fault: std::sync::Mutex<Option<MountCleanupStage>>,
 }
 
 struct InFlightMutation<'a> {
@@ -126,6 +146,11 @@ impl StorageMountLeaseState {
             && now_epoch_secs() <= self.expires_at_epoch_secs.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_revoked_for_test(&self) -> bool {
+        self.revoked.load(Ordering::Acquire)
+    }
+
     fn renew(&self) {
         self.expires_at_epoch_secs.store(
             now_epoch_secs().saturating_add(LEASE_IDLE_TTL_SECS),
@@ -158,21 +183,45 @@ pub(crate) async fn issue_lease(
     provider: String,
     mountpoint: PathBuf,
 ) -> Result<StorageMountLeaseV1, String> {
+    validate_issue_request(&provider, &mountpoint)?;
+    refuse_if_retiring(kernel, &caller, &view).await?;
+    let (owner, target) = resolve_owner(kernel, &caller, allow_cross_owner, &view, target).await?;
+    let caller_uid = kernel.principal_directory.uid_for(&caller).ok();
+    #[cfg(test)]
+    admission::pause_issue_admission_for_test(kernel).await;
+    // Publication and drain share this lock. Recheck retirement and the
+    // resolved directory bindings here so an issue either inserts before
+    // drain snapshots or sees retirement/reclamation and inserts nothing.
+    // The test barrier stays above this lock.
+    let _publication = kernel.storage_mount_mutations.lock().await;
+    refuse_if_retiring(kernel, &caller, &view).await?;
+    refuse_if_identity_reclaimed(kernel, &caller, &view, owner, caller_uid)?;
+    publish_issued_lease(
+        kernel, caller, owner, view, target, access, provider, mountpoint,
+    )
+}
+
+fn validate_issue_request(provider: &str, mountpoint: &Path) -> Result<(), String> {
     if provider.is_empty() || provider.len() > 128 || provider.chars().any(char::is_control) {
         return Err("native storage provider identity is invalid".to_owned());
     }
     if !mountpoint.is_absolute() {
         return Err("native storage mountpoint must be absolute".to_owned());
     }
-    if kernel.capabilities.is_principal_retiring(&caller).await {
-        return Err("cannot issue a storage mount lease for a retiring principal".to_owned());
-    }
-    if let StorageProviderViewV1::Principal(viewed) = &view
-        && kernel.capabilities.is_principal_retiring(viewed).await
-    {
-        return Err("cannot issue a storage mount lease for a retiring principal".to_owned());
-    }
-    let (owner, target) = resolve_owner(kernel, &caller, allow_cross_owner, &view, target).await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_issued_lease(
+    kernel: &Arc<Kernel>,
+    caller: PrincipalId,
+    owner: StateOwner,
+    view: StorageProviderViewV1,
+    target: StorageFilesystemTargetV1,
+    access: StorageProviderAccessV1,
+    provider: String,
+    mountpoint: PathBuf,
+) -> Result<StorageMountLeaseV1, String> {
     let mount_id = StorageMountId::new();
     #[cfg(unix)]
     let resource_path = private_mount_resource_path(mount_id)?;
@@ -209,18 +258,34 @@ pub(crate) async fn issue_lease(
         shutdown_tx,
         #[cfg(test)]
         mutation_test_gate: std::sync::Mutex::new(None),
+        #[cfg(test)]
+        cleanup_fault: std::sync::Mutex::new(None),
     });
 
     #[cfg(any(unix, windows))]
-    let listener = bind_private_listener(&callback_path)?;
+    let listener = match bind_private_listener(&callback_path) {
+        Ok(listener) => listener,
+        Err(error) => {
+            let _ = cleanup_unpublished(&resource_path, &callback_path);
+            return Err(error);
+        },
+    };
     #[cfg(not(any(unix, windows)))]
-    return Err("native mount callback transport is not implemented on this platform".to_owned());
+    {
+        let _ = cleanup_unpublished(&resource_path, &callback_path);
+        return Err(
+            "native mount callback transport is not implemented on this platform".to_owned(),
+        );
+    }
 
     let lease = state.public_lease(token);
     if let Err(error) = write_private_manifest(&resource_path.join(LEASE_MANIFEST_NAME), &lease) {
         drop(listener);
-        cleanup_resource(&resource_path, &callback_path);
-        return Err(format!("write private mount manifest: {error}"));
+        let cleanup = cleanup_unpublished(&resource_path, &callback_path);
+        return Err(match cleanup {
+            Ok(()) => format!("write private mount manifest: {error}"),
+            Err(cleanup) => format!("write private mount manifest: {error}; {cleanup}"),
+        });
     }
     kernel.storage_mounts.insert(mount_id, Arc::clone(&state));
 
@@ -303,105 +368,6 @@ pub(crate) async fn sync_lease(
     state.dirty.store(false, Ordering::Release);
     state.renew();
     Ok(())
-}
-
-/// Revoke one lease and drain any in-flight mutation before cleanup.
-pub(crate) async fn revoke_lease(
-    kernel: &Kernel,
-    caller: &PrincipalId,
-    allow_cross_owner: bool,
-    mount_id: StorageMountId,
-) -> Result<(), String> {
-    let state = owned_lease(kernel, caller, allow_cross_owner, mount_id)?;
-    force_revoke_lease(kernel, &state).await;
-    Ok(())
-}
-
-/// Revoke every live or stale mount that can still name `principal`.
-///
-/// Matches leases requested by the principal, leases whose admitted view is
-/// that principal, and leases whose typed owner is the principal's immutable
-/// UID. Expired map entries are included so a stale callback cannot outlive
-/// identity deletion. Fail closed if any matching lease remains afterwards.
-pub(crate) async fn revoke_all_leases_for_principal(
-    kernel: &Kernel,
-    principal: &PrincipalId,
-) -> Result<(), String> {
-    let uid = kernel.principal_directory.uid_for(principal).ok();
-    let matched: Vec<Arc<StorageMountLeaseState>> = kernel
-        .storage_mounts
-        .iter()
-        .filter(|entry| lease_covers_principal(entry.value(), principal, uid))
-        .map(|entry| Arc::clone(entry.value()))
-        .collect();
-    for state in &matched {
-        state.revoked.store(true, Ordering::Release);
-        let _ = state.shutdown_tx.send(true);
-    }
-    {
-        let _mutation_guard = kernel.storage_mount_mutations.lock().await;
-        for state in &matched {
-            kernel.storage_mounts.remove(&state.mount_id);
-            cleanup_resource(&state.resource_path, &state.callback_path);
-        }
-    }
-    if kernel
-        .storage_mounts
-        .iter()
-        .any(|entry| lease_covers_principal(entry.value(), principal, uid))
-    {
-        return Err("storage mount lease survived principal deletion drain".to_owned());
-    }
-    Ok(())
-}
-
-async fn force_revoke_lease(kernel: &Kernel, state: &StorageMountLeaseState) {
-    state.revoked.store(true, Ordering::Release);
-    let _ = state.shutdown_tx.send(true);
-    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
-    kernel.storage_mounts.remove(&state.mount_id);
-    cleanup_resource(&state.resource_path, &state.callback_path);
-}
-
-fn lease_covers_principal(
-    state: &StorageMountLeaseState,
-    principal: &PrincipalId,
-    uid: Option<astrid_storage::PrincipalUid>,
-) -> bool {
-    if &state.requested_by == principal {
-        return true;
-    }
-    if let StorageProviderViewV1::Principal(viewed) = &state.view
-        && viewed == principal
-    {
-        return true;
-    }
-    uid.is_some_and(|uid| matches!(state.owner, StateOwner::Principal(owner) if owner == uid))
-}
-
-#[cfg(test)]
-pub(crate) fn expire_lease_for_test(state: &StorageMountLeaseState) {
-    state.expires_at_epoch_secs.store(0, Ordering::Release);
-}
-
-fn owned_lease(
-    kernel: &Kernel,
-    caller: &PrincipalId,
-    allow_cross_owner: bool,
-    mount_id: StorageMountId,
-) -> Result<Arc<StorageMountLeaseState>, String> {
-    let state = kernel
-        .storage_mounts
-        .get(&mount_id)
-        .map(|entry| Arc::clone(entry.value()))
-        .ok_or_else(|| format!("storage mount lease {mount_id} was not found"))?;
-    if !state.is_owned_by(caller) && !allow_cross_owner {
-        return Err("storage mount lease belongs to another principal".to_owned());
-    }
-    if !state.is_live() {
-        return Err("storage mount lease is expired or revoked".to_owned());
-    }
-    Ok(state)
 }
 
 async fn resolve_owner(
@@ -577,11 +543,11 @@ async fn serve_listener(
             _ = shutdown_rx.changed() => break,
             _ = expiry_check.tick() => {
                 if !state.is_live() {
-                    state.revoked.store(true, Ordering::Release);
                     if let Some(kernel) = kernel.upgrade() {
-                        kernel.storage_mounts.remove(&state.mount_id);
+                        expire_idle_mapped_lease(&kernel, &state).await;
+                    } else {
+                        let _ = cleanup_resource_paths(&state.resource_path, &state.callback_path, None);
                     }
-                    cleanup_resource(&state.resource_path, &state.callback_path);
                     break;
                 }
             },
@@ -972,15 +938,6 @@ fn write_private_manifest(path: &Path, lease: &StorageMountLeaseV1) -> io::Resul
     let mut bytes = serde_json::to_vec(lease).map_err(io::Error::other)?;
     bytes.push(b'\n');
     astrid_core::platform_fs::atomic_write_private_file(path, &bytes)
-}
-
-fn cleanup_resource(resource_path: &Path, callback_path: &Path) {
-    let _ = local_transport::remove_endpoint(callback_path);
-    let _ = std::fs::remove_file(resource_path.join(LEASE_MANIFEST_NAME));
-    let _ = std::fs::remove_dir(resource_path);
-    if let Some(root) = resource_path.parent() {
-        let _ = std::fs::remove_dir(root);
-    }
 }
 
 #[cfg(all(test, any(unix, windows)))]
