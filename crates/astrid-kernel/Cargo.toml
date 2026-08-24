@@ -81,6 +81,7 @@ windows-sys = { workspace = true, features = [
 [dev-dependencies]
 async-trait = { workspace = true }
 sha2 = { workspace = true }
+wat = { workspace = true }
 
 [lints]
 workspace = true

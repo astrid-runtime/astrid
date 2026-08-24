@@ -31,6 +31,9 @@ mod capsule_adversarial_tests;
 mod capsules_loaded;
 #[cfg(test)]
 mod capsules_loaded_tests;
+#[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
+#[path = "catalog_authority_tests.rs"]
+mod catalog_authority_tests;
 /// Grant-on-first-use consent handler (issue #998).
 ///
 /// Native-only: reuses the management-API admin grant machinery
@@ -1384,6 +1387,27 @@ impl Kernel {
         Ok(())
     }
 
+    /// Verify an installed capsule against the authority source selected by
+    /// this runtime. Native daemon loads use the packed System catalog; the
+    /// unbound compatibility path retains its POSIX executable check.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn verify_installed_authority_for_runtime(
+        &self,
+        dir: &Path,
+        manifest: &astrid_capsule_types::manifest::CapsuleManifest,
+    ) -> anyhow::Result<()> {
+        if let Some(store) = self.principal_store.as_ref() {
+            astrid_capsule_install::verify_installed_authority_with_store(
+                &self.astrid_home,
+                dir,
+                manifest,
+                store,
+            )
+        } else {
+            astrid_capsule_install::verify_installed_authority(&self.astrid_home, dir, manifest)
+        }
+    }
+
     /// Verify a path-only capsule cache against the durable package registry.
     ///
     /// The extracted directory is disposable projection state; its owner,
@@ -1505,26 +1529,13 @@ impl Kernel {
                     manifest.package.name
                 );
             }
-            let verify = if let Some(store) = self.principal_store.as_ref() {
-                astrid_capsule_install::verify_installed_authority_with_store(
-                    &self.astrid_home,
-                    &dir,
-                    &manifest,
-                    store,
-                )
-            } else {
-                astrid_capsule_install::verify_installed_authority(
-                    &self.astrid_home,
-                    &dir,
-                    &manifest,
-                )
-            };
-            verify.map_err(|error| {
-                anyhow::anyhow!(
-                    "capsule '{}' exceeds or cannot prove its installed authority: {error:#}",
-                    manifest.package.name
-                )
-            })?;
+            self.verify_installed_authority_for_runtime(&dir, &manifest)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "capsule '{}' exceeds or cannot prove its installed authority: {error:#}",
+                        manifest.package.name
+                    )
+                })?;
         }
         self.verify_workspace_component_paths(&dir, &manifest)?;
         let id = astrid_capsule_types::CapsuleId::from_static(&manifest.package.name);
@@ -1818,20 +1829,7 @@ impl Kernel {
                     "capsule replacement source is outside the explicit workspace portal and has no durable registry authority"
                 );
             }
-            if let Some(store) = self.principal_store.as_ref() {
-                astrid_capsule_install::verify_installed_authority_with_store(
-                    &self.astrid_home,
-                    source_dir,
-                    &manifest,
-                    store,
-                )?;
-            } else {
-                astrid_capsule_install::verify_installed_authority(
-                    &self.astrid_home,
-                    source_dir,
-                    &manifest,
-                )?;
-            }
+            self.verify_installed_authority_for_runtime(source_dir, &manifest)?;
         }
         self.verify_workspace_component_paths(source_dir, &manifest)?;
         if !manifest.mcp_servers.is_empty() {

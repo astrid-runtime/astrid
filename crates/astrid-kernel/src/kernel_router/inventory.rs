@@ -31,22 +31,28 @@ pub(super) fn durable_package_details(
         .metadata()
         .wasm_hash
         .as_deref()
-        .and_then(|expected| {
-            match astrid_capsule_install::wasm::catalog_wasm_hash(store, expected) {
-                Ok(hash) => Some(hash),
-                Err(error) => {
-                    warn!(
-                        capsule,
-                        expected_hash = expected,
-                        error = %error,
-                        "durable capsule WASM is absent or invalid in the system catalog"
-                    );
-                    None
-                },
-            }
-        });
+        .and_then(|expected| verified_catalog_wasm_hash(store, capsule, expected));
     let update_source = verified_remote_update_source(package.metadata().source.as_deref());
     (hashes, wasm_hash, update_source)
+}
+
+fn verified_catalog_wasm_hash(
+    store: &astrid_storage::RuntimePrincipalStore,
+    capsule: &str,
+    expected: &str,
+) -> Option<String> {
+    match astrid_capsule_install::wasm::catalog_wasm_hash(store, expected) {
+        Ok(hash) => Some(hash),
+        Err(error) => {
+            warn!(
+                capsule,
+                expected_hash = expected,
+                error = %error,
+                "durable capsule WASM is absent or invalid in the system catalog"
+            );
+            None
+        },
+    }
 }
 
 fn verified_remote_update_source(source: Option<&str>) -> Option<String> {
@@ -116,7 +122,11 @@ pub(super) async fn visible_inventory_manifests(
 
 #[cfg(test)]
 mod tests {
-    use super::verified_remote_update_source;
+    use std::sync::Arc;
+
+    use super::{verified_catalog_wasm_hash, verified_remote_update_source};
+    use astrid_core::dirs::AstridHome;
+    use astrid_storage::{KvQuotaResolver, StateOwner};
 
     #[test]
     fn update_source_exposes_remote_github_but_never_native_paths() {
@@ -137,6 +147,61 @@ mod tests {
         assert_eq!(
             verified_remote_update_source(Some("./registry.capsule")),
             None
+        );
+    }
+
+    fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
+        Arc::new(|owner: &StateOwner| {
+            Ok(match owner {
+                StateOwner::System => None,
+                StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn catalog_hash_is_not_exposed_for_missing_or_tampered_wasm() {
+        let missing_dir = tempfile::tempdir().expect("missing catalog home");
+        let missing_home = AstridHome::from_path(missing_dir.path());
+        missing_home.ensure().expect("ensure home");
+        let missing_store =
+            astrid_storage::open_runtime_principal_store(&missing_home, unlimited_quota())
+                .await
+                .expect("open store");
+        let bytes = b"catalog-authority";
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        assert_eq!(
+            verified_catalog_wasm_hash(&missing_store, "catalog", &hash),
+            None,
+            "metadata must not advertise a hash when System/bin is absent"
+        );
+
+        let valid_name =
+            astrid_storage::ContentName::new(format!("bin/{hash}.wasm")).expect("catalog name");
+        missing_store
+            .content()
+            .put(&StateOwner::System, &valid_name, bytes)
+            .expect("put catalog bytes");
+        assert_eq!(
+            verified_catalog_wasm_hash(&missing_store, "catalog", &hash),
+            Some(hash.clone())
+        );
+
+        let tampered_dir = tempfile::tempdir().expect("tampered catalog home");
+        let tampered_home = AstridHome::from_path(tampered_dir.path());
+        tampered_home.ensure().expect("ensure home");
+        let tampered_store =
+            astrid_storage::open_runtime_principal_store(&tampered_home, unlimited_quota())
+                .await
+                .expect("open tampered store");
+        tampered_store
+            .content()
+            .put(&StateOwner::System, &valid_name, b"tampered")
+            .expect("put tampered bytes");
+        assert_eq!(
+            verified_catalog_wasm_hash(&tampered_store, "catalog", &hash),
+            None,
+            "metadata must not advertise a hash when System/bin is tampered"
         );
     }
 }
