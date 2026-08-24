@@ -1,8 +1,8 @@
 //! Explicit admission of the durable native runtime file tree.
 //!
 //! The runtime tree is a host-facing source snapshot. Its durable regular
-//! files become system-owned named content; live IPC endpoints and bootstrap
-//! executables remain outside the volume.
+//! files become system-owned named content; only the hosted volume and live
+//! IPC socket remain outside the volume.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -11,16 +11,8 @@ use crate::error::{StorageError, StorageResult};
 
 use super::{ContiguousFileIngest, RuntimePrincipalStore, StateOwner};
 
-const EXCLUDED_PATHS: [&str; 8] = [
-    "etc/layout-version",
-    "var/astrid.volume",
-    "keys/runtime.key",
-    "run/system.sock",
-    "run/system.lock",
-    "run/system.pid",
-    "run/system.ready",
-    "run/system.token",
-];
+const VOLUME_PATH_PREFIX: &str = "var/astrid.volume";
+const SOCKET_PATH: &str = "run/system.sock";
 
 /// One regular file discovered in the native runtime tree.
 ///
@@ -126,6 +118,9 @@ fn collect_files(
                 "source tree contains a symbolic link".to_owned(),
             ));
         }
+        // Sockets and other host-special entries are never catalog content.
+        // Ignore them so a stale endpoint cannot fail admission of the
+        // regular files that make up the runtime snapshot.
         if metadata.is_dir() {
             collect_files(root, &path, files)?;
         } else if metadata.is_file() {
@@ -133,11 +128,6 @@ fn collect_files(
                 relative_text.replace(std::path::MAIN_SEPARATOR, "/"),
                 path,
                 metadata,
-            ));
-        } else {
-            return Err(tree_error(
-                &path,
-                "source tree contains a special entry".to_owned(),
             ));
         }
     }
@@ -202,17 +192,7 @@ fn content_name_from_relative(path: &Path, root: &Path) -> StorageResult<Content
 }
 
 fn is_excluded(relative: &str) -> bool {
-    EXCLUDED_PATHS.contains(&relative)
-        || relative == "var/migrations"
-        || relative.starts_with("var/migrations/")
-        || relative == "var/content-staging"
-        || relative.starts_with("var/content-staging/")
-        || relative == "var/principal-store"
-        || relative.starts_with("var/principal-store/")
-        || matches!(
-            relative,
-            "astrid" | "astrid-daemon" | "bin/astrid" | "bin/astrid-daemon"
-        )
+    relative.starts_with(VOLUME_PATH_PREFIX) || relative == SOCKET_PATH
 }
 
 fn tree_error(path: &Path, detail: impl std::fmt::Display) -> StorageError {
@@ -240,6 +220,41 @@ mod tests {
         })
     }
 
+    fn durable_files(wasm_hash: &str, wasm: &[u8], nested_wasm: &[u8]) -> Vec<(String, Vec<u8>)> {
+        vec![
+            (format!("bin/{wasm_hash}.wasm"), wasm.to_vec()),
+            (
+                "run/capsules/example/meta.json".to_owned(),
+                format!("{{\"wasm_hash\":\"{wasm_hash}\"}}").into_bytes(),
+            ),
+            (
+                "run/capsules/example/component.wasm".to_owned(),
+                nested_wasm.to_vec(),
+            ),
+            (
+                "wit/astrid-contracts.wit".to_owned(),
+                b"package astrid:contracts;".to_vec(),
+            ),
+            ("etc/layout-version".to_owned(), b"2".to_vec()),
+            ("keys/runtime.key".to_owned(), b"runtime-key".to_vec()),
+            ("run/system.lock".to_owned(), b"lock".to_vec()),
+            ("run/system.pid".to_owned(), b"pid".to_vec()),
+            ("run/system.ready".to_owned(), b"ready".to_vec()),
+            ("run/system.token".to_owned(), b"token".to_vec()),
+            ("var/content-staging/payload".to_owned(), b"staged".to_vec()),
+            ("var/config.json".to_owned(), b"{\"durable\":true}".to_vec()),
+            ("var/migrations/marker".to_owned(), b"migration".to_vec()),
+            ("var/principal-store/legacy".to_owned(), b"legacy".to_vec()),
+            ("bin/astrid".to_owned(), b"bootstrap".to_vec()),
+            ("bin/astrid-daemon".to_owned(), b"bootstrap-daemon".to_vec()),
+            ("astrid".to_owned(), b"root-bootstrap".to_vec()),
+            (
+                "astrid-daemon".to_owned(),
+                b"root-bootstrap-daemon".to_vec(),
+            ),
+        ]
+    }
+
     #[tokio::test]
     async fn admits_runtime_tree_and_reopens_from_preclose_volume_copy() {
         let source = tempfile::tempdir().unwrap();
@@ -249,22 +264,7 @@ mod tests {
         let wasm = b"\0asm\x01\0\0\0runtime-wasm-unique".to_vec();
         let nested_wasm = b"\0asm\x01\0\0\0nested-wasm-unique".to_vec();
         let wasm_hash = blake3::hash(&wasm).to_hex().to_string();
-        let durable = vec![
-            (format!("bin/{wasm_hash}.wasm"), wasm.clone()),
-            (
-                "run/capsules/example/meta.json".to_owned(),
-                format!("{{\"wasm_hash\":\"{wasm_hash}\"}}").into_bytes(),
-            ),
-            (
-                "run/capsules/example/component.wasm".to_owned(),
-                nested_wasm.clone(),
-            ),
-            (
-                "wit/astrid-contracts.wit".to_owned(),
-                b"package astrid:contracts;".to_vec(),
-            ),
-            ("var/config.json".to_owned(), b"{\"durable\":true}".to_vec()),
-        ];
+        let durable = durable_files(&wasm_hash, &wasm, &nested_wasm);
         for (relative, bytes) in &durable {
             let path = source.path().join(relative);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -272,13 +272,9 @@ mod tests {
         }
         for relative in [
             "var/astrid.volume",
+            "var/astrid.volume.compacting",
+            "var/astrid.volume.previous",
             "run/system.sock",
-            "run/system.lock",
-            "run/system.pid",
-            "run/system.ready",
-            "run/system.token",
-            "astrid",
-            "astrid-daemon",
         ] {
             let path = source.path().join(relative);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -325,6 +321,7 @@ mod tests {
             .await
             .unwrap();
         let filesystem = AstridFilesystem::new(reopened.content(), StateOwner::System);
+        let expected_count = durable.len();
         let mut reconstructed = BTreeMap::new();
         for (name, bytes) in durable {
             let path = FilesystemPath::new(name).unwrap();
@@ -334,7 +331,7 @@ mod tests {
             assert_eq!(Sha256::digest(&actual), expected_digest);
             reconstructed.insert(path.as_str().to_owned(), actual);
         }
-        assert_eq!(reconstructed.len(), 5);
+        assert_eq!(reconstructed.len(), expected_count);
     }
 
     #[cfg(unix)]
@@ -347,5 +344,25 @@ mod tests {
         symlink(outside.path(), root.path().join("redirect")).unwrap();
         let error = scan(root.path()).unwrap_err();
         assert!(error.to_string().contains("symbolic link"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_special_entries_without_failing_scan() {
+        use std::os::unix::net::UnixListener;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("run")).unwrap();
+        std::fs::write(root.path().join("regular"), b"durable").unwrap();
+        let _socket = UnixListener::bind(root.path().join("run/other.sock")).unwrap();
+
+        let entries = scan(root.path()).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name().as_str())
+                .collect::<Vec<_>>(),
+            ["regular"]
+        );
     }
 }

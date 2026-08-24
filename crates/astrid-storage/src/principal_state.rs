@@ -499,17 +499,17 @@ impl RuntimePrincipalStore {
 
     /// Admit the durable native runtime tree into the system-owned catalog.
     ///
-    /// The source is walked without following redirects. Runtime sockets,
-    /// locks, PID/readiness/token sentinels, the volume itself, and bootstrap
-    /// host binaries remain POSIX-owned; every other regular file is published
-    /// under its slash-separated relative path through the packed content
-    /// arena. This is an explicit admission operation, never an open-time
-    /// conversion of existing volume regions.
+    /// The source is walked without following redirects. The live runtime
+    /// socket and hosted volume remain POSIX-owned; every other regular file,
+    /// including sentinels and bootstrap binaries, is published under its
+    /// slash-separated relative path through the packed content arena. Other
+    /// special entries are skipped. This is an explicit admission operation,
+    /// never an open-time conversion of existing volume regions.
     ///
     /// # Errors
     ///
-    /// Returns a storage error when the source tree contains a redirect or
-    /// special entry, cannot be read, or packed publication fails.
+    /// Returns a storage error when the source tree contains a redirect,
+    /// cannot be read, or packed publication fails.
     pub fn admit_runtime_tree(
         &self,
         runtime_root: impl AsRef<std::path::Path>,
@@ -525,8 +525,8 @@ impl RuntimePrincipalStore {
     ///
     /// # Errors
     ///
-    /// Returns a storage error when the source tree contains a redirect or
-    /// special entry, cannot be read, or has an unrepresentable timestamp.
+    /// Returns a storage error when the source tree contains a redirect,
+    /// cannot be read, or has an unrepresentable timestamp.
     pub fn scan_runtime_tree(
         &self,
         runtime_root: impl AsRef<std::path::Path>,

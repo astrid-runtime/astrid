@@ -14,6 +14,7 @@ use astrid_storage::{RuntimePrincipalStore, RuntimeTreeEntry, StateOwner};
 use serde::{Deserialize, Serialize};
 
 const RECEIPT_NAME: &str = "runtime-tree-v1.json";
+const RECEIPT_RELATIVE_PATH: &str = "var/migrations/runtime-tree-v1.json";
 const RECEIPT_SCHEMA: u32 = 1;
 // A receipt is host migration metadata, not an operator quota. This hard
 // parser guard bounds allocation for a corrupted or hostile local file.
@@ -65,7 +66,8 @@ impl RuntimeTreeReceipt {
 /// The blocking walk and packed publication run off the async executor. A
 /// receipt is written only after a second metadata scan agrees with the first,
 /// so a source mutation during ingest cannot be mistaken for a completed
-/// admission.
+/// admission. The receipt itself is runtime content, so it is published in a
+/// second batch after the receipt is written.
 pub(crate) async fn admit(home: &AstridHome, store: &RuntimePrincipalStore) -> io::Result<()> {
     let home = home.clone();
     let store = store.clone();
@@ -82,6 +84,7 @@ fn admit_blocking(home: &AstridHome, store: &RuntimePrincipalStore) -> io::Resul
     if let Some(receipt) = read_receipt(&receipt_path)?
         && receipt.matches_entries(&entries)
         && catalog_contains_entries(store, &entries)?
+        && catalog_contains_receipt(store, &receipt_path)?
     {
         return Ok(());
     }
@@ -101,11 +104,20 @@ fn admit_blocking(home: &AstridHome, store: &RuntimePrincipalStore) -> io::Resul
     let receipt = RuntimeTreeReceipt::from_entries(&after);
     let bytes = serde_json::to_vec(&receipt).map_err(io::Error::other)?;
     astrid_core::platform_fs::ensure_private_directory(&home.migrations_dir())?;
-    astrid_core::platform_fs::atomic_write_private_file(&receipt_path, &bytes)
+    astrid_core::platform_fs::atomic_write_private_file(&receipt_path, &bytes)?;
+    store.admit_runtime_tree(home.root()).map_err(storage_error)
 }
 
 fn scan(store: &RuntimePrincipalStore, root: &Path) -> io::Result<Vec<RuntimeTreeEntry>> {
-    store.scan_runtime_tree(root).map_err(storage_error)
+    store
+        .scan_runtime_tree(root)
+        .map(|entries| {
+            entries
+                .into_iter()
+                .filter(|entry| entry.name().as_str() != RECEIPT_RELATIVE_PATH)
+                .collect()
+        })
+        .map_err(storage_error)
 }
 
 fn catalog_contains_entries(
@@ -123,6 +135,20 @@ fn catalog_contains_entries(
     Ok(entries
         .iter()
         .all(|entry| catalog_sizes.get(entry.name().as_str()) == Some(&entry.logical_bytes())))
+}
+
+fn catalog_contains_receipt(
+    store: &RuntimePrincipalStore,
+    receipt_path: &Path,
+) -> io::Result<bool> {
+    let receipt_bytes = fs::metadata(receipt_path)?.len();
+    let catalog = store
+        .content()
+        .list(&StateOwner::System)
+        .map_err(|error| io::Error::other(format!("list packed runtime catalog: {error}")))?;
+    Ok(catalog.iter().any(|entry| {
+        entry.name().as_str() == RECEIPT_RELATIVE_PATH && entry.logical_bytes() == receipt_bytes
+    }))
 }
 
 fn read_receipt(path: &Path) -> io::Result<Option<RuntimeTreeReceipt>> {
@@ -259,7 +285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_home_admits_no_generated_control_files() {
+    async fn fresh_home_admits_generated_control_files() {
         let directory = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(directory.path());
         home.ensure().unwrap();
@@ -274,10 +300,26 @@ mod tests {
             .into_iter()
             .map(|entry| entry.name().as_str().to_owned())
             .collect::<Vec<_>>();
-        assert!(
-            names.is_empty(),
-            "fresh home admitted generated files: {names:?}"
-        );
+        for expected in [
+            "etc/layout-version",
+            "var/content-staging/intents.v1.log",
+            "var/principal-store/migration.complete",
+            "var/principal-store/objects.arena",
+            "var/principal-store/objects.index",
+            "var/principal-store/representations/CURRENT",
+            "var/principal-store/representations/generations/0000000000000001/metadata.arena",
+            "var/principal-store/representations/generations/0000000000000001/state.journal",
+            "var/principal-store/roots.journal",
+            "var/principal-store/store.lock",
+            "var/principal-store/store.meta",
+            RECEIPT_RELATIVE_PATH,
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "fresh home omitted generated runtime file {expected}: {names:?}"
+            );
+        }
+        assert!(!names.iter().any(|name| name == "var/astrid.volume"));
         assert!(fs::read_to_string(home.migrations_dir().join(RECEIPT_NAME)).is_ok());
     }
 
