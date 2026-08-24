@@ -102,13 +102,6 @@ fn collect_files(
         let relative = path
             .strip_prefix(root)
             .map_err(|_| tree_error(&path, "source entry escaped runtime root".to_owned()))?;
-        let relative_text = relative
-            .to_str()
-            .ok_or_else(|| tree_error(&path, "source entry path is not valid UTF-8".to_owned()))?;
-        if is_excluded(relative_text) {
-            continue;
-        }
-
         let metadata = std::fs::symlink_metadata(&path)
             .map_err(|error| tree_error(&path, format!("inspect source entry: {error}")))?;
         let file_type = metadata.file_type();
@@ -121,13 +114,23 @@ fn collect_files(
         // Sockets and other host-special entries are never catalog content.
         // Ignore them so a stale endpoint cannot fail admission of the
         // regular files that make up the runtime snapshot.
-        if metadata.is_dir() {
-            collect_files(root, &path, files)?;
-        } else if metadata.is_file() {
-            files.push((
-                relative_text.replace(std::path::MAIN_SEPARATOR, "/"),
-                path,
-                metadata,
+        if let Some(relative_text) = relative.to_str() {
+            if is_excluded(relative_text) {
+                continue;
+            }
+            if metadata.is_dir() {
+                collect_files(root, &path, files)?;
+            } else if metadata.is_file() {
+                files.push((
+                    relative_text.replace(std::path::MAIN_SEPARATOR, "/"),
+                    path,
+                    metadata,
+                ));
+            }
+        } else if metadata.is_dir() || metadata.is_file() {
+            return Err(tree_error(
+                &path,
+                "source entry path is not valid UTF-8".to_owned(),
             ));
         }
     }
