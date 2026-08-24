@@ -10,7 +10,9 @@ use std::io;
 use std::path::Path;
 
 use astrid_core::dirs::AstridHome;
-use astrid_storage::{RuntimePrincipalStore, RuntimeTreeEntry, StateOwner};
+use astrid_storage::{
+    ContentName, ContiguousFileIngest, RuntimePrincipalStore, RuntimeTreeEntry, StateOwner,
+};
 use serde::{Deserialize, Serialize};
 
 const RECEIPT_NAME: &str = "runtime-tree-v1.json";
@@ -105,7 +107,22 @@ fn admit_blocking(home: &AstridHome, store: &RuntimePrincipalStore) -> io::Resul
     let bytes = serde_json::to_vec(&receipt).map_err(io::Error::other)?;
     astrid_core::platform_fs::ensure_private_directory(&home.migrations_dir())?;
     astrid_core::platform_fs::atomic_write_private_file(&receipt_path, &bytes)?;
-    store.admit_runtime_tree(home.root()).map_err(storage_error)
+    admit_receipt(store, &receipt_path)
+}
+
+fn admit_receipt(store: &RuntimePrincipalStore, receipt_path: &Path) -> io::Result<()> {
+    let name = ContentName::new(RECEIPT_RELATIVE_PATH.to_owned()).map_err(io::Error::other)?;
+    let bytes = fs::metadata(receipt_path)?.len();
+    store
+        .put_contiguous_files(
+            StateOwner::System,
+            [ContiguousFileIngest::new(
+                name,
+                receipt_path.to_owned(),
+                bytes,
+            )],
+        )
+        .map_err(storage_error)
 }
 
 fn scan(store: &RuntimePrincipalStore, root: &Path) -> io::Result<Vec<RuntimeTreeEntry>> {
