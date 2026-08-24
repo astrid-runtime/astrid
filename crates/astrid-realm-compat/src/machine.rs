@@ -228,8 +228,14 @@ impl PortableMachine {
         match opcode {
             0x03 => self.execute_load(instruction, rd, rs1, funct3)?,
             0x0f => {
-                if funct3 > 1 {
-                    return Err(illegal(self.pc, instruction));
+                match funct3 {
+                    // FENCE is part of the claimed base RV64I subset. The
+                    // fixture has no shared memory, so it retires as a no-op.
+                    0 => {},
+                    // FENCE.I belongs to Zifencei and is deliberately not
+                    // admitted by this base-subset machine.
+                    1 => return Err(unsupported(self.pc, instruction)),
+                    _ => return Err(illegal(self.pc, instruction)),
                 }
             },
             0x13 => self.execute_op_imm(instruction, rd, rs1, funct3)?,
@@ -643,6 +649,17 @@ mod tests {
             run_words(&[0x0010_0073], DEFAULT_INSTRUCTION_FUEL),
             Err(MachineError::UnsupportedInstruction { .. })
         ));
+        assert!(matches!(
+            run_words(&[0x0000_100f], DEFAULT_INSTRUCTION_FUEL),
+            Err(MachineError::UnsupportedInstruction {
+                instruction: 0x0000_100f,
+                ..
+            })
+        ));
+        assert_eq!(
+            run_words(&[0x0000_000f, 0x0000_0073], DEFAULT_INSTRUCTION_FUEL),
+            Ok((0, 2))
+        );
     }
 
     #[test]

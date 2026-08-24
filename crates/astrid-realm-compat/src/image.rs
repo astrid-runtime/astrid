@@ -5,16 +5,17 @@
 
 use astrid_provider::ProviderError;
 use astrid_resource_types::ApplicationGenerationRef;
+use blake3::Hasher;
 
 use crate::machine::MachineError;
 
 /// Maximum admitted instruction image. Larger payloads fail closed.
 pub const MAX_IMAGE_BYTES: usize = 256;
 
-/// Domain tag mixed into crate-local image identity.
-const IMAGE_IDENTITY_DOMAIN: [u8; 32] = *b"astrid.realm-compat.guest-img.v1";
+/// Domain-separated content identity context for admitted guest images.
+const IMAGE_IDENTITY_CONTEXT: &str = "astrid.realm-compat.guest-image.v1";
 
-/// Immutable identity of one admitted guest image. Not a CAS digest.
+/// Immutable collision-resistant content identity of one admitted guest image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GuestImageId([u8; 32]);
 
@@ -46,7 +47,7 @@ impl GuestImage {
     /// # Errors
     ///
     /// Empty, oversized, or unaligned images return [`MachineError::InvalidImage`].
-    pub fn admit(bytes: &[u8]) -> Result<Self, MachineError> {
+    pub(crate) fn admit(bytes: &[u8]) -> Result<Self, MachineError> {
         if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES || !bytes.len().is_multiple_of(4) {
             return Err(MachineError::InvalidImage);
         }
@@ -58,7 +59,7 @@ impl GuestImage {
         Ok(Self {
             bytes: image,
             len: u16::try_from(bytes.len()).map_err(|_| MachineError::InvalidImage)?,
-            id: identity_of(bytes),
+            id: content_identity(bytes),
         })
     }
 
@@ -81,6 +82,13 @@ pub const SYNTHETIC_EXIT_ZERO: [u8; 8] = image8(encode_addi(10, 0, 0), ECALL);
 /// `addi a0, x0, 7; ecall` — synthetic exit status 7.
 pub const SYNTHETIC_EXIT_SEVEN: [u8; 8] = image8(encode_addi(10, 0, 7), ECALL);
 
+// These two private images are a regression fixture for the rejected identity
+// mixer. Their bytes are deliberately distinct while producing different
+// machine exits, and they remain in the closed catalog so the provider path is
+// tested instead of only the direct machine constructor.
+const COLLIDING_IMAGE_ZERO: [u8; 64] = image64(encode_addi(10, 0, 0), ECALL, 0);
+const COLLIDING_IMAGE_SEVEN: [u8; 64] = image64(encode_addi(10, 0, 7), ECALL, 0x0090_0000);
+
 const ECALL: u32 = 0x0000_0073;
 
 /// Resolve a closure application slot onto a known synthetic image.
@@ -89,14 +97,16 @@ const ECALL: u32 = 0x0000_0073;
 ///
 /// Unknown identities are [`ProviderError::TypeMismatch`].
 pub fn known_image(application: ApplicationGenerationRef) -> Result<GuestImage, ProviderError> {
-    let zero = GuestImage::admit(&SYNTHETIC_EXIT_ZERO).map_err(|_| ProviderError::InvalidLength)?;
-    if application.as_bytes() == zero.id().as_bytes() {
-        return Ok(zero);
-    }
-    let seven =
-        GuestImage::admit(&SYNTHETIC_EXIT_SEVEN).map_err(|_| ProviderError::InvalidLength)?;
-    if application.as_bytes() == seven.id().as_bytes() {
-        return Ok(seven);
+    for expected in [
+        SYNTHETIC_EXIT_ZERO.as_slice(),
+        SYNTHETIC_EXIT_SEVEN.as_slice(),
+        COLLIDING_IMAGE_ZERO.as_slice(),
+        COLLIDING_IMAGE_SEVEN.as_slice(),
+    ] {
+        let image = GuestImage::admit(expected).map_err(|_| ProviderError::InvalidLength)?;
+        if application.as_bytes() == image.id().as_bytes() && image.as_bytes() == expected {
+            return Ok(image);
+        }
     }
     Err(ProviderError::TypeMismatch)
 }
@@ -135,30 +145,57 @@ const fn image8(word0: u32, word1: u32) -> [u8; 8] {
     [a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]]
 }
 
-fn identity_of(bytes: &[u8]) -> GuestImageId {
-    let mut id = IMAGE_IDENTITY_DOMAIN;
-    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes();
-    for (slot, byte) in len.iter().enumerate() {
-        if let Some(cell) = id.get_mut(slot.saturating_add(24)) {
-            *cell ^= *byte;
-        }
+#[allow(clippy::arithmetic_side_effects)]
+const fn image64(word0: u32, word1: u32, word8: u32) -> [u8; 64] {
+    let a = word0.to_le_bytes();
+    let b = word1.to_le_bytes();
+    let c = word8.to_le_bytes();
+    let mut image = [0_u8; 64];
+    let mut index = 0;
+    while index < 4 {
+        image[index] = a[index];
+        image[index + 4] = b[index];
+        image[index + 32] = c[index];
+        index += 1;
     }
-    for (index, &byte) in bytes.iter().enumerate() {
-        let slot = index & 31;
-        if let Some(cell) = id.get_mut(slot) {
-            let salt = u8::try_from(index & 0xff).unwrap_or(u8::MAX);
-            *cell = cell.wrapping_add(byte).wrapping_add(salt);
-        }
-    }
-    GuestImageId(id)
+    image
+}
+
+fn content_identity(bytes: &[u8]) -> GuestImageId {
+    let mut hasher = Hasher::new_derive_key(IMAGE_IDENTITY_CONTEXT);
+    hasher.update(bytes);
+    GuestImageId(*hasher.finalize().as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{GuestImage, SYNTHETIC_EXIT_SEVEN, SYNTHETIC_EXIT_ZERO, known_image};
-    use crate::machine::MachineError;
-    use astrid_provider::ProviderError;
+    use super::{
+        COLLIDING_IMAGE_SEVEN, COLLIDING_IMAGE_ZERO, GuestImage, SYNTHETIC_EXIT_SEVEN,
+        SYNTHETIC_EXIT_ZERO, known_image,
+    };
+    use crate::fixtures::{alice_principal, instance_for_image, job_against};
+    use crate::interpreter::ReferenceInterpreter;
+    use crate::machine::{MachineError, PortableMachine};
+    use astrid_provider::{ExecutionOutcome, ExecutionProvider, ProviderError};
     use astrid_resource_types::ApplicationGenerationRef;
+
+    fn rejected_identity_of(bytes: &[u8]) -> [u8; 32] {
+        let mut id = *b"astrid.realm-compat.guest-img.v1";
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes();
+        for (slot, byte) in len.iter().enumerate() {
+            if let Some(cell) = id.get_mut(slot.saturating_add(24)) {
+                *cell ^= *byte;
+            }
+        }
+        for (index, &byte) in bytes.iter().enumerate() {
+            let slot = index & 31;
+            if let Some(cell) = id.get_mut(slot) {
+                let salt = u8::try_from(index & 0xff).unwrap_or(u8::MAX);
+                *cell = cell.wrapping_add(byte).wrapping_add(salt);
+            }
+        }
+        id
+    }
 
     #[test]
     fn synthetic_images_have_distinct_identities() {
@@ -193,6 +230,53 @@ mod tests {
         assert_eq!(
             GuestImage::admit(&[0_u8; 260]),
             Err(MachineError::InvalidImage)
+        );
+    }
+
+    #[test]
+    fn content_identity_and_provider_resolution_cannot_split_rejected_collision() {
+        assert_ne!(COLLIDING_IMAGE_ZERO, COLLIDING_IMAGE_SEVEN);
+        assert_eq!(
+            rejected_identity_of(&COLLIDING_IMAGE_ZERO),
+            rejected_identity_of(&COLLIDING_IMAGE_SEVEN)
+        );
+
+        let zero = GuestImage::admit(&COLLIDING_IMAGE_ZERO).unwrap();
+        let seven = GuestImage::admit(&COLLIDING_IMAGE_SEVEN).unwrap();
+        assert_ne!(zero.id(), seven.id());
+        assert_eq!(
+            known_image(zero.id().application_generation())
+                .unwrap()
+                .as_bytes(),
+            COLLIDING_IMAGE_ZERO
+        );
+        assert_eq!(
+            known_image(seven.id().application_generation())
+                .unwrap()
+                .as_bytes(),
+            COLLIDING_IMAGE_SEVEN
+        );
+
+        let mut zero_machine = PortableMachine::for_owner(alice_principal(), &zero, 64).unwrap();
+        let mut seven_machine = PortableMachine::for_owner(alice_principal(), &seven, 64).unwrap();
+        assert_eq!(zero_machine.run(alice_principal()), Ok(0));
+        assert_eq!(seven_machine.run(alice_principal()), Ok(7));
+
+        let provider = ReferenceInterpreter::new();
+        let zero_instance = instance_for_image(alice_principal(), &zero);
+        let zero_job = job_against(&zero_instance, alice_principal(), &[b"guest"]).unwrap();
+        let seven_instance = instance_for_image(alice_principal(), &seven);
+        let seven_job = job_against(&seven_instance, alice_principal(), &[b"guest"]).unwrap();
+        assert_eq!(
+            provider.exit(&zero_instance, &zero_job).unwrap().outcome(),
+            ExecutionOutcome::Exited { status: 0 }
+        );
+        assert_eq!(
+            provider
+                .exit(&seven_instance, &seven_job)
+                .unwrap()
+                .outcome(),
+            ExecutionOutcome::Exited { status: 7 }
         );
     }
 }

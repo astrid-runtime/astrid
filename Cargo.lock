@@ -809,6 +809,7 @@ dependencies = [
  "astrid-projection",
  "astrid-provider",
  "astrid-resource-types",
+ "blake3",
 ]
 
 [[package]]
