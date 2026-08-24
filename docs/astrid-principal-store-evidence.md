@@ -67,7 +67,8 @@ Assumptions:
     state, and derived state are distinguishable before root construction.
 14. Principal roots name typed commit objects, imports admit only the declared
     owning closure, and published placement epochs advance monotonically using
-    registered blob representations.
+    registered packed/direct representations. Unknown recipe, coverage,
+    profile-kind, and replica-locator tags fail closed during recovery.
 
 The evidence must test violations of assumptions 2–14 rather than hiding them.
 
@@ -287,20 +288,20 @@ specification functions.
 | STO-PROP-34 | Adding or replacing a representation contract preserves existing semantic identities whenever canonical output is equal |
 | STO-PROP-35 | Transform streams enforce confinement, backpressure, and execution bounds without admitting partial output |
 | STO-PROP-36 | Lossy encode/decode produces a distinct semantic identity and typed derivation rather than an equal representation binding |
-| STO-PROP-37 | Reconstructing any accepted direct, sliced, contiguous, compressed, delta, or generated representation recomputes the declared exact ObjectId |
+| STO-PROP-37 | Reconstructing any accepted representation recomputes the declared exact ObjectId; unknown recipe and locator tags fail closed before reconstruction |
 | STO-PROP-38 | Every crash prefix of representation publication recovers old, old-plus-new, or new placement, never a live object with no path |
 | STO-PROP-39 | Dropping the final representation, a transitive recipe dependency, or a leased placement is rejected before physical deletion |
 | STO-PROP-40 | Arena-only stores synthesize direct representations without changing any ObjectId, root, export, or quota |
 | STO-PROP-41 | Full export materializes the same canonical closure regardless of the locally selected physical representation |
 | STO-PROP-42 | A missing, unregistered, or dependency-incomplete profile makes every dependent candidate unavailable |
-| STO-PROP-43 | Any mismatch between compact coverage fields and the named canonical File is rejected at admission |
+| STO-PROP-43 | Exact coverage length must equal the reconstructed canonical ObjectRecord |
 | STO-PROP-44 | Every crash prefix around state publication activates the complete old pair or complete new pair, never mixed catalogue and placement roots |
-| STO-PROP-45 | Coverage traversal retains all File/ChunkTree metadata and never creates a dependency edge from a representation to its covered Chunk outputs |
-| STO-PROP-46 | Every adoption crash prefix recovers a sealed generation, non-authoritative incoming file, exact raw blob, or verified pre-existing blob without overwriting live bytes |
+| STO-PROP-45 | Exact coverage names one reconstructed object and does not invent extra coverage tags |
+| STO-PROP-46 | Unknown coverage, recipe, profile-kind, and replica-locator tags fail closed without reconstructing content |
 | STO-PROP-47 | Temporary-file checkpoint replacement preserves the valid old or new active state across every crash prefix, and append rolls over before either configured tail bound is exceeded |
 | STO-PROP-48 | Non-canonical, zero, output-understating, or exceeded reconstruction bounds reject the candidate without admitting partial output |
 | STO-PROP-49 | A forced BlobId digest collision with any unequal preimage field is fatal and never deduplicates |
-| STO-PROP-50 | Every adoption crash prefix before metadata durability leaves the new representation state inactive |
+| STO-PROP-50 | A crash before packed publication leaves the previous catalogue and placement pair authoritative |
 | STO-PROP-51 | Every allocator-visible creation or removal changes physical usage by that distinct extent's allocated bytes without changing logical usage |
 | STO-PROP-52 | Any insertion order yields the same physical-map root, and a point update replaces no node outside its radix path |
 | STO-PROP-53 | Metadata-arena, representation-journal, checkpoint, and CURRENT frames reject swapped magics, payload tags, identities, generations, and trailing bytes |
@@ -315,7 +316,7 @@ specification functions.
 | STO-PROP-62 | Restart without revocation policy blocks new transform admission while preserving reads through every admitted final path |
 | STO-PROP-63 | Every activation crash prefix uses complete implicit arena authority or a complete explicit direct catalogue, never a partial mapping |
 | STO-PROP-64 | Adoption recovery rejects wrong intent names, checksums, staging identities, namespace generations, modes, and trailing bytes without blocking unrelated keys |
-| STO-PROP-65 | File and ChunkTree records required by contiguous coverage receive direct placements in the same state CAS as that coverage |
+| STO-PROP-65 | File and ChunkTree records published through packed ingest receive placements in the same state CAS as their covering objects |
 | STO-PROP-66 | Hashing a context as message bytes or changing any physical identity scheme field disagrees with every registered golden vector |
 | STO-PROP-67 | Adoption rejects any outer/embedded staging mismatch, unknown source platform, altered file identity, or non-canonical key path before source mutation |
 
@@ -579,17 +580,11 @@ canonical records, and retained admission evidence. It does not treat an
 editable sidecar or filesystem timestamp as proof that every byte of a
 multi-terabyte blob is still unchanged.
 
-Direct arena frames retain their physical checksum validation. A contiguous
-blob is reverified per covered Chunk before bytes cross the logical read
-boundary; background scrub can recompute its whole BlobId, and an operator may
-require a full open-time pass. On a failed slice, the reader first discards any
-disposable slice offset, re-derives it from canonical coverage, and retries.
-A repeated physical mismatch, frame-checksum failure, or whole-BlobId mismatch
-quarantines only that `ReplicaV1`; every remaining replica for the same blob is
-tried. The representation is quarantined only when independently verified blob
-bytes fail its deterministic recipe, coverage, evidence, or canonical output.
-If every replica for the final recoverable path fails, the read returns an
-integrity error and audit records loss rather than returning unverified bytes.
+Direct arena frames retain their physical checksum validation. The current
+durable reader serves packed arena frames and verifies canonical records before
+returning bytes. Unknown replica-locator or recipe tags fail closed during
+recovery. Repeated frame or canonical-identity failures return an integrity
+error and audit the loss rather than returning unverified bytes.
 
 An authenticated Evidence object proves what admission observed and binds the
 normalized representation subject, BlobId, coverage, and runtime/profile
@@ -615,18 +610,13 @@ leases, and caller resource authority. A physical failure follows the
 replica-isolation procedure above; a representation-level validation failure
 quarantines that record. Selection continues only with another complete path.
 
-For a contiguous range, the File DAG supplies boundaries and identities. Cold
-reads obtain complete overlapping chunks, validate slices, reconstruct Chunk
+For a file range, the File DAG supplies boundaries and identities. Cold reads
+obtain complete overlapping packed chunks, validate slices, reconstruct Chunk
 records, and recompute each `ObjectId`. Boundary-neighbor checks follow the
 content grammar. Process-local principal evidence may skip proven work;
-durable state must be authenticated Evidence bound to File, representation,
-and BlobId.
-
-The blob's whole identity is verified at adoption and by scrub. This permits
-sequential read-ahead while chunk identities retain bounded random-read
-verification. A hosted `mmap` promise requires a provider-specific immutable
-handle and tamper/degradation story. Prior whole-blob verification is not
-protection against privileged mutation of a mapped host file.
+durable state must be authenticated Evidence bound to File and its packed
+representation. A hosted `mmap` promise still requires a provider-specific
+immutable handle and tamper/degradation story.
 
 ## 15. Physical representation failure matrix
 
@@ -674,20 +664,21 @@ Implementation follows this evidence order:
    arena bytes.
 3. Add representation and placement leases, final-path liveness proofs, and
    crash-prefix enumeration.
-4. Implement contiguous staged-file adoption and verified file-range reads.
-5. Teach compaction to choose between retained contiguous blobs and
-   materialized chunks while preserving receipts.
+4. Keep packed arena ingest and verified file-range reads on the same
+   canonical-chunk contract.
+5. Teach compaction to preserve packed placements and materialize canonical
+   chunks while preserving receipts; do not add a loose-file writer or reader.
 6. Add compressed, delta, and generated profiles only with pinned decoders,
    bounds, and corpus evidence.
 
-The benchmark matrix compares direct arena, packed slice, contiguous file,
-compressed, delta, and generated paths. It records ingest and reconstruction
-throughput, latency by range size, physical bytes read/written, CPU, peak
-resident memory, retained byte-time, metadata bytes, read amplification,
-first-touch verification, warm verification, post-reopen behavior, and
-compaction cost. Required workloads include random and repetitive files,
-version chains, model-scale content, one-live-slice amplification, cache-cold
-reads, concurrent principals, ENOSPC, and every named crash boundary.
+The benchmark matrix compares direct arena and packed slices, with any future
+transform profiles treated as separate experiments. It records ingest and
+reconstruction throughput, latency by range size, physical bytes read/written,
+CPU, peak resident memory, retained byte-time, metadata bytes, read
+amplification, first-touch verification, warm verification, post-reopen
+behavior, and compaction cost. Required workloads include random and
+repetitive files, version chains, model-scale content, cache-cold reads,
+concurrent principals, ENOSPC, and every named crash boundary.
 
 No representation may replace the last direct arena path until independent
 recovery, full materialized export/import, adversarial bounds, crash-prefix

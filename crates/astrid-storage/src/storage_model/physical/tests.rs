@@ -11,9 +11,9 @@ use std::process::{Command, Output};
 use crate::storage_model::{BlobId, InvocationId, ObjectId};
 
 use super::{
-    CanonicalChunkingProfile, Coverage, Dependency, PhysicalIdentity, PhysicalModelError,
-    ProfileDependency, ProfileKind, Recipe, ReconstructionBounds, RepresentationProfile,
-    RepresentationProfileId, RepresentationRecord, RepresentationRecordId,
+    Coverage, Dependency, PhysicalIdentity, PhysicalModelError, ProfileDependency, ProfileKind,
+    Recipe, ReconstructionBounds, RepresentationProfile, RepresentationProfileId,
+    RepresentationRecord, RepresentationRecordId,
 };
 
 #[derive(Clone, Copy)]
@@ -169,6 +169,13 @@ fn builtin_profile_round_trips_and_rejects_transform_fields() {
     assert_eq!(
         RepresentationProfile::decode(&unknown_kind),
         Err(PhysicalModelError::UnknownTag("profile-kind", u8::MAX))
+    );
+
+    let mut reserved_kind = encoded.clone();
+    reserved_kind[2] = 2;
+    assert_eq!(
+        RepresentationProfile::decode(&reserved_kind),
+        Err(PhysicalModelError::UnknownTag("profile-kind", 2))
     );
 
     let mut trailing = encoded;
@@ -353,23 +360,32 @@ fn representation_revalidates_public_coverage_variants() {
         ),
         Err(PhysicalModelError::InvalidCoverage(_))
     ));
-    assert!(matches!(
-        RepresentationRecord::new(
-            profile_id,
-            Coverage::CanonicalFileChunks {
-                file: object(4),
-                content_root: None,
-                logical_bytes: 1,
-                chunk_count: 1,
-                chunking_profile: CanonicalChunkingProfile::ASTRID_V1,
-            },
-            Recipe::ContiguousFile { blob: blob(5) },
-            1,
-            1,
-            Some(object(6)),
-        ),
-        Err(PhysicalModelError::InvalidCoverage(_))
-    ));
+    let encoded = RepresentationRecord::new(
+        profile_id,
+        Coverage::exact(object(2), 32).unwrap(),
+        Recipe::DirectCanonical { blob: blob(3) },
+        32,
+        32,
+        None,
+    )
+    .unwrap()
+    .encode()
+    .unwrap();
+    // version u16 + tagged profile identity (u16,u16,u32,digest)
+    let coverage_tag = 2 + 2 + 2 + 4 + 32;
+    assert_eq!(encoded[coverage_tag], 0);
+    let mut reserved = encoded.clone();
+    reserved[coverage_tag] = 1;
+    assert_eq!(
+        RepresentationRecord::decode(&reserved),
+        Err(PhysicalModelError::UnknownTag("coverage", 1))
+    );
+    let mut reserved_recipe = encoded;
+    reserved_recipe[coverage_tag + 1 + 2 + 2 + 4 + 32 + 8] = 2;
+    assert_eq!(
+        RepresentationRecord::decode(&reserved_recipe),
+        Err(PhysicalModelError::UnknownTag("recipe", 2))
+    );
 }
 
 #[test]
@@ -441,9 +457,6 @@ fn built_in_recipe_families_round_trip_under_their_only_compatible_profiles() {
     let packed =
         RepresentationProfile::new_builtin(ProfileKind::PackedCanonical, bounds(), object(1))
             .unwrap();
-    let contiguous =
-        RepresentationProfile::new_builtin(ProfileKind::ContiguousFile, bounds(), object(1))
-            .unwrap();
     assert_record_round_trip(
         &direct_profile(),
         exact.clone(),
@@ -460,20 +473,6 @@ fn built_in_recipe_families_round_trip_under_their_only_compatible_profiles() {
             length: 64,
         },
         64,
-        Some(evidence),
-    );
-    assert_record_round_trip(
-        &contiguous,
-        Coverage::canonical_file_chunks(
-            object(10),
-            Some(object(11)),
-            300_000,
-            2,
-            CanonicalChunkingProfile::ASTRID_V1,
-        )
-        .unwrap(),
-        Recipe::ContiguousFile { blob: blob(12) },
-        128,
         Some(evidence),
     );
 }
@@ -551,20 +550,6 @@ fn packed_slice_rejects_length_mismatch_and_overflow() {
             Err(PhysicalModelError::InvalidRecipe(_))
         ));
     }
-}
-
-#[test]
-fn canonical_file_coverage_rejects_impossible_shapes() {
-    let profile = CanonicalChunkingProfile::ASTRID_V1;
-    assert!(Coverage::canonical_file_chunks(object(1), None, 0, 0, profile).is_ok());
-    assert!(matches!(
-        Coverage::canonical_file_chunks(object(1), Some(object(2)), 0, 1, profile),
-        Err(PhysicalModelError::InvalidCoverage(_))
-    ));
-    assert!(matches!(
-        Coverage::canonical_file_chunks(object(1), Some(object(2)), 1024, 2, profile),
-        Err(PhysicalModelError::InvalidCoverage(_))
-    ));
 }
 
 #[test]
@@ -770,37 +755,6 @@ fn independent_reader_enforces_the_direct_input_bound() {
         output_bytes,
         output_bytes,
         None,
-    )
-    .unwrap();
-    assert!(
-        !run_independent_fixture(&fixture_for(&profile, encoded_blob, &record))
-            .status
-            .success()
-    );
-}
-
-#[test]
-fn independent_reader_rejects_a_contiguous_blob_length_mismatch() {
-    let profile =
-        RepresentationProfile::new_builtin(ProfileKind::ContiguousFile, bounds(), object(1))
-            .unwrap();
-    let profile_id = profile.identify(&Blake3PhysicalIdentity).unwrap();
-    let encoded_blob = b"short file";
-    let blob_id = BlobId::identify(&Blake3PhysicalIdentity, profile_id, encoded_blob).unwrap();
-    let record = RepresentationRecord::new(
-        profile_id,
-        Coverage::canonical_file_chunks(
-            object(2),
-            Some(object(3)),
-            64,
-            1,
-            CanonicalChunkingProfile::ASTRID_V1,
-        )
-        .unwrap(),
-        Recipe::ContiguousFile { blob: blob_id },
-        64,
-        64,
-        Some(object(4)),
     )
     .unwrap();
     assert!(

@@ -1,14 +1,12 @@
 # Astrid Exact Physical Representations
 
-Status: design contract; no capsule or WIT surface is activated
+Status: historical design reference; no capsule or WIT surface is activated
 
 Tracks: [#1396](https://github.com/astrid-runtime/astrid/issues/1396)
 
 This document defines the physical seam between a logical `ObjectId` and the
-bytes from which that object can be recovered. It covers the current arena,
-adopted contiguous staging files, packed and compressed bytes, exact deltas,
-and deterministic generator recipes without turning any of them into a second
-logical object model.
+bytes from which that object can be recovered. The current durable path is the
+packed arena.
 
 The deterministic `export_closure` bundle remains the archival authority. The
 live engine, its representation catalogue, placement records, and indexes are
@@ -36,7 +34,7 @@ PlacementEpoch
 `SemanticId` remains above this boundary. A semantic contract may equate typed values, but a
 physical representation reproduces the exact `ObjectRecord` named by `ObjectId`; similarity
 changes neither identity nor recoverability. The current `BlobId -> ObjectId` relation remains
-the direct-one-object subset; contiguous files may cover many chunks and objects may use many blobs.
+the direct-one-object subset; objects may use many blobs.
 
 ## Binding invariants
 
@@ -80,7 +78,7 @@ record:
 ```text
 RepresentationProfileV1 {
     version: u16 = 1,
-    kind: direct-canonical | packed-canonical | contiguous-file | transform,
+    kind: direct-canonical | packed-canonical | transform,
     decoder_or_generator: Option<ObjectId>,
     transform_contract: Option<ObjectId>,
     runtime_semantic_profile: Option<ObjectId>,
@@ -116,7 +114,7 @@ different result under the same profile.
 The profile pins the encoding grammar, decoder or generator closure,
 deterministic runtime profile, dictionaries and other immutable data,
 reconstruction-visible failure behavior, and reconstruction bounds. Built-in
-direct, packed, and contiguous profiles pin their frozen engine grammar rather
+direct and packed profiles pin their frozen engine grammar rather
 than a transform capsule.
 Registering a transform-backed profile is operator/signature authority: exact
 output verification prevents substitution, but an untrusted decoder can still
@@ -128,7 +126,6 @@ Profile and recipe compatibility is closed in format one:
 |---|---|---|---|
 | `direct-canonical` | `DirectCanonical` | `Exact` | all absent |
 | `packed-canonical` | `PackedSlice` | `Exact` | all absent |
-| `contiguous-file` | `ContiguousFile` | `CanonicalFileChunks` | all absent |
 | `transform` | `Compressed`, `Delta`, or `Generated` | `Exact` | all present |
 
 For built-in profiles, `canonical_parameters` is empty and
@@ -210,7 +207,7 @@ specification, while a transform profile retains the role-typed set derived
 above. Nothing else may be fetched ambiently during replay.
 
 The record array is exactly the sorted unique union of `Profile(profile)` and
-these recipe-derived entries: direct, packed, and contiguous add
+these recipe-derived entries: direct and packed add
 `PhysicalBlob(blob)`; compressed adds `PhysicalBlob(blob)` and its optional
 `PhysicalBlob(dictionary)`; delta adds `PhysicalBlob(patch)` and
 `LogicalObject(base)`; generated adds `Invocation(invocation)` and
@@ -240,11 +237,11 @@ The canonical wire follows the existing format-one discipline:
   length`, then exactly that many digest bytes;
 - every byte string and sequence begins with a `u64` byte or item count;
 - every option is one byte (`0` absent, `1` present) followed by the value;
-- profile-kind tags are direct canonical `0`, packed canonical `1`,
-  contiguous file `2`, and transform `3`;
-- coverage tags are exact `0` and canonical-file-chunks `1`;
-- recipe tags are direct `0`, packed slice `1`, contiguous file `2`,
-  compressed `3`, delta `4`, and generated `5`; and
+- profile-kind tags are direct canonical `0`, packed canonical `1`, and
+  transform `3` (tag `2` is invalid);
+- coverage tags are exact `0` (tag `1` is invalid);
+- recipe tags are direct `0`, packed slice `1`, compressed `3`, delta `4`,
+  and generated `5` (tag `2` is invalid); and
 - dependency tags are logical object `0`, physical blob `1`, representation `2`, profile `3`, invocation `4`, and evidence `5`.
 
 Counts must equal the bytes or items consumed, reserved values are rejected,
@@ -278,54 +275,17 @@ CoverageV1 =
         object: ObjectId,
         canonical_record_bytes: u64,
     }
-  | CanonicalFileChunks {
-        file: ObjectId,
-        content_root: Option<ObjectId>,
-        logical_bytes: u64,
-        chunk_count: u64,
-        chunking_profile: ChunkingProfile,
-    }
 ```
-
-`CanonicalFileChunks` is the compact form required for staged-file adoption.
-The referenced canonical File and ChunkTree records determine a unique ordered
-sequence of chunk identities and lengths. The contiguous blob contains their
-payload bytes in exactly that order. The representation therefore covers each
-Chunk record without persisting a second `(ObjectId, offset, length)` record
-for every chunk. A disposable reverse index may cache those slices.
 
 The coverage fields are assertions, not an alternate File descriptor.
 For `Exact`, `canonical_record_bytes` equals the byte length of the target
 ObjectId's complete canonical `ObjectRecord` encoding produced by replay;
 admission and recovery reconstruct, identify, and compare that record before
 accepting the length. An arbitrary claimed length is invalid.
-Admission decodes `file` and requires `content_root`, `logical_bytes`,
-`chunk_count`, and `chunking_profile` to equal the canonical File fields and
-its ownership edge exactly. It then validates the complete canonical tree
-shape and totals. A mismatch is rejected; readers never choose between the
-coverage copy and the File. This makes one accepted coverage encoding name one
-File DAG.
 
-Coverage traversal is output-aware. It retains the File record and every
-reachable ChunkTree record as physical metadata dependencies, validates their
-canonical shape, and stops whenever an ownership edge reaches a Chunk. That
-Chunk is a covered output, not a dependency of the representation that
-reconstructs it. For a single-chunk File the content edge therefore stops
-immediately; for an empty File there are no outputs. Ordinary owning-closure
-traversal must not be substituted here, because it would turn covered Chunk
-leaves into a self-dependency. The derived metadata set is canonical and need
-not be serialized per chunk.
-
-The File and ChunkTree metadata remain ordinary canonical records. They are
-small and are not replaced by the raw file blob. If the File ceases to be
-logically live while one of its chunks remains live elsewhere, representation
-GC must either retain the complete canonical File and ChunkTree metadata
-together with the whole blob, or materialize every surviving chunk before
-dropping the file-wide representation and its metadata.
-Physical retention does not revive the dead File in a principal closure.
-
-New coverage grammars require new tags. A decoder must never reinterpret an
-old coverage record.
+File and ChunkTree metadata remain ordinary canonical records published
+through packed arena ingest. New coverage grammars require new tags. A
+decoder must never reinterpret an old coverage record.
 
 ### Recipes
 
@@ -337,7 +297,6 @@ RecipeV1 =
         offset: u64,
         length: u64,
     }
-  | ContiguousFile { blob: BlobId }
   | Compressed {
         blob: BlobId,
         dictionary: Option<BlobId>,
@@ -354,13 +313,11 @@ RecipeV1 =
 ```
 
 `DirectCanonical` and `PackedSlice` reproduce one complete canonical
-`ObjectRecord` encoding. `ContiguousFile` is valid only with
-`CanonicalFileChunks`; raw chunk payload plus the fixed Chunk grammar
-reconstructs each covered canonical Chunk record. `Compressed`, `Delta`, and
+`ObjectRecord` encoding. `Compressed`, `Delta`, and
 `Generated` must produce a complete canonical record before identity
 validation.
 
-For direct, packed, contiguous, compressed, and delta recipes, the
+For direct, packed, compressed, and delta recipes, the
 `PlacementEntry.profile` of the primary `blob` or `patch` must equal
 `RepresentationRecordV1.profile`. A dictionary and any other dependency blob
 retains its own profile. A mismatch is invalid rather than an opportunity to
@@ -393,8 +350,8 @@ RepresentationAdmissionEvidenceV1 {
 }
 ```
 
-Method tags are direct `0`, packed slice `1`, contiguous file `2`, compressed
-`3`, and delta `4`, and must match the recipe. The subject is
+Method tags are direct `0`, packed slice `1`, compressed `3`, and delta `4`
+(tag `2` is invalid), and must match the recipe. The subject is
 `PhysicalId("astrid-representation-admission-subject-v1\0", bytes)` where
 `bytes` is the candidate representation's canonical encoding normalized by
 setting `verification_evidence` absent and removing precisely its derived
@@ -410,11 +367,9 @@ canonical-record byte length as `u64`. Counts and lengths are checked. The
 observed byte fields equal the primary placement's encoded length and the
 record's `canonical_output_bytes` respectively.
 
-For `Exact`, the transcript has one output. For `CanonicalFileChunks`, traversal
-is the File DAG's logical chunk-occurrence order and emits an ObjectId only on
-its first occurrence; later occurrences of the same ObjectId are skipped.
-`covered_output_count` is therefore the unique emitted count, without sorting,
-and agrees with the unique-object rule for `canonical_output_bytes`.
+For `Exact`, the transcript has one output. `covered_output_count` is the
+unique emitted count and agrees with the unique-object rule for
+`canonical_output_bytes`.
 
 The engine reconstructs the outputs, recomputes the evidence, and admits only
 the identical ObjectId; a guest or importer never supplies a trusted claim.
@@ -526,7 +481,6 @@ ReplicaV1 {
     storage_node: StorageNodeId,      // canonical wire is u32
     locator: ArenaFrame { arena_generation: u64, offset: u64,
                           payload_length: u64, frame_checksum: [u8; 32] }
-           | LooseBlob { namespace_generation: u64 }
            | PackFrame { pack_generation: u64, offset: u64,
                          frame_length: u64, frame_checksum: [u8; 32] },
 }
@@ -543,7 +497,6 @@ root, locator paths are canonical ASCII and never supplied by an index:
 ```text
 ArenaFrame generation 0:  objects.arena
 ArenaFrame generation N:  representations/blobs/arenas/<N:016x>.arena
-LooseBlob generation N:   representations/blobs/loose/<N:016x>/<BlobId>.blob
 PackFrame generation N:   representations/blobs/packs/<N:016x>.pack
 ```
 
@@ -572,29 +525,6 @@ and the checksum equals the header. Payload blob, profile, and encoded length
 must equal the `PlacementEntryV1`; the encoded bytes reproduce the BlobId.
 Generation-zero arena locators instead read the existing `ASTOBJ1\0` object
 frame grammar. Pack ranges are in-bounds and non-overlapping.
-
-A `LooseBlob` keeps encoded bytes raw for zero-copy adoption and requires the
-sibling `<BlobId>.meta` beside `<BlobId>.blob`. The metadata is one common
-format-one frame with magic `ASTBLM1\0` and payload:
-
-```text
-LooseBlobMetaV1 = version:u16 = 1 || blob:BlobId
-    || profile:RepresentationProfileId || encoded_length:u64
-```
-
-Metadata publishes first via exclusive `<BlobId>.meta.tmp`, file flush,
-reopen verification, no-replace rename, and directory flush; only then may the
-raw blob install no-replace. Equal occupied metadata is reusable after exact
-frame comparison; unequal metadata is a fatal collision. A raw blob without
-valid metadata is unattributed and never reused. The placement CAS follows
-verification of both files. Thus a crash before the CAS retains the original
-profile preimage, and admission can stream the exact raw length to collision-
-compare and rederive the BlobId. Adoption recovery additionally binds this
-metadata to its durable intent.
-
-Locators agree with frame headers; profile and length reproduce the BlobId
-preimage. Counts never trust a disposable index. Tags are arena `0`, loose `1`,
-and pack `2`.
 
 The catalogue and placement roots become authoritative only as one pair:
 
@@ -660,7 +590,7 @@ The following are disposable and may be rebuilt from the catalogue,
 placement set, and self-identifying blobs:
 
 - `ObjectId -> candidate RepresentationRecordId[]` reverse lookup;
-- chunk slice offsets derived from `CanonicalFileChunks` traversal;
+- chunk slice offsets rebuilt from canonical File/ChunkTree records;
 - `BlobId -> local file/arena offset` lookup pages;
 - verified-object, verified-edge, and cost-model caches; and
 - access-frequency and locality observations.
@@ -693,60 +623,6 @@ representation failure; neither is an untyped "candidate" failure.
 The operator policy, bounded search, and measurement contract are normative in
 [astrid-storage-performance.md](astrid-storage-performance.md#representation-selection-cost-model).
 
-## Publication and replacement
-
-General representation publication uses this order:
-
-1. reserve temporary physical bytes, resident memory, and compute from the
-   operator resource authority;
-2. create or locate candidate blobs without making them authoritative;
-3. recompute every `BlobId`, reconstruct every declared target, compare
-   candidate-equal existing bytes, and produce verification evidence;
-4. server-identify and append every new verification Evidence `ObjectRecord`
-   and other logical dependency to `objects.arena`, flush it, and add each
-   object's direct representation and exact arena placement to the candidate
-   physical state;
-5. flush all new blobs and their containing directories;
-6. append and flush new profile/representation records, path-copy catalogue
-   nodes, placement nodes, and their candidate roots;
-7. under the representation mutation fence, recheck that every evidence object
-   and its direct recovery path is present, plus all other dependencies, limits, and
-   the expected `RepresentationStateId`;
-8. append and flush one state record and representation-journal CAS binding the new
-   catalogue root and placement set;
-9. release temporary reservations; and
-10. retire replaced representations only after reader and transaction leases
-   drain.
-
-Publishing an alternate representation before any principal references its
-objects is safe: it is an unowned recoverable cache entry. Publishing a
-principal root before at least one representation is durable and catalogued is
-forbidden. Root commit revalidates representation liveness while holding the
-same mutation fence used by the resurrection rule.
-
-Replacement is additive before it is subtractive:
-
-```text
-old valid
-    -> old valid + new staged
-    -> old valid + new published
-    -> new published, old retiring
-    -> new published
-```
-
-There is no state in which neither path is valid. ENOSPC, cancellation,
-verification failure, or a root conflict leaves the old catalogue and
-placement authoritative. A durability failure poisons and reopens the engine
-through the existing recovery path before another mutation.
-
-## Contiguous staged-file adoption
-
-The byte-exact intent grammar, crash protocol, and one-write adoption path are
-normative in
-[astrid-contiguous-staged-file-adoption.md](astrid-contiguous-staged-file-adoption.md).
-Adoption is a consumer of this representation contract, never a second
-publication path.
-
 ## Liveness, GC, and compaction
 
 Let `L` be the set of live logical `ObjectId`s and `R` the selected physical
@@ -764,9 +640,9 @@ recoverable.
 
 Logical reachability and representation reachability are separate fact
 families. The existing format-one `GcFactSnapshotId` continues to describe the
-logical object universe and root/pin reachability. Representation selection and
-blob retirement use a separate canonical representation-placement snapshot;
-they do not reinterpret historical GC snapshots or receipts.
+logical object universe and root/pin reachability. Any future representation
+placement would use a separate canonical snapshot; current packed arena
+collection reclaims packed arena media only.
 
 The native collector enforces both proofs while holding the mutation fence.
 Tensor Logic may explain or audit the relations, but it cannot authorize
@@ -781,16 +657,9 @@ Two races receive explicit fences:
   placement epoch. Compaction may install a new path but cannot remove the
   leased path until the handle closes.
 
-A contiguous blob can retain far more bytes than the surviving slices need.
-Compaction measures this amplification. It may keep the blob for hot sequential
-reads, materialize independent live chunks, or add a compressed representation
-before retiring it. It must never delete the blob while it is the final path
-for any live covered object.
-
-Compaction is the preferred representation-migration window because it already
-streams live bytes. Reverification, sketches, reordering, recompression, and
-contiguous materialization may share that traversal, while their CPU,
-metadata, and writes remain measured rather than called free.
+Current compaction streams live packed arena bytes and preserves canonical
+chunk identities. Reverification, sketches, reordering, and any future
+transform remain measured experiments rather than implicit writers.
 
 ## Accounting and privacy
 
@@ -913,8 +782,8 @@ Arena-only stores require no principal migration:
 2. Creating an explicit representation catalogue is additive. Until the amended
    `format-spec-object` marker is durable, the arena remains the required recovery path.
 3. Alternate representations may be populated without changing roots.
-4. Compaction may remove the final arena copy only after `store.meta` atomically
-   names the amended RÚNATAL `format-spec-object` that defines the catalogue.
+4. Compaction preserves the final packed arena copy; no alternate representation
+   may replace it through this compatibility path.
 5. Downgrade materializes, flushes, and verifies canonical arena records before
    atomically restoring the predecessor `format-spec-object`; only then may it reclaim representation state.
 
@@ -922,10 +791,9 @@ The format-spec marker, catalogue, and placement formats are engine-local
 recovery state. They receive the same torn-tail and byte-prefix crash testing
 as the arena. Before activation, the store's in-band RÚNATAL specification and
 independent reader must learn their byte-exact grammar and be able to enumerate
-every representation. Direct and contiguous materialized profiles must be
-recoverable without Astrid code. Transform recipes may remain an optional live
-economy only because their complete archived closure is retained and full
-export materializes their outputs; they do not weaken RÚNATAL's canonical
+every packed representation. Unknown recipe, profile-kind, and replica-locator
+tags fail closed. Transform recipes may remain model grammar only because full
+export materializes canonical records; they do not weaken RÚNATAL's canonical
 materialized-export promise.
 
 ## Lifecycle summary
@@ -935,9 +803,9 @@ admission
     untrusted candidate -> bounded reconstruction -> identity comparison
     -> durable staging -> catalogue/placement publication
 
-adoption
-    durable sealed file -> one-pass DAG and BlobId -> durable rename intent
-    -> blob placement -> representation publication -> principal root CAS
+ingest
+    staged home files -> packed arena frames -> representation publication
+    -> principal root CAS
 
 selection
     authorized ObjectId -> constrained candidates -> lease -> reconstruct

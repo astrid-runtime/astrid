@@ -10,15 +10,12 @@ use std::time::{Duration, Instant};
 use astrid_core::dirs::AstridHome;
 use astrid_core::identity::PrincipalUid;
 use astrid_storage::content_dag::{ContentObjectSink, build_content_streaming};
-use astrid_storage::engine::{DurableEngine, RecoveryLimits};
-use astrid_storage::storage_model::{
-    ObjectClass, ObjectFormatVersion, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord,
-};
+use astrid_storage::storage_model::{ObjectId, ObjectIdentity, ObjectRecord};
 use astrid_storage::{
     Blake3ObjectIdentityV1, ChunkingProfile, ContentName, KvQuotaResolver,
     NativeContentStagingArea, NativePrincipalContentStore, ObjectCacheCapacity, ObjectCacheConfig,
-    ObjectCacheController, RuntimePrincipalStore, StateOwner, StateOwnerCodecV2,
-    open_runtime_principal_store, open_runtime_principal_store_with_object_cache,
+    ObjectCacheController, RuntimePrincipalStore, StateOwner, open_runtime_principal_store,
+    open_runtime_principal_store_with_object_cache,
 };
 
 use super::config::Config;
@@ -40,7 +37,6 @@ pub(super) async fn run(
     benchmark_native_large_writes(config, root, source, report)?;
     benchmark_staging_large_writes(config, root, source, report)?;
     benchmark_content_compute(config, source, report)?;
-    benchmark_contiguous_copy_fallback(config, root, source, report)?;
     benchmark_bulk_ingest(config, root, source, source_digest, report).await?;
     benchmark_small_files(config, root, report)?;
     benchmark_runtime(config, root, source, source_digest, report).await?;
@@ -65,47 +61,6 @@ pub(super) async fn run(
         "astrid_concurrent_shared_read_warm",
         "astrid_read_warm",
     )?;
-    Ok(())
-}
-
-fn benchmark_contiguous_copy_fallback(
-    config: &Config,
-    root: &Path,
-    source: &Path,
-    report: &mut Report,
-) -> BenchResult<()> {
-    let mut samples = Vec::with_capacity(config.samples);
-    for _ in 0..config.samples {
-        let directory = tempfile::tempdir_in(root)?;
-        let engine = DurableEngine::<StateOwner, Blake3ObjectIdentityV1, StateOwnerCodecV2>::open(
-            directory.path(),
-            Blake3ObjectIdentityV1,
-            StateOwnerCodecV2,
-            RecoveryLimits::process_addressable(),
-        )?;
-        let specification = ObjectRecord::new(
-            ObjectKind::Evidence,
-            ObjectFormatVersion::V1,
-            b"storage_io contiguous fallback specification".to_vec(),
-            Vec::new(),
-            0,
-            ObjectClass::Metadata,
-        )?;
-        let (specification, _) = engine.persist_standalone_object(&specification)?;
-        engine.ensure_direct_representation_catalogue(specification, &[specification])?;
-        let prepared = engine.prepare_contiguous_file(
-            ChunkingProfile::ASTRID_V1,
-            config.bytes,
-            File::open(source)?.take(config.bytes),
-        )?;
-        let started = Instant::now();
-        black_box(
-            engine.publish_contiguous_copy(prepared, File::open(source)?.take(config.bytes))?,
-        );
-        samples.push(started.elapsed());
-        engine.close()?;
-    }
-    report.record_bytes("astrid_contiguous_copy_fallback", config.bytes, samples);
     Ok(())
 }
 

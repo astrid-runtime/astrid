@@ -109,7 +109,7 @@ def decode_profile(data):
     if version != 1:
         raise FormatError("unsupported representation profile version")
     kind = cursor.integer(1)
-    if kind > 3:
+    if kind not in (0, 1, 3):
         raise FormatError("unknown representation profile kind")
     decoder = optional_identity(cursor, LOGICAL_SCHEME)
     contract = optional_identity(cursor, LOGICAL_SCHEME)
@@ -191,31 +191,6 @@ def encode_profile(profile):
     return bytes(output)
 
 
-def decode_chunking_profile(cursor):
-    algorithm = cursor.integer(1)
-    revision = cursor.integer(2)
-    normalization = cursor.integer(1)
-    minimum = cursor.integer(4)
-    average = cursor.integer(4)
-    maximum = cursor.integer(4)
-    seed = cursor.integer(8)
-    if (algorithm, revision, normalization) != (1, 1, 1):
-        raise FormatError("unsupported chunking profile")
-    if (
-        not 64 <= minimum <= 1_048_576
-        or not 256 <= average <= 4_194_304
-        or not 1024 <= maximum <= 16_777_216
-        or not minimum < average < maximum
-        or average & (average - 1)
-    ):
-        raise FormatError("invalid chunking profile")
-    return (algorithm, revision, normalization, minimum, average, maximum, seed)
-
-
-def encode_chunking_profile(profile):
-    return struct.pack("<BHBIIIQ", *profile)
-
-
 def decode_coverage(cursor):
     tag = cursor.integer(1)
     if tag == 0:
@@ -223,31 +198,13 @@ def decode_coverage(cursor):
         if not value[2]:
             raise FormatError("zero exact canonical record length")
         return value
-    if tag == 1:
-        file_id = identity(cursor, LOGICAL_SCHEME)
-        root = optional_identity(cursor, LOGICAL_SCHEME)
-        logical_bytes = cursor.integer(8)
-        chunk_count = cursor.integer(8)
-        profile = decode_chunking_profile(cursor)
-        if not logical_bytes:
-            if root is not None or chunk_count:
-                raise FormatError("empty file has content coverage")
-        elif root is None or not chunk_count or ((chunk_count == 1) != (logical_bytes <= profile[5])):
-            raise FormatError("non-canonical file coverage shape")
-        return (tag, file_id, root, logical_bytes, chunk_count, profile)
     raise FormatError("unknown coverage tag")
 
 
 def encode_coverage(coverage):
-    if coverage[0] == 0:
-        return b"\0" + identity_bytes(coverage[1]) + struct.pack("<Q", coverage[2])
-    return (
-        b"\1"
-        + identity_bytes(coverage[1])
-        + encode_optional(coverage[2])
-        + struct.pack("<QQ", coverage[3], coverage[4])
-        + encode_chunking_profile(coverage[5])
-    )
+    if coverage[0] != 0:
+        raise FormatError("unknown coverage tag")
+    return b"\0" + identity_bytes(coverage[1]) + struct.pack("<Q", coverage[2])
 
 
 def decode_recipe(cursor):
@@ -264,8 +221,6 @@ def decode_recipe(cursor):
         if not recipe[3] or recipe[2] + recipe[3] > (1 << 64) - 1:
             raise FormatError("unbounded packed-slice range")
         return recipe
-    if tag == 2:
-        return (tag, identity(cursor, PHYSICAL_SCHEME))
     if tag == 3:
         return (
             tag,
@@ -320,7 +275,7 @@ def encode_dependency(value):
 def derived_dependencies(profile, recipe, evidence):
     dependencies = [(3, profile)]
     tag = recipe[0]
-    if tag in (0, 1, 2):
+    if tag in (0, 1):
         dependencies.append((1, recipe[1]))
     elif tag == 3:
         dependencies.append((1, recipe[1]))
@@ -361,14 +316,9 @@ def decode_representation(data):
         raise FormatError("invalid representation output bound")
     if coverage[0] == 0 and canonical_output_bytes != coverage[2]:
         raise FormatError("exact output byte count mismatch")
-    if coverage[0] == 1 and ((coverage[4] == 0) != (canonical_output_bytes == 0)):
-        raise FormatError("file output byte count mismatch")
     if recipe[0] == 0:
         if coverage[0] != 0:
             raise FormatError("direct recipe has non-exact coverage")
-    elif recipe[0] == 2:
-        if coverage[0] != 1 or evidence is None:
-            raise FormatError("contiguous recipe lacks file coverage or evidence")
     elif recipe[0] == 5:
         if coverage[0] != 0 or evidence != recipe[3]:
             raise FormatError("generated recipe evidence mismatch")
@@ -567,8 +517,6 @@ def decode_locator(cursor):
         if not locator[3]:
             raise FormatError("arena locator has zero payload")
         return locator
-    if tag == 1:
-        return (tag, cursor.integer(8))
     if tag == 2:
         locator = (tag, cursor.integer(8), cursor.integer(8), cursor.integer(8), cursor.take(32))
         if locator[3] <= 52:
@@ -579,10 +527,7 @@ def decode_locator(cursor):
 
 def encode_locator(locator):
     output = bytearray([locator[0]])
-    if locator[0] == 1:
-        output += struct.pack("<Q", locator[1])
-    else:
-        output += struct.pack("<QQQ", locator[1], locator[2], locator[3]) + locator[4]
+    output += struct.pack("<QQQ", locator[1], locator[2], locator[3]) + locator[4]
     return bytes(output)
 
 
@@ -897,7 +842,7 @@ def decode_fixture(path):
         raise FormatError("representation names another profile")
     compatible = (
         (profile["kind"], record["recipe"][0], record["coverage"][0])
-        in ((0, 0, 0), (1, 1, 0), (2, 2, 1), (3, 3, 0), (3, 4, 0), (3, 5, 0))
+        in ((0, 0, 0), (1, 1, 0), (3, 3, 0), (3, 4, 0), (3, 5, 0))
     )
     if not compatible:
         raise FormatError("profile, recipe, and coverage are incompatible")
@@ -917,8 +862,6 @@ def decode_fixture(path):
             raise FormatError("direct blob exceeds its profile input bound")
         if len(encoded_blob) != record["canonical_output_bytes"]:
             raise FormatError("direct blob length differs from canonical output")
-    if record["recipe"][0] == 2 and len(encoded_blob) != record["coverage"][3]:
-        raise FormatError("contiguous blob length differs from logical file length")
     result = {
         "profile": identity_text(profile_id),
         "blob": identity_text(blob_id),

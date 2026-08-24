@@ -9,11 +9,12 @@ use super::format_amendment::{
     PRE_DENSE_RADIX_FORMAT_SPEC_ID, PRE_FASTCDC_FREEZE_FORMAT_SPEC_ID,
     PRE_FLEET_OWNER_FORMAT_SPEC_ID, PRE_GC_OUTBOX_FORMAT_SPEC_ID, PRE_KV_TRANSITION_FORMAT_SPEC_ID,
     PRE_MECHANICAL_AUDIT_FORMAT_SPEC_ID, PRE_PHYSICAL_CATALOGUE_FORMAT_SPEC_ID,
-    PRE_RUNATAL_NAMING_FORMAT_SPEC_ID, PRE_SHA384_ATTESTATION_FORMAT_SPEC_ID,
-    PRE_WORKSPACE_BRANCH_FORMAT_SPEC_ID, STORE_METADATA_FILE, format_spec_record,
-    legacy_store_metadata, pre_fleet_owner_store_metadata, pre_representation_store_metadata,
-    prepare_catalog_specification, prepare_destination, prepare_format_specification,
-    previous_store_metadata, representation_bootstrap_objects, store_metadata,
+    PRE_RESERVED_REPRESENTATION_TAG_FORMAT_SPEC_ID, PRE_RUNATAL_NAMING_FORMAT_SPEC_ID,
+    PRE_SHA384_ATTESTATION_FORMAT_SPEC_ID, PRE_WORKSPACE_BRANCH_FORMAT_SPEC_ID,
+    STORE_METADATA_FILE, format_spec_record, legacy_store_metadata, pre_fleet_owner_store_metadata,
+    pre_representation_store_metadata, prepare_catalog_specification, prepare_destination,
+    prepare_format_specification, previous_store_metadata, representation_bootstrap_objects,
+    store_metadata,
 };
 use super::{
     Blake3ObjectIdentityV1, RuntimeEngine, StateOwnerCodecV1, StateOwnerCodecV2, StateOwnerV1,
@@ -116,6 +117,7 @@ fn completed_prior_v1_stores_are_selected_for_runatal_amendment() {
     // remains an in-place predecessor.  Opening it selects the amendment
     // path rather than silently treating an unknown kind as Derived.
     assert_prior_format_is_selected(PRE_WORKSPACE_BRANCH_FORMAT_SPEC_ID, false);
+    assert_prior_current_projection_is_selected(PRE_RESERVED_REPRESENTATION_TAG_FORMAT_SPEC_ID);
 }
 
 fn assert_pre_fleet_owner_format_is_selected() {

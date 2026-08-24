@@ -636,14 +636,14 @@ pub use gc_evidence::{
     RetentionPolicyId, TensorLogicProofId,
 };
 pub use physical::{
-    CanonicalChunkingProfile, CanonicalPhysicalMap, Coverage, Dependency, PhysicalIdentity,
-    PhysicalMapDomain, PhysicalMapKey, PhysicalMapNode, PhysicalMapNodeId, PhysicalModelError,
-    PlacementEntry, PlacementSet, PlacementSetId, ProfileDependency, ProfileKind, Recipe,
-    ReconstructionBounds, Replica, ReplicaLocator, RepresentationAdmissionEvidence,
-    RepresentationAdmissionMethod, RepresentationAdmissionSubjectId,
-    RepresentationAdmissionTranscript, RepresentationCatalogueRoot, RepresentationCatalogueRootId,
-    RepresentationOutputObservation, RepresentationProfile, RepresentationProfileId,
-    RepresentationRecord, RepresentationRecordId, RepresentationState, RepresentationStateId,
+    CanonicalPhysicalMap, Coverage, Dependency, PhysicalIdentity, PhysicalMapDomain,
+    PhysicalMapKey, PhysicalMapNode, PhysicalMapNodeId, PhysicalModelError, PlacementEntry,
+    PlacementSet, PlacementSetId, ProfileDependency, ProfileKind, Recipe, ReconstructionBounds,
+    Replica, ReplicaLocator, RepresentationAdmissionEvidence, RepresentationAdmissionMethod,
+    RepresentationAdmissionSubjectId, RepresentationAdmissionTranscript,
+    RepresentationCatalogueRoot, RepresentationCatalogueRootId, RepresentationOutputObservation,
+    RepresentationProfile, RepresentationProfileId, RepresentationRecord, RepresentationRecordId,
+    RepresentationState, RepresentationStateId,
 };
 pub use proof::{
     OwnedSubtreePatch, ReferencePath, StateSelector, StateViewProof, TransitionWitness,

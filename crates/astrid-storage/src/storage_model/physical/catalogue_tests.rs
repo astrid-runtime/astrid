@@ -563,14 +563,17 @@ fn placement_entries_sort_replicas_and_reject_duplicates() {
         payload_length: 64,
         frame_checksum: [8; 32],
     };
-    let loose = ReplicaLocator::LooseBlob {
-        namespace_generation: 7,
+    let pack = ReplicaLocator::PackFrame {
+        pack_generation: 7,
+        offset: 52,
+        frame_length: 116,
+        frame_checksum: [9; 32],
     };
     let entry = PlacementEntry::new(
         BlobId::new([1; 32]),
         RepresentationProfileId::new([2; 32]),
         64,
-        vec![replica(2, loose), replica(1, arena)],
+        vec![replica(2, pack), replica(1, arena)],
     )
     .unwrap();
     assert_eq!(entry.replicas()[0].storage_node(), StorageNodeId::new(1));
@@ -586,6 +589,37 @@ fn placement_entries_sort_replicas_and_reject_duplicates() {
             vec![replica(1, arena), replica(1, arena)],
         )
         .is_err()
+    );
+}
+
+#[test]
+fn replica_locator_reserved_tag_is_unknown() {
+    let arena = ReplicaLocator::ArenaFrame {
+        arena_generation: 0,
+        offset: 128,
+        payload_length: 64,
+        frame_checksum: [8; 32],
+    };
+    let entry = PlacementEntry::new(
+        BlobId::new([1; 32]),
+        RepresentationProfileId::new([2; 32]),
+        64,
+        vec![replica(1, arena)],
+    )
+    .unwrap();
+    let mut encoded = entry.encode().unwrap();
+    let storage_node = 1_u32.to_le_bytes();
+    let pos = encoded
+        .windows(5)
+        .rposition(|window| window[..4] == storage_node && window[4] == 0)
+        .expect("storage node 1 arena locator tag");
+    encoded[pos + 4] = 1;
+    assert_eq!(
+        PlacementEntry::decode(&encoded),
+        Err(crate::storage_model::PhysicalModelError::UnknownTag(
+            "replica-locator",
+            1
+        ))
     );
 }
 

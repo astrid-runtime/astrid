@@ -120,7 +120,6 @@ where
                 )?
             } else {
                 RepresentationStore::activate(
-                    self.hosted_path()?,
                     self.hosted_directory()?,
                     self.limits,
                     frozen_specification,

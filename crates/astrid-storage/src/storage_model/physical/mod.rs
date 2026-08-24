@@ -31,7 +31,7 @@ pub use placement::{PlacementEntry, PlacementSet, Replica, ReplicaLocator};
 pub use profile::{
     Dependency, ProfileDependency, ProfileKind, ReconstructionBounds, RepresentationProfile,
 };
-pub use representation::{CanonicalChunkingProfile, Coverage, Recipe, RepresentationRecord};
+pub use representation::{Coverage, Recipe, RepresentationRecord};
 pub use state::RepresentationState;
 
 /// Validation or canonical-wire failure in the physical representation model.
@@ -60,7 +60,7 @@ pub enum PhysicalModelError {
     ZeroReconstructionBound(&'static str),
     /// A profile combined fields or dependencies that its kind forbids.
     InvalidProfile(&'static str),
-    /// File coverage contradicted its chunking shape.
+    /// Coverage contradicted its declared length or tag.
     InvalidCoverage(&'static str),
     /// A recipe contradicted its coverage or evidence requirements.
     InvalidRecipe(&'static str),

@@ -13,120 +13,6 @@ use super::identity::{
 use super::profile::{Dependency, ProfileKind, RepresentationProfile};
 
 const REPRESENTATION_VERSION: u16 = 1;
-const FASTCDC_ALGORITHM: u8 = 1;
-const FASTCDC_REVISION: u16 = 1;
-const FASTCDC_NORMALIZATION: u8 = 1;
-
-/// Canonical identity-bearing `FastCDC` profile copied from a File descriptor.
-///
-/// This physical-model value carries the same frozen fields as the logical
-/// content model without making the lower-level model depend on its decoder.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CanonicalChunkingProfile {
-    minimum_bytes: u32,
-    average_bytes: u32,
-    maximum_bytes: u32,
-    gear_seed: u64,
-}
-
-impl CanonicalChunkingProfile {
-    /// Astrid's pinned 16/64/256 `KiB` `FastCDC` format-one profile.
-    pub const ASTRID_V1: Self = Self {
-        minimum_bytes: 16 * 1024,
-        average_bytes: 64 * 1024,
-        maximum_bytes: 256 * 1024,
-        gear_seed: 0,
-    };
-
-    /// Construct a validated pinned `FastCDC` 2020 profile.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PhysicalModelError::InvalidCoverage`] when the sizes are
-    /// outside the frozen implementation bounds or are not strictly ordered.
-    pub fn fastcdc_v2020(
-        minimum_bytes: u32,
-        average_bytes: u32,
-        maximum_bytes: u32,
-        gear_seed: u64,
-    ) -> Result<Self, PhysicalModelError> {
-        if !(64..=1_048_576).contains(&minimum_bytes)
-            || !(256..=4_194_304).contains(&average_bytes)
-            || !(1024..=16_777_216).contains(&maximum_bytes)
-        {
-            return Err(PhysicalModelError::InvalidCoverage(
-                "chunk sizes are outside FastCDC 2020 bounds",
-            ));
-        }
-        if !(minimum_bytes < average_bytes && average_bytes < maximum_bytes) {
-            return Err(PhysicalModelError::InvalidCoverage(
-                "chunk sizes are not strictly increasing",
-            ));
-        }
-        if !average_bytes.is_power_of_two() {
-            return Err(PhysicalModelError::InvalidCoverage(
-                "average chunk size is not a power of two",
-            ));
-        }
-        Ok(Self {
-            minimum_bytes,
-            average_bytes,
-            maximum_bytes,
-            gear_seed,
-        })
-    }
-
-    /// Return the minimum chunk size.
-    #[must_use]
-    pub const fn minimum_bytes(self) -> u32 {
-        self.minimum_bytes
-    }
-
-    /// Return the target average chunk size.
-    #[must_use]
-    pub const fn average_bytes(self) -> u32 {
-        self.average_bytes
-    }
-
-    /// Return the maximum chunk size.
-    #[must_use]
-    pub const fn maximum_bytes(self) -> u32 {
-        self.maximum_bytes
-    }
-
-    /// Return the pinned gear-table seed.
-    #[must_use]
-    pub const fn gear_seed(self) -> u64 {
-        self.gear_seed
-    }
-
-    fn encode_into(self, encoder: &mut Encoder) {
-        encoder.u8(FASTCDC_ALGORITHM);
-        encoder.u16(FASTCDC_REVISION);
-        encoder.u8(FASTCDC_NORMALIZATION);
-        encoder.u32(self.minimum_bytes);
-        encoder.u32(self.average_bytes);
-        encoder.u32(self.maximum_bytes);
-        encoder.u64(self.gear_seed);
-    }
-
-    fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, PhysicalModelError> {
-        if decoder.u8()? != FASTCDC_ALGORITHM
-            || decoder.u16()? != FASTCDC_REVISION
-            || decoder.u8()? != FASTCDC_NORMALIZATION
-        {
-            return Err(PhysicalModelError::InvalidCoverage(
-                "unsupported chunking profile",
-            ));
-        }
-        Self::fastcdc_v2020(
-            decoder.u32()?,
-            decoder.u32()?,
-            decoder.u32()?,
-            decoder.u64()?,
-        )
-    }
-}
 
 /// Exact logical records recoverable from one physical representation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,19 +23,6 @@ pub enum Coverage {
         object: ObjectId,
         /// Complete canonical `ObjectRecord` byte length.
         canonical_record_bytes: u64,
-    },
-    /// Canonical chunk records reconstructed from one contiguous file stream.
-    CanonicalFileChunks {
-        /// Canonical File object whose DAG fixes chunk order and lengths.
-        file: ObjectId,
-        /// Canonical File content root, absent only for an empty file.
-        content_root: Option<ObjectId>,
-        /// Exact user-visible file length.
-        logical_bytes: u64,
-        /// Exact logical chunk occurrence count.
-        chunk_count: u64,
-        /// Identity-bearing chunking profile copied from the canonical File.
-        chunking_profile: CanonicalChunkingProfile,
     },
 }
 
@@ -171,30 +44,6 @@ impl Coverage {
         Ok(coverage)
     }
 
-    /// Construct compact canonical File/Chunk coverage.
-    ///
-    /// # Errors
-    ///
-    /// Rejects empty/non-empty shape contradictions and impossible one-chunk
-    /// threshold claims. Admission later compares every field to the File DAG.
-    pub fn canonical_file_chunks(
-        file: ObjectId,
-        content_root: Option<ObjectId>,
-        logical_bytes: u64,
-        chunk_count: u64,
-        chunking_profile: CanonicalChunkingProfile,
-    ) -> Result<Self, PhysicalModelError> {
-        let coverage = Self::CanonicalFileChunks {
-            file,
-            content_root,
-            logical_bytes,
-            chunk_count,
-            chunking_profile,
-        };
-        coverage.validate()?;
-        Ok(coverage)
-    }
-
     fn validate(&self) -> Result<(), PhysicalModelError> {
         match self {
             Self::Exact {
@@ -205,34 +54,6 @@ impl Coverage {
                     return Err(PhysicalModelError::InvalidCoverage(
                         "exact canonical record length is zero",
                     ));
-                }
-            },
-            Self::CanonicalFileChunks {
-                content_root,
-                logical_bytes,
-                chunk_count,
-                chunking_profile,
-                ..
-            } => {
-                if *logical_bytes == 0 {
-                    if content_root.is_some() || *chunk_count != 0 {
-                        return Err(PhysicalModelError::InvalidCoverage(
-                            "empty file has content coverage",
-                        ));
-                    }
-                } else {
-                    if content_root.is_none() || *chunk_count == 0 {
-                        return Err(PhysicalModelError::InvalidCoverage(
-                            "non-empty file omits content coverage",
-                        ));
-                    }
-                    let fits_one_chunk =
-                        *logical_bytes <= u64::from(chunking_profile.maximum_bytes());
-                    if (*chunk_count == 1) != fits_one_chunk {
-                        return Err(PhysicalModelError::InvalidCoverage(
-                            "file violates the whole-object chunk threshold",
-                        ));
-                    }
                 }
             },
         }
@@ -249,33 +70,12 @@ impl Coverage {
                 encode_object_id(encoder, *object);
                 encoder.u64(*canonical_record_bytes);
             },
-            Self::CanonicalFileChunks {
-                file,
-                content_root,
-                logical_bytes,
-                chunk_count,
-                chunking_profile,
-            } => {
-                encoder.u8(1);
-                encode_object_id(encoder, *file);
-                encode_optional_object(encoder, *content_root);
-                encoder.u64(*logical_bytes);
-                encoder.u64(*chunk_count);
-                chunking_profile.encode_into(encoder);
-            },
         }
     }
 
     fn decode_from(decoder: &mut Decoder<'_>) -> Result<Self, PhysicalModelError> {
         match decoder.u8()? {
             0 => Self::exact(decode_object_id(decoder)?, decoder.u64()?),
-            1 => Self::canonical_file_chunks(
-                decode_object_id(decoder)?,
-                decoder.option(decode_object_id)?,
-                decoder.u64()?,
-                decoder.u64()?,
-                CanonicalChunkingProfile::decode_from(decoder)?,
-            ),
             tag => Err(PhysicalModelError::UnknownTag("coverage", tag)),
         }
     }
@@ -297,11 +97,6 @@ pub enum Recipe {
         offset: u64,
         /// Non-zero canonical record byte length.
         length: u64,
-    },
-    /// One raw blob is a canonical File's contiguous payload stream.
-    ContiguousFile {
-        /// Profile-bound raw file blob.
-        blob: BlobId,
     },
     /// A pinned decoder expands one compressed canonical record.
     Compressed {
@@ -344,10 +139,6 @@ impl Recipe {
                 encode_blob_id(encoder, *blob);
                 encoder.u64(*offset);
                 encoder.u64(*length);
-            },
-            Self::ContiguousFile { blob } => {
-                encoder.u8(2);
-                encode_blob_id(encoder, *blob);
             },
             Self::Compressed { blob, dictionary } => {
                 encoder.u8(3);
@@ -396,9 +187,6 @@ impl Recipe {
                 }
                 Ok(recipe)
             },
-            2 => Ok(Self::ContiguousFile {
-                blob: decode_blob_id(decoder)?,
-            }),
             3 => Ok(Self::Compressed {
                 blob: decode_blob_id(decoder)?,
                 dictionary: decoder.option(decode_blob_id)?,
@@ -532,10 +320,6 @@ impl RepresentationRecord {
                 ProfileKind::PackedCanonical,
                 Recipe::PackedSlice { .. },
                 Coverage::Exact { .. }
-            ) | (
-                ProfileKind::ContiguousFile,
-                Recipe::ContiguousFile { .. },
-                Coverage::CanonicalFileChunks { .. }
             ) | (
                 ProfileKind::Transform,
                 Recipe::Compressed { .. } | Recipe::Delta { .. } | Recipe::Generated { .. },
@@ -692,9 +476,7 @@ fn derived_dependencies(
 ) -> Vec<Dependency> {
     let mut dependencies = alloc::vec![Dependency::Profile(profile)];
     match recipe {
-        Recipe::DirectCanonical { blob }
-        | Recipe::PackedSlice { blob, .. }
-        | Recipe::ContiguousFile { blob } => {
+        Recipe::DirectCanonical { blob } | Recipe::PackedSlice { blob, .. } => {
             dependencies.push(Dependency::PhysicalBlob(*blob));
         },
         Recipe::Compressed { blob, dictionary } => {
@@ -739,23 +521,15 @@ fn validate_recipe(
     if canonical_output_bytes > maximum_reconstruction_bytes {
         return Err(PhysicalModelError::ReconstructionBoundTooSmall);
     }
-    match coverage {
-        Coverage::Exact {
-            canonical_record_bytes,
-            ..
-        } if canonical_output_bytes != *canonical_record_bytes => {
-            return Err(PhysicalModelError::InvalidRecipe(
-                "exact output byte count differs from coverage",
-            ));
-        },
-        Coverage::CanonicalFileChunks { chunk_count, .. }
-            if (*chunk_count == 0) != (canonical_output_bytes == 0) =>
-        {
-            return Err(PhysicalModelError::InvalidRecipe(
-                "file chunk output byte count contradicts chunk count",
-            ));
-        },
-        _ => {},
+    if let Coverage::Exact {
+        canonical_record_bytes,
+        ..
+    } = coverage
+        && canonical_output_bytes != *canonical_record_bytes
+    {
+        return Err(PhysicalModelError::InvalidRecipe(
+            "exact output byte count differs from coverage",
+        ));
     }
     match recipe {
         Recipe::DirectCanonical { .. } => {
@@ -782,18 +556,6 @@ fn validate_recipe(
             if verification_evidence.is_none() {
                 return Err(PhysicalModelError::InvalidRecipe(
                     "packed recipe requires admission evidence",
-                ));
-            }
-        },
-        Recipe::ContiguousFile { .. } => {
-            if !matches!(coverage, Coverage::CanonicalFileChunks { .. }) {
-                return Err(PhysicalModelError::InvalidRecipe(
-                    "contiguous recipe requires canonical file coverage",
-                ));
-            }
-            if verification_evidence.is_none() {
-                return Err(PhysicalModelError::InvalidRecipe(
-                    "contiguous recipe requires admission evidence",
                 ));
             }
         },

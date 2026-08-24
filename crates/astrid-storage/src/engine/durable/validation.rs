@@ -3,7 +3,6 @@
 use crate::storage_model::{ModelError, ObjectId, ObjectKind, ObjectRecord, PrincipalUsage, World};
 
 use super::format::read_indexed_object;
-use super::representations::{RepresentationStore, read_contiguous_object};
 use super::wal::PendingWalOverlay;
 use super::{
     ArenaLocation, BTreeMap, BTreeSet, DurableError, File, PersistentObjectIdentity, ROOT_FILE,
@@ -15,7 +14,6 @@ pub(super) struct ClosureObjects<'a, I, P: Ord> {
     pub(super) index: &'a BTreeMap<ObjectId, ArenaLocation>,
     pub(super) incoming: &'a BTreeMap<ObjectId, ObjectRecord>,
     pub(super) pending: Option<&'a PendingWalOverlay<P>>,
-    pub(super) representations: Option<&'a RepresentationStore>,
     pub(super) identity: &'a I,
     pub(super) limits: RecoveryLimits,
 }
@@ -30,14 +28,6 @@ impl<I: PersistentObjectIdentity, P: Ord> ClosureObjects<'_, I, P> {
         }
         if let Some(location) = self.index.get(&id).copied() {
             return read_indexed_object(self.arena, id, location, self.identity, self.limits);
-        }
-        if let Some((file, location)) = self
-            .representations
-            .map(|store| store.open_contiguous_read(id))
-            .transpose()?
-            .flatten()
-        {
-            return read_contiguous_object(file, location, id, self.identity);
         }
         Err(ModelError::MissingObject(id).into())
     }

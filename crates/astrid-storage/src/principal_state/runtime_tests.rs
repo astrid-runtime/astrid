@@ -7,9 +7,8 @@ use std::time::{Duration, Instant};
 use crate::engine::{ObjectCacheCapacity, ObjectCacheController, RootTransaction};
 use crate::resources::ResidentMemoryAuthority;
 use crate::storage_model::{
-    CanonicalChunkingProfile, ObjectClass, ObjectFormatVersion, ObjectKind, ObjectReference,
-    PhysicalIdentity, ProfileKind, ReconstructionBounds, ReferenceLabel, RepresentationProfile,
-    RootGeneration, RootState,
+    ObjectClass, ObjectFormatVersion, ObjectKind, ObjectReference, PhysicalIdentity, ProfileKind,
+    ReconstructionBounds, ReferenceLabel, RepresentationProfile, RootGeneration, RootState,
 };
 use crate::volume::AstridVolume as _;
 use crate::{AstridFilesystem, FilesystemPath};
@@ -308,16 +307,6 @@ fn physical_identity_v1_matches_the_runatal_golden_vector() {
 }
 
 #[test]
-fn physical_chunking_profile_matches_the_canonical_content_profile() {
-    let content = ChunkingProfile::ASTRID_V1;
-    let physical = CanonicalChunkingProfile::ASTRID_V1;
-    assert_eq!(physical.minimum_bytes(), content.minimum_bytes());
-    assert_eq!(physical.average_bytes(), content.average_bytes());
-    assert_eq!(physical.maximum_bytes(), content.maximum_bytes());
-    assert_eq!(physical.gear_seed(), content.gear_seed());
-}
-
-#[test]
 fn format_specification_has_a_tagged_metadata_identity() {
     let record = bootstrap::format_specification().unwrap();
     let id = Blake3ObjectIdentityV1.identify(&record);
@@ -330,7 +319,7 @@ fn format_specification_has_a_tagged_metadata_identity() {
     assert!(record.references().is_empty());
     assert_eq!(
         object_id_hex(id),
-        "58726b3c243c30ebc0941f656427520094a6bb10e7b2190be732b5a61300144d"
+        "ac3e1ab1e82be24dae7cdef949698dd54d2407bc7f39fb30709dc36677eea61d"
     );
     assert_eq!(
         object_id_hex(catalog_id),
@@ -341,7 +330,7 @@ fn format_specification_has_a_tagged_metadata_identity() {
         "format=astrid-principal-store-v1\n\
          identity=blake3-object-identity-v1\n\
          identity-wire=tagged-identity-v1\n\
-         format-spec-object=1:1:32:58726b3c243c30ebc0941f656427520094a6bb10e7b2190be732b5a61300144d\n\
+         format-spec-object=1:1:32:ac3e1ab1e82be24dae7cdef949698dd54d2407bc7f39fb30709dc36677eea61d\n\
          content-catalog-spec-object=1:1:32:8f3999b066b666396259c4a92f9de7c5b8e67df9d38a69fb4fb824968b56ecdb\n\
          representations=authoritative-direct-v1\n\
          principal-codec=state-owner-v2\n\

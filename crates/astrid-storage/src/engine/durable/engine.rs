@@ -83,24 +83,15 @@ where
             if let Some(record) = self.object_cache.get(principal, id) {
                 return Ok(Some(record));
             }
-            let (pending, location, contiguous, generation) = {
+            let (pending, location, generation) = {
                 let inner = self.lock_usable_with(&mut recovery)?;
                 let pending = inner
                     .pending_wal
                     .get_object(&id)
                     .map(|object| Arc::new(object.record().clone()));
-                let contiguous = if pending.is_none() {
-                    match inner.representations.as_ref() {
-                        Some(store) => store.open_contiguous_read(id)?,
-                        None => None,
-                    }
-                } else {
-                    None
-                };
                 (
                     pending,
                     inner.index.get(&id).copied(),
-                    contiguous,
                     inner.arena_generation,
                 )
             };
@@ -110,26 +101,6 @@ where
                     id,
                     generation,
                     record.as_ref().clone(),
-                    &mut recovery,
-                )? {
-                    return Ok(Some(record));
-                }
-                continue;
-            }
-            if location.is_none()
-                && let Some((file, location)) = contiguous
-            {
-                let record = super::representations::read_contiguous_object(
-                    file,
-                    location,
-                    id,
-                    &self.identity,
-                )?;
-                if let Some(record) = self.retain_loaded_object_if_current_with(
-                    principal,
-                    id,
-                    generation,
-                    record,
                     &mut recovery,
                 )? {
                     return Ok(Some(record));
@@ -217,23 +188,13 @@ where
         }
 
         loop {
-            let (locations, contiguous, generation) = {
+            let (locations, generation) = {
                 let inner = self.lock_usable_with(&mut recovery)?;
                 let locations = missing
                     .keys()
                     .filter_map(|id| inner.index.get(id).copied().map(|location| (*id, location)))
                     .collect::<Vec<_>>();
-                let mut contiguous = Vec::new();
-                if let Some(store) = inner.representations.as_ref() {
-                    for id in missing.keys() {
-                        if !inner.index.contains_key(id)
-                            && let Some((file, location)) = store.open_contiguous_read(*id)?
-                        {
-                            contiguous.push((*id, file, location));
-                        }
-                    }
-                }
-                (locations, contiguous, inner.arena_generation)
+                (locations, inner.arena_generation)
             };
             let reader_guard = self.arena_reader.read();
             let Some(reader) = reader_guard.as_ref() else {
@@ -242,31 +203,11 @@ where
             if reader.generation != generation {
                 continue;
             }
-            let mut loaded =
+            let loaded =
                 read_indexed_objects(&reader.file, &locations, &self.identity, self.limits)?;
             drop(reader_guard);
-            for (id, file, location) in contiguous {
-                loaded.insert(
-                    id,
-                    super::representations::read_contiguous_object(
-                        file,
-                        location,
-                        id,
-                        &self.identity,
-                    )?,
-                );
-            }
-
             let inner = self.lock_usable_with(&mut recovery)?;
-            if inner.arena_generation != generation
-                || loaded.keys().any(|id| {
-                    !inner.index.contains_key(id)
-                        && !inner
-                            .representations
-                            .as_ref()
-                            .is_some_and(|store| store.contains_contiguous(*id))
-                })
-            {
+            if inner.arena_generation != generation {
                 continue;
             }
             for (id, record) in loaded {
@@ -307,13 +248,7 @@ where
         recovery: &mut RecoveryScope,
     ) -> Result<Option<Arc<ObjectRecord>>, DurableError> {
         let inner = self.lock_usable_with(recovery)?;
-        if inner.arena_generation != generation
-            || (!inner.index.contains_key(&id)
-                && !inner
-                    .representations
-                    .as_ref()
-                    .is_some_and(|store| store.contains_contiguous(id)))
-        {
+        if inner.arena_generation != generation || !inner.index.contains_key(&id) {
             return Ok(None);
         }
         Ok(Some(self.object_cache.insert(principal, id, record)))
@@ -623,7 +558,6 @@ where
         let DurableInner {
             files,
             index,
-            representations,
             pending_wal,
             ..
         } = &mut *inner;
@@ -634,7 +568,6 @@ where
                 index,
                 incoming: &BTreeMap::new(),
                 pending: Some(pending_wal),
-                representations: representations.as_ref(),
                 identity: &self.identity,
                 limits: self.limits,
             },
@@ -659,7 +592,6 @@ where
         let DurableInner {
             files,
             index,
-            representations,
             pending_wal,
             ..
         } = &mut *inner;
@@ -670,7 +602,6 @@ where
                 index,
                 incoming: &BTreeMap::new(),
                 pending: Some(pending_wal),
-                representations: representations.as_ref(),
                 identity: &self.identity,
                 limits: self.limits,
             },
@@ -801,7 +732,6 @@ where
             files,
             index,
             validated,
-            representations,
             ..
         } = inner;
         let files = live_files_mut(files)?;
@@ -811,7 +741,6 @@ where
                 index,
                 incoming,
                 pending: Some(pending_wal),
-                representations: representations.as_ref(),
                 identity: &self.identity,
                 limits: self.limits,
             },

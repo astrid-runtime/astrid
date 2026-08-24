@@ -128,93 +128,6 @@ where
     Ok(committed)
 }
 
-/// Fold the object records from every complete WAL transaction into the
-/// canonical arena without publishing roots or physical representations.
-///
-/// Recovery uses this bounded pre-pass when a direct generation-zero frame was
-/// lost.  Rebuilding contiguous virtual chunks needs the staged arena/index
-/// objects before normal replay validates root closures; retaining this pass
-/// separate keeps root CAS and representation publication in `recover_wal`.
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub(crate) fn stage_committed_wal_objects<P, I, C>(
-    wal: &File,
-    arena: &mut File,
-    index: &mut BTreeMap<ObjectId, ArenaLocation>,
-    identity: &SharedIdentity<I>,
-    codec: SharedPrincipalCodec<C>,
-    limits: RecoveryLimits,
-) -> Result<(), DurableError>
-where
-    P: Clone + Ord,
-    I: PersistentObjectIdentity,
-    C: PrincipalCodec<P>,
-{
-    let reader = wal
-        .try_clone()
-        .map_err(|source| io_error("clone ASTWAL2 staging reader", source))?;
-    let mut scanner =
-        WalScanner::new(reader, identity.clone(), codec, limits).map_err(durable_error)?;
-    let mut payload_reader = scanner
-        .reader()
-        .try_clone()
-        .map_err(|source| io_error("clone ASTWAL2 staging payload reader", source))?;
-    let mut pending = Vec::<WalObjectDescriptor>::new();
-
-    while let Some(event) = scanner.next_event().map_err(durable_error)? {
-        match event {
-            WalEvent::Begin(_) => pending.clear(),
-            WalEvent::Object(object) => pending.push(object),
-            WalEvent::Root(_) => {},
-            WalEvent::Commit(_) => {
-                let mut incoming = BTreeMap::<ObjectId, (ObjectRecord, Vec<u8>)>::new();
-                for descriptor in &pending {
-                    let (id, record, payload) =
-                        read_object_record(&mut payload_reader, *descriptor, identity, limits)?;
-                    if id != descriptor.id() {
-                        return Err(corrupt_wal("WAL object descriptor identity mismatch"));
-                    }
-                    if incoming.insert(id, (record, payload)).is_some() {
-                        return Err(ModelError::ObjectCollision(id).into());
-                    }
-                }
-                scanner.restore_cursor().map_err(durable_error)?;
-
-                for (id, (record, _payload)) in &incoming {
-                    if let Some(location) = index.get(id).copied() {
-                        let existing = crate::engine::durable::format::read_indexed_object(
-                            arena, *id, location, identity, limits,
-                        )?;
-                        if existing != *record {
-                            return Err(ModelError::ObjectCollision(*id).into());
-                        }
-                    }
-                }
-
-                let new_objects = incoming
-                    .into_iter()
-                    .filter(|(id, _)| !index.contains_key(id))
-                    .map(|(id, (_record, payload))| (id, payload))
-                    .collect::<Vec<_>>();
-                let payloads = new_objects
-                    .iter()
-                    .map(|(_, payload)| payload.as_slice())
-                    .collect::<Vec<_>>();
-                let locations = append_frames(arena, ARENA_MAGIC, &payloads)?;
-                for ((id, _payload), location) in new_objects.into_iter().zip(locations) {
-                    index.insert(id, location);
-                }
-                arena
-                    .sync_data()
-                    .map_err(|source| io_error("flush WAL-staged object arena", source))?;
-                pending.clear();
-            },
-            WalEvent::Tail(_) => break,
-        }
-    }
-    Ok(())
-}
-
 /// Replay an existing ASTWAL2 stream and return a writer resumed at its clean
 /// append boundary.
 ///
@@ -444,7 +357,6 @@ where
                 index,
                 incoming: &incoming,
                 pending: None,
-                representations: representations.as_deref(),
                 identity,
                 limits,
             },

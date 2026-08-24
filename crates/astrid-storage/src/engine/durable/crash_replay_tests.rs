@@ -206,12 +206,7 @@ impl FaultInjector for EngineTraceFaults {
             | FaultPoint::BeforeInProcessRecoveryOpen
             | FaultPoint::BeforeInProcessRecoveryArenaFlush
             | FaultPoint::BeforeInProcessRecoveryRootFlush
-            | FaultPoint::AfterContiguousStructuralFlush
-            | FaultPoint::AfterContiguousBlobInstall
-            | FaultPoint::AfterContiguousMetadataAppend
-            | FaultPoint::AfterContiguousStatePublish
-            | FaultPoint::AfterCompactionRepresentationRebase
-            | FaultPoint::AfterCompactionBlobRetirement => {},
+            | FaultPoint::AfterCompactionRepresentationRebase => {},
         }
         false
     }

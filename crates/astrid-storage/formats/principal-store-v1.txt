@@ -1498,8 +1498,8 @@ Format 1 registers:
 RepresentationProfileV1 is:
 
   u16  version = 1
-  u8   kind: direct-canonical=0, packed-canonical=1,
-             contiguous-file=2, transform=3
+  u8   kind: direct-canonical=0, packed-canonical=1, transform=3
+             (tag 2 is invalid)
   Option<TaggedObjectIdentity> decoder_or_generator
   Option<TaggedObjectIdentity> transform_contract
   Option<TaggedObjectIdentity> runtime_semantic_profile
@@ -1546,28 +1546,13 @@ CoverageV1 is one of:
     TaggedObjectIdentity object
     u64 canonical_record_bytes, non-zero
 
-  tag 1, CanonicalFileChunks:
-    TaggedObjectIdentity file
-    Option<TaggedObjectIdentity> content_root
-    u64 logical_bytes
-    u64 chunk_count
-    u8 chunk_algorithm = 1
-    u16 chunk_implementation_revision = 1
-    u8 chunk_normalization = 1
-    u32 minimum_bytes
-    u32 average_bytes
-    u32 maximum_bytes
-    u64 gear_seed
-
-CanonicalFileChunks uses the FastCDC constraints in section 7.2. An empty file
-has absent content_root and zero chunks. A non-empty file has both; exactly one
-chunk is required iff logical_bytes is no greater than maximum_bytes.
+  tag 1 is invalid
 
 RecipeV1 is one of:
 
   tag 0, DirectCanonical: BlobId
   tag 1, PackedSlice: BlobId || offset:u64 || non-zero length:u64
-  tag 2, ContiguousFile: BlobId
+  tag 2 is invalid
   tag 3, Compressed: BlobId || Option<dictionary BlobId>
   tag 4, Delta: patch BlobId || base TaggedObjectIdentity
   tag 5, Generated: invocation TaggedObjectIdentity || output_ordinal:u32
@@ -1594,9 +1579,9 @@ the canonical output and does not exceed the profile bound.
 
 DirectCanonical requires Exact coverage, equal canonical/output/reconstruction
 lengths, no verification evidence, and dependencies on exactly its profile and
-blob. PackedCanonical likewise requires Exact coverage. ContiguousFile requires
-CanonicalFileChunks. Compressed, Delta, and Generated require a transform
-profile and verification evidence; Generated evidence equals recipe.evidence.
+blob. PackedCanonical likewise requires Exact coverage. Compressed, Delta, and
+Generated require a transform profile and verification evidence; Generated
+evidence equals recipe.evidence.
 
 
 12.4 Canonical physical maps and catalogue roots
@@ -1709,8 +1694,7 @@ ReplicaV1 begins with storage_node:u32 and one locator:
     u64 payload_length, non-zero
     u8[32] frame_checksum
 
-  tag 1 LooseBlob:
-    u64 namespace_generation
+  tag 1 is invalid
 
   tag 2 PackFrame:
     u64 pack_generation

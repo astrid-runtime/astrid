@@ -55,7 +55,6 @@ struct CompactionIntent {
 }
 
 pub(super) fn recover_interrupted_compaction<P, I, C>(
-    directory: &Path,
     store_root: &cap_std::fs::Dir,
     codec: &C,
     identity: &I,
@@ -66,7 +65,7 @@ where
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
-    recovery::recover_interrupted_compaction(directory, store_root, codec, identity, limits)
+    recovery::recover_interrupted_compaction(store_root, codec, identity, limits)
 }
 
 /// Native relation snapshot and proposed condemned set for one GC proof.
@@ -388,7 +387,6 @@ where
         let super::DurableInner {
             files,
             index,
-            representations,
             pending_wal,
             ..
         } = inner;
@@ -400,7 +398,6 @@ where
                     index,
                     incoming: &BTreeMap::new(),
                     pending: Some(pending_wal),
-                    representations: representations.as_ref(),
                     identity: &self.identity,
                     limits: self.limits,
                 },
@@ -454,11 +451,7 @@ where
     }
 
     fn object_universe(inner: &DurableInner<P>) -> BTreeSet<ObjectId> {
-        let mut universe = inner.index.keys().copied().collect::<BTreeSet<_>>();
-        if let Some(representations) = &inner.representations {
-            universe.extend(representations.contiguous_object_ids());
-        }
-        universe
+        inner.index.keys().copied().collect::<BTreeSet<_>>()
     }
 
     fn read_compaction_object(
@@ -466,28 +459,10 @@ where
         inner: &mut DurableInner<P>,
         id: ObjectId,
     ) -> Result<ObjectRecord, DurableError> {
-        let super::DurableInner {
-            files,
-            index,
-            representations,
-            ..
-        } = inner;
+        let super::DurableInner { files, index, .. } = inner;
         if let Some(location) = index.get(&id).copied() {
             let files = live_files_mut(files)?;
             return read_indexed_object(&files.arena, id, location, &self.identity, self.limits);
-        }
-        if let Some((file, location)) = representations
-            .as_ref()
-            .map(|store| store.open_contiguous_read(id))
-            .transpose()?
-            .flatten()
-        {
-            return super::representations::read_contiguous_object(
-                file,
-                location,
-                id,
-                &self.identity,
-            );
         }
         Err(crate::storage_model::ModelError::MissingObject(id).into())
     }
@@ -592,8 +567,6 @@ where
                 self.limits,
             )?;
             self.fail_if(FaultPoint::AfterCompactionRepresentationRebase)?;
-            representations.retire_loose_blobs()?;
-            self.fail_if(FaultPoint::AfterCompactionBlobRetirement)?;
         }
         let arena_bytes_after = replacement.arena_len;
         self.install_replacement(inner, replacement)?;
@@ -794,7 +767,6 @@ where
             &mut arena,
             &mut journal,
             &new_index,
-            None,
             &self.principal_codec,
             &self.identity,
             self.limits,
@@ -820,7 +792,6 @@ where
             &mut roots,
             &mut arena,
             &index,
-            None,
             &self.principal_codec,
             &self.identity,
             self.limits,
@@ -881,7 +852,6 @@ fn validate_replacement<P, I, C>(
     arena: &mut File,
     roots: &mut File,
     expected_index: &BTreeMap<ObjectId, ArenaLocation>,
-    representations: Option<&super::representations::RepresentationStore>,
     codec: &C,
     identity: &I,
     limits: RecoveryLimits,
@@ -897,15 +867,8 @@ where
             "replacement arena index changed during verification",
         ));
     }
-    let (roots_by_principal, validated) = recover_roots(
-        roots,
-        arena,
-        &recovered,
-        representations,
-        codec,
-        identity,
-        limits,
-    )?;
+    let (roots_by_principal, validated) =
+        recover_roots(roots, arena, &recovered, codec, identity, limits)?;
     let arena_len = arena
         .metadata()
         .map_err(|source| io_error("read replacement arena metadata", source))?

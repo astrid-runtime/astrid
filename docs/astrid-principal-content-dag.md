@@ -233,9 +233,9 @@ This private area is never a guest path. A platform provider must bind each
 open handle to a host-stamped principal and that principal's live resource
 lease before exposing writes. The current increment supplies the common
 crash-safe lifecycle; provider adapters, staged-byte reservation accounting,
-parallel chunk/hash workers, change detection, and adopting the staged file as
-a contiguous physical representation remain tracked in
-[#1392](https://github.com/astrid-runtime/astrid/issues/1392).
+ parallel chunk/hash workers and change detection remain tracked in
+ [#1392](https://github.com/astrid-runtime/astrid/issues/1392). Staged home
+ files publish through packed arena ingest.
 
 Canonical 128-way packing is positional. Appends and size-preserving
 replacements rewrite only affected root-to-leaf paths, but a middle insertion
