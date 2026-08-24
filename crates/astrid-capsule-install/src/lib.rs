@@ -9,8 +9,9 @@
 //!
 //! * File layout — copying the capsule tree into its target dir under
 //!   `~/.astrid/<principal>/capsules/<id>/`, with rollback on failure.
-//! * Content-addressing — `wasm` binaries go to `~/.astrid/bin/`,
-//!   `wit` blobs go to `~/.astrid/wit/store/`, both keyed by BLAKE3.
+//! * Content-addressing — storage-backed `wasm` binaries go to the system
+//!   `bin/<hash>.wasm` catalog, while workspace-only compatibility installs
+//!   retain their native cache; WIT content remains keyed by BLAKE3.
 //! * Contracts retention/skew — seeding the daemon canonical
 //!   `astrid-contracts.wit` and comparing capsule pins against it
 //!   (warn-only; see [`contracts`]).
@@ -61,6 +62,7 @@
 
 pub mod archive;
 pub mod authority;
+mod authority_store;
 pub mod contracts;
 pub mod copy;
 pub mod github_source;
@@ -90,6 +92,7 @@ pub use authority::{
     inspect_directory_for_principal_with_layout, read_archive_manifest, read_installed_authority,
     remove_installed_authority, verify_installed_authority,
 };
+pub use authority_store::verify_installed_authority_with_store;
 #[cfg(test)]
 pub use contracts::refresh_canonical_contracts;
 pub use contracts::{

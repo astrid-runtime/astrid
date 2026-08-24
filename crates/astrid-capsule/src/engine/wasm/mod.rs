@@ -1934,6 +1934,11 @@ impl ExecutionEngine for WasmEngine {
         let catalog_bytes = None;
         let wasm_source = if let Some(bytes) = catalog_bytes {
             content_source::WasmSource::Bytes(bytes)
+        } else if ctx.principal_store.is_some() {
+            let hash = expected_hash.as_deref().unwrap_or("<missing>");
+            return Err(CapsuleError::UnsupportedEntryPoint(format!(
+                "WASM catalog entry 'bin/{hash}.wasm' is missing; refusing to load from a host path"
+            )));
         } else if component.path.is_absolute() {
             content_source::WasmSource::Path(component.path.clone())
         } else {

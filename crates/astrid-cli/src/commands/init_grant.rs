@@ -172,6 +172,16 @@ pub(super) fn validate_locked_capsules(
     target: &PrincipalId,
     locked: &[super::LockedCapsule],
 ) -> anyhow::Result<Vec<String>> {
+    validate_locked_capsules_with_store(home, target, locked, None)
+}
+
+#[cfg(test)]
+fn validate_locked_capsules_with_store(
+    home: &AstridHome,
+    target: &PrincipalId,
+    locked: &[super::LockedCapsule],
+    store: Option<&astrid_storage::RuntimePrincipalStore>,
+) -> anyhow::Result<Vec<String>> {
     let mut installed = Vec::with_capacity(locked.len());
     for capsule in locked {
         let expected = CapsuleId::new(capsule.name.clone())?;
@@ -223,6 +233,7 @@ pub(super) fn validate_locked_capsules(
             &manifest,
             meta.wasm_hash.as_deref(),
             &capsule.hash,
+            store,
         )?;
         installed.push(expected.as_str().to_string());
     }
@@ -302,6 +313,7 @@ fn validate_locked_wasm(
     manifest: &CapsuleManifest,
     meta_hash: Option<&str>,
     locked_hash: &str,
+    store: Option<&astrid_storage::RuntimePrincipalStore>,
 ) -> anyhow::Result<()> {
     let declares_wasm = manifest_declares_wasm(manifest);
     let Some(meta_hash) = meta_hash else {
@@ -324,14 +336,41 @@ fn validate_locked_wasm(
     if meta_hash != locked_hex {
         bail!("Distro.lock capsule '{capsule}' hash disagrees with installed metadata");
     }
-    let blob_path = home.bin_dir().join(format!("{locked_hex}.wasm"));
-    let bytes = std::fs::read(&blob_path).with_context(|| {
-        format!(
-            "Distro.lock capsule '{}' content blob is missing or unreadable at {}",
-            capsule,
-            blob_path.display()
-        )
-    })?;
+    let bytes = if let Some(store) = store {
+        let name = astrid_storage::ContentName::new(format!("bin/{locked_hex}.wasm"))?;
+        let descriptor = store
+            .content()
+            .describe(&astrid_storage::StateOwner::System, &name)
+            .map_err(|error| anyhow::anyhow!(error))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Distro.lock capsule '{capsule}' catalog entry is missing: bin/{locked_hex}.wasm"
+                )
+            })?;
+        store
+            .content()
+            .read_range(
+                &astrid_storage::StateOwner::System,
+                &name,
+                0,
+                descriptor.logical_bytes(),
+            )
+            .map_err(|error| anyhow::anyhow!(error))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Distro.lock capsule '{capsule}' catalog entry has no readable bytes: bin/{locked_hex}.wasm"
+                )
+            })?
+    } else {
+        let blob_path = home.bin_dir().join(format!("{locked_hex}.wasm"));
+        std::fs::read(&blob_path).with_context(|| {
+            format!(
+                "Distro.lock capsule '{}' content blob is missing or unreadable at {}",
+                capsule,
+                blob_path.display()
+            )
+        })?
+    };
     let actual = blake3::hash(&bytes);
     if actual != locked {
         bail!("Distro.lock capsule '{capsule}' content blob bytes do not match hash {locked_hash}");
@@ -462,6 +501,7 @@ mod tests {
     use super::*;
     use crate::commands::capsule::{install, meta};
     use crate::commands::init::LockedCapsule;
+    use std::sync::Arc;
 
     /// (c) The flag is only meaningful with a distro to resolve the grant
     /// set: setting it without a distro source is a hard error.
@@ -674,6 +714,64 @@ mod tests {
         std::fs::remove_file(blob).unwrap();
         let err = validate_locked_capsules(&home, &target, &locked).unwrap_err();
         assert!(err.to_string().contains("missing or unreadable"));
+    }
+
+    #[test]
+    fn fresh_lock_rehashes_catalog_wasm_bytes_when_store_is_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(dir.path());
+        let target = PrincipalId::new("alice").unwrap();
+        let install_dir = install::resolve_target_dir_for(&home, &target, "cli", false).unwrap();
+        std::fs::create_dir_all(&install_dir).unwrap();
+        std::fs::write(
+            install_dir.join("Capsule.toml"),
+            "[package]\nname = \"cli\"\nversion = \"1.0.0\"\n\n[[component]]\nfile = \"cli.wasm\"\n",
+        )
+        .unwrap();
+        let wasm = b"catalog wasm bytes".to_vec();
+        let hash = blake3::hash(&wasm).to_hex().to_string();
+        meta::write_meta(
+            &install_dir,
+            &meta::CapsuleMeta {
+                version: "1.0.0".to_string(),
+                wasm_hash: Some(hash.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let locked = vec![LockedCapsule {
+            name: "cli".to_string(),
+            version: "1.0.0".to_string(),
+            source: "@example/cli".to_string(),
+            hash: format!("blake3:{hash}"),
+            resolved_ref: Some("v1.0.0".to_string()),
+        }];
+        let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
+            Arc::new(|owner: &astrid_storage::StateOwner| {
+                Ok(match owner {
+                    astrid_storage::StateOwner::System => None,
+                    astrid_storage::StateOwner::Principal(_)
+                    | astrid_storage::StateOwner::Fleet(_) => Some(u64::MAX),
+                })
+            });
+        let store = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(astrid_storage::open_runtime_principal_store(&home, quota))
+            .unwrap();
+        let name = astrid_storage::ContentName::new(format!("bin/{hash}.wasm")).unwrap();
+        store
+            .content()
+            .put(&astrid_storage::StateOwner::System, &name, &wasm)
+            .unwrap();
+
+        assert_eq!(
+            validate_locked_capsules_with_store(&home, &target, &locked, Some(&store)).unwrap(),
+            vec!["cli"]
+        );
+        assert!(
+            !home.bin_dir().join(format!("{hash}.wasm")).exists(),
+            "Distro.lock verification must not require a POSIX WASM blob"
+        );
     }
 
     #[test]

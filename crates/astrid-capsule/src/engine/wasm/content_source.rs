@@ -40,14 +40,15 @@ pub(super) fn catalog_bytes(
     let descriptor = content
         .describe(&astrid_storage::StateOwner::System, &name)
         .ok()??;
-    content
+    let bytes = content
         .read_range(
             &astrid_storage::StateOwner::System,
             &name,
             0,
             descriptor.logical_bytes(),
         )
-        .ok()?
+        .ok()??;
+    (blake3::hash(&bytes).to_hex().as_str() == hash).then_some(bytes)
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
@@ -86,5 +87,23 @@ mod tests {
 
         assert_eq!(catalog_bytes(Some(&store), Some(&hash)), Some(bytes));
         assert_eq!(catalog_bytes(Some(&store), Some("missing")), None);
+    }
+
+    #[tokio::test]
+    async fn catalog_bytes_rejects_hash_mismatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(directory.path());
+        home.ensure().unwrap();
+        let store = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+        let expected = blake3::hash(b"expected").to_hex().to_string();
+        let name = astrid_storage::ContentName::new(format!("bin/{expected}.wasm")).unwrap();
+        store
+            .content()
+            .put(&astrid_storage::StateOwner::System, &name, b"tampered")
+            .unwrap();
+
+        assert_eq!(catalog_bytes(Some(&store), Some(&expected)), None);
     }
 }
