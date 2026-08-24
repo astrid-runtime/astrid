@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Workload-neutral compatibility reference-interpreter fixture for Astrid"
+description = "Workload-neutral compatibility portable-machine fixture for Astrid"
 
 [features]
 default = []
