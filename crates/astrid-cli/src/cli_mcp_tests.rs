@@ -68,3 +68,15 @@ fn mcp_ready_defaults_to_hook_format() {
         _ => panic!("expected mcp ready"),
     }
 }
+
+#[test]
+fn mcp_ready_accepts_explicit_hook_format_after_subcommand() {
+    let parsed = Cli::try_parse_from(["astrid", "mcp", "ready", "--format", "hook"])
+        .expect("ready format argv must parse");
+    match parsed.command {
+        Some(Commands::Mcp {
+            command: McpCommands::Ready { format },
+        }) => assert_eq!(format, "hook"),
+        _ => panic!("expected mcp ready"),
+    }
+}
