@@ -58,6 +58,15 @@ impl HostState {
                 self.capsule_id
             )));
         }
+        let crate::registry::RuntimeScope::Principal(owner_uid) = runtime_id.key().scope() else {
+            return Err(crate::error::CapsuleError::ExecutionFailed(format!(
+                "runtime '{}' is not the principal owner of capsule '{}'",
+                runtime_id.key().capsule_id(),
+                self.capsule_id
+            )));
+        };
+        self.stamped_invocation =
+            Some(crate::stamp::StampedInvocation::from_trusted_uid(owner_uid));
         self.invocation_kv = Some(self.kv.clone());
         self.invocation_home = self.home.clone();
         self.invocation_tmp = self.tmp.clone();
@@ -231,6 +240,26 @@ impl HostState {
             .principal
             .as_deref()
             .and_then(|p| astrid_core::PrincipalId::new(p).ok());
+        // A cached stamp is a hint for the current publisher alias only.
+        // Owner to principalless must become Unspecified, not inherited attribution.
+        let trusted_uid = if let Some(alias) = publisher.as_ref()
+            && let Some(stamp) = self.stamped_invocation.as_ref()
+        {
+            crate::stamp::IngressIdentity::revalidated_cached_uid(
+                &self.principal_directory,
+                alias,
+                stamp.principal(),
+            )
+        } else {
+            None
+        };
+        self.stamped_invocation = crate::stamp::IngressIdentity::from_host_context(
+            &self.principal_directory,
+            publisher.as_ref(),
+            trusted_uid,
+        )
+        .trusted_stamp()
+        .cloned();
         if !self.system_runtime
             && publisher
                 .as_ref()

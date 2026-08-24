@@ -2603,6 +2603,7 @@ impl ExecutionEngine for WasmEngine {
                     memory_ledger.clone(),
                 ),
                 principal: st_principal.clone(),
+                stamped_invocation: None,
                 system_runtime: st_system_runtime,
                 capsule_uuid,
                 caller_context: None,
@@ -3693,6 +3694,13 @@ impl ExecutionEngine for WasmEngine {
                 let invocation_principal: Option<astrid_core::PrincipalId> = caller
                     .and_then(|msg| msg.principal.as_deref())
                     .and_then(|p| astrid_core::PrincipalId::new(p).ok());
+                state.stamped_invocation = crate::stamp::IngressIdentity::from_host_context(
+                    &state.principal_directory,
+                    invocation_principal.as_ref(),
+                    None,
+                )
+                .trusted_stamp()
+                .cloned();
 
                 install_principal_overlays(state, invocation_principal.as_ref()).await;
             }
@@ -3932,6 +3940,7 @@ async fn build_lifecycle_host_state(
         ),
         resource_table: wasmtime::component::ResourceTable::new(),
         principal: principal.clone(),
+        stamped_invocation: None,
         system_runtime: false,
         capsule_uuid: uuid::Uuid::new_v4(),
         caller_context: None,

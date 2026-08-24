@@ -456,6 +456,7 @@ impl Drop for PoolCheckout {
 /// ctx, whose sole content is the inherited-stderr stdio config.
 fn clear_on_return(state: &mut HostState, reset_resources: bool) {
     state.caller_context = None;
+    state.stamped_invocation = None;
     state.interceptor_active = false;
     state.invocation_kv = None;
     state.invocation_home = None;
@@ -679,6 +680,26 @@ mod tests {
             );
             assert_eq!(state.ingress_principal, None);
             assert_eq!(state.ingress_device_key_id, None);
+        }
+    }
+
+    #[test]
+    fn clear_on_return_clears_stamped_invocation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+
+        for reset_resources in [true, false] {
+            let mut state = minimal_host_state(rt.handle().clone());
+            let uid = astrid_core::PrincipalUid::from_bytes([0x51; 32]);
+            state.stamped_invocation = Some(crate::stamp::StampedInvocation::from_trusted_uid(uid));
+
+            clear_on_return(&mut state, reset_resources);
+
+            assert!(
+                state.stamped_invocation.is_none(),
+                "pooled return must drop attribution (reset_resources = {reset_resources})"
+            );
         }
     }
 
