@@ -8,7 +8,9 @@ use crate::encoding::{
     require_exact_len, take, write_header, write_nested,
 };
 use crate::error::ProviderError;
-use crate::instance::InstanceId;
+use crate::instance::{AdmittedInstance, InstanceId};
+use crate::job::Job;
+use crate::provider::ProviderIdentity;
 
 /// Uninhabited type: receipts cannot produce a live handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,9 +77,47 @@ impl DescriptorDecode for ExecutionOutcome {
     }
 }
 
+/// Canonical receipt identity. Not a replay ledger and not exactly-once
+/// execution. Duplicate [`CausalRequestId`] values share this binding when
+/// provider, operation, and instance also match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ReceiptBinding {
+    provider: ProviderIdentity,
+    operation: OperationId,
+    causal: CausalRequestId,
+    instance: InstanceId,
+}
+
+impl ReceiptBinding {
+    /// Provider incarnation named by this binding.
+    #[must_use]
+    pub const fn provider(self) -> ProviderIdentity {
+        self.provider
+    }
+
+    /// Operation named by this binding.
+    #[must_use]
+    pub const fn operation(self) -> OperationId {
+        self.operation
+    }
+
+    /// Causal request identity.
+    #[must_use]
+    pub const fn causal(self) -> CausalRequestId {
+        self.causal
+    }
+
+    /// Instance named by this binding.
+    #[must_use]
+    pub const fn instance(self) -> InstanceId {
+        self.instance
+    }
+}
+
 /// Durable-looking receipt of start or exit. Not a live handle or lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExecutionReceipt {
+    provider: ProviderIdentity,
     operation: OperationId,
     causal: CausalRequestId,
     instance: InstanceId,
@@ -86,22 +126,47 @@ pub struct ExecutionReceipt {
 
 impl ExecutionReceipt {
     /// Exact encoded length, including nested identities.
-    pub const ENCODED_LEN: usize = 95;
+    pub const ENCODED_LEN: usize = 144;
 
-    /// Construct a receipt for one operation.
+    /// Construct a receipt for one provider request.
     #[must_use]
     pub const fn new(
+        provider: ProviderIdentity,
         operation: OperationId,
         causal: CausalRequestId,
         instance: InstanceId,
         outcome: ExecutionOutcome,
     ) -> Self {
         Self {
+            provider,
             operation,
             causal,
             instance,
             outcome,
         }
+    }
+
+    /// Copy identities from a validated request. Outcome remains caller-chosen.
+    #[must_use]
+    pub const fn for_request(
+        provider: ProviderIdentity,
+        job: &Job,
+        instance: &AdmittedInstance,
+        outcome: ExecutionOutcome,
+    ) -> Self {
+        Self::new(
+            provider,
+            job.operation(),
+            job.causal(),
+            instance.id(),
+            outcome,
+        )
+    }
+
+    /// Provider incarnation named by this receipt.
+    #[must_use]
+    pub const fn provider(&self) -> ProviderIdentity {
+        self.provider
     }
 
     /// Operation this receipt names.
@@ -128,6 +193,17 @@ impl ExecutionReceipt {
         self.outcome
     }
 
+    /// Canonical identity/binding, independent of outcome.
+    #[must_use]
+    pub const fn binding(&self) -> ReceiptBinding {
+        ReceiptBinding {
+            provider: self.provider,
+            operation: self.operation,
+            causal: self.causal,
+            instance: self.instance,
+        }
+    }
+
     /// Receipts never become live handles.
     ///
     /// # Errors
@@ -147,7 +223,8 @@ impl DescriptorEncode for ExecutionReceipt {
     fn encode_descriptor(&self, output: &mut [u8]) -> Result<(), ProviderError> {
         require_exact_len(output, Self::ENCODED_LEN)?;
         write_header(output, ProviderTypeTag::ExecutionReceipt)?;
-        let offset = encode_resource(output, 3, &self.operation)?;
+        let offset = write_nested(output, 3, &self.provider)?;
+        let offset = encode_resource(output, offset, &self.operation)?;
         let offset = encode_resource(output, offset, &self.causal)?;
         let offset = write_nested(output, offset, &self.instance)?;
         write_nested(output, offset, &self.outcome)?;
@@ -159,22 +236,27 @@ impl DescriptorDecode for ExecutionReceipt {
     fn decode_descriptor(input: &[u8]) -> Result<Self, ProviderError> {
         require_exact_len(input, Self::ENCODED_LEN)?;
         check_header(input, ProviderTypeTag::ExecutionReceipt)?;
-        let (operation, offset) = decode_resource::<OperationId>(input, 3, 19)?;
+        let (provider, offset) =
+            read_nested::<ProviderIdentity>(input, 3, ProviderIdentity::ENCODED_LEN)?;
+        let (operation, offset) = decode_resource::<OperationId>(input, offset, 19)?;
         let (causal, offset) = decode_resource::<CausalRequestId>(input, offset, 19)?;
         let (instance, offset) = read_nested::<InstanceId>(input, offset, InstanceId::ENCODED_LEN)?;
         let (outcome, _) =
             read_nested::<ExecutionOutcome>(input, offset, ExecutionOutcome::ENCODED_LEN)?;
-        Ok(Self::new(operation, causal, instance, outcome))
+        Ok(Self::new(provider, operation, causal, instance, outcome))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astrid_resource_types::{ObjectGeneration, ResourceId};
+    use crate::fixtures::{honest_instance, honest_job};
+    use crate::null::NullProvider;
+    use astrid_resource_types::{ObjectGeneration, ProviderId, ResourceId};
 
     fn receipt(outcome: ExecutionOutcome) -> ExecutionReceipt {
         ExecutionReceipt::new(
+            NullProvider::identity_value(),
             OperationId::from_bytes([0x41; 16]),
             CausalRequestId::from_bytes([0x42; 16]),
             InstanceId::new(
@@ -206,6 +288,53 @@ mod tests {
         assert_eq!(
             ExecutionOutcome::decode_descriptor(&started),
             Err(ProviderError::NonCanonical)
+        );
+    }
+
+    #[test]
+    fn outcome_unknown_is_distinct_and_causal_binding_is_canonical() {
+        let unknown = receipt(ExecutionOutcome::OutcomeUnknown);
+        let started = receipt(ExecutionOutcome::Started);
+        assert_ne!(unknown, started);
+        assert_ne!(unknown.outcome(), started.outcome());
+        assert_eq!(unknown.binding(), started.binding());
+        let other_provider = ExecutionReceipt::new(
+            ProviderIdentity::new(
+                ProviderId::from_bytes([0xb5; 32]),
+                unknown.provider().generation(),
+            ),
+            unknown.operation(),
+            unknown.causal(),
+            unknown.instance(),
+            ExecutionOutcome::OutcomeUnknown,
+        );
+        assert_ne!(unknown, other_provider);
+        assert_ne!(unknown.binding(), other_provider.binding());
+        let job = honest_job().unwrap();
+        let instance = honest_instance();
+        let first = ExecutionReceipt::for_request(
+            NullProvider::identity_value(),
+            &job,
+            &instance,
+            ExecutionOutcome::OutcomeUnknown,
+        );
+        let second = ExecutionReceipt::for_request(
+            NullProvider::identity_value(),
+            &job,
+            &instance,
+            ExecutionOutcome::Exited { status: 0 },
+        );
+        assert_eq!(first.binding(), second.binding());
+        assert_eq!(first.causal(), second.causal());
+        assert_ne!(first.outcome(), second.outcome());
+        let mut leftover = [0_u8; ExecutionReceipt::ENCODED_LEN + 1];
+        first
+            .encode_descriptor(&mut leftover[..ExecutionReceipt::ENCODED_LEN])
+            .unwrap();
+        leftover[ExecutionReceipt::ENCODED_LEN] = 1;
+        assert_eq!(
+            ExecutionReceipt::decode_descriptor(&leftover),
+            Err(ProviderError::InvalidLength)
         );
     }
 }

@@ -42,6 +42,8 @@ pub enum ProviderTypeTag {
     ExecutionOutcome = 14,
     /// [`crate::ExecutionReceipt`].
     ExecutionReceipt = 15,
+    /// [`crate::ProviderIdentity`].
+    ProviderIdentity = 16,
 }
 
 impl ProviderTypeTag {
@@ -70,6 +72,7 @@ impl ProviderTypeTag {
             13 => Some(Self::Checkpoint),
             14 => Some(Self::ExecutionOutcome),
             15 => Some(Self::ExecutionReceipt),
+            16 => Some(Self::ProviderIdentity),
             _ => None,
         }
     }
@@ -196,6 +199,7 @@ mod tests {
             (ProviderTypeTag::Checkpoint, 13),
             (ProviderTypeTag::ExecutionOutcome, 14),
             (ProviderTypeTag::ExecutionReceipt, 15),
+            (ProviderTypeTag::ProviderIdentity, 16),
         ];
         for (tag, code) in golden {
             assert_eq!(tag.code(), code);

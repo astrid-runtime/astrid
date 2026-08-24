@@ -25,10 +25,10 @@ impl NullProvider {
     }
 
     fn unknown_receipt(job: &Job, instance: &AdmittedInstance) -> ExecutionReceipt {
-        ExecutionReceipt::new(
-            job.operation(),
-            job.causal(),
-            instance.id(),
+        ExecutionReceipt::for_request(
+            Self::identity_value(),
+            job,
+            instance,
             ExecutionOutcome::OutcomeUnknown,
         )
     }
@@ -89,8 +89,8 @@ mod tests {
             Err(ProviderError::NotSupported)
         );
         assert_eq!(
-            provider.restore(&Checkpoint::new(
-                instance.id(),
+            provider.restore(&Checkpoint::from_instance(
+                instance,
                 CheckpointBlobId::from_bytes([9; 32]),
             )),
             Err(ProviderError::NotSupported)

@@ -124,10 +124,10 @@ mod tests {
 
     #[test]
     fn serialized_receipt_cannot_become_a_live_handle() {
-        let receipt = ExecutionReceipt::new(
-            honest_job().unwrap().operation(),
-            honest_job().unwrap().causal(),
-            honest_instance().id(),
+        let receipt = ExecutionReceipt::for_request(
+            NullProvider.identity(),
+            &honest_job().unwrap(),
+            &honest_instance(),
             ExecutionOutcome::Started,
         );
         let mut encoded = [0_u8; ExecutionReceipt::ENCODED_LEN];

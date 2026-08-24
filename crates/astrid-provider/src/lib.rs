@@ -1,9 +1,10 @@
 //! Host-neutral execution-provider descriptors for Astrid.
 //!
 //! This crate names application closures, admitted-instance descriptors, structured
-//! jobs, opaque attachments and streams, checkpoint blob identity, and execution
-//! receipts. It is never identity, authority, consent, or policy. Descriptors and
-//! receipts cannot mint a live handle, lease, or grant.
+//! jobs, opaque attachments and streams, checkpoints bound to provider and instance
+//! identity, and execution receipts bound to provider identity. It is never
+//! identity, authority, consent, or policy. Descriptors and receipts cannot mint a
+//! live handle, lease, or grant. [`CapsuleAdapter`] has no public inner provider.
 //!
 //! Workload and vendor names are fixtures elsewhere. Types and traits here do not
 //! encode a guest OS, device vendor, or named interpreter.
@@ -52,6 +53,7 @@ pub use job::Job;
 pub use null::{NULL_PROVIDER_GENERATION, NULL_PROVIDER_ID, NullProvider};
 pub use principal::HostPrincipal;
 pub use provider::{
-    ExecutionProvider, ProviderIdentity, check_binding, check_provider, check_start,
+    ExecutionProvider, ProviderIdentity, check_binding, check_checkpoint, check_identity,
+    check_provider, check_receipt, check_restore, check_restored_instance, check_start,
 };
-pub use receipt::{ExecutionOutcome, ExecutionReceipt, LiveHandle};
+pub use receipt::{ExecutionOutcome, ExecutionReceipt, LiveHandle, ReceiptBinding};
