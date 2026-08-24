@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use astrid_audit::{AuditAction, AuditOutcome, AuthorizationProof};
 use astrid_capabilities::{CapabilityCheck, PermissionError};
 use astrid_core::groups::GroupConfig;
-use astrid_core::principal::PrincipalId;
 use astrid_core::profile::{DeviceScope, PrincipalProfile};
+use astrid_core::{PrincipalUid, principal::PrincipalId};
 use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use astrid_events::kernel_api::{KernelRequest, KernelResponse};
 use tracing::{debug, info, warn};
@@ -766,6 +766,7 @@ fn resolve_device_key_id(message: &IpcMessage) -> Option<String> {
 #[derive(Debug)]
 struct AuthorizedRequest {
     principal: PrincipalId,
+    principal_uid: Option<PrincipalUid>,
     profile: Arc<PrincipalProfile>,
     groups: Arc<GroupConfig>,
     device_scope: Option<DeviceScope>,
@@ -839,8 +840,19 @@ fn authorize_request(
         check = check.with_device_scope(scope);
     }
     check.require(required_cap)?;
+    let principal_uid = match kernel.principal_directory.uid_for(caller) {
+        Ok(uid) => Some(uid),
+        Err(_) if required_cap.contains("storage:mount") => {
+            return Err(PermissionError::MissingCapability {
+                principal: caller.clone(),
+                required: required_cap.to_string(),
+            });
+        },
+        Err(_) => None,
+    };
     Ok(AuthorizedRequest {
         principal: caller.clone(),
+        principal_uid,
         profile,
         groups,
         device_scope,

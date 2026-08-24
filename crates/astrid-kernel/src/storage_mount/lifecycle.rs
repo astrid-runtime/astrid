@@ -4,8 +4,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use astrid_capabilities::CapabilityCheck;
 use astrid_core::PrincipalId;
-use astrid_core::storage_provider::{StorageMountId, StorageProviderViewV1};
+use astrid_core::profile::DeviceScope;
+use astrid_core::storage_provider::{
+    StorageMountId, StorageProviderAccessV1, StorageProviderViewV1,
+};
 use astrid_core::{FleetUid, PrincipalUid, WorkspaceUid};
 use astrid_storage::{StateOwner, WorkspaceBranchStore};
 
@@ -17,30 +21,128 @@ use crate::Kernel;
 
 const PUBLICATION_CLOSED: &str = "cannot issue a storage mount lease for a retiring principal";
 
-/// Alias plus the immutable UID captured before any admission await.
+/// Alias plus the immutable UID captured at the policy decision point.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct PrincipalBinding {
+pub(crate) struct PrincipalBinding {
     alias: PrincipalId,
     uid: PrincipalUid,
 }
 
 impl PrincipalBinding {
-    pub(super) fn capture(kernel: &Kernel, alias: &PrincipalId) -> Result<Self, String> {
+    pub(crate) fn bound(alias: PrincipalId, uid: PrincipalUid) -> Self {
+        Self { alias, uid }
+    }
+
+    pub(crate) fn capture(kernel: &Kernel, alias: &PrincipalId) -> Result<Self, String> {
         let uid = kernel.principal_directory.uid_for(alias).map_err(|error| {
             format!("principal `{alias}` has no immutable storage identity: {error}")
         })?;
-        Ok(Self {
-            alias: alias.clone(),
-            uid,
-        })
+        Ok(Self::bound(alias.clone(), uid))
     }
 
-    pub(super) const fn uid(&self) -> PrincipalUid {
+    pub(crate) const fn uid(&self) -> PrincipalUid {
         self.uid
     }
 
-    pub(super) fn alias(&self) -> &PrincipalId {
+    pub(crate) fn alias(&self) -> &PrincipalId {
         &self.alias
+    }
+}
+
+/// Cross-owner mount scope granted to one authenticated identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MountOwnerScope {
+    CallerOnly,
+    CrossOwnerRead,
+    CrossOwnerWrite,
+}
+
+impl MountOwnerScope {
+    pub(crate) const fn allows_foreign_read(self) -> bool {
+        matches!(self, Self::CrossOwnerRead | Self::CrossOwnerWrite)
+    }
+
+    pub(crate) const fn allows_foreign_write(self) -> bool {
+        matches!(self, Self::CrossOwnerWrite)
+    }
+
+    pub(crate) const fn allows_foreign_issue(self, access: StorageProviderAccessV1) -> bool {
+        match access {
+            StorageProviderAccessV1::ReadOnly => self.allows_foreign_read(),
+            StorageProviderAccessV1::ReadWrite => self.allows_foreign_write(),
+        }
+    }
+
+    const fn covers(self, required: Self) -> bool {
+        match required {
+            Self::CallerOnly => true,
+            Self::CrossOwnerRead => self.allows_foreign_read(),
+            Self::CrossOwnerWrite => self.allows_foreign_write(),
+        }
+    }
+}
+
+/// UID-bound mount grant decided at authorization, not inside `issue_lease`.
+#[derive(Clone, Debug)]
+pub(crate) struct MountAdmission {
+    caller: PrincipalBinding,
+    owner_scope: MountOwnerScope,
+    required_cap: Option<&'static str>,
+    device_scope: Option<DeviceScope>,
+}
+
+impl MountAdmission {
+    pub(crate) fn bound(
+        caller: PrincipalBinding,
+        owner_scope: MountOwnerScope,
+        required_cap: Option<&'static str>,
+        device_scope: Option<DeviceScope>,
+    ) -> Self {
+        Self {
+            caller,
+            owner_scope,
+            required_cap,
+            device_scope,
+        }
+    }
+
+    pub(crate) fn capture(
+        kernel: &Kernel,
+        caller: &PrincipalId,
+        owner_scope: MountOwnerScope,
+    ) -> Result<Self, String> {
+        Ok(Self::bound(
+            PrincipalBinding::capture(kernel, caller)?,
+            owner_scope,
+            None,
+            None,
+        ))
+    }
+
+    pub(crate) fn caller(&self) -> &PrincipalBinding {
+        &self.caller
+    }
+
+    pub(crate) fn alias(&self) -> &PrincipalId {
+        self.caller.alias()
+    }
+
+    pub(crate) const fn owner_scope(&self) -> MountOwnerScope {
+        self.owner_scope
+    }
+}
+
+/// Reconstruct the cross-owner grant implied by a capability check.
+pub(crate) fn mount_owner_scope_from_check(check: &CapabilityCheck<'_>) -> MountOwnerScope {
+    if check.has("storage:mount")
+        || check.has("storage:mount:write")
+        || check.has("storage:mount:system:write")
+    {
+        MountOwnerScope::CrossOwnerWrite
+    } else if check.has("storage:mount:read") || check.has("storage:mount:system:read") {
+        MountOwnerScope::CrossOwnerRead
+    } else {
+        MountOwnerScope::CallerOnly
     }
 }
 
@@ -98,11 +200,12 @@ pub(super) async fn refuse_if_retiring(
 /// Recheck captured caller/viewed/owner facts in the publication critical section.
 pub(super) async fn revalidate_publication(
     kernel: &Kernel,
-    caller: &PrincipalBinding,
+    admission: &MountAdmission,
     owner: StateOwner,
     proof: &PublicationProof,
 ) -> Result<(), String> {
-    refuse_live_binding(kernel, caller).await?;
+    refuse_live_binding(kernel, admission.caller()).await?;
+    confirm_mount_grant(kernel, admission)?;
     if let Some(viewed) = &proof.viewed {
         refuse_live_binding(kernel, viewed).await?;
         if owner != StateOwner::Principal(viewed.uid) {
@@ -110,10 +213,35 @@ pub(super) async fn revalidate_publication(
         }
     }
     if let Some(fleet) = proof.fleet_membership {
-        confirm_fleet_membership(kernel, caller.uid, fleet, owner).await?;
+        confirm_fleet_membership(kernel, admission.caller().uid(), fleet, owner).await?;
     }
     if let Some(workspace) = proof.workspace {
-        confirm_workspace_binding(kernel, caller.uid, owner, workspace)?;
+        confirm_workspace_binding(kernel, admission.caller().uid(), owner, workspace)?;
+    }
+    Ok(())
+}
+
+fn confirm_mount_grant(kernel: &Kernel, admission: &MountAdmission) -> Result<(), String> {
+    let Some(required_cap) = admission.required_cap else {
+        return Ok(());
+    };
+    let profile = kernel
+        .profile_cache
+        .resolve(admission.alias())
+        .map_err(|error| format!("revalidate mount authorization: {error}"))?;
+    if !profile.enabled {
+        return Err(PUBLICATION_CLOSED.to_owned());
+    }
+    let groups = kernel.groups.load_full();
+    let mut check =
+        CapabilityCheck::new_borrowed(profile.as_ref(), groups.as_ref(), admission.alias());
+    if let Some(scope) = &admission.device_scope {
+        check = check.with_device_scope(scope);
+    }
+    if check.require(required_cap).is_err()
+        || !mount_owner_scope_from_check(&check).covers(admission.owner_scope)
+    {
+        return Err(PUBLICATION_CLOSED.to_owned());
     }
     Ok(())
 }
@@ -208,10 +336,10 @@ pub(super) fn cleanup_mapped_lease(
 pub(crate) async fn revoke_lease(
     kernel: &Kernel,
     caller: &PrincipalId,
-    allow_cross_owner: bool,
+    owner_scope: MountOwnerScope,
     mount_id: StorageMountId,
 ) -> Result<(), String> {
-    let state = mapped_owned_lease(kernel, caller, allow_cross_owner, mount_id)?;
+    let state = mapped_owned_lease(kernel, caller, owner_scope.allows_foreign_write(), mount_id)?;
     force_revoke_lease(kernel, &state).await
 }
 
@@ -308,10 +436,10 @@ fn revoke_visible(states: &[Arc<StorageMountLeaseState>]) {
 pub(super) fn owned_lease(
     kernel: &Kernel,
     caller: &PrincipalId,
-    allow_cross_owner: bool,
+    allow_foreign: bool,
     mount_id: StorageMountId,
 ) -> Result<Arc<StorageMountLeaseState>, String> {
-    let state = mapped_owned_lease(kernel, caller, allow_cross_owner, mount_id)?;
+    let state = mapped_owned_lease(kernel, caller, allow_foreign, mount_id)?;
     if !state.is_live() {
         return Err("storage mount lease is expired or revoked".to_owned());
     }
@@ -321,7 +449,7 @@ pub(super) fn owned_lease(
 fn mapped_owned_lease(
     kernel: &Kernel,
     caller: &PrincipalId,
-    allow_cross_owner: bool,
+    allow_foreign: bool,
     mount_id: StorageMountId,
 ) -> Result<Arc<StorageMountLeaseState>, String> {
     let state = kernel
@@ -329,7 +457,7 @@ fn mapped_owned_lease(
         .get(&mount_id)
         .map(|entry| Arc::clone(entry.value()))
         .ok_or_else(|| format!("storage mount lease {mount_id} was not found"))?;
-    if !state.is_owned_by(caller) && !allow_cross_owner {
+    if !state.is_owned_by(caller) && !allow_foreign {
         return Err("storage mount lease belongs to another principal".to_owned());
     }
     Ok(state)

@@ -51,15 +51,18 @@ pub(crate) use admission::last_authorized_caller_uid;
 #[cfg(test)]
 pub(crate) use cleanup::MountCleanupStage;
 use cleanup::cleanup_resource_paths;
+pub(crate) use lifecycle::{
+    MountAdmission, MountOwnerScope, PrincipalBinding, mount_owner_scope_from_check,
+    revoke_all_leases_for_principal, revoke_lease,
+};
 use lifecycle::{
-    PrincipalBinding, PublicationProof, cleanup_unpublished, expire_idle_mapped_lease, owned_lease,
+    PublicationProof, cleanup_unpublished, expire_idle_mapped_lease, owned_lease,
     refuse_if_retiring, revalidate_publication,
 };
 #[cfg(test)]
 pub(crate) use lifecycle::{
     clear_cleanup_fault_for_test, expire_lease_for_test, inject_cleanup_fault_for_test,
 };
-pub(crate) use lifecycle::{revoke_all_leases_for_principal, revoke_lease};
 #[cfg(any(unix, windows))]
 mod process_broker;
 #[cfg(any(unix, windows))]
@@ -174,11 +177,9 @@ impl StorageMountLeaseState {
 }
 
 /// Resolve and issue one native mount lease.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn issue_lease(
     kernel: &Arc<Kernel>,
-    caller: PrincipalId,
-    allow_cross_owner: bool,
+    admission: &MountAdmission,
     view: StorageProviderViewV1,
     target: StorageFilesystemTargetV1,
     access: StorageProviderAccessV1,
@@ -186,21 +187,37 @@ pub(crate) async fn issue_lease(
     mountpoint: PathBuf,
 ) -> Result<StorageMountLeaseV1, String> {
     validate_issue_request(&provider, &mountpoint)?;
-    let caller_binding = PrincipalBinding::capture(kernel, &caller)?;
-    refuse_if_retiring(kernel, &caller, &view).await?;
-    let (owner, target, proof) =
-        resolve_owner(kernel, &caller_binding, allow_cross_owner, &view, target).await?;
+    #[cfg(test)]
+    admission::record_authorized_caller(kernel, admission.caller().uid());
+    refuse_if_retiring(kernel, admission.alias(), &view).await?;
+    let (owner, target, proof) = resolve_owner(kernel, admission, access, &view, target).await?;
     #[cfg(test)]
     admission::pause_issue_admission_for_test(kernel).await;
-    // Publication and drain share this lock. Recheck captured bindings and
-    // authorization facts here so an issue either inserts before drain or
-    // sees retirement/reclamation/drift and inserts nothing. The test
+    // Publication and drain share this lock. Recheck the authorized UID
+    // binding, live policy, and owner facts here so an issue either
+    // inserts before drain or sees drift and inserts nothing. The test
     // barrier stays above this lock, immediately after resolve_owner.
     let _publication = kernel.storage_mount_mutations.lock().await;
-    revalidate_publication(kernel, &caller_binding, owner, &proof).await?;
+    revalidate_publication(kernel, admission, owner, &proof).await?;
     publish_issued_lease(
-        kernel, caller, owner, view, target, access, provider, mountpoint,
+        kernel,
+        admission.alias().clone(),
+        owner,
+        view,
+        target,
+        access,
+        provider,
+        mountpoint,
     )
+}
+
+#[cfg(test)]
+pub(crate) fn test_mount_admission(
+    kernel: &Kernel,
+    caller: &PrincipalId,
+    owner_scope: MountOwnerScope,
+) -> MountAdmission {
+    MountAdmission::capture(kernel, caller, owner_scope).expect("test mount admission")
 }
 
 fn validate_issue_request(provider: &str, mountpoint: &Path) -> Result<(), String> {
@@ -303,10 +320,10 @@ fn publish_issued_lease(
 pub(crate) fn lease_status(
     kernel: &Kernel,
     caller: &PrincipalId,
-    allow_cross_owner: bool,
+    owner_scope: MountOwnerScope,
     mount_id: StorageMountId,
 ) -> Result<serde_json::Value, String> {
-    let state = owned_lease(kernel, caller, allow_cross_owner, mount_id)?;
+    let state = owned_lease(kernel, caller, owner_scope.allows_foreign_read(), mount_id)?;
     state.renew();
     Ok(json!({
         "mount_id": state.mount_id,
@@ -327,10 +344,10 @@ pub(crate) fn lease_status(
 pub(crate) async fn sync_lease(
     kernel: &Kernel,
     caller: &PrincipalId,
-    allow_cross_owner: bool,
+    owner_scope: MountOwnerScope,
     mount_id: StorageMountId,
 ) -> Result<(), String> {
-    let state = owned_lease(kernel, caller, allow_cross_owner, mount_id)?;
+    let state = owned_lease(kernel, caller, owner_scope.allows_foreign_write(), mount_id)?;
     let _mutation_guard = kernel.storage_mount_mutations.lock().await;
     if !state.is_live() {
         return Err("storage mount lease is expired or revoked".to_owned());
@@ -374,13 +391,13 @@ pub(crate) async fn sync_lease(
 
 async fn resolve_owner(
     kernel: &Kernel,
-    caller: &PrincipalBinding,
-    allow_cross_owner: bool,
+    admission: &MountAdmission,
+    access: StorageProviderAccessV1,
     view: &StorageProviderViewV1,
     target: StorageFilesystemTargetV1,
 ) -> Result<(StateOwner, StorageFilesystemTargetV1, PublicationProof), String> {
-    #[cfg(test)]
-    admission::record_authorized_caller(kernel, caller.uid());
+    let caller = admission.caller();
+    let allow_cross_owner = admission.owner_scope().allows_foreign_issue(access);
     let (owner, mut proof) = authorize_view(kernel, caller, allow_cross_owner, view).await?;
     if let StorageFilesystemTargetV1::WorkspaceBranch { workspace } = &target {
         confirm_workspace_target(kernel, caller, allow_cross_owner, owner, *workspace)?;

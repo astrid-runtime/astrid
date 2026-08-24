@@ -179,10 +179,10 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             .ok_or_else(|| "resolve process creation identity for provider lifetime".to_owned())?;
 
         let provider = platform_process_provider_name();
+        let admission = MountAdmission::capture(&kernel, principal, MountOwnerScope::CallerOnly)?;
         let branch_lease = issue_lease(
             &kernel,
-            principal.clone(),
-            false,
+            &admission,
             branch_view,
             StorageFilesystemTargetV1::WorkspaceBranch {
                 workspace: binding.branch,
@@ -194,8 +194,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
         .await?;
         let owner_lease = match issue_lease(
             &kernel,
-            principal.clone(),
-            false,
+            &admission,
             // HOME is always the acting principal's owner-local root.  A
             // principal assigned to a Fleet still receives a private HOME;
             // the Fleet workspace branch above is an explicit separate view.
@@ -211,7 +210,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
         {
             Ok(lease) => lease,
             Err(error) => {
-                let _ = revoke_lease(&kernel, principal, true, branch_lease.mount_id).await;
+                rollback_uncommitted_lease(&kernel, principal, branch_lease.mount_id).await;
                 return Err(error);
             },
         };
@@ -221,8 +220,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
         {
             match issue_lease(
                 &kernel,
-                principal.clone(),
-                false,
+                &admission,
                 StorageProviderViewV1::Fleet(fleet_uid),
                 StorageFilesystemTargetV1::OwnerSubtree {
                     prefix: "shared".to_owned(),
@@ -235,8 +233,8 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             {
                 Ok(lease) => Some(lease),
                 Err(error) => {
-                    let _ = revoke_lease(&kernel, principal, true, owner_lease.mount_id).await;
-                    let _ = revoke_lease(&kernel, principal, true, branch_lease.mount_id).await;
+                    rollback_uncommitted_lease(&kernel, principal, owner_lease.mount_id).await;
+                    rollback_uncommitted_lease(&kernel, principal, branch_lease.mount_id).await;
                     return Err(error);
                 },
             }
@@ -297,8 +295,8 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             Ok(child) => child,
             Err(error) => {
                 if error.cleanup_ok {
-                    let _ = revoke_lease(&kernel, principal, true, owner_lease.mount_id).await;
-                    let _ = revoke_lease(&kernel, principal, true, branch_lease.mount_id).await;
+                    rollback_uncommitted_lease(&kernel, principal, owner_lease.mount_id).await;
+                    rollback_uncommitted_lease(&kernel, principal, branch_lease.mount_id).await;
                 } else {
                     tracing::error!(
                         error = %error.message,
@@ -318,8 +316,8 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                 )
                 .await;
                 if branch_stopped && error.cleanup_ok {
-                    let _ = revoke_lease(&kernel, principal, true, owner_lease.mount_id).await;
-                    let _ = revoke_lease(&kernel, principal, true, branch_lease.mount_id).await;
+                    rollback_uncommitted_lease(&kernel, principal, owner_lease.mount_id).await;
+                    rollback_uncommitted_lease(&kernel, principal, branch_lease.mount_id).await;
                 } else {
                     tracing::error!(
                         branch_stopped,
@@ -348,10 +346,10 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                     )
                     .await;
                     if owner_stopped && branch_stopped && error.cleanup_ok {
-                        let _ = revoke_lease(&kernel, principal, true, owner_lease.mount_id).await;
-                        let _ = revoke_lease(&kernel, principal, true, branch_lease.mount_id).await;
+                        rollback_uncommitted_lease(&kernel, principal, owner_lease.mount_id).await;
+                        rollback_uncommitted_lease(&kernel, principal, branch_lease.mount_id).await;
                         if let Some(lease) = shared_lease.as_ref() {
-                            let _ = revoke_lease(&kernel, principal, true, lease.mount_id).await;
+                            rollback_uncommitted_lease(&kernel, principal, lease.mount_id).await;
                         }
                     } else {
                         tracing::error!(
@@ -494,6 +492,14 @@ async fn stop_running_provider(provider: &mut RunningProvider) -> bool {
     stopped
 }
 
+async fn rollback_uncommitted_lease(
+    kernel: &Kernel,
+    principal: &PrincipalId,
+    mount_id: StorageMountId,
+) {
+    let _ = revoke_lease(kernel, principal, MountOwnerScope::CallerOnly, mount_id).await;
+}
+
 #[cfg(any(unix, windows))]
 async fn revoke_projection_leases(
     kernel: &Kernel,
@@ -517,7 +523,7 @@ async fn revoke_mapped_projection_lease(
     principal: &PrincipalId,
     mount_id: StorageMountId,
 ) -> bool {
-    match revoke_lease(kernel, principal, true, mount_id).await {
+    match revoke_lease(kernel, principal, MountOwnerScope::CallerOnly, mount_id).await {
         Ok(()) => true,
         Err(_) if kernel.storage_mounts.get(&mount_id).is_none() => true,
         Err(_) => false,

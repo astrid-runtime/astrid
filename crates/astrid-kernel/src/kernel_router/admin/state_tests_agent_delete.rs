@@ -23,8 +23,9 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 #[cfg(any(unix, windows))]
 use crate::storage_mount::{
-    MountCleanupStage, arm_issue_admission_gate, clear_cleanup_fault_for_test,
-    expire_lease_for_test, inject_cleanup_fault_for_test, issue_lease, last_authorized_caller_uid,
+    MountAdmission, MountCleanupStage, MountOwnerScope, arm_issue_admission_gate,
+    clear_cleanup_fault_for_test, expire_lease_for_test, inject_cleanup_fault_for_test,
+    issue_lease, last_authorized_caller_uid, test_mount_admission,
 };
 
 use super::handlers;
@@ -381,10 +382,10 @@ async fn issue_principal_mount(
     principal: &PrincipalId,
     mountpoint: std::path::PathBuf,
 ) -> Result<StorageMountLeaseV1, String> {
+    let admission = MountAdmission::capture(kernel, principal, MountOwnerScope::CallerOnly)?;
     issue_lease(
         kernel,
-        principal.clone(),
-        false,
+        &admission,
         StorageProviderViewV1::Principal(principal.clone()),
         StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadWrite,
@@ -431,8 +432,11 @@ async fn issue_lease_fails_closed_once_principal_retirement_begins() {
 
     let cross = issue_lease(
         &kernel,
-        PrincipalId::default(),
-        true,
+        &test_mount_admission(
+            &kernel,
+            &PrincipalId::default(),
+            MountOwnerScope::CrossOwnerWrite,
+        ),
         StorageProviderViewV1::Principal(principal.clone()),
         StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadWrite,
@@ -567,8 +571,11 @@ async fn paused_issue_after_owner_resolve_cannot_publish_after_viewed_principal_
     let issue = tokio::spawn(async move {
         issue_lease(
             &issue_kernel,
-            PrincipalId::default(),
-            true,
+            &test_mount_admission(
+                &issue_kernel,
+                &PrincipalId::default(),
+                MountOwnerScope::CrossOwnerWrite,
+            ),
             StorageProviderViewV1::Principal(viewed),
             StorageFilesystemTargetV1::OwnerRoot,
             StorageProviderAccessV1::ReadWrite,
@@ -604,6 +611,37 @@ async fn paused_issue_after_owner_resolve_cannot_publish_after_viewed_principal_
 }
 
 #[cfg(any(unix, windows))]
+fn assert_cleanup_fault_retained(
+    lease: &StorageMountLeaseV1,
+    label: &str,
+    fault: MountCleanupStage,
+) {
+    match fault {
+        MountCleanupStage::Callback => {
+            assert!(
+                lease.callback_path.exists(),
+                "{label}: callback cleanup fault must leave the endpoint"
+            );
+        },
+        MountCleanupStage::Manifest => {
+            assert!(
+                lease.resource_path.join("lease.json").exists(),
+                "{label}: manifest cleanup fault must leave the manifest"
+            );
+        },
+        MountCleanupStage::Directory => {
+            assert!(
+                !lease.callback_path.exists(),
+                "{label}: directory cleanup fault must follow callback removal"
+            );
+            assert!(
+                lease.resource_path.exists(),
+                "{label}: directory cleanup fault must leave the resource directory"
+            );
+        },
+    }
+}
+
 async fn delete_fails_closed_on_cleanup_fault_then_retries(
     kernel: &Arc<Kernel>,
     mountpoint: PathBuf,
@@ -660,21 +698,7 @@ async fn delete_fails_closed_on_cleanup_fault_then_retries(
             "{label}: leftover map entry must be revoked"
         );
     }
-    match fault {
-        MountCleanupStage::Callback => {
-            assert!(
-                lease.callback_path.exists(),
-                "{label}: callback cleanup fault must leave the endpoint"
-            );
-        },
-        MountCleanupStage::Manifest => {
-            assert!(
-                lease.resource_path.join("lease.json").exists(),
-                "{label}: manifest cleanup fault must leave the manifest"
-            );
-        },
-        MountCleanupStage::Directory => unreachable!("directory fault is not injected"),
-    }
+    assert_cleanup_fault_retained(&lease, label, fault);
     clear_cleanup_fault_for_test(&state);
     let retried = handlers::dispatch(
         kernel,
@@ -712,6 +736,7 @@ async fn agent_delete_preserves_identity_when_mount_cleanup_fails_then_retries()
     for (label, fault) in [
         ("cleanup-callback", MountCleanupStage::Callback),
         ("cleanup-manifest", MountCleanupStage::Manifest),
+        ("cleanup-directory", MountCleanupStage::Directory),
     ] {
         delete_fails_closed_on_cleanup_fault_then_retries(
             &kernel,
@@ -736,8 +761,11 @@ async fn paused_issue_after_owner_resolve_cannot_publish_after_admin_caller_drai
     let issue = tokio::spawn(async move {
         issue_lease(
             &issue_kernel,
-            issue_principal,
-            true,
+            &test_mount_admission(
+                &issue_kernel,
+                &issue_principal,
+                MountOwnerScope::CrossOwnerWrite,
+            ),
             StorageProviderViewV1::Admin,
             StorageFilesystemTargetV1::OwnerRoot,
             StorageProviderAccessV1::ReadWrite,
@@ -790,8 +818,7 @@ async fn paused_issue_after_owner_resolve_cannot_publish_after_self_fleet_alias_
     let issue = tokio::spawn(async move {
         issue_lease(
             &issue_kernel,
-            issue_caller,
-            false,
+            &test_mount_admission(&issue_kernel, &issue_caller, MountOwnerScope::CallerOnly),
             StorageProviderViewV1::Fleet(fleet),
             StorageFilesystemTargetV1::OwnerRoot,
             StorageProviderAccessV1::ReadWrite,

@@ -11,20 +11,20 @@ use astrid_core::storage_provider::{
 
 use super::revoke_projection_leases;
 use crate::storage_mount::{
-    MountCleanupStage, clear_cleanup_fault_for_test, inject_cleanup_fault_for_test, issue_lease,
+    MountCleanupStage, MountOwnerScope, clear_cleanup_fault_for_test,
+    inject_cleanup_fault_for_test, issue_lease, test_mount_admission,
 };
 
 async fn issue_named_lease(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
     view: StorageProviderViewV1,
-    allow_cross_owner: bool,
+    owner_scope: MountOwnerScope,
     mountpoint: std::path::PathBuf,
 ) -> astrid_core::storage_filesystem::StorageMountLeaseV1 {
     issue_lease(
         kernel,
-        caller.clone(),
-        allow_cross_owner,
+        &test_mount_admission(kernel, caller, owner_scope),
         view,
         StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadWrite,
@@ -41,6 +41,16 @@ fn mapped(kernel: &crate::Kernel, mount_id: StorageMountId) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn projection_cleanup_revokes_every_lease_when_branch_cleanup_fails() {
+    for fault in [
+        MountCleanupStage::Callback,
+        MountCleanupStage::Manifest,
+        MountCleanupStage::Directory,
+    ] {
+        projection_cleanup_revokes_every_lease_on_fault(fault).await;
+    }
+}
+
+async fn projection_cleanup_revokes_every_lease_on_fault(fault: MountCleanupStage) {
     let temporary = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(temporary.path().join(".astrid"));
     let kernel = Arc::new(crate::test_kernel_with_home(home).await);
@@ -49,7 +59,7 @@ async fn projection_cleanup_revokes_every_lease_when_branch_cleanup_fails() {
         &kernel,
         &caller,
         StorageProviderViewV1::Principal(caller.clone()),
-        false,
+        MountOwnerScope::CallerOnly,
         temporary.path().join("branch-mount"),
     )
     .await;
@@ -57,7 +67,7 @@ async fn projection_cleanup_revokes_every_lease_when_branch_cleanup_fails() {
         &kernel,
         &caller,
         StorageProviderViewV1::Principal(caller.clone()),
-        false,
+        MountOwnerScope::CallerOnly,
         temporary.path().join("owner-mount"),
     )
     .await;
@@ -65,14 +75,14 @@ async fn projection_cleanup_revokes_every_lease_when_branch_cleanup_fails() {
         &kernel,
         &caller,
         StorageProviderViewV1::Admin,
-        true,
+        MountOwnerScope::CrossOwnerWrite,
         temporary.path().join("shared-mount"),
     )
     .await;
     let branch_state = Arc::clone(kernel.storage_mounts.get(&branch.mount_id).unwrap().value());
     let owner_state = Arc::clone(kernel.storage_mounts.get(&owner.mount_id).unwrap().value());
     let shared_state = Arc::clone(kernel.storage_mounts.get(&shared.mount_id).unwrap().value());
-    inject_cleanup_fault_for_test(&branch_state, MountCleanupStage::Callback);
+    inject_cleanup_fault_for_test(&branch_state, fault);
 
     assert!(
         !revoke_projection_leases(
@@ -88,7 +98,19 @@ async fn projection_cleanup_revokes_every_lease_when_branch_cleanup_fails() {
     assert!(branch_state.is_revoked_for_test());
     assert!(owner_state.is_revoked_for_test());
     assert!(shared_state.is_revoked_for_test());
-    assert!(branch.callback_path.exists());
+    match fault {
+        MountCleanupStage::Callback => {
+            assert!(branch.callback_path.exists());
+        },
+        MountCleanupStage::Manifest => {
+            assert!(!branch.callback_path.exists());
+            assert!(branch.resource_path.join("lease.json").exists());
+        },
+        MountCleanupStage::Directory => {
+            assert!(!branch.callback_path.exists());
+            assert!(branch.resource_path.exists());
+        },
+    }
     assert!(!mapped(&kernel, owner.mount_id));
     assert!(!mapped(&kernel, shared.mount_id));
     assert!(!owner.callback_path.exists());

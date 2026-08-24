@@ -433,7 +433,7 @@ pub fn required_capability_for_admin_request(
     }
 }
 
-fn storage_mount_required_capability(
+pub(super) fn storage_mount_required_capability(
     request: &AdminRequestKind,
     scope: AuthorityScope,
 ) -> &'static str {
