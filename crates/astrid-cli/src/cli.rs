@@ -500,6 +500,25 @@ pub(crate) enum McpCommands {
         #[arg(long = "request-timeout", value_name = "DURATION")]
         request_timeout: Option<String>,
     },
+    /// Attach this host's stdio stream to the persistent per-user gateway.
+    ///
+    /// The global `--principal` option may follow this subcommand, as in
+    /// `astrid mcp attach --principal codex-code --workspace "$PWD"`.
+    Attach {
+        /// Host project directory used as the `cwd://` root.
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+    },
+    /// Run the persistent per-user MCP gateway.
+    Gateway,
+    /// Wait for the gateway without running doctor or installation flows.
+    Ready {
+        /// Output format: `hook`, `pretty`, or `json`.
+        #[arg(long, default_value = "hook")]
+        format: String,
+    },
+    /// Reap orphaned long-timeout `mcp serve` processes.
+    Gc,
 }
 
 #[derive(Subcommand)]

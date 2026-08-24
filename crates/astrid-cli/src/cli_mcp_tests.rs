@@ -33,3 +33,38 @@ fn mcp_serve_accepts_aos_host_plugin_flags() {
         _ => panic!("expected mcp serve"),
     }
 }
+
+#[test]
+fn mcp_attach_accepts_principal_after_subcommand() {
+    let parsed = Cli::try_parse_from([
+        "astrid",
+        "mcp",
+        "attach",
+        "--principal",
+        "codex-code",
+        "--workspace",
+        "/tmp/project",
+    ])
+    .expect("attach argv must parse");
+    assert_eq!(parsed.principal.as_deref(), Some("codex-code"));
+    match parsed.command {
+        Some(Commands::Mcp {
+            command: McpCommands::Attach { workspace },
+        }) => assert_eq!(
+            workspace.as_deref(),
+            Some(std::path::Path::new("/tmp/project"))
+        ),
+        _ => panic!("expected mcp attach"),
+    }
+}
+
+#[test]
+fn mcp_ready_defaults_to_hook_format() {
+    let parsed = Cli::try_parse_from(["astrid", "mcp", "ready"]).expect("ready argv must parse");
+    match parsed.command {
+        Some(Commands::Mcp {
+            command: McpCommands::Ready { format },
+        }) => assert_eq!(format, "hook"),
+        _ => panic!("expected mcp ready"),
+    }
+}

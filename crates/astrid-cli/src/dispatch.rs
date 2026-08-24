@@ -455,6 +455,12 @@ async fn dispatch_mcp(command: McpCommands) -> Result<ExitCode> {
             workspace,
             request_timeout: _,
         } => commands::mcp::serve(None, workspace.as_deref()).await,
+        McpCommands::Attach { workspace } => {
+            commands::mcp::attach(None, workspace.as_deref()).await
+        },
+        McpCommands::Gateway => commands::mcp::gateway(None).await,
+        McpCommands::Ready { format } => commands::mcp::ready(None, &format).await,
+        McpCommands::Gc => commands::mcp::gc(),
     }
 }
 
