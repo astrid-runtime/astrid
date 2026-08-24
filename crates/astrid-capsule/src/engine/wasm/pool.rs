@@ -683,6 +683,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn clear_on_return_clears_stamped_invocation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+
+        for reset_resources in [true, false] {
+            let mut state = minimal_host_state(rt.handle().clone());
+            let uid = astrid_core::PrincipalUid::from_bytes([0x51; 32]);
+            state.stamped_invocation = Some(crate::stamp::StampedInvocation::from_trusted_uid(uid));
+
+            clear_on_return(&mut state, reset_resources);
+
+            assert!(
+                state.stamped_invocation.is_none(),
+                "pooled return must drop attribution (reset_resources = {reset_resources})"
+            );
+        }
+    }
+
     /// Eviction trims the warm set down to exactly `min_idle`, evicting the
     /// oldest-returned (front of the queue) first, and is a no-op at/below
     /// `min_idle`.

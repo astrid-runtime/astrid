@@ -240,23 +240,19 @@ impl HostState {
             .principal
             .as_deref()
             .and_then(|p| astrid_core::PrincipalId::new(p).ok());
-        let previous_principal = self
-            .caller_context
-            .as_ref()
-            .and_then(|context| context.principal.as_deref());
-        let owner_context =
-            previous_principal.is_none_or(|principal| principal == self.principal.as_str());
-        let trusted_uid = self
-            .stamped_invocation
-            .as_ref()
-            .map(|stamp| stamp.principal())
-            .filter(|_| {
-                owner_context
-                    && (publisher
-                        .as_ref()
-                        .is_some_and(|principal| principal == &self.principal)
-                        || publisher.is_none())
-            });
+        // A cached stamp is a hint for the current publisher alias only.
+        // Owner to principalless must become Unspecified, not inherited attribution.
+        let trusted_uid = if let Some(alias) = publisher.as_ref()
+            && let Some(stamp) = self.stamped_invocation.as_ref()
+        {
+            crate::stamp::IngressIdentity::revalidated_cached_uid(
+                &self.principal_directory,
+                alias,
+                stamp.principal(),
+            )
+        } else {
+            None
+        };
         self.stamped_invocation = crate::stamp::IngressIdentity::from_host_context(
             &self.principal_directory,
             publisher.as_ref(),

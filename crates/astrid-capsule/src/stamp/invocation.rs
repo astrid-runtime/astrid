@@ -1,7 +1,10 @@
 use astrid_core::PrincipalUid;
 
-/// A host-created invocation identity that cannot be constructed from wire
-/// aliases or guest payloads.
+/// Host attribution of a principal UID for the current capsule invocation.
+///
+/// This value records who the host bound to the invocation. It is not live
+/// authority: it does not grant rights, resource scope, or budget, and it
+/// cannot substitute for `ResourceAuthority` or admitted-table preflight.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StampedInvocation {
     principal: PrincipalUid,
