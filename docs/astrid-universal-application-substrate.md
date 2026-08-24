@@ -147,8 +147,9 @@ This specification does not:
 - claim binary compatibility before a conformance workload has run;
 - let a host mint, copy, or widen action handles through labels, icons, or
   layout;
-- treat QEMU, TCG, or KVM success as proof that host or hypervisor authority
-  is absent; or
+- treat QEMU, TCG, or KVM success as bare-metal, no-host, or hypervisor
+  machine authority, or as proof that host or hypervisor authority is
+  absent; or
 - treat hosted success as evidence that Astrid itself boots, owns the machine,
   contains hardware effects, or satisfies a product release gate.
 
@@ -264,20 +265,28 @@ Each principal nevertheless receives a distinct logical service instance with:
 
 The privacy ceiling for physical sharing and dedup is:
 
-- verified immutable application or system closure bytes may occupy shared
-  physical media;
-- hostile principals must not share writable pages, residual memory after use,
-  credentials, handles, or timing-sensitive cache entries;
-- page-cache, compiled-artifact, and other cache sharing across hostile
-  principals is forbidden unless a named threat model is proven for that exact
-  sharing class;
+- the default is hostile-principal isolation of every physical sharing class;
+- a sharing class is permitted only when a named, evidence-backed threat
+  model covers that exact class;
+- verified immutable application or system closure bytes remain a candidate
+  sharing class, not an automatic exemption from isolation or leakage
+  controls;
+- hostile principals must not share writable pages, residual memory after
+  use, credentials, or live handles;
+- isolation and any permitted sharing class must cover storage contention
+  and timing, dedup equality and existence observability, shared device
+  queues, cache and microarchitectural channels, and any equivalent
+  cross-principal leakage;
+- logical owner, quota, accounting, and non-enumeration remain separate
+  whether or not physical bytes are shared; they do not close those leakage
+  classes by themselves; and
 - content-addressed deduplication may share physical bytes of non-secret
-  immutable objects without merging logical owners; and
-- logical owner, quota, and accounting remain separate whether or not physical
-  bytes are shared.
+  immutable objects without merging logical owners only when the named
+  threat model for that class is proven.
 
 A later measurement may prove a narrower sharing implementation. It cannot
-relax this ceiling by default or treat cache warmth as a security proof.
+relax this ceiling by default or treat cache warmth, logical accounting, or
+non-enumeration as a security proof.
 
 ### 5.2 Lifecycle
 
@@ -982,14 +991,18 @@ The sealed boot bundle contains enough authenticated provider artifacts to
 reach storage and recovery without conventional device-specific code in ring
 0. The initial experimental machine contract is x86-64 QEMU/KVM with UEFI,
 fixed memory, one CPU, serial diagnostics, APIC timer, and an explicit
-virtio/IOMMU topology. QEMU, TCG, and KVM runs are functional and conformance
-evidence for that emulator contract only. They do not prove absence of host
-or hypervisor authority, DMA containment against a malicious hypervisor, or
-physical-machine ownership. The contract becomes a supported machine only after
-install, interrupted-update, rollback, recovery, isolation, and
-hardware-provider gates pass on its exact named claims. Physical-hardware
-support requires a separately named board, firmware, and device contract with
-continuous hardware evidence.
+virtio/IOMMU topology. QEMU, TCG, and KVM runs establish only the named
+emulator machine-contract enforcement boundary. They are functional and
+conformance evidence for that emulator contract. They never establish
+bare-metal, no-host, or hypervisor machine authority, DMA containment
+against a malicious hypervisor, or physical-machine ownership. Standalone
+machine-authority claims are reserved for named physical board, firmware,
+and device evidence. First-owner enrollment remains the unresolved
+ceremony in section 14.5 and is not this contract. The contract becomes a
+supported machine only after install, interrupted-update, rollback,
+recovery, isolation, and hardware-provider gates pass on its exact named
+claims. Physical-hardware support requires a separately named board,
+firmware, and device contract with continuous hardware evidence.
 
 ### 14.5 Trust-boundary handoff and first-owner enrollment
 
@@ -1081,8 +1094,9 @@ Claims must state hardware, provider, application generation, workload,
 concurrency, durability policy, cache state, and measurement interval. Shared
 page-cache warmth and stored green fixtures are not independent economic proof.
 Hostile-principal page or cache sharing is not an economic optimization that
-overrides the section 5.1 privacy ceiling. Logical charges are reported even when
-physical bytes are not shared.
+overrides the section 5.1 privacy ceiling. Logical charges are reported even
+when physical bytes are shared, and they do not close the named leakage
+classes.
 
 ## 17. Reclaiming previous work
 
@@ -1211,11 +1225,16 @@ first Realm proof and not a native-kernel completion claim.
 - Start one preloaded provider Capsule or isolated device Realm from the signed
   boot plan and publish only its typed service.
 
-Exit gate: an Astrid image boots without a host operating system, establishes
-machine authority, contains a hostile native domain, and reaches authenticated
-recovery using only the sealed bundle. QEMU/KVM/TCG evidence for this gate is
-functional/conformance only and does not prove absence of host or hypervisor
-authority.
+Emulator exit gate: QEMU, TCG, or KVM evidence establishes only that the
+named experimental machine contract in section 14.4 enforces protection,
+capability, IPC, a hostile native domain, and authenticated sealed-bundle
+recovery on that emulator. It never establishes bare-metal, no-host, or
+hypervisor machine authority, and it does not prove DMA containment against
+a malicious hypervisor.
+
+Standalone machine-authority claims are reserved for separately named
+physical board, firmware, and device evidence. First-owner enrollment
+remains the unresolved ceremony in section 14.5 and is not this gate.
 
 ### Stage C: native system services and Capsule host
 
@@ -1350,8 +1369,9 @@ evidence, and a non-claim:
 - **Native kernel.** Claim: boots and enforces protection, capability, and IPC
   on a named machine contract. Evidence: signed image digest, boot log,
   isolation and recovery tests on that contract. Non-claim: QEMU, TCG, or KVM
-  success is not absence of host or hypervisor authority, and not physical
-  ownership.
+  evidence establishes only the named emulator machine-contract enforcement
+  boundary; it is not bare-metal, no-host, or hypervisor machine authority,
+  and not physical ownership.
 - **System image.** Claim: authenticates a signed System Generation and
   selected slot. Evidence: signature verification, slot activation,
   rollback/recovery. Non-claim: image presence is not first-owner enrollment.
@@ -1379,9 +1399,9 @@ ruling. Frozen ceilings in this document are not reopened by the list:
 4. checkpoint granularity and application-consistency hooks;
 5. the first hardware-virtualized Realm backend and its conformance envelope,
    which remains later than the RV64-in-WASM oracle and BusyBox argv fixture;
-6. remaining measurements of physical-sharing implementations under the section 5.1
-   privacy ceiling; the ceiling itself is frozen, and logical charges remain
-   separate either way;
+6. remaining measurements of physical-sharing implementations under the
+   section 5.1 privacy ceiling; the ceiling itself is frozen; logical charges
+   remain separate and do not close the named leakage classes;
 7. remaining cache-implementation evidence under that same ceiling;
 8. system-generation migration and rollback behavior when application state
    schemas change;
@@ -1402,7 +1422,8 @@ This programme succeeds when all of the following are true:
 
 - a signed Astrid image independently boots an authenticated System Generation
   on at least one qualified machine contract without a host operating system or
-  conventional privileged driver stack;
+  conventional privileged driver stack; emulator QEMU/KVM/TCG evidence cannot
+  satisfy this no-host machine-authority claim;
 - distribution-neutral Astrid primitives let a distribution-owned installer
   provision, update, roll back, and recover that machine while preserving
   ownership, revocation, audit, and principal state;

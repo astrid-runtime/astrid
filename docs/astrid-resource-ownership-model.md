@@ -84,11 +84,18 @@ mechanisms, but it must not reverse these decisions:
     introduced and proven.
 11. Presentation never implies authority. Astrid issues admitted action
     handles; host labels, icons, and layout cannot mint or widen them.
-12. Physical sharing and dedup obey the substrate privacy ceiling; logical
-    owner and accounting remain separate either way.
-13. QEMU, TCG, KVM, and hosted success are functional/conformance evidence,
-    not proof that host or hypervisor authority is absent. First-owner
-    enrollment is the unresolved ceremony in substrate section 14.5.
+12. Physical sharing and dedup obey the substrate privacy ceiling. Logical
+    owner, accounting, and non-enumeration remain separate; they do not
+    close storage contention, dedup observability, shared-device, cache,
+    microarchitectural, or equivalent leakage by themselves. Default is
+    hostile-principal isolation unless a named evidence-backed threat model
+    permits each sharing class.
+13. QEMU, TCG, and KVM evidence establishes only a named emulator
+    machine-contract enforcement boundary. It is not bare-metal, no-host,
+    or hypervisor machine authority, and not proof that host or hypervisor
+    authority is absent. Hosted success is the same class of functional
+    evidence. First-owner enrollment is the unresolved ceremony in
+    substrate section 14.5.
 
 Changing one of these decisions requires a focused ADR or RFC that identifies
 the violated invariant, supplies adversarial evidence, and explains why a less
@@ -181,6 +188,8 @@ ResourceAuthority {
     provider_identity
     provider_generation
     accounting_scope
+    resource_scope
+    budget
     durability_class
     transfer_class
     parent_delegation
@@ -196,8 +205,9 @@ ready.
 
 Serializable descriptors and receipts may describe this tuple but are not a
 live `ResourceAuthority`. Live authority also depends on non-serializable
-holder/table state in the enforcing domain; deserializing the fields can never
-manufacture a usable handle.
+holder/table state in the enforcing domain, including authority-bearing
+`resource_scope`, `budget`, and reservation/envelope bindings;
+deserializing the fields can never manufacture a usable handle.
 
 - `handle_id` is an unguessable or table-local opaque reference. Knowledge of
   the value is not sufficient if the caller/table binding differs.
@@ -226,6 +236,13 @@ manufacture a usable handle.
 - provider identity and generation prevent silent backend substitution.
 - accounting scope binds reservations and usage even when physical bytes are
   shared.
+- `resource_scope` is a bounded, host-only description of the admitted object
+  subset. It is not a guest-supplied path or a serializable grant.
+- `budget` binds the reserved resource envelope, or a precise linked
+  reservation identity, so child attenuation can prove a subset of remaining
+  parent budget. Authority-bearing scope, budget, and envelope live in
+  non-serializable holder/table state; descriptors may name them but cannot
+  mint them.
 - durability class controls crash/restart behavior.
 - transfer class states whether a handle is local-only, movable, shareable,
   delegable, or non-transferable.
@@ -244,8 +261,9 @@ policy allows.
 The ring-0 capability entry stays smaller than the full product tuple: it binds
 domain-local slot, object generation, rights, and derivation/revocation facts.
 The admitted user-space/service table binds owner, principal, application,
-provider, lifecycle, accounting, and policy evidence. Kernel legibility relates
-these layers without moving product policy or strings into ring 0.
+provider, lifecycle, accounting, `resource_scope`, budget/envelope, and
+policy evidence. Kernel legibility relates these layers without moving product
+policy or strings into ring 0.
 
 Owner, holder, issuer, provider, operator, and accounting payer are distinct
 roles. A principal may hold an attenuated handle to a fleet-owned object; a
@@ -253,9 +271,12 @@ provider may implement it without owning it; an operator pool may pay for
 physical residency while each principal pays its logical charge.
 
 Physical sharing does not merge owners or logical charges. The privacy ceiling
-in the universal-application substrate applies here: hostile principals do not
-share writable pages or unproven caches; logical accounting remains separate
-either way.
+in the universal-application substrate applies here: the default is
+hostile-principal isolation; logical accounting and non-enumeration do not
+close storage contention or timing, dedup equality or existence
+observability, shared device queues, cache or microarchitectural channels,
+or equivalent leakage. Each sharing class requires a named evidence-backed
+threat model.
 
 ### 3.2 Generation and epoch vocabulary
 
@@ -316,6 +337,11 @@ child.transfer_class     no more permissive than parent.transfer_class
 child.authority_epoch    current parent authority epoch
 child.parent_delegation  authenticated lineage record or live parent reference
 ```
+
+`resource_scope` and `budget` are fields of the live `ResourceAuthority`
+tuple. They are host-only and non-serializable where authority-bearing.
+Delegation proves subset attenuation against those live bindings, not
+against a guest descriptor.
 
 Revokes win. Missing registry entries, target kinds, providers, semantic
 profiles, identities, epochs, or accounting authorities fail closed.
@@ -642,7 +668,11 @@ never deserialize an authoritative context from their own payload.
 For scheduled/background work, construction consumes a current `ServiceLease`
 that already binds principal UID, service identity, rights, authority epoch,
 lifecycle generation, expiry/revocation domain, and budget account. There is
-no implicit default principal.
+no implicit default principal. `ServiceLease` is a typed initiator binding
+into live `ResourceAuthority`; it is not a serializable substitute for that
+tuple. Requested `resource_scope` and reserved `budget` are validated
+against the live host tuple in preflight, not reconstructed from the lease
+alone.
 
 `AuthorityDecision` records the exact registry revision, grant/token evidence,
 revokes, requested-manifest digest, immutable approved-grant snapshot and
@@ -662,7 +692,10 @@ provider-specific object. Operations perform one shared preflight:
 3. compare authority and lifecycle epochs;
 4. validate the requested typed right;
 5. validate provider generation and availability;
-6. reserve or verify accounting capacity;
+6. validate requested `resource_scope` and reserved `budget` against the
+   live host bindings (bounded scope plus resource-envelope or linked
+   reservation identity), not merely `accounting_scope` or remaining
+   capacity;
 7. invoke the provider; and
 8. commit usage and audit/receipt outcome.
 
@@ -864,16 +897,20 @@ they never select the owner or storage authority.
    scope and transition receipts without forcing one generic ledger.
 2. Define child/sub-agent budget delegation and unused-budget return.
 3. Separate physical host consumption from logical per-principal charges for
-   shared immutable objects. Apply the substrate privacy ceiling: no
-   hostile-principal page or cache sharing unless a named threat model is
-   proven; logical charges remain separate either way.
+   shared immutable objects. Apply the substrate privacy ceiling: default
+   hostile-principal isolation; no sharing class is permitted unless a named
+   evidence-backed threat model covers that exact class, including storage
+   contention/timing, dedup observability, shared device queues, and cache
+   or microarchitectural channels. Logical charges and non-enumeration do
+   not close those leakage classes.
 4. Add descriptor, socket, process, stream, storage, and operation-count
    authorities incrementally.
 5. Prove crash, cancellation, timeout, deletion, and provider-loss reclamation.
 
 Exit gate: no child or shared cache can escape principal and ancestor ceilings,
 logical accounting is independent of cache warmth, and physical sharing has
-not relaxed owner isolation.
+not relaxed owner isolation or closed the named leakage classes by
+accounting alone.
 
 After Steps 1-5, native machine authority and Realm semantics are independent
 tracks. Neither waits for the other. The substrate Track N/Track R split and
@@ -931,9 +968,10 @@ Track N is independent of Track R after the types/storage foundation.
 4. Start a component through the freestanding AOT/Pulley host.
 5. Run the same resource conformance corpus against hosted and native Astrid.
 
-QEMU, TCG, and KVM boot evidence is functional/conformance only. It cannot
-prove absence of host or hypervisor authority, DMA containment against a
-malicious hypervisor, or first-owner enrollment.
+QEMU, TCG, and KVM boot evidence establishes only a named emulator
+machine-contract enforcement boundary. It cannot prove bare-metal, no-host,
+or hypervisor machine authority, DMA containment against a malicious
+hypervisor, or first-owner enrollment.
 
 Exit gate: the same admitted operation and durable principal state survive a
 hosted/native move without changing authority semantics. That gate is not a
@@ -1105,9 +1143,10 @@ The following ideas conflict with the locked direction:
 18. **Persist or serialize raw live handles as authority.** Cross-domain or
     cross-machine use requires re-admission or an explicit signed delegation;
     table slot values are local implementation details.
-19. **Treat QEMU, TCG, or KVM success as proof that host or hypervisor
-    authority is absent.** Those runs are functional/conformance evidence
-    only.
+19. **Treat QEMU, TCG, or KVM success as bare-metal, no-host, or hypervisor
+    machine authority, or as proof that host or hypervisor authority is
+    absent.** Those runs establish only a named emulator machine-contract
+    enforcement boundary.
 20. **Let a host mint or widen action handles through labels, icons, or
     layout.** Presentation is not authority; Astrid issues admitted action
     handles.
@@ -1175,8 +1214,10 @@ The following ideas conflict with the locked direction:
 
 Execution-scope claims are falsifiable and use the same subject/claim/evidence/
 non-claim ledger as the universal-application substrate: native kernel, system
-image, provider, storage, and Realm. QEMU/KVM/TCG cannot prove absence of host
-authority. Hosted success cannot prove standalone machine ownership.
+image, provider, storage, and Realm. QEMU/KVM/TCG establishes only a named
+emulator machine-contract enforcement boundary; it cannot prove absence of
+host authority or standalone machine ownership. Hosted success cannot prove
+standalone machine ownership.
 
 ## 10. Review and acceptance policy
 
