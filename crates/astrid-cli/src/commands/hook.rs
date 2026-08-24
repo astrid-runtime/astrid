@@ -208,4 +208,84 @@ mod tests {
             0
         );
     }
+
+    #[test]
+    fn transport_failure_respects_fail_closed_opt_in() {
+        let test_exe = std::env::current_exe().expect("locate hook test binary");
+        let root = tempfile::Builder::new()
+            .prefix("astrid-hook-policy-")
+            .tempdir_in("/private/tmp")
+            .expect("create throwaway hook test home");
+        let home = root.path().join("home");
+        let astrid_home = root.path().join("astrid");
+        std::fs::create_dir_all(&home).expect("create throwaway HOME");
+        std::fs::create_dir_all(&astrid_home).expect("create throwaway ASTRID_HOME");
+
+        // The child executes the real hook command against the absent socket
+        // under the throwaway ASTRID_HOME, so its transport result is a
+        // failure rather than a synthetic exit code.
+        let cases = [
+            ("default", None),
+            ("unset", None),
+            ("empty", Some("")),
+            ("true", Some("true")),
+            ("zero", Some("0")),
+            ("one", Some("1")),
+        ];
+        for (label, fail_closed) in cases {
+            let mut command = std::process::Command::new(&test_exe);
+            command
+                .arg("--exact")
+                .arg("commands::hook::tests::transport_failure_policy_child")
+                .arg("--ignored")
+                .arg("--quiet")
+                .env("ASTRID_HOOK_POLICY_CHILD", "1")
+                .env("ASTRID_HOOK_TOKEN", "hook-token")
+                .env("HOME", &home)
+                .env("ASTRID_HOME", &astrid_home)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            match fail_closed {
+                Some(value) => {
+                    command.env(FAIL_CLOSED_ENV, value);
+                },
+                None => {
+                    command.env_remove(FAIL_CLOSED_ENV);
+                },
+            }
+
+            let output = command
+                .output()
+                .unwrap_or_else(|error| panic!("run {label} hook policy child: {error}"));
+            assert!(
+                output.status.success(),
+                "{label} hook policy child failed with status {}",
+                output.status
+            );
+        }
+    }
+
+    #[ignore = "subprocess-only hook policy fixture"]
+    #[tokio::test]
+    async fn transport_failure_policy_child() {
+        if std::env::var_os("ASTRID_HOOK_POLICY_CHILD").is_none() {
+            return;
+        }
+
+        let actual = run(HookArgs {
+            host: "codex".to_string(),
+            session: "isolated".to_string(),
+            event: "session_start".to_string(),
+            workspace: None,
+            timeout_ms: Some(0),
+        })
+        .await
+        .expect("hook transport result");
+        let expected = match std::env::var(FAIL_CLOSED_ENV) {
+            Ok(value) if value == "1" => ExitCode::from(1),
+            _ => ExitCode::SUCCESS,
+        };
+        assert_eq!(actual, expected, "unexpected hook transport policy result");
+    }
 }
