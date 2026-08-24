@@ -35,7 +35,10 @@ const MAX_REGISTRATION_BYTES: usize = 16 * 1024;
 /// A client must finish its tiny registration preface promptly. This is a
 /// protocol `DoS` ceiling, not an operator tuning knob: half-open sockets must
 /// not retain listener tasks indefinitely.
+#[cfg(not(test))]
 const REGISTRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const REGISTRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 type Client = Arc<Mutex<crate::socket_client::SocketClient>>;
 type Peers = Arc<Mutex<HashMap<String, Peer<RoleServer>>>>;
@@ -335,8 +338,11 @@ fn set_socket_mode(path: &Path) -> Result<()> {
 mod tests {
     use std::path::PathBuf;
 
+    use tokio::io::{AsyncWriteExt, BufReader};
+
     use super::{
-        GatewayState, MAX_ATTACHES, authenticate_registration, mint_hook_token, validate_workspace,
+        GatewayState, MAX_ATTACHES, MAX_REGISTRATION_BYTES, authenticate_registration,
+        mint_hook_token, read_registration, read_registration_inner, validate_workspace,
     };
     use crate::commands::mcp::lifecycle::AttachRegistration;
 
@@ -360,6 +366,47 @@ mod tests {
         assert!(state.acquire("codex-code").await.is_err());
         drop(permits);
         assert!(state.acquire("codex-code").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn registration_preface_times_out_without_a_newline() {
+        let (_peer, stream) = tokio::io::duplex(1);
+        let mut reader = BufReader::new(stream);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_registration(&mut reader),
+        )
+        .await
+        .expect("registration timeout test must complete");
+        let error = result.expect_err("a preface without a newline must time out");
+        assert!(
+            error
+                .to_string()
+                .contains("timed out reading MCP attach registration"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_registration_preface_fails_without_waiting_for_a_newline() {
+        let (mut peer, stream) = tokio::io::duplex(MAX_REGISTRATION_BYTES + 1);
+        peer.write_all(&vec![b'x'; MAX_REGISTRATION_BYTES + 1])
+            .await
+            .expect("oversized preface must fit in the test peer");
+        let mut reader = BufReader::new(stream);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_registration_inner(&mut reader),
+        )
+        .await
+        .expect("registration size test must complete");
+        let error = result.expect_err("an oversized preface must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("registration is missing or too large"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
