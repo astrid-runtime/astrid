@@ -1,5 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+#[cfg(feature = "uefi")]
+#[path = "src/build_config.rs"]
+mod build_config;
+
 const BOOTLOADER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
@@ -79,20 +84,19 @@ fn build_uefi_bootloader() -> PathBuf {
         cmd.arg("--version").arg(BOOTLOADER_VERSION);
     }
     cmd.arg("--locked");
-    cmd.arg("--target").arg("x86_64-unknown-uefi");
+    cmd.arg("--target").arg(build_config::NESTED_UEFI_TARGET);
     cmd.arg("-Zbuild-std=core")
         .arg("-Zbuild-std-features=compiler-builtins-mem");
     cmd.arg("--root").arg(&out_dir);
     cmd.arg("-vv");
     cmd.env_remove("RUSTFLAGS");
     cmd.env_remove("CARGO_ENCODED_RUSTFLAGS");
-    // The nested UEFI build targets x86_64 even when kimage runs on a
-    // non-x86 host. Current nightly LLVM can abort while compiling the
-    // curve25519 SIMD backend for that cross-target; the serial backend is
-    // equivalent for verification and keeps the loader build fail-closed.
-    if std::env::consts::ARCH != "x86_64" {
-        cmd.env("RUSTFLAGS", "--cfg curve25519_dalek_backend=\"serial\"");
-    }
+    // The nested UEFI build always targets x86_64. The pinned nightly LLVM
+    // can abort while compiling curve25519's SIMD backend for this target,
+    // including when kimage itself runs on x86_64. The serial backend is an
+    // equivalent verification build choice and keeps the loader build
+    // fail-closed on every host.
+    cmd.env("RUSTFLAGS", build_config::NESTED_UEFI_RUSTFLAGS);
     let status = cmd
         .status()
         .expect("failed to run cargo install for uefi bootloader");
