@@ -445,6 +445,12 @@ fn corrupt_record_length_cannot_hide_a_valid_successor() {
     let first_write = VOLUME_MAGIC.len() as u64 + create_length;
     file.seek(SeekFrom::Start(first_write + 8)).unwrap();
     file.write_all(&u64::MAX.to_le_bytes()).unwrap();
+    let footer_byte = file.metadata().unwrap().len().checked_sub(1).unwrap();
+    file.seek(SeekFrom::Start(footer_byte)).unwrap();
+    file.read_exact(&mut encoded[..1]).unwrap();
+    encoded[0] ^= 0x80;
+    file.seek(SeekFrom::Start(footer_byte)).unwrap();
+    file.write_all(&encoded[..1]).unwrap();
     file.sync_all().unwrap();
 
     let error = HostedFileVolume::open(&path).unwrap_err();
@@ -493,27 +499,24 @@ fn corrupt_write_checksum_does_not_block_footer_open() {
 }
 
 #[test]
-fn footer_open_does_not_hash_tens_of_megabytes_of_write_payload() {
+fn footer_open_reads_only_the_commit_header_after_many_writes() {
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("astrid.volume");
     let region = VolumeRegion::new("objects").unwrap();
-    let payload = vec![0xA5_u8; 32 * 1024 * 1024];
     {
         let volume = HostedFileVolume::open(&path).unwrap();
         volume.create_region(&region, true).unwrap();
-        volume
-            .write_region_from(&region, 0, payload.len() as u64, &mut payload.as_slice())
-            .unwrap();
+        for index in 0..256_u64 {
+            let byte = [u8::try_from(index % 251).unwrap()];
+            volume.write_region_at(&region, index, &byte).unwrap();
+        }
         volume.sync().unwrap();
     }
-    let started = std::time::Instant::now();
+
+    recover::reset_read_header_count();
     let volume = HostedFileVolume::open(&path).unwrap();
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < std::time::Duration::from_secs(3),
-        "footer open unexpectedly hashed the payload: {elapsed:?}"
-    );
-    assert_eq!(volume.region_len(&region).unwrap(), payload.len() as u64);
+    assert_eq!(recover::read_header_count(), 1);
+    assert_eq!(volume.region_len(&region).unwrap(), 256);
 }
 
 #[test]

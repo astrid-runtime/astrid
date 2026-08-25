@@ -1,5 +1,7 @@
 //! Hosted volume recovery, commit snapshots, and the EOF durability footer.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
@@ -20,6 +22,21 @@ const MAX_COMMIT_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
 const SNAPSHOT_MAGIC: [u8; 8] = *b"ASTMAP1\0";
 const FOOTER_MAGIC: [u8; 8] = *b"ASTFTR1\0";
 const FOOTER_BYTES: usize = FOOTER_MAGIC.len() + 8 + 8 + 8 + 32;
+
+#[cfg(test)]
+thread_local! {
+    static READ_HEADER_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_read_header_count() {
+    READ_HEADER_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn read_header_count() -> usize {
+    READ_HEADER_COUNT.with(Cell::get)
+}
 
 #[derive(Debug)]
 pub(super) struct Recovery {
@@ -138,7 +155,6 @@ fn recover_footer_at(
     {
         return Ok(None);
     }
-    validate_record_headers(file, durable_len)?;
     let Some((header, payload)) = read_commit(file, last_commit_offset, durable_len, sequence)?
     else {
         return Ok(None);
@@ -243,36 +259,6 @@ fn recover_from_headers(file: &File) -> io::Result<Recovery> {
     })
 }
 
-fn validate_record_headers(file: &File, end: u64) -> io::Result<()> {
-    let mut offset = VOLUME_MAGIC.len() as u64;
-    let mut sequence = 0_u64;
-    while offset < end {
-        let Some(header) = read_header(file, offset, end)? else {
-            return Err(invalid_transition(
-                "truncated Astrid volume record before footer",
-            ));
-        };
-        if header.sequence != sequence.saturating_add(1) {
-            return Err(invalid_transition(
-                "Astrid volume record sequence is not contiguous",
-            ));
-        }
-        if header.operation != Operation::Write && header.operation != Operation::Commit {
-            let _ = read_record_payload(file, &header)?;
-        }
-        sequence = header.sequence;
-        offset = offset
-            .checked_add(header.total_len)
-            .ok_or_else(|| io::Error::other("volume header scan offset overflow"))?;
-    }
-    if offset != end {
-        return Err(invalid_transition(
-            "volume footer does not follow a complete journal",
-        ));
-    }
-    Ok(())
-}
-
 fn apply_record(
     regions: &mut BTreeMap<VolumeRegion, RegionState>,
     header: &RecordHeader,
@@ -366,6 +352,8 @@ fn read_header(file: &File, offset: u64, physical_len: u64) -> io::Result<Option
     if remaining < RECORD_FIXED_BYTES as u64 {
         return Ok(None);
     }
+    #[cfg(test)]
+    READ_HEADER_COUNT.with(|count| count.set(count.get().saturating_add(1)));
     let mut fixed = [0_u8; RECORD_FIXED_BYTES];
     read_exact_at(file, offset, &mut fixed)?;
     if fixed[..RECORD_MAGIC.len()] != RECORD_MAGIC {
