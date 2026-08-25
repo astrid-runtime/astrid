@@ -49,12 +49,7 @@ impl Journal {
             }
             let frame = match decode_frame(&raw) {
                 Ok(frame) => frame,
-                Err(_) => {
-                    if self.bytes[end..].iter().any(|byte| *byte != 0) {
-                        return Err(JournalError::InteriorCorrupt);
-                    }
-                    return Ok(parsed);
-                },
+                Err(_) => return Err(JournalError::InteriorCorrupt),
             };
             validate_frame(&parsed, frame)?;
             parsed.frames[index] = Some(frame);

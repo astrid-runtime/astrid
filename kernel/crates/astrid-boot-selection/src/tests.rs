@@ -1,4 +1,6 @@
-use crate::codec::{FRAME_LEN, RESERVED_START, decode_frame, encode_frame};
+use crate::codec::{
+    CHECKSUM_END, CHECKSUM_START, FRAME_LEN, RESERVED_START, decode_frame, encode_frame,
+};
 use crate::error::{JournalError, SelectionError};
 use crate::journal::{JOURNAL_LEN, Journal};
 use crate::policy::{MAX_ATTEMPTS, SelectionPolicy};
@@ -57,6 +59,7 @@ fn fixed_empty_journal_recovers() {
     );
     assert_eq!(JOURNAL_LEN, 4096);
     assert_eq!(FRAME_LEN, 256);
+    assert_eq!(CHECKSUM_END, FRAME_LEN);
 }
 
 #[test]
@@ -79,10 +82,10 @@ fn journal_size_is_exact_and_unknown_markers_fail_closed() {
         let mut bytes = confirmed.as_bytes();
         bytes[FRAME_LEN + offset] = 0xff;
         let malformed = Journal::from_bytes(&bytes).expect("fixed journal");
-        assert!(matches!(
+        assert_eq!(
             selector().recover(malformed, verified()),
-            BootDecision::Pending(trial) if trial.slot() == Slot::A
-        ));
+            BootDecision::Recovery
+        );
     }
 }
 
@@ -281,6 +284,88 @@ fn slot_swapped_failed_claim_falls_back_to_distinct_confirmation() {
     ));
 }
 
+fn corrupt_final_checksum(journal: Journal, frame_index: usize) -> Journal {
+    let mut bytes = journal.as_bytes();
+    bytes[frame_index * FRAME_LEN + CHECKSUM_START] ^= 1;
+    Journal::from_bytes(&bytes).expect("fixed journal")
+}
+
+#[test]
+fn same_slot_torn_attempt_three_or_bad_is_recovery() {
+    let confirmed = {
+        let first = selector()
+            .start_pending(Journal::empty(), Slot::A, facts(1), 1)
+            .expect("first");
+        selector()
+            .confirm(first.journal(), first.token())
+            .expect("confirmed")
+    };
+    let trial_one = selector()
+        .start_pending(confirmed, Slot::A, facts(2), 2)
+        .expect("trial one");
+    let trial_two = selector()
+        .start_pending(trial_one.journal(), Slot::A, facts(2), 3)
+        .expect("trial two");
+    let trial_three = selector()
+        .start_pending(trial_two.journal(), Slot::A, facts(2), 4)
+        .expect("trial three");
+    assert_eq!(
+        selector().recover(corrupt_final_checksum(trial_three.journal(), 4), verified()),
+        BootDecision::Recovery
+    );
+
+    let trial = selector()
+        .start_pending(confirmed, Slot::A, facts(2), 2)
+        .expect("bad trial");
+    let bad = selector()
+        .mark_bad(trial.journal(), trial.token())
+        .expect("bad");
+    assert_eq!(
+        selector().recover(corrupt_final_checksum(bad, 3), verified()),
+        BootDecision::Recovery
+    );
+}
+
+#[test]
+fn slot_swapped_torn_attempt_three_or_bad_is_recovery() {
+    let first = selector()
+        .start_pending(Journal::empty(), Slot::A, facts(1), 1)
+        .expect("first");
+    let first_confirmed = selector()
+        .confirm(first.journal(), first.token())
+        .expect("first confirmed");
+    let second = selector()
+        .start_pending(first_confirmed, Slot::B, facts(2), 2)
+        .expect("second");
+    let second_confirmed = selector()
+        .confirm(second.journal(), second.token())
+        .expect("second confirmed");
+    let trial_one = selector()
+        .start_pending(second_confirmed, Slot::B, facts(1), 3)
+        .expect("slot-swapped trial one");
+    let trial_two = selector()
+        .start_pending(trial_one.journal(), Slot::B, facts(1), 4)
+        .expect("slot-swapped trial two");
+    let trial_three = selector()
+        .start_pending(trial_two.journal(), Slot::B, facts(1), 5)
+        .expect("slot-swapped trial three");
+    assert_eq!(
+        selector().recover(corrupt_final_checksum(trial_three.journal(), 6), verified()),
+        BootDecision::Recovery
+    );
+
+    let trial = selector()
+        .start_pending(second_confirmed, Slot::B, facts(1), 3)
+        .expect("slot-swapped bad trial");
+    let bad = selector()
+        .mark_bad(trial.journal(), trial.token())
+        .expect("bad");
+    assert_eq!(
+        selector().recover(corrupt_final_checksum(bad, 5), verified()),
+        BootDecision::Recovery
+    );
+}
+
 #[test]
 fn each_independent_policy_floor_is_enforced() {
     let candidate = facts(1);
@@ -318,7 +403,7 @@ fn stale_newer_pending_falls_back_to_confirmed() {
 }
 
 #[test]
-fn malformed_final_with_zero_tail_rolls_back_but_interior_corruption_recovers() {
+fn nonzero_malformed_final_and_interior_corruption_recover() {
     let first = selector()
         .start_pending(Journal::empty(), Slot::A, facts(1), 1)
         .expect("pending");
@@ -328,10 +413,7 @@ fn malformed_final_with_zero_tail_rolls_back_but_interior_corruption_recovers() 
     let mut bytes = confirmed.as_bytes();
     bytes[FRAME_LEN] = 0x55;
     let torn = Journal::from_bytes(&bytes).expect("journal");
-    assert!(matches!(
-        selector().recover(torn, verified()),
-        BootDecision::Pending(trial) if trial.attempt() == 1
-    ));
+    assert_eq!(selector().recover(torn, verified()), BootDecision::Recovery);
     let mut bytes = torn.as_bytes();
     bytes[2 * FRAME_LEN] = 0x66;
     let interior = Journal::from_bytes(&bytes).expect("journal");
@@ -364,7 +446,7 @@ fn empty_gap_and_later_nonzero_frame_are_interior_corruption() {
 }
 
 #[test]
-fn reserved_checksum_and_marker_changes_are_rejected_as_torn_final() {
+fn nonzero_reserved_checksum_and_marker_fail_closed() {
     let first = selector()
         .start_pending(Journal::empty(), Slot::A, facts(1), 1)
         .expect("pending");
@@ -374,24 +456,24 @@ fn reserved_checksum_and_marker_changes_are_rejected_as_torn_final() {
     let mut bytes = confirmed.as_bytes();
     bytes[FRAME_LEN + RESERVED_START] = 1;
     let reserved = Journal::from_bytes(&bytes).expect("journal");
-    assert!(matches!(
+    assert_eq!(
         selector().recover(reserved, verified()),
-        BootDecision::Pending(trial) if trial.attempt() == 1 && trial.slot() == Slot::A
-    ));
+        BootDecision::Recovery
+    );
     let mut bytes = confirmed.as_bytes();
-    bytes[FRAME_LEN + 224] ^= 1;
+    bytes[FRAME_LEN + CHECKSUM_START] ^= 1;
     let checksum = Journal::from_bytes(&bytes).expect("journal");
-    assert!(matches!(
+    assert_eq!(
         selector().recover(checksum, verified()),
-        BootDecision::Pending(trial) if trial.attempt() == 1 && trial.slot() == Slot::A
-    ));
+        BootDecision::Recovery
+    );
     let mut bytes = confirmed.as_bytes();
     bytes[FRAME_LEN] = b'X';
     let marker = Journal::from_bytes(&bytes).expect("journal");
-    assert!(matches!(
+    assert_eq!(
         selector().recover(marker, verified()),
-        BootDecision::Pending(trial) if trial.attempt() == 1 && trial.slot() == Slot::A
-    ));
+        BootDecision::Recovery
+    );
 }
 
 #[test]

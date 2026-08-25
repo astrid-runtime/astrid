@@ -30,6 +30,11 @@ pub const SYSGEN_FLOOR_END: usize = SYSGEN_FLOOR_START + 8;
 pub const CHECKSUM_START: usize = SYSGEN_FLOOR_END;
 pub const CHECKSUM_END: usize = CHECKSUM_START + 32;
 
+// The checksum is the terminal field. Keep this as a compile-time invariant:
+// a future trailer or commit marker must be assigned an offset and validated,
+// rather than silently becoming unauthenticated frame bytes.
+const _: () = assert!(CHECKSUM_END == FRAME_LEN);
+
 pub fn encode_frame(frame: &Frame) -> [u8; FRAME_LEN] {
     let mut out = [0u8; FRAME_LEN];
     out[..MAGIC.len()].copy_from_slice(MAGIC);
@@ -84,6 +89,8 @@ pub fn encode_frame(frame: &Frame) -> [u8; FRAME_LEN] {
 }
 
 pub fn decode_frame(bytes: &[u8; FRAME_LEN]) -> Result<Frame, JournalError> {
+    // Magic/version, zero reserved padding, and the terminal checksum are all
+    // mandatory before any persisted claim is considered.
     if bytes[..MAGIC.len()] != MAGIC[..] || bytes[8] != VERSION {
         return Err(JournalError::InteriorCorrupt);
     }
