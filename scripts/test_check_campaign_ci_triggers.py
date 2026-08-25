@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 
 from check_campaign_ci_triggers import (
+    CI_YML_LINE_CAP,
     OWNED_WORKFLOWS,
     check_repository,
     load_workflows,
@@ -283,6 +284,26 @@ class CampaignCiTriggerTests(unittest.TestCase):
         self.assertTrue(
             any(
                 "scorecard.yml: pull_request event is not allowed" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_ci_yml_stays_within_source_line_cap(self):
+        temp_root = self._copy_workflows()
+        errors = check_repository(temp_root)
+        self.assertFalse(
+            any("ci.yml: exceeds" in error for error in errors),
+            errors,
+        )
+        workflow = temp_root / ".github" / "workflows" / "ci.yml"
+        current = workflow.read_text(encoding="utf-8")
+        pad = CI_YML_LINE_CAP - current.count("\n") + 1
+        workflow.write_text(current + ("\n" * pad), encoding="utf-8")
+        errors = check_repository(temp_root)
+        self.assertTrue(
+            any(
+                f"ci.yml: exceeds {CI_YML_LINE_CAP}-line source cap" in error
                 for error in errors
             ),
             errors,

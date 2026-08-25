@@ -18,6 +18,7 @@ MAIN_BRANCH = "main"
 CODEX_BRANCH_PREFIX = "codex/"
 DOCS_PATH = "docs/**"
 CHANGES_PATH = "changes/**"
+CI_YML_LINE_CAP = 1000
 
 OWNED_WORKFLOWS = frozenset(
     {
@@ -320,6 +321,11 @@ def validate_workflows(workflows: Mapping[str, str]) -> list[str]:
 
     ci = workflows.get("ci.yml")
     if ci is not None:
+        line_count = ci.count("\n")
+        if line_count > CI_YML_LINE_CAP:
+            errors.append(
+                f"ci.yml: exceeds {CI_YML_LINE_CAP}-line source cap ({line_count} newlines)"
+            )
         for event in ("pull_request", "push"):
             paths = _event_field_values(ci, event, "paths") or []
             if any(_is_docs_path(path) for path in paths):
