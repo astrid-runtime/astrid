@@ -8,7 +8,7 @@ use core::alloc::Layout;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use astrid_native_closure::ClosureError;
+use astrid_native_closure::{ClosureError, ReadableRange, prove_pages_readable, ranges_overlap};
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use linked_list_allocator::Heap;
 use spin::{Mutex, Once};
@@ -193,7 +193,7 @@ extern "C" fn text_probe() {
 }
 
 /// True if `page` is a canonical address whose leaf is present (readable).
-pub fn page_present_readable(page: u64) -> bool {
+fn page_present_readable(page: u64) -> bool {
     let Ok(addr) = VirtAddr::try_new(page) else {
         return false;
     };
@@ -202,27 +202,8 @@ pub fn page_present_readable(page: u64) -> bool {
 
 /// Validate a loader-mapped virtual range before copying its untrusted bytes.
 pub fn prove_readable_range(start: u64, len: u64) -> Result<(), ClosureError> {
-    if start == 0 || len == 0 {
-        return Err(ClosureError::Missing);
-    }
-    let end = start.checked_add(len).ok_or(ClosureError::Malformed)?;
-    if !is_canonical(start) || !is_canonical(end - 1) {
-        return Err(ClosureError::Malformed);
-    }
-    let mut page = start & !(FRAME_SIZE - 1);
-    let last_page = (end - 1) & !(FRAME_SIZE - 1);
-    loop {
-        if !page_present_readable(page) {
-            return Err(ClosureError::Unmapped);
-        }
-        if page == last_page {
-            break;
-        }
-        page = page
-            .checked_add(FRAME_SIZE)
-            .ok_or(ClosureError::Malformed)?;
-    }
-    Ok(())
+    let range = ReadableRange::try_new(start, len)?;
+    prove_pages_readable(range, page_present_readable)
 }
 
 /// Copy a previously proven loader-mapped range into kernel-owned storage.
@@ -241,56 +222,6 @@ pub unsafe fn copy_readable_range(start: u64, destination: &mut [u8]) -> Result<
     let source = unsafe { core::slice::from_raw_parts(start as *const u8, destination.len()) };
     destination.copy_from_slice(source);
     Ok(())
-}
-
-fn ranges_overlap(
-    first_start: u64,
-    first_len: u64,
-    second_start: u64,
-    second_len: u64,
-) -> Result<bool, ClosureError> {
-    let first_end = first_start
-        .checked_add(first_len)
-        .ok_or(ClosureError::Malformed)?;
-    let second_end = second_start
-        .checked_add(second_len)
-        .ok_or(ClosureError::Malformed)?;
-    Ok(first_start < second_end && second_start < first_end)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{copy_readable_range, ranges_overlap};
-
-    #[test]
-    fn exact_and_partial_source_destination_overlap_is_rejected() {
-        assert!(ranges_overlap(0x1000, 0x100, 0x1000, 0x100).unwrap());
-        assert!(ranges_overlap(0x1000, 0x100, 0x1080, 0x100).unwrap());
-        assert!(ranges_overlap(0x1080, 0x100, 0x1000, 0x100).unwrap());
-    }
-
-    #[test]
-    fn disjoint_ranges_are_accepted() {
-        assert!(!ranges_overlap(0x1000, 0x100, 0x1100, 0x100).unwrap());
-        assert!(!ranges_overlap(0x1100, 0x100, 0x1000, 0x100).unwrap());
-    }
-
-    #[test]
-    fn overflowing_range_is_rejected() {
-        assert!(ranges_overlap(u64::MAX - 3, 4, 0, 1).is_err());
-    }
-
-    #[test]
-    fn non_overlapping_copy_succeeds() {
-        let source = [1u8, 2, 3, 4];
-        let mut destination = [0u8; 4];
-        // SAFETY: the test arrays are resident and readable for the copy, and
-        // their distinct allocations establish the required non-overlap.
-        unsafe {
-            copy_readable_range(source.as_ptr() as u64, &mut destination).unwrap();
-        }
-        assert_eq!(destination, source);
-    }
 }
 
 fn leaf_flags(addr: VirtAddr) -> Option<PageTableFlags> {
@@ -318,11 +249,6 @@ fn leaf_flags(addr: VirtAddr) -> Option<PageTableFlags> {
         table_phys = entry.addr().as_u64();
     }
     Some(flags)
-}
-
-const fn is_canonical(addr: u64) -> bool {
-    let sign_extended = ((addr as i64) << 16) >> 16;
-    sign_extended as u64 == addr
 }
 
 /// Audit W^X for the kernel image. Returns violation booleans:
