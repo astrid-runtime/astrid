@@ -2,15 +2,21 @@
 
 use ed25519_dalek::{Signature, VerifyingKey};
 
-use crate::codec::{decode_manifest, signature_message};
+use crate::codec::{decode_manifest, encode_manifest, signature_message};
 use crate::error::GenerationError;
 use crate::policy::{TrustedInput, VerifiedGeneration};
+use crate::types::ManifestIdentity;
 
 pub fn verify_manifest(
     bytes: &[u8],
     trusted: &TrustedInput,
 ) -> Result<VerifiedGeneration, GenerationError> {
     let signed = decode_manifest(bytes)?;
+    let canonical = encode_manifest(&signed);
+    if canonical.as_slice() != bytes {
+        return Err(GenerationError::NonCanonical);
+    }
+    let manifest_identity = ManifestIdentity::from_canonical(&canonical);
     if signed.signer() != trusted.signer() {
         return Err(GenerationError::UntrustedSigner);
     }
@@ -45,7 +51,7 @@ pub fn verify_manifest(
     if manifest.sizes() != trusted.sizes() {
         return Err(GenerationError::SizeMismatch);
     }
-    Ok(VerifiedGeneration::new(signed))
+    Ok(VerifiedGeneration::new(signed, manifest_identity))
 }
 
 fn verify_signature(

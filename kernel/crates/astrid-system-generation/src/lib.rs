@@ -20,22 +20,20 @@ mod verify;
 
 #[cfg(any(test, feature = "sign"))]
 mod fixture;
-#[cfg(any(test, feature = "sign"))]
+#[cfg(test)]
 mod sign;
 
-pub use codec::{decode_manifest, encode_manifest};
 pub use error::GenerationError;
 pub use policy::{TrustedInput, TrustedInputData, VerifiedGeneration};
 pub use types::{
-    ComponentSet, ContentId, Expiration, Generation, MANIFEST_LEN, MAX_COMPONENTS, ManifestInput,
-    ManifestSizes, Revocation, RollbackFloor, SignedSystemGeneration, SystemGenerationManifest,
+    ComponentSet, ContentId, Expiration, Generation, MANIFEST_LEN, MAX_COMPONENTS,
+    ManifestIdentity, ManifestInput, ManifestSizes, Revocation, RollbackFloor,
+    SystemGenerationManifest,
 };
 pub use verify::verify_manifest;
 
 #[cfg(any(test, feature = "sign"))]
 pub use fixture::fixture_signing_key;
-#[cfg(any(test, feature = "sign"))]
-pub use sign::sign_manifest;
 
 #[cfg(test)]
 extern crate std;

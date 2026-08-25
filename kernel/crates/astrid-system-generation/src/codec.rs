@@ -8,7 +8,7 @@ use crate::types::{
     UNSIGNED_LEN, VERSION,
 };
 
-pub fn encode_manifest(signed: &SignedSystemGeneration) -> [u8; MANIFEST_LEN] {
+pub(crate) fn encode_manifest(signed: &SignedSystemGeneration) -> [u8; MANIFEST_LEN] {
     let mut out = [0u8; MANIFEST_LEN];
     encode_unsigned(&signed.manifest, &mut out[..UNSIGNED_LEN]);
     out[SIGNER_OFFSET..SIGNATURE_OFFSET].copy_from_slice(&signed.signer);
@@ -16,7 +16,7 @@ pub fn encode_manifest(signed: &SignedSystemGeneration) -> [u8; MANIFEST_LEN] {
     out
 }
 
-pub fn decode_manifest(bytes: &[u8]) -> Result<SignedSystemGeneration, GenerationError> {
+pub(crate) fn decode_manifest(bytes: &[u8]) -> Result<SignedSystemGeneration, GenerationError> {
     if bytes.is_empty() {
         return Err(GenerationError::Missing);
     }

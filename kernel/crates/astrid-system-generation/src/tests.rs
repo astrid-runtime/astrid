@@ -6,8 +6,9 @@ use crate::fixture::fixture_signing_key;
 use crate::policy::{TrustedInput, TrustedInputData};
 use crate::sign::sign_manifest;
 use crate::types::{
-    ComponentSet, ContentId, Expiration, Generation, MANIFEST_LEN, MAX_COMPONENTS, ManifestInput,
-    ManifestSizes, Revocation, RollbackFloor, SystemGenerationManifest,
+    ComponentSet, ContentId, Expiration, Generation, MANIFEST_LEN, MAX_COMPONENTS,
+    ManifestIdentity, ManifestInput, ManifestSizes, Revocation, RollbackFloor,
+    SystemGenerationManifest,
 };
 use crate::verify::verify_manifest;
 
@@ -77,6 +78,48 @@ fn exact_canonical_bytes_roundtrip() {
     );
     let verified = verify_manifest(&bytes, &trusted(&key(1))).expect("verify");
     assert_eq!(verified.manifest(), manifest());
+}
+
+#[test]
+fn manifest_identity_is_bound_to_verified_canonical_bytes() {
+    let key = key(1);
+    let bytes = signed_bytes(&key);
+    let verified = verify_manifest(&bytes, &trusted(&key)).expect("verify");
+    assert_eq!(
+        verified.manifest_identity(),
+        ManifestIdentity::from_canonical(&bytes)
+    );
+
+    let changed = make_manifest(ManifestInput {
+        kernel_identity: id(1),
+        plan_digest: id(2),
+        components: components(),
+        object_root: id(6),
+        closure_root: id(7),
+        generation: Generation::new(9),
+        rollback_floor: RollbackFloor::new(9),
+        expires_at: Expiration::never(),
+        revocation: Revocation::Active,
+        sizes: sizes(),
+    })
+    .expect("changed manifest");
+    let changed_bytes = encode_manifest(&sign_manifest(&key, changed));
+    let changed_verified = verify_manifest(&changed_bytes, &trusted(&key)).expect("changed verify");
+    assert_ne!(
+        verified.manifest_identity(),
+        changed_verified.manifest_identity()
+    );
+}
+
+#[test]
+fn canonical_mutation_without_resigning_fails_verification() {
+    let key = key(1);
+    let mut bytes = signed_bytes(&key);
+    bytes[396] ^= 1;
+    assert_eq!(
+        verify_manifest(&bytes, &trusted(&key)),
+        Err(GenerationError::SignatureInvalid)
+    );
 }
 
 #[test]
