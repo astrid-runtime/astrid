@@ -15,12 +15,12 @@ mod rate_limit;
 mod response;
 mod visibility;
 
-#[cfg(test)]
-pub(crate) use identity::arm_authorize_identity_gate;
 pub(crate) use identity::{
     AuthorizedPrincipal, AuthorizedRequest, authorize_request, authorize_request_with_identity,
     pause_authorize_identity_for_test,
 };
+#[cfg(test)]
+pub(crate) use identity::{arm_authorize_identity_gate, arm_confirm_policy_identity_gate};
 pub(crate) use rate_limit::ManagementRateLimiter;
 #[cfg(test)]
 pub(crate) use rate_limit::rate_limit_for_request;

@@ -88,7 +88,8 @@ mod tests {
     use super::*;
     use crate::kernel_router::admin::handlers;
     use crate::kernel_router::{
-        AuthorizedPrincipal, arm_authorize_identity_gate, authorize_request_with_identity,
+        AuthorizedPrincipal, arm_authorize_identity_gate, arm_confirm_policy_identity_gate,
+        authorize_request_with_identity,
     };
     use crate::storage_mount::{MountOwnerScope, last_authorized_caller_uid, test_mount_admission};
     use astrid_core::groups::BUILTIN_ADMIN;
@@ -443,6 +444,59 @@ mod tests {
         assert!(
             !mountpoint.exists()
                 || std::fs::read_dir(&mountpoint).is_ok_and(|entries| entries.count() == 0)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_route_fails_closed_if_identity_changes_during_policy_confirm() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
+        let kernel = std::sync::Arc::new(crate::test_kernel_with_home(home).await);
+        let caller = create_admin_grouped(&kernel, "policy-confirm-admin").await;
+        let uid_x = kernel.principal_directory.uid_for(&caller).unwrap();
+        let guard = arm_confirm_policy_identity_gate(&kernel);
+        let mountpoint = temporary.path().join("policy-confirm-mount");
+        let request = AdminKernelRequest::with_request_id(
+            "policy-confirm-identity",
+            AdminRequestKind::StorageMountIssue {
+                view: astrid_core::storage_provider::StorageProviderViewV1::Admin,
+                access: astrid_core::storage_provider::StorageProviderAccessV1::ReadWrite,
+                provider: "policy-confirm-identity".to_owned(),
+                mountpoint: mountpoint.clone(),
+            },
+        );
+        let send = tokio::spawn({
+            let kernel = Arc::clone(&kernel);
+            let caller = caller.clone();
+            async move { send_admin(&kernel, &caller, "storage.mount.issue", request).await }
+        });
+        guard.gate().wait_until_entered().await;
+        delete_principal(&kernel, &caller).await;
+        let recycled = create_admin_grouped(&kernel, "policy-confirm-admin").await;
+        let uid_y = kernel.principal_directory.uid_for(&recycled).unwrap();
+        assert_ne!(uid_x, uid_y);
+        guard.gate().release();
+        let response = send.await.expect("join admin send");
+        assert_eq!(response["status"], "Error");
+        assert!(
+            response["data"]
+                .as_str()
+                .is_some_and(|error| !error.is_empty()),
+            "identity drift during policy confirmation must fail: {response}"
+        );
+        assert!(
+            kernel.storage_mounts.is_empty(),
+            "policy-confirm drift must not publish a lease"
+        );
+        assert_eq!(
+            last_authorized_caller_uid(&kernel),
+            None,
+            "policy denial must occur before issue_lease admission"
+        );
+        assert!(
+            !mountpoint.exists()
+                || std::fs::read_dir(&mountpoint).is_ok_and(|entries| entries.count() == 0),
+            "policy-confirm drift must not leave a callback or mount resource"
         );
     }
 

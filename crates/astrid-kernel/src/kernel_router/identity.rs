@@ -194,6 +194,8 @@ fn confirm_policy_still_holds(
     identity: &AuthorizedPrincipal,
 ) -> Result<(), PermissionError> {
     identity.confirm_live(kernel)?;
+    #[cfg(test)]
+    confirm_policy_identity_gate::pause(kernel);
     let Ok(profile) = kernel.profile_cache.resolve(caller) else {
         return Err(PermissionError::MissingCapability {
             principal: caller.clone(),
@@ -210,7 +212,8 @@ fn confirm_policy_still_holds(
     if let Some(scope) = device_scope {
         check = check.with_device_scope(scope);
     }
-    check.require(required_cap)
+    check.require(required_cap)?;
+    identity.confirm_live(kernel)
 }
 
 pub(crate) async fn pause_authorize_identity_for_test(kernel: &Arc<crate::Kernel>) {
@@ -222,6 +225,9 @@ pub(crate) async fn pause_authorize_identity_for_test(kernel: &Arc<crate::Kernel
 
 #[cfg(test)]
 pub(crate) use identity_gate::arm_authorize_identity_gate;
+
+#[cfg(test)]
+pub(crate) use confirm_policy_identity_gate::arm_confirm_policy_identity_gate;
 
 #[cfg(test)]
 mod identity_gate {
@@ -295,6 +301,108 @@ mod identity_gate {
             if let Ok(permit) = gate.release.acquire().await {
                 permit.forget();
             }
+        }
+    }
+
+    fn kernel_key(kernel: &crate::Kernel) -> usize {
+        std::ptr::from_ref(kernel) as usize
+    }
+}
+
+#[cfg(test)]
+mod confirm_policy_identity_gate {
+    use std::sync::{Arc, Condvar, LazyLock, Mutex};
+
+    use dashmap::DashMap;
+
+    struct GateState {
+        entered: bool,
+        released: bool,
+    }
+
+    pub(crate) struct ConfirmPolicyIdentityGate {
+        state: Mutex<GateState>,
+        changed: Condvar,
+    }
+
+    impl ConfirmPolicyIdentityGate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(GateState {
+                    entered: false,
+                    released: false,
+                }),
+                changed: Condvar::new(),
+            })
+        }
+
+        fn pause(&self) {
+            let mut state = self.state.lock().expect("confirm policy gate state");
+            state.entered = true;
+            self.changed.notify_all();
+            while !state.released {
+                state = self.changed.wait(state).expect("confirm policy gate wait");
+            }
+        }
+
+        fn has_entered(&self) -> bool {
+            self.state
+                .lock()
+                .expect("confirm policy gate state")
+                .entered
+        }
+
+        pub(crate) async fn wait_until_entered(&self) {
+            while !self.has_entered() {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        pub(crate) fn release(&self) {
+            let mut state = self.state.lock().expect("confirm policy gate state");
+            state.released = true;
+            self.changed.notify_all();
+        }
+    }
+
+    pub(crate) struct ConfirmPolicyIdentityGateGuard {
+        kernel: Arc<crate::Kernel>,
+        gate: Arc<ConfirmPolicyIdentityGate>,
+    }
+
+    impl ConfirmPolicyIdentityGateGuard {
+        pub(crate) fn gate(&self) -> &ConfirmPolicyIdentityGate {
+            &self.gate
+        }
+    }
+
+    impl Drop for ConfirmPolicyIdentityGateGuard {
+        fn drop(&mut self) {
+            self.gate.release();
+            GATES.remove(&kernel_key(&self.kernel));
+        }
+    }
+
+    static GATES: LazyLock<DashMap<usize, Arc<ConfirmPolicyIdentityGate>>> =
+        LazyLock::new(DashMap::new);
+
+    pub(crate) fn arm_confirm_policy_identity_gate(
+        kernel: &Arc<crate::Kernel>,
+    ) -> ConfirmPolicyIdentityGateGuard {
+        let gate = ConfirmPolicyIdentityGate::new();
+        GATES.insert(Arc::as_ptr(kernel) as usize, Arc::clone(&gate));
+        ConfirmPolicyIdentityGateGuard {
+            kernel: Arc::clone(kernel),
+            gate,
+        }
+    }
+
+    pub(super) fn pause(kernel: &crate::Kernel) {
+        let gate = GATES
+            .get(&kernel_key(kernel))
+            .map(|entry| Arc::clone(entry.value()));
+        if let Some(gate) = gate {
+            gate.pause();
         }
     }
 
