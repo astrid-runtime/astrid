@@ -48,12 +48,12 @@ compatibility-backend falsifier, not the definition of Realm.
 Related documents:
 
 - [Astrid Universal Application Substrate](astrid-universal-application-substrate.md)
-- [Astrid Kernel Charter](astrid-kernel-charter.md)
+- [Astrid Kernel Charter](architecture/astrid-kernel-charter.md)
 - [Astrid Native Component Kernel](astrid-native-kernel.md)
-- [Astrid Principal Store](astrid-principal-store.md)
-- [Astrid Principal Store Runtime Realization](astrid-principal-store-runtime.md)
-- [Astrid User, Fleet, and Principal Ownership](astrid-user-fleet-ownership.md)
-- [Astrid Driver Domain Contract](astrid-driver-domain-contract.md)
+- [Astrid Principal Store](architecture/astrid-principal-store.md)
+- [Astrid Principal Store Runtime Realization](reference/astrid-principal-store-runtime.md)
+- [Astrid User, Fleet, and Principal Ownership](architecture/astrid-user-fleet-ownership.md)
+- [Astrid Driver Domain Contract](architecture/astrid-driver-domain-contract.md)
 
 ## 1. Locked decision
 

@@ -44,7 +44,7 @@
 //! standard names (no `astrid_` prefix) so off-the-shelf dashboards
 //! work unmodified. `astrid_build_info` exposes build constants
 //! (version/sha/rustc) on the unauthenticated endpoint deliberately —
-//! they carry no principal, path, or secret. See `docs/metrics.md`.
+//! they carry no principal, path, or secret. See `docs/operations/metrics.md`.
 
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;

@@ -45,8 +45,6 @@ split-and-move successor:
 - [Native component kernel](astrid-native-kernel.md)
 - [Tensor Logic composition](astrid-tensor-logic-composition.md)
 
-Compatibility stubs remain at the previous `docs/*.md` paths.
-
 ## Concepts
 
 - [Conservation of computation](concepts/astrid-conservation-of-computation.md)

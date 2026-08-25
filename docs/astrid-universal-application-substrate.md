@@ -48,14 +48,14 @@ compatibility-backend falsifier, not the definition of Realm.
 Related documents:
 
 - [Astrid Resource Ownership Model](astrid-resource-ownership-model.md)
-- [Astrid AI-Native OS Workplan](astrid-ai-native-os-workplan.md)
-- [Astrid Kernel Charter](astrid-kernel-charter.md)
+- [Astrid AI-Native OS Workplan](architecture/astrid-ai-native-os-workplan.md)
+- [Astrid Kernel Charter](architecture/astrid-kernel-charter.md)
 - [Astrid Native Component Kernel](astrid-native-kernel.md)
-- [Astrid Driver Domain Contract](astrid-driver-domain-contract.md)
-- [Astrid Principal Store](astrid-principal-store.md)
-- [Astrid Principal Store Runtime Realization](astrid-principal-store-runtime.md)
-- [Astrid User, Fleet, and Principal Ownership](astrid-user-fleet-ownership.md)
-- [Distro Signing and Trust](distro-signing.md)
+- [Astrid Driver Domain Contract](architecture/astrid-driver-domain-contract.md)
+- [Astrid Principal Store](architecture/astrid-principal-store.md)
+- [Astrid Principal Store Runtime Realization](reference/astrid-principal-store-runtime.md)
+- [Astrid User, Fleet, and Principal Ownership](architecture/astrid-user-fleet-ownership.md)
+- [Distro Signing and Trust](operations/distro-signing.md)
 
 ## 1. Decision
 
