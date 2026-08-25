@@ -93,8 +93,8 @@ Historical device-local results remain useful for diagnosing regressions, but
 they are not portable release numbers. The full methodology, cross-platform CI
 contract, historical baselines, raw samples, and content-bound evidence
 envelopes live in
-[`../../docs/astrid-storage-performance.md`](../../docs/astrid-storage-performance.md)
-and [`../../docs/benchmarks/storage-io/`](../../docs/benchmarks/storage-io/).
+[`../../docs/reference/astrid-storage-performance.md`](../../docs/reference/astrid-storage-performance.md)
+and [`../../docs/benchmarks/storage-io/`](../../docs/benchmarks/storage-io).
 
 ## Development
 

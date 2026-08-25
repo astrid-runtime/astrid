@@ -252,7 +252,7 @@ tools and runtime-served guidance) is the on-ramp; the direction is an agent tha
 installs its own capsules within the capability sandbox.
 
 Reproducible builds and deterministic tests are consumers of
-[Muninn's verified computation memory](docs/astrid-forge-muninn.md): complete source and toolchain
+[Muninn's verified computation memory](docs/decisions/astrid-forge-muninn.md): complete source and toolchain
 closures become derivation inputs, so an unchanged fleet build is a verified lookup while install,
 signing, and publication remain fresh authorized effects.
 
@@ -291,17 +291,19 @@ list.
 
 ## Documentation
 
+- **[Docs index](docs/README.md)** is the GitHub and Obsidian navigation root for
+  architecture, concepts, decisions, guides, reference, and operations.
 - **[The Astrid Book](https://github.com/astrid-runtime/book)** is the canonical reference: the
   kernel, the capsule model, the host ABI, the bus, and the security model, grounded in the source
   with file and line anchors. Start with [Getting Started](https://github.com/astrid-runtime/book)
   to go from nothing to a working agent in a few minutes.
-- **Operator guides** live in [`docs/`](docs/): the [unified config schema](docs/config.md),
-  [LLM model selection](docs/models.md), [distro signing](docs/distro-signing.md), the
-  [gateway deployment runbook](docs/gateway-deployment.md), and
-  [generating a gateway client](docs/gateway-client.md). Architecture programs include
-  [conservation of computation](docs/astrid-conservation-of-computation.md),
-  [Muninn](docs/astrid-muninn.md), [Huginn](docs/astrid-huginn.md), and the
-  [Refinery](docs/astrid-refinery.md).
+- **Operator guides** live in [`docs/`](docs/): the [unified config schema](docs/reference/config.md),
+  [LLM model selection](docs/guides/models.md), [distro signing](docs/operations/distro-signing.md), the
+  [gateway deployment runbook](docs/operations/gateway-deployment.md), and
+  [generating a gateway client](docs/guides/gateway-client.md). Architecture programs include
+  [conservation of computation](docs/concepts/astrid-conservation-of-computation.md),
+  [Muninn](docs/concepts/astrid-muninn.md), [Huginn](docs/concepts/astrid-huginn.md), and the
+  [Refinery](docs/concepts/astrid-refinery.md).
 
 ## Development
 
@@ -320,7 +322,7 @@ identity before independently checking the BLAKE3 manifest and extracting any by
 Cargo remain responsible for updates they install; signed SHA-256 manifests remain available for
 their compatibility requirements. GitHub build-provenance attestations are published as additional
 evidence and are not substituted for the updater's release-archive signature. See the
-[self-update security model](docs/self-update-security.md).
+[self-update security model](docs/operations/self-update-security.md).
 
 ## Contributing
 

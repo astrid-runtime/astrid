@@ -1,0 +1,17 @@
+{
+  "file-explorer": true,
+  "global-search": true,
+  "switcher": true,
+  "graph": true,
+  "backlink": true,
+  "outgoing-link": true,
+  "outline": true,
+  "command-palette": true,
+  "editor-status": true,
+  "bookmarks": false,
+  "page-preview": true,
+  "sync": false,
+  "publish": false,
+  "slides": false,
+  "audio-recorder": false
+}
