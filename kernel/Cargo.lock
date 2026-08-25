@@ -41,6 +41,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "astrid-system-generation"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "ed25519-dalek",
+]
+
+[[package]]
 name = "bit_field"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
