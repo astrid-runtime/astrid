@@ -1,0 +1,18 @@
+[package]
+name = "bootloader-x86_64-uefi"
+version = "0.11.16"
+edition = "2024"
+description = "UEFI bootloader for x86_64"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rust-osdev/bootloader"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bootloader_api = { path = "../api", version = "0.11.16" }
+bootloader-x86_64-common = { path = "../common", version = "0.11.16" }
+bootloader-boot-config = { path = "../common/config", version = "0.11.16" }
+log = "0.4.14"
+x86_64 = "0.15.2"
+serde-json-core = "0.5.0"
+uefi = "0.38.0"

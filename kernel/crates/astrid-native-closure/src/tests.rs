@@ -56,12 +56,12 @@ fn verify(bytes: &[u8]) -> Result<crate::BoundIdentities, ClosureError> {
 fn valid_distinct_empty_sysgen_binds() {
     let bound = verify(&encode_table(&good_table())).expect("valid table");
     assert_eq!(
-        bound.kernel_bootstrap,
+        bound.kernel_identity(),
         MeasuredIdentity::from_payload(elf())
     );
-    assert_eq!(bound.system_generation, MeasuredIdentity::empty_sysgen());
-    assert_eq!(bound.kernel_floor, CURRENT_FLOOR);
-    assert_eq!(bound.sysgen_floor, CURRENT_FLOOR);
+    assert_eq!(bound.sysgen_identity(), MeasuredIdentity::empty_sysgen());
+    assert_eq!(bound.kernel_floor(), CURRENT_FLOOR);
+    assert_eq!(bound.sysgen_floor(), CURRENT_FLOOR);
     assert!(bound.distinct());
 }
 
@@ -71,8 +71,8 @@ fn mixed_valid_floors_bind() {
     let sysgen_floor = GenerationFloor::new(2);
     let table = signed_table(&k, &s, CURRENT_FLOOR, sysgen_floor, elf());
     let bound = verify(&encode_table(&table)).expect("mixed floors");
-    assert_eq!(bound.kernel_floor, CURRENT_FLOOR);
-    assert_eq!(bound.sysgen_floor, sysgen_floor);
+    assert_eq!(bound.kernel_floor(), CURRENT_FLOOR);
+    assert_eq!(bound.sysgen_floor(), sysgen_floor);
 }
 
 #[test]
@@ -83,8 +83,8 @@ fn exact_floor_equals_policy_min_binds() {
     let policy = policy_for(&k, &s, kernel_min, sysgen_min);
     let table = signed_table(&k, &s, kernel_min, sysgen_min, elf());
     let bound = verify_table(&encode_table(&table), &policy).expect("exact floors");
-    assert_eq!(bound.kernel_floor, kernel_min);
-    assert_eq!(bound.sysgen_floor, sysgen_min);
+    assert_eq!(bound.kernel_floor(), kernel_min);
+    assert_eq!(bound.sysgen_floor(), sysgen_min);
 }
 
 #[test]
@@ -270,8 +270,8 @@ fn emulator_fixture_uses_current_floor_and_fixture_public_keys() {
         elf(),
     );
     let bound = verify_table(&encode_table(&table), &policy).expect("fixture table");
-    assert_eq!(bound.kernel_floor, CURRENT_FLOOR);
-    assert_eq!(bound.sysgen_floor, CURRENT_FLOOR);
+    assert_eq!(bound.kernel_floor(), CURRENT_FLOOR);
+    assert_eq!(bound.sysgen_floor(), CURRENT_FLOOR);
 }
 
 #[test]

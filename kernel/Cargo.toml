@@ -12,6 +12,7 @@ members = [
     "tools/kimage",
     "tools/ktest",
 ]
+exclude = ["tools/bootloader"]
 
 [profile.dev]
 panic = "abort"

@@ -24,12 +24,12 @@ pub fn verify_table(bytes: &[u8], policy: &TrustedPolicy) -> Result<BoundIdentit
     check_floors(&table, policy)?;
     check_identities(&table)?;
     check_signatures(&table, policy)?;
-    Ok(BoundIdentities {
-        kernel_bootstrap: table.kernel.identity,
-        system_generation: table.sysgen.identity,
-        kernel_floor: table.kernel.floor,
-        sysgen_floor: table.sysgen.floor,
-    })
+    Ok(BoundIdentities::from_verified(
+        table.kernel.identity,
+        table.sysgen.identity,
+        table.kernel.floor,
+        table.sysgen.floor,
+    ))
 }
 
 fn check_slot_kinds(table: &DualClosureTable) -> Result<(), ClosureError> {
@@ -113,24 +113,24 @@ pub fn verify_policy_handoff(
     }
 
     let policy = decoded.policy;
-    if policy.kernel_verify == policy.sysgen_verify
-        || policy.kernel_verify == decoded.root_verify
-        || policy.sysgen_verify == decoded.root_verify
+    if policy.kernel_verify() == policy.sysgen_verify()
+        || policy.kernel_verify() == decoded.root_verify
+        || policy.sysgen_verify() == decoded.root_verify
     {
         return Err(ClosureError::SameKey);
     }
-    if policy.kernel_floor < root.kernel_min() || policy.sysgen_floor < root.sysgen_min() {
+    if policy.kernel_floor() < root.kernel_min() || policy.sysgen_floor() < root.sysgen_min() {
         return Err(ClosureError::Stale);
     }
-    if policy.policy_generation < root.min_policy_generation() {
+    if policy.policy_generation() < root.min_policy_generation() {
         return Err(ClosureError::PolicyGenerationStale);
     }
-    if policy.context != *expected {
+    if policy.context() != *expected {
         return Err(ClosureError::BindingMismatch);
     }
 
-    Ok(AuthenticatedPolicyHandoff {
-        root_verify: decoded.root_verify,
+    Ok(AuthenticatedPolicyHandoff::from_verified(
+        decoded.root_verify,
         policy,
-    })
+    ))
 }

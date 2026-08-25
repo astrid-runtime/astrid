@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "40 5 * * *" # every day at 5:40
+
+# This causes PR pushes to cancel previous builds, but does not impact cron jobs due to use of .ref, which will have the commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v3
+      - run: cargo --version --verbose
+      - uses: Swatinem/rust-cache@v2
+      - uses: r7kamura/rust-problem-matchers@v1.1.0
+      - name: "Run `cargo check`"
+        run: cargo check --all-targets --all --exclude 'test_kernel*'
+      - name: "Check test kernels"
+        run: cargo check --all
+        working-directory: tests/test_kernels
+      - name: "Check docs.rs build"
+        run: cargo check
+        env:
+          RUSTFLAGS: "--cfg docsrs_dummy_build"
+
+  test:
+    name: Test
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v3
+      - run: cargo --version --verbose
+      - uses: Swatinem/rust-cache@v2
+
+      # install QEMU
+      - name: Install QEMU (Linux)
+        run: sudo apt update && sudo apt install qemu-system-x86
+        if: runner.os == 'Linux'
+      - name: Install QEMU (macOS)
+        run: brew install qemu
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_BOTTLE_SOURCE_FALLBACK: 1
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+      - name: Install QEMU (Windows)
+        run: |
+          choco install qemu --version 2021.5.5
+          echo "$Env:Programfiles\qemu" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        if: runner.os == 'Windows'
+        shell: pwsh
+      - name: "Print QEMU Version"
+        run: qemu-system-x86_64 --version
+
+      - uses: r7kamura/rust-problem-matchers@v1.1.0
+      - name: Run api tests
+        run: cargo test -p bootloader_api
+      - name: Run bootloader common tests
+        if: runner.arch == 'X64'
+        run: cargo test -p bootloader-x86_64-common
+      - name: Run integration tests
+        run: cargo test -- --test-threads 1
+
+      # test feature gates (only on one OS is enough)
+      - name: Test with only UEFI feature
+        if: runner.os == 'Linux'
+        run: cargo test --no-default-features --features uefi
+      - name: Test with only BIOS feature
+        if: runner.os == 'Linux'
+        run: cargo test --no-default-features --features bios
+
+  examples:
+    name: Build examples
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v3
+      - uses: Swatinem/rust-cache@v2
+      - uses: r7kamura/rust-problem-matchers@v1.1.0
+      - name: Install QEMU (Linux)
+        run: sudo apt update && sudo apt install qemu-system-x86
+      - name: "Build basic example"
+        run: cargo build
+        working-directory: examples/basic
+      - name: "Run basic example (bios)"
+        run: cargo run bios
+        working-directory: examples/basic
+      - name: "Run basic example (uefi)"
+        run: cargo run uefi
+        working-directory: examples/basic
+
+  fmt:
+    name: Check Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: r7kamura/rust-problem-matchers@v1.1.0
+      - run: cargo fmt --all -- --check
+      - run: cargo fmt --all -- --check
+        working-directory: tests/test_kernels
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - run: cargo --version --verbose
+      - uses: Swatinem/rust-cache@v2
+      - uses: r7kamura/rust-problem-matchers@v1.1.0
+      - run: cargo clippy --all --all-targets --exclude 'test_kernel*'
+      - run: cargo clippy --all
+        working-directory: tests/test_kernels
+
+  semver-checks:
+    name: Semver Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "semver-checks"
+          cache-targets: false
+      - name: Check semver (API)
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: bootloader_api
+          rust-toolchain: manual
+      - name: Check semver
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          rust-toolchain: manual
+
+  typos:
+    name: Check spelling
+    runs-on: ubuntu-latest
+    steps:
+      - uses: crate-ci/typos@v1.0.4
