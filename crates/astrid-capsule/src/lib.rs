@@ -35,6 +35,7 @@ pub mod readiness;
 pub mod registry;
 pub mod schema_catalog;
 pub mod security;
+pub mod stamp;
 pub mod tool_discovery;
 pub mod topic;
 pub mod toposort;
