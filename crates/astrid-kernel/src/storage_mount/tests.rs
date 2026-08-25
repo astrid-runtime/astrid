@@ -1447,7 +1447,7 @@ async fn revoke_drains_an_in_flight_mutation_and_fences_new_mutation() {
     assert_eq!(state.in_flight_mutations.load(Ordering::Acquire), 0);
     assert!(state.dirty.load(Ordering::Acquire));
     assert!(!kernel.storage_mounts.contains_key(&lease.mount_id));
-    assert!(!lease.callback_path.exists());
+    assert!(!astrid_core::local_transport::endpoint_is_present(&lease.callback_path).unwrap());
     let fenced = execute_operation(&kernel, &state, create("after-revoke.txt")).await;
     assert!(matches!(
         fenced,
@@ -1702,6 +1702,6 @@ async fn revoke_retries_after_injected_cleanup_failure() {
     .await
     .expect("retry after clearing cleanup fault");
     assert!(!kernel.storage_mounts.contains_key(&lease.mount_id));
-    assert!(!lease.callback_path.exists());
+    assert!(!astrid_core::local_transport::endpoint_is_present(&lease.callback_path).unwrap());
     assert!(!lease.resource_path.exists());
 }

@@ -390,9 +390,17 @@ pub(crate) async fn revoke_all_leases_for_principal(
 ) -> Result<(), String> {
     let uid = kernel.principal_directory.uid_for(principal).ok();
     revoke_visible(&mapped_leases_for_principal(kernel, principal, uid));
-    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
     let matched = mapped_leases_for_principal(kernel, principal, uid);
     revoke_visible(&matched);
+    // Listener shutdown must be acknowledged before cleanup. In particular,
+    // do not hold storage_mount_mutations while waiting: the listener's
+    // connection tasks may need that lock to finish their own shutdown path.
+    for state in &matched {
+        if !state.wait_listener_closed().await {
+            return Err("storage mount callback listener did not shut down".to_owned());
+        }
+    }
+    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
     let mut errors = Vec::new();
     for state in &matched {
         if let Err(error) = cleanup_mapped_lease(kernel, state) {
@@ -415,6 +423,11 @@ pub(crate) async fn revoke_all_leases_for_principal(
 async fn force_revoke_lease(kernel: &Kernel, state: &StorageMountLeaseState) -> Result<(), String> {
     state.revoked.store(true, Ordering::Release);
     let _ = state.shutdown_tx.send(true);
+    // The listener owns the platform endpoint. Wait outside the mutation
+    // fence so the listener can finish any in-flight connection bookkeeping.
+    if !state.wait_listener_closed().await {
+        return Err("storage mount callback listener did not shut down".to_owned());
+    }
     let _mutation_guard = kernel.storage_mount_mutations.lock().await;
     cleanup_mapped_lease(kernel, state).map_err(|error| error.to_string())
 }

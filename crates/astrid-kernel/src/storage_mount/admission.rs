@@ -90,6 +90,13 @@ pub(crate) fn last_authorized_caller_uid(kernel: &Kernel) -> Option<PrincipalUid
         .map(|entry| *entry.value())
 }
 
+/// Clear test-only admission evidence before a fresh kernel can reuse an old
+/// allocation address. Production admission state is not affected.
+#[cfg(test)]
+pub(crate) fn clear_last_authorized_caller_for_test(kernel: &Kernel) {
+    AUTHORIZED_CALLERS.remove(&kernel_key(kernel));
+}
+
 fn kernel_key(kernel: &Kernel) -> usize {
     std::ptr::from_ref(kernel) as usize
 }

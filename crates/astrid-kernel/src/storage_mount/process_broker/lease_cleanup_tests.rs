@@ -1,5 +1,6 @@
 //! Projection lease-set cleanup regressions.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use astrid_core::PrincipalId;
@@ -37,6 +38,10 @@ async fn issue_named_lease(
 
 fn mapped(kernel: &crate::Kernel, mount_id: StorageMountId) -> bool {
     kernel.storage_mounts.contains_key(&mount_id)
+}
+
+fn callback_endpoint_present(path: &Path) -> bool {
+    astrid_core::local_transport::endpoint_is_present(path).expect("callback endpoint state")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -100,21 +105,21 @@ async fn projection_cleanup_revokes_every_lease_on_fault(fault: MountCleanupStag
     assert!(shared_state.is_revoked_for_test());
     match fault {
         MountCleanupStage::Callback => {
-            assert!(branch.callback_path.exists());
+            assert_eq!(callback_endpoint_present(&branch.callback_path), cfg!(unix));
         },
         MountCleanupStage::Manifest => {
-            assert!(!branch.callback_path.exists());
+            assert!(!callback_endpoint_present(&branch.callback_path));
             assert!(branch.resource_path.join("lease.json").exists());
         },
         MountCleanupStage::Directory => {
-            assert!(!branch.callback_path.exists());
+            assert!(!callback_endpoint_present(&branch.callback_path));
             assert!(branch.resource_path.exists());
         },
     }
     assert!(!mapped(&kernel, owner.mount_id));
     assert!(!mapped(&kernel, shared.mount_id));
-    assert!(!owner.callback_path.exists());
-    assert!(!shared.callback_path.exists());
+    assert!(!callback_endpoint_present(&owner.callback_path));
+    assert!(!callback_endpoint_present(&shared.callback_path));
 
     clear_cleanup_fault_for_test(&branch_state);
     assert!(
@@ -128,6 +133,6 @@ async fn projection_cleanup_revokes_every_lease_on_fault(fault: MountCleanupStag
         .await
     );
     assert!(!mapped(&kernel, branch.mount_id));
-    assert!(!branch.callback_path.exists());
+    assert!(!callback_endpoint_present(&branch.callback_path));
     assert!(!branch.resource_path.exists());
 }

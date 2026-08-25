@@ -471,7 +471,7 @@ async fn agent_delete_drains_live_mount_and_refuses_resurrection() {
         kernel.storage_mounts.get(&lease.mount_id).is_none(),
         "live mount must not survive agent_delete"
     );
-    assert!(!lease.callback_path.exists());
+    assert!(!astrid_core::local_transport::endpoint_is_present(&lease.callback_path).unwrap());
     assert!(!lease.resource_path.exists());
     assert!(
         astrid_core::local_transport::connect(&lease.callback_path)
@@ -511,7 +511,7 @@ async fn agent_delete_drains_expired_mount_still_mapped() {
         kernel.storage_mounts.get(&lease.mount_id).is_none(),
         "expired mapped mount must not survive agent_delete"
     );
-    assert!(!lease.callback_path.exists());
+    assert!(!astrid_core::local_transport::endpoint_is_present(&lease.callback_path).unwrap());
     assert!(
         astrid_core::local_transport::connect(&lease.callback_path)
             .await
@@ -619,8 +619,10 @@ fn assert_cleanup_fault_retained(
     match fault {
         MountCleanupStage::Callback => {
             assert!(
-                lease.callback_path.exists(),
-                "{label}: callback cleanup fault must leave the endpoint"
+                astrid_core::local_transport::endpoint_is_present(&lease.callback_path)
+                    .expect("callback endpoint state")
+                    == cfg!(unix),
+                "{label}: callback cleanup fault must leave the endpoint where the backend supports a retained endpoint"
             );
         },
         MountCleanupStage::Manifest => {
@@ -631,7 +633,8 @@ fn assert_cleanup_fault_retained(
         },
         MountCleanupStage::Directory => {
             assert!(
-                !lease.callback_path.exists(),
+                !astrid_core::local_transport::endpoint_is_present(&lease.callback_path)
+                    .expect("callback endpoint state"),
                 "{label}: directory cleanup fault must follow callback removal"
             );
             assert!(
@@ -725,7 +728,7 @@ async fn delete_fails_closed_on_cleanup_fault_then_retries(
         kernel.storage_mounts.get(&lease.mount_id).is_none(),
         "{label}: successful retry must remove the map entry"
     );
-    assert!(!lease.callback_path.exists());
+    assert!(!astrid_core::local_transport::endpoint_is_present(&lease.callback_path).unwrap());
     assert!(!lease.resource_path.exists());
 }
 

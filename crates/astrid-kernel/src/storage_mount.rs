@@ -46,6 +46,8 @@ mod lifecycle;
 #[cfg(test)]
 pub(crate) use admission::arm_issue_admission_gate;
 #[cfg(test)]
+pub(crate) use admission::clear_last_authorized_caller_for_test;
+#[cfg(test)]
 pub(crate) use admission::last_authorized_caller_uid;
 #[cfg(test)]
 pub(crate) use cleanup::MountCleanupStage;
@@ -76,6 +78,9 @@ pub(super) use process_broker::{
 };
 
 const LEASE_IDLE_TTL_SECS: u64 = 60 * 60;
+/// Bound listener shutdown waits without turning a stalled listener into an
+/// endpoint-removal race; timed-out cleanup remains mapped for retry.
+const LISTENER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_CALLBACK_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const LEASE_MANIFEST_NAME: &str = "lease.json";
 
@@ -113,6 +118,12 @@ pub(crate) struct StorageMountLeaseState {
     dirty: AtomicBool,
     in_flight_mutations: AtomicU64,
     shutdown_tx: watch::Sender<bool>,
+    /// Set after the listener task has dropped its backend listener handle.
+    ///
+    /// Windows named-pipe endpoints are kernel objects rather than removable
+    /// filesystem entries. Cleanup must wait for this acknowledgement before
+    /// asking the transport backend to remove the endpoint.
+    listener_closed_tx: watch::Sender<bool>,
     #[cfg(test)]
     mutation_test_gate: std::sync::Mutex<Option<Arc<MutationTestGate>>>,
     #[cfg(test)]
@@ -152,6 +163,21 @@ impl StorageMountLeaseState {
     fn is_live(&self) -> bool {
         !self.revoked.load(Ordering::Acquire)
             && now_epoch_secs() <= self.expires_at_epoch_secs.load(Ordering::Acquire)
+    }
+
+    async fn wait_listener_closed(&self) -> bool {
+        let mut closed = self.listener_closed_tx.subscribe();
+        let wait = async {
+            while !*closed.borrow() {
+                if closed.changed().await.is_err() {
+                    return false;
+                }
+            }
+            true
+        };
+        tokio::time::timeout(LISTENER_SHUTDOWN_TIMEOUT, wait)
+            .await
+            .unwrap_or(false)
     }
 
     #[cfg(test)]
@@ -257,6 +283,7 @@ fn publish_issued_lease(
         .map_err(|error| format!("create private mount resource: {error}"))?;
     let (token, token_hash) = generate_lease_token()?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (listener_closed_tx, _) = watch::channel(false);
     #[cfg(unix)]
     let callback_path = resource_path.join("control.sock");
     #[cfg(not(unix))]
@@ -279,6 +306,7 @@ fn publish_issued_lease(
         dirty: AtomicBool::new(false),
         in_flight_mutations: AtomicU64::new(0),
         shutdown_tx,
+        listener_closed_tx,
         #[cfg(test)]
         mutation_test_gate: std::sync::Mutex::new(None),
         #[cfg(test)]
@@ -506,16 +534,17 @@ async fn serve_listener(
     // future alive across harmless expiry ticks: recreating it on every
     // `select!` iteration could drop a claimed pipe and break a valid client.
     let mut accepted = Box::pin(local_transport::accept(&listener));
+    let mut expired = false;
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => break,
             _ = expiry_check.tick() => {
-                if !state.is_live() {
-                    if let Some(kernel) = kernel.upgrade() {
-                        expire_idle_mapped_lease(&kernel, &state).await;
-                    } else {
-                        let _ = cleanup_resource_paths(&state.resource_path, &state.callback_path, None);
-                    }
+                if !state.revoked.load(Ordering::Acquire)
+                    && now_epoch_secs() > state.expires_at_epoch_secs.load(Ordering::Acquire)
+                {
+                    state.revoked.store(true, Ordering::Release);
+                    let _ = state.shutdown_tx.send(true);
+                    expired = true;
                     break;
                 }
             },
@@ -537,6 +566,21 @@ async fn serve_listener(
                     Err(_) => break,
                 }
             }
+        }
+    }
+
+    // The accept future borrows the listener and may hold a backend-specific
+    // pending handle. Drop it before releasing the listener so Windows can
+    // observe the named-pipe endpoint as absent.
+    drop(accepted);
+    drop(listener);
+    state.listener_closed_tx.send_replace(true);
+
+    if expired {
+        if let Some(kernel) = kernel.upgrade() {
+            expire_idle_mapped_lease(&kernel, &state).await;
+        } else {
+            let _ = cleanup_resource_paths(&state.resource_path, &state.callback_path, None);
         }
     }
 }

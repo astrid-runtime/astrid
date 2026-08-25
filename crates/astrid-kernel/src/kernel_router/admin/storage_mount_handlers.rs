@@ -91,7 +91,10 @@ mod tests {
         AuthorizedPrincipal, arm_authorize_identity_gate, arm_confirm_policy_identity_gate,
         authorize_request_with_identity,
     };
-    use crate::storage_mount::{MountOwnerScope, last_authorized_caller_uid, test_mount_admission};
+    use crate::storage_mount::{
+        MountOwnerScope, clear_last_authorized_caller_for_test, last_authorized_caller_uid,
+        test_mount_admission,
+    };
     use astrid_core::groups::BUILTIN_ADMIN;
     use astrid_core::principal::PrincipalId;
     use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
@@ -452,6 +455,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
         let kernel = std::sync::Arc::new(crate::test_kernel_with_home(home).await);
+        clear_last_authorized_caller_for_test(&kernel);
         let caller = create_admin_grouped(&kernel, "policy-confirm-admin").await;
         let uid_x = kernel.principal_directory.uid_for(&caller).unwrap();
         let guard = arm_confirm_policy_identity_gate(&kernel);
