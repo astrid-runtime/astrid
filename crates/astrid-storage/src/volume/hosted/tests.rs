@@ -3,7 +3,17 @@ use super::*;
 use crate::volume::VolumeFile;
 
 fn append_valid_uncommitted_write(path: &std::path::Path, sequence: u64, payload: &[u8]) {
-    let name = b"objects";
+    append_valid_record(path, sequence, Operation::Write, b"objects", 0, payload);
+}
+
+fn append_valid_record(
+    path: &std::path::Path,
+    sequence: u64,
+    operation: Operation,
+    name: &[u8],
+    logical_offset: u64,
+    payload: &[u8],
+) {
     let name_len = u16::try_from(name.len()).unwrap();
     let payload_len = u64::try_from(payload.len()).unwrap();
     let total = u64::try_from(RECORD_FIXED_BYTES)
@@ -13,9 +23,9 @@ fn append_valid_uncommitted_write(path: &std::path::Path, sequence: u64, payload
         .unwrap();
     let mut hasher = blake3::Hasher::new_derive_key("astrid volume record v1");
     hasher.update(&sequence.to_le_bytes());
-    hasher.update(&[Operation::Write as u8]);
+    hasher.update(&[operation as u8]);
     hasher.update(&name_len.to_le_bytes());
-    hasher.update(&0_u64.to_le_bytes());
+    hasher.update(&logical_offset.to_le_bytes());
     hasher.update(&payload_len.to_le_bytes());
     hasher.update(name);
     hasher.update(payload);
@@ -24,9 +34,9 @@ fn append_valid_uncommitted_write(path: &std::path::Path, sequence: u64, payload
     record.extend_from_slice(&RECORD_MAGIC);
     record.extend_from_slice(&total.to_le_bytes());
     record.extend_from_slice(&sequence.to_le_bytes());
-    record.extend_from_slice(&[Operation::Write as u8]);
+    record.extend_from_slice(&[operation as u8]);
     record.extend_from_slice(&name_len.to_le_bytes());
-    record.extend_from_slice(&0_u64.to_le_bytes());
+    record.extend_from_slice(&logical_offset.to_le_bytes());
     record.extend_from_slice(&payload_len.to_le_bytes());
     record.extend_from_slice(&checksum);
     record.extend_from_slice(name);
@@ -67,6 +77,35 @@ fn hosted_volume_recovers_regions_without_host_directory_projection() {
     assert_eq!(volume.read_region_at(&region, 0, &mut bytes).unwrap(), 8);
     assert_eq!(&bytes, b"abXYef\0\0");
     assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn legacy_empty_commit_recovers_without_hashing_write_payloads() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    std::fs::write(&path, VOLUME_MAGIC).unwrap();
+    append_valid_record(&path, 1, Operation::Create, b"objects", 0, &[]);
+    append_valid_record(&path, 2, Operation::Write, b"objects", 0, b"legacy");
+    append_valid_record(
+        &path,
+        3,
+        Operation::Commit,
+        COMMIT_REGION.as_bytes(),
+        0,
+        &[],
+    );
+    let mut bytes = std::fs::read(&path).unwrap();
+    let create_length = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+    let write_offset = VOLUME_MAGIC.len() as u64 + create_length;
+    bytes[usize::try_from(write_offset).unwrap() + 43] ^= 0x80;
+    std::fs::write(&path, bytes).unwrap();
+
+    let volume = HostedFileVolume::open(&path).unwrap();
+    let mut recovered = [0_u8; 6];
+    volume
+        .read_region_at(&VolumeRegion::new("objects").unwrap(), 0, &mut recovered)
+        .unwrap();
+    assert_eq!(&recovered, b"legacy");
 }
 
 #[test]
@@ -414,7 +453,7 @@ fn corrupt_record_length_cannot_hide_a_valid_successor() {
 }
 
 #[test]
-fn corrupt_record_checksum_cannot_hide_a_valid_successor() {
+fn corrupt_write_checksum_does_not_block_footer_open() {
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("astrid.volume");
     let region = VolumeRegion::new("objects").unwrap();
@@ -447,10 +486,58 @@ fn corrupt_record_checksum_cannot_hide_a_valid_successor() {
     file.write_all(&byte).unwrap();
     file.sync_all().unwrap();
 
-    let error = HostedFileVolume::open(&path).unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    assert!(error.to_string().contains("interior"), "{error}");
-    assert!(error.to_string().contains("checksum"), "{error}");
+    let volume = HostedFileVolume::open(&path).unwrap();
+    let mut recovered = [0_u8; 11];
+    volume.read_region_at(&region, 0, &mut recovered).unwrap();
+    assert_eq!(&recovered, b"firstsecond");
+}
+
+#[test]
+fn footer_open_does_not_hash_tens_of_megabytes_of_write_payload() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let region = VolumeRegion::new("objects").unwrap();
+    let payload = vec![0xA5_u8; 32 * 1024 * 1024];
+    {
+        let volume = HostedFileVolume::open(&path).unwrap();
+        volume.create_region(&region, true).unwrap();
+        volume
+            .write_region_from(&region, 0, payload.len() as u64, &mut payload.as_slice())
+            .unwrap();
+        volume.sync().unwrap();
+    }
+    let started = std::time::Instant::now();
+    let volume = HostedFileVolume::open(&path).unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "footer open unexpectedly hashed the payload: {elapsed:?}"
+    );
+    assert_eq!(volume.region_len(&region).unwrap(), payload.len() as u64);
+}
+
+#[test]
+fn damaged_footer_falls_back_to_headers_and_is_reinstalled() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let region = VolumeRegion::new("objects").unwrap();
+    {
+        let volume = HostedFileVolume::open(&path).unwrap();
+        volume.create_region(&region, true).unwrap();
+        volume.write_region_at(&region, 0, b"durable").unwrap();
+        volume.sync().unwrap();
+    }
+    let committed_len = std::fs::metadata(&path).unwrap().len();
+    let mut bytes = std::fs::read(&path).unwrap();
+    let last = bytes.len().checked_sub(1).unwrap();
+    bytes[last] ^= 0x80;
+    std::fs::write(&path, bytes).unwrap();
+
+    let volume = HostedFileVolume::open(&path).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), committed_len);
+    let mut recovered = [0_u8; 7];
+    volume.read_region_at(&region, 0, &mut recovered).unwrap();
+    assert_eq!(&recovered, b"durable");
 }
 
 #[test]

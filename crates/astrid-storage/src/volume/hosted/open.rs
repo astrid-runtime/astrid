@@ -9,7 +9,7 @@ use std::sync::{Arc, OnceLock, RwLock, Weak};
 use fs2::FileExt as _;
 use parking_lot::{Mutex, MutexGuard};
 
-use super::{ContainerState, HostedFileVolume, VOLUME_MAGIC, reclaim, recover_container};
+use super::{ContainerState, HostedFileVolume, VOLUME_MAGIC, reclaim, recover};
 
 type SharedOpenReclaimLock = Mutex<()>;
 
@@ -61,8 +61,9 @@ impl HostedFileVolume {
     /// # Errors
     ///
     /// Returns an error for a lock conflict, invalid header, interior corrupt
-    /// record, invalid region name, or host I/O failure. An incomplete final
-    /// record is treated as an uncommitted tail and truncated.
+    /// framing, invalid region name, or host I/O failure. An incomplete final
+    /// record is treated as an uncommitted tail and truncated. Once a footer
+    /// exists, recovery reads only the footer, one commit, and its snapshot.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Arc<Self>> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -113,23 +114,33 @@ impl HostedFileVolume {
                 ));
             }
         }
-        let (regions, sequence, valid_len, durable_len) = recover_container(&mut file)?;
-        if file.metadata()?.len() != valid_len {
-            file.set_len(valid_len)?;
+        let recovery = recover::recover_container(&mut file)?;
+        if file.metadata()?.len() != recovery.valid_len && !recovery.footer_present {
+            file.set_len(recovery.valid_len)?;
             file.sync_all()?;
+        }
+        let footer_pending = !recovery.footer_present;
+        let mut state = ContainerState {
+            file,
+            sequence: recovery.sequence,
+            valid_len: recovery.valid_len,
+            durable_len: recovery.durable_len,
+            last_commit_offset: recovery.last_commit_offset,
+            last_commit_has_snapshot: recovery.last_commit_has_snapshot,
+            boundary_pending: false,
+            footer_pending,
+            regions: recovery.regions,
+        };
+        if footer_pending {
+            // A header-only recovery is immediately upgraded so the next boot
+            // can use the footer even when no caller performs an explicit sync.
+            HostedFileVolume::make_durable(&mut state)?;
         }
         drop(swap_guard);
         Ok(Arc::new(Self {
             path,
             open_lock,
-            state: Mutex::new(ContainerState {
-                file,
-                sequence,
-                valid_len,
-                durable_len,
-                boundary_pending: false,
-                regions,
-            }),
+            state: Mutex::new(state),
         }))
     }
 }

@@ -152,7 +152,10 @@ pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
         sequence: 0,
         valid_len: 0,
         durable_len: 0,
+        last_commit_offset: 0,
+        last_commit_has_snapshot: false,
         boundary_pending: false,
+        footer_pending: true,
         regions: BTreeMap::new(),
     };
     rebuilt.file.write_all(&VOLUME_MAGIC)?;
@@ -195,6 +198,8 @@ pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
     let rebuilt_regions = rebuilt.regions.clone();
     let rebuilt_sequence = rebuilt.sequence;
     let rebuilt_len = rebuilt.valid_len;
+    let rebuilt_commit_offset = rebuilt.last_commit_offset;
+    let rebuilt_has_snapshot = rebuilt.last_commit_has_snapshot;
     rebuilt.file.sync_all()?;
     drop(rebuilt);
 
@@ -220,7 +225,10 @@ pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
     state.sequence = rebuilt_sequence;
     state.valid_len = rebuilt_len;
     state.durable_len = rebuilt_len;
+    state.last_commit_offset = rebuilt_commit_offset;
+    state.last_commit_has_snapshot = rebuilt_has_snapshot;
     state.boundary_pending = false;
+    state.footer_pending = false;
     state.regions = rebuilt_regions;
     std::fs::remove_file(previous)?;
     Ok(())

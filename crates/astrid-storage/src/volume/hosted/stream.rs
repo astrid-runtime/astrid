@@ -70,6 +70,14 @@ pub(super) fn append_from(
         Err(error) => {
             let _ = state.file.set_len(start);
             let _ = state.file.seek(SeekFrom::Start(start));
+            if state.last_commit_offset != 0 && start == state.durable_len {
+                let _ = super::recover::write_footer(
+                    &mut state.file,
+                    state.last_commit_offset,
+                    state.durable_len,
+                    state.sequence,
+                );
+            }
             Err(error)
         },
     }
@@ -103,6 +111,11 @@ fn append_from_inner(
     hasher.update(&payload_len.to_le_bytes());
     hasher.update(name);
 
+    // The previous footer ends at `valid_len`; remove it before publishing a
+    // new record. A failed stream leaves footer_pending set so the next sync
+    // restores the prior durable footer.
+    state.footer_pending = true;
+    state.file.set_len(state.valid_len)?;
     state.file.seek(SeekFrom::Start(state.valid_len))?;
     state.file.write_all(&RECORD_MAGIC)?;
     state.file.write_all(&total_len.to_le_bytes())?;
