@@ -3,6 +3,7 @@ pub mod admin;
 mod caller;
 mod connection_tracker;
 mod device_scope;
+mod identity;
 /// `KernelRequest::InstallCapsule` handler — delegates to the
 /// `astrid-capsule-install` library so the daemon and the CLI reach
 /// disk through the same code path.
@@ -14,6 +15,12 @@ mod rate_limit;
 mod response;
 mod visibility;
 
+pub(crate) use identity::{
+    AuthorizedPrincipal, AuthorizedRequest, authorize_request, authorize_request_with_identity,
+    pause_authorize_identity_for_test,
+};
+#[cfg(test)]
+pub(crate) use identity::{arm_authorize_identity_gate, arm_confirm_policy_identity_gate};
 pub(crate) use rate_limit::ManagementRateLimiter;
 #[cfg(test)]
 pub(crate) use rate_limit::rate_limit_for_request;
@@ -23,10 +30,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use astrid_audit::{AuditAction, AuditOutcome, AuthorizationProof};
-use astrid_capabilities::{CapabilityCheck, PermissionError};
-use astrid_core::groups::GroupConfig;
 use astrid_core::principal::PrincipalId;
-use astrid_core::profile::{DeviceScope, PrincipalProfile};
 use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use astrid_events::kernel_api::{KernelRequest, KernelResponse};
 use tracing::{debug, info, warn};
@@ -760,91 +764,6 @@ pub fn kernel_request_method(req: &KernelRequest) -> &'static str {
 /// unattenuated full-principal request (every legacy / unpaired connection).
 fn resolve_device_key_id(message: &IpcMessage) -> Option<String> {
     message.device_key_id.clone()
-}
-
-/// Authorization inputs pinned at the request's policy decision point.
-#[derive(Debug)]
-struct AuthorizedRequest {
-    principal: PrincipalId,
-    profile: Arc<PrincipalProfile>,
-    groups: Arc<GroupConfig>,
-    device_scope: Option<DeviceScope>,
-}
-
-impl AuthorizedRequest {
-    fn capability_check(&self) -> CapabilityCheck<'_> {
-        let check = CapabilityCheck::new(
-            self.profile.as_ref(),
-            self.groups.as_ref(),
-            self.principal.clone(),
-        );
-        match &self.device_scope {
-            Some(scope) => check.with_device_scope(scope),
-            None => check,
-        }
-    }
-}
-
-/// Evaluate the capability check for `caller` against the kernel's resolved
-/// group config and the caller's profile.
-///
-/// Returns the pinned authorization snapshot on success, or the policy reason
-/// on denial. Profile resolution failures (malformed TOML, IO error) are
-/// themselves treated as deny — fail-closed — with a synthesized
-/// `MissingCapability` so the deny path has a single shape in the audit log.
-fn authorize_request(
-    kernel: &crate::Kernel,
-    caller: &PrincipalId,
-    device_key_id: Option<&str>,
-    required_cap: &str,
-) -> Result<AuthorizedRequest, PermissionError> {
-    let profile = match kernel.profile_cache.resolve(caller) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(
-                security_event = true,
-                principal = %caller,
-                error = %e,
-                "Profile resolution failed — fail-closed deny"
-            );
-            return Err(PermissionError::MissingCapability {
-                principal: caller.clone(),
-                required: required_cap.to_string(),
-            });
-        },
-    };
-    // Enabled gate runs BEFORE the capability check so a disabled
-    // principal cannot exercise any management API surface — even one
-    // they would otherwise be authorized for. The `default` principal
-    // is bootstrap-managed and `caps.revoke`/`agent.disable` against
-    // it are rejected up front, so this check cannot lock the
-    // single-tenant path.
-    if !profile.enabled {
-        warn!(
-            security_event = true,
-            principal = %caller,
-            required = required_cap,
-            "Disabled principal denied — fail-closed enforcement"
-        );
-        return Err(PermissionError::PrincipalDisabled {
-            principal: caller.clone(),
-        });
-    }
-    let groups = kernel.groups.load_full();
-
-    let device_scope = resolve_device_scope(profile.as_ref(), caller, device_key_id, required_cap)?;
-
-    let mut check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone());
-    if let Some(scope) = &device_scope {
-        check = check.with_device_scope(scope);
-    }
-    check.require(required_cap)?;
-    Ok(AuthorizedRequest {
-        principal: caller.clone(),
-        profile,
-        groups,
-        device_scope,
-    })
 }
 
 /// Bundled inputs for [`record_admin_audit`] — keeps the call site

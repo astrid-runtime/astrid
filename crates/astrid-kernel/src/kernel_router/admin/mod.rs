@@ -73,8 +73,9 @@ use tracing::warn;
 
 use super::caller::{CallerResolutionError, MANAGEMENT_CALLER_REQUIRED};
 use super::{
-    AdminAuditEntry, AuthorityScope, authorize_request, publish_response, record_admin_audit,
-    resolve_caller, resolve_device_key_id,
+    AdminAuditEntry, AuthorityScope, AuthorizedPrincipal, authorize_request,
+    authorize_request_with_identity, pause_authorize_identity_for_test, publish_response,
+    record_admin_audit, resolve_caller, resolve_device_key_id,
 };
 
 /// Admin IPC input topic prefix.
@@ -433,7 +434,7 @@ pub fn required_capability_for_admin_request(
     }
 }
 
-fn storage_mount_required_capability(
+pub(super) fn storage_mount_required_capability(
     request: &AdminRequestKind,
     scope: AuthorityScope,
 ) -> &'static str {
@@ -807,11 +808,25 @@ async fn authorize_admin_request(
     kernel: &Arc<crate::Kernel>,
     context: &AdminAuthorizationContext<'_>,
 ) -> Result<super::AuthorizedRequest, String> {
-    let authorization = match authorize_request(
+    let identity = if context.kind.requires_principal_identity() {
+        match AuthorizedPrincipal::bind(kernel, context.caller) {
+            Ok(identity) => Some(identity),
+            Err(error) => {
+                let error = error.to_string();
+                record_admin_authorization_failure(kernel, context, &error).await;
+                return Err(error);
+            },
+        }
+    } else {
+        None
+    };
+    pause_authorize_identity_for_test(kernel).await;
+    let authorization = match authorize_request_with_identity(
         kernel,
         context.caller,
         context.device_key_id,
         context.required_cap,
+        identity,
     ) {
         Ok(authorization) => authorization,
         Err(error) => {

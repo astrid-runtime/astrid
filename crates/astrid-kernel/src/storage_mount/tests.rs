@@ -1,6 +1,7 @@
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 
+use super::filesystem::CallbackFilesystem;
 use super::*;
 
 async fn callback(
@@ -705,8 +706,7 @@ async fn private_callbacks_bind_authority_and_isolate_principal_and_fleet_views(
 
     let principal = issue_lease(
         &kernel,
-        caller.clone(),
-        false,
+        &test_mount_admission(&kernel, &caller, MountOwnerScope::CallerOnly),
         StorageProviderViewV1::Principal(caller.clone()),
         astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadWrite,
@@ -876,8 +876,7 @@ async fn private_callbacks_bind_authority_and_isolate_principal_and_fleet_views(
 
     let fleet_lease = issue_lease(
         &kernel,
-        caller.clone(),
-        false,
+        &test_mount_admission(&kernel, &caller, MountOwnerScope::CallerOnly),
         StorageProviderViewV1::Fleet(fleet),
         astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadWrite,
@@ -919,8 +918,7 @@ async fn private_callbacks_bind_authority_and_isolate_principal_and_fleet_views(
 
     let system_lease = issue_lease(
         &kernel,
-        caller.clone(),
-        true,
+        &test_mount_admission(&kernel, &caller, MountOwnerScope::CrossOwnerWrite),
         StorageProviderViewV1::Admin,
         astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadWrite,
@@ -948,8 +946,7 @@ async fn private_callbacks_bind_authority_and_isolate_principal_and_fleet_views(
 
     let read_only = issue_lease(
         &kernel,
-        caller.clone(),
-        false,
+        &test_mount_admission(&kernel, &caller, MountOwnerScope::CallerOnly),
         StorageProviderViewV1::Principal(caller.clone()),
         astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadOnly,
@@ -965,18 +962,38 @@ async fn private_callbacks_bind_authority_and_isolate_principal_and_fleet_views(
             if code == "read-only"
     ));
 
-    revoke_lease(&kernel, &caller, false, principal.mount_id)
-        .await
-        .unwrap();
-    revoke_lease(&kernel, &caller, false, fleet_lease.mount_id)
-        .await
-        .unwrap();
-    revoke_lease(&kernel, &caller, false, system_lease.mount_id)
-        .await
-        .unwrap();
-    revoke_lease(&kernel, &caller, false, read_only.mount_id)
-        .await
-        .unwrap();
+    revoke_lease(
+        &kernel,
+        &caller,
+        MountOwnerScope::CallerOnly,
+        principal.mount_id,
+    )
+    .await
+    .unwrap();
+    revoke_lease(
+        &kernel,
+        &caller,
+        MountOwnerScope::CallerOnly,
+        fleet_lease.mount_id,
+    )
+    .await
+    .unwrap();
+    revoke_lease(
+        &kernel,
+        &caller,
+        MountOwnerScope::CallerOnly,
+        system_lease.mount_id,
+    )
+    .await
+    .unwrap();
+    revoke_lease(
+        &kernel,
+        &caller,
+        MountOwnerScope::CallerOnly,
+        read_only.mount_id,
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1002,8 +1019,7 @@ async fn synced_owner_mounts_reopen_without_cross_view_aliasing() {
 
     let principal = issue_lease(
         &kernel,
-        caller.clone(),
-        false,
+        &test_mount_admission(&kernel, &caller, MountOwnerScope::CallerOnly),
         StorageProviderViewV1::Principal(caller.clone()),
         astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadWrite,
@@ -1014,8 +1030,7 @@ async fn synced_owner_mounts_reopen_without_cross_view_aliasing() {
     .unwrap();
     let fleet_lease = issue_lease(
         &kernel,
-        caller.clone(),
-        false,
+        &test_mount_admission(&kernel, &caller, MountOwnerScope::CallerOnly),
         StorageProviderViewV1::Fleet(fleet),
         astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadWrite,
@@ -1058,17 +1073,26 @@ async fn synced_owner_mounts_reopen_without_cross_view_aliasing() {
             StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done)
         );
     }
-    revoke_lease(&kernel, &caller, false, principal.mount_id)
-        .await
-        .unwrap();
-    revoke_lease(&kernel, &caller, false, fleet_lease.mount_id)
-        .await
-        .unwrap();
+    revoke_lease(
+        &kernel,
+        &caller,
+        MountOwnerScope::CallerOnly,
+        principal.mount_id,
+    )
+    .await
+    .unwrap();
+    revoke_lease(
+        &kernel,
+        &caller,
+        MountOwnerScope::CallerOnly,
+        fleet_lease.mount_id,
+    )
+    .await
+    .unwrap();
 
     let principal_reopened = issue_lease(
         &kernel,
-        caller.clone(),
-        false,
+        &test_mount_admission(&kernel, &caller, MountOwnerScope::CallerOnly),
         StorageProviderViewV1::Principal(caller.clone()),
         astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadOnly,
@@ -1079,8 +1103,7 @@ async fn synced_owner_mounts_reopen_without_cross_view_aliasing() {
     .unwrap();
     let fleet_reopened = issue_lease(
         &kernel,
-        caller.clone(),
-        false,
+        &test_mount_admission(&kernel, &caller, MountOwnerScope::CallerOnly),
         StorageProviderViewV1::Fleet(fleet),
         astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadOnly,
@@ -1116,12 +1139,22 @@ async fn synced_owner_mounts_reopen_without_cross_view_aliasing() {
         ));
     }
 
-    revoke_lease(&kernel, &caller, false, principal_reopened.mount_id)
-        .await
-        .unwrap();
-    revoke_lease(&kernel, &caller, false, fleet_reopened.mount_id)
-        .await
-        .unwrap();
+    revoke_lease(
+        &kernel,
+        &caller,
+        MountOwnerScope::CallerOnly,
+        principal_reopened.mount_id,
+    )
+    .await
+    .unwrap();
+    revoke_lease(
+        &kernel,
+        &caller,
+        MountOwnerScope::CallerOnly,
+        fleet_reopened.mount_id,
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1131,8 +1164,11 @@ async fn version_one_callback_round_trips_small_binary_io() {
     let kernel = crate::test_kernel_with_home(home).await;
     let lease = issue_lease(
         &kernel,
-        PrincipalId::default(),
-        true,
+        &test_mount_admission(
+            &kernel,
+            &PrincipalId::default(),
+            MountOwnerScope::CrossOwnerWrite,
+        ),
         StorageProviderViewV1::Admin,
         astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadWrite,
@@ -1170,9 +1206,14 @@ async fn version_one_callback_round_trips_small_binary_io() {
         .await,
         StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Data(expected))
     );
-    revoke_lease(&kernel, &PrincipalId::default(), true, lease.mount_id)
-        .await
-        .unwrap();
+    revoke_lease(
+        &kernel,
+        &PrincipalId::default(),
+        MountOwnerScope::CrossOwnerWrite,
+        lease.mount_id,
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1182,8 +1223,11 @@ async fn version_two_framing_transports_maximum_file_io() {
     let kernel = crate::test_kernel_with_home(home).await;
     let lease = issue_lease(
         &kernel,
-        PrincipalId::default(),
-        true,
+        &test_mount_admission(
+            &kernel,
+            &PrincipalId::default(),
+            MountOwnerScope::CrossOwnerWrite,
+        ),
         StorageProviderViewV1::Admin,
         astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadWrite,
@@ -1225,9 +1269,14 @@ async fn version_two_framing_transports_maximum_file_io() {
         .await,
         StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Data(expected))
     );
-    revoke_lease(&kernel, &PrincipalId::default(), true, lease.mount_id)
-        .await
-        .unwrap();
+    revoke_lease(
+        &kernel,
+        &PrincipalId::default(),
+        MountOwnerScope::CrossOwnerWrite,
+        lease.mount_id,
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1238,8 +1287,7 @@ async fn dirty_tracks_only_successfully_acknowledged_unsynced_mutations() {
     let caller = PrincipalId::default();
     let lease = issue_lease(
         &kernel,
-        caller.clone(),
-        true,
+        &test_mount_admission(&kernel, &caller, MountOwnerScope::CrossOwnerWrite),
         StorageProviderViewV1::Admin,
         astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadWrite,
@@ -1299,13 +1347,25 @@ async fn dirty_tracks_only_successfully_acknowledged_unsynced_mutations() {
     );
     assert!(!state.dirty.load(Ordering::Acquire));
     assert_eq!(state.in_flight_mutations.load(Ordering::Acquire), 0);
-    let status = lease_status(&kernel, &caller, true, lease.mount_id).unwrap();
+    let status = lease_status(
+        &kernel,
+        &caller,
+        MountOwnerScope::CrossOwnerWrite,
+        lease.mount_id,
+    )
+    .await
+    .unwrap();
     assert_eq!(status["dirty"], false);
     assert_eq!(status["in_flight_mutations"], 0);
 
-    revoke_lease(&kernel, &caller, true, lease.mount_id)
-        .await
-        .unwrap();
+    revoke_lease(
+        &kernel,
+        &caller,
+        MountOwnerScope::CrossOwnerWrite,
+        lease.mount_id,
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1316,8 +1376,7 @@ async fn revoke_drains_an_in_flight_mutation_and_fences_new_mutation() {
     let caller = PrincipalId::default();
     let lease = issue_lease(
         &kernel,
-        caller.clone(),
-        true,
+        &test_mount_admission(&kernel, &caller, MountOwnerScope::CrossOwnerWrite),
         StorageProviderViewV1::Admin,
         astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
         StorageProviderAccessV1::ReadWrite,
@@ -1330,9 +1389,14 @@ async fn revoke_drains_an_in_flight_mutation_and_fences_new_mutation() {
         callback(&lease, &lease.lease_token, create("in-flight.bin")).await,
         StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done)
     );
-    sync_lease(&kernel, &caller, true, lease.mount_id)
-        .await
-        .unwrap();
+    sync_lease(
+        &kernel,
+        &caller,
+        MountOwnerScope::CrossOwnerWrite,
+        lease.mount_id,
+    )
+    .await
+    .unwrap();
     let state = Arc::clone(kernel.storage_mounts.get(&lease.mount_id).unwrap().value());
     let gate = Arc::new(MutationTestGate {
         entered: tokio::sync::Semaphore::new(0),
@@ -1359,7 +1423,13 @@ async fn revoke_drains_an_in_flight_mutation_and_fences_new_mutation() {
     let revocation_kernel = Arc::clone(&kernel);
     let revocation_caller = caller.clone();
     let revocation = tokio::spawn(async move {
-        revoke_lease(&revocation_kernel, &revocation_caller, true, lease.mount_id).await
+        revoke_lease(
+            &revocation_kernel,
+            &revocation_caller,
+            MountOwnerScope::CrossOwnerWrite,
+            lease.mount_id,
+        )
+        .await
     });
     while !state.revoked.load(Ordering::Acquire) {
         tokio::task::yield_now().await;
@@ -1430,8 +1500,7 @@ async fn internal_workspace_branch_lease_fixes_branch_target() {
         .unwrap();
     let foreign_error = issue_lease(
         &kernel,
-        caller.clone(),
-        false,
+        &test_mount_admission(&kernel, &caller, MountOwnerScope::CallerOnly),
         StorageProviderViewV1::Principal(caller.clone()),
         astrid_core::storage_filesystem::StorageFilesystemTargetV1::WorkspaceBranch {
             workspace: foreign_workspace,
@@ -1446,8 +1515,7 @@ async fn internal_workspace_branch_lease_fixes_branch_target() {
 
     let lease = issue_lease(
         &kernel,
-        caller.clone(),
-        false,
+        &test_mount_admission(&kernel, &caller, MountOwnerScope::CallerOnly),
         StorageProviderViewV1::Principal(caller.clone()),
         astrid_core::storage_filesystem::StorageFilesystemTargetV1::WorkspaceBranch { workspace },
         StorageProviderAccessV1::ReadWrite,
@@ -1504,9 +1572,14 @@ async fn internal_workspace_branch_lease_fixes_branch_target() {
             .unwrap()
             .is_some()
     );
-    revoke_lease(&kernel, &caller, false, lease.mount_id)
-        .await
-        .unwrap();
+    revoke_lease(
+        &kernel,
+        &caller,
+        MountOwnerScope::CallerOnly,
+        lease.mount_id,
+    )
+    .await
+    .unwrap();
     branches.promote(&owner, workspace).unwrap();
     assert_eq!(
         store
@@ -1533,8 +1606,7 @@ async fn internal_workspace_branch_lease_fixes_branch_target() {
         .unwrap();
     let rollback_lease = issue_lease(
         &kernel,
-        caller.clone(),
-        false,
+        &test_mount_admission(&kernel, &caller, MountOwnerScope::CallerOnly),
         StorageProviderViewV1::Principal(caller.clone()),
         astrid_core::storage_filesystem::StorageFilesystemTargetV1::WorkspaceBranch {
             workspace: rollback_workspace,
@@ -1554,9 +1626,14 @@ async fn internal_workspace_branch_lease_fixes_branch_target() {
         .await,
         StorageFilesystemOutcomeV1::Success(StorageFilesystemSuccessV1::Done)
     );
-    revoke_lease(&kernel, &caller, false, rollback_lease.mount_id)
-        .await
-        .unwrap();
+    revoke_lease(
+        &kernel,
+        &caller,
+        MountOwnerScope::CallerOnly,
+        rollback_lease.mount_id,
+    )
+    .await
+    .unwrap();
     branches.rollback(&owner, rollback_workspace).unwrap();
     assert_eq!(
         store
@@ -1571,4 +1648,60 @@ async fn internal_workspace_branch_lease_fixes_branch_target() {
             .unwrap(),
         None
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_retries_after_injected_cleanup_failure() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
+    let kernel = Arc::new(crate::test_kernel_with_home(home).await);
+    let caller = PrincipalId::default();
+    let lease = issue_lease(
+        &kernel,
+        &test_mount_admission(&kernel, &caller, MountOwnerScope::CrossOwnerWrite),
+        StorageProviderViewV1::Admin,
+        astrid_core::storage_filesystem::StorageFilesystemTargetV1::OwnerRoot,
+        StorageProviderAccessV1::ReadWrite,
+        "test-provider".to_owned(),
+        temporary.path().join("cleanup-fault-mount"),
+    )
+    .await
+    .unwrap();
+    let state = Arc::clone(kernel.storage_mounts.get(&lease.mount_id).unwrap().value());
+    inject_cleanup_fault_for_test(&state, MountCleanupStage::Manifest);
+    let error = revoke_lease(
+        &kernel,
+        &caller,
+        MountOwnerScope::CrossOwnerWrite,
+        lease.mount_id,
+    )
+    .await
+    .expect_err("injected manifest cleanup must fail closed");
+    assert!(
+        error.contains("manifest"),
+        "expected manifest cleanup diagnostic, got {error}"
+    );
+    assert!(
+        kernel.storage_mounts.contains_key(&lease.mount_id),
+        "failed cleanup must keep the revoked lease mapped"
+    );
+    assert!(state.is_revoked_for_test());
+    assert!(
+        lease
+            .resource_path
+            .join(super::LEASE_MANIFEST_NAME)
+            .exists()
+    );
+    clear_cleanup_fault_for_test(&state);
+    revoke_lease(
+        &kernel,
+        &caller,
+        MountOwnerScope::CrossOwnerWrite,
+        lease.mount_id,
+    )
+    .await
+    .expect("retry after clearing cleanup fault");
+    assert!(!kernel.storage_mounts.contains_key(&lease.mount_id));
+    assert!(!lease.callback_path.exists());
+    assert!(!lease.resource_path.exists());
 }
