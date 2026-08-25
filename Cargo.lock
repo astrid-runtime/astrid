@@ -803,6 +803,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "astrid-realm-compat"
+version = "0.10.4"
+dependencies = [
+ "astrid-projection",
+ "astrid-provider",
+ "astrid-resource-types",
+ "blake3",
+]
+
+[[package]]
 name = "astrid-resource-types"
 version = "0.10.4"
 dependencies = [

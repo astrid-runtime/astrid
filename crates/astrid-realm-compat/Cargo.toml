@@ -1,0 +1,23 @@
+[package]
+name = "astrid-realm-compat"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Workload-neutral compatibility portable-machine fixture for Astrid"
+
+[features]
+default = []
+
+[dependencies]
+astrid-provider = { workspace = true }
+astrid-resource-types = { workspace = true }
+blake3 = { version = "1.5", default-features = false, features = ["pure"] }
+
+[dev-dependencies]
+astrid-projection = { workspace = true }
+
+[lints]
+workspace = true

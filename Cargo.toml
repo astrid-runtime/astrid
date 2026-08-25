@@ -24,6 +24,7 @@ members = [
     "crates/astrid-prelude",
     "crates/astrid-projection",
     "crates/astrid-provider",
+    "crates/astrid-realm-compat",
     "crates/astrid-resource-types",
     "crates/astrid-runtime",
     "crates/astrid-storage",
@@ -66,6 +67,7 @@ astrid-mcp = { path = "crates/astrid-mcp", version = "0.10.4" }
 astrid-prelude = { path = "crates/astrid-prelude", version = "0.10.4" }
 astrid-projection = { path = "crates/astrid-projection", version = "0.10.4" }
 astrid-provider = { path = "crates/astrid-provider", version = "0.10.4" }
+astrid-realm-compat = { path = "crates/astrid-realm-compat", version = "0.10.4" }
 astrid-resource-types = { path = "crates/astrid-resource-types", version = "0.10.4" }
 astrid-runtime = { path = "crates/astrid-runtime", version = "0.10.4" }
 astrid-storage = { path = "crates/astrid-storage", version = "0.10.4" }
