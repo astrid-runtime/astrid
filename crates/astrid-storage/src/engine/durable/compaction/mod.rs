@@ -695,7 +695,8 @@ where
             self.hosted_directory()?,
             &index_state,
             self.identity.scheme(),
-        );
+            self.faults.as_ref(),
+        )?;
         let mut arena = open_rw_capability(self.hosted_directory()?, Path::new(ARENA_FILE), false)?;
         let mut roots = open_rw_capability(self.hosted_directory()?, Path::new(ROOT_FILE), false)?;
         arena
@@ -718,7 +719,7 @@ where
         inner.files = Some(DurableFiles {
             arena,
             roots,
-            index_cache,
+            index_cache: Some(index_cache),
             arena_len: replacement.arena_len,
             arena_tail: replacement.arena_tail,
         });

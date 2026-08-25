@@ -845,8 +845,8 @@ use native_io::{
 use recovery::{RecoveryScope, recover_store, recover_volume};
 use roots::{encode_root_record, encode_root_snapshot, recover_root_history, recover_roots};
 use validation::{
-    ClosureObjects, materialize_closure, recovery_closure_error, usage_from_closure,
-    validate_commit_closure, validate_incremental_closure,
+    ClosureObjects, materialize_closure, preload_indexed_closures, recovery_closure_error,
+    usage_from_closure, validate_commit_closure, validate_incremental_closure,
 };
 
 #[cfg(test)]

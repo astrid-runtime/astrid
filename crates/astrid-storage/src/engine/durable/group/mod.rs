@@ -425,11 +425,7 @@ where
                         live_files_mut(&mut inner.files)
                             .map_or(true, |files| files.arena_len >= previous_arena_len)
                     );
-                    let frontier = if self.transaction_wal.is_enabled() {
-                        Self::advance_wal_arena_frontier(&mut inner, persisted.arena_len)
-                    } else {
-                        self.advance_index_frontier(&mut inner, persisted.arena_len)
-                    };
+                    let frontier = self.publish_commit_frontier(&mut inner, persisted.arena_len);
                     if let Err(error) = frontier {
                         self.mark_requires_recovery(&mut inner);
                         complete_failed_group(&mut completions, accepted, error);
@@ -463,6 +459,19 @@ where
         drop(inner);
         for (receipt, result) in completions {
             receipt.complete(result);
+        }
+    }
+
+    fn publish_commit_frontier(
+        &self,
+        inner: &mut DurableInner<P>,
+        arena_len: u64,
+    ) -> Result<(), DurableError> {
+        if self.transaction_wal.is_enabled() {
+            Self::advance_wal_arena_frontier(inner, arena_len)
+        } else {
+            self.advance_index_frontier(inner, arena_len)?;
+            self.sync_volume()
         }
     }
 
@@ -570,7 +579,6 @@ where
         self.fail_if(FaultPoint::BeforeRootCas)?;
 
         self.publish_group_roots(files, accepted)?;
-        self.sync_volume()?;
         let arena_len = files
             .arena
             .metadata()

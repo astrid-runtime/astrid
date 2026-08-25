@@ -7,7 +7,8 @@ use super::{
     MutexGuard, PersistentObjectIdentity, PrincipalCodec, ROOT_FILE, RecoveredStore,
     RecoveryLimits, Seek, SeekFrom, SharedIdentity, SharedPrincipalCodec, WAL_FILE, io, io_error,
     open_rw_capability, recover_arena, recover_index, recover_interrupted_compaction,
-    recover_root_history, recover_roots, replace_index, sync_store_directory_capability,
+    recover_root_history, recover_roots, replace_index, replace_volume_index,
+    sync_store_directory_capability,
 };
 use crate::volume::AstridVolume;
 use std::collections::BTreeSet;
@@ -37,6 +38,7 @@ pub(super) fn recover_store<P, I, C>(
     identity: &SharedIdentity<I>,
     limits: RecoveryLimits,
     create_wal: bool,
+    faults: &dyn FaultInjector,
 ) -> Result<RecoveredWal<P, I, C>, DurableError>
 where
     P: Clone + Ord,
@@ -79,7 +81,7 @@ where
             objects: index,
         };
         drop(index_cache.take());
-        index_cache = replace_index(store_root, &state, scheme);
+        index_cache = Some(replace_index(store_root, &state, scheme, faults)?);
         (state.objects, state.arena_tail)
     };
     if let Some(representations) = &mut representations {
@@ -146,6 +148,7 @@ pub(super) fn recover_volume<P, I, C>(
     identity: &SharedIdentity<I>,
     limits: RecoveryLimits,
     create_wal: bool,
+    faults: &dyn FaultInjector,
 ) -> Result<RecoveredWal<P, I, C>, DurableError>
 where
     P: Clone + Ord,
@@ -159,26 +162,21 @@ where
     volume
         .sync()
         .map_err(|source| io_error("flush Astrid volume namespace", source))?;
-    let scheme = identity.scheme();
-    let arena_len = arena
-        .metadata()
-        .map_err(|source| io_error("read object-arena metadata", source))?
-        .len();
     let mut representations =
         super::representations::RepresentationStore::open_volume(volume, limits)?;
     let protected_arena_len = representations.as_ref().map_or(
         Ok(0),
         super::representations::RepresentationStore::generation_zero_protected_len,
     )?;
-    let cached = index_cache
-        .as_mut()
-        .and_then(|file| recover_index(file, &mut arena, scheme, limits, arena_len));
-    let (index, arena_tail) = if let Some(state) = cached {
-        (state.objects, state.arena_tail)
-    } else {
-        drop(index_cache.take());
-        recover_arena(&mut arena, identity, limits, protected_arena_len)?
-    };
+    let (index, arena_tail) = recover_volume_index(
+        volume,
+        &mut arena,
+        &mut index_cache,
+        identity,
+        limits,
+        protected_arena_len,
+        faults,
+    )?;
     if let Some(store) = &mut representations {
         store.validate_generation_zero_index(&index)?;
     }
@@ -235,6 +233,58 @@ where
         },
         wal_writer,
     ))
+}
+
+fn recover_volume_index<I>(
+    volume: &Arc<dyn AstridVolume>,
+    arena: &mut super::File,
+    index_cache: &mut Option<super::File>,
+    identity: &SharedIdentity<I>,
+    limits: RecoveryLimits,
+    protected_arena_len: u64,
+    faults: &dyn FaultInjector,
+) -> Result<
+    (
+        std::collections::BTreeMap<crate::storage_model::ObjectId, super::ArenaLocation>,
+        Option<super::ArenaLocation>,
+    ),
+    DurableError,
+>
+where
+    I: PersistentObjectIdentity,
+{
+    let scheme = identity.scheme();
+    let arena_len = arena
+        .metadata()
+        .map_err(|source| io_error("read object-arena metadata", source))?
+        .len();
+    if let Some(state) = index_cache
+        .as_mut()
+        .and_then(|file| recover_index(file, arena, scheme, limits, arena_len))
+    {
+        return Ok((state.objects, state.arena_tail));
+    }
+
+    drop(index_cache.take());
+    let (index, arena_tail) = recover_arena(arena, identity, limits, protected_arena_len)?;
+    let state = IndexState {
+        arena_len: arena
+            .metadata()
+            .map_err(|source| io_error("read recovered arena metadata", source))?
+            .len(),
+        arena_tail,
+        objects: index.clone(),
+    };
+    *index_cache = Some(replace_volume_index(
+        Arc::clone(volume),
+        &state,
+        scheme,
+        faults,
+    )?);
+    volume
+        .sync()
+        .map_err(|source| io_error("flush rebuilt volume index", source))?;
+    Ok((index, arena_tail))
 }
 
 fn open_optional_native_wal(
@@ -451,6 +501,7 @@ where
                 &self.identity,
                 self.limits,
                 self.transaction_wal.is_enabled(),
+                self.faults.as_ref(),
             ),
             (None, None, Some(volume)) => recover_volume(
                 volume,
@@ -458,6 +509,7 @@ where
                 &self.identity,
                 self.limits,
                 self.transaction_wal.is_enabled(),
+                self.faults.as_ref(),
             ),
             _ => Err(DurableError::InvalidRepresentationState(
                 "durable engine media configuration is inconsistent",

@@ -7,7 +7,7 @@ use crate::storage_model::{ModelError, ObjectId, RootGeneration, RootState};
 use super::{
     ArenaLocation, DurableError, DurableIo, File, IdentityScheme, PersistentObjectIdentity,
     PrincipalCodec, ROOT_FILE, ROOT_MAGIC, RecoveryLimits, corrupt, materialize_closure,
-    recovery_closure_error, scan_frames, validate_commit_closure,
+    preload_indexed_closures, recovery_closure_error, scan_frames, validate_commit_closure,
 };
 
 const SNAPSHOT_SENTINEL: u64 = u64::MAX;
@@ -64,12 +64,24 @@ where
     I: PersistentObjectIdentity,
 {
     let mut validated = BTreeSet::new();
+    let preload = preload_indexed_closures(
+        arena,
+        index,
+        recovered.values().map(|(root, _)| root.commit),
+        identity,
+        limits,
+    )
+    .map_err(|error| {
+        let root_offset = recovered.values().next().map_or(0, |(_, offset)| *offset);
+        recovery_closure_error(error, root_offset)
+    })?;
+    let empty_index = BTreeMap::new();
     for (root, offset) in recovered.values().copied() {
         let records = materialize_closure(
             &mut super::ClosureObjects::<_, P> {
                 arena,
-                index,
-                incoming: &BTreeMap::new(),
+                index: &empty_index,
+                incoming: &preload,
                 pending: None,
                 identity,
                 limits,

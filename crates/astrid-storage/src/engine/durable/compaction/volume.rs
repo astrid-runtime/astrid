@@ -179,8 +179,12 @@ where
             arena_tail: replacement.arena_tail,
             objects: replacement.index.clone(),
         };
-        let index_cache =
-            replace_volume_index(Arc::clone(&volume), &index_state, self.identity.scheme());
+        let index_cache = replace_volume_index(
+            Arc::clone(&volume),
+            &index_state,
+            self.identity.scheme(),
+            self.faults.as_ref(),
+        )?;
         let mut arena = File::volume(Arc::clone(&volume), ARENA_FILE, false)?;
         let mut roots = File::volume(volume, ROOT_FILE, false)?;
         arena
@@ -203,7 +207,7 @@ where
         inner.files = Some(DurableFiles {
             arena,
             roots,
-            index_cache,
+            index_cache: Some(index_cache),
             arena_len: replacement.arena_len,
             arena_tail: replacement.arena_tail,
         });

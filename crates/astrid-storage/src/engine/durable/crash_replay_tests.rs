@@ -206,7 +206,8 @@ impl FaultInjector for EngineTraceFaults {
             | FaultPoint::BeforeInProcessRecoveryOpen
             | FaultPoint::BeforeInProcessRecoveryArenaFlush
             | FaultPoint::BeforeInProcessRecoveryRootFlush
-            | FaultPoint::AfterCompactionRepresentationRebase => {},
+            | FaultPoint::AfterCompactionRepresentationRebase
+            | FaultPoint::BeforeIndexCachePublication => {},
         }
         false
     }

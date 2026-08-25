@@ -212,6 +212,7 @@ where
             &identity,
             limits,
             policy.transaction_wal.is_enabled(),
+            faults.as_ref(),
         )?;
         Ok(Self::from_recovered(
             None,
@@ -284,6 +285,7 @@ where
             &identity,
             limits,
             options.policy.transaction_wal.is_enabled(),
+            options.faults.as_ref(),
         )?;
 
         Ok(Self::from_recovered(
