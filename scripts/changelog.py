@@ -29,7 +29,11 @@ def is_code_path(path: str) -> bool:
 
 
 def parse_labels(raw: str) -> list[str]:
-    return [part.strip() for part in re.split(r"[\s,]+", raw) if part.strip()]
+    # GitHub's expression language passes a quoted ``\n`` separator from
+    # ``join(labels, '\n')`` as the two literal characters ``\\n``. Treat it
+    # like a real newline while retaining the existing whitespace/comma
+    # delimiters used by the CLI and environment-variable callers.
+    return [part.strip() for part in re.split(r"(?:\\n|[\s,]+)", raw) if part.strip()]
 
 
 def has_skip_changelog(labels: Iterable[str]) -> bool:
