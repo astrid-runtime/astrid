@@ -106,6 +106,15 @@ impl Selector {
             return Err(SelectionError::Journal(JournalError::Ineligible));
         }
         let parsed = journal.parse().map_err(|_| SelectionError::Recovery)?;
+        if parsed.is_failed(facts.claim()) {
+            return Err(SelectionError::Journal(JournalError::AttemptsExhausted));
+        }
+        if parsed
+            .latest_confirmed()
+            .is_some_and(|confirmed| confirmed.claim == facts.claim())
+        {
+            return Err(SelectionError::Journal(JournalError::PendingExists));
+        }
         let attempt = match parsed.latest_pending() {
             Some(pending) if pending.attempt >= MAX_ATTEMPTS => {
                 return Err(SelectionError::Journal(JournalError::AttemptsExhausted));

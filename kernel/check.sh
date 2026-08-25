@@ -17,11 +17,23 @@ cargo fmt --all -- --check
 echo "== stable cargo test -p astrid-native-closure --locked =="
 cargo test -p astrid-native-closure --locked
 
+echo "== stable cargo test -p astrid-boot-selection --locked (default) =="
+cargo test -p astrid-boot-selection --locked
+
+echo "== stable cargo test -p astrid-boot-selection --locked (no default features) =="
+cargo test -p astrid-boot-selection --no-default-features --locked
+
 echo "== stable cargo clippy -p astrid-native-closure (host, all features) =="
 cargo clippy -p astrid-native-closure --all-targets --all-features --locked -- -D warnings
 
 echo "== stable cargo clippy -p astrid-native-closure --target x86_64-unknown-none =="
 cargo clippy -p astrid-native-closure --target x86_64-unknown-none --locked -- -D warnings
+
+echo "== stable cargo clippy -p astrid-boot-selection (host, all targets) =="
+cargo clippy -p astrid-boot-selection --all-targets --all-features --locked -- -D warnings
+
+echo "== stable cargo check -p astrid-boot-selection --target x86_64-unknown-none =="
+cargo check -p astrid-boot-selection --no-default-features --target x86_64-unknown-none --locked
 
 echo "== stable cargo test -p ktest --locked =="
 cargo test -p ktest --locked

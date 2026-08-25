@@ -297,6 +297,8 @@ pub(crate) fn transition_is_valid(
             if next.slot != previous.slot
                 || next.claim != previous.claim
                 || next.attempt != previous.attempt
+                || (next.state == RecordState::Confirmed
+                    && previous.attempt >= crate::policy::MAX_ATTEMPTS)
                 || next.boot_sequence != previous.boot_sequence
             {
                 return Err(JournalError::InvalidTransition);

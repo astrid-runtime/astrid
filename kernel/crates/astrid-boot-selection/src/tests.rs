@@ -226,6 +226,62 @@ fn newer_bad_or_exhausted_same_slot_falls_back_to_confirmed() {
 }
 
 #[test]
+fn failed_trial_claim_cannot_reauthorize_old_confirmation() {
+    let candidate = facts(1);
+    let first = selector()
+        .start_pending(Journal::empty(), Slot::A, candidate, 1)
+        .expect("first");
+    let confirmed = selector()
+        .confirm(first.journal(), first.token())
+        .expect("confirmed");
+    let pending_frame = Frame {
+        state: RecordState::Pending,
+        slot: Slot::A,
+        attempt: 1,
+        record_seq: 2,
+        boot_sequence: 2,
+        claim: candidate.claim(),
+    };
+    let with_trial = bytes_with_frame(confirmed, 2, &pending_frame);
+    let bad_frame = Frame {
+        state: RecordState::Bad,
+        record_seq: 3,
+        ..pending_frame
+    };
+    let bad = bytes_with_frame(with_trial, 3, &bad_frame);
+    assert_eq!(selector().recover(bad, verified()), BootDecision::Recovery);
+}
+
+#[test]
+fn slot_swapped_failed_claim_falls_back_to_distinct_confirmation() {
+    let first_facts = facts(1);
+    let second_facts = facts(2);
+    let first = selector()
+        .start_pending(Journal::empty(), Slot::A, first_facts, 1)
+        .expect("first");
+    let first_confirmed = selector()
+        .confirm(first.journal(), first.token())
+        .expect("first confirmed");
+    let second = selector()
+        .start_pending(first_confirmed, Slot::B, second_facts, 2)
+        .expect("second");
+    let second_confirmed = selector()
+        .confirm(second.journal(), second.token())
+        .expect("second confirmed");
+    let swapped_trial = selector()
+        .start_pending(second_confirmed, Slot::A, first_facts, 3)
+        .expect("slot-swapped trial");
+    let bad = selector()
+        .mark_bad(swapped_trial.journal(), swapped_trial.token())
+        .expect("bad");
+    assert!(matches!(
+        selector().recover(bad, verified()),
+        BootDecision::Confirmed(boot)
+            if boot.slot() == Slot::B && boot.candidate() == second_facts
+    ));
+}
+
+#[test]
 fn each_independent_policy_floor_is_enforced() {
     let candidate = facts(1);
     let policies = [
@@ -406,8 +462,9 @@ fn full_journal_stops_at_sixteen_contiguous_frames() {
     let mut boot = 1;
     for index in 0..8 {
         let slot = if index % 2 == 0 { Slot::A } else { Slot::B };
+        let candidate = facts(if index % 2 == 0 { 1 } else { 2 });
         let pending = selector()
-            .start_pending(journal, slot, facts(1), boot)
+            .start_pending(journal, slot, candidate, boot)
             .expect("pending");
         journal = selector()
             .confirm(pending.journal(), pending.token())
@@ -423,9 +480,10 @@ fn full_journal_stops_at_sixteen_contiguous_frames() {
 #[test]
 fn every_valid_frame_boundary_recovers_without_reading_future_bytes() {
     let mut full = Journal::empty();
-    for boot in 1..=8 {
+    for (index, boot) in (0..8).zip(1..=8) {
+        let candidate = facts(if index % 2 == 0 { 1 } else { 2 });
         let pending = selector()
-            .start_pending(full, Slot::A, facts(1), boot)
+            .start_pending(full, Slot::A, candidate, boot)
             .expect("pending");
         full = selector()
             .confirm(pending.journal(), pending.token())
