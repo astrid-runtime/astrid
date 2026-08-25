@@ -2,7 +2,7 @@
 
 This document is the single human-readable record for the format-one chunker
 gate. The generated machine report is
-[`benchmarks/astrid-storage-chunker-evidence-v1.json`](benchmarks/astrid-storage-chunker-evidence-v1.json).
+[`benchmarks/astrid-storage-chunker-evidence-v1.json`](../benchmarks/astrid-storage-chunker-evidence-v1.json).
 The harness that produced it is the non-published
 `astrid-storage-chunker-evidence` workspace crate.
 

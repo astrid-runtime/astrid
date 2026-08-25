@@ -4,8 +4,8 @@ Status: Milestone 0 exit artifact; the words that keep claims honest
 
 Last reviewed: 2026-07-21
 
-Companions: [kernel charter](astrid-kernel-charter.md),
-[threat model](astrid-kernel-threat-model.md),
+Companions: [kernel charter](../architecture/astrid-kernel-charter.md),
+[threat model](../architecture/astrid-kernel-threat-model.md),
 [requirement-to-evidence matrix](astrid-kernel-evidence-matrix.md)
 
 The charter's evidence discipline (charter §8) is only enforceable if the

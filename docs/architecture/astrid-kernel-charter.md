@@ -5,10 +5,10 @@ Status: Milestone 0 exit artifact; binding on all native-kernel work
 Last reviewed: 2026-07-21
 
 Companions: [threat model](astrid-kernel-threat-model.md),
-[native-kernel scope](astrid-native-kernel.md),
+[native-kernel scope](../astrid-native-kernel.md),
 [AI-native OS workplan](astrid-ai-native-os-workplan.md),
 [driver domain contract](astrid-driver-domain-contract.md),
-[Tensor Logic composition](astrid-tensor-logic-composition.md)
+[Tensor Logic composition](../astrid-tensor-logic-composition.md)
 
 This charter states what the Astrid native kernel is, what may never enter it,
 and the decisions that are now closed. It exists so that the kernel cannot
@@ -120,7 +120,7 @@ complete positive obligation set, and additions to it require amendment.
   projection of the object tables as typed relations and to subscribe to
   bounded relation deltas. Owner, type, direction, authority, provenance,
   budget, and lifecycle are first-class fields, aligned with the catalog
-  model in [Tensor Logic composition](astrid-tensor-logic-composition.md).
+  model in [Tensor Logic composition](../astrid-tensor-logic-composition.md).
   This is an ABI family, not a debug channel: the system ontology's base
   relations are emitted by the kernel because they ARE the kernel's state,
   never scraped from it after the fact. Reasoning over those relations
@@ -256,7 +256,7 @@ were lost. The Realm programme's standard applies unchanged:
 ## 9. Naming
 
 The ring-0 artifact is `astrid-native-kernel` (crate and workspace naming
-per the [scope document](astrid-native-kernel.md)). The existing
+per the [scope document](../astrid-native-kernel.md)). The existing
 `astrid-kernel` crate, the semantic capsule/event supervisor, is unchanged
 and over time becomes the user-space `astrid-system` supervisor. The two
 are different objects and are never referred to interchangeably in code,

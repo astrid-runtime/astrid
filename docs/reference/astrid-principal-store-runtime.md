@@ -1,9 +1,9 @@
 # Astrid Principal Store Runtime Realization
 
-This companion to [Astrid Principal Store](astrid-principal-store.md) carries
+This companion to [Astrid Principal Store](../architecture/astrid-principal-store.md) carries
 the runtime boundary, delivery order, remaining evidence questions, and prior
 art. Operational economics, accounting, privacy, and retention are specified
-in [Astrid Principal Store Operations](astrid-principal-store-operations.md).
+in [Astrid Principal Store Operations](../operations/astrid-principal-store-operations.md).
 
 ## 18. Host filesystem projection
 
@@ -142,7 +142,7 @@ migration story.
 - Multi-device synchronization will exchange verified closures and publish
   roots through ordinary compare-and-swap. Object-set difference uses the
   rateless reconciliation direction in
-  [Multi-Device Object-Set Reconciliation](astrid-sync-reconciliation.md);
+  [Multi-Device Object-Set Reconciliation](../concepts/astrid-sync-reconciliation.md);
   product and conflict semantics remain a separate design.
 - Delta compression between near-identical chunks is considered only if the
   temporal version-chain sweep demonstrates savings beyond content-defined

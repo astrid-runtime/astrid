@@ -6,9 +6,9 @@ Last reviewed: 2026-07-18
 
 Baselines:
 
-- [Astrid Native Component Kernel](astrid-native-kernel.md)
+- [Astrid Native Component Kernel](../astrid-native-kernel.md)
 - [Astrid Fleet Computer and Principal Views](astrid-fleet-computer.md)
-- [Astrid Tensor Logic Composition](astrid-tensor-logic-composition.md)
+- [Astrid Tensor Logic Composition](../astrid-tensor-logic-composition.md)
 - [Astrid Driver Domain Contract](astrid-driver-domain-contract.md)
 - [AOS Principal Linux Realm](https://github.com/unicity-aos/aos-ce/blob/main/docs/principal-linux-realm.md)
 
@@ -154,10 +154,10 @@ not become a ring-0 ABI.
   drivers, DMA, and recovery infrastructure:
   [Astrid Kernel Threat Model](astrid-kernel-threat-model.md).
 - [x] Create a requirement-to-evidence matrix for every claimed security property:
-  [Astrid Kernel Requirement-to-Evidence Matrix](astrid-kernel-evidence-matrix.md).
+  [Astrid Kernel Requirement-to-Evidence Matrix](../reference/astrid-kernel-evidence-matrix.md).
 - [x] Record ADRs for protection domains, capability object representation, handle
   transfer, revocation, fault endpoints, scheduling, and audit ordering:
-  [Astrid Kernel Architecture Decision Records](astrid-kernel-adrs.md).
+  [Astrid Kernel Architecture Decision Records](../decisions/astrid-kernel-adrs.md).
 - [ ] Define the support-policy vocabulary: experimental machine, supported host,
   supported capsule contract, verified claim, and known residual risk.
 
@@ -195,7 +195,7 @@ capsule behavior accidentally.
   [principal-bound storage contract](astrid-principal-store.md) with generations,
   quotas, flush, atomic rename, crash points, snapshots, rollback, deletion, key
   revocation, export/import, and placement-only rebalancing, plus its
-  [falsifiability contract](astrid-principal-store-evidence.md).
+  [falsifiability contract](../reference/astrid-principal-store-evidence.md).
 - [ ] Implement the realm VFS over an immutable base, private writable overlay,
   durable `/home/agent`, explicit `/workspace`, ephemeral `/tmp`, and synthetic
   `/proc` and `/dev`.

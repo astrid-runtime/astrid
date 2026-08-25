@@ -1,10 +1,10 @@
 # Astrid Principal Store Operations
 
-This companion to [Astrid Principal Store](astrid-principal-store.md) carries
+This companion to [Astrid Principal Store](../architecture/astrid-principal-store.md) carries
 the operational model above its logical object, authority, provenance, and
 portable import/export foundation. Runtime realization and delivery order
 continue in [Astrid Principal Store Runtime
-Realization](astrid-principal-store-runtime.md).
+Realization](../reference/astrid-principal-store-runtime.md).
 
 ## 12. Clone and inheritance
 
@@ -25,7 +25,7 @@ new: select source root -> authorize selected components -> commit destination r
 
 The agent-workspace complexity case and its benchmark boundary are recorded
 with the implemented engine in
-[Principal Store Engine Realization](astrid-principal-store-engine.md).
+[Principal Store Engine Realization](../reference/astrid-principal-store-engine.md).
 
 ## 13. Sysadmin rebalancing
 

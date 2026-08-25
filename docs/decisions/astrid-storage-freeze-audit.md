@@ -184,7 +184,7 @@ but do not sit on the point-mutation write path.
 
 **Status:** complete. The reproducible harness, full measurements, supply-chain
 record, and decision are in
-[`astrid-storage-chunker-evidence.md`](astrid-storage-chunker-evidence.md).
+[`astrid-storage-chunker-evidence.md`](../reference/astrid-storage-chunker-evidence.md).
 The byte-exact algorithm, accepted parameter grammar, and three golden vectors
 are frozen in RÚNATAL and verified by both production Rust and the independent
 reader.

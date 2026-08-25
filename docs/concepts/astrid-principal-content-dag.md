@@ -68,7 +68,7 @@ typed structural record. Collision checking still compares canonical records.
 
 The pinned sizes are measured rather than speculative. The corpus, convergence
 definitions, complete sweep result, and hypothesis boundary live in the single
-[Storage Performance and Convergence](astrid-storage-performance.md) record.
+[Storage Performance and Convergence](../reference/astrid-storage-performance.md) record.
 This document owns the persistent grammar only.
 
 ## Canonical objects
@@ -200,7 +200,7 @@ dependency.
 
 A provider must not silently equate this stronger durable acknowledgement with
 an ordinary host `close`. The benchmark contract in
-[Storage Performance and Convergence](astrid-storage-performance.md) measures
+[Storage Performance and Convergence](../reference/astrid-storage-performance.md) measures
 cached write, close, explicit sync, seal, and background publication
 separately. A hosted filesystem must state whether ordinary close waits for
 `seal`, whether only `fsync` does, and how a provider-process crash recovers a

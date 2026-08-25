@@ -7,7 +7,7 @@ that cannot dial the daemon's Unix socket and must go through
 canonical guidance for how to build a client against it.
 
 If you're standing the gateway *up*, see the
-[deployment runbook](gateway-deployment.md) instead.
+[deployment runbook](../operations/gateway-deployment.md) instead.
 
 ## TL;DR
 
@@ -115,7 +115,7 @@ SDKs. Until then, generate from the spec as described above.
 
 ## See also
 
-- [Gateway deployment runbook](gateway-deployment.md) — standing the
+- [Gateway deployment runbook](../operations/gateway-deployment.md) — standing the
   gateway up behind a reverse proxy or with native TLS.
 - `GET /api/openapi.json` on a running daemon — the authoritative
   contract.

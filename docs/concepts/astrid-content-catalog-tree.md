@@ -146,7 +146,7 @@ The implementation is accepted only when tests or benchmarks demonstrate:
 - malformed ordering, accounting, reuse, and cycle cases fail closed.
 
 The measured cardinality, amplification, publication, and reopen results live
-in [Storage Performance and Convergence](astrid-storage-performance.md).
+in [Storage Performance and Convergence](../reference/astrid-storage-performance.md).
 Reproduce the in-process cardinality probe with:
 
 `cargo test -p astrid-storage --release catalog_scale_probe -- --ignored --nocapture`

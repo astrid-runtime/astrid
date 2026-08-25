@@ -1,7 +1,7 @@
 # Astrid Principal Store Engine Realization
 
 This implementation companion to
-[Astrid Principal Store](astrid-principal-store.md) records the executable
+[Astrid Principal Store](../architecture/astrid-principal-store.md) records the executable
 engine, KV projection, native migration, durability boundary, and agent
 working-set claim. The primary design remains authoritative for the logical
 state and authority model.
@@ -275,7 +275,7 @@ on the engine mutex therefore consume blocking workers rather than parking the
 asynchronous workers that schedule capsules and IPC.
 
 The frozen byte-level specification is
-[`principal-store-v1.txt`](../crates/astrid-storage/formats/principal-store-v1.txt).
+[`principal-store-v1.txt`](../../crates/astrid-storage/formats/principal-store-v1.txt).
 It defines both frame magics, every field width and byte order, both exact
 BLAKE3 derive-key context strings, all object/reference tags, identity
 construction, current KV/content canonical grammars, and root-journal replay.

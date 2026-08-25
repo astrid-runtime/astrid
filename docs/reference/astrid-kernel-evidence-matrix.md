@@ -4,9 +4,9 @@ Status: Milestone 0 exit artifact; the falsifiability contract for the kernel
 
 Last reviewed: 2026-07-21
 
-Companions: [kernel charter](astrid-kernel-charter.md),
-[threat model](astrid-kernel-threat-model.md),
-[native-kernel scope](astrid-native-kernel.md)
+Companions: [kernel charter](../architecture/astrid-kernel-charter.md),
+[threat model](../architecture/astrid-kernel-threat-model.md),
+[native-kernel scope](../astrid-native-kernel.md)
 
 The charter and threat model make claims. This document is the rule that a
 claim is not held until a test would fail if the property were lost. It maps
@@ -31,7 +31,7 @@ Each row is one property. Columns:
   (for example `host+qemu` when a property is proven both off-target and in
   the harness); each named kind is an independent obligation for that row.
 - **Gate** — the milestone whose exit this row blocks (M1–M6, per the
-  [scope document](astrid-native-kernel.md) execution plan).
+  [scope document](../astrid-native-kernel.md) execution plan).
 
 A property with no evidence column filled is not a property; it is a wish,
 and must not be described as held in any doc, PR, or release note.

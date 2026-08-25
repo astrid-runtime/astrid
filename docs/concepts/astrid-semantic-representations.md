@@ -532,7 +532,7 @@ Semantic equivalence contributes one separately reported term to convergence;
 it never changes the byte-identity or authorization rules in this document.
 The metric vocabulary, measured whole-file results, platform-scale hypothesis,
 and required corpus axes live in
-[Storage Performance and Convergence](astrid-storage-performance.md).
+[Storage Performance and Convergence](../reference/astrid-storage-performance.md).
 
 ## Required evidence before activation
 

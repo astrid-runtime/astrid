@@ -610,7 +610,7 @@ verified object frames; no eager rewrite or logical migration is required.
 
 The replica-isolated corruption policy, verification boundary, and read-path
 evidence requirements are normative in
-[astrid-principal-store-evidence.md](astrid-principal-store-evidence.md#14-physical-representation-recovery-and-reads).
+[astrid-principal-store-evidence.md](../reference/astrid-principal-store-evidence.md#14-physical-representation-recovery-and-reads).
 
 ## Read and verification path
 
@@ -621,7 +621,7 @@ representation failure; neither is an untyped "candidate" failure.
 ## Costed selection
 
 The operator policy, bounded search, and measurement contract are normative in
-[astrid-storage-performance.md](astrid-storage-performance.md#representation-selection-cost-model).
+[astrid-storage-performance.md](../reference/astrid-storage-performance.md#representation-selection-cost-model).
 
 ## Liveness, GC, and compaction
 
@@ -828,7 +828,7 @@ garbage collection
 ## Failure and adversarial matrix
 
 The crash and adversarial outcomes live with the executable store obligations
-in [astrid-principal-store-evidence.md](astrid-principal-store-evidence.md#15-physical-representation-failure-matrix).
+in [astrid-principal-store-evidence.md](../reference/astrid-principal-store-evidence.md#15-physical-representation-failure-matrix).
 
 ## Internal API boundary
 
@@ -865,4 +865,4 @@ surface requires a separate RFC after the interface freeze.
 
 The implementation sequence, benchmark matrix, and replacement gates live with
 the rest of the store's proof obligations in
-[astrid-principal-store-evidence.md](astrid-principal-store-evidence.md#16-physical-representation-implementation-gates).
+[astrid-principal-store-evidence.md](../reference/astrid-principal-store-evidence.md#16-physical-representation-implementation-gates).

@@ -4,10 +4,10 @@ Status: Milestone 0 exit artifact; the concrete mechanism choices under the char
 
 Last reviewed: 2026-07-21
 
-Companions: [kernel charter](astrid-kernel-charter.md),
-[threat model](astrid-kernel-threat-model.md),
-[requirement-to-evidence matrix](astrid-kernel-evidence-matrix.md),
-[native-kernel scope](astrid-native-kernel.md)
+Companions: [kernel charter](../architecture/astrid-kernel-charter.md),
+[threat model](../architecture/astrid-kernel-threat-model.md),
+[requirement-to-evidence matrix](../reference/astrid-kernel-evidence-matrix.md),
+[native-kernel scope](../astrid-native-kernel.md)
 
 The charter sets the invariants; the threat model says what we defend
 against; the matrix says how each claim is falsified. This document records
@@ -17,7 +17,7 @@ be picked. Each record states context, the decision, the alternatives
 weighed, and the consequences, so a later reader sees not just what was
 chosen but what was rejected and why.
 
-These are the seven decisions the [workplan](astrid-ai-native-os-workplan.md)
+These are the seven decisions the [workplan](../architecture/astrid-ai-native-os-workplan.md)
 requires before the v0 ABI sketch: protection domains, capability object
 representation, handle transfer, revocation, fault endpoints, scheduling,
 and audit ordering. Each is numbered `ADR-K<n>` and referenced from the ABI

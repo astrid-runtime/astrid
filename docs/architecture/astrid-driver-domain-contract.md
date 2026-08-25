@@ -7,8 +7,8 @@ Last reviewed: 2026-07-18
 Related:
 
 - [Astrid AI-Native OS Workplan](astrid-ai-native-os-workplan.md)
-- [Astrid Native Component Kernel](astrid-native-kernel.md)
-- [Astrid Tensor Logic Composition](astrid-tensor-logic-composition.md)
+- [Astrid Native Component Kernel](../astrid-native-kernel.md)
+- [Astrid Tensor Logic Composition](../astrid-tensor-logic-composition.md)
 
 ## 1. Decision
 

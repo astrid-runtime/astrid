@@ -5,9 +5,9 @@ Status: implemented engine mechanism; composition policy remains explicit
 Tracks: [#1386](https://github.com/astrid-runtime/astrid/issues/1386)
 
 Companions:
-[Principal Store Engine](astrid-principal-store-engine.md),
-[Refinery](astrid-refinery.md), and
-[Format 1](../crates/astrid-storage/formats/principal-store-v1.txt)
+[Principal Store Engine](../reference/astrid-principal-store-engine.md),
+[Refinery](../concepts/astrid-refinery.md), and
+[Format 1](../../crates/astrid-storage/formats/principal-store-v1.txt)
 
 ## Authority boundary
 

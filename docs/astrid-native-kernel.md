@@ -9,8 +9,8 @@ Code baseline: Astrid Runtime `v0.10.1` (`4771bab3`)
 Decision state: scope an Astrid-owned kernel; implementation choices remain open
 
 Execution and evidence are tracked in the
-[AI-Native OS Workplan](astrid-ai-native-os-workplan.md). The precise driver-role
-boundary is in the [Driver Domain Contract](astrid-driver-domain-contract.md).
+[AI-Native OS Workplan](architecture/astrid-ai-native-os-workplan.md). The precise driver-role
+boundary is in the [Driver Domain Contract](architecture/astrid-driver-domain-contract.md).
 
 ## 1. Executive conclusion
 
@@ -426,8 +426,8 @@ Relevant Wasmtime references:
 
 The detailed object, transition, placement, export/import, accounting, and
 evidence contract lives in the
-[Astrid Principal Store](astrid-principal-store.md) design and its
-[evidence plan](astrid-principal-store-evidence.md).
+[Astrid Principal Store](architecture/astrid-principal-store.md) design and its
+[evidence plan](reference/astrid-principal-store-evidence.md).
 
 The first runtime-domain prototype may use `MemoryKvStore` only to prove
 component execution. The native host now opens `TreeKvStore` over the durable
@@ -640,7 +640,7 @@ zero-copy, bounded-memory design and Wasmtime's supported memory model.
 
 The complete identity, capability, lifecycle, reset, DMA, composition, and GPU
 refinement is specified in the
-[Driver Domain Contract](astrid-driver-domain-contract.md).
+[Driver Domain Contract](architecture/astrid-driver-domain-contract.md).
 
 ### 7.2 Required hardware host interface
 

@@ -5,7 +5,7 @@ Status: Milestone 0 exit artifact; companion to the kernel charter
 Last reviewed: 2026-07-21
 
 Companions: [kernel charter](astrid-kernel-charter.md),
-[native-kernel scope](astrid-native-kernel.md),
+[native-kernel scope](../astrid-native-kernel.md),
 [driver domain contract](astrid-driver-domain-contract.md)
 
 This document states what the Astrid native kernel defends against, what it
@@ -17,7 +17,7 @@ and where the charter has no answer yet, that gap is stated as an open item
 rather than hidden.
 
 The scope is the first machine contract from the [scope
-document](astrid-native-kernel.md): x86-64 under QEMU/KVM with UEFI, one
+document](../astrid-native-kernel.md): x86-64 under QEMU/KVM with UEFI, one
 CPU, fixed memory, serial, and virtio RNG/block/net/vsock, IOMMU emulation
 enabled before any untrusted domain receives direct DMA. Threats specific to
 later hardware (SMP, real IOMMU silicon, direct-DMA fast paths, AArch64) are
@@ -314,7 +314,7 @@ not a solved claim.
 
 Each threat class above must graduate from "addressed by clause" to "a test
 fails if the property is lost." The Milestone 0
-[requirement-to-evidence matrix](astrid-kernel-evidence-matrix.md) carries the
+[requirement-to-evidence matrix](../reference/astrid-kernel-evidence-matrix.md) carries the
 full mapping; in summary, at least:
 
 - forged handle, widened-rights transfer, out-of-range memory/IPC → rejected

@@ -8,9 +8,9 @@ Related documents:
 
 - [Astrid user and fleet ownership](astrid-user-fleet-ownership.md)
 - [Astrid Principal Store](astrid-principal-store.md)
-- [Astrid Principal Store Runtime Realization](astrid-principal-store-runtime.md)
-- [Astrid Hosted Volume Format 1](../crates/astrid-storage/formats/astrid-volume-v1.txt)
-- [Astrid Native Component Kernel](astrid-native-kernel.md)
+- [Astrid Principal Store Runtime Realization](../reference/astrid-principal-store-runtime.md)
+- [Astrid Hosted Volume Format 1](../../crates/astrid-storage/formats/astrid-volume-v1.txt)
+- [Astrid Native Component Kernel](../astrid-native-kernel.md)
 - [AOS Principal Linux Realm](https://github.com/unicity-aos/aos-ce/blob/main/docs/principal-linux-realm.md), an optional Linux capsule consumer
 
 ## 1. Product ruling

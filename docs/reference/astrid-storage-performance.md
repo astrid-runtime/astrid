@@ -6,7 +6,7 @@ performance. Component design documents define behavior and link here instead
 of copying results.
 
 Selected raw outputs are preserved in
-[`benchmarks/storage-io/`](benchmarks/storage-io/README.md).
+[`benchmarks/storage-io/`](../benchmarks/storage-io/README.md).
 
 The manually dispatched `Storage benchmark evidence` workflow runs the same
 content-bound harness on GitHub-hosted Linux x86-64, macOS arm64, and Windows
@@ -746,7 +746,7 @@ The canonical chunk DAG remains the logical identity and transfer form, and the
 packed arena path is the only runtime placement for hot large-file reads.
 
 The exact contract is documented in [Exact Physical
-Representations](astrid-physical-representations.md). Current staging covers
+Representations](../concepts/astrid-physical-representations.md). Current staging covers
 canonical Chunk records via packed arena ingest and keeps the File and
 ChunkTree records materialized.
 

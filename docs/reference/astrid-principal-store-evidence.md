@@ -5,9 +5,9 @@ Status: proposed falsifiability contract
 Last reviewed: 2026-07-25
 
 Companions:
-[principal-store architecture](astrid-principal-store.md),
-[physical representation contract](astrid-physical-representations.md), and
-[semantic representations](astrid-semantic-representations.md)
+[principal-store architecture](../architecture/astrid-principal-store.md),
+[physical representation contract](../concepts/astrid-physical-representations.md), and
+[semantic representations](../concepts/astrid-semantic-representations.md)
 
 This document separates three kinds of confidence:
 
@@ -552,7 +552,7 @@ evidence; it never reinterprets an old digest or signature in place.
 
 The operational audit log remains independent of the store and periodically
 anchors its signed chain head through the Evidence/root-CAS protocol in
-[Audit Chain Anchoring into Principal Storage](astrid-audit-store-anchoring.md).
+[Audit Chain Anchoring into Principal Storage](../decisions/astrid-audit-store-anchoring.md).
 The store therefore adds export and archaeological custody without becoming
 the only witness to its own correctness.
 

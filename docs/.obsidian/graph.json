@@ -1,0 +1,69 @@
+{
+  "collapse-filter": false,
+  "search": "",
+  "showTags": false,
+  "showAttachments": false,
+  "hideUnresolved": false,
+  "showOrphans": true,
+  "collapse-color-groups": false,
+  "colorGroups": [
+    {
+      "query": "path:architecture",
+      "color": {
+        "a": 1,
+        "rgb": 4280391410
+      }
+    },
+    {
+      "query": "path:concepts",
+      "color": {
+        "a": 1,
+        "rgb": 4283215690
+      }
+    },
+    {
+      "query": "path:decisions",
+      "color": {
+        "a": 1,
+        "rgb": 4294924066
+      }
+    },
+    {
+      "query": "path:guides",
+      "color": {
+        "a": 1,
+        "rgb": 4286611711
+      }
+    },
+    {
+      "query": "path:reference",
+      "color": {
+        "a": 1,
+        "rgb": 4289379276
+      }
+    },
+    {
+      "query": "path:operations",
+      "color": {
+        "a": 1,
+        "rgb": 4294940672
+      }
+    },
+    {
+      "query": "path:benchmarks",
+      "color": {
+        "a": 1,
+        "rgb": 4283782485
+      }
+    }
+  ],
+  "bookmarks": [],
+  "showArrow": false,
+  "textFade": 75,
+  "nodeSizeMultiplier": 1,
+  "lineSizeMultiplier": 1,
+  "repelForce": 1,
+  "centerStrength": 0.5,
+  "linkDistance": 250,
+  "scale": 1
+}

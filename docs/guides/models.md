@@ -379,7 +379,7 @@ loaded and `astrid capsule list` to see what is installed.
 
 ## See also
 
-- [Unified config schema](config.md) -- `config.toml` reference, including
+- [Unified config schema](../reference/config.md) -- `config.toml` reference, including
   the capsule env config overlay mechanism.
 - [Generating a gateway API client](gateway-client.md) -- HTTP access to the
   agent prompt endpoint that drives LLM turns.

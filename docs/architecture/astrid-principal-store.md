@@ -4,16 +4,16 @@ Status: proposed architecture and implementation contract
 
 Last reviewed: 2026-07-25
 
-Companions: [native-kernel scope](astrid-native-kernel.md),
+Companions: [native-kernel scope](../astrid-native-kernel.md),
 [AI-native OS workplan](astrid-ai-native-os-workplan.md),
-[kernel evidence matrix](astrid-kernel-evidence-matrix.md), and
-[principal-store evidence plan](astrid-principal-store-evidence.md).
+[kernel evidence matrix](../reference/astrid-kernel-evidence-matrix.md), and
+[principal-store evidence plan](../reference/astrid-principal-store-evidence.md).
 
 The pre-release constants and literature posture are recorded in the
-[storage freeze audit](astrid-storage-freeze-audit.md) and
-[storage FTO triage](astrid-storage-fto-triage.md). Deterministic computation
+[storage freeze audit](../decisions/astrid-storage-freeze-audit.md) and
+[storage FTO triage](../decisions/astrid-storage-fto-triage.md). Deterministic computation
 above the object layer follows the
-[conservation-of-computation contract](astrid-conservation-of-computation.md).
+[conservation-of-computation contract](../concepts/astrid-conservation-of-computation.md).
 
 ## 1. Decision
 
@@ -230,7 +230,7 @@ rebuild and fault injection rather than treating either as later cleanup.
 
 The implemented engine contract, compatibility oracle, native cutover, and
 durable host-file realization are maintained in
-[Principal Store Engine Realization](astrid-principal-store-engine.md).
+[Principal Store Engine Realization](../reference/astrid-principal-store-engine.md).
 
 ## 6. Four identifiers, not one overloaded hash
 
@@ -278,7 +278,7 @@ produce a new `BlobId` for the same `ObjectId`. Logical roots do not change.
 
 The exact profile-bound BlobId grammar, representation catalogue, recovery
 leases, and accounting are specified in [Exact Physical
-Representations](astrid-physical-representations.md). Current content writes
+Representations](../concepts/astrid-physical-representations.md). Current content writes
 use packed arena ingest. Semantic equivalence remains a separate layer.
 
 ### 6.3 `SemanticId`
@@ -317,7 +317,7 @@ safe to serve across principals merely because their canonical values match.
 The complete substitution threat, registration authority, representation trust
 classes, generic streaming host boundary, image-capsule example, retention
 choices, and typed transformation graph are specified in [Semantic
-Representations](astrid-semantic-representations.md).
+Representations](../concepts/astrid-semantic-representations.md).
 
 ### 6.4 Capabilities and root authority
 
@@ -538,7 +538,7 @@ Physical duplicate admission stays below the guest API line. The first queued
 transaction receives the privileged insertion diagnostic for a shared object;
 later transactions do not expose whether their bytes were already present.
 Measured throughput and latency remain in
-[`astrid-storage-performance.md`](astrid-storage-performance.md).
+[`astrid-storage-performance.md`](../reference/astrid-storage-performance.md).
 
 ## 9. Provenance
 
@@ -797,9 +797,9 @@ or a typed principal-collision outcome.
 
 Clone/inheritance, rebalancing, deduplication economics, accounting, privacy,
 erasure, and retention continue in [Principal Store
-Operations](astrid-principal-store-operations.md). Host filesystem projection,
+Operations](../operations/astrid-principal-store-operations.md). Host filesystem projection,
 runtime integration, tensor-ready scaffolding, implementation order, open
 evidence questions, prior art, and the Astrid-specific synthesis continue in
-[Principal Store Runtime Realization](astrid-principal-store-runtime.md).
+[Principal Store Runtime Realization](../reference/astrid-principal-store-runtime.md).
 Contract-scoped equality, trusted encodings, and typed transformation routing
-continue in [Semantic Representations](astrid-semantic-representations.md).
+continue in [Semantic Representations](../concepts/astrid-semantic-representations.md).
