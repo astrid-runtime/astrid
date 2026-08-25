@@ -1,0 +1,132 @@
+name: Native kernel
+run-name: Native kernel (TCG emulator evidence only)
+
+on:
+  pull_request:
+    branches: [os/universal]
+    paths:
+      - 'kernel/**'
+      - '.github/workflows/native-kernel.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-kernel-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  split-checks:
+    name: Native split checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95.0"
+          targets: x86_64-unknown-none
+          components: rust-src, clippy, rustfmt
+
+      - name: Install nightly Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly
+          components: rust-src, clippy
+
+      - name: Run supported split checks
+        working-directory: kernel
+        run: |
+          rustup show
+          ./check.sh
+
+  qemu-tcg:
+    name: QEMU TCG boot (emulator evidence only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95.0"
+          targets: x86_64-unknown-none
+          components: rust-src, clippy, rustfmt
+
+      - name: Install nightly Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly
+          components: rust-src, clippy
+
+      - name: Install QEMU and OVMF
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf
+
+      - name: Require QEMU and a known OVMF pair
+        run: |
+          set -euo pipefail
+          command -v qemu-system-x86_64
+          qemu-system-x86_64 --version
+          # QEMU 11.0.2 does not support -print-datadir; do not probe it as a
+          # portability claim. Bind an explicit known pair from packaged paths.
+
+          code=""
+          vars=""
+          pairs="OVMF_CODE_4M.fd:OVMF_VARS_4M.fd OVMF_CODE.fd:OVMF_VARS.fd edk2-x86_64-code.fd:edk2-i386-vars.fd QEMU_EFI.fd:QEMU_VARS.fd"
+          dirs="/usr/share/OVMF /usr/share/qemu /usr/share/edk2/ovmf /usr/share/edk2-ovmf/x64 /usr/share/edk2-ovmf /usr/share/qemu/firmware"
+          for dir in $dirs; do
+            for pair in $pairs; do
+              code_name="${pair%%:*}"
+              vars_name="${pair##*:}"
+              if [[ -f "$dir/$code_name" && -f "$dir/$vars_name" ]]; then
+                code="$dir/$code_name"
+                vars="$dir/$vars_name"
+                break 2
+              fi
+            done
+          done
+          if [[ -z "$code" || -z "$vars" ]]; then
+            echo "No supported OVMF code/vars pair was installed; refusing to skip as success." >&2
+            find /usr/share/OVMF /usr/share/qemu /usr/share/edk2 /usr/share/edk2-ovmf -maxdepth 3 -type f -print 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "Using OVMF code=$code vars=$vars"
+          {
+            echo "ASTRID_QEMU_FIRMWARE_CODE=$code"
+            echo "ASTRID_QEMU_FIRMWARE_VARS=$vars"
+          } >> "$GITHUB_ENV"
+
+      - name: Boot under explicit TCG
+        working-directory: kernel
+        run: |
+          rustup show
+          # Functional/conformance evidence for the named emulator fixture only.
+          # No KVM, virtio/IOMMU, DMA, bare-metal, firmware-root, A/B, or first-owner claim.
+          # DETERMINISM FAIL is reported by ktest and is not a boot-assertion gate.
+          ./run.sh

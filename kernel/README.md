@@ -144,6 +144,16 @@ supported machine or an owner ceremony. Table header keys and
 `./run.sh` is the QEMU evidence. Image determinism is reported honestly
 and remains FAIL.
 
+### CI
+
+The dedicated `.github/workflows/native-kernel.yml` workflow runs for pull
+requests targeting `os/universal`. It invokes `./check.sh` for the supported
+stable/nightly split checks and `./run.sh` for explicit-TCG QEMU evidence.
+Root `ci.yml` still targets `main` and does not ingest this nested workspace.
+Do not run `cargo clippy --workspace` here. `DETERMINISM: FAIL` is reported
+by the QEMU job and is not a boot-assertion gate. That job is emulator
+evidence only and preserves the non-claims above.
+
 ## Toolchain
 
 Pinned to stable Rust 1.95.0. Interrupt handlers use stable naked-function
