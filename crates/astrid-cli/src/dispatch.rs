@@ -99,6 +99,7 @@ fn should_check_for_update(cli: &Cli) -> bool {
             cli.command,
             Some(
                 Commands::Update(_)
+                    | Commands::Hook(_)
                     | Commands::Completions(_)
                     | Commands::Mcp { .. }
                     | Commands::Init { offline: true, .. }
@@ -150,6 +151,7 @@ async fn dispatch_subcommand(
         Some(Commands::Voucher { command }) => commands::voucher::run(command),
         Some(Commands::Trust { command }) => commands::trust::run(command),
         Some(Commands::Audit(args)) => commands::audit::run(&args).await,
+        Some(Commands::Hook(args)) => commands::hook::run(args).await,
         Some(Commands::Budget { command }) => commands::budget::run(command),
         Some(Commands::Build {
             path,
@@ -453,6 +455,12 @@ async fn dispatch_mcp(command: McpCommands) -> Result<ExitCode> {
             workspace,
             request_timeout: _,
         } => commands::mcp::serve(None, workspace.as_deref()).await,
+        McpCommands::Attach { workspace } => {
+            commands::mcp::attach(None, workspace.as_deref()).await
+        },
+        McpCommands::Gateway => commands::mcp::gateway(None).await,
+        McpCommands::Ready { format } => commands::mcp::ready(None, &format).await,
+        McpCommands::Gc => commands::mcp::gc(),
     }
 }
 

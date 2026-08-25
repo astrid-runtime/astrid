@@ -33,10 +33,57 @@
 //! for `mcp serve` (to the log file, else stderr) regardless of operator
 //! config, so a stray diagnostic can never corrupt the protocol stream.
 
+// The persistent gateway uses Unix-domain sockets. Keep those implementations
+// out of non-Unix builds while preserving the CLI command surface with an
+// actionable unsupported-target error.
+#[cfg(unix)]
+mod attach;
+#[cfg(not(unix))]
+mod attach {
+    use std::path::Path;
+    use std::process::ExitCode;
+
+    use anyhow::Result;
+
+    pub(crate) async fn run(
+        _principal: Option<&str>,
+        _workspace: Option<&Path>,
+    ) -> Result<ExitCode> {
+        anyhow::bail!("MCP gateway attach is only supported on Unix hosts")
+    }
+}
 mod elicit;
 mod form_elicitation;
+#[cfg(unix)]
+mod gateway;
+#[cfg(not(unix))]
+mod gateway {
+    use std::process::ExitCode;
+
+    use anyhow::Result;
+
+    pub(crate) async fn run(_principal: Option<&str>) -> Result<ExitCode> {
+        anyhow::bail!("MCP gateway is only supported on Unix hosts")
+    }
+}
 mod grant;
 mod ingress;
+#[cfg(unix)]
+mod lifecycle;
+#[cfg(not(unix))]
+mod lifecycle {
+    use std::process::ExitCode;
+
+    use anyhow::Result;
+
+    pub(crate) async fn ready(_principal: Option<&str>, _format: &str) -> Result<ExitCode> {
+        anyhow::bail!("MCP gateway readiness is only supported on Unix hosts")
+    }
+
+    pub(crate) fn gc() -> Result<ExitCode> {
+        anyhow::bail!("MCP gateway cleanup is only supported on Unix hosts")
+    }
+}
 mod mrtr;
 // Parent-death detection reads `getppid()` (Unix-only); the module and its use
 // site are target-gated so the CLI still compiles on non-Unix targets.
@@ -46,6 +93,13 @@ mod readiness;
 mod server;
 mod session_guard;
 mod watch;
+
+#[allow(unused_imports)]
+pub(crate) use attach::run as attach;
+#[allow(unused_imports)]
+pub(crate) use gateway::run as gateway;
+#[allow(unused_imports)]
+pub(crate) use lifecycle::{gc, ready};
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -138,6 +192,16 @@ pub(crate) async fn serve(
     // not `--workspace` (the host project).
     let cwd = std::env::current_dir().context("failed to read mcp serve cwd")?;
     let daemon_root = mcp_serve_daemon_root(&cwd, workspace);
+    let workspace_context = workspace
+        .map(std::fs::canonicalize)
+        .transpose()
+        .with_context(|| {
+            workspace.map_or_else(
+                || "failed to resolve MCP workspace".to_owned(),
+                |path| format!("failed to resolve MCP workspace {}", path.display()),
+            )
+        })?
+        .unwrap_or_else(|| cwd.clone());
     crate::commands::daemon::ensure_daemon_quiet("mcp-serve", Some(&daemon_root))
         .await
         .context("failed to ensure Astrid daemon for `astrid mcp serve`")?;
@@ -191,6 +255,7 @@ pub(crate) async fn serve(
         Arc::new(Mutex::new(client)),
         caller.clone(),
         daemon_root.clone(),
+        workspace_context,
     );
 
     // `rmcp::transport::stdio()` yields the (stdin, stdout) pair the MCP

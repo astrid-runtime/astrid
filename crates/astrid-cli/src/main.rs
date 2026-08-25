@@ -47,12 +47,33 @@ mod workspace_layout;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let parsed = cli::Cli::parse();
-    if workspace_layout::initialize(parsed.workspace_state_dir.clone()).is_err() {
-        eprintln!("error: workspace layout was already initialized");
-        return ExitCode::from(1);
+    let parsed = match cli::Cli::try_parse() {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let hook_invocation = raw_args_include_hook();
+            let usage_error = error.use_stderr();
+            let exit_code = error.exit_code();
+            if hook_invocation && usage_error {
+                // Host hook runners must never interpret clap's usage exit 2
+                // as a policy denial. Keep the protocol fail-open even when
+                // the invocation itself is malformed.
+                astrid_emit::write_continue_line();
+            }
+            let _ = error.print();
+            if hook_invocation && usage_error {
+                return commands::hook::failure_exit_code();
+            }
+            return ExitCode::from(u8::try_from(exit_code.clamp(0, 255)).unwrap_or(1));
+        },
+    };
+    let hook_invocation = matches!(&parsed.command, Some(cli::Commands::Hook(_)));
+    if !hook_invocation {
+        if workspace_layout::initialize(parsed.workspace_state_dir.clone()).is_err() {
+            eprintln!("error: workspace layout was already initialized");
+            return ExitCode::from(1);
+        }
+        bootstrap::init_logging(&parsed);
     }
-    bootstrap::init_logging(&parsed);
 
     // Resolve and validate the process-wide principal ONCE, before any
     // socket connection. Every IPC message the process sends stamps
@@ -62,16 +83,41 @@ async fn main() -> ExitCode {
     match principal::resolve_process(parsed.principal.as_deref()) {
         Ok(p) => principal::set(p),
         Err(e) => {
+            if hook_invocation {
+                astrid_emit::write_continue_line();
+            }
             eprintln!("{}", theme::Theme::error(&format!("error: {e:#}")));
-            return ExitCode::from(1);
+            return if hook_invocation {
+                commands::hook::failure_exit_code()
+            } else {
+                ExitCode::from(1)
+            };
         },
     }
 
     match dispatch::dispatch(parsed).await {
         Ok(code) => code,
         Err(e) => {
+            if hook_invocation {
+                astrid_emit::write_continue_line();
+            }
             eprintln!("{}", theme::Theme::error(&format!("error: {e:#}")));
-            ExitCode::from(1)
+            if hook_invocation {
+                commands::hook::failure_exit_code()
+            } else {
+                ExitCode::from(1)
+            }
         },
     }
+}
+
+/// Return whether the raw process arguments contain the hidden hook command.
+///
+/// Clap validates the complete command tree before it can construct a
+/// [`cli::Cli`], so malformed hook arguments are the one path where the
+/// parsed command is unavailable. An exact-token check is deliberately used:
+/// values such as `--session hook` are not a command and must retain normal
+/// clap exit semantics.
+fn raw_args_include_hook() -> bool {
+    std::env::args().skip(1).any(|arg| arg == "hook")
 }

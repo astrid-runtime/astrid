@@ -301,13 +301,14 @@ state = ["only expected temp key files are created or removed"]
 evidence = ["keypair transcript and key directory listing"]
 
 [scenarios.mcp_bounded_smoke]
-status = "covered"
+status = "mapped"
 surfaces = ["cli"]
 auth = ["agent"]
 success = ["mcp serve starts with a fake bounded client and exits cleanly"]
 denial = ["invalid client request or missing caps is rejected"]
 state = ["MCP server process is terminated deterministically"]
 evidence = ["MCP transcript and process cleanup artifact"]
+remaining = ["persistent mcp attach, gateway, ready, and gc lifecycle paths are mapped but need a hosted gateway harness"]
 
 [scenarios.model_principal_isolation]
 status = "covered"

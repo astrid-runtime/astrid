@@ -17,7 +17,7 @@
 //!
 //! # Wire contract (with the shipped sage validator)
 //!
-//! The published payload is an [`IpcPayload::RawJson`] object with
+//! The generic published payload is an [`IpcPayload::RawJson`] object with
 //! exactly these six fields, matching sage's `HookEnvelope`
 //! deserialize shape byte-for-byte:
 //!
@@ -32,10 +32,12 @@
 //! }
 //! ```
 //!
-//! `session_id` and `token` are claim-only transport fields that sage
-//! authenticates (KV token match) and then strips before it republishes
-//! the canonical event. `principal_id` rides inside the body **and** is
-//! stamped on the IPC message via `publish-as` for diagnostic
+//! Host-specific callers may add top-level event metadata through
+//! [`HostHookEnvValues`]; the standalone binary never does so and remains
+//! this six-field pipe. `session_id` and `token` are claim-only transport fields
+//! that sage authenticates (KV token match) and then strips before it
+//! republishes the canonical event. `principal_id` rides inside the body
+//! **and** is stamped on the IPC message via `publish-as` for diagnostic
 //! correctness; sage authenticates identity via the KV token, not via
 //! claimed-vs-attributed comparison.
 
@@ -81,6 +83,45 @@ pub struct Args {
     /// required.
     #[arg(long = "topic", value_name = "TOPIC")]
     pub topic_flag: Option<String>,
+}
+
+/// Default wait for a policy hook that needs the broker to accept its frame.
+/// Observation hooks pass `0` to make the transport fire-and-forget.
+pub const DEFAULT_POLICY_TIMEOUT_MS: u64 = 1_000;
+
+/// Validate a host/session/event segment before putting it in a bus topic.
+///
+/// These values originate in a host hook payload or command line. Keeping
+/// the check at this boundary prevents a caller from smuggling additional
+/// topic segments into the fixed hook route.
+fn validate_topic_segment(name: &str, value: &str) -> Result<()> {
+    if value.is_empty() || value.len() > 64 {
+        anyhow::bail!("{name} must be 1-64 ASCII characters");
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        anyhow::bail!("{name} must contain only ASCII letters, digits, '_' or '-'");
+    }
+    Ok(())
+}
+
+/// Derive the host hook topic used by the thin `astrid hook` command.
+///
+/// Every host route carries the session as a topic segment. Codex and the
+/// other host runners subscribe to their own `{host}.v1.hook.*.*` namespace;
+/// the envelope itself remains the six-field [`build_envelope`] contract.
+///
+/// # Errors
+/// Returns an error when any segment is empty, too long, or contains a topic
+/// separator/control character.
+pub fn hook_topic(host: &str, session: &str, event: &str) -> Result<String> {
+    validate_topic_segment("host", host)?;
+    validate_topic_segment("session", session)?;
+    validate_topic_segment("event", event)?;
+
+    Ok(format!("{host}.v1.hook.{session}.{event}"))
 }
 
 impl Args {
@@ -239,6 +280,34 @@ pub fn build_envelope(
     })
 }
 
+/// Add optional host-hook metadata to the six-field transport envelope.
+///
+/// The generic `astrid-emit` path deliberately remains the six-field sage
+/// contract. Host adapters use this extension when their runner needs the
+/// event and workspace at the top level (rather than hidden in the opaque
+/// payload). `workspace_id` is omitted when no workspace was supplied so the
+/// receiving runner can distinguish "not provided" from an empty identifier.
+#[must_use]
+fn build_envelope_with_host_metadata(
+    hook: &str,
+    payload: &str,
+    env: &HostHookEnvValues<'_>,
+) -> Value {
+    let mut envelope = build_envelope(hook, payload, env.principal_id, env.session_id, env.token);
+    if let Some(object) = envelope.as_object_mut() {
+        if let Some(event) = env.event {
+            object.insert("event".to_string(), Value::String(event.to_string()));
+        }
+        if let Some(workspace_id) = env.workspace_id {
+            object.insert(
+                "workspace_id".to_string(),
+                Value::String(workspace_id.to_string()),
+            );
+        }
+    }
+    envelope
+}
+
 /// The three required environment variables, captured as owned strings.
 /// All three are set on the agent child's environment by the spawning
 /// kernel; a missing or empty value means `astrid-emit` was invoked
@@ -272,6 +341,19 @@ fn env_lookup(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
+/// Read the hook token supplied by the host runner.
+///
+/// The runner mints and persists this token once per session. Hook events only
+/// echo it; this helper deliberately never generates a replacement token.
+///
+/// # Errors
+/// Returns an error when `ASTRID_HOOK_TOKEN` is missing or empty.
+pub fn hook_token_from_env() -> Result<String> {
+    env_lookup("ASTRID_HOOK_TOKEN").ok_or_else(|| {
+        anyhow::anyhow!("required environment variable ASTRID_HOOK_TOKEN is missing or empty")
+    })
+}
+
 /// Core, testable logic: given a topic, stdin payload, the three env
 /// values, and an [`Emitter`], build the envelope and publish it.
 ///
@@ -300,6 +382,26 @@ pub async fn emit<E: Emitter>(
     }
 }
 
+/// Publish one host-specific hook envelope with top-level event metadata.
+///
+/// This keeps the generic [`emit`] contract stable for sage-compatible
+/// producers while allowing Codex and similar runners to deserialize their
+/// required `event` and optional `workspace_id` fields directly.
+pub async fn emit_host_hook<E: Emitter>(
+    emitter: &E,
+    topic: &str,
+    stdin_payload: &str,
+    env: &HostHookEnvValues<'_>,
+) -> Outcome {
+    let hook = derive_hook(topic);
+    let envelope = build_envelope_with_host_metadata(hook, stdin_payload, env);
+
+    match emitter.publish(topic, envelope, env.principal_id).await {
+        Ok(()) => Outcome::ok(),
+        Err(e) => Outcome::fail(format!("astrid-emit: failed to publish on {topic}: {e:#}")),
+    }
+}
+
 /// Borrowed view of the three env values passed into [`emit`]. Keeps the
 /// `emit` signature stable while letting both `run` (owned `HookEnv`)
 /// and tests (string literals) supply the values without cloning.
@@ -311,6 +413,24 @@ pub struct HookEnvValues<'a> {
     pub session_id: &'a str,
     /// `ASTRID_HOOK_TOKEN`.
     pub token: &'a str,
+}
+
+/// Borrowed view of the transport values plus the host metadata required by
+/// a host-specific runner such as Codex. The optional workspace remains
+/// omitted from the wire object when it is unavailable.
+#[derive(Debug, Clone, Copy)]
+pub struct HostHookEnvValues<'a> {
+    /// `ASTRID_PRINCIPAL_ID`.
+    pub principal_id: &'a str,
+    /// `ASTRID_SESSION_ID`.
+    pub session_id: &'a str,
+    /// `ASTRID_HOOK_TOKEN`.
+    pub token: &'a str,
+    /// Host event name, when the host-specific hook ingress needs it at the
+    /// top level of the envelope.
+    pub event: Option<&'a str>,
+    /// Host workspace identifier, when one is available.
+    pub workspace_id: Option<&'a str>,
 }
 
 /// Read stdin to EOF as a UTF-8 string (lossy — invalid sequences become
@@ -338,6 +458,65 @@ fn write_continue() {
     let mut out = std::io::stdout();
     let _ = writeln!(out, "{CONTINUE_LINE}");
     let _ = out.flush();
+}
+
+/// Write the hook protocol's unconditional continue response.
+///
+/// The CLI's `hook` wrapper uses this when argument/environment validation
+/// fails before it can invoke [`run_topic`].
+pub fn write_continue_line() {
+    write_continue();
+}
+
+/// Read stdin, publish one hook envelope, and emit the fixed continue line.
+///
+/// A timeout of `0` means fire-and-forget: the client still performs the
+/// connect/write/flush sequence, but does not wait on an outer timer. A
+/// non-zero timeout bounds that sequence for policy hooks. Every outcome is
+/// fail-soft and writes `{"continue":true}` before returning.
+pub async fn run_topic(topic: &str, env: &HookEnvValues<'_>, timeout_ms: u64) -> ExitCode {
+    let stdin_payload = read_stdin_lossy();
+    let publish = emit(&SocketEmitter, topic, &stdin_payload, env);
+    let outcome = if timeout_ms == 0 {
+        publish.await
+    } else {
+        match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), publish).await {
+            Ok(outcome) => outcome,
+            Err(_) => Outcome::fail(format!(
+                "astrid-emit: timed out after {timeout_ms} ms publishing on {topic}"
+            )),
+        }
+    };
+
+    write_continue();
+    if let Some(msg) = outcome.stderr {
+        eprintln!("{msg}");
+    }
+    outcome.exit
+}
+
+/// Read stdin, publish one host-specific envelope, and emit the fixed
+/// continue line. This uses the same connect/write/close [`SocketEmitter`]
+/// as the standalone `astrid-emit` binary.
+pub async fn run_host_topic(topic: &str, env: &HostHookEnvValues<'_>, timeout_ms: u64) -> ExitCode {
+    let stdin_payload = read_stdin_lossy();
+    let publish = emit_host_hook(&SocketEmitter, topic, &stdin_payload, env);
+    let outcome = if timeout_ms == 0 {
+        publish.await
+    } else {
+        match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), publish).await {
+            Ok(outcome) => outcome,
+            Err(_) => Outcome::fail(format!(
+                "astrid-emit: timed out after {timeout_ms} ms publishing on {topic}"
+            )),
+        }
+    };
+
+    write_continue();
+    if let Some(msg) = outcome.stderr {
+        eprintln!("{msg}");
+    }
+    outcome.exit
 }
 
 /// Process entry point. Parses args, reads env + stdin, publishes via the
@@ -477,6 +656,28 @@ mod tests {
     }
 
     #[test]
+    fn hook_topic_uses_codex_session_route() {
+        assert_eq!(
+            hook_topic("codex", "session-1", "pre_tool_use").expect("valid hook route"),
+            "codex.v1.hook.session-1.pre_tool_use"
+        );
+    }
+
+    #[test]
+    fn hook_topic_includes_session_for_every_host() {
+        assert_eq!(
+            hook_topic("claude", "session-1", "after_tool_use").expect("valid hook route"),
+            "claude.v1.hook.session-1.after_tool_use"
+        );
+    }
+
+    #[test]
+    fn hook_topic_rejects_topic_injection() {
+        let error = hook_topic("codex", "session.bad", "event").expect_err("dot is invalid");
+        assert!(error.to_string().contains("session"));
+    }
+
+    #[test]
     fn build_envelope_has_exactly_six_fields() {
         let env = build_envelope("before_tool_call", "{\"k\":1}", "alice", "s1", "tk");
         let obj = env.as_object().expect("envelope is a JSON object");
@@ -526,6 +727,52 @@ mod tests {
         assert_eq!(obj["principal_id"], "alice");
         assert_eq!(obj["session_id"], "s1");
         assert_eq!(obj["token"], "tk");
+    }
+
+    #[tokio::test]
+    async fn host_metadata_is_forwarded_at_top_level() {
+        let fake = FakeEmitter::recording();
+        let host_env = HostHookEnvValues {
+            principal_id: "alice",
+            session_id: "s1",
+            token: "tk",
+            event: Some("pre_tool_use"),
+            workspace_id: Some("cwd-42"),
+        };
+        let outcome = emit_host_hook(
+            &fake,
+            "codex.v1.hook.s1.pre_tool_use",
+            "{\"tool_name\":\"Bash\"}",
+            &host_env,
+        )
+        .await;
+
+        assert!(outcome.stderr.is_none());
+        let (topic, envelope, principal) = fake.take();
+        assert_eq!(topic, "codex.v1.hook.s1.pre_tool_use");
+        assert_eq!(principal, "alice");
+        assert_eq!(envelope["event"], "pre_tool_use");
+        assert_eq!(envelope["workspace_id"], "cwd-42");
+        assert_eq!(envelope["principal_id"], "alice");
+        assert_eq!(envelope["session_id"], "s1");
+        assert_eq!(envelope["token"], "tk");
+    }
+
+    #[tokio::test]
+    async fn host_metadata_omits_workspace_when_unset() {
+        let fake = FakeEmitter::recording();
+        let host_env = HostHookEnvValues {
+            principal_id: "alice",
+            session_id: "s1",
+            token: "tk",
+            event: Some("session_start"),
+            workspace_id: None,
+        };
+        let _ = emit_host_hook(&fake, "codex.v1.hook.s1.session_start", "{}", &host_env).await;
+
+        let (_, envelope, _) = fake.take();
+        assert_eq!(envelope["event"], "session_start");
+        assert!(envelope.get("workspace_id").is_none());
     }
 
     #[tokio::test]

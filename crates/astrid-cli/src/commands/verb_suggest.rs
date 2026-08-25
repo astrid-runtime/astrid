@@ -153,6 +153,7 @@ mod tests {
         "voucher",
         "trust",
         "audit",
+        "hook",
         "budget",
         "session",
         "capsule",

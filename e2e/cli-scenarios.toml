@@ -489,6 +489,30 @@ status = "covered"
 mode = "long_running"
 principal = "agent"
 
+[commands."mcp attach"]
+scenario = "mcp_bounded_smoke"
+status = "mapped"
+mode = "long_running"
+principal = "agent"
+
+[commands."mcp gateway"]
+scenario = "mcp_bounded_smoke"
+status = "mapped"
+mode = "long_running"
+principal = "agent"
+
+[commands."mcp ready"]
+scenario = "mcp_bounded_smoke"
+status = "mapped"
+mode = "read"
+principal = "agent"
+
+[commands."mcp gc"]
+scenario = "mcp_bounded_smoke"
+status = "mapped"
+mode = "mutating"
+principal = "agent"
+
 [commands."distro apply"]
 scenario = "distro_lifecycle"
 status = "waived"
