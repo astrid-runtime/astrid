@@ -3,12 +3,18 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
 
-from check_campaign_ci_triggers import check_repository
+from check_campaign_ci_triggers import (
+    OWNED_WORKFLOWS,
+    check_repository,
+    load_workflows,
+    validate_workflows,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,31 +33,184 @@ class CampaignCiTriggerTests(unittest.TestCase):
     def test_pull_request_requires_campaign_branch(self):
         temp_root = self._copy_workflows()
         workflow = temp_root / ".github" / "workflows" / "ci.yml"
-        workflow.write_text(workflow.read_text(encoding="utf-8").replace(
-            "branches: [main, os/universal]", "branches: [main]", 1
-        ), encoding="utf-8")
+        workflow.write_text(
+            workflow.read_text(encoding="utf-8").replace(
+                "branches: [main, os/universal]", "branches: [main]", 1
+            ),
+            encoding="utf-8",
+        )
         errors = check_repository(temp_root)
-        self.assertTrue(any("ci.yml: pull_request.branches is missing os/universal" in error for error in errors))
+        self.assertTrue(
+            any(
+                "ci.yml: pull_request.branches is missing os/universal" in error
+                for error in errors
+            )
+        )
+
+    def test_pull_request_requires_main_branch(self):
+        temp_root = self._copy_workflows()
+        workflow = temp_root / ".github" / "workflows" / "pr-checks.yml"
+        workflow.write_text(
+            workflow.read_text(encoding="utf-8").replace(
+                "branches: [main, os/universal]", "branches: [os/universal]", 1
+            ),
+            encoding="utf-8",
+        )
+        errors = check_repository(temp_root)
+        self.assertTrue(
+            any(
+                "pr-checks.yml: pull_request.branches is missing main" in error
+                for error in errors
+            )
+        )
 
     def test_codex_filter_is_rejected(self):
         temp_root = self._copy_workflows()
         workflow = temp_root / ".github" / "workflows" / "pr-checks.yml"
-        forbidden_branch = "codex/" + "**"
-        workflow.write_text(workflow.read_text(encoding="utf-8").replace(
-            "branches: [main, os/universal]",
-            f"branches: [main, os/universal, {forbidden_branch}]",
-            1,
-        ), encoding="utf-8")
+        workflow.write_text(
+            workflow.read_text(encoding="utf-8").replace(
+                "branches: [main, os/universal]",
+                "branches: [main, os/universal, codex/**]",
+                1,
+            ),
+            encoding="utf-8",
+        )
         errors = check_repository(temp_root)
-        self.assertTrue(any("pr-checks.yml: pull_request.branches must not include codex branch filters" in error for error in errors))
+        self.assertTrue(
+            any(
+                "pr-checks.yml: pull_request.branches must not include codex branch filters"
+                in error
+                for error in errors
+            )
+        )
+
+    def test_branchless_pull_request_is_rejected(self):
+        temp_root = self._copy_workflows()
+        workflow = temp_root / ".github" / "workflows" / "pr-checks.yml"
+        workflow.write_text(
+            workflow.read_text(encoding="utf-8").replace(
+                "    branches: [main, os/universal]\n", "", 1
+            ),
+            encoding="utf-8",
+        )
+        errors = check_repository(temp_root)
+        self.assertTrue(
+            any("pr-checks.yml: pull_request.branches is required" in error for error in errors)
+        )
+
+    def test_all_owned_branchless_pull_request_is_rejected(self):
+        drop_pr_branches = re.compile(
+            r"(  pull_request:\n(?:    [^\n]+\n)*?)    branches: \[main, os/universal\]\n"
+        )
+        workflows = load_workflows(ROOT)
+        mutated = {
+            name: (
+                drop_pr_branches.sub(r"\1", text, count=1)
+                if name in OWNED_WORKFLOWS
+                else text
+            )
+            for name, text in workflows.items()
+        }
+        errors = validate_workflows(mutated)
+        required = {
+            f"{name}: pull_request.branches is required" for name in OWNED_WORKFLOWS
+        }
+        self.assertTrue(required.issubset(set(errors)), errors)
+
+    def test_branches_ignore_on_ci_is_rejected(self):
+        temp_root = self._copy_workflows()
+        workflow = temp_root / ".github" / "workflows" / "ci.yml"
+        workflow.write_text(
+            workflow.read_text(encoding="utf-8").replace(
+                "    branches: [main, os/universal]",
+                "    branches-ignore: [main]",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        errors = check_repository(temp_root)
+        self.assertTrue(
+            any(
+                "ci.yml: pull_request.branches-ignore is not allowed" in error
+                for error in errors
+            )
+        )
+
+    def test_branches_ignore_on_scorecard_is_rejected(self):
+        temp_root = self._copy_workflows()
+        workflow = temp_root / ".github" / "workflows" / "scorecard.yml"
+        workflow.write_text(
+            workflow.read_text(encoding="utf-8").replace(
+                "    branches: [main]", "    branches-ignore: [main]", 1
+            ),
+            encoding="utf-8",
+        )
+        errors = check_repository(temp_root)
+        self.assertTrue(
+            any(
+                "scorecard.yml: push.branches-ignore is not allowed" in error
+                for error in errors
+            )
+        )
+
+    def test_oci_branch_narrowing_is_rejected(self):
+        temp_root = self._copy_workflows()
+        workflow = temp_root / ".github" / "workflows" / "oci-amd64.yml"
+        text = workflow.read_text(encoding="utf-8")
+        workflow.write_text(
+            text.replace(
+                "  pull_request:\n    paths:",
+                "  pull_request:\n    branches: [main, os/universal]\n    paths:",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        errors = check_repository(temp_root)
+        self.assertTrue(
+            any(
+                "oci-amd64.yml: pull_request.branches must remain unfiltered" in error
+                for error in errors
+            )
+        )
+
+    def test_ci_docs_path_is_rejected(self):
+        temp_root = self._copy_workflows()
+        workflow = temp_root / ".github" / "workflows" / "ci.yml"
+        text = workflow.read_text(encoding="utf-8")
+        workflow.write_text(
+            text.replace(
+                "      - '**.rs'\n",
+                "      - '**.rs'\n      - 'docs/**'\n",
+            ),
+            encoding="utf-8",
+        )
+        errors = check_repository(temp_root)
+        self.assertTrue(
+            any(
+                "ci.yml: pull_request.paths must not include docs coverage" in error
+                or "ci.yml: push.paths must not include docs coverage" in error
+                for error in errors
+            )
+        )
 
     def test_changelog_docs_and_changes_are_required(self):
-        temp_root = self._copy_workflows()
-        workflow = temp_root / ".github" / "workflows" / "changelog.yml"
-        text = workflow.read_text(encoding="utf-8").replace('      - "docs/**"\n', "")
-        workflow.write_text(text, encoding="utf-8")
-        errors = check_repository(temp_root)
-        self.assertTrue(any("changelog.yml: pull_request.paths is missing docs/**" in error for error in errors))
+        for required_path in ("docs/**", "changes/**"):
+            with self.subTest(required_path=required_path):
+                temp_root = self._copy_workflows()
+                workflow = temp_root / ".github" / "workflows" / "changelog.yml"
+                text = workflow.read_text(encoding="utf-8").replace(
+                    f'      - "{required_path}"\n', ""
+                )
+                workflow.write_text(text, encoding="utf-8")
+                errors = check_repository(temp_root)
+                self.assertTrue(
+                    any(
+                        f"changelog.yml: pull_request.paths is missing {required_path}"
+                        in error
+                        for error in errors
+                    ),
+                    errors,
+                )
 
     def test_push_campaign_branch_is_allowlisted(self):
         temp_root = self._copy_workflows()
@@ -61,7 +220,13 @@ class CampaignCiTriggerTests(unittest.TestCase):
         )
         workflow.write_text(text, encoding="utf-8")
         errors = check_repository(temp_root)
-        self.assertTrue(any("scorecard.yml: os/universal push coverage is not authorized" in error for error in errors))
+        self.assertTrue(
+            any(
+                "scorecard.yml: protected workflow gained campaign branch expansion"
+                in error
+                for error in errors
+            )
+        )
 
 
 if __name__ == "__main__":

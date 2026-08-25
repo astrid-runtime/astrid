@@ -16,6 +16,8 @@ from pathlib import Path
 CAMPAIGN_BRANCH = "os/universal"
 MAIN_BRANCH = "main"
 CODEX_BRANCH_PREFIX = "codex/"
+DOCS_PATH = "docs/**"
+CHANGES_PATH = "changes/**"
 
 OWNED_WORKFLOWS = frozenset(
     {
@@ -39,6 +41,7 @@ PUSH_CAMPAIGN_WORKFLOWS = frozenset(
     }
 )
 PROTECTED_WORKFLOWS = frozenset({"release.yml", "scorecard.yml", "native-kernel.yml"})
+OCI_WORKFLOWS = frozenset({"oci-amd64.yml", "oci-arm64.yml"})
 
 
 def _event_block(text: str, event: str) -> list[str] | None:
@@ -46,6 +49,7 @@ def _event_block(text: str, event: str) -> list[str] | None:
 
     lines = text.splitlines()
     event_pattern = re.compile(rf"^  {re.escape(event)}:\s*(?:#.*)?$")
+    sibling_pattern = re.compile(r"^  [^\s#].*:")
     top_level_pattern = re.compile(r"^[^\s#].*:")
 
     for index, line in enumerate(lines):
@@ -53,7 +57,9 @@ def _event_block(text: str, event: str) -> list[str] | None:
             continue
         end = len(lines)
         for candidate, candidate_line in enumerate(lines[index + 1 :], index + 1):
-            if top_level_pattern.match(candidate_line):
+            if top_level_pattern.match(candidate_line) or sibling_pattern.match(
+                candidate_line
+            ):
                 end = candidate
                 break
         return lines[index + 1 : end]
@@ -108,8 +114,30 @@ def _event_field_values(text: str, event: str, field: str) -> list[str] | None:
     return None if block is None else _field_values(block, field)
 
 
+def _has_event(text: str, event: str) -> bool:
+    return _event_block(text, event) is not None
+
+
 def _has_codex_filter(branches: list[str]) -> bool:
-    return any(branch.startswith(CODEX_BRANCH_PREFIX) for branch in branches)
+    return any(
+        branch.startswith(CODEX_BRANCH_PREFIX) or branch.startswith("codex")
+        for branch in branches
+    )
+
+
+def _is_docs_path(path: str) -> bool:
+    return path == DOCS_PATH or path.startswith("docs/")
+
+
+def _reject_branch_ignore(errors: list[str], name: str, text: str) -> None:
+    for event in ("pull_request", "push"):
+        if _event_field_values(text, event, "branches-ignore"):
+            errors.append(f"{name}: {event}.branches-ignore is not allowed")
+
+
+def _reject_codex(errors: list[str], name: str, event: str, branches: list[str]) -> None:
+    if _has_codex_filter(branches):
+        errors.append(f"{name}: {event}.branches must not include codex branch filters")
 
 
 def validate_workflows(workflows: Mapping[str, str]) -> list[str]:
@@ -118,34 +146,58 @@ def validate_workflows(workflows: Mapping[str, str]) -> list[str]:
     errors: list[str] = []
 
     for name, text in sorted(workflows.items()):
-        pull_request_branches = _event_field_values(text, "pull_request", "branches")
-        if pull_request_branches is not None:
-            if name in PROTECTED_WORKFLOWS:
-                if CAMPAIGN_BRANCH in pull_request_branches or _has_codex_filter(pull_request_branches):
-                    errors.append(f"{name}: protected workflow has a campaign pull_request branch")
-            else:
-                missing = {MAIN_BRANCH, CAMPAIGN_BRANCH}.difference(pull_request_branches)
-                if missing:
-                    errors.append(
-                        f"{name}: pull_request.branches is missing {', '.join(sorted(missing))}"
-                    )
-                if _has_codex_filter(pull_request_branches):
-                    errors.append(f"{name}: pull_request.branches must not include codex branch filters")
+        _reject_branch_ignore(errors, name, text)
 
+        pull_request_branches = _event_field_values(text, "pull_request", "branches")
         push_branches = _event_field_values(text, "push", "branches")
+
+        if name in PROTECTED_WORKFLOWS:
+            for event, branches in (
+                ("pull_request", pull_request_branches),
+                ("push", push_branches),
+            ):
+                if branches and (
+                    CAMPAIGN_BRANCH in branches or _has_codex_filter(branches)
+                ):
+                    errors.append(
+                        f"{name}: protected workflow gained campaign branch expansion"
+                    )
+            continue
+
+        if name in OCI_WORKFLOWS:
+            for event in ("pull_request", "push"):
+                if _event_field_values(text, event, "branches"):
+                    errors.append(
+                        f"{name}: {event}.branches must remain unfiltered"
+                    )
+            continue
+
+        if pull_request_branches is not None:
+            missing = {MAIN_BRANCH, CAMPAIGN_BRANCH}.difference(pull_request_branches)
+            if missing:
+                errors.append(
+                    f"{name}: pull_request.branches is missing {', '.join(sorted(missing))}"
+                )
+            _reject_codex(errors, name, "pull_request", pull_request_branches)
+
         if push_branches is not None:
             if MAIN_BRANCH not in push_branches:
                 errors.append(f"{name}: push.branches must preserve main")
             if CAMPAIGN_BRANCH in push_branches and name not in PUSH_CAMPAIGN_WORKFLOWS:
                 errors.append(f"{name}: os/universal push coverage is not authorized")
-            if _has_codex_filter(push_branches):
-                errors.append(f"{name}: push.branches must not include codex branch filters")
+            _reject_codex(errors, name, "push", push_branches)
 
-        if name in PROTECTED_WORKFLOWS:
-            for event in ("pull_request", "push"):
-                branches = _event_field_values(text, event, "branches")
-                if branches and (CAMPAIGN_BRANCH in branches or _has_codex_filter(branches)):
-                    errors.append(f"{name}: protected workflow gained campaign branch expansion")
+    for name in OWNED_WORKFLOWS:
+        text = workflows.get(name)
+        if text is None:
+            errors.append(f"{name}: owned workflow is missing")
+            continue
+        if not _has_event(text, "pull_request"):
+            errors.append(f"{name}: pull_request event is required")
+            continue
+        branches = _event_field_values(text, "pull_request", "branches")
+        if branches is None:
+            errors.append(f"{name}: pull_request.branches is required")
 
     for name in PUSH_CAMPAIGN_WORKFLOWS:
         text = workflows.get(name)
@@ -156,15 +208,13 @@ def validate_workflows(workflows: Mapping[str, str]) -> list[str]:
         if branches is None or CAMPAIGN_BRANCH not in branches:
             errors.append(f"{name}: push.branches must include os/universal")
 
-    for name in OWNED_WORKFLOWS:
+    for name in OCI_WORKFLOWS:
         text = workflows.get(name)
         if text is None:
-            errors.append(f"{name}: owned workflow is missing")
+            errors.append(f"{name}: OCI workflow is missing")
             continue
-        for event in ("pull_request", "push"):
-            branches = _event_field_values(text, event, "branches")
-            if branches and _has_codex_filter(branches):
-                errors.append(f"{name}: {event}.branches must not include codex branch filters")
+        if not _has_event(text, "pull_request"):
+            errors.append(f"{name}: pull_request event is required")
 
     changelog = workflows.get("changelog.yml")
     if changelog is None:
@@ -174,9 +224,18 @@ def validate_workflows(workflows: Mapping[str, str]) -> list[str]:
         if paths is None:
             errors.append("changelog.yml: pull_request.paths is missing")
         else:
-            for required_path in ("docs/**", "changes/**"):
+            for required_path in (DOCS_PATH, CHANGES_PATH):
                 if required_path not in paths:
-                    errors.append(f"changelog.yml: pull_request.paths is missing {required_path}")
+                    errors.append(
+                        f"changelog.yml: pull_request.paths is missing {required_path}"
+                    )
+
+    ci = workflows.get("ci.yml")
+    if ci is not None:
+        for event in ("pull_request", "push"):
+            paths = _event_field_values(ci, event, "paths") or []
+            if any(_is_docs_path(path) for path in paths):
+                errors.append(f"ci.yml: {event}.paths must not include docs coverage")
 
     return errors
 
