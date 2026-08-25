@@ -56,9 +56,11 @@ impl Selector {
 
     /// Recover the newest eligible pending trial or confirmed candidate.
     ///
-    /// A malformed/torn final frame with an all-zero tail is ignored by the
-    /// journal scanner. Any interior corruption becomes `Recovery`; this
-    /// method never silently chooses a later record over a damaged interior.
+    /// Rollback/truncation is accepted only for a canonical all-zero 256-byte
+    /// unpublished frame followed by an all-zero tail; any nonzero malformed
+    /// terminal frame becomes `Recovery`. Any interior corruption becomes
+    /// `Recovery`; this method never silently chooses a later record over a
+    /// damaged interior.
     pub fn recover(&self, journal: Journal, verified: VerifiedCandidates) -> BootDecision {
         let Ok(parsed) = journal.parse() else {
             return BootDecision::Recovery;
