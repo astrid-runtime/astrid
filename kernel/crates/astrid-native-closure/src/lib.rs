@@ -13,8 +13,10 @@
 
 mod codec;
 mod error;
+mod handoff;
 mod policy;
 mod region;
+mod root;
 mod types;
 mod verify;
 
@@ -25,13 +27,22 @@ mod sign;
 
 pub use codec::{decode_table, encode_table};
 pub use error::ClosureError;
+pub use handoff::{
+    AuthenticatedPolicyHandoff, HANDOFF_BODY_LEN, HANDOFF_DOMAIN, HANDOFF_LEN, HANDOFF_MAGIC,
+    HANDOFF_PREFIX_LEN, HANDOFF_SIGNED_LEN, HANDOFF_VERSION, HandoffContext, PolicyHandoff,
+};
 pub use policy::{EMULATOR_KERNEL_VERIFY_KEY, EMULATOR_SYSGEN_VERIFY_KEY, TrustedPolicy};
 pub use region::{ClosureTableRegion, PAGE_SIZE, prove_pages_readable};
+pub use root::RootVerifier;
 pub use types::{
-    BoundIdentities, CURRENT_FLOOR, ClosureArtifact, ClosureKind, DualClosureKeys,
-    DualClosureTable, EMPTY_SYSGEN, GenerationFloor, MeasuredIdentity, TABLE_LEN,
+    BootContextBinding, BoundIdentities, CURRENT_FLOOR, ClosureArtifact, ClosureKind,
+    DualClosureKeys, DualClosureTable, EMPTY_SYSGEN, GenerationFloor, LoaderIdentity,
+    LoaderMeasurement, MeasuredIdentity, PolicyGeneration, TABLE_LEN,
 };
-pub use verify::verify_table;
+pub use verify::{verify_policy_handoff, verify_table};
+
+#[cfg(any(test, feature = "sign"))]
+pub use handoff::sign_policy_handoff;
 
 #[cfg(any(test, feature = "sign"))]
 pub use fixture::{FixtureRole, fixture_signing_key};
@@ -43,5 +54,7 @@ extern crate std;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_handoff;
 #[cfg(test)]
 mod tests_region;

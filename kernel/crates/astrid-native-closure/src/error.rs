@@ -14,6 +14,10 @@ pub enum ClosureError {
     SameKey,
     Collision,
     NotEmpty,
+    RootKeyMismatch,
+    RootSignatureInvalid,
+    PolicyGenerationStale,
+    BindingMismatch,
 }
 
 impl ClosureError {
@@ -30,6 +34,10 @@ impl ClosureError {
             Self::SameKey => "same_key",
             Self::Collision => "collision",
             Self::NotEmpty => "not_empty",
+            Self::RootKeyMismatch => "root_key",
+            Self::RootSignatureInvalid => "root_signature",
+            Self::PolicyGenerationStale => "policy_generation_stale",
+            Self::BindingMismatch => "binding",
         }
     }
 }

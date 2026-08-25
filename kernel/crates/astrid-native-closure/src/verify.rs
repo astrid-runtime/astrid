@@ -7,7 +7,9 @@ use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::codec::decode_table;
 use crate::error::ClosureError;
+use crate::handoff::{AuthenticatedPolicyHandoff, HandoffContext, decode_handoff, encode_unsigned};
 use crate::policy::TrustedPolicy;
+use crate::root::RootVerifier;
 use crate::types::{
     BoundIdentities, ClosureArtifact, ClosureKind, DualClosureTable, signed_message,
 };
@@ -87,4 +89,48 @@ fn verifies(key: &[u8; 32], msg: &[u8], signature: &[u8; 64]) -> bool {
     };
     let sig = Signature::from_bytes(signature);
     vk.verify_strict(msg, &sig).is_ok()
+}
+
+/// Verify a root-signed loader policy against explicit root and boot context.
+///
+/// The envelope is untrusted until the root signature passes. Root inputs
+/// provide the accepted subordinate keys and independent rollback minima; the
+/// caller supplies the live image/table/loader/context bindings to prevent
+/// replay into another boot.
+pub fn verify_policy_handoff(
+    bytes: &[u8],
+    root: &RootVerifier,
+    expected: &HandoffContext,
+) -> Result<AuthenticatedPolicyHandoff, ClosureError> {
+    let decoded = decode_handoff(bytes)?;
+    if decoded.root_verify != root.root_verify() {
+        return Err(ClosureError::RootKeyMismatch);
+    }
+
+    let unsigned = encode_unsigned(&decoded.root_verify, &decoded.policy);
+    if !verifies(&decoded.root_verify, &unsigned, &decoded.signature) {
+        return Err(ClosureError::RootSignatureInvalid);
+    }
+
+    let policy = decoded.policy;
+    if policy.kernel_verify == policy.sysgen_verify
+        || policy.kernel_verify == decoded.root_verify
+        || policy.sysgen_verify == decoded.root_verify
+    {
+        return Err(ClosureError::SameKey);
+    }
+    if policy.kernel_floor < root.kernel_min() || policy.sysgen_floor < root.sysgen_min() {
+        return Err(ClosureError::Stale);
+    }
+    if policy.policy_generation < root.min_policy_generation() {
+        return Err(ClosureError::PolicyGenerationStale);
+    }
+    if policy.context != *expected {
+        return Err(ClosureError::BindingMismatch);
+    }
+
+    Ok(AuthenticatedPolicyHandoff {
+        root_verify: decoded.root_verify,
+        policy,
+    })
 }
