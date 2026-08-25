@@ -10,8 +10,8 @@ Decision state: preserve current behavior; add an exact composition model first;
 reserve Tensor Logic execution for a later, explicitly activated backend
 
 Execution and evidence are tracked in the
-[AI-Native OS Workplan](astrid-ai-native-os-workplan.md). Hardware-role terminology
-is defined by the [Driver Domain Contract](astrid-driver-domain-contract.md).
+[AI-Native OS Workplan](architecture/astrid-ai-native-os-workplan.md). Hardware-role terminology
+is defined by the [Driver Domain Contract](architecture/astrid-driver-domain-contract.md).
 
 ## 1. Executive decision
 
@@ -1087,7 +1087,7 @@ authority checks, budgets, revocation, and fault containment.
 
 Reference: [wgpu documentation](https://docs.rs/wgpu/latest/wgpu/)
 
-Reference: [Astrid Driver Domain Contract](astrid-driver-domain-contract.md)
+Reference: [Astrid Driver Domain Contract](architecture/astrid-driver-domain-contract.md)
 
 A driver can be implemented in WASM only if a smaller trusted substrate gives it
 the device primitives it needs. WASM does not make a GPU self-driving: DMA can

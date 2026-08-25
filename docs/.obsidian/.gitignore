@@ -1,0 +1,10 @@
+workspace.json
+workspace-mobile.json
+cache/
+plugins/
+hotkeys.json
+community-plugins.json.bak
+graph.json.bak
+local-state
+snippets/
+themes/

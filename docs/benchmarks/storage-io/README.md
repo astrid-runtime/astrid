@@ -2,7 +2,7 @@
 
 The canonical interpretation, code-state ledger, claim boundaries, and
 reproduction contract live in
-[`../../astrid-storage-performance.md`](../../astrid-storage-performance.md).
+[`../../reference/astrid-storage-performance.md`](../../reference/astrid-storage-performance.md).
 This directory contains evidence only:
 
 - selected `astrid-storage-io-benchmark-v1` historical JSON outputs with raw

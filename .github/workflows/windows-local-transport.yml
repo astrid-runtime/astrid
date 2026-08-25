@@ -2,7 +2,7 @@ name: Windows local transport
 
 on:
   push:
-    branches: [main]
+    branches: [main, os/universal]
     paths:
       - 'crates/astrid-core/**'
       - 'crates/astrid-capsule/**'
@@ -11,7 +11,7 @@ on:
       - 'Cargo.lock'
       - '.github/workflows/windows-local-transport.yml'
   pull_request:
-    branches: [main]
+    branches: [main, os/universal]
     paths:
       - 'crates/astrid-core/**'
       - 'crates/astrid-capsule/**'

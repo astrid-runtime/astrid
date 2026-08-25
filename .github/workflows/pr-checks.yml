@@ -2,7 +2,7 @@ name: PR Checks
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, os/universal]
     types: [opened, edited, reopened, labeled, unlabeled, synchronize]
 
 permissions:
@@ -400,6 +400,22 @@ jobs:
         with:
           egress-policy: audit
 
+      - name: Checkout trusted linked-issue checker
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted-linked-issue
+          sparse-checkout: scripts/check_linked_issue.py
+          sparse-checkout-cone-mode: false
+
+      - name: Checkout introducing linked-issue checker
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: bootstrap-linked-issue
+          sparse-checkout: scripts/check_linked_issue.py
+          sparse-checkout-cone-mode: false
+
       - name: Check for linked issue
         env:
           GH_TOKEN: ${{ github.token }}
@@ -409,8 +425,19 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
-          if echo "$PR_BODY" | grep -qiE '(close[sd]?|fix(e[sd])?|resolve[sd]?)\s+#[0-9]+'; then
-            echo "PR references an issue."
+          CHECKER=""
+          if [ -f trusted-linked-issue/scripts/check_linked_issue.py ]; then
+            CHECKER=trusted-linked-issue/scripts/check_linked_issue.py
+          elif [ -f bootstrap-linked-issue/scripts/check_linked_issue.py ]; then
+            CHECKER=bootstrap-linked-issue/scripts/check_linked_issue.py
+          else
+            echo "::error::Linked-issue checker is missing from the trusted base commit and the introducing PR bootstrap path."
+            exit 1
+          fi
+
+          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.md"
+          if python3 "$CHECKER" "$RUNNER_TEMP/pr-body.md"; then
+            echo "PR references an issue with a recognized Tracking, Refs, or closing line."
             exit 0
           fi
 
@@ -474,7 +501,7 @@ jobs:
           fi
 
           echo "::error::Every PR must be linked to an issue unless a documented traceability exception applies."
-          echo "::error::Use 'Closes #N' in the PR body, link an issue via the GitHub sidebar, add one of: no-issue, maintenance, docs-only, release, deps, dependencies, or modify only .github/workflows/."
+          echo "::error::Use a dedicated line such as 'Tracking #N', 'Refs #N', or a GitHub closing keyword like 'Closes #N'. Incidental or negated phrases such as 'This is not Closes #1564' do not count. You may also link an issue via the GitHub sidebar, add one of: no-issue, maintenance, docs-only, release, deps, dependencies, or modify only .github/workflows/."
           exit 1
 
   account-age:
