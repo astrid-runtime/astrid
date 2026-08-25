@@ -1,0 +1,17 @@
+[package]
+name = "astrid-native-closure"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "astrid_native_closure"
+path = "src/lib.rs"
+
+[features]
+default = []
+sign = []
+
+[dependencies]
+blake3 = { version = "=1.8.5", default-features = false, features = ["pure"] }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["zeroize"] }
