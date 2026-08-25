@@ -20,7 +20,7 @@ mod verify;
 
 #[cfg(any(test, feature = "sign"))]
 mod fixture;
-#[cfg(any(test, feature = "sign"))]
+#[cfg(test)]
 mod sign;
 
 pub use error::GenerationError;

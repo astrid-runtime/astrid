@@ -23,6 +23,18 @@ cargo clippy -p astrid-native-closure --all-targets --all-features --locked -- -
 echo "== stable cargo clippy -p astrid-native-closure --target x86_64-unknown-none =="
 cargo clippy -p astrid-native-closure --target x86_64-unknown-none --locked -- -D warnings
 
+echo "== stable cargo test -p astrid-system-generation --locked =="
+cargo test -p astrid-system-generation --locked
+
+echo "== stable cargo check -p astrid-system-generation --target x86_64-unknown-none (no default features) =="
+cargo check -p astrid-system-generation --target x86_64-unknown-none --no-default-features --locked
+
+echo "== stable cargo clippy -p astrid-system-generation (host, all features) =="
+cargo clippy -p astrid-system-generation --all-targets --all-features --locked -- -D warnings
+
+echo "== stable cargo clippy -p astrid-system-generation --target x86_64-unknown-none (no default features) =="
+cargo clippy -p astrid-system-generation --target x86_64-unknown-none --no-default-features --locked -- -D warnings
+
 echo "== stable cargo test -p ktest --locked =="
 cargo test -p ktest --locked
 

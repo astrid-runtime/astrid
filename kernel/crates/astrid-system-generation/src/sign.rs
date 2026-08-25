@@ -5,7 +5,6 @@ use ed25519_dalek::{Signer, SigningKey};
 use crate::codec::signature_message;
 use crate::types::SignedSystemGeneration;
 
-#[allow(dead_code)]
 pub(crate) fn sign_manifest(
     signing_key: &SigningKey,
     manifest: crate::SystemGenerationManifest,
