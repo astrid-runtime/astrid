@@ -42,6 +42,8 @@ PUSH_CAMPAIGN_WORKFLOWS = frozenset(
     }
 )
 PROTECTED_WORKFLOWS = frozenset({"release.yml", "scorecard.yml", "native-kernel.yml"})
+NATIVE_KERNEL_PR_BRANCHES = [CAMPAIGN_BRANCH]
+NATIVE_KERNEL_ON_EVENTS = frozenset({"pull_request"})
 OCI_WORKFLOWS = frozenset({"oci-amd64.yml", "oci-arm64.yml"})
 RELEASE_PUSH_TAGS = ("v[0-9]+.*", "!v[0-9]+.*-nightly.*")
 SCORECARD_ON_EVENTS = frozenset({"branch_protection_rule", "push", "schedule"})
@@ -174,6 +176,26 @@ def _protected_workflow_errors(name: str, text: str) -> list[str]:
     push_branches = _event_field_values(text, "push", "branches")
     pull_request_branches = _event_field_values(text, "pull_request", "branches")
     push_tags = _event_field_values(text, "push", "tags")
+
+    if name == "native-kernel.yml":
+        if not _has_event(text, "pull_request"):
+            errors.append("native-kernel.yml: pull_request event is required")
+        elif pull_request_branches is None:
+            errors.append("native-kernel.yml: pull_request.branches is required")
+        elif pull_request_branches != NATIVE_KERNEL_PR_BRANCHES:
+            errors.append(
+                "native-kernel.yml: pull_request.branches must be exactly [os/universal]"
+            )
+        if _has_event(text, "push"):
+            errors.append("native-kernel.yml: push event is not allowed")
+        unexpected = [
+            event for event in _on_events(text) if event not in NATIVE_KERNEL_ON_EVENTS
+        ]
+        if unexpected:
+            errors.append(
+                "native-kernel.yml: unexpected on event " + ", ".join(unexpected)
+            )
+        return errors
 
     if name == "scorecard.yml":
         if not _has_event(text, "push"):

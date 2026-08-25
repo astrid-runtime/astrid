@@ -309,6 +309,47 @@ class CampaignCiTriggerTests(unittest.TestCase):
             errors,
         )
 
+    def test_native_kernel_trigger_shape_is_pinned(self):
+        temp_root = self._copy_workflows()
+        workflow = temp_root / ".github" / "workflows" / "native-kernel.yml"
+        errors = check_repository(temp_root)
+        self.assertFalse(
+            any(error.startswith("native-kernel.yml:") for error in errors),
+            errors,
+        )
+
+        workflow.write_text(
+            workflow.read_text(encoding="utf-8").replace(
+                "branches: [os/universal]",
+                "branches: [main, os/universal]",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        errors = check_repository(temp_root)
+        self.assertTrue(
+            any(
+                "native-kernel.yml: pull_request.branches must be exactly [os/universal]"
+                in error
+                for error in errors
+            ),
+            errors,
+        )
+
+        workflow.write_text(
+            workflow.read_text(encoding="utf-8").replace(
+                "  pull_request:\n",
+                "  push:\n    branches: [main]\n  pull_request:\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        errors = check_repository(temp_root)
+        self.assertTrue(
+            any("native-kernel.yml: push event is not allowed" in error for error in errors),
+            errors,
+        )
+
     def test_push_campaign_branch_is_allowlisted(self):
         temp_root = self._copy_workflows()
         workflow = temp_root / ".github" / "workflows" / "scorecard.yml"
