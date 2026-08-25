@@ -212,7 +212,10 @@ def recover_volume(path):
                 raise VolumeFormatError("invalid volume metadata transaction envelope")
             apply_volume_mutations(regions, volume_metadata_mutations(payload))
         else:
-            if name != VOLUME_COMMIT_REGION or logical_offset != 0 or payload:
+            # Format-1 commits may carry the hosted region-map snapshot. The
+            # independent reader replays the preceding records and does not
+            # need to interpret that optional acceleration payload.
+            if name != VOLUME_COMMIT_REGION or logical_offset != 0:
                 raise VolumeFormatError("invalid volume commit boundary")
             committed_regions = {
                 name: bytes(value) for name, value in regions.items()

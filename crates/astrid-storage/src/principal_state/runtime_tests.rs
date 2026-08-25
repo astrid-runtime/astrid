@@ -1196,7 +1196,7 @@ async fn hosted_volume_retires_a_torn_tail_and_reopens_committed_roots() {
 
 #[cfg(not(target_os = "windows"))]
 #[tokio::test]
-async fn hosted_volume_rejects_interior_container_corruption() {
+async fn hosted_volume_rejects_interior_container_corruption_on_header_fallback() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
     let store = open_runtime_principal_store(&home, unlimited_quota())
@@ -1209,6 +1209,17 @@ async fn hosted_volume_rejects_interior_container_corruption() {
     let mut bytes = std::fs::read(&path).unwrap();
     bytes[8] ^= 0x80;
     std::fs::write(&path, bytes).unwrap();
+
+    let reopened = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .expect("valid footer should bypass interior journal scanning");
+    reopened.engine.close().unwrap();
+    drop(reopened);
+
+    let mut bytes = std::fs::read(&path).unwrap();
+    *bytes.last_mut().unwrap() ^= 0x80;
+    std::fs::write(&path, bytes).unwrap();
+
     let Err(error) = open_runtime_principal_store(&home, unlimited_quota()).await else {
         panic!("corrupt Astrid volume unexpectedly reopened");
     };

@@ -67,6 +67,7 @@ cap-std = "4.0.2"
 caseless = { workspace = true }
 fs2 = { workspace = true }
 libc = { workspace = true }
+nix = { workspace = true }
 unicode-normalization = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
