@@ -738,12 +738,14 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "subtle",
  "tempfile",
  "tokio",
  "toml",
  "tracing",
  "uuid",
+ "wat",
  "windows-sys 0.61.2",
 ]
 

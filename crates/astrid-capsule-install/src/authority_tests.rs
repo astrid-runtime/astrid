@@ -9,7 +9,7 @@ use astrid_core::dirs::{AstridHome, WorkspaceLayout};
 use astrid_core::identity::PrincipalUid;
 use astrid_crypto::KeyPair;
 use astrid_storage::{
-    KvQuotaResolver, PrincipalDirectory, RuntimePrincipalStore, StateOwner,
+    ContentName, KvQuotaResolver, PrincipalDirectory, RuntimePrincipalStore, StateOwner,
     open_runtime_principal_store_with_directory,
 };
 
@@ -20,6 +20,7 @@ use crate::{
     install_from_local_path_authorized_for_principal_with_layout, read_installed_authority,
     resolve_target_dir_for, unpack_and_install_authorized_for_principal_in_workspace,
     unpack_and_install_authorized_for_principal_with_layout, verify_installed_authority,
+    verify_installed_authority_with_store,
 };
 
 fn write_archive(path: &Path, name: &str, version: &str, capabilities: &str) {
@@ -221,7 +222,7 @@ fn installed_wasm_cannot_be_repointed_after_authority_approval() {
 
     let manifest =
         astrid_capsule::discovery::load_manifest(&output.target_dir.join("Capsule.toml")).unwrap();
-    verify_installed_authority(&home, &output.target_dir, &manifest).unwrap();
+    verify_installed_authority_with_store(&home, &output.target_dir, &manifest, &storage).unwrap();
     let authority = read_installed_authority(&home, &output.target_dir)
         .unwrap()
         .unwrap();
@@ -232,25 +233,32 @@ fn installed_wasm_cannot_be_repointed_after_authority_approval() {
         "the exact approved executable must be pinned in the kernel-owned receipt"
     );
 
-    // Swap both the pointer and the content-addressed bytes while leaving the
-    // approved manifest byte-identical. A name-only authority receipt would
-    // accept this after restart; the executable pin must reject it.
+    // Swap the pointer and publish different bytes under the new catalog name
+    // while leaving the approved manifest byte-identical. A name-only
+    // authority receipt would accept this after restart; the executable pin
+    // must reject it.
     let malicious_wasm = wat::parse_str("(component (core module))").unwrap();
     let malicious_hash = blake3::hash(&malicious_wasm).to_hex().to_string();
-    std::fs::write(
-        home.bin_dir().join(format!("{malicious_hash}.wasm")),
-        malicious_wasm,
-    )
-    .unwrap();
+    storage
+        .content()
+        .put(
+            &StateOwner::System,
+            &ContentName::new(format!("bin/{malicious_hash}.wasm")).unwrap(),
+            &malicious_wasm,
+        )
+        .unwrap();
     let meta_path = output.target_dir.join("meta.json");
     let mut meta: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
     meta["wasm_hash"] = serde_json::Value::String(malicious_hash);
     std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
 
-    let error = verify_installed_authority(&home, &output.target_dir, &manifest).unwrap_err();
+    let error =
+        verify_installed_authority_with_store(&home, &output.target_dir, &manifest, &storage)
+            .unwrap_err();
     assert!(
-        error.to_string().contains("WASM integrity check failed"),
+        error.to_string().contains("approved")
+            || error.to_string().contains("integrity check failed"),
         "unexpected authority error: {error:#}"
     );
 }

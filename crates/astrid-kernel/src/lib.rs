@@ -31,6 +31,9 @@ mod capsule_adversarial_tests;
 mod capsules_loaded;
 #[cfg(test)]
 mod capsules_loaded_tests;
+#[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
+#[path = "catalog_authority_tests.rs"]
+mod catalog_authority_tests;
 /// Grant-on-first-use consent handler (issue #998).
 ///
 /// Native-only: reuses the management-API admin grant machinery
@@ -58,6 +61,8 @@ mod principal_home_migration;
 mod principal_log_migration;
 #[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
 mod runtime_policy_tests;
+#[cfg(not(target_family = "wasm"))]
+mod runtime_tree_admit;
 /// The Unix Domain Socket manager. Unix-only: binds the `UnixListener` and
 /// acquires the singleton advisory lock.
 #[cfg(unix)]
@@ -1128,6 +1133,15 @@ impl Kernel {
                 .await?;
             }
 
+            // The host runtime tree crosses the same singleton-owned
+            // migrate-only window as the released layout sources. Admission
+            // runs for fresh, legacy, and existing-v2 homes; a matching
+            // receipt avoids payload reads and catalog publication on boot.
+            #[cfg(not(target_family = "wasm"))]
+            if let Some(store) = principal_store.as_ref() {
+                runtime_tree_admit::admit(&home, store).await?;
+            }
+
             // The released profile, when present, is now represented by the
             // completed migration ledger. Apply the normal idempotent admin
             // seed before deriving the root principal identity from its key.
@@ -1373,6 +1387,27 @@ impl Kernel {
         Ok(())
     }
 
+    /// Verify an installed capsule against the authority source selected by
+    /// this runtime. Native daemon loads use the packed System catalog; the
+    /// unbound compatibility path retains its POSIX executable check.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn verify_installed_authority_for_runtime(
+        &self,
+        dir: &Path,
+        manifest: &astrid_capsule_types::manifest::CapsuleManifest,
+    ) -> anyhow::Result<()> {
+        if let Some(store) = self.principal_store.as_ref() {
+            astrid_capsule_install::verify_installed_authority_with_store(
+                &self.astrid_home,
+                dir,
+                manifest,
+                store,
+            )
+        } else {
+            astrid_capsule_install::verify_installed_authority(&self.astrid_home, dir, manifest)
+        }
+    }
+
     /// Verify a path-only capsule cache against the durable package registry.
     ///
     /// The extracted directory is disposable projection state; its owner,
@@ -1494,7 +1529,7 @@ impl Kernel {
                     manifest.package.name
                 );
             }
-            astrid_capsule_install::verify_installed_authority(&self.astrid_home, &dir, &manifest)
+            self.verify_installed_authority_for_runtime(&dir, &manifest)
                 .map_err(|error| {
                     anyhow::anyhow!(
                         "capsule '{}' exceeds or cannot prove its installed authority: {error:#}",
@@ -1794,11 +1829,7 @@ impl Kernel {
                     "capsule replacement source is outside the explicit workspace portal and has no durable registry authority"
                 );
             }
-            astrid_capsule_install::verify_installed_authority(
-                &self.astrid_home,
-                source_dir,
-                &manifest,
-            )?;
+            self.verify_installed_authority_for_runtime(source_dir, &manifest)?;
         }
         self.verify_workspace_component_paths(source_dir, &manifest)?;
         if !manifest.mcp_servers.is_empty() {

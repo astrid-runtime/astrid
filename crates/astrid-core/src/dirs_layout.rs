@@ -137,6 +137,15 @@ impl AstridHome {
     /// Hosted Astrid volume; bare metal implements the same path-free contract.
     #[must_use]
     pub fn storage_volume_path(&self) -> PathBuf {
+        self.root().join("volume")
+    }
+
+    /// Released pre-root-volume path accepted only during one-time promotion.
+    ///
+    /// New stores never use this path. Storage opening moves a regular file
+    /// found here to [`Self::storage_volume_path`] before serving the home.
+    #[must_use]
+    pub fn legacy_storage_volume_path(&self) -> PathBuf {
         self.var_dir().join("astrid.volume")
     }
 
@@ -181,8 +190,13 @@ impl AstridHome {
         }
         reject_automatic_windows_layout_one()?;
         self.preflight_layout_v2_paths()?;
-        if std::fs::symlink_metadata(self.storage_volume_path()).is_ok() {
-            inventory_regular_file(&self.storage_volume_path())?;
+        for path in [
+            self.storage_volume_path(),
+            self.legacy_storage_volume_path(),
+        ] {
+            if std::fs::symlink_metadata(&path).is_ok() {
+                inventory_regular_file(&path)?;
+            }
         }
         let intent = LayoutMigrationRecordV1::capture(self, target)?;
         ensure_migration_capacity(&self.var_dir(), intent.material.source.bytes)?;

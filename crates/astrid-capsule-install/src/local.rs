@@ -718,7 +718,7 @@ pub(crate) fn install_from_local_path_internal(
     // Source-direct content-addressing. Nothing under target_dir is
     // touched yet — if any of these fail the existing install (if
     // any) is intact.
-    let wasm = content_address_wasm(home, source_dir, &manifest)
+    let wasm = content_address_wasm(home, source_dir, &manifest, options.storage.as_deref())
         .context("failed to content-address WASM binary")?;
     installed_authority.wasm_hash_pinned = true;
     installed_authority.approved_wasm_hash = wasm.as_ref().map(|w| w.hash.clone());

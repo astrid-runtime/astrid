@@ -82,6 +82,43 @@ fn write_minimal_capsule(base: &std::path::Path, name: &str, version: &str) {
     .unwrap();
 }
 
+#[test]
+fn storage_install_publishes_wasm_to_system_catalog() {
+    let capsule_dir = tempfile::tempdir().unwrap();
+    let bytes = wat::parse_str("(component)").unwrap();
+    std::fs::write(
+        capsule_dir.path().join("Capsule.toml"),
+        "[package]\nname = \"install-catalog\"\nversion = \"1.0.0\"\n\n[[component]]\nid = \"main\"\nfile = \"main.wasm\"\n",
+    )
+    .unwrap();
+    std::fs::write(capsule_dir.path().join("main.wasm"), &bytes).unwrap();
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let storage = install_store(&home);
+    install_from_local_path(capsule_dir.path(), &home, install_options(&storage))
+        .expect("storage-backed install should publish WASM");
+
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    let name = astrid_storage::ContentName::new(format!("bin/{hash}.wasm")).unwrap();
+    let descriptor = storage
+        .content()
+        .describe(&StateOwner::System, &name)
+        .unwrap()
+        .expect("system catalog WASM entry");
+    let catalog_bytes = storage
+        .content()
+        .read_range(&StateOwner::System, &name, 0, descriptor.logical_bytes())
+        .unwrap()
+        .expect("system catalog WASM bytes");
+
+    assert_eq!(catalog_bytes, bytes);
+    assert!(
+        !home.bin_dir().join(format!("{hash}.wasm")).exists(),
+        "storage-backed install must not create a second durable POSIX WASM store"
+    );
+}
+
 #[cfg(windows)]
 struct FreshWindowsHome {
     path: std::path::PathBuf,

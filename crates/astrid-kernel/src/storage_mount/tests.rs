@@ -3,6 +3,9 @@ use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 
 use super::*;
 
+#[path = "runtime_tree_tests.rs"]
+mod runtime_tree_tests;
+
 async fn callback(
     lease: &StorageMountLeaseV1,
     token: &str,

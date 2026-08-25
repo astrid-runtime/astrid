@@ -56,6 +56,7 @@ mod owner_migration;
 mod projection_name_tests;
 #[cfg(all(test, feature = "legacy-surrealkv"))]
 mod release_fixture_tests;
+mod runtime_tree;
 mod staging;
 mod volume_migration;
 
@@ -75,6 +76,7 @@ use format_amendment::{
     store_metadata,
 };
 use native_io::atomic_write;
+pub use runtime_tree::RuntimeTreeEntry;
 pub use staging::{
     NativeContentStagingArea, ReadyStagedContent, StagedContentId, StagedContentWriter,
 };
@@ -495,6 +497,43 @@ impl RuntimePrincipalStore {
         Arc::clone(&self.content)
     }
 
+    /// Admit the durable native runtime tree into the system-owned catalog.
+    ///
+    /// The source is walked without following redirects. The live runtime
+    /// socket and hosted volume remain POSIX-owned; every other regular file,
+    /// including sentinels and bootstrap binaries, is published under its
+    /// slash-separated relative path through the packed content arena. Other
+    /// special entries are skipped. This is an explicit admission operation,
+    /// never an open-time conversion of existing volume regions.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the source tree contains a redirect,
+    /// cannot be read, or packed publication fails.
+    pub fn admit_runtime_tree(
+        &self,
+        runtime_root: impl AsRef<std::path::Path>,
+    ) -> StorageResult<()> {
+        runtime_tree::admit(self, runtime_root.as_ref())
+    }
+
+    /// Scan the native runtime tree without reading file payloads.
+    ///
+    /// The scan uses the exact exclusions and path validation applied by
+    /// [`Self::admit_runtime_tree`]. Kernel migration receipts therefore do
+    /// not maintain a second, drifting definition of the packed tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the source tree contains a redirect,
+    /// cannot be read, or has an unrepresentable timestamp.
+    pub fn scan_runtime_tree(
+        &self,
+        runtime_root: impl AsRef<std::path::Path>,
+    ) -> StorageResult<Vec<RuntimeTreeEntry>> {
+        runtime_tree::scan(runtime_root.as_ref())
+    }
+
     /// Return the durable per-principal installed-capsule registry.
     ///
     /// The registry is backed by the same owner-root content projection as KV;
@@ -712,7 +751,7 @@ async fn open_runtime_principal_store_with_options(
     principals: PrincipalDirectory,
     policy: DurableEnginePolicy<StateOwner>,
 ) -> StorageResult<RuntimePrincipalStore> {
-    if home.storage_volume_path().exists() {
+    if volume_migration::existing_volume_available(home)? {
         let (engine, receipt) =
             volume_migration::open_existing(home, policy)?.ok_or_else(|| {
                 StorageError::Connection("Astrid volume disappeared while opening".to_owned())
@@ -906,3 +945,5 @@ pub async fn open_runtime_kv_with_directory(
 mod purge_tests;
 #[cfg(test)]
 mod runtime_tests;
+#[cfg(test)]
+mod volume_migration_tests;

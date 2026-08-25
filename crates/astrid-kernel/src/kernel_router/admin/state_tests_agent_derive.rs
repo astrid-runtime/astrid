@@ -12,8 +12,8 @@ use astrid_core::groups::{BUILTIN_ADMIN, BUILTIN_RESTRICTED};
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::PrincipalProfile;
 use astrid_events::kernel_api::{AdminResponseBody, AgentDeriveRequest};
-use astrid_storage::ScopedKvStore;
 use astrid_storage::env::{SECRET_KEY_PREFIX, principal_secret_namespace};
+use astrid_storage::{ContentName, ScopedKvStore, StateOwner};
 
 use crate::Kernel;
 
@@ -438,6 +438,21 @@ type = "string"
     .unwrap();
     crate::capsule_adversarial_tests::publish_without_running_lifecycle(&kernel, &source, &install)
         .expect("publish configuredness regression fixture");
+
+    // Native runtimes with a bound principal store load executable bytes from
+    // the System content catalog. Keep this fixture on that production path so
+    // the assertion below exercises reload's environment error wrapping,
+    // rather than the catalog-miss fail-closed guard.
+    let wasm = std::fs::read(install.join("main.wasm")).unwrap();
+    let wasm_hash = blake3::hash(&wasm).to_hex().to_string();
+    let catalog_name = ContentName::new(format!("bin/{wasm_hash}.wasm")).unwrap();
+    kernel
+        .principal_store
+        .as_ref()
+        .unwrap()
+        .content()
+        .put(&StateOwner::System, &catalog_name, &wasm)
+        .unwrap();
 
     let id = CapsuleId::new("astrid-capsule-openai-compat").unwrap();
     let error = kernel

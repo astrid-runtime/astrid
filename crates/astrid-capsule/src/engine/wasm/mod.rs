@@ -46,6 +46,10 @@ impl WorkspaceMountResolver for WorkspaceBranchResolver {
 mod bind_workers;
 #[allow(unreachable_pub)]
 pub(crate) mod bindings;
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "catalog_load_tests.rs"]
+mod catalog_load_tests;
+mod content_source;
 pub mod host;
 pub mod host_state;
 pub mod limits;
@@ -107,32 +111,6 @@ fn prune_old_logs(log_dir: &std::path::Path, max_days: u64) {
         {
             let _ = std::fs::remove_file(entry.path());
         }
-    }
-}
-
-/// Read the expected WASM hash from `meta.json` in the capsule directory.
-fn read_expected_wasm_hash(capsule_dir: &std::path::Path) -> Option<String> {
-    let meta_path = capsule_dir.join("meta.json");
-    let content = std::fs::read_to_string(&meta_path).ok()?;
-    let meta: serde_json::Value = serde_json::from_str(&content).ok()?;
-    meta.get("wasm_hash")?.as_str().map(String::from)
-}
-
-/// Resolve a content-addressed WASM binary from `lib/{hash}.wasm`.
-///
-/// Reads `meta.json` in the capsule dir to find the `wasm_hash` field,
-/// then resolves the path in the Astrid home `lib/` directory.
-fn resolve_content_addressed_wasm(capsule_dir: &std::path::Path) -> Option<PathBuf> {
-    let meta_path = capsule_dir.join("meta.json");
-    let content = std::fs::read_to_string(&meta_path).ok()?;
-    let meta: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let hash = meta.get("wasm_hash")?.as_str()?;
-    let home = astrid_core::dirs::AstridHome::resolve().ok()?;
-    let wasm_path = home.bin_dir().join(format!("{hash}.wasm"));
-    if wasm_path.exists() {
-        Some(wasm_path)
-    } else {
-        None
     }
 }
 
@@ -1951,15 +1929,31 @@ impl ExecutionEngine for WasmEngine {
             )
         })?;
 
-        let wasm_path = if component.path.is_absolute() {
-            component.path.clone()
+        let expected_hash = content_source::read_expected_hash(&self._capsule_dir);
+        #[cfg(not(target_family = "wasm"))]
+        let catalog_bytes =
+            content_source::catalog_bytes(ctx.principal_store.as_ref(), expected_hash.as_deref());
+        #[cfg(target_family = "wasm")]
+        let catalog_bytes = None;
+        let wasm_source = if let Some(bytes) = catalog_bytes {
+            content_source::WasmSource::Bytes(bytes)
+        } else if ctx.principal_store.is_some() {
+            let hash = expected_hash.as_deref().unwrap_or("<missing>");
+            return Err(CapsuleError::UnsupportedEntryPoint(format!(
+                "WASM catalog entry 'bin/{hash}.wasm' is missing; refusing to load from a host path"
+            )));
+        } else if component.path.is_absolute() {
+            content_source::WasmSource::Path(component.path.clone())
         } else {
             let local = self._capsule_dir.join(&component.path);
             if local.exists() {
-                local
+                content_source::WasmSource::Path(local)
             } else {
-                // WASM may be content-addressed in lib/ — check meta.json for hash.
-                resolve_content_addressed_wasm(&self._capsule_dir).unwrap_or(local)
+                // Compatibility fallback for homes not yet admitted to the
+                // packed catalog. New runtime loads prefer catalog bytes.
+                content_source::WasmSource::Path(
+                    content_source::host_path(expected_hash.as_deref()).unwrap_or(local),
+                )
             }
         };
 
@@ -1993,7 +1987,7 @@ impl ExecutionEngine for WasmEngine {
             wasm_config.insert(key, serde_json::Value::String(val));
         }
 
-        let wasm_hash = read_expected_wasm_hash(&self._capsule_dir)
+        let wasm_hash = expected_hash
             .map(crate::registry::WasmHash::from_raw)
             .unwrap_or_else(|| {
                 crate::registry::WasmHash::synthetic(
@@ -2101,13 +2095,16 @@ impl ExecutionEngine for WasmEngine {
             process_tracker_for_engine,
             persistent_registry_for_engine,
         ) = async {
-            let wasm_bytes = std::fs::read(&wasm_path).map_err(|e| {
-                CapsuleError::UnsupportedEntryPoint(format!("Failed to read WASM: {e}"))
-            })?;
+            let wasm_bytes = match wasm_source {
+                content_source::WasmSource::Bytes(bytes) => bytes,
+                content_source::WasmSource::Path(path) => std::fs::read(&path).map_err(|e| {
+                    CapsuleError::UnsupportedEntryPoint(format!("Failed to read WASM: {e}"))
+                })?,
+            };
 
             // BLAKE3 integrity verification. Fail-secure: no hash = no load.
             let actual_hash = blake3::hash(&wasm_bytes).to_hex().to_string();
-            match read_expected_wasm_hash(&capsule_dir_for_verify) {
+            match content_source::read_expected_hash(&capsule_dir_for_verify) {
                 Some(expected_hash) if actual_hash == expected_hash => {
                     // Hash matches — verified.
                 },

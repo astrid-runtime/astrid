@@ -32,6 +32,19 @@ fn test_home_root(dir: &tempfile::TempDir) -> PathBuf {
     }
 }
 
+#[test]
+fn storage_volume_path_is_at_runtime_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+
+    assert_eq!(home.storage_volume_path(), home.root().join("volume"));
+    assert_ne!(
+        home.storage_volume_path(),
+        home.legacy_storage_volume_path()
+    );
+    assert!(!home.storage_volume_path().starts_with(home.var_dir()));
+}
+
 fn parent_traversal_path() -> String {
     #[cfg(windows)]
     {
