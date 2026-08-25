@@ -2,11 +2,55 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::Arc;
+
+use crate::storage_model::{ObjectClass, ObjectFormatVersion, ObjectKind, RetentionPolicyId};
+use crate::volume::{AstridVolume, HostedFileVolume, VolumeRegion};
 
 use super::tests::{
     TEST_IDENTITY_SCHEME, TestEngine, TestIdentity, Utf8Codec, flip_byte, limits, open, transaction,
 };
 use super::*;
+
+#[derive(Clone, Copy, Debug)]
+struct AcceptCompactionProof;
+
+impl CompactionProofVerifier for AcceptCompactionProof {
+    fn verify(
+        &self,
+        facts: &CompactionFacts,
+        _policy: &ObjectRecord,
+        _proof: &ObjectRecord,
+    ) -> bool {
+        !facts.condemned().is_empty()
+    }
+}
+
+fn compaction_evidence(bytes: &[u8]) -> ObjectRecord {
+    ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        bytes.to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap()
+}
+
+fn open_volume(path: &std::path::Path) -> (Arc<dyn AstridVolume>, TestEngine) {
+    let volume_path = path.join("astrid.volume");
+    let volume: Arc<dyn AstridVolume> = HostedFileVolume::open(&volume_path).unwrap();
+    let engine = DurableEngine::open_volume(
+        Arc::clone(&volume),
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        DurableEnginePolicy::default(),
+    )
+    .unwrap();
+    (volume, engine)
+}
 
 fn frame_end(path: &std::path::Path, offset: u64) -> u64 {
     let mut file = File::open(path).unwrap();
@@ -200,6 +244,115 @@ fn startup_fallback_then_commit_reopens_without_root_conflict() {
             .any(|window| window == &newest.commit.as_bytes()[..]),
         "the rejected candidate frame must remain retained in the journal"
     );
+}
+
+#[test]
+fn startup_fallback_then_compaction_then_commit_reopens_without_root_conflict() {
+    let source = tempfile::tempdir().unwrap();
+    let (engine, first, newest, _newer_offset) = commit_pair(source.path());
+    let arena = source.path().join(ARENA_FILE);
+    let arena_len = std::fs::metadata(&arena).unwrap().len();
+    flip_byte(&arena, arena_len.saturating_sub(1));
+    drop(engine);
+
+    let recovered = open(source.path());
+    assert_eq!(recovered.root(&"alice".to_owned()).unwrap(), Some(first));
+    assert_eq!(recovered.rejected_recovery_candidates().unwrap().len(), 1);
+
+    let orphan = compaction_evidence(b"unreachable-after-startup-fallback");
+    let (orphan_id, _) = recovered.persist_standalone_object(&orphan).unwrap();
+    let policy = compaction_evidence(b"retain-current-root");
+    let retention = CompactionRetention::new(
+        ObjectId::new([0xC0; 32]),
+        RetentionPolicyId::new(recovered.identify(&policy)),
+        [],
+    );
+    let facts = recovered.capture_compaction_facts(&retention).unwrap();
+    assert!(facts.condemned().contains(&orphan_id));
+    let authorization = recovered
+        .verify_compaction_plan(
+            retention,
+            facts,
+            policy,
+            compaction_evidence(b"compaction-proof"),
+            &AcceptCompactionProof,
+        )
+        .unwrap();
+
+    recovered.compact(&authorization).unwrap();
+    assert_eq!(recovered.root(&"alice".to_owned()).unwrap(), Some(first));
+    assert!(recovered.object(orphan_id).unwrap().is_none());
+    assert_eq!(recovered.rejected_recovery_candidates().unwrap().len(), 1);
+
+    let (_, transaction) = transaction("alice", Some(first), b"after-compaction");
+    let committed = recovered.commit(transaction).unwrap().root();
+    assert_eq!(committed.generation.get(), first.generation.get() + 1);
+    assert_ne!(committed, newest);
+    recovered.flush().unwrap();
+
+    let copy = tempfile::tempdir().unwrap();
+    for file_name in [ARENA_FILE, ROOT_FILE, INDEX_FILE] {
+        std::fs::copy(source.path().join(file_name), copy.path().join(file_name)).unwrap();
+    }
+    drop(recovered);
+
+    let reopened = open(copy.path());
+    assert_eq!(reopened.root(&"alice".to_owned()).unwrap(), Some(committed));
+}
+
+#[test]
+fn volume_compaction_fails_closed_after_startup_fallback() {
+    let source = tempfile::tempdir().unwrap();
+    let (volume, engine) = open_volume(source.path());
+    let (_, first_transaction) = transaction("alice", None, b"before");
+    let first = engine.commit(first_transaction).unwrap().root();
+    let (_, second_transaction) = transaction("alice", Some(first), b"after");
+    let _newest = engine.commit(second_transaction).unwrap().root();
+
+    let arena = VolumeRegion::new(ARENA_FILE).unwrap();
+    let arena_len = volume.region_len(&arena).unwrap();
+    let mut last = [0_u8; 1];
+    volume
+        .read_region_at(&arena, arena_len.saturating_sub(1), &mut last)
+        .unwrap();
+    last[0] ^= 1;
+    volume
+        .write_region_at(&arena, arena_len.saturating_sub(1), &last)
+        .unwrap();
+    volume.sync().unwrap();
+    drop(engine);
+    drop(volume);
+
+    let (_volume, recovered) = open_volume(source.path());
+    assert_eq!(recovered.root(&"alice".to_owned()).unwrap(), Some(first));
+    assert_eq!(recovered.rejected_recovery_candidates().unwrap().len(), 1);
+
+    let orphan = compaction_evidence(b"unreachable-after-volume-fallback");
+    let (orphan_id, _) = recovered.persist_standalone_object(&orphan).unwrap();
+    let policy = compaction_evidence(b"retain-current-volume-root");
+    let retention = CompactionRetention::new(
+        ObjectId::new([0xC0; 32]),
+        RetentionPolicyId::new(recovered.identify(&policy)),
+        [],
+    );
+    let facts = recovered.capture_compaction_facts(&retention).unwrap();
+    assert!(facts.condemned().contains(&orphan_id));
+    let authorization = recovered
+        .verify_compaction_plan(
+            retention,
+            facts,
+            policy,
+            compaction_evidence(b"volume-compaction-proof"),
+            &AcceptCompactionProof,
+        )
+        .unwrap();
+    assert!(matches!(
+        recovered.compact(&authorization),
+        Err(DurableError::CompactionSnapshotChanged)
+    ));
+    assert_eq!(recovered.root(&"alice".to_owned()).unwrap(), Some(first));
+    assert!(recovered.object(orphan_id).unwrap().is_some());
+    assert_eq!(recovered.rejected_recovery_candidates().unwrap().len(), 1);
 }
 
 #[test]

@@ -27,6 +27,16 @@ where
         live: &BTreeSet<ObjectId>,
         volume: &Arc<dyn AstridVolume>,
     ) -> Result<CompactionReport, DurableError> {
+        // Volume compaction currently replaces the arena only; its root
+        // journal remains in place.  A startup fallback deliberately retains
+        // a rejected journal head, so proceeding would make the in-memory
+        // replacement and durable lineage disagree.  Refuse before creating
+        // any compacting region until the volume root-snapshot transaction
+        // can reconcile both together.
+        if inner.journal_heads != inner.roots_by_principal {
+            return Err(DurableError::CompactionSnapshotChanged);
+        }
+
         // The packed arena is the sole source of live logical objects.
         let objects_before =
             u64::try_from(inner.index.len()).map_err(|_| DurableError::EncodingOverflow)?;
