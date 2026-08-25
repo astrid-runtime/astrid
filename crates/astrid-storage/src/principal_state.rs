@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::engine::{
     DurableEngine, DurableEnginePolicy, GroupCommitPolicy, IdentityScheme, ObjectCacheConfig,
     ObjectCacheStats, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
-    RecoveryRetryPolicy,
+    RecoveryRetryPolicy, RejectedRootCandidate,
 };
 use crate::storage_model::{
     ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, PhysicalIdentity, ReferenceKind,
@@ -401,6 +401,22 @@ impl RuntimePrincipalStore {
     #[must_use]
     pub fn object_cache_principal_charge(&self, owner: &StateOwner) -> u64 {
         self.engine.object_cache_principal_charge(owner)
+    }
+
+    /// Return startup root candidates rejected because their committed object
+    /// closure was incomplete. This is a read-only operator diagnostic; it is
+    /// not a guest-visible namespace or an authority-bearing control surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage connection error when the authoritative engine is
+    /// closed or still requires recovery.
+    pub fn rejected_recovery_candidates(
+        &self,
+    ) -> StorageResult<Vec<RejectedRootCandidate<StateOwner>>> {
+        self.engine.rejected_recovery_candidates().map_err(|error| {
+            StorageError::Connection(format!("read recovery diagnostics: {error}"))
+        })
     }
 
     /// Honor current resident-memory pressure by evicting cache entries.

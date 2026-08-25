@@ -371,9 +371,8 @@ where
                 return;
             },
         };
-
         let mut accepted = Vec::new();
-        let mut pending_roots = BTreeMap::new();
+        let (mut pending_roots, mut pending_journal_heads) = (BTreeMap::new(), BTreeMap::new());
         let mut pending_frames = BTreeMap::<ObjectId, Arc<[u8]>>::new();
         Self::seed_pending_wal_frames(
             self.transaction_wal.is_enabled(),
@@ -385,6 +384,7 @@ where
                 &mut inner,
                 request.transaction,
                 &pending_roots,
+                &pending_journal_heads,
                 request.observer.as_deref(),
             ) {
                 Ok(mut prepared) => {
@@ -392,7 +392,7 @@ where
                         completions.push((request.receipt, Err(error)));
                         continue;
                     }
-                    pending_roots.insert(prepared.principal.clone(), prepared.root);
+                    record_pending_root(&mut pending_roots, &mut pending_journal_heads, &prepared);
                     accepted.push(AcceptedCommit {
                         prepared,
                         receipt: request.receipt,
@@ -402,7 +402,6 @@ where
                 Err(error) => completions.push((request.receipt, Err(error))),
             }
         }
-
         if !accepted.is_empty() {
             let previous_arena_len = match live_files_mut(&mut inner.files) {
                 Ok(files) => files.arena_len,
@@ -438,10 +437,7 @@ where
                             inner
                                 .validated
                                 .extend(accepted.prepared.validated.iter().copied());
-                            inner.roots_by_principal.insert(
-                                accepted.prepared.principal.clone(),
-                                accepted.prepared.root,
-                            );
+                            publish_root_state(&mut inner, &accepted.prepared);
                             self.published_roots
                                 .publish(&accepted.prepared.principal, accepted.prepared.root);
                             completions.push((
@@ -739,4 +735,22 @@ fn complete_failed_group<P: Ord>(
             Err(first.take().unwrap_or(DurableError::RequiresRecovery)),
         ));
     }
+}
+
+fn record_pending_root<P: Ord + Clone>(
+    pending_roots: &mut BTreeMap<P, super::RootState>,
+    pending_journal_heads: &mut BTreeMap<P, super::RootState>,
+    prepared: &Prepared<P>,
+) {
+    pending_roots.insert(prepared.principal.clone(), prepared.root);
+    pending_journal_heads.insert(prepared.principal.clone(), prepared.root);
+}
+
+fn publish_root_state<P: Ord + Clone>(inner: &mut DurableInner<P>, prepared: &Prepared<P>) {
+    inner
+        .roots_by_principal
+        .insert(prepared.principal.clone(), prepared.root);
+    inner
+        .journal_heads
+        .insert(prepared.principal.clone(), prepared.root);
 }

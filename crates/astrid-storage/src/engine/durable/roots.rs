@@ -14,6 +14,13 @@ const SNAPSHOT_SENTINEL: u64 = u64::MAX;
 const SNAPSHOT_RECORD: u8 = 1;
 const CURRENT_DIGEST_BYTES: u32 = 32;
 
+type StartupRecovery<P> = (
+    BTreeMap<P, RootState>,
+    BTreeMap<P, RootState>,
+    BTreeSet<ObjectId>,
+    Vec<super::RejectedRootCandidate<P>>,
+);
+
 pub(super) fn recover_root_history<P, C, R>(
     roots: &mut R,
     codec: &C,
@@ -25,7 +32,30 @@ where
     C: PrincipalCodec<P>,
     R: DurableIo,
 {
-    let mut recovered = BTreeMap::<P, (RootState, u64)>::new();
+    let recovered = recover_root_journal_chain(roots, codec, scheme, limits)?;
+    recovered
+        .into_iter()
+        .map(|(principal, mut roots)| {
+            let latest = roots
+                .pop()
+                .ok_or_else(|| corrupt(ROOT_FILE, 0, "root journal principal has no history"))?;
+            Ok((principal, latest))
+        })
+        .collect()
+}
+
+pub(super) fn recover_root_journal_chain<P, C, R>(
+    roots: &mut R,
+    codec: &C,
+    scheme: IdentityScheme,
+    limits: RecoveryLimits,
+) -> Result<BTreeMap<P, Vec<(RootState, u64)>>, DurableError>
+where
+    P: Ord,
+    C: PrincipalCodec<P>,
+    R: DurableIo,
+{
+    let mut recovered = BTreeMap::<P, Vec<(RootState, u64)>>::new();
     scan_frames(roots, ROOT_FILE, ROOT_MAGIC, limits, |offset, payload| {
         let record = decode_root_journal_record(payload, scheme)
             .map_err(|detail| corrupt(ROOT_FILE, offset, detail))?;
@@ -65,25 +95,7 @@ where
 {
     let mut validated = BTreeSet::new();
     for (root, offset) in recovered.values().copied() {
-        let records = materialize_closure(
-            &mut super::ClosureObjects::<_, P> {
-                arena,
-                index,
-                incoming: &BTreeMap::new(),
-                pending: None,
-                identity,
-                limits,
-            },
-            root.commit,
-        )
-        .map_err(|error| recovery_closure_error(error, offset))?;
-        validate_commit_closure(&records, root.commit).map_err(|source| {
-            DurableError::RecoveryModel {
-                file: ROOT_FILE,
-                offset,
-                source,
-            }
-        })?;
+        let records = validate_root_candidate(arena, index, identity, limits, root, offset)?;
         validated.extend(records.into_iter().map(|(id, _)| id));
     }
     Ok((
@@ -95,8 +107,107 @@ where
     ))
 }
 
+fn validate_root_candidate<I>(
+    arena: &mut File,
+    index: &BTreeMap<ObjectId, ArenaLocation>,
+    identity: &I,
+    limits: RecoveryLimits,
+    root: RootState,
+    offset: u64,
+) -> Result<Vec<(ObjectId, crate::storage_model::ObjectRecord)>, DurableError>
+where
+    I: PersistentObjectIdentity,
+{
+    let records = materialize_closure(
+        &mut super::ClosureObjects::<_, ()> {
+            arena,
+            index,
+            incoming: &BTreeMap::new(),
+            pending: None,
+            identity,
+            limits,
+        },
+        root.commit,
+    )
+    .map_err(|error| recovery_closure_error(error, offset))?;
+    validate_commit_closure(&records, root.commit).map_err(|source| {
+        DurableError::RecoveryModel {
+            file: ROOT_FILE,
+            offset,
+            source,
+        }
+    })?;
+    Ok(records)
+}
+
+pub(super) fn recover_startup_roots<P, I, C, R>(
+    roots: &mut R,
+    arena: &mut File,
+    index: &BTreeMap<ObjectId, ArenaLocation>,
+    codec: &C,
+    identity: &I,
+    limits: RecoveryLimits,
+) -> Result<StartupRecovery<P>, DurableError>
+where
+    P: Clone + Ord,
+    I: PersistentObjectIdentity,
+    C: PrincipalCodec<P>,
+    R: DurableIo,
+{
+    let chains = recover_root_journal_chain(roots, codec, identity.scheme(), limits)?;
+    let journal_heads = chains
+        .iter()
+        .filter_map(|(principal, candidates)| {
+            candidates
+                .last()
+                .map(|(root, _)| (principal.clone(), *root))
+        })
+        .collect();
+    let mut selected = BTreeMap::new();
+    let mut validated = BTreeSet::new();
+    let mut rejected = Vec::new();
+    for (principal, candidates) in chains {
+        let mut newest_missing = None;
+        let mut selected_root = None;
+        for (root, offset) in candidates.iter().rev().copied() {
+            match validate_root_candidate(arena, index, identity, limits, root, offset) {
+                Ok(records) => {
+                    validated.extend(records.into_iter().map(|(id, _)| id));
+                    selected_root = Some(root);
+                    break;
+                },
+                Err(DurableError::RecoveryModel {
+                    source: ModelError::MissingObject(missing),
+                    ..
+                }) => {
+                    if newest_missing.is_none() {
+                        newest_missing = Some((root, offset, missing));
+                    }
+                    rejected.push(super::RejectedRootCandidate {
+                        principal: principal.clone(),
+                        offset,
+                        root,
+                        missing,
+                    });
+                },
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(root) = selected_root {
+            selected.insert(principal, root);
+        } else if let Some((_, offset, missing)) = newest_missing {
+            return Err(DurableError::RecoveryModel {
+                file: ROOT_FILE,
+                offset,
+                source: ModelError::MissingObject(missing),
+            });
+        }
+    }
+    Ok((selected, journal_heads, validated, rejected))
+}
+
 fn apply_root_journal_record<P, C>(
-    recovered: &mut BTreeMap<P, (RootState, u64)>,
+    recovered: &mut BTreeMap<P, Vec<(RootState, u64)>>,
     codec: &C,
     scheme: IdentityScheme,
     offset: u64,
@@ -141,7 +252,7 @@ where
             }
             for (principal_bytes, root) in entries {
                 let principal = decode_principal(codec, &principal_bytes, offset)?;
-                if recovered.insert(principal, (root, offset)).is_some() {
+                if recovered.insert(principal, vec![(root, offset)]).is_some() {
                     return Err(corrupt(
                         ROOT_FILE,
                         offset,
@@ -155,7 +266,7 @@ where
 }
 
 fn apply_transition<P, C>(
-    recovered: &mut BTreeMap<P, (RootState, u64)>,
+    recovered: &mut BTreeMap<P, Vec<(RootState, u64)>>,
     codec: &C,
     offset: u64,
     record: &DecodedRootRecord,
@@ -165,7 +276,9 @@ where
     C: PrincipalCodec<P>,
 {
     let principal = decode_principal(codec, &record.principal, offset)?;
-    let actual = recovered.get(&principal).map(|(root, _)| *root);
+    let actual = recovered
+        .get(&principal)
+        .and_then(|roots| roots.last().map(|(root, _)| *root));
     if actual != record.expected {
         return Err(DurableError::RecoveryModel {
             file: ROOT_FILE,
@@ -192,7 +305,10 @@ where
             "replacement generation does not match journal history",
         ));
     }
-    recovered.insert(principal, (record.replacement, offset));
+    recovered
+        .entry(principal)
+        .or_default()
+        .push((record.replacement, offset));
     Ok(())
 }
 

@@ -766,6 +766,11 @@ where
         self.object_cache
             .retain_objects(|object| replacement.index.contains_key(&object));
         inner.roots_by_principal = replacement.roots;
+        // A startup fallback can leave the retained journal head on a newer
+        // rejected frame than the live root we selected.  The replacement
+        // journal is a new authoritative snapshot, so its roots are also the
+        // only valid lineage heads for the next append.
+        inner.journal_heads = inner.roots_by_principal.clone();
         inner.index = replacement.index;
         inner.pending_index_locations.clear();
         inner.pending_direct_objects.clear();
