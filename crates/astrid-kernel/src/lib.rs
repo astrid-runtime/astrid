@@ -65,6 +65,8 @@ pub mod socket;
 /// Authenticated native filesystem lease and callback service.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod storage_mount;
+#[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
+mod systemresident_health_tests;
 
 use arc_swap::ArcSwap;
 use astrid_audit::AuditLog;
