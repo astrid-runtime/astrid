@@ -1,17 +1,22 @@
-# Astrid native-kernel — M1 plus dual-closure stub
+# Astrid native-kernel — M1 plus authenticated handoff fixture
 
 Recovered isolated `kernel/` workspace. M1 boots to Rust ring 0 on the
 experimental emulator machine, emits structured serial evidence, runs
 negative-first self-tests, and halts with a machine-checkable outcome.
-This child adds a dual-closure stub: the loader signs a kernel/bootstrap
-closure and a distinct empty System Generation as separate artifacts;
-ring 0 verifies the table and binds the measured identities.
+This child adds a fixed 734-byte loader bundle: a 379-byte `ASTRIDPH`
+root-signed policy handoff followed by a 355-byte `ASTRIDDC` dual-closure
+table. Ring 0 validates the mapped ramdisk, copies it into kernel-owned
+memory, measures the raw ELF physical span named by BootInfo, checks the
+handoff bindings, constructs the authorized subordinate policy, and then
+binds both closure identities.
 
-Ring 0 verifies the table against a compiled emulator-fixture public-key
-policy with independent kernel and System Generation floors. The table
-cannot choose trust keys or rollback policy. Authenticated loader handoff
-is not available: fixture *private* keys stay in `kimage` (`sign` feature).
-This is not firmware root of trust and not self-measurement.
+The root verifier is an emulator fixture key with independent minimum
+generation/floors; the signed handoff authorizes subordinate keys and keeps
+kernel/System Generation floors independent. The table cannot choose trust
+keys or rollback policy. Explicit hex key files are required by `kimage`; the
+committed files under `tools/kimage/fixtures/` are development-only material
+and are never environment defaults. The handoff does not authenticate
+firmware or a production loader root.
 
 This workspace is isolated from `crates/astrid-kernel`. Nested
 `[workspace]` membership keeps core CI from ingesting these crates.
@@ -38,13 +43,13 @@ KVM, virtio, or IOMMU, and therefore does not prove that topology.
 
 ## Layout
 
-- `crates/astrid-native-closure/` — `#![no_std]` dual-closure codec,
-  external `TrustedPolicy`, ramdisk region validator, verify, and
+- `crates/astrid-native-closure/` — `#![no_std]` fixed handoff/dual-closure
+  codecs, external root/policy inputs, region validator, verify, and
   loader-only signing.
 - `crates/astrid-native-kernel/` — `#![no_std] #![no_main]` ring-0 binary.
-- `tools/kimage/` — wraps a kernel ELF into a bootable UEFI disk image
-  and embeds the dual-closure table as a bootloader ramdisk (memory
-  table, not a guest filesystem).
+- `tools/kimage/` — wraps a kernel ELF into a bootable UEFI disk image,
+  requires explicit root/kernel/sysgen key files, and embeds the exact
+  handoff+table bundle as a bootloader ramdisk (not a guest filesystem).
 - `tools/ktest/` — QEMU serial-assertion harness and host unit tests.
 
 ## Run
@@ -56,7 +61,7 @@ KVM, virtio, or IOMMU, and therefore does not prove that topology.
 The harness builds the kernel, builds the UEFI image twice (determinism
 measurement), boots QEMU (`q35`, explicit `tcg`, UEFI pflash, 1 CPU,
 256 MiB, COM1, `-display none`, `isa-debug-exit`), captures JSONL serial,
-and asserts one combined serial sequence (boot, both closure
+and asserts one combined serial sequence (boot, handoff binding, both closure
 identities/floors, bound, M1 milestones, halt). QEMU is killed after two
 minutes.
 
@@ -68,6 +73,11 @@ claim datadir portability. Override with:
 
 - `ASTRID_QEMU_FIRMWARE_CODE` and `ASTRID_QEMU_FIRMWARE_VARS`
 - `ASTRID_QEMU_FIRMWARE_DIR`
+
+The image builder requires explicit `--root-key`, `--kernel-key`, and
+`--sysgen-key` files on every invocation. `ktest` passes the three committed
+development fixture files explicitly; no environment secret or implicit
+signing fallback is accepted.
 
 `kimage` still needs a nightly toolchain because bootloader 0.11 runs
 `-Zbuild-std`. The supported channel is the dated pin `nightly-2026-07-21`
@@ -89,7 +99,7 @@ the parent target lock.
 - `seq` values are contiguous and strictly increasing from 0.
 - required events appear exactly once.
 - `boot.entry` is the first kernel event.
-- combined order: `boot.entry`, `idt.ready`, `closure.kernel`,
+- combined order: `boot.entry`, `idt.ready`, `handoff.bound`, `closure.kernel`,
   `closure.sysgen`, `closure.bound`, `mem.map`, `paging.wx`,
   `heap.ready`, `halt`.
 - GDT/IDT are installed before any ramdisk copy.
@@ -101,9 +111,11 @@ the parent target lock.
 - any `test.fail` fails the run, including unknown names such as
   `future_gate`.
 - `halt` with `outcome:"ok"` and QEMU exit code 33.
-- host `verify_table(bytes, TrustedPolicy::emulator_fixture())` accepts
-  the ramdisk table. Serial `closure.kernel` / `closure.sysgen` /
-  `closure.bound` carry independent `kernel_floor` and `sysgen_floor`
+- host `verify_policy_handoff` accepts the exact handoff against independent
+  root/context inputs, then `verify_table` accepts the table using the
+  root-authorized subordinate policy. Serial `handoff.bound` carries the raw
+  ELF and closure-table measurements. Serial `closure.kernel` /
+  `closure.sysgen` / `closure.bound` carry independent `kernel_floor` and `sysgen_floor`
   and match the measured ELF identity and the empty System Generation
   identity.
 - `verify_table` rejects arbitrary self-signed keys, a lowered mutable
@@ -119,22 +131,23 @@ Hermes claim. Timing is not evidence. Image determinism is reported
 honestly: `DETERMINISM: FAIL` does not fail boot assertions and is not
 coerced to PASS.
 
-Ring 0 compiles emulator-fixture **public** keys and `CURRENT_FLOOR` as
-independent minima. Fixture **private** keys are host-only (`kimage`,
-`feature = "sign"`) and are not present in ring 0. This child does
-**not** prove firmware authenticated the loader, does not prove ring 0
-re-hashed the in-memory kernel image, and does not claim a firmware root
-of trust or self-measurement. Dual-closure here is a distinct pair of
-signed artifacts plus identity binding against an external policy, not a
-supported machine or an owner ceremony. Table header keys and
-`min_floor` are untrusted advertisements.
+Ring 0 compiles only the emulator-fixture **root public key** plus independent
+minimum floors/generation. It validates the physical mapping and hashes the
+raw loader-provided ELF span; it does not hash the relocated image,
+bootloader, or firmware. Fixture **private** keys are supplied explicitly to
+host-only `kimage` and are not present in ring 0. This child does **not** prove
+firmware authenticated the loader, a production root of trust, self-measurement,
+or an owner ceremony. Table header keys and `min_floor` remain untrusted
+advertisements. The 64 MiB raw-ELF bound is a fixed ring-0 DoS guard for this
+256 MiB emulator machine contract, not an operator configuration knob.
 
 ## Checks
 
 `./check.sh` is the supported host sequence. It does **not** run
 `cargo clippy --workspace`.
 
-- stable `astrid-native-closure`: `cargo test -p astrid-native-closure --locked`,
+- stable `astrid-native-closure`: default and `--no-default-features` tests,
+  no-default `x86_64-unknown-none` check,
   host `cargo clippy -p astrid-native-closure --all-targets --all-features --locked -- -D warnings`,
   and `x86_64-unknown-none` lib clippy (no `--all-targets` on none)
 - stable `ktest`: `cargo test -p ktest --locked` and

@@ -1,5 +1,5 @@
 //! Host QEMU serial-assertion harness for the M1 experimental machine
-//! plus the dual-closure stub.
+//! plus the fixed authenticated handoff/dual-closure fixture.
 //!
 //! Builds the ring-0 kernel, wraps it into a UEFI image twice (determinism
 //! measurement), boots under explicit TCG, and asserts one combined serial
@@ -12,7 +12,11 @@ use std::process::{Command, Stdio};
 use std::thread;
 
 use anyhow::{Context, Result, bail};
-use astrid_native_closure::{CURRENT_FLOOR, MeasuredIdentity, TrustedPolicy, verify_table};
+use astrid_native_closure::{
+    BootContextBinding, CURRENT_FLOOR, HANDOFF_LEN, HandoffContext, LoaderIdentity,
+    LoaderMeasurement, MeasuredIdentity, PolicyGeneration, RootVerifier, TABLE_LEN, TrustedPolicy,
+    verify_policy_handoff, verify_table,
+};
 use ktest::determinism::{Determinism, compare_images};
 use ktest::events::{ExpectedClosures, assert_boot, parse_events};
 use ktest::firmware;
@@ -57,7 +61,8 @@ fn main() -> Result<()> {
     build_image(&root, &kernel_elf, &image_b)?;
 
     let determinism = compare_images(&image_a, &image_b)?;
-    let (kernel_hex, sysgen_hex) = loader_identities(&image_a, &image_b, &kernel_elf)?;
+    let (kernel_hex, sysgen_hex, kernel_image_hex, closure_table_hex) =
+        loader_identities(&image_a, &image_b, &kernel_elf)?;
 
     let firmware = firmware::discover()?;
     println!(
@@ -78,6 +83,9 @@ fn main() -> Result<()> {
     }
 
     let closures = ExpectedClosures {
+        policy_generation: 1,
+        kernel_image_hex: &kernel_image_hex,
+        closure_table_hex: &closure_table_hex,
         kernel_id_hex: &kernel_hex,
         sysgen_id_hex: &sysgen_hex,
         kernel_floor: CURRENT_FLOOR.get(),
@@ -117,28 +125,61 @@ fn identity_hex(id: MeasuredIdentity) -> String {
     String::from_utf8(buf.to_vec()).expect("hex digits are ascii")
 }
 
+const EMULATOR_ROOT_VERIFY_KEY: [u8; 32] = [
+    237, 73, 40, 198, 40, 209, 194, 198, 234, 233, 3, 56, 144, 89, 149, 97, 41, 89, 39, 58, 92, 99,
+    249, 54, 54, 193, 70, 20, 172, 135, 55, 209,
+];
+const LOADER_MEASUREMENT_DOMAIN: &[u8] = b"astrid.kimage.loader.measurement.v1";
+const LOADER_IDENTITY_DOMAIN: &[u8] = b"astrid.kimage.loader.identity.v1";
+const BOOT_CONTEXT_DOMAIN: &[u8] = b"astrid.boot.q35.uefi.tcg.v1";
+
 fn loader_identities(
     image_a: &Path,
     image_b: &Path,
     kernel_elf: &Path,
-) -> Result<(String, String)> {
-    let closures_a = image_a.with_extension("closures");
-    let closures_b = image_b.with_extension("closures");
-    let bytes_a = std::fs::read(&closures_a)
-        .with_context(|| format!("reading dual-closure table {}", closures_a.display()))?;
-    let bytes_b = std::fs::read(&closures_b)
-        .with_context(|| format!("reading dual-closure table {}", closures_b.display()))?;
+) -> Result<(String, String, String, String)> {
+    let ramdisk_a = image_a.with_extension("ramdisk");
+    let ramdisk_b = image_b.with_extension("ramdisk");
+    let bytes_a = std::fs::read(&ramdisk_a)
+        .with_context(|| format!("reading policy handoff ramdisk {}", ramdisk_a.display()))?;
+    let bytes_b = std::fs::read(&ramdisk_b)
+        .with_context(|| format!("reading policy handoff ramdisk {}", ramdisk_b.display()))?;
     if bytes_a != bytes_b {
-        bail!("dual-closure tables differ across kimage invocations");
+        bail!("policy handoff ramdisks differ across kimage invocations");
     }
-    let bound = verify_table(&bytes_a, &TrustedPolicy::emulator_fixture())
-        .map_err(|err| anyhow::anyhow!("host verify_table rejected: {}", err.as_reason()))?;
-    if bound.kernel_floor != CURRENT_FLOOR || bound.sysgen_floor != CURRENT_FLOOR {
-        bail!("loader floors are not the emulator CURRENT_FLOOR minima");
+    if bytes_a.len() != HANDOFF_LEN + TABLE_LEN {
+        bail!(
+            "policy handoff ramdisk length is {}, expected {}",
+            bytes_a.len(),
+            HANDOFF_LEN + TABLE_LEN
+        );
     }
     let elf = std::fs::read(kernel_elf)
         .with_context(|| format!("reading kernel ELF {}", kernel_elf.display()))?;
     let kernel_id = MeasuredIdentity::from_payload(&elf);
+    let table_bytes = &bytes_a[HANDOFF_LEN..];
+    let closure_table = MeasuredIdentity::from_payload(table_bytes);
+    let expected = expected_context(kernel_id, closure_table);
+    let root = RootVerifier::try_new(
+        EMULATOR_ROOT_VERIFY_KEY,
+        CURRENT_FLOOR,
+        CURRENT_FLOOR,
+        PolicyGeneration::new(1),
+    )
+    .map_err(|err| anyhow::anyhow!("root verifier construction failed: {}", err.as_reason()))?;
+    let handoff =
+        verify_policy_handoff(&bytes_a[..HANDOFF_LEN], &root, &expected).map_err(|err| {
+            anyhow::anyhow!("host verify_policy_handoff rejected: {}", err.as_reason())
+        })?;
+    let policy = TrustedPolicy::try_new(
+        handoff.policy.kernel_verify,
+        handoff.policy.sysgen_verify,
+        handoff.policy.kernel_floor,
+        handoff.policy.sysgen_floor,
+    )
+    .map_err(|err| anyhow::anyhow!("handoff policy rejected: {}", err.as_reason()))?;
+    let bound = verify_table(table_bytes, &policy)
+        .map_err(|err| anyhow::anyhow!("host verify_table rejected: {}", err.as_reason()))?;
     let sysgen_id = MeasuredIdentity::empty_sysgen();
     if bound.kernel_bootstrap != kernel_id {
         bail!("loader kernel identity does not match measured ELF");
@@ -149,12 +190,98 @@ fn loader_identities(
     if !bound.distinct() {
         bail!("loader identities are not distinct");
     }
-    let kernel_hex = identity_hex(kernel_id);
+    hostile_bundle_checks(&bytes_a, &elf, &expected, &policy)?;
+    let kernel_hex = identity_hex(bound.kernel_bootstrap);
     let sysgen_hex = identity_hex(sysgen_id);
-    println!("== dual-closure host verify_table OK ==");
+    let kernel_image_hex = identity_hex(kernel_id);
+    let closure_table_hex = identity_hex(closure_table);
+    println!("== policy handoff + dual-closure host verification OK ==");
     println!("kernel-bootstrap id: {kernel_hex}");
     println!("system-generation id: {sysgen_hex}");
-    Ok((kernel_hex, sysgen_hex))
+    println!("raw ELF image id: {kernel_image_hex}");
+    println!("closure table id: {closure_table_hex}");
+    Ok((kernel_hex, sysgen_hex, kernel_image_hex, closure_table_hex))
+}
+
+fn expected_context(
+    kernel_image: MeasuredIdentity,
+    closure_table: MeasuredIdentity,
+) -> HandoffContext {
+    HandoffContext::new(
+        kernel_image,
+        closure_table,
+        LoaderMeasurement::from_bytes(
+            MeasuredIdentity::from_payload(LOADER_MEASUREMENT_DOMAIN).as_bytes(),
+        ),
+        LoaderIdentity::from_bytes(
+            MeasuredIdentity::from_payload(LOADER_IDENTITY_DOMAIN).as_bytes(),
+        ),
+        BootContextBinding::from_bytes(
+            MeasuredIdentity::from_payload(BOOT_CONTEXT_DOMAIN).as_bytes(),
+        ),
+    )
+}
+
+fn hostile_bundle_checks(
+    bundle: &[u8],
+    elf: &[u8],
+    expected: &HandoffContext,
+    policy: &TrustedPolicy,
+) -> Result<()> {
+    let root = RootVerifier::try_new(
+        EMULATOR_ROOT_VERIFY_KEY,
+        CURRENT_FLOOR,
+        CURRENT_FLOOR,
+        PolicyGeneration::new(1),
+    )
+    .map_err(|err| anyhow::anyhow!(err.as_reason()))?;
+    let mut extended = bundle[..HANDOFF_LEN].to_vec();
+    extended.push(0);
+    for (name, bytes) in [
+        ("missing", bundle[..0].to_vec()),
+        ("truncated", bundle[..HANDOFF_LEN - 1].to_vec()),
+        ("extended", extended),
+    ] {
+        if verify_policy_handoff(&bytes, &root, expected).is_ok() {
+            bail!("hostile {name} handoff unexpectedly accepted");
+        }
+    }
+    let mut tampered = bundle.to_vec();
+    tampered[0] ^= 1;
+    if verify_policy_handoff(&tampered[..HANDOFF_LEN], &root, expected).is_ok() {
+        bail!("tampered handoff unexpectedly accepted");
+    }
+    let mut swapped = Vec::with_capacity(bundle.len());
+    swapped.extend_from_slice(&bundle[HANDOFF_LEN..]);
+    swapped.extend_from_slice(&bundle[..HANDOFF_LEN]);
+    if verify_policy_handoff(&swapped[..HANDOFF_LEN], &root, expected).is_ok() {
+        bail!("swapped handoff/table bundle unexpectedly accepted");
+    }
+    let mut wrong_context = *expected;
+    wrong_context.kernel_image = MeasuredIdentity::from_payload(b"wrong raw ELF");
+    if verify_policy_handoff(&bundle[..HANDOFF_LEN], &root, &wrong_context).is_ok() {
+        bail!("loader/context replay unexpectedly accepted");
+    }
+    let wrong_root = RootVerifier::try_new(
+        [0xA5; 32],
+        CURRENT_FLOOR,
+        CURRENT_FLOOR,
+        PolicyGeneration::new(1),
+    )
+    .map_err(|err| anyhow::anyhow!(err.as_reason()))?;
+    if verify_policy_handoff(&bundle[..HANDOFF_LEN], &wrong_root, expected).is_ok() {
+        bail!("wrong root unexpectedly accepted");
+    }
+    let mut table = bundle[HANDOFF_LEN..].to_vec();
+    table[0] ^= 1;
+    if verify_table(&table, policy).is_ok() {
+        bail!("tampered closure table unexpectedly accepted");
+    }
+    if elf.is_empty() {
+        bail!("empty raw ELF fixture");
+    }
+    println!("hostile handoff/table falsifiers: PASS");
+    Ok(())
 }
 
 fn print_summary(determinism: Determinism, exit_code: Option<i32>, assertions_ok: bool) {

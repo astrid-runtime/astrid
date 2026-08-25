@@ -8,10 +8,11 @@
 //! from the user-space `astrid-kernel` supervisor.
 //!
 //! M1 claims: UEFI q35 TCG boot, W^X of the kernel image, APIC timer delivery,
-//! fallible heap/frame pools. Dual-closure stub: ring 0 binds kernel/bootstrap and empty
-//! System Generation identities against a compiled fixture public-key policy. This crate does
-//! not claim KVM, virtio, IOMMU, DMA, A/B, first-owner, services, filesystem,
-//! Linux, host-absence, or physical ownership.
+//! fallible heap/frame pools, and a fixture-only root-signed policy handoff
+//! whose raw loader ELF/table/context bindings are checked before closures.
+//! The relocated image, bootloader, firmware, and physical ownership are not
+//! measured or authenticated. This crate does not claim KVM, virtio, IOMMU,
+//! DMA, A/B, first-owner, services, filesystem, Linux, or host-absence.
 
 #![no_std]
 #![no_main]
@@ -57,7 +58,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial::ev_idt_ready(interrupts::EXCEPTION_VECTORS);
 
     match closure::accept(boot_info) {
-        Ok(bound) => emit_bound(bound),
+        Ok(accepted) => emit_bound(accepted),
         Err(err) => {
             serial::ev_closure_reject(err.as_reason());
             serial::ev_halt(false);
@@ -93,13 +94,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial::exit_qemu(wx_ok && tests_ok);
 }
 
-fn emit_bound(bound: astrid_native_closure::BoundIdentities) {
+fn emit_bound(accepted: closure::AcceptedClosure) {
+    let bound = accepted.bound;
     let mut kernel_hex = [0u8; 64];
     let mut sysgen_hex = [0u8; 64];
     bound.kernel_bootstrap.write_hex(&mut kernel_hex);
     bound.system_generation.write_hex(&mut sysgen_hex);
     let kernel_hex = core::str::from_utf8(&kernel_hex).expect("hex digits are ascii");
     let sysgen_hex = core::str::from_utf8(&sysgen_hex).expect("hex digits are ascii");
+    let mut kernel_image_hex = [0u8; 64];
+    let mut closure_table_hex = [0u8; 64];
+    accepted.kernel_image.write_hex(&mut kernel_image_hex);
+    accepted.closure_table.write_hex(&mut closure_table_hex);
+    let kernel_image_hex = core::str::from_utf8(&kernel_image_hex).expect("hex digits are ascii");
+    let closure_table_hex = core::str::from_utf8(&closure_table_hex).expect("hex digits are ascii");
+    serial::ev_handoff_bound(
+        accepted.handoff.policy.policy_generation.get(),
+        kernel_image_hex,
+        closure_table_hex,
+    );
     serial::ev_closure_kernel(bound.kernel_floor.get(), kernel_hex);
     serial::ev_closure_sysgen(bound.sysgen_floor.get(), sysgen_hex);
     serial::ev_closure_bound(

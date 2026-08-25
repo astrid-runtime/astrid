@@ -8,6 +8,7 @@ use core::alloc::Layout;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use astrid_native_closure::{ClosureError, MeasuredIdentity};
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use linked_list_allocator::Heap;
 use spin::{Mutex, Once};
@@ -21,6 +22,10 @@ pub const MAX_FRAMES: usize = (PHYS_SPAN / FRAME_SIZE) as usize;
 const BITMAP_WORDS: usize = MAX_FRAMES / 64;
 
 pub const HEAP_SIZE: usize = 1024 * 1024;
+/// Maximum raw ELF span accepted from BootInfo. The loader's physical span is
+/// bounded before any pointer is formed; this is a fixture safety ceiling, not
+/// a claim about arbitrary kernel images.
+pub const MAX_KERNEL_ELF_LEN: u64 = 64 * 1024 * 1024;
 static mut HEAP_MEM: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
 #[used]
@@ -199,6 +204,97 @@ pub fn page_present_readable(page: u64) -> bool {
     leaf_flags(addr).is_some_and(|f| f.contains(PageTableFlags::PRESENT))
 }
 
+/// Validate and measure the physical span named by `BootInfo::kernel_addr`.
+///
+/// BootInfo reports the physical address of the raw ELF bytes. The active
+/// physical-memory mapping is the only address translation used here. Every
+/// covering mapped page is checked before the contiguous read-only slice is
+/// formed; the bytes are hashed in place without copying. The relocated
+/// kernel image, bootloader, and firmware are deliberately outside this
+/// measurement.
+pub fn measure_physical_span(
+    physical_start: u64,
+    len: u64,
+) -> Result<MeasuredIdentity, ClosureError> {
+    if physical_start == 0 || len == 0 {
+        return Err(ClosureError::Missing);
+    }
+    if len > MAX_KERNEL_ELF_LEN {
+        return Err(ClosureError::Malformed);
+    }
+    let physical_end = physical_start
+        .checked_add(len)
+        .ok_or(ClosureError::Malformed)?;
+    let offset = phys_offset();
+    let virtual_start = offset
+        .checked_add(physical_start)
+        .ok_or(ClosureError::Malformed)?;
+    let virtual_end = virtual_start
+        .checked_add(len)
+        .ok_or(ClosureError::Malformed)?;
+    if !is_canonical(virtual_start)
+        || !is_canonical(virtual_end - 1)
+        || physical_end <= physical_start
+    {
+        return Err(ClosureError::Malformed);
+    }
+
+    let mut page = physical_start & !(FRAME_SIZE - 1);
+    let last_page = (physical_end - 1) & !(FRAME_SIZE - 1);
+    loop {
+        let virtual_page = offset.checked_add(page).ok_or(ClosureError::Malformed)?;
+        if !is_canonical(virtual_page) || !page_present_readable(virtual_page) {
+            return Err(ClosureError::Unmapped);
+        }
+        if page == last_page {
+            break;
+        }
+        page = page
+            .checked_add(FRAME_SIZE)
+            .ok_or(ClosureError::Malformed)?;
+    }
+
+    // SAFETY: every covering page has been proven present/readable in the
+    // active physical-memory mapping and the checked span is canonical.
+    let bytes = unsafe { core::slice::from_raw_parts(virtual_start as *const u8, len as usize) };
+    Ok(MeasuredIdentity::from_payload(bytes))
+}
+
+/// Validate a loader-mapped virtual range before copying its untrusted bytes.
+pub fn prove_readable_range(start: u64, len: u64) -> Result<(), ClosureError> {
+    if start == 0 || len == 0 {
+        return Err(ClosureError::Missing);
+    }
+    let end = start.checked_add(len).ok_or(ClosureError::Malformed)?;
+    if !is_canonical(start) || !is_canonical(end - 1) {
+        return Err(ClosureError::Malformed);
+    }
+    let mut page = start & !(FRAME_SIZE - 1);
+    let last_page = (end - 1) & !(FRAME_SIZE - 1);
+    loop {
+        if !page_present_readable(page) {
+            return Err(ClosureError::Unmapped);
+        }
+        if page == last_page {
+            break;
+        }
+        page = page
+            .checked_add(FRAME_SIZE)
+            .ok_or(ClosureError::Malformed)?;
+    }
+    Ok(())
+}
+
+/// Copy a previously proven loader-mapped range into kernel-owned storage.
+///
+/// # Safety
+/// Call [`prove_readable_range`] for the same range immediately before this
+/// operation, and provide a destination of exactly `len` bytes.
+pub unsafe fn copy_readable_range(start: u64, destination: &mut [u8]) {
+    let source = unsafe { core::slice::from_raw_parts(start as *const u8, destination.len()) };
+    destination.copy_from_slice(source);
+}
+
 fn leaf_flags(addr: VirtAddr) -> Option<PageTableFlags> {
     let (l4_frame, _) = Cr3::read();
     let mut table_phys = l4_frame.start_address().as_u64();
@@ -224,6 +320,11 @@ fn leaf_flags(addr: VirtAddr) -> Option<PageTableFlags> {
         table_phys = entry.addr().as_u64();
     }
     Some(flags)
+}
+
+const fn is_canonical(addr: u64) -> bool {
+    let sign_extended = ((addr as i64) << 16) >> 16;
+    sign_extended as u64 == addr
 }
 
 /// Audit W^X for the kernel image. Returns violation booleans:

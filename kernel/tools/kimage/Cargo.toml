@@ -17,3 +17,4 @@ bench = false
 bootloader = { version = "=0.11.16", default-features = false, features = ["uefi"] }
 anyhow = "=1.0.104"
 astrid-native-closure = { path = "../../crates/astrid-native-closure", features = ["sign"] }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["zeroize"] }

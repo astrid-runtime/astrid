@@ -373,6 +373,7 @@ dependencies = [
  "anyhow",
  "astrid-native-closure",
  "bootloader",
+ "ed25519-dalek",
 ]
 
 [[package]]
