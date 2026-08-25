@@ -98,6 +98,7 @@ async fn assert_root_entries(lease: &StorageMountLeaseV1) {
     for name in ["astrid", "astrid-daemon"] {
         assert_entry_kind(&root_entries, name, StorageFilesystemEntryKindV1::File);
     }
+    assert!(!root_entries.iter().any(|entry| entry.name == "volume"));
 }
 
 async fn assert_packed_files(lease: &StorageMountLeaseV1, wasm_hash: &str) {
@@ -214,11 +215,6 @@ async fn assert_volume_and_socket_absent(lease: &StorageMountLeaseV1) {
         };
         assert_entry_kind(&var_entries, name, kind);
     }
-    assert!(
-        !var_entries
-            .iter()
-            .any(|entry| entry.name == "astrid.volume")
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

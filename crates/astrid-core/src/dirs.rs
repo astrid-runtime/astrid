@@ -25,8 +25,8 @@
 //! │   ├── gateway.toml                   daemon config
 //! │   ├── hooks/                         system hooks
 //! │   └── layout-version                 layout version sentinel
+//! ├── volume                            hosted Astrid-owned storage media
 //! ├── var/
-//! │   ├── astrid.volume                  hosted Astrid-owned storage volume
 //! │   ├── content-staging/                private acknowledged-write staging
 //! │   ├── migrations/                     durable layout intents and receipts
 //! │   └── state.db/                      temporary legacy import source (removed after verification)

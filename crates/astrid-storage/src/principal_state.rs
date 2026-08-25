@@ -751,7 +751,7 @@ async fn open_runtime_principal_store_with_options(
     principals: PrincipalDirectory,
     policy: DurableEnginePolicy<StateOwner>,
 ) -> StorageResult<RuntimePrincipalStore> {
-    if home.storage_volume_path().exists() {
+    if volume_migration::existing_volume_available(home)? {
         let (engine, receipt) =
             volume_migration::open_existing(home, policy)?.ok_or_else(|| {
                 StorageError::Connection("Astrid volume disappeared while opening".to_owned())
@@ -945,3 +945,5 @@ pub async fn open_runtime_kv_with_directory(
 mod purge_tests;
 #[cfg(test)]
 mod runtime_tests;
+#[cfg(test)]
+mod volume_migration_tests;

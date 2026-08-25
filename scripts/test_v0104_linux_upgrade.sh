@@ -384,9 +384,9 @@ import sys
 home = pathlib.Path(sys.argv[1])
 if (home / "etc/layout-version").read_bytes() != b"2":
     raise SystemExit("layout-version is not exactly 2")
-if not (home / "var/astrid.volume").is_file():
+if not (home / "volume").is_file():
     raise SystemExit("Astrid volume is absent after upgrade")
-if (home / "var/astrid.volume").stat().st_size == 0:
+if (home / "volume").stat().st_size == 0:
     raise SystemExit("Astrid volume is empty after upgrade")
 if (home / "var/state.db").exists():
     raise SystemExit("released var/state.db survived verified retirement")

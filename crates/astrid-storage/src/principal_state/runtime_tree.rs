@@ -11,7 +11,7 @@ use crate::error::{StorageError, StorageResult};
 
 use super::{ContiguousFileIngest, RuntimePrincipalStore, StateOwner};
 
-const VOLUME_PATH_PREFIX: &str = "var/astrid.volume";
+const VOLUME_PATH_PREFIX: &str = "volume";
 const SOCKET_PATH: &str = "run/system.sock";
 
 /// One regular file discovered in the native runtime tree.
@@ -226,11 +226,7 @@ mod tests {
 
     #[test]
     fn excludes_windows_separator_paths() {
-        for path in [
-            "var\\astrid.volume",
-            "var\\astrid.volume.compacting",
-            "run\\system.sock",
-        ] {
+        for path in ["volume", "volume\\compacting", "run\\system.sock"] {
             let normalized = normalize_relative_path(path);
             assert!(is_excluded(&normalized), "path was not excluded: {path}");
         }
@@ -291,9 +287,9 @@ mod tests {
             std::fs::write(path, bytes).unwrap();
         }
         for relative in [
-            "var/astrid.volume",
-            "var/astrid.volume.compacting",
-            "var/astrid.volume.previous",
+            "volume",
+            "volume.compacting",
+            "volume.previous",
             "run/system.sock",
         ] {
             let path = source.path().join(relative);

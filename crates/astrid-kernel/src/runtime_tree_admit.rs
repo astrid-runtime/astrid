@@ -295,7 +295,7 @@ mod tests {
         assert_eq!(Sha256::digest(&actual), Sha256::digest(&wasm));
         assert!(
             filesystem
-                .stat(&FilesystemPath::new("var/astrid.volume").unwrap())
+                .stat(&FilesystemPath::new("volume").unwrap())
                 .is_err()
         );
         assert!(fs::read_to_string(home.migrations_dir().join(RECEIPT_NAME)).is_ok());
@@ -336,7 +336,7 @@ mod tests {
                 "fresh home omitted generated runtime file {expected}: {names:?}"
             );
         }
-        assert!(!names.iter().any(|name| name == "var/astrid.volume"));
+        assert!(!names.iter().any(|name| name == "volume"));
         assert!(fs::read_to_string(home.migrations_dir().join(RECEIPT_NAME)).is_ok());
     }
 
