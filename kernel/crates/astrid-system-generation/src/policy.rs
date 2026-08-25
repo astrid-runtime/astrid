@@ -1,7 +1,9 @@
 //! Explicit trusted inputs and the result of successful admission.
 
 use crate::error::GenerationError;
-use crate::types::{ComponentSet, ContentId, Generation, ManifestSizes, SignedSystemGeneration};
+use crate::types::{
+    ComponentSet, ContentId, Generation, ManifestIdentity, ManifestSizes, SignedSystemGeneration,
+};
 
 /// Inert input DTO for constructing the trusted policy boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,11 +96,18 @@ impl TrustedInput {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VerifiedGeneration {
     signed: SignedSystemGeneration,
+    manifest_identity: ManifestIdentity,
 }
 
 impl VerifiedGeneration {
-    pub(crate) const fn new(signed: SignedSystemGeneration) -> Self {
-        Self { signed }
+    pub(crate) const fn new(
+        signed: SignedSystemGeneration,
+        manifest_identity: ManifestIdentity,
+    ) -> Self {
+        Self {
+            signed,
+            manifest_identity,
+        }
     }
 
     pub const fn manifest(self) -> crate::SystemGenerationManifest {
@@ -107,5 +116,11 @@ impl VerifiedGeneration {
 
     pub const fn signer(self) -> [u8; 32] {
         self.signed.signer()
+    }
+
+    /// Returns the stable identity of the exact canonical signed bytes that
+    /// passed verification.
+    pub const fn manifest_identity(self) -> ManifestIdentity {
+        self.manifest_identity
     }
 }

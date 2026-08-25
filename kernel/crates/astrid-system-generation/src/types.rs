@@ -18,6 +18,8 @@ pub const SIGNATURE_OFFSET: usize = SIGNER_OFFSET + KEY_LEN;
 pub const MANIFEST_LEN: usize = SIGNATURE_OFFSET + SIGNATURE_LEN;
 pub const REVOKED_FLAG: u8 = 1;
 
+const MANIFEST_IDENTITY_DOMAIN: &str = "astrid.system-generation.manifest-identity.v1";
+
 /// A non-zero domain-separated BLAKE3 content identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ContentId([u8; DIGEST_LEN]);
@@ -34,6 +36,26 @@ impl ContentId {
             return Err(GenerationError::InvalidContentId);
         }
         Ok(Self(bytes))
+    }
+
+    pub const fn as_bytes(self) -> [u8; DIGEST_LEN] {
+        self.0
+    }
+}
+
+/// The identity of a verified canonical signed manifest.
+///
+/// The field is intentionally private and the only constructor is the
+/// verifier-owned canonical-byte path. Callers may compare or copy an
+/// identity, but cannot mint one for an unverified manifest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ManifestIdentity([u8; DIGEST_LEN]);
+
+impl ManifestIdentity {
+    pub(crate) fn from_canonical(bytes: &[u8; MANIFEST_LEN]) -> Self {
+        let mut hasher = blake3::Hasher::new_derive_key(MANIFEST_IDENTITY_DOMAIN);
+        hasher.update(bytes);
+        Self(*hasher.finalize().as_bytes())
     }
 
     pub const fn as_bytes(self) -> [u8; DIGEST_LEN] {
@@ -330,18 +352,18 @@ impl SystemGenerationManifest {
 
 /// The signed envelope decoded from the fixed wire representation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SignedSystemGeneration {
+pub(crate) struct SignedSystemGeneration {
     pub(crate) manifest: SystemGenerationManifest,
     pub(crate) signer: [u8; KEY_LEN],
     pub(crate) signature: [u8; SIGNATURE_LEN],
 }
 
 impl SignedSystemGeneration {
-    pub const fn manifest(self) -> SystemGenerationManifest {
+    pub(crate) const fn manifest(self) -> SystemGenerationManifest {
         self.manifest
     }
 
-    pub const fn signer(self) -> [u8; KEY_LEN] {
+    pub(crate) const fn signer(self) -> [u8; KEY_LEN] {
         self.signer
     }
 }
