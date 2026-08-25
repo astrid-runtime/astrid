@@ -31,6 +31,8 @@ mod capsule_adversarial_tests;
 mod capsules_loaded;
 #[cfg(test)]
 mod capsules_loaded_tests;
+/// Internal first-owner enrollment and boot-authority gate.
+mod first_owner;
 /// Grant-on-first-use consent handler (issue #998).
 ///
 /// Native-only: reuses the management-API admin grant machinery
@@ -1142,17 +1144,32 @@ impl Kernel {
                     .map_err(|e| {
                         std::io::Error::other(format!("Failed to bootstrap CLI root user: {e}"))
                     })?;
-            bootstrap_cli_root_ownership(
-                &ownership_store,
-                &principal_directory,
-                root_user,
-                root_principal_identity,
-                adopt_released_layout_principals,
-            )
-            .await
-            .map_err(|error| {
-                std::io::Error::other(format!("Failed to bootstrap CLI root ownership: {error}"))
-            })?;
+            // A fresh host is Unenrolled and a crash-recovered ceremony is
+            // Pending; neither state may silently promote the CLI root. The
+            // legacy helper remains available for an already Enrolled graph
+            // so existing identities stay compatible.
+            if first_owner::legacy_root_bootstrap_allowed(&ownership_store)
+                .await
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "Failed to load first-owner boot authority: {error}"
+                    ))
+                })?
+            {
+                bootstrap_cli_root_ownership(
+                    &ownership_store,
+                    &principal_directory,
+                    root_user,
+                    root_principal_identity,
+                    adopt_released_layout_principals,
+                )
+                .await
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "Failed to bootstrap CLI root ownership: {error}"
+                    ))
+                })?;
+            }
 
             // Apply pre-configured identity links from config.
             apply_identity_config(&identity_store, &workspace_root, &workspace_layout).await;

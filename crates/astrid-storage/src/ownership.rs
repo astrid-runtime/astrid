@@ -17,10 +17,15 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::{KvStore, PrincipalDirectory, ScopedKvStore, StorageError};
 
+#[path = "ownership_first_owner.rs"]
+mod ownership_first_owner;
+pub use ownership_first_owner::{FirstOwnerEnrollment, FirstOwnerError};
+
 /// Namespace reserved for the authoritative ownership graph.
 pub const OWNERSHIP_NAMESPACE: &str = "system:ownership";
 const GRAPH_KEY: &str = "graph-v1";
-const GRAPH_FORMAT_VERSION: u16 = 1;
+const GRAPH_FORMAT_VERSION: u16 = 2;
+const LEGACY_GRAPH_FORMAT_VERSION: u16 = 1;
 const MAX_CAS_ATTEMPTS: usize = 64;
 
 /// One fleet identity and all current human memberships.
@@ -60,6 +65,10 @@ pub struct OwnershipSnapshot {
     principal_ownership: BTreeMap<PrincipalUid, PrincipalOwnership>,
     #[serde(default)]
     principal_deletions: BTreeMap<PrincipalUid, PrincipalDeletionReservation>,
+    /// First-owner enrollment is optional only while reading an empty v1
+    /// legacy graph. New writes always materialize the state explicitly.
+    #[serde(default)]
+    enrollment: Option<FirstOwnerEnrollment>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +85,7 @@ impl Default for OwnershipSnapshot {
             fleets: BTreeMap::new(),
             principal_ownership: BTreeMap::new(),
             principal_deletions: BTreeMap::new(),
+            enrollment: Some(FirstOwnerEnrollment::Unenrolled),
         }
     }
 }
@@ -118,6 +128,7 @@ impl OwnershipSnapshot {
         if self.format_version != GRAPH_FORMAT_VERSION {
             return Err(OwnershipError::UnsupportedFormat(self.format_version));
         }
+        self.validate_first_owner()?;
         for (uid, identity) in &self.users {
             identity.validate()?;
             if *uid != identity.uid {
@@ -805,13 +816,27 @@ impl OwnershipStore {
     }
 
     fn decode(&self, raw: Option<&[u8]>) -> Result<OwnershipSnapshot, OwnershipError> {
-        let graph = raw.map_or_else(
+        let mut graph = raw.map_or_else(
             || Ok(OwnershipSnapshot::default()),
             |bytes| {
                 serde_json::from_slice(bytes)
                     .map_err(|error| OwnershipError::Serialization(error.to_string()))
             },
         )?;
+        if graph.format_version == LEGACY_GRAPH_FORMAT_VERSION {
+            if graph.has_legacy_authority() {
+                return Err(OwnershipError::LegacyOwnershipRequiresEnrollment);
+            }
+            graph.format_version = GRAPH_FORMAT_VERSION;
+            graph.enrollment = Some(FirstOwnerEnrollment::Unenrolled);
+        } else if graph.format_version != GRAPH_FORMAT_VERSION {
+            return Err(OwnershipError::UnsupportedFormat(graph.format_version));
+        } else if graph.enrollment.is_none() {
+            if graph.has_legacy_authority() {
+                return Err(OwnershipError::LegacyOwnershipRequiresEnrollment);
+            }
+            graph.enrollment = Some(FirstOwnerEnrollment::Unenrolled);
+        }
         graph.validate(&self.principals)?;
         Ok(graph)
     }
@@ -859,6 +884,13 @@ pub enum OwnershipError {
     /// Stored graph uses an unknown format.
     #[error("unsupported ownership graph format version {0}")]
     UnsupportedFormat(u16),
+    /// A legacy graph already containing ownership cannot be guessed into a
+    /// first-owner enrollment state.
+    #[error("legacy ownership graph contains authority but no first-owner enrollment")]
+    LegacyOwnershipRequiresEnrollment,
+    /// First-owner enrollment failed closed.
+    #[error(transparent)]
+    FirstOwner(#[from] FirstOwnerError),
     /// Persisted relationships failed invariant validation.
     #[error("corrupt ownership graph: {0}")]
     CorruptGraph(String),
@@ -926,6 +958,9 @@ pub enum OwnershipError {
     ConcurrentModification,
 }
 
+#[cfg(test)]
+#[path = "ownership_first_owner_tests.rs"]
+mod first_owner_tests;
 #[cfg(test)]
 #[path = "ownership_tests.rs"]
 mod tests;

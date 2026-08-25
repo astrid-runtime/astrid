@@ -14,9 +14,10 @@ test-support = []
 
 [dependencies]
 async-trait = { workspace = true }
-astrid-resource-types = { workspace = true }
+astrid-resource-types = { workspace = true, features = ["serde"] }
 base64 = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
+ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }

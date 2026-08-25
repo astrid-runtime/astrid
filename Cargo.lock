@@ -502,6 +502,7 @@ dependencies = [
  "blake3",
  "chrono",
  "directories",
+ "ed25519-dalek",
  "fs2",
  "getrandom 0.4.3",
  "hex",
