@@ -287,7 +287,7 @@ async fn dispatch_services(
         | AdminRequestKind::StorageMountStatus { .. }
         | AdminRequestKind::StorageMountSync { .. }
         | AdminRequestKind::StorageMountRevoke { .. }) => {
-            super::storage_mount_handlers::dispatch(kernel, caller, authorization, req).await
+            super::storage_mount_handlers::dispatch(kernel, authorization, req).await
         },
         AdminRequestKind::AuditStats => super::audit_handlers::stats(kernel).await,
         AdminRequestKind::AuditPrune {

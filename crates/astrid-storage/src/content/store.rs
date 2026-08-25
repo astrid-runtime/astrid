@@ -756,6 +756,7 @@ where
         principal: &P,
         name: &ContentName,
     ) -> Result<Option<PrincipalContentReadHandle<P, E>>, PrincipalContentError> {
+        let _in_flight = self.read_leases.begin_open();
         let header = self.header(principal)?;
         let Some(entry) = self.catalog_lookup(principal, header.catalog, name)? else {
             return Ok(None);
@@ -783,6 +784,8 @@ where
                 "catalog and file logical lengths disagree",
             ));
         }
+        #[cfg(test)]
+        self.read_leases.pause_after_resolve_for_test();
         let lease = self.read_leases.register(principal.clone(), entry.file);
         Ok(Some(PrincipalContentReadHandle {
             engine: Arc::clone(&self.engine),
@@ -800,6 +803,21 @@ where
     /// the engine fence recheck; a stale plan fails closed.
     pub(crate) fn compaction_read_handle_roots(&self) -> Vec<(P, ObjectId)> {
         self.read_leases.roots()
+    }
+
+    /// Snapshot live handle roots after the caller owns the engine mutation fence.
+    pub(crate) fn begin_compaction_observation(
+        &self,
+    ) -> Result<CompactionObservationGuard<P>, CompactionObservationError> {
+        self.read_leases.begin_compaction_observation()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_open_read_before_register_gate(&self) -> Arc<OpenReadTestGate> {
+        let gate = OpenReadTestGate::new();
+        self.read_leases
+            .install_open_read_test_gate(Arc::clone(&gate));
+        gate
     }
 
     /// Reconstruct one complete named value.
@@ -947,7 +965,10 @@ mod read_handle;
 mod workspace;
 
 use read_handle::ContentReadLeaseRegistry;
+#[cfg(test)]
+pub(crate) use read_handle::OpenReadTestGate;
 pub use read_handle::PrincipalContentReadHandle;
+pub(crate) use read_handle::{CompactionObservationError, CompactionObservationGuard};
 
 use projection::{
     CachedVerifiedContent, ContentHeader, DeferredAdmission, EngineIdentity, EngineSink,

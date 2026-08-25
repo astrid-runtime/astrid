@@ -43,7 +43,7 @@ pub use durable::{
     FaultInjector, FaultPoint, GroupCommitPolicy, IdentityScheme, NoFaults, ObjectCacheCapacity,
     ObjectCacheConfig, ObjectCacheController, ObjectCacheMemoryBudget, ObjectCacheStats,
     PersistentObjectIdentity, PrincipalCodec, PrincipalObjectCacheBudget, RecoveryLimits,
-    RecoveryRetryPolicy, TransactionWalPolicy, VerifiedCompactionPlan,
+    RecoveryRetryPolicy, RejectedRootCandidate, TransactionWalPolicy, VerifiedCompactionPlan,
     deterministic_compaction_proof,
 };
 pub use kv::{

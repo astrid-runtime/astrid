@@ -336,6 +336,8 @@ where
             published_roots: super::PublishedRoots::new(&recovered.roots_by_principal),
             inner: Mutex::new(DurableInner {
                 roots_by_principal: recovered.roots_by_principal,
+                journal_heads: recovered.journal_heads,
+                rejected_roots: recovered.rejected_roots,
                 index: recovered.index,
                 pending_wal: super::wal::PendingWalOverlay::default(),
                 pending_index_locations: Vec::new(),

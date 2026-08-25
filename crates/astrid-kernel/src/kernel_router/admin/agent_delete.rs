@@ -64,6 +64,13 @@ pub(super) async fn agent_delete(
         }
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    if let Err(error) =
+        crate::storage_mount::revoke_all_leases_for_principal(kernel, &principal).await
+    {
+        return err_internal(format!("storage mount lease drain failed: {error}"));
+    }
+
     if let Err(e) = kernel
         .identity_store
         .unlink(AGENT_IDENTITY_PLATFORM, principal.as_str())
