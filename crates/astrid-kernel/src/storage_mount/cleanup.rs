@@ -8,6 +8,12 @@ use astrid_core::storage_provider::StorageMountId;
 
 use super::LEASE_MANIFEST_NAME;
 
+/// The Windows private-file writer leaves its transaction lock as a named
+/// artifact after the handle is released. Mount cleanup owns this one file;
+/// every other unexpected entry must keep directory removal fail-closed.
+#[cfg(windows)]
+const PRIVATE_WRITE_TRANSACTION_LOCK_NAME: &str = ".astrid-private-write.lock";
+
 /// Stage that failed while removing a native mount's private resources.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MountCleanupStage {
@@ -78,6 +84,21 @@ pub(super) fn cleanup_resource_paths(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {},
         Err(error) => return Err((MountCleanupStage::Manifest, error)),
     }
+    #[cfg(windows)]
+    {
+        // Any private-file manifest transaction has returned before this
+        // function is called, and mapped cleanup has released its listener.
+        // The Windows writer leaves this exact lock artifact behind. Do not
+        // scan or recursively remove the directory: unknown entries must
+        // remain a directory-stage failure for an explicit retry path.
+        // Report lock errors at Manifest because this is manifest transaction
+        // metadata, not an unknown directory entry cleanup may ignore.
+        match std::fs::remove_file(resource_path.join(PRIVATE_WRITE_TRANSACTION_LOCK_NAME)) {
+            Ok(()) => {},
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+            Err(error) => return Err((MountCleanupStage::Manifest, error)),
+        }
+    }
     if fault == Some(MountCleanupStage::Directory) {
         return Err((
             MountCleanupStage::Directory,
@@ -104,5 +125,70 @@ pub(super) fn cleanup_error(
         mount_id,
         stage,
         source,
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::{MountCleanupStage, PRIVATE_WRITE_TRANSACTION_LOCK_NAME, cleanup_resource_paths};
+
+    #[test]
+    fn cleanup_removes_known_writer_lock_but_preserves_unknown_entries() {
+        let temporary = tempfile::tempdir().expect("temporary cleanup root");
+        let resource_path = temporary.path().join("mounts").join("resource");
+        std::fs::create_dir_all(&resource_path).expect("resource directory");
+        let callback_path = resource_path.join("control.endpoint");
+        std::fs::write(resource_path.join("lease.json"), b"manifest").expect("lease manifest");
+        std::fs::write(
+            resource_path.join(PRIVATE_WRITE_TRANSACTION_LOCK_NAME),
+            b"transaction lock",
+        )
+        .expect("writer lock artifact");
+        let unrelated = resource_path.join("unexpected-entry");
+        std::fs::write(&unrelated, b"must remain").expect("unrelated entry");
+
+        let error = cleanup_resource_paths(&resource_path, &callback_path, None)
+            .expect_err("unknown resource entries must keep cleanup fail-closed");
+        assert_eq!(error.0, MountCleanupStage::Directory);
+        assert!(
+            !resource_path
+                .join(PRIVATE_WRITE_TRANSACTION_LOCK_NAME)
+                .exists(),
+            "known writer lock should be removed before directory cleanup"
+        );
+        assert!(unrelated.exists(), "unknown entries must never be removed");
+        assert!(resource_path.exists(), "directory remains for retry");
+
+        std::fs::remove_file(&unrelated).expect("remove test residue");
+        cleanup_resource_paths(&resource_path, &callback_path, None)
+            .expect("cleanup should succeed once unknown entry is removed");
+        assert!(!resource_path.exists());
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::{MountCleanupStage, cleanup_resource_paths};
+
+    #[test]
+    fn cleanup_preserves_unknown_entries_and_retries() {
+        let temporary = tempfile::tempdir().expect("temporary cleanup root");
+        let resource_path = temporary.path().join("mounts").join("resource");
+        std::fs::create_dir_all(&resource_path).expect("resource directory");
+        let callback_path = resource_path.join("control.sock");
+        std::fs::write(resource_path.join("lease.json"), b"manifest").expect("lease manifest");
+        let unrelated = resource_path.join("unexpected-entry");
+        std::fs::write(&unrelated, b"must remain").expect("unrelated entry");
+
+        let error = cleanup_resource_paths(&resource_path, &callback_path, None)
+            .expect_err("unknown resource entries must keep cleanup fail-closed");
+        assert_eq!(error.0, MountCleanupStage::Directory);
+        assert!(unrelated.exists(), "unknown entries must never be removed");
+        assert!(resource_path.exists(), "directory remains for retry");
+
+        std::fs::remove_file(&unrelated).expect("remove test residue");
+        cleanup_resource_paths(&resource_path, &callback_path, None)
+            .expect("cleanup should succeed once unknown entry is removed");
+        assert!(!resource_path.exists());
     }
 }
