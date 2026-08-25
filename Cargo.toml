@@ -74,7 +74,7 @@ astrid-workspace = { path = "crates/astrid-workspace", version = "0.10.4" }
 anyhow = "1.0"
 arboard = "3"
 arc-swap = "1.7"
-lz4_flex = "0.12"
+lz4_flex = "0.14"
 # Streaming + HTTP-server deps (async-stream, axum, tokio-stream,
 # tower, tower-http, utoipa) all back the new `astrid-gateway` crate
 # and have no in-workspace substitute. They are scoped to
@@ -120,7 +120,7 @@ flate2 = "1.0"
 # Chunk boundaries are persistent principal-store format, not merely an
 # implementation detail. Exact-pin the audited FastCDC 2020 implementation;
 # upgrades require golden-boundary verification and a new chunking profile.
-fastcdc = "=4.0.1"
+fastcdc = "=5.0.0"
 fs2 = "0.4"
 futures = "0.3"
 globset = "0.4"
@@ -232,7 +232,7 @@ thiserror = "2.0"
 # `rt-multi-thread`).
 tokio = { version = "1.49", features = ["sync", "macros", "time", "rt", "io-util"] }
 tokio-util = "0.7"
-toml = "0.9"
+toml = "1.1"
 # Middleware substrate axum is built on (`Service` trait composition,
 # request-id, trace, CORS, body-size limit, response-header injection).
 # Dropping `tower-http` means re-implementing each middleware by hand;
@@ -254,13 +254,13 @@ url = "2"
 utoipa = { version = "5", features = ["axum_extras"] }
 uuid = { version = "1.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
 walkdir = "2.5"
-wasm-encoder = "0.256"
+wasm-encoder = "0.257"
 wat = "1.256"
-wasmparser = "0.256"
+wasmparser = "0.257"
 windows-sys = "0.61"
-wit-component = "0.256"
-wit-parser = "0.256"
-wasmtime = { version = "47.0.3", features = ["component-model", "cranelift"] }
+wit-component = "0.257"
+wit-parser = "0.257"
+wasmtime = { version = "48.0.0", features = ["component-model", "cranelift"] }
 wasmtime-wasi = "47.0.3"
 unicode-normalization = "=0.1.25"
 unicode-width = "0.2"
