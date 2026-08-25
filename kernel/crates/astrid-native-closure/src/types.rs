@@ -73,6 +73,74 @@ impl GenerationFloor {
     }
 }
 
+/// Monotonic generation of an authenticated loader policy.
+///
+/// This is separate from the two artifact floors: a policy can advance its
+/// generation while retaining independent rollback floors for kernel and
+/// System Generation artifacts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PolicyGeneration(u64);
+
+impl PolicyGeneration {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    pub const fn to_le_bytes(self) -> [u8; 8] {
+        self.0.to_le_bytes()
+    }
+
+    pub const fn from_le_bytes(bytes: [u8; 8]) -> Self {
+        Self(u64::from_le_bytes(bytes))
+    }
+}
+
+/// A fixed-size loader measurement binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoaderMeasurement([u8; 32]);
+
+impl LoaderMeasurement {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// A fixed-size loader identity binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoaderIdentity([u8; 32]);
+
+impl LoaderIdentity {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// A fixed-size boot-context binding supplied independently by the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BootContextBinding([u8; 32]);
+
+impl BootContextBinding {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
 /// blake3 measurement of a closure payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MeasuredIdentity([u8; 32]);
