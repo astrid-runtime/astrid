@@ -6,9 +6,11 @@ negative-first self-tests, and halts with a machine-checkable outcome.
 This child adds a fixed 734-byte loader bundle: a 379-byte `ASTRIDPH`
 root-signed policy handoff followed by a 355-byte `ASTRIDDC` dual-closure
 table. Ring 0 validates the mapped ramdisk, copies it into kernel-owned
-memory, measures the raw ELF physical span named by BootInfo, checks the
-handoff bindings, constructs the authorized subordinate policy, and then
-binds both closure identities.
+memory, checks a bounded receipt produced by the pre-relocation UEFI loader,
+re-verifies the signed handoff/table bindings, constructs the authorized
+subordinate policy, and then binds both closure identities. The loader
+measures the original `Kernel.elf.input` before writable PT_LOAD mappings;
+ring 0 never hashes the mutable `BootInfo::kernel_addr` backing span.
 
 The root verifier is an emulator fixture key with independent minimum
 generation/floors; the signed handoff authorizes subordinate keys and keeps
@@ -51,6 +53,10 @@ KVM, virtio, or IOMMU, and therefore does not prove that topology.
   requires explicit root/kernel/sysgen key files, and embeds the exact
   handoff+table bundle as a bootloader ramdisk (not a guest filesystem).
 - `tools/ktest/` — QEMU serial-assertion harness and host unit tests.
+- `tools/bootloader/` — minimal vendored bootloader 0.11.16 UEFI/API/common
+  sources with the pre-relocation verification hook and bounded `BootInfo`
+  receipt. Upstream MIT/Apache notices are retained; BIOS/test-kernel sources
+  are not part of this fixture.
 
 ## Run
 
@@ -62,8 +68,10 @@ The harness builds the kernel, builds the UEFI image twice (determinism
 measurement), boots QEMU (`q35`, explicit `tcg`, UEFI pflash, 1 CPU,
 256 MiB, COM1, `-display none`, `isa-debug-exit`), captures JSONL serial,
 and asserts one combined serial sequence (boot, handoff binding, both closure
-identities/floors, bound, M1 milestones, halt). QEMU is killed after two
-minutes.
+identities/floors, bound, M1 milestones, halt). It also boots a deliberately
+tampered signed bundle and requires loader rejection before `boot.entry`; that
+negative run is killed after a bounded 15-second timeout. Normal QEMU runs are
+killed after two minutes.
 
 Firmware discovery used on this host: executable-relative QEMU share,
 package prefixes (Homebrew is one), well-known OVMF paths, and env
@@ -111,10 +119,14 @@ the parent target lock.
 - any `test.fail` fails the run, including unknown names such as
   `future_gate`.
 - `halt` with `outcome:"ok"` and QEMU exit code 33.
+- host pre-relocation falsifiers reject altered length, root, subordinate key,
+  floor, generation, context, kernel digest, and table bytes; receipt falsifiers
+  reject forged status/digests/bundle bytes. A deliberate mutation of the raw
+  ELF backing after loader verification leaves the receipt acceptance stable.
 - host `verify_policy_handoff` accepts the exact handoff against independent
   root/context inputs, then `verify_table` accepts the table using the
-  root-authorized subordinate policy. Serial `handoff.bound` carries the raw
-  ELF and closure-table measurements. Serial `closure.kernel` /
+  root-authorized subordinate policy. Serial `handoff.bound` carries the
+  pre-relocation raw ELF and closure-table measurements. Serial `closure.kernel` /
   `closure.sysgen` / `closure.bound` carry independent `kernel_floor` and `sysgen_floor`
   and match the measured ELF identity and the empty System Generation
   identity.
@@ -131,15 +143,15 @@ Hermes claim. Timing is not evidence. Image determinism is reported
 honestly: `DETERMINISM: FAIL` does not fail boot assertions and is not
 coerced to PASS.
 
-Ring 0 compiles only the emulator-fixture **root public key** plus independent
-minimum floors/generation. It validates the physical mapping and hashes the
-raw loader-provided ELF span; it does not hash the relocated image,
-bootloader, or firmware. Fixture **private** keys are supplied explicitly to
+The pre-relocation hook and ring 0 compile only the emulator-fixture **root
+public key** and minimum generation/floors. The loader measures the original
+raw ELF bytes before writable PT_LOAD mappings; ring 0 checks that signed
+evidence and never hashes the relocated image, bootloader, firmware, or
+`BootInfo::kernel_addr`. Fixture **private** keys are supplied explicitly to
 host-only `kimage` and are not present in ring 0. This child does **not** prove
-firmware authenticated the loader, a production root of trust, self-measurement,
-or an owner ceremony. Table header keys and `min_floor` remain untrusted
-advertisements. The 64 MiB raw-ELF bound is a fixed ring-0 DoS guard for this
-256 MiB emulator machine contract, not an operator configuration knob.
+firmware authenticated the loader, a production root of trust, hardware
+self-measurement, or an owner ceremony. Table header keys and `min_floor`
+remain untrusted advertisements.
 
 ## Checks
 

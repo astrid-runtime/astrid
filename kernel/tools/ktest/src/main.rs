@@ -17,11 +17,12 @@ use astrid_native_closure::{
     LoaderMeasurement, MeasuredIdentity, PolicyGeneration, RootVerifier, TABLE_LEN, TrustedPolicy,
     verify_policy_handoff, verify_table,
 };
+use bootloader_api::info::LoaderHandoffVerification;
 use ktest::determinism::{Determinism, compare_images};
 use ktest::events::{ExpectedClosures, assert_boot, parse_events};
 use ktest::firmware;
 use ktest::image::{KIMAGE_NIGHTLY, KimageInvocation};
-use ktest::machine::{self, EXPECT_EXIT_CODE, QEMU_BIN, TIMEOUT};
+use ktest::machine::{self, EXPECT_EXIT_CODE, QEMU_BIN, TAMPER_TIMEOUT, TIMEOUT};
 use wait_timeout::ChildExt;
 
 fn main() -> Result<()> {
@@ -56,9 +57,11 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&out_dir).context("creating kimage output dir")?;
     let image_a = out_dir.join("astrid-native-kernel-a.img");
     let image_b = out_dir.join("astrid-native-kernel-b.img");
+    let tampered_image = out_dir.join("astrid-native-kernel-tampered.img");
     println!("== building UEFI disk image (x2) ==");
     build_image(&root, &kernel_elf, &image_a)?;
     build_image(&root, &kernel_elf, &image_b)?;
+    build_tampered_image(&root, &kernel_elf, &tampered_image)?;
 
     let determinism = compare_images(&image_a, &image_b)?;
     let (kernel_hex, sysgen_hex, kernel_image_hex, closure_table_hex) =
@@ -74,7 +77,7 @@ fn main() -> Result<()> {
         "== booting under QEMU (q35/UEFI/TCG explicit accel, timeout {}s) ==",
         TIMEOUT.as_secs()
     );
-    let run = run_qemu(&out_dir, &firmware.code, &firmware.vars, &image_a)?;
+    let run = run_qemu(&out_dir, &firmware.code, &firmware.vars, &image_a, TIMEOUT)?;
 
     let events = parse_events(&run.serial);
     println!("\n== parsed {} kernel event(s) ==", events.len());
@@ -95,6 +98,13 @@ fn main() -> Result<()> {
     print_summary(determinism, run.exit_code, assertions_ok);
 
     if assertions_ok {
+        assert_tampered_boot_rejected(&run_qemu(
+            &out_dir,
+            &firmware.code,
+            &firmware.vars,
+            &tampered_image,
+            TAMPER_TIMEOUT,
+        )?)?;
         Ok(())
     } else {
         bail!("boot assertions failed");
@@ -117,6 +127,14 @@ fn tools_toolchain() -> String {
 fn build_image(root: &Path, kernel_elf: &Path, output: &Path) -> Result<()> {
     let inv = KimageInvocation::new(root, tools_toolchain());
     run_inherited(&mut inv.command(root, kernel_elf, output), "kimage")
+}
+
+fn build_tampered_image(root: &Path, kernel_elf: &Path, output: &Path) -> Result<()> {
+    let inv = KimageInvocation::new(root, tools_toolchain());
+    run_inherited(
+        &mut inv.command_with_tampered_handoff(root, kernel_elf, output),
+        "kimage tampered handoff",
+    )
 }
 
 fn identity_hex(id: MeasuredIdentity) -> String {
@@ -171,27 +189,30 @@ fn loader_identities(
         verify_policy_handoff(&bytes_a[..HANDOFF_LEN], &root, &expected).map_err(|err| {
             anyhow::anyhow!("host verify_policy_handoff rejected: {}", err.as_reason())
         })?;
+    let policy_handoff = handoff.policy();
     let policy = TrustedPolicy::try_new(
-        handoff.policy.kernel_verify,
-        handoff.policy.sysgen_verify,
-        handoff.policy.kernel_floor,
-        handoff.policy.sysgen_floor,
+        policy_handoff.kernel_verify(),
+        policy_handoff.sysgen_verify(),
+        policy_handoff.kernel_floor(),
+        policy_handoff.sysgen_floor(),
     )
     .map_err(|err| anyhow::anyhow!("handoff policy rejected: {}", err.as_reason()))?;
     let bound = verify_table(table_bytes, &policy)
         .map_err(|err| anyhow::anyhow!("host verify_table rejected: {}", err.as_reason()))?;
     let sysgen_id = MeasuredIdentity::empty_sysgen();
-    if bound.kernel_bootstrap != kernel_id {
+    if bound.kernel_identity() != kernel_id {
         bail!("loader kernel identity does not match measured ELF");
     }
-    if bound.system_generation != sysgen_id {
+    if bound.sysgen_identity() != sysgen_id {
         bail!("loader sysgen identity is not the empty System Generation");
     }
     if !bound.distinct() {
         bail!("loader identities are not distinct");
     }
-    hostile_bundle_checks(&bytes_a, &elf, &expected, &policy)?;
-    let kernel_hex = identity_hex(bound.kernel_bootstrap);
+    let receipt = loader_receipt(&bytes_a, &handoff, kernel_id, closure_table);
+    pre_relocation_hostile_checks(&bytes_a, &elf, &expected, &policy)?;
+    receipt_checks(&bytes_a, &elf, &receipt, &handoff, &expected)?;
+    let kernel_hex = identity_hex(bound.kernel_identity());
     let sysgen_hex = identity_hex(sysgen_id);
     let kernel_image_hex = identity_hex(kernel_id);
     let closure_table_hex = identity_hex(closure_table);
@@ -222,7 +243,35 @@ fn expected_context(
     )
 }
 
-fn hostile_bundle_checks(
+fn loader_receipt(
+    bundle: &[u8],
+    handoff: &astrid_native_closure::AuthenticatedPolicyHandoff,
+    kernel_image: MeasuredIdentity,
+    closure_table: MeasuredIdentity,
+) -> LoaderHandoffVerification {
+    LoaderHandoffVerification {
+        magic: *b"ASTRIDLV",
+        version: 1,
+        status: 1,
+        reserved: [0; 6],
+        envelope_digest: MeasuredIdentity::from_payload(&bundle[..HANDOFF_LEN]).as_bytes(),
+        kernel_image: kernel_image.as_bytes(),
+        closure_table: closure_table.as_bytes(),
+        loader_measurement: handoff.policy().context().loader_measurement.as_bytes(),
+        loader_identity: handoff.policy().context().loader_identity.as_bytes(),
+        boot_context: handoff.policy().context().boot_context.as_bytes(),
+        root_verify: handoff.root_verify(),
+        kernel_verify: handoff.policy().kernel_verify(),
+        sysgen_verify: handoff.policy().sysgen_verify(),
+        policy_generation: handoff.policy().policy_generation().get(),
+        kernel_floor: handoff.policy().kernel_floor().get(),
+        sysgen_floor: handoff.policy().sysgen_floor().get(),
+    }
+}
+
+/// Host-side execution of the pre-relocation handoff falsifiers. These run
+/// before QEMU and cover every fixed-width field authenticated by the loader.
+fn pre_relocation_hostile_checks(
     bundle: &[u8],
     elf: &[u8],
     expected: &HandoffContext,
@@ -272,6 +321,18 @@ fn hostile_bundle_checks(
     if verify_policy_handoff(&bundle[..HANDOFF_LEN], &wrong_root, expected).is_ok() {
         bail!("wrong root unexpectedly accepted");
     }
+    for (name, offset) in [
+        ("subkey", 67usize),
+        ("floor", 131usize),
+        ("generation", 147usize),
+        ("kernel_digest", 155usize),
+    ] {
+        let mut altered = bundle[..HANDOFF_LEN].to_vec();
+        altered[offset] ^= 1;
+        if verify_policy_handoff(&altered, &root, expected).is_ok() {
+            bail!("pre-hook {name} mutation unexpectedly accepted");
+        }
+    }
     let mut table = bundle[HANDOFF_LEN..].to_vec();
     table[0] ^= 1;
     if verify_table(&table, policy).is_ok() {
@@ -280,8 +341,86 @@ fn hostile_bundle_checks(
     if elf.is_empty() {
         bail!("empty raw ELF fixture");
     }
-    println!("hostile handoff/table falsifiers: PASS");
+    println!("pre-relocation hostile handoff/table falsifiers: PASS");
     Ok(())
+}
+
+fn receipt_matches(
+    bundle: &[u8],
+    receipt: &LoaderHandoffVerification,
+    handoff: &astrid_native_closure::AuthenticatedPolicyHandoff,
+    expected: &HandoffContext,
+) -> bool {
+    receipt.magic == *b"ASTRIDLV"
+        && receipt.version == 1
+        && receipt.status == 1
+        && receipt.reserved == [0; 6]
+        && receipt.envelope_digest
+            == MeasuredIdentity::from_payload(&bundle[..HANDOFF_LEN]).as_bytes()
+        && receipt.closure_table
+            == MeasuredIdentity::from_payload(&bundle[HANDOFF_LEN..]).as_bytes()
+        && receipt.kernel_image == expected.kernel_image.as_bytes()
+        && receipt.loader_measurement == expected.loader_measurement.as_bytes()
+        && receipt.loader_identity == expected.loader_identity.as_bytes()
+        && receipt.boot_context == expected.boot_context.as_bytes()
+        && receipt.root_verify == handoff.root_verify()
+        && receipt.kernel_verify == handoff.policy().kernel_verify()
+        && receipt.sysgen_verify == handoff.policy().sysgen_verify()
+        && receipt.policy_generation == handoff.policy().policy_generation().get()
+        && receipt.kernel_floor == handoff.policy().kernel_floor().get()
+        && receipt.sysgen_floor == handoff.policy().sysgen_floor().get()
+}
+
+fn receipt_checks(
+    bundle: &[u8],
+    elf: &[u8],
+    receipt: &LoaderHandoffVerification,
+    handoff: &astrid_native_closure::AuthenticatedPolicyHandoff,
+    expected: &HandoffContext,
+) -> Result<()> {
+    if !receipt_matches(bundle, receipt, handoff, expected) {
+        bail!("valid loader receipt rejected by host evidence check");
+    }
+    for (name, mutate) in [
+        (
+            "receipt status",
+            mutate_status as fn(&mut LoaderHandoffVerification),
+        ),
+        ("receipt envelope digest", mutate_envelope),
+        ("receipt table digest", mutate_table),
+    ] {
+        let mut altered = *receipt;
+        mutate(&mut altered);
+        if receipt_matches(bundle, &altered, handoff, expected) {
+            bail!("forged {name} unexpectedly accepted");
+        }
+    }
+    let mut altered_bundle = bundle.to_vec();
+    altered_bundle[HANDOFF_LEN] ^= 1;
+    if receipt_matches(&altered_bundle, receipt, handoff, expected) {
+        bail!("forged bundle unexpectedly accepted with old receipt");
+    }
+    // Once loader evidence is emitted, later mutation of its raw backing
+    // cannot change ring-0 acceptance: ring 0 never hashes kernel_addr.
+    let mut mutated_raw = elf.to_vec();
+    mutated_raw[0] ^= 1;
+    if !receipt_matches(bundle, receipt, handoff, expected) || mutated_raw == elf {
+        bail!("post-verification raw backing mutation changed evidence");
+    }
+    println!("loader receipt tamper/raw-backing falsifiers: PASS");
+    Ok(())
+}
+
+fn mutate_status(receipt: &mut LoaderHandoffVerification) {
+    receipt.status ^= 1;
+}
+
+fn mutate_envelope(receipt: &mut LoaderHandoffVerification) {
+    receipt.envelope_digest[0] ^= 1;
+}
+
+fn mutate_table(receipt: &mut LoaderHandoffVerification) {
+    receipt.closure_table[0] ^= 1;
 }
 
 fn print_summary(determinism: Determinism, exit_code: Option<i32>, assertions_ok: bool) {
@@ -306,9 +445,16 @@ fn print_summary(determinism: Determinism, exit_code: Option<i32>, assertions_ok
 struct QemuRun {
     serial: String,
     exit_code: Option<i32>,
+    timed_out: bool,
 }
 
-fn run_qemu(out_dir: &Path, code: &Path, vars_template: &Path, image: &Path) -> Result<QemuRun> {
+fn run_qemu(
+    out_dir: &Path,
+    code: &Path,
+    vars_template: &Path,
+    image: &Path,
+    timeout: std::time::Duration,
+) -> Result<QemuRun> {
     let vars = out_dir.join("vars.fd");
     std::fs::copy(vars_template, &vars)
         .with_context(|| format!("copying vars flash from {}", vars_template.display()))?;
@@ -335,12 +481,12 @@ fn run_qemu(out_dir: &Path, code: &Path, vars_template: &Path, image: &Path) -> 
         buf
     });
 
-    let status = match child.wait_timeout(TIMEOUT).context("waiting on qemu")? {
-        Some(status) => status,
+    let (status, timed_out) = match child.wait_timeout(timeout).context("waiting on qemu")? {
+        Some(status) => (status, false),
         None => {
-            eprintln!("!! QEMU exceeded {}s — killing", TIMEOUT.as_secs());
+            eprintln!("!! QEMU exceeded {}s — killing", timeout.as_secs());
             let _ = child.kill();
-            child.wait().context("reaping killed qemu")?
+            (child.wait().context("reaping killed qemu")?, true)
         },
     };
 
@@ -348,7 +494,36 @@ fn run_qemu(out_dir: &Path, code: &Path, vars_template: &Path, image: &Path) -> 
     Ok(QemuRun {
         serial: String::from_utf8_lossy(&serial).into_owned(),
         exit_code: status.code(),
+        timed_out,
     })
+}
+
+fn assert_tampered_boot_rejected(run: &QemuRun) -> Result<()> {
+    let events = parse_events(&run.serial);
+    let entered = events
+        .iter()
+        .any(|event| ktest::events::ev_name(event) == "boot.entry");
+    let reached_kernel = events.iter().any(|event| {
+        let name = ktest::events::ev_name(event);
+        name == "idt.ready" || name.starts_with("closure.") || name == "mem.map"
+    });
+    let rejected = run.serial.contains("Astrid policy handoff rejected");
+    println!(
+        "tampered handoff: timed_out={} exit={:?} events={} loader_rejection_text={}",
+        run.timed_out,
+        run.exit_code,
+        events.len(),
+        rejected
+    );
+    if entered || reached_kernel || !run.timed_out || !rejected {
+        bail!(
+            "tampered handoff did not fail before kernel entry (entered={entered}, reached_kernel={reached_kernel}, timed_out={}, rejected_text={rejected}, serial={:?})",
+            run.timed_out,
+            run.serial
+        );
+    }
+    println!("tampered handoff fail-before-entry: PASS");
+    Ok(())
 }
 
 fn run_inherited(cmd: &mut Command, what: &str) -> Result<()> {

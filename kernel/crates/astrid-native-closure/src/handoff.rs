@@ -60,18 +60,29 @@ impl HandoffContext {
 }
 
 /// Root-authorized subordinate policy and its bound boot context.
+///
+/// The fields are intentionally opaque outside this crate. Host signing uses
+/// [`PolicyHandoff::for_signing`] only when the explicit `sign` feature is
+/// enabled; runtime callers can obtain a value only from verification.
+///
+/// ```compile_fail
+/// use astrid_native_closure::PolicyHandoff;
+/// fn cannot_forge(value: PolicyHandoff) {
+///     let _ = value.kernel_verify;
+/// }
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PolicyHandoff {
-    pub kernel_verify: [u8; 32],
-    pub sysgen_verify: [u8; 32],
-    pub kernel_floor: GenerationFloor,
-    pub sysgen_floor: GenerationFloor,
-    pub policy_generation: PolicyGeneration,
-    pub context: HandoffContext,
+    kernel_verify: [u8; 32],
+    sysgen_verify: [u8; 32],
+    kernel_floor: GenerationFloor,
+    sysgen_floor: GenerationFloor,
+    policy_generation: PolicyGeneration,
+    context: HandoffContext,
 }
 
 impl PolicyHandoff {
-    pub const fn new(
+    pub(crate) const fn from_parts(
         kernel_verify: [u8; 32],
         sysgen_verify: [u8; 32],
         kernel_floor: GenerationFloor,
@@ -88,13 +99,85 @@ impl PolicyHandoff {
             context,
         }
     }
+
+    /// Construct a host-only statement for signing.
+    ///
+    /// Runtime verification never exposes a public raw constructor. This
+    /// entry point exists only for the explicit `sign` feature (and tests),
+    /// which is used by the fixture image builder.
+    #[cfg(any(test, feature = "sign"))]
+    pub fn for_signing(
+        kernel_verify: [u8; 32],
+        sysgen_verify: [u8; 32],
+        kernel_floor: GenerationFloor,
+        sysgen_floor: GenerationFloor,
+        policy_generation: PolicyGeneration,
+        context: HandoffContext,
+    ) -> Self {
+        Self::from_parts(
+            kernel_verify,
+            sysgen_verify,
+            kernel_floor,
+            sysgen_floor,
+            policy_generation,
+            context,
+        )
+    }
+
+    pub const fn kernel_verify(self) -> [u8; 32] {
+        self.kernel_verify
+    }
+
+    pub const fn sysgen_verify(self) -> [u8; 32] {
+        self.sysgen_verify
+    }
+
+    pub const fn kernel_floor(self) -> GenerationFloor {
+        self.kernel_floor
+    }
+
+    pub const fn sysgen_floor(self) -> GenerationFloor {
+        self.sysgen_floor
+    }
+
+    pub const fn policy_generation(self) -> PolicyGeneration {
+        self.policy_generation
+    }
+
+    pub const fn context(self) -> HandoffContext {
+        self.context
+    }
 }
 
 /// Values returned only after the root signature and all bindings pass.
+///
+/// ```compile_fail
+/// use astrid_native_closure::AuthenticatedPolicyHandoff;
+/// fn cannot_forge(value: AuthenticatedPolicyHandoff) {
+///     let _ = value.policy;
+/// }
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuthenticatedPolicyHandoff {
-    pub root_verify: [u8; 32],
-    pub policy: PolicyHandoff,
+    root_verify: [u8; 32],
+    policy: PolicyHandoff,
+}
+
+impl AuthenticatedPolicyHandoff {
+    pub(crate) const fn from_verified(root_verify: [u8; 32], policy: PolicyHandoff) -> Self {
+        Self {
+            root_verify,
+            policy,
+        }
+    }
+
+    pub const fn root_verify(self) -> [u8; 32] {
+        self.root_verify
+    }
+
+    pub const fn policy(self) -> PolicyHandoff {
+        self.policy
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -144,7 +227,7 @@ pub(crate) fn decode_handoff(bytes: &[u8]) -> Result<DecodedHandoff, ClosureErro
 
     Ok(DecodedHandoff {
         root_verify,
-        policy: PolicyHandoff::new(
+        policy: PolicyHandoff::from_parts(
             kernel_verify,
             sysgen_verify,
             kernel_floor,
@@ -178,16 +261,17 @@ pub(crate) fn encode_unsigned(
 
     let body = &mut out[HANDOFF_PREFIX_LEN..HANDOFF_SIGNED_LEN];
     let mut offset = 0;
-    put_key(body, &mut offset, &policy.kernel_verify);
-    put_key(body, &mut offset, &policy.sysgen_verify);
-    put_floor(body, &mut offset, policy.kernel_floor);
-    put_floor(body, &mut offset, policy.sysgen_floor);
-    put_generation(body, &mut offset, policy.policy_generation);
-    put_identity(body, &mut offset, policy.context.kernel_image);
-    put_identity(body, &mut offset, policy.context.closure_table);
-    put_binding(body, &mut offset, policy.context.loader_measurement);
-    put_binding(body, &mut offset, policy.context.loader_identity);
-    put_binding(body, &mut offset, policy.context.boot_context);
+    put_key(body, &mut offset, &policy.kernel_verify());
+    put_key(body, &mut offset, &policy.sysgen_verify());
+    put_floor(body, &mut offset, policy.kernel_floor());
+    put_floor(body, &mut offset, policy.sysgen_floor());
+    put_generation(body, &mut offset, policy.policy_generation());
+    let context = policy.context();
+    put_identity(body, &mut offset, context.kernel_image);
+    put_identity(body, &mut offset, context.closure_table);
+    put_binding(body, &mut offset, context.loader_measurement);
+    put_binding(body, &mut offset, context.loader_identity);
+    put_binding(body, &mut offset, context.boot_context);
     out
 }
 

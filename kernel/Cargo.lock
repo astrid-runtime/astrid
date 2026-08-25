@@ -84,8 +84,6 @@ dependencies = [
 [[package]]
 name = "bootloader"
 version = "0.11.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "873ecb966ce2cf2d9e56247422f892f7daee8dbdac58945035d348885e582b74"
 dependencies = [
  "anyhow",
  "bootloader-boot-config",
@@ -98,9 +96,7 @@ dependencies = [
 
 [[package]]
 name = "bootloader-boot-config"
-version = "0.11.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b688f587df1a3157a22f82d5f6426e8625d13d0706a4672424398aaee7e33cd"
+version = "0.11.16"
 dependencies = [
  "serde",
 ]
@@ -108,8 +104,6 @@ dependencies = [
 [[package]]
 name = "bootloader_api"
 version = "0.11.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "895bece39f47cd2063425b9361c0be662c7e2cf0922471ea16312d853600feb3"
 
 [[package]]
 name = "bumpalo"
@@ -383,6 +377,7 @@ dependencies = [
  "anyhow",
  "astrid-native-closure",
  "blake3",
+ "bootloader_api",
  "serde_json",
  "wait-timeout",
 ]

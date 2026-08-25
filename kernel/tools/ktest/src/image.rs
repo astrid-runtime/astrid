@@ -74,6 +74,17 @@ impl KimageInvocation {
         ]);
         cmd
     }
+
+    pub fn command_with_tampered_handoff(
+        &self,
+        root: &Path,
+        kernel: &Path,
+        output: &Path,
+    ) -> Command {
+        let mut cmd = self.command(root, kernel, output);
+        cmd.arg("--tamper-handoff");
+        cmd
+    }
 }
 
 #[cfg(test)]
@@ -139,5 +150,17 @@ mod tests {
         }
         assert!(saw_nested, "nested CARGO_TARGET_DIR missing");
         assert!(cleared_build_target, "CARGO_BUILD_TARGET_DIR not cleared");
+        assert!(!args.contains(&"--tamper-handoff".to_string()));
+
+        let tampered = inv.command_with_tampered_handoff(
+            Path::new("/ws"),
+            Path::new("/k.elf"),
+            Path::new("/o.img"),
+        );
+        let tampered_args: Vec<String> = tampered
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(tampered_args.ends_with(&["--tamper-handoff".to_string()]));
     }
 }

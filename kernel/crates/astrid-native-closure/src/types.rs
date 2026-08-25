@@ -202,17 +202,57 @@ pub struct DualClosureTable {
 }
 
 /// Identities accepted after verification. Floors stay independent.
+///
+/// The accepted facts are opaque so an untrusted caller cannot forge a bound
+/// selector result by constructing or mutating the record directly.
+///
+/// ```compile_fail
+/// use astrid_native_closure::BoundIdentities;
+/// fn cannot_forge(value: BoundIdentities) {
+///     let _ = value.kernel_bootstrap;
+/// }
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BoundIdentities {
-    pub kernel_bootstrap: MeasuredIdentity,
-    pub system_generation: MeasuredIdentity,
-    pub kernel_floor: GenerationFloor,
-    pub sysgen_floor: GenerationFloor,
+    kernel_bootstrap: MeasuredIdentity,
+    system_generation: MeasuredIdentity,
+    kernel_floor: GenerationFloor,
+    sysgen_floor: GenerationFloor,
 }
 
 impl BoundIdentities {
+    pub(crate) const fn from_verified(
+        kernel_bootstrap: MeasuredIdentity,
+        system_generation: MeasuredIdentity,
+        kernel_floor: GenerationFloor,
+        sysgen_floor: GenerationFloor,
+    ) -> Self {
+        Self {
+            kernel_bootstrap,
+            system_generation,
+            kernel_floor,
+            sysgen_floor,
+        }
+    }
+
+    pub const fn kernel_identity(self) -> MeasuredIdentity {
+        self.kernel_bootstrap
+    }
+
+    pub const fn sysgen_identity(self) -> MeasuredIdentity {
+        self.system_generation
+    }
+
+    pub const fn kernel_floor(self) -> GenerationFloor {
+        self.kernel_floor
+    }
+
+    pub const fn sysgen_floor(self) -> GenerationFloor {
+        self.sysgen_floor
+    }
+
     pub fn distinct(self) -> bool {
-        self.kernel_bootstrap != self.system_generation
+        self.kernel_identity() != self.sysgen_identity()
     }
 }
 

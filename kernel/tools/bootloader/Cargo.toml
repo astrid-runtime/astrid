@@ -1,0 +1,76 @@
+[package]
+name = "bootloader"
+description = "An experimental x86_64 bootloader that works on both BIOS and UEFI systems."
+authors = ["Philipp Oppermann <dev@phil-opp.com>"]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+version = "0.11.16"
+repository = "https://github.com/rust-osdev/bootloader"
+
+[workspace]
+members = ["api", "common", "common/config", "uefi"]
+resolver = "3"
+
+[features]
+default = ["bios", "uefi"]
+bios = ["dep:mbrman"]
+uefi = ["dep:gpt"]
+
+[dependencies]
+anyhow = "1.0.32"
+fatfs = { version = "0.3.4", default-features = false, features = [
+    "std",
+    "alloc",
+] }
+tempfile = "3.27.0"
+mbrman = { version = "0.5.1", optional = true }
+gpt = { version = "3.0.0", optional = true }
+bootloader-boot-config = { path = "common/config", version = "0.11.16" }
+serde_json = "1.0.91"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = false
+debug = true
+overflow-checks = true
+
+# duplicated from `bios/boot_sector/Cargo.toml`
+[profile.stage-1]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = false
+overflow-checks = false
+
+# duplicated from `bios/stage-2/Cargo.toml`
+[profile.stage-2]
+inherits = "release"
+opt-level = "z"
+codegen-units = 1
+debug = false
+overflow-checks = true
+
+# duplicated from `bios/stage-3/Cargo.toml`
+[profile.stage-3]
+inherits = "release"
+debug = true
+overflow-checks = true
+
+# duplicated from `bios/stage-4/Cargo.toml`
+[profile.stage-4]
+inherits = "release"
+debug = true
+overflow-checks = true
+
+[build-dependencies]
+llvm-tools = "0.1.1"
+
+[package.metadata.docs.rs]
+rustc-args = ["--cfg", "docsrs_dummy_build"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs_dummy_build)'] }

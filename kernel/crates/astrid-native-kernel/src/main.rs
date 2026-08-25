@@ -9,7 +9,8 @@
 //!
 //! M1 claims: UEFI q35 TCG boot, W^X of the kernel image, APIC timer delivery,
 //! fallible heap/frame pools, and a fixture-only root-signed policy handoff
-//! whose raw loader ELF/table/context bindings are checked before closures.
+//! whose original raw ELF/table/context bindings are verified by the loader
+//! before writable PT_LOAD mappings and rechecked by ring 0 before closures.
 //! The relocated image, bootloader, firmware, and physical ownership are not
 //! measured or authenticated. This crate does not claim KVM, virtio, IOMMU,
 //! DMA, A/B, first-owner, services, filesystem, Linux, or host-absence.
@@ -98,8 +99,8 @@ fn emit_bound(accepted: closure::AcceptedClosure) {
     let bound = accepted.bound;
     let mut kernel_hex = [0u8; 64];
     let mut sysgen_hex = [0u8; 64];
-    bound.kernel_bootstrap.write_hex(&mut kernel_hex);
-    bound.system_generation.write_hex(&mut sysgen_hex);
+    bound.kernel_identity().write_hex(&mut kernel_hex);
+    bound.sysgen_identity().write_hex(&mut sysgen_hex);
     let kernel_hex = core::str::from_utf8(&kernel_hex).expect("hex digits are ascii");
     let sysgen_hex = core::str::from_utf8(&sysgen_hex).expect("hex digits are ascii");
     let mut kernel_image_hex = [0u8; 64];
@@ -109,15 +110,15 @@ fn emit_bound(accepted: closure::AcceptedClosure) {
     let kernel_image_hex = core::str::from_utf8(&kernel_image_hex).expect("hex digits are ascii");
     let closure_table_hex = core::str::from_utf8(&closure_table_hex).expect("hex digits are ascii");
     serial::ev_handoff_bound(
-        accepted.handoff.policy.policy_generation.get(),
+        accepted.handoff.policy().policy_generation().get(),
         kernel_image_hex,
         closure_table_hex,
     );
-    serial::ev_closure_kernel(bound.kernel_floor.get(), kernel_hex);
-    serial::ev_closure_sysgen(bound.sysgen_floor.get(), sysgen_hex);
+    serial::ev_closure_kernel(bound.kernel_floor().get(), kernel_hex);
+    serial::ev_closure_sysgen(bound.sysgen_floor().get(), sysgen_hex);
     serial::ev_closure_bound(
-        bound.kernel_floor.get(),
-        bound.sysgen_floor.get(),
+        bound.kernel_floor().get(),
+        bound.sysgen_floor().get(),
         kernel_hex,
         sysgen_hex,
     );

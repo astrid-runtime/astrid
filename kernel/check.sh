@@ -11,8 +11,8 @@ toolchain="${KTEST_TOOLCHAIN:-nightly-2026-07-21}"
 host="$root/target/kimage-host"
 nested="$root/target/bootloader-nested"
 
-echo "== cargo fmt --all -- --check =="
-cargo fmt --all -- --check
+echo "== cargo fmt (kernel packages; vendored bootloader uses its own pinned toolchain) =="
+cargo fmt -p astrid-native-closure -p astrid-native-kernel -p kimage -p ktest -- --check
 
 echo "== stable cargo test -p astrid-native-closure --locked =="
 cargo test -p astrid-native-closure --locked

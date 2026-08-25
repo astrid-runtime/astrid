@@ -1,0 +1,18 @@
+[package]
+name = "bootloader-x86_64-uefi"
+version.workspace = true
+edition = "2024"
+description = "UEFI bootloader for x86_64"
+license.workspace = true
+repository.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bootloader_api = { workspace = true }
+bootloader-x86_64-common = { workspace = true }
+bootloader-boot-config = { workspace = true }
+log = "0.4.14"
+x86_64 = "0.15.2"
+serde-json-core = "0.5.0"
+uefi = "0.38.0"

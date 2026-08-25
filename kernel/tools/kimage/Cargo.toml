@@ -14,7 +14,7 @@ bench = false
 # match). UEFI only. bootloader 0.11's build.rs runs `cargo install ...
 # -Zbuild-std`, which requires a nightly toolchain; the host tools are
 # therefore built under nightly while the ring-0 kernel stays on 1.95.0.
-bootloader = { version = "=0.11.16", default-features = false, features = ["uefi"] }
+bootloader = { path = "../bootloader", version = "=0.11.16", default-features = false, features = ["uefi"] }
 anyhow = "=1.0.104"
 astrid-native-closure = { path = "../../crates/astrid-native-closure", features = ["sign"] }
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["zeroize"] }

@@ -1,0 +1,14 @@
+[package]
+name = "bootloader_api"
+license = "MIT OR Apache-2.0"
+version = "0.11.16"
+repository = "https://github.com/rust-osdev/bootloader"
+edition = "2024"
+description = "Makes a kernel compatible with the bootloader crate"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+
+[dev-dependencies]
+rand = "0.8.6"

@@ -1,0 +1,10 @@
+[package]
+name = "bootloader-boot-config"
+version = "0.11.16"
+edition = "2024"
+description = "The runtime configurations that are saved in a JSON file for the bootloader crate"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rust-osdev/bootloader"
+
+[dependencies]
+serde = { version = "1.0.152", default-features = false, features = ["derive"] }

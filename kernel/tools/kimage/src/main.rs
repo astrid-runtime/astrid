@@ -1,7 +1,7 @@
 //! Host tool: wrap a kernel ELF into a bootable UEFI disk image.
 //!
 //! Usage: `kimage <kernel-elf> <output-image> --root-key <file>
-//! --kernel-key <file> --sysgen-key <file>`. Key files contain exactly 32 raw
+//! --kernel-key <file> --sysgen-key <file> [--tamper-handoff]`. Key files contain exactly 32 raw
 //! seed bytes encoded as 64 hexadecimal characters. No signing material is
 //! taken from the environment or selected by a silent default. The explicit
 //! fixture files under `tools/kimage/fixtures/` are development-only inputs.
@@ -43,6 +43,11 @@ fn main() -> Result<()> {
     let root_key = required_key(&mut args, "--root-key")?;
     let kernel_key = required_key(&mut args, "--kernel-key")?;
     let sysgen_key = required_key(&mut args, "--sysgen-key")?;
+    let tamper_handoff = match args.next().as_deref() {
+        None => false,
+        Some("--tamper-handoff") => true,
+        Some(_) => bail!("unexpected argument; {}", usage()),
+    };
     if args.next().is_some() {
         bail!("unexpected argument; {}", usage());
     }
@@ -65,7 +70,7 @@ fn main() -> Result<()> {
     let closures = encode_table(&table);
     let kernel_image = MeasuredIdentity::from_payload(&elf);
     let closure_table = MeasuredIdentity::from_payload(&closures);
-    let policy = PolicyHandoff::new(
+    let policy = PolicyHandoff::for_signing(
         kernel_key.verifying_key().to_bytes(),
         sysgen_key.verifying_key().to_bytes(),
         CURRENT_FLOOR,
@@ -77,6 +82,11 @@ fn main() -> Result<()> {
     let mut ramdisk = [0u8; HANDOFF_LEN + TABLE_LEN];
     ramdisk[..HANDOFF_LEN].copy_from_slice(&handoff);
     ramdisk[HANDOFF_LEN..].copy_from_slice(&closures);
+    if tamper_handoff {
+        // Test-only image mode: corrupt the signed envelope after signing so
+        // the loader must reject it before any PT_LOAD mapping or kernel entry.
+        ramdisk[0] ^= 1;
+    }
 
     let closures_path = output.with_extension("closures");
     std::fs::write(&closures_path, closures)
@@ -99,7 +109,7 @@ fn main() -> Result<()> {
 }
 
 fn usage() -> &'static str {
-    "usage: kimage <kernel-elf> <output-image> --root-key <file> --kernel-key <file> --sysgen-key <file>"
+    "usage: kimage <kernel-elf> <output-image> --root-key <file> --kernel-key <file> --sysgen-key <file> [--tamper-handoff]"
 }
 
 fn required_key(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<PathBuf> {
