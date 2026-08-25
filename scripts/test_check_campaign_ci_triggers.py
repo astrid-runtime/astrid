@@ -212,6 +212,54 @@ class CampaignCiTriggerTests(unittest.TestCase):
                     errors,
                 )
 
+    def test_protected_workflows_reject_branchless_or_wildcard_push(self):
+        temp_root = self._copy_workflows()
+        scorecard = temp_root / ".github" / "workflows" / "scorecard.yml"
+        scorecard.write_text(
+            scorecard.read_text(encoding="utf-8").replace(
+                "    branches: [main]\n", "", 1
+            ),
+            encoding="utf-8",
+        )
+        errors = check_repository(temp_root)
+        self.assertTrue(
+            any("scorecard.yml: push.branches is required" in error for error in errors),
+            errors,
+        )
+
+        temp_root = self._copy_workflows()
+        release = temp_root / ".github" / "workflows" / "release.yml"
+        release.write_text(
+            release.read_text(encoding="utf-8").replace(
+                "  push:\n    tags:\n      - 'v[0-9]+.*'\n      - '!v[0-9]+.*-nightly.*'\n",
+                "  push:\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        errors = check_repository(temp_root)
+        self.assertTrue(
+            any("release.yml: push.tags is required" in error for error in errors),
+            errors,
+        )
+
+        temp_root = self._copy_workflows()
+        scorecard = temp_root / ".github" / "workflows" / "scorecard.yml"
+        scorecard.write_text(
+            scorecard.read_text(encoding="utf-8").replace(
+                "branches: [main]", "branches: ['**']", 1
+            ),
+            encoding="utf-8",
+        )
+        errors = check_repository(temp_root)
+        self.assertTrue(
+            any(
+                "scorecard.yml: push.branches must be exactly [main]" in error
+                for error in errors
+            ),
+            errors,
+        )
+
     def test_push_campaign_branch_is_allowlisted(self):
         temp_root = self._copy_workflows()
         workflow = temp_root / ".github" / "workflows" / "scorecard.yml"
@@ -222,10 +270,10 @@ class CampaignCiTriggerTests(unittest.TestCase):
         errors = check_repository(temp_root)
         self.assertTrue(
             any(
-                "scorecard.yml: protected workflow gained campaign branch expansion"
-                in error
+                "scorecard.yml: push.branches must be exactly [main]" in error
                 for error in errors
-            )
+            ),
+            errors,
         )
 
 

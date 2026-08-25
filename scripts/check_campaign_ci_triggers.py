@@ -42,6 +42,7 @@ PUSH_CAMPAIGN_WORKFLOWS = frozenset(
 )
 PROTECTED_WORKFLOWS = frozenset({"release.yml", "scorecard.yml", "native-kernel.yml"})
 OCI_WORKFLOWS = frozenset({"oci-amd64.yml", "oci-arm64.yml"})
+RELEASE_PUSH_TAGS = ("v[0-9]+.*", "!v[0-9]+.*-nightly.*")
 
 
 def _event_block(text: str, event: str) -> list[str] | None:
@@ -129,6 +130,10 @@ def _is_docs_path(path: str) -> bool:
     return path == DOCS_PATH or path.startswith("docs/")
 
 
+def _is_wildcard_branch(branch: str) -> bool:
+    return "*" in branch
+
+
 def _reject_branch_ignore(errors: list[str], name: str, text: str) -> None:
     for event in ("pull_request", "push"):
         if _event_field_values(text, event, "branches-ignore"):
@@ -138,6 +143,68 @@ def _reject_branch_ignore(errors: list[str], name: str, text: str) -> None:
 def _reject_codex(errors: list[str], name: str, event: str, branches: list[str]) -> None:
     if _has_codex_filter(branches):
         errors.append(f"{name}: {event}.branches must not include codex branch filters")
+
+
+
+def _protected_workflow_errors(name: str, text: str) -> list[str]:
+    """Reject campaign expansion and branchless/wildcard protected triggers."""
+
+    errors: list[str] = []
+    push_branches = _event_field_values(text, "push", "branches")
+    pull_request_branches = _event_field_values(text, "pull_request", "branches")
+    push_tags = _event_field_values(text, "push", "tags")
+
+    if name == "scorecard.yml":
+        if not _has_event(text, "push"):
+            errors.append("scorecard.yml: push event is required")
+        elif push_branches is None:
+            errors.append("scorecard.yml: push.branches is required")
+        elif push_branches != [MAIN_BRANCH]:
+            errors.append("scorecard.yml: push.branches must be exactly [main]")
+        if push_tags is not None:
+            errors.append("scorecard.yml: push.tags is not allowed")
+        if pull_request_branches is not None:
+            errors.append("scorecard.yml: pull_request.branches is not allowed")
+        if not _has_event(text, "branch_protection_rule"):
+            errors.append("scorecard.yml: branch_protection_rule event is required")
+        if not _has_event(text, "schedule"):
+            errors.append("scorecard.yml: schedule event is required")
+        return errors
+
+    if name == "release.yml":
+        if not _has_event(text, "push"):
+            errors.append("release.yml: push event is required")
+        else:
+            if push_branches is not None:
+                errors.append("release.yml: push.branches is not allowed")
+            if not push_tags:
+                errors.append("release.yml: push.tags is required")
+            elif tuple(push_tags) != RELEASE_PUSH_TAGS:
+                errors.append("release.yml: push.tags must remain the canonical tag filter")
+        if _has_event(text, "pull_request"):
+            errors.append("release.yml: pull_request event is not allowed")
+        if not _has_event(text, "workflow_dispatch"):
+            errors.append("release.yml: workflow_dispatch event is required")
+        return errors
+
+    for event, branches in (
+        ("pull_request", pull_request_branches),
+        ("push", push_branches),
+    ):
+        if branches and (
+            CAMPAIGN_BRANCH in branches
+            or _has_codex_filter(branches)
+            or any(_is_wildcard_branch(branch) for branch in branches)
+        ):
+            errors.append(f"{name}: protected workflow gained campaign branch expansion")
+        if (
+            event == "push"
+            and _has_event(text, "push")
+            and branches is None
+            and push_tags is None
+        ):
+            errors.append(f"{name}: push.branches is required")
+    return errors
 
 
 def validate_workflows(workflows: Mapping[str, str]) -> list[str]:
@@ -152,16 +219,7 @@ def validate_workflows(workflows: Mapping[str, str]) -> list[str]:
         push_branches = _event_field_values(text, "push", "branches")
 
         if name in PROTECTED_WORKFLOWS:
-            for event, branches in (
-                ("pull_request", pull_request_branches),
-                ("push", push_branches),
-            ):
-                if branches and (
-                    CAMPAIGN_BRANCH in branches or _has_codex_filter(branches)
-                ):
-                    errors.append(
-                        f"{name}: protected workflow gained campaign branch expansion"
-                    )
+            errors.extend(_protected_workflow_errors(name, text))
             continue
 
         if name in OCI_WORKFLOWS:
