@@ -2,7 +2,7 @@ name: Runtime E2E
 
 on:
   push:
-    branches: [main]
+    branches: [main, os/universal]
     paths:
       - '.github/workflows/runtime-e2e.yml'
       - 'Cargo.lock'
@@ -23,7 +23,7 @@ on:
       - 'e2e/**'
       - 'scripts/e2e/**'
   pull_request:
-    branches: [main]
+    branches: [main, os/universal]
     paths:
       - '.github/workflows/runtime-e2e.yml'
       - 'Cargo.lock'

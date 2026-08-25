@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, stream-*]
+    branches: [main, stream-*, os/universal]
     paths:
       - '**.rs'
       - 'scripts/install-windows.ps1'
@@ -46,6 +46,8 @@ on:
       - 'scripts/channel_publication.py'
       - 'scripts/test_channel_publication.py'
       - 'scripts/test_channel_workflow_contract.sh'
+      - 'scripts/*campaign_ci_triggers.py'
+      - 'scripts/*linked_issue.py'
       - 'scripts/nightly_version.py'
       - 'scripts/test_nightly_version.py'
       - 'release/nightly.toml'
@@ -57,7 +59,7 @@ on:
       - '.github/workflows/native-storage-certification.yml'
       - '.github/workflows/release.yml'
   pull_request:
-    branches: [main]
+    branches: [main, os/universal]
     paths:
       - '**.rs'
       - 'scripts/install-windows.ps1'
@@ -101,6 +103,8 @@ on:
       - 'scripts/channel_publication.py'
       - 'scripts/test_channel_publication.py'
       - 'scripts/test_channel_workflow_contract.sh'
+      - 'scripts/*campaign_ci_triggers.py'
+      - 'scripts/*linked_issue.py'
       - 'scripts/nightly_version.py'
       - 'scripts/test_nightly_version.py'
       - 'release/nightly.toml'

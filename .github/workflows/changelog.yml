@@ -2,12 +2,14 @@ name: Changelog
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, os/universal]
     types: [opened, synchronize, reopened, labeled]
     paths:
       - "**.rs"
       - "**/Cargo.toml"
       - "Cargo.lock"
+      - "docs/**"
+      - "changes/**"
 
 permissions:
   contents: read

@@ -2,7 +2,7 @@ name: Published v0.10.4 macOS upgrade
 
 on:
   push:
-    branches: [main, stream-*]
+    branches: [main, stream-*, os/universal]
     paths:
       - '**.rs'
       - 'native/macos/**'
@@ -14,7 +14,7 @@ on:
       - '**/Cargo.lock'
       - '.github/workflows/macos-v0104-upgrade.yml'
   pull_request:
-    branches: [main]
+    branches: [main, os/universal]
     paths:
       - '**.rs'
       - 'native/macos/**'
