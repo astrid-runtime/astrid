@@ -5,7 +5,7 @@ use super::{
     ARENA_MAGIC, DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN,
     FRAME_HEADER_LEN_USIZE, File, IndexState, LIFECYCLE_CLOSED, PersistentObjectIdentity,
     PrincipalCodec, ROOT_MAGIC, StoreLock, append_frames, io_error, live_files_mut,
-    read_indexed_object_with_payload, replace_index, replace_volume_index,
+    read_indexed_object_with_payload,
 };
 
 impl<P, I, C> DurableEngine<P, I, C>
@@ -258,16 +258,7 @@ where
             return;
         };
         drop(files.index_cache.take());
-        let volume = self.volume.read();
-        files.index_cache = match (self.directory_capability.as_deref(), volume.as_ref()) {
-            (Some(directory), None) => replace_index(directory, &state, self.identity.scheme()),
-            (None, Some(volume)) => replace_volume_index(
-                std::sync::Arc::clone(volume),
-                &state,
-                self.identity.scheme(),
-            ),
-            _ => None,
-        };
+        files.index_cache = self.replace_index_cache(&state);
         files.arena_len = arena_len;
         files.arena_tail = arena_tail;
         inner.pending_index_locations.clear();
@@ -295,7 +286,11 @@ where
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
-    engine.on_volume_media() && files.index_cache.is_some()
+    engine.on_volume_media()
+        && files
+            .index_cache
+            .as_ref()
+            .is_some_and(super::index::index_cache_starts_with_snapshot)
 }
 
 fn retain_volume_index_deltas<P, I, C>(
@@ -313,7 +308,11 @@ where
         let Ok(files) = live_files_mut(&mut inner.files) else {
             return false;
         };
-        if files.index_cache.is_none() {
+        if files
+            .index_cache
+            .as_ref()
+            .is_none_or(|cache| !super::index::index_cache_starts_with_snapshot(cache))
+        {
             return false;
         }
     }
@@ -328,6 +327,9 @@ where
 }
 
 fn index_cache_has_one_frame(file: &mut File) -> bool {
+    if !super::index::index_cache_starts_with_snapshot(file) {
+        return false;
+    }
     let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
         return false;
     };

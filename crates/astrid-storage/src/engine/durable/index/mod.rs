@@ -13,11 +13,11 @@ use std::path::Path;
 use crate::storage_model::ObjectId;
 
 use super::{
-    ARENA_FILE, ArenaLocation, DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN, File,
-    INDEX_FILE, INDEX_MAGIC, IdentityScheme, PersistentObjectIdentity, PrincipalCodec,
-    RecoveryLimits, append_frame, create_private_file_capability, live_files_mut,
-    open_rw_capability, scan_frames, sync_store_directory_capability, verify_indexed_location,
-    verify_indexed_tail,
+    ARENA_FILE, ArenaLocation, DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN,
+    FRAME_HEADER_LEN_USIZE, File, INDEX_FILE, INDEX_MAGIC, IdentityScheme,
+    PersistentObjectIdentity, PrincipalCodec, RecoveryLimits, append_frame,
+    create_private_file_capability, live_files_mut, open_rw_capability, scan_frames,
+    sync_store_directory_capability, verify_indexed_location, verify_indexed_tail,
 };
 use crate::volume::AstridVolume;
 use std::sync::Arc;
@@ -43,6 +43,22 @@ pub(super) struct IndexDelta<'a> {
     pub(super) objects: &'a [(ObjectId, ArenaLocation)],
 }
 
+#[derive(Clone, Copy)]
+enum IndexCacheKind {
+    Missing,
+    Empty,
+    Snapshot,
+    Invalid,
+}
+
+struct IndexFrontier<'a> {
+    previous_arena_len: u64,
+    previous_arena_tail: Option<ArenaLocation>,
+    arena_len: u64,
+    arena_tail: Option<ArenaLocation>,
+    locations: &'a [(ObjectId, ArenaLocation)],
+}
+
 impl<P, I, C> DurableEngine<P, I, C>
 where
     P: Clone + Ord,
@@ -55,7 +71,10 @@ where
         inner: &mut DurableInner<P>,
         arena_len: u64,
     ) -> Result<(), DurableError> {
-        let previous_arena_len = live_files_mut(&mut inner.files)?.arena_len;
+        let (previous_arena_len, previous_arena_tail) = {
+            let files = live_files_mut(&mut inner.files)?;
+            (files.arena_len, files.arena_tail)
+        };
         if arena_len < previous_arena_len {
             return Err(DurableError::Corrupt {
                 file: ARENA_FILE,
@@ -63,36 +82,132 @@ where
                 detail: "object arena moved behind the cached durable frontier",
             });
         }
-        if arena_len == previous_arena_len {
-            debug_assert!(inner.pending_index_locations.is_empty());
-            debug_assert!(inner.pending_direct_objects.is_empty());
-            return Ok(());
-        }
 
         let locations = std::mem::take(&mut inner.pending_index_locations);
         inner.pending_direct_objects.clear();
-        let Some(arena_tail) = locations.last().map(|(_, location)| *location) else {
-            return Err(DurableError::Corrupt {
-                file: ARENA_FILE,
-                offset: previous_arena_len,
-                detail: "object arena advanced without indexed locations",
-            });
+        let arena_tail = locations
+            .last()
+            .map(|(_, location)| *location)
+            .or(previous_arena_tail);
+        let arena_tail = match (arena_len > previous_arena_len, arena_tail) {
+            (true, Some(arena_tail)) => Some(arena_tail),
+            (true, None) => {
+                return Err(DurableError::Corrupt {
+                    file: ARENA_FILE,
+                    offset: previous_arena_len,
+                    detail: "object arena advanced without indexed locations",
+                });
+            },
+            (false, arena_tail) => arena_tail,
         };
-        let files = live_files_mut(&mut inner.files)?;
-        if let Some(mut cache) = files.index_cache.take() {
-            let delta = IndexDelta {
-                previous_arena_len,
-                arena_len,
-                arena_tail,
-                objects: &locations,
-            };
-            if append_index_delta(&mut cache, &delta, self.identity.scheme()).is_ok() {
-                files.index_cache = Some(cache);
+        let cache_kind = {
+            let files = live_files_mut(&mut inner.files)?;
+            match files.index_cache.as_ref() {
+                None => IndexCacheKind::Missing,
+                Some(cache) if index_cache_is_empty(cache) => IndexCacheKind::Empty,
+                Some(cache) if index_cache_starts_with_snapshot(cache) => IndexCacheKind::Snapshot,
+                Some(_) => IndexCacheKind::Invalid,
             }
-        }
+        };
+        let frontier = IndexFrontier {
+            previous_arena_len,
+            previous_arena_tail,
+            arena_len,
+            arena_tail,
+            locations: &locations,
+        };
+        self.publish_index_cache(inner, cache_kind, &frontier)?;
+        let files = live_files_mut(&mut inner.files)?;
         files.arena_len = arena_len;
-        files.arena_tail = Some(arena_tail);
+        files.arena_tail = arena_tail;
         Ok(())
+    }
+
+    fn publish_index_cache(
+        &self,
+        inner: &mut DurableInner<P>,
+        cache_kind: IndexCacheKind,
+        frontier: &IndexFrontier<'_>,
+    ) -> Result<(), DurableError> {
+        let files = live_files_mut(&mut inner.files)?;
+        match cache_kind {
+            IndexCacheKind::Snapshot => {
+                let Some(mut cache) = files.index_cache.take() else {
+                    return Err(DurableError::Closed);
+                };
+                if frontier.locations.is_empty() {
+                    files.index_cache = Some(cache);
+                } else {
+                    let delta = IndexDelta {
+                        previous_arena_len: frontier.previous_arena_len,
+                        arena_len: frontier.arena_len,
+                        arena_tail: frontier.arena_tail.ok_or(DurableError::Corrupt {
+                            file: ARENA_FILE,
+                            offset: frontier.previous_arena_len,
+                            detail: "object arena advanced without indexed locations",
+                        })?,
+                        objects: frontier.locations,
+                    };
+                    if append_index_delta(&mut cache, &delta, self.identity.scheme()).is_ok() {
+                        let _ = cache.sync_data();
+                        files.index_cache = Some(cache);
+                    }
+                }
+            },
+            IndexCacheKind::Empty => {
+                let Some(mut cache) = files.index_cache.take() else {
+                    return Err(DurableError::Closed);
+                };
+                let previous_state = IndexState {
+                    arena_len: frontier.previous_arena_len,
+                    arena_tail: frontier.previous_arena_tail,
+                    objects: objects_through_arena(&inner.index, frontier.previous_arena_len),
+                };
+                let snapshot = append_snapshot(&mut cache, &previous_state, self.identity.scheme())
+                    .and_then(|()| {
+                        if frontier.locations.is_empty() {
+                            Ok(())
+                        } else {
+                            let delta = IndexDelta {
+                                previous_arena_len: frontier.previous_arena_len,
+                                arena_len: frontier.arena_len,
+                                arena_tail: frontier.arena_tail.ok_or(DurableError::Corrupt {
+                                    file: ARENA_FILE,
+                                    offset: frontier.previous_arena_len,
+                                    detail: "object arena advanced without indexed locations",
+                                })?,
+                                objects: frontier.locations,
+                            };
+                            append_index_delta(&mut cache, &delta, self.identity.scheme())
+                        }
+                    });
+                if snapshot.is_ok() {
+                    let _ = cache.sync_data();
+                    files.index_cache = Some(cache);
+                }
+            },
+            IndexCacheKind::Invalid | IndexCacheKind::Missing => {
+                let current_state = IndexState {
+                    arena_len: frontier.arena_len,
+                    arena_tail: frontier.arena_tail,
+                    objects: inner.index.clone(),
+                };
+                drop(files.index_cache.take());
+                files.index_cache = self.replace_index_cache(&current_state);
+            },
+        }
+        Ok(())
+    }
+
+    pub(super) fn replace_index_cache(&self, state: &IndexState) -> Option<File> {
+        let volume = self.volume.read();
+        match (self.directory_capability.as_deref(), volume.as_ref()) {
+            (Some(directory), None) => replace_index(directory, state, self.identity.scheme()),
+            (None, Some(volume)) => {
+                replace_volume_index(std::sync::Arc::clone(volume), state, self.identity.scheme())
+            },
+            _ => None,
+        }
     }
 }
 
@@ -249,6 +364,61 @@ pub(super) fn append_index_delta(
     let payload = encode_delta(delta, scheme)?;
     append_frame(file, INDEX_MAGIC, &payload)?;
     Ok(())
+}
+
+fn append_snapshot(
+    file: &mut File,
+    state: &IndexState,
+    scheme: IdentityScheme,
+) -> Result<(), DurableError> {
+    let payload = encode_snapshot(state, scheme)?;
+    append_frame(file, INDEX_MAGIC, &payload).map(|_| ())
+}
+
+pub(super) fn index_cache_starts_with_snapshot(file: &File) -> bool {
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return false;
+    };
+    if length < FRAME_HEADER_LEN {
+        return false;
+    }
+    let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
+    if !matches!(file.read_at(&mut header, 0), Ok(read) if read == FRAME_HEADER_LEN_USIZE) {
+        return false;
+    }
+    if header[..8] != INDEX_MAGIC {
+        return false;
+    }
+    let payload_len = u64::from_le_bytes(header[12..20].try_into().unwrap_or([0; 8]));
+    let Some(frame_end) = FRAME_HEADER_LEN.checked_add(payload_len) else {
+        return false;
+    };
+    if frame_end > length {
+        return false;
+    }
+    let mut record = [0_u8; 1];
+    matches!(file.read_at(&mut record, FRAME_HEADER_LEN), Ok(read) if read == 1)
+        && record[0] == SNAPSHOT_RECORD
+}
+
+fn index_cache_is_empty(file: &File) -> bool {
+    file.metadata().is_ok_and(|metadata| metadata.len() == 0)
+}
+
+fn objects_through_arena(
+    objects: &BTreeMap<ObjectId, ArenaLocation>,
+    arena_len: u64,
+) -> BTreeMap<ObjectId, ArenaLocation> {
+    objects
+        .iter()
+        .filter_map(|(id, location)| {
+            let end = location
+                .offset
+                .checked_add(FRAME_HEADER_LEN)
+                .and_then(|value| value.checked_add(location.payload_len))?;
+            (end <= arena_len).then_some((*id, *location))
+        })
+        .collect()
 }
 
 fn encode_snapshot(state: &IndexState, scheme: IdentityScheme) -> Result<Vec<u8>, DurableError> {

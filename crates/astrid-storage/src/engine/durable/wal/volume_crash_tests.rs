@@ -3,6 +3,9 @@
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
+use crate::engine::durable::format::{
+    last_batch_spans, recovery_arena_scans, reset_last_batch_spans, reset_recovery_arena_scans,
+};
 use crate::engine::durable::tests::{
     TestIdentity, Utf8Codec, limits, transaction as kv_transaction,
 };
@@ -221,4 +224,45 @@ fn disabled_wal_volume_commit_survives_reopen_from_on_disk_bytes() {
         commit
     );
     assert!(engine.object(commit).unwrap().is_some());
+}
+
+#[test]
+fn disabled_wal_volume_publishes_index_before_fresh_backend_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let volume_path = directory.path().join("astrid.volume");
+    let volume: Arc<dyn AstridVolume> = HostedFileVolume::open(&volume_path).unwrap();
+    let engine = DurableEngine::open_volume(
+        Arc::clone(&volume),
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        disabled_wal_policy(),
+    )
+    .unwrap();
+    let (commit, tx) = kv_transaction("alice", None, b"indexed-reopen");
+    let root = engine.commit(tx).unwrap().root();
+    assert_eq!(root.commit, commit);
+
+    // Capture the complete volume while the source backend is still live.
+    let snapshot = directory.path().join("snapshot.volume");
+    std::fs::copy(&volume_path, &snapshot).unwrap();
+    drop(engine);
+    drop(volume);
+
+    reset_recovery_arena_scans();
+    reset_last_batch_spans();
+    let fresh_volume: Arc<dyn AstridVolume> = HostedFileVolume::open(&snapshot).unwrap();
+    let fresh = DurableEngine::open_volume(
+        fresh_volume,
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        disabled_wal_policy(),
+    )
+    .unwrap();
+
+    assert_eq!(fresh.root(&"alice".to_owned()).unwrap(), Some(root));
+    assert_eq!(fresh.object_count().unwrap(), 2);
+    assert_eq!(recovery_arena_scans(), 0);
+    assert!(last_batch_spans() > 0);
 }

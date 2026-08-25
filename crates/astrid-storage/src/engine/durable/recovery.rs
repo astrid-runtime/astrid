@@ -7,7 +7,8 @@ use super::{
     MutexGuard, PersistentObjectIdentity, PrincipalCodec, ROOT_FILE, RecoveredStore,
     RecoveryLimits, Seek, SeekFrom, SharedIdentity, SharedPrincipalCodec, WAL_FILE, io, io_error,
     open_rw_capability, recover_arena, recover_index, recover_interrupted_compaction,
-    recover_root_history, recover_roots, replace_index, sync_store_directory_capability,
+    recover_root_history, recover_roots, replace_index, replace_volume_index,
+    sync_store_directory_capability,
 };
 use crate::volume::AstridVolume;
 use std::collections::BTreeSet;
@@ -177,7 +178,22 @@ where
         (state.objects, state.arena_tail)
     } else {
         drop(index_cache.take());
-        recover_arena(&mut arena, identity, limits, protected_arena_len)?
+        let (index, arena_tail) = recover_arena(&mut arena, identity, limits, protected_arena_len)?;
+        let state = IndexState {
+            arena_len: arena
+                .metadata()
+                .map_err(|source| io_error("read recovered arena metadata", source))?
+                .len(),
+            arena_tail,
+            objects: index.clone(),
+        };
+        index_cache = replace_volume_index(Arc::clone(volume), &state, scheme);
+        if index_cache.is_some() {
+            volume
+                .sync()
+                .map_err(|source| io_error("flush rebuilt volume index", source))?;
+        }
+        (index, arena_tail)
     };
     if let Some(store) = &mut representations {
         store.validate_generation_zero_index(&index)?;
