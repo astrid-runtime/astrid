@@ -16,7 +16,7 @@ use astrid_native_closure::{CURRENT_FLOOR, MeasuredIdentity, TrustedPolicy, veri
 use ktest::determinism::{Determinism, compare_images};
 use ktest::events::{ExpectedClosures, assert_boot, parse_events};
 use ktest::firmware;
-use ktest::image::KimageInvocation;
+use ktest::image::{KIMAGE_NIGHTLY, KimageInvocation};
 use ktest::machine::{self, EXPECT_EXIT_CODE, QEMU_BIN, TIMEOUT};
 use wait_timeout::ChildExt;
 
@@ -103,7 +103,7 @@ fn workspace_root() -> Result<PathBuf> {
 }
 
 fn tools_toolchain() -> String {
-    std::env::var("KTEST_TOOLCHAIN").unwrap_or_else(|_| "nightly".to_string())
+    std::env::var("KTEST_TOOLCHAIN").unwrap_or_else(|_| KIMAGE_NIGHTLY.to_string())
 }
 
 fn build_image(root: &Path, kernel_elf: &Path, output: &Path) -> Result<()> {

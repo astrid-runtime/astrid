@@ -2,11 +2,12 @@
 # Supported split checks for this isolated kernel workspace.
 # Do not run `cargo clippy --workspace` on stable: bootloader 0.11's
 # build.rs requires nightly `-Zbuild-std` and fails on this host.
+# kimage/bootloader nightly is a dated pin, not rolling `nightly`.
 set -euo pipefail
 root="$(cd "$(dirname "$0")" && pwd)"
 cd "$root"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/target}"
-toolchain="${KTEST_TOOLCHAIN:-nightly}"
+toolchain="${KTEST_TOOLCHAIN:-nightly-2026-07-21}"
 host="$root/target/kimage-host"
 nested="$root/target/bootloader-nested"
 
@@ -31,7 +32,7 @@ cargo clippy -p ktest --all-targets --locked -- -D warnings
 echo "== stable cargo clippy -p astrid-native-kernel --target x86_64-unknown-none =="
 cargo clippy -p astrid-native-kernel --target x86_64-unknown-none --locked -- -D warnings
 
-echo "== nightly cargo clippy -p kimage (isolated target dirs) =="
+echo "== nightly cargo clippy -p kimage (isolated target dirs, toolchain=$toolchain) =="
 env -u CARGO_BUILD_TARGET_DIR \
   CARGO_TARGET_DIR="$nested" \
   rustup run "$toolchain" cargo clippy -p kimage --all-targets --locked --target-dir "$host" -- -D warnings

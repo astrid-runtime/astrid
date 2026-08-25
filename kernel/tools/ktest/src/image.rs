@@ -9,6 +9,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Dated rustup channel for kimage and the nested UEFI bootloader build.
+/// Floating `nightly` is not CI evidence: bootloader 0.11.16 failed to
+/// link `wcslen` on GitHub rolling nightly.
+pub const KIMAGE_NIGHTLY: &str = "nightly-2026-07-21";
+
 /// Nightly host artifacts for the `kimage` binary and the `bootloader` crate.
 pub const HOST_TARGET_REL: &str = "target/kimage-host";
 /// Target dir inherited by nested `cargo install -Zbuild-std`.
@@ -63,6 +68,13 @@ impl KimageInvocation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kimage_nightly_is_dated_not_floating() {
+        assert_eq!(KIMAGE_NIGHTLY, "nightly-2026-07-21");
+        assert_ne!(KIMAGE_NIGHTLY, "nightly");
+        assert!(KIMAGE_NIGHTLY.starts_with("nightly-20"));
+    }
 
     #[test]
     fn nested_target_is_not_the_parent_host_target() {

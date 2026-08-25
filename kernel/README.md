@@ -70,10 +70,14 @@ claim datadir portability. Override with:
 - `ASTRID_QEMU_FIRMWARE_DIR`
 
 `kimage` still needs a nightly toolchain because bootloader 0.11 runs
-`-Zbuild-std`. Override with `KTEST_TOOLCHAIN`. The ring-0 kernel stays
-on stable 1.95.0. Do not run `cargo clippy --workspace` on stable; that
-fails here because bootloader 0.11 requires nightly `-Zbuild-std`.
-Use `./check.sh` for the supported split checks.
+`-Zbuild-std`. The supported channel is the dated pin `nightly-2026-07-21`
+(rustc 1.99.0-nightly `87e5904f5`, 2026-07-20). Override with
+`KTEST_TOOLCHAIN`. Floating `nightly` is not CI evidence: GitHub rolling
+nightly failed to link bootloader 0.11.16's nested `x86_64-unknown-uefi`
+build (`undefined symbol: wcslen`). The ring-0 kernel stays on stable
+1.95.0. Do not run `cargo clippy --workspace` on stable; that fails here
+because bootloader 0.11 requires nightly `-Zbuild-std`. Use `./check.sh`
+for the supported split checks.
 
 kimage host artifacts go in `target/kimage-host`. Nested bootloader
 `cargo install` uses `target/bootloader-nested` via `CARGO_TARGET_DIR`.
@@ -137,7 +141,7 @@ supported machine or an owner ceremony. Table header keys and
   `cargo clippy -p ktest --all-targets --locked -- -D warnings`
 - stable `astrid-native-kernel` for `x86_64-unknown-none`:
   `cargo clippy -p astrid-native-kernel --target x86_64-unknown-none --locked -- -D warnings`
-- nightly `kimage`: `rustup run nightly cargo clippy -p kimage --all-targets --locked --target-dir target/kimage-host -- -D warnings`
+- pinned nightly `kimage`: `rustup run nightly-2026-07-21 cargo clippy -p kimage --all-targets --locked --target-dir target/kimage-host -- -D warnings`
   with `CARGO_TARGET_DIR=target/bootloader-nested` so nested
   `cargo install -Zbuild-std` cannot deadlock on the parent lock.
 
@@ -147,12 +151,14 @@ and remains FAIL.
 ### CI
 
 The dedicated `.github/workflows/native-kernel.yml` workflow runs for pull
-requests targeting `os/universal`. It invokes `./check.sh` for the supported
-stable/nightly split checks and `./run.sh` for explicit-TCG QEMU evidence.
-Root `ci.yml` still targets `main` and does not ingest this nested workspace.
-Do not run `cargo clippy --workspace` here. `DETERMINISM: FAIL` is reported
-by the QEMU job and is not a boot-assertion gate. That job is emulator
-evidence only and preserves the non-claims above.
+requests targeting `os/universal`. It installs stable 1.95.0 plus
+`nightly-2026-07-21`, sets `KTEST_TOOLCHAIN` to that dated pin, and
+invokes `./check.sh` plus `./run.sh`. It does not install rolling
+`nightly`. Root `ci.yml` still targets `main` and does not ingest this
+nested workspace. Do not run `cargo clippy --workspace` here.
+`DETERMINISM: FAIL` is reported by the QEMU job and is not a
+boot-assertion gate. That job is emulator evidence only and preserves
+the non-claims above.
 
 ## Toolchain
 

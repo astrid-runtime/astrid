@@ -18,6 +18,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  # bootloader 0.11.16 nested x86_64-unknown-uefi currently fails to
+  # link wcslen on rolling nightly. This dated channel is the locally
+  # proven kimage/bootloader pin (rustc 1.99.0-nightly 87e5904f5, 2026-07-20).
+  KTEST_TOOLCHAIN: nightly-2026-07-21
 
 jobs:
   split-checks:
@@ -42,10 +46,10 @@ jobs:
           targets: x86_64-unknown-none
           components: rust-src, clippy, rustfmt
 
-      - name: Install nightly Rust toolchain
+      - name: Install pinned kimage nightly toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-21
           components: rust-src, clippy
 
       - name: Run supported split checks
@@ -76,10 +80,10 @@ jobs:
           targets: x86_64-unknown-none
           components: rust-src, clippy, rustfmt
 
-      - name: Install nightly Rust toolchain
+      - name: Install pinned kimage nightly toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-21
           components: rust-src, clippy
 
       - name: Install QEMU and OVMF
