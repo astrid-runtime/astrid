@@ -64,6 +64,34 @@ class CheckLinkedIssueTests(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertTrue(has_recognized_issue_line(line))
 
+    def test_hidden_tracking_in_code_fence_fails(self):
+        body = "```\nTracking #1564\n```\n"
+        self.assertFalse(has_recognized_issue_line(body))
+        body = "```text\nTracking #1564\n```\n"
+        self.assertFalse(has_recognized_issue_line(body))
+        body = "~~~\nRefs #1564\n~~~\n"
+        self.assertFalse(has_recognized_issue_line(body))
+
+    def test_hidden_tracking_in_html_comment_fails(self):
+        body = "<!--\nTracking #1564\n-->\n"
+        self.assertFalse(has_recognized_issue_line(body))
+        body = "<!-- Tracking #1564 -->\n"
+        self.assertFalse(has_recognized_issue_line(body))
+
+    def test_indented_code_tracking_fails(self):
+        self.assertFalse(has_recognized_issue_line("    Tracking #1564\n"))
+        self.assertFalse(has_recognized_issue_line("\n    Tracking #1564\n"))
+        self.assertFalse(has_recognized_issue_line("\tTracking #1564\n"))
+
+    def test_visible_tracking_survives_nearby_hidden_markup(self):
+        body = (
+            "```\nTracking #1\n```\n"
+            "<!-- Tracking #2 -->\n"
+            "Tracking #1564\n"
+        )
+        self.assertTrue(has_recognized_issue_line(body))
+        self.assertEqual(recognized_issue_lines(body), ["Tracking #1564"])
+
     def test_negated_closes_substring_fails(self):
         body = "This is not Closes #1564"
         self.assertTrue(OLD_UNANCHORED.search(body))
