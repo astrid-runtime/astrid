@@ -1,0 +1,20 @@
+[package]
+name = "astrid-resource-types"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Portable resource vocabulary for Astrid"
+
+[features]
+default = []
+alloc = []
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { version = "1.0", default-features = false, features = ["derive"], optional = true }
+
+[lints]
+workspace = true

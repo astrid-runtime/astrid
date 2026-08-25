@@ -1,0 +1,20 @@
+[package]
+name = "astrid-provider"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Host-neutral, non-authoritative execution-provider descriptors for Astrid"
+
+[features]
+default = []
+alloc = ["astrid-resource-types/alloc", "astrid-projection/alloc"]
+
+[dependencies]
+astrid-projection = { workspace = true }
+astrid-resource-types = { workspace = true }
+
+[lints]
+workspace = true
