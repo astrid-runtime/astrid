@@ -16,6 +16,7 @@ const CURRENT_DIGEST_BYTES: u32 = 32;
 
 type StartupRecovery<P> = (
     BTreeMap<P, RootState>,
+    BTreeMap<P, RootState>,
     BTreeSet<ObjectId>,
     Vec<super::RejectedRootCandidate<P>>,
 );
@@ -154,6 +155,14 @@ where
     R: DurableIo,
 {
     let chains = recover_root_journal_chain(roots, codec, identity.scheme(), limits)?;
+    let journal_heads = chains
+        .iter()
+        .filter_map(|(principal, candidates)| {
+            candidates
+                .last()
+                .map(|(root, _)| (principal.clone(), *root))
+        })
+        .collect();
     let mut selected = BTreeMap::new();
     let mut validated = BTreeSet::new();
     let mut rejected = Vec::new();
@@ -194,7 +203,7 @@ where
             });
         }
     }
-    Ok((selected, validated, rejected))
+    Ok((selected, journal_heads, validated, rejected))
 }
 
 fn apply_root_journal_record<P, C>(

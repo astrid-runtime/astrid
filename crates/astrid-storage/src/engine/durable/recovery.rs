@@ -100,7 +100,7 @@ where
     } else {
         None
     };
-    let (roots_by_principal, validated, rejected_roots) = recover_startup_roots(
+    let (roots_by_principal, journal_heads, validated, rejected_roots) = recover_startup_roots(
         &mut roots,
         &mut arena,
         &index,
@@ -124,6 +124,7 @@ where
     Ok((
         RecoveredStore {
             roots_by_principal,
+            journal_heads,
             rejected_roots,
             index,
             validated,
@@ -198,7 +199,7 @@ where
     } else {
         None
     };
-    let (roots_by_principal, validated, rejected_roots) = recover_startup_roots(
+    let (roots_by_principal, journal_heads, validated, rejected_roots) = recover_startup_roots(
         &mut roots,
         &mut arena,
         &index,
@@ -222,6 +223,7 @@ where
     Ok((
         RecoveredStore {
             roots_by_principal,
+            journal_heads,
             rejected_roots,
             index,
             validated,
@@ -406,6 +408,7 @@ where
             match recovered {
                 Ok((recovered, wal)) => {
                     inner.roots_by_principal = recovered.roots_by_principal;
+                    inner.journal_heads = recovered.journal_heads;
                     inner.rejected_roots = recovered.rejected_roots;
                     self.published_roots.replace(&inner.roots_by_principal);
                     inner.index = recovered.index;

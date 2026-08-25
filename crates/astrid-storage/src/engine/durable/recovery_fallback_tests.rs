@@ -152,3 +152,103 @@ fn startup_skips_multiple_newest_incomplete_roots_and_reports_each() {
     assert_eq!(rejected[1].root, first_rejected);
     assert_eq!(rejected[1].missing, first_rejected.commit);
 }
+
+#[test]
+fn startup_fallback_then_commit_reopens_without_root_conflict() {
+    let source = tempfile::tempdir().unwrap();
+    let (engine, first, newest, _newer_offset) = commit_pair(source.path());
+    let journal = source.path().join(ROOT_FILE);
+    let journal_len_before_fallback = std::fs::metadata(&journal).unwrap().len();
+    let arena = source.path().join(ARENA_FILE);
+    let arena_len = std::fs::metadata(&arena).unwrap().len();
+    flip_byte(&arena, arena_len.saturating_sub(1));
+    drop(engine);
+
+    let recovered = open(source.path());
+    assert_eq!(recovered.root(&"alice".to_owned()).unwrap(), Some(first));
+    assert_eq!(recovered.rejected_recovery_candidates().unwrap().len(), 1);
+
+    let (_, transaction) = transaction("alice", Some(first), b"after-recovery");
+    let committed = recovered.commit(transaction).unwrap().root();
+    assert_eq!(committed.generation.get(), newest.generation.get() + 1);
+    assert_eq!(committed.generation.get(), 2);
+    recovered.flush().unwrap();
+
+    let copy = tempfile::tempdir().unwrap();
+    for file_name in [ARENA_FILE, ROOT_FILE, INDEX_FILE] {
+        std::fs::copy(source.path().join(file_name), copy.path().join(file_name)).unwrap();
+    }
+    drop(recovered);
+
+    let reopened = open(copy.path());
+    assert_eq!(reopened.root(&"alice".to_owned()).unwrap(), Some(committed));
+    assert!(
+        std::fs::metadata(copy.path().join(ROOT_FILE))
+            .unwrap()
+            .len()
+            > journal_len_before_fallback,
+        "the post-fallback commit must append a new journal frame"
+    );
+    let mut journal_bytes = Vec::new();
+    File::open(copy.path().join(ROOT_FILE))
+        .unwrap()
+        .read_to_end(&mut journal_bytes)
+        .unwrap();
+    assert!(
+        journal_bytes
+            .windows(newest.commit.as_bytes().len())
+            .any(|window| window == &newest.commit.as_bytes()[..]),
+        "the rejected candidate frame must remain retained in the journal"
+    );
+}
+
+#[test]
+fn production_recovery_fallback_report_visible() {
+    let directory = tempfile::tempdir().unwrap();
+    let (engine, first, newest, newer_offset) = commit_pair(directory.path());
+    let arena = directory.path().join(ARENA_FILE);
+    let arena_len = std::fs::metadata(&arena).unwrap().len();
+    flip_byte(&arena, arena_len.saturating_sub(1));
+    drop(engine);
+
+    let recovered =
+        DurableEngine::open(directory.path(), TestIdentity, Utf8Codec, limits()).unwrap();
+    let report = recovered.rejected_recovery_candidates().unwrap();
+    assert_eq!(recovered.root(&"alice".to_owned()).unwrap(), Some(first));
+    assert_eq!(report.len(), 1);
+    assert_eq!(report[0].principal, "alice");
+    assert_eq!(report[0].offset, newer_offset);
+    assert_eq!(report[0].root, newest);
+    assert_eq!(report[0].missing, newest.commit);
+}
+
+#[test]
+fn startup_fallback_does_not_swallow_unrelated_model_errors() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = open(directory.path());
+    let (_, transaction) = transaction("alice", None, b"before");
+    let first = engine.commit(transaction).unwrap().root();
+    drop(engine);
+
+    let wrong_expected = RootState {
+        generation: first.generation,
+        commit: ObjectId::new([0x55; 32]),
+    };
+    let replacement = RootState {
+        generation: first.generation.checked_next().unwrap(),
+        commit: ObjectId::new([0x56; 32]),
+    };
+    append_root_frame(
+        &directory.path().join(ROOT_FILE),
+        Some(wrong_expected),
+        replacement,
+    );
+
+    assert!(matches!(
+        DurableEngine::open(directory.path(), TestIdentity, Utf8Codec, limits()),
+        Err(DurableError::RecoveryModel {
+            source: ModelError::RootConflict { .. },
+            ..
+        })
+    ));
+}

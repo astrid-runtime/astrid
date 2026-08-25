@@ -551,14 +551,12 @@ where
     /// for diagnostics but does not install them as live roots. The report is
     /// empty for a clean startup and never changes live-read fail-closed
     /// behavior.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "crate diagnostics accessor is consumed by recovery fallback tests and callers"
-        )
-    )]
-    pub(crate) fn rejected_recovery_candidates(
+    ///
+    /// # Errors
+    ///
+    /// Returns a recovery or closed error when the authoritative engine cannot
+    /// currently provide its diagnostic snapshot.
+    pub fn rejected_recovery_candidates(
         &self,
     ) -> Result<Vec<super::RejectedRootCandidate<P>>, DurableError> {
         let inner = self.lock_usable()?;
@@ -635,6 +633,7 @@ where
         inner: &mut DurableInner<P>,
         transaction: RootTransaction<P>,
         pending_roots: &BTreeMap<P, RootState>,
+        pending_journal_heads: &BTreeMap<P, RootState>,
         observer: Option<&dyn ProjectionObserver>,
     ) -> Result<Prepared<P>, DurableError> {
         let RootTransaction {
@@ -660,18 +659,8 @@ where
         if actual != expected {
             return Err(ModelError::RootConflict { expected, actual }.into());
         }
-        let generation = match actual {
-            Some(root) => root
-                .generation
-                .checked_next()
-                .ok_or(ModelError::ArithmeticOverflow)?,
-            None => RootGeneration::INITIAL,
-        };
-        let root = RootState {
-            generation,
-            commit: commit_id,
-        };
-
+        let journal_head = journal_head_for(inner, &principal, pending_journal_heads);
+        let root = next_journal_root(journal_head, commit_id)?;
         let mut unique = BTreeMap::new();
         for (id, record) in records {
             match unique.get(&id) {
@@ -723,12 +712,13 @@ where
             }
         }
         let principal_bytes = self.principal_codec.encode(&principal);
-        let journal = encode_root_record(self.identity.scheme(), &principal_bytes, expected, root)?;
+        let journal =
+            encode_root_record(self.identity.scheme(), &principal_bytes, journal_head, root)?;
         ensure_payload_limit(ROOT_FILE, 0, journal.len(), self.limits)?;
 
         Ok(Prepared {
             principal,
-            expected,
+            expected: journal_head,
             root,
             objects_inserted: u64::try_from(objects.len())
                 .map_err(|_| ModelError::ArithmeticOverflow)?
@@ -775,4 +765,35 @@ where
         }
         Ok(())
     }
+}
+
+fn journal_head_for<P: Ord + Clone>(
+    inner: &mut DurableInner<P>,
+    principal: &P,
+    pending_journal_heads: &BTreeMap<P, RootState>,
+) -> Option<RootState> {
+    if let Some(root) = pending_journal_heads.get(principal).copied() {
+        return Some(root);
+    }
+    if let Some(root) = inner.journal_heads.get(principal).copied() {
+        return Some(root);
+    }
+    let root = inner.roots_by_principal.get(principal).copied()?;
+    inner.journal_heads.insert(principal.clone(), root);
+    Some(root)
+}
+
+fn next_journal_root(
+    journal_head: Option<RootState>,
+    commit: ObjectId,
+) -> Result<RootState, DurableError> {
+    let generation = journal_head
+        .map(|root| {
+            root.generation
+                .checked_next()
+                .ok_or(ModelError::ArithmeticOverflow)
+        })
+        .transpose()?
+        .unwrap_or(RootGeneration::INITIAL);
+    Ok(RootState { generation, commit })
 }

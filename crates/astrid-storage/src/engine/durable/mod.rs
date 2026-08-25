@@ -553,6 +553,11 @@ struct ArenaLocation {
 #[derive(Debug)]
 struct DurableInner<P: Ord> {
     roots_by_principal: BTreeMap<P, RootState>,
+    /// Last root transition recovered from the journal, even when startup
+    /// rejected that candidate's object closure and selected an older live
+    /// root. Commit preparation advances this lineage independently of the
+    /// live-root compare-and-swap view.
+    journal_heads: BTreeMap<P, RootState>,
     rejected_roots: Vec<RejectedRootCandidate<P>>,
     index: BTreeMap<ObjectId, ArenaLocation>,
     pending_wal: wal::PendingWalOverlay<P>,
@@ -567,11 +572,16 @@ struct DurableInner<P: Ord> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RejectedRootCandidate<P> {
-    pub(crate) principal: P,
-    pub(crate) offset: u64,
-    pub(crate) root: RootState,
-    pub(crate) missing: ObjectId,
+/// Startup recovery evidence for one rejected committed root.
+pub struct RejectedRootCandidate<P> {
+    /// Principal whose committed root was rejected during startup recovery.
+    pub principal: P,
+    /// Byte offset of the retained root-journal frame.
+    pub offset: u64,
+    /// Integrity-verified root whose closure was incomplete.
+    pub root: RootState,
+    /// Object that made the candidate closure incomplete.
+    pub missing: ObjectId,
 }
 
 #[derive(Debug)]
@@ -648,6 +658,7 @@ where
 #[derive(Debug)]
 struct RecoveredStore<P: Ord> {
     roots_by_principal: BTreeMap<P, RootState>,
+    journal_heads: BTreeMap<P, RootState>,
     rejected_roots: Vec<RejectedRootCandidate<P>>,
     index: BTreeMap<ObjectId, ArenaLocation>,
     validated: BTreeSet<ObjectId>,
