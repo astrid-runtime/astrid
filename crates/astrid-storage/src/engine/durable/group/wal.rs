@@ -91,6 +91,7 @@ where
             .map(|accepted| Self::collect_prepared_wal_objects(&accepted.prepared))
             .collect::<Result<Vec<_>, _>>()?;
         self.append_wal_transactions(accepted, &staged, &prepared)?;
+        self.sync_volume()?;
         self.fail_if(FaultPoint::AfterWalPublication)?;
         self.install_wal_overlay(inner, accepted, &staged, &prepared)?;
         let arena_len = live_files_mut(&mut inner.files)?
