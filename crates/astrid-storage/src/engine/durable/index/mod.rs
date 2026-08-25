@@ -1,10 +1,13 @@
 //! Disposable persistent object index for the host-file engine.
 //!
 //! The arena and root journal remain the only authoritative files. This cache
-//! may lag, tear, corrupt, or disappear; every such case falls back to an
-//! authoritative arena scan and checkpoint replacement. Principal roots and
-//! validated closures are deliberately absent: recovery always derives them
-//! from the root journal and identity-checked arena objects.
+//! may lag, tear, corrupt, or disappear; those cases fall back to an
+//! authoritative arena scan and checkpoint replacement. Once a new
+//! checkpoint is required, its publication is part of the durable operation:
+//! an I/O failure is returned instead of allowing a successful root with a
+//! missing or stale index. Principal roots and validated closures are
+//! deliberately absent: recovery always derives them from the root journal
+//! and identity-checked arena objects.
 
 use std::collections::BTreeMap;
 use std::io::{Seek, SeekFrom};
@@ -14,7 +17,7 @@ use crate::storage_model::ObjectId;
 
 use super::{
     ARENA_FILE, ArenaLocation, DurableEngine, DurableError, DurableInner, FRAME_HEADER_LEN,
-    FRAME_HEADER_LEN_USIZE, File, INDEX_FILE, INDEX_MAGIC, IdentityScheme,
+    FRAME_HEADER_LEN_USIZE, FaultInjector, File, INDEX_FILE, INDEX_MAGIC, IdentityScheme,
     PersistentObjectIdentity, PrincipalCodec, RecoveryLimits, append_frame,
     create_private_file_capability, live_files_mut, open_rw_capability, scan_frames,
     sync_store_directory_capability, verify_indexed_location, verify_indexed_tail,
@@ -138,6 +141,7 @@ where
                 if frontier.locations.is_empty() {
                     files.index_cache = Some(cache);
                 } else {
+                    self.fail_if(super::FaultPoint::BeforeIndexCachePublication)?;
                     let delta = IndexDelta {
                         previous_arena_len: frontier.previous_arena_len,
                         arena_len: frontier.arena_len,
@@ -148,43 +152,41 @@ where
                         })?,
                         objects: frontier.locations,
                     };
-                    if append_index_delta(&mut cache, &delta, self.identity.scheme()).is_ok() {
-                        let _ = cache.sync_data();
-                        files.index_cache = Some(cache);
-                    }
+                    append_index_delta(&mut cache, &delta, self.identity.scheme())?;
+                    cache.sync_data().map_err(|source| {
+                        super::io_error("flush durable object-index delta", source)
+                    })?;
+                    files.index_cache = Some(cache);
                 }
             },
             IndexCacheKind::Empty => {
                 let Some(mut cache) = files.index_cache.take() else {
                     return Err(DurableError::Closed);
                 };
+                self.fail_if(super::FaultPoint::BeforeIndexCachePublication)?;
                 let previous_state = IndexState {
                     arena_len: frontier.previous_arena_len,
                     arena_tail: frontier.previous_arena_tail,
                     objects: objects_through_arena(&inner.index, frontier.previous_arena_len),
                 };
-                let snapshot = append_snapshot(&mut cache, &previous_state, self.identity.scheme())
-                    .and_then(|()| {
-                        if frontier.locations.is_empty() {
-                            Ok(())
-                        } else {
-                            let delta = IndexDelta {
-                                previous_arena_len: frontier.previous_arena_len,
-                                arena_len: frontier.arena_len,
-                                arena_tail: frontier.arena_tail.ok_or(DurableError::Corrupt {
-                                    file: ARENA_FILE,
-                                    offset: frontier.previous_arena_len,
-                                    detail: "object arena advanced without indexed locations",
-                                })?,
-                                objects: frontier.locations,
-                            };
-                            append_index_delta(&mut cache, &delta, self.identity.scheme())
-                        }
-                    });
-                if snapshot.is_ok() {
-                    let _ = cache.sync_data();
-                    files.index_cache = Some(cache);
+                append_snapshot(&mut cache, &previous_state, self.identity.scheme())?;
+                if !frontier.locations.is_empty() {
+                    let delta = IndexDelta {
+                        previous_arena_len: frontier.previous_arena_len,
+                        arena_len: frontier.arena_len,
+                        arena_tail: frontier.arena_tail.ok_or(DurableError::Corrupt {
+                            file: ARENA_FILE,
+                            offset: frontier.previous_arena_len,
+                            detail: "object arena advanced without indexed locations",
+                        })?,
+                        objects: frontier.locations,
+                    };
+                    append_index_delta(&mut cache, &delta, self.identity.scheme())?;
                 }
+                cache.sync_data().map_err(|source| {
+                    super::io_error("flush rebuilt durable object index", source)
+                })?;
+                files.index_cache = Some(cache);
             },
             IndexCacheKind::Invalid | IndexCacheKind::Missing => {
                 let current_state = IndexState {
@@ -193,29 +195,39 @@ where
                     objects: inner.index.clone(),
                 };
                 drop(files.index_cache.take());
-                files.index_cache = self.replace_index_cache(&current_state);
+                files.index_cache = Some(self.replace_index_cache(&current_state)?);
             },
         }
         Ok(())
     }
 
-    pub(super) fn replace_index_cache(&self, state: &IndexState) -> Option<File> {
+    pub(super) fn replace_index_cache(&self, state: &IndexState) -> Result<File, DurableError> {
         let volume = self.volume.read();
         match (self.directory_capability.as_deref(), volume.as_ref()) {
-            (Some(directory), None) => replace_index(directory, state, self.identity.scheme()),
-            (None, Some(volume)) => {
-                replace_volume_index(std::sync::Arc::clone(volume), state, self.identity.scheme())
-            },
-            _ => None,
+            (Some(directory), None) => replace_index(
+                directory,
+                state,
+                self.identity.scheme(),
+                self.faults.as_ref(),
+            ),
+            (None, Some(volume)) => replace_volume_index(
+                std::sync::Arc::clone(volume),
+                state,
+                self.identity.scheme(),
+                self.faults.as_ref(),
+            ),
+            _ => Err(DurableError::InvalidRepresentationState(
+                "durable index media configuration is inconsistent",
+            )),
         }
     }
 }
 
 /// Attempt to restore an exact object-arena prefix from the cache.
 ///
-/// Every cache failure is represented as `None`: the caller must scan the
-/// authoritative arena and replace the checkpoint. The cache can improve
-/// availability only, never reduce it.
+/// A cache failure is represented as `None`: the caller must scan the
+/// authoritative arena and replace the checkpoint. Publication errors from
+/// that replacement are returned by the caller and fail recovery closed.
 pub(super) fn recover_index(
     file: &mut File,
     arena: &mut File,
@@ -284,34 +296,67 @@ pub(super) fn replace_index(
     directory: &cap_std::fs::Dir,
     state: &IndexState,
     scheme: IdentityScheme,
-) -> Option<File> {
-    let payload = encode_snapshot(state, scheme).ok()?;
+    faults: &dyn FaultInjector,
+) -> Result<File, DurableError> {
+    if faults.should_fail(super::FaultPoint::BeforeIndexCachePublication) {
+        return Err(DurableError::FaultInjected(
+            super::FaultPoint::BeforeIndexCachePublication,
+        ));
+    }
+    let payload = encode_snapshot(state, scheme)?;
     let temporary = format!("{INDEX_FILE}.tmp");
-    remove_checkpoint_if_present(directory, &temporary).ok()?;
-    let mut file = create_private_file_capability(directory, Path::new(&temporary)).ok()?;
-    append_frame(&mut file, INDEX_MAGIC, &payload).ok()?;
-    file.sync_data().ok()?;
+    remove_checkpoint_if_present(directory, &temporary)
+        .map_err(|source| super::io_error("remove temporary durable object index", source))?;
+    let mut file = create_private_file_capability(directory, Path::new(&temporary))
+        .map_err(|error| index_error("create temporary durable object index", error))?;
+    append_frame(&mut file, INDEX_MAGIC, &payload)
+        .map_err(|error| index_error("append durable object-index snapshot", error))?;
+    file.sync_data()
+        .map_err(|source| super::io_error("flush durable object-index snapshot", source))?;
     drop(file);
-    replace_checkpoint(directory, &temporary, INDEX_FILE).ok()?;
-    sync_store_directory_capability(directory).ok()?;
-    let mut reopened = open_rw_capability(directory, Path::new(INDEX_FILE), false).ok()?;
-    reopened.seek(SeekFrom::End(0)).ok()?;
-    Some(reopened)
+    replace_checkpoint(directory, &temporary, INDEX_FILE)
+        .map_err(|source| super::io_error("publish durable object-index snapshot", source))?;
+    sync_store_directory_capability(directory)?;
+    let mut reopened = open_rw_capability(directory, Path::new(INDEX_FILE), false)
+        .map_err(|error| index_error("reopen durable object index", error))?;
+    reopened
+        .seek(SeekFrom::End(0))
+        .map_err(|source| super::io_error("seek durable object index", source))?;
+    Ok(reopened)
 }
 
 pub(super) fn replace_volume_index(
     volume: Arc<dyn AstridVolume>,
     state: &IndexState,
     scheme: IdentityScheme,
-) -> Option<File> {
-    let payload = encode_snapshot(state, scheme).ok()?;
-    let mut file = File::volume(volume, INDEX_FILE, true).ok()?;
-    file.set_len(0).ok()?;
-    file.seek(SeekFrom::Start(0)).ok()?;
-    append_frame(&mut file, INDEX_MAGIC, &payload).ok()?;
-    file.sync_data().ok()?;
-    file.seek(SeekFrom::End(0)).ok()?;
-    Some(file)
+    faults: &dyn FaultInjector,
+) -> Result<File, DurableError> {
+    if faults.should_fail(super::FaultPoint::BeforeIndexCachePublication) {
+        return Err(DurableError::FaultInjected(
+            super::FaultPoint::BeforeIndexCachePublication,
+        ));
+    }
+    let payload = encode_snapshot(state, scheme)?;
+    let mut file = File::volume(volume, INDEX_FILE, true)
+        .map_err(|error| index_error("open durable volume object index", error))?;
+    file.set_len(0)
+        .map_err(|source| super::io_error("truncate durable volume object index", source))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| super::io_error("seek durable volume object index", source))?;
+    append_frame(&mut file, INDEX_MAGIC, &payload)
+        .map_err(|error| index_error("append durable volume object-index snapshot", error))?;
+    file.sync_data()
+        .map_err(|source| super::io_error("flush durable volume object-index snapshot", source))?;
+    file.seek(SeekFrom::End(0))
+        .map_err(|source| super::io_error("seek durable volume object index", source))?;
+    Ok(file)
+}
+
+fn index_error(operation: &'static str, error: DurableError) -> DurableError {
+    match error {
+        DurableError::Io { source, .. } => super::io_error(operation, source),
+        error => error,
+    }
 }
 
 #[cfg(not(windows))]
@@ -362,7 +407,8 @@ pub(super) fn append_index_delta(
     scheme: IdentityScheme,
 ) -> Result<(), DurableError> {
     let payload = encode_delta(delta, scheme)?;
-    append_frame(file, INDEX_MAGIC, &payload)?;
+    append_frame(file, INDEX_MAGIC, &payload)
+        .map_err(|error| index_error("append durable object-index delta", error))?;
     Ok(())
 }
 
@@ -372,7 +418,9 @@ fn append_snapshot(
     scheme: IdentityScheme,
 ) -> Result<(), DurableError> {
     let payload = encode_snapshot(state, scheme)?;
-    append_frame(file, INDEX_MAGIC, &payload).map(|_| ())
+    append_frame(file, INDEX_MAGIC, &payload)
+        .map_err(|error| index_error("append durable object-index snapshot", error))
+        .map(|_| ())
 }
 
 pub(super) fn index_cache_starts_with_snapshot(file: &File) -> bool {

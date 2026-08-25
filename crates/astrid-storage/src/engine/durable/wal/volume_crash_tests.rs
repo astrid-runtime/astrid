@@ -11,7 +11,7 @@ use crate::engine::durable::tests::{
 };
 use crate::engine::durable::{
     DurableEngine, DurableEnginePolicy, DurableError, FaultInjector, FaultPoint, GroupCommitPolicy,
-    ObjectCacheConfig, RecoveryRetryPolicy, TransactionWalPolicy, WAL_FILE,
+    INDEX_FILE, ObjectCacheConfig, RecoveryRetryPolicy, TransactionWalPolicy, WAL_FILE,
 };
 use crate::volume::{AstridVolume, HostedFileVolume, VolumeRegion};
 
@@ -265,4 +265,73 @@ fn disabled_wal_volume_publishes_index_before_fresh_backend_reopen() {
     assert_eq!(fresh.object_count().unwrap(), 2);
     assert_eq!(recovery_arena_scans(), 0);
     assert!(last_batch_spans() > 0);
+}
+
+#[test]
+fn disabled_wal_index_publication_failure_after_root_append_returns_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let volume_path = directory.path().join("astrid.volume");
+    let volume: Arc<dyn AstridVolume> = HostedFileVolume::open(&volume_path).unwrap();
+    let engine = DurableEngine::open_volume(
+        Arc::clone(&volume),
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        disabled_wal_policy(),
+    )
+    .unwrap();
+    let (_, first_tx) = kv_transaction("alice", None, b"index-publication-seed");
+    let first_root = engine.commit(first_tx).unwrap().root();
+    drop(engine);
+
+    let engine = DurableEngine::open_volume_with_faults(
+        volume,
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        disabled_wal_policy(),
+        Arc::new(FailAt(FaultPoint::BeforeIndexCachePublication)),
+    )
+    .unwrap();
+    let (_, tx) = kv_transaction("alice", Some(first_root), b"index-publication-failure");
+    let error = engine.commit(tx).unwrap_err();
+    assert!(matches!(
+        error,
+        DurableError::FaultInjected(FaultPoint::BeforeIndexCachePublication)
+    ));
+}
+
+#[test]
+fn volume_recovery_index_publication_failure_fails_open() {
+    let directory = tempfile::tempdir().unwrap();
+    let volume_path = directory.path().join("astrid.volume");
+    let volume: Arc<dyn AstridVolume> = HostedFileVolume::open(&volume_path).unwrap();
+    let engine = DurableEngine::open_volume(
+        Arc::clone(&volume),
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        disabled_wal_policy(),
+    )
+    .unwrap();
+    let (_, tx) = kv_transaction("alice", None, b"recovery-index-publication-failure");
+    engine.commit(tx).unwrap();
+    drop(engine);
+
+    let index_region = crate::volume::VolumeRegion::new(INDEX_FILE).unwrap();
+    volume.set_region_len(&index_region, 0).unwrap();
+    volume.sync().unwrap();
+    let error = DurableEngine::open_volume_with_faults(
+        volume,
+        TestIdentity,
+        Utf8Codec,
+        limits(),
+        disabled_wal_policy(),
+        Arc::new(FailAt(FaultPoint::BeforeIndexCachePublication)),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        DurableError::FaultInjected(FaultPoint::BeforeIndexCachePublication)
+    ));
 }
