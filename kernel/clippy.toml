@@ -1,0 +1,18 @@
+# Isolated native-kernel workspace. MSRV matches origin/main.
+msrv = "1.95"
+
+cognitive-complexity-threshold = 25
+too-many-arguments-threshold = 7
+too-many-lines-threshold = 100
+type-complexity-threshold = 250
+
+doc-valid-idents = [
+    "Astrid",
+    "APIC",
+    "COM",
+    "EDK",
+    "GPT",
+    "QEMU",
+    "TCG",
+    "UEFI",
+]
