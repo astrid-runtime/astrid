@@ -1,5 +1,8 @@
 use super::*;
-use astrid_core::{FleetGenesis, FleetIdentity, PrincipalOwnership, UserGenesis, UserIdentity};
+use astrid_core::{
+    FirstOwnerClaim, FleetGenesis, FleetIdentity, PrincipalOwnership, UserGenesis, UserIdentity,
+};
+use astrid_crypto::KeyPair;
 use astrid_storage::{KvQuotaResolver, StateOwner};
 use chrono::{TimeZone, Utc};
 use uuid::Uuid;
@@ -73,15 +76,54 @@ fn fleet_identity(id: u128, creator: astrid_core::UserUid) -> FleetIdentity {
     .expect("fleet identity")
 }
 
-fn user_identity(id: u128, key: u8) -> UserIdentity {
-    UserIdentity::from_genesis(UserGenesis::from_parts(
-        Uuid::from_u128(id),
-        Utc.timestamp_opt(1_700_000_000, 0)
-            .single()
-            .expect("user time"),
-        [key; 32],
-    ))
-    .expect("user identity")
+async fn enroll_fixture_owner(
+    ownership: &astrid_storage::OwnershipStore,
+    owner: &UserIdentity,
+    fleet: &FleetIdentity,
+    principal_uid: astrid_core::PrincipalUid,
+    signing_key: &KeyPair,
+) {
+    let machine_context = [21; 32];
+    let boot_context = [22; 32];
+    let kernel_identity = [23; 32];
+    let system_generation = [24; 32];
+    let nonce = [25; 32];
+    let unsigned = FirstOwnerClaim::from_parts(
+        machine_context,
+        boot_context,
+        kernel_identity,
+        system_generation,
+        owner.uid,
+        fleet.uid,
+        principal_uid,
+        *signing_key.public_key_bytes(),
+        nonce,
+        1,
+        [0; 64],
+    )
+    .expect("unsigned fixture claim");
+    let claim = FirstOwnerClaim::from_parts(
+        machine_context,
+        boot_context,
+        kernel_identity,
+        system_generation,
+        owner.uid,
+        fleet.uid,
+        principal_uid,
+        *signing_key.public_key_bytes(),
+        nonce,
+        1,
+        *signing_key.sign(&unsigned.canonical_message()).as_bytes(),
+    )
+    .expect("signed fixture claim");
+    ownership
+        .begin_first_owner(claim)
+        .await
+        .expect("begin fixture enrollment");
+    ownership
+        .commit_first_owner(claim, owner.clone(), fleet.clone())
+        .await
+        .expect("commit fixture enrollment");
 }
 
 #[tokio::test]
@@ -238,20 +280,28 @@ async fn boot_cleanup_preserves_durable_uid_binding() {
 #[tokio::test]
 async fn assigned_fleet_principals_share_base_but_get_independent_branches() {
     let fixture = fixture().await;
-    let owner = user_identity(0xD1, 1);
+    let signing_key = KeyPair::from_secret_key(&[1; 32]).expect("fixture signing key");
+    let owner = UserIdentity::from_genesis(UserGenesis::from_parts(
+        Uuid::from_u128(0xD1),
+        Utc.timestamp_opt(1_700_000_000, 0)
+            .single()
+            .expect("owner time"),
+        *signing_key.public_key_bytes(),
+    ))
+    .expect("owner identity");
     let fleet = fleet_identity(0xD2, owner.uid);
     let ownership = Arc::new(
         astrid_storage::OwnershipStore::new(fixture.store.kv(), fixture.directory.clone())
             .expect("ownership store"),
     );
-    ownership.create_user(owner.clone()).await.expect("user");
-    ownership.create_fleet(fleet.clone()).await.expect("fleet");
+    let alice_uid = fixture
+        .directory
+        .uid_for(&fixture.alice)
+        .expect("alice uid");
+    enroll_fixture_owner(&ownership, &owner, &fleet, alice_uid, &signing_key).await;
     ownership
         .assign_principal(PrincipalOwnership {
-            principal_uid: fixture
-                .directory
-                .uid_for(&fixture.alice)
-                .expect("alice uid"),
+            principal_uid: alice_uid,
             fleet_uid: fleet.uid,
             assigned_by: owner.uid,
         })
@@ -280,34 +330,30 @@ async fn assigned_fleet_principals_share_base_but_get_independent_branches() {
 #[tokio::test]
 async fn ownership_move_invalidates_existing_branch_before_finish() {
     let fixture = fixture().await;
-    let owner = user_identity(0xE1, 2);
+    let signing_key = KeyPair::from_secret_key(&[2; 32]).expect("fixture signing key");
+    let owner = UserIdentity::from_genesis(UserGenesis::from_parts(
+        Uuid::from_u128(0xE1),
+        Utc.timestamp_opt(1_700_000_000, 0)
+            .single()
+            .expect("owner time"),
+        *signing_key.public_key_bytes(),
+    ))
+    .expect("owner identity");
     let first = fleet_identity(0xE2, owner.uid);
     let second = fleet_identity(0xE3, owner.uid);
     let ownership = Arc::new(
         astrid_storage::OwnershipStore::new(fixture.store.kv(), fixture.directory.clone())
             .expect("ownership store"),
     );
-    ownership.create_user(owner.clone()).await.expect("user");
-    ownership
-        .create_fleet(first.clone())
-        .await
-        .expect("first fleet");
-    ownership
-        .create_fleet(second.clone())
-        .await
-        .expect("second fleet");
     let alice_uid = fixture
         .directory
         .uid_for(&fixture.alice)
         .expect("alice uid");
+    enroll_fixture_owner(&ownership, &owner, &first, alice_uid, &signing_key).await;
     ownership
-        .assign_principal(PrincipalOwnership {
-            principal_uid: alice_uid,
-            fleet_uid: first.uid,
-            assigned_by: owner.uid,
-        })
+        .create_fleet(second.clone())
         .await
-        .expect("assignment");
+        .expect("second fleet");
     let service = WorkspaceBranchService::new_with_ownership(
         fixture.store.clone(),
         fixture.directory.clone(),

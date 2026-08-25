@@ -562,11 +562,13 @@ async fn unbound_leftover_is_adopted_into_the_operator_fleet() {
 
     let backend: Arc<dyn astrid_storage::KvStore> = Arc::new(MemoryKvStore::new());
     let ownership = OwnershipStore::new(backend, principals.clone()).expect("ownership");
+    let root_signing_key =
+        astrid_crypto::KeyPair::from_secret_key(&[2; 32]).expect("manual root key");
     let root_identity =
         astrid_core::PrincipalIdentity::from_genesis(astrid_core::PrincipalGenesis::from_parts(
             uuid::Uuid::from_u128(2),
             chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
-            [2; 32],
+            *root_signing_key.public_key_bytes(),
         ))
         .expect("root identity");
     let root_user = astrid_core::AstridUserId {
@@ -576,6 +578,14 @@ async fn unbound_leftover_is_adopted_into_the_operator_fleet() {
         display_name: None,
         created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
     };
+    crate::first_owner_test_support::enroll_test_first_owner(
+        &ownership,
+        &principals,
+        &root_user,
+        &root_identity,
+        &root_signing_key,
+    )
+    .await;
     crate::bootstrap_cli_root_ownership(&ownership, &principals, root_user, root_identity, true)
         .await
         .expect("adopt unowned principals");

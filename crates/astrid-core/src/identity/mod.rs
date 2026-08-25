@@ -13,7 +13,9 @@ pub mod principal;
 /// Core identity types.
 pub mod types;
 
-pub use first_owner::{FIRST_OWNER_MESSAGE_LEN, FirstOwnerClaim, FirstOwnerClaimError};
+pub use first_owner::{
+    FIRST_OWNER_MESSAGE_LEN, FirstOwnerClaim, FirstOwnerClaimError, FirstOwnerGeneration,
+};
 pub use ownership::{
     FleetGenesis, FleetIdentity, FleetMembership, FleetRole, FleetUid, OwnershipIdentityError,
     PrincipalOwnership, UserGenesis, UserIdentity, UserUid,

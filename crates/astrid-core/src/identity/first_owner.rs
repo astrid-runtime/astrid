@@ -5,6 +5,8 @@
 //! authenticated boot context and atomically commit the claim with the
 //! ownership graph before any principal authority exists.
 
+use core::num::NonZeroU64;
+
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -13,7 +15,7 @@ use astrid_resource_types::AuthorityEpoch;
 use super::{FleetUid, PrincipalUid, UserUid};
 
 /// Exact number of bytes in the first-owner signing statement.
-pub const FIRST_OWNER_MESSAGE_LEN: usize = 333;
+pub const FIRST_OWNER_MESSAGE_LEN: usize = 349;
 
 const MESSAGE_HEADER: [u8; 5] = *b"AFOv1";
 const DOMAIN_SEPARATOR: [u8; 32] = *b"ASTRID-FIRST-OWNER-PROVISION-V1!";
@@ -24,6 +26,12 @@ pub enum FirstOwnerClaimError {
     /// Authority epochs are one-based and cannot be zero.
     #[error("first-owner authority epoch must be non-zero")]
     ZeroAuthorityEpoch,
+    /// Authority generations are one-based and cannot be zero.
+    #[error("first-owner authority generation must be non-zero")]
+    ZeroAuthorityGeneration,
+    /// A pending first-owner claim must carry a non-zero expiry timestamp.
+    #[error("first-owner claim expiry must be non-zero")]
+    ZeroExpiry,
     /// The immutable user key is not a valid Ed25519 public key.
     #[error("first-owner public key is not a valid Ed25519 key")]
     InvalidPublicKey,
@@ -49,7 +57,9 @@ pub enum FirstOwnerClaimError {
 /// 229..261 initial PrincipalUid
 /// 261..293 immutable initial user public key
 /// 293..325 request nonce
-/// 325..333 non-zero AuthorityEpoch, little endian
+/// 325..333 non-zero authority generation, little endian
+/// 333..341 non-zero expiry timestamp, little endian
+/// 341..349 non-zero AuthorityEpoch, little endian
 /// ```
 ///
 /// A claim is not a bearer handle. In particular, the bytes do not grant
@@ -67,12 +77,49 @@ pub struct FirstOwnerClaim {
     principal_uid: PrincipalUid,
     initial_user_public_key: [u8; 32],
     nonce: [u8; 32],
+    authority_generation: FirstOwnerGeneration,
+    expires_at: u64,
     authority_epoch: AuthorityEpoch,
     #[serde(
         serialize_with = "serialize_signature",
         deserialize_with = "deserialize_signature"
     )]
     signature: [u8; 64],
+}
+
+/// Durable generation of the first-owner authority domain.
+///
+/// This is deliberately distinct from [`AuthorityEpoch`]: the epoch names
+/// the live authorization decision while the generation names the enrollment
+/// state incarnation. Both values are signed into a claim and persisted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FirstOwnerGeneration(NonZeroU64);
+
+impl FirstOwnerGeneration {
+    /// First valid generation.
+    pub const INITIAL: Self = Self(NonZeroU64::MIN);
+
+    /// Construct from a non-zero raw value.
+    #[must_use]
+    pub const fn from_raw(raw: u64) -> Option<Self> {
+        match NonZeroU64::new(raw) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Return the raw non-zero value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    /// Advance without wrapping.
+    #[must_use]
+    pub fn checked_next(self) -> Option<Self> {
+        self.get().checked_add(1).and_then(Self::from_raw)
+    }
 }
 
 fn serialize_signature<S>(signature: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
@@ -129,6 +176,53 @@ impl FirstOwnerClaim {
         authority_epoch: u64,
         signature: [u8; 64],
     ) -> Result<Self, FirstOwnerClaimError> {
+        Self::from_parts_with_authority(
+            machine_context,
+            boot_context,
+            kernel_identity,
+            system_generation,
+            user_uid,
+            fleet_uid,
+            principal_uid,
+            initial_user_public_key,
+            nonce,
+            FirstOwnerGeneration::INITIAL.get(),
+            u64::MAX,
+            authority_epoch,
+            signature,
+        )
+    }
+
+    /// Construct a claim with explicit authority generation and expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the generation or authority epoch is zero, or
+    /// when the expiry timestamp is zero.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the constructor mirrors the fixed canonical statement fields"
+    )]
+    pub fn from_parts_with_authority(
+        machine_context: [u8; 32],
+        boot_context: [u8; 32],
+        kernel_identity: [u8; 32],
+        system_generation: [u8; 32],
+        user_uid: UserUid,
+        fleet_uid: FleetUid,
+        principal_uid: PrincipalUid,
+        initial_user_public_key: [u8; 32],
+        nonce: [u8; 32],
+        authority_generation: u64,
+        expires_at: u64,
+        authority_epoch: u64,
+        signature: [u8; 64],
+    ) -> Result<Self, FirstOwnerClaimError> {
+        let authority_generation = FirstOwnerGeneration::from_raw(authority_generation)
+            .ok_or(FirstOwnerClaimError::ZeroAuthorityGeneration)?;
+        if expires_at == 0 {
+            return Err(FirstOwnerClaimError::ZeroExpiry);
+        }
         let authority_epoch = AuthorityEpoch::from_raw(authority_epoch)
             .ok_or(FirstOwnerClaimError::ZeroAuthorityEpoch)?;
         Ok(Self {
@@ -141,6 +235,8 @@ impl FirstOwnerClaim {
             principal_uid,
             initial_user_public_key,
             nonce,
+            authority_generation,
+            expires_at,
             authority_epoch,
             signature,
         })
@@ -206,6 +302,24 @@ impl FirstOwnerClaim {
         self.authority_epoch
     }
 
+    /// Return the signed authority generation.
+    #[must_use]
+    pub const fn authority_generation(&self) -> FirstOwnerGeneration {
+        self.authority_generation
+    }
+
+    /// Return the signed expiry timestamp in Unix seconds.
+    #[must_use]
+    pub const fn expires_at(&self) -> u64 {
+        self.expires_at
+    }
+
+    /// Return whether this claim has expired at the supplied Unix timestamp.
+    #[must_use]
+    pub const fn is_expired_at(&self, now: u64) -> bool {
+        now >= self.expires_at
+    }
+
     /// Return the detached Ed25519 signature.
     #[must_use]
     pub const fn signature(&self) -> &[u8; 64] {
@@ -227,7 +341,9 @@ impl FirstOwnerClaim {
         message[229..261].copy_from_slice(self.principal_uid.as_bytes());
         message[261..293].copy_from_slice(&self.initial_user_public_key);
         message[293..325].copy_from_slice(&self.nonce);
-        message[325..333].copy_from_slice(&self.authority_epoch.get().to_le_bytes());
+        message[325..333].copy_from_slice(&self.authority_generation.get().to_le_bytes());
+        message[333..341].copy_from_slice(&self.expires_at.to_le_bytes());
+        message[341..349].copy_from_slice(&self.authority_epoch.get().to_le_bytes());
         message
     }
 
@@ -291,7 +407,7 @@ mod tests {
             [9; 32],
         ))
         .unwrap();
-        let unsigned = FirstOwnerClaim::from_parts(
+        let unsigned = FirstOwnerClaim::from_parts_with_authority(
             [1; 32],
             [2; 32],
             [3; 32],
@@ -302,10 +418,12 @@ mod tests {
             key.verifying_key().to_bytes(),
             [5; 32],
             1,
+            1_800_000_000,
+            1,
             [0; 64],
         )
         .unwrap();
-        FirstOwnerClaim::from_parts(
+        FirstOwnerClaim::from_parts_with_authority(
             *unsigned.machine_context(),
             *unsigned.boot_context(),
             *unsigned.kernel_identity(),
@@ -315,6 +433,8 @@ mod tests {
             unsigned.principal_uid(),
             *unsigned.initial_user_public_key(),
             *unsigned.nonce(),
+            unsigned.authority_generation().get(),
+            unsigned.expires_at(),
             unsigned.authority_epoch().get(),
             key.sign(&unsigned.canonical_message()).to_bytes(),
         )
@@ -329,9 +449,11 @@ mod tests {
         assert_eq!(&message[..5], b"AFOv1");
         assert_eq!(&message[5..37], b"ASTRID-FIRST-OWNER-PROVISION-V1!");
         assert_eq!(message[325..333], [1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(message[333..341], 1_800_000_000_u64.to_le_bytes());
+        assert_eq!(message[341..349], [1, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(
             encode(claim.canonical_digest()),
-            "b44d73c7af92584d2c1e2278e54fc72c631ab8cec6b3a90dafdc342a7dcf7b53"
+            "098711ebbf8804c59ccb8789bbe98592b839ff4144e507d7dd5e626e41c04932"
         );
     }
 
@@ -367,6 +489,12 @@ mod tests {
         altered.nonce[0] ^= 1;
         assert_ne!(altered.canonical_digest(), original);
         altered = claim;
+        altered.authority_generation = FirstOwnerGeneration::from_raw(2).unwrap();
+        assert_ne!(altered.canonical_digest(), original);
+        altered = claim;
+        altered.expires_at += 1;
+        assert_ne!(altered.canonical_digest(), original);
+        altered = claim;
         altered.authority_epoch = AuthorityEpoch::from_raw(2).unwrap();
         assert_ne!(altered.canonical_digest(), original);
     }
@@ -386,7 +514,7 @@ mod tests {
     #[test]
     fn zero_epoch_is_rejected() {
         assert_eq!(
-            FirstOwnerClaim::from_parts(
+            FirstOwnerClaim::from_parts_with_authority(
                 [0; 32],
                 [0; 32],
                 [0; 32],
@@ -396,6 +524,8 @@ mod tests {
                 PrincipalUid::from_bytes([0; 32]),
                 [0; 32],
                 [0; 32],
+                1,
+                1_800_000_000,
                 0,
                 [0; 64],
             ),
@@ -405,7 +535,7 @@ mod tests {
 
     #[test]
     fn maximum_epoch_is_encoded_without_wrapping() {
-        let claim = FirstOwnerClaim::from_parts(
+        let claim = FirstOwnerClaim::from_parts_with_authority(
             [1; 32],
             [2; 32],
             [3; 32],
@@ -415,6 +545,8 @@ mod tests {
             PrincipalUid::from_bytes([7; 32]),
             [8; 32],
             [9; 32],
+            u64::MAX,
+            u64::MAX,
             u64::MAX,
             [0; 64],
         )

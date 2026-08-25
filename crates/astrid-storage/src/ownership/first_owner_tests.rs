@@ -330,66 +330,296 @@ async fn tampered_pending_claim_fails_closed_on_reopen() {
 }
 
 #[tokio::test]
-async fn commit_revalidates_deletion_and_directory_identity() {
+async fn pending_first_owner_rejects_deletion_reservation() {
     let fixture = fixture();
     fixture
         .store
         .begin_first_owner(fixture.claim)
         .await
         .unwrap();
-    let guard = fixture
+    assert!(matches!(
+        fixture
+            .store
+            .guard_principal_deletion_for_alias(
+                fixture.principal_uid,
+                astrid_core::PrincipalId::new("root").unwrap(),
+            )
+            .await,
+        Err(OwnershipError::AuthorityNotEnrolled)
+    ));
+    assert!(
+        fixture
+            .store
+            .commit_first_owner(fixture.claim, fixture.user, fixture.fleet)
+            .await
+            .unwrap()
+            .is_enrolled()
+    );
+}
+
+#[tokio::test]
+async fn pending_first_owner_rejects_authority_mutations_until_commit() {
+    let fixture = fixture();
+    fixture
         .store
-        .guard_principal_deletion_for_alias(
-            fixture.principal_uid,
-            astrid_core::PrincipalId::new("root").unwrap(),
+        .begin_first_owner(fixture.claim)
+        .await
+        .unwrap();
+    let second_fleet = FleetIdentity::from_genesis(FleetGenesis::from_parts(
+        Uuid::from_u128(4),
+        at(1_700_003_000),
+        fixture.user.uid,
+    ))
+    .unwrap();
+    assert!(matches!(
+        fixture.store.create_fleet(second_fleet).await,
+        Err(OwnershipError::AuthorityNotEnrolled)
+    ));
+    assert!(matches!(
+        fixture
+            .store
+            .transfer_principal(
+                fixture.principal_uid,
+                fixture.fleet.uid,
+                fixture.fleet.uid,
+                fixture.user.uid,
+            )
+            .await,
+        Err(OwnershipError::AuthorityNotEnrolled)
+    ));
+}
+
+#[tokio::test]
+async fn enrolled_graph_rejects_missing_user_identity_or_owner_membership() {
+    let missing_user = fixture();
+    missing_user
+        .store
+        .begin_first_owner(missing_user.claim)
+        .await
+        .unwrap();
+    missing_user
+        .store
+        .commit_first_owner(
+            missing_user.claim,
+            missing_user.user.clone(),
+            missing_user.fleet.clone(),
         )
         .await
         .unwrap();
-    // The guard serializes the deletion reservation write with ownership
-    // mutations. Drop it after the reservation is durable so the commit can
-    // observe the reservation rather than waiting on the exclusive barrier.
-    drop(guard);
+    let raw = missing_user
+        .backend
+        .get(super::OWNERSHIP_NAMESPACE, super::GRAPH_KEY)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut json: Value = serde_json::from_slice(&raw).unwrap();
+    json["users"]
+        .as_object_mut()
+        .unwrap()
+        .remove(&missing_user.user.uid.to_string());
+    missing_user
+        .backend
+        .set(
+            super::OWNERSHIP_NAMESPACE,
+            super::GRAPH_KEY,
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .await
+        .unwrap();
     assert!(matches!(
-        fixture
-            .store
-            .commit_first_owner(fixture.claim, fixture.user.clone(), fixture.fleet.clone())
+        missing_user.store.load().await,
+        Err(OwnershipError::CorruptGraph(_))
+    ));
+
+    // Owner membership is checked independently on a fresh valid fixture.
+    let second = fixture();
+    second.store.begin_first_owner(second.claim).await.unwrap();
+    second
+        .store
+        .commit_first_owner(second.claim, second.user.clone(), second.fleet.clone())
+        .await
+        .unwrap();
+    let raw = second
+        .backend
+        .get(super::OWNERSHIP_NAMESPACE, super::GRAPH_KEY)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut json: Value = serde_json::from_slice(&raw).unwrap();
+    json["fleets"][second.fleet.uid.to_string()]["memberships"]
+        .as_object_mut()
+        .unwrap()
+        .remove(&second.user.uid.to_string());
+    second
+        .backend
+        .set(
+            super::OWNERSHIP_NAMESPACE,
+            super::GRAPH_KEY,
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        second.store.load().await,
+        Err(OwnershipError::CorruptGraph(_))
+    ));
+}
+
+#[tokio::test]
+async fn cancelled_claim_is_stale_after_reopen_and_cannot_mint_a_new_owner() {
+    let fixture = fixture();
+    fixture
+        .store
+        .begin_first_owner(fixture.claim)
+        .await
+        .unwrap();
+    fixture
+        .store
+        .cancel_first_owner(fixture.claim)
+        .await
+        .unwrap();
+    let reopened =
+        OwnershipStore::new(fixture.backend.clone(), fixture.principals.clone()).unwrap();
+    assert!(matches!(
+        reopened.begin_first_owner(fixture.claim).await,
+        Err(OwnershipError::FirstOwner(FirstOwnerError::StaleClaim))
+    ));
+    let changed_key = SigningKey::from_bytes(&[8; 32]);
+    let current = reopened.load().await.unwrap();
+    let unsigned = FirstOwnerClaim::from_parts_with_authority(
+        *fixture.claim.machine_context(),
+        *fixture.claim.boot_context(),
+        *fixture.claim.kernel_identity(),
+        *fixture.claim.system_generation(),
+        fixture.claim.user_uid(),
+        fixture.claim.fleet_uid(),
+        fixture.claim.principal_uid(),
+        changed_key.verifying_key().to_bytes(),
+        *fixture.claim.nonce(),
+        current.authority_generation().get(),
+        u64::MAX,
+        current.authority_epoch().get(),
+        [0; 64],
+    )
+    .unwrap();
+    let changed = FirstOwnerClaim::from_parts_with_authority(
+        *unsigned.machine_context(),
+        *unsigned.boot_context(),
+        *unsigned.kernel_identity(),
+        *unsigned.system_generation(),
+        unsigned.user_uid(),
+        unsigned.fleet_uid(),
+        unsigned.principal_uid(),
+        *unsigned.initial_user_public_key(),
+        *unsigned.nonce(),
+        current.authority_generation().get(),
+        u64::MAX,
+        unsigned.authority_epoch().get(),
+        changed_key.sign(&unsigned.canonical_message()).to_bytes(),
+    )
+    .unwrap();
+    reopened.begin_first_owner(changed).await.unwrap();
+    assert!(matches!(
+        reopened
+            .commit_first_owner(changed, fixture.user, fixture.fleet)
             .await,
         Err(OwnershipError::FirstOwner(
-            FirstOwnerError::PrincipalDeletionInProgress
+            FirstOwnerError::IdentityMismatch("user")
         ))
     ));
-    fixture.principals.unregister(
-        &astrid_core::PrincipalId::new("root").unwrap(),
-        fixture.principal_uid,
-    );
-    assert!(matches!(
-        fixture
-            .store
-            .ensure_alias_available(&astrid_core::PrincipalId::new("root").unwrap())
-            .await,
-        Err(OwnershipError::DeletionAliasReserved { .. })
-    ));
-    let replacement = PrincipalIdentity::from_genesis(PrincipalGenesis::from_parts(
-        Uuid::from_u128(4),
-        at(1_700_003_000),
-        [10; 32],
+}
+
+#[tokio::test]
+async fn post_enrollment_transfer_preserves_claim_counters_and_rejects_new_owner() {
+    let fixture = fixture();
+    fixture
+        .store
+        .begin_first_owner(fixture.claim)
+        .await
+        .unwrap();
+    fixture
+        .store
+        .commit_first_owner(fixture.claim, fixture.user.clone(), fixture.fleet.clone())
+        .await
+        .unwrap();
+    let second_fleet = FleetIdentity::from_genesis(FleetGenesis::from_parts(
+        Uuid::from_u128(5),
+        at(1_700_003_001),
+        fixture.user.uid,
     ))
     .unwrap();
     fixture
-        .principals
-        .register(
-            astrid_core::PrincipalId::new("root").unwrap(),
-            replacement.uid,
-        )
+        .store
+        .create_fleet(second_fleet.clone())
+        .await
         .unwrap();
+    fixture
+        .store
+        .transfer_principal(
+            fixture.principal_uid,
+            fixture.fleet.uid,
+            second_fleet.uid,
+            fixture.user.uid,
+        )
+        .await
+        .unwrap();
+    let graph = fixture.store.load().await.unwrap();
+    assert_eq!(graph.authority_epoch(), fixture.claim.authority_epoch());
+    assert_eq!(
+        graph.authority_generation(),
+        fixture.claim.authority_generation()
+    );
+    assert_eq!(
+        graph.first_owner_state(),
+        FirstOwnerEnrollment::Enrolled {
+            claim: fixture.claim
+        }
+    );
+
+    let other_key = SigningKey::from_bytes(&[10; 32]);
+    let other_user = UserIdentity::from_genesis(UserGenesis::from_parts(
+        Uuid::from_u128(6),
+        at(1_700_003_002),
+        other_key.verifying_key().to_bytes(),
+    ))
+    .unwrap();
+    let other_fleet = FleetIdentity::from_genesis(FleetGenesis::from_parts(
+        Uuid::from_u128(7),
+        at(1_700_003_003),
+        other_user.uid,
+    ))
+    .unwrap();
+    let unsigned = FirstOwnerClaim::from_parts(
+        *fixture.claim.machine_context(),
+        *fixture.claim.boot_context(),
+        *fixture.claim.kernel_identity(),
+        *fixture.claim.system_generation(),
+        other_user.uid,
+        other_fleet.uid,
+        fixture.claim.principal_uid(),
+        other_key.verifying_key().to_bytes(),
+        [99; 32],
+        fixture.claim.authority_epoch().get(),
+        [0; 64],
+    )
+    .unwrap();
+    let other_claim = FirstOwnerClaim::from_parts(
+        *unsigned.machine_context(),
+        *unsigned.boot_context(),
+        *unsigned.kernel_identity(),
+        *unsigned.system_generation(),
+        unsigned.user_uid(),
+        unsigned.fleet_uid(),
+        unsigned.principal_uid(),
+        *unsigned.initial_user_public_key(),
+        *unsigned.nonce(),
+        unsigned.authority_epoch().get(),
+        other_key.sign(&unsigned.canonical_message()).to_bytes(),
+    )
+    .unwrap();
     assert!(matches!(
-        fixture
-            .store
-            .commit_first_owner(fixture.claim, fixture.user.clone(), fixture.fleet.clone())
-            .await,
-        Err(OwnershipError::FirstOwner(
-            FirstOwnerError::PrincipalNotAdmitted
-        ))
+        fixture.store.begin_first_owner(other_claim).await,
+        Err(OwnershipError::FirstOwner(FirstOwnerError::AlreadyEnrolled))
     ));
 }
 
@@ -463,23 +693,18 @@ async fn empty_legacy_graph_migrates_but_legacy_authority_fails_closed() {
         FirstOwnerEnrollment::Unenrolled
     );
 
+    assert!(matches!(
+        fixture.store.create_user(fixture.user.clone()).await,
+        Err(OwnershipError::AuthorityNotEnrolled)
+    ));
     fixture
         .store
-        .create_user(fixture.user.clone())
+        .begin_first_owner(fixture.claim)
         .await
         .unwrap();
     fixture
         .store
-        .create_fleet(fixture.fleet.clone())
-        .await
-        .unwrap();
-    fixture
-        .store
-        .assign_principal(astrid_core::PrincipalOwnership {
-            principal_uid: fixture.principal_uid,
-            fleet_uid: fixture.fleet.uid,
-            assigned_by: fixture.user.uid,
-        })
+        .commit_first_owner(fixture.claim, fixture.user.clone(), fixture.fleet.clone())
         .await
         .unwrap();
     let raw = fixture

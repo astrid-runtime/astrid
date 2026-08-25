@@ -77,10 +77,11 @@ pub use utils::truncate_to_boundary;
 
 // Identity types
 pub use identity::{
-    AstridUserId, FIRST_OWNER_MESSAGE_LEN, FirstOwnerClaim, FirstOwnerClaimError, FleetGenesis,
-    FleetIdentity, FleetMembership, FleetRole, FleetUid, FrontendLink, OwnershipIdentityError,
-    PrincipalGenesis, PrincipalIdentity, PrincipalIdentityError, PrincipalOwnership, PrincipalUid,
-    UserGenesis, UserIdentity, UserUid, normalize_platform,
+    AstridUserId, FIRST_OWNER_MESSAGE_LEN, FirstOwnerClaim, FirstOwnerClaimError,
+    FirstOwnerGeneration, FleetGenesis, FleetIdentity, FleetMembership, FleetRole, FleetUid,
+    FrontendLink, OwnershipIdentityError, PrincipalGenesis, PrincipalIdentity,
+    PrincipalIdentityError, PrincipalOwnership, PrincipalUid, UserGenesis, UserIdentity, UserUid,
+    normalize_platform,
 };
 
 // Uplink types
