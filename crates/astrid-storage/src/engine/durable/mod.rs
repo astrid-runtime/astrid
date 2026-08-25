@@ -553,6 +553,7 @@ struct ArenaLocation {
 #[derive(Debug)]
 struct DurableInner<P: Ord> {
     roots_by_principal: BTreeMap<P, RootState>,
+    rejected_roots: Vec<RejectedRootCandidate<P>>,
     index: BTreeMap<ObjectId, ArenaLocation>,
     pending_wal: wal::PendingWalOverlay<P>,
     pending_index_locations: Vec<(ObjectId, ArenaLocation)>,
@@ -563,6 +564,14 @@ struct DurableInner<P: Ord> {
     lock: Option<StoreLock>,
     poisoned: bool,
     arena_generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RejectedRootCandidate<P> {
+    pub(crate) principal: P,
+    pub(crate) offset: u64,
+    pub(crate) root: RootState,
+    pub(crate) missing: ObjectId,
 }
 
 #[derive(Debug)]
@@ -639,6 +648,7 @@ where
 #[derive(Debug)]
 struct RecoveredStore<P: Ord> {
     roots_by_principal: BTreeMap<P, RootState>,
+    rejected_roots: Vec<RejectedRootCandidate<P>>,
     index: BTreeMap<ObjectId, ArenaLocation>,
     validated: BTreeSet<ObjectId>,
     files: DurableFiles,
@@ -843,7 +853,10 @@ use native_io::{
     open_rw as open_rw_capability, sync_directory as sync_store_directory_capability,
 };
 use recovery::{RecoveryScope, recover_store, recover_volume};
-use roots::{encode_root_record, encode_root_snapshot, recover_root_history, recover_roots};
+use roots::{
+    encode_root_record, encode_root_snapshot, recover_root_history, recover_roots,
+    recover_startup_roots,
+};
 use validation::{
     ClosureObjects, materialize_closure, recovery_closure_error, usage_from_closure,
     validate_commit_closure, validate_incremental_closure,
@@ -857,5 +870,7 @@ mod crash_replay_tests;
 mod group_tests;
 #[cfg(test)]
 mod index_tests;
+#[cfg(test)]
+mod recovery_fallback_tests;
 #[cfg(test)]
 mod tests;

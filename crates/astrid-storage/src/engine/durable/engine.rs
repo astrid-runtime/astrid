@@ -545,6 +545,26 @@ where
             .collect())
     }
 
+    /// Return startup candidates whose committed closure was incomplete.
+    ///
+    /// Recovery retains these integrity-verified, lineage-valid journal frames
+    /// for diagnostics but does not install them as live roots. The report is
+    /// empty for a clean startup and never changes live-read fail-closed
+    /// behavior.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "crate diagnostics accessor is consumed by recovery fallback tests and callers"
+        )
+    )]
+    pub(crate) fn rejected_recovery_candidates(
+        &self,
+    ) -> Result<Vec<super::RejectedRootCandidate<P>>, DurableError> {
+        let inner = self.lock_usable()?;
+        Ok(inner.rejected_roots.clone())
+    }
+
     /// Capture one current root and its complete owning closure.
     ///
     /// # Errors

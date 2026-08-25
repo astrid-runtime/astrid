@@ -7,7 +7,7 @@ use super::{
     MutexGuard, PersistentObjectIdentity, PrincipalCodec, ROOT_FILE, RecoveredStore,
     RecoveryLimits, Seek, SeekFrom, SharedIdentity, SharedPrincipalCodec, WAL_FILE, io, io_error,
     open_rw_capability, recover_arena, recover_index, recover_interrupted_compaction,
-    recover_root_history, recover_roots, replace_index, sync_store_directory_capability,
+    recover_root_history, recover_startup_roots, replace_index, sync_store_directory_capability,
 };
 use crate::volume::AstridVolume;
 use std::collections::BTreeSet;
@@ -100,7 +100,7 @@ where
     } else {
         None
     };
-    let (roots_by_principal, validated) = recover_roots(
+    let (roots_by_principal, validated, rejected_roots) = recover_startup_roots(
         &mut roots,
         &mut arena,
         &index,
@@ -124,6 +124,7 @@ where
     Ok((
         RecoveredStore {
             roots_by_principal,
+            rejected_roots,
             index,
             validated,
             files: DurableFiles {
@@ -197,7 +198,7 @@ where
     } else {
         None
     };
-    let (roots_by_principal, validated) = recover_roots(
+    let (roots_by_principal, validated, rejected_roots) = recover_startup_roots(
         &mut roots,
         &mut arena,
         &index,
@@ -221,6 +222,7 @@ where
     Ok((
         RecoveredStore {
             roots_by_principal,
+            rejected_roots,
             index,
             validated,
             files: DurableFiles {
@@ -404,6 +406,7 @@ where
             match recovered {
                 Ok((recovered, wal)) => {
                     inner.roots_by_principal = recovered.roots_by_principal;
+                    inner.rejected_roots = recovered.rejected_roots;
                     self.published_roots.replace(&inner.roots_by_principal);
                     inner.index = recovered.index;
                     inner.pending_index_locations.clear();
