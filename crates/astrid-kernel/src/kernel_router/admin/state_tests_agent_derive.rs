@@ -12,8 +12,8 @@ use astrid_core::groups::{BUILTIN_ADMIN, BUILTIN_RESTRICTED};
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::PrincipalProfile;
 use astrid_events::kernel_api::{AdminResponseBody, AgentDeriveRequest};
-use astrid_storage::{ContentName, ScopedKvStore, StateOwner};
 use astrid_storage::env::{SECRET_KEY_PREFIX, principal_secret_namespace};
+use astrid_storage::{ContentName, ScopedKvStore, StateOwner};
 
 use crate::Kernel;
 
