@@ -7,6 +7,7 @@ resolver = "2"
 members = [
     "crates/astrid-native-closure",
     "crates/astrid-native-kernel",
+    "crates/astrid-system-generation",
     "tools/kimage",
     "tools/ktest",
 ]
