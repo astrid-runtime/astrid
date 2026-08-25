@@ -97,8 +97,8 @@ fn copy_ramdisk(
         return Err(ClosureError::Truncated);
     }
     crate::memory::prove_readable_range(addr, boot_info.ramdisk_len)?;
-    // SAFETY: the exact canonical range and every covering page were proven
-    // readable immediately above; this copies only into kernel-owned storage.
-    unsafe { crate::memory::copy_readable_range(addr, destination) };
-    Ok(())
+    // SAFETY: the range was proven readable above; the helper also rejects
+    // overlap with this kernel-owned destination before forming a source
+    // slice or invoking the non-overlapping copy primitive.
+    unsafe { crate::memory::copy_readable_range(addr, destination) }
 }

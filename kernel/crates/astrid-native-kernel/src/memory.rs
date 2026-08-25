@@ -289,10 +289,68 @@ pub fn prove_readable_range(start: u64, len: u64) -> Result<(), ClosureError> {
 ///
 /// # Safety
 /// Call [`prove_readable_range`] for the same range immediately before this
-/// operation, and provide a destination of exactly `len` bytes.
-pub unsafe fn copy_readable_range(start: u64, destination: &mut [u8]) {
+/// operation, and provide a destination of exactly `len` bytes. The source
+/// must remain readable for the duration of the copy. The checked overlap
+/// guard below is required because the source address is loader input while
+/// the destination is a kernel-owned stack buffer.
+pub unsafe fn copy_readable_range(start: u64, destination: &mut [u8]) -> Result<(), ClosureError> {
+    let len = destination.len() as u64;
+    if ranges_overlap(start, len, destination.as_mut_ptr() as u64, len)? {
+        return Err(ClosureError::Malformed);
+    }
     let source = unsafe { core::slice::from_raw_parts(start as *const u8, destination.len()) };
     destination.copy_from_slice(source);
+    Ok(())
+}
+
+fn ranges_overlap(
+    first_start: u64,
+    first_len: u64,
+    second_start: u64,
+    second_len: u64,
+) -> Result<bool, ClosureError> {
+    let first_end = first_start
+        .checked_add(first_len)
+        .ok_or(ClosureError::Malformed)?;
+    let second_end = second_start
+        .checked_add(second_len)
+        .ok_or(ClosureError::Malformed)?;
+    Ok(first_start < second_end && second_start < first_end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{copy_readable_range, ranges_overlap};
+
+    #[test]
+    fn exact_and_partial_source_destination_overlap_is_rejected() {
+        assert!(ranges_overlap(0x1000, 0x100, 0x1000, 0x100).unwrap());
+        assert!(ranges_overlap(0x1000, 0x100, 0x1080, 0x100).unwrap());
+        assert!(ranges_overlap(0x1080, 0x100, 0x1000, 0x100).unwrap());
+    }
+
+    #[test]
+    fn disjoint_ranges_are_accepted() {
+        assert!(!ranges_overlap(0x1000, 0x100, 0x1100, 0x100).unwrap());
+        assert!(!ranges_overlap(0x1100, 0x100, 0x1000, 0x100).unwrap());
+    }
+
+    #[test]
+    fn overflowing_range_is_rejected() {
+        assert!(ranges_overlap(u64::MAX - 3, 4, 0, 1).is_err());
+    }
+
+    #[test]
+    fn non_overlapping_copy_succeeds() {
+        let source = [1u8, 2, 3, 4];
+        let mut destination = [0u8; 4];
+        // SAFETY: the test arrays are resident and readable for the copy, and
+        // their distinct allocations establish the required non-overlap.
+        unsafe {
+            copy_readable_range(source.as_ptr() as u64, &mut destination).unwrap();
+        }
+        assert_eq!(destination, source);
+    }
 }
 
 fn leaf_flags(addr: VirtAddr) -> Option<PageTableFlags> {
