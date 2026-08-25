@@ -9,6 +9,25 @@ use astrid_native_closure::{
     PolicyGeneration, RootVerifier, TABLE_LEN, TrustedPolicy, verify_policy_handoff, verify_table,
 };
 use bootloader_api::BootInfo;
+use bootloader_api::info::LoaderHandoffVerification;
+
+// Keep ring 0's view of the loader receipt pinned to the vendored
+// bootloader/common producer. A layout drift would otherwise turn the
+// evidence fields into a differently interpreted byte stream.
+const _: () = {
+    use core::mem::{align_of, offset_of, size_of};
+
+    assert!(size_of::<LoaderHandoffVerification>() == 328);
+    assert!(align_of::<LoaderHandoffVerification>() == 8);
+    assert!(offset_of!(LoaderHandoffVerification, magic) == 0);
+    assert!(offset_of!(LoaderHandoffVerification, envelope_digest) == 16);
+    assert!(offset_of!(LoaderHandoffVerification, kernel_image) == 48);
+    assert!(offset_of!(LoaderHandoffVerification, closure_table) == 80);
+    assert!(offset_of!(LoaderHandoffVerification, root_verify) == 208);
+    assert!(offset_of!(LoaderHandoffVerification, policy_generation) == 304);
+    assert!(offset_of!(LoaderHandoffVerification, kernel_floor) == 312);
+    assert!(offset_of!(LoaderHandoffVerification, sysgen_floor) == 320);
+};
 
 /// The exact ramdisk contract is `[ASTRIDPH; 379][ASTRIDDC; 355]`.
 pub const RAMDISK_BUNDLE_LEN: usize = HANDOFF_LEN + TABLE_LEN;

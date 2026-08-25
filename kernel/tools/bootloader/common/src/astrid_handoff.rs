@@ -13,6 +13,24 @@ use astrid_native_closure::{
 };
 use bootloader_api::info::LoaderHandoffVerification;
 
+// Keep the bootloader's receipt layout pinned to the ring-0 consumer. These
+// assertions fail at compile time if a field is inserted, reordered, or
+// receives a different alignment in the vendored ABI.
+const _: () = {
+    use core::mem::{align_of, offset_of, size_of};
+
+    assert!(size_of::<LoaderHandoffVerification>() == 328);
+    assert!(align_of::<LoaderHandoffVerification>() == 8);
+    assert!(offset_of!(LoaderHandoffVerification, magic) == 0);
+    assert!(offset_of!(LoaderHandoffVerification, envelope_digest) == 16);
+    assert!(offset_of!(LoaderHandoffVerification, kernel_image) == 48);
+    assert!(offset_of!(LoaderHandoffVerification, closure_table) == 80);
+    assert!(offset_of!(LoaderHandoffVerification, root_verify) == 208);
+    assert!(offset_of!(LoaderHandoffVerification, policy_generation) == 304);
+    assert!(offset_of!(LoaderHandoffVerification, kernel_floor) == 312);
+    assert!(offset_of!(LoaderHandoffVerification, sysgen_floor) == 320);
+};
+
 pub const RECEIPT_MAGIC: [u8; 8] = *b"ASTRIDLV";
 pub const RECEIPT_VERSION: u8 = 1;
 pub const RECEIPT_STATUS_VERIFIED: u8 = 1;
