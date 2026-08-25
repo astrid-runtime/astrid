@@ -43,6 +43,8 @@ PUSH_CAMPAIGN_WORKFLOWS = frozenset(
 PROTECTED_WORKFLOWS = frozenset({"release.yml", "scorecard.yml", "native-kernel.yml"})
 OCI_WORKFLOWS = frozenset({"oci-amd64.yml", "oci-arm64.yml"})
 RELEASE_PUSH_TAGS = ("v[0-9]+.*", "!v[0-9]+.*-nightly.*")
+SCORECARD_ON_EVENTS = frozenset({"branch_protection_rule", "push", "schedule"})
+RELEASE_ON_EVENTS = frozenset({"push", "workflow_dispatch"})
 
 
 def _event_block(text: str, event: str) -> list[str] | None:
@@ -119,6 +121,25 @@ def _has_event(text: str, event: str) -> bool:
     return _event_block(text, event) is not None
 
 
+def _on_events(text: str) -> list[str]:
+    """Return two-space event names nested under the workflow ``on:`` block."""
+
+    events: list[str] = []
+    in_on = False
+    for line in text.splitlines():
+        if line.startswith("on:"):
+            in_on = True
+            continue
+        if not in_on:
+            continue
+        if re.match(r"^[^\s#].*:", line):
+            break
+        match = re.match(r"^  ([^\s#][^:]*):", line)
+        if match:
+            events.append(match.group(1))
+    return events
+
+
 def _has_codex_filter(branches: list[str]) -> bool:
     return any(
         branch.startswith(CODEX_BRANCH_PREFIX) or branch.startswith("codex")
@@ -145,7 +166,6 @@ def _reject_codex(errors: list[str], name: str, event: str, branches: list[str])
         errors.append(f"{name}: {event}.branches must not include codex branch filters")
 
 
-
 def _protected_workflow_errors(name: str, text: str) -> list[str]:
     """Reject campaign expansion and branchless/wildcard protected triggers."""
 
@@ -163,8 +183,13 @@ def _protected_workflow_errors(name: str, text: str) -> list[str]:
             errors.append("scorecard.yml: push.branches must be exactly [main]")
         if push_tags is not None:
             errors.append("scorecard.yml: push.tags is not allowed")
-        if pull_request_branches is not None:
-            errors.append("scorecard.yml: pull_request.branches is not allowed")
+        if _has_event(text, "pull_request"):
+            errors.append("scorecard.yml: pull_request event is not allowed")
+        unexpected = [event for event in _on_events(text) if event not in SCORECARD_ON_EVENTS]
+        if unexpected:
+            errors.append(
+                "scorecard.yml: unexpected on event " + ", ".join(unexpected)
+            )
         if not _has_event(text, "branch_protection_rule"):
             errors.append("scorecard.yml: branch_protection_rule event is required")
         if not _has_event(text, "schedule"):
@@ -183,10 +208,15 @@ def _protected_workflow_errors(name: str, text: str) -> list[str]:
                 errors.append("release.yml: push.tags must remain the canonical tag filter")
         if _has_event(text, "pull_request"):
             errors.append("release.yml: pull_request event is not allowed")
+        unexpected = [event for event in _on_events(text) if event not in RELEASE_ON_EVENTS]
+        if unexpected:
+            errors.append("release.yml: unexpected on event " + ", ".join(unexpected))
         if not _has_event(text, "workflow_dispatch"):
             errors.append("release.yml: workflow_dispatch event is required")
         return errors
 
+    if _has_event(text, "pull_request") and pull_request_branches is None:
+        errors.append(f"{name}: pull_request.branches is required")
     for event, branches in (
         ("pull_request", pull_request_branches),
         ("push", push_branches),

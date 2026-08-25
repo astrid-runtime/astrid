@@ -260,6 +260,34 @@ class CampaignCiTriggerTests(unittest.TestCase):
             errors,
         )
 
+    def test_scorecard_rejects_branchless_pull_request_event(self):
+        workflows = load_workflows(ROOT)
+        scorecard = workflows["scorecard.yml"]
+        mutated = dict(workflows)
+        mutated["scorecard.yml"] = scorecard.replace("on:\n", "on:\n  pull_request:\n", 1)
+        errors = validate_workflows(mutated)
+        self.assertTrue(
+            any(
+                "scorecard.yml: pull_request event is not allowed" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+        mutated["scorecard.yml"] = scorecard.replace(
+            "on:\n",
+            "on:\n  pull_request:\n    types: [opened]\n",
+            1,
+        )
+        errors = validate_workflows(mutated)
+        self.assertTrue(
+            any(
+                "scorecard.yml: pull_request event is not allowed" in error
+                for error in errors
+            ),
+            errors,
+        )
+
     def test_push_campaign_branch_is_allowlisted(self):
         temp_root = self._copy_workflows()
         workflow = temp_root / ".github" / "workflows" / "scorecard.yml"
