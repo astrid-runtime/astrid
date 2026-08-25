@@ -4,8 +4,10 @@
 
 use std::sync::Arc;
 
+use crate::content::ContentName;
 use crate::engine::{
     CompactionFacts, CompactionProofVerifier, CompactionRetention, CompactionRootKind,
+    DurableError, VerifiedCompactionPlan,
 };
 use crate::storage_model::{
     ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord, RetentionPolicyId,
@@ -69,6 +71,46 @@ fn evidence(bytes: &[u8]) -> ObjectRecord {
         ObjectClass::Metadata,
     )
     .unwrap()
+}
+
+async fn verified_runtime_plan(
+    store: &RuntimePrincipalStore,
+    policy_bytes: &[u8],
+    proof_bytes: &[u8],
+) -> VerifiedCompactionPlan {
+    let policy = evidence(policy_bytes);
+    let retention = store
+        .prepare_compaction_retention(
+            ObjectId::new([0xC0; 32]),
+            RetentionPolicyId::new(store.engine.identify(&policy)),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let facts = store.engine.capture_compaction_facts(&retention).unwrap();
+    store
+        .engine
+        .verify_compaction_plan(
+            retention,
+            facts,
+            policy,
+            evidence(proof_bytes),
+            &AcceptCompactionProof,
+        )
+        .unwrap()
+}
+
+fn compact_live(
+    store: &RuntimePrincipalStore,
+    plan: &VerifiedCompactionPlan,
+) -> Result<crate::engine::CompactionReport, DurableError> {
+    let content = store.content();
+    store.engine.compact_with_live_read_handles(plan, || {
+        let observation = content
+            .begin_compaction_observation()
+            .map_err(|_| DurableError::CompactionSnapshotChanged)?;
+        Ok((observation.live_object_ids(), observation))
+    })
 }
 
 #[tokio::test]
@@ -336,4 +378,260 @@ async fn deterministic_runtime_compaction_reclaims_and_delivers_receipt() {
             .is_some()
     );
     reopened.engine.close().unwrap();
+}
+
+#[tokio::test]
+async fn compaction_fails_closed_when_a_read_handle_is_dropped_after_plan_capture() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let alice_uid = create_alice(&store).await;
+    let owner = StateOwner::Principal(alice_uid);
+    let (_orphan, _) = store
+        .engine
+        .persist_standalone_object(&evidence(b"collect-dropped-handle"))
+        .unwrap();
+    let name = ContentName::new("models/a.bin").unwrap();
+    store.content().put(&owner, &name, b"file-a").unwrap();
+    let handle = store.content().open_read(&owner, &name).unwrap().unwrap();
+    let policy = evidence(b"handle-drop-after-capture");
+    let retention = store
+        .prepare_compaction_retention(
+            ObjectId::new([0xC0; 32]),
+            RetentionPolicyId::new(store.engine.identify(&policy)),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert!(retention.additional_roots().iter().any(|root| {
+        root.kind() == CompactionRootKind::ReadHandle && root.object() == handle.descriptor().file()
+    }));
+    let facts = store.engine.capture_compaction_facts(&retention).unwrap();
+    let plan = store
+        .engine
+        .verify_compaction_plan(
+            retention,
+            facts,
+            policy,
+            evidence(b"test-tensor-logic-proof"),
+            &AcceptCompactionProof,
+        )
+        .unwrap();
+    drop(handle);
+    let content = store.content();
+    assert!(matches!(
+        store.engine.compact_with_live_read_handles(&plan, || {
+            let observation = content
+                .begin_compaction_observation()
+                .map_err(|_| DurableError::CompactionSnapshotChanged)?;
+            Ok((observation.live_object_ids(), observation))
+        }),
+        Err(DurableError::CompactionSnapshotChanged)
+    ));
+    store.engine.close().unwrap();
+}
+
+#[tokio::test]
+async fn compaction_fails_closed_when_a_read_handle_opens_after_plan_capture() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let alice_uid = create_alice(&store).await;
+    let owner = StateOwner::Principal(alice_uid);
+    let (_orphan, _) = store
+        .engine
+        .persist_standalone_object(&evidence(b"collect-opened-handle"))
+        .unwrap();
+    let name_a = ContentName::new("models/a.bin").unwrap();
+    let name_b = ContentName::new("models/b.bin").unwrap();
+    store.content().put(&owner, &name_a, b"file-a").unwrap();
+    store.content().put(&owner, &name_b, b"file-b").unwrap();
+    let handle_a = store.content().open_read(&owner, &name_a).unwrap().unwrap();
+    let policy = evidence(b"handle-open-after-capture");
+    let retention = store
+        .prepare_compaction_retention(
+            ObjectId::new([0xC0; 32]),
+            RetentionPolicyId::new(store.engine.identify(&policy)),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert!(retention.additional_roots().iter().any(|root| {
+        root.kind() == CompactionRootKind::ReadHandle
+            && root.object() == handle_a.descriptor().file()
+    }));
+    assert!(retention.additional_roots().iter().all(|root| {
+        root.kind() != CompactionRootKind::ReadHandle
+            || root.object() == handle_a.descriptor().file()
+    }));
+    let facts = store.engine.capture_compaction_facts(&retention).unwrap();
+    let plan = store
+        .engine
+        .verify_compaction_plan(
+            retention,
+            facts,
+            policy,
+            evidence(b"test-tensor-logic-proof"),
+            &AcceptCompactionProof,
+        )
+        .unwrap();
+    let handle_b = store.content().open_read(&owner, &name_b).unwrap().unwrap();
+    let content = store.content();
+    assert!(matches!(
+        store.engine.compact_with_live_read_handles(&plan, || {
+            let observation = content
+                .begin_compaction_observation()
+                .map_err(|_| DurableError::CompactionSnapshotChanged)?;
+            Ok((observation.live_object_ids(), observation))
+        }),
+        Err(DurableError::CompactionSnapshotChanged)
+    ));
+    drop(handle_a);
+    drop(handle_b);
+    store.engine.close().unwrap();
+}
+
+#[tokio::test]
+async fn compaction_fails_closed_when_open_read_pauses_before_lease_registration() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let alice_uid = create_alice(&store).await;
+    let owner = StateOwner::Principal(alice_uid);
+    let (_orphan, _) = store
+        .engine
+        .persist_standalone_object(&evidence(b"collect-inflight-open"))
+        .unwrap();
+    let name = ContentName::new("models/a.bin").unwrap();
+    store.content().put(&owner, &name, b"file-a").unwrap();
+    let policy = evidence(b"inflight-open-before-register");
+    let retention = store
+        .prepare_compaction_retention(
+            ObjectId::new([0xC0; 32]),
+            RetentionPolicyId::new(store.engine.identify(&policy)),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let facts = store.engine.capture_compaction_facts(&retention).unwrap();
+    let plan = store
+        .engine
+        .verify_compaction_plan(
+            retention,
+            facts,
+            policy,
+            evidence(b"test-tensor-logic-proof"),
+            &AcceptCompactionProof,
+        )
+        .unwrap();
+    let gate = store.content().arm_open_read_before_register_gate();
+    let opener_store = store.clone();
+    let opener_name = name.clone();
+    let opener = std::thread::spawn(move || opener_store.content().open_read(&owner, &opener_name));
+    gate.wait_until_entered();
+    let content = store.content();
+    let compact = store.engine.compact_with_live_read_handles(&plan, || {
+        let observation = content
+            .begin_compaction_observation()
+            .map_err(|_| DurableError::CompactionSnapshotChanged)?;
+        Ok((observation.live_object_ids(), observation))
+    });
+    gate.release();
+    assert!(
+        matches!(compact, Err(DurableError::CompactionSnapshotChanged)),
+        "compaction must fail closed on an in-flight open before lease registration, got {compact:?}"
+    );
+    let handle = opener
+        .join()
+        .expect("open_read thread")
+        .expect("open_read")
+        .expect("named content");
+    assert_eq!(handle.read().expect("handle remains readable"), b"file-a");
+    store.engine.close().unwrap();
+}
+
+#[tokio::test]
+async fn compaction_fails_closed_while_inflight_open_holds_replaced_generation() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let alice_uid = create_alice(&store).await;
+    let owner = StateOwner::Principal(alice_uid);
+    let name = ContentName::new("models/a.bin").unwrap();
+    let generation_a = store
+        .content()
+        .put(&owner, &name, b"generation-a")
+        .unwrap()
+        .descriptor()
+        .file();
+    let gate = store.content().arm_open_read_before_register_gate();
+    let opener_store = store.clone();
+    let opener_name = name.clone();
+    let opener = std::thread::spawn(move || opener_store.content().open_read(&owner, &opener_name));
+    gate.wait_until_entered();
+
+    let generation_b = store
+        .content()
+        .put(&owner, &name, b"generation-b")
+        .unwrap()
+        .descriptor()
+        .file();
+    assert_ne!(generation_a, generation_b);
+    let plan = verified_runtime_plan(
+        &store,
+        b"inflight-replaced-generation",
+        b"test-tensor-logic-proof",
+    )
+    .await;
+    assert!(
+        plan.facts().condemned().contains(&generation_a),
+        "replaced generation must be reclaimable without a registered handle"
+    );
+    assert!(!plan.facts().condemned().contains(&generation_b));
+    let compact = compact_live(&store, &plan);
+    assert!(
+        matches!(compact, Err(DurableError::CompactionSnapshotChanged)),
+        "live compaction must fail closed on an in-flight opener of a replaced generation, got {compact:?}"
+    );
+
+    gate.release();
+    let handle = opener
+        .join()
+        .expect("open_read thread")
+        .expect("open_read")
+        .expect("named content");
+    assert_eq!(handle.descriptor().file(), generation_a);
+    assert_eq!(
+        handle.read().expect("stale generation remains readable"),
+        b"generation-a"
+    );
+    assert_eq!(
+        store.content().read(&owner, &name).unwrap().as_deref(),
+        Some(b"generation-b".as_slice())
+    );
+    drop(handle);
+
+    let plan = verified_runtime_plan(
+        &store,
+        b"reclaim-replaced-generation",
+        b"test-tensor-logic-proof-reclaim",
+    )
+    .await;
+    assert!(plan.facts().condemned().contains(&generation_a));
+    compact_live(&store, &plan).expect("compaction after dropping the in-flight handle");
+    assert_eq!(store.engine.object(generation_a).unwrap(), None);
+    assert!(store.engine.object(generation_b).unwrap().is_some());
+    assert_eq!(
+        store.content().read(&owner, &name).unwrap().as_deref(),
+        Some(b"generation-b".as_slice())
+    );
+    store.engine.close().unwrap();
 }

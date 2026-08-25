@@ -270,6 +270,10 @@ where
 
     /// Execute one proof-audited compaction under the native mutation fence.
     ///
+    /// Engine tests that pin `ReadHandle` roots without a live registry must
+    /// keep calling this method. Production composition that captured open
+    /// content handles uses [`Self::compact_with_live_read_handles`].
+    ///
     /// # Errors
     ///
     /// Fails closed if roots, pins, handles, quarantine, or the object
@@ -280,15 +284,66 @@ where
         authorization: &VerifiedCompactionPlan,
     ) -> Result<CompactionReport, DurableError> {
         let mut inner = self.lock_usable()?;
-        let (facts, live) = self.capture_facts_locked(&mut inner, &authorization.retention)?;
+        self.execute_verified_compaction(&mut inner, authorization)
+    }
+
+    /// Execute one proof-audited compaction after re-reading live read-handle
+    /// roots inside the mutation fence.
+    ///
+    /// `observe` runs only after [`Self::lock_usable`] succeeds. It must return
+    /// a snapshot of registered handle roots plus a guard that keeps compaction
+    /// visible to in-flight openers until this method returns. The live
+    /// object-id set is compared with the plan's `ReadHandle` additional roots.
+    /// Retention deduplicates, so comparison is by set identity rather than
+    /// handle count. Drift, or an opener already in flight, fails closed with
+    /// [`DurableError::CompactionSnapshotChanged`].
+    ///
+    /// `observe` must not take the engine lock: compaction already holds it.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed if live handle roots drifted from the verified plan, an
+    /// in-flight open was already announced, or the remaining compaction fence
+    /// refuses the rewrite.
+    pub fn compact_with_live_read_handles<Observe, Roots, Guard>(
+        &self,
+        authorization: &VerifiedCompactionPlan,
+        observe: Observe,
+    ) -> Result<CompactionReport, DurableError>
+    where
+        Observe: FnOnce() -> Result<(Roots, Guard), DurableError>,
+        Roots: IntoIterator<Item = ObjectId>,
+    {
+        let mut inner = self.lock_usable()?;
+        let (live_roots, _observation) = observe()?;
+        let live_roots = live_roots.into_iter().collect::<BTreeSet<_>>();
+        let planned_roots = authorization
+            .retention
+            .additional_roots()
+            .iter()
+            .filter(|root| root.kind() == CompactionRootKind::ReadHandle)
+            .map(|root| root.object())
+            .collect::<BTreeSet<_>>();
+        if live_roots != planned_roots {
+            return Err(DurableError::CompactionSnapshotChanged);
+        }
+        self.execute_verified_compaction(&mut inner, authorization)
+    }
+
+    fn execute_verified_compaction(
+        &self,
+        inner: &mut DurableInner<P>,
+        authorization: &VerifiedCompactionPlan,
+    ) -> Result<CompactionReport, DurableError> {
+        let (facts, live) = self.capture_facts_locked(inner, &authorization.retention)?;
         if facts != authorization.facts {
             return Err(DurableError::CompactionSnapshotChanged);
         }
         let volume = self.volume.read().as_ref().cloned();
         let result = if let Some(volume) = volume {
-            self.compact_volume_locked(&mut inner, authorization, &live, &volume)
+            self.compact_volume_locked(inner, authorization, &live, &volume)
         } else {
-            self.compact_locked(&mut inner, authorization, &live)
+            self.compact_locked(inner, authorization, &live)
         };
         if inner.files.is_none()
             || matches!(
@@ -296,7 +351,7 @@ where
                 Err(DurableError::FaultInjected(_) | DurableError::Io { .. })
             )
         {
-            self.mark_requires_recovery(&mut inner);
+            self.mark_requires_recovery(inner);
         }
         result
     }

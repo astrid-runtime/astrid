@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use crate::engine::{
     CompactionEvidenceBundle, CompactionReport, CompactionRetainedRoot, CompactionRetention,
-    CompactionRootKind, DeterministicCompactionProofVerifier, deterministic_compaction_proof,
+    CompactionRootKind, DeterministicCompactionProofVerifier, DurableError,
+    deterministic_compaction_proof,
 };
 use crate::storage_model::{
     GcCommitId, ObjectClass, ObjectFormatVersion, ObjectId, ObjectKind, ObjectRecord,
@@ -171,6 +172,7 @@ impl RuntimePrincipalStore {
         ensure_compaction_headroom(&self.engine)?;
         let policy_id = RetentionPolicyId::new(self.engine.identify(&policy));
         let engine = Arc::clone(&self.engine);
+        let content = Arc::clone(&self.content);
         let mut additional_roots = additional_roots;
         additional_roots.extend(self.compaction_read_handle_roots().into_iter().map(
             |(_, object)| CompactionRetainedRoot::new(CompactionRootKind::ReadHandle, object),
@@ -195,9 +197,16 @@ impl RuntimePrincipalStore {
                 .map_err(|error| {
                     StorageError::Connection(format!("verify compaction proof: {error}"))
                 })?;
-            engine.compact(&plan).map_err(|error| {
-                StorageError::Connection(format!("compact durable store: {error}"))
-            })
+            engine
+                .compact_with_live_read_handles(&plan, || {
+                    let observation = content
+                        .begin_compaction_observation()
+                        .map_err(|_| DurableError::CompactionSnapshotChanged)?;
+                    Ok((observation.live_object_ids(), observation))
+                })
+                .map_err(|error| {
+                    StorageError::Connection(format!("compact durable store: {error}"))
+                })
         })
         .await
         .map_err(|error| StorageError::Connection(format!("compaction worker failed: {error}")))?
