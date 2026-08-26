@@ -20,6 +20,7 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+mod action_descriptor;
 mod encoding;
 mod error;
 mod fixtures;
@@ -29,6 +30,11 @@ mod revision;
 mod snapshot;
 mod view;
 
+pub use action_descriptor::{
+    ACTION_BINDING_BYTES, ACTION_DESCRIPTOR_ENCODED_LEN, ActionDescriptor, ActionDescriptorFacts,
+    ActionDigest, ActionEligibility, ActionExpiry, ActionGeneration, ActionObservation,
+    ActionPrincipal, ActionScope,
+};
 pub use encoding::{CANONICAL_VERSION, DescriptorDecode, DescriptorEncode, ProjectionTypeTag};
 pub use error::ProjectionError;
 pub use fixtures::{honest_snapshot, honest_two_object_view};

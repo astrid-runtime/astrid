@@ -1,5 +1,7 @@
 //! Semantic object identity bound to [`ResourceId`].
 
+use core::fmt;
+
 use astrid_resource_types::{CanonicalDecode, CanonicalEncode, ResourceId};
 
 use crate::encoding::{
@@ -12,9 +14,16 @@ use crate::error::ProjectionError;
 /// The object is a view of exactly one [`ResourceId`]. It cannot be constructed
 /// from a string name, schema topic, or [`astrid_resource_types::ResourceKind`].
 /// Knowing the identifier is not a grant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SemanticObjectId {
     resource: ResourceId,
+}
+
+impl fmt::Debug for SemanticObjectId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = self;
+        formatter.write_str("SemanticObjectId")
+    }
 }
 
 impl SemanticObjectId {
