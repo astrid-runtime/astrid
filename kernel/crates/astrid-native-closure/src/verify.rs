@@ -54,8 +54,8 @@ fn check_identities(table: &DualClosureTable) -> Result<(), ClosureError> {
     if table.kernel.identity == table.sysgen.identity {
         return Err(ClosureError::Collision);
     }
-    if table.sysgen.identity != crate::types::MeasuredIdentity::empty_sysgen() {
-        return Err(ClosureError::NotEmpty);
+    if table.sysgen.identity == crate::types::MeasuredIdentity::empty_sysgen() {
+        return Err(ClosureError::EmptySysgen);
     }
     Ok(())
 }

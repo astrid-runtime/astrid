@@ -1,5 +1,5 @@
 //! Host QEMU serial-assertion harness for the M1 experimental machine
-//! plus the fixed authenticated handoff/dual-closure fixture.
+//! plus the fixed authenticated handoff/dual-closure/descriptor fixture.
 //!
 //! Builds the ring-0 kernel, wraps it into a UEFI image twice (determinism
 //! measurement), boots under explicit TCG, and asserts one combined serial
@@ -24,6 +24,8 @@ use ktest::firmware;
 use ktest::image::{KIMAGE_NIGHTLY, KimageInvocation};
 use ktest::machine::{self, EXPECT_EXIT_CODE, QEMU_BIN, TAMPER_TIMEOUT, TIMEOUT};
 use wait_timeout::ChildExt;
+
+const MANIFEST_LEN: usize = 548;
 
 fn main() -> Result<()> {
     let root = workspace_root()?;
@@ -132,8 +134,8 @@ fn build_image(root: &Path, kernel_elf: &Path, output: &Path) -> Result<()> {
 fn build_tampered_image(root: &Path, kernel_elf: &Path, output: &Path) -> Result<()> {
     let inv = KimageInvocation::new(root, tools_toolchain());
     run_inherited(
-        &mut inv.command_with_tampered_handoff(root, kernel_elf, output),
-        "kimage tampered handoff",
+        &mut inv.command_with_tampered_sysgen(root, kernel_elf, output),
+        "kimage tampered system-generation descriptor",
     )
 }
 
@@ -165,17 +167,20 @@ fn loader_identities(
     if bytes_a != bytes_b {
         bail!("policy handoff ramdisks differ across kimage invocations");
     }
-    if bytes_a.len() != HANDOFF_LEN + TABLE_LEN {
+    let table_end = HANDOFF_LEN + TABLE_LEN;
+    let bundle_len = table_end + MANIFEST_LEN;
+    if bytes_a.len() != bundle_len {
         bail!(
             "policy handoff ramdisk length is {}, expected {}",
             bytes_a.len(),
-            HANDOFF_LEN + TABLE_LEN
+            bundle_len
         );
     }
     let elf = std::fs::read(kernel_elf)
         .with_context(|| format!("reading kernel ELF {}", kernel_elf.display()))?;
     let kernel_id = MeasuredIdentity::from_payload(&elf);
-    let table_bytes = &bytes_a[HANDOFF_LEN..];
+    let table_bytes = &bytes_a[HANDOFF_LEN..table_end];
+    let descriptor_bytes = &bytes_a[table_end..];
     let closure_table = MeasuredIdentity::from_payload(table_bytes);
     let expected = expected_context(kernel_id, closure_table);
     let root = RootVerifier::try_new(
@@ -199,12 +204,12 @@ fn loader_identities(
     .map_err(|err| anyhow::anyhow!("handoff policy rejected: {}", err.as_reason()))?;
     let bound = verify_table(table_bytes, &policy)
         .map_err(|err| anyhow::anyhow!("host verify_table rejected: {}", err.as_reason()))?;
-    let sysgen_id = MeasuredIdentity::empty_sysgen();
+    let sysgen_id = MeasuredIdentity::from_payload(descriptor_bytes);
     if bound.kernel_identity() != kernel_id {
         bail!("loader kernel identity does not match measured ELF");
     }
     if bound.sysgen_identity() != sysgen_id {
-        bail!("loader sysgen identity is not the empty System Generation");
+        bail!("loader sysgen identity does not match descriptor bytes");
     }
     if !bound.distinct() {
         bail!("loader identities are not distinct");
@@ -333,10 +338,18 @@ fn pre_relocation_hostile_checks(
             bail!("pre-hook {name} mutation unexpectedly accepted");
         }
     }
-    let mut table = bundle[HANDOFF_LEN..].to_vec();
+    let table_end = HANDOFF_LEN + TABLE_LEN;
+    let mut table = bundle[HANDOFF_LEN..table_end].to_vec();
     table[0] ^= 1;
     if verify_table(&table, policy).is_ok() {
         bail!("tampered closure table unexpectedly accepted");
+    }
+    let bound = verify_table(&bundle[HANDOFF_LEN..table_end], policy)
+        .map_err(|err| anyhow::anyhow!(err.as_reason()))?;
+    let mut descriptor = bundle[table_end..].to_vec();
+    descriptor[0] ^= 1;
+    if bound.sysgen_identity() == MeasuredIdentity::from_payload(&descriptor) {
+        bail!("mutated ASTRIDSG descriptor unexpectedly retained its table identity");
     }
     if elf.is_empty() {
         bail!("empty raw ELF fixture");
@@ -358,7 +371,8 @@ fn receipt_matches(
         && receipt.envelope_digest
             == MeasuredIdentity::from_payload(&bundle[..HANDOFF_LEN]).as_bytes()
         && receipt.closure_table
-            == MeasuredIdentity::from_payload(&bundle[HANDOFF_LEN..]).as_bytes()
+            == MeasuredIdentity::from_payload(&bundle[HANDOFF_LEN..HANDOFF_LEN + TABLE_LEN])
+                .as_bytes()
         && receipt.kernel_image == expected.kernel_image.as_bytes()
         && receipt.loader_measurement == expected.loader_measurement.as_bytes()
         && receipt.loader_identity == expected.loader_identity.as_bytes()
@@ -509,7 +523,7 @@ fn assert_tampered_boot_rejected(run: &QemuRun) -> Result<()> {
     });
     let rejected = run.serial.contains("Astrid policy handoff rejected");
     println!(
-        "tampered handoff: timed_out={} exit={:?} events={} loader_rejection_text={}",
+        "tampered ASTRIDSG: timed_out={} exit={:?} events={} loader_rejection_text={}",
         run.timed_out,
         run.exit_code,
         events.len(),
@@ -517,12 +531,12 @@ fn assert_tampered_boot_rejected(run: &QemuRun) -> Result<()> {
     );
     if entered || reached_kernel || !run.timed_out || !rejected {
         bail!(
-            "tampered handoff did not fail before kernel entry (entered={entered}, reached_kernel={reached_kernel}, timed_out={}, rejected_text={rejected}, serial={:?})",
+            "tampered ASTRIDSG did not fail before kernel entry (entered={entered}, reached_kernel={reached_kernel}, timed_out={}, rejected_text={rejected}, serial={:?})",
             run.timed_out,
             run.serial
         );
     }
-    println!("tampered handoff fail-before-entry: PASS");
+    println!("tampered ASTRIDSG fail-before-entry: PASS");
     Ok(())
 }
 

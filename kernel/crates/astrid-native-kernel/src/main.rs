@@ -28,6 +28,7 @@ mod serial;
 mod tests;
 mod trap;
 
+use astrid_system_generation::{MANIFEST_LEN, verify_manifest};
 use bootloader_api::config::Mapping;
 use bootloader_api::{BootInfo, BootloaderConfig, entry_point};
 
@@ -59,7 +60,37 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial::ev_idt_ready(interrupts::EXCEPTION_VECTORS);
 
     match closure::accept(boot_info) {
-        Ok(accepted) => emit_bound(accepted),
+        Ok(accepted) => {
+            // The handoff/table are independently bound before this event;
+            // manifest admission below remains a separate fail-closed gate.
+            emit_bound(&accepted);
+            // Keep descriptor bytes independent of the loader-owned mapping;
+            // only this kernel-owned copy may enter manifest verification.
+            let mut descriptor = [0u8; MANIFEST_LEN];
+            closure::copy_system_generation(&accepted, &mut descriptor);
+            if accepted.bound.sysgen_identity()
+                != astrid_native_closure::MeasuredIdentity::from_payload(&descriptor)
+            {
+                serial::ev_closure_reject(
+                    astrid_native_closure::ClosureError::BindingMismatch.as_reason(),
+                );
+                serial::ev_halt(false);
+                serial::exit_qemu(false);
+            }
+            let trusted = match closure::trusted_system_generation_input(&accepted) {
+                Ok(input) => input,
+                Err(err) => {
+                    serial::ev_closure_reject(err.as_reason());
+                    serial::ev_halt(false);
+                    serial::exit_qemu(false);
+                },
+            };
+            if let Err(err) = verify_manifest(&descriptor, &trusted) {
+                serial::ev_closure_reject(err.as_reason());
+                serial::ev_halt(false);
+                serial::exit_qemu(false);
+            }
+        },
         Err(err) => {
             serial::ev_closure_reject(err.as_reason());
             serial::ev_halt(false);
@@ -95,7 +126,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial::exit_qemu(wx_ok && tests_ok);
 }
 
-fn emit_bound(accepted: closure::AcceptedClosure) {
+fn emit_bound(accepted: &closure::AcceptedClosure) {
     let bound = accepted.bound;
     let mut kernel_hex = [0u8; 64];
     let mut sysgen_hex = [0u8; 64];
@@ -115,7 +146,7 @@ fn emit_bound(accepted: closure::AcceptedClosure) {
         closure_table_hex,
     );
     serial::ev_closure_kernel(bound.kernel_floor().get(), kernel_hex);
-    serial::ev_closure_sysgen(bound.sysgen_floor().get(), sysgen_hex);
+    serial::ev_closure_sysgen(bound.sysgen_floor().get(), sysgen_hex, false);
     serial::ev_closure_bound(
         bound.kernel_floor().get(),
         bound.sysgen_floor().get(),

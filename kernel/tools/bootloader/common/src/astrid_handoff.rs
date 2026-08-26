@@ -11,6 +11,12 @@ use astrid_native_closure::{
     LoaderMeasurement, MeasuredIdentity, PolicyGeneration, RootVerifier, TABLE_LEN, TrustedPolicy,
     verify_policy_handoff, verify_table,
 };
+
+// Keep this loader-local framing constant in sync with the canonical
+// astrid-system-generation manifest length. The bootloader vendor intentionally
+// depends only on the closure crate, so changing the descriptor wire layout is
+// a deliberate review point rather than an accidental transitive update.
+const MANIFEST_LEN: usize = 548;
 use bootloader_api::info::LoaderHandoffVerification;
 
 // Keep the bootloader's receipt layout pinned to the ring-0 consumer. These
@@ -47,14 +53,15 @@ const BOOT_CONTEXT_DOMAIN: &[u8] = b"astrid.boot.q35.uefi.tcg.v1";
 /// Verify the exact handoff while the loader still owns the original files.
 ///
 /// `kernel_elf` is the original `Kernel.elf.input` byte slice, not a
-/// relocated image. `bundle` must be exactly `[ASTRIDPH][ASTRIDDC]`. The
-/// resulting receipt contains evidence only; it is not sufficient authority
-/// for ring 0 without the second verification there.
+/// relocated image. `bundle` must be exactly
+/// `[ASTRIDPH][ASTRIDDC][ASTRIDSG]`. The resulting receipt contains evidence
+/// only; it is not sufficient authority for ring 0 without the second
+/// verification there.
 pub fn verify_before_mapping(
     kernel_elf: &[u8],
     bundle: &[u8],
 ) -> Result<LoaderHandoffVerification, &'static str> {
-    if bundle.len() != HANDOFF_LEN + TABLE_LEN {
+    if bundle.len() != HANDOFF_LEN + TABLE_LEN + MANIFEST_LEN {
         return Err("handoff_length");
     }
     if kernel_elf.is_empty() {
@@ -62,7 +69,9 @@ pub fn verify_before_mapping(
     }
 
     let kernel_image = MeasuredIdentity::from_payload(kernel_elf);
-    let closure_table = MeasuredIdentity::from_payload(&bundle[HANDOFF_LEN..]);
+    let table_end = HANDOFF_LEN + TABLE_LEN;
+    let closure_table = MeasuredIdentity::from_payload(&bundle[HANDOFF_LEN..table_end]);
+    let sysgen_payload = &bundle[table_end..];
     let expected = expected_context(kernel_image, closure_table);
     let root = RootVerifier::try_new(
         EMULATOR_ROOT_VERIFY_KEY,
@@ -80,7 +89,11 @@ pub fn verify_before_mapping(
         handoff.policy().sysgen_floor(),
     )
     .map_err(|err| err.as_reason())?;
-    verify_table(&bundle[HANDOFF_LEN..], &policy).map_err(|err| err.as_reason())?;
+    let bound =
+        verify_table(&bundle[HANDOFF_LEN..table_end], &policy).map_err(|err| err.as_reason())?;
+    if bound.sysgen_identity() != MeasuredIdentity::from_payload(sysgen_payload) {
+        return Err("binding");
+    }
 
     Ok(LoaderHandoffVerification {
         magic: RECEIPT_MAGIC,
@@ -119,4 +132,41 @@ pub fn expected_context(
             MeasuredIdentity::from_payload(BOOT_CONTEXT_DOMAIN).as_bytes(),
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verify_before_mapping;
+    use astrid_native_closure::{HANDOFF_LEN, TABLE_LEN};
+
+    #[test]
+    fn legacy_and_noncanonical_ramdisk_lengths_fail_closed() {
+        let legacy = vec![0u8; HANDOFF_LEN + TABLE_LEN];
+        assert_eq!(
+            verify_before_mapping(b"kernel", &legacy),
+            Err("handoff_length")
+        );
+
+        let truncated = vec![0u8; HANDOFF_LEN + TABLE_LEN + super::MANIFEST_LEN - 1];
+        assert_eq!(
+            verify_before_mapping(b"kernel", &truncated),
+            Err("handoff_length")
+        );
+
+        let extended = vec![0u8; HANDOFF_LEN + TABLE_LEN + super::MANIFEST_LEN + 1];
+        assert_eq!(
+            verify_before_mapping(b"kernel", &extended),
+            Err("handoff_length")
+        );
+    }
+
+    #[test]
+    fn exact_length_reaches_content_validation() {
+        let exact = vec![0u8; HANDOFF_LEN + TABLE_LEN + super::MANIFEST_LEN];
+        assert_eq!(
+            verify_before_mapping(&[], &exact),
+            Err("kernel_empty"),
+            "the canonical length must not be rejected as a legacy bundle"
+        );
+    }
 }

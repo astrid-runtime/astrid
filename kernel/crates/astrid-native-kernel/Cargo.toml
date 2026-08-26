@@ -24,3 +24,4 @@ spin = "=0.9.9"
 raw-cpuid = "=11.6.0"
 
 astrid-native-closure = { path = "../astrid-native-closure" }
+astrid-system-generation = { path = "../astrid-system-generation", default-features = false }

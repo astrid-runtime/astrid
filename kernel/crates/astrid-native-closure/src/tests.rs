@@ -4,7 +4,7 @@ use crate::codec::{decode_table, encode_table};
 use crate::error::ClosureError;
 use crate::fixture::{FixtureRole, fixture_signing_key};
 use crate::policy::{EMULATOR_KERNEL_VERIFY_KEY, EMULATOR_SYSGEN_VERIFY_KEY, TrustedPolicy};
-use crate::sign::{sign_artifact, signed_table};
+use crate::sign::{sign_artifact, sign_empty_sysgen, signed_table};
 use crate::types::{
     CURRENT_FLOOR, ClosureKind, DualClosureKeys, DualClosureTable, GenerationFloor,
     MeasuredIdentity, TABLE_LEN,
@@ -17,6 +17,10 @@ fn key(byte: u8) -> SigningKey {
 
 fn elf() -> &'static [u8] {
     b"fake-kernel-elf-bytes"
+}
+
+fn sysgen() -> &'static [u8] {
+    b"signed-system-generation-payload"
 }
 
 fn policy_for(
@@ -45,7 +49,7 @@ fn good_policy() -> TrustedPolicy {
 
 fn good_table() -> DualClosureTable {
     let (k, s) = good_keys();
-    signed_table(&k, &s, CURRENT_FLOOR, CURRENT_FLOOR, elf())
+    signed_table(&k, &s, CURRENT_FLOOR, CURRENT_FLOOR, elf(), sysgen())
 }
 
 fn verify(bytes: &[u8]) -> Result<crate::BoundIdentities, ClosureError> {
@@ -53,13 +57,16 @@ fn verify(bytes: &[u8]) -> Result<crate::BoundIdentities, ClosureError> {
 }
 
 #[test]
-fn valid_distinct_empty_sysgen_binds() {
+fn valid_distinct_sysgen_binds() {
     let bound = verify(&encode_table(&good_table())).expect("valid table");
     assert_eq!(
         bound.kernel_identity(),
         MeasuredIdentity::from_payload(elf())
     );
-    assert_eq!(bound.sysgen_identity(), MeasuredIdentity::empty_sysgen());
+    assert_eq!(
+        bound.sysgen_identity(),
+        MeasuredIdentity::from_payload(sysgen())
+    );
     assert_eq!(bound.kernel_floor(), CURRENT_FLOOR);
     assert_eq!(bound.sysgen_floor(), CURRENT_FLOOR);
     assert!(bound.distinct());
@@ -69,7 +76,7 @@ fn valid_distinct_empty_sysgen_binds() {
 fn mixed_valid_floors_bind() {
     let (k, s) = good_keys();
     let sysgen_floor = GenerationFloor::new(2);
-    let table = signed_table(&k, &s, CURRENT_FLOOR, sysgen_floor, elf());
+    let table = signed_table(&k, &s, CURRENT_FLOOR, sysgen_floor, elf(), sysgen());
     let bound = verify(&encode_table(&table)).expect("mixed floors");
     assert_eq!(bound.kernel_floor(), CURRENT_FLOOR);
     assert_eq!(bound.sysgen_floor(), sysgen_floor);
@@ -81,7 +88,7 @@ fn exact_floor_equals_policy_min_binds() {
     let kernel_min = GenerationFloor::new(4);
     let sysgen_min = GenerationFloor::new(7);
     let policy = policy_for(&k, &s, kernel_min, sysgen_min);
-    let table = signed_table(&k, &s, kernel_min, sysgen_min, elf());
+    let table = signed_table(&k, &s, kernel_min, sysgen_min, elf(), sysgen());
     let bound = verify_table(&encode_table(&table), &policy).expect("exact floors");
     assert_eq!(bound.kernel_floor(), kernel_min);
     assert_eq!(bound.sysgen_floor(), sysgen_min);
@@ -110,14 +117,28 @@ fn swapped_kinds_fail() {
 #[test]
 fn independently_stale_sysgen_fails() {
     let (k, s) = good_keys();
-    let table = signed_table(&k, &s, CURRENT_FLOOR, GenerationFloor::new(0), elf());
+    let table = signed_table(
+        &k,
+        &s,
+        CURRENT_FLOOR,
+        GenerationFloor::new(0),
+        elf(),
+        sysgen(),
+    );
     assert_eq!(verify(&encode_table(&table)), Err(ClosureError::Stale));
 }
 
 #[test]
 fn independently_stale_kernel_fails() {
     let (k, s) = good_keys();
-    let table = signed_table(&k, &s, GenerationFloor::new(0), CURRENT_FLOOR, elf());
+    let table = signed_table(
+        &k,
+        &s,
+        GenerationFloor::new(0),
+        CURRENT_FLOOR,
+        elf(),
+        sysgen(),
+    );
     assert_eq!(verify(&encode_table(&table)), Err(ClosureError::Stale));
 }
 
@@ -130,6 +151,7 @@ fn lowered_header_min_floor_does_not_admit_stale() {
         GenerationFloor::new(0),
         GenerationFloor::new(0),
         elf(),
+        sysgen(),
     );
     table.min_floor = GenerationFloor::new(0);
     assert_eq!(verify(&encode_table(&table)), Err(ClosureError::Stale));
@@ -154,7 +176,14 @@ fn advertised_attacker_keys_ignored_when_signatures_match_policy() {
 
 #[test]
 fn arbitrary_self_signed_keys_fail_against_policy() {
-    let table = signed_table(&key(9), &key(10), CURRENT_FLOOR, CURRENT_FLOOR, elf());
+    let table = signed_table(
+        &key(9),
+        &key(10),
+        CURRENT_FLOOR,
+        CURRENT_FLOOR,
+        elf(),
+        sysgen(),
+    );
     assert_eq!(verify(&encode_table(&table)), Err(ClosureError::CrossBound));
 }
 
@@ -167,6 +196,7 @@ fn cross_bound_kernel_signed_by_sysgen_fails() {
         CURRENT_FLOOR,
         CURRENT_FLOOR,
         elf(),
+        sysgen(),
     );
     table.kernel = sign_artifact(
         &sysgen_key,
@@ -186,6 +216,7 @@ fn swapped_artifact_keys_fail() {
         CURRENT_FLOOR,
         CURRENT_FLOOR,
         elf(),
+        sysgen(),
     );
     table.kernel = sign_artifact(
         &sysgen_key,
@@ -197,7 +228,7 @@ fn swapped_artifact_keys_fail() {
         &kernel_key,
         ClosureKind::SystemGeneration,
         CURRENT_FLOOR,
-        MeasuredIdentity::empty_sysgen(),
+        MeasuredIdentity::from_payload(sysgen()),
     );
     assert_eq!(verify(&encode_table(&table)), Err(ClosureError::CrossBound));
 }
@@ -220,10 +251,38 @@ fn identity_collision_fails() {
 }
 
 #[test]
-fn non_empty_sysgen_fails() {
-    let mut table = good_table();
-    table.sysgen.identity = MeasuredIdentity::from_payload(b"not-empty");
-    assert_eq!(verify(&encode_table(&table)), Err(ClosureError::NotEmpty));
+fn empty_sysgen_with_descriptor_present_fails() {
+    let (kernel_key, sysgen_key) = good_keys();
+    let mut table = signed_table(
+        &kernel_key,
+        &sysgen_key,
+        CURRENT_FLOOR,
+        CURRENT_FLOOR,
+        elf(),
+        sysgen(),
+    );
+    // `sign_empty_sysgen` exists only as a falsifier: even a valid signature
+    // over the empty sentinel cannot authorize a descriptor in the bundle.
+    table.sysgen = sign_empty_sysgen(&sysgen_key, CURRENT_FLOOR);
+    assert_ne!(
+        table.sysgen.identity,
+        MeasuredIdentity::from_payload(b"descriptor-present")
+    );
+    assert_eq!(
+        verify(&encode_table(&table)),
+        Err(ClosureError::EmptySysgen)
+    );
+}
+
+#[test]
+fn sysgen_identity_mismatch_against_copied_descriptor_is_detectable() {
+    let bound = verify(&encode_table(&good_table())).expect("valid table");
+    let mut copied = sysgen().to_vec();
+    copied[0] ^= 1;
+    assert_ne!(
+        bound.sysgen_identity(),
+        MeasuredIdentity::from_payload(&copied)
+    );
 }
 
 #[test]
@@ -268,6 +327,7 @@ fn emulator_fixture_uses_current_floor_and_fixture_public_keys() {
         CURRENT_FLOOR,
         CURRENT_FLOOR,
         elf(),
+        sysgen(),
     );
     let bound = verify_table(&encode_table(&table), &policy).expect("fixture table");
     assert_eq!(bound.kernel_floor(), CURRENT_FLOOR);
@@ -284,6 +344,7 @@ fn independently_stale_against_split_policy_mins() {
         GenerationFloor::new(1),
         GenerationFloor::new(1),
         elf(),
+        sysgen(),
     );
     assert_eq!(
         verify_table(&encode_table(&stale_sysgen), &policy),
@@ -295,6 +356,7 @@ fn independently_stale_against_split_policy_mins() {
         GenerationFloor::new(0),
         GenerationFloor::new(2),
         elf(),
+        sysgen(),
     );
     assert_eq!(
         verify_table(&encode_table(&stale_kernel), &policy),
@@ -306,6 +368,7 @@ fn independently_stale_against_split_policy_mins() {
         GenerationFloor::new(1),
         GenerationFloor::new(2),
         elf(),
+        sysgen(),
     );
     verify_table(&encode_table(&mixed), &policy).expect("split mins");
 }

@@ -1,16 +1,16 @@
 //! Host tool: wrap a kernel ELF into a bootable UEFI disk image.
 //!
 //! Usage: `kimage <kernel-elf> <output-image> --root-key <file>
-//! --kernel-key <file> --sysgen-key <file> [--tamper-handoff]`. Key files contain exactly 32 raw
+//! --kernel-key <file> --sysgen-key <file> [--tamper-handoff|--tamper-sysgen]`. Key files contain exactly 32 raw
 //! seed bytes encoded as 64 hexadecimal characters. No signing material is
 //! taken from the environment or selected by a silent default. The explicit
 //! fixture files under `tools/kimage/fixtures/` are development-only inputs.
 //!
-//! The ramdisk is exactly `[379-byte ASTRIDPH][355-byte ASTRIDDC]`; the latter
-//! is also written as `<output>.closures` for inspection. The root-signed
-//! handoff binds the raw ELF measurement, table digest, and fixture loader/
-//! boot-context identities. It is not firmware authentication or a production
-//! root of trust.
+//! The ramdisk is exactly `[379-byte ASTRIDPH][355-byte ASTRIDDC][548-byte
+//! ASTRIDSG]`; the latter two are also written as `<output>.closures` and
+//! `<output>.sysgen` for inspection. The root-signed handoff binds the raw ELF
+//! measurement, table digest, and fixture loader/boot-context identities. It
+//! is not firmware authentication or a production root of trust.
 
 use std::path::{Path, PathBuf};
 
@@ -19,6 +19,11 @@ use astrid_native_closure::{
     BootContextBinding, CURRENT_FLOOR, HANDOFF_LEN, HandoffContext, LoaderIdentity,
     LoaderMeasurement, MeasuredIdentity, PolicyGeneration, PolicyHandoff, TABLE_LEN, encode_table,
     sign_policy_handoff, signed_table,
+};
+use astrid_system_generation::{
+    ContentId, EMULATOR_CLOSURE_ROOT, EMULATOR_COMPONENTS, EMULATOR_GENERATION_FLOOR,
+    EMULATOR_MANIFEST_SIZES, EMULATOR_OBJECT_ROOT, EMULATOR_PLAN_DIGEST, Expiration, Generation,
+    MANIFEST_LEN, ManifestInput, Revocation, RollbackFloor, SystemGenerationManifest, signed_bytes,
 };
 use ed25519_dalek::SigningKey;
 
@@ -43,11 +48,14 @@ fn main() -> Result<()> {
     let root_key = required_key(&mut args, "--root-key")?;
     let kernel_key = required_key(&mut args, "--kernel-key")?;
     let sysgen_key = required_key(&mut args, "--sysgen-key")?;
-    let tamper_handoff = match args.next().as_deref() {
+    let tamper_arg = args.next();
+    let tamper_handoff = match tamper_arg.as_deref() {
         None => false,
         Some("--tamper-handoff") => true,
+        Some("--tamper-sysgen") => false,
         Some(_) => bail!("unexpected argument; {}", usage()),
     };
+    let tamper_sysgen = tamper_arg.as_deref() == Some("--tamper-sysgen");
     if args.next().is_some() {
         bail!("unexpected argument; {}", usage());
     }
@@ -66,9 +74,36 @@ fn main() -> Result<()> {
         bail!("explicit root key is not the emulator fixture root key");
     }
 
-    let table = signed_table(&kernel_key, &sysgen_key, CURRENT_FLOOR, CURRENT_FLOOR, &elf);
-    let closures = encode_table(&table);
     let kernel_image = MeasuredIdentity::from_payload(&elf);
+    let kernel_identity = ContentId::try_from_bytes(kernel_image.as_bytes()).map_err(|err| {
+        anyhow::anyhow!("kernel identity fixture is invalid: {}", err.as_reason())
+    })?;
+    let manifest = SystemGenerationManifest::try_new(ManifestInput {
+        kernel_identity,
+        plan_digest: ContentId::try_from_bytes(EMULATOR_PLAN_DIGEST)
+            .map_err(|err| anyhow::anyhow!("plan fixture is invalid: {}", err.as_reason()))?,
+        components: EMULATOR_COMPONENTS,
+        object_root: ContentId::try_from_bytes(EMULATOR_OBJECT_ROOT)
+            .map_err(|err| anyhow::anyhow!("object fixture is invalid: {}", err.as_reason()))?,
+        closure_root: ContentId::try_from_bytes(EMULATOR_CLOSURE_ROOT)
+            .map_err(|err| anyhow::anyhow!("closure fixture is invalid: {}", err.as_reason()))?,
+        generation: Generation::new(EMULATOR_GENERATION_FLOOR),
+        rollback_floor: RollbackFloor::new(EMULATOR_GENERATION_FLOOR),
+        expires_at: Expiration::never(),
+        revocation: Revocation::Active,
+        sizes: EMULATOR_MANIFEST_SIZES,
+    })
+    .map_err(|err| anyhow::anyhow!("system-generation fixture is invalid: {}", err.as_reason()))?;
+    let descriptor = signed_bytes(&sysgen_key, manifest);
+    let table = signed_table(
+        &kernel_key,
+        &sysgen_key,
+        CURRENT_FLOOR,
+        CURRENT_FLOOR,
+        &elf,
+        &descriptor,
+    );
+    let closures = encode_table(&table);
     let closure_table = MeasuredIdentity::from_payload(&closures);
     let policy = PolicyHandoff::for_signing(
         kernel_key.verifying_key().to_bytes(),
@@ -79,10 +114,15 @@ fn main() -> Result<()> {
         expected_context(kernel_image, closure_table),
     );
     let handoff = sign_policy_handoff(&root_key, &policy);
-    let mut ramdisk = [0u8; HANDOFF_LEN + TABLE_LEN];
+    let mut ramdisk = [0u8; HANDOFF_LEN + TABLE_LEN + MANIFEST_LEN];
     ramdisk[..HANDOFF_LEN].copy_from_slice(&handoff);
-    ramdisk[HANDOFF_LEN..].copy_from_slice(&closures);
-    if tamper_handoff {
+    ramdisk[HANDOFF_LEN..HANDOFF_LEN + TABLE_LEN].copy_from_slice(&closures);
+    ramdisk[HANDOFF_LEN + TABLE_LEN..].copy_from_slice(&descriptor);
+    if tamper_sysgen {
+        // Test-only image mode: corrupt the signed descriptor after packing so
+        // the loader must reject the table/descriptor identity binding.
+        ramdisk[HANDOFF_LEN + TABLE_LEN] ^= 1;
+    } else if tamper_handoff {
         // Test-only image mode: corrupt the signed envelope after signing so
         // the loader must reject it before any PT_LOAD mapping or kernel entry.
         ramdisk[0] ^= 1;
@@ -91,6 +131,13 @@ fn main() -> Result<()> {
     let closures_path = output.with_extension("closures");
     std::fs::write(&closures_path, closures)
         .with_context(|| format!("writing dual-closure table {}", closures_path.display()))?;
+    let descriptor_path = output.with_extension("sysgen");
+    std::fs::write(&descriptor_path, descriptor).with_context(|| {
+        format!(
+            "writing system-generation descriptor {}",
+            descriptor_path.display()
+        )
+    })?;
     let ramdisk_path = output.with_extension("ramdisk");
     std::fs::write(&ramdisk_path, ramdisk)
         .with_context(|| format!("writing policy handoff ramdisk {}", ramdisk_path.display()))?;
@@ -109,7 +156,7 @@ fn main() -> Result<()> {
 }
 
 fn usage() -> &'static str {
-    "usage: kimage <kernel-elf> <output-image> --root-key <file> --kernel-key <file> --sysgen-key <file> [--tamper-handoff]"
+    "usage: kimage <kernel-elf> <output-image> --root-key <file> --kernel-key <file> --sysgen-key <file> [--tamper-handoff|--tamper-sysgen]"
 }
 
 fn required_key(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<PathBuf> {

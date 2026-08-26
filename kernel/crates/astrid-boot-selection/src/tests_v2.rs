@@ -2,7 +2,7 @@ use astrid_native_closure::{
     AuthenticatedPolicyHandoff, BootContextBinding, ClosureKind, DualClosureKeys, GenerationFloor,
     HandoffContext, LoaderIdentity, LoaderMeasurement, MeasuredIdentity, PolicyGeneration,
     PolicyHandoff, RootVerifier, TrustedPolicy, encode_table, fixture_signing_key as closure_key,
-    sign_artifact, sign_empty_sysgen, sign_policy_handoff, verify_policy_handoff, verify_table,
+    sign_artifact, sign_policy_handoff, verify_policy_handoff, verify_table,
 };
 use astrid_system_generation::{
     ComponentSet, ContentId, Expiration, Generation, ManifestSizes, Revocation, RollbackFloor,
@@ -23,6 +23,10 @@ use crate::verified_adapter::{AdapterError, authenticated_policy, bind_verified_
 
 fn digest(byte: u8) -> [u8; 32] {
     [byte; 32]
+}
+
+fn sysgen_payload() -> &'static [u8] {
+    b"adapter-system-generation-descriptor"
 }
 
 fn facts(byte: u8, policy_generation: u64) -> CandidateFacts {
@@ -288,7 +292,12 @@ fn verified_bound_with_keys(
             system_generation: sysgen.verifying_key().to_bytes(),
         },
         kernel: kernel_artifact,
-        sysgen: sign_empty_sysgen(sysgen, GenerationFloor::new(sysgen_floor)),
+        sysgen: sign_artifact(
+            sysgen,
+            ClosureKind::SystemGeneration,
+            GenerationFloor::new(sysgen_floor),
+            MeasuredIdentity::from_payload(sysgen_payload()),
+        ),
     };
     let policy = TrustedPolicy::try_new(
         kernel.verifying_key().to_bytes(),

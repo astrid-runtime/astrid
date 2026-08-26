@@ -201,10 +201,10 @@ fn closure_holds(events: &[Value], closures: &ExpectedClosures<'_>) -> bool {
         }),
     );
     ok &= check(
-        "closure.sysgen empty, floor, and id match empty sysgen",
+        "closure.sysgen non-empty descriptor, floor, and id match loader",
         sysgen_ev.is_some_and(|e| {
             e.get("kind").and_then(Value::as_str) == Some("system-generation")
-                && e.get("empty") == Some(&Value::Bool(true))
+                && e.get("empty") == Some(&Value::Bool(false))
                 && e.get("floor").and_then(Value::as_u64) == Some(closures.sysgen_floor)
                 && e.get("id").and_then(Value::as_str) == Some(closures.sysgen_id_hex)
         }),
@@ -309,7 +309,7 @@ mod tests {
             "\"ev\":\"closure.kernel\",\"kind\":\"kernel-bootstrap\",\"floor\":{kfloor},\"id\":\"{kernel}\""
         ));
         ev(format!(
-            "\"ev\":\"closure.sysgen\",\"kind\":\"system-generation\",\"floor\":{sfloor},\"id\":\"{sysgen}\",\"empty\":true"
+            "\"ev\":\"closure.sysgen\",\"kind\":\"system-generation\",\"floor\":{sfloor},\"id\":\"{sysgen}\",\"empty\":false"
         ));
         ev(format!(
             "\"ev\":\"closure.bound\",\"kernel_floor\":{kfloor},\"sysgen_floor\":{sfloor},\"kernel_id\":\"{kernel}\",\"sysgen_id\":\"{sysgen}\""

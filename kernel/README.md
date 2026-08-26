@@ -3,14 +3,15 @@
 Recovered isolated `kernel/` workspace. M1 boots to Rust ring 0 on the
 experimental emulator machine, emits structured serial evidence, runs
 negative-first self-tests, and halts with a machine-checkable outcome.
-This child adds a fixed 734-byte loader bundle: a 379-byte `ASTRIDPH`
-root-signed policy handoff followed by a 355-byte `ASTRIDDC` dual-closure
-table. Ring 0 validates the mapped ramdisk, copies it into kernel-owned
-memory, checks a bounded receipt produced by the pre-relocation UEFI loader,
-re-verifies the signed handoff/table bindings, constructs the authorized
-subordinate policy, and then binds both closure identities. The loader
-measures the original `Kernel.elf.input` before writable PT_LOAD mappings;
-ring 0 never hashes the mutable `BootInfo::kernel_addr` backing span.
+This child adds a fixed 1282-byte loader bundle: a 379-byte `ASTRIDPH`
+root-signed policy handoff, a 355-byte `ASTRIDDC` dual-closure table, and a
+548-byte canonical signed `ASTRIDSG` descriptor. Ring 0 validates the mapped
+ramdisk, copies the descriptor into kernel-owned memory, checks a bounded
+receipt produced by the pre-relocation UEFI loader, re-verifies the signed
+handoff/table bindings, binds the descriptor identity to those exact copied
+bytes, and verifies the manifest against compiled fixture policy inputs. The
+loader measures the original `Kernel.elf.input` before writable PT_LOAD
+mappings; ring 0 never hashes the mutable `BootInfo::kernel_addr` backing span.
 
 The root verifier is an emulator fixture key with independent minimum
 generation/floors; the signed handoff authorizes subordinate keys and keeps
@@ -51,7 +52,8 @@ KVM, virtio, or IOMMU, and therefore does not prove that topology.
 - `crates/astrid-native-kernel/` — `#![no_std] #![no_main]` ring-0 binary.
 - `tools/kimage/` — wraps a kernel ELF into a bootable UEFI disk image,
   requires explicit root/kernel/sysgen key files, and embeds the exact
-  handoff+table bundle as a bootloader ramdisk (not a guest filesystem).
+  handoff+table+descriptor bundle as a bootloader ramdisk (not a guest
+  filesystem).
 - `tools/ktest/` — QEMU serial-assertion harness and host unit tests.
 - `tools/bootloader/` — minimal vendored bootloader 0.11.16 UEFI/API/common
   sources with the pre-relocation verification hook and bounded `BootInfo`
@@ -128,8 +130,7 @@ the parent target lock.
   root-authorized subordinate policy. Serial `handoff.bound` carries the
   pre-relocation raw ELF and closure-table measurements. Serial `closure.kernel` /
   `closure.sysgen` / `closure.bound` carry independent `kernel_floor` and `sysgen_floor`
-  and match the measured ELF identity and the empty System Generation
-  identity.
+  and match the measured ELF identity and the signed descriptor identity.
 - `verify_table` rejects arbitrary self-signed keys, a lowered mutable
   header floor used to admit stale artifacts, independently stale kernel
   or sysgen, swapped keys/artifacts, and missing/truncated/unmapped

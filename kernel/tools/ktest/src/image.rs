@@ -85,6 +85,17 @@ impl KimageInvocation {
         cmd.arg("--tamper-handoff");
         cmd
     }
+
+    pub fn command_with_tampered_sysgen(
+        &self,
+        root: &Path,
+        kernel: &Path,
+        output: &Path,
+    ) -> Command {
+        let mut cmd = self.command(root, kernel, output);
+        cmd.arg("--tamper-sysgen");
+        cmd
+    }
 }
 
 #[cfg(test)]
@@ -162,5 +173,16 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
         assert!(tampered_args.ends_with(&["--tamper-handoff".to_string()]));
+
+        let tampered = inv.command_with_tampered_sysgen(
+            Path::new("/ws"),
+            Path::new("/k.elf"),
+            Path::new("/o.img"),
+        );
+        let tampered_args: Vec<String> = tampered
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(tampered_args.ends_with(&["--tamper-sysgen".to_string()]));
     }
 }

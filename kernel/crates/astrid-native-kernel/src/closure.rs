@@ -8,6 +8,11 @@ use astrid_native_closure::{
     HANDOFF_LEN, HandoffContext, LoaderIdentity, LoaderMeasurement, MeasuredIdentity,
     PolicyGeneration, RootVerifier, TABLE_LEN, TrustedPolicy, verify_policy_handoff, verify_table,
 };
+use astrid_system_generation::{
+    ContentId, EMULATOR_CLOSURE_ROOT, EMULATOR_COMPONENTS, EMULATOR_GENERATION_FLOOR,
+    EMULATOR_MANIFEST_SIZES, EMULATOR_NOW_UNIX_SECONDS, EMULATOR_OBJECT_ROOT, EMULATOR_PLAN_DIGEST,
+    Generation, GenerationError, MANIFEST_LEN, TrustedInput, TrustedInputData,
+};
 use bootloader_api::BootInfo;
 use bootloader_api::info::LoaderHandoffVerification;
 
@@ -29,8 +34,8 @@ const _: () = {
     assert!(offset_of!(LoaderHandoffVerification, sysgen_floor) == 320);
 };
 
-/// The exact ramdisk contract is `[ASTRIDPH; 379][ASTRIDDC; 355]`.
-pub const RAMDISK_BUNDLE_LEN: usize = HANDOFF_LEN + TABLE_LEN;
+/// The exact ramdisk contract is `[ASTRIDPH; 379][ASTRIDDC; 355][ASTRIDSG; 548]`.
+pub const RAMDISK_BUNDLE_LEN: usize = HANDOFF_LEN + TABLE_LEN + MANIFEST_LEN;
 
 /// Emulator fixture root public key corresponding to the explicit root seed
 /// in `tools/kimage/fixtures/root.key.hex`. The envelope's root-key field is
@@ -51,6 +56,9 @@ pub struct AcceptedClosure {
     pub bound: BoundIdentities,
     pub kernel_image: MeasuredIdentity,
     pub closure_table: MeasuredIdentity,
+    /// Exact descriptor bytes copied from the loader-owned ramdisk. This is
+    /// still untrusted until the caller binds its identity and verifies it.
+    pub sysgen_payload: [u8; MANIFEST_LEN],
 }
 
 pub fn accept(boot_info: &BootInfo) -> Result<AcceptedClosure, ClosureError> {
@@ -73,7 +81,9 @@ pub fn accept(boot_info: &BootInfo) -> Result<AcceptedClosure, ClosureError> {
     // PT_LOAD mappings existed. Ring 0 never hashes BootInfo::kernel_addr:
     // those pages may alias the relocated image and can change after entry.
     let kernel_image = MeasuredIdentity::from_bytes(receipt.kernel_image);
-    let table_bytes = &bundle[HANDOFF_LEN..];
+    let table_end = HANDOFF_LEN + TABLE_LEN;
+    let table_bytes = &bundle[HANDOFF_LEN..table_end];
+    let sysgen_payload = &bundle[table_end..];
     let closure_table = MeasuredIdentity::from_bytes(receipt.closure_table);
     if MeasuredIdentity::from_payload(&bundle[..HANDOFF_LEN]).as_bytes() != receipt.envelope_digest
         || MeasuredIdentity::from_payload(table_bytes).as_bytes() != receipt.closure_table
@@ -111,11 +121,44 @@ pub fn accept(boot_info: &BootInfo) -> Result<AcceptedClosure, ClosureError> {
         policy_handoff.sysgen_floor(),
     )?;
     let bound = verify_table(table_bytes, &policy)?;
+    let mut descriptor = [0u8; MANIFEST_LEN];
+    descriptor.copy_from_slice(sysgen_payload);
     Ok(AcceptedClosure {
         handoff,
         bound,
         kernel_image,
         closure_table,
+        sysgen_payload: descriptor,
+    })
+}
+
+/// Copy the accepted descriptor into a caller-owned kernel buffer before any
+/// manifest parsing. The source was already copied out of loader memory by
+/// [`accept`], and the destination remains independent of the ramdisk alias.
+pub fn copy_system_generation(accepted: &AcceptedClosure, destination: &mut [u8; MANIFEST_LEN]) {
+    destination.copy_from_slice(&accepted.sysgen_payload);
+}
+
+/// Build the ring-0 trusted input exclusively from authenticated handoff data
+/// and compiled emulator fixture values. Manifest fields never populate this
+/// policy boundary.
+pub fn trusted_system_generation_input(
+    accepted: &AcceptedClosure,
+) -> Result<TrustedInput, GenerationError> {
+    let kernel_identity = ContentId::try_from_bytes(accepted.kernel_image.as_bytes())?;
+    let plan_digest = ContentId::try_from_bytes(EMULATOR_PLAN_DIGEST)?;
+    let object_root = ContentId::try_from_bytes(EMULATOR_OBJECT_ROOT)?;
+    let closure_root = ContentId::try_from_bytes(EMULATOR_CLOSURE_ROOT)?;
+    TrustedInput::try_new(TrustedInputData {
+        signer: accepted.handoff.policy().sysgen_verify(),
+        kernel_identity,
+        plan_digest,
+        components: EMULATOR_COMPONENTS,
+        object_root,
+        closure_root,
+        generation_floor: Generation::new(EMULATOR_GENERATION_FLOOR),
+        now_unix_seconds: EMULATOR_NOW_UNIX_SECONDS,
+        sizes: EMULATOR_MANIFEST_SIZES,
     })
 }
 

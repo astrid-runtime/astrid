@@ -51,6 +51,7 @@ name = "astrid-native-kernel"
 version = "0.0.0"
 dependencies = [
  "astrid-native-closure",
+ "astrid-system-generation",
  "bootloader_api",
  "linked_list_allocator",
  "raw-cpuid",
@@ -392,6 +393,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "astrid-native-closure",
+ "astrid-system-generation",
  "bootloader",
  "ed25519-dalek",
 ]

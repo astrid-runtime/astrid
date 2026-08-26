@@ -52,6 +52,7 @@ pub fn signed_table(
     kernel_floor: GenerationFloor,
     sysgen_floor: GenerationFloor,
     kernel_elf: &[u8],
+    sysgen_payload: &[u8],
 ) -> DualClosureTable {
     DualClosureTable {
         min_floor: core::cmp::min(kernel_floor, sysgen_floor),
@@ -60,6 +61,11 @@ pub fn signed_table(
             system_generation: sysgen_key.verifying_key().to_bytes(),
         },
         kernel: sign_kernel_bootstrap(kernel_key, kernel_floor, kernel_elf),
-        sysgen: sign_empty_sysgen(sysgen_key, sysgen_floor),
+        sysgen: sign_artifact(
+            sysgen_key,
+            ClosureKind::SystemGeneration,
+            sysgen_floor,
+            MeasuredIdentity::from_payload(sysgen_payload),
+        ),
     }
 }

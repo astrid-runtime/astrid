@@ -160,9 +160,9 @@ pub fn ev_closure_kernel(floor: u64, id: &str) {
     ));
 }
 
-pub fn ev_closure_sysgen(floor: u64, id: &str) {
+pub fn ev_closure_sysgen(floor: u64, id: &str, empty: bool) {
     emit(format_args!(
-        "\"ev\":\"closure.sysgen\",\"kind\":\"system-generation\",\"floor\":{floor},\"id\":\"{id}\",\"empty\":true"
+        "\"ev\":\"closure.sysgen\",\"kind\":\"system-generation\",\"floor\":{floor},\"id\":\"{id}\",\"empty\":{empty}"
     ));
 }
 

@@ -1,4 +1,4 @@
-//! Dual-closure stub: kernel/bootstrap and empty System Generation artifacts.
+//! Dual-closure handoff: kernel/bootstrap and signed System Generation artifacts.
 //!
 //! The loader (`kimage`) measures and signs two distinct artifacts. Ring 0
 //! verifies the table against a compiled [`TrustedPolicy`] and binds the
