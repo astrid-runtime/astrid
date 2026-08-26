@@ -1,12 +1,16 @@
 FROM rust:1.95.0-bookworm@sha256:4c2fd73ef19c5ef9d54bee03b06b2839a392604fbfcd578ed948b71b37c1d7fb
 
 ARG ASTRID_SOURCE_COMMIT
+ARG ASTRID_VERSION
 
 LABEL org.opencontainers.image.title="Astrid CI toolchain"
 LABEL org.opencontainers.image.description="CI-only Rust toolchain and Astrid binaries for capsule repositories"
 LABEL org.opencontainers.image.source="https://github.com/astrid-runtime/astrid"
 LABEL org.opencontainers.image.revision="${ASTRID_SOURCE_COMMIT}"
+LABEL org.opencontainers.image.version="${ASTRID_VERSION}"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL io.astrid.ci.rust-version="1.95.0"
+LABEL io.astrid.ci.variant="bookworm"
 
 ENV CARGO_TERM_COLOR=always
 ENV RUST_BACKTRACE=1
