@@ -29,6 +29,9 @@ mod bus_monitor;
 mod capsule_adversarial_tests;
 /// `astrid.v1.capsules_loaded` payload assembly (opaque per-capsule metadata).
 mod capsules_loaded;
+#[cfg(all(test, unix))]
+#[path = "capsules_loaded_epoch_tests.rs"]
+mod capsules_loaded_epoch_tests;
 #[cfg(test)]
 mod capsules_loaded_tests;
 /// Internal first-owner enrollment and boot-authority gate.
@@ -56,6 +59,8 @@ pub mod invite;
 pub mod kernel_router;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod legacy_migration_barrier;
+/// Kernel-owned principal-scoped MCP tool snapshots and namespace epochs.
+mod mcp_snapshot;
 /// Persistent pair-device token store (issue #756).
 pub mod pair_token;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -104,6 +109,11 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, RwLock};
+
+use mcp_snapshot::McpSnapshotStore;
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+const MCP_TOOLS_LIST_TOPIC: &str = "astrid.v1.request.mcp.tools.list";
 
 const SCOPED_TOPIC_PROBE_SENTINEL: &str = "\0astrid.scoped-topic\0";
 const SCOPED_SERVICE_PROBE_SENTINEL: &str = "\0astrid.scoped-service\0";
@@ -318,6 +328,10 @@ pub struct Kernel {
     /// identical view cannot resume it mid-drain. Weak values make idle keys
     /// self-evicting without an unbounded fleet-history map.
     capsule_view_locks: Arc<DashMap<CapsuleViewKey, Weak<Mutex<()>>>>,
+    /// Last complete MCP tool surface for each principal.  Replacement is
+    /// guarded by one async mutex so descriptors and their private epoch become
+    /// visible together.
+    mcp_snapshots: Arc<Mutex<McpSnapshotStore>>,
     /// Ephemeral mode: shut down immediately when the last client disconnects.
     pub ephemeral: AtomicBool,
     /// Instant when the kernel was booted (for uptime calculation). Crate-
@@ -1280,6 +1294,7 @@ impl Kernel {
             full_reload_in_flight: AtomicBool::new(false),
             capsule_load_lock: Mutex::new(()),
             capsule_view_locks: Arc::new(DashMap::new()),
+            mcp_snapshots: Arc::new(Mutex::new(McpSnapshotStore::default())),
             ephemeral: AtomicBool::new(false),
             boot_time: astrid_runtime::time::Instant::now(),
             shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -1314,6 +1329,7 @@ impl Kernel {
             drop(spawn_idle_monitor(Arc::clone(&kernel)));
             drop(spawn_react_watchdog(Arc::clone(&kernel)));
             drop(spawn_capsule_health_monitor(Arc::clone(&kernel)));
+            drop(Self::spawn_mcp_tools_list_responder(Arc::clone(&kernel)));
         }
         // Passive storm diagnostics — subscribes synchronously inside the
         // call (before the debug-assert below) so it counts toward
@@ -2685,165 +2701,6 @@ impl Kernel {
         }
     }
 
-    /// Publish `astrid.v1.capsules_loaded` so subscribers re-read the current
-    /// capsule/tool set after the loaded set changes — the registry, and the
-    /// `astrid mcp serve` shim, which turns this into an MCP
-    /// `notifications/tools/list_changed` for connected clients.
-    ///
-    /// The payload carries, per loaded capsule, its installed `meta.json` under
-    /// `capsules[].meta` with the capsule's tool surface injected. The kernel
-    /// probes each loaded capsule once — invoking its `tool_describe`
-    /// interceptor (the same hook the dispatcher already routes) and injecting
-    /// the captured descriptors — so a consumer (e.g. the sage-mcp broker) gets
-    /// a deterministic, complete tool surface from this signal **without the
-    /// capsule having been rebuilt**. The kernel invokes-and-forwards: it never
-    /// interprets the descriptors (the broker owns all policy). A describe
-    /// failure leaves `tools` absent for that capsule this cycle (the consumer
-    /// falls back to its fan-out). The legacy `status: "ready"` field is
-    /// retained so bare-signal subscribers (the shim, the TUI) keep working; the
-    /// `capsules` field is additive. The signal is emitted once per principal
-    /// and bus-stamped with that principal so socket consumers only receive
-    /// their own inventory view.
-    pub(crate) async fn publish_capsules_loaded(&self) {
-        // Clone the loaded-capsule handles under a brief read lock, then release
-        // it before any filesystem I/O or `tool_describe` invocation (which can
-        // `block_in_place` and must never run while holding the registry lock).
-        let capsules = {
-            let reg = self.capsules.read().await;
-            reg.cloned_values_with_principal()
-        };
-
-        self.publish_capsules_loaded_snapshot(capsules, &PrincipalId::default())
-            .await;
-    }
-
-    /// Publish the current capsule inventory for exactly one principal view.
-    ///
-    /// Provisioning and profile mutation already carry the affected principal;
-    /// re-describing every other live view in those paths turns one local
-    /// mutation into fleet-wide work. Snapshot the target view while holding the
-    /// registry lock, then perform all filesystem and guest calls after release.
-    /// An empty view still emits an empty inventory so consumers can discard a
-    /// previously cached tool surface for this principal.
-    pub(crate) async fn publish_capsules_loaded_for(&self, principal: &PrincipalId) {
-        let capsules = {
-            let reg = self.capsules.read().await;
-            reg.cloned_values_for(principal)
-                .into_iter()
-                .map(|capsule| (principal.clone(), capsule))
-                .collect()
-        };
-
-        self.publish_capsules_loaded_snapshot(capsules, principal)
-            .await;
-    }
-
-    async fn publish_capsules_loaded_snapshot(
-        &self,
-        capsules: Vec<(PrincipalId, Arc<dyn astrid_capsule::capsule::Capsule>)>,
-        empty_principal: &PrincipalId,
-    ) {
-        let mut by_principal = std::collections::BTreeMap::<
-            String,
-            Vec<(String, String, Option<serde_json::Value>)>,
-        >::new();
-        for (principal, capsule) in &capsules {
-            let name = capsule.id().to_string();
-            let mut meta = capsule.source_dir().and_then(|source_dir| {
-                self.verify_workspace_capsule_tree(source_dir).ok()?;
-                let meta = capsules_loaded::read_capsule_meta_opaque(source_dir);
-                self.verify_workspace_capsule_tree(source_dir).ok()?;
-                meta
-            });
-            // `tools` is live-owned data. Strip surfaces persisted by older
-            // Astrid releases before probing so an unavailable/failed probe
-            // leaves the field genuinely absent and consumer fan-out can run.
-            meta = capsules_loaded::without_tools(meta);
-
-            // Probe the live instance for its tool surface and inject it. Best-
-            // effort: a describe (or serialize) failure leaves `tools` absent
-            // and the consumer falls back to its fan-out for this cycle.
-            match astrid_capsule::describe_loaded_capsule_status_for(capsule.as_ref(), principal)
-                .await
-            {
-                Ok(Some(tools)) => {
-                    // A tool advertises straight from its `#[astrid::tool]`
-                    // annotation, but only EXECUTES if the manifest `[subscribe]`s
-                    // its `tool.v1.execute.<name>` topic (the dispatcher routes
-                    // solely from `[subscribe]` handlers). When they drift the tool
-                    // appears in tools/list yet silently never runs — no dispatch,
-                    // no capsule log, no error. Surface that at load, naming the
-                    // exact missing line, so authors don't lose hours to it.
-                    // Skip the manifest lookup entirely for a capsule with no
-                    // tools (most non-tool capsules) — nothing to cross-check.
-                    if !tools.is_empty() {
-                        let interceptors = capsule.manifest().effective_interceptors();
-                        for tool in
-                            astrid_capsule::tools_missing_execute_route(&tools, &interceptors)
-                        {
-                            tracing::warn!(
-                                capsule_id = %name,
-                                "capsule advertises tool '{tool}' but no `tool.v1.execute.{tool}` \
-                                 subscription routes it — it appears in tools/list but will never \
-                                 execute. Add to Capsule.toml: [subscribe] \
-                                 \"tool.v1.execute.{tool}\" = {{ wit = \
-                                 \"@unicity-astrid/wit/types/tool-call\", handler = \
-                                 \"tool_execute_{tool}\" }}"
-                            );
-                        }
-                    }
-                    match serde_json::to_value(&tools) {
-                        Ok(tools_json) => {
-                            meta = Some(capsules_loaded::inject_tools(meta, tools_json));
-                        },
-                        Err(e) => tracing::debug!(
-                            capsule_id = %name, error = %e,
-                            "failed to serialize live-described tools; capsule left uncaptured this cycle"
-                        ),
-                    }
-                },
-                Ok(None) => {
-                    // Pool-less / run-loop capsule: the interceptor describe
-                    // can't run, so leave `tools` ABSENT (not `[]`). The
-                    // consumer's describe fan-out then fires and the capsule's
-                    // own `tool.v1.request.describe` responder supplies its
-                    // surface. Injecting `[]` reads as "0 tools" and suppresses
-                    // the fan-out (#1198).
-                    tracing::debug!(
-                        capsule_id = %name,
-                        "pool-less/run-loop capsule: leaving tools absent so the describe fan-out fires (#1198)"
-                    );
-                },
-                Err(e) => tracing::debug!(
-                    capsule_id = %name, error = %e,
-                    "live tool_describe failed; capsule left uncaptured this cycle"
-                ),
-            }
-            by_principal
-                .entry(principal.to_string())
-                .or_default()
-                .push((principal.to_string(), name, meta));
-        }
-        if by_principal.is_empty() {
-            by_principal.insert(empty_principal.to_string(), Vec::new());
-        }
-
-        for (principal, entries) in by_principal {
-            let payload = capsules_loaded::build_capsules_loaded_payload(entries);
-
-            let msg = astrid_events::ipc::IpcMessage::new(
-                astrid_events::ipc::Topic::from_raw("astrid.v1.capsules_loaded"),
-                astrid_events::ipc::IpcPayload::RawJson(payload),
-                self.session_id.0,
-            )
-            .with_principal(principal);
-            let _ = self.event_bus.publish(astrid_events::AstridEvent::Ipc {
-                metadata: astrid_events::EventMetadata::new("kernel"),
-                message: msg,
-            });
-        }
-    }
-
     /// Reload a single capsule by id without a daemon restart.
     ///
     /// If the capsule is already registered, [`Self::restart_capsule`] re-reads
@@ -3737,6 +3594,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         full_reload_in_flight: AtomicBool::new(false),
         capsule_load_lock: Mutex::new(()),
         capsule_view_locks: Arc::new(DashMap::new()),
+        mcp_snapshots: Arc::new(Mutex::new(McpSnapshotStore::default())),
         ephemeral: AtomicBool::new(false),
         boot_time: astrid_runtime::time::Instant::now(),
         shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -4250,7 +4108,7 @@ fn load_or_generate_runtime_key(keys_dir: &Path) -> std::io::Result<KeyPair> {
 /// the grant-on-first-use observer (`astrid.v1.approval` — see
 /// [`grant_on_use::spawn_grant_on_use_handler`]).
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-const INTERNAL_SUBSCRIBER_COUNT: usize = 6;
+const INTERNAL_SUBSCRIBER_COUNT: usize = 7;
 /// Browser-profile count: only the `EventDispatcher` and the bus activity
 /// monitor subscribe at boot — the router pair, `ConnectionTracker`, and
 /// the grant-on-first-use observer are native-gated machinery.

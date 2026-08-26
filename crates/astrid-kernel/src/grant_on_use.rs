@@ -305,6 +305,8 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
     if !changed {
         // Already granted — idempotent. Invalidate to be safe; no save needed.
         kernel.profile_cache.invalidate(&pid);
+        drop(_guard);
+        kernel.publish_capsules_loaded_for(&pid).await;
         return;
     }
 
@@ -331,6 +333,8 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
         return;
     }
     kernel.profile_cache.invalidate(&pid);
+    drop(_guard);
+    kernel.publish_capsules_loaded_for(&pid).await;
 
     info!(
         security_event = true,
