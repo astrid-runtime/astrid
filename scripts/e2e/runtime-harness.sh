@@ -595,6 +595,24 @@ PY
     "$ARTIFACTS/paired-refresh-me-after-revoke.json")"
   assert_status "revoked refreshed paired bearer denied" "$status" 401
 
+  # Re-pair the same public key after revocation. The kernel accepts the new
+  # registration and returns the same deterministic key_id; the Rust
+  # regression pins the strictly-newer issuance rule without relying on a
+  # wall-clock sleep in this runtime harness.
+  status="$(http_status POST /api/auth/pair-device "$user_bearer" \
+    '{"expires_secs":120,"label":"regular-user phone re-pair","scope":"use-only"}' \
+    "$ARTIFACTS/agent-pair-device-repair-issue.json")"
+  assert_status "agent pair-device re-pair issue" "$status" 200
+  local repaired_pair_token repaired_paired_bearer repaired_key_id
+  repaired_pair_token="$(json_field "$ARTIFACTS/agent-pair-device-repair-issue.json" token)"
+  status="$(http_status POST /api/auth/pair-device/redeem "" \
+    "{\"token\":\"$repaired_pair_token\",\"public_key\":\"$paired_pubkey\"}" \
+    "$ARTIFACTS/agent-pair-device-repair-redeem.json")"
+  assert_status "agent pair-device re-pair redeem" "$status" 200
+  repaired_paired_bearer="$(json_field "$ARTIFACTS/agent-pair-device-repair-redeem.json" session_token)"
+  repaired_key_id="$(json_field "$ARTIFACTS/agent-pair-device-repair-redeem.json" key_id)"
+  [[ "$repaired_key_id" == "$paired_key_id" ]] || fail "re-pair key_id $repaired_key_id did not match revoked key_id $paired_key_id"
+
   status="$(http_status POST /api/auth/redeem "" \
     "{\"token\":\"$agent_invite\",\"public_key\":\"$paired_pubkey\",\"display_name\":\"reuse\"}" \
     "$ARTIFACTS/agent-invite-reuse-denied.json")"
@@ -804,6 +822,12 @@ PY
   status="$(http_status GET /api/auth/me "$user_bearer" "" "$ARTIFACTS/restart-agent-me.json")"
   assert_status "restart agent auth/me" "$status" 200
   json_assert_field_equals "$ARTIFACTS/restart-agent-me.json" principal "$user_principal"
+  status="$(http_status GET /api/auth/me "$paired_bearer" "" \
+    "$ARTIFACTS/restart-paired-me-after-revoke.json")"
+  assert_status "restart revoked paired bearer denied" "$status" 401
+  status="$(http_status GET /api/auth/me "$refreshed_paired_bearer" "" \
+    "$ARTIFACTS/restart-paired-refresh-me-after-revoke.json")"
+  assert_status "restart revoked refreshed paired bearer denied" "$status" 401
   status="$(http_status POST /api/auth/refresh "$user_bearer" "" "$ARTIFACTS/restart-agent-refresh.json")"
   assert_status "restart agent refresh" "$status" 200
   local restart_user_bearer
@@ -933,14 +957,14 @@ PY
   note "collecting scoped audit artifacts"
   collect_audit_artifacts "$restart_user_bearer" "$ops_bearer" "$user_principal" "$ops_principal" \
     "$paired_key_id" "$user_bearer" "$ops_bearer" "$paired_bearer" "$refreshed_paired_bearer" \
-    "$restart_user_bearer" "$agent_invite" "$pair_token"
+    "$repaired_paired_bearer" "$restart_user_bearer" "$agent_invite" "$pair_token" "$repaired_pair_token"
   status="$(http_status GET /metrics "" "" "$ARTIFACTS/final-metrics.txt")"
   assert_status "final metrics scrape" "$status" 200
   json_assert_metrics_contract "$ARTIFACTS/final-metrics.txt" \
     "$user_principal" "$ops_principal" "$user_session" "$ops_session" "$paired_key_id"
   assert_runtime_log_contract "$ARTIFACTS/daemon.log" "$ASTRID_HOME/log" -- \
     "$user_bearer" "$ops_bearer" "$paired_bearer" "$refreshed_paired_bearer" \
-    "$restart_user_bearer" "$agent_invite" "$pair_token"
+    "$repaired_paired_bearer" "$restart_user_bearer" "$agent_invite" "$pair_token" "$repaired_pair_token"
 
   redaction_check "$sentinel"
   redaction_check "$user_secret"
