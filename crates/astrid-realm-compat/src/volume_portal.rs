@@ -6,11 +6,12 @@
 //! namespace selection. The volume remains the only byte store and the only
 //! durability boundary.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io::Read;
 use std::sync::{
-    Arc, Mutex, MutexGuard,
-    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, MutexGuard, OnceLock, Weak,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use astrid_provider::{HostPrincipal, ProviderError};
@@ -32,6 +33,42 @@ const METADATA_LEN: usize = METADATA_MAGIC.len() + 32 + GENERATION_ENCODED_LEN;
 const OWNER_OFFSET: usize = 8;
 const GENERATION_OFFSET: usize = 40;
 
+static NEXT_PORTAL_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+struct VolumeCoordinator {
+    state: Mutex<CoordinatorState>,
+}
+
+// A staged mutation is released only by the staging portal's successful
+// commit. Drop must not clear it: that would let another portal flush the
+// unsynced volume tail through AstridVolume::sync.
+
+#[derive(Debug, Default)]
+struct CoordinatorState {
+    active: Option<ActiveMutation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActiveMutation {
+    owner: HostPrincipal,
+    portal_id: u64,
+}
+
+#[derive(Debug)]
+struct VolumeCoordinatorEntry {
+    volume: Weak<dyn AstridVolume>,
+    coordinator: Arc<VolumeCoordinator>,
+}
+
+static VOLUME_COORDINATORS: OnceLock<Mutex<HashMap<usize, VolumeCoordinatorEntry>>> =
+    OnceLock::new();
+
+struct OperationGuard<'a> {
+    _operation: MutexGuard<'a, ()>,
+    coordinator: MutexGuard<'a, CoordinatorState>,
+}
+
 /// Durable owner-bound byte portal.
 ///
 /// The owner is immutable for the lifetime of this value. Every byte and
@@ -44,8 +81,9 @@ pub struct OwnerVolumePortal {
     metadata_region: VolumeRegion,
     payload_region: VolumeRegion,
     operation_lock: Arc<Mutex<()>>,
+    coordinator: Arc<VolumeCoordinator>,
+    portal_id: u64,
     poisoned: Arc<AtomicBool>,
-    dirty: Arc<AtomicBool>,
 }
 
 impl Clone for OwnerVolumePortal {
@@ -56,8 +94,9 @@ impl Clone for OwnerVolumePortal {
             metadata_region: self.metadata_region.clone(),
             payload_region: self.payload_region.clone(),
             operation_lock: Arc::clone(&self.operation_lock),
+            coordinator: Arc::clone(&self.coordinator),
+            portal_id: self.portal_id,
             poisoned: Arc::clone(&self.poisoned),
-            dirty: Arc::clone(&self.dirty),
         }
     }
 }
@@ -88,11 +127,17 @@ impl OwnerVolumePortal {
         owner: HostPrincipal,
     ) -> Result<Self, ProviderError> {
         let (metadata_region, payload_region) = regions_for(owner)?;
-        let metadata_exists = volume
-            .region_exists(&metadata_region)
+        let coordinator = coordinator_for(&volume)?;
+        let portal =
+            Self::new_unchecked(volume, owner, metadata_region, payload_region, coordinator);
+        let mut guard = portal.lock_operation()?;
+        let metadata_exists = portal
+            .volume
+            .region_exists(&portal.metadata_region)
             .map_err(|_| ProviderError::NotSupported)?;
-        let payload_exists = volume
-            .region_exists(&payload_region)
+        let payload_exists = portal
+            .volume
+            .region_exists(&portal.payload_region)
             .map_err(|_| ProviderError::NotSupported)?;
 
         if metadata_exists != payload_exists {
@@ -100,19 +145,26 @@ impl OwnerVolumePortal {
         }
 
         if !metadata_exists {
-            volume
-                .create_region(&metadata_region, true)
+            guard
+                .coordinator
+                .reserve_mutation(portal.owner, portal.portal_id)?;
+            portal
+                .volume
+                .create_region(&portal.metadata_region, true)
                 .map_err(|_| ProviderError::NotSupported)?;
-            volume
-                .create_region(&payload_region, true)
+            portal
+                .volume
+                .create_region(&portal.payload_region, true)
                 .map_err(|_| ProviderError::NotSupported)?;
-            let portal = Self::new_unchecked(volume, owner, metadata_region, payload_region);
             portal.write_generation(ObjectGeneration::INITIAL)?;
             portal.sync_unchecked()?;
+            guard
+                .coordinator
+                .clear_mutation(portal.owner, portal.portal_id)?;
+            drop(guard);
             return Ok(portal);
         }
 
-        let portal = Self::new_unchecked(volume, owner, metadata_region, payload_region);
         let _ = portal.read_generation()?;
         let payload_len = portal
             .volume
@@ -122,6 +174,7 @@ impl OwnerVolumePortal {
             portal.poison();
             return Err(ProviderError::NotSupported);
         }
+        drop(guard);
         Ok(portal)
     }
 
@@ -153,6 +206,7 @@ impl OwnerVolumePortal {
         owner: HostPrincipal,
         metadata_region: VolumeRegion,
         payload_region: VolumeRegion,
+        coordinator: Arc<VolumeCoordinator>,
     ) -> Self {
         Self {
             volume,
@@ -160,8 +214,9 @@ impl OwnerVolumePortal {
             metadata_region,
             payload_region,
             operation_lock: Arc::new(Mutex::new(())),
+            coordinator,
+            portal_id: NEXT_PORTAL_ID.fetch_add(1, Ordering::Relaxed),
             poisoned: Arc::new(AtomicBool::new(false)),
-            dirty: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -351,11 +406,17 @@ impl OwnerVolumePortal {
         payload: &mut dyn Read,
     ) -> Result<(), ProviderError> {
         self.require_owner(caller)?;
-        let _guard = self.lock_operation()?;
+        let mut guard = self.lock_operation()?;
+        let owns_active_mutation = guard.coordinator.active_for(self.owner, self.portal_id)?;
         self.check_generation(generation)?;
         Self::check_range_u64(offset, payload_len)?;
         if payload_len == 0 {
             return Ok(());
+        }
+        if !owns_active_mutation {
+            guard
+                .coordinator
+                .reserve_mutation(self.owner, self.portal_id)?;
         }
         self.write_payload_unchecked(offset, payload_len, payload)
     }
@@ -411,16 +472,19 @@ impl OwnerVolumePortal {
         generation: ObjectGeneration,
     ) -> Result<ObjectGeneration, ProviderError> {
         self.require_owner(caller)?;
-        let _guard = self.lock_operation()?;
+        let mut guard = self.lock_operation()?;
+        let owns_active_mutation = guard.coordinator.active_for(self.owner, self.portal_id)?;
         self.check_generation(generation)?;
-        if self.dirty.load(Ordering::Acquire) {
+        if owns_active_mutation {
             let next = generation.checked_next().map_err(|_| {
                 self.poison();
                 ProviderError::NotSupported
             })?;
             self.write_generation(next)?;
             self.sync_unchecked()?;
-            self.dirty.store(false, Ordering::Release);
+            guard
+                .coordinator
+                .clear_mutation(self.owner, self.portal_id)?;
             Ok(next)
         } else {
             self.sync_unchecked()?;
@@ -446,7 +510,8 @@ impl OwnerVolumePortal {
         bytes: &[u8],
     ) -> Result<ObjectGeneration, ProviderError> {
         self.require_owner(caller)?;
-        let _guard = self.lock_operation()?;
+        let mut guard = self.lock_operation()?;
+        let owns_active_mutation = guard.coordinator.active_for(self.owner, self.portal_id)?;
         self.check_generation(generation)?;
         let payload_len = u64::try_from(bytes.len()).map_err(|_| ProviderError::NotSupported)?;
         Self::check_range_u64(offset, payload_len)?;
@@ -454,10 +519,17 @@ impl OwnerVolumePortal {
             self.poison();
             ProviderError::NotSupported
         })?;
+        if !owns_active_mutation {
+            guard
+                .coordinator
+                .reserve_mutation(self.owner, self.portal_id)?;
+        }
         self.write_payload_unchecked(offset, payload_len, &mut &bytes[..])?;
         self.write_generation(next)?;
         self.sync_unchecked()?;
-        self.dirty.store(false, Ordering::Release);
+        guard
+            .coordinator
+            .clear_mutation(self.owner, self.portal_id)?;
         Ok(next)
     }
 
@@ -493,15 +565,23 @@ impl OwnerVolumePortal {
         generation: ObjectGeneration,
     ) -> Result<ObjectGeneration, ProviderError> {
         self.require_owner(caller)?;
-        let _guard = self.lock_operation()?;
+        let mut guard = self.lock_operation()?;
+        let owns_active_mutation = guard.coordinator.active_for(self.owner, self.portal_id)?;
         self.check_generation(generation)?;
         let next = generation.checked_next().map_err(|_| {
             self.poison();
             ProviderError::NotSupported
         })?;
+        if !owns_active_mutation {
+            guard
+                .coordinator
+                .reserve_mutation(self.owner, self.portal_id)?;
+        }
         self.write_generation(next)?;
         self.sync_unchecked()?;
-        self.dirty.store(false, Ordering::Release);
+        guard
+            .coordinator
+            .clear_mutation(self.owner, self.portal_id)?;
         Ok(next)
     }
 
@@ -518,13 +598,21 @@ impl OwnerVolumePortal {
         self.advance_generation(caller, generation)
     }
 
-    fn lock_operation(&self) -> Result<MutexGuard<'_, ()>, ProviderError> {
+    fn lock_operation(&self) -> Result<OperationGuard<'_>, ProviderError> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(ProviderError::NotSupported);
         }
-        self.operation_lock.lock().map_err(|_| {
+        let Ok(operation) = self.operation_lock.lock() else {
             self.poison();
-            ProviderError::NotSupported
+            return Err(ProviderError::NotSupported);
+        };
+        let Ok(coordinator) = self.coordinator.state.lock() else {
+            self.poison();
+            return Err(ProviderError::NotSupported);
+        };
+        Ok(OperationGuard {
+            _operation: operation,
+            coordinator,
         })
     }
 
@@ -607,7 +695,6 @@ impl OwnerVolumePortal {
                 self.poison();
                 ProviderError::NotSupported
             })?;
-        self.dirty.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -638,6 +725,71 @@ impl OwnerVolumePortal {
     }
 }
 
+impl CoordinatorState {
+    fn active_for(&self, owner: HostPrincipal, portal_id: u64) -> Result<bool, ProviderError> {
+        match self.active {
+            None => Ok(false),
+            Some(active) if active.owner == owner && active.portal_id == portal_id => Ok(true),
+            Some(_) => Err(ProviderError::NotSupported),
+        }
+    }
+
+    fn reserve_mutation(
+        &mut self,
+        owner: HostPrincipal,
+        portal_id: u64,
+    ) -> Result<(), ProviderError> {
+        match self.active {
+            None => {
+                self.active = Some(ActiveMutation { owner, portal_id });
+                Ok(())
+            },
+            Some(active) if active.owner == owner && active.portal_id == portal_id => Ok(()),
+            Some(_) => Err(ProviderError::NotSupported),
+        }
+    }
+
+    fn clear_mutation(
+        &mut self,
+        owner: HostPrincipal,
+        portal_id: u64,
+    ) -> Result<(), ProviderError> {
+        match self.active {
+            Some(active) if active.owner == owner && active.portal_id == portal_id => {
+                self.active = None;
+                Ok(())
+            },
+            _ => Err(ProviderError::NotSupported),
+        }
+    }
+}
+
+fn coordinator_for(
+    volume: &Arc<dyn AstridVolume>,
+) -> Result<Arc<VolumeCoordinator>, ProviderError> {
+    let key = Arc::as_ptr(volume).cast::<()>() as usize;
+    let registry = VOLUME_COORDINATORS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut entries = registry.lock().map_err(|_| ProviderError::NotSupported)?;
+    entries.retain(|_, entry| entry.volume.upgrade().is_some());
+    if let Some(entry) = entries.get(&key)
+        && let Some(existing_volume) = entry.volume.upgrade()
+        && Arc::ptr_eq(&existing_volume, volume)
+    {
+        return Ok(Arc::clone(&entry.coordinator));
+    }
+    let coordinator = Arc::new(VolumeCoordinator {
+        state: Mutex::new(CoordinatorState::default()),
+    });
+    entries.insert(
+        key,
+        VolumeCoordinatorEntry {
+            volume: Arc::downgrade(volume),
+            coordinator: Arc::clone(&coordinator),
+        },
+    );
+    Ok(coordinator)
+}
+
 fn regions_for(owner: HostPrincipal) -> Result<(VolumeRegion, VolumeRegion), ProviderError> {
     let encoded = owner.as_bytes();
     let mut base = String::new();
@@ -655,162 +807,5 @@ fn regions_for(owner: HostPrincipal) -> Result<(VolumeRegion, VolumeRegion), Pro
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{MAX_OWNER_VOLUME_BYTES, OwnerVolumePortal};
-    use crate::fixtures::{alice_principal, bob_principal};
-    use astrid_provider::ProviderError;
-    use astrid_resource_types::ObjectGeneration;
-    use astrid_storage::volume::HostedFileVolume;
-    use std::sync::Arc;
-
-    fn volume() -> (tempfile::TempDir, Arc<HostedFileVolume>) {
-        let temporary = tempfile::tempdir().expect("temporary volume directory");
-        let path = temporary.path().join("astrid.volume");
-        let volume = HostedFileVolume::open(path).expect("hosted volume");
-        (temporary, volume)
-    }
-
-    #[test]
-    fn two_principals_are_isolated_in_one_reopened_volume() {
-        let (temporary, volume) = volume();
-        let path = temporary.path().join("astrid.volume");
-        let alice = OwnerVolumePortal::open(volume.clone(), alice_principal()).unwrap();
-        let bob = OwnerVolumePortal::open(volume.clone(), bob_principal()).unwrap();
-        let generation = ObjectGeneration::INITIAL;
-        alice
-            .write_at(alice_principal(), generation, 0, b"alice")
-            .unwrap();
-        let alice_generation = alice.sync(alice_principal(), generation).unwrap();
-        bob.write_at(bob_principal(), generation, 0, b"bob")
-            .unwrap();
-        let bob_generation = bob.sync(bob_principal(), generation).unwrap();
-
-        let mut alice_bytes = [0_u8; 5];
-        let mut bob_bytes = [0_u8; 3];
-        assert_eq!(
-            alice.read_at(alice_principal(), alice_generation, 0, &mut alice_bytes),
-            Ok(5)
-        );
-        assert_eq!(
-            bob.read_at(bob_principal(), bob_generation, 0, &mut bob_bytes),
-            Ok(3)
-        );
-        assert_eq!(&alice_bytes, b"alice");
-        assert_eq!(&bob_bytes, b"bob");
-        assert_eq!(
-            alice.read_at(bob_principal(), alice_generation, 0, &mut alice_bytes),
-            Err(ProviderError::PrincipalMismatch)
-        );
-        assert_eq!(
-            bob.write_at(alice_principal(), bob_generation, 0, b"nope"),
-            Err(ProviderError::PrincipalMismatch)
-        );
-
-        drop(alice);
-        drop(bob);
-        drop(volume);
-        let reopened_volume = HostedFileVolume::open(path).unwrap();
-        let reopened_alice =
-            OwnerVolumePortal::open(reopened_volume.clone(), alice_principal()).unwrap();
-        let reopened_bob = OwnerVolumePortal::open(reopened_volume, bob_principal()).unwrap();
-        let mut alice_after = [0_u8; 5];
-        let mut bob_after = [0_u8; 3];
-        reopened_alice
-            .read_at(alice_principal(), alice_generation, 0, &mut alice_after)
-            .unwrap();
-        reopened_bob
-            .read_at(bob_principal(), bob_generation, 0, &mut bob_after)
-            .unwrap();
-        assert_eq!(&alice_after, b"alice");
-        assert_eq!(&bob_after, b"bob");
-    }
-
-    #[test]
-    fn stale_generation_and_host_path_fail_closed() {
-        let (_temporary, volume) = volume();
-        let portal = OwnerVolumePortal::open(volume, alice_principal()).unwrap();
-        assert!(portal.as_host_path().is_none());
-        assert_eq!(
-            portal.require_owner(bob_principal()),
-            Err(ProviderError::PrincipalMismatch)
-        );
-        assert_eq!(
-            portal.require_generation(alice_principal(), ObjectGeneration::from_raw(2).unwrap(),),
-            Err(ProviderError::StaleGeneration {
-                found: 1,
-                requested: 2,
-            })
-        );
-        assert_eq!(portal.owner(), alice_principal());
-        assert_eq!(portal.namespace_id(), alice_principal());
-    }
-
-    #[test]
-    fn generation_advance_is_durable_and_denies_old_generation() {
-        let (_temporary, volume) = volume();
-        let portal = OwnerVolumePortal::open(volume, alice_principal()).unwrap();
-        let next = portal
-            .advance_generation(alice_principal(), ObjectGeneration::INITIAL)
-            .unwrap();
-        assert_eq!(next.get(), 2);
-        assert_eq!(
-            portal.write_at(alice_principal(), ObjectGeneration::INITIAL, 0, b"stale"),
-            Err(ProviderError::StaleGeneration {
-                found: 2,
-                requested: 1,
-            })
-        );
-        portal
-            .write_at(alice_principal(), next, 0, b"current")
-            .unwrap();
-        portal.sync(alice_principal(), next).unwrap();
-    }
-
-    #[test]
-    fn unsynced_tail_is_discarded_on_reopen_without_mixed_owner_bytes() {
-        let (temporary, volume) = volume();
-        let path = temporary.path().join("astrid.volume");
-        let portal = OwnerVolumePortal::open(volume.clone(), alice_principal()).unwrap();
-        let generation = ObjectGeneration::INITIAL;
-        portal
-            .write_at(alice_principal(), generation, 0, b"committed")
-            .unwrap();
-        let generation = portal.sync(alice_principal(), generation).unwrap();
-        portal
-            .write_at(alice_principal(), generation, 0, b"unsynced")
-            .unwrap();
-        let crash_copy = temporary.path().join("crash.volume");
-        std::fs::copy(&path, &crash_copy).unwrap();
-        drop(portal);
-        drop(volume);
-
-        let reopened_volume = HostedFileVolume::open(crash_copy).unwrap();
-        let reopened_alice =
-            OwnerVolumePortal::open(reopened_volume.clone(), alice_principal()).unwrap();
-        let reopened_bob = OwnerVolumePortal::open(reopened_volume, bob_principal()).unwrap();
-        let mut bytes = [0_u8; 9];
-        reopened_alice
-            .read_at(alice_principal(), generation, 0, &mut bytes)
-            .unwrap();
-        assert_eq!(&bytes, b"committed");
-        assert_eq!(
-            reopened_bob.read_at(bob_principal(), ObjectGeneration::INITIAL, 0, &mut bytes,),
-            Ok(0)
-        );
-    }
-
-    #[test]
-    fn bounded_extent_rejects_over_capacity_before_volume_write() {
-        let (_temporary, volume) = volume();
-        let portal = OwnerVolumePortal::open(volume, alice_principal()).unwrap();
-        assert_eq!(
-            portal.write_at(
-                alice_principal(),
-                ObjectGeneration::INITIAL,
-                MAX_OWNER_VOLUME_BYTES,
-                b"x",
-            ),
-            Err(ProviderError::NotSupported)
-        );
-    }
-}
+#[path = "volume_portal_tests.rs"]
+mod tests;
