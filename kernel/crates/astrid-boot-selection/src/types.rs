@@ -21,6 +21,7 @@ impl Digest {
 pub(crate) struct CandidateInput {
     pub(crate) descriptor_identity: [u8; DIGEST_LEN],
     pub(crate) kernel_identity: [u8; DIGEST_LEN],
+    pub(crate) system_generation_identity: [u8; DIGEST_LEN],
     pub(crate) plan_digest: [u8; DIGEST_LEN],
     pub(crate) object_root: [u8; DIGEST_LEN],
     pub(crate) closure_root: [u8; DIGEST_LEN],
@@ -28,6 +29,7 @@ pub(crate) struct CandidateInput {
     pub(crate) rollback_floor: u64,
     pub(crate) kernel_floor: u64,
     pub(crate) sysgen_floor: u64,
+    pub(crate) policy_generation: u64,
 }
 
 /// Facts are intentionally opaque. A later adapter constructs them from
@@ -37,6 +39,7 @@ pub(crate) struct CandidateInput {
 pub struct CandidateFacts {
     descriptor_identity: Digest,
     kernel_identity: Digest,
+    system_generation_identity: Digest,
     plan_digest: Digest,
     object_root: Digest,
     closure_root: Digest,
@@ -44,6 +47,7 @@ pub struct CandidateFacts {
     rollback_floor: u64,
     kernel_floor: u64,
     sysgen_floor: u64,
+    policy_generation: u64,
 }
 
 impl CandidateFacts {
@@ -54,6 +58,7 @@ impl CandidateFacts {
         Self {
             descriptor_identity: Digest::from_bytes(input.descriptor_identity),
             kernel_identity: Digest::from_bytes(input.kernel_identity),
+            system_generation_identity: Digest::from_bytes(input.system_generation_identity),
             plan_digest: Digest::from_bytes(input.plan_digest),
             object_root: Digest::from_bytes(input.object_root),
             closure_root: Digest::from_bytes(input.closure_root),
@@ -61,6 +66,7 @@ impl CandidateFacts {
             rollback_floor: input.rollback_floor,
             kernel_floor: input.kernel_floor,
             sysgen_floor: input.sysgen_floor,
+            policy_generation: input.policy_generation,
         }
     }
 
@@ -80,10 +86,19 @@ impl CandidateFacts {
         self.sysgen_floor
     }
 
+    pub(crate) const fn system_generation_identity(self) -> [u8; DIGEST_LEN] {
+        self.system_generation_identity.as_bytes()
+    }
+
+    pub(crate) const fn policy_generation(self) -> u64 {
+        self.policy_generation
+    }
+
     pub(crate) const fn claim(self) -> CandidateClaim {
         CandidateClaim {
             descriptor_identity: self.descriptor_identity,
             kernel_identity: self.kernel_identity,
+            system_generation_identity: Digest::from_bytes(self.system_generation_identity()),
             plan_digest: self.plan_digest,
             object_root: self.object_root,
             closure_root: self.closure_root,
@@ -91,6 +106,7 @@ impl CandidateFacts {
             rollback_floor: self.rollback_floor,
             kernel_floor: self.kernel_floor,
             sysgen_floor: self.sysgen_floor,
+            policy_generation: self.policy_generation,
         }
     }
 }
@@ -102,6 +118,7 @@ impl CandidateFacts {
 pub(crate) struct CandidateClaim {
     descriptor_identity: Digest,
     kernel_identity: Digest,
+    system_generation_identity: Digest,
     plan_digest: Digest,
     object_root: Digest,
     closure_root: Digest,
@@ -109,6 +126,7 @@ pub(crate) struct CandidateClaim {
     rollback_floor: u64,
     kernel_floor: u64,
     sysgen_floor: u64,
+    policy_generation: u64,
 }
 
 impl CandidateClaim {
@@ -116,6 +134,7 @@ impl CandidateClaim {
         Self {
             descriptor_identity: Digest::from_bytes(input.descriptor_identity),
             kernel_identity: Digest::from_bytes(input.kernel_identity),
+            system_generation_identity: Digest::from_bytes(input.system_generation_identity),
             plan_digest: Digest::from_bytes(input.plan_digest),
             object_root: Digest::from_bytes(input.object_root),
             closure_root: Digest::from_bytes(input.closure_root),
@@ -123,6 +142,7 @@ impl CandidateClaim {
             rollback_floor: input.rollback_floor,
             kernel_floor: input.kernel_floor,
             sysgen_floor: input.sysgen_floor,
+            policy_generation: input.policy_generation,
         }
     }
 
@@ -136,6 +156,10 @@ impl CandidateClaim {
 
     pub(crate) const fn kernel_identity(self) -> [u8; DIGEST_LEN] {
         self.kernel_identity.as_bytes()
+    }
+
+    pub(crate) const fn system_generation_identity(self) -> [u8; DIGEST_LEN] {
+        self.system_generation_identity.as_bytes()
     }
 
     pub(crate) const fn plan_digest(self) -> [u8; DIGEST_LEN] {
@@ -166,10 +190,15 @@ impl CandidateClaim {
         self.sysgen_floor
     }
 
+    pub(crate) const fn policy_generation(self) -> u64 {
+        self.policy_generation
+    }
+
     pub(crate) fn well_formed(self) -> bool {
         [
             self.descriptor_identity,
             self.kernel_identity,
+            self.system_generation_identity,
             self.plan_digest,
             self.object_root,
             self.closure_root,

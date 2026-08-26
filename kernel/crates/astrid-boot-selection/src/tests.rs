@@ -19,6 +19,7 @@ fn facts_with_generation(byte: u8, generation: u64) -> CandidateFacts {
     CandidateFacts::from_verified(CandidateInput {
         descriptor_identity: digest(byte),
         kernel_identity: digest(byte.wrapping_add(1)),
+        system_generation_identity: digest(byte.wrapping_add(5)),
         plan_digest: digest(byte.wrapping_add(2)),
         object_root: digest(byte.wrapping_add(3)),
         closure_root: digest(byte.wrapping_add(4)),
@@ -26,6 +27,7 @@ fn facts_with_generation(byte: u8, generation: u64) -> CandidateFacts {
         rollback_floor: 10 + u64::from(byte),
         kernel_floor: 10 + u64::from(byte),
         sysgen_floor: 10 + u64::from(byte),
+        policy_generation: 10 + u64::from(byte),
     })
 }
 
@@ -57,8 +59,8 @@ fn fixed_empty_journal_recovers() {
         selector().recover(Journal::empty(), verified()),
         BootDecision::Recovery
     );
-    assert_eq!(JOURNAL_LEN, 4096);
-    assert_eq!(FRAME_LEN, 256);
+    assert_eq!(JOURNAL_LEN, 4736);
+    assert_eq!(FRAME_LEN, 296);
     assert_eq!(CHECKSUM_END, FRAME_LEN);
 }
 

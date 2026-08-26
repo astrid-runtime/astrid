@@ -10,3 +10,10 @@ path = "src/lib.rs"
 
 [dependencies]
 blake3 = { version = "=1.8.5", default-features = false, features = ["pure"] }
+astrid-native-closure = { path = "../astrid-native-closure" }
+astrid-system-generation = { path = "../astrid-system-generation" }
+
+[dev-dependencies]
+astrid-native-closure = { path = "../astrid-native-closure", features = ["sign"] }
+astrid-system-generation = { path = "../astrid-system-generation", features = ["sign"] }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["zeroize"] }
