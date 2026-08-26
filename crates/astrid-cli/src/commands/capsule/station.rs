@@ -810,7 +810,7 @@ pub(super) fn test_lock_backend_active() -> bool {
     test_lock_backend::active()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "station_regressions.rs"]
 mod regressions;
 
@@ -820,6 +820,7 @@ mod tests {
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use std::fs::File;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tar::Builder;
 
@@ -875,6 +876,7 @@ mod tests {
         (dir, path)
     }
 
+    #[cfg(unix)]
     fn fake_station_script(dir: &Path, fixture: &Path, marker: &Path) -> PathBuf {
         let script = dir.join("astrid-station-fake");
         let body = format!(
@@ -954,6 +956,7 @@ mod tests {
         assert!(verify_manifest_digest(&archive, &lock).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn station_update_uses_existing_lock_and_private_handoff_not_astrid_cas() {
         let root = tempfile::tempdir().unwrap();
