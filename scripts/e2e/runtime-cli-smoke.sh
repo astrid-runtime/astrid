@@ -17,10 +17,17 @@ run_cli_semantic_smoke() {
   run_cli agent enable e2e-cli-lifecycle
   run_cli agent show e2e-cli-lifecycle --format json > "$ARTIFACTS/cli-agent-lifecycle-enabled.json"
   json_assert_cli_agent_enabled "$ARTIFACTS/cli-agent-lifecycle-enabled.json" e2e-cli-lifecycle true
-  run_cli agent delete e2e-cli-lifecycle -y
-  if run_cli agent show e2e-cli-lifecycle --format json > "$ARTIFACTS/cli-agent-lifecycle-deleted.json"; then
-    fail "deleted agent e2e-cli-lifecycle remained visible"
-  fi
+  assert_cli_exit_contains "cli-agent-lifecycle-delete-denied" 1 \
+    "ownership mutation requires an enrolled authority" \
+    agent delete e2e-cli-lifecycle -y
+  run_cli agent show e2e-cli-lifecycle --format json \
+    > "$ARTIFACTS/cli-agent-lifecycle-after-denied-delete.json"
+  json_assert_cli_agent_show \
+    "$ARTIFACTS/cli-agent-lifecycle-after-denied-delete.json" \
+    e2e-cli-lifecycle agent
+  json_assert_cli_agent_enabled \
+    "$ARTIFACTS/cli-agent-lifecycle-after-denied-delete.json" \
+    e2e-cli-lifecycle true
   run_cli caps grant "$ops_principal" caps:token:mint
   run_cli caps grant "$ops_principal" caps:token:list
   run_cli caps grant "$ops_principal" caps:token:revoke
@@ -140,7 +147,17 @@ PY
     2>> "$ARTIFACTS/cli-transcript.log"
   run_cli agent show e2e-cli-redeemed --format json > "$ARTIFACTS/cli-invite-redeemed-agent.json"
   json_assert_cli_agent_show "$ARTIFACTS/cli-invite-redeemed-agent.json" e2e-cli-redeemed agent
-  run_cli agent delete e2e-cli-redeemed -y
+  assert_cli_exit_contains "cli-invite-redeemed-delete-denied" 1 \
+    "ownership mutation requires an enrolled authority" \
+    agent delete e2e-cli-redeemed -y
+  run_cli agent show e2e-cli-redeemed --format json \
+    > "$ARTIFACTS/cli-invite-redeemed-after-denied-delete.json"
+  json_assert_cli_agent_show \
+    "$ARTIFACTS/cli-invite-redeemed-after-denied-delete.json" \
+    e2e-cli-redeemed agent
+  json_assert_cli_agent_enabled \
+    "$ARTIFACTS/cli-invite-redeemed-after-denied-delete.json" \
+    e2e-cli-redeemed true
   run_cli keypair delete e2e-cli-redeem-key --yes
 
   run_cli quota show --agent "$user_principal" --format json > "$ARTIFACTS/cli-quota-show-user.json"
