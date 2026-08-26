@@ -311,11 +311,15 @@ fn is_mcp_attach(command: &str) -> bool {
         return false;
     }
     let tokens = command.split_whitespace().collect::<Vec<_>>();
-    let has_attach = tokens.windows(2).any(|pair| pair == ["mcp", "attach"]);
-    has_attach
-        && tokens
-            .iter()
-            .any(|token| matches!(command_file_name(token), "astrid" | "aos"))
+    let Some(attach_index) = tokens.windows(2).position(|pair| pair == ["mcp", "attach"]) else {
+        return false;
+    };
+    // Only the executable/wrapper prefix can establish Astrid identity. A
+    // basename after `mcp attach` is commonly a workspace or script argument
+    // and must not make an unrelated process reapable.
+    tokens[..attach_index]
+        .iter()
+        .any(|token| matches!(command_file_name(token), "astrid" | "aos"))
 }
 
 fn is_reapable_mcp(command: &str) -> bool {
@@ -408,6 +412,9 @@ mod tests {
         ));
         assert!(is_python_frame(
             "Python -u /cache/bin/aos-mcp-frame astrid --principal codex-code mcp attach"
+        ));
+        assert!(!is_mcp_attach(
+            "node worker.js mcp attach --workspace /tmp/astrid"
         ));
         assert!(!is_mcp_attach("astrid --principal codex-code mcp gateway"));
         assert!(!is_mcp_attach("aos mcp serve --request-timeout 1d5m"));

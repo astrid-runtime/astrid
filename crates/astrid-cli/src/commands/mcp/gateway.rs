@@ -17,7 +17,7 @@ use rmcp::ServiceExt;
 use rmcp::service::{Peer, RoleServer};
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -48,9 +48,15 @@ type Client = Arc<Mutex<crate::socket_client::SocketClient>>;
 type Peers = Arc<Mutex<HashMap<String, Peer<RoleServer>>>>;
 
 struct AttachSlot {
+    id: Uuid,
     cancel: CancellationToken,
     last_activity: Arc<StdMutex<Instant>>,
     done: Arc<Notify>,
+}
+
+struct AttachReservation {
+    admission: OwnedMutexGuard<()>,
+    permit: OwnedSemaphorePermit,
 }
 
 struct GatewayState {
@@ -61,6 +67,7 @@ struct GatewayState {
     peers: Mutex<HashMap<String, Peers>>,
     permits: Mutex<HashMap<String, Arc<Semaphore>>>,
     slots: Mutex<HashMap<String, AttachSlot>>,
+    admission: Arc<Mutex<()>>,
     initialize: Mutex<()>,
 }
 
@@ -74,6 +81,7 @@ impl GatewayState {
             peers: Mutex::new(HashMap::new()),
             permits: Mutex::new(HashMap::new()),
             slots: Mutex::new(HashMap::new()),
+            admission: Arc::new(Mutex::new(())),
             initialize: Mutex::new(()),
         }
     }
@@ -159,6 +167,20 @@ impl GatewayState {
         )
     }
 
+    /// Reserve a host session through replacement, cap admission, and slot
+    /// installation as one linearizable operation. The reservation owns the
+    /// admission guard until `install` publishes the new slot.
+    async fn reserve_session(
+        &self,
+        host_session_id: &str,
+        principal: &str,
+    ) -> Result<AttachReservation> {
+        let admission = Arc::clone(&self.admission).lock_owned().await;
+        self.replace_session(host_session_id).await;
+        let permit = self.acquire(principal).await?;
+        Ok(AttachReservation { admission, permit })
+    }
+
     async fn replace_session(&self, host_session_id: &str) {
         let slot = self.slots.lock().await.remove(host_session_id);
         if let Some(slot) = slot {
@@ -197,8 +219,41 @@ impl GatewayState {
         self.slots.lock().await.insert(host_session_id, slot);
     }
 
-    async fn take_slot(&self, host_session_id: &str) -> Option<AttachSlot> {
-        self.slots.lock().await.remove(host_session_id)
+    async fn take_slot_if(&self, host_session_id: &str, id: Uuid) -> bool {
+        let mut slots = self.slots.lock().await;
+        if slots.get(host_session_id).is_some_and(|slot| slot.id == id) {
+            slots.remove(host_session_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove a slot, release its cap, then wake replacement/eviction waiters.
+    async fn finish_slot(
+        &self,
+        host_session_id: &str,
+        id: Uuid,
+        permit: OwnedSemaphorePermit,
+        done: Arc<Notify>,
+    ) {
+        self.take_slot_if(host_session_id, id).await;
+        drop(permit);
+        done.notify_waiters();
+    }
+}
+
+impl AttachReservation {
+    async fn install(
+        self,
+        state: &GatewayState,
+        host_session_id: String,
+        slot: AttachSlot,
+    ) -> OwnedSemaphorePermit {
+        let Self { admission, permit } = self;
+        state.install_slot(host_session_id, slot).await;
+        drop(admission);
+        permit
     }
 }
 
@@ -271,17 +326,21 @@ async fn serve_attach(stream: UnixStream, state: Arc<GatewayState>) -> Result<()
     let workspace = validate_workspace(&registration.workspace_abs)?;
     let principal_key = principal.to_string();
     let host_session_id = registration.host_session_id.clone();
-    state.replace_session(&host_session_id).await;
-    let permit = state.acquire(&principal_key).await?;
     let client = state.client_for(&principal).await?;
     let peers = state.peers_for(&principal_key).await?;
+    let reservation = state
+        .reserve_session(&host_session_id, &principal_key)
+        .await?;
     let last_activity = Arc::new(StdMutex::new(Instant::now()));
     let cancel = CancellationToken::new();
     let done = Arc::new(Notify::new());
-    state
-        .install_slot(
+    let slot_id = Uuid::new_v4();
+    let permit = reservation
+        .install(
+            &state,
             host_session_id.clone(),
             AttachSlot {
+                id: slot_id,
                 cancel: cancel.clone(),
                 last_activity: Arc::clone(&last_activity),
                 done: Arc::clone(&done),
@@ -301,13 +360,13 @@ async fn serve_attach(stream: UnixStream, state: Arc<GatewayState>) -> Result<()
         reader,
         write_half,
         peers,
-        host_session_id.clone(),
+        slot_id,
         cancel,
     )
     .await;
-    let _ = state.take_slot(&host_session_id).await;
-    done.notify_waiters();
-    drop(permit);
+    state
+        .finish_slot(&host_session_id, slot_id, permit, done)
+        .await;
     result
 }
 
@@ -316,7 +375,7 @@ async fn run_attached_session<R>(
     reader: R,
     write_half: tokio::io::WriteHalf<UnixStream>,
     peers: Peers,
-    host_session_id: String,
+    slot_id: Uuid,
     cancel: CancellationToken,
 ) -> Result<()>
 where
@@ -326,15 +385,18 @@ where
         .serve((reader, write_half))
         .await
         .context("MCP gateway failed to initialize attach session")?;
+    // Use the slot generation rather than the host session id so a delayed
+    // predecessor cannot remove a replacement's peer from the shared watcher.
+    let peer_key = slot_id.to_string();
     peers
         .lock()
         .await
-        .insert(host_session_id.clone(), running.peer().clone());
+        .insert(peer_key.clone(), running.peer().clone());
     let result = tokio::select! {
         result = running.waiting() => result.context("MCP gateway attach transport terminated abnormally"),
         () = cancel.cancelled() => Err(anyhow::anyhow!("MCP attach replaced or idle-evicted")),
     };
-    peers.lock().await.remove(&host_session_id);
+    peers.lock().await.remove(&peer_key);
     result.map(|_| ())
 }
 
@@ -443,7 +505,7 @@ mod tests {
     use tokio::io::{AsyncWriteExt, BufReader};
 
     use super::{
-        GatewayState, MAX_ATTACHES, MAX_REGISTRATION_BYTES, authenticate_registration,
+        AttachSlot, GatewayState, MAX_ATTACHES, MAX_REGISTRATION_BYTES, authenticate_registration,
         mint_hook_token, read_registration, read_registration_inner, validate_workspace,
     };
     use crate::commands::mcp::lifecycle::AttachRegistration;
@@ -582,7 +644,7 @@ mod tests {
         use tokio::time::Instant;
         use tokio_util::sync::CancellationToken;
 
-        use super::AttachSlot;
+        use uuid::Uuid;
 
         let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
         let state = GatewayState::new(
@@ -597,6 +659,7 @@ mod tests {
             .install_slot(
                 "thread-1".into(),
                 AttachSlot {
+                    id: Uuid::new_v4(),
                     cancel: cancel.clone(),
                     last_activity: Arc::new(StdMutex::new(Instant::now())),
                     done: Arc::clone(&done),
@@ -616,6 +679,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_session_admission_serializes_reserve_acquire_install() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        use tokio::sync::Notify;
+        use tokio::time::{Duration, Instant, timeout};
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+
+        let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
+        let state = Arc::new(GatewayState::new(
+            PathBuf::from("/runtime-home"),
+            principal,
+            "gateway-token".into(),
+        ));
+        let first = state
+            .reserve_session("thread-1", "codex-code")
+            .await
+            .expect("first reservation");
+        let second_state = Arc::clone(&state);
+        let mut second =
+            tokio::spawn(
+                async move { second_state.reserve_session("thread-1", "codex-code").await },
+            );
+        tokio::task::yield_now().await;
+        assert!(
+            timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err()
+        );
+
+        let first_id = Uuid::new_v4();
+        let first_cancel = CancellationToken::new();
+        let first_done = Arc::new(Notify::new());
+        let first_permit = first
+            .install(
+                &state,
+                "thread-1".into(),
+                AttachSlot {
+                    id: first_id,
+                    cancel: first_cancel.clone(),
+                    last_activity: Arc::new(StdMutex::new(Instant::now())),
+                    done: Arc::clone(&first_done),
+                },
+            )
+            .await;
+        let cleanup_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            first_cancel.cancelled().await;
+            cleanup_state.take_slot_if("thread-1", first_id).await;
+            drop(first_permit);
+            first_done.notify_waiters();
+        });
+
+        let second = timeout(Duration::from_secs(1), &mut second)
+            .await
+            .expect("second reservation must complete")
+            .expect("second reservation task")
+            .expect("second reservation");
+        let second_id = Uuid::new_v4();
+        let second_done = Arc::new(Notify::new());
+        let second_permit = second
+            .install(
+                &state,
+                "thread-1".into(),
+                AttachSlot {
+                    id: second_id,
+                    cancel: CancellationToken::new(),
+                    last_activity: Arc::new(StdMutex::new(Instant::now())),
+                    done: Arc::clone(&second_done),
+                },
+            )
+            .await;
+        assert_eq!(
+            state.slots.lock().await.get("thread-1").map(|slot| slot.id),
+            Some(second_id)
+        );
+        state
+            .finish_slot("thread-1", second_id, second_permit, second_done)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn stale_session_cleanup_cannot_remove_a_replacement() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        use tokio::sync::Notify;
+        use tokio::time::Instant;
+        use tokio_util::sync::CancellationToken;
+        use uuid::Uuid;
+
+        let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
+        let state = GatewayState::new(
+            PathBuf::from("/runtime-home"),
+            principal,
+            "gateway-token".into(),
+        );
+        let old_id = Uuid::new_v4();
+        let old_cancel = CancellationToken::new();
+        state
+            .install_slot(
+                "thread-1".into(),
+                AttachSlot {
+                    id: old_id,
+                    cancel: old_cancel,
+                    last_activity: Arc::new(StdMutex::new(Instant::now())),
+                    done: Arc::new(Notify::new()),
+                },
+            )
+            .await;
+        assert!(state.take_slot_if("thread-1", old_id).await);
+
+        let replacement_id = Uuid::new_v4();
+        state
+            .install_slot(
+                "thread-1".into(),
+                AttachSlot {
+                    id: replacement_id,
+                    cancel: CancellationToken::new(),
+                    last_activity: Arc::new(StdMutex::new(Instant::now())),
+                    done: Arc::new(Notify::new()),
+                },
+            )
+            .await;
+        assert!(!state.take_slot_if("thread-1", old_id).await);
+        assert_eq!(
+            state.slots.lock().await.get("thread-1").map(|slot| slot.id),
+            Some(replacement_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_slot_releases_cap_before_notifying_waiters() {
+        use std::sync::Arc;
+
+        use tokio::sync::Notify;
+        use tokio::time::{Duration, timeout};
+        use uuid::Uuid;
+
+        let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
+        let state = Arc::new(GatewayState::new(
+            PathBuf::from("/runtime-home"),
+            principal,
+            "gateway-token".into(),
+        ));
+        let finishing = state.acquire("codex-code").await.expect("permit");
+        let mut occupied = Vec::with_capacity(MAX_ATTACHES - 1);
+        for _ in 0..MAX_ATTACHES - 1 {
+            occupied.push(state.acquire("codex-code").await.expect("permit"));
+        }
+        let done = Arc::new(Notify::new());
+        let notified = Arc::clone(&done).notified_owned();
+        let waiter_state = Arc::clone(&state);
+        let waiter = tokio::spawn(async move {
+            notified.await;
+            waiter_state.acquire("codex-code").await
+        });
+        tokio::task::yield_now().await;
+        state
+            .finish_slot("thread-1", Uuid::new_v4(), finishing, done)
+            .await;
+        let permit = timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter must wake")
+            .expect("waiter task")
+            .expect("released permit must be available before notification");
+        drop(permit);
+        drop(occupied);
+    }
+
+    #[tokio::test]
     async fn acquire_evicts_idle_lru_then_admits() {
         use std::sync::{Arc, Mutex as StdMutex};
 
@@ -624,6 +857,7 @@ mod tests {
         use tokio_util::sync::CancellationToken;
 
         use super::{ATTACH_IDLE_EOF, AttachSlot};
+        use uuid::Uuid;
 
         let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
         let state = GatewayState::new(
@@ -642,6 +876,7 @@ mod tests {
                 .install_slot(
                     format!("idle-{index}"),
                     AttachSlot {
+                        id: Uuid::new_v4(),
                         cancel: cancel.clone(),
                         last_activity: Arc::new(StdMutex::new(last)),
                         done: Arc::clone(&done),
@@ -668,7 +903,7 @@ mod tests {
         use tokio::time::Instant;
         use tokio_util::sync::CancellationToken;
 
-        use super::AttachSlot;
+        use uuid::Uuid;
 
         let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
         let state = GatewayState::new(
@@ -685,6 +920,7 @@ mod tests {
                 .install_slot(
                     format!("live-{index}"),
                     AttachSlot {
+                        id: Uuid::new_v4(),
                         cancel: cancel.clone(),
                         last_activity: Arc::new(StdMutex::new(Instant::now())),
                         done: Arc::clone(&done),

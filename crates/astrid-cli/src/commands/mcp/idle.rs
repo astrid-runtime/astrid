@@ -109,15 +109,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_reader_survives_traffic_inside_the_window() {
+    async fn idle_reader_resets_after_traffic_and_survives_the_original_deadline() {
         let (mut peer, stream) = tokio::io::duplex(32);
         let last = Arc::new(Mutex::new(Instant::now()));
         let mut reader = IdleEof::new(BufReader::new(stream), ATTACH_IDLE_EOF, Arc::clone(&last));
         tokio::spawn(async move {
             tokio::time::sleep(ATTACH_IDLE_EOF / 2).await;
             peer.write_u8(b'x').await.expect("traffic");
+            tokio::time::sleep(ATTACH_IDLE_EOF * 7 / 8).await;
+            let _ = peer.write_u8(b'y').await;
         });
         assert_eq!(reader.read_u8().await.expect("byte"), b'x');
         assert!(!is_idle(&last, ATTACH_IDLE_EOF));
+        assert_eq!(reader.read_u8().await.expect("reset byte"), b'y');
     }
 }
