@@ -191,6 +191,7 @@ the non-claims above.
 Pinned to stable Rust 1.95.0. Interrupt handlers use stable naked-function
 ISR stubs via `x86_64`'s `Entry::set_handler_addr`.
 
-`x86_64-unknown-none` builds set `curve25519_dalek_backend="serial"` so
-ring-0 Ed25519 does not take the x86 SIMD codegen path. That is a compile
-choice, not a cryptography or timing claim.
+`x86_64-unknown-none`, `aarch64-unknown-none`, and
+`riscv64gc-unknown-none-elf` builds set
+`curve25519_dalek_backend="serial"`. SIMD cannot activate on the AArch64 and
+RISC-V arches; this is a compile choice, not a crypto claim.

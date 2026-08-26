@@ -56,7 +56,35 @@ jobs:
         working-directory: kernel
         run: |
           rustup show
-          ./check.sh
+          ./check.sh x86
+
+  semantic-portability:
+    name: Compile-only semantic targets (AArch64 + RISC-V)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95.0"
+          targets: x86_64-unknown-none,aarch64-unknown-none,riscv64gc-unknown-none-elf
+          components: rust-src, clippy, rustfmt
+
+      - name: Run compile-only portability checks
+        working-directory: kernel
+        run: |
+          rustup show
+          ./check.sh portability
 
   qemu-tcg:
     name: QEMU TCG boot (emulator evidence only)

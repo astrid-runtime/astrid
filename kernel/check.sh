@@ -11,6 +11,91 @@ toolchain="${KTEST_TOOLCHAIN:-nightly-2026-07-21}"
 host="$root/target/kimage-host"
 nested="$root/target/bootloader-nested"
 
+mode="${1:-all}"
+if [[ $# -gt 1 ]]; then
+  echo "usage: $0 [x86|portability]" >&2
+  exit 2
+fi
+
+require_target() {
+  local target="$1"
+  local cfg installed_targets installed_target
+  if ! cfg="$(rustc --print cfg --target "$target" 2>&1)"; then
+    echo "check.sh: required target $target is not recognized by the active rustc" >&2
+    echo "$cfg" >&2
+    exit 1
+  fi
+  if ! installed_targets="$(rustup target list --installed 2>&1)"; then
+    echo "check.sh: unable to query installed Rust targets" >&2
+    echo "$installed_targets" >&2
+    exit 1
+  fi
+  while IFS= read -r installed_target; do
+    if [[ "$installed_target" == "$target" ]]; then
+      return 0
+    fi
+  done <<< "$installed_targets"
+  echo "check.sh: required target $target is missing; install it with 'rustup target add $target'" >&2
+  exit 1
+}
+
+run_portability() {
+  local target spec package feature_spec
+  local -a package_args
+  local -a required_targets=(
+    "x86_64-unknown-none"
+    "aarch64-unknown-none"
+    "riscv64gc-unknown-none-elf"
+  )
+  local -a targets=(
+    "aarch64-unknown-none"
+    "riscv64gc-unknown-none-elf"
+  )
+  local -a packages=(
+    "astrid-native-closure|--no-default-features"
+    "astrid-system-generation|--no-default-features"
+    "astrid-boot-selection|--no-default-features"
+    "astrid-init-plan|"
+  )
+
+  for target in "${required_targets[@]}"; do
+    require_target "$target"
+  done
+
+  for target in "${targets[@]}"; do
+    for spec in "${packages[@]}"; do
+      package="${spec%%|*}"
+      feature_spec="${spec#*|}"
+      package_args=(-p "$package")
+      if [[ -n "$feature_spec" ]]; then
+        package_args+=(--no-default-features)
+      fi
+
+      echo "== stable cargo check -p $package ${feature_spec:+$feature_spec }--target $target (compile-only) =="
+      cargo check "${package_args[@]}" --target "$target" --locked
+
+      echo "== stable cargo clippy -p $package ${feature_spec:+$feature_spec }--target $target (compile-only) =="
+      cargo clippy "${package_args[@]}" --target "$target" --locked -- -D warnings
+    done
+  done
+
+  echo "check.sh: PASS (compile-only portability checks; not boot or hardware evidence)"
+}
+
+case "$mode" in
+  x86|all)
+    require_target "x86_64-unknown-none"
+    ;;
+  portability)
+    run_portability
+    exit 0
+    ;;
+  *)
+    echo "usage: $0 [x86|portability]" >&2
+    exit 2
+    ;;
+esac
+
 echo "== cargo fmt (kernel packages; vendored bootloader uses its own pinned toolchain) =="
 cargo fmt -p astrid-native-closure -p astrid-native-kernel -p astrid-boot-selection -p astrid-init-plan -p astrid-system-generation -p kimage -p ktest -- --check
 
@@ -80,3 +165,7 @@ env -u CARGO_BUILD_TARGET_DIR \
   rustup run "$toolchain" cargo clippy -p kimage --all-targets --locked --target-dir "$host" -- -D warnings
 
 echo "check.sh: PASS (split checks only; not workspace clippy)"
+
+if [[ "$mode" == all ]]; then
+  run_portability
+fi
