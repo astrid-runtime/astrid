@@ -10,9 +10,13 @@
 //! fallback. Guest argv cannot select a namespace. Two-principal isolation uses
 //! the [`HostPrincipal`] stamp seam; this crate does not mint stamps or leases.
 //!
+//! The optional `volume` feature adds a native, owner-scoped durable portal
+//! over an injected `AstridVolume`; the default and wasm builds remain this
+//! ephemeral compatibility fixture.
+//!
 //! Live authority stays on the host. Receipts cannot become live handles.
 
-#![no_std]
+#![cfg_attr(any(not(feature = "volume"), target_family = "wasm"), no_std)]
 #![forbid(unsafe_code)]
 
 mod fixtures;
@@ -20,6 +24,9 @@ mod image;
 mod interpreter;
 mod machine;
 mod ramfs;
+
+#[cfg(all(feature = "volume", not(target_family = "wasm")))]
+mod volume_portal;
 
 #[cfg(test)]
 mod corpus;
@@ -38,3 +45,6 @@ pub use machine::{
     RAM_BYTES,
 };
 pub use ramfs::EphemeralRamfs;
+
+#[cfg(all(feature = "volume", not(target_family = "wasm")))]
+pub use volume_portal::{MAX_OWNER_VOLUME_BYTES, OwnerVolumePortal};
