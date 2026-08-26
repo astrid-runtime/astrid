@@ -44,6 +44,22 @@ fn snapshot(object_byte: u8, label: &[u8], metadata: &PresentationMetadata) -> P
     )
 }
 
+fn assert_stale_error_rendering_is_opaque(error: &ProjectionError) {
+    let stale_debug = format_args!("{error:?}").to_string();
+    let stale_display = format_args!("{error}").to_string();
+    assert_eq!(stale_debug, "ActionStaleRevision");
+    assert_eq!(
+        stale_display,
+        "invalid projection descriptor: ActionStaleRevision"
+    );
+    for rendered in [&stale_debug, &stale_display] {
+        assert!(!rendered.contains('7'));
+        assert!(!rendered.contains('8'));
+        assert!(!rendered.contains("found"));
+        assert!(!rendered.contains("requested"));
+    }
+}
+
 #[test]
 fn descriptor_roundtrip_is_fixed_and_debug_is_opaque() {
     let descriptor = descriptor();
@@ -175,19 +191,7 @@ fn descriptor_rejects_stale_expired_drift_and_cross_principal_observations() {
         Err(ProjectionError::ActionStaleRevision)
     );
     let stale_error = descriptor.check(&stale).unwrap_err();
-    let stale_debug = format_args!("{stale_error:?}").to_string();
-    let stale_display = format_args!("{stale_error}").to_string();
-    assert_eq!(stale_debug, "ActionStaleRevision");
-    assert_eq!(
-        stale_display,
-        "invalid projection descriptor: ActionStaleRevision"
-    );
-    for rendered in [&stale_debug, &stale_display] {
-        assert!(!rendered.contains('7'));
-        assert!(!rendered.contains('8'));
-        assert!(!rendered.contains("found"));
-        assert!(!rendered.contains("requested"));
-    }
+    assert_stale_error_rendering_is_opaque(&stale_error);
 
     let scope = ActionObservation::new(
         honest.object(),
