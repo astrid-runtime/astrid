@@ -10,12 +10,18 @@ use astrid_resource_types::{
 use crate::stamp::StampedInvocation;
 
 use super::scope::{
-    AdmissionOptions, Reservation, ResourceAuthority, ResourceHandle, ResourceScope,
-    RevocationSelector, SemanticObject,
+    AdmissionOptions, MAX_SCOPE_OBJECTS, Reservation, ResourceAuthority, ResourceHandle,
+    ResourceScope, RevocationSelector, SemanticObject,
 };
 
 /// Maximum delegation depth checked while resolving a live child.
 const MAX_LINEAGE_DEPTH: usize = 64;
+/// Reuse the existing per-scope object ceiling as the per-table live ceiling.
+///
+/// This is a host-side containment bound, not an operator policy knob.
+const MAX_LIVE_AUTHORITY_SLOTS: usize = MAX_SCOPE_OBJECTS;
+/// A distinct invalidator may address every bounded live authority once.
+const MAX_REVOCATION_SELECTORS: usize = MAX_SCOPE_OBJECTS;
 
 #[derive(Debug)]
 struct Slot {
@@ -82,6 +88,18 @@ impl ResourceAuthorityTable {
     #[must_use]
     pub(crate) const fn released_reserved_units(&self) -> u128 {
         self.released_reserved_units
+    }
+
+    /// Number of table-local slot records allocated by this instance.
+    #[must_use]
+    pub(crate) const fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Number of retained selector tombstones in this instance.
+    #[must_use]
+    pub(crate) fn revoked_selector_count(&self) -> usize {
+        self.revoked_selectors.len()
     }
 
     /// Admit one invocation-scoped [`ResourceKind::SemanticObject`].
@@ -267,6 +285,12 @@ impl ResourceAuthorityTable {
         &mut self,
         selector: RevocationSelector,
     ) -> Result<(), ResourceErrorCode> {
+        if self.revoked_selectors.contains(&selector) {
+            return Ok(());
+        }
+        if self.revoked_selectors.len() >= MAX_REVOCATION_SELECTORS {
+            return Err(ResourceErrorCode::Exhausted);
+        }
         self.revoked_selectors.insert(selector);
         Ok(())
     }
@@ -314,7 +338,17 @@ impl ResourceAuthorityTable {
         {
             return Err(ResourceErrorCode::Exhausted);
         }
+        if self.live_authority_count() >= MAX_LIVE_AUTHORITY_SLOTS {
+            return Err(ResourceErrorCode::Exhausted);
+        }
         Ok(())
+    }
+
+    fn live_authority_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| !slot.retired && slot.authority.is_some())
+            .count()
     }
 
     fn reserve_units(&mut self, units: u64) -> Result<(), ResourceErrorCode> {

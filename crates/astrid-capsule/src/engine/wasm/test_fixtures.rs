@@ -104,6 +104,7 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         ),
         principal: astrid_core::PrincipalId::default(),
         stamped_invocation: None,
+        semantic_authorities: Default::default(),
         system_runtime: false,
         capsule_uuid: uuid::Uuid::new_v4(),
         caller_context: None,

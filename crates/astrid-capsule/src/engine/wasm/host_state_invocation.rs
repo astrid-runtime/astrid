@@ -65,6 +65,7 @@ impl HostState {
                 self.capsule_id
             )));
         };
+        self.semantic_authorities.prepare_for_replacement();
         self.stamped_invocation =
             Some(crate::stamp::StampedInvocation::from_trusted_uid(owner_uid));
         self.invocation_kv = Some(self.kv.clone());
@@ -236,6 +237,7 @@ impl HostState {
             return;
         }
 
+        self.semantic_authorities.prepare_for_replacement();
         let publisher: Option<astrid_core::PrincipalId> = msg
             .principal
             .as_deref()

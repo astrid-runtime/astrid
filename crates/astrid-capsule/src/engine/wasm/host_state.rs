@@ -16,6 +16,8 @@ use astrid_core::uplink::{InboundMessage, MAX_UPLINKS_PER_CAPSULE, UplinkDescrip
 use astrid_storage::ScopedKvStore;
 use astrid_storage::secret::SecretStore;
 
+pub use crate::engine::wasm::host_state_types::LifecyclePhase;
+
 /// An active network stream owned by a capsule.
 ///
 /// Holds either an inbound host-local connection (accepted from the
@@ -63,19 +65,6 @@ pub struct TcpStreamSlot {
 pub struct SharedTcpListener {
     pub listener: Arc<tokio::net::TcpListener>,
     pub holders: std::sync::atomic::AtomicUsize,
-}
-
-/// The lifecycle phase a capsule is currently executing in.
-///
-/// Set on [`HostState`] during `#[install]` or `#[upgrade]` dispatch.
-/// The `astrid_elicit` host function checks this field and rejects calls
-/// outside of a lifecycle phase.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LifecyclePhase {
-    /// First-time installation.
-    Install,
-    /// Upgrading from a previous version.
-    Upgrade,
 }
 
 /// Metadata for an interceptor binding declared in `Capsule.toml`.
@@ -263,6 +252,11 @@ pub struct HostState {
     /// Attribution only; not a live authority grant. Crate-private so a
     /// downstream crate cannot install or replay a cloned stamp.
     pub(crate) stamped_invocation: Option<crate::stamp::StampedInvocation>,
+    /// Invocation-scoped authorities for the crate-private SemanticObject fixture.
+    ///
+    /// This is deliberately independent of WASI files, streams, HTTP, sockets,
+    /// processes, and every guest-visible resource-table entry.
+    pub(crate) semantic_authorities: super::host_state_authority::HostStateSemanticAuthorities,
     /// Explicit kernel-service scope. When false, every long-lived IPC route
     /// is restricted to `principal`; default-principal is still a principal.
     pub system_runtime: bool,
