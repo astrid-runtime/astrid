@@ -1,0 +1,151 @@
+name: CI toolchain image
+
+on:
+  pull_request:
+    paths:
+      - '.dockerignore'
+      - '.github/workflows/ci-image.yml'
+      - 'container/ci/**'
+      - 'scripts/test_ci_image_contract.py'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: astrid-ci-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: ghcr.io/astrid-runtime/astrid-ci
+
+jobs:
+  build:
+    name: Build and test exact CI image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+          targets: wasm32-unknown-unknown
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          shared-key: ci-image
+
+      - name: Test CI image contracts
+        run: python3 scripts/test_ci_image_contract.py
+
+      - name: Build exact Astrid binaries
+        run: cargo build --release --locked -p astrid
+
+      - name: Stage CI image payload
+        run: |
+          mkdir -p dist/ci
+          for binary in astrid astrid-build astrid-daemon astrid-emit; do
+            install -m 0755 "target/release/$binary" "dist/ci/$binary"
+          done
+
+      - name: Build CI image from staged binaries
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            --build-arg "ASTRID_SOURCE_COMMIT=$GITHUB_SHA" \
+            --tag astrid-ci:test \
+            --file container/ci/Dockerfile \
+            .
+
+      - name: Test exact CI image
+        run: container/ci/test.sh astrid-ci:test "$GITHUB_SHA"
+
+      - name: Export exact tested image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker image save --output dist/ci/astrid-ci-image.tar astrid-ci:test
+          sha256sum dist/ci/astrid-ci-image.tar > dist/ci/astrid-ci-image.tar.sha256
+          sha256sum --check dist/ci/astrid-ci-image.tar.sha256
+
+      - name: Upload exact tested image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: astrid-ci-image-${{ github.sha }}
+          path: |
+            dist/ci/astrid-ci-image.tar
+            dist/ci/astrid-ci-image.tar.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish exact tested CI image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - name: Download exact tested image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: astrid-ci-image-${{ github.sha }}
+          path: dist/ci
+
+      - name: Verify and load exact tested image
+        run: |
+          sha256sum --check dist/ci/astrid-ci-image.tar.sha256
+          docker image load --input dist/ci/astrid-ci-image.tar
+          test "$(docker image inspect astrid-ci:test --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
+
+      - name: Authenticate to GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Publish immutable source-commit tag
+        id: publish
+        run: |
+          IMAGE_TAG="${IMAGE_NAME}:${GITHUB_SHA}"
+          docker image tag astrid-ci:test "$IMAGE_TAG"
+          docker image push "$IMAGE_TAG"
+          docker image pull "$IMAGE_TAG"
+          BOUND_IMAGE=$(docker image inspect "$IMAGE_TAG" --format '{{index .RepoDigests 0}}')
+          DIGEST=${BOUND_IMAGE##*@}
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$BOUND_IMAGE" = "${IMAGE_NAME}@${DIGEST}"
+          {
+            echo "image=$BOUND_IMAGE"
+            echo "digest=$DIGEST"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Attest published image provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+
+      - name: Record digest for consumers
+        env:
+          PUBLISHED_IMAGE: ${{ steps.publish.outputs.image }}
+        run: printf '%s\n' "\`$PUBLISHED_IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
