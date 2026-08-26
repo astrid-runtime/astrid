@@ -229,8 +229,15 @@ mod tests {
 
     use super::*;
 
+    fn fixture_nonce() -> [u8; 32] {
+        let mut nonce = [0_u8; 32];
+        getrandom::fill(&mut nonce).expect("fixture nonce");
+        nonce
+    }
+
     fn unsigned_claim() -> FirstOwnerClaim {
-        FirstOwnerClaim::from_parts(
+        let nonce = fixture_nonce();
+        let claim = FirstOwnerClaim::from_parts(
             [1; 32],
             [2; 32],
             [3; 32],
@@ -239,11 +246,13 @@ mod tests {
             FleetUid::from_bytes([6; 32]),
             PrincipalUid::from_bytes([7; 32]),
             [8; 32],
-            [9; 32],
+            nonce,
             1,
             [0; 64],
         )
-        .expect("non-zero epoch is valid")
+        .expect("non-zero epoch is valid");
+        assert_eq!(*claim.nonce(), nonce);
+        claim
     }
 
     #[test]

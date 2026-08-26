@@ -33,6 +33,7 @@ async-trait = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }
 dashmap = { workspace = true }
+getrandom = "0.4"
 hex = { workspace = true }
 metrics = { workspace = true }
 parking_lot = { workspace = true }
@@ -53,6 +54,9 @@ tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
 
 # Native-only dependencies: the Wasmtime execution engine, its HTTP/socket/
 # process host functions, the MCP host engine, manifest discovery, and the

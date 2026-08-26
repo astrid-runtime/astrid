@@ -18,6 +18,12 @@ fn at(seconds: i64) -> chrono::DateTime<Utc> {
     Utc.timestamp_opt(seconds, 0).single().unwrap()
 }
 
+fn fixture_nonce() -> [u8; 32] {
+    let mut nonce = [0_u8; 32];
+    getrandom::fill(&mut nonce).expect("fixture nonce");
+    nonce
+}
+
 struct Fixture {
     backend: Arc<MemoryKvStore>,
     store: OwnershipStore,
@@ -114,6 +120,7 @@ fn fixture() -> Fixture {
     ))
     .unwrap()
     .uid;
+    let nonce = fixture_nonce();
     let unsigned = FirstOwnerClaim::from_parts(
         [1; 32],
         [2; 32],
@@ -123,7 +130,7 @@ fn fixture() -> Fixture {
         fleet.uid,
         principal_uid,
         user.genesis.initial_public_key,
-        [5; 32],
+        nonce,
         1,
         [0; 64],
     )
@@ -142,6 +149,7 @@ fn fixture() -> Fixture {
         signing_key.sign(&unsigned.canonical_message()).to_bytes(),
     )
     .unwrap();
+    assert_eq!(*claim.nonce(), nonce);
     principals
         .register(
             astrid_core::PrincipalId::new("root").unwrap(),
@@ -737,6 +745,7 @@ async fn post_enrollment_transfer_preserves_claim_counters_and_rejects_new_owner
         other_user.uid,
     ))
     .unwrap();
+    let nonce = fixture_nonce();
     let unsigned = FirstOwnerClaim::from_parts(
         *fixture.claim.machine_context(),
         *fixture.claim.boot_context(),
@@ -746,7 +755,7 @@ async fn post_enrollment_transfer_preserves_claim_counters_and_rejects_new_owner
         other_fleet.uid,
         fixture.claim.principal_uid(),
         other_key.verifying_key().to_bytes(),
-        [99; 32],
+        nonce,
         fixture.claim.authority_epoch().get(),
         [0; 64],
     )
@@ -765,6 +774,7 @@ async fn post_enrollment_transfer_preserves_claim_counters_and_rejects_new_owner
         other_key.sign(&unsigned.canonical_message()).to_bytes(),
     )
     .unwrap();
+    assert_eq!(*other_claim.nonce(), nonce);
     assert!(matches!(
         fixture.store.begin_first_owner(other_claim).await,
         Err(OwnershipError::FirstOwner(FirstOwnerError::AlreadyEnrolled))

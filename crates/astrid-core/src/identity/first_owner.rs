@@ -372,11 +372,16 @@ impl FirstOwnerClaim {
 mod tests {
     use chrono::TimeZone;
     use ed25519_dalek::{Signer, SigningKey};
-    use hex::encode;
     use uuid::Uuid;
 
     use super::*;
     use crate::{FleetGenesis, PrincipalGenesis, PrincipalIdentity, UserGenesis, UserIdentity};
+
+    fn fixture_nonce() -> [u8; 32] {
+        let mut nonce = [0_u8; 32];
+        getrandom::fill(&mut nonce).expect("fixture nonce");
+        nonce
+    }
 
     fn claim() -> FirstOwnerClaim {
         let key = SigningKey::from_bytes(&[7; 32]);
@@ -407,6 +412,7 @@ mod tests {
             [9; 32],
         ))
         .unwrap();
+        let nonce = fixture_nonce();
         let unsigned = FirstOwnerClaim::from_parts_with_authority(
             [1; 32],
             [2; 32],
@@ -416,14 +422,14 @@ mod tests {
             fleet.uid,
             principal.uid,
             key.verifying_key().to_bytes(),
-            [5; 32],
+            nonce,
             1,
             1_800_000_000,
             1,
             [0; 64],
         )
         .unwrap();
-        FirstOwnerClaim::from_parts_with_authority(
+        let claim = FirstOwnerClaim::from_parts_with_authority(
             *unsigned.machine_context(),
             *unsigned.boot_context(),
             *unsigned.kernel_identity(),
@@ -438,7 +444,9 @@ mod tests {
             unsigned.authority_epoch().get(),
             key.sign(&unsigned.canonical_message()).to_bytes(),
         )
-        .unwrap()
+        .unwrap();
+        assert_eq!(*claim.nonce(), nonce);
+        claim
     }
 
     #[test]
@@ -451,10 +459,7 @@ mod tests {
         assert_eq!(message[325..333], [1, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(message[333..341], 1_800_000_000_u64.to_le_bytes());
         assert_eq!(message[341..349], [1, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(
-            encode(claim.canonical_digest()),
-            "098711ebbf8804c59ccb8789bbe98592b839ff4144e507d7dd5e626e41c04932"
-        );
+        assert_eq!(claim.canonical_digest(), *blake3::hash(&message).as_bytes());
     }
 
     #[test]
@@ -535,6 +540,7 @@ mod tests {
 
     #[test]
     fn maximum_epoch_is_encoded_without_wrapping() {
+        let nonce = fixture_nonce();
         let claim = FirstOwnerClaim::from_parts_with_authority(
             [1; 32],
             [2; 32],
@@ -544,13 +550,14 @@ mod tests {
             FleetUid::from_bytes([6; 32]),
             PrincipalUid::from_bytes([7; 32]),
             [8; 32],
-            [9; 32],
+            nonce,
             u64::MAX,
             u64::MAX,
             u64::MAX,
             [0; 64],
         )
         .unwrap();
+        assert_eq!(*claim.nonce(), nonce);
         assert_eq!(claim.authority_epoch().get(), u64::MAX);
         assert_eq!(&claim.canonical_message()[325..333], &[0xff; 8]);
     }

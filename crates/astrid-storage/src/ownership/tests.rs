@@ -124,6 +124,12 @@ fn at(seconds: i64) -> chrono::DateTime<Utc> {
     Utc.timestamp_opt(seconds, 0).single().unwrap()
 }
 
+fn fixture_nonce() -> [u8; 32] {
+    let mut nonce = [0_u8; 32];
+    getrandom::fill(&mut nonce).expect("fixture nonce");
+    nonce
+}
+
 fn user(id: u128, key: u8) -> UserIdentity {
     UserIdentity::from_genesis(UserGenesis::from_parts(
         Uuid::from_u128(id),
@@ -170,6 +176,7 @@ async fn enroll_store(store: &OwnershipStore, principals: &PrincipalDirectory) {
     let bootstrap_fleet = fleet(0xbeef, bootstrap_user.uid);
     let bootstrap_principal = principal(0xcafe, 92);
     admit_principal(principals, "bootstrap-principal", bootstrap_principal);
+    let nonce = fixture_nonce();
     let unsigned = FirstOwnerClaim::from_parts(
         [41; 32],
         [42; 32],
@@ -179,7 +186,7 @@ async fn enroll_store(store: &OwnershipStore, principals: &PrincipalDirectory) {
         bootstrap_fleet.uid,
         bootstrap_principal,
         key.verifying_key().to_bytes(),
-        [45; 32],
+        nonce,
         1,
         [0; 64],
     )
@@ -198,6 +205,7 @@ async fn enroll_store(store: &OwnershipStore, principals: &PrincipalDirectory) {
         key.sign(&unsigned.canonical_message()).to_bytes(),
     )
     .unwrap();
+    assert_eq!(*claim.nonce(), nonce);
     store.begin_first_owner(claim).await.unwrap();
     store
         .commit_first_owner(claim, bootstrap_user, bootstrap_fleet)

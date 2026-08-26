@@ -87,7 +87,8 @@ async fn enroll_fixture_owner(
     let boot_context = [22; 32];
     let kernel_identity = [23; 32];
     let system_generation = [24; 32];
-    let nonce = [25; 32];
+    let mut nonce = [0_u8; 32];
+    getrandom::fill(&mut nonce).expect("fixture nonce");
     let unsigned = FirstOwnerClaim::from_parts(
         machine_context,
         boot_context,
@@ -116,6 +117,7 @@ async fn enroll_fixture_owner(
         *signing_key.sign(&unsigned.canonical_message()).as_bytes(),
     )
     .expect("signed fixture claim");
+    assert_eq!(*claim.nonce(), nonce);
     ownership
         .begin_first_owner(claim)
         .await

@@ -38,7 +38,8 @@ pub(crate) async fn enroll_test_first_owner(
     let boot_context = [12; 32];
     let kernel_identity = [13; 32];
     let system_generation = [14; 32];
-    let nonce = [15; 32];
+    let mut nonce = [0_u8; 32];
+    getrandom::fill(&mut nonce).expect("test first-owner: nonce");
     let unsigned = FirstOwnerClaim::from_parts(
         machine_context,
         boot_context,
@@ -67,6 +68,7 @@ pub(crate) async fn enroll_test_first_owner(
         *signing_key.sign(&unsigned.canonical_message()).as_bytes(),
     )
     .expect("test first-owner: signed claim");
+    assert_eq!(*claim.nonce(), nonce);
     let context = AuthenticatedBootContext::from_provenance(
         BootContextProvenance::AuthenticatedHandoff,
         machine_context,
