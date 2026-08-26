@@ -284,6 +284,18 @@ fn command_file_name(token: &str) -> &str {
         .unwrap_or(token)
 }
 
+fn is_env_assignment(token: &str) -> bool {
+    let Some((name, _value)) = token.split_once('=') else {
+        return false;
+    };
+    let mut characters = name.bytes();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    (first == b'_' || first.is_ascii_alphabetic())
+        && characters.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+}
+
 fn is_python_frame(command: &str) -> bool {
     command.contains("aos-mcp-frame")
         || command.contains("Python.framework")
@@ -314,12 +326,29 @@ fn is_mcp_attach(command: &str) -> bool {
     let Some(attach_index) = tokens.windows(2).position(|pair| pair == ["mcp", "attach"]) else {
         return false;
     };
-    // Only the executable/wrapper prefix can establish Astrid identity. A
-    // basename after `mcp attach` is commonly a workspace or script argument
-    // and must not make an unrelated process reapable.
-    tokens[..attach_index]
-        .iter()
-        .any(|token| matches!(command_file_name(token), "astrid" | "aos"))
+    // Only argv[0] (or an explicit `env VAR=value ...` wrapper) can establish
+    // Astrid identity. A basename later in the command is commonly a script,
+    // workspace, or argument and must not make an unrelated process reapable.
+    let prefix = &tokens[..attach_index];
+    let Some(executable) = prefix.first() else {
+        return false;
+    };
+    if matches!(command_file_name(executable), "astrid" | "aos") {
+        return true;
+    }
+    if command_file_name(executable) != "env" {
+        return false;
+    }
+    let mut index = 1;
+    while prefix
+        .get(index)
+        .is_some_and(|token| is_env_assignment(token))
+    {
+        index = index.saturating_add(1);
+    }
+    prefix
+        .get(index)
+        .is_some_and(|token| matches!(command_file_name(token), "astrid" | "aos"))
 }
 
 fn is_reapable_mcp(command: &str) -> bool {
@@ -415,6 +444,10 @@ mod tests {
         ));
         assert!(!is_mcp_attach(
             "node worker.js mcp attach --workspace /tmp/astrid"
+        ));
+        assert!(!is_mcp_attach("node /tmp/astrid worker.js mcp attach"));
+        assert!(is_mcp_attach(
+            "env ASTRID_SESSION_ID=thread-1 /opt/aos mcp attach --workspace /tmp/proj"
         ));
         assert!(!is_mcp_attach("astrid --principal codex-code mcp gateway"));
         assert!(!is_mcp_attach("aos mcp serve --request-timeout 1d5m"));

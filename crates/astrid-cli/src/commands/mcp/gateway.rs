@@ -71,6 +71,48 @@ struct GatewayState {
     initialize: Mutex<()>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static FINISH_SLOT_PROBE: std::cell::RefCell<Option<Arc<StdMutex<Option<bool>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct FinishSlotProbeGuard;
+
+#[cfg(test)]
+fn register_finish_slot_probe(result: Arc<StdMutex<Option<bool>>>) -> FinishSlotProbeGuard {
+    FINISH_SLOT_PROBE.with(|probe| {
+        assert!(
+            probe.replace(Some(result)).is_none(),
+            "finish-slot probe already set"
+        );
+    });
+    FinishSlotProbeGuard
+}
+
+#[cfg(test)]
+impl Drop for FinishSlotProbeGuard {
+    fn drop(&mut self) {
+        FINISH_SLOT_PROBE.with(|probe| {
+            probe.borrow_mut().take();
+        });
+    }
+}
+
+#[cfg(test)]
+fn probe_finish_slot(semaphore: &Semaphore) {
+    FINISH_SLOT_PROBE.with(|probe| {
+        let Some(result) = probe.borrow().clone() else {
+            return;
+        };
+        let available = semaphore.try_acquire().is_ok();
+        if let Ok(mut observed) = result.lock() {
+            *observed = Some(available);
+        }
+    });
+}
+
 impl GatewayState {
     fn new(daemon_root: PathBuf, principal: astrid_core::PrincipalId, hook_token: String) -> Self {
         Self {
@@ -238,7 +280,11 @@ impl GatewayState {
         done: Arc<Notify>,
     ) {
         self.take_slot_if(host_session_id, id).await;
+        #[cfg(test)]
+        let semaphore = self.semaphore_for(self.principal.as_ref()).await;
         drop(permit);
+        #[cfg(test)]
+        probe_finish_slot(&semaphore);
         done.notify_waiters();
     }
 }
@@ -811,7 +857,7 @@ mod tests {
 
     #[tokio::test]
     async fn finish_slot_releases_cap_before_notifying_waiters() {
-        use std::sync::Arc;
+        use std::sync::{Arc, Mutex as StdMutex};
 
         use tokio::sync::Notify;
         use tokio::time::{Duration, timeout};
@@ -823,6 +869,8 @@ mod tests {
             principal,
             "gateway-token".into(),
         ));
+        let observed = Arc::new(StdMutex::new(None));
+        let _probe = super::register_finish_slot_probe(Arc::clone(&observed));
         let finishing = state.acquire("codex-code").await.expect("permit");
         let mut occupied = Vec::with_capacity(MAX_ATTACHES - 1);
         for _ in 0..MAX_ATTACHES - 1 {
@@ -839,6 +887,11 @@ mod tests {
         state
             .finish_slot("thread-1", Uuid::new_v4(), finishing, done)
             .await;
+        assert_eq!(
+            *observed.lock().expect("finish-slot probe mutex"),
+            Some(true),
+            "permit must be available at the notification boundary"
+        );
         let permit = timeout(Duration::from_secs(1), waiter)
             .await
             .expect("waiter must wake")
