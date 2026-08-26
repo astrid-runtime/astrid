@@ -30,6 +30,7 @@ concurrency:
 
 env:
   IMAGE_NAME: ghcr.io/astrid-runtime/astrid-ci
+  BUILD_IMAGE: docker.io/library/rust:1.95.0-bookworm@sha256:4c2fd73ef19c5ef9d54bee03b06b2839a392604fbfcd578ed948b71b37c1d7fb
   RUST_VERSION: 1.95.0
   IMAGE_VARIANT: bookworm
 
@@ -168,7 +169,7 @@ jobs:
       - name: Restore Rust build cache
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
-          shared-key: ci-image
+          shared-key: ci-image-bookworm-amd64
           workspaces: .ci-source -> .ci-source/target
 
       - name: Test CI image contracts
@@ -176,12 +177,19 @@ jobs:
 
       - name: Build exact Astrid binaries
         run: |
-          cargo build \
-            --manifest-path .ci-source/Cargo.toml \
-            --target-dir .ci-source/target \
-            --release \
-            --locked \
-            -p astrid
+          docker run --rm \
+            --platform linux/amd64 \
+            --env CARGO_INCREMENTAL=0 \
+            --env CARGO_TERM_COLOR=always \
+            --env HOST_GID="$(id -g)" \
+            --env HOST_UID="$(id -u)" \
+            --volume "$PWD:/workspace" \
+            --workdir /workspace/.ci-source \
+            "$BUILD_IMAGE" \
+            bash -euc '
+              cargo build --target-dir target --release --locked -p astrid
+              chown -R "$HOST_UID:$HOST_GID" target
+            '
 
       - name: Stage CI image payload
         run: |

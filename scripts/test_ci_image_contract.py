@@ -58,7 +58,15 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("Check out the image definition", WORKFLOW)
         self.assertIn("Check out exact Astrid release source", WORKFLOW)
         self.assertIn("path: .ci-source", WORKFLOW)
-        self.assertIn("--manifest-path .ci-source/Cargo.toml", WORKFLOW)
+        self.assertIn("--workdir /workspace/.ci-source", WORKFLOW)
+
+    def test_binaries_are_built_inside_the_exact_runtime_base(self) -> None:
+        base = DOCKERFILE.splitlines()[0].removeprefix("FROM ")
+        self.assertIn(f"BUILD_IMAGE: docker.io/library/{base}", WORKFLOW)
+        self.assertIn('"$BUILD_IMAGE"', WORKFLOW)
+        self.assertIn("--workdir /workspace/.ci-source", WORKFLOW)
+        self.assertIn("cargo build --target-dir target --release --locked -p astrid", WORKFLOW)
+        self.assertIn("shared-key: ci-image-bookworm-amd64", WORKFLOW)
 
     def test_publishes_exact_version_variant_and_source_tags(self) -> None:
         self.assertIn('CANONICAL_TAG="${IMAGE_NAME}:sha-${SOURCE_COMMIT}"', WORKFLOW)
