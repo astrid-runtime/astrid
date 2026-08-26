@@ -56,6 +56,18 @@ pub enum ProjectionError {
     NotAnInvocation,
     /// Nested `astrid-resource-types` bytes failed to decode.
     ResourceEncoding,
+    /// An action descriptor carried an impossible zero generation.
+    InvalidActionGeneration,
+    /// An action descriptor's digest did not match the observed action.
+    ActionDigestMismatch,
+    /// An action descriptor's scope did not match the observed scope.
+    ActionScopeMismatch,
+    /// The observed action generation did not match the descriptor.
+    ActionGenerationDrift,
+    /// The descriptor was observed at or after its expiry.
+    ActionExpired,
+    /// The descriptor was presented by a different principal.
+    ActionCrossPrincipal,
 }
 
 impl fmt::Display for ProjectionError {

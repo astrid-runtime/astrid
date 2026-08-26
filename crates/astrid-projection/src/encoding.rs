@@ -24,6 +24,8 @@ pub enum ProjectionTypeTag {
     ProjectionSnapshot = 5,
     /// [`crate::ProjectionUpdate`].
     ProjectionUpdate = 6,
+    /// [`crate::ActionDescriptor`].
+    ActionDescriptor = 7,
 }
 
 impl ProjectionTypeTag {
@@ -43,6 +45,7 @@ impl ProjectionTypeTag {
             4 => Some(Self::PresentationMetadata),
             5 => Some(Self::ProjectionSnapshot),
             6 => Some(Self::ProjectionUpdate),
+            7 => Some(Self::ActionDescriptor),
             _ => None,
         }
     }
@@ -132,6 +135,7 @@ mod tests {
             (ProjectionTypeTag::PresentationMetadata, 4),
             (ProjectionTypeTag::ProjectionSnapshot, 5),
             (ProjectionTypeTag::ProjectionUpdate, 6),
+            (ProjectionTypeTag::ActionDescriptor, 7),
         ];
         for (tag, code) in golden {
             assert_eq!(tag.code(), code);
