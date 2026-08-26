@@ -1,6 +1,7 @@
 //! Host-side combined boot ktest helpers. Ring 0 stays in
-//! `astrid-native-kernel`. Signing stays in `astrid-native-closure` on the
-//! loader path. Trust policy is compiled public keys, not table-chosen keys.
+//! `astrid-native-kernel`; explicit fixture key files are consumed by the
+//! loader path. Root policy and boot-context expectations are never selected
+//! from untrusted table headers.
 
 pub mod determinism;
 pub mod events;

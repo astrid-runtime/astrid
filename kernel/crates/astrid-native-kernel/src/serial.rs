@@ -119,6 +119,12 @@ pub fn ev_idt_ready(vectors: u32) {
     emit(format_args!("\"ev\":\"idt.ready\",\"vectors\":{vectors}"));
 }
 
+pub fn ev_handoff_bound(policy_generation: u64, kernel_image: &str, closure_table: &str) {
+    emit(format_args!(
+        "\"ev\":\"handoff.bound\",\"policy_generation\":{policy_generation},\"kernel_image\":\"{kernel_image}\",\"closure_table\":\"{closure_table}\""
+    ));
+}
+
 pub fn ev_apic_timer_start() {
     emit(format_args!("\"ev\":\"apic.timer.start\""));
 }

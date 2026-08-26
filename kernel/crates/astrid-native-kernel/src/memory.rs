@@ -8,6 +8,7 @@ use core::alloc::Layout;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use astrid_native_closure::{ClosureError, ReadableRange, prove_pages_readable, ranges_overlap};
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use linked_list_allocator::Heap;
 use spin::{Mutex, Once};
@@ -192,11 +193,35 @@ extern "C" fn text_probe() {
 }
 
 /// True if `page` is a canonical address whose leaf is present (readable).
-pub fn page_present_readable(page: u64) -> bool {
+fn page_present_readable(page: u64) -> bool {
     let Ok(addr) = VirtAddr::try_new(page) else {
         return false;
     };
     leaf_flags(addr).is_some_and(|f| f.contains(PageTableFlags::PRESENT))
+}
+
+/// Validate a loader-mapped virtual range before copying its untrusted bytes.
+pub fn prove_readable_range(start: u64, len: u64) -> Result<(), ClosureError> {
+    let range = ReadableRange::try_new(start, len)?;
+    prove_pages_readable(range, page_present_readable)
+}
+
+/// Copy a previously proven loader-mapped range into kernel-owned storage.
+///
+/// # Safety
+/// Call [`prove_readable_range`] for the same range immediately before this
+/// operation, and provide a destination of exactly `len` bytes. The source
+/// must remain readable for the duration of the copy. The checked overlap
+/// guard below is required because the source address is loader input while
+/// the destination is a kernel-owned stack buffer.
+pub unsafe fn copy_readable_range(start: u64, destination: &mut [u8]) -> Result<(), ClosureError> {
+    let len = destination.len() as u64;
+    if ranges_overlap(start, len, destination.as_mut_ptr() as u64, len)? {
+        return Err(ClosureError::Malformed);
+    }
+    let source = unsafe { core::slice::from_raw_parts(start as *const u8, destination.len()) };
+    destination.copy_from_slice(source);
+    Ok(())
 }
 
 fn leaf_flags(addr: VirtAddr) -> Option<PageTableFlags> {

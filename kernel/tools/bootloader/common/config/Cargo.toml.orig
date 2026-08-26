@@ -1,0 +1,10 @@
+[package]
+name = "bootloader-boot-config"
+version.workspace = true
+edition = "2024"
+description = "The runtime configurations that are saved in a JSON file for the bootloader crate"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1.0.152", default-features = false, features = ["derive"] }

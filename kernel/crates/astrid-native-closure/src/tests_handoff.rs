@@ -36,7 +36,7 @@ fn policy(root: &SigningKey) -> RootVerifier {
 }
 
 fn statement(kernel: &SigningKey, sysgen: &SigningKey, context: HandoffContext) -> PolicyHandoff {
-    PolicyHandoff::new(
+    PolicyHandoff::for_signing(
         kernel.verifying_key().to_bytes(),
         sysgen.verifying_key().to_bytes(),
         GenerationFloor::new(4),
@@ -59,12 +59,19 @@ fn signed() -> (RootVerifier, HandoffContext, [u8; HANDOFF_LEN]) {
 fn valid_handoff_binds_keys_floors_generation_and_context() {
     let (root, expected, bytes) = signed();
     let accepted = verify_policy_handoff(&bytes, &root, &expected).expect("valid handoff");
-    assert_eq!(accepted.root_verify, root.root_verify());
-    assert_ne!(accepted.policy.kernel_verify, accepted.policy.sysgen_verify);
-    assert_eq!(accepted.policy.kernel_floor, GenerationFloor::new(4));
-    assert_eq!(accepted.policy.sysgen_floor, GenerationFloor::new(6));
-    assert_eq!(accepted.policy.policy_generation, PolicyGeneration::new(8));
-    assert_eq!(accepted.policy.context, expected);
+    let accepted_policy = accepted.policy();
+    assert_eq!(accepted.root_verify(), root.root_verify());
+    assert_ne!(
+        accepted_policy.kernel_verify(),
+        accepted_policy.sysgen_verify()
+    );
+    assert_eq!(accepted_policy.kernel_floor(), GenerationFloor::new(4));
+    assert_eq!(accepted_policy.sysgen_floor(), GenerationFloor::new(6));
+    assert_eq!(
+        accepted_policy.policy_generation(),
+        PolicyGeneration::new(8)
+    );
+    assert_eq!(accepted_policy.context(), expected);
 }
 
 #[test]
@@ -158,11 +165,11 @@ fn root_signed_handoff_can_rotate_subordinate_keys() {
     let accepted = verify_policy_handoff(&bytes, &policy(&root), &expected)
         .expect("root authorizes rotated subordinate keys");
     assert_eq!(
-        accepted.policy.kernel_verify,
+        accepted.policy().kernel_verify(),
         rotated_kernel.verifying_key().to_bytes()
     );
     assert_eq!(
-        accepted.policy.sysgen_verify,
+        accepted.policy().sysgen_verify(),
         rotated_sysgen.verifying_key().to_bytes()
     );
 }
@@ -191,26 +198,42 @@ fn collapsed_or_stale_independent_floors_are_rejected() {
     let kernel = key(1);
     let sysgen = key(2);
     let expected = context(6);
-    let mut collapsed = statement(&kernel, &sysgen, expected);
-    collapsed.kernel_floor = GenerationFloor::new(4);
-    collapsed.sysgen_floor = GenerationFloor::new(4);
+    let collapsed = PolicyHandoff::for_signing(
+        kernel.verifying_key().to_bytes(),
+        sysgen.verifying_key().to_bytes(),
+        GenerationFloor::new(4),
+        GenerationFloor::new(4),
+        PolicyGeneration::new(8),
+        expected,
+    );
     let bytes = sign_policy_handoff(&root, &collapsed);
     assert_eq!(
         verify_policy_handoff(&bytes, &policy(&root), &expected),
         Err(ClosureError::Stale)
     );
 
-    let mut swapped = statement(&kernel, &sysgen, expected);
-    swapped.kernel_floor = GenerationFloor::new(6);
-    swapped.sysgen_floor = GenerationFloor::new(4);
+    let swapped = PolicyHandoff::for_signing(
+        kernel.verifying_key().to_bytes(),
+        sysgen.verifying_key().to_bytes(),
+        GenerationFloor::new(6),
+        GenerationFloor::new(4),
+        PolicyGeneration::new(8),
+        expected,
+    );
     let bytes = sign_policy_handoff(&root, &swapped);
     assert_eq!(
         verify_policy_handoff(&bytes, &policy(&root), &expected),
         Err(ClosureError::Stale)
     );
 
-    let mut stale = statement(&kernel, &sysgen, expected);
-    stale.policy_generation = PolicyGeneration::new(6);
+    let stale = PolicyHandoff::for_signing(
+        kernel.verifying_key().to_bytes(),
+        sysgen.verifying_key().to_bytes(),
+        GenerationFloor::new(4),
+        GenerationFloor::new(6),
+        PolicyGeneration::new(6),
+        expected,
+    );
     let bytes = sign_policy_handoff(&root, &stale);
     assert_eq!(
         verify_policy_handoff(&bytes, &policy(&root), &expected),

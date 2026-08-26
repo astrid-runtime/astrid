@@ -32,7 +32,7 @@ pub use handoff::{
     HANDOFF_PREFIX_LEN, HANDOFF_SIGNED_LEN, HANDOFF_VERSION, HandoffContext, PolicyHandoff,
 };
 pub use policy::{EMULATOR_KERNEL_VERIFY_KEY, EMULATOR_SYSGEN_VERIFY_KEY, TrustedPolicy};
-pub use region::{ClosureTableRegion, PAGE_SIZE, prove_pages_readable};
+pub use region::{PAGE_SIZE, ReadableRange, prove_pages_readable, ranges_overlap};
 pub use root::RootVerifier;
 pub use types::{
     BootContextBinding, BoundIdentities, CURRENT_FLOOR, ClosureArtifact, ClosureKind,

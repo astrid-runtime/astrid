@@ -18,6 +18,9 @@ pub const KIMAGE_NIGHTLY: &str = "nightly-2026-07-21";
 pub const HOST_TARGET_REL: &str = "target/kimage-host";
 /// Target dir inherited by nested `cargo install -Zbuild-std`.
 pub const NESTED_TARGET_REL: &str = "target/bootloader-nested";
+pub const ROOT_KEY_REL: &str = "tools/kimage/fixtures/root.key.hex";
+pub const KERNEL_KEY_REL: &str = "tools/kimage/fixtures/kernel.key.hex";
+pub const SYSGEN_KEY_REL: &str = "tools/kimage/fixtures/sysgen.key.hex";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KimageInvocation {
@@ -61,6 +64,25 @@ impl KimageInvocation {
         cmd.arg("--");
         cmd.arg(kernel);
         cmd.arg(output);
+        cmd.args([
+            "--root-key",
+            ROOT_KEY_REL,
+            "--kernel-key",
+            KERNEL_KEY_REL,
+            "--sysgen-key",
+            SYSGEN_KEY_REL,
+        ]);
+        cmd
+    }
+
+    pub fn command_with_tampered_handoff(
+        &self,
+        root: &Path,
+        kernel: &Path,
+        output: &Path,
+    ) -> Command {
+        let mut cmd = self.command(root, kernel, output);
+        cmd.arg("--tamper-handoff");
         cmd
     }
 }
@@ -99,6 +121,15 @@ mod tests {
             "missing parent --target-dir: {args:?}"
         );
         assert!(args.contains(&"--locked".to_string()));
+        assert!(args.windows(2).any(|w| w == ["--root-key", ROOT_KEY_REL]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--kernel-key", KERNEL_KEY_REL])
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--sysgen-key", SYSGEN_KEY_REL])
+        );
         let mut saw_nested = false;
         let mut cleared_build_target = false;
         for (key, val) in cmd.get_envs() {
@@ -119,5 +150,17 @@ mod tests {
         }
         assert!(saw_nested, "nested CARGO_TARGET_DIR missing");
         assert!(cleared_build_target, "CARGO_BUILD_TARGET_DIR not cleared");
+        assert!(!args.contains(&"--tamper-handoff".to_string()));
+
+        let tampered = inv.command_with_tampered_handoff(
+            Path::new("/ws"),
+            Path::new("/k.elf"),
+            Path::new("/o.img"),
+        );
+        let tampered_args: Vec<String> = tampered
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(tampered_args.ends_with(&["--tamper-handoff".to_string()]));
     }
 }

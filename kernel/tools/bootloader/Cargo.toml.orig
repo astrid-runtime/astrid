@@ -1,0 +1,112 @@
+[package]
+name = "bootloader"
+description = "An experimental x86_64 bootloader that works on both BIOS and UEFI systems."
+license.workspace = true
+version.workspace = true
+repository.workspace = true
+authors = ["Philipp Oppermann <dev@phil-opp.com>"]
+edition = "2024"
+
+[workspace]
+members = [
+    "api",
+    "common",
+    "common/config",
+    "uefi",
+    "bios/boot_sector",
+    "bios/stage-*",
+    "bios/common",
+    "tests/runner",
+]
+exclude = ["examples/basic", "examples/test_framework", "tests/test_kernels/*"]
+resolver = "3"
+
+[workspace.package]
+# don't forget to update `workspace.dependencies` below
+version = "0.11.16"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rust-osdev/bootloader"
+
+[workspace.dependencies]
+bootloader_api = { version = "0.11.16", path = "api" }
+bootloader-x86_64-common = { version = "0.11.16", path = "common" }
+bootloader-boot-config = { version = "0.11.16", path = "common/config" }
+bootloader-x86_64-bios-common = { version = "0.11.16", path = "bios/common" }
+
+[features]
+default = ["bios", "uefi"]
+bios = ["dep:mbrman"]
+uefi = ["dep:gpt"]
+
+[dependencies]
+anyhow = "1.0.32"
+fatfs = { version = "0.3.4", default-features = false, features = [
+    "std",
+    "alloc",
+] }
+tempfile = "3.27.0"
+mbrman = { version = "0.5.1", optional = true }
+gpt = { version = "3.0.0", optional = true }
+bootloader-boot-config = { workspace = true }
+serde_json = "1.0.91"
+
+[dev-dependencies]
+bootloader_test_runner = { path = "tests/runner" }
+test_kernel_default_settings = { path = "tests/test_kernels/default_settings", artifact = "bin", target = "x86_64-unknown-none" }
+test_kernel_higher_half = { path = "tests/test_kernels/higher_half", artifact = "bin", target = "x86_64-unknown-none" }
+test_kernel_map_phys_mem = { path = "tests/test_kernels/map_phys_mem", artifact = "bin", target = "x86_64-unknown-none" }
+test_kernel_pie = { path = "tests/test_kernels/pie", artifact = "bin", target = "x86_64-unknown-none" }
+test_kernel_ramdisk = { path = "tests/test_kernels/ramdisk", artifact = "bin", target = "x86_64-unknown-none" }
+test_kernel_config_file = { path = "tests/test_kernels/config_file", artifact = "bin", target = "x86_64-unknown-none" }
+test_kernel_min_stack = { path = "tests/test_kernels/min_stack", artifact = "bin", target = "x86_64-unknown-none" }
+test_kernel_lower_memory_free = { path = "tests/test_kernels/lower_memory_free", artifact = "bin", target = "x86_64-unknown-none" }
+test_kernel_write_usable_memory = { path = "tests/test_kernels/write_usable_memory", artifact = "bin", target = "x86_64-unknown-none" }
+test_kernel_fixed_kernel_address = { path = "tests/test_kernels/fixed_kernel_address", artifact = "bin", target = "x86_64-unknown-none" }
+test_kernel_stack_address = { path = "tests/test_kernels/stack_address", artifact = "bin", target = "x86_64-unknown-none" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = false
+debug = true
+overflow-checks = true
+
+# duplicated from `bios/boot_sector/Cargo.toml`
+[profile.stage-1]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = false
+overflow-checks = false
+
+# duplicated from `bios/stage-2/Cargo.toml`
+[profile.stage-2]
+inherits = "release"
+opt-level = "z"
+codegen-units = 1
+debug = false
+overflow-checks = true
+
+# duplicated from `bios/stage-3/Cargo.toml`
+[profile.stage-3]
+inherits = "release"
+debug = true
+overflow-checks = true
+
+# duplicated from `bios/stage-4/Cargo.toml`
+[profile.stage-4]
+inherits = "release"
+debug = true
+overflow-checks = true
+
+[build-dependencies]
+llvm-tools = "0.1.1"
+
+[package.metadata.docs.rs]
+rustc-args = ["--cfg", "docsrs_dummy_build"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs_dummy_build)'] }

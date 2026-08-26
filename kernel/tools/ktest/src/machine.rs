@@ -20,6 +20,7 @@ pub const CPU: &str = "max";
 pub const MEMORY_MIB: u32 = 256;
 pub const SMP: u32 = 1;
 pub const TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
+pub const TAMPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// isa-debug-exit success value 0x10 -> QEMU process exit code (0x10<<1)|1.
 pub const EXPECT_EXIT_CODE: i32 = 33;
 
