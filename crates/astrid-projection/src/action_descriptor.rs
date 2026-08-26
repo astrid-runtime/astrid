@@ -1,11 +1,11 @@
 //! Private, non-authoritative action eligibility descriptors.
 //!
-//! [`ActionDescriptor`] binds an opaque action digest to one projection
-//! revision, scope, principal, generation, and expiry. It is an observation
-//! contract only: it has no handle, lease, issuer, refresh operation, or path
-//! to a live invocation. A caller must supply the current observation context
-//! to [`ActionDescriptor::eligibility`]; presentation labels and metadata are
-//! deliberately absent from that context.
+//! [`ActionDescriptor`] binds a [`SemanticObjectId`], opaque action digest,
+//! projection revision, scope, principal, generation, and expiry. It is an
+//! observation contract only: it has no handle, lease, issuer, refresh
+//! operation, or path to a live invocation. A caller must supply the current
+//! object-bound observation context to [`ActionDescriptor::eligibility`];
+//! presentation labels and metadata are deliberately absent from that context.
 
 use core::fmt;
 use core::num::NonZeroU64;
@@ -14,13 +14,15 @@ use crate::encoding::{
     DescriptorDecode, DescriptorEncode, ProjectionTypeTag, check_header, write_header,
 };
 use crate::error::ProjectionError;
+use crate::object::SemanticObjectId;
 use crate::revision::ProjectionRevision;
+use crate::snapshot::ProjectionSnapshot;
 
 /// Width of an opaque action binding value.
 pub const ACTION_BINDING_BYTES: usize = 32;
 
 /// Exact version-one encoded size of an [`ActionDescriptor`].
-pub const ACTION_DESCRIPTOR_ENCODED_LEN: usize = 126;
+pub const ACTION_DESCRIPTOR_ENCODED_LEN: usize = 164;
 
 macro_rules! opaque_binding {
     ($(#[$meta:meta])* $name:ident, $debug:literal) => {
@@ -160,8 +162,9 @@ impl From<u64> for ActionExpiry {
 /// Every field is required. There is no default context and no method that
 /// derives one from presentation text, so omission or substitution fails
 /// closed at the descriptor boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ActionObservation {
+    object: SemanticObjectId,
     digest: ActionDigest,
     revision: ProjectionRevision,
     scope: ActionScope,
@@ -171,9 +174,11 @@ pub struct ActionObservation {
 }
 
 impl ActionObservation {
-    /// Bind an observation to all descriptor-controlled identity facts.
+    /// Bind an observation to one semantic object and all descriptor-controlled
+    /// identity facts.
     #[must_use]
     pub const fn new(
+        object: SemanticObjectId,
         digest: ActionDigest,
         revision: ProjectionRevision,
         scope: ActionScope,
@@ -182,6 +187,7 @@ impl ActionObservation {
         now: u64,
     ) -> Self {
         Self {
+            object,
             digest,
             revision,
             scope,
@@ -196,13 +202,41 @@ impl ActionObservation {
     #[must_use]
     pub const fn for_principal(
         principal: ActionPrincipal,
+        object: SemanticObjectId,
         digest: ActionDigest,
         revision: ProjectionRevision,
         scope: ActionScope,
         generation: ActionGeneration,
         now: u64,
     ) -> Self {
-        Self::new(digest, revision, scope, generation, principal, now)
+        Self::new(object, digest, revision, scope, generation, principal, now)
+    }
+
+    /// Bind an observation directly to a typed projection snapshot.
+    #[must_use]
+    pub const fn for_snapshot(
+        snapshot: ProjectionSnapshot,
+        digest: ActionDigest,
+        scope: ActionScope,
+        generation: ActionGeneration,
+        principal: ActionPrincipal,
+        now: u64,
+    ) -> Self {
+        Self::new(
+            snapshot.object(),
+            digest,
+            snapshot.revision(),
+            scope,
+            generation,
+            principal,
+            now,
+        )
+    }
+
+    /// Semantic object observed at this projection boundary.
+    #[must_use]
+    pub const fn object(self) -> SemanticObjectId {
+        self.object
     }
 
     /// Digest observed for the action arguments and target.
@@ -242,12 +276,20 @@ impl ActionObservation {
     }
 }
 
+impl fmt::Debug for ActionObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = self;
+        formatter.write_str("ActionObservation")
+    }
+}
+
 /// Publicly inspectable, read-only facts carried by an action descriptor.
 ///
 /// This is a value snapshot, not a minting request. Its fields remain private
 /// and it has no constructor, refresh, or conversion into a live invocation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ActionDescriptorFacts {
+    object: SemanticObjectId,
     digest: ActionDigest,
     revision: ProjectionRevision,
     scope: ActionScope,
@@ -257,6 +299,12 @@ pub struct ActionDescriptorFacts {
 }
 
 impl ActionDescriptorFacts {
+    /// Semantic object bound into this descriptor.
+    #[must_use]
+    pub const fn object(self) -> SemanticObjectId {
+        self.object
+    }
+
     /// Opaque action digest.
     #[must_use]
     pub const fn digest(self) -> ActionDigest {
@@ -294,6 +342,13 @@ impl ActionDescriptorFacts {
     }
 }
 
+impl fmt::Debug for ActionDescriptorFacts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = self;
+        formatter.write_str("ActionDescriptorFacts")
+    }
+}
+
 /// Result of comparing a descriptor with a current observation context.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -312,6 +367,8 @@ pub enum ActionEligibility {
     GenerationDrift = 6,
     /// The observation is at or after expiry.
     Expired = 7,
+    /// The semantic object differs.
+    ObjectMismatch = 8,
 }
 
 /// Immutable, non-authoritative action description.
@@ -321,6 +378,7 @@ pub enum ActionEligibility {
 /// recomputed against the caller-supplied context every time.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ActionDescriptor {
+    object: SemanticObjectId,
     digest: ActionDigest,
     revision: ProjectionRevision,
     scope: ActionScope,
@@ -337,10 +395,11 @@ impl fmt::Debug for ActionDescriptor {
 }
 
 impl ActionDescriptor {
-    /// Bind an action digest to a projection revision, scope, generation,
-    /// expiry, and principal.
+    /// Bind an action digest to one semantic object, projection revision,
+    /// scope, generation, expiry, and principal.
     #[must_use]
     pub const fn new(
+        object: SemanticObjectId,
         digest: ActionDigest,
         revision: ProjectionRevision,
         scope: ActionScope,
@@ -349,6 +408,7 @@ impl ActionDescriptor {
         principal: ActionPrincipal,
     ) -> Self {
         Self {
+            object,
             digest,
             revision,
             scope,
@@ -362,13 +422,43 @@ impl ActionDescriptor {
     #[must_use]
     pub const fn for_principal(
         principal: ActionPrincipal,
+        object: SemanticObjectId,
         digest: ActionDigest,
         revision: ProjectionRevision,
         scope: ActionScope,
         generation: ActionGeneration,
         expiry: ActionExpiry,
     ) -> Self {
-        Self::new(digest, revision, scope, generation, expiry, principal)
+        Self::new(
+            object, digest, revision, scope, generation, expiry, principal,
+        )
+    }
+
+    /// Bind a descriptor directly to a typed projection snapshot.
+    #[must_use]
+    pub const fn for_snapshot(
+        snapshot: ProjectionSnapshot,
+        digest: ActionDigest,
+        scope: ActionScope,
+        generation: ActionGeneration,
+        expiry: ActionExpiry,
+        principal: ActionPrincipal,
+    ) -> Self {
+        Self::new(
+            snapshot.object(),
+            digest,
+            snapshot.revision(),
+            scope,
+            generation,
+            expiry,
+            principal,
+        )
+    }
+
+    /// Semantic object bound into this descriptor.
+    #[must_use]
+    pub const fn object(self) -> SemanticObjectId {
+        self.object
     }
 
     /// Opaque action digest bound into this descriptor.
@@ -411,6 +501,7 @@ impl ActionDescriptor {
     #[must_use]
     pub const fn facts(self) -> ActionDescriptorFacts {
         ActionDescriptorFacts {
+            object: self.object,
             digest: self.digest,
             revision: self.revision,
             scope: self.scope,
@@ -425,6 +516,9 @@ impl ActionDescriptor {
     pub fn eligibility(&self, observation: &ActionObservation) -> ActionEligibility {
         if self.principal != observation.principal {
             return ActionEligibility::CrossPrincipal;
+        }
+        if self.object != observation.object {
+            return ActionEligibility::ObjectMismatch;
         }
         if self.digest != observation.digest {
             return ActionEligibility::DigestMismatch;
@@ -454,12 +548,14 @@ impl ActionDescriptor {
     ///
     /// # Errors
     ///
-    /// Returns a projection error for stale, substituted, expired, or
-    /// cross-principal observations. Presentation values are not consulted.
+    /// Returns a projection error for stale, substituted, expired,
+    /// cross-object, or cross-principal observations. Presentation values are
+    /// not consulted.
     pub fn check(&self, observation: &ActionObservation) -> Result<(), ProjectionError> {
         match self.eligibility(observation) {
             ActionEligibility::Eligible => Ok(()),
             ActionEligibility::CrossPrincipal => Err(ProjectionError::ActionCrossPrincipal),
+            ActionEligibility::ObjectMismatch => Err(ProjectionError::ActionObjectMismatch),
             ActionEligibility::DigestMismatch => Err(ProjectionError::ActionDigestMismatch),
             ActionEligibility::StaleRevision => Err(ProjectionError::StaleRevision {
                 found: self.revision.get(),
@@ -482,12 +578,13 @@ impl DescriptorEncode for ActionDescriptor {
             return Err(ProjectionError::InvalidLength);
         }
         write_header(output, ProjectionTypeTag::ActionDescriptor)?;
-        output[3..35].copy_from_slice(self.digest.as_bytes());
-        self.revision.encode_descriptor(&mut output[35..46])?;
-        output[46..78].copy_from_slice(self.scope.as_bytes());
-        output[78..86].copy_from_slice(&self.generation.get().to_le_bytes());
-        output[86..94].copy_from_slice(&self.expiry.get().to_le_bytes());
-        output[94..126].copy_from_slice(self.principal.as_bytes());
+        self.object.encode_descriptor(&mut output[3..41])?;
+        output[41..73].copy_from_slice(self.digest.as_bytes());
+        self.revision.encode_descriptor(&mut output[73..84])?;
+        output[84..116].copy_from_slice(self.scope.as_bytes());
+        output[116..124].copy_from_slice(&self.generation.get().to_le_bytes());
+        output[124..132].copy_from_slice(&self.expiry.get().to_le_bytes());
+        output[132..164].copy_from_slice(self.principal.as_bytes());
         Ok(())
     }
 }
@@ -499,26 +596,28 @@ impl DescriptorDecode for ActionDescriptor {
         }
         check_header(input, ProjectionTypeTag::ActionDescriptor)?;
 
+        let object = SemanticObjectId::decode_descriptor(&input[3..41])?;
         let mut digest = [0_u8; ACTION_BINDING_BYTES];
-        digest.copy_from_slice(&input[3..35]);
-        let revision = ProjectionRevision::decode_descriptor(&input[35..46])?;
+        digest.copy_from_slice(&input[41..73]);
+        let revision = ProjectionRevision::decode_descriptor(&input[73..84])?;
         let mut scope = [0_u8; ACTION_BINDING_BYTES];
-        scope.copy_from_slice(&input[46..78]);
+        scope.copy_from_slice(&input[84..116]);
         let generation_raw = u64::from_le_bytes(
-            input[78..86]
+            input[116..124]
                 .try_into()
                 .map_err(|_| ProjectionError::InvalidLength)?,
         );
         let generation = ActionGeneration::from_raw(generation_raw)
             .ok_or(ProjectionError::InvalidActionGeneration)?;
         let expiry = ActionExpiry::from_raw(u64::from_le_bytes(
-            input[86..94]
+            input[124..132]
                 .try_into()
                 .map_err(|_| ProjectionError::InvalidLength)?,
         ));
         let mut principal = [0_u8; ACTION_BINDING_BYTES];
-        principal.copy_from_slice(&input[94..126]);
+        principal.copy_from_slice(&input[132..164]);
         Ok(Self::new(
+            object,
             ActionDigest::from_bytes(digest),
             revision,
             ActionScope::from_bytes(scope),
@@ -530,260 +629,5 @@ impl DescriptorDecode for ActionDescriptor {
 }
 
 #[cfg(test)]
-mod tests {
-    extern crate alloc;
-
-    use super::*;
-    use crate::presentation::{PresentationLabel, PresentationMetadata};
-    use crate::snapshot::ProjectionSnapshot;
-    use alloc::string::ToString;
-    use astrid_resource_types::{ResourceId, ResourceTypeId};
-
-    fn descriptor() -> ActionDescriptor {
-        ActionDescriptor::new(
-            ActionDigest::from_bytes([0x11; ACTION_BINDING_BYTES]),
-            ProjectionRevision::from_raw(7).unwrap(),
-            ActionScope::from_bytes([0x22; ACTION_BINDING_BYTES]),
-            ActionGeneration::from_raw(3).unwrap(),
-            ActionExpiry::from_raw(100),
-            ActionPrincipal::from_bytes([0x33; ACTION_BINDING_BYTES]),
-        )
-    }
-
-    fn observation() -> ActionObservation {
-        ActionObservation::new(
-            ActionDigest::from_bytes([0x11; ACTION_BINDING_BYTES]),
-            ProjectionRevision::from_raw(7).unwrap(),
-            ActionScope::from_bytes([0x22; ACTION_BINDING_BYTES]),
-            ActionGeneration::from_raw(3).unwrap(),
-            ActionPrincipal::from_bytes([0x33; ACTION_BINDING_BYTES]),
-            99,
-        )
-    }
-
-    fn snapshot(label: &[u8], metadata: &PresentationMetadata) -> ProjectionSnapshot {
-        ProjectionSnapshot::new(
-            crate::SemanticObjectId::for_resource(ResourceId::from_bytes([0x44; 32])),
-            ResourceTypeId::from_bytes([0x55; 32]),
-            ProjectionRevision::from_raw(7).unwrap(),
-            PresentationLabel::from_utf8(label).unwrap(),
-            *metadata,
-        )
-    }
-
-    #[test]
-    fn descriptor_roundtrip_is_fixed_and_debug_is_opaque() {
-        let descriptor = descriptor();
-        let mut encoded = [0_u8; ACTION_DESCRIPTOR_ENCODED_LEN];
-        assert_eq!(descriptor.encoded_len(), ACTION_DESCRIPTOR_ENCODED_LEN);
-        descriptor.encode_descriptor(&mut encoded).unwrap();
-        assert_eq!(
-            ActionDescriptor::decode_descriptor(&encoded),
-            Ok(descriptor)
-        );
-        assert_eq!(
-            format_args!("{descriptor:?}").to_string(),
-            "ActionDescriptor"
-        );
-        assert_eq!(
-            ActionDescriptor::decode_descriptor(&encoded[..125]),
-            Err(ProjectionError::InvalidLength)
-        );
-        encoded[78..86].fill(0);
-        assert_eq!(
-            ActionDescriptor::decode_descriptor(&encoded),
-            Err(ProjectionError::InvalidActionGeneration)
-        );
-    }
-
-    #[test]
-    fn descriptor_rejects_stale_expired_drift_and_cross_principal_observations() {
-        let descriptor = descriptor();
-        let honest = observation();
-        assert_eq!(descriptor.eligibility(&honest), ActionEligibility::Eligible);
-        assert!(descriptor.is_eligible(&honest));
-        assert_eq!(descriptor.check(&honest), Ok(()));
-
-        let digest = ActionObservation::new(
-            ActionDigest::from_bytes([0xee; ACTION_BINDING_BYTES]),
-            honest.revision(),
-            honest.scope(),
-            honest.generation(),
-            honest.principal(),
-            honest.now(),
-        );
-        assert_eq!(
-            descriptor.check(&digest),
-            Err(ProjectionError::ActionDigestMismatch)
-        );
-
-        let stale = ActionObservation::new(
-            honest.digest(),
-            ProjectionRevision::from_raw(8).unwrap(),
-            honest.scope(),
-            honest.generation(),
-            honest.principal(),
-            honest.now(),
-        );
-        assert_eq!(
-            descriptor.eligibility(&stale),
-            ActionEligibility::StaleRevision
-        );
-        assert_eq!(
-            descriptor.check(&stale),
-            Err(ProjectionError::StaleRevision {
-                found: 7,
-                requested: 8,
-            })
-        );
-
-        let scope = ActionObservation::new(
-            honest.digest(),
-            honest.revision(),
-            ActionScope::from_bytes([0xef; ACTION_BINDING_BYTES]),
-            honest.generation(),
-            honest.principal(),
-            honest.now(),
-        );
-        assert_eq!(
-            descriptor.check(&scope),
-            Err(ProjectionError::ActionScopeMismatch)
-        );
-
-        let generation = ActionObservation::new(
-            honest.digest(),
-            honest.revision(),
-            honest.scope(),
-            ActionGeneration::from_raw(4).unwrap(),
-            honest.principal(),
-            honest.now(),
-        );
-        assert_eq!(
-            descriptor.check(&generation),
-            Err(ProjectionError::ActionGenerationDrift)
-        );
-
-        let principal = ActionObservation::new(
-            honest.digest(),
-            honest.revision(),
-            honest.scope(),
-            honest.generation(),
-            ActionPrincipal::from_bytes([0xaa; ACTION_BINDING_BYTES]),
-            honest.now(),
-        );
-        assert_eq!(
-            descriptor.check(&principal),
-            Err(ProjectionError::ActionCrossPrincipal)
-        );
-
-        let expired = ActionObservation::new(
-            honest.digest(),
-            honest.revision(),
-            honest.scope(),
-            honest.generation(),
-            honest.principal(),
-            100,
-        );
-        assert_eq!(
-            descriptor.check(&expired),
-            Err(ProjectionError::ActionExpired)
-        );
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    struct PresenterResult {
-        eligible: bool,
-        label: PresentationLabel,
-        metadata: PresentationMetadata,
-        facts: ActionDescriptorFacts,
-    }
-
-    // This consumer is presentation-shaped: it carries labels and metadata,
-    // and treats descriptor eligibility as an opaque boolean decision.
-    fn presenter_consumer(
-        snapshot: &ProjectionSnapshot,
-        descriptor: &ActionDescriptor,
-        observation: &ActionObservation,
-    ) -> PresenterResult {
-        PresenterResult {
-            eligible: descriptor.is_eligible(observation),
-            label: snapshot.label(),
-            metadata: snapshot.metadata(),
-            facts: descriptor.facts(),
-        }
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    struct EligibilityResult {
-        eligible: bool,
-        facts: ActionDescriptorFacts,
-    }
-
-    // This consumer is structurally different: it reads each bound fact and
-    // derives eligibility without consulting presentation values.
-    fn eligibility_consumer(
-        descriptor: &ActionDescriptor,
-        observation: &ActionObservation,
-    ) -> EligibilityResult {
-        let facts = descriptor.facts();
-        let eligible = facts.principal() == observation.principal()
-            && facts.digest() == observation.digest()
-            && facts.revision() == observation.revision()
-            && facts.scope() == observation.scope()
-            && facts.generation() == observation.generation()
-            && !facts.expiry().is_expired_at(observation.now());
-        EligibilityResult { eligible, facts }
-    }
-
-    #[test]
-    fn independent_consumers_agree_and_presentation_cannot_mint_or_widen() {
-        let descriptor = descriptor();
-        let observation = observation();
-        let plain = snapshot(b"safe", &PresentationMetadata::EMPTY);
-        let hostile_metadata = PresentationMetadata::try_from_pairs(&[
-            ("action_handle", "forged"),
-            ("invoke", "true"),
-            ("rights", "root"),
-        ])
-        .unwrap();
-        let hostile = snapshot(b"ADMIN GRANT", &hostile_metadata);
-
-        let first = presenter_consumer(&plain, &descriptor, &observation);
-        let second = eligibility_consumer(&descriptor, &observation);
-        assert!(first.eligible);
-        assert_eq!(first.eligible, second.eligible);
-        assert_eq!(first.facts, second.facts);
-
-        // A malicious presentation changes only display fields; eligibility
-        // and all descriptor facts remain exactly those of the bound action.
-        let hostile_result = presenter_consumer(&hostile, &descriptor, &observation);
-        assert!(hostile_result.eligible);
-        assert_eq!(hostile_result.facts, first.facts);
-        assert_eq!(hostile_result.label.as_str(), "ADMIN GRANT");
-        assert!(
-            hostile_result
-                .metadata
-                .iter()
-                .any(|(key, value)| key == "action_handle" && value == "forged")
-        );
-
-        // A copied descriptor cannot refresh itself after the projection moves
-        // to a new revision; replay fails against the new observation.
-        let replayed = descriptor;
-        let moved = ActionObservation::new(
-            observation.digest(),
-            observation.revision().checked_next().unwrap(),
-            observation.scope(),
-            observation.generation(),
-            observation.principal(),
-            observation.now(),
-        );
-        assert_eq!(
-            replayed.check(&moved),
-            Err(ProjectionError::StaleRevision {
-                found: 7,
-                requested: 8,
-            })
-        );
-    }
-}
+#[path = "action_descriptor_tests.rs"]
+mod tests;

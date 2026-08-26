@@ -68,6 +68,8 @@ pub enum ProjectionError {
     ActionExpired,
     /// The descriptor was presented by a different principal.
     ActionCrossPrincipal,
+    /// The descriptor and observation named different semantic objects.
+    ActionObjectMismatch,
 }
 
 impl fmt::Display for ProjectionError {
