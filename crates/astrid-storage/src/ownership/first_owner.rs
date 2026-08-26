@@ -230,7 +230,8 @@ impl super::OwnershipStore {
         &self,
         claim: FirstOwnerClaim,
     ) -> Result<FirstOwnerEnrollment, OwnershipError> {
-        self.begin_first_owner_at(claim, now_unix_seconds()).await
+        self.begin_first_owner_with_clock(&claim, now_unix_seconds)
+            .await
     }
 
     /// Begin first-owner enrollment at an explicit timestamp for deterministic
@@ -245,11 +246,17 @@ impl super::OwnershipStore {
         claim: FirstOwnerClaim,
         now: u64,
     ) -> Result<FirstOwnerEnrollment, OwnershipError> {
+        self.begin_first_owner_with_clock(&claim, move || now).await
+    }
+
+    pub(super) async fn begin_first_owner_with_clock(
+        &self,
+        claim: &FirstOwnerClaim,
+        now: impl Fn() -> u64 + Send + Sync,
+    ) -> Result<FirstOwnerEnrollment, OwnershipError> {
         claim.verify_signature().map_err(FirstOwnerError::from)?;
-        if claim.is_expired_at(now) {
-            return Err(FirstOwnerError::Expired.into());
-        }
-        self.mutate(|graph| {
+        let claim = *claim;
+        self.mutate(move |graph| {
             let state = graph.first_owner_state();
             match state {
                 FirstOwnerEnrollment::Unenrolled | FirstOwnerEnrollment::Cancelled { .. } => {
@@ -258,10 +265,23 @@ impl super::OwnershipStore {
                     {
                         return Err(FirstOwnerError::StaleClaim.into());
                     }
+                    // Read the clock only after the mutation lock has been
+                    // acquired and the current graph has been decoded. A
+                    // request that waited past its finite expiry must never
+                    // become durable Pending.
+                    if claim.is_expired_at(now()) {
+                        return Err(FirstOwnerError::Expired.into());
+                    }
                     graph.set_first_owner_state(&FirstOwnerEnrollment::Pending { claim });
                     Ok(graph.first_owner_state())
                 },
-                FirstOwnerEnrollment::Pending { claim: existing } if existing == claim => Ok(state),
+                FirstOwnerEnrollment::Pending { claim: existing } if existing == claim => {
+                    if claim.is_expired_at(now()) {
+                        Err(FirstOwnerError::Expired.into())
+                    } else {
+                        Ok(state)
+                    }
+                },
                 FirstOwnerEnrollment::Pending { .. } => Err(FirstOwnerError::Replay.into()),
                 FirstOwnerEnrollment::Enrolled { claim: existing } if existing == claim => {
                     Ok(state)
@@ -352,10 +372,19 @@ impl super::OwnershipStore {
         user: UserIdentity,
         fleet: FleetIdentity,
     ) -> Result<FirstOwnerEnrollment, OwnershipError> {
+        self.commit_first_owner_with_clock(&claim, user, fleet, now_unix_seconds)
+            .await
+    }
+
+    pub(super) async fn commit_first_owner_with_clock(
+        &self,
+        claim: &FirstOwnerClaim,
+        user: UserIdentity,
+        fleet: FleetIdentity,
+        now: impl Fn() -> u64 + Send + Sync,
+    ) -> Result<FirstOwnerEnrollment, OwnershipError> {
         claim.verify_signature().map_err(FirstOwnerError::from)?;
-        if claim.is_expired_at(now_unix_seconds()) {
-            return Err(FirstOwnerError::Expired.into());
-        }
+        let claim = *claim;
         user.validate()?;
         fleet.validate()?;
         if user.uid != claim.user_uid()
@@ -367,8 +396,8 @@ impl super::OwnershipStore {
             return Err(FirstOwnerError::IdentityMismatch("fleet").into());
         }
         let principals = &self.principals;
-        self.mutate(|graph| {
-            Self::apply_first_owner_commit(principals, graph, &claim, &user, &fleet)
+        self.mutate(move |graph| {
+            Self::apply_first_owner_commit(principals, graph, &claim, &user, &fleet, &now)
         })
         .await
     }
@@ -379,6 +408,7 @@ impl super::OwnershipStore {
         claim: &FirstOwnerClaim,
         user: &UserIdentity,
         fleet: &FleetIdentity,
+        now: &dyn Fn() -> u64,
     ) -> Result<FirstOwnerEnrollment, OwnershipError> {
         match graph.first_owner_state() {
             FirstOwnerEnrollment::Pending { claim: existing } if existing == *claim => {},
@@ -447,6 +477,14 @@ impl super::OwnershipStore {
             graph
                 .principal_ownership
                 .insert(claim.principal_uid(), ownership);
+        }
+        // This is deliberately the final decision immediately before the
+        // Enrolled state and its graph edges can be published by the CAS. The
+        // closure has already acquired the mutation lock and decoded the
+        // current Pending graph, so expiry cannot be checked against a stale
+        // pre-lock timestamp.
+        if claim.is_expired_at(now()) {
+            return Err(FirstOwnerError::Expired.into());
         }
         graph.set_first_owner_state(&FirstOwnerEnrollment::Enrolled { claim: *claim });
         Ok(graph.first_owner_state())

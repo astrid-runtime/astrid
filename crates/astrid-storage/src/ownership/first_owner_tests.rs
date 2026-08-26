@@ -1,5 +1,5 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Barrier};
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
@@ -157,6 +157,154 @@ fn fixture() -> Fixture {
         fleet,
         principal_uid,
     }
+}
+
+fn signed_claim_with_expiry(
+    fixture: &Fixture,
+    authority_generation: u64,
+    expires_at: u64,
+    authority_epoch: u64,
+) -> Result<FirstOwnerClaim, astrid_core::FirstOwnerClaimError> {
+    let signing_key = SigningKey::from_bytes(&[7; 32]);
+    let unsigned = FirstOwnerClaim::from_parts_with_authority(
+        *fixture.claim.machine_context(),
+        *fixture.claim.boot_context(),
+        *fixture.claim.kernel_identity(),
+        *fixture.claim.system_generation(),
+        fixture.claim.user_uid(),
+        fixture.claim.fleet_uid(),
+        fixture.claim.principal_uid(),
+        *fixture.claim.initial_user_public_key(),
+        *fixture.claim.nonce(),
+        authority_generation,
+        expires_at,
+        authority_epoch,
+        [0; 64],
+    )?;
+    FirstOwnerClaim::from_parts_with_authority(
+        *unsigned.machine_context(),
+        *unsigned.boot_context(),
+        *unsigned.kernel_identity(),
+        *unsigned.system_generation(),
+        unsigned.user_uid(),
+        unsigned.fleet_uid(),
+        unsigned.principal_uid(),
+        *unsigned.initial_user_public_key(),
+        *unsigned.nonce(),
+        unsigned.authority_generation().get(),
+        unsigned.expires_at(),
+        unsigned.authority_epoch().get(),
+        signing_key.sign(&unsigned.canonical_message()).to_bytes(),
+    )
+}
+
+#[test]
+fn zero_expiry_is_rejected_at_the_signed_claim_boundary() {
+    let fixture = fixture();
+    assert_eq!(
+        signed_claim_with_expiry(&fixture, 1, 0, 1),
+        Err(astrid_core::FirstOwnerClaimError::ZeroExpiry)
+    );
+}
+
+#[tokio::test]
+async fn begin_after_expiry_never_creates_pending_state() {
+    let fixture = fixture();
+    let claim = signed_claim_with_expiry(&fixture, 1, 10, 1).unwrap();
+    assert!(matches!(
+        fixture.store.begin_first_owner_at(claim, 10).await,
+        Err(OwnershipError::FirstOwner(FirstOwnerError::Expired))
+    ));
+    assert_eq!(
+        fixture.store.first_owner_state().await.unwrap(),
+        FirstOwnerEnrollment::Unenrolled
+    );
+}
+
+#[tokio::test]
+async fn commit_after_expiry_leaves_only_pending_state() {
+    let fixture = fixture();
+    let claim = signed_claim_with_expiry(&fixture, 1, 10, 1).unwrap();
+    fixture.store.begin_first_owner_at(claim, 9).await.unwrap();
+    assert!(matches!(
+        fixture
+            .store
+            .commit_first_owner_with_clock(
+                &claim,
+                fixture.user.clone(),
+                fixture.fleet.clone(),
+                || 10,
+            )
+            .await,
+        Err(OwnershipError::FirstOwner(FirstOwnerError::Expired))
+    ));
+    let pending = fixture.store.load().await.unwrap();
+    assert!(pending.first_owner_state().is_pending());
+    assert!(pending.user(fixture.user.uid).is_none());
+    assert!(pending.fleet(fixture.fleet.uid).is_none());
+    assert!(pending.principal_owner(fixture.principal_uid).is_none());
+}
+
+#[tokio::test]
+async fn explicit_expiry_advances_counters_and_stales_replay() {
+    let fixture = fixture();
+    let claim = signed_claim_with_expiry(&fixture, 1, 10, 1).unwrap();
+    fixture.store.begin_first_owner_at(claim, 9).await.unwrap();
+    assert!(matches!(
+        fixture.store.expire_first_owner_at(10).await,
+        Ok(FirstOwnerEnrollment::Cancelled { claim: expired }) if expired == claim
+    ));
+    let cancelled = fixture.store.load().await.unwrap();
+    assert_eq!(cancelled.authority_epoch().get(), 2);
+    assert_eq!(cancelled.authority_generation().get(), 2);
+    assert!(matches!(
+        fixture.store.begin_first_owner_at(claim, 10).await,
+        Err(OwnershipError::FirstOwner(FirstOwnerError::StaleClaim))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_commit_crossing_expiry_cannot_publish_owner_edges() {
+    let fixture = fixture();
+    let claim = signed_claim_with_expiry(&fixture, 1, 10, 1).unwrap();
+    fixture.store.begin_first_owner_at(claim, 9).await.unwrap();
+
+    let entered_clock = Arc::new(Barrier::new(2));
+    let release_clock = Arc::new(Barrier::new(2));
+    let now = Arc::new(AtomicU64::new(9));
+    let store = fixture.store.clone();
+    let user = fixture.user.clone();
+    let fleet = fixture.fleet.clone();
+    let clock_entered = Arc::clone(&entered_clock);
+    let clock_release = Arc::clone(&release_clock);
+    let clock_now = Arc::clone(&now);
+    let commit = tokio::spawn(async move {
+        store
+            .commit_first_owner_with_clock(&claim, user, fleet, move || {
+                clock_entered.wait();
+                clock_release.wait();
+                clock_now.load(Ordering::Acquire)
+            })
+            .await
+    });
+
+    // The injected clock is reached only from inside the mutation closure,
+    // after the lock and current Pending graph have been acquired/decoded.
+    entered_clock.wait();
+    now.store(10, Ordering::Release);
+    release_clock.wait();
+    assert!(matches!(
+        commit.await.unwrap(),
+        Err(OwnershipError::FirstOwner(FirstOwnerError::Expired))
+    ));
+
+    let pending = fixture.store.load().await.unwrap();
+    assert!(pending.first_owner_state().is_pending());
+    assert!(pending.user(fixture.user.uid).is_none());
+    assert!(pending.fleet(fixture.fleet.uid).is_none());
+    assert!(pending.principal_owner(fixture.principal_uid).is_none());
+    assert_eq!(pending.authority_epoch().get(), 1);
+    assert_eq!(pending.authority_generation().get(), 1);
 }
 
 #[tokio::test]
