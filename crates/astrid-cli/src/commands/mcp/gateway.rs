@@ -9,17 +9,21 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rmcp::ServiceExt;
 use rmcp::service::{Peer, RoleServer};
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
-use tokio::time::timeout;
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::time::{Instant, timeout};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+use super::idle::{ATTACH_IDLE_EOF, IdleEof, is_idle};
 
 use super::lifecycle::{
     ATTACH_REGISTRATION_VERSION, AttachRegistration, GatewayReady, prepare_gateway_socket,
@@ -43,6 +47,12 @@ const REGISTRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_mill
 type Client = Arc<Mutex<crate::socket_client::SocketClient>>;
 type Peers = Arc<Mutex<HashMap<String, Peer<RoleServer>>>>;
 
+struct AttachSlot {
+    cancel: CancellationToken,
+    last_activity: Arc<StdMutex<Instant>>,
+    done: Arc<Notify>,
+}
+
 struct GatewayState {
     daemon_root: PathBuf,
     principal: astrid_core::PrincipalId,
@@ -50,6 +60,7 @@ struct GatewayState {
     clients: Mutex<HashMap<String, Client>>,
     peers: Mutex<HashMap<String, Peers>>,
     permits: Mutex<HashMap<String, Arc<Semaphore>>>,
+    slots: Mutex<HashMap<String, AttachSlot>>,
     initialize: Mutex<()>,
 }
 
@@ -62,6 +73,7 @@ impl GatewayState {
             clients: Mutex::new(HashMap::new()),
             peers: Mutex::new(HashMap::new()),
             permits: Mutex::new(HashMap::new()),
+            slots: Mutex::new(HashMap::new()),
             initialize: Mutex::new(()),
         }
     }
@@ -123,19 +135,70 @@ impl GatewayState {
             .ok_or_else(|| anyhow::anyhow!("MCP gateway principal channel was not initialized"))
     }
 
-    async fn acquire(&self, principal: &str) -> Result<OwnedSemaphorePermit> {
-        let semaphore = self
-            .permits
+    async fn semaphore_for(&self, principal: &str) -> Arc<Semaphore> {
+        self.permits
             .lock()
             .await
             .entry(principal.to_owned())
             .or_insert_with(|| Arc::new(Semaphore::new(MAX_ATTACHES)))
-            .clone();
-        semaphore.try_acquire_owned().map_err(|_| {
-            anyhow::anyhow!(
-                "MCP gateway attach limit reached for principal '{principal}' ({MAX_ATTACHES})"
-            )
-        })
+            .clone()
+    }
+
+    async fn acquire(&self, principal: &str) -> Result<OwnedSemaphorePermit> {
+        let semaphore = self.semaphore_for(principal).await;
+        if let Ok(permit) = semaphore.clone().try_acquire_owned() {
+            return Ok(permit);
+        }
+        if self.evict_lru_idle().await
+            && let Ok(permit) = semaphore.try_acquire_owned()
+        {
+            return Ok(permit);
+        }
+        anyhow::bail!(
+            "MCP gateway attach limit reached for principal '{principal}' ({MAX_ATTACHES})"
+        )
+    }
+
+    async fn replace_session(&self, host_session_id: &str) {
+        let slot = self.slots.lock().await.remove(host_session_id);
+        if let Some(slot) = slot {
+            let notified = slot.done.notified();
+            tokio::pin!(notified);
+            slot.cancel.cancel();
+            let _ = timeout(Duration::from_secs(1), notified).await;
+        }
+    }
+
+    async fn evict_lru_idle(&self) -> bool {
+        let mut slots = self.slots.lock().await;
+        let idle_key = slots
+            .iter()
+            .filter(|(_, slot)| is_idle(&slot.last_activity, ATTACH_IDLE_EOF))
+            .min_by_key(|(_, slot)| {
+                slot.last_activity
+                    .lock()
+                    .map_or_else(|_| Instant::now(), |instant| *instant)
+            })
+            .map(|(key, _)| key.clone());
+        let Some(key) = idle_key else {
+            return false;
+        };
+        let Some(slot) = slots.remove(&key) else {
+            return false;
+        };
+        drop(slots);
+        let notified = slot.done.notified();
+        tokio::pin!(notified);
+        slot.cancel.cancel();
+        timeout(Duration::from_secs(1), notified).await.is_ok()
+    }
+
+    async fn install_slot(&self, host_session_id: String, slot: AttachSlot) {
+        self.slots.lock().await.insert(host_session_id, slot);
+    }
+
+    async fn take_slot(&self, host_session_id: &str) -> Option<AttachSlot> {
+        self.slots.lock().await.remove(host_session_id)
     }
 }
 
@@ -208,9 +271,24 @@ async fn serve_attach(stream: UnixStream, state: Arc<GatewayState>) -> Result<()
     let workspace = validate_workspace(&registration.workspace_abs)?;
     let principal_key = principal.to_string();
     let host_session_id = registration.host_session_id.clone();
+    state.replace_session(&host_session_id).await;
     let permit = state.acquire(&principal_key).await?;
     let client = state.client_for(&principal).await?;
     let peers = state.peers_for(&principal_key).await?;
+    let last_activity = Arc::new(StdMutex::new(Instant::now()));
+    let cancel = CancellationToken::new();
+    let done = Arc::new(Notify::new());
+    state
+        .install_slot(
+            host_session_id.clone(),
+            AttachSlot {
+                cancel: cancel.clone(),
+                last_activity: Arc::clone(&last_activity),
+                done: Arc::clone(&done),
+            },
+        )
+        .await;
+    let reader = IdleEof::new(reader, ATTACH_IDLE_EOF, last_activity);
 
     info!(
         principal = %principal_key,
@@ -218,7 +296,32 @@ async fn serve_attach(stream: UnixStream, state: Arc<GatewayState>) -> Result<()
         host_session_id = %registration.host_session_id,
         "MCP gateway accepted attach"
     );
-    let server = AstridMcpServer::new(client, principal, state.daemon_root.clone(), workspace);
+    let result = run_attached_session(
+        AstridMcpServer::new(client, principal, state.daemon_root.clone(), workspace),
+        reader,
+        write_half,
+        peers,
+        host_session_id.clone(),
+        cancel,
+    )
+    .await;
+    let _ = state.take_slot(&host_session_id).await;
+    done.notify_waiters();
+    drop(permit);
+    result
+}
+
+async fn run_attached_session<R>(
+    server: AstridMcpServer,
+    reader: R,
+    write_half: tokio::io::WriteHalf<UnixStream>,
+    peers: Peers,
+    host_session_id: String,
+    cancel: CancellationToken,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
     let running = server
         .serve((reader, write_half))
         .await
@@ -227,12 +330,11 @@ async fn serve_attach(stream: UnixStream, state: Arc<GatewayState>) -> Result<()
         .lock()
         .await
         .insert(host_session_id.clone(), running.peer().clone());
-    let result = running
-        .waiting()
-        .await
-        .context("MCP gateway attach transport terminated abnormally");
+    let result = tokio::select! {
+        result = running.waiting() => result.context("MCP gateway attach transport terminated abnormally"),
+        () = cancel.cancelled() => Err(anyhow::anyhow!("MCP attach replaced or idle-evicted")),
+    };
     peers.lock().await.remove(&host_session_id);
-    drop(permit);
     result.map(|_| ())
 }
 
@@ -470,5 +572,135 @@ mod tests {
         let second = mint_hook_token();
         assert_eq!(first.len(), 64);
         assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn same_session_replaces_the_previous_attach() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        use tokio::sync::Notify;
+        use tokio::time::Instant;
+        use tokio_util::sync::CancellationToken;
+
+        use super::AttachSlot;
+
+        let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
+        let state = GatewayState::new(
+            PathBuf::from("/runtime-home"),
+            principal,
+            "gateway-token".into(),
+        );
+        let permit = state.acquire("codex-code").await.expect("permit");
+        let cancel = CancellationToken::new();
+        let done = Arc::new(Notify::new());
+        state
+            .install_slot(
+                "thread-1".into(),
+                AttachSlot {
+                    cancel: cancel.clone(),
+                    last_activity: Arc::new(StdMutex::new(Instant::now())),
+                    done: Arc::clone(&done),
+                },
+            )
+            .await;
+        tokio::spawn(async move {
+            cancel.cancelled().await;
+            drop(permit);
+            done.notify_waiters();
+        });
+        state.replace_session("thread-1").await;
+        let _permit = state
+            .acquire("codex-code")
+            .await
+            .expect("replaced session must free the attach cap");
+    }
+
+    #[tokio::test]
+    async fn acquire_evicts_idle_lru_then_admits() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        use tokio::sync::Notify;
+        use tokio::time::Instant;
+        use tokio_util::sync::CancellationToken;
+
+        use super::{ATTACH_IDLE_EOF, AttachSlot};
+
+        let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
+        let state = GatewayState::new(
+            PathBuf::from("/runtime-home"),
+            principal,
+            "gateway-token".into(),
+        );
+        for index in 0..MAX_ATTACHES {
+            let permit = state.acquire("codex-code").await.expect("permit");
+            let cancel = CancellationToken::new();
+            let done = Arc::new(Notify::new());
+            let last = Instant::now()
+                .checked_sub(ATTACH_IDLE_EOF + std::time::Duration::from_millis(5))
+                .expect("idle timestamp");
+            state
+                .install_slot(
+                    format!("idle-{index}"),
+                    AttachSlot {
+                        cancel: cancel.clone(),
+                        last_activity: Arc::new(StdMutex::new(last)),
+                        done: Arc::clone(&done),
+                    },
+                )
+                .await;
+            tokio::spawn(async move {
+                cancel.cancelled().await;
+                drop(permit);
+                done.notify_waiters();
+            });
+        }
+        let _permit = state
+            .acquire("codex-code")
+            .await
+            .expect("idle LRU eviction must admit a new attach");
+    }
+
+    #[tokio::test]
+    async fn acquire_does_not_evict_active_slots() {
+        use std::sync::{Arc, Mutex as StdMutex};
+
+        use tokio::sync::Notify;
+        use tokio::time::Instant;
+        use tokio_util::sync::CancellationToken;
+
+        use super::AttachSlot;
+
+        let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
+        let state = GatewayState::new(
+            PathBuf::from("/runtime-home"),
+            principal,
+            "gateway-token".into(),
+        );
+        let mut cancels = Vec::new();
+        for index in 0..MAX_ATTACHES {
+            let permit = state.acquire("codex-code").await.expect("permit");
+            let cancel = CancellationToken::new();
+            let done = Arc::new(Notify::new());
+            state
+                .install_slot(
+                    format!("live-{index}"),
+                    AttachSlot {
+                        cancel: cancel.clone(),
+                        last_activity: Arc::new(StdMutex::new(Instant::now())),
+                        done: Arc::clone(&done),
+                    },
+                )
+                .await;
+            cancels.push(cancel.clone());
+            tokio::spawn(async move {
+                cancel.cancelled().await;
+                drop(permit);
+                done.notify_waiters();
+            });
+        }
+        assert!(state.acquire("codex-code").await.is_err());
+        for cancel in cancels {
+            cancel.cancel();
+        }
     }
 }
