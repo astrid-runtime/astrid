@@ -57,6 +57,7 @@ pub(crate) fn without_tools(meta: Option<Value>) -> Option<Value> {
 /// `{ "tools": [...] }` object so the consumer sees the surface either way. The
 /// kernel does not interpret the descriptors — it forwards what the capsule
 /// reported.
+#[cfg(test)]
 pub(crate) fn inject_tools(meta: Option<Value>, tools: Value) -> Value {
     let mut obj = match meta {
         Some(Value::Object(map)) => map,

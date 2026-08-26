@@ -255,7 +255,7 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
     };
 
     // Serialize with `agent modify` (#993) so the load-modify-save is atomic.
-    let _guard = kernel.admin_write_lock.lock().await;
+    let guard = kernel.admin_write_lock.lock().await;
 
     let path = principal_profile_path(kernel, &pid);
     // A grant for a principal with no profile on disk is a fail-closed no-op,
@@ -305,7 +305,7 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
     if !changed {
         // Already granted — idempotent. Invalidate to be safe; no save needed.
         kernel.profile_cache.invalidate(&pid);
-        drop(_guard);
+        drop(guard);
         kernel.publish_capsules_loaded_for(&pid).await;
         return;
     }
@@ -333,7 +333,7 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
         return;
     }
     kernel.profile_cache.invalidate(&pid);
-    drop(_guard);
+    drop(guard);
     kernel.publish_capsules_loaded_for(&pid).await;
 
     info!(
