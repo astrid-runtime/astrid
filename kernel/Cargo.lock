@@ -24,7 +24,10 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 name = "astrid-boot-selection"
 version = "0.0.0"
 dependencies = [
+ "astrid-native-closure",
+ "astrid-system-generation",
  "blake3",
+ "ed25519-dalek",
 ]
 
 [[package]]

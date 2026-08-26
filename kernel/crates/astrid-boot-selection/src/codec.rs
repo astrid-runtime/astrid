@@ -3,9 +3,9 @@
 use crate::error::JournalError;
 use crate::types::{CandidateClaim, CandidateInput, DIGEST_LEN, Frame, RecordState, Slot};
 
-pub const FRAME_LEN: usize = 256;
-pub const MAGIC: &[u8; 8] = b"ASTRABJ1";
-pub const VERSION: u8 = 1;
+pub const FRAME_LEN: usize = 296;
+pub const MAGIC: &[u8; 8] = b"ASTRABJ2";
+pub const VERSION: u8 = 2;
 pub const RESERVED_START: usize = 12;
 pub const RESERVED_END: usize = 16;
 pub const RECORD_SEQ_START: usize = 16;
@@ -15,7 +15,8 @@ pub const BOOT_SEQUENCE_END: usize = 32;
 pub const FACTS_START: usize = 32;
 pub const DESCRIPTOR_START: usize = FACTS_START;
 pub const KERNEL_START: usize = DESCRIPTOR_START + DIGEST_LEN;
-pub const PLAN_START: usize = KERNEL_START + DIGEST_LEN;
+pub const SYSGEN_START: usize = KERNEL_START + DIGEST_LEN;
+pub const PLAN_START: usize = SYSGEN_START + DIGEST_LEN;
 pub const OBJECT_ROOT_START: usize = PLAN_START + DIGEST_LEN;
 pub const CLOSURE_ROOT_START: usize = OBJECT_ROOT_START + DIGEST_LEN;
 pub const FACTS_END: usize = CLOSURE_ROOT_START + DIGEST_LEN;
@@ -27,7 +28,9 @@ pub const KERNEL_FLOOR_START: usize = ROLLBACK_END;
 pub const KERNEL_FLOOR_END: usize = KERNEL_FLOOR_START + 8;
 pub const SYSGEN_FLOOR_START: usize = KERNEL_FLOOR_END;
 pub const SYSGEN_FLOOR_END: usize = SYSGEN_FLOOR_START + 8;
-pub const CHECKSUM_START: usize = SYSGEN_FLOOR_END;
+pub const POLICY_GENERATION_START: usize = SYSGEN_FLOOR_END;
+pub const POLICY_GENERATION_END: usize = POLICY_GENERATION_START + 8;
+pub const CHECKSUM_START: usize = POLICY_GENERATION_END;
 pub const CHECKSUM_END: usize = CHECKSUM_START + 32;
 
 // The checksum is the terminal field. Keep this as a compile-time invariant:
@@ -53,7 +56,11 @@ pub fn encode_frame(frame: &Frame) -> [u8; FRAME_LEN] {
     );
     copy_digest(
         frame.claim.kernel_identity(),
-        &mut out[KERNEL_START..PLAN_START],
+        &mut out[KERNEL_START..SYSGEN_START],
+    );
+    copy_digest(
+        frame.claim.system_generation_identity(),
+        &mut out[SYSGEN_START..PLAN_START],
     );
     copy_digest(
         frame.claim.plan_digest(),
@@ -82,6 +89,10 @@ pub fn encode_frame(frame: &Frame) -> [u8; FRAME_LEN] {
     write_u64(
         frame.claim.sysgen_floor(),
         &mut out[SYSGEN_FLOOR_START..SYSGEN_FLOOR_END],
+    );
+    write_u64(
+        frame.claim.policy_generation(),
+        &mut out[POLICY_GENERATION_START..POLICY_GENERATION_END],
     );
     let checksum = checksum(&out[..CHECKSUM_START]);
     out[CHECKSUM_START..CHECKSUM_END].copy_from_slice(&checksum);
@@ -123,15 +134,17 @@ pub fn decode_frame(bytes: &[u8; FRAME_LEN]) -> Result<Frame, JournalError> {
 fn decode_claim(bytes: &[u8; FRAME_LEN]) -> Result<CandidateClaim, JournalError> {
     let mut descriptor = [0u8; DIGEST_LEN];
     let mut kernel = [0u8; DIGEST_LEN];
+    let mut sysgen = [0u8; DIGEST_LEN];
     let mut plan = [0u8; DIGEST_LEN];
     let mut object_root = [0u8; DIGEST_LEN];
     let mut closure_root = [0u8; DIGEST_LEN];
     descriptor.copy_from_slice(&bytes[DESCRIPTOR_START..KERNEL_START]);
-    kernel.copy_from_slice(&bytes[KERNEL_START..PLAN_START]);
+    kernel.copy_from_slice(&bytes[KERNEL_START..SYSGEN_START]);
+    sysgen.copy_from_slice(&bytes[SYSGEN_START..PLAN_START]);
     plan.copy_from_slice(&bytes[PLAN_START..OBJECT_ROOT_START]);
     object_root.copy_from_slice(&bytes[OBJECT_ROOT_START..CLOSURE_ROOT_START]);
     closure_root.copy_from_slice(&bytes[CLOSURE_ROOT_START..FACTS_END]);
-    if [descriptor, kernel, plan, object_root, closure_root]
+    if [descriptor, kernel, sysgen, plan, object_root, closure_root]
         .iter()
         .any(|digest| digest.iter().all(|byte| *byte == 0))
     {
@@ -140,6 +153,7 @@ fn decode_claim(bytes: &[u8; FRAME_LEN]) -> Result<CandidateClaim, JournalError>
     Ok(CandidateClaim::from_persisted(CandidateInput {
         descriptor_identity: descriptor,
         kernel_identity: kernel,
+        system_generation_identity: sysgen,
         plan_digest: plan,
         object_root,
         closure_root,
@@ -147,12 +161,13 @@ fn decode_claim(bytes: &[u8; FRAME_LEN]) -> Result<CandidateClaim, JournalError>
         rollback_floor: read_u64(&bytes[ROLLBACK_START..ROLLBACK_END]),
         kernel_floor: read_u64(&bytes[KERNEL_FLOOR_START..KERNEL_FLOOR_END]),
         sysgen_floor: read_u64(&bytes[SYSGEN_FLOOR_START..SYSGEN_FLOOR_END]),
+        policy_generation: read_u64(&bytes[POLICY_GENERATION_START..POLICY_GENERATION_END]),
     }))
 }
 
 /// BLAKE3 detects torn or modified bytes only; it is not authentication.
 fn checksum(bytes: &[u8]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key("astrid.boot-selection.journal.v1");
+    let mut hasher = blake3::Hasher::new_derive_key("astrid.boot-selection.journal.v2");
     hasher.update(bytes);
     *hasher.finalize().as_bytes()
 }

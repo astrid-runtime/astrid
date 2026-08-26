@@ -20,7 +20,7 @@ mod verify;
 
 #[cfg(any(test, feature = "sign"))]
 mod fixture;
-#[cfg(test)]
+#[cfg(any(test, feature = "sign"))]
 mod sign;
 
 pub use error::GenerationError;
@@ -34,6 +34,8 @@ pub use verify::verify_manifest;
 
 #[cfg(any(test, feature = "sign"))]
 pub use fixture::fixture_signing_key;
+#[cfg(any(test, feature = "sign"))]
+pub use sign::signed_bytes;
 
 #[cfg(test)]
 extern crate std;

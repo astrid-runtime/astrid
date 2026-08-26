@@ -13,6 +13,7 @@ pub struct SelectionPolicy {
     min_rollback_floor: u64,
     min_kernel_floor: u64,
     min_sysgen_floor: u64,
+    min_policy_generation: u64,
 }
 
 impl SelectionPolicy {
@@ -27,6 +28,29 @@ impl SelectionPolicy {
             min_rollback_floor,
             min_kernel_floor,
             min_sysgen_floor,
+            min_policy_generation: 0,
+        }
+    }
+
+    /// Construct a policy from an authenticated loader handoff. The policy
+    /// generation is a separate replay floor; it is never inferred from a
+    /// descriptor generation or either closure floor.
+    // This constructor is intentionally private until the selector is wired
+    // to the real boot path; public callers retain `new` compatibility.
+    #[allow(dead_code)]
+    pub(crate) const fn from_authenticated(
+        min_generation: u64,
+        min_rollback_floor: u64,
+        min_kernel_floor: u64,
+        min_sysgen_floor: u64,
+        min_policy_generation: u64,
+    ) -> Self {
+        Self {
+            min_generation,
+            min_rollback_floor,
+            min_kernel_floor,
+            min_sysgen_floor,
+            min_policy_generation,
         }
     }
 
@@ -35,5 +59,10 @@ impl SelectionPolicy {
             && facts.rollback_floor() >= self.min_rollback_floor
             && facts.kernel_floor() >= self.min_kernel_floor
             && facts.sysgen_floor() >= self.min_sysgen_floor
+            && self.accepts_authenticated_generation(facts.policy_generation())
+    }
+
+    pub(crate) const fn accepts_authenticated_generation(self, generation: u64) -> bool {
+        generation >= self.min_policy_generation
     }
 }

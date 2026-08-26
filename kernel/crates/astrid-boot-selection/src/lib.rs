@@ -18,6 +18,7 @@ mod journal;
 mod policy;
 mod selector;
 mod types;
+mod verified_adapter;
 
 pub use codec::FRAME_LEN;
 pub use error::{JournalError, SelectionError};
@@ -31,3 +32,5 @@ extern crate std;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_v2;
