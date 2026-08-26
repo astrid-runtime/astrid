@@ -87,7 +87,7 @@ async fn enroll_fixture_owner(
     let boot_context = [22; 32];
     let kernel_identity = [23; 32];
     let system_generation = [24; 32];
-    let mut nonce = [0_u8; 32];
+    let mut nonce: [u8; 32] = std::array::from_fn(|_| 0_u8);
     getrandom::fill(&mut nonce).expect("fixture nonce");
     let unsigned = FirstOwnerClaim::from_parts(
         machine_context,

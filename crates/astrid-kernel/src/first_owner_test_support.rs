@@ -38,7 +38,7 @@ pub(crate) async fn enroll_test_first_owner(
     let boot_context = [12; 32];
     let kernel_identity = [13; 32];
     let system_generation = [14; 32];
-    let mut nonce = [0_u8; 32];
+    let mut nonce: [u8; 32] = std::array::from_fn(|_| 0_u8);
     getrandom::fill(&mut nonce).expect("test first-owner: nonce");
     let unsigned = FirstOwnerClaim::from_parts(
         machine_context,

@@ -378,7 +378,7 @@ mod tests {
     use crate::{FleetGenesis, PrincipalGenesis, PrincipalIdentity, UserGenesis, UserIdentity};
 
     fn fixture_nonce() -> [u8; 32] {
-        let mut nonce = [0_u8; 32];
+        let mut nonce: [u8; 32] = std::array::from_fn(|_| 0_u8);
         getrandom::fill(&mut nonce).expect("fixture nonce");
         nonce
     }
