@@ -13,7 +13,7 @@ nested="$root/target/bootloader-nested"
 
 mode="${1:-all}"
 if [[ $# -gt 1 ]]; then
-  echo "usage: $0 [x86|portability]" >&2
+  echo "usage: $0 [x86|portability|all]" >&2
   exit 2
 fi
 
@@ -43,7 +43,6 @@ run_portability() {
   local target spec package feature_spec
   local -a package_args
   local -a required_targets=(
-    "x86_64-unknown-none"
     "aarch64-unknown-none"
     "riscv64gc-unknown-none-elf"
   )
@@ -91,7 +90,7 @@ case "$mode" in
     exit 0
     ;;
   *)
-    echo "usage: $0 [x86|portability]" >&2
+    echo "usage: $0 [x86|portability|all]" >&2
     exit 2
     ;;
 esac

@@ -1,5 +1,5 @@
 name: Native kernel
-run-name: Native kernel (TCG emulator evidence only)
+run-name: Native kernel (split checks, compile-only semantic targets, TCG emulator evidence)
 
 on:
   pull_request:

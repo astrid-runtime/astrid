@@ -1,8 +1,5 @@
 # Ring-0 builds pin curve25519-dalek's serial backend explicitly. SIMD cannot
 # activate on these arches; this is a code-generation choice, not a crypto
 # claim.
-[target.x86_64-unknown-none]
-rustflags = ['--cfg', 'curve25519_dalek_backend="serial"']
-
 [target.'cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))']
 rustflags = ['--cfg', 'curve25519_dalek_backend="serial"']
