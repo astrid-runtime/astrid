@@ -25,22 +25,24 @@
 //! out of the management API. `caps.grant` and `quota.set` are still
 //! allowed (they only add permissions / adjust resource bounds).
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use astrid_core::capability_grammar::validate_capability;
 use astrid_core::principal::PrincipalId;
-use astrid_core::profile::{
-    CapabilityPattern, CapsuleGrant, GroupName, PrincipalProfile, ProfileError,
-};
+use astrid_core::profile::{CapabilityPattern, CapsuleGrant, GroupName, PrincipalProfile};
 use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody, AgentSummary};
 use tracing::{info, warn};
 
 use crate::kernel_router::AuthorizedRequest;
 
 mod env_handlers;
+mod helpers;
 use super::inheritance::copy_modify_env;
 use env_handlers::{EnvSetRequest, env_delete, env_list, env_set};
+pub(crate) use helpers::{
+    err_bad_input, err_internal, err_profile, principal_profile_path, require_principal_exists,
+    success_json,
+};
 
 /// Platform label used by the identity store for agent principals
 /// created via [`AdminRequestKind::AgentCreate`]. The per-principal
@@ -125,6 +127,9 @@ async fn dispatch_inner(
         | AdminRequestKind::EnvDelete { .. }
         | AdminRequestKind::DistroLockGet { .. }
         | AdminRequestKind::DistroLockSet { .. }
+        | AdminRequestKind::StationLockGet { .. }
+        | AdminRequestKind::StationLockSet { .. }
+        | AdminRequestKind::StationLockDelete { .. }
         | AdminRequestKind::GroupCreate { .. }
         | AdminRequestKind::GroupDelete { .. }
         | AdminRequestKind::GroupModify { .. }
@@ -163,6 +168,14 @@ async fn dispatch_policy(
     device_key_id: Option<&str>,
     req: AdminRequestKind,
 ) -> AdminResponseBody {
+    if matches!(
+        &req,
+        AdminRequestKind::StationLockGet { .. }
+            | AdminRequestKind::StationLockSet { .. }
+            | AdminRequestKind::StationLockDelete { .. }
+    ) {
+        return dispatch_station_policy(kernel, req).await;
+    }
     match req {
         AdminRequestKind::EnvSet {
             principal,
@@ -248,6 +261,29 @@ async fn dispatch_policy(
             super::caps_tokens::dispatch(kernel, req).await
         },
         _ => AdminResponseBody::Error("not a policy request".to_owned()),
+    }
+}
+
+async fn dispatch_station_policy(
+    kernel: &Arc<crate::Kernel>,
+    req: AdminRequestKind,
+) -> AdminResponseBody {
+    match req {
+        AdminRequestKind::StationLockGet { principal, capsule } => {
+            super::station_handlers::get(kernel, &principal, &capsule).await
+        },
+        AdminRequestKind::StationLockSet {
+            principal,
+            capsule,
+            lock,
+            expected_hash,
+        } => super::station_handlers::set(kernel, &principal, &capsule, *lock, expected_hash).await,
+        AdminRequestKind::StationLockDelete {
+            principal,
+            capsule,
+            expected_hash,
+        } => super::station_handlers::delete(kernel, &principal, &capsule, expected_hash).await,
+        _ => AdminResponseBody::Error("unexpected Station policy request".to_owned()),
     }
 }
 
@@ -954,47 +990,4 @@ async fn mutate_caps(
         "principal": principal.as_str(),
         "capabilities": capabilities,
     }))
-}
-
-// ── Helpers ────────────────────────────────────────────────────────────
-
-pub(crate) fn principal_profile_path(
-    kernel: &Arc<crate::Kernel>,
-    principal: &PrincipalId,
-) -> PathBuf {
-    PrincipalProfile::path_for(&kernel.astrid_home, principal)
-}
-
-/// Reject mutating-handler calls that target a principal with no
-/// `profile.toml` on disk. Required because
-/// [`PrincipalProfile::load_from_path`] returns `Default` on `NotFound`,
-/// which would let a typo'd name silently materialize a phantom
-/// principal with grants on disk.
-pub(crate) fn require_principal_exists(principal: &PrincipalId, path: &Path) -> Result<(), String> {
-    if path.exists() {
-        Ok(())
-    } else {
-        Err(format!(
-            "principal {principal} does not exist (no profile.toml at {})",
-            path.display()
-        ))
-    }
-}
-
-pub(super) fn err_bad_input(msg: String) -> AdminResponseBody {
-    warn!(error = %msg, "admin request rejected: bad input");
-    AdminResponseBody::Error(msg)
-}
-
-pub(super) fn err_internal(msg: String) -> AdminResponseBody {
-    warn!(error = %msg, "admin request failed: internal error");
-    AdminResponseBody::Error(msg)
-}
-
-pub(super) fn err_profile(principal: &PrincipalId, e: &ProfileError) -> AdminResponseBody {
-    err_internal(format!("profile error for {principal}: {e}"))
-}
-
-pub(super) fn success_json(val: serde_json::Value) -> AdminResponseBody {
-    AdminResponseBody::Success(val)
 }

@@ -28,7 +28,8 @@ pub use readiness::{AgentLoopReadiness, AgentReadinessProbe, CapsuleTopicProbe, 
 pub use response_types::{
     AdminResponseBody, AgentSummary, AuditHealth, AuditPruneResult, AuditStats,
     DistroCapsuleProvenance, DistroProvenance, GroupSummary, InviteIssued, InviteRedeemed,
-    InviteSummary, PairTokenIssued, PairTokenRedeemed, ResourceUsage,
+    InviteSummary, PairTokenIssued, PairTokenRedeemed, ResourceUsage, StationCoordinate,
+    StationLock,
 };
 
 use crate::PrincipalId;
@@ -268,6 +269,10 @@ pub struct CapsuleMetadataEntry {
     /// mutable aliases are never used as storage keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_uid: Option<crate::identity::PrincipalUid>,
+    /// Registry identity associated with the package, when a Station lock is
+    /// present. This is separate from the daemon-stamped `source_id` UUID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_source: Option<String>,
 }
 
 /// Non-secret metadata for one capsule-declared environment field.
@@ -660,6 +665,40 @@ pub enum AdminRequestKind {
         lock: DistroProvenance,
         /// BLAKE3 digest of the previously read canonical record. `None`
         /// means the caller expects no record to exist (create semantics).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_hash: Option<String>,
+    },
+    /// Read one owner-scoped Station lock for a capsule.
+    StationLockGet {
+        /// Principal whose control record is addressed.
+        principal: PrincipalId,
+        /// Capsule package identifier used as the typed control key.
+        capsule: String,
+    },
+    /// Atomically replace one owner-scoped Station lock.
+    StationLockSet {
+        /// Principal whose control record is addressed.
+        principal: PrincipalId,
+        /// Capsule package identifier used as the typed control key.
+        capsule: String,
+        /// Exact `station-lock-v2` record returned by Station.
+        lock: Box<StationLock>,
+        /// BLAKE3 digest of the previously read lock JSON. `None` means the
+        /// caller expects no lock to exist (create semantics).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_hash: Option<String>,
+    },
+    /// Delete one owner-scoped Station lock.
+    ///
+    /// Deletion is idempotent. When `expected_hash` is supplied, the kernel
+    /// only clears the record if it still matches that canonical digest.
+    StationLockDelete {
+        /// Principal whose control record is addressed.
+        principal: PrincipalId,
+        /// Capsule package identifier used as the typed control key.
+        capsule: String,
+        /// BLAKE3 digest of the lock JSON that may be removed. Omitted means
+        /// the caller accepts the current value and still gets a CAS write.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_hash: Option<String>,
     },

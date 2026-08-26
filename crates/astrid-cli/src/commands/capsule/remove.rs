@@ -93,6 +93,15 @@ fn remove_capsule_from_home_for_in_workspace(
         .with_context(|| format!("failed to remove {}", target_dir.display()))?;
     astrid_capsule_install::remove_installed_authority(home, &target_dir)
         .context("failed to remove capsule authority receipt")?;
+    // Workspace Station installs are rejected before handoff, so normally no
+    // lock exists here. If a daemon is ready (for example after an operator
+    // migrated an older workspace), clear any matching owner-scoped lock after
+    // the on-disk delete; a clear failure is surfaced so stale authority is
+    // never silently reinterpreted on update/show.
+    if station_lock_clear_ready() {
+        super::install_headless::admin_block_on(super::station::clear_lock(principal, name))
+            .context("failed to clear Station lock after workspace removal")?;
+    }
 
     // Delete principal-scoped configuration through the daemon with
     // --purge. Native env files are never consulted or removed here.
@@ -114,6 +123,60 @@ fn remove_capsule_from_home_for_in_workspace(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn test_remove_capsule_from_home_for_in_workspace(
+    home: &AstridHome,
+    principal: &PrincipalId,
+    name: &str,
+    workspace: bool,
+    workspace_root: Option<&Path>,
+    force: bool,
+    purge: bool,
+) -> anyhow::Result<()> {
+    let _readiness = TestStationReadinessGuard::install(true);
+    remove_capsule_from_home_for_in_workspace(
+        home,
+        principal,
+        name,
+        workspace,
+        workspace_root,
+        force,
+        purge,
+    )
+}
+
+fn station_lock_clear_ready() -> bool {
+    #[cfg(test)]
+    if let Some(ready) = TEST_STATION_READINESS.with(std::cell::Cell::get) {
+        return ready;
+    }
+    crate::socket_client::readiness_path().exists()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_STATION_READINESS: std::cell::Cell<Option<bool>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+struct TestStationReadinessGuard(Option<bool>);
+
+#[cfg(test)]
+impl TestStationReadinessGuard {
+    fn install(ready: bool) -> Self {
+        Self(TEST_STATION_READINESS.with(|value| value.replace(Some(ready))))
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestStationReadinessGuard {
+    fn drop(&mut self) {
+        TEST_STATION_READINESS.with(|value| value.set(self.0));
+    }
 }
 
 /// Validate that `name` exists and passes dependency safety checks.
