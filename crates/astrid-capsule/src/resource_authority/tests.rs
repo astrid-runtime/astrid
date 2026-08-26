@@ -366,6 +366,16 @@ fn scope_is_bounded_and_wrong_kind_is_rejected() {
         ResourceScope::from_identities(ids),
         Err(ResourceErrorCode::InvalidDescriptor)
     );
+    let repeated = std::iter::repeat_n(identity(1), 65);
+    assert_eq!(
+        ResourceScope::from_identities(repeated),
+        Err(ResourceErrorCode::InvalidDescriptor)
+    );
+    assert_eq!(
+        ResourceScope::from_identities(std::iter::repeat_n(identity(1), 64))
+            .expect("64 raw identities remain within the bound"),
+        ResourceScope::singleton(identity(1))
+    );
     let object = identity(9);
     assert_eq!(
         table.admit(

@@ -33,16 +33,24 @@ impl ResourceScope {
     }
 
     /// Build a bounded host selector from already typed identities.
+    ///
+    /// The ceiling is raw input cardinality, not unique-set size.
     pub(crate) fn from_identities<I>(identities: I) -> Result<Self, ResourceErrorCode>
     where
         I: IntoIterator<Item = ResourceId>,
     {
         let mut admitted = BTreeSet::new();
+        // Bound raw input cardinality, not unique-set size, so a repeating or
+        // unbounded iterator still trips the DoS ceiling.
+        let mut raw_count = 0usize;
         for identity in identities {
-            admitted.insert(identity);
-            if admitted.len() > MAX_SCOPE_OBJECTS {
+            raw_count = raw_count
+                .checked_add(1)
+                .ok_or(ResourceErrorCode::InvalidDescriptor)?;
+            if raw_count > MAX_SCOPE_OBJECTS {
                 return Err(ResourceErrorCode::InvalidDescriptor);
             }
+            admitted.insert(identity);
         }
         Ok(Self {
             identities: admitted,
