@@ -50,6 +50,11 @@ const SUCCESS_BOUND_EVENTS: &[&str] = &[
     "closure.bound",
 ];
 
+const RING0_REJECT_ORDER: &[&str] = &["boot.entry", "idt.ready", "closure.reject", "halt"];
+
+/// `isa-debug-exit` maps the ring-0 failure value `0x11` to process exit 35.
+pub const RING0_REJECT_EXIT_CODE: i32 = 35;
+
 /// Loader-measured identities and independent floors expected on serial.
 pub struct ExpectedClosures<'a> {
     pub policy_generation: u64,
@@ -124,6 +129,73 @@ pub fn rejected_without_success_bound_events(events: &[Value]) -> bool {
         && SUCCESS_BOUND_EVENTS
             .iter()
             .all(|name| count_named(events, name) == 0)
+}
+
+/// Assert the executable ring-0 system-generation rejection contract.
+///
+/// The image used by this assertion has a canonical, correctly signed
+/// descriptor whose plan identity differs from compiled `TrustedInput`. It
+/// must therefore pass loader/table binding and reach the kernel before
+/// `verify_manifest` emits `plan_mismatch`. A synthetic serial fixture alone
+/// cannot establish that ordering; callers must supply a real QEMU trace.
+pub fn assert_ring0_plan_mismatch(events: &[Value], exit_code: Option<i32>) -> bool {
+    println!("\n== ring-0 plan-mismatch rejection assertions ==");
+    let mut ok = true;
+    ok &= check(
+        "seq contiguous strictly increasing from 0",
+        contiguous_seq_from_zero(events),
+    );
+    ok &= check(
+        "boot.entry<idt.ready<closure.reject<halt",
+        ordered(events, RING0_REJECT_ORDER),
+    );
+    ok &= check(
+        "exactly one event for each ring-0 rejection milestone",
+        events.len() == RING0_REJECT_ORDER.len()
+            && RING0_REJECT_ORDER
+                .iter()
+                .all(|name| count_named(events, name) == 1),
+    );
+    ok &= check(
+        "closure.reject reason=plan_mismatch",
+        events.iter().any(|event| {
+            ev_name(event) == "closure.reject"
+                && event.get("reason").and_then(Value::as_str) == Some("plan_mismatch")
+        }),
+    );
+    ok &= check(
+        "no success-bound closure events",
+        rejected_without_success_bound_events(events),
+    );
+    ok &= check(
+        "no later init/test success",
+        [
+            "mem.map",
+            "paging.wx",
+            "heap.ready",
+            "apic.timer.start",
+            "apic.timer.tick",
+            "entropy.seeded",
+            "entropy.unavailable",
+            "test.pass",
+            "test.fail",
+        ]
+        .iter()
+        .all(|name| count_named(events, name) == 0),
+    );
+    ok &= check("halt is terminal", halt_is_terminal(events));
+    ok &= check(
+        "halt outcome=fault",
+        events.last().is_some_and(|event| {
+            ev_name(event) == "halt"
+                && event.get("outcome").and_then(Value::as_str) == Some("fault")
+        }),
+    );
+    ok &= check(
+        &format!("QEMU exit code == {RING0_REJECT_EXIT_CODE}"),
+        exit_code == Some(RING0_REJECT_EXIT_CODE),
+    );
+    ok
 }
 
 fn required_events_once(events: &[Value]) -> bool {
@@ -484,6 +556,33 @@ mod tests {
         assert!(!rejected_without_success_bound_events(&parse_events(
             &contaminated
         )));
+    }
+
+    #[test]
+    fn ring0_plan_mismatch_trace_requires_kernel_rejection_shape() {
+        let serial = concat!(
+            "{\"seq\":0,\"ev\":\"boot.entry\"}\n",
+            "{\"seq\":1,\"ev\":\"idt.ready\",\"vectors\":32}\n",
+            "{\"seq\":2,\"ev\":\"closure.reject\",\"reason\":\"plan_mismatch\"}\n",
+            "{\"seq\":3,\"ev\":\"halt\",\"outcome\":\"fault\"}\n",
+        );
+        assert!(assert_ring0_plan_mismatch(&parse_events(serial), Some(35)));
+
+        let loader_reject = serial.replace("plan_mismatch", "binding");
+        assert!(!assert_ring0_plan_mismatch(
+            &parse_events(&loader_reject),
+            Some(35)
+        ));
+        let contaminated = format!("{}{{\"seq\":4,\"ev\":\"handoff.bound\"}}\n", serial);
+        assert!(!assert_ring0_plan_mismatch(
+            &parse_events(&contaminated),
+            Some(35)
+        ));
+        let success_exit = serial.replace("\"outcome\":\"fault\"", "\"outcome\":\"ok\"");
+        assert!(!assert_ring0_plan_mismatch(
+            &parse_events(&success_exit),
+            Some(33)
+        ));
     }
 
     #[test]

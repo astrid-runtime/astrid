@@ -20,7 +20,9 @@ use astrid_native_closure::{
 use astrid_system_generation::MANIFEST_LEN;
 use bootloader_api::info::LoaderHandoffVerification;
 use ktest::determinism::{Determinism, compare_images};
-use ktest::events::{ExpectedClosures, assert_boot, parse_events};
+use ktest::events::{
+    ExpectedClosures, RING0_REJECT_EXIT_CODE, assert_boot, assert_ring0_plan_mismatch, parse_events,
+};
 use ktest::firmware;
 use ktest::image::{KIMAGE_NIGHTLY, KimageInvocation};
 use ktest::machine::{self, EXPECT_EXIT_CODE, QEMU_BIN, TAMPER_TIMEOUT, TIMEOUT};
@@ -59,10 +61,12 @@ fn main() -> Result<()> {
     let image_a = out_dir.join("astrid-native-kernel-a.img");
     let image_b = out_dir.join("astrid-native-kernel-b.img");
     let tampered_image = out_dir.join("astrid-native-kernel-tampered.img");
+    let mismatched_plan_image = out_dir.join("astrid-native-kernel-mismatched-plan.img");
     println!("== building UEFI disk image (x2) ==");
     build_image(&root, &kernel_elf, &image_a)?;
     build_image(&root, &kernel_elf, &image_b)?;
     build_tampered_image(&root, &kernel_elf, &tampered_image)?;
+    build_mismatched_plan_image(&root, &kernel_elf, &mismatched_plan_image)?;
 
     let determinism = compare_images(&image_a, &image_b)?;
     let (kernel_hex, sysgen_hex, kernel_image_hex, closure_table_hex) =
@@ -106,6 +110,30 @@ fn main() -> Result<()> {
             &tampered_image,
             TAMPER_TIMEOUT,
         )?)?;
+        let mismatched_plan_run = run_qemu(
+            &out_dir,
+            &firmware.code,
+            &firmware.vars,
+            &mismatched_plan_image,
+            TAMPER_TIMEOUT,
+        )?;
+        let mismatched_plan_events = parse_events(&mismatched_plan_run.serial);
+        println!(
+            "\n== ring-0 plan-mismatch QEMU serial (exit {:?}) ==\n{}",
+            mismatched_plan_run.exit_code, mismatched_plan_run.serial
+        );
+        if !assert_ring0_plan_mismatch(&mismatched_plan_events, mismatched_plan_run.exit_code) {
+            bail!(
+                "ring-0 plan-mismatch rejection assertions failed (timed_out={}, serial={:?})",
+                mismatched_plan_run.timed_out,
+                mismatched_plan_run.serial
+            );
+        }
+        println!(
+            "ring-0 plan-mismatch rejection: PASS (QEMU exit {}, expected {})",
+            mismatched_plan_run.exit_code.unwrap_or_default(),
+            RING0_REJECT_EXIT_CODE
+        );
         Ok(())
     } else {
         bail!("boot assertions failed");
@@ -135,6 +163,14 @@ fn build_tampered_image(root: &Path, kernel_elf: &Path, output: &Path) -> Result
     run_inherited(
         &mut inv.command_with_tampered_sysgen(root, kernel_elf, output),
         "kimage tampered system-generation descriptor",
+    )
+}
+
+fn build_mismatched_plan_image(root: &Path, kernel_elf: &Path, output: &Path) -> Result<()> {
+    let inv = KimageInvocation::new(root, tools_toolchain());
+    run_inherited(
+        &mut inv.command_with_mismatched_sysgen_plan(root, kernel_elf, output),
+        "kimage mismatched system-generation plan",
     )
 }
 

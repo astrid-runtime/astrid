@@ -1,7 +1,7 @@
 //! Host tool: wrap a kernel ELF into a bootable UEFI disk image.
 //!
 //! Usage: `kimage <kernel-elf> <output-image> --root-key <file>
-//! --kernel-key <file> --sysgen-key <file> [--tamper-handoff|--tamper-sysgen]`. Key files contain exactly 32 raw
+//! --kernel-key <file> --sysgen-key <file> [--tamper-handoff|--tamper-sysgen|--mismatch-sysgen-plan]`. Key files contain exactly 32 raw
 //! seed bytes encoded as 64 hexadecimal characters. No signing material is
 //! taken from the environment or selected by a silent default. The explicit
 //! fixture files under `tools/kimage/fixtures/` are development-only inputs.
@@ -37,6 +37,10 @@ const EMULATOR_ROOT_VERIFY_KEY: [u8; 32] = [
 const LOADER_MEASUREMENT_DOMAIN: &[u8] = b"astrid.kimage.loader.measurement.v1";
 const LOADER_IDENTITY_DOMAIN: &[u8] = b"astrid.kimage.loader.identity.v1";
 const BOOT_CONTEXT_DOMAIN: &[u8] = b"astrid.boot.q35.uefi.tcg.v1";
+/// Deliberately mismatched, but valid, plan identity for the ring-0 reject
+/// falsifier. The descriptor remains canonical and correctly signed; only
+/// compiled TrustedInput admission should reject it.
+const MISMATCH_PLAN_DIGEST: [u8; 32] = [0x99; 32];
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -55,10 +59,11 @@ fn main() -> Result<()> {
     let tamper_handoff = match tamper_arg.as_deref() {
         None => false,
         Some("--tamper-handoff") => true,
-        Some("--tamper-sysgen") => false,
+        Some("--tamper-sysgen" | "--mismatch-sysgen-plan") => false,
         Some(_) => bail!("unexpected argument; {}", usage()),
     };
     let tamper_sysgen = tamper_arg.as_deref() == Some("--tamper-sysgen");
+    let mismatch_sysgen_plan = tamper_arg.as_deref() == Some("--mismatch-sysgen-plan");
     if args.next().is_some() {
         bail!("unexpected argument; {}", usage());
     }
@@ -81,9 +86,14 @@ fn main() -> Result<()> {
     let kernel_identity = ContentId::try_from_bytes(kernel_image.as_bytes()).map_err(|err| {
         anyhow::anyhow!("kernel identity fixture is invalid: {}", err.as_reason())
     })?;
+    let plan_digest = if mismatch_sysgen_plan {
+        MISMATCH_PLAN_DIGEST
+    } else {
+        EMULATOR_PLAN_DIGEST
+    };
     let manifest = SystemGenerationManifest::try_new(ManifestInput {
         kernel_identity,
-        plan_digest: ContentId::try_from_bytes(EMULATOR_PLAN_DIGEST)
+        plan_digest: ContentId::try_from_bytes(plan_digest)
             .map_err(|err| anyhow::anyhow!("plan fixture is invalid: {}", err.as_reason()))?,
         components: EMULATOR_COMPONENTS,
         object_root: ContentId::try_from_bytes(EMULATOR_OBJECT_ROOT)
@@ -159,7 +169,7 @@ fn main() -> Result<()> {
 }
 
 fn usage() -> &'static str {
-    "usage: kimage <kernel-elf> <output-image> --root-key <file> --kernel-key <file> --sysgen-key <file> [--tamper-handoff|--tamper-sysgen]"
+    "usage: kimage <kernel-elf> <output-image> --root-key <file> --kernel-key <file> --sysgen-key <file> [--tamper-handoff|--tamper-sysgen|--mismatch-sysgen-plan]"
 }
 
 fn required_key(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<PathBuf> {

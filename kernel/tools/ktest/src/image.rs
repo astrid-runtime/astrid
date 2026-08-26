@@ -96,6 +96,21 @@ impl KimageInvocation {
         cmd.arg("--tamper-sysgen");
         cmd
     }
+
+    /// Build a canonical, correctly signed descriptor whose plan digest is
+    /// intentionally different from ring 0's compiled TrustedInput. The
+    /// loader/table/handoff bindings are recomputed by kimage, so rejection
+    /// must occur only at the kernel manifest verifier.
+    pub fn command_with_mismatched_sysgen_plan(
+        &self,
+        root: &Path,
+        kernel: &Path,
+        output: &Path,
+    ) -> Command {
+        let mut cmd = self.command(root, kernel, output);
+        cmd.arg("--mismatch-sysgen-plan");
+        cmd
+    }
 }
 
 #[cfg(test)]
@@ -184,5 +199,16 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
         assert!(tampered_args.ends_with(&["--tamper-sysgen".to_string()]));
+
+        let mismatched = inv.command_with_mismatched_sysgen_plan(
+            Path::new("/ws"),
+            Path::new("/k.elf"),
+            Path::new("/o.img"),
+        );
+        let mismatched_args: Vec<String> = mismatched
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(mismatched_args.ends_with(&["--mismatch-sysgen-plan".to_string()]));
     }
 }
