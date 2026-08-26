@@ -21,6 +21,9 @@ mod interpreter;
 mod machine;
 mod ramfs;
 
+#[cfg(test)]
+mod corpus;
+
 pub use astrid_provider::HostPrincipal;
 pub use fixtures::{alice_principal, bob_principal, host_principal_from_stamp_uid};
 pub use image::{
