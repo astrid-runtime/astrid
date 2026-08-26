@@ -52,7 +52,10 @@ use uuid::Uuid;
 
 use crate::socket_client::SocketClient;
 
-use super::server::{TOOLS_LIST_TOPIC, new_req_id, unwrap_reply_payload, unwrap_reply_payload_ref};
+use super::server::{
+    TOOLS_LIST_TOPIC, new_req_id, snapshot_tool_names, unwrap_reply_payload,
+    unwrap_reply_payload_ref,
+};
 
 /// Kernel broadcast emitted once every capsule (re)load completes.
 const CAPSULES_LOADED_TOPIC: &str = "astrid.v1.capsules_loaded";
@@ -115,15 +118,14 @@ pub(super) async fn run(peer: Peer<RoleServer>, principal: String, daemon_root: 
     //     earlier version did) left this one unbound — and silently starved of
     //     every broadcast, so no `tools/list_changed` ever fired.
     //
-    // On a seed failure, fall back to the empty set: the first successful
-    // re-enumeration then over-notifies once (the client harmlessly re-fetches)
-    // rather than under-notifying. The bind still took effect as long as the
-    // request was sent, so the read loop remains live.
-    let mut last_known: BTreeSet<String> = match enumerate_on(&mut watch_client, &principal).await {
-        Ok(names) => names,
+    // A failed seed leaves the baseline unknown.  Keep that distinction: an
+    // empty set is authority-bearing only after a valid epoch and complete
+    // snapshot have been received.
+    let mut last_known = match enumerate_on(&mut watch_client, &principal).await {
+        Ok(state) => Some(state),
         Err(e) => {
-            warn!(error = %e, "MCP hot-reload watcher: baseline seed failed; starting from empty set");
-            BTreeSet::new()
+            warn!(error = %e, "MCP hot-reload watcher: baseline seed failed; waiting for a valid resnapshot");
+            None
         },
     };
 
@@ -152,21 +154,35 @@ pub(super) async fn run(peer: Peer<RoleServer>, principal: String, daemon_root: 
             continue;
         }
 
-        // Read the new tool surface straight from the broadcast PAYLOAD — the
-        // kernel already injected each capsule's described tools into it (see
-        // `astrid_kernel::capsules_loaded`). This is the intended contract: "a
-        // sandboxed consumer derives a deterministic tool surface from this
-        // signal, instead of a racy describe fan-out". An earlier version
-        // re-enumerated over a fresh broker round trip here; that round trip
-        // could time out precisely when a reload was in flight (the broker busy
-        // with its own describe fan-out), silently swallowing the notification.
-        // Reading the payload removes that dependency and fires immediately.
-        debug!(
-            "MCP hot-reload watcher: capsules_loaded received; reading tool surface from payload"
-        );
-        let names = tool_names_from_capsules_loaded(unwrap_reply_payload_ref(&raw), &principal);
+        // `capsules_loaded` is a payload-light hint.  Its epoch is useful only
+        // for anomaly detection; the authoritative tools and epoch come from a
+        // fresh full `tools/list` snapshot on this same authenticated uplink.
+        let hint = unwrap_reply_payload_ref(&raw);
+        let hint_epoch = hint.get("epoch").and_then(Value::as_u64);
+        let expected = last_known
+            .as_ref()
+            .and_then(|state| state.epoch.checked_add(1));
+        let valid_next = valid_next_epoch(last_known.as_ref(), hint_epoch);
+        if !valid_next {
+            debug!(
+                hint_epoch = ?hint_epoch,
+                expected = ?expected,
+                "MCP hot-reload watcher: malformed, stale, reordered, missed, or overflow hint; forcing full resnapshot"
+            );
+        }
 
-        if names == last_known {
+        let refreshed = match enumerate_on(&mut watch_client, &principal).await {
+            Ok(state) => state,
+            Err(error) => {
+                warn!(%error, "MCP hot-reload watcher: full resnapshot failed; retaining prior authority");
+                continue;
+            },
+        };
+        let changed = last_known
+            .as_ref()
+            .is_none_or(|previous| previous.names != refreshed.names);
+        last_known = Some(refreshed);
+        if !changed {
             debug!("MCP hot-reload watcher: tool set unchanged; suppressing notification");
             continue;
         }
@@ -177,24 +193,29 @@ pub(super) async fn run(peer: Peer<RoleServer>, principal: String, daemon_root: 
             return;
         }
         info!(
-            tools = names.len(),
-            "MCP hot-reload watcher: tool set changed; pushed tools/list_changed"
+            "MCP hot-reload watcher: valid resnapshot changed tool set; pushed tools/list_changed"
         );
-        last_known = names;
     }
 }
 
-/// Send a `tools.list` request on the GIVEN uplink and collect the set of tool
-/// names from the broker reply.
-///
-/// The request establishes the baseline inventory. The connection was already
-/// bound to `principal` by the signed native-uplink handshake, so subsequent
-/// per-principal `capsules_loaded` broadcasts route to this watcher without a
-/// first-message identity convention.
-async fn enumerate_on(
-    client: &mut SocketClient,
-    principal: &str,
-) -> anyhow::Result<BTreeSet<String>> {
+/// One complete authority snapshot held by the watcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotState {
+    epoch: u64,
+    names: BTreeSet<String>,
+}
+
+fn valid_next_epoch(last_known: Option<&SnapshotState>, hint_epoch: Option<u64>) -> bool {
+    let Some(expected) = last_known.and_then(|state| state.epoch.checked_add(1)) else {
+        return false;
+    };
+    hint_epoch == Some(expected)
+}
+
+/// Send a `tools.list` request on the given uplink and parse a complete,
+/// epoch-bearing kernel snapshot. A malformed response is an error; callers
+/// retain no synthetic empty authority state.
+async fn enumerate_on(client: &mut SocketClient, principal: &str) -> anyhow::Result<SnapshotState> {
     let req_id = new_req_id();
     let reply_topic = astrid_types::Topic::kernel_response(&req_id);
     let body = json!({ "req_id": req_id });
@@ -211,204 +232,69 @@ async fn enumerate_on(
     let raw = client
         .read_until_topic(&reply_topic, ENUMERATE_DEADLINE)
         .await?;
-    Ok(tool_names_from_reply(&unwrap_reply_payload(&raw)))
-}
-
-/// Extract the set of tool names from a broker `tools.list` reply
-/// (`{ "tools": [{ "name": ... }, ...] }`).
-///
-/// A stable, order-insensitive signature of the tool surface: the watcher
-/// diffs successive sets to suppress no-op `tools/list_changed` notifications
-/// (equal sets ⇒ quiet). A missing or misshapen reply yields the empty set
-/// rather than an error, so a degraded broker reply diffs cleanly instead of
-/// wedging the loop.
-fn tool_names_from_reply(reply: &Value) -> BTreeSet<String> {
-    reply
-        .get("tools")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|t| t.get("name").and_then(Value::as_str))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Extract the set of tool names from an `astrid.v1.capsules_loaded` payload
-/// (`{ "status", "capsules": [{ "principal", "name", "meta": { "tools": [...] } }] }`),
-/// keeping only entries whose per-capsule `principal` matches `principal`.
-///
-/// The kernel injects each capsule's described tool surface into `meta.tools`
-/// (see `astrid_kernel::capsules_loaded`), so the loaded set rides along with
-/// the signal and the watcher never needs a second broker round trip. The
-/// broadcast is already principal-scoped by the cli-proxy, but the payload
-/// carries an explicit per-entry `principal` — honouring it is defense in depth:
-/// a stray cross-principal entry can never widen this watcher's view. Any
-/// missing/`null`/misshapen field degrades to the empty set (never an error),
-/// so a partially-described reload diffs cleanly instead of wedging the loop.
-fn tool_names_from_capsules_loaded(payload: &Value, principal: &str) -> BTreeSet<String> {
-    payload
-        .get("capsules")
-        .and_then(Value::as_array)
-        .map(|caps| {
-            caps.iter()
-                .filter(|c| c.get("principal").and_then(Value::as_str) == Some(principal))
-                .filter_map(|c| {
-                    c.get("meta")
-                        .and_then(|m| m.get("tools"))
-                        .and_then(Value::as_array)
-                })
-                .flatten()
-                .filter_map(|t| t.get("name").and_then(Value::as_str))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+    let (epoch, names) = snapshot_tool_names(&unwrap_reply_payload(&raw))
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok(SnapshotState { epoch, names })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Names are extracted and collected into an order-insensitive set.
-    #[test]
-    fn tool_names_are_extracted_as_a_set() {
-        let reply = json!({ "tools": [
-            { "name": "read_file" },
-            { "name": "write_file" },
-            { "name": "grep_search" },
-        ] });
-        assert_eq!(
-            tool_names_from_reply(&reply),
-            BTreeSet::from([
-                "grep_search".to_string(),
-                "read_file".to_string(),
-                "write_file".to_string(),
-            ])
-        );
+    fn snapshot(names: &[&str], epoch: u64) -> Value {
+        json!({
+            "epoch": epoch,
+            "tools": names.iter().map(|name| json!({
+                "name": name,
+                "description": "",
+                "inputSchema": {},
+            })).collect::<Vec<_>>(),
+        })
     }
 
-    /// A nameless descriptor, a missing `tools` key, and a wrong-typed `tools`
-    /// all degrade to a clean set rather than erroring — a malformed reply must
-    /// never wedge or panic the watch loop.
     #[test]
-    fn malformed_replies_degrade_to_a_clean_set() {
-        let mixed = json!({ "tools": [{ "name": "a" }, { "description": "no name" }, {}] });
-        assert_eq!(
-            tool_names_from_reply(&mixed),
-            BTreeSet::from(["a".to_string()])
-        );
-        assert!(tool_names_from_reply(&json!({})).is_empty());
-        assert!(tool_names_from_reply(&json!({ "tools": "nope" })).is_empty());
+    fn valid_snapshot_accepts_empty_tools_only_with_epoch() {
+        let (_, names) = snapshot_tool_names(&snapshot(&[], 1)).expect("valid empty snapshot");
+        assert!(names.is_empty());
+        assert!(snapshot_tool_names(&json!({ "tools": [] })).is_err());
     }
 
-    /// The diff the watcher keys on: adding or removing a tool changes the set
-    /// (fires a notification), while a pure reorder of the same names does not
-    /// (stays quiet). This is the "quiet when unchanged" contract.
     #[test]
-    fn set_diff_detects_membership_not_order() {
-        let before = tool_names_from_reply(&json!({ "tools": [{ "name": "a" }, { "name": "b" }] }));
-        let added = tool_names_from_reply(
-            &json!({ "tools": [{ "name": "a" }, { "name": "b" }, { "name": "c" }] }),
-        );
-        let removed = tool_names_from_reply(&json!({ "tools": [{ "name": "a" }] }));
-        let reordered =
-            tool_names_from_reply(&json!({ "tools": [{ "name": "b" }, { "name": "a" }] }));
-
-        assert_ne!(before, added, "an added tool must be a detected change");
-        assert_ne!(before, removed, "a removed tool must be a detected change");
-        assert_eq!(
-            before, reordered,
-            "reordering identical names must stay quiet"
-        );
-    }
-
-    /// Tool names are read from `capsules[].meta.tools[].name` across every
-    /// capsule entry that belongs to the watcher's principal.
-    #[test]
-    fn capsules_loaded_collects_tools_across_capsules() {
-        let payload = json!({
-            "status": "ready",
-            "capsules": [
-                { "principal": "default", "name": "astrid-capsule-system",
-                  "meta": { "tools": [{ "name": "system_status" }] } },
-                { "principal": "default", "name": "astrid-capsule-fs",
-                  "meta": { "tools": [{ "name": "read_file" }, { "name": "write_file" }] } },
-            ]
-        });
-        assert_eq!(
-            tool_names_from_capsules_loaded(&payload, "default"),
-            BTreeSet::from([
-                "read_file".to_string(),
-                "system_status".to_string(),
-                "write_file".to_string(),
-            ])
-        );
-    }
-
-    /// Only entries stamped with the watcher's principal count — a
-    /// cross-principal entry can never widen the view.
-    #[test]
-    fn capsules_loaded_filters_by_principal() {
-        let payload = json!({
-            "capsules": [
-                { "principal": "default", "name": "a", "meta": { "tools": [{ "name": "mine" }] } },
-                { "principal": "bob", "name": "b", "meta": { "tools": [{ "name": "theirs" }] } },
-            ]
-        });
-        assert_eq!(
-            tool_names_from_capsules_loaded(&payload, "default"),
-            BTreeSet::from(["mine".to_string()])
-        );
-    }
-
-    /// A `null` meta, a meta with no `tools`, a nameless descriptor, and a
-    /// missing/misshapen `capsules` all degrade to the empty set rather than
-    /// erroring — a partially-described reload must never wedge the loop.
-    #[test]
-    fn capsules_loaded_degrades_on_missing_fields() {
-        let ragged = json!({
-            "capsules": [
-                { "principal": "default", "name": "a", "meta": null },
-                { "principal": "default", "name": "b", "meta": { "version": "1.0.0" } },
-                { "principal": "default", "name": "c", "meta": { "tools": [{ "no": "name" }] } },
-            ]
-        });
-        assert!(tool_names_from_capsules_loaded(&ragged, "default").is_empty());
-        assert!(tool_names_from_capsules_loaded(&json!({}), "default").is_empty());
+    fn malformed_snapshot_is_an_error_not_empty() {
+        assert!(snapshot_tool_names(&json!({})).is_err());
+        assert!(snapshot_tool_names(&json!({ "epoch": 2, "tools": "nope" })).is_err());
         assert!(
-            tool_names_from_capsules_loaded(&json!({ "capsules": "nope" }), "default").is_empty()
+            snapshot_tool_names(&json!({
+                "epoch": 2,
+                "tools": [{ "name": "broken", "inputSchema": null }]
+            }))
+            .is_err()
         );
     }
 
-    /// End-to-end diff contract: installing a capsule (its tools appear in the
-    /// next broadcast) is a detected change; unloading one (its tools vanish)
-    /// is too. This is exactly the signal the watch loop keys its
-    /// `tools/list_changed` push on.
     #[test]
-    fn capsules_loaded_diff_tracks_install_and_unload() {
-        let base = tool_names_from_capsules_loaded(
-            &json!({ "capsules": [
-                { "principal": "default", "name": "sys", "meta": { "tools": [{ "name": "system_status" }] } }
-            ] }),
-            "default",
-        );
-        let after_install = tool_names_from_capsules_loaded(
-            &json!({ "capsules": [
-                { "principal": "default", "name": "sys", "meta": { "tools": [{ "name": "system_status" }] } },
-                { "principal": "default", "name": "fs", "meta": { "tools": [{ "name": "read_file" }] } }
-            ] }),
-            "default",
-        );
-        assert_ne!(
-            base, after_install,
-            "a newly installed capsule's tools must register as a change"
-        );
-        // Unload returns to the base surface — also a change from `after_install`.
-        assert_ne!(
-            after_install, base,
-            "an unloaded capsule's tools vanishing must register as a change"
-        );
+    fn duplicate_stale_reordered_missed_and_overflow_hints_require_resnapshot() {
+        let current = SnapshotState {
+            epoch: 7,
+            names: BTreeSet::from(["a".to_string()]),
+        };
+        for hint in [None, Some(0), Some(7), Some(6), Some(9)] {
+            assert!(!valid_next_epoch(Some(&current), hint));
+        }
+        assert!(valid_next_epoch(Some(&current), Some(8)));
+        let overflow = SnapshotState {
+            epoch: u64::MAX,
+            names: BTreeSet::new(),
+        };
+        assert!(!valid_next_epoch(Some(&overflow), Some(u64::MAX)));
+    }
+
+    #[test]
+    fn disjoint_name_sets_remain_disjoint_after_resnapshot() {
+        let (_, alice) = snapshot_tool_names(&snapshot(&["a"], 1)).expect("alice");
+        let (_, bob) = snapshot_tool_names(&snapshot(&["b"], 1)).expect("bob");
+        assert_eq!(alice, BTreeSet::from(["a".to_string()]));
+        assert_eq!(bob, BTreeSet::from(["b".to_string()]));
+        assert!(alice.is_disjoint(&bob));
     }
 }

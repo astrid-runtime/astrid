@@ -57,6 +57,7 @@ pub(crate) fn without_tools(meta: Option<Value>) -> Option<Value> {
 /// `{ "tools": [...] }` object so the consumer sees the surface either way. The
 /// kernel does not interpret the descriptors — it forwards what the capsule
 /// reported.
+#[cfg(test)]
 pub(crate) fn inject_tools(meta: Option<Value>, tools: Value) -> Value {
     let mut obj = match meta {
         Some(Value::Object(map)) => map,
@@ -78,13 +79,33 @@ pub(crate) fn inject_tools(meta: Option<Value>, tools: Value) -> Value {
 pub(crate) fn build_capsules_loaded_payload(
     entries: Vec<(String, String, Option<Value>)>,
 ) -> Value {
+    build_capsules_loaded_payload_with_optional_epoch(entries, None)
+}
+
+/// Build a principal-scoped inventory hint carrying a successfully allocated
+/// MCP namespace epoch.  The epoch is omitted when snapshot production failed;
+/// consumers must treat that hint as malformed and perform a full resnapshot.
+pub(crate) fn build_capsules_loaded_payload_with_epoch(
+    entries: Vec<(String, String, Option<Value>)>,
+    epoch: u64,
+) -> Value {
+    build_capsules_loaded_payload_with_optional_epoch(entries, Some(epoch))
+}
+
+fn build_capsules_loaded_payload_with_optional_epoch(
+    entries: Vec<(String, String, Option<Value>)>,
+    epoch: Option<u64>,
+) -> Value {
     let capsules: Vec<Value> = entries
         .into_iter()
         .map(
             |(principal, name, meta)| json!({ "principal": principal, "name": name, "meta": meta }),
         )
         .collect();
-    json!({ "status": "ready", "capsules": capsules })
+    match epoch {
+        Some(epoch) => json!({ "status": "ready", "epoch": epoch, "capsules": capsules }),
+        None => json!({ "status": "ready", "capsules": capsules }),
+    }
 }
 
 #[cfg(test)]

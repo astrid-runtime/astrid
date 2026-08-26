@@ -24,7 +24,9 @@ pub(crate) use identity::{arm_authorize_identity_gate, arm_confirm_policy_identi
 pub(crate) use rate_limit::ManagementRateLimiter;
 #[cfg(test)]
 pub(crate) use rate_limit::rate_limit_for_request;
-pub(crate) use response::{KeepalivePinger, publish_response, workspace_commit_response};
+pub(crate) use response::{
+    KeepalivePinger, publish_response, publish_response_value, workspace_commit_response,
+};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

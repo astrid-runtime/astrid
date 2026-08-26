@@ -45,6 +45,9 @@ mod parent_death;
 mod readiness;
 mod server;
 mod session_guard;
+#[cfg(test)]
+#[path = "snapshot_epoch_tests.rs"]
+mod snapshot_epoch_tests;
 mod watch;
 
 use std::path::{Path, PathBuf};

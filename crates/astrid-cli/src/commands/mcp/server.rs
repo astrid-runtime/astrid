@@ -31,6 +31,7 @@
 //! reply frame is never consumed by the wrong waiter.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -461,11 +462,7 @@ impl ServerHandler for AstridMcpServer {
 
         let reply = self.round_trip(TOOLS_LIST_TOPIC, &req_id, body).await?;
 
-        let tools = reply
-            .get("tools")
-            .and_then(Value::as_array)
-            .map(|arr| arr.iter().filter_map(tool_from_descriptor).collect())
-            .unwrap_or_default();
+        let tools = snapshot_tools_from_reply(&reply)?;
 
         Ok(ListToolsResult::with_all_items(tools))
     }
@@ -729,33 +726,91 @@ pub(super) fn unwrap_reply_payload_ref(raw: &Value) -> &Value {
     payload
 }
 
-/// Translate one broker MCP descriptor
-/// (`{ name, title?, description, inputSchema, capabilities? }`) into an
-/// rmcp [`Tool`]. Descriptors missing a name or schema object are
-/// skipped — the broker already charset-gates names, so this is a
-/// shape, not a trust, check.
-fn tool_from_descriptor(desc: &Value) -> Option<Tool> {
-    let name = desc.get("name").and_then(Value::as_str)?.to_string();
+/// Parse the private namespace epoch carried by a kernel snapshot response.
+///
+/// Epoch `0`, a missing field, or a non-integer is malformed. In particular,
+/// callers must not turn a malformed response into an empty `tools/list`.
+pub(super) fn snapshot_epoch(reply: &Value) -> Result<u64, McpError> {
+    if let Some(error) = reply.get("error").and_then(Value::as_str) {
+        return Err(McpError::internal_error(error.to_string(), None));
+    }
+    reply
+        .get("epoch")
+        .and_then(Value::as_u64)
+        .filter(|epoch| *epoch > 0)
+        .ok_or_else(|| McpError::internal_error("MCP snapshot has no valid epoch", None))
+}
 
-    // `Tool::input_schema` is a JSON object; default to an empty schema
-    // when the descriptor omits or malforms it rather than dropping the
-    // tool entirely.
+/// Parse a complete kernel snapshot into rmcp tools. Every descriptor must
+/// have a name and object-valued JSON schema; malformed entries are errors so a
+/// consumer cannot accidentally expose a partial or empty authority view.
+fn snapshot_tools_from_reply(reply: &Value) -> Result<Vec<Tool>, McpError> {
+    let _epoch = snapshot_epoch(reply)?;
+    let descriptors = reply
+        .get("tools")
+        .and_then(Value::as_array)
+        .ok_or_else(|| McpError::internal_error("MCP snapshot has no tools array", None))?;
+    descriptors.iter().map(tool_from_descriptor).collect()
+}
+
+/// Parse a complete kernel snapshot into an order-insensitive set of names.
+/// The watcher uses this only after validating the epoch and every descriptor.
+pub(super) fn snapshot_tool_names(reply: &Value) -> Result<(u64, BTreeSet<String>), McpError> {
+    let epoch = snapshot_epoch(reply)?;
+    let descriptors = reply
+        .get("tools")
+        .and_then(Value::as_array)
+        .ok_or_else(|| McpError::internal_error("MCP snapshot has no tools array", None))?;
+    let mut names = BTreeSet::new();
+    for descriptor in descriptors {
+        let _ = tool_from_descriptor(descriptor)?;
+        let name = descriptor
+            .get("name")
+            .and_then(Value::as_str)
+            .expect("tool_from_descriptor validated name");
+        names.insert(name.to_string());
+    }
+    Ok((epoch, names))
+}
+
+/// Translate one kernel MCP descriptor (`{ name, description, inputSchema }`)
+/// into an rmcp [`Tool`]. The kernel emits a complete descriptor, so missing or
+/// malformed fields are rejected rather than defaulted.
+fn tool_from_descriptor(desc: &Value) -> Result<Tool, McpError> {
+    let name = desc
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| McpError::internal_error("MCP snapshot tool has no name", None))?
+        .to_string();
+
     let input_schema = desc
         .get("inputSchema")
+        .or_else(|| desc.get("input_schema"))
         .and_then(Value::as_object)
         .cloned()
-        .unwrap_or_default();
+        .ok_or_else(|| McpError::internal_error("MCP snapshot tool has no input schema", None))?;
 
     let description = desc
         .get("description")
-        .and_then(Value::as_str)
-        .map(|s| Cow::Owned(s.to_string()));
+        .map(|value| {
+            value
+                .as_str()
+                .map(|text| Cow::Owned(text.to_string()))
+                .ok_or_else(|| {
+                    McpError::internal_error("MCP snapshot tool has invalid description", None)
+                })
+        })
+        .transpose()?;
 
     let mut tool = Tool::new_with_raw(name, description, Arc::new(input_schema));
-    if let Some(title) = desc.get("title").and_then(Value::as_str) {
+    if let Some(title) = desc.get("title") {
+        let title = title
+            .as_str()
+            .ok_or_else(|| McpError::internal_error("MCP snapshot tool has invalid title", None))?;
         tool = tool.with_title(title);
     }
-    Some(tool)
+    Ok(tool)
 }
 
 /// Translate one broker content block into rmcp [`ContentBlock`].
