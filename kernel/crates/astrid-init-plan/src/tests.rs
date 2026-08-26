@@ -109,6 +109,7 @@ struct Driver {
     readiness_failures: Vec<u8>,
     pending_polls: Vec<u8>,
     stop_failures: Vec<u8>,
+    stop_failures_once: Vec<u8>,
     fail_publish: bool,
     fail_retire: bool,
 }
@@ -143,6 +144,11 @@ impl Driver {
 
     fn fail_stop_at(mut self, component: u8) -> Self {
         self.stop_failures.push(component);
+        self
+    }
+
+    fn fail_stop_once_at(mut self, component: u8) -> Self {
+        self.stop_failures_once.push(component);
         self
     }
 }
@@ -192,6 +198,13 @@ impl ServiceDriver for Driver {
         let id = Self::component(component);
         self.stops.push(id);
         if self.stop_failures.contains(&id) {
+            Err(id)
+        } else if let Some(position) = self
+            .stop_failures_once
+            .iter()
+            .position(|candidate| *candidate == id)
+        {
+            self.stop_failures_once.swap_remove(position);
             Err(id)
         } else {
             Ok(())
@@ -345,6 +358,26 @@ fn cleanup_attempts_every_started_service_after_a_stop_error() {
     assert_eq!(plan.state(), LifecycleState::Failed);
     assert_eq!(driver.stops, vec![3, 2, 1]);
     assert_eq!(driver.publish_calls, 0);
+}
+
+#[test]
+fn failed_compensation_retains_stop_bit_for_recovery_retry() {
+    let original = verified(2, 37);
+    let fresh = verified(1, 38);
+    let mut plan = InitPlan::try_from_verified(original).expect("plan");
+    let mut driver = Driver::default().fail_readiness_at(2).fail_stop_once_at(2);
+
+    assert!(matches!(
+        plan.run(&mut driver),
+        Err(LifecycleError::Readiness { .. })
+    ));
+    assert_eq!(plan.state(), LifecycleState::Failed);
+    assert_eq!(driver.stops, vec![2, 1]);
+
+    plan.recover(fresh, &mut driver).expect("retry failed stop");
+    assert_eq!(driver.stops, vec![2, 1, 2]);
+    assert_eq!(plan.state(), LifecycleState::Verified);
+    assert_eq!(plan.generation_identity(), fresh.manifest_identity());
 }
 
 #[test]

@@ -6,7 +6,7 @@ use crate::driver::{Readiness, ServiceDriver};
 use crate::error::{LifecycleError, PlanError};
 use crate::types::{
     ComponentId, ComponentIds, LifecycleState, MAX_READINESS_POLLS, MAX_SERVICES,
-    MAX_START_ATTEMPTS, MAX_STEPS,
+    MAX_START_ATTEMPTS, MAX_STEPS, StartedMask,
 };
 
 /// Fixed protocol/DoS ceilings and the per-run budgets selected under them.
@@ -83,7 +83,7 @@ pub struct InitPlan {
     components: ComponentIds,
     limits: PlanLimits,
     state: LifecycleState,
-    started_mask: u8,
+    started_mask: StartedMask,
     retire_pending: bool,
     steps: usize,
 }
@@ -136,7 +136,7 @@ impl InitPlan {
             components,
             limits,
             state: LifecycleState::Verified,
-            started_mask: 0,
+            started_mask: StartedMask::empty(),
             retire_pending: false,
             steps: 0,
         })
@@ -181,14 +181,14 @@ impl InitPlan {
     ) -> Result<(), LifecycleError<D::Error>> {
         match self.state {
             LifecycleState::Verified => {},
-            LifecycleState::Failed if self.started_mask == 0 && !self.retire_pending => {},
+            LifecycleState::Failed if self.started_mask.is_empty() && !self.retire_pending => {},
             LifecycleState::Failed => return Err(LifecycleError::InvalidState(self.state)),
             state => return Err(LifecycleError::InvalidState(state)),
         }
 
         self.state = LifecycleState::Starting;
         self.steps = 0;
-        self.started_mask = 0;
+        self.started_mask = StartedMask::empty();
 
         let mut index = 0;
         while index < self.components.len() {
@@ -201,18 +201,23 @@ impl InitPlan {
                 if let Err(error) = self.step::<D>() {
                     return self.fail(driver, error);
                 }
+                if !self.started_mask.set(index) {
+                    return self.fail(driver, LifecycleError::Plan(PlanError::TooManyServices));
+                }
                 match driver.start(component) {
                     Ok(()) => {
                         started = true;
                         break;
                     },
-                    Err(_) => attempts += 1,
+                    Err(_) => {
+                        self.started_mask.clear(index);
+                        attempts += 1;
+                    },
                 }
             }
             if !started {
                 return self.fail(driver, LifecycleError::StartAttemptsExhausted { component });
             }
-            self.started_mask |= 1 << index;
             index += 1;
         }
 
@@ -264,7 +269,8 @@ impl InitPlan {
 
     /// Replace a failed/stopped plan with a fresh caller-selected verified
     /// generation. Slot selection, storage lookup, and reconciliation remain
-    /// outside this crate.
+    /// outside this crate. Recovery of a failed plan retries retained started
+    /// and retire-pending state before installing the replacement.
     pub fn recover<D: ServiceDriver>(
         &mut self,
         fresh: VerifiedGeneration,
@@ -282,7 +288,7 @@ impl InitPlan {
             self.state,
             LifecycleState::Published | LifecycleState::Starting | LifecycleState::ReadyUnpublished
         ) || (self.state == LifecycleState::Failed
-            && (self.started_mask != 0 || self.retire_pending));
+            && (!self.started_mask.is_empty() || self.retire_pending));
         if needs_stop {
             self.stop(driver)?;
         }
@@ -298,7 +304,7 @@ impl InitPlan {
     ) -> Result<(), LifecycleError<D::Error>> {
         match self.state {
             LifecycleState::Stopped => return Ok(()),
-            LifecycleState::Failed if self.started_mask == 0 && !self.retire_pending => {
+            LifecycleState::Failed if self.started_mask.is_empty() && !self.retire_pending => {
                 return Ok(());
             },
             LifecycleState::Verified => {
@@ -327,12 +333,7 @@ impl InitPlan {
         } else if was_published {
             self.retire_pending = false;
         }
-        let mut index = self.components.len();
-        while index != 0 {
-            index -= 1;
-            if self.started_mask & (1 << index) == 0 {
-                continue;
-            }
+        for index in self.started_mask.reverse_indices(self.components.len()) {
             let Some(component) = self.components.get(index) else {
                 self.state = LifecycleState::Failed;
                 continue;
@@ -353,7 +354,7 @@ impl InitPlan {
                     break;
                 }
             } else {
-                self.started_mask &= !(1 << index);
+                self.started_mask.clear(index);
             }
         }
         if let Some(error) = primary {
@@ -382,12 +383,7 @@ impl InitPlan {
     ) -> Result<(), LifecycleError<D::Error>> {
         self.state = LifecycleState::Stopping;
         let mut cleanup_error: Option<LifecycleError<D::Error>> = None;
-        let mut index = self.components.len();
-        while index != 0 {
-            index -= 1;
-            if self.started_mask & (1 << index) == 0 {
-                continue;
-            }
+        for index in self.started_mask.reverse_indices(self.components.len()) {
             let Some(component) = self.components.get(index) else {
                 continue;
             };
@@ -398,7 +394,9 @@ impl InitPlan {
                 break;
             }
             match driver.stop(component) {
-                Ok(()) => self.started_mask &= !(1 << index),
+                Ok(()) => {
+                    self.started_mask.clear(index);
+                },
                 Err(error) if cleanup_error.is_none() => {
                     cleanup_error = Some(LifecycleError::Stop {
                         component,
