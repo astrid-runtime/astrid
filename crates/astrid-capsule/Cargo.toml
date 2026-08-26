@@ -26,6 +26,7 @@ astrid-core = { workspace = true }
 astrid-crypto = { workspace = true }
 astrid-events = { workspace = true }
 astrid-runtime = { workspace = true }
+astrid-resource-types = { workspace = true }
 astrid-storage = { workspace = true }
 anyhow = { workspace = true }
 arc-swap = { workspace = true }

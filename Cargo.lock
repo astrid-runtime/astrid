@@ -394,6 +394,7 @@ dependencies = [
  "astrid-crypto",
  "astrid-events",
  "astrid-mcp",
+ "astrid-resource-types",
  "astrid-runtime",
  "astrid-storage",
  "astrid-uplink",
