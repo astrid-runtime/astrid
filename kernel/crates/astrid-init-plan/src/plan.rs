@@ -346,8 +346,11 @@ impl InitPlan {
                     })
             }) {
                 self.state = LifecycleState::Failed;
-                if primary.is_none() {
+                if primary.is_none() || matches!(&error, LifecycleError::StepBudgetExceeded) {
                     primary = Some(error);
+                }
+                if matches!(&primary, Some(LifecycleError::StepBudgetExceeded)) {
+                    break;
                 }
             } else {
                 self.started_mask &= !(1 << index);
@@ -367,8 +370,10 @@ impl InitPlan {
         error: LifecycleError<D::Error>,
     ) -> Result<(), LifecycleError<D::Error>> {
         self.state = LifecycleState::Failed;
-        let _ = self.cleanup(driver);
-        Err(error)
+        match self.cleanup(driver) {
+            Err(LifecycleError::StepBudgetExceeded) => Err(LifecycleError::StepBudgetExceeded),
+            _ => Err(error),
+        }
     }
 
     fn cleanup<D: ServiceDriver>(
@@ -386,6 +391,12 @@ impl InitPlan {
             let Some(component) = self.components.get(index) else {
                 continue;
             };
+            // Reserve the call before invoking the driver. If the budget is
+            // exhausted, retain this bit and let a later recovery retry it.
+            if let Err(error) = self.step::<D>() {
+                cleanup_error = Some(error);
+                break;
+            }
             match driver.stop(component) {
                 Ok(()) => self.started_mask &= !(1 << index),
                 Err(error) if cleanup_error.is_none() => {
@@ -405,13 +416,13 @@ impl InitPlan {
     }
 
     fn step<D: ServiceDriver>(&mut self) -> Result<(), LifecycleError<D::Error>> {
+        if self.steps >= self.limits.steps {
+            return Err(LifecycleError::StepBudgetExceeded);
+        }
         self.steps = self
             .steps
             .checked_add(1)
             .ok_or(LifecycleError::StepBudgetExceeded)?;
-        if self.steps > self.limits.steps {
-            return Err(LifecycleError::StepBudgetExceeded);
-        }
         Ok(())
     }
 }

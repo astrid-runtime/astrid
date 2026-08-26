@@ -118,6 +118,14 @@ impl Driver {
         component.as_bytes()[0]
     }
 
+    fn call_count(&self) -> usize {
+        self.starts.len()
+            + self.readiness.len()
+            + self.stops.len()
+            + self.publish_calls
+            + self.retire_calls
+    }
+
     fn fail_start_at(mut self, component: u8) -> Self {
         self.start_failures.push(component);
         self
@@ -337,6 +345,28 @@ fn cleanup_attempts_every_started_service_after_a_stop_error() {
     assert_eq!(plan.state(), LifecycleState::Failed);
     assert_eq!(driver.stops, vec![3, 2, 1]);
     assert_eq!(driver.publish_calls, 0);
+}
+
+#[test]
+fn cleanup_budget_is_hard_bound_and_recovery_resumes_retained_teardown() {
+    let limits = PlanLimits::try_new(3, 3, 4).expect("limits");
+    let mut plan = InitPlan::try_from_verified_with_limits(verified(2, 36), limits).expect("plan");
+    let mut driver = Driver::default().fail_readiness_at(2);
+
+    assert_eq!(
+        plan.run(&mut driver),
+        Err(LifecycleError::StepBudgetExceeded)
+    );
+    assert_eq!(driver.call_count(), 4);
+    assert!(driver.stops.is_empty());
+    assert_eq!(plan.state(), LifecycleState::Failed);
+
+    let fresh = verified(1, 37);
+    plan.recover(fresh, &mut driver).expect("bounded recovery");
+    assert_eq!(driver.stops, vec![2, 1]);
+    assert_eq!(plan.state(), LifecycleState::Verified);
+    assert_eq!(plan.component_count(), 1);
+    assert_eq!(plan.generation_identity(), fresh.manifest_identity());
 }
 
 #[test]
