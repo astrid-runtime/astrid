@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use crate::socket_client::SocketClient;
 
-use super::server::{TOOLS_LIST_TOPIC, new_req_id};
+use super::server::{TOOLS_LIST_TOPIC, new_req_id, snapshot_tool_names, unwrap_reply_payload};
 
 const CAPSULES_LOADED_TOPIC: &str = "astrid.v1.capsules_loaded";
 
@@ -152,8 +152,15 @@ async fn wait_for_broker_on<I: ReadinessIo>(
 
         let topic = raw.get("topic").and_then(Value::as_str);
         if topic.is_some_and(|topic| outstanding.contains(topic)) {
-            info!(%principal, "MCP broker readiness confirmed");
-            return Ok(());
+            match snapshot_tool_names(&unwrap_reply_payload(&raw)) {
+                Ok((_epoch, _names)) => {
+                    info!(%principal, "MCP snapshot readiness confirmed");
+                    return Ok(());
+                },
+                Err(error) => {
+                    debug!(%principal, %error, "MCP readiness probe returned malformed snapshot; retrying");
+                },
+            }
         }
 
         if topic == Some(CAPSULES_LOADED_TOPIC) {
@@ -262,7 +269,7 @@ mod tests {
                     "principal": self.principal.to_string(),
                     "payload": {
                         "type": "raw_json",
-                        "value": { "kind": "tools.list", "req_id": req_id, "tools": [] }
+                        "value": { "kind": "tools.list", "req_id": req_id, "epoch": 1, "tools": [] }
                     }
                 })));
             }

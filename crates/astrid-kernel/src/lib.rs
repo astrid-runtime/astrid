@@ -29,6 +29,9 @@ mod bus_monitor;
 mod capsule_adversarial_tests;
 /// `astrid.v1.capsules_loaded` payload assembly (opaque per-capsule metadata).
 mod capsules_loaded;
+#[cfg(all(test, unix))]
+#[path = "capsules_loaded_epoch_tests.rs"]
+mod capsules_loaded_epoch_tests;
 #[cfg(test)]
 mod capsules_loaded_tests;
 /// Internal first-owner enrollment and boot-authority gate.
@@ -56,6 +59,8 @@ pub mod invite;
 pub mod kernel_router;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod legacy_migration_barrier;
+/// Kernel-owned principal-scoped MCP tool snapshots and namespace epochs.
+mod mcp_snapshot;
 /// Persistent pair-device token store (issue #756).
 pub mod pair_token;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -104,6 +109,11 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, RwLock};
+
+use mcp_snapshot::{McpNamespaceEpoch, McpSnapshotStore, McpToolSnapshot};
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+const MCP_TOOLS_LIST_TOPIC: &str = "astrid.v1.request.mcp.tools.list";
 
 const SCOPED_TOPIC_PROBE_SENTINEL: &str = "\0astrid.scoped-topic\0";
 const SCOPED_SERVICE_PROBE_SENTINEL: &str = "\0astrid.scoped-service\0";
@@ -318,6 +328,10 @@ pub struct Kernel {
     /// identical view cannot resume it mid-drain. Weak values make idle keys
     /// self-evicting without an unbounded fleet-history map.
     capsule_view_locks: Arc<DashMap<CapsuleViewKey, Weak<Mutex<()>>>>,
+    /// Last complete MCP tool surface for each principal.  Replacement is
+    /// guarded by one async mutex so descriptors and their private epoch become
+    /// visible together.
+    mcp_snapshots: Arc<Mutex<McpSnapshotStore>>,
     /// Ephemeral mode: shut down immediately when the last client disconnects.
     pub ephemeral: AtomicBool,
     /// Instant when the kernel was booted (for uptime calculation). Crate-
@@ -1280,6 +1294,7 @@ impl Kernel {
             full_reload_in_flight: AtomicBool::new(false),
             capsule_load_lock: Mutex::new(()),
             capsule_view_locks: Arc::new(DashMap::new()),
+            mcp_snapshots: Arc::new(Mutex::new(McpSnapshotStore::default())),
             ephemeral: AtomicBool::new(false),
             boot_time: astrid_runtime::time::Instant::now(),
             shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -1314,6 +1329,7 @@ impl Kernel {
             drop(spawn_idle_monitor(Arc::clone(&kernel)));
             drop(spawn_react_watchdog(Arc::clone(&kernel)));
             drop(spawn_capsule_health_monitor(Arc::clone(&kernel)));
+            drop(Self::spawn_mcp_tools_list_responder(Arc::clone(&kernel)));
         }
         // Passive storm diagnostics — subscribes synchronously inside the
         // call (before the debug-assert below) so it counts toward
@@ -2685,36 +2701,197 @@ impl Kernel {
         }
     }
 
+    /// Build and atomically publish one principal's complete MCP tool surface.
+    ///
+    /// The registry view is only a candidate set: every runtime is intersected
+    /// with the authenticated principal's live capsule grants before its
+    /// descriptor is admitted.  A failed profile resolution or descriptor
+    /// probe is an error, never a valid empty surface.  Descriptors are fully
+    /// materialized before the store lock is taken, then the epoch and vector
+    /// are replaced together under that lock.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn refresh_mcp_snapshot(
+        &self,
+        principal: &PrincipalId,
+    ) -> anyhow::Result<McpNamespaceEpoch> {
+        let runtimes = if *principal == PrincipalId::anonymous() {
+            Vec::new()
+        } else {
+            let registry = self.capsules.read().await;
+            registry.cloned_runtimes_for(principal)
+        };
+        self.refresh_mcp_snapshot_from_runtimes(principal, runtimes)
+            .await
+    }
+
+    async fn refresh_mcp_snapshot_from_runtimes(
+        &self,
+        principal: &PrincipalId,
+        runtimes: Vec<(
+            astrid_capsule::registry::RuntimeId,
+            Arc<dyn astrid_capsule::capsule::Capsule>,
+        )>,
+    ) -> anyhow::Result<McpNamespaceEpoch> {
+        let resolver = astrid_capsule::CapsuleAccessResolver::new(
+            Arc::clone(&self.profile_cache),
+            Arc::clone(&self.groups),
+        );
+        let anonymous = *principal == PrincipalId::anonymous();
+        if !anonymous && !resolver.principal_is_resolvable(principal) {
+            anyhow::bail!("principal '{principal}' has no resolvable enabled profile");
+        }
+
+        let mut tools = Vec::new();
+        for (runtime_id, capsule) in runtimes {
+            let capsule_id = runtime_id.key().capsule_id();
+            if !resolver.is_capsule_allowed(Some(principal.as_str()), capsule_id) {
+                continue;
+            }
+            let Some(mut described) =
+                astrid_capsule::describe_loaded_capsule_status_for(capsule.as_ref(), principal)
+                    .await?
+            else {
+                anyhow::bail!(
+                    "tool surface for capsule '{capsule_id}' is unavailable for principal '{principal}'"
+                );
+            };
+            tools.append(&mut described);
+        }
+
+        // Keep the wire surface deterministic across registry map iteration and
+        // capsule reloads.  Tool names are the MCP dispatch key, so duplicate
+        // names are collapsed to the first descriptor in stable order.
+        tools.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.description.cmp(&right.description))
+                .then_with(|| {
+                    left.input_schema
+                        .to_string()
+                        .cmp(&right.input_schema.to_string())
+                })
+        });
+        tools.dedup_by(|left, right| left.name == right.name);
+
+        let mut store = self.mcp_snapshots.lock().await;
+        let snapshot = store
+            .replace(principal.clone(), tools)
+            .ok_or_else(|| anyhow::anyhow!("MCP namespace epoch exhausted for '{principal}'"))?;
+        Ok(snapshot.epoch)
+    }
+
+    /// Return the latest principal snapshot, producing one on first request.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn mcp_snapshot_for(
+        &self,
+        principal: &PrincipalId,
+    ) -> anyhow::Result<Arc<McpToolSnapshot>> {
+        if let Some(snapshot) = self.mcp_snapshots.lock().await.get(principal) {
+            return Ok(snapshot);
+        }
+        self.refresh_mcp_snapshot(principal).await?;
+        self.mcp_snapshots
+            .lock()
+            .await
+            .get(principal)
+            .ok_or_else(|| anyhow::anyhow!("MCP snapshot disappeared for '{principal}'"))
+    }
+
+    /// Answer the existing MCP `tools/list` request topic from the kernel's
+    /// authenticated snapshot store.  This responder is deliberately separate
+    /// from the capsule router: no out-of-tree broker is required for list
+    /// completeness, and the caller principal is taken from the signed IPC
+    /// ingress rather than from the request body.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn spawn_mcp_tools_list_responder(kernel: Arc<Self>) -> astrid_runtime::JoinHandle<()> {
+        let mut receiver = kernel
+            .event_bus
+            .subscribe_topic_as(MCP_TOOLS_LIST_TOPIC, "mcp_snapshot");
+        astrid_runtime::spawn(async move {
+            while let Some(event) = receiver.recv().await {
+                let astrid_events::AstridEvent::Ipc { message, .. } = &*event else {
+                    continue;
+                };
+                let astrid_events::ipc::IpcPayload::RawJson(body) = &message.payload else {
+                    continue;
+                };
+                // Native uplink ingress rebuilds client messages with a nil
+                // source id after authenticating the socket.  A capsule
+                // publish carries its own runtime UUID and must not be able to
+                // turn a caller-controlled principal string into a snapshot
+                // read, even when it has publish access to the shared request
+                // namespace.
+                if message.source_id != uuid::Uuid::nil() {
+                    continue;
+                }
+                let Some(req_id) = body.get("req_id").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                if req_id.is_empty() || req_id.contains('.') {
+                    continue;
+                }
+                let Some(raw_principal) = message.principal.as_deref() else {
+                    continue;
+                };
+                let Ok(principal) = PrincipalId::new(raw_principal) else {
+                    continue;
+                };
+                let response = match kernel.mcp_snapshot_for(&principal).await {
+                    Ok(snapshot) => serde_json::json!({
+                        "kind": "tools.list",
+                        "req_id": req_id,
+                        "epoch": snapshot.epoch.get(),
+                        "tools": snapshot.tools.iter().map(|tool| serde_json::json!({
+                            "name": tool.name,
+                            "description": tool.description,
+                            "inputSchema": tool.input_schema,
+                        })).collect::<Vec<_>>(),
+                    }),
+                    Err(error) => serde_json::json!({
+                        "kind": "tools.list",
+                        "req_id": req_id,
+                        "error": error.to_string(),
+                    }),
+                };
+                kernel_router::publish_response_value(
+                    &kernel,
+                    astrid_events::ipc::Topic::kernel_response(req_id),
+                    principal.as_str(),
+                    message.device_key_id.as_deref(),
+                    response,
+                );
+            }
+        })
+    }
+
     /// Publish `astrid.v1.capsules_loaded` so subscribers re-read the current
     /// capsule/tool set after the loaded set changes — the registry, and the
     /// `astrid mcp serve` shim, which turns this into an MCP
     /// `notifications/tools/list_changed` for connected clients.
     ///
-    /// The payload carries, per loaded capsule, its installed `meta.json` under
-    /// `capsules[].meta` with the capsule's tool surface injected. The kernel
-    /// probes each loaded capsule once — invoking its `tool_describe`
-    /// interceptor (the same hook the dispatcher already routes) and injecting
-    /// the captured descriptors — so a consumer (e.g. the sage-mcp broker) gets
-    /// a deterministic, complete tool surface from this signal **without the
-    /// capsule having been rebuilt**. The kernel invokes-and-forwards: it never
-    /// interprets the descriptors (the broker owns all policy). A describe
-    /// failure leaves `tools` absent for that capsule this cycle (the consumer
-    /// falls back to its fan-out). The legacy `status: "ready"` field is
-    /// retained so bare-signal subscribers (the shim, the TUI) keep working; the
-    /// `capsules` field is additive. The signal is emitted once per principal
-    /// and bus-stamped with that principal so socket consumers only receive
-    /// their own inventory view.
+    /// The payload carries a principal-scoped inventory hint and the private
+    /// namespace epoch.  Tool descriptors are intentionally omitted from the
+    /// hint: consumers must rebuild from the kernel-owned full snapshot on the
+    /// existing `tools/list` request topic.  A hint without a valid epoch is
+    /// therefore never authority-bearing.
     pub(crate) async fn publish_capsules_loaded(&self) {
-        // Clone the loaded-capsule handles under a brief read lock, then release
-        // it before any filesystem I/O or `tool_describe` invocation (which can
-        // `block_in_place` and must never run while holding the registry lock).
-        let capsules = {
-            let reg = self.capsules.read().await;
-            reg.cloned_values_with_principal()
+        let mut principals = {
+            let registry = self.capsules.read().await;
+            registry
+                .cloned_values_with_principal()
+                .into_iter()
+                .map(|(principal, _)| principal)
+                .collect::<std::collections::HashSet<_>>()
         };
-
-        self.publish_capsules_loaded_snapshot(capsules, &PrincipalId::default())
-            .await;
+        principals.extend(self.mcp_snapshots.lock().await.principals());
+        if principals.is_empty() {
+            principals.insert(PrincipalId::default());
+        }
+        let mut principals: Vec<_> = principals.into_iter().collect();
+        principals.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        for principal in principals {
+            self.publish_capsules_loaded_for(&principal).await;
+        }
     }
 
     /// Publish the current capsule inventory for exactly one principal view.
@@ -2726,15 +2903,39 @@ impl Kernel {
     /// An empty view still emits an empty inventory so consumers can discard a
     /// previously cached tool surface for this principal.
     pub(crate) async fn publish_capsules_loaded_for(&self, principal: &PrincipalId) {
-        let capsules = {
+        let runtimes = if *principal == PrincipalId::anonymous() {
+            Vec::new()
+        } else {
             let reg = self.capsules.read().await;
-            reg.cloned_values_for(principal)
-                .into_iter()
-                .map(|capsule| (principal.clone(), capsule))
-                .collect()
+            reg.cloned_runtimes_for(principal)
+        };
+        let capsules: Vec<(PrincipalId, Arc<dyn astrid_capsule::capsule::Capsule>)> = runtimes
+            .iter()
+            .map(|(_, capsule)| (principal.clone(), Arc::clone(capsule)))
+            .collect();
+        let epoch = match self
+            .refresh_mcp_snapshot_from_runtimes(principal, runtimes)
+            .await
+        {
+            Ok(epoch) => Some(epoch),
+            Err(error) => {
+                tracing::warn!(%principal, %error, "MCP snapshot refresh failed; publishing non-authoritative hint");
+                // Keep the legacy inventory signal useful to diagnostics even
+                // when policy inputs are unavailable.  These probes are never
+                // inserted into the snapshot and therefore cannot turn an
+                // unresolved principal into an authority-bearing empty view.
+                for (entry_principal, capsule) in &capsules {
+                    let _ = astrid_capsule::describe_loaded_capsule_status_for(
+                        capsule.as_ref(),
+                        entry_principal,
+                    )
+                    .await;
+                }
+                None
+            },
         };
 
-        self.publish_capsules_loaded_snapshot(capsules, principal)
+        self.publish_capsules_loaded_snapshot(capsules, principal, epoch)
             .await;
     }
 
@@ -2742,6 +2943,7 @@ impl Kernel {
         &self,
         capsules: Vec<(PrincipalId, Arc<dyn astrid_capsule::capsule::Capsule>)>,
         empty_principal: &PrincipalId,
+        epoch: Option<McpNamespaceEpoch>,
     ) {
         let mut by_principal = std::collections::BTreeMap::<
             String,
@@ -2760,65 +2962,6 @@ impl Kernel {
             // leaves the field genuinely absent and consumer fan-out can run.
             meta = capsules_loaded::without_tools(meta);
 
-            // Probe the live instance for its tool surface and inject it. Best-
-            // effort: a describe (or serialize) failure leaves `tools` absent
-            // and the consumer falls back to its fan-out for this cycle.
-            match astrid_capsule::describe_loaded_capsule_status_for(capsule.as_ref(), principal)
-                .await
-            {
-                Ok(Some(tools)) => {
-                    // A tool advertises straight from its `#[astrid::tool]`
-                    // annotation, but only EXECUTES if the manifest `[subscribe]`s
-                    // its `tool.v1.execute.<name>` topic (the dispatcher routes
-                    // solely from `[subscribe]` handlers). When they drift the tool
-                    // appears in tools/list yet silently never runs — no dispatch,
-                    // no capsule log, no error. Surface that at load, naming the
-                    // exact missing line, so authors don't lose hours to it.
-                    // Skip the manifest lookup entirely for a capsule with no
-                    // tools (most non-tool capsules) — nothing to cross-check.
-                    if !tools.is_empty() {
-                        let interceptors = capsule.manifest().effective_interceptors();
-                        for tool in
-                            astrid_capsule::tools_missing_execute_route(&tools, &interceptors)
-                        {
-                            tracing::warn!(
-                                capsule_id = %name,
-                                "capsule advertises tool '{tool}' but no `tool.v1.execute.{tool}` \
-                                 subscription routes it — it appears in tools/list but will never \
-                                 execute. Add to Capsule.toml: [subscribe] \
-                                 \"tool.v1.execute.{tool}\" = {{ wit = \
-                                 \"@unicity-astrid/wit/types/tool-call\", handler = \
-                                 \"tool_execute_{tool}\" }}"
-                            );
-                        }
-                    }
-                    match serde_json::to_value(&tools) {
-                        Ok(tools_json) => {
-                            meta = Some(capsules_loaded::inject_tools(meta, tools_json));
-                        },
-                        Err(e) => tracing::debug!(
-                            capsule_id = %name, error = %e,
-                            "failed to serialize live-described tools; capsule left uncaptured this cycle"
-                        ),
-                    }
-                },
-                Ok(None) => {
-                    // Pool-less / run-loop capsule: the interceptor describe
-                    // can't run, so leave `tools` ABSENT (not `[]`). The
-                    // consumer's describe fan-out then fires and the capsule's
-                    // own `tool.v1.request.describe` responder supplies its
-                    // surface. Injecting `[]` reads as "0 tools" and suppresses
-                    // the fan-out (#1198).
-                    tracing::debug!(
-                        capsule_id = %name,
-                        "pool-less/run-loop capsule: leaving tools absent so the describe fan-out fires (#1198)"
-                    );
-                },
-                Err(e) => tracing::debug!(
-                    capsule_id = %name, error = %e,
-                    "live tool_describe failed; capsule left uncaptured this cycle"
-                ),
-            }
             by_principal
                 .entry(principal.to_string())
                 .or_default()
@@ -2829,7 +2972,12 @@ impl Kernel {
         }
 
         for (principal, entries) in by_principal {
-            let payload = capsules_loaded::build_capsules_loaded_payload(entries);
+            let payload = match epoch {
+                Some(epoch) => {
+                    capsules_loaded::build_capsules_loaded_payload_with_epoch(entries, epoch.get())
+                },
+                None => capsules_loaded::build_capsules_loaded_payload(entries),
+            };
 
             let msg = astrid_events::ipc::IpcMessage::new(
                 astrid_events::ipc::Topic::from_raw("astrid.v1.capsules_loaded"),
@@ -3737,6 +3885,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         full_reload_in_flight: AtomicBool::new(false),
         capsule_load_lock: Mutex::new(()),
         capsule_view_locks: Arc::new(DashMap::new()),
+        mcp_snapshots: Arc::new(Mutex::new(McpSnapshotStore::default())),
         ephemeral: AtomicBool::new(false),
         boot_time: astrid_runtime::time::Instant::now(),
         shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -4250,7 +4399,7 @@ fn load_or_generate_runtime_key(keys_dir: &Path) -> std::io::Result<KeyPair> {
 /// the grant-on-first-use observer (`astrid.v1.approval` — see
 /// [`grant_on_use::spawn_grant_on_use_handler`]).
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-const INTERNAL_SUBSCRIBER_COUNT: usize = 6;
+const INTERNAL_SUBSCRIBER_COUNT: usize = 7;
 /// Browser-profile count: only the `EventDispatcher` and the bus activity
 /// monitor subscribe at boot — the router pair, `ConnectionTracker`, and
 /// the grant-on-first-use observer are native-gated machinery.
