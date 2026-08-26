@@ -412,3 +412,47 @@ fn live_authority_surface_has_no_serialization_or_descriptor_constructor() {
     assert!(!source.contains("impl From<BudgetId> for Reservation"));
     assert!(!source.contains("impl From<AccountId> for Reservation"));
 }
+
+#[test]
+fn attenuation_child_respects_live_authority_ceiling() {
+    let owner = stamp(7);
+    let mut table = ResourceAuthorityTable::new();
+    let mut roots = Vec::with_capacity(64);
+    for index in 0..64u8 {
+        let object = identity(index);
+        let outcome = table.admit(
+            &owner,
+            ResourceKind::SemanticObject,
+            object,
+            ResourceScope::singleton(object),
+            reservation(10),
+            options(
+                rights(Rights::READ.bits() | Rights::DELEGATE.bits()),
+                None,
+                None,
+            ),
+        );
+        let Ok(root) = outcome else {
+            panic!(
+                "live authority {index} must admit below the bound: {:?}",
+                outcome.as_ref().err()
+            );
+        };
+        roots.push(root);
+    }
+
+    let parent = roots[0];
+    assert_eq!(
+        table.attenuate(
+            &owner,
+            parent,
+            Rights::READ,
+            ResourceScope::singleton(identity(0)),
+            1,
+        ),
+        Err(ResourceErrorCode::Exhausted)
+    );
+    assert_eq!(table.slot_count(), 64);
+    assert_eq!(table.active_reserved_units(), 640);
+    assert!(roots.iter().all(|root| table.lookup(&owner, *root).is_ok()));
+}

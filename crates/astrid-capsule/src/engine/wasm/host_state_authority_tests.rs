@@ -355,3 +355,42 @@ async fn selector_tombstones_are_bounded_and_cleared_on_table_replacement() {
     assert_eq!(state.semantic_authorities.active_reserved_units(), 0);
     assert_eq!(state.semantic_authorities.allocated_slot_count(), 0);
 }
+
+#[tokio::test]
+async fn attenuation_child_respects_live_authority_ceiling() {
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    let admission_stamp = stamp(5);
+    let mut roots = Vec::with_capacity(64);
+    for index in 0..64usize {
+        let object = identity(index.try_into().expect("bounded index"));
+        let outcome = state.semantic_authorities.admit(
+            &admission_stamp,
+            ResourceKind::SemanticObject,
+            object,
+            scope(object),
+            reservation(10),
+            options(root_rights(), None, None),
+        );
+        let Ok(root) = outcome else {
+            panic!(
+                "live authority {index} must admit below the bound: {:?}",
+                outcome.as_ref().err()
+            );
+        };
+        roots.push(root);
+    }
+
+    assert_eq!(
+        state.semantic_authorities.attenuate(
+            &admission_stamp,
+            roots[0],
+            Rights::READ,
+            scope(identity(0)),
+            1,
+        ),
+        Err(ResourceErrorCode::Exhausted)
+    );
+    assert_eq!(state.semantic_authorities.tracked_count(), 64);
+    assert_eq!(state.semantic_authorities.allocated_slot_count(), 64);
+    assert_eq!(state.semantic_authorities.active_reserved_units(), 640);
+}

@@ -113,8 +113,8 @@ impl ResourceAuthorityTable {
         options: AdmissionOptions,
     ) -> Result<ResourceHandle, ResourceErrorCode> {
         self.validate_admission(kind, identity, &scope, &options, reservation.remaining)?;
+        let handle = self.allocate_slot()?;
         self.reserve_units(reservation.remaining)?;
-        let handle = self.allocate_slot();
         let authority = ResourceAuthority {
             kind,
             identity,
@@ -205,7 +205,7 @@ impl ResourceAuthorityTable {
         let requested_scope = scope.borrow().clone();
         let snapshot = self.delegation_snapshot(stamp, parent)?;
         self.validate_delegation(&snapshot, rights, &requested_scope, budget, expiry)?;
-        let handle = self.allocate_slot();
+        let handle = self.allocate_slot()?;
         self.debit_parent(parent, budget)?;
         let authority = ResourceAuthority {
             kind: snapshot.kind,
@@ -338,9 +338,6 @@ impl ResourceAuthorityTable {
         {
             return Err(ResourceErrorCode::Exhausted);
         }
-        if self.live_authority_count() >= MAX_LIVE_AUTHORITY_SLOTS {
-            return Err(ResourceErrorCode::Exhausted);
-        }
         Ok(())
     }
 
@@ -359,24 +356,27 @@ impl ResourceAuthorityTable {
         Ok(())
     }
 
-    fn allocate_slot(&mut self) -> ResourceHandle {
+    fn allocate_slot(&mut self) -> Result<ResourceHandle, ResourceErrorCode> {
+        if self.live_authority_count() >= MAX_LIVE_AUTHORITY_SLOTS {
+            return Err(ResourceErrorCode::Exhausted);
+        }
         if let Some((slot, entry)) = self
             .slots
             .iter()
             .enumerate()
             .find(|(_, entry)| !entry.retired && entry.authority.is_none())
         {
-            return ResourceHandle {
+            return Ok(ResourceHandle {
                 slot,
                 generation: entry.generation,
-            };
+            });
         }
         let slot = self.slots.len();
         self.slots.push(Slot::new());
-        ResourceHandle {
+        Ok(ResourceHandle {
             slot,
             generation: ObjectGeneration::INITIAL,
-        }
+        })
     }
 
     fn slot_authority(
