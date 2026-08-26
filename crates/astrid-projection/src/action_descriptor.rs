@@ -128,7 +128,7 @@ impl fmt::Debug for ActionGeneration {
 ///
 /// The projection crate does not read a clock. A host supplies this value as
 /// part of an observation context, so tests and consumers remain deterministic.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ActionExpiry(u64);
 
 impl ActionExpiry {
@@ -154,6 +154,13 @@ impl ActionExpiry {
 impl From<u64> for ActionExpiry {
     fn from(raw: u64) -> Self {
         Self::from_raw(raw)
+    }
+}
+
+impl fmt::Debug for ActionExpiry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = self;
+        formatter.write_str("ActionExpiry")
     }
 }
 
@@ -557,10 +564,7 @@ impl ActionDescriptor {
             ActionEligibility::CrossPrincipal => Err(ProjectionError::ActionCrossPrincipal),
             ActionEligibility::ObjectMismatch => Err(ProjectionError::ActionObjectMismatch),
             ActionEligibility::DigestMismatch => Err(ProjectionError::ActionDigestMismatch),
-            ActionEligibility::StaleRevision => Err(ProjectionError::StaleRevision {
-                found: self.revision.get(),
-                requested: observation.revision.get(),
-            }),
+            ActionEligibility::StaleRevision => Err(ProjectionError::ActionStaleRevision),
             ActionEligibility::ScopeMismatch => Err(ProjectionError::ActionScopeMismatch),
             ActionEligibility::GenerationDrift => Err(ProjectionError::ActionGenerationDrift),
             ActionEligibility::Expired => Err(ProjectionError::ActionExpired),

@@ -66,6 +66,8 @@ pub enum ProjectionError {
     ActionGenerationDrift,
     /// The descriptor was observed at or after its expiry.
     ActionExpired,
+    /// The action observation used a different projection revision.
+    ActionStaleRevision,
     /// The descriptor was presented by a different principal.
     ActionCrossPrincipal,
     /// The descriptor and observation named different semantic objects.

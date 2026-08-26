@@ -1,6 +1,6 @@
 //! Checked projection revisions. Never wrap.
 
-use core::num::NonZeroU64;
+use core::{fmt, num::NonZeroU64};
 
 use crate::encoding::{
     DescriptorDecode, DescriptorEncode, ProjectionTypeTag, check_header, write_header,
@@ -10,8 +10,15 @@ use crate::error::ProjectionError;
 /// Generation of a projection snapshot stream.
 ///
 /// Distinct from object, provider, lifecycle, and authority generations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProjectionRevision(NonZeroU64);
+
+impl fmt::Debug for ProjectionRevision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = self;
+        formatter.write_str("ProjectionRevision")
+    }
+}
 
 impl ProjectionRevision {
     /// First valid revision.

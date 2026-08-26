@@ -67,6 +67,34 @@ fn descriptor_roundtrip_is_fixed_and_debug_is_opaque() {
         "ActionObservation"
     );
     assert_eq!(
+        format_args!("{:?}", descriptor.expiry()).to_string(),
+        "ActionExpiry"
+    );
+    assert_eq!(
+        format_args!("{:?}", descriptor.digest()).to_string(),
+        "ActionDigest"
+    );
+    assert_eq!(
+        format_args!("{:?}", descriptor.scope()).to_string(),
+        "ActionScope"
+    );
+    assert_eq!(
+        format_args!("{:?}", descriptor.principal()).to_string(),
+        "ActionPrincipal"
+    );
+    assert_eq!(
+        format_args!("{:?}", descriptor.generation()).to_string(),
+        "ActionGeneration"
+    );
+    assert_eq!(
+        format_args!("{:?}", descriptor.revision()).to_string(),
+        "ProjectionRevision"
+    );
+    assert_eq!(
+        format_args!("{:?}", descriptor.object()).to_string(),
+        "SemanticObjectId"
+    );
+    assert_eq!(
         ActionDescriptor::decode_descriptor(&encoded[..125]),
         Err(ProjectionError::InvalidLength)
     );
@@ -144,11 +172,19 @@ fn descriptor_rejects_stale_expired_drift_and_cross_principal_observations() {
     );
     assert_eq!(
         descriptor.check(&stale),
-        Err(ProjectionError::StaleRevision {
-            found: 7,
-            requested: 8,
-        })
+        Err(ProjectionError::ActionStaleRevision)
     );
+    let stale_error = descriptor.check(&stale).unwrap_err();
+    let stale_debug = format_args!("{stale_error:?}").to_string();
+    let stale_display = format_args!("{stale_error}").to_string();
+    assert_eq!(stale_debug, "ActionStaleRevision");
+    assert_eq!(stale_display, "invalid projection descriptor: ActionStaleRevision");
+    for rendered in [&stale_debug, &stale_display] {
+        assert!(!rendered.contains('7'));
+        assert!(!rendered.contains('8'));
+        assert!(!rendered.contains("found"));
+        assert!(!rendered.contains("requested"));
+    }
 
     let scope = ActionObservation::new(
         honest.object(),
@@ -305,10 +341,7 @@ fn independent_consumers_agree_and_presentation_cannot_mint_or_widen() {
     );
     assert_eq!(
         replayed.check(&moved),
-        Err(ProjectionError::StaleRevision {
-            found: 7,
-            requested: 8,
-        })
+        Err(ProjectionError::ActionStaleRevision)
     );
 }
 
