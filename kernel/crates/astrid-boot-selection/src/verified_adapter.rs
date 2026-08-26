@@ -20,6 +20,7 @@ pub enum AdapterError {
     KernelIdentityMismatch,
     KernelFloorMismatch,
     SysgenFloorMismatch,
+    SubordinateKeyMismatch,
 }
 
 impl AdapterError {
@@ -30,6 +31,7 @@ impl AdapterError {
             Self::KernelIdentityMismatch => "kernel_identity_mismatch",
             Self::KernelFloorMismatch => "kernel_floor_mismatch",
             Self::SysgenFloorMismatch => "sysgen_floor_mismatch",
+            Self::SubordinateKeyMismatch => "subordinate_key_mismatch",
         }
     }
 }
@@ -41,11 +43,18 @@ impl AdapterError {
 /// closure table, and the policy epoch is copied only from the authenticated
 /// handoff. None of these values is substituted for another.
 #[allow(dead_code)]
-pub fn bind_verified_candidate(
+pub(crate) fn bind_verified_candidate(
     generation: VerifiedGeneration,
     bound: BoundIdentities,
     handoff: AuthenticatedPolicyHandoff,
 ) -> Result<CandidateFacts, AdapterError> {
+    let policy = handoff.policy();
+    if policy.kernel_verify() != bound.kernel_verify()
+        || policy.sysgen_verify() != bound.sysgen_verify()
+    {
+        return Err(AdapterError::SubordinateKeyMismatch);
+    }
+
     if !bound.distinct() {
         return Err(AdapterError::ClosureIdentityCollision);
     }
@@ -55,7 +64,6 @@ pub fn bind_verified_candidate(
         return Err(AdapterError::KernelIdentityMismatch);
     }
 
-    let policy = handoff.policy();
     if policy.kernel_floor() != bound.kernel_floor() {
         return Err(AdapterError::KernelFloorMismatch);
     }
@@ -81,7 +89,7 @@ pub fn bind_verified_candidate(
 /// Build a selector policy only after the same authenticated tuple has been
 /// bound. The five floors remain independent in the resulting policy.
 #[allow(dead_code)]
-pub fn authenticated_policy(
+pub(crate) fn authenticated_policy(
     generation: VerifiedGeneration,
     bound: BoundIdentities,
     handoff: AuthenticatedPolicyHandoff,

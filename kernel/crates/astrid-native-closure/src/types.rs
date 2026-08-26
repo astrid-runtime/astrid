@@ -218,6 +218,8 @@ pub struct BoundIdentities {
     system_generation: MeasuredIdentity,
     kernel_floor: GenerationFloor,
     sysgen_floor: GenerationFloor,
+    kernel_verify: [u8; KEY_LEN],
+    sysgen_verify: [u8; KEY_LEN],
 }
 
 impl BoundIdentities {
@@ -226,12 +228,16 @@ impl BoundIdentities {
         system_generation: MeasuredIdentity,
         kernel_floor: GenerationFloor,
         sysgen_floor: GenerationFloor,
+        kernel_verify: [u8; KEY_LEN],
+        sysgen_verify: [u8; KEY_LEN],
     ) -> Self {
         Self {
             kernel_bootstrap,
             system_generation,
             kernel_floor,
             sysgen_floor,
+            kernel_verify,
+            sysgen_verify,
         }
     }
 
@@ -249,6 +255,20 @@ impl BoundIdentities {
 
     pub const fn sysgen_floor(self) -> GenerationFloor {
         self.sysgen_floor
+    }
+
+    /// Verifying key used by [`crate::verify_table`] for the kernel artifact.
+    /// The field is retained in the verifier-owned output so a later adapter
+    /// cannot mix identities verified under one policy with a handoff naming
+    /// another policy's subordinate key.
+    pub const fn kernel_verify(self) -> [u8; KEY_LEN] {
+        self.kernel_verify
+    }
+
+    /// Verifying key used by [`crate::verify_table`] for the System Generation
+    /// artifact.
+    pub const fn sysgen_verify(self) -> [u8; KEY_LEN] {
+        self.sysgen_verify
     }
 
     pub fn distinct(self) -> bool {

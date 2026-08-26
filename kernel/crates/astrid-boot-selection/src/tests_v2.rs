@@ -6,9 +6,9 @@ use astrid_native_closure::{
 };
 use astrid_system_generation::{
     ComponentSet, ContentId, Expiration, Generation, ManifestSizes, Revocation, RollbackFloor,
-    TrustedInput, TrustedInputData, verify_manifest,
+    TrustedInput, TrustedInputData, signed_bytes, verify_manifest,
 };
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 
 use crate::codec::{
     CHECKSUM_END, CHECKSUM_START, FRAME_LEN, MAGIC, POLICY_GENERATION_START, RESERVED_END,
@@ -53,6 +53,34 @@ fn recompute_checksum(bytes: &mut [u8; JOURNAL_LEN], frame_index: usize) {
     frame[CHECKSUM_START..CHECKSUM_END].copy_from_slice(hasher.finalize().as_bytes());
 }
 
+// This fixture mirrors the accepted v1 codec at d65a4e59/4e9ffa: a 256-byte
+// `ASTRABJ1` frame, a 4096-byte journal, and the v1 checksum domain. It stays
+// test-local so v1 bytes are never decoded or reinterpreted as v2 facts.
+fn valid_v1_journal() -> [u8; 4096] {
+    const V1_FRAME_LEN: usize = 256;
+    const V1_CHECKSUM_START: usize = 224;
+    const V1_CHECKSUM_END: usize = 256;
+    let mut journal = [0u8; 4096];
+    let frame = &mut journal[..V1_FRAME_LEN];
+    frame[..8].copy_from_slice(b"ASTRABJ1");
+    frame[8] = 1;
+    frame[9] = 1;
+    frame[10] = 1;
+    frame[11] = 1;
+    frame[16..24].copy_from_slice(&0u64.to_le_bytes());
+    frame[24..32].copy_from_slice(&1u64.to_le_bytes());
+    for (start, value) in [(32, 0x11), (64, 0x12), (96, 0x13), (128, 0x14), (160, 0x15)] {
+        frame[start..start + 32].fill(value);
+    }
+    for (start, value) in [(192, 17u64), (200, 16), (208, 13), (216, 14)] {
+        frame[start..start + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    let mut hasher = blake3::Hasher::new_derive_key("astrid.boot-selection.journal.v1");
+    hasher.update(&frame[..V1_CHECKSUM_START]);
+    frame[V1_CHECKSUM_START..V1_CHECKSUM_END].copy_from_slice(hasher.finalize().as_bytes());
+    journal
+}
+
 #[test]
 fn v2_frame_and_journal_sizes_are_exact() {
     assert_eq!(FRAME_LEN, 296);
@@ -67,14 +95,18 @@ fn v2_frame_and_journal_sizes_are_exact() {
 
 #[test]
 fn v1_length_and_padded_v1_are_rejected_without_reinterpretation() {
+    let v1 = valid_v1_journal();
+    assert!(v1[..256].iter().any(|byte| *byte != 0));
+    assert_eq!(Journal::from_bytes(&v1), Err(JournalError::WrongLength));
+
+    let mut padded = [0u8; JOURNAL_LEN];
+    padded[..v1.len()].copy_from_slice(&v1);
+    let padded = Journal::from_bytes(&padded).expect("padded v1 journal");
     assert_eq!(
-        Journal::from_bytes(&[0; 4096]),
-        Err(JournalError::WrongLength)
+        selector().recover(padded, VerifiedCandidates::empty()),
+        BootDecision::Recovery
     );
-    assert_eq!(
-        Journal::from_bytes(&[0; 4096 + (FRAME_LEN - 256)]),
-        Err(JournalError::WrongLength)
-    );
+
     assert_eq!(
         Journal::from_bytes(&[0; JOURNAL_LEN - 1]),
         Err(JournalError::WrongLength)
@@ -188,8 +220,18 @@ fn handoff_context(seed: u8) -> HandoffContext {
 
 fn verified_handoff(kernel_floor: u64, sysgen_floor: u64) -> AuthenticatedPolicyHandoff {
     let root = SigningKey::from_bytes(&[3; 32]);
-    let kernel = SigningKey::from_bytes(&[1; 32]);
-    let sysgen = SigningKey::from_bytes(&[2; 32]);
+    let kernel = closure_key(astrid_native_closure::FixtureRole::KernelBootstrap);
+    let sysgen = closure_key(astrid_native_closure::FixtureRole::SystemGeneration);
+    verified_handoff_with_keys(&root, &kernel, &sysgen, kernel_floor, sysgen_floor)
+}
+
+fn verified_handoff_with_keys(
+    root: &SigningKey,
+    kernel: &SigningKey,
+    sysgen: &SigningKey,
+    kernel_floor: u64,
+    sysgen_floor: u64,
+) -> AuthenticatedPolicyHandoff {
     let expected = handoff_context(9);
     let policy = PolicyHandoff::for_signing(
         kernel.verifying_key().to_bytes(),
@@ -199,7 +241,7 @@ fn verified_handoff(kernel_floor: u64, sysgen_floor: u64) -> AuthenticatedPolicy
         PolicyGeneration::new(19),
         expected,
     );
-    let bytes = sign_policy_handoff(&root, &policy);
+    let bytes = sign_policy_handoff(root, &policy);
     let verifier = RootVerifier::try_new(
         root.verifying_key().to_bytes(),
         GenerationFloor::new(kernel_floor),
@@ -217,8 +259,24 @@ fn verified_bound(
 ) -> astrid_native_closure::BoundIdentities {
     let kernel = closure_key(astrid_native_closure::FixtureRole::KernelBootstrap);
     let sysgen = closure_key(astrid_native_closure::FixtureRole::SystemGeneration);
-    let kernel_artifact = sign_artifact(
+    verified_bound_with_keys(
         &kernel,
+        &sysgen,
+        kernel_identity,
+        kernel_floor,
+        sysgen_floor,
+    )
+}
+
+fn verified_bound_with_keys(
+    kernel: &SigningKey,
+    sysgen: &SigningKey,
+    kernel_identity: [u8; 32],
+    kernel_floor: u64,
+    sysgen_floor: u64,
+) -> astrid_native_closure::BoundIdentities {
+    let kernel_artifact = sign_artifact(
+        kernel,
         ClosureKind::KernelBootstrap,
         GenerationFloor::new(kernel_floor),
         MeasuredIdentity::from_bytes(kernel_identity),
@@ -230,7 +288,7 @@ fn verified_bound(
             system_generation: sysgen.verifying_key().to_bytes(),
         },
         kernel: kernel_artifact,
-        sysgen: sign_empty_sysgen(&sysgen, GenerationFloor::new(sysgen_floor)),
+        sysgen: sign_empty_sysgen(sysgen, GenerationFloor::new(sysgen_floor)),
     };
     let policy = TrustedPolicy::try_new(
         kernel.verifying_key().to_bytes(),
@@ -247,9 +305,6 @@ fn verified_generation(
     generation: u64,
     rollback: u64,
 ) -> astrid_system_generation::VerifiedGeneration {
-    const UNSIGNED_LEN: usize = 452;
-    const SIGNER_OFFSET: usize = 452;
-    const SIGNATURE_OFFSET: usize = 484;
     let signer = astrid_system_generation::fixture_signing_key();
     let kernel = ContentId::try_from_bytes(kernel_identity).expect("kernel id");
     let plan = ContentId::try_from_bytes(digest(2)).expect("plan");
@@ -270,32 +325,7 @@ fn verified_generation(
         },
     )
     .expect("manifest");
-    let mut unsigned = [0u8; UNSIGNED_LEN];
-    unsigned[..8].copy_from_slice(b"ASTRIDSG");
-    unsigned[8] = 1;
-    unsigned[9] = 0;
-    unsigned[10] = 0;
-    unsigned[11] = 0;
-    unsigned[12..44].copy_from_slice(&kernel.as_bytes());
-    unsigned[44..76].copy_from_slice(&plan.as_bytes());
-    unsigned[76..332].fill(0);
-    unsigned[332..364].copy_from_slice(&object.as_bytes());
-    unsigned[364..396].copy_from_slice(&closure.as_bytes());
-    unsigned[396..404].copy_from_slice(&generation.to_le_bytes());
-    unsigned[404..412].copy_from_slice(&rollback.to_le_bytes());
-    unsigned[412..420].copy_from_slice(&0u64.to_le_bytes());
-    unsigned[420..428].copy_from_slice(&1u64.to_le_bytes());
-    unsigned[428..436].copy_from_slice(&2u64.to_le_bytes());
-    unsigned[436..444].copy_from_slice(&3u64.to_le_bytes());
-    unsigned[444..452].copy_from_slice(&4u64.to_le_bytes());
-    let mut message = [0u8; 36 + UNSIGNED_LEN];
-    message[..36].copy_from_slice(b"astrid.system-generation.manifest.v1");
-    message[36..].copy_from_slice(&unsigned);
-    let signature = signer.sign(&message);
-    let mut bytes = [0u8; astrid_system_generation::MANIFEST_LEN];
-    bytes[..UNSIGNED_LEN].copy_from_slice(&unsigned);
-    bytes[SIGNER_OFFSET..SIGNATURE_OFFSET].copy_from_slice(&signer.verifying_key().to_bytes());
-    bytes[SIGNATURE_OFFSET..].copy_from_slice(&signature.to_bytes());
+    let bytes = signed_bytes(&signer, manifest);
     let trusted = TrustedInput::try_new(TrustedInputData {
         signer: signer.verifying_key().to_bytes(),
         kernel_identity: kernel,
@@ -342,6 +372,32 @@ fn adapter_maps_descriptor_closures_and_policy_without_crossing_domains() {
     let policy = authenticated_policy(generation, bound, handoff).expect("policy");
     assert!(policy.accepts_authenticated_generation(19));
     assert!(!policy.accepts_authenticated_generation(18));
+}
+
+#[test]
+fn adapter_rejects_mixed_and_swapped_subordinate_keys() {
+    let root = SigningKey::from_bytes(&[3; 32]);
+    let table_kernel = SigningKey::from_bytes(&[4; 32]);
+    let table_sysgen = SigningKey::from_bytes(&[5; 32]);
+    let other_sysgen = SigningKey::from_bytes(&[6; 32]);
+    let generation = verified_generation(digest(11), 17, 16);
+    let bound = verified_bound_with_keys(&table_kernel, &table_sysgen, digest(11), 13, 14);
+
+    // Both inputs are valid under their own policies, but the sysgen key is
+    // authorized by a different handoff than the one used for table verify.
+    let mixed = verified_handoff_with_keys(&root, &table_kernel, &other_sysgen, 13, 14);
+    assert_eq!(
+        bind_verified_candidate(generation, bound, mixed),
+        Err(AdapterError::SubordinateKeyMismatch)
+    );
+
+    // Role swapping must fail independently even when the same two keys are
+    // present in the table and handoff.
+    let swapped = verified_handoff_with_keys(&root, &table_sysgen, &table_kernel, 13, 14);
+    assert_eq!(
+        bind_verified_candidate(generation, bound, swapped),
+        Err(AdapterError::SubordinateKeyMismatch)
+    );
 }
 
 #[test]

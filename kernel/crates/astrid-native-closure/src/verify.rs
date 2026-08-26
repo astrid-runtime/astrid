@@ -29,6 +29,8 @@ pub fn verify_table(bytes: &[u8], policy: &TrustedPolicy) -> Result<BoundIdentit
         table.sysgen.identity,
         table.kernel.floor,
         table.sysgen.floor,
+        policy.kernel_verify(),
+        policy.sysgen_verify(),
     ))
 }
 
