@@ -33,6 +33,7 @@ pub mod principal_class;
 pub mod profile_cache;
 pub mod readiness;
 pub mod registry;
+pub(crate) mod resource_authority;
 pub mod schema_catalog;
 pub mod security;
 pub mod stamp;
