@@ -73,6 +73,8 @@ pub mod socket;
 /// Authenticated native filesystem lease and callback service.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod storage_mount;
+#[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
+mod systemresident_health_tests;
 
 use arc_swap::ArcSwap;
 use astrid_audit::AuditLog;
@@ -1587,7 +1589,7 @@ impl Kernel {
                 .write()
                 .await
                 .reserve_runtime_id(id.clone(), wasm_hash.clone(), scope)?;
-        let mut capsule = self
+        let capsule = self
             .build_capsule_runtime(
                 manifest,
                 &dir,
@@ -1596,13 +1598,7 @@ impl Kernel {
             )
             .await?;
 
-        if let Err(error) = activate_and_wait_ready(&id, capsule.as_mut()).await {
-            capsule.request_cancel();
-            if let Err(cleanup) = capsule.unload().await {
-                tracing::warn!(capsule_id = %id, error = %cleanup, "Failed to unload rejected runtime candidate");
-            }
-            return Err(error);
-        }
+        let capsule = prepare_capsule_candidate(&id, capsule).await?;
 
         if !manifest_path.exists() {
             unload_loaded_capsule_after_source_disappeared(capsule, &id, principal, &manifest_path)
@@ -1858,7 +1854,7 @@ impl Kernel {
                 .write()
                 .await
                 .reserve_runtime_id(id.clone(), artifact, actual_scope)?;
-        let mut capsule = self
+        let capsule = self
             .build_capsule_runtime(
                 manifest,
                 source_dir,
@@ -1872,13 +1868,7 @@ impl Kernel {
                 manifest_path.display()
             );
         }
-        if let Err(error) = activate_and_wait_ready(id, capsule.as_mut()).await {
-            capsule.request_cancel();
-            if let Err(cleanup) = capsule.unload().await {
-                tracing::warn!(capsule_id = %id, error = %cleanup, "Failed to unload rejected replacement candidate");
-            }
-            return Err(error);
-        }
+        let capsule = prepare_capsule_candidate(id, capsule).await?;
         Ok(PreparedRuntimeReplacement {
             capsule,
             runtime_id,
@@ -4511,6 +4501,24 @@ async fn activate_and_wait_ready(
             anyhow::bail!("candidate generation for '{id}' exited before signaling ready")
         },
     }
+}
+
+/// Activate a candidate and keep the rejection cleanup identical for initial
+/// publication and live replacement.  Both production paths must cancel and
+/// unload a candidate that never became publishable.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+async fn prepare_capsule_candidate(
+    id: &astrid_capsule_types::CapsuleId,
+    mut candidate: Box<dyn astrid_capsule::capsule::Capsule>,
+) -> Result<Box<dyn astrid_capsule::capsule::Capsule>, anyhow::Error> {
+    if let Err(error) = activate_and_wait_ready(id, candidate.as_mut()).await {
+        candidate.request_cancel();
+        if let Err(cleanup) = candidate.unload().await {
+            tracing::warn!(capsule_id = %id, error = %cleanup, "Failed to unload rejected runtime candidate");
+        }
+        return Err(error);
+    }
+    Ok(candidate)
 }
 
 /// Attempts to restart a failed capsule, respecting backoff and max retries.
