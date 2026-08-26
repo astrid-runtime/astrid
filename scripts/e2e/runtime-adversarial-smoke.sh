@@ -711,11 +711,20 @@ run_adversarial_principal_smoke() {
   json_assert_cli_agent_enabled "$ARTIFACTS/http-principal-lifecycle-enabled-show.json" \
     e2e-http-lifecycle true
   status="$(http_status DELETE /api/sys/principals/e2e-http-lifecycle "$admin_bearer" "" \
-    "$ARTIFACTS/http-principal-lifecycle-delete.json")"
-  assert_status "admin HTTP principal delete" "$status" 204
+    "$ARTIFACTS/http-principal-lifecycle-delete-denied.json")"
+  assert_status "unenrolled admin HTTP principal delete denied" "$status" 403
+  json_assert_http_forbidden_reason \
+    "$ARTIFACTS/http-principal-lifecycle-delete-denied.json" \
+    "ownership mutation requires an enrolled authority"
   status="$(http_status GET /api/sys/principals/e2e-http-lifecycle "$admin_bearer" "" \
-    "$ARTIFACTS/http-principal-lifecycle-deleted-show.json")"
-  assert_status "deleted HTTP principal hidden" "$status" 404
+    "$ARTIFACTS/http-principal-lifecycle-after-denied-delete.json")"
+  assert_status "unenrolled HTTP principal survives denied delete" "$status" 200
+  json_assert_cli_agent_enabled \
+    "$ARTIFACTS/http-principal-lifecycle-after-denied-delete.json" \
+    e2e-http-lifecycle true
+  json_assert_cli_agent_show \
+    "$ARTIFACTS/http-principal-lifecycle-after-denied-delete.json" \
+    e2e-http-lifecycle ops-team
 
   status="$(http_status POST /api/sys/principals "$admin_bearer" \
     "{\"name\":\"e2e-http-smuggle-clone\",\"groups\":[\"agent\"],\"grants\":[],\"inherit_from\":\"$user_principal\",\"clone_from\":\"$user_principal\",\"allow_admin_clone\":true}" \
@@ -724,8 +733,20 @@ run_adversarial_principal_smoke() {
   json_assert_http_create_did_not_inherit_or_clone "$ASTRID_HOME" \
     e2e-http-smuggle-clone astrid-capsule-openai-compat
   status="$(http_status DELETE /api/sys/principals/e2e-http-smuggle-clone "$admin_bearer" "" \
-    "$ARTIFACTS/http-principal-clone-smuggle-delete.json")"
-  assert_status "admin HTTP clone smuggling cleanup" "$status" 204
+    "$ARTIFACTS/http-principal-clone-smuggle-delete-denied.json")"
+  assert_status "unenrolled admin HTTP clone smuggling cleanup denied" "$status" 403
+  json_assert_http_forbidden_reason \
+    "$ARTIFACTS/http-principal-clone-smuggle-delete-denied.json" \
+    "ownership mutation requires an enrolled authority"
+  status="$(http_status GET /api/sys/principals/e2e-http-smuggle-clone "$admin_bearer" "" \
+    "$ARTIFACTS/http-principal-clone-smuggle-after-denied-delete.json")"
+  assert_status "unenrolled HTTP clone smuggling target survives denied delete" "$status" 200
+  json_assert_cli_agent_enabled \
+    "$ARTIFACTS/http-principal-clone-smuggle-after-denied-delete.json" \
+    e2e-http-smuggle-clone true
+  json_assert_cli_agent_show \
+    "$ARTIFACTS/http-principal-clone-smuggle-after-denied-delete.json" \
+    e2e-http-smuggle-clone agent
 
   status="$(http_status POST /api/sys/groups "$user_bearer" \
     '{"name":"regular-group-create-denied","capabilities":["system:status"]}' \
@@ -922,6 +943,21 @@ if data.get("principal") != sys.argv[2]:
     raise SystemExit(f"unexpected principal: {data!r}")
 if sys.argv[3] in data.get("groups", []):
     raise SystemExit(f"forbidden group {sys.argv[3]!r} present: {data!r}")
+PY
+}
+
+json_assert_http_forbidden_reason() {
+  local file=$1 expected=$2
+  "$PYTHON" - "$file" "$expected" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if data.get("error") != "forbidden":
+    raise SystemExit(f"unexpected forbidden response: {data!r}")
+reason = data.get("reason")
+if not isinstance(reason, str) or sys.argv[2] not in reason:
+    raise SystemExit(f"forbidden reason missing {sys.argv[2]!r}: {data!r}")
 PY
 }
 

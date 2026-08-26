@@ -33,7 +33,7 @@ mod capsules_loaded;
 mod capsules_loaded_tests;
 /// Internal first-owner enrollment and boot-authority gate.
 mod first_owner;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "first_owner_boot_tests.rs"]
 mod first_owner_boot_tests;
 #[cfg(test)]
