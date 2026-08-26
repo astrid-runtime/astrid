@@ -1,7 +1,7 @@
 use super::{DeviceKeyInfo, EnvEntry, PrincipalId, Quotas, StorageMountLeaseV1};
 use serde::{Deserialize, Serialize};
 
-/// Coordinate carried by a Station v2 lock.
+/// Coordinate carried by a Station publication lock.
 ///
 /// This deliberately mirrors Station's JSON shape without linking the core
 /// API to the standalone Station crate.

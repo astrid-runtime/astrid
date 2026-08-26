@@ -22,7 +22,7 @@ const MANIFEST_DOMAIN: &[u8] = b"astrid:capsule-manifest:v1\0";
 pub(crate) struct StationArtifact {
     /// Archive staged below Station's `var/sources/<id>/handoff` directory.
     pub(crate) path: PathBuf,
-    /// Exact v2 source lock returned by Station.
+    /// Exact typed source lock returned by Station.
     pub(crate) lock: StationLock,
 }
 
@@ -54,7 +54,7 @@ fn is_configured_at(binary: &Path, home: &Path) -> anyhow::Result<bool> {
 
 /// Resolve and fetch a Station coordinate into the private handoff area.
 ///
-/// A new install first resolves and writes a strict v2 lock. An update passes
+/// A new install first resolves and writes a strict typed lock. An update passes
 /// the existing lock to Station, so no GitHub/latest path is consulted.
 pub(crate) fn resolve_and_fetch(
     coordinate: &str,
