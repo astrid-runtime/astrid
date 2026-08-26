@@ -11,6 +11,9 @@ path = "src/lib.rs"
 [features]
 default = []
 sign = []
+# Development-only values used by the emulator kimage/ring-0 fixtures. The
+# default production API intentionally does not expose these constants.
+emulator-fixture = []
 
 [dependencies]
 blake3 = { version = "=1.8.5", default-features = false, features = ["pure"] }

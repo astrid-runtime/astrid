@@ -404,6 +404,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "astrid-native-closure",
+ "astrid-system-generation",
  "blake3",
  "bootloader_api",
  "serde_json",

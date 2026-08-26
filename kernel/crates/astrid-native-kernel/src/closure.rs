@@ -8,10 +8,12 @@ use astrid_native_closure::{
     HANDOFF_LEN, HandoffContext, LoaderIdentity, LoaderMeasurement, MeasuredIdentity,
     PolicyGeneration, RootVerifier, TABLE_LEN, TrustedPolicy, verify_policy_handoff, verify_table,
 };
+use astrid_system_generation::emulator_fixture::{
+    EMULATOR_CLOSURE_ROOT, EMULATOR_COMPONENTS, EMULATOR_GENERATION_FLOOR, EMULATOR_MANIFEST_SIZES,
+    EMULATOR_NOW_UNIX_SECONDS, EMULATOR_OBJECT_ROOT, EMULATOR_PLAN_DIGEST,
+};
 use astrid_system_generation::{
-    ContentId, EMULATOR_CLOSURE_ROOT, EMULATOR_COMPONENTS, EMULATOR_GENERATION_FLOOR,
-    EMULATOR_MANIFEST_SIZES, EMULATOR_NOW_UNIX_SECONDS, EMULATOR_OBJECT_ROOT, EMULATOR_PLAN_DIGEST,
-    Generation, GenerationError, MANIFEST_LEN, TrustedInput, TrustedInputData,
+    ContentId, Generation, GenerationError, MANIFEST_LEN, TrustedInput, TrustedInputData,
 };
 use bootloader_api::BootInfo;
 use bootloader_api::info::LoaderHandoffVerification;
@@ -51,17 +53,35 @@ const BOOT_CONTEXT_DOMAIN: &[u8] = b"astrid.boot.q35.uefi.tcg.v1";
 
 /// Values accepted only after both the root handoff and closure table verify.
 #[derive(Clone, Copy)]
-pub struct AcceptedClosure {
-    pub handoff: AuthenticatedPolicyHandoff,
-    pub bound: BoundIdentities,
-    pub kernel_image: MeasuredIdentity,
-    pub closure_table: MeasuredIdentity,
+pub(super) struct AcceptedClosure {
+    handoff: AuthenticatedPolicyHandoff,
+    bound: BoundIdentities,
+    kernel_image: MeasuredIdentity,
+    closure_table: MeasuredIdentity,
     /// Exact descriptor bytes copied from the loader-owned ramdisk. This is
     /// still untrusted until the caller binds its identity and verifies it.
-    pub sysgen_payload: [u8; MANIFEST_LEN],
+    sysgen_payload: [u8; MANIFEST_LEN],
 }
 
-pub fn accept(boot_info: &BootInfo) -> Result<AcceptedClosure, ClosureError> {
+impl AcceptedClosure {
+    pub(super) const fn handoff(&self) -> AuthenticatedPolicyHandoff {
+        self.handoff
+    }
+
+    pub(super) const fn bound(&self) -> BoundIdentities {
+        self.bound
+    }
+
+    pub(super) const fn kernel_image(&self) -> MeasuredIdentity {
+        self.kernel_image
+    }
+
+    pub(super) const fn closure_table(&self) -> MeasuredIdentity {
+        self.closure_table
+    }
+}
+
+pub(super) fn accept(boot_info: &BootInfo) -> Result<AcceptedClosure, ClosureError> {
     let mut bundle = [0u8; RAMDISK_BUNDLE_LEN];
     copy_ramdisk(boot_info, &mut bundle)?;
 
@@ -135,14 +155,17 @@ pub fn accept(boot_info: &BootInfo) -> Result<AcceptedClosure, ClosureError> {
 /// Copy the accepted descriptor into a caller-owned kernel buffer before any
 /// manifest parsing. The source was already copied out of loader memory by
 /// [`accept`], and the destination remains independent of the ramdisk alias.
-pub fn copy_system_generation(accepted: &AcceptedClosure, destination: &mut [u8; MANIFEST_LEN]) {
+pub(super) fn copy_system_generation(
+    accepted: &AcceptedClosure,
+    destination: &mut [u8; MANIFEST_LEN],
+) {
     destination.copy_from_slice(&accepted.sysgen_payload);
 }
 
 /// Build the ring-0 trusted input exclusively from authenticated handoff data
 /// and compiled emulator fixture values. Manifest fields never populate this
 /// policy boundary.
-pub fn trusted_system_generation_input(
+pub(super) fn trusted_system_generation_input(
     accepted: &AcceptedClosure,
 ) -> Result<TrustedInput, GenerationError> {
     let kernel_identity = ContentId::try_from_bytes(accepted.kernel_image.as_bytes())?;

@@ -31,12 +31,21 @@ pub use types::{
 };
 pub use verify::verify_manifest;
 
+/// Emulator-only values used to construct the canonical development fixture.
+/// This module is available only when the explicitly named
+/// `emulator-fixture` feature is enabled; the default production API contains
+/// no raw fixture constants.
+#[cfg(feature = "emulator-fixture")]
+pub mod emulator_fixture {
+    pub use super::fixture::{
+        EMULATOR_CLOSURE_ROOT, EMULATOR_COMPONENTS, EMULATOR_GENERATION_FLOOR,
+        EMULATOR_MANIFEST_SIZES, EMULATOR_NOW_UNIX_SECONDS, EMULATOR_OBJECT_ROOT,
+        EMULATOR_PLAN_DIGEST,
+    };
+}
+
 #[cfg(any(test, feature = "sign"))]
 pub use fixture::fixture_signing_key;
-pub use fixture::{
-    EMULATOR_CLOSURE_ROOT, EMULATOR_COMPONENTS, EMULATOR_GENERATION_FLOOR, EMULATOR_MANIFEST_SIZES,
-    EMULATOR_NOW_UNIX_SECONDS, EMULATOR_OBJECT_ROOT, EMULATOR_PLAN_DIGEST,
-};
 #[cfg(any(test, feature = "sign"))]
 pub use sign::signed_bytes;
 

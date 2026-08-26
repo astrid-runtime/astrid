@@ -1,26 +1,34 @@
 //! Emulator-only fixture values; never a product owner key.
 
 /// Plan digest bound to the descriptor fixture. This is a compiled test value,
-/// not a digest of a live service plan.
+/// not a digest of a live service plan. It is re-exported only through the
+/// feature-gated `emulator_fixture` module.
+#[cfg(feature = "emulator-fixture")]
 pub const EMULATOR_PLAN_DIGEST: [u8; 32] = [0x11; 32];
 
 /// Object-root digest bound to the descriptor fixture.
+#[cfg(feature = "emulator-fixture")]
 pub const EMULATOR_OBJECT_ROOT: [u8; 32] = [0x22; 32];
 
 /// Closure-root digest bound to the descriptor fixture.
+#[cfg(feature = "emulator-fixture")]
 pub const EMULATOR_CLOSURE_ROOT: [u8; 32] = [0x33; 32];
 
 /// System Generation floor for the emulator descriptor, independent of the
 /// dual-closure rollback floors.
+#[cfg(feature = "emulator-fixture")]
 pub const EMULATOR_GENERATION_FLOOR: u64 = 1;
 
 /// The emulator has no wall-clock authority; zero keeps the fixture unexpired.
+#[cfg(feature = "emulator-fixture")]
 pub const EMULATOR_NOW_UNIX_SECONDS: u64 = 0;
 
 /// Fixed descriptor size claims shared by host signing and ring-0 admission.
+#[cfg(feature = "emulator-fixture")]
 pub const EMULATOR_MANIFEST_SIZES: crate::ManifestSizes = crate::ManifestSizes::new(1, 2, 3, 4);
 
 /// The emulator descriptor carries no component/service entries.
+#[cfg(feature = "emulator-fixture")]
 pub const EMULATOR_COMPONENTS: crate::ComponentSet = crate::ComponentSet::empty();
 
 #[cfg(any(test, feature = "sign"))]

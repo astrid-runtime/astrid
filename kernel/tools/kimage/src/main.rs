@@ -20,10 +20,13 @@ use astrid_native_closure::{
     LoaderMeasurement, MeasuredIdentity, PolicyGeneration, PolicyHandoff, TABLE_LEN, encode_table,
     sign_policy_handoff, signed_table,
 };
+use astrid_system_generation::emulator_fixture::{
+    EMULATOR_CLOSURE_ROOT, EMULATOR_COMPONENTS, EMULATOR_GENERATION_FLOOR, EMULATOR_MANIFEST_SIZES,
+    EMULATOR_OBJECT_ROOT, EMULATOR_PLAN_DIGEST,
+};
 use astrid_system_generation::{
-    ContentId, EMULATOR_CLOSURE_ROOT, EMULATOR_COMPONENTS, EMULATOR_GENERATION_FLOOR,
-    EMULATOR_MANIFEST_SIZES, EMULATOR_OBJECT_ROOT, EMULATOR_PLAN_DIGEST, Expiration, Generation,
-    MANIFEST_LEN, ManifestInput, Revocation, RollbackFloor, SystemGenerationManifest, signed_bytes,
+    ContentId, Expiration, Generation, MANIFEST_LEN, ManifestInput, Revocation, RollbackFloor,
+    SystemGenerationManifest, signed_bytes,
 };
 use ed25519_dalek::SigningKey;
 

@@ -17,6 +17,7 @@ use astrid_native_closure::{
     LoaderMeasurement, MeasuredIdentity, PolicyGeneration, RootVerifier, TABLE_LEN, TrustedPolicy,
     verify_policy_handoff, verify_table,
 };
+use astrid_system_generation::MANIFEST_LEN;
 use bootloader_api::info::LoaderHandoffVerification;
 use ktest::determinism::{Determinism, compare_images};
 use ktest::events::{ExpectedClosures, assert_boot, parse_events};
@@ -24,8 +25,6 @@ use ktest::firmware;
 use ktest::image::{KIMAGE_NIGHTLY, KimageInvocation};
 use ktest::machine::{self, EXPECT_EXIT_CODE, QEMU_BIN, TAMPER_TIMEOUT, TIMEOUT};
 use wait_timeout::ChildExt;
-
-const MANIFEST_LEN: usize = 548;
 
 fn main() -> Result<()> {
     let root = workspace_root()?;

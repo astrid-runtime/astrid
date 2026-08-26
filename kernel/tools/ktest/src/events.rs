@@ -43,6 +43,13 @@ const REQUIRED_PASSES: &[&str] = &[
     "frame_exhaustion",
 ];
 
+const SUCCESS_BOUND_EVENTS: &[&str] = &[
+    "handoff.bound",
+    "closure.kernel",
+    "closure.sysgen",
+    "closure.bound",
+];
+
 /// Loader-measured identities and independent floors expected on serial.
 pub struct ExpectedClosures<'a> {
     pub policy_generation: u64,
@@ -107,6 +114,16 @@ pub fn halt_is_terminal(events: &[Value]) -> bool {
 
 pub fn any_test_fail(events: &[Value]) -> bool {
     count_named(events, "test.fail") > 0
+}
+
+/// A rejected generation must never emit success-bound evidence. This is
+/// intentionally independent of the happy-path assertions so a reject trace
+/// cannot be made to look accepted by retaining stale closure events.
+pub fn rejected_without_success_bound_events(events: &[Value]) -> bool {
+    count_named(events, "closure.reject") > 0
+        && SUCCESS_BOUND_EVENTS
+            .iter()
+            .all(|name| count_named(events, name) == 0)
 }
 
 fn required_events_once(events: &[Value]) -> bool {
@@ -450,6 +467,23 @@ mod tests {
         assert!(!assert_boot(&events, Some(33), 33, &swapped));
         let rejected = passing_serial().replace("closure.bound", "closure.reject");
         assert!(!assert_ok(&rejected));
+    }
+
+    #[test]
+    fn rejected_sysgen_emits_no_success_bound_events() {
+        let serial = concat!(
+            "{\"seq\":0,\"ev\":\"boot.entry\"}\n",
+            "{\"seq\":1,\"ev\":\"idt.ready\",\"vectors\":32}\n",
+            "{\"seq\":2,\"ev\":\"closure.reject\",\"reason\":\"binding\"}\n",
+            "{\"seq\":3,\"ev\":\"halt\",\"outcome\":\"fail\"}\n",
+        );
+        let events = parse_events(serial);
+        assert!(rejected_without_success_bound_events(&events));
+
+        let contaminated = format!("{serial}{{\"seq\":4,\"ev\":\"handoff.bound\"}}\n");
+        assert!(!rejected_without_success_bound_events(&parse_events(
+            &contaminated
+        )));
     }
 
     #[test]

@@ -61,14 +61,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     match closure::accept(boot_info) {
         Ok(accepted) => {
-            // The handoff/table are independently bound before this event;
-            // manifest admission below remains a separate fail-closed gate.
-            emit_bound(&accepted);
             // Keep descriptor bytes independent of the loader-owned mapping;
             // only this kernel-owned copy may enter manifest verification.
             let mut descriptor = [0u8; MANIFEST_LEN];
             closure::copy_system_generation(&accepted, &mut descriptor);
-            if accepted.bound.sysgen_identity()
+            if accepted.bound().sysgen_identity()
                 != astrid_native_closure::MeasuredIdentity::from_payload(&descriptor)
             {
                 serial::ev_closure_reject(
@@ -90,6 +87,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 serial::ev_halt(false);
                 serial::exit_qemu(false);
             }
+            // Emit success-bound evidence only after the descriptor has been
+            // copied into kernel-owned memory, identity-bound, and admitted by
+            // the canonical manifest verifier.
+            emit_bound(&accepted);
         },
         Err(err) => {
             serial::ev_closure_reject(err.as_reason());
@@ -127,7 +128,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 }
 
 fn emit_bound(accepted: &closure::AcceptedClosure) {
-    let bound = accepted.bound;
+    let bound = accepted.bound();
     let mut kernel_hex = [0u8; 64];
     let mut sysgen_hex = [0u8; 64];
     bound.kernel_identity().write_hex(&mut kernel_hex);
@@ -136,12 +137,12 @@ fn emit_bound(accepted: &closure::AcceptedClosure) {
     let sysgen_hex = core::str::from_utf8(&sysgen_hex).expect("hex digits are ascii");
     let mut kernel_image_hex = [0u8; 64];
     let mut closure_table_hex = [0u8; 64];
-    accepted.kernel_image.write_hex(&mut kernel_image_hex);
-    accepted.closure_table.write_hex(&mut closure_table_hex);
+    accepted.kernel_image().write_hex(&mut kernel_image_hex);
+    accepted.closure_table().write_hex(&mut closure_table_hex);
     let kernel_image_hex = core::str::from_utf8(&kernel_image_hex).expect("hex digits are ascii");
     let closure_table_hex = core::str::from_utf8(&closure_table_hex).expect("hex digits are ascii");
     serial::ev_handoff_bound(
-        accepted.handoff.policy().policy_generation().get(),
+        accepted.handoff().policy().policy_generation().get(),
         kernel_image_hex,
         closure_table_hex,
     );
