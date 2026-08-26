@@ -5,6 +5,25 @@
 use super::*;
 
 #[test]
+fn configured_station_coordinate_workspace_fails_before_handoff() {
+    let error = station_dispatch("@official/demo", true, true, true)
+        .expect_err("workspace Station coordinate unexpectedly passed dispatch");
+    assert!(error.to_string().contains("daemon/control state"));
+    assert!(station_dispatch("@official/demo", true, true, false).is_ok());
+}
+
+#[test]
+fn station_dispatch_preserves_github_and_local_provenance_boundaries() {
+    assert!(station_dispatch("@official/demo", true, false, true).unwrap());
+    assert!(!station_dispatch("@official/demo", true, false, false).unwrap());
+    assert!(!station_dispatch("https://github.com/official/demo", true, false, true).unwrap());
+    assert!(!station_dispatch("github.com/official/demo", true, false, true).unwrap());
+    // Batch/Distro.lock and persisted-source callers disable Station dispatch.
+    assert!(!station_dispatch("@org/repo", false, false, true).unwrap());
+    assert!(!station_dispatch("./capsule.capsule", true, false, true).unwrap());
+}
+
+#[test]
 fn manual_install_vars_parse_once_per_key() {
     let items = vec!["mode=headless".to_string(), "token=a=b".to_string()];
     let options = ManualInstallOptions::from_cli(true, false, &items).expect("valid variables");

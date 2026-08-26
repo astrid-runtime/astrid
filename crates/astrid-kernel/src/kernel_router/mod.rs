@@ -410,9 +410,23 @@ async fn handle_request(
         KernelRequest::RemoveCapsule { id, force: _ } => {
             match astrid_capsule::capsule::CapsuleId::new(id.clone()) {
                 Ok(cap_id) => match kernel.remove_one_capsule(&cap_id, &caller).await {
-                    Ok(true) => KernelResponse::Success(
-                        serde_json::json!({"status": "removed", "capsule": id}),
-                    ),
+                    Ok(true) => {
+                        match admin::clear_station_lock(kernel, &caller, cap_id.as_str()).await {
+                            astrid_core::kernel_api::AdminResponseBody::Success(_) => {
+                                KernelResponse::Success(
+                                    serde_json::json!({"status": "removed", "capsule": id}),
+                                )
+                            },
+                            astrid_core::kernel_api::AdminResponseBody::Error(error) => {
+                                KernelResponse::Error(format!(
+                                    "capsule '{id}' removed but Station lock clear failed: {error}"
+                                ))
+                            },
+                            other => KernelResponse::Error(format!(
+                                "capsule '{id}' removed but Station lock clear returned unexpected response: {other:?}"
+                            )),
+                        }
+                    },
                     Ok(false) => KernelResponse::Error(format!(
                         "capsule '{id}' is not installed for principal '{caller}'"
                     )),
@@ -550,6 +564,7 @@ async fn handle_request(
                     update_source,
                     source_id,
                     owner_uid,
+                    registry_source: None,
                 });
             }
             KernelResponse::CapsuleMetadata(entries)
