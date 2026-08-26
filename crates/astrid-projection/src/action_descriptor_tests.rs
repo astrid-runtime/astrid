@@ -178,7 +178,10 @@ fn descriptor_rejects_stale_expired_drift_and_cross_principal_observations() {
     let stale_debug = format_args!("{stale_error:?}").to_string();
     let stale_display = format_args!("{stale_error}").to_string();
     assert_eq!(stale_debug, "ActionStaleRevision");
-    assert_eq!(stale_display, "invalid projection descriptor: ActionStaleRevision");
+    assert_eq!(
+        stale_display,
+        "invalid projection descriptor: ActionStaleRevision"
+    );
     for rendered in [&stale_debug, &stale_display] {
         assert!(!rendered.contains('7'));
         assert!(!rendered.contains('8'));
