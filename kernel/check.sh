@@ -42,10 +42,6 @@ require_target() {
 run_portability() {
   local target spec package feature_spec
   local -a package_args
-  local -a required_targets=(
-    "aarch64-unknown-none"
-    "riscv64gc-unknown-none-elf"
-  )
   local -a targets=(
     "aarch64-unknown-none"
     "riscv64gc-unknown-none-elf"
@@ -57,11 +53,8 @@ run_portability() {
     "astrid-init-plan|"
   )
 
-  for target in "${required_targets[@]}"; do
-    require_target "$target"
-  done
-
   for target in "${targets[@]}"; do
+    require_target "$target"
     for spec in "${packages[@]}"; do
       package="${spec%%|*}"
       feature_spec="${spec#*|}"
