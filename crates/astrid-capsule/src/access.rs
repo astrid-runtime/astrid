@@ -307,18 +307,6 @@ impl CapsuleAccessResolver {
             .is_some_and(|access| access.is_capsule_allowed(capsule))
     }
 
-    /// Return whether a principal has a resolvable, enabled profile.
-    ///
-    /// Snapshot producers use this before filtering a registry view.  A
-    /// profile read/validation failure must not silently become a valid empty
-    /// tool snapshot, because an empty surface is authority-bearing only after
-    /// the principal's policy inputs were successfully resolved.
-    #[must_use]
-    pub fn principal_is_resolvable(&self, principal: &PrincipalId) -> bool {
-        self.resolve_access(Some(principal.as_str()), None)
-            .is_some()
-    }
-
     /// Return true when the caller may bypass principal-view narrowing.
     #[must_use]
     pub fn is_admin(&self, principal: Option<&str>) -> bool {
