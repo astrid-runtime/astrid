@@ -10,14 +10,17 @@ description = "Workload-neutral compatibility portable-machine fixture for Astri
 
 [features]
 default = []
+volume = ["dep:astrid-storage"]
 
 [dependencies]
 astrid-provider = { workspace = true }
 astrid-resource-types = { workspace = true }
+astrid-storage = { workspace = true, optional = true }
 blake3 = { version = "1.5", default-features = false, features = ["pure"] }
 
 [dev-dependencies]
 astrid-projection = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

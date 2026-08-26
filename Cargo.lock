@@ -813,7 +813,9 @@ dependencies = [
  "astrid-projection",
  "astrid-provider",
  "astrid-resource-types",
+ "astrid-storage",
  "blake3",
+ "tempfile",
 ]
 
 [[package]]
