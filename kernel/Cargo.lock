@@ -31,6 +31,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "astrid-init-plan"
+version = "0.0.0"
+dependencies = [
+ "astrid-system-generation",
+ "ed25519-dalek",
+]
+
+[[package]]
 name = "astrid-native-closure"
 version = "0.0.0"
 dependencies = [

@@ -8,6 +8,7 @@ members = [
     "crates/astrid-native-closure",
     "crates/astrid-native-kernel",
     "crates/astrid-boot-selection",
+    "crates/astrid-init-plan",
     "crates/astrid-system-generation",
     "tools/kimage",
     "tools/ktest",

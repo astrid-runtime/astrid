@@ -1,0 +1,15 @@
+[package]
+name = "astrid-init-plan"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "astrid_init_plan"
+path = "src/lib.rs"
+
+[dependencies]
+astrid-system-generation = { path = "../astrid-system-generation" }
+
+[dev-dependencies]
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["zeroize"] }
