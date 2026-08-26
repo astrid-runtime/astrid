@@ -31,6 +31,14 @@ mod capsule_adversarial_tests;
 mod capsules_loaded;
 #[cfg(test)]
 mod capsules_loaded_tests;
+/// Internal first-owner enrollment and boot-authority gate.
+mod first_owner;
+#[cfg(test)]
+#[path = "first_owner_boot_tests.rs"]
+mod first_owner_boot_tests;
+#[cfg(test)]
+#[path = "first_owner_test_support.rs"]
+mod first_owner_test_support;
 /// Grant-on-first-use consent handler (issue #998).
 ///
 /// Native-only: reuses the management-API admin grant machinery
@@ -1142,17 +1150,32 @@ impl Kernel {
                     .map_err(|e| {
                         std::io::Error::other(format!("Failed to bootstrap CLI root user: {e}"))
                     })?;
-            bootstrap_cli_root_ownership(
-                &ownership_store,
-                &principal_directory,
-                root_user,
-                root_principal_identity,
-                adopt_released_layout_principals,
-            )
-            .await
-            .map_err(|error| {
-                std::io::Error::other(format!("Failed to bootstrap CLI root ownership: {error}"))
-            })?;
+            // A fresh host is Unenrolled and a crash-recovered ceremony is
+            // Pending; neither state may silently promote the CLI root. The
+            // legacy helper remains available for an already Enrolled graph
+            // so existing identities stay compatible.
+            if first_owner::legacy_root_bootstrap_allowed(&ownership_store)
+                .await
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "Failed to load first-owner boot authority: {error}"
+                    ))
+                })?
+            {
+                bootstrap_cli_root_ownership(
+                    &ownership_store,
+                    &principal_directory,
+                    root_user,
+                    root_principal_identity,
+                    adopt_released_layout_principals,
+                )
+                .await
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "Failed to bootstrap CLI root ownership: {error}"
+                    ))
+                })?;
+            }
 
             // Apply pre-configured identity links from config.
             apply_identity_config(&identity_store, &workspace_root, &workspace_layout).await;
@@ -3619,10 +3642,25 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
     seed_default_principal_admin_profile(&home).expect("test kernel: seed default profile");
     let (identity_store, ownership_store) =
         open_test_identity_stores(&kv, principal_directory.clone());
-    identity_store
-        .create_principal(PrincipalId::default(), [7; 32])
+    let signing_key = astrid_crypto::KeyPair::from_secret_key(&[7; 32])
+        .expect("test kernel: default principal key");
+    let root_user = identity_store
+        .create_principal(PrincipalId::default(), *signing_key.public_key_bytes())
         .await
         .expect("test kernel: seed default principal identity");
+    let root_principal_identity = identity_store
+        .get_principal_identity(root_user.id)
+        .await
+        .expect("test kernel: load default principal identity")
+        .expect("test kernel: default principal identity");
+    first_owner_test_support::enroll_test_first_owner(
+        &ownership_store,
+        &principal_directory,
+        &root_user,
+        &root_principal_identity,
+        &signing_key,
+    )
+    .await;
 
     // `AstridHome::ensure` has already written the v2 sentinel. Complete the
     // fresh-home barrier receipt in the fixture so delete/reclaim tests model
@@ -5566,11 +5604,13 @@ mod tests {
         let directory = astrid_storage::PrincipalDirectory::default();
         let ownership_store =
             astrid_storage::OwnershipStore::new(backend, directory.clone()).unwrap();
+        let root_signing_key =
+            astrid_crypto::KeyPair::from_secret_key(&[2; 32]).expect("manual root key");
         let principal_identity = astrid_core::PrincipalIdentity::from_genesis(
             astrid_core::PrincipalGenesis::from_parts(
                 uuid::Uuid::from_u128(2),
                 chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
-                [2; 32],
+                *root_signing_key.public_key_bytes(),
             ),
         )
         .unwrap();
@@ -5598,6 +5638,15 @@ mod tests {
             display_name: None,
             created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
         };
+
+        first_owner_test_support::enroll_test_first_owner(
+            &ownership_store,
+            &directory,
+            &root_user,
+            &principal_identity,
+            &root_signing_key,
+        )
+        .await;
 
         bootstrap_cli_root_ownership(
             &ownership_store,

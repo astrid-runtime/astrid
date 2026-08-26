@@ -4,6 +4,8 @@
 //! platforms, and [`FrontendLink`], a mapping from platform-specific identities
 //! to Astrid users.
 
+/// Signed first-owner provisioning facts.
+pub mod first_owner;
 /// Durable human and fleet ownership identities.
 pub mod ownership;
 /// Stable principal identity.
@@ -11,6 +13,9 @@ pub mod principal;
 /// Core identity types.
 pub mod types;
 
+pub use first_owner::{
+    FIRST_OWNER_MESSAGE_LEN, FirstOwnerClaim, FirstOwnerClaimError, FirstOwnerGeneration,
+};
 pub use ownership::{
     FleetGenesis, FleetIdentity, FleetMembership, FleetRole, FleetUid, OwnershipIdentityError,
     PrincipalOwnership, UserGenesis, UserIdentity, UserUid,
