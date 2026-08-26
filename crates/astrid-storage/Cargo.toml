@@ -20,6 +20,7 @@ full = ["kv", "legacy-surrealkv"]
 
 [dependencies]
 astrid-core = { workspace = true }
+astrid-resource-types = { workspace = true, features = ["serde"] }
 astrid-crypto = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }

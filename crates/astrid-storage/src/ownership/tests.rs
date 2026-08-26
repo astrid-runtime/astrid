@@ -2,12 +2,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
+use ed25519_dalek::{Signer, SigningKey};
 use tokio::sync::{Barrier, Notify};
 use uuid::Uuid;
 
 use super::*;
 use crate::MemoryKvStore;
-use astrid_core::{FleetGenesis, PrincipalGenesis, PrincipalIdentity, UserGenesis};
+use astrid_core::{
+    FirstOwnerClaim, FleetGenesis, PrincipalGenesis, PrincipalIdentity, UserGenesis,
+};
 
 #[derive(Debug)]
 struct ReadBarrierKv {
@@ -149,12 +152,57 @@ fn principal(id: u128, key: u8) -> PrincipalUid {
     .uid
 }
 
-fn store() -> (OwnershipStore, PrincipalDirectory) {
+async fn enrolled_store() -> (OwnershipStore, PrincipalDirectory) {
     let principals = PrincipalDirectory::default();
-    (
-        OwnershipStore::new(Arc::new(MemoryKvStore::new()), principals.clone()).unwrap(),
-        principals,
+    let store = OwnershipStore::new(Arc::new(MemoryKvStore::new()), principals.clone()).unwrap();
+    enroll_store(&store, &principals).await;
+    (store, principals)
+}
+
+async fn enroll_store(store: &OwnershipStore, principals: &PrincipalDirectory) {
+    let key = SigningKey::from_bytes(&[91; 32]);
+    let bootstrap_user = UserIdentity::from_genesis(UserGenesis::from_parts(
+        Uuid::from_u128(0xfeed),
+        at(1_700_000_000),
+        key.verifying_key().to_bytes(),
+    ))
+    .unwrap();
+    let bootstrap_fleet = fleet(0xbeef, bootstrap_user.uid);
+    let bootstrap_principal = principal(0xcafe, 92);
+    admit_principal(principals, "bootstrap-principal", bootstrap_principal);
+    let unsigned = FirstOwnerClaim::from_parts(
+        [41; 32],
+        [42; 32],
+        [43; 32],
+        [44; 32],
+        bootstrap_user.uid,
+        bootstrap_fleet.uid,
+        bootstrap_principal,
+        key.verifying_key().to_bytes(),
+        [45; 32],
+        1,
+        [0; 64],
     )
+    .unwrap();
+    let claim = FirstOwnerClaim::from_parts(
+        *unsigned.machine_context(),
+        *unsigned.boot_context(),
+        *unsigned.kernel_identity(),
+        *unsigned.system_generation(),
+        unsigned.user_uid(),
+        unsigned.fleet_uid(),
+        unsigned.principal_uid(),
+        *unsigned.initial_user_public_key(),
+        *unsigned.nonce(),
+        unsigned.authority_epoch().get(),
+        key.sign(&unsigned.canonical_message()).to_bytes(),
+    )
+    .unwrap();
+    store.begin_first_owner(claim).await.unwrap();
+    store
+        .commit_first_owner(claim, bootstrap_user, bootstrap_fleet)
+        .await
+        .unwrap();
 }
 
 fn admit_principal(directory: &PrincipalDirectory, alias: &str, uid: PrincipalUid) {
@@ -165,7 +213,7 @@ fn admit_principal(directory: &PrincipalDirectory, alias: &str, uid: PrincipalUi
 
 #[tokio::test]
 async fn fleet_creation_atomically_bootstraps_its_owner() {
-    let (store, _) = store();
+    let (store, _) = enrolled_store().await;
     let owner = user(1, 1);
     let owned_fleet = fleet(10, owner.uid);
     store.create_user(owner.clone()).await.unwrap();
@@ -183,7 +231,7 @@ async fn fleet_creation_atomically_bootstraps_its_owner() {
 
 #[tokio::test]
 async fn principal_cannot_be_silently_reassigned() {
-    let (store, principals) = store();
+    let (store, principals) = enrolled_store().await;
     let owner = user(1, 1);
     let first = fleet(10, owner.uid);
     let second = fleet(11, owner.uid);
@@ -227,7 +275,7 @@ async fn principal_cannot_be_silently_reassigned() {
 
 #[tokio::test]
 async fn explicit_transfer_requires_management_of_both_fleets() {
-    let (store, principals) = store();
+    let (store, principals) = enrolled_store().await;
     let first_owner = user(1, 1);
     let second_owner = user(2, 2);
     let first = fleet(10, first_owner.uid);
@@ -280,7 +328,7 @@ async fn explicit_transfer_requires_management_of_both_fleets() {
 
 #[tokio::test]
 async fn last_owner_cannot_be_demoted_or_removed() {
-    let (store, _) = store();
+    let (store, _) = enrolled_store().await;
     let owner = user(1, 1);
     let owned_fleet = fleet(10, owner.uid);
     store.create_user(owner.clone()).await.unwrap();
@@ -302,7 +350,7 @@ async fn last_owner_cannot_be_demoted_or_removed() {
 
 #[tokio::test]
 async fn administrator_cannot_escalate_to_owner_or_remove_one() {
-    let (store, _) = store();
+    let (store, _) = enrolled_store().await;
     let owner = user(1, 1);
     let administrator = user(2, 2);
     let owned_fleet = fleet(10, owner.uid);
@@ -359,6 +407,7 @@ async fn concurrent_principal_assignments_do_not_lose_updates() {
     let raw: Arc<dyn KvStore> = backend.clone();
     let principals = PrincipalDirectory::default();
     let store = OwnershipStore::new(raw, principals.clone()).unwrap();
+    enroll_store(&store, &principals).await;
     let owner = user(1, 1);
     let owned_fleet = fleet(10, owner.uid);
     let first = principal(20, 2);
@@ -403,6 +452,7 @@ async fn unknown_principals_are_rejected_on_assignment_and_reopen() {
     let admitted = PrincipalDirectory::default();
     let raw: Arc<dyn KvStore> = backend.clone();
     let store = OwnershipStore::new(raw, admitted.clone()).unwrap();
+    enroll_store(&store, &admitted).await;
     let owner = user(1, 1);
     let owned_fleet = fleet(10, owner.uid);
     let principal_uid = principal(20, 2);
@@ -444,6 +494,7 @@ async fn deletion_guard_serializes_assignment_with_directory_removal() {
     let principals = PrincipalDirectory::default();
     let store = OwnershipStore::new(backend.clone(), principals.clone()).unwrap();
     let independently_opened = OwnershipStore::new(backend.clone(), principals.clone()).unwrap();
+    enroll_store(&store, &principals).await;
     let owner = user(1, 1);
     let owned_fleet = fleet(10, owner.uid);
     let principal_uid = principal(20, 2);
@@ -485,6 +536,7 @@ async fn deletion_reservation_can_be_finished_by_alias_after_identity_disappears
     let principals = PrincipalDirectory::default();
     let store = OwnershipStore::new(backend.clone(), principals.clone()).unwrap();
     let independently_opened = OwnershipStore::new(backend, principals.clone()).unwrap();
+    enroll_store(&store, &principals).await;
     let principal_uid = principal(20, 2);
     let alias = astrid_core::PrincipalId::new("recoverable-deletion").unwrap();
     principals.register(alias.clone(), principal_uid).unwrap();
@@ -525,6 +577,7 @@ async fn interrupted_deletion_reserves_alias_until_resumed_guard_finishes() {
     let backend = Arc::new(MemoryKvStore::new());
     let principals = PrincipalDirectory::default();
     let store = OwnershipStore::new(backend, principals.clone()).unwrap();
+    enroll_store(&store, &principals).await;
     let principal_uid = principal(20, 2);
     let alias = astrid_core::PrincipalId::new("recoverable-deletion").unwrap();
     principals.register(alias.clone(), principal_uid).unwrap();
@@ -554,7 +607,8 @@ async fn interrupted_deletion_reserves_alias_until_resumed_guard_finishes() {
 async fn legacy_alias_reservation_blocks_recreation_without_a_live_identity() {
     let backend = Arc::new(MemoryKvStore::new());
     let principals = PrincipalDirectory::default();
-    let store = OwnershipStore::new(backend, principals).unwrap();
+    let store = OwnershipStore::new(backend, principals.clone()).unwrap();
+    enroll_store(&store, &principals).await;
     let alias = astrid_core::PrincipalId::new("legacy-partial-delete").unwrap();
 
     let guard = store
@@ -583,6 +637,7 @@ async fn deletion_reservation_rejects_a_second_deletion_for_the_same_alias() {
     let backend = Arc::new(MemoryKvStore::new());
     let principals = PrincipalDirectory::default();
     let store = OwnershipStore::new(backend, principals.clone()).unwrap();
+    enroll_store(&store, &principals).await;
     let first = principal(20, 2);
     let second = principal(21, 3);
     let alias = astrid_core::PrincipalId::new("reserved-alias").unwrap();
@@ -610,6 +665,7 @@ async fn stale_assignment_retries_and_observes_deletion_reservation() {
     let principals = PrincipalDirectory::default();
     let store = OwnershipStore::new(backend.clone(), principals.clone()).unwrap();
     let independently_opened = OwnershipStore::new(backend.clone(), principals.clone()).unwrap();
+    enroll_store(&store, &principals).await;
     let owner = user(1, 1);
     let owned_fleet = fleet(10, owner.uid);
     let principal_uid = principal(20, 2);
