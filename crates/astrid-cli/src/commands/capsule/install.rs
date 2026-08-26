@@ -26,6 +26,8 @@ use super::install_github::{github_api_client, release_tag_url, resolve_github_r
 mod authority;
 #[path = "install_local.rs"]
 mod install_local;
+#[path = "station_install.rs"]
+mod station_install;
 
 #[cfg(test)]
 use astrid_capsule_install::inspect_directory_for_principal_with_layout;
@@ -34,6 +36,15 @@ use authority::authority_decision;
 use authority::daemon_install_authority;
 
 use install_local::{install_from_local, unpack_via_lib};
+
+pub(crate) use station_install::StationInstallRequest;
+pub(crate) use station_install::install_capsule_with_options_and_station_lock;
+#[cfg(test)]
+pub(crate) use station_install::install_capsule_with_options_and_station_lock_in_home;
+#[cfg(test)]
+pub(crate) use station_install::test_daemon_install_call;
+#[cfg(test)]
+pub(crate) use station_install::test_local_install_backend;
 
 #[derive(Clone, Copy)]
 struct ExpectedCapsule<'a> {
@@ -175,29 +186,19 @@ pub(crate) async fn install_capsule_with_options(
     approve_untrusted: bool,
     vars: &[String],
 ) -> anyhow::Result<()> {
-    let prompt = ManualInstallOptions::from_cli(yes, approve_untrusted, vars)?;
-    let principal = crate::principal::current();
-    let (installed, _resolved) = install_capsule_inner(InstallRequest {
-        source,
-        name_hint: capsule,
-        workspace,
-        refspec: &RefSpec::default(),
-        principal: &principal,
-        expected: None,
-        prompt: &prompt,
-        allow_station: true,
-    })
-    .await?;
-    let installed_ids: Vec<String> = installed
-        .iter()
-        .map(|capsule| capsule.id.as_str().to_string())
-        .collect();
-    // Live-load: if a daemon is running, hot-load (or upgrade) each just-installed
-    // capsule so it's usable without a restart. Best-effort and non-fatal — the
-    // on-disk install above already succeeded standalone. The `update` and TUI
-    // install paths route through here too, so they inherit live hot-swap.
-    super::live_load::nudge_daemon_reload(&installed_ids).await;
-    Ok(())
+    station_install::install_capsule_with_options_and_station_lock(
+        &station_install::StationInstallRequest {
+            source,
+            capsule,
+            workspace,
+            yes,
+            approve_untrusted,
+            station_lock: None,
+            station_lock_sha256: None,
+            vars,
+        },
+    )
+    .await
 }
 
 /// Reinstall a previously persisted source without allowing a newly
@@ -266,7 +267,7 @@ pub(super) async fn install_capsule_inner(
     install_capsule_inner_at(request, &home).await
 }
 
-async fn install_capsule_inner_at(
+pub(super) async fn install_capsule_inner_at(
     request: InstallRequest<'_>,
     home: &AstridHome,
 ) -> anyhow::Result<(Vec<InstalledCapsuleOutcome>, Option<String>)> {

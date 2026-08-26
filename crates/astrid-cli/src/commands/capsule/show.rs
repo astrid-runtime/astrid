@@ -93,12 +93,7 @@ pub(crate) async fn run(args: &ShowArgs) -> Result<ExitCode> {
         serde_json::from_value(entry.capabilities.clone())?;
     let permissions = semantic_capabilities(&capabilities);
     let station_lock = station::load_lock(&principal, &entry.name).await?;
-    let registry_source = station_lock.as_ref().map(|lock| {
-        format!(
-            "@{}/{} ({})",
-            lock.coordinate.namespace, lock.coordinate.name, lock.publication_digest
-        )
-    });
+    let registry_source = registry_identity(station_lock.as_ref());
     let manifest = serde_json::to_string_pretty(&serde_json::json!({
         "package": {
             "name": entry.name,
@@ -147,6 +142,18 @@ pub(crate) async fn run(args: &ShowArgs) -> Result<ExitCode> {
         println!("  {line}");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Render the owner-scoped Station identity shown alongside the daemon source.
+pub(crate) fn registry_identity(
+    lock: Option<&astrid_core::kernel_api::StationLock>,
+) -> Option<String> {
+    lock.map(|lock| {
+        format!(
+            "@{}/{} ({})",
+            lock.coordinate.namespace, lock.coordinate.name, lock.publication_digest
+        )
+    })
 }
 
 fn print_permissions(permissions: &[SemanticCapability]) {

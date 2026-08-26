@@ -33,6 +33,10 @@ pub(super) async fn install_from_local(
     // Unpack `.capsule` archive when source is a file.
     if source_path.is_file() && source.ends_with(".capsule") {
         if !workspace {
+            #[cfg(test)]
+            if let Some(result) = super::station_install::test_daemon_install_outcome(source) {
+                return result;
+            }
             let installed = install_daemon::install_local_via_daemon_outcome(
                 source,
                 prompt,

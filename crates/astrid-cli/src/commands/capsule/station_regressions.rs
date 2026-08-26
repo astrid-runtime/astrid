@@ -3,11 +3,15 @@
 
 use super::*;
 use crate::commands::capsule::install::ManualInstallOptions;
+use crate::commands::capsule::install::test_daemon_install_call;
+use crate::commands::capsule::install_update::{DaemonUpdateSource, daemon_update_source};
 use crate::commands::capsule::remove::test_remove_capsule_from_home_for_in_workspace;
 use crate::commands::capsule::show::CapsuleShow;
+use crate::commands::capsule::show::registry_identity;
 use astrid_core::kernel_api::CapsuleMetadataEntry;
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use sha2::Digest as _;
 use std::fs::File;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -189,11 +193,336 @@ fn write_lock_json(path: &Path, lock: &StationLock) {
     std::fs::write(path, serde_json::to_vec_pretty(lock).unwrap()).unwrap();
 }
 
+fn lock_file_sha256(path: &Path) -> String {
+    let bytes = std::fs::read(path).unwrap();
+    format!("sha256:{}", hex::encode(sha2::Sha256::digest(&bytes)))
+}
+
 fn domain_digest(manifest: &[u8]) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(MANIFEST_DOMAIN);
     hasher.update(manifest);
     hasher.finalize().to_hex().to_string()
+}
+
+fn lock_for_archive(archive: &Path, manifest: &[u8]) -> StationLock {
+    let bytes = std::fs::read(archive).unwrap();
+    let mut lock = sample_lock(&format!("blake3:{}", domain_digest(manifest)));
+    lock.artifact_size = bytes.len() as u64;
+    lock.artifact_sha256 = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&bytes)));
+    lock.artifact_blake3 = format!("blake3:{}", blake3::hash(&bytes).to_hex());
+    lock
+}
+
+#[test]
+fn station_handoff_rejects_artifact_byte_substitution_before_lock_persist() {
+    let root = tempfile::tempdir().unwrap();
+    let manifest = b"[package]\nname = \"demo\"\nversion = \"1.0.0\"\n";
+    let (_fixture_dir, archive) = capsule_archive(manifest);
+    let lock = lock_for_archive(&archive, manifest);
+    let lock_path = root.path().join("handoff.lock.json");
+    write_lock_json(&lock_path, &lock);
+    let lock_sha256 = lock_file_sha256(&lock_path);
+    let original = std::fs::read(&archive).unwrap();
+    let mut substituted = original.clone();
+    substituted[0] ^= 0xff;
+    std::fs::write(&archive, substituted).unwrap();
+
+    let principal = PrincipalId::default();
+    let home = astrid_core::dirs::AstridHome::from_path(root.path().join("astrid"));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _lock_backend = runtime.block_on(super::test_lock_backend::install());
+    let result = runtime.block_on(
+        crate::commands::capsule::install::install_capsule_with_options_and_station_lock_in_home(
+            &crate::commands::capsule::install::StationInstallRequest {
+                source: archive.to_str().unwrap(),
+                capsule: None,
+                workspace: false,
+                yes: true,
+                approve_untrusted: true,
+                station_lock: Some(lock_path.as_path()),
+                station_lock_sha256: Some(lock_sha256.as_str()),
+                vars: &[],
+            },
+            &home,
+        ),
+    );
+    assert!(
+        result.is_err(),
+        "substituted archive was handed to the daemon"
+    );
+    assert!(
+        runtime
+            .block_on(load_lock(&principal, "demo"))
+            .unwrap()
+            .is_none(),
+        "artifact substitution must fail before Station lock persistence"
+    );
+}
+
+#[test]
+fn station_handoff_rejects_lock_byte_substitution_before_lock_persist() {
+    let root = tempfile::tempdir().unwrap();
+    let manifest = b"[package]\nname = \"demo\"\nversion = \"1.0.0\"\n";
+    let (_fixture_dir, archive) = capsule_archive(manifest);
+    let mut lock = lock_for_archive(&archive, manifest);
+    let lock_path = root.path().join("handoff.lock.json");
+    write_lock_json(&lock_path, &lock);
+    let lock_sha256 = lock_file_sha256(&lock_path);
+    lock.station_id = "attacker-controlled-source".to_owned();
+    write_lock_json(&lock_path, &lock);
+
+    let principal = PrincipalId::default();
+    let home = astrid_core::dirs::AstridHome::from_path(root.path().join("astrid"));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _lock_backend = runtime.block_on(super::test_lock_backend::install());
+    let result = runtime.block_on(
+        crate::commands::capsule::install::install_capsule_with_options_and_station_lock_in_home(
+            &crate::commands::capsule::install::StationInstallRequest {
+                source: archive.to_str().unwrap(),
+                capsule: None,
+                workspace: false,
+                yes: true,
+                approve_untrusted: true,
+                station_lock: Some(lock_path.as_path()),
+                station_lock_sha256: Some(lock_sha256.as_str()),
+                vars: &[],
+            },
+            &home,
+        ),
+    );
+    assert!(result.is_err(), "substituted lock was handed to the daemon");
+    assert!(
+        runtime
+            .block_on(load_lock(&principal, "demo"))
+            .unwrap()
+            .is_none(),
+        "lock substitution must fail before Station lock persistence"
+    );
+}
+
+#[tokio::test]
+async fn station_private_handoff_persists_lock_show_and_update_source() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace_root = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace_root).unwrap();
+    let _current_dir = CurrentDirGuard::install(&workspace_root);
+    let manifest = b"[package]\nname = \"demo\"\nversion = \"1.0.0\"\n";
+    let (_fixture_dir, archive) = capsule_archive(manifest);
+    let expected = lock_for_archive(&archive, manifest);
+    let lock_path = root.path().join("handoff.lock.json");
+    write_lock_json(&lock_path, &expected);
+    let lock_sha256 = lock_file_sha256(&lock_path);
+
+    let principal = PrincipalId::default();
+    let home = astrid_core::dirs::AstridHome::from_path(root.path().join("astrid"));
+    let _lock_backend = super::test_lock_backend::install().await;
+    let mut previous = sample_lock(&digest("blake3:", 0x01));
+    previous.station_id = "previous-registry".to_owned();
+    store_lock(&principal, "demo", previous.clone())
+        .await
+        .unwrap();
+    let _local_backend = crate::commands::capsule::install::test_local_install_backend(false);
+    crate::commands::capsule::install::install_capsule_with_options_and_station_lock_in_home(
+        &crate::commands::capsule::install::StationInstallRequest {
+            source: archive.to_str().unwrap(),
+            capsule: None,
+            workspace: false,
+            yes: true,
+            approve_untrusted: true,
+            station_lock: Some(lock_path.as_path()),
+            station_lock_sha256: Some(lock_sha256.as_str()),
+            vars: &[],
+        },
+        &home,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        super::test_lock_backend::set_calls(),
+        2,
+        "handoff must replace seeded provenance without extra writes"
+    );
+
+    let persisted = load_lock(&principal, "demo")
+        .await
+        .unwrap()
+        .expect("StationLockGet must observe the owner-scoped handoff");
+    assert_eq!(persisted, expected);
+    assert_ne!(persisted.station_id, previous.station_id);
+
+    let (daemon_source, daemon_calls) = test_daemon_install_call()
+        .expect("private staging must reach the daemon local-install boundary");
+    assert_eq!(daemon_calls, 1);
+    {
+        let source_path = std::path::Path::new(daemon_source.as_str());
+        assert!(
+            source_path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| name.starts_with("astrid-station-handoff-")),
+            "daemon must receive a create-new staged archive: {:?}",
+            source_path.display()
+        );
+    }
+    assert_eq!(
+        registry_identity(Some(&persisted)).as_deref(),
+        Some(
+            format!(
+                "@{}/{} ({})",
+                persisted.coordinate.namespace,
+                persisted.coordinate.name,
+                persisted.publication_digest
+            )
+            .as_str()
+        )
+    );
+
+    let entry = metadata_without_update_source();
+    assert!(matches!(
+        daemon_update_source(&entry, Some(persisted)),
+        DaemonUpdateSource::Station(_)
+    ));
+}
+
+#[tokio::test]
+async fn station_handoff_failure_restores_previous_owner_scoped_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace_root = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace_root).unwrap();
+    let _current_dir = CurrentDirGuard::install(&workspace_root);
+    let manifest = b"[package]\nname = \"demo\"\nversion = \"1.0.0\"\n";
+    let (_fixture_dir, archive) = capsule_archive(manifest);
+    let lock = lock_for_archive(&archive, manifest);
+    let lock_path = root.path().join("handoff.lock.json");
+    write_lock_json(&lock_path, &lock);
+    let lock_sha256 = lock_file_sha256(&lock_path);
+
+    let principal = PrincipalId::default();
+    let home = astrid_core::dirs::AstridHome::from_path(root.path().join("astrid"));
+    let _lock_backend = super::test_lock_backend::install().await;
+    let previous = sample_lock(&digest("blake3:", 0x01));
+    store_lock(&principal, "demo", previous.clone())
+        .await
+        .unwrap();
+    let _local_backend = crate::commands::capsule::install::test_local_install_backend(true);
+    let error =
+        crate::commands::capsule::install::install_capsule_with_options_and_station_lock_in_home(
+            &crate::commands::capsule::install::StationInstallRequest {
+                source: archive.to_str().unwrap(),
+                capsule: None,
+                workspace: false,
+                yes: true,
+                approve_untrusted: true,
+                station_lock: Some(lock_path.as_path()),
+                station_lock_sha256: Some(lock_sha256.as_str()),
+                vars: &[],
+            },
+            &home,
+        )
+        .await
+        .expect_err("failure after persistence must fail the command");
+    assert!(error.to_string().contains("daemon install failed"));
+    assert_eq!(
+        load_lock(&principal, "demo").await.unwrap().as_ref(),
+        Some(&previous)
+    );
+    assert_eq!(
+        super::test_lock_backend::set_calls(),
+        3,
+        "failed handoff must write replacement then restore the previous lock"
+    );
+}
+
+#[tokio::test]
+async fn ordinary_local_install_without_station_flags_performs_no_lock_set() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace_root = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace_root).unwrap();
+    let _current_dir = CurrentDirGuard::install(&workspace_root);
+    let manifest = b"[package]\nname = \"demo\"\nversion = \"1.0.0\"\n";
+    let (_fixture_dir, archive) = capsule_archive(manifest);
+    let principal = PrincipalId::default();
+    let home = astrid_core::dirs::AstridHome::from_path(root.path().join("astrid"));
+    let _lock_backend = super::test_lock_backend::install().await;
+    let _local_backend = crate::commands::capsule::install::test_local_install_backend(false);
+
+    crate::commands::capsule::install::install_capsule_with_options_and_station_lock_in_home(
+        &crate::commands::capsule::install::StationInstallRequest {
+            source: archive.to_str().unwrap(),
+            capsule: None,
+            workspace: false,
+            yes: true,
+            approve_untrusted: false,
+            station_lock: None,
+            station_lock_sha256: None,
+            vars: &[],
+        },
+        &home,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(super::test_lock_backend::set_calls(), 0);
+    let (daemon_source, calls) = test_daemon_install_call().unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(
+        std::fs::canonicalize(&daemon_source).unwrap(),
+        std::fs::canonicalize(&archive).unwrap()
+    );
+    assert!(
+        load_lock(&principal, "demo").await.unwrap().is_none(),
+        "an arbitrary local capsule remains local"
+    );
+}
+
+#[tokio::test]
+async fn station_flags_must_be_supplied_as_a_pair() {
+    let root = tempfile::tempdir().unwrap();
+    let manifest = b"[package]\nname = \"demo\"\nversion = \"1.0.0\"\n";
+    let (_fixture_dir, archive) = capsule_archive(manifest);
+    let lock = lock_for_archive(&archive, manifest);
+    let lock_path = root.path().join("pair.lock.json");
+    write_lock_json(&lock_path, &lock);
+    let digest_value = lock_file_sha256(&lock_path);
+    let home = astrid_core::dirs::AstridHome::from_path(root.path().join("astrid"));
+    let _lock_backend = super::test_lock_backend::install().await;
+    for (lock, sha) in [
+        (Some(lock_path.as_path()), None),
+        (None, Some(digest_value.as_str())),
+    ] {
+        let error =
+            crate::commands::capsule::install::install_capsule_with_options_and_station_lock_in_home(
+                &crate::commands::capsule::install::StationInstallRequest {
+                    source: archive.to_str().unwrap(),
+                    capsule: None,
+                    workspace: false,
+                    yes: true,
+                    approve_untrusted: false,
+                    station_lock: lock,
+                    station_lock_sha256: sha,
+                    vars: &[],
+                },
+                &home,
+            )
+            .await
+            .expect_err("either handoff flag alone must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("--station-lock and --station-lock-sha256"),
+            "unexpected paired-argument error: {error}"
+        );
+    }
+    assert_eq!(super::test_lock_backend::set_calls(), 0);
 }
 
 #[test]
