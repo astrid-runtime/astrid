@@ -48,6 +48,11 @@ mod bind_workers;
 pub(crate) mod bindings;
 pub mod host;
 pub mod host_state;
+mod host_state_authority;
+#[cfg(test)]
+#[path = "host_state_authority_tests.rs"]
+mod host_state_authority_tests;
+mod host_state_types;
 pub mod limits;
 mod pool;
 mod storage_vfs;
@@ -2604,6 +2609,7 @@ impl ExecutionEngine for WasmEngine {
                 ),
                 principal: st_principal.clone(),
                 stamped_invocation: None,
+                semantic_authorities: Default::default(),
                 system_runtime: st_system_runtime,
                 capsule_uuid,
                 caller_context: None,
@@ -3941,6 +3947,7 @@ async fn build_lifecycle_host_state(
         resource_table: wasmtime::component::ResourceTable::new(),
         principal: principal.clone(),
         stamped_invocation: None,
+        semantic_authorities: Default::default(),
         system_runtime: false,
         capsule_uuid: uuid::Uuid::new_v4(),
         caller_context: None,
