@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pio-media-guest",
+    "crates/pio-media-host",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.0.0"
+license = "UNLICENSED"
+
+[profile.guest]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
