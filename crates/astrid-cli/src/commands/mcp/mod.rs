@@ -56,6 +56,8 @@ mod elicit;
 mod form_elicitation;
 #[cfg(unix)]
 mod gateway;
+#[cfg(unix)]
+mod idle;
 #[cfg(not(unix))]
 mod gateway {
     use std::process::ExitCode;

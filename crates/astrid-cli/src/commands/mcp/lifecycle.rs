@@ -277,6 +277,36 @@ fn parse_process_row(line: &str) -> Option<ProcessRow> {
     })
 }
 
+fn command_file_name(token: &str) -> &str {
+    Path::new(token)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(token)
+}
+
+fn is_env_assignment(token: &str) -> bool {
+    let Some((name, _value)) = token.split_once('=') else {
+        return false;
+    };
+    let mut characters = name.bytes();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    (first == b'_' || first.is_ascii_alphabetic())
+        && characters.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+}
+
+fn is_python_frame(command: &str) -> bool {
+    command.contains("aos-mcp-frame")
+        || command.contains("Python.framework")
+        || command.split_whitespace().any(|token| {
+            matches!(
+                command_file_name(token),
+                "python3" | "Python" | "aos-mcp-frame"
+            )
+        })
+}
+
 fn is_long_mcp_serve(command: &str) -> bool {
     let tokens = command.split_whitespace().collect::<Vec<_>>();
     let has_mcp_serve = tokens.windows(2).any(|pair| pair == ["mcp", "serve"]);
@@ -288,7 +318,47 @@ fn is_long_mcp_serve(command: &str) -> bool {
     has_mcp_serve && has_timeout
 }
 
-/// Remove orphaned long-timeout `mcp serve` processes.
+fn is_mcp_attach(command: &str) -> bool {
+    if is_python_frame(command) {
+        return false;
+    }
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    let Some(attach_index) = tokens.windows(2).position(|pair| pair == ["mcp", "attach"]) else {
+        return false;
+    };
+    // Only argv[0] (or an explicit `env VAR=value ...` wrapper) can establish
+    // Astrid identity. A basename later in the command is commonly a script,
+    // workspace, or argument and must not make an unrelated process reapable.
+    let prefix = &tokens[..attach_index];
+    let Some(executable) = prefix.first() else {
+        return false;
+    };
+    if matches!(command_file_name(executable), "astrid" | "aos") {
+        return true;
+    }
+    if command_file_name(executable) != "env" {
+        return false;
+    }
+    let mut index = 1;
+    while prefix
+        .get(index)
+        .is_some_and(|token| is_env_assignment(token))
+    {
+        index = index.saturating_add(1);
+    }
+    prefix
+        .get(index)
+        .is_some_and(|token| matches!(command_file_name(token), "astrid" | "aos"))
+}
+
+fn is_reapable_mcp(command: &str) -> bool {
+    is_long_mcp_serve(command) || is_mcp_attach(command)
+}
+
+/// Remove orphaned long-timeout `mcp serve` and `mcp attach` processes.
+///
+/// Never signals Python `aos-mcp-frame` processes. Those abort on 3.14 if a
+/// SIGKILL races `Buffered_close`; attach children are the reap target.
 pub(crate) fn gc() -> Result<ExitCode> {
     let output = Command::new("ps")
         .args(["-axo", "pid=,ppid=,command="])
@@ -300,7 +370,7 @@ pub(crate) fn gc() -> Result<ExitCode> {
     let listing = String::from_utf8_lossy(&output.stdout);
     let mut reaped = 0_u32;
     for row in listing.lines().filter_map(parse_process_row) {
-        if row.pid == std::process::id() || !is_long_mcp_serve(&row.command) {
+        if row.pid == std::process::id() || !is_reapable_mcp(&row.command) {
             continue;
         }
         let parent_dead =
@@ -309,8 +379,8 @@ pub(crate) fn gc() -> Result<ExitCode> {
             continue;
         }
         // Re-read the command immediately before signalling to avoid killing a
-        // recycled PID that no longer belongs to the long-timeout MCP shim.
-        if !process_command(row.pid).is_some_and(|command| is_long_mcp_serve(&command)) {
+        // recycled PID that no longer belongs to a reapable MCP shim.
+        if !process_command(row.pid).is_some_and(|command| is_reapable_mcp(&command)) {
             continue;
         }
         #[cfg(unix)]
@@ -338,7 +408,10 @@ fn process_command(pid: u32) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GatewayReady, ReadyFormat, is_long_mcp_serve, parse_process_row};
+    use super::{
+        GatewayReady, ReadyFormat, is_long_mcp_serve, is_mcp_attach, is_python_frame,
+        parse_process_row,
+    };
 
     #[test]
     fn process_parser_preserves_command_after_pid_fields() {
@@ -355,6 +428,29 @@ mod tests {
         assert!(is_long_mcp_serve("aos mcp serve --request-timeout=1d5m"));
         assert!(!is_long_mcp_serve("aos mcp serve --request-timeout 30s"));
         assert!(!is_long_mcp_serve("aos mcp gateway --request-timeout 1d5m"));
+    }
+
+    #[test]
+    fn gc_reaps_orphaned_attach_but_never_python_frames() {
+        assert!(is_mcp_attach(
+            "/Users/me/.aos/runtime/bin/astrid --principal codex-code mcp attach --workspace /tmp/proj"
+        ));
+        assert!(is_mcp_attach("aos --principal codex-code mcp attach"));
+        assert!(!is_mcp_attach(
+            "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python -u /cache/unicity-aos/bin/aos-mcp-frame /runtime/bin/astrid --principal codex-code mcp attach --workspace /plugin"
+        ));
+        assert!(is_python_frame(
+            "Python -u /cache/bin/aos-mcp-frame astrid --principal codex-code mcp attach"
+        ));
+        assert!(!is_mcp_attach(
+            "node worker.js mcp attach --workspace /tmp/astrid"
+        ));
+        assert!(!is_mcp_attach("node /tmp/astrid worker.js mcp attach"));
+        assert!(is_mcp_attach(
+            "env ASTRID_SESSION_ID=thread-1 /opt/aos mcp attach --workspace /tmp/proj"
+        ));
+        assert!(!is_mcp_attach("astrid --principal codex-code mcp gateway"));
+        assert!(!is_mcp_attach("aos mcp serve --request-timeout 1d5m"));
     }
 
     #[test]
