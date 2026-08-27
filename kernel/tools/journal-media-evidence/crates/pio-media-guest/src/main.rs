@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+#[path = "../../../shared/crash.rs"]
+mod crash;
 #[path = "../../../shared/media.rs"]
 mod media;
 
@@ -549,17 +551,7 @@ fn parse_ascii_u64(bytes: &[u8]) -> u64 {
 
 fn crash_arm(frame_index: usize) {
     let text = crash_text();
-    if !starts_with_bytes(&text, b"frame:") {
-        return;
-    }
-    let digits_end = text[6..]
-        .iter()
-        .position(|byte| !byte.is_ascii_digit())
-        .unwrap_or(text.len());
-    if digits_end == 6 {
-        return;
-    }
-    if parse_ascii_u64(&text[6..digits_end]) as usize == frame_index {
+    if crash::selector_matches(&text, frame_index) {
         print_hex_u64(b"CRASH-BARRIER FRAME=", frame_index as u64);
         spin_for_kill();
     }

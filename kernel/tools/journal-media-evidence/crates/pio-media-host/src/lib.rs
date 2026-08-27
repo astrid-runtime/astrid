@@ -1,3 +1,5 @@
+#[path = "../../../shared/crash.rs"]
+pub mod crash;
 #[path = "../../../shared/media.rs"]
 pub mod media;
 
