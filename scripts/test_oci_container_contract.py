@@ -19,7 +19,11 @@ class DockerfileContractTests(unittest.TestCase):
     def test_packages_release_bytes_without_building_source(self) -> None:
         self.assertIn("COPY dist/oci-amd64/astrid-release.tar.gz", DOCKERFILE)
         self.assertIn("ARG ASTRID_ARCHIVE_SHA256", DOCKERFILE)
+        self.assertIn("ARG ASTRID_ARCHIVE_BLAKE3", DOCKERFILE)
+        self.assertIn("ARG ASTRID_RELEASE_RECEIPT_SHA256", DOCKERFILE)
+        self.assertIn("ARG ASTRID_RELEASE_MANIFEST_SHA256", DOCKERFILE)
         self.assertIn("sha256sum --check --strict", DOCKERFILE)
+        self.assertIn("/opt/astrid/release-receipt.json", DOCKERFILE)
         self.assertNotIn("cargo build", DOCKERFILE)
         self.assertNotIn("git clone", DOCKERFILE)
         self.assertNotIn("curl ", DOCKERFILE)
@@ -35,6 +39,30 @@ class DockerfileContractTests(unittest.TestCase):
     def test_base_image_is_digest_pinned(self) -> None:
         first_line = DOCKERFILE.splitlines()[0]
         self.assertRegex(first_line, r"^FROM .+@sha256:[0-9a-f]{64}$")
+
+    def test_release_receipt_binds_image_to_exact_source_and_archive(self) -> None:
+        for field in (
+            "repository",
+            "version",
+            "tag",
+            "source-commit",
+            "target",
+            "archive",
+            "archive-sha256",
+            "archive-blake3",
+            "release-manifest-sha256",
+            "release-workflow-identity",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(field, DOCKERFILE)
+        for label in (
+            "io.astrid.release.archive-sha256",
+            "io.astrid.release.archive-blake3",
+            "io.astrid.release.receipt-sha256",
+            "io.astrid.release.manifest-sha256",
+        ):
+            with self.subTest(label=label):
+                self.assertIn(label, DOCKERFILE)
 
 
 class EntrypointContractTests(unittest.TestCase):
@@ -64,6 +92,14 @@ class EntrypointContractTests(unittest.TestCase):
         self.assertIn(".astrid-oci-write-probe.XXXXXX", ENTRYPOINT)
         self.assertNotIn(".astrid-oci-write-probe.$$", ENTRYPOINT)
 
+    def test_hosted_profile_fixes_state_workspace_and_home_identity(self) -> None:
+        self.assertIn("ASTRID_HOME is fixed to /var/lib/astrid", ENTRYPOINT)
+        self.assertIn("ASTRID_WORKSPACE is fixed to /workspace", ENTRYPOINT)
+        self.assertIn("ASTRID_WORKSPACE_STATE_DIR is fixed to .astrid", ENTRYPOINT)
+        self.assertIn("HOME is fixed to /var/lib/astrid", ENTRYPOINT)
+        self.assertIn("ASTRID_HOME=/var/lib/astrid", ENTRYPOINT)
+        self.assertIn("ASTRID_WORKSPACE=/workspace", ENTRYPOINT)
+
     def test_foreground_daemon_allowlist_rejects_ephemeral_and_unknown_flags(self) -> None:
         self.assertIn("exec /usr/local/bin/astrid-daemon", ENTRYPOINT)
         command = ENTRYPOINT.rsplit("exec /usr/local/bin/astrid-daemon", 1)[1]
@@ -82,6 +118,28 @@ class RuntimeHarnessContractTests(unittest.TestCase):
         self.assertEqual(TEST_HARNESS.count("FROM $TEST_BASE_IMAGE"), 2)
         self.assertNotIn("FROM $IMAGE", TEST_HARNESS)
         self.assertIn('docker image rm --force "$TEST_BASE_IMAGE"', TEST_HARNESS)
+
+    def test_harness_has_restart_owner_and_audit_isolation_probes(self) -> None:
+        for marker in (
+            "restart/reopen",
+            "audit",
+            "principal",
+            "workspace",
+            "capability",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, TEST_HARNESS.lower())
+        self.assertIn("docker restart", TEST_HARNESS)
+        self.assertIn("agent create", TEST_HARNESS)
+        self.assertIn("audit stats", TEST_HARNESS)
+
+    def test_harness_rejects_host_socket_and_privileged_runtime(self) -> None:
+        lowered = TEST_HARNESS.lower()
+        self.assertNotIn("docker.sock", lowered)
+        self.assertNotIn("--privileged", lowered)
+        self.assertIn("--read-only", lowered)
+        self.assertIn("--cap-drop=all", lowered)
+        self.assertIn("--security-opt=no-new-privileges", lowered)
 
 
 class WorkflowContractTests(unittest.TestCase):
@@ -115,6 +173,13 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("type=docker,dest=", build_job)
         self.assertNotIn("--load", build_job)
         self.assertIn('echo "BOUND_IMAGE=$IMAGE_REPO_DIGEST"', build_job)
+        for build_arg in (
+            '"ASTRID_ARCHIVE_BLAKE3=$ARCHIVE_BLAKE3"',
+            '"ASTRID_RELEASE_MANIFEST_SHA256=$RELEASE_MANIFEST_SHA256"',
+            '"ASTRID_RELEASE_RECEIPT_SHA256=$RELEASE_RECEIPT_SHA256"',
+        ):
+            with self.subTest(build_arg=build_arg):
+                self.assertIn(build_arg, build_job)
         first_binding = build_job.index("python3 scripts/oci_export_binding.py")
         runtime_test = build_job.index('container/amd64/test.sh "$BOUND_IMAGE"')
         scan = build_job.index("aquasecurity/trivy-action")

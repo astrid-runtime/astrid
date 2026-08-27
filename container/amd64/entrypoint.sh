@@ -47,6 +47,22 @@ done
 [ -z "$expect_daemon_value" ] ||
     fail "$expect_daemon_value requires an integer greater than zero"
 
+# The hosted profile has one image-owned state/workspace identity.  A caller
+# may choose the bind mounts at these fixed locations, but cannot redirect the
+# daemon to a host path or alias and thereby mint a different authority root.
+if [ "${ASTRID_HOME:-/var/lib/astrid}" != /var/lib/astrid ]; then
+    fail "ASTRID_HOME is fixed to /var/lib/astrid in the hosted profile"
+fi
+if [ "${ASTRID_WORKSPACE:-/workspace}" != /workspace ]; then
+    fail "ASTRID_WORKSPACE is fixed to /workspace in the hosted profile"
+fi
+if [ "${ASTRID_WORKSPACE_STATE_DIR:-.astrid}" != .astrid ]; then
+    fail "ASTRID_WORKSPACE_STATE_DIR is fixed to .astrid in the hosted profile"
+fi
+if [ "${HOME:-/var/lib/astrid}" != /var/lib/astrid ]; then
+    fail "HOME is fixed to /var/lib/astrid in the hosted profile"
+fi
+
 distro_path=${ASTRID_DISTRO_PATH:-/run/astrid/distro.shuttle}
 expected_sha256=${ASTRID_DISTRO_SHA256:-}
 
@@ -65,8 +81,8 @@ esac
 [ ! -L "$distro_path" ] ||
     fail "signed distro must be a regular file, not a symbolic link: $distro_path"
 
-: "${ASTRID_HOME:=/var/lib/astrid}"
-: "${ASTRID_WORKSPACE:=/workspace}"
+ASTRID_HOME=/var/lib/astrid
+ASTRID_WORKSPACE=/workspace
 export ASTRID_HOME ASTRID_WORKSPACE
 export HOME="$ASTRID_HOME"
 export ASTRID_DAEMON_LOG_TARGET=stderr

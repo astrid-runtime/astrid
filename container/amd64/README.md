@@ -16,12 +16,20 @@ python3 scripts/oci_release.py fetch \
 
 archive_sha256=$(python3 -c \
   'import json; print(json.load(open("dist/oci-amd64/release-receipt.json"))["archive-sha256"])')
+archive_blake3=$(python3 -c \
+  'import json; print(json.load(open("dist/oci-amd64/release-receipt.json"))["archive-blake3"])')
+release_manifest_sha256=$(python3 -c \
+  'import json; print(json.load(open("dist/oci-amd64/release-receipt.json"))["release-manifest-sha256"])')
+release_receipt_sha256=$(sha256sum dist/oci-amd64/release-receipt.json | cut -d ' ' -f 1)
 
 docker build \
   --platform linux/amd64 \
   --build-arg ASTRID_VERSION=0.10.4 \
   --build-arg ASTRID_SOURCE_COMMIT=b6bf5d1d579915eb5d3c944857d84e62a4fcc878 \
   --build-arg ASTRID_ARCHIVE_SHA256="$archive_sha256" \
+  --build-arg ASTRID_ARCHIVE_BLAKE3="$archive_blake3" \
+  --build-arg ASTRID_RELEASE_MANIFEST_SHA256="$release_manifest_sha256" \
+  --build-arg ASTRID_RELEASE_RECEIPT_SHA256="$release_receipt_sha256" \
   --tag astrid-runtime:0.10.4-amd64 \
   --file container/amd64/Dockerfile .
 ```
@@ -35,6 +43,13 @@ bytes into a package-free, digest-pinned Ubuntu 24.04 amd64 base. Ubuntu 24.04
 is the compatibility floor for the currently published `v0.10.4` archive
 (glibc 2.39); releases produced after Astrid's glibc-baseline gate also run
 there.
+
+The image embeds the release receipt derived from the verified signed release
+manifest and archive. It checks the receipt SHA-256 and every identity field
+(repository, tag, source commit, target, archive name, archive SHA-256, archive
+BLAKE3, manifest SHA-256, and release-workflow identity) during the build.
+Those values are repeated as immutable OCI labels, so an image digest cannot be
+detached from the exact signed release/source provenance that was tested.
 
 ## Run
 
@@ -93,6 +108,30 @@ itself never selects that artifact.
 This target does not publish `latest`, channel, or canonical multi-architecture
 tags. ARM64 is a separate target and must be validated independently before a
 multi-architecture index can be assembled.
+
+## Hosted profile qualification
+
+The amd64 target is one bounded hosted profile: a signed Astrid release runs as
+the non-root PID 1 daemon on a Linux container runtime. The profile owns fixed
+`/var/lib/astrid` state and `/workspace` paths; callers cannot replace those
+identities with environment variables or daemon arguments. The qualification
+requires a read-only root, all capabilities dropped, `no-new-privileges`, no
+host or container-engine socket, and a writable state/workspace mount owned by
+UID/GID `65532`.
+
+The OCI harness starts the real daemon, waits for its readiness sentinel, and
+uses an authenticated `astrid status` round trip. It then provisions two
+non-admin principals, records separate owner state and audit counters, stops
+and reopens the same state mount, and verifies that both principals and the
+audit chain survive restart without crossing workspaces or capability grants.
+The harness also rejects absent, externally mismatched, signed-but-tampered,
+and path-swapped shuttles before the daemon is reached. A root or host Linux
+UID/path is only a container runtime identity; it cannot mint an Astrid
+principal, grant, or authority without Astrid's authenticated control path.
+
+This is not a Linux application Realm, a graphics or driver Realm, arm64
+parity, a hostless OS, or a claim that the Linux kernel is untrusted. It is
+only the signed amd64 hosted profile described above.
 
 ## Build evidence and signatures
 
