@@ -12,9 +12,9 @@ use core::panic::PanicInfo;
 use core::ptr::{addr_of, addr_of_mut};
 
 use crate::media::{
-    auth::Authenticator, build_slot_record, canonical_payload, parse_media, CommitMetadata,
-    Recovery, FRAME_COUNT, KEY_ID, MEDIA_LEN, RECORD_LEN, RECORD_SECTORS, SECTOR_LEN,
-    STATE_COMMITTED,
+    CommitMetadata, FRAME_COUNT, KEY_ID, MEDIA_LEN, RECORD_LEN, RECORD_SECTORS, Recovery,
+    SECTOR_LEN, STATE_COMMITTED, auth::Authenticator, build_slot_record, canonical_payload,
+    parse_media,
 };
 
 const COMMAND_BASE: u16 = 0x1f0;
@@ -60,7 +60,7 @@ fn panic(info: &PanicInfo<'_>) -> ! {
     debug_exit(0x21)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "efiapi" fn efi_main(_image_handle: u64, _system_table: u64) -> u64 {
     run()
 }

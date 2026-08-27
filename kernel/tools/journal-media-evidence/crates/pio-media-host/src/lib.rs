@@ -6,8 +6,8 @@ pub mod media;
 #[cfg(test)]
 mod tests {
     use super::media::{
-        auth::Authenticator, build_slot_record, canonical_payload, parse_media, CommitMetadata,
-        Recovery, Slot, FRAME_COUNT, KEY_ID, MEDIA_LEN, RECORD_LEN, STATE_COMMITTED, TAG_OFFSET,
+        CommitMetadata, FRAME_COUNT, KEY_ID, MEDIA_LEN, RECORD_LEN, Recovery, STATE_COMMITTED,
+        Slot, TAG_OFFSET, auth::Authenticator, build_slot_record, canonical_payload, parse_media,
     };
     use hmac::{Hmac, Mac};
     use sha2::Sha256;

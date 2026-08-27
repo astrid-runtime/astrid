@@ -267,7 +267,7 @@ pub mod auth {
     }
 }
 
-use auth::{tags_equal, Authenticator};
+use auth::{Authenticator, tags_equal};
 
 #[allow(clippy::large_enum_variant)]
 pub enum Recovery {
@@ -432,10 +432,10 @@ pub fn parse_media(
         ((false, _), (false, _)) => {
             return Ok(Recovery::Torn {
                 reason: "missing-commit",
-            })
+            });
         },
         ((true, epoch), (true, other_epoch)) if epoch == other_epoch => {
-            return Ok(Recovery::ConflictingSameEpoch { epoch })
+            return Ok(Recovery::ConflictingSameEpoch { epoch });
         },
         ((true, _), (false, _)) => Slot::A,
         ((false, _), (true, _)) => Slot::B,
