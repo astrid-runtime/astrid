@@ -96,7 +96,17 @@ jobs:
             --output dist/oci-amd64
           ARCHIVE_SHA256=$(python3 -c \
             'import json; print(json.load(open("dist/oci-amd64/release-receipt.json"))["archive-sha256"])')
-          echo "ARCHIVE_SHA256=$ARCHIVE_SHA256" >> "$GITHUB_ENV"
+          ARCHIVE_BLAKE3=$(python3 -c \
+            'import json; print(json.load(open("dist/oci-amd64/release-receipt.json"))["archive-blake3"])')
+          RELEASE_MANIFEST_SHA256=$(python3 -c \
+            'import json; print(json.load(open("dist/oci-amd64/release-receipt.json"))["release-manifest-sha256"])')
+          RELEASE_RECEIPT_SHA256=$(sha256sum dist/oci-amd64/release-receipt.json | cut -d ' ' -f 1)
+          {
+            echo "ARCHIVE_SHA256=$ARCHIVE_SHA256"
+            echo "ARCHIVE_BLAKE3=$ARCHIVE_BLAKE3"
+            echo "RELEASE_MANIFEST_SHA256=$RELEASE_MANIFEST_SHA256"
+            echo "RELEASE_RECEIPT_SHA256=$RELEASE_RECEIPT_SHA256"
+          } >> "$GITHUB_ENV"
 
       - name: Check out pinned compatible uplink fixture
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -153,6 +163,9 @@ jobs:
             --build-arg "ASTRID_VERSION=$VERSION" \
             --build-arg "ASTRID_SOURCE_COMMIT=$SOURCE_COMMIT" \
             --build-arg "ASTRID_ARCHIVE_SHA256=$ARCHIVE_SHA256" \
+            --build-arg "ASTRID_ARCHIVE_BLAKE3=$ARCHIVE_BLAKE3" \
+            --build-arg "ASTRID_RELEASE_MANIFEST_SHA256=$RELEASE_MANIFEST_SHA256" \
+            --build-arg "ASTRID_RELEASE_RECEIPT_SHA256=$RELEASE_RECEIPT_SHA256" \
             --tag "$IMAGE" \
             --file container/amd64/Dockerfile \
             --output "type=oci,dest=dist/astrid-${VERSION}-amd64.oci.tar" \
