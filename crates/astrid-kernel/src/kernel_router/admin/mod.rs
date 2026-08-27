@@ -57,6 +57,8 @@ mod state_tests_caps_tokens;
 mod state_tests_group;
 #[cfg(test)]
 mod state_tests_usage;
+pub(crate) mod station_handlers;
+pub(crate) mod station_store;
 mod storage_mount_handlers;
 #[cfg(test)]
 mod tests;
@@ -82,6 +84,18 @@ const ADMIN_TOPIC_PREFIX: &str = "astrid.v1.admin.";
 /// Admin IPC response topic prefix. Used only as a loop-back guard (the
 /// outbound response topic is built through [`Topic::admin_response`]).
 const ADMIN_RESPONSE_PREFIX: &str = "astrid.v1.admin.response.";
+
+/// Clear an owner-scoped Station lock after a durable capsule removal. The
+/// removal request has already passed kernel authorization, so this internal
+/// post-condition uses the same typed handler without publishing a second IPC
+/// request or audit row.
+pub(crate) async fn clear_station_lock(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    capsule: &str,
+) -> AdminResponseBody {
+    station_handlers::delete(kernel, principal, capsule, None).await
+}
 
 /// Spawn the admin dispatcher task. Mirrors [`super::spawn_kernel_router`]
 /// but listens on `astrid.v1.admin.*` and parses
@@ -235,6 +249,9 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         | AdminRequestKind::EnvDelete { principal, .. }
         | AdminRequestKind::DistroLockGet { principal }
         | AdminRequestKind::DistroLockSet { principal, .. }
+        | AdminRequestKind::StationLockGet { principal, .. }
+        | AdminRequestKind::StationLockSet { principal, .. }
+        | AdminRequestKind::StationLockDelete { principal, .. }
         // Device management is self-scoped when the target IS the caller —
         // a principal lists / revokes its own devices with `self:auth:pair`;
         // operating on another principal's devices needs the global form.
@@ -355,11 +372,19 @@ pub fn required_capability_for_admin_request(
         (AdminRequestKind::EnvList { .. }, AuthorityScope::Self_) => "self:env:read",
         (AdminRequestKind::EnvList { .. }, AuthorityScope::Global) => "env:read",
         (
-            AdminRequestKind::DistroLockGet { .. } | AdminRequestKind::DistroLockSet { .. },
+            AdminRequestKind::DistroLockGet { .. }
+            | AdminRequestKind::DistroLockSet { .. }
+            | AdminRequestKind::StationLockGet { .. }
+            | AdminRequestKind::StationLockSet { .. }
+            | AdminRequestKind::StationLockDelete { .. },
             AuthorityScope::Self_,
         ) => "self:capsule:install",
         (
-            AdminRequestKind::DistroLockGet { .. } | AdminRequestKind::DistroLockSet { .. },
+            AdminRequestKind::DistroLockGet { .. }
+            | AdminRequestKind::DistroLockSet { .. }
+            | AdminRequestKind::StationLockGet { .. }
+            | AdminRequestKind::StationLockSet { .. }
+            | AdminRequestKind::StationLockDelete { .. },
             AuthorityScope::Global,
         ) => "capsule:install",
         // Usage is a read over the same quota surface; reuse the quota:get
@@ -503,6 +528,9 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::EnvDelete { .. } => "admin.env.delete",
         AdminRequestKind::DistroLockGet { .. } => "admin.distro.lock.get",
         AdminRequestKind::DistroLockSet { .. } => "admin.distro.lock.set",
+        AdminRequestKind::StationLockGet { .. } => "admin.station.lock.get",
+        AdminRequestKind::StationLockSet { .. } => "admin.station.lock.set",
+        AdminRequestKind::StationLockDelete { .. } => "admin.station.lock.delete",
         AdminRequestKind::GroupCreate { .. } => "admin.group.create",
         AdminRequestKind::GroupDelete { .. } => "admin.group.delete",
         AdminRequestKind::GroupModify { .. } => "admin.group.modify",
@@ -639,6 +667,9 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         | AdminRequestKind::EnvDelete { principal, .. }
         | AdminRequestKind::DistroLockGet { principal }
         | AdminRequestKind::DistroLockSet { principal, .. }
+        | AdminRequestKind::StationLockGet { principal, .. }
+        | AdminRequestKind::StationLockSet { principal, .. }
+        | AdminRequestKind::StationLockDelete { principal, .. }
         | AdminRequestKind::CapsGrant { principal, .. }
         | AdminRequestKind::CapsRevoke { principal, .. }
         | AdminRequestKind::CapsTokenMint { principal, .. }

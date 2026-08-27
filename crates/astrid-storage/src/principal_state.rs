@@ -270,21 +270,22 @@ impl KvPrincipalResolver<StateOwner> for StateOwnerResolver {
             if principal == "system" && matches!(control, "audit" | "invites" | "pair-tokens") {
                 return Ok(StateOwner::System);
             }
-            // The fixed distro control projection is principal-owned but has
-            // no capsule suffix. It is kept distinct from env/secret views
-            // so ordinary capsule code cannot address distro provenance.
-            if control == "distro" {
+            // Fixed distro and Station control projections are principal-owned
+            // but have no capsule suffix. They stay distinct from env/secret
+            // views so ordinary capsule code cannot address provenance or
+            // Station resolution state.
+            if matches!(control, "distro" | "station") {
                 let uid_text = principal.strip_prefix("principal-uid:").ok_or_else(|| {
                     StorageError::InvalidKey(
-                        "principal distro namespace must use immutable principal-uid".to_owned(),
+                        "principal control namespace must use immutable principal-uid".to_owned(),
                     )
                 })?;
                 let uid = uid_text.parse::<PrincipalUid>().map_err(|error| {
-                    StorageError::InvalidKey(format!("invalid principal distro UID: {error}"))
+                    StorageError::InvalidKey(format!("invalid principal control UID: {error}"))
                 })?;
                 if !self.principals.contains_uid(uid) {
                     return Err(StorageError::InvalidKey(
-                        "principal distro UID is not an admitted durable identity".to_owned(),
+                        "principal control UID is not an admitted durable identity".to_owned(),
                     ));
                 }
                 return Ok(StateOwner::Principal(uid));

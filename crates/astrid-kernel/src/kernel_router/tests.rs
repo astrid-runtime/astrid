@@ -234,6 +234,7 @@ fn required_capability_mapping_per_variant_self_scope() {
                 provenance: None,
                 authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
                 env: Vec::new(),
+                station_binding: None,
             },
             AuthorityScope::Self_
         ),
@@ -291,6 +292,7 @@ fn required_capability_mapping_global_scope() {
                 provenance: None,
                 authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
                 env: Vec::new(),
+                station_binding: None,
             },
             AuthorityScope::Global
         ),
@@ -343,6 +345,7 @@ fn resolve_scope_requires_global_authority_only_for_cross_principal_install() {
         provenance: None,
         authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
         env: Vec::new(),
+        station_binding: None,
     };
     assert_eq!(resolve_scope(&self_install, &caller), AuthorityScope::Self_);
     let cross_install = KernelRequest::InstallCapsule {
@@ -352,6 +355,7 @@ fn resolve_scope_requires_global_authority_only_for_cross_principal_install() {
         provenance: None,
         authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
         env: Vec::new(),
+        station_binding: None,
     };
     assert_eq!(
         resolve_scope(&cross_install, &caller),
@@ -408,6 +412,7 @@ fn resolve_scope_treats_workspace_capsule_install_as_self() {
                 provenance: None,
                 authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
                 env: Vec::new(),
+                station_binding: None,
             },
             &caller,
         ),

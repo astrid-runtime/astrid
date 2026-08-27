@@ -18,6 +18,7 @@ use astrid_core::PrincipalId;
 use astrid_core::kernel_api::{
     AdminRequestKind, AdminResponseBody, CapsuleInstallAuthority, CapsuleInstallEnv,
     CapsuleInstallProvenance, EnvStorageScope, EnvValueKind, KernelRequest, KernelResponse,
+    StationInstallBinding,
 };
 
 use super::install::ManualInstallOptions;
@@ -38,6 +39,7 @@ pub(super) async fn install_local_via_daemon_outcome(
     source: &str,
     prompt: &ManualInstallOptions,
     authority: CapsuleInstallAuthority,
+    station_binding: Option<StationInstallBinding>,
 ) -> anyhow::Result<InstalledCapsuleOutcome> {
     let principal = crate::principal::current();
     crate::commands::daemon::ensure_persistent_daemon("capsule install")
@@ -62,7 +64,8 @@ pub(super) async fn install_local_via_daemon_outcome(
             &astrid_core::dirs::AstridHome::resolve()?.config_path(),
         )?
     };
-    install_local_via_daemon_for_target(source, &vars, &principal, None, authority).await
+    install_local_via_daemon_for_target(source, &vars, &principal, None, authority, station_binding)
+        .await
 }
 
 async fn list_existing_keys(
@@ -92,6 +95,7 @@ pub(crate) async fn install_local_via_daemon_for_target(
     target: &PrincipalId,
     provenance: Option<CapsuleInstallProvenance>,
     authority: CapsuleInstallAuthority,
+    station_binding: Option<StationInstallBinding>,
 ) -> anyhow::Result<InstalledCapsuleOutcome> {
     crate::commands::daemon::ensure_persistent_daemon("capsule install")
         .await
@@ -108,6 +112,7 @@ pub(crate) async fn install_local_via_daemon_for_target(
             target_principal: Some(target.clone()),
             provenance,
             authority,
+            station_binding,
             env: values
                 .iter()
                 .map(|value| CapsuleInstallEnv {

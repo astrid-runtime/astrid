@@ -16,10 +16,14 @@ use astrid_capsule_install::{
     CapsuleLocation, InstalledCapsule, scan_installed_capsules_in_home_for_with_layout,
 };
 use astrid_core::dirs::AstridHome;
-use astrid_core::kernel_api::{CapsuleMetadataEntry, KernelRequest, KernelResponse};
+use astrid_core::kernel_api::{CapsuleMetadataEntry, KernelRequest, KernelResponse, StationLock};
 
-use super::install::install_capsule_with_options;
+use super::install::{
+    install_existing_source_in_home_with_options, install_existing_source_with_options,
+    install_from_station_lock,
+};
 use super::meta::{CapsuleMeta, read_meta};
+use super::station;
 
 /// Result of checking a remote source for a newer capsule version.
 pub(super) enum UpdateCheck {
@@ -27,6 +31,35 @@ pub(super) enum UpdateCheck {
     UpToDate { latest: semver::Version },
     Failed { reason: String },
     Skipped { reason: String },
+}
+
+pub(crate) enum DaemonUpdateSource {
+    Durable(String),
+    Station(Box<StationLock>),
+    None,
+}
+
+struct DaemonUpdatePlan {
+    to_update: Vec<(String, String)>,
+    station_to_update: Vec<(String, Box<StationLock>)>,
+    up_to_date: u32,
+    check_failed: u32,
+    skipped: u32,
+}
+
+pub(crate) fn daemon_update_source(
+    entry: &CapsuleMetadataEntry,
+    station_lock: Option<StationLock>,
+) -> DaemonUpdateSource {
+    if let Some(source) = &entry.update_source {
+        // Durable package provenance is authoritative even when a stale
+        // Station control record is still present for the same name.
+        DaemonUpdateSource::Durable(source.clone())
+    } else if let Some(lock) = station_lock {
+        DaemonUpdateSource::Station(Box::new(lock))
+    } else {
+        DaemonUpdateSource::None
+    }
 }
 
 /// Fetch the latest release version from GitHub for a given org/repo.
@@ -120,15 +153,24 @@ pub(crate) async fn update_capsule(
 ) -> anyhow::Result<()> {
     let home = AstridHome::resolve()?;
     let principal = crate::principal::current();
+    update_capsule_in_home(target, workspace, approve_untrusted, &home, &principal).await
+}
 
+async fn update_capsule_in_home(
+    target: Option<&str>,
+    workspace: bool,
+    approve_untrusted: bool,
+    home: &AstridHome,
+    principal: &astrid_core::PrincipalId,
+) -> anyhow::Result<()> {
     if !workspace {
-        return update_daemon_capsules(target, &principal, approve_untrusted).await;
+        return update_daemon_capsules(target, principal, approve_untrusted).await;
     }
 
     if let Some(name) = target {
         let target_dir = astrid_capsule_install::resolve_target_dir_for_with_layout(
-            &home,
-            &principal,
+            home,
+            principal,
             name,
             workspace,
             crate::workspace_layout::current(),
@@ -156,18 +198,28 @@ pub(crate) async fn update_capsule(
         // monorepo release that ships several `.capsule` assets, pass `name`
         // as the selector so update refreshes only that one — not every
         // capsule the release contains.
-        install_capsule_with_options(
+        install_existing_source_in_home_with_options(
             &source,
             Some(name),
             workspace,
-            false,
             approve_untrusted,
-            &[],
+            home,
+            principal,
         )
         .await
     } else {
-        update_all_capsules(&home, &principal, workspace, approve_untrusted).await
+        update_all_capsules(home, principal, workspace, approve_untrusted).await
     }
+}
+
+#[cfg(test)]
+pub(super) async fn test_update_workspace_capsule_in_home(
+    name: &str,
+    home: &AstridHome,
+    principal: &astrid_core::PrincipalId,
+    approve_untrusted: bool,
+) -> anyhow::Result<()> {
+    update_capsule_in_home(Some(name), true, approve_untrusted, home, principal).await
 }
 
 async fn daemon_capsule_metadata() -> anyhow::Result<Vec<CapsuleMetadataEntry>> {
@@ -192,16 +244,42 @@ async fn update_daemon_capsules(
             .into_iter()
             .find(|entry| entry.name == name)
             .ok_or_else(|| anyhow::anyhow!("Capsule '{name}' is not installed."))?;
-        let Some(source) = entry.update_source else {
-            eprintln!(
-                "Capsule '{name}' has no remotely updateable source; its durable package is unchanged."
-            );
-            return Ok(());
+        let station_lock = if entry.update_source.is_none() {
+            station::load_lock(principal, name).await?
+        } else {
+            None
         };
-        eprintln!("Updating {name} from {source}...");
-        install_capsule_with_options(&source, Some(name), false, false, approve_untrusted, &[])
-            .await?;
-        regenerate_distro_lock(principal).await
+        match daemon_update_source(&entry, station_lock) {
+            DaemonUpdateSource::Durable(source) => {
+                eprintln!("Updating {name} from {source}...");
+                install_existing_source_with_options(&source, Some(name), false, approve_untrusted)
+                    .await?;
+                return regenerate_distro_lock(principal).await;
+            },
+            DaemonUpdateSource::Station(lock) => {
+                eprintln!("Updating {name} from Station {}...", lock.coordinate.name);
+                let home = AstridHome::resolve()?;
+                let ids = install_from_station_lock(
+                    name,
+                    &lock,
+                    false,
+                    &home,
+                    principal,
+                    approve_untrusted,
+                )
+                .await?;
+                let installed_ids = ids
+                    .iter()
+                    .map(|capsule| capsule.id.as_str().to_owned())
+                    .collect::<Vec<_>>();
+                super::live_load::nudge_daemon_reload(&installed_ids).await;
+                return Ok(());
+            },
+            DaemonUpdateSource::None => eprintln!(
+                "Capsule '{name}' has no remotely updateable source; its durable package is unchanged."
+            ),
+        }
+        Ok(())
     } else {
         update_all_daemon_capsules(entries, principal, approve_untrusted).await
     }
@@ -226,52 +304,41 @@ async fn update_all_daemon_capsules(
         entries.len()
     );
 
-    let mut to_update = Vec::new();
-    let mut up_to_date = 0u32;
-    let mut check_failed = 0u32;
-    let mut skipped = 0u32;
-    for entry in entries {
-        let Some(source) = entry.update_source else {
-            eprintln!("  {}: skipped (no remote source recorded)", entry.name);
-            skipped = skipped.saturating_add(1);
-            continue;
-        };
-        match check_remote_version(&client, &source, &entry.version).await {
-            UpdateCheck::Available { latest } => {
-                eprintln!(
-                    "  {}: {} -> {latest} (update available)",
-                    entry.name, entry.version
-                );
-                to_update.push((entry.name, source));
-            },
-            UpdateCheck::UpToDate { latest } => {
-                eprintln!(
-                    "  {}: {} (up to date, latest: {latest})",
-                    entry.name, entry.version
-                );
-                up_to_date = up_to_date.saturating_add(1);
-            },
-            UpdateCheck::Failed { reason } => {
-                eprintln!(
-                    "  {}: {} (check failed: {reason})",
-                    entry.name, entry.version
-                );
-                check_failed = check_failed.saturating_add(1);
-            },
-            UpdateCheck::Skipped { reason } => {
-                eprintln!("  {}: skipped ({reason})", entry.name);
-                skipped = skipped.saturating_add(1);
-            },
-        }
-    }
+    let plan = plan_daemon_updates(entries, principal, &client).await?;
+    let DaemonUpdatePlan {
+        to_update,
+        station_to_update,
+        up_to_date,
+        check_failed,
+        skipped,
+    } = plan;
 
     let mut updated = 0u32;
     let mut install_failed = 0u32;
+    for (name, lock) in &station_to_update {
+        eprintln!("Updating {name} from Station {}...", lock.coordinate.name);
+        let home = AstridHome::resolve()?;
+        match install_from_station_lock(name, lock, false, &home, principal, approve_untrusted)
+            .await
+        {
+            Ok(ids) => {
+                let installed_ids = ids
+                    .iter()
+                    .map(|capsule| capsule.id.as_str().to_owned())
+                    .collect::<Vec<_>>();
+                super::live_load::nudge_daemon_reload(&installed_ids).await;
+                updated = updated.saturating_add(1);
+            },
+            Err(error) => {
+                eprintln!("  Failed to update {name}: {error}");
+                install_failed = install_failed.saturating_add(1);
+            },
+        }
+    }
     for (name, source) in &to_update {
         eprintln!("Updating {name} from {source}...");
         if let Err(error) =
-            install_capsule_with_options(source, Some(name), false, false, approve_untrusted, &[])
-                .await
+            install_existing_source_with_options(source, Some(name), false, approve_untrusted).await
         {
             eprintln!("  Failed to update {name}: {error}");
             install_failed = install_failed.saturating_add(1);
@@ -288,6 +355,68 @@ async fn update_all_daemon_capsules(
         regenerate_distro_lock(principal).await?;
     }
     Ok(())
+}
+
+async fn plan_daemon_updates(
+    entries: Vec<CapsuleMetadataEntry>,
+    principal: &astrid_core::PrincipalId,
+    client: &reqwest::Client,
+) -> anyhow::Result<DaemonUpdatePlan> {
+    let mut plan = DaemonUpdatePlan {
+        to_update: Vec::new(),
+        station_to_update: Vec::new(),
+        up_to_date: 0,
+        check_failed: 0,
+        skipped: 0,
+    };
+    for entry in entries {
+        let station_lock = if entry.update_source.is_none() {
+            station::load_lock(principal, &entry.name).await?
+        } else {
+            None
+        };
+        let source = match daemon_update_source(&entry, station_lock) {
+            DaemonUpdateSource::Durable(source) => source,
+            DaemonUpdateSource::Station(lock) => {
+                eprintln!("  {}: Station lock re-resolve required", entry.name);
+                plan.station_to_update.push((entry.name, lock));
+                continue;
+            },
+            DaemonUpdateSource::None => {
+                eprintln!("  {}: skipped (no remote source recorded)", entry.name);
+                plan.skipped = plan.skipped.saturating_add(1);
+                continue;
+            },
+        };
+        match check_remote_version(client, &source, &entry.version).await {
+            UpdateCheck::Available { latest } => {
+                eprintln!(
+                    "  {}: {} -> {latest} (update available)",
+                    entry.name, entry.version
+                );
+                plan.to_update.push((entry.name, source));
+            },
+            UpdateCheck::UpToDate { latest } => {
+                eprintln!(
+                    "  {}: {} (up to date, latest: {latest})",
+                    entry.name, entry.version
+                );
+                plan.up_to_date = plan.up_to_date.saturating_add(1);
+            },
+            UpdateCheck::Failed { reason } => {
+                eprintln!(
+                    "  {}: {} (check failed: {reason})",
+                    entry.name, entry.version
+                );
+                plan.check_failed = plan.check_failed.saturating_add(1);
+            },
+            UpdateCheck::Skipped { reason } => {
+                eprintln!("  {}: skipped ({reason})", entry.name);
+                plan.skipped = plan.skipped.saturating_add(1);
+            },
+        }
+    }
+    Ok(plan)
 }
 
 /// Check all installed capsules for updates and install those with newer versions.
@@ -367,15 +496,9 @@ async fn update_all_capsules(
         eprintln!("Updating {name} from {source}...");
         // Selector = the capsule being updated, so a monorepo source refreshes
         // only this one (see the single-target update above).
-        if let Err(e) = install_capsule_with_options(
-            source,
-            Some(name),
-            workspace,
-            false,
-            approve_untrusted,
-            &[],
-        )
-        .await
+        if let Err(e) =
+            install_existing_source_with_options(source, Some(name), workspace, approve_untrusted)
+                .await
         {
             eprintln!("  Failed to update {name}: {e}");
             install_failed = install_failed.saturating_add(1);
@@ -516,5 +639,60 @@ mod tests {
         assert!(
             matches!(result, UpdateCheck::Skipped { reason } if reason.contains("local source"))
         );
+    }
+
+    #[test]
+    fn durable_github_source_wins_over_stale_station_lock() {
+        let entry = CapsuleMetadataEntry {
+            name: "demo".to_owned(),
+            version: "1.0.0".to_owned(),
+            description: None,
+            interceptor_events: Vec::new(),
+            imports: std::collections::HashMap::new(),
+            exports: std::collections::HashMap::new(),
+            capabilities: serde_json::Value::Null,
+            env: std::collections::HashMap::new(),
+            wit_hashes: Vec::new(),
+            wasm_hash: None,
+            update_source: Some("@example/demo".to_owned()),
+            source_id: None,
+            owner_uid: None,
+            registry_source: None,
+        };
+        let selected = daemon_update_source(&entry, Some(station_lock_fixture()));
+        assert!(
+            matches!(selected, DaemonUpdateSource::Durable(source) if source == "@example/demo")
+        );
+    }
+
+    fn station_lock_fixture() -> StationLock {
+        let digest = |prefix: &str, byte: u8| format!("{prefix}{}", hex::encode([byte; 32]));
+        StationLock {
+            schema: "station-lock-v2".to_owned(),
+            station_id: "official".to_owned(),
+            trust_root: digest("sha256:", 1),
+            coordinate: astrid_core::kernel_api::StationCoordinate {
+                namespace: "official".to_owned(),
+                name: "demo".to_owned(),
+            },
+            version: "1.0.0".to_owned(),
+            publication_digest: digest("blake3:", 2),
+            artifact_size: 0,
+            artifact_media_type: "application/vnd.astrid.capsule".to_owned(),
+            artifact_sha256: digest("sha256:", 3),
+            artifact_blake3: digest("blake3:", 4),
+            manifest_digest: digest("blake3:", 5),
+            capsule_content_digest: digest("blake3:", 6),
+            package_digest: digest("blake3:", 7),
+            component_count: 0,
+            component_digest: digest("blake3:", 8),
+            wit_digest: digest("blake3:", 9),
+            capability_digest: digest("blake3:", 10),
+            ipc_digest: digest("blake3:", 11),
+            runtime_abi_digest: digest("blake3:", 12),
+            dependency_digest: digest("blake3:", 13),
+            provenance_digest: digest("blake3:", 14),
+            source_digest: digest("blake3:", 15),
+        }
     }
 }
