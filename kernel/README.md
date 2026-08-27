@@ -140,9 +140,10 @@ the parent target lock.
 
 No KVM, virtio/IOMMU, DMA, bare-metal/no-host, physical ownership, A/B
 persistence, first-owner, services, Wasmtime, filesystem, Linux, or
-Hermes claim. Timing is not evidence. Image determinism is reported
-honestly: `DETERMINISM: FAIL` does not fail boot assertions and is not
-coerced to PASS.
+Hermes claim. Timing is not evidence. Sequential emulator-image
+packaging determinism is reported as an independent result:
+`DETERMINISM: PASS` does not strengthen boot assertions and is not
+coerced into them.
 
 The pre-relocation hook and ring 0 compile only the emulator-fixture **root
 public key** and minimum generation/floors. The loader measures the original
@@ -171,8 +172,8 @@ remain untrusted advertisements.
   with `CARGO_TARGET_DIR=target/bootloader-nested` so nested
   `cargo install -Zbuild-std` cannot deadlock on the parent lock.
 
-`./run.sh` is the QEMU evidence. Image determinism is reported honestly
-and remains FAIL.
+`./run.sh` is the QEMU evidence. Sequential native emulator-image
+packaging determinism reports `PASS`.
 
 ### CI
 
@@ -182,9 +183,9 @@ requests targeting `os/universal`. It installs stable 1.95.0 plus
 invokes `./check.sh` plus `./run.sh`. It does not install rolling
 `nightly`. Root `ci.yml` still targets `main` and does not ingest this
 nested workspace. Do not run `cargo clippy --workspace` here.
-`DETERMINISM: FAIL` is reported by the QEMU job and is not a
-boot-assertion gate. That job is emulator evidence only and preserves
-the non-claims above.
+The QEMU job reports `DETERMINISM: PASS` for sequential native
+emulator-image packaging and does not treat it as a boot-assertion gate.
+That job is emulator evidence only and preserves the non-claims above.
 
 ## Toolchain
 
