@@ -14,7 +14,7 @@ resolver = "3"
 [features]
 default = ["bios", "uefi"]
 bios = ["dep:mbrman"]
-uefi = ["dep:gpt"]
+uefi = ["dep:gpt", "dep:uuid"]
 
 [dependencies]
 anyhow = "1.0.32"
@@ -25,6 +25,7 @@ fatfs = { version = "0.3.4", default-features = false, features = [
 tempfile = "3.27.0"
 mbrman = { version = "0.5.1", optional = true }
 gpt = { version = "3.0.0", optional = true }
+uuid = { version = "=1.25.0", default-features = false, features = ["v5"], optional = true }
 bootloader-boot-config = { path = "common/config", version = "0.11.16" }
 serde_json = "1.0.91"
 
