@@ -16,15 +16,32 @@ use super::authority::{authority_decision, daemon_install_authority};
 use super::{BATCH_MODE, ExpectedCapsule, ManualInstallOptions, OfflineCapsuleProvenance};
 use crate::commands::capsule::{install_daemon, meta};
 
+/// One fully-resolved local route invocation. Bundled so the wide install
+/// surface stays reviewable without growing an argument list.
+pub(super) struct LocalInstallCall<'ctx, 'src> {
+    pub(crate) source: &'src str,
+    pub(crate) workspace: bool,
+    pub(crate) home: &'ctx AstridHome,
+    pub(crate) original_source: Option<&'src str>,
+    pub(crate) principal: &'ctx astrid_core::PrincipalId,
+    pub(crate) expected: Option<ExpectedCapsule<'src>>,
+    pub(crate) prompt: &'ctx ManualInstallOptions,
+    pub(crate) station_binding: Option<&'src astrid_core::kernel_api::StationInstallBinding>,
+}
+
 pub(super) async fn install_from_local(
-    source: &str,
-    workspace: bool,
-    home: &AstridHome,
-    original_source: Option<&str>,
-    principal: &astrid_core::PrincipalId,
-    expected: Option<ExpectedCapsule<'_>>,
-    prompt: &ManualInstallOptions,
+    call: LocalInstallCall<'_, '_>,
 ) -> anyhow::Result<Vec<InstalledCapsuleOutcome>> {
+    let LocalInstallCall {
+        source,
+        workspace,
+        home,
+        original_source,
+        principal,
+        expected,
+        prompt,
+        station_binding,
+    } = call;
     let source_path = Path::new(source);
     if !source_path.exists() {
         bail!("Source path does not exist: {source}");
@@ -37,12 +54,7 @@ pub(super) async fn install_from_local(
             if let Some(result) = super::station_install::test_daemon_install_outcome(source) {
                 return result;
             }
-            let installed = install_daemon::install_local_via_daemon_outcome(
-                source,
-                prompt,
-                daemon_install_authority(source, principal, prompt)?,
-            )
-            .await?;
+            let installed = daemon_route(source, prompt, principal, station_binding).await?;
             return Ok(vec![installed]);
         }
         return unpack_via_lib(
@@ -86,10 +98,13 @@ pub(super) async fn install_from_local(
                     let archive = archive
                         .to_str()
                         .context("built capsule archive path is not UTF-8")?;
+                    // Auto-built archives never carry a caller Station lock;
+                    // the builder output is not the locked artifact.
                     let installed = install_daemon::install_local_via_daemon_outcome(
                         archive,
                         prompt,
                         daemon_install_authority(archive, principal, prompt)?,
+                        None,
                     )
                     .await?;
                     return Ok(vec![installed]);
@@ -110,12 +125,7 @@ pub(super) async fn install_from_local(
     }
 
     if !workspace {
-        let installed = install_daemon::install_local_via_daemon_outcome(
-            source,
-            prompt,
-            daemon_install_authority(source, principal, prompt)?,
-        )
-        .await?;
+        let installed = daemon_route(source, prompt, principal, station_binding).await?;
         return Ok(vec![installed]);
     }
 
@@ -129,6 +139,24 @@ pub(super) async fn install_from_local(
         prompt,
     )
     .map(|installed| vec![installed])
+}
+
+/// Send one fully-resolved local artifact to the sole durable writer.
+/// The kernel owns caller-byte verification and any optional Station binding.
+async fn daemon_route(
+    source: &str,
+    prompt: &ManualInstallOptions,
+    principal: &astrid_core::PrincipalId,
+    station_binding: Option<&astrid_core::kernel_api::StationInstallBinding>,
+) -> anyhow::Result<InstalledCapsuleOutcome> {
+    let authority = daemon_install_authority(source, principal, prompt)?;
+    install_daemon::install_local_via_daemon_outcome(
+        source,
+        prompt,
+        authority,
+        station_binding.cloned(),
+    )
+    .await
 }
 
 pub(crate) fn install_from_local_path(

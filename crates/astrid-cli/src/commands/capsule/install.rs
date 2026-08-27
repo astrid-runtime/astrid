@@ -17,6 +17,7 @@ use astrid_capsule_install::github_source::{
 use astrid_core::dirs::AstridHome;
 
 use super::{station, station_rollback};
+use install_local::LocalInstallCall;
 
 pub(crate) use super::install_batch::{
     BatchInstallOutcome, InstalledCapsuleOutcome, RefSpec, install_capsule_batch,
@@ -41,6 +42,7 @@ pub(crate) use station_install::StationInstallRequest;
 pub(crate) use station_install::install_capsule_with_options_and_station_lock;
 #[cfg(test)]
 pub(crate) use station_install::install_capsule_with_options_and_station_lock_in_home;
+pub(crate) use station_install::install_from_station_lock;
 #[cfg(test)]
 pub(crate) use station_install::test_daemon_install_call;
 #[cfg(test)]
@@ -49,9 +51,9 @@ pub(crate) use station_install::test_local_install_backend;
 pub(crate) use station_rollback::{combine_install_and_restore_errors, restore_station_lock};
 
 #[derive(Clone, Copy)]
-struct ExpectedCapsule<'a> {
-    id: &'a CapsuleId,
-    version: Option<&'a str>,
+pub(super) struct ExpectedCapsule<'a> {
+    pub(super) id: &'a CapsuleId,
+    pub(super) version: Option<&'a str>,
 }
 
 #[derive(Clone, Copy)]
@@ -80,17 +82,17 @@ pub(super) struct InstallRequest<'a> {
     pub(super) allow_station: bool,
 }
 
-struct SourceInstallContext<'a> {
-    base: &'a str,
-    name_hint: Option<&'a str>,
-    version: Option<&'a str>,
-    tag: Option<&'a str>,
-    workspace: bool,
-    home: &'a AstridHome,
-    principal: &'a astrid_core::PrincipalId,
-    expected: Option<ExpectedCapsule<'a>>,
-    prompt: &'a ManualInstallOptions,
-    allow_station: bool,
+pub(super) struct SourceInstallContext<'a> {
+    pub(super) base: &'a str,
+    pub(super) name_hint: Option<&'a str>,
+    pub(super) version: Option<&'a str>,
+    pub(super) tag: Option<&'a str>,
+    pub(super) workspace: bool,
+    pub(super) home: &'a AstridHome,
+    pub(super) principal: &'a astrid_core::PrincipalId,
+    pub(super) expected: Option<ExpectedCapsule<'a>>,
+    pub(super) prompt: &'a ManualInstallOptions,
+    pub(super) allow_station: bool,
 }
 
 /// Operator input policy for a manual capsule install.
@@ -335,7 +337,7 @@ pub(super) async fn test_install_station_source_with_workspace(
         prompt,
         allow_station: true,
     };
-    let (installed, _) = install_station_source(&context, coordinate).await?;
+    let (installed, _) = station_install::install_station_source(&context, coordinate).await?;
     Ok(installed)
 }
 
@@ -378,7 +380,7 @@ async fn dispatch_source(
     {
         let station_configured = station::is_configured()?;
         if station_dispatch(context.base, true, context.workspace, station_configured)? {
-            return install_station_source(&context, coordinate).await;
+            return station_install::install_station_source(&context, coordinate).await;
         }
     }
     if let Some(repo) = context.base.strip_prefix('@') {
@@ -394,79 +396,18 @@ async fn dispatch_source(
 async fn install_local_source(
     context: &SourceInstallContext<'_>,
 ) -> anyhow::Result<(Vec<InstalledCapsuleOutcome>, Option<String>)> {
-    let ids = install_from_local(
-        context.base,
-        context.workspace,
-        context.home,
-        Some(context.base),
-        context.principal,
-        context.expected,
-        context.prompt,
-    )
+    let ids = install_from_local(LocalInstallCall {
+        source: context.base,
+        workspace: context.workspace,
+        home: context.home,
+        original_source: Some(context.base),
+        principal: context.principal,
+        expected: context.expected,
+        prompt: context.prompt,
+        station_binding: None,
+    })
     .await?;
     clear_replaced_station_locks(context.workspace, context.principal, &ids).await?;
-    Ok((ids, None))
-}
-
-async fn install_station_source(
-    context: &SourceInstallContext<'_>,
-    coordinate: &str,
-) -> anyhow::Result<(Vec<InstalledCapsuleOutcome>, Option<String>)> {
-    let coordinate = format!("@{coordinate}");
-    let staged = station::resolve_and_fetch(&coordinate, context.version, None)?;
-    let staged_path = staged
-        .path
-        .to_str()
-        .context("Station handoff path is not UTF-8")?;
-    let station_id = CapsuleId::new(staged.lock.coordinate.name.clone())?;
-    if let Some(expected) = context.expected {
-        anyhow::ensure!(
-            expected.id == &station_id,
-            "Station lock coordinate does not match the requested capsule"
-        );
-    }
-    let name = staged.lock.coordinate.name.as_str();
-    let previous = station::load_lock(context.principal, name).await?;
-    let previous_for_failure = previous.clone();
-    station::store_lock(context.principal, name, staged.lock.clone()).await?;
-    let ids = match install_from_local(
-        staged_path,
-        context.workspace,
-        context.home,
-        None,
-        context.principal,
-        Some(ExpectedCapsule {
-            id: &station_id,
-            version: Some(staged.lock.version.as_str()),
-        }),
-        context.prompt,
-    )
-    .await
-    {
-        Ok(ids) => ids,
-        Err(error) => {
-            return Err(station_rollback::combine_install_and_restore_errors(
-                error,
-                station_rollback::restore_station_lock(
-                    context.principal,
-                    name,
-                    previous_for_failure.as_ref(),
-                    &staged.lock,
-                )
-                .await,
-            ));
-        },
-    };
-    if ids.iter().any(|installed| installed.id.as_str() != name) {
-        station_rollback::restore_station_lock(
-            context.principal,
-            name,
-            previous.as_ref(),
-            &staged.lock,
-        )
-        .await?;
-        bail!("Station lock coordinate does not match installed capsule");
-    }
     Ok((ids, None))
 }
 
@@ -546,78 +487,6 @@ async fn clear_replaced_station_locks(
             })?;
     }
     Ok(())
-}
-
-/// Re-resolve and install an existing Station lock through the normal local
-/// archive installer. The Station lock, never GitHub/latest, chooses bytes.
-pub(super) async fn install_from_station_lock(
-    name: &str,
-    lock: &astrid_core::kernel_api::StationLock,
-    workspace: bool,
-    home: &AstridHome,
-    principal: &astrid_core::PrincipalId,
-    approve_untrusted: bool,
-) -> anyhow::Result<Vec<InstalledCapsuleOutcome>> {
-    let staged = station::resolve_and_fetch("", None, Some(lock))?;
-    anyhow::ensure!(
-        staged.lock.coordinate.name == name,
-        "Station lock coordinate does not match installed capsule"
-    );
-    let staged_path = staged
-        .path
-        .to_str()
-        .context("Station handoff path is not UTF-8")?;
-    let expected_id = CapsuleId::new(name.to_owned())?;
-    let prompt = ManualInstallOptions {
-        approve_untrusted,
-        ..Default::default()
-    };
-    let previous = if workspace {
-        None
-    } else {
-        station::load_lock(principal, name).await?
-    };
-    let previous_for_failure = previous.clone();
-    if !workspace {
-        station::store_lock(principal, name, staged.lock.clone()).await?;
-    }
-    let ids = install_from_local(
-        staged_path,
-        workspace,
-        home,
-        None,
-        principal,
-        Some(ExpectedCapsule {
-            id: &expected_id,
-            version: Some(staged.lock.version.as_str()),
-        }),
-        &prompt,
-    )
-    .await;
-    let ids = match ids {
-        Ok(ids) => ids,
-        Err(error) => {
-            if !workspace {
-                return Err(station_rollback::combine_install_and_restore_errors(
-                    error,
-                    station_rollback::restore_station_lock(
-                        principal,
-                        name,
-                        previous_for_failure.as_ref(),
-                        &staged.lock,
-                    )
-                    .await,
-                ));
-            }
-            return Err(error);
-        },
-    };
-    if !workspace && ids.iter().any(|installed| installed.id != expected_id) {
-        station_rollback::restore_station_lock(principal, name, previous.as_ref(), &staged.lock)
-            .await?;
-        bail!("Station installed an unexpected capsule");
-    }
-    Ok(ids)
 }
 
 // ---------------------------------------------------------------------------
@@ -849,6 +718,7 @@ async fn download_and_unpack(
                 context.principal,
                 context.prompt,
             )?,
+            None,
         )
         .await;
     }
@@ -976,6 +846,7 @@ async fn clone_and_build(
                     context.principal,
                     context.prompt,
                 )?,
+                None,
             )
             .await;
         }

@@ -217,6 +217,7 @@ async fn install_selected_capsules(
                     source_digest: Some(source_digest),
                 }),
                 astrid_core::kernel_api::CapsuleInstallAuthority::OperatorDistribution,
+                None,
             )
             .await
             .with_context(|| format!("failed to install capsule {}", cap.name))?;

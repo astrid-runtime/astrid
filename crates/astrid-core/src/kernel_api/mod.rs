@@ -17,7 +17,7 @@ mod response_types;
 pub use agent::{AgentDeriveKernelRequest, AgentDeriveRequest};
 pub use install::{
     CapsuleInstallAuthority, CapsuleInstallEnv, CapsuleInstallProvenance, EnvEntry,
-    EnvStorageScope, EnvValueKind,
+    EnvStorageScope, EnvValueKind, StationInstallBinding,
 };
 pub use projection_names::{
     PROJECTION_NAME_DIAGNOSTIC_METHOD, PROJECTION_NAME_DIAGNOSTIC_TOPIC,
@@ -74,6 +74,13 @@ pub enum KernelRequest {
         /// kernel's environment limits.
         #[serde(default)]
         env: Vec<CapsuleInstallEnv>,
+        /// Optional typed Station lock binding. When present, the daemon
+        /// stages and installs only the exact artifact named by the binding
+        /// lock and persists that lock in the same owner/capsule critical
+        /// section as the package mutation. Absent bindings never touch
+        /// Station locks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        station_binding: Option<StationInstallBinding>,
     },
     /// Request to approve a capability grant (usually following an `ApprovalNeeded` response).
     ApproveCapability {

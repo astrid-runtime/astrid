@@ -296,6 +296,7 @@ async fn handle_request(
             provenance,
             authority,
             env,
+            station_binding,
         } => {
             info!(
                 source = %source,
@@ -313,6 +314,7 @@ async fn handle_request(
                     provenance: provenance.as_ref(),
                     authority,
                     env: &env,
+                    station_binding: &station_binding,
                 },
             )
             .await

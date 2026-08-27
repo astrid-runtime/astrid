@@ -1,8 +1,8 @@
 //! Astrid-side Station archive handoff.
 //!
 //! The standalone Station process remains the source authority. This module
-//! only carries its exact verified lock alongside a private archive into the
-//! existing daemon-owned local installer.
+//! carries its verified lock alongside the caller-selected archive and lets
+//! the kernel bind their persistence together.
 
 use std::path::Path;
 
@@ -11,16 +11,18 @@ use astrid_capsule::capsule::CapsuleId;
 use astrid_core::dirs::AstridHome;
 
 use super::{
-    ExpectedCapsule, InstallRequest, ManualInstallOptions, RefSpec, install_capsule_inner_at,
-    install_from_local,
+    ExpectedCapsule, InstallRequest, ManualInstallOptions, RefSpec, SourceInstallContext,
+    install_capsule_inner_at, install_from_local,
 };
+use crate::commands::capsule::station_rollback;
 use crate::commands::capsule::{live_load, station, station_handoff};
 
 /// Manual install with an optional exact Station lock handoff.
 ///
 /// The explicit handoff is intentionally narrower than ordinary source
-/// dispatch: it accepts one local `.capsule`, validates the untrusted lock and
-/// exact archive bytes, then stores that lock before the daemon install.
+/// dispatch: it accepts one local `.capsule`, canonicalizes its SHA-bound lock,
+/// and forwards a typed binding for kernel-side verification and one atomic
+/// lock/package transaction.
 pub(crate) struct StationInstallRequest<'a> {
     pub(crate) source: &'a str,
     pub(crate) capsule: Option<&'a str>,
@@ -115,6 +117,207 @@ pub(crate) fn test_daemon_install_call() -> Option<(String, usize)> {
     })
 }
 
+/// Resolve one interactive owner-facing `@namespace/name` coordinate through
+/// the standalone Station source authority.
+pub(super) async fn install_station_source(
+    context: &SourceInstallContext<'_>,
+    coordinate: &str,
+) -> anyhow::Result<(Vec<super::InstalledCapsuleOutcome>, Option<String>)> {
+    let coordinate = format!("@{coordinate}");
+    let staged = station::resolve_and_fetch(&coordinate, context.version, None)?;
+    let staged_path = staged
+        .path
+        .to_str()
+        .context("Station handoff path is not UTF-8")?;
+    let station_id = CapsuleId::new(staged.lock.coordinate.name.clone())?;
+    if let Some(expected) = context.expected {
+        anyhow::ensure!(
+            expected.id == &station_id,
+            "Station lock coordinate does not match the requested capsule"
+        );
+    }
+    let name = staged.lock.coordinate.name.as_str();
+    let previous = station::load_lock(context.principal, name).await?;
+    let previous_for_failure = previous.clone();
+    // Daemon-owned installs carry the lock inside the kernel's atomic
+    // Station transaction. Workspace installs have no daemon transaction, so
+    // they keep the legacy conditional-store/rollback pair.
+    let expected_hash = if context.workspace {
+        None
+    } else {
+        previous
+            .as_ref()
+            .map(station::station_lock_digest)
+            .transpose()?
+    };
+    let ids = if context.workspace {
+        station::store_lock(context.principal, name, staged.lock.clone()).await?;
+        match install_from_local(super::install_local::LocalInstallCall {
+            source: staged_path,
+            workspace: true,
+            home: context.home,
+            original_source: None,
+            principal: context.principal,
+            expected: Some(ExpectedCapsule {
+                id: &station_id,
+                version: Some(staged.lock.version.as_str()),
+            }),
+            prompt: context.prompt,
+            station_binding: None,
+        })
+        .await
+        {
+            Ok(ids) => ids,
+            Err(error) => {
+                return Err(station_rollback::combine_install_and_restore_errors(
+                    error,
+                    station_rollback::restore_station_lock(
+                        context.principal,
+                        name,
+                        previous_for_failure.as_ref(),
+                        &staged.lock,
+                    )
+                    .await,
+                ));
+            },
+        }
+    } else {
+        let binding = astrid_core::kernel_api::StationInstallBinding {
+            capsule: name.to_owned(),
+            lock: Box::new(staged.lock.clone()),
+            expected_hash,
+        };
+        install_from_local(super::install_local::LocalInstallCall {
+            source: staged_path,
+            workspace: false,
+            home: context.home,
+            original_source: None,
+            principal: context.principal,
+            expected: Some(ExpectedCapsule {
+                id: &station_id,
+                version: Some(staged.lock.version.as_str()),
+            }),
+            prompt: context.prompt,
+            station_binding: Some(&binding),
+        })
+        .await?
+    };
+    if context.workspace && ids.iter().any(|installed| installed.id.as_str() != name) {
+        station_rollback::restore_station_lock(
+            context.principal,
+            name,
+            previous.as_ref(),
+            &staged.lock,
+        )
+        .await?;
+        bail!("Station lock coordinate does not match installed capsule");
+    }
+    Ok((ids, None))
+}
+
+/// Re-resolve and install an existing Station lock through the normal local
+/// archive installer. The Station lock, never GitHub/latest, chooses bytes.
+pub(crate) async fn install_from_station_lock(
+    name: &str,
+    lock: &astrid_core::kernel_api::StationLock,
+    workspace: bool,
+    home: &AstridHome,
+    principal: &astrid_core::PrincipalId,
+    approve_untrusted: bool,
+) -> anyhow::Result<Vec<super::InstalledCapsuleOutcome>> {
+    let staged = station::resolve_and_fetch("", None, Some(lock))?;
+    anyhow::ensure!(
+        staged.lock.coordinate.name == name,
+        "Station lock coordinate does not match installed capsule"
+    );
+    let staged_path = staged
+        .path
+        .to_str()
+        .context("Station handoff path is not UTF-8")?;
+    let expected_id = CapsuleId::new(name.to_owned())?;
+    let prompt = ManualInstallOptions {
+        approve_untrusted,
+        ..Default::default()
+    };
+    let previous = if workspace {
+        None
+    } else {
+        station::load_lock(principal, name).await?
+    };
+    let previous_for_failure = previous.clone();
+    let expected_hash = if workspace {
+        None
+    } else {
+        previous
+            .as_ref()
+            .map(station::station_lock_digest)
+            .transpose()?
+    };
+    let station_binding = (!workspace).then(|| astrid_core::kernel_api::StationInstallBinding {
+        capsule: name.to_owned(),
+        lock: Box::new(staged.lock.clone()),
+        expected_hash,
+    });
+    let ids = if workspace {
+        install_from_local(super::install_local::LocalInstallCall {
+            source: staged_path,
+            workspace: true,
+            home,
+            original_source: None,
+            principal,
+            expected: Some(ExpectedCapsule {
+                id: &expected_id,
+                version: Some(staged.lock.version.as_str()),
+            }),
+            prompt: &prompt,
+            station_binding: None,
+        })
+        .await
+    } else {
+        let binding = station_binding.as_ref().expect("bound non-workspace");
+        install_from_local(super::install_local::LocalInstallCall {
+            source: staged_path,
+            workspace: false,
+            original_source: None,
+            home,
+            principal,
+            expected: Some(ExpectedCapsule {
+                id: &expected_id,
+                version: Some(staged.lock.version.as_str()),
+            }),
+            prompt: &prompt,
+            station_binding: Some(binding),
+        })
+        .await
+    };
+    let ids = match ids {
+        Ok(ids) => ids,
+        Err(error) => {
+            if workspace {
+                return Err(station_rollback::combine_install_and_restore_errors(
+                    error,
+                    station_rollback::restore_station_lock(
+                        principal,
+                        name,
+                        previous_for_failure.as_ref(),
+                        &staged.lock,
+                    )
+                    .await,
+                ));
+            }
+            return Err(error);
+        },
+    };
+    if workspace && ids.iter().any(|installed| installed.id != expected_id) {
+        // Workspace installs have no kernel transaction; restore the lock the
+        // legacy CLI dance wrote before failing loudly.
+        station_rollback::restore_station_lock(principal, name, previous.as_ref(), &staged.lock)
+            .await?;
+        bail!("Station installed an unexpected capsule");
+    }
+    Ok(ids)
+}
+
 pub(crate) async fn install_capsule_with_options_and_station_lock_in_home(
     request: &StationInstallRequest<'_>,
     home: &AstridHome,
@@ -176,7 +379,7 @@ pub(crate) async fn install_capsule_with_options_and_station_lock_in_home(
 }
 
 /// Install one Station-verified local archive while retaining its exact
-/// source lock in the authenticated owner's control namespace.
+/// source lock through the daemon's atomic Station install transaction.
 async fn install_local_archive_with_station_lock(
     source: &str,
     lock_path: &Path,
@@ -187,56 +390,37 @@ async fn install_local_archive_with_station_lock(
 ) -> anyhow::Result<Vec<super::InstalledCapsuleOutcome>> {
     let archive = Path::new(source);
     let lock = station_handoff::read_lock_file(lock_path, station_lock_sha256)?;
-    let staged = station_handoff::stage_verified_archive(archive, &lock)?;
-    let staged_path = staged
-        .path()
-        .to_str()
-        .context("private Station handoff path is not UTF-8")?;
-    let expected_id = CapsuleId::new(lock.coordinate.name.clone())?;
-    let capsule = expected_id.as_str();
-    let previous = station::load_lock(principal, capsule).await?;
-    let previous_for_failure = previous.clone();
-    station::store_lock(principal, capsule, lock.clone()).await?;
-
-    let installed = install_from_local(
-        staged_path,
-        false,
+    let mut canonical = lock;
+    station::canonicalize_lock(&mut canonical)?;
+    let expected_id = CapsuleId::new(canonical.coordinate.name.clone())?;
+    // The daemon verifies this expectation under its per-owner/capsule
+    // critical section: `None` means this operation must observe no prior
+    // lock, and a stale digest fails the install before any mutation.
+    let capsule_key = expected_id.as_str().to_owned();
+    let previous = station::load_lock(principal, &capsule_key).await?;
+    let expected_hash = previous
+        .as_ref()
+        .map(station::station_lock_digest)
+        .transpose()?;
+    let binding = astrid_core::kernel_api::StationInstallBinding {
+        capsule: capsule_key,
+        lock: Box::new(canonical),
+        expected_hash,
+    };
+    let version = binding.lock.version.clone();
+    let installed = install_from_local(super::install_local::LocalInstallCall {
+        source: archive.to_str().context("archive path is not UTF-8")?,
+        workspace: false,
         home,
-        None,
+        original_source: None,
         principal,
-        Some(ExpectedCapsule {
+        expected: Some(ExpectedCapsule {
             id: &expected_id,
-            version: Some(lock.version.as_str()),
+            version: Some(version.as_str()),
         }),
         prompt,
-    )
-    .await;
-    let installed = match installed {
-        Ok(installed) => installed,
-        Err(error) => {
-            return Err(
-                crate::commands::capsule::station_rollback::combine_install_and_restore_errors(
-                    error,
-                    crate::commands::capsule::station_rollback::restore_station_lock(
-                        principal,
-                        capsule,
-                        previous_for_failure.as_ref(),
-                        &lock,
-                    )
-                    .await,
-                ),
-            );
-        },
-    };
-    if installed.iter().any(|capsule| capsule.id != expected_id) {
-        crate::commands::capsule::station_rollback::restore_station_lock(
-            principal,
-            capsule,
-            previous.as_ref(),
-            &lock,
-        )
-        .await?;
-        bail!("Station lock coordinate does not match installed capsule");
-    }
+        station_binding: Some(&binding),
+    })
+    .await?;
     Ok(installed)
 }

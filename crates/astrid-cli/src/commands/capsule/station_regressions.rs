@@ -312,7 +312,7 @@ fn station_handoff_rejects_lock_byte_substitution_before_lock_persist() {
 }
 
 #[tokio::test]
-async fn station_private_handoff_persists_lock_show_and_update_source() {
+async fn station_handoff_forwards_binding_and_keeps_cli_writes_absent() {
     let root = tempfile::tempdir().unwrap();
     let workspace_root = root.path().join("workspace");
     std::fs::create_dir_all(&workspace_root).unwrap();
@@ -350,19 +350,20 @@ async fn station_private_handoff_persists_lock_show_and_update_source() {
     .unwrap();
     assert_eq!(
         super::test_lock_backend::set_calls(),
-        2,
-        "handoff must replace seeded provenance without extra writes"
+        1,
+        "only the seeded prior exists; the kernel transaction owns persistence"
     );
 
+    // Without the real kernel the control store keeps its prior state; the
+    // kernel-level replacement regression lives beside the kernel handler.
     let persisted = load_lock(&principal, "demo")
         .await
         .unwrap()
-        .expect("StationLockGet must observe the owner-scoped handoff");
-    assert_eq!(persisted, expected);
-    assert_ne!(persisted.station_id, previous.station_id);
+        .expect("prior owner lock stays readable at the CLI layer");
+    assert_eq!(persisted, previous);
 
     let (daemon_source, daemon_calls) = test_daemon_install_call()
-        .expect("private staging must reach the daemon local-install boundary");
+        .expect("the caller archive must reach the daemon local-install boundary");
     assert_eq!(daemon_calls, 1);
     {
         let source_path = std::path::Path::new(daemon_source.as_str());
@@ -370,8 +371,9 @@ async fn station_private_handoff_persists_lock_show_and_update_source() {
             source_path
                 .file_name()
                 .and_then(std::ffi::OsStr::to_str)
-                .is_some_and(|name| name.starts_with("astrid-station-handoff-")),
-            "daemon must receive a create-new staged archive: {:?}",
+                .is_some(),
+            "daemon receives the exact caller path; private staging happens inside \
+             the kernel: {:?}",
             source_path.display()
         );
     }
@@ -396,7 +398,7 @@ async fn station_private_handoff_persists_lock_show_and_update_source() {
 }
 
 #[tokio::test]
-async fn station_handoff_failure_restores_previous_owner_scoped_lock() {
+async fn station_handoff_failure_never_touches_station_state() {
     let root = tempfile::tempdir().unwrap();
     let workspace_root = root.path().join("workspace");
     std::fs::create_dir_all(&workspace_root).unwrap();
@@ -439,8 +441,8 @@ async fn station_handoff_failure_restores_previous_owner_scoped_lock() {
     );
     assert_eq!(
         super::test_lock_backend::set_calls(),
-        3,
-        "failed handoff must write replacement then restore the previous lock"
+        1,
+        "failures happen before any CLI-side Station mutation beyond the seed"
     );
 }
 

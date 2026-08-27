@@ -164,7 +164,7 @@ async fn backend_failure_surfaces_with_original_install_context() {
 }
 
 #[tokio::test]
-async fn coordinate_failure_surfaces_rollback_failure_without_clobbering_current_lock() {
+async fn coordinate_failure_leaves_owner_scoped_state_untouched() {
     let root = tempfile::tempdir().unwrap();
     let station_home = root.path().join("station");
     std::fs::create_dir_all(&station_home).unwrap();
@@ -186,7 +186,6 @@ async fn coordinate_failure_surfaces_rollback_failure_without_clobbering_current
     super::store_lock(&principal, "demo", previous.clone())
         .await
         .unwrap();
-    super::test_lock_backend::queue_set_failure_on_call(3);
     let _local = crate::commands::capsule::install::test_local_install_backend(true);
     let error = crate::commands::capsule::install::test_install_station_source_with_workspace(
         "@official/demo",
@@ -202,9 +201,16 @@ async fn coordinate_failure_surfaces_rollback_failure_without_clobbering_current
     .await
     .expect_err("failed daemon installation must roll back");
     assert!(format!("{error:#}").contains("daemon install failed"));
-    assert!(format!("{error:#}").contains("Station lock rollback failed"));
-    assert_eq!(load_lock(&principal, "demo").await.unwrap(), Some(lock));
-    assert_eq!(super::test_lock_backend::set_calls(), 3);
+    assert!(
+        !format!("{error:#}").contains("Station lock rollback failed"),
+        "the kernel owns failure-time state; the CLI performs no rollback"
+    );
+    assert_eq!(load_lock(&principal, "demo").await.unwrap(), Some(previous));
+    assert_eq!(
+        super::test_lock_backend::set_calls(),
+        1,
+        "only the seed write exists; the kernel transaction is not exercised here"
+    );
 }
 
 #[tokio::test]
@@ -236,6 +242,8 @@ async fn backend_delete_failure_surfaces_and_preserves_just_written_lock() {
 
 #[tokio::test]
 async fn existing_lock_failure_restores_the_previous_owner_scoped_lock() {
+    // Legacy workspace-route rollback coverage lives with the retained CLI
+    // dance; daemon routes are covered by kernel-level station regressions.
     let root = tempfile::tempdir().unwrap();
     let station_home = root.path().join("station");
     std::fs::create_dir_all(&station_home).unwrap();
@@ -265,5 +273,9 @@ async fn existing_lock_failure_restores_the_previous_owner_scoped_lock() {
     .expect_err("failed existing-lock update must roll back");
     assert!(format!("{error:#}").contains("daemon install failed"));
     assert_eq!(load_lock(&principal, "demo").await.unwrap(), Some(previous));
-    assert_eq!(super::test_lock_backend::set_calls(), 3);
+    assert_eq!(
+        super::test_lock_backend::set_calls(),
+        1,
+        "only the seed write exists; the kernel transaction is not exercised here"
+    );
 }
