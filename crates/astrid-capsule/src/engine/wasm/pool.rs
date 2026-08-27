@@ -454,7 +454,10 @@ impl Drop for PoolCheckout {
 /// capsules import zero `wasi:*` functions, so the only WASI-created handles
 /// (streams/pollables) live in the `resource_table` cleared above, not in the
 /// ctx, whose sole content is the inherited-stderr stdio config.
-fn clear_on_return(state: &mut HostState, reset_resources: bool) {
+pub(super) fn clear_on_return(state: &mut HostState, reset_resources: bool) {
+    // Reverse-drain authorities while their admission stamps are still in
+    // place, then replace the bounded table so neither lease sees prior slots.
+    state.semantic_authorities.prepare_for_replacement();
     state.caller_context = None;
     state.stamped_invocation = None;
     state.interceptor_active = false;
