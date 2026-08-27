@@ -12,7 +12,7 @@ use astrid_core::dirs::AstridHome;
 
 use super::{
     ExpectedCapsule, InstallRequest, ManualInstallOptions, RefSpec, install_capsule_inner_at,
-    install_from_local, restore_station_lock,
+    install_from_local,
 };
 use crate::commands::capsule::{live_load, station, station_handoff};
 
@@ -214,12 +214,28 @@ async fn install_local_archive_with_station_lock(
     let installed = match installed {
         Ok(installed) => installed,
         Err(error) => {
-            restore_station_lock(principal, capsule, previous_for_failure).await;
-            return Err(error);
+            return Err(
+                crate::commands::capsule::station_rollback::combine_install_and_restore_errors(
+                    error,
+                    crate::commands::capsule::station_rollback::restore_station_lock(
+                        principal,
+                        capsule,
+                        previous_for_failure.as_ref(),
+                        &lock,
+                    )
+                    .await,
+                ),
+            );
         },
     };
     if installed.iter().any(|capsule| capsule.id != expected_id) {
-        restore_station_lock(principal, capsule, previous).await;
+        crate::commands::capsule::station_rollback::restore_station_lock(
+            principal,
+            capsule,
+            previous.as_ref(),
+            &lock,
+        )
+        .await?;
         bail!("Station lock coordinate does not match installed capsule");
     }
     Ok(installed)

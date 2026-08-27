@@ -16,7 +16,7 @@ use astrid_capsule_install::github_source::{
 };
 use astrid_core::dirs::AstridHome;
 
-use super::station;
+use super::{station, station_rollback};
 
 pub(crate) use super::install_batch::{
     BatchInstallOutcome, InstalledCapsuleOutcome, RefSpec, install_capsule_batch,
@@ -45,6 +45,8 @@ pub(crate) use station_install::install_capsule_with_options_and_station_lock_in
 pub(crate) use station_install::test_daemon_install_call;
 #[cfg(test)]
 pub(crate) use station_install::test_local_install_backend;
+#[cfg(test)]
+pub(crate) use station_rollback::{combine_install_and_restore_errors, restore_station_lock};
 
 #[derive(Clone, Copy)]
 struct ExpectedCapsule<'a> {
@@ -307,6 +309,17 @@ pub(super) async fn test_install_station_source(
     principal: &astrid_core::PrincipalId,
     prompt: &ManualInstallOptions,
 ) -> anyhow::Result<Vec<InstalledCapsuleOutcome>> {
+    test_install_station_source_with_workspace(source, home, principal, prompt, true).await
+}
+
+#[cfg(test)]
+pub(super) async fn test_install_station_source_with_workspace(
+    source: &str,
+    home: &AstridHome,
+    principal: &astrid_core::PrincipalId,
+    prompt: &ManualInstallOptions,
+    workspace: bool,
+) -> anyhow::Result<Vec<InstalledCapsuleOutcome>> {
     let coordinate = source
         .strip_prefix('@')
         .ok_or_else(|| anyhow::anyhow!("test Station source must be a coordinate"))?;
@@ -315,7 +328,7 @@ pub(super) async fn test_install_station_source(
         name_hint: None,
         version: None,
         tag: None,
-        workspace: true,
+        workspace,
         home,
         principal,
         expected: None,
@@ -432,12 +445,26 @@ async fn install_station_source(
     {
         Ok(ids) => ids,
         Err(error) => {
-            restore_station_lock(context.principal, name, previous_for_failure).await;
-            return Err(error);
+            return Err(station_rollback::combine_install_and_restore_errors(
+                error,
+                station_rollback::restore_station_lock(
+                    context.principal,
+                    name,
+                    previous_for_failure.as_ref(),
+                    &staged.lock,
+                )
+                .await,
+            ));
         },
     };
     if ids.iter().any(|installed| installed.id.as_str() != name) {
-        restore_station_lock(context.principal, name, previous).await;
+        station_rollback::restore_station_lock(
+            context.principal,
+            name,
+            previous.as_ref(),
+            &staged.lock,
+        )
+        .await?;
         bail!("Station lock coordinate does not match installed capsule");
     }
     Ok((ids, None))
@@ -505,7 +532,7 @@ async fn clear_replaced_station_locks(
     principal: &astrid_core::PrincipalId,
     installed: &[InstalledCapsuleOutcome],
 ) -> anyhow::Result<()> {
-    if workspace && !station_lock_clear_ready() {
+    if workspace && !station_rollback::station_lock_clear_ready() {
         return Ok(());
     }
     for capsule in installed {
@@ -519,33 +546,6 @@ async fn clear_replaced_station_locks(
             })?;
     }
     Ok(())
-}
-
-fn station_lock_clear_ready() -> bool {
-    #[cfg(test)]
-    if station::test_lock_backend_active() {
-        return true;
-    }
-    crate::socket_client::readiness_path().exists()
-}
-
-async fn restore_station_lock(
-    principal: &astrid_core::PrincipalId,
-    capsule: &str,
-    previous: Option<astrid_core::kernel_api::StationLock>,
-) {
-    let result = match previous {
-        Some(lock) => station::store_lock(principal, capsule, lock).await,
-        None => station::clear_lock(principal, capsule).await,
-    };
-    if let Err(error) = result {
-        tracing::warn!(
-            principal = %principal,
-            capsule,
-            %error,
-            "failed to restore Station lock after install failure"
-        );
-    }
 }
 
 /// Re-resolve and install an existing Station lock through the normal local
@@ -598,13 +598,23 @@ pub(super) async fn install_from_station_lock(
         Ok(ids) => ids,
         Err(error) => {
             if !workspace {
-                restore_station_lock(principal, name, previous_for_failure).await;
+                return Err(station_rollback::combine_install_and_restore_errors(
+                    error,
+                    station_rollback::restore_station_lock(
+                        principal,
+                        name,
+                        previous_for_failure.as_ref(),
+                        &staged.lock,
+                    )
+                    .await,
+                ));
             }
             return Err(error);
         },
     };
     if !workspace && ids.iter().any(|installed| installed.id != expected_id) {
-        restore_station_lock(principal, name, previous).await;
+        station_rollback::restore_station_lock(principal, name, previous.as_ref(), &staged.lock)
+            .await?;
         bail!("Station installed an unexpected capsule");
     }
     Ok(ids)

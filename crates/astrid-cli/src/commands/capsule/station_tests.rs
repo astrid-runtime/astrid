@@ -1,6 +1,7 @@
 use super::*;
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use sha2::{Digest as _, Sha256};
 use std::fs::File;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -56,6 +57,18 @@ fn capsule_archive(manifest: &[u8]) -> (tempfile::TempDir, PathBuf) {
     let encoder = archive.into_inner().unwrap();
     encoder.finish().unwrap();
     (dir, path)
+}
+
+fn lock_for_archive(archive: &Path, manifest: &[u8]) -> StationLock {
+    let bytes = std::fs::read(archive).unwrap();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(MANIFEST_DOMAIN);
+    hasher.update(manifest);
+    let mut lock = sample_lock(&format!("blake3:{}", hasher.finalize().to_hex()));
+    lock.artifact_size = bytes.len() as u64;
+    lock.artifact_sha256 = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
+    lock.artifact_blake3 = format!("blake3:{}", blake3::hash(&bytes).to_hex());
+    lock
 }
 
 #[cfg(unix)]
@@ -143,14 +156,15 @@ fn station_update_uses_existing_lock_and_private_handoff_not_astrid_cas() {
     std::fs::create_dir_all(&astrid_home).unwrap();
     let manifest = b"[package]\nname = \"demo\"\nversion = \"1.0.0\"\n";
     let (_fixture_dir, fixture) = capsule_archive(manifest);
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(MANIFEST_DOMAIN);
-    hasher.update(manifest);
-    let mut lock = sample_lock(&format!("blake3:{}", hasher.finalize().to_hex()));
+    let mut lock = lock_for_archive(&fixture, manifest);
     // Older Station clients emitted bare BLAKE3 commitments. The update
     // path must normalize those before fetch and handoff side effects.
     lock.publication_digest = hex::encode([0x22_u8; 32]);
-    lock.artifact_blake3 = hex::encode([0x44_u8; 32]);
+    let expected_artifact_blake3 = lock.artifact_blake3.clone();
+    lock.artifact_blake3 = expected_artifact_blake3
+        .strip_prefix("blake3:")
+        .unwrap()
+        .to_owned();
     let marker = root.path().join("station-calls");
     let script = fake_station_script(root.path(), &fixture, &marker);
 
@@ -161,10 +175,16 @@ fn station_update_uses_existing_lock_and_private_handoff_not_astrid_cas() {
     assert!(calls.contains("fetch"));
     assert!(calls.contains("--lock"));
     assert!(!calls.contains(" resolve "));
-    let expected_parent = station_home.join("var/sources/official/handoff");
-    assert!(artifact.path.starts_with(expected_parent));
+    assert_ne!(artifact.path, fixture);
+    assert!(
+        artifact
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("astrid-station-handoff-"))
+    );
     assert!(!artifact.path.starts_with(astrid_home.join("var")));
     assert!(artifact.path.is_file());
     assert_eq!(artifact.lock.publication_digest, digest("blake3:", 0x22));
-    assert_eq!(artifact.lock.artifact_blake3, digest("blake3:", 0x44));
+    assert_eq!(artifact.lock.artifact_blake3, expected_artifact_blake3);
 }

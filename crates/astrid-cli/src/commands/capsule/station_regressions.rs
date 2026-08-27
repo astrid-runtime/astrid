@@ -20,6 +20,8 @@ use tar::Builder;
 
 static PROCESS_SETTINGS_LOCK: Mutex<()> = Mutex::new(());
 
+mod station_rollback_tests;
+
 struct CurrentDirGuard {
     _lock: MutexGuard<'static, ()>,
     old_current_dir: PathBuf,
@@ -536,8 +538,7 @@ fn station_install_remove_local_install_does_not_reresolve_station() {
     std::fs::create_dir_all(&workspace_root).unwrap();
     let manifest = b"[package]\nname = \"demo\"\nversion = \"1.0.0\"\n";
     let (_fixture_dir, fixture) = capsule_archive(manifest);
-    let hex = domain_digest(manifest);
-    let lock = sample_lock(&format!("blake3:{hex}"));
+    let lock = lock_for_archive(&fixture, manifest);
     let lock_json = root.path().join("resolved.lock.json");
     write_lock_json(&lock_json, &lock);
     let marker = root.path().join("station-calls");
@@ -654,8 +655,7 @@ fn station_local_replacement_clears_live_lock_before_update_and_show() {
     std::fs::create_dir_all(&workspace_root).unwrap();
     let manifest = b"[package]\nname = \"demo\"\nversion = \"1.0.0\"\n";
     let (_fixture_dir, fixture) = capsule_archive(manifest);
-    let hex = domain_digest(manifest);
-    let lock = sample_lock(&format!("blake3:{hex}"));
+    let lock = lock_for_archive(&fixture, manifest);
     let lock_json = root.path().join("resolved.lock.json");
     write_lock_json(&lock_json, &lock);
     let marker = root.path().join("station-calls");
@@ -744,9 +744,10 @@ async fn bare_hex_manifest_is_canonicalized_before_lock_set_and_update_from_lock
     let manifest = b"[package]\nname = \"demo\"\nversion = \"1.0.0\"\n";
     let (_fixture_dir, fixture) = capsule_archive(manifest);
     let hex = domain_digest(manifest);
-    let mut lock = sample_lock(&hex);
+    let mut lock = lock_for_archive(&fixture, manifest);
     lock.publication_digest = hex::encode([0x22_u8; 32]);
-    lock.artifact_blake3 = hex::encode([0x44_u8; 32]);
+    let artifact_blake3 = lock.artifact_blake3.clone();
+    lock.artifact_blake3 = artifact_blake3.strip_prefix("blake3:").unwrap().to_owned();
     let lock_json = root.path().join("resolved.lock.json");
     write_lock_json(&lock_json, &lock);
     let marker = root.path().join("station-calls");
@@ -770,7 +771,7 @@ async fn bare_hex_manifest_is_canonicalized_before_lock_set_and_update_from_lock
         .expect("canonical lock");
     assert_eq!(persisted.manifest_digest, format!("blake3:{hex}"));
     assert_eq!(persisted.publication_digest, digest("blake3:", 0x22));
-    assert_eq!(persisted.artifact_blake3, digest("blake3:", 0x44));
+    assert_eq!(persisted.artifact_blake3, artifact_blake3);
     assert!(persisted.manifest_digest.starts_with("blake3:"));
 
     let artifact =

@@ -20,12 +20,14 @@ const MANIFEST_DOMAIN: &[u8] = b"astrid:capsule-manifest:v1\0";
 pub(crate) const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A private Station handoff ready for Astrid's existing local installer.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct StationArtifact {
-    /// Archive staged below Station's `var/sources/<id>/handoff` directory.
+    /// Exact archive bytes staged for the daemon-owned local installer.
     pub(crate) path: PathBuf,
     /// Exact typed source lock returned by Station.
     pub(crate) lock: StationLock,
+    /// Create-new binding copy owned for the lifetime of the handoff.
+    _bound_archive: tempfile::NamedTempFile,
 }
 
 /// Whether at least one enabled Station source is configured.
@@ -148,7 +150,12 @@ pub(crate) async fn store_lock(
     canonicalize_lock(&mut lock)?;
     #[cfg(test)]
     if test_lock_backend::active() {
-        test_lock_backend::set(principal, capsule, lock);
+        let expected_hash = test_lock_backend::get(principal, capsule)
+            .as_ref()
+            .map(station_lock_digest)
+            .transpose()?;
+        test_lock_backend::set(principal, capsule, lock, expected_hash.as_deref())
+            .map_err(anyhow::Error::msg)?;
         return Ok(());
     }
     let mut client = crate::admin_client::connect_as_active_agent().await?;
@@ -164,6 +171,27 @@ pub(crate) async fn store_lock(
         other => bail!("unexpected Station lock response: {other:?}"),
     };
     let expected_hash = current.as_ref().map(station_lock_digest).transpose()?;
+    store_lock_at_expected_hash(principal, capsule, lock, expected_hash).await
+}
+
+/// Set a lock only when the backend still holds the caller's expected value.
+///
+/// Rollback uses this primitive against the record it wrote immediately
+/// beforehand; it never refreshes state to overwrite a newer owner.
+pub(crate) async fn store_lock_at_expected_hash(
+    principal: &PrincipalId,
+    capsule: &str,
+    mut lock: StationLock,
+    expected_hash: Option<String>,
+) -> anyhow::Result<()> {
+    canonicalize_lock(&mut lock)?;
+    #[cfg(test)]
+    if test_lock_backend::active() {
+        test_lock_backend::set(principal, capsule, lock, expected_hash.as_deref())
+            .map_err(anyhow::Error::msg)?;
+        return Ok(());
+    }
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
     let response = client
         .request(AdminRequestKind::StationLockSet {
             principal: principal.clone(),
@@ -184,7 +212,7 @@ pub(crate) async fn store_lock(
 pub(crate) async fn clear_lock(principal: &PrincipalId, capsule: &str) -> anyhow::Result<()> {
     #[cfg(test)]
     if test_lock_backend::active() {
-        test_lock_backend::delete(principal, capsule);
+        test_lock_backend::delete(principal, capsule, None).map_err(anyhow::Error::msg)?;
         return Ok(());
     }
     let mut client = crate::admin_client::connect_as_active_agent().await?;
@@ -193,6 +221,32 @@ pub(crate) async fn clear_lock(principal: &PrincipalId, capsule: &str) -> anyhow
             principal: principal.clone(),
             capsule: capsule.to_owned(),
             expected_hash: None,
+        })
+        .await?;
+    match response {
+        AdminResponseBody::Success(_) => Ok(()),
+        AdminResponseBody::Error(error) => Err(anyhow::anyhow!(error)),
+        other => bail!("unexpected Station lock delete response: {other:?}"),
+    }
+}
+
+/// Delete a lock only while it still has the exact hash being rolled back.
+pub(crate) async fn delete_lock_at_expected_hash(
+    principal: &PrincipalId,
+    capsule: &str,
+    expected_hash: String,
+) -> anyhow::Result<()> {
+    #[cfg(test)]
+    if test_lock_backend::active() {
+        return test_lock_backend::delete(principal, capsule, Some(expected_hash))
+            .map_err(anyhow::Error::msg);
+    }
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
+    let response = client
+        .request(AdminRequestKind::StationLockDelete {
+            principal: principal.clone(),
+            capsule: capsule.to_owned(),
+            expected_hash: Some(expected_hash),
         })
         .await?;
     match response {
@@ -235,9 +289,12 @@ fn fetch_for_source_at(
     let stage = prepare_handoff(home, source, &publication_hex)?;
     fetch_handoff(source, lock_coordinate, &stage, &staging, binary, home)?;
     verify_manifest_digest(&stage, &staging.lock)?;
+    let bound = super::station_handoff::stage_verified_archive(&stage, &staging.lock)
+        .context("bind fetched Station archive bytes")?;
     Ok(StationArtifact {
-        path: stage,
+        path: bound.path().to_path_buf(),
         lock: staging.lock,
+        _bound_archive: bound,
     })
 }
 
@@ -746,7 +803,7 @@ fn decode_digest(value: &str, prefix: &str) -> anyhow::Result<Vec<u8>> {
     hex::decode(hex).context("decode digest")
 }
 
-fn station_lock_digest(lock: &StationLock) -> anyhow::Result<String> {
+pub(crate) fn station_lock_digest(lock: &StationLock) -> anyhow::Result<String> {
     let bytes = serde_json::to_vec(lock).context("encode Station lock")?;
     Ok(format!("blake3:{}", blake3::hash(&bytes).to_hex()))
 }
