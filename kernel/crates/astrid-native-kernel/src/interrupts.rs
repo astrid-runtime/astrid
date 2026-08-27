@@ -5,6 +5,7 @@
 use core::sync::atomic::Ordering;
 
 use spin::Once;
+use x86_64::PrivilegeLevel;
 use x86_64::VirtAddr;
 use x86_64::structures::idt::InterruptDescriptorTable;
 
@@ -31,7 +32,11 @@ pub fn init_idt() {
             idt.debug.set_handler_addr(addr(trap::isr_1));
             idt.non_maskable_interrupt
                 .set_handler_addr(addr(trap::isr_2));
-            idt.breakpoint.set_handler_addr(addr(trap::isr_3));
+            // Domain fixtures return to ring 0 through breakpoint, so the
+            // software exception gate must be callable from CPL 3.
+            idt.breakpoint
+                .set_handler_addr(addr(trap::isr_3))
+                .set_privilege_level(PrivilegeLevel::Ring3);
             idt.overflow.set_handler_addr(addr(trap::isr_4));
             idt.bound_range_exceeded.set_handler_addr(addr(trap::isr_5));
             idt.invalid_opcode.set_handler_addr(addr(trap::isr_6));

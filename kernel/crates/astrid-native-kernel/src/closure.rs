@@ -5,18 +5,21 @@
 
 use astrid_native_closure::{
     AuthenticatedPolicyHandoff, BootContextBinding, BoundIdentities, CURRENT_FLOOR, ClosureError,
-    HANDOFF_LEN, HandoffContext, LoaderIdentity, LoaderMeasurement, MeasuredIdentity,
-    PolicyGeneration, RootVerifier, TABLE_LEN, TrustedPolicy, verify_policy_handoff, verify_table,
+    EMULATOR_COMPONENT_LEN, HANDOFF_LEN, HandoffContext, LoaderIdentity, LoaderMeasurement,
+    MeasuredIdentity, PolicyGeneration, RootVerifier, TABLE_LEN, TrustedPolicy,
+    verify_policy_handoff, verify_table,
 };
 use astrid_system_generation::emulator_fixture::{
-    EMULATOR_CLOSURE_ROOT, EMULATOR_COMPONENTS, EMULATOR_GENERATION_FLOOR, EMULATOR_MANIFEST_SIZES,
-    EMULATOR_NOW_UNIX_SECONDS, EMULATOR_OBJECT_ROOT, EMULATOR_PLAN_DIGEST,
+    EMULATOR_CLOSURE_ROOT, EMULATOR_COMPONENT_LEN as FIXTURE_COMPONENT_LEN,
+    EMULATOR_GENERATION_FLOOR, EMULATOR_MANIFEST_SIZES, EMULATOR_NOW_UNIX_SECONDS,
+    EMULATOR_OBJECT_ROOT, EMULATOR_PLAN_DIGEST, emulator_components,
 };
 use astrid_system_generation::{
     ContentId, Generation, GenerationError, MANIFEST_LEN, TrustedInput, TrustedInputData,
 };
 use bootloader_api::BootInfo;
 use bootloader_api::info::LoaderHandoffVerification;
+use spin::Mutex;
 
 // Keep ring 0's view of the loader receipt pinned to the vendored
 // bootloader/common producer. A layout drift would otherwise turn the
@@ -36,8 +39,11 @@ const _: () = {
     assert!(offset_of!(LoaderHandoffVerification, sysgen_floor) == 320);
 };
 
-/// The exact ramdisk contract is `[ASTRIDPH; 379][ASTRIDDC; 355][ASTRIDSG; 548]`.
-pub const RAMDISK_BUNDLE_LEN: usize = HANDOFF_LEN + TABLE_LEN + MANIFEST_LEN;
+/// The exact ramdisk contract adds the measured native-domain component.
+pub const RAMDISK_BUNDLE_LEN: usize =
+    HANDOFF_LEN + TABLE_LEN + MANIFEST_LEN + EMULATOR_COMPONENT_LEN;
+
+const _: () = assert!(EMULATOR_COMPONENT_LEN == FIXTURE_COMPONENT_LEN);
 
 /// Emulator fixture root public key corresponding to the explicit root seed
 /// in `tools/kimage/fixtures/root.key.hex`. The envelope's root-key field is
@@ -51,6 +57,10 @@ const LOADER_MEASUREMENT_DOMAIN: &[u8] = b"astrid.kimage.loader.measurement.v1";
 const LOADER_IDENTITY_DOMAIN: &[u8] = b"astrid.kimage.loader.identity.v1";
 const BOOT_CONTEXT_DOMAIN: &[u8] = b"astrid.boot.q35.uefi.tcg.v1";
 
+type ComponentBytes = [u8; EMULATOR_COMPONENT_LEN];
+
+static AUTHENTICATED_COMPONENT: Mutex<Option<ComponentBytes>> = Mutex::new(None);
+
 /// Values accepted only after both the root handoff and closure table verify.
 #[derive(Clone, Copy)]
 pub(super) struct AcceptedClosure {
@@ -61,6 +71,8 @@ pub(super) struct AcceptedClosure {
     /// Exact descriptor bytes copied from the loader-owned ramdisk. This is
     /// still untrusted until the caller binds its identity and verifies it.
     sysgen_payload: [u8; MANIFEST_LEN],
+    /// Non-empty executable input independently matched to a signed digest.
+    component_payload: [u8; EMULATOR_COMPONENT_LEN],
 }
 
 impl AcceptedClosure {
@@ -79,6 +91,30 @@ impl AcceptedClosure {
     pub(super) const fn closure_table(&self) -> MeasuredIdentity {
         self.closure_table
     }
+
+    pub(super) const fn component(&self) -> &[u8; EMULATOR_COMPONENT_LEN] {
+        &self.component_payload
+    }
+}
+
+pub(super) fn bind_component(bytes: &[u8; EMULATOR_COMPONENT_LEN]) -> bool {
+    let identity = ContentId::from_payload(bytes);
+    let components = emulator_components();
+    if components.count() != 1 || components.digest(0) != Some(identity) {
+        return false;
+    }
+    *AUTHENTICATED_COMPONENT.lock() = Some(*bytes);
+    true
+}
+
+pub(super) fn authenticated_component() -> ComponentBytes {
+    AUTHENTICATED_COMPONENT
+        .lock()
+        .expect("authenticated component is present")
+}
+
+pub(super) fn authenticated_component_id() -> ContentId {
+    ContentId::from_payload(&authenticated_component())
 }
 
 pub(super) fn accept(boot_info: &BootInfo) -> Result<AcceptedClosure, ClosureError> {
@@ -103,7 +139,9 @@ pub(super) fn accept(boot_info: &BootInfo) -> Result<AcceptedClosure, ClosureErr
     let kernel_image = MeasuredIdentity::from_bytes(receipt.kernel_image);
     let table_end = HANDOFF_LEN + TABLE_LEN;
     let table_bytes = &bundle[HANDOFF_LEN..table_end];
-    let sysgen_payload = &bundle[table_end..];
+    let sysgen_end = table_end + MANIFEST_LEN;
+    let sysgen_payload = &bundle[table_end..sysgen_end];
+    let component_payload = &bundle[sysgen_end..];
     let closure_table = MeasuredIdentity::from_bytes(receipt.closure_table);
     if MeasuredIdentity::from_payload(&bundle[..HANDOFF_LEN]).as_bytes() != receipt.envelope_digest
         || MeasuredIdentity::from_payload(table_bytes).as_bytes() != receipt.closure_table
@@ -149,6 +187,9 @@ pub(super) fn accept(boot_info: &BootInfo) -> Result<AcceptedClosure, ClosureErr
         kernel_image,
         closure_table,
         sysgen_payload: descriptor,
+        component_payload: component_payload
+            .try_into()
+            .map_err(|_| ClosureError::Truncated)?,
     })
 }
 
@@ -176,7 +217,7 @@ pub(super) fn trusted_system_generation_input(
         signer: accepted.handoff.policy().sysgen_verify(),
         kernel_identity,
         plan_digest,
-        components: EMULATOR_COMPONENTS,
+        components: emulator_components(),
         object_root,
         closure_root,
         generation_floor: Generation::new(EMULATOR_GENERATION_FLOOR),

@@ -14,7 +14,8 @@ use linked_list_allocator::Heap;
 use spin::{Mutex, Once};
 use x86_64::VirtAddr;
 use x86_64::registers::control::Cr3;
-use x86_64::structures::paging::{PageTable, PageTableFlags};
+use x86_64::structures::paging::PageTable;
+use x86_64::structures::paging::PageTableFlags;
 
 pub const FRAME_SIZE: u64 = 4096;
 const PHYS_SPAN: u64 = 256 * 1024 * 1024;
@@ -85,12 +86,15 @@ impl FrameAllocator {
         None
     }
 
-    fn free(&mut self, frame: Frame) {
+    /// Returns true only when this call changed an allocated frame to free.
+    fn try_free(&mut self, frame: Frame) -> bool {
         let idx = (frame.phys() / FRAME_SIZE) as usize;
-        if idx < MAX_FRAMES {
+        if idx < MAX_FRAMES && self.allocated[idx / 64] & (1 << (idx % 64)) != 0 {
             self.allocated[idx / 64] &= !(1u64 << (idx % 64));
             self.cursor = self.cursor.min(idx);
+            return true;
         }
+        false
     }
 
     fn reset(&mut self) {
@@ -106,7 +110,7 @@ pub fn set_phys_offset(offset: u64) {
     PHYS_OFFSET.store(offset, Ordering::SeqCst);
 }
 
-fn phys_offset() -> u64 {
+pub fn phys_offset() -> u64 {
     PHYS_OFFSET.load(Ordering::SeqCst)
 }
 
@@ -150,7 +154,77 @@ pub fn alloc_frame() -> Option<Frame> {
 }
 
 pub fn free_frame(frame: Frame) {
-    FRAMES.lock().free(frame);
+    FRAMES.lock().try_free(frame);
+}
+
+fn reserve_frame(frame: Frame) {
+    let idx = (frame.phys() / FRAME_SIZE) as usize;
+    if idx < MAX_FRAMES {
+        let allocator = &mut *FRAMES.lock();
+        allocator.allocated[idx / 64] |= 1 << (idx % 64);
+        allocator.cursor = allocator.cursor.max((idx + 1) % MAX_FRAMES);
+    }
+}
+
+/// Reserve frames owned by live page tables and non-alias kernel mappings.
+pub fn reserve_live_page_tables() {
+    let (root, _) = Cr3::read();
+    let alias_index = VirtAddr::new(phys_offset()).p4_index();
+    reserve_table_tree(
+        root.start_address().as_u64(),
+        4,
+        true,
+        Some(alias_index.into()),
+    );
+}
+
+fn reserve_table_tree(table_phys: u64, depth: u8, reserve_leaves: bool, skip_alias: Option<u16>) {
+    reserve_frame(Frame::from_phys(table_phys));
+    if depth == 0 {
+        return;
+    }
+    let offset = phys_offset();
+    // SAFETY: this is the live CR3 tree, reached only through the fixed
+    // physical-memory mapping while ring zero owns the allocator.
+    let table = unsafe { &*((offset + table_phys) as *const PageTable) };
+    for (index, entry) in table.iter().enumerate() {
+        let index = index as u16;
+        if !entry.flags().contains(PageTableFlags::PRESENT) {
+            continue;
+        }
+        let frame = Frame::from_phys(entry.addr().as_u64());
+        if Some(index) == skip_alias {
+            reserve_frame(frame);
+            reserve_table_tree(frame.phys(), depth - 1, false, None);
+            continue;
+        }
+        if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            reserve_frame(frame);
+            continue;
+        }
+        if depth == 1 && !reserve_leaves {
+            continue;
+        }
+        reserve_table_tree(frame.phys(), depth - 1, reserve_leaves, None);
+    }
+}
+
+/// Release a frame exactly once and clear it while still exclusively owned.
+pub fn reclaim_frame(frame: Frame) -> bool {
+    let mut allocator = FRAMES.lock();
+    if !allocator.try_free(frame) {
+        return false;
+    }
+    // SAFETY: the allocation was just released; no alias can observe the old
+    // contents until another alloc_frame returns this same physical address.
+    unsafe {
+        core::ptr::write_bytes(
+            (phys_offset() + frame.phys()) as *mut u8,
+            0,
+            FRAME_SIZE as usize,
+        )
+    };
+    true
 }
 
 pub fn reset_frames() {
@@ -249,6 +323,35 @@ fn leaf_flags(addr: VirtAddr) -> Option<PageTableFlags> {
         table_phys = entry.addr().as_u64();
     }
     Some(flags)
+}
+
+/// Zero through the fixed physical-memory map while a frame is still owned.
+///
+/// # Safety
+/// Caller must exclusively own `frame`; no other mapping may observe it.
+pub unsafe fn zero_frame(frame: Frame) {
+    unsafe {
+        core::ptr::write_bytes(
+            (phys_offset() + frame.phys()) as *mut u8,
+            0,
+            FRAME_SIZE as usize,
+        );
+    }
+}
+
+/// Check every byte of an owned frame through the fixed physical map.
+///
+/// # Safety
+/// Caller must exclusively own `frame`.
+pub unsafe fn frame_is_zeroed(frame: Frame) -> bool {
+    unsafe {
+        core::slice::from_raw_parts(
+            (phys_offset() + frame.phys()) as *const u8,
+            FRAME_SIZE as usize,
+        )
+        .iter()
+        .all(|byte| *byte == 0)
+    }
 }
 
 /// Audit W^X for the kernel image. Returns violation booleans:

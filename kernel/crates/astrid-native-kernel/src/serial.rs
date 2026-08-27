@@ -178,6 +178,90 @@ pub fn ev_closure_reject(reason: &str) {
     ));
 }
 
+pub fn ev_domain_started(id: u64, generation: u64, scenario: u64) {
+    emit(format_args!(
+        "\"ev\":\"domain.start\",\"id\":{id},\"generation\":{generation},\"scenario\":{scenario}"
+    ));
+}
+
+pub fn ev_domain_entered(id: u64, generation: u64, cpl: u64) {
+    emit(format_args!(
+        "\"ev\":\"domain.entered\",\"id\":{id},\"generation\":{generation},\"cpl\":{cpl}"
+    ));
+}
+
+pub fn ev_domain_cancelled(id: u64, generation: u64) {
+    emit(format_args!(
+        "\"ev\":\"domain.cancelled\",\"id\":{id},\"generation\":{generation}"
+    ));
+}
+
+pub fn ev_domain_quota(id: u64, ticks: u32) {
+    emit(format_args!(
+        "\"ev\":\"domain.quota\",\"id\":{id},\"ticks\":{ticks}"
+    ));
+}
+
+pub fn ev_domain_outcome(
+    kind: &str,
+    vector: u8,
+    error_code: u64,
+    fault_address: u64,
+    rip: u64,
+    cpl: u64,
+) {
+    emit(format_args!(
+        "\"ev\":\"domain.outcome\",\"kind\":\"{kind}\",\"vector\":{vector},\"error_code\":{error_code},\"fault_address\":\"{fault_address:#x}\",\"rip\":\"{rip:#x}\",\"cpl\":{cpl}"
+    ));
+}
+
+pub fn ev_domain_reclaimed(
+    id: u64,
+    generation: u64,
+    expected: u64,
+    freed: u64,
+    swept: u64,
+    blocked: u64,
+) {
+    emit(format_args!(
+        "\"ev\":\"domain.reclaim\",\"id\":{id},\"generation\":{generation},\"expected\":{expected},\"freed\":{freed},\"swept\":{swept},\"blocked\":{blocked}"
+    ));
+}
+
+pub fn ev_domain_audit(frames: u64, wx_ok: bool, kernel_excluded: bool, peer_excluded: bool) {
+    emit(format_args!(
+        "\"ev\":\"domain.audit\",\"frames\":{frames},\"wx_ok\":{wx_ok},\"kernel_excluded\":{kernel_excluded},\"peer_excluded\":{peer_excluded}"
+    ));
+}
+
+pub fn ev_domain_accounting(expected: u64, observed: u64) {
+    emit(format_args!(
+        "\"ev\":\"domain.accounting\",\"expected\":{expected},\"observed\":{observed}"
+    ));
+}
+
+pub fn ev_domain_policy(audit_ok: bool, stack_zeroed: bool, probe_zeroed: bool) {
+    emit(format_args!(
+        "\"ev\":\"domain.policy\",\"audit_ok\":{audit_ok},\"stack_zeroed\":{stack_zeroed},\"probe_zeroed\":{probe_zeroed}"
+    ));
+}
+
+pub fn ev_domain_exclusion(alias_excluded: bool, kernel_excluded: bool, peer_excluded: bool) {
+    emit(format_args!(
+        "\"ev\":\"domain.exclusion\",\"alias_excluded\":{alias_excluded},\"kernel_excluded\":{kernel_excluded},\"peer_excluded\":{peer_excluded}"
+    ));
+}
+
+pub fn ev_domain_auth_reject(reason: &str) {
+    emit(format_args!(
+        "\"ev\":\"domain.auth.reject\",\"reason\":\"{reason}\""
+    ));
+}
+
+pub fn ev_domain_harness(pass: bool) {
+    emit(format_args!("\"ev\":\"domain.harness\",\"outcome\":{pass}"));
+}
+
 pub fn ev_halt(ok: bool) {
     let outcome = if ok { "ok" } else { "fault" };
     emit(format_args!("\"ev\":\"halt\",\"outcome\":\"{outcome}\""));

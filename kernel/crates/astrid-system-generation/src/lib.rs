@@ -19,6 +19,8 @@ mod types;
 mod verify;
 
 mod fixture;
+#[cfg(feature = "emulator-fixture")]
+mod fixture_component;
 #[cfg(any(test, feature = "sign"))]
 mod sign;
 
@@ -38,9 +40,12 @@ pub use verify::verify_manifest;
 #[cfg(feature = "emulator-fixture")]
 pub mod emulator_fixture {
     pub use super::fixture::{
-        EMULATOR_CLOSURE_ROOT, EMULATOR_COMPONENTS, EMULATOR_GENERATION_FLOOR,
-        EMULATOR_MANIFEST_SIZES, EMULATOR_NOW_UNIX_SECONDS, EMULATOR_OBJECT_ROOT,
-        EMULATOR_PLAN_DIGEST,
+        EMULATOR_CLOSURE_ROOT, EMULATOR_GENERATION_FLOOR, EMULATOR_MANIFEST_SIZES,
+        EMULATOR_NOW_UNIX_SECONDS, EMULATOR_OBJECT_ROOT, EMULATOR_PLAN_DIGEST,
+    };
+    pub use super::fixture_component::{
+        EMULATOR_COMPONENT_CODE_LEN, EMULATOR_COMPONENT_LEN, emulator_component,
+        emulator_components,
     };
 }
 

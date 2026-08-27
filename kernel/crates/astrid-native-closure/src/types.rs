@@ -21,6 +21,9 @@ pub const ARTIFACT_LEN: usize = KIND_LEN + FLOOR_LEN + ID_LEN + KEY_LEN + SIG_LE
 pub const HEADER_LEN: usize = 8 + 1 + 8 + KEY_LEN + KEY_LEN;
 pub const TABLE_LEN: usize = HEADER_LEN + ARTIFACT_LEN * 2;
 pub const SIGNED_LEN: usize = 17 + KIND_LEN + FLOOR_LEN + ID_LEN;
+/// Fixed framing for the development emulator's executable component. The
+/// signed descriptor binds its digest; ring 0 re-verifies the binding.
+pub const EMULATOR_COMPONENT_LEN: usize = 130;
 
 /// Which signed artifact this is. The two kinds must stay distinct.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

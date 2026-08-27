@@ -7,9 +7,9 @@
 //! is an emulator fixture, not a firmware or production root of trust.
 
 use astrid_native_closure::{
-    BootContextBinding, CURRENT_FLOOR, HANDOFF_LEN, HandoffContext, LoaderIdentity,
-    LoaderMeasurement, MeasuredIdentity, PolicyGeneration, RootVerifier, TABLE_LEN, TrustedPolicy,
-    verify_policy_handoff, verify_table,
+    BootContextBinding, CURRENT_FLOOR, EMULATOR_COMPONENT_LEN, HANDOFF_LEN, HandoffContext,
+    LoaderIdentity, LoaderMeasurement, MeasuredIdentity, PolicyGeneration, RootVerifier, TABLE_LEN,
+    TrustedPolicy, verify_policy_handoff, verify_table,
 };
 
 // Keep this loader-local framing constant in sync with the canonical
@@ -54,14 +54,15 @@ const BOOT_CONTEXT_DOMAIN: &[u8] = b"astrid.boot.q35.uefi.tcg.v1";
 ///
 /// `kernel_elf` is the original `Kernel.elf.input` byte slice, not a
 /// relocated image. `bundle` must be exactly
-/// `[ASTRIDPH][ASTRIDDC][ASTRIDSG]`. The resulting receipt contains evidence
-/// only; it is not sufficient authority for ring 0 without the second
-/// verification there.
+/// `[ASTRIDPH][ASTRIDDC][ASTRIDSG][component]`. The resulting receipt
+/// contains evidence only; it is not sufficient authority for ring 0 without
+/// the second verification there.
 pub fn verify_before_mapping(
     kernel_elf: &[u8],
     bundle: &[u8],
 ) -> Result<LoaderHandoffVerification, &'static str> {
-    if bundle.len() != HANDOFF_LEN + TABLE_LEN + MANIFEST_LEN {
+    let manifest_end = HANDOFF_LEN + TABLE_LEN + MANIFEST_LEN;
+    if bundle.len() != manifest_end + EMULATOR_COMPONENT_LEN {
         return Err("handoff_length");
     }
     if kernel_elf.is_empty() {
@@ -71,7 +72,7 @@ pub fn verify_before_mapping(
     let kernel_image = MeasuredIdentity::from_payload(kernel_elf);
     let table_end = HANDOFF_LEN + TABLE_LEN;
     let closure_table = MeasuredIdentity::from_payload(&bundle[HANDOFF_LEN..table_end]);
-    let sysgen_payload = &bundle[table_end..];
+    let sysgen_payload = &bundle[table_end..manifest_end];
     let expected = expected_context(kernel_image, closure_table);
     let root = RootVerifier::try_new(
         EMULATOR_ROOT_VERIFY_KEY,
@@ -147,13 +148,17 @@ mod tests {
             Err("handoff_length")
         );
 
-        let truncated = vec![0u8; HANDOFF_LEN + TABLE_LEN + super::MANIFEST_LEN - 1];
+        let truncated = vec![0u8; HANDOFF_LEN + TABLE_LEN + super::MANIFEST_LEN
+            + astrid_native_closure::EMULATOR_COMPONENT_LEN
+            - 1];
         assert_eq!(
             verify_before_mapping(b"kernel", &truncated),
             Err("handoff_length")
         );
 
-        let extended = vec![0u8; HANDOFF_LEN + TABLE_LEN + super::MANIFEST_LEN + 1];
+        let extended = vec![0u8; HANDOFF_LEN + TABLE_LEN + super::MANIFEST_LEN
+            + astrid_native_closure::EMULATOR_COMPONENT_LEN
+            + 1];
         assert_eq!(
             verify_before_mapping(b"kernel", &extended),
             Err("handoff_length")
@@ -162,7 +167,8 @@ mod tests {
 
     #[test]
     fn exact_length_reaches_content_validation() {
-        let exact = vec![0u8; HANDOFF_LEN + TABLE_LEN + super::MANIFEST_LEN];
+        let exact = vec![0u8; HANDOFF_LEN + TABLE_LEN + super::MANIFEST_LEN
+            + astrid_native_closure::EMULATOR_COMPONENT_LEN];
         assert_eq!(
             verify_before_mapping(&[], &exact),
             Err("kernel_empty"),

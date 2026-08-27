@@ -27,10 +27,6 @@ pub const EMULATOR_NOW_UNIX_SECONDS: u64 = 0;
 #[cfg(feature = "emulator-fixture")]
 pub const EMULATOR_MANIFEST_SIZES: crate::ManifestSizes = crate::ManifestSizes::new(1, 2, 3, 4);
 
-/// The emulator descriptor carries no component/service entries.
-#[cfg(feature = "emulator-fixture")]
-pub const EMULATOR_COMPONENTS: crate::ComponentSet = crate::ComponentSet::empty();
-
 #[cfg(any(test, feature = "sign"))]
 use ed25519_dalek::SigningKey;
 

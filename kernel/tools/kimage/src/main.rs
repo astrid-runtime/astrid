@@ -21,9 +21,10 @@ use astrid_native_closure::{
     sign_policy_handoff, signed_table,
 };
 use astrid_system_generation::emulator_fixture::{
-    EMULATOR_CLOSURE_ROOT, EMULATOR_COMPONENTS, EMULATOR_GENERATION_FLOOR, EMULATOR_MANIFEST_SIZES,
-    EMULATOR_OBJECT_ROOT, EMULATOR_PLAN_DIGEST,
+    EMULATOR_CLOSURE_ROOT, EMULATOR_COMPONENT_LEN, EMULATOR_GENERATION_FLOOR,
+    EMULATOR_MANIFEST_SIZES, EMULATOR_OBJECT_ROOT, EMULATOR_PLAN_DIGEST,
 };
+use astrid_system_generation::emulator_fixture::{emulator_component, emulator_components};
 use astrid_system_generation::{
     ContentId, Expiration, Generation, MANIFEST_LEN, ManifestInput, Revocation, RollbackFloor,
     SystemGenerationManifest, signed_bytes,
@@ -95,7 +96,7 @@ fn main() -> Result<()> {
         kernel_identity,
         plan_digest: ContentId::try_from_bytes(plan_digest)
             .map_err(|err| anyhow::anyhow!("plan fixture is invalid: {}", err.as_reason()))?,
-        components: EMULATOR_COMPONENTS,
+        components: emulator_components(),
         object_root: ContentId::try_from_bytes(EMULATOR_OBJECT_ROOT)
             .map_err(|err| anyhow::anyhow!("object fixture is invalid: {}", err.as_reason()))?,
         closure_root: ContentId::try_from_bytes(EMULATOR_CLOSURE_ROOT)
@@ -127,10 +128,13 @@ fn main() -> Result<()> {
         expected_context(kernel_image, closure_table),
     );
     let handoff = sign_policy_handoff(&root_key, &policy);
-    let mut ramdisk = [0u8; HANDOFF_LEN + TABLE_LEN + MANIFEST_LEN];
+    let component = emulator_component();
+    let mut ramdisk = [0u8; HANDOFF_LEN + TABLE_LEN + MANIFEST_LEN + EMULATOR_COMPONENT_LEN];
     ramdisk[..HANDOFF_LEN].copy_from_slice(&handoff);
     ramdisk[HANDOFF_LEN..HANDOFF_LEN + TABLE_LEN].copy_from_slice(&closures);
-    ramdisk[HANDOFF_LEN + TABLE_LEN..].copy_from_slice(&descriptor);
+    ramdisk[HANDOFF_LEN + TABLE_LEN..HANDOFF_LEN + TABLE_LEN + MANIFEST_LEN]
+        .copy_from_slice(&descriptor);
+    ramdisk[HANDOFF_LEN + TABLE_LEN + MANIFEST_LEN..].copy_from_slice(&component);
     if tamper_sysgen {
         // Test-only image mode: corrupt the signed descriptor after packing so
         // the loader must reject the table/descriptor identity binding.

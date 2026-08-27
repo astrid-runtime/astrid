@@ -1,5 +1,5 @@
-//! GDT + TSS. The double-fault handler runs on a dedicated IST stack.
-//! M1 stays in ring 0; user descriptors are a later child.
+//! GDT + TSS. The double-fault handler runs on a dedicated IST stack; the
+//! privilege-stack entry is armed only while a native domain is running.
 
 use spin::Once;
 use x86_64::VirtAddr;
@@ -20,6 +20,8 @@ static GDT: Once<(GlobalDescriptorTable, Selectors)> = Once::new();
 struct Selectors {
     kernel_code: SegmentSelector,
     kernel_data: SegmentSelector,
+    user_code: SegmentSelector,
+    user_data: SegmentSelector,
     tss: SegmentSelector,
 }
 
@@ -39,12 +41,16 @@ pub fn init() {
         let mut gdt = GlobalDescriptorTable::new();
         let kernel_code = gdt.append(Descriptor::kernel_code_segment());
         let kernel_data = gdt.append(Descriptor::kernel_data_segment());
+        let user_code = gdt.append(Descriptor::user_code_segment());
+        let user_data = gdt.append(Descriptor::user_data_segment());
         let tss = gdt.append(Descriptor::tss_segment(tss_ref));
         (
             gdt,
             Selectors {
                 kernel_code,
                 kernel_data,
+                user_code,
+                user_data,
                 tss,
             },
         )
@@ -58,4 +64,22 @@ pub fn init() {
         ES::set_reg(selectors.kernel_data);
         load_tss(selectors.tss);
     }
+}
+
+/// Arm the guarded kernel transition stack for one lower-privilege execution.
+pub fn set_privilege_stack(end: VirtAddr) {
+    // SAFETY: TSS is exclusively owned by boot and the single-domain manager.
+    unsafe {
+        (*core::ptr::addr_of_mut!(TSS)).privilege_stack_table[0] = end;
+    }
+}
+
+pub fn user_selectors() -> (SegmentSelector, SegmentSelector) {
+    let (_, selectors) = GDT.get().expect("GDT not initialized");
+    (selectors.user_code, selectors.user_data)
+}
+
+pub fn kernel_selectors() -> (SegmentSelector, SegmentSelector) {
+    let (_, selectors) = GDT.get().expect("GDT not initialized");
+    (selectors.kernel_code, selectors.kernel_data)
 }

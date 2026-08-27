@@ -83,6 +83,11 @@ pub fn mask_timer() {
     );
 }
 
+pub fn unmask_timer() {
+    write_reg(REG_LVT_TIMER, u32::from(TIMER_VECTOR) | LVT_PERIODIC);
+    write_reg(REG_TIMER_INITIAL, 0x0010_0000);
+}
+
 pub fn eoi() {
     write_reg(REG_EOI, 0);
 }

@@ -13,11 +13,12 @@ use std::thread;
 
 use anyhow::{Context, Result, bail};
 use astrid_native_closure::{
-    BootContextBinding, CURRENT_FLOOR, HANDOFF_LEN, HandoffContext, LoaderIdentity,
-    LoaderMeasurement, MeasuredIdentity, PolicyGeneration, RootVerifier, TABLE_LEN, TrustedPolicy,
-    verify_policy_handoff, verify_table,
+    BootContextBinding, CURRENT_FLOOR, EMULATOR_COMPONENT_LEN, HANDOFF_LEN, HandoffContext,
+    LoaderIdentity, LoaderMeasurement, MeasuredIdentity, PolicyGeneration, RootVerifier, TABLE_LEN,
+    TrustedPolicy, verify_policy_handoff, verify_table,
 };
 use astrid_system_generation::MANIFEST_LEN;
+use astrid_system_generation::emulator_fixture::emulator_component;
 use bootloader_api::info::LoaderHandoffVerification;
 use ktest::determinism::{Determinism, compare_images};
 use ktest::events::{
@@ -119,9 +120,12 @@ fn main() -> Result<()> {
         )?;
         let mismatched_plan_events = parse_events(&mismatched_plan_run.serial);
         println!(
-            "\n== ring-0 plan-mismatch QEMU serial (exit {:?}) ==\n{}",
-            mismatched_plan_run.exit_code, mismatched_plan_run.serial
+            "\n== ring-0 plan-mismatch QEMU events (exit {:?}) ==",
+            mismatched_plan_run.exit_code
         );
+        for event in &mismatched_plan_events {
+            println!("  {event}");
+        }
         if !assert_ring0_plan_mismatch(&mismatched_plan_events, mismatched_plan_run.exit_code) {
             bail!(
                 "ring-0 plan-mismatch rejection assertions failed (timed_out={}, serial={:?})",
@@ -203,7 +207,8 @@ fn loader_identities(
         bail!("policy handoff ramdisks differ across kimage invocations");
     }
     let table_end = HANDOFF_LEN + TABLE_LEN;
-    let bundle_len = table_end + MANIFEST_LEN;
+    let manifest_end = table_end + MANIFEST_LEN;
+    let bundle_len = manifest_end + EMULATOR_COMPONENT_LEN;
     if bytes_a.len() != bundle_len {
         bail!(
             "policy handoff ramdisk length is {}, expected {}",
@@ -215,7 +220,8 @@ fn loader_identities(
         .with_context(|| format!("reading kernel ELF {}", kernel_elf.display()))?;
     let kernel_id = MeasuredIdentity::from_payload(&elf);
     let table_bytes = &bytes_a[HANDOFF_LEN..table_end];
-    let descriptor_bytes = &bytes_a[table_end..];
+    let descriptor_bytes = &bytes_a[table_end..manifest_end];
+    let component_bytes = &bytes_a[manifest_end..];
     let closure_table = MeasuredIdentity::from_payload(table_bytes);
     let expected = expected_context(kernel_id, closure_table);
     let root = RootVerifier::try_new(
@@ -248,6 +254,9 @@ fn loader_identities(
     }
     if !bound.distinct() {
         bail!("loader identities are not distinct");
+    }
+    if component_bytes != emulator_component() {
+        bail!("authenticated component bytes do not match the canonical fixture");
     }
     let receipt = loader_receipt(&bytes_a, &handoff, kernel_id, closure_table);
     pre_relocation_hostile_checks(&bytes_a, &elf, &expected, &policy)?;

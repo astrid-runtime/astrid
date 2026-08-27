@@ -6,7 +6,9 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use crate::{apic, serial};
+use crate::{apic, domains, serial};
+
+use x86_64::registers::control::Cr2;
 
 /// Set by a self-test immediately before it provokes an expected page fault.
 pub static EXPECT_FAULT: AtomicBool = AtomicBool::new(false);
@@ -57,6 +59,14 @@ unsafe extern "C" fn rust_trap_handler(frame: *mut TrapFrame) {
     // that lives on the current stack for the duration of this call.
     let f = unsafe { &mut *frame };
     let vector = f.vector as u8;
+    let fault_address = if vector == VECTOR_PAGE_FAULT {
+        Cr2::read_raw()
+    } else {
+        0
+    };
+    if domains::handle_domain_trap(f, fault_address) {
+        return;
+    }
     match vector {
         VECTOR_TIMER => handle_timer(),
         VECTOR_SPURIOUS => {},

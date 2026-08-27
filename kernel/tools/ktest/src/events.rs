@@ -43,6 +43,16 @@ const REQUIRED_PASSES: &[&str] = &[
     "frame_exhaustion",
 ];
 
+const DOMAIN_REQUIRED_PASSES: &[&str] = &[
+    "authenticated_nonempty_component_binds_payload",
+    "ring3_entry_return",
+    "per_domain_page_table_exclusion",
+    "quota_preempts_infinite_loop_and_preserves_peer",
+    "fault_is_domain_scoped",
+    "reclaim_exactly_once_under_fault_kill_cancel",
+    "hostile_first_then_clean_second_domain",
+];
+
 const SUCCESS_BOUND_EVENTS: &[&str] = &[
     "handoff.bound",
     "closure.kernel",
@@ -329,7 +339,7 @@ fn wx_holds(events: &[Value]) -> bool {
 
 fn self_tests_hold(events: &[Value]) -> bool {
     let mut ok = true;
-    for name in REQUIRED_PASSES {
+    for name in REQUIRED_PASSES.iter().chain(DOMAIN_REQUIRED_PASSES) {
         let n = test_pass_count(events, name);
         ok &= check(&format!("exactly one test.pass {name} (got {n})"), n == 1);
     }
@@ -412,6 +422,9 @@ mod tests {
         for name in REQUIRED_PASSES {
             ev(format!("\"ev\":\"test.pass\",\"name\":\"{name}\""));
         }
+        for name in DOMAIN_REQUIRED_PASSES {
+            ev(format!("\"ev\":\"test.pass\",\"name\":\"{name}\""));
+        }
         ev("\"ev\":\"halt\",\"outcome\":\"ok\"".into());
         out
     }
@@ -490,6 +503,22 @@ mod tests {
         );
         assert!(serial.contains("future_gate"));
         assert!(!assert_ok(&serial));
+    }
+
+    #[test]
+    fn missing_or_duplicate_domain_gate_fails() {
+        let missing = passing_serial().replacen(
+            "\"ev\":\"test.pass\",\"name\":\"fault_is_domain_scoped\"}\n",
+            "",
+            1,
+        );
+        assert!(!assert_ok(&missing), "missing domain gate must fail");
+
+        let duplicate = passing_serial().replace(
+            "\"ev\":\"halt\",\"outcome\":\"ok\"",
+            "\"ev\":\"test.pass\",\"name\":\"fault_is_domain_scoped\"}\n{\"seq\":99,\"ev\":\"halt\",\"outcome\":\"ok\"",
+        );
+        assert!(!assert_ok(&duplicate), "duplicate domain gate must fail");
     }
 
     #[test]

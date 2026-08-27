@@ -36,8 +36,8 @@ pub use region::{PAGE_SIZE, ReadableRange, prove_pages_readable, ranges_overlap}
 pub use root::RootVerifier;
 pub use types::{
     BootContextBinding, BoundIdentities, CURRENT_FLOOR, ClosureArtifact, ClosureKind,
-    DualClosureKeys, DualClosureTable, EMPTY_SYSGEN, GenerationFloor, LoaderIdentity,
-    LoaderMeasurement, MeasuredIdentity, PolicyGeneration, TABLE_LEN,
+    DualClosureKeys, DualClosureTable, EMPTY_SYSGEN, EMULATOR_COMPONENT_LEN, GenerationFloor,
+    LoaderIdentity, LoaderMeasurement, MeasuredIdentity, PolicyGeneration, TABLE_LEN,
 };
 pub use verify::{verify_policy_handoff, verify_table};
 

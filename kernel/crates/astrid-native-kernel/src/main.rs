@@ -20,6 +20,7 @@
 
 mod apic;
 mod closure;
+mod domains;
 mod entropy;
 mod gdt;
 mod interrupts;
@@ -91,6 +92,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // copied into kernel-owned memory, identity-bound, and admitted by
             // the canonical manifest verifier.
             emit_bound(&accepted);
+            if !closure::bind_component(accepted.component()) {
+                serial::ev_closure_reject(
+                    astrid_native_closure::ClosureError::BindingMismatch.as_reason(),
+                );
+                serial::ev_halt(false);
+                serial::exit_qemu(false);
+            }
         },
         Err(err) => {
             serial::ev_closure_reject(err.as_reason());
@@ -123,6 +131,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     let wx_ok = !rodata_nx_w && !text_w && !data_exec;
     let tests_ok = tests::run_all(data_exec);
+    if wx_ok && tests_ok {
+        memory::reserve_live_page_tables();
+        let component = closure::authenticated_component();
+        let component_id = closure::authenticated_component_id();
+        domains::start_harness(&component, component_id);
+    }
     serial::ev_halt(wx_ok && tests_ok);
     serial::exit_qemu(wx_ok && tests_ok);
 }
