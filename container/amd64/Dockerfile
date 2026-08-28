@@ -38,17 +38,32 @@ RUN set -eu; \
     test "${#ASTRID_RELEASE_MANIFEST_SHA256}" -eq 64; \
     echo "$ASTRID_ARCHIVE_SHA256  /tmp/astrid-release.tar.gz" | sha256sum --check --strict -; \
     echo "$ASTRID_RELEASE_RECEIPT_SHA256  /opt/astrid/release-receipt.json" | sha256sum --check --strict -; \
-    grep -Fqx "  \"repository\": \"astrid-runtime/astrid\"," /opt/astrid/release-receipt.json; \
-    grep -Fqx "  \"version\": \"$ASTRID_VERSION\"," /opt/astrid/release-receipt.json; \
-    grep -Fqx "  \"tag\": \"v$ASTRID_VERSION\"," /opt/astrid/release-receipt.json; \
-    grep -Fqx "  \"source-commit\": \"$ASTRID_SOURCE_COMMIT\"," /opt/astrid/release-receipt.json; \
-    grep -Fqx '  \"target\": \"x86_64-unknown-linux-gnu\",' /opt/astrid/release-receipt.json; \
-    grep -Fqx "  \"archive\": \"astrid-$ASTRID_VERSION-x86_64-unknown-linux-gnu.tar.gz\"," /opt/astrid/release-receipt.json; \
-    grep -Fqx "  \"archive-sha256\": \"$ASTRID_ARCHIVE_SHA256\"," /opt/astrid/release-receipt.json; \
-    grep -Fqx "  \"archive-blake3\": \"$ASTRID_ARCHIVE_BLAKE3\"," /opt/astrid/release-receipt.json; \
-    grep -Fqx "  \"release-manifest\": \"astrid-$ASTRID_VERSION-release.toml\"," /opt/astrid/release-receipt.json; \
-    grep -Fqx "  \"release-manifest-sha256\": \"$ASTRID_RELEASE_MANIFEST_SHA256\"," /opt/astrid/release-receipt.json; \
-    grep -Fqx "  \"release-workflow-identity\": \"https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v$ASTRID_VERSION\"," /opt/astrid/release-receipt.json; \
+    bind_receipt_field() { \
+      actual=$(sed -nE "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"([^\"]*)\",?$/\1/p" "$1"); \
+      [ "$actual" = "$3" ]; \
+    }; \
+    bind_receipt_field /opt/astrid/release-receipt.json \
+      "repository" "astrid-runtime/astrid"; \
+    bind_receipt_field /opt/astrid/release-receipt.json \
+      "version" "$ASTRID_VERSION"; \
+    bind_receipt_field /opt/astrid/release-receipt.json \
+      "tag" "v$ASTRID_VERSION"; \
+    bind_receipt_field /opt/astrid/release-receipt.json \
+      "source-commit" "$ASTRID_SOURCE_COMMIT"; \
+    bind_receipt_field /opt/astrid/release-receipt.json \
+      "target" "x86_64-unknown-linux-gnu"; \
+    bind_receipt_field /opt/astrid/release-receipt.json \
+      "archive" "astrid-$ASTRID_VERSION-x86_64-unknown-linux-gnu.tar.gz"; \
+    bind_receipt_field /opt/astrid/release-receipt.json \
+      "archive-sha256" "$ASTRID_ARCHIVE_SHA256"; \
+    bind_receipt_field /opt/astrid/release-receipt.json \
+      "archive-blake3" "$ASTRID_ARCHIVE_BLAKE3"; \
+    bind_receipt_field /opt/astrid/release-receipt.json \
+      "release-manifest" "astrid-$ASTRID_VERSION-release.toml"; \
+    bind_receipt_field /opt/astrid/release-receipt.json \
+      "release-manifest-sha256" "$ASTRID_RELEASE_MANIFEST_SHA256"; \
+    bind_receipt_field /opt/astrid/release-receipt.json \
+      "release-workflow-identity" "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v$ASTRID_VERSION"; \
     mkdir -p /opt/astrid/release /var/lib/astrid /workspace /run/astrid; \
     tar -xzf /tmp/astrid-release.tar.gz \
       --strip-components=1 \
