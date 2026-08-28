@@ -275,6 +275,7 @@ where
         built: Option<&BuiltContent>,
         catalog_records: BTreeMap<ObjectId, ObjectRecord>,
     ) -> Result<RootTransaction<P>, PrincipalContentError> {
+        self.engine.admit_principal(&principal)?;
         let mut records: BTreeMap<ObjectId, ObjectRecord> = built
             .map(|built| built.records().iter().cloned().collect())
             .unwrap_or_default();

@@ -272,6 +272,7 @@ where
         transaction: RootTransaction<P>,
         observer: Option<Arc<dyn ProjectionObserver>>,
     ) -> Result<CommitOutcome, DurableError> {
+        self.admit_principal(transaction.principal())?;
         let receipt = Arc::new(CommitReceipt::default());
         let mut lead = {
             let mut group = self.commit_group.lock();

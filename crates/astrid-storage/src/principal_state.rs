@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::engine::{
-    DurableEngine, DurableEnginePolicy, GroupCommitPolicy, IdentityScheme, ObjectCacheConfig,
-    ObjectCacheStats, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
+    DurableEngine, DurableEnginePolicy, DurableError, GroupCommitPolicy, IdentityScheme,
+    ObjectCacheConfig, ObjectCacheStats, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
     RecoveryRetryPolicy, RejectedRootCandidate,
 };
 use crate::storage_model::{
@@ -269,6 +269,13 @@ impl PrincipalCodec<StateOwner> for StateOwnerCodecV2 {
                 Some(StateOwner::Fleet(uid))
             },
             _ => None,
+        }
+    }
+
+    fn admit_principal(&self, owner: &StateOwner) -> Result<(), DurableError> {
+        match owner {
+            StateOwner::User(_) => Err(DurableError::UnsupportedPrincipal),
+            StateOwner::System | StateOwner::Principal(_) | StateOwner::Fleet(_) => Ok(()),
         }
     }
 }

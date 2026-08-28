@@ -4,7 +4,7 @@ use std::num::NonZeroU64;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::engine::{ObjectCacheCapacity, ObjectCacheController, RootTransaction};
+use crate::engine::{DurableError, ObjectCacheCapacity, ObjectCacheController, RootTransaction};
 use crate::resources::ResidentMemoryAuthority;
 use crate::storage_model::{
     ObjectClass, ObjectFormatVersion, ObjectKind, ObjectReference, PhysicalIdentity, ProfileKind,
@@ -298,6 +298,7 @@ async fn user_owner_writes_and_staging_reject_before_durable_mutation() {
     let user = astrid_core::UserUid::from_bytes([11; 32]);
     let owner = StateOwner::User(user);
     let name = ContentName::new("workspace/user.bin").unwrap();
+    let home_tree_before = filesystem_snapshot(directory.path());
 
     assert!(store.engine.root(&owner).unwrap().is_none());
     let content_error = store
@@ -326,6 +327,62 @@ async fn user_owner_writes_and_staging_reject_before_durable_mutation() {
     assert!(reopened.engine.root(&owner).unwrap().is_none());
     assert_eq!(reopened.content().read(&owner, &name).unwrap(), None);
     assert!(reopened.staging().ready().unwrap().is_empty());
+    assert_eq!(
+        filesystem_snapshot(directory.path()),
+        home_tree_before,
+        "rejected user operations changed durable home bytes"
+    );
+}
+
+#[test]
+fn direct_engine_user_commit_rejects_without_durable_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = StateOwner::User(astrid_core::UserUid::from_bytes([11; 32]));
+    let engine = RuntimeEngine::open(
+        directory.path(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    let roots_path = directory.path().join("roots.journal");
+    let roots_before = std::fs::read(&roots_path).unwrap();
+    let tree_before = filesystem_snapshot(directory.path());
+
+    let commit = ObjectRecord::new(
+        ObjectKind::Commit,
+        ObjectFormatVersion::new(3).unwrap(),
+        Vec::new(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let commit_id = Blake3ObjectIdentityV1.identify(&commit);
+    let error = engine
+        .commit(RootTransaction::new(owner, None, commit_id, Vec::new()))
+        .unwrap_err();
+    assert!(matches!(error, DurableError::UnsupportedPrincipal));
+    assert_eq!(std::fs::read(&roots_path).unwrap(), roots_before);
+    assert_eq!(filesystem_snapshot(directory.path()), tree_before);
+    assert_eq!(engine.root(&owner).unwrap(), None);
+
+    engine.close().unwrap();
+    drop(engine);
+    let reopened = RuntimeEngine::open(
+        directory.path(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    assert_eq!(reopened.root(&owner).unwrap(), None);
+    assert_eq!(
+        std::fs::read(&roots_path).unwrap(),
+        roots_before,
+        "reopening changed the roots journal"
+    );
+    reopened.close().unwrap();
 }
 
 #[test]
