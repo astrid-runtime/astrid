@@ -251,6 +251,19 @@ run_as_principal_cli() {
     /usr/local/bin/astrid "$@"
 }
 
+assert_v0104_audit_is_non_gating() {
+  local output=$1
+  local error=$2
+  if run_real_cli audit status \
+    >"$output" 2>"$error"; then
+    fail "v0.10.4 unexpectedly exposed an audit query"
+  fi
+  grep -q "audit trail inspection is not available" "$error" ||
+    fail "unexpected v0.10.4 audit surface; re-evaluate the exact-release proof"
+  printf '%s\n' \
+    "BLOCKED AUDIT (non-gating): v0.10.4 baseline blocker; audit is deferred and exposes no supported chain/head or principal-scoped query."
+}
+
 ARCH=$(docker image inspect "$IMAGE" --format '{{.Architecture}}')
 USER=$(docker image inspect "$IMAGE" --format '{{.Config.User}}')
 ENTRYPOINT=$(docker image inspect "$IMAGE" --format '{{json .Config.Entrypoint}}')
@@ -653,13 +666,7 @@ grep -q "STAGED_DISTRO_SURVIVED_SOURCE_SWAP" "$TEST_ROOT/swap.out" ||
 # The exact v0.10.4 audit command is a registered stub. Record that fact as a
 # non-gating blocker instead of pretending that a global count, absent query,
 # or green test exit proves audit continuity.
-if run_real_cli audit status \
-  >"$TEST_ROOT/audit-probe.out" 2>"$TEST_ROOT/audit-probe.err"; then
-  fail "v0.10.4 unexpectedly exposed an audit query"
-fi
-grep -q "audit trail inspection is not available" "$TEST_ROOT/audit-probe.err" ||
-  fail "unexpected v0.10.4 audit surface; re-evaluate the exact-release proof"
-printf '%s\n' \
-  "BLOCKED AUDIT (non-gating): v0.10.4 baseline blocker; audit is deferred and exposes no supported chain/head or principal-scoped query."
+assert_v0104_audit_is_non_gating \
+  "$TEST_ROOT/audit-probe.out" "$TEST_ROOT/audit-probe.err"
 echo "oci $OCI_TEST_LABEL structure, authentication, principal authority, and fresh-container reopen checks passed"
 echo "Audit continuity remains unproven on v0.10.4; this result does not claim hosted-profile qualification."
