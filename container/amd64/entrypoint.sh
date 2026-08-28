@@ -6,6 +6,16 @@ fail() {
     exit 1
 }
 
+# These inherited variables disable security gates in the pinned release.
+# Rejecting them here keeps the fail-closed hosted profile independent of the
+# caller's shell, CI matrix, or orchestrator environment.
+if [ "${ASTRID_SANDBOX_POLICY+set}" = set ]; then
+    fail "inherited ASTRID_SANDBOX_POLICY override is not permitted"
+fi
+if [ "${ASTRID_ALLOW_LOCAL_IPS+set}" = set ]; then
+    fail "inherited ASTRID_ALLOW_LOCAL_IPS override is not permitted"
+fi
+
 # The image owns daemon lifecycle. Callers may tune bounded runtime ceilings
 # and verbosity, but may not replace the workspace/session identity, request
 # ephemeral shutdown, or pass newly-added daemon flags without an explicit

@@ -12,6 +12,7 @@ TEST_BASE_IMAGE="astrid-oci-bound-base:${RANDOM}-${RANDOM}"
 TEST_IMAGE="astrid-oci-entrypoint-test:${RANDOM}-${RANDOM}"
 TEST_SWAP_IMAGE="astrid-oci-swap-test:${RANDOM}-${RANDOM}"
 REAL_CONTAINER=
+FIRST_REAL_CONTAINER=
 
 cleanup() {
   if [[ -n "$REAL_CONTAINER" ]]; then
@@ -88,6 +89,12 @@ start_real_runtime() {
 
 }
 
+stop_real_runtime() {
+  docker stop --time 10 "$REAL_CONTAINER" >/dev/null
+  docker rm "$REAL_CONTAINER" >/dev/null
+  REAL_CONTAINER=
+}
+
 wait_real_runtime() {
   local label=${1:-real}
   local release_ready=false
@@ -113,25 +120,48 @@ wait_real_runtime() {
     fail "authenticated release daemon did not answer status ($label)"
 }
 
+assert_daemon_is_pid_one() {
+  local identity
+  identity=$(docker exec "$REAL_CONTAINER" /bin/sh -ec '
+    [ "$(cat /proc/1/comm)" = astrid-daemon ] ||
+      { printf "comm=%s\n" "$(cat /proc/1/comm)" >&2; exit 1; }
+    exe=$(readlink /proc/1/exe)
+    [ "$(basename "$exe")" = astrid-daemon ] ||
+      { printf "exe=%s\n" "$exe" >&2; exit 1; }
+    uid=$(sed -n "s/^Uid:[[:space:]]*//p" /proc/1/status | cut -d" " -f1)
+    gid=$(sed -n "s/^Gid:[[:space:]]*//p" /proc/1/status | cut -d" " -f1)
+    [ "$uid" = 65532 ] && [ "$gid" = 65532 ] ||
+      { printf "uid=%s gid=%s\n" "$uid" "$gid" >&2; exit 1; }
+    [ "$(readlink /proc/1/cwd)" = /workspace ] ||
+      { printf "cwd=%s\n" "$(readlink /proc/1/cwd)" >&2; exit 1; }
+    printf "PID1 astrid-daemon 65532:65532 /workspace\n"
+    ') || fail "daemon identity probe failed"
+  [[ "$identity" == "PID1 astrid-daemon 65532:65532 /workspace" ]] ||
+    fail "real daemon is not PID 1 as uid/gid 65532 in /workspace: $identity"
+}
+
 run_real_cli() {
   docker exec "$REAL_CONTAINER" /usr/local/bin/astrid "$@"
 }
 
-assert_real_json_has_principals() {
+assert_real_self_list() {
   local path=$1
-  "$PYTHON" - "$path" <<'PY'
+  local principal=$2
+  "$PYTHON" - "$path" "$principal" <<'PY'
 import json
 import sys
 
 path = sys.argv[1]
+principal = sys.argv[2]
 with open(path, encoding="utf-8") as handle:
     items = json.load(handle)
 if not isinstance(items, list):
     raise SystemExit("agent list response is not an array")
-names = {item.get("principal") for item in items if isinstance(item, dict)}
-for expected in ("hosted-alpha", "hosted-beta"):
-    if expected not in names:
-        raise SystemExit(f"restart lost principal {expected!r}: {sorted(names)!r}")
+names = [item.get("principal") for item in items if isinstance(item, dict)]
+if names != [principal]:
+    raise SystemExit(
+        f"agent list did not return exactly {principal!r}: {names!r}"
+    )
 PY
 }
 
@@ -153,6 +183,58 @@ if "restricted" not in alpha.get("groups", []):
 if "restricted" in beta.get("groups", []):
     raise SystemExit("hosted-beta inherited hosted-alpha's capability group")
 PY
+}
+
+read_runtime_state_file() {
+  local relative=$1
+  docker run --rm \
+    --platform "$OCI_PLATFORM" \
+    --user 0:0 \
+    --entrypoint /bin/sh \
+    --mount "type=bind,src=$run_dir/real-state,dst=/runtime,readonly" \
+    "$IMAGE" \
+    -ec 'cat "$1"' \
+    sh "$relative"
+}
+
+assert_runtime_state_file_mode() {
+  local relative=$1
+  local mode
+  mode=$(docker run --rm \
+    --platform "$OCI_PLATFORM" \
+    --user 0:0 \
+    --entrypoint /bin/sh \
+    --mount "type=bind,src=$run_dir/real-state,dst=/runtime,readonly" \
+    "$IMAGE" \
+    -ec 'stat -c "%a %u %g" "$1"' \
+    sh "$relative")
+  [[ "$mode" == "600 65532 65532" ]] ||
+    fail "owner state $relative has unsafe custody metadata: $mode"
+}
+
+assert_runtime_state_values() {
+  local alpha=$1
+  local beta=$2
+  "$PYTHON" - "$alpha" "$beta" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    alpha = json.load(handle)
+with open(sys.argv[2], encoding="utf-8") as handle:
+    beta = json.load(handle)
+if alpha.get("OCI_OWNER_STATE") != "alpha-owner-state":
+    raise SystemExit("hosted-alpha owner state changed or crossed")
+if beta.get("OCI_OWNER_STATE") != "beta-owner-state":
+    raise SystemExit("hosted-beta owner state changed or crossed")
+PY
+}
+
+run_as_principal_cli() {
+  local principal=$1
+  shift
+  docker exec --env "ASTRID_PRINCIPAL=$principal" "$REAL_CONTAINER" \
+    /usr/local/bin/astrid "$@"
 }
 
 ARCH=$(docker image inspect "$IMAGE" --format '{{.Architecture}}')
@@ -189,10 +271,14 @@ prepare_runtime_dir "$run_dir/real-workspace" 0755
 distro_sha256=$(sha256sum "$TEST_ROOT/fixtures/distro.shuttle")
 distro_sha256=${distro_sha256%% *}
 
-# Exercise the authenticated release daemon itself. The readiness sentinel and
-# an authenticated CLI status round trip must both succeed while the daemon is
-# PID 1 under the deployment restrictions claimed by this image.
+# Exercise the authenticated release daemon itself. The readiness sentinel,
+# authenticated CLI status round trip, direct PID 1 identity, distinct owner
+# state, and same mounted workspace must survive a fresh container on the same
+# state/workspace mounts.
 start_real_runtime "$run_dir/real-state" "$run_dir/real-workspace"
+wait_real_runtime initial
+assert_daemon_is_pid_one
+FIRST_REAL_CONTAINER=$REAL_CONTAINER
 
 # Persist two independent owner records and a capability-group change through
 # the authenticated admin path.  This is deliberately done by the real
@@ -215,66 +301,90 @@ run_real_cli agent modify hosted-alpha --add-group restricted \
   cat "$TEST_ROOT/alpha-modify.err" >&2 || true
   fail "could not update hosted-alpha capability group"
 }
+run_real_cli agent create hosted-restricted --group restricted --yes \
+  >"$TEST_ROOT/restricted-create.out" 2>"$TEST_ROOT/restricted-create.err" || {
+  cat "$TEST_ROOT/restricted-create.out" >&2 || true
+  cat "$TEST_ROOT/restricted-create.err" >&2 || true
+  fail "could not create the restricted denial principal"
+}
 run_real_cli agent show hosted-alpha --format json >"$TEST_ROOT/alpha-before.json" \
   || fail "could not inspect hosted-alpha before restart"
 run_real_cli agent show hosted-beta --format json >"$TEST_ROOT/beta-before.json" \
   || fail "could not inspect hosted-beta before restart"
 assert_real_principal_isolation "$TEST_ROOT/alpha-before.json" "$TEST_ROOT/beta-before.json"
-run_real_cli agent list --format json >"$TEST_ROOT/agents-before.json" \
-  || fail "could not list hosted principals before restart"
-assert_real_json_has_principals "$TEST_ROOT/agents-before.json"
-run_real_cli audit stats --format json >"$TEST_ROOT/audit-before.json" \
-  || fail "could not read audit stats before restart"
+run_as_principal_cli hosted-alpha agent list --format json \
+  >"$TEST_ROOT/alpha-self-before.json" \
+  || fail "hosted-alpha could not read its own principal row"
+assert_real_self_list "$TEST_ROOT/alpha-self-before.json" hosted-alpha
+run_as_principal_cli hosted-beta agent list --format json \
+  >"$TEST_ROOT/beta-self-before.json" \
+  || fail "hosted-beta could not read its own principal row"
+assert_real_self_list "$TEST_ROOT/beta-self-before.json" hosted-beta
 
-# Restart/reopen the same owner state/workspace mounts. The image's init
-# path must not turn a restart into a fresh identity or silently reset audit
-# heads. Docker keeps the same container, PID 1, and bind mounts for this gate.
-docker restart --time 10 "$REAL_CONTAINER" >/dev/null
-wait_real_runtime restart
-run_real_cli agent list --format json >"$TEST_ROOT/agents-after.json" \
-  || fail "could not list hosted principals after restart"
-assert_real_json_has_principals "$TEST_ROOT/agents-after.json"
+run_real_cli secret set OCI_OWNER_STATE alpha-owner-state --agent hosted-alpha \
+  >"$TEST_ROOT/alpha-state-write.out" 2>"$TEST_ROOT/alpha-state-write.err" \
+  || fail "could not write hosted-alpha owner state"
+run_real_cli secret set OCI_OWNER_STATE beta-owner-state --agent hosted-beta \
+  >"$TEST_ROOT/beta-state-write.out" 2>"$TEST_ROOT/beta-state-write.err" \
+  || fail "could not write hosted-beta owner state"
+printf 'same-mounted-workspace\n' \
+  >"$run_dir/real-workspace/.astrid-oci-mounted-state"
+read_runtime_state_file home/hosted-alpha/.config/env/default.env.json \
+  >"$TEST_ROOT/alpha-state-before.json"
+read_runtime_state_file home/hosted-beta/.config/env/default.env.json \
+  >"$TEST_ROOT/beta-state-before.json"
+assert_runtime_state_file_mode home/hosted-alpha/.config/env/default.env.json
+assert_runtime_state_file_mode home/hosted-beta/.config/env/default.env.json
+assert_runtime_state_file_mode keys/runtime.key
+assert_runtime_state_values \
+  "$TEST_ROOT/alpha-state-before.json" "$TEST_ROOT/beta-state-before.json"
+
+# Stop and remove the first container before creating the successor. This is
+# a fresh process and container namespace opening the same durable mounts, not
+# Docker resuming or restarting the original PID 1.
+stop_real_runtime
+start_real_runtime "$run_dir/real-state" "$run_dir/real-workspace"
+[[ -n "$FIRST_REAL_CONTAINER" && "$REAL_CONTAINER" != "$FIRST_REAL_CONTAINER" ]] ||
+  fail "fresh-container reopen did not create a new container"
+wait_real_runtime reopen
+assert_daemon_is_pid_one
+[[ "$(cat "$run_dir/real-workspace/.astrid-oci-mounted-state")" == same-mounted-workspace ]] ||
+  fail "workspace mount state did not survive fresh-container reopen"
+read_runtime_state_file home/hosted-alpha/.config/env/default.env.json \
+  >"$TEST_ROOT/alpha-state-after.json"
+read_runtime_state_file home/hosted-beta/.config/env/default.env.json \
+  >"$TEST_ROOT/beta-state-after.json"
+assert_runtime_state_values \
+  "$TEST_ROOT/alpha-state-after.json" "$TEST_ROOT/beta-state-after.json"
 run_real_cli agent show hosted-alpha --format json >"$TEST_ROOT/alpha-after.json" \
   || fail "could not inspect hosted-alpha after restart"
 run_real_cli agent show hosted-beta --format json >"$TEST_ROOT/beta-after.json" \
   || fail "could not inspect hosted-beta after restart"
 assert_real_principal_isolation "$TEST_ROOT/alpha-after.json" "$TEST_ROOT/beta-after.json"
-run_real_cli audit stats --format json >"$TEST_ROOT/audit-after.json" \
-  || fail "could not read audit stats after restart"
-"$PYTHON" - "$TEST_ROOT/audit-before.json" "$TEST_ROOT/audit-after.json" <<'PY'
-import json
-import sys
+run_as_principal_cli hosted-alpha agent list --format json \
+  >"$TEST_ROOT/alpha-self-after.json" \
+  || fail "hosted-alpha lost self-scoped list after fresh-container reopen"
+assert_real_self_list "$TEST_ROOT/alpha-self-after.json" hosted-alpha
+run_as_principal_cli hosted-beta agent list --format json \
+  >"$TEST_ROOT/beta-self-after.json" \
+  || fail "hosted-beta lost self-scoped list after fresh-container reopen"
+assert_real_self_list "$TEST_ROOT/beta-self-after.json" hosted-beta
 
-before = json.load(open(sys.argv[1], encoding="utf-8"))
-after = json.load(open(sys.argv[2], encoding="utf-8"))
-before_stats = before.get("stats", {})
-after_stats = after.get("stats", {})
-before_count = before_stats.get("total_count")
-after_count = after_stats.get("total_count")
-if not isinstance(before_count, int) or not isinstance(after_count, int):
-    raise SystemExit("audit stats omitted total_count across restart")
-if after_count < before_count:
-    raise SystemExit(f"audit count regressed across restart: {before_count} -> {after_count}")
-if after_stats.get("degraded"):
-    raise SystemExit("audit became degraded after restart")
-PY
-
-# A principal's stamped client cannot use its Linux UID or an environment
-# label to gain operator authority.  The kernel must reject admin enumeration
-# for both owner principals even though they share the container UID.
-for principal in hosted-alpha hosted-beta; do
-  if docker exec "$REAL_CONTAINER" env ASTRID_PRINCIPAL="$principal" \
-    /usr/local/bin/astrid agent list >"$TEST_ROOT/$principal-list.out" \
-    2>"$TEST_ROOT/$principal-list.err"; then
-    fail "$principal unexpectedly gained operator agent-list authority"
-  fi
-  grep -Eqi "denied|permission|admin" "$TEST_ROOT/$principal-list.err" ||
-    fail "$principal denial did not identify an authority boundary"
-done
-
-docker stop --time 10 "$REAL_CONTAINER" >/dev/null
-docker rm "$REAL_CONTAINER" >/dev/null
-REAL_CONTAINER=
+# A genuine restricted principal has no implicit self:list capability, so it
+# must not inherit the agent-group self row. An agent principal also cannot
+# modify a peer despite sharing the container UID and state mount.
+if run_as_principal_cli hosted-restricted agent list \
+  >"$TEST_ROOT/restricted-list.out" 2>"$TEST_ROOT/restricted-list.err"; then
+  fail "restricted principal unexpectedly gained agent-list authority"
+fi
+grep -Eqi "denied|permission|capability" "$TEST_ROOT/restricted-list.err" ||
+  fail "restricted principal denial did not identify an authority boundary"
+if run_as_principal_cli hosted-alpha agent modify hosted-beta --add-group restricted \
+  >"$TEST_ROOT/alpha-cross-modify.out" 2>"$TEST_ROOT/alpha-cross-modify.err"; then
+  fail "hosted-alpha unexpectedly modified hosted-beta"
+fi
+grep -Eqi "denied|permission|capability" "$TEST_ROOT/alpha-cross-modify.err" ||
+  fail "cross-principal denial did not identify an authority boundary"
 
 # Reject lifecycle and identity overrides before any distro I/O.
 for forbidden in \
@@ -312,6 +422,21 @@ for override in \
   fi
   grep -q "fixed to" "$TEST_ROOT/$override_name.err" ||
     fail "authority-root override $override did not fail closed"
+done
+
+# Security-sensitive policy overrides are inherited inputs too. The hosted
+# profile denies both, even when the caller supplies an otherwise harmless
+# value, before any distro or runtime initialization can occur.
+for override in \
+  "ASTRID_SANDBOX_POLICY=off" \
+  "ASTRID_ALLOW_LOCAL_IPS=1"; do
+  override_name=${override%%=*}
+  if docker run --rm --platform "$OCI_PLATFORM" --env "$override" "$IMAGE" \
+    >"$TEST_ROOT/$override_name.out" 2>"$TEST_ROOT/$override_name.err"; then
+    fail "hosted profile accepted inherited policy override $override"
+  fi
+  grep -q "override is not permitted" "$TEST_ROOT/$override_name.err" ||
+    fail "inherited policy override $override did not fail closed"
 done
 
 cat > "$TEST_ROOT/fake-daemon" <<'EOF'
@@ -511,4 +636,13 @@ fi
 grep -q "STAGED_DISTRO_SURVIVED_SOURCE_SWAP" "$TEST_ROOT/swap.out" ||
   fail "source pathname swap test did not reach the daemon"
 
-echo "oci $OCI_TEST_LABEL structure, authentication, and restricted startup tests passed"
+# The exact v0.10.4 audit command is a registered stub. Its persistence is not
+# exposed through a supported query, so this profile must stop here rather than
+# passing a global count or inventing release behavior.
+if run_real_cli audit status \
+  >"$TEST_ROOT/audit-probe.out" 2>"$TEST_ROOT/audit-probe.err"; then
+  fail "v0.10.4 unexpectedly exposed an audit query"
+fi
+grep -q "audit trail inspection is not available" "$TEST_ROOT/audit-probe.err" ||
+  fail "unexpected v0.10.4 audit surface; re-evaluate the exact-release proof"
+fail "v0.10.4 baseline blocker: audit is deferred and exposes no supported chain/head or principal-scoped query; audit qualification requires a later exact immutable release"
