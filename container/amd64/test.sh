@@ -258,7 +258,8 @@ assert_v0104_audit_is_non_gating() {
     >"$output" 2>"$error"; then
     fail "v0.10.4 unexpectedly exposed an audit query"
   fi
-  grep -q "audit trail inspection is not available" "$error" ||
+  printf '%s\n' "audit trail inspection is not available" |
+    cmp -s - "$error" ||
     fail "unexpected v0.10.4 audit surface; re-evaluate the exact-release proof"
   printf '%s\n' \
     "BLOCKED AUDIT (non-gating): v0.10.4 baseline blocker; audit is deferred and exposes no supported chain/head or principal-scoped query."
