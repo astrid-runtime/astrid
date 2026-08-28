@@ -11,14 +11,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::engine::{
-    DurableEngine, DurableEnginePolicy, GroupCommitPolicy, IdentityScheme, ObjectCacheConfig,
-    ObjectCacheStats, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
+    DurableEngine, DurableEnginePolicy, DurableError, GroupCommitPolicy, IdentityScheme,
+    ObjectCacheConfig, ObjectCacheStats, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
     RecoveryRetryPolicy, RejectedRootCandidate,
 };
 use crate::storage_model::{
     ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, PhysicalIdentity, ReferenceKind,
 };
 use astrid_core::FleetUid;
+use astrid_core::UserUid;
 use astrid_core::dirs::AstridHome;
 use astrid_core::identity::PrincipalUid;
 use astrid_core::kernel_api::{ProjectionNameDiagnostic, ProjectionNamePolicyPreset};
@@ -88,6 +89,8 @@ pub enum StateOwner {
     Principal(PrincipalUid),
     /// State shared by the admitted members of one user-owned fleet.
     Fleet(FleetUid),
+    /// State owned by one validated human user.
+    User(UserUid),
 }
 
 /// Version-one canonical BLAKE3 identity for typed storage objects.
@@ -210,8 +213,26 @@ impl PrincipalCodec<StateOwnerV1> for StateOwnerCodecV1 {
 /// The version-one `System` and `Principal` encodings remain byte-for-byte
 /// stable. Fleet ownership is appended under tag `2`; it is never represented
 /// as a synthetic principal or hidden beneath system authority.
+///
+/// V2 does not admit [`StateOwner::User`]. Its infallible encoder emits a
+/// rejection marker that can never decode back to an owner; its checked
+/// encoder returns `None` instead. Its decoder also fails closed on tag `3`,
+/// and the active runtime remains on V2.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StateOwnerCodecV2;
+
+impl StateOwnerCodecV2 {
+    /// Encode an owner only when the V2 grammar admits it.
+    #[must_use]
+    pub fn encode_checked(&self, owner: &StateOwner) -> Option<Vec<u8>> {
+        match owner {
+            StateOwner::User(_) => None,
+            StateOwner::System | StateOwner::Principal(_) | StateOwner::Fleet(_) => {
+                Some(self.encode(owner))
+            },
+        }
+    }
+}
 
 impl PrincipalCodec<StateOwner> for StateOwnerCodecV2 {
     fn encode(&self, owner: &StateOwner) -> Vec<u8> {
@@ -229,6 +250,10 @@ impl PrincipalCodec<StateOwner> for StateOwnerCodecV2 {
                 bytes.extend_from_slice(fleet.as_bytes());
                 bytes
             },
+            // The infallible interface has no error channel. Reserve an empty
+            // principal so canonical WAL validation rejects User before a root
+            // record can be encoded or committed.
+            StateOwner::User(_) => Vec::new(),
         }
     }
 
@@ -242,6 +267,66 @@ impl PrincipalCodec<StateOwner> for StateOwnerCodecV2 {
             (2, fleet) if fleet.len() == 32 => {
                 let uid = FleetUid::from_bytes(<[u8; 32]>::try_from(fleet).ok()?);
                 Some(StateOwner::Fleet(uid))
+            },
+            _ => None,
+        }
+    }
+
+    fn admit_principal(&self, owner: &StateOwner) -> Result<(), DurableError> {
+        match owner {
+            StateOwner::User(_) => Err(DurableError::UnsupportedPrincipal),
+            StateOwner::System | StateOwner::Principal(_) | StateOwner::Fleet(_) => Ok(()),
+        }
+    }
+}
+
+/// Version-three canonical owner grammar with an explicit user tag.
+///
+/// The version-one and version-two encodings remain byte-for-byte stable.
+/// Human-user ownership is appended under tag `3`; it is never represented
+/// as a synthetic principal or conflated with system authority.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StateOwnerCodecV3;
+
+impl PrincipalCodec<StateOwner> for StateOwnerCodecV3 {
+    fn encode(&self, owner: &StateOwner) -> Vec<u8> {
+        match owner {
+            StateOwner::System => vec![0],
+            StateOwner::Principal(principal) => {
+                let mut bytes = Vec::with_capacity(33);
+                bytes.push(1);
+                bytes.extend_from_slice(principal.as_bytes());
+                bytes
+            },
+            StateOwner::Fleet(fleet) => {
+                let mut bytes = Vec::with_capacity(33);
+                bytes.push(2);
+                bytes.extend_from_slice(fleet.as_bytes());
+                bytes
+            },
+            StateOwner::User(user) => {
+                let mut bytes = Vec::with_capacity(33);
+                bytes.push(3);
+                bytes.extend_from_slice(user.as_bytes());
+                bytes
+            },
+        }
+    }
+
+    fn decode(&self, bytes: &[u8]) -> Option<StateOwner> {
+        match bytes.split_first()? {
+            (0, []) => Some(StateOwner::System),
+            (1, principal) if principal.len() == 32 => {
+                let uid = PrincipalUid::from_bytes(<[u8; 32]>::try_from(principal).ok()?);
+                Some(StateOwner::Principal(uid))
+            },
+            (2, fleet) if fleet.len() == 32 => {
+                let uid = FleetUid::from_bytes(<[u8; 32]>::try_from(fleet).ok()?);
+                Some(StateOwner::Fleet(uid))
+            },
+            (3, user) if user.len() == 32 => {
+                let uid = UserUid::from_bytes(<[u8; 32]>::try_from(user).ok()?);
+                Some(StateOwner::User(uid))
             },
             _ => None,
         }
@@ -802,6 +887,17 @@ async fn open_runtime_principal_store_with_options(
     assemble_runtime_store(home, quota, principals, Arc::new(engine), receipt).await
 }
 
+fn fail_closed_runtime_quota(
+    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
+) -> Arc<dyn KvQuotaResolver<StateOwner>> {
+    Arc::new(move |owner: &StateOwner| match owner {
+        StateOwner::User(_) => Err(StorageError::Internal(
+            "user StateOwner is not admitted by runtime owner codec V2".to_owned(),
+        )),
+        _ => quota.max_logical_bytes(owner),
+    })
+}
+
 async fn assemble_runtime_store(
     home: &AstridHome,
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
@@ -809,6 +905,7 @@ async fn assemble_runtime_store(
     engine: Arc<RuntimeEngine>,
     directory_cutover_receipt: String,
 ) -> StorageResult<RuntimePrincipalStore> {
+    let quota = fail_closed_runtime_quota(quota);
     let format_spec = bootstrap::format_specification()?;
     let format_spec_id = engine.identify(&format_spec);
     let catalog_spec = bootstrap::content_catalog_format_specification()?;

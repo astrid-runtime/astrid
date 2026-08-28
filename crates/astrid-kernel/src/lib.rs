@@ -758,6 +758,11 @@ impl Kernel {
                     astrid_storage::StateOwner::Fleet(_) => {
                         Ok(Some(astrid_core::profile::DEFAULT_MAX_STORAGE_BYTES))
                     },
+                    astrid_storage::StateOwner::User(_) => {
+                        Err(astrid_storage::StorageError::Internal(
+                            "user StateOwner is not a supported kernel storage owner".to_owned(),
+                        ))
+                    },
                 }
             });
 
@@ -3407,6 +3412,9 @@ async fn open_test_runtime_kv(
             astrid_storage::StateOwner::Fleet(_) => {
                 Ok(Some(astrid_core::profile::DEFAULT_MAX_STORAGE_BYTES))
             },
+            astrid_storage::StateOwner::User(_) => Err(astrid_storage::StorageError::Internal(
+                "user StateOwner is not a supported kernel storage owner".to_owned(),
+            )),
         });
     let store =
         astrid_storage::open_runtime_principal_store_with_directory(home, quota, directory.clone())
