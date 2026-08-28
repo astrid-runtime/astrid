@@ -6,8 +6,8 @@ use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame, Size4KiB};
 
 use super::types::{
-    CODE_BASE, ComponentImage, DomainPagingError, SLOT_CAPACITY, expected_owned_frames, peer_probe,
-    stack_base,
+    CODE_BASE, ComponentImage, DomainGeneration, DomainId, DomainPagingError, SLOT_CAPACITY,
+    expected_owned_frames, peer_probe, stack_base,
 };
 use crate::memory::{self, FRAME_SIZE, Frame};
 use crate::serial;
@@ -81,6 +81,13 @@ pub(super) struct AddressSpace {
     probe: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReleaseStatus {
+    Released(u64, u64),
+    RestoreFailed,
+    ReclaimBlocked(u64, u64),
+}
+
 impl AddressSpace {
     pub(super) fn new(image: ComponentImage, probe: u64) -> Result<Self, DomainPagingError> {
         let expected = expected_owned_frames(image.code_len(), image.stack_pages());
@@ -99,7 +106,7 @@ impl AddressSpace {
             probe,
         };
         if let Err(error) = space.build(expected) {
-            space.release();
+            space.discard();
             return Err(error);
         }
         Ok(space)
@@ -491,10 +498,47 @@ impl AddressSpace {
         self.peer_probes().any(|probe| probe == address)
     }
 
-    pub(super) fn release(&mut self) -> (u64, u64) {
+    pub(super) fn release(&mut self, id: DomainId, generation: DomainGeneration) -> ReleaseStatus {
+        self.release_inner(Some((id, generation)))
+    }
+
+    /// Release an address space that was never admitted under a domain
+    /// identity. It has no lifecycle event of its own, but its frames must
+    /// still be returned before prepare reports the admission failure.
+    pub(super) fn discard(&mut self) -> ReleaseStatus {
+        self.reclaim_owned()
+    }
+
+    fn release_inner(&mut self, identity: Option<(DomainId, DomainGeneration)>) -> ReleaseStatus {
         // SAFETY: no further domain access can occur; restore the supervisor
         // root captured before this child root became active.
         unsafe { Cr3::write(self.source_cr3, self.source_cr3_flags) };
+        let observed = Cr3::read();
+        if observed != self.source_root() {
+            if let Some((id, generation)) = identity {
+                serial::ev_domain_restore(
+                    id.0 + 1,
+                    generation.0,
+                    false,
+                    observed.0.start_address().as_u64(),
+                    observed.1.bits(),
+                );
+            }
+            return ReleaseStatus::RestoreFailed;
+        }
+        if let Some((id, generation)) = identity {
+            serial::ev_domain_restore(
+                id.0 + 1,
+                generation.0,
+                true,
+                self.source_cr3.start_address().as_u64(),
+                self.source_cr3_flags.bits(),
+            );
+        }
+        self.reclaim_owned()
+    }
+
+    fn reclaim_owned(&mut self) -> ReleaseStatus {
         let expected = self.owned.count() as u64;
         let mut freed = 0u64;
         while self.owned.len > 0 {
@@ -507,7 +551,11 @@ impl AddressSpace {
             self.owned.frames[self.owned.len - 1] = None;
             self.owned.len -= 1;
         }
-        (expected, freed)
+        if expected == freed {
+            ReleaseStatus::Released(expected, freed)
+        } else {
+            ReleaseStatus::ReclaimBlocked(expected, freed)
+        }
     }
 }
 

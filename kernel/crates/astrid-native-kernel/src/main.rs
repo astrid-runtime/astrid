@@ -137,6 +137,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let tests_ok = tests::run_all(data_exec);
     if wx_ok && tests_ok {
         memory::reserve_live_page_tables();
+        domains::bind_kernel_cr3();
         let component = closure::authenticated_component();
         let component_id = closure::authenticated_component_id();
         domains::start_harness(&component, component_id);

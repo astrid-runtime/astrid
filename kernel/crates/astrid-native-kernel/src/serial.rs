@@ -182,6 +182,12 @@ pub fn ev_component_bound() {
     emit(format_args!("\"ev\":\"component.bound\",\"empty\":false"));
 }
 
+pub fn ev_kernel_cr3(root: u64, flags: u64) {
+    emit(format_args!(
+        "\"ev\":\"kernel.cr3\",\"root\":\"{root:#x}\",\"flags\":{flags}"
+    ));
+}
+
 pub fn ev_domain_started(id: u64, generation: u64, scenario: u64) {
     emit(format_args!(
         "\"ev\":\"domain.start\",\"id\":{id},\"generation\":{generation},\"scenario\":{scenario}"
@@ -194,9 +200,42 @@ pub fn ev_domain_entered(id: u64, generation: u64, cpl: u64) {
     ));
 }
 
+pub fn ev_domain_context(
+    id: u64,
+    generation: u64,
+    root: u64,
+    flags: u64,
+    cpl: u64,
+    fs: u64,
+    gs: u64,
+) {
+    emit(format_args!(
+        "\"ev\":\"domain.context\",\"id\":{id},\"generation\":{generation},\
+        \"root\":\"{root:#x}\",\"flags\":{flags},\"cpl\":{cpl},\"fs\":{fs},\"gs\":{gs}"
+    ));
+}
+
+pub fn ev_domain_cancel_request(id: u64, generation: u64) {
+    emit(format_args!(
+        "\"ev\":\"domain.cancel.request\",\"id\":{id},\"generation\":{generation}"
+    ));
+}
+
+pub fn ev_domain_trap_reject(reason: &str) {
+    emit(format_args!(
+        "\"ev\":\"domain.trap.reject\",\"reason\":\"{reason}\""
+    ));
+}
+
 pub fn ev_domain_cancelled(id: u64, generation: u64) {
     emit(format_args!(
         "\"ev\":\"domain.cancelled\",\"id\":{id},\"generation\":{generation}"
+    ));
+}
+
+pub fn ev_domain_cancel_rejected(id: u64, generation: u64, reason: &str) {
+    emit(format_args!(
+        "\"ev\":\"domain.cancel.reject\",\"id\":{id},\"generation\":{generation},\"reason\":\"{reason}\""
     ));
 }
 
@@ -206,17 +245,60 @@ pub fn ev_domain_quota(id: u64, ticks: u32) {
     ));
 }
 
-pub fn ev_domain_registers(id: u64, generation: u64, cpl: u64, rdi: u64, rsp: u64) {
+#[allow(clippy::too_many_arguments)]
+pub fn ev_domain_registers(
+    id: u64,
+    generation: u64,
+    cpl: u64,
+    rdi: u64,
+    rsp: u64,
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rsi: u64,
+    rbp: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+) {
     emit(format_args!(
-        "\"ev\":\"domain.registers\",\"id\":{id},\"generation\":{generation},\"cpl\":{cpl},\"rdi\":{rdi},\"rsp\":\"{rsp:#x}\""
+        "\"ev\":\"domain.registers\",\"id\":{id},\"generation\":{generation},\"cpl\":{cpl},\
+        \"rax\":{rax},\"rbx\":{rbx},\"rcx\":{rcx},\"rdx\":{rdx},\"rsi\":{rsi},\"rdi\":{rdi},\
+        \"rbp\":{rbp},\"r8\":{r8},\"r9\":{r9},\"r10\":{r10},\"r11\":{r11},\"r12\":{r12},\
+        \"r13\":{r13},\"r14\":{r14},\"r15\":{r15},\"rsp\":\"{rsp:#x}\""
     ));
 }
 
-pub fn ev_domain_restore(ok: bool) {
-    emit(format_args!("\"ev\":\"domain.restore\",\"ok\":{ok}"));
+pub fn ev_domain_restore(id: u64, generation: u64, ok: bool, root: u64, flags: u64) {
+    emit(format_args!(
+        "\"ev\":\"domain.restore\",\"id\":{id},\"generation\":{generation},\"ok\":{ok},\
+        \"root\":\"{root:#x}\",\"flags\":{flags}"
+    ));
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DomainEventIdentity {
+    pub event_id: u64,
+    pub generation: u64,
+}
+
+impl DomainEventIdentity {
+    pub const fn new(event_id: u64, generation: u64) -> Self {
+        Self {
+            event_id,
+            generation,
+        }
+    }
 }
 
 pub fn ev_domain_outcome(
+    identity: DomainEventIdentity,
     kind: &str,
     vector: u8,
     error_code: u64,
@@ -225,7 +307,10 @@ pub fn ev_domain_outcome(
     cpl: u64,
 ) {
     emit(format_args!(
-        "\"ev\":\"domain.outcome\",\"kind\":\"{kind}\",\"vector\":{vector},\"error_code\":{error_code},\"fault_address\":\"{fault_address:#x}\",\"rip\":\"{rip:#x}\",\"cpl\":{cpl}"
+        "\"ev\":\"domain.outcome\",\"id\":{},\"generation\":{},\"kind\":\"{kind}\",\
+        \"vector\":{vector},\"error_code\":{error_code},\
+        \"fault_address\":\"{fault_address:#x}\",\"rip\":\"{rip:#x}\",\"cpl\":{cpl}",
+        identity.event_id, identity.generation,
     ));
 }
 

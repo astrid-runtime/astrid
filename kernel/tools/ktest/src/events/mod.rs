@@ -19,20 +19,7 @@ const REQUIRED_ONCE: &[&str] = &[
     "mem.map",
     "paging.wx",
     "heap.ready",
-    "halt",
-];
-
-const COMBINED_ORDER: &[&str] = &[
-    "boot.entry",
-    "idt.ready",
-    "component.bound",
-    "handoff.bound",
-    "closure.kernel",
-    "closure.sysgen",
-    "closure.bound",
-    "mem.map",
-    "paging.wx",
-    "heap.ready",
+    "kernel.cr3",
     "halt",
 ];
 
@@ -56,7 +43,44 @@ const DOMAIN_REQUIRED_PASSES: &[&str] = &[
     "hostile_first_then_clean_second_domain",
 ];
 
+const EXTRA_REQUIRED_PASSES: &[&str] = &[
+    "guest_gp_fs_gs_entry_contract",
+    "active_domain_lifecycle_exclusion",
+    "stale_handle_rejection",
+    "generation_overflow_is_fail_closed",
+    "exact_kernel_cr3_restore",
+];
+#[cfg(test)]
+pub(crate) const OVERFLOW_GATE: &str = EXTRA_REQUIRED_PASSES[3];
+
+#[cfg(test)]
+pub(crate) const ENTRY_STATE_GATE: &str = "guest_gp_fs_gs_entry_contract";
+#[cfg(test)]
+pub(crate) const RESTORE_GATE: &str = "exact_kernel_cr3_restore";
+#[cfg(test)]
+pub(crate) const ACTIVE_GUARD_GATE: &str = "active_domain_lifecycle_exclusion";
+#[cfg(test)]
+pub(crate) const STALE_GATE: &str = "stale_handle_rejection";
+#[cfg(test)]
+pub(crate) const QUOTA_GATE: &str = "quota_preempts_infinite_loop_and_preserves_peer";
+#[cfg(test)]
+pub(crate) const PAGING_GATE: &str = "per_domain_page_table_exclusion";
+#[cfg(test)]
+pub(crate) const FAULT_GATE: &str = "fault_is_domain_scoped";
+#[cfg(test)]
+pub(crate) const RECLAIM_GATE: &str = "reclaim_exactly_once_under_fault_kill_cancel";
+#[cfg(test)]
+pub(crate) const CLEAN_RESTART_GATE: &str = "hostile_first_then_clean_second_domain";
+
 const SUCCESS_BOUND_EVENTS: &[&str] = &[
+    "component.bound",
+    "handoff.bound",
+    "closure.kernel",
+    "closure.sysgen",
+    "closure.bound",
+];
+
+const CLOSURE_SUCCESS_BOUND_EVENTS: &[&str] = &[
     "handoff.bound",
     "closure.kernel",
     "closure.sysgen",
@@ -64,6 +88,173 @@ const SUCCESS_BOUND_EVENTS: &[&str] = &[
 ];
 
 const RING0_REJECT_ORDER: &[&str] = &["boot.entry", "idt.ready", "closure.reject", "halt"];
+
+/// A strict name-only walker first, so every field assertion below operates
+/// on a trace whose event kinds are already in the machine's exact order.
+#[derive(Clone, Copy)]
+enum SequenceStep {
+    One(&'static str),
+    Pass(&'static str),
+    Many(&'static [&'static str]),
+    Repeated(&'static str, usize),
+}
+
+impl SequenceStep {
+    fn name(&self, index: usize) -> &'static str {
+        match self {
+            Self::One(name) => name,
+            Self::Pass(_) => "test.pass",
+            Self::Many(names) => names[index],
+            Self::Repeated(name, _) => name,
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::One(_) => 1,
+            Self::Pass(_) => 1,
+            Self::Many(names) => names.len(),
+            Self::Repeated(_, count) => *count,
+        }
+    }
+}
+
+fn walk_sequence(events: &[Value], pattern: &[SequenceStep]) -> bool {
+    first_sequence_mismatch(events, pattern).is_none()
+}
+
+fn first_sequence_mismatch(
+    events: &[Value],
+    pattern: &[SequenceStep],
+) -> Option<(usize, &'static str)> {
+    let mut cursor = 0usize;
+    for step in pattern {
+        for index in 0..step.len() {
+            let Some(event) = events.get(cursor) else {
+                return Some((cursor, step.name(index)));
+            };
+            if ev_name(event) != step.name(index) {
+                return Some((cursor, step.name(index)));
+            }
+            if let SequenceStep::Pass(expected_name) = step
+                && string_field(event, "name") != Some(expected_name)
+            {
+                return Some((cursor, expected_name));
+            }
+            cursor += 1;
+        }
+    }
+    (cursor < events.len()).then(|| {
+        let last = pattern.last();
+        (cursor, last.map_or("trace-end", |step| step.name(0)))
+    })
+}
+
+const PREPARE_EVENTS: &[&str] = &[
+    "domain.exclusion",
+    "domain.audit",
+    "domain.policy",
+    "domain.audit",
+];
+const START_EVENT: &str = "domain.start";
+const GUEST_ENTRY_EVENTS: &[&str] = &["domain.entered", "domain.context"];
+const GUEST_REGISTER_EVENT: &str = "domain.registers";
+const GUEST_TAIL_EVENTS: &[&str] = &["domain.outcome", "domain.restore", "domain.reclaim"];
+const CANCEL_TAIL_EVENTS: &[&str] = &[
+    "domain.cancel.request",
+    "domain.restore",
+    "domain.reclaim",
+    "domain.cancelled",
+    "domain.outcome",
+];
+const BOOT_MILESTONE_EVENTS: &[&str] = &[
+    "boot.entry",
+    "idt.ready",
+    "component.bound",
+    "handoff.bound",
+    "closure.kernel",
+    "closure.sysgen",
+    "closure.bound",
+    "mem.map",
+    "paging.wx",
+    "heap.ready",
+    "apic.timer.start",
+];
+fn push_guest_terminal(pattern: &mut Vec<SequenceStep>, quota: bool) {
+    pattern.push(SequenceStep::Many(GUEST_ENTRY_EVENTS));
+    if quota {
+        pattern.push(SequenceStep::One("domain.quota"));
+    }
+    pattern.push(SequenceStep::One(GUEST_REGISTER_EVENT));
+    pattern.push(SequenceStep::Many(GUEST_TAIL_EVENTS));
+}
+
+fn full_sequence() -> Vec<SequenceStep> {
+    let mut pattern = vec![
+        SequenceStep::Many(BOOT_MILESTONE_EVENTS),
+        SequenceStep::Repeated("apic.timer.tick", 8),
+        SequenceStep::One("entropy.seeded"),
+        SequenceStep::One("fault"),
+        SequenceStep::Pass(REQUIRED_PASSES[0]),
+        SequenceStep::One("fault"),
+        SequenceStep::Pass(REQUIRED_PASSES[1]),
+        SequenceStep::One("fault"),
+        SequenceStep::Pass(REQUIRED_PASSES[2]),
+        SequenceStep::Pass(REQUIRED_PASSES[3]),
+        SequenceStep::Pass(REQUIRED_PASSES[4]),
+        SequenceStep::Pass(REQUIRED_PASSES[5]),
+        SequenceStep::One("kernel.cr3"),
+        SequenceStep::Pass(EXTRA_REQUIRED_PASSES[3]),
+        SequenceStep::One("domain.auth.reject"),
+        SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[0]),
+    ];
+    let push_started = |pattern: &mut Vec<SequenceStep>| {
+        pattern.push(SequenceStep::Many(PREPARE_EVENTS));
+        pattern.push(SequenceStep::One(START_EVENT));
+    };
+
+    push_started(&mut pattern);
+    push_guest_terminal(&mut pattern, false);
+    pattern.push(SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[1]));
+    pattern.push(SequenceStep::Pass(EXTRA_REQUIRED_PASSES[0]));
+    push_started(&mut pattern);
+    push_guest_terminal(&mut pattern, false);
+    pattern.extend([
+        SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[2]),
+        SequenceStep::Pass(EXTRA_REQUIRED_PASSES[4]),
+        SequenceStep::Many(PREPARE_EVENTS),
+        SequenceStep::Pass(EXTRA_REQUIRED_PASSES[1]),
+        SequenceStep::One("domain.cancel.reject"),
+        SequenceStep::Pass(EXTRA_REQUIRED_PASSES[2]),
+    ]);
+
+    pattern.push(SequenceStep::Many(PREPARE_EVENTS));
+    pattern.push(SequenceStep::One(START_EVENT));
+    push_guest_terminal(&mut pattern, false);
+    pattern.push(SequenceStep::Many(CANCEL_TAIL_EVENTS));
+    pattern.push(SequenceStep::Many(PREPARE_EVENTS));
+    pattern.push(SequenceStep::Many(PREPARE_EVENTS));
+    pattern.push(SequenceStep::One(START_EVENT));
+    push_guest_terminal(&mut pattern, true);
+    pattern.push(SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[4]));
+    pattern.push(SequenceStep::One("domain.start"));
+    push_guest_terminal(&mut pattern, false);
+    push_started(&mut pattern);
+    push_guest_terminal(&mut pattern, false);
+    pattern.extend([
+        SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[3]),
+        SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[5]),
+        SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[6]),
+    ]);
+    push_started(&mut pattern);
+    push_guest_terminal(&mut pattern, false);
+    pattern.extend([
+        SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[7]),
+        SequenceStep::One("domain.harness"),
+        SequenceStep::One("halt"),
+    ]);
+    pattern
+}
 
 /// Slot 0 handles the entry, invalid-opcode, fault, quota, hostile, and clean
 /// scenarios. Slot 1 proves peer preservation twice. Releases increment each
@@ -77,6 +268,7 @@ const DOMAIN_STARTS: &[(u64, u64, u64)] = &[
     (1, 5, 3),
     (1, 6, 0),
 ];
+const DOMAIN_ADMISSION_COUNT: usize = DOMAIN_STARTS.len() + 1;
 const DOMAIN_ENTERED: &[(u64, u64)] = &[(1, 1), (1, 2), (1, 3), (1, 4), (2, 2), (1, 5), (1, 6)];
 const DOMAIN_REGISTERS: &[(u64, u64, u64)] = &[
     (1, 1, 0),
@@ -96,6 +288,17 @@ const DOMAIN_RECLAIMS: &[(u64, u64)] = &[
     (2, 2),
     (1, 5),
     (1, 6),
+];
+const DOMAIN_CANCEL_REJECTS: &[(&str, u64, u64)] = &[("stale_handle", 1, 1)];
+const DOMAIN_OUTCOMES: &[(u64, u64, &str, u64, u64, &str, u64)] = &[
+    (1, 1, "clean_exit", 3, 0, "0x0", 3),
+    (1, 2, "invalid_instruction", 6, 0, "0x0", 3),
+    (1, 3, "page_fault", 14, 6, "0x0", 3),
+    (2, 1, "cancelled", 0, 0, "0x0", 0),
+    (1, 4, "quota_exhausted", 32, 0, "0x0", 3),
+    (2, 2, "clean_exit", 3, 0, "0x0", 3),
+    (1, 5, "page_fault", 14, 6, HOSTILE_PEER_FAULT_ADDRESS, 3),
+    (1, 6, "clean_exit", 3, 0, "0x0", 3),
 ];
 const HOSTILE_PEER_FAULT_ADDRESS: &str = "0x328000001000";
 
@@ -173,7 +376,7 @@ pub fn any_test_fail(events: &[Value]) -> bool {
 /// cannot be made to look accepted by retaining stale closure events.
 pub fn rejected_without_success_bound_events(events: &[Value]) -> bool {
     count_named(events, "closure.reject") > 0
-        && SUCCESS_BOUND_EVENTS
+        && CLOSURE_SUCCESS_BOUND_EVENTS
             .iter()
             .all(|name| count_named(events, name) == 0)
 }
@@ -244,52 +447,6 @@ fn all_bools(events: &[Value], name: &str, field: &str, expected: bool) -> bool 
             .all(|event| bool_field(event, field) == Some(expected))
 }
 
-fn domain_outcomes_hold(events: &[Value]) -> bool {
-    let counts = [
-        ("clean_exit", 3),
-        ("invalid_instruction", 1),
-        ("page_fault", 2),
-        ("quota_exhausted", 1),
-        ("cancelled", 1),
-    ];
-    let mut ok = true;
-    for (kind, expected) in counts {
-        let observed = named_events(events, "domain.outcome")
-            .into_iter()
-            .filter(|event| string_field(event, "kind") == Some(kind))
-            .count();
-        ok &= observed == expected;
-    }
-    let page_fault_addresses: Vec<&str> = named_events(events, "domain.outcome")
-        .into_iter()
-        .filter(|event| string_field(event, "kind") == Some("page_fault"))
-        .filter_map(|event| string_field(event, "fault_address"))
-        .collect();
-    ok &= page_fault_addresses == ["0x0", HOSTILE_PEER_FAULT_ADDRESS];
-    ok
-}
-
-fn domain_audits_hold(events: &[Value]) -> bool {
-    named_events(events, "domain.audit")
-        .into_iter()
-        .all(|event| {
-            u64_field(event, "frames").is_some_and(|frames| frames > 0)
-                && bool_field(event, "wx_ok") == Some(true)
-                && bool_field(event, "kernel_excluded") == Some(true)
-                && bool_field(event, "peer_excluded") == Some(true)
-        })
-}
-
-fn domain_exclusions_hold(events: &[Value]) -> bool {
-    named_events(events, "domain.exclusion")
-        .into_iter()
-        .all(|event| {
-            bool_field(event, "alias_excluded") == Some(true)
-                && bool_field(event, "kernel_excluded") == Some(true)
-                && bool_field(event, "peer_excluded") == Some(true)
-        })
-}
-
 /// Bind the domain claim to its complete machine-visible lifecycle: exact
 /// starts, ring-3 entries, guest registers, outcomes, CR3 restoration, and
 /// frame reclamation. Generation values must strictly advance on each reuse.
@@ -316,10 +473,41 @@ fn domain_lifecycle_holds(events: &[Value]) -> bool {
     ) && named_events(events, "domain.registers")
         .into_iter()
         .all(|event| {
+            let entry_contract =
+                u64_field(event, "id") == Some(1) && u64_field(event, "generation") == Some(1);
+            let zero_gpr = !entry_contract
+                || [
+                    "rax", "rbx", "rcx", "rdx", "rsi", "rbp", "r8", "r9", "r10", "r11", "r12",
+                    "r13", "r14", "r15",
+                ]
+                .iter()
+                .all(|name| u64_field(event, name) == Some(0));
             string_field(event, "rsp").is_some_and(|rsp| rsp.starts_with("0x"))
                 && u64_field(event, "cpl") == Some(3)
+                && zero_gpr
         });
-    let outcomes_ok = domain_outcomes_hold(events);
+    let contexts_ok = named_events(events, "domain.context")
+        .into_iter()
+        .all(|event| {
+            string_field(event, "root").is_some_and(|root| root.starts_with("0x"))
+                && u64_field(event, "cpl") == Some(3)
+                && u64_field(event, "fs") == Some(0)
+                && u64_field(event, "gs") == Some(0)
+        });
+    let outcomes_ok = named_events(events, "domain.outcome")
+        .into_iter()
+        .map(|event| {
+            (
+                u64_field(event, "id").unwrap_or_default(),
+                u64_field(event, "generation").unwrap_or_default(),
+                string_field(event, "kind").unwrap_or_default(),
+                u64_field(event, "vector").unwrap_or_default(),
+                u64_field(event, "error_code").unwrap_or_default(),
+                string_field(event, "fault_address").unwrap_or_default(),
+                u64_field(event, "cpl").unwrap_or_default(),
+            )
+        })
+        .eq(DOMAIN_OUTCOMES.iter().copied());
     let reclaims_ok = exact_pairs(
         events,
         "domain.reclaim",
@@ -337,10 +525,44 @@ fn domain_lifecycle_holds(events: &[Value]) -> bool {
                     && u64_field(event, "blocked") == Some(0)
             })
         });
-    let restores_ok = named_events(events, "domain.restore").len() == DOMAIN_RECLAIMS.len()
-        && all_bools(events, "domain.restore", "ok", true);
-    let audits_ok = domain_audits_hold(events);
-    let exclusions_ok = domain_exclusions_hold(events);
+    let restores_ok = exact_pairs(
+        events,
+        "domain.restore",
+        "id",
+        "generation",
+        DOMAIN_RECLAIMS,
+    ) && all_bools(events, "domain.restore", "ok", true);
+    let audits_ok = named_events(events, "domain.audit").len() == 2 * DOMAIN_ADMISSION_COUNT
+        && named_events(events, "domain.audit")
+            .into_iter()
+            .all(|event| {
+                u64_field(event, "frames").is_some_and(|frames| frames > 0)
+                    && bool_field(event, "wx_ok") == Some(true)
+                    && bool_field(event, "kernel_excluded") == Some(true)
+                    && bool_field(event, "peer_excluded") == Some(true)
+            });
+    let exclusions_ok = named_events(events, "domain.exclusion").len() == DOMAIN_ADMISSION_COUNT
+        && named_events(events, "domain.exclusion")
+            .into_iter()
+            .all(|event| {
+                bool_field(event, "alias_excluded") == Some(true)
+                    && bool_field(event, "kernel_excluded") == Some(true)
+                    && bool_field(event, "peer_excluded") == Some(true)
+            });
+    let policies_ok = named_events(events, "domain.policy").len() == DOMAIN_ADMISSION_COUNT
+        && all_bools(events, "domain.policy", "audit_ok", true)
+        && all_bools(events, "domain.policy", "stack_zeroed", true)
+        && all_bools(events, "domain.policy", "probe_zeroed", true);
+    let cancel_rejects_ok = named_events(events, "domain.cancel.reject")
+        .into_iter()
+        .map(|event| {
+            (
+                string_field(event, "reason").unwrap_or_default(),
+                u64_field(event, "id").unwrap_or_default(),
+                u64_field(event, "generation").unwrap_or_default(),
+            )
+        })
+        .eq(DOMAIN_CANCEL_REJECTS.iter().copied());
     let accounting_ok = count_named(events, "domain.accounting") == 0;
     let tamper_events = named_events(events, "domain.auth.reject")
         .into_iter()
@@ -367,11 +589,14 @@ fn domain_lifecycle_holds(events: &[Value]) -> bool {
     ok &= check("exact domain starts and monotonic generations", starts_ok);
     ok &= check("exact ring-3 domain entries", entries_ok);
     ok &= check("exact guest registers and CPL", registers_ok);
+    ok &= check("ring-3 context and FS/GS entry state", contexts_ok);
     ok &= check("exact domain outcomes and fault addresses", outcomes_ok);
     ok &= check("exact reclaim generations and accounting", reclaims_ok);
     ok &= check("restores accompany every reclaim", restores_ok);
     ok &= check("domain page-table audits", audits_ok);
     ok &= check("domain exclusion evidence", exclusions_ok);
+    ok &= check("zero-on-admission policy", policies_ok);
+    ok &= check("exact active and stale cancel rejection", cancel_rejects_ok);
     ok &= check("no domain accounting leaks", accounting_ok);
     ok &= check(
         "tampered component rejection before auth success",
@@ -398,8 +623,8 @@ pub fn assert_ring0_plan_mismatch(events: &[Value], exit_code: Option<i32>) -> b
         contiguous_seq_from_zero(events),
     );
     ok &= check(
-        "boot.entry<idt.ready<closure.reject<halt",
-        ordered(events, RING0_REJECT_ORDER),
+        "exact ring-0 reject event sequence",
+        walk_sequence(events, &[SequenceStep::Many(RING0_REJECT_ORDER)]),
     );
     ok &= check(
         "exactly one event for each ring-0 rejection milestone",
@@ -474,6 +699,13 @@ pub fn assert_boot(
 ) -> bool {
     println!("\n== assertions ==");
     let mut ok = true;
+    let sequence_mismatch =
+        first_sequence_mismatch(events, &full_sequence()).map(|(index, expected)| {
+            let observed = events
+                .get(index)
+                .map_or_else(|| "end-of-trace".to_string(), |event| event.to_string());
+            format!(" (first mismatch at event {index}, expected {expected}: {observed})")
+        });
     ok &= check(
         "seq contiguous strictly increasing from 0",
         contiguous_seq_from_zero(events),
@@ -487,8 +719,8 @@ pub fn assert_boot(
         events.first().map(ev_name) == Some("boot.entry"),
     );
     ok &= check(
-        "boot.entry<idt.ready<handoff.bound<closure.kernel<closure.sysgen<closure.bound<mem.map<paging.wx<heap.ready<halt",
-        ordered(events, COMBINED_ORDER),
+        &format!("exact full event sequence{sequence_mismatch:?}"),
+        sequence_mismatch.is_none(),
     );
     ok &= check("halt is terminal", halt_is_terminal(events));
     ok &= check(
@@ -496,7 +728,10 @@ pub fn assert_boot(
         wx_holds(events),
     );
     let ticks = count_named(events, "apic.timer.tick");
-    ok &= check(&format!(">=8 apic.timer.tick (got {ticks})"), ticks >= 8);
+    ok &= check(
+        &format!("exactly 8 apic.timer.tick (got {ticks})"),
+        ticks == 8,
+    );
     ok &= check(
         "no test.fail (including unknown names)",
         !any_test_fail(events),
@@ -517,6 +752,12 @@ pub fn assert_boot(
 
 fn closure_holds(events: &[Value], closures: &ExpectedClosures<'_>) -> bool {
     let mut ok = true;
+    ok &= check(
+        "one event for each success-bound milestone",
+        SUCCESS_BOUND_EVENTS
+            .iter()
+            .all(|name| count_named(events, name) == 1),
+    );
     ok &= check(
         "no closure.reject",
         count_named(events, "closure.reject") == 0,
@@ -582,333 +823,16 @@ fn wx_holds(events: &[Value]) -> bool {
 
 fn self_tests_hold(events: &[Value]) -> bool {
     let mut ok = true;
-    for name in REQUIRED_PASSES.iter().chain(DOMAIN_REQUIRED_PASSES) {
+    for name in REQUIRED_PASSES
+        .iter()
+        .chain(DOMAIN_REQUIRED_PASSES)
+        .chain(EXTRA_REQUIRED_PASSES)
+    {
         let n = test_pass_count(events, name);
         ok &= check(&format!("exactly one test.pass {name} (got {n})"), n == 1);
     }
     ok
 }
 
-fn ordered(events: &[Value], names: &[&str]) -> bool {
-    let mut last = -1i64;
-    for name in names {
-        match events.iter().position(|e| ev_name(e) == *name) {
-            Some(idx) if (idx as i64) > last => last = idx as i64,
-            _ => return false,
-        }
-    }
-    true
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const KERNEL_IMAGE_ID: &str =
-        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-    const CLOSURE_TABLE_ID: &str =
-        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
-
-    fn kernel_id() -> String {
-        "aa".repeat(32)
-    }
-
-    fn sysgen_id() -> String {
-        "bb".repeat(32)
-    }
-
-    fn expected() -> ExpectedClosures<'static> {
-        ExpectedClosures {
-            policy_generation: 1,
-            kernel_image_hex: KERNEL_IMAGE_ID,
-            closure_table_hex: CLOSURE_TABLE_ID,
-            kernel_id_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            sysgen_id_hex: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            kernel_floor: 1,
-            sysgen_floor: 1,
-        }
-    }
-
-    fn passing_serial() -> String {
-        passing_serial_with(&kernel_id(), &sysgen_id(), 1, 1)
-    }
-
-    fn passing_serial_with(kernel: &str, sysgen: &str, kfloor: u64, sfloor: u64) -> String {
-        let mut seq = 0u64;
-        let mut out = String::new();
-        let mut ev = |payload: String| {
-            out.push_str(&format!("{{\"seq\":{seq},{payload}}}\n"));
-            seq += 1;
-        };
-        ev("\"ev\":\"boot.entry\"".into());
-        ev("\"ev\":\"idt.ready\",\"vectors\":32".into());
-        ev("\"ev\":\"component.bound\",\"empty\":false".into());
-        ev(format!(
-            "\"ev\":\"handoff.bound\",\"policy_generation\":1,\"kernel_image\":\"{}\",\"closure_table\":\"{}\"",
-            "cc".repeat(32),
-            "dd".repeat(32),
-        ));
-        ev(format!(
-            "\"ev\":\"closure.kernel\",\"kind\":\"kernel-bootstrap\",\"floor\":{kfloor},\"id\":\"{kernel}\""
-        ));
-        ev(format!(
-            "\"ev\":\"closure.sysgen\",\"kind\":\"system-generation\",\"floor\":{sfloor},\"id\":\"{sysgen}\",\"empty\":false"
-        ));
-        ev(format!(
-            "\"ev\":\"closure.bound\",\"kernel_floor\":{kfloor},\"sysgen_floor\":{sfloor},\"kernel_id\":\"{kernel}\",\"sysgen_id\":\"{sysgen}\""
-        ));
-        ev("\"ev\":\"mem.map\",\"usable_regions\":1,\"usable_bytes\":1".into());
-        ev("\"ev\":\"paging.wx\",\"rodata_nx_w\":false,\"text_w\":false".into());
-        ev("\"ev\":\"heap.ready\",\"bytes\":1048576".into());
-        for n in 1..=8 {
-            ev(format!("\"ev\":\"apic.timer.tick\",\"n\":{n}"));
-        }
-        ev("\"ev\":\"domain.auth.reject\",\"reason\":\"tampered_component_rejected\"".into());
-        for name in REQUIRED_PASSES {
-            ev(format!("\"ev\":\"test.pass\",\"name\":\"{name}\""));
-        }
-        for name in &DOMAIN_REQUIRED_PASSES[..DOMAIN_REQUIRED_PASSES.len() - 1] {
-            ev(format!("\"ev\":\"test.pass\",\"name\":\"{name}\""));
-        }
-        for (id, generation, scenario) in DOMAIN_STARTS {
-            ev(format!(
-                "\"ev\":\"domain.start\",\"id\":{id},\"generation\":{generation},\"scenario\":{scenario}"
-            ));
-        }
-        for (id, generation) in DOMAIN_ENTERED {
-            ev(format!(
-                "\"ev\":\"domain.entered\",\"id\":{id},\"generation\":{generation},\"cpl\":3"
-            ));
-        }
-        for (id, generation, rdi) in DOMAIN_REGISTERS {
-            ev(format!(
-                "\"ev\":\"domain.registers\",\"id\":{id},\"generation\":{generation},\"cpl\":3,\"rdi\":{rdi},\"rsp\":\"0x1000\""
-            ));
-        }
-        for (kind, vector, error, address) in [
-            ("clean_exit", 3, 0, "0x0"),
-            ("invalid_instruction", 6, 0, "0x0"),
-            ("page_fault", 14, 4, "0x0"),
-            ("cancelled", 0, 0, "0x0"),
-            ("quota_exhausted", 32, 0, "0x0"),
-            ("clean_exit", 3, 0, "0x0"),
-            ("page_fault", 14, 4, HOSTILE_PEER_FAULT_ADDRESS),
-            ("clean_exit", 3, 0, "0x0"),
-        ] {
-            ev(format!(
-                "\"ev\":\"domain.outcome\",\"kind\":\"{kind}\",\"vector\":{vector},\"error_code\":{error},\"fault_address\":\"{address}\",\"rip\":\"0x0\",\"cpl\":3"
-            ));
-        }
-        for _ in DOMAIN_RECLAIMS {
-            ev("\"ev\":\"domain.restore\",\"ok\":true".into());
-        }
-        for (id, generation) in DOMAIN_RECLAIMS {
-            ev(format!(
-                "\"ev\":\"domain.reclaim\",\"id\":{id},\"generation\":{generation},\"expected\":16,\"freed\":16,\"swept\":16,\"blocked\":0"
-            ));
-        }
-        for _ in DOMAIN_RECLAIMS {
-            ev("\"ev\":\"domain.audit\",\"frames\":16,\"wx_ok\":true,\"kernel_excluded\":true,\"peer_excluded\":true".into());
-            ev("\"ev\":\"domain.exclusion\",\"alias_excluded\":true,\"kernel_excluded\":true,\"peer_excluded\":true".into());
-        }
-        ev(format!(
-            "\"ev\":\"test.pass\",\"name\":\"{}\"",
-            DOMAIN_REQUIRED_PASSES[DOMAIN_REQUIRED_PASSES.len() - 1]
-        ));
-        ev("\"ev\":\"domain.harness\",\"outcome\":true".into());
-        ev("\"ev\":\"halt\",\"outcome\":\"ok\"".into());
-        out
-    }
-
-    fn assert_ok(serial: &str) -> bool {
-        assert_boot(&parse_events(serial), Some(33), 33, &expected())
-    }
-
-    #[test]
-    fn parses_jsonl_and_skips_firmware_noise() {
-        let serial = "Welcome to EDK2\n{\"seq\":0,\"ev\":\"boot.entry\"}\nnot json\n";
-        let events = parse_events(serial);
-        assert_eq!(events.len(), 1);
-        assert_eq!(ev_name(&events[0]), "boot.entry");
-    }
-
-    #[test]
-    fn combined_fixture_passes() {
-        assert!(assert_ok(&passing_serial()));
-    }
-
-    #[test]
-    fn mixed_floors_on_bound_are_independent() {
-        let kernel = kernel_id();
-        let sysgen = sysgen_id();
-        let serial = passing_serial_with(&kernel, &sysgen, 1, 2);
-        let closures = ExpectedClosures {
-            policy_generation: 1,
-            kernel_image_hex: KERNEL_IMAGE_ID,
-            closure_table_hex: CLOSURE_TABLE_ID,
-            kernel_id_hex: &kernel,
-            sysgen_id_hex: &sysgen,
-            kernel_floor: 1,
-            sysgen_floor: 2,
-        };
-        assert!(assert_boot(&parse_events(&serial), Some(33), 33, &closures));
-    }
-
-    #[test]
-    fn collapsed_bound_floor_fails() {
-        let serial =
-            passing_serial().replace("\"kernel_floor\":1,\"sysgen_floor\":1", "\"floor\":1");
-        assert!(!assert_ok(&serial));
-    }
-
-    #[test]
-    fn wx_violation_fails() {
-        let serial = passing_serial().replace("\"rodata_nx_w\":false", "\"rodata_nx_w\":true");
-        assert!(!assert_ok(&serial));
-    }
-
-    #[test]
-    fn sequence_gap_reorder_or_duplicate_fails() {
-        let gap = passing_serial().replacen("\"seq\":5,", "\"seq\":50,", 1);
-        let duplicate = passing_serial().replacen("\"seq\":5,", "\"seq\":4,", 1);
-        let reorder = passing_serial().replacen("\"seq\":5,", "\"seq\":7,", 1);
-        let reorder = reorder.replacen("\"seq\":6,", "\"seq\":5,", 1);
-        assert!(!assert_ok(&gap), "gap must fail");
-        assert!(!assert_ok(&duplicate), "duplicate seq must fail");
-        assert!(!assert_ok(&reorder), "reordered seq must fail");
-    }
-
-    #[test]
-    fn post_halt_event_fails() {
-        let mut serial = passing_serial();
-        serial.push_str(r#"{"seq":99,"ev":"apic.timer.tick","n":9}"#);
-        serial.push('\n');
-        assert!(!assert_ok(&serial));
-    }
-
-    #[test]
-    fn test_fail_future_gate_fails() {
-        let serial = passing_serial().replace(
-            "\"ev\":\"halt\",\"outcome\":\"ok\"",
-            "\"ev\":\"test.fail\",\"name\":\"future_gate\"}\n{\"seq\":99,\"ev\":\"halt\",\"outcome\":\"ok\"",
-        );
-        assert!(serial.contains("future_gate"));
-        assert!(!assert_ok(&serial));
-    }
-
-    #[test]
-    fn missing_or_duplicate_domain_gate_fails() {
-        let missing = passing_serial().replacen(
-            "\"ev\":\"test.pass\",\"name\":\"fault_is_domain_scoped\"}\n",
-            "",
-            1,
-        );
-        assert!(!assert_ok(&missing), "missing domain gate must fail");
-
-        let duplicate = passing_serial().replace(
-            "\"ev\":\"halt\",\"outcome\":\"ok\"",
-            "\"ev\":\"test.pass\",\"name\":\"fault_is_domain_scoped\"}\n{\"seq\":99,\"ev\":\"halt\",\"outcome\":\"ok\"",
-        );
-        assert!(!assert_ok(&duplicate), "duplicate domain gate must fail");
-    }
-
-    #[test]
-    fn duplicate_or_missing_required_event_fails() {
-        let duplicate_boot =
-            passing_serial().replacen("\"ev\":\"mem.map\"", "\"ev\":\"boot.entry\"", 1);
-        let missing_map =
-            passing_serial().replacen("\"ev\":\"mem.map\"", "\"ev\":\"apic.timer.start\"", 1);
-        assert!(!assert_ok(&duplicate_boot));
-        assert!(!assert_ok(&missing_map));
-    }
-
-    #[test]
-    fn reordered_closure_and_m1_events_fail() {
-        let serial = passing_serial().replace("handoff.bound", "tmp.handoff");
-        let serial = serial.replace("closure.kernel", "handoff.bound");
-        let serial = serial.replace("tmp.handoff", "closure.kernel");
-        assert!(
-            !assert_ok(&serial),
-            "handoff.bound after closure.kernel must fail"
-        );
-        let serial = passing_serial().replace("closure.bound", "tmp.bound");
-        let serial = serial.replace("mem.map", "closure.bound");
-        let serial = serial.replace("tmp.bound", "mem.map");
-        assert!(!assert_ok(&serial), "closure.bound after mem.map must fail");
-        let serial = passing_serial().replace("closure.kernel", "tmp.kernel");
-        let serial = serial.replace("paging.wx", "closure.kernel");
-        let serial = serial.replace("tmp.kernel", "paging.wx");
-        assert!(
-            !assert_ok(&serial),
-            "closure.kernel after paging.wx must fail"
-        );
-    }
-
-    #[test]
-    fn dual_closure_reject_or_mismatch_fails() {
-        let events = parse_events(&passing_serial());
-        let swapped = ExpectedClosures {
-            policy_generation: 1,
-            kernel_image_hex: expected().kernel_image_hex,
-            closure_table_hex: expected().closure_table_hex,
-            kernel_id_hex: expected().sysgen_id_hex,
-            sysgen_id_hex: expected().kernel_id_hex,
-            kernel_floor: 1,
-            sysgen_floor: 1,
-        };
-        assert!(!assert_boot(&events, Some(33), 33, &swapped));
-        let rejected = passing_serial().replace("closure.bound", "closure.reject");
-        assert!(!assert_ok(&rejected));
-    }
-
-    #[test]
-    fn rejected_sysgen_emits_no_success_bound_events() {
-        let serial = concat!(
-            "{\"seq\":0,\"ev\":\"boot.entry\"}\n",
-            "{\"seq\":1,\"ev\":\"idt.ready\",\"vectors\":32}\n",
-            "{\"seq\":2,\"ev\":\"closure.reject\",\"reason\":\"binding\"}\n",
-            "{\"seq\":3,\"ev\":\"halt\",\"outcome\":\"fail\"}\n",
-        );
-        let events = parse_events(serial);
-        assert!(rejected_without_success_bound_events(&events));
-
-        let contaminated = format!("{serial}{{\"seq\":4,\"ev\":\"handoff.bound\"}}\n");
-        assert!(!rejected_without_success_bound_events(&parse_events(
-            &contaminated
-        )));
-    }
-
-    #[test]
-    fn ring0_plan_mismatch_trace_requires_kernel_rejection_shape() {
-        let serial = concat!(
-            "{\"seq\":0,\"ev\":\"boot.entry\"}\n",
-            "{\"seq\":1,\"ev\":\"idt.ready\",\"vectors\":32}\n",
-            "{\"seq\":2,\"ev\":\"closure.reject\",\"reason\":\"plan_mismatch\"}\n",
-            "{\"seq\":3,\"ev\":\"halt\",\"outcome\":\"fault\"}\n",
-        );
-        assert!(assert_ring0_plan_mismatch(&parse_events(serial), Some(35)));
-
-        let loader_reject = serial.replace("plan_mismatch", "binding");
-        assert!(!assert_ring0_plan_mismatch(
-            &parse_events(&loader_reject),
-            Some(35)
-        ));
-        let contaminated = format!("{}{{\"seq\":4,\"ev\":\"handoff.bound\"}}\n", serial);
-        assert!(!assert_ring0_plan_mismatch(
-            &parse_events(&contaminated),
-            Some(35)
-        ));
-        let success_exit = serial.replace("\"outcome\":\"fault\"", "\"outcome\":\"ok\"");
-        assert!(!assert_ring0_plan_mismatch(
-            &parse_events(&success_exit),
-            Some(33)
-        ));
-    }
-
-    #[test]
-    fn dual_closure_missing_bound_fails() {
-        let serial =
-            passing_serial().replace("\"ev\":\"closure.bound\"", "\"ev\":\"closure.kernel\"");
-        assert!(!assert_ok(&serial));
-    }
-}
+mod tests;

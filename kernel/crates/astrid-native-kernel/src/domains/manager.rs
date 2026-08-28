@@ -2,23 +2,23 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use spin::Mutex;
+use spin::{Mutex, Once};
 use x86_64::VirtAddr;
+use x86_64::registers::control::{Cr3, Cr3Flags};
+use x86_64::structures::paging::{PhysFrame, Size4KiB};
 
 use astrid_system_generation::ContentId;
 
 use super::paging::AddressSpace;
 use super::types::{
-    BindError, CODE_BASE, ComponentImage, DomainHandle, DomainPagingError, ENTRYPOINT,
-    KERNEL_STACK_TOP, Outcome, PEER_PROBE, SLOT_CAPACITY, Scenario,
+    BindError, CODE_BASE, ComponentImage, DomainGeneration, DomainHandle, DomainId,
+    DomainPagingError, ENTRYPOINT, KERNEL_STACK_TOP, Outcome, PEER_PROBE, SLOT_CAPACITY, Scenario,
 };
 use crate::apic;
 use crate::gdt;
 use crate::memory::FRAME_SIZE;
 use crate::serial;
 use crate::trap::TrapFrame;
-use x86_64::registers::control::Cr3;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PrepareError {
     Bind(BindError),
@@ -26,6 +26,8 @@ pub(crate) enum PrepareError {
     ResourceCapacity,
     SlotCapacity,
     GenerationExhausted,
+    ActiveDomain,
+    WrongCr3,
 }
 
 impl PrepareError {
@@ -36,6 +38,29 @@ impl PrepareError {
             Self::ResourceCapacity => "resource_capacity",
             Self::SlotCapacity => "slot_capacity",
             Self::GenerationExhausted => "generation_exhausted",
+            Self::ActiveDomain => "active_domain",
+            Self::WrongCr3 => "wrong_cr3",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CancelError {
+    StaleHandle,
+    NotPrepared,
+    ActiveDomain,
+    WrongCr3,
+    ReleaseFailed,
+}
+
+impl CancelError {
+    pub(crate) const fn as_reason(self) -> &'static str {
+        match self {
+            Self::StaleHandle => "stale_handle",
+            Self::NotPrepared => "not_prepared",
+            Self::ActiveDomain => "active_domain",
+            Self::WrongCr3 => "wrong_cr3",
+            Self::ReleaseFailed => "release_failed",
         }
     }
 }
@@ -53,6 +78,13 @@ struct ReclaimStats {
 }
 
 impl ReclaimStats {
+    const fn zero() -> Self {
+        Self {
+            expected: 0,
+            freed: 0,
+        }
+    }
+
     const fn exactly_once(self) -> bool {
         self.expected > 0 && self.expected == self.freed
     }
@@ -62,8 +94,15 @@ impl ReclaimStats {
 enum DomainState {
     Prepared,
     Running,
-    Dying,
+    Releasing,
     Reclaimed,
+    ReleaseFailed,
+}
+
+impl DomainState {
+    const fn is_live(self) -> bool {
+        matches!(self, Self::Prepared | Self::Running)
+    }
 }
 
 struct Domain {
@@ -92,6 +131,8 @@ struct Current {
     active: AtomicBool,
     slot: AtomicU64,
     generation: AtomicU64,
+    root: AtomicU64,
+    root_flags: AtomicU64,
     entered: AtomicBool,
     ticks: AtomicU32,
     quota: AtomicU32,
@@ -103,6 +144,8 @@ static CURRENT: Current = Current {
     active: AtomicBool::new(false),
     slot: AtomicU64::new(0),
     generation: AtomicU64::new(0),
+    root: AtomicU64::new(0),
+    root_flags: AtomicU64::new(0),
     entered: AtomicBool::new(false),
     ticks: AtomicU32::new(0),
     quota: AtomicU32::new(0),
@@ -124,7 +167,35 @@ struct TrapContext {
 
 static TERMINAL_CONTEXT: Mutex<Option<TrapContext>> = Mutex::new(None);
 
+static KERNEL_CR3: Once<(PhysFrame<Size4KiB>, Cr3Flags)> = Once::new();
+
 static RESUME_STACK_END: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn init_kernel_cr3() {
+    KERNEL_CR3.call_once(Cr3::read);
+}
+
+fn lifecycle_context_error(
+    active: bool,
+    current: Option<(PhysFrame<Size4KiB>, Cr3Flags)>,
+    expected: Option<(PhysFrame<Size4KiB>, Cr3Flags)>,
+) -> Option<PrepareError> {
+    if active {
+        return Some(PrepareError::ActiveDomain);
+    }
+    let Some(expected) = expected else {
+        return Some(PrepareError::WrongCr3);
+    };
+    (current != Some(expected)).then_some(PrepareError::WrongCr3)
+}
+
+fn lifecycle_error() -> Option<PrepareError> {
+    lifecycle_context_error(
+        CURRENT.active.load(Ordering::SeqCst),
+        Some(Cr3::read()),
+        KERNEL_CR3.get().copied(),
+    )
+}
 
 pub(crate) fn init_resume_stack() {
     RESUME_STACK_END.store(aligned_stack_end(), Ordering::SeqCst);
@@ -147,11 +218,49 @@ fn current_stack_pointer() -> u64 {
     pointer
 }
 
+fn guest_entry_state_ok(frame: &TrapFrame, scenario: u64) -> bool {
+    let (fs, gs) = guest_segment_selectors();
+    frame.rdi == scenario
+        && [
+            frame.rax, frame.rbx, frame.rcx, frame.rdx, frame.rsi, frame.rbp, frame.r8, frame.r9,
+            frame.r10, frame.r11, frame.r12, frame.r13, frame.r14, frame.r15,
+        ]
+        .into_iter()
+        .all(|value| value == 0)
+        && fs == 0
+        && gs == 0
+}
+
+fn guest_segment_selectors() -> (u64, u64) {
+    let fs: u16;
+    let gs: u16;
+    // SAFETY: reads the FS/GS selectors without changing state.
+    unsafe {
+        core::arch::asm!(
+            "mov {fs:x}, fs",
+            "mov {gs:x}, gs",
+            fs = out(reg) fs,
+            gs = out(reg) gs,
+            options(nomem, preserves_flags)
+        );
+    }
+    (fs as u64, gs as u64)
+}
+
+pub(crate) fn kernel_cr3_restored() -> bool {
+    KERNEL_CR3
+        .get()
+        .is_some_and(|expected| Cr3::read() == *expected)
+}
+
 pub(crate) fn prepare(
     raw: &[u8],
     expected_identity: ContentId,
     scenario: Scenario,
 ) -> Result<DomainHandle, PrepareError> {
+    if let Some(error) = lifecycle_error() {
+        return Err(error);
+    }
     let image = ComponentImage::parse(raw).map_err(PrepareError::Bind)?;
     if image.identity() != expected_identity {
         return Err(PrepareError::Bind(BindError::HashMismatch));
@@ -165,12 +274,18 @@ pub(crate) fn prepare(
                 .is_none_or(|domain| domain.state == DomainState::Reclaimed)
         })
         .ok_or(PrepareError::SlotCapacity)?;
+    let generation = match manager.slots[slot].as_ref().map(|domain| domain.generation) {
+        Some(previous) => previous
+            .checked_add(1)
+            .ok_or(PrepareError::GenerationExhausted)?,
+        None => 1,
+    };
     let probe = PEER_PROBE + slot as u64 * FRAME_SIZE;
     let space = AddressSpace::new(image, probe).map_err(PrepareError::Paging)?;
     let needed = space.required_frames();
     if manager.used_frames + needed > super::types::RESOURCE_CAPACITY as u64 {
         let mut space = space;
-        space.release();
+        space.discard();
         return Err(PrepareError::ResourceCapacity);
     }
     let audit_ok = space.audit();
@@ -179,18 +294,11 @@ pub(crate) fn prepare(
     serial::ev_domain_policy(audit_ok, stack_zeroed, probe_zeroed);
     if !audit_ok || !stack_zeroed || !probe_zeroed {
         let mut space = space;
-        space.release();
+        space.discard();
         return Err(PrepareError::Paging(
             super::types::DomainPagingError::PolicyViolation,
         ));
     }
-    let generation = match manager.slots[slot].as_ref() {
-        Some(previous) => previous
-            .generation
-            .checked_add(1)
-            .ok_or(PrepareError::GenerationExhausted)?,
-        None => 1,
-    };
     manager.used_frames += needed;
     manager.slots[slot] = Some(Domain {
         generation,
@@ -208,15 +316,12 @@ pub(crate) fn prepare(
 
 pub(crate) fn identity(handle: DomainHandle) -> Option<DomainIdentity> {
     let manager = MANAGER.lock();
-    manager.valid_domain(handle).map(|domain| {
-        let space = domain
-            .space
-            .as_ref()
-            .expect("prepared domain has an address space");
-        DomainIdentity {
+    manager.valid_domain(handle).and_then(|domain| {
+        let space = domain.space.as_ref()?;
+        Some(DomainIdentity {
             root: space.root_phys(),
             probe: space.probe(),
-        }
+        })
     })
 }
 
@@ -265,7 +370,10 @@ pub(crate) fn peer_is_prepared(handle: DomainHandle) -> bool {
 }
 
 pub(crate) fn start(handle: DomainHandle, scenario: Scenario) -> Result<(), PrepareError> {
-    let plan = {
+    if let Some(error) = lifecycle_error() {
+        return Err(error);
+    }
+    let context = {
         let mut manager = MANAGER.lock();
         let Some(domain) = manager.valid_domain_mut(handle) else {
             return Err(PrepareError::Bind(BindError::NotInstalled));
@@ -273,18 +381,28 @@ pub(crate) fn start(handle: DomainHandle, scenario: Scenario) -> Result<(), Prep
         if domain.state != DomainState::Prepared || domain.scenario != scenario {
             return Err(PrepareError::Bind(BindError::Malformed));
         }
-        let space = domain
-            .space
-            .as_ref()
-            .expect("prepared domain has an address space");
+        let Some(space) = domain.space.as_ref() else {
+            return Err(PrepareError::Paging(
+                super::types::DomainPagingError::PolicyViolation,
+            ));
+        };
+        if let Some(error) = lifecycle_error() {
+            return Err(error);
+        }
         let root = space.root_phys();
         let user_stack = space.user_stack_top();
+        let quota = domain.quota_ticks;
+        let source = space.source_root();
+        if Cr3::read() != source {
+            return Err(PrepareError::WrongCr3);
+        }
         domain.state = DomainState::Running;
-        (root, user_stack, domain.quota_ticks, scenario)
+        (root, user_stack, quota, scenario)
     };
-    let (root, user_end, quota, scenario) = plan;
+    let (root, user_end, quota, scenario) = context;
     gdt::set_privilege_stack(VirtAddr::new(KERNEL_STACK_TOP));
     apic::unmask_timer();
+    let (_, source_flags) = Cr3::read();
     CURRENT.stack_end.store(user_end, Ordering::SeqCst);
     CURRENT.slot.store(handle.id().0, Ordering::SeqCst);
     CURRENT
@@ -293,6 +411,10 @@ pub(crate) fn start(handle: DomainHandle, scenario: Scenario) -> Result<(), Prep
     CURRENT.ticks.store(0, Ordering::SeqCst);
     CURRENT.quota.store(quota, Ordering::SeqCst);
     CURRENT.scenario.store(scenario.value(), Ordering::SeqCst);
+    CURRENT.root.store(root, Ordering::SeqCst);
+    CURRENT
+        .root_flags
+        .store(source_flags.bits(), Ordering::SeqCst);
     CURRENT.entered.store(false, Ordering::SeqCst);
     CURRENT.active.store(true, Ordering::SeqCst);
     serial::ev_domain_started(handle.id().0 + 1, handle.generation().0, scenario.value());
@@ -305,23 +427,44 @@ fn enter_user(root: u64, stack: u64, scenario: u64) -> ! {
     let user_code = user_code.0 as u64;
     // SAFETY: the address space was audited; the TSS has a real guarded RSP0;
     // the user selectors, entry, stack, and quota were validated by admission.
+    // Guest GP inputs are explicit: RDI carries the scenario and every other
+    // guest-visible GP register and FS/GS selector starts at zero. The entry
+    // address is staged through R12 because RBX must be cleared after use.
     unsafe {
         core::arch::asm!(
-            "mov cr3, {root}",
-            "mov rdi, {scenario}",
-            "push {user_data}",
-            "push {user_stack}",
-            "push {rflags}",
-            "push {user_code}",
-            "push {entry}",
+            "mov rbx, {entry}",
+            "mov r12, rbx",
+            "mov cr3, rcx",
+            "xor eax, eax",
+            "xor ebx, ebx",
+            "xor edx, edx",
+            "xor esi, esi",
+            "xor edi, edi",
+            "mov edi, r8d",
+            "xor ebp, ebp",
+            "xor r13d, r13d",
+            "xor r14d, r14d",
+            "xor r15d, r15d",
+            "xor ecx, ecx",
+            "mov fs, cx",
+            "mov gs, cx",
+            "push r9",
+            "push r10",
+            "push 0x202",
+            "push r11",
+            "push r12",
+            "xor r9d, r9d",
+            "xor r10d, r10d",
+            "xor r11d, r11d",
+            "xor r12d, r12d",
+            "xor r8d, r8d",
             "iretq",
-            root = in(reg) root,
-            user_data = in(reg) user_data,
-            user_stack = in(reg) stack,
-            rflags = in(reg) 0x202u64,
-            user_code = in(reg) user_code,
+            in("rcx") root,
+            in("r9") user_data,
+            in("r10") stack,
+            in("r11") user_code,
             entry = in(reg) CODE_BASE + ENTRYPOINT,
-            scenario = in(reg) scenario,
+            in("r8") scenario,
             options(noreturn)
         );
     }
@@ -348,13 +491,36 @@ pub(crate) fn handle_domain_trap(frame: &mut TrapFrame, fault_address: u64) -> b
     if !CURRENT.active.load(Ordering::SeqCst) || frame.cs & 3 != 3 {
         return false;
     }
+    let expected_root = CURRENT.root.load(Ordering::SeqCst);
+    let expected_flags = CURRENT.root_flags.load(Ordering::SeqCst);
+    let (current_root, current_flags) = Cr3::read();
+    if current_root.start_address().as_u64() != expected_root
+        || current_flags.bits() != expected_flags
+    {
+        serial::ev_domain_trap_reject("cr3_mismatch");
+        serial::ev_domain_harness(false);
+        serial::ev_halt(false);
+        serial::exit_qemu(false);
+    }
     if !CURRENT.entered.swap(true, Ordering::SeqCst) {
+        let (context_root, context_flags) = Cr3::read();
+        let (fs, gs) = guest_segment_selectors();
+        let entry_state_ok = guest_entry_state_ok(frame, CURRENT.scenario.load(Ordering::SeqCst));
         serial::ev_domain_entered(
             CURRENT.slot.load(Ordering::SeqCst) + 1,
             CURRENT.generation.load(Ordering::SeqCst),
             frame.cs & 3,
         );
-        super::harness::record_entry(frame.cs & 3);
+        serial::ev_domain_context(
+            CURRENT.slot.load(Ordering::SeqCst) + 1,
+            CURRENT.generation.load(Ordering::SeqCst),
+            context_root.start_address().as_u64(),
+            context_flags.bits(),
+            frame.cs & 3,
+            fs,
+            gs,
+        );
+        super::harness::record_entry(frame.cs & 3, entry_state_ok);
     }
     let vector = frame.vector as u8;
     if vector == 14 {
@@ -389,6 +555,20 @@ pub(crate) fn handle_domain_trap(frame: &mut TrapFrame, fault_address: u64) -> b
         frame.cs & 3,
         frame.rdi,
         frame.rsp,
+        frame.rax,
+        frame.rbx,
+        frame.rcx,
+        frame.rdx,
+        frame.rsi,
+        frame.rbp,
+        frame.r8,
+        frame.r9,
+        frame.r10,
+        frame.r11,
+        frame.r12,
+        frame.r13,
+        frame.r14,
+        frame.r15,
     );
     let context = TrapContext {
         slot: CURRENT.slot.load(Ordering::SeqCst),
@@ -428,6 +608,8 @@ extern "C" fn domain_terminal() -> ! {
     );
     let stats = MANAGER.lock().terminate(handle, context.outcome, &context);
     CURRENT.active.store(false, Ordering::SeqCst);
+    CURRENT.root.store(0, Ordering::SeqCst);
+    CURRENT.root_flags.store(0, Ordering::SeqCst);
     if !stats.exactly_once() {
         serial::ev_domain_harness(false);
         serial::ev_halt(false);
@@ -465,74 +647,124 @@ extern "C" fn domain_terminal() -> ! {
     }
 }
 
-pub(crate) fn cancel(handle: DomainHandle) -> (u64, u64) {
+pub(crate) fn cancel(handle: DomainHandle) -> Result<(u64, u64), CancelError> {
     MANAGER.lock().cancel_prepared(handle)
+}
+
+pub(crate) fn active_lifecycle_guard_rejects(
+    handle: DomainHandle,
+    scenario: Scenario,
+    raw: &[u8],
+    expected: ContentId,
+) -> bool {
+    let frames = outstanding_frames();
+    CURRENT.active.store(true, Ordering::SeqCst);
+    let prepare_rejected = matches!(
+        prepare(raw, expected, scenario),
+        Err(PrepareError::ActiveDomain)
+    );
+    let start_rejected = matches!(start(handle, scenario), Err(PrepareError::ActiveDomain));
+    let cancel_rejected = matches!(cancel(handle), Err(CancelError::ActiveDomain));
+    CURRENT.active.store(false, Ordering::SeqCst);
+    prepare_rejected
+        && start_rejected
+        && cancel_rejected
+        && outstanding_frames() == frames
+        && !is_stale(handle)
+}
+
+pub(crate) fn generation_overflow_rejects_prepare(raw: &[u8], expected: ContentId) -> bool {
+    let frames = outstanding_frames();
+    {
+        let mut manager = MANAGER.lock();
+        if manager.slots[0].is_some() {
+            return false;
+        }
+        manager.slots[0] = Some(Domain {
+            generation: u64::MAX,
+            state: DomainState::Reclaimed,
+            scenario: Scenario::Exit,
+            quota_ticks: 0,
+            space: None,
+        });
+    }
+    let rejected = matches!(
+        prepare(raw, expected, Scenario::Exit),
+        Err(PrepareError::GenerationExhausted)
+    );
+    let mut manager = MANAGER.lock();
+    let unchanged = manager.slots[0].as_ref().is_some_and(|domain| {
+        domain.generation == u64::MAX && domain.state == DomainState::Reclaimed
+    });
+    manager.slots[0] = None;
+    rejected && unchanged && manager.used_frames == frames
 }
 
 impl Manager {
     fn valid_domain(&self, handle: DomainHandle) -> Option<&Domain> {
         let slot = self.slots.get(handle.id().0 as usize)?;
         let domain = slot.as_ref()?;
-        (domain.generation == handle.generation().0 && domain.state != DomainState::Reclaimed)
-            .then_some(domain)
+        (domain.generation == handle.generation().0 && domain.state.is_live()).then_some(domain)
     }
 
     fn valid_domain_mut(&mut self, handle: DomainHandle) -> Option<&mut Domain> {
         let slot = self.slots.get_mut(handle.id().0 as usize)?;
         let domain = slot.as_mut()?;
-        (domain.generation == handle.generation().0 && domain.state != DomainState::Reclaimed)
-            .then_some(domain)
+        (domain.generation == handle.generation().0 && domain.state.is_live()).then_some(domain)
     }
 
     fn release_slot(&mut self, handle: DomainHandle) -> ReclaimStats {
         let Some(slot) = self.slots.get_mut(handle.id().0 as usize) else {
-            return ReclaimStats {
-                expected: 0,
-                freed: 0,
-            };
+            return ReclaimStats::zero();
         };
         let Some(domain) = slot.as_mut() else {
-            return ReclaimStats {
-                expected: 0,
-                freed: 0,
-            };
+            return ReclaimStats::zero();
         };
-        if !matches!(domain.state, DomainState::Prepared | DomainState::Running) {
-            return ReclaimStats {
-                expected: 0,
-                freed: 0,
-            };
+        if domain.generation != handle.generation().0 || !domain.state.is_live() {
+            return ReclaimStats::zero();
         }
-        domain.state = DomainState::Dying;
+
+        let generation = domain.generation;
         let identity = domain.space.as_ref().map(|space| DomainIdentity {
             root: space.root_phys(),
             probe: space.probe(),
         });
         self.last_identity = identity;
-        let Some(mut space) = domain.space.take() else {
-            domain.state = DomainState::Reclaimed;
-            return ReclaimStats {
-                expected: 0,
-                freed: 0,
-            };
+        domain.state = DomainState::Releasing;
+        let Some(space) = domain.space.as_mut() else {
+            domain.state = DomainState::ReleaseFailed;
+            return ReclaimStats::zero();
         };
-        let (expected, freed) = space.release();
-        let restored = Cr3::read() == space.source_root();
-        serial::ev_domain_restore(restored);
+        let status = space.release(DomainId(handle.id().0), DomainGeneration(generation));
+        let (expected, freed) = match status {
+            super::paging::ReleaseStatus::Released(expected, freed) => (expected, freed),
+            super::paging::ReleaseStatus::RestoreFailed => {
+                domain.state = DomainState::ReleaseFailed;
+                return ReclaimStats::zero();
+            },
+            super::paging::ReleaseStatus::ReclaimBlocked(expected, freed) => {
+                domain.state = DomainState::ReleaseFailed;
+                (expected, freed)
+            },
+        };
         let Some(domain) = slot.as_mut() else {
-            unreachable!("the dying domain remains in its slot");
+            return ReclaimStats { expected, freed };
         };
-        domain.state = DomainState::Reclaimed;
-        self.used_frames = self.used_frames.saturating_sub(expected);
-        serial::ev_domain_reclaimed(
-            handle.id().0 + 1,
-            domain.generation,
-            expected,
-            freed,
-            freed,
-            expected - freed,
-        );
-        ReclaimStats { expected, freed }
+        if expected > 0 && expected == freed {
+            domain.state = DomainState::Reclaimed;
+            self.used_frames = self.used_frames.saturating_sub(expected);
+            serial::ev_domain_reclaimed(
+                handle.id().0 + 1,
+                domain.generation,
+                expected,
+                freed,
+                freed,
+                expected - freed,
+            );
+            ReclaimStats { expected, freed }
+        } else {
+            ReclaimStats { expected, freed }
+        }
     }
 
     fn terminate(
@@ -542,6 +774,7 @@ impl Manager {
         event: &TrapContext,
     ) -> ReclaimStats {
         serial::ev_domain_outcome(
+            serial::DomainEventIdentity::new(event.slot + 1, event.generation),
             outcome.name(),
             event.vector,
             event.error_code,
@@ -552,12 +785,53 @@ impl Manager {
         self.release_slot(handle)
     }
 
-    fn cancel_prepared(&mut self, handle: DomainHandle) -> (u64, u64) {
-        if let Some(domain) = self.valid_domain(handle) {
-            serial::ev_domain_cancelled(handle.id().0 + 1, domain.generation);
+    fn cancel_prepared(&mut self, handle: DomainHandle) -> Result<(u64, u64), CancelError> {
+        if CURRENT.active.load(Ordering::SeqCst) {
+            return Err(CancelError::ActiveDomain);
         }
-        serial::ev_domain_outcome(Outcome::Cancelled.name(), 0, 0, 0, 0, 0);
+        let Some(domain) = self.valid_domain(handle) else {
+            serial::ev_domain_cancel_rejected(
+                handle.id().0 + 1,
+                handle.generation().0,
+                CancelError::StaleHandle.as_reason(),
+            );
+            return Err(CancelError::StaleHandle);
+        };
+        if domain.state == DomainState::Running {
+            return Err(CancelError::ActiveDomain);
+        }
+        if domain.state != DomainState::Prepared {
+            serial::ev_domain_cancel_rejected(
+                handle.id().0 + 1,
+                domain.generation,
+                CancelError::NotPrepared.as_reason(),
+            );
+            return Err(CancelError::NotPrepared);
+        }
+        let Some(space) = domain.space.as_ref() else {
+            return Err(CancelError::NotPrepared);
+        };
+        let source = space.source_root();
+        if KERNEL_CR3.get().is_none_or(|expected| *expected != source) || Cr3::read() != source {
+            return Err(CancelError::WrongCr3);
+        }
+        let generation = domain.generation;
+        serial::ev_domain_cancel_request(handle.id().0 + 1, generation);
         let stats = self.release_slot(handle);
-        (stats.expected, stats.freed)
+        if stats.exactly_once() {
+            serial::ev_domain_cancelled(handle.id().0 + 1, generation);
+            serial::ev_domain_outcome(
+                serial::DomainEventIdentity::new(handle.id().0 + 1, generation),
+                Outcome::Cancelled.name(),
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+            Ok((stats.expected, stats.freed))
+        } else {
+            Err(CancelError::ReleaseFailed)
+        }
     }
 }

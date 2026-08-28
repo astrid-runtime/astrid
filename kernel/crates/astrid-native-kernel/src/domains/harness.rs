@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use astrid_system_generation::ContentId;
 use astrid_system_generation::emulator_fixture::EMULATOR_COMPONENT_LEN;
 
-use super::manager::{self, DomainIdentity, PrepareError};
+use super::manager::{self, CancelError, DomainIdentity, PrepareError};
 use super::types::{BindError, ComponentImage, DomainGeneration, DomainHandle, DomainId};
 use super::types::{Outcome, Scenario};
 use crate::closure::{authenticated_component, authenticated_component_id};
@@ -20,6 +20,11 @@ const QUOTA_GATE: &str = "quota_preempts_infinite_loop_and_preserves_peer";
 const FAULT_GATE: &str = "fault_is_domain_scoped";
 const RECLAIM_GATE: &str = "reclaim_exactly_once_under_fault_kill_cancel";
 const CLEAN_RESTART_GATE: &str = "hostile_first_then_clean_second_domain";
+const ENTRY_STATE_GATE: &str = "guest_gp_fs_gs_entry_contract";
+const ACTIVE_GUARD_GATE: &str = "active_domain_lifecycle_exclusion";
+const STALE_GATE: &str = "stale_handle_rejection";
+const OVERFLOW_GATE: &str = "generation_overflow_is_fail_closed";
+const RESTORE_GATE: &str = "exact_kernel_cr3_restore";
 
 const PHASE_ENTRY: u64 = 0;
 const PHASE_INVALID_PREPARE: u64 = 1;
@@ -49,6 +54,12 @@ static RUNTIME_PEER_EXCLUDED: AtomicBool = AtomicBool::new(false);
 static RECLAIM_ONCE: AtomicBool = AtomicBool::new(true);
 static ENTERED_CPL3: AtomicBool = AtomicBool::new(false);
 static CLEAN_RESTART_OK: AtomicBool = AtomicBool::new(false);
+static ENTRY_STATE_OK: AtomicBool = AtomicBool::new(false);
+static ENTRY_STATE_OBSERVED: AtomicBool = AtomicBool::new(false);
+static ACTIVE_GUARD_OK: AtomicBool = AtomicBool::new(false);
+static STALE_OK: AtomicBool = AtomicBool::new(false);
+static OVERFLOW_OK: AtomicBool = AtomicBool::new(false);
+static RESTORE_OK: AtomicBool = AtomicBool::new(false);
 
 fn handle(storage: &AtomicU64) -> DomainHandle {
     let bits = storage.load(Ordering::SeqCst);
@@ -109,8 +120,11 @@ pub(crate) fn record_outcome(outcome: Outcome, reclaim_once: bool) {
     }
 }
 
-pub(crate) fn record_entry(cpl: u64) {
-    ENTERED_CPL3.store(cpl == 3, Ordering::SeqCst);
+pub(crate) fn record_entry(cpl: u64, entry_state_ok: bool) {
+    if !ENTRY_STATE_OBSERVED.swap(true, Ordering::SeqCst) {
+        ENTERED_CPL3.store(cpl == 3, Ordering::SeqCst);
+        ENTRY_STATE_OK.store(entry_state_ok, Ordering::SeqCst);
+    }
 }
 
 pub(crate) fn scheduler() -> ! {
@@ -127,6 +141,13 @@ pub(crate) fn scheduler() -> ! {
 }
 
 pub(crate) fn start(raw: &[u8], expected: ContentId) -> ! {
+    OVERFLOW_OK.store(
+        report(
+            OVERFLOW_GATE,
+            manager::generation_overflow_rejects_prepare(raw, expected),
+        ),
+        Ordering::SeqCst,
+    );
     let authenticated = auth_gate(raw, expected);
     AUTH_OK.store(authenticated, Ordering::SeqCst);
     if !authenticated {
@@ -168,6 +189,13 @@ fn advance_fault_prepare() -> ! {
     if !report(ENTRY_GATE, entry_ok) {
         fail("ring3_entry_not_observed");
     }
+    ENTRY_STATE_OK.store(
+        report(ENTRY_STATE_GATE, ENTRY_STATE_OK.load(Ordering::SeqCst)),
+        Ordering::SeqCst,
+    );
+    if !ENTRY_STATE_OK.load(Ordering::SeqCst) {
+        fail("guest_entry_state_not_cleared");
+    }
     let raw = authenticated_component();
     let expected = authenticated_component_id();
     let invalid = prepare_domain(&raw, expected, Scenario::InvalidInstruction);
@@ -183,9 +211,29 @@ fn invalid_completed() -> ! {
     if !report(INVALID_OPCODE_GATE, pass) {
         fail("invalid_opcode_was_not_domain_scoped");
     }
+
+    RESTORE_OK.store(
+        report(RESTORE_GATE, manager::kernel_cr3_restored()),
+        Ordering::SeqCst,
+    );
+    let entry = handle(&ENTRY_HANDLE);
     let raw = authenticated_component();
     let expected = authenticated_component_id();
     let fault = prepare_domain(&raw, expected, Scenario::PageFault);
+
+    let active_ok =
+        manager::active_lifecycle_guard_rejects(fault, Scenario::PageFault, &raw, expected);
+    ACTIVE_GUARD_OK.store(report(ACTIVE_GUARD_GATE, active_ok), Ordering::SeqCst);
+
+    let frames_before = manager::outstanding_frames();
+    let newer_generation = manager::generation(fault);
+    let stale_result = manager::cancel(entry);
+    let stale_ok = matches!(stale_result, Err(CancelError::StaleHandle))
+        && manager::outstanding_frames() == frames_before
+        && manager::generation(fault) == newer_generation
+        && !manager::is_stale(fault);
+    STALE_OK.store(report(STALE_GATE, stale_ok), Ordering::SeqCst);
+
     store_handle(&FAULT_HANDLE, fault);
     let peer = prepare_domain(&raw, expected, Scenario::CancelOnly);
     store_handle(&PEER_HANDLE, peer);
@@ -197,7 +245,9 @@ fn fault_completed() -> ! {
     let fault = handle(&FAULT_HANDLE);
     let peer = handle(&PEER_HANDLE);
     let peer_preserved = manager::peer_is_prepared(fault);
-    let (expected, freed) = manager::cancel(peer);
+    let Ok((expected, freed)) = manager::cancel(peer) else {
+        fail("prepared_peer_cancel_rejected");
+    };
     let scoped = manager::is_stale(fault) && peer_preserved && expected > 0 && expected == freed;
     FAULT_SCOPED_OK.store(scoped, Ordering::SeqCst);
 
@@ -283,14 +333,28 @@ fn clean_second_started() -> ! {
     let prior_gates = AUTH_OK.load(Ordering::SeqCst)
         && ENTRY_OK.load(Ordering::SeqCst)
         && INVALID_OPCODE_OK.load(Ordering::SeqCst)
+        && ENTRY_STATE_OK.load(Ordering::SeqCst)
+        && ACTIVE_GUARD_OK.load(Ordering::SeqCst)
+        && STALE_OK.load(Ordering::SeqCst)
+        && OVERFLOW_OK.load(Ordering::SeqCst)
+        && RESTORE_OK.load(Ordering::SeqCst)
         && PAGING_OK.load(Ordering::SeqCst)
         && QUOTA_OK.load(Ordering::SeqCst)
         && FAULT_SCOPED_OK.load(Ordering::SeqCst)
         && reclaim_pass;
     let restart_ok = prior_gates && fresh && clean_zeroed && manager::outstanding_frames() > 0;
     CLEAN_RESTART_OK.store(restart_ok, Ordering::SeqCst);
-    if !restart_ok {
-        fail("clean_second_domain_was_not_fresh");
+    if !prior_gates {
+        fail("clean_prior_gates_failed");
+    }
+    if !fresh {
+        fail("clean_fresh_identity_failed");
+    }
+    if !clean_zeroed {
+        fail("clean_fresh_zeroing_failed");
+    }
+    if manager::outstanding_frames() == 0 {
+        fail("clean_fresh_frames_missing");
     }
     set_phase(PHASE_DONE);
     start_domain(clean, Scenario::Exit);

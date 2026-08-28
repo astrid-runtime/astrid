@@ -27,17 +27,6 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   bounded to 4096 bytes so `astrid storage` can render them instead of rejecting
   the provider as an invalid structured error. Generic mount, permission, lease,
   and rollback failures stay `provider-operation` hard errors. Closes #1567.
-### Added
-
-- **The q35/TCG development kernel now establishes isolated native
-  protection domains.** Authenticated non-empty component bytes bind before
-  success evidence to a private ring-3 entry with owned page tables, bounded
-  stack/frame/quota limits, monotonic reuse identities, W^X and kernel/peer
-  exclusion, exact CR3 restoration, typed fault containment, and exactly-once
-  reclamation. A hostile first domain can be reclaimed before a clean second
-  domain starts.
-  Refs #1704.
-
 - **A run-loop capsule serving a loopback TCP port can now handle connections
   concurrently.** A `#[astrid::run]` capsule that declares a TCP `net_bind` and
   no `host_process` may set `bind_workers = N` to run N worker Stores, each
