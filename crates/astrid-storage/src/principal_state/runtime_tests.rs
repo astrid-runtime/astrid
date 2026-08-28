@@ -4,7 +4,10 @@ use std::num::NonZeroU64;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::engine::{ObjectCacheCapacity, ObjectCacheController, RootTransaction};
+use crate::engine::{
+    DurableError, ObjectCacheCapacity, ObjectCacheController, PrincipalProjectionEngine,
+    PrincipalProjectionError, RootTransaction,
+};
 use crate::resources::ResidentMemoryAuthority;
 use crate::storage_model::{
     ObjectClass, ObjectFormatVersion, ObjectKind, ObjectReference, PhysicalIdentity, ProfileKind,
@@ -16,16 +19,20 @@ use crate::{AstridFilesystem, FilesystemPath};
 use astrid_core::profile::{DeviceKey, DeviceScope, PrincipalProfile};
 
 use super::*;
-use crate::content::{CONTENT_COMPONENT_LABEL, CatalogValue, LegacyCatalog, encode_legacy_catalog};
+use crate::content::{
+    CONTENT_COMPONENT_LABEL, CatalogValue, LegacyCatalog, PrincipalContentError,
+    encode_legacy_catalog,
+};
 use crate::{ChunkingProfile, ContentIngest, ContentName};
 
+mod owner_rejection_tests;
 mod staging_batch_tests;
 
 fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
     Arc::new(|owner: &StateOwner| {
         Ok(match owner {
             StateOwner::System => None,
-            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+            StateOwner::Principal(_) | StateOwner::Fleet(_) | StateOwner::User(_) => Some(u64::MAX),
         })
     })
 }
@@ -48,6 +55,28 @@ fn test_directory(aliases: &[&str]) -> PrincipalDirectory {
             .unwrap();
     }
     directory
+}
+
+fn filesystem_snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                directories.push(path);
+            } else {
+                let name = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                files.insert(name, std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    files
 }
 
 async fn create_test_principal(store: &RuntimePrincipalStore, alias: &str) -> PrincipalUid {
@@ -237,24 +266,6 @@ async fn closing_a_governed_cache_releases_physical_and_logical_leases() {
     assert_eq!(closed.physical_reserved_bytes, 0);
     assert!(closed.logical_leases.is_empty());
     authority.remove_principal(&owner).unwrap();
-}
-
-#[test]
-fn owner_codec_round_trips_only_canonical_values() {
-    let codec = StateOwnerCodecV2;
-    let owners = [
-        StateOwner::System,
-        test_owner("alice"),
-        StateOwner::Fleet(astrid_core::FleetUid::from_bytes([7; 32])),
-    ];
-    for owner in owners {
-        let encoded = codec.encode(&owner);
-        assert_eq!(codec.decode(&encoded), Some(owner));
-    }
-    assert_eq!(codec.decode(&[]), None);
-    assert_eq!(codec.decode(&[0, 0]), None);
-    assert_eq!(codec.decode(&[1]), None);
-    assert_eq!(codec.decode(&[1, b':']), None);
 }
 
 #[test]
@@ -1571,7 +1582,7 @@ async fn live_quota_blocks_growth_but_allows_recovery_and_system_state() {
     let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
         Ok(match owner {
             StateOwner::System => None,
-            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(27),
+            StateOwner::Principal(_) | StateOwner::Fleet(_) | StateOwner::User(_) => Some(27),
         })
     });
     let store = open_runtime_principal_store(&home, quota).await.unwrap();
@@ -1616,7 +1627,7 @@ async fn rejected_streaming_writes_do_not_grow_the_physical_volume() {
     let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
         Ok(match owner {
             StateOwner::System => None,
-            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(27),
+            StateOwner::Principal(_) | StateOwner::Fleet(_) | StateOwner::User(_) => Some(27),
         })
     });
     let store = open_runtime_principal_store(&home, quota).await.unwrap();

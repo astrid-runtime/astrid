@@ -30,19 +30,21 @@ async fn fixture() -> (
         .expect("legacy principal home");
     let principals = PrincipalDirectory::default();
     let quota_principals = principals.clone();
-    let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(move |owner: &StateOwner| {
-        Ok(match owner {
-            StateOwner::System => None,
+    let quota: Arc<dyn KvQuotaResolver<StateOwner>> =
+        Arc::new(move |owner: &StateOwner| match owner {
+            StateOwner::System => Ok(None),
             StateOwner::Principal(uid) => {
                 if quota_principals.contains_uid(*uid) {
-                    Some(u64::MAX)
+                    Ok(Some(u64::MAX))
                 } else {
-                    None
+                    Ok(None)
                 }
             },
-            StateOwner::Fleet(_) => Some(u64::MAX),
-        })
-    });
+            StateOwner::Fleet(_) => Ok(Some(u64::MAX)),
+            StateOwner::User(_) => Err(astrid_storage::StorageError::Internal(
+                "user StateOwner is not a supported kernel storage owner".to_owned(),
+            )),
+        });
     let store = open_runtime_principal_store_with_directory(&home, quota, principals.clone())
         .await
         .expect("store");
@@ -50,6 +52,35 @@ async fn fixture() -> (
         .register(principal.clone(), uid)
         .expect("register");
     (directory, home, store, principals, principal, uid)
+}
+
+#[test]
+fn kernel_quota_rejects_user_state_owner_fail_closed() {
+    let principals = PrincipalDirectory::default();
+    let quota_principals = principals.clone();
+    let quota: Arc<dyn KvQuotaResolver<StateOwner>> =
+        Arc::new(move |owner: &StateOwner| match owner {
+            StateOwner::System => Ok(None),
+            StateOwner::Principal(uid) => {
+                if quota_principals.contains_uid(*uid) {
+                    Ok(Some(u64::MAX))
+                } else {
+                    Ok(None)
+                }
+            },
+            StateOwner::Fleet(_) => Ok(Some(u64::MAX)),
+            StateOwner::User(_) => Err(astrid_storage::StorageError::Internal(
+                "user StateOwner is not a supported kernel storage owner".to_owned(),
+            )),
+        });
+    let user = astrid_core::UserUid::from_bytes([0x91; 32]);
+    let error = quota
+        .max_logical_bytes(&StateOwner::User(user))
+        .expect_err("user owners must not receive a kernel storage quota");
+    assert!(matches!(
+        error,
+        astrid_storage::StorageError::Internal(message) if message.contains("user StateOwner")
+    ));
 }
 
 #[tokio::test]

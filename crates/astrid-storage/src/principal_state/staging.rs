@@ -25,7 +25,7 @@ use super::native_io::private_file_identity;
 use super::native_io::{
     PrivateDirectory, PrivateFileIdentity, create_private_file, ensure_private_directory,
 };
-use super::{NativePrincipalContentStore, StateOwner};
+use super::{NativePrincipalContentStore, StateOwner, StateOwnerCodecV2};
 use crate::content::{ChunkingProfile, ContentBatchWriteOutcome, ContentName, ContentWriteOutcome};
 use crate::error::{StorageError, StorageResult};
 
@@ -314,6 +314,11 @@ impl NativeContentStagingArea {
         profile: ChunkingProfile,
         id: StagedContentId,
     ) -> StorageResult<StagedContentWriter> {
+        if StateOwnerCodecV2.encode_checked(&owner).is_none() {
+            return Err(StorageError::Internal(
+                "user StateOwner is not admitted by runtime owner codec V2".to_owned(),
+            ));
+        }
         let path = self.inner.generations.join(open_generation_name(id));
         let file = {
             let mut order = self.inner.seal_order.lock();

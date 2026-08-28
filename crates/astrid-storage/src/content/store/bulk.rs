@@ -292,6 +292,7 @@ where
         R: Read + Send,
         I: IntoIterator<Item = ContentIngest<R>>,
     {
+        self.admit_write_owner(principal)?;
         let ordered = ordered_ingests(ingests)?;
         let phase_observer = observe.then(|| Arc::new(BulkPhaseObserver::default()));
         let (completed, pending) = self.partition_cached_ingests(principal, ordered, cache)?;
