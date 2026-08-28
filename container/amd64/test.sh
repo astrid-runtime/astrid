@@ -42,7 +42,7 @@ fail() {
 parse_proc_status_field() {
   local status_file=$1
   local field=$2
-  awk -v field="$field" '$1 == field ":" { print $2; exit }' "$status_file"
+  awk -v field="$field" '$1 == field ":" && NF == 5 && $2 == 65532 && $3 == 65532 && $4 == 65532 && $5 == 65532 { print $2; exit }' "$status_file"
 }
 
 prepare_runtime_dir() {
