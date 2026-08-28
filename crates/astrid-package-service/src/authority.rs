@@ -98,17 +98,19 @@ pub struct AuthenticatedAuthority(AuthorityDecision);
 
 impl AuthenticatedAuthority {
     /// Binds issuer evidence to the canonical context digest.
-    #[must_use]
     pub fn bind(
         context: &OperationContext,
         issuer: AuthorityIssuer,
         evidence: Blake3Digest,
-    ) -> Self {
-        Self(AuthorityDecision {
+    ) -> PackageServiceResult<Self> {
+        if evidence.as_bytes() == &[0; 32] {
+            return Err(PackageServiceError::AuthorityIssuerRejected);
+        }
+        Ok(Self(AuthorityDecision {
             issuer,
             context_digest: *context.digest(),
             evidence,
-        })
+        }))
     }
 
     pub(crate) fn decision_digest(&self) -> AuthorityDecisionDigest {

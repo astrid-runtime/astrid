@@ -30,6 +30,7 @@ pub use context::Duration;
 pub use context::{
     AdmittedService, ApproverIdentity, AuthenticatedIngress, IngressChannel, Operation,
     OperationContext, OperationContextSpec, ResourceBudget, ResourceClass, ResourceClasses,
+    Timestamp,
 };
 pub use digest::{
     AuthorityDecisionDigest, Blake3Digest, BudgetDigest, ContextDigest, DigestWriter, PlanDigest,
@@ -39,14 +40,17 @@ pub use error::{PackageServiceError, PackageServiceResult};
 pub use identity::{
     ArtifactFormatVersion, ArtifactIdentity, AuthorityIssuerIdentity, BoundedEvidence,
     ComponentIdentity, JOURNAL_SCHEMA_VERSION, JournalSchemaVersion, ManifestFormatVersion,
-    ManifestIdentity, Nonce, PROTOCOL_VERSION, PackageObject, PackageVersion, ProtocolVersion,
-    ProvenanceClass, ProvenanceEvidence, STATE_SCHEMA_VERSION, ServiceGeneration,
+    ManifestIdentity, Nonce, PROTOCOL_VERSION, PackageName, PackageObject, PackageVersion,
+    ProtocolVersion, ProvenanceClass, ProvenanceEvidence, STATE_SCHEMA_VERSION, ServiceGeneration,
     StateSchemaVersion, ValidatedArtifact,
 };
 pub use journal::{
-    DrainPlan, DrainResult, JournalStatus, OperationJournalRecord, PackageSlotRecord,
-    ReceiptOutcome, RecoveryEvidence, ReplayOutcome, Tombstone,
+    DrainPlan, DrainResult, JournalStatus, OperationJournalRecord, OperationReceipt,
+    PackageSlotRecord, ReceiptOutcome, RecoveryEvidence, ReplayOutcome, Tombstone,
 };
 pub use lifecycle::PackageServiceModel;
 pub use policy::{JournalPolicy, JournalRetention, Occupancy, RetentionWindow};
-pub use state::{CanonicalInstalledState, ExpectedPackageState, InstalledStateSpec, PackageSlot};
+pub use state::{
+    CanonicalInstalledState, DrainDestination, ExpectedPackageState, InstalledStateSpec,
+    LifecycleState, PackageSlot,
+};

@@ -1,8 +1,10 @@
 use crate::bytes::PrincipalUid;
+use crate::context::Operation;
 use crate::context::Timestamp;
 use crate::digest::{
     AuthorityDecisionDigest, Blake3Digest, DigestWriter, PlanDigest, ProvenanceDigest, StateDigest,
 };
+use crate::error::{PackageServiceError, PackageServiceResult};
 use crate::identity::{
     ArtifactIdentity, ManifestIdentity, Nonce, PackageObject, STATE_SCHEMA_VERSION,
     StateSchemaVersion,
@@ -31,6 +33,28 @@ impl ExpectedPackageState {
     pub(crate) fn matches_digest(&self, actual: StateDigest) -> bool {
         matches!(self, Self::Exact(expected) if expected.as_bytes() == actual.as_bytes())
             || matches!(self, Self::Absent if actual.as_bytes() == &[0; 32])
+    }
+
+    /// Derives the state-bound plan digest for a canonical lifecycle action.
+    pub fn lifecycle_plan_digest(&self, operation: Operation) -> PackageServiceResult<PlanDigest> {
+        let Self::Exact(state_digest) = self else {
+            return Err(PackageServiceError::ExpectedStateMismatch);
+        };
+        if !matches!(
+            operation,
+            Operation::Activate | Operation::Deactivate | Operation::Remove
+        ) {
+            return Err(PackageServiceError::LifecycleTransition);
+        }
+        let mut writer = DigestWriter::new();
+        writer.tag(match operation {
+            Operation::Activate => 1,
+            Operation::Deactivate => 2,
+            Operation::Remove => 3,
+            _ => 0,
+        });
+        writer.digest(state_digest);
+        Ok(writer.finish("astrid.package.lifecycle-plan.v1"))
     }
 }
 
@@ -141,9 +165,8 @@ pub struct CanonicalInstalledState {
 }
 
 impl CanonicalInstalledState {
-    /// Constructs and digests a canonical installed state.
-    #[must_use]
-    pub fn new(spec: InstalledStateSpec) -> Self {
+    /// Constructs, validates, and digests a canonical installed state.
+    pub fn new(spec: InstalledStateSpec) -> PackageServiceResult<Self> {
         let InstalledStateSpec {
             owner,
             package_object,
@@ -157,6 +180,12 @@ impl CanonicalInstalledState {
             generation,
             completing_nonce,
         } = spec;
+        if authority_digest.as_bytes() == &[0; 32]
+            || provenance.as_bytes() == &[0; 32]
+            || content_root.as_bytes() == &[0; 32]
+        {
+            return Err(PackageServiceError::InvalidValue("installed-state digest"));
+        }
         let mut value = Self {
             schema_version: STATE_SCHEMA_VERSION,
             owner,
@@ -175,7 +204,7 @@ impl CanonicalInstalledState {
         let mut writer = DigestWriter::new();
         value.write(&mut writer);
         value.digest = writer.finish("astrid.package.installed-state.v1");
-        value
+        Ok(value)
     }
 
     fn write(&self, writer: &mut DigestWriter) {
@@ -221,6 +250,30 @@ impl CanonicalInstalledState {
     #[must_use]
     pub const fn generation_value(&self) -> NonZeroU64 {
         self.generation
+    }
+
+    /// Returns the exact-byte artifact identity.
+    #[must_use]
+    pub const fn artifact(&self) -> &ArtifactIdentity {
+        &self.artifact
+    }
+
+    /// Returns the immutable content root.
+    #[must_use]
+    pub const fn content_root(&self) -> &Blake3Digest {
+        &self.content_root
+    }
+
+    /// Returns the exact manifest identity.
+    #[must_use]
+    pub const fn manifest(&self) -> &ManifestIdentity {
+        &self.manifest
+    }
+
+    /// Returns the lifecycle plan bound by the completing operation.
+    #[must_use]
+    pub const fn lifecycle_plan(&self) -> &PlanDigest {
+        &self.lifecycle_plan
     }
 
     /// Returns the nonce that completed this canonical state.

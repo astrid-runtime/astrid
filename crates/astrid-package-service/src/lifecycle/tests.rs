@@ -1,6 +1,6 @@
 use super::*;
 use crate::authority::{AuthorityIssuer, AuthorityIssuerClass};
-use crate::bytes::PrincipalUid;
+use crate::bytes::{PrincipalUid, RecoveryToken};
 use crate::context::{
     ApproverIdentity, IngressChannel, OperationContextSpec, ResourceBudget, ResourceClasses,
 };
@@ -14,6 +14,8 @@ use crate::policy::{JournalPolicy, JournalRetention, RetentionWindow};
 use crate::state::PackageSlot;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::time::Duration;
+
+mod cure_tests;
 
 fn non_zero(value: u64) -> NonZeroU64 {
     match NonZeroU64::new(value) {
@@ -98,6 +100,15 @@ struct Fixture {
     budget: ResourceBudget,
 }
 
+struct ContextOptions {
+    operation: Operation,
+    expected: ExpectedPackageState,
+    plan: PlanDigest,
+    participants: (PrincipalUid, PrincipalUid),
+    generation: u64,
+    nonce: Nonce,
+    expiry: Timestamp,
+}
 impl Fixture {
     fn new() -> Self {
         Self {
@@ -141,22 +152,34 @@ impl Fixture {
         generation: u64,
         nonce: Nonce,
     ) -> OperationContext {
+        self.context_with_expiry(ContextOptions {
+            operation,
+            expected,
+            plan,
+            participants,
+            generation,
+            nonce,
+            expiry: Timestamp::new(1_000),
+        })
+    }
+
+    fn context_with_expiry(&self, options: ContextOptions) -> OperationContext {
         match OperationContext::new(
             OperationContextSpec {
-                nonce,
-                operation,
-                expected_state: expected,
-                effective_caller: participants.1,
-                approver: ApproverIdentity::Principal(participants.1),
-                target_owner: participants.0,
+                nonce: options.nonce,
+                operation: options.operation,
+                expected_state: options.expected,
+                effective_caller: options.participants.1,
+                approver: ApproverIdentity::Principal(options.participants.1),
+                target_owner: options.participants.0,
                 package_object: self.object,
                 artifact: artifact(),
                 manifest: manifest(),
-                plan_digest: plan,
+                plan_digest: options.plan,
                 budget: self.budget,
-                expiry: Timestamp::new(1_000),
+                expiry: options.expiry,
             },
-            &self.service_at(generation),
+            &self.service_at(options.generation),
             Timestamp::new(100),
         ) {
             Ok(value) => value,
@@ -173,7 +196,10 @@ impl Fixture {
     }
 
     fn authority(&self, context: &OperationContext) -> AuthenticatedAuthority {
-        AuthenticatedAuthority::bind(context, self.issuer, self.evidence)
+        match AuthenticatedAuthority::bind(context, self.issuer, self.evidence) {
+            Ok(value) => value,
+            Err(_) => panic!("fixed authority is valid"),
+        }
     }
 
     fn begin(
@@ -193,7 +219,10 @@ impl Fixture {
     }
 
     fn authority_for(&self, context: &OperationContext) -> AuthenticatedAuthority {
-        AuthenticatedAuthority::bind(context, self.issuer, self.evidence)
+        match AuthenticatedAuthority::bind(context, self.issuer, self.evidence) {
+            Ok(value) => value,
+            Err(_) => panic!("fixed authority is valid"),
+        }
     }
 
     fn slot(&self, owner: PrincipalUid) -> PackageSlot {
@@ -276,11 +305,15 @@ fn begin_update(model: &mut PackageServiceModel, fixture: &Fixture) -> Nonce {
         Some(state) => state.digest(),
         None => panic!("installed state should exist"),
     };
-    let replacement_plan = DrainPlan::new(
+    let replacement_plan = match DrainPlan::new(
         DrainDestination::Replacement,
+        ExpectedPackageState::Exact(state),
         Timestamp::new(200),
         Nonce::from_bytes([2; 32]),
-    );
+    ) {
+        Ok(value) => value,
+        Err(_) => panic!("replacement plan is valid"),
+    };
     let context = fixture.context(
         Operation::Update,
         ExpectedPackageState::Exact(state),
@@ -313,11 +346,15 @@ fn begin_remove(model: &mut PackageServiceModel, fixture: &Fixture) -> Nonce {
         Some(state) => state.digest(),
         None => panic!("installed state should exist"),
     };
-    let removal_plan = DrainPlan::new(
+    let removal_plan = match DrainPlan::new(
         DrainDestination::Removal,
+        ExpectedPackageState::Exact(state),
         Timestamp::new(400),
         Nonce::from_bytes([3; 32]),
-    );
+    ) {
+        Ok(value) => value,
+        Err(_) => panic!("removal plan is valid"),
+    };
     let context = fixture.context(
         Operation::Remove,
         ExpectedPackageState::Exact(state),
@@ -340,235 +377,6 @@ fn begin_remove(model: &mut PackageServiceModel, fixture: &Fixture) -> Nonce {
         )
         .unwrap_or_else(|_| panic!("removal drain should start"));
     nonce
-}
-
-#[test]
-fn authority_replay_rejects_changed_context_fields() {
-    let fixture = Fixture::new();
-    let mut model = PackageServiceModel::new(policy(8));
-    let base = fixture.context(
-        Operation::Install,
-        ExpectedPackageState::Absent,
-        plan_digest(20),
-        (fixture.owner, fixture.caller),
-        1,
-        Nonce::from_bytes([7; 32]),
-    );
-    let authority = fixture.authority(&base);
-    let changed = [
-        fixture.context(
-            Operation::Install,
-            ExpectedPackageState::Absent,
-            plan_digest(21),
-            (fixture.owner, fixture.caller),
-            1,
-            Nonce::from_bytes([7; 32]),
-        ),
-        fixture.context(
-            Operation::Install,
-            ExpectedPackageState::Absent,
-            plan_digest(20),
-            (fixture.other_owner, fixture.caller),
-            1,
-            Nonce::from_bytes([7; 32]),
-        ),
-        fixture.context(
-            Operation::Install,
-            ExpectedPackageState::Absent,
-            plan_digest(20),
-            (fixture.owner, fixture.other_owner),
-            1,
-            Nonce::from_bytes([7; 32]),
-        ),
-        fixture.context(
-            Operation::Install,
-            ExpectedPackageState::Absent,
-            plan_digest(20),
-            (fixture.owner, fixture.caller),
-            2,
-            Nonce::from_bytes([7; 32]),
-        ),
-    ];
-    for context in changed {
-        let error = model
-            .begin(
-                context,
-                &authority,
-                fixture.ingress,
-                &fixture.service_at(1),
-                Timestamp::new(100),
-            )
-            .err()
-            .unwrap_or_else(|| panic!("changed authority context must fail"));
-        assert!(matches!(
-            error,
-            PackageServiceError::AuthorityContextMismatch
-        ));
-    }
-    assert!(model.slot_record(&fixture.slot(fixture.owner)).is_none());
-}
-
-#[test]
-fn terminal_receipt_replays_after_update_and_removal() {
-    let fixture = Fixture::new();
-    let mut model = PackageServiceModel::new(policy(8));
-    install(&mut model, &fixture, 1);
-    let update_nonce = begin_update(&mut model, &fixture);
-    model
-        .prove_drain_leases(&update_nonce, 0, Timestamp::new(200))
-        .unwrap_or_else(|_| panic!("zero leases should be provable"));
-    model
-        .complete(
-            &update_nonce,
-            Some(&validated_artifact(13)),
-            None,
-            true,
-            Timestamp::new(220),
-        )
-        .unwrap_or_else(|_| panic!("update should commit"));
-    let remove_nonce = begin_remove(&mut model, &fixture);
-    model
-        .prove_drain_leases(&remove_nonce, 0, Timestamp::new(400))
-        .unwrap_or_else(|_| panic!("zero leases should be provable"));
-    let retired = model
-        .complete(&remove_nonce, None, None, true, Timestamp::new(420))
-        .unwrap_or_else(|_| panic!("removal should commit"));
-    assert_eq!(retired.outcome(), ReceiptOutcome::Retired);
-    assert_eq!(retired.protocol_version().get(), 1);
-    assert_eq!(retired.operation(), Operation::Remove);
-    assert_eq!(retired.slot(), fixture.slot(fixture.owner));
-    assert!(
-        model
-            .slot_record(&fixture.slot(fixture.owner))
-            .and_then(|record| record.state())
-            .is_none()
-    );
-
-    let original = fixture.context(
-        Operation::Install,
-        ExpectedPackageState::Absent,
-        plan_digest(20),
-        (fixture.owner, fixture.caller),
-        1,
-        Nonce::from_bytes([1; 32]),
-    );
-    match model.replay(&original.nonce(), Some(*original.digest())) {
-        Ok(ReplayOutcome::Receipt(receipt)) => {
-            assert_eq!(receipt.outcome(), ReceiptOutcome::Installed)
-        },
-        _ => panic!("original receipt must remain replayable"),
-    }
-}
-
-#[test]
-fn cross_owner_nonce_use_is_isolated() {
-    let fixture = Fixture::new();
-    let mut model = PackageServiceModel::new(policy(8));
-    let first = fixture.context(
-        Operation::Install,
-        ExpectedPackageState::Absent,
-        plan_digest(20),
-        (fixture.owner, fixture.caller),
-        1,
-        Nonce::from_bytes([9; 32]),
-    );
-    fixture
-        .begin(&mut model, first, 100)
-        .unwrap_or_else(|_| panic!("first owner admission should succeed"));
-    let second = fixture.context(
-        Operation::Install,
-        ExpectedPackageState::Absent,
-        plan_digest(20),
-        (fixture.other_owner, fixture.caller),
-        1,
-        Nonce::from_bytes([9; 32]),
-    );
-    let error = fixture
-        .begin(&mut model, second, 100)
-        .err()
-        .unwrap_or_else(|| panic!("cross-owner nonce must fail"));
-    assert!(matches!(error, PackageServiceError::ReplayRejected));
-    assert!(
-        model
-            .slot_record(&fixture.slot(fixture.other_owner))
-            .is_none()
-    );
-}
-
-#[test]
-fn nonce_replay_after_later_commits_is_rejected_and_bound() {
-    let fixture = Fixture::new();
-    let mut model = PackageServiceModel::new(policy_short_retention(8, 128));
-    install(&mut model, &fixture, 1);
-    let update_nonce = begin_update(&mut model, &fixture);
-    model
-        .prove_drain_leases(&update_nonce, 0, Timestamp::new(200))
-        .unwrap_or_else(|_| panic!("zero leases should be provable"));
-    model
-        .complete(
-            &update_nonce,
-            Some(&validated_artifact(13)),
-            None,
-            true,
-            Timestamp::new(220),
-        )
-        .unwrap_or_else(|_| panic!("update should commit"));
-
-    let collected = model
-        .collect(Timestamp::new(900), 8)
-        .unwrap_or_else(|_| panic!("eligible terminal records should collect"));
-    assert_eq!(collected, 2);
-
-    let original = fixture.context(
-        Operation::Install,
-        ExpectedPackageState::Absent,
-        plan_digest(20),
-        (fixture.owner, fixture.caller),
-        1,
-        Nonce::from_bytes([1; 32]),
-    );
-    let current_state = model
-        .slot_record(&fixture.slot(fixture.owner))
-        .and_then(|record| record.state().map(CanonicalInstalledState::digest))
-        .unwrap_or_else(|| panic!("updated state should exist"));
-    let replay_context = fixture.context(
-        Operation::Update,
-        ExpectedPackageState::Exact(current_state),
-        plan_digest(22),
-        (fixture.owner, fixture.caller),
-        1,
-        Nonce::from_bytes([1; 32]),
-    );
-    let replay_error = fixture
-        .begin(&mut model, replay_context, 910)
-        .err()
-        .unwrap_or_else(|| panic!("collected nonce must not execute again"));
-    assert!(
-        matches!(replay_error, PackageServiceError::ReplayRejected),
-        "unexpected replay error: {replay_error:?}"
-    );
-    match model.replay(&original.nonce(), Some(*original.digest())) {
-        Ok(ReplayOutcome::Tombstoned(tombstone)) => {
-            assert_eq!(tombstone.terminal_status(), JournalStatus::Committed);
-            assert_eq!(tombstone.outcome(), Some(ReceiptOutcome::Installed));
-            assert_eq!(tombstone.context_digest(), *original.digest());
-        },
-        _ => panic!("collected receipt must remain distinguishable from loss"),
-    }
-
-    let other_context = fixture.context(
-        Operation::Install,
-        ExpectedPackageState::Absent,
-        plan_digest(21),
-        (fixture.owner, fixture.caller),
-        1,
-        Nonce::from_bytes([1; 32]),
-    );
-    let error = model
-        .replay(&other_context.nonce(), Some(*other_context.digest()))
-        .err()
-        .unwrap_or_else(|| panic!("tombstone must reject a different context"));
-    assert!(matches!(error, PackageServiceError::ReplayRejected));
 }
 
 #[test]
@@ -647,12 +455,11 @@ fn drain_expiry_blocks_and_abort_is_coherent() {
         abort_model.slot_record(&abort_fixture.slot(abort_fixture.owner)).and_then(|record| record.state()),
         Some(state) if *state.lifecycle_state() == LifecycleState::Inactive
     ));
-    assert_eq!(
-        abort_model
-            .slot_record(&abort_fixture.slot(abort_fixture.owner))
-            .and_then(|record| record.state().map(CanonicalInstalledState::digest)),
-        Some(original)
-    );
+    let cancelled_digest = abort_model
+        .slot_record(&abort_fixture.slot(abort_fixture.owner))
+        .and_then(|record| record.state().map(CanonicalInstalledState::digest))
+        .unwrap_or_else(|| panic!("cancelled state should remain"));
+    assert_ne!(cancelled_digest, original);
 }
 
 #[test]
@@ -693,6 +500,7 @@ fn canonical_state_digests_are_deterministic_and_domain_separated() {
         authority_digest,
         &validated_artifact(12),
         LifecycleState::Inactive,
+        non_zero(1),
     )
     .unwrap_or_else(|_| panic!("state should construct"));
     let second = new_installed_state(
@@ -700,6 +508,7 @@ fn canonical_state_digests_are_deterministic_and_domain_separated() {
         authority_digest,
         &validated_artifact(12),
         LifecycleState::Inactive,
+        non_zero(1),
     )
     .unwrap_or_else(|_| panic!("state should construct"));
     assert_eq!(first.digest(), second.digest());
@@ -718,6 +527,7 @@ fn canonical_state_digests_are_deterministic_and_domain_separated() {
             .decision_digest(),
         &validated_artifact(12),
         LifecycleState::Inactive,
+        non_zero(1),
     )
     .unwrap_or_else(|_| panic!("state should construct"));
     assert_ne!(first.digest(), different.digest());
@@ -836,7 +646,9 @@ fn activation_requires_exact_installed_state_and_produces_active_generation() {
     let context = fixture.context(
         Operation::Activate,
         ExpectedPackageState::Exact(state),
-        plan_digest(30),
+        ExpectedPackageState::Exact(state)
+            .lifecycle_plan_digest(Operation::Activate)
+            .unwrap_or_else(|_| panic!("activation plan is valid")),
         (fixture.owner, fixture.caller),
         1,
         Nonce::from_bytes([4; 32]),

@@ -190,27 +190,49 @@ impl OperationReceipt {
     pub const fn after_state(&self) -> StateDigest {
         self.after_state
     }
+
+    /// Returns the canonical package-state generation produced by the receipt.
+    #[must_use]
+    pub const fn state_generation(&self) -> NonZeroU64 {
+        self.state_generation
+    }
+
+    /// Returns the admitted-service generation covered by the receipt.
+    #[must_use]
+    pub const fn service_generation(&self) -> NonZeroU64 {
+        self.service_generation
+    }
 }
 
 /// Durable intent for a bounded drain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DrainPlan {
     destination: DrainDestination,
+    state_digest: StateDigest,
     deadline: Timestamp,
     nonce: Nonce,
 }
 
 impl DrainPlan {
-    pub(crate) const fn new(
+    /// Validates a drain against the exact canonical state it may alter.
+    pub fn new(
         destination: DrainDestination,
+        expected_state: crate::state::ExpectedPackageState,
         deadline: Timestamp,
         nonce: Nonce,
-    ) -> Self {
-        Self {
+    ) -> PackageServiceResult<Self> {
+        let crate::state::ExpectedPackageState::Exact(state_digest) = expected_state else {
+            return Err(PackageServiceError::InvalidValue("drain expected state"));
+        };
+        if nonce.as_bytes() == &[0; 32] || deadline.get() == 0 {
+            return Err(PackageServiceError::InvalidValue("drain plan"));
+        }
+        Ok(Self {
             destination,
+            state_digest,
             deadline,
             nonce,
-        }
+        })
     }
 
     /// Returns the destination.
@@ -239,6 +261,7 @@ impl DrainPlan {
             DrainDestination::Replacement => 1,
             DrainDestination::Removal => 2,
         });
+        writer.digest(&self.state_digest);
         writer.u64(self.deadline.get());
         writer.bytes(self.nonce.as_bytes());
         writer.finish("astrid.package.plan.v1")
