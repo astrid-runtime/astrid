@@ -265,16 +265,42 @@ run_as_principal_cli() {
     /usr/local/bin/astrid "$@"
 }
 
+register_v0104_audit_stderr() {
+  local destination=$1
+
+  # Registered from v0.10.4 / TEST_SOURCE_COMMIT=b6bf5d1d579915eb5d3c944857d84e62a4fcc878.
+  # The stream is exactly 175 bytes, SHA-256 8af9a0342aa14e2f65a9f563a0685f8dc8f806f7eda3d2ae5fa088fe667ae8a4.
+  # Any release or byte drift requires a fresh exact-release re-evaluation.
+  printf '%s\n' \
+    "astrid: audit trail inspection is not available in this release." \
+    >"$destination"
+  printf '%s\n' \
+    "  Tracking issue #675 (Layer 7 audit log routing) — see https://github.com/astrid-runtime/astrid/issues/675" \
+    >>"$destination"
+}
+
 assert_v0104_audit_is_non_gating() {
   local output=$1
   local error=$2
-  if run_real_cli audit status \
-    >"$output" 2>"$error"; then
+  local status=0
+  local expected=$TEST_ROOT/v0104-audit-expected.stderr
+
+  run_real_cli audit status \
+    >"$output" 2>"$error" || status=$?
+  if [ "$status" -eq 0 ]; then
     fail "v0.10.4 unexpectedly exposed an audit query"
   fi
-  printf '%s\n' "audit trail inspection is not available" |
-    cmp -s - "$error" ||
-    fail "unexpected v0.10.4 audit surface; re-evaluate the exact-release proof"
+  if [ "$status" -ne 2 ]; then
+    printf '%s\n' "captured stderr:" >&2
+    cat "$error" >&2
+    fail "v0.10.4 audit stub exited $status, expected 2; re-evaluate the exact-release proof"
+  fi
+  register_v0104_audit_stderr "$expected"
+  if ! cmp -s "$error" "$expected"; then
+    printf '%s\n' "captured stderr:" >&2
+    cat "$error" >&2
+    fail "v0.10.4 audit stderr drifted; re-evaluate the exact-release proof"
+  fi
   printf '%s\n' \
     "BLOCKED AUDIT (non-gating): v0.10.4 baseline blocker; audit is deferred and exposes no supported chain/head or principal-scoped query."
 }
