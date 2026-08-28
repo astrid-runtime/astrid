@@ -313,10 +313,29 @@ class RuntimeHarnessContractTests(unittest.TestCase):
             "audit is deferred and exposes no supported chain/head or "
             "principal-scoped query.\n"
         )
+        registered_stderr = "audit trail inspection is not available"
         cases = [
-            ("failed-stub", "1", "audit trail inspection is not available", 0),
-            ("successful-stub", "0", "audit trail inspection is not available", 1),
+            ("failed-stub", "1", registered_stderr, 0),
+            ("successful-stub", "0", registered_stderr, 1),
             ("wrong-failed-stub", "1", "audit trail query failed", 1),
+            (
+                "failed-prefix-and-marker",
+                "1",
+                f"prefix {registered_stderr}",
+                1,
+            ),
+            (
+                "failed-marker-and-suffix",
+                "1",
+                f"{registered_stderr} suffix",
+                1,
+            ),
+            (
+                "failed-marker-and-extra-line",
+                "1",
+                f"{registered_stderr}\nextra detail",
+                1,
+            ),
         ]
 
         with tempfile.TemporaryDirectory() as temporary:
