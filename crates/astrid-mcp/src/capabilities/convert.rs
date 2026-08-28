@@ -17,8 +17,26 @@ use serde_json::Value;
 pub(super) fn convert_rmcp_schema(
     schema: &rmcp::model::ElicitationSchema,
 ) -> (ElicitationSchema, Option<String>) {
-    let first = schema.properties.iter().next();
-    let prop_name = first.map(|(name, _)| name.clone());
+    // RMCP records the peer's wire order separately from the compatibility
+    // map. Prefer that order so "first property" follows the offered schema,
+    // then fall back to map order for explicitly constructed schemas.
+    let first = schema
+        .property_order
+        .as_ref()
+        .and_then(|names| {
+            names
+                .iter()
+                .find_map(|name| schema.properties.get_key_value(name))
+        })
+        .map(|(name, definition)| (name.clone(), definition))
+        .or_else(|| {
+            schema
+                .properties
+                .iter()
+                .next()
+                .map(|(name, definition)| (name.clone(), definition))
+        });
+    let prop_name = first.as_ref().map(|(name, _)| name.clone());
 
     if let Some((_, primitive)) = first {
         // Serialize the PrimitiveSchema to JSON to inspect its type without
@@ -156,6 +174,34 @@ mod tests {
             }
         ));
         assert_eq!(prop_name, Some("api_key".to_string()));
+    }
+
+    #[test]
+    fn test_convert_rmcp_schema_honors_property_order_and_dialect() {
+        // Parse from text: the project's JSON map is order-insensitive.
+        let mut rmcp_schema: rmcp::model::ElicitationSchema = serde_json::from_str(
+            r#"{
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "alphabetical": {"type": "boolean"},
+                    "offered": {"type": "boolean"}
+                }
+            }"#,
+        )
+        .unwrap();
+        rmcp_schema.property_order = Some(vec!["offered".to_owned(), "alphabetical".to_owned()]);
+
+        assert_eq!(
+            rmcp_schema.schema.as_deref(),
+            Some("https://json-schema.org/draft/2020-12/schema")
+        );
+        let (schema, prop_name) = convert_rmcp_schema(&rmcp_schema);
+        assert!(matches!(
+            schema,
+            ElicitationSchema::Confirm { default: false }
+        ));
+        assert_eq!(prop_name.as_deref(), Some("offered"));
     }
 
     #[test]

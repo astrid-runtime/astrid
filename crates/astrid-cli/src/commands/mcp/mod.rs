@@ -258,7 +258,8 @@ pub(crate) async fn serve(
         caller.clone(),
         daemon_root.clone(),
         workspace_context,
-    );
+    )
+    .context("Failed to initialize the MCP request-state codec")?;
 
     // `rmcp::transport::stdio()` yields the (stdin, stdout) pair the MCP
     // transport drives. `serve` performs the MCP handshake and spawns the
