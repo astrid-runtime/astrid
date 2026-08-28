@@ -74,7 +74,7 @@ astrid-workspace = { path = "crates/astrid-workspace", version = "0.10.4" }
 anyhow = "1.0"
 arboard = "3"
 arc-swap = "1.7"
-lz4_flex = "0.12"
+lz4_flex = "0.14"
 # Streaming + HTTP-server deps (async-stream, axum, tokio-stream,
 # tower, tower-http, utoipa) all back the new `astrid-gateway` crate
 # and have no in-workspace substitute. They are scoped to

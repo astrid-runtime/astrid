@@ -820,7 +820,7 @@ dependencies = [
  "hex",
  "keyring",
  "libc",
- "lz4_flex",
+ "lz4_flex 0.14.0",
  "nix 0.31.3",
  "parking_lot",
  "serde",
@@ -4327,6 +4327,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lz4_flex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "mac_address"
 version = "1.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6790,7 +6799,7 @@ dependencies = [
  "guardian",
  "integer-encoding",
  "log",
- "lz4_flex",
+ "lz4_flex 0.12.2",
  "parking_lot",
  "quick_cache",
  "rand 0.9.5",
