@@ -57,7 +57,7 @@ mod pool;
 mod storage_vfs;
 #[cfg(test)]
 mod test_fixtures;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "workspace_git_discovery_tests.rs"]
 mod workspace_git_discovery_tests;
 
