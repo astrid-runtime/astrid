@@ -178,19 +178,27 @@ mod tests {
 
     #[test]
     fn test_convert_rmcp_schema_honors_property_order_and_dialect() {
-        // Parse from text: the project's JSON map is order-insensitive.
-        let mut rmcp_schema: rmcp::model::ElicitationSchema = serde_json::from_str(
+        // Parse the wire representation through RMCP's custom IndexMap-backed
+        // schema deserializer. This proves RMCP records the peer's offered
+        // property order rather than merely exercising a manually populated
+        // compatibility field.
+        let rmcp_schema: rmcp::model::ElicitationSchema = serde_json::from_str(
             r#"{
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
                 "properties": {
-                    "alphabetical": {"type": "boolean"},
-                    "offered": {"type": "boolean"}
+                    "offered": {"type": "boolean"},
+                    "alphabetical": {"type": "boolean"}
                 }
             }"#,
         )
         .unwrap();
-        rmcp_schema.property_order = Some(vec!["offered".to_owned(), "alphabetical".to_owned()]);
+
+        let expected_order = vec!["offered".to_owned(), "alphabetical".to_owned()];
+        assert_eq!(
+            rmcp_schema.property_order.as_deref(),
+            Some(expected_order.as_slice())
+        );
 
         assert_eq!(
             rmcp_schema.schema.as_deref(),
