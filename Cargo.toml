@@ -145,7 +145,7 @@ keyring = { version = "3", features = [
 landlock = "0.4"
 libc = "0.2"
 nix = { version = "0.31", features = ["process", "signal", "user", "fs", "resource"] }
-process-wrap = { version = "9", features = ["tokio1"] }
+process-wrap = { version = "10", features = ["tokio1"] }
 # Async-signal-safe signal handling on a dedicated OS thread. Used by the
 # daemon's SIGTERM/SIGINT/SIGHUP watchdog, which owns those signals off the
 # tokio runtime so the daemon is killable even when every worker is pinned.
@@ -199,7 +199,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # changes in minor versions. Cargo.lock is committed, but the patch range also
 # prevents fresh resolution from silently adopting a future incompatible minor.
 # It still admits compatible bug and security fixes.
-rmcp = { version = "~3.1.2", features = ["server", "client", "transport-io", "transport-child-process", "elicitation", "macros", "request-state", "schemars"] }
+rmcp = { version = "~3.1.2", features = ["server", "client", "transport-io", "elicitation", "macros", "request-state", "schemars"] }
 rustyline = { version = "18", features = ["derive"] }
 semver = "1"
 serde = { version = "1.0", features = ["derive"] }
