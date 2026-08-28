@@ -845,7 +845,7 @@ pub fn call_hook_trigger(
 
 fn build_wasmtime_engine() -> CapsuleResult<wasmtime::Engine> {
     let mut config = wasmtime::Config::new();
-    // Wasmtime 47 enables GC and exception handling by default. Astrid's guest
+    // Wasmtime 48 enables GC and exception handling by default. Astrid's guest
     // language is a security boundary, so an engine upgrade must not silently
     // expand the accepted proposal set. Enable new proposals only after an
     // explicit runtime design and compatibility decision.
@@ -1699,7 +1699,7 @@ struct CompiledWasmArtifact {
     _epoch_ticker: EpochTickerGuard,
 }
 
-const COMPILED_ENGINE_ABI: &str = "astrid-wasmtime47-component-abi-v1";
+const COMPILED_ENGINE_ABI: &str = "astrid-wasmtime48-component-abi-v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CompiledArtifactKey(String);
@@ -1731,6 +1731,14 @@ impl CompiledWasmCache {
         // This domain is part of the cache identity. Bump it whenever the
         // engine configuration or linked host ABI changes incompatibly.
         let key = CompiledArtifactKey::new(verified_hash);
+        self.compile_with_key(key, wasm_bytes)
+    }
+
+    fn compile_with_key(
+        &self,
+        key: CompiledArtifactKey,
+        wasm_bytes: &[u8],
+    ) -> CapsuleResult<Arc<CompiledWasmArtifact>> {
         let mut entries = self
             .entries
             .lock()
@@ -1781,11 +1789,32 @@ mod compiled_artifact_cache_tests {
     }
 
     #[test]
-    fn compiled_cache_key_is_bound_to_the_wasmtime_47_abi() {
+    fn compiled_cache_key_is_bound_to_the_wasmtime_48_abi() {
         assert_eq!(
             CompiledArtifactKey::new("verified"),
-            CompiledArtifactKey("astrid-wasmtime47-component-abi-v1:verified".to_owned())
+            CompiledArtifactKey("astrid-wasmtime48-component-abi-v1:verified".to_owned())
         );
+    }
+
+    #[test]
+    fn stale_wasmtime_47_cache_entry_is_rejected_and_recompiled() {
+        let bytes = wasm_encoder::Component::new().finish();
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        let stale_key = CompiledArtifactKey(format!("astrid-wasmtime47-component-abi-v1:{hash}"));
+        let cache = CompiledWasmCache::default();
+
+        let stale = cache
+            .compile_with_key(stale_key.clone(), &bytes)
+            .expect("stale generation");
+        let current = cache.compile(&hash, &bytes).expect("current generation");
+
+        assert!(!Arc::ptr_eq(&stale, &current));
+        let entries = cache
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(entries.contains_key(&stale_key));
+        assert!(entries.contains_key(&CompiledArtifactKey::new(&hash)));
     }
 
     #[test]
