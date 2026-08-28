@@ -3,8 +3,12 @@
 
 from __future__ import annotations
 
+import os
 import pathlib
 import re
+import shlex
+import subprocess
+import tempfile
 import unittest
 
 
@@ -13,6 +17,44 @@ DOCKERFILE = (ROOT / "container/amd64/Dockerfile").read_text(encoding="utf-8")
 ENTRYPOINT = (ROOT / "container/amd64/entrypoint.sh").read_text(encoding="utf-8")
 TEST_HARNESS = (ROOT / "container/amd64/test.sh").read_text(encoding="utf-8")
 WORKFLOW = (ROOT / ".github/workflows/oci-amd64.yml").read_text(encoding="utf-8")
+
+
+def shell_function(name: str) -> str:
+    match = re.search(rf"(?ms)^{re.escape(name)}\(\) \{{\n.*?^\}}$", TEST_HARNESS)
+    if match is None:
+        raise AssertionError(f"shell function is not extractable: {name}")
+    return match.group(0)
+
+
+def run_extracted_shell(
+    functions: list[str],
+    invocation: str,
+    bin_dir: pathlib.Path,
+    environment: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    inherited_environment = os.environ.copy()
+    inherited_environment["PATH"] = f"{bin_dir}{os.pathsep}{inherited_environment['PATH']}"
+    inherited_environment["IMAGE"] = "contract-fixture-image"
+    inherited_environment["OCI_PLATFORM"] = "linux/amd64"
+    inherited_environment.update(environment or {})
+    script = "\n".join(("set -euo pipefail", *functions, invocation, ""))
+    return subprocess.run(
+        ["bash", "-c", script],
+        cwd=bin_dir,
+        env=inherited_environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def docker_call_log(log_path: pathlib.Path) -> list[list[str]]:
+    records = log_path.read_bytes().removesuffix(b"\0\0").split(b"\0\0")
+    return [
+        argument.decode("utf-8").split("\0")
+        for argument in records
+        if argument
+    ]
 
 
 class DockerfileContractTests(unittest.TestCase):
@@ -151,30 +193,85 @@ class RuntimeHarnessContractTests(unittest.TestCase):
         self.assertNotIn("docker restart", TEST_HARNESS.lower())
         self.assertIn("agent create", TEST_HARNESS)
 
-    def test_runtime_state_helpers_use_mount_and_uid_for_evidence(self) -> None:
-        self.assertEqual(TEST_HARNESS.count('local runtime_file="/runtime/$relative"'), 2)
-        self.assertIn("direct filesystem secret writes", TEST_HARNESS)
-        self.assertIn("shared state mount", TEST_HARNESS)
-        self.assertIn(
-            "not authenticated admin IPC or secret-read isolation",
-            TEST_HARNESS,
-        )
-        self.assertIn(
-            'write_runtime_workspace_marker "$run_dir/real-workspace"',
-            TEST_HARNESS,
-        )
-        self.assertIn('"/workspace/.astrid-oci-mounted-state"', TEST_HARNESS)
-        self.assertIn("--user 65532:65532", TEST_HARNESS)
-        self.assertLess(
-            TEST_HARNESS.index('prepare_runtime_dir "$run_dir/real-workspace" 0755'),
-            TEST_HARNESS.index(
-                'write_runtime_workspace_marker "$run_dir/real-workspace"'
-            ),
-        )
-        self.assertNotIn(
-            '>"$run_dir/real-workspace/.astrid-oci-mounted-state"',
-            TEST_HARNESS,
-        )
+    def test_runtime_state_readers_resolve_through_runtime_mount(self) -> None:
+        for function_name in (
+            "read_runtime_state_file",
+            "assert_runtime_state_file_mode",
+        ):
+            function = shell_function(function_name)
+            with self.subTest(function=function_name):
+                self.assertEqual(
+                    function.count('local runtime_file="/runtime/$relative"'),
+                    1,
+                )
+                self.assertEqual(function.count("docker run"), 1)
+                self.assertIn("--mount", function)
+                self.assertIn('dst=/runtime,readonly"', function)
+
+    def test_workspace_marker_helper_uses_runtime_uid_container_not_host_write(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            bin_dir = root / "bin"
+            workspace = root / "workspace"
+            bin_dir.mkdir()
+            workspace.mkdir()
+            call_log = root / "docker-calls"
+            fake_docker = bin_dir / "docker"
+            fake_docker.write_text(
+                "#!/bin/sh\n"
+                "for argument do\n"
+                "  printf '%s\\0' \"$argument\" >> \"$DOCKER_CALL_LOG\"\n"
+                "done\n"
+                "printf '\\0' >> \"$DOCKER_CALL_LOG\"\n",
+                encoding="utf-8",
+            )
+            fake_docker.chmod(0o755)
+
+            completed = run_extracted_shell(
+                [shell_function("write_runtime_workspace_marker")],
+                f"write_runtime_workspace_marker {shlex.quote(str(workspace))}",
+                bin_dir,
+                {"DOCKER_CALL_LOG": str(call_log)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                completed.stdout,
+                "",
+                "the marker helper must execute inside the container",
+            )
+            self.assertFalse(
+                (workspace / ".astrid-oci-mounted-state").exists(),
+                "the marker helper must not write to the host-side directory",
+            )
+            calls = docker_call_log(call_log)
+            self.assertEqual(len(calls), 1)
+            arguments = calls[0]
+            self.assertEqual(arguments[:2], ["run", "--rm"])
+            self.assertEqual(arguments[arguments.index("--platform") + 1], "linux/amd64")
+            self.assertEqual(arguments[arguments.index("--user") + 1], "65532:65532")
+            self.assertEqual(
+                arguments[arguments.index("--entrypoint") + 1],
+                "/bin/sh",
+            )
+            self.assertEqual(
+                arguments[arguments.index("--mount") + 1],
+                f"type=bind,src={workspace},dst=/workspace",
+            )
+            self.assertEqual(
+                arguments[arguments.index("-ec") + 1],
+                'printf "%s\\n" "$1" > "$2"',
+            )
+            self.assertEqual(
+                arguments[arguments.index("-ec") + 2 :],
+                [
+                    "sh",
+                    "same-mounted-workspace",
+                    "/workspace/.astrid-oci-mounted-state",
+                ],
+            )
 
     def test_harness_never_uses_unsupported_v0104_audit_query(self) -> None:
         self.assertNotIn("audit stats", TEST_HARNESS.lower())
@@ -190,6 +287,80 @@ class RuntimeHarnessContractTests(unittest.TestCase):
             "no supported chain/head or principal-scoped query",
             TEST_HARNESS.lower(),
         )
+
+    def test_audit_probe_requires_failed_stub_status_and_reports_blocker(self) -> None:
+        audit_functions = [
+            "fail() {\n"
+            '  printf "audit probe: %s\\n" "$*" >&2\n'
+            "  exit 1\n"
+            "}\n",
+            "REAL_CONTAINER=contract-runtime\n",
+            shell_function("run_real_cli"),
+            shell_function("assert_v0104_audit_is_non_gating"),
+        ]
+        fake_docker_source = (
+            "#!/bin/sh\n"
+            "for argument do\n"
+            "  printf '%s\\0' \"$argument\" >> \"$DOCKER_CALL_LOG\"\n"
+            "done\n"
+            "printf '\\0' >> \"$DOCKER_CALL_LOG\"\n"
+            'printf "%s\\n" "audit trail inspection is not available" >&2\n'
+            'exit "$FAKE_AUDIT_STATUS"\n'
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            bin_dir = root / "failed-stub"
+            bin_dir.mkdir()
+            call_log = root / "failed-audit-calls"
+            fake_docker = bin_dir / "docker"
+            fake_docker.write_text(fake_docker_source, encoding="utf-8")
+            fake_docker.chmod(0o755)
+            completed = run_extracted_shell(
+                audit_functions,
+                "assert_v0104_audit_is_non_gating probe.out probe.err",
+                bin_dir,
+                {
+                    "DOCKER_CALL_LOG": str(call_log),
+                    "FAKE_AUDIT_STATUS": "1",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                completed.stdout,
+                "BLOCKED AUDIT (non-gating): v0.10.4 baseline blocker; "
+                "audit is deferred and exposes no supported chain/head or "
+                "principal-scoped query.\n",
+            )
+            calls = docker_call_log(call_log)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][0], "exec")
+            self.assertEqual(
+                calls[0][-3:],
+                ["/usr/local/bin/astrid", "audit", "status"],
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            bin_dir = root / "successful-query"
+            bin_dir.mkdir()
+            fake_docker = bin_dir / "docker"
+            fake_docker.write_text("exit 0\n", encoding="utf-8")
+            fake_docker.chmod(0o755)
+            completed = run_extracted_shell(
+                audit_functions,
+                "assert_v0104_audit_is_non_gating probe.out probe.err",
+                bin_dir,
+                {"FAKE_AUDIT_STATUS": "0"},
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertNotIn("BLOCKED AUDIT", completed.stdout)
+            self.assertIn(
+                "v0.10.4 unexpectedly exposed an audit query",
+                completed.stderr,
+            )
 
     def test_harness_rejects_inherited_security_policy_bypasses(self) -> None:
         self.assertIn("ASTRID_SANDBOX_POLICY=off", TEST_HARNESS)
