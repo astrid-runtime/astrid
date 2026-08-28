@@ -569,6 +569,7 @@ class RuntimeHarnessContractTests(unittest.TestCase):
             "}\n",
             "REAL_CONTAINER=contract-runtime\n",
             shell_function("run_real_cli"),
+            shell_function("register_v0104_audit_stderr"),
             shell_function("assert_v0104_audit_is_non_gating"),
         ]
         fake_docker_source = (
@@ -577,7 +578,7 @@ class RuntimeHarnessContractTests(unittest.TestCase):
             "  printf '%s\\0' \"$argument\" >> \"$DOCKER_CALL_LOG\"\n"
             "done\n"
             "printf '\\0' >> \"$DOCKER_CALL_LOG\"\n"
-            'printf "%s\\n" "$FAKE_AUDIT_STDERR" >&2\n'
+            'printf "%s" "$FAKE_AUDIT_STDERR" >&2\n'
             'exit "$FAKE_AUDIT_STATUS"\n'
         )
 
@@ -586,27 +587,56 @@ class RuntimeHarnessContractTests(unittest.TestCase):
             "audit is deferred and exposes no supported chain/head or "
             "principal-scoped query.\n"
         )
-        registered_stderr = "audit trail inspection is not available"
+        registered_first = (
+            "astrid: audit trail inspection is not available in this release.\n"
+        )
+        registered_second = (
+            "  Tracking issue #675 (Layer 7 audit log routing) — see "
+            "https://github.com/astrid-runtime/astrid/issues/675\n"
+        )
+        registered_stderr = registered_first + registered_second
         cases = [
-            ("failed-stub", "1", registered_stderr, 0),
-            ("successful-stub", "0", registered_stderr, 1),
-            ("wrong-failed-stub", "1", "audit trail query failed", 1),
+            ("registered-status-two", "2", registered_stderr, 0),
+            ("status-zero", "0", registered_stderr, 1),
+            ("status-one", "1", registered_stderr, 1),
+            ("status-three", "3", registered_stderr, 1),
+            ("old-one-line", "2", "audit trail inspection is not available\n", 1),
+            ("first-line-only", "2", registered_first, 1),
             (
-                "failed-prefix-and-marker",
-                "1",
-                f"prefix {registered_stderr}",
+                "missing-issue-number",
+                "2",
+                registered_first
+                + registered_second.replace("#675 ", "", 1),
                 1,
             ),
             (
-                "failed-marker-and-suffix",
-                "1",
-                f"{registered_stderr} suffix",
+                "prefix",
+                "2",
+                "prefix " + registered_stderr,
                 1,
             ),
             (
-                "failed-marker-and-extra-line",
-                "1",
-                f"{registered_stderr}\nextra detail",
+                "suffix",
+                "2",
+                registered_stderr.removesuffix("\n") + " suffix\n",
+                1,
+            ),
+            (
+                "extra-line",
+                "2",
+                registered_stderr + "extra detail\n",
+                1,
+            ),
+            (
+                "extra-whitespace",
+                "2",
+                registered_first.replace("\n", " \n", 1) + registered_second,
+                1,
+            ),
+            (
+                "ascii-hyphen",
+                "2",
+                registered_first + registered_second.replace("—", "-", 1),
                 1,
             ),
         ]
@@ -628,6 +658,7 @@ class RuntimeHarnessContractTests(unittest.TestCase):
                         "DOCKER_CALL_LOG": str(call_log),
                         "FAKE_AUDIT_STATUS": status,
                         "FAKE_AUDIT_STDERR": stderr,
+                        "TEST_ROOT": str(bin_dir),
                     },
                 )
 
@@ -648,12 +679,33 @@ class RuntimeHarnessContractTests(unittest.TestCase):
                         self.assertEqual(completed.stdout, expected_blocker)
                     else:
                         self.assertEqual(completed.stdout, "")
-                        self.assertIn(
-                            "v0.10.4 unexpectedly exposed an audit query"
-                            if status == "0"
-                            else "unexpected v0.10.4 audit surface",
-                            completed.stderr,
-                        )
+                        if status == "0":
+                            self.assertIn(
+                                "v0.10.4 unexpectedly exposed an audit query",
+                                completed.stderr,
+                            )
+                        else:
+                            self.assertIn("captured stderr", completed.stderr)
+                            self.assertIn(
+                                "re-evaluate the exact-release proof",
+                                completed.stderr,
+                            )
+
+    def test_audit_probe_rejects_status_and_matcher_mutations(self) -> None:
+        registered_function = shell_function("register_v0104_audit_stderr")
+        assert_function = shell_function("assert_v0104_audit_is_non_gating")
+
+        self.assertIn("v0.10.4 / TEST_SOURCE_COMMIT=b6bf5d1", registered_function)
+        self.assertIn(
+            "SHA-256 8af9a0342aa14e2f65a9f563a0685f8dc8f806f7eda3d2ae5fa088fe667ae8a4",
+            registered_function,
+        )
+        self.assertIn("run_real_cli audit status", assert_function)
+        self.assertIn('|| status=$?', assert_function)
+        self.assertNotIn("|| true", assert_function)
+        self.assertIn('[ "$status" -ne 2 ]', assert_function)
+        self.assertNotIn("grep -Fq", assert_function)
+        self.assertIn('cmp -s "$error" "$expected"', assert_function)
 
     def test_harness_rejects_inherited_security_policy_bypasses(self) -> None:
         self.assertIn("ASTRID_SANDBOX_POLICY=off", TEST_HARNESS)
