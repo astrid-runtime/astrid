@@ -16,7 +16,10 @@ use crate::{AstridFilesystem, FilesystemPath};
 use astrid_core::profile::{DeviceKey, DeviceScope, PrincipalProfile};
 
 use super::*;
-use crate::content::{CONTENT_COMPONENT_LABEL, CatalogValue, LegacyCatalog, encode_legacy_catalog};
+use crate::content::{
+    CONTENT_COMPONENT_LABEL, CatalogValue, LegacyCatalog, PrincipalContentError,
+    encode_legacy_catalog,
+};
 use crate::{ChunkingProfile, ContentIngest, ContentName};
 
 mod staging_batch_tests;
@@ -48,6 +51,28 @@ fn test_directory(aliases: &[&str]) -> PrincipalDirectory {
             .unwrap();
     }
     directory
+}
+
+fn filesystem_snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                directories.push(path);
+            } else {
+                let name = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                files.insert(name, std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    files
 }
 
 async fn create_test_principal(store: &RuntimePrincipalStore, alias: &str) -> PrincipalUid {
@@ -254,12 +279,53 @@ fn owner_codec_round_trips_only_canonical_values() {
     let user = astrid_core::UserUid::from_bytes([11; 32]);
     let mut user_bytes = vec![3];
     user_bytes.extend_from_slice(user.as_bytes());
-    assert_eq!(codec.encode(&StateOwner::User(user)), user_bytes);
+    assert_eq!(codec.encode_checked(&StateOwner::User(user)), None);
+    assert!(codec.encode(&StateOwner::User(user)).is_empty());
     assert_eq!(codec.decode(&user_bytes), None);
     assert_eq!(codec.decode(&[]), None);
     assert_eq!(codec.decode(&[0, 0]), None);
     assert_eq!(codec.decode(&[1]), None);
     assert_eq!(codec.decode(&[1, b':']), None);
+}
+
+#[tokio::test]
+async fn user_owner_writes_and_staging_reject_before_durable_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let user = astrid_core::UserUid::from_bytes([11; 32]);
+    let owner = StateOwner::User(user);
+    let name = ContentName::new("workspace/user.bin").unwrap();
+
+    assert!(store.engine.root(&owner).unwrap().is_none());
+    let content_error = store
+        .content()
+        .put(&owner, &name, b"throwaway")
+        .unwrap_err();
+    assert!(matches!(
+        content_error,
+        PrincipalContentError::QuotaPolicy(StorageError::Internal(_))
+    ));
+    assert!(store.engine.root(&owner).unwrap().is_none());
+
+    let staging_root = home.content_staging_path();
+    let staging_before = filesystem_snapshot(&staging_root);
+    let staging_error = store
+        .staging()
+        .begin(owner, name.clone(), ChunkingProfile::ASTRID_V1)
+        .unwrap_err();
+    assert!(staging_error.to_string().contains("user StateOwner"));
+    assert_eq!(filesystem_snapshot(&staging_root), staging_before);
+
+    drop(store);
+    let reopened = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    assert!(reopened.engine.root(&owner).unwrap().is_none());
+    assert_eq!(reopened.content().read(&owner, &name).unwrap(), None);
+    assert!(reopened.staging().ready().unwrap().is_empty());
 }
 
 #[test]

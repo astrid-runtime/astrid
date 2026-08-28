@@ -108,7 +108,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
         let branch_view = match binding.owner {
             StateOwner::Principal(_) => StorageProviderViewV1::Principal(principal.clone()),
             StateOwner::Fleet(uid) => StorageProviderViewV1::Fleet(uid),
-            StateOwner::System => {
+            StateOwner::System | StateOwner::User(_) => {
                 return Err("system workspace owner is not process-mountable".to_owned());
             },
         };

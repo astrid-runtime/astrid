@@ -214,11 +214,25 @@ impl PrincipalCodec<StateOwnerV1> for StateOwnerCodecV1 {
 /// stable. Fleet ownership is appended under tag `2`; it is never represented
 /// as a synthetic principal or hidden beneath system authority.
 ///
-/// V2 does not admit [`StateOwner::User`]. Its infallible encoder emits the
-/// canonical V3 bytes rather than relabeling a user; its decoder still fails
-/// closed on tag `3`, and the active runtime remains on V2.
+/// V2 does not admit [`StateOwner::User`]. Its infallible encoder emits a
+/// rejection marker that can never decode back to an owner; its checked
+/// encoder returns `None` instead. Its decoder also fails closed on tag `3`,
+/// and the active runtime remains on V2.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StateOwnerCodecV2;
+
+impl StateOwnerCodecV2 {
+    /// Encode an owner only when the V2 grammar admits it.
+    #[must_use]
+    pub fn encode_checked(&self, owner: &StateOwner) -> Option<Vec<u8>> {
+        match owner {
+            StateOwner::User(_) => None,
+            StateOwner::System | StateOwner::Principal(_) | StateOwner::Fleet(_) => {
+                Some(self.encode(owner))
+            },
+        }
+    }
+}
 
 impl PrincipalCodec<StateOwner> for StateOwnerCodecV2 {
     fn encode(&self, owner: &StateOwner) -> Vec<u8> {
@@ -236,7 +250,10 @@ impl PrincipalCodec<StateOwner> for StateOwnerCodecV2 {
                 bytes.extend_from_slice(fleet.as_bytes());
                 bytes
             },
-            StateOwner::User(_) => StateOwnerCodecV3.encode(owner),
+            // The infallible interface has no error channel. Reserve an empty
+            // principal so canonical WAL validation rejects User before a root
+            // record can be encoded or committed.
+            StateOwner::User(_) => Vec::new(),
         }
     }
 
@@ -863,6 +880,17 @@ async fn open_runtime_principal_store_with_options(
     assemble_runtime_store(home, quota, principals, Arc::new(engine), receipt).await
 }
 
+fn fail_closed_runtime_quota(
+    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
+) -> Arc<dyn KvQuotaResolver<StateOwner>> {
+    Arc::new(move |owner: &StateOwner| match owner {
+        StateOwner::User(_) => Err(StorageError::Internal(
+            "user StateOwner is not admitted by runtime owner codec V2".to_owned(),
+        )),
+        _ => quota.max_logical_bytes(owner),
+    })
+}
+
 async fn assemble_runtime_store(
     home: &AstridHome,
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
@@ -870,6 +898,7 @@ async fn assemble_runtime_store(
     engine: Arc<RuntimeEngine>,
     directory_cutover_receipt: String,
 ) -> StorageResult<RuntimePrincipalStore> {
+    let quota = fail_closed_runtime_quota(quota);
     let format_spec = bootstrap::format_specification()?;
     let format_spec_id = engine.identify(&format_spec);
     let catalog_spec = bootstrap::content_catalog_format_specification()?;
