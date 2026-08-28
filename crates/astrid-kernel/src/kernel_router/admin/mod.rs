@@ -67,7 +67,7 @@ use astrid_audit::{AuditOutcome, AuthorizationProof};
 use astrid_core::principal::PrincipalId;
 use astrid_events::ipc::{IpcPayload, Topic};
 use astrid_events::kernel_api::{
-    AdminKernelRequest, AdminKernelResponse, AdminRequestKind, AdminResponseBody,
+    AdminKernelRequest, AdminKernelResponse, AdminRequestKind, AdminResponseBody, EnvStorageScope,
 };
 use tracing::warn;
 
@@ -227,12 +227,32 @@ fn admin_response_topic(input_topic: &str) -> Topic {
 #[must_use]
 pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> AuthorityScope {
     match req {
+        // Host-wide shared env/secret namespaces are not principal-scoped
+        // storage: the `principal` field is ignored for `Shared` writes and
+        // every capsule falls back to `system:control:*` on miss. Require the
+        // global `env:write` form even when the caller names themselves —
+        // otherwise `self:*` (builtin agent) can poison every principal's
+        // shared secret resolution for a capsule.
+        AdminRequestKind::EnvSet {
+            principal,
+            scope,
+            ..
+        }
+        | AdminRequestKind::EnvDelete {
+            principal,
+            scope,
+            ..
+        } => {
+            if *scope == EnvStorageScope::Shared || principal != caller {
+                AuthorityScope::Global
+            } else {
+                AuthorityScope::Self_
+            }
+        }
         AdminRequestKind::QuotaGet { principal }
         | AdminRequestKind::QuotaSet { principal, .. }
         | AdminRequestKind::UsageGet { principal }
-        | AdminRequestKind::EnvSet { principal, .. }
         | AdminRequestKind::EnvList { principal, .. }
-        | AdminRequestKind::EnvDelete { principal, .. }
         | AdminRequestKind::DistroLockGet { principal }
         | AdminRequestKind::DistroLockSet { principal, .. }
         // Device management is self-scoped when the target IS the caller —
