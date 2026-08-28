@@ -55,11 +55,13 @@ fn emit_start(serial: Emit<'_>, id: u64, generation: u64, scenario: u64) {
 }
 
 fn emit_context(serial: Emit<'_>, id: u64, generation: u64, _rdi: u64) {
+    let root = if id == 1 { "0xfe01000" } else { "0xfe17000" };
     serial(format!(
         "\"ev\":\"domain.entered\",\"id\":{id},\"generation\":{generation},\"cpl\":3"
     ));
     serial(format!(
-        "\"ev\":\"domain.context\",\"id\":{id},\"generation\":{generation},\"root\":\"0x2000\",\"flags\":3,\"cpl\":3,\"fs\":0,\"gs\":0"
+        "\"ev\":\"domain.context\",\"id\":{id},\"generation\":{generation},\
+            \"root\":\"{root}\",\"flags\":0,\"cpl\":3,\"fs\":0,\"gs\":0"
     ));
 }
 
@@ -90,7 +92,8 @@ fn emit_terminal(
             \"fault_address\":\"{address}\",\"rip\":\"0x10\",\"cpl\":3"
     ));
     serial(format!(
-        "\"ev\":\"domain.restore\",\"id\":{id},\"generation\":{generation},\"ok\":true,\"root\":\"0x1000\",\"flags\":3"
+        "\"ev\":\"domain.restore\",\"id\":{id},\"generation\":{generation},\
+            \"ok\":true,\"root\":\"0x101000\",\"flags\":0"
     ));
     serial(format!(
         "\"ev\":\"domain.reclaim\",\"id\":{id},\"generation\":{generation},\"expected\":16,\"freed\":16,\"swept\":16,\"blocked\":0"
@@ -102,7 +105,8 @@ fn emit_cancel(serial: Emit<'_>, id: u64, generation: u64) {
         "\"ev\":\"domain.cancel.request\",\"id\":{id},\"generation\":{generation}"
     ));
     serial(format!(
-        "\"ev\":\"domain.restore\",\"id\":{id},\"generation\":{generation},\"ok\":true,\"root\":\"0x1000\",\"flags\":3"
+        "\"ev\":\"domain.restore\",\"id\":{id},\"generation\":{generation},\
+            \"ok\":true,\"root\":\"0x101000\",\"flags\":0"
     ));
     serial(format!(
         "\"ev\":\"domain.reclaim\",\"id\":{id},\"generation\":{generation},\"expected\":16,\"freed\":16,\"swept\":16,\"blocked\":0"
@@ -165,7 +169,7 @@ fn passing_serial_with(kernel: &str, sysgen: &str, kfloor: u64, sfloor: u64) -> 
     emit_pass(&mut ev, REQUIRED_PASSES[3]);
     emit_pass(&mut ev, REQUIRED_PASSES[4]);
     emit_pass(&mut ev, REQUIRED_PASSES[5]);
-    ev("\"ev\":\"kernel.cr3\",\"root\":\"0x1000\",\"flags\":3".into());
+    ev("\"ev\":\"kernel.cr3\",\"root\":\"0x101000\",\"flags\":0".into());
     emit_pass(&mut ev, super::OVERFLOW_GATE);
     ev("\"ev\":\"domain.auth.reject\",\"reason\":\"tampered_component_rejected\"".into());
     emit_pass(&mut ev, DOMAIN_REQUIRED_PASSES[0]);
@@ -388,6 +392,11 @@ fn rejected_sysgen_emits_no_success_bound_events() {
     assert!(!rejected_without_success_bound_events(&parse_events(
         &contaminated
     )));
+
+    let contaminated = format!("{serial}{{\"seq\":4,\"ev\":\"component.bound\"}}\n");
+    assert!(!rejected_without_success_bound_events(&parse_events(
+        &contaminated
+    )));
 }
 
 #[test]
@@ -421,4 +430,79 @@ fn ring0_plan_mismatch_trace_requires_kernel_rejection_shape() {
 fn dual_closure_missing_bound_fails() {
     let serial = passing_serial().replace("\"ev\":\"closure.bound\"", "\"ev\":\"closure.kernel\"");
     assert!(!assert_ok(&serial));
+}
+
+#[test]
+fn mutated_context_identity_flags_or_root_fails() {
+    let wrong_identity = passing_serial().replacen(
+        "\"ev\":\"domain.context\",\"id\":1,\"generation\":1",
+        "\"ev\":\"domain.context\",\"id\":9,\"generation\":1",
+        1,
+    );
+    assert!(wrong_identity.contains("\"id\":9,\"generation\":1"));
+    assert!(!assert_ok(&wrong_identity));
+
+    let wrong_flags = passing_serial().replacen(
+        "\"ev\":\"domain.context\",\"id\":1,\"generation\":1,\"root\":\"0xfe01000\",\"flags\":0",
+        "\"ev\":\"domain.context\",\"id\":1,\"generation\":1,\"root\":\"0xfe01000\",\"flags\":1",
+        1,
+    );
+    assert!(wrong_flags.contains("\"flags\":1"));
+    assert!(!assert_ok(&wrong_flags));
+
+    let kernel_root = passing_serial().replacen(
+        "\"ev\":\"domain.context\",\"id\":1,\"generation\":1,\"root\":\"0xfe01000\"",
+        "\"ev\":\"domain.context\",\"id\":1,\"generation\":1,\"root\":\"0x101000\"",
+        1,
+    );
+    assert!(kernel_root.contains("\"root\":\"0x101000\""));
+    assert!(!assert_ok(&kernel_root));
+}
+
+#[test]
+fn mutated_restore_identity_root_or_flags_fails() {
+    let wrong_identity = passing_serial().replacen(
+        "\"ev\":\"domain.restore\",\"id\":1,\"generation\":1",
+        "\"ev\":\"domain.restore\",\"id\":9,\"generation\":1",
+        1,
+    );
+    assert!(wrong_identity.contains("\"id\":9,\"generation\":1"));
+    assert!(!assert_ok(&wrong_identity));
+
+    let wrong_root = passing_serial().replacen(
+        "\"ev\":\"domain.restore\",\"id\":1,\"generation\":1,\"ok\":true,\"root\":\"0x101000\"",
+        "\"ev\":\"domain.restore\",\"id\":1,\"generation\":1,\"ok\":true,\"root\":\"0xfe01000\"",
+        1,
+    );
+    assert!(wrong_root.contains("\"root\":\"0xfe01000\""));
+    assert!(!assert_ok(&wrong_root));
+
+    let wrong_flags = passing_serial().replacen(
+        "\"ev\":\"domain.restore\",\"id\":1,\"generation\":1,\"ok\":true,\
+         \"root\":\"0x101000\",\"flags\":0",
+        "\"ev\":\"domain.restore\",\"id\":1,\"generation\":1,\"ok\":true,\
+         \"root\":\"0x101000\",\"flags\":1",
+        1,
+    );
+    assert!(wrong_flags.contains("\"flags\":1"));
+    assert!(!assert_ok(&wrong_flags));
+}
+
+#[test]
+fn mutated_cancel_identities_fail() {
+    let wrong_request = passing_serial().replacen(
+        "\"ev\":\"domain.cancel.request\",\"id\":2,\"generation\":1",
+        "\"ev\":\"domain.cancel.request\",\"id\":2,\"generation\":2",
+        1,
+    );
+    assert!(wrong_request.contains("\"ev\":\"domain.cancel.request\",\"id\":2,\"generation\":2"));
+    assert!(!assert_ok(&wrong_request));
+
+    let wrong_cancelled = passing_serial().replacen(
+        "\"ev\":\"domain.cancelled\",\"id\":2,\"generation\":1",
+        "\"ev\":\"domain.cancelled\",\"id\":1,\"generation\":1",
+        1,
+    );
+    assert!(wrong_cancelled.contains("\"ev\":\"domain.cancelled\",\"id\":1,\"generation\":1"));
+    assert!(!assert_ok(&wrong_cancelled));
 }

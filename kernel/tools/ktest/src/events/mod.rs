@@ -81,6 +81,7 @@ const SUCCESS_BOUND_EVENTS: &[&str] = &[
 ];
 
 const CLOSURE_SUCCESS_BOUND_EVENTS: &[&str] = &[
+    "component.bound",
     "handoff.bound",
     "closure.kernel",
     "closure.sysgen",
@@ -290,6 +291,11 @@ const DOMAIN_RECLAIMS: &[(u64, u64)] = &[
     (1, 6),
 ];
 const DOMAIN_CANCEL_REJECTS: &[(&str, u64, u64)] = &[("stale_handle", 1, 1)];
+const DOMAIN_CANCEL_IDENTITIES: &[(u64, u64)] = &[(2, 1)];
+const KERNEL_CR3_ROOT: &str = "0x101000";
+const KERNEL_CR3_FLAGS: u64 = 0;
+const DOMAIN_CONTEXT_FLAGS: u64 = 0;
+const SLOT_CONTEXT_ROOTS: [&str; 2] = ["0xfe01000", "0xfe17000"];
 const DOMAIN_OUTCOMES: &[(u64, u64, &str, u64, u64, &str, u64)] = &[
     (1, 1, "clean_exit", 3, 0, "0x0", 3),
     (1, 2, "invalid_instruction", 6, 0, "0x0", 3),
@@ -486,14 +492,39 @@ fn domain_lifecycle_holds(events: &[Value]) -> bool {
                 && u64_field(event, "cpl") == Some(3)
                 && zero_gpr
         });
-    let contexts_ok = named_events(events, "domain.context")
+    let kernel_cr3 = named_events(events, "kernel.cr3").first().copied();
+    let kernel_cr3_ok = kernel_cr3.is_some_and(|event| {
+        string_field(event, "root") == Some(KERNEL_CR3_ROOT)
+            && u64_field(event, "flags") == Some(KERNEL_CR3_FLAGS)
+    });
+    let start_identities: Vec<(u64, u64)> = DOMAIN_STARTS
+        .iter()
+        .map(|(id, generation, _)| (*id, *generation))
+        .collect();
+    let context_identities: Vec<(u64, u64)> = named_events(events, "domain.context")
         .into_iter()
-        .all(|event| {
-            string_field(event, "root").is_some_and(|root| root.starts_with("0x"))
-                && u64_field(event, "cpl") == Some(3)
-                && u64_field(event, "fs") == Some(0)
-                && u64_field(event, "gs") == Some(0)
-        });
+        .map(|event| {
+            (
+                u64_field(event, "id").unwrap_or_default(),
+                u64_field(event, "generation").unwrap_or_default(),
+            )
+        })
+        .collect();
+    let contexts_ok = context_identities == start_identities
+        && named_events(events, "domain.context")
+            .into_iter()
+            .all(|event| {
+                let expected_root = match u64_field(event, "id") {
+                    Some(1) => SLOT_CONTEXT_ROOTS[0],
+                    Some(2) => SLOT_CONTEXT_ROOTS[1],
+                    _ => "",
+                };
+                string_field(event, "root") == Some(expected_root)
+                    && u64_field(event, "flags") == Some(DOMAIN_CONTEXT_FLAGS)
+                    && u64_field(event, "cpl") == Some(3)
+                    && u64_field(event, "fs") == Some(0)
+                    && u64_field(event, "gs") == Some(0)
+            });
     let outcomes_ok = named_events(events, "domain.outcome")
         .into_iter()
         .map(|event| {
@@ -532,6 +563,14 @@ fn domain_lifecycle_holds(events: &[Value]) -> bool {
         "generation",
         DOMAIN_RECLAIMS,
     ) && all_bools(events, "domain.restore", "ok", true);
+    let restores_ok = kernel_cr3_ok
+        && restores_ok
+        && named_events(events, "domain.restore")
+            .into_iter()
+            .all(|event| {
+                string_field(event, "root") == Some(KERNEL_CR3_ROOT)
+                    && u64_field(event, "flags") == Some(KERNEL_CR3_FLAGS)
+            });
     let audits_ok = named_events(events, "domain.audit").len() == 2 * DOMAIN_ADMISSION_COUNT
         && named_events(events, "domain.audit")
             .into_iter()
@@ -563,6 +602,19 @@ fn domain_lifecycle_holds(events: &[Value]) -> bool {
             )
         })
         .eq(DOMAIN_CANCEL_REJECTS.iter().copied());
+    let cancel_identities_ok = exact_pairs(
+        events,
+        "domain.cancel.request",
+        "id",
+        "generation",
+        DOMAIN_CANCEL_IDENTITIES,
+    ) && exact_pairs(
+        events,
+        "domain.cancelled",
+        "id",
+        "generation",
+        DOMAIN_CANCEL_IDENTITIES,
+    );
     let accounting_ok = count_named(events, "domain.accounting") == 0;
     let tamper_events = named_events(events, "domain.auth.reject")
         .into_iter()
@@ -589,7 +641,10 @@ fn domain_lifecycle_holds(events: &[Value]) -> bool {
     ok &= check("exact domain starts and monotonic generations", starts_ok);
     ok &= check("exact ring-3 domain entries", entries_ok);
     ok &= check("exact guest registers and CPL", registers_ok);
-    ok &= check("ring-3 context and FS/GS entry state", contexts_ok);
+    ok &= check(
+        "context identity, flags, and start/kernel-CR3 relation",
+        contexts_ok,
+    );
     ok &= check("exact domain outcomes and fault addresses", outcomes_ok);
     ok &= check("exact reclaim generations and accounting", reclaims_ok);
     ok &= check("restores accompany every reclaim", restores_ok);
@@ -597,6 +652,10 @@ fn domain_lifecycle_holds(events: &[Value]) -> bool {
     ok &= check("domain exclusion evidence", exclusions_ok);
     ok &= check("zero-on-admission policy", policies_ok);
     ok &= check("exact active and stale cancel rejection", cancel_rejects_ok);
+    ok &= check(
+        "exact cancel request/cancelled identities",
+        cancel_identities_ok,
+    );
     ok &= check("no domain accounting leaks", accounting_ok);
     ok &= check(
         "tampered component rejection before auth success",
