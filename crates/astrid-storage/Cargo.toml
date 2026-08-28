@@ -26,6 +26,7 @@ async-trait = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
 fastcdc = { workspace = true }
+fastcdc-v4 = { workspace = true }
 hex = { workspace = true }
 lz4_flex = { workspace = true }
 keyring = { workspace = true, optional = true }
@@ -44,6 +45,7 @@ base64 = { workspace = true }
 blake3 = { workspace = true }
 ed25519-dalek = { workspace = true }
 fastcdc = { workspace = true }
+fastcdc-v4 = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }

@@ -814,7 +814,8 @@ dependencies = [
  "caseless",
  "chrono",
  "ed25519-dalek",
- "fastcdc",
+ "fastcdc 4.0.1",
+ "fastcdc 5.0.0",
  "fs2",
  "getrandom 0.4.3",
  "hex",
@@ -843,7 +844,7 @@ dependencies = [
  "anyhow",
  "astrid-storage",
  "blake3",
- "fastcdc",
+ "fastcdc 5.0.0",
  "hex",
  "mincdc",
  "mothcdc",
@@ -2774,6 +2775,12 @@ name = "fastcdc"
 version = "4.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77af40d8a8dadb92dc178569a5f5edb5f3056e98255c2de48ab5d59a52892e0c"
+
+[[package]]
+name = "fastcdc"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0431c3132902a1bed6fe77dcfa5d03844e083f263b81288246a2d43dd7d4b2ad"
 
 [[package]]
 name = "faster-hex"
