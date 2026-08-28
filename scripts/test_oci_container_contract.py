@@ -288,7 +288,7 @@ class RuntimeHarnessContractTests(unittest.TestCase):
             TEST_HARNESS.lower(),
         )
 
-    def test_audit_probe_requires_failed_stub_status_and_reports_blocker(self) -> None:
+    def test_audit_probe_requires_failed_status_and_exact_stub_stderr(self) -> None:
         audit_functions = [
             "fail() {\n"
             '  printf "audit probe: %s\\n" "$*" >&2\n'
@@ -304,63 +304,64 @@ class RuntimeHarnessContractTests(unittest.TestCase):
             "  printf '%s\\0' \"$argument\" >> \"$DOCKER_CALL_LOG\"\n"
             "done\n"
             "printf '\\0' >> \"$DOCKER_CALL_LOG\"\n"
-            'printf "%s\\n" "audit trail inspection is not available" >&2\n'
+            'printf "%s\\n" "$FAKE_AUDIT_STDERR" >&2\n'
             'exit "$FAKE_AUDIT_STATUS"\n'
         )
 
-        with tempfile.TemporaryDirectory() as temporary:
-            root = pathlib.Path(temporary)
-            bin_dir = root / "failed-stub"
-            bin_dir.mkdir()
-            call_log = root / "failed-audit-calls"
-            fake_docker = bin_dir / "docker"
-            fake_docker.write_text(fake_docker_source, encoding="utf-8")
-            fake_docker.chmod(0o755)
-            completed = run_extracted_shell(
-                audit_functions,
-                "assert_v0104_audit_is_non_gating probe.out probe.err",
-                bin_dir,
-                {
-                    "DOCKER_CALL_LOG": str(call_log),
-                    "FAKE_AUDIT_STATUS": "1",
-                },
-            )
-
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertEqual(
-                completed.stdout,
-                "BLOCKED AUDIT (non-gating): v0.10.4 baseline blocker; "
-                "audit is deferred and exposes no supported chain/head or "
-                "principal-scoped query.\n",
-            )
-            calls = docker_call_log(call_log)
-            self.assertEqual(len(calls), 1)
-            self.assertEqual(calls[0][0], "exec")
-            self.assertEqual(
-                calls[0][-3:],
-                ["/usr/local/bin/astrid", "audit", "status"],
-            )
+        expected_blocker = (
+            "BLOCKED AUDIT (non-gating): v0.10.4 baseline blocker; "
+            "audit is deferred and exposes no supported chain/head or "
+            "principal-scoped query.\n"
+        )
+        cases = [
+            ("failed-stub", "1", "audit trail inspection is not available", 0),
+            ("successful-stub", "0", "audit trail inspection is not available", 1),
+            ("wrong-failed-stub", "1", "audit trail query failed", 1),
+        ]
 
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
-            bin_dir = root / "successful-query"
-            bin_dir.mkdir()
-            fake_docker = bin_dir / "docker"
-            fake_docker.write_text("exit 0\n", encoding="utf-8")
-            fake_docker.chmod(0o755)
-            completed = run_extracted_shell(
-                audit_functions,
-                "assert_v0104_audit_is_non_gating probe.out probe.err",
-                bin_dir,
-                {"FAKE_AUDIT_STATUS": "0"},
-            )
+            for label, status, stderr, expected_status in cases:
+                bin_dir = root / label
+                bin_dir.mkdir()
+                call_log = root / f"{label}-calls"
+                fake_docker = bin_dir / "docker"
+                fake_docker.write_text(fake_docker_source, encoding="utf-8")
+                fake_docker.chmod(0o755)
+                completed = run_extracted_shell(
+                    audit_functions,
+                    "assert_v0104_audit_is_non_gating probe.out probe.err",
+                    bin_dir,
+                    {
+                        "DOCKER_CALL_LOG": str(call_log),
+                        "FAKE_AUDIT_STATUS": status,
+                        "FAKE_AUDIT_STDERR": stderr,
+                    },
+                )
 
-            self.assertNotEqual(completed.returncode, 0)
-            self.assertNotIn("BLOCKED AUDIT", completed.stdout)
-            self.assertIn(
-                "v0.10.4 unexpectedly exposed an audit query",
-                completed.stderr,
-            )
+                with self.subTest(case=label):
+                    self.assertEqual(
+                        completed.returncode,
+                        expected_status,
+                        completed.stderr,
+                    )
+                    calls = docker_call_log(call_log)
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(calls[0][0], "exec")
+                    self.assertEqual(
+                        calls[0][-3:],
+                        ["/usr/local/bin/astrid", "audit", "status"],
+                    )
+                    if expected_status == 0:
+                        self.assertEqual(completed.stdout, expected_blocker)
+                    else:
+                        self.assertEqual(completed.stdout, "")
+                        self.assertIn(
+                            "v0.10.4 unexpectedly exposed an audit query"
+                            if status == "0"
+                            else "unexpected v0.10.4 audit surface",
+                            completed.stderr,
+                        )
 
     def test_harness_rejects_inherited_security_policy_bypasses(self) -> None:
         self.assertIn("ASTRID_SANDBOX_POLICY=off", TEST_HARNESS)
