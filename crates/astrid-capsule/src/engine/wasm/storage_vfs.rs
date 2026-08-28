@@ -592,6 +592,11 @@ mod tests {
             Ok(match owner {
                 StateOwner::System => None,
                 StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+                astrid_storage::StateOwner::User(_) => {
+                    Err(astrid_storage::StorageError::Internal(
+                        "test quota resolver rejects user StateOwner".to_owned(),
+                    ))?
+                },
             })
         });
         let store = open_runtime_principal_store(&home, quota)
@@ -745,6 +750,11 @@ mod tests {
             Ok(match owner {
                 StateOwner::System => None,
                 StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+                astrid_storage::StateOwner::User(_) => {
+                    Err(astrid_storage::StorageError::Internal(
+                        "test quota resolver rejects user StateOwner".to_owned(),
+                    ))?
+                },
             })
         });
         let reopened = open_runtime_principal_store(&home, quota)

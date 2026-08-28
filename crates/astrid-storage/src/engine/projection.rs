@@ -274,6 +274,15 @@ impl From<ModelError> for PrincipalProjectionError {
 
 /// Engine operations shared by typed principal-state projections.
 pub trait PrincipalProjectionEngine<P>: Send + Sync {
+    /// Check whether the projection's durable owner grammar admits a root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed admission error without staging or publishing state.
+    fn admit_principal(&self, _principal: &P) -> Result<(), PrincipalProjectionError> {
+        Ok(())
+    }
+
     /// Compute one canonical object identity.
     fn identify_object(&self, record: &ObjectRecord) -> ObjectId;
 
@@ -641,6 +650,10 @@ where
     I: PersistentObjectIdentity + Send + Sync,
     C: PrincipalCodec<P> + Send + Sync,
 {
+    fn admit_principal(&self, principal: &P) -> Result<(), PrincipalProjectionError> {
+        DurableEngine::admit_principal(self, principal).map_err(map_durable)
+    }
+
     fn identify_object(&self, record: &ObjectRecord) -> ObjectId {
         self.identify(record)
     }

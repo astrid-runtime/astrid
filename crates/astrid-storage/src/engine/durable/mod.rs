@@ -251,6 +251,16 @@ pub trait PrincipalCodec<P>: Send + Sync {
 
     /// Decode and validate one principal identifier.
     fn decode(&self, bytes: &[u8]) -> Option<P>;
+
+    /// Check whether this durable wire grammar admits the principal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an admission error when the principal is reserved by this
+    /// wire version. The default accepts every in-memory principal.
+    fn admit_principal(&self, _principal: &P) -> Result<(), DurableError> {
+        Ok(())
+    }
 }
 
 /// Algorithm and construction version carried beside every durable identity.
@@ -326,6 +336,10 @@ where
 
     fn decode(&self, bytes: &[u8]) -> Option<P> {
         self.0.decode(bytes)
+    }
+
+    fn admit_principal(&self, principal: &P) -> Result<(), DurableError> {
+        self.0.admit_principal(principal)
     }
 }
 
@@ -408,6 +422,8 @@ pub enum DurableError {
         /// Root-journal frame containing the bytes.
         offset: u64,
     },
+    /// The in-memory principal is not admitted by the active wire grammar.
+    UnsupportedPrincipal,
     /// A structurally valid frame violates the portable state model during
     /// recovery.
     RecoveryModel {
@@ -475,6 +491,9 @@ impl fmt::Display for DurableError {
                     formatter,
                     "invalid principal bytes at root-journal byte {offset}"
                 )
+            },
+            Self::UnsupportedPrincipal => {
+                formatter.write_str("principal is not admitted by the durable owner codec")
             },
             Self::RecoveryModel {
                 file,

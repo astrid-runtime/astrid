@@ -318,6 +318,15 @@ impl From<ModelError> for KvProjectionError {
 /// This keeps the compatibility adapter independent of whether the principal
 /// world is held in memory or reconstructed lazily from a durable arena.
 pub trait KvProjectionEngine<P>: Send + Sync {
+    /// Check whether the durable owner grammar admits a KV root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed admission error without staging or publishing state.
+    fn admit_kv_principal(&self, _principal: &P) -> Result<(), KvProjectionError> {
+        Ok(())
+    }
+
     /// Compute the logical identity of one canonical object.
     fn identify_kv_object(&self, record: &ObjectRecord) -> ObjectId;
 
@@ -442,6 +451,10 @@ where
     I: PersistentObjectIdentity + Send + Sync,
     C: PrincipalCodec<P> + Send + Sync,
 {
+    fn admit_kv_principal(&self, principal: &P) -> Result<(), KvProjectionError> {
+        DurableEngine::admit_principal(self, principal).map_err(map_durable_error)
+    }
+
     fn identify_kv_object(&self, record: &ObjectRecord) -> ObjectId {
         self.identify(record)
     }
@@ -603,6 +616,7 @@ where
     P: Ord,
     E: KvProjectionEngine<P>,
 {
+    engine.admit_kv_principal(&snapshot.principal)?;
     let transaction = encode_transaction(engine, snapshot)?;
     engine.commit_kv_root(transaction)
 }
