@@ -39,6 +39,12 @@ fail() {
   exit 1
 }
 
+parse_proc_status_field() {
+  local status_file=$1
+  local field=$2
+  awk -v field="$field" '$1 == field ":" { print $2; exit }' "$status_file"
+}
+
 prepare_runtime_dir() {
   local directory=$1
   local mode=${2:-0700}
@@ -133,23 +139,31 @@ wait_real_runtime() {
 }
 
 assert_daemon_is_pid_one() {
-  local identity
-  identity=$(docker exec "$REAL_CONTAINER" /bin/sh -ec '
-    [ "$(cat /proc/1/comm)" = astrid-daemon ] ||
-      { printf "comm=%s\n" "$(cat /proc/1/comm)" >&2; exit 1; }
-    exe=$(readlink /proc/1/exe)
+  local status
+  status=$(docker exec "$REAL_CONTAINER" cat /proc/1/status) ||
+    fail "daemon status probe failed"
+  local comm
+  comm=$(docker exec "$REAL_CONTAINER" cat /proc/1/comm) ||
+    fail "daemon command-name probe failed"
+  local exe
+  exe=$(docker exec "$REAL_CONTAINER" readlink /proc/1/exe) ||
+    fail "daemon executable probe failed"
+  local cwd
+  cwd=$(docker exec "$REAL_CONTAINER" readlink /proc/1/cwd) ||
+    fail "daemon working-directory probe failed"
+  local uid
+  uid=$(printf '%s\n' "$status" | parse_proc_status_field /dev/stdin Uid)
+  local gid
+  gid=$(printf '%s\n' "$status" | parse_proc_status_field /dev/stdin Gid)
+  [ "$comm" = astrid-daemon ] ||
+    { printf "comm=%s\n" "$comm" >&2; exit 1; }
     [ "$(basename "$exe")" = astrid-daemon ] ||
       { printf "exe=%s\n" "$exe" >&2; exit 1; }
-    uid=$(sed -n "s/^Uid:[[:space:]]*//p" /proc/1/status | cut -d" " -f1)
-    gid=$(sed -n "s/^Gid:[[:space:]]*//p" /proc/1/status | cut -d" " -f1)
-    [ "$uid" = 65532 ] && [ "$gid" = 65532 ] ||
-      { printf "uid=%s gid=%s\n" "$uid" "$gid" >&2; exit 1; }
-    [ "$(readlink /proc/1/cwd)" = /workspace ] ||
-      { printf "cwd=%s\n" "$(readlink /proc/1/cwd)" >&2; exit 1; }
-    printf "PID1 astrid-daemon 65532:65532 /workspace\n"
-    ') || fail "daemon identity probe failed"
-  [[ "$identity" == "PID1 astrid-daemon 65532:65532 /workspace" ]] ||
-    fail "real daemon is not PID 1 as uid/gid 65532 in /workspace: $identity"
+  [ "$uid" = 65532 ] && [ "$gid" = 65532 ] ||
+    { printf "uid=%s gid=%s\n" "$uid" "$gid" >&2; exit 1; }
+  [ "$cwd" = /workspace ] ||
+    { printf "cwd=%s\n" "$cwd" >&2; exit 1; }
+  printf 'PID1 astrid-daemon 65532:65532 /workspace\n'
 }
 
 run_real_cli() {

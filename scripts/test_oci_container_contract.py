@@ -379,6 +379,93 @@ class RuntimeHarnessContractTests(unittest.TestCase):
         self.assertNotIn("docker restart", TEST_HARNESS.lower())
         self.assertIn("agent create", TEST_HARNESS)
 
+    def test_daemon_pid1_identity_parses_tab_delimited_proc_status(self) -> None:
+        assert_function = shell_function("assert_daemon_is_pid_one")
+        parse_function = shell_function("parse_proc_status_field")
+        new_parser = (
+            "  awk -v field=\"$field\" "
+            "'$1 == field \":\" { print $2; exit }' \"$status_file\""
+        )
+        old_parser = (
+            '  sed -n "s/^${field}:[[:space:]]*//p" "$status_file" '
+            '| cut -d" " -f1'
+        )
+        fail_function = (
+            "fail() {\n"
+            "  printf 'pid1 contract: %s\\n' \"$*\" >&2\n"
+            "  exit 1\n"
+            "}\n"
+        )
+        self.assertIn(new_parser, parse_function)
+        self.assertNotIn("cut -d", assert_function)
+
+        valid_status = (
+            "Name:\tastrid-daemon\n"
+            "Uid:\t65532\t65532\t65532\t65532\n"
+            "Gid:\t65532\t65532\t65532\t65532\n"
+        )
+        invalid_status = valid_status.replace(
+            "Uid:\t65532",
+            "Uid:\t65533",
+            1,
+        )
+        mutant_parser = parse_function.replace(new_parser, old_parser)
+        cases = [
+            ("tab-delimited-fields", parse_function, valid_status, 0),
+            ("old-space-delimited-cut", mutant_parser, valid_status, 1),
+            ("wrong-uid", parse_function, invalid_status, 1),
+        ]
+
+        for label, parser, status, expected_status in cases:
+            with self.subTest(case=label):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = pathlib.Path(temporary)
+                    bin_dir = root / "bin"
+                    bin_dir.mkdir()
+                    fake_docker = bin_dir / "docker"
+                    fake_docker.write_text(
+                        "#!/bin/sh\n"
+                        "case \"$*\" in\n"
+                        "*\"cat /proc/1/status\"*)\n"
+                        "  printf '%s\\n' \"$FAKE_STATUS\"\n"
+                        "  ;;\n"
+                        "*\"cat /proc/1/comm\"*)\n"
+                        "  printf '%s\\n' astrid-daemon\n"
+                        "  ;;\n"
+                        "*\"readlink /proc/1/exe\"*)\n"
+                        "  printf '%s\\n' /opt/astrid/release/astrid-daemon\n"
+                        "  ;;\n"
+                        "*\"readlink /proc/1/cwd\"*)\n"
+                        "  printf '%s\\n' /workspace\n"
+                        "  ;;\n"
+                        "*)\n"
+                        "  printf 'unexpected docker call: %s\\n' \"$*\" >&2\n"
+                        "  exit 64\n"
+                        "esac\n",
+                        encoding="utf-8",
+                    )
+                    fake_docker.chmod(0o755)
+                    completed = run_extracted_shell(
+                        [fail_function, parser, assert_function],
+                        "assert_daemon_is_pid_one",
+                        bin_dir,
+                        {
+                            "REAL_CONTAINER": "contract-runtime",
+                            "FAKE_STATUS": status,
+                        },
+                    )
+
+                    self.assertEqual(
+                        completed.returncode,
+                        expected_status,
+                        completed.stderr,
+                    )
+                    if expected_status == 0:
+                        self.assertEqual(
+                            completed.stdout,
+                            "PID1 astrid-daemon 65532:65532 /workspace\n",
+                        )
+
     def test_runtime_state_readers_resolve_through_runtime_mount(self) -> None:
         for function_name in (
             "read_runtime_state_file",
