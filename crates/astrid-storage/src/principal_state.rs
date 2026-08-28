@@ -11,14 +11,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::engine::{
-    DurableEngine, DurableEnginePolicy, GroupCommitPolicy, IdentityScheme, ObjectCacheConfig,
-    ObjectCacheStats, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
+    DurableEngine, DurableEnginePolicy, DurableError, GroupCommitPolicy, IdentityScheme,
+    ObjectCacheConfig, ObjectCacheStats, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
     RecoveryRetryPolicy, RejectedRootCandidate,
 };
 use crate::storage_model::{
     ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, PhysicalIdentity, ReferenceKind,
 };
 use astrid_core::FleetUid;
+use astrid_core::UserUid;
 use astrid_core::dirs::AstridHome;
 use astrid_core::identity::PrincipalUid;
 use astrid_core::kernel_api::{ProjectionNameDiagnostic, ProjectionNamePolicyPreset};
@@ -51,6 +52,8 @@ mod format_amendment_tests;
 mod format_migration_tests;
 mod migrations;
 mod native_io;
+mod owner_codec_v1;
+mod owner_codec_v3;
 mod owner_migration;
 #[cfg(test)]
 mod projection_name_tests;
@@ -75,6 +78,8 @@ use format_amendment::{
     store_metadata,
 };
 use native_io::atomic_write;
+pub use owner_codec_v1::{StateOwnerCodecV1, StateOwnerV1};
+pub use owner_codec_v3::StateOwnerCodecV3;
 pub use staging::{
     NativeContentStagingArea, ReadyStagedContent, StagedContentId, StagedContentWriter,
 };
@@ -88,6 +93,8 @@ pub enum StateOwner {
     Principal(PrincipalUid),
     /// State shared by the admitted members of one user-owned fleet.
     Fleet(FleetUid),
+    /// State owned by one validated human user.
+    User(UserUid),
 }
 
 /// Version-one canonical BLAKE3 identity for typed storage objects.
@@ -158,60 +165,31 @@ fn hash_length(hasher: &mut blake3::Hasher, length: usize) {
     hasher.update(&(length as u128).to_le_bytes());
 }
 
-/// Frozen owner domain admitted by [`StateOwnerCodecV1`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum StateOwnerV1 {
-    /// Kernel-owned state.
-    System,
-    /// State owned by one validated principal.
-    Principal(PrincipalUid),
-}
-
-impl From<StateOwnerV1> for StateOwner {
-    fn from(owner: StateOwnerV1) -> Self {
-        match owner {
-            StateOwnerV1::System => Self::System,
-            StateOwnerV1::Principal(principal) => Self::Principal(principal),
-        }
-    }
-}
-
-/// Canonical codec for [`StateOwnerV1`].
-#[derive(Clone, Copy, Debug, Default)]
-pub struct StateOwnerCodecV1;
-
-impl PrincipalCodec<StateOwnerV1> for StateOwnerCodecV1 {
-    fn encode(&self, owner: &StateOwnerV1) -> Vec<u8> {
-        match owner {
-            StateOwnerV1::System => vec![0],
-            StateOwnerV1::Principal(principal) => {
-                let mut bytes = Vec::with_capacity(33);
-                bytes.push(1);
-                bytes.extend_from_slice(principal.as_bytes());
-                bytes
-            },
-        }
-    }
-
-    fn decode(&self, bytes: &[u8]) -> Option<StateOwnerV1> {
-        match bytes.split_first()? {
-            (0, []) => Some(StateOwnerV1::System),
-            (1, principal) if principal.len() == 32 => {
-                let uid = PrincipalUid::from_bytes(<[u8; 32]>::try_from(principal).ok()?);
-                Some(StateOwnerV1::Principal(uid))
-            },
-            _ => None,
-        }
-    }
-}
-
 /// Version-two canonical owner grammar with an explicit fleet tag.
 ///
 /// The version-one `System` and `Principal` encodings remain byte-for-byte
 /// stable. Fleet ownership is appended under tag `2`; it is never represented
 /// as a synthetic principal or hidden beneath system authority.
+///
+/// V2 does not admit [`StateOwner::User`]. Its infallible encoder emits a
+/// rejection marker that can never decode back to an owner; its checked
+/// encoder returns `None` instead. Its decoder also fails closed on tag `3`,
+/// and the active runtime remains on V2.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StateOwnerCodecV2;
+
+impl StateOwnerCodecV2 {
+    /// Encode an owner only when the V2 grammar admits it.
+    #[must_use]
+    pub fn encode_checked(&self, owner: &StateOwner) -> Option<Vec<u8>> {
+        match owner {
+            StateOwner::User(_) => None,
+            StateOwner::System | StateOwner::Principal(_) | StateOwner::Fleet(_) => {
+                Some(self.encode(owner))
+            },
+        }
+    }
+}
 
 impl PrincipalCodec<StateOwner> for StateOwnerCodecV2 {
     fn encode(&self, owner: &StateOwner) -> Vec<u8> {
@@ -229,6 +207,10 @@ impl PrincipalCodec<StateOwner> for StateOwnerCodecV2 {
                 bytes.extend_from_slice(fleet.as_bytes());
                 bytes
             },
+            // The infallible interface has no error channel. Reserve an empty
+            // principal so canonical WAL validation rejects User before a root
+            // record can be encoded or committed.
+            StateOwner::User(_) => Vec::new(),
         }
     }
 
@@ -244,6 +226,13 @@ impl PrincipalCodec<StateOwner> for StateOwnerCodecV2 {
                 Some(StateOwner::Fleet(uid))
             },
             _ => None,
+        }
+    }
+
+    fn admit_principal(&self, owner: &StateOwner) -> Result<(), DurableError> {
+        match owner {
+            StateOwner::User(_) => Err(DurableError::UnsupportedPrincipal),
+            StateOwner::System | StateOwner::Principal(_) | StateOwner::Fleet(_) => Ok(()),
         }
     }
 }
@@ -802,6 +791,26 @@ async fn open_runtime_principal_store_with_options(
     assemble_runtime_store(home, quota, principals, Arc::new(engine), receipt).await
 }
 
+fn fail_closed_runtime_quota(
+    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
+) -> Arc<dyn KvQuotaResolver<StateOwner>> {
+    Arc::new(move |owner: &StateOwner| match owner {
+        StateOwner::User(_) => Err(StorageError::Internal(
+            "user StateOwner is not admitted by runtime owner codec V2".to_owned(),
+        )),
+        _ => quota.max_logical_bytes(owner),
+    })
+}
+
+fn runtime_kv_read_cache_config() -> KvReadCacheConfig<StateOwner> {
+    KvReadCacheConfig::bounded(
+        NonZeroUsize::new(256 * 1024 * 1024).expect("256 MiB"),
+        NonZeroUsize::new(64 * 1024 * 1024).expect("64 MiB"),
+        NonZeroUsize::new(4_096).expect("owner limit"),
+        NonZeroUsize::new(65_536).expect("entries per owner"),
+    )
+}
+
 async fn assemble_runtime_store(
     home: &AstridHome,
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
@@ -809,6 +818,7 @@ async fn assemble_runtime_store(
     engine: Arc<RuntimeEngine>,
     directory_cutover_receipt: String,
 ) -> StorageResult<RuntimePrincipalStore> {
+    let quota = fail_closed_runtime_quota(quota);
     let format_spec = bootstrap::format_specification()?;
     let format_spec_id = engine.identify(&format_spec);
     let catalog_spec = bootstrap::content_catalog_format_specification()?;
@@ -842,12 +852,7 @@ async fn assemble_runtime_store(
             Arc::clone(&validated_kv),
             Arc::clone(&validated_catalogs),
         )
-        .with_read_cache(KvReadCacheConfig::bounded(
-            NonZeroUsize::new(256 * 1024 * 1024).expect("256 MiB"),
-            NonZeroUsize::new(64 * 1024 * 1024).expect("64 MiB"),
-            NonZeroUsize::new(4_096).expect("owner limit"),
-            NonZeroUsize::new(65_536).expect("entries per owner"),
-        )),
+        .with_read_cache(runtime_kv_read_cache_config()),
     );
     let kv: Arc<dyn KvStore> = runtime_kv.clone();
     KvIdentityStore::with_principal_directory(

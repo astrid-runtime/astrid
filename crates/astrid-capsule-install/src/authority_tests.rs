@@ -9,7 +9,7 @@ use astrid_core::dirs::{AstridHome, WorkspaceLayout};
 use astrid_core::identity::PrincipalUid;
 use astrid_crypto::KeyPair;
 use astrid_storage::{
-    KvQuotaResolver, PrincipalDirectory, RuntimePrincipalStore, StateOwner,
+    KvQuotaResolver, PrincipalDirectory, RuntimePrincipalStore, StateOwner, StorageError,
     open_runtime_principal_store_with_directory,
 };
 
@@ -79,6 +79,9 @@ fn install_store(home: &AstridHome, principal: &PrincipalId) -> Arc<RuntimePrinc
         Ok(match owner {
             StateOwner::System => None,
             StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+            StateOwner::User(_) => Err(StorageError::Internal(
+                "test quota resolver rejects user StateOwner".to_owned(),
+            ))?,
         })
     });
     let store = Arc::new(

@@ -261,6 +261,7 @@ where
         source: R,
         profile: ChunkingProfile,
     ) -> Result<ContentWriteOutcome, PrincipalContentError> {
+        self.admit_write_owner(principal)?;
         if let Some((bound, limit)) = self.quota_staging_bound(principal)? {
             let (verified, records) = self.stage_deferred_bounded(source, profile, bound, limit)?;
             self.publish_deferred(principal, name, verified, &records)
@@ -268,6 +269,16 @@ where
             let (verified, objects_inserted) = self.stage_streaming(source, profile)?;
             self.publish(principal, name, verified, None, objects_inserted)
         }
+    }
+
+    /// Reuse the engine's durable-owner grammar before source construction.
+    ///
+    /// Without quota, neither path would otherwise learn that an owner is
+    /// unsupported until publication, after streaming had already appended
+    /// unreachable objects to the shared arena.
+    fn admit_write_owner(&self, principal: &P) -> Result<(), PrincipalContentError> {
+        self.engine.admit_principal(principal)?;
+        Ok(())
     }
 
     pub(crate) fn stage_streaming<R: Read>(

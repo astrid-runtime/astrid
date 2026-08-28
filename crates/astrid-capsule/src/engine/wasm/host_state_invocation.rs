@@ -446,7 +446,7 @@ mod recv_vfs_tests {
     async fn recv_vfs_switches_principals_and_clears_without_one() {
         use astrid_storage::{
             IdentityStore, KvIdentityStore, KvQuotaResolver, ScopedKvStore, StateOwner,
-            open_runtime_principal_store,
+            StorageError, open_runtime_principal_store,
         };
 
         let root = tempfile::tempdir().expect("runtime store");
@@ -458,6 +458,9 @@ mod recv_vfs_tests {
             Ok(match owner {
                 StateOwner::System => None,
                 StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+                StateOwner::User(_) => Err(StorageError::Internal(
+                    "test quota resolver rejects user StateOwner".to_owned(),
+                ))?,
             })
         });
         let store = open_runtime_principal_store(&astrid_home, quota)

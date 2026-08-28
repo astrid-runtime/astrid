@@ -90,7 +90,7 @@ async fn published_v0104_home_imports_verifies_and_retires_legacy_store() {
     let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
         Ok(match owner {
             StateOwner::System => None,
-            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+            StateOwner::Principal(_) | StateOwner::Fleet(_) | StateOwner::User(_) => Some(u64::MAX),
         })
     });
 

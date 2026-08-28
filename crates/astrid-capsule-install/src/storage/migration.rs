@@ -359,7 +359,7 @@ mod tests {
 
     use astrid_core::identity::PrincipalUid;
     use astrid_storage::{
-        KvQuotaResolver, PrincipalDirectory, StateOwner,
+        KvQuotaResolver, PrincipalDirectory, StateOwner, StorageError,
         open_runtime_principal_store_with_directory,
     };
 
@@ -378,6 +378,9 @@ mod tests {
             Ok(match owner {
                 StateOwner::System => None,
                 StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+                StateOwner::User(_) => Err(StorageError::Internal(
+                    "test quota resolver rejects user StateOwner".to_owned(),
+                ))?,
             })
         });
         let store = Arc::new(
@@ -466,6 +469,9 @@ mod tests {
             Ok(match owner {
                 StateOwner::System => None,
                 StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+                StateOwner::User(_) => Err(StorageError::Internal(
+                    "test quota resolver rejects user StateOwner".to_owned(),
+                ))?,
             })
         });
         Arc::new(

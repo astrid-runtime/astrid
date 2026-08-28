@@ -305,7 +305,8 @@ mod tests {
     use astrid_core::identity::PrincipalUid;
     use astrid_storage::{
         CapsuleInstallExpectation, CapsulePackage, KvQuotaResolver, PrincipalDirectory,
-        RuntimePrincipalStore, StateOwner, open_runtime_principal_store_with_directory,
+        RuntimePrincipalStore, StateOwner, StorageError,
+        open_runtime_principal_store_with_directory,
     };
     use flate2::Compression;
     use flate2::write::GzEncoder;
@@ -363,6 +364,18 @@ mod tests {
         )
     }
 
+    fn test_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
+        Arc::new(|owner: &StateOwner| {
+            Ok(match owner {
+                StateOwner::System => None,
+                StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+                StateOwner::User(_) => Err(StorageError::Internal(
+                    "test quota resolver rejects user StateOwner".to_owned(),
+                ))?,
+            })
+        })
+    }
+
     fn test_store() -> (tempfile::TempDir, Arc<RuntimePrincipalStore>, PrincipalUid) {
         let root = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(root.path());
@@ -370,17 +383,28 @@ mod tests {
         let uid = PrincipalUid::from_bytes([0x31; 32]);
         let directory = PrincipalDirectory::default();
         directory.register(principal, uid).unwrap();
-        let quota: Arc<dyn KvQuotaResolver<StateOwner>> =
-            Arc::new(|_owner: &StateOwner| Ok(Some(u64::MAX)));
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let store = Arc::new(
             runtime
                 .block_on(open_runtime_principal_store_with_directory(
-                    &home, quota, directory,
+                    &home,
+                    test_quota(),
+                    directory,
                 ))
                 .unwrap(),
         );
         (root, store, uid)
+    }
+
+    #[test]
+    fn test_quota_rejects_user_owner() {
+        let user = astrid_core::UserUid::from_bytes([11; 32]);
+        let error = test_quota()
+            .max_logical_bytes(&StateOwner::User(user))
+            .unwrap_err();
+
+        assert!(matches!(error, StorageError::Internal(_)));
+        assert!(error.to_string().contains("user StateOwner"));
     }
 
     #[test]

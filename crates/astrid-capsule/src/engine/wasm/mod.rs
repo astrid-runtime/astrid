@@ -4255,6 +4255,11 @@ mod lifecycle_context_tests {
                     astrid_storage::StateOwner::System => None,
                     astrid_storage::StateOwner::Principal(_)
                     | astrid_storage::StateOwner::Fleet(_) => Some(u64::MAX),
+                    astrid_storage::StateOwner::User(_) => {
+                        Err(astrid_storage::StorageError::Internal(
+                            "test quota resolver rejects user StateOwner".to_owned(),
+                        ))?
+                    },
                 })
             });
         let principal_store = astrid_storage::open_runtime_principal_store_with_directory(

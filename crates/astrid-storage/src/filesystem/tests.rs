@@ -22,7 +22,7 @@ async fn filesystem() -> (
     let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
         Ok(match owner {
             StateOwner::System => None,
-            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+            StateOwner::Principal(_) | StateOwner::Fleet(_) | StateOwner::User(_) => Some(u64::MAX),
         })
     });
     let store = open_runtime_principal_store(&home, quota).await.unwrap();
@@ -58,7 +58,7 @@ async fn owner_views_are_isolated_over_one_physical_store() {
     let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
         Ok(match owner {
             StateOwner::System => None,
-            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+            StateOwner::Principal(_) | StateOwner::Fleet(_) | StateOwner::User(_) => Some(u64::MAX),
         })
     });
     drop(first);

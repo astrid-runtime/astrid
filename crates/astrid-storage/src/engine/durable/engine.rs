@@ -17,6 +17,15 @@ where
     I: PersistentObjectIdentity,
     C: PrincipalCodec<P>,
 {
+    /// Check whether the active durable wire grammar admits one principal.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed admission error without changing engine state.
+    pub fn admit_principal(&self, principal: &P) -> Result<(), DurableError> {
+        self.principal_codec.admit_principal(principal)
+    }
+
     #[cfg(test)]
     pub(crate) fn durable_region_len(&self, name: &str) -> Result<u64, DurableError> {
         let inner = self.lock_usable()?;
