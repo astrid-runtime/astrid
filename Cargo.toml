@@ -254,12 +254,12 @@ url = "2"
 utoipa = { version = "5", features = ["axum_extras"] }
 uuid = { version = "1.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
 walkdir = "2.5"
-wasm-encoder = "0.257.1"
+wasm-encoder = "0.256"
 wat = "1.256"
-wasmparser = "0.257.1"
+wasmparser = "0.256"
 windows-sys = "0.61"
 wit-component = "0.257.1"
-wit-parser = "0.257.1"
+wit-parser = "0.256"
 wasmtime = { version = "47.0.3", features = ["component-model", "cranelift"] }
 wasmtime-wasi = "47.0.3"
 unicode-normalization = "=0.1.25"
