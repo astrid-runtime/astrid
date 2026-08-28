@@ -29,11 +29,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   and rollback failures stay `provider-operation` hard errors. Closes #1567.
 ### Added
 
-- **The q35/TCG development kernel now establishes one isolated native
-  protection domain.** Authenticated non-empty component bytes bind to a private
-  ring-3 entry, owned page tables, bounded stack/frame/quota limits, W^X and
-  kernel/peer exclusion, typed fault containment, and exactly-once reclamation.
-  A hostile first domain can be reclaimed before a clean second domain starts.
+- **The q35/TCG development kernel now establishes isolated native
+  protection domains.** Authenticated non-empty component bytes bind before
+  success evidence to a private ring-3 entry with owned page tables, bounded
+  stack/frame/quota limits, monotonic reuse identities, W^X and kernel/peer
+  exclusion, exact CR3 restoration, typed fault containment, and exactly-once
+  reclamation. A hostile first domain can be reclaimed before a clean second
+  domain starts.
   Refs #1704.
 
 - **A run-loop capsule serving a loopback TCP port can now handle connections

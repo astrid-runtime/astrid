@@ -14,6 +14,9 @@ pub(super) const ENTRYPOINT: u64 = 0;
 pub(super) const fn stack_base() -> u64 {
     STACK_BASE
 }
+pub(super) const fn peer_probe(slot: usize) -> u64 {
+    PEER_PROBE + slot as u64 * crate::memory::FRAME_SIZE
+}
 pub(super) const QUOTA_TICKS_LIMIT: u32 = 64;
 pub(super) const MAX_STACK_PAGES: usize = 2;
 pub(super) const RESOURCE_CAPACITY: usize = 64;
@@ -196,6 +199,9 @@ pub(crate) enum Scenario {
     Quota = 2,
     PeerProbe = 3,
     CancelOnly = 4,
+    // Keep the established fixture scenario values stable while adding the
+    // second deliberate fault path.
+    InvalidInstruction = 5,
 }
 
 impl Scenario {

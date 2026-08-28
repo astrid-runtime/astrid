@@ -11,6 +11,7 @@ use serde_json::Value;
 const REQUIRED_ONCE: &[&str] = &[
     "boot.entry",
     "idt.ready",
+    "component.bound",
     "handoff.bound",
     "closure.kernel",
     "closure.sysgen",
@@ -24,6 +25,7 @@ const REQUIRED_ONCE: &[&str] = &[
 const COMBINED_ORDER: &[&str] = &[
     "boot.entry",
     "idt.ready",
+    "component.bound",
     "handoff.bound",
     "closure.kernel",
     "closure.sysgen",
@@ -46,6 +48,7 @@ const REQUIRED_PASSES: &[&str] = &[
 const DOMAIN_REQUIRED_PASSES: &[&str] = &[
     "authenticated_nonempty_component_binds_payload",
     "ring3_entry_return",
+    "real_invalid_opcode_is_domain_scoped",
     "per_domain_page_table_exclusion",
     "quota_preempts_infinite_loop_and_preserves_peer",
     "fault_is_domain_scoped",
@@ -61,6 +64,40 @@ const SUCCESS_BOUND_EVENTS: &[&str] = &[
 ];
 
 const RING0_REJECT_ORDER: &[&str] = &["boot.entry", "idt.ready", "closure.reject", "halt"];
+
+/// Slot 0 handles the entry, invalid-opcode, fault, quota, hostile, and clean
+/// scenarios. Slot 1 proves peer preservation twice. Releases increment each
+/// slot generation, so these exact values reject stale-handle reuse.
+const DOMAIN_STARTS: &[(u64, u64, u64)] = &[
+    (1, 1, 0),
+    (1, 2, 5),
+    (1, 3, 1),
+    (1, 4, 2),
+    (2, 2, 0),
+    (1, 5, 3),
+    (1, 6, 0),
+];
+const DOMAIN_ENTERED: &[(u64, u64)] = &[(1, 1), (1, 2), (1, 3), (1, 4), (2, 2), (1, 5), (1, 6)];
+const DOMAIN_REGISTERS: &[(u64, u64, u64)] = &[
+    (1, 1, 0),
+    (1, 2, 5),
+    (1, 3, 1),
+    (1, 4, 2),
+    (2, 2, 0),
+    (1, 5, 3),
+    (1, 6, 0),
+];
+const DOMAIN_RECLAIMS: &[(u64, u64)] = &[
+    (1, 1),
+    (1, 2),
+    (1, 3),
+    (2, 1),
+    (1, 4),
+    (2, 2),
+    (1, 5),
+    (1, 6),
+];
+const HOSTILE_PEER_FAULT_ADDRESS: &str = "0x328000001000";
 
 /// `isa-debug-exit` maps the ring-0 failure value `0x11` to process exit 35.
 pub const RING0_REJECT_EXIT_CODE: i32 = 35;
@@ -139,6 +176,211 @@ pub fn rejected_without_success_bound_events(events: &[Value]) -> bool {
         && SUCCESS_BOUND_EVENTS
             .iter()
             .all(|name| count_named(events, name) == 0)
+}
+
+fn u64_field(event: &Value, name: &str) -> Option<u64> {
+    event.get(name).and_then(Value::as_u64)
+}
+
+fn bool_field(event: &Value, name: &str) -> Option<bool> {
+    event.get(name).and_then(Value::as_bool)
+}
+
+fn string_field<'a>(event: &'a Value, name: &str) -> Option<&'a str> {
+    event.get(name).and_then(Value::as_str)
+}
+
+fn named_events<'a>(events: &'a [Value], name: &str) -> Vec<&'a Value> {
+    events
+        .iter()
+        .filter(|event| ev_name(event) == name)
+        .collect()
+}
+
+fn exact_pairs(
+    events: &[Value],
+    name: &str,
+    first: &str,
+    second: &str,
+    expected: &[(u64, u64)],
+) -> bool {
+    let observed: Vec<(u64, u64)> = named_events(events, name)
+        .into_iter()
+        .map(|event| {
+            (
+                u64_field(event, first).unwrap_or_default(),
+                u64_field(event, second).unwrap_or_default(),
+            )
+        })
+        .collect();
+    observed == expected
+}
+
+fn exact_triples(
+    events: &[Value],
+    name: &str,
+    first: &str,
+    second: &str,
+    third: &str,
+    expected: &[(u64, u64, u64)],
+) -> bool {
+    let observed: Vec<(u64, u64, u64)> = named_events(events, name)
+        .into_iter()
+        .map(|event| {
+            (
+                u64_field(event, first).unwrap_or_default(),
+                u64_field(event, second).unwrap_or_default(),
+                u64_field(event, third).unwrap_or_default(),
+            )
+        })
+        .collect();
+    observed == expected
+}
+
+fn all_bools(events: &[Value], name: &str, field: &str, expected: bool) -> bool {
+    !named_events(events, name).is_empty()
+        && named_events(events, name)
+            .into_iter()
+            .all(|event| bool_field(event, field) == Some(expected))
+}
+
+fn domain_outcomes_hold(events: &[Value]) -> bool {
+    let counts = [
+        ("clean_exit", 3),
+        ("invalid_instruction", 1),
+        ("page_fault", 2),
+        ("quota_exhausted", 1),
+        ("cancelled", 1),
+    ];
+    let mut ok = true;
+    for (kind, expected) in counts {
+        let observed = named_events(events, "domain.outcome")
+            .into_iter()
+            .filter(|event| string_field(event, "kind") == Some(kind))
+            .count();
+        ok &= observed == expected;
+    }
+    let page_fault_addresses: Vec<&str> = named_events(events, "domain.outcome")
+        .into_iter()
+        .filter(|event| string_field(event, "kind") == Some("page_fault"))
+        .filter_map(|event| string_field(event, "fault_address"))
+        .collect();
+    ok &= page_fault_addresses == ["0x0", HOSTILE_PEER_FAULT_ADDRESS];
+    ok
+}
+
+fn domain_audits_hold(events: &[Value]) -> bool {
+    named_events(events, "domain.audit")
+        .into_iter()
+        .all(|event| {
+            u64_field(event, "frames").is_some_and(|frames| frames > 0)
+                && bool_field(event, "wx_ok") == Some(true)
+                && bool_field(event, "kernel_excluded") == Some(true)
+                && bool_field(event, "peer_excluded") == Some(true)
+        })
+}
+
+fn domain_exclusions_hold(events: &[Value]) -> bool {
+    named_events(events, "domain.exclusion")
+        .into_iter()
+        .all(|event| {
+            bool_field(event, "alias_excluded") == Some(true)
+                && bool_field(event, "kernel_excluded") == Some(true)
+                && bool_field(event, "peer_excluded") == Some(true)
+        })
+}
+
+/// Bind the domain claim to its complete machine-visible lifecycle: exact
+/// starts, ring-3 entries, guest registers, outcomes, CR3 restoration, and
+/// frame reclamation. Generation values must strictly advance on each reuse.
+fn domain_lifecycle_holds(events: &[Value]) -> bool {
+    let starts_ok = exact_triples(
+        events,
+        "domain.start",
+        "id",
+        "generation",
+        "scenario",
+        DOMAIN_STARTS,
+    );
+    let entries_ok = exact_pairs(events, "domain.entered", "id", "generation", DOMAIN_ENTERED)
+        && named_events(events, "domain.entered")
+            .into_iter()
+            .all(|event| u64_field(event, "cpl") == Some(3));
+    let registers_ok = exact_triples(
+        events,
+        "domain.registers",
+        "id",
+        "generation",
+        "rdi",
+        DOMAIN_REGISTERS,
+    ) && named_events(events, "domain.registers")
+        .into_iter()
+        .all(|event| {
+            string_field(event, "rsp").is_some_and(|rsp| rsp.starts_with("0x"))
+                && u64_field(event, "cpl") == Some(3)
+        });
+    let outcomes_ok = domain_outcomes_hold(events);
+    let reclaims_ok = exact_pairs(
+        events,
+        "domain.reclaim",
+        "id",
+        "generation",
+        DOMAIN_RECLAIMS,
+    ) && named_events(events, "domain.reclaim")
+        .into_iter()
+        .all(|event| {
+            let expected = u64_field(event, "expected");
+            expected.is_some_and(|expected| {
+                expected > 0
+                    && u64_field(event, "freed") == Some(expected)
+                    && u64_field(event, "swept") == Some(expected)
+                    && u64_field(event, "blocked") == Some(0)
+            })
+        });
+    let restores_ok = named_events(events, "domain.restore").len() == DOMAIN_RECLAIMS.len()
+        && all_bools(events, "domain.restore", "ok", true);
+    let audits_ok = domain_audits_hold(events);
+    let exclusions_ok = domain_exclusions_hold(events);
+    let accounting_ok = count_named(events, "domain.accounting") == 0;
+    let tamper_events = named_events(events, "domain.auth.reject")
+        .into_iter()
+        .filter(|event| string_field(event, "reason") == Some("tampered_component_rejected"))
+        .count();
+    let tamper_ok = tamper_events == 1;
+    let auth_pass = events.iter().position(|event| {
+        ev_name(event) == "test.pass"
+            && string_field(event, "name") == Some("authenticated_nonempty_component_binds_payload")
+    });
+    let tamper = events.iter().position(|event| {
+        ev_name(event) == "domain.auth.reject"
+            && string_field(event, "reason") == Some("tampered_component_rejected")
+    });
+    let tamper_order_ok =
+        tamper.is_some_and(|tamper| auth_pass.is_some_and(|auth_pass| tamper < auth_pass));
+    let harness_ok = count_named(events, "domain.harness") == 1
+        && named_events(events, "domain.harness")
+            .into_iter()
+            .all(|event| bool_field(event, "outcome") == Some(true));
+    let terminal: Vec<&str> = events.iter().rev().take(3).map(ev_name).collect();
+    let terminal_ok = terminal == ["halt", "domain.harness", "test.pass"];
+    let mut ok = true;
+    ok &= check("exact domain starts and monotonic generations", starts_ok);
+    ok &= check("exact ring-3 domain entries", entries_ok);
+    ok &= check("exact guest registers and CPL", registers_ok);
+    ok &= check("exact domain outcomes and fault addresses", outcomes_ok);
+    ok &= check("exact reclaim generations and accounting", reclaims_ok);
+    ok &= check("restores accompany every reclaim", restores_ok);
+    ok &= check("domain page-table audits", audits_ok);
+    ok &= check("domain exclusion evidence", exclusions_ok);
+    ok &= check("no domain accounting leaks", accounting_ok);
+    ok &= check(
+        "tampered component rejection before auth success",
+        tamper_ok,
+    );
+    ok &= check("tamper rejection ordering", tamper_order_ok);
+    ok &= check("domain harness success", harness_ok);
+    ok &= check("domain terminal ordering", terminal_ok);
+    ok
 }
 
 /// Assert the executable ring-0 system-generation rejection contract.
@@ -260,6 +502,7 @@ pub fn assert_boot(
         !any_test_fail(events),
     );
     ok &= self_tests_hold(events);
+    ok &= check("domain lifecycle evidence", domain_lifecycle_holds(events));
     let halt_ok = events.last().is_some_and(|e| {
         ev_name(e) == "halt" && e.get("outcome").and_then(Value::as_str) == Some("ok")
     });
@@ -399,6 +642,7 @@ mod tests {
         };
         ev("\"ev\":\"boot.entry\"".into());
         ev("\"ev\":\"idt.ready\",\"vectors\":32".into());
+        ev("\"ev\":\"component.bound\",\"empty\":false".into());
         ev(format!(
             "\"ev\":\"handoff.bound\",\"policy_generation\":1,\"kernel_image\":\"{}\",\"closure_table\":\"{}\"",
             "cc".repeat(32),
@@ -419,12 +663,59 @@ mod tests {
         for n in 1..=8 {
             ev(format!("\"ev\":\"apic.timer.tick\",\"n\":{n}"));
         }
+        ev("\"ev\":\"domain.auth.reject\",\"reason\":\"tampered_component_rejected\"".into());
         for name in REQUIRED_PASSES {
             ev(format!("\"ev\":\"test.pass\",\"name\":\"{name}\""));
         }
-        for name in DOMAIN_REQUIRED_PASSES {
+        for name in &DOMAIN_REQUIRED_PASSES[..DOMAIN_REQUIRED_PASSES.len() - 1] {
             ev(format!("\"ev\":\"test.pass\",\"name\":\"{name}\""));
         }
+        for (id, generation, scenario) in DOMAIN_STARTS {
+            ev(format!(
+                "\"ev\":\"domain.start\",\"id\":{id},\"generation\":{generation},\"scenario\":{scenario}"
+            ));
+        }
+        for (id, generation) in DOMAIN_ENTERED {
+            ev(format!(
+                "\"ev\":\"domain.entered\",\"id\":{id},\"generation\":{generation},\"cpl\":3"
+            ));
+        }
+        for (id, generation, rdi) in DOMAIN_REGISTERS {
+            ev(format!(
+                "\"ev\":\"domain.registers\",\"id\":{id},\"generation\":{generation},\"cpl\":3,\"rdi\":{rdi},\"rsp\":\"0x1000\""
+            ));
+        }
+        for (kind, vector, error, address) in [
+            ("clean_exit", 3, 0, "0x0"),
+            ("invalid_instruction", 6, 0, "0x0"),
+            ("page_fault", 14, 4, "0x0"),
+            ("cancelled", 0, 0, "0x0"),
+            ("quota_exhausted", 32, 0, "0x0"),
+            ("clean_exit", 3, 0, "0x0"),
+            ("page_fault", 14, 4, HOSTILE_PEER_FAULT_ADDRESS),
+            ("clean_exit", 3, 0, "0x0"),
+        ] {
+            ev(format!(
+                "\"ev\":\"domain.outcome\",\"kind\":\"{kind}\",\"vector\":{vector},\"error_code\":{error},\"fault_address\":\"{address}\",\"rip\":\"0x0\",\"cpl\":3"
+            ));
+        }
+        for _ in DOMAIN_RECLAIMS {
+            ev("\"ev\":\"domain.restore\",\"ok\":true".into());
+        }
+        for (id, generation) in DOMAIN_RECLAIMS {
+            ev(format!(
+                "\"ev\":\"domain.reclaim\",\"id\":{id},\"generation\":{generation},\"expected\":16,\"freed\":16,\"swept\":16,\"blocked\":0"
+            ));
+        }
+        for _ in DOMAIN_RECLAIMS {
+            ev("\"ev\":\"domain.audit\",\"frames\":16,\"wx_ok\":true,\"kernel_excluded\":true,\"peer_excluded\":true".into());
+            ev("\"ev\":\"domain.exclusion\",\"alias_excluded\":true,\"kernel_excluded\":true,\"peer_excluded\":true".into());
+        }
+        ev(format!(
+            "\"ev\":\"test.pass\",\"name\":\"{}\"",
+            DOMAIN_REQUIRED_PASSES[DOMAIN_REQUIRED_PASSES.len() - 1]
+        ));
+        ev("\"ev\":\"domain.harness\",\"outcome\":true".into());
         ev("\"ev\":\"halt\",\"outcome\":\"ok\"".into());
         out
     }

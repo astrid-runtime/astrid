@@ -178,6 +178,10 @@ pub fn ev_closure_reject(reason: &str) {
     ));
 }
 
+pub fn ev_component_bound() {
+    emit(format_args!("\"ev\":\"component.bound\",\"empty\":false"));
+}
+
 pub fn ev_domain_started(id: u64, generation: u64, scenario: u64) {
     emit(format_args!(
         "\"ev\":\"domain.start\",\"id\":{id},\"generation\":{generation},\"scenario\":{scenario}"
@@ -200,6 +204,16 @@ pub fn ev_domain_quota(id: u64, ticks: u32) {
     emit(format_args!(
         "\"ev\":\"domain.quota\",\"id\":{id},\"ticks\":{ticks}"
     ));
+}
+
+pub fn ev_domain_registers(id: u64, generation: u64, cpl: u64, rdi: u64, rsp: u64) {
+    emit(format_args!(
+        "\"ev\":\"domain.registers\",\"id\":{id},\"generation\":{generation},\"cpl\":{cpl},\"rdi\":{rdi},\"rsp\":\"{rsp:#x}\""
+    ));
+}
+
+pub fn ev_domain_restore(ok: bool) {
+    emit(format_args!("\"ev\":\"domain.restore\",\"ok\":{ok}"));
 }
 
 pub fn ev_domain_outcome(

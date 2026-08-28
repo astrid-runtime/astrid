@@ -17,6 +17,7 @@ use crate::gdt;
 use crate::memory::FRAME_SIZE;
 use crate::serial;
 use crate::trap::TrapFrame;
+use x86_64::registers::control::Cr3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PrepareError {
@@ -24,6 +25,7 @@ pub(crate) enum PrepareError {
     Paging(DomainPagingError),
     ResourceCapacity,
     SlotCapacity,
+    GenerationExhausted,
 }
 
 impl PrepareError {
@@ -33,6 +35,7 @@ impl PrepareError {
             Self::Paging(error) => error.as_reason(),
             Self::ResourceCapacity => "resource_capacity",
             Self::SlotCapacity => "slot_capacity",
+            Self::GenerationExhausted => "generation_exhausted",
         }
     }
 }
@@ -93,6 +96,7 @@ struct Current {
     ticks: AtomicU32,
     quota: AtomicU32,
     scenario: AtomicU64,
+    stack_end: AtomicU64,
 }
 
 static CURRENT: Current = Current {
@@ -103,6 +107,7 @@ static CURRENT: Current = Current {
     ticks: AtomicU32::new(0),
     quota: AtomicU32::new(0),
     scenario: AtomicU64::new(0),
+    stack_end: AtomicU64::new(0),
 };
 
 #[derive(Clone, Copy)]
@@ -179,7 +184,13 @@ pub(crate) fn prepare(
             super::types::DomainPagingError::PolicyViolation,
         ));
     }
-    let generation = 1;
+    let generation = match manager.slots[slot].as_ref() {
+        Some(previous) => previous
+            .generation
+            .checked_add(1)
+            .ok_or(PrepareError::GenerationExhausted)?,
+        None => 1,
+    };
     manager.used_frames += needed;
     manager.slots[slot] = Some(Domain {
         generation,
@@ -274,6 +285,7 @@ pub(crate) fn start(handle: DomainHandle, scenario: Scenario) -> Result<(), Prep
     let (root, user_end, quota, scenario) = plan;
     gdt::set_privilege_stack(VirtAddr::new(KERNEL_STACK_TOP));
     apic::unmask_timer();
+    CURRENT.stack_end.store(user_end, Ordering::SeqCst);
     CURRENT.slot.store(handle.id().0, Ordering::SeqCst);
     CURRENT
         .generation
@@ -349,23 +361,35 @@ pub(crate) fn handle_domain_trap(frame: &mut TrapFrame, fault_address: u64) -> b
         super::harness::record_fault(fault_address);
     }
     let quota = CURRENT.quota.load(Ordering::SeqCst);
-    let outcome = match vector {
-        3 => Outcome::CleanExit,
-        6 => Outcome::InvalidInstruction,
-        14 => Outcome::PageFault,
-        32 => {
-            let ticks = CURRENT.ticks.fetch_add(1, Ordering::SeqCst) + 1;
-            if ticks < quota {
+    let scenario = CURRENT.scenario.load(Ordering::SeqCst);
+    let outcome = if frame.rdi != scenario {
+        Outcome::UnexpectedFault
+    } else {
+        match vector {
+            3 => Outcome::CleanExit,
+            6 if frame.cs & 3 == 3 => Outcome::InvalidInstruction,
+            14 => Outcome::PageFault,
+            32 => {
+                let ticks = CURRENT.ticks.fetch_add(1, Ordering::SeqCst) + 1;
+                if ticks < quota {
+                    apic::eoi();
+                    return true;
+                }
+                apic::mask_timer();
                 apic::eoi();
-                return true;
-            }
-            apic::mask_timer();
-            apic::eoi();
-            serial::ev_domain_quota(CURRENT.slot.load(Ordering::SeqCst) + 1, ticks);
-            Outcome::QuotaExhausted
-        },
-        _ => Outcome::UnexpectedFault,
+                serial::ev_domain_quota(CURRENT.slot.load(Ordering::SeqCst) + 1, ticks);
+                Outcome::QuotaExhausted
+            },
+            _ => Outcome::UnexpectedFault,
+        }
     };
+    serial::ev_domain_registers(
+        CURRENT.slot.load(Ordering::SeqCst) + 1,
+        CURRENT.generation.load(Ordering::SeqCst),
+        frame.cs & 3,
+        frame.rdi,
+        frame.rsp,
+    );
     let context = TrapContext {
         slot: CURRENT.slot.load(Ordering::SeqCst),
         generation: CURRENT.generation.load(Ordering::SeqCst),
@@ -449,13 +473,15 @@ impl Manager {
     fn valid_domain(&self, handle: DomainHandle) -> Option<&Domain> {
         let slot = self.slots.get(handle.id().0 as usize)?;
         let domain = slot.as_ref()?;
-        (domain.generation == handle.generation().0).then_some(domain)
+        (domain.generation == handle.generation().0 && domain.state != DomainState::Reclaimed)
+            .then_some(domain)
     }
 
     fn valid_domain_mut(&mut self, handle: DomainHandle) -> Option<&mut Domain> {
         let slot = self.slots.get_mut(handle.id().0 as usize)?;
         let domain = slot.as_mut()?;
-        (domain.generation == handle.generation().0).then_some(domain)
+        (domain.generation == handle.generation().0 && domain.state != DomainState::Reclaimed)
+            .then_some(domain)
     }
 
     fn release_slot(&mut self, handle: DomainHandle) -> ReclaimStats {
@@ -477,7 +503,6 @@ impl Manager {
                 freed: 0,
             };
         }
-        domain.generation += 1;
         domain.state = DomainState::Dying;
         let identity = domain.space.as_ref().map(|space| DomainIdentity {
             root: space.root_phys(),
@@ -492,6 +517,8 @@ impl Manager {
             };
         };
         let (expected, freed) = space.release();
+        let restored = Cr3::read() == space.source_root();
+        serial::ev_domain_restore(restored);
         let Some(domain) = slot.as_mut() else {
             unreachable!("the dying domain remains in its slot");
         };

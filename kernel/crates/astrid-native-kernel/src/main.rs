@@ -88,10 +88,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 serial::ev_halt(false);
                 serial::exit_qemu(false);
             }
-            // Emit success-bound evidence only after the descriptor has been
-            // copied into kernel-owned memory, identity-bound, and admitted by
-            // the canonical manifest verifier.
-            emit_bound(&accepted);
+            // The executable component is admitted only after its kernel copy
+            // matches the authenticated component set. Keep this gate ahead of
+            // every success-bound closure event.
             if !closure::bind_component(accepted.component()) {
                 serial::ev_closure_reject(
                     astrid_native_closure::ClosureError::BindingMismatch.as_reason(),
@@ -99,6 +98,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 serial::ev_halt(false);
                 serial::exit_qemu(false);
             }
+            serial::ev_component_bound();
+            // Emit success-bound evidence only after the descriptor has been
+            // copied into kernel-owned memory, identity-bound, and admitted by
+            // the canonical manifest verifier.
+            emit_bound(&accepted);
         },
         Err(err) => {
             serial::ev_closure_reject(err.as_reason());

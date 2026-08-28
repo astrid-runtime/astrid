@@ -6,7 +6,8 @@ use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::{PageTable, PageTableFlags, PhysFrame, Size4KiB};
 
 use super::types::{
-    CODE_BASE, ComponentImage, DomainPagingError, expected_owned_frames, stack_base,
+    CODE_BASE, ComponentImage, DomainPagingError, SLOT_CAPACITY, expected_owned_frames, peer_probe,
+    stack_base,
 };
 use crate::memory::{self, FRAME_SIZE, Frame};
 use crate::serial;
@@ -75,6 +76,7 @@ pub(super) struct AddressSpace {
     image: ComponentImage,
     owned: OwnedFrames,
     source_cr3: PhysFrame<Size4KiB>,
+    source_cr3_flags: Cr3Flags,
     root: Frame,
     probe: u64,
 }
@@ -85,13 +87,14 @@ impl AddressSpace {
         if expected != image.owned_frames() {
             return Err(DomainPagingError::AccountingMismatch);
         }
-        let (source_cr3, _) = Cr3::read();
+        let (source_cr3, source_cr3_flags) = Cr3::read();
         let mut owned = OwnedFrames::new();
         let root = owned.alloc_zeroed()?;
         let mut space = Self {
             image,
             owned,
             source_cr3,
+            source_cr3_flags,
             root,
             probe,
         };
@@ -119,7 +122,7 @@ impl AddressSpace {
         }
         let (wx_ok, kernel_excluded) = self.audit_tree();
         let alias_excluded = !self.is_mapped(memory::phys_offset());
-        let peer_excluded = !self.is_mapped(self.peer_probe());
+        let peer_excluded = !self.peer_probes().any(|probe| self.is_mapped(probe));
         serial::ev_domain_exclusion(alias_excluded, kernel_excluded, peer_excluded);
         serial::ev_domain_audit(
             self.owned.count() as u64,
@@ -136,6 +139,10 @@ impl AddressSpace {
 
     pub(super) const fn root_phys(&self) -> u64 {
         self.root.phys()
+    }
+
+    pub(super) const fn source_root(&self) -> (PhysFrame<Size4KiB>, Cr3Flags) {
+        (self.source_cr3, self.source_cr3_flags)
     }
 
     pub(super) const fn probe(&self) -> u64 {
@@ -365,11 +372,13 @@ impl AddressSpace {
 
     pub(super) fn audit(&self) -> bool {
         let (wx_ok, kernel_excluded) = self.audit_tree();
-        kernel_excluded && !self.is_mapped(self.peer_probe()) && wx_ok
+        kernel_excluded && !self.peer_probes().any(|probe| self.is_mapped(probe)) && wx_ok
     }
 
-    fn peer_probe(&self) -> u64 {
-        self.probe ^ FRAME_SIZE
+    fn peer_probes(&self) -> impl Iterator<Item = u64> {
+        (0..SLOT_CAPACITY)
+            .map(peer_probe)
+            .filter(|probe| *probe != self.probe)
     }
 
     fn is_mapped(&self, address: u64) -> bool {
@@ -456,7 +465,7 @@ impl AddressSpace {
                         if user_leaf {
                             let address = leaf_address(p4, p3i, p2i, p1i);
                             excluded &=
-                                self.is_expected_leaf(address) && address != self.peer_probe();
+                                self.is_expected_leaf(address) && !self.is_peer_probe(address);
                         }
                     }
                 }
@@ -478,10 +487,14 @@ impl AddressSpace {
         (CODE_BASE..code_end).contains(&address)
     }
 
+    fn is_peer_probe(&self, address: u64) -> bool {
+        self.peer_probes().any(|probe| probe == address)
+    }
+
     pub(super) fn release(&mut self) -> (u64, u64) {
         // SAFETY: no further domain access can occur; restore the supervisor
         // root captured before this child root became active.
-        unsafe { Cr3::write(self.source_cr3, Cr3Flags::empty()) };
+        unsafe { Cr3::write(self.source_cr3, self.source_cr3_flags) };
         let expected = self.owned.count() as u64;
         let mut freed = 0u64;
         while self.owned.len > 0 {
