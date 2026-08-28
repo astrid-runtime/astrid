@@ -25,7 +25,7 @@ fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
     Arc::new(|owner: &StateOwner| {
         Ok(match owner {
             StateOwner::System => None,
-            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+            StateOwner::Principal(_) | StateOwner::Fleet(_) | StateOwner::User(_) => Some(u64::MAX),
         })
     })
 }
@@ -251,10 +251,56 @@ fn owner_codec_round_trips_only_canonical_values() {
         let encoded = codec.encode(&owner);
         assert_eq!(codec.decode(&encoded), Some(owner));
     }
+    let user = astrid_core::UserUid::from_bytes([11; 32]);
+    let mut user_bytes = vec![3];
+    user_bytes.extend_from_slice(user.as_bytes());
+    assert_eq!(codec.encode(&StateOwner::User(user)), user_bytes);
+    assert_eq!(codec.decode(&user_bytes), None);
     assert_eq!(codec.decode(&[]), None);
     assert_eq!(codec.decode(&[0, 0]), None);
     assert_eq!(codec.decode(&[1]), None);
     assert_eq!(codec.decode(&[1, b':']), None);
+}
+
+#[test]
+fn owner_codec_v3_preserves_legacy_forms_and_rejects_bad_user_bytes() {
+    let codec = StateOwnerCodecV3;
+    let principal = test_uid("alice");
+    let fleet = astrid_core::FleetUid::from_bytes([7; 32]);
+    let user = astrid_core::UserUid::from_bytes([11; 32]);
+
+    let mut principal_bytes = vec![1];
+    principal_bytes.extend_from_slice(principal.as_bytes());
+    let mut fleet_bytes = vec![2];
+    fleet_bytes.extend_from_slice(fleet.as_bytes());
+    let mut user_bytes = vec![3];
+    user_bytes.extend_from_slice(user.as_bytes());
+
+    assert_eq!(
+        codec.decode(&principal_bytes),
+        Some(StateOwner::Principal(principal))
+    );
+    assert_eq!(codec.decode(&fleet_bytes), Some(StateOwner::Fleet(fleet)));
+    assert_eq!(codec.decode(&user_bytes), Some(StateOwner::User(user)));
+    assert_eq!(codec.encode(&StateOwner::System), [0]);
+    assert_eq!(
+        codec.encode(&StateOwner::Principal(principal)),
+        principal_bytes
+    );
+    assert_eq!(codec.encode(&StateOwner::Fleet(fleet)), fleet_bytes);
+    assert_eq!(codec.encode(&StateOwner::User(user)), user_bytes);
+
+    for malformed in [
+        &[0, 0][..],
+        &[1][..],
+        &[2, 7][..],
+        &[3][..],
+        &[3, 11][..],
+        &[4][..],
+        &[0xff][..],
+    ] {
+        assert_eq!(codec.decode(malformed), None);
+    }
 }
 
 #[test]
@@ -1571,7 +1617,7 @@ async fn live_quota_blocks_growth_but_allows_recovery_and_system_state() {
     let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
         Ok(match owner {
             StateOwner::System => None,
-            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(27),
+            StateOwner::Principal(_) | StateOwner::Fleet(_) | StateOwner::User(_) => Some(27),
         })
     });
     let store = open_runtime_principal_store(&home, quota).await.unwrap();
@@ -1616,7 +1662,7 @@ async fn rejected_streaming_writes_do_not_grow_the_physical_volume() {
     let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
         Ok(match owner {
             StateOwner::System => None,
-            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(27),
+            StateOwner::Principal(_) | StateOwner::Fleet(_) | StateOwner::User(_) => Some(27),
         })
     });
     let store = open_runtime_principal_store(&home, quota).await.unwrap();
