@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import re
@@ -57,6 +58,59 @@ def docker_call_log(log_path: pathlib.Path) -> list[list[str]]:
     ]
 
 
+def dockerfile_run_shell() -> str:
+    lines = DOCKERFILE.splitlines()
+    start = next(
+        index for index, line in enumerate(lines) if line.startswith("RUN ")
+    )
+    command = []
+    for line in lines[start:]:
+        stripped = line.strip()
+        command.append(stripped)
+        if not stripped.endswith("\\"):
+            break
+    else:
+        raise AssertionError("RUN command is missing its terminator")
+    return " ".join(part.removesuffix("\\") for part in command)
+
+
+def receipt_field_matcher() -> str:
+    shell = dockerfile_run_shell()
+    start = shell.index("bind_receipt_field() {")
+    open_brace = shell.index("{", start)
+    depth = 1
+    for end in range(open_brace + 1, len(shell)):
+        if shell[end] == "{":
+            depth += 1
+        elif shell[end] == "}":
+            depth -= 1
+            if depth == 0:
+                return shell[start : end + 1]
+    raise AssertionError("receipt field matcher is not extractable")
+
+
+def run_receipt_matcher(
+    matcher: str,
+    receipt_path: pathlib.Path,
+    key: str,
+    expected: str,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "sh",
+            "-c",
+            f'{matcher}\nbind_receipt_field "$1" "$2" "$3"',
+            "sh",
+            str(receipt_path),
+            key,
+            expected,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 class DockerfileContractTests(unittest.TestCase):
     def test_packages_release_bytes_without_building_source(self) -> None:
         self.assertIn("COPY dist/oci-amd64/astrid-release.tar.gz", DOCKERFILE)
@@ -92,6 +146,7 @@ class DockerfileContractTests(unittest.TestCase):
             "archive",
             "archive-sha256",
             "archive-blake3",
+            "release-manifest",
             "release-manifest-sha256",
             "release-workflow-identity",
         ):
@@ -105,6 +160,137 @@ class DockerfileContractTests(unittest.TestCase):
         ):
             with self.subTest(label=label):
                 self.assertIn(label, DOCKERFILE)
+
+    def test_receipt_matcher_accepts_object_fields_regardless_of_order(self) -> None:
+        matcher = receipt_field_matcher()
+        for forbidden_parser in ("grep ", "python", "jq"):
+            with self.subTest(forbidden_parser=forbidden_parser):
+                self.assertNotIn(forbidden_parser, matcher)
+
+        receipt = {
+            "schema-version": 1,
+            "repository": "astrid-runtime/astrid",
+            "version": "0.10.4",
+            "tag": "v0.10.4",
+            "source-commit": "b6bf5d1d579915eb5d3c944857d84e62a4fcc878",
+            "target": "x86_64-unknown-linux-gnu",
+            "archive": "astrid-0.10.4-x86_64-unknown-linux-gnu.tar.gz",
+            "archive-size": 1024,
+            "archive-sha256": "a" * 64,
+            "archive-blake3": "b" * 64,
+            "release-manifest": "astrid-0.10.4-release.toml",
+            "release-manifest-sha256": "c" * 64,
+            "release-workflow-identity": (
+                "https://github.com/astrid-runtime/astrid/"
+                ".github/workflows/release.yml@refs/tags/v0.10.4"
+            ),
+        }
+        fields = {
+            field: value
+            for field, value in receipt.items()
+            if isinstance(value, str)
+        }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "release-receipt.json"
+            path.write_text(
+                json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(
+                path.read_text(encoding="utf-8")
+                .splitlines()[-2]
+                .lstrip()
+                .startswith('"version"')
+            )
+            for field, expected in fields.items():
+                with self.subTest(field=field):
+                    completed = run_receipt_matcher(matcher, path, field, expected)
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+
+            reordered = {"version": receipt["version"], **receipt}
+            path.write_text(json.dumps(reordered, indent=2) + "\n", encoding="utf-8")
+            completed = run_receipt_matcher(
+                matcher,
+                path,
+                "version",
+                receipt["version"],
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_receipt_matcher_rejects_swapped_object_fields(self) -> None:
+        matcher = receipt_field_matcher()
+        fields = {
+            "repository": "astrid-runtime/astrid",
+            "version": "0.10.4",
+            "tag": "v0.10.4",
+            "source-commit": "b6bf5d1d579915eb5d3c944857d84e62a4fcc878",
+            "target": "x86_64-unknown-linux-gnu",
+            "archive": "astrid-0.10.4-x86_64-unknown-linux-gnu.tar.gz",
+            "archive-sha256": "a" * 64,
+            "archive-blake3": "b" * 64,
+            "release-manifest": "astrid-0.10.4-release.toml",
+            "release-manifest-sha256": "c" * 64,
+            "release-workflow-identity": (
+                "https://github.com/astrid-runtime/astrid/"
+                ".github/workflows/release.yml@refs/tags/v0.10.4"
+            ),
+        }
+
+        for field, expected in fields.items():
+            receipt = dict.fromkeys(fields, "bounded-contract-value")
+            receipt[field] = expected
+            with tempfile.TemporaryDirectory() as temporary:
+                path = pathlib.Path(temporary) / "release-receipt.json"
+                path.write_text(
+                    json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                completed = run_receipt_matcher(matcher, path, field, expected)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+
+                swapped = dict(receipt)
+                swapped[field] = f"{expected}-swapped"
+                path.write_text(
+                    json.dumps(swapped, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                completed = run_receipt_matcher(matcher, path, field, expected)
+                self.assertNotEqual(completed.returncode, 0)
+
+    def test_old_line_binds_reject_last_key_and_escaped_target(self) -> None:
+        receipt = {
+            "target": "x86_64-unknown-linux-gnu",
+            "version": "0.10.4",
+        }
+        old_version_needle = '  "version": "0.10.4",'
+        old_target_needle = r'  \"target\": \"x86_64-unknown-linux-gnu\",'
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "release-receipt.json"
+            path.write_text(
+                json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            lines = path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(lines[-2], '  "version": "0.10.4"')
+            self.assertIn('  "target": "x86_64-unknown-linux-gnu",', lines)
+
+            completed = subprocess.run(
+                ["sh", "-c", 'grep -Fqx "$2" "$1"', "sh", str(path), old_version_needle],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+
+            completed = subprocess.run(
+                ["sh", "-c", 'grep -Fqx "$2" "$1"', "sh", str(path), old_target_needle],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0)
 
 
 class EntrypointContractTests(unittest.TestCase):
