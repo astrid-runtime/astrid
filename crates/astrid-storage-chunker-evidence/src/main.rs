@@ -33,7 +33,7 @@ struct EvidenceReport {
     corpus_privacy: &'static str,
     benchmark_environment: environment::BenchmarkEnvironment,
     object_cost_model: &'static str,
-    sources: [SourceRecord; 3],
+    sources: [SourceRecord; 4],
     unavailable_candidates: [UnavailableCandidate; 1],
     results: Vec<CandidateResult>,
     edit_stability: Vec<StabilityResult>,

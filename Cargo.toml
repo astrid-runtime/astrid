@@ -118,9 +118,10 @@ directories = "6.0"
 ed25519-dalek = { version = "3.0", features = ["rand_core", "zeroize", "serde"] }
 flate2 = "1.0"
 # Chunk boundaries are persistent principal-store format, not merely an
-# implementation detail. Exact-pin the audited FastCDC 2020 implementation;
-# upgrades require golden-boundary verification and a new chunking profile.
-fastcdc = "=4.0.1"
+# implementation detail. Exact-pin FastCDC 5 for even profiles and preserve the
+# audited FastCDC 4 scan for the legacy odd revision-1 compatibility edge.
+fastcdc = "=5.0.0"
+fastcdc-v4 = { package = "fastcdc", version = "=4.0.1" }
 fs2 = "0.4"
 futures = "0.3"
 globset = "0.4"

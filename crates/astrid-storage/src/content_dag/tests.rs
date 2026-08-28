@@ -516,12 +516,12 @@ fn profile_identity_is_deterministic_and_seeded() {
 fn odd_minimum_profile_keeps_its_pre_freeze_boundaries() {
     let bytes = deterministic_bytes(4096);
     let profile = ChunkingProfile::fastcdc_v2020(65, 256, 1024, 0).unwrap();
-    let boundaries: Vec<_> = fastcdc::v2020::FastCDC::with_level_and_seed(
+    let boundaries: Vec<_> = fastcdc_v4::v2020::FastCDC::with_level_and_seed(
         &bytes,
         65,
         256,
         1024,
-        fastcdc::v2020::Normalization::Level1,
+        fastcdc_v4::v2020::Normalization::Level1,
         0,
     )
     .map(|chunk| chunk.length)
@@ -544,12 +544,12 @@ fn odd_minimum_profile_keeps_its_pre_freeze_boundaries() {
     // can canonically cut one byte below the declared minimum.
     let mut edge_bytes = vec![1_u8; 2048];
     edge_bytes[64] = 248;
-    let edge_boundaries: Vec<_> = fastcdc::v2020::FastCDC::with_level_and_seed(
+    let edge_boundaries: Vec<_> = fastcdc_v4::v2020::FastCDC::with_level_and_seed(
         &edge_bytes,
         65,
         256,
         1024,
-        fastcdc::v2020::Normalization::Level1,
+        fastcdc_v4::v2020::Normalization::Level1,
         0,
     )
     .map(|chunk| chunk.length)

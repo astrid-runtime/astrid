@@ -173,7 +173,7 @@ pub fn candidates(target_kib: u32) -> Result<Vec<Candidate>> {
             algorithm: Algorithm::FastCdc2020,
             minimum_bytes: fast_minimum,
             maximum_bytes: fast_maximum,
-            implementation: "fastcdc=4.0.1",
+            implementation: "fastcdc=5.0.0 (even profiles only)",
             boundary_semantics: BoundarySemantics {
                 non_final_bounds: "minimum <= length <= maximum",
                 final_chunk: "may be shorter than minimum; never exceeds maximum",
@@ -323,6 +323,9 @@ mod tests {
                 .unwrap()
                 .contains("\"target_bytes\":65536")
         );
+        assert_eq!(fastcdc.implementation, "fastcdc=5.0.0 (even profiles only)");
+        assert!(fastcdc.minimum_bytes.is_multiple_of(2));
+        assert!(fastcdc.maximum_bytes.is_multiple_of(2));
     }
 
     #[test]

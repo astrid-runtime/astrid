@@ -138,6 +138,17 @@ impl ChunkingProfile {
     pub const fn gear_seed(self) -> u64 {
         self.gear_seed
     }
+
+    /// Return whether this persisted profile requires the `FastCDC` 4 scan.
+    ///
+    /// `FastCDC` 5 documents even profile sizes as a precondition. Revision 1
+    /// deliberately admits odd minimum and maximum sizes, so only those legacy
+    /// profiles retain the exact `FastCDC` 4 implementation revision.
+    pub(crate) const fn uses_legacy_fastcdc_v4(self) -> bool {
+        !self.minimum_bytes.is_multiple_of(2)
+            || !self.average_bytes.is_multiple_of(2)
+            || !self.maximum_bytes.is_multiple_of(2)
+    }
 }
 
 impl Default for ChunkingProfile {
