@@ -371,15 +371,14 @@ async fn serve_attach(stream: UnixStream, state: Arc<GatewayState>) -> Result<()
         host_session_id = %registration.host_session_id,
         "MCP gateway accepted attach"
     );
-    let result = run_attached_session(
-        AstridMcpServer::new(client, principal, state.daemon_root.clone(), workspace),
-        reader,
-        write_half,
-        peers,
-        slot_id,
-        cancel,
-    )
-    .await;
+    let server = AstridMcpServer::new(client, principal, state.daemon_root.clone(), workspace)
+        .context("Failed to initialize the MCP request-state codec");
+    let result = match server {
+        Ok(server) => {
+            run_attached_session(server, reader, write_half, peers, slot_id, cancel).await
+        },
+        Err(error) => Err(error),
+    };
     state
         .finish_slot(&host_session_id, slot_id, permit, done)
         .await;

@@ -196,11 +196,11 @@ rcgen = "0.14"
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 regex = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
-# Pinned to the 2.2.x patch range (~). RMCP releases breaking protocol and API
+# Pinned to the 3.1.x patch range (~). RMCP releases breaking protocol and API
 # changes in minor versions. Cargo.lock is committed, but the patch range also
 # prevents fresh resolution from silently adopting a future incompatible minor.
 # It still admits compatible bug and security fixes.
-rmcp = { version = "~3.1.2", features = ["server", "client", "transport-io", "elicitation", "macros", "request-state", "schemars"] }
+rmcp = { version = "~3.1.4", features = ["server", "client", "transport-io", "elicitation", "macros", "request-state", "schemars"] }
 rustyline = { version = "18", features = ["derive"] }
 semver = "1"
 serde = { version = "1.0", features = ["derive"] }
