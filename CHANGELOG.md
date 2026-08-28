@@ -9,19 +9,6 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
-### Changed
-
-- **The Linux amd64 OCI qualification now fails closed at its exact release
-  baseline instead of inventing unsupported evidence.** The hosted harness
-  rejects inherited sandbox/local-IP policy overrides, proves the daemon is
-  PID 1 as UID/GID `65532`, replaces same-container restart with a fresh
-  container opening the same state/workspace mounts, verifies distinct
-  principal owner state and exact self-scoped agent listings across that
-  reopen, and uses a real restricted principal for denial coverage. It
-  documents shared UID/state-mount key custody and stops with a precise
-  blocker because pinned Astrid v0.10.4 exposes no supported audit
-  chain/head/principal query. Tracking #1708.
-
 ### Fixed
 
 - **`astrid status` and `astrid mcp serve` no longer treat an unlinked
