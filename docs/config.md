@@ -67,7 +67,7 @@ output_per_million = 15.0
 
 | Field | Type | Description |
 |---|---|---|
-| `provider` | string | The model provider (e.g., `"claude"`). |
+| `provider` | string | The model provider (`"claude"`, `"openai"`, `"openai-compat"`, `"orcarouter"`, `"zai"`). |
 | `model` | string | The model identifier sent to the API. |
 | `max_tokens` | integer | Maximum tokens to generate per response. |
 | `temperature` | float | Sampling temperature (0.0 - 1.0). |

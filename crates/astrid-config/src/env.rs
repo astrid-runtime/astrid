@@ -103,6 +103,11 @@ const ENV_MAPPINGS: &[EnvMapping] = &[
         var_name: "ZAI_API_KEY",
         field_path: "model.api_key",
     },
+    // OrcaRouter env var.
+    EnvMapping {
+        var_name: "ORCAROUTER_API_KEY",
+        field_path: "model.api_key",
+    },
     // OpenAI env var.
     EnvMapping {
         var_name: "OPENAI_API_KEY",
@@ -422,6 +427,21 @@ mod tests {
         apply_env_fallbacks(&mut merged, &mut sources, &env);
 
         assert_eq!(merged["model"]["api_key"].as_str().unwrap(), "sk-ant-test");
+    }
+
+    #[test]
+    fn test_orcarouter_api_key_fallback() {
+        let mut merged: toml::Value = toml::from_str("[model]").unwrap();
+        let mut sources = FieldSources::new();
+        let env = make_env(&[("ORCAROUTER_API_KEY", "orc-test-key")]);
+
+        apply_env_fallbacks(&mut merged, &mut sources, &env);
+
+        assert_eq!(merged["model"]["api_key"].as_str().unwrap(), "orc-test-key");
+        assert_eq!(
+            sources.get("model.api_key"),
+            Some(&ConfigLayer::Environment)
+        );
     }
 
     // ---- Restricted ${VAR} resolution tests ----

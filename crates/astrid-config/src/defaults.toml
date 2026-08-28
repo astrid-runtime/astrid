@@ -16,7 +16,8 @@
 # Controls which LLM provider and model to use, along with generation settings.
 
 [model]
-# LLM provider to use. Currently supported: "claude"
+# LLM provider to use. Currently supported: "claude", "openai", "openai-compat",
+# "orcarouter", "zai"
 provider = "unknown"
 
 # Model identifier. Examples:
@@ -27,7 +28,9 @@ model = "unknown"
 
 # API key for the provider. If not set here, will be read from:
 # - ANTHROPIC_API_KEY environment variable (for Claude)
-# - OPENAI_API_KEY environment variable (for OpenAI, future)
+# - OPENAI_API_KEY environment variable (for OpenAI)
+# - ORCAROUTER_API_KEY environment variable (for OrcaRouter)
+# - ZAI_API_KEY environment variable (for Z.AI)
 # api_key = ""
 
 # Custom API endpoint URL. Leave empty to use provider's default.

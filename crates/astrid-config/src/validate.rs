@@ -38,12 +38,12 @@ fn validate_model(config: &Config) -> ConfigResult<()> {
 
     if !matches!(
         m.provider.as_str(),
-        "claude" | "openai" | "openai-compat" | "zai" | "unknown"
+        "claude" | "openai" | "openai-compat" | "orcarouter" | "zai" | "unknown"
     ) {
         return Err(ConfigError::ValidationError {
             field: "model.provider".to_owned(),
             message: format!(
-                "unsupported provider '{}'; expected one of: claude, openai, openai-compat, zai, unknown",
+                "unsupported provider '{}'; expected one of: claude, openai, openai-compat, orcarouter, zai, unknown",
                 m.provider
             ),
         });
@@ -436,6 +436,13 @@ mod tests {
         config.model.provider = "grok".to_owned();
         let err = validate(&config).unwrap_err();
         assert!(matches!(err, ConfigError::ValidationError { .. }));
+    }
+
+    #[test]
+    fn test_orcarouter_provider_is_valid() {
+        let mut config = Config::default();
+        config.model.provider = "orcarouter".to_owned();
+        assert!(validate(&config).is_ok());
     }
 
     #[test]
