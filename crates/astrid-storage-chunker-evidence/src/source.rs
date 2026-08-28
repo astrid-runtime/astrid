@@ -19,15 +19,23 @@ pub struct UnavailableCandidate {
     pub reasons: [&'static str; 4],
 }
 
-pub fn source_records() -> [SourceRecord; 3] {
+pub fn source_records() -> [SourceRecord; 4] {
     [
         SourceRecord {
             component: "fastcdc",
+            version: "5.0.0",
+            source_revision: "eeb3cbe8ed4eeef020aa346707bbdb29abd814ad",
+            repository: "https://github.com/nlfiedler/fastcdc-rs",
+            license: "MIT",
+            role: "production algorithm and evidence baseline for even profiles",
+        },
+        SourceRecord {
+            component: "fastcdc-v4",
             version: "4.0.1",
             source_revision: "2e47aa3146c6dbae34896997eebd162b280a7052",
             repository: "https://github.com/nlfiedler/fastcdc-rs",
             license: "MIT",
-            role: "current production algorithm and evidence baseline",
+            role: "legacy compatibility scan for odd revision-1 profiles",
         },
         SourceRecord {
             component: "mincdc",
