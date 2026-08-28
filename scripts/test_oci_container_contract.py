@@ -66,6 +66,24 @@ class DockerfileContractTests(unittest.TestCase):
 
 
 class EntrypointContractTests(unittest.TestCase):
+    def test_rejects_inherited_security_policy_bypasses_before_runtime(self) -> None:
+        self.assertIn(
+            "inherited ASTRID_SANDBOX_POLICY override is not permitted",
+            ENTRYPOINT,
+        )
+        self.assertIn(
+            "inherited ASTRID_ALLOW_LOCAL_IPS override is not permitted",
+            ENTRYPOINT,
+        )
+        self.assertLess(
+            ENTRYPOINT.index("ASTRID_SANDBOX_POLICY+set"),
+            ENTRYPOINT.index("for daemon_argument do"),
+        )
+        self.assertLess(
+            ENTRYPOINT.index("ASTRID_ALLOW_LOCAL_IPS+set"),
+            ENTRYPOINT.index("/usr/local/bin/astrid init"),
+        )
+
     def test_requires_external_pin_and_internal_signature_gate(self) -> None:
         self.assertIn("ASTRID_DISTRO_SHA256 is required", ENTRYPOINT)
         self.assertIn("sha256sum", ENTRYPOINT)
@@ -119,19 +137,33 @@ class RuntimeHarnessContractTests(unittest.TestCase):
         self.assertNotIn("FROM $IMAGE", TEST_HARNESS)
         self.assertIn('docker image rm --force "$TEST_BASE_IMAGE"', TEST_HARNESS)
 
-    def test_harness_has_restart_owner_and_audit_isolation_probes(self) -> None:
+    def test_harness_has_fresh_reopen_owner_and_principal_isolation_probes(self) -> None:
         for marker in (
-            "restart/reopen",
-            "audit",
+            "fresh-container reopen",
             "principal",
-            "workspace",
-            "capability",
+            "owner state",
+            "same mounted workspace",
+            "pid1 astrid-daemon",
+            "hosted-restricted agent list",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, TEST_HARNESS.lower())
-        self.assertIn("docker restart", TEST_HARNESS)
+        self.assertNotIn("docker restart", TEST_HARNESS.lower())
         self.assertIn("agent create", TEST_HARNESS)
-        self.assertIn("audit stats", TEST_HARNESS)
+
+    def test_harness_never_uses_unsupported_v0104_audit_query(self) -> None:
+        self.assertNotIn("audit stats", TEST_HARNESS.lower())
+        self.assertIn("audit status", TEST_HARNESS)
+        self.assertIn("v0.10.4 baseline blocker", TEST_HARNESS)
+        self.assertIn(
+            "no supported chain/head or principal-scoped query",
+            TEST_HARNESS.lower(),
+        )
+
+    def test_harness_rejects_inherited_security_policy_bypasses(self) -> None:
+        self.assertIn("ASTRID_SANDBOX_POLICY=off", TEST_HARNESS)
+        self.assertIn("ASTRID_ALLOW_LOCAL_IPS=1", TEST_HARNESS)
+        self.assertIn("inherited policy override", TEST_HARNESS.lower())
 
     def test_harness_rejects_host_socket_and_privileged_runtime(self) -> None:
         lowered = TEST_HARNESS.lower()

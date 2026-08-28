@@ -96,6 +96,9 @@ owner-only permissions to its state root. Container arguments are restricted
 to verbosity and the three bounded daemon concurrency controls. In particular,
 callers cannot enable ephemeral mode or replace the image-owned
 workspace/session identity.
+The entrypoint also rejects inherited `ASTRID_SANDBOX_POLICY` and
+`ASTRID_ALLOW_LOCAL_IPS` overrides before initialization; the neutral hosted
+profile does not inherit an operator's security-policy bypasses.
 
 The neutral target does not install `bwrap` or a product shell/tool stack.
 Distros that request native subprocess hosting therefore fail closed at
@@ -120,14 +123,30 @@ host or container-engine socket, and a writable state/workspace mount owned by
 UID/GID `65532`.
 
 The OCI harness starts the real daemon, waits for its readiness sentinel, and
-uses an authenticated `astrid status` round trip. It then provisions two
-non-admin principals, records separate owner state and audit counters, stops
-and reopens the same state mount, and verifies that both principals and the
-audit chain survive restart without crossing workspaces or capability grants.
-The harness also rejects absent, externally mismatched, signed-but-tampered,
-and path-swapped shuttles before the daemon is reached. A root or host Linux
-UID/path is only a container runtime identity; it cannot mint an Astrid
-principal, grant, or authority without Astrid's authenticated control path.
+directly checks that the daemon executable is PID 1 as UID/GID `65532` in
+`/workspace`. It provisions agent and genuinely restricted principals, asserts
+exact self-scoped agent-list responses, writes distinct principal owner state,
+and removes the first container before opening the same state/workspace mounts
+in a fresh container. It then verifies the owner state, workspace mount,
+principal identities, and authenticated control path across that fresh reopen
+and rejects cross-principal modification. The harness also rejects absent,
+externally mismatched, signed-but-tampered, and path-swapped shuttles before
+the daemon is reached. A root or host Linux UID/path is only a container
+runtime identity; it cannot mint an Astrid principal, grant, or authority
+through Astrid's authenticated control path.
+
+The pinned v0.10.4 baseline has two explicit custody and evidence limits. The
+runtime signing key and all principal-owned files live under the same
+UID/GID `65532` state mount: the OS does not give each Astrid principal a
+separate UID, and a caller with root access, the container runtime's host
+access, or write access to that state mount can read or alter those bytes.
+Astrid's authenticated IPC remains the authority boundary for principal
+actions; this profile does not claim OS-level per-principal key custody or
+protection from state-mount custody. In addition, v0.10.4's `astrid audit`
+surface is a deferred stub and exposes no supported chain/head or
+principal-scoped query. The harness therefore fails its final audit gate with
+that exact baseline blocker rather than substituting a global count or mutating
+the pinned release.
 
 This is not a Linux application Realm, a graphics or driver Realm, arm64
 parity, a hostless OS, or a claim that the Linux kernel is untrusted. It is
