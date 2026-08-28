@@ -57,6 +57,9 @@ mod pool;
 mod storage_vfs;
 #[cfg(test)]
 mod test_fixtures;
+#[cfg(all(test, unix))]
+#[path = "workspace_git_discovery_tests.rs"]
+mod workspace_git_discovery_tests;
 
 /// Today's date as `YYYY-MM-DD` for daily log rotation.
 fn today_date_string() -> String {
