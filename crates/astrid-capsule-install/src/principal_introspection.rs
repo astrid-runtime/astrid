@@ -76,7 +76,8 @@ mod tests {
     use super::*;
     use astrid_core::dirs::AstridHome;
     use astrid_storage::{
-        CapsuleInstallExpectation, CapsulePackage, KvQuotaResolver, open_runtime_principal_store,
+        CapsuleInstallExpectation, CapsulePackage, KvQuotaResolver, StorageError,
+        open_runtime_principal_store,
     };
 
     fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
@@ -84,6 +85,9 @@ mod tests {
             Ok(match owner {
                 StateOwner::System => None,
                 StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+                StateOwner::User(_) => Err(StorageError::Internal(
+                    "test quota resolver rejects user StateOwner".to_owned(),
+                ))?,
             })
         })
     }

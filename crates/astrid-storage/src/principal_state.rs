@@ -52,6 +52,8 @@ mod format_amendment_tests;
 mod format_migration_tests;
 mod migrations;
 mod native_io;
+mod owner_codec_v1;
+mod owner_codec_v3;
 mod owner_migration;
 #[cfg(test)]
 mod projection_name_tests;
@@ -76,6 +78,8 @@ use format_amendment::{
     store_metadata,
 };
 use native_io::atomic_write;
+pub use owner_codec_v1::{StateOwnerCodecV1, StateOwnerV1};
+pub use owner_codec_v3::StateOwnerCodecV3;
 pub use staging::{
     NativeContentStagingArea, ReadyStagedContent, StagedContentId, StagedContentWriter,
 };
@@ -161,53 +165,6 @@ fn hash_length(hasher: &mut blake3::Hasher, length: usize) {
     hasher.update(&(length as u128).to_le_bytes());
 }
 
-/// Frozen owner domain admitted by [`StateOwnerCodecV1`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum StateOwnerV1 {
-    /// Kernel-owned state.
-    System,
-    /// State owned by one validated principal.
-    Principal(PrincipalUid),
-}
-
-impl From<StateOwnerV1> for StateOwner {
-    fn from(owner: StateOwnerV1) -> Self {
-        match owner {
-            StateOwnerV1::System => Self::System,
-            StateOwnerV1::Principal(principal) => Self::Principal(principal),
-        }
-    }
-}
-
-/// Canonical codec for [`StateOwnerV1`].
-#[derive(Clone, Copy, Debug, Default)]
-pub struct StateOwnerCodecV1;
-
-impl PrincipalCodec<StateOwnerV1> for StateOwnerCodecV1 {
-    fn encode(&self, owner: &StateOwnerV1) -> Vec<u8> {
-        match owner {
-            StateOwnerV1::System => vec![0],
-            StateOwnerV1::Principal(principal) => {
-                let mut bytes = Vec::with_capacity(33);
-                bytes.push(1);
-                bytes.extend_from_slice(principal.as_bytes());
-                bytes
-            },
-        }
-    }
-
-    fn decode(&self, bytes: &[u8]) -> Option<StateOwnerV1> {
-        match bytes.split_first()? {
-            (0, []) => Some(StateOwnerV1::System),
-            (1, principal) if principal.len() == 32 => {
-                let uid = PrincipalUid::from_bytes(<[u8; 32]>::try_from(principal).ok()?);
-                Some(StateOwnerV1::Principal(uid))
-            },
-            _ => None,
-        }
-    }
-}
-
 /// Version-two canonical owner grammar with an explicit fleet tag.
 ///
 /// The version-one `System` and `Principal` encodings remain byte-for-byte
@@ -276,59 +233,6 @@ impl PrincipalCodec<StateOwner> for StateOwnerCodecV2 {
         match owner {
             StateOwner::User(_) => Err(DurableError::UnsupportedPrincipal),
             StateOwner::System | StateOwner::Principal(_) | StateOwner::Fleet(_) => Ok(()),
-        }
-    }
-}
-
-/// Version-three canonical owner grammar with an explicit user tag.
-///
-/// The version-one and version-two encodings remain byte-for-byte stable.
-/// Human-user ownership is appended under tag `3`; it is never represented
-/// as a synthetic principal or conflated with system authority.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct StateOwnerCodecV3;
-
-impl PrincipalCodec<StateOwner> for StateOwnerCodecV3 {
-    fn encode(&self, owner: &StateOwner) -> Vec<u8> {
-        match owner {
-            StateOwner::System => vec![0],
-            StateOwner::Principal(principal) => {
-                let mut bytes = Vec::with_capacity(33);
-                bytes.push(1);
-                bytes.extend_from_slice(principal.as_bytes());
-                bytes
-            },
-            StateOwner::Fleet(fleet) => {
-                let mut bytes = Vec::with_capacity(33);
-                bytes.push(2);
-                bytes.extend_from_slice(fleet.as_bytes());
-                bytes
-            },
-            StateOwner::User(user) => {
-                let mut bytes = Vec::with_capacity(33);
-                bytes.push(3);
-                bytes.extend_from_slice(user.as_bytes());
-                bytes
-            },
-        }
-    }
-
-    fn decode(&self, bytes: &[u8]) -> Option<StateOwner> {
-        match bytes.split_first()? {
-            (0, []) => Some(StateOwner::System),
-            (1, principal) if principal.len() == 32 => {
-                let uid = PrincipalUid::from_bytes(<[u8; 32]>::try_from(principal).ok()?);
-                Some(StateOwner::Principal(uid))
-            },
-            (2, fleet) if fleet.len() == 32 => {
-                let uid = FleetUid::from_bytes(<[u8; 32]>::try_from(fleet).ok()?);
-                Some(StateOwner::Fleet(uid))
-            },
-            (3, user) if user.len() == 32 => {
-                let uid = UserUid::from_bytes(<[u8; 32]>::try_from(user).ok()?);
-                Some(StateOwner::User(uid))
-            },
-            _ => None,
         }
     }
 }
@@ -898,6 +802,15 @@ fn fail_closed_runtime_quota(
     })
 }
 
+fn runtime_kv_read_cache_config() -> KvReadCacheConfig<StateOwner> {
+    KvReadCacheConfig::bounded(
+        NonZeroUsize::new(256 * 1024 * 1024).expect("256 MiB"),
+        NonZeroUsize::new(64 * 1024 * 1024).expect("64 MiB"),
+        NonZeroUsize::new(4_096).expect("owner limit"),
+        NonZeroUsize::new(65_536).expect("entries per owner"),
+    )
+}
+
 async fn assemble_runtime_store(
     home: &AstridHome,
     quota: Arc<dyn KvQuotaResolver<StateOwner>>,
@@ -939,12 +852,7 @@ async fn assemble_runtime_store(
             Arc::clone(&validated_kv),
             Arc::clone(&validated_catalogs),
         )
-        .with_read_cache(KvReadCacheConfig::bounded(
-            NonZeroUsize::new(256 * 1024 * 1024).expect("256 MiB"),
-            NonZeroUsize::new(64 * 1024 * 1024).expect("64 MiB"),
-            NonZeroUsize::new(4_096).expect("owner limit"),
-            NonZeroUsize::new(65_536).expect("entries per owner"),
-        )),
+        .with_read_cache(runtime_kv_read_cache_config()),
     );
     let kv: Arc<dyn KvStore> = runtime_kv.clone();
     KvIdentityStore::with_principal_directory(

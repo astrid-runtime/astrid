@@ -499,7 +499,7 @@ async fn legacy_move_refuses_nonempty_destination() {
 #[ignore = "local frozen Surreal copy; set ASTRID_AUDIT_MOVE_SRC"]
 async fn local_blind_move_onto_volume() {
     use astrid_core::dirs::AstridHome;
-    use astrid_storage::{KvQuotaResolver, StateOwner, open_runtime_principal_store};
+    use astrid_storage::{KvQuotaResolver, StateOwner, StorageError, open_runtime_principal_store};
     use std::time::Instant;
 
     let source = std::env::var("ASTRID_AUDIT_MOVE_SRC").expect("ASTRID_AUDIT_MOVE_SRC");
@@ -515,6 +515,9 @@ async fn local_blind_move_onto_volume() {
             Ok(match owner {
                 StateOwner::System => None,
                 StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+                StateOwner::User(_) => Err(StorageError::Internal(
+                    "test quota resolver rejects user StateOwner".to_owned(),
+                ))?,
             })
         });
     let store = open_runtime_principal_store(&home, quota)
@@ -558,7 +561,7 @@ async fn local_blind_move_onto_volume() {
 #[ignore = "reopen throwaway volume dest from local_blind_move_onto_volume"]
 async fn local_blind_move_reopen_and_append() {
     use astrid_core::dirs::AstridHome;
-    use astrid_storage::{KvQuotaResolver, StateOwner, open_runtime_principal_store};
+    use astrid_storage::{KvQuotaResolver, StateOwner, StorageError, open_runtime_principal_store};
 
     let dest_root = std::env::var("ASTRID_AUDIT_MOVE_DEST")
         .unwrap_or_else(|_| "/private/tmp/astrid-audit-blind-dest2".to_owned());
@@ -568,6 +571,9 @@ async fn local_blind_move_reopen_and_append() {
             Ok(match owner {
                 StateOwner::System => None,
                 StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+                StateOwner::User(_) => Err(StorageError::Internal(
+                    "test quota resolver rejects user StateOwner".to_owned(),
+                ))?,
             })
         });
     let store = open_runtime_principal_store(&home, quota)
