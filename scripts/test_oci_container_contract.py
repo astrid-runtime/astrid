@@ -151,10 +151,41 @@ class RuntimeHarnessContractTests(unittest.TestCase):
         self.assertNotIn("docker restart", TEST_HARNESS.lower())
         self.assertIn("agent create", TEST_HARNESS)
 
+    def test_runtime_state_helpers_use_mount_and_uid_for_evidence(self) -> None:
+        self.assertEqual(TEST_HARNESS.count('local runtime_file="/runtime/$relative"'), 2)
+        self.assertIn("direct filesystem secret writes", TEST_HARNESS)
+        self.assertIn("shared state mount", TEST_HARNESS)
+        self.assertIn(
+            "not authenticated admin IPC or secret-read isolation",
+            TEST_HARNESS,
+        )
+        self.assertIn(
+            'write_runtime_workspace_marker "$run_dir/real-workspace"',
+            TEST_HARNESS,
+        )
+        self.assertIn('"/workspace/.astrid-oci-mounted-state"', TEST_HARNESS)
+        self.assertIn("--user 65532:65532", TEST_HARNESS)
+        self.assertLess(
+            TEST_HARNESS.index('prepare_runtime_dir "$run_dir/real-workspace" 0755'),
+            TEST_HARNESS.index(
+                'write_runtime_workspace_marker "$run_dir/real-workspace"'
+            ),
+        )
+        self.assertNotIn(
+            '>"$run_dir/real-workspace/.astrid-oci-mounted-state"',
+            TEST_HARNESS,
+        )
+
     def test_harness_never_uses_unsupported_v0104_audit_query(self) -> None:
         self.assertNotIn("audit stats", TEST_HARNESS.lower())
         self.assertIn("audit status", TEST_HARNESS)
         self.assertIn("v0.10.4 baseline blocker", TEST_HARNESS)
+        self.assertIn("BLOCKED AUDIT (non-gating)", TEST_HARNESS)
+        self.assertIn(
+            "this result does not claim hosted-profile qualification",
+            TEST_HARNESS,
+        )
+        self.assertNotIn('fail "v0.10.4 baseline blocker', TEST_HARNESS)
         self.assertIn(
             "no supported chain/head or principal-scoped query",
             TEST_HARNESS.lower(),

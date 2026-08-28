@@ -72,6 +72,18 @@ runtime_path_is_symlink() {
     sh "$relative"
 }
 
+write_runtime_workspace_marker() {
+  local directory=$1
+  docker run --rm \
+    --platform "$OCI_PLATFORM" \
+    --user 65532:65532 \
+    --entrypoint /bin/sh \
+    --mount "type=bind,src=$directory,dst=/workspace" \
+    "$IMAGE" \
+    -ec 'printf "%s\n" "$1" > "$2"' \
+    sh same-mounted-workspace "/workspace/.astrid-oci-mounted-state"
+}
+
 start_real_runtime() {
   local state_dir=$1
   local workspace_dir=$2
@@ -165,7 +177,7 @@ if names != [principal]:
 PY
 }
 
-assert_real_principal_isolation() {
+assert_real_principal_identity_and_groups() {
   local alpha=$1
   local beta=$2
   "$PYTHON" - "$alpha" "$beta" <<'PY'
@@ -187,18 +199,20 @@ PY
 
 read_runtime_state_file() {
   local relative=$1
+  local runtime_file="/runtime/$relative"
   docker run --rm \
     --platform "$OCI_PLATFORM" \
     --user 0:0 \
     --entrypoint /bin/sh \
     --mount "type=bind,src=$run_dir/real-state,dst=/runtime,readonly" \
     "$IMAGE" \
-    -ec 'cat "$1"' \
-    sh "$relative"
+    -ec 'cat -- "$1"' \
+    sh "$runtime_file"
 }
 
 assert_runtime_state_file_mode() {
   local relative=$1
+  local runtime_file="/runtime/$relative"
   local mode
   mode=$(docker run --rm \
     --platform "$OCI_PLATFORM" \
@@ -207,7 +221,7 @@ assert_runtime_state_file_mode() {
     --mount "type=bind,src=$run_dir/real-state,dst=/runtime,readonly" \
     "$IMAGE" \
     -ec 'stat -c "%a %u %g" "$1"' \
-    sh "$relative")
+    sh "$runtime_file")
   [[ "$mode" == "600 65532 65532" ]] ||
     fail "owner state $relative has unsafe custody metadata: $mode"
 }
@@ -268,6 +282,7 @@ python3 scripts/create_oci_test_shuttle.py \
 run_dir="$TEST_ROOT/run"
 prepare_runtime_dir "$run_dir/real-state"
 prepare_runtime_dir "$run_dir/real-workspace" 0755
+write_runtime_workspace_marker "$run_dir/real-workspace"
 distro_sha256=$(sha256sum "$TEST_ROOT/fixtures/distro.shuttle")
 distro_sha256=${distro_sha256%% *}
 
@@ -280,9 +295,10 @@ wait_real_runtime initial
 assert_daemon_is_pid_one
 FIRST_REAL_CONTAINER=$REAL_CONTAINER
 
-# Persist two independent owner records and a capability-group change through
-# the authenticated admin path.  This is deliberately done by the real
-# release binary, not by writing files from the container's Linux UID.
+# Create principals and update a capability group through the authenticated
+# admin CLI. Then use the release CLI's direct filesystem secret writes to
+# persist distinct owner-state artifacts on the shared state mount. This is
+# persistence evidence, not authenticated admin IPC or secret-read isolation.
 run_real_cli agent create hosted-alpha --group agent --yes \
   >"$TEST_ROOT/alpha-create.out" 2>"$TEST_ROOT/alpha-create.err" || {
   cat "$TEST_ROOT/alpha-create.out" >&2 || true
@@ -311,7 +327,7 @@ run_real_cli agent show hosted-alpha --format json >"$TEST_ROOT/alpha-before.jso
   || fail "could not inspect hosted-alpha before restart"
 run_real_cli agent show hosted-beta --format json >"$TEST_ROOT/beta-before.json" \
   || fail "could not inspect hosted-beta before restart"
-assert_real_principal_isolation "$TEST_ROOT/alpha-before.json" "$TEST_ROOT/beta-before.json"
+assert_real_principal_identity_and_groups "$TEST_ROOT/alpha-before.json" "$TEST_ROOT/beta-before.json"
 run_as_principal_cli hosted-alpha agent list --format json \
   >"$TEST_ROOT/alpha-self-before.json" \
   || fail "hosted-alpha could not read its own principal row"
@@ -327,8 +343,6 @@ run_real_cli secret set OCI_OWNER_STATE alpha-owner-state --agent hosted-alpha \
 run_real_cli secret set OCI_OWNER_STATE beta-owner-state --agent hosted-beta \
   >"$TEST_ROOT/beta-state-write.out" 2>"$TEST_ROOT/beta-state-write.err" \
   || fail "could not write hosted-beta owner state"
-printf 'same-mounted-workspace\n' \
-  >"$run_dir/real-workspace/.astrid-oci-mounted-state"
 read_runtime_state_file home/hosted-alpha/.config/env/default.env.json \
   >"$TEST_ROOT/alpha-state-before.json"
 read_runtime_state_file home/hosted-beta/.config/env/default.env.json \
@@ -360,7 +374,7 @@ run_real_cli agent show hosted-alpha --format json >"$TEST_ROOT/alpha-after.json
   || fail "could not inspect hosted-alpha after restart"
 run_real_cli agent show hosted-beta --format json >"$TEST_ROOT/beta-after.json" \
   || fail "could not inspect hosted-beta after restart"
-assert_real_principal_isolation "$TEST_ROOT/alpha-after.json" "$TEST_ROOT/beta-after.json"
+assert_real_principal_identity_and_groups "$TEST_ROOT/alpha-after.json" "$TEST_ROOT/beta-after.json"
 run_as_principal_cli hosted-alpha agent list --format json \
   >"$TEST_ROOT/alpha-self-after.json" \
   || fail "hosted-alpha lost self-scoped list after fresh-container reopen"
@@ -636,13 +650,16 @@ fi
 grep -q "STAGED_DISTRO_SURVIVED_SOURCE_SWAP" "$TEST_ROOT/swap.out" ||
   fail "source pathname swap test did not reach the daemon"
 
-# The exact v0.10.4 audit command is a registered stub. Its persistence is not
-# exposed through a supported query, so this profile must stop here rather than
-# passing a global count or inventing release behavior.
+# The exact v0.10.4 audit command is a registered stub. Record that fact as a
+# non-gating blocker instead of pretending that a global count, absent query,
+# or green test exit proves audit continuity.
 if run_real_cli audit status \
   >"$TEST_ROOT/audit-probe.out" 2>"$TEST_ROOT/audit-probe.err"; then
   fail "v0.10.4 unexpectedly exposed an audit query"
 fi
 grep -q "audit trail inspection is not available" "$TEST_ROOT/audit-probe.err" ||
   fail "unexpected v0.10.4 audit surface; re-evaluate the exact-release proof"
-fail "v0.10.4 baseline blocker: audit is deferred and exposes no supported chain/head or principal-scoped query; audit qualification requires a later exact immutable release"
+printf '%s\n' \
+  "BLOCKED AUDIT (non-gating): v0.10.4 baseline blocker; audit is deferred and exposes no supported chain/head or principal-scoped query."
+echo "oci $OCI_TEST_LABEL structure, authentication, principal authority, and fresh-container reopen checks passed"
+echo "Audit continuity remains unproven on v0.10.4; this result does not claim hosted-profile qualification."
