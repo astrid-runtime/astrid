@@ -4,7 +4,10 @@ use std::num::NonZeroU64;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::engine::{DurableError, ObjectCacheCapacity, ObjectCacheController, RootTransaction};
+use crate::engine::{
+    DurableError, ObjectCacheCapacity, ObjectCacheController, PrincipalProjectionEngine,
+    PrincipalProjectionError, RootTransaction,
+};
 use crate::resources::ResidentMemoryAuthority;
 use crate::storage_model::{
     ObjectClass, ObjectFormatVersion, ObjectKind, ObjectReference, PhysicalIdentity, ProfileKind,
@@ -381,6 +384,80 @@ fn direct_engine_user_commit_rejects_without_durable_mutation() {
         std::fs::read(&roots_path).unwrap(),
         roots_before,
         "reopening changed the roots journal"
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
+fn quota_less_user_streaming_rejects_without_arena_or_root_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = StateOwner::User(astrid_core::UserUid::from_bytes([11; 32]));
+    let engine = Arc::new(
+        RuntimeEngine::open(
+            directory.path(),
+            Blake3ObjectIdentityV1,
+            StateOwnerCodecV2,
+            RecoveryLimits::process_addressable(),
+        )
+        .unwrap(),
+    );
+    let store = NativePrincipalContentStore::from_engine(Arc::clone(&engine));
+    let name = ContentName::new("user/streamed.bin").unwrap();
+    let roots_path = directory.path().join("roots.journal");
+    let arena_path = directory.path().join("objects.arena");
+    let roots_before = std::fs::read(&roots_path).unwrap();
+    let arena_before = std::fs::read(&arena_path).unwrap();
+
+    let streaming_error = store
+        .put_streaming(&owner, &name, b"throwaway".as_slice())
+        .unwrap_err();
+    assert!(match streaming_error {
+        PrincipalContentError::Projection(PrincipalProjectionError::Engine(error)) => {
+            error == "principal is not admitted by the durable owner codec"
+        },
+        _ => false,
+    });
+
+    let batch_error = store
+        .put_streaming_batch(
+            &owner,
+            [ContentIngest::new(
+                ContentName::new("user/bulk.bin").unwrap(),
+                b"throwaway".as_slice(),
+            )],
+        )
+        .unwrap_err();
+    assert!(match batch_error {
+        PrincipalContentError::Projection(PrincipalProjectionError::Engine(error)) => {
+            error == "principal is not admitted by the durable owner codec"
+        },
+        _ => false,
+    });
+    assert_eq!(engine.root(&owner).unwrap(), None);
+    assert_eq!(engine.object_count().unwrap(), 0);
+    assert_eq!(std::fs::read(&arena_path).unwrap(), arena_before);
+    assert_eq!(std::fs::read(&roots_path).unwrap(), roots_before);
+
+    engine.flush_projection().unwrap();
+    engine.close().unwrap();
+    drop(store);
+    drop(engine);
+    let reopened = Arc::new(
+        RuntimeEngine::open(
+            directory.path(),
+            Blake3ObjectIdentityV1,
+            StateOwnerCodecV2,
+            RecoveryLimits::process_addressable(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(reopened.root(&owner).unwrap(), None);
+    assert_eq!(reopened.object_count().unwrap(), 0);
+    assert_eq!(std::fs::read(&arena_path).unwrap(), arena_before);
+    assert_eq!(
+        std::fs::read(&roots_path).unwrap(),
+        roots_before,
+        "reopening changed roots or arena after rejected User streaming"
     );
     reopened.close().unwrap();
 }
