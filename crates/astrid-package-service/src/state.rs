@@ -1,0 +1,282 @@
+use crate::bytes::PrincipalUid;
+use crate::context::Timestamp;
+use crate::digest::{
+    AuthorityDecisionDigest, Blake3Digest, DigestWriter, PlanDigest, ProvenanceDigest, StateDigest,
+};
+use crate::identity::{
+    ArtifactIdentity, ManifestIdentity, Nonce, PackageObject, STATE_SCHEMA_VERSION,
+    StateSchemaVersion,
+};
+use std::num::NonZeroU64;
+
+/// Canonical absence or exact canonical installed-state digest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExpectedPackageState {
+    /// No authoritative installed state exists.
+    Absent,
+    /// The exact canonical digest must remain visible.
+    Exact(StateDigest),
+}
+
+impl ExpectedPackageState {
+    /// Returns the digest used for stale-state checks; absent is a fixed zero digest.
+    #[must_use]
+    pub const fn digest(&self) -> StateDigest {
+        match self {
+            Self::Absent => StateDigest::from_bytes([0; 32]),
+            Self::Exact(digest) => *digest,
+        }
+    }
+
+    pub(crate) fn matches_digest(&self, actual: StateDigest) -> bool {
+        matches!(self, Self::Exact(expected) if expected.as_bytes() == actual.as_bytes())
+            || matches!(self, Self::Absent if actual.as_bytes() == &[0; 32])
+    }
+}
+
+/// Immutable owner/package slot identity.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PackageSlot {
+    owner: PrincipalUid,
+    package_object: PackageObject,
+}
+
+impl PackageSlot {
+    /// Creates an owner-scoped slot.
+    #[must_use]
+    pub const fn new(owner: PrincipalUid, package_object: PackageObject) -> Self {
+        Self {
+            owner,
+            package_object,
+        }
+    }
+
+    /// Returns the immutable owner.
+    #[must_use]
+    pub const fn owner(&self) -> PrincipalUid {
+        self.owner
+    }
+
+    /// Returns the immutable package object.
+    #[must_use]
+    pub const fn package_object(&self) -> PackageObject {
+        self.package_object
+    }
+}
+
+/// Drain destination recorded while old leases disappear.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DrainDestination {
+    /// Drain before a replacement commit.
+    Replacement,
+    /// Drain before final removal.
+    Removal,
+}
+
+/// Canonical lifecycle state, including bounded drain details.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LifecycleState {
+    /// No active runtime generation.
+    Inactive,
+    /// Canonical state and runtime generation agree.
+    Active,
+    /// A bounded drain is durable and activation is refused.
+    Draining {
+        /// The recorded destination.
+        destination: DrainDestination,
+        /// The bounded drain deadline.
+        deadline: Timestamp,
+        /// The operation nonce that owns the drain.
+        nonce: Nonce,
+        /// The exact number of live leases still draining.
+        live_leases: u32,
+    },
+}
+
+impl LifecycleState {
+    const fn tag(&self) -> u8 {
+        match self {
+            Self::Inactive => 1,
+            Self::Active => 2,
+            Self::Draining { .. } => 3,
+        }
+    }
+
+    fn write(&self, writer: &mut DigestWriter) {
+        writer.tag(self.tag());
+        if let Self::Draining {
+            destination,
+            deadline,
+            nonce,
+            live_leases,
+        } = self
+        {
+            writer.tag(match destination {
+                DrainDestination::Replacement => 1,
+                DrainDestination::Removal => 2,
+            });
+            writer.u64(deadline.get());
+            writer.bytes(nonce.as_bytes());
+            writer.u64(u64::from(*live_leases));
+        }
+    }
+}
+
+/// The single authoritative installed-state object for one owner/package slot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalInstalledState {
+    schema_version: StateSchemaVersion,
+    owner: PrincipalUid,
+    package_object: PackageObject,
+    artifact: ArtifactIdentity,
+    content_root: Blake3Digest,
+    manifest: ManifestIdentity,
+    authority_digest: AuthorityDecisionDigest,
+    provenance: ProvenanceDigest,
+    lifecycle_state: LifecycleState,
+    lifecycle_plan: PlanDigest,
+    generation: NonZeroU64,
+    completing_nonce: Nonce,
+    digest: StateDigest,
+}
+
+impl CanonicalInstalledState {
+    /// Constructs and digests a canonical installed state.
+    #[must_use]
+    pub fn new(spec: InstalledStateSpec) -> Self {
+        let InstalledStateSpec {
+            owner,
+            package_object,
+            artifact,
+            content_root,
+            manifest,
+            authority_digest,
+            provenance,
+            lifecycle_state,
+            lifecycle_plan,
+            generation,
+            completing_nonce,
+        } = spec;
+        let mut value = Self {
+            schema_version: STATE_SCHEMA_VERSION,
+            owner,
+            package_object,
+            artifact,
+            content_root,
+            manifest,
+            authority_digest,
+            provenance,
+            lifecycle_state,
+            lifecycle_plan,
+            generation,
+            completing_nonce,
+            digest: StateDigest::from_bytes([0; 32]),
+        };
+        let mut writer = DigestWriter::new();
+        value.write(&mut writer);
+        value.digest = writer.finish("astrid.package.installed-state.v1");
+        value
+    }
+
+    fn write(&self, writer: &mut DigestWriter) {
+        writer.u64(u64::from(self.schema_version.get()));
+        writer.bytes(self.owner.as_bytes());
+        writer.bytes(self.package_object.as_bytes());
+        writer.u64(u64::from(self.artifact.format_version()));
+        writer.u64(self.artifact.size_bytes());
+        writer.digest(self.artifact.sha256());
+        writer.digest(self.artifact.blake3());
+        writer.digest(&self.content_root);
+        writer.u64(u64::from(self.manifest.format_version()));
+        writer.bytes(self.manifest.package_name().as_str().as_bytes());
+        writer.bytes(self.manifest.package_version().as_str().as_bytes());
+        writer.digest(self.manifest.manifest_digest());
+        writer.digest(&self.authority_digest);
+        writer.digest(&self.provenance);
+        self.lifecycle_state.write(writer);
+        writer.digest(&self.lifecycle_plan);
+        writer.u64(self.generation.get());
+        writer.bytes(self.completing_nonce.as_bytes());
+    }
+
+    /// Returns the canonical state digest.
+    #[must_use]
+    pub const fn digest(&self) -> StateDigest {
+        self.digest
+    }
+
+    /// Returns the owner/package identity.
+    #[must_use]
+    pub const fn slot(&self) -> PackageSlot {
+        PackageSlot::new(self.owner, self.package_object)
+    }
+
+    /// Returns the lifecycle state.
+    #[must_use]
+    pub const fn lifecycle_state(&self) -> &LifecycleState {
+        &self.lifecycle_state
+    }
+
+    /// Returns the canonical state generation.
+    #[must_use]
+    pub const fn generation_value(&self) -> NonZeroU64 {
+        self.generation
+    }
+
+    /// Returns the nonce that completed this canonical state.
+    #[must_use]
+    pub const fn completing_nonce(&self) -> Nonce {
+        self.completing_nonce
+    }
+
+    /// Returns the canonical authenticated-authority decision digest.
+    #[must_use]
+    pub const fn authority_digest(&self) -> &AuthorityDecisionDigest {
+        &self.authority_digest
+    }
+
+    pub(crate) fn set_lifecycle_state(
+        &mut self,
+        lifecycle_state: LifecycleState,
+        plan: PlanDigest,
+        generation: NonZeroU64,
+    ) {
+        self.lifecycle_state = lifecycle_state;
+        self.lifecycle_plan = plan;
+        self.generation = generation;
+        self.redigest();
+    }
+
+    pub(crate) fn redigest(&mut self) {
+        let mut writer = DigestWriter::new();
+        self.write(&mut writer);
+        self.digest = writer.finish("astrid.package.installed-state.v1");
+    }
+}
+
+/// Input for one canonical installed-state value before digesting.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstalledStateSpec {
+    /// Immutable owner UID.
+    pub owner: PrincipalUid,
+    /// Immutable package object identity.
+    pub package_object: PackageObject,
+    /// Exact-byte artifact identity.
+    pub artifact: ArtifactIdentity,
+    /// Immutable content root.
+    pub content_root: Blake3Digest,
+    /// Exact manifest identity.
+    pub manifest: ManifestIdentity,
+    /// Canonical authenticated-authority decision digest.
+    pub authority_digest: AuthorityDecisionDigest,
+    /// Attribution evidence digest.
+    pub provenance: ProvenanceDigest,
+    /// Canonical lifecycle state.
+    pub lifecycle_state: LifecycleState,
+    /// Lifecycle plan digest.
+    pub lifecycle_plan: PlanDigest,
+    /// Canonical generation.
+    pub generation: NonZeroU64,
+    /// Completing operation nonce.
+    pub completing_nonce: Nonce,
+}

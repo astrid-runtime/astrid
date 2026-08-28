@@ -1,0 +1,13 @@
+[package]
+name = "astrid-package-service"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+blake3.workspace = true
+thiserror.workspace = true

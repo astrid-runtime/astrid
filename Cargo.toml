@@ -15,6 +15,7 @@ members = [
     "crates/astrid-emit",
     "crates/astrid-crypto",
     "crates/astrid-events",
+    "crates/astrid-package-service",
     "crates/astrid-types",
     "crates/astrid-gateway",
     "crates/astrid-hooks",
