@@ -112,41 +112,46 @@ This target does not publish `latest`, channel, or canonical multi-architecture
 tags. ARM64 is a separate target and must be validated independently before a
 multi-architecture index can be assembled.
 
-## Hosted profile qualification
+## Hosted profile evidence
 
 The amd64 target is one bounded hosted profile: a signed Astrid release runs as
 the non-root PID 1 daemon on a Linux container runtime. The profile owns fixed
 `/var/lib/astrid` state and `/workspace` paths; callers cannot replace those
-identities with environment variables or daemon arguments. The qualification
-requires a read-only root, all capabilities dropped, `no-new-privileges`, no
+identities with environment variables or daemon arguments. The checks require a
+read-only root, all capabilities dropped, `no-new-privileges`, no
 host or container-engine socket, and a writable state/workspace mount owned by
 UID/GID `65532`.
 
 The OCI harness starts the real daemon, waits for its readiness sentinel, and
 directly checks that the daemon executable is PID 1 as UID/GID `65532` in
 `/workspace`. It provisions agent and genuinely restricted principals, asserts
-exact self-scoped agent-list responses, writes distinct principal owner state,
-and removes the first container before opening the same state/workspace mounts
-in a fresh container. It then verifies the owner state, workspace mount,
-principal identities, and authenticated control path across that fresh reopen
-and rejects cross-principal modification. The harness also rejects absent,
-externally mismatched, signed-but-tampered, and path-swapped shuttles before
-the daemon is reached. A root or host Linux UID/path is only a container
-runtime identity; it cannot mint an Astrid principal, grant, or authority
-through Astrid's authenticated control path.
+exact self-scoped agent-list responses, uses the release CLI to write distinct
+direct owner-state artifacts, and removes the first container before opening
+the same state/workspace mounts in a fresh container. It then verifies those
+state artifacts, the workspace marker, principal identities, and authenticated
+control path across that fresh reopen and rejects cross-principal
+modification. This is persistence evidence on deliberately shared mounts; it
+does not execute or claim cross-principal workspace, mount, or secret-read
+isolation. The harness also rejects absent, externally mismatched,
+signed-but-tampered, and path-swapped shuttles before the daemon is reached. A
+host Linux UID/path alone cannot mint a new Astrid principal or grant, but a
+reader of the state mount can wield existing principal keys.
 
 The pinned v0.10.4 baseline has two explicit custody and evidence limits. The
 runtime signing key and all principal-owned files live under the same
 UID/GID `65532` state mount: the OS does not give each Astrid principal a
 separate UID, and a caller with root access, the container runtime's host
-access, or write access to that state mount can read or alter those bytes.
-Astrid's authenticated IPC remains the authority boundary for principal
-actions; this profile does not claim OS-level per-principal key custody or
-protection from state-mount custody. In addition, v0.10.4's `astrid audit`
-surface is a deferred stub and exposes no supported chain/head or
-principal-scoped query. The harness therefore fails its final audit gate with
-that exact baseline blocker rather than substituting a global count or mutating
-the pinned release.
+access, or read/write access to that state mount can wield or alter existing
+principal-owned bytes. Minting a new Astrid principal or grant still requires
+an existing credential or authorized control path; this profile does not claim
+OS-level per-principal key custody or protection from state-mount custody. In
+addition, v0.10.4's `astrid audit` surface is a deferred stub and exposes no
+supported chain/head or principal-scoped query. The harness records that
+surface as an explicit
+non-gating blocked audit probe rather than substituting a global count or
+mutating the pinned release. It therefore does not claim audit continuity or
+hosted-profile qualification; issue #1708 remains open until a supported
+immutable release supplies that evidence.
 
 This is not a Linux application Realm, a graphics or driver Realm, arm64
 parity, a hostless OS, or a claim that the Linux kernel is untrusted. It is
