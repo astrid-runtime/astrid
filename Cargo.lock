@@ -5210,9 +5210,9 @@ dependencies = [
 
 [[package]]
 name = "process-wrap"
-version = "9.1.0"
+version = "10.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e842efad9119158434d193c6682e2ebee4b44d6ad801d7b349623b3f57cdf55"
+checksum = "0e3f4237d0e4741eb50bc5584db701f1299c85fa31ff0274dd6445e79dc42d12"
 dependencies = [
  "futures",
  "indexmap",
@@ -5881,7 +5881,6 @@ dependencies = [
  "hmac 0.13.0",
  "pastey",
  "pin-project-lite",
- "process-wrap",
  "rmcp-macros",
  "schemars",
  "serde",

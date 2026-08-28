@@ -364,9 +364,8 @@ async fn process_tree_wrapper_kills_descendants_without_touching_peer_group() {
         .arg("astrid-mcp-test")
         .arg(&descendant_effect)
         .arg(&ready);
-    let mut owned = wrap_process_tree(owned_command)
-        .spawn()
-        .expect("spawn owned tree");
+    let owned = OwnedProcessTransport::new(wrap_process_tree(owned_command))
+        .expect("spawn owned transport");
 
     let mut peer = tokio::process::Command::new("/bin/sh");
     peer.arg("-c")
@@ -383,9 +382,7 @@ async fn process_tree_wrapper_kills_descendants_without_touching_peer_group() {
     .await
     .expect("owned descendant should start");
 
-    Box::into_pin(owned.kill())
-        .await
-        .expect("kill owned process group");
+    drop(owned);
     peer.wait().await.expect("wait for peer");
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -397,6 +394,58 @@ async fn process_tree_wrapper_kills_descendants_without_touching_peer_group() {
         peer_effect.exists(),
         "an unrelated process group must survive"
     );
+}
+
+#[tokio::test]
+async fn owned_transport_reports_startup_failure_without_spawning() {
+    let missing = std::env::temp_dir().join("astrid-mcp-process-wrap-missing-executable");
+    let command = tokio::process::Command::new(missing);
+    let Err(error) = OwnedProcessTransport::new(wrap_process_tree(command)) else {
+        panic!("missing MCP executable should fail startup");
+    };
+
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn owned_transport_frames_jsonrpc_messages() {
+    use rmcp::service::TxJsonRpcMessage;
+    use rmcp::transport::Transport as _;
+
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg("IFS= read -r line; printf '%s\\n' \"$line\"");
+    let mut transport =
+        OwnedProcessTransport::new(wrap_process_tree(command)).expect("spawn echo transport");
+
+    let outgoing_message = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+    });
+    let mut expected_message = outgoing_message.clone();
+    expected_message["params"] = serde_json::Value::Null;
+    let outgoing: TxJsonRpcMessage<RoleClient> =
+        serde_json::from_value(outgoing_message).expect("valid client notification");
+    transport
+        .send(outgoing)
+        .await
+        .expect("write framed JSON-RPC message");
+
+    let received = tokio::time::timeout(std::time::Duration::from_secs(2), transport.receive())
+        .await
+        .expect("receive should not hang")
+        .expect("newline should frame one JSON-RPC message");
+    assert_eq!(
+        serde_json::to_value(&received).expect("serialize receive"),
+        expected_message
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), transport.close())
+        .await
+        .expect("close should not hang")
+        .expect("echo child should shut down");
 }
 
 #[tokio::test]

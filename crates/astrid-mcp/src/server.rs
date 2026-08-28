@@ -12,13 +12,13 @@ use tracing::{error, info, warn};
 use astrid_core::retry::RetryConfig;
 
 use rmcp::service::{Peer, RoleClient, RunningService};
-use rmcp::transport::TokioChildProcess;
 use rmcp::{ClientCacheConfig, ClientServiceExt};
 
 use crate::capabilities::CapabilitiesHandler;
 use crate::capabilities::{AstridClientHandler, ServerNotice};
 use crate::config::{RestartPolicy, ServerConfig, ServersConfig, Transport};
 use crate::error::{McpError, McpResult};
+use crate::process_transport::OwnedProcessTransport;
 use crate::server_process::{
     build_unsandboxed_command, mcp_client_lifecycle, today_date_string, wrap_process_tree,
 };
@@ -352,7 +352,7 @@ impl ServerManager {
         }
 
         // Create transport (spawns the child process)
-        let transport = TokioChildProcess::new(wrap_process_tree(cmd)).map_err(|e| {
+        let transport = OwnedProcessTransport::new(wrap_process_tree(cmd)).map_err(|e| {
             McpError::ServerStartFailed {
                 name: name.to_string(),
                 reason: e.to_string(),
