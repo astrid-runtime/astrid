@@ -11,6 +11,7 @@ pub const MAGIC: &[u8; 8] = b"ASTRABJ2";
 pub const COMMIT_MAGIC: &[u8; 8] = b"PIOJAUT2";
 pub const INVALID_MAGIC: &[u8; 8] = b"PIOJINV2";
 pub const KEY_ID: &[u8; 16] = b"PIO1691-KEY-0001";
+pub const DEVICE_SERIAL_LEN: usize = 20;
 pub const STATE_PENDING: u8 = 1;
 pub const STATE_INVALIDATED: u8 = 0;
 pub const STATE_COMMITTED: u8 = 2;
@@ -74,7 +75,7 @@ fn get_u64(bytes: &[u8]) -> u64 {
 }
 
 pub mod auth {
-    use super::KEY_ID;
+    use super::{DEVICE_SERIAL_LEN, KEY_ID};
 
     pub const KEY_LEN: usize = 32;
     pub const TAG_LEN: usize = 32;
@@ -95,9 +96,14 @@ pub mod auth {
             }
         }
 
-        /// HMAC-SHA-256 over the exact commit header (through its tag field)
-        /// plus every byte of the sixteen 512-byte padded frame sectors.
-        pub fn tag(&self, media_header: &[u8], padded_payload: &[u8]) -> Tag {
+        /// HMAC-SHA-256 over the raw ATA IDENTIFY serial, the exact commit
+        /// header (through its tag field), and every padded frame sector.
+        pub fn tag(
+            &self,
+            device_serial: &[u8; DEVICE_SERIAL_LEN],
+            media_header: &[u8],
+            padded_payload: &[u8],
+        ) -> Tag {
             let mut inner = Sha256::new();
             let mut ipad = [0x36u8; 64];
             for (pad_byte, key_byte) in ipad.iter_mut().zip(self.key.iter()) {
@@ -106,6 +112,7 @@ pub mod auth {
             inner.update(&ipad);
             inner.update(DOMAIN);
             inner.update(KEY_ID);
+            inner.update(device_serial);
             inner.update(media_header);
             inner.update(padded_payload);
             let inner_digest = inner.finalize();
@@ -270,6 +277,7 @@ pub mod auth {
 use auth::{Authenticator, tags_equal};
 
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Recovery {
     Candidate {
         epoch: u64,
@@ -314,6 +322,7 @@ pub fn build_slot_record(
     payload: &[u8; PAYLOAD_LEN],
     metadata: CommitMetadata,
     slot: Slot,
+    device_serial: &[u8; DEVICE_SERIAL_LEN],
     authenticator: &Authenticator,
 ) -> [u8; RECORD_LEN] {
     let mut record = [0; RECORD_LEN];
@@ -338,6 +347,7 @@ pub fn build_slot_record(
     // The authenticator sees the complete on-media representation, including
     // each sector's trailing padding and the copy identity.
     let tag = authenticator.tag(
+        device_serial,
         &record[start..start + TAG_OFFSET],
         &record[..FRAME_COUNT * SECTOR_LEN],
     );
@@ -348,6 +358,7 @@ pub fn build_slot_record(
 pub fn parse_media(
     media: &[u8],
     fresh_floor: u64,
+    device_serial: &[u8; DEVICE_SERIAL_LEN],
     authenticator: &Authenticator,
 ) -> Result<Recovery, &'static str> {
     if media.len() < MEDIA_LEN || !media.len().is_multiple_of(SECTOR_LEN) {
@@ -410,6 +421,7 @@ pub fn parse_media(
         // Authenticator binds the commit header through TAG_OFFSET plus the
         // sixteen padded frame sectors, matching `build_slot_record`.
         let expected = authenticator.tag(
+            device_serial,
             &commit[..TAG_OFFSET],
             &media[base..base + FRAME_COUNT * SECTOR_LEN],
         );
@@ -421,6 +433,11 @@ pub fn parse_media(
         }
         if state == STATE_PENDING {
             return Ok(Recovery::Uncommitted { epoch });
+        }
+        if epoch == u64::MAX {
+            return Ok(Recovery::Torn {
+                reason: "epoch-exhausted",
+            });
         }
         if state != STATE_COMMITTED {
             return Ok(Recovery::Torn { reason: "state" });

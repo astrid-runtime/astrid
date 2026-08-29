@@ -12,9 +12,9 @@ use core::panic::PanicInfo;
 use core::ptr::{addr_of, addr_of_mut};
 
 use crate::media::{
-    CommitMetadata, FRAME_COUNT, KEY_ID, MEDIA_LEN, RECORD_LEN, RECORD_SECTORS, Recovery,
-    SECTOR_LEN, STATE_COMMITTED, auth::Authenticator, build_slot_record, canonical_payload,
-    parse_media,
+    CommitMetadata, DEVICE_SERIAL_LEN, FRAME_COUNT, KEY_ID, MEDIA_LEN, RECORD_LEN, RECORD_SECTORS,
+    Recovery, SECTOR_LEN, STATE_COMMITTED, auth::Authenticator, build_slot_record,
+    canonical_payload, parse_media,
 };
 
 const COMMAND_BASE: u16 = 0x1f0;
@@ -69,12 +69,12 @@ fn run() -> ! {
     uart_print(b"PIO1691 BOOT\n");
     load_fw_cfg();
     print_config();
-    identify_device();
+    let device_serial = identify_device();
     read_initial_media();
     let authenticator =
         Authenticator::new(*authenticator_key()).expect("external verifier key is nonzero");
     let fresh_floor = parse_floor();
-    let observed = match parse_media(media_map(), fresh_floor, &authenticator) {
+    let observed = match parse_media(media_map(), fresh_floor, &device_serial, &authenticator) {
         Ok(result) => result,
         Err(_) => guest_panic("media-size"),
     };
@@ -119,6 +119,7 @@ fn run() -> ! {
             epoch: next_epoch,
         },
         target_slot,
+        &device_serial,
         &authenticator,
     );
 
@@ -138,7 +139,7 @@ fn run() -> ! {
     write_commit_sector(target_slot);
     crash_before_commit_flush();
     pio_flush_cache_ext(b"commit");
-    verify_record_guest(&authenticator);
+    verify_record_guest(&authenticator, &device_serial);
     print_exact(&[b"PIO1691 ", b"ROUNDTRIP PASS\n"]);
     finish()
 }
@@ -222,7 +223,7 @@ fn read_back_frames_guest(slot: media::Slot) {
     }
 }
 
-fn verify_record_guest(authenticator: &Authenticator) {
+fn verify_record_guest(authenticator: &Authenticator, device_serial: &[u8; DEVICE_SERIAL_LEN]) {
     let mut observed = [0u8; MEDIA_LEN];
     let mut sector = [0u8; SECTOR_LEN];
     for slot in media::Slot::ALL {
@@ -233,7 +234,7 @@ fn verify_record_guest(authenticator: &Authenticator) {
             observed[destination..destination + SECTOR_LEN].copy_from_slice(&sector);
         }
     }
-    match parse_media(&observed, parse_floor(), authenticator) {
+    match parse_media(&observed, parse_floor(), device_serial, authenticator) {
         Ok(Recovery::Candidate { epoch, payload, .. }) if payload == canonical_payload() => {
             print_exact(&[b"GUEST-AUTH-CANDIDATE ", b"EPOCH="]);
             uart_hex(epoch);
@@ -243,7 +244,7 @@ fn verify_record_guest(authenticator: &Authenticator) {
     }
 }
 
-fn identify_device() {
+fn identify_device() -> [u8; DEVICE_SERIAL_LEN] {
     print_exact(&[b"GUEST-ATA ", b"IDENTIFY-BEGIN\n"]);
     let initial_status = wait_device_ready();
     print_hex_u64(b"GUEST-ATA INITIAL-STATUS=", u64::from(initial_status));
@@ -264,6 +265,15 @@ fn identify_device() {
         *word = read_u16(COMMAND_BASE);
     }
     wait_transfer_complete();
+    let mut device_serial = [0u8; DEVICE_SERIAL_LEN];
+    for (index, word) in words[10..10 + DEVICE_SERIAL_LEN / 2].iter().enumerate() {
+        device_serial[index * 2..index * 2 + 2].copy_from_slice(&word.to_be_bytes());
+    }
+    print_exact(&[b"GUEST-ATA IDENTIFY.SERIAL.TEXT=", b""]);
+    uart_print(trimmed_ascii(&device_serial));
+    print_exact(&[b"\nGUEST-ATA IDENTIFY.SERIAL.HEX=", b""]);
+    uart_hex_bytes(&device_serial);
+    uart_print(b"\n");
     print_hex_u64(b"GUEST-ATA IDENTIFY-WORD83=", u64::from(words[83]));
     print_hex_u64(b"GUEST-ATA IDENTIFY-WORD106=", u64::from(words[106]));
     if words[83] & (1 << 10) == 0 || words[83] & (1 << 13) == 0 {
@@ -273,6 +283,7 @@ fn identify_device() {
         b"GUEST-ATA IDENTIFY.DEVICE=0xEC ",
         b"SECTORS=512 LBA48=YES FLUSH=YES\n",
     ]);
+    device_serial
 }
 
 fn wait_device_ready() -> u8 {
@@ -595,6 +606,21 @@ fn print_zero_terminated(bytes: &[u8]) {
         .position(|byte| *byte == 0)
         .unwrap_or(bytes.len());
     uart_print(&bytes[..end]);
+}
+
+fn trimmed_ascii(bytes: &[u8]) -> &[u8] {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0 || *byte == b' ')
+        .unwrap_or(bytes.len());
+    &bytes[..end]
+}
+
+fn uart_hex_bytes(bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes {
+        uart_print(&[HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]]);
+    }
 }
 
 fn print_recovery(recovery: &Recovery) {

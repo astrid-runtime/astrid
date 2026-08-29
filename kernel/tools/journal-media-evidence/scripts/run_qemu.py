@@ -18,6 +18,7 @@ OVMF = Path("/opt/homebrew/share/qemu/edk2-x86_64-code.fd")
 QEMU = Path("/opt/homebrew/bin/qemu-system-x86_64")
 TIMEOUT_S = 90
 JOURNAL_BYTES = 1024 * 1024
+JOURNAL_SERIAL = "PIO1691-JOURNAL-0001"
 DEBUG_SUCCESS = 33
 DEBUG_PANIC = 67
 
@@ -72,6 +73,9 @@ def main() -> int:
     parser.add_argument("--reuse-journal", type=Path)
     parser.add_argument("--keep-journal", action="store_true")
     parser.add_argument("--kill-after-serial")
+    parser.add_argument("--journal-serial", default=JOURNAL_SERIAL)
+    parser.add_argument("--journal-bytes", type=int, default=JOURNAL_BYTES)
+    parser.add_argument("--no-journal-device", action="store_true")
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]
@@ -100,7 +104,7 @@ def main() -> int:
     if args.reuse_journal:
         shutil.copyfile(args.reuse_journal, journal)
     else:
-        journal.write_bytes(b"\x00" * JOURNAL_BYTES)
+        journal.write_bytes(b"\x00" * args.journal_bytes)
 
     before = sha256(journal)
     (run_dir / "journal.before.sha").write_text(f"{before}  {journal}\n")
@@ -134,12 +138,6 @@ def main() -> int:
         f"if=none,id=root,format=raw,file={root_img}",
         "-device",
         "ide-hd,drive=root",
-        "-drive",
-        f"if=none,id=journal,format=raw,file={journal},readonly=off,cache=none",
-        "-device",
-        "isa-ide,id=astrid-pio",
-        "-device",
-        "ide-hd,bus=astrid-pio.0,drive=journal,unit=0,write-cache=on",
         "-fw_cfg",
         f"name=opt/astrid.pio.key,file={key}",
         "-fw_cfg",
@@ -149,6 +147,18 @@ def main() -> int:
         "-fw_cfg",
         f"name=opt/astrid.pio.crash,file={run_dir / 'crash.txt'}",
     ]
+    if not args.no_journal_device:
+        qemu_cmd.extend(
+            [
+                "-drive",
+                f"if=none,id=journal,format=raw,file={journal},readonly=off,cache=none",
+                "-device",
+                "isa-ide,id=astrid-pio",
+                "-device",
+                "ide-hd,bus=astrid-pio.0,drive=journal,unit=0,write-cache=on,"
+                f"serial={args.journal_serial}",
+            ]
+        )
     (run_dir / "qemu.cmd").write_text(" ".join(qemu_cmd) + "\n")
 
     if qmp.exists():
@@ -193,6 +203,10 @@ def main() -> int:
     after = sha256(journal)
     (run_dir / "journal.after.sha").write_text(f"{after}  {journal}\n")
     serial_text = serial.read_text(errors="replace") if serial.exists() else ""
+    marker = "GUEST-ATA IDENTIFY.SERIAL.TEXT="
+    observed_serial = (
+        serial_text.split(marker, 1)[1].splitlines()[0] if marker in serial_text else ""
+    )
     summary = {
         "name": args.name,
         "mode": args.mode,
@@ -202,10 +216,21 @@ def main() -> int:
         "before": before,
         "after": after,
         "changed": before != after,
-        "lba11": sector_head(journal, 0x11).hex(),
-        "lba11_nonzero": nonzero_count(journal, 0x11),
-        "lba21": sector_head(journal, 0x21).hex(),
-        "lba21_nonzero": nonzero_count(journal, 0x21),
+        "journal_serial": observed_serial,
+        "serial_ok": observed_serial == args.journal_serial,
+        **(
+            {
+                "lba11": sector_head(journal, 0x11).hex(),
+                "lba11_nonzero": nonzero_count(journal, 0x11),
+                "lba21": sector_head(journal, 0x21).hex(),
+                "lba21_nonzero": nonzero_count(journal, 0x21),
+            }
+            if journal.stat().st_size >= 0x22 * 512
+            else {}
+        ),
+        "torn": "RECOVERY=TORN" in serial_text,
+        "missing_commit": "RECOVERY=TORN REASON=missing-commit" in serial_text,
+        "stale": "RECOVERY=STALE" in serial_text,
         "success_line": "PIO1691 SUCCESS" in serial_text,
         "auth_candidate": "GUEST-AUTH-CANDIDATE" in serial_text,
         "roundtrip": "ROUNDTRIP PASS" in serial_text,
@@ -213,7 +238,12 @@ def main() -> int:
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary))
-    if rc == DEBUG_SUCCESS and summary["success_line"]:
+    if (
+        rc == DEBUG_SUCCESS
+        and summary["success_line"]
+        and summary["serial_ok"]
+        and summary["auth_candidate"]
+    ):
         return 0
     if rc == 124:
         return 124
