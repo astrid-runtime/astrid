@@ -1,14 +1,16 @@
 use super::{
-    PackageServiceModel, active_drain_lineage, first_state_generation, next_generation_value,
-    recorded_drain_deadline, restore_to_boundary_successor,
+    PackageServiceModel, active_drain_lineage, commit_plan_digest, first_state_generation,
+    next_generation_value, recorded_drain_deadline, restore_to_boundary_successor,
 };
 use crate::bytes::RecoveryToken;
 use crate::context::{Operation, OperationContext, Timestamp};
-use crate::digest::{AuthorityDecisionDigest, StateDigest};
+use crate::digest::{AuthorityDecisionDigest, PlanDigest, StateDigest};
 use crate::error::{PackageServiceError, PackageServiceResult};
 use crate::identity::{Nonce, STATE_SCHEMA_VERSION};
 use crate::journal::{JournalStatus, OperationReceipt, ReceiptOutcome, RecoveryEvidence};
-use crate::state::{CanonicalInstalledState, DrainLineage, LifecycleState, PackageSlot};
+use crate::state::{
+    CanonicalInstalledState, DrainDestination, DrainLineage, LifecycleState, PackageSlot,
+};
 use std::num::NonZeroU64;
 
 #[derive(Clone)]
@@ -20,6 +22,9 @@ struct RecoverySnapshot {
     boundary_generation: Option<NonZeroU64>,
     drain_deadline: Option<Timestamp>,
     drain_lineage: Option<DrainLineage>,
+    drain_destination: Option<DrainDestination>,
+    retained_state: Option<CanonicalInstalledState>,
+    staged_commit_plan: Option<PlanDigest>,
 }
 
 enum RecoveryEffect {
@@ -85,11 +90,15 @@ impl PackageServiceModel {
             Some(state) => recorded_drain_deadline(state, &nonce)?,
             None => None,
         };
-        let drain_lineage = match slot_record.state() {
+        let (drain_lineage, drain_destination) = match slot_record.state() {
             Some(state) if matches!(state.lifecycle_state(), LifecycleState::Draining { .. }) => {
-                Some(active_drain_lineage(slot_record, &nonce)?)
+                let lineage = active_drain_lineage(slot_record, &nonce)?;
+                let LifecycleState::Draining { destination, .. } = state.lifecycle_state() else {
+                    return Err(PackageServiceError::OccupancyCorruption);
+                };
+                (Some(lineage), Some(*destination))
             },
-            _ => None,
+            _ => (None, None),
         };
         Ok(RecoverySnapshot {
             context: record.context().clone(),
@@ -99,6 +108,9 @@ impl PackageServiceModel {
             boundary_generation: record.state_generation(),
             drain_deadline,
             drain_lineage,
+            drain_destination,
+            retained_state: slot_record.state().cloned(),
+            staged_commit_plan: record.staged_commit_plan().copied(),
         })
     }
 
@@ -162,6 +174,7 @@ impl PackageServiceModel {
                     .journal_mut(&nonce)
                     .ok_or(PackageServiceError::RecordMissing)?;
                 journal.take_drain_lineage();
+                journal.take_staged_commit_plan();
                 journal.set_state_generation(generation);
                 journal.resolve_recovery(None, JournalStatus::Failed, now);
             },
@@ -182,6 +195,8 @@ impl PackageServiceModel {
                 let journal = record_slot
                     .journal_mut(&nonce)
                     .ok_or(PackageServiceError::RecordMissing)?;
+                journal.take_drain_lineage();
+                journal.take_staged_commit_plan();
                 journal.set_state_generation(exact_successor_generation(&snapshot)?);
                 journal.resolve_recovery(Some(receipt.clone()), JournalStatus::Committed, now);
                 return Ok(Some(receipt));
@@ -212,6 +227,12 @@ fn recovery_effect(
         }
     }
     let state = observed.ok_or(PackageServiceError::RecoveryUnresolved)?;
+    if snapshot.context.operation() == crate::context::Operation::Update
+        && (snapshot.drain_lineage.is_none()
+            || snapshot.drain_destination != Some(DrainDestination::Replacement))
+    {
+        return Err(PackageServiceError::RecoveryUnresolved);
+    }
     validate_observed_state(snapshot, evidence, state)?;
     match snapshot.context.operation() {
         crate::context::Operation::Install => {
@@ -250,6 +271,9 @@ fn restore_effect(
         .ok_or(PackageServiceError::RecoveryUnresolved)?;
     let base = lineage.base_state();
     let expected_generation = base.generation_value();
+    if evidence.activation_receipt().is_some() {
+        return Err(PackageServiceError::BindingMismatch);
+    }
     if state.digest() != snapshot.before
         || lineage.base_state().digest() != snapshot.before
         || state != base
@@ -272,12 +296,17 @@ fn absence_effect(
     observed: Option<&CanonicalInstalledState>,
 ) -> PackageServiceResult<RecoveryEffect> {
     if snapshot.context.operation() != crate::context::Operation::Remove
+        || snapshot.drain_lineage.is_none()
+        || snapshot.drain_destination != Some(DrainDestination::Removal)
         || observed.is_some()
         || !evidence.zero_leases_proved()
     {
         return Err(PackageServiceError::RecoveryUnresolved);
     }
     let generation = exact_successor_generation(snapshot)?;
+    if evidence.activation_receipt().is_some() {
+        return Err(PackageServiceError::BindingMismatch);
+    }
     if evidence.runtime_generation() != generation {
         return Err(PackageServiceError::RecoveryUnresolved);
     }
@@ -289,6 +318,15 @@ fn validate_observed_state(
     evidence: &RecoveryEvidence,
     state: &CanonicalInstalledState,
 ) -> PackageServiceResult<()> {
+    let expected_commit_plan =
+        commit_plan_digest(&snapshot.context, state.content_root(), state.provenance());
+    if matches!(
+        snapshot.context.operation(),
+        crate::context::Operation::Install | crate::context::Operation::Update
+    ) && snapshot.staged_commit_plan != Some(expected_commit_plan)
+    {
+        return Err(PackageServiceError::RecoveryUnresolved);
+    }
     if state.digest() != evidence.observed_state()
         || !state.has_valid_digest()
         || state.schema_version() != STATE_SCHEMA_VERSION
@@ -309,6 +347,20 @@ fn validate_observed_state(
         || *state.lifecycle_state() != expected_lifecycle(snapshot.context.operation())
     {
         return Err(PackageServiceError::RecoveryUnresolved);
+    }
+    if matches!(
+        snapshot.context.operation(),
+        crate::context::Operation::Activate | crate::context::Operation::Deactivate
+    ) {
+        let baseline = snapshot
+            .retained_state
+            .as_ref()
+            .ok_or(PackageServiceError::RecoveryUnresolved)?;
+        if state.content_root() != baseline.content_root()
+            || state.provenance() != baseline.provenance()
+        {
+            return Err(PackageServiceError::RecoveryUnresolved);
+        }
     }
     if snapshot.context.operation() == crate::context::Operation::Activate {
         if evidence.activation_receipt().is_none() {

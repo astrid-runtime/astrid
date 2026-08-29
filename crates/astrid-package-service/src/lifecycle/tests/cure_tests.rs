@@ -349,19 +349,20 @@ fn repeated_updates_monotonically_bump_package_generation() {
         .slot_record(&fixture.slot(fixture.owner))
         .and_then(|record| record.state().map(CanonicalInstalledState::digest))
         .unwrap_or_else(|| panic!("updated state should exist"));
-    let replacement_plan = match DrainPlan::new(
+    let second_artifact = validated_artifact(14);
+    let second_plan = match DrainPlan::new(
         DrainDestination::Replacement,
         ExpectedPackageState::Exact(second_state),
         Timestamp::new(350),
         Nonce::from_bytes([6; 32]),
     ) {
         Ok(value) => value,
-        Err(_) => panic!("replacement plan is valid"),
+        Err(_) => panic!("second replacement plan is valid"),
     };
     let second_context = fixture.context(
         Operation::Update,
         ExpectedPackageState::Exact(second_state),
-        replacement_plan.digest(),
+        second_plan.digest(),
         (fixture.owner, fixture.caller),
         1,
         Nonce::from_bytes([6; 32]),
@@ -379,9 +380,12 @@ fn repeated_updates_monotonically_bump_package_generation() {
         )
         .unwrap_or_else(|_| panic!("second drain should start"));
     model
+        .stage_commit_artifact(&second, &second_artifact)
+        .unwrap_or_else(|_| panic!("second replacement should stage"));
+    model
         .complete(
             &second,
-            Some(&validated_artifact(14)),
+            Some(&second_artifact),
             None,
             true,
             Timestamp::new(320),
@@ -393,6 +397,97 @@ fn repeated_updates_monotonically_bump_package_generation() {
         .map(|state| state.generation_value().get())
         .unwrap_or_else(|| panic!("second updated state should exist"));
     assert!(second_generation > first_generation);
+}
+
+#[test]
+fn install_recovery_rejects_arbitrary_content_and_provenance() {
+    let fixture = Fixture::new();
+    let mut model = PackageServiceModel::new(policy(8));
+    let nonce = Nonce::from_bytes([11; 32]);
+    let staged_artifact = validated_artifact(12);
+    let binding_context = fixture.context(
+        Operation::Install,
+        ExpectedPackageState::Absent,
+        plan_digest(20),
+        (fixture.owner, fixture.caller),
+        1,
+        nonce,
+    );
+    let context = fixture.context(
+        Operation::Install,
+        ExpectedPackageState::Absent,
+        commit_plan_for_artifact(&binding_context, &staged_artifact),
+        (fixture.owner, fixture.caller),
+        1,
+        nonce,
+    );
+    let operation = fixture
+        .begin(&mut model, context, 100)
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    model
+        .begin_work(&operation, Timestamp::new(110))
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    model
+        .stage_commit_artifact(&operation, &staged_artifact)
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    model
+        .mark_unknown(&operation, Timestamp::new(120))
+        .unwrap_or_else(|error| panic!("{error:?}"));
+
+    let slot = fixture.slot(fixture.owner);
+    let authority = model
+        .slot_record(&slot)
+        .and_then(|record| record.journal_record(&operation))
+        .map(|record| *record.authority_digest())
+        .unwrap_or_else(|| panic!("install authority should remain"));
+    let token = model
+        .slot_record(&slot)
+        .and_then(|record| record.journal_record(&operation))
+        .map(OperationJournalRecord::recovery_token)
+        .unwrap_or_else(|| panic!("install token should remain"));
+    let operation_context = model
+        .context_for(&operation)
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    let valid = new_installed_state(
+        &operation_context,
+        authority,
+        &staged_artifact,
+        LifecycleState::Inactive,
+        non_zero(1),
+    )
+    .unwrap_or_else(|error| panic!("{error:?}"));
+
+    for provenance in [valid.provenance(), &ProvenanceDigest::from_bytes([99; 32])] {
+        for content_root in [*valid.content_root(), digest(99)] {
+            if *provenance == *valid.provenance() && content_root == *valid.content_root() {
+                continue;
+            }
+            let spoof = CanonicalInstalledState::new(InstalledStateSpec {
+                owner: fixture.owner,
+                package_object: fixture.object,
+                artifact: *operation_context.artifact(),
+                content_root,
+                manifest: operation_context.manifest().clone(),
+                authority_digest: authority,
+                provenance: *provenance,
+                lifecycle_state: LifecycleState::Inactive,
+                lifecycle_plan: *operation_context.plan_digest(),
+                generation: non_zero(1),
+                completing_nonce: nonce,
+            })
+            .unwrap_or_else(|error| panic!("{error:?}"));
+            let evidence =
+                match RecoveryEvidence::new(token, spoof.digest(), non_zero(1), None, false) {
+                    Ok(value) => value,
+                    Err(error) => panic!("{error:?}"),
+                };
+            let error = model
+                .recover_observed(&operation, &evidence, Some(&spoof), Timestamp::new(130))
+                .err()
+                .unwrap_or_else(|| panic!("arbitrary install evidence must fail"));
+            assert!(matches!(error, PackageServiceError::RecoveryUnresolved));
+        }
+    }
 }
 
 #[test]

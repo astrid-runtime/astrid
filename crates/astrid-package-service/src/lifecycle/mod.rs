@@ -2,7 +2,7 @@ use crate::authority::AuthenticatedAuthority;
 use crate::context::{
     AdmittedService, AuthenticatedIngress, Operation, OperationContext, Timestamp,
 };
-use crate::digest::{Blake3Digest, DigestWriter, ProvenanceDigest, StateDigest};
+use crate::digest::{Blake3Digest, DigestWriter, PlanDigest, ProvenanceDigest, StateDigest};
 use crate::error::{PackageServiceError, PackageServiceResult};
 use crate::identity::{Nonce, ProvenanceEvidence, ValidatedArtifact};
 use crate::journal::{
@@ -296,6 +296,33 @@ impl PackageServiceModel {
         Ok(())
     }
 
+    /// Binds the exact staged commit content before the uncertain boundary.
+    pub fn stage_commit_artifact(
+        &mut self,
+        nonce: &Nonce,
+        artifact: &ValidatedArtifact,
+    ) -> PackageServiceResult<()> {
+        let context = self.context_for(nonce)?;
+        if !matches!(context.operation(), Operation::Install | Operation::Update) {
+            return Err(PackageServiceError::LifecycleTransition);
+        }
+        validate_context_artifact(&context, artifact)?;
+        let plan = commit_plan_digest(
+            &context,
+            artifact.content_root(),
+            &provenance_digest(artifact.provenance()),
+        );
+        let record = self.record_mut(nonce)?;
+        if !matches!(
+            record.status(),
+            JournalStatus::Intent | JournalStatus::Executing
+        ) {
+            return Err(PackageServiceError::RecordNotReconcilable);
+        }
+        record.set_staged_commit_plan(plan);
+        Ok(())
+    }
+
     /// Records independently proved runtime lease count without completing the drain.
     pub fn prove_drain_leases(
         &mut self,
@@ -403,11 +430,23 @@ impl PackageServiceModel {
         if journal_status != JournalStatus::Executing {
             return Err(PackageServiceError::RecordNotReconcilable);
         }
+        let staged_commit_plan = record_slot
+            .journal_record(nonce)
+            .and_then(OperationJournalRecord::staged_commit_plan)
+            .copied();
 
         let (after_state, outcome, generation) = match context.operation() {
             Operation::Install => {
                 let artifact = artifact.ok_or(PackageServiceError::BindingMismatch)?;
                 validate_context_artifact(&context, artifact)?;
+                if Some(commit_plan_digest(
+                    &context,
+                    artifact.content_root(),
+                    &provenance_digest(artifact.provenance()),
+                )) != staged_commit_plan
+                {
+                    return Err(PackageServiceError::BindingMismatch);
+                }
                 let state = new_installed_state(
                     &context,
                     authority_digest,
@@ -434,6 +473,14 @@ impl PackageServiceModel {
                 active_drain_lineage(record_slot, nonce)?;
                 if !zero_leases_proved {
                     return Err(PackageServiceError::DrainBlocked);
+                }
+                if Some(commit_plan_digest(
+                    &context,
+                    artifact.content_root(),
+                    &provenance_digest(artifact.provenance()),
+                )) != staged_commit_plan
+                {
+                    return Err(PackageServiceError::BindingMismatch);
                 }
                 let replacement = new_installed_state(
                     &context,
@@ -510,6 +557,7 @@ impl PackageServiceModel {
             .journal_mut(nonce)
             .ok_or(PackageServiceError::RecordMissing)?;
         journal.take_drain_lineage();
+        journal.take_staged_commit_plan();
         journal.set_state_generation(generation);
         journal.commit(receipt.clone(), now);
         Ok(receipt)
@@ -568,6 +616,7 @@ impl PackageServiceModel {
         let journal = record_slot
             .journal_mut(nonce)
             .ok_or(PackageServiceError::RecordMissing)?;
+        journal.take_staged_commit_plan();
         journal.terminal_failure(JournalStatus::Aborted, now);
         Ok(())
     }
@@ -626,6 +675,7 @@ impl PackageServiceModel {
                 journal.set_state_generation(generation);
             }
             journal.take_drain_lineage();
+            journal.take_staged_commit_plan();
             journal.terminal_failure(JournalStatus::Expired, now);
             return Ok(DrainResult::Completed);
         }
@@ -636,6 +686,7 @@ impl PackageServiceModel {
             .journal_mut(nonce)
             .ok_or(PackageServiceError::RecordMissing)?;
         journal.take_drain_lineage();
+        journal.take_staged_commit_plan();
         journal.set_state_generation(restored_generation);
         journal.terminal_failure(JournalStatus::Expired, now);
         Ok(DrainResult::Completed)
@@ -766,6 +817,28 @@ fn validate_context_artifact(
         return Err(PackageServiceError::BindingMismatch);
     }
     Ok(())
+}
+
+pub(crate) fn commit_plan_digest(
+    context: &OperationContext,
+    content_root: &Blake3Digest,
+    provenance: &ProvenanceDigest,
+) -> PlanDigest {
+    let artifact_identity = context.artifact();
+    let manifest = context.manifest();
+    let mut writer = DigestWriter::new();
+    writer.u64(u64::from(artifact_identity.format_version()));
+    writer.u64(artifact_identity.size_bytes());
+    writer.digest(artifact_identity.sha256());
+    writer.digest(artifact_identity.blake3());
+    writer.u64(u64::from(manifest.format_version()));
+    writer.bytes(manifest.package_name().as_str().as_bytes());
+    writer.bytes(manifest.package_version().as_str().as_bytes());
+    writer.digest(manifest.manifest_digest());
+    writer.digest(content_root);
+    writer.digest(provenance);
+    writer.tag(context.operation().tag());
+    writer.finish("astrid.package.commit-plan.v1")
 }
 
 fn new_installed_state(

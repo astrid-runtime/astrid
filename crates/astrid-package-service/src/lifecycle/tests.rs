@@ -90,6 +90,17 @@ fn validated_artifact(content: u8) -> ValidatedArtifact {
     }
 }
 
+fn commit_plan_for_artifact(
+    context: &OperationContext,
+    artifact: &ValidatedArtifact,
+) -> PlanDigest {
+    commit_plan_digest(
+        context,
+        artifact.content_root(),
+        &provenance_digest(artifact.provenance()),
+    )
+}
+
 struct Fixture {
     caller: PrincipalUid,
     owner: PrincipalUid,
@@ -273,10 +284,19 @@ fn policy_short_retention(capacity: u64, tombstone_capacity: u64) -> JournalPoli
 }
 
 fn install(model: &mut PackageServiceModel, fixture: &Fixture, nonce_byte: u8) -> OperationReceipt {
-    let context = fixture.context(
+    let staged_artifact = validated_artifact(12);
+    let binding_context = fixture.context(
         Operation::Install,
         ExpectedPackageState::Absent,
         plan_digest(20),
+        (fixture.owner, fixture.caller),
+        1,
+        Nonce::from_bytes([nonce_byte; 32]),
+    );
+    let context = fixture.context(
+        Operation::Install,
+        ExpectedPackageState::Absent,
+        commit_plan_for_artifact(&binding_context, &staged_artifact),
         (fixture.owner, fixture.caller),
         1,
         Nonce::from_bytes([nonce_byte; 32]),
@@ -289,6 +309,9 @@ fn install(model: &mut PackageServiceModel, fixture: &Fixture, nonce_byte: u8) -
         .begin_work(&nonce, Timestamp::new(110))
         .unwrap_or_else(|_| panic!("work should start"));
     model
+        .stage_commit_artifact(&nonce, &staged_artifact)
+        .unwrap_or_else(|_| panic!("install artifact should stage"));
+    model
         .complete(
             &nonce,
             Some(&validated_artifact(12)),
@@ -300,6 +323,14 @@ fn install(model: &mut PackageServiceModel, fixture: &Fixture, nonce_byte: u8) -
 }
 
 fn begin_update(model: &mut PackageServiceModel, fixture: &Fixture) -> Nonce {
+    begin_update_with_deadline(model, fixture, Timestamp::new(200))
+}
+
+fn begin_update_with_deadline(
+    model: &mut PackageServiceModel,
+    fixture: &Fixture,
+    deadline: Timestamp,
+) -> Nonce {
     let state = match model
         .slot_record(&fixture.slot(fixture.owner))
         .and_then(|record| record.state())
@@ -307,10 +338,11 @@ fn begin_update(model: &mut PackageServiceModel, fixture: &Fixture) -> Nonce {
         Some(state) => state.digest(),
         None => panic!("installed state should exist"),
     };
+    let staged_artifact = validated_artifact(13);
     let replacement_plan = match DrainPlan::new(
         DrainDestination::Replacement,
         ExpectedPackageState::Exact(state),
-        Timestamp::new(200),
+        deadline,
         Nonce::from_bytes([2; 32]),
     ) {
         Ok(value) => value,
@@ -332,11 +364,14 @@ fn begin_update(model: &mut PackageServiceModel, fixture: &Fixture) -> Nonce {
         .begin_drain(
             &nonce,
             DrainDestination::Replacement,
-            Timestamp::new(200),
+            deadline,
             1,
             Timestamp::new(140),
         )
         .unwrap_or_else(|_| panic!("replacement drain should start"));
+    model
+        .stage_commit_artifact(&nonce, &staged_artifact)
+        .unwrap_or_else(|_| panic!("replacement artifact should stage"));
     nonce
 }
 

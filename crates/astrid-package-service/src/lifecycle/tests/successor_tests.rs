@@ -41,6 +41,11 @@ enum ObservedMutation {
     Nonce(Nonce),
 }
 
+enum ExpectedRecoveryFailure {
+    Unresolved,
+    BindingMismatch,
+}
+
 fn mutated_state(
     base: &CanonicalInstalledState,
     mutation: ObservedMutation,
@@ -131,18 +136,22 @@ fn reject_observed_recovery(
     nonce: &Nonce,
     observed: &CanonicalInstalledState,
     evidence: &RecoveryEvidence,
+    expected: ExpectedRecoveryFailure,
 ) {
     let before = current_state(model, fixture);
     let error = model
         .recover_observed(nonce, evidence, Some(observed), Timestamp::new(220))
         .err()
         .unwrap_or_else(|| panic!("invalid observed state must fail closed"));
-    assert!(matches!(
-        error,
-        PackageServiceError::RecoveryUnresolved
-            | PackageServiceError::BindingMismatch
-            | PackageServiceError::AuthorityExpired
-    ));
+    let correct = match expected {
+        ExpectedRecoveryFailure::Unresolved => {
+            matches!(error, PackageServiceError::RecoveryUnresolved)
+        },
+        ExpectedRecoveryFailure::BindingMismatch => {
+            matches!(error, PackageServiceError::BindingMismatch)
+        },
+    };
+    assert!(correct, "unexpected recovery failure: {error:?}");
     assert_eq!(current_state(model, fixture), before);
 }
 
@@ -426,6 +435,7 @@ fn observed_recovery_boundary_accepts_only_the_exact_successor() {
         &activation,
         &skipped,
         &mismatched_evidence,
+        ExpectedRecoveryFailure::Unresolved,
     );
 
     let skipped_evidence =
@@ -437,6 +447,7 @@ fn observed_recovery_boundary_accepts_only_the_exact_successor() {
         &activation,
         &skipped,
         &skipped_evidence,
+        ExpectedRecoveryFailure::Unresolved,
     );
 
     let stale = new_installed_state(
@@ -450,7 +461,14 @@ fn observed_recovery_boundary_accepts_only_the_exact_successor() {
     let stale_evidence =
         recovery_evidence_for(token, stale.digest(), stale.generation_value(), None)
             .unwrap_or_else(|_| panic!("stale evidence should construct"));
-    reject_observed_recovery(&mut model, &fixture, &activation, &stale, &stale_evidence);
+    reject_observed_recovery(
+        &mut model,
+        &fixture,
+        &activation,
+        &stale,
+        &stale_evidence,
+        ExpectedRecoveryFailure::Unresolved,
+    );
 
     let wrong_token_evidence = recovery_evidence_for(
         RecoveryToken::from_bytes([9; 32]),
@@ -465,6 +483,7 @@ fn observed_recovery_boundary_accepts_only_the_exact_successor() {
         &activation,
         &stale,
         &wrong_token_evidence,
+        ExpectedRecoveryFailure::Unresolved,
     );
 
     let zero_receipt_evidence = RecoveryEvidence::new(
@@ -482,9 +501,9 @@ fn observed_boundary_rejects_each_mutated_recovery_binding() {
     let fixture = Fixture::new();
     let mut model = PackageServiceModel::new(policy(8));
     install(&mut model, &fixture, 1);
-    let nonce = begin_update(&mut model, &fixture);
+    let nonce = begin_update_with_deadline(&mut model, &fixture, Timestamp::new(400));
     model
-        .mark_unknown(&nonce, Timestamp::new(180))
+        .mark_unknown(&nonce, Timestamp::new(150))
         .unwrap_or_else(|_| panic!("unknown boundary should be recorded"));
     let slot = fixture.slot(fixture.owner);
     let context = model
@@ -500,8 +519,14 @@ fn observed_boundary_rejects_each_mutated_recovery_binding() {
         .and_then(|record| record.journal_record(&nonce))
         .map(OperationJournalRecord::recovery_token)
         .unwrap_or_else(|| panic!("unknown token should remain"));
-    let valid = activation_state(&context, authority, non_zero(2))
-        .unwrap_or_else(|error| panic!("valid update state should construct: {error:?}"));
+    let valid = new_installed_state(
+        &context,
+        authority,
+        &validated_artifact(13),
+        LifecycleState::Inactive,
+        non_zero(3),
+    )
+    .unwrap_or_else(|error| panic!("valid update state should construct: {error:?}"));
 
     let alternate_artifact =
         match ArtifactIdentity::new(format(1), non_zero(129), sha(21), digest(21)) {
@@ -533,38 +558,47 @@ fn observed_boundary_rejects_each_mutated_recovery_binding() {
     ];
     for mutation in mutations {
         let mutated = mutated_state(&valid, mutation).unwrap_or_else(|error| panic!("{error:?}"));
-        let evidence = recovery_evidence_for(
-            token,
-            mutated.digest(),
-            mutated.generation_value(),
-            Some(digest(31)),
-        )
-        .unwrap_or_else(|error| panic!("{error:?}"));
-        reject_observed_recovery(&mut model, &fixture, &nonce, &mutated, &evidence);
+        let evidence =
+            recovery_evidence_for(token, mutated.digest(), mutated.generation_value(), None)
+                .unwrap_or_else(|error| panic!("{error:?}"));
+        reject_observed_recovery(
+            &mut model,
+            &fixture,
+            &nonce,
+            &mutated,
+            &evidence,
+            ExpectedRecoveryFailure::Unresolved,
+        );
     }
 
     let runtime_mismatch = recovery_evidence_for(token, valid.digest(), non_zero(2), None)
         .unwrap_or_else(|error| panic!("{error:?}"));
-    reject_observed_recovery(&mut model, &fixture, &nonce, &valid, &runtime_mismatch);
+    reject_observed_recovery(
+        &mut model,
+        &fixture,
+        &nonce,
+        &valid,
+        &runtime_mismatch,
+        ExpectedRecoveryFailure::Unresolved,
+    );
 
-    let missing_receipt = recovery_evidence_for(token, valid.digest(), non_zero(2), None)
-        .unwrap_or_else(|error| panic!("{error:?}"));
-    reject_observed_recovery(&mut model, &fixture, &nonce, &valid, &missing_receipt);
+    let unexpected_receipt =
+        recovery_evidence_for(token, valid.digest(), non_zero(3), Some(digest(31)))
+            .unwrap_or_else(|error| panic!("{error:?}"));
+    reject_observed_recovery(
+        &mut model,
+        &fixture,
+        &nonce,
+        &valid,
+        &unexpected_receipt,
+        ExpectedRecoveryFailure::BindingMismatch,
+    );
 
     let wrong_token = recovery_evidence_for(
         RecoveryToken::from_bytes([28; 32]),
         valid.digest(),
-        non_zero(2),
-        Some(digest(31)),
-    )
-    .unwrap_or_else(|error| panic!("{error:?}"));
-    reject_observed_recovery(&mut model, &fixture, &nonce, &valid, &wrong_token);
-
-    let evidence_digest_mismatch = recovery_evidence_for(
-        token,
-        StateDigest::from_bytes([29; 32]),
-        non_zero(2),
-        Some(digest(31)),
+        non_zero(3),
+        None,
     )
     .unwrap_or_else(|error| panic!("{error:?}"));
     reject_observed_recovery(
@@ -572,7 +606,20 @@ fn observed_boundary_rejects_each_mutated_recovery_binding() {
         &fixture,
         &nonce,
         &valid,
+        &wrong_token,
+        ExpectedRecoveryFailure::Unresolved,
+    );
+
+    let evidence_digest_mismatch =
+        recovery_evidence_for(token, StateDigest::from_bytes([29; 32]), non_zero(3), None)
+            .unwrap_or_else(|error| panic!("{error:?}"));
+    reject_observed_recovery(
+        &mut model,
+        &fixture,
+        &nonce,
+        &valid,
         &evidence_digest_mismatch,
+        ExpectedRecoveryFailure::Unresolved,
     );
 }
 

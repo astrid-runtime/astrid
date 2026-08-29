@@ -350,6 +350,7 @@ pub struct OperationJournalRecord {
     recovery_token: RecoveryToken,
     state_generation: Option<NonZeroU64>,
     drain_lineage: Option<DrainLineage>,
+    staged_commit_plan: Option<PlanDigest>,
 }
 
 impl OperationJournalRecord {
@@ -403,6 +404,7 @@ impl OperationJournalRecord {
             recovery_token,
             state_generation,
             drain_lineage: None,
+            staged_commit_plan: None,
         }
     }
 
@@ -458,6 +460,13 @@ impl OperationJournalRecord {
             },
             None => writer.tag(0),
         }
+        match &self.staged_commit_plan {
+            Some(plan) => {
+                writer.tag(1);
+                writer.digest(plan);
+            },
+            None => writer.tag(0),
+        }
         writer.finish("astrid.package.journal-record.v1")
     }
 
@@ -491,6 +500,18 @@ impl OperationJournalRecord {
 
     pub(crate) fn take_drain_lineage(&mut self) -> Option<DrainLineage> {
         self.drain_lineage.take()
+    }
+
+    pub(crate) const fn staged_commit_plan(&self) -> Option<&PlanDigest> {
+        self.staged_commit_plan.as_ref()
+    }
+
+    pub(crate) fn set_staged_commit_plan(&mut self, plan: PlanDigest) {
+        self.staged_commit_plan = Some(plan);
+    }
+
+    pub(crate) fn take_staged_commit_plan(&mut self) -> Option<PlanDigest> {
+        self.staged_commit_plan.take()
     }
 
     pub(crate) const fn before_state(&self) -> StateDigest {
