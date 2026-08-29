@@ -30,3 +30,10 @@ raw-cpuid = "=11.6.0"
 
 astrid-native-closure = { path = "../astrid-native-closure" }
 astrid-system-generation = { path = "../astrid-system-generation", default-features = false, features = ["emulator-fixture"] }
+# Rolling audit root. Same frozen pure backend as the sibling kernel crates.
+blake3 = { version = "=1.8.5", default-features = false, features = ["pure"] }
+
+[dev-dependencies]
+# Private host verifier: kernel audit tests cross-check the canonical frames,
+# rolling root, and checkpoint tags against the independent decoder.
+native-audit-verifier = { path = "../../tools/native-audit-verifier" }

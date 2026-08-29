@@ -1,0 +1,566 @@
+//! Typed identities, event classes, and capacity derivation for the private
+//! audit chain.
+
+use core::num::NonZeroU64;
+
+use super::root;
+use crate::ipc::DomainToken;
+
+/// Restated landed #1705 protocol ceilings used for static capacity
+/// derivation only. If the landed pools change, this derivation must be
+/// recalculated before the audit relay remains sound (#1759 freeze).
+pub(crate) const AUDIT_DOMAIN_SLOTS: usize = 2;
+pub(crate) const AUDIT_CAP_SLOTS_PER_DOMAIN: usize = 8;
+pub(crate) const AUDIT_ENDPOINT_POOL: usize = 4;
+pub(crate) const AUDIT_CAP_OBJECT_POOL: usize = 16;
+/// Landed message payload ceiling. Audit payloads never exceed it.
+pub(crate) const AUDIT_MAX_PAYLOAD: usize = 64;
+
+const _: () = assert!(
+    AUDIT_DOMAIN_SLOTS * AUDIT_CAP_SLOTS_PER_DOMAIN == AUDIT_CAP_OBJECT_POOL,
+    "landed domain and capability pools disagree with the audit capacity derivation",
+);
+
+/// Maximum mandatory terminal/invalidation records one admitted atomic
+/// mutation batch can produce at the frozen ceilings: mass invalidation of
+/// every capability-instance slot of both domain slots, every endpoint, and
+/// the dying domain identity itself. This is the statically derived relay
+/// reserve, never a single global death slot.
+pub(crate) const MAX_TERMINAL_RECORDS_PER_BATCH: usize =
+    AUDIT_DOMAIN_SLOTS * AUDIT_CAP_SLOTS_PER_DOMAIN + AUDIT_ENDPOINT_POOL + 1;
+
+/// Boot-scoped audit session identity. A kernel restart mints a new identity;
+/// this slice claims no cross-boot durable continuity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BootSessionId([u8; 16]);
+
+impl BootSessionId {
+    /// Rejects the all-zero identity so two boots can never share one chain.
+    pub const fn new(bytes: [u8; 16]) -> Option<Self> {
+        let mut index = 0;
+        let mut any_nonzero = false;
+        while index < bytes.len() {
+            if bytes[index] != 0 {
+                any_nonzero = true;
+            }
+            index += 1;
+        }
+        if any_nonzero { Some(Self(bytes)) } else { None }
+    }
+
+    pub const fn bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+/// Landed caller identity (#1705 `DomainToken`): domain slot plus generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AuditSubject {
+    slot: u8,
+    generation: NonZeroU64,
+}
+
+impl AuditSubject {
+    pub fn from_domain(token: DomainToken) -> Self {
+        Self {
+            slot: token.slot().index() as u8,
+            generation: token.generation(),
+        }
+    }
+
+    pub(crate) fn from_parts(slot: u8, generation: NonZeroU64) -> Option<Self> {
+        if slot as usize >= AUDIT_DOMAIN_SLOTS {
+            return None;
+        }
+        Some(Self { slot, generation })
+    }
+
+    pub const fn slot(self) -> u8 {
+        self.slot
+    }
+
+    pub const fn generation(self) -> NonZeroU64 {
+        self.generation
+    }
+}
+
+/// Landed object kind (#1705 domain or endpoint object).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AuditObjectKind {
+    Domain,
+    Endpoint,
+}
+
+impl AuditObjectKind {
+    pub(crate) const fn from_discriminant(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Domain),
+            2 => Some(Self::Endpoint),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn discriminant(self) -> u8 {
+        match self {
+            Self::Domain => 1,
+            Self::Endpoint => 2,
+        }
+    }
+}
+
+/// Typed object identity for one frame. Values restate the landed #1705 and
+/// #1758 identity fields through ceiling-enforced constructors; this is
+/// attribution encoding, not a parallel identity authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AuditObject {
+    Domain {
+        slot: u8,
+        generation: NonZeroU64,
+    },
+    Endpoint {
+        pool_index: u8,
+        generation: NonZeroU64,
+    },
+    CapabilityInstance(AuditCapabilityInstance),
+}
+
+impl AuditObject {
+    pub fn domain(slot: usize, generation: u64) -> Option<Self> {
+        if slot >= AUDIT_DOMAIN_SLOTS {
+            return None;
+        }
+        Some(Self::Domain {
+            slot: slot as u8,
+            generation: NonZeroU64::new(generation)?,
+        })
+    }
+
+    pub fn endpoint(pool_index: usize, generation: u64) -> Option<Self> {
+        if pool_index >= AUDIT_ENDPOINT_POOL {
+            return None;
+        }
+        Some(Self::Endpoint {
+            pool_index: pool_index as u8,
+            generation: NonZeroU64::new(generation)?,
+        })
+    }
+
+    pub fn capability_instance(
+        projection_token: u64,
+        capability_slot: usize,
+        capability_generation: u64,
+        object_kind: AuditObjectKind,
+        object_token: u64,
+    ) -> Option<Self> {
+        Some(Self::CapabilityInstance(AuditCapabilityInstance::try_new(
+            projection_token,
+            capability_slot,
+            capability_generation,
+            object_kind,
+            object_token,
+        )?))
+    }
+}
+
+/// Full landed #1758 capability-instance identity restated for attribution:
+/// kernel-issued projection token, capability-table slot, capability/object
+/// generations, and the held object identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AuditCapabilityInstance {
+    projection_token: NonZeroU64,
+    capability_slot: u8,
+    capability_generation: NonZeroU64,
+    object_kind: AuditObjectKind,
+    object_token: NonZeroU64,
+}
+
+impl AuditCapabilityInstance {
+    pub fn try_new(
+        projection_token: u64,
+        capability_slot: usize,
+        capability_generation: u64,
+        object_kind: AuditObjectKind,
+        object_token: u64,
+    ) -> Option<Self> {
+        if capability_slot >= AUDIT_CAP_SLOTS_PER_DOMAIN {
+            return None;
+        }
+        Some(Self {
+            projection_token: NonZeroU64::new(projection_token)?,
+            capability_slot: capability_slot as u8,
+            capability_generation: NonZeroU64::new(capability_generation)?,
+            object_kind,
+            object_token: NonZeroU64::new(object_token)?,
+        })
+    }
+
+    pub const fn projection_token(self) -> NonZeroU64 {
+        self.projection_token
+    }
+
+    pub const fn capability_slot(self) -> u8 {
+        self.capability_slot
+    }
+
+    pub const fn capability_generation(self) -> NonZeroU64 {
+        self.capability_generation
+    }
+
+    pub const fn object_kind(self) -> AuditObjectKind {
+        self.object_kind
+    }
+
+    pub const fn object_token(self) -> NonZeroU64 {
+        self.object_token
+    }
+}
+
+/// Landed #1705 rights bits (`SEND=1 RECV=2 GRANT=4 IDENTIFY=8`). Unknown
+/// bits fail closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AuditRights(u16);
+
+impl AuditRights {
+    const LANDED_RIGHTS_MASK: u16 = 0b1111;
+
+    pub const fn from_bits(bits: u16) -> Option<Self> {
+        if bits & !Self::LANDED_RIGHTS_MASK == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+}
+
+/// Typed denial reason. Denials never disclose a foreign object identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DenialReason {
+    StaleIdentity = 1,
+    MissingCapability = 2,
+    RightsInsufficient = 3,
+    ForeignObject = 4,
+    CapacityExhausted = 5,
+    MalformedRequest = 6,
+}
+
+impl DenialReason {
+    pub(crate) const fn from_discriminant(value: u16) -> Option<Self> {
+        match value {
+            1 => Some(Self::StaleIdentity),
+            2 => Some(Self::MissingCapability),
+            3 => Some(Self::RightsInsufficient),
+            4 => Some(Self::ForeignObject),
+            5 => Some(Self::CapacityExhausted),
+            6 => Some(Self::MalformedRequest),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn discriminant(self) -> u16 {
+        match self {
+            Self::StaleIdentity => 1,
+            Self::MissingCapability => 2,
+            Self::RightsInsufficient => 3,
+            Self::ForeignObject => 4,
+            Self::CapacityExhausted => 5,
+            Self::MalformedRequest => 6,
+        }
+    }
+}
+
+/// Caller-visible denial context: one typed reason plus a bounded caller
+/// stamp. The canonical payload is `reason: u16` little-endian, then 8 stamp
+/// bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenialContext {
+    reason: DenialReason,
+    stamp: [u8; 8],
+}
+
+impl DenialContext {
+    pub(crate) const PAYLOAD_LEN: usize = 10;
+
+    pub const fn new(reason: DenialReason, stamp: [u8; 8]) -> Self {
+        Self { reason, stamp }
+    }
+
+    pub(crate) fn payload_bytes(self) -> [u8; Self::PAYLOAD_LEN] {
+        let reason = self.reason.discriminant().to_le_bytes();
+        let mut out = [0u8; Self::PAYLOAD_LEN];
+        out[0] = reason[0];
+        out[1] = reason[1];
+        out[2..].copy_from_slice(&self.stamp);
+        out
+    }
+
+    pub(crate) fn from_payload(payload: &[u8]) -> Option<Self> {
+        if payload.len() != Self::PAYLOAD_LEN {
+            return None;
+        }
+        let reason = u16::from_le_bytes([payload[0], payload[1]]);
+        let mut stamp = [0u8; 8];
+        stamp.copy_from_slice(&payload[2..]);
+        Some(Self {
+            reason: DenialReason::from_discriminant(reason)?,
+            stamp,
+        })
+    }
+
+    pub const fn reason(self) -> DenialReason {
+        self.reason
+    }
+
+    pub const fn stamp(self) -> [u8; 8] {
+        self.stamp
+    }
+}
+
+/// Security-event class. Discriminant groups follow the #1759 freeze: domain
+/// lifecycle, capability, IPC, generation, root, and bounded denial.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AuditClass {
+    DomainCreate = 1,
+    DomainAdmit = 2,
+    DomainStart = 3,
+    DomainEnter = 4,
+    DomainExit = 5,
+    DomainFault = 6,
+    DomainKill = 7,
+    DomainReclaim = 8,
+    DomainCancel = 9,
+    CapabilityDerive = 16,
+    CapabilityGrant = 17,
+    CapabilityRevoke = 18,
+    IpcSend = 32,
+    IpcRecv = 33,
+    IpcQueueDrop = 34,
+    IpcEndpointTeardown = 35,
+    GenerationAdvance = 48,
+    GenerationReject = 49,
+    GenerationOverflow = 50,
+    RootCheckpoint = 64,
+    RootOverflow = 65,
+    RootIncomplete = 66,
+    BoundedDenial = 80,
+}
+
+impl AuditClass {
+    pub(crate) const fn from_discriminant(value: u16) -> Option<Self> {
+        match value {
+            1 => Some(Self::DomainCreate),
+            2 => Some(Self::DomainAdmit),
+            3 => Some(Self::DomainStart),
+            4 => Some(Self::DomainEnter),
+            5 => Some(Self::DomainExit),
+            6 => Some(Self::DomainFault),
+            7 => Some(Self::DomainKill),
+            8 => Some(Self::DomainReclaim),
+            9 => Some(Self::DomainCancel),
+            16 => Some(Self::CapabilityDerive),
+            17 => Some(Self::CapabilityGrant),
+            18 => Some(Self::CapabilityRevoke),
+            32 => Some(Self::IpcSend),
+            33 => Some(Self::IpcRecv),
+            34 => Some(Self::IpcQueueDrop),
+            35 => Some(Self::IpcEndpointTeardown),
+            48 => Some(Self::GenerationAdvance),
+            49 => Some(Self::GenerationReject),
+            50 => Some(Self::GenerationOverflow),
+            64 => Some(Self::RootCheckpoint),
+            65 => Some(Self::RootOverflow),
+            66 => Some(Self::RootIncomplete),
+            80 => Some(Self::BoundedDenial),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn discriminant(self) -> u16 {
+        self as u16
+    }
+}
+
+/// One typed audit event before canonical encoding. Construction is
+/// fallible where a ceiling applies, so a frame can never encode a value the
+/// landed pools cannot produce.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuditEvent {
+    class: AuditClass,
+    subject: AuditSubject,
+    object: Option<AuditObject>,
+    rights: AuditRights,
+    payload: [u8; AUDIT_MAX_PAYLOAD],
+    payload_len: usize,
+}
+
+impl AuditEvent {
+    pub fn new(class: AuditClass, subject: AuditSubject) -> Self {
+        Self {
+            class,
+            subject,
+            object: None,
+            rights: AuditRights::from_bits(0).expect("zero is a valid rights mask"),
+            payload: [0; AUDIT_MAX_PAYLOAD],
+            payload_len: 0,
+        }
+    }
+
+    pub fn with_object(mut self, object: AuditObject) -> Self {
+        self.object = Some(object);
+        self
+    }
+
+    pub fn with_rights(mut self, rights: AuditRights) -> Self {
+        self.rights = rights;
+        self
+    }
+
+    pub fn with_payload(mut self, payload: &[u8]) -> Option<Self> {
+        if payload.len() > AUDIT_MAX_PAYLOAD {
+            return None;
+        }
+        self.payload = [0; AUDIT_MAX_PAYLOAD];
+        self.payload[..payload.len()].copy_from_slice(payload);
+        self.payload_len = payload.len();
+        Some(self)
+    }
+
+    /// A bounded denial under caller-visible/stamped context. The object
+    /// stays absent: an unauthorized attempt must not disclose foreign
+    /// object identity through the verifier projection.
+    pub fn denial(subject: AuditSubject, context: DenialContext) -> Self {
+        let payload = context.payload_bytes();
+        Self {
+            class: AuditClass::BoundedDenial,
+            subject,
+            object: None,
+            rights: AuditRights::from_bits(0).expect("zero is a valid rights mask"),
+            payload: [0; AUDIT_MAX_PAYLOAD],
+            payload_len: 0,
+        }
+        .with_payload(&payload)
+        .expect("denial payload fits the landed ceiling")
+    }
+
+    pub const fn class(self) -> AuditClass {
+        self.class
+    }
+
+    pub const fn subject(self) -> AuditSubject {
+        self.subject
+    }
+
+    pub const fn object(self) -> Option<AuditObject> {
+        self.object
+    }
+
+    pub const fn rights(self) -> AuditRights {
+        self.rights
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        &self.payload[..self.payload_len]
+    }
+}
+
+/// Kernel-authenticated restart checkpoint bound to boot/session identity,
+/// exact `audit_seq`, root, codec version, and relay generation. A
+/// verifier-local cache alone is never a trusted checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuditCheckpoint {
+    boot: BootSessionId,
+    seq: u64,
+    root: [u8; root::ROOT_LEN],
+    codec_version: u16,
+    relay_generation: u64,
+    tag: [u8; root::ROOT_LEN],
+}
+
+impl AuditCheckpoint {
+    pub(crate) fn seal(
+        boot: BootSessionId,
+        seq: u64,
+        root: [u8; root::ROOT_LEN],
+        relay_generation: u64,
+    ) -> Self {
+        let codec_version = super::CODEC_VERSION;
+        let tag = root::checkpoint_tag(boot, seq, root, relay_generation);
+        Self {
+            boot,
+            seq,
+            root,
+            codec_version,
+            relay_generation,
+            tag,
+        }
+    }
+
+    pub(crate) fn verify_tag(&self) -> bool {
+        root::checkpoint_tag(self.boot, self.seq, self.root, self.relay_generation) == self.tag
+    }
+
+    pub const fn boot(self) -> BootSessionId {
+        self.boot
+    }
+
+    pub const fn seq(self) -> u64 {
+        self.seq
+    }
+
+    pub const fn root(self) -> [u8; root::ROOT_LEN] {
+        self.root
+    }
+
+    pub const fn codec_version(self) -> u16 {
+        self.codec_version
+    }
+
+    pub const fn relay_generation(self) -> u64 {
+        self.relay_generation
+    }
+
+    pub const fn tag(self) -> [u8; root::ROOT_LEN] {
+        self.tag
+    }
+}
+
+/// Fail-closed audit errors. None of these are recoverable by wraparound or
+/// silent omission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditError {
+    SequenceOverflow,
+    RelayGenerationOverflow,
+    PayloadTooLarge,
+    EncodeOverflow,
+    MalformedFrame,
+    UnauthorizedDisclosure,
+    RootMismatch,
+    CheckpointMismatch,
+    RelayWindowOverflow,
+    RelayInvalidCursor,
+    RelayStaleCursor,
+    BatchCapacityExhausted,
+}
+
+impl core::fmt::Display for AuditError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let text = match self {
+            Self::SequenceOverflow => "audit sequence overflow",
+            Self::RelayGenerationOverflow => "relay generation overflow",
+            Self::PayloadTooLarge => "payload exceeds the landed ceiling",
+            Self::EncodeOverflow => "canonical frame exceeds the fixed bound",
+            Self::MalformedFrame => "malformed canonical frame",
+            Self::UnauthorizedDisclosure => "denial frame discloses a foreign identity",
+            Self::RootMismatch => "rolling root mismatch",
+            Self::CheckpointMismatch => "checkpoint authentication mismatch",
+            Self::RelayWindowOverflow => "relay window overflow",
+            Self::RelayInvalidCursor => "relay cursor invalid",
+            Self::RelayStaleCursor => "relay cursor stale",
+            Self::BatchCapacityExhausted => "batch exceeds the static terminal reserve",
+        };
+        f.write_str(text)
+    }
+}
