@@ -98,8 +98,6 @@ fn diagnostics_launch(
 async fn spawn_child_with_inherited_stderr(
     scratch: &tempfile::TempDir,
 ) -> (tokio::process::Child, u32) {
-    use std::io::Read as _;
-
     let pid_path = scratch.path().join("stderr-holder.pid");
     let child = tokio::process::Command::new("/bin/sh")
         .arg("-c")
@@ -111,22 +109,32 @@ async fn spawn_child_with_inherited_stderr(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn child with inherited stderr");
+    let pid = wait_for_reported_pid(&pid_path)
+        .await
+        .expect("child reported its stderr holder");
+    (child, pid)
+}
+
+#[cfg(unix)]
+async fn wait_for_reported_pid(pid_path: &std::path::Path) -> Result<u32, String> {
+    use std::io::Read as _;
+
     let started = tokio::time::Instant::now();
-    let mut pid = String::new();
+    let timeout = std::time::Duration::from_secs(1);
     loop {
-        if let Ok(mut file) = std::fs::File::open(&pid_path) {
-            file.read_to_string(&mut pid)
-                .expect("read stderr-holder PID");
-            break;
+        if let Ok(mut file) = std::fs::File::open(pid_path) {
+            let mut contents = String::new();
+            file.read_to_string(&mut contents)
+                .map_err(|error| format!("read stderr-holder PID: {error}"))?;
+            if let Ok(pid) = contents.trim().parse::<u32>() {
+                return Ok(pid);
+            }
         }
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "child did not report its stderr holder"
-        );
+        if started.elapsed() >= timeout {
+            return Err("child did not report a parseable stderr-holder PID".to_owned());
+        }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    let pid = pid.trim().parse().expect("stderr-holder PID");
-    (child, pid)
 }
 
 #[cfg(unix)]
@@ -173,9 +181,7 @@ fn retained_cleanup_state(
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_stop_returns_rollback_promptly_when_descendant_holds_stderr() {
-    use std::io::Write as _;
-    use std::os::unix::net::UnixListener;
-    use std::sync::Arc;
+    use tokio::io::AsyncWriteExt as _;
 
     let scratch = tempfile::tempdir().expect("diagnostics scratch");
     let (_home_root, kernel) = fleet_shared_kernel().await;
@@ -190,17 +196,16 @@ async fn failed_stop_returns_rollback_promptly_when_descendant_holds_stderr() {
         read_write: true,
     };
     let control_path = scratch.path().join("process-control.sock");
-    let listener = Arc::new(UnixListener::bind(&control_path).expect("bind live endpoint"));
-    let responder_listener = Arc::clone(&listener);
-    let responder = tokio::task::spawn_blocking(move || {
-        for attempt in 0..3 {
-            let Ok((mut stream, _)) = responder_listener.accept() else {
+    let listener = tokio::net::UnixListener::bind(&control_path).expect("bind live endpoint");
+    let responder = tokio::spawn(async move {
+        for _ in 0..2 {
+            let Ok((mut stream, _)) = listener.accept().await else {
                 break;
             };
-            if attempt < 2 {
-                stream
-                    .write_all(b"{\"status\":\"ready\"}\n")
-                    .expect("write stop refusal");
+            if let Err(error) = stream.write_all(b"{\"status\":\"ready\"}\n").await
+                && error.kind() != std::io::ErrorKind::BrokenPipe
+            {
+                panic!("write stop refusal: {error}");
             }
         }
     });
@@ -253,9 +258,9 @@ async fn failed_stop_returns_rollback_promptly_when_descendant_holds_stderr() {
         cleanup_state,
     )
     .await;
-    let _ =
-        std::os::unix::net::UnixStream::connect(&control_path).expect("release fixture listener");
-    responder.await.expect("stop responder");
+    responder
+        .await
+        .expect("stop responder completed without a panic");
     let projection = Arc::clone(projections.get(&key).expect("authoritative blocker"));
     assert!(
         projection
@@ -266,6 +271,27 @@ async fn failed_stop_returns_rollback_promptly_when_descendant_holds_stderr() {
     let _ = std::process::Command::new("kill")
         .arg(stderr_holder_pid.to_string())
         .status();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stderr_pid_readiness_ignores_an_initially_empty_file() {
+    let scratch = tempfile::tempdir().expect("PID scratch");
+    let pid_path = scratch.path().join("stderr-holder.pid");
+    std::fs::write(&pid_path, b"").expect("create empty PID file");
+    let writer = tokio::spawn({
+        let pid_path = pid_path.clone();
+        async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            std::fs::write(&pid_path, b"123\n").expect("write stderr-holder PID");
+        }
+    });
+
+    let pid = wait_for_reported_pid(&pid_path)
+        .await
+        .expect("empty PID file is not ready content");
+    writer.await.expect("PID writer");
+    assert_eq!(pid, 123);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
