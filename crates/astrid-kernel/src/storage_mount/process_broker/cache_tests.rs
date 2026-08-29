@@ -37,6 +37,7 @@ async fn process_projection_cache_reuses_one_pair_until_last_close() {
     let (binding, key) = test_projection_key([0xA1; 32], [0xB2; 16]);
     let projection = Arc::new(CachedProcessProjection {
         binding,
+        component_mount_ids: Vec::new(),
         workspace_mountpoint: PathBuf::from("/private/workspace"),
         home_mountpoint: PathBuf::from("/private/home"),
         fleet_shared_mountpoint: None,
@@ -103,6 +104,7 @@ async fn last_close_refuses_remount_while_projection_is_closing() {
     let (binding, key) = test_projection_key([0xA3; 32], [0xB4; 16]);
     let projection = Arc::new(CachedProcessProjection {
         binding,
+        component_mount_ids: Vec::new(),
         workspace_mountpoint: PathBuf::from("/private/workspace-close"),
         home_mountpoint: PathBuf::from("/private/home-close"),
         fleet_shared_mountpoint: None,
@@ -154,6 +156,7 @@ async fn failed_projection_cleanup_retries_before_new_mount() {
     let (binding, key) = test_projection_key([0xA2; 32], [0xB3; 16]);
     let projection = Arc::new(CachedProcessProjection {
         binding,
+        component_mount_ids: Vec::new(),
         workspace_mountpoint: PathBuf::from("/private/workspace-retry"),
         home_mountpoint: PathBuf::from("/private/home-retry"),
         fleet_shared_mountpoint: None,

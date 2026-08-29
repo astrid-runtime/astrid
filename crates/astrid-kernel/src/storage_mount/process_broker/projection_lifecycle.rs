@@ -153,7 +153,6 @@ async fn cleanup_projection(state: &mut ProjectionCleanupState) -> bool {
     .await
     {
         tracing::error!("failed to revoke process storage projection leases; retaining resources");
-        return false;
     }
     if let Err(error) = std::fs::remove_dir_all(&state.mount_root) {
         tracing::error!(%error, "failed to remove process storage projection root");
@@ -220,6 +219,14 @@ pub(crate) fn retain_failed_launch_projection(
     fleet_shared_mountpoint: Option<PathBuf>,
     cleanup_state: ProjectionCleanupState,
 ) {
+    let component_mount_ids = projection_component_mount_ids(
+        &cleanup_state.branch.lease.mount_id,
+        Some(&cleanup_state.owner.lease.mount_id),
+        cleanup_state
+            .shared
+            .as_ref()
+            .map(|shared| &shared.lease.mount_id),
+    );
     let cleanup_state = Arc::new(tokio::sync::Mutex::new(cleanup_state));
     let cleanup_state_for_projection = Arc::clone(&cleanup_state);
     let cleanup: ProjectionCleanup = Arc::new(move || {
@@ -230,6 +237,7 @@ pub(crate) fn retain_failed_launch_projection(
         key.clone(),
         Arc::new(CachedProcessProjection {
             binding: key.binding.clone(),
+            component_mount_ids,
             workspace_mountpoint,
             home_mountpoint,
             fleet_shared_mountpoint,
@@ -250,9 +258,10 @@ pub(crate) fn retain_failed_issue_projection(
     >,
     key: &ProcessProjectionKey,
     kernel: &Arc<Kernel>,
+    component_mount_ids: Vec<StorageMountId>,
     paths: RetainedIssuePaths,
     branch: ProjectionLeaseTarget,
-    owner: ProjectionLeaseTarget,
+    owner: Option<ProjectionLeaseTarget>,
 ) {
     let kernel = Arc::downgrade(kernel);
     let binding = key.binding.clone();
@@ -275,7 +284,7 @@ pub(crate) fn retain_failed_issue_projection(
             let Some(kernel) = kernel.upgrade() else {
                 return false;
             };
-            cleanup_uncommitted_issue_lease_set(&kernel, &binding, &branch, &owner).await
+            cleanup_uncommitted_issue_lease_set(&kernel, &binding, &branch, owner.as_ref()).await
                 && std::fs::remove_dir_all(mount_root).is_ok()
         })
     });
@@ -283,6 +292,7 @@ pub(crate) fn retain_failed_issue_projection(
         key.clone(),
         Arc::new(CachedProcessProjection {
             binding: key.binding.clone(),
+            component_mount_ids,
             workspace_mountpoint: workspace,
             home_mountpoint: home,
             fleet_shared_mountpoint: fleet_shared,
@@ -336,7 +346,7 @@ pub(crate) async fn cleanup_uncommitted_issue_lease_set(
     kernel: &Kernel,
     binding: &ProcessProjectionBinding,
     branch: &ProjectionLeaseTarget,
-    owner: &ProjectionLeaseTarget,
+    owner: Option<&ProjectionLeaseTarget>,
 ) -> bool {
     if binding.validate().is_err() {
         return false;
@@ -376,9 +386,25 @@ pub(crate) async fn revoke_projection_leases(
     owner: &ProjectionLeaseTarget,
     shared: Option<&ProjectionLeaseTarget>,
 ) -> bool {
-    let Ok(states) = mapped_projection_leases(kernel, binding, branch, owner, shared) else {
-        return false;
-    };
+    let targets = [Some(branch), Some(owner), shared];
+    let mut states = Vec::with_capacity(targets.len());
+    for target in targets.iter().flatten() {
+        let Some(state) = kernel
+            .storage_mounts
+            .get(&target.mount_id)
+            .map(|entry| Arc::clone(entry.value()))
+        else {
+            continue;
+        };
+        if state.requested_by_uid != binding.acting_uid
+            || state.owner != target.target.durable_owner()
+            || state.target != target.target.durable_target()
+            || state.access != StorageProviderAccessV1::ReadWrite
+        {
+            return false;
+        }
+        states.push(state);
+    }
     fence_projection_states(&states, true);
     let mut listener_checks = tokio::task::JoinSet::new();
     for state in &states {
@@ -397,14 +423,106 @@ pub(crate) async fn revoke_projection_leases(
     unmapped && listeners_closed
 }
 
+async fn fence_available_projection_leases(
+    kernel: &Kernel,
+    binding: &ProcessProjectionBinding,
+    component_mount_ids: &[StorageMountId],
+) {
+    let (states, _, _) = exact_projection_lease_states(kernel, binding, component_mount_ids);
+    fence_projection_states(&states, true);
+    let mut listener_checks = tokio::task::JoinSet::new();
+    for state in &states {
+        let state = Arc::clone(state);
+        listener_checks.spawn(async move { state.wait_listener_closed().await });
+    }
+    while let Some(closed) = listener_checks.join_next().await {
+        if !closed.unwrap_or_default() {
+            tracing::error!("failed to drain an authorized process storage projection listener");
+        }
+    }
+}
+
+pub(crate) fn projection_component_mount_ids(
+    branch: &StorageMountId,
+    owner: Option<&StorageMountId>,
+    shared: Option<&StorageMountId>,
+) -> Vec<StorageMountId> {
+    [Some(*branch), owner.copied(), shared.copied()]
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Compare a recorded exact set with the kernel and retain authorized states.
+///
+/// Missing or expired/revoked members make `all_live` false, but still-mapped
+/// members with the recorded identity stay in `states` for retained cleanup.
+/// Identity mismatches are excluded and make `authorized` false: they are no
+/// longer safe to clean as members of this projection.
+fn exact_projection_lease_states(
+    kernel: &Kernel,
+    binding: &ProcessProjectionBinding,
+    component_mount_ids: &[StorageMountId],
+) -> (Vec<Arc<super::StorageMountLeaseState>>, bool, bool) {
+    let targets = [
+        Some(&binding.targets.workspace),
+        Some(&binding.targets.owner_home),
+        binding.targets.fleet_shared.as_ref(),
+    ];
+    let expected_count = targets.iter().flatten().count();
+    if component_mount_ids.len() != expected_count {
+        return (Vec::new(), false, false);
+    }
+
+    let mut seen_mount_ids = std::collections::HashSet::new();
+
+    let mut states = Vec::with_capacity(expected_count);
+    let mut all_live = true;
+    let mut authorized = true;
+    for (mount_id, target) in component_mount_ids.iter().zip(targets.iter().flatten()) {
+        if !seen_mount_ids.insert(*mount_id) {
+            return (Vec::new(), false, false);
+        }
+        let Some(state) = kernel
+            .storage_mounts
+            .get(mount_id)
+            .map(|entry| Arc::clone(entry.value()))
+        else {
+            all_live = false;
+            continue;
+        };
+        if state.requested_by_uid != binding.acting_uid
+            || state.owner != target.durable_owner()
+            || state.target != target.durable_target()
+            || state.access != StorageProviderAccessV1::ReadWrite
+        {
+            all_live = false;
+            authorized = false;
+            continue;
+        }
+        all_live &= state.provider == platform_process_provider_name() && state.is_live();
+        states.push(state);
+    }
+    (states, all_live, authorized)
+}
+
+pub(crate) fn projection_leases_are_live(
+    kernel: &Kernel,
+    projection: &CachedProcessProjection,
+) -> bool {
+    let (_, all_live, authorized) =
+        exact_projection_lease_states(kernel, &projection.binding, &projection.component_mount_ids);
+    all_live && authorized
+}
+
 fn mapped_projection_leases(
     kernel: &Kernel,
     binding: &ProcessProjectionBinding,
     branch: &ProjectionLeaseTarget,
-    owner: &ProjectionLeaseTarget,
+    owner: Option<&ProjectionLeaseTarget>,
     shared: Option<&ProjectionLeaseTarget>,
 ) -> Result<Vec<Arc<super::StorageMountLeaseState>>, ()> {
-    let targets = [Some(branch), Some(owner), shared];
+    let targets = [Some(branch), owner, shared];
     let mut states = Vec::with_capacity(targets.len());
     for target in targets.into_iter().flatten() {
         let Some(state) = kernel
@@ -412,7 +530,7 @@ fn mapped_projection_leases(
             .get(&target.mount_id)
             .map(|entry| Arc::clone(entry.value()))
         else {
-            continue;
+            return Err(());
         };
         if state.requested_by_uid != binding.acting_uid
             || state.owner != target.target.durable_owner()
@@ -450,7 +568,7 @@ async fn fence_projection_leases(
     owner: &ProjectionLeaseTarget,
     shared: Option<&ProjectionLeaseTarget>,
 ) -> bool {
-    let Ok(states) = mapped_projection_leases(kernel, binding, branch, owner, shared) else {
+    let Ok(states) = mapped_projection_leases(kernel, binding, branch, Some(owner), shared) else {
         return false;
     };
     if states.is_empty() {
@@ -477,6 +595,36 @@ pub(crate) async fn retry_failed_projection(
     key: &ProcessProjectionKey,
 ) -> bool {
     if !(projection.cleanup)().await {
+        return false;
+    }
+    projection.cleanup_failed.store(false, Ordering::Release);
+    if projections
+        .get(key)
+        .is_some_and(|current| Arc::ptr_eq(current, projection))
+    {
+        projections.remove(key);
+    }
+    true
+}
+
+/// Fence and retain-teardown a cache entry whose exact lease set degraded.
+///
+/// This is called before any reference is taken. It works even when another
+/// mount guard still owns a reference: external revocation means the cached
+/// provider pair is no longer a complete authority and must not be reused.
+pub(crate) async fn invalidate_unhealthy_projection(
+    kernel: &Kernel,
+    projection: &Arc<CachedProcessProjection>,
+    projections: &mut std::collections::BTreeMap<
+        ProcessProjectionKey,
+        Arc<CachedProcessProjection>,
+    >,
+    key: &ProcessProjectionKey,
+) -> bool {
+    fence_available_projection_leases(kernel, &projection.binding, &projection.component_mount_ids)
+        .await;
+    if !(projection.cleanup)().await {
+        projection.cleanup_failed.store(true, Ordering::Release);
         return false;
     }
     projection.cleanup_failed.store(false, Ordering::Release);

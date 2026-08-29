@@ -18,6 +18,7 @@ use super::{
     retain_failed_launch_projection, retry_failed_projection, rollback_or_retain_failed_launch,
 };
 
+mod cache_invalidation_tests;
 mod exact_fence_tests;
 mod partial_issue_tests;
 mod stopped_provider_tests;

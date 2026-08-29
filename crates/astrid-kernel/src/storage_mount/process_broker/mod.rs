@@ -43,7 +43,8 @@ pub(crate) use projection_lifecycle::{
 #[cfg(any(unix, windows))]
 pub(crate) use projection_lifecycle::{
     RetainedIssuePaths, blocked_projection_lease, cleanup_projection_state,
-    cleanup_uncommitted_issue_lease_set, generate_parent_tokens, projection_mount,
+    cleanup_uncommitted_issue_lease_set, generate_parent_tokens, invalidate_unhealthy_projection,
+    projection_component_mount_ids, projection_leases_are_live, projection_mount,
     retain_cached_projection, retain_failed_issue_projection, retain_locked_projection,
     retry_failed_projection, rollback_or_retain_failed_launch,
 };
@@ -77,6 +78,7 @@ impl ProcessProjectionKey {
 
 pub(crate) struct CachedProcessProjection {
     pub(crate) binding: ProcessProjectionBinding,
+    pub(crate) component_mount_ids: Vec<StorageMountId>,
     pub(crate) workspace_mountpoint: PathBuf,
     pub(crate) home_mountpoint: PathBuf,
     pub(crate) fleet_shared_mountpoint: Option<PathBuf>,
@@ -141,16 +143,26 @@ async fn retain_uncommitted_issue_lease(
         fleet_shared_mountpoint,
         issue_error,
     } = rollback;
-    let owner_target = ProjectionLeaseTarget {
-        mount_id: owner_mount_id.unwrap_or_default(),
+    let owner_target = owner_mount_id.map(|mount_id| ProjectionLeaseTarget {
+        mount_id,
         target: key.binding.targets.owner_home.clone(),
-    };
+    });
     let branch_target = ProjectionLeaseTarget {
         mount_id: branch_mount_id,
         target: key.binding.targets.workspace.clone(),
     };
-    if cleanup_uncommitted_issue_lease_set(kernel, &key.binding, &branch_target, &owner_target)
-        .await
+    let component_mount_ids = projection_component_mount_ids(
+        &branch_target.mount_id,
+        owner_target.as_ref().map(|owner| &owner.mount_id),
+        None,
+    );
+    if cleanup_uncommitted_issue_lease_set(
+        kernel,
+        &key.binding,
+        &branch_target,
+        owner_target.as_ref(),
+    )
+    .await
     {
         let _ = std::fs::remove_dir_all(&mount_root);
         return issue_error;
@@ -160,6 +172,7 @@ async fn retain_uncommitted_issue_lease(
         projections,
         key,
         kernel,
+        component_mount_ids,
         RetainedIssuePaths {
             workspace: workspace_mountpoint,
             home: home_mountpoint,
@@ -266,6 +279,19 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                 // lease revocation, and resource removal. Do not create a
                 // second provider pair while any prior resources remain.
                 if !retry_failed_projection(&projection, &mut projections, &key).await {
+                    return Err(
+                        "native process storage projection requires administrative cleanup"
+                            .to_owned(),
+                    );
+                }
+                true
+            } else if !projection_leases_are_live(&kernel, &projection) {
+                // External revocation, expiry, or kernel-map drift makes the
+                // cached set partial or untrustworthy. Fence and clean before
+                // admission; never take a reference on stale provider paths.
+                if !invalidate_unhealthy_projection(&kernel, &projection, &mut projections, &key)
+                    .await
+                {
                     return Err(
                         "native process storage projection requires administrative cleanup"
                             .to_owned(),
@@ -819,6 +845,11 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
         });
         let projection = Arc::new(CachedProcessProjection {
             binding: key.binding.clone(),
+            component_mount_ids: projection_component_mount_ids(
+                &branch_lease.mount_id,
+                Some(&owner_lease.mount_id),
+                shared_lease.as_ref().map(|lease| &lease.mount_id),
+            ),
             workspace_mountpoint,
             // The lease target is the fixed `home` owner subtree, so the
             // provider exposes that subtree directly at its mountpoint.
