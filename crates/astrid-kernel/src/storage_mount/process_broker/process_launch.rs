@@ -12,6 +12,8 @@ pub(super) struct ProcessProviderLaunchError {
     pub(super) child: Option<Box<tokio::process::Child>>,
 }
 
+const PROVIDER_DIAGNOSTICS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 type SpawnedProcessProvider = (
     tokio::process::Child,
     Option<tokio::task::JoinHandle<Vec<u8>>>,
@@ -257,7 +259,7 @@ async fn read_process_provider_ready(
     Ok(child)
 }
 
-async fn abort_process_provider(
+pub(super) async fn abort_process_provider(
     mut child: tokio::process::Child,
     launch: &StorageProviderServiceLaunchV1,
     message: String,
@@ -269,16 +271,34 @@ async fn abort_process_provider(
         launch.parent.token.clone(),
     )
     .await;
+    let mut diagnostics_timeout = false;
     let diagnostics = match stderr_task {
-        Some(task) => task.await.ok().and_then(|bytes| {
-            (!bytes.is_empty()).then(|| String::from_utf8_lossy(&bytes).trim().to_owned())
-        }),
+        Some(mut task) => {
+            let bytes = match tokio::time::timeout(PROVIDER_DIAGNOSTICS_TIMEOUT, &mut task).await {
+                Ok(Ok(bytes)) => Some(bytes),
+                // A descendant can inherit stderr after the provider child is
+                // reaped. Diagnostics are advisory; rollback must not wait on
+                // that unrelated lifetime.
+                Err(_) => {
+                    task.abort();
+                    diagnostics_timeout = true;
+                    None
+                },
+                Ok(Err(_)) => None,
+            };
+            bytes.and_then(|bytes| {
+                (!bytes.is_empty()).then(|| String::from_utf8_lossy(&bytes).trim().to_owned())
+            })
+        },
         None => None,
     };
-    let message = diagnostics.map_or_else(
-        || message.clone(),
-        |diagnostics| format!("{message}; provider diagnostics: {diagnostics}"),
-    );
+    let message = if let Some(diagnostics) = diagnostics {
+        format!("{message}; provider diagnostics: {diagnostics}")
+    } else if diagnostics_timeout {
+        format!("{message}; provider diagnostics timed out")
+    } else {
+        message.clone()
+    };
     ProcessProviderLaunchError {
         message,
         cleanup_ok,

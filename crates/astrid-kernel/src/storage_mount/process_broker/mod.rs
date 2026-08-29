@@ -11,6 +11,8 @@ use process_stop::stop_process_provider;
 #[cfg(any(unix, windows))]
 mod process_launch;
 #[cfg(all(test, any(unix, windows)))]
+use process_launch::abort_process_provider;
+#[cfg(all(test, any(unix, windows)))]
 pub(crate) use process_launch::arm_launch_failure;
 #[cfg(any(unix, windows))]
 use process_launch::launch_process_provider;

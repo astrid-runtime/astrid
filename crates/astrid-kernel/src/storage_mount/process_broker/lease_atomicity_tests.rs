@@ -6,12 +6,13 @@ use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
 use astrid_storage::StateOwner;
 
-use super::arm_launch_failure;
 use super::{
     KernelProcessStorageMountBroker, PROCESS_MOUNT_TEST_ID, ParentTokenSlot,
     ProcessProjectionBinding, ProcessProjectionTargetSet, ProjectionGeneration,
     arm_parent_token_failure, retain_failed_launch_projection, retry_failed_projection,
+    rollback_or_retain_failed_launch,
 };
+use super::{abort_process_provider, arm_launch_failure};
 
 fn binding(actor: astrid_core::PrincipalUid) -> ProcessProjectionBinding {
     let owner = StateOwner::Principal(actor);
@@ -60,6 +61,213 @@ async fn fleet_shared_kernel() -> (tempfile::TempDir, Arc<crate::Kernel>) {
     (temporary, kernel)
 }
 
+#[cfg(unix)]
+fn diagnostics_launch(
+    scratch: &tempfile::TempDir,
+    control_path: std::path::PathBuf,
+) -> astrid_core::storage_filesystem::StorageProviderServiceLaunchV1 {
+    use astrid_core::storage_filesystem::{
+        STORAGE_FILESYSTEM_SERVICE_LAUNCH_SCHEMA_V1, StorageMountLeaseV1,
+        StorageProviderParentLifetimeV1,
+    };
+    use astrid_core::storage_provider::{StorageProviderAccessV1, StorageProviderViewV1};
+
+    let callback_path = scratch.path().join("callback.sock");
+    astrid_core::storage_filesystem::StorageProviderServiceLaunchV1 {
+        schema: STORAGE_FILESYSTEM_SERVICE_LAUNCH_SCHEMA_V1,
+        lease: StorageMountLeaseV1 {
+            mount_id: astrid_core::storage_provider::StorageMountId::new(),
+            view: StorageProviderViewV1::Principal(PrincipalId::default()),
+            access: StorageProviderAccessV1::ReadWrite,
+            resource_path: scratch.path().join("resource"),
+            callback_path,
+            lease_token: "diagnostics-token".to_owned(),
+            expires_at_epoch_secs: u64::MAX,
+        },
+        mountpoint: scratch.path().join("mountpoint"),
+        control_path,
+        parent: StorageProviderParentLifetimeV1 {
+            pid: std::process::id(),
+            start_identity: None,
+            token: "diagnostics-token".to_owned(),
+        },
+    }
+}
+
+#[cfg(unix)]
+async fn spawn_child_with_inherited_stderr(
+    scratch: &tempfile::TempDir,
+) -> (tokio::process::Child, u32) {
+    use std::io::Read as _;
+
+    let pid_path = scratch.path().join("stderr-holder.pid");
+    let child = tokio::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("sleep 30 2>&1 & echo $! > \"$1\"")
+        .arg("/bin/sh")
+        .arg(&pid_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn child with inherited stderr");
+    let started = tokio::time::Instant::now();
+    let mut pid = String::new();
+    loop {
+        if let Ok(mut file) = std::fs::File::open(&pid_path) {
+            file.read_to_string(&mut pid)
+                .expect("read stderr-holder PID");
+            break;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "child did not report its stderr holder"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let pid = pid.trim().parse().expect("stderr-holder PID");
+    (child, pid)
+}
+
+#[cfg(unix)]
+fn retained_cleanup_state(
+    kernel: &Arc<crate::Kernel>,
+    binding: &ProcessProjectionBinding,
+    failed_child: Option<Box<tokio::process::Child>>,
+    control_path: std::path::PathBuf,
+    scratch: &tempfile::TempDir,
+) -> super::ProjectionCleanupState {
+    super::ProjectionCleanupState {
+        kernel: Arc::downgrade(kernel),
+        binding: binding.clone(),
+        branch: super::ProjectionLeaseProvider {
+            running: super::RunningProvider {
+                child: failed_child.map(|child| *child),
+                control_path,
+                token: "diagnostics-token".to_owned(),
+                stopped: false,
+            },
+            lease: super::ProjectionLeaseTarget {
+                mount_id: astrid_core::storage_provider::StorageMountId::new(),
+                target: binding.targets.owner_home.clone(),
+            },
+        },
+        owner: super::ProjectionLeaseProvider {
+            running: super::RunningProvider {
+                child: None,
+                control_path: scratch.path().join("absent.sock"),
+                token: "unused".to_owned(),
+                stopped: true,
+            },
+            lease: super::ProjectionLeaseTarget {
+                mount_id: astrid_core::storage_provider::StorageMountId::new(),
+                target: binding.targets.workspace.clone(),
+            },
+        },
+        shared: None,
+        mount_root: scratch.path().join("mount-root"),
+        cleaned: false,
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_stop_returns_rollback_promptly_when_descendant_holds_stderr() {
+    use std::io::Write as _;
+    use std::os::unix::net::UnixListener;
+    use std::sync::Arc;
+
+    let scratch = tempfile::tempdir().expect("diagnostics scratch");
+    let (_home_root, kernel) = fleet_shared_kernel().await;
+    let caller = PrincipalId::default();
+    let actor = kernel
+        .principal_directory
+        .uid_for(&caller)
+        .expect("caller actor UID");
+    let binding = binding(actor);
+    let key = super::ProcessProjectionKey {
+        binding: binding.clone(),
+        read_write: true,
+    };
+    let control_path = scratch.path().join("process-control.sock");
+    let listener = Arc::new(UnixListener::bind(&control_path).expect("bind live endpoint"));
+    let responder_listener = Arc::clone(&listener);
+    let responder = tokio::task::spawn_blocking(move || {
+        for attempt in 0..3 {
+            let Ok((mut stream, _)) = responder_listener.accept() else {
+                break;
+            };
+            if attempt < 2 {
+                stream
+                    .write_all(b"{\"status\":\"ready\"}\n")
+                    .expect("write stop refusal");
+            }
+        }
+    });
+    let launch = diagnostics_launch(&scratch, control_path.clone());
+    let (mut child, stderr_holder_pid) = spawn_child_with_inherited_stderr(&scratch).await;
+    let stderr_task = child.stderr.take().map(|mut stderr| {
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+
+            let mut bytes = Vec::new();
+            let _ = stderr.read_to_end(&mut bytes).await;
+            bytes
+        })
+    });
+
+    let started = tokio::time::Instant::now();
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        abort_process_provider(
+            child,
+            &launch,
+            "diagnostics deadline".to_owned(),
+            stderr_task,
+        ),
+    )
+    .await
+    .expect("failed STOP/reap must not wait for the unrelated stderr holder");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "rollback input took {elapsed:?}"
+    );
+    assert!(!error.cleanup_ok, "the live endpoint must retain the child");
+    assert!(error.child.is_some(), "failed STOP/reap retains the child");
+
+    let cleanup_state = retained_cleanup_state(
+        &kernel,
+        &binding,
+        error.child,
+        control_path.clone(),
+        &scratch,
+    );
+    let mut projections = BTreeMap::new();
+    rollback_or_retain_failed_launch(
+        &mut projections,
+        &key,
+        scratch.path().join("workspace"),
+        scratch.path().join("owner"),
+        None,
+        cleanup_state,
+    )
+    .await;
+    let _ =
+        std::os::unix::net::UnixStream::connect(&control_path).expect("release fixture listener");
+    responder.await.expect("stop responder");
+    let projection = Arc::clone(projections.get(&key).expect("authoritative blocker"));
+    assert!(
+        projection
+            .cleanup_failed
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+
+    let _ = std::process::Command::new("kill")
+        .arg(stderr_holder_pid.to_string())
+        .status();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parent_token_failures_do_not_accumulate_uuid_mount_roots() {
     // The fault slot is process-global, so exercise the owner and Fleet
@@ -89,13 +297,8 @@ async fn assert_parent_token_rollback(slot: ParentTokenSlot) {
     );
     let process_root = kernel.astrid_home.run_dir().join("process-storage");
     assert!(
-        !process_root.exists()
-            || process_root
-                .read_dir()
-                .expect("process storage root")
-                .next()
-                .is_none(),
-        "a pre-publication failure must remove the ephemeral mount root"
+        !process_root.exists(),
+        "a pre-publication failure must not allocate or retain a mount-root parent"
     );
 }
 
