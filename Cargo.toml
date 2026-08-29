@@ -259,7 +259,7 @@ wasm-encoder = "0.256"
 wat = "1.256"
 wasmparser = "0.256"
 windows-sys = "0.61"
-wit-component = "0.256"
+wit-component = "0.257.1"
 wit-parser = "0.256"
 wasmtime = { version = "48.0.1", features = ["component-model", "cranelift"] }
 wasmtime-wasi = "48.0.1"
