@@ -7,9 +7,9 @@ use astrid_core::dirs::AstridHome;
 use astrid_storage::StateOwner;
 
 use super::{
-    KernelProcessStorageMountBroker, ProcessProjectionBinding, ProcessProjectionTargetSet,
-    ProjectionGeneration, arm_parent_token_faults, retain_failed_launch_projection,
-    retry_failed_projection,
+    KernelProcessStorageMountBroker, ParentTokenSlot, ProcessProjectionBinding,
+    ProcessProjectionTargetSet, ProjectionGeneration, arm_parent_token_failure,
+    retain_failed_launch_projection, retry_failed_projection,
 };
 
 fn binding(actor: astrid_core::PrincipalUid) -> ProcessProjectionBinding {
@@ -29,27 +29,72 @@ fn binding(actor: astrid_core::PrincipalUid) -> ProcessProjectionBinding {
     .expect("valid projection binding")
 }
 
+async fn fleet_shared_kernel() -> (tempfile::TempDir, Arc<crate::Kernel>) {
+    let temporary = tempfile::tempdir().expect("test home root");
+    let home = AstridHome::from_path(temporary.path().join(".astrid"));
+    let kernel = crate::test_kernel_with_home(home).await;
+    let caller = PrincipalId::default();
+    let actor = kernel
+        .principal_directory
+        .uid_for(&caller)
+        .expect("caller actor UID");
+    let ownership = kernel
+        .ownership_store
+        .load()
+        .await
+        .expect("load ownership graph");
+    let assignment = ownership
+        .principal_owner(actor)
+        .expect("test kernel first-owner assignment");
+    assert!(
+        kernel
+            .ownership_store
+            .load()
+            .await
+            .expect("reload ownership graph")
+            .fleet(assignment.fleet_uid)
+            .is_some(),
+        "test kernel must contain the Fleet shared owner"
+    );
+    (temporary, kernel)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn late_parent_token_failure_leaves_no_live_lease_set() {
-    for failed_tokens in [2_usize, 3] {
-        let temporary = tempfile::tempdir().expect("test home root");
-        let home = AstridHome::from_path(temporary.path().join(".astrid"));
-        let kernel = Arc::new(crate::test_kernel_with_home(home).await);
-        let caller = PrincipalId::default();
-        let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
-
-        arm_parent_token_faults(failed_tokens);
-        let Err(error) = broker.mount(&caller).await else {
-            panic!("late parent token failure must not publish a projection");
-        };
-        arm_parent_token_faults(0);
-
-        assert!(error.contains("injected parent token failure"));
-        assert!(
-            kernel.storage_mounts.is_empty(),
-            "no process lease may survive a parent-token failure"
-        );
+async fn parent_token_failures_ordinals_two_and_three_leave_fleet_set_and_root_clean() {
+    // The fault slot is process-global, so exercise the owner and Fleet
+    // ordinals in one deterministic sequence instead of racing two tests.
+    for slot in [ParentTokenSlot::OwnerHome, ParentTokenSlot::FleetShared] {
+        assert_parent_token_rollback(slot).await;
     }
+}
+
+async fn assert_parent_token_rollback(slot: ParentTokenSlot) {
+    let (_temporary, kernel) = fleet_shared_kernel().await;
+    let caller = PrincipalId::default();
+    let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
+
+    arm_parent_token_failure(slot);
+    let Err(error) = broker.mount(&caller).await else {
+        panic!("the selected parent token must fail before lease publication");
+    };
+
+    assert!(
+        error.contains("injected parent token failure"),
+        "unexpected mount error: {error}"
+    );
+    assert!(
+        kernel.storage_mounts.is_empty(),
+        "no branch, owner, or Fleet shared lease may survive"
+    );
+    let process_root = kernel.astrid_home.run_dir().join("process-storage");
+    assert!(
+        process_root
+            .read_dir()
+            .expect("process storage root")
+            .next()
+            .is_none(),
+        "a pre-publication failure must remove the ephemeral mount root"
+    );
 }
 
 #[cfg(unix)]
