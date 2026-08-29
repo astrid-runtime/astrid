@@ -153,6 +153,7 @@ async fn cleanup_projection(state: &mut ProjectionCleanupState) -> bool {
     .await
     {
         tracing::error!("failed to revoke process storage projection leases; retaining resources");
+        return false;
     }
     if let Err(error) = std::fs::remove_dir_all(&state.mount_root) {
         tracing::error!(%error, "failed to remove process storage projection root");
@@ -351,6 +352,9 @@ pub(crate) async fn cleanup_uncommitted_issue_lease_set(
     if binding.validate().is_err() {
         return false;
     }
+    // A recorded issued member can disappear between issue failure and the
+    // bounded retry. Absence is already clean; a present member must still
+    // prove the exact actor, owner, target, access, and provider identity.
     let Ok(states) = mapped_projection_leases(kernel, binding, branch, owner, None) else {
         return false;
     };
@@ -386,25 +390,9 @@ pub(crate) async fn revoke_projection_leases(
     owner: &ProjectionLeaseTarget,
     shared: Option<&ProjectionLeaseTarget>,
 ) -> bool {
-    let targets = [Some(branch), Some(owner), shared];
-    let mut states = Vec::with_capacity(targets.len());
-    for target in targets.iter().flatten() {
-        let Some(state) = kernel
-            .storage_mounts
-            .get(&target.mount_id)
-            .map(|entry| Arc::clone(entry.value()))
-        else {
-            continue;
-        };
-        if state.requested_by_uid != binding.acting_uid
-            || state.owner != target.target.durable_owner()
-            || state.target != target.target.durable_target()
-            || state.access != StorageProviderAccessV1::ReadWrite
-        {
-            return false;
-        }
-        states.push(state);
-    }
+    let Ok(states) = mapped_projection_leases(kernel, binding, branch, Some(owner), shared) else {
+        return false;
+    };
     fence_projection_states(&states, true);
     let mut listener_checks = tokio::task::JoinSet::new();
     for state in &states {
@@ -427,7 +415,7 @@ async fn fence_available_projection_leases(
     kernel: &Kernel,
     binding: &ProcessProjectionBinding,
     component_mount_ids: &[StorageMountId],
-) {
+) -> bool {
     let (states, _, _) = exact_projection_lease_states(kernel, binding, component_mount_ids);
     fence_projection_states(&states, true);
     let mut listener_checks = tokio::task::JoinSet::new();
@@ -435,11 +423,16 @@ async fn fence_available_projection_leases(
         let state = Arc::clone(state);
         listener_checks.spawn(async move { state.wait_listener_closed().await });
     }
+    let mut listeners_closed = true;
     while let Some(closed) = listener_checks.join_next().await {
-        if !closed.unwrap_or_default() {
-            tracing::error!("failed to drain an authorized process storage projection listener");
-        }
+        listeners_closed &= closed.unwrap_or_default();
     }
+    if !listeners_closed {
+        tracing::error!(
+            "failed to drain an authorized process storage projection listener before cleanup"
+        );
+    }
+    listeners_closed
 }
 
 pub(crate) fn projection_component_mount_ids(
@@ -458,7 +451,8 @@ pub(crate) fn projection_component_mount_ids(
 /// Missing or expired/revoked members make `all_live` false, but still-mapped
 /// members with the recorded identity stay in `states` for retained cleanup.
 /// Identity mismatches are excluded and make `authorized` false: they are no
-/// longer safe to clean as members of this projection.
+/// longer safe to fence or clean as members of this projection. Provider drift
+/// is an identity mismatch, not merely degraded liveness.
 fn exact_projection_lease_states(
     kernel: &Kernel,
     binding: &ProcessProjectionBinding,
@@ -495,6 +489,7 @@ fn exact_projection_lease_states(
             || state.owner != target.durable_owner()
             || state.target != target.durable_target()
             || state.access != StorageProviderAccessV1::ReadWrite
+            || state.provider != platform_process_provider_name()
         {
             all_live = false;
             authorized = false;
@@ -523,19 +518,21 @@ fn mapped_projection_leases(
     shared: Option<&ProjectionLeaseTarget>,
 ) -> Result<Vec<Arc<super::StorageMountLeaseState>>, ()> {
     let targets = [Some(branch), owner, shared];
-    let mut states = Vec::with_capacity(targets.len());
+    let expected_count = targets.iter().flatten().count();
+    let mut states = Vec::with_capacity(expected_count);
     for target in targets.into_iter().flatten() {
         let Some(state) = kernel
             .storage_mounts
             .get(&target.mount_id)
             .map(|entry| Arc::clone(entry.value()))
         else {
-            return Err(());
+            continue;
         };
         if state.requested_by_uid != binding.acting_uid
             || state.owner != target.target.durable_owner()
             || state.target != target.target.durable_target()
             || state.access != StorageProviderAccessV1::ReadWrite
+            || state.provider != platform_process_provider_name()
         {
             return Err(());
         }
@@ -595,6 +592,7 @@ pub(crate) async fn retry_failed_projection(
     key: &ProcessProjectionKey,
 ) -> bool {
     if !(projection.cleanup)().await {
+        projection.cleanup_failed.store(true, Ordering::Release);
         return false;
     }
     projection.cleanup_failed.store(false, Ordering::Release);
@@ -621,8 +619,22 @@ pub(crate) async fn invalidate_unhealthy_projection(
     >,
     key: &ProcessProjectionKey,
 ) -> bool {
-    fence_available_projection_leases(kernel, &projection.binding, &projection.component_mount_ids)
-        .await;
+    let (_, _, authorized) =
+        exact_projection_lease_states(kernel, &projection.binding, &projection.component_mount_ids);
+    if !authorized {
+        projection.cleanup_failed.store(true, Ordering::Release);
+        return false;
+    }
+    if !fence_available_projection_leases(
+        kernel,
+        &projection.binding,
+        &projection.component_mount_ids,
+    )
+    .await
+    {
+        projection.cleanup_failed.store(true, Ordering::Release);
+        return false;
+    }
     if !(projection.cleanup)().await {
         projection.cleanup_failed.store(true, Ordering::Release);
         return false;
@@ -656,12 +668,9 @@ pub(crate) fn retain_cached_projection(projection: &CachedProcessProjection) -> 
     Ok(())
 }
 
-pub(crate) fn retain_locked_projection(
+pub(crate) async fn retain_locked_projection(
+    kernel: &Kernel,
     projection: Arc<CachedProcessProjection>,
-    projections: tokio::sync::MutexGuard<
-        '_,
-        std::collections::BTreeMap<ProcessProjectionKey, Arc<CachedProcessProjection>>,
-    >,
     cache: Arc<
         tokio::sync::Mutex<
             std::collections::BTreeMap<ProcessProjectionKey, Arc<CachedProcessProjection>>,
@@ -669,9 +678,82 @@ pub(crate) fn retain_locked_projection(
     >,
     key: ProcessProjectionKey,
 ) -> Result<astrid_capsule::context::ProcessStorageMount, String> {
+    // Validation and reference acquisition share the publication/drain lock.
+    // A concurrent ordinary revoke or expiry therefore either completes first
+    // (the stale set is not retained) or happens after this caller owns a
+    // reference (normal authority invalidation for an already admitted mount).
+    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
+    #[cfg(all(test, any(unix, windows)))]
+    pause_retain_validation_for_test().await;
+    if !projection_leases_are_live(kernel, &projection) {
+        return Err("native process storage projection became unhealthy".to_owned());
+    }
     retain_cached_projection(&projection)?;
-    drop(projections);
     Ok(projection_mount(projection, cache, key))
+}
+
+#[cfg(all(test, any(unix, windows)))]
+#[derive(Default)]
+struct RetainValidationGate {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(all(test, any(unix, windows)))]
+static RETAIN_VALIDATION_GATE: std::sync::Mutex<Option<Arc<RetainValidationGate>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) struct RetainValidationGateGuard {
+    gate: Arc<RetainValidationGate>,
+}
+
+#[cfg(all(test, any(unix, windows)))]
+impl RetainValidationGateGuard {
+    pub(crate) fn entered(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.gate.entered)
+    }
+
+    pub(crate) fn release(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.gate.release)
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+impl Drop for RetainValidationGateGuard {
+    fn drop(&mut self) {
+        let mut installed = RETAIN_VALIDATION_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if installed
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &self.gate))
+        {
+            *installed = None;
+        }
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) fn arm_retain_validation_gate() -> RetainValidationGateGuard {
+    let gate = Arc::new(RetainValidationGate::default());
+    *RETAIN_VALIDATION_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&gate));
+    RetainValidationGateGuard { gate }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+async fn pause_retain_validation_for_test() {
+    let gate = RETAIN_VALIDATION_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(Arc::clone);
+    if let Some(gate) = gate {
+        gate.entered.notify_one();
+        gate.release.notified().await;
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]

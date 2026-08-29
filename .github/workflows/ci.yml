@@ -560,8 +560,25 @@ jobs:
           cargo test --locked --target ${{ matrix.target }} -p astrid-core
           local_transport -- --nocapture --test-threads=1
 
+      - name: Build and stage the exact process storage provider
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          cargo build --locked --target ${{ matrix.target }} -p astrid-storage-provider-winfsp
+          $provider = "target/${{ matrix.target }}/debug/astrid-storage-provider-winfsp.exe"
+          $testDirectory = "target/${{ matrix.target }}/debug/deps"
+          if (-not (Test-Path -LiteralPath $provider -PathType Leaf)) {
+            throw "the exact Windows process storage provider was not built"
+          }
+          New-Item -ItemType Directory -Path $testDirectory -Force | Out-Null
+          Copy-Item -LiteralPath $provider -Destination $testDirectory -Force
+          Get-Item -LiteralPath (Join-Path $testDirectory (Split-Path -Leaf $provider)) |
+            Select-Object FullName, Length
+
       - name: Run storage callback transport tests natively
         if: matrix.target == 'x86_64-pc-windows-msvc'
+        env:
+          ASTRID_PROCESS_PROVIDER_TESTS: "1"
         shell: pwsh
         run: >-
           cargo test --locked --target ${{ matrix.target }} -p astrid-kernel

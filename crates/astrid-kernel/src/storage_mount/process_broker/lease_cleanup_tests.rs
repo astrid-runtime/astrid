@@ -54,7 +54,7 @@ async fn issue_home_lease(
             prefix: "home".to_owned(),
         },
         StorageProviderAccessV1::ReadWrite,
-        "test-provider".to_owned(),
+        super::platform_process_provider_name().to_owned(),
         mountpoint,
     )
     .await

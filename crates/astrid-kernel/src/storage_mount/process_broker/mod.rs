@@ -34,7 +34,7 @@ pub(crate) use projection_lifecycle::cached_projection_mount;
 pub(crate) use projection_lifecycle::retain_failed_launch_projection;
 #[cfg(all(test, any(unix, windows)))]
 pub(crate) use projection_lifecycle::{
-    ParentTokenSlot, arm_parent_token_failure, revoke_projection_leases,
+    ParentTokenSlot, arm_parent_token_failure, arm_retain_validation_gate, revoke_projection_leases,
 };
 #[cfg(any(unix, windows))]
 pub(crate) use projection_lifecycle::{
@@ -45,8 +45,8 @@ pub(crate) use projection_lifecycle::{
     RetainedIssuePaths, blocked_projection_lease, cleanup_projection_state,
     cleanup_uncommitted_issue_lease_set, generate_parent_tokens, invalidate_unhealthy_projection,
     projection_component_mount_ids, projection_leases_are_live, projection_mount,
-    retain_cached_projection, retain_failed_issue_projection, retain_locked_projection,
-    retry_failed_projection, rollback_or_retain_failed_launch,
+    retain_failed_issue_projection, retain_locked_projection, retry_failed_projection,
+    rollback_or_retain_failed_launch,
 };
 #[cfg(all(test, any(unix, windows)))]
 mod projection_identity_tests;
@@ -164,8 +164,10 @@ async fn retain_uncommitted_issue_lease(
     )
     .await
     {
-        let _ = std::fs::remove_dir_all(&mount_root);
-        return issue_error;
+        if std::fs::remove_dir_all(&mount_root).is_ok() {
+            return issue_error;
+        }
+        return format!("{issue_error}; process mount root cleanup failed");
     }
 
     retain_failed_issue_projection(
@@ -194,6 +196,7 @@ async fn retain_uncommitted_issue_lease(
 /// envelope; owner and branch remain in [`StorageMountLeaseState`] and
 /// callback dispatch.
 #[cfg(any(unix, windows))]
+#[derive(Clone)]
 pub(crate) struct KernelProcessStorageMountBroker {
     pub(crate) kernel: std::sync::Weak<Kernel>,
     projections: Arc<
@@ -303,11 +306,12 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             };
             if !retried {
                 return retain_locked_projection(
+                    &kernel,
                     projection,
-                    projections,
                     Arc::clone(&self.projections),
                     key,
-                );
+                )
+                .await;
             }
         }
         if let Some(error) = blocked_projection_lease(&kernel, &key.binding) {
@@ -864,10 +868,15 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             cleanup,
         });
         projections.insert(key.clone(), Arc::clone(&projection));
-        retain_cached_projection(&projection)?;
-        drop(projections);
+        retain_locked_projection(
+            &kernel,
+            Arc::clone(&projection),
+            Arc::clone(&self.projections),
+            key.clone(),
+        )
+        .await?;
         Ok(projection_mount(
-            projection,
+            Arc::clone(&projection),
             Arc::clone(&self.projections),
             key,
         ))

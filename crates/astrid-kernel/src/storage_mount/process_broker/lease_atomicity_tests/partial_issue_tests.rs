@@ -58,6 +58,12 @@ fn assert_retained_issue_authority(kernel: &crate::Kernel, stage: ProcessLaunchS
 }
 
 async fn assert_partial_issue_retains_exact_authority(stage: ProcessLaunchStage, test_id: u64) {
+    if !super::process_provider_test_lane_enabled() {
+        println!(
+            "skipping {stage:?} retained issue cleanup retry: coinstalled native process storage provider is unavailable"
+        );
+        return;
+    }
     let (_temporary, kernel) = fleet_shared_kernel().await;
     let caller = PrincipalId::default();
     let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
@@ -110,13 +116,18 @@ async fn assert_partial_issue_retains_exact_authority(stage: ProcessLaunchStage,
     {
         crate::storage_mount::clear_cleanup_fault_for_test(&state);
     }
-    let Err(retry_error) = broker.mount(&caller).await else {
-        panic!("{stage:?} cleanup retry must pass authority, then reach the absent provider");
-    };
-    assert!(
-        retry_error.contains("inspect coinstalled storage provider"),
-        "unexpected post-cleanup retry error: {retry_error}"
+    let replacement_mount = PROCESS_MOUNT_TEST_ID
+        .scope(test_id, broker.mount(&caller))
+        .await
+        .unwrap_or_else(|error| {
+            panic!("{stage:?} provider-lane cleanup retry must create a replacement: {error}")
+        });
+    assert_eq!(
+        kernel.storage_mounts.len(),
+        3,
+        "{stage:?} provider-lane replacement must publish its complete exact set"
     );
+    replacement_mount.close_async().await;
     assert!(broker.projections.lock().await.is_empty());
     assert!(kernel.storage_mounts.is_empty());
     assert!(
@@ -130,13 +141,21 @@ async fn assert_partial_issue_retains_exact_authority(stage: ProcessLaunchStage,
             .is_none()
     );
 
-    let Err(replacement_error) = replacement_broker.mount(&caller).await else {
-        panic!("{stage:?} replacement must be admitted after successful exact cleanup");
-    };
-    assert!(
-        replacement_error.contains("inspect coinstalled storage provider"),
-        "replacement should reach provider discovery, not authority: {replacement_error}"
+    let independent_replacement = PROCESS_MOUNT_TEST_ID
+        .scope(
+            test_id.saturating_add(1000),
+            replacement_broker.mount(&caller),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("{stage:?} independent replacement must be admitted after cleanup: {error}")
+        });
+    assert_eq!(
+        kernel.storage_mounts.len(),
+        3,
+        "{stage:?} independent replacement must publish its complete exact set"
     );
+    independent_replacement.close_async().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

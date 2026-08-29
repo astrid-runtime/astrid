@@ -45,6 +45,10 @@ fn binding(actor: astrid_core::PrincipalUid) -> ProcessProjectionBinding {
     )
 }
 
+pub(crate) fn process_provider_test_lane_enabled() -> bool {
+    std::env::var("ASTRID_PROCESS_PROVIDER_TESTS").is_ok_and(|value| value == "1")
+}
+
 fn binding_on(
     actor: astrid_core::PrincipalUid,
     owner: StateOwner,
@@ -357,13 +361,27 @@ async fn assert_retry_releases_authority(
         .expect("inspect released Windows provider endpoint"),
         "Windows provider endpoint must disappear when its responder drops"
     );
-    let Err(retry_error) = broker.mount(caller).await else {
-        panic!("retry must pass authority, then reach the absent unit-test provider");
-    };
-    assert!(
-        retry_error.contains("inspect coinstalled storage provider"),
-        "unexpected post-authority retry error for {stage:?}: {retry_error}"
+    let replacement_mount = broker.mount(caller).await.unwrap_or_else(|error| {
+        panic!("{stage:?} provider-lane retry must create a replacement: {error}")
+    });
+    assert_eq!(
+        kernel.storage_mounts.len(),
+        expected_lease_count(stage),
+        "{stage:?} provider-lane replacement must publish its complete exact set"
     );
+    assert_eq!(
+        broker
+            .projections
+            .lock()
+            .await
+            .values()
+            .next()
+            .expect("{stage:?} replacement projection")
+            .refs
+            .load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+    replacement_mount.close_async().await;
     assert!(
         broker.projections.lock().await.is_empty(),
         "{stage:?} successful retry must remove the retained blocker"
@@ -397,6 +415,12 @@ async fn assert_retry_releases_authority(
 }
 
 async fn assert_real_launch_retains_blocker(stage: ProcessLaunchStage, test_id: u64) {
+    if !process_provider_test_lane_enabled() {
+        println!(
+            "skipping {stage:?} retained provider cleanup retry: coinstalled native process storage provider is unavailable"
+        );
+        return;
+    }
     let (_temporary, kernel) = fleet_shared_kernel().await;
     let caller = PrincipalId::default();
     let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
