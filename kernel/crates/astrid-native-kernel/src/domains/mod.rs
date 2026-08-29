@@ -49,12 +49,8 @@ pub fn mark_ipc_cancelled(domain: crate::ipc::DomainToken) -> bool {
     wait::mark_ipc_cancelled(domain)
 }
 
-pub fn mark_ipc_peer_failed(domain: crate::ipc::DomainToken) -> bool {
-    wait::mark_ipc_peer_failed_domain(domain)
-}
-
-pub fn mark_ipc_peer_failed_terminal(domain: crate::ipc::DomainToken) -> bool {
-    wait::mark_ipc_peer_failed_terminal(domain)
+pub fn mark_ipc_peers_failed(domains: [Option<crate::ipc::DomainToken>; 2]) -> usize {
+    wait::mark_ipc_peers_failed(domains)
 }
 
 #[cfg(test)]

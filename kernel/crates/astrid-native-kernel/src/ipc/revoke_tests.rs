@@ -1,6 +1,7 @@
 //! Production-path regressions for capability revocation and terminal wakes.
 
 use super::abi::MAX_BUFFER_BYTES;
+use super::capability::DOMAIN_SLOTS;
 use super::capability::Rights;
 use super::error::IpcError;
 use super::test_support::{
@@ -155,8 +156,9 @@ fn cap_revoke_terminal_wakes_parked_recv_peer_without_stale_waiter() {
 
     let peer_slot = find(peer, Rights::RECV).unwrap();
     assert_eq!(revoke(peer, peer_slot), Ok(1));
-    assert!(!peer_parked(peer));
-    assert!(!domain_blocked(peer));
+    assert_eq!(peer_status(peer), Some("faulted"));
+    assert!(peer_parked(peer));
+    assert!(domain_blocked(peer));
     assert_eq!(find(peer, Rights::RECV), None);
     assert_eq!(queued_for(peer), 0);
     assert!(!has_waiter(peer));
@@ -178,6 +180,7 @@ fn cap_revoke_appends_revoked_domain_after_surviving_peer_wake() {
 
     let endpoint = endpoint_create(creator).unwrap();
     assert!(bind_peer(creator, peer).is_ok());
+    assert!(park_member(peer));
     assert!(install_transfer_message(peer, creator, endpoint, None));
     assert!(park_peer(peer, "received"));
     assert!(park_peer(creator, "sent"));
@@ -187,10 +190,20 @@ fn cap_revoke_appends_revoked_domain_after_surviving_peer_wake() {
     let root_slot = find(creator, Rights::ALL).unwrap();
     assert_eq!(revoke(creator, root_slot), Ok(2));
 
-    assert!(!peer_parked(peer));
-    assert!(!peer_parked(creator));
-    assert!(!domain_blocked(peer));
-    assert!(!domain_blocked(creator));
+    assert_eq!(peer_status(peer), Some("faulted"));
+    assert_eq!(peer_status(creator), Some("faulted"));
+    assert!(peer_parked(peer));
+    assert!(peer_parked(creator));
+    assert!(domain_blocked(peer));
+    assert!(domain_blocked(creator));
     assert!(!has_waiter(peer));
     assert!(!has_waiter(creator));
+}
+
+#[test]
+fn domain_tokens_reject_slots_outside_the_domain_table() {
+    assert!(DomainToken::new(0, 1).is_some());
+    assert!(DomainToken::new(1, 1).is_some());
+    assert!(DomainToken::new(u64::from(u32::MAX), 1).is_none());
+    assert!(DomainToken::new(DOMAIN_SLOTS as u64, 1).is_none());
 }

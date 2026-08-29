@@ -15,7 +15,11 @@ pub struct DomainToken {
 
 impl DomainToken {
     pub fn new(slot: u64, generation: u64) -> Option<Self> {
-        let slot = CapSlot::try_new(slot as usize).ok()?;
+        let slot = usize::try_from(slot).ok()?;
+        if slot >= DOMAIN_SLOTS {
+            return None;
+        }
+        let slot = CapSlot::try_new(slot).ok()?;
         Some(Self {
             slot,
             generation: NonZeroU64::new(generation)?,

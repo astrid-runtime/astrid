@@ -163,45 +163,28 @@ pub fn mark_ipc_peer_failed(handle: DomainHandle) {
     }
 }
 
-pub fn mark_ipc_peer_failed_domain(domain: crate::ipc::DomainToken) -> bool {
-    let Some(handle) = domain_handle_token(domain) else {
-        return false;
-    };
-    mark_ipc_peer_failed(handle);
-    true
-}
-
-/// Mark a parked IPC peer terminal and hand it back to the production waiter.
+/// Record every parked peer as Faulted while retaining its manager slot.
 ///
-/// On the freestanding target this reaches the real resume path; on host tests
-/// the same function validates the visible `PARKED` and `MANAGER` transition.
-pub fn mark_ipc_peer_failed_terminal(domain: crate::ipc::DomainToken) -> bool {
-    let Some(handle) = domain_handle_token(domain) else {
-        return false;
-    };
-    mark_ipc_peer_failed(handle);
-    #[cfg(not(test))]
-    {
-        matches!(resume_blocked(handle), Err(()) | Ok(()))
-    }
-    #[cfg(test)]
-    {
-        let resumed = {
-            let mut manager = super::manager::MANAGER.lock();
-            let mut resumed = false;
-            if let Some(domain) = manager.valid_domain_mut(handle)
-                && domain.state == super::manager::DomainState::Blocked
-            {
-                domain.state = super::manager::DomainState::Running;
-                resumed = true;
-            }
-            resumed
+/// Revocation runs from the live syscall domain, so it must not enter another
+/// domain's non-returning resume path. The scheduler can resume each parked
+/// peer later through the ordinary `Blocked` transition.
+pub fn mark_ipc_peers_failed(domains: [Option<crate::ipc::DomainToken>; 2]) -> usize {
+    let mut parked_domains = PARKED.lock();
+    let mut failed = 0;
+    for domain in domains.into_iter().flatten() {
+        let Some(handle) = domain_handle_token(domain) else {
+            continue;
         };
-        if resumed {
-            clear_parked(handle);
+        let slot = handle.id().value() as usize;
+        if let Some(parked) = parked_domains[slot].as_mut()
+            && parked.handle == handle
+            && matches!(parked.status, BlockStatus::Received | BlockStatus::Sent)
+        {
+            parked.status = BlockStatus::Faulted;
+            failed += 1;
         }
-        resumed
     }
+    failed
 }
 
 #[cfg(not(test))]

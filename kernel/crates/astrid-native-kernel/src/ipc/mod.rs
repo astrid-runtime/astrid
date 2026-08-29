@@ -1,9 +1,5 @@
 //! Private fixed-capability endpoint IPC for native protection domains.
 
-// The freestanding binary owns the production entry point, while host tests
-// exercise these same functions directly through the platform seam.
-#![allow(dead_code, unused_imports)]
-
 mod abi;
 mod capability;
 mod copy;
@@ -594,9 +590,7 @@ fn cap_revoke(frame: &TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcE
         reclaim_object(&mut state, removed.endpoint);
     }
     drop(state);
-    for wake in wakes.into_iter().flatten() {
-        crate::domains::mark_ipc_peer_failed_terminal(wake);
-    }
+    crate::domains::mark_ipc_peers_failed(wakes);
     Ok((0, removed_count as u64))
 }
 
