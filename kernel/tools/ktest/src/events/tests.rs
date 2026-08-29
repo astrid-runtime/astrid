@@ -180,7 +180,9 @@ fn emit_ipc_server_resume(serial: Emit<'_>, id: u64, generation: u64) {
         "\"ev\":\"ipc.resume\",\"id\":{id},\"generation\":{generation}"
     ));
     emit_ipc_op(serial, id, generation, "send", "ok");
-    emit_ipc_terminal(serial, id, generation, "clean_exit", 3, "0x0", 1);
+    serial(format!(
+        "\"ev\":\"ipc.park\",\"id\":{id},\"generation\":{generation}"
+    ));
 }
 
 fn emit_ipc_client_resume(serial: Emit<'_>, id: u64, generation: u64) {
@@ -190,19 +192,22 @@ fn emit_ipc_client_resume(serial: Emit<'_>, id: u64, generation: u64) {
     serial(format!(
         "\"ev\":\"ipc.resume\",\"id\":{id},\"generation\":{generation}"
     ));
-    for (op, status) in [
-        ("send", "malformed"),
-        ("send", "stale"),
-        ("endpoint_create", "no_space"),
-        ("cap_revoke", "ok"),
-        ("send", "stale"),
-        ("send", "stale"),
-        ("send", "stale"),
-        ("recv", "stale"),
-    ] {
-        emit_ipc_op(serial, id, generation, op, status);
-    }
-    emit_ipc_terminal(serial, id, generation, "clean_exit", 3, "0x0", 0);
+    emit_ipc_terminal(serial, id, generation, "clean_exit", 3, "0x0", 1);
+}
+
+fn emit_ipc_server_peer_release(serial: Emit<'_>, id: u64, generation: u64) {
+    serial(format!(
+        "\"ev\":\"ipc.reclaim\",\"id\":{id},\"generation\":{generation},\
+            \"capabilities\":1,\"endpoints\":1,\"queued\":0"
+    ));
+    serial(format!(
+        "\"ev\":\"domain.restore\",\"id\":{id},\"generation\":{generation},\
+            \"ok\":true,\"root\":\"0x101000\",\"flags\":0"
+    ));
+    serial(format!(
+        "\"ev\":\"domain.reclaim\",\"id\":{id},\"generation\":{generation},\
+            \"expected\":16,\"freed\":16,\"swept\":16,\"blocked\":0"
+    ));
 }
 
 fn emit_ipc_cancel(serial: Emit<'_>, id: u64, generation: u64) {
@@ -349,10 +354,22 @@ fn passing_serial_with(kernel: &str, sysgen: &str, kfloor: u64, sfloor: u64) -> 
     emit_prepare(&mut ev, 2, 3, 7);
     emit_start(&mut ev, 2, 3, 7);
     emit_context(&mut ev, 2, 3, 0);
-    emit_ipc_op(&mut ev, 2, 3, "send", "ok");
-    ev(format!("\"ev\":\"ipc.park\",\"id\":2,\"generation\":3"));
+    for (op, status) in [
+        ("send", "malformed"),
+        ("send", "malformed"),
+        ("send", "malformed"),
+        ("endpoint_create", "ok"),
+        ("cap_revoke", "ok"),
+        ("send", "malformed"),
+        ("send", "malformed"),
+        ("send", "malformed"),
+    ] {
+        emit_ipc_op(&mut ev, 2, 3, op, status);
+    }
+    ev("\"ev\":\"ipc.park\",\"id\":2,\"generation\":3".into());
     emit_ipc_server_resume(&mut ev, 1, 7);
     emit_ipc_client_resume(&mut ev, 2, 3);
+    emit_ipc_server_peer_release(&mut ev, 1, 7);
     emit_pass(&mut ev, super::DOMAIN_REQUIRED_PASSES[8]);
 
     emit_prepare(&mut ev, 1, 8, 6);
@@ -371,13 +388,14 @@ fn passing_serial_with(kernel: &str, sysgen: &str, kfloor: u64, sfloor: u64) -> 
         super::HOSTILE_IPC_FAULT_ADDRESS,
         1,
     );
+    emit_ipc_server_peer_release(&mut ev, 1, 8);
     emit_pass(&mut ev, super::DOMAIN_REQUIRED_PASSES[9]);
 
-    emit_prepare(&mut ev, 2, 5, 9);
-    emit_start(&mut ev, 2, 5, 9);
-    emit_context(&mut ev, 2, 5, 0);
-    emit_ipc_park(&mut ev, 2, 5);
-    emit_ipc_cancel(&mut ev, 2, 5);
+    emit_prepare(&mut ev, 1, 9, 9);
+    emit_start(&mut ev, 1, 9, 9);
+    emit_context(&mut ev, 1, 9, 0);
+    emit_ipc_park(&mut ev, 1, 9);
+    emit_ipc_cancel(&mut ev, 1, 9);
     emit_pass(&mut ev, super::DOMAIN_REQUIRED_PASSES[10]);
     emit_pass(&mut ev, super::CLEAN_RESTART_GATE);
     ev("\"ev\":\"domain.harness\",\"outcome\":true".into());

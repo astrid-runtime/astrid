@@ -8,6 +8,9 @@
 
 use serde_json::Value;
 
+mod closure;
+
+use closure::closure_holds;
 const REQUIRED_ONCE: &[&str] = &[
     "boot.entry",
     "idt.ready",
@@ -172,33 +175,19 @@ const CANCEL_TAIL_EVENTS: &[&str] = &[
     "domain.outcome",
 ];
 const IPC_PARK_TAIL_EVENTS: &[&str] = &["ipc.op", "ipc.park"];
-const IPC_SERVER_RESUME_TAIL_EVENTS: &[&str] = &[
-    "ipc.wake",
-    "ipc.resume",
-    "ipc.op",
-    "domain.registers",
-    "domain.outcome",
-    "ipc.reclaim",
-    "domain.restore",
-    "domain.reclaim",
-];
+const IPC_PARK_EVENT: &str = "ipc.park";
+const IPC_SERVER_RESUME_TAIL_EVENTS: &[&str] = &["ipc.wake", "ipc.resume", "ipc.op", "ipc.park"];
 const IPC_CLIENT_RESUME_TAIL_EVENTS: &[&str] = &[
     "ipc.wake",
     "ipc.resume",
-    "ipc.op",
-    "ipc.op",
-    "ipc.op",
-    "ipc.op",
-    "ipc.op",
-    "ipc.op",
-    "ipc.op",
-    "ipc.op",
     "domain.registers",
     "domain.outcome",
     "ipc.reclaim",
     "domain.restore",
     "domain.reclaim",
 ];
+const IPC_SERVER_PEER_RELEASE_TAIL_EVENTS: &[&str] =
+    &["ipc.reclaim", "domain.restore", "domain.reclaim"];
 const IPC_FAULT_CLIENT_TAIL_EVENTS: &[&str] = &[
     "domain.registers",
     "domain.outcome",
@@ -301,9 +290,11 @@ fn full_sequence() -> Vec<SequenceStep> {
     pattern.push(SequenceStep::Many(IPC_PARK_TAIL_EVENTS));
     push_started(&mut pattern);
     pattern.push(SequenceStep::Many(GUEST_ENTRY_EVENTS));
-    pattern.push(SequenceStep::Many(IPC_PARK_TAIL_EVENTS));
+    pattern.push(SequenceStep::Repeated("ipc.op", 8));
+    pattern.push(SequenceStep::One(IPC_PARK_EVENT));
     pattern.push(SequenceStep::Many(IPC_SERVER_RESUME_TAIL_EVENTS));
     pattern.push(SequenceStep::Many(IPC_CLIENT_RESUME_TAIL_EVENTS));
+    pattern.push(SequenceStep::Many(IPC_SERVER_PEER_RELEASE_TAIL_EVENTS));
     pattern.push(SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[8]));
     push_started(&mut pattern);
     pattern.push(SequenceStep::Many(GUEST_ENTRY_EVENTS));
@@ -311,6 +302,7 @@ fn full_sequence() -> Vec<SequenceStep> {
     push_started(&mut pattern);
     pattern.push(SequenceStep::Many(GUEST_ENTRY_EVENTS));
     pattern.push(SequenceStep::Many(IPC_FAULT_CLIENT_TAIL_EVENTS));
+    pattern.push(SequenceStep::Many(IPC_SERVER_PEER_RELEASE_TAIL_EVENTS));
     pattern.push(SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[9]));
     push_started(&mut pattern);
     pattern.push(SequenceStep::Many(GUEST_ENTRY_EVENTS));
@@ -340,7 +332,7 @@ const DOMAIN_STARTS: &[(u64, u64, u64)] = &[
     (2, 3, 7),
     (1, 8, 6),
     (2, 4, 8),
-    (2, 5, 9),
+    (1, 9, 9),
 ];
 const DOMAIN_ADMISSION_COUNT: usize = DOMAIN_STARTS.len() + 1;
 const DOMAIN_ENTERED: &[(u64, u64)] = &[
@@ -355,7 +347,7 @@ const DOMAIN_ENTERED: &[(u64, u64)] = &[
     (2, 3),
     (1, 8),
     (2, 4),
-    (2, 5),
+    (1, 9),
 ];
 const DOMAIN_REGISTERS: &[(u64, u64, u64)] = &[
     (1, 1, 0),
@@ -365,7 +357,6 @@ const DOMAIN_REGISTERS: &[(u64, u64, u64)] = &[
     (2, 2, 0),
     (1, 5, 3),
     (1, 6, 0),
-    (1, 7, 0),
     (2, 3, 0),
     (2, 4, 0),
 ];
@@ -378,13 +369,14 @@ const DOMAIN_RECLAIMS: &[(u64, u64)] = &[
     (2, 2),
     (1, 5),
     (1, 6),
-    (1, 7),
     (2, 3),
+    (1, 7),
     (2, 4),
-    (2, 5),
+    (1, 8),
+    (1, 9),
 ];
 const DOMAIN_CANCEL_REJECTS: &[(&str, u64, u64)] = &[("stale_handle", 1, 1)];
-const DOMAIN_CANCEL_IDENTITIES: &[(u64, u64)] = &[(2, 1), (2, 5)];
+const DOMAIN_CANCEL_IDENTITIES: &[(u64, u64)] = &[(2, 1), (1, 9)];
 const KERNEL_CR3_ROOT: &str = "0x101000";
 const KERNEL_CR3_FLAGS: u64 = 0;
 const DOMAIN_CONTEXT_FLAGS: u64 = 0;
@@ -398,32 +390,31 @@ const DOMAIN_OUTCOMES: &[(u64, u64, &str, u64, u64, &str, u64)] = &[
     (2, 2, "clean_exit", 3, 0, "0x0", 3),
     (1, 5, "page_fault", 14, 6, HOSTILE_PEER_FAULT_ADDRESS, 3),
     (1, 6, "clean_exit", 3, 0, "0x0", 3),
-    (1, 7, "clean_exit", 3, 0, "0x0", 3),
     (2, 3, "clean_exit", 3, 0, "0x0", 3),
-    (2, 4, "page_fault", 14, 6, "0x328000002000", 3),
-    (2, 5, "cancelled", 0, 0, "0x0", 0),
+    (2, 4, "page_fault", 14, 6, HOSTILE_IPC_FAULT_ADDRESS, 3),
+    (1, 9, "cancelled", 0, 0, "0x0", 0),
 ];
 const HOSTILE_IPC_FAULT_ADDRESS: &str = "0x328000002000";
 const IPC_RECLAIMS: &[(u64, u64, u64, u64, u64)] = &[
-    (1, 7, 1, 0, 0),
-    (2, 3, 0, 0, 0),
+    (2, 3, 1, 0, 0),
+    (1, 7, 1, 1, 0),
     (2, 4, 1, 0, 0),
-    (2, 5, 1, 1, 0),
+    (1, 8, 1, 1, 0),
+    (1, 9, 1, 1, 0),
 ];
 const IPC_OPS: &[(u64, u64, &str, &str)] = &[
     (1, 7, "endpoint_create", "ok"),
-    (2, 3, "send", "ok"),
-    (1, 7, "send", "ok"),
     (2, 3, "send", "malformed"),
-    (2, 3, "send", "stale"),
-    (2, 3, "endpoint_create", "no_space"),
+    (2, 3, "send", "malformed"),
+    (2, 3, "send", "malformed"),
+    (2, 3, "endpoint_create", "ok"),
     (2, 3, "cap_revoke", "ok"),
-    (2, 3, "send", "stale"),
-    (2, 3, "send", "stale"),
-    (2, 3, "send", "stale"),
-    (2, 3, "recv", "stale"),
+    (2, 3, "send", "malformed"),
+    (2, 3, "send", "malformed"),
+    (2, 3, "send", "malformed"),
+    (1, 7, "send", "ok"),
     (1, 8, "endpoint_create", "ok"),
-    (2, 5, "endpoint_create", "ok"),
+    (1, 9, "endpoint_create", "ok"),
 ];
 const HOSTILE_PEER_FAULT_ADDRESS: &str = "0x328000001000";
 
@@ -758,7 +749,7 @@ fn domain_lifecycle_holds(events: &[Value]) -> bool {
             )
         })
         .eq(IPC_RECLAIMS.iter().copied());
-    let ipc_flow_ok = count_named(events, "ipc.park") == 4
+    let ipc_flow_ok = count_named(events, "ipc.park") == 5
         && count_named(events, "ipc.wake") == 3
         && count_named(events, "ipc.resume") == 2;
     let tamper_events = named_events(events, "domain.auth.reject")
@@ -957,63 +948,7 @@ pub fn assert_boot(
     ok
 }
 
-fn closure_holds(events: &[Value], closures: &ExpectedClosures<'_>) -> bool {
-    let mut ok = true;
-    ok &= check(
-        "one event for each success-bound milestone",
-        SUCCESS_BOUND_EVENTS
-            .iter()
-            .all(|name| count_named(events, name) == 1),
-    );
-    ok &= check(
-        "no closure.reject",
-        count_named(events, "closure.reject") == 0,
-    );
-    let kernel_ev = events.iter().find(|e| ev_name(e) == "closure.kernel");
-    let sysgen_ev = events.iter().find(|e| ev_name(e) == "closure.sysgen");
-    let bound_ev = events.iter().find(|e| ev_name(e) == "closure.bound");
-    let handoff_ev = events.iter().find(|e| ev_name(e) == "handoff.bound");
-    ok &= check(
-        "handoff.bound generation and measurements match loader",
-        handoff_ev.is_some_and(|e| {
-            e.get("policy_generation").and_then(Value::as_u64) == Some(closures.policy_generation)
-                && e.get("kernel_image").and_then(Value::as_str) == Some(closures.kernel_image_hex)
-                && e.get("closure_table").and_then(Value::as_str)
-                    == Some(closures.closure_table_hex)
-        }),
-    );
-    ok &= check(
-        "closure.kernel kind, floor, and id match loader",
-        kernel_ev.is_some_and(|e| {
-            e.get("kind").and_then(Value::as_str) == Some("kernel-bootstrap")
-                && e.get("floor").and_then(Value::as_u64) == Some(closures.kernel_floor)
-                && e.get("id").and_then(Value::as_str) == Some(closures.kernel_id_hex)
-        }),
-    );
-    ok &= check(
-        "closure.sysgen non-empty descriptor, floor, and id match loader",
-        sysgen_ev.is_some_and(|e| {
-            e.get("kind").and_then(Value::as_str) == Some("system-generation")
-                && e.get("empty") == Some(&Value::Bool(false))
-                && e.get("floor").and_then(Value::as_u64) == Some(closures.sysgen_floor)
-                && e.get("id").and_then(Value::as_str) == Some(closures.sysgen_id_hex)
-        }),
-    );
-    ok &= check(
-        "closure.bound keeps independent floors and distinct identities",
-        bound_ev.is_some_and(|e| {
-            e.get("kernel_floor").and_then(Value::as_u64) == Some(closures.kernel_floor)
-                && e.get("sysgen_floor").and_then(Value::as_u64) == Some(closures.sysgen_floor)
-                && e.get("kernel_id").and_then(Value::as_str) == Some(closures.kernel_id_hex)
-                && e.get("sysgen_id").and_then(Value::as_str) == Some(closures.sysgen_id_hex)
-                && closures.kernel_id_hex != closures.sysgen_id_hex
-                && e.get("floor").is_none()
-        }),
-    );
-    ok
-}
-
-fn check(label: &str, pass: bool) -> bool {
+pub(super) fn check(label: &str, pass: bool) -> bool {
     println!("  [{}] {label}", if pass { "PASS" } else { "FAIL" });
     pass
 }

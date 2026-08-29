@@ -154,8 +154,8 @@ impl CapTable {
         }
         (0..CAP_SLOTS_PER_DOMAIN)
             .map(CapSlot::try_new)
-            .find_map(Result::ok)
-            .filter(|slot| self.slots[slot.index()].is_none())
+            .filter_map(Result::ok)
+            .find(|slot| self.slots[slot.index()].is_none())
     }
 
     pub(super) fn count(&self, domain: DomainToken) -> usize {

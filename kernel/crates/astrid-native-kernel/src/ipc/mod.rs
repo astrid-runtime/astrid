@@ -16,6 +16,7 @@ use crate::trap::TrapFrame;
 pub(crate) use abi::MAX_BUFFER_BYTES;
 pub(crate) use capability::DomainToken;
 use capability::{CapSlot, CapTable, Capability, DerivationLink, Rights};
+pub(crate) use copy::finish_copy;
 use endpoint::{Endpoint, Message, SendOutcome};
 use error::IpcError;
 
@@ -229,16 +230,29 @@ pub(crate) fn complete_parked_recv(
         return Err(());
     };
     let endpoint_id = source.endpoint;
-    let transferred_slot = if message.transfer().is_some() {
-        let destination_slot = CapSlot::try_new(usize::from(parsed.cap_slot())).map_err(|_| ())?;
-        let capability = message.transfer().ok_or(())?;
-        state.capabilities[domain.slot().index()]
-            .install(domain, destination_slot, capability)
-            .map_err(|_| ())?;
-        Some(destination_slot)
-    } else {
-        None
-    };
+    let mut transferred_slot = None;
+    if let Some(capability) = message.transfer() {
+        let destination_slot = CapSlot::try_new(usize::from(parsed.cap_slot()));
+        let installed = match destination_slot {
+            Ok(slot)
+                if state.capabilities[domain.slot().index()]
+                    .install(domain, slot, capability)
+                    .is_ok() =>
+            {
+                Some(slot)
+            },
+            _ => None,
+        };
+        match installed {
+            Some(slot) => transferred_slot = Some(slot),
+            None => {
+                if let Some(object) = state.objects[endpoint_id.index()].as_mut() {
+                    object.restore(domain, message, false);
+                }
+                return Err(());
+            },
+        }
+    }
     parsed.set_message(
         message.tag(),
         u32::from(message.transfer().is_some()) * abi::FLAG_TRANSFER,
@@ -267,7 +281,16 @@ fn dispatch(
         abi::Operation::EndpointCreate => endpoint_create(domain),
         abi::Operation::Send => send(frame, domain),
         abi::Operation::Recv => recv(frame, domain),
-        abi::Operation::Cancel => Err(IpcError::Busy),
+        abi::Operation::Cancel => {
+            let endpoint_cancelled = cancel_waiter(domain);
+            let parked_cancelled = crate::domains::mark_ipc_cancelled(domain);
+            let cancelled = endpoint_cancelled || parked_cancelled;
+            if cancelled {
+                Ok((CANCELLED_STATUS, 0))
+            } else {
+                Err(IpcError::Busy)
+            }
+        },
         abi::Operation::CapRevoke => cap_revoke(frame, domain),
         abi::Operation::CapIdentify => cap_identify(frame, domain),
     }
@@ -384,14 +407,29 @@ fn recv(frame: &mut TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcErr
         return Err(IpcError::Busy);
     };
     let endpoint_id = source.endpoint;
-    let transferred_slot = if message.transfer().is_some() {
-        let destination_slot = CapSlot::try_new(usize::from(output.cap_slot()))?;
-        let capability = message.transfer().ok_or(IpcError::Malformed)?;
-        state.capabilities[domain.slot().index()].install(domain, destination_slot, capability)?;
-        Some(destination_slot)
-    } else {
-        None
-    };
+    let mut transferred_slot = None;
+    if let Some(capability) = message.transfer() {
+        let destination_slot = CapSlot::try_new(usize::from(output.cap_slot()));
+        let installed = match destination_slot {
+            Ok(slot)
+                if state.capabilities[domain.slot().index()]
+                    .install(domain, slot, capability)
+                    .is_ok() =>
+            {
+                Some(slot)
+            },
+            _ => None,
+        };
+        match installed {
+            Some(slot) => transferred_slot = Some(slot),
+            None => {
+                if let Some(object) = state.objects[endpoint_id.index()].as_mut() {
+                    object.restore(domain, message, false);
+                }
+                return Err(IpcError::NoSpace);
+            },
+        }
+    }
     output.set_message(
         message.tag(),
         u32::from(message.transfer().is_some()) * abi::FLAG_TRANSFER,
@@ -437,11 +475,12 @@ fn rollback_recv(
 fn cap_revoke(frame: &TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcError> {
     let slot = slot_argument(frame.rdi)?;
     let mut state = IPC.lock();
-    let Some(removed) = state.capabilities[domain.slot().index()].remove(domain, slot) else {
+    let Some(removed) = state.capabilities[domain.slot().index()].get(domain, slot) else {
         return Err(IpcError::Stale);
     };
-    let mut removed_count = 1usize;
     let parent = DerivationLink { domain, slot };
+    let mut descendants = [None; abi::CAP_SLOTS_PER_DOMAIN * capability::DOMAIN_SLOTS];
+    let mut descendant_count = 0usize;
     for table_index in 0..state.capabilities.len() {
         let Some(owner) = state.capabilities[table_index].owner() else {
             continue;
@@ -449,14 +488,28 @@ fn cap_revoke(frame: &TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcE
         for index in 0..abi::CAP_SLOTS_PER_DOMAIN {
             if state.capabilities[table_index]
                 .capability_at(index)
-                .is_some_and(|capability| is_derived_from(capability.parent, parent))
-                && state.capabilities[table_index].remove_index(owner, index)
+                .is_some_and(|capability| is_derived_from(&state, capability.parent, parent))
             {
-                removed_count += 1;
+                descendants[descendant_count] = Some((table_index, owner, index));
+                descendant_count += 1;
             }
         }
     }
-    removed_count += revoke_queued_messages(&mut state, parent);
+    let revoked_messages = revoke_queued_messages(&mut state, parent);
+    if state.capabilities[domain.slot().index()]
+        .remove(domain, slot)
+        .is_none()
+    {
+        return Err(IpcError::Stale);
+    }
+    let mut removed_count = 1usize;
+    for entry in descendants.into_iter().flatten() {
+        let (table_index, owner, index) = entry;
+        if state.capabilities[table_index].remove_index(owner, index) {
+            removed_count += 1;
+        }
+    }
+    removed_count += revoked_messages;
     if endpoint_is_unused(&state, removed.endpoint) {
         reclaim_object(&mut state, removed.endpoint);
     }
@@ -529,6 +582,15 @@ pub(crate) fn teardown_domain(domain: DomainToken) -> TeardownOutcome {
     outcome
 }
 
+pub(crate) fn cancel_waiter(domain: DomainToken) -> bool {
+    let mut state = IPC.lock();
+    state
+        .objects
+        .iter_mut()
+        .flatten()
+        .any(|object| object.cancel_waiter(domain))
+}
+
 fn reclaim_object(state: &mut IpcState, id: EndpointId) -> bool {
     let Some(object) = state.objects[id.index()].as_mut() else {
         return false;
@@ -583,8 +645,8 @@ fn endpoint_pair(
 fn find_slot(state: &IpcState, domain: DomainToken, required: Rights) -> Option<CapSlot> {
     (0..abi::CAP_SLOTS_PER_DOMAIN)
         .map(CapSlot::try_new)
-        .find_map(Result::ok)
-        .filter(|slot| {
+        .filter_map(Result::ok)
+        .find(|slot| {
             state.capabilities[domain.slot().index()]
                 .get(domain, *slot)
                 .is_some_and(|capability| capability.rights.contains(required))
@@ -598,24 +660,94 @@ fn slot_argument(value: u64) -> Result<CapSlot, IpcError> {
     CapSlot::try_new(value as usize)
 }
 
-fn is_derived_from(parent: Option<DerivationLink>, ancestor: DerivationLink) -> bool {
-    parent == Some(ancestor)
+fn is_derived_from(
+    state: &IpcState,
+    parent: Option<DerivationLink>,
+    ancestor: DerivationLink,
+) -> bool {
+    let mut cursor = parent;
+    for _ in 0..abi::CAP_OBJECT_POOL * capability::DOMAIN_SLOTS {
+        let Some(link) = cursor else {
+            return false;
+        };
+        if link == ancestor {
+            return true;
+        }
+        cursor = state.capabilities[link.domain.slot().index()]
+            .get(link.domain, link.slot)
+            .and_then(|capability| capability.parent);
+    }
+    false
 }
 
 fn revoke_queued_messages(state: &mut IpcState, parent: DerivationLink) -> usize {
     let mut removed = 0;
     for object_index in 0..state.objects.len() {
-        let Some(object) = state.objects[object_index].as_mut() else {
-            continue;
-        };
         for index in 0..abi::ENDPOINT_POOL.min(2) {
-            if object.queue_message(index).is_some_and(|message| {
-                is_derived_from(message.transfer().and_then(|cap| cap.parent), parent)
-            }) && object.clear_queue(index)
+            let derived = state.objects[object_index]
+                .as_ref()
+                .and_then(|object| object.queue_message(index))
+                .is_some_and(|message| {
+                    is_derived_from(state, message.transfer().and_then(|cap| cap.parent), parent)
+                });
+            if derived
+                && state.objects[object_index]
+                    .as_mut()
+                    .is_some_and(|object| object.clear_queue(index))
             {
                 removed += 1;
             }
         }
     }
     removed
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn reset() {
+        *IPC.lock() = IpcState::empty();
+    }
+
+    pub(crate) fn capability(domain: DomainToken, slot: CapSlot) -> Option<Capability> {
+        IPC.lock().capabilities[domain.slot().index()].get(domain, slot)
+    }
+
+    pub(crate) fn install_copy(
+        domain: DomainToken,
+        source_slot: CapSlot,
+        destination_slot: CapSlot,
+    ) -> bool {
+        let mut state = IPC.lock();
+        let Some(capability) = state.capabilities[domain.slot().index()].get(domain, source_slot)
+        else {
+            return false;
+        };
+        state.capabilities[domain.slot().index()]
+            .install(domain, destination_slot, capability)
+            .is_ok()
+    }
+
+    pub(crate) fn free_slot(domain: DomainToken) -> Option<CapSlot> {
+        IPC.lock().capabilities[domain.slot().index()].free_slot(domain)
+    }
+
+    pub(crate) fn find(domain: DomainToken, rights: Rights) -> Option<CapSlot> {
+        let state = IPC.lock();
+        find_slot(&state, domain, rights)
+    }
+
+    pub(crate) fn queued_for(domain: DomainToken) -> usize {
+        IPC.lock()
+            .objects
+            .iter()
+            .flatten()
+            .map(|object| object.queued_for(domain))
+            .sum()
+    }
+
+    pub(crate) fn peer_wake_on_teardown(domain: DomainToken) -> Option<DomainToken> {
+        teardown_domain(domain).waiters.into_iter().flatten().next()
+    }
 }

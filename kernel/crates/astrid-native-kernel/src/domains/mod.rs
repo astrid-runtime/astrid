@@ -35,3 +35,7 @@ pub(crate) fn bind_ipc_peer(
 ) -> bool {
     wait::bind_ipc_peer(creator_slot, creator_generation, peer_slot, peer_generation)
 }
+
+pub(crate) fn mark_ipc_cancelled(domain: crate::ipc::DomainToken) -> bool {
+    wait::mark_ipc_cancelled(domain)
+}

@@ -8,3 +8,6 @@ pub mod events;
 pub mod firmware;
 pub mod image;
 pub mod machine;
+
+#[cfg(test)]
+mod ipc_regressions;

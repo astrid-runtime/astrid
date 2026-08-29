@@ -115,10 +115,10 @@ impl Endpoint {
         let Some(index) = self.destination_index(destination) else {
             return SendOutcome::Full;
         };
+        if self.waiters[index] == Some(destination) && self.queues[index].is_some() {
+            return SendOutcome::Full;
+        }
         if self.waiters[index] == Some(destination) {
-            if self.queues[index].is_some() {
-                return SendOutcome::Full;
-            }
             self.waiters[index] = None;
             self.queues[index] = Some(message);
             SendOutcome::Ready
@@ -171,14 +171,27 @@ impl Endpoint {
         for index in 0..ENDPOINT_MEMBERS {
             if self.members[index] == Some(domain) {
                 self.members[index] = None;
-            } else if self.members[index].is_some() {
-                if self.waiters[index].take().is_some() {
-                    wakes[wake_index] = self.members[index];
-                    wake_index += 1;
-                }
+                self.queues[index].take();
+                self.waiters[index].take();
+            } else if self.members[index].is_some() && self.waiters[index].take().is_some() {
+                wakes[wake_index] = self.members[index];
+                wake_index += 1;
             }
         }
         wakes
+    }
+
+    pub(super) fn cancel_waiter(&mut self, domain: DomainToken) -> bool {
+        let Some(index) = self
+            .waiters
+            .iter()
+            .position(|waiter| *waiter == Some(domain))
+        else {
+            return false;
+        };
+        self.queues[index].take();
+        self.waiters[index].take();
+        true
     }
 
     pub(super) fn queue_message(&self, index: usize) -> Option<Message> {

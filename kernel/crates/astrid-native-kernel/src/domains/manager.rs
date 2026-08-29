@@ -259,15 +259,6 @@ pub(crate) fn kernel_cr3_restored() -> bool {
         .is_some_and(|expected| Cr3::read() == *expected)
 }
 
-pub(super) fn restore_kernel_cr3() {
-    let Some((root, flags)) = KERNEL_CR3.get().copied() else {
-        fail_terminal("kernel_cr3_missing");
-    };
-    // SAFETY: this is the kernel root recorded before entering a domain and
-    // is restored only after the domain state has left the on-CPU context.
-    unsafe { Cr3::write(root, flags) };
-}
-
 pub(super) fn kernel_cr3_value() -> u64 {
     let Some((root, flags)) = KERNEL_CR3.get().copied() else {
         fail_terminal("kernel_cr3_missing");
@@ -803,6 +794,7 @@ impl Manager {
             probe: space.probe(),
         });
         self.last_identity = identity;
+        let mut failed_peers = [None; 2];
         if domain.ipc_enabled {
             let ipc_outcome = super::wait::release_ipc(handle.id().value(), generation);
             serial::ev_ipc_reclaim(
@@ -812,12 +804,17 @@ impl Manager {
                 ipc_outcome.capabilities as u64,
                 ipc_outcome.queued_messages as u64,
             );
-            for wake in ipc_outcome.waiters.into_iter().flatten() {
+            for (failed_peer, wake) in failed_peers
+                .iter_mut()
+                .zip(ipc_outcome.waiters.into_iter().flatten())
+            {
                 let Some(wake_handle) = super::wait::domain_handle_token(wake) else {
                     fail_terminal("invalid_ipc_wake");
                 };
                 super::wait::mark_ipc_peer_failed(wake_handle);
+                *failed_peer = Some(wake_handle);
             }
+            super::wait::clear_parked(handle);
         }
         domain.state = DomainState::Releasing;
         let Some(space) = domain.space.as_mut() else {
@@ -836,24 +833,32 @@ impl Manager {
                 (expected, freed)
             },
         };
-        let Some(domain) = slot.as_mut() else {
-            return ReclaimStats { expected, freed };
+        let reclaimed = {
+            let Some(domain) = slot.as_mut() else {
+                return ReclaimStats { expected, freed };
+            };
+            if expected == 0 || expected != freed {
+                false
+            } else {
+                domain.state = DomainState::Reclaimed;
+                self.used_frames = self.used_frames.saturating_sub(expected);
+                serial::ev_domain_reclaimed(
+                    handle.id().0 + 1,
+                    domain.generation,
+                    expected,
+                    freed,
+                    freed,
+                    expected - freed,
+                );
+                true
+            }
         };
-        if expected > 0 && expected == freed {
-            domain.state = DomainState::Reclaimed;
-            self.used_frames = self.used_frames.saturating_sub(expected);
-            serial::ev_domain_reclaimed(
-                handle.id().0 + 1,
-                domain.generation,
-                expected,
-                freed,
-                freed,
-                expected - freed,
-            );
-            ReclaimStats { expected, freed }
-        } else {
-            ReclaimStats { expected, freed }
+        if reclaimed {
+            for failed_peer in failed_peers.into_iter().flatten() {
+                self.release_slot(failed_peer);
+            }
         }
+        ReclaimStats { expected, freed }
     }
 
     fn terminate(

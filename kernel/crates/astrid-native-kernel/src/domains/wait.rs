@@ -118,11 +118,35 @@ pub(super) fn mark_ipc_ready(handle: DomainHandle, status: BlockStatus) {
     }
 }
 
+pub(super) fn mark_ipc_cancelled(domain: ipc::DomainToken) -> bool {
+    let Some(handle) = domain_handle_token(domain) else {
+        return false;
+    };
+    let mut parked_domains = PARKED.lock();
+    let cancelled = parked_domains[handle.id().value() as usize]
+        .as_mut()
+        .is_some_and(|parked| parked.handle == handle);
+    if cancelled && let Some(parked) = parked_domains[handle.id().value() as usize].as_mut() {
+        parked.status = BlockStatus::Cancelled;
+    }
+    cancelled
+}
+
+pub(crate) fn clear_parked(handle: DomainHandle) {
+    let mut parked_domains = PARKED.lock();
+    if parked_domains[handle.id().value() as usize]
+        .as_ref()
+        .is_some_and(|parked| parked.handle == handle)
+    {
+        parked_domains[handle.id().value() as usize] = None;
+    }
+}
+
 pub(super) fn mark_ipc_peer_failed(handle: DomainHandle) {
     let mut parked_domains = PARKED.lock();
     if let Some(parked) = parked_domains[handle.id().value() as usize].as_mut()
         && parked.handle == handle
-        && parked.status == BlockStatus::Received
+        && matches!(parked.status, BlockStatus::Received | BlockStatus::Sent)
     {
         parked.status = BlockStatus::Faulted;
     }
@@ -362,10 +386,7 @@ pub(crate) fn copy_current_user(address: u64, buffer: &mut [u8], to_user: bool) 
         kernel_cr3_value(),
         user_cr3,
     );
-    if copied && to_user {
-        buffer.copy_from_slice(scratch.as_slice());
-    }
-    copied
+    crate::ipc::finish_copy(buffer, scratch.as_slice(), copied, to_user)
 }
 
 #[unsafe(naked)]
@@ -425,4 +446,41 @@ extern "C" fn copy_in_kernel_context(
         "ret",
         copy = sym call_copy_user,
     );
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn park(
+        handle: DomainHandle,
+        status: BlockStatus,
+        user_buffer: u64,
+        cap_slot: u64,
+        buffer_len: u64,
+    ) {
+        PARKED.lock()[handle.id().value() as usize] = Some(ParkedDomain {
+            handle,
+            root: 0x1000,
+            root_flags: 0,
+            frame: 0,
+            status,
+            user_buffer,
+            cap_slot,
+            buffer_len,
+        });
+    }
+
+    pub(crate) fn status(handle: DomainHandle) -> Option<BlockStatus> {
+        PARKED.lock()[handle.id().value() as usize]
+            .as_ref()
+            .filter(|parked| parked.handle == handle)
+            .map(|parked| parked.status)
+    }
+
+    pub(crate) fn parked(handle: DomainHandle) -> bool {
+        PARKED.lock()[handle.id().value() as usize]
+            .as_ref()
+            .is_some_and(|parked| parked.handle == handle)
+    }
 }
