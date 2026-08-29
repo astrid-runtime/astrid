@@ -720,6 +720,11 @@ impl Kernel {
                 "Failed to clear stale principal runtime scratch: {error}"
             ))
         })?;
+        home.clear_runtime_process_storage().map_err(|error| {
+            std::io::Error::other(format!(
+                "Failed to reclaim stale process storage scratch: {error}"
+            ))
+        })?;
         if home.layout_version()?.as_deref() == Some(astrid_core::dirs::LEGACY_LAYOUT_VERSION) {
             let migration_target =
                 astrid_core::dirs::LayoutMigrationTarget::for_current_executable(
@@ -1006,6 +1011,11 @@ impl Kernel {
         home.clear_runtime_principal_scratch().map_err(|error| {
             std::io::Error::other(format!(
                 "Failed to clear stale principal runtime scratch: {error}"
+            ))
+        })?;
+        home.clear_runtime_process_storage().map_err(|error| {
+            std::io::Error::other(format!(
+                "Failed to reclaim stale process storage scratch: {error}"
             ))
         })?;
 

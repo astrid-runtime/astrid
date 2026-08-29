@@ -10,6 +10,8 @@ mod process_stop;
 use process_stop::stop_process_provider;
 #[cfg(any(unix, windows))]
 mod process_launch;
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) use process_launch::arm_launch_failure;
 #[cfg(any(unix, windows))]
 use process_launch::launch_process_provider;
 pub(crate) use process_launch::platform_process_provider_name;
@@ -48,6 +50,11 @@ pub(crate) use projection_identity::{
 
 pub(crate) type ProjectionCleanup =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync + 'static>;
+
+#[cfg(all(test, any(unix, windows)))]
+tokio::task_local! {
+    static PROCESS_MOUNT_TEST_ID: u64;
+}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ProcessProjectionKey {
@@ -189,9 +196,30 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             return Err(error);
         }
 
+        ensure_owner_home(&kernel, principal_uid).await?;
+        if let StateOwner::Fleet(fleet_uid) = key.binding.owner {
+            ensure_fleet_shared(&kernel, fleet_uid).await?;
+        }
+
+        // Generate every parent token before publishing the first lease. A
+        // late token failure must not turn into a partial, live lease set or
+        // allocate the random provider-service root.
+        let parent_tokens = match generate_parent_tokens(&key.binding.targets) {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                return Err(error);
+            },
+        };
+        let branch_parent_token = parent_tokens.branch;
+        let owner_parent_token = parent_tokens.owner_home;
+        let shared_parent_token = parent_tokens.fleet_shared;
+        let provider = platform_process_provider_name();
+        let admission = MountAdmission::capture(&kernel, principal, MountOwnerScope::CallerOnly)?;
+
         // A durable branch is an authority target, not a host mount identity.
         // The random root identifies this one provider-service incarnation;
-        // all concurrent children over the same key share it.
+        // all concurrent children over the same key share it. It is created
+        // only after Fleet, HOME, token, and admission preparation succeeds.
         let process_root = kernel.astrid_home.run_dir().join("process-storage");
         astrid_core::platform_fs::ensure_private_directory(&process_root)
             .map_err(|error| format!("create process storage root: {error}"))?;
@@ -204,8 +232,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             .map_err(|error| format!("create workspace mountpoint: {error}"))?;
         astrid_core::platform_fs::ensure_private_directory(&home_mountpoint)
             .map_err(|error| format!("create owner mountpoint: {error}"))?;
-        let fleet_shared_mountpoint = if let StateOwner::Fleet(fleet_uid) = key.binding.owner {
-            ensure_fleet_shared(&kernel, fleet_uid).await?;
+        let fleet_shared_mountpoint = if matches!(key.binding.owner, StateOwner::Fleet(_)) {
             let path = mount_root.join("shared");
             astrid_core::platform_fs::ensure_private_directory(&path)
                 .map_err(|error| format!("create Fleet shared mountpoint: {error}"))?;
@@ -214,22 +241,6 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             None
         };
 
-        ensure_owner_home(&kernel, principal_uid).await?;
-
-        // Generate every parent token before publishing the first lease. A
-        // late token failure must not turn into a partial, live lease set.
-        let parent_tokens = match generate_parent_tokens(&key.binding.targets) {
-            Ok(tokens) => tokens,
-            Err(error) => {
-                let _ = std::fs::remove_dir_all(&mount_root);
-                return Err(error);
-            },
-        };
-        let branch_parent_token = parent_tokens.branch;
-        let owner_parent_token = parent_tokens.owner_home;
-        let shared_parent_token = parent_tokens.fleet_shared;
-        let provider = platform_process_provider_name();
-        let admission = MountAdmission::capture(&kernel, principal, MountOwnerScope::CallerOnly)?;
         let branch_target = key.binding.targets.workspace.durable_target();
         let branch_lease = match issue_lease(
             &kernel,

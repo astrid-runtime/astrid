@@ -527,6 +527,27 @@ fn runtime_principal_scratch_is_cleared_on_restart() {
     assert!(!stale.parent().unwrap().exists());
 }
 
+#[test]
+fn runtime_process_storage_scratch_is_cleared_on_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    home.ensure().unwrap();
+    let stale = home
+        .run_dir()
+        .join("process-storage")
+        .join("018f0000000000000000000000000000")
+        .join("workspace");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("leftover"), b"ephemeral").unwrap();
+
+    home.clear_runtime_process_storage().unwrap();
+
+    let process_storage = home.run_dir().join("process-storage");
+    assert!(process_storage.is_dir());
+    assert!(process_storage.read_dir().unwrap().next().is_none());
+    assert!(!stale.parent().unwrap().exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn runtime_principal_scratch_rejects_redirects_without_following_or_deleting() {
@@ -558,6 +579,35 @@ fn runtime_principal_scratch_rejects_redirects_without_following_or_deleting() {
 
 #[cfg(unix)]
 #[test]
+fn runtime_process_storage_scratch_rejects_redirects_without_following_or_deleting() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    home.ensure().unwrap();
+    let process_storage = home.run_dir().join("process-storage");
+    std::fs::create_dir_all(&process_storage).unwrap();
+    let outside_file = outside.path().join("survive");
+    std::fs::write(&outside_file, b"outside").unwrap();
+    let redirect = process_storage.join("stale-root");
+    symlink(outside.path(), &redirect).unwrap();
+
+    let error = home.clear_runtime_process_storage().unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("redirect"));
+    assert_eq!(std::fs::read(outside_file).unwrap(), b"outside");
+    assert!(
+        std::fs::symlink_metadata(redirect)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn runtime_principal_scratch_rejects_special_entries_without_partial_delete() {
     use nix::sys::stat::Mode;
     use nix::unistd::mkfifo;
@@ -573,6 +623,30 @@ fn runtime_principal_scratch_rejects_special_entries_without_partial_delete() {
     mkfifo(&fifo, Mode::from_bits_truncate(0o600)).unwrap();
 
     let error = home.clear_runtime_principal_scratch().unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("special file"));
+    assert_eq!(std::fs::read(retained).unwrap(), b"must survive");
+    assert!(fifo.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_process_storage_scratch_rejects_special_entries_without_partial_delete() {
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    home.ensure().unwrap();
+    let stale_root = home.run_dir().join("process-storage").join("stale-root");
+    std::fs::create_dir_all(&stale_root).unwrap();
+    let retained = stale_root.join("retained");
+    std::fs::write(&retained, b"must survive").unwrap();
+    let fifo = stale_root.join("unsafe.fifo");
+    mkfifo(&fifo, Mode::from_bits_truncate(0o600)).unwrap();
+
+    let error = home.clear_runtime_process_storage().unwrap_err();
 
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     assert!(error.to_string().contains("special file"));

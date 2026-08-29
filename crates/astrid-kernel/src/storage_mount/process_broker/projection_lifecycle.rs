@@ -427,7 +427,12 @@ fn random_parent_token(slot: ParentTokenSlot) -> Result<String, String> {
     #[cfg(not(test))]
     let _ = slot;
     #[cfg(test)]
-    if inject_parent_token_failure(slot) {
+    if inject_parent_token_failure(
+        slot,
+        super::PROCESS_MOUNT_TEST_ID
+            .try_with(|test_id| *test_id)
+            .unwrap_or_default(),
+    ) {
         return Err("injected parent token failure".to_owned());
     }
     let (token, _) = generate_lease_token()?;
@@ -438,13 +443,23 @@ fn random_parent_token(slot: ParentTokenSlot) -> Result<String, String> {
 static PARENT_TOKEN_FAILURE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 #[cfg(all(test, any(unix, windows)))]
-fn inject_parent_token_failure(slot: ParentTokenSlot) -> bool {
-    PARENT_TOKEN_FAILURE
-        .compare_exchange(slot as u8, 0, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
+static PARENT_TOKEN_FAILURE_TEST_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(test, any(unix, windows)))]
+fn inject_parent_token_failure(slot: ParentTokenSlot, current_test_id: u64) -> bool {
+    current_test_id == PARENT_TOKEN_FAILURE_TEST_ID.load(Ordering::Acquire)
+        && PARENT_TOKEN_FAILURE
+            .compare_exchange(slot as u8, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        && {
+            PARENT_TOKEN_FAILURE_TEST_ID.store(0, Ordering::Release);
+            true
+        }
 }
 
 #[cfg(all(test, any(unix, windows)))]
-pub(crate) fn arm_parent_token_failure(slot: ParentTokenSlot) {
+pub(crate) fn arm_parent_token_failure(slot: ParentTokenSlot, test_id: u64) {
     PARENT_TOKEN_FAILURE.store(slot as u8, Ordering::Release);
+    PARENT_TOKEN_FAILURE_TEST_ID.store(test_id, Ordering::Release);
 }

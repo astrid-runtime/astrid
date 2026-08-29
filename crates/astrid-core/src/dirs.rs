@@ -534,22 +534,6 @@ impl AstridHome {
         self.root.join("run")
     }
 
-    /// Clear stale per-principal runtime scratch from a prior daemon process.
-    ///
-    /// Only the disposable `run/principals/` subtree is touched. The complete
-    /// tree is validated without following redirects before anything is
-    /// removed; symlinks, mount boundaries, and special entries fail closed.
-    /// The subtree root is retained and private UID scratch directories are
-    /// recreated on demand by the capsule runtime.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error and leaves the subtree untouched when a redirect,
-    /// mount boundary, or special entry is present.
-    pub fn clear_runtime_principal_scratch(&self) -> io::Result<()> {
-        crate::runtime_scratch::clear_principal_scratch(&self.run_dir().join("principals"))
-    }
-
     /// Portable endpoint token for the kernel's host-local transport.
     ///
     /// Unix uses this as the domain-socket path (`run/system.sock`). Windows

@@ -6,10 +6,11 @@ use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
 use astrid_storage::StateOwner;
 
+use super::arm_launch_failure;
 use super::{
-    KernelProcessStorageMountBroker, ParentTokenSlot, ProcessProjectionBinding,
-    ProcessProjectionTargetSet, ProjectionGeneration, arm_parent_token_failure,
-    retain_failed_launch_projection, retry_failed_projection,
+    KernelProcessStorageMountBroker, PROCESS_MOUNT_TEST_ID, ParentTokenSlot,
+    ProcessProjectionBinding, ProcessProjectionTargetSet, ProjectionGeneration,
+    arm_parent_token_failure, retain_failed_launch_projection, retry_failed_projection,
 };
 
 fn binding(actor: astrid_core::PrincipalUid) -> ProcessProjectionBinding {
@@ -60,7 +61,7 @@ async fn fleet_shared_kernel() -> (tempfile::TempDir, Arc<crate::Kernel>) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn parent_token_failures_ordinals_two_and_three_leave_fleet_set_and_root_clean() {
+async fn parent_token_failures_do_not_accumulate_uuid_mount_roots() {
     // The fault slot is process-global, so exercise the owner and Fleet
     // ordinals in one deterministic sequence instead of racing two tests.
     for slot in [ParentTokenSlot::OwnerHome, ParentTokenSlot::FleetShared] {
@@ -73,8 +74,8 @@ async fn assert_parent_token_rollback(slot: ParentTokenSlot) {
     let caller = PrincipalId::default();
     let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
 
-    arm_parent_token_failure(slot);
-    let Err(error) = broker.mount(&caller).await else {
+    arm_parent_token_failure(slot, 1);
+    let Err(error) = PROCESS_MOUNT_TEST_ID.scope(1, broker.mount(&caller)).await else {
         panic!("the selected parent token must fail before lease publication");
     };
 
@@ -88,12 +89,47 @@ async fn assert_parent_token_rollback(slot: ParentTokenSlot) {
     );
     let process_root = kernel.astrid_home.run_dir().join("process-storage");
     assert!(
+        !process_root.exists()
+            || process_root
+                .read_dir()
+                .expect("process storage root")
+                .next()
+                .is_none(),
+        "a pre-publication failure must remove the ephemeral mount root"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_publication_launch_failure_revokes_branch_owner_and_fleet_leases() {
+    let (_temporary, kernel) = fleet_shared_kernel().await;
+    let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
+    let caller = PrincipalId::default();
+
+    arm_launch_failure(2);
+    let Err(error) = PROCESS_MOUNT_TEST_ID.scope(2, broker.mount(&caller)).await else {
+        panic!("the injected launch-stage fault must fail provider startup");
+    };
+
+    assert!(
+        error.contains("injected post-publication launch failure"),
+        "unexpected launch error: {error}"
+    );
+    assert!(
+        kernel.storage_mounts.is_empty(),
+        "branch, owner-home, and Fleet-shared leases must all be revoked"
+    );
+    assert!(
+        broker.projections.lock().await.is_empty(),
+        "successful rollback must not retain a retry blocker"
+    );
+    let process_root = kernel.astrid_home.run_dir().join("process-storage");
+    assert!(
         process_root
             .read_dir()
             .expect("process storage root")
             .next()
             .is_none(),
-        "a pre-publication failure must remove the ephemeral mount root"
+        "successful cleanup must remove the UUID mount root"
     );
 }
 
