@@ -282,21 +282,43 @@ impl CanonicalInstalledState {
         self.completing_nonce
     }
 
+    /// Returns the canonical state schema version.
+    #[must_use]
+    pub(crate) const fn schema_version(&self) -> StateSchemaVersion {
+        self.schema_version
+    }
+
     /// Returns the canonical authenticated-authority decision digest.
     #[must_use]
     pub const fn authority_digest(&self) -> &AuthorityDecisionDigest {
         &self.authority_digest
     }
 
-    pub(crate) fn set_lifecycle_state(
+    /// Returns the attribution evidence digest retained with canonical state.
+    #[must_use]
+    pub const fn provenance(&self) -> &ProvenanceDigest {
+        &self.provenance
+    }
+
+    /// Returns whether the retained digest covers the retained canonical fields.
+    pub(crate) fn has_valid_digest(&self) -> bool {
+        let mut writer = DigestWriter::new();
+        self.write(&mut writer);
+        let candidate: StateDigest = writer.finish("astrid.package.installed-state.v1");
+        candidate == self.digest
+    }
+
+    pub(crate) fn set_lifecycle_result(
         &mut self,
         lifecycle_state: LifecycleState,
         plan: PlanDigest,
         generation: NonZeroU64,
+        completing_nonce: Nonce,
     ) {
         self.lifecycle_state = lifecycle_state;
         self.lifecycle_plan = plan;
         self.generation = generation;
+        self.completing_nonce = completing_nonce;
         self.redigest();
     }
 

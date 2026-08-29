@@ -16,6 +16,7 @@ use std::num::{NonZeroU32, NonZeroU64};
 use std::time::Duration;
 
 mod cure_tests;
+mod successor_tests;
 
 fn non_zero(value: u64) -> NonZeroU64 {
     match NonZeroU64::new(value) {
@@ -469,10 +470,10 @@ fn retired_receipt_keeps_absent_canonical_state() {
     install(&mut model, &fixture, 1);
     let nonce = begin_remove(&mut model, &fixture);
     model
-        .prove_drain_leases(&nonce, 0, Timestamp::new(400))
+        .prove_drain_leases(&nonce, 0, Timestamp::new(399))
         .unwrap_or_else(|_| panic!("zero leases should be provable"));
     let receipt = model
-        .complete(&nonce, None, None, true, Timestamp::new(420))
+        .complete(&nonce, None, None, true, Timestamp::new(399))
         .unwrap_or_else(|_| panic!("zero-lease removal should commit"));
     assert_eq!(receipt.outcome(), ReceiptOutcome::Retired);
     assert!(
@@ -597,7 +598,7 @@ fn quota_collection_is_atomic_when_tombstone_capacity_is_short() {
     install(&mut model, &fixture, 1);
     let update_nonce = begin_update(&mut model, &fixture);
     model
-        .prove_drain_leases(&update_nonce, 0, Timestamp::new(200))
+        .prove_drain_leases(&update_nonce, 0, Timestamp::new(199))
         .unwrap_or_else(|_| panic!("zero leases should be provable"));
     model
         .complete(
@@ -605,7 +606,7 @@ fn quota_collection_is_atomic_when_tombstone_capacity_is_short() {
             Some(&validated_artifact(13)),
             None,
             true,
-            Timestamp::new(220),
+            Timestamp::new(199),
         )
         .unwrap_or_else(|_| panic!("update should commit"));
     let before = model.occupancy();

@@ -311,21 +311,26 @@ impl RecoveryEvidence {
     }
 
     /// Constructs recovery evidence from independently read state/runtime values.
-    #[must_use]
-    pub const fn new(
+    pub fn new(
         token: RecoveryToken,
         observed_state: StateDigest,
         runtime_generation: NonZeroU64,
         activation_receipt: Option<Blake3Digest>,
         zero_leases_proved: bool,
-    ) -> Self {
-        Self {
+    ) -> PackageServiceResult<Self> {
+        if token.into_bytes() == [0; 32] {
+            return Err(PackageServiceError::InvalidValue("recovery token"));
+        }
+        if activation_receipt.is_some_and(|receipt| receipt.as_bytes() == &[0; 32]) {
+            return Err(PackageServiceError::InvalidValue("activation receipt"));
+        }
+        Ok(Self {
             token,
             observed_state,
             runtime_generation,
             activation_receipt,
             zero_leases_proved,
-        }
+        })
     }
 }
 
@@ -466,6 +471,10 @@ impl OperationJournalRecord {
 
     pub(crate) fn set_drain_base_state(&mut self, state: CanonicalInstalledState) {
         self.drain_base_state = Some(state);
+    }
+
+    pub(crate) const fn drain_base_state(&self) -> Option<&CanonicalInstalledState> {
+        self.drain_base_state.as_ref()
     }
 
     pub(crate) fn take_drain_base_state(&mut self) -> Option<CanonicalInstalledState> {

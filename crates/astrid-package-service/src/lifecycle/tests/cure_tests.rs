@@ -1,14 +1,22 @@
 use super::*;
+use crate::journal::RecoveryEvidence;
 
 fn recovery_evidence(
     token: RecoveryToken,
     observed: StateDigest,
     generation: u64,
 ) -> RecoveryEvidence {
-    RecoveryEvidence::new(token, observed, non_zero(generation), None, false)
+    match RecoveryEvidence::new(token, observed, non_zero(generation), None, false) {
+        Ok(value) => value,
+        Err(error) => panic!("test recovery evidence is valid: {error:?}"),
+    }
 }
 
-fn begin_activation(model: &mut PackageServiceModel, fixture: &Fixture, nonce_byte: u8) -> Nonce {
+pub(super) fn begin_activation(
+    model: &mut PackageServiceModel,
+    fixture: &Fixture,
+    nonce_byte: u8,
+) -> Nonce {
     let state = model
         .slot_record(&fixture.slot(fixture.owner))
         .and_then(|record| record.state().map(CanonicalInstalledState::digest))
@@ -81,14 +89,15 @@ fn mid_drain_recovery_does_not_infer_update_success() {
     let old_evidence = recovery_evidence(token, prior.digest(), 1);
     model
         .recover(&nonce, &old_evidence, Timestamp::new(200))
-        .unwrap_or_else(|_| panic!("exact old-state evidence should resolve"));
+        .unwrap_or_else(|error| panic!("exact old-state evidence should resolve: {error:?}"));
     let restored = model
         .slot_record(&fixture.slot(fixture.owner))
         .and_then(|record| record.state())
         .cloned()
         .unwrap_or_else(|| panic!("restored state should exist"));
     assert_eq!(restored.lifecycle_state(), &LifecycleState::Inactive,);
-    assert!(restored.generation_value().get() > prior.generation_value().get());
+    assert_eq!(restored.generation_value().get(), 3);
+    assert_eq!(restored.completing_nonce(), nonce);
 }
 
 #[test]
@@ -105,13 +114,17 @@ fn recovery_rejects_a_token_mismatch() {
     model
         .mark_unknown(&nonce, Timestamp::new(180))
         .unwrap_or_else(|_| panic!("unknown boundary should be recorded"));
-    let evidence = RecoveryEvidence::new(
-        RecoveryToken::from_bytes([0; 32]),
-        prior.digest(),
-        non_zero(1),
-        None,
-        false,
+    assert!(
+        RecoveryEvidence::new(
+            RecoveryToken::from_bytes([0; 32]),
+            prior.digest(),
+            non_zero(1),
+            None,
+            false,
+        )
+        .is_err()
     );
+    let evidence = recovery_evidence(RecoveryToken::from_bytes([8; 32]), prior.digest(), 1);
     let error = model
         .recover(&nonce, &evidence, Timestamp::new(190))
         .err()
@@ -152,25 +165,39 @@ fn recovery_accepts_structurally_proven_new_update_state() {
         non_zero(3),
     )
     .unwrap_or_else(|_| panic!("new update state should construct"));
-    model
-        .slots
-        .get_mut(&slot)
-        .unwrap_or_else(|| panic!("owner slot should remain"))
-        .replace_state(Some(new_state.clone()));
     let token = model
         .slot_record(&slot)
         .and_then(|record| record.journal_record(&nonce))
         .map(OperationJournalRecord::recovery_token)
         .unwrap_or_else(|| panic!("recovery token should remain"));
-    let evidence = RecoveryEvidence::new(
+    let evidence = match RecoveryEvidence::new(
         token,
         new_state.digest(),
         new_state.generation_value(),
         None,
         true,
-    );
+    ) {
+        Ok(value) => value,
+        Err(error) => panic!("new-state recovery evidence is valid: {error:?}"),
+    };
+    let state_before_recovery = model
+        .slot_record(&slot)
+        .and_then(|record| record.state())
+        .cloned()
+        .unwrap_or_else(|| panic!("draining state should remain"));
+    for now in [200, 201] {
+        let error = model
+            .recover_observed(&nonce, &evidence, Some(&new_state), Timestamp::new(now))
+            .err()
+            .unwrap_or_else(|| panic!("late replacement recovery must fail"));
+        assert!(matches!(error, PackageServiceError::AuthorityExpired));
+        assert_eq!(
+            model.slot_record(&slot).and_then(|record| record.state()),
+            Some(&state_before_recovery)
+        );
+    }
     let receipt = model
-        .recover(&nonce, &evidence, Timestamp::new(200))
+        .recover_observed(&nonce, &evidence, Some(&new_state), Timestamp::new(199))
         .unwrap_or_else(|_| panic!("structural new-state proof should recover"))
         .unwrap_or_else(|| panic!("new-state proof should produce a receipt"));
     assert_eq!(receipt.outcome(), ReceiptOutcome::Updated);
@@ -191,15 +218,29 @@ fn active_drain_abort_and_expiry_restore_inactive_content() {
         .unwrap_or_else(|| panic!("active state should exist"));
 
     let update_nonce = begin_update(&mut model, &fixture);
+    let recovery_token = model
+        .slot_record(&fixture.slot(fixture.owner))
+        .and_then(|record| record.journal_record(&update_nonce))
+        .map(OperationJournalRecord::recovery_token)
+        .unwrap_or_else(|| panic!("recovery record should exist"));
     model
         .expire_drain(&update_nonce, Timestamp::new(250), false)
         .unwrap_or_else(|_| panic!("drain expiry should be observable"));
+    assert!(matches!(
+        model
+            .slot_record(&fixture.slot(fixture.owner))
+            .and_then(|record| record.state())
+            .map(CanonicalInstalledState::lifecycle_state),
+        Some(LifecycleState::Draining { live_leases: 1, .. })
+    ));
+    let blocked_evidence = recovery_evidence(
+        recovery_token,
+        active_before.digest(),
+        active_before.generation_value().get(),
+    );
     model
-        .prove_drain_leases(&update_nonce, 0, Timestamp::new(260))
-        .unwrap_or_else(|_| panic!("zero leases should become provable"));
-    model
-        .expire_drain(&update_nonce, Timestamp::new(270), true)
-        .unwrap_or_else(|_| panic!("proved drain should restore safely"));
+        .recover(&update_nonce, &blocked_evidence, Timestamp::new(260))
+        .unwrap_or_else(|error| panic!("blocked drain should recover old content: {error:?}"));
     let expired = model
         .slot_record(&fixture.slot(fixture.owner))
         .and_then(|record| record.state())
@@ -286,7 +327,7 @@ fn repeated_updates_monotonically_bump_package_generation() {
 
     let first = begin_update(&mut model, &fixture);
     model
-        .prove_drain_leases(&first, 0, Timestamp::new(200))
+        .prove_drain_leases(&first, 0, Timestamp::new(199))
         .unwrap_or_else(|_| panic!("first drain should complete"));
     model
         .complete(
@@ -294,7 +335,7 @@ fn repeated_updates_monotonically_bump_package_generation() {
             Some(&validated_artifact(13)),
             None,
             true,
-            Timestamp::new(220),
+            Timestamp::new(199),
         )
         .unwrap_or_else(|_| panic!("first update should commit"));
     let first_generation = model
