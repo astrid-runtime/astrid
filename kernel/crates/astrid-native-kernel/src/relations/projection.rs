@@ -434,18 +434,31 @@ impl ProjectionStore {
 
             // A batch is one projection-local epoch even when it contains many
             // full-row changes; every change still participates in the replay.
+            // Replays order deletes before upserts within the epoch, matching
+            // the authoritative staged mutation order, so a later DELETE still
+            // funds an earlier UPSERT at the fixed row ceiling.
             let batch_epoch = delta.epoch();
-            while delta_index < deltas.len() {
-                let Some(batch_delta) = deltas[delta_index] else {
-                    delta_index += 1;
-                    continue;
-                };
-                if batch_delta.epoch() != batch_epoch {
-                    break;
+            let mut batch_end = delta_index;
+            while batch_end < deltas.len() {
+                match deltas[batch_end] {
+                    Some(batch_delta) if batch_delta.epoch() == batch_epoch => batch_end += 1,
+                    Some(_) => break,
+                    None => batch_end += 1,
                 }
-                apply_to_rows(&mut rows, &mut len, batch_delta.change());
-                delta_index += 1;
             }
+            for replay_deletes in [true, false] {
+                let mut scan = delta_index;
+                while scan < batch_end {
+                    if let Some(batch_delta) = deltas[scan] {
+                        let is_delete = matches!(batch_delta.change(), RelationChange::Delete(_));
+                        if is_delete == replay_deletes {
+                            apply_to_rows(&mut rows, &mut len, batch_delta.change());
+                        }
+                    }
+                    scan += 1;
+                }
+            }
+            delta_index = batch_end;
         }
         if expected_epoch != reader.epoch {
             return Err(ProjectionError::ResnapshotRequired);

@@ -527,6 +527,49 @@ fn batch_delete_makes_room_for_a_new_key_at_capacity() {
     );
 }
 
+#[test]
+fn batch_upsert_then_delete_at_capacity_folds_in_authoritative_order() {
+    let mut store = store();
+    let lease = reader(&mut store, 0, 1);
+    for value in 1..=MAX_RELATION_ROWS as u64 {
+        apply_one(&mut store, lease, holds_relation(lease, 1, 3, value));
+    }
+    let (base, cursor) = fold_base(&mut store, lease);
+
+    let retained = holds_relation(lease, 1, 3, 1);
+    let inserted = holds_relation(lease, 1, 4, MAX_RELATION_ROWS as u64 + 1);
+    let mut batch = AuthoritativeBatch::empty();
+    batch
+        .push(RelationMutation::new(
+            lease,
+            RelationChange::Upsert(inserted),
+        ))
+        .unwrap();
+    batch
+        .push(RelationMutation::new(
+            lease,
+            RelationChange::Delete(retained.key()),
+        ))
+        .unwrap();
+    assert_eq!(store.apply(batch).unwrap(), 2);
+
+    let direct = store.snapshot(lease).unwrap();
+    let replayed = store.fold(lease, base, cursor).unwrap();
+    assert_eq!(replayed, direct);
+    assert_eq!(replayed.len(), MAX_RELATION_ROWS);
+    assert!(
+        replayed
+            .rows()
+            .any(|relation| relation.key() == inserted.key())
+    );
+    assert!(
+        !replayed
+            .rows()
+            .any(|relation| relation.key() == retained.key())
+    );
+    assert_canonical(&replayed);
+}
+
 fn apply_one_or_error(
     store: &mut ProjectionStore,
     lease: ReaderLease,
