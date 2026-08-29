@@ -387,7 +387,12 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                         token: token.clone(),
                     },
                 });
-        let branch_child = match launch_process_provider(&branch_launch).await {
+        let branch_child = match launch_process_provider(
+            &branch_launch,
+            process_launch::ProcessLaunchStage::Branch,
+        )
+        .await
+        {
             Ok(child) => child,
             Err(error) => {
                 let cleanup_state = ProjectionCleanupState {
@@ -452,7 +457,12 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                 return Err(error.message);
             },
         };
-        let owner_child = match launch_process_provider(&owner_launch).await {
+        let owner_child = match launch_process_provider(
+            &owner_launch,
+            process_launch::ProcessLaunchStage::OwnerHome,
+        )
+        .await
+        {
             Ok(child) => child,
             Err(error) => {
                 let cleanup_state = ProjectionCleanupState {
@@ -518,7 +528,12 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             },
         };
         let mut shared_child = if let Some(shared_launch) = shared_launch.clone() {
-            match launch_process_provider(&shared_launch).await {
+            match launch_process_provider(
+                &shared_launch,
+                process_launch::ProcessLaunchStage::FleetShared,
+            )
+            .await
+            {
                 Ok(child) => Some((child, shared_launch)),
                 Err(error) => {
                     let cleanup_state = ProjectionCleanupState {

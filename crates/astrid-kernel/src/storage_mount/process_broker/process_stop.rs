@@ -28,13 +28,10 @@ pub(super) async fn stop_process_provider(
     if !reap_child(child).await {
         return false;
     }
-    if protocol_ok {
-        return true;
-    }
-    // A crashed child can leave a stale or absent control endpoint. Treat
-    // that as stopped only after the process has been reaped and the
-    // endpoint is confirmed dead; a live endpoint still owning the key
-    // remains wedged.
+    // Reaping is not ownership release. A provider can acknowledge STOP,
+    // exit, and still leave a replacement or inherited listener at the
+    // control endpoint. Probe after every STOP/reap outcome so only a dead
+    // endpoint can clear the projection key.
     match local_transport::connect_outcome(&control_path).await {
         Ok(ConnectOutcome::Absent | ConnectOutcome::Stale) => true,
         Ok(ConnectOutcome::Connected(stream)) => {
@@ -104,6 +101,10 @@ async fn reap_child(child: &mut tokio::process::Child) -> bool {
 #[cfg(test)]
 mod tests {
     use super::stop_process_provider;
+    use astrid_core::local_transport;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::sync::Notify;
 
     fn spawn_exited_child() -> tokio::process::Child {
         #[cfg(unix)]
@@ -143,5 +144,36 @@ mod tests {
             stop_process_provider(&mut child, path, "unused-token".to_owned()).await,
             "reaped child with a stale control endpoint must not wedge the projection key"
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_stop_with_live_endpoint_is_retained_after_child_reap() {
+        let mut child = spawn_exited_child();
+        let directory = tempfile::tempdir().expect("temporary control dir");
+        let path = directory.path().join("still-live.sock");
+        let listener = local_transport::bind(&path).expect("bind live control endpoint");
+        let release = Arc::new(Notify::new());
+        let responder = tokio::spawn({
+            let release = Arc::clone(&release);
+            async move {
+                let mut stream = local_transport::accept(&listener)
+                    .await
+                    .expect("accept authenticated stop request");
+                stream
+                    .write_all(b"{\"status\":\"stopped\"}\n")
+                    .await
+                    .expect("write canonical stop acknowledgement");
+                let _ = stream.read_u8().await;
+                release.notified().await;
+            }
+        });
+
+        assert!(
+            !stop_process_provider(&mut child, path, "unused-token".to_owned()).await,
+            "a canonical STOP followed by reap must not release a live endpoint"
+        );
+        release.notify_waiters();
+        responder.await.expect("live endpoint responder");
     }
 }

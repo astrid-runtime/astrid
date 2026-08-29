@@ -19,18 +19,53 @@ type SpawnedProcessProvider = (
     Option<tokio::task::JoinHandle<Vec<u8>>>,
 );
 
+/// The deterministic provider startup stage represented by one launch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProcessLaunchStage {
+    Branch,
+    OwnerHome,
+    FleetShared,
+}
+
+impl ProcessLaunchStage {
+    #[cfg(all(test, any(unix, windows)))]
+    pub(crate) const fn as_u8(self) -> u8 {
+        match self {
+            Self::Branch => 1,
+            Self::OwnerHome => 2,
+            Self::FleetShared => 3,
+        }
+    }
+}
+
 #[cfg(all(test, any(unix, windows)))]
-static INJECTED_LAUNCH_FAILURE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static INJECTED_LAUNCH_FAILURE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 #[cfg(all(test, any(unix, windows)))]
 static INJECTED_LAUNCH_FAILURE_TEST_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(all(test, any(unix, windows)))]
-pub(crate) fn arm_launch_failure(test_id: u64) {
-    INJECTED_LAUNCH_FAILURE.store(true, std::sync::atomic::Ordering::Release);
+pub(crate) fn arm_launch_failure(stage: ProcessLaunchStage, test_id: u64) {
+    INJECTED_LAUNCH_FAILURE.store(stage.as_u8(), std::sync::atomic::Ordering::Release);
     INJECTED_LAUNCH_FAILURE_TEST_ID.store(test_id, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) fn launch_failure_matches(stage: ProcessLaunchStage, current_test_id: u64) -> bool {
+    current_test_id == INJECTED_LAUNCH_FAILURE_TEST_ID.load(std::sync::atomic::Ordering::Acquire)
+        && INJECTED_LAUNCH_FAILURE
+            .compare_exchange(
+                stage.as_u8(),
+                0,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        && {
+            INJECTED_LAUNCH_FAILURE_TEST_ID.store(0, std::sync::atomic::Ordering::Release);
+            true
+        }
 }
 
 pub(crate) fn platform_process_provider_name() -> &'static str {
@@ -159,20 +194,17 @@ async fn send_process_provider_payload(
 
 pub(super) async fn launch_process_provider(
     launch: &StorageProviderServiceLaunchV1,
+    stage: ProcessLaunchStage,
 ) -> Result<tokio::process::Child, ProcessProviderLaunchError> {
+    #[cfg(not(all(test, any(unix, windows))))]
+    let _ = stage;
+
     #[cfg(all(test, any(unix, windows)))]
     {
         let current_test_id = super::PROCESS_MOUNT_TEST_ID
             .try_with(|test_id| *test_id)
             .unwrap_or_default();
-        if current_test_id
-            == INJECTED_LAUNCH_FAILURE_TEST_ID.load(std::sync::atomic::Ordering::Acquire)
-            && INJECTED_LAUNCH_FAILURE.swap(false, std::sync::atomic::Ordering::AcqRel)
-            && {
-                INJECTED_LAUNCH_FAILURE_TEST_ID.store(0, std::sync::atomic::Ordering::Release);
-                true
-            }
-        {
+        if launch_failure_matches(stage, current_test_id) {
             return Err(ProcessProviderLaunchError {
                 message: "injected post-publication launch failure".to_owned(),
                 cleanup_ok: true,
