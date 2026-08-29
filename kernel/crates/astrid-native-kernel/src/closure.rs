@@ -44,6 +44,7 @@ pub const RAMDISK_BUNDLE_LEN: usize =
     HANDOFF_LEN + TABLE_LEN + MANIFEST_LEN + EMULATOR_COMPONENT_LEN;
 
 const _: () = assert!(EMULATOR_COMPONENT_LEN == FIXTURE_COMPONENT_LEN);
+const _: () = assert!(EMULATOR_COMPONENT_LEN == 479);
 
 /// Emulator fixture root public key corresponding to the explicit root seed
 /// in `tools/kimage/fixtures/root.key.hex`. The envelope's root-key field is

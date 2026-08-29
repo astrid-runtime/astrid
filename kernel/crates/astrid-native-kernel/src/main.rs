@@ -24,6 +24,7 @@ mod domains;
 mod entropy;
 mod gdt;
 mod interrupts;
+mod ipc;
 mod memory;
 mod serial;
 mod tests;

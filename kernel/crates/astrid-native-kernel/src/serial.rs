@@ -361,6 +361,36 @@ pub fn ev_domain_harness(pass: bool) {
     emit(format_args!("\"ev\":\"domain.harness\",\"outcome\":{pass}"));
 }
 
+pub fn ev_ipc_op(id: u64, generation: u64, operation: &str, status: &str) {
+    emit(format_args!(
+        "\"ev\":\"ipc.op\",\"id\":{id},\"generation\":{generation},\"op\":\"{operation}\",\"status\":\"{status}\""
+    ));
+}
+
+pub fn ev_ipc_park(id: u64, generation: u64) {
+    emit(format_args!(
+        "\"ev\":\"ipc.park\",\"id\":{id},\"generation\":{generation}"
+    ));
+}
+
+pub fn ev_ipc_resume(id: u64, generation: u64) {
+    emit(format_args!(
+        "\"ev\":\"ipc.resume\",\"id\":{id},\"generation\":{generation}"
+    ));
+}
+
+pub fn ev_ipc_wake(id: u64, generation: u64, status: &str) {
+    emit(format_args!(
+        "\"ev\":\"ipc.wake\",\"id\":{id},\"generation\":{generation},\"status\":\"{status}\""
+    ));
+}
+
+pub fn ev_ipc_reclaim(id: u64, generation: u64, endpoints: u64, capabilities: u64, queued: u64) {
+    emit(format_args!(
+        "\"ev\":\"ipc.reclaim\",\"id\":{id},\"generation\":{generation},\"endpoints\":{endpoints},\"capabilities\":{capabilities},\"queued\":{queued}"
+    ));
+}
+
 pub fn ev_halt(ok: bool) {
     let outcome = if ok { "ok" } else { "fault" };
     emit(format_args!("\"ev\":\"halt\",\"outcome\":\"{outcome}\""));

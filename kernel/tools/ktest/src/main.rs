@@ -17,8 +17,14 @@ use astrid_native_closure::{
     LoaderIdentity, LoaderMeasurement, MeasuredIdentity, PolicyGeneration, RootVerifier, TABLE_LEN,
     TrustedPolicy, verify_policy_handoff, verify_table,
 };
-use astrid_system_generation::MANIFEST_LEN;
-use astrid_system_generation::emulator_fixture::emulator_component;
+use astrid_system_generation::emulator_fixture::{
+    EMULATOR_CLOSURE_ROOT, EMULATOR_GENERATION_FLOOR, EMULATOR_MANIFEST_SIZES,
+    EMULATOR_NOW_UNIX_SECONDS, EMULATOR_OBJECT_ROOT, EMULATOR_PLAN_DIGEST, emulator_component,
+    emulator_components,
+};
+use astrid_system_generation::{
+    ContentId, Generation, MANIFEST_LEN, TrustedInput, TrustedInputData, verify_manifest,
+};
 use bootloader_api::info::LoaderHandoffVerification;
 use ktest::determinism::{Determinism, compare_images};
 use ktest::events::{
@@ -33,7 +39,10 @@ fn main() -> Result<()> {
     let root = workspace_root()?;
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
 
-    let kernel_target = root.join("target");
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("target"));
+    let kernel_target = target_dir.clone();
     println!("== building astrid-native-kernel (x86_64-unknown-none, release) ==");
     run_inherited(
         Command::new(&cargo)
@@ -57,7 +66,7 @@ fn main() -> Result<()> {
         bail!("kernel ELF not found at {}", kernel_elf.display());
     }
 
-    let out_dir = root.join("target/kimage");
+    let out_dir = target_dir.join("kimage");
     std::fs::create_dir_all(&out_dir).context("creating kimage output dir")?;
     let image_a = out_dir.join("astrid-native-kernel-a.img");
     let image_b = out_dir.join("astrid-native-kernel-b.img");
@@ -188,6 +197,7 @@ const EMULATOR_ROOT_VERIFY_KEY: [u8; 32] = [
     237, 73, 40, 198, 40, 209, 194, 198, 234, 233, 3, 56, 144, 89, 149, 97, 41, 89, 39, 58, 92, 99,
     249, 54, 54, 193, 70, 20, 172, 135, 55, 209,
 ];
+const _: () = assert!(EMULATOR_COMPONENT_LEN == 479);
 const LOADER_MEASUREMENT_DOMAIN: &[u8] = b"astrid.kimage.loader.measurement.v1";
 const LOADER_IDENTITY_DOMAIN: &[u8] = b"astrid.kimage.loader.identity.v1";
 const BOOT_CONTEXT_DOMAIN: &[u8] = b"astrid.boot.q35.uefi.tcg.v1";
@@ -257,6 +267,36 @@ fn loader_identities(
     }
     if component_bytes != emulator_component() {
         bail!("authenticated component bytes do not match the canonical fixture");
+    }
+    let component_identity = ContentId::from_payload(component_bytes);
+    if emulator_components().digest(0) != Some(component_identity) {
+        bail!("canonical component identity does not match changed bytes");
+    }
+    let trusted = TrustedInput::try_new(TrustedInputData {
+        signer: policy_handoff.sysgen_verify(),
+        kernel_identity: ContentId::try_from_bytes(kernel_id.as_bytes()).map_err(|err| {
+            anyhow::anyhow!("kernel content identity is invalid: {}", err.as_reason())
+        })?,
+        plan_digest: ContentId::try_from_bytes(EMULATOR_PLAN_DIGEST)
+            .map_err(|err| anyhow::anyhow!("plan fixture is invalid: {}", err.as_reason()))?,
+        components: emulator_components(),
+        object_root: ContentId::try_from_bytes(EMULATOR_OBJECT_ROOT)
+            .map_err(|err| anyhow::anyhow!("object fixture is invalid: {}", err.as_reason()))?,
+        closure_root: ContentId::try_from_bytes(EMULATOR_CLOSURE_ROOT)
+            .map_err(|err| anyhow::anyhow!("closure fixture is invalid: {}", err.as_reason()))?,
+        generation_floor: Generation::new(EMULATOR_GENERATION_FLOOR),
+        now_unix_seconds: EMULATOR_NOW_UNIX_SECONDS,
+        sizes: EMULATOR_MANIFEST_SIZES,
+    })
+    .map_err(|err| anyhow::anyhow!("trusted descriptor input rejected: {}", err.as_reason()))?;
+    let verified = verify_manifest(descriptor_bytes, &trusted)
+        .map_err(|err| anyhow::anyhow!("canonical descriptor rejected: {}", err.as_reason()))?;
+    if verified.manifest().components() != emulator_components()
+        || verified.manifest().closure_root()
+            != ContentId::try_from_bytes(EMULATOR_CLOSURE_ROOT)
+                .map_err(|err| anyhow::anyhow!("closure fixture is invalid: {}", err.as_reason()))?
+    {
+        bail!("verified descriptor does not bind the recomputed fixture identities");
     }
     let receipt = loader_receipt(&bytes_a, &handoff, kernel_id, closure_table);
     pre_relocation_hostile_checks(&bytes_a, &elf, &expected, &policy)?;

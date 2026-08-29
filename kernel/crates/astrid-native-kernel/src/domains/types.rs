@@ -202,6 +202,10 @@ pub(crate) enum Scenario {
     // Keep the established fixture scenario values stable while adding the
     // second deliberate fault path.
     InvalidInstruction = 5,
+    IpcServer = 6,
+    IpcClient = 7,
+    IpcPeerFault = 8,
+    IpcCancelServer = 9,
 }
 
 impl Scenario {
@@ -238,6 +242,18 @@ pub(super) struct DomainId(pub(super) u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct DomainGeneration(pub(super) u64);
+
+impl DomainId {
+    pub(super) const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+impl DomainGeneration {
+    pub(super) const fn value(self) -> u64 {
+        self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct DomainHandle {

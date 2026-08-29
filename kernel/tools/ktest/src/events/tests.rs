@@ -120,6 +120,116 @@ fn emit_cancel(serial: Emit<'_>, id: u64, generation: u64) {
     ));
 }
 
+fn emit_ipc_op(serial: Emit<'_>, id: u64, generation: u64, op: &str, status: &str) {
+    serial(format!(
+        "\"ev\":\"ipc.op\",\"id\":{id},\"generation\":{generation},\"op\":\"{op}\",\"status\":\"{status}\""
+    ));
+}
+
+fn emit_ipc_park(serial: Emit<'_>, id: u64, generation: u64) {
+    emit_ipc_op(serial, id, generation, "endpoint_create", "ok");
+    serial(format!(
+        "\"ev\":\"ipc.park\",\"id\":{id},\"generation\":{generation}"
+    ));
+}
+
+fn emit_ipc_reclaim(serial: Emit<'_>, id: u64, generation: u64, capabilities: u64) {
+    serial(format!(
+        "\"ev\":\"ipc.reclaim\",\"id\":{id},\"generation\":{generation},\
+            \"endpoints\":0,\"capabilities\":{capabilities},\"queued\":0"
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_ipc_terminal(
+    serial: Emit<'_>,
+    id: u64,
+    generation: u64,
+    kind: &str,
+    vector: u64,
+    address: &str,
+    capabilities: u64,
+) {
+    serial(format!(
+        "\"ev\":\"domain.registers\",\"id\":{id},\"generation\":{generation},\"cpl\":3,\
+            \"rax\":0,\"rbx\":0,\"rcx\":0,\"rdx\":0,\"rsi\":0,\"rdi\":0,\"rbp\":0,\
+            \"r8\":0,\"r9\":0,\"r10\":0,\"r11\":0,\"r12\":0,\"r13\":0,\"r14\":0,\"r15\":0,\
+            \"rsp\":\"0x1000\""
+    ));
+    let error_code = if vector == 14 { 6 } else { 0 };
+    serial(format!(
+        "\"ev\":\"domain.outcome\",\"id\":{id},\"generation\":{generation},\"kind\":\"{kind}\",\
+            \"vector\":{vector},\"error_code\":{error_code},\
+            \"fault_address\":\"{address}\",\"rip\":\"0x10\",\"cpl\":3"
+    ));
+    emit_ipc_reclaim(serial, id, generation, capabilities);
+    serial(format!(
+        "\"ev\":\"domain.restore\",\"id\":{id},\"generation\":{generation},\
+            \"ok\":true,\"root\":\"0x101000\",\"flags\":0"
+    ));
+    serial(format!(
+        "\"ev\":\"domain.reclaim\",\"id\":{id},\"generation\":{generation},\"expected\":16,\"freed\":16,\"swept\":16,\"blocked\":0"
+    ));
+}
+
+fn emit_ipc_server_resume(serial: Emit<'_>, id: u64, generation: u64) {
+    serial(format!(
+        "\"ev\":\"ipc.wake\",\"id\":{id},\"generation\":{generation},\"status\":\"received\""
+    ));
+    serial(format!(
+        "\"ev\":\"ipc.resume\",\"id\":{id},\"generation\":{generation}"
+    ));
+    emit_ipc_op(serial, id, generation, "send", "ok");
+    emit_ipc_terminal(serial, id, generation, "clean_exit", 3, "0x0", 1);
+}
+
+fn emit_ipc_client_resume(serial: Emit<'_>, id: u64, generation: u64) {
+    serial(format!(
+        "\"ev\":\"ipc.wake\",\"id\":{id},\"generation\":{generation},\"status\":\"sent\""
+    ));
+    serial(format!(
+        "\"ev\":\"ipc.resume\",\"id\":{id},\"generation\":{generation}"
+    ));
+    for (op, status) in [
+        ("send", "malformed"),
+        ("send", "stale"),
+        ("endpoint_create", "no_space"),
+        ("cap_revoke", "ok"),
+        ("send", "stale"),
+        ("send", "stale"),
+        ("send", "stale"),
+        ("recv", "stale"),
+    ] {
+        emit_ipc_op(serial, id, generation, op, status);
+    }
+    emit_ipc_terminal(serial, id, generation, "clean_exit", 3, "0x0", 0);
+}
+
+fn emit_ipc_cancel(serial: Emit<'_>, id: u64, generation: u64) {
+    serial(format!(
+        "\"ev\":\"domain.cancel.request\",\"id\":{id},\"generation\":{generation}"
+    ));
+    serial(format!(
+        "\"ev\":\"ipc.wake\",\"id\":{id},\"generation\":{generation},\"status\":\"cancelled\""
+    ));
+    serial(format!(
+        "\"ev\":\"ipc.reclaim\",\"id\":{id},\"generation\":{generation},\"capabilities\":1,\"endpoints\":1,\"queued\":0"
+    ));
+    serial(format!(
+        "\"ev\":\"domain.restore\",\"id\":{id},\"generation\":{generation},\"ok\":true,\"root\":\"0x101000\",\"flags\":0"
+    ));
+    serial(format!(
+        "\"ev\":\"domain.reclaim\",\"id\":{id},\"generation\":{generation},\"expected\":16,\"freed\":16,\"swept\":16,\"blocked\":0"
+    ));
+    serial(format!(
+        "\"ev\":\"domain.cancelled\",\"id\":{id},\"generation\":{generation}"
+    ));
+    serial(format!(
+        "\"ev\":\"domain.outcome\",\"id\":{id},\"generation\":{generation},\"kind\":\"cancelled\",\
+            \"vector\":0,\"error_code\":0,\"fault_address\":\"0x0\",\"rip\":\"0x0\",\"cpl\":0"
+    ));
+}
+
 fn passing_serial_with(kernel: &str, sysgen: &str, kfloor: u64, sfloor: u64) -> String {
     let mut seq = 0u64;
     let mut out = String::new();
@@ -231,6 +341,44 @@ fn passing_serial_with(kernel: &str, sysgen: &str, kfloor: u64, sfloor: u64) -> 
     emit_start(&mut ev, 1, 6, 0);
     emit_context(&mut ev, 1, 6, 0);
     emit_terminal(&mut ev, 1, 6, 0, "clean_exit", 3, "0x0", false);
+
+    emit_prepare(&mut ev, 1, 7, 6);
+    emit_start(&mut ev, 1, 7, 6);
+    emit_context(&mut ev, 1, 7, 0);
+    emit_ipc_park(&mut ev, 1, 7);
+    emit_prepare(&mut ev, 2, 3, 7);
+    emit_start(&mut ev, 2, 3, 7);
+    emit_context(&mut ev, 2, 3, 0);
+    emit_ipc_op(&mut ev, 2, 3, "send", "ok");
+    ev(format!("\"ev\":\"ipc.park\",\"id\":2,\"generation\":3"));
+    emit_ipc_server_resume(&mut ev, 1, 7);
+    emit_ipc_client_resume(&mut ev, 2, 3);
+    emit_pass(&mut ev, super::DOMAIN_REQUIRED_PASSES[8]);
+
+    emit_prepare(&mut ev, 1, 8, 6);
+    emit_start(&mut ev, 1, 8, 6);
+    emit_context(&mut ev, 1, 8, 0);
+    emit_ipc_park(&mut ev, 1, 8);
+    emit_prepare(&mut ev, 2, 4, 8);
+    emit_start(&mut ev, 2, 4, 8);
+    emit_context(&mut ev, 2, 4, 0);
+    emit_ipc_terminal(
+        &mut ev,
+        2,
+        4,
+        "page_fault",
+        14,
+        super::HOSTILE_IPC_FAULT_ADDRESS,
+        1,
+    );
+    emit_pass(&mut ev, super::DOMAIN_REQUIRED_PASSES[9]);
+
+    emit_prepare(&mut ev, 2, 5, 9);
+    emit_start(&mut ev, 2, 5, 9);
+    emit_context(&mut ev, 2, 5, 0);
+    emit_ipc_park(&mut ev, 2, 5);
+    emit_ipc_cancel(&mut ev, 2, 5);
+    emit_pass(&mut ev, super::DOMAIN_REQUIRED_PASSES[10]);
     emit_pass(&mut ev, super::CLEAN_RESTART_GATE);
     ev("\"ev\":\"domain.harness\",\"outcome\":true".into());
     ev("\"ev\":\"halt\",\"outcome\":\"ok\"".into());

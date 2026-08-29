@@ -47,6 +47,7 @@ pub struct TrapFrame {
 const VECTOR_BREAKPOINT: u8 = 3;
 const VECTOR_PAGE_FAULT: u8 = 14;
 pub const VECTOR_TIMER: u8 = 32;
+pub const VECTOR_IPC: u8 = 112;
 pub const VECTOR_SPURIOUS: u8 = 255;
 
 /// The one Rust trap handler. Mutations to `frame.rip` take effect on `iretq`.
@@ -92,7 +93,7 @@ fn handle_timer() {
 }
 
 fn handle_page_fault(f: &mut TrapFrame) {
-    serial::ev_fault(VECTOR_PAGE_FAULT, f.error_code, f.rip);
+    serial::ev_fault(VECTOR_PAGE_FAULT, Cr2::read_raw(), f.rip);
     if EXPECT_FAULT.swap(false, Ordering::SeqCst) {
         f.rip = RECOVERY_RIP.load(Ordering::SeqCst);
         return;
@@ -196,4 +197,5 @@ isr_noerr!(isr_28, 28);
 isr_err!(isr_29, 29);
 isr_err!(isr_30, 30);
 isr_noerr!(isr_32, 32);
+isr_noerr!(isr_112, 112);
 isr_noerr!(isr_255, 255);
