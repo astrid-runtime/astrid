@@ -4,16 +4,21 @@ use std::sync::Arc;
 use astrid_capsule::context::ProcessStorageMountBroker as _;
 use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
-use astrid_core::storage_provider::StorageProviderViewV1;
 use astrid_storage::StateOwner;
 
 use super::{
-    KernelProcessStorageMountBroker, MountAdmission, MountOwnerScope, PROCESS_MOUNT_TEST_ID,
-    ParentTokenSlot, ProcessProjectionBinding, ProcessProjectionTargetSet, ProjectionGeneration,
-    arm_parent_token_failure, issue_lease, platform_process_provider_name,
-    retain_failed_launch_projection, retry_failed_projection, rollback_or_retain_failed_launch,
+    KernelProcessStorageMountBroker, PROCESS_MOUNT_TEST_ID, ParentTokenSlot,
+    ProcessProjectionBinding, ProcessProjectionTargetSet, ProjectionGeneration,
+    arm_parent_token_failure, retain_failed_launch_projection, retry_failed_projection,
+    rollback_or_retain_failed_launch,
 };
-use super::{abort_process_provider, arm_launch_failure, process_launch::ProcessLaunchStage};
+use super::{
+    abort_process_provider, arm_launch_cleanup_failure, arm_launch_failure,
+    process_launch::{
+        ProcessLaunchStage, published_provider_leases, release_launch_cleanup_failure,
+        spawned_provider_pids,
+    },
+};
 
 fn binding(actor: astrid_core::PrincipalUid) -> ProcessProjectionBinding {
     binding_on(
@@ -40,321 +45,111 @@ fn binding_on(
     .expect("valid projection binding")
 }
 
-fn spawn_exited_child() -> tokio::process::Child {
-    #[cfg(unix)]
-    {
-        tokio::process::Command::new("true")
-            .spawn()
-            .expect("spawn exited prior provider")
-    }
-    #[cfg(windows)]
-    {
-        tokio::process::Command::new("cmd")
-            .args(["/C", "exit", "0"])
-            .spawn()
-            .expect("spawn exited prior provider")
+fn expected_prior_stages(stage: ProcessLaunchStage) -> &'static [ProcessLaunchStage] {
+    match stage {
+        ProcessLaunchStage::Branch => unreachable!("branch cannot have prior provider stages"),
+        ProcessLaunchStage::OwnerHome => &[ProcessLaunchStage::Branch],
+        ProcessLaunchStage::FleetShared => {
+            &[ProcessLaunchStage::Branch, ProcessLaunchStage::OwnerHome]
+        },
     }
 }
 
-async fn issue_stage_leases(
+fn expected_lease_count(stage: ProcessLaunchStage) -> usize {
+    // A Fleet projection publishes all three leases before provider launch.
+    match stage {
+        ProcessLaunchStage::Branch
+        | ProcessLaunchStage::OwnerHome
+        | ProcessLaunchStage::FleetShared => 3,
+    }
+}
+
+#[cfg(unix)]
+fn provider_pid_is_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+#[cfg(windows)]
+fn provider_pid_is_alive(pid: u32) -> bool {
+    let Ok(output) = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+    else {
+        return false;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    !stdout.contains("INFO:") && stdout.contains(&format!("\"{pid}\""))
+}
+
+fn assert_recorded_pids_reaped(stage: ProcessLaunchStage, test_id: u64) {
+    let pids = spawned_provider_pids(test_id);
+    assert_eq!(
+        pids.len(),
+        expected_prior_stages(stage).len(),
+        "{stage:?} must record a PID for each prior real provider child"
+    );
+    assert_eq!(
+        pids.keys().copied().collect::<Vec<_>>(),
+        expected_prior_stages(stage),
+        "{stage:?} must spawn exactly its prior stages"
+    );
+    for (prior_stage, pid) in pids {
+        assert!(
+            !provider_pid_is_alive(pid),
+            "{prior_stage:?} prior provider PID {pid} must be reaped"
+        );
+    }
+}
+
+fn assert_published_leases_revoked(
     kernel: &Arc<crate::Kernel>,
-    caller: astrid_core::PrincipalId,
-    binding: &ProcessProjectionBinding,
-    scratch: &tempfile::TempDir,
-) -> (
-    astrid_core::storage_filesystem::StorageMountLeaseV1,
-    astrid_core::storage_filesystem::StorageMountLeaseV1,
-    Option<astrid_core::storage_filesystem::StorageMountLeaseV1>,
-) {
-    let admission = MountAdmission::capture(kernel, &caller, MountOwnerScope::CallerOnly)
-        .expect("stage test admission");
-    let branch_view = match binding.owner {
-        StateOwner::Fleet(fleet_uid) => StorageProviderViewV1::Fleet(fleet_uid),
-        StateOwner::Principal(_) => StorageProviderViewV1::Principal(caller.clone()),
-        StateOwner::System | StateOwner::User(_) => {
-            panic!("stage fixture supports only principal and Fleet owners")
-        },
-    };
-    let branch_lease = issue_lease(
-        kernel,
-        &admission,
-        branch_view,
-        binding.targets.workspace.durable_target(),
-        astrid_core::storage_provider::StorageProviderAccessV1::ReadWrite,
-        platform_process_provider_name().to_owned(),
-        scratch.path().join("workspace"),
-    )
-    .await
-    .expect("issue branch stage lease");
-    let owner_lease = issue_lease(
-        kernel,
-        &admission,
-        StorageProviderViewV1::Principal(caller.clone()),
-        binding.targets.owner_home.durable_target(),
-        astrid_core::storage_provider::StorageProviderAccessV1::ReadWrite,
-        platform_process_provider_name().to_owned(),
-        scratch.path().join("owner"),
-    )
-    .await
-    .expect("issue owner stage lease");
-    let shared_lease = match binding.targets.fleet_shared.as_ref() {
-        Some(target) => Some(
-            issue_lease(
-                kernel,
-                &admission,
-                StorageProviderViewV1::Fleet(match target {
-                    super::ProcessProjectionTarget::FleetShared(fleet_uid) => *fleet_uid,
-                    _ => panic!("Fleet shared target has a Fleet identity"),
-                }),
-                target.durable_target(),
-                astrid_core::storage_provider::StorageProviderAccessV1::ReadWrite,
-                platform_process_provider_name().to_owned(),
-                scratch.path().join("shared"),
-            )
-            .await
-            .expect("issue Fleet shared stage lease"),
-        ),
-        None => None,
-    };
-    (branch_lease, owner_lease, shared_lease)
-}
-
-async fn stage_binding_on(
-    kernel: &Arc<crate::Kernel>,
-    caller: &PrincipalId,
-) -> ProcessProjectionBinding {
-    let actor = kernel
-        .principal_directory
-        .uid_for(caller)
-        .expect("caller actor UID");
-    let workspace = kernel
-        .workspace_branches
-        .as_ref()
-        .expect("test workspace service")
-        .bind(caller)
-        .await
-        .expect("bind test workspace");
-    let fleet_shared = match workspace.owner {
-        StateOwner::Fleet(fleet_uid) => Some(fleet_uid),
-        StateOwner::Principal(_) => None,
-        StateOwner::System | StateOwner::User(_) => {
-            panic!("test workspace owner is not process-mountable")
-        },
-    };
-    binding_on(actor, workspace.owner, workspace.branch, fleet_shared)
-}
-
-fn stopped_provider(
-    child: Option<tokio::process::Child>,
-    control_path: &std::path::Path,
-    token: String,
-    stopped: bool,
-    lease: &astrid_core::storage_filesystem::StorageMountLeaseV1,
-    target: super::ProcessProjectionTarget,
-) -> super::ProjectionLeaseProvider {
-    super::ProjectionLeaseProvider {
-        running: super::RunningProvider {
-            child,
-            control_path: control_path.to_path_buf(),
-            token,
-            stopped,
-        },
-        lease: super::ProjectionLeaseTarget {
-            mount_id: lease.mount_id,
-            target,
-        },
-    }
-}
-
-fn retained_endpoint() -> (
-    tempfile::TempDir,
-    Arc<tokio::sync::Notify>,
-    tokio::task::JoinHandle<()>,
-) {
-    use astrid_core::local_transport;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    use tokio::sync::Notify;
-
-    #[cfg(unix)]
-    let endpoint_root = tempfile::tempdir_in("/tmp").expect("create short endpoint root");
-    #[cfg(windows)]
-    let endpoint_root = tempfile::tempdir().expect("create retained endpoint root");
-    let listener =
-        local_transport::bind(&endpoint_root.path().join("c")).expect("bind retained endpoint");
-    let release = Arc::new(Notify::new());
-    let responder = tokio::spawn({
-        let release = Arc::clone(&release);
-        async move {
-            for _ in 0..4 {
-                let mut stream = local_transport::accept(&listener)
-                    .await
-                    .expect("accept retained stop request");
-                let mut frame = Vec::new();
-                while let Ok(byte) = stream.read_u8().await {
-                    frame.push(byte);
-                    if byte == b'\n' {
-                        break;
-                    }
-                }
-                if frame.ends_with(b"\n") {
-                    stream
-                        .write_all(b"{\"status\":\"ready\"}\n")
-                        .await
-                        .expect("write stop refusal");
-                    let _ = stream.read_u8().await;
-                }
-            }
-            release.notified().await;
-        }
-    });
-    (endpoint_root, release, responder)
-}
-
-fn stage_retained_cleanup_state(
     stage: ProcessLaunchStage,
-    kernel: &Arc<crate::Kernel>,
-    binding: &ProcessProjectionBinding,
-    leases: (
-        &astrid_core::storage_filesystem::StorageMountLeaseV1,
-        &astrid_core::storage_filesystem::StorageMountLeaseV1,
-        Option<&astrid_core::storage_filesystem::StorageMountLeaseV1>,
-    ),
-    control_path: &std::path::Path,
-    mount_root: &std::path::Path,
-) -> super::ProjectionCleanupState {
-    let (branch_lease, owner_lease, shared_lease) = leases;
-    super::ProjectionCleanupState {
-        kernel: Arc::downgrade(kernel),
-        binding: binding.clone(),
-        branch: stopped_provider(
-            (stage == ProcessLaunchStage::Branch).then(spawn_exited_child),
-            &(if stage == ProcessLaunchStage::Branch {
-                control_path.to_path_buf()
-            } else {
-                branch_lease.resource_path.join("process-control.sock")
-            }),
-            branch_lease.lease_token.clone(),
-            stage != ProcessLaunchStage::Branch,
-            branch_lease,
-            binding.targets.workspace.clone(),
-        ),
-        owner: stopped_provider(
-            (stage == ProcessLaunchStage::OwnerHome).then(spawn_exited_child),
-            &(if stage == ProcessLaunchStage::OwnerHome {
-                control_path.to_path_buf()
-            } else {
-                owner_lease.resource_path.join("process-control.sock")
-            }),
-            owner_lease.lease_token.clone(),
-            !matches!(
-                stage,
-                ProcessLaunchStage::OwnerHome | ProcessLaunchStage::FleetShared
-            ),
-            owner_lease,
-            binding.targets.owner_home.clone(),
-        ),
-        shared: shared_lease.map(|lease| {
-            stopped_provider(
-                (stage == ProcessLaunchStage::FleetShared).then(spawn_exited_child),
-                &(if stage == ProcessLaunchStage::FleetShared {
-                    control_path.to_path_buf()
-                } else {
-                    lease.resource_path.join("process-control.sock")
-                }),
-                lease.lease_token.clone(),
-                stage != ProcessLaunchStage::FleetShared,
-                lease,
-                binding
-                    .targets
-                    .fleet_shared
-                    .clone()
-                    .expect("shared lease has a Fleet target"),
-            )
-        }),
-        mount_root: mount_root.to_path_buf(),
-        cleaned: false,
-    }
-}
-
-async fn assert_stage_launch_rollback(stage: ProcessLaunchStage) {
-    let (temporary, kernel) = fleet_shared_kernel().await;
-    let caller = PrincipalId::default();
-    let binding = stage_binding_on(&kernel, &caller).await;
-    let key = super::ProcessProjectionKey {
-        binding: binding.clone(),
-        read_write: true,
-    };
-    let (branch_lease, owner_lease, shared_lease) =
-        issue_stage_leases(&kernel, caller.clone(), &binding, &temporary).await;
-    let expected_leases = if shared_lease.is_some() { 3 } else { 2 };
-    assert_eq!(kernel.storage_mounts.len(), expected_leases);
-
-    let branch_control = branch_lease.resource_path.join("process-control.sock");
-    let owner_control = owner_lease.resource_path.join("process-control.sock");
-    let shared_control = shared_lease
-        .as_ref()
-        .map(|lease| lease.resource_path.join("process-control.sock"));
-    let process_root = kernel.astrid_home.run_dir().join("process-storage");
-    let mount_root = process_root.join("stage-mount-root");
-    std::fs::create_dir_all(&mount_root).expect("create broker-owned stage mount root");
-    let cleanup_state = super::ProjectionCleanupState {
-        kernel: Arc::downgrade(&kernel),
-        binding: binding.clone(),
-        branch: stopped_provider(
-            (stage != ProcessLaunchStage::Branch).then(spawn_exited_child),
-            &branch_control,
-            branch_lease.lease_token.clone(),
-            false,
-            &branch_lease,
-            binding.targets.workspace.clone(),
-        ),
-        owner: stopped_provider(
-            (stage == ProcessLaunchStage::FleetShared).then(spawn_exited_child),
-            &owner_control,
-            owner_lease.lease_token.clone(),
-            false,
-            &owner_lease,
-            binding.targets.owner_home.clone(),
-        ),
-        shared: shared_lease.as_ref().map(|lease| {
-            stopped_provider(
-                None,
-                &shared_control
-                    .clone()
-                    .expect("shared lease has a control endpoint"),
-                lease.lease_token.clone(),
-                false,
-                lease,
-                binding
-                    .targets
-                    .fleet_shared
-                    .clone()
-                    .expect("shared lease has a Fleet target"),
-            )
-        }),
-        mount_root,
-        cleaned: false,
-    };
-    let mut projections = std::collections::BTreeMap::new();
-    rollback_or_retain_failed_launch(
-        &mut projections,
-        &key,
-        temporary.path().join("workspace"),
-        temporary.path().join("owner"),
-        shared_lease
-            .as_ref()
-            .map(|_| temporary.path().join("shared")),
-        cleanup_state,
-    )
-    .await;
-
-    assert!(
-        kernel.storage_mounts.is_empty(),
-        "{stage:?} launch rollback must revoke every exact published lease"
+    test_id: u64,
+) {
+    let published = published_provider_leases(test_id);
+    assert_eq!(
+        published.len(),
+        expected_lease_count(stage),
+        "{stage:?} must observe every published lease"
     );
     assert!(
-        projections.is_empty(),
-        "{stage:?} must not retain a blocker"
+        published
+            .values()
+            .all(|mount_id| !kernel.storage_mounts.contains_key(mount_id)),
+        "{stage:?} launch rollback must revoke every exact published lease"
+    );
+    assert_eq!(
+        kernel.storage_mounts.len(),
+        0,
+        "{stage:?} launch rollback must leave no other live lease"
+    );
+}
+
+async fn assert_real_launch_rollback(stage: ProcessLaunchStage, test_id: u64) {
+    let (_temporary, kernel) = fleet_shared_kernel().await;
+    let caller = PrincipalId::default();
+    let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
+    let process_root = kernel.astrid_home.run_dir().join("process-storage");
+    arm_launch_failure(stage, test_id);
+    let Err(error) = PROCESS_MOUNT_TEST_ID
+        .scope(test_id, broker.mount(&caller))
+        .await
+    else {
+        panic!("the selected {stage:?} launch fault must fail provider startup");
+    };
+    assert!(
+        error.contains("injected post-publication launch failure"),
+        "unexpected {stage:?} launch error: {error}"
+    );
+
+    assert_recorded_pids_reaped(stage, test_id);
+    assert_published_leases_revoked(&kernel, stage, test_id);
+    assert!(
+        broker.projections.lock().await.is_empty(),
+        "{stage:?} successful rollback must not retain a blocker"
     );
     assert!(
         process_root
@@ -366,119 +161,130 @@ async fn assert_stage_launch_rollback(stage: ProcessLaunchStage) {
     );
 }
 
-async fn assert_stage_launch_retains_blocker(stage: ProcessLaunchStage) {
-    let (temporary, kernel) = fleet_shared_kernel().await;
+async fn assert_real_launch_retains_blocker(stage: ProcessLaunchStage, test_id: u64) {
+    let (_temporary, kernel) = fleet_shared_kernel().await;
     let caller = PrincipalId::default();
-    let binding = stage_binding_on(&kernel, &caller).await;
-    let key = super::ProcessProjectionKey {
-        binding: binding.clone(),
-        read_write: true,
-    };
     let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
-    let (branch_lease, owner_lease, shared_lease) =
-        issue_stage_leases(&kernel, caller.clone(), &binding, &temporary).await;
-    let endpoint = retained_endpoint();
-    let (endpoint_root, release, responder) = endpoint;
-    let mount_root = endpoint_root.path().to_path_buf();
-    let control_path = mount_root.join("c");
-    let cleanup_state = stage_retained_cleanup_state(
-        stage,
-        &kernel,
-        &binding,
-        (&branch_lease, &owner_lease, shared_lease.as_ref()),
-        &control_path,
-        &mount_root,
+    let replacement_broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
+    arm_launch_cleanup_failure(stage, test_id);
+    let Err(error) = PROCESS_MOUNT_TEST_ID
+        .scope(test_id, broker.mount(&caller))
+        .await
+    else {
+        panic!("the selected {stage:?} launch fault must fail provider startup");
+    };
+    assert!(
+        error.contains("injected retained-endpoint launch failure"),
+        "unexpected {stage:?} launch error: {error}"
     );
-    let mut projections = std::collections::BTreeMap::new();
-    rollback_or_retain_failed_launch(
-        &mut projections,
-        &key,
-        temporary.path().join("workspace"),
-        temporary.path().join("owner"),
-        shared_lease
-            .as_ref()
-            .map(|_| temporary.path().join("shared")),
-        cleanup_state,
-    )
-    .await;
+    assert_recorded_pids_reaped(stage, test_id);
 
-    let projection = Arc::clone(projections.get(&key).expect("authoritative blocker"));
+    let published = published_provider_leases(test_id);
+    assert_eq!(
+        published.len(),
+        expected_lease_count(stage),
+        "{stage:?} must retain every published lease when cleanup fails"
+    );
+    assert_eq!(
+        kernel.storage_mounts.len(),
+        expected_lease_count(stage),
+        "{stage:?} failed cleanup must leave the lease authority unchanged"
+    );
+    for mount_id in published.values() {
+        assert!(
+            kernel.storage_mounts.contains_key(mount_id),
+            "{stage:?} must retain lease {mount_id}"
+        );
+    }
+
+    let projections = broker.projections.lock().await;
+    assert_eq!(
+        projections.len(),
+        1,
+        "{stage:?} failed cleanup must retain one authoritative blocker"
+    );
+    let projection = projections.values().next().expect("authoritative blocker");
     assert!(
         projection
             .cleanup_failed
             .load(std::sync::atomic::Ordering::Acquire),
         "{stage:?} failed endpoint cleanup must retain the blocker"
     );
+    let key = projections
+        .keys()
+        .next()
+        .expect("retained projection key")
+        .clone();
+    let projection = Arc::clone(projection);
+    drop(projections);
+    let mut retained_projections = broker.projections.lock().await.clone();
     assert!(
-        !retry_failed_projection(&projection, &mut projections, &key).await,
+        !retry_failed_projection(&projection, &mut retained_projections, &key).await,
         "{stage:?} authoritative retry must remain blocked by the live endpoint"
     );
-    let Err(replacement_error) = PROCESS_MOUNT_TEST_ID
-        .scope(9_000 + u64::from(stage.as_u8()), broker.mount(&caller))
-        .await
-    else {
+    assert!(!retained_projections.is_empty());
+
+    let Err(replacement_error) = replacement_broker.mount(&caller).await else {
         panic!("{stage:?} replacement must be denied while cleanup is retained");
     };
     assert!(
         replacement_error.starts_with("existing process projection lease "),
         "unexpected replacement denial for {stage:?}: {replacement_error}"
     );
-    assert!(!projections.is_empty());
+    assert_eq!(
+        kernel.storage_mounts.len(),
+        expected_lease_count(stage),
+        "{stage:?} denied replacement must not mutate lease authority"
+    );
 
-    release.notify_waiters();
-    responder.await.expect("retained endpoint responder");
+    release_launch_cleanup_failure(test_id).await;
 }
 
 #[tokio::test]
 async fn launch_failure_selector_is_stage_specific_and_single_shot() {
-    let stages = [
-        ProcessLaunchStage::Branch,
-        ProcessLaunchStage::OwnerHome,
-        ProcessLaunchStage::FleetShared,
-    ];
-    for stage in stages {
-        let test_id = 9_100 + u64::from(stage.as_u8());
-        arm_launch_failure(stage, test_id);
-        let other_stage = match stage {
-            ProcessLaunchStage::Branch => ProcessLaunchStage::OwnerHome,
-            ProcessLaunchStage::OwnerHome => ProcessLaunchStage::FleetShared,
-            ProcessLaunchStage::FleetShared => ProcessLaunchStage::Branch,
-        };
-        assert!(
-            !super::process_launch::launch_failure_matches(other_stage, test_id),
-            "an armed {stage:?} fault must not consume a {other_stage:?} launch"
-        );
-        assert!(
-            super::process_launch::launch_failure_matches(stage, test_id),
-            "the selected {stage:?} fault must consume exactly that launch"
-        );
-        assert!(
-            !super::process_launch::launch_failure_matches(stage, test_id),
-            "a launch fault must be single-shot"
-        );
-    }
+    arm_launch_failure(ProcessLaunchStage::FleetShared, 91);
+    arm_launch_failure(ProcessLaunchStage::Branch, 92);
+
+    assert!(
+        !super::process_launch::launch_failure_matches(ProcessLaunchStage::OwnerHome, 91),
+        "test 91's Fleet fault must not consume an OwnerHome launch"
+    );
+    assert!(
+        !super::process_launch::launch_failure_matches(ProcessLaunchStage::Branch, 91),
+        "test 91's Fleet fault must not consume a Branch launch"
+    );
+    assert!(
+        super::process_launch::launch_failure_matches(ProcessLaunchStage::FleetShared, 91),
+        "test 91's Fleet fault must consume only its own matching launch"
+    );
+    assert!(
+        !super::process_launch::launch_failure_matches(ProcessLaunchStage::FleetShared, 91),
+        "a launch fault must be single-shot"
+    );
+    assert!(
+        super::process_launch::launch_failure_matches(ProcessLaunchStage::Branch, 92),
+        "test 91 must not overwrite or consume test 92's Branch fault"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stage_launch_faults_roll_back_published_leases_in_order() {
-    for stage in [
-        ProcessLaunchStage::Branch,
-        ProcessLaunchStage::OwnerHome,
-        ProcessLaunchStage::FleetShared,
-    ] {
-        assert_stage_launch_rollback(stage).await;
-    }
+async fn branch_success_owner_home_fault_rolls_back_real_mount() {
+    assert_real_launch_rollback(ProcessLaunchStage::OwnerHome, 201).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stage_launch_faults_retain_blockers_when_endpoint_cleanup_fails() {
-    for stage in [
-        ProcessLaunchStage::Branch,
-        ProcessLaunchStage::OwnerHome,
-        ProcessLaunchStage::FleetShared,
-    ] {
-        assert_stage_launch_retains_blocker(stage).await;
-    }
+async fn branch_and_owner_success_fleet_shared_fault_rolls_back_real_mount() {
+    assert_real_launch_rollback(ProcessLaunchStage::FleetShared, 202).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_home_cleanup_failure_retains_real_mount_blocker() {
+    assert_real_launch_retains_blocker(ProcessLaunchStage::OwnerHome, 301).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fleet_shared_cleanup_failure_retains_real_mount_blocker() {
+    assert_real_launch_retains_blocker(ProcessLaunchStage::FleetShared, 302).await;
 }
 
 async fn fleet_shared_kernel() -> (tempfile::TempDir, Arc<crate::Kernel>) {

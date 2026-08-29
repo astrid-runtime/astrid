@@ -1,5 +1,8 @@
 //! Discovery, launch, and readiness for the coinstalled process provider.
 
+#[cfg(all(test, any(unix, windows)))]
+use std::collections::BTreeMap;
+
 use super::*;
 
 pub(super) struct ProcessProviderLaunchError {
@@ -12,6 +15,8 @@ pub(super) struct ProcessProviderLaunchError {
     pub(super) child: Option<Box<tokio::process::Child>>,
 }
 
+/// Fixed, non-configurable denial-of-service hard guard: a descendant holding
+/// stderr cannot stall rollback past this deadline.
 const PROVIDER_DIAGNOSTICS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 type SpawnedProcessProvider = (
@@ -20,7 +25,7 @@ type SpawnedProcessProvider = (
 );
 
 /// The deterministic provider startup stage represented by one launch.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum ProcessLaunchStage {
     Branch,
     OwnerHome,
@@ -39,33 +44,201 @@ impl ProcessLaunchStage {
 }
 
 #[cfg(all(test, any(unix, windows)))]
-static INJECTED_LAUNCH_FAILURE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+impl ProcessLaunchStage {
+    pub(crate) const fn is_before(self, target: Self) -> bool {
+        self.as_u8() < target.as_u8()
+    }
+}
 
 #[cfg(all(test, any(unix, windows)))]
-static INJECTED_LAUNCH_FAILURE_TEST_ID: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LaunchFaultKind {
+    Clean,
+    EndpointRetained,
+}
+
+#[cfg(all(test, any(unix, windows)))]
+static LAUNCH_FAILURES: std::sync::Mutex<BTreeMap<u64, ProcessLaunchStage>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+#[cfg(all(test, any(unix, windows)))]
+static LAUNCH_FAILURE_KINDS: std::sync::Mutex<BTreeMap<u64, LaunchFaultKind>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+#[cfg(all(test, any(unix, windows)))]
+static SPAWNED_PROVIDER_PIDS: std::sync::Mutex<BTreeMap<u64, BTreeMap<ProcessLaunchStage, u32>>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+#[cfg(all(test, any(unix, windows)))]
+static PUBLISHED_PROVIDER_LEASES: std::sync::Mutex<
+    BTreeMap<u64, BTreeMap<ProcessLaunchStage, StorageMountId>>,
+> = std::sync::Mutex::new(BTreeMap::new());
+
+#[cfg(all(test, any(unix, windows)))]
+struct RetainedLaunchEndpoint {
+    release: Arc<tokio::sync::Notify>,
+    responder: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(all(test, any(unix, windows)))]
+static RETAINED_LAUNCH_ENDPOINTS: std::sync::Mutex<BTreeMap<u64, RetainedLaunchEndpoint>> =
+    std::sync::Mutex::new(BTreeMap::new());
 
 #[cfg(all(test, any(unix, windows)))]
 pub(crate) fn arm_launch_failure(stage: ProcessLaunchStage, test_id: u64) {
-    INJECTED_LAUNCH_FAILURE.store(stage.as_u8(), std::sync::atomic::Ordering::Release);
-    INJECTED_LAUNCH_FAILURE_TEST_ID.store(test_id, std::sync::atomic::Ordering::Release);
+    LAUNCH_FAILURES
+        .lock()
+        .expect("launch failure selector")
+        .insert(test_id, stage);
+    LAUNCH_FAILURE_KINDS
+        .lock()
+        .expect("launch failure modes")
+        .insert(test_id, LaunchFaultKind::Clean);
 }
 
 #[cfg(all(test, any(unix, windows)))]
 pub(crate) fn launch_failure_matches(stage: ProcessLaunchStage, current_test_id: u64) -> bool {
-    current_test_id == INJECTED_LAUNCH_FAILURE_TEST_ID.load(std::sync::atomic::Ordering::Acquire)
-        && INJECTED_LAUNCH_FAILURE
-            .compare_exchange(
-                stage.as_u8(),
-                0,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_ok()
-        && {
-            INJECTED_LAUNCH_FAILURE_TEST_ID.store(0, std::sync::atomic::Ordering::Release);
-            true
+    let mut failures = LAUNCH_FAILURES.lock().expect("launch failure selector");
+    if failures.get(&current_test_id) != Some(&stage) {
+        return false;
+    }
+    failures.remove(&current_test_id);
+    LAUNCH_FAILURE_KINDS
+        .lock()
+        .expect("launch failure modes")
+        .remove(&current_test_id);
+    true
+}
+
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) fn arm_launch_cleanup_failure(stage: ProcessLaunchStage, test_id: u64) {
+    LAUNCH_FAILURES
+        .lock()
+        .expect("launch failure selector")
+        .insert(test_id, stage);
+    LAUNCH_FAILURE_KINDS
+        .lock()
+        .expect("launch failure modes")
+        .insert(test_id, LaunchFaultKind::EndpointRetained);
+}
+
+#[cfg(all(test, any(unix, windows)))]
+fn selected_launch_failure(test_id: u64) -> Option<ProcessLaunchStage> {
+    LAUNCH_FAILURES
+        .lock()
+        .expect("launch failure selector")
+        .get(&test_id)
+        .copied()
+}
+
+#[cfg(all(test, any(unix, windows)))]
+fn spawn_long_lived_test_provider() -> Result<tokio::process::Child, ProcessProviderLaunchError> {
+    let mut command = if cfg!(unix) {
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("30");
+        command
+    } else {
+        let mut command = tokio::process::Command::new("ping");
+        command.args(["-n", "31", "127.0.0.1"]);
+        command
+    };
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command.spawn().map_err(|error| ProcessProviderLaunchError {
+        message: format!("launch test-only prior provider: {error}"),
+        cleanup_ok: true,
+        child: None,
+    })
+}
+
+#[cfg(all(test, any(unix, windows)))]
+fn record_spawned_provider(test_id: u64, stage: ProcessLaunchStage, pid: u32) {
+    SPAWNED_PROVIDER_PIDS
+        .lock()
+        .expect("spawned provider PIDs")
+        .entry(test_id)
+        .or_default()
+        .insert(stage, pid);
+}
+
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) fn record_published_test_lease(
+    stage: ProcessLaunchStage,
+    lease_mount_id: StorageMountId,
+) {
+    let test_id = super::PROCESS_MOUNT_TEST_ID
+        .try_with(|test_id| *test_id)
+        .unwrap_or_default();
+    PUBLISHED_PROVIDER_LEASES
+        .lock()
+        .expect("launched provider leases")
+        .entry(test_id)
+        .or_default()
+        .insert(stage, lease_mount_id);
+}
+
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) fn spawned_provider_pids(test_id: u64) -> BTreeMap<ProcessLaunchStage, u32> {
+    SPAWNED_PROVIDER_PIDS
+        .lock()
+        .expect("spawned provider PIDs")
+        .get(&test_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) fn published_provider_leases(
+    test_id: u64,
+) -> BTreeMap<ProcessLaunchStage, StorageMountId> {
+    PUBLISHED_PROVIDER_LEASES
+        .lock()
+        .expect("launched provider leases")
+        .get(&test_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[cfg(all(test, any(unix, windows)))]
+fn retain_launch_failure_endpoint(
+    test_id: u64,
+    launch: &StorageProviderServiceLaunchV1,
+) -> Result<(), String> {
+    let listener = local_transport::bind(&launch.control_path)
+        .map_err(|error| format!("bind retained test control endpoint: {error}"))?;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let responder = tokio::spawn({
+        let release = Arc::clone(&release);
+        async move {
+            if let Ok(mut stream) = local_transport::accept(&listener).await {
+                let _ = stream.write_all(b"{\"status\":\"ready\"}\n").await;
+                let _ = stream.flush().await;
+                release.notified().await;
+            }
         }
+    });
+    RETAINED_LAUNCH_ENDPOINTS
+        .lock()
+        .expect("retained launch endpoints")
+        .insert(test_id, RetainedLaunchEndpoint { release, responder });
+    Ok(())
+}
+
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) async fn release_launch_cleanup_failure(test_id: u64) {
+    let endpoint = RETAINED_LAUNCH_ENDPOINTS
+        .lock()
+        .expect("retained launch endpoints")
+        .remove(&test_id);
+    if let Some(endpoint) = endpoint {
+        endpoint.release.notify_waiters();
+        endpoint
+            .responder
+            .await
+            .expect("retained endpoint responder");
+    }
 }
 
 pub(crate) fn platform_process_provider_name() -> &'static str {
@@ -204,12 +377,45 @@ pub(super) async fn launch_process_provider(
         let current_test_id = super::PROCESS_MOUNT_TEST_ID
             .try_with(|test_id| *test_id)
             .unwrap_or_default();
-        if launch_failure_matches(stage, current_test_id) {
-            return Err(ProcessProviderLaunchError {
-                message: "injected post-publication launch failure".to_owned(),
-                cleanup_ok: true,
-                child: None,
-            });
+        if let Some(selected_stage) = selected_launch_failure(current_test_id) {
+            if stage == selected_stage {
+                let cleanup_failure = LAUNCH_FAILURE_KINDS
+                    .lock()
+                    .expect("launch failure modes")
+                    .get(&current_test_id)
+                    == Some(&LaunchFaultKind::EndpointRetained);
+                if launch_failure_matches(stage, current_test_id) {
+                    record_published_test_lease(stage, launch.lease.mount_id);
+                    if cleanup_failure {
+                        if let Err(error) = retain_launch_failure_endpoint(current_test_id, launch)
+                        {
+                            return Err(ProcessProviderLaunchError {
+                                message: error,
+                                cleanup_ok: true,
+                                child: None,
+                            });
+                        }
+                        return Err(ProcessProviderLaunchError {
+                            message: "injected retained-endpoint launch failure".to_owned(),
+                            cleanup_ok: false,
+                            child: None,
+                        });
+                    }
+                    return Err(ProcessProviderLaunchError {
+                        message: "injected post-publication launch failure".to_owned(),
+                        cleanup_ok: true,
+                        child: None,
+                    });
+                }
+            } else if stage.is_before(selected_stage) {
+                return spawn_long_lived_test_provider().inspect(|child| {
+                    record_spawned_provider(
+                        current_test_id,
+                        stage,
+                        child.id().expect("fresh test provider reports a PID"),
+                    );
+                });
+            }
         }
     }
 

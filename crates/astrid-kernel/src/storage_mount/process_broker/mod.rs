@@ -13,6 +13,8 @@ mod process_launch;
 #[cfg(all(test, any(unix, windows)))]
 use process_launch::abort_process_provider;
 #[cfg(all(test, any(unix, windows)))]
+pub(crate) use process_launch::arm_launch_cleanup_failure;
+#[cfg(all(test, any(unix, windows)))]
 pub(crate) use process_launch::arm_launch_failure;
 #[cfg(any(unix, windows))]
 use process_launch::launch_process_provider;
@@ -261,6 +263,11 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                 return Err(error);
             },
         };
+        #[cfg(all(test, any(unix, windows)))]
+        process_launch::record_published_test_lease(
+            process_launch::ProcessLaunchStage::Branch,
+            branch_lease.mount_id,
+        );
         let owner_lease = match issue_lease(
             &kernel,
             &admission,
@@ -288,6 +295,11 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                 return Err(error);
             },
         };
+        #[cfg(all(test, any(unix, windows)))]
+        process_launch::record_published_test_lease(
+            process_launch::ProcessLaunchStage::OwnerHome,
+            owner_lease.mount_id,
+        );
 
         let shared_target = key
             .binding
@@ -343,6 +355,13 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
         } else {
             None
         };
+        #[cfg(all(test, any(unix, windows)))]
+        if let Some(lease) = shared_lease.as_ref() {
+            process_launch::record_published_test_lease(
+                process_launch::ProcessLaunchStage::FleetShared,
+                lease.mount_id,
+            );
+        }
 
         let branch_control = branch_lease.resource_path.join("process-control.sock");
         let owner_control = owner_lease.resource_path.join("process-control.sock");
