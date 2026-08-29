@@ -422,7 +422,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
- "wasm-encoder 0.256.0",
+ "wasm-encoder 0.257.1",
  "wasmparser 0.257.1",
  "wasmtime",
  "wasmtime-wasi",
