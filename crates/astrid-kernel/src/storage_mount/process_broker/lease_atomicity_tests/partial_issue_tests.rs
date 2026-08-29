@@ -19,6 +19,44 @@ fn expected_lease_count(stage: ProcessLaunchStage) -> usize {
     }
 }
 
+fn assert_retained_issue_authority(kernel: &crate::Kernel, stage: ProcessLaunchStage) {
+    assert_eq!(
+        kernel.storage_mounts.len(),
+        expected_lease_count(stage),
+        "{stage:?} failed cleanup must retain every issued lease"
+    );
+    for entry in kernel.storage_mounts.iter() {
+        let retained_lease = entry.value();
+        assert!(
+            retained_lease.is_revoked_for_test(),
+            "cleanup-faulted lease must remain revoked"
+        );
+
+        // Unix socket pathnames may outlive their listener; Windows named
+        // pipes vanish with the final server handle. Durable authority does
+        // not depend on this transport-specific pathname.
+        #[cfg(unix)]
+        {
+            let callback_path = retained_lease.callback_identity_for_test().0;
+            assert!(
+                astrid_core::local_transport::endpoint_is_present(&callback_path).unwrap(),
+                "cleanup-faulted callback endpoint must remain retained"
+            );
+        }
+    }
+    assert_eq!(
+        kernel
+            .astrid_home
+            .run_dir()
+            .join("process-storage")
+            .read_dir()
+            .expect("process storage root")
+            .count(),
+        1,
+        "{stage:?} failed cleanup must retain its exact provider root"
+    );
+}
+
 async fn assert_partial_issue_retains_exact_authority(stage: ProcessLaunchStage, test_id: u64) {
     let (_temporary, kernel) = fleet_shared_kernel().await;
     let caller = PrincipalId::default();
@@ -36,29 +74,7 @@ async fn assert_partial_issue_retains_exact_authority(stage: ProcessLaunchStage,
         issue_error.contains("native storage provider identity is invalid"),
         "unexpected {stage:?} issue error: {issue_error}"
     );
-    assert_eq!(
-        kernel.storage_mounts.len(),
-        expected_lease_count(stage),
-        "{stage:?} failed cleanup must retain every issued lease"
-    );
-    for entry in kernel.storage_mounts.iter() {
-        let callback_path = entry.value().callback_identity_for_test().0;
-        assert!(
-            astrid_core::local_transport::endpoint_is_present(&callback_path).unwrap(),
-            "cleanup-faulted callback endpoint must remain retained"
-        );
-    }
-    assert_eq!(
-        kernel
-            .astrid_home
-            .run_dir()
-            .join("process-storage")
-            .read_dir()
-            .expect("process storage root")
-            .count(),
-        1,
-        "{stage:?} failed cleanup must retain its exact provider root"
-    );
+    assert_retained_issue_authority(&kernel, stage);
 
     {
         let projections = broker.projections.lock().await;
