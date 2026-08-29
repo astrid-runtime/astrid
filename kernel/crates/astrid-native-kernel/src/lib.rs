@@ -21,6 +21,10 @@ pub mod ipc;
 #[cfg(not(test))]
 pub mod memory;
 pub mod platform;
+// Production-compiled ahead of its first consumer so the native target keeps
+// typechecking the frozen relation semantics.
+#[allow(dead_code)]
+mod relations;
 #[cfg(not(test))]
 pub mod serial;
 #[cfg(not(test))]
