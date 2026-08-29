@@ -215,12 +215,17 @@ impl ProjectionStore {
             });
         }
 
-        let retired = self.readers[slot].take();
-        if let Some(mut old) = retired {
-            let epoch = old
-                .epoch
-                .checked_add(1)
-                .ok_or(ProjectionError::ResnapshotRequired)?;
+        let retirement_epoch = self.readers[slot]
+            .as_ref()
+            .map(|old| {
+                old.epoch
+                    .checked_add(1)
+                    .ok_or(ProjectionError::ResnapshotRequired)
+            })
+            .transpose()?;
+        let token = self.mint_token()?;
+        if let Some(mut old) = self.readers[slot].take() {
+            let epoch = retirement_epoch.expect("checked before retirement");
             let mut index = 0usize;
             while index < self.row_count {
                 let Some(row) = self.rows[index] else {
@@ -255,7 +260,6 @@ impl ProjectionStore {
             }
         }
 
-        let token = self.mint_token()?;
         self.readers[slot] = Some(Reader::new(token, identity));
         Ok(ReaderLease {
             token,
@@ -457,6 +461,11 @@ impl ProjectionStore {
     pub fn apply(&mut self, batch: AuthoritativeBatch) -> Result<usize, ProjectionError> {
         let plan = self.plan_batch(batch)?;
 
+        // Stage capacity-sensitive row mutations before publishing them. This
+        // lets a later DELETE fund an earlier UPSERT in the same batch without
+        // exposing intermediate state.
+        let mut planned_rows = self.rows;
+        let mut planned_row_count = self.row_count;
         let mut changed = [false; READER_SLOTS];
         let mut applied = 0usize;
         for index in 0..plan.len {
@@ -464,11 +473,38 @@ impl ProjectionStore {
                 continue;
             }
             let mutation = batch.mutations().nth(index).expect("planned batch index");
+            if !matches!(mutation.change, RelationChange::Delete(_)) {
+                continue;
+            }
             let reader_index = plan.reader_indexes[index];
-            let mutated = apply_to_rows(&mut self.rows, &mut self.row_count, mutation.change);
+            let mutated = apply_to_rows(&mut planned_rows, &mut planned_row_count, mutation.change);
             debug_assert!(mutated);
             changed[reader_index] = true;
             applied += 1;
+        }
+        for index in 0..plan.len {
+            if !plan.effective[index] {
+                continue;
+            }
+            let mutation = batch.mutations().nth(index).expect("planned batch index");
+            if !matches!(mutation.change, RelationChange::Upsert(_)) {
+                continue;
+            }
+            let reader_index = plan.reader_indexes[index];
+            let mutated = apply_to_rows(&mut planned_rows, &mut planned_row_count, mutation.change);
+            debug_assert!(mutated);
+            changed[reader_index] = true;
+            applied += 1;
+        }
+
+        self.rows = planned_rows;
+        self.row_count = planned_row_count;
+        for index in 0..plan.len {
+            if !plan.effective[index] {
+                continue;
+            }
+            let mutation = batch.mutations().nth(index).expect("planned batch index");
+            let reader_index = plan.reader_indexes[index];
             let delta = RelationDelta::new(plan.batch_epochs[reader_index], mutation.change);
             if let Some(reader) = &mut self.readers[reader_index] {
                 reader.deltas.push(delta);
@@ -492,6 +528,24 @@ impl ProjectionStore {
         let mut plan = BatchPlan::empty();
         let mut final_row_count = self.row_count;
 
+        // A batch is atomic, so count every effective mutation before
+        // validating capacity. A later DELETE can make room for an earlier
+        // UPSERT even at the fixed ceiling.
+        for mutation in batch.mutations() {
+            let existing = relation_index(&self.rows, mutation.change.key());
+            match mutation.change {
+                RelationChange::Upsert(_) if existing.is_none() => {
+                    final_row_count = final_row_count
+                        .checked_add(1)
+                        .ok_or(ProjectionError::NoSpace)?;
+                },
+                RelationChange::Delete(_) if existing.is_some() => {
+                    final_row_count = final_row_count.saturating_sub(1);
+                },
+                _ => {},
+            }
+        }
+
         for (index, mutation) in batch.mutations().enumerate() {
             let key = mutation.change.key();
             if mutation.reader.token != key.scope()
@@ -514,23 +568,15 @@ impl ProjectionStore {
             plan.reader_indexes[index] = reader_index;
 
             let existing = relation_index(&self.rows, key);
+            let is_new = existing.is_none();
             match mutation.change {
                 RelationChange::Upsert(relation) => {
-                    self.validate_upsert(relation)?;
-                    let is_new = existing.is_none();
+                    self.validate_upsert(relation, is_new, final_row_count)?;
                     plan.effective[index] =
                         existing.is_none_or(|at| self.rows[at] != Some(relation));
-                    if is_new && plan.effective[index] {
-                        final_row_count = final_row_count
-                            .checked_add(1)
-                            .ok_or(ProjectionError::NoSpace)?;
-                    }
                 },
                 RelationChange::Delete(_) => {
                     plan.effective[index] = existing.is_some();
-                    if plan.effective[index] {
-                        final_row_count -= 1;
-                    }
                 },
             }
             plan.len = index + 1;
@@ -557,10 +603,13 @@ impl ProjectionStore {
         *slot = Some(key);
     }
 
-    fn validate_upsert(&self, relation: Relation) -> Result<(), ProjectionError> {
-        if relation_index(&self.rows, relation.key()).is_none()
-            && (self.row_count == MAX_RELATION_ROWS || self.logical_deletions_overflowed)
-        {
+    fn validate_upsert(
+        &self,
+        relation: Relation,
+        is_new: bool,
+        final_row_count: usize,
+    ) -> Result<(), ProjectionError> {
+        if is_new && (final_row_count > MAX_RELATION_ROWS || self.logical_deletions_overflowed) {
             return Err(ProjectionError::NoSpace);
         }
         if self.logical_deletions.contains(&Some(relation.key())) {
@@ -571,18 +620,25 @@ impl ProjectionStore {
             .object_refs()
             .into_iter()
             .flatten()
-            .any(|object| self.reclaim_for_object(object).is_some())
+            .any(|object| {
+                self.reclaim_for_object(relation.key().scope(), object)
+                    .is_some()
+            })
         {
             return Err(ProjectionError::Resurrection);
         }
         Ok(())
     }
 
-    fn reclaim_for_object(&self, object: ObjectRef) -> Option<ReclaimObservation> {
+    fn reclaim_for_object(
+        &self,
+        scope: DomainProjectionToken,
+        object: ObjectRef,
+    ) -> Option<ReclaimObservation> {
         self.reclaim
             .into_iter()
             .flatten()
-            .find(|observation| observation.object_ref() == object)
+            .find(|observation| observation.scope() == scope && observation.object_ref() == object)
     }
 
     pub fn record_reclaim(
@@ -592,11 +648,11 @@ impl ProjectionStore {
         outcome: ReclaimOutcome,
     ) -> Result<bool, ProjectionError> {
         self.reader_at(lease)?;
-        if self
-            .rows
-            .iter()
-            .any(|row| row.is_some_and(|relation| relation_is_dead(relation, object)))
-        {
+        if self.rows.iter().any(|row| {
+            row.is_some_and(|relation| {
+                relation.key().scope() == lease.token && relation_is_dead(relation, object)
+            })
+        }) {
             return Err(ProjectionError::Denied);
         }
         if self.reclaim.iter().any(|observation| {
@@ -619,8 +675,7 @@ impl ProjectionStore {
         object: ObjectRef,
     ) -> Result<ReclaimObservation, ProjectionError> {
         self.reader_at(lease)?;
-        self.reclaim_for_object(object)
-            .filter(|observation| observation.scope() == lease.token)
+        self.reclaim_for_object(lease.token, object)
             .ok_or(ProjectionError::Denied)
     }
 

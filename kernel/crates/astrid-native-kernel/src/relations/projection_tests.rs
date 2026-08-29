@@ -418,6 +418,115 @@ fn epoch_overflow_fails_closed_and_does_not_wrap() {
     assert!(store.snapshot(lease).unwrap().is_empty());
 }
 
+#[test]
+fn reader_retirement_overflow_leaves_the_slot_and_rows_intact() {
+    let mut store = store();
+    let old = reader(&mut store, 0, 1);
+    let relation = object_relation(old.token(), ObjectKind::Endpoint, 1);
+    apply_one(&mut store, old, relation);
+    store.force_epoch_overflow(old).unwrap();
+
+    assert_eq!(
+        store
+            .register_reader(DomainToken::new(0, 2).unwrap())
+            .unwrap_err(),
+        ProjectionError::ResnapshotRequired
+    );
+    assert_eq!(
+        store
+            .register_reader(DomainToken::new(0, 3).unwrap())
+            .unwrap_err(),
+        ProjectionError::ResnapshotRequired
+    );
+    assert_eq!(store.relation_epoch(old).unwrap(), u64::MAX);
+    assert_eq!(store.snapshot(old).unwrap().rows().count(), 1);
+}
+
+#[test]
+fn reclaim_resurrection_is_bound_to_reader_scope() {
+    let mut store = store();
+    let first = reader(&mut store, 0, 1);
+    let second = reader(&mut store, 1, 1);
+    let first_relation = object_relation(first.token(), ObjectKind::Endpoint, 7);
+    apply_one(&mut store, first, first_relation);
+    apply_change(
+        &mut store,
+        first,
+        RelationChange::Delete(first_relation.key()),
+    )
+    .unwrap();
+    assert!(
+        store
+            .record_reclaim(
+                first,
+                object(ObjectKind::Endpoint, 7),
+                ReclaimOutcome::ReleaseFailed,
+            )
+            .unwrap()
+    );
+
+    assert_eq!(
+        store
+            .reclaim_observation(second, object(ObjectKind::Endpoint, 7))
+            .unwrap_err(),
+        ProjectionError::Denied
+    );
+    assert_eq!(
+        apply_one_or_error(
+            &mut store,
+            second,
+            object_relation(second.token(), ObjectKind::Endpoint, 7),
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn batch_delete_makes_room_for_a_new_key_at_capacity() {
+    let mut store = store();
+    let lease = reader(&mut store, 0, 1);
+    for value in 1..=MAX_RELATION_ROWS as u64 {
+        apply_one(&mut store, lease, holds_relation(lease, 1, 3, value));
+    }
+    store.base_snapshot(lease).unwrap();
+    let retained = holds_relation(lease, 1, 3, 1);
+    let inserted = holds_relation(lease, 1, 4, MAX_RELATION_ROWS as u64 + 1);
+
+    let mut batch = AuthoritativeBatch::empty();
+    batch
+        .push(RelationMutation::new(
+            lease,
+            RelationChange::Upsert(inserted),
+        ))
+        .unwrap();
+    batch
+        .push(RelationMutation::new(
+            lease,
+            RelationChange::Delete(retained.key()),
+        ))
+        .unwrap();
+    assert_eq!(store.apply(batch).unwrap(), 2);
+    assert_eq!(
+        store.relation_epoch(lease).unwrap(),
+        MAX_RELATION_ROWS as u64 + 1
+    );
+    assert_eq!(store.snapshot(lease).unwrap().len(), MAX_RELATION_ROWS);
+    assert!(
+        !store
+            .snapshot(lease)
+            .unwrap()
+            .rows()
+            .any(|relation| relation.key() == retained.key())
+    );
+    assert!(
+        store
+            .snapshot(lease)
+            .unwrap()
+            .rows()
+            .any(|relation| relation.key() == inserted.key())
+    );
+}
+
 fn apply_one_or_error(
     store: &mut ProjectionStore,
     lease: ReaderLease,
