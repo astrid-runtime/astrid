@@ -551,6 +551,16 @@ fn clear_runtime_process_storage_scratch(
     sync_process_storage_directory(&root)
 }
 
+#[cfg(not(unix))]
+fn clear_runtime_process_storage_scratch(
+    _home: &astrid_core::dirs::AstridHome,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "process storage scratch cleanup requires native Unix support",
+    ))
+}
+
 #[cfg(unix)]
 fn validate_process_storage_tree(path: &Path, root_device: u64) -> std::io::Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
@@ -686,7 +696,7 @@ fn decode_process_storage_mount_path(encoded: &str) -> Option<PathBuf> {
             index = end;
         } else {
             decoded.push(bytes[index]);
-            index += 1;
+            index = index.checked_add(1)?;
         }
     }
     Some(PathBuf::from(std::ffi::OsString::from_vec(decoded)))

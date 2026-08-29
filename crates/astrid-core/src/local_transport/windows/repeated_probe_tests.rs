@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 #[tokio::test]
 async fn repeated_presence_probes_remain_deterministic_until_explicit_release() {
     let endpoint = Path::new(r"C:\ignored\repeated-probes.sock");
-    let listener = std::sync::Arc::new(bind(endpoint).unwrap());
+    let listener = bind(endpoint).unwrap();
     let mut clients = Vec::new();
 
     for round in 0..4 {
@@ -24,7 +24,7 @@ async fn repeated_presence_probes_remain_deterministic_until_explicit_release() 
     for (round, mut client) in clients.into_iter().enumerate() {
         client.write_all(b"probe").await.unwrap();
         client.flush().await.unwrap();
-        let mut server = accept(std::sync::Arc::clone(&listener)).await.unwrap();
+        let mut server = accept(&listener).await.unwrap();
         assert!(peer_is_current_user(&server).unwrap());
         let mut bytes = [0_u8; 5];
         server.read_exact(&mut bytes).await.unwrap();
