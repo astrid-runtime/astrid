@@ -17,7 +17,7 @@ use astrid_native_closure::{
 // depends only on the closure crate, so changing the descriptor wire layout is
 // a deliberate review point rather than an accidental transitive update.
 const MANIFEST_LEN: usize = 548;
-const _: () = assert!(EMULATOR_COMPONENT_LEN == 479);
+const _: () = assert!(EMULATOR_COMPONENT_LEN == 517);
 use bootloader_api::info::LoaderHandoffVerification;
 
 // Keep the bootloader's receipt layout pinned to the ring-0 consumer. These

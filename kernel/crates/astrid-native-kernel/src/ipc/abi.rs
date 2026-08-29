@@ -169,6 +169,11 @@ impl MessageBuffer {
         self.payload = payload;
     }
 
+    #[cfg(test)]
+    pub(super) fn set_cap_slot(&mut self, cap_slot: u16) {
+        self.cap_slot = cap_slot;
+    }
+
     pub(super) fn payload_mut(&mut self) -> &mut [u8; MAX_PAYLOAD_BYTES] {
         &mut self.payload
     }

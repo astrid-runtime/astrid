@@ -5,6 +5,9 @@ mod capability;
 mod copy;
 mod endpoint;
 mod error;
+#[cfg(test)]
+#[path = "test_support.rs"]
+pub(crate) mod test_support;
 
 use core::num::NonZeroU64;
 
@@ -86,6 +89,7 @@ impl IpcState {
 
 static IPC: Mutex<IpcState> = Mutex::new(IpcState::empty());
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SyscallOutcome {
     Done(u64, u64),
     Block(BlockReason),
@@ -107,6 +111,7 @@ pub(crate) struct TeardownOutcome {
     pub(crate) capabilities: usize,
     pub(crate) queued_messages: usize,
     pub(crate) waiters: [Option<DomainToken>; 2],
+    pub(crate) peer_failures: [Option<DomainToken>; 2],
 }
 
 impl TeardownOutcome {
@@ -115,7 +120,75 @@ impl TeardownOutcome {
         capabilities: 0,
         queued_messages: 0,
         waiters: [None; 2],
+        peer_failures: [None; 2],
     };
+}
+
+fn merge_wakes(target: &mut [Option<DomainToken>; 2], wakes: [Option<DomainToken>; 2]) {
+    for domain in wakes.into_iter().flatten() {
+        if !target.contains(&Some(domain))
+            && let Some(slot) = target.iter_mut().find(|slot| slot.is_none())
+        {
+            *slot = Some(domain);
+        }
+    }
+}
+
+fn revoke_derived_capabilities(state: &mut IpcState, ancestor: DerivationLink) -> usize {
+    let mut descendants = [None; abi::CAP_SLOTS_PER_DOMAIN * capability::DOMAIN_SLOTS];
+    let mut descendant_count = 0usize;
+    for table_index in 0..state.capabilities.len() {
+        let Some(owner) = state.capabilities[table_index].owner() else {
+            continue;
+        };
+        for index in 0..abi::CAP_SLOTS_PER_DOMAIN {
+            let derived = state.capabilities[table_index]
+                .capability_at(index)
+                .is_some_and(|capability| is_derived_from(state, capability.parent, ancestor));
+            if derived {
+                descendants[descendant_count] = Some((table_index, owner, index));
+                descendant_count += 1;
+            }
+        }
+    }
+
+    descendants
+        .into_iter()
+        .flatten()
+        .filter(|(table_index, owner, index)| {
+            state.capabilities[*table_index].remove_index(*owner, *index)
+        })
+        .count()
+}
+
+fn unbind_members_without_capabilities(
+    state: &mut IpcState,
+    waiters: &mut [Option<DomainToken>; 2],
+) {
+    let mut candidates = [None; capability::DOMAIN_SLOTS];
+    for (index, table) in state.capabilities.iter().enumerate() {
+        if let Some(owner) = table.owner()
+            && let Some(domain) = DomainToken::new(index as u64, owner.generation().get())
+        {
+            candidates[index] = Some(domain);
+        }
+    }
+    for object_index in 0..state.objects.len() {
+        let Some(endpoint_id) = EndpointId::try_new(object_index).ok() else {
+            continue;
+        };
+        for candidate in candidates.into_iter().flatten() {
+            let holds_capability = state.capabilities[candidate.slot().index()]
+                .capability_slots()
+                .iter()
+                .flatten()
+                .any(|capability| capability.endpoint == endpoint_id);
+            if !holds_capability && let Some(object) = state.objects[object_index].as_mut() {
+                let wakes = object.unbind_without_capability(candidate);
+                merge_wakes(waiters, wakes);
+            }
+        }
+    }
 }
 
 pub(crate) fn prepare_domain(domain: DomainToken) {
@@ -263,7 +336,7 @@ pub(crate) fn complete_parked_recv(
     let transfer = message.transfer();
     drop(state);
     let committed = commit(&mut encoded);
-    if !committed && transfer.is_some() {
+    if !committed {
         rollback_recv(domain, endpoint_id, message, transfer, transferred_slot);
     }
     committed.then_some(()).ok_or(())
@@ -284,7 +357,9 @@ fn dispatch(
         abi::Operation::Cancel => {
             let endpoint_cancelled = cancel_waiter(domain);
             let parked_cancelled = crate::domains::mark_ipc_cancelled(domain);
-            let cancelled = endpoint_cancelled || parked_cancelled;
+            let running_cancel =
+                !(endpoint_cancelled || parked_cancelled) && domain_has_capability(domain);
+            let cancelled = endpoint_cancelled || parked_cancelled || running_cancel;
             if cancelled {
                 Ok((CANCELLED_STATUS, 0))
             } else {
@@ -458,17 +533,15 @@ fn rollback_recv(
     if let Some(slot) = installed {
         state.capabilities[domain.slot().index()].remove(domain, slot);
     }
-    if transfer.is_some() {
-        let restored = Message::new(
-            message.sender(),
-            message.tag(),
-            message.payload_len(),
-            message.payload(),
-            transfer,
-        );
-        if let Some(object) = state.objects[endpoint_id.index()].as_mut() {
-            object.restore(domain, restored, true);
-        }
+    let restored = Message::new(
+        message.sender(),
+        message.tag(),
+        message.payload_len(),
+        message.payload(),
+        transfer,
+    );
+    if let Some(object) = state.objects[endpoint_id.index()].as_mut() {
+        object.restore(domain, restored, false);
     }
 }
 
@@ -513,6 +586,8 @@ fn cap_revoke(frame: &TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcE
     if endpoint_is_unused(&state, removed.endpoint) {
         reclaim_object(&mut state, removed.endpoint);
     }
+    let mut wakes = [None; 2];
+    unbind_members_without_capabilities(&mut state, &mut wakes);
     Ok((0, removed_count as u64))
 }
 
@@ -545,8 +620,31 @@ pub(crate) fn teardown_domain(domain: DomainToken) -> TeardownOutcome {
     let mut outcome = TeardownOutcome::EMPTY;
     let mut state = IPC.lock();
     outcome.capabilities = state.capabilities[domain.slot().index()].count(domain);
-    for index in 0..abi::CAP_SLOTS_PER_DOMAIN {
-        state.capabilities[domain.slot().index()].remove_index(domain, index);
+    let ancestors: [_; abi::CAP_SLOTS_PER_DOMAIN] = core::array::from_fn(|index| {
+        state.capabilities[domain.slot().index()]
+            .capability_at(index)
+            .and_then(|_| CapSlot::try_new(index).ok())
+            .map(|slot| DerivationLink { domain, slot })
+    });
+
+    for (index, ancestor) in ancestors
+        .into_iter()
+        .enumerate()
+        .take(abi::CAP_SLOTS_PER_DOMAIN)
+    {
+        if state.capabilities[domain.slot().index()].remove_index(domain, index)
+            && let Some(slot) = ancestor
+        {
+            outcome.capabilities += revoke_derived_capabilities(&mut state, slot);
+        }
+    }
+
+    for object_index in 0..state.objects.len() {
+        let Some(object) = state.objects[object_index].as_mut() else {
+            continue;
+        };
+        object.queued_peer_failures(domain, &mut outcome.peer_failures);
+        outcome.queued_messages += object.drain_sender(domain);
     }
     for object_index in 0..state.objects.len() {
         outcome.queued_messages += state.objects[object_index]
@@ -566,6 +664,7 @@ pub(crate) fn teardown_domain(domain: DomainToken) -> TeardownOutcome {
             }
         }
     }
+    unbind_members_without_capabilities(&mut state, &mut outcome.waiters);
     let mut object_ids = [None; abi::ENDPOINT_POOL];
     for (index, object) in state.objects.iter().enumerate() {
         if object.is_some()
@@ -589,6 +688,15 @@ pub(crate) fn cancel_waiter(domain: DomainToken) -> bool {
         .iter_mut()
         .flatten()
         .any(|object| object.cancel_waiter(domain))
+}
+
+fn domain_has_capability(domain: DomainToken) -> bool {
+    let state = IPC.lock();
+    state.capabilities[domain.slot().index()]
+        .capability_slots()
+        .iter()
+        .flatten()
+        .any(|_| true)
 }
 
 fn reclaim_object(state: &mut IpcState, id: EndpointId) -> bool {
@@ -700,54 +808,4 @@ fn revoke_queued_messages(state: &mut IpcState, parent: DerivationLink) -> usize
         }
     }
     removed
-}
-
-#[cfg(test)]
-pub(crate) mod test_support {
-    use super::*;
-
-    pub(crate) fn reset() {
-        *IPC.lock() = IpcState::empty();
-    }
-
-    pub(crate) fn capability(domain: DomainToken, slot: CapSlot) -> Option<Capability> {
-        IPC.lock().capabilities[domain.slot().index()].get(domain, slot)
-    }
-
-    pub(crate) fn install_copy(
-        domain: DomainToken,
-        source_slot: CapSlot,
-        destination_slot: CapSlot,
-    ) -> bool {
-        let mut state = IPC.lock();
-        let Some(capability) = state.capabilities[domain.slot().index()].get(domain, source_slot)
-        else {
-            return false;
-        };
-        state.capabilities[domain.slot().index()]
-            .install(domain, destination_slot, capability)
-            .is_ok()
-    }
-
-    pub(crate) fn free_slot(domain: DomainToken) -> Option<CapSlot> {
-        IPC.lock().capabilities[domain.slot().index()].free_slot(domain)
-    }
-
-    pub(crate) fn find(domain: DomainToken, rights: Rights) -> Option<CapSlot> {
-        let state = IPC.lock();
-        find_slot(&state, domain, rights)
-    }
-
-    pub(crate) fn queued_for(domain: DomainToken) -> usize {
-        IPC.lock()
-            .objects
-            .iter()
-            .flatten()
-            .map(|object| object.queued_for(domain))
-            .sum()
-    }
-
-    pub(crate) fn peer_wake_on_teardown(domain: DomainToken) -> Option<DomainToken> {
-        teardown_domain(domain).waiters.into_iter().flatten().next()
-    }
 }

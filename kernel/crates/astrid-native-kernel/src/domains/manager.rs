@@ -8,7 +8,6 @@ use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::{PhysFrame, Size4KiB};
 
 use astrid_system_generation::ContentId;
-
 use super::paging::AddressSpace;
 use super::types::{
     BindError, CODE_BASE, ComponentImage, DomainGeneration, DomainHandle, DomainId,
@@ -172,6 +171,8 @@ static TERMINAL_CONTEXT: Mutex<Option<TrapContext>> = Mutex::new(None);
 
 /// The landed #1704 prefix is frozen through this exclusive append boundary.
 const IPC_APPEND_OFFSET: u64 = 71;
+/// Scenario 10 resumes at the end of the unchanged #1704 code prefix.
+const IPC_CANCEL_GUEST_APPEND_OFFSET: u64 = 415;
 
 static KERNEL_CR3: Once<(PhysFrame<Size4KiB>, Cr3Flags)> = Once::new();
 
@@ -325,6 +326,7 @@ pub(crate) fn prepare(
                 | Scenario::IpcClient
                 | Scenario::IpcPeerFault
                 | Scenario::IpcCancelServer
+                | Scenario::IpcCancelGuest
         ),
     });
     let handle = DomainHandle::new(
@@ -576,6 +578,12 @@ pub(crate) fn handle_domain_trap(frame: &mut TrapFrame, fault_address: u64) -> b
         super::harness::record_fault(fault_address);
     }
     let scenario = CURRENT.scenario.load(Ordering::SeqCst);
+    if vector == 6 && scenario == Scenario::IpcCancelGuest.value() && frame.rip == CODE_BASE + 95 {
+        // Scenario 10 deliberately reaches the unchanged shared invalid
+        // fall-through; only this new scenario resumes into appended bytes.
+    frame.rip = CODE_BASE + IPC_CANCEL_GUEST_APPEND_OFFSET;
+        return true;
+    }
     if vector == apic::TIMER_VECTOR && scenario >= Scenario::IpcServer.value() {
         // The landed #1704 dispatch is byte-frozen and has no path for the
         // new scenarios. Timer preemption is the one transition to the
@@ -804,10 +812,13 @@ impl Manager {
                 ipc_outcome.capabilities as u64,
                 ipc_outcome.queued_messages as u64,
             );
-            for (failed_peer, wake) in failed_peers
-                .iter_mut()
-                .zip(ipc_outcome.waiters.into_iter().flatten())
-            {
+            for (failed_peer, wake) in failed_peers.iter_mut().zip(
+                ipc_outcome
+                    .waiters
+                    .into_iter()
+                    .chain(ipc_outcome.peer_failures)
+                    .flatten(),
+            ) {
                 let Some(wake_handle) = super::wait::domain_handle_token(wake) else {
                     fail_terminal("invalid_ipc_wake");
                 };

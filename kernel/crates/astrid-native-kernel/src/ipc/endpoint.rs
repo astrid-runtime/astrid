@@ -5,6 +5,7 @@ use super::capability::{Capability, DomainToken};
 
 const ENDPOINT_MEMBERS: usize = 2;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SendOutcome {
     Delivered,
     Ready,
@@ -181,6 +182,55 @@ impl Endpoint {
         wakes
     }
 
+    pub(super) fn unbind_without_capability(
+        &mut self,
+        domain: DomainToken,
+    ) -> [Option<DomainToken>; 2] {
+        if self.members.contains(&Some(domain)) {
+            self.clear_domain(domain)
+        } else {
+            [None; 2]
+        }
+    }
+
+    pub(super) fn drain_sender(&mut self, sender: DomainToken) -> usize {
+        let mut removed = 0;
+        for queue in &mut self.queues {
+            if queue.is_some_and(|message| message.sender() == sender) && queue.take().is_some() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    pub(super) fn queued_peer_failures(
+        &self,
+        domain: DomainToken,
+        peers: &mut [Option<DomainToken>; 2],
+    ) {
+        for (index, queue) in self.queues.iter().enumerate() {
+            let Some(message) = queue else {
+                continue;
+            };
+            let peer = if message.sender() == domain {
+                self.members.get(index).copied().flatten()
+            } else if self.members.get(index).copied().flatten() == Some(domain) {
+                Some(message.sender())
+            } else {
+                None
+            };
+            let Some(peer) = peer else {
+                continue;
+            };
+            if peer == domain || peers.contains(&Some(peer)) {
+                continue;
+            }
+            if let Some(slot) = peers.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(peer);
+            }
+        }
+    }
+
     pub(super) fn cancel_waiter(&mut self, domain: DomainToken) -> bool {
         let Some(index) = self
             .waiters
@@ -202,6 +252,11 @@ impl Endpoint {
         self.destination_index(domain)
             .map(|index| usize::from(self.queues[index].is_some()))
             .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_waiter(&self, domain: DomainToken) -> bool {
+        self.waiters.contains(&Some(domain))
     }
 
     pub(super) fn clear_queue(&mut self, index: usize) -> bool {

@@ -42,7 +42,7 @@ const BOOT_CONTEXT_DOMAIN: &[u8] = b"astrid.boot.q35.uefi.tcg.v1";
 /// falsifier. The descriptor remains canonical and correctly signed; only
 /// compiled TrustedInput admission should reject it.
 const MISMATCH_PLAN_DIGEST: [u8; 32] = [0x99; 32];
-const _: () = assert!(EMULATOR_COMPONENT_LEN == 479);
+const _: () = assert!(EMULATOR_COMPONENT_LEN == 517);
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);

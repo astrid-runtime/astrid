@@ -169,6 +169,10 @@ impl CapTable {
         self.slots.get(index).copied().flatten()
     }
 
+    pub(super) fn capability_slots(&self) -> [Option<Capability>; CAP_SLOTS_PER_DOMAIN] {
+        self.slots
+    }
+
     pub(super) fn remove_index(&mut self, domain: DomainToken, index: usize) -> bool {
         if self.owner != Some(domain) {
             return false;

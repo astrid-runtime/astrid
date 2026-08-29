@@ -197,7 +197,7 @@ const EMULATOR_ROOT_VERIFY_KEY: [u8; 32] = [
     237, 73, 40, 198, 40, 209, 194, 198, 234, 233, 3, 56, 144, 89, 149, 97, 41, 89, 39, 58, 92, 99,
     249, 54, 54, 193, 70, 20, 172, 135, 55, 209,
 ];
-const _: () = assert!(EMULATOR_COMPONENT_LEN == 479);
+const _: () = assert!(EMULATOR_COMPONENT_LEN == 517);
 const LOADER_MEASUREMENT_DOMAIN: &[u8] = b"astrid.kimage.loader.measurement.v1";
 const LOADER_IDENTITY_DOMAIN: &[u8] = b"astrid.kimage.loader.identity.v1";
 const BOOT_CONTEXT_DOMAIN: &[u8] = b"astrid.boot.q35.uefi.tcg.v1";

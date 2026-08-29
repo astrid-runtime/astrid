@@ -174,7 +174,7 @@ pub(crate) fn scheduler() -> ! {
             IPC_FAULT_OK.store(true, Ordering::SeqCst);
             advance_ipc_cancel_server()
         },
-        PHASE_IPC_CANCEL_SERVER_PREPARE => cancel_ipc_server(),
+        PHASE_IPC_CANCEL_SERVER_PREPARE => ipc_cancel_guest_done(),
         PHASE_IPC_CANCEL_SERVER_DONE => finish(),
         _ => fail("invalid_harness_phase"),
     }
@@ -491,19 +491,18 @@ fn advance_ipc_cancel_server() -> ! {
         fail("ipc_peer_fault_flow_failed");
     }
     let (raw, expected) = authenticated();
-    let server = prepare_domain(&raw, expected, Scenario::IpcCancelServer);
+    let server = prepare_domain(&raw, expected, Scenario::IpcCancelGuest);
     store_handle(&IPC_SERVER_HANDLE, server);
     set_phase(PHASE_IPC_CANCEL_SERVER_PREPARE);
-    start_domain(server, Scenario::IpcCancelServer);
+    start_domain(server, Scenario::IpcCancelGuest);
 }
 
-fn cancel_ipc_server() -> ! {
+fn ipc_cancel_guest_done() -> ! {
     let server = handle(&IPC_SERVER_HANDLE);
-    let cancelled = manager::cancel(server).is_ok();
-    IPC_CANCEL_OK.store(cancelled, Ordering::SeqCst);
-    IPC_CANCEL_OK.store(report(IPC_CANCEL_GATE, cancelled), Ordering::SeqCst);
-    if !cancelled {
-        fail("blocked_ipc_cancel_rejected");
+    let passed = manager::is_stale(server) && manager::outstanding_frames() == 0;
+    IPC_CANCEL_OK.store(report(IPC_CANCEL_GATE, passed), Ordering::SeqCst);
+    if !passed {
+        fail("running_guest_ipc_cancel_rejected");
     }
     set_phase(PHASE_IPC_CANCEL_SERVER_DONE);
     scheduler()

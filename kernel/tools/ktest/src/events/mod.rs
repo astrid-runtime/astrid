@@ -195,14 +195,13 @@ const IPC_FAULT_CLIENT_TAIL_EVENTS: &[&str] = &[
     "domain.restore",
     "domain.reclaim",
 ];
-const IPC_CANCEL_TAIL_EVENTS: &[&str] = &[
-    "domain.cancel.request",
-    "ipc.wake",
+const IPC_CANCEL_GUEST_OPS: &[&str] = &["ipc.op", "ipc.op"];
+const IPC_CANCEL_GUEST_TAIL_EVENTS: &[&str] = &[
+    "domain.registers",
+    "domain.outcome",
     "ipc.reclaim",
     "domain.restore",
     "domain.reclaim",
-    "domain.cancelled",
-    "domain.outcome",
 ];
 const BOOT_MILESTONE_EVENTS: &[&str] = &[
     "boot.entry",
@@ -306,8 +305,8 @@ fn full_sequence() -> Vec<SequenceStep> {
     pattern.push(SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[9]));
     push_started(&mut pattern);
     pattern.push(SequenceStep::Many(GUEST_ENTRY_EVENTS));
-    pattern.push(SequenceStep::Many(IPC_PARK_TAIL_EVENTS));
-    pattern.push(SequenceStep::Many(IPC_CANCEL_TAIL_EVENTS));
+    pattern.push(SequenceStep::Many(IPC_CANCEL_GUEST_OPS));
+    pattern.push(SequenceStep::Many(IPC_CANCEL_GUEST_TAIL_EVENTS));
     pattern.push(SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[10]));
     pattern.push(SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[7]));
     pattern.extend([
@@ -332,7 +331,7 @@ const DOMAIN_STARTS: &[(u64, u64, u64)] = &[
     (2, 3, 7),
     (1, 8, 6),
     (2, 4, 8),
-    (1, 9, 9),
+    (1, 9, 10),
 ];
 const DOMAIN_ADMISSION_COUNT: usize = DOMAIN_STARTS.len() + 1;
 const DOMAIN_ENTERED: &[(u64, u64)] = &[
@@ -359,6 +358,7 @@ const DOMAIN_REGISTERS: &[(u64, u64, u64)] = &[
     (1, 6, 0),
     (2, 3, 0),
     (2, 4, 0),
+    (1, 9, 0),
 ];
 const DOMAIN_RECLAIMS: &[(u64, u64)] = &[
     (1, 1),
@@ -376,7 +376,7 @@ const DOMAIN_RECLAIMS: &[(u64, u64)] = &[
     (1, 9),
 ];
 const DOMAIN_CANCEL_REJECTS: &[(&str, u64, u64)] = &[("stale_handle", 1, 1)];
-const DOMAIN_CANCEL_IDENTITIES: &[(u64, u64)] = &[(2, 1), (1, 9)];
+const DOMAIN_CANCEL_IDENTITIES: &[(u64, u64)] = &[(2, 1)];
 const KERNEL_CR3_ROOT: &str = "0x101000";
 const KERNEL_CR3_FLAGS: u64 = 0;
 const DOMAIN_CONTEXT_FLAGS: u64 = 0;
@@ -392,7 +392,7 @@ const DOMAIN_OUTCOMES: &[(u64, u64, &str, u64, u64, &str, u64)] = &[
     (1, 6, "clean_exit", 3, 0, "0x0", 3),
     (2, 3, "clean_exit", 3, 0, "0x0", 3),
     (2, 4, "page_fault", 14, 6, HOSTILE_IPC_FAULT_ADDRESS, 3),
-    (1, 9, "cancelled", 0, 0, "0x0", 0),
+    (1, 9, "clean_exit", 3, 0, "0x0", 3),
 ];
 const HOSTILE_IPC_FAULT_ADDRESS: &str = "0x328000002000";
 const IPC_RECLAIMS: &[(u64, u64, u64, u64, u64)] = &[
@@ -415,6 +415,7 @@ const IPC_OPS: &[(u64, u64, &str, &str)] = &[
     (1, 7, "send", "ok"),
     (1, 8, "endpoint_create", "ok"),
     (1, 9, "endpoint_create", "ok"),
+    (1, 9, "cancel", "ok"),
 ];
 const HOSTILE_PEER_FAULT_ADDRESS: &str = "0x328000001000";
 
@@ -591,16 +592,22 @@ fn domain_lifecycle_holds(events: &[Value]) -> bool {
         .all(|event| {
             let entry_contract =
                 u64_field(event, "id") == Some(1) && u64_field(event, "generation") == Some(1);
+            let guest_cancel_contract = u64_field(event, "id") == Some(1)
+                && u64_field(event, "generation") == Some(9);
+            let guest_cancel_ok =
+                !guest_cancel_contract || u64_field(event, "rax") == Some(7);
             let zero_gpr = !entry_contract
-                || [
-                    "rax", "rbx", "rcx", "rdx", "rsi", "rbp", "r8", "r9", "r10", "r11", "r12",
-                    "r13", "r14", "r15",
-                ]
-                .iter()
-                .all(|name| u64_field(event, name) == Some(0));
+                || (u64_field(event, "rax") == Some(0)
+                    && [
+                        "rbx", "rcx", "rdx", "rsi", "rbp", "r8", "r9", "r10", "r11", "r12",
+                        "r13", "r14", "r15",
+                    ]
+                    .iter()
+                    .all(|name| u64_field(event, name) == Some(0)));
             string_field(event, "rsp").is_some_and(|rsp| rsp.starts_with("0x"))
                 && u64_field(event, "cpl") == Some(3)
                 && zero_gpr
+                && guest_cancel_ok
         });
     let kernel_cr3 = named_events(events, "kernel.cr3").first().copied();
     let kernel_cr3_ok = kernel_cr3.is_some_and(|event| {
@@ -749,8 +756,8 @@ fn domain_lifecycle_holds(events: &[Value]) -> bool {
             )
         })
         .eq(IPC_RECLAIMS.iter().copied());
-    let ipc_flow_ok = count_named(events, "ipc.park") == 5
-        && count_named(events, "ipc.wake") == 3
+    let ipc_flow_ok = count_named(events, "ipc.park") == 4
+        && count_named(events, "ipc.wake") == 2
         && count_named(events, "ipc.resume") == 2;
     let tamper_events = named_events(events, "domain.auth.reject")
         .into_iter()

@@ -3,14 +3,19 @@
 use core::sync::atomic::Ordering;
 
 use spin::Mutex;
+#[cfg(not(test))]
 use x86_64::VirtAddr;
+#[cfg(not(test))]
 use x86_64::registers::control::Cr3;
 
+#[cfg(not(test))]
 use super::manager::{
     CURRENT, MANAGER, fail_terminal, kernel_cr3_value, resume_stack_end, scheduler_resume,
 };
+#[cfg(not(test))]
 use super::paging::AddressSpace;
 use super::types::{DomainGeneration, DomainHandle, DomainId, KERNEL_STACK_TOP};
+#[cfg(not(test))]
 use crate::gdt;
 use crate::ipc;
 use crate::serial;
@@ -56,6 +61,7 @@ static PARKED: Mutex<[Option<ParkedDomain>; 2]> = Mutex::new([None, None]);
 static COPY_SCRATCH: Mutex<[u8; 96]> = Mutex::new([0; 96]);
 static PENDING_COMPLETION: Mutex<Option<CompletionRequest>> = Mutex::new(None);
 
+#[cfg(not(test))]
 pub(super) fn current_handle() -> DomainHandle {
     DomainHandle::new(
         DomainId(CURRENT.slot.load(Ordering::SeqCst)),
@@ -63,6 +69,7 @@ pub(super) fn current_handle() -> DomainHandle {
     )
 }
 
+#[cfg(not(test))]
 pub(super) fn park_current(frame: &mut TrapFrame, status: BlockStatus) -> ! {
     let handle = current_handle();
     let slot = handle.id().value() as usize;
@@ -97,6 +104,7 @@ pub(super) fn park_current(frame: &mut TrapFrame, status: BlockStatus) -> ! {
     park_in_kernel_context(resume_stack_end(), kernel_cr3_value());
 }
 
+#[cfg(not(test))]
 fn set_domain_blocked(handle: DomainHandle) -> Result<(), ()> {
     let mut manager = MANAGER.lock();
     let Some(domain) = manager.valid_domain_mut(handle) else {
@@ -152,6 +160,7 @@ pub(super) fn mark_ipc_peer_failed(handle: DomainHandle) {
     }
 }
 
+#[cfg(not(test))]
 pub(crate) fn resume_blocked(handle: DomainHandle) -> Result<(), ()> {
     let Some(parked) = PARKED.lock()[handle.id().value() as usize] else {
         return Err(());
@@ -229,6 +238,7 @@ pub(crate) fn resume_blocked(handle: DomainHandle) -> Result<(), ()> {
     resume_user(parked.frame, user_root)
 }
 
+#[cfg(not(test))]
 fn complete_received_payload(
     space: &AddressSpace,
     address: u64,
@@ -249,6 +259,7 @@ fn complete_received_payload(
     .map_err(|_| ())
 }
 
+#[cfg(not(test))]
 unsafe extern "C" fn complete_pending(frame: *mut TrapFrame) -> bool {
     let Some(request) = PENDING_COMPLETION.lock().take() else {
         return false;
@@ -260,6 +271,7 @@ unsafe extern "C" fn complete_pending(frame: *mut TrapFrame) -> bool {
     true
 }
 
+#[cfg(not(test))]
 #[unsafe(naked)]
 extern "C" fn write_completion_in_domain_context(
     frame: usize,
@@ -285,6 +297,7 @@ extern "C" fn write_completion_in_domain_context(
     );
 }
 
+#[cfg(not(test))]
 #[unsafe(naked)]
 extern "C" fn resume_user(frame: usize, root: u64) -> ! {
     core::arch::naked_asm!(
@@ -351,6 +364,7 @@ pub(crate) fn release_ipc(domain_slot: u64, generation: u64) -> ipc::TeardownOut
     ipc::teardown_domain(domain)
 }
 
+#[cfg(not(test))]
 pub(crate) fn copy_current_user(address: u64, buffer: &mut [u8], to_user: bool) -> bool {
     if !CURRENT.active.load(Ordering::SeqCst) {
         return false;
@@ -389,6 +403,7 @@ pub(crate) fn copy_current_user(address: u64, buffer: &mut [u8], to_user: bool) 
     crate::ipc::finish_copy(buffer, scratch.as_slice(), copied, to_user)
 }
 
+#[cfg(not(test))]
 #[unsafe(naked)]
 extern "C" fn park_in_kernel_context(kernel_stack_end: usize, kernel_cr3: u64) -> ! {
     core::arch::naked_asm!(
@@ -399,6 +414,7 @@ extern "C" fn park_in_kernel_context(kernel_stack_end: usize, kernel_cr3: u64) -
     );
 }
 
+#[cfg(not(test))]
 unsafe extern "C" fn call_copy_user(
     space: *const AddressSpace,
     address: u64,
@@ -413,6 +429,7 @@ unsafe extern "C" fn call_copy_user(
     unsafe { (*space).copy_user(address, buffer, to_user != 0) }
 }
 
+#[cfg(not(test))]
 #[unsafe(naked)]
 extern "C" fn copy_in_kernel_context(
     space: *const AddressSpace,
@@ -482,5 +499,88 @@ pub(crate) mod test_support {
         PARKED.lock()[handle.id().value() as usize]
             .as_ref()
             .is_some_and(|parked| parked.handle == handle)
+    }
+
+    pub(crate) fn reset() {
+        *PARKED.lock() = [None, None];
+        *PENDING_COMPLETION.lock() = None;
+    }
+
+    pub(crate) fn all_statuses() -> [Option<BlockStatus>; 2] {
+        PARKED
+            .lock()
+            .map(|parked| parked.map(|parked| parked.status))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{all_statuses, park, reset, status};
+    use super::*;
+    use crate::ipc::test_support::{endpoint_create, install_transfer_message, reset as reset_ipc};
+    use crate::ipc::{DomainToken, bind_peer, prepare_domain, teardown_domain};
+    use crate::test_lock::LOCK;
+
+    fn token(slot: u64) -> DomainToken {
+        DomainToken::new(slot, 1).unwrap()
+    }
+
+    fn handle(slot: u64) -> DomainHandle {
+        DomainHandle::new(DomainId(slot), DomainGeneration(1))
+    }
+
+    #[test]
+    fn peer_failure_terminals_are_sent_and_received() {
+        let _guard = LOCK.lock();
+        reset();
+        reset_ipc();
+        park(handle(0), BlockStatus::Sent, 0, 0, 96);
+        park(handle(1), BlockStatus::Received, 0, 0, 96);
+        mark_ipc_peer_failed(handle(0));
+        mark_ipc_peer_failed(handle(1));
+        assert_eq!(
+            all_statuses(),
+            [Some(BlockStatus::Faulted), Some(BlockStatus::Faulted)]
+        );
+    }
+
+    #[test]
+    fn sender_teardown_reports_and_fails_parked_sent_sender() {
+        let _guard = LOCK.lock();
+        reset();
+        reset_ipc();
+        let sender = token(0);
+        let receiver = token(1);
+        prepare_domain(sender);
+        prepare_domain(receiver);
+        let endpoint = endpoint_create(sender).unwrap();
+        assert!(bind_peer(sender, receiver).is_ok());
+        assert!(crate::ipc::test_support::park_member(receiver));
+        park(handle(1), BlockStatus::Received, 0, 0, 96);
+        assert!(install_transfer_message(receiver, sender, endpoint, None));
+        let outcome = teardown_domain(sender);
+        assert_eq!(outcome.queued_messages, 1);
+        assert!(outcome.peer_failures.contains(&Some(receiver)));
+    }
+
+    #[test]
+    fn receiver_teardown_finds_parked_sent_sender_without_waiter() {
+        let _guard = LOCK.lock();
+        reset();
+        reset_ipc();
+        let sender = token(0);
+        let receiver = token(1);
+        prepare_domain(sender);
+        prepare_domain(receiver);
+        let endpoint = endpoint_create(sender).unwrap();
+        assert!(bind_peer(sender, receiver).is_ok());
+        assert!(crate::ipc::test_support::park_member(receiver));
+        park(handle(1), BlockStatus::Received, 0, 0, 96);
+        assert!(install_transfer_message(receiver, sender, endpoint, None));
+        park(handle(0), BlockStatus::Sent, 0, 0, 96);
+        let outcome = teardown_domain(receiver);
+        assert_eq!(outcome.peer_failures, [Some(sender), None]);
+        mark_ipc_peer_failed(handle(0));
+        assert_eq!(status(handle(0)), Some(BlockStatus::Faulted));
     }
 }

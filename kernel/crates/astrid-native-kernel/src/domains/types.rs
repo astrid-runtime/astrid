@@ -205,7 +205,9 @@ pub(crate) enum Scenario {
     IpcServer = 6,
     IpcClient = 7,
     IpcPeerFault = 8,
+    #[allow(dead_code)]
     IpcCancelServer = 9,
+    IpcCancelGuest = 10,
 }
 
 impl Scenario {
@@ -256,7 +258,7 @@ impl DomainGeneration {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct DomainHandle {
+pub(crate) struct DomainHandle {
     id: DomainId,
     generation: DomainGeneration,
 }
