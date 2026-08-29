@@ -39,7 +39,8 @@ durable I/O, and authorization remain outside the primitive crate.
 Version one records:
 
 - algorithm: FastCDC 2020;
-- implementation revision: `fastcdc` 4.0.1;
+- implementation revision: one; even profiles are built with `fastcdc` 5.0.0
+  and legacy odd profiles retain an exact `fastcdc` 4.0.1 compatibility edge;
 - normalization: level one;
 - minimum: 16 KiB;
 - target average: 64 KiB;

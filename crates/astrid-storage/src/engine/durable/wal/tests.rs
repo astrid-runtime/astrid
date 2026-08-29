@@ -256,7 +256,7 @@ impl Seek for FailingProbeReader {
     }
 }
 
-fn scheme() -> IdentityScheme {
+pub(super) fn scheme() -> IdentityScheme {
     IdentityScheme::new(1, 1).unwrap()
 }
 
@@ -271,7 +271,7 @@ fn sequence(value: u64) -> WalSequence {
     WalSequence::new(value).unwrap()
 }
 
-fn record(value: u64, payload_len: usize) -> ObjectRecord {
+pub(super) fn record(value: u64, payload_len: usize) -> ObjectRecord {
     let mut payload = value.to_be_bytes().to_vec();
     payload.resize(payload_len.max(8), 0);
     ObjectRecord::new(
@@ -285,13 +285,13 @@ fn record(value: u64, payload_len: usize) -> ObjectRecord {
     .unwrap()
 }
 
-fn object_id(value: u64) -> ObjectId {
+pub(super) fn object_id(value: u64) -> ObjectId {
     let mut bytes = [0_u8; 32];
     bytes[..8].copy_from_slice(&value.to_be_bytes());
     ObjectId::new(bytes)
 }
 
-fn root(value: u64) -> RootState {
+pub(super) fn root(value: u64) -> RootState {
     RootState {
         generation: RootGeneration::INITIAL,
         commit: object_id(value),
@@ -478,7 +478,7 @@ fn corrupt_record_checksum(bytes: &mut [u8], index: usize) {
     }
 }
 
-fn scan_events(bytes: Vec<u8>) -> Result<Vec<WalEvent>, WalError> {
+pub(super) fn scan_events(bytes: Vec<u8>) -> Result<Vec<WalEvent>, WalError> {
     let mut scanner = WalScanner::new(
         Cursor::new(bytes),
         TestIdentity,

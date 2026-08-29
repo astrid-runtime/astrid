@@ -74,7 +74,7 @@ astrid-workspace = { path = "crates/astrid-workspace", version = "0.10.4" }
 anyhow = "1.0"
 arboard = "3"
 arc-swap = "1.7"
-lz4_flex = "0.12"
+lz4_flex = "0.14"
 # Streaming + HTTP-server deps (async-stream, axum, tokio-stream,
 # tower, tower-http, utoipa) all back the new `astrid-gateway` crate
 # and have no in-workspace substitute. They are scoped to
@@ -118,9 +118,10 @@ directories = "6.0"
 ed25519-dalek = { version = "3.0", features = ["rand_core", "zeroize", "serde"] }
 flate2 = "1.0"
 # Chunk boundaries are persistent principal-store format, not merely an
-# implementation detail. Exact-pin the audited FastCDC 2020 implementation;
-# upgrades require golden-boundary verification and a new chunking profile.
-fastcdc = "=4.0.1"
+# implementation detail. Exact-pin FastCDC 5 for even profiles and preserve the
+# audited FastCDC 4 scan for the legacy odd revision-1 compatibility edge.
+fastcdc = "=5.0.0"
+fastcdc-v4 = { package = "fastcdc", version = "=4.0.1" }
 fs2 = "0.4"
 futures = "0.3"
 globset = "0.4"
@@ -145,7 +146,7 @@ keyring = { version = "3", features = [
 landlock = "0.4"
 libc = "0.2"
 nix = { version = "0.31", features = ["process", "signal", "user", "fs", "resource"] }
-process-wrap = { version = "9", features = ["tokio1"] }
+process-wrap = { version = "10", features = ["tokio1"] }
 # Async-signal-safe signal handling on a dedicated OS thread. Used by the
 # daemon's SIGTERM/SIGINT/SIGHUP watchdog, which owns those signals off the
 # tokio runtime so the daemon is killable even when every worker is pinned.
@@ -195,11 +196,11 @@ rcgen = "0.14"
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 regex = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
-# Pinned to the 2.2.x patch range (~). RMCP releases breaking protocol and API
+# Pinned to the 3.1.x patch range (~). RMCP releases breaking protocol and API
 # changes in minor versions. Cargo.lock is committed, but the patch range also
 # prevents fresh resolution from silently adopting a future incompatible minor.
 # It still admits compatible bug and security fixes.
-rmcp = { version = "~3.1.2", features = ["server", "client", "transport-io", "transport-child-process", "elicitation", "macros", "request-state", "schemars"] }
+rmcp = { version = "~3.1.4", features = ["server", "client", "transport-io", "elicitation", "macros", "request-state", "schemars"] }
 rustyline = { version = "18", features = ["derive"] }
 semver = "1"
 serde = { version = "1.0", features = ["derive"] }
@@ -212,7 +213,7 @@ sha2 = "0.11"
 sigstore-verify = { version = "=0.11.0", default-features = false, features = ["rustls", "tuf"] }
 subtle = "2"
 surrealkv = "0.21"
-syn = { version = "3", features = ["full", "visit"] }
+syn = { version = "~3.0.4", features = ["full", "visit"] }
 syntect = { version = "5", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-fancy"] }
 tar = "0.4"
 teloxide = { version = "0.13", default-features = false, features = ["macros", "rustls", "ctrlc_handler"] }
@@ -232,7 +233,7 @@ thiserror = "2.0"
 # `rt-multi-thread`).
 tokio = { version = "1.49", features = ["sync", "macros", "time", "rt", "io-util"] }
 tokio-util = "0.7"
-toml = "0.9"
+toml = "~1.1.4"
 # Middleware substrate axum is built on (`Service` trait composition,
 # request-id, trace, CORS, body-size limit, response-header injection).
 # Dropping `tower-http` means re-implementing each middleware by hand;
@@ -252,16 +253,16 @@ url = "2"
 # other OpenAPI generator. `axum_extras` plugs into axum's extractor
 # system so `#[utoipa::path]` annotations on handlers carry through.
 utoipa = { version = "5", features = ["axum_extras"] }
-uuid = { version = "1.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
+uuid = { version = "~1.25.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
 walkdir = "2.5"
 wasm-encoder = "0.256"
 wat = "1.256"
 wasmparser = "0.256"
 windows-sys = "0.61"
-wit-component = "0.256"
+wit-component = "0.257.1"
 wit-parser = "0.257.1"
-wasmtime = { version = "47.0.3", features = ["component-model", "cranelift"] }
-wasmtime-wasi = "47.0.3"
+wasmtime = { version = "48.0.1", features = ["component-model", "cranelift"] }
+wasmtime-wasi = "48.0.1"
 unicode-normalization = "=0.1.25"
 unicode-width = "0.2"
 which = "8"
