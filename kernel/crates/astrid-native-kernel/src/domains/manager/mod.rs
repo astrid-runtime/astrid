@@ -1,10 +1,11 @@
 //! Typed domain admission, execution, fault containment, and reclamation.
 
+#[cfg(not(test))]
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use spin::{Mutex, Once};
+use spin::Mutex;
 #[cfg(not(test))]
-use x86_64::VirtAddr;
+use spin::Once;
 #[cfg(not(test))]
 use x86_64::registers::control::{Cr3, Cr3Flags};
 #[cfg(not(test))]
@@ -12,14 +13,14 @@ use x86_64::structures::paging::{PhysFrame, Size4KiB};
 
 #[cfg(not(test))]
 use super::paging::AddressSpace;
-use super::types::{
-    BindError, CODE_BASE, ComponentImage, DomainGeneration, DomainHandle, DomainId,
-    DomainPagingError, ENTRYPOINT, KERNEL_STACK_TOP, Outcome, PEER_PROBE, SLOT_CAPACITY, Scenario,
-};
+use super::types::{BindError, DomainHandle, DomainPagingError, SLOT_CAPACITY, Scenario};
+#[cfg(not(test))]
+use super::types::{CODE_BASE, ComponentImage, DomainGeneration, DomainId, Outcome, PEER_PROBE};
 #[cfg(not(test))]
 use crate::apic;
 #[cfg(not(test))]
 use crate::gdt;
+#[cfg(not(test))]
 use crate::ipc;
 #[cfg(not(test))]
 use crate::memory::FRAME_SIZE;
@@ -27,6 +28,7 @@ use crate::memory::FRAME_SIZE;
 use crate::serial;
 #[cfg(not(test))]
 use crate::trap::TrapFrame;
+#[cfg(not(test))]
 use astrid_system_generation::ContentId;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrepareError {
@@ -427,108 +429,11 @@ pub fn peer_is_prepared(handle: DomainHandle) -> bool {
         })
 }
 
-#[cfg(not(test))]
-pub fn start(handle: DomainHandle, scenario: Scenario) -> Result<(), PrepareError> {
-    if let Some(error) = lifecycle_error() {
-        return Err(error);
-    }
-    let context = {
-        let mut manager = MANAGER.lock();
-        let Some(domain) = manager.valid_domain_mut(handle) else {
-            return Err(PrepareError::Bind(BindError::NotInstalled));
-        };
-        if domain.state != DomainState::Prepared || domain.scenario != scenario {
-            return Err(PrepareError::Bind(BindError::Malformed));
-        }
-        let Some(space) = domain.space.as_ref() else {
-            return Err(PrepareError::Paging(
-                super::types::DomainPagingError::PolicyViolation,
-            ));
-        };
-        if let Some(error) = lifecycle_error() {
-            return Err(error);
-        }
-        let root = space.root_phys();
-        let user_stack = space.user_stack_top();
-        let quota = domain.quota_ticks;
-        let source = space.source_root();
-        if Cr3::read() != source {
-            return Err(PrepareError::WrongCr3);
-        }
-        domain.state = DomainState::Running;
-        (root, user_stack, quota, scenario)
-    };
-    let (root, user_end, quota, scenario) = context;
-    gdt::set_privilege_stack(VirtAddr::new(KERNEL_STACK_TOP));
-    apic::unmask_timer();
-    let (_, source_flags) = Cr3::read();
-    CURRENT.stack_end.store(user_end, Ordering::SeqCst);
-    CURRENT.slot.store(handle.id().0, Ordering::SeqCst);
-    CURRENT
-        .generation
-        .store(handle.generation().0, Ordering::SeqCst);
-    CURRENT.ticks.store(0, Ordering::SeqCst);
-    CURRENT.quota.store(quota, Ordering::SeqCst);
-    CURRENT.scenario.store(scenario.value(), Ordering::SeqCst);
-    CURRENT.root.store(root, Ordering::SeqCst);
-    CURRENT
-        .root_flags
-        .store(source_flags.bits(), Ordering::SeqCst);
-    CURRENT.entered.store(false, Ordering::SeqCst);
-    CURRENT.active.store(true, Ordering::SeqCst);
-    serial::ev_domain_started(handle.id().0 + 1, handle.generation().0, scenario.value());
-    enter_user(root, user_end, scenario.value());
-}
+mod start;
 
+pub(super) use start::StartContext;
 #[cfg(not(test))]
-fn enter_user(root: u64, stack: u64, scenario: u64) -> ! {
-    let (user_code, user_data) = gdt::user_selectors();
-    let user_data = user_data.0 as u64;
-    let user_code = user_code.0 as u64;
-    // SAFETY: the address space was audited; the TSS has a real guarded RSP0;
-    // the user selectors, entry, stack, and quota were validated by admission.
-    // Guest GP inputs are explicit: RDI carries the scenario and every other
-    // guest-visible GP register and FS/GS selector starts at zero. The entry
-    // address is staged through R12 because RBX must be cleared after use.
-    unsafe {
-        core::arch::asm!(
-            "mov rbx, {entry}",
-            "mov r12, rbx",
-            "mov cr3, rcx",
-            "xor eax, eax",
-            "xor ebx, ebx",
-            "xor edx, edx",
-            "xor esi, esi",
-            "xor edi, edi",
-            "mov edi, r8d",
-            "xor ebp, ebp",
-            "xor r13d, r13d",
-            "xor r14d, r14d",
-            "xor r15d, r15d",
-            "xor ecx, ecx",
-            "mov fs, cx",
-            "mov gs, cx",
-            "push r9",
-            "push r10",
-            "push 0x202",
-            "push r11",
-            "push r12",
-            "xor r9d, r9d",
-            "xor r10d, r10d",
-            "xor r11d, r11d",
-            "xor r12d, r12d",
-            "xor r8d, r8d",
-            "iretq",
-            in("rcx") root,
-            in("r9") user_data,
-            in("r10") stack,
-            in("r11") user_code,
-            entry = in(reg) CODE_BASE + ENTRYPOINT,
-            in("r8") scenario,
-            options(noreturn)
-        );
-    }
-}
+pub(super) use start::{enter_running, stage_context, staged_state, start_running};
 
 #[cfg(not(test))]
 pub extern "C" fn scheduler_resume() -> ! {
@@ -777,7 +682,10 @@ pub fn active_lifecycle_guard_rejects(
         prepare(raw, expected, scenario),
         Err(PrepareError::ActiveDomain)
     );
-    let start_rejected = matches!(start(handle, scenario), Err(PrepareError::ActiveDomain));
+    let start_rejected = matches!(
+        stage_context(handle, scenario),
+        Err(PrepareError::ActiveDomain)
+    );
     let cancel_rejected = matches!(cancel(handle), Err(CancelError::ActiveDomain));
     CURRENT.active.store(false, Ordering::SeqCst);
     prepare_rejected
