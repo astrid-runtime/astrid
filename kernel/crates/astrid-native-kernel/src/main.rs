@@ -18,16 +18,25 @@
 #![no_std]
 #![no_main]
 
-mod apic;
-mod closure;
-mod domains;
-mod entropy;
-mod gdt;
-mod interrupts;
-mod memory;
-mod serial;
-mod tests;
-mod trap;
+use astrid_native_kernel::platform::{self, Platform};
+use astrid_native_kernel::tests;
+use astrid_native_kernel::{apic, closure, domains, entropy, gdt, interrupts, memory, serial};
+
+struct KernelPlatform;
+
+impl Platform for KernelPlatform {
+    fn copy_current_user(&self, address: u64, buffer: &mut [u8], to_user: bool) -> bool {
+        domains::copy_current_user(address, buffer, to_user)
+    }
+
+    fn ev_ipc_op(&self, id: u64, generation: u64, operation: &str, status: &str) {
+        serial::ev_ipc_op(id, generation, operation, status);
+    }
+}
+
+fn install_ipc_platform() {
+    platform::install(&KernelPlatform);
+}
 
 use astrid_system_generation::{MANIFEST_LEN, verify_manifest};
 use bootloader_api::config::Mapping;
@@ -44,6 +53,7 @@ static BOOTLOADER_CONFIG: BootloaderConfig = {
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    install_ipc_platform();
     serial::init();
     serial::ev_boot_entry();
 

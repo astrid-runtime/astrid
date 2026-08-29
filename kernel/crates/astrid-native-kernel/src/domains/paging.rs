@@ -342,7 +342,7 @@ impl AddressSpace {
         Ok(())
     }
 
-    fn leaf_frame(&self, virtual_address: u64) -> Option<Frame> {
+    fn leaf_entry(&self, virtual_address: u64) -> Option<(Frame, PageTableFlags)> {
         let address = VirtAddr::new(virtual_address);
         let indices = [
             usize::from(address.p4_index()),
@@ -361,15 +361,49 @@ impl AddressSpace {
                 return None;
             }
             if level == 3 {
-                return Some(Frame::from_phys(entry.addr().as_u64()));
+                return Some((Frame::from_phys(entry.addr().as_u64()), entry.flags()));
             }
             table = entry.addr().as_u64();
         }
         None
     }
 
+    pub(super) fn copy_user(&self, virtual_address: u64, buffer: &mut [u8], to_user: bool) -> bool {
+        if buffer.len() > super::types::PAGE_SIZE {
+            return false;
+        }
+        let Some(end) = virtual_address.checked_add(buffer.len() as u64) else {
+            return false;
+        };
+        if end > (1u64 << 47) {
+            return false;
+        }
+        for (offset, byte) in buffer.iter_mut().enumerate() {
+            let address = virtual_address + offset as u64;
+            let Some((frame, flags)) = self.leaf_entry(address) else {
+                return false;
+            };
+            if !flags.contains(PageTableFlags::USER_ACCESSIBLE | PageTableFlags::PRESENT)
+                || (to_user && !flags.contains(PageTableFlags::WRITABLE))
+            {
+                return false;
+            }
+            let source = (memory::phys_offset() + frame.phys() + (address & 0xfff)) as *mut u8;
+            // SAFETY: the audited user leaf is exclusively mapped in the
+            // current address space and ring zero copies one bounded byte.
+            unsafe {
+                if to_user {
+                    source.write_volatile(*byte);
+                } else {
+                    *byte = source.read_volatile();
+                }
+            }
+        }
+        true
+    }
+
     fn zeroed_at(&self, virtual_address: u64) -> bool {
-        let Some(frame) = self.leaf_frame(virtual_address) else {
+        let Some((frame, _flags)) = self.leaf_entry(virtual_address) else {
             return false;
         };
         // SAFETY: the mapped leaf remains exclusively owned by this inactive

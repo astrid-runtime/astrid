@@ -25,6 +25,9 @@ const ACTIVE_GUARD_GATE: &str = "active_domain_lifecycle_exclusion";
 const STALE_GATE: &str = "stale_handle_rejection";
 const OVERFLOW_GATE: &str = "generation_overflow_is_fail_closed";
 const RESTORE_GATE: &str = "exact_kernel_cr3_restore";
+const IPC_EXCHANGE_GATE: &str = "authenticated_domains_exchange_bounded_capability_message";
+const IPC_FAULT_GATE: &str = "peer_fault_wakes_blocked_recv_with_typed_status";
+const IPC_CANCEL_GATE: &str = "cancel_reclaims_blocked_ipc_exactly_once";
 
 const PHASE_ENTRY: u64 = 0;
 const PHASE_INVALID_PREPARE: u64 = 1;
@@ -33,6 +36,15 @@ const PHASE_QUOTA_PREPARE: u64 = 3;
 const PHASE_PEER_DONE: u64 = 4;
 const PHASE_HOSTILE_PREPARE: u64 = 5;
 const PHASE_DONE: u64 = 7;
+const PHASE_IPC_SERVER_PREPARE: u64 = 8;
+const PHASE_IPC_CLIENT_PREPARE: u64 = 10;
+const PHASE_IPC_SERVER_RESUMED: u64 = 12;
+const PHASE_IPC_CLIENT_RESUMED: u64 = 13;
+const PHASE_IPC_FAULT_SERVER_PREPARE: u64 = 14;
+const PHASE_IPC_FAULT_CLIENT_PREPARE: u64 = 16;
+const PHASE_IPC_FAULT_SERVER_RESUMED: u64 = 17;
+const PHASE_IPC_CANCEL_SERVER_PREPARE: u64 = 18;
+const PHASE_IPC_CANCEL_SERVER_DONE: u64 = 20;
 
 static PHASE: AtomicU64 = AtomicU64::new(PHASE_ENTRY);
 static ENTRY_HANDLE: AtomicU64 = AtomicU64::new(0);
@@ -43,6 +55,8 @@ static PEER_HANDLE: AtomicU64 = AtomicU64::new(0);
 static HOSTILE_HANDLE: AtomicU64 = AtomicU64::new(0);
 static HOSTILE_PEER_PROBE: AtomicU64 = AtomicU64::new(0);
 static LAST_FAULT: AtomicU64 = AtomicU64::new(0);
+static IPC_SERVER_HANDLE: AtomicU64 = AtomicU64::new(0);
+static IPC_CLIENT_HANDLE: AtomicU64 = AtomicU64::new(0);
 
 static AUTH_OK: AtomicBool = AtomicBool::new(false);
 static ENTRY_OK: AtomicBool = AtomicBool::new(false);
@@ -60,6 +74,9 @@ static ACTIVE_GUARD_OK: AtomicBool = AtomicBool::new(false);
 static STALE_OK: AtomicBool = AtomicBool::new(false);
 static OVERFLOW_OK: AtomicBool = AtomicBool::new(false);
 static RESTORE_OK: AtomicBool = AtomicBool::new(false);
+static IPC_EXCHANGE_OK: AtomicBool = AtomicBool::new(false);
+static IPC_FAULT_OK: AtomicBool = AtomicBool::new(false);
+static IPC_CANCEL_OK: AtomicBool = AtomicBool::new(false);
 
 fn handle(storage: &AtomicU64) -> DomainHandle {
     let bits = storage.load(Ordering::SeqCst);
@@ -113,6 +130,14 @@ pub(crate) fn record_outcome(outcome: Outcome, reclaim_once: bool) {
         PHASE_FAULT_PREPARE | PHASE_HOSTILE_PREPARE => Outcome::PageFault,
         PHASE_QUOTA_PREPARE => Outcome::QuotaExhausted,
         PHASE_PEER_DONE => Outcome::CleanExit,
+        PHASE_IPC_SERVER_PREPARE
+        | PHASE_IPC_CLIENT_PREPARE
+        | PHASE_IPC_SERVER_RESUMED
+        | PHASE_IPC_CLIENT_RESUMED
+        | PHASE_IPC_FAULT_SERVER_PREPARE
+        | PHASE_IPC_FAULT_SERVER_RESUMED
+        | PHASE_IPC_CANCEL_SERVER_PREPARE => Outcome::CleanExit,
+        PHASE_IPC_FAULT_CLIENT_PREPARE => Outcome::PageFault,
         _ => Outcome::UnexpectedFault,
     };
     if outcome != expected {
@@ -135,7 +160,22 @@ pub(crate) fn scheduler() -> ! {
         PHASE_QUOTA_PREPARE => quota_completed(),
         PHASE_PEER_DONE => advance_hostile_prepare(),
         PHASE_HOSTILE_PREPARE => clean_second_started(),
-        PHASE_DONE => finish(),
+        PHASE_DONE => advance_ipc_exchange(),
+        PHASE_IPC_SERVER_PREPARE => start_ipc_client(),
+        PHASE_IPC_CLIENT_PREPARE => resume_ipc_server(),
+        PHASE_IPC_SERVER_RESUMED => resume_ipc_client(),
+        PHASE_IPC_CLIENT_RESUMED => advance_ipc_fault_server(),
+        PHASE_IPC_FAULT_SERVER_PREPARE => start_ipc_fault_client(),
+        PHASE_IPC_FAULT_CLIENT_PREPARE => {
+            IPC_FAULT_OK.store(true, Ordering::SeqCst);
+            advance_ipc_cancel_server()
+        },
+        PHASE_IPC_FAULT_SERVER_RESUMED => {
+            IPC_FAULT_OK.store(true, Ordering::SeqCst);
+            advance_ipc_cancel_server()
+        },
+        PHASE_IPC_CANCEL_SERVER_PREPARE => ipc_cancel_guest_done(),
+        PHASE_IPC_CANCEL_SERVER_DONE => finish(),
         _ => fail("invalid_harness_phase"),
     }
 }
@@ -360,8 +400,120 @@ fn clean_second_started() -> ! {
     start_domain(clean, Scenario::Exit);
 }
 
+fn authenticated() -> ([u8; EMULATOR_COMPONENT_LEN], ContentId) {
+    (authenticated_component(), authenticated_component_id())
+}
+
+fn advance_ipc_exchange() -> ! {
+    let (raw, expected) = authenticated();
+    let server = prepare_domain(&raw, expected, Scenario::IpcServer);
+    store_handle(&IPC_SERVER_HANDLE, server);
+    set_phase(PHASE_IPC_SERVER_PREPARE);
+    start_domain(server, Scenario::IpcServer);
+}
+
+fn start_ipc_client() -> ! {
+    let server = handle(&IPC_SERVER_HANDLE);
+    let (raw, expected) = authenticated();
+    let client = prepare_domain(&raw, expected, Scenario::IpcClient);
+    store_handle(&IPC_CLIENT_HANDLE, client);
+    let bound = crate::domains::bind_ipc_peer(
+        server.id().value(),
+        manager::generation(server).unwrap_or_default(),
+        client.id().value(),
+        manager::generation(client).unwrap_or_default(),
+    );
+    if !bound {
+        fail("ipc_peer_binding_rejected");
+    }
+    set_phase(PHASE_IPC_CLIENT_PREPARE);
+    start_domain(client, Scenario::IpcClient);
+}
+
+fn resume_ipc_server() -> ! {
+    let server = handle(&IPC_SERVER_HANDLE);
+    set_phase(PHASE_IPC_SERVER_RESUMED);
+    match super::wait::resume_blocked(server) {
+        Ok(()) => unreachable!("resuming a parked domain does not return"),
+        Err(()) => fail("ipc_server_resume_rejected"),
+    }
+}
+
+fn resume_ipc_client() -> ! {
+    IPC_EXCHANGE_OK.store(true, Ordering::SeqCst);
+    let client = handle(&IPC_CLIENT_HANDLE);
+    set_phase(PHASE_IPC_CLIENT_RESUMED);
+    match super::wait::resume_blocked(client) {
+        Ok(()) => unreachable!("resuming a parked domain does not return"),
+        Err(()) => fail("ipc_client_resume_rejected"),
+    }
+}
+
+fn advance_ipc_fault_server() -> ! {
+    IPC_EXCHANGE_OK.store(
+        report(IPC_EXCHANGE_GATE, IPC_EXCHANGE_OK.load(Ordering::SeqCst)),
+        Ordering::SeqCst,
+    );
+    if !IPC_EXCHANGE_OK.load(Ordering::SeqCst) {
+        fail("ipc_exchange_flow_failed");
+    }
+    let (raw, expected) = authenticated();
+    let server = prepare_domain(&raw, expected, Scenario::IpcServer);
+    store_handle(&IPC_SERVER_HANDLE, server);
+    set_phase(PHASE_IPC_FAULT_SERVER_PREPARE);
+    start_domain(server, Scenario::IpcServer);
+}
+
+fn start_ipc_fault_client() -> ! {
+    let server = handle(&IPC_SERVER_HANDLE);
+    let (raw, expected) = authenticated();
+    let client = prepare_domain(&raw, expected, Scenario::IpcPeerFault);
+    store_handle(&IPC_CLIENT_HANDLE, client);
+    let bound = crate::domains::bind_ipc_peer(
+        server.id().value(),
+        manager::generation(server).unwrap_or_default(),
+        client.id().value(),
+        manager::generation(client).unwrap_or_default(),
+    );
+    if !bound {
+        fail("fault_ipc_peer_binding_rejected");
+    }
+    set_phase(PHASE_IPC_FAULT_CLIENT_PREPARE);
+    start_domain(client, Scenario::IpcPeerFault);
+}
+
+fn advance_ipc_cancel_server() -> ! {
+    IPC_FAULT_OK.store(
+        report(IPC_FAULT_GATE, IPC_FAULT_OK.load(Ordering::SeqCst)),
+        Ordering::SeqCst,
+    );
+    if !IPC_FAULT_OK.load(Ordering::SeqCst) {
+        fail("ipc_peer_fault_flow_failed");
+    }
+    let (raw, expected) = authenticated();
+    let server = prepare_domain(&raw, expected, Scenario::IpcCancelGuest);
+    store_handle(&IPC_SERVER_HANDLE, server);
+    set_phase(PHASE_IPC_CANCEL_SERVER_PREPARE);
+    start_domain(server, Scenario::IpcCancelGuest);
+}
+
+fn ipc_cancel_guest_done() -> ! {
+    let server = handle(&IPC_SERVER_HANDLE);
+    let passed = manager::is_stale(server) && manager::outstanding_frames() == 0;
+    IPC_CANCEL_OK.store(report(IPC_CANCEL_GATE, passed), Ordering::SeqCst);
+    if !passed {
+        fail("running_guest_ipc_cancel_rejected");
+    }
+    set_phase(PHASE_IPC_CANCEL_SERVER_DONE);
+    scheduler()
+}
+
 fn finish() -> ! {
-    let pass = report(CLEAN_RESTART_GATE, CLEAN_RESTART_OK.load(Ordering::SeqCst));
+    let prior = CLEAN_RESTART_OK.load(Ordering::SeqCst)
+        && IPC_EXCHANGE_OK.load(Ordering::SeqCst)
+        && IPC_FAULT_OK.load(Ordering::SeqCst)
+        && IPC_CANCEL_OK.load(Ordering::SeqCst);
+    let pass = report(CLEAN_RESTART_GATE, CLEAN_RESTART_OK.load(Ordering::SeqCst)) && prior;
     serial::ev_domain_harness(pass);
     serial::ev_halt(pass);
     serial::exit_qemu(pass);

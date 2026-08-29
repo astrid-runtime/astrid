@@ -4,6 +4,11 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 
+[lib]
+name = "astrid_native_kernel"
+test = true
+bench = false
+
 [[bin]]
 name = "astrid-native-kernel"
 test = false

@@ -6,8 +6,8 @@
 //! taken from the environment or selected by a silent default. The explicit
 //! fixture files under `tools/kimage/fixtures/` are development-only inputs.
 //!
-//! The ramdisk is exactly `[379-byte ASTRIDPH][355-byte ASTRIDDC][548-byte
-//! ASTRIDSG]`; the latter two are also written as `<output>.closures` and
+//! The ramdisk is exactly `[ASTRIDPH][ASTRIDDC][ASTRIDSG][component]`; the
+//! latter two are also written as `<output>.closures` and
 //! `<output>.sysgen` for inspection. The root-signed handoff binds the raw ELF
 //! measurement, table digest, and fixture loader/boot-context identities. It
 //! is not firmware authentication or a production root of trust.
@@ -42,6 +42,7 @@ const BOOT_CONTEXT_DOMAIN: &[u8] = b"astrid.boot.q35.uefi.tcg.v1";
 /// falsifier. The descriptor remains canonical and correctly signed; only
 /// compiled TrustedInput admission should reject it.
 const MISMATCH_PLAN_DIGEST: [u8; 32] = [0x99; 32];
+const _: () = assert!(EMULATOR_COMPONENT_LEN == 517);
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);

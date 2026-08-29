@@ -3,36 +3,39 @@
 use astrid_system_generation::ContentId;
 use astrid_system_generation::emulator_fixture::EMULATOR_COMPONENT_CODE_LEN;
 
-use crate::memory;
+#[cfg(test)]
+const FRAME_SIZE: u64 = 4096;
+#[cfg(not(test))]
+use crate::memory::FRAME_SIZE;
 
-pub(super) const PAGE_SIZE: usize = memory::FRAME_SIZE as usize;
-pub(super) const MAX_COMPONENT_BYTES: usize = PAGE_SIZE;
-pub(super) const HEADER_LEN: usize = 64;
+pub const PAGE_SIZE: usize = FRAME_SIZE as usize;
+pub const MAX_COMPONENT_BYTES: usize = PAGE_SIZE;
+pub const HEADER_LEN: usize = 64;
 const HEADER_MAGIC: [u8; 10] = *b"ASTRIDCOMP";
-pub(super) const CODE_OFFSET: u64 = HEADER_LEN as u64;
-pub(super) const ENTRYPOINT: u64 = 0;
-pub(super) const fn stack_base() -> u64 {
+pub const CODE_OFFSET: u64 = HEADER_LEN as u64;
+pub const ENTRYPOINT: u64 = 0;
+pub const fn stack_base() -> u64 {
     STACK_BASE
 }
-pub(super) const fn peer_probe(slot: usize) -> u64 {
-    PEER_PROBE + slot as u64 * crate::memory::FRAME_SIZE
+pub const fn peer_probe(slot: usize) -> u64 {
+    PEER_PROBE + slot as u64 * FRAME_SIZE
 }
-pub(super) const QUOTA_TICKS_LIMIT: u32 = 64;
-pub(super) const MAX_STACK_PAGES: usize = 2;
-pub(super) const RESOURCE_CAPACITY: usize = 64;
-pub(super) const SLOT_CAPACITY: usize = 2;
+pub const QUOTA_TICKS_LIMIT: u32 = 64;
+pub const MAX_STACK_PAGES: usize = 2;
+pub const RESOURCE_CAPACITY: usize = 64;
+pub const SLOT_CAPACITY: usize = 2;
 
 /// Keep user mappings in a private low-half PML4 subtree, away from the
 /// subtree occupied by the supervisor-only kernel-image copy.
 const DOMAIN_P4: u64 = 100;
-pub(super) const CODE_BASE: u64 = DOMAIN_P4 << 39;
-pub(super) const STACK_BASE: u64 = CODE_BASE + 0x4000_0000;
-pub(super) const PEER_PROBE: u64 = (DOMAIN_P4 + 1) << 39;
-pub(super) const KERNEL_STACK: u64 = CODE_BASE + 0x001f_f000;
-pub(super) const KERNEL_STACK_TOP: u64 = KERNEL_STACK + PAGE_SIZE as u64;
+pub const CODE_BASE: u64 = DOMAIN_P4 << 39;
+pub const STACK_BASE: u64 = CODE_BASE + 0x4000_0000;
+pub const PEER_PROBE: u64 = (DOMAIN_P4 + 1) << 39;
+pub const KERNEL_STACK: u64 = CODE_BASE + 0x001f_f000;
+pub const KERNEL_STACK_TOP: u64 = KERNEL_STACK + PAGE_SIZE as u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BindError {
+pub enum BindError {
     NotInstalled,
     Empty,
     Oversized,
@@ -41,7 +44,7 @@ pub(crate) enum BindError {
 }
 
 impl BindError {
-    pub(crate) const fn as_reason(self) -> &'static str {
+    pub const fn as_reason(self) -> &'static str {
         match self {
             Self::NotInstalled => "not_installed",
             Self::Empty => "empty",
@@ -53,7 +56,7 @@ impl BindError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DomainPagingError {
+pub enum DomainPagingError {
     FrameExhausted,
     FrameCapacity,
     AccountingMismatch,
@@ -62,7 +65,7 @@ pub(crate) enum DomainPagingError {
 }
 
 impl DomainPagingError {
-    pub(crate) const fn as_reason(self) -> &'static str {
+    pub const fn as_reason(self) -> &'static str {
         match self {
             Self::FrameExhausted => "frame_exhausted",
             Self::FrameCapacity => "frame_capacity",
@@ -88,7 +91,7 @@ fn read_u32(bytes: &[u8], range: core::ops::Range<usize>) -> Result<u32, BindErr
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct ComponentImage {
+pub struct ComponentImage {
     bytes: [u8; MAX_COMPONENT_BYTES],
     len: usize,
     code_len: usize,
@@ -98,7 +101,7 @@ pub(super) struct ComponentImage {
 }
 
 impl ComponentImage {
-    pub(super) fn parse(raw: &[u8]) -> Result<Self, BindError> {
+    pub fn parse(raw: &[u8]) -> Result<Self, BindError> {
         if raw.is_empty() {
             return Err(BindError::Empty);
         }
@@ -149,36 +152,36 @@ impl ComponentImage {
         })
     }
 
-    pub(super) fn slice(&self) -> &[u8] {
+    pub fn slice(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
 
-    pub(super) fn identity(&self) -> ContentId {
+    pub fn identity(&self) -> ContentId {
         ContentId::from_payload(self.slice())
     }
 
-    pub(super) fn code(&self) -> &[u8] {
+    pub fn code(&self) -> &[u8] {
         &self.bytes[HEADER_LEN..HEADER_LEN + self.code_len]
     }
 
-    pub(super) const fn code_len(&self) -> usize {
+    pub const fn code_len(&self) -> usize {
         self.code_len
     }
 
-    pub(super) const fn stack_pages(&self) -> usize {
+    pub const fn stack_pages(&self) -> usize {
         self.stack_pages
     }
 
-    pub(super) const fn owned_frames(&self) -> usize {
+    pub const fn owned_frames(&self) -> usize {
         self.max_frames
     }
 
-    pub(super) const fn quota_ticks(&self) -> u32 {
+    pub const fn quota_ticks(&self) -> u32 {
         self.quota_ticks
     }
 }
 
-pub(super) const fn expected_owned_frames(code_len: usize, stack_pages: usize) -> usize {
+pub const fn expected_owned_frames(code_len: usize, stack_pages: usize) -> usize {
     // One root; independent L3/L2/L1 paths for code, stack, and probe; one
     // guarded transition leaf; and the three APIC path tables. The APIC
     // leaf is backing MMIO, not domain-owned RAM, so it is absent.
@@ -193,7 +196,7 @@ const fn code_pages_for_len(len: usize) -> usize {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Scenario {
+pub enum Scenario {
     Exit = 0,
     PageFault = 1,
     Quota = 2,
@@ -202,16 +205,22 @@ pub(crate) enum Scenario {
     // Keep the established fixture scenario values stable while adding the
     // second deliberate fault path.
     InvalidInstruction = 5,
+    IpcServer = 6,
+    IpcClient = 7,
+    IpcPeerFault = 8,
+    #[allow(dead_code)]
+    IpcCancelServer = 9,
+    IpcCancelGuest = 10,
 }
 
 impl Scenario {
-    pub(super) const fn value(self) -> u64 {
+    pub const fn value(self) -> u64 {
         self as u64
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Outcome {
+pub enum Outcome {
     CleanExit,
     PageFault,
     InvalidInstruction,
@@ -221,7 +230,7 @@ pub(crate) enum Outcome {
 }
 
 impl Outcome {
-    pub(super) const fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::CleanExit => "clean_exit",
             Self::PageFault => "page_fault",
@@ -234,27 +243,39 @@ impl Outcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct DomainId(pub(super) u64);
+pub struct DomainId(pub u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) struct DomainGeneration(pub(super) u64);
+pub struct DomainGeneration(pub u64);
+
+impl DomainId {
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+impl DomainGeneration {
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct DomainHandle {
+pub struct DomainHandle {
     id: DomainId,
     generation: DomainGeneration,
 }
 
 impl DomainHandle {
-    pub(super) const fn new(id: DomainId, generation: DomainGeneration) -> Self {
+    pub const fn new(id: DomainId, generation: DomainGeneration) -> Self {
         Self { id, generation }
     }
 
-    pub(super) const fn id(self) -> DomainId {
+    pub const fn id(self) -> DomainId {
         self.id
     }
 
-    pub(super) const fn generation(self) -> DomainGeneration {
+    pub const fn generation(self) -> DomainGeneration {
         self.generation
     }
 }

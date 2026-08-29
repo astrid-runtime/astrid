@@ -17,6 +17,7 @@ use astrid_native_closure::{
 // depends only on the closure crate, so changing the descriptor wire layout is
 // a deliberate review point rather than an accidental transitive update.
 const MANIFEST_LEN: usize = 548;
+const _: () = assert!(EMULATOR_COMPONENT_LEN == 517);
 use bootloader_api::info::LoaderHandoffVerification;
 
 // Keep the bootloader's receipt layout pinned to the ring-0 consumer. These
@@ -148,17 +149,27 @@ mod tests {
             Err("handoff_length")
         );
 
-        let truncated = vec![0u8; HANDOFF_LEN + TABLE_LEN + super::MANIFEST_LEN
-            + astrid_native_closure::EMULATOR_COMPONENT_LEN
-            - 1];
+        let truncated = vec![
+            0u8;
+            HANDOFF_LEN
+                + TABLE_LEN
+                + super::MANIFEST_LEN
+                + astrid_native_closure::EMULATOR_COMPONENT_LEN
+                - 1
+        ];
         assert_eq!(
             verify_before_mapping(b"kernel", &truncated),
             Err("handoff_length")
         );
 
-        let extended = vec![0u8; HANDOFF_LEN + TABLE_LEN + super::MANIFEST_LEN
-            + astrid_native_closure::EMULATOR_COMPONENT_LEN
-            + 1];
+        let extended = vec![
+            0u8;
+            HANDOFF_LEN
+                + TABLE_LEN
+                + super::MANIFEST_LEN
+                + astrid_native_closure::EMULATOR_COMPONENT_LEN
+                + 1
+        ];
         assert_eq!(
             verify_before_mapping(b"kernel", &extended),
             Err("handoff_length")
@@ -167,8 +178,13 @@ mod tests {
 
     #[test]
     fn exact_length_reaches_content_validation() {
-        let exact = vec![0u8; HANDOFF_LEN + TABLE_LEN + super::MANIFEST_LEN
-            + astrid_native_closure::EMULATOR_COMPONENT_LEN];
+        let exact = vec![
+            0u8;
+            HANDOFF_LEN
+                + TABLE_LEN
+                + super::MANIFEST_LEN
+                + astrid_native_closure::EMULATOR_COMPONENT_LEN
+        ];
         assert_eq!(
             verify_before_mapping(&[], &exact),
             Err("kernel_empty"),

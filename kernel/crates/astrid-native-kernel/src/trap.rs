@@ -6,6 +6,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+pub use crate::platform::TrapFrame;
 use crate::{apic, domains, serial};
 
 use x86_64::registers::control::Cr2;
@@ -17,36 +18,10 @@ pub static RECOVERY_RIP: AtomicU64 = AtomicU64::new(0);
 /// Count of APIC timer ticks observed so far.
 pub static TICK: AtomicU32 = AtomicU32::new(0);
 
-/// Registers saved by the common stub plus the CPU-pushed interrupt frame.
-#[repr(C)]
-pub struct TrapFrame {
-    pub rax: u64,
-    pub rbx: u64,
-    pub rcx: u64,
-    pub rdx: u64,
-    pub rsi: u64,
-    pub rdi: u64,
-    pub rbp: u64,
-    pub r8: u64,
-    pub r9: u64,
-    pub r10: u64,
-    pub r11: u64,
-    pub r12: u64,
-    pub r13: u64,
-    pub r14: u64,
-    pub r15: u64,
-    pub vector: u64,
-    pub error_code: u64,
-    pub rip: u64,
-    pub cs: u64,
-    pub rflags: u64,
-    pub rsp: u64,
-    pub ss: u64,
-}
-
 const VECTOR_BREAKPOINT: u8 = 3;
 const VECTOR_PAGE_FAULT: u8 = 14;
 pub const VECTOR_TIMER: u8 = 32;
+pub const VECTOR_IPC: u8 = 112;
 pub const VECTOR_SPURIOUS: u8 = 255;
 
 /// The one Rust trap handler. Mutations to `frame.rip` take effect on `iretq`.
@@ -92,7 +67,7 @@ fn handle_timer() {
 }
 
 fn handle_page_fault(f: &mut TrapFrame) {
-    serial::ev_fault(VECTOR_PAGE_FAULT, f.error_code, f.rip);
+    serial::ev_fault(VECTOR_PAGE_FAULT, Cr2::read_raw(), f.rip);
     if EXPECT_FAULT.swap(false, Ordering::SeqCst) {
         f.rip = RECOVERY_RIP.load(Ordering::SeqCst);
         return;
@@ -196,4 +171,5 @@ isr_noerr!(isr_28, 28);
 isr_err!(isr_29, 29);
 isr_err!(isr_30, 30);
 isr_noerr!(isr_32, 32);
+isr_noerr!(isr_112, 112);
 isr_noerr!(isr_255, 255);

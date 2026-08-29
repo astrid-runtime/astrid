@@ -93,7 +93,7 @@ fn heap_exhaustion() -> bool {
                 *slot = Some(p);
                 count += 1;
             },
-            Err(()) => {
+            Err(memory::HeapError::Exhausted) => {
                 got_err = true;
                 break;
             },

@@ -38,6 +38,11 @@ pub struct Frame {
     phys: u64,
 }
 
+#[derive(Debug)]
+pub enum HeapError {
+    Exhausted,
+}
+
 impl Frame {
     pub const fn from_phys(phys: u64) -> Self {
         Self { phys }
@@ -243,11 +248,12 @@ pub fn init_heap() {
     });
 }
 
-pub fn heap_alloc(layout: Layout) -> Result<NonNull<u8>, ()> {
+pub fn heap_alloc(layout: Layout) -> Result<NonNull<u8>, HeapError> {
     HEAP.get()
         .expect("heap not initialized")
         .lock()
         .allocate_first_fit(layout)
+        .map_err(|_| HeapError::Exhausted)
 }
 
 /// # Safety
