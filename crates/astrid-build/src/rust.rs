@@ -302,7 +302,8 @@ fn ensure_component(wasm_path: &Path) -> Result<PathBuf> {
         return Ok(wasm_path.to_path_buf());
     }
     info!("   Wrapping core wasm into Component Model component...");
-    let component = wit_component::ComponentEncoder::default()
+    let mut encoder = wit_component::ComponentEncoder::default();
+    let component = encoder
         .validate(true)
         .module(&bytes)
         .context("ComponentEncoder rejected the core wasm — wit-bindgen `generate!` may be missing or producing the wrong section")?

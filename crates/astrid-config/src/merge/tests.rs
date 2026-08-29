@@ -2,6 +2,49 @@ use super::path::set_nested;
 use super::*;
 
 #[test]
+fn layered_values_preserve_datetime_and_stable_text() {
+    let mut base: toml::Value = toml::from_str(
+        r#"
+        [metadata]
+        created = 1979-05-27T00:32:00-07:00
+
+        [model]
+        provider = "claude"
+    "#,
+    )
+    .unwrap();
+    let overlay: toml::Value = toml::from_str(
+        r"
+        [model]
+        max_tokens = 8192
+    ",
+    )
+    .unwrap();
+    let mut sources = FieldSources::new();
+
+    deep_merge_tracking(&mut base, &overlay, "", &ConfigLayer::User, &mut sources);
+
+    assert_eq!(
+        base["metadata"]["created"]
+            .as_datetime()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("1979-05-27T00:32:00-07:00")
+    );
+    assert_eq!(
+        toml::to_string_pretty(&base).unwrap(),
+        concat!(
+            "[metadata]\n",
+            "created = 1979-05-27T00:32:00-07:00\n",
+            "\n",
+            "[model]\n",
+            "max_tokens = 8192\n",
+            "provider = \"claude\"\n",
+        )
+    );
+}
+
+#[test]
 fn test_deep_merge_scalars() {
     let mut base: toml::Value = toml::from_str(
         r#"

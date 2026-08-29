@@ -758,4 +758,89 @@ file = "skills/ignored/SKILL.md"
         assert!(!encoded.contains("[[skill]]"));
         assert!(!encoded.contains("skills/ignored/SKILL.md"));
     }
+
+    #[test]
+    fn representative_manifest_round_trips_with_stable_text() {
+        let source = r#"
+[package]
+name = "compatibility-probe"
+version = "1.2.3"
+
+[[component]]
+id = "worker"
+file = "worker.wasm"
+type = "executable"
+
+[imports.astrid]
+session = { version = "^1.0", optional = true }
+
+[exports]
+"astrid:worker" = "1.2.3"
+"#;
+        let manifest: CapsuleManifest = toml::from_str(source).unwrap();
+        assert_eq!(manifest.package.name, "compatibility-probe");
+        assert_eq!(manifest.components[0].id, "worker");
+        assert_eq!(
+            manifest.imports["astrid"]["session"].version.to_string(),
+            "^1.0"
+        );
+        assert!(manifest.imports["astrid"]["session"].optional);
+        assert_eq!(
+            manifest.exports["astrid"]["worker"].version.to_string(),
+            "1.2.3"
+        );
+
+        let encoded = toml::to_string_pretty(&manifest).unwrap();
+        assert_eq!(
+            encoded,
+            concat!(
+                "tool = []\n",
+                "context_file = []\n",
+                "command = []\n",
+                "mcp_server = []\n",
+                "uplink = []\n",
+                "\n",
+                "[package]\n",
+                "name = \"compatibility-probe\"\n",
+                "version = \"1.2.3\"\n",
+                "authors = []\n",
+                "keywords = []\n",
+                "categories = []\n",
+                "\n",
+                "[[component]]\n",
+                "id = \"worker\"\n",
+                "file = \"worker.wasm\"\n",
+                "type = \"executable\"\n",
+                "link = []\n",
+                "\n",
+                "[imports.astrid.session]\n",
+                "version = \"^1.0\"\n",
+                "optional = true\n",
+                "\n",
+                "[exports.astrid.worker]\n",
+                "version = \"1.2.3\"\n",
+                "\n",
+                "[publish]\n",
+                "\n",
+                "[subscribe]\n",
+                "\n",
+                "[capabilities]\n",
+                "uplink = false\n",
+                "net = []\n",
+                "kv = []\n",
+                "fs_read = []\n",
+                "fs_write = []\n",
+                "host_process = []\n",
+                "allow_persistent = false\n",
+                "net_bind = []\n",
+                "net_connect = []\n",
+                "identity = []\n",
+                "allow_prompt_injection = false\n",
+                "\n",
+                "[env]\n",
+            )
+        );
+        let round_trip: CapsuleManifest = toml::from_str(&encoded).unwrap();
+        assert_eq!(toml::to_string_pretty(&round_trip).unwrap(), encoded);
+    }
 }
