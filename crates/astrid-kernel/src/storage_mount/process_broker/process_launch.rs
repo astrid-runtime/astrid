@@ -5,6 +5,11 @@ use super::*;
 pub(super) struct ProcessProviderLaunchError {
     pub(super) message: String,
     pub(super) cleanup_ok: bool,
+    /// Retained only when cleanup failed. A successful cleanup is defined by
+    /// `stop_process_provider`: STOP/reap completion plus a dead endpoint.
+    /// Keeping the handle here makes a failed cleanup retryable against the
+    /// exact provider instead of leaving an unobservable live process.
+    pub(super) child: Option<Box<tokio::process::Child>>,
 }
 
 type SpawnedProcessProvider = (
@@ -79,6 +84,7 @@ fn spawn_process_provider() -> Result<SpawnedProcessProvider, ProcessProviderLau
         ProcessProviderLaunchError {
             message,
             cleanup_ok: true,
+            child: None,
         }
     })?;
     let mut command = tokio::process::Command::new(binary);
@@ -92,6 +98,7 @@ fn spawn_process_provider() -> Result<SpawnedProcessProvider, ProcessProviderLau
         .map_err(|error| ProcessProviderLaunchError {
             message: format!("launch native storage provider: {error}"),
             cleanup_ok: true,
+            child: None,
         })?;
     let stderr_task = child.stderr.take().map(|stderr| {
         tokio::spawn(async move {
@@ -240,6 +247,7 @@ async fn abort_process_provider(
     ProcessProviderLaunchError {
         message,
         cleanup_ok,
+        child: (!cleanup_ok).then_some(Box::new(child)),
     }
 }
 

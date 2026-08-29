@@ -31,7 +31,10 @@ pub(crate) type ProjectionCleanup =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync + 'static>;
 
 struct RunningProvider {
-    child: tokio::process::Child,
+    // A failed launch can leave an unmanaged provider after its Child handle
+    // has been consumed by the launch error path. Retaining the authenticated
+    // control identity lets a blocked retry confirm that it is really gone.
+    child: Option<tokio::process::Child>,
     control_path: PathBuf,
     token: String,
     stopped: bool,
@@ -224,6 +227,15 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
 
         ensure_owner_home(&kernel, principal_uid).await?;
 
+        // Generate every parent token before publishing the first lease. A
+        // late token failure must not turn into a partial, live lease set.
+        let branch_parent_token = random_parent_token()?;
+        let owner_parent_token = random_parent_token()?;
+        let shared_parent_token = if key.binding.targets.fleet_shared.is_some() {
+            Some(random_parent_token()?)
+        } else {
+            None
+        };
         let provider = platform_process_provider_name();
         let admission = MountAdmission::capture(&kernel, principal, MountOwnerScope::CallerOnly)?;
         let branch_target = key.binding.targets.workspace.durable_target();
@@ -318,18 +330,12 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             None
         };
 
-        let branch_parent_token = random_parent_token()?;
-        let owner_parent_token = random_parent_token()?;
-        let shared_parent_token = match shared_lease.as_ref() {
-            Some(_) => Some(random_parent_token()?),
-            None => None,
-        };
         let branch_control = branch_lease.resource_path.join("process-control.sock");
         let owner_control = owner_lease.resource_path.join("process-control.sock");
         let parent = StorageProviderParentLifetimeV1 {
             pid: key.binding.generation.parent_pid,
             start_identity: Some(key.binding.generation.start_identity.to_string()),
-            token: branch_parent_token,
+            token: branch_parent_token.clone(),
         };
         let branch_launch = StorageProviderServiceLaunchV1 {
             schema: STORAGE_FILESYSTEM_SERVICE_LAUNCH_SCHEMA_V1,
@@ -346,7 +352,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             parent: StorageProviderParentLifetimeV1 {
                 pid: parent.pid,
                 start_identity: Some(key.binding.generation.start_identity.to_string()),
-                token: owner_parent_token,
+                token: owner_parent_token.clone(),
             },
         };
         let shared_launch =
@@ -371,6 +377,37 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             Ok(child) => child,
             Err(error) => {
                 let provider_stopped = error.cleanup_ok;
+                let cleanup_state = ProjectionCleanupState {
+                    kernel: Arc::downgrade(&kernel),
+                    binding: key.binding.clone(),
+                    branch: ProjectionLeaseProvider {
+                        running: RunningProvider {
+                            child: error.child.map(|child| *child),
+                            control_path: branch_control.clone(),
+                            token: branch_parent_token.clone(),
+                            stopped: provider_stopped,
+                        },
+                        lease: ProjectionLeaseTarget {
+                            mount_id: branch_lease.mount_id,
+                            target: key.binding.targets.workspace.clone(),
+                        },
+                    },
+                    owner: ProjectionLeaseProvider {
+                        running: RunningProvider {
+                            child: None,
+                            control_path: owner_control.clone(),
+                            token: owner_parent_token.clone(),
+                            stopped: true,
+                        },
+                        lease: ProjectionLeaseTarget {
+                            mount_id: owner_lease.mount_id,
+                            target: key.binding.targets.owner_home.clone(),
+                        },
+                    },
+                    shared: None,
+                    mount_root: mount_root.clone(),
+                    cleaned: false,
+                };
                 if !provider_stopped {
                     tracing::error!(
                         error = %error.message,
@@ -391,6 +428,16 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                     branch_lease.mount_id,
                 )
                 .await;
+                if !provider_stopped {
+                    retain_failed_launch_projection(
+                        &mut projections,
+                        &key,
+                        workspace_mountpoint.clone(),
+                        home_mountpoint.clone(),
+                        fleet_shared_mountpoint.clone(),
+                        cleanup_state,
+                    );
+                }
                 return Err(error.message);
             },
         };
@@ -404,6 +451,37 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                 )
                 .await;
                 let provider_stopped = branch_stopped && error.cleanup_ok;
+                let cleanup_state = ProjectionCleanupState {
+                    kernel: Arc::downgrade(&kernel),
+                    binding: key.binding.clone(),
+                    branch: ProjectionLeaseProvider {
+                        running: RunningProvider {
+                            child: Some(branch_child),
+                            control_path: branch_control.clone(),
+                            token: branch_parent_token.clone(),
+                            stopped: branch_stopped,
+                        },
+                        lease: ProjectionLeaseTarget {
+                            mount_id: branch_lease.mount_id,
+                            target: key.binding.targets.workspace.clone(),
+                        },
+                    },
+                    owner: ProjectionLeaseProvider {
+                        running: RunningProvider {
+                            child: error.child.map(|child| *child),
+                            control_path: owner_control.clone(),
+                            token: owner_parent_token.clone(),
+                            stopped: error.cleanup_ok,
+                        },
+                        lease: ProjectionLeaseTarget {
+                            mount_id: owner_lease.mount_id,
+                            target: key.binding.targets.owner_home.clone(),
+                        },
+                    },
+                    shared: None,
+                    mount_root: mount_root.clone(),
+                    cleaned: false,
+                };
                 rollback_uncommitted_lease(
                     &kernel,
                     &key.binding,
@@ -419,6 +497,14 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                 )
                 .await;
                 if !provider_stopped {
+                    retain_failed_launch_projection(
+                        &mut projections,
+                        &key,
+                        workspace_mountpoint.clone(),
+                        home_mountpoint.clone(),
+                        fleet_shared_mountpoint.clone(),
+                        cleanup_state,
+                    );
                     tracing::error!(
                         branch_stopped,
                         owner_stopped = error.cleanup_ok,
@@ -446,6 +532,57 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                     )
                     .await;
                     let provider_stopped = owner_stopped && branch_stopped && error.cleanup_ok;
+                    let cleanup_state = ProjectionCleanupState {
+                        kernel: Arc::downgrade(&kernel),
+                        binding: key.binding.clone(),
+                        branch: ProjectionLeaseProvider {
+                            running: RunningProvider {
+                                child: Some(branch_child),
+                                control_path: branch_control.clone(),
+                                token: branch_parent_token.clone(),
+                                stopped: branch_stopped,
+                            },
+                            lease: ProjectionLeaseTarget {
+                                mount_id: branch_lease.mount_id,
+                                target: key.binding.targets.workspace.clone(),
+                            },
+                        },
+                        owner: ProjectionLeaseProvider {
+                            running: RunningProvider {
+                                child: Some(owner_child),
+                                control_path: owner_control.clone(),
+                                token: owner_parent_token.clone(),
+                                stopped: owner_stopped,
+                            },
+                            lease: ProjectionLeaseTarget {
+                                mount_id: owner_lease.mount_id,
+                                target: key.binding.targets.owner_home.clone(),
+                            },
+                        },
+                        shared: shared_lease.as_ref().map(|lease| ProjectionLeaseProvider {
+                            running: RunningProvider {
+                                child: error.child.map(|child| *child),
+                                control_path: lease.resource_path.join("process-control.sock"),
+                                token: shared_parent_token
+                                    .as_ref()
+                                    .expect("shared lease has a parent token")
+                                    .clone(),
+                                stopped: error.cleanup_ok,
+                            },
+                            lease: ProjectionLeaseTarget {
+                                mount_id: lease.mount_id,
+                                target: key
+                                    .binding
+                                    .targets
+                                    .fleet_shared
+                                    .as_ref()
+                                    .expect("shared lease has a Fleet target")
+                                    .clone(),
+                            },
+                        }),
+                        mount_root: mount_root.clone(),
+                        cleaned: false,
+                    };
                     rollback_uncommitted_lease(
                         &kernel,
                         &key.binding,
@@ -468,6 +605,14 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                             .await;
                     }
                     if !provider_stopped {
+                        retain_failed_launch_projection(
+                            &mut projections,
+                            &key,
+                            workspace_mountpoint.clone(),
+                            home_mountpoint.clone(),
+                            fleet_shared_mountpoint.clone(),
+                            cleanup_state,
+                        );
                         tracing::error!(
                             owner_stopped,
                             branch_stopped,
@@ -486,7 +631,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             binding: key.binding.clone(),
             branch: ProjectionLeaseProvider {
                 running: RunningProvider {
-                    child: branch_child,
+                    child: Some(branch_child),
                     control_path: branch_control,
                     token: branch_launch.parent.token,
                     stopped: false,
@@ -498,7 +643,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             },
             owner: ProjectionLeaseProvider {
                 running: RunningProvider {
-                    child: owner_child,
+                    child: Some(owner_child),
                     control_path: owner_control,
                     token: owner_launch.parent.token,
                     stopped: false,
@@ -512,7 +657,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                 .take()
                 .map(|(child, launch)| ProjectionLeaseProvider {
                     running: RunningProvider {
-                        child,
+                        child: Some(child),
                         control_path: launch.control_path,
                         token: launch.parent.token,
                         stopped: false,
@@ -626,16 +771,58 @@ async fn stop_running_provider(provider: &mut RunningProvider) -> bool {
     if provider.stopped {
         return true;
     }
-    let stopped = stop_process_provider(
-        &mut provider.child,
-        provider.control_path.clone(),
-        provider.token.clone(),
-    )
-    .await;
+    let stopped = if let Some(child) = provider.child.as_mut() {
+        stop_process_provider(child, provider.control_path.clone(), provider.token.clone()).await
+    } else {
+        unmanaged_provider_is_stopped(&provider.control_path).await
+    };
     if stopped {
         provider.stopped = true;
     }
     stopped
+}
+
+#[cfg(any(unix, windows))]
+async fn unmanaged_provider_is_stopped(control_path: &Path) -> bool {
+    match local_transport::connect_outcome(control_path).await {
+        Ok(local_transport::ConnectOutcome::Absent | local_transport::ConnectOutcome::Stale) => {
+            true
+        },
+        Ok(local_transport::ConnectOutcome::Connected(_)) | Err(_) => false,
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn retain_failed_launch_projection(
+    projections: &mut std::collections::BTreeMap<
+        ProcessProjectionKey,
+        Arc<CachedProcessProjection>,
+    >,
+    key: &ProcessProjectionKey,
+    workspace_mountpoint: PathBuf,
+    home_mountpoint: PathBuf,
+    fleet_shared_mountpoint: Option<PathBuf>,
+    cleanup_state: ProjectionCleanupState,
+) {
+    let cleanup_state = Arc::new(tokio::sync::Mutex::new(cleanup_state));
+    let cleanup_state_for_projection = Arc::clone(&cleanup_state);
+    let cleanup: ProjectionCleanup = Arc::new(move || {
+        let cleanup_state = Arc::clone(&cleanup_state_for_projection);
+        Box::pin(async move { cleanup_projection_state(cleanup_state).await })
+    });
+    projections.insert(
+        key.clone(),
+        Arc::new(CachedProcessProjection {
+            binding: key.binding.clone(),
+            workspace_mountpoint,
+            home_mountpoint,
+            fleet_shared_mountpoint,
+            refs: AtomicU64::new(0),
+            closing: AtomicBool::new(false),
+            cleanup_failed: AtomicBool::new(true),
+            cleanup,
+        }),
+    );
 }
 
 async fn rollback_uncommitted_lease(
@@ -719,9 +906,9 @@ async fn revoke_mapped_projection_lease(
 #[cfg(any(unix, windows))]
 pub(crate) async fn retry_failed_projection(
     projection: &Arc<CachedProcessProjection>,
-    projections: &mut tokio::sync::MutexGuard<
-        '_,
-        std::collections::BTreeMap<ProcessProjectionKey, Arc<CachedProcessProjection>>,
+    projections: &mut std::collections::BTreeMap<
+        ProcessProjectionKey,
+        Arc<CachedProcessProjection>,
     >,
     key: &ProcessProjectionKey,
 ) -> bool {
@@ -889,9 +1076,38 @@ async fn ensure_fleet_shared(
 
 #[cfg(any(unix, windows))]
 fn random_parent_token() -> Result<String, String> {
+    #[cfg(test)]
+    loop {
+        match PARENT_TOKEN_FAULTS.compare_exchange(0, 0, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => break,
+            Err(faults) => {
+                if let Some(remaining) = faults.checked_sub(1) {
+                    if PARENT_TOKEN_FAULTS
+                        .compare_exchange(faults, remaining, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        return Err("injected parent token failure".to_owned());
+                    }
+                } else {
+                    break;
+                }
+            },
+        }
+    }
     let (token, _) = generate_lease_token()?;
     Ok(token)
 }
 
 #[cfg(all(test, any(unix, windows)))]
+static PARENT_TOKEN_FAULTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) fn arm_parent_token_faults(count: usize) {
+    PARENT_TOKEN_FAULTS.store(count, Ordering::Release);
+}
+
+#[cfg(all(test, any(unix, windows)))]
 mod lease_cleanup_tests;
+
+#[cfg(all(test, any(unix, windows)))]
+mod lease_atomicity_tests;
