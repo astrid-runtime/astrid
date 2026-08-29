@@ -8,20 +8,16 @@ async fn repeated_presence_probes_remain_deterministic_until_explicit_release() 
     let endpoint = Path::new(r"C:\ignored\repeated-probes.sock");
     let listener = bind(endpoint).unwrap();
     let mut clients = Vec::new();
+    let mut servers = Vec::new();
 
     for round in 0..4 {
         assert!(
             endpoint_is_present(endpoint).unwrap(),
             "round {round}: published endpoint must remain authoritative"
         );
-        let ConnectOutcome::Connected(client) = connect_outcome(endpoint).await.unwrap() else {
+        let ConnectOutcome::Connected(mut client) = connect_outcome(endpoint).await.unwrap() else {
             panic!("round {round}: published endpoint must connect");
         };
-        clients.push(client);
-    }
-
-    let mut servers = Vec::new();
-    for (round, mut client) in clients.into_iter().enumerate() {
         client.write_all(b"probe").await.unwrap();
         client.flush().await.unwrap();
         let mut server = accept(&listener).await.unwrap();
@@ -29,10 +25,12 @@ async fn repeated_presence_probes_remain_deterministic_until_explicit_release() 
         let mut bytes = [0_u8; 5];
         server.read_exact(&mut bytes).await.unwrap();
         assert_eq!(&bytes, b"probe", "round {round} payload");
+        clients.push(client);
         servers.push(server);
     }
 
     assert!(endpoint_is_present(endpoint).unwrap());
+    drop(clients);
     drop(servers);
     drop(listener);
     wait_until_endpoint_is_absent(endpoint).await;
