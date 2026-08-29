@@ -13,8 +13,8 @@ use std::{
 use super::{
     CachedProcessProjection, Kernel, ProcessProjectionBinding, ProcessProjectionKey,
     ProcessProjectionTarget, ProcessProjectionTargetSet, ProjectionCleanup, StorageMountId,
-    StorageProviderAccessV1, force_revoke_projection_lease, generate_lease_token, local_transport,
-    platform_process_provider_name, stop_process_provider,
+    StorageProviderAccessV1, force_fence_projection_lease, force_revoke_projection_lease,
+    generate_lease_token, local_transport, platform_process_provider_name, stop_process_provider,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,23 +106,26 @@ async fn cleanup_projection(state: &mut ProjectionCleanupState) -> bool {
     // only the emergency fallback when a provider is wedged or gone; keeping
     // the provider handles in the state makes a later mount request retry the
     // same bounded operation instead of creating a second projection.
-    if state.binding.validate().is_err() {
+    let binding_valid = state.binding.validate().is_ok();
+    if !binding_valid {
         tracing::error!("process storage projection binding became invalid");
-        return false;
     }
-    let branch_stopped = stop_running_provider(&mut state.branch.running).await;
-    let owner_stopped = stop_running_provider(&mut state.owner.running).await;
-    let shared_stopped = match state.shared.as_mut() {
-        Some(shared) => stop_running_provider(&mut shared.running).await,
-        None => true,
-    };
-    if !branch_stopped || !owner_stopped || !shared_stopped {
+    let branch_stopped = binding_valid && stop_running_provider(&mut state.branch.running).await;
+    let owner_stopped = binding_valid && stop_running_provider(&mut state.owner.running).await;
+    let shared_stopped = binding_valid
+        && match state.shared.as_mut() {
+            Some(shared) => stop_running_provider(&mut shared.running).await,
+            None => true,
+        };
+    if !(binding_valid && branch_stopped && owner_stopped && shared_stopped) {
         tracing::error!(
+            binding_valid,
             branch_stopped,
             owner_stopped,
             shared_stopped,
             "native process storage provider teardown failed; retaining private mount resources"
         );
+        fence_retained_projection(state).await;
         return false;
     }
     let Some(kernel) = state.kernel.upgrade() else {
@@ -147,6 +150,67 @@ async fn cleanup_projection(state: &mut ProjectionCleanupState) -> bool {
     }
     state.cleaned = true;
     true
+}
+
+async fn fence_retained_projection(state: &mut ProjectionCleanupState) {
+    let Some(kernel) = state.kernel.upgrade() else {
+        tracing::error!(
+            "kernel shut down before retained process storage projection leases were fenced"
+        );
+        return;
+    };
+    let fenced = fence_projection_leases(
+        &kernel,
+        &state.binding,
+        &state.branch.lease,
+        &state.owner.lease,
+        state.shared.as_ref().map(|shared| &shared.lease),
+    )
+    .await;
+    if !fenced {
+        tracing::error!(
+            "failed to fence every exact process storage projection lease after retained teardown"
+        );
+    }
+}
+
+async fn fence_projection_leases(
+    kernel: &Kernel,
+    binding: &ProcessProjectionBinding,
+    branch: &ProjectionLeaseTarget,
+    owner: &ProjectionLeaseTarget,
+    shared: Option<&ProjectionLeaseTarget>,
+) -> bool {
+    let branch = force_fence_projection_lease(
+        kernel,
+        binding.acting_uid,
+        branch.target.durable_owner(),
+        &branch.target.durable_target(),
+        branch.mount_id,
+    )
+    .await;
+    let owner = force_fence_projection_lease(
+        kernel,
+        binding.acting_uid,
+        owner.target.durable_owner(),
+        &owner.target.durable_target(),
+        owner.mount_id,
+    )
+    .await;
+    let shared = match shared {
+        Some(shared) => {
+            force_fence_projection_lease(
+                kernel,
+                binding.acting_uid,
+                shared.target.durable_owner(),
+                &shared.target.durable_target(),
+                shared.mount_id,
+            )
+            .await
+        },
+        None => true,
+    };
+    branch && owner && shared
 }
 
 async fn stop_running_provider(provider: &mut RunningProvider) -> bool {

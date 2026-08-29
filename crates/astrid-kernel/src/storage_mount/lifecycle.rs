@@ -386,6 +386,33 @@ pub(crate) async fn force_revoke_projection_lease(
     cleanup_mapped_lease(kernel, &state).is_ok()
 }
 
+/// Revoke one projection lease without releasing its provider resources.
+///
+/// A retained provider teardown must make the lease unusable immediately, but
+/// cannot prove that the provider endpoint and mount root are gone. Keeping
+/// the revoked map entry lets the bounded retry use the exact provider and
+/// lease again; the mutation fence drains already admitted writers.
+pub(crate) async fn force_fence_projection_lease(
+    kernel: &Kernel,
+    requester_uid: PrincipalUid,
+    expected_owner: StateOwner,
+    expected_target: &StorageFilesystemTargetV1,
+    mount_id: StorageMountId,
+) -> bool {
+    let Ok(state) = mapped_owned_lease(kernel, requester_uid, false, mount_id) else {
+        return kernel.storage_mounts.get(&mount_id).is_none();
+    };
+    if state.owner != expected_owner
+        || state.target != *expected_target
+        || state.access != StorageProviderAccessV1::ReadWrite
+    {
+        return false;
+    }
+    state.revoked.store(true, Ordering::Release);
+    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
+    true
+}
+
 /// Revoke using a UID-bound grant. Alias equality is never ownership.
 pub(crate) async fn revoke_from_grant(
     kernel: &Kernel,

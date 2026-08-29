@@ -30,6 +30,15 @@ fn injected_kernel_resources(home: &AstridHome) -> crate::KernelResources {
     )
 }
 
+fn singleton_owned_kernel_resources(home: &AstridHome) -> crate::KernelResources {
+    let mut resources = injected_kernel_resources(home);
+    resources.singleton_lock = Some(
+        crate::socket::acquire_boot_singleton_lock(home)
+            .expect("acquire test singleton boot ownership"),
+    );
+    resources
+}
+
 async fn boot_with_injected_resources(
     home: &AstridHome,
     resources: crate::KernelResources,
@@ -108,7 +117,7 @@ async fn production_startup_reclaims_stale_process_storage() {
     std::fs::write(stale_root.join("workspace").join("leftover"), b"stale")
         .expect("seed stale process-storage file");
 
-    let kernel = boot_with_injected_resources(&home, injected_kernel_resources(&home))
+    let kernel = boot_with_injected_resources(&home, singleton_owned_kernel_resources(&home))
         .await
         .expect("production startup after safe reclamation");
 
@@ -138,7 +147,8 @@ async fn production_startup_fails_closed_when_process_storage_is_redirected() {
     let stale_root = process_storage.join("018f0000000000000000000000000000");
     symlink(&outside, &stale_root).expect("redirect stale UUID root");
 
-    let Err(error) = boot_with_injected_resources(&home, injected_kernel_resources(&home)).await
+    let Err(error) =
+        boot_with_injected_resources(&home, singleton_owned_kernel_resources(&home)).await
     else {
         panic!("redirected process storage must fail startup closed");
     };
@@ -173,7 +183,8 @@ async fn production_startup_fails_closed_when_process_storage_has_special_entry(
     let fifo = stale_root.join("unsafe.fifo");
     mkfifo(&fifo, Mode::from_bits_truncate(0o600)).expect("seed special entry");
 
-    let Err(error) = boot_with_injected_resources(&home, injected_kernel_resources(&home)).await
+    let Err(error) =
+        boot_with_injected_resources(&home, singleton_owned_kernel_resources(&home)).await
     else {
         panic!("special process-storage entry must fail startup closed");
     };
@@ -184,4 +195,38 @@ async fn production_startup_fails_closed_when_process_storage_has_special_entry(
     );
     assert_eq!(std::fs::read(retained).unwrap(), b"must survive");
     assert!(fifo.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lockless_injected_kernel_preserves_live_process_storage() {
+    let (_dir, home) = scratch_home();
+    let first = boot_with_injected_resources(&home, injected_kernel_resources(&home))
+        .await
+        .expect("boot first lockless injected kernel");
+
+    let process_storage = home.run_dir().join("process-storage");
+    let live_root = process_storage.join("first-live-uuid-root");
+    std::fs::create_dir_all(live_root.join("workspace")).expect("create live process root");
+    std::fs::write(live_root.join("workspace").join("live"), b"live authority")
+        .expect("seed live process root");
+
+    let second = boot_with_injected_resources(&home, injected_kernel_resources(&home))
+        .await
+        .expect("boot second lockless injected kernel");
+    assert!(
+        process_storage.is_dir(),
+        "lockless boot must not remove the shared run/process-storage root"
+    );
+    assert_eq!(
+        std::fs::read(live_root.join("workspace").join("live")).unwrap(),
+        b"live authority",
+        "a lockless boot must not delete the first live kernel's UUID root"
+    );
+
+    drop(second);
+    assert!(
+        live_root.exists(),
+        "second boot completion must remain non-destructive"
+    );
+    drop(first);
 }

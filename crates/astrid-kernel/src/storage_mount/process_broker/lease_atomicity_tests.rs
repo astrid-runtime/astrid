@@ -4,13 +4,18 @@ use std::sync::Arc;
 use astrid_capsule::context::ProcessStorageMountBroker as _;
 use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
+use astrid_core::storage_filesystem::{
+    STORAGE_FILESYSTEM_PROTOCOL_V1, StorageFilesystemOperationV1, StorageFilesystemResponseV1,
+};
+use astrid_core::storage_provider::StorageMountId;
 use astrid_storage::StateOwner;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use super::{
     KernelProcessStorageMountBroker, PROCESS_MOUNT_TEST_ID, ParentTokenSlot,
-    ProcessProjectionBinding, ProcessProjectionTargetSet, ProjectionGeneration,
-    arm_parent_token_failure, retain_failed_launch_projection, retry_failed_projection,
-    rollback_or_retain_failed_launch,
+    ProcessProjectionBinding, ProcessProjectionKey, ProcessProjectionTargetSet,
+    ProjectionGeneration, arm_parent_token_failure, blocked_projection_lease,
+    retain_failed_launch_projection, retry_failed_projection, rollback_or_retain_failed_launch,
 };
 use super::{
     abort_process_provider, arm_launch_cleanup_failure, arm_launch_failure,
@@ -128,6 +133,65 @@ fn assert_published_leases_revoked(
     );
 }
 
+async fn assert_authenticated_callback_denied(
+    kernel: &Arc<crate::Kernel>,
+    mount_id: astrid_core::storage_provider::StorageMountId,
+) {
+    let (callback_path, token) = {
+        let lease = kernel
+            .storage_mounts
+            .get(&mount_id)
+            .expect("retained exact lease");
+        lease.callback_identity_for_test()
+    };
+    let mut stream = astrid_core::local_transport::connect(&callback_path)
+        .await
+        .expect("connect retained lease callback");
+    let request = astrid_core::storage_filesystem::StorageFilesystemRequestV1 {
+        protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V1,
+        request_id: "retained-authority-replay".to_owned(),
+        lease_token: token,
+        operation: StorageFilesystemOperationV1::Stat {
+            path: String::new(),
+        },
+    };
+    let bytes = serde_json::to_vec(&request).expect("encode retained callback replay");
+    stream
+        .write_all(
+            &u32::try_from(bytes.len())
+                .expect("bounded retained callback replay")
+                .to_be_bytes(),
+        )
+        .await
+        .expect("send retained callback replay");
+    stream
+        .write_all(&bytes)
+        .await
+        .expect("send retained callback payload");
+    let mut length = [0_u8; 4];
+    stream
+        .read_exact(&mut length)
+        .await
+        .expect("read retained callback response length");
+    let mut payload = vec![0_u8; u32::from_be_bytes(length) as usize];
+    stream
+        .read_exact(&mut payload)
+        .await
+        .expect("read retained callback response");
+    let response: StorageFilesystemResponseV1 =
+        serde_json::from_slice(&payload).expect("decode retained callback response");
+    assert!(
+        matches!(
+            response.outcome,
+            astrid_core::storage_filesystem::StorageFilesystemOutcomeV1::Failure(
+                ref failure
+            ) if failure.code == "stale-lease"
+        ),
+        "retained authenticated callback must be stale-lease denied: {:?}",
+        response.outcome
+    );
+}
+
 async fn assert_real_launch_rollback(stage: ProcessLaunchStage, test_id: u64) {
     let (_temporary, kernel) = fleet_shared_kernel().await;
     let caller = PrincipalId::default();
@@ -161,25 +225,25 @@ async fn assert_real_launch_rollback(stage: ProcessLaunchStage, test_id: u64) {
     );
 }
 
-async fn assert_real_launch_retains_blocker(stage: ProcessLaunchStage, test_id: u64) {
-    let (_temporary, kernel) = fleet_shared_kernel().await;
-    let caller = PrincipalId::default();
-    let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
-    let replacement_broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
-    arm_launch_cleanup_failure(stage, test_id);
-    let Err(error) = PROCESS_MOUNT_TEST_ID
-        .scope(test_id, broker.mount(&caller))
-        .await
-    else {
-        panic!("the selected {stage:?} launch fault must fail provider startup");
-    };
-    assert!(
-        error.contains("injected retained-endpoint launch failure"),
-        "unexpected {stage:?} launch error: {error}"
-    );
-    assert_recorded_pids_reaped(stage, test_id);
+struct RetainedLaunchProof<'a> {
+    kernel: &'a Arc<crate::Kernel>,
+    broker: &'a KernelProcessStorageMountBroker,
+    replacement_broker: &'a KernelProcessStorageMountBroker,
+    caller: &'a PrincipalId,
+    stage: ProcessLaunchStage,
+    test_id: u64,
+}
 
-    let published = published_provider_leases(test_id);
+async fn assert_retained_authority_before_retry(
+    proof: &RetainedLaunchProof<'_>,
+    published: &BTreeMap<ProcessLaunchStage, StorageMountId>,
+    published_ids: &[StorageMountId],
+) -> ProcessProjectionKey {
+    let stage = proof.stage;
+    let kernel = proof.kernel;
+    let broker = proof.broker;
+    let replacement_broker = proof.replacement_broker;
+    let caller = proof.caller;
     assert_eq!(
         published.len(),
         expected_lease_count(stage),
@@ -188,14 +252,20 @@ async fn assert_real_launch_retains_blocker(stage: ProcessLaunchStage, test_id: 
     assert_eq!(
         kernel.storage_mounts.len(),
         expected_lease_count(stage),
-        "{stage:?} failed cleanup must leave the lease authority unchanged"
+        "{stage:?} retained failure must retain every exact revoked lease"
     );
-    for mount_id in published.values() {
-        assert!(
-            kernel.storage_mounts.contains_key(mount_id),
-            "{stage:?} must retain lease {mount_id}"
-        );
+    for mount_id in published_ids {
+        assert_authenticated_callback_denied(kernel, *mount_id).await;
     }
+    let process_root = kernel.astrid_home.run_dir().join("process-storage");
+    assert_eq!(
+        process_root
+            .read_dir()
+            .expect("retained process storage root")
+            .count(),
+        1,
+        "{stage:?} retained failure must preserve the UUID root"
+    );
 
     let projections = broker.projections.lock().await;
     assert_eq!(
@@ -222,9 +292,8 @@ async fn assert_real_launch_retains_blocker(stage: ProcessLaunchStage, test_id: 
         !retry_failed_projection(&projection, &mut retained_projections, &key).await,
         "{stage:?} authoritative retry must remain blocked by the live endpoint"
     );
-    assert!(!retained_projections.is_empty());
 
-    let Err(replacement_error) = replacement_broker.mount(&caller).await else {
+    let Err(replacement_error) = replacement_broker.mount(caller).await else {
         panic!("{stage:?} replacement must be denied while cleanup is retained");
     };
     assert!(
@@ -234,10 +303,105 @@ async fn assert_real_launch_retains_blocker(stage: ProcessLaunchStage, test_id: 
     assert_eq!(
         kernel.storage_mounts.len(),
         expected_lease_count(stage),
-        "{stage:?} denied replacement must not mutate lease authority"
+        "{stage:?} denied replacement must retain revoked authority"
     );
+    key
+}
 
-    release_launch_cleanup_failure(test_id).await;
+async fn assert_retry_releases_authority(
+    proof: &RetainedLaunchProof<'_>,
+    key: &ProcessProjectionKey,
+    published: &BTreeMap<ProcessLaunchStage, StorageMountId>,
+    published_ids: &[StorageMountId],
+) {
+    let stage = proof.stage;
+    let kernel = proof.kernel;
+    let broker = proof.broker;
+    let caller = proof.caller;
+    release_launch_cleanup_failure(proof.test_id).await;
+    let failed_callback_path = {
+        let lease = kernel
+            .storage_mounts
+            .get(published.get(&stage).expect("failed published lease"))
+            .expect("failed exact lease remains retained until retry");
+        lease.callback_identity_for_test().0
+    };
+    std::fs::remove_file(
+        failed_callback_path
+            .parent()
+            .expect("failed provider resource root")
+            .join("process-control.sock"),
+    )
+    .expect("release retained provider endpoint");
+    let Err(retry_error) = broker.mount(caller).await else {
+        panic!("retry must pass authority, then reach the absent unit-test provider");
+    };
+    assert!(
+        retry_error.contains("inspect coinstalled storage provider"),
+        "unexpected post-authority retry error for {stage:?}: {retry_error}"
+    );
+    assert!(
+        broker.projections.lock().await.is_empty(),
+        "{stage:?} successful retry must remove the retained blocker"
+    );
+    assert!(
+        published_ids
+            .iter()
+            .all(|mount_id| !kernel.storage_mounts.contains_key(mount_id)),
+        "{stage:?} successful retry must remove every exact revoked lease"
+    );
+    assert_eq!(
+        kernel.storage_mounts.len(),
+        0,
+        "{stage:?} successful retry must leave no live authority"
+    );
+    assert!(
+        blocked_projection_lease(kernel, &key.binding).is_none(),
+        "{stage:?} replacement admission must no longer be blocked"
+    );
+    assert!(
+        kernel
+            .astrid_home
+            .run_dir()
+            .join("process-storage")
+            .read_dir()
+            .expect("process storage root after retry")
+            .next()
+            .is_none(),
+        "{stage:?} successful retry must remove the retained UUID root"
+    );
+}
+
+async fn assert_real_launch_retains_blocker(stage: ProcessLaunchStage, test_id: u64) {
+    let (_temporary, kernel) = fleet_shared_kernel().await;
+    let caller = PrincipalId::default();
+    let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
+    let replacement_broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
+    arm_launch_cleanup_failure(stage, test_id);
+    let Err(error) = PROCESS_MOUNT_TEST_ID
+        .scope(test_id, broker.mount(&caller))
+        .await
+    else {
+        panic!("the selected {stage:?} launch fault must fail provider startup");
+    };
+    assert!(
+        error.contains("injected retained-endpoint launch failure"),
+        "unexpected {stage:?} launch error: {error}"
+    );
+    assert_recorded_pids_reaped(stage, test_id);
+
+    let published = published_provider_leases(test_id);
+    let published_ids = published.values().copied().collect::<Vec<_>>();
+    let proof = RetainedLaunchProof {
+        kernel: &kernel,
+        broker: &broker,
+        replacement_broker: &replacement_broker,
+        caller: &caller,
+        stage,
+        test_id,
+    };
+    let key = assert_retained_authority_before_retry(&proof, &published, &published_ids).await;
+    assert_retry_releases_authority(&proof, &key, &published, &published_ids).await;
 }
 
 #[tokio::test]

@@ -52,6 +52,8 @@ pub(crate) use admission::last_authorized_caller_uid;
 #[cfg(test)]
 pub(crate) use cleanup::MountCleanupStage;
 use cleanup::cleanup_resource_paths;
+#[cfg(any(unix, windows))]
+pub(crate) use lifecycle::force_fence_projection_lease;
 #[cfg(test)]
 pub(crate) use lifecycle::revoke_lease;
 pub(crate) use lifecycle::{
@@ -117,6 +119,8 @@ pub(crate) struct StorageMountLeaseState {
     dirty: AtomicBool,
     in_flight_mutations: AtomicU64,
     shutdown_tx: watch::Sender<bool>,
+    #[cfg(all(test, any(unix, windows)))]
+    token_for_test: String,
     /// Set after the listener task has dropped its backend listener handle.
     ///
     /// Windows named-pipe endpoints are kernel objects rather than removable
@@ -182,6 +186,11 @@ impl StorageMountLeaseState {
     #[cfg(test)]
     pub(crate) fn is_revoked_for_test(&self) -> bool {
         self.revoked.load(Ordering::Acquire)
+    }
+
+    #[cfg(all(test, any(unix, windows)))]
+    pub(crate) fn callback_identity_for_test(&self) -> (std::path::PathBuf, String) {
+        (self.callback_path.clone(), self.token_for_test.clone())
     }
 
     fn renew(&self) {
@@ -305,6 +314,8 @@ fn publish_issued_lease(
         dirty: AtomicBool::new(false),
         in_flight_mutations: AtomicU64::new(0),
         shutdown_tx,
+        #[cfg(all(test, any(unix, windows)))]
+        token_for_test: token.clone(),
         listener_closed_tx,
         #[cfg(test)]
         mutation_test_gate: std::sync::Mutex::new(None),

@@ -443,9 +443,15 @@ pub struct KernelResources {
     pub cli_socket_listener: Option<astrid_capsule::context::UplinkListener>,
     /// Exclusive advisory lock enforcing a single kernel instance, held for the
     /// process lifetime; its `Drop` releases the lock. Independent of
-    /// `cli_socket_listener` — the kernel never reads either field, so a host
-    /// supplies whichever facilities it actually has (the native daemon: both;
-    /// test kernels and hosts with no real socket: neither).
+    /// `cli_socket_listener`. The kernel reads `singleton_lock` only once as
+    /// the startup-reclamation ownership gate, so a host supplies whichever
+    /// facilities it actually has (the native daemon: both; test kernels and
+    /// hosts with no real socket: neither).
+    ///
+    /// Carrying this lock is also the portable ownership gate for native
+    /// startup reclamation. Resources without it must not reclaim shared
+    /// `run/process-storage` authority, because another kernel may still own
+    /// a live provider root.
     pub singleton_lock: Option<std::fs::File>,
     /// Native layout origin captured before `AstridHome::ensure`. `None`
     /// denotes an injected/portable composition root, which does not own the
@@ -1008,16 +1014,22 @@ impl Kernel {
         #[cfg(not(unix))]
         let _ = token_path;
 
+        // Process-storage UUID roots are live provider authority, not portable
+        // scratch. A lockless injected host has not acquired the boot boundary
+        // that makes reclamation safe against another live kernel.
+        let owns_singleton_boot = singleton_lock.is_some();
         home.clear_runtime_principal_scratch().map_err(|error| {
             std::io::Error::other(format!(
                 "Failed to clear stale principal runtime scratch: {error}"
             ))
         })?;
-        home.clear_runtime_process_storage().map_err(|error| {
-            std::io::Error::other(format!(
-                "Failed to reclaim stale process storage scratch: {error}"
-            ))
-        })?;
+        if owns_singleton_boot {
+            home.clear_runtime_process_storage().map_err(|error| {
+                std::io::Error::other(format!(
+                    "Failed to reclaim stale process storage scratch: {error}"
+                ))
+            })?;
+        }
 
         let workspace_selection = workspace_layout.resolve(&workspace_root).map_err(|error| {
             std::io::Error::new(error.kind(), format!("unsafe workspace selection: {error}"))
