@@ -133,13 +133,7 @@ fn emit_ipc_park(serial: Emit<'_>, id: u64, generation: u64) {
     ));
 }
 
-fn emit_ipc_reclaim(
-    serial: Emit<'_>,
-    id: u64,
-    generation: u64,
-    capabilities: u64,
-    endpoints: u64,
-) {
+fn emit_ipc_reclaim(serial: Emit<'_>, id: u64, generation: u64, capabilities: u64, endpoints: u64) {
     serial(format!(
         "\"ev\":\"ipc.reclaim\",\"id\":{id},\"generation\":{generation},\
             \"endpoints\":{endpoints},\"capabilities\":{capabilities},\"queued\":0"

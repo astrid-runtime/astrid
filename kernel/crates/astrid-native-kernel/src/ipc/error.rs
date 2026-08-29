@@ -1,7 +1,7 @@
 //! Typed private-IPC terminals shared by the ABI decoder and object pools.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum IpcError {
+pub enum IpcError {
     WouldBlock,
     NoSpace,
     Busy,

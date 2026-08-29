@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [lib]
-path = "src/lib.rs"
+name = "astrid_native_kernel"
 test = true
 bench = false
 

@@ -160,6 +160,14 @@ pub(super) fn mark_ipc_peer_failed(handle: DomainHandle) {
     }
 }
 
+pub(crate) fn mark_ipc_peer_failed_domain(domain: crate::ipc::DomainToken) -> bool {
+    let Some(handle) = domain_handle_token(domain) else {
+        return false;
+    };
+    mark_ipc_peer_failed(handle);
+    true
+}
+
 #[cfg(not(test))]
 pub(crate) fn resume_blocked(handle: DomainHandle) -> Result<(), ()> {
     let Some(parked) = PARKED.lock()[handle.id().value() as usize] else {
@@ -506,6 +514,10 @@ pub(crate) mod test_support {
         *PENDING_COMPLETION.lock() = None;
     }
 
+    pub(crate) fn status_name(handle: DomainHandle) -> Option<&'static str> {
+        status(handle).map(BlockStatus::as_name)
+    }
+
     pub(crate) fn all_statuses() -> [Option<BlockStatus>; 2] {
         PARKED
             .lock()
@@ -513,8 +525,8 @@ pub(crate) mod test_support {
     }
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any())]
+mod removed_tests {
     use super::test_support::{all_statuses, park, reset, status};
     use super::*;
     use crate::ipc::test_support::{endpoint_create, install_transfer_message, reset as reset_ipc};

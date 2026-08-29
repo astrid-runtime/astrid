@@ -8,13 +8,13 @@ use super::error::IpcError;
 pub(crate) const DOMAIN_SLOTS: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct DomainToken {
+pub struct DomainToken {
     slot: CapSlot,
     generation: NonZeroU64,
 }
 
 impl DomainToken {
-    pub(crate) fn new(slot: u64, generation: u64) -> Option<Self> {
+    pub fn new(slot: u64, generation: u64) -> Option<Self> {
         let slot = CapSlot::try_new(slot as usize).ok()?;
         Some(Self {
             slot,
@@ -22,17 +22,17 @@ impl DomainToken {
         })
     }
 
-    pub(crate) const fn slot(self) -> CapSlot {
+    pub const fn slot(self) -> CapSlot {
         self.slot
     }
 
-    pub(crate) const fn generation(self) -> NonZeroU64 {
+    pub const fn generation(self) -> NonZeroU64 {
         self.generation
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct CapSlot(u8);
+pub struct CapSlot(u8);
 
 impl CapSlot {
     pub(crate) const fn try_new(value: usize) -> Result<Self, IpcError> {
@@ -47,7 +47,7 @@ impl CapSlot {
         self.0
     }
 
-    pub(crate) const fn index(self) -> usize {
+    pub const fn index(self) -> usize {
         self.0 as usize
     }
 }

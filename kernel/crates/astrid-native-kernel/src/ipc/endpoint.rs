@@ -6,7 +6,7 @@ use super::capability::{Capability, DomainToken};
 const ENDPOINT_MEMBERS: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SendOutcome {
+pub(crate) enum SendOutcome {
     Delivered,
     Ready,
     Full,
@@ -187,7 +187,13 @@ impl Endpoint {
         domain: DomainToken,
     ) -> [Option<DomainToken>; 2] {
         if self.members.contains(&Some(domain)) {
-            self.clear_domain(domain)
+            let mut wakes = self.clear_domain(domain);
+            // The revoked domain itself may be parked even when it is the
+            // only endpoint member; report it so revoke can fail it terminal.
+            if !wakes.contains(&Some(domain)) {
+                wakes[0] = Some(domain);
+            }
+            wakes
         } else {
             [None; 2]
         }

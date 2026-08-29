@@ -592,15 +592,14 @@ fn domain_lifecycle_holds(events: &[Value]) -> bool {
         .all(|event| {
             let entry_contract =
                 u64_field(event, "id") == Some(1) && u64_field(event, "generation") == Some(1);
-            let guest_cancel_contract = u64_field(event, "id") == Some(1)
-                && u64_field(event, "generation") == Some(9);
-            let guest_cancel_ok =
-                !guest_cancel_contract || u64_field(event, "rax") == Some(7);
+            let guest_cancel_contract =
+                u64_field(event, "id") == Some(1) && u64_field(event, "generation") == Some(9);
+            let guest_cancel_ok = !guest_cancel_contract || u64_field(event, "rax") == Some(7);
             let zero_gpr = !entry_contract
                 || (u64_field(event, "rax") == Some(0)
                     && [
-                        "rbx", "rcx", "rdx", "rsi", "rbp", "r8", "r9", "r10", "r11", "r12",
-                        "r13", "r14", "r15",
+                        "rbx", "rcx", "rdx", "rsi", "rbp", "r8", "r9", "r10", "r11", "r12", "r13",
+                        "r14", "r15",
                     ]
                     .iter()
                     .all(|name| u64_field(event, name) == Some(0)));

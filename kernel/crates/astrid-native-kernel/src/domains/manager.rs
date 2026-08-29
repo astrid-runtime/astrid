@@ -7,7 +7,6 @@ use x86_64::VirtAddr;
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::{PhysFrame, Size4KiB};
 
-use astrid_system_generation::ContentId;
 use super::paging::AddressSpace;
 use super::types::{
     BindError, CODE_BASE, ComponentImage, DomainGeneration, DomainHandle, DomainId,
@@ -19,6 +18,7 @@ use crate::ipc;
 use crate::memory::FRAME_SIZE;
 use crate::serial;
 use crate::trap::TrapFrame;
+use astrid_system_generation::ContentId;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PrepareError {
     Bind(BindError),
@@ -581,7 +581,7 @@ pub(crate) fn handle_domain_trap(frame: &mut TrapFrame, fault_address: u64) -> b
     if vector == 6 && scenario == Scenario::IpcCancelGuest.value() && frame.rip == CODE_BASE + 95 {
         // Scenario 10 deliberately reaches the unchanged shared invalid
         // fall-through; only this new scenario resumes into appended bytes.
-    frame.rip = CODE_BASE + IPC_CANCEL_GUEST_APPEND_OFFSET;
+        frame.rip = CODE_BASE + IPC_CANCEL_GUEST_APPEND_OFFSET;
         return true;
     }
     if vector == apic::TIMER_VECTOR && scenario >= Scenario::IpcServer.value() {

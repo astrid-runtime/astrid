@@ -39,3 +39,34 @@ pub(crate) fn bind_ipc_peer(
 pub(crate) fn mark_ipc_cancelled(domain: crate::ipc::DomainToken) -> bool {
     wait::mark_ipc_cancelled(domain)
 }
+
+pub(crate) fn mark_ipc_peer_failed(domain: crate::ipc::DomainToken) -> bool {
+    wait::mark_ipc_peer_failed_domain(domain)
+}
+
+#[cfg(test)]
+pub(crate) fn ipc_peer_status_for_test(domain: crate::ipc::DomainToken) -> Option<&'static str> {
+    let Some(handle) = wait::domain_handle_token(domain) else {
+        return None;
+    };
+    wait::test_support::status_name(handle)
+}
+
+#[cfg(test)]
+pub(crate) fn park_ipc_peer_for_test(domain: crate::ipc::DomainToken, status: &str) -> bool {
+    let Some(handle) = wait::domain_handle_token(domain) else {
+        return false;
+    };
+    let status = match status {
+        "sent" => wait::BlockStatus::Sent,
+        "received" => wait::BlockStatus::Received,
+        _ => return false,
+    };
+    wait::test_support::park(handle, status, 0, 0, crate::ipc::MAX_BUFFER_BYTES as u64);
+    true
+}
+
+#[cfg(test)]
+pub(crate) fn reset_wait_state_for_test() {
+    wait::test_support::reset();
+}

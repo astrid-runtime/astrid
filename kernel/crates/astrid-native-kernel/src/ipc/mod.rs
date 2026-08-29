@@ -1,25 +1,29 @@
 //! Private fixed-capability endpoint IPC for native protection domains.
 
+// The freestanding binary owns the production entry point, while host tests
+// exercise these same functions directly through the platform seam.
+#![allow(dead_code, unused_imports)]
+
 mod abi;
 mod capability;
 mod copy;
 mod endpoint;
 mod error;
 #[cfg(test)]
-#[path = "test_support.rs"]
 pub(crate) mod test_support;
+#[cfg(test)]
+mod revoke_tests;
 
 use core::num::NonZeroU64;
 
 use spin::Mutex;
 
-use crate::serial;
-use crate::trap::TrapFrame;
+use crate::platform::{self, TrapFrame};
 
-pub(crate) use abi::MAX_BUFFER_BYTES;
-pub(crate) use capability::DomainToken;
+pub use abi::MAX_BUFFER_BYTES;
+pub use capability::DomainToken;
 use capability::{CapSlot, CapTable, Capability, DerivationLink, Rights};
-pub(crate) use copy::finish_copy;
+pub use copy::finish_copy;
 use endpoint::{Endpoint, Message, SendOutcome};
 use error::IpcError;
 
@@ -90,32 +94,32 @@ impl IpcState {
 static IPC: Mutex<IpcState> = Mutex::new(IpcState::empty());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SyscallOutcome {
+pub enum SyscallOutcome {
     Done(u64, u64),
     Block(BlockReason),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BlockReason {
+pub enum BlockReason {
     SendReady,
     RecvEmpty,
 }
 
-pub(crate) const VECTOR: u8 = 112;
-pub(crate) const FAULTED_STATUS: u64 = IpcError::Faulted.as_code();
-pub(crate) const CANCELLED_STATUS: u64 = IpcError::Cancelled.as_code();
+pub const VECTOR: u8 = 112;
+pub const FAULTED_STATUS: u64 = IpcError::Faulted.as_code();
+pub const CANCELLED_STATUS: u64 = IpcError::Cancelled.as_code();
 
 #[derive(Clone, Copy)]
-pub(crate) struct TeardownOutcome {
-    pub(crate) endpoints: usize,
-    pub(crate) capabilities: usize,
-    pub(crate) queued_messages: usize,
-    pub(crate) waiters: [Option<DomainToken>; 2],
-    pub(crate) peer_failures: [Option<DomainToken>; 2],
+pub struct TeardownOutcome {
+    pub endpoints: usize,
+    pub capabilities: usize,
+    pub queued_messages: usize,
+    pub waiters: [Option<DomainToken>; 2],
+    pub peer_failures: [Option<DomainToken>; 2],
 }
 
 impl TeardownOutcome {
-    pub(crate) const EMPTY: Self = Self {
+    pub const EMPTY: Self = Self {
         endpoints: 0,
         capabilities: 0,
         queued_messages: 0,
@@ -191,12 +195,12 @@ fn unbind_members_without_capabilities(
     }
 }
 
-pub(crate) fn prepare_domain(domain: DomainToken) {
+pub fn prepare_domain(domain: DomainToken) {
     let mut state = IPC.lock();
     state.capabilities[domain.slot().index()].reset(domain);
 }
 
-pub(crate) fn bind_peer(creator: DomainToken, peer: DomainToken) -> Result<(), IpcError> {
+pub fn bind_peer(creator: DomainToken, peer: DomainToken) -> Result<(), IpcError> {
     let mut state = IPC.lock();
     let creator_slot = find_slot(&state, creator, Rights::GRANT).ok_or(IpcError::Denied)?;
     let source = state.capabilities[creator.slot().index()]
@@ -229,7 +233,7 @@ pub(crate) fn bind_peer(creator: DomainToken, peer: DomainToken) -> Result<(), I
     )
 }
 
-pub(crate) fn handle_call(frame: &mut TrapFrame, domain: DomainToken) -> SyscallOutcome {
+pub fn handle_call(frame: &mut TrapFrame, domain: DomainToken) -> SyscallOutcome {
     let Some(operation) = abi::Operation::decode(frame.rax) else {
         return fault(domain, IpcError::Malformed, None);
     };
@@ -242,7 +246,7 @@ pub(crate) fn handle_call(frame: &mut TrapFrame, domain: DomainToken) -> Syscall
             };
             if blocks {
                 if operation == abi::Operation::Send {
-                    serial::ev_ipc_op(
+                    platform::current().ev_ipc_op(
                         domain.slot().index() as u64 + 1,
                         domain.generation().get(),
                         operation.as_name(),
@@ -255,7 +259,7 @@ pub(crate) fn handle_call(frame: &mut TrapFrame, domain: DomainToken) -> Syscall
                 };
                 return SyscallOutcome::Block(reason);
             }
-            serial::ev_ipc_op(
+            platform::current().ev_ipc_op(
                 domain.slot().index() as u64 + 1,
                 domain.generation().get(),
                 operation.as_name(),
@@ -272,7 +276,7 @@ fn fault(
     error: IpcError,
     operation: Option<abi::Operation>,
 ) -> SyscallOutcome {
-    serial::ev_ipc_op(
+    platform::current().ev_ipc_op(
         domain.slot().index() as u64 + 1,
         domain.generation().get(),
         operation.map_or("unknown", abi::Operation::as_name),
@@ -281,7 +285,8 @@ fn fault(
     SyscallOutcome::Done(error.as_code(), 0)
 }
 
-pub(crate) fn complete_parked_recv(
+#[allow(clippy::result_unit_err)]
+pub fn complete_parked_recv(
     domain: DomainToken,
     input: &[u8; abi::MAX_BUFFER_BYTES],
     slot: u64,
@@ -356,7 +361,7 @@ fn dispatch(
         abi::Operation::Recv => recv(frame, domain),
         abi::Operation::Cancel => {
             let endpoint_cancelled = cancel_waiter(domain);
-            let parked_cancelled = crate::domains::mark_ipc_cancelled(domain);
+            let parked_cancelled = platform::current().mark_ipc_cancelled(domain);
             let running_cancel =
                 !(endpoint_cancelled || parked_cancelled) && domain_has_capability(domain);
             let cancelled = endpoint_cancelled || parked_cancelled || running_cancel;
@@ -583,11 +588,15 @@ fn cap_revoke(frame: &TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcE
         }
     }
     removed_count += revoked_messages;
+    let mut wakes = [None; 2];
+    unbind_members_without_capabilities(&mut state, &mut wakes);
     if endpoint_is_unused(&state, removed.endpoint) {
         reclaim_object(&mut state, removed.endpoint);
     }
-    let mut wakes = [None; 2];
-    unbind_members_without_capabilities(&mut state, &mut wakes);
+    drop(state);
+    for wake in wakes.into_iter().flatten() {
+        platform::current().mark_ipc_peer_failed(wake);
+    }
     Ok((0, removed_count as u64))
 }
 
@@ -616,7 +625,7 @@ fn cap_identify(frame: &mut TrapFrame, domain: DomainToken) -> Result<(u64, u64)
     Ok((0, abi::MAX_BUFFER_BYTES as u64))
 }
 
-pub(crate) fn teardown_domain(domain: DomainToken) -> TeardownOutcome {
+pub fn teardown_domain(domain: DomainToken) -> TeardownOutcome {
     let mut outcome = TeardownOutcome::EMPTY;
     let mut state = IPC.lock();
     outcome.capabilities = state.capabilities[domain.slot().index()].count(domain);

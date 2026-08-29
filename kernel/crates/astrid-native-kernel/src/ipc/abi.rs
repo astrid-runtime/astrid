@@ -8,7 +8,7 @@ pub(super) const ENDPOINT_POOL: usize = 4;
 pub(super) const CAP_OBJECT_POOL: usize = 16;
 pub(super) const QUEUE_DEPTH: usize = 1;
 pub(super) const MAX_PAYLOAD_BYTES: usize = 64;
-pub(crate) const MAX_BUFFER_BYTES: usize = 96;
+pub const MAX_BUFFER_BYTES: usize = 96;
 pub(super) const TRANSFERS_PER_MESSAGE: usize = 1;
 
 pub(super) const OP_ENDPOINT_CREATE: u64 = 1;

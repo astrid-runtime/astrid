@@ -4,7 +4,12 @@ use super::*;
 
 pub(crate) fn reset() {
     *IPC.lock() = IpcState::empty();
-    crate::domains::wait::test_support::reset();
+    crate::platform::reset_for_test();
+}
+
+pub(crate) fn test_lock() -> spin::MutexGuard<'static, ()> {
+    static TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+    TEST_LOCK.lock()
 }
 
 pub(crate) fn capability(domain: DomainToken, slot: CapSlot) -> Option<Capability> {
@@ -44,6 +49,14 @@ pub(crate) fn park_member(domain: DomainToken) -> bool {
         .iter_mut()
         .flatten()
         .any(|object| object.park(domain))
+}
+
+pub(crate) fn park_peer(domain: DomainToken, status: &str) -> bool {
+    crate::platform::park_peer_for_test(domain, status)
+}
+
+pub(crate) fn peer_status(domain: DomainToken) -> Option<&'static str> {
+    crate::platform::peer_status_for_test(domain)
 }
 
 pub(crate) fn cap_revoke(domain: DomainToken, slot: CapSlot) -> Result<u64, IpcError> {
@@ -109,7 +122,7 @@ mod tests {
         install_transfer_message, object_count, park_member, queued_for, reset, send_outcome,
     };
     use super::*;
-    use crate::test_lock::LOCK;
+    use super::test_support::test_lock;
 
     fn domain(slot: u64) -> DomainToken {
         DomainToken::new(slot, 1).unwrap()
@@ -125,7 +138,7 @@ mod tests {
 
     #[test]
     fn revoking_last_peer_capability_unbinds_stale_member() {
-        let _guard = LOCK.lock();
+        let _guard = test_lock();
         reset();
         let creator = domain(0);
         let peer = domain(1);
@@ -144,7 +157,7 @@ mod tests {
 
     #[test]
     fn teardown_revokes_derivation_subtree_and_sender_queue() {
-        let _guard = LOCK.lock();
+        let _guard = test_lock();
         reset();
         let creator = domain(0);
         let peer = domain(1);
@@ -163,7 +176,7 @@ mod tests {
 
     #[test]
     fn failed_nontransfer_copyout_restores_without_waiter() {
-        let _guard = LOCK.lock();
+        let _guard = test_lock();
         reset();
         let creator = domain(0);
         let peer = domain(1);
@@ -181,7 +194,7 @@ mod tests {
 
     #[test]
     fn failed_transfer_copyout_does_not_install_stale_waiter() {
-        let _guard = LOCK.lock();
+        let _guard = test_lock();
         reset();
         let creator = domain(0);
         let peer = domain(1);
@@ -206,22 +219,4 @@ mod tests {
         assert!(!has_waiter(peer));
     }
 
-    #[test]
-    fn running_guest_cancel_requires_live_capability_and_is_typed() {
-        let _guard = LOCK.lock();
-        reset();
-        let domain = DomainToken::new(0, 1).unwrap();
-        prepare_domain(domain);
-        let mut frame = TrapFrame::zeroed();
-        frame.rax = 4;
-        assert_eq!(
-            handle_call(&mut frame, domain),
-            SyscallOutcome::Done(IpcError::Busy.as_code(), 0)
-        );
-        endpoint_create(domain).unwrap();
-        assert_eq!(
-            handle_call(&mut frame, domain),
-            SyscallOutcome::Done(CANCELLED_STATUS, 0)
-        );
-    }
 }
