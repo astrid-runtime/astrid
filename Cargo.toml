@@ -256,7 +256,7 @@ utoipa = { version = "5", features = ["axum_extras"] }
 uuid = { version = "~1.25.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
 walkdir = "2.5"
 wasm-encoder = "0.257.1"
-wat = "1.256"
+wat = "=1.257.1"
 wasmparser = "0.257.1"
 windows-sys = "0.61"
 wit-component = "0.257.1"
