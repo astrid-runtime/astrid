@@ -14,6 +14,11 @@ QEMU_RUNS = ROOT / "target" / "qemu-runs"
 RUNNER = ROOT / "scripts" / "run_qemu.py"
 JOURNAL_SERIAL = "PIO1691-JOURNAL-0001"
 CLONE_SERIAL = "PIO1691-CLONE-000001"
+RUNNER_SUCCESS = 0
+RUNNER_TORN_RECOVERY = 33
+RUNNER_GUEST_PANIC = 67
+HOST_PROCESS_KILL = 137
+RUNNER_TIMEOUT = 124
 
 
 def serial_evidence(serial_text: str) -> list[str]:
@@ -38,7 +43,11 @@ def remove_run_dir(name: str) -> None:
 
 
 def run_case(
-    name: str, *, preserve_run: bool = False, **arguments: str | Path | int | bool
+    name: str,
+    *,
+    expected_runner_rc: int,
+    preserve_run: bool = False,
+    **arguments: str | Path | int | bool,
 ) -> dict[str, object]:
     command = [sys.executable, str(RUNNER), "--name", name]
     for key, value in arguments.items():
@@ -57,19 +66,31 @@ def run_case(
         raise AssertionError(f"{name}: runner did not produce evidence")
 
     summary = json.loads(summary_path.read_text())
+    runner_rc = completed.returncode
+    if runner_rc == RUNNER_TIMEOUT:
+        raise AssertionError(f"{name}: runner timed out")
+    if runner_rc != expected_runner_rc:
+        raise AssertionError(
+            f"{name}: runner rc {runner_rc}, expected {expected_runner_rc}"
+        )
     result: dict[str, object] = {
         "name": name,
-        "runner_rc": completed.returncode,
+        "runner_rc": runner_rc,
         "summary": summary,
         "serial_evidence": serial_evidence(serial_path.read_text(errors="replace")),
     }
-    expected_serial = "" if arguments.get("no_journal_device") else JOURNAL_SERIAL
+    expected_serial = (
+        ""
+        if arguments.get("no_journal_device")
+        else str(arguments.get("journal_serial", JOURNAL_SERIAL))
+    )
     if summary.get("journal_serial") != expected_serial:
         result["serial_error"] = [
             summary.get("journal_serial"),
             "expected",
             expected_serial,
         ]
+        raise AssertionError(f"{name}: serial mismatch: {result['serial_error']}")
     if not preserve_run:
         remove_run_dir(name)
     return result
@@ -103,7 +124,11 @@ def main() -> int:
     results: list[dict[str, object]] = []
 
     try:
-        clean = run_case("clean-two-boot", preserve_run=True)
+        clean = run_case(
+            "clean-two-boot",
+            expected_runner_rc=RUNNER_SUCCESS,
+            preserve_run=True,
+        )
         require(clean, "changed", "serial_ok", "auth_candidate", "roundtrip")
         source = inputs / "clean.img"
         shutil.copyfile(QEMU_RUNS / "clean-two-boot" / "journal.img", source)
@@ -111,7 +136,11 @@ def main() -> int:
         results.append(clean)
 
         recover = run_case(
-            "recover", mode="recover", reuse_journal=source, keep_journal=True
+            "recover",
+            expected_runner_rc=RUNNER_SUCCESS,
+            mode="recover",
+            reuse_journal=source,
+            keep_journal=True,
         )
         require(recover, "serial_ok", "auth_candidate")
         require_absent(recover, "changed", "panic")
@@ -120,11 +149,11 @@ def main() -> int:
         for frame in (0, 8, 15):
             crash = run_case(
                 f"crash-frame-{frame}",
+                expected_runner_rc=HOST_PROCESS_KILL,
                 preserve_run=True,
                 crash=f"frame:{frame}",
                 kill_after_serial=f"CRASH-BARRIER FRAME={frame:016x}",
             )
-            assert crash["runner_rc"] == 137
             require(crash, "serial_ok", "missing_commit")
             require_absent(crash, "auth_candidate", "panic")
             crashed = inputs / f"crash-frame-{frame}.img"
@@ -134,6 +163,7 @@ def main() -> int:
 
             recovery = run_case(
                 f"crash-frame-{frame}-recover",
+                expected_runner_rc=RUNNER_TORN_RECOVERY,
                 mode="recover",
                 reuse_journal=crashed,
             )
@@ -143,20 +173,20 @@ def main() -> int:
 
         pre_commit = run_case(
             "crash-pre-commit",
+            expected_runner_rc=HOST_PROCESS_KILL,
             crash="before-commit",
             kill_after_serial="CRASH-BARRIER BEFORE-COMMIT\n",
         )
-        assert pre_commit["runner_rc"] == 137
         require(pre_commit, "changed", "serial_ok", "missing_commit")
         require_absent(pre_commit, "auth_candidate", "panic")
         results.append(pre_commit)
 
         pre_flush = run_case(
             "crash-pre-flush",
+            expected_runner_rc=HOST_PROCESS_KILL,
             crash="commit-flush-begin",
             kill_after_serial="CRASH-BARRIER COMMIT-FLUSH-BEGIN\n",
         )
-        assert pre_flush["runner_rc"] == 137
         require(pre_flush, "changed", "serial_ok")
         require_absent(pre_flush, "auth_candidate", "panic")
         results.append(pre_flush)
@@ -170,6 +200,7 @@ def main() -> int:
             handle.write(bytes([original[0] ^ 1]))
         forged_case = run_case(
             "negative-forged-byte",
+            expected_runner_rc=RUNNER_TORN_RECOVERY,
             mode="recover",
             reuse_journal=forged,
         )
@@ -179,6 +210,7 @@ def main() -> int:
 
         stale_floor = run_case(
             "negative-stale-floor",
+            expected_runner_rc=RUNNER_GUEST_PANIC,
             mode="recover",
             reuse_journal=source,
             floor="1002",
@@ -189,23 +221,32 @@ def main() -> int:
 
         clone = run_case(
             "negative-cloned-old-media",
+            expected_runner_rc=RUNNER_TORN_RECOVERY,
             mode="recover",
             reuse_journal=source,
             journal_serial=CLONE_SERIAL,
         )
-        require(clone, "torn")
+        require(clone, "serial_ok", "torn")
         require_absent(clone, "auth_candidate", "panic")
         summary = clone["summary"]
         assert isinstance(summary, dict)
         assert summary["journal_serial"] == CLONE_SERIAL
         results.append(clone)
 
-        missing_device = run_case("negative-missing-device", no_journal_device=True)
+        missing_device = run_case(
+            "negative-missing-device",
+            expected_runner_rc=RUNNER_GUEST_PANIC,
+            no_journal_device=True,
+        )
         require(missing_device, "panic")
         require_absent(missing_device, "auth_candidate", "success_line")
         results.append(missing_device)
 
-        wrong_size = run_case("negative-wrong-size", journal_bytes=16384)
+        wrong_size = run_case(
+            "negative-wrong-size",
+            expected_runner_rc=RUNNER_GUEST_PANIC,
+            journal_bytes=16384,
+        )
         require(wrong_size, "panic")
         require_absent(wrong_size, "auth_candidate", "success_line")
         results.append(wrong_size)
