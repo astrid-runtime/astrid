@@ -1,13 +1,31 @@
+#[cfg(any(unix, windows))]
+pub(crate) use super::lifecycle::force_revoke_projection_lease;
 use super::*;
 
 #[cfg(any(unix, windows))]
 mod process_identity;
 #[cfg(any(unix, windows))]
-use process_identity::parent_start_identity;
-#[cfg(any(unix, windows))]
 mod process_stop;
 #[cfg(any(unix, windows))]
 use process_stop::stop_process_provider;
+#[cfg(any(unix, windows))]
+mod process_launch;
+#[cfg(any(unix, windows))]
+use process_launch::launch_process_provider;
+pub(crate) use process_launch::platform_process_provider_name;
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) use process_launch::validate_process_provider_ready;
+#[cfg(all(test, any(unix, windows)))]
+mod cache_tests;
+#[cfg(any(unix, windows))]
+mod projection_identity;
+#[cfg(all(test, any(unix, windows)))]
+mod projection_identity_tests;
+#[cfg(any(unix, windows))]
+pub(crate) use projection_identity::{
+    ProcessProjectionBinding, ProcessProjectionTarget, ProcessProjectionTargetSet,
+    ProjectionGeneration,
+};
 
 pub(crate) type ProjectionCleanup =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync + 'static>;
@@ -21,26 +39,38 @@ struct RunningProvider {
 
 struct ProjectionCleanupState {
     kernel: std::sync::Weak<Kernel>,
-    principal: PrincipalId,
-    branch: RunningProvider,
-    owner: RunningProvider,
-    shared: Option<RunningProvider>,
-    branch_id: StorageMountId,
-    owner_id: StorageMountId,
-    shared_id: Option<StorageMountId>,
+    binding: ProcessProjectionBinding,
+    branch: ProjectionLeaseProvider,
+    owner: ProjectionLeaseProvider,
+    shared: Option<ProjectionLeaseProvider>,
     mount_root: PathBuf,
     cleaned: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProjectionLeaseProvider {
+    running: RunningProvider,
+    lease: ProjectionLeaseTarget,
+}
+
+struct ProjectionLeaseTarget {
+    mount_id: StorageMountId,
+    target: ProcessProjectionTarget,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ProcessProjectionKey {
-    pub(crate) principal_uid: astrid_core::PrincipalUid,
-    pub(crate) owner: StateOwner,
-    pub(crate) branch: astrid_core::WorkspaceUid,
+    pub(crate) binding: ProcessProjectionBinding,
     pub(crate) read_write: bool,
 }
 
+impl ProcessProjectionKey {
+    pub(crate) fn matches_projection(&self, projection: &CachedProcessProjection) -> bool {
+        projection.binding.validate().is_ok() && self.binding == projection.binding
+    }
+}
+
 pub(crate) struct CachedProcessProjection {
+    pub(crate) binding: ProcessProjectionBinding,
     pub(crate) workspace_mountpoint: PathBuf,
     pub(crate) home_mountpoint: PathBuf,
     pub(crate) fleet_shared_mountpoint: Option<PathBuf>,
@@ -100,12 +130,30 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
         // capsules for one immutable UID from racing to create duplicate
         // provider pairs; subsequent callers take the cached fast path.
         let mut projections = self.projections.lock().await;
-        let binding = service.bind(principal).await?;
+        let generation = ProjectionGeneration::capture()?;
+        let workspace_binding = service.bind(principal).await?;
         let principal_uid = kernel
             .principal_directory
             .uid_for(principal)
             .map_err(|error| format!("resolve principal process projection identity: {error}"))?;
-        let branch_view = match binding.owner {
+        if principal_uid != workspace_binding.uid {
+            return Err("workspace branch identity changed during process admission".to_owned());
+        }
+        let binding = ProcessProjectionBinding::new(
+            workspace_binding.owner,
+            principal_uid,
+            generation,
+            ProcessProjectionTargetSet::branch(
+                workspace_binding.owner,
+                principal_uid,
+                workspace_binding.branch,
+                match workspace_binding.owner {
+                    StateOwner::Fleet(fleet_uid) => Some(fleet_uid),
+                    _ => None,
+                },
+            )?,
+        )?;
+        let branch_view = match workspace_binding.owner {
             StateOwner::Principal(_) => StorageProviderViewV1::Principal(principal.clone()),
             StateOwner::Fleet(uid) => StorageProviderViewV1::Fleet(uid),
             StateOwner::System | StateOwner::User(_) => {
@@ -114,18 +162,19 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
         };
         let access = StorageProviderAccessV1::ReadWrite;
         let key = ProcessProjectionKey {
-            principal_uid,
-            owner: binding.owner,
-            branch: binding.branch,
+            binding,
             read_write: matches!(access, StorageProviderAccessV1::ReadWrite),
         };
         if let Some(projection) = projections.get(&key).cloned() {
+            if !key.matches_projection(&projection) {
+                return Err("process projection identity mismatch".to_owned());
+            }
             let retried = if projection.cleanup_failed.load(Ordering::Acquire) {
                 // A failed last-close retains the projection in this cache so
                 // a later authenticated mount request can retry STOP/reap,
                 // lease revocation, and resource removal. Do not create a
                 // second provider pair while any prior resources remain.
-                if !retry_failed_projection(&projection, &self.projections, key).await {
+                if !retry_failed_projection(&projection, &mut projections, &key).await {
                     return Err(
                         "native process storage projection requires administrative cleanup"
                             .to_owned(),
@@ -144,6 +193,10 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                 );
             }
         }
+        if let Some(error) = blocked_projection_lease(&kernel, &key.binding) {
+            return Err(error);
+        }
+
         // A durable branch is an authority target, not a host mount identity.
         // The random root identifies this one provider-service incarnation;
         // all concurrent children over the same key share it.
@@ -159,7 +212,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             .map_err(|error| format!("create workspace mountpoint: {error}"))?;
         astrid_core::platform_fs::ensure_private_directory(&home_mountpoint)
             .map_err(|error| format!("create owner mountpoint: {error}"))?;
-        let fleet_shared_mountpoint = if let StateOwner::Fleet(fleet_uid) = binding.owner {
+        let fleet_shared_mountpoint = if let StateOwner::Fleet(fleet_uid) = key.binding.owner {
             ensure_fleet_shared(&kernel, fleet_uid).await?;
             let path = mount_root.join("shared");
             astrid_core::platform_fs::ensure_private_directory(&path)
@@ -169,24 +222,16 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             None
         };
 
-        let owner_uid = kernel
-            .principal_directory
-            .uid_for(principal)
-            .map_err(|error| format!("resolve principal owner for HOME: {error}"))?;
-        ensure_owner_home(&kernel, owner_uid).await?;
-        let parent_pid = std::process::id();
-        let parent_start = parent_start_identity(parent_pid)
-            .ok_or_else(|| "resolve process creation identity for provider lifetime".to_owned())?;
+        ensure_owner_home(&kernel, principal_uid).await?;
 
         let provider = platform_process_provider_name();
         let admission = MountAdmission::capture(&kernel, principal, MountOwnerScope::CallerOnly)?;
+        let branch_target = key.binding.targets.workspace.durable_target();
         let branch_lease = issue_lease(
             &kernel,
             &admission,
             branch_view,
-            StorageFilesystemTargetV1::WorkspaceBranch {
-                workspace: binding.branch,
-            },
+            branch_target,
             access,
             provider.to_owned(),
             workspace_mountpoint.clone(),
@@ -199,9 +244,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             // principal assigned to a Fleet still receives a private HOME;
             // the Fleet workspace branch above is an explicit separate view.
             StorageProviderViewV1::Principal(principal.clone()),
-            StorageFilesystemTargetV1::OwnerSubtree {
-                prefix: "home".to_owned(),
-            },
+            key.binding.targets.owner_home.durable_target(),
             access,
             provider.to_owned(),
             home_mountpoint.clone(),
@@ -210,21 +253,42 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
         {
             Ok(lease) => lease,
             Err(error) => {
-                rollback_uncommitted_lease(&kernel, principal, branch_lease.mount_id).await;
+                rollback_uncommitted_lease(
+                    &kernel,
+                    &key.binding,
+                    &key.binding.targets.workspace,
+                    branch_lease.mount_id,
+                )
+                .await;
                 return Err(error);
             },
         };
 
-        let shared_lease = if let (StateOwner::Fleet(fleet_uid), Some(shared_mountpoint)) =
-            (binding.owner, fleet_shared_mountpoint.as_ref())
+        let shared_target = key
+            .binding
+            .targets
+            .fleet_shared
+            .as_ref()
+            .map(ProcessProjectionTarget::durable_target);
+        let shared_view = key
+            .binding
+            .targets
+            .fleet_shared
+            .as_ref()
+            .map(|target| match target {
+                ProcessProjectionTarget::FleetShared(fleet_uid) => {
+                    StorageProviderViewV1::Fleet(*fleet_uid)
+                },
+                _ => unreachable!("validated target set contains only Fleet shared targets"),
+            });
+        let shared_lease = if let (Some(target), Some(view), Some(shared_mountpoint)) =
+            (shared_target, shared_view, fleet_shared_mountpoint.as_ref())
         {
             match issue_lease(
                 &kernel,
                 &admission,
-                StorageProviderViewV1::Fleet(fleet_uid),
-                StorageFilesystemTargetV1::OwnerSubtree {
-                    prefix: "shared".to_owned(),
-                },
+                view,
+                target,
                 access,
                 provider.to_owned(),
                 shared_mountpoint.clone(),
@@ -233,8 +297,20 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             {
                 Ok(lease) => Some(lease),
                 Err(error) => {
-                    rollback_uncommitted_lease(&kernel, principal, owner_lease.mount_id).await;
-                    rollback_uncommitted_lease(&kernel, principal, branch_lease.mount_id).await;
+                    rollback_uncommitted_lease(
+                        &kernel,
+                        &key.binding,
+                        &key.binding.targets.owner_home,
+                        owner_lease.mount_id,
+                    )
+                    .await;
+                    rollback_uncommitted_lease(
+                        &kernel,
+                        &key.binding,
+                        &key.binding.targets.workspace,
+                        branch_lease.mount_id,
+                    )
+                    .await;
                     return Err(error);
                 },
             }
@@ -251,8 +327,8 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
         let branch_control = branch_lease.resource_path.join("process-control.sock");
         let owner_control = owner_lease.resource_path.join("process-control.sock");
         let parent = StorageProviderParentLifetimeV1 {
-            pid: parent_pid,
-            start_identity: Some(parent_start.clone()),
+            pid: key.binding.generation.parent_pid,
+            start_identity: Some(key.binding.generation.start_identity.to_string()),
             token: branch_parent_token,
         };
         let branch_launch = StorageProviderServiceLaunchV1 {
@@ -269,7 +345,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             control_path: owner_control.clone(),
             parent: StorageProviderParentLifetimeV1 {
                 pid: parent.pid,
-                start_identity: Some(parent_start),
+                start_identity: Some(key.binding.generation.start_identity.to_string()),
                 token: owner_parent_token,
             },
         };
@@ -294,15 +370,27 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
         let mut branch_child = match launch_process_provider(&branch_launch).await {
             Ok(child) => child,
             Err(error) => {
-                if error.cleanup_ok {
-                    rollback_uncommitted_lease(&kernel, principal, owner_lease.mount_id).await;
-                    rollback_uncommitted_lease(&kernel, principal, branch_lease.mount_id).await;
-                } else {
+                let provider_stopped = error.cleanup_ok;
+                if !provider_stopped {
                     tracing::error!(
                         error = %error.message,
-                        "native branch provider launch cleanup failed; retaining leases and mount resources"
+                        "native branch provider launch cleanup failed; revoking leases before retry"
                     );
                 }
+                rollback_uncommitted_lease(
+                    &kernel,
+                    &key.binding,
+                    &key.binding.targets.owner_home,
+                    owner_lease.mount_id,
+                )
+                .await;
+                rollback_uncommitted_lease(
+                    &kernel,
+                    &key.binding,
+                    &key.binding.targets.workspace,
+                    branch_lease.mount_id,
+                )
+                .await;
                 return Err(error.message);
             },
         };
@@ -315,15 +403,27 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                     branch_launch.parent.token.clone(),
                 )
                 .await;
-                if branch_stopped && error.cleanup_ok {
-                    rollback_uncommitted_lease(&kernel, principal, owner_lease.mount_id).await;
-                    rollback_uncommitted_lease(&kernel, principal, branch_lease.mount_id).await;
-                } else {
+                let provider_stopped = branch_stopped && error.cleanup_ok;
+                rollback_uncommitted_lease(
+                    &kernel,
+                    &key.binding,
+                    &key.binding.targets.owner_home,
+                    owner_lease.mount_id,
+                )
+                .await;
+                rollback_uncommitted_lease(
+                    &kernel,
+                    &key.binding,
+                    &key.binding.targets.workspace,
+                    branch_lease.mount_id,
+                )
+                .await;
+                if !provider_stopped {
                     tracing::error!(
                         branch_stopped,
                         owner_stopped = error.cleanup_ok,
                         error = %error.message,
-                        "native process provider launch rollback failed; retaining leases and mount resources"
+                        "native process provider launch rollback failed; retaining unreclaimed provider resources"
                     );
                 }
                 return Err(error.message);
@@ -345,18 +445,34 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                         branch_launch.parent.token.clone(),
                     )
                     .await;
-                    if owner_stopped && branch_stopped && error.cleanup_ok {
-                        rollback_uncommitted_lease(&kernel, principal, owner_lease.mount_id).await;
-                        rollback_uncommitted_lease(&kernel, principal, branch_lease.mount_id).await;
-                        if let Some(lease) = shared_lease.as_ref() {
-                            rollback_uncommitted_lease(&kernel, principal, lease.mount_id).await;
-                        }
-                    } else {
+                    let provider_stopped = owner_stopped && branch_stopped && error.cleanup_ok;
+                    rollback_uncommitted_lease(
+                        &kernel,
+                        &key.binding,
+                        &key.binding.targets.owner_home,
+                        owner_lease.mount_id,
+                    )
+                    .await;
+                    rollback_uncommitted_lease(
+                        &kernel,
+                        &key.binding,
+                        &key.binding.targets.workspace,
+                        branch_lease.mount_id,
+                    )
+                    .await;
+                    if let (Some(lease), Some(target)) = (
+                        shared_lease.as_ref(),
+                        key.binding.targets.fleet_shared.as_ref(),
+                    ) {
+                        rollback_uncommitted_lease(&kernel, &key.binding, target, lease.mount_id)
+                            .await;
+                    }
+                    if !provider_stopped {
                         tracing::error!(
                             owner_stopped,
                             branch_stopped,
                             error = %error.message,
-                            "Fleet shared provider launch rollback failed; retaining projection resources"
+                            "Fleet shared provider launch rollback failed; retaining unreclaimed provider resources"
                         );
                     }
                     return Err(error.message);
@@ -367,28 +483,53 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
         };
         let cleanup_state = Arc::new(tokio::sync::Mutex::new(ProjectionCleanupState {
             kernel: Arc::downgrade(&kernel),
-            principal: principal.clone(),
-            branch: RunningProvider {
-                child: branch_child,
-                control_path: branch_control,
-                token: branch_launch.parent.token,
-                stopped: false,
+            binding: key.binding.clone(),
+            branch: ProjectionLeaseProvider {
+                running: RunningProvider {
+                    child: branch_child,
+                    control_path: branch_control,
+                    token: branch_launch.parent.token,
+                    stopped: false,
+                },
+                lease: ProjectionLeaseTarget {
+                    mount_id: branch_lease.mount_id,
+                    target: key.binding.targets.workspace.clone(),
+                },
             },
-            owner: RunningProvider {
-                child: owner_child,
-                control_path: owner_control,
-                token: owner_launch.parent.token,
-                stopped: false,
+            owner: ProjectionLeaseProvider {
+                running: RunningProvider {
+                    child: owner_child,
+                    control_path: owner_control,
+                    token: owner_launch.parent.token,
+                    stopped: false,
+                },
+                lease: ProjectionLeaseTarget {
+                    mount_id: owner_lease.mount_id,
+                    target: key.binding.targets.owner_home.clone(),
+                },
             },
-            shared: shared_child.take().map(|(child, launch)| RunningProvider {
-                child,
-                control_path: launch.control_path,
-                token: launch.parent.token,
-                stopped: false,
-            }),
-            branch_id: branch_lease.mount_id,
-            owner_id: owner_lease.mount_id,
-            shared_id: shared_lease.as_ref().map(|lease| lease.mount_id),
+            shared: shared_child
+                .take()
+                .map(|(child, launch)| ProjectionLeaseProvider {
+                    running: RunningProvider {
+                        child,
+                        control_path: launch.control_path,
+                        token: launch.parent.token,
+                        stopped: false,
+                    },
+                    lease: ProjectionLeaseTarget {
+                        mount_id: shared_lease
+                            .as_ref()
+                            .expect("shared child has an issued lease")
+                            .mount_id,
+                        target: key
+                            .binding
+                            .targets
+                            .fleet_shared
+                            .clone()
+                            .expect("shared child has a Fleet target"),
+                    },
+                }),
             mount_root: mount_root.clone(),
             cleaned: false,
         }));
@@ -398,6 +539,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             Box::pin(async move { cleanup_projection_state(cleanup_state).await })
         });
         let projection = Arc::new(CachedProcessProjection {
+            binding: key.binding.clone(),
             workspace_mountpoint,
             // The lease target is the fixed `home` owner subtree, so the
             // provider exposes that subtree directly at its mountpoint.
@@ -411,7 +553,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             cleanup_failed: AtomicBool::new(false),
             cleanup,
         });
-        projections.insert(key, Arc::clone(&projection));
+        projections.insert(key.clone(), Arc::clone(&projection));
         retain_cached_projection(&projection)?;
         drop(projections);
         Ok(projection_mount(
@@ -436,10 +578,14 @@ async fn cleanup_projection_state(
     // only the emergency fallback when a provider is wedged or gone; keeping
     // the provider handles in the state makes a later mount request retry the
     // same bounded operation instead of creating a second projection.
-    let branch_stopped = stop_running_provider(&mut state.branch).await;
-    let owner_stopped = stop_running_provider(&mut state.owner).await;
+    if state.binding.validate().is_err() {
+        tracing::error!("process storage projection binding became invalid");
+        return false;
+    }
+    let branch_stopped = stop_running_provider(&mut state.branch.running).await;
+    let owner_stopped = stop_running_provider(&mut state.owner.running).await;
     let shared_stopped = match state.shared.as_mut() {
-        Some(shared) => stop_running_provider(shared).await,
+        Some(shared) => stop_running_provider(&mut shared.running).await,
         None => true,
     };
     if !branch_stopped || !owner_stopped || !shared_stopped {
@@ -457,10 +603,10 @@ async fn cleanup_projection_state(
     };
     if !revoke_projection_leases(
         &kernel,
-        &state.principal,
-        state.branch_id,
-        state.owner_id,
-        state.shared_id,
+        &state.binding,
+        &state.branch.lease,
+        &state.owner.lease,
+        state.shared.as_ref().map(|shared| &shared.lease),
     )
     .await
     {
@@ -494,24 +640,59 @@ async fn stop_running_provider(provider: &mut RunningProvider) -> bool {
 
 async fn rollback_uncommitted_lease(
     kernel: &Kernel,
-    principal: &PrincipalId,
+    binding: &ProcessProjectionBinding,
+    target: &ProcessProjectionTarget,
     mount_id: StorageMountId,
 ) {
-    let _ = revoke_lease(kernel, principal, MountOwnerScope::CallerOnly, mount_id).await;
+    let expected_owner = target.durable_owner();
+    let expected_target = target.durable_target();
+    let _ = force_revoke_projection_lease(
+        kernel,
+        binding.acting_uid,
+        expected_owner,
+        &expected_target,
+        mount_id,
+    )
+    .await;
+}
+
+fn blocked_projection_lease(kernel: &Kernel, binding: &ProcessProjectionBinding) -> Option<String> {
+    let targets = [
+        Some(&binding.targets.workspace),
+        Some(&binding.targets.owner_home),
+        binding.targets.fleet_shared.as_ref(),
+    ];
+    for entry in kernel.storage_mounts.iter() {
+        let state = entry.value();
+        let target_matches = targets.iter().flatten().any(|target| {
+            target.durable_owner() == state.owner && target.durable_target() == state.target
+        });
+        if state.requested_by_uid == binding.acting_uid
+            && state.access == StorageProviderAccessV1::ReadWrite
+            && state.provider == platform_process_provider_name()
+            && target_matches
+        {
+            return Some(format!(
+                "existing process projection lease {} requires cleanup",
+                state.mount_id
+            ));
+        }
+    }
+    None
 }
 
 #[cfg(any(unix, windows))]
 async fn revoke_projection_leases(
     kernel: &Kernel,
-    principal: &PrincipalId,
-    branch_id: StorageMountId,
-    owner_id: StorageMountId,
-    shared_id: Option<StorageMountId>,
+    binding: &ProcessProjectionBinding,
+    branch: &ProjectionLeaseTarget,
+    owner: &ProjectionLeaseTarget,
+    shared: Option<&ProjectionLeaseTarget>,
 ) -> bool {
-    let branch = revoke_mapped_projection_lease(kernel, principal, branch_id).await;
-    let owner = revoke_mapped_projection_lease(kernel, principal, owner_id).await;
-    let shared = match shared_id {
-        Some(shared_id) => revoke_mapped_projection_lease(kernel, principal, shared_id).await,
+    let branch = revoke_mapped_projection_lease(kernel, binding, branch).await;
+    let owner = revoke_mapped_projection_lease(kernel, binding, owner).await;
+    let shared = match shared {
+        Some(shared) => revoke_mapped_projection_lease(kernel, binding, shared).await,
         None => true,
     };
     branch && owner && shared
@@ -520,36 +701,39 @@ async fn revoke_projection_leases(
 #[cfg(any(unix, windows))]
 async fn revoke_mapped_projection_lease(
     kernel: &Kernel,
-    principal: &PrincipalId,
-    mount_id: StorageMountId,
+    binding: &ProcessProjectionBinding,
+    lease: &ProjectionLeaseTarget,
 ) -> bool {
-    match revoke_lease(kernel, principal, MountOwnerScope::CallerOnly, mount_id).await {
-        Ok(()) => true,
-        Err(_) if kernel.storage_mounts.get(&mount_id).is_none() => true,
-        Err(_) => false,
-    }
+    let expected_owner = lease.target.durable_owner();
+    let expected_target = lease.target.durable_target();
+    force_revoke_projection_lease(
+        kernel,
+        binding.acting_uid,
+        expected_owner,
+        &expected_target,
+        lease.mount_id,
+    )
+    .await
 }
 
 #[cfg(any(unix, windows))]
 pub(crate) async fn retry_failed_projection(
     projection: &Arc<CachedProcessProjection>,
-    projections: &Arc<
-        tokio::sync::Mutex<
-            std::collections::BTreeMap<ProcessProjectionKey, Arc<CachedProcessProjection>>,
-        >,
+    projections: &mut tokio::sync::MutexGuard<
+        '_,
+        std::collections::BTreeMap<ProcessProjectionKey, Arc<CachedProcessProjection>>,
     >,
-    key: ProcessProjectionKey,
+    key: &ProcessProjectionKey,
 ) -> bool {
     if !(projection.cleanup)().await {
         return false;
     }
     projection.cleanup_failed.store(false, Ordering::Release);
-    let mut projections = projections.lock().await;
     if projections
-        .get(&key)
+        .get(key)
         .is_some_and(|current| Arc::ptr_eq(current, projection))
     {
-        projections.remove(&key);
+        projections.remove(key);
     }
     true
 }
@@ -645,269 +829,13 @@ pub(crate) async fn cached_projection_mount(
             std::collections::BTreeMap<ProcessProjectionKey, Arc<CachedProcessProjection>>,
         >,
     >,
-    key: ProcessProjectionKey,
+    key: &ProcessProjectionKey,
 ) -> Result<astrid_capsule::context::ProcessStorageMount, String> {
     {
         let _guard = projections.lock().await;
         retain_cached_projection(&projection)?;
     }
-    Ok(projection_mount(projection, projections, key))
-}
-
-#[cfg(any(unix, windows))]
-pub(crate) fn platform_process_provider_name() -> &'static str {
-    #[cfg(target_os = "linux")]
-    {
-        "astrid-storage-provider-fuse"
-    }
-    #[cfg(target_os = "macos")]
-    {
-        "astrid-storage-provider-fskit"
-    }
-    #[cfg(windows)]
-    {
-        "astrid-storage-provider-winfsp"
-    }
-}
-
-#[cfg(any(unix, windows))]
-fn platform_process_provider_argument() -> &'static str {
-    #[cfg(target_os = "linux")]
-    {
-        "--astrid-provider-fuse-service-v1"
-    }
-    #[cfg(target_os = "macos")]
-    {
-        "--astrid-provider-fskit-service-v1"
-    }
-    #[cfg(windows)]
-    {
-        "--astrid-provider-winfsp-service-v1"
-    }
-}
-
-#[cfg(any(unix, windows))]
-fn find_process_provider(name: &str) -> Result<PathBuf, String> {
-    let executable = std::env::current_exe()
-        .map_err(|error| format!("resolve kernel executable for storage provider: {error}"))?;
-    let directory = executable
-        .parent()
-        .ok_or_else(|| "kernel executable has no installation directory".to_owned())?;
-    let candidate = directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-    validate_process_provider_binary(&candidate)?;
-    Ok(candidate)
-}
-
-#[cfg(any(unix, windows))]
-fn validate_process_provider_binary(candidate: &Path) -> Result<(), String> {
-    let metadata = std::fs::symlink_metadata(candidate)
-        .map_err(|error| format!("inspect coinstalled storage provider: {error}"))?;
-    if !metadata.file_type().is_file() {
-        return Err("coinstalled storage provider is not a regular non-symlink file".to_owned());
-    }
-    astrid_core::platform_fs::verify_no_redirects(candidate)
-        .map_err(|error| format!("validate coinstalled storage provider path: {error}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        if metadata.permissions().mode() & 0o022 != 0 {
-            return Err(
-                "coinstalled storage provider is group/world writable and not trusted".to_owned(),
-            );
-        }
-    }
-    Ok(())
-}
-
-#[cfg(any(unix, windows))]
-struct ProcessProviderLaunchError {
-    message: String,
-    cleanup_ok: bool,
-}
-
-#[cfg(any(unix, windows))]
-#[allow(clippy::too_many_lines)]
-async fn launch_process_provider(
-    launch: &StorageProviderServiceLaunchV1,
-) -> Result<tokio::process::Child, ProcessProviderLaunchError> {
-    let binary = find_process_provider(platform_process_provider_name()).map_err(|message| {
-        ProcessProviderLaunchError {
-            message,
-            cleanup_ok: true,
-        }
-    })?;
-    let mut command = tokio::process::Command::new(binary);
-    command
-        .arg(platform_process_provider_argument())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| ProcessProviderLaunchError {
-            message: format!("launch native storage provider: {error}"),
-            cleanup_ok: true,
-        })?;
-    let stderr_task = child.stderr.take().map(|stderr| {
-        tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            let _ = stderr.take(64 * 1024 + 1).read_to_end(&mut bytes).await;
-            bytes.truncate(64 * 1024);
-            bytes
-        })
-    });
-    let payload = match serde_json::to_vec(launch) {
-        Ok(payload) => payload,
-        Err(error) => {
-            return Err(abort_process_provider(
-                child,
-                launch,
-                format!("encode native storage provider launch: {error}"),
-                stderr_task,
-            )
-            .await);
-        },
-    };
-    let Some(mut stdin) = child.stdin.take() else {
-        return Err(abort_process_provider(
-            child,
-            launch,
-            "native storage provider stdin unavailable".to_owned(),
-            stderr_task,
-        )
-        .await);
-    };
-    if let Err(error) = stdin.write_all(&payload).await {
-        return Err(abort_process_provider(
-            child,
-            launch,
-            format!("send native storage provider launch: {error}"),
-            stderr_task,
-        )
-        .await);
-    }
-    drop(stdin);
-    let Some(stdout) = child.stdout.take() else {
-        return Err(abort_process_provider(
-            child,
-            launch,
-            "native storage provider stdout unavailable".to_owned(),
-            stderr_task,
-        )
-        .await);
-    };
-    let mut line = String::new();
-    let reader = tokio::io::BufReader::new(stdout);
-    let read = match tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        reader.take((64 * 1024 + 1) as u64).read_line(&mut line),
-    )
-    .await
-    {
-        Ok(Ok(read)) => read,
-        Ok(Err(error)) => {
-            return Err(abort_process_provider(
-                child,
-                launch,
-                format!("read native storage provider readiness: {error}"),
-                stderr_task,
-            )
-            .await);
-        },
-        Err(_) => {
-            return Err(abort_process_provider(
-                child,
-                launch,
-                "timed out waiting for native storage provider readiness".to_owned(),
-                stderr_task,
-            )
-            .await);
-        },
-    };
-    if read > 64 * 1024 || !line.ends_with('\n') {
-        return Err(abort_process_provider(
-            child,
-            launch,
-            "native storage provider readiness frame is malformed or oversized".to_owned(),
-            stderr_task,
-        )
-        .await);
-    }
-    let line = line.strip_suffix('\n').unwrap_or(&line);
-    let line = line.strip_suffix('\r').unwrap_or(line);
-    if let Err(error) = validate_process_provider_ready(launch, line) {
-        return Err(abort_process_provider(child, launch, error, stderr_task).await);
-    }
-    drop(stderr_task);
-    Ok(child)
-}
-
-#[cfg(any(unix, windows))]
-async fn abort_process_provider(
-    mut child: tokio::process::Child,
-    launch: &StorageProviderServiceLaunchV1,
-    message: String,
-    stderr_task: Option<tokio::task::JoinHandle<Vec<u8>>>,
-) -> ProcessProviderLaunchError {
-    let cleanup_ok = stop_process_provider(
-        &mut child,
-        launch.control_path.clone(),
-        launch.parent.token.clone(),
-    )
-    .await;
-    let diagnostics = match stderr_task {
-        Some(task) => task.await.ok().and_then(|bytes| {
-            (!bytes.is_empty()).then(|| String::from_utf8_lossy(&bytes).trim().to_owned())
-        }),
-        None => None,
-    };
-    let message = diagnostics.map_or_else(
-        || message.clone(),
-        |diagnostics| format!("{message}; provider diagnostics: {diagnostics}"),
-    );
-    ProcessProviderLaunchError {
-        message,
-        cleanup_ok,
-    }
-}
-
-#[cfg(any(unix, windows))]
-pub(crate) fn validate_process_provider_ready(
-    launch: &StorageProviderServiceLaunchV1,
-    line: &str,
-) -> Result<(), String> {
-    if line.len() > 64 * 1024 {
-        return Err("native storage provider readiness exceeds the bounded frame".to_owned());
-    }
-    let ready: StorageProviderServiceReadyV1 = serde_json::from_str(line)
-        .map_err(|error| format!("decode native storage provider readiness: {error}"))?;
-    let canonical = serde_json::to_string(&ready)
-        .map_err(|error| format!("encode native storage provider readiness: {error}"))?;
-    if canonical != line {
-        return Err("native storage provider readiness is not canonical JSON".to_owned());
-    }
-    if ready.schema != STORAGE_FILESYSTEM_SERVICE_READY_SCHEMA_V1
-        || ready.provider != platform_process_provider_name()
-        || ready.mount_id != launch.lease.mount_id.as_uuid()
-        || ready.control_path != launch.control_path
-    {
-        return Err("native storage provider readiness identity mismatch".to_owned());
-    }
-    let expected = storage_provider_service_ready_challenge(
-        &launch.parent.token,
-        STORAGE_FILESYSTEM_SERVICE_READY_SCHEMA_V1,
-        platform_process_provider_name(),
-        launch.lease.mount_id.as_uuid(),
-        &launch.control_path,
-        &launch.lease.resource_path,
-        &launch.lease.callback_path,
-    )
-    .map_err(|error| format!("derive native storage provider readiness challenge: {error}"))?;
-    if !bool::from(expected.as_bytes().ct_eq(ready.challenge.as_bytes())) {
-        return Err("native storage provider readiness challenge mismatch".to_owned());
-    }
-    Ok(())
+    Ok(projection_mount(projection, projections, key.clone()))
 }
 
 async fn ensure_owner_home(
@@ -957,28 +885,6 @@ async fn ensure_fleet_shared(
     })
     .await
     .map_err(|error| format!("Fleet shared preparation worker failed: {error}"))?
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt as _;
-
-    #[test]
-    fn provider_binary_validation_rejects_group_or_world_writable_files() {
-        let temporary = tempfile::tempdir().expect("provider fixture root");
-        let provider = temporary.path().join("astrid-storage-provider");
-        std::fs::write(&provider, b"provider").expect("provider fixture");
-        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755))
-            .expect("trusted provider mode");
-        validate_process_provider_binary(&provider).expect("trusted provider accepted");
-
-        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o775))
-            .expect("unsafe provider mode");
-        let error = validate_process_provider_binary(&provider)
-            .expect_err("group-writable provider must fail closed");
-        assert!(error.contains("group/world writable"));
-    }
 }
 
 #[cfg(any(unix, windows))]

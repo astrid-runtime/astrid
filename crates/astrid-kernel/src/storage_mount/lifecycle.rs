@@ -339,6 +339,7 @@ pub(super) fn cleanup_mapped_lease(
 }
 
 /// Revoke one mapped lease, including a revoked entry left after failed cleanup.
+#[cfg(test)]
 pub(crate) async fn revoke_lease(
     kernel: &Kernel,
     caller: &PrincipalId,
@@ -351,6 +352,38 @@ pub(crate) async fn revoke_lease(
         mount_id,
     )
     .await
+}
+
+/// Force-revoke one projection lease by its immutable requester UID.
+///
+/// Projection drain may run after capability retirement, where reconstructing
+/// a normal alias grant would fail. The caller must still own the exact UID
+/// bound when the lease was issued.
+pub(crate) async fn force_revoke_projection_lease(
+    kernel: &Kernel,
+    requester_uid: PrincipalUid,
+    expected_owner: StateOwner,
+    expected_target: &StorageFilesystemTargetV1,
+    mount_id: StorageMountId,
+) -> bool {
+    let state = match mapped_owned_lease(kernel, requester_uid, false, mount_id) {
+        Ok(state) => state,
+        Err(_) if kernel.storage_mounts.get(&mount_id).is_none() => return true,
+        Err(_) => return false,
+    };
+    if state.owner != expected_owner
+        || state.target != *expected_target
+        || state.access != StorageProviderAccessV1::ReadWrite
+    {
+        return false;
+    }
+    state.revoked.store(true, Ordering::Release);
+    let _ = state.shutdown_tx.send(true);
+    if !state.wait_listener_closed().await {
+        return false;
+    }
+    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
+    cleanup_mapped_lease(kernel, &state).is_ok()
 }
 
 /// Revoke using a UID-bound grant. Alias equality is never ownership.

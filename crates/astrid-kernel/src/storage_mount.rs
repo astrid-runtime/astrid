@@ -52,9 +52,11 @@ pub(crate) use admission::last_authorized_caller_uid;
 #[cfg(test)]
 pub(crate) use cleanup::MountCleanupStage;
 use cleanup::cleanup_resource_paths;
+#[cfg(test)]
+pub(crate) use lifecycle::revoke_lease;
 pub(crate) use lifecycle::{
     MountAdmission, MountGrant, MountOwnerScope, PrincipalBinding, lease_status_from_grant,
-    mount_owner_scope_from_check, revoke_all_leases_for_principal, revoke_from_grant, revoke_lease,
+    mount_owner_scope_from_check, revoke_all_leases_for_principal, revoke_from_grant,
     sync_lease_from_grant,
 };
 use lifecycle::{
@@ -72,10 +74,7 @@ mod process_broker;
 #[cfg(any(unix, windows))]
 pub(crate) use process_broker::KernelProcessStorageMountBroker;
 #[cfg(all(test, any(unix, windows)))]
-pub(super) use process_broker::{
-    CachedProcessProjection, ProcessProjectionKey, cached_projection_mount,
-    platform_process_provider_name, retry_failed_projection, validate_process_provider_ready,
-};
+pub(super) use process_broker::{platform_process_provider_name, validate_process_provider_ready};
 
 const LEASE_IDLE_TTL_SECS: u64 = 60 * 60;
 /// Bound listener shutdown waits without turning a stalled listener into an
