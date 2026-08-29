@@ -443,16 +443,14 @@ pub struct KernelResources {
     pub cli_socket_listener: Option<astrid_capsule::context::UplinkListener>,
     /// Exclusive advisory lock enforcing a single kernel instance, held for the
     /// process lifetime; its `Drop` releases the lock. Independent of
-    /// `cli_socket_listener`. The kernel reads `singleton_lock` only once as
-    /// the startup-reclamation ownership gate, so a host supplies whichever
-    /// facilities it actually has (the native daemon: both; test kernels and
-    /// hosts with no real socket: neither).
-    ///
-    /// Carrying this lock is also the portable ownership gate for native
-    /// startup reclamation. Resources without it must not reclaim shared
-    /// `run/process-storage` authority, because another kernel may still own
-    /// a live provider root.
+    /// `cli_socket_listener`. This public resource records ownership only; it
+    /// never authorizes reclamation of shared process-storage authority.
     pub singleton_lock: Option<std::fs::File>,
+    /// Private native composition proof for process-storage reclamation.
+    ///
+    /// This is deliberately not a public constructor argument. An injected
+    /// `Some(File)` is an ordinary resource and never grants boot ownership.
+    process_storage_ownership: Option<NativeProcessStorageOwnership>,
     /// Native layout origin captured before `AstridHome::ensure`. `None`
     /// denotes an injected/portable composition root, which does not own the
     /// host-home migration lifecycle.
@@ -483,9 +481,16 @@ impl KernelResources {
             token_path,
             cli_socket_listener,
             singleton_lock,
+            process_storage_ownership: None,
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             layout_origin: None,
         }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_native_process_storage_ownership(mut self) -> Self {
+        self.process_storage_ownership = Some(NativeProcessStorageOwnership);
+        self
     }
 
     #[cfg(unix)]
@@ -494,6 +499,10 @@ impl KernelResources {
         self
     }
 }
+
+/// Opaque proof that the native composition acquired the boot singleton lock.
+#[derive(Debug)]
+pub(crate) struct NativeProcessStorageOwnership;
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 struct PreparedRuntimeReplacement {
@@ -726,11 +735,6 @@ impl Kernel {
                 "Failed to clear stale principal runtime scratch: {error}"
             ))
         })?;
-        home.clear_runtime_process_storage().map_err(|error| {
-            std::io::Error::other(format!(
-                "Failed to reclaim stale process storage scratch: {error}"
-            ))
-        })?;
         if home.layout_version()?.as_deref() == Some(astrid_core::dirs::LEGACY_LAYOUT_VERSION) {
             let migration_target =
                 astrid_core::dirs::LayoutMigrationTarget::for_current_executable(
@@ -805,6 +809,7 @@ impl Kernel {
             Some(Arc::new(tokio::sync::Mutex::new(listener))),
             Some(singleton_lock),
         )
+        .with_native_process_storage_ownership()
         .with_layout_origin(layout_origin);
 
         Self::with_resources_and_workspace_layout_with_profile_cache_and_directory(
@@ -1008,6 +1013,7 @@ impl Kernel {
             token_path,
             cli_socket_listener,
             singleton_lock,
+            process_storage_ownership,
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             layout_origin,
         } = resources;
@@ -1015,22 +1021,20 @@ impl Kernel {
         let _ = token_path;
 
         // Process-storage UUID roots are live provider authority, not portable
-        // scratch. A lockless injected host has not acquired the boot boundary
-        // that makes reclamation safe against another live kernel.
-        let owns_singleton_boot = singleton_lock.is_some();
-        home.clear_runtime_principal_scratch().map_err(|error| {
-            std::io::Error::other(format!(
-                "Failed to clear stale principal runtime scratch: {error}"
-            ))
-        })?;
-        if owns_singleton_boot {
+        // scratch. Only the private native composition proof grants cleanup;
+        // a public `Some(File)` singleton resource does not.
+        if process_storage_ownership.is_some() {
             home.clear_runtime_process_storage().map_err(|error| {
                 std::io::Error::other(format!(
                     "Failed to reclaim stale process storage scratch: {error}"
                 ))
             })?;
         }
-
+        home.clear_runtime_principal_scratch().map_err(|error| {
+            std::io::Error::other(format!(
+                "Failed to clear stale principal runtime scratch: {error}"
+            ))
+        })?;
         let workspace_selection = workspace_layout.resolve(&workspace_root).map_err(|error| {
             std::io::Error::new(error.kind(), format!("unsafe workspace selection: {error}"))
         })?;

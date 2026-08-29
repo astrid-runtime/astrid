@@ -451,6 +451,242 @@ async fn fleet_shared_cleanup_failure_retains_real_mount_blocker() {
     assert_real_launch_retains_blocker(ProcessLaunchStage::FleetShared, 302).await;
 }
 
+struct ExactFenceFixture {
+    kernel: Arc<crate::Kernel>,
+    caller: PrincipalId,
+    binding: ProcessProjectionBinding,
+    branch: astrid_core::storage_filesystem::StorageMountLeaseV1,
+    owner: astrid_core::storage_filesystem::StorageMountLeaseV1,
+    shared: astrid_core::storage_filesystem::StorageMountLeaseV1,
+    states: Vec<Arc<crate::storage_mount::StorageMountLeaseState>>,
+    expiry_before: u64,
+}
+
+async fn exact_fence_fixture() -> ExactFenceFixture {
+    let (_temporary, kernel) = fleet_shared_kernel().await;
+    let caller = PrincipalId::default();
+    let actor = kernel
+        .principal_directory
+        .uid_for(&caller)
+        .expect("caller actor UID");
+    let workspace = kernel
+        .workspace_branches
+        .as_ref()
+        .expect("workspace branch service")
+        .bind(&caller)
+        .await
+        .expect("bind caller workspace")
+        .branch;
+    let fleet = kernel
+        .ownership_store
+        .load()
+        .await
+        .expect("load ownership graph")
+        .principal_owner(actor)
+        .expect("caller fleet assignment")
+        .fleet_uid;
+    let binding = binding_on(actor, StateOwner::Fleet(fleet), workspace, Some(fleet));
+    let admission = crate::storage_mount::test_mount_admission(
+        &kernel,
+        &caller,
+        crate::storage_mount::MountOwnerScope::CrossOwnerWrite,
+    );
+    let provider = super::process_launch::platform_process_provider_name().to_owned();
+    let targets = &binding.targets;
+    let mountpoints = [
+        std::path::PathBuf::from("/tmp/fence-branch"),
+        std::path::PathBuf::from("/tmp/fence-owner"),
+        std::path::PathBuf::from("/tmp/fence-shared"),
+    ];
+    let views = [
+        astrid_core::storage_provider::StorageProviderViewV1::Fleet(fleet),
+        astrid_core::storage_provider::StorageProviderViewV1::Principal(caller.clone()),
+        astrid_core::storage_provider::StorageProviderViewV1::Fleet(fleet),
+    ];
+    let targets = [
+        targets.workspace.durable_target(),
+        targets.owner_home.durable_target(),
+        targets
+            .fleet_shared
+            .as_ref()
+            .expect("shared target")
+            .durable_target(),
+    ];
+    let mut leases = Vec::new();
+    for (((target, view), mountpoint), name) in targets
+        .into_iter()
+        .zip(views)
+        .zip(mountpoints)
+        .zip(["branch", "owner", "shared"])
+    {
+        leases.push(
+            super::issue_lease(
+                &kernel,
+                &admission,
+                view,
+                target,
+                astrid_core::storage_provider::StorageProviderAccessV1::ReadWrite,
+                provider.clone(),
+                mountpoint,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("issue {name} fence lease: {error}")),
+        );
+    }
+    let states = leases
+        .iter()
+        .map(|lease| Arc::clone(kernel.storage_mounts.get(&lease.mount_id).unwrap().value()))
+        .collect();
+    let expiry_before = leases[1]
+        .expires_at_epoch_secs
+        .min(leases[2].expires_at_epoch_secs);
+    ExactFenceFixture {
+        kernel,
+        caller,
+        binding,
+        branch: leases[0].clone(),
+        owner: leases[1].clone(),
+        shared: leases[2].clone(),
+        states,
+        expiry_before,
+    }
+}
+
+async fn assert_exact_reads_and_renewals_denied(fixture: &ExactFenceFixture) {
+    for state in &fixture.states {
+        for operation in [
+            StorageFilesystemOperationV1::Stat {
+                path: String::new(),
+            },
+            StorageFilesystemOperationV1::Read {
+                path: "denied".to_owned(),
+                offset: 0,
+                length: 8,
+            },
+            StorageFilesystemOperationV1::ReadDirectory {
+                path: String::new(),
+            },
+        ] {
+            let outcome = crate::storage_mount::execute_operation_for_test(
+                fixture.kernel.as_ref(),
+                state,
+                operation,
+            )
+            .await;
+            assert!(
+                matches!(
+                    outcome,
+                    astrid_core::storage_filesystem::StorageFilesystemOutcomeV1::Failure(
+                        ref failure
+                    ) if failure.code == "stale-lease"
+                ),
+                "revoked read/stat/readdir must be denied: {outcome:?}"
+            );
+        }
+    }
+    for lease in [&fixture.owner, &fixture.shared] {
+        let error = crate::storage_mount::lease_status(
+            &fixture.kernel,
+            &fixture.caller,
+            crate::storage_mount::MountOwnerScope::CrossOwnerWrite,
+            lease.mount_id,
+        )
+        .await
+        .expect_err("revoked renewal must fail");
+        assert!(error.contains("expired or revoked"), "{error}");
+    }
+    assert_eq!(
+        fixture.states[1]
+            .expires_at_epoch_secs
+            .load(std::sync::atomic::Ordering::Acquire),
+        fixture.expiry_before,
+        "denied status must not renew"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exact_set_fence_denies_reads_and_renewal_while_writer_held() {
+    use super::{ProjectionLeaseTarget, projection_lifecycle::fence_projection_leases_for_test};
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    let fixture = exact_fence_fixture().await;
+    let branch_state = Arc::clone(&fixture.states[0]);
+    let gate = Arc::new(crate::storage_mount::MutationTestGate {
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    *branch_state.mutation_test_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    let mutation_kernel = Arc::clone(&fixture.kernel);
+    let mutation = tokio::spawn(async move {
+        crate::storage_mount::execute_operation_for_test(
+            &mutation_kernel,
+            &branch_state,
+            StorageFilesystemOperationV1::Create {
+                path: "in-flight.bin".to_owned(),
+                kind: astrid_core::storage_filesystem::StorageFilesystemEntryKindV1::File,
+            },
+        )
+        .await
+    });
+    gate.entered
+        .acquire()
+        .await
+        .expect("writer entered")
+        .forget();
+
+    let targets = &fixture.binding.targets;
+    let branch_target = ProjectionLeaseTarget {
+        mount_id: fixture.branch.mount_id,
+        target: targets.workspace.clone(),
+    };
+    let owner_target = ProjectionLeaseTarget {
+        mount_id: fixture.owner.mount_id,
+        target: targets.owner_home.clone(),
+    };
+    let shared_target = ProjectionLeaseTarget {
+        mount_id: fixture.shared.mount_id,
+        target: targets
+            .fleet_shared
+            .as_ref()
+            .expect("shared target")
+            .clone(),
+    };
+    let fence_kernel = Arc::clone(&fixture.kernel);
+    let binding = fixture.binding.clone();
+    let fence = tokio::spawn(async move {
+        fence_projection_leases_for_test(
+            &fence_kernel,
+            &binding,
+            &branch_target,
+            &owner_target,
+            Some(&shared_target),
+        )
+        .await
+    });
+    while !fixture.states[0].revoked.load(AtomicOrdering::Acquire) {
+        tokio::task::yield_now().await;
+    }
+
+    assert_exact_reads_and_renewals_denied(&fixture).await;
+    assert!(
+        fixture
+            .states
+            .iter()
+            .all(|state| state.is_revoked_for_test()),
+        "the complete exact set must be synchronously revoked"
+    );
+    gate.release.add_permits(1);
+    let mutation_outcome = mutation.await.expect("held writer completes");
+    assert!(
+        matches!(
+            mutation_outcome,
+            astrid_core::storage_filesystem::StorageFilesystemOutcomeV1::Success(_)
+        ),
+        "revocation must drain an already admitted writer: {mutation_outcome:?}"
+    );
+    assert!(fence.await.expect("exact-set fence"));
+}
+
 async fn fleet_shared_kernel() -> (tempfile::TempDir, Arc<crate::Kernel>) {
     let temporary = tempfile::tempdir().expect("test home root");
     let home = AstridHome::from_path(temporary.path().join(".astrid"));

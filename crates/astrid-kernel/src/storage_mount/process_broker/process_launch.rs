@@ -18,6 +18,8 @@ pub(super) struct ProcessProviderLaunchError {
 /// Fixed, non-configurable denial-of-service hard guard: a descendant holding
 /// stderr cannot stall rollback past this deadline.
 const PROVIDER_DIAGNOSTICS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Fixed protocol hard guard: readiness must arrive inside one bounded frame.
+const PROVIDER_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 type SpawnedProcessProvider = (
     tokio::process::Child,
@@ -454,7 +456,7 @@ async fn read_process_provider_ready(
     let mut line = String::new();
     let reader = tokio::io::BufReader::new(stdout);
     let read = match tokio::time::timeout(
-        std::time::Duration::from_secs(15),
+        PROVIDER_READY_TIMEOUT,
         reader.take((64 * 1024 + 1) as u64).read_line(&mut line),
     )
     .await

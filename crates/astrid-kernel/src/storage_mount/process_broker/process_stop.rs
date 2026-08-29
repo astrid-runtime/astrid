@@ -13,6 +13,12 @@ enum ProcessProviderStopResponse {
     Failure { code: String, message: String },
 }
 
+/// Fixed protocol hard guard: a wedged provider must not hold STOP open.
+const STOP_ACKNOWLEDGEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Fixed child-lifetime hard guard before the emergency kill.
+const REAP_GRACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Fixed child-lifetime hard guard after the emergency kill.
+const KILLED_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 pub(super) async fn stop_process_provider(
     child: &mut tokio::process::Child,
     control_path: PathBuf,
@@ -64,7 +70,7 @@ async fn send_stop_request(
     let mut line = String::new();
     let reader = tokio::io::BufReader::new(stream);
     let read = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        STOP_ACKNOWLEDGEMENT_TIMEOUT,
         reader.take((64 * 1024 + 1) as u64).read_line(&mut line),
     )
     .await
@@ -87,13 +93,12 @@ async fn send_stop_request(
 }
 
 async fn reap_child(child: &mut tokio::process::Child) -> bool {
-    if let Ok(Ok(_)) = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await
-    {
+    if let Ok(Ok(_)) = tokio::time::timeout(REAP_GRACE_TIMEOUT, child.wait()).await {
         return true;
     }
     let _ = child.start_kill();
     matches!(
-        tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await,
+        tokio::time::timeout(KILLED_REAP_TIMEOUT, child.wait()).await,
         Ok(Ok(_))
     )
 }

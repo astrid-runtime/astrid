@@ -36,7 +36,7 @@ fn singleton_owned_kernel_resources(home: &AstridHome) -> crate::KernelResources
         crate::socket::acquire_boot_singleton_lock(home)
             .expect("acquire test singleton boot ownership"),
     );
-    resources
+    resources.with_native_process_storage_ownership()
 }
 
 async fn boot_with_injected_resources(
@@ -229,4 +229,28 @@ async fn lockless_injected_kernel_preserves_live_process_storage() {
         "second boot completion must remain non-destructive"
     );
     drop(first);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn arbitrary_injected_file_preserves_live_process_storage() {
+    let (dir, home) = scratch_home();
+    let mut resources = injected_kernel_resources(&home);
+    let unrelated = dir.path().join("unrelated.lock");
+    resources.singleton_lock = Some(std::fs::File::create(&unrelated).expect("unrelated file"));
+
+    let process_storage = home.run_dir().join("process-storage");
+    let live_root = process_storage.join("fake-file-live-root");
+    std::fs::create_dir_all(live_root.join("workspace")).expect("create live root");
+    std::fs::write(live_root.join("workspace").join("live"), b"live")
+        .expect("seed live process root");
+
+    let kernel = boot_with_injected_resources(&home, resources)
+        .await
+        .expect("boot injected kernel with unrelated singleton resource");
+    assert_eq!(
+        std::fs::read(live_root.join("workspace").join("live")).unwrap(),
+        b"live",
+        "an arbitrary Some(File) must not authorize process-storage cleanup"
+    );
+    drop(kernel);
 }

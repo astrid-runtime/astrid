@@ -52,8 +52,6 @@ pub(crate) use admission::last_authorized_caller_uid;
 #[cfg(test)]
 pub(crate) use cleanup::MountCleanupStage;
 use cleanup::cleanup_resource_paths;
-#[cfg(any(unix, windows))]
-pub(crate) use lifecycle::force_fence_projection_lease;
 #[cfg(test)]
 pub(crate) use lifecycle::revoke_lease;
 pub(crate) use lifecycle::{
@@ -100,6 +98,13 @@ enum CallbackResponse {
     V2(StorageFilesystemResponseV2),
 }
 
+/// A synchronous admission ticket for callback or renewal work.
+///
+/// Revocation marks the lease under the same lock, so either admission is
+/// linearized before revocation or the operation observes the revoked lease.
+struct AdmissionGuard<'a> {
+    _guard: std::sync::MutexGuard<'a, ()>,
+}
 /// In-memory authority fixed when a native filesystem lease is issued.
 pub(crate) struct StorageMountLeaseState {
     mount_id: StorageMountId,
@@ -116,6 +121,7 @@ pub(crate) struct StorageMountLeaseState {
     token_hash: [u8; 32],
     expires_at_epoch_secs: AtomicU64,
     revoked: AtomicBool,
+    admission: std::sync::Mutex<()>,
     dirty: AtomicBool,
     in_flight_mutations: AtomicU64,
     shutdown_tx: watch::Sender<bool>,
@@ -198,6 +204,18 @@ impl StorageMountLeaseState {
             now_epoch_secs().saturating_add(LEASE_IDLE_TTL_SECS),
             Ordering::Release,
         );
+    }
+
+    fn try_admit(&self) -> Option<AdmissionGuard<'_>> {
+        let guard = self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.is_live() {
+            return None;
+        }
+        self.renew();
+        Some(AdmissionGuard { _guard: guard })
     }
 
     fn public_lease(&self, token: String) -> StorageMountLeaseV1 {
@@ -311,6 +329,7 @@ fn publish_issued_lease(
         token_hash,
         expires_at_epoch_secs: AtomicU64::new(now_epoch_secs().saturating_add(LEASE_IDLE_TTL_SECS)),
         revoked: AtomicBool::new(false),
+        admission: std::sync::Mutex::new(()),
         dirty: AtomicBool::new(false),
         in_flight_mutations: AtomicU64::new(0),
         shutdown_tx,
@@ -753,8 +772,9 @@ async fn dispatch_request(
         failure("stale-lease", "storage mount lease is expired or revoked")
     } else if !token_matches(&state.token_hash, &request.lease_token) {
         failure("unauthorized", "storage mount lease token is invalid")
+    } else if state.try_admit().is_none() {
+        failure("stale-lease", "storage mount lease is expired or revoked")
     } else {
-        state.renew();
         execute_operation(kernel, state, request.operation).await
     };
     let response = StorageFilesystemResponseV1 {
@@ -805,6 +825,9 @@ async fn execute_operation(
     operation: StorageFilesystemOperationV1,
 ) -> StorageFilesystemOutcomeV1 {
     let is_mutation = is_mutation(&operation);
+    if !requires_mutation_serialization(&operation) && state.try_admit().is_none() {
+        return failure("stale-lease", "storage mount lease is expired or revoked");
+    }
     let is_sync = matches!(&operation, StorageFilesystemOperationV1::Sync);
     if is_mutation && state.access != StorageProviderAccessV1::ReadWrite {
         return failure("read-only", "storage mount lease is read-only");
@@ -954,6 +977,15 @@ fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
+}
+
+#[cfg(test)]
+pub(crate) async fn execute_operation_for_test(
+    kernel: &Kernel,
+    state: &StorageMountLeaseState,
+    operation: StorageFilesystemOperationV1,
+) -> StorageFilesystemOutcomeV1 {
+    execute_operation(kernel, state, operation).await
 }
 
 fn write_private_manifest(path: &Path, lease: &StorageMountLeaseV1) -> io::Result<()> {

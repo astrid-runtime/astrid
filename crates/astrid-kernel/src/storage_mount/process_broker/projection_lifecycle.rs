@@ -13,9 +13,11 @@ use std::{
 use super::{
     CachedProcessProjection, Kernel, ProcessProjectionBinding, ProcessProjectionKey,
     ProcessProjectionTarget, ProcessProjectionTargetSet, ProjectionCleanup, StorageMountId,
-    StorageProviderAccessV1, force_fence_projection_lease, force_revoke_projection_lease,
-    generate_lease_token, local_transport, platform_process_provider_name, stop_process_provider,
+    StorageProviderAccessV1, force_revoke_projection_lease, generate_lease_token, local_transport,
+    platform_process_provider_name, stop_process_provider,
 };
+use crate::storage_mount::lifecycle::cleanup_mapped_lease;
+use crate::storage_mount::lifecycle::force_fence_projection_lease;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ParentTokenSlot {
@@ -110,13 +112,20 @@ async fn cleanup_projection(state: &mut ProjectionCleanupState) -> bool {
     if !binding_valid {
         tracing::error!("process storage projection binding became invalid");
     }
-    let branch_stopped = binding_valid && stop_running_provider(&mut state.branch.running).await;
-    let owner_stopped = binding_valid && stop_running_provider(&mut state.owner.running).await;
-    let shared_stopped = binding_valid
-        && match state.shared.as_mut() {
-            Some(shared) => stop_running_provider(&mut shared.running).await,
-            None => true,
-        };
+    let (branch_stopped, owner_stopped, shared_stopped) = if binding_valid {
+        tokio::join!(
+            stop_running_provider(&mut state.branch.running),
+            stop_running_provider(&mut state.owner.running),
+            async {
+                match state.shared.as_mut() {
+                    Some(shared) => stop_running_provider(&mut shared.running).await,
+                    None => true,
+                }
+            },
+        )
+    } else {
+        (false, false, false)
+    };
     if !(binding_valid && branch_stopped && owner_stopped && shared_stopped) {
         tracing::error!(
             binding_valid,
@@ -172,45 +181,6 @@ async fn fence_retained_projection(state: &mut ProjectionCleanupState) {
             "failed to fence every exact process storage projection lease after retained teardown"
         );
     }
-}
-
-async fn fence_projection_leases(
-    kernel: &Kernel,
-    binding: &ProcessProjectionBinding,
-    branch: &ProjectionLeaseTarget,
-    owner: &ProjectionLeaseTarget,
-    shared: Option<&ProjectionLeaseTarget>,
-) -> bool {
-    let branch = force_fence_projection_lease(
-        kernel,
-        binding.acting_uid,
-        branch.target.durable_owner(),
-        &branch.target.durable_target(),
-        branch.mount_id,
-    )
-    .await;
-    let owner = force_fence_projection_lease(
-        kernel,
-        binding.acting_uid,
-        owner.target.durable_owner(),
-        &owner.target.durable_target(),
-        owner.mount_id,
-    )
-    .await;
-    let shared = match shared {
-        Some(shared) => {
-            force_fence_projection_lease(
-                kernel,
-                binding.acting_uid,
-                shared.target.durable_owner(),
-                &shared.target.durable_target(),
-                shared.mount_id,
-            )
-            .await
-        },
-        None => true,
-    };
-    branch && owner && shared
 }
 
 async fn stop_running_provider(provider: &mut RunningProvider) -> bool {
@@ -322,30 +292,96 @@ pub(crate) async fn revoke_projection_leases(
     owner: &ProjectionLeaseTarget,
     shared: Option<&ProjectionLeaseTarget>,
 ) -> bool {
-    let branch = revoke_mapped_projection_lease(kernel, binding, branch).await;
-    let owner = revoke_mapped_projection_lease(kernel, binding, owner).await;
-    let shared = match shared {
-        Some(shared) => revoke_mapped_projection_lease(kernel, binding, shared).await,
-        None => true,
+    let Ok(states) = mapped_projection_leases(kernel, binding, branch, owner, shared) else {
+        return false;
     };
-    branch && owner && shared
+    fence_projection_states(&states, true);
+    let mut listener_checks = tokio::task::JoinSet::new();
+    for state in &states {
+        let state = Arc::clone(state);
+        listener_checks.spawn(async move { state.wait_listener_closed().await });
+    }
+    let mut listeners_closed = true;
+    while let Some(closed) = listener_checks.join_next().await {
+        listeners_closed &= closed.unwrap_or_default();
+    }
+    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
+    let mut unmapped = true;
+    for state in &states {
+        unmapped &= cleanup_mapped_lease(kernel, state).is_ok();
+    }
+    unmapped && listeners_closed
 }
 
-async fn revoke_mapped_projection_lease(
+fn mapped_projection_leases(
     kernel: &Kernel,
     binding: &ProcessProjectionBinding,
-    lease: &ProjectionLeaseTarget,
+    branch: &ProjectionLeaseTarget,
+    owner: &ProjectionLeaseTarget,
+    shared: Option<&ProjectionLeaseTarget>,
+) -> Result<Vec<Arc<super::StorageMountLeaseState>>, ()> {
+    let targets = [Some(branch), Some(owner), shared];
+    let mut states = Vec::with_capacity(targets.len());
+    for target in targets.into_iter().flatten() {
+        let Some(state) = kernel
+            .storage_mounts
+            .get(&target.mount_id)
+            .map(|entry| Arc::clone(entry.value()))
+        else {
+            continue;
+        };
+        if state.requested_by_uid != binding.acting_uid
+            || state.owner != target.target.durable_owner()
+            || state.target != target.target.durable_target()
+            || state.access != StorageProviderAccessV1::ReadWrite
+        {
+            return Err(());
+        }
+        states.push(state);
+    }
+    Ok(states)
+}
+
+fn fence_projection_states(
+    states: &[Arc<super::StorageMountLeaseState>],
+    shutdown_listeners: bool,
+) {
+    for state in states {
+        let admission = state
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.revoked.store(true, Ordering::Release);
+        if shutdown_listeners {
+            let _ = state.shutdown_tx.send(true);
+        }
+        drop(admission);
+    }
+}
+
+async fn fence_projection_leases(
+    kernel: &Kernel,
+    binding: &ProcessProjectionBinding,
+    branch: &ProjectionLeaseTarget,
+    owner: &ProjectionLeaseTarget,
+    shared: Option<&ProjectionLeaseTarget>,
 ) -> bool {
-    let expected_owner = lease.target.durable_owner();
-    let expected_target = lease.target.durable_target();
-    force_revoke_projection_lease(
-        kernel,
-        binding.acting_uid,
-        expected_owner,
-        &expected_target,
-        lease.mount_id,
-    )
-    .await
+    let Ok(states) = mapped_projection_leases(kernel, binding, branch, owner, shared) else {
+        return false;
+    };
+    if states.is_empty() {
+        return force_fence_projection_lease(
+            kernel,
+            binding.acting_uid,
+            branch.target.durable_owner(),
+            &branch.target.durable_target(),
+            branch.mount_id,
+        )
+        .await;
+    }
+    fence_projection_states(&states, false);
+    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
+    true
 }
 
 pub(crate) async fn retry_failed_projection(
@@ -367,6 +403,17 @@ pub(crate) async fn retry_failed_projection(
         projections.remove(key);
     }
     true
+}
+
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) async fn fence_projection_leases_for_test(
+    kernel: &Kernel,
+    binding: &ProcessProjectionBinding,
+    branch: &ProjectionLeaseTarget,
+    owner: &ProjectionLeaseTarget,
+    shared: Option<&ProjectionLeaseTarget>,
+) -> bool {
+    fence_projection_leases(kernel, binding, branch, owner, shared).await
 }
 
 pub(crate) fn retain_cached_projection(projection: &CachedProcessProjection) -> Result<(), String> {

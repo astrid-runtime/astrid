@@ -318,7 +318,7 @@ pub(super) fn cleanup_unpublished(
         .map_err(|(stage, source)| cleanup_error(None, stage, source).to_string())
 }
 
-pub(super) fn cleanup_mapped_lease(
+pub(crate) fn cleanup_mapped_lease(
     kernel: &Kernel,
     state: &StorageMountLeaseState,
 ) -> Result<(), MountCleanupError> {
@@ -632,7 +632,9 @@ pub(crate) async fn lease_status_from_grant(
         grant.owner_scope().allows_foreign_read(),
         mount_id,
     )?;
-    state.renew();
+    if state.try_admit().is_none() {
+        return Err("storage mount lease is expired or revoked".to_owned());
+    }
     Ok(json!({
         "mount_id": state.mount_id,
         "view": state.view,
