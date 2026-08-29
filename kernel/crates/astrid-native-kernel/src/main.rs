@@ -70,6 +70,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     interrupts::init_idt();
     serial::ev_idt_ready(interrupts::EXCEPTION_VECTORS);
 
+    let admitted;
     match closure::accept(boot_info) {
         Ok(accepted) => {
             // Keep descriptor bytes independent of the loader-owned mapping;
@@ -93,15 +94,27 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     serial::exit_qemu(false);
                 },
             };
-            if let Err(err) = verify_manifest(&descriptor, &trusted) {
-                serial::ev_closure_reject(err.as_reason());
-                serial::ev_halt(false);
-                serial::exit_qemu(false);
-            }
-            // The executable component is admitted only after its kernel copy
-            // matches the authenticated component set. Keep this gate ahead of
-            // every success-bound closure event.
-            if !closure::bind_component(accepted.component()) {
+            let verified = match verify_manifest(&descriptor, &trusted) {
+                Ok(verified) => verified,
+                Err(err) => {
+                    serial::ev_closure_reject(err.as_reason());
+                    serial::ev_halt(false);
+                    serial::exit_qemu(false)
+                },
+            };
+            // Admission consumes the verifier-owned generation, not fixture
+            // constants. Keep this gate ahead of every success-bound event.
+            admitted = match closure::admit_component(verified, accepted.component()) {
+                Ok(admitted) => admitted,
+                Err(err) => {
+                    serial::ev_closure_reject(err.as_reason());
+                    serial::ev_halt(false);
+                    serial::exit_qemu(false)
+                },
+            };
+            if admitted.verified_generation().signer()
+                != accepted.handoff().policy().sysgen_verify()
+            {
                 serial::ev_closure_reject(
                     astrid_native_closure::ClosureError::BindingMismatch.as_reason(),
                 );
@@ -148,9 +161,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     if wx_ok && tests_ok {
         memory::reserve_live_page_tables();
         domains::bind_kernel_cr3();
-        let component = closure::authenticated_component();
-        let component_id = closure::authenticated_component_id();
-        domains::start_harness(&component, component_id);
+        let component = *admitted.component();
+        domains::start_harness(&component, &admitted);
     }
     serial::ev_halt(wx_ok && tests_ok);
     serial::exit_qemu(wx_ok && tests_ok);

@@ -5,6 +5,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use astrid_system_generation::ContentId;
 use astrid_system_generation::emulator_fixture::EMULATOR_COMPONENT_LEN;
 
+use super::admission;
 use super::manager::{self, CancelError, DomainIdentity, PrepareError};
 use super::types::{BindError, ComponentImage, DomainGeneration, DomainHandle, DomainId};
 use super::types::{Outcome, Scenario};
@@ -101,6 +102,8 @@ fn fail(reason: &'static str) -> ! {
 }
 
 fn start_domain(handle: DomainHandle, scenario: Scenario) -> ! {
+    admission::confirm_start(handle, authenticated_component_id())
+        .unwrap_or_else(|error| fail(error.as_reason()));
     if let Err(error) = manager::start(handle, scenario) {
         fail(error.as_reason());
     }
@@ -108,7 +111,7 @@ fn start_domain(handle: DomainHandle, scenario: Scenario) -> ! {
 }
 
 fn prepare_domain(raw: &[u8], expected: ContentId, scenario: Scenario) -> DomainHandle {
-    match manager::prepare(raw, expected, scenario) {
+    match admission::prepare(raw, expected, scenario) {
         Ok(handle) => handle,
         Err(error) => fail(error.as_reason()),
     }
