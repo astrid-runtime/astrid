@@ -9,6 +9,7 @@ mod harness;
 mod manager;
 #[cfg(not(test))]
 mod paging;
+mod stage;
 #[cfg(test)]
 mod test_support;
 mod types;

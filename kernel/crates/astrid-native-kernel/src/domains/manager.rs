@@ -427,17 +427,97 @@ pub fn peer_is_prepared(handle: DomainHandle) -> bool {
         })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct StartContext {
+    scenario: Scenario,
+    root: u64,
+    user_stack: u64,
+    quota_ticks: u32,
+    source: u64,
+}
+
+#[cfg(test)]
+impl StartContext {
+    pub(super) const fn new(
+        scenario: Scenario,
+        root: u64,
+        user_stack: u64,
+        quota_ticks: u32,
+        source: u64,
+    ) -> Self {
+        Self {
+            scenario,
+            root,
+            user_stack,
+            quota_ticks,
+            source,
+        }
+    }
+}
+
 #[cfg(not(test))]
-pub fn start(handle: DomainHandle, scenario: Scenario) -> Result<(), PrepareError> {
+pub(super) fn staged_state(handle: DomainHandle) -> Result<(DomainState, Scenario), PrepareError> {
+    let manager = MANAGER.lock();
+    let Some(domain) = manager.valid_domain(handle) else {
+        return Err(PrepareError::Bind(BindError::NotInstalled));
+    };
+    Ok((domain.state, domain.scenario))
+}
+
+#[cfg(not(test))]
+pub(super) fn stage_context(
+    handle: DomainHandle,
+    scenario: Scenario,
+) -> Result<StartContext, PrepareError> {
     if let Some(error) = lifecycle_error() {
         return Err(error);
     }
-    let context = {
+    let manager = MANAGER.lock();
+    let Some(domain) = manager.valid_domain(handle) else {
+        return Err(PrepareError::Bind(BindError::NotInstalled));
+    };
+    if domain.state != DomainState::Prepared || domain.scenario != scenario {
+        return Err(PrepareError::Bind(BindError::Malformed));
+    }
+    let Some(space) = domain.space.as_ref() else {
+        return Err(PrepareError::Paging(
+            super::types::DomainPagingError::PolicyViolation,
+        ));
+    };
+    if let Some(error) = lifecycle_error() {
+        return Err(error);
+    }
+    let root = space.root_phys();
+    let source = space.source_root();
+    if Cr3::read() != source {
+        return Err(PrepareError::WrongCr3);
+    }
+    Ok(StartContext {
+        scenario,
+        root,
+        user_stack: space.user_stack_top(),
+        quota_ticks: domain.quota_ticks,
+        source: source.0.start_address().as_u64(),
+    })
+}
+
+#[cfg(not(test))]
+pub(super) fn start_running(
+    handle: DomainHandle,
+    context: StartContext,
+) -> Result<(), PrepareError> {
+    if let Some(error) = lifecycle_error() {
+        return Err(error);
+    }
+    {
         let mut manager = MANAGER.lock();
         let Some(domain) = manager.valid_domain_mut(handle) else {
             return Err(PrepareError::Bind(BindError::NotInstalled));
         };
-        if domain.state != DomainState::Prepared || domain.scenario != scenario {
+        if domain.state != DomainState::Prepared
+            || domain.scenario != context.scenario
+            || domain.quota_ticks != context.quota_ticks
+        {
             return Err(PrepareError::Bind(BindError::Malformed));
         }
         let Some(space) = domain.space.as_ref() else {
@@ -445,20 +525,32 @@ pub fn start(handle: DomainHandle, scenario: Scenario) -> Result<(), PrepareErro
                 super::types::DomainPagingError::PolicyViolation,
             ));
         };
+        if space.root_phys() != context.root
+            || space.user_stack_top() != context.user_stack
+            || space.source_root().0.start_address().as_u64() != context.source
+        {
+            return Err(PrepareError::Bind(BindError::Malformed));
+        }
+        if Cr3::read().0.start_address().as_u64() != context.source {
+            return Err(PrepareError::WrongCr3);
+        }
         if let Some(error) = lifecycle_error() {
             return Err(error);
         }
-        let root = space.root_phys();
-        let user_stack = space.user_stack_top();
-        let quota = domain.quota_ticks;
-        let source = space.source_root();
-        if Cr3::read() != source {
-            return Err(PrepareError::WrongCr3);
-        }
         domain.state = DomainState::Running;
-        (root, user_stack, quota, scenario)
-    };
-    let (root, user_end, quota, scenario) = context;
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+pub(super) fn enter_running(handle: DomainHandle, context: StartContext) -> ! {
+    let StartContext {
+        scenario,
+        root,
+        user_stack: user_end,
+        quota_ticks: quota,
+        source: _,
+    } = context;
     gdt::set_privilege_stack(VirtAddr::new(KERNEL_STACK_TOP));
     apic::unmask_timer();
     let (_, source_flags) = Cr3::read();
@@ -777,7 +869,10 @@ pub fn active_lifecycle_guard_rejects(
         prepare(raw, expected, scenario),
         Err(PrepareError::ActiveDomain)
     );
-    let start_rejected = matches!(start(handle, scenario), Err(PrepareError::ActiveDomain));
+    let start_rejected = matches!(
+        stage_context(handle, scenario),
+        Err(PrepareError::ActiveDomain)
+    );
     let cancel_rejected = matches!(cancel(handle), Err(CancelError::ActiveDomain));
     CURRENT.active.store(false, Ordering::SeqCst);
     prepare_rejected

@@ -7,6 +7,7 @@ use astrid_system_generation::emulator_fixture::EMULATOR_COMPONENT_LEN;
 
 use super::admission;
 use super::manager::{self, CancelError, DomainIdentity, PrepareError};
+use super::stage;
 use super::types::{BindError, ComponentImage, DomainGeneration, DomainHandle, DomainId};
 use super::types::{Outcome, Scenario};
 use crate::closure::{authenticated_component, authenticated_component_id};
@@ -102,9 +103,11 @@ fn fail(reason: &'static str) -> ! {
 }
 
 fn start_domain(handle: DomainHandle, scenario: Scenario) -> ! {
-    admission::confirm_start(handle, authenticated_component_id())
-        .unwrap_or_else(|error| fail(error.as_reason()));
-    if let Err(error) = manager::start(handle, scenario) {
+    let staged = match stage::stage_start(handle, authenticated_component_id(), scenario) {
+        Ok(staged) => staged,
+        Err(error) => fail(error.as_reason()),
+    };
+    if let Err(error) = stage::dispatch_start(staged) {
         fail(error.as_reason());
     }
     unreachable!("domain start is terminal until the trap returns to the scheduler")
