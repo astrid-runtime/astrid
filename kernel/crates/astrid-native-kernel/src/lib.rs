@@ -21,6 +21,7 @@ pub mod ipc;
 #[cfg(not(test))]
 pub mod memory;
 pub mod platform;
+pub mod relations;
 #[cfg(not(test))]
 pub mod serial;
 #[cfg(not(test))]
