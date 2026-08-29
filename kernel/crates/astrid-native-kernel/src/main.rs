@@ -162,9 +162,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         memory::reserve_live_page_tables();
         domains::bind_kernel_cr3();
         let component = *admitted.component();
-        let component_id = admitted.component_id();
-        let manifest_identity = admitted.manifest_identity();
-        domains::start_harness(&component, manifest_identity, component_id);
+        domains::start_harness(&component, &admitted);
     }
     serial::ev_halt(wx_ok && tests_ok);
     serial::exit_qemu(wx_ok && tests_ok);

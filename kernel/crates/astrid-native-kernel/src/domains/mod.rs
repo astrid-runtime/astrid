@@ -22,19 +22,23 @@ pub fn bind_kernel_cr3() {
 }
 
 #[cfg(not(test))]
-pub fn start_harness(
-    raw: &[u8],
-    manifest_identity: astrid_system_generation::ManifestIdentity,
-    expected: astrid_system_generation::ContentId,
-) -> ! {
-    admission::install(manifest_identity, expected).unwrap_or_else(|error| {
+pub fn start_harness(raw: &[u8], admitted: &crate::closure::AdmittedGeneration) -> ! {
+    if astrid_system_generation::ContentId::from_payload(raw) != admitted.component_id() {
+        crate::serial::ev_domain_auth_reject(
+            crate::domains::admission::AdmissionError::ComponentMismatch.as_reason(),
+        );
+        crate::serial::ev_domain_harness(false);
+        crate::serial::ev_halt(false);
+        crate::serial::exit_qemu(false);
+    }
+    admission::install(admitted).unwrap_or_else(|error| {
         crate::serial::ev_domain_auth_reject(error.as_reason());
         crate::serial::ev_domain_harness(false);
         crate::serial::ev_halt(false);
         crate::serial::exit_qemu(false);
     });
     manager::init_resume_stack();
-    harness::start(raw, expected)
+    harness::start(raw, admitted.component_id())
 }
 
 #[cfg(not(test))]

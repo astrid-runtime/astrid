@@ -906,6 +906,7 @@ impl Manager {
                     freed,
                     expected - freed,
                 );
+                super::admission::release(handle);
                 true
             }
         };
