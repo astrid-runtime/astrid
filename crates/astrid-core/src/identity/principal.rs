@@ -324,8 +324,19 @@ mod tests {
     fn serde_round_trip_keeps_canonical_text() {
         let identity = PrincipalIdentity::from_genesis(genesis()).unwrap();
         let encoded = toml::to_string(&identity).unwrap();
-        assert!(encoded.contains(&format!("uid = \"{}\"", identity.uid)));
-        assert!(encoded.contains(&format!("initial_public_key = \"{}\"", "5a".repeat(32))));
+        assert_eq!(
+            encoded,
+            concat!(
+                "uid = \"c2bcce8a2372c53b60ad922845ffd591b475e15f4005de34bf4039198d5b6987\"\n",
+                "\n",
+                "[genesis]\n",
+                "format_version = 1\n",
+                "identity_id = \"00112233-4455-6677-8899-aabbccddeeff\"\n",
+                "created_at_seconds = 1700000000\n",
+                "created_at_nanoseconds = 123456789\n",
+                "initial_public_key = \"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\"\n",
+            )
+        );
         let decoded: PrincipalIdentity = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded, identity);
         decoded.validate().unwrap();

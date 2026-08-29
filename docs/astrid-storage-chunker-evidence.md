@@ -218,7 +218,8 @@ revisions:
 
 | Component | Version | Source revision | License | Role |
 |---|---|---|---|---|
-| `fastcdc` | 4.0.1 | `2e47aa3146c6dbae34896997eebd162b280a7052` | MIT | production baseline |
+| `fastcdc` | 5.0.0 | `eeb3cbe8ed4eeef020aa346707bbdb29abd814ad` | MIT | production baseline for even profiles |
+| `fastcdc-v4` | 4.0.1 | `2e47aa3146c6dbae34896997eebd162b280a7052` | MIT | legacy odd-profile compatibility edge |
 | `mincdc` | 0.1.0 | `638840e6809274e3e8e9916951d3c3ae4f3f5191` | Zlib | accelerated evidence oracle |
 | `mothcdc` | 0.7.2 | `3900c1e4e6c311bf832cb5099b2e0170e070970f` | Zlib | representation evidence oracle |
 
