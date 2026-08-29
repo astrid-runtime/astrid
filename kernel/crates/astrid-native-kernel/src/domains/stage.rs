@@ -5,7 +5,7 @@ use astrid_system_generation::{ContentId, ManifestIdentity};
 
 use super::admission;
 use super::manager::{self, DomainState};
-use super::types::{DomainHandle, Scenario};
+use super::types::{BindError, DomainHandle, Scenario};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StageError {
@@ -76,6 +76,23 @@ where
         }
         Ok(())
     }
+
+    fn authorize_dispatch(
+        &self,
+        manifest_identity: G,
+        component_id: C,
+        state: DomainState,
+        scenario: Scenario,
+        context: manager::StartContext,
+    ) -> Result<manager::StartContext, StageError> {
+        self.revalidate(manifest_identity, component_id, state, scenario)?;
+        if context != self.context {
+            return Err(StageError::Domain(manager::PrepareError::Bind(
+                BindError::Malformed,
+            )));
+        }
+        Ok(context)
+    }
 }
 
 #[cfg(not(test))]
@@ -103,14 +120,15 @@ pub(crate) fn dispatch_start(
     let manifest_identity = admission::confirm_start(staged.handle, staged.component_id)
         .map_err(StageError::Admission)?;
     let (state, scenario) = manager::staged_state(staged.handle).map_err(StageError::Domain)?;
-    staged.revalidate(manifest_identity, staged.component_id, state, scenario)?;
     let context =
         manager::stage_context(staged.handle, staged.scenario).map_err(StageError::Domain)?;
-    if context != staged.context {
-        return Err(StageError::Domain(manager::PrepareError::Bind(
-            super::types::BindError::Malformed,
-        )));
-    }
+    let context = staged.authorize_dispatch(
+        manifest_identity,
+        staged.component_id,
+        state,
+        scenario,
+        context,
+    )?;
     manager::start_running(staged.handle, context).map_err(StageError::Domain)?;
     manager::enter_running(staged.handle, context)
 }
@@ -119,8 +137,11 @@ pub(crate) fn dispatch_start(
 mod tests {
     use super::super::types::{DomainGeneration, DomainHandle, DomainId};
     use super::{StageError, StagedStart};
+    use crate::domains::admission::AdmissionError;
     use crate::domains::manager::DomainState;
+    use crate::domains::manager::PrepareError;
     use crate::domains::manager::StartContext;
+    use crate::domains::types::BindError;
     use crate::domains::types::Scenario;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,5 +242,83 @@ mod tests {
                 Err(StageError::StaleDomain)
             );
         }
+    }
+
+    #[test]
+    fn dispatch_authorization_revalidates_state_and_context() {
+        let staged = staged(Scenario::Exit);
+        let current = context(Scenario::Exit);
+        let substituted_context = context(Scenario::PageFault);
+
+        assert_eq!(
+            staged.authorize_dispatch(
+                GENERATION,
+                COMPONENT,
+                DomainState::Prepared,
+                Scenario::Exit,
+                current
+            ),
+            Ok(current)
+        );
+        assert_eq!(
+            staged.authorize_dispatch(
+                SUBSTITUTED,
+                COMPONENT,
+                DomainState::Prepared,
+                Scenario::Exit,
+                current
+            ),
+            Err(StageError::Admission(AdmissionError::SubstitutedIdentity))
+        );
+        assert_eq!(
+            staged.authorize_dispatch(
+                GENERATION,
+                MISMATCHED,
+                DomainState::Prepared,
+                Scenario::Exit,
+                current
+            ),
+            Err(StageError::Admission(AdmissionError::ComponentMismatch))
+        );
+        assert_eq!(
+            staged.authorize_dispatch(
+                GENERATION,
+                COMPONENT,
+                DomainState::Running,
+                Scenario::Exit,
+                current
+            ),
+            Err(StageError::NotPrepared)
+        );
+        assert_eq!(
+            staged.authorize_dispatch(
+                GENERATION,
+                COMPONENT,
+                DomainState::Reclaimed,
+                Scenario::Exit,
+                current
+            ),
+            Err(StageError::StaleDomain)
+        );
+        assert_eq!(
+            staged.authorize_dispatch(
+                GENERATION,
+                COMPONENT,
+                DomainState::Prepared,
+                Scenario::PageFault,
+                current
+            ),
+            Err(StageError::ScenarioMismatch)
+        );
+        assert_eq!(
+            staged.authorize_dispatch(
+                GENERATION,
+                COMPONENT,
+                DomainState::Prepared,
+                Scenario::Exit,
+                substituted_context
+            ),
+            Err(StageError::Domain(PrepareError::Bind(BindError::Malformed)))
+        );
     }
 }
