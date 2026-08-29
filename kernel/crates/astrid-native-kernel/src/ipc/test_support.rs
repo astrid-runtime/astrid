@@ -59,6 +59,18 @@ pub(crate) fn peer_status(domain: DomainToken) -> Option<&'static str> {
     crate::platform::peer_status_for_test(domain)
 }
 
+pub(crate) fn peer_parked(domain: DomainToken) -> bool {
+    crate::platform::peer_parked_for_test(domain)
+}
+
+pub(crate) fn install_blocked(domain: DomainToken) -> bool {
+    crate::domains::install_blocked_ipc_for_test(domain)
+}
+
+pub(crate) fn domain_blocked(domain: DomainToken) -> bool {
+    crate::domains::ipc_blocked_for_test(domain)
+}
+
 pub(crate) fn cap_revoke(domain: DomainToken, slot: CapSlot) -> Result<u64, IpcError> {
     super::cap_revoke(
         &TrapFrame {
@@ -117,12 +129,12 @@ pub(crate) fn send_outcome(
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::test_lock;
     use super::test_support::{
         cap_revoke as support_cap_revoke, capability, endpoint_create, has_waiter,
         install_transfer_message, object_count, park_member, queued_for, reset, send_outcome,
     };
     use super::*;
-    use super::test_support::test_lock;
 
     fn domain(slot: u64) -> DomainToken {
         DomainToken::new(slot, 1).unwrap()
@@ -218,5 +230,4 @@ mod tests {
         );
         assert!(!has_waiter(peer));
     }
-
 }

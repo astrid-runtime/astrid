@@ -190,8 +190,10 @@ impl Endpoint {
             let mut wakes = self.clear_domain(domain);
             // The revoked domain itself may be parked even when it is the
             // only endpoint member; report it so revoke can fail it terminal.
-            if !wakes.contains(&Some(domain)) {
-                wakes[0] = Some(domain);
+            if !wakes.contains(&Some(domain))
+                && let Some(slot) = wakes.iter_mut().find(|slot| slot.is_none())
+            {
+                *slot = Some(domain);
             }
             wakes
         } else {

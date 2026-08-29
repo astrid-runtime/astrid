@@ -3,11 +3,12 @@
 use super::abi::MAX_BUFFER_BYTES;
 use super::capability::Rights;
 use super::error::IpcError;
-use super::*;
 use super::test_support::{
-    capability, endpoint_create, find, has_waiter, install_transfer_message, object_count,
-    park_member, park_peer, peer_status, queued_for, reset, send_outcome, test_lock,
+    capability, domain_blocked, endpoint_create, find, has_waiter, install_blocked,
+    install_transfer_message, object_count, park_member, park_peer, peer_parked, peer_status,
+    queued_for, reset, send_outcome, test_lock,
 };
+use super::*;
 use crate::platform::TrapFrame;
 
 fn domain(slot: u64) -> DomainToken {
@@ -47,15 +48,10 @@ fn receive_transfer(
     ));
     let recv_slot = find(recipient, Rights::RECV)?;
     let wire = recv_wire(sender, install_slot);
-    super::complete_parked_recv(
-        recipient,
-        &wire,
-        u64::from(recv_slot.get()),
-        |encoded| {
-            crate::platform::set_user_memory_for_test(*encoded);
-            true
-        },
-    )
+    super::complete_parked_recv(recipient, &wire, u64::from(recv_slot.get()), |encoded| {
+        crate::platform::set_user_memory_for_test(*encoded);
+        true
+    })
     .ok()?;
     let slot = CapSlot::try_new(usize::from(install_slot)).ok()?;
     capability(recipient, slot)
@@ -63,7 +59,10 @@ fn receive_transfer(
 
 fn derived_transfer(parent: Capability, owner: DomainToken, slot: CapSlot) -> Capability {
     Capability {
-        parent: Some(DerivationLink { domain: owner, slot }),
+        parent: Some(DerivationLink {
+            domain: owner,
+            slot,
+        }),
         ..parent
     }
 }
@@ -85,8 +84,7 @@ fn cap_revoke_removes_grandchild_and_drains_derived_queue() {
     let child_slot = CapSlot::try_new(usize::from(child_slot_index)).unwrap();
     let child_transfer = derived_transfer(root, creator, root_slot);
     let derived_child =
-        receive_transfer(child, creator, endpoint, child_transfer, child_slot_index)
-            .unwrap();
+        receive_transfer(child, creator, endpoint, child_transfer, child_slot_index).unwrap();
     assert_eq!(
         derived_child.parent,
         Some(DerivationLink {
@@ -150,12 +148,15 @@ fn cap_revoke_terminal_wakes_parked_recv_peer_without_stale_waiter() {
     assert!(park_member(peer));
     assert!(install_transfer_message(peer, creator, endpoint, None));
     assert!(park_peer(peer, "received"));
+    assert!(install_blocked(peer));
     assert_eq!(peer_status(peer), Some("received"));
     assert_eq!(queued_for(peer), 1);
+    assert!(domain_blocked(peer));
 
     let peer_slot = find(peer, Rights::RECV).unwrap();
     assert_eq!(revoke(peer, peer_slot), Ok(1));
-    assert_eq!(peer_status(peer), Some("faulted"));
+    assert!(!peer_parked(peer));
+    assert!(!domain_blocked(peer));
     assert_eq!(find(peer, Rights::RECV), None);
     assert_eq!(queued_for(peer), 0);
     assert!(!has_waiter(peer));
@@ -164,4 +165,32 @@ fn cap_revoke_terminal_wakes_parked_recv_peer_without_stale_waiter() {
         send_outcome(creator, peer, endpoint),
         Some(SendOutcome::Full)
     );
+}
+
+#[test]
+fn cap_revoke_appends_revoked_domain_after_surviving_peer_wake() {
+    let _guard = test_lock();
+    reset();
+    let creator = domain(0);
+    let peer = domain(1);
+    prepare_domain(creator);
+    prepare_domain(peer);
+
+    let endpoint = endpoint_create(creator).unwrap();
+    assert!(bind_peer(creator, peer).is_ok());
+    assert!(install_transfer_message(peer, creator, endpoint, None));
+    assert!(park_peer(peer, "received"));
+    assert!(park_peer(creator, "sent"));
+    assert!(install_blocked(peer));
+    assert!(install_blocked(creator));
+
+    let root_slot = find(creator, Rights::ALL).unwrap();
+    assert_eq!(revoke(creator, root_slot), Ok(2));
+
+    assert!(!peer_parked(peer));
+    assert!(!peer_parked(creator));
+    assert!(!domain_blocked(peer));
+    assert!(!domain_blocked(creator));
+    assert!(!has_waiter(peer));
+    assert!(!has_waiter(creator));
 }

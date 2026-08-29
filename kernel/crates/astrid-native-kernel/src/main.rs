@@ -18,32 +18,15 @@
 #![no_std]
 #![no_main]
 
-mod apic;
-mod closure;
-mod domains;
-mod entropy;
-mod gdt;
-mod interrupts;
-mod memory;
-mod serial;
-mod tests;
-mod trap;
-
 use astrid_native_kernel::platform::{self, Platform};
+use astrid_native_kernel::tests;
+use astrid_native_kernel::{apic, closure, domains, entropy, gdt, interrupts, memory, serial};
 
 struct KernelPlatform;
 
 impl Platform for KernelPlatform {
     fn copy_current_user(&self, address: u64, buffer: &mut [u8], to_user: bool) -> bool {
         domains::copy_current_user(address, buffer, to_user)
-    }
-
-    fn mark_ipc_cancelled(&self, domain: ipc::DomainToken) -> bool {
-        domains::mark_ipc_cancelled(domain)
-    }
-
-    fn mark_ipc_peer_failed(&self, domain: ipc::DomainToken) {
-        domains::mark_ipc_peer_failed(domain);
     }
 
     fn ev_ipc_op(&self, id: u64, generation: u64, operation: &str, status: &str) {
@@ -54,8 +37,6 @@ impl Platform for KernelPlatform {
 fn install_ipc_platform() {
     platform::install(&KernelPlatform);
 }
-
-pub(crate) use astrid_native_kernel::ipc;
 
 use astrid_system_generation::{MANIFEST_LEN, verify_manifest};
 use bootloader_api::config::Mapping;

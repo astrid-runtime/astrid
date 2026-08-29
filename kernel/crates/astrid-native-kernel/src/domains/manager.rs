@@ -3,24 +3,33 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use spin::{Mutex, Once};
+#[cfg(not(test))]
 use x86_64::VirtAddr;
+#[cfg(not(test))]
 use x86_64::registers::control::{Cr3, Cr3Flags};
+#[cfg(not(test))]
 use x86_64::structures::paging::{PhysFrame, Size4KiB};
 
+#[cfg(not(test))]
 use super::paging::AddressSpace;
 use super::types::{
     BindError, CODE_BASE, ComponentImage, DomainGeneration, DomainHandle, DomainId,
     DomainPagingError, ENTRYPOINT, KERNEL_STACK_TOP, Outcome, PEER_PROBE, SLOT_CAPACITY, Scenario,
 };
+#[cfg(not(test))]
 use crate::apic;
+#[cfg(not(test))]
 use crate::gdt;
 use crate::ipc;
+#[cfg(not(test))]
 use crate::memory::FRAME_SIZE;
+#[cfg(not(test))]
 use crate::serial;
+#[cfg(not(test))]
 use crate::trap::TrapFrame;
 use astrid_system_generation::ContentId;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PrepareError {
+pub enum PrepareError {
     Bind(BindError),
     Paging(DomainPagingError),
     ResourceCapacity,
@@ -31,7 +40,7 @@ pub(crate) enum PrepareError {
 }
 
 impl PrepareError {
-    pub(crate) const fn as_reason(self) -> &'static str {
+    pub const fn as_reason(self) -> &'static str {
         match self {
             Self::Bind(error) => error.as_reason(),
             Self::Paging(error) => error.as_reason(),
@@ -45,7 +54,7 @@ impl PrepareError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CancelError {
+pub enum CancelError {
     StaleHandle,
     NotPrepared,
     ActiveDomain,
@@ -54,7 +63,7 @@ pub(crate) enum CancelError {
 }
 
 impl CancelError {
-    pub(crate) const fn as_reason(self) -> &'static str {
+    pub const fn as_reason(self) -> &'static str {
         match self {
             Self::StaleHandle => "stale_handle",
             Self::NotPrepared => "not_prepared",
@@ -66,9 +75,9 @@ impl CancelError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct DomainIdentity {
-    pub(crate) root: u64,
-    pub(crate) probe: u64,
+pub struct DomainIdentity {
+    pub root: u64,
+    pub probe: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,7 +100,7 @@ impl ReclaimStats {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum DomainState {
+pub enum DomainState {
     Prepared,
     Running,
     Blocked,
@@ -106,43 +115,48 @@ impl DomainState {
     }
 }
 
-pub(super) struct Domain {
-    pub(super) generation: u64,
-    pub(super) state: DomainState,
-    pub(super) scenario: Scenario,
-    quota_ticks: u32,
+pub struct Domain {
+    pub generation: u64,
+    pub state: DomainState,
+    pub scenario: Scenario,
+    pub(super) quota_ticks: u32,
+    #[cfg(not(test))]
     pub(super) space: Option<AddressSpace>,
-    ipc_enabled: bool,
+    #[cfg(test)]
+    pub(super) space: Option<()>,
+    pub(super) ipc_enabled: bool,
 }
 
 #[derive(Default)]
-pub(super) struct Manager {
-    slots: [Option<Domain>; SLOT_CAPACITY],
+pub struct Manager {
+    pub(super) slots: [Option<Domain>; SLOT_CAPACITY],
     used_frames: u64,
     last_identity: Option<DomainIdentity>,
 }
 
-pub(super) static MANAGER: Mutex<Manager> = Mutex::new(Manager {
+pub static MANAGER: Mutex<Manager> = Mutex::new(Manager {
     slots: [None, None],
     used_frames: 0,
     last_identity: None,
 });
 
+#[cfg(not(test))]
 #[derive(Default)]
-pub(super) struct Current {
-    pub(super) active: AtomicBool,
-    pub(super) slot: AtomicU64,
-    pub(super) generation: AtomicU64,
-    pub(super) root: AtomicU64,
-    pub(super) root_flags: AtomicU64,
-    pub(super) entered: AtomicBool,
-    pub(super) ticks: AtomicU32,
-    pub(super) quota: AtomicU32,
-    pub(super) scenario: AtomicU64,
-    pub(super) stack_end: AtomicU64,
+pub struct Current {
+    pub active: AtomicBool,
+    pub slot: AtomicU64,
+    pub generation: AtomicU64,
+    pub root: AtomicU64,
+    pub root_flags: AtomicU64,
+    pub entered: AtomicBool,
+    pub ticks: AtomicU32,
+    pub quota: AtomicU32,
+    pub scenario: AtomicU64,
+    pub stack_end: AtomicU64,
 }
 
-pub(super) static CURRENT: Current = Current {
+#[cfg(not(test))]
+pub static CURRENT: Current = Current {
     active: AtomicBool::new(false),
     slot: AtomicU64::new(0),
     generation: AtomicU64::new(0),
@@ -155,6 +169,7 @@ pub(super) static CURRENT: Current = Current {
     stack_end: AtomicU64::new(0),
 };
 
+#[cfg(not(test))]
 #[derive(Clone, Copy)]
 struct TrapContext {
     slot: u64,
@@ -167,6 +182,7 @@ struct TrapContext {
     outcome: Outcome,
 }
 
+#[cfg(not(test))]
 static TERMINAL_CONTEXT: Mutex<Option<TrapContext>> = Mutex::new(None);
 
 /// The landed #1704 prefix is frozen through this exclusive append boundary.
@@ -174,14 +190,18 @@ const IPC_APPEND_OFFSET: u64 = 71;
 /// Scenario 10 resumes at the end of the unchanged #1704 code prefix.
 const IPC_CANCEL_GUEST_APPEND_OFFSET: u64 = 415;
 
+#[cfg(not(test))]
 static KERNEL_CR3: Once<(PhysFrame<Size4KiB>, Cr3Flags)> = Once::new();
 
+#[cfg(not(test))]
 static RESUME_STACK_END: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) fn init_kernel_cr3() {
+#[cfg(not(test))]
+pub fn init_kernel_cr3() {
     KERNEL_CR3.call_once(Cr3::read);
 }
 
+#[cfg(not(test))]
 fn lifecycle_context_error(
     active: bool,
     current: Option<(PhysFrame<Size4KiB>, Cr3Flags)>,
@@ -196,6 +216,7 @@ fn lifecycle_context_error(
     (current != Some(expected)).then_some(PrepareError::WrongCr3)
 }
 
+#[cfg(not(test))]
 fn lifecycle_error() -> Option<PrepareError> {
     lifecycle_context_error(
         CURRENT.active.load(Ordering::SeqCst),
@@ -204,18 +225,22 @@ fn lifecycle_error() -> Option<PrepareError> {
     )
 }
 
-pub(crate) fn init_resume_stack() {
+#[cfg(not(test))]
+pub fn init_resume_stack() {
     RESUME_STACK_END.store(aligned_stack_end(), Ordering::SeqCst);
 }
 
-pub(super) fn resume_stack_end() -> usize {
+#[cfg(not(test))]
+pub fn resume_stack_end() -> usize {
     RESUME_STACK_END.load(Ordering::SeqCst) as usize
 }
 
+#[cfg(not(test))]
 fn aligned_stack_end() -> u64 {
     current_stack_pointer() & !0xf
 }
 
+#[cfg(not(test))]
 fn current_stack_pointer() -> u64 {
     let pointer;
     // SAFETY: reads the current stack pointer without changing it.
@@ -225,6 +250,7 @@ fn current_stack_pointer() -> u64 {
     pointer
 }
 
+#[cfg(not(test))]
 fn guest_entry_state_ok(frame: &TrapFrame, scenario: u64) -> bool {
     let (fs, gs) = guest_segment_selectors();
     frame.rdi == scenario
@@ -238,6 +264,7 @@ fn guest_entry_state_ok(frame: &TrapFrame, scenario: u64) -> bool {
         && gs == 0
 }
 
+#[cfg(not(test))]
 fn guest_segment_selectors() -> (u64, u64) {
     let fs: u16;
     let gs: u16;
@@ -254,20 +281,23 @@ fn guest_segment_selectors() -> (u64, u64) {
     (fs as u64, gs as u64)
 }
 
-pub(crate) fn kernel_cr3_restored() -> bool {
+#[cfg(not(test))]
+pub fn kernel_cr3_restored() -> bool {
     KERNEL_CR3
         .get()
         .is_some_and(|expected| Cr3::read() == *expected)
 }
 
-pub(super) fn kernel_cr3_value() -> u64 {
+#[cfg(not(test))]
+pub fn kernel_cr3_value() -> u64 {
     let Some((root, flags)) = KERNEL_CR3.get().copied() else {
         fail_terminal("kernel_cr3_missing");
     };
     root.start_address().as_u64() | (flags.bits() & 0xfff)
 }
 
-pub(crate) fn prepare(
+#[cfg(not(test))]
+pub fn prepare(
     raw: &[u8],
     expected_identity: ContentId,
     scenario: Scenario,
@@ -338,7 +368,8 @@ pub(crate) fn prepare(
     Ok(handle)
 }
 
-pub(crate) fn identity(handle: DomainHandle) -> Option<DomainIdentity> {
+#[cfg(not(test))]
+pub fn identity(handle: DomainHandle) -> Option<DomainIdentity> {
     let manager = MANAGER.lock();
     manager.valid_domain(handle).and_then(|domain| {
         let space = domain.space.as_ref()?;
@@ -349,22 +380,24 @@ pub(crate) fn identity(handle: DomainHandle) -> Option<DomainIdentity> {
     })
 }
 
-pub(crate) fn last_identity() -> Option<DomainIdentity> {
+#[cfg(not(test))]
+pub fn last_identity() -> Option<DomainIdentity> {
     MANAGER.lock().last_identity
 }
 
-pub(crate) fn is_stale(handle: DomainHandle) -> bool {
+pub fn is_stale(handle: DomainHandle) -> bool {
     MANAGER.lock().valid_domain(handle).is_none()
 }
 
-pub(crate) fn generation(handle: DomainHandle) -> Option<u64> {
+pub fn generation(handle: DomainHandle) -> Option<u64> {
     MANAGER
         .lock()
         .valid_domain(handle)
         .map(|domain| domain.generation)
 }
 
-pub(crate) fn clean_domain_zeroed(handle: DomainHandle) -> bool {
+#[cfg(not(test))]
+pub fn clean_domain_zeroed(handle: DomainHandle) -> bool {
     let manager = MANAGER.lock();
     manager.valid_domain(handle).is_some_and(|domain| {
         domain
@@ -374,11 +407,12 @@ pub(crate) fn clean_domain_zeroed(handle: DomainHandle) -> bool {
     })
 }
 
-pub(crate) fn outstanding_frames() -> u64 {
+#[cfg(not(test))]
+pub fn outstanding_frames() -> u64 {
     MANAGER.lock().used_frames
 }
 
-pub(crate) fn peer_is_prepared(handle: DomainHandle) -> bool {
+pub fn peer_is_prepared(handle: DomainHandle) -> bool {
     let index = handle.id().0 as usize;
     MANAGER
         .lock()
@@ -393,7 +427,8 @@ pub(crate) fn peer_is_prepared(handle: DomainHandle) -> bool {
         })
 }
 
-pub(crate) fn start(handle: DomainHandle, scenario: Scenario) -> Result<(), PrepareError> {
+#[cfg(not(test))]
+pub fn start(handle: DomainHandle, scenario: Scenario) -> Result<(), PrepareError> {
     if let Some(error) = lifecycle_error() {
         return Err(error);
     }
@@ -445,6 +480,7 @@ pub(crate) fn start(handle: DomainHandle, scenario: Scenario) -> Result<(), Prep
     enter_user(root, user_end, scenario.value());
 }
 
+#[cfg(not(test))]
 fn enter_user(root: u64, stack: u64, scenario: u64) -> ! {
     let (user_code, user_data) = gdt::user_selectors();
     let user_data = user_data.0 as u64;
@@ -494,7 +530,8 @@ fn enter_user(root: u64, stack: u64, scenario: u64) -> ! {
     }
 }
 
-pub(super) extern "C" fn scheduler_resume() -> ! {
+#[cfg(not(test))]
+pub extern "C" fn scheduler_resume() -> ! {
     let stack_end = resume_stack_end();
     // SAFETY: the terminal trap has returned here on the guarded transition
     // stack; no domain frame remains live below this point. Move to the
@@ -511,14 +548,16 @@ pub(super) extern "C" fn scheduler_resume() -> ! {
     }
 }
 
-pub(super) fn fail_terminal(reason: &'static str) -> ! {
+#[cfg(not(test))]
+pub fn fail_terminal(reason: &'static str) -> ! {
     serial::ev_domain_trap_reject(reason);
     serial::ev_domain_harness(false);
     serial::ev_halt(false);
     serial::exit_qemu(false);
 }
 
-pub(crate) fn handle_domain_trap(frame: &mut TrapFrame, fault_address: u64) -> bool {
+#[cfg(not(test))]
+pub fn handle_domain_trap(frame: &mut TrapFrame, fault_address: u64) -> bool {
     if !CURRENT.active.load(Ordering::SeqCst) || frame.cs & 3 != 3 {
         return false;
     }
@@ -655,8 +694,9 @@ pub(crate) fn handle_domain_trap(frame: &mut TrapFrame, fault_address: u64) -> b
     switch_to_resume(resume_stack_end());
 }
 
+#[cfg(not(test))]
 #[unsafe(naked)]
-pub(super) extern "C" fn switch_to_resume(stack_end: usize) -> ! {
+pub extern "C" fn switch_to_resume(stack_end: usize) -> ! {
     core::arch::naked_asm!(
         "mov rsp, rdi",
         "xor ebp, ebp",
@@ -666,6 +706,7 @@ pub(super) extern "C" fn switch_to_resume(stack_end: usize) -> ! {
     );
 }
 
+#[cfg(not(test))]
 extern "C" fn domain_terminal() -> ! {
     let mut terminal = TERMINAL_CONTEXT.lock();
     let Some(context) = terminal.as_ref().copied() else {
@@ -718,11 +759,13 @@ extern "C" fn domain_terminal() -> ! {
     }
 }
 
-pub(crate) fn cancel(handle: DomainHandle) -> Result<(u64, u64), CancelError> {
+#[cfg(not(test))]
+pub fn cancel(handle: DomainHandle) -> Result<(u64, u64), CancelError> {
     MANAGER.lock().cancel_prepared(handle)
 }
 
-pub(crate) fn active_lifecycle_guard_rejects(
+#[cfg(not(test))]
+pub fn active_lifecycle_guard_rejects(
     handle: DomainHandle,
     scenario: Scenario,
     raw: &[u8],
@@ -744,7 +787,8 @@ pub(crate) fn active_lifecycle_guard_rejects(
         && !is_stale(handle)
 }
 
-pub(crate) fn generation_overflow_rejects_prepare(raw: &[u8], expected: ContentId) -> bool {
+#[cfg(not(test))]
+pub fn generation_overflow_rejects_prepare(raw: &[u8], expected: ContentId) -> bool {
     let frames = outstanding_frames();
     {
         let mut manager = MANAGER.lock();
@@ -773,18 +817,19 @@ pub(crate) fn generation_overflow_rejects_prepare(raw: &[u8], expected: ContentI
 }
 
 impl Manager {
-    pub(super) fn valid_domain(&self, handle: DomainHandle) -> Option<&Domain> {
+    pub fn valid_domain(&self, handle: DomainHandle) -> Option<&Domain> {
         let slot = self.slots.get(handle.id().0 as usize)?;
         let domain = slot.as_ref()?;
         (domain.generation == handle.generation().0 && domain.state.is_live()).then_some(domain)
     }
 
-    pub(super) fn valid_domain_mut(&mut self, handle: DomainHandle) -> Option<&mut Domain> {
+    pub fn valid_domain_mut(&mut self, handle: DomainHandle) -> Option<&mut Domain> {
         let slot = self.slots.get_mut(handle.id().0 as usize)?;
         let domain = slot.as_mut()?;
         (domain.generation == handle.generation().0 && domain.state.is_live()).then_some(domain)
     }
 
+    #[cfg(not(test))]
     fn release_slot(&mut self, handle: DomainHandle) -> ReclaimStats {
         let Some(slot) = self.slots.get_mut(handle.id().0 as usize) else {
             return ReclaimStats::zero();
@@ -872,6 +917,7 @@ impl Manager {
         ReclaimStats { expected, freed }
     }
 
+    #[cfg(not(test))]
     fn terminate(
         &mut self,
         handle: DomainHandle,
@@ -890,6 +936,7 @@ impl Manager {
         self.release_slot(handle)
     }
 
+    #[cfg(not(test))]
     fn cancel_prepared(&mut self, handle: DomainHandle) -> Result<(u64, u64), CancelError> {
         if CURRENT.active.load(Ordering::SeqCst) {
             return Err(CancelError::ActiveDomain);

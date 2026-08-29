@@ -1,8 +1,8 @@
 //! The narrow machine boundary used by the production IPC authority model.
 
-use spin::Mutex;
-
+#[cfg(test)]
 use crate::ipc::DomainToken;
+use spin::Mutex;
 
 /// CPU context observed by IPC operations. The x86 trap stub fills this
 /// representation; the authority state machine never touches machine registers.
@@ -64,8 +64,6 @@ impl TrapFrame {
 
 pub trait Platform: Sync + Send + 'static {
     fn copy_current_user(&self, address: u64, buffer: &mut [u8], to_user: bool) -> bool;
-    fn mark_ipc_cancelled(&self, domain: DomainToken) -> bool;
-    fn mark_ipc_peer_failed(&self, domain: DomainToken);
     fn ev_ipc_op(&self, id: u64, generation: u64, operation: &str, status: &str);
 }
 
@@ -82,37 +80,7 @@ pub fn current() -> &'static dyn Platform {
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TestStatus {
-    Sent,
-    Received,
-    Cancelled,
-    Faulted,
-}
-
-#[cfg(test)]
-impl TestStatus {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Sent => "sent",
-            Self::Received => "received",
-            Self::Cancelled => "cancelled",
-            Self::Faulted => "faulted",
-        }
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Default)]
-struct ParkedPeer {
-    status: Option<TestStatus>,
-    failed: Option<DomainToken>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy)]
 struct TestState {
-    parked: [ParkedPeer; 2],
     user_memory: [u8; crate::ipc::MAX_BUFFER_BYTES],
 }
 
@@ -120,18 +88,12 @@ struct TestState {
 impl Default for TestState {
     fn default() -> Self {
         Self {
-            parked: [ParkedPeer::default(); 2],
             user_memory: [0; crate::ipc::MAX_BUFFER_BYTES],
         }
     }
 }
-
 #[cfg(test)]
 static TEST_STATE: Mutex<TestState> = Mutex::new(TestState {
-    parked: [ParkedPeer {
-        status: None,
-        failed: None,
-    }; 2],
     user_memory: [0; crate::ipc::MAX_BUFFER_BYTES],
 });
 
@@ -153,26 +115,6 @@ impl Platform for TestPlatform {
         true
     }
 
-    fn mark_ipc_cancelled(&self, domain: DomainToken) -> bool {
-        let mut state = TEST_STATE.lock();
-        let parked = &mut state.parked[domain.slot().index()];
-        if let Some(_status @ (TestStatus::Sent | TestStatus::Received)) = parked.status {
-            parked.status = Some(TestStatus::Cancelled);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn mark_ipc_peer_failed(&self, domain: DomainToken) {
-        let mut state = TEST_STATE.lock();
-        let parked = &mut state.parked[domain.slot().index()];
-        if matches!(parked.status, Some(TestStatus::Sent | TestStatus::Received)) {
-            parked.status = Some(TestStatus::Faulted);
-        }
-        parked.failed = Some(domain);
-    }
-
     fn ev_ipc_op(&self, _id: u64, _generation: u64, _operation: &str, _status: &str) {}
 }
 
@@ -180,6 +122,7 @@ impl Platform for TestPlatform {
 pub(crate) fn reset_for_test() {
     install(&TestPlatform);
     *TEST_STATE.lock() = TestState::default();
+    crate::domains::reset_wait_state_for_test();
 }
 
 #[cfg(test)]
@@ -189,18 +132,15 @@ pub(crate) fn set_user_memory_for_test(payload: [u8; crate::ipc::MAX_BUFFER_BYTE
 
 #[cfg(test)]
 pub(crate) fn park_peer_for_test(domain: DomainToken, status: &str) -> bool {
-    let status = match status {
-        "sent" => TestStatus::Sent,
-        "received" => TestStatus::Received,
-        _ => return false,
-    };
-    TEST_STATE.lock().parked[domain.slot().index()].status = Some(status);
-    true
+    crate::domains::park_ipc_peer_for_test(domain, status)
 }
 
 #[cfg(test)]
 pub(crate) fn peer_status_for_test(domain: DomainToken) -> Option<&'static str> {
-    TEST_STATE.lock().parked[domain.slot().index()]
-        .status
-        .map(TestStatus::name)
+    crate::domains::ipc_peer_status_for_test(domain)
+}
+
+#[cfg(test)]
+pub(crate) fn peer_parked_for_test(domain: DomainToken) -> bool {
+    crate::domains::ipc_peer_parked_for_test(domain)
 }

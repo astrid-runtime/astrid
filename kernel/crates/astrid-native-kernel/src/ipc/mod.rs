@@ -10,9 +10,9 @@ mod copy;
 mod endpoint;
 mod error;
 #[cfg(test)]
-pub(crate) mod test_support;
-#[cfg(test)]
 mod revoke_tests;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use core::num::NonZeroU64;
 
@@ -361,7 +361,7 @@ fn dispatch(
         abi::Operation::Recv => recv(frame, domain),
         abi::Operation::Cancel => {
             let endpoint_cancelled = cancel_waiter(domain);
-            let parked_cancelled = platform::current().mark_ipc_cancelled(domain);
+            let parked_cancelled = crate::domains::mark_ipc_cancelled(domain);
             let running_cancel =
                 !(endpoint_cancelled || parked_cancelled) && domain_has_capability(domain);
             let cancelled = endpoint_cancelled || parked_cancelled || running_cancel;
@@ -595,7 +595,7 @@ fn cap_revoke(frame: &TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcE
     }
     drop(state);
     for wake in wakes.into_iter().flatten() {
-        platform::current().mark_ipc_peer_failed(wake);
+        crate::domains::mark_ipc_peer_failed_terminal(wake);
     }
     Ok((0, removed_count as u64))
 }

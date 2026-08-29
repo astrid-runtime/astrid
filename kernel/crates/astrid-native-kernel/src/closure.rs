@@ -64,7 +64,7 @@ static AUTHENTICATED_COMPONENT: Mutex<Option<ComponentBytes>> = Mutex::new(None)
 
 /// Values accepted only after both the root handoff and closure table verify.
 #[derive(Clone, Copy)]
-pub(super) struct AcceptedClosure {
+pub struct AcceptedClosure {
     handoff: AuthenticatedPolicyHandoff,
     bound: BoundIdentities,
     kernel_image: MeasuredIdentity,
@@ -77,28 +77,28 @@ pub(super) struct AcceptedClosure {
 }
 
 impl AcceptedClosure {
-    pub(super) const fn handoff(&self) -> AuthenticatedPolicyHandoff {
+    pub const fn handoff(&self) -> AuthenticatedPolicyHandoff {
         self.handoff
     }
 
-    pub(super) const fn bound(&self) -> BoundIdentities {
+    pub const fn bound(&self) -> BoundIdentities {
         self.bound
     }
 
-    pub(super) const fn kernel_image(&self) -> MeasuredIdentity {
+    pub const fn kernel_image(&self) -> MeasuredIdentity {
         self.kernel_image
     }
 
-    pub(super) const fn closure_table(&self) -> MeasuredIdentity {
+    pub const fn closure_table(&self) -> MeasuredIdentity {
         self.closure_table
     }
 
-    pub(super) const fn component(&self) -> &[u8; EMULATOR_COMPONENT_LEN] {
+    pub const fn component(&self) -> &[u8; EMULATOR_COMPONENT_LEN] {
         &self.component_payload
     }
 }
 
-pub(super) fn bind_component(bytes: &[u8; EMULATOR_COMPONENT_LEN]) -> bool {
+pub fn bind_component(bytes: &[u8; EMULATOR_COMPONENT_LEN]) -> bool {
     let identity = ContentId::from_payload(bytes);
     let components = emulator_components();
     if components.count() != 1 || components.digest(0) != Some(identity) {
@@ -108,17 +108,17 @@ pub(super) fn bind_component(bytes: &[u8; EMULATOR_COMPONENT_LEN]) -> bool {
     true
 }
 
-pub(super) fn authenticated_component() -> ComponentBytes {
+pub fn authenticated_component() -> ComponentBytes {
     AUTHENTICATED_COMPONENT
         .lock()
         .expect("authenticated component is present")
 }
 
-pub(super) fn authenticated_component_id() -> ContentId {
+pub fn authenticated_component_id() -> ContentId {
     ContentId::from_payload(&authenticated_component())
 }
 
-pub(super) fn accept(boot_info: &BootInfo) -> Result<AcceptedClosure, ClosureError> {
+pub fn accept(boot_info: &BootInfo) -> Result<AcceptedClosure, ClosureError> {
     let mut bundle = [0u8; RAMDISK_BUNDLE_LEN];
     copy_ramdisk(boot_info, &mut bundle)?;
 
@@ -197,17 +197,14 @@ pub(super) fn accept(boot_info: &BootInfo) -> Result<AcceptedClosure, ClosureErr
 /// Copy the accepted descriptor into a caller-owned kernel buffer before any
 /// manifest parsing. The source was already copied out of loader memory by
 /// [`accept`], and the destination remains independent of the ramdisk alias.
-pub(super) fn copy_system_generation(
-    accepted: &AcceptedClosure,
-    destination: &mut [u8; MANIFEST_LEN],
-) {
+pub fn copy_system_generation(accepted: &AcceptedClosure, destination: &mut [u8; MANIFEST_LEN]) {
     destination.copy_from_slice(&accepted.sysgen_payload);
 }
 
 /// Build the ring-0 trusted input exclusively from authenticated handoff data
 /// and compiled emulator fixture values. Manifest fields never populate this
 /// policy boundary.
-pub(super) fn trusted_system_generation_input(
+pub fn trusted_system_generation_input(
     accepted: &AcceptedClosure,
 ) -> Result<TrustedInput, GenerationError> {
     let kernel_identity = ContentId::try_from_bytes(accepted.kernel_image.as_bytes())?;

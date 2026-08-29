@@ -1,5 +1,6 @@
 //! On-CPU parking, typed wakeup, and the private IPC trap bridge.
 
+#[cfg(not(test))]
 use core::sync::atomic::Ordering;
 
 use spin::Mutex;
@@ -18,11 +19,13 @@ use super::types::{DomainGeneration, DomainHandle, DomainId, KERNEL_STACK_TOP};
 #[cfg(not(test))]
 use crate::gdt;
 use crate::ipc;
+#[cfg(not(test))]
 use crate::serial;
+#[cfg(not(test))]
 use crate::trap::TrapFrame;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum BlockStatus {
+pub enum BlockStatus {
     Sent,
     Received,
     Cancelled,
@@ -62,7 +65,7 @@ static COPY_SCRATCH: Mutex<[u8; 96]> = Mutex::new([0; 96]);
 static PENDING_COMPLETION: Mutex<Option<CompletionRequest>> = Mutex::new(None);
 
 #[cfg(not(test))]
-pub(super) fn current_handle() -> DomainHandle {
+pub fn current_handle() -> DomainHandle {
     DomainHandle::new(
         DomainId(CURRENT.slot.load(Ordering::SeqCst)),
         DomainGeneration(CURRENT.generation.load(Ordering::SeqCst)),
@@ -70,7 +73,7 @@ pub(super) fn current_handle() -> DomainHandle {
 }
 
 #[cfg(not(test))]
-pub(super) fn park_current(frame: &mut TrapFrame, status: BlockStatus) -> ! {
+pub fn park_current(frame: &mut TrapFrame, status: BlockStatus) -> ! {
     let handle = current_handle();
     let slot = handle.id().value() as usize;
     let parked = ParkedDomain {
@@ -117,7 +120,7 @@ fn set_domain_blocked(handle: DomainHandle) -> Result<(), ()> {
     Ok(())
 }
 
-pub(super) fn mark_ipc_ready(handle: DomainHandle, status: BlockStatus) {
+pub fn mark_ipc_ready(handle: DomainHandle, status: BlockStatus) {
     let mut parked_domains = PARKED.lock();
     if let Some(parked) = parked_domains[handle.id().value() as usize].as_mut()
         && parked.handle == handle
@@ -126,7 +129,7 @@ pub(super) fn mark_ipc_ready(handle: DomainHandle, status: BlockStatus) {
     }
 }
 
-pub(super) fn mark_ipc_cancelled(domain: ipc::DomainToken) -> bool {
+pub fn mark_ipc_cancelled(domain: ipc::DomainToken) -> bool {
     let Some(handle) = domain_handle_token(domain) else {
         return false;
     };
@@ -140,7 +143,7 @@ pub(super) fn mark_ipc_cancelled(domain: ipc::DomainToken) -> bool {
     cancelled
 }
 
-pub(crate) fn clear_parked(handle: DomainHandle) {
+pub fn clear_parked(handle: DomainHandle) {
     let mut parked_domains = PARKED.lock();
     if parked_domains[handle.id().value() as usize]
         .as_ref()
@@ -150,7 +153,7 @@ pub(crate) fn clear_parked(handle: DomainHandle) {
     }
 }
 
-pub(super) fn mark_ipc_peer_failed(handle: DomainHandle) {
+pub fn mark_ipc_peer_failed(handle: DomainHandle) {
     let mut parked_domains = PARKED.lock();
     if let Some(parked) = parked_domains[handle.id().value() as usize].as_mut()
         && parked.handle == handle
@@ -160,7 +163,7 @@ pub(super) fn mark_ipc_peer_failed(handle: DomainHandle) {
     }
 }
 
-pub(crate) fn mark_ipc_peer_failed_domain(domain: crate::ipc::DomainToken) -> bool {
+pub fn mark_ipc_peer_failed_domain(domain: crate::ipc::DomainToken) -> bool {
     let Some(handle) = domain_handle_token(domain) else {
         return false;
     };
@@ -168,8 +171,41 @@ pub(crate) fn mark_ipc_peer_failed_domain(domain: crate::ipc::DomainToken) -> bo
     true
 }
 
+/// Mark a parked IPC peer terminal and hand it back to the production waiter.
+///
+/// On the freestanding target this reaches the real resume path; on host tests
+/// the same function validates the visible `PARKED` and `MANAGER` transition.
+pub fn mark_ipc_peer_failed_terminal(domain: crate::ipc::DomainToken) -> bool {
+    let Some(handle) = domain_handle_token(domain) else {
+        return false;
+    };
+    mark_ipc_peer_failed(handle);
+    #[cfg(not(test))]
+    {
+        matches!(resume_blocked(handle), Err(()) | Ok(()))
+    }
+    #[cfg(test)]
+    {
+        let resumed = {
+            let mut manager = super::manager::MANAGER.lock();
+            let mut resumed = false;
+            if let Some(domain) = manager.valid_domain_mut(handle)
+                && domain.state == super::manager::DomainState::Blocked
+            {
+                domain.state = super::manager::DomainState::Running;
+                resumed = true;
+            }
+            resumed
+        };
+        if resumed {
+            clear_parked(handle);
+        }
+        resumed
+    }
+}
+
 #[cfg(not(test))]
-pub(crate) fn resume_blocked(handle: DomainHandle) -> Result<(), ()> {
+pub fn resume_blocked(handle: DomainHandle) -> Result<(), ()> {
     let Some(parked) = PARKED.lock()[handle.id().value() as usize] else {
         return Err(());
     };
@@ -331,7 +367,7 @@ extern "C" fn resume_user(frame: usize, root: u64) -> ! {
     );
 }
 
-pub(crate) fn prepare_ipc(domain_slot: u64, generation: u64) -> bool {
+pub fn prepare_ipc(domain_slot: u64, generation: u64) -> bool {
     let Some(domain) = ipc::DomainToken::new(domain_slot, generation) else {
         return false;
     };
@@ -339,18 +375,18 @@ pub(crate) fn prepare_ipc(domain_slot: u64, generation: u64) -> bool {
     true
 }
 
-pub(super) fn ipc_domain_token(handle: DomainHandle) -> Option<ipc::DomainToken> {
+pub fn ipc_domain_token(handle: DomainHandle) -> Option<ipc::DomainToken> {
     ipc::DomainToken::new(handle.id().value(), handle.generation().value())
 }
 
-pub(super) fn domain_handle_token(domain: ipc::DomainToken) -> Option<DomainHandle> {
+pub fn domain_handle_token(domain: ipc::DomainToken) -> Option<DomainHandle> {
     Some(DomainHandle::new(
         DomainId(domain.slot().index() as u64),
         DomainGeneration(domain.generation().get()),
     ))
 }
 
-pub(crate) fn bind_ipc_peer(
+pub fn bind_ipc_peer(
     creator_slot: u64,
     creator_generation: u64,
     peer_slot: u64,
@@ -365,7 +401,7 @@ pub(crate) fn bind_ipc_peer(
     ipc::bind_peer(creator, peer).is_ok()
 }
 
-pub(crate) fn release_ipc(domain_slot: u64, generation: u64) -> ipc::TeardownOutcome {
+pub fn release_ipc(domain_slot: u64, generation: u64) -> ipc::TeardownOutcome {
     let Some(domain) = ipc::DomainToken::new(domain_slot, generation) else {
         return ipc::TeardownOutcome::EMPTY;
     };
@@ -373,7 +409,7 @@ pub(crate) fn release_ipc(domain_slot: u64, generation: u64) -> ipc::TeardownOut
 }
 
 #[cfg(not(test))]
-pub(crate) fn copy_current_user(address: u64, buffer: &mut [u8], to_user: bool) -> bool {
+pub fn copy_current_user(address: u64, buffer: &mut [u8], to_user: bool) -> bool {
     if !CURRENT.active.load(Ordering::SeqCst) {
         return false;
     }
@@ -474,10 +510,10 @@ extern "C" fn copy_in_kernel_context(
 }
 
 #[cfg(test)]
-pub(crate) mod test_support {
+pub mod test_support {
     use super::*;
 
-    pub(crate) fn park(
+    pub fn park(
         handle: DomainHandle,
         status: BlockStatus,
         user_buffer: u64,
@@ -496,103 +532,31 @@ pub(crate) mod test_support {
         });
     }
 
-    pub(crate) fn status(handle: DomainHandle) -> Option<BlockStatus> {
+    pub fn status(handle: DomainHandle) -> Option<BlockStatus> {
         PARKED.lock()[handle.id().value() as usize]
             .as_ref()
             .filter(|parked| parked.handle == handle)
             .map(|parked| parked.status)
     }
 
-    pub(crate) fn parked(handle: DomainHandle) -> bool {
+    pub fn parked(handle: DomainHandle) -> bool {
         PARKED.lock()[handle.id().value() as usize]
             .as_ref()
             .is_some_and(|parked| parked.handle == handle)
     }
 
-    pub(crate) fn reset() {
+    pub fn reset() {
         *PARKED.lock() = [None, None];
         *PENDING_COMPLETION.lock() = None;
     }
 
-    pub(crate) fn status_name(handle: DomainHandle) -> Option<&'static str> {
+    pub fn status_name(handle: DomainHandle) -> Option<&'static str> {
         status(handle).map(BlockStatus::as_name)
     }
 
-    pub(crate) fn all_statuses() -> [Option<BlockStatus>; 2] {
+    pub fn all_statuses() -> [Option<BlockStatus>; 2] {
         PARKED
             .lock()
             .map(|parked| parked.map(|parked| parked.status))
-    }
-}
-
-#[cfg(any())]
-mod removed_tests {
-    use super::test_support::{all_statuses, park, reset, status};
-    use super::*;
-    use crate::ipc::test_support::{endpoint_create, install_transfer_message, reset as reset_ipc};
-    use crate::ipc::{DomainToken, bind_peer, prepare_domain, teardown_domain};
-    use crate::test_lock::LOCK;
-
-    fn token(slot: u64) -> DomainToken {
-        DomainToken::new(slot, 1).unwrap()
-    }
-
-    fn handle(slot: u64) -> DomainHandle {
-        DomainHandle::new(DomainId(slot), DomainGeneration(1))
-    }
-
-    #[test]
-    fn peer_failure_terminals_are_sent_and_received() {
-        let _guard = LOCK.lock();
-        reset();
-        reset_ipc();
-        park(handle(0), BlockStatus::Sent, 0, 0, 96);
-        park(handle(1), BlockStatus::Received, 0, 0, 96);
-        mark_ipc_peer_failed(handle(0));
-        mark_ipc_peer_failed(handle(1));
-        assert_eq!(
-            all_statuses(),
-            [Some(BlockStatus::Faulted), Some(BlockStatus::Faulted)]
-        );
-    }
-
-    #[test]
-    fn sender_teardown_reports_and_fails_parked_sent_sender() {
-        let _guard = LOCK.lock();
-        reset();
-        reset_ipc();
-        let sender = token(0);
-        let receiver = token(1);
-        prepare_domain(sender);
-        prepare_domain(receiver);
-        let endpoint = endpoint_create(sender).unwrap();
-        assert!(bind_peer(sender, receiver).is_ok());
-        assert!(crate::ipc::test_support::park_member(receiver));
-        park(handle(1), BlockStatus::Received, 0, 0, 96);
-        assert!(install_transfer_message(receiver, sender, endpoint, None));
-        let outcome = teardown_domain(sender);
-        assert_eq!(outcome.queued_messages, 1);
-        assert!(outcome.peer_failures.contains(&Some(receiver)));
-    }
-
-    #[test]
-    fn receiver_teardown_finds_parked_sent_sender_without_waiter() {
-        let _guard = LOCK.lock();
-        reset();
-        reset_ipc();
-        let sender = token(0);
-        let receiver = token(1);
-        prepare_domain(sender);
-        prepare_domain(receiver);
-        let endpoint = endpoint_create(sender).unwrap();
-        assert!(bind_peer(sender, receiver).is_ok());
-        assert!(crate::ipc::test_support::park_member(receiver));
-        park(handle(1), BlockStatus::Received, 0, 0, 96);
-        assert!(install_transfer_message(receiver, sender, endpoint, None));
-        park(handle(0), BlockStatus::Sent, 0, 0, 96);
-        let outcome = teardown_domain(receiver);
-        assert_eq!(outcome.peer_failures, [Some(sender), None]);
-        mark_ipc_peer_failed(handle(0));
-        assert_eq!(status(handle(0)), Some(BlockStatus::Faulted));
     }
 }
