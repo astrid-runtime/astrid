@@ -6,8 +6,9 @@ use super::projection::{
 };
 use super::types::{
     AuthorityObject, CapabilityGeneration, CapabilityInstance, CapabilitySlot, DELTA_RING_ENTRIES,
-    DomainProjectionToken, ObjectKind, ObjectRef, ObjectToken, ProjectionError, RELATION_PAGE_ROWS,
-    ReclaimOutcome, Relation, RelationChange, RelationKey, RelationRights,
+    DomainProjectionToken, MAX_RELATION_ROWS, ObjectKind, ObjectRef, ObjectToken, ProjectionError,
+    RELATION_PAGE_ROWS, ReaderIdentity, ReclaimOutcome, Relation, RelationChange, RelationKey,
+    RelationRights,
 };
 use crate::ipc::DomainToken;
 
@@ -33,12 +34,19 @@ fn object(kind: ObjectKind, value: u64) -> ObjectRef {
     ObjectRef::new(kind, token(value))
 }
 
-fn capability(lease: ReaderLease, slot: usize, generation_value: u64) -> CapabilityInstance {
-    CapabilityInstance::new(
+fn capability(
+    lease: ReaderLease,
+    slot: usize,
+    generation_value: u64,
+    object_value: u64,
+) -> CapabilityInstance {
+    CapabilityInstance::try_new(
         lease.token(),
         CapabilitySlot::try_new(slot).unwrap(),
+        object(ObjectKind::Endpoint, object_value),
         generation(generation_value),
     )
+    .unwrap()
 }
 
 fn object_relation(scope: DomainProjectionToken, kind: ObjectKind, value: u64) -> Relation {
@@ -53,10 +61,27 @@ fn holds_relation(
 ) -> Relation {
     Relation::holds(
         lease.token(),
-        capability(lease, slot, generation_value),
+        capability(lease, slot, generation_value, object_value),
         object(ObjectKind::Endpoint, object_value),
         RelationRights::SEND,
     )
+    .unwrap()
+}
+
+fn hold_with_rights(
+    lease: ReaderLease,
+    slot: usize,
+    generation_value: u64,
+    object_value: u64,
+    rights: RelationRights,
+) -> Relation {
+    Relation::holds(
+        lease.token(),
+        capability(lease, slot, generation_value, object_value),
+        object(ObjectKind::Endpoint, object_value),
+        rights,
+    )
+    .unwrap()
 }
 
 fn derive_relation(
@@ -64,7 +89,7 @@ fn derive_relation(
     parent: CapabilityInstance,
     child: CapabilityInstance,
 ) -> Relation {
-    Relation::derives(lease.token(), parent, child)
+    Relation::derives(lease.token(), parent, child).unwrap()
 }
 
 fn apply_one(store: &mut ProjectionStore, lease: ReaderLease, relation: Relation) {
@@ -145,7 +170,7 @@ fn object_capability_and_endpoint_tables_project_without_message_rows() {
         held.key(),
         RelationKey::Holds {
             scope: second.token(),
-            capability: capability(second, 3, 7),
+            capability: capability(second, 3, 7, 11),
             object: object(ObjectKind::Endpoint, 11),
         }
     );
@@ -159,10 +184,10 @@ fn relation_identities_use_full_capability_instances_across_reuse() {
     let mut store = store();
     let source = reader(&mut store, 0, 1);
     let target = reader(&mut store, 1, 1);
-    let parent_a = capability(source, 3, 5);
-    let parent_b = capability(source, 3, 6);
-    let child_a = capability(target, 3, 7);
-    let child_b = capability(target, 3, 8);
+    let parent_a = capability(source, 3, 5, 20);
+    let parent_b = capability(source, 3, 6, 20);
+    let child_a = capability(target, 3, 7, 20);
+    let child_b = capability(target, 3, 8, 20);
 
     apply_one(
         &mut store,
@@ -231,7 +256,7 @@ fn epochs_are_projection_local_and_batches_advance_exactly_once() {
     let mut store = store();
     let first = reader(&mut store, 0, 1);
     let second = reader(&mut store, 1, 1);
-    let child = capability(first, 1, 2);
+    let child = capability(first, 1, 2, 2);
 
     let mut batch = AuthoritativeBatch::empty();
     for relation in [
@@ -266,6 +291,118 @@ fn epochs_are_projection_local_and_batches_advance_exactly_once() {
 }
 
 #[test]
+fn batch_fold_applies_every_visible_change_at_one_projection_epoch() {
+    let mut store = store();
+    let lease = reader(&mut store, 0, 1);
+    let parent = capability(lease, 1, 4, 10);
+    let child = capability(lease, 2, 5, 10);
+
+    let mut batch = AuthoritativeBatch::empty();
+    batch
+        .push(RelationMutation::new(
+            lease,
+            RelationChange::Upsert(object_relation(lease.token(), ObjectKind::Endpoint, 10)),
+        ))
+        .unwrap();
+    batch
+        .push(RelationMutation::new(
+            lease,
+            RelationChange::Upsert(holds_relation(lease, 1, 4, 10)),
+        ))
+        .unwrap();
+    batch
+        .push(RelationMutation::new(
+            lease,
+            RelationChange::Upsert(derive_relation(lease, parent, child)),
+        ))
+        .unwrap();
+
+    let (base, cursor) = fold_base(&mut store, lease);
+    assert_eq!(store.apply(batch).unwrap(), 3);
+    assert_eq!(store.relation_epoch(lease).unwrap(), 1);
+    assert_eq!(store.snapshot(lease).unwrap().len(), 3);
+    assert_eq!(
+        store.fold(lease, base, cursor).unwrap(),
+        store.snapshot(lease).unwrap()
+    );
+}
+
+#[test]
+fn cursors_cannot_move_between_readers_with_the_same_generation() {
+    let mut store = store();
+    let first = reader(&mut store, 0, 1);
+    let second = reader(&mut store, 1, 1);
+    let first_base = store.base_snapshot(first).unwrap();
+    let second_base = store.base_snapshot(second).unwrap();
+
+    apply_one(
+        &mut store,
+        first,
+        object_relation(first.token(), ObjectKind::Endpoint, 1),
+    );
+    assert_eq!(
+        store
+            .fold(first, first_base, store.delta_cursor(second).unwrap())
+            .unwrap_err(),
+        ProjectionError::ResnapshotRequired
+    );
+    assert_eq!(
+        store
+            .snapshot_page(first, store.page_cursor(second, 0).unwrap())
+            .unwrap_err(),
+        ProjectionError::ResnapshotRequired
+    );
+    assert!(
+        store
+            .fold(second, second_base, store.delta_cursor(second).unwrap())
+            .is_ok()
+    );
+}
+
+#[test]
+fn generation_reuse_retires_rows_without_leaving_them_in_capacity() {
+    let mut store = store();
+    let old = reader(&mut store, 0, 1);
+    let live = reader(&mut store, 1, 1);
+    apply_one(
+        &mut store,
+        old,
+        object_relation(old.token(), ObjectKind::Endpoint, 1),
+    );
+    apply_one(
+        &mut store,
+        live,
+        object_relation(live.token(), ObjectKind::Domain, 2),
+    );
+
+    let fresh = reader(&mut store, 0, 2);
+    assert_eq!(store.retired_delete_count(0), 1);
+    assert_eq!(
+        store.snapshot(old).unwrap_err(),
+        ProjectionError::ResnapshotRequired
+    );
+    assert_eq!(store.snapshot(live).unwrap().len(), 1);
+
+    apply_change(
+        &mut store,
+        live,
+        RelationChange::Delete(object_relation(live.token(), ObjectKind::Domain, 2).key()),
+    )
+    .unwrap();
+
+    for value in 0..MAX_RELATION_ROWS {
+        apply_one(
+            &mut store,
+            fresh,
+            holds_relation(fresh, 1, 7, value as u64 + 3),
+        );
+    }
+    let final_base = store.base_snapshot(fresh).unwrap();
+    assert_eq!(final_base.len(), MAX_RELATION_ROWS);
+    assert_eq!(store.snapshot(fresh).unwrap().len(), MAX_RELATION_ROWS);
+}
+
+#[test]
 fn epoch_overflow_fails_closed_and_does_not_wrap() {
     let mut store = store();
     let lease = reader(&mut store, 0, 1);
@@ -293,6 +430,7 @@ fn apply_one_or_error(
 fn deterministic_fold_equals_direct_snapshot_and_rejects_bad_cursors() {
     let mut store = store();
     let lease = reader(&mut store, 0, 1);
+    let other = reader(&mut store, 1, 1);
     apply_one(
         &mut store,
         lease,
@@ -318,7 +456,7 @@ fn deterministic_fold_equals_direct_snapshot_and_rejects_bad_cursors() {
 
     assert_eq!(
         store
-            .fold(lease, base, DeltaCursor::new(lease.reader_generation(), 0))
+            .fold(lease, base, store.delta_cursor(other).unwrap())
             .unwrap_err(),
         ProjectionError::ResnapshotRequired
     );
@@ -327,7 +465,10 @@ fn deterministic_fold_equals_direct_snapshot_and_rejects_bad_cursors() {
             .fold(
                 lease,
                 base,
-                DeltaCursor::new(lease.reader_generation() + 1, base.epoch())
+                DeltaCursor::new(
+                    ReaderIdentity::new(0, lease.reader_generation() + 1, lease.token()).unwrap(),
+                    base.epoch()
+                )
             )
             .unwrap_err(),
         ProjectionError::ResnapshotRequired
@@ -342,7 +483,12 @@ fn delta_ring_overflow_requires_a_new_base_and_then_resumes() {
     apply_one(&mut store, lease, relation);
 
     for epoch in 2..=(DELTA_RING_ENTRIES + 2) {
-        apply_one(&mut store, lease, relation);
+        let rights = if epoch % 2 == 0 {
+            RelationRights::RECV
+        } else {
+            RelationRights::SEND
+        };
+        apply_one(&mut store, lease, hold_with_rights(lease, 1, 9, 1, rights));
         assert_eq!(store.relation_epoch(lease).unwrap(), epoch as u64);
     }
     assert_eq!(
@@ -394,12 +540,16 @@ fn delete_is_once_and_reclaim_failure_cannot_resurrect() {
 
     assert!(
         store
-            .record_reclaim(lease, token(7), ReclaimOutcome::ReleaseFailed)
+            .record_reclaim(
+                lease,
+                object(ObjectKind::Endpoint, 7),
+                ReclaimOutcome::ReleaseFailed,
+            )
             .unwrap()
     );
     assert_eq!(
         store
-            .reclaim_observation(lease, token(7))
+            .reclaim_observation(lease, object(ObjectKind::Endpoint, 7))
             .unwrap()
             .outcome(),
         ReclaimOutcome::ReleaseFailed
@@ -408,7 +558,136 @@ fn delete_is_once_and_reclaim_failure_cannot_resurrect() {
         apply_one_or_error(&mut store, lease, object_row),
         Err(ProjectionError::Resurrection)
     );
+    assert_eq!(
+        apply_one_or_error(&mut store, lease, hold),
+        Err(ProjectionError::Resurrection)
+    );
     assert!(store.snapshot(lease).unwrap().is_empty());
+}
+
+#[test]
+fn logical_deletion_is_a_tombstone_distinct_from_reclaim() {
+    let mut store = store();
+    let lease = reader(&mut store, 0, 1);
+    let relation = object_relation(lease.token(), ObjectKind::Endpoint, 12);
+    apply_one(&mut store, lease, relation);
+    apply_change(&mut store, lease, RelationChange::Delete(relation.key())).unwrap();
+
+    assert_eq!(
+        apply_one_or_error(&mut store, lease, relation),
+        Err(ProjectionError::Resurrection)
+    );
+    assert!(
+        store
+            .record_reclaim(
+                lease,
+                object(ObjectKind::Endpoint, 12),
+                ReclaimOutcome::ReleaseFailed,
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+fn derives_and_reclaim_carry_object_kind_identity() {
+    let mut store = store();
+    let lease = reader(&mut store, 0, 1);
+    let parent = capability(lease, 1, 4, 14);
+    let child = capability(lease, 2, 5, 14);
+    let derivation = derive_relation(lease, parent, child);
+    apply_one(&mut store, lease, derivation);
+    apply_change(&mut store, lease, RelationChange::Delete(derivation.key())).unwrap();
+
+    assert!(
+        store
+            .record_reclaim(
+                lease,
+                object(ObjectKind::Endpoint, 14),
+                ReclaimOutcome::ReclaimBlocked,
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        apply_one_or_error(&mut store, lease, derivation),
+        Err(ProjectionError::Resurrection)
+    );
+
+    let domain_lease = reader(&mut store, 1, 1);
+    assert!(
+        store
+            .record_reclaim(
+                domain_lease,
+                object(ObjectKind::Domain, 15),
+                ReclaimOutcome::ReleaseFailed,
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        apply_one_or_error(
+            &mut store,
+            domain_lease,
+            object_relation(domain_lease.token(), ObjectKind::Domain, 15),
+        ),
+        Err(ProjectionError::Resurrection)
+    );
+    let endpoint_with_reused_number =
+        object_relation(domain_lease.token(), ObjectKind::Endpoint, 15);
+    apply_one(&mut store, domain_lease, endpoint_with_reused_number);
+}
+
+#[test]
+fn relation_constructors_enforce_scoped_capability_and_endpoint_identity() {
+    let mut store = store();
+    let first = reader(&mut store, 0, 1);
+    let second = reader(&mut store, 1, 1);
+
+    assert!(
+        CapabilityInstance::try_new(
+            first.token(),
+            CapabilitySlot::try_new(1).unwrap(),
+            object(ObjectKind::Domain, 1),
+            generation(2),
+        )
+        .is_none()
+    );
+    assert!(
+        Relation::holds(
+            first.token(),
+            capability(second, 1, 2, 3),
+            object(ObjectKind::Endpoint, 3),
+            RelationRights::SEND,
+        )
+        .is_none()
+    );
+    assert!(
+        Relation::holds(
+            first.token(),
+            capability(first, 1, 2, 3),
+            object(ObjectKind::Endpoint, 4),
+            RelationRights::SEND,
+        )
+        .is_none()
+    );
+    assert!(
+        Relation::holds(
+            first.token(),
+            capability(first, 1, 2, 3),
+            object(ObjectKind::Domain, 3),
+            RelationRights::SEND,
+        )
+        .is_none()
+    );
+
+    let foreign_child = capability(second, 2, 3, 3);
+    assert!(Relation::derives(first.token(), capability(first, 1, 2, 3), foreign_child).is_none());
+    assert!(
+        Relation::derives(
+            first.token(),
+            capability(first, 1, 2, 3),
+            capability(first, 2, 3, 4),
+        )
+        .is_none()
+    );
 }
 
 #[test]
@@ -421,19 +700,27 @@ fn reclaim_blocked_is_observable_after_logical_delete() {
 
     assert!(
         store
-            .record_reclaim(lease, token(8), ReclaimOutcome::ReclaimBlocked)
+            .record_reclaim(
+                lease,
+                object(ObjectKind::Endpoint, 8),
+                ReclaimOutcome::ReclaimBlocked,
+            )
             .unwrap()
     );
     assert_eq!(
         store
-            .reclaim_observation(lease, token(8))
+            .reclaim_observation(lease, object(ObjectKind::Endpoint, 8))
             .unwrap()
             .outcome(),
         ReclaimOutcome::ReclaimBlocked
     );
     assert!(
         !store
-            .record_reclaim(lease, token(8), ReclaimOutcome::ReclaimBlocked)
+            .record_reclaim(
+                lease,
+                object(ObjectKind::Endpoint, 8),
+                ReclaimOutcome::ReclaimBlocked,
+            )
             .unwrap()
     );
 }
@@ -488,33 +775,36 @@ fn pages_are_bounded_and_invalid_cursors_resnapshot() {
 
     let epoch = store.relation_epoch(lease).unwrap();
     let page0 = store
-        .snapshot_page(lease, PageCursor::new(1, epoch, 0))
+        .snapshot_page(lease, store.page_cursor(lease, 0).unwrap())
         .unwrap();
     assert_eq!(page0.len(), RELATION_PAGE_ROWS);
     assert!(page0.has_more());
     assert_canonical(&store.snapshot(lease).unwrap());
 
     let page1 = store
-        .snapshot_page(lease, PageCursor::new(1, epoch, 1))
+        .snapshot_page(lease, store.page_cursor(lease, 1).unwrap())
         .unwrap();
     assert_eq!(page1.len(), 4);
     assert!(!page1.has_more());
 
     assert_eq!(
         store
-            .snapshot_page(lease, PageCursor::new(2, epoch, 0))
+            .snapshot_page(lease, store.page_cursor(lease, 2).unwrap())
             .unwrap_err(),
         ProjectionError::ResnapshotRequired
     );
     assert_eq!(
         store
-            .snapshot_page(lease, PageCursor::new(1, epoch + 1, 0))
+            .snapshot_page(
+                lease,
+                PageCursor::new(store.page_cursor(lease, 0).unwrap().reader, epoch + 1, 0)
+            )
             .unwrap_err(),
         ProjectionError::ResnapshotRequired
     );
     assert_eq!(
         store
-            .snapshot_page(lease, PageCursor::new(1, epoch, 5))
+            .snapshot_page(lease, store.page_cursor(lease, 5).unwrap())
             .unwrap_err(),
         ProjectionError::ResnapshotRequired
     );

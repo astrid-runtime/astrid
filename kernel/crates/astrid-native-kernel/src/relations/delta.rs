@@ -1,39 +1,39 @@
 //! Canonical cursors and fixed-capacity delta records.
 
-use super::types::{DELTA_RING_ENTRIES, RelationChange};
+use super::types::{DELTA_RING_ENTRIES, ReaderIdentity, RelationChange};
 
 /// Canonical position from which a reader replay starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeltaCursor {
-    pub(crate) reader_generation: u64,
+    pub(crate) reader: ReaderIdentity,
     pub(crate) after_epoch: u64,
 }
 
 impl DeltaCursor {
-    pub const fn new(reader_generation: u64, after_epoch: u64) -> Self {
+    pub const fn new(reader: ReaderIdentity, after_epoch: u64) -> Self {
         Self {
-            reader_generation,
+            reader,
             after_epoch,
         }
     }
 
-    pub(crate) const fn matches(self, reader_generation: u64, after_epoch: u64) -> bool {
-        self.reader_generation == reader_generation && self.after_epoch == after_epoch
+    pub(crate) fn matches(self, reader: ReaderIdentity, after_epoch: u64) -> bool {
+        self.reader == reader && self.after_epoch == after_epoch
     }
 }
 
 /// Canonical page position. It is reader-generation checked by the projection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageCursor {
-    pub(crate) reader_generation: u64,
+    pub(crate) reader: ReaderIdentity,
     pub(crate) epoch: u64,
     pub(crate) page: u32,
 }
 
 impl PageCursor {
-    pub const fn new(reader_generation: u64, epoch: u64, page: u32) -> Self {
+    pub const fn new(reader: ReaderIdentity, epoch: u64, page: u32) -> Self {
         Self {
-            reader_generation,
+            reader,
             epoch,
             page,
         }

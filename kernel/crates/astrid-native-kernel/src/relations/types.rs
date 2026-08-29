@@ -30,6 +30,33 @@ impl DomainProjectionToken {
     }
 }
 
+/// The complete projection identity of a cursor's owner. The slot is kept
+/// alongside the kernel token so a token minting error can never collapse two
+/// readers onto one cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReaderIdentity {
+    domain_slot: u8,
+    domain_generation: NonZeroU64,
+    projection_token: DomainProjectionToken,
+}
+
+impl ReaderIdentity {
+    pub fn new(
+        domain_slot: usize,
+        domain_generation: u64,
+        projection_token: DomainProjectionToken,
+    ) -> Option<Self> {
+        if domain_slot > u8::MAX as usize {
+            return None;
+        }
+        Some(Self {
+            domain_slot: domain_slot as u8,
+            domain_generation: NonZeroU64::new(domain_generation)?,
+            projection_token,
+        })
+    }
+}
+
 /// Caller-known capability-table slot in the landed eight-slot domain table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CapabilitySlot(u8);
@@ -164,20 +191,26 @@ impl RelationRights {
 pub struct CapabilityInstance {
     domain: DomainProjectionToken,
     slot: CapabilitySlot,
+    object: ObjectRef,
     generation: CapabilityGeneration,
 }
 
 impl CapabilityInstance {
-    pub const fn new(
+    pub fn try_new(
         domain: DomainProjectionToken,
         slot: CapabilitySlot,
+        object: ObjectRef,
         generation: CapabilityGeneration,
-    ) -> Self {
-        Self {
+    ) -> Option<Self> {
+        if object.kind() != ObjectKind::Endpoint {
+            return None;
+        }
+        Some(Self {
             domain,
             slot,
+            object,
             generation,
-        }
+        })
     }
 
     pub const fn domain(self) -> DomainProjectionToken {
@@ -186,6 +219,10 @@ impl CapabilityInstance {
 
     pub const fn slot(self) -> CapabilitySlot {
         self.slot
+    }
+
+    pub const fn object(self) -> ObjectRef {
+        self.object
     }
 
     pub const fn generation(self) -> CapabilityGeneration {
@@ -220,11 +257,15 @@ impl RelationKey {
         }
     }
 
-    pub(crate) const fn object_tokens(self) -> [Option<ObjectToken>; 2] {
+    pub(crate) const fn object_refs(self) -> [Option<ObjectRef>; 3] {
         match self {
-            Self::Object { object, .. } => [Some(object.token()), None],
-            Self::Holds { object, .. } => [Some(object.token()), None],
-            Self::Derives { .. } => [None, None],
+            Self::Object { object, .. } => [Some(object), None, None],
+            Self::Holds {
+                capability, object, ..
+            } => [Some(object), Some(capability.object()), None],
+            Self::Derives { parent, child, .. } => {
+                [Some(parent.object()), Some(child.object()), None]
+            },
         }
     }
 }
@@ -250,35 +291,44 @@ impl Relation {
         }
     }
 
-    pub const fn holds(
+    pub fn holds(
         scope: DomainProjectionToken,
         capability: CapabilityInstance,
         object: ObjectRef,
         rights: RelationRights,
-    ) -> Self {
-        Self {
+    ) -> Option<Self> {
+        if capability.domain() != scope
+            || object.kind() != ObjectKind::Endpoint
+            || capability.object() != object
+        {
+            return None;
+        }
+        Some(Self {
             key: RelationKey::Holds {
                 scope,
                 capability,
                 object,
             },
             state: RelationState::Holds { rights },
-        }
+        })
     }
 
-    pub const fn derives(
+    pub fn derives(
         scope: DomainProjectionToken,
         parent: CapabilityInstance,
         child: CapabilityInstance,
-    ) -> Self {
-        Self {
+    ) -> Option<Self> {
+        if child.domain() != scope || parent.object() != child.object() {
+            return None;
+        }
+        Some(Self {
             key: RelationKey::Derives {
                 scope,
                 parent,
                 child,
             },
             state: RelationState::Derives,
-        }
+        })
     }
 
     pub const fn key(self) -> RelationKey {
@@ -314,16 +364,12 @@ pub enum ReclaimOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReclaimObservation {
     scope: DomainProjectionToken,
-    object: ObjectToken,
+    object: ObjectRef,
     outcome: ReclaimOutcome,
 }
 
 impl ReclaimObservation {
-    pub const fn new(
-        scope: DomainProjectionToken,
-        object: ObjectToken,
-        outcome: ReclaimOutcome,
-    ) -> Self {
+    pub fn new(scope: DomainProjectionToken, object: ObjectRef, outcome: ReclaimOutcome) -> Self {
         Self {
             scope,
             object,
@@ -336,6 +382,10 @@ impl ReclaimObservation {
     }
 
     pub const fn object(self) -> ObjectToken {
+        self.object.token()
+    }
+
+    pub const fn object_ref(self) -> ObjectRef {
         self.object
     }
 
