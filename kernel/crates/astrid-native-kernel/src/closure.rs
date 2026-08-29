@@ -10,12 +10,12 @@ use astrid_native_closure::{
     verify_policy_handoff, verify_table,
 };
 use astrid_system_generation::emulator_fixture::{
-    EMULATOR_CLOSURE_ROOT, EMULATOR_COMPONENT_LEN as FIXTURE_COMPONENT_LEN,
-    EMULATOR_GENERATION_FLOOR, EMULATOR_MANIFEST_SIZES, EMULATOR_NOW_UNIX_SECONDS,
-    EMULATOR_OBJECT_ROOT, EMULATOR_PLAN_DIGEST, emulator_components,
+    EMULATOR_CLOSURE_ROOT, EMULATOR_GENERATION_FLOOR, EMULATOR_MANIFEST_SIZES,
+    EMULATOR_NOW_UNIX_SECONDS, EMULATOR_OBJECT_ROOT, EMULATOR_PLAN_DIGEST, emulator_components,
 };
 use astrid_system_generation::{
     ContentId, Generation, GenerationError, MANIFEST_LEN, TrustedInput, TrustedInputData,
+    VerifiedGeneration,
 };
 use bootloader_api::BootInfo;
 use bootloader_api::info::LoaderHandoffVerification;
@@ -43,7 +43,6 @@ const _: () = {
 pub const RAMDISK_BUNDLE_LEN: usize =
     HANDOFF_LEN + TABLE_LEN + MANIFEST_LEN + EMULATOR_COMPONENT_LEN;
 
-const _: () = assert!(EMULATOR_COMPONENT_LEN == FIXTURE_COMPONENT_LEN);
 const _: () = assert!(EMULATOR_COMPONENT_LEN == 517);
 
 /// Emulator fixture root public key corresponding to the explicit root seed
@@ -76,6 +75,35 @@ pub struct AcceptedClosure {
     component_payload: [u8; EMULATOR_COMPONENT_LEN],
 }
 
+/// A verified generation and the one component admitted from its component
+/// set. This is the only ring-0 bridge between manifest verification and
+/// native-domain admission; its fields stay private so a handle can never be
+/// relabeled after admission.
+#[derive(Clone, Copy)]
+pub struct AdmittedGeneration {
+    verified: VerifiedGeneration,
+    component: ComponentBytes,
+    component_id: ContentId,
+}
+
+impl AdmittedGeneration {
+    pub const fn verified_generation(&self) -> VerifiedGeneration {
+        self.verified
+    }
+
+    pub const fn manifest_identity(&self) -> astrid_system_generation::ManifestIdentity {
+        self.verified.manifest_identity()
+    }
+
+    pub const fn component(&self) -> &ComponentBytes {
+        &self.component
+    }
+
+    pub const fn component_id(&self) -> ContentId {
+        self.component_id
+    }
+}
+
 impl AcceptedClosure {
     pub const fn handoff(&self) -> AuthenticatedPolicyHandoff {
         self.handoff
@@ -98,14 +126,21 @@ impl AcceptedClosure {
     }
 }
 
-pub fn bind_component(bytes: &[u8; EMULATOR_COMPONENT_LEN]) -> bool {
+pub fn admit_component(
+    verified: VerifiedGeneration,
+    bytes: &[u8; EMULATOR_COMPONENT_LEN],
+) -> Result<AdmittedGeneration, ClosureError> {
     let identity = ContentId::from_payload(bytes);
-    let components = emulator_components();
+    let components = verified.manifest().components();
     if components.count() != 1 || components.digest(0) != Some(identity) {
-        return false;
+        return Err(ClosureError::BindingMismatch);
     }
     *AUTHENTICATED_COMPONENT.lock() = Some(*bytes);
-    true
+    Ok(AdmittedGeneration {
+        verified,
+        component: *bytes,
+        component_id: identity,
+    })
 }
 
 pub fn authenticated_component() -> ComponentBytes {

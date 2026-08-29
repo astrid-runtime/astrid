@@ -3,6 +3,7 @@
 #[cfg(not(test))]
 use x86_64::registers::control::Cr3;
 
+mod admission;
 #[cfg(not(test))]
 mod harness;
 mod manager;
@@ -21,7 +22,17 @@ pub fn bind_kernel_cr3() {
 }
 
 #[cfg(not(test))]
-pub fn start_harness(raw: &[u8], expected: astrid_system_generation::ContentId) -> ! {
+pub fn start_harness(
+    raw: &[u8],
+    manifest_identity: astrid_system_generation::ManifestIdentity,
+    expected: astrid_system_generation::ContentId,
+) -> ! {
+    admission::install(manifest_identity, expected).unwrap_or_else(|error| {
+        crate::serial::ev_domain_auth_reject(error.as_reason());
+        crate::serial::ev_domain_harness(false);
+        crate::serial::ev_halt(false);
+        crate::serial::exit_qemu(false);
+    });
     manager::init_resume_stack();
     harness::start(raw, expected)
 }
