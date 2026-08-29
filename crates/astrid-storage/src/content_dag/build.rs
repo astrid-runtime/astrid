@@ -5,6 +5,7 @@ use crate::storage_model::{
     ReferenceLabel,
 };
 use fastcdc::v2020::{FastCDC, Normalization};
+use fastcdc_v4::v2020::{FastCDC as FastCDCV4, Normalization as NormalizationV4};
 
 use crate::content_dag::{
     CHUNK_TREE_FANOUT, CONTENT_LABEL, ChunkingProfile, ContentDescriptor, ContentError,
@@ -93,6 +94,33 @@ pub fn build_content<I: ObjectIdentity>(
                 &mut unique_chunks,
                 source,
             )?;
+        } else if profile.uses_legacy_fastcdc_v4() {
+            let chunker = FastCDCV4::with_level_and_seed(
+                source,
+                usize::try_from(profile.minimum_bytes())
+                    .map_err(|_| ContentError::LengthOverflow)?,
+                usize::try_from(profile.average_bytes())
+                    .map_err(|_| ContentError::LengthOverflow)?,
+                maximum,
+                NormalizationV4::Level1,
+                profile.gear_seed(),
+            );
+            for chunk in chunker {
+                let end = chunk
+                    .offset
+                    .checked_add(chunk.length)
+                    .ok_or(ContentError::LengthOverflow)?;
+                let bytes = source
+                    .get(chunk.offset..end)
+                    .ok_or(ContentError::LengthOverflow)?;
+                push_chunk(
+                    identity,
+                    &mut records,
+                    &mut chunks,
+                    &mut unique_chunks,
+                    bytes,
+                )?;
+            }
         } else {
             let chunker = FastCDC::with_level_and_seed(
                 source,

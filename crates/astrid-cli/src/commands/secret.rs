@@ -408,6 +408,43 @@ fn secret_key_from_entry(entry: EnvEntry) -> SecretKey {
     }
 }
 
+/// Outcome of one `EnvDelete` probe while sweeping agent then shared storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretDeleteProbe {
+    /// Kernel reported whether a value was removed from this scope.
+    Deleted(bool),
+    /// Shared-scope mutation was denied. Callers with only `self:env:write`
+    /// skip this probe so a successful agent-scoped delete can finish.
+    SharedUnauthorized,
+}
+
+/// Classify one `EnvDelete` response while sweeping agent then shared storage.
+///
+/// Shared-scope mutations require global `env:write`. `astrid secret delete`
+/// still probes Shared after Agent so an admin can remove both copies, but a
+/// caller who only holds `self:env:write` must not fail the whole command
+/// after a successful agent-scoped delete.
+fn classify_secret_delete_response(
+    scope: EnvStorageScope,
+    body: AdminResponseBody,
+) -> Result<SecretDeleteProbe> {
+    match body {
+        AdminResponseBody::Error(msg)
+            if scope == EnvStorageScope::Shared && msg.contains("permission denied") =>
+        {
+            Ok(SecretDeleteProbe::SharedUnauthorized)
+        },
+        AdminResponseBody::Error(msg) => Err(anyhow::anyhow!("kernel rejected request: {msg}")),
+        AdminResponseBody::Success(value) => Ok(SecretDeleteProbe::Deleted(
+            value
+                .get("deleted")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        )),
+        other => anyhow::bail!("unexpected response from kernel: {other:?}"),
+    }
+}
+
 async fn run_delete(args: &DeleteArgs) -> Result<ExitCode> {
     let principal = context::resolve_agent(args.agent.as_deref())?;
     let capsule = validate_optional_capsule(args.capsule.as_deref())?;
@@ -431,12 +468,9 @@ async fn run_delete(args: &DeleteArgs) -> Result<ExitCode> {
                 scope,
             })
             .await?;
-        let body = crate::admin_client::into_result(body)?;
-        if let AdminResponseBody::Success(value) = body {
-            removed |= value
-                .get("deleted")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+        match classify_secret_delete_response(scope, body)? {
+            SecretDeleteProbe::Deleted(deleted) => removed |= deleted,
+            SecretDeleteProbe::SharedUnauthorized => {},
         }
     }
     if !removed {
@@ -480,6 +514,57 @@ mod tests {
 
     fn provider_id() -> CapsuleId {
         CapsuleId::new("provider").unwrap()
+    }
+
+    #[test]
+    fn shared_permission_denial_does_not_fail_agent_secret_delete() {
+        let denied = AdminResponseBody::Error(
+            "permission denied for principal alice: missing capability env:write".into(),
+        );
+        assert_eq!(
+            classify_secret_delete_response(EnvStorageScope::Shared, denied).unwrap(),
+            SecretDeleteProbe::SharedUnauthorized
+        );
+
+        let agent_deleted = AdminResponseBody::Success(serde_json::json!({"deleted": true}));
+        assert_eq!(
+            classify_secret_delete_response(EnvStorageScope::Agent, agent_deleted).unwrap(),
+            SecretDeleteProbe::Deleted(true)
+        );
+    }
+
+    #[test]
+    fn agent_permission_denial_still_fails_secret_delete() {
+        let denied = AdminResponseBody::Error(
+            "permission denied for principal alice: missing capability self:env:write".into(),
+        );
+        let error = classify_secret_delete_response(EnvStorageScope::Agent, denied)
+            .expect_err("agent-scope denial must fail the command");
+        assert!(error.to_string().contains("permission denied"));
+    }
+
+    #[test]
+    fn shared_validation_errors_still_fail_secret_delete() {
+        let invalid = AdminResponseBody::Error(
+            "environment key must be non-empty and must not contain ':'".into(),
+        );
+        let error = classify_secret_delete_response(EnvStorageScope::Shared, invalid)
+            .expect_err("non-auth Shared errors must still fail");
+        assert!(error.to_string().contains("environment key"));
+    }
+
+    #[test]
+    fn shared_delete_success_is_recorded() {
+        let shared_deleted = AdminResponseBody::Success(serde_json::json!({"deleted": true}));
+        assert_eq!(
+            classify_secret_delete_response(EnvStorageScope::Shared, shared_deleted).unwrap(),
+            SecretDeleteProbe::Deleted(true)
+        );
+        let shared_missing = AdminResponseBody::Success(serde_json::json!({"deleted": false}));
+        assert_eq!(
+            classify_secret_delete_response(EnvStorageScope::Shared, shared_missing).unwrap(),
+            SecretDeleteProbe::Deleted(false)
+        );
     }
 
     #[test]

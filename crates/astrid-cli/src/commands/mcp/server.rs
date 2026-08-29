@@ -136,15 +136,15 @@ impl AstridMcpServer {
         principal: PrincipalId,
         daemon_root: PathBuf,
         workspace: PathBuf,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, McpError> {
+        Ok(Self {
             client,
             principal,
             daemon_root,
             workspace,
             needs_reconnect: AtomicBool::new(false),
-            mrtr: MrtrBridge::new(),
-        }
+            mrtr: MrtrBridge::new()?,
+        })
     }
 
     /// Reconnect the held uplink without ever retaining a client authenticated
