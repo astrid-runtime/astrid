@@ -27,6 +27,16 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   bounded to 4096 bytes so `astrid storage` can render them instead of rejecting
   the provider as an invalid structured error. Generic mount, permission, lease,
   and rollback failures stay `provider-operation` hard errors. Closes #1567.
+- **Native process-storage reclamation is no longer reachable as a raw public
+  home cleanup.** Boot still reclaims stale roots only through the private
+  native singleton-ownership gate, while arbitrary injected lock files and
+  lockless injected kernels remain non-destructive. Tracking #1710.
+- **Partial process-projection issue failures now retain retry authority
+  atomically.** If cleanup of an already issued OwnerHome or Fleet-shared lease
+  set fails, every mapped member stays revoked and authoritative, the exact
+  binding and provider root remain retained, no member is unmapped until all
+  resources are gone, and a successful authenticated retry clears the blocker
+  before replacement admission. Tracking #1710.
 ### Added
 
 - **A run-loop capsule serving a loopback TCP port can now handle connections

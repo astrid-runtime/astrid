@@ -17,6 +17,17 @@ use super::{
     ProjectionGeneration, arm_parent_token_failure, blocked_projection_lease,
     retain_failed_launch_projection, retry_failed_projection, rollback_or_retain_failed_launch,
 };
+
+mod exact_fence_tests;
+mod partial_issue_tests;
+mod stopped_provider_tests;
+
+#[cfg(unix)]
+pub(crate) use super::projection_lifecycle::fence_projection_leases_for_test;
+pub(crate) use super::{
+    ProjectionCleanupState, ProjectionLeaseProvider, ProjectionLeaseTarget, RunningProvider,
+    arm_partial_issue_failure,
+};
 use super::{
     abort_process_provider, arm_launch_cleanup_failure, arm_launch_failure,
     process_launch::{
@@ -463,7 +474,7 @@ struct ExactFenceFixture {
 }
 
 async fn exact_fence_fixture() -> ExactFenceFixture {
-    let (_temporary, kernel) = fleet_shared_kernel().await;
+    let (temporary, kernel) = fleet_shared_kernel().await;
     let caller = PrincipalId::default();
     let actor = kernel
         .principal_directory
@@ -494,9 +505,9 @@ async fn exact_fence_fixture() -> ExactFenceFixture {
     let provider = super::process_launch::platform_process_provider_name().to_owned();
     let targets = &binding.targets;
     let mountpoints = [
-        std::path::PathBuf::from("/tmp/fence-branch"),
-        std::path::PathBuf::from("/tmp/fence-owner"),
-        std::path::PathBuf::from("/tmp/fence-shared"),
+        temporary.path().join("fence-branch"),
+        temporary.path().join("fence-owner"),
+        temporary.path().join("fence-shared"),
     ];
     let views = [
         astrid_core::storage_provider::StorageProviderViewV1::Fleet(fleet),
@@ -602,89 +613,6 @@ async fn assert_exact_reads_and_renewals_denied(fixture: &ExactFenceFixture) {
         fixture.expiry_before,
         "denied status must not renew"
     );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn exact_set_fence_denies_reads_and_renewal_while_writer_held() {
-    use super::{ProjectionLeaseTarget, projection_lifecycle::fence_projection_leases_for_test};
-    use std::sync::atomic::Ordering as AtomicOrdering;
-
-    let fixture = exact_fence_fixture().await;
-    let branch_state = Arc::clone(&fixture.states[0]);
-    let gate = Arc::new(crate::storage_mount::MutationTestGate {
-        entered: tokio::sync::Semaphore::new(0),
-        release: tokio::sync::Semaphore::new(0),
-    });
-    *branch_state.mutation_test_gate.lock().unwrap() = Some(Arc::clone(&gate));
-    let mutation_kernel = Arc::clone(&fixture.kernel);
-    let mutation = tokio::spawn(async move {
-        crate::storage_mount::execute_operation_for_test(
-            &mutation_kernel,
-            &branch_state,
-            StorageFilesystemOperationV1::Create {
-                path: "in-flight.bin".to_owned(),
-                kind: astrid_core::storage_filesystem::StorageFilesystemEntryKindV1::File,
-            },
-        )
-        .await
-    });
-    gate.entered
-        .acquire()
-        .await
-        .expect("writer entered")
-        .forget();
-
-    let targets = &fixture.binding.targets;
-    let branch_target = ProjectionLeaseTarget {
-        mount_id: fixture.branch.mount_id,
-        target: targets.workspace.clone(),
-    };
-    let owner_target = ProjectionLeaseTarget {
-        mount_id: fixture.owner.mount_id,
-        target: targets.owner_home.clone(),
-    };
-    let shared_target = ProjectionLeaseTarget {
-        mount_id: fixture.shared.mount_id,
-        target: targets
-            .fleet_shared
-            .as_ref()
-            .expect("shared target")
-            .clone(),
-    };
-    let fence_kernel = Arc::clone(&fixture.kernel);
-    let binding = fixture.binding.clone();
-    let fence = tokio::spawn(async move {
-        fence_projection_leases_for_test(
-            &fence_kernel,
-            &binding,
-            &branch_target,
-            &owner_target,
-            Some(&shared_target),
-        )
-        .await
-    });
-    while !fixture.states[0].revoked.load(AtomicOrdering::Acquire) {
-        tokio::task::yield_now().await;
-    }
-
-    assert_exact_reads_and_renewals_denied(&fixture).await;
-    assert!(
-        fixture
-            .states
-            .iter()
-            .all(|state| state.is_revoked_for_test()),
-        "the complete exact set must be synchronously revoked"
-    );
-    gate.release.add_permits(1);
-    let mutation_outcome = mutation.await.expect("held writer completes");
-    assert!(
-        matches!(
-            mutation_outcome,
-            astrid_core::storage_filesystem::StorageFilesystemOutcomeV1::Success(_)
-        ),
-        "revocation must drain an already admitted writer: {mutation_outcome:?}"
-    );
-    assert!(fence.await.expect("exact-set fence"));
 }
 
 async fn fleet_shared_kernel() -> (tempfile::TempDir, Arc<crate::Kernel>) {
@@ -1016,106 +944,4 @@ async fn post_publication_launch_failure_revokes_branch_owner_and_fleet_leases()
             .is_none(),
         "successful cleanup must remove the UUID mount root"
     );
-}
-
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_stop_retains_blocker_until_provider_cleanup_succeeds() {
-    use std::os::unix::net::UnixListener;
-
-    use std::io::Write as _;
-
-    use super::{ProjectionLeaseProvider, ProjectionLeaseTarget, RunningProvider};
-
-    let temporary = tempfile::tempdir().expect("test home root");
-    let home = AstridHome::from_path(temporary.path().join(".astrid"));
-    let kernel = Arc::new(crate::test_kernel_with_home(home).await);
-    let caller = PrincipalId::default();
-    let actor = kernel
-        .principal_directory
-        .uid_for(&caller)
-        .expect("caller actor UID");
-    let binding = binding(actor);
-    let key = super::ProcessProjectionKey {
-        binding: binding.clone(),
-        read_write: true,
-    };
-    let mount_root = temporary.path().join("process-mount");
-    std::fs::create_dir_all(&mount_root).expect("create retained mount root");
-    let control_path = mount_root.join("process-control.sock");
-    let listener =
-        Arc::new(UnixListener::bind(&control_path).expect("bind live provider endpoint"));
-    let responder_listener = Arc::clone(&listener);
-    let responder = tokio::task::spawn_blocking(move || {
-        let (mut stream, _) = responder_listener.accept().expect("accept stop request");
-        stream
-            .write_all(b"{\"status\":\"ready\"}\n")
-            .expect("write stop refusal");
-    });
-    let child = tokio::process::Command::new("true")
-        .spawn()
-        .expect("spawn exited test child");
-    let cleanup_state = super::ProjectionCleanupState {
-        kernel: Arc::downgrade(&kernel),
-        binding: binding.clone(),
-        branch: ProjectionLeaseProvider {
-            running: RunningProvider {
-                child: Some(child),
-                control_path: control_path.clone(),
-                token: "test-token".to_owned(),
-                stopped: false,
-            },
-            lease: ProjectionLeaseTarget {
-                mount_id: astrid_core::storage_provider::StorageMountId::new(),
-                target: binding.targets.owner_home.clone(),
-            },
-        },
-        owner: ProjectionLeaseProvider {
-            running: RunningProvider {
-                child: None,
-                control_path: mount_root.join("absent.sock"),
-                token: "test-token".to_owned(),
-                stopped: true,
-            },
-            lease: ProjectionLeaseTarget {
-                mount_id: astrid_core::storage_provider::StorageMountId::new(),
-                target: binding.targets.workspace.clone(),
-            },
-        },
-        shared: None,
-        mount_root: mount_root.clone(),
-        cleaned: false,
-    };
-    let mut projections = BTreeMap::new();
-    retain_failed_launch_projection(
-        &mut projections,
-        &key,
-        temporary.path().join("workspace"),
-        temporary.path().join("owner"),
-        None,
-        cleanup_state,
-    );
-
-    let projection = Arc::clone(projections.get(&key).expect("retained blocker"));
-    let mut guard = projections;
-    let stopped = retry_failed_projection(&projection, &mut guard, &key).await;
-    responder.await.expect("stop responder");
-    assert!(!stopped, "a provider that remained ready must stay blocked");
-    assert!(
-        guard.contains_key(&key),
-        "otherwise-successful lease cleanup must not remove the unreaped-provider blocker"
-    );
-    assert!(
-        kernel.storage_mounts.is_empty(),
-        "the blocker must remain authoritative without a live lease"
-    );
-
-    drop(std::fs::File::open(&control_path));
-    std::fs::remove_file(&control_path).expect("remove stopped provider endpoint");
-    assert!(
-        retry_failed_projection(&projection, &mut guard, &key).await,
-        "retry must complete after the provider endpoint is gone"
-    );
-    assert!(!guard.contains_key(&key));
-    assert!(!mount_root.exists());
 }

@@ -1,4 +1,4 @@
-#[cfg(any(unix, windows))]
+#[cfg(all(test, any(unix, windows)))]
 pub(crate) use super::lifecycle::force_revoke_projection_lease;
 use super::*;
 
@@ -29,10 +29,12 @@ mod projection_identity;
 mod projection_lifecycle;
 #[cfg(all(test, any(unix, windows)))]
 pub(crate) use projection_lifecycle::cached_projection_mount;
+#[cfg(any(unix, windows))]
+#[cfg(test)]
+pub(crate) use projection_lifecycle::retain_failed_launch_projection;
 #[cfg(all(test, any(unix, windows)))]
 pub(crate) use projection_lifecycle::{
-    ParentTokenSlot, arm_parent_token_failure, retain_failed_launch_projection,
-    revoke_projection_leases,
+    ParentTokenSlot, arm_parent_token_failure, revoke_projection_leases,
 };
 #[cfg(any(unix, windows))]
 pub(crate) use projection_lifecycle::{
@@ -40,9 +42,10 @@ pub(crate) use projection_lifecycle::{
 };
 #[cfg(any(unix, windows))]
 pub(crate) use projection_lifecycle::{
-    blocked_projection_lease, cleanup_projection_state, generate_parent_tokens, projection_mount,
-    retain_cached_projection, retain_locked_projection, retry_failed_projection,
-    rollback_or_retain_failed_launch, rollback_uncommitted_lease,
+    RetainedIssuePaths, blocked_projection_lease, cleanup_projection_state,
+    cleanup_uncommitted_issue_lease_set, generate_parent_tokens, projection_mount,
+    retain_cached_projection, retain_failed_issue_projection, retain_locked_projection,
+    retry_failed_projection, rollback_or_retain_failed_launch,
 };
 #[cfg(all(test, any(unix, windows)))]
 mod projection_identity_tests;
@@ -81,6 +84,91 @@ pub(crate) struct CachedProcessProjection {
     pub(crate) closing: AtomicBool,
     pub(crate) cleanup_failed: AtomicBool,
     pub(super) cleanup: ProjectionCleanup,
+}
+
+#[cfg(all(test, any(unix, windows)))]
+static PARTIAL_ISSUE_FAILURES: std::sync::Mutex<
+    std::collections::BTreeMap<u64, process_launch::ProcessLaunchStage>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) fn arm_partial_issue_failure(stage: process_launch::ProcessLaunchStage, test_id: u64) {
+    PARTIAL_ISSUE_FAILURES
+        .lock()
+        .expect("partial issue failure selector")
+        .insert(test_id, stage);
+}
+
+#[cfg(all(test, any(unix, windows)))]
+fn take_partial_issue_failure(stage: process_launch::ProcessLaunchStage) -> bool {
+    let current_test_id = PROCESS_MOUNT_TEST_ID
+        .try_with(|test_id| *test_id)
+        .unwrap_or(0);
+    let mut failures = PARTIAL_ISSUE_FAILURES
+        .lock()
+        .expect("partial issue failure selector");
+    if failures.get(&current_test_id) != Some(&stage) {
+        return false;
+    }
+    failures.remove(&current_test_id).is_some()
+}
+
+struct UncommittedIssueRollback {
+    branch_mount_id: StorageMountId,
+    owner_mount_id: Option<StorageMountId>,
+    mount_root: PathBuf,
+    workspace_mountpoint: PathBuf,
+    home_mountpoint: PathBuf,
+    fleet_shared_mountpoint: Option<PathBuf>,
+    issue_error: String,
+}
+
+async fn retain_uncommitted_issue_lease(
+    projections: &mut std::collections::BTreeMap<
+        ProcessProjectionKey,
+        Arc<CachedProcessProjection>,
+    >,
+    key: &ProcessProjectionKey,
+    kernel: &Arc<Kernel>,
+    rollback: UncommittedIssueRollback,
+) -> String {
+    let UncommittedIssueRollback {
+        branch_mount_id,
+        owner_mount_id,
+        mount_root,
+        workspace_mountpoint,
+        home_mountpoint,
+        fleet_shared_mountpoint,
+        issue_error,
+    } = rollback;
+    let owner_target = ProjectionLeaseTarget {
+        mount_id: owner_mount_id.unwrap_or_default(),
+        target: key.binding.targets.owner_home.clone(),
+    };
+    let branch_target = ProjectionLeaseTarget {
+        mount_id: branch_mount_id,
+        target: key.binding.targets.workspace.clone(),
+    };
+    if cleanup_uncommitted_issue_lease_set(kernel, &key.binding, &branch_target, &owner_target)
+        .await
+    {
+        let _ = std::fs::remove_dir_all(&mount_root);
+        return issue_error;
+    }
+
+    retain_failed_issue_projection(
+        projections,
+        key,
+        kernel,
+        RetainedIssuePaths {
+            workspace: workspace_mountpoint,
+            home: home_mountpoint,
+            fleet_shared: fleet_shared_mountpoint,
+        },
+        branch_target,
+        owner_target,
+    );
+    format!("{issue_error}; issued lease cleanup failed and remains retained")
 }
 
 /// Kernel implementation of the capsule-neutral process storage broker.
@@ -268,6 +356,28 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             process_launch::ProcessLaunchStage::Branch,
             branch_lease.mount_id,
         );
+        #[cfg(all(test, any(unix, windows)))]
+        let owner_provider = {
+            let owner_provider = provider.to_owned();
+            if take_partial_issue_failure(process_launch::ProcessLaunchStage::OwnerHome) {
+                let state = Arc::clone(
+                    kernel
+                        .storage_mounts
+                        .get(&branch_lease.mount_id)
+                        .expect("branch lease before OwnerHome issue failure")
+                        .value(),
+                );
+                crate::storage_mount::inject_cleanup_fault_for_test(
+                    &state,
+                    crate::storage_mount::MountCleanupStage::Callback,
+                );
+                "\t".to_owned()
+            } else {
+                owner_provider
+            }
+        };
+        #[cfg(not(all(test, any(unix, windows))))]
+        let owner_provider = provider.to_owned();
         let owner_lease = match issue_lease(
             &kernel,
             &admission,
@@ -277,21 +387,28 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             StorageProviderViewV1::Principal(principal.clone()),
             key.binding.targets.owner_home.durable_target(),
             access,
-            provider.to_owned(),
+            owner_provider,
             home_mountpoint.clone(),
         )
         .await
         {
             Ok(lease) => lease,
             Err(error) => {
-                rollback_uncommitted_lease(
+                let error = retain_uncommitted_issue_lease(
+                    &mut projections,
+                    &key,
                     &kernel,
-                    &key.binding,
-                    &key.binding.targets.workspace,
-                    branch_lease.mount_id,
+                    UncommittedIssueRollback {
+                        branch_mount_id: branch_lease.mount_id,
+                        owner_mount_id: None,
+                        mount_root: mount_root.clone(),
+                        workspace_mountpoint: workspace_mountpoint.clone(),
+                        home_mountpoint: home_mountpoint.clone(),
+                        fleet_shared_mountpoint: fleet_shared_mountpoint.clone(),
+                        issue_error: error,
+                    },
                 )
                 .await;
-                let _ = std::fs::remove_dir_all(&mount_root);
                 return Err(error);
             },
         };
@@ -300,6 +417,28 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             process_launch::ProcessLaunchStage::OwnerHome,
             owner_lease.mount_id,
         );
+        #[cfg(all(test, any(unix, windows)))]
+        let shared_provider = {
+            let shared_provider = provider.to_owned();
+            if take_partial_issue_failure(process_launch::ProcessLaunchStage::FleetShared) {
+                let state = Arc::clone(
+                    kernel
+                        .storage_mounts
+                        .get(&branch_lease.mount_id)
+                        .expect("branch lease before Fleet issue failure")
+                        .value(),
+                );
+                crate::storage_mount::inject_cleanup_fault_for_test(
+                    &state,
+                    crate::storage_mount::MountCleanupStage::Callback,
+                );
+                "\t".to_owned()
+            } else {
+                shared_provider
+            }
+        };
+        #[cfg(not(all(test, any(unix, windows))))]
+        let shared_provider = provider.to_owned();
 
         let shared_target = key
             .binding
@@ -327,28 +466,28 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                 view,
                 target,
                 access,
-                provider.to_owned(),
+                shared_provider,
                 shared_mountpoint.clone(),
             )
             .await
             {
                 Ok(lease) => Some(lease),
                 Err(error) => {
-                    rollback_uncommitted_lease(
+                    let error = retain_uncommitted_issue_lease(
+                        &mut projections,
+                        &key,
                         &kernel,
-                        &key.binding,
-                        &key.binding.targets.owner_home,
-                        owner_lease.mount_id,
+                        UncommittedIssueRollback {
+                            branch_mount_id: branch_lease.mount_id,
+                            owner_mount_id: Some(owner_lease.mount_id),
+                            mount_root: mount_root.clone(),
+                            workspace_mountpoint: workspace_mountpoint.clone(),
+                            home_mountpoint: home_mountpoint.clone(),
+                            fleet_shared_mountpoint: fleet_shared_mountpoint.clone(),
+                            issue_error: error,
+                        },
                     )
                     .await;
-                    rollback_uncommitted_lease(
-                        &kernel,
-                        &key.binding,
-                        &key.binding.targets.workspace,
-                        branch_lease.mount_id,
-                    )
-                    .await;
-                    let _ = std::fs::remove_dir_all(&mount_root);
                     return Err(error);
                 },
             }

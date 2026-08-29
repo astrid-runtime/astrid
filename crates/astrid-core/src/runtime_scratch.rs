@@ -71,24 +71,6 @@ impl crate::dirs::AstridHome {
             &self.run_dir().join("principals"),
         )
     }
-
-    /// Clear stale native process storage projection roots from a prior
-    /// daemon process.
-    ///
-    /// The disposable `run/process-storage/` subtree is validated before any
-    /// child is removed; redirects, mount boundaries, and special entries fail
-    /// closed. The subtree root is retained for the new daemon.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error and leaves the subtree untouched when a redirect,
-    /// mount boundary, or special entry is present.
-    pub fn clear_runtime_process_storage(&self) -> io::Result<()> {
-        clear_runtime_scratch(
-            "process storage scratch",
-            &self.run_dir().join("process-storage"),
-        )
-    }
 }
 
 fn validate_tree(kind: &'static str, path: &Path, root_device: u64) -> io::Result<()> {

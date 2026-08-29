@@ -322,6 +322,18 @@ pub(crate) fn cleanup_mapped_lease(
     kernel: &Kernel,
     state: &StorageMountLeaseState,
 ) -> Result<(), MountCleanupError> {
+    cleanup_mapped_lease_resources(state)?;
+    kernel.storage_mounts.remove(&state.mount_id);
+    Ok(())
+}
+
+/// Remove one mapped lease's host resources without changing authority.
+///
+/// Issue-set rollback uses this two-phase form so one failed resource cannot
+/// strand the other members as unmapped authority.
+pub(crate) fn cleanup_mapped_lease_resources(
+    state: &StorageMountLeaseState,
+) -> Result<(), MountCleanupError> {
     let fault = {
         #[cfg(test)]
         {
@@ -333,9 +345,7 @@ pub(crate) fn cleanup_mapped_lease(
         }
     };
     cleanup_resource_paths(&state.resource_path, &state.callback_path, fault)
-        .map_err(|(stage, source)| cleanup_error(Some(state.mount_id), stage, source))?;
-    kernel.storage_mounts.remove(&state.mount_id);
-    Ok(())
+        .map_err(|(stage, source)| cleanup_error(Some(state.mount_id), stage, source))
 }
 
 /// Revoke one mapped lease, including a revoked entry left after failed cleanup.
@@ -359,6 +369,7 @@ pub(crate) async fn revoke_lease(
 /// Projection drain may run after capability retirement, where reconstructing
 /// a normal alias grant would fail. The caller must still own the exact UID
 /// bound when the lease was issued.
+#[cfg(test)]
 pub(crate) async fn force_revoke_projection_lease(
     kernel: &Kernel,
     requester_uid: PrincipalUid,

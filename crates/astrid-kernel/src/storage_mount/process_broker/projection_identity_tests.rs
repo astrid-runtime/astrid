@@ -12,7 +12,6 @@ use astrid_storage::StateOwner;
 use super::{
     ProcessProjectionBinding, ProcessProjectionTarget, ProcessProjectionTargetSet,
     ProjectionGeneration, blocked_projection_lease, force_revoke_projection_lease,
-    rollback_uncommitted_lease,
 };
 use crate::storage_mount::{
     MountOwnerScope, clear_cleanup_fault_for_test, inject_cleanup_fault_for_test, issue_lease,
@@ -265,32 +264,6 @@ async fn failed_force_revoke_retains_revoked_state_until_retry() {
     assert!(state.is_revoked_for_test());
     clear_cleanup_fault_for_test(&state);
     assert!(force_revoke_projection_lease(&kernel, actor, owner, &target, lease.mount_id).await);
-    assert!(!kernel.storage_mounts.contains_key(&lease.mount_id));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn launch_rollback_revokes_the_exact_typed_projection_target() {
-    let temporary = tempfile::tempdir().expect("test home root");
-    let home = AstridHome::from_path(temporary.path().join(".astrid"));
-    let kernel = Arc::new(crate::test_kernel_with_home(home).await);
-    let caller = PrincipalId::default();
-    let actor = kernel
-        .principal_directory
-        .uid_for(&caller)
-        .expect("caller actor UID");
-    let binding = valid_binding(actor, [0xC6; 16]);
-    let lease = issue_home_lease(&kernel, &caller, "rollback", "test-provider").await;
-    let wrong_target = ProcessProjectionTarget::FleetShared(FleetUid::from_bytes([0xE3; 32]));
-
-    rollback_uncommitted_lease(&kernel, &binding, &wrong_target, lease.mount_id).await;
-    assert!(kernel.storage_mounts.contains_key(&lease.mount_id));
-    rollback_uncommitted_lease(
-        &kernel,
-        &binding,
-        &binding.targets.owner_home,
-        lease.mount_id,
-    )
-    .await;
     assert!(!kernel.storage_mounts.contains_key(&lease.mount_id));
 }
 

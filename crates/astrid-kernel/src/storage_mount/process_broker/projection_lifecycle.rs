@@ -13,10 +13,11 @@ use std::{
 use super::{
     CachedProcessProjection, Kernel, ProcessProjectionBinding, ProcessProjectionKey,
     ProcessProjectionTarget, ProcessProjectionTargetSet, ProjectionCleanup, StorageMountId,
-    StorageProviderAccessV1, force_revoke_projection_lease, generate_lease_token, local_transport,
-    platform_process_provider_name, stop_process_provider,
+    StorageProviderAccessV1, generate_lease_token, local_transport, platform_process_provider_name,
+    stop_process_provider,
 };
 use crate::storage_mount::lifecycle::cleanup_mapped_lease;
+use crate::storage_mount::lifecycle::cleanup_mapped_lease_resources;
 use crate::storage_mount::lifecycle::force_fence_projection_lease;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,6 +52,7 @@ pub(crate) struct ProjectionLeaseProvider {
     pub(super) lease: ProjectionLeaseTarget,
 }
 
+#[derive(Clone)]
 pub(crate) struct ProjectionLeaseTarget {
     pub(crate) mount_id: StorageMountId,
     pub(crate) target: ProcessProjectionTarget,
@@ -239,22 +241,63 @@ pub(crate) fn retain_failed_launch_projection(
     );
 }
 
-pub(crate) async fn rollback_uncommitted_lease(
-    kernel: &Kernel,
-    binding: &ProcessProjectionBinding,
-    target: &ProcessProjectionTarget,
-    mount_id: StorageMountId,
+/// Retain an issue-set failure with a retry that preserves all-or-nothing
+/// unmap semantics instead of falling back to provider-launch teardown.
+pub(crate) fn retain_failed_issue_projection(
+    projections: &mut std::collections::BTreeMap<
+        ProcessProjectionKey,
+        Arc<CachedProcessProjection>,
+    >,
+    key: &ProcessProjectionKey,
+    kernel: &Arc<Kernel>,
+    paths: RetainedIssuePaths,
+    branch: ProjectionLeaseTarget,
+    owner: ProjectionLeaseTarget,
 ) {
-    let expected_owner = target.durable_owner();
-    let expected_target = target.durable_target();
-    let _ = force_revoke_projection_lease(
-        kernel,
-        binding.acting_uid,
-        expected_owner,
-        &expected_target,
-        mount_id,
-    )
-    .await;
+    let kernel = Arc::downgrade(kernel);
+    let binding = key.binding.clone();
+    let RetainedIssuePaths {
+        workspace,
+        home,
+        fleet_shared,
+    } = paths;
+    let mount_root = workspace
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let cleanup: ProjectionCleanup = Arc::new(move || {
+        let binding = binding.clone();
+        let branch = branch.clone();
+        let owner = owner.clone();
+        let kernel = kernel.clone();
+        let mount_root = mount_root.clone();
+        Box::pin(async move {
+            let Some(kernel) = kernel.upgrade() else {
+                return false;
+            };
+            cleanup_uncommitted_issue_lease_set(&kernel, &binding, &branch, &owner).await
+                && std::fs::remove_dir_all(mount_root).is_ok()
+        })
+    });
+    projections.insert(
+        key.clone(),
+        Arc::new(CachedProcessProjection {
+            binding: key.binding.clone(),
+            workspace_mountpoint: workspace,
+            home_mountpoint: home,
+            fleet_shared_mountpoint: fleet_shared,
+            refs: AtomicU64::new(0),
+            closing: AtomicBool::new(false),
+            cleanup_failed: AtomicBool::new(true),
+            cleanup,
+        }),
+    );
+}
+
+pub(crate) struct RetainedIssuePaths {
+    pub(super) workspace: PathBuf,
+    pub(super) home: PathBuf,
+    pub(super) fleet_shared: Option<PathBuf>,
 }
 
 pub(crate) fn blocked_projection_lease(
@@ -283,6 +326,47 @@ pub(crate) fn blocked_projection_lease(
         }
     }
     None
+}
+
+/// Roll an uncommitted issue set back without unmapping a partial subset.
+///
+/// Resources are removed first. Only after every mapped member proves
+/// resource-free does the second phase unmap the exact revoked set.
+pub(crate) async fn cleanup_uncommitted_issue_lease_set(
+    kernel: &Kernel,
+    binding: &ProcessProjectionBinding,
+    branch: &ProjectionLeaseTarget,
+    owner: &ProjectionLeaseTarget,
+) -> bool {
+    if binding.validate().is_err() {
+        return false;
+    }
+    let Ok(states) = mapped_projection_leases(kernel, binding, branch, owner, None) else {
+        return false;
+    };
+    fence_projection_states(&states, true);
+    let mut listener_checks = tokio::task::JoinSet::new();
+    for state in &states {
+        let state = Arc::clone(state);
+        listener_checks.spawn(async move { state.wait_listener_closed().await });
+    }
+    let mut listeners_closed = true;
+    while let Some(closed) = listener_checks.join_next().await {
+        listeners_closed &= closed.unwrap_or_default();
+    }
+    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
+    if !listeners_closed {
+        return false;
+    }
+    for state in &states {
+        if cleanup_mapped_lease_resources(state).is_err() {
+            return false;
+        }
+    }
+    for state in &states {
+        kernel.storage_mounts.remove(&state.mount_id);
+    }
+    true
 }
 
 pub(crate) async fn revoke_projection_leases(
