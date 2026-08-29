@@ -14,13 +14,10 @@ use astrid_capsule_install::AuthorityDecision;
 use astrid_capsule_install::github_source::{
     capsule_assets, extract_github_org_repo, parse_github_source, pick_capsule,
 };
-use astrid_capsule_install::{
-    InstallOptions, inspect_archive_for_principal_with_layout,
-    inspect_directory_for_principal_with_layout, resolve_target_dir_for_with_layout,
-};
 use astrid_core::dirs::AstridHome;
 
-use super::install_finish::{finish_install, run_with_elicit};
+use super::{station, station_rollback};
+use install_local::LocalInstallCall;
 
 pub(crate) use super::install_batch::{
     BatchInstallOutcome, InstalledCapsuleOutcome, RefSpec, install_capsule_batch,
@@ -28,13 +25,35 @@ pub(crate) use super::install_batch::{
 use super::install_github::{github_api_client, release_tag_url, resolve_github_ref};
 
 mod authority;
+#[path = "install_local.rs"]
+mod install_local;
+#[path = "station_install.rs"]
+mod station_install;
 
-use authority::{authority_decision, daemon_install_authority};
+#[cfg(test)]
+use astrid_capsule_install::inspect_directory_for_principal_with_layout;
+#[cfg(test)]
+use authority::authority_decision;
+use authority::daemon_install_authority;
+
+use install_local::{install_from_local, unpack_via_lib};
+
+pub(crate) use station_install::StationInstallRequest;
+pub(crate) use station_install::install_capsule_with_options_and_station_lock;
+#[cfg(test)]
+pub(crate) use station_install::install_capsule_with_options_and_station_lock_in_home;
+pub(crate) use station_install::install_from_station_lock;
+#[cfg(test)]
+pub(crate) use station_install::test_daemon_install_call;
+#[cfg(test)]
+pub(crate) use station_install::test_local_install_backend;
+#[cfg(test)]
+pub(crate) use station_rollback::{combine_install_and_restore_errors, restore_station_lock};
 
 #[derive(Clone, Copy)]
-struct ExpectedCapsule<'a> {
-    id: &'a CapsuleId,
-    version: Option<&'a str>,
+pub(super) struct ExpectedCapsule<'a> {
+    pub(super) id: &'a CapsuleId,
+    pub(super) version: Option<&'a str>,
 }
 
 #[derive(Clone, Copy)]
@@ -47,6 +66,33 @@ struct InstallContext<'a> {
     principal: &'a astrid_core::PrincipalId,
     expected: Option<ExpectedCapsule<'a>>,
     prompt: &'a ManualInstallOptions,
+}
+
+/// Inputs shared by manual, persisted-source, and distro-batch dispatch.
+/// Keeping the source request typed avoids a long positional argument list at
+/// the source boundary, where Station and GitHub authority diverge.
+pub(super) struct InstallRequest<'a> {
+    pub(super) source: &'a str,
+    pub(super) name_hint: Option<&'a str>,
+    pub(super) workspace: bool,
+    pub(super) refspec: &'a RefSpec,
+    pub(super) principal: &'a astrid_core::PrincipalId,
+    pub(super) expected: Option<&'a CapsuleId>,
+    pub(super) prompt: &'a ManualInstallOptions,
+    pub(super) allow_station: bool,
+}
+
+pub(super) struct SourceInstallContext<'a> {
+    pub(super) base: &'a str,
+    pub(super) name_hint: Option<&'a str>,
+    pub(super) version: Option<&'a str>,
+    pub(super) tag: Option<&'a str>,
+    pub(super) workspace: bool,
+    pub(super) home: &'a AstridHome,
+    pub(super) principal: &'a astrid_core::PrincipalId,
+    pub(super) expected: Option<ExpectedCapsule<'a>>,
+    pub(super) prompt: &'a ManualInstallOptions,
+    pub(super) allow_station: bool,
 }
 
 /// Operator input policy for a manual capsule install.
@@ -144,131 +190,303 @@ pub(crate) async fn install_capsule_with_options(
     approve_untrusted: bool,
     vars: &[String],
 ) -> anyhow::Result<()> {
-    let prompt = ManualInstallOptions::from_cli(yes, approve_untrusted, vars)?;
+    station_install::install_capsule_with_options_and_station_lock(
+        &station_install::StationInstallRequest {
+            source,
+            capsule,
+            workspace,
+            yes,
+            approve_untrusted,
+            station_lock: None,
+            station_lock_sha256: None,
+            vars,
+        },
+    )
+    .await
+}
+
+/// Reinstall a previously persisted source without allowing a newly
+/// configured Station source to reinterpret its provenance.
+pub(crate) async fn install_existing_source_with_options(
+    source: &str,
+    capsule: Option<&str>,
+    workspace: bool,
+    approve_untrusted: bool,
+) -> anyhow::Result<()> {
+    let home = AstridHome::resolve()?;
     let principal = crate::principal::current();
-    let (installed, _resolved) = install_capsule_inner(
+    install_existing_source_in_home_with_options(
         source,
         capsule,
         workspace,
-        &RefSpec::default(),
+        approve_untrusted,
+        &home,
         &principal,
-        None,
-        &prompt,
+    )
+    .await
+}
+
+pub(super) async fn install_existing_source_in_home_with_options(
+    source: &str,
+    capsule: Option<&str>,
+    workspace: bool,
+    approve_untrusted: bool,
+    home: &AstridHome,
+    principal: &astrid_core::PrincipalId,
+) -> anyhow::Result<()> {
+    let prompt = ManualInstallOptions {
+        approve_untrusted,
+        ..Default::default()
+    };
+    let (installed, _resolved) = install_capsule_inner_at(
+        InstallRequest {
+            source,
+            name_hint: capsule,
+            workspace,
+            refspec: &RefSpec::default(),
+            principal,
+            expected: None,
+            prompt: &prompt,
+            allow_station: false,
+        },
+        home,
     )
     .await?;
     let installed_ids: Vec<String> = installed
         .iter()
         .map(|capsule| capsule.id.as_str().to_string())
         .collect();
-    // Live-load: if a daemon is running, hot-load (or upgrade) each just-installed
-    // capsule so it's usable without a restart. Best-effort and non-fatal — the
-    // on-disk install above already succeeded standalone. The `update` and TUI
-    // install paths route through here too, so they inherit live hot-swap.
     super::live_load::nudge_daemon_reload(&installed_ids).await;
     Ok(())
 }
 
 /// Install dispatch shared by the CLI and distro-batch paths.
-/// `name_hint` is the `--capsule <name>` / distro capsule `name` selector
-/// used to pick the right archive when a release ships several. Returns
-/// `(installed_capsule_ids, resolved_ref)`: the ids of every capsule
-/// installed, and the resolved git ref for GitHub-backed sources (`Some`),
-/// or `None` for local-path sources, which have no remote ref to resolve.
+/// Returns `(installed_capsule_ids, resolved_ref)`: the ids of every capsule
+/// installed, and the resolved git ref for GitHub-backed sources (`Some`), or
+/// `None` for local-path sources, which have no remote ref to resolve.
 pub(super) async fn install_capsule_inner(
-    source: &str,
-    name_hint: Option<&str>,
-    workspace: bool,
-    refspec: &RefSpec,
-    principal: &astrid_core::PrincipalId,
-    expected: Option<&CapsuleId>,
-    prompt: &ManualInstallOptions,
+    request: InstallRequest<'_>,
 ) -> anyhow::Result<(Vec<InstalledCapsuleOutcome>, Option<String>)> {
     let home = AstridHome::resolve()?;
+    install_capsule_inner_at(request, &home).await
+}
 
+pub(super) async fn install_capsule_inner_at(
+    request: InstallRequest<'_>,
+    home: &AstridHome,
+) -> anyhow::Result<(Vec<InstalledCapsuleOutcome>, Option<String>)> {
     // Recover any `@org/repo@version` CLI suffix and fold it into the
     // ref spec (an explicit RefSpec from a distro manifest wins).
-    let (base, suffix_version) = split_version_suffix(source);
-    let version = refspec
+    let (base, suffix_version) = split_version_suffix(request.source);
+    let version = request
+        .refspec
         .version
         .clone()
         .or_else(|| suffix_version.map(str::to_string));
-    let tag = refspec.tag.clone();
-    let expected = expected.map(|id| ExpectedCapsule {
+    let tag = request.refspec.tag.clone();
+    let expected = request.expected.map(|id| ExpectedCapsule {
         id,
         version: version.as_deref(),
     });
 
-    // 1. Explicit local path — record the path as the source so a
-    //    later `astrid distro update` can re-resolve from it (it's the
-    //    canonical reference for a locally-sourced capsule). No remote
-    //    ref to resolve.
-    if base.starts_with('.') || base.starts_with('/') {
-        let ids = install_from_local(
-            base,
-            workspace,
-            &home,
-            Some(base),
-            principal,
-            expected,
-            prompt,
-        )
-        .await?;
-        return Ok((ids, None));
-    }
-
-    // 2. Namespace alias @org/repo → GitHub.
-    if let Some(repo) = base.strip_prefix('@') {
-        let url = format!("https://github.com/{repo}");
-        return install_from_github(
-            &url,
-            name_hint,
-            version.as_deref(),
-            tag.as_deref(),
-            InstallContext {
-                workspace,
-                daemon: !workspace,
-                home: &home,
-                original_source: Some(base),
-                principal,
-                expected,
-                prompt,
-            },
-        )
-        .await;
-    }
-
-    // 3. Raw GitHub URL.
-    if base.starts_with("github.com/") || base.starts_with("https://github.com/") {
-        return install_from_github(
-            base,
-            name_hint,
-            version.as_deref(),
-            tag.as_deref(),
-            InstallContext {
-                workspace,
-                daemon: !workspace,
-                home: &home,
-                original_source: Some(base),
-                principal,
-                expected,
-                prompt,
-            },
-        )
-        .await;
-    }
-
-    // 4. Fallback: assume local folder. No remote ref to resolve.
-    let ids = install_from_local(
+    dispatch_source(SourceInstallContext {
         base,
-        workspace,
-        &home,
-        Some(base),
-        principal,
+        name_hint: request.name_hint,
+        version: version.as_deref(),
+        tag: tag.as_deref(),
+        workspace: request.workspace,
+        home,
+        principal: request.principal,
         expected,
+        prompt: request.prompt,
+        allow_station: request.allow_station,
+    })
+    .await
+}
+
+#[cfg(test)]
+pub(super) async fn test_install_station_source(
+    source: &str,
+    home: &AstridHome,
+    principal: &astrid_core::PrincipalId,
+    prompt: &ManualInstallOptions,
+) -> anyhow::Result<Vec<InstalledCapsuleOutcome>> {
+    test_install_station_source_with_workspace(source, home, principal, prompt, true).await
+}
+
+#[cfg(test)]
+pub(super) async fn test_install_station_source_with_workspace(
+    source: &str,
+    home: &AstridHome,
+    principal: &astrid_core::PrincipalId,
+    prompt: &ManualInstallOptions,
+    workspace: bool,
+) -> anyhow::Result<Vec<InstalledCapsuleOutcome>> {
+    let coordinate = source
+        .strip_prefix('@')
+        .ok_or_else(|| anyhow::anyhow!("test Station source must be a coordinate"))?;
+    let context = SourceInstallContext {
+        base: source,
+        name_hint: None,
+        version: None,
+        tag: None,
+        workspace,
+        home,
+        principal,
+        expected: None,
         prompt,
+        allow_station: true,
+    };
+    let (installed, _) = station_install::install_station_source(&context, coordinate).await?;
+    Ok(installed)
+}
+
+#[cfg(test)]
+pub(super) async fn test_install_local_source(
+    source: &str,
+    home: &AstridHome,
+    principal: &astrid_core::PrincipalId,
+    prompt: &ManualInstallOptions,
+) -> anyhow::Result<Vec<InstalledCapsuleOutcome>> {
+    let context = SourceInstallContext {
+        base: source,
+        name_hint: None,
+        version: None,
+        tag: None,
+        workspace: true,
+        home,
+        principal,
+        expected: None,
+        prompt,
+        allow_station: false,
+    };
+    let (installed, _) = install_local_source(&context).await?;
+    Ok(installed)
+}
+
+async fn dispatch_source(
+    context: SourceInstallContext<'_>,
+) -> anyhow::Result<(Vec<InstalledCapsuleOutcome>, Option<String>)> {
+    // Explicit paths and unknown source forms are local installs. A
+    // configured interactive @namespace/name may instead cross the Station
+    // trust boundary; every other @ form remains GitHub-backed.
+    if context.base.starts_with('.') || context.base.starts_with('/') {
+        return install_local_source(&context).await;
+    }
+    if context.allow_station
+        && !BATCH_MODE.load(Ordering::Relaxed)
+        && let Some(coordinate) = context.base.strip_prefix('@')
+        && coordinate.matches('/').count() == 1
+    {
+        let station_configured = station::is_configured()?;
+        if station_dispatch(context.base, true, context.workspace, station_configured)? {
+            return station_install::install_station_source(&context, coordinate).await;
+        }
+    }
+    if let Some(repo) = context.base.strip_prefix('@') {
+        let url = format!("https://github.com/{repo}");
+        return install_github_source(&context, &url).await;
+    }
+    if context.base.starts_with("github.com/") || context.base.starts_with("https://github.com/") {
+        return install_github_source(&context, context.base).await;
+    }
+    install_local_source(&context).await
+}
+
+async fn install_local_source(
+    context: &SourceInstallContext<'_>,
+) -> anyhow::Result<(Vec<InstalledCapsuleOutcome>, Option<String>)> {
+    let ids = install_from_local(LocalInstallCall {
+        source: context.base,
+        workspace: context.workspace,
+        home: context.home,
+        original_source: Some(context.base),
+        principal: context.principal,
+        expected: context.expected,
+        prompt: context.prompt,
+        station_binding: None,
+    })
+    .await?;
+    clear_replaced_station_locks(context.workspace, context.principal, &ids).await?;
+    Ok((ids, None))
+}
+
+async fn install_github_source(
+    context: &SourceInstallContext<'_>,
+    url: &str,
+) -> anyhow::Result<(Vec<InstalledCapsuleOutcome>, Option<String>)> {
+    let result = install_from_github(
+        url,
+        context.name_hint,
+        context.version,
+        context.tag,
+        InstallContext {
+            workspace: context.workspace,
+            daemon: !context.workspace,
+            home: context.home,
+            original_source: Some(context.base),
+            principal: context.principal,
+            expected: context.expected,
+            prompt: context.prompt,
+        },
     )
     .await?;
-    Ok((ids, None))
+    clear_replaced_station_locks(context.workspace, context.principal, &result.0).await?;
+    Ok(result)
+}
+
+/// Station locks are persisted through daemon control state. Workspace mode
+/// has no authenticated owner-scoped writer, so configured Station aliases
+/// must fail before resolution and handoff.
+pub(super) fn station_workspace_guard(
+    workspace: bool,
+    station_configured: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !(workspace && station_configured),
+        "Station coordinate installs require daemon/control state; use a daemon install"
+    );
+    Ok(())
+}
+
+/// Decide whether one interactive alias is a Station coordinate. Explicit
+/// GitHub URLs, unconfigured aliases, and provenance-preserving callers pass
+/// through to the existing GitHub/local dispatcher.
+pub(super) fn station_dispatch(
+    base: &str,
+    allow_station: bool,
+    workspace: bool,
+    station_configured: bool,
+) -> anyhow::Result<bool> {
+    let Some(coordinate) = base.strip_prefix('@') else {
+        return Ok(false);
+    };
+    if coordinate.matches('/').count() != 1 || !allow_station {
+        return Ok(false);
+    }
+    station_workspace_guard(workspace, station_configured)?;
+    Ok(station_configured)
+}
+
+async fn clear_replaced_station_locks(
+    workspace: bool,
+    principal: &astrid_core::PrincipalId,
+    installed: &[InstalledCapsuleOutcome],
+) -> anyhow::Result<()> {
+    if workspace && !station_rollback::station_lock_clear_ready() {
+        return Ok(());
+    }
+    for capsule in installed {
+        station::clear_lock(principal, capsule.id.as_str())
+            .await
+            .with_context(|| {
+                format!(
+                    "clear stale Station lock after installing {}",
+                    capsule.id.as_str()
+                )
+            })?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -500,6 +718,7 @@ async fn download_and_unpack(
                 context.principal,
                 context.prompt,
             )?,
+            None,
         )
         .await;
     }
@@ -627,6 +846,7 @@ async fn clone_and_build(
                     context.principal,
                     context.prompt,
                 )?,
+                None,
             )
             .await;
         }
@@ -642,317 +862,6 @@ async fn clone_and_build(
     }
 
     bail!("astrid-build produced no .capsule archive.");
-}
-
-async fn install_from_local(
-    source: &str,
-    workspace: bool,
-    home: &AstridHome,
-    original_source: Option<&str>,
-    principal: &astrid_core::PrincipalId,
-    expected: Option<ExpectedCapsule<'_>>,
-    prompt: &ManualInstallOptions,
-) -> anyhow::Result<Vec<InstalledCapsuleOutcome>> {
-    let source_path = Path::new(source);
-    if !source_path.exists() {
-        bail!("Source path does not exist: {source}");
-    }
-
-    // Unpack `.capsule` archive when source is a file.
-    if source_path.is_file() && source.ends_with(".capsule") {
-        if !workspace {
-            let installed = super::install_daemon::install_local_via_daemon_outcome(
-                source,
-                prompt,
-                daemon_install_authority(source, principal, prompt)?,
-            )
-            .await?;
-            return Ok(vec![installed]);
-        }
-        return unpack_via_lib(
-            source_path,
-            workspace,
-            home,
-            original_source,
-            principal,
-            expected,
-            prompt,
-        )
-        .map(|installed| vec![installed]);
-    }
-
-    // Auto-build Rust capsules when source is a directory with a Cargo.toml.
-    if source_path.is_dir() && source_path.join("Cargo.toml").exists() {
-        let tmp_dir = tempfile::tempdir().context("failed to create temp dir for building")?;
-        let output_dir = tmp_dir.path().join("dist");
-
-        let build_bin = crate::bootstrap::find_companion_binary("astrid-build")?;
-        let status = std::process::Command::new(build_bin)
-            .arg(source)
-            .arg("--output")
-            .arg(output_dir.to_str().context("Invalid output dir path")?)
-            .arg("--type")
-            .arg("rust")
-            .status()
-            .context("Failed to run astrid-build")?;
-        if !status.success() {
-            bail!(
-                "astrid-build failed with exit code {}",
-                status.code().unwrap_or(1)
-            );
-        }
-
-        for entry in std::fs::read_dir(&output_dir)? {
-            let entry = entry?;
-            if entry.path().extension().and_then(|s| s.to_str()) == Some("capsule") {
-                if !workspace {
-                    let archive = entry.path();
-                    let archive = archive
-                        .to_str()
-                        .context("built capsule archive path is not UTF-8")?;
-                    let installed = super::install_daemon::install_local_via_daemon_outcome(
-                        archive,
-                        prompt,
-                        daemon_install_authority(archive, principal, prompt)?,
-                    )
-                    .await?;
-                    return Ok(vec![installed]);
-                }
-                return unpack_via_lib(
-                    &entry.path(),
-                    workspace,
-                    home,
-                    original_source,
-                    principal,
-                    expected,
-                    prompt,
-                )
-                .map(|installed| vec![installed]);
-            }
-        }
-        bail!("Failed to auto-build capsule from Cargo project.");
-    }
-
-    if !workspace {
-        let installed = super::install_daemon::install_local_via_daemon_outcome(
-            source,
-            prompt,
-            daemon_install_authority(source, principal, prompt)?,
-        )
-        .await?;
-        return Ok(vec![installed]);
-    }
-
-    install_from_local_path_for_principal(
-        source_path,
-        workspace,
-        home,
-        original_source,
-        principal,
-        expected,
-        prompt,
-    )
-    .map(|installed| vec![installed])
-}
-
-/// Install a capsule from a directory containing `Capsule.toml`.
-/// CLI-facing wrapper that wires up an in-process event bus with a
-/// stdin elicit handler subscribed (so capsules can prompt for
-/// `[env]` values during their install lifecycle hook), runs the
-/// install via the shared lib, then renders post-install diagnostics
-/// and prompts for any unset `[env]` fields.
-pub(crate) fn install_from_local_path(
-    source_dir: &Path,
-    workspace: bool,
-    home: &AstridHome,
-    original_source: Option<&str>,
-    approve_untrusted: bool,
-) -> anyhow::Result<String> {
-    let principal = crate::principal::current();
-    let prompt = ManualInstallOptions {
-        approve_untrusted,
-        ..Default::default()
-    };
-    install_from_local_path_for_principal(
-        source_dir,
-        workspace,
-        home,
-        original_source,
-        &principal,
-        None,
-        &prompt,
-    )
-    .map(|installed| installed.id.as_str().to_string())
-}
-
-fn install_from_local_path_for_principal(
-    source_dir: &Path,
-    workspace: bool,
-    home: &AstridHome,
-    original_source: Option<&str>,
-    principal: &astrid_core::PrincipalId,
-    expected: Option<ExpectedCapsule<'_>>,
-    prompt: &ManualInstallOptions,
-) -> anyhow::Result<InstalledCapsuleOutcome> {
-    let inspection = inspect_directory_for_principal_with_layout(
-        source_dir,
-        home,
-        principal,
-        workspace,
-        crate::workspace_layout::current(),
-    )?;
-    let authority = authority_decision(&inspection, prompt)?;
-    let opts = InstallOptions {
-        workspace,
-        original_source: original_source.map(String::from),
-        skip_import_check: BATCH_MODE.load(Ordering::Relaxed),
-        lifecycle_bus: None,
-        storage: None,
-        provenance_distro: None,
-        provenance_source_digest: None,
-    };
-    let output = run_with_elicit(opts, prompt, |opts, bus| {
-        let opts = InstallOptions {
-            lifecycle_bus: Some(bus),
-            ..opts
-        };
-        match expected {
-            Some(expected) => {
-                astrid_capsule_install::install_from_local_path_checked_authorized_for_principal_with_layout(
-                    source_dir,
-                    home,
-                    opts,
-                    principal,
-                    expected.id,
-                    expected.version,
-                    &authority,
-                    crate::workspace_layout::current(),
-                )
-            },
-            None => astrid_capsule_install::install_from_local_path_authorized_for_principal_with_layout(
-                source_dir,
-                home,
-                opts,
-                principal,
-                &authority,
-                crate::workspace_layout::current(),
-            ),
-        }
-    })?;
-    finish_install(&output, home, principal, prompt)
-}
-
-/// Install a capsule from a local `.capsule` file in batch (offline)
-/// mode, recording `original_source` and signing provenance in
-/// `meta.json`.
-/// Used by the `.shuttle` offline-install path: the file already lives
-/// in the verified mirror, so no network is touched. `original_source`
-/// is the distro's canonical `@org/repo` (NOT the mirror path) so a
-/// later online `update` can re-resolve. Provenance fields are
-/// descriptive — trust was established by the distro signature check
-/// before this is called, not re-derived here.
-pub(crate) fn install_offline_capsule(
-    archive: &Path,
-    home: &AstridHome,
-    expected: &CapsuleId,
-    expected_version: Option<&str>,
-    provenance: OfflineCapsuleProvenance<'_>,
-    principal: &astrid_core::PrincipalId,
-) -> anyhow::Result<InstalledCapsuleOutcome> {
-    BATCH_MODE.store(true, Ordering::Relaxed);
-    let prompt = ManualInstallOptions::default();
-    let result = (|| {
-        let installed = unpack_via_lib(
-            archive,
-            false,
-            home,
-            Some(provenance.original_source),
-            principal,
-            Some(ExpectedCapsule {
-                id: expected,
-                version: expected_version,
-            }),
-            &prompt,
-        )?;
-        // Post-stamp provenance into the freshly-written meta.json. The
-        // unpack above installs under the explicit target principal and
-        // selected workspace layout, so read metadata through the same path.
-        let target_dir = resolve_target_dir_for_with_layout(
-            home,
-            principal,
-            expected.as_str(),
-            false,
-            crate::workspace_layout::current(),
-        )?;
-        if let Some(mut meta) = super::meta::read_meta(&target_dir) {
-            meta.resolved_ref = provenance.resolved_ref.map(String::from);
-            meta.signer = provenance.signer.map(String::from);
-            meta.signature = provenance.signature.map(String::from);
-            super::meta::write_meta(&target_dir, &meta)?;
-        }
-        Ok(installed)
-    })();
-    BATCH_MODE.store(false, Ordering::Relaxed);
-    result
-}
-
-/// Unpack a `.capsule` archive and install from it. Returns the installed
-/// capsule id.
-fn unpack_via_lib(
-    archive: &Path,
-    workspace: bool,
-    home: &AstridHome,
-    original_source: Option<&str>,
-    principal: &astrid_core::PrincipalId,
-    expected: Option<ExpectedCapsule<'_>>,
-    prompt: &ManualInstallOptions,
-) -> anyhow::Result<InstalledCapsuleOutcome> {
-    let inspection = inspect_archive_for_principal_with_layout(
-        archive,
-        home,
-        principal,
-        workspace,
-        crate::workspace_layout::current(),
-    )?;
-    let authority = authority_decision(&inspection, prompt)?;
-    let opts = InstallOptions {
-        workspace,
-        original_source: original_source.map(String::from),
-        skip_import_check: BATCH_MODE.load(Ordering::Relaxed),
-        lifecycle_bus: None,
-        storage: None,
-        provenance_distro: None,
-        provenance_source_digest: None,
-    };
-    let output = run_with_elicit(opts, prompt, |opts, bus| {
-        let opts = InstallOptions {
-            lifecycle_bus: Some(bus),
-            ..opts
-        };
-        match expected {
-            Some(expected) => {
-                astrid_capsule_install::unpack_and_install_checked_authorized_for_principal_with_layout(
-                    archive,
-                    home,
-                    opts,
-                    principal,
-                    expected.id,
-                    expected.version,
-                    &authority,
-                    crate::workspace_layout::current(),
-                )
-            },
-            None => astrid_capsule_install::unpack_and_install_authorized_for_principal_with_layout(
-                archive,
-                home,
-                opts,
-                principal,
-                &authority,
-                crate::workspace_layout::current(),
-            ),
-        }
-    })?;
-    finish_install(&output, home, principal, prompt)
 }
 
 // Source-resolution tests live here; install machinery is tested in

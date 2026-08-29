@@ -1,6 +1,73 @@
 use super::{DeviceKeyInfo, EnvEntry, PrincipalId, Quotas, StorageMountLeaseV1};
 use serde::{Deserialize, Serialize};
 
+/// Coordinate carried by a Station publication lock.
+///
+/// This deliberately mirrors Station's JSON shape without linking the core
+/// API to the standalone Station crate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StationCoordinate {
+    /// Namespace portion of the Station coordinate.
+    pub namespace: String,
+    /// Capsule name portion of the Station coordinate.
+    pub name: String,
+}
+
+/// Exact Station `station-lock-v2` wire record.
+///
+/// The record is stored as typed owner control state, not inside a capsule
+/// package or Astrid's content-addressed stores. Field names intentionally
+/// match Station's lock wire; there is no Astrid-specific second schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StationLock {
+    /// Stable Station lock discriminator. Must be `station-lock-v2`.
+    pub schema: String,
+    /// Station identity.
+    pub station_id: String,
+    /// Pinned trust-root fingerprint.
+    pub trust_root: String,
+    /// Published capsule coordinate.
+    pub coordinate: StationCoordinate,
+    /// Canonical semantic version.
+    pub version: String,
+    /// Sealed publication digest.
+    pub publication_digest: String,
+    /// Transport artifact byte length.
+    pub artifact_size: u64,
+    /// Transport media type.
+    pub artifact_media_type: String,
+    /// Transport SHA-256 digest.
+    pub artifact_sha256: String,
+    /// Transport BLAKE3 digest.
+    pub artifact_blake3: String,
+    /// Digest of the exact Capsule.toml bytes under Astrid's manifest domain.
+    pub manifest_digest: String,
+    /// Capsule content-tree digest.
+    pub capsule_content_digest: String,
+    /// Embedded package digest.
+    pub package_digest: String,
+    /// Number of components in the package.
+    pub component_count: u32,
+    /// Component-set digest.
+    pub component_digest: String,
+    /// WIT map/aggregate digest.
+    pub wit_digest: String,
+    /// Effective capability declaration digest.
+    pub capability_digest: String,
+    /// Full IPC definition digest.
+    pub ipc_digest: String,
+    /// Runtime ABI digest.
+    pub runtime_abi_digest: String,
+    /// Dependency declaration digest.
+    pub dependency_digest: String,
+    /// Build provenance digest.
+    pub provenance_digest: String,
+    /// Source provenance digest.
+    pub source_digest: String,
+}
+
 /// Durable provenance for one authenticated principal's distro installation.
 ///
 /// This is control-plane state, not an ordinary home file. The kernel stores
@@ -59,6 +126,8 @@ pub enum AdminResponseBody {
     EnvList(Vec<EnvEntry>),
     /// Response for [`AdminRequestKind::DistroLockGet`].
     DistroLock(Box<Option<DistroProvenance>>),
+    /// Response for [`AdminRequestKind::StationLockGet`].
+    StationLock(Box<Option<StationLock>>),
     /// Response for [`AdminRequestKind::InviteIssue`] — the freshly
     /// minted token plus its persisted metadata. The redemption URL is
     /// derived client-side from the deployment's public gateway base

@@ -22,6 +22,11 @@ pub(crate) fn write_headless_env_fields(
     principal: &PrincipalId,
     vars: &HashMap<String, String>,
 ) -> anyhow::Result<()> {
+    // A config-free capsule has nothing to project into the daemon. Keeping
+    // this path local also lets offline/manual installs remain daemon-free.
+    if env_defs.is_empty() && vars.is_empty() {
+        return Ok(());
+    }
     for key in vars.keys() {
         if !env_defs.contains_key(key) {
             anyhow::bail!("--var names no [env] field in {capsule_id}: {key}");

@@ -19,6 +19,8 @@ use crate::context;
 use crate::theme::Theme;
 use crate::value_formatter::{ValueFormat, emit_structured};
 
+use super::station;
+
 #[derive(Args, Debug, Clone)]
 pub(crate) struct ShowArgs {
     /// Capsule name.
@@ -59,6 +61,10 @@ pub(crate) struct CapsuleShow {
     pub manifest: String,
     /// Human-facing permissions derived from the manifest.
     pub permissions: Vec<SemanticCapability>,
+    /// Station coordinate/publication identity, when this owner has a
+    /// Station lock. This is separate from the daemon `source` UUID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_source: Option<String>,
 }
 
 /// Entry point for `astrid capsule show`.
@@ -86,6 +92,8 @@ pub(crate) async fn run(args: &ShowArgs) -> Result<ExitCode> {
     let capabilities: astrid_capsule_types::manifest::CapabilitiesDef =
         serde_json::from_value(entry.capabilities.clone())?;
     let permissions = semantic_capabilities(&capabilities);
+    let station_lock = station::load_lock(&principal, &entry.name).await?;
+    let registry_source = registry_identity(station_lock.as_ref());
     let manifest = serde_json::to_string_pretty(&serde_json::json!({
         "package": {
             "name": entry.name,
@@ -110,6 +118,7 @@ pub(crate) async fn run(args: &ShowArgs) -> Result<ExitCode> {
         contracts_status: "daemon-registry".to_owned(),
         manifest,
         permissions,
+        registry_source,
     };
 
     if !format.is_pretty() {
@@ -120,7 +129,10 @@ pub(crate) async fn run(args: &ShowArgs) -> Result<ExitCode> {
     println!("{} {}", "Capsule".bold(), args.name.cyan());
     println!("  Version:      {}", record.version);
     println!("  Source:       {}", record.source);
-    println!("  Registry:     daemon-owned");
+    println!(
+        "  Registry:     {}",
+        record.registry_source.as_deref().unwrap_or("daemon-owned")
+    );
     println!("  Agent:        {principal}");
     println!();
     print_permissions(&record.permissions);
@@ -130,6 +142,18 @@ pub(crate) async fn run(args: &ShowArgs) -> Result<ExitCode> {
         println!("  {line}");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Render the owner-scoped Station identity shown alongside the daemon source.
+pub(crate) fn registry_identity(
+    lock: Option<&astrid_core::kernel_api::StationLock>,
+) -> Option<String> {
+    lock.map(|lock| {
+        format!(
+            "@{}/{} ({})",
+            lock.coordinate.namespace, lock.coordinate.name, lock.publication_digest
+        )
+    })
 }
 
 fn print_permissions(permissions: &[SemanticCapability]) {
@@ -278,11 +302,39 @@ mod tests {
             contracts_status: "match".into(),
             manifest: "[package]\nname = \"x\"\n".into(),
             permissions: Vec::new(),
+            registry_source: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["name"], "x");
         assert_eq!(parsed["version"], "0.1.0");
         assert_eq!(parsed["contracts_status"], "match");
+    }
+
+    #[test]
+    fn source_uuid_and_station_registry_identity_are_separate() {
+        let rec = CapsuleShow {
+            name: "demo".into(),
+            version: "1.0.0".into(),
+            source: "8d5f2f7d-c89f-4d8f-9ac8-4b5e3d7c7b2d".into(),
+            wasm_hash: String::new(),
+            installed_at: String::new(),
+            updated_at: String::new(),
+            contracts_pin: None,
+            contracts_canonical: None,
+            contracts_status: "daemon-registry".into(),
+            manifest: String::new(),
+            permissions: Vec::new(),
+            registry_source: Some(
+                "@official/demo (blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)"
+                    .into(),
+            ),
+        };
+        let json = serde_json::to_value(rec).unwrap();
+        assert_eq!(json["source"], "8d5f2f7d-c89f-4d8f-9ac8-4b5e3d7c7b2d");
+        assert_eq!(
+            json["registry_source"],
+            "@official/demo (blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)"
+        );
     }
 }

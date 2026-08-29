@@ -52,15 +52,16 @@ pub(crate) async fn install_capsule_batch(
     );
     super::install::BATCH_MODE.store(true, Ordering::Relaxed);
     let prompt = super::install::ManualInstallOptions::default();
-    let result = super::install::install_capsule_inner(
+    let result = super::install::install_capsule_inner(super::install::InstallRequest {
         source,
-        Some(expected.as_str()),
+        name_hint: Some(expected.as_str()),
         workspace,
         refspec,
         principal,
-        Some(expected),
-        &prompt,
-    )
+        expected: Some(expected),
+        prompt: &prompt,
+        allow_station: false,
+    })
     .await;
     super::install::BATCH_MODE.store(false, Ordering::Relaxed);
     result.map(|(installed, resolved_ref)| BatchInstallOutcome {

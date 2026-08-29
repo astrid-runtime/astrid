@@ -1,5 +1,6 @@
 //! Capsule install and environment wire types.
 
+use super::response_types::StationLock;
 use serde::{Deserialize, Serialize};
 
 /// Host-owned projection selected by an env/secret admin request.
@@ -82,4 +83,26 @@ pub struct CapsuleInstallEnv {
     pub value: String,
     /// Secret or non-secret projection.
     pub kind: EnvValueKind,
+}
+
+/// Typed Station handoff bound into one daemon-owned install transaction.
+///
+/// When this value accompanies [`KernelRequest::InstallCapsule`](super::KernelRequest::InstallCapsule),
+/// the daemon verifies that the exact source bytes named by the embedded
+/// Station lock are staged once into private storage, installs only those
+/// bytes, and persists the lock inside the same owner/capsule critical
+/// section as the package mutation. `expected_hash` follows the same create
+/// semantics as the typed Station lock admin API: `None` means the caller
+/// expects no prior lock, never "mutate unconditionally". Omitting the whole
+/// binding performs no Station mutation at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StationInstallBinding {
+    /// Capsule package key owning the durable Station lock record.
+    pub capsule: String,
+    /// Exact verified Station lock whose artifact digests name these bytes.
+    pub lock: Box<StationLock>,
+    /// Canonical BLAKE3 digest of the prior owner-scoped lock JSON. `None`
+    /// expects no prior record; a supplied digest must still be present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_hash: Option<String>,
 }

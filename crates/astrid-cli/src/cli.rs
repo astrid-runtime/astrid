@@ -394,6 +394,15 @@ pub(crate) enum CapsuleCommands {
         /// Does not trust its signer for future installs.
         #[arg(long)]
         approve_untrusted: bool,
+        /// Carry a verified Station lock with this private local `.capsule` handoff.
+        /// The lock is validated against the exact artifact before any daemon write;
+        /// this is not a generic source or authority override.
+        #[arg(long, value_name = "PATH")]
+        station_lock: Option<PathBuf>,
+        /// SHA-256 of the raw Station lock bytes written for this handoff.
+        /// This internal sidecar binds the lock to the Station subprocess output.
+        #[arg(long, value_name = "DIGEST", hide = true)]
+        station_lock_sha256: Option<String>,
         /// Pre-supply a value; prefer `ASTRID_VAR_<KEY>` for secrets (repeatable).
         #[arg(long = "var", value_name = "KEY=VALUE")]
         vars: Vec<String>,

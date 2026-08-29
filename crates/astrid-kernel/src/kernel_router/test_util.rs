@@ -18,6 +18,7 @@ pub(crate) fn all_kernel_request_variants() -> Vec<KernelRequest> {
             provenance: None,
             authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
             env: Vec::new(),
+            station_binding: None,
         },
         KernelRequest::ListCapsules,
         KernelRequest::GetCommands,

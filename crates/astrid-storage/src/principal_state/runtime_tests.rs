@@ -1458,14 +1458,35 @@ fn control_namespaces_require_admitted_immutable_uids() {
             .unwrap(),
         StateOwner::Principal(uid)
     );
+    assert_eq!(
+        resolver
+            .resolve(&format!("principal-uid:{uid}:control:station"))
+            .unwrap(),
+        StateOwner::Principal(uid)
+    );
+    assert!(matches!(
+        resolver.resolve(&format!("principal-uid:{uid}:control:station:runner")),
+        Err(StorageError::InvalidKey(message))
+            if message.contains("invalid projection or capsule")
+    ));
     assert!(matches!(
         resolver.resolve("alice:control:env:runner"),
+        Err(StorageError::InvalidKey(message))
+            if message.contains("immutable principal-uid")
+    ));
+    assert!(matches!(
+        resolver.resolve("alice:control:station"),
         Err(StorageError::InvalidKey(message))
             if message.contains("immutable principal-uid")
     ));
     let unknown = PrincipalUid::from_bytes([0xa5; 32]);
     assert!(matches!(
         resolver.resolve(&format!("principal-uid:{unknown}:control:env:runner")),
+        Err(StorageError::InvalidKey(message))
+            if message.contains("not an admitted durable identity")
+    ));
+    assert!(matches!(
+        resolver.resolve(&format!("principal-uid:{unknown}:control:station")),
         Err(StorageError::InvalidKey(message))
             if message.contains("not an admitted durable identity")
     ));
@@ -1481,6 +1502,11 @@ fn control_namespaces_require_admitted_immutable_uids() {
         resolver.resolve("system:control:pair-tokens").unwrap(),
         StateOwner::System
     );
+    assert!(matches!(
+        resolver.resolve("system:control:station"),
+        Err(StorageError::InvalidKey(message))
+            if message.contains("immutable principal-uid")
+    ));
     assert!(matches!(
         resolver.resolve("system:control:unknown"),
         Err(StorageError::InvalidKey(message))
