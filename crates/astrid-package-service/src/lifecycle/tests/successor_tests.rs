@@ -200,7 +200,7 @@ fn recorded_drain_deadline_blocks_success_at_and_after_boundary() {
     assert_eq!(restored.lifecycle_state(), &LifecycleState::Inactive);
     assert_eq!(
         restored.generation_value().get(),
-        draining.generation_value().get()
+        proved.generation_value().get() + 1
     );
 }
 

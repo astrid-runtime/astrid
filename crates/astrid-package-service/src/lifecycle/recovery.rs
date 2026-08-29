@@ -1,6 +1,6 @@
 use super::{
-    PackageServiceModel, first_state_generation, next_generation_value, recorded_drain_deadline,
-    restore_prior_content_to_successor,
+    PackageServiceModel, active_drain_lineage, first_state_generation, next_generation_value,
+    recorded_drain_deadline, restore_to_boundary_successor,
 };
 use crate::bytes::RecoveryToken;
 use crate::context::{Operation, OperationContext, Timestamp};
@@ -8,7 +8,7 @@ use crate::digest::{AuthorityDecisionDigest, StateDigest};
 use crate::error::{PackageServiceError, PackageServiceResult};
 use crate::identity::{Nonce, STATE_SCHEMA_VERSION};
 use crate::journal::{JournalStatus, OperationReceipt, ReceiptOutcome, RecoveryEvidence};
-use crate::state::{CanonicalInstalledState, LifecycleState, PackageSlot};
+use crate::state::{CanonicalInstalledState, DrainLineage, LifecycleState, PackageSlot};
 use std::num::NonZeroU64;
 
 #[derive(Clone)]
@@ -19,11 +19,11 @@ struct RecoverySnapshot {
     before: StateDigest,
     boundary_generation: Option<NonZeroU64>,
     drain_deadline: Option<Timestamp>,
-    base_state: Option<CanonicalInstalledState>,
+    drain_lineage: Option<DrainLineage>,
 }
 
 enum RecoveryEffect {
-    RestoreInactive { generation: NonZeroU64 },
+    RestoreInactive,
     Commit(Option<Box<CanonicalInstalledState>>),
 }
 
@@ -77,13 +77,19 @@ impl PackageServiceModel {
             return Err(PackageServiceError::RecordNotReconcilable);
         }
         let nonce = record.context().nonce();
-        let drain_deadline = match self
+        let slot_record = self
             .slots
             .get(&slot)
-            .and_then(|slot_record| slot_record.state())
-        {
+            .ok_or(PackageServiceError::RecordMissing)?;
+        let drain_deadline = match slot_record.state() {
             Some(state) => recorded_drain_deadline(state, &nonce)?,
             None => None,
+        };
+        let drain_lineage = match slot_record.state() {
+            Some(state) if matches!(state.lifecycle_state(), LifecycleState::Draining { .. }) => {
+                Some(active_drain_lineage(slot_record, &nonce)?)
+            },
+            _ => None,
         };
         Ok(RecoverySnapshot {
             context: record.context().clone(),
@@ -92,7 +98,7 @@ impl PackageServiceModel {
             before: record.before_state(),
             boundary_generation: record.state_generation(),
             drain_deadline,
-            base_state: record.drain_base_state().cloned(),
+            drain_lineage,
         })
     }
 
@@ -113,10 +119,14 @@ impl PackageServiceModel {
             .journal_record(&snapshot.context.nonce())
             .ok_or(PackageServiceError::RecordMissing)?;
         if evidence.observed_state().as_bytes() == snapshot.before.as_bytes() {
-            let record = slot_record
-                .journal_record(&snapshot.context.nonce())
-                .ok_or(PackageServiceError::RecordMissing)?;
-            return Ok(record.drain_base_state().cloned());
+            let lineage = snapshot
+                .drain_lineage
+                .as_ref()
+                .ok_or(PackageServiceError::RecoveryUnresolved)?;
+            if lineage.base_state().digest() != snapshot.before {
+                return Err(PackageServiceError::RecoveryUnresolved);
+            }
+            return Ok(Some(lineage.base_state().clone()));
         }
         Ok(slot_record.state().cloned())
     }
@@ -139,17 +149,19 @@ impl PackageServiceModel {
             .get_mut(&slot)
             .ok_or(PackageServiceError::RecordMissing)?;
         match effect {
-            RecoveryEffect::RestoreInactive { generation } => {
-                let base = record_slot
-                    .journal_mut(&nonce)
-                    .and_then(crate::journal::OperationJournalRecord::take_drain_base_state)
+            RecoveryEffect::RestoreInactive => {
+                let lineage = record_slot
+                    .journal_record(&nonce)
+                    .and_then(crate::journal::OperationJournalRecord::drain_lineage)
+                    .cloned()
                     .ok_or(PackageServiceError::OccupancyCorruption)?;
-                let restored = restore_prior_content_to_successor(base, nonce, generation)?;
+                let restored = restore_to_boundary_successor(&lineage, &nonce)?;
                 let generation = restored.generation_value();
                 record_slot.replace_state(Some(restored));
                 let journal = record_slot
                     .journal_mut(&nonce)
                     .ok_or(PackageServiceError::RecordMissing)?;
+                journal.take_drain_lineage();
                 journal.set_state_generation(generation);
                 journal.resolve_recovery(None, JournalStatus::Failed, now);
             },
@@ -232,19 +244,15 @@ fn restore_effect(
         return Err(PackageServiceError::RecoveryUnresolved);
     }
     let state = observed.ok_or(PackageServiceError::RecoveryUnresolved)?;
-    let expected_base = snapshot
-        .base_state
+    let lineage = snapshot
+        .drain_lineage
         .as_ref()
         .ok_or(PackageServiceError::RecoveryUnresolved)?;
-    if state != expected_base {
-        return Err(PackageServiceError::RecoveryUnresolved);
-    }
-    let expected_generation = snapshot
-        .boundary_generation
-        .and_then(|generation| generation.get().checked_sub(1))
-        .and_then(NonZeroU64::new)
-        .ok_or(PackageServiceError::RecoveryUnresolved)?;
+    let base = lineage.base_state();
+    let expected_generation = base.generation_value();
     if state.digest() != snapshot.before
+        || lineage.base_state().digest() != snapshot.before
+        || state != base
         || !state.has_valid_digest()
         || state.schema_version() != STATE_SCHEMA_VERSION
         || state.generation_value() != expected_generation
@@ -255,12 +263,7 @@ fn restore_effect(
     {
         return Err(PackageServiceError::RecoveryUnresolved);
     }
-    let generation = next_generation_value(
-        snapshot
-            .boundary_generation
-            .ok_or(PackageServiceError::RecoveryUnresolved)?,
-    )?;
-    Ok(RecoveryEffect::RestoreInactive { generation })
+    Ok(RecoveryEffect::RestoreInactive)
 }
 
 fn absence_effect(
@@ -327,6 +330,9 @@ fn validate_observed_state(
 fn exact_successor_generation(snapshot: &RecoverySnapshot) -> PackageServiceResult<NonZeroU64> {
     if snapshot.context.operation() == crate::context::Operation::Install {
         return first_state_generation();
+    }
+    if let Some(lineage) = snapshot.drain_lineage.as_ref() {
+        return next_generation_value(lineage.boundary_generation());
     }
     next_generation_value(
         snapshot

@@ -11,13 +11,16 @@ use crate::journal::{
 };
 use crate::policy::{JournalPolicy, Occupancy};
 use crate::state::{
-    CanonicalInstalledState, DrainDestination, ExpectedPackageState, InstalledStateSpec,
-    LifecycleState, PackageSlot,
+    CanonicalInstalledState, DrainDestination, DrainLineage, ExpectedPackageState,
+    InstalledStateSpec, LifecycleState, PackageSlot,
 };
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
+mod lineage;
 mod recovery;
+
+use self::lineage::{active_drain_lineage, restore_to_boundary_successor};
 
 /// Pure executable owner/package state model.
 #[derive(Debug)]
@@ -283,7 +286,7 @@ impl PackageServiceModel {
             *nonce,
         );
         if let Some(journal) = record.journal_mut(nonce) {
-            journal.set_drain_base_state(base_state);
+            journal.set_drain_lineage(DrainLineage::new(base_state, generation)?);
         }
         record.replace_state(Some(replacement.clone()));
         let journal = record
@@ -331,6 +334,7 @@ impl PackageServiceModel {
         if now >= *deadline {
             return Err(PackageServiceError::AuthorityExpired);
         }
+        active_drain_lineage(record, nonce)?;
         let deadline = *deadline;
         let destination = *destination;
         let generation = next_generation(&state)?;
@@ -350,7 +354,7 @@ impl PackageServiceModel {
         let journal = record
             .journal_mut(nonce)
             .ok_or(PackageServiceError::RecordMissing)?;
-        journal.set_state_generation(generation);
+        journal.advance_drain_boundary()?;
         Ok(())
     }
 
@@ -427,6 +431,7 @@ impl PackageServiceModel {
                 };
                 require_open_drain(&state, nonce, now)?;
                 require_zero_drain(&state, *nonce, DrainDestination::Replacement)?;
+                active_drain_lineage(record_slot, nonce)?;
                 if !zero_leases_proved {
                     return Err(PackageServiceError::DrainBlocked);
                 }
@@ -479,6 +484,7 @@ impl PackageServiceModel {
                 };
                 require_open_drain(&state, nonce, now)?;
                 require_zero_drain(&state, *nonce, DrainDestination::Removal)?;
+                active_drain_lineage(record_slot, nonce)?;
                 if !zero_leases_proved {
                     return Err(PackageServiceError::DrainBlocked);
                 }
@@ -503,6 +509,7 @@ impl PackageServiceModel {
         let journal = record_slot
             .journal_mut(nonce)
             .ok_or(PackageServiceError::RecordMissing)?;
+        journal.take_drain_lineage();
         journal.set_state_generation(generation);
         journal.commit(receipt.clone(), now);
         Ok(receipt)
@@ -548,12 +555,15 @@ impl PackageServiceModel {
             if now >= deadline {
                 return Err(PackageServiceError::LifecycleTransition);
             }
-            let restored = record_slot
-                .journal_mut(nonce)
-                .and_then(OperationJournalRecord::take_drain_base_state)
-                .ok_or(PackageServiceError::OccupancyCorruption)?;
-            let safe_restored = restore_prior_content(restored, *nonce)?;
+            let lineage = active_drain_lineage(record_slot, nonce)?;
+            let safe_restored = restore_to_boundary_successor(&lineage, nonce)?;
+            let restored_generation = safe_restored.generation_value();
             record_slot.replace_state(Some(safe_restored));
+            let journal = record_slot
+                .journal_mut(nonce)
+                .ok_or(PackageServiceError::RecordMissing)?;
+            journal.take_drain_lineage();
+            journal.set_state_generation(restored_generation);
         }
         let journal = record_slot
             .journal_mut(nonce)
@@ -585,7 +595,7 @@ impl PackageServiceModel {
         let LifecycleState::Draining {
             deadline,
             nonce: drain_nonce,
-            live_leases,
+            live_leases: _,
             destination,
         } = state.lifecycle_state()
         else {
@@ -594,13 +604,14 @@ impl PackageServiceModel {
         if drain_nonce.as_bytes() != nonce.as_bytes() || now < *deadline {
             return Err(PackageServiceError::LifecycleTransition);
         }
-        if *live_leases > 0 || !zero_leases_proved {
+        if !zero_leases_proved {
             let journal = record_slot
                 .journal_mut(nonce)
                 .ok_or(PackageServiceError::RecordMissing)?;
             journal.mark_unknown(now);
             return Ok(DrainResult::Blocked);
         }
+        let lineage = active_drain_lineage(record_slot, nonce)?;
         if *destination == DrainDestination::Removal {
             let generation = record_slot
                 .journal_record(nonce)
@@ -614,18 +625,18 @@ impl PackageServiceModel {
             if let Some(generation) = generation {
                 journal.set_state_generation(generation);
             }
+            journal.take_drain_lineage();
             journal.terminal_failure(JournalStatus::Expired, now);
             return Ok(DrainResult::Completed);
         }
-        let restored = record_slot
-            .journal_mut(nonce)
-            .and_then(OperationJournalRecord::take_drain_base_state)
-            .ok_or(PackageServiceError::OccupancyCorruption)?;
-        let safe_restored = restore_prior_content(restored, *nonce)?;
+        let safe_restored = restore_to_boundary_successor(&lineage, nonce)?;
+        let restored_generation = safe_restored.generation_value();
         record_slot.replace_state(Some(safe_restored));
         let journal = record_slot
             .journal_mut(nonce)
             .ok_or(PackageServiceError::RecordMissing)?;
+        journal.take_drain_lineage();
+        journal.set_state_generation(restored_generation);
         journal.terminal_failure(JournalStatus::Expired, now);
         Ok(DrainResult::Completed)
     }
@@ -837,14 +848,6 @@ fn require_zero_drain(
         return Err(PackageServiceError::DrainBlocked);
     }
     Ok(())
-}
-
-fn restore_prior_content(
-    state: CanonicalInstalledState,
-    completing_nonce: Nonce,
-) -> PackageServiceResult<CanonicalInstalledState> {
-    let generation = next_generation(&state)?;
-    restore_prior_content_to_successor(state, completing_nonce, generation)
 }
 
 fn restore_prior_content_to_successor(

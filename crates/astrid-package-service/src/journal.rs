@@ -6,7 +6,7 @@ use crate::digest::{
 };
 use crate::error::{PackageServiceError, PackageServiceResult};
 use crate::identity::{JOURNAL_SCHEMA_VERSION, JournalSchemaVersion, Nonce, ProtocolVersion};
-use crate::state::{CanonicalInstalledState, DrainDestination, PackageSlot};
+use crate::state::{CanonicalInstalledState, DrainDestination, DrainLineage, PackageSlot};
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
@@ -349,7 +349,7 @@ pub struct OperationJournalRecord {
     receipt: Option<OperationReceipt>,
     recovery_token: RecoveryToken,
     state_generation: Option<NonZeroU64>,
-    drain_base_state: Option<CanonicalInstalledState>,
+    drain_lineage: Option<DrainLineage>,
 }
 
 impl OperationJournalRecord {
@@ -402,7 +402,7 @@ impl OperationJournalRecord {
             receipt: None,
             recovery_token,
             state_generation,
-            drain_base_state: None,
+            drain_lineage: None,
         }
     }
 
@@ -469,16 +469,28 @@ impl OperationJournalRecord {
         self.state_generation = Some(generation);
     }
 
-    pub(crate) fn set_drain_base_state(&mut self, state: CanonicalInstalledState) {
-        self.drain_base_state = Some(state);
+    pub(crate) fn set_drain_lineage(&mut self, lineage: DrainLineage) {
+        self.drain_lineage = Some(lineage);
     }
 
-    pub(crate) const fn drain_base_state(&self) -> Option<&CanonicalInstalledState> {
-        self.drain_base_state.as_ref()
+    pub(crate) const fn drain_lineage(&self) -> Option<&DrainLineage> {
+        self.drain_lineage.as_ref()
     }
 
-    pub(crate) fn take_drain_base_state(&mut self) -> Option<CanonicalInstalledState> {
-        self.drain_base_state.take()
+    pub(crate) fn advance_drain_boundary(&mut self) -> PackageServiceResult<()> {
+        let lineage = self
+            .drain_lineage
+            .as_ref()
+            .ok_or(PackageServiceError::OccupancyCorruption)?
+            .advanced()?;
+        let generation = lineage.boundary_generation();
+        self.drain_lineage = Some(lineage);
+        self.state_generation = Some(generation);
+        Ok(())
+    }
+
+    pub(crate) fn take_drain_lineage(&mut self) -> Option<DrainLineage> {
+        self.drain_lineage.take()
     }
 
     pub(crate) const fn before_state(&self) -> StateDigest {

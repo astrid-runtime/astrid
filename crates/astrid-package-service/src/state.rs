@@ -164,6 +164,55 @@ pub struct CanonicalInstalledState {
     digest: StateDigest,
 }
 
+/// The immutable prior content and authoritative boundary of an active drain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DrainLineage {
+    base_state: CanonicalInstalledState,
+    boundary_generation: NonZeroU64,
+}
+
+impl DrainLineage {
+    pub(crate) fn new(
+        base_state: CanonicalInstalledState,
+        boundary_generation: NonZeroU64,
+    ) -> PackageServiceResult<Self> {
+        if !base_state.has_valid_digest()
+            || matches!(
+                base_state.lifecycle_state(),
+                LifecycleState::Draining { .. }
+            )
+            || boundary_generation.get() <= base_state.generation_value().get()
+        {
+            return Err(PackageServiceError::InvalidValue("drain lineage"));
+        }
+        Ok(Self {
+            base_state,
+            boundary_generation,
+        })
+    }
+
+    pub(crate) fn advanced(&self) -> PackageServiceResult<Self> {
+        let generation = self
+            .boundary_generation
+            .get()
+            .checked_add(1)
+            .ok_or(PackageServiceError::GenerationOverflow)?;
+        let generation = NonZeroU64::try_from(generation).map_err(PackageServiceError::from)?;
+        Ok(Self {
+            base_state: self.base_state.clone(),
+            boundary_generation: generation,
+        })
+    }
+
+    pub(crate) const fn base_state(&self) -> &CanonicalInstalledState {
+        &self.base_state
+    }
+
+    pub(crate) const fn boundary_generation(&self) -> NonZeroU64 {
+        self.boundary_generation
+    }
+}
+
 impl CanonicalInstalledState {
     /// Constructs, validates, and digests a canonical installed state.
     pub fn new(spec: InstalledStateSpec) -> PackageServiceResult<Self> {

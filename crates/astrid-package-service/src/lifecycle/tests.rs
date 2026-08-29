@@ -16,6 +16,7 @@ use std::num::{NonZeroU32, NonZeroU64};
 use std::time::Duration;
 
 mod cure_tests;
+mod lineage_tests;
 mod successor_tests;
 
 fn non_zero(value: u64) -> NonZeroU64 {
