@@ -22,7 +22,6 @@ mod exact_fence_tests;
 mod partial_issue_tests;
 mod stopped_provider_tests;
 
-#[cfg(unix)]
 pub(crate) use super::projection_lifecycle::fence_projection_leases_for_test;
 pub(crate) use super::{
     ProjectionCleanupState, ProjectionLeaseProvider, ProjectionLeaseTarget, RunningProvider,
