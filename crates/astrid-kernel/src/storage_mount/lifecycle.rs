@@ -420,6 +420,9 @@ pub(crate) async fn force_fence_projection_lease(
         return false;
     }
     state.revoked.store(true, Ordering::Release);
+    // This is fence-only: retained teardown deliberately leaves the callback
+    // listener and its platform endpoint in place. Actual cleanup and force
+    // revoke own listener shutdown.
     let _mutation_guard = kernel.storage_mount_mutations.lock().await;
     true
 }

@@ -214,9 +214,44 @@ fn retain_launch_failure_endpoint(
     let responder = tokio::spawn({
         let release = Arc::clone(&release);
         async move {
-            if let Ok(mut stream) = local_transport::accept(&listener).await {
-                let _ = stream.write_all(b"{\"status\":\"ready\"}\n").await;
-                let _ = stream.flush().await;
+            loop {
+                let mut stream = tokio::select! {
+                    () = release.notified() => return,
+                    accepted = local_transport::accept(&listener) => match accepted {
+                        Ok(stream) => stream,
+                        // Windows availability probes can consume and close an
+                        // accept instance before transport authentication. The
+                        // backend replenishes the listener; retain the endpoint.
+                        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            continue;
+                        },
+                        Err(_) => return,
+                    },
+                };
+
+                // Transport authentication happens inside Windows accept. On
+                // Unix, the 0600 socket already limits peers; requiring a
+                // payload byte distinguishes an authenticated caller from a
+                // connect-and-drop availability probe.
+                let mut first_byte = [0_u8; 1];
+                let read_payload = stream.read_exact(&mut first_byte);
+                let read = tokio::select! {
+                    () = release.notified() => return,
+                    read = read_payload => read,
+                };
+                match read {
+                    Ok(_) => {},
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => continue,
+                    Err(_) => return,
+                }
+                let answered = async {
+                    stream.write_all(b"{\"status\":\"ready\"}\n").await.is_ok()
+                        && stream.flush().await.is_ok()
+                };
+                tokio::select! {
+                    () = release.notified() => return,
+                    _ = answered => {},
+                }
                 release.notified().await;
             }
         }
@@ -235,7 +270,7 @@ pub(crate) async fn release_launch_cleanup_failure(test_id: u64) {
         .expect("retained launch endpoints")
         .remove(&test_id);
     if let Some(endpoint) = endpoint {
-        endpoint.release.notify_waiters();
+        endpoint.release.notify_one();
         endpoint
             .responder
             .await

@@ -336,6 +336,8 @@ async fn assert_retry_releases_authority(
             .expect("failed exact lease remains retained until retry");
         lease.callback_identity_for_test().0
     };
+
+    #[cfg(unix)]
     std::fs::remove_file(
         failed_callback_path
             .parent()
@@ -343,6 +345,17 @@ async fn assert_retry_releases_authority(
             .join("process-control.sock"),
     )
     .expect("release retained provider endpoint");
+    #[cfg(windows)]
+    assert!(
+        !astrid_core::local_transport::endpoint_is_present(
+            &failed_callback_path
+                .parent()
+                .expect("failed provider resource root")
+                .join("process-control.sock"),
+        )
+        .expect("inspect released Windows provider endpoint"),
+        "Windows provider endpoint must disappear when its responder drops"
+    );
     let Err(retry_error) = broker.mount(caller).await else {
         panic!("retry must pass authority, then reach the absent unit-test provider");
     };
