@@ -14,6 +14,8 @@ pub(crate) enum StageError {
     NotPrepared,
     ScenarioMismatch,
     StaleDomain,
+    Releasing,
+    ReleaseFailed,
 }
 
 impl StageError {
@@ -24,6 +26,8 @@ impl StageError {
             Self::NotPrepared => "domain_not_prepared",
             Self::ScenarioMismatch => "domain_scenario_mismatch",
             Self::StaleDomain => "staged_domain_stale",
+            Self::Releasing => "domain_releasing",
+            Self::ReleaseFailed => "domain_release_failed",
         }
     }
 }
@@ -44,13 +48,7 @@ where
     G: Copy + PartialEq,
     C: Copy + PartialEq,
 {
-    fn revalidate(
-        &self,
-        manifest_identity: G,
-        component_id: C,
-        state: DomainState,
-        scenario: Scenario,
-    ) -> Result<(), StageError> {
+    fn validate_identity(&self, manifest_identity: G, component_id: C) -> Result<(), StageError> {
         if manifest_identity != self.manifest_identity {
             return Err(StageError::Admission(
                 admission::AdmissionError::SubstitutedIdentity,
@@ -61,20 +59,38 @@ where
                 admission::AdmissionError::ComponentMismatch,
             ));
         }
+        Ok(())
+    }
+
+    fn validate_observation_state(
+        &self,
+        state: DomainState,
+        scenario: Scenario,
+    ) -> Result<DomainState, StageError> {
         match state {
-            DomainState::Prepared => {
+            DomainState::Prepared | DomainState::Running | DomainState::Blocked => {
                 if scenario != self.scenario {
                     return Err(StageError::ScenarioMismatch);
                 }
+                Ok(state)
             },
-            DomainState::Running | DomainState::Blocked | DomainState::Releasing => {
-                return Err(StageError::NotPrepared);
-            },
-            DomainState::Reclaimed | DomainState::ReleaseFailed => {
-                return Err(StageError::StaleDomain);
-            },
+            DomainState::Releasing => Err(StageError::Releasing),
+            DomainState::Reclaimed => Err(StageError::StaleDomain),
+            DomainState::ReleaseFailed => Err(StageError::ReleaseFailed),
         }
-        Ok(())
+    }
+
+    fn revalidate(
+        &self,
+        manifest_identity: G,
+        component_id: C,
+        state: DomainState,
+        scenario: Scenario,
+    ) -> Result<(), StageError> {
+        match self.validate_observation_state(state, scenario)? {
+            DomainState::Prepared => self.validate_identity(manifest_identity, component_id),
+            _ => Err(StageError::NotPrepared),
+        }
     }
 
     fn authorize_dispatch(
@@ -92,6 +108,40 @@ where
             )));
         }
         Ok(context)
+    }
+}
+
+#[cfg(not(test))]
+impl StagedStart<ManifestIdentity, ContentId> {
+    #[cfg(not(test))]
+    pub(crate) fn observe(&self) -> Result<DomainState, StageError> {
+        let observed = manager::staged_state(self.handle).map_err(StageError::Domain)?;
+        let manifest_identity = admission::confirm_start(self.handle, self.component_id)
+            .map_err(|error| self.classify_admission_error(error, observed))?;
+        self.validate_identity(manifest_identity, self.component_id)?;
+        let Some((state, scenario)) = observed else {
+            return Err(StageError::Admission(
+                admission::AdmissionError::StaleDomain,
+            ));
+        };
+        self.validate_observation_state(state, scenario)
+    }
+
+    #[cfg(not(test))]
+    fn classify_admission_error(
+        &self,
+        error: admission::AdmissionError,
+        observed: Option<(DomainState, Scenario)>,
+    ) -> StageError {
+        match (error, observed) {
+            (admission::AdmissionError::StaleDomain, Some((DomainState::Releasing, _))) => {
+                StageError::Releasing
+            },
+            (admission::AdmissionError::StaleDomain, Some((DomainState::ReleaseFailed, _))) => {
+                StageError::ReleaseFailed
+            },
+            (error, _) => StageError::Admission(error),
+        }
     }
 }
 
@@ -117,19 +167,24 @@ pub(crate) fn stage_start(
 pub(crate) fn dispatch_start(
     staged: StagedStart<ManifestIdentity, ContentId>,
 ) -> Result<(), StageError> {
-    let manifest_identity = admission::confirm_start(staged.handle, staged.component_id)
-        .map_err(StageError::Admission)?;
-    let (state, scenario) = manager::staged_state(staged.handle).map_err(StageError::Domain)?;
+    if staged.observe()? != DomainState::Prepared {
+        return Err(StageError::NotPrepared);
+    }
     let context =
         manager::stage_context(staged.handle, staged.scenario).map_err(StageError::Domain)?;
-    let context = staged.authorize_dispatch(
-        manifest_identity,
+    staged.authorize_dispatch(
+        staged.manifest_identity,
         staged.component_id,
-        state,
-        scenario,
+        DomainState::Prepared,
+        staged.scenario,
         context,
     )?;
     manager::start_running(staged.handle, context).map_err(StageError::Domain)?;
+    if staged.observe()? != DomainState::Running {
+        return Err(StageError::Domain(manager::PrepareError::Bind(
+            BindError::Malformed,
+        )));
+    }
     manager::enter_running(staged.handle, context)
 }
 
@@ -210,18 +265,107 @@ mod tests {
     }
 
     #[test]
-    fn non_prepared_or_mismatched_dispatch_state_fails() {
+    fn observation_accepts_only_authorized_live_states() {
         let staged = staged(Scenario::Exit);
-        for state in [
-            DomainState::Running,
-            DomainState::Blocked,
-            DomainState::Releasing,
+        for (state, expected) in [
+            (DomainState::Prepared, DomainState::Prepared),
+            (DomainState::Running, DomainState::Running),
+            (DomainState::Blocked, DomainState::Blocked),
         ] {
             assert_eq!(
-                staged.revalidate(GENERATION, COMPONENT, state, Scenario::Exit),
+                staged.validate_observation_state(state, Scenario::Exit),
+                Ok(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn release_observation_failure_reasons_are_exact() {
+        let staged = staged(Scenario::Exit);
+        assert_eq!(
+            staged.validate_observation_state(DomainState::Releasing, Scenario::Exit),
+            Err(StageError::Releasing)
+        );
+        assert_eq!(
+            staged.validate_observation_state(DomainState::Reclaimed, Scenario::Exit),
+            Err(StageError::StaleDomain)
+        );
+        assert_eq!(
+            staged.validate_observation_state(DomainState::ReleaseFailed, Scenario::Exit),
+            Err(StageError::ReleaseFailed)
+        );
+    }
+
+    #[test]
+    fn observation_scenario_mismatch_fails() {
+        let staged = staged(Scenario::Exit);
+        for state in [
+            DomainState::Prepared,
+            DomainState::Running,
+            DomainState::Blocked,
+        ] {
+            assert_eq!(
+                staged.validate_observation_state(state, Scenario::PageFault),
+                Err(StageError::ScenarioMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn observation_identity_equality_is_required() {
+        let staged = staged(Scenario::Exit);
+        assert_eq!(
+            staged.validate_identity(SUBSTITUTED, COMPONENT),
+            Err(StageError::Admission(AdmissionError::SubstitutedIdentity))
+        );
+        assert_eq!(
+            staged.validate_identity(GENERATION, MISMATCHED),
+            Err(StageError::Admission(AdmissionError::ComponentMismatch))
+        );
+        assert_eq!(staged.validate_identity(GENERATION, COMPONENT), Ok(()));
+    }
+
+    #[test]
+    fn dispatch_running_or_blocked_is_not_prepared() {
+        let staged = staged(Scenario::Exit);
+        for state in [DomainState::Running, DomainState::Blocked] {
+            assert_eq!(
+                staged.authorize_dispatch(
+                    GENERATION,
+                    COMPONENT,
+                    state,
+                    Scenario::Exit,
+                    context(Scenario::Exit),
+                ),
                 Err(StageError::NotPrepared)
             );
         }
+    }
+
+    #[test]
+    fn dispatch_release_states_fail_before_transition() {
+        let staged = staged(Scenario::Exit);
+        for (state, expected) in [
+            (DomainState::Releasing, StageError::Releasing),
+            (DomainState::Reclaimed, StageError::StaleDomain),
+            (DomainState::ReleaseFailed, StageError::ReleaseFailed),
+        ] {
+            assert_eq!(
+                staged.authorize_dispatch(
+                    GENERATION,
+                    COMPONENT,
+                    state,
+                    Scenario::Exit,
+                    context(Scenario::Exit),
+                ),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn mismatched_dispatch_scenario_fails() {
+        let staged = staged(Scenario::Exit);
         assert_eq!(
             staged.revalidate(
                 GENERATION,
@@ -236,12 +380,24 @@ mod tests {
     #[test]
     fn reclaimed_dispatch_state_is_stale() {
         let staged = staged(Scenario::Exit);
-        for state in [DomainState::Reclaimed, DomainState::ReleaseFailed] {
-            assert_eq!(
-                staged.revalidate(GENERATION, COMPONENT, state, Scenario::Exit),
-                Err(StageError::StaleDomain)
-            );
-        }
+        assert_eq!(
+            staged.revalidate(
+                GENERATION,
+                COMPONENT,
+                DomainState::Reclaimed,
+                Scenario::Exit
+            ),
+            Err(StageError::StaleDomain)
+        );
+        assert_eq!(
+            staged.revalidate(
+                GENERATION,
+                COMPONENT,
+                DomainState::ReleaseFailed,
+                Scenario::Exit
+            ),
+            Err(StageError::ReleaseFailed)
+        );
     }
 
     #[test]
