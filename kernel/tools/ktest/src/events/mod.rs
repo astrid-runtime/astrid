@@ -9,8 +9,9 @@
 use serde_json::Value;
 
 mod closure;
+mod relations_gate;
 
-use closure::closure_holds;
+use {closure::closure_holds, relations_gate::relations_projection_holds};
 const REQUIRED_ONCE: &[&str] = &[
     "boot.entry",
     "idt.ready",
@@ -174,9 +175,9 @@ const CANCEL_TAIL_EVENTS: &[&str] = &[
     "domain.cancelled",
     "domain.outcome",
 ];
-const IPC_PARK_TAIL_EVENTS: &[&str] = &["ipc.op", "ipc.park"];
 const IPC_PARK_EVENT: &str = "ipc.park";
 const IPC_SERVER_RESUME_TAIL_EVENTS: &[&str] = &["ipc.wake", "ipc.resume", "ipc.op", "ipc.park"];
+const IPC_PARK_TAIL_EVENTS: &[&str] = &["relations.projection", "ipc.op", "ipc.park"];
 const IPC_CLIENT_RESUME_TAIL_EVENTS: &[&str] = &[
     "ipc.wake",
     "ipc.resume",
@@ -195,7 +196,18 @@ const IPC_FAULT_CLIENT_TAIL_EVENTS: &[&str] = &[
     "domain.restore",
     "domain.reclaim",
 ];
-const IPC_CANCEL_GUEST_OPS: &[&str] = &["ipc.op", "ipc.op"];
+const IPC_CANCEL_GUEST_OPS: &[&str] = &["relations.projection", "ipc.op", "ipc.op"];
+const IPC_CLIENT_OPS: &[&str] = &[
+    "ipc.op",
+    "ipc.op",
+    "ipc.op",
+    "relations.projection",
+    "ipc.op",
+    "ipc.op",
+    "ipc.op",
+    "ipc.op",
+    "ipc.op",
+];
 const IPC_CANCEL_GUEST_TAIL_EVENTS: &[&str] = &[
     "domain.registers",
     "domain.outcome",
@@ -289,7 +301,7 @@ fn full_sequence() -> Vec<SequenceStep> {
     pattern.push(SequenceStep::Many(IPC_PARK_TAIL_EVENTS));
     push_started(&mut pattern);
     pattern.push(SequenceStep::Many(GUEST_ENTRY_EVENTS));
-    pattern.push(SequenceStep::Repeated("ipc.op", 8));
+    pattern.push(SequenceStep::Many(IPC_CLIENT_OPS));
     pattern.push(SequenceStep::One(IPC_PARK_EVENT));
     pattern.push(SequenceStep::Many(IPC_SERVER_RESUME_TAIL_EVENTS));
     pattern.push(SequenceStep::Many(IPC_CLIENT_RESUME_TAIL_EVENTS));
@@ -758,6 +770,7 @@ fn domain_lifecycle_holds(events: &[Value]) -> bool {
     let ipc_flow_ok = count_named(events, "ipc.park") == 4
         && count_named(events, "ipc.wake") == 2
         && count_named(events, "ipc.resume") == 2;
+    let relations_ok = relations_projection_holds(events);
     let tamper_events = named_events(events, "domain.auth.reject")
         .into_iter()
         .filter(|event| string_field(event, "reason") == Some("tampered_component_rejected"))
@@ -801,6 +814,7 @@ fn domain_lifecycle_holds(events: &[Value]) -> bool {
     ok &= check("exact private-IPC operations", ipc_ops_ok);
     ok &= check("exact private-IPC reclaim evidence", ipc_reclaims_ok);
     ok &= check("exact private-IPC park/wake/resume flow", ipc_flow_ok);
+    ok &= check("same-lock IPC relation projection", relations_ok);
     ok &= check("no domain accounting leaks", accounting_ok);
     ok &= check(
         "tampered component rejection before auth success",

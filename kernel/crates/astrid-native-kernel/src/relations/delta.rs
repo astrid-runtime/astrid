@@ -95,4 +95,8 @@ impl DeltaRing {
     pub(crate) fn deltas(&self) -> [Option<RelationDelta>; DELTA_RING_ENTRIES] {
         self.entries
     }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &RelationDelta> {
+        self.entries.iter().flatten()
+    }
 }

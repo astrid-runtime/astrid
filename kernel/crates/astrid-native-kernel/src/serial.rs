@@ -367,6 +367,28 @@ pub fn ev_ipc_op(id: u64, generation: u64, operation: &str, status: &str) {
     ));
 }
 
+pub fn ev_relations_projection(
+    id: u64,
+    generation: u64,
+    epoch: u64,
+    rows: usize,
+    fold_epoch: u64,
+    fold_rows: usize,
+    fold_matches: bool,
+) {
+    emit(format_args!(
+        "\"ev\":\"relations.projection\",\"same_lock\":true,\"id\":{id},\"generation\":{generation},\
+        \"epoch\":{epoch},\"rows\":{rows},\"fold_epoch\":{fold_epoch},\"fold_rows\":{fold_rows},\
+        \"fold_matches\":{fold_matches}"
+    ));
+}
+
+pub fn ev_relations_projection_failed(operation: &'static str, error: u8) {
+    emit(format_args!(
+        "\"ev\":\"relations.projection.failed\",\"op\":\"{operation}\",\"error\":{error}"
+    ));
+}
+
 pub fn ev_ipc_park(id: u64, generation: u64) {
     emit(format_args!(
         "\"ev\":\"ipc.park\",\"id\":{id},\"generation\":{generation}"
