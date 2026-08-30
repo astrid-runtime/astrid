@@ -1,14 +1,21 @@
 //! Private identity-bound Running-stop scheduler handoff.
 
 use super::types::{DomainHandle, Scenario};
-use astrid_system_generation::{ContentId, ManifestIdentity};
+use astrid_system_generation::ContentId;
+#[cfg(not(test))]
+use astrid_system_generation::ManifestIdentity;
 
 #[cfg(not(test))]
 use super::manager::{CURRENT, MANAGER, fail_terminal};
 #[cfg(not(test))]
 use crate::serial;
 
-pub(crate) type DomainStop = StopLifecycle<ManifestIdentity, ContentId>;
+#[cfg(not(test))]
+type HostManifestIdentity = ManifestIdentity;
+#[cfg(test)]
+type HostManifestIdentity = ();
+
+pub(crate) type DomainStop = StopLifecycle<HostManifestIdentity, ContentId>;
 
 #[cfg(test)]
 mod tests;
@@ -137,7 +144,11 @@ where
         }
     }
 
-    fn take_timer(&mut self, handle: DomainHandle, scenario: Scenario) -> Result<(), StopError> {
+    pub(in crate::domains) fn take_timer(
+        &mut self,
+        handle: DomainHandle,
+        scenario: Scenario,
+    ) -> Result<(), StopError> {
         let Self::Armed(ticket) = *self else {
             return Err(StopError::NotArmed);
         };
@@ -211,10 +222,7 @@ pub(crate) fn take_timer_trap(handle: DomainHandle) {
     }
     {
         let mut manager = MANAGER.lock();
-        let Some(domain) = manager.valid_domain_mut(handle) else {
-            fail_terminal("stop_domain_invalid");
-        };
-        if domain.stop.take_timer(handle, scenario).is_err() {
+        if manager.take_running_stop(handle, scenario).is_err() {
             fail_terminal("stop_take_rejected");
         }
     }

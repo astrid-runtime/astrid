@@ -1,7 +1,9 @@
 //! Host falsifiers for the private stop lifecycle state machine.
 
+use super::super::manager::{Domain, DomainState, MANAGER};
 use super::super::types::{DomainGeneration, DomainHandle, DomainId, Scenario};
 use super::{StopError, StopLifecycle};
+use astrid_system_generation::ContentId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TestManifest(u8);
@@ -42,6 +44,68 @@ fn taken(slot: u64, generation: u64) -> StopLifecycle<TestManifest, TestComponen
     stop.take_timer(handle(slot, generation), Scenario::RunningStop)
         .unwrap();
     stop
+}
+
+fn installed_armed_with_state(
+    state: DomainState,
+) -> spin::MutexGuard<'static, super::super::manager::Manager> {
+    let handle = handle(0, 12);
+    let component_id = ContentId::from_payload(b"stop-running-state-falsifier");
+    let stop = StopLifecycle::stage(handle, (), component_id, Scenario::RunningStop)
+        .unwrap()
+        .into_armed(handle, (), component_id, Scenario::RunningStop)
+        .unwrap();
+    let mut manager = MANAGER.lock();
+    manager.slots[0] = Some(Domain {
+        generation: 12,
+        state,
+        scenario: Scenario::RunningStop,
+        quota_ticks: 0,
+        space: None,
+        ipc_enabled: false,
+        stop,
+    });
+    manager
+}
+
+#[test]
+fn armed_prepared_domain_is_not_consumed() {
+    let mut manager = installed_armed_with_state(DomainState::Prepared);
+    assert_eq!(
+        manager.take_running_stop(handle(0, 12), Scenario::RunningStop),
+        Err(StopError::StateMismatch)
+    );
+    assert_eq!(
+        manager.slots[0].as_ref().unwrap().state,
+        DomainState::Prepared
+    );
+    drop(manager);
+
+    let mut manager = installed_armed_with_state(DomainState::Running);
+    assert_eq!(
+        manager.take_running_stop(handle(0, 12), Scenario::RunningStop),
+        Ok(())
+    );
+}
+
+#[test]
+fn armed_blocked_domain_is_not_consumed() {
+    let mut manager = installed_armed_with_state(DomainState::Blocked);
+    assert_eq!(
+        manager.take_running_stop(handle(0, 12), Scenario::RunningStop),
+        Err(StopError::StateMismatch)
+    );
+    assert_eq!(
+        manager.slots[0].as_ref().unwrap().state,
+        DomainState::Blocked
+    );
+    drop(manager);
+
+    let mut manager = installed_armed_with_state(DomainState::Running);
+    assert_eq!(
+        manager.take_running_stop(handle(0, 12), Scenario::RunningStop),
+        Ok(())
+    );
 }
 
 #[test]

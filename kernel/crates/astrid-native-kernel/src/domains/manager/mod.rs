@@ -1,7 +1,9 @@
 //! Typed domain admission, execution, fault containment, and reclamation.
 
+use core::sync::atomic::Ordering;
+
 #[cfg(not(test))]
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 
 use spin::Mutex;
 #[cfg(not(test))]
@@ -14,23 +16,22 @@ use x86_64::structures::paging::{PhysFrame, Size4KiB};
 #[cfg(not(test))]
 use super::paging::AddressSpace;
 use super::stop::DomainStop;
-use super::types::{BindError, DomainHandle, DomainPagingError, SLOT_CAPACITY, Scenario};
+use super::types::{
+    BindError, DomainGeneration, DomainHandle, DomainId, DomainPagingError, Outcome, SLOT_CAPACITY,
+    Scenario,
+};
 #[cfg(not(test))]
-use super::types::{CODE_BASE, ComponentImage, DomainGeneration, DomainId, Outcome, PEER_PROBE};
-#[cfg(not(test))]
-use crate::apic;
-#[cfg(not(test))]
-use crate::gdt;
-#[cfg(not(test))]
+use super::types::{ComponentImage, PEER_PROBE};
 use crate::ipc;
 #[cfg(not(test))]
 use crate::memory::FRAME_SIZE;
 #[cfg(not(test))]
 use crate::serial;
 #[cfg(not(test))]
-use crate::trap::TrapFrame;
-#[cfg(not(test))]
 use astrid_system_generation::ContentId;
+
+#[cfg(test)]
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrepareError {
     Bind(BindError),
@@ -153,6 +154,74 @@ pub struct Manager {
     last_identity: Option<DomainIdentity>,
 }
 
+#[cfg(test)]
+static RELATION_RELEASE_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static SPACE_RELEASE_FAILURE: AtomicU8 = AtomicU8::new(0);
+#[cfg(test)]
+static ADMISSION_RELEASES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpaceRelease {
+    Released(u64, u64),
+    MissingSpace,
+    RestoreFailed,
+    ReclaimBlocked(u64, u64),
+}
+
+#[cfg(not(test))]
+fn release_space(
+    space: &mut AddressSpace,
+    id: DomainId,
+    generation: DomainGeneration,
+) -> SpaceRelease {
+    match space.release(id, generation) {
+        super::paging::ReleaseStatus::Released(expected, freed) => {
+            SpaceRelease::Released(expected, freed)
+        },
+        super::paging::ReleaseStatus::RestoreFailed => SpaceRelease::RestoreFailed,
+        super::paging::ReleaseStatus::ReclaimBlocked(expected, freed) => {
+            SpaceRelease::ReclaimBlocked(expected, freed)
+        },
+    }
+}
+
+#[cfg(test)]
+fn release_space(_space: &mut (), _id: DomainId, _generation: DomainGeneration) -> SpaceRelease {
+    match SPACE_RELEASE_FAILURE.load(Ordering::SeqCst) {
+        1 => SpaceRelease::RestoreFailed,
+        2 => SpaceRelease::ReclaimBlocked(3, 2),
+        _ => SpaceRelease::Released(3, 3),
+    }
+}
+
+#[cfg(test)]
+fn release_ipc_for_release(slot: u64, generation: u64) -> ipc::TeardownOutcome {
+    let mut outcome = super::wait::release_ipc(slot, generation);
+    if RELATION_RELEASE_FAILURE.load(Ordering::SeqCst) {
+        outcome.relation_released = false;
+    }
+    outcome
+}
+
+#[cfg(not(test))]
+fn release_ipc_for_release(slot: u64, generation: u64) -> ipc::TeardownOutcome {
+    super::wait::release_ipc(slot, generation)
+}
+
+#[cfg(not(test))]
+fn space_identity(space: &AddressSpace) -> Option<DomainIdentity> {
+    Some(DomainIdentity {
+        root: space.root_phys(),
+        probe: space.probe(),
+    })
+}
+
+#[cfg(test)]
+fn space_identity(_space: &()) -> Option<DomainIdentity> {
+    None
+}
+
 pub static MANAGER: Mutex<Manager> = Mutex::new(Manager {
     slots: [None, None],
     used_frames: 0,
@@ -188,9 +257,8 @@ pub static CURRENT: Current = Current {
     stack_end: AtomicU64::new(0),
 };
 
-#[cfg(not(test))]
 #[derive(Clone, Copy)]
-struct TrapContext {
+pub(super) struct TrapContext {
     slot: u64,
     generation: u64,
     vector: u8,
@@ -202,7 +270,7 @@ struct TrapContext {
 }
 
 #[cfg(not(test))]
-static TERMINAL_CONTEXT: Mutex<Option<TrapContext>> = Mutex::new(None);
+pub(super) static TERMINAL_CONTEXT: Mutex<Option<TrapContext>> = Mutex::new(None);
 
 /// The landed #1704 prefix is frozen through this exclusive append boundary.
 const IPC_APPEND_OFFSET: u64 = 71;
@@ -270,37 +338,6 @@ fn current_stack_pointer() -> u64 {
 }
 
 #[cfg(not(test))]
-fn guest_entry_state_ok(frame: &TrapFrame, scenario: u64) -> bool {
-    let (fs, gs) = guest_segment_selectors();
-    frame.rdi == scenario
-        && [
-            frame.rax, frame.rbx, frame.rcx, frame.rdx, frame.rsi, frame.rbp, frame.r8, frame.r9,
-            frame.r10, frame.r11, frame.r12, frame.r13, frame.r14, frame.r15,
-        ]
-        .into_iter()
-        .all(|value| value == 0)
-        && fs == 0
-        && gs == 0
-}
-
-#[cfg(not(test))]
-fn guest_segment_selectors() -> (u64, u64) {
-    let fs: u16;
-    let gs: u16;
-    // SAFETY: reads the FS/GS selectors without changing state.
-    unsafe {
-        core::arch::asm!(
-            "mov {fs:x}, fs",
-            "mov {gs:x}, gs",
-            fs = out(reg) fs,
-            gs = out(reg) gs,
-            options(nomem, preserves_flags)
-        );
-    }
-    (fs as u64, gs as u64)
-}
-
-#[cfg(not(test))]
 pub fn kernel_cr3_restored() -> bool {
     KERNEL_CR3
         .get()
@@ -332,10 +369,7 @@ pub fn prepare(
     let slot = manager
         .slots
         .iter()
-        .position(|slot| {
-            slot.as_ref()
-                .is_none_or(|domain| domain.state == DomainState::Reclaimed)
-        })
+        .position(|slot| Manager::slot_is_preparable(slot.as_ref()))
         .ok_or(PrepareError::SlotCapacity)?;
     let generation = match manager.slots[slot].as_ref().map(|domain| domain.generation) {
         Some(previous) => previous
@@ -448,6 +482,13 @@ pub fn peer_is_prepared(handle: DomainHandle) -> bool {
 }
 
 mod start;
+#[cfg(test)]
+mod stop_tests;
+#[cfg(not(test))]
+mod trap;
+
+#[cfg(not(test))]
+pub use trap::handle_domain_trap;
 
 pub(super) use start::StartContext;
 #[cfg(not(test))]
@@ -477,242 +518,6 @@ pub fn fail_terminal(reason: &'static str) -> ! {
     serial::ev_domain_harness(false);
     serial::ev_halt(false);
     serial::exit_qemu(false);
-}
-
-#[cfg(not(test))]
-pub fn handle_domain_trap(frame: &mut TrapFrame, fault_address: u64) -> bool {
-    if !CURRENT.active.load(Ordering::SeqCst) || frame.cs & 3 != 3 {
-        return false;
-    }
-    let expected_root = CURRENT.root.load(Ordering::SeqCst);
-    let expected_flags = CURRENT.root_flags.load(Ordering::SeqCst);
-    let (current_root, current_flags) = Cr3::read();
-    if current_root.start_address().as_u64() != expected_root
-        || current_flags.bits() != expected_flags
-    {
-        serial::ev_domain_trap_reject("cr3_mismatch");
-        serial::ev_domain_harness(false);
-        serial::ev_halt(false);
-        serial::exit_qemu(false);
-    }
-    if !CURRENT.entered.swap(true, Ordering::SeqCst) {
-        let (context_root, context_flags) = Cr3::read();
-        let (fs, gs) = guest_segment_selectors();
-        let entry_state_ok = guest_entry_state_ok(frame, CURRENT.scenario.load(Ordering::SeqCst));
-        serial::ev_domain_entered(
-            CURRENT.slot.load(Ordering::SeqCst) + 1,
-            CURRENT.generation.load(Ordering::SeqCst),
-            frame.cs & 3,
-        );
-        serial::ev_domain_context(
-            CURRENT.slot.load(Ordering::SeqCst) + 1,
-            CURRENT.generation.load(Ordering::SeqCst),
-            context_root.start_address().as_u64(),
-            context_flags.bits(),
-            frame.cs & 3,
-            fs,
-            gs,
-        );
-        super::harness::record_entry(frame.cs & 3, entry_state_ok);
-    }
-    let vector = frame.vector as u8;
-    if vector == crate::ipc::VECTOR {
-        let handle = super::wait::current_handle();
-        let Some(domain_token) = super::wait::ipc_domain_token(handle) else {
-            fail_terminal("invalid_ipc_domain");
-        };
-        match ipc::handle_call(frame, domain_token) {
-            ipc::SyscallOutcome::Done(status, aux) => {
-                frame.rax = status;
-                frame.rdx = aux;
-                return true;
-            },
-            ipc::SyscallOutcome::Block(reason) => {
-                let status = match reason {
-                    ipc::BlockReason::SendReady => super::wait::BlockStatus::Sent,
-                    ipc::BlockReason::RecvEmpty => super::wait::BlockStatus::Received,
-                };
-                super::wait::park_current(frame, status);
-            },
-        }
-    }
-    if vector == 14 {
-        super::harness::record_fault(fault_address);
-    }
-    let scenario = CURRENT.scenario.load(Ordering::SeqCst);
-    if vector == 6 && scenario == Scenario::IpcCancelGuest.value() && frame.rip == CODE_BASE + 95 {
-        // Scenario 10 deliberately reaches the unchanged shared invalid
-        // fall-through; only this new scenario resumes into appended bytes.
-        frame.rip = CODE_BASE + IPC_CANCEL_GUEST_APPEND_OFFSET;
-        return true;
-    }
-    if vector == apic::TIMER_VECTOR && scenario == Scenario::RunningStop.value() {
-        let handle = super::wait::current_handle();
-        super::stop::take_timer_trap(handle);
-        apic::mask_timer();
-        apic::eoi();
-        serial::ev_stop_taken(handle.id().0 + 1, handle.generation().0, u64::from(vector));
-        let context = TrapContext {
-            slot: handle.id().0,
-            generation: handle.generation().0,
-            vector,
-            error_code: frame.error_code,
-            rip: frame.rip,
-            cs: frame.cs,
-            fault_address,
-            outcome: Outcome::Cancelled,
-        };
-        *TERMINAL_CONTEXT.lock() = Some(context);
-        switch_to_resume(resume_stack_end());
-    }
-    if vector == apic::TIMER_VECTOR && scenario >= Scenario::IpcServer.value() {
-        // The landed #1704 dispatch is byte-frozen and has no path for the
-        // new scenarios. Timer preemption is the one transition to the
-        // appended private-IPC entry that scenarios 0-5 never take.
-        apic::eoi();
-        frame.rip = CODE_BASE + IPC_APPEND_OFFSET;
-        return true;
-    }
-    let quota = CURRENT.quota.load(Ordering::SeqCst);
-    let ipc_scenario = scenario >= Scenario::IpcServer.value();
-    let ipc_terminal = vector == 3 && ipc_scenario;
-    let outcome = if ipc_terminal {
-        Outcome::CleanExit
-    } else if vector == 14 && ipc_scenario {
-        Outcome::PageFault
-    } else if frame.rdi != scenario {
-        Outcome::UnexpectedFault
-    } else {
-        match vector {
-            3 => Outcome::CleanExit,
-            6 if frame.cs & 3 == 3 => Outcome::InvalidInstruction,
-            14 => Outcome::PageFault,
-            32 => {
-                let ticks = CURRENT.ticks.fetch_add(1, Ordering::SeqCst) + 1;
-                if ticks < quota {
-                    apic::eoi();
-                    return true;
-                }
-                apic::mask_timer();
-                apic::eoi();
-                serial::ev_domain_quota(CURRENT.slot.load(Ordering::SeqCst) + 1, ticks);
-                Outcome::QuotaExhausted
-            },
-            _ => Outcome::UnexpectedFault,
-        }
-    };
-    if !super::stop::abort_for_terminal(super::wait::current_handle()) {
-        fail_terminal("stop_terminal_conflict");
-    }
-    serial::ev_domain_registers(
-        CURRENT.slot.load(Ordering::SeqCst) + 1,
-        CURRENT.generation.load(Ordering::SeqCst),
-        frame.cs & 3,
-        frame.rdi,
-        frame.rsp,
-        frame.rax,
-        frame.rbx,
-        frame.rcx,
-        frame.rdx,
-        frame.rsi,
-        frame.rbp,
-        frame.r8,
-        frame.r9,
-        frame.r10,
-        frame.r11,
-        frame.r12,
-        frame.r13,
-        frame.r14,
-        frame.r15,
-    );
-    let context = TrapContext {
-        slot: CURRENT.slot.load(Ordering::SeqCst),
-        generation: CURRENT.generation.load(Ordering::SeqCst),
-        vector: frame.vector as u8,
-        error_code: frame.error_code,
-        rip: frame.rip,
-        cs: frame.cs,
-        fault_address,
-        outcome,
-    };
-    *TERMINAL_CONTEXT.lock() = Some(context);
-    switch_to_resume(resume_stack_end());
-}
-
-#[cfg(not(test))]
-#[unsafe(naked)]
-pub extern "C" fn switch_to_resume(stack_end: usize) -> ! {
-    core::arch::naked_asm!(
-        "mov rsp, rdi",
-        "xor ebp, ebp",
-        "call {terminal}",
-        "ud2",
-        terminal = sym domain_terminal,
-    );
-}
-
-#[cfg(not(test))]
-extern "C" fn domain_terminal() -> ! {
-    let mut terminal = TERMINAL_CONTEXT.lock();
-    let Some(context) = terminal.as_ref().copied() else {
-        serial::ev_domain_harness(false);
-        serial::ev_halt(false);
-        serial::exit_qemu(false);
-    };
-    let handle = DomainHandle::new(
-        super::types::DomainId(context.slot),
-        super::types::DomainGeneration(context.generation),
-    );
-    let stats = MANAGER.lock().terminate(handle, context.outcome, &context);
-    CURRENT.active.store(false, Ordering::SeqCst);
-    CURRENT.root.store(0, Ordering::SeqCst);
-    CURRENT.root_flags.store(0, Ordering::SeqCst);
-    let stop_requested =
-        context.vector == crate::apic::TIMER_VECTOR && context.outcome == Outcome::Cancelled;
-    if stop_requested {
-        serial::ev_stop_current_inactive(handle.id().0 + 1, handle.generation().0);
-    }
-    if !stats.exactly_once() {
-        if stop_requested {
-            serial::ev_stop_completed(handle.id().0 + 1, handle.generation().0, false);
-        }
-        serial::ev_domain_harness(false);
-        serial::ev_halt(false);
-        serial::exit_qemu(false);
-    }
-    *terminal = None;
-    drop(terminal);
-    super::harness::record_outcome(context.outcome, stats.exactly_once());
-    if stop_requested {
-        serial::ev_stop_completed(handle.id().0 + 1, handle.generation().0, true);
-    }
-    let (kernel_code, kernel_data) = gdt::kernel_selectors();
-    let return_stack = resume_stack_end();
-    let rip = scheduler_resume as *const () as usize as u64;
-    let cs = kernel_code.0 as u64;
-    let rflags = 0x002u64;
-    let rsp = return_stack as u64;
-    let ss = kernel_data.0 as u64;
-    // SAFETY: terminal teardown has restored the kernel CR3. All return
-    // values are held in registers while moving to the kernel resume stack.
-    unsafe {
-        core::arch::asm!(
-            "mov rsp, {return_stack}",
-            "push {ss}",
-            "push {rsp}",
-            "push {rflags}",
-            "push {cs}",
-            "push {rip}",
-            "iretq",
-            return_stack = in(reg) return_stack,
-            ss = in(reg) ss,
-            rsp = in(reg) rsp,
-            rflags = in(reg) rflags,
-            cs = in(reg) cs,
-            rip = in(reg) rip,
-            options(noreturn)
-        );
-    }
 }
 
 #[cfg(not(test))]
@@ -789,6 +594,39 @@ impl Manager {
         (domain.generation == handle.generation().0 && domain.state.is_live()).then_some(domain)
     }
 
+    pub(in crate::domains) fn take_running_stop(
+        &mut self,
+        handle: DomainHandle,
+        scenario: Scenario,
+    ) -> Result<(), super::stop::StopError> {
+        let Some(domain) = self
+            .slots
+            .get_mut(handle.id().0 as usize)
+            .and_then(Option::as_mut)
+            .filter(|domain| domain.generation == handle.generation().0)
+        else {
+            return Err(super::stop::StopError::StateMismatch);
+        };
+        if domain.state != DomainState::Running {
+            return Err(super::stop::StopError::StateMismatch);
+        }
+        domain.stop.take_timer(handle, scenario)
+    }
+
+    fn slot_is_preparable(domain: Option<&Domain>) -> bool {
+        domain.is_none_or(|domain| domain.state == DomainState::Reclaimed)
+    }
+
+    fn release_domain_admission(handle: DomainHandle) {
+        #[cfg(test)]
+        {
+            ADMISSION_RELEASES.fetch_add(1, Ordering::SeqCst);
+            let _ = handle;
+        }
+        #[cfg(not(test))]
+        super::admission::release(handle);
+    }
+
     fn stop_taken(&self, handle: DomainHandle) -> bool {
         self.slots
             .get(handle.id().0 as usize)
@@ -800,138 +638,230 @@ impl Manager {
             })
     }
 
-    #[cfg(not(test))]
     fn release_slot(&mut self, handle: DomainHandle) -> ReclaimStats {
         self.release_slot_with_stop(handle, None)
     }
 
-    #[cfg(not(test))]
+    fn begin_relation_release(
+        &mut self,
+        handle: DomainHandle,
+        stop_context: Option<&TrapContext>,
+    ) -> Option<(u64, bool, bool, ipc::TeardownOutcome)> {
+        let slot = self.slots.get_mut(handle.id().0 as usize)?;
+        let domain = slot.as_mut()?;
+        if domain.generation != handle.generation().0 || !domain.state.is_live() {
+            return None;
+        }
+
+        let generation = domain.generation;
+        let stop_requested = domain.stop.is_taken();
+        if let Some(_context) = stop_context {
+            #[cfg(not(test))]
+            serial::ev_domain_outcome(
+                serial::DomainEventIdentity::new(_context.slot + 1, _context.generation),
+                _context.outcome.name(),
+                _context.vector,
+                _context.error_code,
+                _context.fault_address,
+                _context.rip,
+                _context.cs & 3,
+            );
+        }
+        let identity = domain.space.as_ref().and_then(space_identity);
+        self.last_identity = identity;
+        let ipc_outcome = release_ipc_for_release(handle.id().value(), generation);
+        let relation_released = ipc_outcome.relation_released;
+        if stop_requested {
+            #[cfg(not(test))]
+            serial::ev_stop_relation_retired(handle.id().0 + 1, generation, relation_released);
+        }
+        if !relation_released {
+            domain.state = DomainState::ReleaseFailed;
+            let _ = domain.stop.finish(handle, false);
+            return None;
+        }
+        Some((generation, stop_requested, relation_released, ipc_outcome))
+    }
+
+    fn mark_release_wakes(
+        &mut self,
+        handle: DomainHandle,
+        _generation: u64,
+        ipc_outcome: ipc::TeardownOutcome,
+    ) -> Option<[Option<DomainHandle>; 2]> {
+        #[cfg(not(test))]
+        serial::ev_ipc_reclaim(
+            handle.id().value() + 1,
+            _generation,
+            ipc_outcome.endpoints as u64,
+            ipc_outcome.capabilities as u64,
+            ipc_outcome.queued_messages as u64,
+        );
+        let mut failed_peers = [None; 2];
+        for (failed_peer, wake) in failed_peers.iter_mut().zip(
+            ipc_outcome
+                .waiters
+                .into_iter()
+                .chain(ipc_outcome.peer_failures)
+                .flatten(),
+        ) {
+            let wake_handle = match super::wait::domain_handle_token(wake) {
+                Some(wake_handle) => wake_handle,
+                #[cfg(not(test))]
+                None => fail_terminal("invalid_ipc_wake"),
+                #[cfg(test)]
+                None => return None,
+            };
+            super::wait::mark_ipc_peer_failed(wake_handle);
+            *failed_peer = Some(wake_handle);
+        }
+        super::wait::clear_parked(handle);
+        Some(failed_peers)
+    }
+
+    fn release_space_for_slot(&mut self, handle: DomainHandle, generation: u64) -> SpaceRelease {
+        let Some(slot) = self.slots.get_mut(handle.id().0 as usize) else {
+            return SpaceRelease::MissingSpace;
+        };
+        let Some(domain) = slot.as_mut() else {
+            return SpaceRelease::MissingSpace;
+        };
+        match domain.space.as_mut() {
+            Some(space) => {
+                release_space(space, DomainId(handle.id().0), DomainGeneration(generation))
+            },
+            None => SpaceRelease::MissingSpace,
+        }
+    }
+
+    fn mark_release_failed(&mut self, handle: DomainHandle) {
+        if let Some(domain) = self.valid_domain_mut(handle) {
+            domain.state = DomainState::ReleaseFailed;
+        }
+        if let Some(domain) = self
+            .slots
+            .get_mut(handle.id().0 as usize)
+            .and_then(Option::as_mut)
+        {
+            let _ = domain.stop.finish(handle, false);
+        }
+    }
+
+    fn stage_and_release_space(
+        &mut self,
+        handle: DomainHandle,
+        generation: u64,
+    ) -> Option<(u64, u64)> {
+        if let Some(domain) = self
+            .slots
+            .get_mut(handle.id().0 as usize)
+            .and_then(Option::as_mut)
+        {
+            domain.state = DomainState::Releasing;
+        }
+        match self.release_space_for_slot(handle, generation) {
+            SpaceRelease::Released(expected, freed) => Some((expected, freed)),
+            SpaceRelease::ReclaimBlocked(expected, freed) => {
+                self.mark_release_failed(handle);
+                Some((expected, freed))
+            },
+            SpaceRelease::MissingSpace | SpaceRelease::RestoreFailed => {
+                self.mark_release_failed(handle);
+                None
+            },
+        }
+    }
+
+    fn reclaim_domain_space(
+        &mut self,
+        handle: DomainHandle,
+        expected: u64,
+        freed: u64,
+        stop_requested: bool,
+    ) -> bool {
+        if expected == 0 || expected != freed {
+            return false;
+        }
+        let Some(domain) = self
+            .slots
+            .get_mut(handle.id().0 as usize)
+            .and_then(Option::as_mut)
+        else {
+            return false;
+        };
+        domain.state = DomainState::Reclaimed;
+        self.used_frames = self.used_frames.saturating_sub(expected);
+        #[cfg(not(test))]
+        serial::ev_domain_reclaimed(
+            handle.id().0 + 1,
+            domain.generation,
+            expected,
+            freed,
+            freed,
+            expected - freed,
+        );
+        Self::release_domain_admission(handle);
+        if stop_requested {
+            #[cfg(not(test))]
+            serial::ev_stop_admission_released(handle.id().0 + 1, domain.generation, true);
+        }
+        true
+    }
+
+    fn finish_stop_release(
+        &mut self,
+        handle: DomainHandle,
+        stop_requested: bool,
+        stats: ReclaimStats,
+        failed_release_ok: bool,
+    ) {
+        if !stop_requested {
+            return;
+        }
+        if let Some(domain) = self
+            .slots
+            .get_mut(handle.id().0 as usize)
+            .and_then(Option::as_mut)
+        {
+            let _ = domain
+                .stop
+                .finish(handle, stats.exactly_once() && failed_release_ok);
+        }
+    }
+
     fn release_slot_with_stop(
         &mut self,
         handle: DomainHandle,
         stop_context: Option<&TrapContext>,
     ) -> ReclaimStats {
-        let Some(slot) = self.slots.get_mut(handle.id().0 as usize) else {
+        let Some((generation, stop_requested, relation_released, ipc_outcome)) =
+            self.begin_relation_release(handle, stop_context)
+        else {
             return ReclaimStats::zero();
         };
-        let Some(domain) = slot.as_mut() else {
+        let ipc_enabled = self
+            .valid_domain(handle)
+            .is_some_and(|domain| domain.ipc_enabled);
+        let failed_peers = if ipc_enabled {
+            self.mark_release_wakes(handle, generation, ipc_outcome)
+        } else {
+            Some([None, None])
+        };
+        let Some(failed_peers) = failed_peers else {
             return ReclaimStats::zero();
         };
-        if domain.generation != handle.generation().0 || !domain.state.is_live() {
-            return ReclaimStats::zero();
-        }
-
-        let generation = domain.generation;
-        let stop_requested = domain.stop.is_taken();
-        if let Some(context) = stop_context {
-            serial::ev_domain_outcome(
-                serial::DomainEventIdentity::new(context.slot + 1, context.generation),
-                context.outcome.name(),
-                context.vector,
-                context.error_code,
-                context.fault_address,
-                context.rip,
-                context.cs & 3,
-            );
-        }
-        let identity = domain.space.as_ref().map(|space| DomainIdentity {
-            root: space.root_phys(),
-            probe: space.probe(),
-        });
-        self.last_identity = identity;
-        let mut failed_peers = [None; 2];
-        let ipc_outcome = super::wait::release_ipc(handle.id().value(), generation);
-        let relation_released = ipc_outcome.relation_released;
-        if stop_requested {
-            serial::ev_stop_relation_retired(handle.id().0 + 1, generation, relation_released);
-        }
-        if domain.ipc_enabled {
-            serial::ev_ipc_reclaim(
-                handle.id().value() + 1,
-                generation,
-                ipc_outcome.endpoints as u64,
-                ipc_outcome.capabilities as u64,
-                ipc_outcome.queued_messages as u64,
-            );
-            for (failed_peer, wake) in failed_peers.iter_mut().zip(
-                ipc_outcome
-                    .waiters
-                    .into_iter()
-                    .chain(ipc_outcome.peer_failures)
-                    .flatten(),
-            ) {
-                let Some(wake_handle) = super::wait::domain_handle_token(wake) else {
-                    fail_terminal("invalid_ipc_wake");
-                };
-                super::wait::mark_ipc_peer_failed(wake_handle);
-                *failed_peer = Some(wake_handle);
-            }
-            super::wait::clear_parked(handle);
-        }
-        domain.state = DomainState::Releasing;
-        let Some(space) = domain.space.as_mut() else {
-            domain.state = DomainState::ReleaseFailed;
+        let Some((expected, freed)) = self.stage_and_release_space(handle, generation) else {
             return ReclaimStats::zero();
         };
-        let status = space.release(DomainId(handle.id().0), DomainGeneration(generation));
-        let (expected, freed) = match status {
-            super::paging::ReleaseStatus::Released(expected, freed) => (expected, freed),
-            super::paging::ReleaseStatus::RestoreFailed => {
-                domain.state = DomainState::ReleaseFailed;
-                return ReclaimStats::zero();
-            },
-            super::paging::ReleaseStatus::ReclaimBlocked(expected, freed) => {
-                domain.state = DomainState::ReleaseFailed;
-                (expected, freed)
-            },
-        };
-        let reclaimed = {
-            let Some(domain) = slot.as_mut() else {
-                return ReclaimStats::from_parts(
-                    expected,
-                    freed,
-                    stop_requested,
-                    relation_released,
-                );
-            };
-            if expected == 0 || expected != freed {
-                false
-            } else {
-                domain.state = DomainState::Reclaimed;
-                self.used_frames = self.used_frames.saturating_sub(expected);
-                serial::ev_domain_reclaimed(
-                    handle.id().0 + 1,
-                    domain.generation,
-                    expected,
-                    freed,
-                    freed,
-                    expected - freed,
-                );
-                super::admission::release(handle);
-                if stop_requested {
-                    serial::ev_stop_admission_released(handle.id().0 + 1, generation, true);
-                }
-                true
-            }
-        };
+        let reclaimed = self.reclaim_domain_space(handle, expected, freed, stop_requested);
         let mut failed_release_ok = true;
         if reclaimed {
-            let _ = slot;
             for failed_peer in failed_peers.into_iter().flatten() {
                 failed_release_ok &= self.release_slot(failed_peer).exactly_once();
             }
         }
         let stats = ReclaimStats::from_parts(expected, freed, stop_requested, relation_released);
-        let stop_complete = stats.exactly_once() && failed_release_ok;
-        if stop_requested {
-            let Some(slot) = self.slots.get_mut(handle.id().0 as usize) else {
-                return stats;
-            };
-            let Some(domain) = slot.as_mut() else {
-                return stats;
-            };
-            let _ = domain.stop.finish(handle, stop_complete);
-        }
+        self.finish_stop_release(handle, stop_requested, stats, failed_release_ok);
         stats
     }
 

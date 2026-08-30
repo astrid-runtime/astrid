@@ -405,6 +405,7 @@ fn passing_serial_with(kernel: &str, sysgen: &str, kfloor: u64, sfloor: u64) -> 
     emit_start(&mut ev, 1, 10, 11);
     emit_context(&mut ev, 1, 10, 0);
     ev("\"ev\":\"domain.stop.taken\",\"id\":1,\"generation\":10,\"source\":\"timer\",\"vector\":32,\"cpl\":3".into());
+    ev("\"ev\":\"domain.registers\",\"id\":1,\"generation\":10,\"cpl\":3,\"rax\":0,\"rbx\":0,\"rcx\":0,\"rdx\":0,\"rsi\":0,\"rdi\":11,\"rbp\":0,\"r8\":0,\"r9\":0,\"r10\":0,\"r11\":0,\"r12\":0,\"r13\":0,\"r14\":0,\"r15\":0,\"rsp\":\"0x1000\"".into());
     ev("\"ev\":\"domain.outcome\",\"id\":1,\"generation\":10,\"kind\":\"cancelled\",\"vector\":32,\"error_code\":0,\"fault_address\":\"0x0\",\"rip\":\"0x100000\",\"cpl\":3".into());
     ev("\"ev\":\"domain.stop.relation-retired\",\"id\":1,\"generation\":10,\"ok\":true".into());
     ev("\"ev\":\"domain.restore\",\"id\":1,\"generation\":10,\"ok\":true,\"root\":\"0x101000\",\"flags\":0".into());
