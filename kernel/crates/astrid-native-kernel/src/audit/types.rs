@@ -63,9 +63,65 @@ const AUTHORITY_ROOT_DOMAIN: &[u8] = b"astrid.native-kernel.audit-authority-root
 const AUTHORITY_ID_DOMAIN: &[u8] = b"astrid.native-kernel.audit-authority-id.v1";
 const AUTHORITY_KEY_DOMAIN: &[u8] = b"astrid.native-kernel.audit-authority-key.v1";
 
+/// Kernel-held entropy supplied to one audit authority. It is never part of
+/// the canonical frames, checkpoint wire, or untrusted handoff. A dropped
+/// value erases its bytes; no constructor exports or copies the input.
+pub(crate) struct KernelSecretEntropy([u8; 32]);
+
+impl KernelSecretEntropy {
+    pub(crate) fn new(bytes: [u8; 32]) -> Option<Self> {
+        if bytes.iter().all(|byte| *byte == 0) {
+            return None;
+        }
+        Some(Self(bytes))
+    }
+
+    const fn bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl Drop for KernelSecretEntropy {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+impl core::fmt::Debug for KernelSecretEntropy {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("KernelSecretEntropy(REDACTED)")
+    }
+}
+
+/// Typed authentication key derived from kernel-held entropy. Its bytes are
+/// exposed only to the modeled independently trusted anchor; they never
+/// enter a frame, checkpoint wire, or untrusted handoff.
+#[derive(Clone, Copy)]
+pub(crate) struct VerificationKey([u8; 32]);
+
+impl VerificationKey {
+    pub(crate) fn new(bytes: [u8; 32]) -> Option<Self> {
+        if bytes.iter().all(|byte| *byte == 0) {
+            return None;
+        }
+        Some(Self(bytes))
+    }
+
+    pub(crate) const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl core::fmt::Debug for VerificationKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("VerificationKey(REDACTED)")
+    }
+}
+
 /// Opaque kernel-owned authentication context. It is derived inside the
-/// kernel from the live boot identity and cannot be constructed from
-/// caller-selected bytes. Its authority id is part of every checkpoint tag.
+/// kernel from live boot identity and kernel-held entropy; the public boot
+/// identity alone is insufficient to reconstruct either its id or key. Its
+/// authority id is part of every checkpoint tag.
 ///
 /// The verification key stays kernel-side for the whole boot/session. It
 /// reaches the verifier only through an independently trusted kernel-origin
@@ -73,16 +129,17 @@ const AUTHORITY_KEY_DOMAIN: &[u8] = b"astrid.native-kernel.audit-authority-key.v
 /// handoff carries none of it. Production anchor delivery and key
 /// lifecycle remain named #1759 residuals, and no fixed production secret
 /// is introduced.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 pub(crate) struct CheckpointAuthContext {
     authority_id: u64,
-    verification_key: [u8; 32],
+    verification_key: VerificationKey,
 }
 
 impl CheckpointAuthContext {
-    fn mint(boot: BootSessionId) -> Self {
+    fn mint(boot: BootSessionId, secret: KernelSecretEntropy) -> Option<Self> {
         let mut id_hasher = Hasher::new();
         id_hasher.update(AUTHORITY_ROOT_DOMAIN);
+        id_hasher.update(secret.bytes());
         id_hasher.update(&boot.bytes());
         id_hasher.update(AUTHORITY_ID_DOMAIN);
         let id_digest: [u8; 32] = id_hasher.finalize().into();
@@ -93,22 +150,22 @@ impl CheckpointAuthContext {
 
         let mut key_hasher = Hasher::new();
         key_hasher.update(AUTHORITY_ROOT_DOMAIN);
+        key_hasher.update(secret.bytes());
         key_hasher.update(&boot.bytes());
         key_hasher.update(AUTHORITY_KEY_DOMAIN);
         key_hasher.update(&authority_id.to_le_bytes());
-        let verification_key: [u8; 32] = key_hasher.finalize().into();
-        debug_assert!(verification_key != [0; 32]);
-        Self {
+        let verification_key = VerificationKey::new(key_hasher.finalize().into())?;
+        Some(Self {
             authority_id,
             verification_key,
-        }
+        })
     }
 
     pub(crate) const fn authority_id(self) -> u64 {
         self.authority_id
     }
 
-    pub(crate) const fn verification_key(self) -> [u8; 32] {
+    pub(crate) const fn verification_key(self) -> VerificationKey {
         self.verification_key
     }
 }
@@ -123,7 +180,7 @@ impl core::fmt::Debug for CheckpointAuthContext {
 /// is untrusted binding evidence: it names the authority and carries a
 /// keyed minting tag, never verification material, so it cannot
 /// authenticate itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct AuditAuthority {
     boot: BootSessionId,
     context: CheckpointAuthContext,
@@ -134,11 +191,11 @@ pub(crate) struct AuditAuthority {
 const VERIFIER_HANDOFF_BYTES: usize = 8 + 8 + 16 + root::ROOT_LEN;
 
 impl AuditAuthority {
-    pub fn mint(boot: BootSessionId) -> Self {
-        Self {
+    pub fn mint(boot: BootSessionId, secret: KernelSecretEntropy) -> Option<Self> {
+        Some(Self {
             boot,
-            context: CheckpointAuthContext::mint(boot),
-        }
+            context: CheckpointAuthContext::mint(boot, secret)?,
+        })
     }
 
     pub const fn boot(self) -> BootSessionId {
@@ -162,7 +219,7 @@ impl AuditAuthority {
         let tag = root::verifier_handoff_tag(
             self.boot,
             self.context.authority_id(),
-            &self.context.verification_key(),
+            &self.context.verification_key().bytes(),
         );
         handoff[32..].copy_from_slice(&tag);
         handoff

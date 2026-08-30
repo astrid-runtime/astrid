@@ -8,8 +8,12 @@ fn boot() -> BootSessionId {
     BootSessionId::new([7; 16]).unwrap()
 }
 
+fn secret() -> KernelSecretEntropy {
+    KernelSecretEntropy::new([0x5A; 32]).unwrap()
+}
+
 fn authority() -> AuditAuthority {
-    AuditAuthority::mint(boot())
+    AuditAuthority::mint(boot(), secret()).unwrap()
 }
 
 fn subject(slot: u64, generation: u64) -> AuditSubject {
@@ -74,13 +78,13 @@ fn anchor_of(live: AuditAuthority) -> native_audit_verifier::AuthContext {
     native_audit_verifier::AuthContext::from_trusted_anchor(
         live.context().authority_id(),
         live.boot().bytes(),
-        live.context().verification_key(),
+        live.context().verification_key().bytes(),
     )
     .unwrap()
 }
 
 fn foreign(boot_byte: u8) -> AuditAuthority {
-    AuditAuthority::mint(BootSessionId::new([boot_byte; 16]).unwrap())
+    AuditAuthority::mint(BootSessionId::new([boot_byte; 16]).unwrap(), secret()).unwrap()
 }
 
 fn host_context() -> native_audit_verifier::AuthContext {
@@ -94,6 +98,10 @@ fn host_handoff() -> [u8; native_audit_verifier::AUTHORITY_HANDOFF_BYTES] {
 fn verifier() -> native_audit_verifier::AuditVerifier {
     native_audit_verifier::AuditVerifier::genesis(boot().bytes(), host_context(), &host_handoff())
         .unwrap()
+}
+
+fn genesis_chain(chain_boot: BootSessionId) -> AuditChain {
+    AuditChain::genesis(chain_boot, secret()).unwrap()
 }
 
 #[test]
@@ -190,7 +198,7 @@ fn rejects_malformed_non_canonical_and_disclosing_inputs() {
 #[test]
 fn append_folds_with_mandatory_source_root() {
     let chain_boot = boot();
-    let mut chain = AuditChain::genesis(chain_boot);
+    let mut chain = genesis_chain(chain_boot);
     let mut host_verifier = verifier();
 
     for expected_seq in 1u64..=5 {
@@ -218,7 +226,7 @@ fn append_folds_with_mandatory_source_root() {
 #[test]
 fn tamper_is_invalid_gap_is_incomplete_duplicate_is_invalid() {
     let chain_boot = boot();
-    let mut chain = AuditChain::genesis(chain_boot);
+    let mut chain = genesis_chain(chain_boot);
     for class in [
         AuditClass::DomainCreate,
         AuditClass::DomainAdmit,
@@ -270,7 +278,7 @@ fn tamper_is_invalid_gap_is_incomplete_duplicate_is_invalid() {
 #[test]
 fn foreign_boot_and_missing_previous_root_are_invalid() {
     let chain_boot = boot();
-    let mut chain = AuditChain::genesis(chain_boot);
+    let mut chain = genesis_chain(chain_boot);
     chain
         .append(domain_event(AuditClass::DomainCreate))
         .unwrap();
@@ -321,7 +329,7 @@ fn sequence_overflow_fails_closed_without_commit() {
 #[test]
 fn ack_requires_take_in_flight_and_matching_folded_root() {
     let chain_boot = boot();
-    let mut chain = AuditChain::genesis(chain_boot);
+    let mut chain = genesis_chain(chain_boot);
     let mut host_verifier = verifier();
     chain
         .append(domain_event(AuditClass::DomainCreate))
@@ -367,7 +375,7 @@ fn ack_requires_take_in_flight_and_matching_folded_root() {
 #[test]
 fn ack_before_take_does_not_retire_a_buffered_slot() {
     let chain_boot = boot();
-    let mut chain = AuditChain::genesis(chain_boot);
+    let mut chain = genesis_chain(chain_boot);
     chain
         .append(domain_event(AuditClass::DomainCreate))
         .unwrap();
@@ -385,7 +393,7 @@ fn ack_before_take_does_not_retire_a_buffered_slot() {
 #[test]
 fn restored_checkpoint_preserves_trusted_relay_generation() {
     let chain_boot = boot();
-    let mut chain = AuditChain::genesis(chain_boot);
+    let mut chain = genesis_chain(chain_boot);
     for _ in 0..AUDIT_RELAY_SLOTS {
         chain
             .append(domain_event(AuditClass::DomainReclaim))
@@ -405,7 +413,7 @@ fn restored_checkpoint_preserves_trusted_relay_generation() {
 #[test]
 fn reserved_headroom_and_overflow_fail_before_atomic_commit() {
     let chain_boot = boot();
-    let mut chain = AuditChain::genesis(chain_boot);
+    let mut chain = genesis_chain(chain_boot);
     for _ in 0..(AUDIT_RELAY_SLOTS - MAX_TERMINAL_RECORDS_PER_BATCH) {
         chain.append(domain_event(AuditClass::DomainEnter)).unwrap();
     }
@@ -505,7 +513,7 @@ fn explicitly_mismatched_previous_root_is_invalid() {
 #[test]
 fn kernel_and_verifier_reject_zero_relay_generation() {
     let chain_boot = boot();
-    let chain = AuditChain::genesis(chain_boot);
+    let chain = genesis_chain(chain_boot);
     let seq = chain.seq();
     let root = *chain.root();
     let mut wire = [0; native_audit_verifier::CHECKPOINT_WIRE_BYTES];
@@ -533,7 +541,7 @@ fn kernel_and_verifier_reject_zero_relay_generation() {
 #[test]
 fn resync_is_generation_bound_and_restores_flow() {
     let chain_boot = boot();
-    let mut chain = AuditChain::genesis(chain_boot);
+    let mut chain = genesis_chain(chain_boot);
     for _ in 0..AUDIT_RELAY_SLOTS {
         chain
             .append(domain_event(AuditClass::DomainReclaim))
@@ -563,7 +571,7 @@ fn resync_is_generation_bound_and_restores_flow() {
 #[test]
 fn checkpoint_is_kernel_authenticated_and_state_bound() {
     let chain_boot = boot();
-    let mut chain = AuditChain::genesis(chain_boot);
+    let mut chain = genesis_chain(chain_boot);
     chain
         .append(domain_event(AuditClass::DomainCreate))
         .unwrap();
@@ -612,7 +620,7 @@ fn checkpoint_is_kernel_authenticated_and_state_bound() {
 #[test]
 fn foreign_or_arbitrary_context_cannot_authenticate_or_retire() {
     let chain_boot = boot();
-    let mut chain = AuditChain::genesis(chain_boot);
+    let mut chain = genesis_chain(chain_boot);
     chain
         .append(domain_event(AuditClass::DomainCreate))
         .unwrap();
@@ -657,7 +665,7 @@ fn foreign_or_arbitrary_context_cannot_authenticate_or_retire() {
 #[test]
 fn handoff_is_untrusted_binding_without_verification_material() {
     let live = authority();
-    let key = live.context().verification_key();
+    let key = live.context().verification_key().bytes();
     let handoff = live.verifier_handoff();
 
     assert_eq!(
@@ -723,6 +731,97 @@ fn structurally_valid_self_authenticated_handoff_is_rejected() {
 }
 
 #[test]
+fn observed_public_derivation_cannot_forge_binding_or_material() {
+    let chain_boot = boot();
+    let live = authority();
+    let handoff = live.verifier_handoff();
+    let genuine_anchor = host_context();
+
+    // Reconstruct the rejected public-only derivation from exactly the
+    // fields an observer can read out of the untrusted handoff.
+    let observed_id = u64::from_le_bytes(handoff[8..16].try_into().expect("fixed handoff layout"));
+    let mut old_key_hasher = Hasher::new();
+    old_key_hasher.update(b"astrid.native-kernel.audit-authority-root.v1");
+    old_key_hasher.update(&handoff[16..32]);
+    old_key_hasher.update(b"astrid.native-kernel.audit-authority-key.v1");
+    old_key_hasher.update(&observed_id.to_le_bytes());
+    let old_key: [u8; 32] = old_key_hasher.finalize().into();
+
+    let mut forged_handoff = handoff;
+    forged_handoff[32..].copy_from_slice(&root::verifier_handoff_tag(
+        chain_boot,
+        observed_id,
+        &old_key,
+    ));
+    assert_eq!(
+        genuine_anchor.bind_handoff(&forged_handoff),
+        Err(native_audit_verifier::VerifyFailure::HandoffUnbound)
+    );
+    assert!(matches!(
+        native_audit_verifier::AuditVerifier::genesis(
+            chain_boot.bytes(),
+            genuine_anchor,
+            &forged_handoff
+        ),
+        Err(native_audit_verifier::VerifyFailure::HandoffUnbound)
+    ));
+
+    let mut chain = genesis_chain(chain_boot);
+    chain
+        .append(domain_event(AuditClass::DomainCreate))
+        .unwrap();
+    let checkpoint = chain.checkpoint();
+    let mut genuine_wire = [0; native_audit_verifier::CHECKPOINT_WIRE_BYTES];
+    let genuine_wire = encode_checkpoint(&checkpoint, live.context(), &mut genuine_wire).unwrap();
+    let mut forged_checkpoint = [0; native_audit_verifier::CHECKPOINT_WIRE_BYTES];
+    forged_checkpoint.copy_from_slice(genuine_wire);
+
+    let mut forged_tag_hasher = Hasher::new_keyed(&old_key);
+    forged_tag_hasher.update(root::CHECKPOINT_DOMAIN_TAG);
+    forged_tag_hasher.update(&super::CODEC_VERSION.to_le_bytes());
+    forged_tag_hasher.update(&checkpoint.boot().bytes());
+    forged_tag_hasher.update(&checkpoint.seq().to_le_bytes());
+    forged_tag_hasher.update(&checkpoint.root());
+    forged_tag_hasher.update(&checkpoint.relay_generation().to_le_bytes());
+    forged_tag_hasher.update(&checkpoint.authority_id().to_le_bytes());
+    let forged_tag: [u8; 32] = forged_tag_hasher.finalize().into();
+    let tag_offset = native_audit_verifier::CHECKPOINT_WIRE_BYTES - root::ROOT_LEN;
+    forged_checkpoint[tag_offset..].copy_from_slice(&forged_tag);
+
+    assert_eq!(
+        native_audit_verifier::verify_checkpoint(&forged_checkpoint, &genuine_anchor),
+        Err(native_audit_verifier::VerifyFailure::CheckpointMismatch)
+    );
+    assert!(matches!(
+        native_audit_verifier::AuditVerifier::from_checkpoint(
+            &forged_checkpoint,
+            genuine_anchor,
+            &handoff
+        ),
+        Err(native_audit_verifier::VerifyFailure::CheckpointMismatch)
+    ));
+
+    chain.relay_mut().grant_credits(1).unwrap();
+    let record = chain.relay_mut().take().unwrap();
+    let mut forged_ack_hasher = Hasher::new_keyed(&old_key);
+    forged_ack_hasher.update(root::ACK_DOMAIN_TAG);
+    forged_ack_hasher.update(&super::CODEC_VERSION.to_le_bytes());
+    forged_ack_hasher.update(&observed_id.to_le_bytes());
+    forged_ack_hasher.update(&chain_boot.bytes());
+    forged_ack_hasher.update(&chain.relay().generation().to_le_bytes());
+    forged_ack_hasher.update(&record.seq().to_le_bytes());
+    forged_ack_hasher.update(&record.root());
+    forged_ack_hasher.update(record.frame());
+    let forged_ack: [u8; 32] = forged_ack_hasher.finalize().into();
+
+    assert_eq!(
+        chain.ack(record.seq(), record.root(), forged_ack),
+        Err(AuditError::RootMismatch)
+    );
+    assert_eq!(chain.relay().redeliver().count(), 1);
+}
+
+#[test]
 fn checkpoint_under_forged_context_is_rejected() {
     let chain_boot = boot();
     // Arbitrary attacker-chosen root and sequence sealed under an
@@ -777,7 +876,7 @@ fn checkpoint_under_forged_context_is_rejected() {
 #[test]
 fn forged_retirement_receipt_is_rejected() {
     let chain_boot = boot();
-    let mut chain = AuditChain::genesis(chain_boot);
+    let mut chain = genesis_chain(chain_boot);
     chain
         .append(domain_event(AuditClass::DomainCreate))
         .unwrap();

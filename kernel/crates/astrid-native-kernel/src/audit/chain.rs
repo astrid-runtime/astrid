@@ -5,7 +5,9 @@
 use super::codec::{Frame, MAX_FRAME_BYTES};
 use super::relay::AuditRelay;
 use super::root;
-use super::types::{AuditAuthority, AuditCheckpoint, AuditError, AuditEvent, BootSessionId};
+use super::types::{
+    AuditAuthority, AuditCheckpoint, AuditError, AuditEvent, BootSessionId, KernelSecretEntropy,
+};
 
 pub(crate) struct AuditChain {
     boot: BootSessionId,
@@ -17,15 +19,15 @@ pub(crate) struct AuditChain {
 
 impl AuditChain {
     /// Starts a new boot/session chain at the domain-separated genesis root.
-    pub fn genesis(boot: BootSessionId) -> Self {
-        let authority = AuditAuthority::mint(boot);
-        Self {
+    pub fn genesis(boot: BootSessionId, secret: KernelSecretEntropy) -> Result<Self, AuditError> {
+        let authority = AuditAuthority::mint(boot, secret).ok_or(AuditError::MalformedFrame)?;
+        Ok(Self {
             boot,
             authority,
             seq: 0,
             root: root::genesis(boot),
             relay: AuditRelay::new(boot),
-        }
+        })
     }
 
     /// Restores from a previously sealed trusted checkpoint. The checkpoint

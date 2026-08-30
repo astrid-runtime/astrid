@@ -53,7 +53,7 @@ pub(crate) fn checkpoint_tag(
     relay_generation: u64,
     context: &CheckpointAuthContext,
 ) -> [u8; ROOT_LEN] {
-    let mut hasher = Hasher::new_keyed(&context.verification_key());
+    let mut hasher = Hasher::new_keyed(&context.verification_key().bytes());
     hasher.update(CHECKPOINT_DOMAIN_TAG);
     hasher.update(&super::CODEC_VERSION.to_le_bytes());
     hasher.update(&boot.bytes());
@@ -75,7 +75,7 @@ pub(crate) fn ack_tag(
     frame: &[u8],
     context: &CheckpointAuthContext,
 ) -> [u8; ROOT_LEN] {
-    let mut hasher = Hasher::new_keyed(&context.verification_key());
+    let mut hasher = Hasher::new_keyed(&context.verification_key().bytes());
     hasher.update(ACK_DOMAIN_TAG);
     hasher.update(&super::CODEC_VERSION.to_le_bytes());
     hasher.update(&context.authority_id().to_le_bytes());
