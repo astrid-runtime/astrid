@@ -412,7 +412,7 @@ pub fn complete_parked_recv(
         return Err(());
     };
     let endpoint_id = source.endpoint;
-    let mut transferred_slot = None;
+    let mut installed_transfer = None;
     if let Some(capability) = message.transfer() {
         let destination_slot = CapSlot::try_new(usize::from(parsed.cap_slot()));
         let installed = match destination_slot {
@@ -427,7 +427,7 @@ pub fn complete_parked_recv(
         };
         match installed {
             Some(slot) => {
-                transferred_slot = Some(slot);
+                installed_transfer = Some((slot, capability));
             },
             None => {
                 if let Some(object) = state.objects[endpoint_id.index()].as_mut() {
@@ -449,7 +449,7 @@ pub fn complete_parked_recv(
     let committed = commit(&mut encoded);
     if committed {
         if let Some(parent) = transfer
-            && let Some(slot) = transferred_slot
+            && let Some((slot, _)) = installed_transfer
         {
             let mut state = IPC.lock();
             if state.capabilities[domain.slot().index()]
@@ -460,7 +460,7 @@ pub fn complete_parked_recv(
             }
         }
     } else {
-        rollback_recv(domain, endpoint_id, message, transferred_slot);
+        rollback_recv(domain, endpoint_id, message, installed_transfer);
     }
     committed.then_some(()).ok_or(())
 }
@@ -619,7 +619,7 @@ fn recv(frame: &mut TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcErr
         return Err(IpcError::Busy);
     };
     let endpoint_id = source.endpoint;
-    let mut transferred_slot = None;
+    let mut installed_transfer = None;
     if let Some(capability) = message.transfer() {
         let destination_slot = CapSlot::try_new(usize::from(output.cap_slot()));
         let installed = match destination_slot {
@@ -634,7 +634,7 @@ fn recv(frame: &mut TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcErr
         };
         match installed {
             Some(slot) => {
-                transferred_slot = Some(slot);
+                installed_transfer = Some((slot, capability));
             },
             None => {
                 if let Some(object) = state.objects[endpoint_id.index()].as_mut() {
@@ -655,11 +655,11 @@ fn recv(frame: &mut TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcErr
     drop(state);
     let mut encoded = encoded;
     if !copy::copy_current_user(frame.rsi, &mut encoded, true) {
-        rollback_recv(domain, endpoint_id, message, transferred_slot);
+        rollback_recv(domain, endpoint_id, message, installed_transfer);
         return Err(IpcError::Faulted);
     }
     if let Some(parent) = transfer
-        && let Some(slot) = transferred_slot
+        && let Some((slot, _)) = installed_transfer
     {
         let mut state = IPC.lock();
         if state.capabilities[domain.slot().index()]

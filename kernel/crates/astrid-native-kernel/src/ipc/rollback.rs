@@ -8,12 +8,20 @@ pub(super) fn rollback_recv(
     domain: DomainToken,
     endpoint_id: super::EndpointId,
     message: Message,
-    slot: Option<CapSlot>,
+    installed: Option<(CapSlot, Capability)>,
 ) {
     let mut state = super::IPC.lock();
-    if let Some(slot) = slot {
-        state.capabilities[domain.slot().index()].remove(domain, slot);
+    if let Some((slot, transferred)) = installed {
+        let table = &mut state.capabilities[domain.slot().index()];
+        if table
+            .get(domain, slot)
+            .is_some_and(|current| current == transferred)
+        {
+            table.remove(domain, slot);
+        }
     }
+    // The destination slot may have been revoked and reused independently of
+    // the queued message. The message's own authority is still checked below.
     // A receive is durable only when its authority remains valid. Requeueing a
     // transfer whose parent or endpoint vanished in the commit gap would let a
     // revoked capability return through an apparently ordinary retry.

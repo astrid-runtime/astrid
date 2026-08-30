@@ -217,6 +217,55 @@ fn revoked_parent_during_parked_failure_consumes_stale_retry() {
     require_fold_from(peer, queued_base.0, queued_base.1);
 }
 
+#[test]
+fn commit_false_revoke_and_replace_preserves_destination_replacement() {
+    let _guard = test_lock();
+    reset();
+    let creator = domain(0);
+    let peer = domain(1);
+    prepare_domain(creator);
+    prepare_domain(peer);
+    let endpoint = endpoint_create(creator).unwrap();
+    assert!(bind_peer(creator, peer).is_ok());
+
+    let root_slot = creator.slot();
+    let root = capability(creator, root_slot).unwrap();
+    let transferred = linked_transfer(root, creator, root_slot);
+    assert!(install_transfer_message(
+        peer,
+        creator,
+        endpoint,
+        Some(transferred)
+    ));
+
+    let rollback_base = observation(peer);
+    let destination_slot = TestCapSlot::try_new(1).unwrap();
+    let wire = recv_wire(1);
+    assert!(
+        complete_parked_recv(peer, &wire, 0, |_| {
+            assert_eq!(cap_revoke(peer, destination_slot), Ok(1));
+            assert!(install_transfer_message(
+                peer,
+                creator,
+                endpoint,
+                Some(root)
+            ));
+            assert!(complete_parked_recv(peer, &wire, 0, |_| true).is_ok());
+            false
+        })
+        .is_err()
+    );
+
+    assert_eq!(capability(peer, destination_slot), Some(root));
+    assert_eq!(queued_for(peer), 1);
+    let direct = observation(peer).0;
+    assert!(direct.rows().any(|relation| matches!(
+        relation.key(),
+        RelationKey::Holds { capability, .. } if capability.slot().index() == 1
+    )));
+    require_fold_from(peer, rollback_base.0, rollback_base.1);
+}
+
 fn require_fold(evidence: ProjectionEvidence) {
     assert!(evidence.fold_matches);
     assert_eq!(evidence.epoch, evidence.fold_epoch);
