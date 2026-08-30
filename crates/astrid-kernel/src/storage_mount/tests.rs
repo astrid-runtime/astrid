@@ -3,6 +3,10 @@ use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 
 use super::filesystem::CallbackFilesystem;
 use super::*;
+use astrid_core::storage_filesystem::{
+    StorageFilesystemOperationV2, StorageFilesystemOutcomeV2, StorageFilesystemRequestV1,
+    StorageFilesystemRequestV2, StorageFilesystemResponseV2, StorageFilesystemSuccessV2,
+};
 
 async fn callback(
     lease: &StorageMountLeaseV1,

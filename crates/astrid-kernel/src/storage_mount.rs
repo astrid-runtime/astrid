@@ -15,9 +15,7 @@ use astrid_core::storage_filesystem::{
     STORAGE_FILESYSTEM_PROTOCOL_V2, STORAGE_FILESYSTEM_SERVICE_LAUNCH_SCHEMA_V1,
     STORAGE_FILESYSTEM_SERVICE_READY_SCHEMA_V1, StorageFilesystemEntryKindV1,
     StorageFilesystemEntryV1, StorageFilesystemFailureV1, StorageFilesystemOperationV1,
-    StorageFilesystemOperationV2, StorageFilesystemOutcomeV1, StorageFilesystemOutcomeV2,
-    StorageFilesystemRequestV1, StorageFilesystemRequestV2, StorageFilesystemResponseV1,
-    StorageFilesystemResponseV2, StorageFilesystemSuccessV1, StorageFilesystemSuccessV2,
+    StorageFilesystemOutcomeV1, StorageFilesystemResponseV1, StorageFilesystemSuccessV1,
     StorageFilesystemTargetV1, StorageMountLeaseV1, StorageProviderParentLifetimeV1,
     StorageProviderServiceLaunchV1, StorageProviderServiceReadyV1,
     storage_provider_service_ready_challenge,
@@ -37,7 +35,9 @@ use tokio::sync::watch;
 
 use crate::Kernel;
 
+mod callback_wire;
 mod filesystem;
+use callback_wire::{CallbackRequest, CallbackResponse, read_request, response_v2, write_response};
 use filesystem::{PrefixedFilesystem, execute_blocking};
 #[cfg(test)]
 mod admission;
@@ -83,23 +83,7 @@ const LEASE_IDLE_TTL_SECS: u64 = 60 * 60;
 const LISTENER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 #[cfg(windows)]
 const ENDPOINT_ABSENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const MAX_CALLBACK_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const LEASE_MANIFEST_NAME: &str = "lease.json";
-
-struct CallbackRequest {
-    request: StorageFilesystemRequestV1,
-    response_version: u16,
-}
-
-#[derive(serde::Deserialize)]
-struct ProtocolProbe {
-    protocol_version: u16,
-}
-
-enum CallbackResponse {
-    V1(StorageFilesystemResponseV1),
-    V2(StorageFilesystemResponseV2),
-}
 
 /// A synchronous admission ticket for callback or renewal work.
 ///
@@ -688,136 +672,6 @@ async fn handle_connection(
     }
 }
 
-#[cfg(any(unix, windows))]
-async fn read_request(stream: &mut LocalStream) -> Result<Option<CallbackRequest>, io::Error> {
-    let mut length = [0_u8; 4];
-    match stream.read_exact(&mut length).await {
-        Ok(_) => {},
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error),
-    }
-    let length = u32::from_be_bytes(length) as usize;
-    if length > MAX_CALLBACK_FRAME_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "mount callback frame exceeds limit",
-        ));
-    }
-    let mut bytes = vec![0_u8; length];
-    stream.read_exact(&mut bytes).await?;
-    let protocol = serde_json::from_slice::<ProtocolProbe>(&bytes)
-        .map_err(io::Error::other)?
-        .protocol_version;
-    if protocol == STORAGE_FILESYSTEM_PROTOCOL_V2 {
-        let request = serde_json::from_slice::<StorageFilesystemRequestV2>(&bytes)
-            .map_err(io::Error::other)?;
-        let operation = decode_operation_v2(request.operation)?;
-        Ok(Some(CallbackRequest {
-            request: StorageFilesystemRequestV1 {
-                protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V1,
-                request_id: request.request_id,
-                lease_token: request.lease_token,
-                operation,
-            },
-            response_version: STORAGE_FILESYSTEM_PROTOCOL_V2,
-        }))
-    } else if protocol == STORAGE_FILESYSTEM_PROTOCOL_V1 {
-        let request = serde_json::from_slice::<StorageFilesystemRequestV1>(&bytes)
-            .map_err(io::Error::other)?;
-        Ok(Some(CallbackRequest {
-            request,
-            response_version: STORAGE_FILESYSTEM_PROTOCOL_V1,
-        }))
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unsupported storage filesystem protocol",
-        ))
-    }
-}
-
-fn decode_operation_v2(
-    operation: StorageFilesystemOperationV2,
-) -> io::Result<StorageFilesystemOperationV1> {
-    Ok(match operation {
-        StorageFilesystemOperationV2::Stat { path } => StorageFilesystemOperationV1::Stat { path },
-        StorageFilesystemOperationV2::ReadDirectory { path } => {
-            StorageFilesystemOperationV1::ReadDirectory { path }
-        },
-        StorageFilesystemOperationV2::Read {
-            path,
-            offset,
-            length,
-        } => StorageFilesystemOperationV1::Read {
-            path,
-            offset,
-            length,
-        },
-        StorageFilesystemOperationV2::Write {
-            path,
-            offset,
-            data_base64,
-        } => {
-            let data = base64::engine::general_purpose::STANDARD
-                .decode(data_base64.as_bytes())
-                .map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("invalid base64 filesystem payload: {error}"),
-                    )
-                })?;
-            let data_length = u64::try_from(data.len()).unwrap_or(u64::MAX);
-            if data_length > STORAGE_FILESYSTEM_MAX_IO_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "filesystem payload exceeds limit",
-                ));
-            }
-            StorageFilesystemOperationV1::Write { path, offset, data }
-        },
-        StorageFilesystemOperationV2::SetLength { path, length } => {
-            StorageFilesystemOperationV1::SetLength { path, length }
-        },
-        StorageFilesystemOperationV2::Create { path, kind } => {
-            StorageFilesystemOperationV1::Create { path, kind }
-        },
-        StorageFilesystemOperationV2::Remove { path } => {
-            StorageFilesystemOperationV1::Remove { path }
-        },
-        StorageFilesystemOperationV2::Rename { from, to, replace } => {
-            StorageFilesystemOperationV1::Rename { from, to, replace }
-        },
-        StorageFilesystemOperationV2::Sync => StorageFilesystemOperationV1::Sync,
-    })
-}
-
-#[cfg(any(unix, windows))]
-async fn write_response(
-    stream: &mut LocalStream,
-    response: CallbackResponse,
-) -> Result<(), io::Error> {
-    let bytes = match response {
-        CallbackResponse::V1(response) => serde_json::to_vec(&response),
-        CallbackResponse::V2(response) => serde_json::to_vec(&response),
-    }
-    .map_err(io::Error::other)?;
-    if bytes.len() > MAX_CALLBACK_FRAME_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "mount callback response exceeds limit",
-        ));
-    }
-    let length = u32::try_from(bytes.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "mount callback response is too large",
-        )
-    })?;
-    stream.write_all(&length.to_be_bytes()).await?;
-    stream.write_all(&bytes).await?;
-    stream.flush().await
-}
-
 async fn dispatch_request(
     kernel: &Kernel,
     state: &StorageMountLeaseState,
@@ -843,36 +697,6 @@ async fn dispatch_request(
         STORAGE_FILESYSTEM_PROTOCOL_V1 => CallbackResponse::V1(response),
         STORAGE_FILESYSTEM_PROTOCOL_V2 => CallbackResponse::V2(response_v2(response)),
         _ => unreachable!("read_request validated the callback protocol version"),
-    }
-}
-
-fn response_v2(response: StorageFilesystemResponseV1) -> StorageFilesystemResponseV2 {
-    let outcome = match response.outcome {
-        StorageFilesystemOutcomeV1::Success(success) => {
-            StorageFilesystemOutcomeV2::Success(match success {
-                StorageFilesystemSuccessV1::Done => StorageFilesystemSuccessV2::Done,
-                StorageFilesystemSuccessV1::Entry(entry) => {
-                    StorageFilesystemSuccessV2::Entry(entry)
-                },
-                StorageFilesystemSuccessV1::Entries(entries) => {
-                    StorageFilesystemSuccessV2::Entries(entries)
-                },
-                StorageFilesystemSuccessV1::Data(data) => StorageFilesystemSuccessV2::Data {
-                    data_base64: base64::engine::general_purpose::STANDARD.encode(data),
-                },
-                StorageFilesystemSuccessV1::Written(length) => {
-                    StorageFilesystemSuccessV2::Written(length)
-                },
-            })
-        },
-        StorageFilesystemOutcomeV1::Failure(failure) => {
-            StorageFilesystemOutcomeV2::Failure(failure)
-        },
-    };
-    StorageFilesystemResponseV2 {
-        protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V2,
-        request_id: response.request_id,
-        outcome,
     }
 }
 
