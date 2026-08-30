@@ -19,6 +19,8 @@ use super::StorageMountLeaseState;
 use super::cleanup::MountCleanupStage;
 use super::cleanup::{MountCleanupError, cleanup_error, cleanup_resource_paths};
 use super::filesystem::{CallbackFilesystem, PrefixedFilesystem};
+#[cfg(any(unix, windows))]
+use super::{BlockingJobDrain, ListenerDrainOutcome};
 use crate::Kernel;
 
 const PUBLICATION_CLOSED: &str = "cannot issue a storage mount lease for a retiring principal";
@@ -507,15 +509,32 @@ pub(crate) async fn revoke_from_grant(
 }
 
 async fn force_revoke_lease(kernel: &Kernel, state: &StorageMountLeaseState) -> Result<(), String> {
+    let already_revoked = state.revoked.load(Ordering::Acquire);
     state.revoked.store(true, Ordering::Release);
     let _ = state.shutdown_tx.send(true);
-    // The listener owns the platform endpoint. Wait outside the mutation
-    // fence so the listener can finish any in-flight connection bookkeeping.
-    if !state.wait_listener_closed().await {
-        return Err(drain_timeout_error(state).to_string());
-    }
+    await_retained_drain(state, !already_revoked).await?;
     let _mutation_guard = kernel.storage_mount_mutations.lock().await;
     cleanup_mapped_lease(kernel, state).map_err(|error| error.to_string())
+}
+
+/// Wait outside the mutation fence for the listener's typed retained-work outcome.
+async fn await_retained_drain(
+    state: &StorageMountLeaseState,
+    include_latched_failure: bool,
+) -> Result<(), String> {
+    let outcome = state.wait_drain_outcome(include_latched_failure).await;
+    match outcome {
+        ListenerDrainOutcome::Failed(BlockingJobDrain::JoinFailed) => Err(cleanup_error(
+            Some(state.mount_id),
+            MountCleanupStage::Drain,
+            std::io::Error::other("retained filesystem worker join failed"),
+        )
+        .to_string()),
+        ListenerDrainOutcome::Failed(BlockingJobDrain::TimedOut)
+        | ListenerDrainOutcome::TimedOut => Err(drain_timeout_error(state).to_string()),
+        ListenerDrainOutcome::Failed(BlockingJobDrain::Completed)
+        | ListenerDrainOutcome::Closed => Ok(()),
+    }
 }
 
 fn drain_timeout_error(state: &StorageMountLeaseState) -> MountCleanupError {
@@ -555,13 +574,9 @@ pub(crate) async fn revoke_all_leases_for_principal(
     revoke_visible(&mapped_leases_for_principal(kernel, principal, uid));
     let matched = mapped_leases_for_principal(kernel, principal, uid);
     revoke_visible(&matched);
-    // Listener shutdown must be acknowledged before cleanup. In particular,
-    // do not hold storage_mount_mutations while waiting: the listener's
-    // connection tasks may need that lock to finish their own shutdown path.
     for state in &matched {
-        if !state.wait_listener_closed().await {
-            return Err(drain_timeout_error(state).to_string());
-        }
+        let already_revoked = state.revoked.load(Ordering::Acquire);
+        await_retained_drain(state, !already_revoked).await?;
     }
     let _mutation_guard = kernel.storage_mount_mutations.lock().await;
     let mut errors = Vec::new();

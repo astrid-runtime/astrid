@@ -128,6 +128,8 @@ pub(crate) struct StorageMountLeaseState {
     /// Filesystem workers retained across callback-connection cancellation.
     blocking_jobs: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
     drain_timeouts: std::sync::Mutex<DrainTimeouts>,
+    #[cfg(any(unix, windows))]
+    drain_failure_tx: watch::Sender<Option<BlockingJobDrain>>,
     #[cfg(all(test, any(unix, windows)))]
     token_for_test: String,
     /// Set after the listener task has dropped its backend listener handle.
@@ -179,6 +181,14 @@ struct DrainTimeouts {
     listener_shutdown: std::time::Duration,
 }
 
+#[cfg(any(unix, windows))]
+#[derive(Debug)]
+enum ListenerDrainOutcome {
+    Failed(BlockingJobDrain),
+    Closed,
+    TimedOut,
+}
+
 impl StorageMountLeaseState {
     fn is_owned_by(&self, caller: astrid_core::PrincipalUid) -> bool {
         self.requested_by_uid == caller
@@ -202,6 +212,40 @@ impl StorageMountLeaseState {
         tokio::time::timeout(self.drain_timeouts().listener_shutdown, wait)
             .await
             .unwrap_or(false)
+    }
+
+    #[cfg(any(unix, windows))]
+    async fn wait_drain_outcome(&self, include_latched_failure: bool) -> ListenerDrainOutcome {
+        let mut failure = self.drain_failure_tx.subscribe();
+        let mut closed = self.listener_closed_tx.subscribe();
+        // A first cleanup must see a fast panic even after the listener closes.
+        // A retry of an already revoked lease is resolving that older outcome.
+        if include_latched_failure && let Some(job_drain) = *failure.borrow() {
+            return ListenerDrainOutcome::Failed(job_drain);
+        }
+        if *closed.borrow() {
+            return ListenerDrainOutcome::Closed;
+        }
+        let wait = async {
+            loop {
+                tokio::select! {
+                    biased;
+                    changed = failure.changed() => {
+                        if changed.is_ok() && let Some(job_drain) = *failure.borrow() {
+                            return ListenerDrainOutcome::Failed(job_drain);
+                        }
+                    },
+                    changed = closed.changed() => {
+                        if changed.is_err() || *closed.borrow() {
+                            return ListenerDrainOutcome::Closed;
+                        }
+                    },
+                }
+            }
+        };
+        tokio::time::timeout(self.drain_timeouts().listener_shutdown, wait)
+            .await
+            .map_or(ListenerDrainOutcome::TimedOut, |outcome| outcome)
     }
 
     #[cfg(test)]
@@ -351,6 +395,8 @@ fn publish_issued_lease(
     let (token, token_hash) = generate_lease_token()?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (listener_closed_tx, _) = watch::channel(false);
+    #[cfg(any(unix, windows))]
+    let (drain_failure_tx, _) = watch::channel(None);
     let cleanup_ledger_path = kernel
         .astrid_home
         .run_dir()
@@ -385,6 +431,8 @@ fn publish_issued_lease(
             accepted_task: ACCEPTED_TASK_DRAIN_TIMEOUT,
             listener_shutdown: LISTENER_SHUTDOWN_TIMEOUT,
         }),
+        #[cfg(any(unix, windows))]
+        drain_failure_tx,
         #[cfg(all(test, any(unix, windows)))]
         blocking_worker_test_gate: std::sync::Mutex::new(None),
         #[cfg(all(test, any(unix, windows)))]
@@ -670,6 +718,7 @@ async fn serve_listener(
     };
     let blocking_drained = blocking_drain == BlockingJobDrain::Completed;
     if !blocking_drained {
+        state.drain_failure_tx.send_replace(Some(blocking_drain));
         tracing::warn!(
             ?blocking_drain,
             "storage mount retained filesystem jobs failed to drain"
@@ -812,6 +861,16 @@ async fn execute_operation(
             }
         })
         .await;
+        // The retained wrapper catches an inner spawn_blocking panic as an
+        // outcome error. Preserve its typed join failure for listener drain
+        // instead of letting the outer JoinSet task complete successfully.
+        if let Err(join_error) = result.as_ref()
+            && join_error.is_panic()
+        {
+            retained_state
+                .drain_failure_tx
+                .send_replace(Some(BlockingJobDrain::JoinFailed));
+        }
         if let Ok(Ok(_)) = result.as_ref() {
             if is_mutation {
                 retained_state.dirty.store(true, Ordering::Release);

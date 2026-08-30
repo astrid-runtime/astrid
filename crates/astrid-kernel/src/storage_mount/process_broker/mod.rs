@@ -207,6 +207,8 @@ async fn retain_uncommitted_issue_lease(
 #[derive(Clone)]
 pub(crate) struct KernelProcessStorageMountBroker {
     pub(crate) kernel: std::sync::Weak<Kernel>,
+    /// Serializes one provider-service incarnation without owning the cache.
+    startup: Arc<tokio::sync::Mutex<()>>,
     projections: Arc<
         tokio::sync::Mutex<
             std::collections::BTreeMap<ProcessProjectionKey, Arc<CachedProcessProjection>>,
@@ -219,15 +221,40 @@ impl KernelProcessStorageMountBroker {
     pub(crate) fn new(kernel: std::sync::Weak<Kernel>) -> Self {
         Self {
             kernel,
+            startup: Arc::new(tokio::sync::Mutex::new(())),
             projections: Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new())),
         }
     }
 }
 
+struct ProjectionAdmission {
+    key: ProcessProjectionKey,
+    principal: PrincipalId,
+    principal_uid: astrid_core::PrincipalUid,
+    branch_view: StorageProviderViewV1,
+    access: StorageProviderAccessV1,
+}
+
+enum CachedProjectionAdmission {
+    Fresh,
+    Healthy(Arc<CachedProcessProjection>),
+}
+
+struct IssuedProjectionLeases {
+    bundle: ProjectionLeaseBundle,
+    tokens: ProjectionLaunchTokens,
+    paths: ProjectionMountPaths,
+}
+
+struct ProjectionIssueContext<'a> {
+    admission: &'a ProjectionAdmission,
+    mount_admission: &'a MountAdmission,
+    paths: &'a ProjectionMountPaths,
+}
+
 #[cfg(any(unix, windows))]
 #[async_trait::async_trait]
 impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorageMountBroker {
-    #[allow(clippy::too_many_lines)]
     async fn mount(
         &self,
         principal: &PrincipalId,
@@ -240,380 +267,473 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             .workspace_branches
             .as_ref()
             .ok_or_else(|| "workspace branch service is unavailable".to_owned())?;
-        // Serialize projection admission and startup. Holding this narrow
-        // kernel-local lock through provider readiness prevents concurrent
-        // capsules for one immutable UID from racing to create duplicate
-        // provider pairs; subsequent callers take the cached fast path.
-        let mut projections = self.projections.lock().await;
-        let generation = ProjectionGeneration::capture()?;
-        let workspace_binding = service.bind(principal).await?;
-        let principal_uid = kernel
-            .principal_directory
-            .uid_for(principal)
-            .map_err(|error| format!("resolve principal process projection identity: {error}"))?;
-        if principal_uid != workspace_binding.uid {
-            return Err("workspace branch identity changed during process admission".to_owned());
-        }
-        let binding = ProcessProjectionBinding::new(
-            workspace_binding.owner,
-            principal_uid,
-            generation,
-            ProcessProjectionTargetSet::branch(
-                workspace_binding.owner,
-                principal_uid,
-                workspace_binding.branch,
-                match workspace_binding.owner {
-                    StateOwner::Fleet(fleet_uid) => Some(fleet_uid),
-                    _ => None,
+        // Startup remains serialized across admission, issue, and launch. The
+        // projection cache itself is never held across retain because retain's
+        // invalidation path must acquire that cache to exact-clean and retry.
+        let _startup = self.startup.lock().await;
+        loop {
+            let mut projections = self.projections.lock().await;
+            let admission = resolve_projection_admission(&kernel, service, principal).await?;
+            let cached = admit_cached_projection(&kernel, &mut projections, &admission.key).await?;
+            let projection = match cached {
+                CachedProjectionAdmission::Healthy(projection) => projection,
+                CachedProjectionAdmission::Fresh => {
+                    let issued =
+                        issue_projection_leases(&kernel, &mut projections, &admission).await?;
+                    publish_projection(&kernel, &mut projections, &admission.key, issued).await?
                 },
-            )?,
-        )?;
-        let branch_view = match workspace_binding.owner {
-            StateOwner::Principal(_) => StorageProviderViewV1::Principal(principal.clone()),
-            StateOwner::Fleet(uid) => StorageProviderViewV1::Fleet(uid),
-            StateOwner::System | StateOwner::User(_) => {
-                return Err("system workspace owner is not process-mountable".to_owned());
-            },
-        };
-        let access = StorageProviderAccessV1::ReadWrite;
-        let key = ProcessProjectionKey {
-            binding,
-            read_write: matches!(access, StorageProviderAccessV1::ReadWrite),
-        };
-        if let Some(projection) = projections.get(&key).cloned() {
-            if !key.matches_projection(&projection) {
-                return Err("process projection identity mismatch".to_owned());
-            }
-            if projection.cleanup_failed.load(Ordering::Acquire) {
-                // A failed last-close retains the projection in this cache so
-                // a later authenticated mount request can retry STOP/reap,
-                // lease revocation, and resource removal. Do not create a
-                // second provider pair while any prior resources remain.
-                if !retry_failed_projection(&projection, &mut projections, &key).await {
-                    return Err(
-                        "native process storage projection requires administrative cleanup"
-                            .to_owned(),
-                    );
-                }
-            } else if !projection_leases_are_live(&kernel, &projection) {
-                // External revocation, expiry, or kernel-map drift makes the
-                // cached set partial or untrustworthy. Fence and clean before
-                // admission; never take a reference on stale provider paths.
-                if !invalidate_unhealthy_projection(&kernel, &projection, &mut projections, &key)
-                    .await
-                {
-                    return Err(
-                        "native process storage projection requires administrative cleanup"
-                            .to_owned(),
-                    );
-                }
-            } else {
-                drop(projections);
-                match retain_locked_projection(
-                    &kernel,
-                    projection,
-                    Arc::clone(&self.projections),
-                    key,
-                )
-                .await
-                {
-                    Ok(mount) => return Ok(mount),
-                    Err(RetainAdmissionFailure::Retry) => {
-                        return Box::pin(self.mount(principal)).await;
-                    },
-                    Err(RetainAdmissionFailure::Blocked(error)) => return Err(error),
-                }
-            }
-        }
-        if let Some(error) = blocked_projection_lease(&kernel, &key.binding) {
-            return Err(error);
-        }
-
-        ensure_owner_home(&kernel, principal_uid).await?;
-        if let StateOwner::Fleet(fleet_uid) = key.binding.owner {
-            ensure_fleet_shared(&kernel, fleet_uid).await?;
-        }
-
-        // Generate every parent token before publishing the first lease. A
-        // late token failure must not turn into a partial, live lease set or
-        // allocate the random provider-service root.
-        let parent_tokens = match generate_parent_tokens(&key.binding.targets) {
-            Ok(tokens) => tokens,
-            Err(error) => {
-                return Err(error);
-            },
-        };
-        let branch_parent_token = parent_tokens.branch;
-        let owner_parent_token = parent_tokens.owner_home;
-        let shared_parent_token = parent_tokens.fleet_shared;
-        let provider = platform_process_provider_name();
-        let admission = MountAdmission::capture(&kernel, principal, MountOwnerScope::CallerOnly)?;
-
-        // A durable branch is an authority target, not a host mount identity.
-        // The random root identifies this one provider-service incarnation;
-        // all concurrent children over the same key share it. It is created
-        // only after Fleet, HOME, token, and admission preparation succeeds.
-        let process_root = kernel.astrid_home.run_dir().join("process-storage");
-        astrid_core::platform_fs::ensure_private_directory(&process_root)
-            .map_err(|error| format!("create process storage root: {error}"))?;
-        let mount_root = process_root.join(uuid::Uuid::new_v4().simple().to_string());
-        astrid_core::platform_fs::ensure_private_directory(&mount_root)
-            .map_err(|error| format!("validate process storage mount root: {error}"))?;
-        let workspace_mountpoint = mount_root.join("workspace");
-        let home_mountpoint = mount_root.join("owner");
-        #[cfg(not(windows))]
-        {
-            astrid_core::platform_fs::ensure_private_directory(&workspace_mountpoint)
-                .map_err(|error| format!("create workspace mountpoint: {error}"))?;
-            astrid_core::platform_fs::ensure_private_directory(&home_mountpoint)
-                .map_err(|error| format!("create owner mountpoint: {error}"))?;
-        }
-        let fleet_shared_mountpoint = if matches!(key.binding.owner, StateOwner::Fleet(_)) {
-            let path = mount_root.join("shared");
-            #[cfg(not(windows))]
-            astrid_core::platform_fs::ensure_private_directory(&path)
-                .map_err(|error| format!("create Fleet shared mountpoint: {error}"))?;
-            Some(path)
-        } else {
-            None
-        };
-
-        let branch_target = key.binding.targets.workspace.durable_target();
-        let branch_lease = match issue_lease(
-            &kernel,
-            &admission,
-            branch_view,
-            branch_target,
-            access,
-            provider.to_owned(),
-            workspace_mountpoint.clone(),
-        )
-        .await
-        {
-            Ok(lease) => lease,
-            Err(error) => {
-                let _ = std::fs::remove_dir_all(&mount_root);
-                return Err(error);
-            },
-        };
-        #[cfg(all(test, any(unix, windows)))]
-        process_launch::record_published_test_lease(
-            process_launch::ProcessLaunchStage::Branch,
-            branch_lease.mount_id,
-        );
-        #[cfg(all(test, any(unix, windows)))]
-        let owner_provider = {
-            let owner_provider = provider.to_owned();
-            if take_partial_issue_failure(process_launch::ProcessLaunchStage::OwnerHome) {
-                let state = Arc::clone(
-                    kernel
-                        .storage_mounts
-                        .get(&branch_lease.mount_id)
-                        .expect("branch lease before OwnerHome issue failure")
-                        .value(),
-                );
-                crate::storage_mount::inject_cleanup_fault_for_test(
-                    &state,
-                    crate::storage_mount::MountCleanupStage::Callback,
-                );
-                "\t".to_owned()
-            } else {
-                owner_provider
-            }
-        };
-        #[cfg(not(all(test, any(unix, windows))))]
-        let owner_provider = provider.to_owned();
-        let owner_lease = match issue_lease(
-            &kernel,
-            &admission,
-            // HOME is always the acting principal's owner-local root.  A
-            // principal assigned to a Fleet still receives a private HOME;
-            // the Fleet workspace branch above is an explicit separate view.
-            StorageProviderViewV1::Principal(principal.clone()),
-            key.binding.targets.owner_home.durable_target(),
-            access,
-            owner_provider,
-            home_mountpoint.clone(),
-        )
-        .await
-        {
-            Ok(lease) => lease,
-            Err(error) => {
-                let error = retain_uncommitted_issue_lease(
-                    &mut projections,
-                    &key,
-                    &kernel,
-                    UncommittedIssueRollback {
-                        branch_mount_id: branch_lease.mount_id,
-                        owner_mount_id: None,
-                        mount_root: mount_root.clone(),
-                        workspace_mountpoint: workspace_mountpoint.clone(),
-                        home_mountpoint: home_mountpoint.clone(),
-                        fleet_shared_mountpoint: fleet_shared_mountpoint.clone(),
-                        issue_error: error,
-                    },
-                )
-                .await;
-                return Err(error);
-            },
-        };
-        #[cfg(all(test, any(unix, windows)))]
-        process_launch::record_published_test_lease(
-            process_launch::ProcessLaunchStage::OwnerHome,
-            owner_lease.mount_id,
-        );
-        #[cfg(all(test, any(unix, windows)))]
-        let shared_provider = {
-            let shared_provider = provider.to_owned();
-            if take_partial_issue_failure(process_launch::ProcessLaunchStage::FleetShared) {
-                let state = Arc::clone(
-                    kernel
-                        .storage_mounts
-                        .get(&branch_lease.mount_id)
-                        .expect("branch lease before Fleet issue failure")
-                        .value(),
-                );
-                crate::storage_mount::inject_cleanup_fault_for_test(
-                    &state,
-                    crate::storage_mount::MountCleanupStage::Callback,
-                );
-                "\t".to_owned()
-            } else {
-                shared_provider
-            }
-        };
-        #[cfg(not(all(test, any(unix, windows))))]
-        let shared_provider = provider.to_owned();
-
-        let shared_target = key
-            .binding
-            .targets
-            .fleet_shared
-            .as_ref()
-            .map(ProcessProjectionTarget::durable_target);
-        let shared_view = key
-            .binding
-            .targets
-            .fleet_shared
-            .as_ref()
-            .map(|target| match target {
-                ProcessProjectionTarget::FleetShared(fleet_uid) => {
-                    StorageProviderViewV1::Fleet(*fleet_uid)
-                },
-                _ => unreachable!("validated target set contains only Fleet shared targets"),
-            });
-        let shared_lease = if let (Some(target), Some(view), Some(shared_mountpoint)) =
-            (shared_target, shared_view, fleet_shared_mountpoint.as_ref())
-        {
-            match issue_lease(
+            };
+            drop(projections);
+            match retain_locked_projection(
                 &kernel,
-                &admission,
-                view,
-                target,
-                access,
-                shared_provider,
-                shared_mountpoint.clone(),
+                projection,
+                Arc::clone(&self.projections),
+                admission.key,
             )
             .await
             {
-                Ok(lease) => Some(lease),
-                Err(error) => {
-                    let error = retain_uncommitted_issue_lease(
-                        &mut projections,
-                        &key,
-                        &kernel,
-                        UncommittedIssueRollback {
-                            branch_mount_id: branch_lease.mount_id,
-                            owner_mount_id: Some(owner_lease.mount_id),
-                            mount_root: mount_root.clone(),
-                            workspace_mountpoint: workspace_mountpoint.clone(),
-                            home_mountpoint: home_mountpoint.clone(),
-                            fleet_shared_mountpoint: fleet_shared_mountpoint.clone(),
-                            issue_error: error,
-                        },
-                    )
-                    .await;
-                    return Err(error);
-                },
+                Ok(mount) => return Ok(mount),
+                Err(RetainAdmissionFailure::Retry) => {},
+                Err(RetainAdmissionFailure::Blocked(error)) => return Err(error),
             }
-        } else {
-            None
-        };
-        #[cfg(all(test, any(unix, windows)))]
-        if let Some(lease) = shared_lease.as_ref() {
-            process_launch::record_published_test_lease(
-                process_launch::ProcessLaunchStage::FleetShared,
-                lease.mount_id,
-            );
-        }
-
-        let lease_bundle = ProjectionLeaseBundle {
-            branch: branch_lease.clone(),
-            owner: owner_lease.clone(),
-            shared: shared_lease.clone(),
-        };
-        let launch_tokens = ProjectionLaunchTokens {
-            branch: branch_parent_token,
-            owner: owner_parent_token,
-            shared: shared_parent_token,
-        };
-        let launch_paths = ProjectionMountPaths {
-            mount_root: mount_root.clone(),
-            workspace: workspace_mountpoint.clone(),
-            owner: home_mountpoint.clone(),
-            fleet_shared: fleet_shared_mountpoint.clone(),
-        };
-        let cleanup_state = launch_projection_providers(
-            &kernel,
-            &mut projections,
-            &key,
-            &lease_bundle,
-            &launch_tokens,
-            &launch_paths,
-        )
-        .await?;
-        let cleanup_state_for_projection = Arc::clone(&cleanup_state);
-        let cleanup: ProjectionCleanup = Arc::new(move || {
-            let cleanup_state = Arc::clone(&cleanup_state_for_projection);
-            Box::pin(async move { cleanup_projection_state(cleanup_state).await })
-        });
-        let projection = Arc::new(CachedProcessProjection {
-            binding: key.binding.clone(),
-            component_mount_ids: projection_component_mount_ids(
-                &branch_lease.mount_id,
-                Some(&owner_lease.mount_id),
-                shared_lease.as_ref().map(|lease| &lease.mount_id),
-            ),
-            workspace_mountpoint,
-            // The lease target is the fixed `home` owner subtree, so the
-            // provider exposes that subtree directly at its mountpoint.
-            // Do not append another logical `home` component here: doing so
-            // would make `home://file` resolve to `<mount>/home/file` and
-            // leave children unable to see the mounted owner subtree.
-            home_mountpoint,
-            fleet_shared_mountpoint,
-            refs: AtomicU64::new(0),
-            closing: AtomicBool::new(false),
-            cleanup_failed: AtomicBool::new(false),
-            cleanup,
-        });
-        projections.insert(key.clone(), Arc::clone(&projection));
-        match retain_locked_projection(
-            &kernel,
-            Arc::clone(&projection),
-            Arc::clone(&self.projections),
-            key.clone(),
-        )
-        .await
-        {
-            Ok(mount) => Ok(mount),
-            Err(RetainAdmissionFailure::Retry) => {
-                drop(projections);
-                Box::pin(self.mount(principal)).await
-            },
-            Err(RetainAdmissionFailure::Blocked(error)) => Err(error),
         }
     }
+}
+
+async fn resolve_projection_admission(
+    kernel: &Arc<Kernel>,
+    service: &astrid_capsule::context::WorkspaceBranchService,
+    principal: &PrincipalId,
+) -> Result<ProjectionAdmission, String> {
+    let generation = ProjectionGeneration::capture()?;
+    let workspace_binding = service.bind(principal).await?;
+    let principal_uid = kernel
+        .principal_directory
+        .uid_for(principal)
+        .map_err(|error| format!("resolve principal process projection identity: {error}"))?;
+    if principal_uid != workspace_binding.uid {
+        return Err("workspace branch identity changed during process admission".to_owned());
+    }
+    let binding = ProcessProjectionBinding::new(
+        workspace_binding.owner,
+        principal_uid,
+        generation,
+        ProcessProjectionTargetSet::branch(
+            workspace_binding.owner,
+            principal_uid,
+            workspace_binding.branch,
+            match workspace_binding.owner {
+                StateOwner::Fleet(fleet_uid) => Some(fleet_uid),
+                _ => None,
+            },
+        )?,
+    )?;
+    let branch_view = match workspace_binding.owner {
+        StateOwner::Principal(_) => StorageProviderViewV1::Principal(principal.clone()),
+        StateOwner::Fleet(uid) => StorageProviderViewV1::Fleet(uid),
+        StateOwner::System | StateOwner::User(_) => {
+            return Err("system workspace owner is not process-mountable".to_owned());
+        },
+    };
+    let access = StorageProviderAccessV1::ReadWrite;
+    Ok(ProjectionAdmission {
+        key: ProcessProjectionKey {
+            binding,
+            read_write: matches!(access, StorageProviderAccessV1::ReadWrite),
+        },
+        principal: principal.clone(),
+        principal_uid,
+        branch_view,
+        access,
+    })
+}
+
+async fn admit_cached_projection(
+    kernel: &Arc<Kernel>,
+    projections: &mut std::collections::BTreeMap<
+        ProcessProjectionKey,
+        Arc<CachedProcessProjection>,
+    >,
+    key: &ProcessProjectionKey,
+) -> Result<CachedProjectionAdmission, String> {
+    let Some(projection) = projections.get(key).cloned() else {
+        return Ok(CachedProjectionAdmission::Fresh);
+    };
+    if !key.matches_projection(&projection) {
+        return Err("process projection identity mismatch".to_owned());
+    }
+    if projection.cleanup_failed.load(Ordering::Acquire) {
+        // A failed last-close stays cached so the next authenticated mount can
+        // retry the exact STOP/reap, revoke, and resource-removal sequence.
+        if !retry_failed_projection(&projection, projections, key).await {
+            return Err(
+                "native process storage projection requires administrative cleanup".to_owned(),
+            );
+        }
+        return Ok(CachedProjectionAdmission::Fresh);
+    }
+    if !projection_leases_are_live(kernel, &projection) {
+        // External revocation, expiry, or map drift must exact-clean before a
+        // new provider incarnation can even be prepared.
+        if !invalidate_unhealthy_projection(kernel, &projection, projections, key).await {
+            return Err(
+                "native process storage projection requires administrative cleanup".to_owned(),
+            );
+        }
+        return Ok(CachedProjectionAdmission::Fresh);
+    }
+    Ok(CachedProjectionAdmission::Healthy(projection))
+}
+
+async fn issue_projection_leases(
+    kernel: &Arc<Kernel>,
+    projections: &mut std::collections::BTreeMap<
+        ProcessProjectionKey,
+        Arc<CachedProcessProjection>,
+    >,
+    admission: &ProjectionAdmission,
+) -> Result<IssuedProjectionLeases, String> {
+    let key = &admission.key;
+    if let Some(error) = blocked_projection_lease(kernel, &key.binding) {
+        return Err(error);
+    }
+    ensure_owner_home(kernel, admission.principal_uid).await?;
+    if let StateOwner::Fleet(fleet_uid) = key.binding.owner {
+        ensure_fleet_shared(kernel, fleet_uid).await?;
+    }
+    let tokens = generate_parent_tokens(&key.binding.targets)?;
+    let mount_admission =
+        MountAdmission::capture(kernel, &admission.principal, MountOwnerScope::CallerOnly)?;
+    let paths = prepare_projection_paths(kernel, key)?;
+    let provider = platform_process_provider_name();
+    let branch = issue_branch_lease(
+        kernel,
+        &ProjectionIssueContext {
+            admission,
+            mount_admission: &mount_admission,
+            paths: &paths,
+        },
+        provider,
+    )
+    .await?;
+    let owner = issue_owner_lease(
+        kernel,
+        projections,
+        &ProjectionIssueContext {
+            admission,
+            mount_admission: &mount_admission,
+            paths: &paths,
+        },
+        provider,
+        &branch,
+    )
+    .await?;
+    let shared = issue_shared_lease(
+        kernel,
+        projections,
+        &ProjectionIssueContext {
+            admission,
+            mount_admission: &mount_admission,
+            paths: &paths,
+        },
+        provider,
+        &branch,
+        &owner,
+    )
+    .await?;
+    Ok(IssuedProjectionLeases {
+        bundle: ProjectionLeaseBundle {
+            branch,
+            owner,
+            shared,
+        },
+        tokens: ProjectionLaunchTokens {
+            branch: tokens.branch,
+            owner: tokens.owner_home,
+            shared: tokens.fleet_shared,
+        },
+        paths,
+    })
+}
+
+fn prepare_projection_paths(
+    kernel: &Arc<Kernel>,
+    key: &ProcessProjectionKey,
+) -> Result<ProjectionMountPaths, String> {
+    // A durable branch is an authority target, not a host mount identity.
+    // The random root identifies this one provider-service incarnation and is
+    // allocated only after HOME, Fleet, token, and admission preparation.
+    let process_root = kernel.astrid_home.run_dir().join("process-storage");
+    astrid_core::platform_fs::ensure_private_directory(&process_root)
+        .map_err(|error| format!("create process storage root: {error}"))?;
+    let mount_root = process_root.join(uuid::Uuid::new_v4().simple().to_string());
+    astrid_core::platform_fs::ensure_private_directory(&mount_root)
+        .map_err(|error| format!("validate process storage mount root: {error}"))?;
+    let workspace = mount_root.join("workspace");
+    let owner = mount_root.join("owner");
+    #[cfg(not(windows))]
+    {
+        astrid_core::platform_fs::ensure_private_directory(&workspace)
+            .map_err(|error| format!("create workspace mountpoint: {error}"))?;
+        astrid_core::platform_fs::ensure_private_directory(&owner)
+            .map_err(|error| format!("create owner mountpoint: {error}"))?;
+    }
+    let fleet_shared = if matches!(key.binding.owner, StateOwner::Fleet(_)) {
+        let path = mount_root.join("shared");
+        #[cfg(not(windows))]
+        astrid_core::platform_fs::ensure_private_directory(&path)
+            .map_err(|error| format!("create Fleet shared mountpoint: {error}"))?;
+        Some(path)
+    } else {
+        None
+    };
+    Ok(ProjectionMountPaths {
+        mount_root,
+        workspace,
+        owner,
+        fleet_shared,
+    })
+}
+
+async fn issue_branch_lease(
+    kernel: &Arc<Kernel>,
+    context: &ProjectionIssueContext<'_>,
+    provider: &str,
+) -> Result<StorageMountLeaseV1, String> {
+    let ProjectionIssueContext {
+        admission,
+        mount_admission,
+        paths,
+    } = context;
+    let branch = issue_lease(
+        kernel,
+        mount_admission,
+        admission.branch_view.clone(),
+        admission.key.binding.targets.workspace.durable_target(),
+        admission.access,
+        provider.to_owned(),
+        paths.workspace.clone(),
+    )
+    .await;
+    match branch {
+        Ok(branch) => {
+            #[cfg(all(test, any(unix, windows)))]
+            process_launch::record_published_test_lease(
+                process_launch::ProcessLaunchStage::Branch,
+                branch.mount_id,
+            );
+            Ok(branch)
+        },
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&paths.mount_root);
+            Err(error)
+        },
+    }
+}
+
+async fn issue_owner_lease(
+    kernel: &Arc<Kernel>,
+    projections: &mut std::collections::BTreeMap<
+        ProcessProjectionKey,
+        Arc<CachedProcessProjection>,
+    >,
+    context: &ProjectionIssueContext<'_>,
+    provider: &str,
+    branch: &StorageMountLeaseV1,
+) -> Result<StorageMountLeaseV1, String> {
+    let ProjectionIssueContext {
+        admission,
+        mount_admission,
+        paths,
+    } = context;
+    let provider = partial_issue_provider(
+        provider,
+        process_launch::ProcessLaunchStage::OwnerHome,
+        kernel,
+        &branch.mount_id,
+    );
+    let owner = issue_lease(
+        kernel,
+        mount_admission,
+        // HOME is always the acting principal's owner-local root. Fleet gets a
+        // private HOME even though its workspace branch is a separate view.
+        StorageProviderViewV1::Principal(admission.principal.clone()),
+        admission.key.binding.targets.owner_home.durable_target(),
+        admission.access,
+        provider,
+        paths.owner.clone(),
+    )
+    .await;
+    match owner {
+        Ok(owner) => {
+            #[cfg(all(test, any(unix, windows)))]
+            process_launch::record_published_test_lease(
+                process_launch::ProcessLaunchStage::OwnerHome,
+                owner.mount_id,
+            );
+            Ok(owner)
+        },
+        Err(error) => Err(retain_uncommitted_issue_lease(
+            projections,
+            &admission.key,
+            kernel,
+            UncommittedIssueRollback {
+                branch_mount_id: branch.mount_id,
+                owner_mount_id: None,
+                mount_root: paths.mount_root.clone(),
+                workspace_mountpoint: paths.workspace.clone(),
+                home_mountpoint: paths.owner.clone(),
+                fleet_shared_mountpoint: paths.fleet_shared.clone(),
+                issue_error: error,
+            },
+        )
+        .await),
+    }
+}
+
+fn partial_issue_provider(
+    provider: &str,
+    stage: process_launch::ProcessLaunchStage,
+    kernel: &Arc<Kernel>,
+    branch_mount_id: &StorageMountId,
+) -> String {
+    #[cfg(not(all(test, any(unix, windows))))]
+    {
+        let _ = (stage, kernel, branch_mount_id);
+        provider.to_owned()
+    }
+    #[cfg(all(test, any(unix, windows)))]
+    {
+        if !take_partial_issue_failure(stage) {
+            return provider.to_owned();
+        }
+        let faulted_state = Arc::clone(
+            kernel
+                .storage_mounts
+                .get(branch_mount_id)
+                .expect("branch lease before partial issue failure")
+                .value(),
+        );
+        crate::storage_mount::inject_cleanup_fault_for_test(
+            &faulted_state,
+            crate::storage_mount::MountCleanupStage::Callback,
+        );
+        "\t".to_owned()
+    }
+}
+
+async fn issue_shared_lease(
+    kernel: &Arc<Kernel>,
+    projections: &mut std::collections::BTreeMap<
+        ProcessProjectionKey,
+        Arc<CachedProcessProjection>,
+    >,
+    context: &ProjectionIssueContext<'_>,
+    provider: &str,
+    branch: &StorageMountLeaseV1,
+    owner: &StorageMountLeaseV1,
+) -> Result<Option<StorageMountLeaseV1>, String> {
+    let ProjectionIssueContext {
+        admission,
+        mount_admission,
+        paths,
+    } = context;
+    let Some(target) = admission.key.binding.targets.fleet_shared.as_ref() else {
+        return Ok(None);
+    };
+    let view = match target {
+        ProcessProjectionTarget::FleetShared(fleet_uid) => StorageProviderViewV1::Fleet(*fleet_uid),
+        _ => return Err("validated target set contains only Fleet shared targets".to_owned()),
+    };
+    let Some(shared_mountpoint) = paths.fleet_shared.as_ref() else {
+        return Err("Fleet target has no shared mountpoint".to_owned());
+    };
+    let provider = partial_issue_provider(
+        provider,
+        process_launch::ProcessLaunchStage::FleetShared,
+        kernel,
+        &owner.mount_id,
+    );
+    let shared = issue_lease(
+        kernel,
+        mount_admission,
+        view,
+        target.durable_target(),
+        admission.access,
+        provider,
+        shared_mountpoint.clone(),
+    )
+    .await;
+    match shared {
+        Ok(shared) => {
+            #[cfg(all(test, any(unix, windows)))]
+            process_launch::record_published_test_lease(
+                process_launch::ProcessLaunchStage::FleetShared,
+                shared.mount_id,
+            );
+            Ok(Some(shared))
+        },
+        Err(error) => Err(retain_uncommitted_issue_lease(
+            projections,
+            &admission.key,
+            kernel,
+            UncommittedIssueRollback {
+                branch_mount_id: branch.mount_id,
+                owner_mount_id: Some(owner.mount_id),
+                mount_root: paths.mount_root.clone(),
+                workspace_mountpoint: paths.workspace.clone(),
+                home_mountpoint: paths.owner.clone(),
+                fleet_shared_mountpoint: paths.fleet_shared.clone(),
+                issue_error: error,
+            },
+        )
+        .await),
+    }
+}
+
+async fn publish_projection(
+    kernel: &Arc<Kernel>,
+    projections: &mut std::collections::BTreeMap<
+        ProcessProjectionKey,
+        Arc<CachedProcessProjection>,
+    >,
+    key: &ProcessProjectionKey,
+    issued: IssuedProjectionLeases,
+) -> Result<Arc<CachedProcessProjection>, String> {
+    let cleanup_state = launch_projection_providers(
+        kernel,
+        projections,
+        key,
+        &issued.bundle,
+        &issued.tokens,
+        &issued.paths,
+    )
+    .await?;
+    let cleanup_state_for_projection = Arc::clone(&cleanup_state);
+    let cleanup: ProjectionCleanup = Arc::new(move || {
+        let cleanup_state = Arc::clone(&cleanup_state_for_projection);
+        Box::pin(async move { cleanup_projection_state(cleanup_state).await })
+    });
+    let projection = Arc::new(CachedProcessProjection {
+        binding: key.binding.clone(),
+        component_mount_ids: projection_component_mount_ids(
+            &issued.bundle.branch.mount_id,
+            Some(&issued.bundle.owner.mount_id),
+            issued.bundle.shared.as_ref().map(|lease| &lease.mount_id),
+        ),
+        workspace_mountpoint: issued.paths.workspace,
+        // The provider mounts the fixed `home` owner subtree directly. Adding
+        // another `home` component would make `home://file` resolve one level
+        // too deep and leave children unable to see the mounted subtree.
+        home_mountpoint: issued.paths.owner,
+        fleet_shared_mountpoint: issued.paths.fleet_shared,
+        refs: AtomicU64::new(0),
+        closing: AtomicBool::new(false),
+        cleanup_failed: AtomicBool::new(false),
+        cleanup,
+    });
+    projections.insert(key.clone(), Arc::clone(&projection));
+    Ok(projection)
 }
 
 async fn ensure_owner_home(

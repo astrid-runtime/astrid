@@ -784,3 +784,165 @@ async fn revocation_after_validation_before_reference_admits_replacement() {
     assert!(kernel.storage_mounts.is_empty());
     assert!(broker.projections.lock().await.is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn first_mount_revocation_between_validation_and_reference_admits_replacement() {
+    if !provider_lane_is_ready(
+        "first_mount_revocation_between_validation_and_reference_admits_replacement",
+    ) {
+        return;
+    }
+    let (_temporary, kernel) = fleet_shared_kernel().await;
+    let caller = PrincipalId::default();
+    let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
+    let validation_gate = arm_retain_validation_gate();
+    let reference_gate = arm_retain_reference_gate();
+    let mount_broker = broker.clone();
+    let mount_caller = caller.clone();
+    let mount_task = tokio::spawn(async move {
+        super::PROCESS_MOUNT_TEST_ID
+            .scope(631, mount_broker.mount(&mount_caller))
+            .await
+    });
+
+    validation_gate.entered().notified().await;
+    validation_gate.release().notify_one();
+    reference_gate.entered().notified().await;
+    let stale = {
+        let projections = broker.projections.lock().await;
+        Arc::clone(projections.values().next().expect("fresh publication"))
+    };
+    let stale_root = stale
+        .workspace_mountpoint
+        .parent()
+        .expect("fresh UUID projection root")
+        .to_path_buf();
+    let owner_mount_id = stale.component_mount_ids[1];
+    let owner_state = Arc::clone(
+        kernel
+            .storage_mounts
+            .get(&owner_mount_id)
+            .expect("fresh owner component")
+            .value(),
+    );
+    let revoke_kernel = Arc::clone(&kernel);
+    let revoke_caller = caller.clone();
+    let revocation = tokio::spawn(async move {
+        crate::storage_mount::revoke_lease(
+            &revoke_kernel,
+            &revoke_caller,
+            crate::storage_mount::MountOwnerScope::CallerOnly,
+            owner_mount_id,
+        )
+        .await
+    });
+    while !owner_state.revoked.load(Ordering::Acquire) {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        owner_state.wait_listener_closed().await,
+        "fresh-mount revocation must STOP and close the listener before retain resumes"
+    );
+    reference_gate.release().notify_one();
+
+    let replacement_mount = tokio::time::timeout(std::time::Duration::from_secs(5), mount_task)
+        .await
+        .expect("fresh retain must not deadlock the projection cache")
+        .expect("first-mount revocation must return a replacement")
+        .expect("fresh mount replacement");
+    revocation
+        .await
+        .expect("fresh-mount revocation task")
+        .expect("authorized fresh-mount revocation");
+    assert!(
+        !stale_root.exists(),
+        "the same fresh admission must exact-clean the revoked UUID root"
+    );
+    assert_eq!(
+        stale.refs.load(Ordering::Acquire),
+        0,
+        "the revoked fresh projection must never receive a reference"
+    );
+    assert!(
+        stale
+            .component_mount_ids
+            .iter()
+            .all(|mount_id| !kernel.storage_mounts.contains_key(mount_id))
+    );
+
+    let projections = broker.projections.lock().await;
+    assert_eq!(projections.len(), 1);
+    let replacement = projections.values().next().expect("replacement");
+    assert!(!Arc::ptr_eq(replacement, &stale));
+    assert_eq!(replacement.refs.load(Ordering::Acquire), 1);
+    drop(projections);
+    replacement_mount.close_async().await;
+    assert!(kernel.storage_mounts.is_empty());
+    assert!(broker.projections.lock().await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn first_mount_expiry_between_validation_and_reference_admits_replacement() {
+    if !provider_lane_is_ready(
+        "first_mount_expiry_between_validation_and_reference_admits_replacement",
+    ) {
+        return;
+    }
+    let (_temporary, kernel) = fleet_shared_kernel().await;
+    let caller = PrincipalId::default();
+    let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
+    let validation_gate = arm_retain_validation_gate();
+    let reference_gate = arm_retain_reference_gate();
+    let mount_broker = broker.clone();
+    let mount_caller = caller.clone();
+    let mount_task = tokio::spawn(async move {
+        super::PROCESS_MOUNT_TEST_ID
+            .scope(641, mount_broker.mount(&mount_caller))
+            .await
+    });
+    validation_gate.entered().notified().await;
+    validation_gate.release().notify_one();
+    reference_gate.entered().notified().await;
+    let stale = {
+        let projections = broker.projections.lock().await;
+        Arc::clone(projections.values().next().expect("fresh publication"))
+    };
+    let stale_root = stale
+        .workspace_mountpoint
+        .parent()
+        .expect("fresh UUID projection root")
+        .to_path_buf();
+    for mount_id in &stale.component_mount_ids {
+        kernel
+            .storage_mounts
+            .get(mount_id)
+            .expect("fresh exact component")
+            .expires_at_epoch_secs
+            .store(0, Ordering::Release);
+    }
+    reference_gate.release().notify_one();
+
+    let replacement_mount = tokio::time::timeout(std::time::Duration::from_secs(5), mount_task)
+        .await
+        .expect("fresh retain must not deadlock the projection cache")
+        .expect("first-mount expiry must return a replacement")
+        .expect("fresh mount replacement");
+    assert!(!stale_root.exists());
+    assert_eq!(stale.refs.load(Ordering::Acquire), 0);
+    assert!(
+        stale
+            .component_mount_ids
+            .iter()
+            .all(|mount_id| !kernel.storage_mounts.contains_key(mount_id))
+    );
+    let projections = broker.projections.lock().await;
+    assert_eq!(projections.len(), 1);
+    assert!(!Arc::ptr_eq(
+        projections.values().next().expect("replacement"),
+        &stale
+    ));
+    drop(projections);
+    replacement_mount.close_async().await;
+    assert!(kernel.storage_mounts.is_empty());
+    assert!(broker.projections.lock().await.is_empty());
+}
