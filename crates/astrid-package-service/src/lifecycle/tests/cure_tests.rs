@@ -65,13 +65,17 @@ fn mid_drain_recovery_does_not_infer_update_success() {
     let draining_generation = model
         .slot_record(&fixture.slot(fixture.owner))
         .and_then(|record| record.state())
-        .map(|state| state.generation_value())
-        .unwrap_or_else(|| panic!("draining generation should exist"));
+        .map_or_else(
+            || panic!("draining generation should exist"),
+            crate::state::CanonicalInstalledState::generation_value,
+        );
     let token = model
         .slot_record(&fixture.slot(fixture.owner))
         .and_then(|record| record.journal_record(&nonce))
-        .map(OperationJournalRecord::recovery_token)
-        .unwrap_or_else(|| panic!("recovery record should exist"));
+        .map_or_else(
+            || panic!("recovery record should exist"),
+            OperationJournalRecord::recovery_token,
+        );
     let false_success = recovery_evidence(token, draining, draining_generation.get());
     let error = model
         .recover(&nonce, &false_success, Timestamp::new(190))
@@ -155,8 +159,10 @@ fn recovery_accepts_structurally_proven_new_update_state() {
     let authority_digest = model
         .slot_record(&slot)
         .and_then(|record| record.journal_record(&nonce))
-        .map(|record| *record.authority_digest())
-        .unwrap_or_else(|| panic!("unknown authority should remain"));
+        .map_or_else(
+            || panic!("unknown authority should remain"),
+            |record| *record.authority_digest(),
+        );
     let new_state = new_installed_state(
         &context,
         authority_digest,
@@ -168,8 +174,10 @@ fn recovery_accepts_structurally_proven_new_update_state() {
     let token = model
         .slot_record(&slot)
         .and_then(|record| record.journal_record(&nonce))
-        .map(OperationJournalRecord::recovery_token)
-        .unwrap_or_else(|| panic!("recovery token should remain"));
+        .map_or_else(
+            || panic!("recovery token should remain"),
+            OperationJournalRecord::recovery_token,
+        );
     let evidence = match RecoveryEvidence::new(
         token,
         new_state.digest(),
@@ -221,8 +229,10 @@ fn active_drain_abort_and_expiry_restore_inactive_content() {
     let recovery_token = model
         .slot_record(&fixture.slot(fixture.owner))
         .and_then(|record| record.journal_record(&update_nonce))
-        .map(OperationJournalRecord::recovery_token)
-        .unwrap_or_else(|| panic!("recovery record should exist"));
+        .map_or_else(
+            || panic!("recovery record should exist"),
+            OperationJournalRecord::recovery_token,
+        );
     model
         .expire_drain(&update_nonce, Timestamp::new(250), false)
         .unwrap_or_else(|_| panic!("drain expiry should be observable"));
@@ -321,8 +331,10 @@ fn repeated_updates_monotonically_bump_package_generation() {
     let installed_generation = model
         .slot_record(&fixture.slot(fixture.owner))
         .and_then(|record| record.state())
-        .map(|state| state.generation_value().get())
-        .unwrap_or_else(|| panic!("installed state should exist"));
+        .map_or_else(
+            || panic!("installed state should exist"),
+            |state| state.generation_value().get(),
+        );
     assert_eq!(installed_generation, 1);
 
     let first = begin_update(&mut model, &fixture);
@@ -341,15 +353,17 @@ fn repeated_updates_monotonically_bump_package_generation() {
     let first_generation = model
         .slot_record(&fixture.slot(fixture.owner))
         .and_then(|record| record.state())
-        .map(|state| state.generation_value().get())
-        .unwrap_or_else(|| panic!("first updated state should exist"));
+        .map_or_else(
+            || panic!("first updated state should exist"),
+            |state| state.generation_value().get(),
+        );
     assert!(first_generation > installed_generation);
 
     let second_state = model
         .slot_record(&fixture.slot(fixture.owner))
         .and_then(|record| record.state().map(CanonicalInstalledState::digest))
         .unwrap_or_else(|| panic!("updated state should exist"));
-    let second_artifact = validated_artifact(14);
+    let second_artifact = validated_artifact(13);
     let second_plan = match DrainPlan::new(
         DrainDestination::Replacement,
         ExpectedPackageState::Exact(second_state),
@@ -357,7 +371,7 @@ fn repeated_updates_monotonically_bump_package_generation() {
         Nonce::from_bytes([6; 32]),
     ) {
         Ok(value) => value,
-        Err(_) => panic!("second replacement plan is valid"),
+        Err(error) => panic!("second replacement plan is valid: {error:?}"),
     };
     let second_context = fixture.context(
         Operation::Update,
@@ -394,8 +408,10 @@ fn repeated_updates_monotonically_bump_package_generation() {
     let second_generation = model
         .slot_record(&fixture.slot(fixture.owner))
         .and_then(|record| record.state())
-        .map(|state| state.generation_value().get())
-        .unwrap_or_else(|| panic!("second updated state should exist"));
+        .map_or_else(
+            || panic!("second updated state should exist"),
+            |state| state.generation_value().get(),
+        );
     assert!(second_generation > first_generation);
 }
 
@@ -438,13 +454,17 @@ fn install_recovery_rejects_arbitrary_content_and_provenance() {
     let authority = model
         .slot_record(&slot)
         .and_then(|record| record.journal_record(&operation))
-        .map(|record| *record.authority_digest())
-        .unwrap_or_else(|| panic!("install authority should remain"));
+        .map_or_else(
+            || panic!("install authority should remain"),
+            |record| *record.authority_digest(),
+        );
     let token = model
         .slot_record(&slot)
         .and_then(|record| record.journal_record(&operation))
-        .map(OperationJournalRecord::recovery_token)
-        .unwrap_or_else(|| panic!("install token should remain"));
+        .map_or_else(
+            || panic!("install token should remain"),
+            OperationJournalRecord::recovery_token,
+        );
     let operation_context = model
         .context_for(&operation)
         .unwrap_or_else(|error| panic!("{error:?}"));
@@ -494,7 +514,7 @@ fn install_recovery_rejects_arbitrary_content_and_provenance() {
 fn expired_intent_reaches_terminal_and_releases_slot() {
     let fixture = Fixture::new();
     let mut model = PackageServiceModel::new(policy_short_retention(1, 128));
-    let context = fixture.context_with_expiry(ContextOptions {
+    let context = fixture.context_with_expiry(&ContextOptions {
         operation: Operation::Install,
         expected: ExpectedPackageState::Absent,
         plan: plan_digest(20),
@@ -517,7 +537,7 @@ fn expired_intent_reaches_terminal_and_releases_slot() {
         Some(JournalStatus::Expired)
     );
 
-    let replacement = fixture.context_with_expiry(ContextOptions {
+    let replacement = fixture.context_with_expiry(&ContextOptions {
         operation: Operation::Install,
         expected: ExpectedPackageState::Absent,
         plan: plan_digest(21),

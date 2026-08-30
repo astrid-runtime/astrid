@@ -41,6 +41,7 @@ enum ObservedMutation {
     Nonce(Nonce),
 }
 
+#[derive(Clone, Copy)]
 enum ExpectedRecoveryFailure {
     Unresolved,
     BindingMismatch,
@@ -374,13 +375,17 @@ fn observed_recovery_boundary_accepts_only_the_exact_successor() {
     let authority_digest = model
         .slot_record(&slot)
         .and_then(|record| record.journal_record(&nonce))
-        .map(|record| *record.authority_digest())
-        .unwrap_or_else(|| panic!("unknown authority should remain"));
+        .map_or_else(
+            || panic!("unknown authority should remain"),
+            |record| *record.authority_digest(),
+        );
     let token = model
         .slot_record(&slot)
         .and_then(|record| record.journal_record(&nonce))
-        .map(OperationJournalRecord::recovery_token)
-        .unwrap_or_else(|| panic!("unknown token should remain"));
+        .map_or_else(
+            || panic!("unknown token should remain"),
+            OperationJournalRecord::recovery_token,
+        );
     let valid_generation = non_zero(draining.generation_value().get() + 1);
     let valid = activation_state(&context, authority_digest, valid_generation)
         .unwrap_or_else(|_| panic!("valid activation state should construct"));
@@ -397,18 +402,30 @@ fn observed_recovery_boundary_accepts_only_the_exact_successor() {
         .unwrap_or_else(|| panic!("exact observed state should produce a receipt"));
     assert_eq!(receipt.outcome(), ReceiptOutcome::Activated);
     assert_eq!(current_state(&model, &fixture), valid);
+}
 
+#[test]
+fn deactivation_recovery_rejects_stale_and_skipped_states() {
+    let fixture = Fixture::new();
+    let mut model = PackageServiceModel::new(policy(8));
+    install(&mut model, &fixture, 1);
+    let slot = fixture.slot(fixture.owner);
+    begin_activation(&mut model, &fixture, 4);
     let activation = begin_lifecycle_without_commit(&mut model, &fixture, Operation::Deactivate, 6);
     let authority_digest = model
         .slot_record(&slot)
         .and_then(|record| record.journal_record(&activation))
-        .map(|record| *record.authority_digest())
-        .unwrap_or_else(|| panic!("second unknown authority should remain"));
+        .map_or_else(
+            || panic!("second unknown authority should remain"),
+            |record| *record.authority_digest(),
+        );
     let token = model
         .slot_record(&slot)
         .and_then(|record| record.journal_record(&activation))
-        .map(OperationJournalRecord::recovery_token)
-        .unwrap_or_else(|| panic!("second unknown token should remain"));
+        .map_or_else(
+            || panic!("second unknown token should remain"),
+            OperationJournalRecord::recovery_token,
+        );
     let deactivation_context = model
         .context_for(&activation)
         .unwrap_or_else(|_| panic!("second unknown context should remain"));
@@ -512,13 +529,17 @@ fn observed_boundary_rejects_each_mutated_recovery_binding() {
     let authority = model
         .slot_record(&slot)
         .and_then(|record| record.journal_record(&nonce))
-        .map(|record| *record.authority_digest())
-        .unwrap_or_else(|| panic!("unknown authority should remain"));
+        .map_or_else(
+            || panic!("unknown authority should remain"),
+            |record| *record.authority_digest(),
+        );
     let token = model
         .slot_record(&slot)
         .and_then(|record| record.journal_record(&nonce))
-        .map(OperationJournalRecord::recovery_token)
-        .unwrap_or_else(|| panic!("unknown token should remain"));
+        .map_or_else(
+            || panic!("unknown token should remain"),
+            OperationJournalRecord::recovery_token,
+        );
     let valid = new_installed_state(
         &context,
         authority,
@@ -528,48 +549,7 @@ fn observed_boundary_rejects_each_mutated_recovery_binding() {
     )
     .unwrap_or_else(|error| panic!("valid update state should construct: {error:?}"));
 
-    let alternate_artifact =
-        match ArtifactIdentity::new(format(1), non_zero(129), sha(21), digest(21)) {
-            Ok(value) => value,
-            Err(error) => panic!("alternate artifact should construct: {error:?}"),
-        };
-    let alternate_manifest = match ManifestIdentity::new(
-        manifest_format(1),
-        base_manifest_name(&valid),
-        base_manifest_version(&valid),
-        digest(22),
-    ) {
-        Ok(value) => value,
-        Err(error) => panic!("alternate manifest should construct: {error:?}"),
-    };
-    let mutations = [
-        ObservedMutation::Owner(fixture.other_owner),
-        ObservedMutation::PackageObject(PackageObject::from_bytes([45; 32])),
-        ObservedMutation::Artifact(alternate_artifact),
-        ObservedMutation::Content(digest(23)),
-        ObservedMutation::Manifest(alternate_manifest),
-        ObservedMutation::Authority(AuthorityDecisionDigest::from_bytes([24; 32])),
-        ObservedMutation::Provenance(ProvenanceDigest::from_bytes([25; 32])),
-        ObservedMutation::Lifecycle(LifecycleState::Active),
-        ObservedMutation::Plan(plan_digest(26)),
-        ObservedMutation::Generation(non_zero(2)),
-        ObservedMutation::Generation(non_zero(4)),
-        ObservedMutation::Nonce(Nonce::from_bytes([27; 32])),
-    ];
-    for mutation in mutations {
-        let mutated = mutated_state(&valid, mutation).unwrap_or_else(|error| panic!("{error:?}"));
-        let evidence =
-            recovery_evidence_for(token, mutated.digest(), mutated.generation_value(), None)
-                .unwrap_or_else(|error| panic!("{error:?}"));
-        reject_observed_recovery(
-            &mut model,
-            &fixture,
-            &nonce,
-            &mutated,
-            &evidence,
-            ExpectedRecoveryFailure::Unresolved,
-        );
-    }
+    reject_mutated_update_bindings(&mut model, &fixture, &nonce, token, &valid);
 
     let runtime_mismatch = recovery_evidence_for(token, valid.digest(), non_zero(2), None)
         .unwrap_or_else(|error| panic!("{error:?}"));
@@ -621,6 +601,52 @@ fn observed_boundary_rejects_each_mutated_recovery_binding() {
         &evidence_digest_mismatch,
         ExpectedRecoveryFailure::Unresolved,
     );
+}
+
+fn reject_mutated_update_bindings(
+    model: &mut PackageServiceModel,
+    fixture: &Fixture,
+    nonce: &Nonce,
+    token: RecoveryToken,
+    valid: &CanonicalInstalledState,
+) {
+    let alternate_artifact = ArtifactIdentity::new(format(1), non_zero(129), sha(21), digest(21))
+        .unwrap_or_else(|error| panic!("alternate artifact should construct: {error:?}"));
+    let alternate_manifest = ManifestIdentity::new(
+        manifest_format(1),
+        base_manifest_name(valid),
+        base_manifest_version(valid),
+        digest(22),
+    )
+    .unwrap_or_else(|error| panic!("alternate manifest should construct: {error:?}"));
+    let mutations = [
+        ObservedMutation::Owner(fixture.other_owner),
+        ObservedMutation::PackageObject(PackageObject::from_bytes([45; 32])),
+        ObservedMutation::Artifact(alternate_artifact),
+        ObservedMutation::Content(digest(23)),
+        ObservedMutation::Manifest(alternate_manifest),
+        ObservedMutation::Authority(AuthorityDecisionDigest::from_bytes([24; 32])),
+        ObservedMutation::Provenance(ProvenanceDigest::from_bytes([25; 32])),
+        ObservedMutation::Lifecycle(LifecycleState::Active),
+        ObservedMutation::Plan(plan_digest(26)),
+        ObservedMutation::Generation(non_zero(2)),
+        ObservedMutation::Generation(non_zero(4)),
+        ObservedMutation::Nonce(Nonce::from_bytes([27; 32])),
+    ];
+    for mutation in mutations {
+        let mutated = mutated_state(valid, mutation).unwrap_or_else(|error| panic!("{error:?}"));
+        let evidence =
+            recovery_evidence_for(token, mutated.digest(), mutated.generation_value(), None)
+                .unwrap_or_else(|error| panic!("{error:?}"));
+        reject_observed_recovery(
+            model,
+            fixture,
+            nonce,
+            &mutated,
+            &evidence,
+            ExpectedRecoveryFailure::Unresolved,
+        );
+    }
 }
 
 fn base_manifest_name(state: &CanonicalInstalledState) -> crate::identity::PackageName {

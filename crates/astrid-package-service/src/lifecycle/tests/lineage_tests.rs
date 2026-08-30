@@ -40,11 +40,19 @@ fn drain_to_boundary(
         model
             .prove_drain_leases(
                 &nonce,
-                u32::try_from(proof + 10).unwrap_or(u32::MAX),
+                u32::try_from(proof)
+                    .ok()
+                    .and_then(|proof| proof.checked_add(10))
+                    .unwrap_or(u32::MAX),
                 Timestamp::new(150),
             )
             .unwrap_or_else(|error| panic!("drain proof should advance: {error:?}"));
-        let expected_boundary = 2 + proof as u64 + 1;
+        let proof_value = u64::try_from(proof)
+            .unwrap_or_else(|error| panic!("proof count is bounded: {error:?}"));
+        let expected_boundary = 2u64
+            .checked_add(proof_value)
+            .and_then(|sum| sum.checked_add(1))
+            .unwrap_or(u64::MAX);
         let proved = current_state(&model, &fixture);
         assert_eq!(proved.generation_value().get(), expected_boundary);
         let lineage = model
@@ -87,8 +95,10 @@ fn drain_resolution_restores_the_exact_successor_of_the_boundary() {
             let token = model
                 .slot_record(&fixture.slot(fixture.owner))
                 .and_then(|record| record.journal_record(&nonce))
-                .map(OperationJournalRecord::recovery_token)
-                .unwrap_or_else(|| panic!("drain record should remain"));
+                .map_or_else(
+                    || panic!("drain record should remain"),
+                    OperationJournalRecord::recovery_token,
+                );
 
             match resolution {
                 DrainResolution::Cancel => {
@@ -152,13 +162,17 @@ fn reject_old_evidence(
     let token = model
         .slot_record(&fixture.slot(fixture.owner))
         .and_then(|record| record.journal_record(nonce))
-        .map(OperationJournalRecord::recovery_token)
-        .unwrap_or_else(|| panic!("recovery token should remain"));
+        .map_or_else(
+            || panic!("recovery token should remain"),
+            OperationJournalRecord::recovery_token,
+        );
     let base_digest = model
         .slot_record(&fixture.slot(fixture.owner))
         .and_then(|record| record.journal_record(nonce))
-        .map(OperationJournalRecord::before_state)
-        .unwrap_or_else(|| panic!("operation boundary should remain"));
+        .map_or_else(
+            || panic!("operation boundary should remain"),
+            OperationJournalRecord::before_state,
+        );
     let evidence = recovery_evidence_for(token, base_digest, generation)
         .unwrap_or_else(|error| panic!("{error:?}"));
     let before = current_state(model, fixture);
@@ -232,8 +246,10 @@ fn old_state_recovery_rejects_every_noncanonical_generation_claim() {
     let service_generation = model
         .slot_record(&fixture.slot(fixture.owner))
         .and_then(|record| record.journal_record(&nonce))
-        .map(|record| non_zero(record.context().service_generation().get()))
-        .unwrap_or_else(|| panic!("service generation should remain"));
+        .map_or_else(
+            || panic!("service generation should remain"),
+            |record| non_zero(record.context().service_generation().get()),
+        );
 
     reject_old_evidence(&mut model, &fixture, &nonce, None, non_zero(2));
     reject_old_evidence(&mut model, &fixture, &nonce, None, non_zero(4));
@@ -276,8 +292,10 @@ fn absence_recovery_requires_the_recorded_removal_lineage() {
     let token = model
         .slot_record(&fixture.slot(fixture.owner))
         .and_then(|record| record.journal_record(&nonce))
-        .map(OperationJournalRecord::recovery_token)
-        .unwrap_or_else(|| panic!("no-drain token should remain"));
+        .map_or_else(
+            || panic!("no-drain token should remain"),
+            OperationJournalRecord::recovery_token,
+        );
     let evidence = match RecoveryEvidence::new(
         token,
         StateDigest::from_bytes([0; 32]),
@@ -311,8 +329,10 @@ fn exact_removal_recovery_clears_lineage_and_retains_terminal_receipt() {
     let token = model
         .slot_record(&fixture.slot(fixture.owner))
         .and_then(|record| record.journal_record(&nonce))
-        .map(OperationJournalRecord::recovery_token)
-        .unwrap_or_else(|| panic!("removal token should remain"));
+        .map_or_else(
+            || panic!("removal token should remain"),
+            OperationJournalRecord::recovery_token,
+        );
     let old_receipt = match RecoveryEvidence::new(
         token,
         base.digest(),
@@ -387,8 +407,10 @@ fn old_state_recovery_rejects_a_mutated_spoof_of_the_base() {
     let authority = model
         .slot_record(&fixture.slot(fixture.owner))
         .and_then(|record| record.journal_record(&nonce))
-        .map(|record| *record.authority_digest())
-        .unwrap_or_else(|| panic!("drain authority should remain"));
+        .map_or_else(
+            || panic!("drain authority should remain"),
+            |record| *record.authority_digest(),
+        );
     let spoofed = CanonicalInstalledState::new(InstalledStateSpec {
         owner: base.slot().owner(),
         package_object: base.slot().package_object(),

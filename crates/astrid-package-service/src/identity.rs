@@ -166,6 +166,9 @@ pub struct ArtifactIdentity {
 
 impl ArtifactIdentity {
     /// Binds both mandatory exact-byte digests and the exact size.
+    ///
+    /// # Errors
+    /// Returns [`PackageServiceError::InvalidValue`] for a zero digest.
     pub fn new(
         format_version: ArtifactFormatVersion,
         size_bytes: NonZeroU64,
@@ -217,6 +220,9 @@ pub struct ManifestIdentity {
 
 impl ManifestIdentity {
     /// Constructs a bounded, validated manifest identity.
+    ///
+    /// # Errors
+    /// Returns [`PackageServiceError::InvalidValue`] for a zero manifest digest.
     pub fn new(
         format_version: ManifestFormatVersion,
         package_name: PackageName,
@@ -286,7 +292,7 @@ pub enum ProvenanceClass {
 }
 
 impl ProvenanceClass {
-    pub(crate) const fn tag(&self) -> u8 {
+    pub(crate) const fn tag(self) -> u8 {
         match self {
             Self::LocalArtifact => 1,
             Self::BuildOutput => 2,
@@ -298,6 +304,9 @@ impl ProvenanceClass {
 
 impl ProvenanceEvidence {
     /// Constructs attribution evidence without interpreting its bounded bytes.
+    ///
+    /// # Errors
+    /// Returns [`PackageServiceError::InvalidValue`] for zero evidence.
     pub fn new(
         class: ProvenanceClass,
         evidence: Blake3Digest,
@@ -338,6 +347,9 @@ impl BoundedEvidence {
     pub const MAX_BYTES: usize = 4_096;
 
     /// Validates and owns an evidence byte vector.
+    ///
+    /// # Errors
+    /// Returns [`PackageServiceError::InvalidValue`] when bytes exceed the protocol ceiling.
     pub fn new(bytes: Vec<u8>) -> PackageServiceResult<Self> {
         if bytes.len() > Self::MAX_BYTES {
             return Err(PackageServiceError::InvalidValue("bounded evidence"));
@@ -354,6 +366,9 @@ impl BoundedEvidence {
 
 impl ValidatedArtifact {
     /// Binds an already validated artifact to immutable content and provenance.
+    ///
+    /// # Errors
+    /// Returns [`PackageServiceError::InvalidValue`] for a zero content root.
     pub fn new(
         artifact: ArtifactIdentity,
         manifest: ManifestIdentity,
@@ -406,6 +421,9 @@ pub struct PackageVersion(String);
 
 impl PackageName {
     /// Validates a lowercase ASCII package name of at most 64 bytes.
+    ///
+    /// # Errors
+    /// Returns [`PackageServiceError::InvalidValue`] for malformed or oversized names.
     pub fn new(value: &str) -> PackageServiceResult<Self> {
         validate_bounded_ascii(value, 64, false)?;
         if !value.bytes().all(|byte| {
@@ -425,6 +443,9 @@ impl PackageName {
 
 impl PackageVersion {
     /// Validates printable, non-whitespace ASCII of at most 64 bytes.
+    ///
+    /// # Errors
+    /// Returns [`PackageServiceError::InvalidValue`] for malformed or oversized versions.
     pub fn new(value: &str) -> PackageServiceResult<Self> {
         validate_bounded_ascii(value, 64, false)?;
         if value

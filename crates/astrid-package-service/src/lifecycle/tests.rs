@@ -4,18 +4,23 @@ use crate::bytes::{PrincipalUid, RecoveryToken};
 use crate::context::{
     ApproverIdentity, IngressChannel, OperationContextSpec, ResourceBudget, ResourceClasses,
 };
-use crate::digest::{Blake3Digest, DigestWriter, PlanDigest, Sha256Digest, TypedDigest};
+use crate::digest::{
+    Blake3Digest, DigestWriter, PlanDigest, ProvenanceDigest, Sha256Digest, TypedDigest,
+};
 use crate::identity::{
     ArtifactFormatVersion, ArtifactIdentity, AuthorityIssuerIdentity, BoundedEvidence,
     ComponentIdentity, ManifestFormatVersion, ManifestIdentity, Nonce, PackageName, PackageObject,
-    PackageVersion, ProvenanceClass, ServiceGeneration,
+    PackageVersion, ProvenanceClass, ProvenanceEvidence, ServiceGeneration, ValidatedArtifact,
 };
+use crate::journal::{OperationJournalRecord, ReceiptOutcome};
 use crate::policy::{JournalPolicy, JournalRetention, RetentionWindow};
-use crate::state::PackageSlot;
+use crate::state::{InstalledStateSpec, PackageSlot};
 use std::num::{NonZeroU32, NonZeroU64};
 use std::time::Duration;
 
+mod binding_tests;
 mod cure_tests;
+mod highwater_tests;
 mod lineage_tests;
 mod successor_tests;
 
@@ -55,38 +60,38 @@ fn plan_digest(byte: u8) -> PlanDigest {
 fn artifact() -> ArtifactIdentity {
     match ArtifactIdentity::new(format(1), non_zero(128), sha(2), digest(3)) {
         Ok(value) => value,
-        Err(_) => panic!("fixed artifact identity is valid"),
+        Err(error) => panic!("fixed artifact identity is valid: {error:?}"),
     }
 }
 
 fn manifest() -> ManifestIdentity {
     let name = match PackageName::new("example-package") {
         Ok(value) => value,
-        Err(_) => panic!("fixed test name is valid"),
+        Err(error) => panic!("fixed test name is valid: {error:?}"),
     };
     let version = match PackageVersion::new("1.2.3") {
         Ok(value) => value,
-        Err(_) => panic!("fixed test version is valid"),
+        Err(error) => panic!("fixed test version is valid: {error:?}"),
     };
     match ManifestIdentity::new(manifest_format(1), name, version, digest(4)) {
         Ok(value) => value,
-        Err(_) => panic!("fixed manifest identity is valid"),
+        Err(error) => panic!("fixed manifest identity is valid: {error:?}"),
     }
 }
 
 fn validated_artifact(content: u8) -> ValidatedArtifact {
     let bounded = match BoundedEvidence::new(vec![1, 2, 3]) {
         Ok(value) => value,
-        Err(_) => panic!("fixed evidence is valid"),
+        Err(error) => panic!("fixed evidence is valid: {error:?}"),
     };
     let provenance =
         match ProvenanceEvidence::new(ProvenanceClass::LocalArtifact, digest(5), bounded) {
             Ok(value) => value,
-            Err(_) => panic!("fixed provenance is valid"),
+            Err(error) => panic!("fixed provenance is valid: {error:?}"),
         };
     match ValidatedArtifact::new(artifact(), manifest(), digest(content), provenance) {
         Ok(value) => value,
-        Err(_) => panic!("fixed validated artifact is valid"),
+        Err(error) => panic!("fixed validated artifact is valid: {error:?}"),
     }
 }
 
@@ -99,6 +104,25 @@ fn commit_plan_for_artifact(
         artifact.content_root(),
         &provenance_digest(artifact.provenance()),
     )
+}
+
+fn commit_plan_for_artifact_parts(
+    operation: Operation,
+    artifact: &ValidatedArtifact,
+    lifecycle_plan: Option<PlanDigest>,
+) -> PlanDigest {
+    crate::context::operation_commit_plan_digest(
+        operation,
+        artifact.artifact(),
+        artifact.manifest(),
+        artifact.content_root(),
+        &provenance_digest(artifact.provenance()),
+        lifecycle_plan,
+    )
+}
+
+fn provenance_for_content(content: u8) -> crate::digest::ProvenanceDigest {
+    provenance_digest(validated_artifact(content).provenance())
 }
 
 struct Fixture {
@@ -146,12 +170,12 @@ impl Fixture {
                 digest(10),
             ) {
                 Ok(value) => value,
-                Err(_) => panic!("fixed issuer is valid"),
+                Err(error) => panic!("fixed issuer is valid: {error:?}"),
             },
             evidence: digest(11),
             budget: ResourceBudget::new(
                 non_zero(4_096),
-                ResourceClasses::new(true, true, true, true),
+                ResourceClasses::new([true, true, true, true]),
             ),
         }
     }
@@ -165,7 +189,7 @@ impl Fixture {
         generation: u64,
         nonce: Nonce,
     ) -> OperationContext {
-        self.context_with_expiry(ContextOptions {
+        self.context_with_expiry(&ContextOptions {
             operation,
             expected,
             plan,
@@ -176,7 +200,7 @@ impl Fixture {
         })
     }
 
-    fn context_with_expiry(&self, options: ContextOptions) -> OperationContext {
+    fn context_with_expiry(&self, options: &ContextOptions) -> OperationContext {
         match OperationContext::new(
             OperationContextSpec {
                 nonce: options.nonce,
@@ -188,7 +212,34 @@ impl Fixture {
                 package_object: self.object,
                 artifact: artifact(),
                 manifest: manifest(),
+                content_root: *validated_artifact(if options.operation == Operation::Update {
+                    13
+                } else {
+                    12
+                })
+                .content_root(),
+                provenance: provenance_for_content(if options.operation == Operation::Update {
+                    13
+                } else {
+                    12
+                }),
                 plan_digest: options.plan,
+                commit_plan_digest: if matches!(
+                    options.operation,
+                    Operation::Install | Operation::Update
+                ) {
+                    commit_plan_for_artifact_parts(
+                        options.operation,
+                        &validated_artifact(if options.operation == Operation::Update {
+                            13
+                        } else {
+                            12
+                        }),
+                        matches!(options.operation, Operation::Update).then_some(options.plan),
+                    )
+                } else {
+                    options.plan
+                },
                 budget: self.budget,
                 expiry: options.expiry,
             },
@@ -196,7 +247,7 @@ impl Fixture {
             Timestamp::new(100),
         ) {
             Ok(value) => value,
-            Err(_) => panic!("fixed operation context is valid"),
+            Err(error) => panic!("fixed operation context is valid: {error:?}"),
         }
     }
 
@@ -208,10 +259,45 @@ impl Fixture {
         )
     }
 
+    fn context_for_state(
+        &self,
+        operation: Operation,
+        expected: ExpectedPackageState,
+        plan: PlanDigest,
+        participants: (PrincipalUid, PrincipalUid),
+        state: &CanonicalInstalledState,
+        nonce: Nonce,
+    ) -> OperationContext {
+        match OperationContext::new(
+            OperationContextSpec {
+                nonce,
+                operation,
+                expected_state: expected,
+                effective_caller: participants.1,
+                approver: ApproverIdentity::Principal(participants.1),
+                target_owner: participants.0,
+                package_object: self.object,
+                artifact: *state.artifact(),
+                manifest: state.manifest().clone(),
+                content_root: *state.content_root(),
+                provenance: *state.provenance(),
+                plan_digest: plan,
+                commit_plan_digest: plan,
+                budget: self.budget,
+                expiry: Timestamp::new(1_000),
+            },
+            &self.service_at(1),
+            Timestamp::new(100),
+        ) {
+            Ok(value) => value,
+            Err(error) => panic!("state-bound context is valid: {error:?}"),
+        }
+    }
+
     fn authority(&self, context: &OperationContext) -> AuthenticatedAuthority {
         match AuthenticatedAuthority::bind(context, self.issuer, self.evidence) {
             Ok(value) => value,
-            Err(_) => panic!("fixed authority is valid"),
+            Err(error) => panic!("fixed authority is valid: {error:?}"),
         }
     }
 
@@ -234,7 +320,7 @@ impl Fixture {
     fn authority_for(&self, context: &OperationContext) -> AuthenticatedAuthority {
         match AuthenticatedAuthority::bind(context, self.issuer, self.evidence) {
             Ok(value) => value,
-            Err(_) => panic!("fixed authority is valid"),
+            Err(error) => panic!("fixed authority is valid: {error:?}"),
         }
     }
 
@@ -250,11 +336,11 @@ fn policy(capacity: u64) -> JournalPolicy {
 fn policy_with_tombstone_capacity(capacity: u64, tombstone_capacity: u64) -> JournalPolicy {
     let receipts = match RetentionWindow::new(Duration::from_hours(1), Duration::from_hours(2)) {
         Ok(value) => value,
-        Err(_) => panic!("test retention is valid"),
+        Err(error) => panic!("test retention is valid: {error:?}"),
     };
     let failures = match RetentionWindow::new(Duration::from_hours(1), Duration::from_hours(2)) {
         Ok(value) => value,
-        Err(_) => panic!("test retention is valid"),
+        Err(error) => panic!("test retention is valid: {error:?}"),
     };
     JournalPolicy::new(
         non_zero(capacity),
@@ -268,11 +354,11 @@ fn policy_with_tombstone_capacity(capacity: u64, tombstone_capacity: u64) -> Jou
 fn policy_short_retention(capacity: u64, tombstone_capacity: u64) -> JournalPolicy {
     let receipts = match RetentionWindow::new(Duration::from_secs(50), Duration::from_secs(100)) {
         Ok(value) => value,
-        Err(_) => panic!("short test retention is valid"),
+        Err(error) => panic!("short test retention is valid: {error:?}"),
     };
     let failures = match RetentionWindow::new(Duration::from_secs(50), Duration::from_secs(100)) {
         Ok(value) => value,
-        Err(_) => panic!("short test retention is valid"),
+        Err(error) => panic!("short test retention is valid: {error:?}"),
     };
     JournalPolicy::new(
         non_zero(capacity),
@@ -303,7 +389,7 @@ fn install(model: &mut PackageServiceModel, fixture: &Fixture, nonce_byte: u8) -
     );
     let nonce = match fixture.begin(model, context, 100) {
         Ok(value) => value,
-        Err(_) => panic!("install admission should succeed"),
+        Err(error) => panic!("install admission should succeed: {error:?}"),
     };
     model
         .begin_work(&nonce, Timestamp::new(110))
@@ -331,7 +417,7 @@ fn begin_update_with_deadline(
     fixture: &Fixture,
     deadline: Timestamp,
 ) -> Nonce {
-    let state = match model
+    let state_digest = match model
         .slot_record(&fixture.slot(fixture.owner))
         .and_then(|record| record.state())
     {
@@ -341,16 +427,16 @@ fn begin_update_with_deadline(
     let staged_artifact = validated_artifact(13);
     let replacement_plan = match DrainPlan::new(
         DrainDestination::Replacement,
-        ExpectedPackageState::Exact(state),
+        ExpectedPackageState::Exact(state_digest),
         deadline,
         Nonce::from_bytes([2; 32]),
     ) {
         Ok(value) => value,
-        Err(_) => panic!("replacement plan is valid"),
+        Err(error) => panic!("replacement plan is valid: {error:?}"),
     };
     let context = fixture.context(
         Operation::Update,
-        ExpectedPackageState::Exact(state),
+        ExpectedPackageState::Exact(state_digest),
         replacement_plan.digest(),
         (fixture.owner, fixture.caller),
         1,
@@ -358,7 +444,7 @@ fn begin_update_with_deadline(
     );
     let nonce = match fixture.begin(model, context, 130) {
         Ok(value) => value,
-        Err(_) => panic!("update admission should succeed"),
+        Err(error) => panic!("update admission should succeed: {error:?}"),
     };
     model
         .begin_drain(
@@ -376,7 +462,7 @@ fn begin_update_with_deadline(
 }
 
 fn begin_remove(model: &mut PackageServiceModel, fixture: &Fixture) -> Nonce {
-    let state = match model
+    let state_digest = match model
         .slot_record(&fixture.slot(fixture.owner))
         .and_then(|record| record.state())
     {
@@ -385,24 +471,30 @@ fn begin_remove(model: &mut PackageServiceModel, fixture: &Fixture) -> Nonce {
     };
     let removal_plan = match DrainPlan::new(
         DrainDestination::Removal,
-        ExpectedPackageState::Exact(state),
+        ExpectedPackageState::Exact(state_digest),
         Timestamp::new(400),
         Nonce::from_bytes([3; 32]),
     ) {
         Ok(value) => value,
-        Err(_) => panic!("removal plan is valid"),
+        Err(error) => panic!("removal plan is valid: {error:?}"),
     };
-    let context = fixture.context(
+    let Some(state_value) = model
+        .slot_record(&fixture.slot(fixture.owner))
+        .and_then(|record| record.state().cloned())
+    else {
+        panic!("installed state should exist")
+    };
+    let context = fixture.context_for_state(
         Operation::Remove,
-        ExpectedPackageState::Exact(state),
+        ExpectedPackageState::Exact(state_value.digest()),
         removal_plan.digest(),
         (fixture.owner, fixture.caller),
-        1,
+        &state_value,
         Nonce::from_bytes([3; 32]),
     );
     let nonce = match fixture.begin(model, context, 300) {
         Ok(value) => value,
-        Err(_) => panic!("remove admission should succeed"),
+        Err(error) => panic!("remove admission should succeed: {error:?}"),
     };
     model
         .begin_drain(

@@ -29,6 +29,9 @@ pub struct AuthorityIssuer {
 
 impl AuthorityIssuer {
     /// Constructs a verified issuer from the authority boundary.
+    ///
+    /// # Errors
+    /// Returns [`PackageServiceError::AuthorityIssuerRejected`] for zero identity or evidence.
     pub fn new(
         class: AuthorityIssuerClass,
         identity: AuthorityIssuerIdentity,
@@ -98,6 +101,9 @@ pub struct AuthenticatedAuthority(AuthorityDecision);
 
 impl AuthenticatedAuthority {
     /// Binds issuer evidence to the canonical context digest.
+    ///
+    /// # Errors
+    /// Returns [`PackageServiceError::AuthorityIssuerRejected`] for zero evidence.
     pub fn bind(
         context: &OperationContext,
         issuer: AuthorityIssuer,

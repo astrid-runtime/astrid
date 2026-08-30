@@ -36,6 +36,9 @@ impl ExpectedPackageState {
     }
 
     /// Derives the state-bound plan digest for a canonical lifecycle action.
+    ///
+    /// # Errors
+    /// Returns typed failures when absent state or the operation is not lifecycle-only.
     pub fn lifecycle_plan_digest(&self, operation: Operation) -> PackageServiceResult<PlanDigest> {
         let Self::Exact(state_digest) = self else {
             return Err(PackageServiceError::ExpectedStateMismatch);
@@ -215,6 +218,9 @@ impl DrainLineage {
 
 impl CanonicalInstalledState {
     /// Constructs, validates, and digests a canonical installed state.
+    ///
+    /// # Errors
+    /// Returns [`PackageServiceError::InvalidValue`] for zero authoritative bindings.
     pub fn new(spec: InstalledStateSpec) -> PackageServiceResult<Self> {
         let InstalledStateSpec {
             owner,

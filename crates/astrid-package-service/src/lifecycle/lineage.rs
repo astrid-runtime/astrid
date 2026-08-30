@@ -1,4 +1,4 @@
-use super::{next_generation_value, restore_prior_content_to_successor};
+use super::generation::next_generation_value;
 use crate::error::{PackageServiceError, PackageServiceResult};
 use crate::identity::Nonce;
 use crate::journal::{OperationJournalRecord, PackageSlotRecord};
@@ -19,6 +19,17 @@ pub(super) fn active_drain_lineage(
         .ok_or(PackageServiceError::LifecycleTransition)?;
     validate(&lineage, state, nonce)?;
     Ok(lineage)
+}
+
+fn restore_prior_content_to_successor(
+    state: CanonicalInstalledState,
+    completing_nonce: Nonce,
+    generation: NonZeroU64,
+) -> CanonicalInstalledState {
+    let plan = *state.lifecycle_plan();
+    let mut restored = state;
+    restored.set_lifecycle_result(LifecycleState::Inactive, plan, generation, completing_nonce);
+    restored
 }
 
 pub(super) fn validate(
@@ -64,5 +75,9 @@ pub(super) fn restore_to_boundary_successor(
     nonce: &Nonce,
 ) -> PackageServiceResult<CanonicalInstalledState> {
     let generation: NonZeroU64 = next_generation_value(lineage.boundary_generation())?;
-    restore_prior_content_to_successor(lineage.base_state().clone(), *nonce, generation)
+    Ok(restore_prior_content_to_successor(
+        lineage.base_state().clone(),
+        *nonce,
+        generation,
+    ))
 }

@@ -1,5 +1,5 @@
 use crate::context::{Duration, Timestamp};
-use crate::error::PackageServiceError;
+use crate::error::{PackageServiceError, PackageServiceResult};
 use crate::journal::{JournalStatus, OperationJournalRecord};
 use std::num::NonZeroU64;
 use std::time::Duration as StdDuration;
@@ -20,6 +20,9 @@ pub struct RetentionWindow {
 
 impl RetentionWindow {
     /// Constructs finite retention bounds with `maximum >= minimum`.
+    ///
+    /// # Errors
+    /// Returns [`PackageServiceError::InvalidValue`] for zero or inverted bounds.
     pub fn new(minimum: StdDuration, maximum: StdDuration) -> Result<Self, PackageServiceError> {
         if minimum.is_zero() || maximum < minimum {
             return Err(PackageServiceError::InvalidValue("retention"));
@@ -49,6 +52,7 @@ pub struct JournalRetention {
 
 impl JournalRetention {
     /// Constructs finite retention classes.
+    #[must_use]
     pub fn new(receipts: RetentionWindow, terminal_failures: RetentionWindow) -> Self {
         Self {
             receipts,
@@ -97,18 +101,21 @@ impl JournalPolicy {
     }
 
     /// Named finite defaults for a private embedded model.
+    ///
+    /// # Panics
+    /// Panics only if named constants violate their constructor invariants.
     #[must_use]
     pub fn default_policy() -> Self {
         let receipts =
             match RetentionWindow::new(Duration::from_hours(7 * 24), Duration::from_hours(90 * 24))
             {
                 Ok(value) => value,
-                Err(_) => panic!("named receipt retention bounds are valid"),
+                Err(error) => panic!("named receipt retention bounds are valid: {error:?}"),
             };
         let terminal_failures =
             match RetentionWindow::new(Duration::from_hours(24), Duration::from_hours(30 * 24)) {
                 Ok(value) => value,
-                Err(_) => panic!("named failure retention bounds are valid"),
+                Err(error) => panic!("named failure retention bounds are valid: {error:?}"),
             };
         Self::new(
             non_zero(1_024),
@@ -153,7 +160,7 @@ impl JournalPolicy {
         self.tombstone_capacity.get()
     }
 
-    pub(crate) fn admission_error(&self) -> PackageServiceError {
+    pub(crate) const fn admission_error() -> PackageServiceError {
         PackageServiceError::QuotaExhausted
     }
 }
@@ -167,18 +174,40 @@ pub struct Occupancy {
 }
 
 impl Occupancy {
-    pub(crate) const fn add_record(&mut self, bytes: u64) {
-        self.records += 1;
-        self.bytes += bytes;
+    pub(crate) fn add_record(&mut self, bytes: u64) -> PackageServiceResult<()> {
+        let records = self
+            .records
+            .checked_add(1)
+            .ok_or(PackageServiceError::OccupancyCorruption)?;
+        let bytes_total = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or(PackageServiceError::OccupancyCorruption)?;
+        self.records = records;
+        self.bytes = bytes_total;
+        Ok(())
     }
 
-    pub(crate) const fn remove_record(&mut self, bytes: u64) {
-        self.records -= 1;
-        self.bytes -= bytes;
+    pub(crate) fn remove_record(&mut self, bytes: u64) -> PackageServiceResult<()> {
+        let records = self
+            .records
+            .checked_sub(1)
+            .ok_or(PackageServiceError::OccupancyCorruption)?;
+        let bytes_total = self
+            .bytes
+            .checked_sub(bytes)
+            .ok_or(PackageServiceError::OccupancyCorruption)?;
+        self.records = records;
+        self.bytes = bytes_total;
+        Ok(())
     }
 
-    pub(crate) const fn add_tombstone(&mut self) {
-        self.tombstones += 1;
+    pub(crate) fn add_tombstone(&mut self) -> PackageServiceResult<()> {
+        self.tombstones = self
+            .tombstones
+            .checked_add(1)
+            .ok_or(PackageServiceError::OccupancyCorruption)?;
+        Ok(())
     }
 
     /// Returns current record, byte, and tombstone occupancy.

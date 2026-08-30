@@ -1,6 +1,8 @@
 use super::{
-    PackageServiceModel, active_drain_lineage, commit_plan_digest, first_state_generation,
-    next_generation_value, recorded_drain_deadline, restore_to_boundary_successor,
+    PackageServiceModel,
+    commit::{commit_plan_digest, recorded_drain_deadline},
+    generation::{next_generation_from_high_watermark, next_generation_value},
+    lineage::{active_drain_lineage, restore_to_boundary_successor},
 };
 use crate::bytes::RecoveryToken;
 use crate::context::{Operation, OperationContext, Timestamp};
@@ -20,6 +22,7 @@ struct RecoverySnapshot {
     token: RecoveryToken,
     before: StateDigest,
     boundary_generation: Option<NonZeroU64>,
+    generation_high_watermark: Option<NonZeroU64>,
     drain_deadline: Option<Timestamp>,
     drain_lineage: Option<DrainLineage>,
     drain_destination: Option<DrainDestination>,
@@ -34,6 +37,9 @@ enum RecoveryEffect {
 
 impl PackageServiceModel {
     /// Reconciles an unknown record from retained canonical observations.
+    ///
+    /// # Errors
+    /// Returns typed recovery failures when evidence or state bindings disagree.
     pub fn recover(
         &mut self,
         nonce: &Nonce,
@@ -45,7 +51,7 @@ impl PackageServiceModel {
             return Err(PackageServiceError::RecoveryUnresolved);
         }
         let observed = self.retained_observation(&snapshot, evidence)?;
-        self.resolve_recovery(snapshot, evidence, observed.as_ref(), now)
+        self.resolve_recovery(&snapshot, evidence, observed.as_ref(), now)
     }
 
     /// Adjudicates a backend-observed canonical value without retaining trust.
@@ -53,6 +59,9 @@ impl PackageServiceModel {
     /// A successful commit re-derives or restores the only canonical value
     /// admitted by the retained operation contract; the caller's value is
     /// never copied into state merely because its digest was echoed.
+    ///
+    /// # Errors
+    /// Returns typed recovery failures when observed values cannot prove one effect.
     pub fn recover_observed(
         &mut self,
         nonce: &Nonce,
@@ -64,7 +73,7 @@ impl PackageServiceModel {
         if snapshot.token.into_bytes() != evidence.token_bytes() {
             return Err(PackageServiceError::RecoveryUnresolved);
         }
-        self.resolve_recovery(snapshot, evidence, observed, now)
+        self.resolve_recovery(&snapshot, evidence, observed, now)
     }
 
     fn recovery_snapshot(&self, nonce: &Nonce) -> PackageServiceResult<RecoverySnapshot> {
@@ -106,6 +115,7 @@ impl PackageServiceModel {
             token: record.recovery_token(),
             before: record.before_state(),
             boundary_generation: record.state_generation(),
+            generation_high_watermark: slot_record.generation_high_watermark(),
             drain_deadline,
             drain_lineage,
             drain_destination,
@@ -145,12 +155,12 @@ impl PackageServiceModel {
 
     fn resolve_recovery(
         &mut self,
-        snapshot: RecoverySnapshot,
+        snapshot: &RecoverySnapshot,
         evidence: &RecoveryEvidence,
         observed: Option<&CanonicalInstalledState>,
         now: crate::context::Timestamp,
     ) -> PackageServiceResult<Option<OperationReceipt>> {
-        let effect = recovery_effect(&snapshot, evidence, observed, now)?;
+        let effect = recovery_effect(snapshot, evidence, observed, now)?;
         let slot = PackageSlot::new(
             snapshot.context.target_owner(),
             snapshot.context.package_object(),
@@ -169,7 +179,7 @@ impl PackageServiceModel {
                     .ok_or(PackageServiceError::OccupancyCorruption)?;
                 let restored = restore_to_boundary_successor(&lineage, &nonce)?;
                 let generation = restored.generation_value();
-                record_slot.replace_state(Some(restored));
+                record_slot.replace_state_with_generation(Some(restored), generation)?;
                 let journal = record_slot
                     .journal_mut(&nonce)
                     .ok_or(PackageServiceError::RecordMissing)?;
@@ -183,21 +193,23 @@ impl PackageServiceModel {
                     || StateDigest::from_bytes([0; 32]),
                     CanonicalInstalledState::digest,
                 );
+                let generation = exact_successor_generation(snapshot)?;
                 let receipt = OperationReceipt::new(
                     &snapshot.context,
                     receipt_outcome(snapshot.context.operation())?,
                     snapshot.before,
                     after,
-                    exact_successor_generation(&snapshot)?,
+                    generation,
                     evidence.activation_receipt(),
                 );
-                record_slot.replace_state(after_state.map(|state| *state));
+                record_slot
+                    .replace_state_with_generation(after_state.map(|state| *state), generation)?;
                 let journal = record_slot
                     .journal_mut(&nonce)
                     .ok_or(PackageServiceError::RecordMissing)?;
                 journal.take_drain_lineage();
                 journal.take_staged_commit_plan();
-                journal.set_state_generation(exact_successor_generation(&snapshot)?);
+                journal.set_state_generation(generation);
                 journal.resolve_recovery(Some(receipt.clone()), JournalStatus::Committed, now);
                 return Ok(Some(receipt));
             },
@@ -235,16 +247,10 @@ fn recovery_effect(
     }
     validate_observed_state(snapshot, evidence, state)?;
     match snapshot.context.operation() {
-        crate::context::Operation::Install => {
-            Ok(RecoveryEffect::Commit(Some(Box::new(state.clone()))))
-        },
-        crate::context::Operation::Update => {
-            Ok(RecoveryEffect::Commit(Some(Box::new(state.clone()))))
-        },
-        crate::context::Operation::Activate => {
-            Ok(RecoveryEffect::Commit(Some(Box::new(state.clone()))))
-        },
-        crate::context::Operation::Deactivate => {
+        crate::context::Operation::Install
+        | crate::context::Operation::Update
+        | crate::context::Operation::Activate
+        | crate::context::Operation::Deactivate => {
             Ok(RecoveryEffect::Commit(Some(Box::new(state.clone()))))
         },
         crate::context::Operation::Remove | crate::context::Operation::Recover => {
@@ -381,7 +387,10 @@ fn validate_observed_state(
 
 fn exact_successor_generation(snapshot: &RecoverySnapshot) -> PackageServiceResult<NonZeroU64> {
     if snapshot.context.operation() == crate::context::Operation::Install {
-        return first_state_generation();
+        return next_generation_from_high_watermark(
+            snapshot.generation_high_watermark,
+            crate::context::Operation::Install,
+        );
     }
     if let Some(lineage) = snapshot.drain_lineage.as_ref() {
         return next_generation_value(lineage.boundary_generation());

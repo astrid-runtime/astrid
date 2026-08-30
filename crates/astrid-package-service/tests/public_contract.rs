@@ -4,7 +4,7 @@ use astrid_package_service::{
     ComponentIdentity, DrainDestination, DrainPlan, ExpectedPackageState, InstalledStateSpec,
     LifecycleState, ManifestFormatVersion, ManifestIdentity, Nonce, OperationReceipt, PackageName,
     PackageObject, PackageServiceError, PackageVersion, PrincipalUid, ProvenanceDigest,
-    ServiceGeneration, StateDigest, Timestamp,
+    ServiceGeneration, StateDigest, Timestamp, operation_commit_plan_digest,
 };
 use std::any::TypeId;
 use std::num::{NonZeroU32, NonZeroU64};
@@ -30,14 +30,14 @@ fn digest(byte: u8) -> Blake3Digest {
 fn package_name() -> PackageName {
     match PackageName::new("example-package") {
         Ok(value) => value,
-        Err(_) => panic!("fixed package name is valid"),
+        Err(error) => panic!("fixed package name is valid: {error:?}"),
     }
 }
 
 fn package_version() -> PackageVersion {
     match PackageVersion::new("1.2.3") {
         Ok(value) => value,
-        Err(_) => panic!("fixed package version is valid"),
+        Err(error) => panic!("fixed package version is valid: {error:?}"),
     }
 }
 
@@ -49,7 +49,7 @@ fn artifact_identity() -> ArtifactIdentity {
         digest(3),
     ) {
         Ok(value) => value,
-        Err(_) => panic!("fixed artifact identity is valid"),
+        Err(error) => panic!("fixed artifact identity is valid: {error:?}"),
     }
 }
 
@@ -61,7 +61,7 @@ fn manifest_identity() -> ManifestIdentity {
         digest(4),
     ) {
         Ok(value) => value,
-        Err(_) => panic!("fixed manifest identity is valid"),
+        Err(error) => panic!("fixed manifest identity is valid: {error:?}"),
     }
 }
 
@@ -95,7 +95,7 @@ fn public_drain_plan_constructor_preserves_state_binding() {
         Nonce::from_bytes([2; 32]),
     ) {
         Ok(value) => value,
-        Err(_) => panic!("valid drain plan should construct"),
+        Err(error) => panic!("valid drain plan should construct: {error:?}"),
     };
     assert_eq!(plan.destination(), DrainDestination::Replacement);
     assert_eq!(plan.deadline(), Timestamp::new(20));
@@ -179,7 +179,7 @@ fn public_authority_constructors_reject_zero_evidence() {
         digest(3),
     ) {
         Ok(value) => value,
-        Err(_) => panic!("fixed issuer is valid"),
+        Err(error) => panic!("fixed issuer is valid: {error:?}"),
     };
     let context = astrid_package_service::OperationContextSpec {
         nonce: Nonce::from_bytes([4; 32]),
@@ -193,10 +193,20 @@ fn public_authority_constructors_reject_zero_evidence() {
         package_object: PackageObject::from_bytes([7; 32]),
         artifact: artifact_identity(),
         manifest: manifest_identity(),
+        content_root: digest(8),
+        provenance: astrid_package_service::ProvenanceDigest::from_bytes([8; 32]),
         plan_digest: astrid_package_service::PlanDigest::from_bytes([8; 32]),
+        commit_plan_digest: operation_commit_plan_digest(
+            astrid_package_service::Operation::Install,
+            &artifact_identity(),
+            &manifest_identity(),
+            &digest(8),
+            &astrid_package_service::ProvenanceDigest::from_bytes([8; 32]),
+            None,
+        ),
         budget: astrid_package_service::ResourceBudget::new(
             non_zero_u64(4_096),
-            astrid_package_service::ResourceClasses::new(true, true, true, true),
+            astrid_package_service::ResourceClasses::new([true, true, true, true]),
         ),
         expiry: Timestamp::new(1_000),
     };
@@ -208,7 +218,7 @@ fn public_authority_constructors_reject_zero_evidence() {
     let context =
         match astrid_package_service::OperationContext::new(context, &service, Timestamp::ZERO) {
             Ok(value) => value,
-            Err(_) => panic!("fixed context is valid"),
+            Err(error) => panic!("fixed context is valid: {error:?}"),
         };
     assert!(matches!(
         AuthenticatedAuthority::bind(&context, issuer, Blake3Digest::from_bytes([0; 32])),

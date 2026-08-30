@@ -30,7 +30,7 @@ pub use context::Duration;
 pub use context::{
     AdmittedService, ApproverIdentity, AuthenticatedIngress, IngressChannel, Operation,
     OperationContext, OperationContextSpec, ResourceBudget, ResourceClass, ResourceClasses,
-    Timestamp,
+    Timestamp, operation_commit_plan_digest,
 };
 pub use digest::{
     AuthorityDecisionDigest, Blake3Digest, BudgetDigest, ContextDigest, DigestWriter, PlanDigest,

@@ -32,7 +32,7 @@ pub enum JournalStatus {
 }
 
 impl JournalStatus {
-    const fn tag(&self) -> u8 {
+    const fn tag(self) -> u8 {
         match self {
             Self::Intent => 1,
             Self::Executing => 2,
@@ -44,7 +44,7 @@ impl JournalStatus {
         }
     }
 
-    pub(crate) const fn is_unresolved(&self) -> bool {
+    pub(crate) const fn is_unresolved(self) -> bool {
         matches!(self, Self::Intent | Self::Executing | Self::Unknown)
     }
 }
@@ -65,7 +65,7 @@ pub enum ReceiptOutcome {
 }
 
 impl ReceiptOutcome {
-    const fn tag(&self) -> u8 {
+    const fn tag(self) -> u8 {
         match self {
             Self::Installed => 1,
             Self::Updated => 2,
@@ -215,6 +215,9 @@ pub struct DrainPlan {
 
 impl DrainPlan {
     /// Validates a drain against the exact canonical state it may alter.
+    ///
+    /// # Errors
+    /// Returns typed invalid-value failures when the plan is not state-bound.
     pub fn new(
         destination: DrainDestination,
         expected_state: crate::state::ExpectedPackageState,
@@ -311,6 +314,9 @@ impl RecoveryEvidence {
     }
 
     /// Constructs recovery evidence from independently read state/runtime values.
+    ///
+    /// # Errors
+    /// Returns [`PackageServiceError::InvalidValue`] for zero evidence.
     pub fn new(
         token: RecoveryToken,
         observed_state: StateDigest,
@@ -602,6 +608,7 @@ pub enum ReplayOutcome {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PackageSlotRecord {
     state: Option<CanonicalInstalledState>,
+    generation_high_watermark: Option<NonZeroU64>,
     journal: BTreeMap<Nonce, OperationJournalRecord>,
 }
 
@@ -646,19 +653,47 @@ impl PackageSlotRecord {
         self.journal.values()
     }
 
+    /// Returns the durable generation high-watermark retained across absence.
+    #[must_use]
+    pub const fn generation_high_watermark(&self) -> Option<NonZeroU64> {
+        self.generation_high_watermark
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_generation_high_watermark_for_test(&mut self, generation: NonZeroU64) {
+        self.generation_high_watermark = Some(generation);
+    }
+
+    /// Replaces state and advances the high-watermark to one exact transition.
+    pub(crate) fn replace_state_with_generation(
+        &mut self,
+        state: Option<CanonicalInstalledState>,
+        generation: NonZeroU64,
+    ) -> PackageServiceResult<()> {
+        if let Some(existing) = self.generation_high_watermark {
+            let successor = existing
+                .get()
+                .checked_add(1)
+                .ok_or(PackageServiceError::GenerationOverflow)?;
+            if successor != generation.get() {
+                return Err(PackageServiceError::BindingMismatch);
+            }
+        } else if generation.get() != 1 {
+            return Err(PackageServiceError::InvalidValue("initial generation"));
+        }
+        self.generation_high_watermark = Some(generation);
+        self.state = state;
+        Ok(())
+    }
+
     pub(crate) fn remove_journal(&mut self, nonce: &Nonce) -> Option<Tombstone> {
         let record = self.journal.remove(nonce)?;
         Some(Tombstone {
             nonce: *nonce,
             terminal_status: record.status(),
             context_digest: *record.context().digest(),
-            outcome: record.receipt().map(|receipt| receipt.outcome()),
+            outcome: record.receipt().map(OperationReceipt::outcome),
             record_digest: record.record_digest(),
         })
-    }
-
-    /// Replaces canonical state and journal as one logical value.
-    pub(crate) fn replace_state(&mut self, state: Option<CanonicalInstalledState>) {
-        self.state = state;
     }
 }

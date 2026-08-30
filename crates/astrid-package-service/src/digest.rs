@@ -117,7 +117,11 @@ impl Display for Blake3Digest {
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    bytes.iter().fold(String::new(), |mut output, byte| {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+        output
+    })
 }
 
 fn cast_length(length: usize) -> u64 {

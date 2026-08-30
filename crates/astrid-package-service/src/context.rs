@@ -1,5 +1,7 @@
 use crate::bytes::PrincipalUid;
-use crate::digest::{Blake3Digest, BudgetDigest, ContextDigest, DigestWriter, PlanDigest};
+use crate::digest::{
+    Blake3Digest, BudgetDigest, ContextDigest, DigestWriter, PlanDigest, ProvenanceDigest,
+};
 use crate::error::{PackageServiceError, PackageServiceResult};
 use crate::identity::{
     ArtifactIdentity, ComponentIdentity, ManifestIdentity, Nonce, PROTOCOL_VERSION, PackageObject,
@@ -65,7 +67,7 @@ pub enum Operation {
 }
 
 impl Operation {
-    pub(crate) const fn tag(&self) -> u8 {
+    pub(crate) const fn tag(self) -> u8 {
         match self {
             Self::Install => 1,
             Self::Update => 2,
@@ -89,7 +91,7 @@ pub enum IngressChannel {
 }
 
 impl IngressChannel {
-    const fn tag(&self) -> u8 {
+    const fn tag(self) -> u8 {
         match self {
             Self::AuthenticatedIpc => 1,
             Self::HostedService => 2,
@@ -108,6 +110,7 @@ pub struct AuthenticatedIngress {
 
 impl AuthenticatedIngress {
     /// Constructs ingress from trusted transport data.
+    #[must_use]
     pub fn new(caller: PrincipalUid, channel: IngressChannel, evidence: Blake3Digest) -> Self {
         Self {
             caller,
@@ -181,7 +184,7 @@ pub enum ApproverIdentity {
 }
 
 impl ApproverIdentity {
-    pub(crate) fn write(&self, writer: &mut DigestWriter) {
+    pub(crate) fn write(self, writer: &mut DigestWriter) {
         match self {
             Self::Principal(uid) => {
                 writer.tag(1);
@@ -189,7 +192,7 @@ impl ApproverIdentity {
             },
             Self::Policy(policy) => {
                 writer.tag(2);
-                writer.digest(policy);
+                writer.digest(&policy);
             },
         }
     }
@@ -198,45 +201,31 @@ impl ApproverIdentity {
 /// Resource classes admitted by the kernel/resource authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResourceClasses {
-    artifact_storage: bool,
-    lifecycle: bool,
-    activation: bool,
-    audit: bool,
+    classes: [bool; 4],
 }
 
 impl ResourceClasses {
-    /// Constructs all-or-nothing admitted classes from authoritative flags.
+    /// Constructs admitted classes in canonical `ResourceClass` order.
     #[must_use]
-    pub const fn new(
-        artifact_storage: bool,
-        lifecycle: bool,
-        activation: bool,
-        audit: bool,
-    ) -> Self {
-        Self {
-            artifact_storage,
-            lifecycle,
-            activation,
-            audit,
-        }
+    pub const fn new(classes: [bool; 4]) -> Self {
+        Self { classes }
     }
 
     /// Returns whether a class is admitted.
     #[must_use]
     pub const fn contains(&self, class: ResourceClass) -> bool {
         match class {
-            ResourceClass::ArtifactStorage => self.artifact_storage,
-            ResourceClass::Lifecycle => self.lifecycle,
-            ResourceClass::Activation => self.activation,
-            ResourceClass::Audit => self.audit,
+            ResourceClass::ArtifactStorage => self.classes[0],
+            ResourceClass::Lifecycle => self.classes[1],
+            ResourceClass::Activation => self.classes[2],
+            ResourceClass::Audit => self.classes[3],
         }
     }
 
-    fn write(&self, writer: &mut DigestWriter) {
-        writer.bool(self.artifact_storage);
-        writer.bool(self.lifecycle);
-        writer.bool(self.activation);
-        writer.bool(self.audit);
+    fn write(self, writer: &mut DigestWriter) {
+        for admitted in self.classes {
+            writer.bool(admitted);
+        }
     }
 }
 
@@ -306,7 +295,10 @@ pub struct OperationContext {
     package_object: PackageObject,
     artifact: ArtifactIdentity,
     manifest: ManifestIdentity,
+    content_root: Blake3Digest,
+    provenance: ProvenanceDigest,
     plan_digest: PlanDigest,
+    commit_plan_digest: PlanDigest,
     budget: ResourceBudget,
     service_component: ComponentIdentity,
     service_generation: ServiceGeneration,
@@ -335,8 +327,14 @@ pub struct OperationContextSpec {
     pub artifact: ArtifactIdentity,
     /// Exact manifest identity.
     pub manifest: ManifestIdentity,
+    /// Exact content root admitted for replacement or retained-state work.
+    pub content_root: Blake3Digest,
+    /// Exact provenance digest admitted for replacement or retained-state work.
+    pub provenance: ProvenanceDigest,
     /// Activation, replacement, or removal plan digest.
     pub plan_digest: PlanDigest,
+    /// Exact staged-and-committed plan bound by authority.
+    pub commit_plan_digest: PlanDigest,
     /// Canonical resource budget.
     pub budget: ResourceBudget,
     /// Authority-owned expiry.
@@ -345,6 +343,9 @@ pub struct OperationContextSpec {
 
 impl OperationContext {
     /// Validates and binds a complete operation context.
+    ///
+    /// # Errors
+    /// Returns typed binding, expiry, identity, resource, and expectation failures.
     pub fn new(
         spec: OperationContextSpec,
         service: &AdmittedService,
@@ -360,7 +361,10 @@ impl OperationContext {
             package_object,
             artifact,
             manifest,
+            content_root,
+            provenance,
             plan_digest,
+            commit_plan_digest,
             budget,
             expiry,
         } = spec;
@@ -371,72 +375,50 @@ impl OperationContext {
             || package_object.as_bytes() == &[0; 32]
             || service.component.as_bytes() == &[0; 32]
             || plan_digest.as_bytes() == &[0; 32]
+            || content_root.as_bytes() == &[0; 32]
+            || provenance.as_bytes() == &[0; 32]
         {
             return Err(PackageServiceError::InvalidValue("operation identity"));
         }
-        match approver {
-            ApproverIdentity::Principal(uid) if uid.as_bytes() == &[0; 32] => {
-                return Err(PackageServiceError::InvalidValue("approver"));
-            },
-            ApproverIdentity::Policy(policy) if policy.as_bytes() == &[0; 32] => {
-                return Err(PackageServiceError::InvalidValue("approver"));
-            },
-            _ => {},
-        }
-        if effective_caller.as_bytes() == &[0; 32] || target_owner.as_bytes() == &[0; 32] {
-            return Err(PackageServiceError::InvalidValue("principal"));
-        }
-        if operation == Operation::Install
-            && !matches!(expected_state, crate::state::ExpectedPackageState::Absent)
-        {
-            return Err(PackageServiceError::ExpectedStateMismatch);
-        }
-        if operation == Operation::Update
-            && !matches!(expected_state, crate::state::ExpectedPackageState::Exact(_))
-        {
-            return Err(PackageServiceError::ExpectedStateMismatch);
-        }
-        if (operation == Operation::Install || operation == Operation::Update)
-            && !budget.classes().contains(ResourceClass::ArtifactStorage)
-        {
+        Self::validate_participants(&approver, &effective_caller, &target_owner)?;
+        let expected_commit_plan = if matches!(operation, Operation::Install | Operation::Update) {
+            operation_commit_plan_digest(
+                operation,
+                &artifact,
+                &manifest,
+                &content_root,
+                &provenance,
+                (operation == Operation::Update).then_some(plan_digest),
+            )
+        } else {
+            plan_digest
+        };
+        let plan_kind_matches = matches!(operation, Operation::Install | Operation::Update)
+            || commit_plan_digest == plan_digest;
+        if commit_plan_digest != expected_commit_plan || !plan_kind_matches {
             return Err(PackageServiceError::BindingMismatch);
         }
-        if !budget.classes().contains(ResourceClass::Lifecycle)
-            || ((operation == Operation::Activate)
-                && !budget.classes().contains(ResourceClass::Activation))
-        {
-            return Err(PackageServiceError::BindingMismatch);
-        }
+        Self::validate_expectations_and_budget(operation, &expected_state, &budget)?;
 
-        let mut writer = DigestWriter::new();
-        writer.u64(u64::from(PROTOCOL_VERSION.get()));
-        writer.bytes(nonce.as_bytes());
-        writer.tag(operation.tag());
-        match &expected_state {
-            crate::state::ExpectedPackageState::Absent => writer.tag(0),
-            crate::state::ExpectedPackageState::Exact(state_digest) => {
-                writer.tag(1);
-                writer.digest(state_digest);
-            },
+        let digest = ContextDigestParts {
+            nonce: &nonce,
+            operation,
+            expected_state: &expected_state,
+            effective_caller: &effective_caller,
+            approver: &approver,
+            target_owner: &target_owner,
+            package_object: &package_object,
+            artifact: &artifact,
+            manifest: &manifest,
+            content_root: &content_root,
+            provenance: &provenance,
+            plan_digest: &plan_digest,
+            commit_plan_digest: &commit_plan_digest,
+            budget: &budget,
+            service,
+            expiry,
         }
-        writer.bytes(effective_caller.as_bytes());
-        approver.write(&mut writer);
-        writer.bytes(target_owner.as_bytes());
-        writer.bytes(package_object.as_bytes());
-        writer.u64(u64::from(artifact.format_version()));
-        writer.u64(artifact.size_bytes());
-        writer.digest(artifact.sha256());
-        writer.digest(artifact.blake3());
-        writer.u64(u64::from(manifest.format_version()));
-        writer.bytes(manifest.package_name().as_str().as_bytes());
-        writer.bytes(manifest.package_version().as_str().as_bytes());
-        writer.digest(manifest.manifest_digest());
-        writer.digest(&plan_digest);
-        writer.digest(budget.digest());
-        writer.bytes(service.component.as_bytes());
-        writer.u64(service.generation.get());
-        writer.u64(expiry.get());
-        let digest = writer.finish("astrid.package.operation-context.v1");
+        .digest();
 
         Ok(Self {
             protocol_version: PROTOCOL_VERSION,
@@ -449,7 +431,10 @@ impl OperationContext {
             package_object,
             artifact,
             manifest,
+            content_root,
+            provenance,
             plan_digest,
+            commit_plan_digest,
             budget,
             service_component: *service.component(),
             service_generation: service.generation(),
@@ -458,6 +443,115 @@ impl OperationContext {
         })
     }
 
+    fn validate_expectations_and_budget(
+        operation: Operation,
+        expected_state: &crate::state::ExpectedPackageState,
+        budget: &ResourceBudget,
+    ) -> PackageServiceResult<()> {
+        let expected_matches = match operation {
+            Operation::Install => {
+                matches!(expected_state, crate::state::ExpectedPackageState::Absent)
+            },
+            Operation::Update => {
+                matches!(expected_state, crate::state::ExpectedPackageState::Exact(_))
+            },
+            _ => true,
+        };
+        if !expected_matches {
+            return Err(PackageServiceError::ExpectedStateMismatch);
+        }
+        let storage_required = matches!(operation, Operation::Install | Operation::Update);
+        if storage_required && !budget.classes().contains(ResourceClass::ArtifactStorage) {
+            return Err(PackageServiceError::BindingMismatch);
+        }
+        if !budget.classes().contains(ResourceClass::Lifecycle)
+            || (operation == Operation::Activate
+                && !budget.classes().contains(ResourceClass::Activation))
+        {
+            return Err(PackageServiceError::BindingMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_participants(
+        approver: &ApproverIdentity,
+        effective_caller: &PrincipalUid,
+        target_owner: &PrincipalUid,
+    ) -> PackageServiceResult<()> {
+        let zero_approver = matches!(
+            approver,
+            ApproverIdentity::Principal(uid) if uid.as_bytes() == &[0; 32]
+        ) || matches!(
+            approver,
+            ApproverIdentity::Policy(policy) if policy.as_bytes() == &[0; 32]
+        );
+        if zero_approver {
+            return Err(PackageServiceError::InvalidValue("approver"));
+        }
+        if effective_caller.as_bytes() == &[0; 32] || target_owner.as_bytes() == &[0; 32] {
+            return Err(PackageServiceError::InvalidValue("principal"));
+        }
+        Ok(())
+    }
+}
+
+struct ContextDigestParts<'a> {
+    nonce: &'a Nonce,
+    operation: Operation,
+    expected_state: &'a crate::state::ExpectedPackageState,
+    effective_caller: &'a PrincipalUid,
+    approver: &'a ApproverIdentity,
+    target_owner: &'a PrincipalUid,
+    package_object: &'a PackageObject,
+    artifact: &'a ArtifactIdentity,
+    manifest: &'a ManifestIdentity,
+    content_root: &'a Blake3Digest,
+    provenance: &'a ProvenanceDigest,
+    plan_digest: &'a PlanDigest,
+    commit_plan_digest: &'a PlanDigest,
+    budget: &'a ResourceBudget,
+    service: &'a AdmittedService,
+    expiry: Timestamp,
+}
+
+impl ContextDigestParts<'_> {
+    fn digest(self) -> ContextDigest {
+        let mut writer = DigestWriter::new();
+        writer.u64(u64::from(PROTOCOL_VERSION.get()));
+        writer.bytes(self.nonce.as_bytes());
+        writer.tag(self.operation.tag());
+        match self.expected_state {
+            crate::state::ExpectedPackageState::Absent => writer.tag(0),
+            crate::state::ExpectedPackageState::Exact(state_digest) => {
+                writer.tag(1);
+                writer.digest(state_digest);
+            },
+        }
+        writer.bytes(self.effective_caller.as_bytes());
+        self.approver.write(&mut writer);
+        writer.bytes(self.target_owner.as_bytes());
+        writer.bytes(self.package_object.as_bytes());
+        writer.u64(u64::from(self.artifact.format_version()));
+        writer.u64(self.artifact.size_bytes());
+        writer.digest(self.artifact.sha256());
+        writer.digest(self.artifact.blake3());
+        writer.u64(u64::from(self.manifest.format_version()));
+        writer.bytes(self.manifest.package_name().as_str().as_bytes());
+        writer.bytes(self.manifest.package_version().as_str().as_bytes());
+        writer.digest(self.manifest.manifest_digest());
+        writer.digest(self.content_root);
+        writer.digest(self.provenance);
+        writer.digest(self.plan_digest);
+        writer.digest(self.commit_plan_digest);
+        writer.digest(self.budget.digest());
+        writer.bytes(self.service.component.as_bytes());
+        writer.u64(self.service.generation.get());
+        writer.u64(self.expiry.get());
+        writer.finish("astrid.package.operation-context.v1")
+    }
+}
+
+impl OperationContext {
     /// Returns the canonical context digest covered by authority.
     #[must_use]
     pub const fn digest(&self) -> &ContextDigest {
@@ -502,10 +596,28 @@ impl OperationContext {
         &self.manifest
     }
 
+    /// Returns the exact committed content root.
+    #[must_use]
+    pub const fn content_root(&self) -> &Blake3Digest {
+        &self.content_root
+    }
+
+    /// Returns the exact committed provenance digest.
+    #[must_use]
+    pub const fn provenance(&self) -> &ProvenanceDigest {
+        &self.provenance
+    }
+
     /// Returns the activation or removal plan digest.
     #[must_use]
     pub const fn plan_digest(&self) -> &PlanDigest {
         &self.plan_digest
+    }
+
+    /// Returns the unified content and lifecycle plan admitted by authority.
+    #[must_use]
+    pub const fn commit_plan_digest(&self) -> &PlanDigest {
+        &self.commit_plan_digest
     }
 
     /// Returns the expiry owned by the canonical context.
@@ -541,4 +653,34 @@ impl OperationContext {
     pub(crate) const fn service_generation(&self) -> ServiceGeneration {
         self.service_generation
     }
+}
+
+/// Derives the exact committed plan admitted by an Install or Update context.
+#[must_use]
+pub fn operation_commit_plan_digest(
+    operation: Operation,
+    artifact: &ArtifactIdentity,
+    manifest: &ManifestIdentity,
+    content_root: &Blake3Digest,
+    provenance: &ProvenanceDigest,
+    lifecycle_plan: Option<PlanDigest>,
+) -> PlanDigest {
+    let mut writer = DigestWriter::new();
+    writer.u64(u64::from(artifact.format_version()));
+    writer.u64(artifact.size_bytes());
+    writer.digest(artifact.sha256());
+    writer.digest(artifact.blake3());
+    writer.u64(u64::from(manifest.format_version()));
+    writer.bytes(manifest.package_name().as_str().as_bytes());
+    writer.bytes(manifest.package_version().as_str().as_bytes());
+    writer.digest(manifest.manifest_digest());
+    writer.digest(content_root);
+    writer.digest(provenance);
+    writer.tag(operation.tag());
+    if operation == Operation::Update
+        && let Some(plan) = lifecycle_plan
+    {
+        writer.digest(&plan);
+    }
+    writer.finish("astrid.package.commit-plan.v1")
 }

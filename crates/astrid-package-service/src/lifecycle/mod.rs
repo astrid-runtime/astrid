@@ -2,25 +2,37 @@ use crate::authority::AuthenticatedAuthority;
 use crate::context::{
     AdmittedService, AuthenticatedIngress, Operation, OperationContext, Timestamp,
 };
-use crate::digest::{Blake3Digest, DigestWriter, PlanDigest, ProvenanceDigest, StateDigest};
+use crate::digest::{Blake3Digest, StateDigest};
 use crate::error::{PackageServiceError, PackageServiceResult};
-use crate::identity::{Nonce, ProvenanceEvidence, ValidatedArtifact};
+use crate::identity::{Nonce, ValidatedArtifact};
 use crate::journal::{
     DrainPlan, DrainResult, JournalStatus, OperationJournalRecord, OperationReceipt,
-    PackageSlotRecord, ReceiptOutcome, ReplayOutcome, Tombstone,
+    PackageSlotRecord, ReplayOutcome, Tombstone,
 };
 use crate::policy::{JournalPolicy, Occupancy};
 use crate::state::{
-    CanonicalInstalledState, DrainDestination, DrainLineage, ExpectedPackageState,
-    InstalledStateSpec, LifecycleState, PackageSlot,
+    CanonicalInstalledState, DrainDestination, DrainLineage, ExpectedPackageState, LifecycleState,
+    PackageSlot,
 };
 use std::collections::BTreeMap;
-use std::num::NonZeroU64;
 
+mod commit;
+mod generation;
 mod lineage;
 mod recovery;
 
+use self::commit::{
+    DrainProof, commit_install, commit_plan_digest, commit_record_metadata, commit_removal,
+    commit_retained_state, commit_update, provenance_digest, recorded_drain_deadline,
+    validate_context_artifact,
+};
+use self::generation::{next_generation, next_generation_value, next_transition_generation};
 use self::lineage::{active_drain_lineage, restore_to_boundary_successor};
+
+#[cfg(test)]
+use self::commit::new_installed_state;
+#[cfg(test)]
+use self::generation::next_generation_from_high_watermark;
 
 /// Pure executable owner/package state model.
 #[derive(Debug)]
@@ -58,6 +70,9 @@ impl PackageServiceModel {
     }
 
     /// Durably represents an intent before any budgeted model effect.
+    ///
+    /// # Errors
+    /// Returns typed admission failures before any durable intent is inserted.
     pub fn begin(
         &mut self,
         context: OperationContext,
@@ -88,8 +103,9 @@ impl PackageServiceModel {
             return Err(PackageServiceError::RecordNotReconcilable);
         }
         if let Some(state) = self.slot_record(&slot).and_then(PackageSlotRecord::state) {
-            self.validate_context_bindings(&context, state)?;
+            Self::validate_context_bindings(&context, state)?;
         }
+        next_transition_generation(self.slots.get(&slot), context.operation())?;
 
         let current_generation = self
             .slot_record(&slot)
@@ -109,11 +125,11 @@ impl PackageServiceModel {
             .policy
             .has_admission_room(&self.occupancy, record_bytes)
         {
-            return Err(self.policy.admission_error());
+            return Err(JournalPolicy::admission_error());
         }
         let nonce = record.context().nonce();
         self.slots.entry(slot).or_default().insert_intent(record)?;
-        self.occupancy.add_record(record_bytes);
+        self.occupancy.add_record(record_bytes)?;
         self.nonce_locations.insert(nonce, slot);
         Ok(nonce)
     }
@@ -135,20 +151,16 @@ impl PackageServiceModel {
             .slots
             .get(slot)
             .and_then(|record| record.state())
-            .map(|state| state.lifecycle_state());
+            .map(super::state::CanonicalInstalledState::lifecycle_state);
         let valid = matches!(
             (operation, lifecycle),
             (Operation::Install, None)
                 | (
-                    Operation::Update,
-                    Some(LifecycleState::Inactive) | Some(LifecycleState::Active)
+                    Operation::Update | Operation::Remove,
+                    Some(LifecycleState::Inactive | LifecycleState::Active)
                 )
                 | (Operation::Activate, Some(LifecycleState::Inactive))
                 | (Operation::Deactivate, Some(LifecycleState::Active))
-                | (
-                    Operation::Remove,
-                    Some(LifecycleState::Inactive) | Some(LifecycleState::Active)
-                )
         );
         if valid {
             Ok(())
@@ -158,7 +170,6 @@ impl PackageServiceModel {
     }
 
     fn validate_context_bindings(
-        &self,
         context: &OperationContext,
         state: &CanonicalInstalledState,
     ) -> PackageServiceResult<()> {
@@ -169,6 +180,11 @@ impl PackageServiceModel {
             return Ok(());
         }
         if context.artifact() != state.artifact() || context.manifest() != state.manifest() {
+            return Err(PackageServiceError::BindingMismatch);
+        }
+        if context.content_root() != state.content_root()
+            || context.provenance() != state.provenance()
+        {
             return Err(PackageServiceError::BindingMismatch);
         }
         if context.operation() != Operation::Remove {
@@ -208,6 +224,9 @@ impl PackageServiceModel {
     }
 
     /// Moves an intent to executing after checking authority expiry.
+    ///
+    /// # Errors
+    /// Returns expiry or record-state failures without changing status.
     pub fn begin_work(&mut self, nonce: &Nonce, now: Timestamp) -> PackageServiceResult<()> {
         let expiry = self.context_for(nonce)?.expiry();
         if now >= expiry {
@@ -222,6 +241,9 @@ impl PackageServiceModel {
     }
 
     /// Durably places the exact state into a bounded drain.
+    ///
+    /// # Errors
+    /// Returns typed binding or transition failures before recording a drain.
     pub fn begin_drain(
         &mut self,
         nonce: &Nonce,
@@ -235,7 +257,10 @@ impl PackageServiceModel {
             DrainDestination::Replacement => Operation::Update,
             DrainDestination::Removal => Operation::Remove,
         };
-        if context.operation() != required || deadline > context.expiry() || deadline <= now {
+        let required_matches = context.operation() == required;
+        let expiry_allows = deadline <= context.expiry();
+        let now_allows = deadline > now;
+        if !(required_matches && expiry_allows && now_allows) {
             return Err(PackageServiceError::BindingMismatch);
         }
         let slot_for_plan = self
@@ -258,6 +283,13 @@ impl PackageServiceModel {
         .map_err(|_| PackageServiceError::BindingMismatch)?;
         if *context.plan_digest() != plan.digest() {
             return Err(PackageServiceError::BindingMismatch);
+        }
+        if context.operation() == Operation::Update {
+            let unified_plan =
+                commit_plan_digest(&context, context.content_root(), context.provenance());
+            if context.commit_plan_digest() != &unified_plan {
+                return Err(PackageServiceError::BindingMismatch);
+            }
         }
         self.begin_work(nonce, now)?;
         let slot = self
@@ -288,7 +320,7 @@ impl PackageServiceModel {
         if let Some(journal) = record.journal_mut(nonce) {
             journal.set_drain_lineage(DrainLineage::new(base_state, generation)?);
         }
-        record.replace_state(Some(replacement.clone()));
+        record.replace_state_with_generation(Some(replacement.clone()), generation)?;
         let journal = record
             .journal_mut(nonce)
             .ok_or(PackageServiceError::RecordMissing)?;
@@ -297,6 +329,9 @@ impl PackageServiceModel {
     }
 
     /// Binds the exact staged commit content before the uncertain boundary.
+    ///
+    /// # Errors
+    /// Returns binding or record-state failures without replacing an existing stage.
     pub fn stage_commit_artifact(
         &mut self,
         nonce: &Nonce,
@@ -312,6 +347,9 @@ impl PackageServiceModel {
             artifact.content_root(),
             &provenance_digest(artifact.provenance()),
         );
+        if context.commit_plan_digest() != &plan {
+            return Err(PackageServiceError::BindingMismatch);
+        }
         let record = self.record_mut(nonce)?;
         if !matches!(
             record.status(),
@@ -319,11 +357,20 @@ impl PackageServiceModel {
         ) {
             return Err(PackageServiceError::RecordNotReconcilable);
         }
+        if record
+            .staged_commit_plan()
+            .is_some_and(|existing| *existing != plan)
+        {
+            return Err(PackageServiceError::BindingMismatch);
+        }
         record.set_staged_commit_plan(plan);
         Ok(())
     }
 
     /// Records independently proved runtime lease count without completing the drain.
+    ///
+    /// # Errors
+    /// Returns expiry, lineage, or generation failures without a canonical commit.
     pub fn prove_drain_leases(
         &mut self,
         nonce: &Nonce,
@@ -377,7 +424,7 @@ impl PackageServiceModel {
             generation,
             *nonce,
         );
-        record.replace_state(Some(replacement));
+        record.replace_state_with_generation(Some(replacement), generation)?;
         let journal = record
             .journal_mut(nonce)
             .ok_or(PackageServiceError::RecordMissing)?;
@@ -386,6 +433,9 @@ impl PackageServiceModel {
     }
 
     /// Commits install, update, activation, deactivation, or final retirement.
+    ///
+    /// # Errors
+    /// Returns typed binding, expiry, drain, or transition failures before commit.
     pub fn complete(
         &mut self,
         nonce: &Nonce,
@@ -415,133 +465,55 @@ impl PackageServiceModel {
             .slots
             .get_mut(&slot)
             .ok_or(PackageServiceError::RecordMissing)?;
-        let journal_status = record_slot
-            .journal_record(nonce)
-            .map(|record| record.status())
-            .ok_or(PackageServiceError::RecordMissing)?;
-        let before = record_slot
-            .journal_record(nonce)
-            .map(|record| record.before_state())
-            .ok_or(PackageServiceError::RecordMissing)?;
-        let authority_digest = record_slot
-            .journal_record(nonce)
-            .map(|record| *record.authority_digest())
-            .ok_or(PackageServiceError::RecordMissing)?;
-        if journal_status != JournalStatus::Executing {
-            return Err(PackageServiceError::RecordNotReconcilable);
-        }
-        let staged_commit_plan = record_slot
-            .journal_record(nonce)
-            .and_then(OperationJournalRecord::staged_commit_plan)
-            .copied();
+        let (before, authority_digest, staged_commit_plan) =
+            commit_record_metadata(record_slot, nonce)?;
 
         let (after_state, outcome, generation) = match context.operation() {
             Operation::Install => {
                 let artifact = artifact.ok_or(PackageServiceError::BindingMismatch)?;
-                validate_context_artifact(&context, artifact)?;
-                if Some(commit_plan_digest(
-                    &context,
-                    artifact.content_root(),
-                    &provenance_digest(artifact.provenance()),
-                )) != staged_commit_plan
-                {
-                    return Err(PackageServiceError::BindingMismatch);
-                }
-                let state = new_installed_state(
+                commit_install(
+                    record_slot,
                     &context,
                     authority_digest,
                     artifact,
-                    LifecycleState::Inactive,
-                    first_state_generation()?,
-                )?;
-                let generation = state.generation_value();
-                record_slot.replace_state(Some(state));
-                (
-                    record_slot.expected_state_digest(),
-                    ReceiptOutcome::Installed,
-                    generation,
-                )
+                    staged_commit_plan,
+                )?
             },
             Operation::Update => {
                 let artifact = artifact.ok_or(PackageServiceError::BindingMismatch)?;
-                validate_context_artifact(&context, artifact)?;
-                let Some(state) = record_slot.state().cloned() else {
-                    return Err(PackageServiceError::LifecycleTransition);
-                };
-                require_open_drain(&state, nonce, now)?;
-                require_zero_drain(&state, *nonce, DrainDestination::Replacement)?;
-                active_drain_lineage(record_slot, nonce)?;
-                if !zero_leases_proved {
-                    return Err(PackageServiceError::DrainBlocked);
-                }
-                if Some(commit_plan_digest(
-                    &context,
-                    artifact.content_root(),
-                    &provenance_digest(artifact.provenance()),
-                )) != staged_commit_plan
-                {
-                    return Err(PackageServiceError::BindingMismatch);
-                }
-                let replacement = new_installed_state(
+                commit_update(
+                    record_slot,
                     &context,
                     authority_digest,
                     artifact,
-                    LifecycleState::Inactive,
-                    next_generation(&state)?,
-                )?;
-                let generation = replacement.generation_value();
-                record_slot.replace_state(Some(replacement));
-                (
-                    record_slot.expected_state_digest(),
-                    ReceiptOutcome::Updated,
-                    generation,
-                )
+                    staged_commit_plan,
+                    &DrainProof {
+                        nonce,
+                        now,
+                        zero_leases: zero_leases_proved,
+                    },
+                )?
             },
             Operation::Activate | Operation::Deactivate => {
                 let Some(state) = record_slot.state().cloned() else {
                     return Err(PackageServiceError::LifecycleTransition);
                 };
-                let next_lifecycle = if context.operation() == Operation::Activate {
-                    LifecycleState::Active
-                } else {
-                    LifecycleState::Inactive
-                };
-                let generation = next_generation(&state)?;
-                let mut replacement = state;
-                replacement.set_lifecycle_result(
-                    next_lifecycle,
-                    *context.plan_digest(),
-                    generation,
-                    *nonce,
-                );
-                record_slot.replace_state(Some(replacement));
-                (
-                    record_slot.expected_state_digest(),
-                    if context.operation() == Operation::Activate {
-                        ReceiptOutcome::Activated
-                    } else {
-                        ReceiptOutcome::Deactivated
-                    },
-                    generation,
-                )
+                commit_retained_state(record_slot, &context, state, nonce)?
             },
             Operation::Remove => {
                 let Some(state) = record_slot.state().cloned() else {
                     return Err(PackageServiceError::LifecycleTransition);
                 };
-                require_open_drain(&state, nonce, now)?;
-                require_zero_drain(&state, *nonce, DrainDestination::Removal)?;
-                active_drain_lineage(record_slot, nonce)?;
-                if !zero_leases_proved {
-                    return Err(PackageServiceError::DrainBlocked);
-                }
-                let generation = next_generation(&state)?;
-                record_slot.replace_state(None);
-                (
-                    record_slot.expected_state_digest(),
-                    ReceiptOutcome::Retired,
-                    generation,
-                )
+                commit_removal(
+                    record_slot,
+                    &state,
+                    nonce,
+                    &DrainProof {
+                        nonce,
+                        now,
+                        zero_leases: zero_leases_proved,
+                    },
+                )?
             },
             Operation::Recover => return Err(PackageServiceError::RecordNotReconcilable),
         };
@@ -564,6 +536,9 @@ impl PackageServiceModel {
     }
 
     /// Moves an executing result to unknown after an uncertain boundary.
+    ///
+    /// # Errors
+    /// Returns record-state failures unless the record is currently executing.
     pub fn mark_unknown(&mut self, nonce: &Nonce, now: Timestamp) -> PackageServiceResult<()> {
         let record = self.record_mut(nonce)?;
         if record.status() != JournalStatus::Executing {
@@ -574,6 +549,9 @@ impl PackageServiceModel {
     }
 
     /// Cancels advisory work only before an unknown commit boundary.
+    ///
+    /// # Errors
+    /// Returns expiry, transition, or restoration failures before terminal status.
     pub fn cancel(&mut self, nonce: &Nonce, now: Timestamp) -> PackageServiceResult<()> {
         let context = self.context_for(nonce)?;
         if now >= context.expiry() {
@@ -606,7 +584,7 @@ impl PackageServiceModel {
             let lineage = active_drain_lineage(record_slot, nonce)?;
             let safe_restored = restore_to_boundary_successor(&lineage, nonce)?;
             let restored_generation = safe_restored.generation_value();
-            record_slot.replace_state(Some(safe_restored));
+            record_slot.replace_state_with_generation(Some(safe_restored), restored_generation)?;
             let journal = record_slot
                 .journal_mut(nonce)
                 .ok_or(PackageServiceError::RecordMissing)?;
@@ -622,6 +600,9 @@ impl PackageServiceModel {
     }
 
     /// Advances a drain at or after its deadline without inventing retirement.
+    ///
+    /// # Errors
+    /// Returns transition or generation failures without a partial drain resolution.
     pub fn expire_drain(
         &mut self,
         nonce: &Nonce,
@@ -666,14 +647,13 @@ impl PackageServiceModel {
                 .journal_record(nonce)
                 .and_then(OperationJournalRecord::state_generation)
                 .map(next_generation_value)
-                .transpose()?;
-            record_slot.replace_state(None);
+                .transpose()?
+                .ok_or(PackageServiceError::OccupancyCorruption)?;
+            record_slot.replace_state_with_generation(None, generation)?;
             let journal = record_slot
                 .journal_mut(nonce)
                 .ok_or(PackageServiceError::RecordMissing)?;
-            if let Some(generation) = generation {
-                journal.set_state_generation(generation);
-            }
+            journal.set_state_generation(generation);
             journal.take_drain_lineage();
             journal.take_staged_commit_plan();
             journal.terminal_failure(JournalStatus::Expired, now);
@@ -681,7 +661,7 @@ impl PackageServiceModel {
         }
         let safe_restored = restore_to_boundary_successor(&lineage, nonce)?;
         let restored_generation = safe_restored.generation_value();
-        record_slot.replace_state(Some(safe_restored));
+        record_slot.replace_state_with_generation(Some(safe_restored), restored_generation)?;
         let journal = record_slot
             .journal_mut(nonce)
             .ok_or(PackageServiceError::RecordMissing)?;
@@ -693,6 +673,9 @@ impl PackageServiceModel {
     }
 
     /// Makes an authority-expired admission explicitly terminal or recoverable.
+    ///
+    /// # Errors
+    /// Returns record-state failures when the record cannot expire yet.
     pub fn expire_unresolved(&mut self, nonce: &Nonce, now: Timestamp) -> PackageServiceResult<()> {
         let context = self.context_for(nonce)?;
         if now < context.expiry() {
@@ -713,6 +696,9 @@ impl PackageServiceModel {
     }
 
     /// Replays a retained receipt or distinguishes collection from loss.
+    ///
+    /// # Errors
+    /// Returns replay failures for missing records or mismatched context digests.
     pub fn replay(
         &self,
         nonce: &Nonce,
@@ -748,6 +734,9 @@ impl PackageServiceModel {
     }
 
     /// Performs one bounded collection pass; unresolved records are never eligible.
+    ///
+    /// # Errors
+    /// Returns quota and occupancy failures atomically before collecting records.
     pub fn collect(&mut self, now: Timestamp, batch_limit: u64) -> PackageServiceResult<u64> {
         let (occupied_records, occupied_bytes, tombstones) = self.occupancy.values();
         let mut actual_records = 0u64;
@@ -788,7 +777,7 @@ impl PackageServiceModel {
             return Err(PackageServiceError::QuotaExhausted);
         }
 
-        let mut collected = 0u64;
+        let mut collected_records = OccupiedRecords::ZERO;
         for (slot, nonce) in selected {
             let slot_record = self
                 .slots
@@ -797,162 +786,35 @@ impl PackageServiceModel {
             let tombstone = slot_record
                 .remove_journal(&nonce)
                 .ok_or(PackageServiceError::OccupancyCorruption)?;
-            self.occupancy.remove_record(1024);
-            self.occupancy.add_tombstone();
+            self.occupancy.remove_record(1024)?;
+            self.occupancy.add_tombstone()?;
             self.tombstones.insert(nonce, tombstone);
             self.nonce_locations.remove(&nonce);
-            collected = collected
+            collected_records = collected_records
                 .checked_add(1)
                 .ok_or(PackageServiceError::GenerationOverflow)?;
         }
-        Ok(collected)
+        Ok(collected_records.value())
     }
-}
-
-fn validate_context_artifact(
-    context: &OperationContext,
-    artifact: &ValidatedArtifact,
-) -> PackageServiceResult<()> {
-    if context.artifact() != artifact.artifact() || context.manifest() != artifact.manifest() {
-        return Err(PackageServiceError::BindingMismatch);
-    }
-    Ok(())
-}
-
-pub(crate) fn commit_plan_digest(
-    context: &OperationContext,
-    content_root: &Blake3Digest,
-    provenance: &ProvenanceDigest,
-) -> PlanDigest {
-    let artifact_identity = context.artifact();
-    let manifest = context.manifest();
-    let mut writer = DigestWriter::new();
-    writer.u64(u64::from(artifact_identity.format_version()));
-    writer.u64(artifact_identity.size_bytes());
-    writer.digest(artifact_identity.sha256());
-    writer.digest(artifact_identity.blake3());
-    writer.u64(u64::from(manifest.format_version()));
-    writer.bytes(manifest.package_name().as_str().as_bytes());
-    writer.bytes(manifest.package_version().as_str().as_bytes());
-    writer.digest(manifest.manifest_digest());
-    writer.digest(content_root);
-    writer.digest(provenance);
-    writer.tag(context.operation().tag());
-    writer.finish("astrid.package.commit-plan.v1")
-}
-
-fn new_installed_state(
-    context: &OperationContext,
-    authority_digest: crate::digest::AuthorityDecisionDigest,
-    artifact: &ValidatedArtifact,
-    lifecycle: LifecycleState,
-    generation: NonZeroU64,
-) -> PackageServiceResult<CanonicalInstalledState> {
-    CanonicalInstalledState::new(InstalledStateSpec {
-        owner: context.target_owner(),
-        package_object: context.package_object(),
-        artifact: *context.artifact(),
-        content_root: *artifact.content_root(),
-        manifest: context.manifest().clone(),
-        authority_digest,
-        provenance: provenance_digest(artifact.provenance()),
-        lifecycle_state: lifecycle,
-        lifecycle_plan: *context.plan_digest(),
-        generation,
-        completing_nonce: context.nonce(),
-    })
-}
-
-fn first_state_generation() -> PackageServiceResult<NonZeroU64> {
-    NonZeroU64::new(1).ok_or(PackageServiceError::InvalidValue("package generation"))
-}
-
-fn recorded_drain_deadline(
-    state: &CanonicalInstalledState,
-    nonce: &Nonce,
-) -> PackageServiceResult<Option<Timestamp>> {
-    let LifecycleState::Draining {
-        deadline,
-        nonce: drain_nonce,
-        live_leases: _,
-        destination: _,
-    } = state.lifecycle_state()
-    else {
-        return Ok(None);
-    };
-    if drain_nonce.as_bytes() != nonce.as_bytes() {
-        return Err(PackageServiceError::LifecycleTransition);
-    }
-    Ok(Some(*deadline))
-}
-
-fn require_open_drain(
-    state: &CanonicalInstalledState,
-    nonce: &Nonce,
-    now: Timestamp,
-) -> PackageServiceResult<()> {
-    let Some(deadline) = recorded_drain_deadline(state, nonce)? else {
-        return Err(PackageServiceError::LifecycleTransition);
-    };
-    if now >= deadline {
-        return Err(PackageServiceError::AuthorityExpired);
-    }
-    Ok(())
-}
-
-fn require_zero_drain(
-    state: &CanonicalInstalledState,
-    nonce: Nonce,
-    destination: DrainDestination,
-) -> PackageServiceResult<()> {
-    let LifecycleState::Draining {
-        destination: observed_destination,
-        nonce: observed_nonce,
-        live_leases,
-        deadline: _,
-    } = state.lifecycle_state()
-    else {
-        return Err(PackageServiceError::LifecycleTransition);
-    };
-    if observed_destination != &destination
-        || observed_nonce.as_bytes() != nonce.as_bytes()
-        || live_leases != &0
-    {
-        return Err(PackageServiceError::DrainBlocked);
-    }
-    Ok(())
-}
-
-fn restore_prior_content_to_successor(
-    state: CanonicalInstalledState,
-    completing_nonce: Nonce,
-    generation: NonZeroU64,
-) -> PackageServiceResult<CanonicalInstalledState> {
-    let plan = *state.lifecycle_plan();
-    let mut restored = state;
-    restored.set_lifecycle_result(LifecycleState::Inactive, plan, generation, completing_nonce);
-    Ok(restored)
-}
-
-fn next_generation(state: &CanonicalInstalledState) -> PackageServiceResult<NonZeroU64> {
-    next_generation_value(state.generation_value())
-}
-
-fn next_generation_value(generation: NonZeroU64) -> PackageServiceResult<NonZeroU64> {
-    let value = generation
-        .get()
-        .checked_add(1)
-        .ok_or(PackageServiceError::GenerationOverflow)?;
-    NonZeroU64::try_from(value).map_err(PackageServiceError::from)
-}
-
-fn provenance_digest(value: &ProvenanceEvidence) -> ProvenanceDigest {
-    let mut writer = DigestWriter::new();
-    writer.tag(value.class().tag());
-    writer.digest(value.evidence());
-    writer.bytes(value.bounded_evidence().as_bytes());
-    writer.finish("astrid.package.provenance.v1")
 }
 
 #[cfg(test)]
 mod tests;
+
+#[derive(Clone, Copy)]
+struct OccupiedRecords(u64);
+
+impl OccupiedRecords {
+    const ZERO: Self = Self(0);
+
+    const fn checked_add(self, records: u64) -> Option<Self> {
+        match self.0.checked_add(records) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    const fn value(self) -> u64 {
+        self.0
+    }
+}
