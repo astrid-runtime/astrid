@@ -64,6 +64,80 @@ fn recv_wire(cap_slot: u16) -> [u8; MAX_BUFFER_BYTES] {
     wire
 }
 
+#[test]
+fn revoked_during_parked_commit_gap_does_not_project_stale_transfer() {
+    let _guard = test_lock();
+    reset();
+    let creator = domain(0);
+    let peer = domain(1);
+    prepare_domain(creator);
+    prepare_domain(peer);
+    let endpoint = endpoint_create(creator).unwrap();
+    assert!(bind_peer(creator, peer).is_ok());
+
+    let creator_root = capability(creator, creator.slot()).unwrap();
+    assert!(install_transfer_message(
+        creator,
+        creator,
+        endpoint,
+        Some(creator_root)
+    ));
+    assert!(
+        complete_parked_recv(creator, &recv_wire(1), 0, |_| true).is_ok(),
+        "creator anchor keeps the transferred endpoint live through the race"
+    );
+
+    let transferred_base = observation(peer);
+    let source_slot = TestCapSlot::try_new(0).unwrap();
+    let transferred_capability = capability(peer, source_slot).unwrap();
+    assert!(install_transfer_message(
+        peer,
+        peer,
+        endpoint,
+        Some(transferred_capability)
+    ));
+
+    let destination_slot = TestCapSlot::try_new(1).unwrap();
+    let wire = recv_wire(1);
+    assert!(
+        complete_parked_recv(peer, &wire, 0, |_| {
+            assert_eq!(cap_revoke(creator, creator.slot()), Ok(3));
+            true
+        })
+        .is_ok()
+    );
+
+    assert!(capability(peer, source_slot).is_none());
+    assert!(capability(peer, destination_slot).is_none());
+    let direct = observation(peer).0;
+    assert!(
+        !direct.rows().any(|relation| matches!(
+            relation.key(),
+            RelationKey::Holds { capability, .. } if capability.slot().index() <= 1
+        )),
+        "no peer Holds row may survive the authoritative revoke"
+    );
+    assert!(
+        !direct.rows().any(|relation| matches!(
+            relation.key(),
+            RelationKey::Derives { child, .. } if child.slot().index() <= 1
+        )),
+        "no peer Derives row may survive the authoritative revoke"
+    );
+    let mut objects = 0;
+    let mut holds = 0;
+    let mut derives = 0;
+    for relation in direct.rows() {
+        match relation.key() {
+            RelationKey::Object { .. } => objects += 1,
+            RelationKey::Holds { .. } => holds += 1,
+            RelationKey::Derives { .. } => derives += 1,
+        }
+    }
+    assert_eq!((objects, holds, derives), (2, 0, 0));
+    require_fold_from(peer, transferred_base.0, transferred_base.1);
+}
+
 fn require_fold(evidence: ProjectionEvidence) {
     assert!(evidence.fold_matches);
     assert_eq!(evidence.epoch, evidence.fold_epoch);

@@ -444,7 +444,12 @@ pub fn complete_parked_recv(
             && let Some(slot) = transferred_slot
         {
             let mut state = IPC.lock();
-            project_transferred_capability(&mut state, domain, parent, slot);
+            if state.capabilities[domain.slot().index()]
+                .get(domain, slot)
+                .is_some_and(|installed| installed == parent)
+            {
+                project_transferred_capability(&mut state, domain, parent, slot);
+            }
         }
     } else {
         rollback_recv(domain, endpoint_id, message, transfer, transferred_slot);
@@ -649,7 +654,12 @@ fn recv(frame: &mut TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcErr
         && let Some(slot) = transferred_slot
     {
         let mut state = IPC.lock();
-        project_transferred_capability(&mut state, domain, parent, slot);
+        if state.capabilities[domain.slot().index()]
+            .get(domain, slot)
+            .is_some_and(|installed| installed == parent)
+        {
+            project_transferred_capability(&mut state, domain, parent, slot);
+        }
     }
     Ok((0, abi::MAX_BUFFER_BYTES as u64))
 }
