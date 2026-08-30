@@ -115,30 +115,33 @@ where
 impl StagedStart<ManifestIdentity, ContentId> {
     #[cfg(not(test))]
     pub(crate) fn observe(&self) -> Result<DomainState, StageError> {
-        let (state, scenario) = match manager::staged_state(self.handle) {
-            Ok(observed) => observed,
-            Err(_) => {
-                // staged_state classifies only live domains; this second
-                // snapshot preserves exact release-state evidence instead.
-                let manager = manager::MANAGER.lock();
-                let Some(domain) = manager
-                    .slots
-                    .get(self.handle.id().0 as usize)
-                    .and_then(Option::as_ref)
-                    .filter(|domain| domain.generation == self.handle.generation().0)
-                else {
-                    return Err(StageError::Domain(manager::PrepareError::Bind(
-                        BindError::NotInstalled,
-                    )));
-                };
-                (domain.state, domain.scenario)
-            },
-        };
-        let observed = self.validate_observation_state(state, scenario)?;
+        let observed = manager::staged_state(self.handle).map_err(StageError::Domain)?;
         let manifest_identity = admission::confirm_start(self.handle, self.component_id)
-            .map_err(StageError::Admission)?;
+            .map_err(|error| self.classify_admission_error(error, observed))?;
         self.validate_identity(manifest_identity, self.component_id)?;
-        Ok(observed)
+        let Some((state, scenario)) = observed else {
+            return Err(StageError::Admission(
+                admission::AdmissionError::StaleDomain,
+            ));
+        };
+        self.validate_observation_state(state, scenario)
+    }
+
+    #[cfg(not(test))]
+    fn classify_admission_error(
+        &self,
+        error: admission::AdmissionError,
+        observed: Option<(DomainState, Scenario)>,
+    ) -> StageError {
+        match (error, observed) {
+            (admission::AdmissionError::StaleDomain, Some((DomainState::Releasing, _))) => {
+                StageError::Releasing
+            },
+            (admission::AdmissionError::StaleDomain, Some((DomainState::ReleaseFailed, _))) => {
+                StageError::ReleaseFailed
+            },
+            (error, _) => StageError::Admission(error),
+        }
     }
 }
 

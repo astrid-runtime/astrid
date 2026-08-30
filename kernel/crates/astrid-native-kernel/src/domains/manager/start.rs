@@ -53,12 +53,17 @@ impl StartContext {
 #[cfg(not(test))]
 pub(in crate::domains) fn staged_state(
     handle: DomainHandle,
-) -> Result<(DomainState, Scenario), PrepareError> {
+) -> Result<Option<(DomainState, Scenario)>, PrepareError> {
     let manager = MANAGER.lock();
-    let Some(domain) = manager.valid_domain(handle) else {
-        return Err(PrepareError::Bind(BindError::NotInstalled));
+    let Some(domain) = manager
+        .slots
+        .get(handle.id().0 as usize)
+        .and_then(Option::as_ref)
+        .filter(|domain| domain.generation == handle.generation().0)
+    else {
+        return Ok(None);
     };
-    Ok((domain.state, domain.scenario))
+    Ok(Some((domain.state, domain.scenario)))
 }
 
 #[cfg(not(test))]
