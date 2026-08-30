@@ -1,5 +1,9 @@
 //! Same-lock translation of authoritative IPC/domain state into relations.
 
+#[cfg(test)]
+use super::delta::DeltaCursor;
+#[cfg(test)]
+use super::projection::Snapshot;
 use super::projection::{ProjectionStore, ReaderLease};
 use super::types::{
     CapabilityGeneration, CapabilityInstance, CapabilitySlot, ObjectKind, ObjectRef, ObjectToken,
@@ -147,17 +151,28 @@ pub(crate) fn domain_released(
     store.retire_reader(domain)
 }
 
-pub(crate) fn projection_evidence(
-    store: &mut ProjectionStore,
+#[cfg(test)]
+pub(crate) fn projection_observation(
+    store: &ProjectionStore,
     domain: DomainToken,
+) -> Result<(Snapshot, DeltaCursor), ProjectionError> {
+    let lease = reader(store, domain)?;
+    Ok((store.snapshot(lease)?, store.delta_cursor(lease)?))
+}
+
+#[cfg(test)]
+pub(crate) fn projection_fold_evidence(
+    store: &ProjectionStore,
+    domain: DomainToken,
+    base: Snapshot,
+    cursor: DeltaCursor,
 ) -> Result<ProjectionEvidence, ProjectionError> {
     let lease = reader(store, domain)?;
-    let (base, replayed) = store.current_fold(lease)?;
-    let replayed = replayed.ok_or(ProjectionError::Denied)?;
+    let replayed = store.fold(lease, base, cursor)?;
     let direct = store.snapshot(lease)?;
     Ok(ProjectionEvidence {
-        epoch: base.epoch(),
-        rows: base.len(),
+        epoch: direct.epoch(),
+        rows: direct.len(),
         fold_epoch: replayed.epoch(),
         fold_rows: replayed.len(),
         fold_matches: replayed == direct,

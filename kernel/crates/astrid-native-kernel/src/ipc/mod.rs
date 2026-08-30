@@ -16,14 +16,14 @@ use spin::Mutex;
 
 use crate::platform::{self, TrapFrame};
 
-#[cfg(test)]
-use crate::relations::ProjectionEvidence;
-#[cfg(test)]
-use crate::relations::projection_evidence;
 use crate::relations::{
     CapabilityFacts, capability_installed, capability_removed, domain_registered, domain_released,
     endpoint_created, endpoint_reclaimed,
 };
+#[cfg(test)]
+use crate::relations::{DeltaCursor, ProjectionEvidence, Snapshot};
+#[cfg(test)]
+use crate::relations::{projection_fold_evidence, projection_observation};
 pub use abi::MAX_BUFFER_BYTES;
 pub use capability::DomainToken;
 use capability::{CapSlot, CapTable, Capability, DerivationLink, Rights};
@@ -144,10 +144,12 @@ fn merge_wakes(target: &mut [Option<DomainToken>; 2], wakes: [Option<DomainToken
     }
 }
 
-fn project<T>(result: Result<T, crate::relations::ProjectionError>, operation: &'static str) -> T {
-    match result {
-        Ok(value) => value,
-        Err(error) => panic!("relations projection {operation} failed: {error:?}"),
+fn project<T>(result: Result<T, crate::relations::ProjectionError>, operation: &'static str) {
+    if let Err(error) = result {
+        #[cfg(not(test))]
+        crate::serial::ev_relations_projection_failed(operation, error.code());
+        #[cfg(test)]
+        let _ = (operation, error);
     }
 }
 
@@ -883,9 +885,19 @@ fn domain_has_capability(domain: DomainToken) -> bool {
 }
 
 #[cfg(test)]
-pub(crate) fn relations_projection_evidence(domain: DomainToken) -> Option<ProjectionEvidence> {
-    let mut state = IPC.lock();
-    projection_evidence(&mut state.relations, domain).ok()
+pub(crate) fn relations_projection_observation(
+    domain: DomainToken,
+) -> Option<(Snapshot, DeltaCursor)> {
+    projection_observation(&IPC.lock().relations, domain).ok()
+}
+
+#[cfg(test)]
+pub(crate) fn relations_projection_fold(
+    domain: DomainToken,
+    base: Snapshot,
+    cursor: DeltaCursor,
+) -> Option<ProjectionEvidence> {
+    projection_fold_evidence(&IPC.lock().relations, domain, base, cursor).ok()
 }
 
 fn reclaim_object(state: &mut IpcState, id: EndpointId) -> bool {

@@ -383,6 +383,12 @@ pub fn ev_relations_projection(
     ));
 }
 
+pub fn ev_relations_projection_failed(operation: &'static str, error: u8) {
+    emit(format_args!(
+        "\"ev\":\"relations.projection.failed\",\"op\":\"{operation}\",\"error\":{error}"
+    ));
+}
+
 pub fn ev_ipc_park(id: u64, generation: u64) {
     emit(format_args!(
         "\"ev\":\"ipc.park\",\"id\":{id},\"generation\":{generation}"

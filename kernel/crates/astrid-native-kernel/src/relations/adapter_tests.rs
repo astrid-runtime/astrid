@@ -6,8 +6,9 @@ use crate::ipc::test_support::{
 };
 use crate::ipc::{
     DomainToken, MAX_BUFFER_BYTES, bind_peer, complete_parked_recv, prepare_domain,
-    relations_projection_evidence, teardown_domain,
+    relations_projection_fold, relations_projection_observation, teardown_domain,
 };
+use crate::relations::{DeltaCursor, Snapshot};
 
 fn domain(slot: u64) -> DomainToken {
     DomainToken::new(slot, 1).unwrap()
@@ -27,6 +28,14 @@ fn require_fold(evidence: ProjectionEvidence) {
     assert_eq!(evidence.rows, evidence.fold_rows);
 }
 
+fn observation(domain: DomainToken) -> (Snapshot, DeltaCursor) {
+    relations_projection_observation(domain).unwrap()
+}
+
+fn require_fold_from(domain: DomainToken, base: Snapshot, cursor: DeltaCursor) {
+    require_fold(relations_projection_fold(domain, base, cursor).unwrap());
+}
+
 #[test]
 fn real_ipc_create_transfer_revoke_and_teardown_fold_to_snapshots() {
     let _guard = test_lock();
@@ -35,28 +44,15 @@ fn real_ipc_create_transfer_revoke_and_teardown_fold_to_snapshots() {
     let peer = domain(1);
     prepare_domain(creator);
     prepare_domain(peer);
-    require_fold(relations_projection_evidence(creator).unwrap());
-    assert_eq!(
-        relations_projection_evidence(creator).unwrap(),
-        ProjectionEvidence {
-            epoch: 1,
-            rows: 1,
-            fold_epoch: 1,
-            fold_rows: 1,
-            fold_matches: true,
-        }
-    );
-
+    let created_base = observation(creator);
     let endpoint = endpoint_create(creator).unwrap();
-    let created = relations_projection_evidence(creator).unwrap();
-    assert_eq!((created.epoch, created.rows), (3, 3));
-    require_fold(created);
+    require_fold_from(creator, created_base.0, created_base.1);
 
+    let bound_base = observation(peer);
     assert!(bind_peer(creator, peer).is_ok());
-    let bound = relations_projection_evidence(peer).unwrap();
-    assert_eq!((bound.epoch, bound.rows), (4, 4));
-    require_fold(bound);
+    require_fold_from(peer, bound_base.0, bound_base.1);
 
+    let transferred_base = observation(peer);
     let root = capability(creator, creator.slot()).unwrap();
     assert!(install_transfer_message(
         peer,
@@ -66,20 +62,16 @@ fn real_ipc_create_transfer_revoke_and_teardown_fold_to_snapshots() {
     ));
     let wire = recv_wire(1);
     assert!(complete_parked_recv(peer, &wire, 0, |_| true).is_ok());
-    let transferred = relations_projection_evidence(peer).unwrap();
-    assert_eq!((transferred.epoch, transferred.rows), (6, 6));
-    require_fold(transferred);
+    require_fold_from(peer, transferred_base.0, transferred_base.1);
 
+    let revoked_base = observation(peer);
     assert_eq!(cap_revoke(creator, creator.slot()), Ok(2));
-    let revoked = relations_projection_evidence(peer).unwrap();
-    assert_eq!((revoked.epoch, revoked.rows), (8, 4));
-    require_fold(revoked);
+    require_fold_from(peer, revoked_base.0, revoked_base.1);
 
+    let surviving_base = observation(peer);
     teardown_domain(creator);
-    let surviving = relations_projection_evidence(peer).unwrap();
-    assert_eq!((surviving.epoch, surviving.rows), (8, 4));
-    require_fold(surviving);
+    require_fold_from(peer, surviving_base.0, surviving_base.1);
 
     teardown_domain(peer);
-    assert!(relations_projection_evidence(peer).is_none());
+    assert!(relations_projection_observation(peer).is_none());
 }
