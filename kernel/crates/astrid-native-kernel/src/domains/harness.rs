@@ -531,6 +531,33 @@ fn ipc_cancel_guest_done() -> ! {
     start_domain(stop, Scenario::RunningStop);
 }
 
+fn completed_stop_is_current_guarded(stop: DomainHandle) -> bool {
+    let current = &manager::CURRENT;
+    let expected = authenticated_component_id();
+
+    current.active.store(true, Ordering::SeqCst);
+    let active_observed =
+        stop::observe_completed_stop(stop, expected, Scenario::RunningStop).is_none();
+    current.active.store(false, Ordering::SeqCst);
+
+    current.root.store(1, Ordering::SeqCst);
+    let root_observed =
+        stop::observe_completed_stop(stop, expected, Scenario::RunningStop).is_none();
+    current.root.store(0, Ordering::SeqCst);
+
+    current.root_flags.store(1, Ordering::SeqCst);
+    let flags_observed =
+        stop::observe_completed_stop(stop, expected, Scenario::RunningStop).is_none();
+    current.root_flags.store(0, Ordering::SeqCst);
+
+    active_observed
+        && root_observed
+        && flags_observed
+        && !current.active.load(Ordering::SeqCst)
+        && current.root.load(Ordering::SeqCst) == 0
+        && current.root_flags.load(Ordering::SeqCst) == 0
+}
+
 fn running_stop_done() -> ! {
     let stop = handle(&IPC_SERVER_HANDLE);
     let passed = manager::is_stale(stop)
@@ -539,6 +566,7 @@ fn running_stop_done() -> ! {
     let stale = DomainHandle::new(stop.id(), DomainGeneration(stop.generation().0 + 1));
     let foreign_slot = DomainHandle::new(DomainId((stop.id().0 + 1) % 2), stop.generation());
     let substituted_component = ContentId::from_payload(b"running-stop-substitution");
+    let suppression_ok = completed_stop_is_current_guarded(stop);
     let exact =
         stop::observe_completed_stop(stop, authenticated_component_id(), Scenario::RunningStop);
     let repeated =
@@ -564,7 +592,7 @@ fn running_stop_done() -> ! {
                 && observation.scenario() == Scenario::RunningStop
                 && observation.outcome() == Outcome::Cancelled
         });
-    if !observation_ok || !exact_ok {
+    if !suppression_ok || !observation_ok || !exact_ok {
         fail("running_stop_observation_rejected");
     }
     RUNNING_STOP_OK.store(report(RUNNING_STOP_GATE, passed), Ordering::SeqCst);
