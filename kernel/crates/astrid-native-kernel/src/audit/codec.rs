@@ -10,7 +10,7 @@ use core::num::NonZeroU64;
 use super::types::{
     AUDIT_MAX_PAYLOAD, AuditCapabilityInstance, AuditCheckpoint, AuditClass, AuditError,
     AuditEvent, AuditObject, AuditObjectKind, AuditRights, AuditSubject, BootSessionId,
-    CheckpointAuthKey, DenialContext,
+    CheckpointAuthContext, DenialContext,
 };
 use super::{CODEC_VERSION, root};
 
@@ -33,9 +33,9 @@ const FRAME_OVERHEAD_BYTES: usize = 4   // total length
 pub(crate) const MAX_FRAME_BYTES: usize = FRAME_OVERHEAD_BYTES + AUDIT_MAX_PAYLOAD + root::ROOT_LEN;
 
 /// Fixed checkpoint wire size: envelope, codec version, boot, seq, root,
-/// relay generation, kernel tag.
+/// relay generation, authority id, kernel tag.
 pub(crate) const CHECKPOINT_WIRE_BYTES: usize =
-    4 + 2 + 16 + 8 + root::ROOT_LEN + 8 + root::ROOT_LEN;
+    4 + 2 + 16 + 8 + root::ROOT_LEN + 8 + 8 + root::ROOT_LEN;
 
 /// One canonical frame: the decoded form of the frozen wire representation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -277,10 +277,10 @@ fn decode_capability_instance(
 /// kernel tag is the authentication; decoding always re-verifies it.
 pub(crate) fn encode_checkpoint<'out>(
     checkpoint: &AuditCheckpoint,
-    auth_key: CheckpointAuthKey,
+    context: CheckpointAuthContext,
     out: &'out mut [u8; CHECKPOINT_WIRE_BYTES],
 ) -> Result<&'out [u8], AuditError> {
-    if !checkpoint.verify_tag(auth_key) {
+    if checkpoint.authority_id() != context.authority_id() || !checkpoint.verify_tag(context) {
         return Err(AuditError::CheckpointMismatch);
     }
     let mut writer = Writer::new(out);
@@ -290,6 +290,7 @@ pub(crate) fn encode_checkpoint<'out>(
     writer.u64(checkpoint.seq())?;
     writer.raw(&checkpoint.root())?;
     writer.u64(checkpoint.relay_generation())?;
+    writer.u64(checkpoint.authority_id())?;
     writer.raw(&checkpoint.tag())?;
     let end = writer.finish()?;
     Ok(&out[..end])
@@ -297,7 +298,7 @@ pub(crate) fn encode_checkpoint<'out>(
 
 pub(crate) fn decode_checkpoint(
     bytes: &[u8],
-    auth_key: CheckpointAuthKey,
+    context: CheckpointAuthContext,
 ) -> Result<AuditCheckpoint, AuditError> {
     let mut reader = Reader::new(bytes)?;
     let total = reader.u32()? as usize;
@@ -315,6 +316,10 @@ pub(crate) fn decode_checkpoint(
     let mut root_bytes = [0; root::ROOT_LEN];
     reader.fill(&mut root_bytes)?;
     let relay_generation = reader.u64()?;
+    let authority_id = reader.u64()?;
+    if authority_id != context.authority_id() {
+        return Err(AuditError::CheckpointMismatch);
+    }
     let mut tag = [0; root::ROOT_LEN];
     reader.fill(&mut tag)?;
     if reader.remaining() != 0 {
@@ -323,7 +328,7 @@ pub(crate) fn decode_checkpoint(
     if relay_generation == 0 {
         return Err(AuditError::MalformedFrame);
     }
-    let expected = AuditCheckpoint::seal(boot, seq, root_bytes, relay_generation, auth_key)?;
+    let expected = AuditCheckpoint::seal(boot, seq, root_bytes, relay_generation, context)?;
     if expected.codec_version() != codec_version || expected.tag() != tag {
         return Err(AuditError::CheckpointMismatch);
     }

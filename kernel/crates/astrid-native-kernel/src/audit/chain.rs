@@ -5,11 +5,11 @@
 use super::codec::{Frame, MAX_FRAME_BYTES};
 use super::relay::AuditRelay;
 use super::root;
-use super::types::{AuditCheckpoint, AuditError, AuditEvent, BootSessionId, CheckpointAuthKey};
+use super::types::{AuditAuthority, AuditCheckpoint, AuditError, AuditEvent, BootSessionId};
 
 pub(crate) struct AuditChain {
     boot: BootSessionId,
-    auth_key: CheckpointAuthKey,
+    authority: AuditAuthority,
     seq: u64,
     root: [u8; root::ROOT_LEN],
     relay: AuditRelay,
@@ -17,10 +17,11 @@ pub(crate) struct AuditChain {
 
 impl AuditChain {
     /// Starts a new boot/session chain at the domain-separated genesis root.
-    pub fn genesis(boot: BootSessionId, auth_key: CheckpointAuthKey) -> Self {
+    pub fn genesis(boot: BootSessionId) -> Self {
+        let authority = AuditAuthority::mint(boot);
         Self {
             boot,
-            auth_key,
+            authority,
             seq: 0,
             root: root::genesis(boot),
             relay: AuditRelay::new(boot),
@@ -32,10 +33,13 @@ impl AuditChain {
     /// relay generation; the relay generation is preserved rather than reset.
     pub(crate) fn restore(
         checkpoint: AuditCheckpoint,
-        auth_key: CheckpointAuthKey,
+        authority: AuditAuthority,
     ) -> Result<Self, AuditError> {
+        if checkpoint.boot() != authority.boot() {
+            return Err(AuditError::CheckpointMismatch);
+        }
         if checkpoint.codec_version() != super::CODEC_VERSION
-            || !checkpoint.verify_tag(auth_key)
+            || !checkpoint.verify_tag(authority.context())
             || checkpoint.relay_generation() == 0
         {
             return Err(AuditError::CheckpointMismatch);
@@ -48,7 +52,7 @@ impl AuditChain {
             AuditRelay::restore(checkpoint.boot(), checkpoint.relay_generation(), next_seq)?;
         Ok(Self {
             boot: checkpoint.boot(),
-            auth_key,
+            authority,
             seq: checkpoint.seq(),
             root: checkpoint.root(),
             relay,
@@ -57,6 +61,10 @@ impl AuditChain {
 
     pub const fn boot(&self) -> BootSessionId {
         self.boot
+    }
+
+    pub(crate) const fn authority(&self) -> AuditAuthority {
+        self.authority
     }
 
     pub const fn seq(&self) -> u64 {
@@ -73,6 +81,27 @@ impl AuditChain {
 
     pub fn relay_mut(&mut self) -> &mut AuditRelay {
         &mut self.relay
+    }
+
+    /// Acknowledges through the chain's kernel-owned authentication context;
+    /// callers can present only the verifier's successful-fold receipt.
+    pub fn ack(
+        &mut self,
+        seq: u64,
+        folded_root: [u8; root::ROOT_LEN],
+        receipt_tag: [u8; root::ROOT_LEN],
+    ) -> Result<(), AuditError> {
+        self.relay
+            .ack(seq, folded_root, receipt_tag, self.authority.context())
+    }
+
+    /// Generation-bumps the relay and seals recovery with the same
+    /// kernel-owned authority.
+    pub fn resync(&mut self) -> Result<AuditCheckpoint, AuditError> {
+        let current_root = self.root;
+        let current_seq = self.seq;
+        self.relay
+            .resync(current_root, current_seq, self.authority.context())
     }
 
     /// Appends one mandatory event as one atomic transition. All fallible
@@ -112,6 +141,7 @@ impl AuditChain {
 
     /// Kernel-authenticated checkpoint bound to the exact current state.
     pub fn checkpoint(&self) -> AuditCheckpoint {
-        self.relay.checkpoint(self.root, self.seq, self.auth_key)
+        self.relay
+            .checkpoint(self.root, self.seq, self.authority.context())
     }
 }

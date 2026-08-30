@@ -15,13 +15,16 @@ use blake3::Hasher;
 /// Frozen canonical frame-codec version this verifier understands.
 pub const CODEC_VERSION: u16 = 1;
 /// Fixed wire size of the canonical checkpoint form.
-pub const CHECKPOINT_WIRE_BYTES: usize = 4 + 2 + 16 + 8 + 32 + 8 + 32;
+pub const CHECKPOINT_WIRE_BYTES: usize = 4 + 2 + 16 + 8 + 32 + 8 + 8 + 32;
+/// Fixed size of a kernel-minted opaque verifier handoff.
+pub const AUTHORITY_HANDOFF_BYTES: usize = 96;
 
 const ROOT_ALGORITHM_ID: &[u8] = b"BLAKE3-256";
 const ROOT_DOMAIN_TAG: &[u8] = b"astrid.native-kernel.audit-root.v1";
 const GENESIS_DOMAIN_TAG: &[u8] = b"astrid.native-kernel.audit-genesis.v1";
 const CHECKPOINT_DOMAIN_TAG: &[u8] = b"astrid.native-kernel.audit-checkpoint.v1";
 const ACK_DOMAIN_TAG: &[u8] = b"astrid.native-kernel.audit-ack.v1";
+const VERIFIER_HANDOFF_DOMAIN_TAG: &[u8] = b"astrid.native-kernel.audit-verifier-handoff.v1";
 
 /// Hard decode failure of one input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,35 +91,72 @@ pub struct CheckpointView {
     pub root: [u8; 32],
     pub codec_version: u16,
     pub relay_generation: u64,
+    pub authority_id: u64,
     pub tag: [u8; 32],
 }
 
-/// Kernel-only checkpoint authentication key. A checkpoint is trusted only
-/// when this key authenticates its complete state binding.
+/// Opaque kernel-minted verifier context. It can enter this crate only
+/// through a sealed handoff; a caller cannot construct a raw authority key.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct CheckpointKey([u8; 32]);
+pub struct AuthContext {
+    authority_id: u64,
+    boot: [u8; 16],
+    verification_key: [u8; 32],
+}
 
-impl CheckpointKey {
-    pub const fn new(bytes: [u8; 32]) -> Option<Self> {
-        let mut index = 0;
-        let mut any_nonzero = false;
-        while index < bytes.len() {
-            if bytes[index] != 0 {
-                any_nonzero = true;
-            }
-            index += 1;
+impl AuthContext {
+    /// Accepts only the sealed 96-byte capability minted by the kernel.
+    pub fn from_handoff(bytes: &[u8; AUTHORITY_HANDOFF_BYTES]) -> Result<Self, VerifyFailure> {
+        if bytes[..8] != *b"ASAUDCTX" {
+            return Err(VerifyFailure::Malformed);
         }
-        if any_nonzero { Some(Self(bytes)) } else { None }
+        let authority_id = u64::from_le_bytes(
+            bytes[8..16]
+                .try_into()
+                .ok()
+                .ok_or(VerifyFailure::Malformed)?,
+        );
+        let boot = bytes[16..32]
+            .try_into()
+            .ok()
+            .filter(|boot: &[u8; 16]| boot.iter().any(|byte| *byte != 0))
+            .ok_or(VerifyFailure::Malformed)?;
+        let verification_key = bytes[32..64]
+            .try_into()
+            .ok()
+            .filter(|key: &[u8; 32]| key.iter().any(|byte| *byte != 0))
+            .ok_or(VerifyFailure::Malformed)?;
+        let tag: [u8; 32] = bytes[64..]
+            .try_into()
+            .map_err(|_| VerifyFailure::Malformed)?;
+        if verifier_handoff_tag(boot, authority_id, &verification_key) != tag {
+            return Err(VerifyFailure::Malformed);
+        }
+        Ok(Self {
+            authority_id,
+            boot,
+            verification_key,
+        })
     }
 
-    pub const fn bytes(self) -> [u8; 32] {
-        self.0
+    #[cfg(test)]
+    fn mint(boot: [u8; 16], seed: u64) -> Self {
+        let mut hasher = Hasher::new();
+        hasher.update(b"native-audit-verifier-test-authority");
+        hasher.update(&boot);
+        hasher.update(&seed.to_le_bytes());
+        let digest: [u8; 32] = hasher.finalize().into();
+        Self {
+            authority_id: seed | 1,
+            boot,
+            verification_key: digest,
+        }
     }
 }
 
-impl core::fmt::Debug for CheckpointKey {
+impl core::fmt::Debug for AuthContext {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("CheckpointKey(REDACTED)")
+        f.write_str("AuthContext(REDACTED)")
     }
 }
 
@@ -145,25 +185,49 @@ fn checkpoint_tag(
     seq: u64,
     root: [u8; 32],
     relay_generation: u64,
-    auth_key: CheckpointKey,
+    context: &AuthContext,
 ) -> [u8; 32] {
-    let mut hasher = Hasher::new_keyed(&auth_key.bytes());
+    let mut hasher = Hasher::new_keyed(&context.verification_key);
     hasher.update(CHECKPOINT_DOMAIN_TAG);
     hasher.update(&CODEC_VERSION.to_le_bytes());
     hasher.update(&boot);
     hasher.update(&seq.to_le_bytes());
     hasher.update(&root);
     hasher.update(&relay_generation.to_le_bytes());
+    hasher.update(&context.authority_id.to_le_bytes());
     hasher.finalize().into()
 }
 
-fn ack_tag(seq: u64, source_root: [u8; 32], frame: &[u8], auth_key: CheckpointKey) -> [u8; 32] {
-    let mut hasher = Hasher::new_keyed(&auth_key.bytes());
+fn ack_tag(
+    boot: [u8; 16],
+    relay_generation: u64,
+    seq: u64,
+    source_root: [u8; 32],
+    frame: &[u8],
+    context: &AuthContext,
+) -> [u8; 32] {
+    let mut hasher = Hasher::new_keyed(&context.verification_key);
     hasher.update(ACK_DOMAIN_TAG);
     hasher.update(&CODEC_VERSION.to_le_bytes());
+    hasher.update(&context.authority_id.to_le_bytes());
+    hasher.update(&boot);
+    hasher.update(&relay_generation.to_le_bytes());
     hasher.update(&seq.to_le_bytes());
     hasher.update(&source_root);
     hasher.update(frame);
+    hasher.finalize().into()
+}
+
+fn verifier_handoff_tag(
+    boot: [u8; 16],
+    authority_id: u64,
+    verification_key: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Hasher::new_keyed(verification_key);
+    hasher.update(VERIFIER_HANDOFF_DOMAIN_TAG);
+    hasher.update(&CODEC_VERSION.to_le_bytes());
+    hasher.update(&boot);
+    hasher.update(&authority_id.to_le_bytes());
     hasher.finalize().into()
 }
 
@@ -171,7 +235,7 @@ fn ack_tag(seq: u64, source_root: [u8; 32], frame: &[u8], auth_key: CheckpointKe
 /// alone is never trusted; only this kernel-sealed binding is.
 pub fn verify_checkpoint(
     wire: &[u8],
-    auth_key: CheckpointKey,
+    context: &AuthContext,
 ) -> Result<CheckpointView, VerifyFailure> {
     if wire.len() != CHECKPOINT_WIRE_BYTES {
         return Err(VerifyFailure::Malformed);
@@ -200,6 +264,7 @@ pub fn verify_checkpoint(
         .ok()
         .ok_or(VerifyFailure::Malformed)?;
     let relay_generation = reader.u64().ok_or(VerifyFailure::Malformed)?;
+    let authority_id = reader.u64().ok_or(VerifyFailure::Malformed)?;
     let tag = reader
         .bytes(32)
         .ok_or(VerifyFailure::Malformed)?
@@ -215,12 +280,13 @@ pub fn verify_checkpoint(
         root,
         codec_version,
         relay_generation,
+        authority_id,
         tag,
     };
-    if relay_generation == 0 {
+    if relay_generation == 0 || authority_id != context.authority_id || boot != context.boot {
         return Err(VerifyFailure::Malformed);
     }
-    if checkpoint_tag(boot, seq, root, relay_generation, auth_key) != tag {
+    if checkpoint_tag(boot, seq, root, relay_generation, context) != tag {
         return Err(VerifyFailure::CheckpointMismatch);
     }
     Ok(view)
@@ -232,26 +298,29 @@ pub struct AuditVerifier {
     boot: [u8; 16],
     next_seq: u64,
     root: [u8; 32],
-    auth_key: CheckpointKey,
+    context: AuthContext,
     relay_generation: u64,
 }
 
 impl AuditVerifier {
-    pub fn genesis(boot: [u8; 16], auth_key: CheckpointKey) -> Result<Self, VerifyFailure> {
+    pub fn genesis(boot: [u8; 16], context: AuthContext) -> Result<Self, VerifyFailure> {
         if boot.iter().all(|byte| *byte == 0) {
+            return Err(VerifyFailure::Malformed);
+        }
+        if boot != context.boot {
             return Err(VerifyFailure::Malformed);
         }
         Ok(Self {
             boot,
             next_seq: 1,
             root: genesis_root(boot),
-            auth_key,
+            context,
             relay_generation: 1,
         })
     }
 
-    pub fn from_checkpoint(wire: &[u8], auth_key: CheckpointKey) -> Result<Self, VerifyFailure> {
-        let checkpoint = verify_checkpoint(wire, auth_key)?;
+    pub fn from_checkpoint(wire: &[u8], context: AuthContext) -> Result<Self, VerifyFailure> {
+        let checkpoint = verify_checkpoint(wire, &context)?;
         let next_seq = checkpoint
             .seq
             .checked_add(1)
@@ -260,7 +329,7 @@ impl AuditVerifier {
             boot: checkpoint.boot,
             root: checkpoint.root,
             next_seq,
-            auth_key,
+            context,
             relay_generation: checkpoint.relay_generation,
         })
     }
@@ -302,7 +371,14 @@ impl AuditVerifier {
         let receipt = FoldReceipt {
             seq: view.seq,
             folded_root: claimed_root,
-            ack_tag: ack_tag(view.seq, claimed_root, frame, self.auth_key),
+            ack_tag: ack_tag(
+                self.boot,
+                self.relay_generation,
+                view.seq,
+                claimed_root,
+                frame,
+                &self.context,
+            ),
         };
         self.root = next_root;
         self.next_seq = next_seq;
@@ -313,7 +389,7 @@ impl AuditVerifier {
     /// source root must match exactly before any acknowledgement range is
     /// trusted across a restart.
     pub fn accept_checkpoint(&self, wire: &[u8]) -> Result<(), VerifyFailure> {
-        let checkpoint = verify_checkpoint(wire, self.auth_key)?;
+        let checkpoint = verify_checkpoint(wire, &self.context)?;
         let next_seq = checkpoint
             .seq
             .checked_add(1)
@@ -331,7 +407,7 @@ impl AuditVerifier {
     /// Accepts exactly one generation-bumped checkpoint after the same state
     /// has been folded. This is the verifier side of explicit resync.
     pub fn accept_resync_checkpoint(&mut self, wire: &[u8]) -> Result<(), VerifyFailure> {
-        let checkpoint = verify_checkpoint(wire, self.auth_key)?;
+        let checkpoint = verify_checkpoint(wire, &self.context)?;
         let next_seq = checkpoint
             .seq
             .checked_add(1)

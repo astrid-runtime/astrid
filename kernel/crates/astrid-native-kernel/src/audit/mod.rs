@@ -30,7 +30,7 @@ pub(crate) use relay::{AUDIT_RELAY_SLOTS, AuditRelay, RelayRecord};
 #[allow(unused_imports)]
 pub(crate) use types::{
     AUDIT_CAP_OBJECT_POOL, AUDIT_CAP_SLOTS_PER_DOMAIN, AUDIT_DOMAIN_SLOTS, AUDIT_ENDPOINT_POOL,
-    AUDIT_MAX_PAYLOAD, AuditCapabilityInstance, AuditCheckpoint, AuditClass, AuditError,
-    AuditEvent, AuditObject, AuditObjectKind, AuditRights, AuditSubject, BootSessionId,
-    CheckpointAuthKey, DenialContext, DenialReason, MAX_TERMINAL_RECORDS_PER_BATCH,
+    AUDIT_MAX_PAYLOAD, AuditAuthority, AuditCapabilityInstance, AuditCheckpoint, AuditClass,
+    AuditError, AuditEvent, AuditObject, AuditObjectKind, AuditRights, AuditSubject, BootSessionId,
+    DenialContext, DenialReason, MAX_TERMINAL_RECORDS_PER_BATCH,
 };

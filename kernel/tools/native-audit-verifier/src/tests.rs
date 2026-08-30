@@ -5,8 +5,8 @@ use blake3::Hasher;
 
 const BOOT: [u8; 16] = [7; 16];
 
-fn key() -> CheckpointKey {
-    CheckpointKey::new([0x5a; 32]).unwrap()
+fn context() -> AuthContext {
+    AuthContext::mint(BOOT, 1)
 }
 
 #[derive(Clone, Copy)]
@@ -84,7 +84,7 @@ fn expected_root(previous: [u8; 32], seq: u64, frame: &[u8]) -> [u8; 32] {
 
 #[test]
 fn genesis_fold_requires_boot_previous_root_and_source_root() {
-    let mut verifier = AuditVerifier::genesis(BOOT, key()).unwrap();
+    let mut verifier = AuditVerifier::genesis(BOOT, context()).unwrap();
     let genesis = verifier.root();
 
     let frame1 = body(BOOT, 1, 1, Object::None, 0, &[], Some(genesis));
@@ -107,7 +107,7 @@ fn genesis_fold_requires_boot_previous_root_and_source_root() {
 
 #[test]
 fn tamper_without_a_valid_claimed_root_is_invalid() {
-    let mut verifier = AuditVerifier::genesis(BOOT, key()).unwrap();
+    let mut verifier = AuditVerifier::genesis(BOOT, context()).unwrap();
     let frame = body(BOOT, 1, 1, Object::None, 0, &[], Some(verifier.root()));
     assert_eq!(
         verifier.fold(&frame, [0; 32]),
@@ -117,7 +117,7 @@ fn tamper_without_a_valid_claimed_root_is_invalid() {
 
 #[test]
 fn cross_boot_and_missing_previous_root_are_invalid() {
-    let mut verifier = AuditVerifier::genesis(BOOT, key()).unwrap();
+    let mut verifier = AuditVerifier::genesis(BOOT, context()).unwrap();
     let foreign = body([8; 16], 1, 1, Object::None, 0, &[], Some(verifier.root()));
     let foreign_root = expected_root(verifier.root(), 1, &foreign);
     assert_eq!(
@@ -135,7 +135,7 @@ fn cross_boot_and_missing_previous_root_are_invalid() {
 
 #[test]
 fn explicitly_mismatched_previous_root_is_invalid() {
-    let mut verifier = AuditVerifier::genesis(BOOT, key()).unwrap();
+    let mut verifier = AuditVerifier::genesis(BOOT, context()).unwrap();
     let wrong_previous = [0xAA; 32];
     let frame = body(BOOT, 1, 1, Object::None, 0, &[], Some(wrong_previous));
     let claimed = expected_root(wrong_previous, 1, &frame);
@@ -148,7 +148,7 @@ fn explicitly_mismatched_previous_root_is_invalid() {
 
 #[test]
 fn fold_overflow_is_fail_closed_without_state_change() {
-    let checkpoint_root = AuditVerifier::genesis(BOOT, key()).unwrap().root();
+    let checkpoint_root = AuditVerifier::genesis(BOOT, context()).unwrap().root();
     let checkpoint = checkpoint_wire(
         BOOT,
         u64::MAX - 1,
@@ -156,7 +156,7 @@ fn fold_overflow_is_fail_closed_without_state_change() {
         1,
         sealed_tag(BOOT, u64::MAX - 1, checkpoint_root, 1),
     );
-    let mut verifier = AuditVerifier::from_checkpoint(&checkpoint, key()).unwrap();
+    let mut verifier = AuditVerifier::from_checkpoint(&checkpoint, context()).unwrap();
     let frame = body(
         BOOT,
         u64::MAX,
@@ -181,7 +181,7 @@ fn fold_overflow_is_fail_closed_without_state_change() {
 
 #[test]
 fn gap_is_incomplete_and_duplicate_is_invalid() {
-    let mut verifier = AuditVerifier::genesis(BOOT, key()).unwrap();
+    let mut verifier = AuditVerifier::genesis(BOOT, context()).unwrap();
     let genesis = verifier.root();
     let frame1 = body(BOOT, 1, 1, Object::None, 0, &[], Some(genesis));
     let root1 = expected_root(genesis, 1, &frame1);
@@ -200,7 +200,7 @@ fn gap_is_incomplete_and_duplicate_is_invalid() {
 
 #[test]
 fn denial_must_not_disclose_a_foreign_identity() {
-    let mut verifier = AuditVerifier::genesis(BOOT, key()).unwrap();
+    let mut verifier = AuditVerifier::genesis(BOOT, context()).unwrap();
     let mut payload = vec![4, 0];
     payload.extend_from_slice(&[9; 8]);
     let denial = body(
@@ -215,7 +215,7 @@ fn denial_must_not_disclose_a_foreign_identity() {
     let denial_root = expected_root(verifier.root(), 1, &denial);
     assert!(verifier.fold(&denial, denial_root).is_ok());
 
-    let mut verifier = AuditVerifier::genesis(BOOT, key()).unwrap();
+    let mut verifier = AuditVerifier::genesis(BOOT, context()).unwrap();
     let disclosing = body(
         BOOT,
         1,
@@ -234,7 +234,7 @@ fn denial_must_not_disclose_a_foreign_identity() {
 #[test]
 fn non_canonical_inputs_fail_closed() {
     let valid = body(BOOT, 1, 1, Object::None, 0, &[], Some(genesis_root(BOOT)));
-    let mut verifier = AuditVerifier::genesis(BOOT, key()).unwrap();
+    let mut verifier = AuditVerifier::genesis(BOOT, context()).unwrap();
 
     assert!(matches!(
         verifier.fold(&valid[..valid.len() - 1], [0; 32]),
@@ -351,7 +351,7 @@ fn non_canonical_inputs_fail_closed() {
         ),
     ];
     for case in cases {
-        let mut verifier = AuditVerifier::genesis(BOOT, key()).unwrap();
+        let mut verifier = AuditVerifier::genesis(BOOT, context()).unwrap();
         assert!(matches!(
             verifier.fold(&case, [0; 32]),
             Err(FoldFailure::Invalid(InvalidReason::Malformed))
@@ -379,6 +379,7 @@ fn checkpoint_wire(
     body.extend_from_slice(&seq.to_le_bytes());
     body.extend_from_slice(&root);
     body.extend_from_slice(&relay_generation.to_le_bytes());
+    body.extend_from_slice(&context().authority_id.to_le_bytes());
     body.extend_from_slice(&tag);
     let mut wire = Vec::new();
     wire.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -387,7 +388,7 @@ fn checkpoint_wire(
 }
 
 fn sealed_tag(boot: [u8; 16], seq: u64, root: [u8; 32], relay_generation: u64) -> [u8; 32] {
-    checkpoint_tag(boot, seq, root, relay_generation, key())
+    checkpoint_tag(boot, seq, root, relay_generation, &context())
 }
 
 fn unkeyed_tag(boot: [u8; 16], seq: u64, root: [u8; 32], relay_generation: u64) -> [u8; 32] {
@@ -398,14 +399,15 @@ fn unkeyed_tag(boot: [u8; 16], seq: u64, root: [u8; 32], relay_generation: u64) 
     hasher.update(&seq.to_le_bytes());
     hasher.update(&root);
     hasher.update(&relay_generation.to_le_bytes());
+    hasher.update(&context().authority_id.to_le_bytes());
     hasher.finalize().into()
 }
 
 #[test]
 fn checkpoint_restart_and_mandatory_source_root_match() {
-    let genesis = AuditVerifier::genesis(BOOT, key()).unwrap().root();
+    let genesis = AuditVerifier::genesis(BOOT, context()).unwrap().root();
     let start = checkpoint_wire(BOOT, 0, genesis, 1, sealed_tag(BOOT, 0, genesis, 1));
-    let mut verifier = AuditVerifier::from_checkpoint(&start, key()).unwrap();
+    let mut verifier = AuditVerifier::from_checkpoint(&start, context()).unwrap();
     assert_eq!(verifier.root(), genesis);
 
     let frame = body(BOOT, 1, 1, Object::None, 0, &[], Some(genesis));
@@ -419,7 +421,7 @@ fn checkpoint_restart_and_mandatory_source_root_match() {
     let last = tampered.len() - 1;
     tampered[last] ^= 1;
     assert!(matches!(
-        AuditVerifier::from_checkpoint(&tampered, key()),
+        AuditVerifier::from_checkpoint(&tampered, context()),
         Err(VerifyFailure::CheckpointMismatch)
     ));
 
@@ -434,10 +436,10 @@ fn checkpoint_restart_and_mandatory_source_root_match() {
 
 #[test]
 fn host_minted_unkeyed_checkpoint_is_rejected() {
-    let genesis = AuditVerifier::genesis(BOOT, key()).unwrap().root();
+    let genesis = AuditVerifier::genesis(BOOT, context()).unwrap().root();
     let mut forged = checkpoint_wire(BOOT, 0, genesis, 1, unkeyed_tag(BOOT, 0, genesis, 1));
     assert_eq!(
-        verify_checkpoint(&forged, key()),
+        verify_checkpoint(&forged, &context()),
         Err(VerifyFailure::CheckpointMismatch)
     );
 
@@ -445,14 +447,14 @@ fn host_minted_unkeyed_checkpoint_is_rejected() {
     let last = trusted.len() - 32;
     let (_, tail) = forged.split_at_mut(last);
     tail.copy_from_slice(&trusted[last..]);
-    assert!(AuditVerifier::from_checkpoint(&forged, key()).is_ok());
+    assert!(AuditVerifier::from_checkpoint(&forged, context()).is_ok());
 }
 
 #[test]
 fn stale_and_future_relay_generations_fail_closed() {
-    let genesis = AuditVerifier::genesis(BOOT, key()).unwrap().root();
+    let genesis = AuditVerifier::genesis(BOOT, context()).unwrap().root();
     let start = checkpoint_wire(BOOT, 0, genesis, 1, sealed_tag(BOOT, 0, genesis, 1));
-    let mut verifier = AuditVerifier::from_checkpoint(&start, key()).unwrap();
+    let mut verifier = AuditVerifier::from_checkpoint(&start, context()).unwrap();
     let frame = body(BOOT, 1, 1, Object::None, 0, &[], Some(genesis));
     let root1 = expected_root(genesis, 1, &frame);
     verifier.fold(&frame, root1).unwrap();
@@ -473,21 +475,21 @@ fn stale_and_future_relay_generations_fail_closed() {
 
 #[test]
 fn zero_relay_generation_is_invalid_on_the_verifier() {
-    let genesis = AuditVerifier::genesis(BOOT, key()).unwrap().root();
+    let genesis = AuditVerifier::genesis(BOOT, context()).unwrap().root();
     let checkpoint = checkpoint_wire(BOOT, 0, genesis, 0, sealed_tag(BOOT, 0, genesis, 0));
     assert_eq!(
-        verify_checkpoint(&checkpoint, key()),
+        verify_checkpoint(&checkpoint, &context()),
         Err(VerifyFailure::Malformed)
     );
     assert!(matches!(
-        AuditVerifier::from_checkpoint(&checkpoint, key()),
+        AuditVerifier::from_checkpoint(&checkpoint, context()),
         Err(VerifyFailure::Malformed)
     ));
 }
 
 #[test]
 fn max_checkpoint_sequence_is_typed_fail_closed() {
-    let genesis = AuditVerifier::genesis(BOOT, key()).unwrap().root();
+    let genesis = AuditVerifier::genesis(BOOT, context()).unwrap().root();
     let checkpoint = checkpoint_wire(
         BOOT,
         u64::MAX,
@@ -496,7 +498,7 @@ fn max_checkpoint_sequence_is_typed_fail_closed() {
         sealed_tag(BOOT, u64::MAX, genesis, 1),
     );
     assert!(matches!(
-        AuditVerifier::from_checkpoint(&checkpoint, key()),
+        AuditVerifier::from_checkpoint(&checkpoint, context()),
         Err(VerifyFailure::SequenceOverflow)
     ));
 }
@@ -504,7 +506,7 @@ fn max_checkpoint_sequence_is_typed_fail_closed() {
 #[test]
 fn zero_boot_genesis_is_rejected() {
     assert!(matches!(
-        AuditVerifier::genesis([0; 16], key()),
+        AuditVerifier::genesis([0; 16], context()),
         Err(VerifyFailure::Malformed)
     ));
 }

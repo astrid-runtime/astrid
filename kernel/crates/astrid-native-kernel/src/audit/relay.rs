@@ -5,7 +5,8 @@
 use super::codec::MAX_FRAME_BYTES;
 use super::root;
 use super::types::{
-    AuditCheckpoint, AuditError, BootSessionId, CheckpointAuthKey, MAX_TERMINAL_RECORDS_PER_BATCH,
+    AuditCheckpoint, AuditError, BootSessionId, CheckpointAuthContext,
+    MAX_TERMINAL_RECORDS_PER_BATCH,
 };
 
 /// Distinct from the #1758 32-entry relation delta rings and their two
@@ -181,7 +182,7 @@ impl AuditRelay {
         seq: u64,
         folded_root: [u8; root::ROOT_LEN],
         receipt_tag: [u8; root::ROOT_LEN],
-        auth_key: CheckpointAuthKey,
+        context: CheckpointAuthContext,
     ) -> Result<(), AuditError> {
         if self.outstanding == 0 || seq != self.oldest_seq {
             return Err(AuditError::RelayStaleCursor);
@@ -198,10 +199,12 @@ impl AuditRelay {
             return Err(AuditError::RootMismatch);
         }
         if root::ack_tag(
+            self.boot,
+            self.generation,
             slot.record.seq(),
             slot.record.root(),
             slot.record.frame(),
-            &auth_key,
+            &context,
         ) != receipt_tag
         {
             return Err(AuditError::RootMismatch);
@@ -219,7 +222,7 @@ impl AuditRelay {
         &mut self,
         current_root: [u8; root::ROOT_LEN],
         current_seq: u64,
-        auth_key: CheckpointAuthKey,
+        context: CheckpointAuthContext,
     ) -> Result<AuditCheckpoint, AuditError> {
         let next_seq = current_seq
             .checked_add(1)
@@ -233,7 +236,7 @@ impl AuditRelay {
         self.next_seq = next_seq;
         self.oldest_seq = self.next_seq;
         self.credits = 0;
-        Ok(self.checkpoint(current_root, current_seq, auth_key))
+        Ok(self.checkpoint(current_root, current_seq, context))
     }
 
     /// Trusted checkpoint bound to boot/session, exact seq, root, codec
@@ -242,14 +245,14 @@ impl AuditRelay {
         &self,
         current_root: [u8; root::ROOT_LEN],
         current_seq: u64,
-        auth_key: CheckpointAuthKey,
+        context: CheckpointAuthContext,
     ) -> AuditCheckpoint {
         AuditCheckpoint::seal(
             self.boot,
             current_seq,
             current_root,
             self.generation,
-            auth_key,
+            context,
         )
         .expect("current relay generation is nonzero")
     }

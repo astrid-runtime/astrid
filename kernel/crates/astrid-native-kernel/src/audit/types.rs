@@ -3,6 +3,8 @@
 
 use core::num::NonZeroU64;
 
+use blake3::Hasher;
+
 use super::root;
 use crate::ipc::DomainToken;
 
@@ -57,33 +59,98 @@ impl BootSessionId {
     }
 }
 
-/// Kernel-only checkpoint authentication key. This slice intentionally does
-/// not authenticate checkpoints with a public, verifier-recomputable hash:
-/// without this key, a host cannot mint a different verifier-local cache.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct CheckpointAuthKey([u8; 32]);
+const AUTHORITY_ROOT_DOMAIN: &[u8] = b"astrid.native-kernel.audit-authority-root.v1";
+const AUTHORITY_ID_DOMAIN: &[u8] = b"astrid.native-kernel.audit-authority-id.v1";
+const AUTHORITY_KEY_DOMAIN: &[u8] = b"astrid.native-kernel.audit-authority-key.v1";
 
-impl CheckpointAuthKey {
-    pub const fn new(bytes: [u8; 32]) -> Option<Self> {
-        let mut index = 0;
-        let mut any_nonzero = false;
-        while index < bytes.len() {
-            if bytes[index] != 0 {
-                any_nonzero = true;
-            }
-            index += 1;
+/// Opaque kernel-owned authentication context. It is derived inside the
+/// kernel from the live boot identity and cannot be constructed from
+/// caller-selected bytes. Its authority id is part of every checkpoint tag.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CheckpointAuthContext {
+    authority_id: u64,
+    verification_key: [u8; 32],
+}
+
+impl CheckpointAuthContext {
+    fn mint(boot: BootSessionId) -> Self {
+        let mut id_hasher = Hasher::new();
+        id_hasher.update(AUTHORITY_ROOT_DOMAIN);
+        id_hasher.update(&boot.bytes());
+        id_hasher.update(AUTHORITY_ID_DOMAIN);
+        let id_digest: [u8; 32] = id_hasher.finalize().into();
+        let mut authority_id = u64::from_le_bytes(id_digest[..8].try_into().unwrap());
+        if authority_id == 0 {
+            authority_id = 1;
         }
-        if any_nonzero { Some(Self(bytes)) } else { None }
+
+        let mut key_hasher = Hasher::new();
+        key_hasher.update(AUTHORITY_ROOT_DOMAIN);
+        key_hasher.update(&boot.bytes());
+        key_hasher.update(AUTHORITY_KEY_DOMAIN);
+        key_hasher.update(&authority_id.to_le_bytes());
+        let verification_key: [u8; 32] = key_hasher.finalize().into();
+        debug_assert!(verification_key != [0; 32]);
+        Self {
+            authority_id,
+            verification_key,
+        }
     }
 
-    pub const fn bytes(self) -> [u8; 32] {
-        self.0
+    pub(crate) const fn authority_id(self) -> u64 {
+        self.authority_id
+    }
+
+    pub(crate) const fn verification_key(self) -> [u8; 32] {
+        self.verification_key
     }
 }
 
-impl core::fmt::Debug for CheckpointAuthKey {
+impl core::fmt::Debug for CheckpointAuthContext {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("CheckpointAuthKey(REDACTED)")
+        f.write_str("CheckpointAuthContext(REDACTED)")
+    }
+}
+
+/// Kernel-minted authority for one live boot/session. Its verifier handoff is
+/// an opaque sealed capability, not a caller-selectable raw key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AuditAuthority {
+    boot: BootSessionId,
+    context: CheckpointAuthContext,
+}
+
+impl AuditAuthority {
+    pub fn mint(boot: BootSessionId) -> Self {
+        Self {
+            boot,
+            context: CheckpointAuthContext::mint(boot),
+        }
+    }
+
+    pub const fn boot(self) -> BootSessionId {
+        self.boot
+    }
+
+    pub(crate) const fn context(self) -> CheckpointAuthContext {
+        self.context
+    }
+
+    /// Sealed opaque handoff accepted by `native-audit-verifier`. The private
+    /// first-slice layout carries no production lifecycle provisioning claim.
+    pub fn verifier_handoff(self) -> [u8; 96] {
+        let mut handoff = [0; 96];
+        handoff[..8].copy_from_slice(b"ASAUDCTX");
+        handoff[8..16].copy_from_slice(&self.context.authority_id().to_le_bytes());
+        handoff[16..32].copy_from_slice(&self.boot.bytes());
+        handoff[32..64].copy_from_slice(&self.context.verification_key());
+        let tag = root::verifier_handoff_tag(
+            self.boot,
+            self.context.authority_id(),
+            &self.context.verification_key(),
+        );
+        handoff[64..].copy_from_slice(&tag);
+        handoff
     }
 }
 
@@ -534,6 +601,7 @@ pub struct AuditCheckpoint {
     root: [u8; root::ROOT_LEN],
     codec_version: u16,
     relay_generation: u64,
+    authority_id: u64,
     tag: [u8; root::ROOT_LEN],
 }
 
@@ -543,30 +611,34 @@ impl AuditCheckpoint {
         seq: u64,
         root: [u8; root::ROOT_LEN],
         relay_generation: u64,
-        auth_key: CheckpointAuthKey,
+        context: CheckpointAuthContext,
     ) -> Result<Self, AuditError> {
-        if relay_generation == 0 {
+        if relay_generation == 0 || context.authority_id() == 0 {
             return Err(AuditError::MalformedFrame);
         }
         let codec_version = super::CODEC_VERSION;
-        let tag = root::checkpoint_tag(boot, seq, root, relay_generation, auth_key);
+        let tag = root::checkpoint_tag(boot, seq, root, relay_generation, &context);
         Ok(Self {
             boot,
             seq,
             root,
             codec_version,
             relay_generation,
+            authority_id: context.authority_id(),
             tag,
         })
     }
 
-    pub(crate) fn verify_tag(&self, auth_key: CheckpointAuthKey) -> bool {
+    pub(crate) fn verify_tag(&self, context: CheckpointAuthContext) -> bool {
+        if self.authority_id != context.authority_id() {
+            return false;
+        }
         root::checkpoint_tag(
             self.boot,
             self.seq,
             self.root,
             self.relay_generation,
-            auth_key,
+            &context,
         ) == self.tag
     }
 
@@ -588,6 +660,10 @@ impl AuditCheckpoint {
 
     pub const fn relay_generation(self) -> u64 {
         self.relay_generation
+    }
+
+    pub const fn authority_id(self) -> u64 {
+        self.authority_id
     }
 
     pub const fn tag(self) -> [u8; root::ROOT_LEN] {
