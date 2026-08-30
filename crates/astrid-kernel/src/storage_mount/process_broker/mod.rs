@@ -33,6 +33,7 @@ mod cache_tests;
 mod projection_identity;
 #[cfg(any(unix, windows))]
 mod projection_lifecycle;
+mod projection_root_removal;
 #[cfg(all(test, any(unix, windows)))]
 pub(crate) use projection_lifecycle::cached_projection_mount;
 #[cfg(any(unix, windows))]
@@ -54,6 +55,9 @@ pub(crate) use projection_lifecycle::{
     projection_component_mount_ids, projection_leases_are_live, retain_failed_issue_projection,
     retain_locked_projection, retry_failed_projection, rollback_or_retain_failed_launch,
 };
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) use projection_root_removal::fail_next_root_removal_for_test;
+use projection_root_removal::remove_projection_root;
 #[cfg(all(test, any(unix, windows)))]
 mod projection_identity_tests;
 #[cfg(all(test, any(unix, windows)))]
@@ -172,7 +176,7 @@ async fn retain_uncommitted_issue_lease(
     )
     .await
     {
-        if std::fs::remove_dir_all(&mount_root).is_ok() {
+        if remove_projection_root(&mount_root).is_ok() {
             return issue_error;
         }
         return format!("{issue_error}; process mount root cleanup failed");

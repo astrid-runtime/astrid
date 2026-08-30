@@ -17,8 +17,9 @@ use super::{
     platform_process_provider_name, stop_process_provider,
 };
 use crate::storage_mount::lifecycle::cleanup_mapped_lease_resources;
-use crate::storage_mount::lifecycle::complete_cleanup_ledger;
-use crate::storage_mount::lifecycle::force_fence_projection_lease;
+use crate::storage_mount::lifecycle::{complete_cleanup_ledger, force_fence_projection_lease};
+
+use super::projection_root_removal::remove_projection_root;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ParentTokenSlot {
@@ -157,7 +158,7 @@ async fn cleanup_projection(state: &mut ProjectionCleanupState) -> bool {
         tracing::error!("failed to revoke process storage projection leases; retaining resources");
         return false;
     }
-    if let Err(error) = std::fs::remove_dir_all(&state.mount_root) {
+    if let Err(error) = remove_projection_root(&state.mount_root) {
         tracing::error!(%error, "failed to remove process storage projection root");
         return false;
     }
@@ -294,7 +295,7 @@ pub(crate) fn retain_failed_issue_projection(
                 return false;
             };
             cleanup_uncommitted_issue_lease_set(&kernel, &binding, &branch, owner.as_ref()).await
-                && std::fs::remove_dir_all(mount_root).is_ok()
+                && remove_projection_root(&mount_root).is_ok()
         })
     });
     projections.insert(
@@ -370,7 +371,7 @@ pub(crate) async fn cleanup_uncommitted_issue_lease_set(
     let mut listener_checks = tokio::task::JoinSet::new();
     for state in &states {
         let state = Arc::clone(state);
-        listener_checks.spawn(async move { state.wait_listener_closed().await });
+        listener_checks.spawn(async move { state.drain_is_settled_for_projection().await });
     }
     let mut listeners_closed = true;
     while let Some(closed) = listener_checks.join_next().await {
@@ -410,7 +411,7 @@ pub(crate) async fn revoke_projection_leases(
     let mut listener_checks = tokio::task::JoinSet::new();
     for state in &states {
         let state = Arc::clone(state);
-        listener_checks.spawn(async move { state.wait_listener_closed().await });
+        listener_checks.spawn(async move { state.drain_is_settled_for_projection().await });
     }
     let mut listeners_closed = true;
     while let Some(closed) = listener_checks.join_next().await {

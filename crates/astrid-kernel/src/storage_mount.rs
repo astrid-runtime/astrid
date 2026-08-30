@@ -39,6 +39,8 @@ use crate::Kernel;
 mod blocking_worker_gate;
 mod callback_wire;
 mod filesystem;
+#[cfg(test)]
+mod state_test_helpers;
 use callback_wire::{CallbackRequest, CallbackResponse, read_request, response_v2, write_response};
 use filesystem::{PrefixedFilesystem, execute_blocking};
 #[cfg(test)]
@@ -130,6 +132,11 @@ pub(crate) struct StorageMountLeaseState {
     drain_timeouts: std::sync::Mutex<DrainTimeouts>,
     #[cfg(any(unix, windows))]
     drain_failure_tx: watch::Sender<Option<BlockingJobDrain>>,
+    /// Tracks whether any cleanup attempt has sampled this lease's drain.
+    /// The first attempt must observe an already-latched panic; the exact
+    /// retry may then proceed once the listener has closed.
+    #[cfg(any(unix, windows))]
+    drain_failure_attempted: std::sync::atomic::AtomicBool,
     #[cfg(all(test, any(unix, windows)))]
     token_for_test: String,
     /// Set after the listener task has dropped its backend listener handle.
@@ -219,8 +226,9 @@ impl StorageMountLeaseState {
         let mut failure = self.drain_failure_tx.subscribe();
         let mut closed = self.listener_closed_tx.subscribe();
         // A first cleanup must see a fast panic even after the listener closes.
-        // A retry of an already revoked lease is resolving that older outcome.
-        if include_latched_failure && let Some(job_drain) = *failure.borrow() {
+        if let Some(job_drain) = *failure.borrow()
+            && include_latched_failure
+        {
             return ListenerDrainOutcome::Failed(job_drain);
         }
         if *closed.borrow() {
@@ -248,15 +256,15 @@ impl StorageMountLeaseState {
             .map_or(ListenerDrainOutcome::TimedOut, |outcome| outcome)
     }
 
-    #[cfg(test)]
-    fn set_drain_timeouts_for_test(&self, timeout: std::time::Duration) {
-        *self
-            .drain_timeouts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = DrainTimeouts {
-            accepted_task: timeout,
-            listener_shutdown: timeout,
-        };
+    /// A projection member must consume a pre-latched drain failure before any
+    /// resource is removed. Timed-out retained work remains an unresolved blocker.
+    async fn drain_is_settled_for_projection(&self) -> bool {
+        let include_latched_failure = self.begin_drain_attempt();
+        matches!(
+            self.wait_drain_outcome(include_latched_failure).await,
+            ListenerDrainOutcome::Failed(BlockingJobDrain::Completed)
+                | ListenerDrainOutcome::Closed
+        )
     }
 
     fn drain_timeouts(&self) -> DrainTimeouts {
@@ -266,14 +274,16 @@ impl StorageMountLeaseState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_revoked_for_test(&self) -> bool {
-        self.revoked.load(Ordering::Acquire)
+    #[cfg(any(unix, windows))]
+    fn record_drain_failure(&self, outcome: BlockingJobDrain) {
+        self.drain_failure_tx.send_replace(Some(outcome));
     }
 
-    #[cfg(all(test, any(unix, windows)))]
-    pub(crate) fn callback_identity_for_test(&self) -> (std::path::PathBuf, String) {
-        (self.callback_path.clone(), self.token_for_test.clone())
+    #[cfg(any(unix, windows))]
+    fn begin_drain_attempt(&self) -> bool {
+        !self
+            .drain_failure_attempted
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
     }
 
     fn renew(&self) {
@@ -293,14 +303,6 @@ impl StorageMountLeaseState {
         }
         self.renew();
         Some(AdmissionGuard { _guard: guard })
-    }
-
-    #[cfg(all(test, any(unix, windows)))]
-    fn blocking_worker_gate_for_test(&self) -> Option<Arc<BlockingWorkerTestGate>> {
-        self.blocking_worker_test_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
     }
 
     fn public_lease(&self, token: String) -> StorageMountLeaseV1 {
@@ -433,6 +435,8 @@ fn publish_issued_lease(
         }),
         #[cfg(any(unix, windows))]
         drain_failure_tx,
+        #[cfg(any(unix, windows))]
+        drain_failure_attempted: std::sync::atomic::AtomicBool::new(false),
         #[cfg(all(test, any(unix, windows)))]
         blocking_worker_test_gate: std::sync::Mutex::new(None),
         #[cfg(all(test, any(unix, windows)))]
@@ -718,7 +722,7 @@ async fn serve_listener(
     };
     let blocking_drained = blocking_drain == BlockingJobDrain::Completed;
     if !blocking_drained {
-        state.drain_failure_tx.send_replace(Some(blocking_drain));
+        state.record_drain_failure(blocking_drain);
         tracing::warn!(
             ?blocking_drain,
             "storage mount retained filesystem jobs failed to drain"
@@ -867,9 +871,7 @@ async fn execute_operation(
         if let Err(join_error) = result.as_ref()
             && join_error.is_panic()
         {
-            retained_state
-                .drain_failure_tx
-                .send_replace(Some(BlockingJobDrain::JoinFailed));
+            retained_state.record_drain_failure(BlockingJobDrain::JoinFailed);
         }
         if let Ok(Ok(_)) = result.as_ref() {
             if is_mutation {

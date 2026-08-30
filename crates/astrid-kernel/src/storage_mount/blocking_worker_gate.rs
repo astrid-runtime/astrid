@@ -4,7 +4,7 @@ use std::sync::mpsc;
 
 /// Coordinates workers after the blocking closure starts, so revocation tests
 /// prove the job was already executing rather than merely queued.
-pub(super) struct BlockingWorkerTestGate {
+pub(crate) struct BlockingWorkerTestGate {
     entered_tx: mpsc::Sender<()>,
     entered_rx: std::sync::Mutex<mpsc::Receiver<()>>,
     failed_tx: mpsc::Sender<()>,
@@ -27,7 +27,7 @@ impl BlockingWorkerTestGate {
         }
     }
 
-    pub(super) fn wait_entered(&self, worker_count: usize) {
+    pub(crate) fn wait_entered(&self, worker_count: usize) {
         let receiver = self
             .entered_rx
             .lock()
@@ -39,7 +39,7 @@ impl BlockingWorkerTestGate {
         }
     }
 
-    pub(super) fn release_workers(&self) {
+    pub(crate) fn release_workers(&self) {
         let senders = self
             .release_txs
             .lock()
@@ -51,12 +51,12 @@ impl BlockingWorkerTestGate {
         }
     }
 
-    pub(super) fn arm_panic_on_release(&self) {
+    pub(crate) fn arm_panic_on_release(&self) {
         self.panic_on_release
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    pub(super) fn wait_failed(&self, worker_count: usize) {
+    pub(crate) fn wait_failed(&self, worker_count: usize) {
         let receiver = self
             .failed_rx
             .lock()

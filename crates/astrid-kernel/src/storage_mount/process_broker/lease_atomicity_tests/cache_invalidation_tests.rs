@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, atomic::Ordering};
 
+use crate::storage_mount::process_broker::fail_next_root_removal_for_test;
 use astrid_capsule::context::ProcessStorageMountBroker as _;
 use astrid_core::PrincipalId;
 
@@ -12,6 +13,9 @@ use crate::storage_mount::process_broker::{
     invalidate_unhealthy_projection, retain_failed_issue_projection,
 };
 use crate::storage_mount::{MountOwnerScope, issue_lease, revoke_lease};
+
+#[path = "root_retry_tests.rs"]
+mod root_retry_tests;
 
 fn provider_lane_is_ready(test_name: &str) -> bool {
     let binary_available = std::env::current_exe().is_ok_and(|test_binary| {
@@ -699,7 +703,31 @@ async fn failed_issue_cleanup_retains_root_and_retry_authority() {
     for state in &fixture.states {
         crate::storage_mount::clear_cleanup_fault_for_test(state);
     }
-    assert!(super::retry_failed_projection(&projection, &mut projections, &key).await);
+    fail_next_root_removal_for_test(mount_root.clone());
+    assert!(
+        !super::retry_failed_projection(&projection, &mut projections, &key).await,
+        "faulted root removal must fail the partial-issue retry"
+    );
+    assert!(
+        projection
+            .cleanup_failed
+            .load(std::sync::atomic::Ordering::Acquire),
+    );
+    assert!(!fixture.kernel.storage_mounts.contains_key(&branch.mount_id));
+    assert!(
+        !fixture
+            .kernel
+            .storage_mounts
+            .contains_key(&fixture.owner.mount_id)
+    );
+    assert!(
+        mount_root.exists(),
+        "successful lease cleanup plus failed root removal must retain the UUID root"
+    );
+    assert!(
+        super::retry_failed_projection(&projection, &mut projections, &key).await,
+        "the exact retry after the root fault must remove the root"
+    );
     assert!(!fixture.kernel.storage_mounts.contains_key(&branch.mount_id));
     assert!(
         !fixture

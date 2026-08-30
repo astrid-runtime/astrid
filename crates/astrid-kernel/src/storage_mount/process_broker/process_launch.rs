@@ -327,6 +327,9 @@ fn validate_process_provider_binary(candidate: &Path) -> Result<(), String> {
     }
     astrid_core::platform_fs::verify_no_redirects(candidate)
         .map_err(|error| format!("validate coinstalled storage provider path: {error}"))?;
+    #[cfg(windows)]
+    astrid_core::platform_fs::validate_trusted_file(candidate)
+        .map_err(|error| format!("validate coinstalled storage provider executable: {error}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;

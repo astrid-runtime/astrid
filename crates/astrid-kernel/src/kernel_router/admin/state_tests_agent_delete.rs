@@ -22,6 +22,9 @@ use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 #[cfg(any(unix, windows))]
+mod latched_panic;
+
+#[cfg(any(unix, windows))]
 use crate::storage_mount::{
     MountAdmission, MountCleanupStage, MountOwnerScope, arm_issue_admission_gate,
     clear_cleanup_fault_for_test, expire_lease_for_test, inject_cleanup_fault_for_test,

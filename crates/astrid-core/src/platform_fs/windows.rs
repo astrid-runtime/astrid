@@ -20,7 +20,7 @@ mod rename;
 pub(super) use executable::replace_executable_set;
 pub(super) use path::{
     default_astrid_home_root, ensure_private_directory, restrict_private_file,
-    validate_private_file, verify_no_redirects,
+    validate_private_file, validate_trusted_file, verify_no_redirects,
 };
 pub(super) use private_file::{atomic_write_private_file, read_private_file_to_string};
 pub(super) use rename::rename_with_write_through;

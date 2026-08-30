@@ -509,10 +509,9 @@ pub(crate) async fn revoke_from_grant(
 }
 
 async fn force_revoke_lease(kernel: &Kernel, state: &StorageMountLeaseState) -> Result<(), String> {
-    let already_revoked = state.revoked.load(Ordering::Acquire);
     state.revoked.store(true, Ordering::Release);
     let _ = state.shutdown_tx.send(true);
-    await_retained_drain(state, !already_revoked).await?;
+    await_retained_drain(state, true).await?;
     let _mutation_guard = kernel.storage_mount_mutations.lock().await;
     cleanup_mapped_lease(kernel, state).map_err(|error| error.to_string())
 }
@@ -520,8 +519,9 @@ async fn force_revoke_lease(kernel: &Kernel, state: &StorageMountLeaseState) -> 
 /// Wait outside the mutation fence for the listener's typed retained-work outcome.
 async fn await_retained_drain(
     state: &StorageMountLeaseState,
-    include_latched_failure: bool,
+    _caller_requested_latch: bool,
 ) -> Result<(), String> {
+    let include_latched_failure = state.begin_drain_attempt();
     let outcome = state.wait_drain_outcome(include_latched_failure).await;
     match outcome {
         ListenerDrainOutcome::Failed(BlockingJobDrain::JoinFailed) => Err(cleanup_error(
@@ -575,8 +575,7 @@ pub(crate) async fn revoke_all_leases_for_principal(
     let matched = mapped_leases_for_principal(kernel, principal, uid);
     revoke_visible(&matched);
     for state in &matched {
-        let already_revoked = state.revoked.load(Ordering::Acquire);
-        await_retained_drain(state, !already_revoked).await?;
+        await_retained_drain(state, true).await?;
     }
     let _mutation_guard = kernel.storage_mount_mutations.lock().await;
     let mut errors = Vec::new();

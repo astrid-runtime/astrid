@@ -25,6 +25,8 @@ use crate::session_token::SessionToken;
 
 #[path = "tests/authority.rs"]
 mod authority_tests;
+#[path = "tests/trusted_file.rs"]
+mod trusted_file_tests;
 
 static NATIVE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
