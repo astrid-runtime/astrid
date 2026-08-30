@@ -30,6 +30,7 @@ const RESTORE_GATE: &str = "exact_kernel_cr3_restore";
 const IPC_EXCHANGE_GATE: &str = "authenticated_domains_exchange_bounded_capability_message";
 const IPC_FAULT_GATE: &str = "peer_fault_wakes_blocked_recv_with_typed_status";
 const IPC_CANCEL_GATE: &str = "cancel_reclaims_blocked_ipc_exactly_once";
+const RUNNING_STOP_GATE: &str = "running_timer_stop_cancels_and_reclaims_exactly_once";
 
 const PHASE_ENTRY: u64 = 0;
 const PHASE_INVALID_PREPARE: u64 = 1;
@@ -47,6 +48,8 @@ const PHASE_IPC_FAULT_CLIENT_PREPARE: u64 = 16;
 const PHASE_IPC_FAULT_SERVER_RESUMED: u64 = 17;
 const PHASE_IPC_CANCEL_SERVER_PREPARE: u64 = 18;
 const PHASE_IPC_CANCEL_SERVER_DONE: u64 = 20;
+const PHASE_RUNNING_STOP_PREPARE: u64 = 21;
+const PHASE_RUNNING_STOP_DONE: u64 = 23;
 
 static PHASE: AtomicU64 = AtomicU64::new(PHASE_ENTRY);
 static ENTRY_HANDLE: AtomicU64 = AtomicU64::new(0);
@@ -79,6 +82,7 @@ static RESTORE_OK: AtomicBool = AtomicBool::new(false);
 static IPC_EXCHANGE_OK: AtomicBool = AtomicBool::new(false);
 static IPC_FAULT_OK: AtomicBool = AtomicBool::new(false);
 static IPC_CANCEL_OK: AtomicBool = AtomicBool::new(false);
+static RUNNING_STOP_OK: AtomicBool = AtomicBool::new(false);
 
 fn handle(storage: &AtomicU64) -> DomainHandle {
     let bits = storage.load(Ordering::SeqCst);
@@ -144,6 +148,7 @@ pub(crate) fn record_outcome(outcome: Outcome, reclaim_once: bool) {
         | PHASE_IPC_FAULT_SERVER_RESUMED
         | PHASE_IPC_CANCEL_SERVER_PREPARE => Outcome::CleanExit,
         PHASE_IPC_FAULT_CLIENT_PREPARE => Outcome::PageFault,
+        PHASE_RUNNING_STOP_PREPARE => Outcome::Cancelled,
         _ => Outcome::UnexpectedFault,
     };
     if outcome != expected {
@@ -182,6 +187,8 @@ pub(crate) fn scheduler() -> ! {
         },
         PHASE_IPC_CANCEL_SERVER_PREPARE => ipc_cancel_guest_done(),
         PHASE_IPC_CANCEL_SERVER_DONE => finish(),
+        PHASE_RUNNING_STOP_PREPARE => running_stop_done(),
+        PHASE_RUNNING_STOP_DONE => finish(),
         _ => fail("invalid_harness_phase"),
     }
 }
@@ -510,7 +517,23 @@ fn ipc_cancel_guest_done() -> ! {
     if !passed {
         fail("running_guest_ipc_cancel_rejected");
     }
-    set_phase(PHASE_IPC_CANCEL_SERVER_DONE);
+    let (raw, expected) = authenticated();
+    let stop = prepare_domain(&raw, expected, Scenario::RunningStop);
+    store_handle(&IPC_SERVER_HANDLE, stop);
+    set_phase(PHASE_RUNNING_STOP_PREPARE);
+    start_domain(stop, Scenario::RunningStop);
+}
+
+fn running_stop_done() -> ! {
+    let stop = handle(&IPC_SERVER_HANDLE);
+    let passed = manager::is_stale(stop)
+        && manager::outstanding_frames() == 0
+        && manager::kernel_cr3_restored();
+    RUNNING_STOP_OK.store(report(RUNNING_STOP_GATE, passed), Ordering::SeqCst);
+    if !passed {
+        fail("running_timer_stop_not_terminal");
+    }
+    set_phase(PHASE_RUNNING_STOP_DONE);
     scheduler()
 }
 
@@ -518,7 +541,8 @@ fn finish() -> ! {
     let prior = CLEAN_RESTART_OK.load(Ordering::SeqCst)
         && IPC_EXCHANGE_OK.load(Ordering::SeqCst)
         && IPC_FAULT_OK.load(Ordering::SeqCst)
-        && IPC_CANCEL_OK.load(Ordering::SeqCst);
+        && IPC_CANCEL_OK.load(Ordering::SeqCst)
+        && RUNNING_STOP_OK.load(Ordering::SeqCst);
     let pass = report(CLEAN_RESTART_GATE, CLEAN_RESTART_OK.load(Ordering::SeqCst)) && prior;
     serial::ev_domain_harness(pass);
     serial::ev_halt(pass);

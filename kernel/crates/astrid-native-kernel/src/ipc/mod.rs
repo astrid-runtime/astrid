@@ -132,6 +132,7 @@ pub struct TeardownOutcome {
     pub queued_messages: usize,
     pub waiters: [Option<DomainToken>; 2],
     pub peer_failures: [Option<DomainToken>; 2],
+    pub relation_released: bool,
 }
 
 impl TeardownOutcome {
@@ -141,6 +142,7 @@ impl TeardownOutcome {
         queued_messages: 0,
         waiters: [None; 2],
         peer_failures: [None; 2],
+        relation_released: true,
     };
 }
 
@@ -853,10 +855,9 @@ pub fn teardown_domain(domain: DomainToken) -> TeardownOutcome {
             );
         }
     }
-    project(
-        domain_released(&mut state.relations, domain),
-        "domain_release",
-    );
+    let relation_release = domain_released(&mut state.relations, domain);
+    project(relation_release, "domain_release");
+    outcome.relation_released = relation_release.is_ok();
     outcome
 }
 

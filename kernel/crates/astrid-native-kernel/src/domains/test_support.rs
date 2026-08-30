@@ -20,6 +20,7 @@ pub(crate) fn install_blocked(handle: DomainHandle) -> bool {
         quota_ticks: 1,
         space: None,
         ipc_enabled: true,
+        stop: super::stop::DomainStop::inactive(),
     });
     true
 }
