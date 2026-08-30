@@ -1,7 +1,7 @@
 //! Fixed endpoint objects, one-deep queues, and blocked-receiver state.
 
 use super::abi::MAX_PAYLOAD_BYTES;
-use super::capability::{Capability, DomainToken};
+use super::capability::{CapTable, Capability, DomainToken};
 
 const ENDPOINT_MEMBERS: usize = 2;
 
@@ -270,4 +270,28 @@ impl Endpoint {
     pub(super) fn clear_queue(&mut self, index: usize) -> bool {
         self.queues.get_mut(index).map(Option::take).is_some()
     }
+}
+
+pub(super) fn reclaim_object(object: &mut Option<Endpoint>) -> bool {
+    let Some(endpoint) = object.as_mut() else {
+        return false;
+    };
+    if endpoint.generation().next().is_none() {
+        return false;
+    }
+    *object = None;
+    true
+}
+
+pub(super) fn endpoint_is_unused(
+    capabilities: &[CapTable; super::capability::DOMAIN_SLOTS],
+    id: super::EndpointId,
+) -> bool {
+    !capabilities.iter().any(|table| {
+        (0..super::abi::CAP_SLOTS_PER_DOMAIN).any(|index| {
+            table
+                .capability_at(index)
+                .is_some_and(|capability| capability.endpoint == id)
+        })
+    })
 }

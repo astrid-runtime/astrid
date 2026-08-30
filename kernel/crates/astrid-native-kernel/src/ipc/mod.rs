@@ -28,7 +28,7 @@ pub use abi::MAX_BUFFER_BYTES;
 pub use capability::DomainToken;
 use capability::{CapSlot, CapTable, Capability, DerivationLink, Rights};
 pub use copy::finish_copy;
-use endpoint::{Endpoint, Message, SendOutcome};
+use endpoint::{Endpoint, Message, SendOutcome, endpoint_is_unused, reclaim_object};
 use error::IpcError;
 
 const _: () = assert!(abi::MAX_BUFFER_BYTES == 96);
@@ -737,11 +737,11 @@ fn cap_revoke(frame: &TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcE
     removed_count += revoked_messages;
     let mut wakes = [None; 2];
     unbind_members_without_capabilities(&mut state, &mut wakes);
-    if endpoint_is_unused(&state, removed.endpoint) {
+    if endpoint_is_unused(&state.capabilities, removed.endpoint) {
         let generation = state.objects[removed.endpoint.index()]
             .as_ref()
             .map(Endpoint::generation);
-        if reclaim_object(&mut state, removed.endpoint)
+        if reclaim_object(&mut state.objects[removed.endpoint.index()])
             && let Some(generation) = generation
         {
             project(
@@ -848,9 +848,9 @@ pub fn teardown_domain(domain: DomainToken) -> TeardownOutcome {
     }
     for id in object_ids.into_iter().flatten() {
         let generation = state.objects[id.index()].as_ref().map(Endpoint::generation);
-        if endpoint_is_unused(&state, id)
+        if endpoint_is_unused(&state.capabilities, id)
             && let Some(generation) = generation
-            && reclaim_object(&mut state, id)
+            && reclaim_object(&mut state.objects[id.index()])
         {
             outcome.endpoints += 1;
             project(
@@ -898,28 +898,6 @@ pub(crate) fn relations_projection_fold(
     cursor: DeltaCursor,
 ) -> Option<ProjectionEvidence> {
     projection_fold_evidence(&IPC.lock().relations, domain, base, cursor).ok()
-}
-
-fn reclaim_object(state: &mut IpcState, id: EndpointId) -> bool {
-    let Some(object) = state.objects[id.index()].as_mut() else {
-        return false;
-    };
-    let Some(next) = object.generation().next() else {
-        return false;
-    };
-    *object = Endpoint::new(next);
-    state.objects[id.index()] = None;
-    true
-}
-
-fn endpoint_is_unused(state: &IpcState, id: EndpointId) -> bool {
-    !state.capabilities.iter().any(|table| {
-        (0..abi::CAP_SLOTS_PER_DOMAIN).any(|index| {
-            table
-                .capability_at(index)
-                .is_some_and(|capability| capability.endpoint == id)
-        })
-    })
 }
 
 fn endpoint_pair(
