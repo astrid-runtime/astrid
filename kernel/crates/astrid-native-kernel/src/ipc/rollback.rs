@@ -1,7 +1,7 @@
 //! Rollback of a received IPC transfer after a failed user-copy commit.
 
 use super::IpcState;
-use super::capability::{CapSlot, Capability, DomainToken};
+use super::capability::{CapSlot, Capability, DomainToken, Rights};
 use super::endpoint::Message;
 
 pub(super) fn rollback_recv(
@@ -47,6 +47,7 @@ pub(super) fn queued_transfer_authority_valid(
             };
             parent.endpoint == capability.endpoint
                 && parent.generation == capability.generation
+                && parent.rights.contains(Rights::GRANT)
                 && parent.rights.contains(capability.rights)
         },
         None => state.capabilities[sender.slot().index()]

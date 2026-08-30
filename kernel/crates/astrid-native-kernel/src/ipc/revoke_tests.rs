@@ -69,6 +69,114 @@ fn derived_transfer(parent: Capability, owner: DomainToken, slot: CapSlot) -> Ca
 }
 
 #[test]
+fn rollback_rejects_replaced_parent_without_grant() {
+    let _guard = test_lock();
+    reset();
+    let source = domain(0);
+    let recipient = domain(1);
+    prepare_domain(source);
+    prepare_domain(recipient);
+
+    let endpoint = endpoint_create(source).unwrap();
+    assert!(bind_peer(source, recipient).is_ok());
+    let source_recv = find(source, Rights::RECV).unwrap();
+    let recipient_root_slot = find(recipient, Rights::GRANT).unwrap();
+    let recipient_root = capability(recipient, recipient_root_slot).unwrap();
+    assert!(install_transfer_message(
+        source,
+        recipient,
+        endpoint,
+        Some(recipient_root)
+    ));
+    assert!(
+        super::complete_parked_recv(
+            source,
+            &recv_wire(recipient, 1),
+            u64::from(source_recv.get()),
+            |_| true
+        )
+        .is_ok()
+    );
+    let source_parent_slot = CapSlot::try_new(1).unwrap();
+    let source_parent = capability(source, source_parent_slot).unwrap();
+    assert!(source_parent.rights.contains(Rights::GRANT));
+
+    let recipient_base = super::relations_projection_observation(recipient).unwrap();
+    let mut send_wire = abi::MessageBuffer::zeroed();
+    send_wire.set_message(7, abi::FLAG_TRANSFER, 4, [1u8; abi::MAX_PAYLOAD_BYTES]);
+    let mut send_wire = send_wire.into_wire(source);
+    send_wire[16..32].fill(0);
+    send_wire[10..12].copy_from_slice(&Rights::SEND.bits().to_le_bytes());
+    crate::platform::set_user_memory_for_test(send_wire);
+    let mut frame = TrapFrame::zeroed();
+    frame.rdi = u64::from(source_parent_slot.get());
+    frame.rsi = 0;
+    frame.rdx = MAX_BUFFER_BYTES as u64;
+    assert_eq!(
+        super::send(&frame, source),
+        Ok((0, MAX_BUFFER_BYTES as u64))
+    );
+
+    let recipient_recv = find(recipient, Rights::RECV).unwrap();
+    assert!(
+        super::complete_parked_recv(
+            recipient,
+            &recv_wire(source, 2),
+            u64::from(recipient_recv.get()),
+            |_| {
+                assert_eq!(revoke(source, source_parent_slot), Ok(2));
+                let mut replacement_wire = abi::MessageBuffer::zeroed();
+                replacement_wire.set_message(
+                    8,
+                    abi::FLAG_TRANSFER,
+                    4,
+                    [2u8; abi::MAX_PAYLOAD_BYTES],
+                );
+                let mut replacement_wire = replacement_wire.into_wire(recipient);
+                replacement_wire[16..32].fill(0);
+                replacement_wire[10..12].copy_from_slice(&Rights::SEND.bits().to_le_bytes());
+                crate::platform::set_user_memory_for_test(replacement_wire);
+                let mut replacement_frame = TrapFrame::zeroed();
+                replacement_frame.rdi = u64::from(recipient_root_slot.get());
+                replacement_frame.rsi = 0;
+                replacement_frame.rdx = MAX_BUFFER_BYTES as u64;
+                assert_eq!(
+                    super::send(&replacement_frame, recipient),
+                    Ok((0, MAX_BUFFER_BYTES as u64))
+                );
+                assert!(
+                    super::complete_parked_recv(
+                        source,
+                        &recv_wire(recipient, 1),
+                        u64::from(source_recv.get()),
+                        |_| true
+                    )
+                    .is_ok()
+                );
+                let replacement = capability(source, source_parent_slot).unwrap();
+                assert_eq!(replacement.rights, Rights::SEND);
+                assert!(!replacement.rights.contains(Rights::GRANT));
+                assert_eq!(
+                    replacement.parent,
+                    Some(DerivationLink {
+                        domain: recipient,
+                        slot: recipient_root_slot
+                    })
+                );
+                false
+            }
+        )
+        .is_err()
+    );
+
+    assert_eq!(queued_for(recipient), 0);
+    assert!(capability(recipient, CapSlot::try_new(2).unwrap()).is_none());
+    let evidence =
+        super::relations_projection_fold(recipient, recipient_base.0, recipient_base.1).unwrap();
+    assert!(evidence.fold_matches);
+}
+
+#[test]
 fn cap_revoke_removes_grandchild_and_drains_derived_queue() {
     let _guard = test_lock();
     reset();
