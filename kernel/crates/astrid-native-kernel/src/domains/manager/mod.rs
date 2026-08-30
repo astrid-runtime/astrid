@@ -594,6 +594,13 @@ impl Manager {
         (domain.generation == handle.generation().0 && domain.state.is_live()).then_some(domain)
     }
 
+    fn releasing_domain_mut(&mut self, handle: DomainHandle) -> Option<&mut Domain> {
+        let slot = self.slots.get_mut(handle.id().0 as usize)?;
+        let domain = slot.as_mut()?;
+        (domain.generation == handle.generation().0 && domain.state == DomainState::Releasing)
+            .then_some(domain)
+    }
+
     pub(in crate::domains) fn take_running_stop(
         &mut self,
         handle: DomainHandle,
@@ -735,7 +742,7 @@ impl Manager {
     }
 
     fn mark_release_failed(&mut self, handle: DomainHandle) {
-        if let Some(domain) = self.valid_domain_mut(handle) {
+        if let Some(domain) = self.releasing_domain_mut(handle) {
             domain.state = DomainState::ReleaseFailed;
         }
         if let Some(domain) = self

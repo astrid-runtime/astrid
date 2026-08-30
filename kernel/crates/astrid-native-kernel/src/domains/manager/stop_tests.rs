@@ -73,7 +73,10 @@ fn relation_release_failure_fails_closed_and_forbids_reuse() {
 #[test]
 fn missing_space_fails_taken_stop_without_accounting_release() {
     let _fixture = lock_fixture();
+    let _ipc_fixture = crate::ipc::test_support::test_lock();
     reset_release_fixture();
+    crate::ipc::test_support::reset();
+    prepare_domain(DomainToken::new(0, 12).unwrap());
     ADMISSION_RELEASES.store(0, Ordering::SeqCst);
     let mut manager = install_taken_domain(None);
 
@@ -88,6 +91,7 @@ fn missing_space_fails_taken_stop_without_accounting_release() {
         assert_eq!(manager.used_frames, 3);
     }
     assert_eq!(ADMISSION_RELEASES.load(Ordering::SeqCst), 0);
+    assert!(!Manager::slot_is_preparable(manager.slots[0].as_ref()));
 
     manager.slots[0] = None;
 }
@@ -95,7 +99,10 @@ fn missing_space_fails_taken_stop_without_accounting_release() {
 #[test]
 fn cr3_restore_failure_finishes_aborted_and_keeps_accounting() {
     let _fixture = lock_fixture();
+    let _ipc_fixture = crate::ipc::test_support::test_lock();
     reset_release_fixture();
+    crate::ipc::test_support::reset();
+    prepare_domain(DomainToken::new(0, 12).unwrap());
     SPACE_RELEASE_FAILURE.store(1, Ordering::SeqCst);
     ADMISSION_RELEASES.store(0, Ordering::SeqCst);
     let mut manager = install_taken_domain(Some(()));
@@ -111,6 +118,35 @@ fn cr3_restore_failure_finishes_aborted_and_keeps_accounting() {
         assert_eq!(manager.used_frames, 3);
     }
     assert_eq!(ADMISSION_RELEASES.load(Ordering::SeqCst), 0);
+    assert!(!Manager::slot_is_preparable(manager.slots[0].as_ref()));
+
+    manager.slots[0] = None;
+    SPACE_RELEASE_FAILURE.store(0, Ordering::SeqCst);
+}
+
+#[test]
+fn reclaim_blocked_fails_taken_stop_and_keeps_accounting() {
+    let _fixture = lock_fixture();
+    let _ipc_fixture = crate::ipc::test_support::test_lock();
+    reset_release_fixture();
+    crate::ipc::test_support::reset();
+    prepare_domain(DomainToken::new(0, 12).unwrap());
+    SPACE_RELEASE_FAILURE.store(2, Ordering::SeqCst);
+    ADMISSION_RELEASES.store(0, Ordering::SeqCst);
+    let mut manager = install_taken_domain(Some(()));
+
+    assert_eq!(
+        manager.release_slot_with_stop(handle(), None),
+        ReclaimStats::from_parts(3, 2, true, true)
+    );
+    {
+        let domain = manager.slots[0].as_ref().unwrap();
+        assert_eq!(domain.state, DomainState::ReleaseFailed);
+        assert!(matches!(domain.stop, DomainStop::Aborted(_)));
+        assert_eq!(manager.used_frames, 3);
+    }
+    assert_eq!(ADMISSION_RELEASES.load(Ordering::SeqCst), 0);
+    assert!(!Manager::slot_is_preparable(manager.slots[0].as_ref()));
 
     manager.slots[0] = None;
     SPACE_RELEASE_FAILURE.store(0, Ordering::SeqCst);
