@@ -525,18 +525,15 @@ async fn await_retained_drain(
     _caller_requested_latch: bool,
 ) -> Result<(), String> {
     match state.await_listener_settlement().await {
-        DrainSettlement::Failure(failure) => {
-            state.arm_drain_retry();
-            Err(match failure {
-                DrainFailureKind::JoinFailed => cleanup_error(
-                    Some(state.mount_id),
-                    MountCleanupStage::Drain,
-                    std::io::Error::other("retained filesystem worker join failed"),
-                )
-                .to_string(),
-                DrainFailureKind::TimedOut => drain_timeout_error(state).to_string(),
-            })
-        },
+        DrainSettlement::Failure(failure) => Err(match failure {
+            DrainFailureKind::JoinFailed => cleanup_error(
+                Some(state.mount_id),
+                MountCleanupStage::Drain,
+                std::io::Error::other("retained filesystem worker join failed"),
+            )
+            .to_string(),
+            DrainFailureKind::TimedOut => drain_timeout_error(state).to_string(),
+        }),
         DrainSettlement::Closed => Ok(()),
     }
 }

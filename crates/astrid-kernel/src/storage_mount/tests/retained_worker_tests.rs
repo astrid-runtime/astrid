@@ -32,6 +32,46 @@ async fn worker_fixture(
     (lease, state, gate)
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drain_timeout_preserves_a_latched_join_failure() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
+    let kernel = Arc::new(crate::test_kernel_with_home(home).await);
+    let caller = PrincipalId::default();
+    let (lease, state, _gate) =
+        worker_fixture(&temporary, &kernel, &caller, "timeout-keeps-join-failure").await;
+    state.set_drain_timeouts_for_test(Duration::from_millis(20));
+    state.latch_join_failure_without_shutdown_for_test();
+
+    let first = state.await_listener_settlement().await;
+    assert!(
+        matches!(
+            first,
+            crate::storage_mount::drain_state::DrainSettlement::Failure(
+                crate::storage_mount::drain_state::DrainFailureKind::JoinFailed
+            )
+        ),
+        "the latched severity must be returned first: {first:?}"
+    );
+
+    let timed_out_attempt = state.await_listener_settlement().await;
+    assert!(
+        matches!(
+            timed_out_attempt,
+            crate::storage_mount::drain_state::DrainSettlement::Failure(
+                crate::storage_mount::drain_state::DrainFailureKind::JoinFailed
+            )
+        ),
+        "the timeout must not downgrade the stored maximum: {timed_out_attempt:?}"
+    );
+
+    revoke(&kernel, &caller, lease.mount_id)
+        .await
+        .expect("the settled listener permits the exact cleanup retry");
+    assert!(!kernel.storage_mounts.contains_key(&lease.mount_id));
+    assert!(!lease.resource_path.exists());
+}
+
 async fn revoke(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,

@@ -41,6 +41,11 @@ impl StorageMountLeaseState {
     }
 
     #[cfg(any(unix, windows))]
+    pub(crate) fn latch_join_failure_without_shutdown_for_test(&self) {
+        self.record_drain_failure(BlockingJobDrain::JoinFailed);
+    }
+
+    #[cfg(any(unix, windows))]
     pub(crate) async fn wait_join_failure_publication_for_test(&self) {
         let mut published = self.drain_failure_tx.subscribe();
         while !*published.borrow() {

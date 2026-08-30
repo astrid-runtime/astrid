@@ -36,6 +36,7 @@ impl StorageMountLeaseState {
         let mut attempt = self.drain_attempts.lock().await;
         if let Some(failure) = self.sample_failure() {
             if attempt.retry_armed.is_none_or(|armed| armed < failure) {
+                attempt.retry_armed = Some(failure);
                 return DrainSettlement::Failure(failure);
             }
             if self.listener_is_closed() {
@@ -61,6 +62,7 @@ impl StorageMountLeaseState {
                             };
                         }
                         if let Some(failure) = self.sample_failure() {
+                            remember_retry_failure(&mut attempt, failure);
                             return Observed::Failure(failure);
                         }
                     },
@@ -77,8 +79,9 @@ impl StorageMountLeaseState {
             Ok(Observed::Failure(failure)) => DrainSettlement::Failure(failure),
             Err(_) => {
                 self.record_drain_failure(BlockingJobDrain::TimedOut);
-                attempt.retry_armed = Some(DrainFailureKind::TimedOut);
-                DrainSettlement::Failure(DrainFailureKind::TimedOut)
+                let failure = self.sample_failure().unwrap_or(DrainFailureKind::TimedOut);
+                remember_retry_failure(&mut attempt, failure);
+                DrainSettlement::Failure(failure)
             },
         }
     }
@@ -105,26 +108,19 @@ impl StorageMountLeaseState {
         }
     }
 
-    /// Authorize the next exact retry at the highest observed severity.
-    pub(super) fn arm_drain_retry(&self) {
-        let mut attempt = self
-            .drain_attempts
-            .try_lock()
-            .expect("drain retry arming follows a settled attempt");
-        if let Some(failure) = self.sample_failure() {
-            attempt.retry_armed = Some(failure);
-        }
-    }
-
-    /// Projection cleanup arms a failed exact retry, then redrains it.
+    /// A failed settlement authorizes the next exact retry while still
+    /// serialized with every other drain consumer.
     pub(super) async fn drain_is_settled_for_cleanup(&self) -> bool {
         match self.await_listener_settlement().await {
             DrainSettlement::Closed => true,
-            DrainSettlement::Failure(_) => {
-                self.arm_drain_retry();
-                false
-            },
+            DrainSettlement::Failure(_) => false,
         }
+    }
+}
+
+fn remember_retry_failure(attempt: &mut DrainAttemptState, failure: DrainFailureKind) {
+    if attempt.retry_armed.is_none_or(|armed| armed < failure) {
+        attempt.retry_armed = Some(failure);
     }
 }
 
