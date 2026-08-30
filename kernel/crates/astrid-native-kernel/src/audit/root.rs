@@ -87,9 +87,10 @@ pub(crate) fn ack_tag(
     hasher.finalize().into()
 }
 
-/// Authenticates the opaque capability handed to the independent verifier.
-/// Possession of this sealed context is the verifier authority for exactly
-/// one boot/session; no caller-selectable raw key constructor exists.
+/// Keys the kernel minting tag bound into the untrusted verifier handoff.
+/// The verification key never travels inside the handoff; the tag is
+/// checkable only by a holder of the independently trusted kernel-origin
+/// anchor, so a caller-minted handoff cannot authenticate itself.
 pub(crate) fn verifier_handoff_tag(
     boot: BootSessionId,
     authority_id: u64,

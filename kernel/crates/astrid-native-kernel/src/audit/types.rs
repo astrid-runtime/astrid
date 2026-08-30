@@ -66,6 +66,13 @@ const AUTHORITY_KEY_DOMAIN: &[u8] = b"astrid.native-kernel.audit-authority-key.v
 /// Opaque kernel-owned authentication context. It is derived inside the
 /// kernel from the live boot identity and cannot be constructed from
 /// caller-selected bytes. Its authority id is part of every checkpoint tag.
+///
+/// The verification key stays kernel-side for the whole boot/session. It
+/// reaches the verifier only through an independently trusted kernel-origin
+/// channel that this unwired slice models by injection; the untrusted
+/// handoff carries none of it. Production anchor delivery and key
+/// lifecycle remain named #1759 residuals, and no fixed production secret
+/// is introduced.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CheckpointAuthContext {
     authority_id: u64,
@@ -112,13 +119,19 @@ impl core::fmt::Debug for CheckpointAuthContext {
     }
 }
 
-/// Kernel-minted authority for one live boot/session. Its verifier handoff is
-/// an opaque sealed capability, not a caller-selectable raw key.
+/// Kernel-minted authority for one live boot/session. Its verifier handoff
+/// is untrusted binding evidence: it names the authority and carries a
+/// keyed minting tag, never verification material, so it cannot
+/// authenticate itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AuditAuthority {
     boot: BootSessionId,
     context: CheckpointAuthContext,
 }
+
+/// Fixed wire size of the untrusted verifier handoff binding: magic,
+/// authority id, boot/session identity, and the keyed tag. No key material.
+const VERIFIER_HANDOFF_BYTES: usize = 8 + 8 + 16 + root::ROOT_LEN;
 
 impl AuditAuthority {
     pub fn mint(boot: BootSessionId) -> Self {
@@ -136,20 +149,22 @@ impl AuditAuthority {
         self.context
     }
 
-    /// Sealed opaque handoff accepted by `native-audit-verifier`. The private
-    /// first-slice layout carries no production lifecycle provisioning claim.
-    pub fn verifier_handoff(self) -> [u8; 96] {
-        let mut handoff = [0; 96];
+    /// Untrusted binding evidence accepted by `native-audit-verifier`. It
+    /// carries no verification material: the tag is checkable only against
+    /// the independently trusted kernel-origin anchor, so a caller-minted
+    /// handoff cannot authenticate itself. The private first-slice layout
+    /// carries no production lifecycle provisioning claim.
+    pub fn verifier_handoff(self) -> [u8; VERIFIER_HANDOFF_BYTES] {
+        let mut handoff = [0; VERIFIER_HANDOFF_BYTES];
         handoff[..8].copy_from_slice(b"ASAUDCTX");
         handoff[8..16].copy_from_slice(&self.context.authority_id().to_le_bytes());
         handoff[16..32].copy_from_slice(&self.boot.bytes());
-        handoff[32..64].copy_from_slice(&self.context.verification_key());
         let tag = root::verifier_handoff_tag(
             self.boot,
             self.context.authority_id(),
             &self.context.verification_key(),
         );
-        handoff[64..].copy_from_slice(&tag);
+        handoff[32..].copy_from_slice(&tag);
         handoff
     }
 }

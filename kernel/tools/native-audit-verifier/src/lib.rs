@@ -4,6 +4,12 @@
 //! frozen canonical frames, folds the rolling BLAKE3 root, checks
 //! kernel-authenticated checkpoints, and reports Invalid versus Incomplete.
 //! It never writes kernel state and is not a second fact base.
+//!
+//! Verification material enters only through an explicitly injected,
+//! independently trusted kernel-origin anchor. The untrusted verifier
+//! handoff carries no key material; it merely binds one boot/session
+//! authority instance to that anchor, and no envelope may authenticate
+//! itself with material carried inside the same untrusted input.
 
 pub mod wire;
 
@@ -16,8 +22,9 @@ use blake3::Hasher;
 pub const CODEC_VERSION: u16 = 1;
 /// Fixed wire size of the canonical checkpoint form.
 pub const CHECKPOINT_WIRE_BYTES: usize = 4 + 2 + 16 + 8 + 32 + 8 + 8 + 32;
-/// Fixed size of a kernel-minted opaque verifier handoff.
-pub const AUTHORITY_HANDOFF_BYTES: usize = 96;
+/// Fixed size of the kernel-minted untrusted handoff binding: magic,
+/// authority id, boot/session identity, keyed tag. No verification material.
+pub const AUTHORITY_HANDOFF_BYTES: usize = 64;
 
 const ROOT_ALGORITHM_ID: &[u8] = b"BLAKE3-256";
 const ROOT_DOMAIN_TAG: &[u8] = b"astrid.native-kernel.audit-root.v1";
@@ -30,6 +37,7 @@ const VERIFIER_HANDOFF_DOMAIN_TAG: &[u8] = b"astrid.native-kernel.audit-verifier
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VerifyFailure {
     Malformed,
+    HandoffUnbound,
     CheckpointMismatch,
     SequenceOverflow,
     StaleRelayGeneration,
@@ -95,8 +103,14 @@ pub struct CheckpointView {
     pub tag: [u8; 32],
 }
 
-/// Opaque kernel-minted verifier context. It can enter this crate only
-/// through a sealed handoff; a caller cannot construct a raw authority key.
+/// Verifier authority bound to one independently trusted kernel-origin
+/// anchor. This is the modeled trusted channel of the unwired first slice:
+/// the anchor is injected from outside the untrusted handoff path, and
+/// production anchor delivery, provisioning, and key lifecycle are named
+/// #1759 residuals. It is the only way verification material enters this
+/// crate; there is deliberately no constructor from untrusted handoff
+/// bytes, because an envelope cannot authenticate itself with material
+/// carried inside it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct AuthContext {
     authority_id: u64,
@@ -105,8 +119,32 @@ pub struct AuthContext {
 }
 
 impl AuthContext {
-    /// Accepts only the sealed 96-byte capability minted by the kernel.
-    pub fn from_handoff(bytes: &[u8; AUTHORITY_HANDOFF_BYTES]) -> Result<Self, VerifyFailure> {
+    /// The only trusted-entry constructor. Rejects degenerate anchors so a
+    /// zero authority id, zero boot, or zero key can never anchor a session.
+    pub fn from_trusted_anchor(
+        authority_id: u64,
+        boot: [u8; 16],
+        verification_key: [u8; 32],
+    ) -> Result<Self, VerifyFailure> {
+        if authority_id == 0
+            || boot.iter().all(|byte| *byte == 0)
+            || verification_key.iter().all(|byte| *byte == 0)
+        {
+            return Err(VerifyFailure::Malformed);
+        }
+        Ok(Self {
+            authority_id,
+            boot,
+            verification_key,
+        })
+    }
+
+    /// Binds untrusted handoff bytes against this trusted anchor. The
+    /// handoff must name the anchored authority id and boot, and its
+    /// minting tag must verify under the anchor key it does not carry.
+    /// A structurally valid but caller-minted handoff therefore stays
+    /// unbound: only the kernel-side key can produce the tag.
+    pub fn bind_handoff(&self, bytes: &[u8; AUTHORITY_HANDOFF_BYTES]) -> Result<(), VerifyFailure> {
         if bytes[..8] != *b"ASAUDCTX" {
             return Err(VerifyFailure::Malformed);
         }
@@ -121,36 +159,16 @@ impl AuthContext {
             .ok()
             .filter(|boot: &[u8; 16]| boot.iter().any(|byte| *byte != 0))
             .ok_or(VerifyFailure::Malformed)?;
-        let verification_key = bytes[32..64]
-            .try_into()
-            .ok()
-            .filter(|key: &[u8; 32]| key.iter().any(|byte| *byte != 0))
-            .ok_or(VerifyFailure::Malformed)?;
-        let tag: [u8; 32] = bytes[64..]
+        if authority_id != self.authority_id || boot != self.boot {
+            return Err(VerifyFailure::HandoffUnbound);
+        }
+        let tag: [u8; 32] = bytes[32..]
             .try_into()
             .map_err(|_| VerifyFailure::Malformed)?;
-        if verifier_handoff_tag(boot, authority_id, &verification_key) != tag {
-            return Err(VerifyFailure::Malformed);
+        if verifier_handoff_tag(boot, authority_id, &self.verification_key) != tag {
+            return Err(VerifyFailure::HandoffUnbound);
         }
-        Ok(Self {
-            authority_id,
-            boot,
-            verification_key,
-        })
-    }
-
-    #[cfg(test)]
-    fn mint(boot: [u8; 16], seed: u64) -> Self {
-        let mut hasher = Hasher::new();
-        hasher.update(b"native-audit-verifier-test-authority");
-        hasher.update(&boot);
-        hasher.update(&seed.to_le_bytes());
-        let digest: [u8; 32] = hasher.finalize().into();
-        Self {
-            authority_id: seed | 1,
-            boot,
-            verification_key: digest,
-        }
+        Ok(())
     }
 }
 
@@ -218,6 +236,10 @@ fn ack_tag(
     hasher.finalize().into()
 }
 
+/// Keys the kernel minting tag bound into the untrusted verifier handoff.
+/// The verification key never travels inside the handoff; the tag is
+/// checkable only by a holder of the independently trusted kernel-origin
+/// anchor, so a caller-minted handoff cannot authenticate itself.
 fn verifier_handoff_tag(
     boot: [u8; 16],
     authority_id: u64,
@@ -303,13 +325,20 @@ pub struct AuditVerifier {
 }
 
 impl AuditVerifier {
-    pub fn genesis(boot: [u8; 16], context: AuthContext) -> Result<Self, VerifyFailure> {
+    /// Starts from genesis only after binding the untrusted handoff against
+    /// the trusted anchor for the same boot.
+    pub fn genesis(
+        boot: [u8; 16],
+        context: AuthContext,
+        handoff: &[u8; AUTHORITY_HANDOFF_BYTES],
+    ) -> Result<Self, VerifyFailure> {
         if boot.iter().all(|byte| *byte == 0) {
             return Err(VerifyFailure::Malformed);
         }
         if boot != context.boot {
             return Err(VerifyFailure::Malformed);
         }
+        context.bind_handoff(handoff)?;
         Ok(Self {
             boot,
             next_seq: 1,
@@ -319,7 +348,14 @@ impl AuditVerifier {
         })
     }
 
-    pub fn from_checkpoint(wire: &[u8], context: AuthContext) -> Result<Self, VerifyFailure> {
+    /// Restarts from a kernel-sealed checkpoint only after binding the
+    /// untrusted handoff against the trusted anchor.
+    pub fn from_checkpoint(
+        wire: &[u8],
+        context: AuthContext,
+        handoff: &[u8; AUTHORITY_HANDOFF_BYTES],
+    ) -> Result<Self, VerifyFailure> {
+        context.bind_handoff(handoff)?;
         let checkpoint = verify_checkpoint(wire, &context)?;
         let next_seq = checkpoint
             .seq
