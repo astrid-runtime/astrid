@@ -5,6 +5,8 @@ use astrid_system_generation::{ContentId, ManifestIdentity};
 
 use super::admission;
 use super::manager::{self, DomainState};
+#[cfg(not(test))]
+use super::stop::StopLifecycle;
 use super::types::{BindError, DomainHandle, Scenario};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,6 +18,7 @@ pub(crate) enum StageError {
     StaleDomain,
     Releasing,
     ReleaseFailed,
+    Stop(super::stop::StopError),
 }
 
 impl StageError {
@@ -28,6 +31,7 @@ impl StageError {
             Self::StaleDomain => "staged_domain_stale",
             Self::Releasing => "domain_releasing",
             Self::ReleaseFailed => "domain_release_failed",
+            Self::Stop(error) => error.as_reason(),
         }
     }
 }
@@ -170,6 +174,13 @@ pub(crate) fn dispatch_start(
     if staged.observe()? != DomainState::Prepared {
         return Err(StageError::NotPrepared);
     }
+    let stop = StopLifecycle::stage(
+        staged.handle,
+        staged.manifest_identity,
+        staged.component_id,
+        staged.scenario,
+    )
+    .map_err(StageError::Stop)?;
     let context =
         manager::stage_context(staged.handle, staged.scenario).map_err(StageError::Domain)?;
     staged.authorize_dispatch(
@@ -179,7 +190,14 @@ pub(crate) fn dispatch_start(
         staged.scenario,
         context,
     )?;
-    manager::start_running(staged.handle, context).map_err(StageError::Domain)?;
+    manager::start_running(
+        staged.handle,
+        context,
+        stop,
+        staged.manifest_identity,
+        staged.component_id,
+    )
+    .map_err(StageError::Domain)?;
     if staged.observe()? != DomainState::Running {
         return Err(StageError::Domain(manager::PrepareError::Bind(
             BindError::Malformed,

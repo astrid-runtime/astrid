@@ -13,6 +13,7 @@ use x86_64::structures::paging::{PhysFrame, Size4KiB};
 
 #[cfg(not(test))]
 use super::paging::AddressSpace;
+use super::stop::DomainStop;
 use super::types::{BindError, DomainHandle, DomainPagingError, SLOT_CAPACITY, Scenario};
 #[cfg(not(test))]
 use super::types::{CODE_BASE, ComponentImage, DomainGeneration, DomainId, Outcome, PEER_PROBE};
@@ -86,6 +87,7 @@ pub struct DomainIdentity {
 struct ReclaimStats {
     expected: u64,
     freed: u64,
+    release_complete: bool,
 }
 
 impl ReclaimStats {
@@ -93,11 +95,25 @@ impl ReclaimStats {
         Self {
             expected: 0,
             freed: 0,
+            release_complete: false,
         }
     }
 
     const fn exactly_once(self) -> bool {
-        self.expected > 0 && self.expected == self.freed
+        self.expected > 0 && self.expected == self.freed && self.release_complete
+    }
+
+    const fn from_parts(
+        expected: u64,
+        freed: u64,
+        stop_requested: bool,
+        relation_released: bool,
+    ) -> Self {
+        Self {
+            expected,
+            freed,
+            release_complete: !stop_requested || relation_released,
+        }
     }
 }
 
@@ -127,6 +143,7 @@ pub struct Domain {
     #[cfg(test)]
     pub(super) space: Option<()>,
     pub(super) ipc_enabled: bool,
+    pub(super) stop: DomainStop,
 }
 
 #[derive(Default)]
@@ -360,6 +377,7 @@ pub fn prepare(
                 | Scenario::IpcCancelServer
                 | Scenario::IpcCancelGuest
         ),
+        stop: DomainStop::inactive(),
     });
     let handle = DomainHandle::new(
         super::types::DomainId(slot as u64),
@@ -528,6 +546,25 @@ pub fn handle_domain_trap(frame: &mut TrapFrame, fault_address: u64) -> bool {
         frame.rip = CODE_BASE + IPC_CANCEL_GUEST_APPEND_OFFSET;
         return true;
     }
+    if vector == apic::TIMER_VECTOR && scenario == Scenario::RunningStop.value() {
+        let handle = super::wait::current_handle();
+        super::stop::take_timer_trap(handle);
+        apic::mask_timer();
+        apic::eoi();
+        serial::ev_stop_taken(handle.id().0 + 1, handle.generation().0, u64::from(vector));
+        let context = TrapContext {
+            slot: handle.id().0,
+            generation: handle.generation().0,
+            vector,
+            error_code: frame.error_code,
+            rip: frame.rip,
+            cs: frame.cs,
+            fault_address,
+            outcome: Outcome::Cancelled,
+        };
+        *TERMINAL_CONTEXT.lock() = Some(context);
+        switch_to_resume(resume_stack_end());
+    }
     if vector == apic::TIMER_VECTOR && scenario >= Scenario::IpcServer.value() {
         // The landed #1704 dispatch is byte-frozen and has no path for the
         // new scenarios. Timer preemption is the one transition to the
@@ -564,6 +601,9 @@ pub fn handle_domain_trap(frame: &mut TrapFrame, fault_address: u64) -> bool {
             _ => Outcome::UnexpectedFault,
         }
     };
+    if !super::stop::abort_for_terminal(super::wait::current_handle()) {
+        fail_terminal("stop_terminal_conflict");
+    }
     serial::ev_domain_registers(
         CURRENT.slot.load(Ordering::SeqCst) + 1,
         CURRENT.generation.load(Ordering::SeqCst),
@@ -627,7 +667,15 @@ extern "C" fn domain_terminal() -> ! {
     CURRENT.active.store(false, Ordering::SeqCst);
     CURRENT.root.store(0, Ordering::SeqCst);
     CURRENT.root_flags.store(0, Ordering::SeqCst);
+    let stop_requested =
+        context.vector == crate::apic::TIMER_VECTOR && context.outcome == Outcome::Cancelled;
+    if stop_requested {
+        serial::ev_stop_current_inactive(handle.id().0 + 1, handle.generation().0);
+    }
     if !stats.exactly_once() {
+        if stop_requested {
+            serial::ev_stop_completed(handle.id().0 + 1, handle.generation().0, false);
+        }
         serial::ev_domain_harness(false);
         serial::ev_halt(false);
         serial::exit_qemu(false);
@@ -635,6 +683,9 @@ extern "C" fn domain_terminal() -> ! {
     *terminal = None;
     drop(terminal);
     super::harness::record_outcome(context.outcome, stats.exactly_once());
+    if stop_requested {
+        serial::ev_stop_completed(handle.id().0 + 1, handle.generation().0, true);
+    }
     let (kernel_code, kernel_data) = gdt::kernel_selectors();
     let return_stack = resume_stack_end();
     let rip = scheduler_resume as *const () as usize as u64;
@@ -710,6 +761,7 @@ pub fn generation_overflow_rejects_prepare(raw: &[u8], expected: ContentId) -> b
             quota_ticks: 0,
             space: None,
             ipc_enabled: false,
+            stop: DomainStop::inactive(),
         });
     }
     let rejected = matches!(
@@ -737,8 +789,28 @@ impl Manager {
         (domain.generation == handle.generation().0 && domain.state.is_live()).then_some(domain)
     }
 
+    fn stop_taken(&self, handle: DomainHandle) -> bool {
+        self.slots
+            .get(handle.id().0 as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|domain| {
+                domain.generation == handle.generation().0
+                    && domain.state.is_live()
+                    && domain.stop.is_taken()
+            })
+    }
+
     #[cfg(not(test))]
     fn release_slot(&mut self, handle: DomainHandle) -> ReclaimStats {
+        self.release_slot_with_stop(handle, None)
+    }
+
+    #[cfg(not(test))]
+    fn release_slot_with_stop(
+        &mut self,
+        handle: DomainHandle,
+        stop_context: Option<&TrapContext>,
+    ) -> ReclaimStats {
         let Some(slot) = self.slots.get_mut(handle.id().0 as usize) else {
             return ReclaimStats::zero();
         };
@@ -750,14 +822,30 @@ impl Manager {
         }
 
         let generation = domain.generation;
+        let stop_requested = domain.stop.is_taken();
+        if let Some(context) = stop_context {
+            serial::ev_domain_outcome(
+                serial::DomainEventIdentity::new(context.slot + 1, context.generation),
+                context.outcome.name(),
+                context.vector,
+                context.error_code,
+                context.fault_address,
+                context.rip,
+                context.cs & 3,
+            );
+        }
         let identity = domain.space.as_ref().map(|space| DomainIdentity {
             root: space.root_phys(),
             probe: space.probe(),
         });
         self.last_identity = identity;
         let mut failed_peers = [None; 2];
+        let ipc_outcome = super::wait::release_ipc(handle.id().value(), generation);
+        let relation_released = ipc_outcome.relation_released;
+        if stop_requested {
+            serial::ev_stop_relation_retired(handle.id().0 + 1, generation, relation_released);
+        }
         if domain.ipc_enabled {
-            let ipc_outcome = super::wait::release_ipc(handle.id().value(), generation);
             serial::ev_ipc_reclaim(
                 handle.id().value() + 1,
                 generation,
@@ -799,7 +887,12 @@ impl Manager {
         };
         let reclaimed = {
             let Some(domain) = slot.as_mut() else {
-                return ReclaimStats { expected, freed };
+                return ReclaimStats::from_parts(
+                    expected,
+                    freed,
+                    stop_requested,
+                    relation_released,
+                );
             };
             if expected == 0 || expected != freed {
                 false
@@ -815,15 +908,31 @@ impl Manager {
                     expected - freed,
                 );
                 super::admission::release(handle);
+                if stop_requested {
+                    serial::ev_stop_admission_released(handle.id().0 + 1, generation, true);
+                }
                 true
             }
         };
+        let mut failed_release_ok = true;
         if reclaimed {
+            let _ = slot;
             for failed_peer in failed_peers.into_iter().flatten() {
-                self.release_slot(failed_peer);
+                failed_release_ok &= self.release_slot(failed_peer).exactly_once();
             }
         }
-        ReclaimStats { expected, freed }
+        let stats = ReclaimStats::from_parts(expected, freed, stop_requested, relation_released);
+        let stop_complete = stats.exactly_once() && failed_release_ok;
+        if stop_requested {
+            let Some(slot) = self.slots.get_mut(handle.id().0 as usize) else {
+                return stats;
+            };
+            let Some(domain) = slot.as_mut() else {
+                return stats;
+            };
+            let _ = domain.stop.finish(handle, stop_complete);
+        }
+        stats
     }
 
     #[cfg(not(test))]
@@ -833,16 +942,19 @@ impl Manager {
         outcome: Outcome,
         event: &TrapContext,
     ) -> ReclaimStats {
-        serial::ev_domain_outcome(
-            serial::DomainEventIdentity::new(event.slot + 1, event.generation),
-            outcome.name(),
-            event.vector,
-            event.error_code,
-            event.fault_address,
-            event.rip,
-            event.cs & 3,
-        );
-        self.release_slot(handle)
+        let stop_requested = self.stop_taken(handle);
+        if !stop_requested {
+            serial::ev_domain_outcome(
+                serial::DomainEventIdentity::new(event.slot + 1, event.generation),
+                outcome.name(),
+                event.vector,
+                event.error_code,
+                event.fault_address,
+                event.rip,
+                event.cs & 3,
+            );
+        }
+        self.release_slot_with_stop(handle, stop_requested.then_some(event))
     }
 
     #[cfg(not(test))]

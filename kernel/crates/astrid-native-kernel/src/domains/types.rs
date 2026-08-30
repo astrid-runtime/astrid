@@ -211,11 +211,34 @@ pub enum Scenario {
     #[allow(dead_code)]
     IpcCancelServer = 9,
     IpcCancelGuest = 10,
+    RunningStop = 11,
 }
 
 impl Scenario {
     pub const fn value(self) -> u64 {
         self as u64
+    }
+}
+
+impl TryFrom<u64> for Scenario {
+    type Error = ();
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Exit),
+            1 => Ok(Self::PageFault),
+            2 => Ok(Self::Quota),
+            3 => Ok(Self::PeerProbe),
+            4 => Ok(Self::CancelOnly),
+            5 => Ok(Self::InvalidInstruction),
+            6 => Ok(Self::IpcServer),
+            7 => Ok(Self::IpcClient),
+            8 => Ok(Self::IpcPeerFault),
+            9 => Ok(Self::IpcCancelServer),
+            10 => Ok(Self::IpcCancelGuest),
+            11 => Ok(Self::RunningStop),
+            _ => Err(()),
+        }
     }
 }
 

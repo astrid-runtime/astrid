@@ -48,6 +48,7 @@ const DOMAIN_REQUIRED_PASSES: &[&str] = &[
     "authenticated_domains_exchange_bounded_capability_message",
     "peer_fault_wakes_blocked_recv_with_typed_status",
     "cancel_reclaims_blocked_ipc_exactly_once",
+    "running_timer_stop_cancels_and_reclaims_exactly_once",
 ];
 
 const EXTRA_REQUIRED_PASSES: &[&str] = &[
@@ -215,6 +216,16 @@ const IPC_CANCEL_GUEST_TAIL_EVENTS: &[&str] = &[
     "domain.restore",
     "domain.reclaim",
 ];
+const RUNNING_STOP_TAIL_EVENTS: &[&str] = &[
+    "domain.stop.taken",
+    "domain.outcome",
+    "domain.stop.relation-retired",
+    "domain.restore",
+    "domain.reclaim",
+    "domain.stop.admission-released",
+    "domain.stop.current-inactive",
+    "domain.stop.completed",
+];
 const BOOT_MILESTONE_EVENTS: &[&str] = &[
     "boot.entry",
     "idt.ready",
@@ -320,6 +331,13 @@ fn full_sequence() -> Vec<SequenceStep> {
     pattern.push(SequenceStep::Many(IPC_CANCEL_GUEST_OPS));
     pattern.push(SequenceStep::Many(IPC_CANCEL_GUEST_TAIL_EVENTS));
     pattern.push(SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[10]));
+    pattern.push(SequenceStep::Many(PREPARE_EVENTS));
+    pattern.push(SequenceStep::One("domain.stop.staged"));
+    pattern.push(SequenceStep::One("domain.stop.armed"));
+    pattern.push(SequenceStep::One(START_EVENT));
+    pattern.push(SequenceStep::Many(GUEST_ENTRY_EVENTS));
+    pattern.push(SequenceStep::Many(RUNNING_STOP_TAIL_EVENTS));
+    pattern.push(SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[11]));
     pattern.push(SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[7]));
     pattern.extend([
         SequenceStep::One("domain.harness"),
@@ -344,6 +362,7 @@ const DOMAIN_STARTS: &[(u64, u64, u64)] = &[
     (1, 8, 6),
     (2, 4, 8),
     (1, 9, 10),
+    (1, 10, 11),
 ];
 const DOMAIN_ADMISSION_COUNT: usize = DOMAIN_STARTS.len() + 1;
 const DOMAIN_ENTERED: &[(u64, u64)] = &[
@@ -359,6 +378,7 @@ const DOMAIN_ENTERED: &[(u64, u64)] = &[
     (1, 8),
     (2, 4),
     (1, 9),
+    (1, 10),
 ];
 const DOMAIN_REGISTERS: &[(u64, u64, u64)] = &[
     (1, 1, 0),
@@ -372,6 +392,7 @@ const DOMAIN_REGISTERS: &[(u64, u64, u64)] = &[
     (2, 4, 0),
     (1, 9, 0),
 ];
+const STOP_DOMAIN: (u64, u64) = (1, 10);
 const DOMAIN_RECLAIMS: &[(u64, u64)] = &[
     (1, 1),
     (1, 2),
@@ -386,6 +407,7 @@ const DOMAIN_RECLAIMS: &[(u64, u64)] = &[
     (2, 4),
     (1, 8),
     (1, 9),
+    (1, 10),
 ];
 const DOMAIN_CANCEL_REJECTS: &[(&str, u64, u64)] = &[("stale_handle", 1, 1)];
 const DOMAIN_CANCEL_IDENTITIES: &[(u64, u64)] = &[(2, 1)];
@@ -405,7 +427,9 @@ const DOMAIN_OUTCOMES: &[(u64, u64, &str, u64, u64, &str, u64)] = &[
     (2, 3, "clean_exit", 3, 0, "0x0", 3),
     (2, 4, "page_fault", 14, 6, HOSTILE_IPC_FAULT_ADDRESS, 3),
     (1, 9, "clean_exit", 3, 0, "0x0", 3),
+    (1, 10, "cancelled", 32, 0, "0x0", 3),
 ];
+const STOP_TAKEN: &[(u64, u64, u64, u64)] = &[(1, 10, 32, 3)];
 const HOSTILE_IPC_FAULT_ADDRESS: &str = "0x328000002000";
 const IPC_RECLAIMS: &[(u64, u64, u64, u64, u64)] = &[
     (2, 3, 1, 0, 0),
@@ -653,20 +677,70 @@ fn domain_lifecycle_holds(events: &[Value]) -> bool {
                     && u64_field(event, "fs") == Some(0)
                     && u64_field(event, "gs") == Some(0)
             });
-    let outcomes_ok = named_events(events, "domain.outcome")
+    let observed_outcomes: Vec<(u64, u64, &str, u64, u64, &str, u64)> =
+        named_events(events, "domain.outcome")
+            .into_iter()
+            .map(|event| {
+                (
+                    u64_field(event, "id").unwrap_or_default(),
+                    u64_field(event, "generation").unwrap_or_default(),
+                    string_field(event, "kind").unwrap_or_default(),
+                    u64_field(event, "vector").unwrap_or_default(),
+                    u64_field(event, "error_code").unwrap_or_default(),
+                    string_field(event, "fault_address").unwrap_or_default(),
+                    u64_field(event, "cpl").unwrap_or_default(),
+                )
+            })
+            .collect();
+    let outcomes_ok = observed_outcomes.len() == DOMAIN_OUTCOMES.len()
+        && observed_outcomes
+            .iter()
+            .zip(DOMAIN_OUTCOMES)
+            .all(|(observed, expected)| {
+                observed.0 == expected.0
+                    && observed.1 == expected.1
+                    && observed.2 == expected.2
+                    && observed.3 == expected.3
+                    && observed.4 == expected.4
+                    && (observed.5 == expected.5 || expected.5 == "*")
+                    && observed.6 == expected.6
+            });
+    let stop_staged_ok = exact_triples(
+        events,
+        "domain.stop.staged",
+        "id",
+        "generation",
+        "scenario",
+        &[(STOP_DOMAIN.0, STOP_DOMAIN.1, 11)],
+    );
+    let stop_armed_ok = exact_pairs(
+        events,
+        "domain.stop.armed",
+        "id",
+        "generation",
+        &[STOP_DOMAIN],
+    );
+    let stop_taken_ok = named_events(events, "domain.stop.taken")
         .into_iter()
         .map(|event| {
             (
                 u64_field(event, "id").unwrap_or_default(),
                 u64_field(event, "generation").unwrap_or_default(),
-                string_field(event, "kind").unwrap_or_default(),
                 u64_field(event, "vector").unwrap_or_default(),
-                u64_field(event, "error_code").unwrap_or_default(),
-                string_field(event, "fault_address").unwrap_or_default(),
                 u64_field(event, "cpl").unwrap_or_default(),
             )
         })
-        .eq(DOMAIN_OUTCOMES.iter().copied());
+        .eq(STOP_TAKEN.iter().copied());
+    let stop_tail_ok = all_bools(events, "domain.stop.relation-retired", "ok", true)
+        && all_bools(events, "domain.stop.admission-released", "ok", true)
+        && all_bools(events, "domain.stop.completed", "ok", true)
+        && exact_pairs(
+            events,
+            "domain.stop.current-inactive",
+            "id",
+            "generation",
+            &[STOP_DOMAIN],
+        );
     let reclaims_ok = exact_pairs(
         events,
         "domain.reclaim",
@@ -801,6 +875,12 @@ fn domain_lifecycle_holds(events: &[Value]) -> bool {
         contexts_ok,
     );
     ok &= check("exact domain outcomes and fault addresses", outcomes_ok);
+    ok &= check(
+        "exact running-stop staging and arming",
+        stop_staged_ok && stop_armed_ok,
+    );
+    ok &= check("exact qualifying timer-stop consumption", stop_taken_ok);
+    ok &= check("running-stop terminal completion order", stop_tail_ok);
     ok &= check("exact reclaim generations and accounting", reclaims_ok);
     ok &= check("restores accompany every reclaim", restores_ok);
     ok &= check("domain page-table audits", audits_ok);

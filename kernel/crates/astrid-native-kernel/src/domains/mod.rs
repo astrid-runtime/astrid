@@ -10,6 +10,7 @@ mod manager;
 #[cfg(not(test))]
 mod paging;
 mod stage;
+mod stop;
 #[cfg(test)]
 mod test_support;
 mod types;

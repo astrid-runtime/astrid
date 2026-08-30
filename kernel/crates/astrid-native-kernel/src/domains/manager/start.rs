@@ -9,6 +9,8 @@ use x86_64::VirtAddr;
 use x86_64::registers::control::Cr3;
 
 #[cfg(not(test))]
+use super::super::stop::DomainStop;
+#[cfg(not(test))]
 use super::{CURRENT, DomainState, MANAGER, PrepareError};
 #[cfg(not(test))]
 use crate::apic;
@@ -105,6 +107,9 @@ pub(in crate::domains) fn stage_context(
 pub(in crate::domains) fn start_running(
     handle: DomainHandle,
     context: StartContext,
+    stop: DomainStop,
+    manifest_identity: astrid_system_generation::ManifestIdentity,
+    component_id: astrid_system_generation::ContentId,
 ) -> Result<(), PrepareError> {
     if let Some(error) = super::lifecycle_error() {
         return Err(error);
@@ -135,7 +140,14 @@ pub(in crate::domains) fn start_running(
         if let Some(error) = super::lifecycle_error() {
             return Err(error);
         }
+        let armed_stop = stop
+            .into_armed(handle, manifest_identity, component_id, context.scenario)
+            .map_err(|_| PrepareError::Bind(BindError::Malformed))?;
         domain.state = DomainState::Running;
+        domain.stop = armed_stop;
+        if context.scenario == crate::domains::types::Scenario::RunningStop {
+            serial::ev_stop_armed(handle.id().0 + 1, handle.generation().0);
+        }
     }
     Ok(())
 }

@@ -233,6 +233,48 @@ pub fn ev_domain_cancelled(id: u64, generation: u64) {
     ));
 }
 
+pub fn ev_stop_staged(id: u64, generation: u64, scenario: u64) {
+    emit(format_args!(
+        "\"ev\":\"domain.stop.staged\",\"id\":{id},\"generation\":{generation},\"scenario\":{scenario}"
+    ));
+}
+
+pub fn ev_stop_armed(id: u64, generation: u64) {
+    emit(format_args!(
+        "\"ev\":\"domain.stop.armed\",\"id\":{id},\"generation\":{generation}"
+    ));
+}
+
+pub fn ev_stop_taken(id: u64, generation: u64, vector: u64) {
+    emit(format_args!(
+        "\"ev\":\"domain.stop.taken\",\"id\":{id},\"generation\":{generation},\"source\":\"timer\",\"vector\":{vector},\"cpl\":3"
+    ));
+}
+
+pub fn ev_stop_relation_retired(id: u64, generation: u64, ok: bool) {
+    emit(format_args!(
+        "\"ev\":\"domain.stop.relation-retired\",\"id\":{id},\"generation\":{generation},\"ok\":{ok}"
+    ));
+}
+
+pub fn ev_stop_admission_released(id: u64, generation: u64, ok: bool) {
+    emit(format_args!(
+        "\"ev\":\"domain.stop.admission-released\",\"id\":{id},\"generation\":{generation},\"ok\":{ok}"
+    ));
+}
+
+pub fn ev_stop_current_inactive(id: u64, generation: u64) {
+    emit(format_args!(
+        "\"ev\":\"domain.stop.current-inactive\",\"id\":{id},\"generation\":{generation}"
+    ));
+}
+
+pub fn ev_stop_completed(id: u64, generation: u64, ok: bool) {
+    emit(format_args!(
+        "\"ev\":\"domain.stop.completed\",\"id\":{id},\"generation\":{generation},\"ok\":{ok}"
+    ));
+}
+
 pub fn ev_domain_cancel_rejected(id: u64, generation: u64, reason: &str) {
     emit(format_args!(
         "\"ev\":\"domain.cancel.reject\",\"id\":{id},\"generation\":{generation},\"reason\":\"{reason}\""
