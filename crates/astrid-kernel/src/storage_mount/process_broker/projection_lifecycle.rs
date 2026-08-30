@@ -16,7 +16,6 @@ use super::{
     StorageMountId, StorageProviderAccessV1, generate_lease_token, local_transport,
     platform_process_provider_name, stop_process_provider,
 };
-use crate::storage_mount::lifecycle::cleanup_mapped_lease;
 use crate::storage_mount::lifecycle::cleanup_mapped_lease_resources;
 use crate::storage_mount::lifecycle::force_fence_projection_lease;
 
@@ -411,12 +410,25 @@ pub(crate) async fn revoke_projection_leases(
     while let Some(closed) = listener_checks.join_next().await {
         listeners_closed &= closed.unwrap_or_default();
     }
-    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
-    let mut unmapped = true;
-    for state in &states {
-        unmapped &= cleanup_mapped_lease(kernel, state).is_ok();
+    if !listeners_closed {
+        tracing::error!(
+            "failed to drain an authorized process storage projection listener before cleanup"
+        );
+        return false;
     }
-    unmapped && listeners_closed
+    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
+
+    // Resource removal and unmap are two phases. A resource fault therefore
+    // leaves the complete exact set mapped as the bounded-retry authority.
+    for state in &states {
+        if cleanup_mapped_lease_resources(state).is_err() {
+            return false;
+        }
+    }
+    for state in &states {
+        kernel.storage_mounts.remove(&state.mount_id);
+    }
+    true
 }
 
 async fn fence_available_projection_leases(

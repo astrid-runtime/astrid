@@ -1,6 +1,6 @@
-#[cfg(all(test, any(unix, windows)))]
-pub(crate) use super::lifecycle::force_revoke_projection_lease;
 use super::*;
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) use crate::storage_mount::lifecycle::force_revoke_projection_lease;
 
 #[cfg(any(unix, windows))]
 mod process_identity;
@@ -51,6 +51,8 @@ pub(crate) use projection_lifecycle::{
 };
 #[cfg(all(test, any(unix, windows)))]
 mod projection_identity_tests;
+#[cfg(all(test, any(unix, windows)))]
+mod retain_linearization_tests;
 #[cfg(any(unix, windows))]
 pub(crate) use projection_identity::{
     ProcessProjectionBinding, ProcessProjectionTarget, ProcessProjectionTargetSet,

@@ -65,12 +65,7 @@ pub(crate) fn daemon_main() -> Result<()> {
         bail!("WinFsp daemon lease contains a relative endpoint");
     }
 
-    let runtime = Arc::new(
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .context("start WinFsp callback runtime")?,
-    );
+    let runtime = Arc::new(start_provider_runtime("WinFsp callback runtime")?);
     let callback = CallbackFs::new(lease.clone(), Arc::clone(&runtime))
         .map_err(|failure| anyhow::anyhow!("build WinFsp callback filesystem: {failure:?}"))?;
     let control_path = provider_control_path(&lease.mount_id)?;
@@ -179,13 +174,19 @@ pub(crate) fn service_main() -> Result<()> {
         &launch.lease.callback_path,
     )
     .map_err(anyhow::Error::msg)?;
-    let runtime = Arc::new(
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .context("start WinFsp service runtime")?,
-    );
+    let runtime = Arc::new(start_provider_runtime("WinFsp service runtime")?);
     runtime.block_on(run_private_service(launch, challenge, runtime.clone()))
+}
+
+/// Build the one runtime owned by a synchronous provider mode.
+fn start_provider_runtime(context: &'static str) -> Result<tokio::runtime::Runtime> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        bail!("{context} cannot start inside another Tokio runtime");
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .with_context(|| format!("start {context}"))
 }
 
 async fn run_private_service(
