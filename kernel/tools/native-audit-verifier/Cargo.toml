@@ -1,0 +1,15 @@
+[package]
+name = "native-audit-verifier"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "native_audit_verifier"
+test = true
+bench = false
+
+[dependencies]
+# Same frozen pure backend as the kernel crates so digests cannot differ by
+# feature selection.
+blake3 = { version = "=1.8.5", default-features = false, features = ["pure"] }
