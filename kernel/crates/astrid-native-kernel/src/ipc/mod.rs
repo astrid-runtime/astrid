@@ -7,8 +7,11 @@ mod endpoint;
 mod error;
 #[cfg(test)]
 mod revoke_tests;
+mod rollback;
 #[cfg(test)]
 pub(crate) mod test_support;
+
+use rollback::rollback_recv;
 
 use core::num::NonZeroU64;
 
@@ -16,11 +19,26 @@ use spin::Mutex;
 
 use crate::platform::{self, TrapFrame};
 
+use crate::relations::{
+    CapabilityFacts, capability_installed, capability_removed, domain_registered, domain_released,
+    endpoint_created, endpoint_reclaimed,
+};
+#[cfg(test)]
+use crate::relations::{DeltaCursor, ProjectionEvidence, Snapshot};
+#[cfg(test)]
+use crate::relations::{projection_fold_evidence, projection_observation};
 pub use abi::MAX_BUFFER_BYTES;
+#[cfg(test)]
+pub(crate) use capability::CapSlot as TestCapSlot;
 pub use capability::DomainToken;
+#[cfg(not(test))]
 use capability::{CapSlot, CapTable, Capability, DerivationLink, Rights};
+#[cfg(test)]
+use capability::{CapSlot, CapTable, Rights};
+#[cfg(test)]
+pub(crate) use capability::{Capability, DerivationLink};
 pub use copy::finish_copy;
-use endpoint::{Endpoint, Message, SendOutcome};
+use endpoint::{Endpoint, Message, SendOutcome, endpoint_is_unused, reclaim_object};
 use error::IpcError;
 
 const _: () = assert!(abi::MAX_BUFFER_BYTES == 96);
@@ -75,6 +93,7 @@ struct IpcState {
     next_object_generation: u64,
     objects: [Option<Endpoint>; abi::ENDPOINT_POOL],
     capabilities: [CapTable; capability::DOMAIN_SLOTS],
+    relations: crate::relations::ProjectionStore,
 }
 
 impl IpcState {
@@ -83,6 +102,7 @@ impl IpcState {
             next_object_generation: 1,
             objects: [None; abi::ENDPOINT_POOL],
             capabilities: [CapTable::unowned(), CapTable::unowned()],
+            relations: crate::relations::ProjectionStore::empty(),
         }
     }
 }
@@ -134,6 +154,64 @@ fn merge_wakes(target: &mut [Option<DomainToken>; 2], wakes: [Option<DomainToken
     }
 }
 
+fn project<T>(result: Result<T, crate::relations::ProjectionError>, operation: &'static str) {
+    if let Err(error) = result {
+        #[cfg(not(test))]
+        crate::serial::ev_relations_projection_failed(operation, error.code());
+        #[cfg(test)]
+        let _ = (operation, error);
+    }
+}
+
+fn capability_facts(capability: Capability, slot: CapSlot) -> CapabilityFacts {
+    CapabilityFacts::new(
+        u64::from(slot.get()),
+        capability.generation.get(),
+        capability.generation.get(),
+        capability.rights.bits(),
+    )
+}
+
+fn project_transferred_capability(
+    state: &mut IpcState,
+    domain: DomainToken,
+    parent: Capability,
+    slot: CapSlot,
+) {
+    let parent_domain = parent.parent.map_or(domain, |link| link.domain);
+    let parent_slot = parent.parent.map_or(slot, |link| link.slot);
+    project(
+        capability_installed(
+            &mut state.relations,
+            parent_domain,
+            capability_facts(parent, parent_slot),
+            domain,
+            capability_facts(parent, slot),
+        ),
+        "transferred_capability_install",
+    );
+    project_relation_evidence(state, domain);
+}
+
+fn project_relation_evidence(state: &mut IpcState, domain: DomainToken) {
+    if let Ok((epoch, rows, fold_epoch, fold_rows, fold_matches)) =
+        state.relations.runtime_evidence(domain)
+    {
+        #[cfg(not(test))]
+        crate::serial::ev_relations_projection(
+            domain.slot().index() as u64 + 1,
+            domain.generation().get(),
+            epoch,
+            rows,
+            fold_epoch,
+            fold_rows,
+            fold_matches,
+        );
+        #[cfg(test)]
+        let _ = (epoch, rows, fold_epoch, fold_rows, fold_matches);
+    }
+}
+
 fn revoke_derived_capabilities(state: &mut IpcState, ancestor: DerivationLink) -> usize {
     let mut descendants = [None; abi::CAP_SLOTS_PER_DOMAIN * capability::DOMAIN_SLOTS];
     let mut descendant_count = 0usize;
@@ -152,13 +230,27 @@ fn revoke_derived_capabilities(state: &mut IpcState, ancestor: DerivationLink) -
         }
     }
 
-    descendants
-        .into_iter()
-        .flatten()
-        .filter(|(table_index, owner, index)| {
-            state.capabilities[*table_index].remove_index(*owner, *index)
-        })
-        .count()
+    let mut removed = 0;
+    for (table_index, owner, index) in descendants.into_iter().flatten() {
+        let Ok(slot) = CapSlot::try_new(index) else {
+            continue;
+        };
+        let Some(capability) = state.capabilities[table_index].get(owner, slot) else {
+            continue;
+        };
+        if state.capabilities[table_index].remove_index(owner, index) {
+            project(
+                capability_removed(
+                    &mut state.relations,
+                    owner,
+                    capability_facts(capability, slot),
+                ),
+                "teardown_derived_capability_revoke",
+            );
+            removed += 1;
+        }
+    }
+    removed
 }
 
 fn unbind_members_without_capabilities(
@@ -193,6 +285,10 @@ fn unbind_members_without_capabilities(
 
 pub fn prepare_domain(domain: DomainToken) {
     let mut state = IPC.lock();
+    project(
+        domain_registered(&mut state.relations, domain),
+        "domain_register",
+    );
     state.capabilities[domain.slot().index()].reset(domain);
 }
 
@@ -214,6 +310,7 @@ pub fn bind_peer(creator: DomainToken, peer: DomainToken) -> Result<(), IpcError
         }
         return Err(IpcError::NoSpace);
     };
+    let child = state.capabilities[peer.slot().index()].get(peer, slot);
     state.capabilities[peer.slot().index()].install(
         peer,
         slot,
@@ -226,7 +323,18 @@ pub fn bind_peer(creator: DomainToken, peer: DomainToken) -> Result<(), IpcError
                 slot: creator_slot,
             }),
         },
-    )
+    )?;
+    project(
+        capability_installed(
+            &mut state.relations,
+            creator,
+            capability_facts(source, creator_slot),
+            peer,
+            capability_facts(child.unwrap_or(source), slot),
+        ),
+        "capability_install",
+    );
+    Ok(())
 }
 
 pub fn handle_call(frame: &mut TrapFrame, domain: DomainToken) -> SyscallOutcome {
@@ -304,7 +412,7 @@ pub fn complete_parked_recv(
         return Err(());
     };
     let endpoint_id = source.endpoint;
-    let mut transferred_slot = None;
+    let mut installed_transfer = None;
     if let Some(capability) = message.transfer() {
         let destination_slot = CapSlot::try_new(usize::from(parsed.cap_slot()));
         let installed = match destination_slot {
@@ -318,7 +426,9 @@ pub fn complete_parked_recv(
             _ => None,
         };
         match installed {
-            Some(slot) => transferred_slot = Some(slot),
+            Some(slot) => {
+                installed_transfer = Some((slot, capability));
+            },
             None => {
                 if let Some(object) = state.objects[endpoint_id.index()].as_mut() {
                     object.restore(domain, message, false);
@@ -337,8 +447,20 @@ pub fn complete_parked_recv(
     let transfer = message.transfer();
     drop(state);
     let committed = commit(&mut encoded);
-    if !committed {
-        rollback_recv(domain, endpoint_id, message, transfer, transferred_slot);
+    if committed {
+        if let Some(parent) = transfer
+            && let Some((slot, _)) = installed_transfer
+        {
+            let mut state = IPC.lock();
+            if state.capabilities[domain.slot().index()]
+                .get(domain, slot)
+                .is_some_and(|installed| installed == parent)
+            {
+                project_transferred_capability(&mut state, domain, parent, slot);
+            }
+        }
+    } else {
+        rollback_recv(domain, endpoint_id, message, installed_transfer);
     }
     committed.then_some(()).ok_or(())
 }
@@ -401,6 +523,20 @@ fn endpoint_create(domain: DomainToken) -> Result<(u64, u64), IpcError> {
     )?;
     state.objects[index] = Some(endpoint);
     state.next_object_generation += 1;
+    project(
+        endpoint_created(
+            &mut state.relations,
+            domain,
+            CapabilityFacts::new(
+                u64::from(slot.get()),
+                generation.get(),
+                generation.get(),
+                Rights::ALL.bits(),
+            ),
+        ),
+        "endpoint_create",
+    );
+    project_relation_evidence(&mut state, domain);
     Ok((0, u64::from(slot.get())))
 }
 
@@ -483,7 +619,7 @@ fn recv(frame: &mut TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcErr
         return Err(IpcError::Busy);
     };
     let endpoint_id = source.endpoint;
-    let mut transferred_slot = None;
+    let mut installed_transfer = None;
     if let Some(capability) = message.transfer() {
         let destination_slot = CapSlot::try_new(usize::from(output.cap_slot()));
         let installed = match destination_slot {
@@ -497,7 +633,9 @@ fn recv(frame: &mut TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcErr
             _ => None,
         };
         match installed {
-            Some(slot) => transferred_slot = Some(slot),
+            Some(slot) => {
+                installed_transfer = Some((slot, capability));
+            },
             None => {
                 if let Some(object) = state.objects[endpoint_id.index()].as_mut() {
                     object.restore(domain, message, false);
@@ -517,33 +655,21 @@ fn recv(frame: &mut TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcErr
     drop(state);
     let mut encoded = encoded;
     if !copy::copy_current_user(frame.rsi, &mut encoded, true) {
-        rollback_recv(domain, endpoint_id, message, transfer, transferred_slot);
+        rollback_recv(domain, endpoint_id, message, installed_transfer);
         return Err(IpcError::Faulted);
     }
+    if let Some(parent) = transfer
+        && let Some((slot, _)) = installed_transfer
+    {
+        let mut state = IPC.lock();
+        if state.capabilities[domain.slot().index()]
+            .get(domain, slot)
+            .is_some_and(|installed| installed == parent)
+        {
+            project_transferred_capability(&mut state, domain, parent, slot);
+        }
+    }
     Ok((0, abi::MAX_BUFFER_BYTES as u64))
-}
-
-fn rollback_recv(
-    domain: DomainToken,
-    endpoint_id: EndpointId,
-    message: Message,
-    transfer: Option<Capability>,
-    installed: Option<CapSlot>,
-) {
-    let mut state = IPC.lock();
-    if let Some(slot) = installed {
-        state.capabilities[domain.slot().index()].remove(domain, slot);
-    }
-    let restored = Message::new(
-        message.sender(),
-        message.tag(),
-        message.payload_len(),
-        message.payload(),
-        transfer,
-    );
-    if let Some(object) = state.objects[endpoint_id.index()].as_mut() {
-        object.restore(domain, restored, false);
-    }
 }
 
 fn cap_revoke(frame: &TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcError> {
@@ -576,18 +702,47 @@ fn cap_revoke(frame: &TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcE
     {
         return Err(IpcError::Stale);
     }
+    project(
+        capability_removed(
+            &mut state.relations,
+            domain,
+            capability_facts(removed, slot),
+        ),
+        "capability_revoke",
+    );
     let mut removed_count = 1usize;
     for entry in descendants.into_iter().flatten() {
         let (table_index, owner, index) = entry;
-        if state.capabilities[table_index].remove_index(owner, index) {
+        if let Ok(child_slot) = CapSlot::try_new(index)
+            && let Some(child) = state.capabilities[table_index].get(owner, child_slot)
+            && state.capabilities[table_index].remove_index(owner, index)
+        {
+            project(
+                capability_removed(
+                    &mut state.relations,
+                    owner,
+                    capability_facts(child, child_slot),
+                ),
+                "derived_capability_revoke",
+            );
             removed_count += 1;
         }
     }
     removed_count += revoked_messages;
     let mut wakes = [None; 2];
     unbind_members_without_capabilities(&mut state, &mut wakes);
-    if endpoint_is_unused(&state, removed.endpoint) {
-        reclaim_object(&mut state, removed.endpoint);
+    if endpoint_is_unused(&state.capabilities, removed.endpoint) {
+        let generation = state.objects[removed.endpoint.index()]
+            .as_ref()
+            .map(Endpoint::generation);
+        if reclaim_object(&mut state.objects[removed.endpoint.index()])
+            && let Some(generation) = generation
+        {
+            project(
+                endpoint_reclaimed(&mut state.relations, generation.get()),
+                "endpoint_reclaim",
+            );
+        }
     }
     drop(state);
     crate::domains::mark_ipc_peers_failed(wakes);
@@ -627,7 +782,6 @@ pub fn teardown_domain(domain: DomainToken) -> TeardownOutcome {
         state.capabilities[domain.slot().index()]
             .capability_at(index)
             .and_then(|_| CapSlot::try_new(index).ok())
-            .map(|slot| DerivationLink { domain, slot })
     });
 
     for (index, ancestor) in ancestors
@@ -635,10 +789,20 @@ pub fn teardown_domain(domain: DomainToken) -> TeardownOutcome {
         .enumerate()
         .take(abi::CAP_SLOTS_PER_DOMAIN)
     {
-        if state.capabilities[domain.slot().index()].remove_index(domain, index)
-            && let Some(slot) = ancestor
+        if let Some(slot) = ancestor
+            && let Some(capability) = state.capabilities[domain.slot().index()].get(domain, slot)
+            && state.capabilities[domain.slot().index()].remove_index(domain, index)
         {
-            outcome.capabilities += revoke_derived_capabilities(&mut state, slot);
+            project(
+                capability_removed(
+                    &mut state.relations,
+                    domain,
+                    capability_facts(capability, slot),
+                ),
+                "teardown_capability_revoke",
+            );
+            outcome.capabilities +=
+                revoke_derived_capabilities(&mut state, DerivationLink { domain, slot });
         }
     }
 
@@ -677,10 +841,22 @@ pub fn teardown_domain(domain: DomainToken) -> TeardownOutcome {
         }
     }
     for id in object_ids.into_iter().flatten() {
-        if endpoint_is_unused(&state, id) && reclaim_object(&mut state, id) {
+        let generation = state.objects[id.index()].as_ref().map(Endpoint::generation);
+        if endpoint_is_unused(&state.capabilities, id)
+            && let Some(generation) = generation
+            && reclaim_object(&mut state.objects[id.index()])
+        {
             outcome.endpoints += 1;
+            project(
+                endpoint_reclaimed(&mut state.relations, generation.get()),
+                "teardown_endpoint_reclaim",
+            );
         }
     }
+    project(
+        domain_released(&mut state.relations, domain),
+        "domain_release",
+    );
     outcome
 }
 
@@ -702,26 +878,20 @@ fn domain_has_capability(domain: DomainToken) -> bool {
         .any(|_| true)
 }
 
-fn reclaim_object(state: &mut IpcState, id: EndpointId) -> bool {
-    let Some(object) = state.objects[id.index()].as_mut() else {
-        return false;
-    };
-    let Some(next) = object.generation().next() else {
-        return false;
-    };
-    *object = Endpoint::new(next);
-    state.objects[id.index()] = None;
-    true
+#[cfg(test)]
+pub(crate) fn relations_projection_observation(
+    domain: DomainToken,
+) -> Option<(Snapshot, DeltaCursor)> {
+    projection_observation(&IPC.lock().relations, domain).ok()
 }
 
-fn endpoint_is_unused(state: &IpcState, id: EndpointId) -> bool {
-    !state.capabilities.iter().any(|table| {
-        (0..abi::CAP_SLOTS_PER_DOMAIN).any(|index| {
-            table
-                .capability_at(index)
-                .is_some_and(|capability| capability.endpoint == id)
-        })
-    })
+#[cfg(test)]
+pub(crate) fn relations_projection_fold(
+    domain: DomainToken,
+    base: Snapshot,
+    cursor: DeltaCursor,
+) -> Option<ProjectionEvidence> {
+    projection_fold_evidence(&IPC.lock().relations, domain, base, cursor).ok()
 }
 
 fn endpoint_pair(
