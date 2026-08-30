@@ -10,7 +10,7 @@ use astrid_storage::StateOwner;
 
 use super::{
     CachedProcessProjection, ProcessProjectionBinding, ProcessProjectionTargetSet,
-    ProjectionCleanup, ProjectionGeneration, arm_retain_validation_gate,
+    ProjectionCleanup, ProjectionGeneration, RetainAdmissionFailure, arm_retain_validation_gate,
     platform_process_provider_name, projection_leases_are_live, retain_locked_projection,
 };
 use crate::storage_mount::expire_lease_for_test;
@@ -55,16 +55,16 @@ async fn revocation_published_under_the_fence() {
         .revoked
         .store(true, Ordering::Release);
     gate.release().notify_one();
-    let Err(error) = tokio::time::timeout(std::time::Duration::from_secs(5), retain)
+    let retain = tokio::time::timeout(std::time::Duration::from_secs(5), retain)
         .await
         .expect("retain linearization must not deadlock")
-        .expect("retain task joins")
-    else {
+        .expect("retain task joins");
+    let Err(failure) = retain else {
         panic!("post-publication validation must refuse a reference");
     };
     assert!(
-        error.contains("became unhealthy"),
-        "unexpected error: {error}"
+        matches!(failure, RetainAdmissionFailure::Retry),
+        "unexpected retain failure: {failure:?}"
     );
     assert_eq!(fixture.projection.refs.load(Ordering::Acquire), 0);
 
@@ -111,16 +111,16 @@ async fn expiry_published_under_the_fence() {
         expire_lease_for_test(state.value());
     }
     gate.release().notify_one();
-    let Err(error) = tokio::time::timeout(std::time::Duration::from_secs(5), retain)
+    let retain = tokio::time::timeout(std::time::Duration::from_secs(5), retain)
         .await
         .expect("retain linearization must not deadlock")
-        .expect("retain task joins")
-    else {
+        .expect("retain task joins");
+    let Err(failure) = retain else {
         panic!("post-publication validation must refuse a reference");
     };
     assert!(
-        error.contains("became unhealthy"),
-        "unexpected error: {error}"
+        matches!(failure, RetainAdmissionFailure::Retry),
+        "unexpected retain failure: {failure:?}"
     );
     assert_eq!(fixture.projection.refs.load(Ordering::Acquire), 0);
 

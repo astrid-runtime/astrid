@@ -8,8 +8,13 @@ mod process_identity;
 mod process_stop;
 #[cfg(any(unix, windows))]
 use process_stop::stop_process_provider;
+mod mount_launch;
 #[cfg(any(unix, windows))]
 mod process_launch;
+use mount_launch::{
+    ProjectionLaunchTokens, ProjectionLeaseBundle, ProjectionMountPaths,
+    launch_projection_providers,
+};
 #[cfg(all(test, any(unix, windows)))]
 use process_launch::abort_process_provider;
 #[cfg(all(test, any(unix, windows)))]
@@ -44,7 +49,7 @@ pub(crate) use projection_lifecycle::{
 };
 #[cfg(any(unix, windows))]
 pub(crate) use projection_lifecycle::{
-    RetainedIssuePaths, blocked_projection_lease, cleanup_projection_state,
+    RetainAdmissionFailure, RetainedIssuePaths, blocked_projection_lease, cleanup_projection_state,
     cleanup_uncommitted_issue_lease_set, generate_parent_tokens, invalidate_unhealthy_projection,
     projection_component_mount_ids, projection_leases_are_live, retain_failed_issue_projection,
     retain_locked_projection, retry_failed_projection, rollback_or_retain_failed_launch,
@@ -279,7 +284,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             if !key.matches_projection(&projection) {
                 return Err("process projection identity mismatch".to_owned());
             }
-            let retried = if projection.cleanup_failed.load(Ordering::Acquire) {
+            if projection.cleanup_failed.load(Ordering::Acquire) {
                 // A failed last-close retains the projection in this cache so
                 // a later authenticated mount request can retry STOP/reap,
                 // lease revocation, and resource removal. Do not create a
@@ -290,7 +295,6 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                             .to_owned(),
                     );
                 }
-                true
             } else if !projection_leases_are_live(&kernel, &projection) {
                 // External revocation, expiry, or kernel-map drift makes the
                 // cached set partial or untrustworthy. Fence and clean before
@@ -303,18 +307,22 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                             .to_owned(),
                     );
                 }
-                true
             } else {
-                false
-            };
-            if !retried {
-                return retain_locked_projection(
+                drop(projections);
+                match retain_locked_projection(
                     &kernel,
                     projection,
                     Arc::clone(&self.projections),
                     key,
                 )
-                .await;
+                .await
+                {
+                    Ok(mount) => return Ok(mount),
+                    Err(RetainAdmissionFailure::Retry) => {
+                        return Box::pin(self.mount(principal)).await;
+                    },
+                    Err(RetainAdmissionFailure::Blocked(error)) => return Err(error),
+                }
             }
         }
         if let Some(error) = blocked_projection_lease(&kernel, &key.binding) {
@@ -539,323 +547,31 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             );
         }
 
-        let branch_control = branch_lease.resource_path.join("process-control.sock");
-        let owner_control = owner_lease.resource_path.join("process-control.sock");
-        let parent = StorageProviderParentLifetimeV1 {
-            pid: key.binding.generation.parent_pid,
-            start_identity: Some(key.binding.generation.start_identity.to_string()),
-            token: branch_parent_token.clone(),
+        let lease_bundle = ProjectionLeaseBundle {
+            branch: branch_lease.clone(),
+            owner: owner_lease.clone(),
+            shared: shared_lease.clone(),
         };
-        let branch_launch = StorageProviderServiceLaunchV1 {
-            schema: STORAGE_FILESYSTEM_SERVICE_LAUNCH_SCHEMA_V1,
-            lease: branch_lease.clone(),
-            mountpoint: workspace_mountpoint.clone(),
-            control_path: branch_control.clone(),
-            parent: parent.clone(),
+        let launch_tokens = ProjectionLaunchTokens {
+            branch: branch_parent_token,
+            owner: owner_parent_token,
+            shared: shared_parent_token,
         };
-        let owner_launch = StorageProviderServiceLaunchV1 {
-            schema: STORAGE_FILESYSTEM_SERVICE_LAUNCH_SCHEMA_V1,
-            lease: owner_lease.clone(),
-            mountpoint: home_mountpoint.clone(),
-            control_path: owner_control.clone(),
-            parent: StorageProviderParentLifetimeV1 {
-                pid: parent.pid,
-                start_identity: Some(key.binding.generation.start_identity.to_string()),
-                token: owner_parent_token.clone(),
-            },
-        };
-        let shared_launch =
-            shared_lease
-                .as_ref()
-                .zip(shared_parent_token.as_ref())
-                .map(|(lease, token)| StorageProviderServiceLaunchV1 {
-                    schema: STORAGE_FILESYSTEM_SERVICE_LAUNCH_SCHEMA_V1,
-                    lease: lease.clone(),
-                    mountpoint: fleet_shared_mountpoint
-                        .as_ref()
-                        .expect("shared lease has a mountpoint")
-                        .clone(),
-                    control_path: lease.resource_path.join("process-control.sock"),
-                    parent: StorageProviderParentLifetimeV1 {
-                        pid: parent.pid,
-                        start_identity: parent.start_identity.clone(),
-                        token: token.clone(),
-                    },
-                });
-        let branch_child = match launch_process_provider(
-            &branch_launch,
-            process_launch::ProcessLaunchStage::Branch,
-            kernel.process_stop_policy,
-        )
-        .await
-        {
-            Ok(child) => child,
-            Err(error) => {
-                let cleanup_state = ProjectionCleanupState {
-                    kernel: Arc::downgrade(&kernel),
-                    stop_policy: kernel.process_stop_policy,
-                    binding: key.binding.clone(),
-                    branch: ProjectionLeaseProvider {
-                        running: RunningProvider {
-                            child: error.child.map(|child| *child),
-                            control_path: branch_control.clone(),
-                            token: branch_parent_token.clone(),
-                            stopped: error.cleanup_ok,
-                        },
-                        lease: ProjectionLeaseTarget {
-                            mount_id: branch_lease.mount_id,
-                            target: key.binding.targets.workspace.clone(),
-                        },
-                    },
-                    owner: ProjectionLeaseProvider {
-                        running: RunningProvider {
-                            child: None,
-                            control_path: owner_control.clone(),
-                            token: owner_parent_token.clone(),
-                            stopped: true,
-                        },
-                        lease: ProjectionLeaseTarget {
-                            mount_id: owner_lease.mount_id,
-                            target: key.binding.targets.owner_home.clone(),
-                        },
-                    },
-                    shared: shared_lease.as_ref().zip(shared_parent_token.as_ref()).map(
-                        |(lease, token)| ProjectionLeaseProvider {
-                            running: RunningProvider {
-                                child: None,
-                                control_path: lease.resource_path.join("process-control.sock"),
-                                token: token.clone(),
-                                stopped: true,
-                            },
-                            lease: ProjectionLeaseTarget {
-                                mount_id: lease.mount_id,
-                                target: key
-                                    .binding
-                                    .targets
-                                    .fleet_shared
-                                    .as_ref()
-                                    .expect("shared lease has a Fleet target")
-                                    .clone(),
-                            },
-                        },
-                    ),
-                    mount_root: mount_root.clone(),
-                    cleaned: false,
-                };
-                rollback_or_retain_failed_launch(
-                    &mut projections,
-                    &key,
-                    workspace_mountpoint.clone(),
-                    home_mountpoint.clone(),
-                    fleet_shared_mountpoint.clone(),
-                    cleanup_state,
-                )
-                .await;
-                return Err(error.message);
-            },
-        };
-        let owner_child = match launch_process_provider(
-            &owner_launch,
-            process_launch::ProcessLaunchStage::OwnerHome,
-            kernel.process_stop_policy,
-        )
-        .await
-        {
-            Ok(child) => child,
-            Err(error) => {
-                let cleanup_state = ProjectionCleanupState {
-                    kernel: Arc::downgrade(&kernel),
-                    stop_policy: kernel.process_stop_policy,
-                    binding: key.binding.clone(),
-                    branch: ProjectionLeaseProvider {
-                        running: RunningProvider {
-                            child: Some(branch_child),
-                            control_path: branch_control.clone(),
-                            token: branch_parent_token.clone(),
-                            stopped: false,
-                        },
-                        lease: ProjectionLeaseTarget {
-                            mount_id: branch_lease.mount_id,
-                            target: key.binding.targets.workspace.clone(),
-                        },
-                    },
-                    owner: ProjectionLeaseProvider {
-                        running: RunningProvider {
-                            child: error.child.map(|child| *child),
-                            control_path: owner_control.clone(),
-                            token: owner_parent_token.clone(),
-                            stopped: error.cleanup_ok,
-                        },
-                        lease: ProjectionLeaseTarget {
-                            mount_id: owner_lease.mount_id,
-                            target: key.binding.targets.owner_home.clone(),
-                        },
-                    },
-                    shared: shared_lease.as_ref().zip(shared_parent_token.as_ref()).map(
-                        |(lease, token)| ProjectionLeaseProvider {
-                            running: RunningProvider {
-                                child: None,
-                                control_path: lease.resource_path.join("process-control.sock"),
-                                token: token.clone(),
-                                stopped: true,
-                            },
-                            lease: ProjectionLeaseTarget {
-                                mount_id: lease.mount_id,
-                                target: key
-                                    .binding
-                                    .targets
-                                    .fleet_shared
-                                    .as_ref()
-                                    .expect("shared lease has a Fleet target")
-                                    .clone(),
-                            },
-                        },
-                    ),
-                    mount_root: mount_root.clone(),
-                    cleaned: false,
-                };
-                rollback_or_retain_failed_launch(
-                    &mut projections,
-                    &key,
-                    workspace_mountpoint.clone(),
-                    home_mountpoint.clone(),
-                    fleet_shared_mountpoint.clone(),
-                    cleanup_state,
-                )
-                .await;
-                return Err(error.message);
-            },
-        };
-        let mut shared_child = if let Some(shared_launch) = shared_launch.clone() {
-            match launch_process_provider(
-                &shared_launch,
-                process_launch::ProcessLaunchStage::FleetShared,
-                kernel.process_stop_policy,
-            )
-            .await
-            {
-                Ok(child) => Some((child, shared_launch)),
-                Err(error) => {
-                    let cleanup_state = ProjectionCleanupState {
-                        kernel: Arc::downgrade(&kernel),
-                        stop_policy: kernel.process_stop_policy,
-                        binding: key.binding.clone(),
-                        branch: ProjectionLeaseProvider {
-                            running: RunningProvider {
-                                child: Some(branch_child),
-                                control_path: branch_control.clone(),
-                                token: branch_parent_token.clone(),
-                                stopped: false,
-                            },
-                            lease: ProjectionLeaseTarget {
-                                mount_id: branch_lease.mount_id,
-                                target: key.binding.targets.workspace.clone(),
-                            },
-                        },
-                        owner: ProjectionLeaseProvider {
-                            running: RunningProvider {
-                                child: Some(owner_child),
-                                control_path: owner_control.clone(),
-                                token: owner_parent_token.clone(),
-                                stopped: false,
-                            },
-                            lease: ProjectionLeaseTarget {
-                                mount_id: owner_lease.mount_id,
-                                target: key.binding.targets.owner_home.clone(),
-                            },
-                        },
-                        shared: shared_lease.as_ref().map(|lease| ProjectionLeaseProvider {
-                            running: RunningProvider {
-                                child: error.child.map(|child| *child),
-                                control_path: lease.resource_path.join("process-control.sock"),
-                                token: shared_parent_token
-                                    .as_ref()
-                                    .expect("shared lease has a parent token")
-                                    .clone(),
-                                stopped: error.cleanup_ok,
-                            },
-                            lease: ProjectionLeaseTarget {
-                                mount_id: lease.mount_id,
-                                target: key
-                                    .binding
-                                    .targets
-                                    .fleet_shared
-                                    .as_ref()
-                                    .expect("shared lease has a Fleet target")
-                                    .clone(),
-                            },
-                        }),
-                        mount_root: mount_root.clone(),
-                        cleaned: false,
-                    };
-                    rollback_or_retain_failed_launch(
-                        &mut projections,
-                        &key,
-                        workspace_mountpoint.clone(),
-                        home_mountpoint.clone(),
-                        fleet_shared_mountpoint.clone(),
-                        cleanup_state,
-                    )
-                    .await;
-                    return Err(error.message);
-                },
-            }
-        } else {
-            None
-        };
-        let cleanup_state = Arc::new(tokio::sync::Mutex::new(ProjectionCleanupState {
-            kernel: Arc::downgrade(&kernel),
-            stop_policy: kernel.process_stop_policy,
-            binding: key.binding.clone(),
-            branch: ProjectionLeaseProvider {
-                running: RunningProvider {
-                    child: Some(branch_child),
-                    control_path: branch_control,
-                    token: branch_launch.parent.token,
-                    stopped: false,
-                },
-                lease: ProjectionLeaseTarget {
-                    mount_id: branch_lease.mount_id,
-                    target: key.binding.targets.workspace.clone(),
-                },
-            },
-            owner: ProjectionLeaseProvider {
-                running: RunningProvider {
-                    child: Some(owner_child),
-                    control_path: owner_control,
-                    token: owner_launch.parent.token,
-                    stopped: false,
-                },
-                lease: ProjectionLeaseTarget {
-                    mount_id: owner_lease.mount_id,
-                    target: key.binding.targets.owner_home.clone(),
-                },
-            },
-            shared: shared_child
-                .take()
-                .map(|(child, launch)| ProjectionLeaseProvider {
-                    running: RunningProvider {
-                        child: Some(child),
-                        control_path: launch.control_path,
-                        token: launch.parent.token,
-                        stopped: false,
-                    },
-                    lease: ProjectionLeaseTarget {
-                        mount_id: shared_lease
-                            .as_ref()
-                            .expect("shared child has an issued lease")
-                            .mount_id,
-                        target: key
-                            .binding
-                            .targets
-                            .fleet_shared
-                            .clone()
-                            .expect("shared child has a Fleet target"),
-                    },
-                }),
+        let launch_paths = ProjectionMountPaths {
             mount_root: mount_root.clone(),
-            cleaned: false,
-        }));
+            workspace: workspace_mountpoint.clone(),
+            owner: home_mountpoint.clone(),
+            fleet_shared: fleet_shared_mountpoint.clone(),
+        };
+        let cleanup_state = launch_projection_providers(
+            &kernel,
+            &mut projections,
+            &key,
+            &lease_bundle,
+            &launch_tokens,
+            &launch_paths,
+        )
+        .await?;
         let cleanup_state_for_projection = Arc::clone(&cleanup_state);
         let cleanup: ProjectionCleanup = Arc::new(move || {
             let cleanup_state = Arc::clone(&cleanup_state_for_projection);
@@ -882,13 +598,21 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             cleanup,
         });
         projections.insert(key.clone(), Arc::clone(&projection));
-        retain_locked_projection(
+        match retain_locked_projection(
             &kernel,
             Arc::clone(&projection),
             Arc::clone(&self.projections),
             key.clone(),
         )
         .await
+        {
+            Ok(mount) => Ok(mount),
+            Err(RetainAdmissionFailure::Retry) => {
+                drop(projections);
+                Box::pin(self.mount(principal)).await
+            },
+            Err(RetainAdmissionFailure::Blocked(error)) => Err(error),
+        }
     }
 }
 

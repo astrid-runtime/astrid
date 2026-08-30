@@ -1,6 +1,5 @@
 //! A degraded exact component set must invalidate its cached projection.
 
-use std::path::Path;
 use std::sync::{Arc, atomic::Ordering};
 
 use astrid_capsule::context::ProcessStorageMountBroker as _;
@@ -8,8 +7,8 @@ use astrid_core::PrincipalId;
 
 use super::{KernelProcessStorageMountBroker, fleet_shared_kernel};
 use crate::storage_mount::process_broker::{
-    CachedProcessProjection, ProcessProjectionKey, ProjectionCleanup, RetainedIssuePaths,
-    arm_retain_reference_gate, arm_retain_validation_gate, cleanup_uncommitted_issue_lease_set,
+    CachedProcessProjection, ProjectionCleanup, RetainedIssuePaths, arm_retain_reference_gate,
+    arm_retain_validation_gate, cleanup_uncommitted_issue_lease_set,
     invalidate_unhealthy_projection, retain_failed_issue_projection,
 };
 use crate::storage_mount::{MountOwnerScope, issue_lease, revoke_lease};
@@ -43,6 +42,14 @@ fn provider_lane_is_ready(test_name: &str) -> bool {
 struct CachedMount {
     mount: astrid_capsule::context::ProcessStorageMount,
     projection: Arc<CachedProcessProjection>,
+}
+
+fn uuid_mount_root(mount: &astrid_capsule::context::ProcessStorageMount) -> std::path::PathBuf {
+    mount
+        .workspace_root
+        .parent()
+        .expect("workspace leaf has a UUID projection root")
+        .to_path_buf()
 }
 
 async fn successful_fleet_mount(
@@ -90,6 +97,7 @@ async fn assert_replacement_after_unhealthy_hit(
     test_id: u64,
 ) {
     let stale_root = stale.mount.workspace_root.clone();
+    let stale_mount_root = uuid_mount_root(&stale.mount);
     let stale_projection = stale.projection;
     let replacement_mount = super::PROCESS_MOUNT_TEST_ID
         .scope(test_id, broker.mount(caller))
@@ -98,6 +106,10 @@ async fn assert_replacement_after_unhealthy_hit(
     assert_ne!(
         replacement_mount.workspace_root, stale_root,
         "a replacement must not return the stale provider root"
+    );
+    assert!(
+        !stale_mount_root.exists(),
+        "cleanup must remove the stale UUID projection root"
     );
     assert!(
         stale_projection
@@ -157,10 +169,19 @@ async fn fresh_admission_has_exactly_one_guard_reference() {
     let mount_root = first
         .workspace_root
         .parent()
-        .and_then(Path::parent)
         .expect("fresh UUID mount root")
         .to_path_buf();
     assert!(mount_root.exists(), "fresh admission must start its root");
+    assert!(
+        mount_root.file_name().is_some_and(|name| {
+            name.len() == 32
+                && name
+                    .to_string_lossy()
+                    .chars()
+                    .all(|char| char.is_ascii_hexdigit())
+        }),
+        "the projection parent must be one UUID incarnation, not the shared process-storage parent"
+    );
     let projections = broker.projections.lock().await;
     assert_eq!(projections.len(), 1);
     let projection = Arc::clone(projections.values().next().expect("fresh projection"));
@@ -350,6 +371,45 @@ async fn revocation_cannot_interleave_validation_and_cached_reference() {
 
     replacement_mount.close_async().await;
     stale.mount.close_async().await;
+    assert!(kernel.storage_mounts.is_empty());
+    assert!(broker.projections.lock().await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expiry_cannot_interleave_validation_and_cached_reference() {
+    if !provider_lane_is_ready("expiry_cannot_interleave_validation_and_cached_reference") {
+        return;
+    }
+    let (_temporary, kernel) = fleet_shared_kernel().await;
+    let caller = PrincipalId::default();
+    let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
+    let stale = successful_fleet_mount(&kernel, &caller, &broker, 611).await;
+
+    let gate = arm_retain_validation_gate();
+    let mount_broker = broker.clone();
+    let mount_caller = caller.clone();
+    let mount_task = tokio::spawn(async move {
+        super::PROCESS_MOUNT_TEST_ID
+            .scope(612, mount_broker.mount(&mount_caller))
+            .await
+    });
+    gate.entered().notified().await;
+    for mount_id in &stale.projection.component_mount_ids {
+        kernel
+            .storage_mounts
+            .get(mount_id)
+            .expect("recorded exact component")
+            .expires_at_epoch_secs
+            .store(0, Ordering::Release);
+    }
+    gate.release().notify_one();
+
+    let replacement_mount = mount_task
+        .await
+        .expect("mount admission task")
+        .expect("validated expiry must admit a replacement after exact cleanup");
+    assert_replacement_after_unhealthy_hit(&kernel, &caller, &broker, stale, 613).await;
+    replacement_mount.close_async().await;
     assert!(kernel.storage_mounts.is_empty());
     assert!(broker.projections.lock().await.is_empty());
 }
@@ -662,180 +722,36 @@ async fn failed_issue_cleanup_retains_root_and_retry_authority() {
     );
 }
 
-struct RetainedFreshFixture {
-    key: ProcessProjectionKey,
-    projection: Arc<CachedProcessProjection>,
-    mount_root: std::path::PathBuf,
-}
-
-async fn install_fresh_retained_projection(
-    kernel: &Arc<crate::Kernel>,
-    broker: &KernelProcessStorageMountBroker,
-    fixture: &super::ExactFenceFixture,
-    root_name: &str,
-) -> RetainedFreshFixture {
-    let key = ProcessProjectionKey {
-        binding: fixture.binding.clone(),
-        read_write: true,
-    };
-    let mount_root = fixture
-        .kernel
-        .astrid_home
-        .run_dir()
-        .join("process-storage")
-        .join(root_name);
-    std::fs::create_dir_all(&mount_root).expect("create fresh validation root");
-    let cleanup_kernel = Arc::downgrade(kernel);
-    let component_mount_ids = fixture
-        .states
-        .iter()
-        .map(|state| state.mount_id)
-        .collect::<Vec<_>>();
-    let cleanup_root = mount_root.clone();
-    let closure_mount_ids = component_mount_ids.clone();
-    let cleanup: ProjectionCleanup = Arc::new(move || {
-        let kernel = cleanup_kernel.clone();
-        let mount_ids = closure_mount_ids.clone();
-        let mount_root = cleanup_root.clone();
-        Box::pin(async move {
-            let Some(kernel) = kernel.upgrade() else {
-                return false;
-            };
-            let states = mount_ids
-                .iter()
-                .filter_map(|mount_id| {
-                    kernel.storage_mounts.get(mount_id).map(|entry| {
-                        assert_eq!(entry.value().mount_id, *mount_id);
-                        Arc::clone(entry.value())
-                    })
-                })
-                .collect::<Vec<_>>();
-            // An externally revoked and already-cleaned member is absent and
-            // therefore clean; the remaining exact IDs must still unmap.
-            let _mutation_guard = kernel.storage_mount_mutations.lock().await;
-            for state in &states {
-                if crate::storage_mount::lifecycle::cleanup_mapped_lease(&kernel, state).is_err() {
-                    return false;
-                }
-            }
-            std::fs::remove_dir_all(mount_root).is_ok()
-        })
-    });
-    let projection = Arc::new(CachedProcessProjection {
-        binding: fixture.binding.clone(),
-        component_mount_ids,
-        workspace_mountpoint: mount_root.join("workspace"),
-        home_mountpoint: mount_root.join("owner"),
-        fleet_shared_mountpoint: Some(mount_root.join("shared")),
-        refs: std::sync::atomic::AtomicU64::new(0),
-        closing: std::sync::atomic::AtomicBool::new(false),
-        cleanup_failed: std::sync::atomic::AtomicBool::new(false),
-        cleanup,
-    });
-    broker
-        .projections
-        .lock()
-        .await
-        .insert(key.clone(), Arc::clone(&projection));
-    RetainedFreshFixture {
-        key,
-        projection,
-        mount_root,
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revocation_after_validation_before_reference_admits_replacement() {
+    if !provider_lane_is_ready("revocation_after_validation_before_reference_admits_replacement") {
+        return;
     }
-}
-
-async fn assert_fresh_failure_retains_and_retries(
-    kernel: &Arc<crate::Kernel>,
-    projections: &Arc<
-        tokio::sync::Mutex<
-            std::collections::BTreeMap<ProcessProjectionKey, Arc<CachedProcessProjection>>,
-        >,
-    >,
-    fresh: RetainedFreshFixture,
-) {
-    assert!(fresh.projection.cleanup_failed.load(Ordering::Acquire));
-    assert_eq!(fresh.projection.refs.load(Ordering::Acquire), 0);
-    assert_eq!(projections.lock().await.len(), 1);
-    assert!(fresh.mount_root.exists());
-
-    let mut retained = projections.lock().await.clone();
-    assert!(
-        super::retry_failed_projection(&fresh.projection, &mut retained, &fresh.key).await,
-        "a retained fresh-validation failure must remain retryable"
-    );
-    assert!(!fresh.projection.cleanup_failed.load(Ordering::Acquire));
-    assert!(
-        fresh
-            .projection
-            .component_mount_ids
-            .iter()
-            .all(|mount_id| !kernel.storage_mounts.contains_key(mount_id))
-    );
-    assert!(!fresh.mount_root.exists());
-    let mut current = projections.lock().await;
-    if current
-        .get(&fresh.key)
-        .is_some_and(|current| Arc::ptr_eq(current, &fresh.projection))
-    {
-        current.remove(&fresh.key);
-    }
-    assert!(current.is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fresh_publication_expiry_before_validation_is_retained_for_retry() {
-    let fixture = super::exact_fence_fixture().await;
-    let caller = fixture.caller.clone();
-    let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&fixture.kernel));
-    let fresh =
-        install_fresh_retained_projection(&fixture.kernel, &broker, &fixture, "fresh-validation")
-            .await;
-
-    let gate = arm_retain_validation_gate();
-    let mount_broker = broker.clone();
-    let mount_caller = caller.clone();
-    let mount_task = tokio::spawn(async move { mount_broker.mount(&mount_caller).await });
-    gate.entered().notified().await;
-    for state in &fixture.states {
-        state.expires_at_epoch_secs.store(0, Ordering::Release);
-    }
-    gate.release().notify_one();
-
-    assert!(mount_task.await.expect("fresh mount task").is_err());
-    for mount_id in &fresh.projection.component_mount_ids {
-        assert!(
-            fixture.kernel.storage_mounts.contains_key(mount_id),
-            "expired fresh authority must remain mapped for retained retry"
-        );
-    }
-    assert_fresh_failure_retains_and_retries(&fixture.kernel, &broker.projections, fresh).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-async fn revocation_after_validation_cannot_acquire_a_reference() {
-    let fixture = super::exact_fence_fixture().await;
-    let caller = fixture.caller.clone();
-    let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&fixture.kernel));
-    let fresh = install_fresh_retained_projection(
-        &fixture.kernel,
-        &broker,
-        &fixture,
-        "post-validation-revoke",
-    )
-    .await;
-    let owner_mount_id = fresh.projection.component_mount_ids[1];
-    let owner_state = Arc::clone(&fixture.states[1]);
+    let (_temporary, kernel) = fleet_shared_kernel().await;
+    let caller = PrincipalId::default();
+    let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
+    let stale = successful_fleet_mount(&kernel, &caller, &broker, 621).await;
+    let owner_mount_id = stale.projection.component_mount_ids[1];
+    let owner_state = kernel
+        .storage_mounts
+        .get(&owner_mount_id)
+        .map(|entry| Arc::clone(entry.value()))
+        .expect("owner component");
 
     let validation_gate = arm_retain_validation_gate();
     let reference_gate = arm_retain_reference_gate();
     let mount_broker = broker.clone();
     let mount_caller = caller.clone();
-    let mount_task = tokio::spawn(async move { mount_broker.mount(&mount_caller).await });
+    let mount_task = tokio::spawn(async move {
+        super::PROCESS_MOUNT_TEST_ID
+            .scope(622, mount_broker.mount(&mount_caller))
+            .await
+    });
     validation_gate.entered().notified().await;
     validation_gate.release().notify_one();
     reference_gate.entered().notified().await;
 
-    let revoke_kernel = Arc::clone(&fixture.kernel);
+    let revoke_kernel = Arc::clone(&kernel);
     let revoke_caller = caller.clone();
     let revocation = tokio::spawn(async move {
         revoke_lease(
@@ -849,25 +765,22 @@ async fn revocation_after_validation_cannot_acquire_a_reference() {
     while !owner_state.revoked.load(Ordering::Acquire) {
         tokio::task::yield_now().await;
     }
+    assert!(
+        owner_state.wait_listener_closed().await,
+        "revocation must drain the component listener before reference release"
+    );
     reference_gate.release().notify_one();
 
-    assert!(
-        mount_task
-            .await
-            .expect("post-validation mount task")
-            .is_err()
-    );
-    assert_eq!(fresh.projection.refs.load(Ordering::Acquire), 0);
-    assert!(fresh.projection.cleanup_failed.load(Ordering::Acquire));
-    for mount_id in &fresh.projection.component_mount_ids {
-        assert!(
-            fixture.kernel.storage_mounts.contains_key(mount_id),
-            "post-validation revocation must remain linearized before retained retry"
-        );
-    }
+    let replacement_mount = mount_task
+        .await
+        .expect("post-validation mount task")
+        .expect("the pre-reference interval must clean and replace in the same admission");
     revocation
         .await
         .expect("post-validation revocation task")
         .expect("post-validation revocation");
-    assert_fresh_failure_retains_and_retries(&fixture.kernel, &broker.projections, fresh).await;
+    assert_replacement_after_unhealthy_hit(&kernel, &caller, &broker, stale, 623).await;
+    replacement_mount.close_async().await;
+    assert!(kernel.storage_mounts.is_empty());
+    assert!(broker.projections.lock().await.is_empty());
 }

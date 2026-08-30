@@ -25,16 +25,34 @@ pub(super) async fn drain_accepted_tasks(state: &StorageMountLeaseState) -> bool
     true
 }
 
-pub(super) async fn drain_blocking_jobs(state: &StorageMountLeaseState) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BlockingJobDrain {
+    Completed,
+    JoinFailed,
+    TimedOut,
+}
+
+pub(super) async fn drain_blocking_jobs(state: &StorageMountLeaseState) -> BlockingJobDrain {
     let mut jobs = state.blocking_jobs.lock().await;
+    let mut join_failed = false;
     let drain = async {
         while let Some(result) = jobs.join_next().await {
-            let _ = result;
+            if result.is_err() {
+                join_failed = true;
+            }
         }
     };
-    tokio::time::timeout(state.drain_timeouts().accepted_task, drain)
+    if tokio::time::timeout(state.drain_timeouts().accepted_task, drain)
         .await
-        .is_ok()
+        .is_err()
+    {
+        return BlockingJobDrain::TimedOut;
+    }
+    if join_failed {
+        BlockingJobDrain::JoinFailed
+    } else {
+        BlockingJobDrain::Completed
+    }
 }
 
 /// A drain timeout is not completion. Keep the revoked lease's admitted jobs

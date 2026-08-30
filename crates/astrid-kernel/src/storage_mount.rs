@@ -35,6 +35,8 @@ use tokio::sync::{oneshot, watch};
 
 use crate::Kernel;
 
+#[cfg(all(test, any(unix, windows)))]
+mod blocking_worker_gate;
 mod callback_wire;
 mod filesystem;
 use callback_wire::{CallbackRequest, CallbackResponse, read_request, response_v2, write_response};
@@ -71,12 +73,15 @@ pub(crate) use lifecycle::{
 pub(crate) use lifecycle::{lease_status, sync_lease};
 #[cfg(any(unix, windows))]
 use retained_jobs::{
-    drain_accepted_tasks, drain_blocking_jobs, endpoint_became_absent, finish_retained_jobs,
+    BlockingJobDrain, drain_accepted_tasks, drain_blocking_jobs, endpoint_became_absent,
+    finish_retained_jobs,
 };
 #[cfg(any(unix, windows))]
 mod process_broker;
 #[cfg(any(unix, windows))]
 mod retained_jobs;
+#[cfg(all(test, any(unix, windows)))]
+use blocking_worker_gate::BlockingWorkerTestGate;
 #[cfg(any(unix, windows))]
 pub(crate) use process_broker::KernelProcessStorageMountBroker;
 pub(crate) use process_broker::ProcessStopPolicy;
@@ -133,6 +138,8 @@ pub(crate) struct StorageMountLeaseState {
     listener_closed_tx: watch::Sender<bool>,
     #[cfg(test)]
     mutation_test_gate: std::sync::Mutex<Option<Arc<MutationTestGate>>>,
+    #[cfg(all(test, any(unix, windows)))]
+    blocking_worker_test_gate: std::sync::Mutex<Option<Arc<BlockingWorkerTestGate>>>,
     #[cfg(test)]
     cleanup_fault: std::sync::Mutex<Option<MountCleanupStage>>,
     /// Durable marker proving a mapped lease's host resources were removed.
@@ -242,6 +249,14 @@ impl StorageMountLeaseState {
         }
         self.renew();
         Some(AdmissionGuard { _guard: guard })
+    }
+
+    #[cfg(all(test, any(unix, windows)))]
+    fn blocking_worker_gate_for_test(&self) -> Option<Arc<BlockingWorkerTestGate>> {
+        self.blocking_worker_test_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn public_lease(&self, token: String) -> StorageMountLeaseV1 {
@@ -370,6 +385,8 @@ fn publish_issued_lease(
             accepted_task: ACCEPTED_TASK_DRAIN_TIMEOUT,
             listener_shutdown: LISTENER_SHUTDOWN_TIMEOUT,
         }),
+        #[cfg(all(test, any(unix, windows)))]
+        blocking_worker_test_gate: std::sync::Mutex::new(None),
         #[cfg(all(test, any(unix, windows)))]
         token_for_test: token.clone(),
         listener_closed_tx,
@@ -646,9 +663,17 @@ async fn serve_listener(
     drop(accepted);
     drop(listener);
     let accepted_drained = drain_accepted_tasks(&state).await;
-    let blocking_drained = accepted_drained && drain_blocking_jobs(&state).await;
+    let blocking_drain = if accepted_drained {
+        drain_blocking_jobs(&state).await
+    } else {
+        BlockingJobDrain::TimedOut
+    };
+    let blocking_drained = blocking_drain == BlockingJobDrain::Completed;
     if !blocking_drained {
-        tracing::warn!("storage mount retained filesystem jobs exceeded their drain bound");
+        tracing::warn!(
+            ?blocking_drain,
+            "storage mount retained filesystem jobs failed to drain"
+        );
         finish_retained_jobs(&state).await;
         return;
     }
@@ -745,6 +770,8 @@ async fn execute_operation(
     let owner = state.owner;
     let target = state.target.clone();
     let retained_state = Arc::clone(&state);
+    #[cfg(all(test, any(unix, windows)))]
+    let blocking_worker_gate = state.blocking_worker_gate_for_test();
     let (outcome_tx, outcome_rx) = oneshot::channel();
     state.blocking_jobs.lock().await.spawn(async move {
         // The guard moves with the retained job: cancelling the callback
@@ -755,28 +782,34 @@ async fn execute_operation(
         if is_mutation {
             pause_mutation_for_test(&retained_state).await;
         }
-        let result = tokio::task::spawn_blocking(move || match target {
-            StorageFilesystemTargetV1::OwnerRoot => {
-                let filesystem = AstridFilesystem::new(store.content(), owner);
-                execute_blocking(&filesystem, operation)
-            },
-            StorageFilesystemTargetV1::WorkspaceBranch { workspace } => {
-                let branches = WorkspaceBranchStore::new(store.content());
-                let filesystem = branches.filesystem(owner, workspace);
-                execute_blocking(&filesystem, operation)
-            },
-            StorageFilesystemTargetV1::OwnerSubtree { prefix } => {
-                if prefix == "shared" {
-                    let filesystem = AstridFilesystem::new_fleet_shared(store.content(), owner);
+        let result = tokio::task::spawn_blocking(move || {
+            #[cfg(all(test, any(unix, windows)))]
+            if let Some(gate) = blocking_worker_gate {
+                gate.run_worker();
+            }
+            match target {
+                StorageFilesystemTargetV1::OwnerRoot => {
+                    let filesystem = AstridFilesystem::new(store.content(), owner);
                     execute_blocking(&filesystem, operation)
-                } else {
-                    let filesystem = PrefixedFilesystem {
-                        inner: AstridFilesystem::new(store.content(), owner),
-                        prefix,
-                    };
+                },
+                StorageFilesystemTargetV1::WorkspaceBranch { workspace } => {
+                    let branches = WorkspaceBranchStore::new(store.content());
+                    let filesystem = branches.filesystem(owner, workspace);
                     execute_blocking(&filesystem, operation)
-                }
-            },
+                },
+                StorageFilesystemTargetV1::OwnerSubtree { prefix } => {
+                    if prefix == "shared" {
+                        let filesystem = AstridFilesystem::new_fleet_shared(store.content(), owner);
+                        execute_blocking(&filesystem, operation)
+                    } else {
+                        let filesystem = PrefixedFilesystem {
+                            inner: AstridFilesystem::new(store.content(), owner),
+                            prefix,
+                        };
+                        execute_blocking(&filesystem, operation)
+                    }
+                },
+            }
         })
         .await;
         if let Ok(Ok(_)) = result.as_ref() {

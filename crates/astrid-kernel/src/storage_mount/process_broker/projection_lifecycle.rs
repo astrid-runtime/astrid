@@ -697,6 +697,18 @@ pub(crate) fn retain_cached_projection(projection: &CachedProcessProjection) -> 
     Ok(())
 }
 
+#[derive(Debug)]
+pub(crate) enum RetainAdmissionFailure {
+    Retry,
+    Blocked(String),
+}
+
+impl From<String> for RetainAdmissionFailure {
+    fn from(error: String) -> Self {
+        Self::Blocked(error)
+    }
+}
+
 pub(crate) async fn retain_locked_projection(
     kernel: &Kernel,
     projection: Arc<CachedProcessProjection>,
@@ -706,32 +718,47 @@ pub(crate) async fn retain_locked_projection(
         >,
     >,
     key: ProcessProjectionKey,
-) -> Result<astrid_capsule::context::ProcessStorageMount, String> {
+) -> Result<astrid_capsule::context::ProcessStorageMount, RetainAdmissionFailure> {
     // Validation and reference acquisition share the publication/drain lock.
     // Revocation publishes its atomic state transition without waiting behind
     // an in-flight writer, so the post-reference recheck closes that interval:
     // either the retain observes revocation and takes no reference, or the
     // revoke observes the reference and invalidates the already admitted set.
-    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
-    #[cfg(all(test, any(unix, windows)))]
-    pause_retain_validation_for_test().await;
+    let mutation_guard = kernel.storage_mount_mutations.lock().await;
     if !projection_leases_are_live(kernel, &projection) {
         // Publication already happened. Keep this exact ownerless entry as a
         // retry blocker instead of dropping live provider resources.
         projection.cleanup_failed.store(true, Ordering::Release);
-        return Err("native process storage projection became unhealthy".to_owned());
+        return Err("native process storage projection became unhealthy"
+            .to_owned()
+            .into());
     }
+    #[cfg(all(test, any(unix, windows)))]
+    pause_retain_validation_for_test().await;
     #[cfg(all(test, any(unix, windows)))]
     pause_retain_reference_for_test().await;
     if !projection_leases_are_live(kernel, &projection) {
-        projection.cleanup_failed.store(true, Ordering::Release);
-        return Err("native process storage projection became unhealthy".to_owned());
+        // The revocation/expiry interval is closed before a reference exists.
+        // Drop the writer fence first because bounded invalidation must drain
+        // listeners and perform exact resource cleanup. A successful cleanup
+        // becomes a same-admission replacement; provider drift or incomplete
+        // cleanup stays an administrative blocker.
+        drop(mutation_guard);
+        let mut projections = cache.lock().await;
+        if !invalidate_unhealthy_projection(kernel, &projection, &mut projections, &key).await {
+            return Err(RetainAdmissionFailure::Blocked(
+                "native process storage projection requires administrative cleanup".to_owned(),
+            ));
+        }
+        return Err(RetainAdmissionFailure::Retry);
     }
     retain_cached_projection(&projection)?;
     if !projection_leases_are_live(kernel, &projection) {
         projection.refs.fetch_sub(1, Ordering::AcqRel);
         projection.cleanup_failed.store(true, Ordering::Release);
-        return Err("native process storage projection became unhealthy".to_owned());
+        return Err("native process storage projection became unhealthy"
+            .to_owned()
+            .into());
     }
     Ok(projection_mount(projection, cache, key))
 }
