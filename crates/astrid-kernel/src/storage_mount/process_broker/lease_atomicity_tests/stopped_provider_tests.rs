@@ -49,6 +49,7 @@ async fn failed_stop_retains_blocker_until_provider_cleanup_succeeds() {
         .expect("spawn exited test child");
     let cleanup_state = ProjectionCleanupState {
         kernel: Arc::downgrade(&kernel),
+        stop_policy: crate::storage_mount::process_broker::ProcessStopPolicy::default(),
         binding: binding.clone(),
         branch: ProjectionLeaseProvider {
             running: RunningProvider {

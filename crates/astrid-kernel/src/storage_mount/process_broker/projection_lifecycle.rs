@@ -12,9 +12,9 @@ use std::{
 
 use super::{
     CachedProcessProjection, Kernel, ProcessProjectionBinding, ProcessProjectionKey,
-    ProcessProjectionTarget, ProcessProjectionTargetSet, ProjectionCleanup, StorageMountId,
-    StorageProviderAccessV1, generate_lease_token, local_transport, platform_process_provider_name,
-    stop_process_provider,
+    ProcessProjectionTarget, ProcessProjectionTargetSet, ProcessStopPolicy, ProjectionCleanup,
+    StorageMountId, StorageProviderAccessV1, generate_lease_token, local_transport,
+    platform_process_provider_name, stop_process_provider,
 };
 use crate::storage_mount::lifecycle::cleanup_mapped_lease;
 use crate::storage_mount::lifecycle::cleanup_mapped_lease_resources;
@@ -39,6 +39,7 @@ pub(crate) struct RunningProvider {
 
 pub(crate) struct ProjectionCleanupState {
     pub(super) kernel: std::sync::Weak<Kernel>,
+    pub(super) stop_policy: ProcessStopPolicy,
     pub(super) binding: ProcessProjectionBinding,
     pub(super) branch: ProjectionLeaseProvider,
     pub(super) owner: ProjectionLeaseProvider,
@@ -114,13 +115,14 @@ async fn cleanup_projection(state: &mut ProjectionCleanupState) -> bool {
     if !binding_valid {
         tracing::error!("process storage projection binding became invalid");
     }
+    let policy = state.stop_policy;
     let (branch_stopped, owner_stopped, shared_stopped) = if binding_valid {
         tokio::join!(
-            stop_running_provider(&mut state.branch.running),
-            stop_running_provider(&mut state.owner.running),
+            stop_running_provider(&mut state.branch.running, policy),
+            stop_running_provider(&mut state.owner.running, policy),
             async {
                 match state.shared.as_mut() {
-                    Some(shared) => stop_running_provider(&mut shared.running).await,
+                    Some(shared) => stop_running_provider(&mut shared.running, policy).await,
                     None => true,
                 }
             },
@@ -185,12 +187,18 @@ async fn fence_retained_projection(state: &mut ProjectionCleanupState) {
     }
 }
 
-async fn stop_running_provider(provider: &mut RunningProvider) -> bool {
+async fn stop_running_provider(provider: &mut RunningProvider, policy: ProcessStopPolicy) -> bool {
     if provider.stopped {
         return true;
     }
     let stopped = if let Some(child) = provider.child.as_mut() {
-        stop_process_provider(child, provider.control_path.clone(), provider.token.clone()).await
+        stop_process_provider(
+            child,
+            provider.control_path.clone(),
+            provider.token.clone(),
+            policy,
+        )
+        .await
     } else {
         unmanaged_provider_is_stopped(&provider.control_path).await
     };
@@ -686,6 +694,15 @@ pub(crate) async fn retain_locked_projection(
     #[cfg(all(test, any(unix, windows)))]
     pause_retain_validation_for_test().await;
     if !projection_leases_are_live(kernel, &projection) {
+        // Publication already happened. Keep this exact ownerless entry as a
+        // retry blocker instead of dropping live provider resources.
+        projection.cleanup_failed.store(true, Ordering::Release);
+        return Err("native process storage projection became unhealthy".to_owned());
+    }
+    #[cfg(all(test, any(unix, windows)))]
+    pause_retain_reference_for_test().await;
+    if !projection_leases_are_live(kernel, &projection) {
+        projection.cleanup_failed.store(true, Ordering::Release);
         return Err("native process storage projection became unhealthy".to_owned());
     }
     retain_cached_projection(&projection)?;
@@ -701,6 +718,10 @@ struct RetainValidationGate {
 
 #[cfg(all(test, any(unix, windows)))]
 static RETAIN_VALIDATION_GATE: std::sync::Mutex<Option<Arc<RetainValidationGate>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(test, any(unix, windows)))]
+static RETAIN_REFERENCE_GATE: std::sync::Mutex<Option<Arc<RetainValidationGate>>> =
     std::sync::Mutex::new(None);
 
 #[cfg(all(test, any(unix, windows)))]
@@ -731,6 +752,15 @@ impl Drop for RetainValidationGateGuard {
         {
             *installed = None;
         }
+        let mut reference_gate = RETAIN_REFERENCE_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reference_gate
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &self.gate))
+        {
+            *reference_gate = None;
+        }
     }
 }
 
@@ -744,8 +774,30 @@ pub(crate) fn arm_retain_validation_gate() -> RetainValidationGateGuard {
 }
 
 #[cfg(all(test, any(unix, windows)))]
+pub(crate) fn arm_retain_reference_gate() -> RetainValidationGateGuard {
+    let gate = Arc::new(RetainValidationGate::default());
+    *RETAIN_REFERENCE_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&gate));
+    RetainValidationGateGuard { gate }
+}
+
+#[cfg(all(test, any(unix, windows)))]
 async fn pause_retain_validation_for_test() {
     let gate = RETAIN_VALIDATION_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(Arc::clone);
+    if let Some(gate) = gate {
+        gate.entered.notify_one();
+        gate.release.notified().await;
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+async fn pause_retain_reference_for_test() {
+    let gate = RETAIN_REFERENCE_GATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()

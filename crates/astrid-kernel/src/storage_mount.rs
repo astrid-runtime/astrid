@@ -73,6 +73,7 @@ pub(crate) use lifecycle::{lease_status, sync_lease};
 mod process_broker;
 #[cfg(any(unix, windows))]
 pub(crate) use process_broker::KernelProcessStorageMountBroker;
+pub(crate) use process_broker::ProcessStopPolicy;
 #[cfg(all(test, any(unix, windows)))]
 pub(super) use process_broker::{platform_process_provider_name, validate_process_provider_ready};
 

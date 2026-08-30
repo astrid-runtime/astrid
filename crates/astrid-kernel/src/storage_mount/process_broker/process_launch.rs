@@ -380,6 +380,7 @@ async fn send_process_provider_payload(
     launch: &StorageProviderServiceLaunchV1,
     payload: Vec<u8>,
     stderr_task: Option<tokio::task::JoinHandle<Vec<u8>>>,
+    stop_policy: super::ProcessStopPolicy,
 ) -> Result<SpawnedProcessProvider, ProcessProviderLaunchError> {
     let Some(mut stdin) = child.stdin.take() else {
         return Err(abort_process_provider(
@@ -387,6 +388,7 @@ async fn send_process_provider_payload(
             launch,
             "native storage provider stdin unavailable".to_owned(),
             stderr_task,
+            stop_policy,
         )
         .await);
     };
@@ -396,6 +398,7 @@ async fn send_process_provider_payload(
             launch,
             format!("send native storage provider launch: {error}"),
             stderr_task,
+            stop_policy,
         )
         .await);
     }
@@ -405,6 +408,7 @@ async fn send_process_provider_payload(
 pub(super) async fn launch_process_provider(
     launch: &StorageProviderServiceLaunchV1,
     stage: ProcessLaunchStage,
+    stop_policy: super::ProcessStopPolicy,
 ) -> Result<tokio::process::Child, ProcessProviderLaunchError> {
     #[cfg(not(all(test, any(unix, windows))))]
     let _ = stage;
@@ -465,19 +469,21 @@ pub(super) async fn launch_process_provider(
                 launch,
                 format!("encode native storage provider launch: {error}"),
                 stderr_task,
+                stop_policy,
             )
             .await);
         },
     };
     let (child, stderr_task) =
-        send_process_provider_payload(child, launch, payload, stderr_task).await?;
-    read_process_provider_ready(child, launch, stderr_task).await
+        send_process_provider_payload(child, launch, payload, stderr_task, stop_policy).await?;
+    read_process_provider_ready(child, launch, stderr_task, stop_policy).await
 }
 
 async fn read_process_provider_ready(
     mut child: tokio::process::Child,
     launch: &StorageProviderServiceLaunchV1,
     stderr_task: Option<tokio::task::JoinHandle<Vec<u8>>>,
+    stop_policy: super::ProcessStopPolicy,
 ) -> Result<tokio::process::Child, ProcessProviderLaunchError> {
     let Some(stdout) = child.stdout.take() else {
         return Err(abort_process_provider(
@@ -485,6 +491,7 @@ async fn read_process_provider_ready(
             launch,
             "native storage provider stdout unavailable".to_owned(),
             stderr_task,
+            stop_policy,
         )
         .await);
     };
@@ -503,6 +510,7 @@ async fn read_process_provider_ready(
                 launch,
                 format!("read native storage provider readiness: {error}"),
                 stderr_task,
+                stop_policy,
             )
             .await);
         },
@@ -512,6 +520,7 @@ async fn read_process_provider_ready(
                 launch,
                 "timed out waiting for native storage provider readiness".to_owned(),
                 stderr_task,
+                stop_policy,
             )
             .await);
         },
@@ -522,13 +531,14 @@ async fn read_process_provider_ready(
             launch,
             "native storage provider readiness frame is malformed or oversized".to_owned(),
             stderr_task,
+            stop_policy,
         )
         .await);
     }
     let line = line.strip_suffix('\n').unwrap_or(&line);
     let line = line.strip_suffix('\r').unwrap_or(line);
     if let Err(error) = validate_process_provider_ready(launch, line) {
-        return Err(abort_process_provider(child, launch, error, stderr_task).await);
+        return Err(abort_process_provider(child, launch, error, stderr_task, stop_policy).await);
     }
     drop(stderr_task);
     Ok(child)
@@ -539,11 +549,13 @@ pub(super) async fn abort_process_provider(
     launch: &StorageProviderServiceLaunchV1,
     message: String,
     stderr_task: Option<tokio::task::JoinHandle<Vec<u8>>>,
+    stop_policy: super::ProcessStopPolicy,
 ) -> ProcessProviderLaunchError {
     let cleanup_ok = stop_process_provider(
         &mut child,
         launch.control_path.clone(),
         launch.parent.token.clone(),
+        stop_policy,
     )
     .await;
     let mut diagnostics_timeout = false;

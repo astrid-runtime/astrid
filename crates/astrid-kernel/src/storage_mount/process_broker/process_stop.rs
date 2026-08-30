@@ -1,6 +1,6 @@
 //! Bounded STOP/reap for a native process storage provider.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use astrid_core::local_transport::{self, ConnectOutcome};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
@@ -13,25 +13,53 @@ enum ProcessProviderStopResponse {
     Failure { code: String, message: String },
 }
 
-/// Fixed protocol hard guard: a wedged provider must not hold STOP open.
-const STOP_ACKNOWLEDGEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// Fixed child-lifetime hard guard before the emergency kill.
-const REAP_GRACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// Fixed child-lifetime hard guard after the emergency kill.
-const KILLED_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Typed operator policy for bounded native provider STOP and reaping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProcessStopPolicy {
+    stop_acknowledgement: std::time::Duration,
+    reap_grace: std::time::Duration,
+    killed_reap: std::time::Duration,
+}
+
+impl Default for ProcessStopPolicy {
+    fn default() -> Self {
+        // Ten seconds bounds a wedged protocol reply without making normal
+        // unmount latency depend on provider I/O or child startup.
+        let timeout = std::time::Duration::from_secs(10);
+        Self {
+            stop_acknowledgement: timeout,
+            reap_grace: timeout,
+            killed_reap: timeout,
+        }
+    }
+}
+
+impl From<&astrid_config::TimeoutsSection> for ProcessStopPolicy {
+    fn from(timeouts: &astrid_config::TimeoutsSection) -> Self {
+        Self {
+            stop_acknowledgement: Duration::from_secs(timeouts.process_stop_ack_secs),
+            reap_grace: Duration::from_secs(timeouts.process_reap_grace_secs),
+            killed_reap: Duration::from_secs(timeouts.process_killed_reap_secs),
+        }
+    }
+}
+
 pub(super) async fn stop_process_provider(
     child: &mut tokio::process::Child,
     control_path: PathBuf,
     token: String,
+    policy: ProcessStopPolicy,
 ) -> bool {
     let protocol_ok = match local_transport::connect_outcome(&control_path).await {
-        Ok(ConnectOutcome::Connected(stream)) => send_stop_request(stream, &token).await.is_ok(),
+        Ok(ConnectOutcome::Connected(stream)) => {
+            send_stop_request(stream, &token, policy).await.is_ok()
+        },
         Ok(ConnectOutcome::Absent | ConnectOutcome::Stale) | Err(_) => false,
     };
     if !protocol_ok {
         let _ = child.start_kill();
     }
-    if !reap_child(child).await {
+    if !reap_child(child, policy).await {
         return false;
     }
     // Reaping is not ownership release. A provider can acknowledge STOP,
@@ -51,6 +79,7 @@ pub(super) async fn stop_process_provider(
 async fn send_stop_request(
     mut stream: local_transport::LocalStream,
     token: &str,
+    policy: ProcessStopPolicy,
 ) -> Result<(), String> {
     let request = serde_json::json!({"operation": "stop", "token": token});
     let bytes = serde_json::to_vec(&request)
@@ -70,7 +99,7 @@ async fn send_stop_request(
     let mut line = String::new();
     let reader = tokio::io::BufReader::new(stream);
     let read = tokio::time::timeout(
-        STOP_ACKNOWLEDGEMENT_TIMEOUT,
+        policy.stop_acknowledgement,
         reader.take((64 * 1024 + 1) as u64).read_line(&mut line),
     )
     .await
@@ -92,22 +121,23 @@ async fn send_stop_request(
     }
 }
 
-async fn reap_child(child: &mut tokio::process::Child) -> bool {
-    if let Ok(Ok(_)) = tokio::time::timeout(REAP_GRACE_TIMEOUT, child.wait()).await {
+async fn reap_child(child: &mut tokio::process::Child, policy: ProcessStopPolicy) -> bool {
+    if let Ok(Ok(_)) = tokio::time::timeout(policy.reap_grace, child.wait()).await {
         return true;
     }
     let _ = child.start_kill();
     matches!(
-        tokio::time::timeout(KILLED_REAP_TIMEOUT, child.wait()).await,
+        tokio::time::timeout(policy.killed_reap, child.wait()).await,
         Ok(Ok(_))
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::stop_process_provider;
+    use super::{ProcessStopPolicy, stop_process_provider};
     use astrid_core::local_transport;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::sync::Notify;
 
@@ -127,13 +157,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn default_stop_policy_preserves_the_protocol_and_reap_hard_guard() {
+        let policy = ProcessStopPolicy::default();
+        assert_eq!(policy.stop_acknowledgement, Duration::from_secs(10));
+        assert_eq!(policy.reap_grace, Duration::from_secs(10));
+        assert_eq!(policy.killed_reap, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn timeout_config_derives_each_stop_and_reap_budget() {
+        let timeouts = astrid_config::TimeoutsSection {
+            process_stop_ack_secs: 7,
+            process_reap_grace_secs: 11,
+            process_killed_reap_secs: 13,
+            ..astrid_config::TimeoutsSection::default()
+        };
+        let policy = ProcessStopPolicy::from(&timeouts);
+        assert_eq!(policy.stop_acknowledgement, Duration::from_secs(7));
+        assert_eq!(policy.reap_grace, Duration::from_secs(11));
+        assert_eq!(policy.killed_reap, Duration::from_secs(13));
+    }
+
     #[tokio::test]
     async fn absent_control_endpoint_is_stopped_after_child_reap() {
         let mut child = spawn_exited_child();
         let directory = tempfile::tempdir().expect("temporary control dir");
         let path = directory.path().join("missing.sock");
         assert!(
-            stop_process_provider(&mut child, path, "unused-token".to_owned()).await,
+            stop_process_provider(
+                &mut child,
+                path,
+                "unused-token".to_owned(),
+                ProcessStopPolicy::default()
+            )
+            .await,
             "reaped child with no control endpoint must not wedge the projection key"
         );
     }
@@ -146,7 +204,13 @@ mod tests {
         let path = directory.path().join("stale.sock");
         drop(std::os::unix::net::UnixListener::bind(&path).expect("stale listener"));
         assert!(
-            stop_process_provider(&mut child, path, "unused-token".to_owned()).await,
+            stop_process_provider(
+                &mut child,
+                path,
+                "unused-token".to_owned(),
+                ProcessStopPolicy::default(),
+            )
+            .await,
             "reaped child with a stale control endpoint must not wedge the projection key"
         );
     }
@@ -175,7 +239,13 @@ mod tests {
         });
 
         assert!(
-            !stop_process_provider(&mut child, path, "unused-token".to_owned()).await,
+            !stop_process_provider(
+                &mut child,
+                path,
+                "unused-token".to_owned(),
+                ProcessStopPolicy::default(),
+            )
+            .await,
             "a canonical STOP followed by reap must not release a live endpoint"
         );
         release.notify_waiters();

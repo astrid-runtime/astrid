@@ -371,6 +371,9 @@ pub struct Kernel {
     /// mounts so concurrent views cannot lose non-overlapping writes.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) storage_mount_mutations: tokio::sync::Mutex<()>,
+    /// Typed process-provider STOP/reap budgets resolved at kernel boot.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    pub(crate) process_stop_policy: storage_mount::ProcessStopPolicy,
     /// System-wide per-principal profile cache (Layer 3 quota enforcement).
     ///
     /// One instance per kernel boot. Every capsule load plumbs this into
@@ -1485,11 +1488,19 @@ impl Kernel {
         }
 
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let host_audit_policy =
-            astrid_config::Config::load_with_layout(Some(&workspace_root), &workspace_layout)
-                .ok()
-                .map(|resolved| crate::audit_sink::HostAuditPolicy::from(&resolved.config.audit))
-                .unwrap_or_default();
+        let resolved_config =
+            astrid_config::Config::load_with_layout(Some(&workspace_root), &workspace_layout).ok();
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let host_audit_policy = resolved_config
+            .as_ref()
+            .map(|resolved| crate::audit_sink::HostAuditPolicy::from(&resolved.config.audit))
+            .unwrap_or_default();
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let process_stop_policy = resolved_config
+            .as_ref()
+            .map_or_else(storage_mount::ProcessStopPolicy::default, |resolved| {
+                storage_mount::ProcessStopPolicy::from(&resolved.config.timeouts)
+            });
 
         let kernel = Arc::new(Self {
             session_id: session_id.clone(),
@@ -1553,6 +1564,8 @@ impl Kernel {
             storage_mounts: Arc::new(DashMap::new()),
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             storage_mount_mutations: tokio::sync::Mutex::new(()),
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            process_stop_policy,
             profile_cache: profile_cache
                 .unwrap_or_else(|| Arc::new(PrincipalProfileCache::with_home(home.clone()))),
             groups,
@@ -3856,6 +3869,8 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         storage_mounts: Arc::new(DashMap::new()),
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         storage_mount_mutations: tokio::sync::Mutex::new(()),
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        process_stop_policy: storage_mount::ProcessStopPolicy::default(),
         profile_cache: Arc::new(PrincipalProfileCache::with_home(home.clone())),
         groups,
         astrid_home: home,

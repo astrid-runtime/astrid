@@ -259,6 +259,27 @@ fn validate_timeouts(config: &Config) -> ConfigResult<()> {
         });
     }
 
+    if t.process_stop_ack_secs == 0 {
+        return Err(ConfigError::ValidationError {
+            field: "timeouts.process_stop_ack_secs".to_owned(),
+            message: "process_stop_ack_secs must be greater than 0".to_owned(),
+        });
+    }
+
+    if t.process_reap_grace_secs == 0 {
+        return Err(ConfigError::ValidationError {
+            field: "timeouts.process_reap_grace_secs".to_owned(),
+            message: "process_reap_grace_secs must be greater than 0".to_owned(),
+        });
+    }
+
+    if t.process_killed_reap_secs == 0 {
+        return Err(ConfigError::ValidationError {
+            field: "timeouts.process_killed_reap_secs".to_owned(),
+            message: "process_killed_reap_secs must be greater than 0".to_owned(),
+        });
+    }
+
     Ok(())
 }
 
@@ -566,6 +587,24 @@ mod tests {
         let mut config = Config::default();
         config.timeouts.daemon_ready_secs = 0;
         assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_invalid_process_stop_timeout_zero() {
+        for field in [
+            "process_stop_ack_secs",
+            "process_reap_grace_secs",
+            "process_killed_reap_secs",
+        ] {
+            let mut config = Config::default();
+            match field {
+                "process_stop_ack_secs" => config.timeouts.process_stop_ack_secs = 0,
+                "process_reap_grace_secs" => config.timeouts.process_reap_grace_secs = 0,
+                "process_killed_reap_secs" => config.timeouts.process_killed_reap_secs = 0,
+                _ => unreachable!("test timeout field"),
+            }
+            assert!(validate(&config).is_err(), "zero {field} must be rejected");
+        }
     }
 
     #[test]

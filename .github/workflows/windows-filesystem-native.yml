@@ -330,7 +330,7 @@ jobs:
           if (-not $acl.AreAccessRulesProtected) {
             throw "the process storage staging DACL is not protected"
           }
-          $ownerSid = $acl.Owner.Translate([System.Security.Principal.SecurityIdentifier]).Value
+          $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
           $trustedSids = @($userSid, "S-1-5-18", "S-1-5-32-544")
           if ($trustedSids -notcontains $ownerSid) {
             throw "the process storage staging owner is untrusted: $ownerSid"

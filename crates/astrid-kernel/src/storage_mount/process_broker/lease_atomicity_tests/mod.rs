@@ -768,6 +768,7 @@ fn retained_cleanup_state(
 ) -> super::ProjectionCleanupState {
     super::ProjectionCleanupState {
         kernel: Arc::downgrade(kernel),
+        stop_policy: super::ProcessStopPolicy::default(),
         binding: binding.clone(),
         branch: super::ProjectionLeaseProvider {
             running: super::RunningProvider {
@@ -850,6 +851,7 @@ async fn failed_stop_returns_rollback_promptly_when_descendant_holds_stderr() {
             &launch,
             "diagnostics deadline".to_owned(),
             stderr_task,
+            super::ProcessStopPolicy::default(),
         ),
     )
     .await

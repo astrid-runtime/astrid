@@ -21,6 +21,7 @@ use process_launch::launch_process_provider;
 pub(crate) use process_launch::platform_process_provider_name;
 #[cfg(all(test, any(unix, windows)))]
 pub(crate) use process_launch::validate_process_provider_ready;
+pub(crate) use process_stop::ProcessStopPolicy;
 #[cfg(all(test, any(unix, windows)))]
 mod cache_tests;
 #[cfg(any(unix, windows))]
@@ -34,7 +35,8 @@ pub(crate) use projection_lifecycle::cached_projection_mount;
 pub(crate) use projection_lifecycle::retain_failed_launch_projection;
 #[cfg(all(test, any(unix, windows)))]
 pub(crate) use projection_lifecycle::{
-    ParentTokenSlot, arm_parent_token_failure, arm_retain_validation_gate, revoke_projection_leases,
+    ParentTokenSlot, arm_parent_token_failure, arm_retain_reference_gate,
+    arm_retain_validation_gate, revoke_projection_leases,
 };
 #[cfg(any(unix, windows))]
 pub(crate) use projection_lifecycle::{
@@ -577,6 +579,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
         let branch_child = match launch_process_provider(
             &branch_launch,
             process_launch::ProcessLaunchStage::Branch,
+            kernel.process_stop_policy,
         )
         .await
         {
@@ -584,6 +587,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             Err(error) => {
                 let cleanup_state = ProjectionCleanupState {
                     kernel: Arc::downgrade(&kernel),
+                    stop_policy: kernel.process_stop_policy,
                     binding: key.binding.clone(),
                     branch: ProjectionLeaseProvider {
                         running: RunningProvider {
@@ -647,6 +651,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
         let owner_child = match launch_process_provider(
             &owner_launch,
             process_launch::ProcessLaunchStage::OwnerHome,
+            kernel.process_stop_policy,
         )
         .await
         {
@@ -654,6 +659,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             Err(error) => {
                 let cleanup_state = ProjectionCleanupState {
                     kernel: Arc::downgrade(&kernel),
+                    stop_policy: kernel.process_stop_policy,
                     binding: key.binding.clone(),
                     branch: ProjectionLeaseProvider {
                         running: RunningProvider {
@@ -718,6 +724,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             match launch_process_provider(
                 &shared_launch,
                 process_launch::ProcessLaunchStage::FleetShared,
+                kernel.process_stop_policy,
             )
             .await
             {
@@ -725,6 +732,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                 Err(error) => {
                     let cleanup_state = ProjectionCleanupState {
                         kernel: Arc::downgrade(&kernel),
+                        stop_policy: kernel.process_stop_policy,
                         binding: key.binding.clone(),
                         branch: ProjectionLeaseProvider {
                             running: RunningProvider {
@@ -791,6 +799,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
         };
         let cleanup_state = Arc::new(tokio::sync::Mutex::new(ProjectionCleanupState {
             kernel: Arc::downgrade(&kernel),
+            stop_policy: kernel.process_stop_policy,
             binding: key.binding.clone(),
             branch: ProjectionLeaseProvider {
                 running: RunningProvider {
