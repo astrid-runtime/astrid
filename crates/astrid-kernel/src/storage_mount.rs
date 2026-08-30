@@ -31,7 +31,7 @@ use base64::Engine as _;
 use rand::{TryRng as _, rngs::SysRng};
 use subtle::ConstantTimeEq as _;
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use crate::Kernel;
 
@@ -70,7 +70,13 @@ pub(crate) use lifecycle::{
 #[cfg(test)]
 pub(crate) use lifecycle::{lease_status, sync_lease};
 #[cfg(any(unix, windows))]
+use retained_jobs::{
+    drain_accepted_tasks, drain_blocking_jobs, endpoint_became_absent, finish_retained_jobs,
+};
+#[cfg(any(unix, windows))]
 mod process_broker;
+#[cfg(any(unix, windows))]
+mod retained_jobs;
 #[cfg(any(unix, windows))]
 pub(crate) use process_broker::KernelProcessStorageMountBroker;
 pub(crate) use process_broker::ProcessStopPolicy;
@@ -81,8 +87,9 @@ const LEASE_IDLE_TTL_SECS: u64 = 60 * 60;
 /// Bound listener shutdown waits without turning a stalled listener into an
 /// endpoint-removal race; timed-out cleanup remains mapped for retry.
 const LISTENER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-#[cfg(windows)]
-const ENDPOINT_ABSENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Cancel idle callback connections quickly, but never use this bound to
+/// discard a blocking filesystem job that has already been admitted.
+const ACCEPTED_TASK_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const LEASE_MANIFEST_NAME: &str = "lease.json";
 
 /// A synchronous admission ticket for callback or renewal work.
@@ -113,6 +120,9 @@ pub(crate) struct StorageMountLeaseState {
     in_flight_mutations: AtomicU64,
     shutdown_tx: watch::Sender<bool>,
     accepted_tasks: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
+    /// Filesystem workers retained across callback-connection cancellation.
+    blocking_jobs: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
+    drain_timeouts: std::sync::Mutex<DrainTimeouts>,
     #[cfg(all(test, any(unix, windows)))]
     token_for_test: String,
     /// Set after the listener task has dropped its backend listener handle.
@@ -129,22 +139,24 @@ pub(crate) struct StorageMountLeaseState {
     cleanup_ledger_path: PathBuf,
 }
 
-struct InFlightMutation<'a> {
-    count: &'a AtomicU64,
+struct InFlightMutation {
+    count: Arc<StorageMountLeaseState>,
 }
 
-impl<'a> InFlightMutation<'a> {
-    fn begin(state: &'a StorageMountLeaseState) -> Self {
+impl InFlightMutation {
+    fn begin(state: &Arc<StorageMountLeaseState>) -> Self {
         state.in_flight_mutations.fetch_add(1, Ordering::AcqRel);
         Self {
-            count: &state.in_flight_mutations,
+            count: Arc::clone(state),
         }
     }
 }
 
-impl Drop for InFlightMutation<'_> {
+impl Drop for InFlightMutation {
     fn drop(&mut self) {
-        self.count.fetch_sub(1, Ordering::AcqRel);
+        self.count
+            .in_flight_mutations
+            .fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -152,6 +164,12 @@ impl Drop for InFlightMutation<'_> {
 struct MutationTestGate {
     entered: tokio::sync::Semaphore,
     release: tokio::sync::Semaphore,
+}
+
+#[derive(Clone, Copy)]
+struct DrainTimeouts {
+    accepted_task: std::time::Duration,
+    listener_shutdown: std::time::Duration,
 }
 
 impl StorageMountLeaseState {
@@ -174,9 +192,27 @@ impl StorageMountLeaseState {
             }
             true
         };
-        tokio::time::timeout(LISTENER_SHUTDOWN_TIMEOUT, wait)
+        tokio::time::timeout(self.drain_timeouts().listener_shutdown, wait)
             .await
             .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    fn set_drain_timeouts_for_test(&self, timeout: std::time::Duration) {
+        *self
+            .drain_timeouts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = DrainTimeouts {
+            accepted_task: timeout,
+            listener_shutdown: timeout,
+        };
+    }
+
+    fn drain_timeouts(&self) -> DrainTimeouts {
+        *self
+            .drain_timeouts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[cfg(test)]
@@ -329,6 +365,11 @@ fn publish_issued_lease(
         in_flight_mutations: AtomicU64::new(0),
         shutdown_tx,
         accepted_tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
+        blocking_jobs: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
+        drain_timeouts: std::sync::Mutex::new(DrainTimeouts {
+            accepted_task: ACCEPTED_TASK_DRAIN_TIMEOUT,
+            listener_shutdown: LISTENER_SHUTDOWN_TIMEOUT,
+        }),
         #[cfg(all(test, any(unix, windows)))]
         token_for_test: token.clone(),
         listener_closed_tx,
@@ -604,7 +645,13 @@ async fn serve_listener(
     // observe the named-pipe endpoint as absent.
     drop(accepted);
     drop(listener);
-    drain_accepted_tasks(&state).await;
+    let accepted_drained = drain_accepted_tasks(&state).await;
+    let blocking_drained = accepted_drained && drain_blocking_jobs(&state).await;
+    if !blocking_drained {
+        tracing::warn!("storage mount retained filesystem jobs exceeded their drain bound");
+        finish_retained_jobs(&state).await;
+        return;
+    }
     if !endpoint_became_absent(&state.callback_path).await {
         return;
     }
@@ -616,42 +663,6 @@ async fn serve_listener(
         } else {
             let _ = cleanup_resource_paths(&state.resource_path, &state.callback_path, None);
         }
-    }
-}
-
-async fn drain_accepted_tasks(state: &StorageMountLeaseState) {
-    let mut tasks = state.accepted_tasks.lock().await;
-    tasks.abort_all();
-    let drain = async {
-        while let Some(result) = tasks.join_next().await {
-            let _ = result;
-        }
-    };
-    if tokio::time::timeout(std::time::Duration::from_secs(1), drain)
-        .await
-        .is_err()
-    {
-        tracing::warn!("storage mount accepted connection cancellation exceeded its drain bound");
-    }
-}
-
-#[cfg_attr(unix, allow(clippy::unused_async))]
-async fn endpoint_became_absent(callback_path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        let _ = callback_path;
-        true
-    }
-    #[cfg(not(unix))]
-    {
-        let wait = async {
-            while astrid_core::local_transport::endpoint_is_present(callback_path).unwrap_or(true) {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        };
-        tokio::time::timeout(ENDPOINT_ABSENCE_TIMEOUT, wait)
-            .await
-            .is_ok()
     }
 }
 
@@ -673,8 +684,8 @@ async fn handle_connection(
 }
 
 async fn dispatch_request(
-    kernel: &Kernel,
-    state: &StorageMountLeaseState,
+    kernel: &Arc<Kernel>,
+    state: &Arc<StorageMountLeaseState>,
     callback: CallbackRequest,
 ) -> CallbackResponse {
     let request = callback.request;
@@ -686,7 +697,12 @@ async fn dispatch_request(
     } else if state.try_admit().is_none() {
         failure("stale-lease", "storage mount lease is expired or revoked")
     } else {
-        execute_operation(kernel, state, request.operation).await
+        execute_operation(
+            std::sync::Arc::clone(kernel),
+            std::sync::Arc::clone(state),
+            request.operation,
+        )
+        .await
     };
     let response = StorageFilesystemResponseV1 {
         protocol_version: STORAGE_FILESYSTEM_PROTOCOL_V1,
@@ -701,8 +717,8 @@ async fn dispatch_request(
 }
 
 async fn execute_operation(
-    kernel: &Kernel,
-    state: &StorageMountLeaseState,
+    kernel: Arc<Kernel>,
+    state: Arc<StorageMountLeaseState>,
     operation: StorageFilesystemOperationV1,
 ) -> StorageFilesystemOutcomeV1 {
     let is_mutation = is_mutation(&operation);
@@ -713,8 +729,8 @@ async fn execute_operation(
     if is_mutation && state.access != StorageProviderAccessV1::ReadWrite {
         return failure("read-only", "storage mount lease is read-only");
     }
-    let _mutation_guard = if requires_mutation_serialization(&operation) {
-        let guard = kernel.storage_mount_mutations.lock().await;
+    let mutation_guard = if requires_mutation_serialization(&operation) {
+        let guard = kernel.storage_mount_mutations.clone().lock_owned().await;
         if !state.is_live() {
             return failure("stale-lease", "storage mount lease is expired or revoked");
         }
@@ -722,53 +738,64 @@ async fn execute_operation(
     } else {
         None
     };
-    let _in_flight = is_mutation.then(|| InFlightMutation::begin(state));
-    #[cfg(test)]
-    if is_mutation {
-        pause_mutation_for_test(state).await;
-    }
+    let in_flight = is_mutation.then(|| InFlightMutation::begin(&state));
     let Some(store) = kernel.principal_store.clone() else {
         return failure("unavailable", "native principal store is unavailable");
     };
     let owner = state.owner;
     let target = state.target.clone();
-    let result = tokio::task::spawn_blocking(move || match target {
-        StorageFilesystemTargetV1::OwnerRoot => {
-            let filesystem = AstridFilesystem::new(store.content(), owner);
-            execute_blocking(&filesystem, operation)
-        },
-        StorageFilesystemTargetV1::WorkspaceBranch { workspace } => {
-            let branches = WorkspaceBranchStore::new(store.content());
-            let filesystem = branches.filesystem(owner, workspace);
-            execute_blocking(&filesystem, operation)
-        },
-        StorageFilesystemTargetV1::OwnerSubtree { prefix } => {
-            if prefix == "shared" {
-                let filesystem = AstridFilesystem::new_fleet_shared(store.content(), owner);
+    let retained_state = Arc::clone(&state);
+    let (outcome_tx, outcome_rx) = oneshot::channel();
+    state.blocking_jobs.lock().await.spawn(async move {
+        // The guard moves with the retained job: cancelling the callback
+        // connection cannot release the publication/drain fence early.
+        let _mutation_guard = mutation_guard;
+        let _in_flight = in_flight;
+        #[cfg(test)]
+        if is_mutation {
+            pause_mutation_for_test(&retained_state).await;
+        }
+        let result = tokio::task::spawn_blocking(move || match target {
+            StorageFilesystemTargetV1::OwnerRoot => {
+                let filesystem = AstridFilesystem::new(store.content(), owner);
                 execute_blocking(&filesystem, operation)
-            } else {
-                let filesystem = PrefixedFilesystem {
-                    inner: AstridFilesystem::new(store.content(), owner),
-                    prefix,
-                };
+            },
+            StorageFilesystemTargetV1::WorkspaceBranch { workspace } => {
+                let branches = WorkspaceBranchStore::new(store.content());
+                let filesystem = branches.filesystem(owner, workspace);
                 execute_blocking(&filesystem, operation)
+            },
+            StorageFilesystemTargetV1::OwnerSubtree { prefix } => {
+                if prefix == "shared" {
+                    let filesystem = AstridFilesystem::new_fleet_shared(store.content(), owner);
+                    execute_blocking(&filesystem, operation)
+                } else {
+                    let filesystem = PrefixedFilesystem {
+                        inner: AstridFilesystem::new(store.content(), owner),
+                        prefix,
+                    };
+                    execute_blocking(&filesystem, operation)
+                }
+            },
+        })
+        .await;
+        if let Ok(Ok(_)) = result.as_ref() {
+            if is_mutation {
+                retained_state.dirty.store(true, Ordering::Release);
+            } else if is_sync {
+                retained_state.dirty.store(false, Ordering::Release);
             }
-        },
-    })
-    .await;
-    let outcome = match result {
+        }
+        let _ = outcome_tx.send(result.map_err(|error| error.to_string()));
+    });
+    let result = outcome_rx
+        .await
+        .unwrap_or_else(|_| Err("filesystem worker was cancelled".to_owned()));
+    match result {
         Ok(Ok(success)) => StorageFilesystemOutcomeV1::Success(success),
         Ok(Err(error)) => map_filesystem_error(&error),
         Err(error) => failure("internal", &format!("filesystem worker failed: {error}")),
-    };
-    if matches!(&outcome, StorageFilesystemOutcomeV1::Success(_)) {
-        if is_mutation {
-            state.dirty.store(true, Ordering::Release);
-        } else if is_sync {
-            state.dirty.store(false, Ordering::Release);
-        }
     }
-    outcome
 }
 
 #[cfg(test)]
@@ -862,8 +889,8 @@ fn now_epoch_secs() -> u64 {
 
 #[cfg(test)]
 pub(crate) async fn execute_operation_for_test(
-    kernel: &Kernel,
-    state: &StorageMountLeaseState,
+    kernel: Arc<Kernel>,
+    state: Arc<StorageMountLeaseState>,
     operation: StorageFilesystemOperationV1,
 ) -> StorageFilesystemOutcomeV1 {
     execute_operation(kernel, state, operation).await

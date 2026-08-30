@@ -512,10 +512,24 @@ async fn force_revoke_lease(kernel: &Kernel, state: &StorageMountLeaseState) -> 
     // The listener owns the platform endpoint. Wait outside the mutation
     // fence so the listener can finish any in-flight connection bookkeeping.
     if !state.wait_listener_closed().await {
-        return Err("storage mount callback listener did not shut down".to_owned());
+        return Err(drain_timeout_error(state).to_string());
     }
     let _mutation_guard = kernel.storage_mount_mutations.lock().await;
     cleanup_mapped_lease(kernel, state).map_err(|error| error.to_string())
+}
+
+fn drain_timeout_error(state: &StorageMountLeaseState) -> MountCleanupError {
+    cleanup_error(
+        Some(state.mount_id),
+        MountCleanupStage::Drain,
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "retained filesystem jobs did not finish within {:?}",
+                state.drain_timeouts().accepted_task
+            ),
+        ),
+    )
 }
 
 pub(super) async fn revalidate_live_grant(
@@ -546,7 +560,7 @@ pub(crate) async fn revoke_all_leases_for_principal(
     // connection tasks may need that lock to finish their own shutdown path.
     for state in &matched {
         if !state.wait_listener_closed().await {
-            return Err("storage mount callback listener did not shut down".to_owned());
+            return Err(drain_timeout_error(state).to_string());
         }
     }
     let _mutation_guard = kernel.storage_mount_mutations.lock().await;

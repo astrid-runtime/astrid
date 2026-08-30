@@ -148,6 +148,9 @@ async fn projection_cleanup_revokes_every_lease_on_fault(fault: MountCleanupStag
                 assert!(callback_endpoint_present(&shared.callback_path));
             }
         },
+        // Drain timeout is a lifecycle admission boundary, not an injected
+        // resource-cleanup fault used by this fixture.
+        MountCleanupStage::Drain => unreachable!("cleanup fixtures never inject drain"),
         MountCleanupStage::Manifest => {
             #[cfg(unix)]
             {

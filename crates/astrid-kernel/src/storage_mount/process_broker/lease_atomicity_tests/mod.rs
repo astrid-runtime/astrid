@@ -616,8 +616,8 @@ async fn assert_exact_reads_and_renewals_denied(fixture: &ExactFenceFixture) {
             },
         ] {
             let outcome = crate::storage_mount::execute_operation_for_test(
-                fixture.kernel.as_ref(),
-                state,
+                Arc::clone(&fixture.kernel),
+                Arc::clone(state),
                 operation,
             )
             .await;

@@ -764,7 +764,7 @@ mod reserved_mountpoint_tests {
     fn reserved_mountpoint_accepts_absent_component_leaves() {
         let temporary = tempfile::tempdir().expect("reserved mount root");
         let parent = temporary.path().join("components");
-        std::fs::create_dir(&parent).expect("private component parent");
+        platform_fs::ensure_private_directory(&parent).expect("trusted private component parent");
         let mountpoints = [
             parent.join("workspace"),
             parent.join("owner"),
@@ -777,6 +777,8 @@ mod reserved_mountpoint_tests {
                     mountpoint.display()
                 )
             });
+            platform_fs::validate_private_directory(&parent)
+                .expect("the provider parent must retain private ACLs");
         }
     }
 
@@ -784,7 +786,7 @@ mod reserved_mountpoint_tests {
     fn reserved_mountpoint_rejects_precreated_leaf() {
         let temporary = tempfile::tempdir().expect("reserved mount root");
         let parent = temporary.path().join("components");
-        std::fs::create_dir(&parent).expect("private component parent");
+        platform_fs::ensure_private_directory(&parent).expect("trusted private component parent");
         let mountpoint = parent.join("workspace");
         std::fs::create_dir(&mountpoint).expect("precreated collision");
         let error = validate_reserved_mountpoint(&mountpoint)

@@ -625,6 +625,9 @@ fn assert_cleanup_fault_retained(
                 "{label}: callback cleanup fault must leave the endpoint where the backend supports a retained endpoint"
             );
         },
+        // Principal deletion retries drain timeouts only after the retained
+        // lifecycle worker acknowledges completion; it is not a resource fault.
+        MountCleanupStage::Drain => unreachable!("delete fixtures never inject drain"),
         MountCleanupStage::Manifest => {
             assert!(
                 lease.resource_path.join("lease.json").exists(),

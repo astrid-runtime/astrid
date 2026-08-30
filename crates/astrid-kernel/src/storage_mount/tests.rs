@@ -1251,12 +1251,12 @@ async fn revoke_drains_an_in_flight_mutation_and_fences_new_mutation() {
         release: tokio::sync::Semaphore::new(0),
     });
     *state.mutation_test_gate.lock().unwrap() = Some(Arc::clone(&gate));
-    let mutation_kernel = Arc::clone(&kernel);
+    let mutation_kernel = Arc::clone(kernel.as_ref());
     let mutation_state = Arc::clone(&state);
     let mutation = tokio::spawn(async move {
         execute_operation(
-            &mutation_kernel,
-            &mutation_state,
+            mutation_kernel,
+            mutation_state,
             StorageFilesystemOperationV1::Write {
                 path: "in-flight.bin".to_owned(),
                 offset: 0,
@@ -1296,12 +1296,137 @@ async fn revoke_drains_an_in_flight_mutation_and_fences_new_mutation() {
     assert!(state.dirty.load(Ordering::Acquire));
     assert!(!kernel.storage_mounts.contains_key(&lease.mount_id));
     assert!(!astrid_core::local_transport::endpoint_is_present(&lease.callback_path).unwrap());
-    let fenced = execute_operation(&kernel, &state, create("after-revoke.txt")).await;
+    let fenced = execute_operation(
+        Arc::clone(kernel.as_ref()),
+        Arc::clone(&state),
+        create("after-revoke.txt"),
+    )
+    .await;
     assert!(matches!(
         fenced,
         StorageFilesystemOutcomeV1::Failure(StorageFilesystemFailureV1 { code, .. })
             if code == "stale-lease"
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn revoked_callback_keeps_blocked_job_mapped_until_worker_ends() {
+    let temporary = tempfile::tempdir().unwrap();
+    let kernel = Arc::new(
+        crate::test_kernel_with_home(astrid_core::dirs::AstridHome::from_path(
+            temporary.path().join(".astrid"),
+        ))
+        .await,
+    );
+    let caller = PrincipalId::default();
+    let mountpoint = temporary.path().join("retained-job-mount");
+    let lease = issue_lease(
+        &kernel,
+        &test_mount_admission(&kernel, &caller, MountOwnerScope::CrossOwnerWrite),
+        StorageProviderViewV1::Admin,
+        StorageFilesystemTargetV1::OwnerRoot,
+        StorageProviderAccessV1::ReadWrite,
+        "test-provider".to_owned(),
+        mountpoint.clone(),
+    )
+    .await
+    .unwrap();
+    let state = Arc::clone(kernel.storage_mounts.get(&lease.mount_id).unwrap().value());
+    state.set_drain_timeouts_for_test(std::time::Duration::from_millis(80));
+    let gate = Arc::new(MutationTestGate {
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    *state.mutation_test_gate.lock().unwrap() = Some(Arc::clone(&gate));
+
+    let callback_lease = lease.clone();
+    let mutation = tokio::spawn(async move {
+        callback(
+            &callback_lease,
+            &callback_lease.lease_token,
+            create("retained.bin"),
+        )
+        .await
+    });
+    gate.entered.acquire().await.unwrap().forget();
+    mutation.abort();
+    assert_eq!(state.in_flight_mutations.load(Ordering::Acquire), 1);
+
+    let revocation_kernel = Arc::clone(&kernel);
+    let revocation_caller = caller.clone();
+    let revocation_mount_id = lease.mount_id;
+    let revocation = tokio::spawn(async move {
+        revoke_lease(
+            &revocation_kernel,
+            &revocation_caller,
+            MountOwnerScope::CrossOwnerWrite,
+            revocation_mount_id,
+        )
+        .await
+    });
+    let error = revocation.await.unwrap().unwrap_err();
+    assert!(
+        error.contains("cleanup failed at drain"),
+        "expected typed drain cleanup failure, got {error}"
+    );
+    assert!(state.revoked.load(Ordering::Acquire));
+    assert!(kernel.storage_mounts.contains_key(&lease.mount_id));
+    assert!(lease.resource_path.exists());
+    assert!(
+        lease
+            .resource_path
+            .join(super::LEASE_MANIFEST_NAME)
+            .exists()
+    );
+
+    let duplicate_kernel = Arc::clone(&kernel);
+    let duplicate_caller = caller.clone();
+    let duplicate = tokio::spawn(async move {
+        issue_lease(
+            &duplicate_kernel,
+            &test_mount_admission(
+                &duplicate_kernel,
+                &duplicate_caller,
+                MountOwnerScope::CrossOwnerWrite,
+            ),
+            StorageProviderViewV1::Admin,
+            StorageFilesystemTargetV1::OwnerRoot,
+            StorageProviderAccessV1::ReadWrite,
+            "test-provider".to_owned(),
+            mountpoint.clone(),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_millis(80), duplicate)
+        .await
+        .expect_err("the retained admitted job must retain the mutation fence");
+
+    gate.release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !state.blocking_jobs.lock().await.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        while !state.wait_listener_closed().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retained job and listener completion");
+
+    revoke_lease(
+        &kernel,
+        &caller,
+        MountOwnerScope::CrossOwnerWrite,
+        lease.mount_id,
+    )
+    .await
+    .expect("exact retry after retained job completion");
+    assert_eq!(state.in_flight_mutations.load(Ordering::Acquire), 0);
+    assert!(state.dirty.load(Ordering::Acquire));
+    assert!(!kernel.storage_mounts.contains_key(&lease.mount_id));
+    assert!(!astrid_core::local_transport::endpoint_is_present(&lease.callback_path).unwrap());
+    assert!(!lease.resource_path.exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

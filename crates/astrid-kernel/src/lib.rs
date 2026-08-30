@@ -370,7 +370,7 @@ pub struct Kernel {
     /// Linearizes read-modify-publish filesystem mutations across all native
     /// mounts so concurrent views cannot lose non-overlapping writes.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    pub(crate) storage_mount_mutations: tokio::sync::Mutex<()>,
+    pub(crate) storage_mount_mutations: Arc<tokio::sync::Mutex<()>>,
     /// Typed process-provider STOP/reap budgets resolved at kernel boot.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) process_stop_policy: storage_mount::ProcessStopPolicy,
@@ -1563,7 +1563,7 @@ impl Kernel {
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             storage_mounts: Arc::new(DashMap::new()),
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-            storage_mount_mutations: tokio::sync::Mutex::new(()),
+            storage_mount_mutations: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             process_stop_policy,
             profile_cache: profile_cache
@@ -3868,7 +3868,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         storage_mounts: Arc::new(DashMap::new()),
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        storage_mount_mutations: tokio::sync::Mutex::new(()),
+        storage_mount_mutations: Arc::new(tokio::sync::Mutex::new(())),
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         process_stop_policy: storage_mount::ProcessStopPolicy::default(),
         profile_cache: Arc::new(PrincipalProfileCache::with_home(home.clone())),

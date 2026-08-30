@@ -21,8 +21,8 @@ async fn exact_set_fence_denies_reads_and_renewal_while_writer_held() {
     let mutation_kernel = Arc::clone(&fixture.kernel);
     let mutation = tokio::spawn(async move {
         crate::storage_mount::execute_operation_for_test(
-            &mutation_kernel,
-            &branch_state,
+            mutation_kernel,
+            branch_state,
             StorageFilesystemOperationV1::Create {
                 path: "in-flight.bin".to_owned(),
                 kind: astrid_core::storage_filesystem::StorageFilesystemEntryKindV1::File,
