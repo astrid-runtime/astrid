@@ -126,7 +126,16 @@ fn emit_ipc_op(serial: Emit<'_>, id: u64, generation: u64, op: &str, status: &st
     ));
 }
 
-fn emit_ipc_park(serial: Emit<'_>, id: u64, generation: u64) {
+fn emit_relation(serial: Emit<'_>, id: u64, generation: u64, epoch: u64, rows: usize) {
+    serial(format!(
+        "\"ev\":\"relations.projection\",\"same_lock\":true,\"id\":{id},\"generation\":{generation},\
+            \"epoch\":{epoch},\"rows\":{rows},\"fold_epoch\":{epoch},\"fold_rows\":{rows},\
+            \"fold_matches\":true"
+    ));
+}
+
+fn emit_ipc_park(serial: Emit<'_>, id: u64, generation: u64, epoch: u64, rows: usize) {
+    emit_relation(serial, id, generation, epoch, rows);
     emit_ipc_op(serial, id, generation, "endpoint_create", "ok");
     serial(format!(
         "\"ev\":\"ipc.park\",\"id\":{id},\"generation\":{generation}"
@@ -213,7 +222,8 @@ fn emit_ipc_server_peer_release(serial: Emit<'_>, id: u64, generation: u64) {
     ));
 }
 
-fn emit_ipc_cancel_guest(serial: Emit<'_>, id: u64, generation: u64) {
+fn emit_ipc_cancel_guest(serial: Emit<'_>, id: u64, generation: u64, epoch: u64, rows: usize) {
+    emit_relation(serial, id, generation, epoch, rows);
     emit_ipc_op(serial, id, generation, "endpoint_create", "ok");
     emit_ipc_op(serial, id, generation, "cancel", "ok");
     emit_ipc_terminal(serial, id, generation, 0, "clean_exit", 3, "0x0", 7, 1, 1);
@@ -334,11 +344,11 @@ fn passing_serial_with(kernel: &str, sysgen: &str, kfloor: u64, sfloor: u64) -> 
     emit_prepare(&mut ev, 1, 7, 6);
     emit_start(&mut ev, 1, 7, 6);
     emit_context(&mut ev, 1, 7, 0);
-    emit_ipc_park(&mut ev, 1, 7);
+    emit_ipc_park(&mut ev, 1, 7, 3, 3);
     emit_prepare(&mut ev, 2, 3, 7);
     emit_start(&mut ev, 2, 3, 7);
     emit_context(&mut ev, 2, 3, 0);
-    for (op, status) in [
+    for (index, (op, status)) in [
         ("send", "malformed"),
         ("send", "malformed"),
         ("send", "malformed"),
@@ -347,7 +357,13 @@ fn passing_serial_with(kernel: &str, sysgen: &str, kfloor: u64, sfloor: u64) -> 
         ("send", "malformed"),
         ("send", "malformed"),
         ("send", "malformed"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index == 3 {
+            emit_relation(&mut ev, 2, 3, 6, 6);
+        }
         emit_ipc_op(&mut ev, 2, 3, op, status);
     }
     ev("\"ev\":\"ipc.park\",\"id\":2,\"generation\":3".into());
@@ -359,7 +375,7 @@ fn passing_serial_with(kernel: &str, sysgen: &str, kfloor: u64, sfloor: u64) -> 
     emit_prepare(&mut ev, 1, 8, 6);
     emit_start(&mut ev, 1, 8, 6);
     emit_context(&mut ev, 1, 8, 0);
-    emit_ipc_park(&mut ev, 1, 8);
+    emit_ipc_park(&mut ev, 1, 8, 3, 3);
     emit_prepare(&mut ev, 2, 4, 8);
     emit_start(&mut ev, 2, 4, 8);
     emit_context(&mut ev, 2, 4, 0);
@@ -381,7 +397,7 @@ fn passing_serial_with(kernel: &str, sysgen: &str, kfloor: u64, sfloor: u64) -> 
     emit_prepare(&mut ev, 1, 9, 10);
     emit_start(&mut ev, 1, 9, 10);
     emit_context(&mut ev, 1, 9, 0);
-    emit_ipc_cancel_guest(&mut ev, 1, 9);
+    emit_ipc_cancel_guest(&mut ev, 1, 9, 3, 3);
     emit_pass(&mut ev, super::DOMAIN_REQUIRED_PASSES[10]);
     emit_pass(&mut ev, super::CLEAN_RESTART_GATE);
     ev("\"ev\":\"domain.harness\",\"outcome\":true".into());

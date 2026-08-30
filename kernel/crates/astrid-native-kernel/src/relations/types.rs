@@ -357,6 +357,7 @@ impl RelationChange {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReclaimOutcome {
+    Reclaimed,
     ReleaseFailed,
     ReclaimBlocked,
 }
@@ -401,4 +402,16 @@ pub enum ProjectionError {
     Resurrection,
     ReaderSlotsExhausted,
     ResnapshotRequired,
+}
+
+impl ProjectionError {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Denied => 1,
+            Self::NoSpace => 2,
+            Self::Resurrection => 3,
+            Self::ReaderSlotsExhausted => 4,
+            Self::ResnapshotRequired => 5,
+        }
+    }
 }
