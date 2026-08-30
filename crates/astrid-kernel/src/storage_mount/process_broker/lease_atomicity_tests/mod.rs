@@ -26,7 +26,8 @@ mod stopped_provider_tests;
 pub(crate) use super::projection_lifecycle::fence_projection_leases_for_test;
 pub(crate) use super::{
     ProjectionCleanupState, ProjectionLeaseProvider, ProjectionLeaseTarget, RunningProvider,
-    arm_partial_issue_failure,
+    arm_issue_root_removal_failure_for_test, arm_partial_issue_failure,
+    arm_partial_issue_provider_error_for_test,
 };
 use super::{
     abort_process_provider, arm_launch_cleanup_failure, arm_launch_failure,

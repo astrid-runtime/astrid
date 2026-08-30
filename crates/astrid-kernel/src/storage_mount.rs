@@ -47,6 +47,7 @@ use filesystem::{PrefixedFilesystem, execute_blocking};
 mod admission;
 mod cleanup;
 mod lifecycle;
+mod mutation;
 #[cfg(test)]
 pub(crate) use admission::arm_issue_admission_gate;
 #[cfg(test)]
@@ -73,6 +74,7 @@ pub(crate) use lifecycle::{
 };
 #[cfg(test)]
 pub(crate) use lifecycle::{lease_status, sync_lease};
+use mutation::InFlightMutation;
 #[cfg(any(unix, windows))]
 use retained_jobs::{
     BlockingJobDrain, drain_accepted_tasks, drain_blocking_jobs, endpoint_became_absent,
@@ -153,27 +155,6 @@ pub(crate) struct StorageMountLeaseState {
     cleanup_fault: std::sync::Mutex<Option<MountCleanupStage>>,
     /// Durable marker proving a mapped lease's host resources were removed.
     cleanup_ledger_path: PathBuf,
-}
-
-struct InFlightMutation {
-    count: Arc<StorageMountLeaseState>,
-}
-
-impl InFlightMutation {
-    fn begin(state: &Arc<StorageMountLeaseState>) -> Self {
-        state.in_flight_mutations.fetch_add(1, Ordering::AcqRel);
-        Self {
-            count: Arc::clone(state),
-        }
-    }
-}
-
-impl Drop for InFlightMutation {
-    fn drop(&mut self) {
-        self.count
-            .in_flight_mutations
-            .fetch_sub(1, Ordering::AcqRel);
-    }
 }
 
 #[cfg(test)]
@@ -276,6 +257,14 @@ impl StorageMountLeaseState {
 
     #[cfg(any(unix, windows))]
     fn record_drain_failure(&self, outcome: BlockingJobDrain) {
+        // A first cleanup can hit its bounded wait before a retained worker
+        // joins. Keep that timeout latched, but let a later real JoinFailed
+        // upgrade it; the retry must see the true panic classification.
+        if outcome == BlockingJobDrain::TimedOut
+            && *self.drain_failure_tx.borrow() == Some(BlockingJobDrain::JoinFailed)
+        {
+            return;
+        }
         self.drain_failure_tx.send_replace(Some(outcome));
     }
 

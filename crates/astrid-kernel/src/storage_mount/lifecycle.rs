@@ -531,7 +531,10 @@ async fn await_retained_drain(
         )
         .to_string()),
         ListenerDrainOutcome::Failed(BlockingJobDrain::TimedOut)
-        | ListenerDrainOutcome::TimedOut => Err(drain_timeout_error(state).to_string()),
+        | ListenerDrainOutcome::TimedOut => {
+            state.record_drain_failure(BlockingJobDrain::TimedOut);
+            Err(drain_timeout_error(state).to_string())
+        },
         ListenerDrainOutcome::Failed(BlockingJobDrain::Completed)
         | ListenerDrainOutcome::Closed => Ok(()),
     }

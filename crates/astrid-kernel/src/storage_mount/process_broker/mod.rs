@@ -106,6 +106,11 @@ static PARTIAL_ISSUE_FAILURES: std::sync::Mutex<
 > = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 #[cfg(all(test, any(unix, windows)))]
+static PARTIAL_ISSUE_PROVIDER_ERRORS: std::sync::Mutex<
+    std::collections::BTreeMap<u64, process_launch::ProcessLaunchStage>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(all(test, any(unix, windows)))]
 pub(crate) fn arm_partial_issue_failure(stage: process_launch::ProcessLaunchStage, test_id: u64) {
     PARTIAL_ISSUE_FAILURES
         .lock()
@@ -113,6 +118,30 @@ pub(crate) fn arm_partial_issue_failure(stage: process_launch::ProcessLaunchStag
         .insert(test_id, stage);
 }
 
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) fn arm_partial_issue_provider_error_for_test(
+    stage: process_launch::ProcessLaunchStage,
+    test_id: u64,
+) {
+    PARTIAL_ISSUE_PROVIDER_ERRORS
+        .lock()
+        .expect("partial issue provider error selector")
+        .insert(test_id, stage);
+}
+
+#[cfg(all(test, any(unix, windows)))]
+fn take_partial_issue_provider_error(stage: process_launch::ProcessLaunchStage) -> bool {
+    let current_test_id = PROCESS_MOUNT_TEST_ID
+        .try_with(|test_id| *test_id)
+        .unwrap_or(0);
+    let mut errors = PARTIAL_ISSUE_PROVIDER_ERRORS
+        .lock()
+        .expect("partial issue provider error selector");
+    if errors.get(&current_test_id) != Some(&stage) {
+        return false;
+    }
+    errors.remove(&current_test_id).is_some()
+}
 #[cfg(all(test, any(unix, windows)))]
 fn take_partial_issue_failure(stage: process_launch::ProcessLaunchStage) -> bool {
     let current_test_id = PROCESS_MOUNT_TEST_ID
@@ -127,9 +156,33 @@ fn take_partial_issue_failure(stage: process_launch::ProcessLaunchStage) -> bool
     failures.remove(&current_test_id).is_some()
 }
 
+#[cfg(all(test, any(unix, windows)))]
+static ISSUE_ROOT_REMOVAL_FAILURES: std::sync::Mutex<std::collections::BTreeSet<u64>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) fn arm_issue_root_removal_failure_for_test(test_id: u64) {
+    ISSUE_ROOT_REMOVAL_FAILURES
+        .lock()
+        .expect("issue root removal failure selector")
+        .insert(test_id);
+}
+
+#[cfg(all(test, any(unix, windows)))]
+fn take_issue_root_removal_failure_for_test() -> bool {
+    let current_test_id = PROCESS_MOUNT_TEST_ID
+        .try_with(|test_id| *test_id)
+        .unwrap_or(0);
+    ISSUE_ROOT_REMOVAL_FAILURES
+        .lock()
+        .expect("issue root removal failure selector")
+        .remove(&current_test_id)
+}
+
 struct UncommittedIssueRollback {
     branch_mount_id: StorageMountId,
     owner_mount_id: Option<StorageMountId>,
+    component_mount_ids: Vec<StorageMountId>,
     mount_root: PathBuf,
     workspace_mountpoint: PathBuf,
     home_mountpoint: PathBuf,
@@ -137,7 +190,7 @@ struct UncommittedIssueRollback {
     issue_error: String,
 }
 
-async fn retain_uncommitted_issue_lease(
+async fn rollback_issued_issue_leases(
     projections: &mut std::collections::BTreeMap<
         ProcessProjectionKey,
         Arc<CachedProcessProjection>,
@@ -149,6 +202,7 @@ async fn retain_uncommitted_issue_lease(
     let UncommittedIssueRollback {
         branch_mount_id,
         owner_mount_id,
+        component_mount_ids,
         mount_root,
         workspace_mountpoint,
         home_mountpoint,
@@ -163,11 +217,8 @@ async fn retain_uncommitted_issue_lease(
         mount_id: branch_mount_id,
         target: key.binding.targets.workspace.clone(),
     };
-    let component_mount_ids = projection_component_mount_ids(
-        &branch_target.mount_id,
-        owner_target.as_ref().map(|owner| &owner.mount_id),
-        None,
-    );
+    // `component_mount_ids` records only leases that were actually issued.
+    // The branch target is the cleanup address for the zero-lease Branch exit.
     if cleanup_uncommitted_issue_lease_set(
         kernel,
         &key.binding,
@@ -179,9 +230,22 @@ async fn retain_uncommitted_issue_lease(
         if remove_projection_root(&mount_root).is_ok() {
             return issue_error;
         }
-        return format!("{issue_error}; process mount root cleanup failed");
+    } else {
+        retain_failed_issue_projection(
+            projections,
+            key,
+            kernel,
+            component_mount_ids,
+            RetainedIssuePaths {
+                workspace: workspace_mountpoint,
+                home: home_mountpoint,
+                fleet_shared: fleet_shared_mountpoint,
+            },
+            branch_target,
+            owner_target,
+        );
+        return format!("{issue_error}; issued lease cleanup failed and remains retained");
     }
-
     retain_failed_issue_projection(
         projections,
         key,
@@ -195,7 +259,7 @@ async fn retain_uncommitted_issue_lease(
         branch_target,
         owner_target,
     );
-    format!("{issue_error}; issued lease cleanup failed and remains retained")
+    format!("{issue_error}; process mount root cleanup failed and remains retained")
 }
 
 /// Kernel implementation of the capsule-neutral process storage broker.
@@ -412,6 +476,7 @@ async fn issue_projection_leases(
     let provider = platform_process_provider_name();
     let branch = issue_branch_lease(
         kernel,
+        projections,
         &ProjectionIssueContext {
             admission,
             mount_admission: &mount_admission,
@@ -473,6 +538,10 @@ fn prepare_projection_paths(
     let mount_root = process_root.join(uuid::Uuid::new_v4().simple().to_string());
     astrid_core::platform_fs::ensure_private_directory(&mount_root)
         .map_err(|error| format!("validate process storage mount root: {error}"))?;
+    #[cfg(all(test, any(unix, windows)))]
+    if take_issue_root_removal_failure_for_test() {
+        fail_next_root_removal_for_test(mount_root.clone());
+    }
     let workspace = mount_root.join("workspace");
     let owner = mount_root.join("owner");
     #[cfg(not(windows))]
@@ -501,6 +570,10 @@ fn prepare_projection_paths(
 
 async fn issue_branch_lease(
     kernel: &Arc<Kernel>,
+    projections: &mut std::collections::BTreeMap<
+        ProcessProjectionKey,
+        Arc<CachedProcessProjection>,
+    >,
     context: &ProjectionIssueContext<'_>,
     provider: &str,
 ) -> Result<StorageMountLeaseV1, String> {
@@ -509,13 +582,22 @@ async fn issue_branch_lease(
         mount_admission,
         paths,
     } = context;
+    #[cfg(all(test, any(unix, windows)))]
+    let provider = if take_partial_issue_provider_error(process_launch::ProcessLaunchStage::Branch)
+    {
+        "\t".to_owned()
+    } else {
+        provider.to_owned()
+    };
+    #[cfg(not(all(test, any(unix, windows))))]
+    let provider = provider.to_owned();
     let branch = issue_lease(
         kernel,
         mount_admission,
         admission.branch_view.clone(),
         admission.key.binding.targets.workspace.durable_target(),
         admission.access,
-        provider.to_owned(),
+        provider,
         paths.workspace.clone(),
     )
     .await;
@@ -528,10 +610,22 @@ async fn issue_branch_lease(
             );
             Ok(branch)
         },
-        Err(error) => {
-            let _ = std::fs::remove_dir_all(&paths.mount_root);
-            Err(error)
-        },
+        Err(error) => Err(rollback_issued_issue_leases(
+            projections,
+            &admission.key,
+            kernel,
+            UncommittedIssueRollback {
+                branch_mount_id: StorageMountId::new(),
+                owner_mount_id: None,
+                component_mount_ids: Vec::new(),
+                mount_root: paths.mount_root.clone(),
+                workspace_mountpoint: paths.workspace.clone(),
+                home_mountpoint: paths.owner.clone(),
+                fleet_shared_mountpoint: paths.fleet_shared.clone(),
+                issue_error: error,
+            },
+        )
+        .await),
     }
 }
 
@@ -577,13 +671,14 @@ async fn issue_owner_lease(
             );
             Ok(owner)
         },
-        Err(error) => Err(retain_uncommitted_issue_lease(
+        Err(error) => Err(rollback_issued_issue_leases(
             projections,
             &admission.key,
             kernel,
             UncommittedIssueRollback {
                 branch_mount_id: branch.mount_id,
                 owner_mount_id: None,
+                component_mount_ids: vec![branch.mount_id],
                 mount_root: paths.mount_root.clone(),
                 workspace_mountpoint: paths.workspace.clone(),
                 home_mountpoint: paths.owner.clone(),
@@ -608,6 +703,9 @@ fn partial_issue_provider(
     }
     #[cfg(all(test, any(unix, windows)))]
     {
+        if take_partial_issue_provider_error(stage) {
+            return "\t".to_owned();
+        }
         if !take_partial_issue_failure(stage) {
             return provider.to_owned();
         }
@@ -677,13 +775,14 @@ async fn issue_shared_lease(
             );
             Ok(Some(shared))
         },
-        Err(error) => Err(retain_uncommitted_issue_lease(
+        Err(error) => Err(rollback_issued_issue_leases(
             projections,
             &admission.key,
             kernel,
             UncommittedIssueRollback {
                 branch_mount_id: branch.mount_id,
                 owner_mount_id: Some(owner.mount_id),
+                component_mount_ids: vec![branch.mount_id, owner.mount_id],
                 mount_root: paths.mount_root.clone(),
                 workspace_mountpoint: paths.workspace.clone(),
                 home_mountpoint: paths.owner.clone(),

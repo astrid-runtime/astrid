@@ -184,3 +184,75 @@ async fn panicking_filesystem_worker_remains_a_retryable_drain_failure() {
     assert!(!kernel.storage_mounts.contains_key(&lease.mount_id));
     assert!(!lease.resource_path.exists());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_later_join_failure_upgrades_a_latched_drain_timeout() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
+    let kernel = Arc::new(crate::test_kernel_with_home(home).await);
+    let caller = PrincipalId::default();
+    let (lease, state, gate) =
+        worker_fixture(&temporary, &kernel, &caller, "timeout-upgrade-worker").await;
+    state.set_drain_timeouts_for_test(Duration::from_millis(20));
+
+    let mutation_lease = lease.clone();
+    let mutation = tokio::spawn(async move {
+        callback(
+            &mutation_lease,
+            &mutation_lease.lease_token,
+            create("timeout-panic.bin"),
+        )
+        .await
+    });
+    let gate_for_wait = Arc::clone(&gate);
+    tokio::task::spawn_blocking(move || gate_for_wait.wait_entered(1))
+        .await
+        .unwrap();
+
+    let revoke_kernel = Arc::clone(&kernel);
+    let revoke_caller = caller.clone();
+    let first_revoke =
+        tokio::spawn(async move { revoke(&revoke_kernel, &revoke_caller, lease.mount_id).await });
+    while !state.revoked.load(Ordering::Acquire) {
+        tokio::task::yield_now().await;
+    }
+    let first_error = tokio::time::timeout(Duration::from_secs(2), first_revoke)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        first_error.contains("did not finish within"),
+        "{first_error}"
+    );
+    assert!(
+        !first_error.contains("retained filesystem worker join failed"),
+        "the first bounded attempt must exercise TimedOut: {first_error}"
+    );
+
+    gate.arm_panic_on_release();
+    gate.release_workers();
+    gate.wait_failed(1);
+    let error = revoke(&kernel, &caller, lease.mount_id).await.unwrap_err();
+    assert!(
+        error.contains("retained filesystem worker join failed"),
+        "JoinFailed must deterministically upgrade TimedOut, got {error}"
+    );
+    assert!(kernel.storage_mounts.contains_key(&lease.mount_id));
+    assert!(lease.resource_path.exists());
+
+    let _ = mutation.await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !state.wait_listener_closed_for_test().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the upgraded retained worker must still close the listener");
+
+    revoke(&kernel, &caller, lease.mount_id)
+        .await
+        .expect("the settled exact retry must remove retained authority");
+    assert!(!kernel.storage_mounts.contains_key(&lease.mount_id));
+    assert!(!lease.resource_path.exists());
+}
