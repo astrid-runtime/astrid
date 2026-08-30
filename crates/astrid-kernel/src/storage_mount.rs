@@ -81,6 +81,8 @@ const LEASE_IDLE_TTL_SECS: u64 = 60 * 60;
 /// Bound listener shutdown waits without turning a stalled listener into an
 /// endpoint-removal race; timed-out cleanup remains mapped for retry.
 const LISTENER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(windows)]
+const ENDPOINT_ABSENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_CALLBACK_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const LEASE_MANIFEST_NAME: &str = "lease.json";
 
@@ -126,6 +128,7 @@ pub(crate) struct StorageMountLeaseState {
     dirty: AtomicBool,
     in_flight_mutations: AtomicU64,
     shutdown_tx: watch::Sender<bool>,
+    accepted_tasks: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
     #[cfg(all(test, any(unix, windows)))]
     token_for_test: String,
     /// Set after the listener task has dropped its backend listener handle.
@@ -138,6 +141,8 @@ pub(crate) struct StorageMountLeaseState {
     mutation_test_gate: std::sync::Mutex<Option<Arc<MutationTestGate>>>,
     #[cfg(test)]
     cleanup_fault: std::sync::Mutex<Option<MountCleanupStage>>,
+    /// Durable marker proving a mapped lease's host resources were removed.
+    cleanup_ledger_path: PathBuf,
 }
 
 struct InFlightMutation<'a> {
@@ -311,6 +316,11 @@ fn publish_issued_lease(
     let (token, token_hash) = generate_lease_token()?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (listener_closed_tx, _) = watch::channel(false);
+    let cleanup_ledger_path = kernel
+        .astrid_home
+        .run_dir()
+        .join("mount-cleanup")
+        .join(format!("{mount_id}.cleaned"));
     #[cfg(unix)]
     let callback_path = resource_path.join("control.sock");
     #[cfg(not(unix))]
@@ -334,6 +344,7 @@ fn publish_issued_lease(
         dirty: AtomicBool::new(false),
         in_flight_mutations: AtomicU64::new(0),
         shutdown_tx,
+        accepted_tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
         #[cfg(all(test, any(unix, windows)))]
         token_for_test: token.clone(),
         listener_closed_tx,
@@ -341,6 +352,7 @@ fn publish_issued_lease(
         mutation_test_gate: std::sync::Mutex::new(None),
         #[cfg(test)]
         cleanup_fault: std::sync::Mutex::new(None),
+        cleanup_ledger_path,
     });
 
     #[cfg(any(unix, windows))]
@@ -572,7 +584,6 @@ async fn serve_listener(
                 if !state.revoked.load(Ordering::Acquire)
                     && now_epoch_secs() > state.expires_at_epoch_secs.load(Ordering::Acquire)
                 {
-                    state.revoked.store(true, Ordering::Release);
                     let _ = state.shutdown_tx.send(true);
                     expired = true;
                     break;
@@ -583,9 +594,14 @@ async fn serve_listener(
                 match result {
                     Ok(stream) => {
                         let Some(kernel) = kernel.upgrade() else { break };
-                        let state = Arc::clone(&state);
-                        astrid_runtime::spawn(async move {
-                            handle_connection(kernel, state, stream).await;
+                        let connection_state = Arc::clone(&state);
+                        let bookkeeping_state = Arc::clone(&state);
+                        let mut accepted_tasks = bookkeeping_state.accepted_tasks.lock().await;
+                        while let Some(result) = accepted_tasks.try_join_next() {
+                            let _ = result;
+                        }
+                        accepted_tasks.spawn(async move {
+                            handle_connection(kernel, connection_state, stream).await;
                         });
                     },
                     Err(error)
@@ -604,6 +620,10 @@ async fn serve_listener(
     // observe the named-pipe endpoint as absent.
     drop(accepted);
     drop(listener);
+    drain_accepted_tasks(&state).await;
+    if !endpoint_became_absent(&state.callback_path).await {
+        return;
+    }
     state.listener_closed_tx.send_replace(true);
 
     if expired {
@@ -612,6 +632,42 @@ async fn serve_listener(
         } else {
             let _ = cleanup_resource_paths(&state.resource_path, &state.callback_path, None);
         }
+    }
+}
+
+async fn drain_accepted_tasks(state: &StorageMountLeaseState) {
+    let mut tasks = state.accepted_tasks.lock().await;
+    tasks.abort_all();
+    let drain = async {
+        while let Some(result) = tasks.join_next().await {
+            let _ = result;
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(1), drain)
+        .await
+        .is_err()
+    {
+        tracing::warn!("storage mount accepted connection cancellation exceeded its drain bound");
+    }
+}
+
+#[cfg_attr(unix, allow(clippy::unused_async))]
+async fn endpoint_became_absent(callback_path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        let _ = callback_path;
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        let wait = async {
+            while astrid_core::local_transport::endpoint_is_present(callback_path).unwrap_or(true) {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        };
+        tokio::time::timeout(ENDPOINT_ABSENCE_TIMEOUT, wait)
+            .await
+            .is_ok()
     }
 }
 

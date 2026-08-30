@@ -304,13 +304,7 @@ fn validate_service_launch(launch: &StorageProviderServiceLaunchV1) -> Result<()
     {
         bail!("WinFsp service mountpoint is public or overlaps the lease resource");
     }
-    platform_fs::validate_private_directory(&launch.mountpoint)
-        .context("validate private WinFsp mountpoint")?;
-    platform_fs::verify_no_redirects(&launch.mountpoint)
-        .context("reject redirected WinFsp mountpoint")?;
-    if std::fs::read_dir(&launch.mountpoint)?.next().is_some() {
-        bail!("WinFsp service mountpoint is not empty");
-    }
+    validate_reserved_mountpoint(&launch.mountpoint)?;
     if !launch.control_path.is_absolute()
         || launch
             .control_path
@@ -334,6 +328,23 @@ fn validate_service_launch(launch: &StorageProviderServiceLaunchV1) -> Result<()
         bail!("WinFsp service control endpoint is already present");
     }
     Ok(())
+}
+
+fn validate_reserved_mountpoint(mountpoint: &Path) -> Result<()> {
+    let parent = mountpoint
+        .parent()
+        .context("WinFsp service mountpoint has no parent")?;
+    platform_fs::validate_private_directory(parent)
+        .context("validate private WinFsp mountpoint parent")?;
+    platform_fs::verify_no_redirects(parent)
+        .context("reject redirected WinFsp mountpoint parent")?;
+    match std::fs::symlink_metadata(mountpoint) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("inspect reserved WinFsp mountpoint"),
+        Ok(_) => Err(anyhow::anyhow!(
+            "WinFsp service mountpoint leaf must be absent and provider-owned"
+        )),
+    }
 }
 
 async fn probe_callback(launch: &StorageProviderServiceLaunchV1) -> Result<()> {
@@ -744,3 +755,40 @@ fn volume_params(access: StorageProviderAccessV1) -> Params {
 #[cfg(test)]
 #[path = "win/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod reserved_mountpoint_tests {
+    use super::*;
+
+    #[test]
+    fn reserved_mountpoint_accepts_absent_component_leaves() {
+        let temporary = tempfile::tempdir().expect("reserved mount root");
+        let parent = temporary.path().join("components");
+        std::fs::create_dir(&parent).expect("private component parent");
+        let mountpoints = [
+            parent.join("workspace"),
+            parent.join("owner"),
+            parent.join("shared"),
+        ];
+        for mountpoint in mountpoints {
+            validate_reserved_mountpoint(&mountpoint).unwrap_or_else(|error| {
+                panic!(
+                    "absent component {} must be admitted: {error:#}",
+                    mountpoint.display()
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn reserved_mountpoint_rejects_precreated_leaf() {
+        let temporary = tempfile::tempdir().expect("reserved mount root");
+        let parent = temporary.path().join("components");
+        std::fs::create_dir(&parent).expect("private component parent");
+        let mountpoint = parent.join("workspace");
+        std::fs::create_dir(&mountpoint).expect("precreated collision");
+        let error = validate_reserved_mountpoint(&mountpoint)
+            .expect_err("a precreated final leaf must preserve WinFsp ownership");
+        assert!(error.to_string().contains("must be absent"));
+    }
+}

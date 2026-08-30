@@ -1549,3 +1549,60 @@ async fn revoke_retries_after_injected_cleanup_failure() {
     assert!(!astrid_core::local_transport::endpoint_is_present(&lease.callback_path).unwrap());
     assert!(!lease.resource_path.exists());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_accepted_connection_is_aborted_before_endpoint_cleanup() {
+    let temporary = tempfile::tempdir().unwrap();
+    let kernel = crate::test_kernel_with_home(astrid_core::dirs::AstridHome::from_path(
+        temporary.path().join(".astrid"),
+    ))
+    .await;
+    let caller = PrincipalId::default();
+    let lease = issue_lease(
+        &kernel,
+        &test_mount_admission(&kernel, &caller, MountOwnerScope::CrossOwnerWrite),
+        StorageProviderViewV1::Admin,
+        StorageFilesystemTargetV1::OwnerRoot,
+        StorageProviderAccessV1::ReadWrite,
+        "idle-transport-test-provider".to_owned(),
+        temporary.path().join("idle-connection-mount"),
+    )
+    .await
+    .unwrap();
+    let state = Arc::clone(kernel.storage_mounts.get(&lease.mount_id).unwrap().value());
+
+    let mut client = astrid_core::local_transport::connect(&lease.callback_path)
+        .await
+        .unwrap();
+    // One byte is consumed by Windows accept authentication and leaves both
+    // backends waiting for the first callback frame.
+    client.write_all(&[0_u8]).await.unwrap();
+    client.flush().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if !state.accepted_tasks.lock().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("accepted connection must be tracked");
+
+    revoke_lease(
+        &kernel,
+        &caller,
+        MountOwnerScope::CrossOwnerWrite,
+        lease.mount_id,
+    )
+    .await
+    .unwrap();
+
+    assert!(!kernel.storage_mounts.contains_key(&lease.mount_id));
+    assert!(
+        !astrid_core::local_transport::endpoint_is_present(&lease.callback_path).unwrap(),
+        "every accepted server handle must close before endpoint cleanup"
+    );
+    assert!(!lease.resource_path.exists());
+    assert!(!kernel.astrid_home.run_dir().join("mount-cleanup").exists());
+}

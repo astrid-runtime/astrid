@@ -1,4 +1,4 @@
-//! Deterministic proof that liveness publication shares the retain fence.
+//! Deterministic final-interval proof for cached projection retention.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -10,54 +10,136 @@ use astrid_storage::StateOwner;
 
 use super::{
     CachedProcessProjection, ProcessProjectionBinding, ProcessProjectionTargetSet,
-    ProjectionCleanup, ProjectionGeneration, projection_leases_are_live,
+    ProjectionCleanup, ProjectionGeneration, arm_retain_validation_gate,
+    platform_process_provider_name, projection_leases_are_live, retain_locked_projection,
 };
+use crate::storage_mount::expire_lease_for_test;
 use crate::storage_mount::{MountOwnerScope, issue_lease, test_mount_admission};
 
 struct LinearizationFixture {
+    #[allow(dead_code)]
     temporary: tempfile::TempDir,
     kernel: Arc<crate::Kernel>,
     projection: Arc<CachedProcessProjection>,
+    key: super::ProcessProjectionKey,
+    caller: PrincipalId,
 }
 
 #[tokio::test]
-async fn revocation_and_expiry_are_visible_inside_the_mutation_fence() {
+async fn revocation_and_expiry_are_seen_before_retention() {
+    revocation_published_under_the_fence().await;
+    expiry_published_under_the_fence().await;
+}
+
+async fn revocation_published_under_the_fence() {
     let fixture = linearization_fixture().await;
-    let retain_fence = fixture.kernel.storage_mount_mutations.lock().await;
-    let owner_state = fixture
+    assert!(
+        projection_leases_are_live(&fixture.kernel, &fixture.projection),
+        "the exact platform-provider set must start live"
+    );
+    let gate = arm_retain_validation_gate();
+    let retain_kernel = Arc::clone(&fixture.kernel);
+    let retain_projection = Arc::clone(&fixture.projection);
+    let retain_cache = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let retain_key = fixture.key.clone();
+    let retain = tokio::spawn(async move {
+        retain_locked_projection(&retain_kernel, retain_projection, retain_cache, retain_key).await
+    });
+    gate.entered().notified().await;
+
+    fixture
         .kernel
         .storage_mounts
         .get(&fixture.projection.component_mount_ids[1])
-        .map(|entry| Arc::clone(entry.value()))
-        .expect("owner member");
-
-    owner_state.revoked.store(true, Ordering::Release);
+        .expect("owner member")
+        .revoked
+        .store(true, Ordering::Release);
+    gate.release().notify_one();
+    let Err(error) = tokio::time::timeout(std::time::Duration::from_secs(5), retain)
+        .await
+        .expect("retain linearization must not deadlock")
+        .expect("retain task joins")
+    else {
+        panic!("post-publication validation must refuse a reference");
+    };
     assert!(
-        !projection_leases_are_live(&fixture.kernel, &fixture.projection),
-        "revocation must be visible before the final reference decision"
+        error.contains("became unhealthy"),
+        "unexpected error: {error}"
     );
-    owner_state.revoked.store(false, Ordering::Release);
+    assert_eq!(fixture.projection.refs.load(Ordering::Acquire), 0);
 
     for mount_id in &fixture.projection.component_mount_ids {
-        fixture
+        let cleanup = async {
+            crate::storage_mount::revoke_lease(
+                &fixture.kernel,
+                &fixture.caller,
+                MountOwnerScope::CrossOwnerWrite,
+                *mount_id,
+            )
+            .await
+            .map_err(|error| std::io::Error::other(format!("cleanup revoke failed: {error}")))
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), cleanup)
+            .await
+            .expect("cleanup revoke must not deadlock")
+            .expect("clean the deterministic fixture");
+    }
+}
+
+async fn expiry_published_under_the_fence() {
+    let fixture = linearization_fixture().await;
+    assert!(
+        projection_leases_are_live(&fixture.kernel, &fixture.projection),
+        "the exact platform-provider set must start live"
+    );
+    let gate = arm_retain_validation_gate();
+    let retain_kernel = Arc::clone(&fixture.kernel);
+    let retain_projection = Arc::clone(&fixture.projection);
+    let retain_cache = Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let retain_key = fixture.key.clone();
+    let retain = tokio::spawn(async move {
+        retain_locked_projection(&retain_kernel, retain_projection, retain_cache, retain_key).await
+    });
+    gate.entered().notified().await;
+
+    for mount_id in &fixture.projection.component_mount_ids {
+        let state = fixture
             .kernel
             .storage_mounts
             .get(mount_id)
-            .expect("mapped member")
-            .expires_at_epoch_secs
-            .store(0, Ordering::Release);
+            .expect("mapped member");
+        expire_lease_for_test(state.value());
     }
+    gate.release().notify_one();
+    let Err(error) = tokio::time::timeout(std::time::Duration::from_secs(5), retain)
+        .await
+        .expect("retain linearization must not deadlock")
+        .expect("retain task joins")
+    else {
+        panic!("post-publication validation must refuse a reference");
+    };
     assert!(
-        !projection_leases_are_live(&fixture.kernel, &fixture.projection),
-        "expiry must be visible before the final reference decision"
+        error.contains("became unhealthy"),
+        "unexpected error: {error}"
     );
     assert_eq!(fixture.projection.refs.load(Ordering::Acquire), 0);
-    drop(retain_fence);
-    assert!(
-        fixture.kernel.storage_mount_mutations.try_lock().is_ok(),
-        "retain validation and reference acquisition must use the same kernel fence"
-    );
-    assert!(fixture.temporary.path().is_dir());
+
+    for mount_id in &fixture.projection.component_mount_ids {
+        let cleanup = async {
+            crate::storage_mount::revoke_lease(
+                &fixture.kernel,
+                &fixture.caller,
+                MountOwnerScope::CrossOwnerWrite,
+                *mount_id,
+            )
+            .await
+            .map_err(|error| std::io::Error::other(format!("cleanup revoke failed: {error}")))
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), cleanup)
+            .await
+            .expect("cleanup revoke must not deadlock")
+            .expect("clean the deterministic fixture");
+    }
 }
 
 async fn linearization_fixture() -> LinearizationFixture {
@@ -88,8 +170,12 @@ async fn linearization_fixture() -> LinearizationFixture {
             .expect("valid target set"),
     )
     .expect("valid projection binding");
+    let key = super::ProcessProjectionKey {
+        binding: binding.clone(),
+        read_write: true,
+    };
     let admission = test_mount_admission(&kernel, &caller, MountOwnerScope::CrossOwnerWrite);
-    let provider = "linearization-test-provider".to_owned();
+    let provider = platform_process_provider_name().to_owned();
     let members = [
         (
             binding.targets.workspace.durable_target(),
@@ -124,7 +210,7 @@ async fn linearization_fixture() -> LinearizationFixture {
             mountpoint,
         )
         .await
-        .expect("issue exact projection member");
+        .expect("issue exact platform-provider member");
         component_mount_ids.push(lease.mount_id);
     }
     let projection = Arc::new(CachedProcessProjection {
@@ -142,6 +228,8 @@ async fn linearization_fixture() -> LinearizationFixture {
         temporary,
         kernel,
         projection,
+        key,
+        caller,
     }
 }
 

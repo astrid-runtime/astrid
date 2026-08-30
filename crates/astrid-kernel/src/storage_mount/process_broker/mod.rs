@@ -353,12 +353,16 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             .map_err(|error| format!("validate process storage mount root: {error}"))?;
         let workspace_mountpoint = mount_root.join("workspace");
         let home_mountpoint = mount_root.join("owner");
-        astrid_core::platform_fs::ensure_private_directory(&workspace_mountpoint)
-            .map_err(|error| format!("create workspace mountpoint: {error}"))?;
-        astrid_core::platform_fs::ensure_private_directory(&home_mountpoint)
-            .map_err(|error| format!("create owner mountpoint: {error}"))?;
+        #[cfg(not(windows))]
+        {
+            astrid_core::platform_fs::ensure_private_directory(&workspace_mountpoint)
+                .map_err(|error| format!("create workspace mountpoint: {error}"))?;
+            astrid_core::platform_fs::ensure_private_directory(&home_mountpoint)
+                .map_err(|error| format!("create owner mountpoint: {error}"))?;
+        }
         let fleet_shared_mountpoint = if matches!(key.binding.owner, StateOwner::Fleet(_)) {
             let path = mount_root.join("shared");
+            #[cfg(not(windows))]
             astrid_core::platform_fs::ensure_private_directory(&path)
                 .map_err(|error| format!("create Fleet shared mountpoint: {error}"))?;
             Some(path)

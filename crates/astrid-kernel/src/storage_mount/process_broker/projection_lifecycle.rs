@@ -17,6 +17,7 @@ use super::{
     platform_process_provider_name, stop_process_provider,
 };
 use crate::storage_mount::lifecycle::cleanup_mapped_lease_resources;
+use crate::storage_mount::lifecycle::complete_cleanup_ledger;
 use crate::storage_mount::lifecycle::force_fence_projection_lease;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -375,12 +376,17 @@ pub(crate) async fn cleanup_uncommitted_issue_lease_set(
     while let Some(closed) = listener_checks.join_next().await {
         listeners_closed &= closed.unwrap_or_default();
     }
-    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
     if !listeners_closed {
         return false;
     }
+    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
     for state in &states {
         if cleanup_mapped_lease_resources(state).is_err() {
+            return false;
+        }
+    }
+    for state in &states {
+        if complete_cleanup_ledger(state).is_err() {
             return false;
         }
     }
@@ -416,12 +422,15 @@ pub(crate) async fn revoke_projection_leases(
         );
         return false;
     }
-    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
-
     // Resource removal and unmap are two phases. A resource fault therefore
     // leaves the complete exact set mapped as the bounded-retry authority.
     for state in &states {
         if cleanup_mapped_lease_resources(state).is_err() {
+            return false;
+        }
+    }
+    for state in &states {
+        if complete_cleanup_ledger(state).is_err() {
             return false;
         }
     }
@@ -699,9 +708,10 @@ pub(crate) async fn retain_locked_projection(
     key: ProcessProjectionKey,
 ) -> Result<astrid_capsule::context::ProcessStorageMount, String> {
     // Validation and reference acquisition share the publication/drain lock.
-    // A concurrent ordinary revoke or expiry therefore either completes first
-    // (the stale set is not retained) or happens after this caller owns a
-    // reference (normal authority invalidation for an already admitted mount).
+    // Revocation publishes its atomic state transition without waiting behind
+    // an in-flight writer, so the post-reference recheck closes that interval:
+    // either the retain observes revocation and takes no reference, or the
+    // revoke observes the reference and invalidates the already admitted set.
     let _mutation_guard = kernel.storage_mount_mutations.lock().await;
     #[cfg(all(test, any(unix, windows)))]
     pause_retain_validation_for_test().await;
@@ -718,6 +728,11 @@ pub(crate) async fn retain_locked_projection(
         return Err("native process storage projection became unhealthy".to_owned());
     }
     retain_cached_projection(&projection)?;
+    if !projection_leases_are_live(kernel, &projection) {
+        projection.refs.fetch_sub(1, Ordering::AcqRel);
+        projection.cleanup_failed.store(true, Ordering::Release);
+        return Err("native process storage projection became unhealthy".to_owned());
+    }
     Ok(projection_mount(projection, cache, key))
 }
 

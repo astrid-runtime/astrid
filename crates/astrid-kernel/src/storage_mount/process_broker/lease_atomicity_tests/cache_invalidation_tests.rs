@@ -554,6 +554,7 @@ async fn mismatched_partial_issue_member_blocks_exact_cleanup() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn failed_issue_cleanup_retains_root_and_retry_authority() {
     let fixture = super::exact_fence_fixture().await;
     let root = tempfile::tempdir().expect("issue cleanup scratch root");
@@ -587,9 +588,9 @@ async fn failed_issue_cleanup_retains_root_and_retry_authority() {
         Some(owner),
     );
     let projection = Arc::clone(projections.get(&key).expect("retained issue blocker"));
-    let branch_state = Arc::clone(&fixture.states[0]);
+    let owner_state = Arc::clone(&fixture.states[1]);
     crate::storage_mount::inject_cleanup_fault_for_test(
-        &branch_state,
+        &owner_state,
         crate::storage_mount::MountCleanupStage::Callback,
     );
 
@@ -614,6 +615,26 @@ async fn failed_issue_cleanup_retains_root_and_retry_authority() {
         mount_root.exists(),
         "failed cleanup must retain the UUID root"
     );
+    let branch_marker = fixture
+        .kernel
+        .astrid_home
+        .run_dir()
+        .join("mount-cleanup")
+        .join(format!("{}.cleaned", branch.mount_id));
+    assert!(
+        branch_marker.is_file(),
+        "the branch resource completed before the owner fault and must be ledgered"
+    );
+    assert!(
+        !fixture
+            .kernel
+            .astrid_home
+            .run_dir()
+            .join("mount-cleanup")
+            .join(format!("{}.cleaned", fixture.owner.mount_id))
+            .is_file(),
+        "only the component whose resources were removed may be ledgered"
+    );
 
     for state in &fixture.states {
         crate::storage_mount::clear_cleanup_fault_for_test(state);
@@ -629,6 +650,15 @@ async fn failed_issue_cleanup_retains_root_and_retry_authority() {
     assert!(
         !mount_root.exists(),
         "successful retry must remove the root"
+    );
+    assert!(
+        !fixture
+            .kernel
+            .astrid_home
+            .run_dir()
+            .join("mount-cleanup")
+            .exists(),
+        "completed unmap must retire the exact cleanup ledger"
     );
 }
 

@@ -16,7 +16,6 @@ use astrid_storage::{AstridFilesystem, StateOwner, WorkspaceBranchStore};
 use serde_json::json;
 
 use super::StorageMountLeaseState;
-#[cfg(test)]
 use super::cleanup::MountCleanupStage;
 use super::cleanup::{MountCleanupError, cleanup_error, cleanup_resource_paths};
 use super::filesystem::{CallbackFilesystem, PrefixedFilesystem};
@@ -323,6 +322,8 @@ pub(crate) fn cleanup_mapped_lease(
     state: &StorageMountLeaseState,
 ) -> Result<(), MountCleanupError> {
     cleanup_mapped_lease_resources(state)?;
+    complete_cleanup_ledger(state)
+        .map_err(|(stage, source)| cleanup_error(Some(state.mount_id), stage, source))?;
     kernel.storage_mounts.remove(&state.mount_id);
     Ok(())
 }
@@ -334,6 +335,9 @@ pub(crate) fn cleanup_mapped_lease(
 pub(crate) fn cleanup_mapped_lease_resources(
     state: &StorageMountLeaseState,
 ) -> Result<(), MountCleanupError> {
+    if cleanup_ledger_is_clean(state) {
+        return Ok(());
+    }
     let fault = {
         #[cfg(test)]
         {
@@ -345,7 +349,66 @@ pub(crate) fn cleanup_mapped_lease_resources(
         }
     };
     cleanup_resource_paths(&state.resource_path, &state.callback_path, fault)
-        .map_err(|(stage, source)| cleanup_error(Some(state.mount_id), stage, source))
+        .map_err(|(stage, source)| cleanup_error(Some(state.mount_id), stage, source))?;
+    record_cleanup_ledger(state)
+        .map_err(|(stage, source)| cleanup_error(Some(state.mount_id), stage, source))?;
+    Ok(())
+}
+
+fn cleanup_ledger_is_clean(state: &StorageMountLeaseState) -> bool {
+    let expected = state.mount_id.to_string();
+    state.cleanup_ledger_path.is_file()
+        && std::fs::read(&state.cleanup_ledger_path).is_ok_and(|bytes| bytes == expected.as_bytes())
+}
+
+fn record_cleanup_ledger(
+    state: &StorageMountLeaseState,
+) -> Result<(), (MountCleanupStage, std::io::Error)> {
+    let parent = state.cleanup_ledger_path.parent().ok_or_else(|| {
+        (
+            MountCleanupStage::Manifest,
+            std::io::Error::other("cleanup ledger has no parent"),
+        )
+    })?;
+    astrid_core::platform_fs::ensure_private_directory(parent).map_err(|error| {
+        (
+            MountCleanupStage::Manifest,
+            std::io::Error::other(format!("create cleanup ledger directory: {error}")),
+        )
+    })?;
+    astrid_core::platform_fs::atomic_write_private_file(
+        &state.cleanup_ledger_path,
+        state.mount_id.to_string().as_bytes(),
+    )
+    .map_err(|error| {
+        (
+            MountCleanupStage::Manifest,
+            std::io::Error::other(format!("write cleanup ledger: {error}")),
+        )
+    })
+}
+
+pub(crate) fn complete_cleanup_ledger(
+    state: &StorageMountLeaseState,
+) -> Result<(), (MountCleanupStage, std::io::Error)> {
+    match std::fs::remove_file(&state.cleanup_ledger_path) {
+        Ok(()) => {},
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(error) => {
+            return Err((
+                MountCleanupStage::Manifest,
+                std::io::Error::other(format!("remove cleanup ledger: {error}")),
+            ));
+        },
+    }
+    if let Some(parent) = state.cleanup_ledger_path.parent() {
+        #[cfg(windows)]
+        {
+            let _ = std::fs::remove_file(parent.join(".astrid-private-write.lock"));
+        }
+        let _ = std::fs::remove_dir(parent);
+    }
+    Ok(())
 }
 
 /// Revoke one mapped lease, including a revoked entry left after failed cleanup.
@@ -443,6 +506,18 @@ pub(crate) async fn revoke_from_grant(
     force_revoke_lease(kernel, &state).await
 }
 
+async fn force_revoke_lease(kernel: &Kernel, state: &StorageMountLeaseState) -> Result<(), String> {
+    state.revoked.store(true, Ordering::Release);
+    let _ = state.shutdown_tx.send(true);
+    // The listener owns the platform endpoint. Wait outside the mutation
+    // fence so the listener can finish any in-flight connection bookkeeping.
+    if !state.wait_listener_closed().await {
+        return Err("storage mount callback listener did not shut down".to_owned());
+    }
+    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
+    cleanup_mapped_lease(kernel, state).map_err(|error| error.to_string())
+}
+
 pub(super) async fn revalidate_live_grant(
     kernel: &Kernel,
     grant: &MountGrant,
@@ -492,18 +567,6 @@ pub(crate) async fn revoke_all_leases_for_principal(
     } else {
         Err(errors.join("; "))
     }
-}
-
-async fn force_revoke_lease(kernel: &Kernel, state: &StorageMountLeaseState) -> Result<(), String> {
-    state.revoked.store(true, Ordering::Release);
-    let _ = state.shutdown_tx.send(true);
-    // The listener owns the platform endpoint. Wait outside the mutation
-    // fence so the listener can finish any in-flight connection bookkeeping.
-    if !state.wait_listener_closed().await {
-        return Err("storage mount callback listener did not shut down".to_owned());
-    }
-    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
-    cleanup_mapped_lease(kernel, state).map_err(|error| error.to_string())
 }
 
 pub(super) async fn expire_idle_mapped_lease(kernel: &Kernel, state: &StorageMountLeaseState) {
