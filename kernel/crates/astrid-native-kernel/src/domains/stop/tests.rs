@@ -46,6 +46,12 @@ fn taken(slot: u64, generation: u64) -> StopLifecycle<TestManifest, TestComponen
     stop
 }
 
+fn completed(slot: u64, generation: u64) -> StopLifecycle<TestManifest, TestComponent> {
+    let mut stop = taken(slot, generation);
+    stop.finish(handle(slot, generation), true).unwrap();
+    stop
+}
+
 fn installed_armed_with_state(
     state: DomainState,
 ) -> spin::MutexGuard<'static, super::super::manager::Manager> {
@@ -301,4 +307,67 @@ fn inactive_stale_and_completed_reject_armed_take() {
         Err(StopError::HandleMismatch)
     );
     assert!(matches!(stale, StopLifecycle::Staged(_)));
+}
+
+#[test]
+fn completed_observation_requires_exact_taken_success() {
+    let handle = handle(0, 3);
+    for stop in [staged(0, 3), armed(0, 3), taken(0, 3), {
+        let mut aborted = taken(0, 3);
+        aborted.finish(handle, false).unwrap();
+        aborted
+    }] {
+        assert!(
+            stop.completed_observation(handle, MANIFEST, COMPONENT, Scenario::RunningStop)
+                .is_none()
+        );
+    }
+
+    let stop = completed(0, 3);
+    let observation = stop
+        .completed_observation(handle, MANIFEST, COMPONENT, Scenario::RunningStop)
+        .unwrap();
+    assert_eq!(observation.handle(), handle);
+    assert_eq!(observation.manifest_identity(), &MANIFEST);
+    assert_eq!(observation.component_id(), &COMPONENT);
+    assert_eq!(observation.scenario(), Scenario::RunningStop);
+    assert_eq!(
+        observation.outcome(),
+        crate::domains::types::Outcome::Cancelled
+    );
+}
+
+#[test]
+fn completed_observation_rejects_substituted_evidence() {
+    let stop = completed(0, 3);
+    assert!(
+        stop.completed_observation(handle(1, 3), MANIFEST, COMPONENT, Scenario::RunningStop)
+            .is_none()
+    );
+    assert!(
+        stop.completed_observation(handle(0, 4), MANIFEST, COMPONENT, Scenario::RunningStop)
+            .is_none()
+    );
+    assert!(
+        stop.completed_observation(
+            handle(0, 3),
+            TestManifest(8),
+            COMPONENT,
+            Scenario::RunningStop
+        )
+        .is_none()
+    );
+    assert!(
+        stop.completed_observation(
+            handle(0, 3),
+            MANIFEST,
+            TestComponent(12),
+            Scenario::RunningStop
+        )
+        .is_none()
+    );
+    assert!(
+        stop.completed_observation(handle(0, 3), MANIFEST, COMPONENT, Scenario::Exit)
+            .is_none()
+    );
 }
