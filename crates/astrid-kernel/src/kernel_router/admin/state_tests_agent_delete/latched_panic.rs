@@ -24,13 +24,6 @@ async fn agent_delete_observes_pre_latched_panic_with_stale_listener_then_retrie
     );
     state.set_drain_timeouts_for_test(std::time::Duration::from_millis(80));
     state.arm_stale_join_failure_for_test();
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while !state.wait_listener_closed_for_test().await {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the panic must settle and close the listener before deletion");
     assert!(!state.is_revoked_for_test());
 
     let failed = handlers::dispatch(

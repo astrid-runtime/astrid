@@ -352,6 +352,19 @@ pub(crate) fn blocked_projection_lease(
 ///
 /// Resources are removed first. Only after every mapped member proves
 /// resource-free does the second phase unmap the exact revoked set.
+async fn drain_projection_states(states: &[Arc<super::StorageMountLeaseState>]) -> bool {
+    let mut listener_checks = tokio::task::JoinSet::new();
+    for state in states {
+        let state = Arc::clone(state);
+        listener_checks.spawn(async move { state.drain_is_settled_for_cleanup().await });
+    }
+    let mut listeners_closed = true;
+    while let Some(closed) = listener_checks.join_next().await {
+        listeners_closed &= closed.unwrap_or_default();
+    }
+    listeners_closed
+}
+
 pub(crate) async fn cleanup_uncommitted_issue_lease_set(
     kernel: &Kernel,
     binding: &ProcessProjectionBinding,
@@ -368,15 +381,7 @@ pub(crate) async fn cleanup_uncommitted_issue_lease_set(
         return false;
     };
     fence_projection_states(&states, true);
-    let mut listener_checks = tokio::task::JoinSet::new();
-    for state in &states {
-        let state = Arc::clone(state);
-        listener_checks.spawn(async move { state.drain_is_settled_for_projection().await });
-    }
-    let mut listeners_closed = true;
-    while let Some(closed) = listener_checks.join_next().await {
-        listeners_closed &= closed.unwrap_or_default();
-    }
+    let listeners_closed = drain_projection_states(&states).await;
     if !listeners_closed {
         return false;
     }
@@ -390,6 +395,9 @@ pub(crate) async fn cleanup_uncommitted_issue_lease_set(
         if complete_cleanup_ledger(state).is_err() {
             return false;
         }
+    }
+    for state in &states {
+        state.complete_drain_retry();
     }
     for state in &states {
         kernel.storage_mounts.remove(&state.mount_id);
@@ -408,15 +416,7 @@ pub(crate) async fn revoke_projection_leases(
         return false;
     };
     fence_projection_states(&states, true);
-    let mut listener_checks = tokio::task::JoinSet::new();
-    for state in &states {
-        let state = Arc::clone(state);
-        listener_checks.spawn(async move { state.drain_is_settled_for_projection().await });
-    }
-    let mut listeners_closed = true;
-    while let Some(closed) = listener_checks.join_next().await {
-        listeners_closed &= closed.unwrap_or_default();
-    }
+    let listeners_closed = drain_projection_states(&states).await;
     if !listeners_closed {
         tracing::error!(
             "failed to drain an authorized process storage projection listener before cleanup"
@@ -436,6 +436,9 @@ pub(crate) async fn revoke_projection_leases(
         }
     }
     for state in &states {
+        state.complete_drain_retry();
+    }
+    for state in &states {
         kernel.storage_mounts.remove(&state.mount_id);
     }
     true
@@ -448,15 +451,7 @@ async fn fence_available_projection_leases(
 ) -> bool {
     let (states, _, _) = exact_projection_lease_states(kernel, binding, component_mount_ids);
     fence_projection_states(&states, true);
-    let mut listener_checks = tokio::task::JoinSet::new();
-    for state in &states {
-        let state = Arc::clone(state);
-        listener_checks.spawn(async move { state.wait_listener_closed().await });
-    }
-    let mut listeners_closed = true;
-    while let Some(closed) = listener_checks.join_next().await {
-        listeners_closed &= closed.unwrap_or_default();
-    }
+    let listeners_closed = drain_projection_states(&states).await;
     if !listeners_closed {
         tracing::error!(
             "failed to drain an authorized process storage projection listener before cleanup"

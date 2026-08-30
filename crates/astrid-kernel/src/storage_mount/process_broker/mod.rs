@@ -35,6 +35,8 @@ mod projection_identity;
 mod projection_lifecycle;
 mod projection_root_removal;
 #[cfg(all(test, any(unix, windows)))]
+mod test_faults;
+#[cfg(all(test, any(unix, windows)))]
 pub(crate) use projection_lifecycle::cached_projection_mount;
 #[cfg(any(unix, windows))]
 #[cfg(test)]
@@ -58,6 +60,16 @@ pub(crate) use projection_lifecycle::{
 #[cfg(all(test, any(unix, windows)))]
 pub(crate) use projection_root_removal::fail_next_root_removal_for_test;
 use projection_root_removal::remove_projection_root;
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) use test_faults::{
+    arm_issue_root_removal_failure_for_test, arm_partial_issue_failure,
+    arm_partial_issue_provider_error_for_test, arm_preparation_failure_for_test,
+};
+#[cfg(all(test, any(unix, windows)))]
+use test_faults::{
+    take_issue_root_removal_failure_for_test, take_partial_issue_failure,
+    take_partial_issue_provider_error, take_preparation_failure_for_test,
+};
 #[cfg(all(test, any(unix, windows)))]
 mod projection_identity_tests;
 #[cfg(all(test, any(unix, windows)))]
@@ -98,85 +110,6 @@ pub(crate) struct CachedProcessProjection {
     pub(crate) closing: AtomicBool,
     pub(crate) cleanup_failed: AtomicBool,
     pub(super) cleanup: ProjectionCleanup,
-}
-
-#[cfg(all(test, any(unix, windows)))]
-static PARTIAL_ISSUE_FAILURES: std::sync::Mutex<
-    std::collections::BTreeMap<u64, process_launch::ProcessLaunchStage>,
-> = std::sync::Mutex::new(std::collections::BTreeMap::new());
-
-#[cfg(all(test, any(unix, windows)))]
-static PARTIAL_ISSUE_PROVIDER_ERRORS: std::sync::Mutex<
-    std::collections::BTreeMap<u64, process_launch::ProcessLaunchStage>,
-> = std::sync::Mutex::new(std::collections::BTreeMap::new());
-
-#[cfg(all(test, any(unix, windows)))]
-pub(crate) fn arm_partial_issue_failure(stage: process_launch::ProcessLaunchStage, test_id: u64) {
-    PARTIAL_ISSUE_FAILURES
-        .lock()
-        .expect("partial issue failure selector")
-        .insert(test_id, stage);
-}
-
-#[cfg(all(test, any(unix, windows)))]
-pub(crate) fn arm_partial_issue_provider_error_for_test(
-    stage: process_launch::ProcessLaunchStage,
-    test_id: u64,
-) {
-    PARTIAL_ISSUE_PROVIDER_ERRORS
-        .lock()
-        .expect("partial issue provider error selector")
-        .insert(test_id, stage);
-}
-
-#[cfg(all(test, any(unix, windows)))]
-fn take_partial_issue_provider_error(stage: process_launch::ProcessLaunchStage) -> bool {
-    let current_test_id = PROCESS_MOUNT_TEST_ID
-        .try_with(|test_id| *test_id)
-        .unwrap_or(0);
-    let mut errors = PARTIAL_ISSUE_PROVIDER_ERRORS
-        .lock()
-        .expect("partial issue provider error selector");
-    if errors.get(&current_test_id) != Some(&stage) {
-        return false;
-    }
-    errors.remove(&current_test_id).is_some()
-}
-#[cfg(all(test, any(unix, windows)))]
-fn take_partial_issue_failure(stage: process_launch::ProcessLaunchStage) -> bool {
-    let current_test_id = PROCESS_MOUNT_TEST_ID
-        .try_with(|test_id| *test_id)
-        .unwrap_or(0);
-    let mut failures = PARTIAL_ISSUE_FAILURES
-        .lock()
-        .expect("partial issue failure selector");
-    if failures.get(&current_test_id) != Some(&stage) {
-        return false;
-    }
-    failures.remove(&current_test_id).is_some()
-}
-
-#[cfg(all(test, any(unix, windows)))]
-static ISSUE_ROOT_REMOVAL_FAILURES: std::sync::Mutex<std::collections::BTreeSet<u64>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
-
-#[cfg(all(test, any(unix, windows)))]
-pub(crate) fn arm_issue_root_removal_failure_for_test(test_id: u64) {
-    ISSUE_ROOT_REMOVAL_FAILURES
-        .lock()
-        .expect("issue root removal failure selector")
-        .insert(test_id);
-}
-
-#[cfg(all(test, any(unix, windows)))]
-fn take_issue_root_removal_failure_for_test() -> bool {
-    let current_test_id = PROCESS_MOUNT_TEST_ID
-        .try_with(|test_id| *test_id)
-        .unwrap_or(0);
-    ISSUE_ROOT_REMOVAL_FAILURES
-        .lock()
-        .expect("issue root removal failure selector")
-        .remove(&current_test_id)
 }
 
 struct UncommittedIssueRollback {
@@ -472,7 +405,7 @@ async fn issue_projection_leases(
     let tokens = generate_parent_tokens(&key.binding.targets)?;
     let mount_admission =
         MountAdmission::capture(kernel, &admission.principal, MountOwnerScope::CallerOnly)?;
-    let paths = prepare_projection_paths(kernel, key)?;
+    let paths = prepare_projection_paths(kernel, projections, key)?;
     let provider = platform_process_provider_name();
     let branch = issue_branch_lease(
         kernel,
@@ -527,6 +460,10 @@ async fn issue_projection_leases(
 
 fn prepare_projection_paths(
     kernel: &Arc<Kernel>,
+    projections: &mut std::collections::BTreeMap<
+        ProcessProjectionKey,
+        Arc<CachedProcessProjection>,
+    >,
     key: &ProcessProjectionKey,
 ) -> Result<ProjectionMountPaths, String> {
     // A durable branch is an authority target, not a host mount identity.
@@ -544,28 +481,114 @@ fn prepare_projection_paths(
     }
     let workspace = mount_root.join("workspace");
     let owner = mount_root.join("owner");
+    let mut paths = ProjectionMountPaths {
+        mount_root: mount_root.clone(),
+        workspace: workspace.clone(),
+        owner: owner.clone(),
+        fleet_shared: None,
+    };
     #[cfg(not(windows))]
     {
-        astrid_core::platform_fs::ensure_private_directory(&workspace)
-            .map_err(|error| format!("create workspace mountpoint: {error}"))?;
-        astrid_core::platform_fs::ensure_private_directory(&owner)
-            .map_err(|error| format!("create owner mountpoint: {error}"))?;
+        #[cfg(all(test, any(unix, windows)))]
+        if take_preparation_failure_for_test(process_launch::ProcessLaunchStage::Branch) {
+            return Err(retain_projection_path_failure(
+                kernel,
+                projections,
+                key,
+                &paths,
+                "workspace mountpoint preparation fault",
+            ));
+        }
+        astrid_core::platform_fs::ensure_private_directory(&workspace).map_err(|error| {
+            retain_projection_path_failure(
+                kernel,
+                projections,
+                key,
+                &paths,
+                format!("create workspace mountpoint: {error}"),
+            )
+        })?;
+        #[cfg(all(test, any(unix, windows)))]
+        if take_preparation_failure_for_test(process_launch::ProcessLaunchStage::OwnerHome) {
+            return Err(retain_projection_path_failure(
+                kernel,
+                projections,
+                key,
+                &paths,
+                "owner mountpoint preparation fault",
+            ));
+        }
+        astrid_core::platform_fs::ensure_private_directory(&owner).map_err(|error| {
+            retain_projection_path_failure(
+                kernel,
+                projections,
+                key,
+                &paths,
+                format!("create owner mountpoint: {error}"),
+            )
+        })?;
     }
     let fleet_shared = if matches!(key.binding.owner, StateOwner::Fleet(_)) {
         let path = mount_root.join("shared");
+        paths.fleet_shared = Some(path.clone());
+        #[cfg(all(test, any(unix, windows)))]
+        if take_preparation_failure_for_test(process_launch::ProcessLaunchStage::FleetShared) {
+            return Err(retain_projection_path_failure(
+                kernel,
+                projections,
+                key,
+                &paths,
+                "Fleet shared mountpoint preparation fault",
+            ));
+        }
         #[cfg(not(windows))]
-        astrid_core::platform_fs::ensure_private_directory(&path)
-            .map_err(|error| format!("create Fleet shared mountpoint: {error}"))?;
+        astrid_core::platform_fs::ensure_private_directory(&path).map_err(|error| {
+            retain_projection_path_failure(
+                kernel,
+                projections,
+                key,
+                &paths,
+                format!("create Fleet shared mountpoint: {error}"),
+            )
+        })?;
         Some(path)
     } else {
         None
     };
-    Ok(ProjectionMountPaths {
-        mount_root,
-        workspace,
-        owner,
-        fleet_shared,
-    })
+    paths.fleet_shared = fleet_shared;
+    Ok(paths)
+}
+
+fn retain_projection_path_failure(
+    kernel: &Arc<Kernel>,
+    projections: &mut std::collections::BTreeMap<
+        ProcessProjectionKey,
+        Arc<CachedProcessProjection>,
+    >,
+    key: &ProcessProjectionKey,
+    paths: &ProjectionMountPaths,
+    error: impl Into<String>,
+) -> String {
+    retain_failed_issue_projection(
+        projections,
+        key,
+        kernel,
+        Vec::new(),
+        RetainedIssuePaths {
+            workspace: paths.workspace.clone(),
+            home: paths.owner.clone(),
+            fleet_shared: paths.fleet_shared.clone(),
+        },
+        ProjectionLeaseTarget {
+            mount_id: StorageMountId::new(),
+            target: key.binding.targets.workspace.clone(),
+        },
+        None,
+    );
+    format!(
+        "{}; process storage path preparation failed and remains retained",
+        error.into()
+    )
 }
 
 async fn issue_branch_lease(

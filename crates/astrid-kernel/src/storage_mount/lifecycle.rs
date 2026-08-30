@@ -18,9 +18,8 @@ use serde_json::json;
 use super::StorageMountLeaseState;
 use super::cleanup::MountCleanupStage;
 use super::cleanup::{MountCleanupError, cleanup_error, cleanup_resource_paths};
+use super::drain_state::{DrainFailureKind, DrainSettlement};
 use super::filesystem::{CallbackFilesystem, PrefixedFilesystem};
-#[cfg(any(unix, windows))]
-use super::{BlockingJobDrain, ListenerDrainOutcome};
 use crate::Kernel;
 
 const PUBLICATION_CLOSED: &str = "cannot issue a storage mount lease for a retiring principal";
@@ -455,11 +454,15 @@ pub(crate) async fn force_revoke_projection_lease(
     }
     state.revoked.store(true, Ordering::Release);
     let _ = state.shutdown_tx.send(true);
-    if !state.wait_listener_closed().await {
+    if await_retained_drain(&state, true).await.is_err() {
         return false;
     }
     let _mutation_guard = kernel.storage_mount_mutations.lock().await;
-    cleanup_mapped_lease(kernel, &state).is_ok()
+    let cleaned = cleanup_mapped_lease(kernel, &state).is_ok();
+    if cleaned {
+        state.complete_drain_retry();
+    }
+    cleaned
 }
 
 /// Revoke one projection lease without releasing its provider resources.
@@ -521,22 +524,20 @@ async fn await_retained_drain(
     state: &StorageMountLeaseState,
     _caller_requested_latch: bool,
 ) -> Result<(), String> {
-    let include_latched_failure = state.begin_drain_attempt();
-    let outcome = state.wait_drain_outcome(include_latched_failure).await;
-    match outcome {
-        ListenerDrainOutcome::Failed(BlockingJobDrain::JoinFailed) => Err(cleanup_error(
-            Some(state.mount_id),
-            MountCleanupStage::Drain,
-            std::io::Error::other("retained filesystem worker join failed"),
-        )
-        .to_string()),
-        ListenerDrainOutcome::Failed(BlockingJobDrain::TimedOut)
-        | ListenerDrainOutcome::TimedOut => {
-            state.record_drain_failure(BlockingJobDrain::TimedOut);
-            Err(drain_timeout_error(state).to_string())
+    match state.await_listener_settlement().await {
+        DrainSettlement::Failure(failure) => {
+            state.arm_drain_retry();
+            Err(match failure {
+                DrainFailureKind::JoinFailed => cleanup_error(
+                    Some(state.mount_id),
+                    MountCleanupStage::Drain,
+                    std::io::Error::other("retained filesystem worker join failed"),
+                )
+                .to_string(),
+                DrainFailureKind::TimedOut => drain_timeout_error(state).to_string(),
+            })
         },
-        ListenerDrainOutcome::Failed(BlockingJobDrain::Completed)
-        | ListenerDrainOutcome::Closed => Ok(()),
+        DrainSettlement::Closed => Ok(()),
     }
 }
 

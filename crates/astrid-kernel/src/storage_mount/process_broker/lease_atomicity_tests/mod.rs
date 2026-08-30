@@ -14,8 +14,9 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use super::{
     KernelProcessStorageMountBroker, PROCESS_MOUNT_TEST_ID, ParentTokenSlot,
     ProcessProjectionBinding, ProcessProjectionKey, ProcessProjectionTargetSet,
-    ProjectionGeneration, arm_parent_token_failure, blocked_projection_lease,
-    retain_failed_launch_projection, retry_failed_projection, rollback_or_retain_failed_launch,
+    ProjectionGeneration, arm_parent_token_failure, arm_preparation_failure_for_test,
+    blocked_projection_lease, retain_failed_launch_projection, retry_failed_projection,
+    rollback_or_retain_failed_launch,
 };
 
 mod cache_invalidation_tests;

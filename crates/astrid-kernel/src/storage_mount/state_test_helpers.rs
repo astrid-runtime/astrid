@@ -40,6 +40,17 @@ impl StorageMountLeaseState {
         let _ = self.shutdown_tx.send(true);
     }
 
+    #[cfg(any(unix, windows))]
+    pub(crate) async fn wait_join_failure_publication_for_test(&self) {
+        let mut published = self.drain_failure_tx.subscribe();
+        while !*published.borrow() {
+            published
+                .changed()
+                .await
+                .expect("drain failure publication sender");
+        }
+    }
+
     pub(crate) fn in_flight_mutations_for_test(&self) -> u64 {
         self.in_flight_mutations.load(Ordering::Acquire)
     }

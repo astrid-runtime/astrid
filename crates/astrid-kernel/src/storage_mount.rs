@@ -38,10 +38,14 @@ use crate::Kernel;
 #[cfg(all(test, any(unix, windows)))]
 mod blocking_worker_gate;
 mod callback_wire;
+#[cfg(any(unix, windows))]
+mod drain_state;
 mod filesystem;
 #[cfg(test)]
 mod state_test_helpers;
 use callback_wire::{CallbackRequest, CallbackResponse, read_request, response_v2, write_response};
+#[cfg(any(unix, windows))]
+use drain_state::DrainFailureKind;
 use filesystem::{PrefixedFilesystem, execute_blocking};
 #[cfg(test)]
 mod admission;
@@ -85,7 +89,7 @@ mod process_broker;
 #[cfg(any(unix, windows))]
 mod retained_jobs;
 #[cfg(all(test, any(unix, windows)))]
-use blocking_worker_gate::BlockingWorkerTestGate;
+pub(crate) use blocking_worker_gate::BlockingWorkerTestGate;
 #[cfg(any(unix, windows))]
 pub(crate) use process_broker::KernelProcessStorageMountBroker;
 pub(crate) use process_broker::ProcessStopPolicy;
@@ -133,12 +137,11 @@ pub(crate) struct StorageMountLeaseState {
     blocking_jobs: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
     drain_timeouts: std::sync::Mutex<DrainTimeouts>,
     #[cfg(any(unix, windows))]
-    drain_failure_tx: watch::Sender<Option<BlockingJobDrain>>,
-    /// Tracks whether any cleanup attempt has sampled this lease's drain.
-    /// The first attempt must observe an already-latched panic; the exact
-    /// retry may then proceed once the listener has closed.
+    drain_failure: std::sync::Mutex<Option<DrainFailureKind>>,
     #[cfg(any(unix, windows))]
-    drain_failure_attempted: std::sync::atomic::AtomicBool,
+    drain_failure_tx: watch::Sender<bool>,
+    #[cfg(any(unix, windows))]
+    drain_attempts: tokio::sync::Mutex<drain_state::DrainAttemptState>,
     #[cfg(all(test, any(unix, windows)))]
     token_for_test: String,
     /// Set after the listener task has dropped its backend listener handle.
@@ -169,14 +172,6 @@ struct DrainTimeouts {
     listener_shutdown: std::time::Duration,
 }
 
-#[cfg(any(unix, windows))]
-#[derive(Debug)]
-enum ListenerDrainOutcome {
-    Failed(BlockingJobDrain),
-    Closed,
-    TimedOut,
-}
-
 impl StorageMountLeaseState {
     fn is_owned_by(&self, caller: astrid_core::PrincipalUid) -> bool {
         self.requested_by_uid == caller
@@ -187,65 +182,30 @@ impl StorageMountLeaseState {
             && now_epoch_secs() <= self.expires_at_epoch_secs.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     async fn wait_listener_closed(&self) -> bool {
-        let mut closed = self.listener_closed_tx.subscribe();
-        let wait = async {
-            while !*closed.borrow() {
-                if closed.changed().await.is_err() {
-                    return false;
-                }
-            }
-            true
-        };
-        tokio::time::timeout(self.drain_timeouts().listener_shutdown, wait)
-            .await
-            .unwrap_or(false)
-    }
-
-    #[cfg(any(unix, windows))]
-    async fn wait_drain_outcome(&self, include_latched_failure: bool) -> ListenerDrainOutcome {
-        let mut failure = self.drain_failure_tx.subscribe();
-        let mut closed = self.listener_closed_tx.subscribe();
-        // A first cleanup must see a fast panic even after the listener closes.
-        if let Some(job_drain) = *failure.borrow()
-            && include_latched_failure
+        #[cfg(any(unix, windows))]
         {
-            return ListenerDrainOutcome::Failed(job_drain);
+            matches!(
+                self.await_listener_settlement().await,
+                drain_state::DrainSettlement::Closed
+            )
         }
-        if *closed.borrow() {
-            return ListenerDrainOutcome::Closed;
-        }
-        let wait = async {
-            loop {
-                tokio::select! {
-                    biased;
-                    changed = failure.changed() => {
-                        if changed.is_ok() && let Some(job_drain) = *failure.borrow() {
-                            return ListenerDrainOutcome::Failed(job_drain);
-                        }
-                    },
-                    changed = closed.changed() => {
-                        if changed.is_err() || *closed.borrow() {
-                            return ListenerDrainOutcome::Closed;
-                        }
-                    },
+        #[cfg(not(any(unix, windows)))]
+        {
+            let mut closed = self.listener_closed_tx.subscribe();
+            let wait = async {
+                while !*closed.borrow() {
+                    if closed.changed().await.is_err() {
+                        return false;
+                    }
                 }
-            }
-        };
-        tokio::time::timeout(self.drain_timeouts().listener_shutdown, wait)
-            .await
-            .map_or(ListenerDrainOutcome::TimedOut, |outcome| outcome)
-    }
-
-    /// A projection member must consume a pre-latched drain failure before any
-    /// resource is removed. Timed-out retained work remains an unresolved blocker.
-    async fn drain_is_settled_for_projection(&self) -> bool {
-        let include_latched_failure = self.begin_drain_attempt();
-        matches!(
-            self.wait_drain_outcome(include_latched_failure).await,
-            ListenerDrainOutcome::Failed(BlockingJobDrain::Completed)
-                | ListenerDrainOutcome::Closed
-        )
+                true
+            };
+            tokio::time::timeout(self.drain_timeouts().listener_shutdown, wait)
+                .await
+                .unwrap_or(false)
+        }
     }
 
     fn drain_timeouts(&self) -> DrainTimeouts {
@@ -257,22 +217,18 @@ impl StorageMountLeaseState {
 
     #[cfg(any(unix, windows))]
     fn record_drain_failure(&self, outcome: BlockingJobDrain) {
-        // A first cleanup can hit its bounded wait before a retained worker
-        // joins. Keep that timeout latched, but let a later real JoinFailed
-        // upgrade it; the retry must see the true panic classification.
-        if outcome == BlockingJobDrain::TimedOut
-            && *self.drain_failure_tx.borrow() == Some(BlockingJobDrain::JoinFailed)
-        {
+        if outcome == BlockingJobDrain::Completed {
             return;
         }
-        self.drain_failure_tx.send_replace(Some(outcome));
-    }
-
-    #[cfg(any(unix, windows))]
-    fn begin_drain_attempt(&self) -> bool {
-        !self
-            .drain_failure_attempted
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        let failure = DrainFailureKind::from(outcome);
+        let mut latch = self
+            .drain_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if latch.is_none_or(|current| failure >= current) {
+            *latch = Some(failure);
+            self.drain_failure_tx.send_replace(true);
+        }
     }
 
     fn renew(&self) {
@@ -387,7 +343,8 @@ fn publish_issued_lease(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (listener_closed_tx, _) = watch::channel(false);
     #[cfg(any(unix, windows))]
-    let (drain_failure_tx, _) = watch::channel(None);
+    #[cfg(any(unix, windows))]
+    let (drain_failure_tx, _) = watch::channel(false);
     let cleanup_ledger_path = kernel
         .astrid_home
         .run_dir()
@@ -423,9 +380,11 @@ fn publish_issued_lease(
             listener_shutdown: LISTENER_SHUTDOWN_TIMEOUT,
         }),
         #[cfg(any(unix, windows))]
+        drain_failure: std::sync::Mutex::new(None),
+        #[cfg(any(unix, windows))]
         drain_failure_tx,
         #[cfg(any(unix, windows))]
-        drain_failure_attempted: std::sync::atomic::AtomicBool::new(false),
+        drain_attempts: tokio::sync::Mutex::new(drain_state::DrainAttemptState::default()),
         #[cfg(all(test, any(unix, windows)))]
         blocking_worker_test_gate: std::sync::Mutex::new(None),
         #[cfg(all(test, any(unix, windows)))]
