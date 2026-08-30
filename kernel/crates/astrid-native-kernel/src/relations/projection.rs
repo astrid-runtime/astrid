@@ -2,11 +2,13 @@
 
 use super::delta::{DeltaCursor, DeltaRing, PageCursor, RelationDelta};
 use super::types::{
-    DomainProjectionToken, MAX_OBJECT_OBSERVATIONS, MAX_RELATION_ROWS, ObjectRef, ProjectionError,
-    READER_SLOTS, ReaderIdentity, ReclaimObservation, ReclaimOutcome, Relation, RelationChange,
-    RelationKey,
+    CapabilityInstance, DomainProjectionToken, MAX_OBJECT_OBSERVATIONS, MAX_RELATION_ROWS,
+    ObjectRef, ProjectionError, READER_SLOTS, ReaderIdentity, ReclaimObservation, ReclaimOutcome,
+    Relation, RelationChange, RelationKey,
 };
 use crate::ipc::DomainToken;
+
+mod evidence;
 
 /// A generation-checked projection reader bound to one domain identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -267,6 +269,143 @@ impl ProjectionStore {
         })
     }
 
+    pub(crate) fn reader_lease(&self, domain: DomainToken) -> Option<ReaderLease> {
+        let reader = self.readers[domain.slot().index()].as_ref()?;
+        (reader.identity.domain == domain).then_some(ReaderLease {
+            token: reader.token,
+            reader: reader.identity,
+        })
+    }
+
+    fn lease_for_token(&self, token: DomainProjectionToken) -> Option<ReaderLease> {
+        self.readers.iter().flatten().find_map(|reader| {
+            (reader.token == token).then_some(ReaderLease {
+                token,
+                reader: reader.identity,
+            })
+        })
+    }
+
+    /// Retire a generation explicitly when its authoritative domain is torn
+    /// down. This is the same DELETE path that later generation reuse uses.
+    pub(crate) fn retire_reader(&mut self, domain: DomainToken) -> Result<(), ProjectionError> {
+        let slot = domain.slot().index();
+        let Some(old) = self.readers[slot].as_ref() else {
+            return Err(ProjectionError::Denied);
+        };
+        if old.identity.domain != domain {
+            return Err(ProjectionError::ResnapshotRequired);
+        }
+        let token = old.token;
+        let retirement_epoch = old
+            .epoch
+            .checked_add(1)
+            .ok_or(ProjectionError::ResnapshotRequired)?;
+        let mut old_deltas = DeltaRing::empty();
+        let mut index = 0usize;
+        while index < self.row_count {
+            let Some(row) = self.rows[index] else {
+                index += 1;
+                continue;
+            };
+            if row.key().scope() == token {
+                let key = row.key();
+                old_deltas.push(RelationDelta::new(
+                    retirement_epoch,
+                    RelationChange::Delete(key),
+                ));
+                remove_row_at(&mut self.rows, &mut self.row_count, index);
+            } else {
+                index += 1;
+            }
+        }
+        self.readers[slot] = None;
+        Ok(())
+    }
+
+    /// Remove every projection row that names a capability instance. Derives
+    /// rows are charged to the reader whose token owns that full row key.
+    pub(crate) fn remove_capability(
+        &mut self,
+        capability: CapabilityInstance,
+    ) -> Result<usize, ProjectionError> {
+        let mut removed = 0usize;
+        let mut index = 0usize;
+        while index < self.row_count {
+            let Some(relation) = self.rows[index] else {
+                index += 1;
+                continue;
+            };
+            let names_capability = match relation.key() {
+                RelationKey::Holds {
+                    capability: held, ..
+                } => held == capability,
+                RelationKey::Derives { parent, child, .. } => {
+                    parent == capability || child == capability
+                },
+                RelationKey::Object { .. } => false,
+            };
+            if !names_capability {
+                index += 1;
+                continue;
+            }
+
+            let key = relation.key();
+            let lease = self
+                .lease_for_token(key.scope())
+                .ok_or(ProjectionError::Denied)?;
+            self.apply_mutation(lease, RelationChange::Delete(key))?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    /// Record a physical object-generation reclaim for every live reader. The
+    /// projection rejects a scope if that scope still names the live object.
+    pub(crate) fn record_object_reclaim(
+        &mut self,
+        object: ObjectRef,
+    ) -> Result<usize, ProjectionError> {
+        let mut recorded = 0usize;
+        self.remove_object_rows(object)?;
+        let mut leases = [None; READER_SLOTS];
+        for (index, reader) in self.readers.iter().enumerate() {
+            leases[index] = reader.map(|reader| ReaderLease {
+                token: reader.token,
+                reader: reader.identity,
+            })
+        }
+        for lease in leases.into_iter().flatten() {
+            if self.record_reclaim(lease, object, ReclaimOutcome::ReleaseFailed)? {
+                recorded += 1;
+            }
+        }
+        Ok(recorded)
+    }
+
+    fn remove_object_rows(&mut self, object: ObjectRef) -> Result<usize, ProjectionError> {
+        let mut removed = 0usize;
+        let mut index = 0usize;
+        while index < self.row_count {
+            let Some(relation) = self.rows[index] else {
+                index += 1;
+                continue;
+            };
+            if !relation_is_dead(relation, object) {
+                index += 1;
+                continue;
+            }
+
+            let key = relation.key();
+            let lease = self
+                .lease_for_token(key.scope())
+                .ok_or(ProjectionError::Denied)?;
+            self.apply_mutation(lease, RelationChange::Delete(key))?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
     fn mint_token(&mut self) -> Result<DomainProjectionToken, ProjectionError> {
         let token = DomainProjectionToken::new(self.next_token).ok_or(ProjectionError::NoSpace)?;
         self.next_token = self
@@ -390,6 +529,16 @@ impl ProjectionStore {
             reader.deltas = DeltaRing::empty();
         }
         Ok(snapshot)
+    }
+
+    pub(crate) fn current_fold(
+        &mut self,
+        lease: ReaderLease,
+    ) -> Result<(Snapshot, Option<Snapshot>), ProjectionError> {
+        let base = self.base_snapshot(lease)?;
+        let cursor = self.delta_cursor(lease)?;
+        let replayed = self.fold(lease, base, cursor)?;
+        Ok((base, Some(replayed)))
     }
 
     pub fn fold(
@@ -535,6 +684,53 @@ impl ProjectionStore {
             }
         }
         Ok(applied)
+    }
+
+    /// Stack-frugal production path for one authoritative relation change.
+    /// This mirrors the single-entry case of `apply` without staging the
+    /// fixed-capacity batch on the small kernel stack.
+    pub(crate) fn apply_mutation(
+        &mut self,
+        reader: ReaderLease,
+        change: RelationChange,
+    ) -> Result<(), ProjectionError> {
+        let reader_index = self.reader_index(reader)?;
+        let batch_epoch = self.readers[reader_index]
+            .as_ref()
+            .and_then(|reader| reader.epoch.checked_add(1))
+            .ok_or(ProjectionError::ResnapshotRequired)?;
+        let existing = relation_index(&self.rows, change.key());
+        let mut next_row_count = self.row_count;
+
+        let effective = match change {
+            RelationChange::Upsert(relation) => {
+                let is_new = existing.is_none();
+                if is_new {
+                    next_row_count = next_row_count
+                        .checked_add(1)
+                        .ok_or(ProjectionError::NoSpace)?;
+                }
+                self.validate_upsert(relation, is_new, next_row_count)?;
+                existing.is_none_or(|at| self.rows[at] != Some(relation))
+            },
+            RelationChange::Delete(_) => existing.is_some(),
+        };
+        if !effective {
+            return Ok(());
+        }
+
+        if apply_to_rows(&mut self.rows, &mut self.row_count, change) {
+            if let Some(reader) = &mut self.readers[reader_index] {
+                reader.deltas.push(RelationDelta::new(batch_epoch, change));
+                reader.epoch = batch_epoch;
+            }
+            if let RelationChange::Delete(key) = change {
+                self.record_logical_deletion(key);
+            }
+            Ok(())
+        } else {
+            Err(ProjectionError::NoSpace)
+        }
     }
 
     fn plan_batch(&self, batch: AuthoritativeBatch) -> Result<BatchPlan, ProjectionError> {
