@@ -68,6 +68,25 @@ fn derived_transfer(parent: Capability, owner: DomainToken, slot: CapSlot) -> Ca
     }
 }
 
+fn transfer_wire(
+    sender: DomainToken,
+    tag: u32,
+    requested_rights: Rights,
+    payload_byte: u8,
+) -> [u8; MAX_BUFFER_BYTES] {
+    let mut parsed = abi::MessageBuffer::zeroed();
+    parsed.set_message(
+        tag,
+        abi::FLAG_TRANSFER,
+        4,
+        [payload_byte; abi::MAX_PAYLOAD_BYTES],
+    );
+    let mut wire = parsed.into_wire(sender);
+    wire[16..32].fill(0);
+    wire[10..12].copy_from_slice(&requested_rights.bits().to_le_bytes());
+    wire
+}
+
 #[test]
 fn rollback_rejects_replaced_parent_without_grant() {
     let _guard = test_lock();
@@ -102,11 +121,7 @@ fn rollback_rejects_replaced_parent_without_grant() {
     assert!(source_parent.rights.contains(Rights::GRANT));
 
     let recipient_base = super::relations_projection_observation(recipient).unwrap();
-    let mut send_wire = abi::MessageBuffer::zeroed();
-    send_wire.set_message(7, abi::FLAG_TRANSFER, 4, [1u8; abi::MAX_PAYLOAD_BYTES]);
-    let mut send_wire = send_wire.into_wire(source);
-    send_wire[16..32].fill(0);
-    send_wire[10..12].copy_from_slice(&Rights::SEND.bits().to_le_bytes());
+    let send_wire = transfer_wire(source, 7, Rights::SEND, 1);
     crate::platform::set_user_memory_for_test(send_wire);
     let mut frame = TrapFrame::zeroed();
     frame.rdi = u64::from(source_parent_slot.get());
@@ -125,16 +140,7 @@ fn rollback_rejects_replaced_parent_without_grant() {
             u64::from(recipient_recv.get()),
             |_| {
                 assert_eq!(revoke(source, source_parent_slot), Ok(2));
-                let mut replacement_wire = abi::MessageBuffer::zeroed();
-                replacement_wire.set_message(
-                    8,
-                    abi::FLAG_TRANSFER,
-                    4,
-                    [2u8; abi::MAX_PAYLOAD_BYTES],
-                );
-                let mut replacement_wire = replacement_wire.into_wire(recipient);
-                replacement_wire[16..32].fill(0);
-                replacement_wire[10..12].copy_from_slice(&Rights::SEND.bits().to_le_bytes());
+                let replacement_wire = transfer_wire(recipient, 8, Rights::SEND, 2);
                 crate::platform::set_user_memory_for_test(replacement_wire);
                 let mut replacement_frame = TrapFrame::zeroed();
                 replacement_frame.rdi = u64::from(recipient_root_slot.get());
