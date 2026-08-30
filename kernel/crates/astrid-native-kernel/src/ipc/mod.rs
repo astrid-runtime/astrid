@@ -7,8 +7,11 @@ mod endpoint;
 mod error;
 #[cfg(test)]
 mod revoke_tests;
+mod rollback;
 #[cfg(test)]
 pub(crate) mod test_support;
+
+use rollback::rollback_recv;
 
 use core::num::NonZeroU64;
 
@@ -28,7 +31,12 @@ pub use abi::MAX_BUFFER_BYTES;
 #[cfg(test)]
 pub(crate) use capability::CapSlot as TestCapSlot;
 pub use capability::DomainToken;
+#[cfg(not(test))]
 use capability::{CapSlot, CapTable, Capability, DerivationLink, Rights};
+#[cfg(test)]
+use capability::{CapSlot, CapTable, Rights};
+#[cfg(test)]
+pub(crate) use capability::{Capability, DerivationLink};
 pub use copy::finish_copy;
 use endpoint::{Endpoint, Message, SendOutcome, endpoint_is_unused, reclaim_object};
 use error::IpcError;
@@ -452,7 +460,7 @@ pub fn complete_parked_recv(
             }
         }
     } else {
-        rollback_recv(domain, endpoint_id, message, transfer, transferred_slot);
+        rollback_recv(domain, endpoint_id, message, transferred_slot);
     }
     committed.then_some(()).ok_or(())
 }
@@ -647,7 +655,7 @@ fn recv(frame: &mut TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcErr
     drop(state);
     let mut encoded = encoded;
     if !copy::copy_current_user(frame.rsi, &mut encoded, true) {
-        rollback_recv(domain, endpoint_id, message, transfer, transferred_slot);
+        rollback_recv(domain, endpoint_id, message, transferred_slot);
         return Err(IpcError::Faulted);
     }
     if let Some(parent) = transfer
@@ -662,29 +670,6 @@ fn recv(frame: &mut TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcErr
         }
     }
     Ok((0, abi::MAX_BUFFER_BYTES as u64))
-}
-
-fn rollback_recv(
-    domain: DomainToken,
-    endpoint_id: EndpointId,
-    message: Message,
-    transfer: Option<Capability>,
-    installed: Option<CapSlot>,
-) {
-    let mut state = IPC.lock();
-    if let Some(slot) = installed {
-        state.capabilities[domain.slot().index()].remove(domain, slot);
-    }
-    let restored = Message::new(
-        message.sender(),
-        message.tag(),
-        message.payload_len(),
-        message.payload(),
-        transfer,
-    );
-    if let Some(object) = state.objects[endpoint_id.index()].as_mut() {
-        object.restore(domain, restored, false);
-    }
 }
 
 fn cap_revoke(frame: &TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcError> {

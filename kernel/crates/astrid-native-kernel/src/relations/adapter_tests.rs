@@ -2,11 +2,12 @@
 
 use super::adapter::ProjectionEvidence;
 use crate::ipc::test_support::{
-    cap_revoke, capability, endpoint_create, install_transfer_message, reset, test_lock,
+    cap_revoke, capability, endpoint_create, install_transfer_message, queued_for, reset, test_lock,
 };
 use crate::ipc::{
-    DomainToken, MAX_BUFFER_BYTES, TestCapSlot, bind_peer, complete_parked_recv, prepare_domain,
-    relations_projection_fold, relations_projection_observation, teardown_domain,
+    Capability, DerivationLink, DomainToken, MAX_BUFFER_BYTES, TestCapSlot, bind_peer,
+    complete_parked_recv, prepare_domain, relations_projection_fold,
+    relations_projection_observation, teardown_domain,
 };
 use crate::relations::types::RelationKey;
 use crate::relations::{DeltaCursor, Snapshot};
@@ -15,6 +16,15 @@ fn domain(slot: u64) -> DomainToken {
     DomainToken::new(slot, 1).unwrap()
 }
 
+fn linked_transfer(capability: Capability, parent: DomainToken, slot: TestCapSlot) -> Capability {
+    Capability {
+        parent: Some(DerivationLink {
+            domain: parent,
+            slot,
+        }),
+        ..capability
+    }
+}
 #[test]
 fn failed_transfer_copyout_does_not_install_stale_waiter() {
     let _guard = test_lock();
@@ -136,6 +146,75 @@ fn revoked_during_parked_commit_gap_does_not_project_stale_transfer() {
     }
     assert_eq!((objects, holds, derives), (2, 0, 0));
     require_fold_from(peer, transferred_base.0, transferred_base.1);
+}
+
+#[test]
+fn revoked_parent_during_parked_failure_consumes_stale_retry() {
+    let _guard = test_lock();
+    reset();
+    let creator = domain(0);
+    let peer = domain(1);
+    prepare_domain(creator);
+    prepare_domain(peer);
+    let endpoint = endpoint_create(creator).unwrap();
+    assert!(bind_peer(creator, peer).is_ok());
+
+    let creator_root = capability(creator, creator.slot()).unwrap();
+    let parent_anchor = linked_transfer(creator_root, creator, creator.slot());
+    assert!(install_transfer_message(
+        creator,
+        creator,
+        endpoint,
+        Some(parent_anchor)
+    ));
+    let anchor_slot = TestCapSlot::try_new(1).unwrap();
+    assert!(complete_parked_recv(creator, &recv_wire(1), 0, |_| true).is_ok());
+    let parent = capability(creator, anchor_slot).unwrap();
+
+    let queued_base = observation(peer);
+    let source_slot = TestCapSlot::try_new(0).unwrap();
+    let stale_transfer = linked_transfer(parent, creator, anchor_slot);
+    assert!(install_transfer_message(
+        peer,
+        creator,
+        endpoint,
+        Some(stale_transfer)
+    ));
+    let destination_slot = TestCapSlot::try_new(2).unwrap();
+    let wire = recv_wire(2);
+    assert!(
+        complete_parked_recv(peer, &wire, 0, |_| {
+            assert_eq!(cap_revoke(creator, anchor_slot), Ok(2));
+            false
+        })
+        .is_err()
+    );
+
+    assert_eq!(queued_for(peer), 0);
+    assert!(capability(peer, destination_slot).is_none());
+    assert!(capability(creator, anchor_slot).is_none());
+    assert!(capability(peer, source_slot).is_some());
+    assert!(complete_parked_recv(peer, &wire, 0, |_| true).is_err());
+    assert_eq!(queued_for(peer), 0);
+
+    let direct = observation(peer).0;
+    assert!(direct.rows().any(|relation| matches!(
+        relation.key(),
+        RelationKey::Holds { capability, .. } if capability.slot().index() == 0
+    )));
+    assert!(direct.rows().any(|relation| matches!(
+        relation.key(),
+        RelationKey::Derives { child, .. } if child.slot().index() == 0
+    )));
+    assert!(!direct.rows().any(|relation| matches!(
+        relation.key(),
+        RelationKey::Holds { capability, .. } if capability.slot().index() == 2
+    )));
+    assert!(!direct.rows().any(|relation| matches!(
+        relation.key(),
+        RelationKey::Derives { child, .. } if child.slot().index() == 2
+    )));
+    require_fold_from(peer, queued_base.0, queued_base.1);
 }
 
 fn require_fold(evidence: ProjectionEvidence) {
