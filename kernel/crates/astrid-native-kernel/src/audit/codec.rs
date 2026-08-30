@@ -320,7 +320,10 @@ pub(crate) fn decode_checkpoint(
     if reader.remaining() != 0 {
         return Err(AuditError::MalformedFrame);
     }
-    let expected = AuditCheckpoint::seal(boot, seq, root_bytes, relay_generation, auth_key);
+    if relay_generation == 0 {
+        return Err(AuditError::MalformedFrame);
+    }
+    let expected = AuditCheckpoint::seal(boot, seq, root_bytes, relay_generation, auth_key)?;
     if expected.codec_version() != codec_version || expected.tag() != tag {
         return Err(AuditError::CheckpointMismatch);
     }

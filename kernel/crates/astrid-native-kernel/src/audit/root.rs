@@ -17,6 +17,7 @@ pub(crate) const ROOT_ALGORITHM_ID: &[u8] = b"BLAKE3-256";
 pub(crate) const ROOT_DOMAIN_TAG: &[u8] = b"astrid.native-kernel.audit-root.v1";
 pub(crate) const GENESIS_DOMAIN_TAG: &[u8] = b"astrid.native-kernel.audit-genesis.v1";
 pub(crate) const CHECKPOINT_DOMAIN_TAG: &[u8] = b"astrid.native-kernel.audit-checkpoint.v1";
+pub(crate) const ACK_DOMAIN_TAG: &[u8] = b"astrid.native-kernel.audit-ack.v1";
 
 pub(crate) fn genesis(boot: BootSessionId) -> [u8; ROOT_LEN] {
     let mut hasher = Hasher::new();
@@ -57,5 +58,23 @@ pub(crate) fn checkpoint_tag(
     hasher.update(&seq.to_le_bytes());
     hasher.update(&root);
     hasher.update(&relay_generation.to_le_bytes());
+    hasher.finalize().into()
+}
+
+/// Binds a verifier receipt to the exact canonical frame and source root it
+/// successfully folded. Relay acknowledgements consume this evidence; relay
+/// flow control still never becomes root authority.
+pub(crate) fn ack_tag(
+    seq: u64,
+    source_root: [u8; ROOT_LEN],
+    frame: &[u8],
+    auth_key: &CheckpointAuthKey,
+) -> [u8; ROOT_LEN] {
+    let mut hasher = Hasher::new_keyed(&auth_key.bytes());
+    hasher.update(ACK_DOMAIN_TAG);
+    hasher.update(&super::CODEC_VERSION.to_le_bytes());
+    hasher.update(&seq.to_le_bytes());
+    hasher.update(&source_root);
+    hasher.update(frame);
     hasher.finalize().into()
 }

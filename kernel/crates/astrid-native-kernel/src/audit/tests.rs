@@ -188,10 +188,8 @@ fn append_folds_with_mandatory_source_root() {
 
         chain.relay_mut().grant_credits(1).unwrap();
         let record = chain.relay_mut().take().unwrap();
-        assert_eq!(
-            host_verifier.fold(record.frame(), record.root()).unwrap(),
-            seq
-        );
+        let receipt = host_verifier.fold(record.frame(), record.root()).unwrap();
+        assert_eq!(receipt.seq(), seq);
         assert_eq!(host_verifier.root(), *chain.root());
     }
 }
@@ -282,7 +280,9 @@ fn foreign_boot_and_missing_previous_root_are_invalid() {
 #[test]
 fn sequence_overflow_fails_closed_without_commit() {
     let chain_boot = boot();
-    let mut chain = AuditChain::restore(chain_boot, auth_key(), u64::MAX, [9; 32]);
+    let checkpoint =
+        AuditCheckpoint::seal(chain_boot, u64::MAX - 1, [9; 32], 1, auth_key()).unwrap();
+    let mut chain = AuditChain::restore(checkpoint, auth_key()).unwrap();
     let before = (chain.seq(), *chain.root());
     assert_eq!(
         chain.append(domain_event(AuditClass::DomainCreate)),
@@ -295,6 +295,7 @@ fn sequence_overflow_fails_closed_without_commit() {
 fn ack_requires_take_in_flight_and_matching_folded_root() {
     let chain_boot = boot();
     let mut chain = AuditChain::genesis(chain_boot, auth_key());
+    let mut host_verifier = verifier();
     chain
         .append(domain_event(AuditClass::DomainCreate))
         .unwrap();
@@ -303,19 +304,87 @@ fn ack_requires_take_in_flight_and_matching_folded_root() {
     chain.relay_mut().grant_credits(1).unwrap();
     let first = chain.relay_mut().take().unwrap();
     assert_eq!(chain.relay().redeliver().count(), 2);
+    let first_receipt = host_verifier.fold(first.frame(), first.root()).unwrap();
     assert_eq!(
-        chain.relay_mut().ack(first.seq(), [0; 32]),
+        chain
+            .relay_mut()
+            .ack(first.seq(), first.root(), [0; 32], auth_key()),
         Err(AuditError::RootMismatch)
     );
-    chain.relay_mut().ack(first.seq(), first.root()).unwrap();
+    chain
+        .relay_mut()
+        .ack(
+            first.seq(),
+            first_receipt.folded_root(),
+            first_receipt.ack_tag(),
+            auth_key(),
+        )
+        .unwrap();
 
     assert_eq!(
-        chain.relay_mut().ack(first.seq(), first.root()),
+        chain.relay_mut().ack(
+            first.seq(),
+            first_receipt.folded_root(),
+            first_receipt.ack_tag(),
+            auth_key()
+        ),
         Err(AuditError::RelayStaleCursor)
     );
     chain.relay_mut().grant_credits(1).unwrap();
     let second = chain.relay_mut().take().unwrap();
-    chain.relay_mut().ack(second.seq(), second.root()).unwrap();
+    let second_receipt = host_verifier.fold(second.frame(), second.root()).unwrap();
+    chain
+        .relay_mut()
+        .ack(
+            second.seq(),
+            second_receipt.folded_root(),
+            second_receipt.ack_tag(),
+            auth_key(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn ack_before_take_does_not_retire_a_buffered_slot() {
+    let chain_boot = boot();
+    let mut chain = AuditChain::genesis(chain_boot, auth_key());
+    chain
+        .append(domain_event(AuditClass::DomainCreate))
+        .unwrap();
+    let before = chain.relay().redeliver().count();
+    assert_eq!(before, 1);
+    assert_eq!(
+        chain.relay_mut().ack(1, [0; 32], [0; 32], auth_key()),
+        Err(AuditError::RelayNotInFlight)
+    );
+    assert_eq!(chain.relay().redeliver().count(), before);
+    chain.relay_mut().grant_credits(1).unwrap();
+    assert!(chain.relay_mut().take().is_some());
+}
+
+#[test]
+fn restored_checkpoint_preserves_trusted_relay_generation() {
+    let chain_boot = boot();
+    let mut chain = AuditChain::genesis(chain_boot, auth_key());
+    for _ in 0..AUDIT_RELAY_SLOTS {
+        chain
+            .append(domain_event(AuditClass::DomainReclaim))
+            .unwrap();
+    }
+    let current_root = *chain.root();
+    let current_seq = chain.seq();
+    let checkpoint = chain
+        .relay_mut()
+        .resync(current_root, current_seq, auth_key())
+        .unwrap();
+    assert_eq!(checkpoint.relay_generation(), 2);
+
+    let restored = AuditChain::restore(checkpoint, auth_key()).unwrap();
+    assert_eq!(restored.boot(), checkpoint.boot());
+    assert_eq!(restored.seq(), checkpoint.seq());
+    assert_eq!(*restored.root(), checkpoint.root());
+    assert_eq!(restored.relay().generation(), 2);
+    assert!(restored.relay().redeliver().next().is_none());
 }
 
 #[test]
@@ -325,7 +394,7 @@ fn reserved_headroom_and_overflow_fail_before_atomic_commit() {
     for _ in 0..(AUDIT_RELAY_SLOTS - MAX_TERMINAL_RECORDS_PER_BATCH) {
         chain.append(domain_event(AuditClass::DomainEnter)).unwrap();
     }
-    assert_eq!(chain.seq(), 43);
+    assert_eq!(chain.seq(), 35);
 
     let before = (
         chain.seq(),
@@ -345,7 +414,7 @@ fn reserved_headroom_and_overflow_fail_before_atomic_commit() {
         before
     );
 
-    for expected_seq in 44u64..=(AUDIT_RELAY_SLOTS as u64) {
+    for expected_seq in 36u64..=(AUDIT_RELAY_SLOTS as u64) {
         let seq = chain
             .append(domain_event(AuditClass::DomainReclaim))
             .unwrap();
@@ -369,6 +438,76 @@ fn reserved_headroom_and_overflow_fail_before_atomic_commit() {
         full
     );
     assert_eq!(chain.relay().redeliver().count(), AUDIT_RELAY_SLOTS);
+}
+
+#[test]
+fn verifier_sequence_overflow_is_atomic_and_repeatable() {
+    let checkpoint = AuditCheckpoint::seal(boot(), u64::MAX - 1, [9; 32], 1, auth_key()).unwrap();
+    let mut wire = [0; native_audit_verifier::CHECKPOINT_WIRE_BYTES];
+    let bytes = encode_checkpoint(&checkpoint, auth_key(), &mut wire).unwrap();
+    let mut verifier =
+        native_audit_verifier::AuditVerifier::from_checkpoint(bytes, host_key()).unwrap();
+    let before = (verifier.next_seq(), verifier.root());
+    let event = domain_event(AuditClass::DomainCreate);
+    let frame = Frame::new(boot(), u64::MAX, &event, Some([9; 32])).unwrap();
+    let mut buf = [0; MAX_FRAME_BYTES];
+    let encoded = frame.encode(&mut buf).unwrap();
+    let claimed = root::advance([9; 32], boot(), u64::MAX, encoded);
+    assert_eq!(
+        verifier.fold(encoded, claimed),
+        Err(native_audit_verifier::FoldFailure::SequenceOverflow)
+    );
+    assert_eq!(
+        verifier.fold(encoded, claimed),
+        Err(native_audit_verifier::FoldFailure::SequenceOverflow)
+    );
+    assert_eq!((verifier.next_seq(), verifier.root()), before);
+}
+
+#[test]
+fn explicitly_mismatched_previous_root_is_invalid() {
+    let chain_boot = boot();
+    let wrong_previous = [0xAA; 32];
+    let event = domain_event(AuditClass::DomainCreate);
+    let frame = Frame::new(chain_boot, 1, &event, Some(wrong_previous)).unwrap();
+    let mut buf = [0; MAX_FRAME_BYTES];
+    let encoded = frame.encode(&mut buf).unwrap();
+    let claimed = root::advance(wrong_previous, chain_boot, 1, encoded);
+    let mut host_verifier = verifier();
+    assert!(matches!(
+        host_verifier.fold(encoded, claimed),
+        Err(native_audit_verifier::FoldFailure::Invalid(
+            native_audit_verifier::InvalidReason::PreviousRootMismatch
+        ))
+    ));
+}
+
+#[test]
+fn kernel_and_verifier_reject_zero_relay_generation() {
+    let chain_boot = boot();
+    let chain = AuditChain::genesis(chain_boot, auth_key());
+    let seq = chain.seq();
+    let root = *chain.root();
+    let mut wire = [0; native_audit_verifier::CHECKPOINT_WIRE_BYTES];
+    encode_checkpoint(&chain.checkpoint(), auth_key(), &mut wire).unwrap();
+    let generation_offset = 4 + 2 + 16 + 8 + 32;
+    wire[generation_offset..generation_offset + 8].copy_from_slice(&0u64.to_le_bytes());
+    let zero_tag = root::checkpoint_tag(chain_boot, seq, root, 0, auth_key());
+    let tag_offset = native_audit_verifier::CHECKPOINT_WIRE_BYTES - 32;
+    wire[tag_offset..].copy_from_slice(&zero_tag);
+
+    assert_eq!(
+        decode_checkpoint(&wire, auth_key()),
+        Err(AuditError::MalformedFrame)
+    );
+    assert_eq!(
+        native_audit_verifier::verify_checkpoint(&wire, host_key()),
+        Err(native_audit_verifier::VerifyFailure::Malformed)
+    );
+    assert_eq!(
+        AuditCheckpoint::seal(chain_boot, seq, root, 0, auth_key()),
+        Err(AuditError::MalformedFrame)
+    );
 }
 
 #[test]
@@ -398,10 +537,8 @@ fn resync_is_generation_bound_and_restores_flow() {
     chain.relay_mut().grant_credits(1).unwrap();
     let record = chain.relay_mut().take().unwrap();
     assert_eq!(record.seq(), seq);
-    assert_eq!(
-        host_verifier.fold(record.frame(), record.root()).unwrap(),
-        seq
-    );
+    let receipt = host_verifier.fold(record.frame(), record.root()).unwrap();
+    assert_eq!(receipt.seq(), seq);
 }
 
 #[test]
@@ -444,6 +581,6 @@ fn checkpoint_is_kernel_authenticated_and_state_bound() {
 
 #[test]
 fn batch_reserve_is_static_and_inside_the_window() {
-    assert_eq!(MAX_TERMINAL_RECORDS_PER_BATCH, 21);
+    assert_eq!(MAX_TERMINAL_RECORDS_PER_BATCH, 29);
     assert!(AUDIT_RELAY_SLOTS >= MAX_TERMINAL_RECORDS_PER_BATCH);
 }

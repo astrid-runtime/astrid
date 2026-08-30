@@ -21,6 +21,7 @@ const ROOT_ALGORITHM_ID: &[u8] = b"BLAKE3-256";
 const ROOT_DOMAIN_TAG: &[u8] = b"astrid.native-kernel.audit-root.v1";
 const GENESIS_DOMAIN_TAG: &[u8] = b"astrid.native-kernel.audit-genesis.v1";
 const CHECKPOINT_DOMAIN_TAG: &[u8] = b"astrid.native-kernel.audit-checkpoint.v1";
+const ACK_DOMAIN_TAG: &[u8] = b"astrid.native-kernel.audit-ack.v1";
 
 /// Hard decode failure of one input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +54,30 @@ pub enum InvalidReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IncompleteReason {
     SequenceGap,
+}
+
+/// Opaque evidence that this verifier completed one fold. Relay code may
+/// acknowledge only with this receipt plus the same source root; it can never
+/// synthesize a retirement from an unfolded frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FoldReceipt {
+    seq: u64,
+    folded_root: [u8; 32],
+    ack_tag: [u8; 32],
+}
+
+impl FoldReceipt {
+    pub const fn seq(self) -> u64 {
+        self.seq
+    }
+
+    pub const fn folded_root(self) -> [u8; 32] {
+        self.folded_root
+    }
+
+    pub const fn ack_tag(self) -> [u8; 32] {
+        self.ack_tag
+    }
 }
 
 /// A kernel-authenticated checkpoint view, already tag-verified.
@@ -129,6 +154,16 @@ fn checkpoint_tag(
     hasher.update(&seq.to_le_bytes());
     hasher.update(&root);
     hasher.update(&relay_generation.to_le_bytes());
+    hasher.finalize().into()
+}
+
+fn ack_tag(seq: u64, source_root: [u8; 32], frame: &[u8], auth_key: CheckpointKey) -> [u8; 32] {
+    let mut hasher = Hasher::new_keyed(&auth_key.bytes());
+    hasher.update(ACK_DOMAIN_TAG);
+    hasher.update(&CODEC_VERSION.to_le_bytes());
+    hasher.update(&seq.to_le_bytes());
+    hasher.update(&source_root);
+    hasher.update(frame);
     hasher.finalize().into()
 }
 
@@ -233,7 +268,11 @@ impl AuditVerifier {
     /// Folds one canonical frame whose source root claim has already been
     /// checked by the caller's handoff record. Contiguity is enforced; a gap
     /// is Incomplete and a duplicate or reorder is Invalid. Never skips.
-    pub fn fold(&mut self, frame: &[u8], claimed_root: [u8; 32]) -> Result<u64, FoldFailure> {
+    pub fn fold(
+        &mut self,
+        frame: &[u8],
+        claimed_root: [u8; 32],
+    ) -> Result<FoldReceipt, FoldFailure> {
         let view = wire::decode_frame(frame).map_err(|error| match error {
             wire::WireError::Malformed => FoldFailure::Invalid(InvalidReason::Malformed),
             wire::WireError::DenialDisclosure => {
@@ -252,16 +291,22 @@ impl AuditVerifier {
         if view.prev_root != Some(self.root) {
             return Err(FoldFailure::Invalid(InvalidReason::PreviousRootMismatch));
         }
+        let next_seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or(FoldFailure::SequenceOverflow)?;
         let next_root = advance(self.root, self.boot, view.seq, frame);
         if claimed_root != next_root {
             return Err(FoldFailure::Invalid(InvalidReason::RootMismatch));
         }
+        let receipt = FoldReceipt {
+            seq: view.seq,
+            folded_root: claimed_root,
+            ack_tag: ack_tag(view.seq, claimed_root, frame, self.auth_key),
+        };
         self.root = next_root;
-        self.next_seq = self
-            .next_seq
-            .checked_add(1)
-            .ok_or(FoldFailure::SequenceOverflow)?;
-        Ok(view.seq)
+        self.next_seq = next_seq;
+        Ok(receipt)
     }
 
     /// Confirms a later kernel checkpoint against the folded state: the

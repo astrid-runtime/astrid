@@ -13,6 +13,7 @@ pub(crate) const AUDIT_DOMAIN_SLOTS: usize = 2;
 pub(crate) const AUDIT_CAP_SLOTS_PER_DOMAIN: usize = 8;
 pub(crate) const AUDIT_ENDPOINT_POOL: usize = 4;
 pub(crate) const AUDIT_CAP_OBJECT_POOL: usize = 16;
+pub(crate) const AUDIT_QUEUES_PER_ENDPOINT: usize = 2;
 /// Landed message payload ceiling. Audit payloads never exceed it.
 pub(crate) const AUDIT_MAX_PAYLOAD: usize = 64;
 
@@ -23,11 +24,14 @@ const _: () = assert!(
 
 /// Maximum mandatory terminal/invalidation records one admitted atomic
 /// mutation batch can produce at the frozen ceilings: mass invalidation of
-/// every capability-instance slot of both domain slots, every endpoint, and
-/// the dying domain identity itself. This is the statically derived relay
-/// reserve, never a single global death slot.
-pub(crate) const MAX_TERMINAL_RECORDS_PER_BATCH: usize =
-    AUDIT_DOMAIN_SLOTS * AUDIT_CAP_SLOTS_PER_DOMAIN + AUDIT_ENDPOINT_POOL + 1;
+/// every capability-instance slot of both domain slots, every endpoint, both
+/// queues on every endpoint, and the dying domain identity itself. This is
+/// the statically derived relay reserve, never a single global death slot.
+pub(crate) const MAX_TERMINAL_RECORDS_PER_BATCH: usize = AUDIT_DOMAIN_SLOTS
+    * AUDIT_CAP_SLOTS_PER_DOMAIN
+    + AUDIT_ENDPOINT_POOL
+    + AUDIT_ENDPOINT_POOL * AUDIT_QUEUES_PER_ENDPOINT
+    + 1;
 
 /// Boot-scoped audit session identity. A kernel restart mints a new identity;
 /// this slice claims no cross-boot durable continuity.
@@ -540,17 +544,20 @@ impl AuditCheckpoint {
         root: [u8; root::ROOT_LEN],
         relay_generation: u64,
         auth_key: CheckpointAuthKey,
-    ) -> Self {
+    ) -> Result<Self, AuditError> {
+        if relay_generation == 0 {
+            return Err(AuditError::MalformedFrame);
+        }
         let codec_version = super::CODEC_VERSION;
         let tag = root::checkpoint_tag(boot, seq, root, relay_generation, auth_key);
-        Self {
+        Ok(Self {
             boot,
             seq,
             root,
             codec_version,
             relay_generation,
             tag,
-        }
+        })
     }
 
     pub(crate) fn verify_tag(&self, auth_key: CheckpointAuthKey) -> bool {

@@ -91,6 +91,28 @@ impl AuditRelay {
         }
     }
 
+    /// Restores flow-control state from a trusted checkpoint without losing
+    /// its relay generation. Outstanding evidence is explicitly not carried
+    /// across the restart; a verifier restarts from this checkpoint.
+    pub(super) fn restore(
+        boot: BootSessionId,
+        generation: u64,
+        next_seq: u64,
+    ) -> Result<Self, AuditError> {
+        if generation == 0 {
+            return Err(AuditError::MalformedFrame);
+        }
+        Ok(Self {
+            boot,
+            generation,
+            next_seq,
+            oldest_seq: next_seq,
+            outstanding: 0,
+            credits: 0,
+            slots: [None; AUDIT_RELAY_SLOTS],
+        })
+    }
+
     /// Publishes one already-rooted record. Window overflow keeps the
     /// authoritative event rooted but downstream-invisible until a resync.
     pub(super) fn publish(
@@ -151,10 +173,16 @@ impl AuditRelay {
         })
     }
 
-    /// Retires exactly the oldest outstanding record. Contiguity enforced.
-    /// Retires exactly the oldest in-flight record after the caller proves
-    /// that folding its canonical frame produced this record's source root.
-    pub fn ack(&mut self, seq: u64, folded_root: [u8; root::ROOT_LEN]) -> Result<(), AuditError> {
+    /// Retires exactly the oldest in-flight record. Besides contiguity and
+    /// source-root equality, the caller must present the keyed receipt emitted
+    /// only by a successful independent fold of this exact canonical frame.
+    pub fn ack(
+        &mut self,
+        seq: u64,
+        folded_root: [u8; root::ROOT_LEN],
+        receipt_tag: [u8; root::ROOT_LEN],
+        auth_key: CheckpointAuthKey,
+    ) -> Result<(), AuditError> {
         if self.outstanding == 0 || seq != self.oldest_seq {
             return Err(AuditError::RelayStaleCursor);
         }
@@ -167,6 +195,15 @@ impl AuditRelay {
             return Err(AuditError::RelayNotInFlight);
         }
         if slot.record.root() != folded_root {
+            return Err(AuditError::RootMismatch);
+        }
+        if root::ack_tag(
+            slot.record.seq(),
+            slot.record.root(),
+            slot.record.frame(),
+            &auth_key,
+        ) != receipt_tag
+        {
             return Err(AuditError::RootMismatch);
         }
         self.slots[index] = None;
@@ -214,9 +251,10 @@ impl AuditRelay {
             self.generation,
             auth_key,
         )
+        .expect("current relay generation is nonzero")
     }
 
-    pub(super) const fn generation(self) -> u64 {
+    pub(super) const fn generation(&self) -> u64 {
         self.generation
     }
 

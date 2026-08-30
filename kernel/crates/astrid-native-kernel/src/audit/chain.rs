@@ -27,21 +27,32 @@ impl AuditChain {
         }
     }
 
-    /// Restores a chain from previously sealed trusted state. Crate-private
-    /// until a later slice wires checkpoint restore into a consumer.
+    /// Restores from a previously sealed trusted checkpoint. The checkpoint
+    /// itself binds boot/session, exact sequence, root, codec/version, and
+    /// relay generation; the relay generation is preserved rather than reset.
     pub(crate) fn restore(
-        boot: BootSessionId,
+        checkpoint: AuditCheckpoint,
         auth_key: CheckpointAuthKey,
-        seq: u64,
-        root: [u8; root::ROOT_LEN],
-    ) -> Self {
-        Self {
-            boot,
-            auth_key,
-            seq,
-            root,
-            relay: AuditRelay::new(boot),
+    ) -> Result<Self, AuditError> {
+        if checkpoint.codec_version() != super::CODEC_VERSION
+            || !checkpoint.verify_tag(auth_key)
+            || checkpoint.relay_generation() == 0
+        {
+            return Err(AuditError::CheckpointMismatch);
         }
+        let next_seq = checkpoint
+            .seq()
+            .checked_add(1)
+            .ok_or(AuditError::SequenceOverflow)?;
+        let relay =
+            AuditRelay::restore(checkpoint.boot(), checkpoint.relay_generation(), next_seq)?;
+        Ok(Self {
+            boot: checkpoint.boot(),
+            auth_key,
+            seq: checkpoint.seq(),
+            root: checkpoint.root(),
+            relay,
+        })
     }
 
     pub const fn boot(&self) -> BootSessionId {

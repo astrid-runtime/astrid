@@ -89,7 +89,7 @@ fn genesis_fold_requires_boot_previous_root_and_source_root() {
 
     let frame1 = body(BOOT, 1, 1, Object::None, 0, &[], Some(genesis));
     let root1 = expected_root(genesis, 1, &frame1);
-    assert_eq!(verifier.fold(&frame1, root1).unwrap(), 1);
+    assert_eq!(verifier.fold(&frame1, root1).unwrap().seq(), 1);
 
     let frame2 = body(
         BOOT,
@@ -101,7 +101,7 @@ fn genesis_fold_requires_boot_previous_root_and_source_root() {
         Some(root1),
     );
     let root2 = expected_root(root1, 2, &frame2);
-    assert_eq!(verifier.fold(&frame2, root2).unwrap(), 2);
+    assert_eq!(verifier.fold(&frame2, root2).unwrap().seq(), 2);
     assert_eq!(verifier.root(), root2);
 }
 
@@ -131,6 +131,52 @@ fn cross_boot_and_missing_previous_root_are_invalid() {
         verifier.fold(&missing_previous, missing_root),
         Err(FoldFailure::Invalid(InvalidReason::PreviousRootMismatch))
     );
+}
+
+#[test]
+fn explicitly_mismatched_previous_root_is_invalid() {
+    let mut verifier = AuditVerifier::genesis(BOOT, key()).unwrap();
+    let wrong_previous = [0xAA; 32];
+    let frame = body(BOOT, 1, 1, Object::None, 0, &[], Some(wrong_previous));
+    let claimed = expected_root(wrong_previous, 1, &frame);
+    assert_eq!(
+        verifier.fold(&frame, claimed),
+        Err(FoldFailure::Invalid(InvalidReason::PreviousRootMismatch))
+    );
+    assert_eq!(verifier.next_seq(), 1);
+}
+
+#[test]
+fn fold_overflow_is_fail_closed_without_state_change() {
+    let checkpoint_root = AuditVerifier::genesis(BOOT, key()).unwrap().root();
+    let checkpoint = checkpoint_wire(
+        BOOT,
+        u64::MAX - 1,
+        checkpoint_root,
+        1,
+        sealed_tag(BOOT, u64::MAX - 1, checkpoint_root, 1),
+    );
+    let mut verifier = AuditVerifier::from_checkpoint(&checkpoint, key()).unwrap();
+    let frame = body(
+        BOOT,
+        u64::MAX,
+        1,
+        Object::None,
+        0,
+        &[],
+        Some(checkpoint_root),
+    );
+    let claimed = expected_root(checkpoint_root, u64::MAX, &frame);
+    let before = (verifier.next_seq(), verifier.root());
+    assert_eq!(
+        verifier.fold(&frame, claimed),
+        Err(FoldFailure::SequenceOverflow)
+    );
+    assert_eq!(
+        verifier.fold(&frame, claimed),
+        Err(FoldFailure::SequenceOverflow)
+    );
+    assert_eq!((verifier.next_seq(), verifier.root()), before);
 }
 
 #[test]
@@ -423,6 +469,20 @@ fn stale_and_future_relay_generations_fail_closed() {
         verifier.accept_resync_checkpoint(&future),
         Err(VerifyFailure::CheckpointMismatch)
     );
+}
+
+#[test]
+fn zero_relay_generation_is_invalid_on_the_verifier() {
+    let genesis = AuditVerifier::genesis(BOOT, key()).unwrap().root();
+    let checkpoint = checkpoint_wire(BOOT, 0, genesis, 0, sealed_tag(BOOT, 0, genesis, 0));
+    assert_eq!(
+        verify_checkpoint(&checkpoint, key()),
+        Err(VerifyFailure::Malformed)
+    );
+    assert!(matches!(
+        AuditVerifier::from_checkpoint(&checkpoint, key()),
+        Err(VerifyFailure::Malformed)
+    ));
 }
 
 #[test]
