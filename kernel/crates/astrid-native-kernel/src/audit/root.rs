@@ -9,7 +9,7 @@
 
 use blake3::Hasher;
 
-use super::types::BootSessionId;
+use super::types::{BootSessionId, CheckpointAuthKey};
 
 pub(crate) const ROOT_LEN: usize = 32;
 
@@ -48,8 +48,9 @@ pub(crate) fn checkpoint_tag(
     seq: u64,
     root: [u8; ROOT_LEN],
     relay_generation: u64,
+    auth_key: CheckpointAuthKey,
 ) -> [u8; ROOT_LEN] {
-    let mut hasher = Hasher::new();
+    let mut hasher = Hasher::new_keyed(&auth_key.bytes());
     hasher.update(CHECKPOINT_DOMAIN_TAG);
     hasher.update(&super::CODEC_VERSION.to_le_bytes());
     hasher.update(&boot.bytes());

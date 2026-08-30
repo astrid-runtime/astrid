@@ -27,6 +27,8 @@ const CHECKPOINT_DOMAIN_TAG: &[u8] = b"astrid.native-kernel.audit-checkpoint.v1"
 pub enum VerifyFailure {
     Malformed,
     CheckpointMismatch,
+    SequenceOverflow,
+    StaleRelayGeneration,
 }
 
 /// One fold step failure. Invalid means the input contradicts the chain;
@@ -35,12 +37,15 @@ pub enum VerifyFailure {
 pub enum FoldFailure {
     Invalid(InvalidReason),
     Incomplete(IncompleteReason),
+    SequenceOverflow,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InvalidReason {
     Malformed,
     DuplicateOrReorder,
+    ForeignBoot,
+    PreviousRootMismatch,
     RootMismatch,
     DenialDisclosure,
 }
@@ -59,6 +64,35 @@ pub struct CheckpointView {
     pub codec_version: u16,
     pub relay_generation: u64,
     pub tag: [u8; 32],
+}
+
+/// Kernel-only checkpoint authentication key. A checkpoint is trusted only
+/// when this key authenticates its complete state binding.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointKey([u8; 32]);
+
+impl CheckpointKey {
+    pub const fn new(bytes: [u8; 32]) -> Option<Self> {
+        let mut index = 0;
+        let mut any_nonzero = false;
+        while index < bytes.len() {
+            if bytes[index] != 0 {
+                any_nonzero = true;
+            }
+            index += 1;
+        }
+        if any_nonzero { Some(Self(bytes)) } else { None }
+    }
+
+    pub const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl core::fmt::Debug for CheckpointKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("CheckpointKey(REDACTED)")
+    }
 }
 
 fn genesis_root(boot: [u8; 16]) -> [u8; 32] {
@@ -81,8 +115,14 @@ fn advance(previous_root: [u8; 32], boot: [u8; 16], seq: u64, frame: &[u8]) -> [
     hasher.finalize().into()
 }
 
-fn checkpoint_tag(boot: [u8; 16], seq: u64, root: [u8; 32], relay_generation: u64) -> [u8; 32] {
-    let mut hasher = Hasher::new();
+fn checkpoint_tag(
+    boot: [u8; 16],
+    seq: u64,
+    root: [u8; 32],
+    relay_generation: u64,
+    auth_key: CheckpointKey,
+) -> [u8; 32] {
+    let mut hasher = Hasher::new_keyed(&auth_key.bytes());
     hasher.update(CHECKPOINT_DOMAIN_TAG);
     hasher.update(&CODEC_VERSION.to_le_bytes());
     hasher.update(&boot);
@@ -94,7 +134,10 @@ fn checkpoint_tag(boot: [u8; 16], seq: u64, root: [u8; 32], relay_generation: u6
 
 /// Tag-verifies a canonical checkpoint wire form. A verifier-local cache
 /// alone is never trusted; only this kernel-sealed binding is.
-pub fn verify_checkpoint(wire: &[u8]) -> Result<CheckpointView, VerifyFailure> {
+pub fn verify_checkpoint(
+    wire: &[u8],
+    auth_key: CheckpointKey,
+) -> Result<CheckpointView, VerifyFailure> {
     if wire.len() != CHECKPOINT_WIRE_BYTES {
         return Err(VerifyFailure::Malformed);
     }
@@ -139,7 +182,10 @@ pub fn verify_checkpoint(wire: &[u8]) -> Result<CheckpointView, VerifyFailure> {
         relay_generation,
         tag,
     };
-    if checkpoint_tag(boot, seq, root, relay_generation) != tag {
+    if relay_generation == 0 {
+        return Err(VerifyFailure::Malformed);
+    }
+    if checkpoint_tag(boot, seq, root, relay_generation, auth_key) != tag {
         return Err(VerifyFailure::CheckpointMismatch);
     }
     Ok(view)
@@ -151,10 +197,12 @@ pub struct AuditVerifier {
     boot: [u8; 16],
     next_seq: u64,
     root: [u8; 32],
+    auth_key: CheckpointKey,
+    relay_generation: u64,
 }
 
 impl AuditVerifier {
-    pub fn genesis(boot: [u8; 16]) -> Result<Self, VerifyFailure> {
+    pub fn genesis(boot: [u8; 16], auth_key: CheckpointKey) -> Result<Self, VerifyFailure> {
         if boot.iter().all(|byte| *byte == 0) {
             return Err(VerifyFailure::Malformed);
         }
@@ -162,33 +210,30 @@ impl AuditVerifier {
             boot,
             next_seq: 1,
             root: genesis_root(boot),
+            auth_key,
+            relay_generation: 1,
         })
     }
 
-    pub fn from_checkpoint(wire: &[u8]) -> Result<Self, VerifyFailure> {
-        let checkpoint = verify_checkpoint(wire)?;
+    pub fn from_checkpoint(wire: &[u8], auth_key: CheckpointKey) -> Result<Self, VerifyFailure> {
+        let checkpoint = verify_checkpoint(wire, auth_key)?;
+        let next_seq = checkpoint
+            .seq
+            .checked_add(1)
+            .ok_or(VerifyFailure::SequenceOverflow)?;
         Ok(Self {
             boot: checkpoint.boot,
-            next_seq: checkpoint.seq + 1,
             root: checkpoint.root,
+            next_seq,
+            auth_key,
+            relay_generation: checkpoint.relay_generation,
         })
     }
 
     /// Folds one canonical frame whose source root claim has already been
     /// checked by the caller's handoff record. Contiguity is enforced; a gap
     /// is Incomplete and a duplicate or reorder is Invalid. Never skips.
-    pub fn fold(&mut self, frame: &[u8]) -> Result<u64, FoldFailure> {
-        self.fold_with_root(frame, None)
-    }
-
-    /// Same as [`AuditVerifier::fold`] while also matching the per-record
-    /// root carried by the handoff (ack `N` only when the source root
-    /// matches).
-    pub fn fold_with_root(
-        &mut self,
-        frame: &[u8],
-        claimed_root: Option<[u8; 32]>,
-    ) -> Result<u64, FoldFailure> {
+    pub fn fold(&mut self, frame: &[u8], claimed_root: [u8; 32]) -> Result<u64, FoldFailure> {
         let view = wire::decode_frame(frame).map_err(|error| match error {
             wire::WireError::Malformed => FoldFailure::Invalid(InvalidReason::Malformed),
             wire::WireError::DenialDisclosure => {
@@ -201,14 +246,21 @@ impl AuditVerifier {
         if view.seq > self.next_seq {
             return Err(FoldFailure::Incomplete(IncompleteReason::SequenceGap));
         }
+        if view.boot != self.boot {
+            return Err(FoldFailure::Invalid(InvalidReason::ForeignBoot));
+        }
+        if view.prev_root != Some(self.root) {
+            return Err(FoldFailure::Invalid(InvalidReason::PreviousRootMismatch));
+        }
         let next_root = advance(self.root, self.boot, view.seq, frame);
-        if let Some(claimed) = claimed_root
-            && claimed != next_root
-        {
+        if claimed_root != next_root {
             return Err(FoldFailure::Invalid(InvalidReason::RootMismatch));
         }
         self.root = next_root;
-        self.next_seq += 1;
+        self.next_seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or(FoldFailure::SequenceOverflow)?;
         Ok(view.seq)
     }
 
@@ -216,13 +268,41 @@ impl AuditVerifier {
     /// source root must match exactly before any acknowledgement range is
     /// trusted across a restart.
     pub fn accept_checkpoint(&self, wire: &[u8]) -> Result<(), VerifyFailure> {
-        let checkpoint = verify_checkpoint(wire)?;
-        if checkpoint.boot != self.boot
-            || checkpoint.seq + 1 != self.next_seq
-            || checkpoint.root != self.root
+        let checkpoint = verify_checkpoint(wire, self.auth_key)?;
+        let next_seq = checkpoint
+            .seq
+            .checked_add(1)
+            .ok_or(VerifyFailure::SequenceOverflow)?;
+        if checkpoint.boot != self.boot || next_seq != self.next_seq || checkpoint.root != self.root
         {
             return Err(VerifyFailure::CheckpointMismatch);
         }
+        if checkpoint.relay_generation != self.relay_generation {
+            return Err(VerifyFailure::StaleRelayGeneration);
+        }
+        Ok(())
+    }
+
+    /// Accepts exactly one generation-bumped checkpoint after the same state
+    /// has been folded. This is the verifier side of explicit resync.
+    pub fn accept_resync_checkpoint(&mut self, wire: &[u8]) -> Result<(), VerifyFailure> {
+        let checkpoint = verify_checkpoint(wire, self.auth_key)?;
+        let next_seq = checkpoint
+            .seq
+            .checked_add(1)
+            .ok_or(VerifyFailure::SequenceOverflow)?;
+        let next_generation = self
+            .relay_generation
+            .checked_add(1)
+            .ok_or(VerifyFailure::Malformed)?;
+        if checkpoint.boot != self.boot
+            || next_seq != self.next_seq
+            || checkpoint.root != self.root
+            || checkpoint.relay_generation != next_generation
+        {
+            return Err(VerifyFailure::CheckpointMismatch);
+        }
+        self.relay_generation = next_generation;
         Ok(())
     }
 

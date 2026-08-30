@@ -5,6 +5,10 @@ use blake3::Hasher;
 
 const BOOT: [u8; 16] = [7; 16];
 
+fn key() -> CheckpointKey {
+    CheckpointKey::new([0x5a; 32]).unwrap()
+}
+
 #[derive(Clone, Copy)]
 enum Object {
     None,
@@ -61,22 +65,16 @@ fn body(
         },
     }
     let mut framed = Vec::new();
-    framed.extend_from_slice(&((out.len()) as u32).to_le_bytes());
+    framed.extend_from_slice(&(out.len() as u32).to_le_bytes());
     framed.extend_from_slice(&out);
     framed
 }
 
-fn root_tag_bytes() -> Vec<u8> {
-    let mut prefix = Vec::new();
-    prefix.extend_from_slice(b"astrid.native-kernel.audit-root.v1");
-    prefix.extend_from_slice(b"BLAKE3-256");
-    prefix.extend_from_slice(&CODEC_VERSION.to_le_bytes());
-    prefix
-}
-
 fn expected_root(previous: [u8; 32], seq: u64, frame: &[u8]) -> [u8; 32] {
     let mut hasher = Hasher::new();
-    hasher.update(&root_tag_bytes());
+    hasher.update(ROOT_DOMAIN_TAG);
+    hasher.update(ROOT_ALGORITHM_ID);
+    hasher.update(&CODEC_VERSION.to_le_bytes());
     hasher.update(&BOOT);
     hasher.update(&seq.to_le_bytes());
     hasher.update(&previous);
@@ -85,13 +83,13 @@ fn expected_root(previous: [u8; 32], seq: u64, frame: &[u8]) -> [u8; 32] {
 }
 
 #[test]
-fn genesis_then_fold_matches_source_roots() {
-    let mut verifier = AuditVerifier::genesis(BOOT).unwrap();
+fn genesis_fold_requires_boot_previous_root_and_source_root() {
+    let mut verifier = AuditVerifier::genesis(BOOT, key()).unwrap();
     let genesis = verifier.root();
 
-    let frame1 = body(BOOT, 1, 1, Object::None, 0, &[], None);
+    let frame1 = body(BOOT, 1, 1, Object::None, 0, &[], Some(genesis));
     let root1 = expected_root(genesis, 1, &frame1);
-    assert_eq!(verifier.fold_with_root(&frame1, Some(root1)).unwrap(), 1);
+    assert_eq!(verifier.fold(&frame1, root1).unwrap(), 1);
 
     let frame2 = body(
         BOOT,
@@ -103,87 +101,213 @@ fn genesis_then_fold_matches_source_roots() {
         Some(root1),
     );
     let root2 = expected_root(root1, 2, &frame2);
-    assert_eq!(verifier.fold_with_root(&frame2, Some(root2)).unwrap(), 2);
+    assert_eq!(verifier.fold(&frame2, root2).unwrap(), 2);
     assert_eq!(verifier.root(), root2);
 }
 
 #[test]
-fn claimed_root_mismatch_is_invalid() {
-    let mut verifier = AuditVerifier::genesis(BOOT).unwrap();
-    let frame = body(BOOT, 1, 1, Object::None, 0, &[], None);
-    let mut wrong = verifier.root();
-    wrong[0] ^= 1;
+fn tamper_without_a_valid_claimed_root_is_invalid() {
+    let mut verifier = AuditVerifier::genesis(BOOT, key()).unwrap();
+    let frame = body(BOOT, 1, 1, Object::None, 0, &[], Some(verifier.root()));
     assert_eq!(
-        verifier.fold_with_root(&frame, Some(wrong)),
+        verifier.fold(&frame, [0; 32]),
         Err(FoldFailure::Invalid(InvalidReason::RootMismatch))
     );
 }
 
 #[test]
-fn gap_is_incomplete_and_duplicate_is_invalid() {
-    let mut verifier = AuditVerifier::genesis(BOOT).unwrap();
-    let frame1 = body(BOOT, 1, 1, Object::None, 0, &[], None);
-    let frame3 = body(BOOT, 3, 3, Object::None, 0, &[], None);
-    verifier.fold(&frame1).unwrap();
+fn cross_boot_and_missing_previous_root_are_invalid() {
+    let mut verifier = AuditVerifier::genesis(BOOT, key()).unwrap();
+    let foreign = body([8; 16], 1, 1, Object::None, 0, &[], Some(verifier.root()));
+    let foreign_root = expected_root(verifier.root(), 1, &foreign);
     assert_eq!(
-        verifier.fold(&frame3),
+        verifier.fold(&foreign, foreign_root),
+        Err(FoldFailure::Invalid(InvalidReason::ForeignBoot))
+    );
+
+    let missing_previous = body(BOOT, 1, 1, Object::None, 0, &[], None);
+    let missing_root = expected_root(verifier.root(), 1, &missing_previous);
+    assert_eq!(
+        verifier.fold(&missing_previous, missing_root),
+        Err(FoldFailure::Invalid(InvalidReason::PreviousRootMismatch))
+    );
+}
+
+#[test]
+fn gap_is_incomplete_and_duplicate_is_invalid() {
+    let mut verifier = AuditVerifier::genesis(BOOT, key()).unwrap();
+    let genesis = verifier.root();
+    let frame1 = body(BOOT, 1, 1, Object::None, 0, &[], Some(genesis));
+    let root1 = expected_root(genesis, 1, &frame1);
+    let frame3 = body(BOOT, 3, 3, Object::None, 0, &[], Some(root1));
+    let root3 = expected_root(root1, 3, &frame3);
+    verifier.fold(&frame1, root1).unwrap();
+    assert_eq!(
+        verifier.fold(&frame3, root3),
         Err(FoldFailure::Incomplete(IncompleteReason::SequenceGap))
     );
     assert_eq!(
-        verifier.fold(&frame1),
+        verifier.fold(&frame1, root1),
         Err(FoldFailure::Invalid(InvalidReason::DuplicateOrReorder))
     );
 }
 
 #[test]
 fn denial_must_not_disclose_a_foreign_identity() {
-    let mut verifier = AuditVerifier::genesis(BOOT).unwrap();
+    let mut verifier = AuditVerifier::genesis(BOOT, key()).unwrap();
     let mut payload = vec![4, 0];
     payload.extend_from_slice(&[9; 8]);
-    let denial = body(BOOT, 1, 80, Object::None, 0, &payload, None);
-    assert!(verifier.fold(&denial).is_ok());
+    let denial = body(
+        BOOT,
+        1,
+        80,
+        Object::None,
+        0,
+        &payload,
+        Some(verifier.root()),
+    );
+    let denial_root = expected_root(verifier.root(), 1, &denial);
+    assert!(verifier.fold(&denial, denial_root).is_ok());
 
-    let mut verifier = AuditVerifier::genesis(BOOT).unwrap();
-    let disclosing = body(BOOT, 1, 80, Object::Domain(1, 3), 0, &payload, None);
+    let mut verifier = AuditVerifier::genesis(BOOT, key()).unwrap();
+    let disclosing = body(
+        BOOT,
+        1,
+        80,
+        Object::Domain(1, 3),
+        0,
+        &payload,
+        Some(verifier.root()),
+    );
     assert_eq!(
-        verifier.fold(&disclosing),
+        verifier.fold(&disclosing, [0; 32]),
         Err(FoldFailure::Invalid(InvalidReason::DenialDisclosure))
     );
 }
 
 #[test]
 fn non_canonical_inputs_fail_closed() {
-    let valid = body(BOOT, 1, 1, Object::None, 0, &[], None);
-    let mut verifier = AuditVerifier::genesis(BOOT).unwrap();
+    let valid = body(BOOT, 1, 1, Object::None, 0, &[], Some(genesis_root(BOOT)));
+    let mut verifier = AuditVerifier::genesis(BOOT, key()).unwrap();
 
     assert!(matches!(
-        verifier.fold(&valid[..valid.len() - 1]),
+        verifier.fold(&valid[..valid.len() - 1], [0; 32]),
         Err(FoldFailure::Invalid(InvalidReason::Malformed))
     ));
     let mut slack = valid.clone();
     slack.push(0);
     assert!(matches!(
-        verifier.fold(&slack),
+        verifier.fold(&slack, [0; 32]),
         Err(FoldFailure::Invalid(InvalidReason::Malformed))
     ));
 
     let cases = [
-        body([0; 16], 1, 1, Object::None, 0, &[], None),
-        body(BOOT, 0, 1, Object::None, 0, &[], None),
-        body(BOOT, 1, 10, Object::None, 0, &[], None),
-        body(BOOT, 1, 1, Object::Domain(2, 1), 0, &[], None),
-        body(BOOT, 1, 1, Object::Domain(1, 0), 0, &[], None),
-        body(BOOT, 1, 1, Object::Endpoint(4, 1), 0, &[], None),
-        body(BOOT, 1, 1, Object::Capability(0, 1, 1, 1, 1), 0, &[], None),
-        body(BOOT, 1, 1, Object::Capability(1, 8, 1, 1, 1), 0, &[], None),
-        body(BOOT, 1, 1, Object::Capability(1, 1, 1, 7, 1), 0, &[], None),
-        body(BOOT, 1, 1, Object::None, 0x10, &[], None),
-        body(BOOT, 1, 1, Object::None, 0, &[0; 65], None),
+        body(
+            [0; 16],
+            1,
+            1,
+            Object::None,
+            0,
+            &[],
+            Some(genesis_root(BOOT)),
+        ),
+        body(BOOT, 0, 1, Object::None, 0, &[], Some(genesis_root(BOOT))),
+        body(BOOT, 1, 10, Object::None, 0, &[], Some(genesis_root(BOOT))),
+        body(
+            BOOT,
+            1,
+            1,
+            Object::Domain(2, 1),
+            0,
+            &[],
+            Some(genesis_root(BOOT)),
+        ),
+        body(
+            BOOT,
+            1,
+            1,
+            Object::Domain(1, 0),
+            0,
+            &[],
+            Some(genesis_root(BOOT)),
+        ),
+        body(
+            BOOT,
+            1,
+            1,
+            Object::Endpoint(4, 1),
+            0,
+            &[],
+            Some(genesis_root(BOOT)),
+        ),
+        body(
+            BOOT,
+            1,
+            1,
+            Object::Capability(1, 1, 1, 1, 1),
+            0,
+            &[],
+            Some(genesis_root(BOOT)),
+        ),
+        body(
+            BOOT,
+            1,
+            1,
+            Object::Capability(0, 1, 1, 2, 1),
+            0,
+            &[],
+            Some(genesis_root(BOOT)),
+        ),
+        body(
+            BOOT,
+            1,
+            1,
+            Object::Capability(1, 8, 1, 2, 1),
+            0,
+            &[],
+            Some(genesis_root(BOOT)),
+        ),
+        body(
+            BOOT,
+            1,
+            1,
+            Object::Capability(1, 1, 0, 2, 1),
+            0,
+            &[],
+            Some(genesis_root(BOOT)),
+        ),
+        body(
+            BOOT,
+            1,
+            1,
+            Object::Capability(1, 1, 1, 2, 0),
+            0,
+            &[],
+            Some(genesis_root(BOOT)),
+        ),
+        body(
+            BOOT,
+            1,
+            1,
+            Object::None,
+            0x10,
+            &[],
+            Some(genesis_root(BOOT)),
+        ),
+        body(
+            BOOT,
+            1,
+            1,
+            Object::None,
+            0,
+            &[0; 65],
+            Some(genesis_root(BOOT)),
+        ),
     ];
     for case in cases {
-        let mut verifier = AuditVerifier::genesis(BOOT).unwrap();
+        let mut verifier = AuditVerifier::genesis(BOOT, key()).unwrap();
         assert!(matches!(
-            verifier.fold(&case),
+            verifier.fold(&case, [0; 32]),
             Err(FoldFailure::Invalid(InvalidReason::Malformed))
         ));
     }
@@ -191,7 +315,7 @@ fn non_canonical_inputs_fail_closed() {
     let mut bad_version = valid.clone();
     bad_version[4..6].copy_from_slice(&2u16.to_le_bytes());
     assert!(matches!(
-        verifier.fold(&bad_version),
+        verifier.fold(&bad_version, [0; 32]),
         Err(FoldFailure::Invalid(InvalidReason::Malformed))
     ));
 }
@@ -216,9 +340,13 @@ fn checkpoint_wire(
     wire
 }
 
-fn tag_for(boot: [u8; 16], seq: u64, root: [u8; 32], relay_generation: u64) -> [u8; 32] {
+fn sealed_tag(boot: [u8; 16], seq: u64, root: [u8; 32], relay_generation: u64) -> [u8; 32] {
+    checkpoint_tag(boot, seq, root, relay_generation, key())
+}
+
+fn unkeyed_tag(boot: [u8; 16], seq: u64, root: [u8; 32], relay_generation: u64) -> [u8; 32] {
     let mut hasher = Hasher::new();
-    hasher.update(b"astrid.native-kernel.audit-checkpoint.v1");
+    hasher.update(CHECKPOINT_DOMAIN_TAG);
     hasher.update(&CODEC_VERSION.to_le_bytes());
     hasher.update(&boot);
     hasher.update(&seq.to_le_bytes());
@@ -228,34 +356,30 @@ fn tag_for(boot: [u8; 16], seq: u64, root: [u8; 32], relay_generation: u64) -> [
 }
 
 #[test]
-fn checkpoint_restart_and_source_root_match() {
-    let genesis = AuditVerifier::genesis(BOOT).unwrap().root();
-    let start = checkpoint_wire(BOOT, 0, genesis, 1, tag_for(BOOT, 0, genesis, 1));
-    let mut verifier = AuditVerifier::from_checkpoint(&start).unwrap();
+fn checkpoint_restart_and_mandatory_source_root_match() {
+    let genesis = AuditVerifier::genesis(BOOT, key()).unwrap().root();
+    let start = checkpoint_wire(BOOT, 0, genesis, 1, sealed_tag(BOOT, 0, genesis, 1));
+    let mut verifier = AuditVerifier::from_checkpoint(&start, key()).unwrap();
     assert_eq!(verifier.root(), genesis);
 
     let frame = body(BOOT, 1, 1, Object::None, 0, &[], Some(genesis));
     let root1 = expected_root(genesis, 1, &frame);
-    verifier.fold_with_root(&frame, Some(root1)).unwrap();
+    verifier.fold(&frame, root1).unwrap();
 
-    let next = checkpoint_wire(BOOT, 1, root1, 1, tag_for(BOOT, 1, root1, 1));
+    let next = checkpoint_wire(BOOT, 1, root1, 1, sealed_tag(BOOT, 1, root1, 1));
     assert_eq!(verifier.accept_checkpoint(&next), Ok(()));
 
     let mut tampered = next.clone();
     let last = tampered.len() - 1;
     tampered[last] ^= 1;
     assert!(matches!(
-        AuditVerifier::from_checkpoint(&tampered),
+        AuditVerifier::from_checkpoint(&tampered, key()),
         Err(VerifyFailure::CheckpointMismatch)
     ));
-    assert_eq!(
-        verifier.accept_checkpoint(&tampered),
-        Err(VerifyFailure::CheckpointMismatch)
-    );
 
     let mut wrong_root = root1;
     wrong_root[0] ^= 1;
-    let mismatched = checkpoint_wire(BOOT, 1, wrong_root, 1, tag_for(BOOT, 1, wrong_root, 1));
+    let mismatched = checkpoint_wire(BOOT, 1, wrong_root, 1, sealed_tag(BOOT, 1, wrong_root, 1));
     assert_eq!(
         verifier.accept_checkpoint(&mismatched),
         Err(VerifyFailure::CheckpointMismatch)
@@ -263,9 +387,64 @@ fn checkpoint_restart_and_source_root_match() {
 }
 
 #[test]
+fn host_minted_unkeyed_checkpoint_is_rejected() {
+    let genesis = AuditVerifier::genesis(BOOT, key()).unwrap().root();
+    let mut forged = checkpoint_wire(BOOT, 0, genesis, 1, unkeyed_tag(BOOT, 0, genesis, 1));
+    assert_eq!(
+        verify_checkpoint(&forged, key()),
+        Err(VerifyFailure::CheckpointMismatch)
+    );
+
+    let trusted = checkpoint_wire(BOOT, 0, genesis, 1, sealed_tag(BOOT, 0, genesis, 1));
+    let last = trusted.len() - 32;
+    let (_, tail) = forged.split_at_mut(last);
+    tail.copy_from_slice(&trusted[last..]);
+    assert!(AuditVerifier::from_checkpoint(&forged, key()).is_ok());
+}
+
+#[test]
+fn stale_and_future_relay_generations_fail_closed() {
+    let genesis = AuditVerifier::genesis(BOOT, key()).unwrap().root();
+    let start = checkpoint_wire(BOOT, 0, genesis, 1, sealed_tag(BOOT, 0, genesis, 1));
+    let mut verifier = AuditVerifier::from_checkpoint(&start, key()).unwrap();
+    let frame = body(BOOT, 1, 1, Object::None, 0, &[], Some(genesis));
+    let root1 = expected_root(genesis, 1, &frame);
+    verifier.fold(&frame, root1).unwrap();
+
+    let resync = checkpoint_wire(BOOT, 1, root1, 2, sealed_tag(BOOT, 1, root1, 2));
+    assert_eq!(verifier.accept_resync_checkpoint(&resync), Ok(()));
+    let stale = checkpoint_wire(BOOT, 1, root1, 1, sealed_tag(BOOT, 1, root1, 1));
+    assert_eq!(
+        verifier.accept_checkpoint(&stale),
+        Err(VerifyFailure::StaleRelayGeneration)
+    );
+    let future = checkpoint_wire(BOOT, 1, root1, 4, sealed_tag(BOOT, 1, root1, 4));
+    assert_eq!(
+        verifier.accept_resync_checkpoint(&future),
+        Err(VerifyFailure::CheckpointMismatch)
+    );
+}
+
+#[test]
+fn max_checkpoint_sequence_is_typed_fail_closed() {
+    let genesis = AuditVerifier::genesis(BOOT, key()).unwrap().root();
+    let checkpoint = checkpoint_wire(
+        BOOT,
+        u64::MAX,
+        genesis,
+        1,
+        sealed_tag(BOOT, u64::MAX, genesis, 1),
+    );
+    assert!(matches!(
+        AuditVerifier::from_checkpoint(&checkpoint, key()),
+        Err(VerifyFailure::SequenceOverflow)
+    ));
+}
+
+#[test]
 fn zero_boot_genesis_is_rejected() {
     assert!(matches!(
-        AuditVerifier::genesis([0; 16]),
+        AuditVerifier::genesis([0; 16], key()),
         Err(VerifyFailure::Malformed)
     ));
 }

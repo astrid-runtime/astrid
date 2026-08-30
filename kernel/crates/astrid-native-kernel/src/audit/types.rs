@@ -53,6 +53,36 @@ impl BootSessionId {
     }
 }
 
+/// Kernel-only checkpoint authentication key. This slice intentionally does
+/// not authenticate checkpoints with a public, verifier-recomputable hash:
+/// without this key, a host cannot mint a different verifier-local cache.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointAuthKey([u8; 32]);
+
+impl CheckpointAuthKey {
+    pub const fn new(bytes: [u8; 32]) -> Option<Self> {
+        let mut index = 0;
+        let mut any_nonzero = false;
+        while index < bytes.len() {
+            if bytes[index] != 0 {
+                any_nonzero = true;
+            }
+            index += 1;
+        }
+        if any_nonzero { Some(Self(bytes)) } else { None }
+    }
+
+    pub const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+impl core::fmt::Debug for CheckpointAuthKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("CheckpointAuthKey(REDACTED)")
+    }
+}
+
 /// Landed caller identity (#1705 `DomainToken`): domain slot plus generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AuditSubject {
@@ -182,7 +212,10 @@ impl AuditCapabilityInstance {
         object_kind: AuditObjectKind,
         object_token: u64,
     ) -> Option<Self> {
-        if capability_slot >= AUDIT_CAP_SLOTS_PER_DOMAIN {
+        // Landed #1758 capability-instance projections name Endpoint objects
+        // only; a Domain identity is attribution, not the held object.
+        if capability_slot >= AUDIT_CAP_SLOTS_PER_DOMAIN || object_kind != AuditObjectKind::Endpoint
+        {
             return None;
         }
         Some(Self {
@@ -381,6 +414,24 @@ impl AuditClass {
     pub(crate) const fn discriminant(self) -> u16 {
         self as u16
     }
+
+    /// Classes whose relay records participate in the statically reserved
+    /// terminal/invalidation headroom. Ordinary records cannot consume the
+    /// headroom needed by one admitted atomic teardown batch.
+    pub(crate) const fn is_terminal_or_invalidation(self) -> bool {
+        matches!(
+            self,
+            Self::DomainKill
+                | Self::DomainReclaim
+                | Self::DomainCancel
+                | Self::CapabilityRevoke
+                | Self::IpcQueueDrop
+                | Self::IpcEndpointTeardown
+                | Self::GenerationOverflow
+                | Self::RootOverflow
+                | Self::RootIncomplete
+        )
+    }
 }
 
 /// One typed audit event before canonical encoding. Construction is
@@ -408,9 +459,12 @@ impl AuditEvent {
         }
     }
 
-    pub fn with_object(mut self, object: AuditObject) -> Self {
+    pub fn with_object(mut self, object: AuditObject) -> Option<Self> {
+        if self.class == AuditClass::BoundedDenial {
+            return None;
+        }
         self.object = Some(object);
-        self
+        Some(self)
     }
 
     pub fn with_rights(mut self, rights: AuditRights) -> Self {
@@ -485,9 +539,10 @@ impl AuditCheckpoint {
         seq: u64,
         root: [u8; root::ROOT_LEN],
         relay_generation: u64,
+        auth_key: CheckpointAuthKey,
     ) -> Self {
         let codec_version = super::CODEC_VERSION;
-        let tag = root::checkpoint_tag(boot, seq, root, relay_generation);
+        let tag = root::checkpoint_tag(boot, seq, root, relay_generation, auth_key);
         Self {
             boot,
             seq,
@@ -498,8 +553,14 @@ impl AuditCheckpoint {
         }
     }
 
-    pub(crate) fn verify_tag(&self) -> bool {
-        root::checkpoint_tag(self.boot, self.seq, self.root, self.relay_generation) == self.tag
+    pub(crate) fn verify_tag(&self, auth_key: CheckpointAuthKey) -> bool {
+        root::checkpoint_tag(
+            self.boot,
+            self.seq,
+            self.root,
+            self.relay_generation,
+            auth_key,
+        ) == self.tag
     }
 
     pub const fn boot(self) -> BootSessionId {
@@ -542,6 +603,8 @@ pub enum AuditError {
     RelayWindowOverflow,
     RelayInvalidCursor,
     RelayStaleCursor,
+    RelayNotInFlight,
+    HandoffIncomplete,
     BatchCapacityExhausted,
 }
 
@@ -559,6 +622,8 @@ impl core::fmt::Display for AuditError {
             Self::RelayWindowOverflow => "relay window overflow",
             Self::RelayInvalidCursor => "relay cursor invalid",
             Self::RelayStaleCursor => "relay cursor stale",
+            Self::RelayNotInFlight => "relay record is not in flight",
+            Self::HandoffIncomplete => "audit handoff is incomplete and requires resync",
             Self::BatchCapacityExhausted => "batch exceeds the static terminal reserve",
         };
         f.write_str(text)

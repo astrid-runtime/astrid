@@ -11,9 +11,11 @@ pub enum WireError {
 /// Minimal view the fold needs: sequence plus denial-projection checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameView {
+    pub boot: [u8; 16],
     pub seq: u64,
     pub class: u16,
     pub has_object: bool,
+    pub prev_root: Option<[u8; 32]>,
 }
 
 const CLASS_DISCRIMINANTS: &[u16] = &[
@@ -35,7 +37,11 @@ pub fn decode_frame(bytes: &[u8]) -> Result<FrameView, WireError> {
     if codec_version != super::CODEC_VERSION {
         return Err(WireError::Malformed);
     }
-    let boot = reader.bytes(16).ok_or(WireError::Malformed)?;
+    let boot: [u8; 16] = reader
+        .bytes(16)
+        .ok_or(WireError::Malformed)?
+        .try_into()
+        .map_err(|_| WireError::Malformed)?;
     if boot.iter().all(|byte| *byte == 0) {
         return Err(WireError::Malformed);
     }
@@ -86,7 +92,7 @@ pub fn decode_frame(bytes: &[u8]) -> Result<FrameView, WireError> {
                 return Err(WireError::Malformed);
             }
             let kind = reader.u8().ok_or(WireError::Malformed)?;
-            if kind != 1 && kind != 2 {
+            if kind != 2 {
                 return Err(WireError::Malformed);
             }
             if reader.u64().ok_or(WireError::Malformed)? == 0 {
@@ -106,13 +112,17 @@ pub fn decode_frame(bytes: &[u8]) -> Result<FrameView, WireError> {
     }
     let payload_start = reader.pos();
     reader.skip(payload_len).ok_or(WireError::Malformed)?;
-    match reader.u8().ok_or(WireError::Malformed)? {
-        0 => {},
-        1 => {
-            reader.skip(32).ok_or(WireError::Malformed)?;
-        },
+    let prev_root = match reader.u8().ok_or(WireError::Malformed)? {
+        0 => None,
+        1 => Some(
+            reader
+                .bytes(32)
+                .ok_or(WireError::Malformed)?
+                .try_into()
+                .map_err(|_| WireError::Malformed)?,
+        ),
         _ => return Err(WireError::Malformed),
-    }
+    };
     if reader.remaining() != 0 {
         return Err(WireError::Malformed);
     }
@@ -128,9 +138,11 @@ pub fn decode_frame(bytes: &[u8]) -> Result<FrameView, WireError> {
         }
     }
     Ok(FrameView {
+        boot,
         seq,
         class,
         has_object,
+        prev_root,
     })
 }
 

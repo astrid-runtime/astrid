@@ -10,7 +10,7 @@ use core::num::NonZeroU64;
 use super::types::{
     AUDIT_MAX_PAYLOAD, AuditCapabilityInstance, AuditCheckpoint, AuditClass, AuditError,
     AuditEvent, AuditObject, AuditObjectKind, AuditRights, AuditSubject, BootSessionId,
-    DenialContext,
+    CheckpointAuthKey, DenialContext,
 };
 use super::{CODEC_VERSION, root};
 
@@ -57,10 +57,18 @@ impl Frame {
         seq: u64,
         event: &AuditEvent,
         prev_root: Option<[u8; root::ROOT_LEN]>,
-    ) -> Self {
+    ) -> Result<Self, AuditError> {
+        if event.class() == AuditClass::BoundedDenial {
+            if event.object().is_some() {
+                return Err(AuditError::UnauthorizedDisclosure);
+            }
+            if DenialContext::from_payload(event.payload()).is_none() {
+                return Err(AuditError::MalformedFrame);
+            }
+        }
         let mut payload = [0; AUDIT_MAX_PAYLOAD];
         payload[..event.payload().len()].copy_from_slice(event.payload());
-        Self {
+        Ok(Self {
             boot,
             seq,
             class: event.class(),
@@ -70,7 +78,7 @@ impl Frame {
             payload,
             payload_len: event.payload().len(),
             prev_root,
-        }
+        })
     }
 
     pub(crate) fn encode<'out>(
@@ -82,6 +90,9 @@ impl Frame {
         writer.u16(CODEC_VERSION)?;
         writer.raw(&self.boot.bytes())?;
         writer.u64(self.seq)?;
+        if self.class == AuditClass::BoundedDenial && self.object.is_some() {
+            return Err(AuditError::UnauthorizedDisclosure);
+        }
         writer.u16(self.class.discriminant())?;
         writer.u8(self.subject.slot())?;
         writer.u64(self.subject.generation().get())?;
@@ -266,8 +277,12 @@ fn decode_capability_instance(
 /// kernel tag is the authentication; decoding always re-verifies it.
 pub(crate) fn encode_checkpoint<'out>(
     checkpoint: &AuditCheckpoint,
+    auth_key: CheckpointAuthKey,
     out: &'out mut [u8; CHECKPOINT_WIRE_BYTES],
 ) -> Result<&'out [u8], AuditError> {
+    if !checkpoint.verify_tag(auth_key) {
+        return Err(AuditError::CheckpointMismatch);
+    }
     let mut writer = Writer::new(out);
     writer.skip_total_length()?;
     writer.u16(checkpoint.codec_version())?;
@@ -280,7 +295,10 @@ pub(crate) fn encode_checkpoint<'out>(
     Ok(&out[..end])
 }
 
-pub(crate) fn decode_checkpoint(bytes: &[u8]) -> Result<AuditCheckpoint, AuditError> {
+pub(crate) fn decode_checkpoint(
+    bytes: &[u8],
+    auth_key: CheckpointAuthKey,
+) -> Result<AuditCheckpoint, AuditError> {
     let mut reader = Reader::new(bytes)?;
     let total = reader.u32()? as usize;
     if bytes.len() - 4 != total || bytes.len() != CHECKPOINT_WIRE_BYTES {
@@ -302,7 +320,7 @@ pub(crate) fn decode_checkpoint(bytes: &[u8]) -> Result<AuditCheckpoint, AuditEr
     if reader.remaining() != 0 {
         return Err(AuditError::MalformedFrame);
     }
-    let expected = AuditCheckpoint::seal(boot, seq, root_bytes, relay_generation);
+    let expected = AuditCheckpoint::seal(boot, seq, root_bytes, relay_generation, auth_key);
     if expected.codec_version() != codec_version || expected.tag() != tag {
         return Err(AuditError::CheckpointMismatch);
     }

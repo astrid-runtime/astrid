@@ -5,10 +5,11 @@
 use super::codec::{Frame, MAX_FRAME_BYTES};
 use super::relay::AuditRelay;
 use super::root;
-use super::types::{AuditCheckpoint, AuditError, AuditEvent, BootSessionId};
+use super::types::{AuditCheckpoint, AuditError, AuditEvent, BootSessionId, CheckpointAuthKey};
 
 pub(crate) struct AuditChain {
     boot: BootSessionId,
+    auth_key: CheckpointAuthKey,
     seq: u64,
     root: [u8; root::ROOT_LEN],
     relay: AuditRelay,
@@ -16,9 +17,10 @@ pub(crate) struct AuditChain {
 
 impl AuditChain {
     /// Starts a new boot/session chain at the domain-separated genesis root.
-    pub fn genesis(boot: BootSessionId) -> Self {
+    pub fn genesis(boot: BootSessionId, auth_key: CheckpointAuthKey) -> Self {
         Self {
             boot,
+            auth_key,
             seq: 0,
             root: root::genesis(boot),
             relay: AuditRelay::new(boot),
@@ -27,9 +29,15 @@ impl AuditChain {
 
     /// Restores a chain from previously sealed trusted state. Crate-private
     /// until a later slice wires checkpoint restore into a consumer.
-    pub(crate) fn restore(boot: BootSessionId, seq: u64, root: [u8; root::ROOT_LEN]) -> Self {
+    pub(crate) fn restore(
+        boot: BootSessionId,
+        auth_key: CheckpointAuthKey,
+        seq: u64,
+        root: [u8; root::ROOT_LEN],
+    ) -> Self {
         Self {
             boot,
+            auth_key,
             seq,
             root,
             relay: AuditRelay::new(boot),
@@ -66,25 +74,33 @@ impl AuditChain {
             .seq
             .checked_add(1)
             .ok_or(AuditError::SequenceOverflow)?;
-        let prev_root = if self.seq == 0 { None } else { Some(self.root) };
-        let frame = Frame::new(self.boot, next, &event, prev_root);
+        let prev_root = Some(self.root);
+        let frame = Frame::new(self.boot, next, &event, prev_root)?;
         let mut buf = [0; MAX_FRAME_BYTES];
         let encoded = frame.encode(&mut buf)?;
         let next_root = root::advance(self.root, self.boot, next, encoded);
 
-        // Commit: frame, checked seq, and rolling root advance together.
+        // The relay is mandatory for this first-slice mutation transition.
+        // A reserve or window failure returns before either authoritative
+        // cursor advances, so no rooted record is stranded outside the
+        // bounded handoff proof. The fallible relay publish performs every
+        // check before mutating a slot or cursor.
+        self.relay.publish(
+            next,
+            encoded,
+            next_root,
+            event.class().is_terminal_or_invalidation(),
+        )?;
+
+        // Commit: frame, checked seq, rolling root, and relay handoff all
+        // advance together after every fallible step has succeeded.
         self.seq = next;
         self.root = next_root;
-
-        // Downstream only. A window overflow latches the relay; later
-        // publishes fail until an explicit resync rebinds it. The committed
-        // record above is authoritative regardless.
-        let _ = self.relay.publish(next, encoded, next_root);
         Ok(next)
     }
 
     /// Kernel-authenticated checkpoint bound to the exact current state.
     pub fn checkpoint(&self) -> AuditCheckpoint {
-        self.relay.checkpoint(self.root, self.seq)
+        self.relay.checkpoint(self.root, self.seq, self.auth_key)
     }
 }
