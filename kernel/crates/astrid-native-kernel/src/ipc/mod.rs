@@ -25,6 +25,8 @@ use crate::relations::{DeltaCursor, ProjectionEvidence, Snapshot};
 #[cfg(test)]
 use crate::relations::{projection_fold_evidence, projection_observation};
 pub use abi::MAX_BUFFER_BYTES;
+#[cfg(test)]
+pub(crate) use capability::CapSlot as TestCapSlot;
 pub use capability::DomainToken;
 use capability::{CapSlot, CapTable, Capability, DerivationLink, Rights};
 pub use copy::finish_copy;
@@ -417,9 +419,6 @@ pub fn complete_parked_recv(
         };
         match installed {
             Some(slot) => {
-                if let Some(parent) = message.transfer() {
-                    project_transferred_capability(&mut state, domain, parent, slot);
-                }
                 transferred_slot = Some(slot);
             },
             None => {
@@ -440,7 +439,14 @@ pub fn complete_parked_recv(
     let transfer = message.transfer();
     drop(state);
     let committed = commit(&mut encoded);
-    if !committed {
+    if committed {
+        if let Some(parent) = transfer
+            && let Some(slot) = transferred_slot
+        {
+            let mut state = IPC.lock();
+            project_transferred_capability(&mut state, domain, parent, slot);
+        }
+    } else {
         rollback_recv(domain, endpoint_id, message, transfer, transferred_slot);
     }
     committed.then_some(()).ok_or(())
@@ -615,9 +621,6 @@ fn recv(frame: &mut TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcErr
         };
         match installed {
             Some(slot) => {
-                if let Some(parent) = message.transfer() {
-                    project_transferred_capability(&mut state, domain, parent, slot);
-                }
                 transferred_slot = Some(slot);
             },
             None => {
@@ -642,6 +645,12 @@ fn recv(frame: &mut TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcErr
         rollback_recv(domain, endpoint_id, message, transfer, transferred_slot);
         return Err(IpcError::Faulted);
     }
+    if let Some(parent) = transfer
+        && let Some(slot) = transferred_slot
+    {
+        let mut state = IPC.lock();
+        project_transferred_capability(&mut state, domain, parent, slot);
+    }
     Ok((0, abi::MAX_BUFFER_BYTES as u64))
 }
 
@@ -655,16 +664,6 @@ fn rollback_recv(
     let mut state = IPC.lock();
     if let Some(slot) = installed {
         state.capabilities[domain.slot().index()].remove(domain, slot);
-        if let Some(transfer) = transfer {
-            project(
-                capability_removed(
-                    &mut state.relations,
-                    domain,
-                    capability_facts(transfer, slot),
-                ),
-                "transferred_capability_rollback",
-            );
-        }
     }
     let restored = Message::new(
         message.sender(),

@@ -124,3 +124,69 @@ fn successful_reclaim_is_accurate_and_replaces_older_generations() {
         ReclaimOutcome::Reclaimed
     );
 }
+
+#[test]
+fn successful_newer_reclaim_resolves_logical_deletion_overflow() {
+    let mut store = ProjectionStore::empty();
+    let lease = reader(&mut store, 0, 1);
+    for value in 1..=(MAX_RELATION_ROWS as u64 + 1) {
+        let relation = endpoint_relation(lease, value);
+        store
+            .apply_mutation(lease, RelationChange::Upsert(relation))
+            .unwrap();
+        store
+            .apply_mutation(lease, RelationChange::Delete(relation.key()))
+            .unwrap();
+    }
+
+    assert!(
+        store
+            .record_reclaim(
+                lease,
+                endpoint_object(MAX_RELATION_ROWS as u64 + 2),
+                ReclaimOutcome::Reclaimed,
+            )
+            .unwrap()
+    );
+
+    let base = store.base_snapshot(lease).unwrap();
+    let cursor = store.delta_cursor(lease).unwrap();
+    let reused = endpoint_relation(lease, MAX_RELATION_ROWS as u64 + 3);
+    store
+        .apply_mutation(lease, RelationChange::Upsert(reused))
+        .unwrap();
+    assert_eq!(store.snapshot(lease).unwrap().rows().count(), 1);
+    assert_eq!(
+        store.fold(lease, base, cursor).unwrap(),
+        store.snapshot(lease).unwrap()
+    );
+}
+
+#[test]
+fn unrelated_retirement_does_not_invent_logical_deletion_overflow() {
+    let mut store = ProjectionStore::empty();
+    let occupied = reader(&mut store, 0, 1);
+    for value in 1..=MAX_RELATION_ROWS as u64 {
+        let relation = endpoint_relation(occupied, value);
+        store
+            .apply_mutation(occupied, RelationChange::Upsert(relation))
+            .unwrap();
+        store
+            .apply_mutation(occupied, RelationChange::Delete(relation.key()))
+            .unwrap();
+    }
+    reader(&mut store, 1, 1);
+    reader(&mut store, 1, 2);
+
+    let base = store.base_snapshot(occupied).unwrap();
+    let cursor = store.delta_cursor(occupied).unwrap();
+    let relation = endpoint_relation(occupied, MAX_RELATION_ROWS as u64 + 1);
+    store
+        .apply_mutation(occupied, RelationChange::Upsert(relation))
+        .unwrap();
+    assert_eq!(store.snapshot(occupied).unwrap().rows().count(), 1);
+    assert_eq!(
+        store.fold(occupied, base, cursor).unwrap(),
+        store.snapshot(occupied).unwrap()
+    );
+}

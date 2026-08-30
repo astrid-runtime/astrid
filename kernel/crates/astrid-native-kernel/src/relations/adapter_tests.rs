@@ -5,13 +5,55 @@ use crate::ipc::test_support::{
     cap_revoke, capability, endpoint_create, install_transfer_message, reset, test_lock,
 };
 use crate::ipc::{
-    DomainToken, MAX_BUFFER_BYTES, bind_peer, complete_parked_recv, prepare_domain,
+    DomainToken, MAX_BUFFER_BYTES, TestCapSlot, bind_peer, complete_parked_recv, prepare_domain,
     relations_projection_fold, relations_projection_observation, teardown_domain,
 };
+use crate::relations::types::RelationKey;
 use crate::relations::{DeltaCursor, Snapshot};
 
 fn domain(slot: u64) -> DomainToken {
     DomainToken::new(slot, 1).unwrap()
+}
+
+#[test]
+fn failed_transfer_copyout_does_not_install_stale_waiter() {
+    let _guard = test_lock();
+    reset();
+    let creator = domain(0);
+    let peer = domain(1);
+    prepare_domain(creator);
+    prepare_domain(peer);
+    let endpoint = endpoint_create(creator).unwrap();
+    assert!(bind_peer(creator, peer).is_ok());
+    let root = capability(creator, creator.slot()).unwrap();
+    assert!(install_transfer_message(
+        peer,
+        creator,
+        endpoint,
+        Some(root)
+    ));
+
+    let wire = recv_wire(1);
+    let failed_base = observation(peer);
+    assert!(complete_parked_recv(peer, &wire, 0, |_| false).is_err());
+    let transferred_slot = TestCapSlot::try_new(1).unwrap();
+    assert!(capability(peer, transferred_slot).is_none());
+    require_fold_from(peer, failed_base.0, failed_base.1);
+
+    let retry_base = observation(peer);
+    assert!(complete_parked_recv(peer, &wire, 0, |_| true).is_ok());
+    assert!(capability(peer, transferred_slot).is_some());
+    let direct = observation(peer).0;
+    assert_eq!(direct.rows().count(), retry_base.0.rows().count() + 2);
+    assert!(direct.rows().any(|relation| matches!(
+        relation.key(),
+        RelationKey::Holds { capability, .. } if capability.slot().index() == 1
+    )));
+    assert!(direct.rows().any(|relation| matches!(
+        relation.key(),
+        RelationKey::Derives { child, .. } if child.slot().index() == 1
+    )));
+    require_fold_from(peer, retry_base.0, retry_base.1);
 }
 
 fn recv_wire(cap_slot: u16) -> [u8; MAX_BUFFER_BYTES] {

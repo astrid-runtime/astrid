@@ -3,8 +3,8 @@
 use super::delta::{DeltaCursor, DeltaRing, PageCursor, RelationDelta};
 use super::types::{
     CapabilityInstance, DomainProjectionToken, MAX_OBJECT_OBSERVATIONS, MAX_RELATION_ROWS,
-    ObjectRef, ProjectionError, READER_SLOTS, ReaderIdentity, ReclaimObservation, ReclaimOutcome,
-    Relation, RelationChange, RelationKey,
+    ObjectKind, ObjectRef, ProjectionError, READER_SLOTS, ReaderIdentity, ReclaimObservation,
+    ReclaimOutcome, Relation, RelationChange, RelationKey,
 };
 use crate::ipc::DomainToken;
 
@@ -127,6 +127,14 @@ pub struct RelationMutation {
     change: RelationChange,
 }
 
+/// Identity of a DELETE that could not be retained in the bounded table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LogicalDeletionOverflow {
+    scope: DomainProjectionToken,
+    object_kind: ObjectKind,
+    generation: u64,
+}
+
 /// Projection state only. Authoritative tables remain outside this type.
 #[derive(Clone, Copy)]
 pub struct ProjectionStore {
@@ -137,7 +145,7 @@ pub struct ProjectionStore {
     row_count: usize,
     reclaim: [Option<ReclaimObservation>; MAX_OBJECT_OBSERVATIONS],
     logical_deletions: [Option<RelationKey>; MAX_RELATION_ROWS],
-    logical_deletions_overflowed: bool,
+    logical_deletions_overflow: [Option<LogicalDeletionOverflow>; READER_SLOTS * 2],
     #[cfg(test)]
     retired_delete_counts: [usize; READER_SLOTS],
 }
@@ -152,7 +160,7 @@ impl ProjectionStore {
             row_count: 0,
             reclaim: [None; MAX_OBJECT_OBSERVATIONS],
             logical_deletions: [None; MAX_RELATION_ROWS],
-            logical_deletions_overflowed: false,
+            logical_deletions_overflow: [None; READER_SLOTS * 2],
             #[cfg(test)]
             retired_delete_counts: [0; READER_SLOTS],
         }
@@ -248,8 +256,11 @@ impl ProjectionStore {
                 *slot = None;
             }
         });
-        self.logical_deletions_overflowed =
-            self.logical_deletions.iter().all(|slot| slot.is_some());
+        self.logical_deletions_overflow.iter_mut().for_each(|slot| {
+            if slot.is_some_and(|overflow| overflow.scope == scope) {
+                *slot = None;
+            }
+        });
     }
     pub(crate) fn reader_lease(&self, domain: DomainToken) -> Option<ReaderLease> {
         let reader = self.readers[domain.slot().index()].as_ref()?;
@@ -641,10 +652,49 @@ impl ProjectionStore {
             .iter_mut()
             .find(|slot| slot.is_none())
         else {
-            self.logical_deletions_overflowed = true;
+            self.record_logical_deletion_overflow(key);
             return;
         };
         *slot = Some(key);
+    }
+
+    fn record_logical_deletion_overflow(&mut self, key: RelationKey) {
+        let Some(object) = key.object_refs().into_iter().flatten().next() else {
+            return;
+        };
+        let generation = key
+            .object_refs()
+            .into_iter()
+            .flatten()
+            .filter(|referenced| referenced.kind() == object.kind())
+            .map(|referenced| referenced.token().get())
+            .max()
+            .unwrap_or_else(|| object.token().get());
+        let overflow = LogicalDeletionOverflow {
+            scope: key.scope(),
+            object_kind: object.kind(),
+            generation,
+        };
+        if let Some(existing) = self
+            .logical_deletions_overflow
+            .iter_mut()
+            .find(|slot| {
+                slot.is_some_and(|existing| {
+                    existing.scope == overflow.scope && existing.object_kind == overflow.object_kind
+                })
+            })
+            .and_then(|slot| slot.as_mut())
+        {
+            existing.generation = existing.generation.max(generation);
+            return;
+        }
+        if let Some(slot) = self
+            .logical_deletions_overflow
+            .iter_mut()
+            .find(|slot| slot.is_none())
+        {
+            *slot = Some(overflow);
+        }
     }
 
     fn validate_upsert(
@@ -653,7 +703,17 @@ impl ProjectionStore {
         is_new: bool,
         final_row_count: usize,
     ) -> Result<(), ProjectionError> {
-        if is_new && (final_row_count > MAX_RELATION_ROWS || self.logical_deletions_overflowed) {
+        if is_new && final_row_count > MAX_RELATION_ROWS {
+            return Err(ProjectionError::NoSpace);
+        }
+        if is_new
+            && relation
+                .key()
+                .object_refs()
+                .into_iter()
+                .flatten()
+                .any(|object| self.logical_deletions_overflowed(relation.key().scope(), object))
+        {
             return Err(ProjectionError::NoSpace);
         }
         if self.logical_deletions.contains(&Some(relation.key())) {
@@ -722,6 +782,7 @@ impl ProjectionStore {
     /// logical DELETE or reclaim observation.
     fn forget_preceding_object_metadata(&mut self, object: ObjectRef) {
         let generation = object.token().get();
+        let mut forgot_preceding_deletion = false;
         self.reclaim.iter_mut().for_each(|slot| {
             if slot.is_some_and(|existing| {
                 existing.object_ref().kind() == object.kind()
@@ -737,8 +798,18 @@ impl ProjectionStore {
                 })
             }) {
                 *slot = None;
+                forgot_preceding_deletion = true;
             }
         });
+        if forgot_preceding_deletion {
+            self.logical_deletions_overflow.iter_mut().for_each(|slot| {
+                if slot.is_some_and(|overflow| {
+                    overflow.object_kind == object.kind() && overflow.generation < generation
+                }) {
+                    *slot = None;
+                }
+            });
+        }
     }
 
     pub fn reclaim_observation(
@@ -749,6 +820,21 @@ impl ProjectionStore {
         self.reader_at(lease)?;
         self.reclaim_for_object(lease.token, object)
             .ok_or(ProjectionError::Denied)
+    }
+
+    fn logical_deletions_overflowed(
+        &self,
+        scope: DomainProjectionToken,
+        object: ObjectRef,
+    ) -> bool {
+        self.logical_deletions_overflow
+            .iter()
+            .flatten()
+            .any(|overflow| {
+                overflow.scope == scope
+                    && overflow.object_kind == object.kind()
+                    && overflow.generation >= object.token().get()
+            })
     }
 
     #[cfg(test)]
