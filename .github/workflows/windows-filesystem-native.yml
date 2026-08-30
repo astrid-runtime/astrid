@@ -283,29 +283,68 @@ jobs:
           cargo test --locked --target ${{ matrix.target }} -p astrid-core
           local_transport -- --nocapture --test-threads=1
 
-      - name: Build and stage the exact process storage provider
+      - name: Run storage callback transport tests in trusted staging
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |
           cargo build --locked --target ${{ matrix.target }} -p astrid-storage-provider-winfsp
           $provider = "target/${{ matrix.target }}/debug/astrid-storage-provider-winfsp.exe"
-          $testDirectory = "target/${{ matrix.target }}/debug/deps"
+          $messages = cargo test --locked --message-format=json --target ${{ matrix.target }} -p astrid-kernel --lib storage_mount --no-run
+          $artifacts = foreach ($message in $messages) {
+            $artifact = $null
+            try {
+              $artifact = $message | ConvertFrom-Json -ErrorAction Stop
+            } catch {
+              continue
+            }
+            if ($artifact.reason -eq "compiler-artifact" -and
+                $artifact.profile.test -eq $true -and
+                $artifact.target.name -eq "astrid-kernel" -and
+                $artifact.target.kind -contains "lib" -and
+                $artifact.executable) {
+              $artifact
+            }
+          }
+          if ($artifacts.Count -ne 1) {
+            throw "expected exactly one kernel storage_mount test executable, found $($artifacts.Count)"
+          }
+          $testExecutable = (Get-Item -LiteralPath $artifacts[0].executable).FullName
           if (-not (Test-Path -LiteralPath $provider -PathType Leaf)) {
             throw "the exact Windows process storage provider was not built"
           }
-          New-Item -ItemType Directory -Path $testDirectory -Force | Out-Null
-          Copy-Item -LiteralPath $provider -Destination $testDirectory -Force
-          Get-Item -LiteralPath (Join-Path $testDirectory (Split-Path -Leaf $provider)) |
+          $stage = Join-Path $env:RUNNER_TEMP ([System.IO.Path]::GetRandomFileName())
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          & icacls.exe $stage /inheritance:r /grant:r `
+            "*$($userSid):(OI)(CI)F" `
+            "*S-1-5-18:(OI)(CI)F" `
+            "*S-1-5-32-544:(OI)(CI)F"
+          if ($LASTEXITCODE -ne 0) {
+            throw "failed to restrict the process storage staging DACL"
+          }
+          $acl = Get-Acl -LiteralPath $stage
+          $rules = @($acl.Access)
+          $trustedSids = @($userSid, "S-1-5-18", "S-1-5-32-544")
+          if ($rules.Count -ne $trustedSids.Count) {
+            throw "the process storage staging DACL has unexpected ACEs"
+          }
+          foreach ($rule in $rules) {
+            $ruleSid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+            if ($rule.IsInherited -or $trustedSids -notcontains $ruleSid) {
+              throw "the process storage staging DACL contains an untrusted ACE"
+            }
+          }
+          $stagedProvider = Join-Path $stage (Split-Path -Leaf $provider)
+          $stagedTestExecutable = Join-Path $stage (Split-Path -Leaf $testExecutable)
+          Copy-Item -LiteralPath $provider -Destination $stagedProvider
+          Copy-Item -LiteralPath $testExecutable -Destination $stagedTestExecutable
+          Get-Item -LiteralPath $stagedProvider, $stagedTestExecutable |
             Select-Object FullName, Length
-
-      - name: Run storage callback transport tests natively
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        env:
-          ASTRID_PROCESS_PROVIDER_TESTS: "1"
-        shell: pwsh
-        run: >-
-          cargo test --locked --target ${{ matrix.target }} -p astrid-kernel
-          storage_mount -- --nocapture --test-threads=1
+          $env:ASTRID_PROCESS_PROVIDER_TESTS = "1"
+          & $stagedTestExecutable storage_mount -- --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) {
+            throw "the trusted process storage provider tests failed with exit code $LASTEXITCODE"
+          }
 
       - name: Run the native WinFsp filesystem round trip
         if: matrix.target == 'x86_64-pc-windows-msvc'
