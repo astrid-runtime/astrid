@@ -15,7 +15,7 @@ use x86_64::structures::paging::{PhysFrame, Size4KiB};
 
 #[cfg(not(test))]
 use super::paging::AddressSpace;
-use super::stop::DomainStop;
+use super::stop::{DomainStop, HostManifestIdentity};
 use super::types::{
     BindError, DomainGeneration, DomainHandle, DomainId, DomainPagingError, Outcome, SLOT_CAPACITY,
     Scenario,
@@ -27,7 +27,6 @@ use crate::ipc;
 use crate::memory::FRAME_SIZE;
 #[cfg(not(test))]
 use crate::serial;
-#[cfg(not(test))]
 use astrid_system_generation::ContentId;
 
 #[cfg(test)]
@@ -618,6 +617,24 @@ impl Manager {
             return Err(super::stop::StopError::StateMismatch);
         }
         domain.stop.take_timer(handle, scenario)
+    }
+
+    pub(in crate::domains) fn completed_running_stop(
+        &self,
+        handle: DomainHandle,
+        component_id: ContentId,
+        scenario: Scenario,
+    ) -> Option<super::stop::StopObservation<HostManifestIdentity, ContentId>> {
+        let domain = self
+            .slots
+            .get(handle.id().0 as usize)
+            .and_then(Option::as_ref)
+            .filter(|domain| {
+                domain.generation == handle.generation().0 && domain.state == DomainState::Reclaimed
+            })?;
+        domain
+            .stop
+            .completed_observation_for(handle, component_id, scenario)
     }
 
     fn slot_is_preparable(domain: Option<&Domain>) -> bool {

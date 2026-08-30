@@ -8,6 +8,7 @@ use astrid_system_generation::emulator_fixture::EMULATOR_COMPONENT_LEN;
 use super::admission;
 use super::manager::{self, CancelError, DomainIdentity, PrepareError};
 use super::stage;
+use super::stop;
 use super::types::{BindError, ComponentImage, DomainGeneration, DomainHandle, DomainId};
 use super::types::{Outcome, Scenario};
 use crate::closure::{authenticated_component, authenticated_component_id};
@@ -518,7 +519,13 @@ fn ipc_cancel_guest_done() -> ! {
         fail("running_guest_ipc_cancel_rejected");
     }
     let (raw, expected) = authenticated();
+    if stop::observe_completed_stop(server, expected, Scenario::RunningStop).is_some() {
+        fail("stale_running_stop_was_observable");
+    }
     let stop = prepare_domain(&raw, expected, Scenario::RunningStop);
+    if stop::observe_completed_stop(stop, expected, Scenario::RunningStop).is_some() {
+        fail("prepared_running_stop_was_observable");
+    }
     store_handle(&IPC_SERVER_HANDLE, stop);
     set_phase(PHASE_RUNNING_STOP_PREPARE);
     start_domain(stop, Scenario::RunningStop);
@@ -529,6 +536,37 @@ fn running_stop_done() -> ! {
     let passed = manager::is_stale(stop)
         && manager::outstanding_frames() == 0
         && manager::kernel_cr3_restored();
+    let stale = DomainHandle::new(stop.id(), DomainGeneration(stop.generation().0 + 1));
+    let foreign_slot = DomainHandle::new(DomainId((stop.id().0 + 1) % 2), stop.generation());
+    let substituted_component = ContentId::from_payload(b"running-stop-substitution");
+    let exact =
+        stop::observe_completed_stop(stop, authenticated_component_id(), Scenario::RunningStop);
+    let repeated =
+        stop::observe_completed_stop(stop, authenticated_component_id(), Scenario::RunningStop);
+    let observation_ok =
+        stop::observe_completed_stop(stale, authenticated_component_id(), Scenario::RunningStop)
+            .is_none()
+            && stop::observe_completed_stop(
+                foreign_slot,
+                authenticated_component_id(),
+                Scenario::RunningStop,
+            )
+            .is_none()
+            && stop::observe_completed_stop(stop, substituted_component, Scenario::RunningStop)
+                .is_none()
+            && stop::observe_completed_stop(stop, authenticated_component_id(), Scenario::Exit)
+                .is_none();
+    let exact_ok = exact.is_some()
+        && exact == repeated
+        && exact.as_ref().is_some_and(|observation| {
+            observation.handle() == stop
+                && *observation.component_id() == authenticated_component_id()
+                && observation.scenario() == Scenario::RunningStop
+                && observation.outcome() == Outcome::Cancelled
+        });
+    if !observation_ok || !exact_ok {
+        fail("running_stop_observation_rejected");
+    }
     RUNNING_STOP_OK.store(report(RUNNING_STOP_GATE, passed), Ordering::SeqCst);
     if !passed {
         fail("running_timer_stop_not_terminal");

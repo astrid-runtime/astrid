@@ -1,6 +1,6 @@
 //! Private identity-bound Running-stop scheduler handoff.
 
-use super::types::{DomainHandle, Scenario};
+use super::types::{DomainHandle, Outcome, Scenario};
 use astrid_system_generation::ContentId;
 #[cfg(not(test))]
 use astrid_system_generation::ManifestIdentity;
@@ -11,9 +11,9 @@ use super::manager::{CURRENT, MANAGER, fail_terminal};
 use crate::serial;
 
 #[cfg(not(test))]
-type HostManifestIdentity = ManifestIdentity;
+pub(in crate::domains) type HostManifestIdentity = ManifestIdentity;
 #[cfg(test)]
-type HostManifestIdentity = ();
+pub(in crate::domains) type HostManifestIdentity = ();
 
 pub(crate) type DomainStop = StopLifecycle<HostManifestIdentity, ContentId>;
 
@@ -54,6 +54,38 @@ pub(crate) struct StopTicket<G, C> {
     scenario: Scenario,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StopObservation<G, C> {
+    handle: DomainHandle,
+    manifest_identity: G,
+    component_id: C,
+    scenario: Scenario,
+    outcome: Outcome,
+}
+
+impl<G, C> StopObservation<G, C> {
+    pub(in crate::domains) const fn handle(&self) -> DomainHandle {
+        self.handle
+    }
+
+    #[cfg(test)]
+    pub(in crate::domains) const fn manifest_identity(&self) -> &G {
+        &self.manifest_identity
+    }
+
+    pub(in crate::domains) const fn component_id(&self) -> &C {
+        &self.component_id
+    }
+
+    pub(in crate::domains) const fn scenario(&self) -> Scenario {
+        self.scenario
+    }
+
+    pub(in crate::domains) const fn outcome(&self) -> Outcome {
+        self.outcome
+    }
+}
+
 impl<G, C> StopTicket<G, C>
 where
     G: Copy + PartialEq,
@@ -79,6 +111,56 @@ where
             return Err(StopError::ScenarioMismatch);
         }
         Ok(())
+    }
+}
+
+impl<G, C> StopLifecycle<G, C>
+where
+    G: Copy + PartialEq,
+    C: Copy + PartialEq,
+{
+    #[cfg(test)]
+    pub(in crate::domains) fn completed_observation(
+        &self,
+        handle: DomainHandle,
+        manifest_identity: G,
+        component_id: C,
+        scenario: Scenario,
+    ) -> Option<StopObservation<G, C>> {
+        let Self::Completed(ticket) = self else {
+            return None;
+        };
+        ticket
+            .verify(handle, manifest_identity, component_id, scenario)
+            .ok()?;
+        (ticket.scenario == Scenario::RunningStop).then_some(StopObservation {
+            handle: ticket.handle,
+            manifest_identity: ticket.manifest_identity,
+            component_id: ticket.component_id,
+            scenario: ticket.scenario,
+            outcome: Outcome::Cancelled,
+        })
+    }
+
+    pub(in crate::domains) fn completed_observation_for(
+        &self,
+        handle: DomainHandle,
+        component_id: C,
+        scenario: Scenario,
+    ) -> Option<StopObservation<G, C>> {
+        let Self::Completed(ticket) = self else {
+            return None;
+        };
+        ticket
+            .verify(handle, ticket.manifest_identity, component_id, scenario)
+            .ok()?;
+        (ticket.scenario == Scenario::RunningStop).then_some(StopObservation {
+            handle: ticket.handle,
+            manifest_identity: ticket.manifest_identity,
+            component_id: ticket.component_id,
+            scenario: ticket.scenario,
+            outcome: Outcome::Cancelled,
+        })
     }
 }
 
@@ -239,4 +321,23 @@ pub(crate) fn abort_for_terminal(handle: DomainHandle) -> bool {
     } else {
         !domain.stop.is_taken()
     }
+}
+
+#[cfg(not(test))]
+pub(in crate::domains) fn observe_completed_stop(
+    handle: DomainHandle,
+    component_id: ContentId,
+    scenario: Scenario,
+) -> Option<StopObservation<HostManifestIdentity, ContentId>> {
+    if CURRENT.active.load(core::sync::atomic::Ordering::SeqCst)
+        || CURRENT.root.load(core::sync::atomic::Ordering::SeqCst) != 0
+        || CURRENT
+            .root_flags
+            .load(core::sync::atomic::Ordering::SeqCst)
+            != 0
+    {
+        return None;
+    }
+    let manager = MANAGER.lock();
+    manager.completed_running_stop(handle, component_id, scenario)
 }
