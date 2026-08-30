@@ -62,13 +62,15 @@ pub(crate) use projection_root_removal::fail_next_root_removal_for_test;
 use projection_root_removal::remove_projection_root;
 #[cfg(all(test, any(unix, windows)))]
 pub(crate) use test_faults::{
-    arm_issue_root_removal_failure_for_test, arm_partial_issue_failure,
-    arm_partial_issue_provider_error_for_test, arm_preparation_failure_for_test,
+    arm_issue_root_removal_failure_for_test, arm_mount_root_creation_failure_for_test,
+    arm_partial_issue_failure, arm_partial_issue_provider_error_for_test,
+    arm_preparation_failure_for_test,
 };
 #[cfg(all(test, any(unix, windows)))]
 use test_faults::{
-    take_issue_root_removal_failure_for_test, take_partial_issue_failure,
-    take_partial_issue_provider_error, take_preparation_failure_for_test,
+    take_issue_root_removal_failure_for_test, take_mount_root_creation_failure_for_test,
+    take_partial_issue_failure, take_partial_issue_provider_error,
+    take_preparation_failure_for_test,
 };
 #[cfg(all(test, any(unix, windows)))]
 mod projection_identity_tests;
@@ -473,8 +475,6 @@ fn prepare_projection_paths(
     astrid_core::platform_fs::ensure_private_directory(&process_root)
         .map_err(|error| format!("create process storage root: {error}"))?;
     let mount_root = process_root.join(uuid::Uuid::new_v4().simple().to_string());
-    astrid_core::platform_fs::ensure_private_directory(&mount_root)
-        .map_err(|error| format!("validate process storage mount root: {error}"))?;
     #[cfg(all(test, any(unix, windows)))]
     if take_issue_root_removal_failure_for_test() {
         fail_next_root_removal_for_test(mount_root.clone());
@@ -487,6 +487,7 @@ fn prepare_projection_paths(
         owner: owner.clone(),
         fleet_shared: None,
     };
+    validate_projection_mount_root(kernel, projections, key, &paths)?;
     #[cfg(not(windows))]
     {
         #[cfg(all(test, any(unix, windows)))]
@@ -557,6 +558,44 @@ fn prepare_projection_paths(
     };
     paths.fleet_shared = fleet_shared;
     Ok(paths)
+}
+
+fn validate_projection_mount_root(
+    kernel: &Arc<Kernel>,
+    projections: &mut std::collections::BTreeMap<
+        ProcessProjectionKey,
+        Arc<CachedProcessProjection>,
+    >,
+    key: &ProcessProjectionKey,
+    paths: &ProjectionMountPaths,
+) -> Result<(), String> {
+    let mount_root = &paths.mount_root;
+    let mount_root_result = astrid_core::platform_fs::ensure_private_directory(mount_root);
+    #[cfg(all(test, any(unix, windows)))]
+    let mount_root_result =
+        if take_mount_root_creation_failure_for_test() && mount_root_result.is_ok() {
+            Err(std::io::Error::other(
+                "injected post-creation mount-root validation failure",
+            ))
+        } else {
+            mount_root_result
+        };
+    if let Err(error) = mount_root_result {
+        // A private-directory policy check can fail after the namespace entry
+        // exists. Keep that exact incarnation under zero-lease retry authority
+        // instead of leaking it as an unlabeled UUID root.
+        if mount_root.exists() {
+            return Err(retain_projection_path_failure(
+                kernel,
+                projections,
+                key,
+                paths,
+                format!("validate process storage mount root: {error}"),
+            ));
+        }
+        return Err(format!("create process storage mount root: {error}"));
+    }
+    Ok(())
 }
 
 fn retain_projection_path_failure(

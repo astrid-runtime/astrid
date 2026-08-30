@@ -137,11 +137,11 @@ fn selected_launch_failure(test_id: u64) -> Option<ProcessLaunchStage> {
 fn spawn_long_lived_test_provider() -> Result<tokio::process::Child, ProcessProviderLaunchError> {
     let mut command = if cfg!(unix) {
         let mut command = tokio::process::Command::new("sleep");
-        command.arg("30");
+        command.arg("300");
         command
     } else {
         let mut command = tokio::process::Command::new("ping");
-        command.args(["-n", "31", "127.0.0.1"]);
+        command.args(["-n", "301", "127.0.0.1"]);
         command
     };
     command

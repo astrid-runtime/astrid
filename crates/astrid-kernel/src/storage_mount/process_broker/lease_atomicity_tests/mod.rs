@@ -22,6 +22,7 @@ use super::{
 mod cache_invalidation_tests;
 mod exact_fence_tests;
 mod partial_issue_tests;
+mod root_creation_tests;
 mod stopped_provider_tests;
 
 pub(crate) use super::projection_lifecycle::fence_projection_leases_for_test;

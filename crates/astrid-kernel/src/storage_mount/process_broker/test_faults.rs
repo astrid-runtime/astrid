@@ -17,6 +17,9 @@ static ISSUE_ROOT_REMOVAL_FAILURES: std::sync::Mutex<std::collections::BTreeSet<
 static PREPARATION_FAILURES: std::sync::Mutex<std::collections::BTreeMap<u64, ProcessLaunchStage>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+static MOUNT_ROOT_CREATION_FAILURES: std::sync::Mutex<std::collections::BTreeSet<u64>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
 pub(crate) fn arm_partial_issue_failure(stage: ProcessLaunchStage, test_id: u64) {
     PARTIAL_ISSUE_FAILURES
         .lock()
@@ -90,4 +93,21 @@ pub(super) fn take_preparation_failure_for_test(stage: ProcessLaunchStage) -> bo
         .expect("preparation failure selector")
         .remove(&current_test_id)
         == Some(stage)
+}
+
+pub(crate) fn arm_mount_root_creation_failure_for_test(test_id: u64) {
+    MOUNT_ROOT_CREATION_FAILURES
+        .lock()
+        .expect("mount-root creation failure selector")
+        .insert(test_id);
+}
+
+pub(super) fn take_mount_root_creation_failure_for_test() -> bool {
+    let current_test_id = PROCESS_MOUNT_TEST_ID
+        .try_with(|test_id| *test_id)
+        .unwrap_or(0);
+    MOUNT_ROOT_CREATION_FAILURES
+        .lock()
+        .expect("mount-root creation failure selector")
+        .remove(&current_test_id)
 }
