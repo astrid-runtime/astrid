@@ -52,8 +52,10 @@ version = "0.0.0"
 dependencies = [
  "astrid-native-closure",
  "astrid-system-generation",
+ "blake3",
  "bootloader_api",
  "linked_list_allocator",
+ "native-audit-verifier",
  "raw-cpuid",
  "spin",
  "x86_64",
@@ -405,11 +407,11 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "astrid-native-closure",
-    "astrid-system-generation",
-    "blake3",
-    "bootloader_api",
-    "serde_json",
-    "wait-timeout",
+ "astrid-system-generation",
+ "blake3",
+ "bootloader_api",
+ "serde_json",
+ "wait-timeout",
 ]
 
 [[package]]
@@ -456,6 +458,13 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "native-audit-verifier"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+]
 
 [[package]]
 name = "once_cell"

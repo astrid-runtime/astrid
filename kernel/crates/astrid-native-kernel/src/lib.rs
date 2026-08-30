@@ -25,6 +25,10 @@ pub mod platform;
 // typechecking the frozen relation semantics.
 #[allow(dead_code)]
 mod relations;
+// Production-compiled ahead of its first consumer so the native target keeps
+// typechecking the frozen audit-chain semantics.
+#[allow(dead_code)]
+mod audit;
 #[cfg(not(test))]
 pub mod serial;
 #[cfg(not(test))]
