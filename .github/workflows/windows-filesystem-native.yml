@@ -299,16 +299,20 @@ jobs:
             }
             if ($artifact.reason -eq "compiler-artifact" -and
                 $artifact.profile.test -eq $true -and
-                $artifact.target.name -eq "astrid-kernel" -and
+                $artifact.target.name -eq "astrid_kernel" -and
                 $artifact.target.kind -contains "lib" -and
                 $artifact.executable) {
               $artifact
             }
           }
-          if ($artifacts.Count -ne 1) {
-            throw "expected exactly one kernel storage_mount test executable, found $($artifacts.Count)"
+          $executables = @($artifacts | Where-Object { $_.executable })
+          if ($executables.Count -ne 1) {
+            throw "expected exactly one astrid_kernel storage_mount executable, found $($executables.Count)"
           }
-          $testExecutable = (Get-Item -LiteralPath $artifacts[0].executable).FullName
+          $testExecutable = (Get-Item -LiteralPath $executables[0].executable).FullName
+          if (-not (Test-Path -LiteralPath $testExecutable -PathType Leaf)) {
+            throw "the Cargo-reported storage_mount executable is not a file: $testExecutable"
+          }
           if (-not (Test-Path -LiteralPath $provider -PathType Leaf)) {
             throw "the exact Windows process storage provider was not built"
           }
@@ -323,15 +327,41 @@ jobs:
             throw "failed to restrict the process storage staging DACL"
           }
           $acl = Get-Acl -LiteralPath $stage
-          $rules = @($acl.Access)
+          if (-not $acl.AreAccessRulesProtected) {
+            throw "the process storage staging DACL is not protected"
+          }
+          $ownerSid = $acl.Owner.Translate([System.Security.Principal.SecurityIdentifier]).Value
           $trustedSids = @($userSid, "S-1-5-18", "S-1-5-32-544")
+          if ($trustedSids -notcontains $ownerSid) {
+            throw "the process storage staging owner is untrusted: $ownerSid"
+          }
+          $rules = @($acl.Access)
           if ($rules.Count -ne $trustedSids.Count) {
             throw "the process storage staging DACL has unexpected ACEs"
           }
-          foreach ($rule in $rules) {
-            $ruleSid = $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
-            if ($rule.IsInherited -or $trustedSids -notcontains $ruleSid) {
-              throw "the process storage staging DACL contains an untrusted ACE"
+          $actualRules = foreach ($rule in $rules) {
+            [pscustomobject]@{
+              Sid = $rule.IdentityReference.Translate(
+                [System.Security.Principal.SecurityIdentifier]
+              ).Value
+              Type = [string]$rule.AccessControlType
+              Rights = [string]$rule.FileSystemRights
+              Inheritance = [string]$rule.InheritanceFlags
+              Propagation = [string]$rule.PropagationFlags
+              Inherited = [bool]$rule.IsInherited
+            }
+          }
+          foreach ($sid in $trustedSids) {
+            $matchingRules = @($actualRules | Where-Object {
+                $_.Sid -eq $sid -and
+                $_.Type -eq "Allow" -and
+                $_.Rights -eq "FullControl" -and
+                $_.Inheritance -eq "ContainerInherit, ObjectInherit" -and
+                $_.Propagation -eq "None" -and
+                -not $_.Inherited
+              })
+            if ($matchingRules.Count -ne 1) {
+              throw "the process storage staging DACL must contain exactly one trusted full-control ACE for $sid"
             }
           }
           $stagedProvider = Join-Path $stage (Split-Path -Leaf $provider)

@@ -1,5 +1,6 @@
 //! A degraded exact component set must invalidate its cached projection.
 
+use std::path::Path;
 use std::sync::{Arc, atomic::Ordering};
 
 use astrid_capsule::context::ProcessStorageMountBroker as _;
@@ -137,6 +138,101 @@ async fn assert_replacement_after_unhealthy_hit(
         kernel.storage_mounts.is_empty(),
         "the replacement must clean its complete new exact set"
     );
+    assert!(broker.projections.lock().await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_admission_has_exactly_one_guard_reference() {
+    if !provider_lane_is_ready("fresh_admission_has_exactly_one_guard_reference") {
+        return;
+    }
+    let (_temporary, kernel) = fleet_shared_kernel().await;
+    let caller = PrincipalId::default();
+    let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
+
+    let first = super::PROCESS_MOUNT_TEST_ID
+        .scope(701, broker.mount(&caller))
+        .await
+        .expect("fresh process projection");
+    let mount_root = first
+        .workspace_root
+        .parent()
+        .and_then(Path::parent)
+        .expect("fresh UUID mount root")
+        .to_path_buf();
+    assert!(mount_root.exists(), "fresh admission must start its root");
+    let projections = broker.projections.lock().await;
+    assert_eq!(projections.len(), 1);
+    let projection = Arc::clone(projections.values().next().expect("fresh projection"));
+    drop(projections);
+    assert_eq!(projection.refs.load(Ordering::Acquire), 1);
+    assert_eq!(projection.component_mount_ids.len(), 3);
+    assert!(
+        projection
+            .component_mount_ids
+            .iter()
+            .all(|mount_id| kernel.storage_mounts.contains_key(mount_id))
+    );
+
+    let reused = super::PROCESS_MOUNT_TEST_ID
+        .scope(702, broker.mount(&caller))
+        .await
+        .expect("cached process projection while the first guard is held");
+    assert_eq!(reused.workspace_root, first.workspace_root);
+    assert_eq!(reused.home_root, first.home_root);
+    assert_eq!(projection.refs.load(Ordering::Acquire), 2);
+    assert_eq!(broker.projections.lock().await.len(), 1);
+
+    first.close_async().await;
+    assert_eq!(projection.refs.load(Ordering::Acquire), 1);
+    assert_eq!(broker.projections.lock().await.len(), 1);
+    assert!(mount_root.exists(), "the last close must own cleanup");
+    assert!(
+        projection
+            .component_mount_ids
+            .iter()
+            .all(|mount_id| kernel.storage_mounts.contains_key(mount_id))
+    );
+
+    reused.close_async().await;
+    assert_eq!(
+        projection.refs.load(Ordering::Acquire),
+        0,
+        "the last close must drain exactly one reference"
+    );
+    assert!(broker.projections.lock().await.is_empty());
+    assert!(
+        projection
+            .component_mount_ids
+            .iter()
+            .all(|mount_id| !kernel.storage_mounts.contains_key(mount_id))
+    );
+    assert!(!mount_root.exists(), "the last close must clean the root");
+
+    let remounted = super::PROCESS_MOUNT_TEST_ID
+        .scope(703, broker.mount(&caller))
+        .await
+        .expect("fresh process projection after the last close");
+    let remounted_projections = broker.projections.lock().await;
+    assert_eq!(remounted_projections.len(), 1);
+    let remounted_projection = Arc::clone(
+        remounted_projections
+            .values()
+            .next()
+            .expect("remounted projection"),
+    );
+    drop(remounted_projections);
+    assert!(!Arc::ptr_eq(&projection, &remounted_projection));
+    assert_eq!(remounted_projection.refs.load(Ordering::Acquire), 1);
+    assert!(
+        remounted_projection
+            .component_mount_ids
+            .iter()
+            .all(|mount_id| kernel.storage_mounts.contains_key(mount_id))
+    );
+    remounted.close_async().await;
+    assert_eq!(remounted_projection.refs.load(Ordering::Acquire), 0);
+    assert!(kernel.storage_mounts.is_empty());
     assert!(broker.projections.lock().await.is_empty());
 }
 

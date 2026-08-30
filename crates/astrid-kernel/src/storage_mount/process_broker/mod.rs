@@ -44,9 +44,8 @@ pub(crate) use projection_lifecycle::{
 pub(crate) use projection_lifecycle::{
     RetainedIssuePaths, blocked_projection_lease, cleanup_projection_state,
     cleanup_uncommitted_issue_lease_set, generate_parent_tokens, invalidate_unhealthy_projection,
-    projection_component_mount_ids, projection_leases_are_live, projection_mount,
-    retain_failed_issue_projection, retain_locked_projection, retry_failed_projection,
-    rollback_or_retain_failed_launch,
+    projection_component_mount_ids, projection_leases_are_live, retain_failed_issue_projection,
+    retain_locked_projection, retry_failed_projection, rollback_or_retain_failed_launch,
 };
 #[cfg(all(test, any(unix, windows)))]
 mod projection_identity_tests;
@@ -874,12 +873,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             Arc::clone(&self.projections),
             key.clone(),
         )
-        .await?;
-        Ok(projection_mount(
-            Arc::clone(&projection),
-            Arc::clone(&self.projections),
-            key,
-        ))
+        .await
     }
 }
 
