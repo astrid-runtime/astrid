@@ -205,6 +205,16 @@ pub fn validate_private_directory(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Validate a trusted regular executable without weakening its parent boundary.
+///
+/// Windows inspects the executable's own trusted-DACL policy in addition to
+/// every existing parent component. Unix retains the binary file-mode policy at
+/// the launch boundary.
+#[cfg(windows)]
+pub fn validate_trusted_file(path: &Path) -> io::Result<()> {
+    windows::validate_trusted_file(path)
+}
+
 /// Rename one filesystem entry with the strongest supported namespace
 /// durability for the host platform.
 ///

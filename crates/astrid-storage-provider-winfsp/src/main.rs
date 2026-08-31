@@ -43,8 +43,7 @@ struct MountRegistry {
     mounts: BTreeMap<String, MountRecord>,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     if arguments.as_slice() == [std::ffi::OsStr::new(DAEMON_ARGUMENT)] {
         #[cfg(windows)]
@@ -67,7 +66,17 @@ async fn main() {
         }
     }
 
-    let response = run().await;
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("{PROVIDER_NAME}: start provider runtime: {error:#}");
+            std::process::exit(2);
+        },
+    };
+    let response = runtime.block_on(run());
     match response {
         Ok(response) => {
             if serde_json::to_writer(std::io::stdout().lock(), &response).is_err() {

@@ -1,0 +1,551 @@
+name: Windows filesystem native
+
+on:
+  push:
+    branches: [main, stream-*, os/universal]
+    paths:
+      - '**.rs'
+      - 'scripts/install-windows.ps1'
+      - 'scripts/uninstall-windows.ps1'
+      - 'scripts/windows_release_manifest.py'
+      - 'scripts/test_windows_release_manifest.py'
+      - 'scripts/release_manifest.py'
+      - 'scripts/test_release_manifest.py'
+      - 'scripts/musl_release_manifest.py'
+      - 'scripts/test_musl_release_manifest.py'
+      - 'scripts/package_release_archive.py'
+      - 'scripts/test_validate_release_archive.py'
+      - 'scripts/validate_release_archive.py'
+      - 'scripts/build-macos-fskit.sh'
+      - 'scripts/check-macos-fskit.sh'
+      - 'scripts/manage-macos-fskit.sh'
+      - 'scripts/test_manage_macos_fskit.sh'
+      - 'scripts/validate-macos-fskit.sh'
+      - 'scripts/validate_macos_release.py'
+      - 'scripts/test_macos_release_packaging.py'
+      - 'scripts/test_v0104_linux_upgrade.sh'
+      - 'scripts/test_v0104_macos_upgrade.sh'
+      - 'scripts/ci/**'
+      - 'scripts/fixtures/windows-release-extension.toml'
+      - 'scripts/check_glibc.py'
+      - 'scripts/test_check_glibc.py'
+      - 'scripts/check_dco.py'
+      - 'scripts/test_check_dco.py'
+      - 'scripts/changelog.py'
+      - 'scripts/test_changelog.py'
+      - 'scripts/check_static_elf.py'
+      - 'scripts/test_check_static_elf.py'
+      - 'scripts/release_publication.py'
+      - 'scripts/test_release_publication.py'
+      - 'scripts/release_draft_recovery.py'
+      - 'scripts/test_release_draft_recovery.py'
+      - 'scripts/crate_publication.py'
+      - 'scripts/test_crate_publication.py'
+      - 'scripts/channel_metadata.py'
+      - 'scripts/test_channel_metadata.py'
+      - 'scripts/channel_publication.py'
+      - 'scripts/test_channel_publication.py'
+      - 'scripts/test_channel_workflow_contract.sh'
+      - 'scripts/*campaign_ci_triggers.py'
+      - 'scripts/*linked_issue.py'
+      - 'scripts/nightly_version.py'
+      - 'scripts/test_nightly_version.py'
+      - 'release/nightly.toml'
+      - 'crates/astrid-storage-provider-fskit/**'
+      - 'native/macos/**'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/native-storage-certification.yml'
+      - '.github/workflows/release.yml'
+      - '.github/workflows/windows-filesystem-native.yml'
+  pull_request:
+    branches: [main, os/universal]
+    paths:
+      - '**.rs'
+      - 'scripts/install-windows.ps1'
+      - 'scripts/uninstall-windows.ps1'
+      - 'scripts/windows_release_manifest.py'
+      - 'scripts/test_windows_release_manifest.py'
+      - 'scripts/release_manifest.py'
+      - 'scripts/test_release_manifest.py'
+      - 'scripts/musl_release_manifest.py'
+      - 'scripts/test_musl_release_manifest.py'
+      - 'scripts/package_release_archive.py'
+      - 'scripts/test_validate_release_archive.py'
+      - 'scripts/validate_release_archive.py'
+      - 'scripts/build-macos-fskit.sh'
+      - 'scripts/check-macos-fskit.sh'
+      - 'scripts/manage-macos-fskit.sh'
+      - 'scripts/test_manage_macos_fskit.sh'
+      - 'scripts/validate-macos-fskit.sh'
+      - 'scripts/validate_macos_release.py'
+      - 'scripts/test_macos_release_packaging.py'
+      - 'scripts/test_v0104_linux_upgrade.sh'
+      - 'scripts/test_v0104_macos_upgrade.sh'
+      - 'scripts/ci/**'
+      - 'scripts/fixtures/windows-release-extension.toml'
+      - 'scripts/check_glibc.py'
+      - 'scripts/test_check_glibc.py'
+      - 'scripts/check_dco.py'
+      - 'scripts/test_check_dco.py'
+      - 'scripts/changelog.py'
+      - 'scripts/test_changelog.py'
+      - 'scripts/check_static_elf.py'
+      - 'scripts/test_check_static_elf.py'
+      - 'scripts/release_publication.py'
+      - 'scripts/test_release_publication.py'
+      - 'scripts/release_draft_recovery.py'
+      - 'scripts/test_release_draft_recovery.py'
+      - 'scripts/crate_publication.py'
+      - 'scripts/test_crate_publication.py'
+      - 'scripts/channel_metadata.py'
+      - 'scripts/test_channel_metadata.py'
+      - 'scripts/channel_publication.py'
+      - 'scripts/test_channel_publication.py'
+      - 'scripts/test_channel_workflow_contract.sh'
+      - 'scripts/*campaign_ci_triggers.py'
+      - 'scripts/*linked_issue.py'
+      - 'scripts/nightly_version.py'
+      - 'scripts/test_nightly_version.py'
+      - 'release/nightly.toml'
+      - 'crates/astrid-storage-provider-fskit/**'
+      - 'native/macos/**'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/native-storage-certification.yml'
+      - '.github/workflows/release.yml'
+      - '.github/workflows/windows-filesystem-native.yml'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  windows-filesystem-native:
+    name: Windows filesystem native tests (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95"
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: windows-filesystem-${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Check the non-test kernel for the Windows target
+        shell: pwsh
+        run: cargo check --locked --target ${{ matrix.target }} -p astrid-kernel --lib
+
+      - name: Lint the non-test kernel for the Windows target
+        shell: pwsh
+        run: >-
+          cargo clippy --locked --target ${{ matrix.target }}
+          -p astrid-kernel --lib -- -D warnings
+
+      - name: Run the filesystem prerequisite tests natively
+        shell: pwsh
+        run: cargo test --locked --target ${{ matrix.target }} -p astrid-core platform_fs -- --nocapture
+
+      - name: Parse the Windows install scripts
+        shell: pwsh
+        run: |
+          $contents = @{}
+          foreach ($script in "scripts/install-windows.ps1", "scripts/uninstall-windows.ps1") {
+            $contents[$script] = Get-Content -LiteralPath $script -Raw
+            $null = [scriptblock]::Create($contents[$script])
+          }
+          foreach ($variable in "WinFspMsi", "WinFspSha256") {
+            $pattern = '(?m)^\${0} = "([^"]+)"\r?$' -f [regex]::Escape($variable)
+            $installPin = [regex]::Match($contents["scripts/install-windows.ps1"], $pattern)
+            $uninstallPin = [regex]::Match($contents["scripts/uninstall-windows.ps1"], $pattern)
+            if (-not $installPin.Success -or -not $uninstallPin.Success -or
+                $installPin.Groups[1].Value -ne $uninstallPin.Groups[1].Value) {
+              throw "Windows install and uninstall scripts disagree on $variable"
+            }
+          }
+
+      - name: Reject a tampered Windows uninstall marker
+        shell: pwsh
+        run: |
+          $install = Join-Path $env:RUNNER_TEMP "astrid-uninstall-marker-test"
+          New-Item -ItemType Directory -Path $install -Force | Out-Null
+          @{ product = "astrid"; winfsp_installed_by_astrid = $false; winfsp_installer = "..\outside.txt" } |
+            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $install "astrid-install.json")
+          $outside = Join-Path $env:RUNNER_TEMP "outside.txt"
+          Set-Content -LiteralPath $outside -Value "keep"
+          try {
+            & scripts/uninstall-windows.ps1 -InstallDir $install
+            throw "tampered uninstall marker was accepted"
+          } catch {
+            if ($_.Exception.Message -eq "tampered uninstall marker was accepted") { throw }
+          }
+          if (-not (Test-Path -LiteralPath $outside -PathType Leaf)) {
+            throw "tampered uninstall marker removed an external file"
+          }
+
+      - name: Reject a tampered cached WinFsp installer
+        shell: pwsh
+        run: |
+          $install = Join-Path $env:RUNNER_TEMP "astrid-uninstall-msi-test"
+          New-Item -ItemType Directory -Path $install -Force | Out-Null
+          @{ product = "astrid"; winfsp_installed_by_astrid = $true; winfsp_installer = "winfsp-2.1.25156.msi" } |
+            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $install "astrid-install.json")
+          $msi = Join-Path $install "winfsp-2.1.25156.msi"
+          Set-Content -LiteralPath $msi -Value "not the pinned WinFsp installer"
+          try {
+            & scripts/uninstall-windows.ps1 -InstallDir $install -RemoveWinFsp
+            throw "tampered cached WinFsp installer was accepted"
+          } catch {
+            if ($_.Exception.Message -eq "tampered cached WinFsp installer was accepted") { throw }
+            if ($_.Exception.Message -notlike "Cached WinFsp installer digest mismatch:*") { throw }
+          }
+          if (-not (Test-Path -LiteralPath $msi -PathType Leaf) -or
+              -not (Test-Path -LiteralPath (Join-Path $install "astrid-install.json") -PathType Leaf)) {
+            throw "tampered MSI rejection mutated the installation"
+          }
+
+      - name: Install pinned WinFsp runtime
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP "winfsp-2.1.25156.msi"
+          Invoke-WebRequest `
+            -Uri "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi" `
+            -OutFile $msi
+          $hash = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash
+          if ($hash -ne "073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A") {
+            throw "WinFsp MSI digest mismatch: $hash"
+          }
+          $exitCode = (Start-Process -FilePath "msiexec.exe" `
+            -ArgumentList @("/i", "`"$msi`"", "ADDLOCAL=F.Developer", "/qn", "/norestart") `
+            -Wait -PassThru).ExitCode
+          if ($exitCode -ne 0 -and $exitCode -ne 3010) {
+            throw "WinFsp installation failed with exit code $exitCode"
+          }
+          $importLibrary = Join-Path ${env:ProgramFiles(x86)} "WinFsp\lib\winfsp-x64.lib"
+          if (-not (Test-Path -LiteralPath $importLibrary -PathType Leaf)) {
+            throw "WinFsp Developer import library was not installed: $importLibrary"
+          }
+          $registry = Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\WOW6432Node\WinFsp" -ErrorAction Stop
+          if ([string]::IsNullOrWhiteSpace($registry.InstallDir)) {
+            throw "WinFsp installation did not publish InstallDir"
+          }
+          $runtimeLibrary = Join-Path $registry.InstallDir "bin\winfsp-x64.dll"
+          if (-not (Test-Path -LiteralPath $runtimeLibrary -PathType Leaf)) {
+            throw "WinFsp x64 runtime DLL was not installed: $runtimeLibrary"
+          }
+
+      - name: Lint the Windows provider
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: >-
+          cargo clippy --locked --target ${{ matrix.target }}
+          -p astrid-storage-provider-winfsp --all-targets -- -D warnings
+
+      - name: Lint the Windows CLI updater
+        shell: pwsh
+        run: >-
+          cargo clippy --locked --target ${{ matrix.target }} -p astrid
+          --bin astrid -- -D warnings
+
+      - name: Run portable WinFsp provider tests natively
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: cargo test --locked --target ${{ matrix.target }} -p astrid-storage-provider-winfsp -- --nocapture
+
+      - name: Run Windows updater tests natively
+        shell: pwsh
+        run: >-
+          cargo test --locked --target ${{ matrix.target }} -p astrid
+          --bin astrid commands::self_update -- --nocapture
+
+      - name: Run local transport security tests natively
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: >-
+          cargo test --locked --target ${{ matrix.target }} -p astrid-core
+          local_transport -- --nocapture --test-threads=1
+
+      - name: Run storage callback transport tests in trusted staging
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          cargo build --locked --target ${{ matrix.target }} -p astrid-storage-provider-winfsp
+          $provider = "target/${{ matrix.target }}/debug/astrid-storage-provider-winfsp.exe"
+          $messages = @(& cargo test --locked --message-format=json-render-diagnostics --target ${{ matrix.target }} -p astrid-kernel --lib storage_mount --no-run 2>&1)
+          $cargoExit = $LASTEXITCODE
+          $parsedMessages = foreach ($message in $messages) {
+            $artifact = $null
+            try {
+              $artifact = ([string]$message) | ConvertFrom-Json -ErrorAction Stop
+            } catch {
+              if ($cargoExit -ne 0) {
+                Write-Host ([string]$message)
+              }
+              continue
+            }
+            $artifact
+          }
+          if ($cargoExit -ne 0) {
+            foreach ($artifact in @($parsedMessages | Where-Object { $_.reason -eq "compiler-message" })) {
+              $rendered = [string]$artifact.message.rendered
+              if ($rendered) {
+                Write-Host $rendered
+              }
+            }
+            exit $cargoExit
+          }
+          $artifacts = foreach ($artifact in $parsedMessages) {
+            if ($artifact.reason -eq "compiler-artifact" -and
+                $artifact.profile.test -eq $true -and
+                $artifact.target.name -eq "astrid_kernel" -and
+                $artifact.target.kind -contains "lib" -and
+                $artifact.executable) {
+              $artifact
+            }
+          }
+          $executables = @($artifacts | Where-Object { $_.executable })
+          if ($executables.Count -ne 1) {
+            throw "expected exactly one astrid_kernel storage_mount executable, found $($executables.Count)"
+          }
+          $testExecutable = (Get-Item -LiteralPath $executables[0].executable).FullName
+          if (-not (Test-Path -LiteralPath $testExecutable -PathType Leaf)) {
+            throw "the Cargo-reported storage_mount executable is not a file: $testExecutable"
+          }
+          if (-not (Test-Path -LiteralPath $provider -PathType Leaf)) {
+            throw "the exact Windows process storage provider was not built"
+          }
+          $stage = Join-Path $env:RUNNER_TEMP ([System.IO.Path]::GetRandomFileName())
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          & icacls.exe $stage /inheritance:r /grant:r `
+            "*$($userSid):(OI)(CI)F" `
+            "*S-1-5-18:(OI)(CI)F" `
+            "*S-1-5-32-544:(OI)(CI)F"
+          if ($LASTEXITCODE -ne 0) {
+            throw "failed to restrict the process storage staging DACL"
+          }
+          $acl = Get-Acl -LiteralPath $stage
+          if (-not $acl.AreAccessRulesProtected) {
+            throw "the process storage staging DACL is not protected"
+          }
+          $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+          $trustedSids = @($userSid, "S-1-5-18", "S-1-5-32-544")
+          if ($trustedSids -notcontains $ownerSid) {
+            throw "the process storage staging owner is untrusted: $ownerSid"
+          }
+          $rules = @($acl.Access)
+          if ($rules.Count -ne $trustedSids.Count) {
+            throw "the process storage staging DACL has unexpected ACEs"
+          }
+          $actualRules = foreach ($rule in $rules) {
+            [pscustomobject]@{
+              Sid = $rule.IdentityReference.Translate(
+                [System.Security.Principal.SecurityIdentifier]
+              ).Value
+              Type = [string]$rule.AccessControlType
+              Rights = [string]$rule.FileSystemRights
+              Inheritance = [string]$rule.InheritanceFlags
+              Propagation = [string]$rule.PropagationFlags
+              Inherited = [bool]$rule.IsInherited
+            }
+          }
+          foreach ($sid in $trustedSids) {
+            $matchingRules = @($actualRules | Where-Object {
+                $_.Sid -eq $sid -and
+                $_.Type -eq "Allow" -and
+                $_.Rights -eq "FullControl" -and
+                $_.Inheritance -eq "ContainerInherit, ObjectInherit" -and
+                $_.Propagation -eq "None" -and
+                -not $_.Inherited
+              })
+            if ($matchingRules.Count -ne 1) {
+              throw "the process storage staging DACL must contain exactly one trusted full-control ACE for $sid"
+            }
+          }
+          $stagedProvider = Join-Path $stage (Split-Path -Leaf $provider)
+          $stagedTestExecutable = Join-Path $stage (Split-Path -Leaf $testExecutable)
+          $sourceProviderHash = (Get-FileHash -LiteralPath $provider -Algorithm SHA256).Hash
+          Copy-Item -LiteralPath $provider -Destination $stagedProvider
+          Copy-Item -LiteralPath $testExecutable -Destination $stagedTestExecutable
+          $stagedProviderHash = (Get-FileHash -LiteralPath $stagedProvider -Algorithm SHA256).Hash
+          if ($stagedProviderHash -ne $sourceProviderHash) {
+            throw "the staged provider identity does not match the built provider"
+          }
+          $providerParent = (Get-Item -LiteralPath $stagedProvider).DirectoryName
+          $testParent = (Get-Item -LiteralPath $stagedTestExecutable).DirectoryName
+          if ($providerParent -ne $testParent) {
+            throw "the staged provider and test executable are not adjacent"
+          }
+          Get-Item -LiteralPath $stagedProvider, $stagedTestExecutable |
+            Select-Object FullName, Length
+          $env:ASTRID_PROCESS_PROVIDER_TESTS = "1"
+          $harnessArguments = @{
+            TestExecutable = $stagedTestExecutable
+            Provider = $stagedProvider
+            TestFilter = "storage_mount"
+            AggregateTimeoutSeconds = 600
+            DiagnosticTimeoutSeconds = 120
+            ListTimeoutSeconds = 60
+            TeardownTimeoutSeconds = 30
+            HeartbeatSeconds = 30
+          }
+          $argumentStage = Join-Path $env:RUNNER_TEMP (
+            "astrid-storage-argument-selftest-" + [System.IO.Path]::GetRandomFileName()
+          )
+          New-Item -ItemType Directory -Path $argumentStage -Force | Out-Null
+          $argumentRecord = Join-Path $argumentStage "arguments.txt"
+          $argumentChild = Join-Path $argumentStage "storage-mount-selftest.cmd"
+          @(
+            "@echo off"
+            "if exist `"$argumentRecord`" del `"$argumentRecord`" >nul 2>&1"
+            ":record"
+            "if `"%~1`"==`"`" goto :respond"
+            ">> `"$argumentRecord`" echo ARG=%~1"
+            "shift"
+            "goto :record"
+            ":respond"
+            "if `"%SELFTEST_ARGUMENT_MODE%`"==`"List`" ("
+            "  echo storage_mount::first: test"
+            "  echo storage_mount::second: test"
+            "  exit /b 0"
+            ")"
+            "echo test storage_mount::first ... ok"
+            "echo test storage_mount::second ... ok"
+            "if `"%SELFTEST_ARGUMENT_MODE%`"==`"Exit7`" exit /b 7"
+            "exit /b %SELFTEST_CHILD_EXIT%"
+          ) | Set-Content -LiteralPath $argumentChild -Encoding Ascii
+
+          function Invoke-ArgumentChild {
+            param([string]$Mode, [array]$Expected, [int]$ChildExit)
+            $env:SELFTEST_ARGUMENT_MODE = $Mode
+            $env:SELFTEST_CHILD_EXIT = "$ChildExit"
+            $stdout = Join-Path $argumentStage "$Mode.stdout.log"
+            $stderr = Join-Path $argumentStage "$Mode.stderr.log"
+            Remove-Item -LiteralPath $argumentRecord, $stdout, $stderr -Force -ErrorAction SilentlyContinue
+            $process = Start-Process -FilePath $argumentChild -ArgumentList $Expected `
+              -WorkingDirectory $argumentStage -RedirectStandardOutput $stdout `
+              -RedirectStandardError $stderr -NoNewWindow -PassThru
+            if (-not $process.WaitForExit($ListTimeoutSeconds * 1000)) {
+              throw "the $Mode argument self-test child timed out"
+            }
+            $record = @(Get-Content -LiteralPath $argumentRecord | Where-Object { $_ -like "ARG=*" } |
+              ForEach-Object { $_.Substring(4) })
+            if ($record.Count -ne $Expected.Count) {
+              throw "the $Mode argument self-test record length differed"
+            }
+            for ($index = 0; $index -lt $Expected.Count; $index++) {
+              if ($record[$index] -cne $Expected[$index]) {
+                throw "the $Mode argument self-test differed at argument $index"
+              }
+            }
+            if ($process.ExitCode -ne $ChildExit) {
+              throw "the $Mode argument self-test exited $($process.ExitCode), expected $ChildExit"
+            }
+            return $stdout
+          }
+
+          $listArguments = @(& scripts/ci/run-windows-storage-mount.ps1 @harnessArguments `
+            -EmitLibTestArguments List | ConvertFrom-Json)
+          $listOutput = Invoke-ArgumentChild -Mode List -Expected $listArguments -ChildExit 0
+          $listNames = @(Get-Content -LiteralPath $listOutput | Where-Object { $_ -match ": test$" })
+          if ($listNames.Count -eq 0) { throw "the argument self-test list was empty" }
+          if ([regex]::Matches((Get-Content -LiteralPath $listOutput -Raw), '(?m)^test\s+.+\.\.\.\s+(?:ok|FAILED|ignored)')) {
+            throw "the argument self-test list executed a test"
+          }
+          $aggregateArguments = @(& scripts/ci/run-windows-storage-mount.ps1 @harnessArguments `
+            -EmitLibTestArguments Aggregate | ConvertFrom-Json)
+          $aggregateOutput = Invoke-ArgumentChild -Mode Aggregate -Expected $aggregateArguments -ChildExit 0
+          $aggregateNames = @([regex]::Matches(
+            (Get-Content -LiteralPath $aggregateOutput -Raw),
+            '(?m)^test\s+(?<name>.+?)\s+\.\.\.\s+(?:ok|FAILED|ignored)\s*(?:\r|$)'
+          ) | ForEach-Object { $_.Groups["name"].Value } | Sort-Object -Unique)
+          $expectedNames = @($listNames | ForEach-Object { ($_ -split ": test$")[0] } | Sort-Object -Unique)
+          if (($aggregateNames -join "`n") -cne ($expectedNames -join "`n")) {
+            throw "the aggregate argument self-test differed from the listed tests"
+          }
+          $null = Invoke-ArgumentChild -Mode Exit7 -Expected $aggregateArguments -ChildExit 7
+          Remove-Item Env:SELFTEST_ARGUMENT_MODE, Env:SELFTEST_CHILD_EXIT -ErrorAction SilentlyContinue
+          Write-Host "direct libtest argument self-test passed"
+
+          & scripts/ci/run-windows-storage-mount.ps1 @harnessArguments -SelfTest
+          $selfTestExit = $LASTEXITCODE
+          if ($selfTestExit -ne 0) { exit $selfTestExit }
+          & scripts/ci/run-windows-storage-mount.ps1 @harnessArguments
+          $harnessExit = $LASTEXITCODE
+          exit $harnessExit
+
+      - name: Run the native WinFsp filesystem round trip
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        env:
+          ASTRID_WINFSP_NATIVE_TEST: "1"
+        shell: pwsh
+        run: >-
+          cargo test --locked --target ${{ matrix.target }}
+          -p astrid-storage-provider-winfsp -- --nocapture --test-threads=1
+
+      - name: Run layout migration policy tests natively
+        shell: pwsh
+        run: cargo test --locked --target ${{ matrix.target }} -p astrid-core dirs::tests -- --nocapture
+
+      - name: Check the typed storage-provider handoff natively
+        shell: pwsh
+        run: >-
+          cargo test
+          --locked
+          --target ${{ matrix.target }}
+          -p astrid
+          --bin astrid
+          commands::storage::tests
+          --
+          --nocapture
+
+      - name: Run fresh runtime signing provisioning natively
+        shell: pwsh
+        run: >-
+          cargo test
+          --locked
+          --target ${{ matrix.target }}
+          -p astrid-build
+          runtime_signing
+          --
+          --nocapture
+
+      - name: Run fresh capsule-install provisioning natively
+        shell: pwsh
+        run: >-
+          cargo test
+          --locked
+          --target ${{ matrix.target }}
+          -p astrid-capsule-install
+          --test install
+          fresh_private_windows_home
+          --
+          --nocapture

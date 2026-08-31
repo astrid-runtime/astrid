@@ -7,7 +7,7 @@ use std::process::Stdio;
 use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, NO_PROPAGATE_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION,
-    UNPROTECTED_DACL_SECURITY_INFORMATION, WinWorldSid,
+    WinWorldSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{FILE_ALL_ACCESS, FILE_GENERIC_READ};
 
@@ -25,6 +25,12 @@ use crate::session_token::SessionToken;
 
 #[path = "tests/authority.rs"]
 mod authority_tests;
+#[path = "tests/trusted_file.rs"]
+mod trusted_file_tests;
+#[path = "tests/world_acl.rs"]
+mod world_acl;
+
+use world_acl::{set_world_entry, set_world_entry_with_flags};
 
 static NATIVE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -132,45 +138,6 @@ fn abort_private_write(file: &Path) {
             .join(PRIVATE_FILE_TRANSACTION_JOURNAL)
             .exists()
     );
-}
-
-fn set_world_entry(path: &Path, mask: u32, protected: bool) {
-    set_world_entry_with_flags(path, mask, protected, 0);
-}
-
-fn set_world_entry_with_flags(path: &Path, mask: u32, protected: bool, inheritance: u32) {
-    let world = WellKnownSid::get(WinWorldSid).unwrap();
-    let mut entries = [explicit_access(
-        world.as_ptr(),
-        TRUSTEE_IS_WELL_KNOWN_GROUP,
-        inheritance,
-    )];
-    entries[0].grfAccessPermissions = mask;
-    let mut acl: *mut ACL = null_mut();
-    // SAFETY: the entry owns a live world SID and the out pointer is valid.
-    let status = unsafe { SetEntriesInAclW(1, entries.as_mut_ptr(), null(), &raw mut acl) };
-    assert_eq!(status, ERROR_SUCCESS);
-    let allocation = LocalAllocation(acl.cast());
-    let mut wide = wide_path(path).unwrap();
-    let protection = if protected {
-        PROTECTED_DACL_SECURITY_INFORMATION
-    } else {
-        UNPROTECTED_DACL_SECURITY_INFORMATION
-    };
-    // SAFETY: path and ACL are live for the call.
-    let status = unsafe {
-        SetNamedSecurityInfoW(
-            wide.as_mut_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | protection,
-            null_mut(),
-            null_mut(),
-            acl,
-            null(),
-        )
-    };
-    drop(allocation);
-    assert_eq!(status, ERROR_SUCCESS);
 }
 
 fn set_required_directory_acl_flags(path: &Path, extra_flags: u32) {
