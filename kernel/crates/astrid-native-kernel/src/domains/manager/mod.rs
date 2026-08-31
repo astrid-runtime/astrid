@@ -13,6 +13,7 @@ use x86_64::registers::control::{Cr3, Cr3Flags};
 #[cfg(not(test))]
 use x86_64::structures::paging::{PhysFrame, Size4KiB};
 
+pub(in crate::domains) use self::control::DomainControl;
 #[cfg(not(test))]
 use super::paging::AddressSpace;
 use super::stop::{DomainStop, HostManifestIdentity};
@@ -144,6 +145,7 @@ pub struct Domain {
     pub(super) space: Option<()>,
     pub(super) ipc_enabled: bool,
     pub(super) stop: DomainStop,
+    pub(super) control: DomainControl,
 }
 
 #[derive(Default)]
@@ -411,6 +413,7 @@ pub fn prepare(
                 | Scenario::IpcCancelGuest
         ),
         stop: DomainStop::inactive(),
+        control: DomainControl::inactive(),
     });
     let handle = DomainHandle::new(
         super::types::DomainId(slot as u64),
@@ -480,6 +483,7 @@ pub fn peer_is_prepared(handle: DomainHandle) -> bool {
         })
 }
 
+mod control;
 mod start;
 #[cfg(test)]
 mod stop_tests;
@@ -489,6 +493,10 @@ mod trap;
 #[cfg(not(test))]
 pub use trap::handle_domain_trap;
 
+#[cfg(not(test))]
+pub(in crate::domains) use control::{
+    request_returned_stop, stage_returning_trap, switch_to_return,
+};
 pub(super) use start::StartContext;
 #[cfg(not(test))]
 pub(super) use start::{enter_running, stage_context, staged_state, start_running};
@@ -566,6 +574,7 @@ pub fn generation_overflow_rejects_prepare(raw: &[u8], expected: ContentId) -> b
             space: None,
             ipc_enabled: false,
             stop: DomainStop::inactive(),
+            control: DomainControl::inactive(),
         });
     }
     let rejected = matches!(
@@ -600,6 +609,7 @@ impl Manager {
             .then_some(domain)
     }
 
+    #[cfg(test)]
     pub(in crate::domains) fn take_running_stop(
         &mut self,
         handle: DomainHandle,

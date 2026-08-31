@@ -1,6 +1,6 @@
 //! Host falsifiers for the private stop lifecycle state machine.
 
-use super::super::manager::{Domain, DomainState, MANAGER};
+use super::super::manager::{Domain, DomainControl, DomainState, MANAGER};
 use super::super::types::{DomainGeneration, DomainHandle, DomainId, Scenario};
 use super::{StopError, StopLifecycle};
 use astrid_system_generation::ContentId;
@@ -70,6 +70,7 @@ fn installed_armed_with_state(
         space: None,
         ipc_enabled: false,
         stop,
+        control: DomainControl::inactive(),
     });
     manager
 }

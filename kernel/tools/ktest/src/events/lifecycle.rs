@@ -52,7 +52,6 @@ const DOMAIN_REGISTERS: &[(u64, u64, u64)] = &[
     (2, 3, 0),
     (2, 4, 0),
     (1, 9, 0),
-    (1, 10, 11),
 ];
 const STOP_DOMAIN: (u64, u64) = (1, 10);
 const DOMAIN_RECLAIMS: &[(u64, u64)] = &[
@@ -91,7 +90,7 @@ const DOMAIN_OUTCOMES: &[(u64, u64, &str, u64, u64, &str, u64)] = &[
     (1, 9, "clean_exit", 3, 0, "0x0", 3),
     (1, 10, "cancelled", 32, 0, "0x0", 3),
 ];
-const STOP_TAKEN: &[(u64, u64, u64, u64)] = &[(1, 10, 32, 3)];
+const STOP_TAKEN: &[(u64, u64, u64, u64)] = &[(1, 10, 32, 0)];
 pub(crate) const HOSTILE_IPC_FAULT_ADDRESS: &str = "0x328000002000";
 const IPC_RECLAIMS: &[(u64, u64, u64, u64, u64)] = &[
     (2, 3, 1, 0, 0),
@@ -248,6 +247,24 @@ pub(super) fn domain_lifecycle_holds(events: &[Value]) -> bool {
             )
         })
         .eq(STOP_TAKEN.iter().copied());
+    let control_returned_ok = exact_pairs(
+        events,
+        "domain.control.returned",
+        "id",
+        "generation",
+        &[STOP_DOMAIN],
+    ) && named_events(events, "domain.control.returned")
+        .into_iter()
+        .all(|event| {
+            u64_field(event, "cpl") == Some(3) && bool_field(event, "terminal") == Some(false)
+        });
+    let control_requested_ok = exact_pairs(
+        events,
+        "domain.stop.request",
+        "id",
+        "generation",
+        &[STOP_DOMAIN],
+    );
     let stop_tail_ok = all_bools(events, "domain.stop.relation-retired", "ok", true)
         && all_bools(events, "domain.stop.admission-released", "ok", true)
         && all_bools(events, "domain.stop.completed", "ok", true)
@@ -396,7 +413,11 @@ pub(super) fn domain_lifecycle_holds(events: &[Value]) -> bool {
         "exact running-stop staging and arming",
         stop_staged_ok && stop_armed_ok,
     );
-    ok &= check("exact qualifying timer-stop consumption", stop_taken_ok);
+    ok &= check(
+        "exact returned-control quiescence and request",
+        control_returned_ok && control_requested_ok,
+    );
+    ok &= check("exact returned-stop consumption", stop_taken_ok);
     ok &= check("running-stop terminal completion order", stop_tail_ok);
     ok &= check("exact reclaim generations and accounting", reclaims_ok);
     ok &= check("restores accompany every reclaim", restores_ok);

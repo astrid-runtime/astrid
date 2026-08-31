@@ -125,8 +125,9 @@ const IPC_CANCEL_GUEST_TAIL_EVENTS: &[&str] = &[
     "domain.reclaim",
 ];
 const RUNNING_STOP_TAIL_EVENTS: &[&str] = &[
+    "domain.control.returned",
+    "domain.stop.request",
     "domain.stop.taken",
-    "domain.registers",
     "domain.outcome",
     "domain.stop.relation-retired",
     "domain.restore",

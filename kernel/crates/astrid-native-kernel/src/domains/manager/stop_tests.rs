@@ -1,5 +1,5 @@
 use super::{ADMISSION_RELEASES, RELATION_RELEASE_FAILURE, ReclaimStats, SPACE_RELEASE_FAILURE};
-use super::{Domain, DomainState, DomainStop, Manager, Scenario};
+use super::{Domain, DomainControl, DomainState, DomainStop, Manager, Scenario};
 use crate::domains::types::{DomainGeneration, DomainHandle, DomainId};
 use crate::ipc::{DomainToken, prepare_domain};
 use astrid_system_generation::ContentId;
@@ -44,6 +44,7 @@ fn install_taken_domain(space: Option<()>) -> spin::MutexGuard<'static, Manager>
         space,
         ipc_enabled: false,
         stop,
+        control: DomainControl::inactive(),
     });
     manager.used_frames = 3;
     manager
@@ -276,6 +277,7 @@ fn same_slot_fresh_generation_hides_old_completed_observation() {
         space: None,
         ipc_enabled: false,
         stop: completed_stop(handle(), old_component),
+        control: DomainControl::inactive(),
     });
 
     assert!(
@@ -293,6 +295,7 @@ fn same_slot_fresh_generation_hides_old_completed_observation() {
         space: None,
         ipc_enabled: false,
         stop: completed_stop(fresh, fresh_component),
+        control: DomainControl::inactive(),
     });
     assert!(
         manager

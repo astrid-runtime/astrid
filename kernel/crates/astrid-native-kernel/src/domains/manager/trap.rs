@@ -98,15 +98,6 @@ fn handle_ipc_syscall(frame: &mut TrapFrame) -> Option<bool> {
     }
 }
 
-fn take_running_stop_trap(frame: &TrapFrame, vector: u8, fault_address: u64) -> ! {
-    let handle = super::super::wait::current_handle();
-    super::super::stop::take_timer_trap(handle);
-    apic::mask_timer();
-    apic::eoi();
-    serial::ev_stop_taken(handle.id().0 + 1, handle.generation().0, u64::from(vector));
-    stage_terminal(frame, fault_address, Outcome::Cancelled);
-}
-
 fn ipc_cancel_guest_resume(frame: &mut TrapFrame) -> Option<()> {
     let scenario = CURRENT.scenario.load(Ordering::SeqCst);
     if frame.vector == 6
@@ -211,7 +202,11 @@ pub fn handle_domain_trap(frame: &mut TrapFrame, fault_address: u64) -> bool {
         return true;
     }
     if vector == apic::TIMER_VECTOR && scenario == Scenario::RunningStop.value() {
-        take_running_stop_trap(frame, vector, fault_address);
+        super::stage_returning_trap(frame).unwrap_or_else(|error| fail_terminal(error.as_reason()));
+        apic::mask_timer();
+        apic::eoi();
+        let _ = (vector, fault_address);
+        super::switch_to_return(super::resume_stack_end());
     }
     if vector == apic::TIMER_VECTOR && scenario >= Scenario::IpcServer.value() {
         // The landed #1704 dispatch is byte-frozen and has no path for the

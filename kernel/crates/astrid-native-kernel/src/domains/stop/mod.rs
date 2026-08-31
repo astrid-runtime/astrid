@@ -6,7 +6,7 @@ use astrid_system_generation::ContentId;
 use astrid_system_generation::ManifestIdentity;
 
 #[cfg(not(test))]
-use super::manager::{CURRENT, MANAGER, fail_terminal};
+use super::manager::{CURRENT, MANAGER};
 #[cfg(not(test))]
 use crate::serial;
 
@@ -179,6 +179,17 @@ where
     G: Copy + PartialEq,
     C: Copy + PartialEq,
 {
+    pub(in crate::domains) fn exact_component(
+        &self,
+        handle: DomainHandle,
+        scenario: Scenario,
+    ) -> Option<C> {
+        let Self::Armed(ticket) = self else {
+            return None;
+        };
+        (ticket.handle == handle && ticket.scenario == scenario).then_some(ticket.component_id)
+    }
+
     pub(crate) const fn inactive() -> Self {
         Self::Inactive
     }
@@ -283,30 +294,6 @@ where
             Self::Aborted(ticket)
         };
         Ok(())
-    }
-}
-
-#[cfg(not(test))]
-pub(crate) fn take_timer_trap(handle: DomainHandle) {
-    let scenario = Scenario::try_from(CURRENT.scenario.load(core::sync::atomic::Ordering::SeqCst))
-        .unwrap_or_else(|_| fail_terminal("stop_scenario_invalid"));
-    let root = CURRENT.root.load(core::sync::atomic::Ordering::SeqCst);
-    let flags = CURRENT
-        .root_flags
-        .load(core::sync::atomic::Ordering::SeqCst);
-    let (current_root, current_flags) = x86_64::registers::control::Cr3::read();
-    if handle != super::wait::current_handle()
-        || scenario != Scenario::RunningStop
-        || current_root.start_address().as_u64() != root
-        || current_flags.bits() != flags
-    {
-        fail_terminal("stop_trap_context_mismatch");
-    }
-    {
-        let mut manager = MANAGER.lock();
-        if manager.take_running_stop(handle, scenario).is_err() {
-            fail_terminal("stop_take_rejected");
-        }
     }
 }
 
