@@ -68,7 +68,7 @@ impl BlockingWorkerTestGate {
         }
     }
 
-    pub(super) fn run_worker(&self, publish_join_failure: impl FnOnce()) {
+    pub(super) fn run_worker(&self) {
         let (release_tx, release_rx) = mpsc::sync_channel(0);
         self.release_txs
             .lock()
@@ -82,11 +82,6 @@ impl BlockingWorkerTestGate {
             .panic_on_release
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            // Publish authoritative lease state before waking the test
-            // observer. Without this barrier, the prior hosted schedule can
-            // start the retry after `failed` while the outer task has not yet
-            // observed and classified the panic.
-            publish_join_failure();
             let _ = self.failed_tx.send(());
             panic!("filesystem worker failed after revocation");
         }

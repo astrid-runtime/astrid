@@ -188,6 +188,16 @@ async fn panicking_filesystem_worker_remains_a_retryable_drain_failure() {
     gate.arm_panic_on_release();
     gate.release_workers();
     gate.wait_failed(1);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        state.wait_join_failure_publication_for_test(),
+    )
+    .await
+    .expect("the production panic classifier must publish JoinFailed");
+    assert!(
+        state.join_failure_is_published_for_test(),
+        "the production classifier must own authoritative JoinFailed publication"
+    );
     let revoke_kernel = Arc::clone(&kernel);
     let revoke_caller = caller.clone();
     let revocation =
