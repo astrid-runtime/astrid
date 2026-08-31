@@ -802,7 +802,7 @@ static CHILD_SUBREAPER_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(target_os = "linux")]
 struct TestChildSubreaper {
-    serialization: std::sync::MutexGuard<'static, ()>,
+    _serialization: std::sync::MutexGuard<'static, ()>,
     previous: Option<bool>,
 }
 
@@ -819,7 +819,7 @@ impl TestChildSubreaper {
         nix::sys::prctl::set_child_subreaper(true)
             .expect("make test process the detached-PID subreaper");
         Self {
-            serialization,
+            _serialization: serialization,
             previous: Some(previous),
         }
     }
