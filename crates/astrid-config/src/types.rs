@@ -11,6 +11,9 @@ use std::collections::HashMap;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 
+/// Provider teardown remains bounded even when every phase is slowed.
+pub(crate) const MAX_PROCESS_STOP_PHASE_SECS: u64 = 60;
+
 // ---------------------------------------------------------------------------
 // Top-level Config
 // ---------------------------------------------------------------------------
@@ -775,6 +778,15 @@ pub struct TimeoutsSection {
     /// instead of SIGKILL. Unlike `idle_secs` / `approval_secs`, workspace
     /// config may raise this value.
     pub daemon_ready_secs: u64,
+    /// Maximum wait for a process-storage provider STOP acknowledgement. The
+    /// hard ceiling is 60 seconds; workspace config can only tighten it.
+    pub process_stop_ack_secs: u64,
+    /// Grace before an unresponsive process-storage provider is killed. The
+    /// hard ceiling is 60 seconds; workspace config can only tighten it.
+    pub process_reap_grace_secs: u64,
+    /// Maximum wait to reap a process-storage provider after it is killed. The
+    /// hard ceiling is 60 seconds; workspace config can only tighten it.
+    pub process_killed_reap_secs: u64,
 }
 
 impl Default for TimeoutsSection {
@@ -789,6 +801,9 @@ impl Default for TimeoutsSection {
             // 10 minutes: layout-1 audit import on a multi-principal home
             // exceeds the old hardcoded 60s CLI killer.
             daemon_ready_secs: std::time::Duration::from_mins(10).as_secs(),
+            process_stop_ack_secs: 10,
+            process_reap_grace_secs: 10,
+            process_killed_reap_secs: 10,
         }
     }
 }

@@ -216,6 +216,24 @@ fn validate_servers(config: &Config) -> ConfigResult<()> {
 
 fn validate_timeouts(config: &Config) -> ConfigResult<()> {
     let t = &config.timeouts;
+    let bounded_stop_phase = |field: &'static str, value: u64| -> ConfigResult<()> {
+        if value == 0 {
+            return Err(ConfigError::ValidationError {
+                field: format!("timeouts.{field}"),
+                message: format!("{field} must be greater than 0"),
+            });
+        }
+        if value > super::types::MAX_PROCESS_STOP_PHASE_SECS {
+            return Err(ConfigError::ValidationError {
+                field: format!("timeouts.{field}"),
+                message: format!(
+                    "{field} must not exceed {} seconds",
+                    super::types::MAX_PROCESS_STOP_PHASE_SECS
+                ),
+            });
+        }
+        Ok(())
+    };
 
     if t.request_secs == 0 {
         return Err(ConfigError::ValidationError {
@@ -258,6 +276,10 @@ fn validate_timeouts(config: &Config) -> ConfigResult<()> {
             message: "daemon_ready_secs must be greater than 0".to_owned(),
         });
     }
+
+    bounded_stop_phase("process_stop_ack_secs", t.process_stop_ack_secs)?;
+    bounded_stop_phase("process_reap_grace_secs", t.process_reap_grace_secs)?;
+    bounded_stop_phase("process_killed_reap_secs", t.process_killed_reap_secs)?;
 
     Ok(())
 }
@@ -566,6 +588,45 @@ mod tests {
         let mut config = Config::default();
         config.timeouts.daemon_ready_secs = 0;
         assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_invalid_process_stop_timeout_zero() {
+        for field in [
+            "process_stop_ack_secs",
+            "process_reap_grace_secs",
+            "process_killed_reap_secs",
+        ] {
+            let mut config = Config::default();
+            match field {
+                "process_stop_ack_secs" => config.timeouts.process_stop_ack_secs = 0,
+                "process_reap_grace_secs" => config.timeouts.process_reap_grace_secs = 0,
+                "process_killed_reap_secs" => config.timeouts.process_killed_reap_secs = 0,
+                _ => unreachable!("test timeout field"),
+            }
+            assert!(validate(&config).is_err(), "zero {field} must be rejected");
+        }
+    }
+
+    #[test]
+    fn test_invalid_process_stop_timeout_above_hard_ceiling() {
+        for field in [
+            "process_stop_ack_secs",
+            "process_reap_grace_secs",
+            "process_killed_reap_secs",
+        ] {
+            let mut config = Config::default();
+            match field {
+                "process_stop_ack_secs" => config.timeouts.process_stop_ack_secs = 61,
+                "process_reap_grace_secs" => config.timeouts.process_reap_grace_secs = 61,
+                "process_killed_reap_secs" => config.timeouts.process_killed_reap_secs = 61,
+                _ => unreachable!("test timeout field"),
+            }
+            assert!(
+                validate(&config).is_err(),
+                "{field} above the hard ceiling must be rejected"
+            );
+        }
     }
 
     #[test]

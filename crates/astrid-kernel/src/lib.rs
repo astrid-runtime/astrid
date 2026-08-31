@@ -370,7 +370,10 @@ pub struct Kernel {
     /// Linearizes read-modify-publish filesystem mutations across all native
     /// mounts so concurrent views cannot lose non-overlapping writes.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    pub(crate) storage_mount_mutations: tokio::sync::Mutex<()>,
+    pub(crate) storage_mount_mutations: Arc<tokio::sync::Mutex<()>>,
+    /// Typed process-provider STOP/reap budgets resolved at kernel boot.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    pub(crate) process_stop_policy: storage_mount::ProcessStopPolicy,
     /// System-wide per-principal profile cache (Layer 3 quota enforcement).
     ///
     /// One instance per kernel boot. Every capsule load plumbs this into
@@ -443,10 +446,14 @@ pub struct KernelResources {
     pub cli_socket_listener: Option<astrid_capsule::context::UplinkListener>,
     /// Exclusive advisory lock enforcing a single kernel instance, held for the
     /// process lifetime; its `Drop` releases the lock. Independent of
-    /// `cli_socket_listener` — the kernel never reads either field, so a host
-    /// supplies whichever facilities it actually has (the native daemon: both;
-    /// test kernels and hosts with no real socket: neither).
+    /// `cli_socket_listener`. This public resource records ownership only; it
+    /// never authorizes reclamation of shared process-storage authority.
     pub singleton_lock: Option<std::fs::File>,
+    /// Private native composition proof for process-storage reclamation.
+    ///
+    /// This is deliberately not a public constructor argument. An injected
+    /// `Some(File)` is an ordinary resource and never grants boot ownership.
+    process_storage_ownership: Option<NativeProcessStorageOwnership>,
     /// Native layout origin captured before `AstridHome::ensure`. `None`
     /// denotes an injected/portable composition root, which does not own the
     /// host-home migration lifecycle.
@@ -477,9 +484,16 @@ impl KernelResources {
             token_path,
             cli_socket_listener,
             singleton_lock,
+            process_storage_ownership: None,
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             layout_origin: None,
         }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_native_process_storage_ownership(mut self) -> Self {
+        self.process_storage_ownership = Some(NativeProcessStorageOwnership);
+        self
     }
 
     #[cfg(unix)]
@@ -487,6 +501,222 @@ impl KernelResources {
         self.layout_origin = Some(origin);
         self
     }
+}
+
+/// Opaque proof that the native composition acquired the boot singleton lock.
+#[derive(Debug)]
+pub(crate) struct NativeProcessStorageOwnership;
+
+/// Remove only the disposable `run/process-storage` children during native
+/// boot. The public home API deliberately has no raw remover; the private
+/// native singleton proof is checked by the boot gate before this helper runs.
+#[cfg(unix)]
+fn clear_runtime_process_storage_scratch(
+    home: &astrid_core::dirs::AstridHome,
+) -> std::io::Result<()> {
+    let root = home.run_dir().join("process-storage");
+    let metadata = match std::fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "process storage scratch is redirected or not a directory: {}",
+                root.display()
+            ),
+        ));
+    }
+
+    let root_device = process_storage_tree_device(&metadata);
+    validate_process_storage_tree(&root, root_device)?;
+    for entry in std::fs::read_dir(&root)? {
+        let child = entry?.path();
+        let child_metadata = std::fs::symlink_metadata(&child)?;
+        ensure_process_storage_boundary(&child, root_device, &child_metadata)?;
+        if child_metadata.is_dir() {
+            delete_process_storage_tree(&child, root_device)?;
+        } else if child_metadata.is_file() {
+            astrid_core::platform_fs::verify_no_redirects(&child)?;
+            std::fs::remove_file(&child)?;
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "process storage scratch contains a special file: {}",
+                    child.display()
+                ),
+            ));
+        }
+    }
+    sync_process_storage_directory(&root)
+}
+
+#[cfg(not(unix))]
+fn clear_runtime_process_storage_scratch(
+    _home: &astrid_core::dirs::AstridHome,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "process storage scratch cleanup requires native Unix support",
+    ))
+}
+
+#[cfg(unix)]
+fn validate_process_storage_tree(path: &Path, root_device: u64) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "process storage scratch is redirected or not a directory: {}",
+                path.display()
+            ),
+        ));
+    }
+    astrid_core::platform_fs::verify_no_redirects(path)?;
+    ensure_process_storage_boundary(path, root_device, &metadata)?;
+
+    for entry in std::fs::read_dir(path)? {
+        let child = entry?.path();
+        let child_metadata = std::fs::symlink_metadata(&child)?;
+        ensure_process_storage_boundary(&child, root_device, &child_metadata)?;
+        if child_metadata.is_dir() {
+            validate_process_storage_tree(&child, root_device)?;
+        } else if child_metadata.is_file() {
+            astrid_core::platform_fs::verify_no_redirects(&child)?;
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "process storage scratch contains a special file: {}",
+                    child.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn delete_process_storage_tree(path: &Path, root_device: u64) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("process storage scratch changed type: {}", path.display()),
+        ));
+    }
+    astrid_core::platform_fs::verify_no_redirects(path)?;
+    ensure_process_storage_boundary(path, root_device, &metadata)?;
+
+    for entry in std::fs::read_dir(path)? {
+        let child = entry?.path();
+        let child_metadata = std::fs::symlink_metadata(&child)?;
+        ensure_process_storage_boundary(&child, root_device, &child_metadata)?;
+        if child_metadata.is_dir() {
+            delete_process_storage_tree(&child, root_device)?;
+        } else if child_metadata.is_file() {
+            astrid_core::platform_fs::verify_no_redirects(&child)?;
+            std::fs::remove_file(&child)?;
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "process storage scratch contains a special file: {}",
+                    child.display()
+                ),
+            ));
+        }
+    }
+
+    sync_process_storage_directory(path)?;
+    std::fs::remove_dir(path)
+}
+
+#[cfg(unix)]
+fn ensure_process_storage_boundary(
+    path: &Path,
+    root_device: u64,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    if process_storage_tree_device(metadata) != root_device || process_storage_mount(path)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "process storage scratch crosses a filesystem or mount boundary: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_storage_tree_device(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+
+    metadata.dev()
+}
+
+#[cfg(target_os = "linux")]
+fn process_storage_mount(path: &Path) -> std::io::Result<bool> {
+    let canonical = std::fs::canonicalize(path)?;
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")?;
+    Ok(mountinfo.lines().any(|line| {
+        let Some(encoded) = line.split_whitespace().nth(4) else {
+            return false;
+        };
+        decode_process_storage_mount_path(encoded).is_some_and(|mountpoint| mountpoint == canonical)
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn decode_process_storage_mount_path(encoded: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            let digit_start = index.checked_add(1)?;
+            let end = digit_start.checked_add(3)?;
+            let digits = bytes.get(digit_start..end)?;
+            if !digits.iter().all(|digit| (b'0'..=b'7').contains(digit)) {
+                return None;
+            }
+            let value = digits.iter().try_fold(0_u8, |value, digit| {
+                value.checked_mul(8)?.checked_add(digit.checked_sub(b'0')?)
+            })?;
+            decoded.push(value);
+            index = end;
+        } else {
+            decoded.push(bytes[index]);
+            index = index.checked_add(1)?;
+        }
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_vec(decoded)))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "device identity catches Unix mounts; the Linux caller needs a fallible signature"
+)]
+fn process_storage_mount(_path: &Path) -> std::io::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn sync_process_storage_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
 }
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -794,6 +1024,7 @@ impl Kernel {
             Some(Arc::new(tokio::sync::Mutex::new(listener))),
             Some(singleton_lock),
         )
+        .with_native_process_storage_ownership()
         .with_layout_origin(layout_origin);
 
         Self::with_resources_and_workspace_layout_with_profile_cache_and_directory(
@@ -997,18 +1228,28 @@ impl Kernel {
             token_path,
             cli_socket_listener,
             singleton_lock,
+            process_storage_ownership,
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             layout_origin,
         } = resources;
         #[cfg(not(unix))]
         let _ = token_path;
 
+        // Process-storage UUID roots are live provider authority, not portable
+        // scratch. Only the private native composition proof grants cleanup;
+        // a public `Some(File)` singleton resource does not.
+        if process_storage_ownership.is_some() {
+            clear_runtime_process_storage_scratch(&home).map_err(|error| {
+                std::io::Error::other(format!(
+                    "Failed to reclaim stale process storage scratch: {error}"
+                ))
+            })?;
+        }
         home.clear_runtime_principal_scratch().map_err(|error| {
             std::io::Error::other(format!(
                 "Failed to clear stale principal runtime scratch: {error}"
             ))
         })?;
-
         let workspace_selection = workspace_layout.resolve(&workspace_root).map_err(|error| {
             std::io::Error::new(error.kind(), format!("unsafe workspace selection: {error}"))
         })?;
@@ -1247,11 +1488,19 @@ impl Kernel {
         }
 
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let host_audit_policy =
-            astrid_config::Config::load_with_layout(Some(&workspace_root), &workspace_layout)
-                .ok()
-                .map(|resolved| crate::audit_sink::HostAuditPolicy::from(&resolved.config.audit))
-                .unwrap_or_default();
+        let resolved_config =
+            astrid_config::Config::load_with_layout(Some(&workspace_root), &workspace_layout).ok();
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let host_audit_policy = resolved_config
+            .as_ref()
+            .map(|resolved| crate::audit_sink::HostAuditPolicy::from(&resolved.config.audit))
+            .unwrap_or_default();
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let process_stop_policy = resolved_config
+            .as_ref()
+            .map_or_else(storage_mount::ProcessStopPolicy::default, |resolved| {
+                storage_mount::ProcessStopPolicy::from(&resolved.config.timeouts)
+            });
 
         let kernel = Arc::new(Self {
             session_id: session_id.clone(),
@@ -1314,7 +1563,9 @@ impl Kernel {
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             storage_mounts: Arc::new(DashMap::new()),
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-            storage_mount_mutations: tokio::sync::Mutex::new(()),
+            storage_mount_mutations: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            process_stop_policy,
             profile_cache: profile_cache
                 .unwrap_or_else(|| Arc::new(PrincipalProfileCache::with_home(home.clone()))),
             groups,
@@ -3617,7 +3868,9 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         storage_mounts: Arc::new(DashMap::new()),
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        storage_mount_mutations: tokio::sync::Mutex::new(()),
+        storage_mount_mutations: Arc::new(tokio::sync::Mutex::new(())),
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        process_stop_policy: storage_mount::ProcessStopPolicy::default(),
         profile_cache: Arc::new(PrincipalProfileCache::with_home(home.clone())),
         groups,
         astrid_home: home,

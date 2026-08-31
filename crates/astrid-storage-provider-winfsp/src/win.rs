@@ -65,12 +65,7 @@ pub(crate) fn daemon_main() -> Result<()> {
         bail!("WinFsp daemon lease contains a relative endpoint");
     }
 
-    let runtime = Arc::new(
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .context("start WinFsp callback runtime")?,
-    );
+    let runtime = Arc::new(start_provider_runtime("WinFsp callback runtime")?);
     let callback = CallbackFs::new(lease.clone(), Arc::clone(&runtime))
         .map_err(|failure| anyhow::anyhow!("build WinFsp callback filesystem: {failure:?}"))?;
     let control_path = provider_control_path(&lease.mount_id)?;
@@ -179,13 +174,19 @@ pub(crate) fn service_main() -> Result<()> {
         &launch.lease.callback_path,
     )
     .map_err(anyhow::Error::msg)?;
-    let runtime = Arc::new(
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .context("start WinFsp service runtime")?,
-    );
+    let runtime = Arc::new(start_provider_runtime("WinFsp service runtime")?);
     runtime.block_on(run_private_service(launch, challenge, runtime.clone()))
+}
+
+/// Build the one runtime owned by a synchronous provider mode.
+fn start_provider_runtime(context: &'static str) -> Result<tokio::runtime::Runtime> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        bail!("{context} cannot start inside another Tokio runtime");
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .with_context(|| format!("start {context}"))
 }
 
 async fn run_private_service(
@@ -303,13 +304,7 @@ fn validate_service_launch(launch: &StorageProviderServiceLaunchV1) -> Result<()
     {
         bail!("WinFsp service mountpoint is public or overlaps the lease resource");
     }
-    platform_fs::validate_private_directory(&launch.mountpoint)
-        .context("validate private WinFsp mountpoint")?;
-    platform_fs::verify_no_redirects(&launch.mountpoint)
-        .context("reject redirected WinFsp mountpoint")?;
-    if std::fs::read_dir(&launch.mountpoint)?.next().is_some() {
-        bail!("WinFsp service mountpoint is not empty");
-    }
+    validate_reserved_mountpoint(&launch.mountpoint)?;
     if !launch.control_path.is_absolute()
         || launch
             .control_path
@@ -333,6 +328,23 @@ fn validate_service_launch(launch: &StorageProviderServiceLaunchV1) -> Result<()
         bail!("WinFsp service control endpoint is already present");
     }
     Ok(())
+}
+
+fn validate_reserved_mountpoint(mountpoint: &Path) -> Result<()> {
+    let parent = mountpoint
+        .parent()
+        .context("WinFsp service mountpoint has no parent")?;
+    platform_fs::validate_private_directory(parent)
+        .context("validate private WinFsp mountpoint parent")?;
+    platform_fs::verify_no_redirects(parent)
+        .context("reject redirected WinFsp mountpoint parent")?;
+    match std::fs::symlink_metadata(mountpoint) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("inspect reserved WinFsp mountpoint"),
+        Ok(_) => Err(anyhow::anyhow!(
+            "WinFsp service mountpoint leaf must be absent and provider-owned"
+        )),
+    }
 }
 
 async fn probe_callback(launch: &StorageProviderServiceLaunchV1) -> Result<()> {
@@ -743,3 +755,42 @@ fn volume_params(access: StorageProviderAccessV1) -> Params {
 #[cfg(test)]
 #[path = "win/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod reserved_mountpoint_tests {
+    use super::*;
+
+    #[test]
+    fn reserved_mountpoint_accepts_absent_component_leaves() {
+        let temporary = tempfile::tempdir().expect("reserved mount root");
+        let parent = temporary.path().join("components");
+        platform_fs::ensure_private_directory(&parent).expect("trusted private component parent");
+        let mountpoints = [
+            parent.join("workspace"),
+            parent.join("owner"),
+            parent.join("shared"),
+        ];
+        for mountpoint in mountpoints {
+            validate_reserved_mountpoint(&mountpoint).unwrap_or_else(|error| {
+                panic!(
+                    "absent component {} must be admitted: {error:#}",
+                    mountpoint.display()
+                )
+            });
+            platform_fs::validate_private_directory(&parent)
+                .expect("the provider parent must retain private ACLs");
+        }
+    }
+
+    #[test]
+    fn reserved_mountpoint_rejects_precreated_leaf() {
+        let temporary = tempfile::tempdir().expect("reserved mount root");
+        let parent = temporary.path().join("components");
+        platform_fs::ensure_private_directory(&parent).expect("trusted private component parent");
+        let mountpoint = parent.join("workspace");
+        std::fs::create_dir(&mountpoint).expect("precreated collision");
+        let error = validate_reserved_mountpoint(&mountpoint)
+            .expect_err("a precreated final leaf must preserve WinFsp ownership");
+        assert!(error.to_string().contains("must be absent"));
+    }
+}

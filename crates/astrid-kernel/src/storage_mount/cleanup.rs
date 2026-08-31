@@ -18,6 +18,7 @@ const PRIVATE_WRITE_TRANSACTION_LOCK_NAME: &str = ".astrid-private-write.lock";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MountCleanupStage {
     Callback,
+    Drain,
     Manifest,
     Directory,
 }
@@ -26,6 +27,7 @@ impl std::fmt::Display for MountCleanupStage {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Callback => "callback",
+            Self::Drain => "drain",
             Self::Manifest => "manifest",
             Self::Directory => "directory",
         })

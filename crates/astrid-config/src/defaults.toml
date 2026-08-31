@@ -413,6 +413,14 @@ idle_secs = 3600  # 1 hour
 # Workspace config may raise this (not decrease-only like idle_secs).
 daemon_ready_secs = 600
 
+# Maximum wait for a native process-storage provider to acknowledge STOP.
+process_stop_ack_secs = 10
+
+# Grace period before an unresponsive native process-storage provider is
+# killed, and the maximum wait to reap it after the kill.
+process_reap_grace_secs = 10
+process_killed_reap_secs = 10
+
 # ============================================================================
 # Session Management
 # ============================================================================
