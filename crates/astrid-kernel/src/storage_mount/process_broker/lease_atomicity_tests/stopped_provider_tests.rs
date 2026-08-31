@@ -15,6 +15,10 @@ use super::{
 #[cfg(unix)]
 const STDERR_NEGATIVE_CONTROL: std::time::Duration = std::time::Duration::from_millis(100);
 #[cfg(unix)]
+const OWNED_CHILD_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(unix)]
+const OWNED_CHILD_REAP_ESCALATION: std::time::Duration = std::time::Duration::from_millis(500);
+#[cfg(unix)]
 const RESPONDER_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(unix)]
@@ -97,16 +101,25 @@ impl OwnedTestChild {
     }
 
     async fn wait(mut self) -> std::process::ExitStatus {
-        self.take()
-            .wait()
-            .await
-            .expect("reap owned test provider child")
+        let mut child = self.take();
+        match tokio::time::timeout(OWNED_CHILD_REAP_TIMEOUT, child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(_)) | Err(_) => OwnedTestChild::from(Some(child)).kill_and_wait().await,
+        }
     }
 
     async fn kill_and_wait(mut self) -> std::process::ExitStatus {
         let mut child = self.take();
         let _ = child.start_kill();
-        child.wait().await.expect("kill and reap owned test child")
+        if let Ok(Ok(status)) = tokio::time::timeout(OWNED_CHILD_REAP_TIMEOUT, child.wait()).await {
+            status
+        } else {
+            let _ = child.start_kill();
+            tokio::time::timeout(OWNED_CHILD_REAP_TIMEOUT, child.wait())
+                .await
+                .expect("bounded escalated owned-child reap")
+                .expect("reap escalated owned test child")
+        }
     }
 }
 
@@ -129,19 +142,29 @@ impl From<Option<Box<tokio::process::Child>>> for OwnedTestChild {
 #[cfg(unix)]
 impl Drop for OwnedTestChild {
     fn drop(&mut self) {
-        use nix::sys::wait::waitpid;
-
         let Some(mut child) = self.child.take() else {
             return;
         };
-        let _ = child.start_kill();
-        if let Some(raw_pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
-            let pid = nix::unistd::Pid::from_raw(raw_pid);
-            match waitpid(pid, None) {
-                Ok(_) | Err(nix::errno::Errno::ESRCH | nix::errno::Errno::ECHILD) => {},
-                Err(error) => panic!("last-resort reap of test child {raw_pid}: {error}"),
+        // Drop cannot await. Move cleanup to a bounded detached thread so an
+        // unwind cannot leave a live test child behind, while normal paths
+        // retain explicit kill/wait ownership.
+        let _ = std::thread::spawn(move || {
+            let _ = child.start_kill();
+            let started = std::time::Instant::now();
+            let mut escalated = false;
+            while started.elapsed() < OWNED_CHILD_REAP_TIMEOUT {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => return,
+                    Ok(None) => {
+                        if !escalated && started.elapsed() >= OWNED_CHILD_REAP_ESCALATION {
+                            let _ = child.start_kill();
+                            escalated = true;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    },
+                }
             }
-        }
+        });
     }
 }
 
@@ -526,10 +549,12 @@ async fn notify_waiters_between_response_and_registration_is_lost() {
     let between = Arc::new(tokio::sync::Notify::new());
     let gate = Arc::new(tokio::sync::Notify::new());
     let (cancellation, mut cancellation_receiver) = tokio::sync::watch::channel(false);
+    let (gate_registered_sender, gate_registered_receiver) = tokio::sync::oneshot::channel();
     let responder = {
         let release = Arc::clone(&release);
         let between = Arc::clone(&between);
         let gate = Arc::clone(&gate);
+        let mut gate_registered_sender = Some(gate_registered_sender);
         tokio::spawn(async move {
             let result = async {
                 let (mut stream, _) = listener.accept().await?;
@@ -540,7 +565,19 @@ async fn notify_waiters_between_response_and_registration_is_lost() {
                 return Err(format!("write lost-notify refusal: {error}"));
             }
             between.notify_one();
-            gate.notified().await;
+            let gate_wait = gate.notified();
+            tokio::pin!(gate_wait);
+            std::future::poll_fn(|context| match gate_wait.as_mut().poll(context) {
+                std::task::Poll::Pending => {
+                    if let Some(sender) = gate_registered_sender.take() {
+                        let _ = sender.send(());
+                    }
+                    std::task::Poll::Ready(())
+                },
+                std::task::Poll::Ready(()) => std::task::Poll::Ready(()),
+            })
+            .await;
+            gate_wait.await;
             let release_registration = release.notified();
             tokio::pin!(release_registration);
             tokio::select! {
@@ -572,9 +609,12 @@ async fn notify_waiters_between_response_and_registration_is_lost() {
     tokio::time::timeout(std::time::Duration::from_secs(1), &mut between_arrival)
         .await
         .expect("responder reaches the between-response barrier");
-    gate.notify_one();
-
     release.notify_waiters();
+    tokio::time::timeout(std::time::Duration::from_secs(1), gate_registered_receiver)
+        .await
+        .expect("bounded lost-notify registration handshake")
+        .expect("responder reports gate registration");
+    gate.notify_one();
     let lost_join = responder;
     tokio::pin!(lost_join);
     let lost = tokio::time::timeout(RESPONDER_JOIN_TIMEOUT, &mut lost_join).await;
@@ -758,22 +798,50 @@ async fn old_stderr_fixture_lifetime_hangs_until_holder_release() {
 }
 
 #[cfg(target_os = "linux")]
-struct TestChildSubreaper;
+static CHILD_SUBREAPER_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(target_os = "linux")]
+struct TestChildSubreaper {
+    serialization: std::sync::MutexGuard<'static, ()>,
+    previous: Option<bool>,
+}
 
 #[cfg(target_os = "linux")]
 impl TestChildSubreaper {
     fn new() -> Self {
+        use std::sync::PoisonError;
+
+        let serialization = CHILD_SUBREAPER_STATE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let previous = nix::sys::prctl::get_child_subreaper()
+            .expect("capture the prior test-process child-subreaper state");
         nix::sys::prctl::set_child_subreaper(true)
             .expect("make test process the detached-PID subreaper");
-        Self
+        Self {
+            serialization,
+            previous: Some(previous),
+        }
+    }
+
+    fn restore(&mut self) -> Result<(), nix::errno::Errno> {
+        let Some(previous) = self.previous else {
+            return Ok(());
+        };
+        match nix::sys::prctl::set_child_subreaper(previous) {
+            Ok(()) => {
+                self.previous = None;
+                Ok(())
+            },
+            Err(error) => Err(error),
+        }
     }
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for TestChildSubreaper {
     fn drop(&mut self) {
-        nix::sys::prctl::set_child_subreaper(false)
-            .expect("restore the test-process child-subreaper policy");
+        let _ = self.restore();
     }
 }
 
@@ -800,24 +868,85 @@ async fn wait_for_reported_pid(pid_path: &std::path::Path) -> u32 {
 }
 
 #[cfg(target_os = "linux")]
-async fn reap_detached_holder(pid: u32) {
-    use nix::sys::signal::Signal;
-    use nix::sys::wait::{WaitStatus, waitpid};
+struct AdoptedTestChild {
+    pid: Option<nix::unistd::Pid>,
+}
 
-    let raw_pid = i32::try_from(pid).expect("bounded detached-holder PID");
-    let target = nix::unistd::Pid::from_raw(raw_pid);
-    nix::sys::signal::kill(target, Signal::SIGTERM)
-        .expect("terminate historical detached stderr holder");
-    let started = tokio::time::Instant::now();
-    loop {
-        match waitpid(target, None) {
-            Ok(WaitStatus::Signaled(_, Signal::SIGTERM, _)) => return,
-            Ok(status) => panic!("unexpected detached-holder status: {status:?}"),
-            Err(nix::errno::Errno::ECHILD) => {
-                panic!("subreaper did not adopt the historical detached holder")
-            },
-            Err(error) => panic!("reap historical detached holder: {error}"),
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum AdoptedReapError {
+    NotAdopted,
+    TimedOut,
+}
+
+#[cfg(target_os = "linux")]
+impl AdoptedTestChild {
+    fn new(raw_pid: u32) -> Self {
+        let raw_pid = i32::try_from(raw_pid).expect("bounded adopted-holder PID");
+        Self {
+            pid: Some(nix::unistd::Pid::from_raw(raw_pid)),
         }
+    }
+
+    async fn terminate_and_reap(mut self) -> Result<nix::sys::wait::WaitStatus, AdoptedReapError> {
+        use nix::sys::signal::Signal;
+        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+
+        let pid = self.pid.take().expect("adopted test child is owned once");
+        nix::sys::signal::kill(pid, Signal::SIGTERM)
+            .expect("terminate historical adopted stderr holder");
+        let started = tokio::time::Instant::now();
+        let mut escalated = false;
+        loop {
+            match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::StillAlive) => {
+                    if started.elapsed() >= OWNED_CHILD_REAP_TIMEOUT {
+                        if escalated {
+                            return Err(AdoptedReapError::TimedOut);
+                        }
+                        let _ = nix::sys::signal::kill(pid, Signal::SIGKILL);
+                        escalated = true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                },
+                Ok(status) => return Ok(status),
+                Err(nix::errno::Errno::ECHILD | nix::errno::Errno::ESRCH) => {
+                    return Err(AdoptedReapError::NotAdopted);
+                },
+                Err(_) => return Err(AdoptedReapError::TimedOut),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for AdoptedTestChild {
+    fn drop(&mut self) {
+        use nix::sys::signal::Signal;
+        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+
+        let Some(pid) = self.pid.take() else {
+            return;
+        };
+        let _ = nix::sys::signal::kill(pid, Signal::SIGTERM);
+        // Keep unwind cleanup nonblocking and nonpanicking; escalate once and
+        // stop after a second bounded interval if the adopted PID is wedged.
+        let _ = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut escalated = false;
+            while started.elapsed() < OWNED_CHILD_REAP_TIMEOUT {
+                match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+                    Ok(WaitStatus::StillAlive) => {
+                        if !escalated && started.elapsed() >= OWNED_CHILD_REAP_ESCALATION {
+                            let _ = nix::sys::signal::kill(pid, Signal::SIGKILL);
+                            escalated = true;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    },
+                    Ok(_) | Err(_) => return,
+                }
+            }
+        });
     }
 }
 
@@ -832,7 +961,7 @@ async fn historical_detached_pid_shell_holds_stderr_until_explicit_reap() {
     let mut shell = OwnedTestChild::new(
         tokio::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg("sleep 30 2>&1 & echo $! > \"$1\"")
+            .arg("(echo historical-inherited-stderr >&2; sleep 30) & echo $! > \"$1\"")
             .arg("/bin/sh")
             .arg(&pid_path)
             .stdin(std::process::Stdio::null())
@@ -865,7 +994,17 @@ async fn historical_detached_pid_shell_holds_stderr_until_explicit_reap() {
     };
     wait_stderr_reader_ready(&reader).await;
     let holder_pid = wait_for_reported_pid(&pid_path).await;
-    shell.wait().await;
+    let holder = AdoptedTestChild::new(holder_pid);
+    let shell_pid = shell.process_id().expect("historical shell PID");
+    let shell_status = shell.wait().await;
+    assert!(
+        shell_status.success(),
+        "historical shell exited cleanly after reporting its descendant: {shell_status:?}"
+    );
+    assert_ne!(
+        holder_pid, shell_pid,
+        "the reported PID must identify the shell's descendant"
+    );
 
     let mut stderr_task = stderr_task;
     let old_shape = tokio::time::timeout(
@@ -878,17 +1017,32 @@ async fn historical_detached_pid_shell_holds_stderr_until_explicit_reap() {
         "the historical detached-PID shell leaves stderr read_to_end hung"
     );
 
-    reap_detached_holder(holder_pid).await;
+    let status = holder
+        .terminate_and_reap()
+        .await
+        .expect("subreaper adopted the historical descendant");
+    assert!(
+        matches!(
+            status.signal(),
+            Some(nix::sys::signal::Signal::SIGTERM | nix::sys::signal::Signal::SIGKILL)
+        ),
+        "the adopted descendant was explicitly signaled and reaped: {status:?}"
+    );
     let bytes = tokio::time::timeout(std::time::Duration::from_secs(1), stderr_task)
         .await
         .expect("historical stderr reader completes after explicit reap")
         .expect("historical stderr reader task");
-    assert!(bytes.is_empty(), "historical stderr contained no output");
+    assert_eq!(
+        bytes, b"historical-inherited-stderr\n",
+        "the live descendant wrote through the inherited stderr pipe"
+    );
     assert!(
         reader.completed.load(Ordering::Acquire),
         "historical reader normal completion was not observed"
     );
-    drop(subreaper);
+    subreaper
+        .restore()
+        .expect("restore the prior child-subreaper state");
 }
 
 #[cfg(unix)]
