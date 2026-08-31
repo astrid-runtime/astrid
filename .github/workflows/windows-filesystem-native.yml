@@ -299,14 +299,30 @@ jobs:
         run: |
           cargo build --locked --target ${{ matrix.target }} -p astrid-storage-provider-winfsp
           $provider = "target/${{ matrix.target }}/debug/astrid-storage-provider-winfsp.exe"
-          $messages = cargo test --locked --message-format=json --target ${{ matrix.target }} -p astrid-kernel --lib storage_mount --no-run
-          $artifacts = foreach ($message in $messages) {
+          $messages = @(& cargo test --locked --message-format=json-render-diagnostics --target ${{ matrix.target }} -p astrid-kernel --lib storage_mount --no-run 2>&1)
+          $cargoExit = $LASTEXITCODE
+          $parsedMessages = foreach ($message in $messages) {
             $artifact = $null
             try {
-              $artifact = $message | ConvertFrom-Json -ErrorAction Stop
+              $artifact = ([string]$message) | ConvertFrom-Json -ErrorAction Stop
             } catch {
+              if ($cargoExit -ne 0) {
+                Write-Host ([string]$message)
+              }
               continue
             }
+            $artifact
+          }
+          if ($cargoExit -ne 0) {
+            foreach ($artifact in @($parsedMessages | Where-Object { $_.reason -eq "compiler-message" })) {
+              $rendered = [string]$artifact.message.rendered
+              if ($rendered) {
+                Write-Host $rendered
+              }
+            }
+            exit $cargoExit
+          }
+          $artifacts = foreach ($artifact in $parsedMessages) {
             if ($artifact.reason -eq "compiler-artifact" -and
                 $artifact.profile.test -eq $true -and
                 $artifact.target.name -eq "astrid_kernel" -and
