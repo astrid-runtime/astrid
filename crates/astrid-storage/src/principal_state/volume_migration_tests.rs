@@ -1,6 +1,15 @@
+use crate::engine::DurableEnginePolicy;
+use crate::storage_model::{
+    ObjectClass, ObjectFormatVersion, ObjectIdentity, ObjectKind, ObjectRecord,
+};
+use crate::volume::HostedFileVolume;
+
+use super::{
+    Blake3ObjectIdentityV1, RuntimeEngine, RuntimeStateOwnerCodecV2, open_runtime_principal_store,
+};
 use std::sync::Arc;
 
-use super::{KvQuotaResolver, StateOwner, open_runtime_principal_store};
+use super::{KvQuotaResolver, RecoveryLimits, StateOwner};
 use astrid_core::dirs::AstridHome;
 
 fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
@@ -10,6 +19,92 @@ fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
             StateOwner::Principal(_) | StateOwner::Fleet(_) | StateOwner::User(_) => Some(u64::MAX),
         })
     })
+}
+
+fn seed_predecessor_volume(home: &AstridHome, records: &[ObjectRecord]) {
+    let path = home.storage_volume_path();
+    let volume = HostedFileVolume::open(&path).expect("seed volume");
+    let engine = RuntimeEngine::open_volume(
+        volume.clone(),
+        Blake3ObjectIdentityV1,
+        RuntimeStateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+        DurableEnginePolicy::default(),
+    )
+    .expect("seed volume engine");
+    for record in records {
+        engine
+            .persist_standalone_object(record)
+            .expect("seed volume object");
+    }
+    engine.close().expect("close seeded volume engine");
+    super::volume_migration::write_cutover_receipt(volume.as_ref(), &[])
+        .expect("write seeded cutover receipt");
+}
+
+#[tokio::test]
+async fn existing_pre_user_volume_prepares_and_reopens_idempotently() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    home.ensure().unwrap();
+
+    let prior_spec = super::format_migration_tests::pre_user_owner_format_spec_record();
+    let catalog_spec = super::bootstrap::content_catalog_format_specification().unwrap();
+    seed_predecessor_volume(&home, &[prior_spec.clone(), catalog_spec.clone()]);
+
+    let current_spec = super::bootstrap::format_specification().unwrap();
+    let current_spec_id = Blake3ObjectIdentityV1.identify(&current_spec);
+    let prior_spec_id = Blake3ObjectIdentityV1.identify(&prior_spec);
+    let first = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .expect("first predecessor-volume reopen");
+    assert_eq!(
+        first.engine.object(current_spec_id).unwrap(),
+        Some(current_spec.clone())
+    );
+    assert_eq!(
+        first.engine.object(prior_spec_id).unwrap(),
+        Some(prior_spec)
+    );
+    first.engine.close().unwrap();
+    drop(first);
+
+    let second = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .expect("second predecessor-volume reopen");
+    assert_eq!(
+        second.engine.object(current_spec_id).unwrap(),
+        Some(current_spec)
+    );
+    second.engine.close().unwrap();
+}
+
+#[tokio::test]
+async fn existing_volume_with_only_an_unrecognized_spec_fails_closed() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    home.ensure().unwrap();
+    let unknown_spec = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"unrecognized volume format specification".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let catalog_spec = super::bootstrap::content_catalog_format_specification().unwrap();
+    seed_predecessor_volume(&home, &[unknown_spec, catalog_spec]);
+
+    let Err(error) = open_runtime_principal_store(&home, unlimited_quota()).await else {
+        panic!("unrecognized predecessor volume must fail closed");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("missing its prior format-v1 specification"),
+        "{error}"
+    );
 }
 
 #[tokio::test]

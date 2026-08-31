@@ -250,7 +250,7 @@ fn verify_snapshots(
     Ok(())
 }
 
-fn write_cutover_receipt(
+pub(super) fn write_cutover_receipt(
     volume: &dyn AstridVolume,
     snapshots: &[(StateOwner, RootSnapshot)],
 ) -> StorageResult<()> {

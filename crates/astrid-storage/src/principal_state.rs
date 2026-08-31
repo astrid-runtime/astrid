@@ -68,15 +68,15 @@ pub const RUNTIME_STORE_FORMAT_ID: &str =
     "astrid-principal-store-v1;state-owner-v2;workspace-branch-v1";
 
 pub use contiguous_ingest::ContiguousFileIngest;
+use format_amendment::{
+    DestinationFormat, PRE_DENSE_RADIX_FORMAT_SPEC_ID, PRE_USER_OWNER_FORMAT_SPEC_ID,
+    STORE_METADATA_FILE, prepare_catalog_specification, prepare_destination,
+    prepare_format_specification, representation_bootstrap_objects, store_metadata,
+};
 #[cfg(test)]
 use format_amendment::{
-    DestinationFormat, PRE_DERIVATION_FORMAT_SPEC_ID, STORE_FORMAT_SPEC, legacy_store_metadata,
-    object_id_hex, persist_format_specification,
-};
-use format_amendment::{
-    PRE_DENSE_RADIX_FORMAT_SPEC_ID, STORE_METADATA_FILE, prepare_catalog_specification,
-    prepare_destination, prepare_format_specification, representation_bootstrap_objects,
-    store_metadata,
+    PRE_DERIVATION_FORMAT_SPEC_ID, STORE_FORMAT_SPEC, legacy_store_metadata, object_id_hex,
+    persist_format_specification,
 };
 use native_io::atomic_write;
 pub use runtime_tree::RuntimeTreeEntry;
@@ -673,7 +673,9 @@ async fn open_runtime_principal_store_with_options(
             volume_migration::open_existing(home, policy)?.ok_or_else(|| {
                 StorageError::Connection("Astrid volume disappeared while opening".to_owned())
             })?;
-        return assemble_runtime_store(home, quota, principals, Arc::new(engine), receipt).await;
+        let engine = Arc::new(engine);
+        let engine = prepare_existing_volume_specifications(engine).await?;
+        return assemble_runtime_store(home, quota, principals, engine, receipt).await;
     }
     let store_path = home.principal_store_path();
     let open_path = store_path.clone();
@@ -740,6 +742,55 @@ async fn open_runtime_principal_store_with_options(
 
     let (engine, receipt) = volume_migration::migrate_directory_store(home, engine, policy)?;
     assemble_runtime_store(home, quota, principals, Arc::new(engine), receipt).await
+}
+
+/// Prepare an already-cut volume's in-band specification before compatibility.
+///
+/// Volume cuts predate `store.meta`; their in-band predecessor is the source of
+/// format authority. Persisting the successor here keeps compatibility
+/// enforcement looking at the accepted amendment rather than rejecting it for
+/// not having been indexed during an older cut.
+async fn prepare_existing_volume_specifications(
+    engine: Arc<RuntimeEngine>,
+) -> StorageResult<Arc<RuntimeEngine>> {
+    let format_spec = bootstrap::format_specification()?;
+    let format_spec_id = engine.identify(&format_spec);
+    let catalog_spec = bootstrap::content_catalog_format_specification()?;
+    let catalog_spec_id = engine.identify(&catalog_spec);
+    let preparation_engine = Arc::clone(&engine);
+    tokio::task::spawn_blocking(move || {
+        let destination = if preparation_engine
+            .object(format_spec_id)
+            .map_err(|error| {
+                StorageError::Connection(format!("read volume format specification: {error}"))
+            })?
+            .is_some()
+        {
+            DestinationFormat::Current
+        } else {
+            DestinationFormat::PriorV1 {
+                format_spec: PRE_USER_OWNER_FORMAT_SPEC_ID,
+                catalog_spec_was_declared: true,
+            }
+        };
+        prepare_format_specification(
+            &preparation_engine,
+            destination,
+            &format_spec,
+            format_spec_id,
+        )?;
+        prepare_catalog_specification(
+            &preparation_engine,
+            DestinationFormat::Current,
+            &catalog_spec,
+            catalog_spec_id,
+        )
+    })
+    .await
+    .map_err(|error| {
+        StorageError::Connection(format!("volume format-amendment worker failed: {error}"))
+    })??;
+    Ok(engine)
 }
 
 async fn assemble_runtime_store(

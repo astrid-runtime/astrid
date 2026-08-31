@@ -151,7 +151,7 @@ fn assert_pre_fleet_owner_format_is_selected() {
     );
 }
 
-fn pre_user_owner_format_spec_record() -> ObjectRecord {
+pub(super) fn pre_user_owner_format_spec_record() -> ObjectRecord {
     let current = std::str::from_utf8(super::format_amendment::STORE_FORMAT_SPEC).unwrap();
     let user_tag = "  03 <32-byte user UID>        user owner\n";
     let user_grammar = "\nA user encoding is exactly 33 bytes: tag 03 followed by the 32-byte,\ndomain-separated BLAKE3 digest of its canonical user identity record. User\nownership is distinct from principal, fleet, and system ownership; readers\nMUST NOT reinterpret one owner domain as another. This is the prerelease wire\ngrammar, not authorization for active runtime durable storage: the active\nruntime admission and recovery barrier continues to reject user owners until\nan explicit authority activation changes that policy.\n";
