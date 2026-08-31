@@ -305,6 +305,10 @@ pub(super) fn is_runtime_forbidden_user_owner(error: &StorageError) -> bool {
     error.to_string().contains(USER_OWNER_NOT_ADMITTED)
 }
 
+pub(super) fn is_runtime_forbidden_user_intent_error(error: &'static str) -> bool {
+    error == USER_OWNER_NOT_ADMITTED
+}
+
 fn decode_generation_footer_payload(
     path: &Path,
     payload: &[u8],

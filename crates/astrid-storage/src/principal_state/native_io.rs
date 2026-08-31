@@ -256,6 +256,17 @@ impl PrivateDirectory {
         }
     }
 
+    pub(super) fn entry_is_file(&self, name: &Path) -> StorageResult<bool> {
+        match self.directory.symlink_metadata(name) {
+            Ok(metadata) => Ok(metadata.is_file()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(connection(format!(
+                "inspect private entry {}: {error}",
+                self.path.join(name).display()
+            ))),
+        }
+    }
+
     pub(super) fn entries(&self) -> StorageResult<Vec<OsString>> {
         self.directory
             .read_dir(Path::new("."))

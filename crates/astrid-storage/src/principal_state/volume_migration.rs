@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use crate::engine::durable::{
-    inspect_volume_root_history_without_repair, inspect_volume_wal_owners_without_repair,
+    OwnerObservations, inspect_volume_root_history_without_repair,
+    inspect_volume_wal_owners_without_repair,
 };
 use crate::engine::{
     DurableEnginePolicy, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits, RootSnapshot,
@@ -30,6 +31,7 @@ pub(super) fn open_existing(
     let Some(path) = promote_legacy_volume(home)? else {
         return Ok(None);
     };
+    reject_runtime_forbidden_legacy_volume(&path)?;
     let volume = HostedFileVolume::open(&path).map_err(|error| {
         connection(format!(
             "open Astrid storage volume {}: {error}",
@@ -86,48 +88,63 @@ fn promote_legacy_volume(home: &AstridHome) -> StorageResult<Option<std::path::P
     }
 }
 
-/// Preflight the canonical owner grammar without weakening malformed handling.
+/// Read the accepted owner grammar without repairing any container evidence.
 ///
-/// A scan error is deliberately ignored: incompatible or damaged media keeps
-/// its current downstream failure behavior. A successfully decoded canonical
-/// User owner is rejected before the legacy path can disappear.
+/// Canonical User evidence wins over malformed evidence. If no User is seen
+/// and either scan could not prove complete coverage, promotion/open fails
+/// closed before any mutating recovery.
 fn reject_runtime_forbidden_legacy_volume(path: &std::path::Path) -> StorageResult<()> {
-    let volume = HostedFileVolume::open(path).map_err(|error| {
+    let volume = HostedFileVolume::inspect_read_only(path).map_err(|error| {
         connection(format!(
-            "open legacy Astrid storage volume {}: {error}",
+            "inspect Astrid storage volume without repair {}: {error}",
             path.display()
         ))
     })?;
-    let volume: Arc<dyn AstridVolume> = volume;
-    let roots = inspect_volume_root_history_without_repair::<StateOwner, StateOwnerCodecV2>(
-        &volume,
-        Blake3ObjectIdentityV1.scheme(),
-        &StateOwnerCodecV2,
-        RecoveryLimits::process_addressable(),
-    );
-    if let Ok(roots) = &roots
-        && roots
-            .keys()
-            .any(|owner| matches!(owner, StateOwner::User(_)))
-    {
-        return Err(connection(
-            "legacy Astrid storage volume contains an explicit user StateOwner; promotion is refused before durable recovery",
-        ));
-    }
+    let roots: OwnerObservations<StateOwner> =
+        inspect_volume_root_history_without_repair::<StateOwner, StateOwnerCodecV2>(
+            &volume,
+            Blake3ObjectIdentityV1.scheme(),
+            &StateOwnerCodecV2,
+            RecoveryLimits::process_addressable(),
+        )
+        .map_err(|error| {
+            connection(format!(
+                "Astrid storage volume root preflight failed: {error}"
+            ))
+        })?;
     let wal_owners = inspect_volume_wal_owners_without_repair::<StateOwner, _, _>(
         &volume,
         &Blake3ObjectIdentityV1,
         &StateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
-    );
-    if let Ok(wal_owners) = &wal_owners
-        && wal_owners
-            .iter()
-            .any(|owner| matches!(owner, StateOwner::User(_)))
+    )
+    .map_err(|error| {
+        connection(format!(
+            "Astrid storage volume WAL preflight failed: {error}"
+        ))
+    })?;
+    if roots
+        .owners
+        .iter()
+        .any(|owner| matches!(owner, StateOwner::User(_)))
     {
         return Err(connection(
-            "legacy Astrid storage volume contains a user-owned WAL transaction; promotion is refused before durable recovery",
+            "Astrid storage volume contains an explicit user StateOwner; mutation is refused before durable recovery",
         ));
+    }
+    if wal_owners
+        .owners
+        .iter()
+        .any(|owner| matches!(owner, StateOwner::User(_)))
+    {
+        return Err(connection(
+            "Astrid storage volume contains a user-owned WAL transaction; mutation is refused before durable recovery",
+        ));
+    }
+    if let Some(error) = roots.scan_error.or(wal_owners.scan_error) {
+        return Err(connection(format!(
+            "Astrid storage volume owner preflight could not prove complete coverage: {error}"
+        )));
     }
     Ok(())
 }

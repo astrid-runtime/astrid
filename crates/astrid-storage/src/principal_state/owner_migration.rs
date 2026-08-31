@@ -570,22 +570,34 @@ fn recover_missing_active_root(store: &Path) -> StorageResult<()> {
 
 /// Reject only a successfully decoded canonical User candidate before rename.
 ///
-/// Invalid or incompatible journal bytes continue to the existing runtime
-/// recovery path, preserving today's generic corruption classification.
+/// Complete owner coverage is required. User evidence wins over malformed
+/// evidence; malformed-only candidates fail closed before any rename.
 fn reject_runtime_forbidden_root_candidate(path: &Path) -> StorageResult<()> {
     let roots = inspect_native_root_history_without_repair::<StateOwner, StateOwnerCodecV2>(
         path,
         Blake3ObjectIdentityV1.scheme(),
         &StateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
-    );
-    if let Ok(roots) = &roots
-        && roots
-            .keys()
-            .any(|owner| matches!(owner, StateOwner::User(_)))
+    )
+    .map_err(|error| {
+        StorageError::Connection(format!(
+            "principal owner migration root candidate {} could not be inspected: {error}",
+            path.display()
+        ))
+    })?;
+    if roots
+        .owners
+        .iter()
+        .any(|owner| matches!(owner, StateOwner::User(_)))
     {
         return Err(StorageError::Connection(format!(
             "principal owner migration root candidate {} contains an explicit user StateOwner; promotion is refused",
+            path.display()
+        )));
+    }
+    if let Some(error) = roots.scan_error {
+        return Err(StorageError::Connection(format!(
+            "principal owner migration root candidate {} could not prove complete coverage: {error}",
             path.display()
         )));
     }
@@ -860,5 +872,71 @@ mod tests {
             assert_eq!(std::fs::read(&candidate_path).unwrap(), bytes);
             assert!(!store.join(ROOT_FILE).exists());
         }
+    }
+
+    #[test]
+    fn malformed_root_frame_cannot_hide_later_user_candidate() {
+        use crate::engine::RootTransaction;
+        use crate::storage_model::{ObjectClass, ObjectFormatVersion, ObjectKind, ObjectRecord};
+
+        let root_bytes = |destination: &Path, owner: &StateOwner| {
+            let fixture = tempfile::tempdir().unwrap();
+            let engine = DurableEngine::open(
+                fixture.path(),
+                Blake3ObjectIdentityV1,
+                StateOwnerCodecV2,
+                RecoveryLimits::process_addressable(),
+            )
+            .unwrap();
+            let commit = ObjectRecord::new(
+                ObjectKind::Commit,
+                ObjectFormatVersion::V1,
+                b"mixed owner migration candidate".to_vec(),
+                Vec::new(),
+                0,
+                ObjectClass::Metadata,
+            )
+            .unwrap();
+            let commit_id = Blake3ObjectIdentityV1.identify(&commit);
+            engine
+                .commit(RootTransaction::new(
+                    *owner,
+                    None,
+                    commit_id,
+                    vec![(commit_id, commit)],
+                ))
+                .unwrap();
+            engine
+                .write_mapped_root_snapshot(destination, &StateOwnerCodecV2, |mapped| Ok(*mapped))
+                .unwrap();
+            engine.close().unwrap();
+            std::fs::read(destination).unwrap()
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = directory.path();
+        let candidate_path = store.join(REPLACEMENT_ROOT_FILE);
+        let principal = root_bytes(
+            &candidate_path,
+            &StateOwner::Principal(astrid_core::PrincipalUid::from_bytes([31; 32])),
+        );
+        let mut mixed = principal.clone();
+        let last = mixed.len() - 1;
+        mixed[last] ^= 0x80;
+        mixed.extend_from_slice(&root_bytes(
+            &store.join("user-root"),
+            &StateOwner::User(astrid_core::UserUid::from_bytes([32; 32])),
+        ));
+        std::fs::write(&candidate_path, &mixed).unwrap();
+
+        let error = recover_missing_active_root(store).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("explicit user StateOwner; promotion is refused"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&candidate_path).unwrap(), mixed);
+        assert!(!store.join(ROOT_FILE).exists());
     }
 }

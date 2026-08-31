@@ -856,7 +856,7 @@ use format::{
     PreparedFrame, append_frame, append_frames, append_prepared_frames, canonical_record_bytes,
     corrupt, decode_object_frame, encode_object_frame, ensure_payload_limit, io_error,
     read_indexed_object, read_indexed_object_with_payload, read_indexed_objects, recover_arena,
-    scan_frames, scan_frames_readonly, verify_indexed_location, verify_indexed_tail,
+    scan_frames, scan_frames_observing, verify_indexed_location, verify_indexed_tail,
     visit_indexed_objects,
 };
 #[cfg(test)]
@@ -866,14 +866,17 @@ use native_io::{
     create_private as create_private_file_capability, open_directory as open_directory_capability,
     open_rw as open_rw_capability, sync_directory as sync_store_directory_capability,
 };
+pub(crate) use recovery::OwnerObservations;
 pub(crate) use recovery::inspect_native_root_history_without_repair;
+#[cfg(test)]
+pub(crate) use recovery::inspect_native_wal_owners_without_repair;
 pub(crate) use recovery::inspect_volume_root_history_without_repair;
 pub(crate) fn inspect_volume_wal_owners_without_repair<P, I, C>(
     volume: &Arc<dyn AstridVolume>,
     identity: &I,
     codec: &C,
     limits: RecoveryLimits,
-) -> Result<BTreeSet<P>, DurableError>
+) -> Result<OwnerObservations<P>, DurableError>
 where
     P: Ord,
     I: PersistentObjectIdentity + Clone,
@@ -885,12 +888,15 @@ where
         .region_exists(&region)
         .map_err(|source| io_error("probe WAL region", source))?
     {
-        return Ok(BTreeSet::new());
+        return Ok(OwnerObservations {
+            owners: BTreeSet::new(),
+            scan_error: None,
+        });
     }
-    let wal = File::volume(Arc::clone(volume), WAL_FILE, false)?;
+    let mut wal = File::volume(Arc::clone(volume), WAL_FILE, false)?;
     wal::wal_root_owners_without_repair(
-        &wal,
-        SharedIdentity::new(identity.clone()),
+        &mut wal,
+        identity.scheme(),
         &SharedPrincipalCodec::new(codec.clone()),
         limits,
     )

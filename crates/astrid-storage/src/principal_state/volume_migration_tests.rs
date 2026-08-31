@@ -158,7 +158,7 @@ async fn legacy_user_volume_is_rejected_before_promotion() {
     assert!(
         error
             .to_string()
-            .contains("explicit user StateOwner; promotion is refused"),
+            .contains("explicit user StateOwner; mutation is refused"),
         "{error}"
     );
     assert_eq!(std::fs::read(&legacy).unwrap(), legacy_before);
@@ -224,10 +224,142 @@ async fn legacy_user_wal_is_rejected_before_promotion() {
     assert!(
         error
             .to_string()
-            .contains("user-owned WAL transaction; promotion is refused"),
+            .contains("user-owned WAL transaction; mutation is refused"),
         "{error}"
     );
     assert_eq!(std::fs::read(&legacy).unwrap(), legacy_before);
+    assert!(!canonical.exists());
+}
+
+#[tokio::test]
+async fn legacy_malformed_root_cannot_hide_later_user() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    home.ensure().unwrap();
+    let canonical = home.storage_volume_path();
+    let volume = HostedFileVolume::open(&canonical).unwrap();
+    let engine = DurableEngine::open_volume(
+        volume.clone(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+        DurableEnginePolicy::default(),
+    )
+    .unwrap();
+    for owner in [
+        StateOwner::Principal(astrid_core::PrincipalUid::from_bytes([41; 32])),
+        StateOwner::User(astrid_core::UserUid::from_bytes([42; 32])),
+    ] {
+        let commit = ObjectRecord::new(
+            ObjectKind::Commit,
+            ObjectFormatVersion::V1,
+            b"mixed root owner".to_vec(),
+            Vec::new(),
+            0,
+            ObjectClass::Metadata,
+        )
+        .unwrap();
+        let commit_id = Blake3ObjectIdentityV1.identify(&commit);
+        engine
+            .commit(RootTransaction::new(
+                owner,
+                None,
+                commit_id,
+                vec![(commit_id, commit)],
+            ))
+            .unwrap();
+    }
+    engine.close().unwrap();
+
+    let roots = VolumeRegion::new("roots.journal").unwrap();
+    volume.write_region_at(&roots, 8, &[0]).unwrap();
+    super::volume_migration::write_cutover_receipt(volume.as_ref(), &[]).unwrap();
+    drop(volume);
+
+    let legacy = home.legacy_storage_volume_path();
+    std::fs::rename(&canonical, &legacy).unwrap();
+    let before = std::fs::read(&legacy).unwrap();
+    let Err(error) = open_runtime_principal_store(&home, unlimited_quota()).await else {
+        panic!("mixed legacy volume must fail closed before promotion");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("explicit user StateOwner; mutation is refused"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&legacy).unwrap(), before);
+    assert!(!canonical.exists());
+}
+
+#[tokio::test]
+async fn legacy_malformed_wal_cannot_hide_later_user() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    home.ensure().unwrap();
+    let canonical = home.storage_volume_path();
+    let policy = DurableEnginePolicy::new(
+        crate::engine::GroupCommitPolicy::immediate(),
+        crate::engine::RecoveryRetryPolicy::immediate(),
+        ObjectCacheConfig::<StateOwner>::disabled(),
+    )
+    .with_transaction_wal(TransactionWalPolicy::enabled(
+        NonZeroU64::new(u64::MAX).unwrap(),
+    ));
+    let volume = HostedFileVolume::open(&canonical).unwrap();
+    let engine = DurableEngine::open_volume(
+        volume.clone(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+        policy,
+    )
+    .unwrap();
+    for owner in [
+        StateOwner::Principal(astrid_core::PrincipalUid::from_bytes([43; 32])),
+        StateOwner::User(astrid_core::UserUid::from_bytes([44; 32])),
+    ] {
+        let commit = ObjectRecord::new(
+            ObjectKind::Commit,
+            ObjectFormatVersion::V1,
+            b"mixed WAL owner".to_vec(),
+            Vec::new(),
+            0,
+            ObjectClass::Metadata,
+        )
+        .unwrap();
+        let commit_id = Blake3ObjectIdentityV1.identify(&commit);
+        engine
+            .commit(RootTransaction::new(
+                owner,
+                None,
+                commit_id,
+                vec![(commit_id, commit)],
+            ))
+            .unwrap();
+    }
+    drop(engine);
+
+    let wal = VolumeRegion::new("transactions.wal").unwrap();
+    volume.write_region_at(&wal, 20, &[0]).unwrap();
+    let roots = VolumeRegion::new("roots.journal").unwrap();
+    volume.set_region_len(&roots, 0).unwrap();
+    volume.sync().unwrap();
+    drop(volume);
+
+    let legacy = home.legacy_storage_volume_path();
+    std::fs::rename(&canonical, &legacy).unwrap();
+    let before = std::fs::read(&legacy).unwrap();
+    let Err(error) = open_runtime_principal_store(&home, unlimited_quota()).await else {
+        panic!("mixed legacy WAL must fail closed before promotion");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("user-owned WAL transaction; mutation is refused"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&legacy).unwrap(), before);
     assert!(!canonical.exists());
 }
 

@@ -10,6 +10,7 @@ use super::format::{
     INTENT_MAGIC, INTENT_VERSION, USER_OWNER_NOT_ADMITTED, append_runtime_forbidden_user_footer,
     encode_fields, load_generation_footer_from_file,
 };
+use super::journal::{JOURNAL_HEADER_BYTES, JOURNAL_MAGIC, SEALED_RECORD, refresh_frame_checksum};
 use super::{
     JOURNAL_FILE, NativeContentStagingArea, QUARANTINE_DIRECTORY, StagedContentId,
     migrate_alias_owner_intents, sealed_generation_name,
@@ -24,6 +25,98 @@ fn principal_owner() -> StateOwner {
         .update(b"principal")
         .finalize();
     StateOwner::Principal(PrincipalUid::from_bytes(*digest.as_bytes()))
+}
+
+#[test]
+fn journal_user_after_malformed_frame_fails_before_recovery_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let area = open_area(directory.path()).unwrap();
+    let mut staged = area
+        .begin(
+            principal_owner(),
+            ContentName::new("order.bin").unwrap(),
+            ChunkingProfile::ASTRID_V1,
+        )
+        .unwrap();
+    staged.write_all(b"malformed first").unwrap();
+    let sealed = staged.seal().unwrap();
+    drop(area);
+
+    let journal = directory.path().join(JOURNAL_FILE);
+    let owner = StateOwnerCodecV2.encode(&user_owner());
+    let encoded_intent = encode_fields(
+        INTENT_MAGIC,
+        INTENT_VERSION,
+        91,
+        StagedContentId(Uuid::from_u128(91)),
+        &owner,
+        &ContentName::new("later-user.bin").unwrap(),
+        ChunkingProfile::ASTRID_V1,
+        0,
+        "astrid native content staging intent v2",
+        true,
+    )
+    .unwrap();
+    let mut frame = vec![0_u8; JOURNAL_HEADER_BYTES];
+    frame[..JOURNAL_MAGIC.len()].copy_from_slice(&JOURNAL_MAGIC);
+    frame[8..10].copy_from_slice(&1_u16.to_le_bytes());
+    let payload_len = u64::try_from(encoded_intent.len() + 1).unwrap();
+    frame[12..20].copy_from_slice(&payload_len.to_le_bytes());
+    frame.push(SEALED_RECORD);
+    frame.extend_from_slice(&encoded_intent);
+    refresh_frame_checksum(&mut frame).unwrap();
+
+    let original = std::fs::read(&journal).unwrap();
+    let mut malformed = original.clone();
+    let last = malformed.len() - 1;
+    malformed[last] ^= 0x80;
+    std::fs::write(&journal, &malformed).unwrap();
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap();
+        file.write_all(&frame).unwrap();
+        file.sync_all().unwrap();
+    }
+    let mixed = std::fs::read(&journal).unwrap();
+    assert_eq!(frame[..JOURNAL_MAGIC.len()], JOURNAL_MAGIC);
+    assert_eq!(mixed.len(), original.len() + frame.len());
+    assert_eq!(
+        &mixed[original.len()..original.len() + JOURNAL_MAGIC.len()],
+        &JOURNAL_MAGIC
+    );
+    let magic_offsets = (0..=mixed.len().saturating_sub(JOURNAL_MAGIC.len()))
+        .filter(|offset| mixed[*offset..*offset + JOURNAL_MAGIC.len()] == JOURNAL_MAGIC)
+        .collect::<Vec<_>>();
+    assert_eq!(magic_offsets, vec![0, original.len()]);
+
+    let error = open_area(directory.path()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("explicit user owner in staging journal"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&journal).unwrap(), mixed);
+    assert!(
+        directory
+            .path()
+            .join(QUARANTINE_DIRECTORY)
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    let expected_name = sealed_generation_name(sealed.sequence(), sealed.id());
+    assert_eq!(
+        sealed
+            .content_path()
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some(expected_name.as_str())
+    );
 }
 
 fn user_owner() -> StateOwner {
@@ -74,7 +167,9 @@ fn orphan_user_footer_fails_before_quarantine_or_journal_mutation() {
 
     let error = open_area(directory.path()).unwrap_err();
     assert!(
-        error.to_string().contains(USER_OWNER_NOT_ADMITTED),
+        error
+            .to_string()
+            .contains("explicit user owner in staged generation"),
         "{error}"
     );
     assert_eq!(std::fs::read(&path).unwrap(), user_bytes);

@@ -9,7 +9,9 @@ use std::sync::{Arc, OnceLock, RwLock, Weak};
 use fs2::FileExt as _;
 use parking_lot::{Mutex, MutexGuard};
 
-use super::{ContainerState, HostedFileVolume, VOLUME_MAGIC, reclaim, recover};
+use super::{
+    ContainerState, HostedFileVolume, ReadOnlyHostedVolume, VOLUME_MAGIC, reclaim, recover,
+};
 
 type SharedOpenReclaimLock = Mutex<()>;
 
@@ -56,6 +58,64 @@ impl OpenReclaimLock {
 }
 
 impl HostedFileVolume {
+    /// Recover a container without creating, repairing, upgrading, or syncing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a lock conflict, invalid header or framing, or
+    /// host I/O failure. No successful or failed inspection writes media.
+    pub(crate) fn inspect_read_only(
+        path: impl AsRef<Path>,
+    ) -> io::Result<Arc<dyn super::super::AstridVolume>> {
+        let path = path.as_ref().to_path_buf();
+        let open_lock = OpenReclaimLock::for_path(&path)?;
+        let swap_guard = open_lock.lock();
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let mut file = options.open(&path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Astrid volume is not a regular file",
+            ));
+        }
+        file.try_lock_exclusive().map_err(|error| {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                io::Error::new(io::ErrorKind::WouldBlock, "Astrid volume is already open")
+            } else {
+                error
+            }
+        })?;
+        let regions = if metadata.len() == 0 {
+            BTreeMap::default()
+        } else {
+            let mut magic = [0_u8; VOLUME_MAGIC.len()];
+            file.read_exact(&mut magic)?;
+            if magic != VOLUME_MAGIC {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid Astrid volume header",
+                ));
+            }
+            recover::recover_container(&mut file)?.regions
+        };
+        let _ = fs2::FileExt::unlock(&file);
+        drop(swap_guard);
+        Ok(Arc::new(ReadOnlyHostedVolume { file, regions }))
+    }
+
     /// Open or create one hosted Astrid volume container.
     ///
     /// # Errors

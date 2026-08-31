@@ -51,7 +51,10 @@ use journal::{
 };
 pub(super) use migration::migrate_alias_owner_intents;
 use migration::{MigrationDirectories, migrate_legacy};
-use recovery::{load_generation, open_generation_in, recover_generations, sealed_generation_name};
+use recovery::{
+    load_generation, open_generation_in, recover_generations, reject_runtime_forbidden_staging,
+    sealed_generation_name,
+};
 use retirement::{establish_in as establish_retired_generation, remove_in as remove_generation};
 pub use writer::StagedContentWriter;
 
@@ -219,6 +222,11 @@ impl NativeContentStagingArea {
         let root_directory = PrivateDirectory::open(&root)?;
         let generations_directory = PrivateDirectory::open(&generations)?;
         let quarantine_directory = PrivateDirectory::open(&quarantine)?;
+        reject_runtime_forbidden_staging(
+            &root_directory,
+            &generations_directory,
+            &quarantine_directory,
+        )?;
         let (journal_file, recovered) = open_journal(&root_directory, &root.join(JOURNAL_FILE))?;
         // Persist the journal and directory links before any seal can be
         // acknowledged through them.

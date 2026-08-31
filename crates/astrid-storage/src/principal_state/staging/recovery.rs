@@ -11,12 +11,13 @@ use super::format::{
     StagingIntent, is_runtime_forbidden_user_owner, load_generation_footer_from_file,
 };
 use super::journal::{
-    JournalRecord, StageKey, StageKey as JournalStageKey, append_records, flush_journal,
+    JournalRecord, StageKey, StageKey as JournalStageKey, append_records,
+    contains_runtime_forbidden_user_without_repair, flush_journal,
 };
 use super::retirement::{create_marker_in, remove_in as remove_generation_in};
 use super::{
-    JournalState, ReadyStagedContent, StagedContentId, StagingFaultInjector, StagingFaultPoint,
-    claim_generation_key, connection, open_generation_name,
+    JOURNAL_FILE, JournalState, ReadyStagedContent, StagedContentId, StagingFaultInjector,
+    StagingFaultPoint, claim_generation_key, connection, open_generation_name,
 };
 use crate::error::StorageResult;
 use crate::principal_state::native_io::{
@@ -27,6 +28,55 @@ struct RecoveryScan {
     recovered: Vec<StagingIntent>,
     completed_with_sealed: BTreeSet<StageKey>,
     namespace_changed: bool,
+}
+
+/// Prove a staging area contains no canonical User before any recovery write.
+pub(super) fn reject_runtime_forbidden_staging(
+    root: &PrivateDirectory,
+    generations: &PrivateDirectory,
+    quarantine: &PrivateDirectory,
+) -> StorageResult<()> {
+    if root.contains(Path::new(JOURNAL_FILE))?
+        && contains_runtime_forbidden_user_without_repair(
+            &mut root.open_file(Path::new(JOURNAL_FILE))?,
+        )
+        .map_err(|error| connection(format!("inspect staging journal without repair: {error}")))?
+    {
+        return Err(connection(
+            "explicit user owner in staging journal is not runtime-admitted".to_owned(),
+        ));
+    }
+    for directory in [generations, quarantine] {
+        for name in directory.entries()? {
+            let name = PathBuf::from(name);
+            if !directory.entry_is_file(&name)? {
+                continue;
+            }
+            let mut file = directory.open_file(&name)?;
+            let path = PathBuf::from(format!("staging generation {}", name.display()));
+            match load_generation_footer_from_file(&path, &mut file) {
+                Ok(footer)
+                    if matches!(
+                        footer.intent.owner,
+                        crate::principal_state::StateOwner::User(_)
+                    ) =>
+                {
+                    return Err(connection(format!(
+                        "explicit user owner in staged generation {} is not runtime-admitted",
+                        name.display()
+                    )));
+                },
+                Err(error) if is_runtime_forbidden_user_owner(&error) => {
+                    return Err(connection(format!(
+                        "explicit user owner in staged generation {} is not runtime-admitted",
+                        name.display()
+                    )));
+                },
+                Ok(_) | Err(_) => {},
+            }
+        }
+    }
+    Ok(())
 }
 
 struct RecoveryContext<'a> {

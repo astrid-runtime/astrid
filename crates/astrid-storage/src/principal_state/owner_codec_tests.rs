@@ -1,6 +1,7 @@
 //! Compatibility and fail-closed regressions for the consolidated V2 owner.
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,7 +12,9 @@ use super::{
 };
 use crate::engine::{
     DurableEngine, DurableEnginePolicy, DurableError, GroupCommitPolicy, ObjectCacheConfig,
-    PrincipalCodec, RecoveryLimits, RecoveryRetryPolicy, RootTransaction, TransactionWalPolicy,
+    PersistentObjectIdentity, PrincipalCodec, RecoveryLimits, RecoveryRetryPolicy, RootTransaction,
+    TransactionWalPolicy, durable::inspect_native_root_history_without_repair,
+    durable::inspect_native_wal_owners_without_repair,
 };
 use crate::kv::KvQuotaResolver;
 use crate::storage_model::ObjectIdentity;
@@ -21,6 +24,264 @@ use std::num::NonZeroU64;
 
 fn user_owner() -> StateOwner {
     StateOwner::User(astrid_core::UserUid::from_bytes([11; 32]))
+}
+
+fn corrupt_last_byte(path: &Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let Some(last) = bytes.len().checked_sub(1) else {
+        panic!("cannot corrupt an empty test file");
+    };
+    bytes[last] ^= 0x80;
+    std::fs::write(path, bytes).unwrap();
+}
+
+fn append_file(source: &Path, destination: &Path) {
+    let bytes = std::fs::read(source).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(destination)
+        .unwrap();
+    file.write_all(&bytes).unwrap();
+}
+
+fn append_bytes(bytes: &[u8], destination: &Path) {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(destination)
+        .unwrap();
+    file.write_all(bytes).unwrap();
+}
+
+#[test]
+fn owner_scan_finds_user_after_malformed_root_frame() {
+    let principal_source = tempfile::tempdir().unwrap();
+    let principal = DurableEngine::open(
+        principal_source.path(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    let commit = commit_record();
+    let commit_id = Blake3ObjectIdentityV1.identify(&commit);
+    principal
+        .commit(RootTransaction::new(
+            StateOwner::Principal(astrid_core::PrincipalUid::from_bytes([7; 32])),
+            None,
+            commit_id,
+            vec![(commit_id, commit)],
+        ))
+        .unwrap();
+    principal.close().unwrap();
+
+    let user_source = tempfile::tempdir().unwrap();
+    let user = DurableEngine::open(
+        user_source.path(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    let commit = commit_record();
+    let commit_id = Blake3ObjectIdentityV1.identify(&commit);
+    user.commit(RootTransaction::new(
+        user_owner(),
+        None,
+        commit_id,
+        vec![(commit_id, commit)],
+    ))
+    .unwrap();
+    user.close().unwrap();
+
+    let candidate = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        principal_source.path().join("roots.journal"),
+        candidate.path().join("roots.journal"),
+    )
+    .unwrap();
+    corrupt_last_byte(&candidate.path().join("roots.journal"));
+    append_file(
+        &user_source.path().join("roots.journal"),
+        &candidate.path().join("roots.journal"),
+    );
+    let before = std::fs::read(candidate.path().join("roots.journal")).unwrap();
+
+    let observations = inspect_native_root_history_without_repair::<StateOwner, _>(
+        &candidate.path().join("roots.journal"),
+        Blake3ObjectIdentityV1.scheme(),
+        &StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    assert!(observations.owners.contains(&user_owner()));
+    assert!(observations.scan_error.is_some());
+    assert_eq!(
+        std::fs::read(candidate.path().join("roots.journal")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn owner_scan_handles_ordinary_multiframe_root_journal() {
+    let source = tempfile::tempdir().unwrap();
+    let engine = DurableEngine::open(
+        source.path(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    let owner = StateOwner::Principal(astrid_core::PrincipalUid::from_bytes([9; 32]));
+    let mut expected = None;
+    for index in 0..256u64 {
+        let commit = ObjectRecord::new(
+            ObjectKind::Commit,
+            ObjectFormatVersion::new(3).unwrap(),
+            format!("ordinary multiframe root {index}").into_bytes(),
+            Vec::new(),
+            0,
+            ObjectClass::Metadata,
+        )
+        .unwrap();
+        let commit_id = Blake3ObjectIdentityV1.identify(&commit);
+        expected = Some(
+            engine
+                .commit(RootTransaction::new(
+                    owner,
+                    expected,
+                    commit_id,
+                    vec![(commit_id, commit)],
+                ))
+                .unwrap()
+                .root(),
+        );
+    }
+    engine.close().unwrap();
+
+    let started = std::time::Instant::now();
+    let observations = inspect_native_root_history_without_repair::<StateOwner, _>(
+        &source.path().join("roots.journal"),
+        Blake3ObjectIdentityV1.scheme(),
+        &StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    assert!(observations.owners.contains(&owner));
+    assert!(observations.scan_error.is_none());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "ordinary multiframe root scan took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn owner_scan_finds_user_after_malformed_wal_frame() {
+    let policy = || {
+        DurableEnginePolicy::new(
+            GroupCommitPolicy::immediate(),
+            RecoveryRetryPolicy::immediate(),
+            ObjectCacheConfig::<StateOwner>::disabled(),
+        )
+        .with_transaction_wal(TransactionWalPolicy::enabled(
+            NonZeroU64::new(u64::MAX).unwrap(),
+        ))
+    };
+    let principal_source = tempfile::tempdir().unwrap();
+    let principal = DurableEngine::open_with_policy(
+        principal_source.path(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+        policy(),
+    )
+    .unwrap();
+    let commit = commit_record();
+    let commit_id = Blake3ObjectIdentityV1.identify(&commit);
+    principal
+        .commit(RootTransaction::new(
+            StateOwner::Principal(astrid_core::PrincipalUid::from_bytes([8; 32])),
+            None,
+            commit_id,
+            vec![(commit_id, commit)],
+        ))
+        .unwrap();
+    drop(principal);
+
+    let user_source = tempfile::tempdir().unwrap();
+    let user = DurableEngine::open_with_policy(
+        user_source.path(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+        policy(),
+    )
+    .unwrap();
+    let commit = commit_record();
+    let commit_id = Blake3ObjectIdentityV1.identify(&commit);
+    user.commit(RootTransaction::new(
+        user_owner(),
+        None,
+        commit_id,
+        vec![(commit_id, commit)],
+    ))
+    .unwrap();
+    drop(user);
+
+    let candidate = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        principal_source.path().join("transactions.wal"),
+        candidate.path().join("transactions.wal"),
+    )
+    .unwrap();
+    corrupt_last_byte(&candidate.path().join("transactions.wal"));
+    let principal_wal = std::fs::read(principal_source.path().join("transactions.wal")).unwrap();
+    while std::fs::metadata(candidate.path().join("transactions.wal"))
+        .unwrap()
+        .len()
+        < 128 * 1024
+    {
+        append_bytes(&principal_wal, &candidate.path().join("transactions.wal"));
+    }
+    assert!(
+        std::fs::metadata(candidate.path().join("transactions.wal"))
+            .unwrap()
+            .len()
+            <= 1024 * 1024,
+        "realistic WAL fixture must remain bounded"
+    );
+    append_file(
+        &user_source.path().join("transactions.wal"),
+        &candidate.path().join("transactions.wal"),
+    );
+    let before = std::fs::read(candidate.path().join("transactions.wal")).unwrap();
+    assert!(
+        before.len() >= 128 * 1024,
+        "realistic WAL size: {}",
+        before.len()
+    );
+
+    let started = std::time::Instant::now();
+
+    let observations = inspect_native_wal_owners_without_repair::<StateOwner, _>(
+        &candidate.path().join("transactions.wal"),
+        Blake3ObjectIdentityV1.scheme(),
+        &StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    assert!(observations.owners.contains(&user_owner()));
+    assert!(observations.scan_error.is_some());
+    assert_eq!(
+        std::fs::read(candidate.path().join("transactions.wal")).unwrap(),
+        before
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "bounded WAL resynchronization took {:?}",
+        started.elapsed()
+    );
 }
 
 fn user_bytes() -> Vec<u8> {
