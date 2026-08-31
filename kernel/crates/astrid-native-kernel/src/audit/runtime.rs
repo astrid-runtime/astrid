@@ -103,7 +103,7 @@ pub(crate) fn install_for_test(
 
 /// Records one event through the real verifier and retires it before return.
 #[inline(never)]
-pub(crate) fn record(event: AuditEvent) -> Result<AuditObservation, AuditError> {
+pub(crate) fn record(event: &AuditEvent) -> Result<AuditObservation, AuditError> {
     let mut runtime = RUNTIME.lock();
     let Some(runtime) = runtime.as_mut() else {
         return Err(AuditError::MalformedFrame);

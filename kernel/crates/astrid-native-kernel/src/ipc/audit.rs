@@ -86,7 +86,7 @@ pub(super) fn prepare_grant_event(
 }
 
 pub(super) fn record_grant(
-    event: AuditEvent,
+    event: &AuditEvent,
 ) -> Result<crate::audit::AuditObservation, super::IpcError> {
     match crate::audit::record(event) {
         Ok(observation) => Ok(observation),
@@ -163,7 +163,7 @@ pub(super) fn endpoint_create(domain: DomainToken) -> Result<(u64, u64), super::
             return Err(error);
         },
     };
-    let observation = match record_grant(event) {
+    let observation = match record_grant(&event) {
         Ok(observation) => observation,
         Err(error) => {
             *scratch = None;

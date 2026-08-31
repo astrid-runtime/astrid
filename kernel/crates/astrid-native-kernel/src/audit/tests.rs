@@ -366,7 +366,7 @@ fn immediate_retirement_rejects_retained_relay_evidence() {
     let verifier_before = (host_verifier.next_seq(), host_verifier.root());
 
     let folded = chain.append_verified(
-        domain_event(AuditClass::DomainAdmit),
+        &domain_event(AuditClass::DomainAdmit),
         &mut |frame: &[u8], root: &[u8; 32]| {
             let mut bad_root = *root;
             bad_root[0] ^= 1;
@@ -404,7 +404,7 @@ fn verified_staging_failure_leaves_chain_untouched() {
     let verifier_before = (host_verifier.next_seq(), host_verifier.root());
 
     let folded = chain.append_verified(
-        domain_event(AuditClass::DomainAdmit),
+        &domain_event(AuditClass::DomainAdmit),
         &mut |frame: &[u8], root: &[u8; 32]| {
             let mut bad_root = *root;
             bad_root[0] ^= 1;

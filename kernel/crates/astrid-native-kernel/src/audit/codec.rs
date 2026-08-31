@@ -5,6 +5,7 @@
 //! exactly one canonical byte representation and decoding rejects any
 //! non-canonical slack.
 
+use core::mem::MaybeUninit;
 use core::num::NonZeroU64;
 
 use super::types::{
@@ -52,12 +53,15 @@ pub struct Frame {
 }
 
 impl Frame {
-    pub(crate) fn new(
+    /// Constructs directly in caller-owned scratch so a live audit transition
+    /// does not materialize another frame-sized temporary on the small stack.
+    pub(crate) fn write_new<'out>(
+        out: &'out mut MaybeUninit<Self>,
         boot: BootSessionId,
         seq: u64,
         event: &AuditEvent,
         prev_root: Option<[u8; root::ROOT_LEN]>,
-    ) -> Result<Self, AuditError> {
+    ) -> Result<&'out mut Self, AuditError> {
         if event.class() == AuditClass::BoundedDenial {
             if event.object().is_some() {
                 return Err(AuditError::UnauthorizedDisclosure);
@@ -68,7 +72,7 @@ impl Frame {
         }
         let mut payload = [0; AUDIT_MAX_PAYLOAD];
         payload[..event.payload().len()].copy_from_slice(event.payload());
-        Ok(Self {
+        out.write(Self {
             boot,
             seq,
             class: event.class(),
@@ -78,7 +82,21 @@ impl Frame {
             payload,
             payload_len: event.payload().len(),
             prev_root,
-        })
+        });
+        // `write` initialized every field, including the bounded payload tail.
+        Ok(unsafe { out.assume_init_mut() })
+    }
+
+    pub(crate) fn new(
+        boot: BootSessionId,
+        seq: u64,
+        event: &AuditEvent,
+        prev_root: Option<[u8; root::ROOT_LEN]>,
+    ) -> Result<Self, AuditError> {
+        let mut slot = MaybeUninit::uninit();
+        Self::write_new(&mut slot, boot, seq, event, prev_root)?;
+        // `write_new` initialized the slot before returning success.
+        Ok(unsafe { slot.assume_init() })
     }
 
     pub(crate) fn encode<'out>(

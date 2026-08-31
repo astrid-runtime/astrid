@@ -8,6 +8,7 @@ use super::root;
 use super::types::{
     AuditAuthority, AuditCheckpoint, AuditError, AuditEvent, BootSessionId, KernelSecretEntropy,
 };
+use core::mem::MaybeUninit;
 pub(crate) struct AuditChain {
     boot: BootSessionId,
     authority: AuditAuthority,
@@ -16,6 +17,7 @@ pub(crate) struct AuditChain {
     root: [u8; root::ROOT_LEN],
     relay: AuditRelay,
     record_scratch: RecordScratch,
+    frame_scratch: MaybeUninit<Frame>,
 }
 
 /// Chain-owned canonical frame scratch. Keeping this in the static runtime
@@ -94,6 +96,7 @@ impl AuditChain {
                 root: [0; root::ROOT_LEN],
                 class: super::types::AuditClass::DomainCreate,
             },
+            frame_scratch: MaybeUninit::uninit(),
         })
     }
 
@@ -133,6 +136,7 @@ impl AuditChain {
                 root: [0; root::ROOT_LEN],
                 class: super::types::AuditClass::DomainCreate,
             },
+            frame_scratch: MaybeUninit::uninit(),
         })
     }
 
@@ -168,7 +172,7 @@ impl AuditChain {
         next: u64,
     ) -> Result<[u8; root::ROOT_LEN], AuditError> {
         let prev_root = Some(self.root);
-        let frame = Frame::new(self.boot, next, event, prev_root)?;
+        let frame = Frame::write_new(&mut self.frame_scratch, self.boot, next, event, prev_root)?;
         let encoded_len = frame.encode(&mut self.record_scratch.encoded)?.len();
         let next_root = self.root_hasher.advance(
             self.root,
@@ -243,7 +247,7 @@ impl AuditChain {
     #[inline(never)]
     pub(crate) fn append_verified<F>(
         &mut self,
-        event: AuditEvent,
+        event: &AuditEvent,
         verify: &mut F,
     ) -> Result<AuditObservation, AuditError>
     where
@@ -253,7 +257,7 @@ impl AuditChain {
             .seq
             .checked_add(1)
             .ok_or(AuditError::SequenceOverflow)?;
-        self.stage_record(&event, next)?;
+        self.stage_record(event, next)?;
 
         // Immediate-retire mode is exclusive. Any buffered/in-flight record
         // means the caller must use the retained-evidence path; checking here
