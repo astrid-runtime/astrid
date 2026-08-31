@@ -40,7 +40,7 @@ async fn fixture() -> (
                     None
                 }
             },
-            StateOwner::Fleet(_) => Some(u64::MAX),
+            StateOwner::Fleet(_) | StateOwner::User(_) => Some(u64::MAX),
         })
     });
     let store = open_runtime_principal_store_with_directory(&home, quota, principals.clone())

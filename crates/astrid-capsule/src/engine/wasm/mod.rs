@@ -4267,7 +4267,8 @@ mod lifecycle_context_tests {
                 Ok(match owner {
                     astrid_storage::StateOwner::System => None,
                     astrid_storage::StateOwner::Principal(_)
-                    | astrid_storage::StateOwner::Fleet(_) => Some(u64::MAX),
+                    | astrid_storage::StateOwner::Fleet(_)
+                    | astrid_storage::StateOwner::User(_) => Some(u64::MAX),
                 })
             });
         let principal_store = astrid_storage::open_runtime_principal_store_with_directory(

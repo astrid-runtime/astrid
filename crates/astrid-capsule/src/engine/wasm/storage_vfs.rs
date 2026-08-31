@@ -23,23 +23,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use astrid_vfs::{Vfs, VfsDirEntry, VfsError, VfsMetadata, VfsResult};
 
-type RuntimeFilesystem = AstridFilesystem<
-    StateOwner,
-    astrid_storage::engine::DurableEngine<
-        StateOwner,
-        astrid_storage::Blake3ObjectIdentityV1,
-        astrid_storage::StateOwnerCodecV2,
-    >,
->;
-
-type RuntimeWorkspaceFilesystem = astrid_storage::WorkspaceFilesystem<
-    StateOwner,
-    astrid_storage::engine::DurableEngine<
-        StateOwner,
-        astrid_storage::Blake3ObjectIdentityV1,
-        astrid_storage::StateOwnerCodecV2,
-    >,
->;
+type RuntimeFilesystem = astrid_storage::RuntimeFilesystem;
 
 trait StorageBackend: Send + Sync {
     fn stat(
@@ -100,7 +84,7 @@ impl StorageBackend for OwnerBackend {
     }
 }
 
-struct WorkspaceBackend(RuntimeWorkspaceFilesystem);
+struct WorkspaceBackend(astrid_storage::RuntimeWorkspaceFilesystem);
 
 impl StorageBackend for WorkspaceBackend {
     fn stat(
@@ -591,7 +575,9 @@ mod tests {
         let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
             Ok(match owner {
                 StateOwner::System => None,
-                StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+                StateOwner::Principal(_) | StateOwner::Fleet(_) | StateOwner::User(_) => {
+                    Some(u64::MAX)
+                },
             })
         });
         let store = open_runtime_principal_store(&home, quota)
@@ -744,7 +730,9 @@ mod tests {
         let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
             Ok(match owner {
                 StateOwner::System => None,
-                StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+                StateOwner::Principal(_) | StateOwner::Fleet(_) | StateOwner::User(_) => {
+                    Some(u64::MAX)
+                },
             })
         });
         let reopened = open_runtime_principal_store(&home, quota)

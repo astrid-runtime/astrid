@@ -426,7 +426,9 @@ mod recv_vfs_tests {
         let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
             Ok(match owner {
                 StateOwner::System => None,
-                StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+                StateOwner::Principal(_) | StateOwner::Fleet(_) | StateOwner::User(_) => {
+                    Some(u64::MAX)
+                },
             })
         });
         let store = open_runtime_principal_store(&astrid_home, quota)

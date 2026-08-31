@@ -111,6 +111,9 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             StateOwner::System => {
                 return Err("system workspace owner is not process-mountable".to_owned());
             },
+            StateOwner::User(_) => {
+                return Err("user workspace owner is not process-mountable".to_owned());
+            },
         };
         let access = StorageProviderAccessV1::ReadWrite;
         let key = ProcessProjectionKey {

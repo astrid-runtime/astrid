@@ -623,6 +623,7 @@ where
             commit: commit_id,
             records,
         } = transaction;
+        self.principal_codec.admit_principal(&principal)?;
         for (declared, record) in &records {
             let computed = self.identify(record);
             if computed != *declared {

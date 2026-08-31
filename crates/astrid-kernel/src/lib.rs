@@ -713,34 +713,7 @@ impl Kernel {
         // capsule engine share exactly one invalidatable profile cache.
         let profile_cache = Arc::new(PrincipalProfileCache::with_home(home.clone()));
         let principal_directory = astrid_storage::PrincipalDirectory::default();
-        let quota_cache = Arc::clone(&profile_cache);
-        let quota_principals = principal_directory.clone();
-        let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
-            Arc::new(move |owner: &astrid_storage::StateOwner| {
-                match owner {
-                    astrid_storage::StateOwner::System => Ok(None),
-                    astrid_storage::StateOwner::Principal(owner) => {
-                        quota_principals.alias_for(*owner).and_then(|principal| {
-                            quota_cache
-                                .resolve(&principal)
-                                .map(|profile| Some(profile.quotas.max_storage_bytes))
-                                .map_err(|error| {
-                                    astrid_storage::StorageError::Internal(format!(
-                                        "resolve storage quota for {principal}: {error}"
-                                    ))
-                                })
-                        })
-                    },
-                    // A fleet is a real writable owner. Until the allocation-policy
-                    // capsule admits a tighter fleet budget, retain the same hard
-                    // storage ceiling used by an unconfigured principal. Accounting
-                    // and enforcement remain in the kernel; policy does not run in
-                    // the storage transaction.
-                    astrid_storage::StateOwner::Fleet(_) => {
-                        Ok(Some(astrid_core::profile::DEFAULT_MAX_STORAGE_BYTES))
-                    },
-                }
-            });
+        let quota = runtime_quota_resolver(Arc::clone(&profile_cache), principal_directory.clone());
 
         // Open the authoritative state store. First cutover imports and
         // verifies legacy SurrealKV under the singleton lock before serving.
@@ -3565,7 +3538,7 @@ async fn open_test_runtime_kv(
                         })
                     })
             },
-            astrid_storage::StateOwner::Fleet(_) => {
+            astrid_storage::StateOwner::Fleet(_) | astrid_storage::StateOwner::User(_) => {
                 Ok(Some(astrid_core::profile::DEFAULT_MAX_STORAGE_BYTES))
             },
         });
@@ -4237,6 +4210,40 @@ fn load_or_generate_runtime_key(keys_dir: &Path) -> std::io::Result<KeyPair> {
     })?;
     astrid_core::platform_fs::restrict_private_file(&key_path)?;
     Ok(keypair)
+}
+
+#[cfg(unix)]
+fn runtime_quota_resolver(
+    profile_cache: Arc<PrincipalProfileCache>,
+    principals: astrid_storage::PrincipalDirectory,
+) -> Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> {
+    Arc::new(move |owner: &astrid_storage::StateOwner| match owner {
+        astrid_storage::StateOwner::System => Ok(None),
+        astrid_storage::StateOwner::Principal(owner) => {
+            principals.alias_for(*owner).and_then(|principal| {
+                profile_cache
+                    .resolve(&principal)
+                    .map(|profile| Some(profile.quotas.max_storage_bytes))
+                    .map_err(|error| {
+                        astrid_storage::StorageError::Internal(format!(
+                            "resolve storage quota for {principal}: {error}"
+                        ))
+                    })
+            })
+        },
+        // A fleet is a real writable owner. Until the allocation-policy capsule
+        // admits a tighter fleet budget, retain the same hard storage ceiling
+        // used by an unconfigured principal. Accounting and enforcement remain
+        // in the kernel; policy does not run in the storage transaction.
+        astrid_storage::StateOwner::Fleet(_) => {
+            Ok(Some(astrid_core::profile::DEFAULT_MAX_STORAGE_BYTES))
+        },
+        // Storage's runtime codec fails closed before invoking this resolver;
+        // retain an explicit denial if that boundary is bypassed.
+        astrid_storage::StateOwner::User(_) => Err(astrid_storage::StorageError::Internal(
+            "user StateOwner is not admitted by runtime owner codec V2".to_owned(),
+        )),
+    })
 }
 
 /// Spawns the persistent-daemon idle monitor.

@@ -13,7 +13,9 @@ use crate::error::StorageResult;
 use crate::principal_state::native_io::{
     PrivateFileIdentity, open_private_file, validate_private_regular_file,
 };
-use crate::principal_state::{StateOwner, StateOwnerCodecV2};
+use crate::principal_state::{
+    RuntimeStateOwnerCodecV2, StateOwner, ensure_runtime_state_owner_admitted,
+};
 
 const INTENT_MAGIC: &[u8; 16] = b"ASTRID-STAGE-V2\0";
 const INTENT_VERSION: u16 = 2;
@@ -57,7 +59,8 @@ pub(super) struct LegacyStagingIntent {
 }
 
 pub(super) fn encode_intent(intent: &StagingIntent) -> StorageResult<Vec<u8>> {
-    let owner = StateOwnerCodecV2.encode(&intent.owner);
+    ensure_runtime_state_owner_admitted(&intent.owner)?;
+    let owner = RuntimeStateOwnerCodecV2.encode(&intent.owner);
     encode_fields(
         INTENT_MAGIC,
         INTENT_VERSION,
@@ -333,7 +336,7 @@ pub(super) fn decode_intent(bytes: &[u8]) -> Result<StagingIntent, &'static str>
         "astrid native content staging intent v2",
         true,
     )?;
-    let owner = StateOwnerCodecV2
+    let owner = RuntimeStateOwnerCodecV2
         .decode(&fields.owner)
         .ok_or("invalid staged owner")?;
     Ok(StagingIntent {
@@ -513,5 +516,36 @@ impl<'a> Decoder<'a> {
 
     fn is_empty(&self) -> bool {
         self.position == self.bytes.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{INTENT_MAGIC, INTENT_VERSION, StagedContentId, decode_intent, encode_fields};
+    use crate::content::{ChunkingProfile, ContentName};
+    use uuid::Uuid;
+
+    #[test]
+    fn recovery_rejects_forged_user_owner_without_decoding() {
+        let mut owner = vec![3];
+        owner.extend_from_slice(&[11; 32]);
+        let bytes = encode_fields(
+            INTENT_MAGIC,
+            INTENT_VERSION,
+            7,
+            StagedContentId(Uuid::from_u128(11)),
+            &owner,
+            &ContentName::new("forged.bin").unwrap(),
+            ChunkingProfile::ASTRID_V1,
+            0,
+            "astrid native content staging intent v2",
+            true,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            decode_intent(&bytes).unwrap_err(),
+            "invalid staged owner"
+        ));
     }
 }

@@ -7,7 +7,7 @@ use crate::error::{StorageError, StorageResult};
 use crate::volume::{AstridVolume, HostedFileVolume, VolumeRegion};
 use astrid_core::dirs::AstridHome;
 
-use super::{Blake3ObjectIdentityV1, RuntimeEngine, StateOwner, StateOwnerCodecV2};
+use super::{Blake3ObjectIdentityV1, RuntimeEngine, RuntimeStateOwnerCodecV2, StateOwner};
 
 const CUTOVER_RECEIPT_REGION: &str = "system/migrations/directory-store-to-volume-v1";
 const MAX_CUTOVER_RECEIPT_BYTES: u64 = 256;
@@ -32,7 +32,7 @@ pub(super) fn open_existing(
     let engine = RuntimeEngine::open_volume(
         volume.clone(),
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV2,
+        RuntimeStateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
         policy,
     )
@@ -121,7 +121,7 @@ pub(super) fn migrate_directory_store(
     let migrated = RuntimeEngine::open_volume(
         volume.clone(),
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV2,
+        RuntimeStateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
         DurableEnginePolicy::default(),
     )
@@ -158,7 +158,7 @@ pub(super) fn migrate_directory_store(
     let engine = RuntimeEngine::open_volume(
         volume.clone(),
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV2,
+        RuntimeStateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
         policy,
     )
@@ -189,7 +189,7 @@ pub(super) fn retire_verified_directory_if_present(
             let source = RuntimeEngine::open_with_policy(
                 &path,
                 Blake3ObjectIdentityV1,
-                StateOwnerCodecV2,
+                RuntimeStateOwnerCodecV2,
                 RecoveryLimits::process_addressable(),
                 DurableEnginePolicy::default(),
             )
@@ -333,7 +333,7 @@ fn cutover_receipt(snapshots: &[(StateOwner, RootSnapshot)]) -> String {
     let mut material = Vec::new();
     material.extend_from_slice(b"astrid-directory-store-to-volume-v1\0");
     for (owner, snapshot) in snapshots {
-        material.extend_from_slice(&StateOwnerCodecV2.encode(owner));
+        material.extend_from_slice(&RuntimeStateOwnerCodecV2.encode(owner));
         material.extend_from_slice(&snapshot.root().generation.get().to_le_bytes());
         material.extend_from_slice(snapshot.root().commit.as_bytes());
         for (id, _) in snapshot.records() {

@@ -25,7 +25,7 @@ use super::native_io::private_file_identity;
 use super::native_io::{
     PrivateDirectory, PrivateFileIdentity, create_private_file, ensure_private_directory,
 };
-use super::{NativePrincipalContentStore, StateOwner};
+use super::{NativePrincipalContentStore, StateOwner, ensure_runtime_state_owner_admitted};
 use crate::content::{ChunkingProfile, ContentBatchWriteOutcome, ContentName, ContentWriteOutcome};
 use crate::error::{StorageError, StorageResult};
 
@@ -314,6 +314,7 @@ impl NativeContentStagingArea {
         profile: ChunkingProfile,
         id: StagedContentId,
     ) -> StorageResult<StagedContentWriter> {
+        ensure_runtime_state_owner_admitted(&owner)?;
         let path = self.inner.generations.join(open_generation_name(id));
         let file = {
             let mut order = self.inner.seal_order.lock();
@@ -390,6 +391,7 @@ impl NativeContentStagingArea {
     ///
     /// Returns a storage or content-publication error. The staged bytes remain
     /// available whenever cleanup did not complete.
+    #[allow(private_interfaces)]
     pub async fn publish(
         &self,
         staged: ReadyStagedContent,
@@ -421,6 +423,7 @@ impl NativeContentStagingArea {
     ///
     /// Returns a staging or content-publication error while retaining every
     /// unacknowledged generation for idempotent retry.
+    #[allow(private_interfaces)]
     pub async fn publish_batch(
         &self,
         staged: Vec<ReadyStagedContent>,
@@ -621,6 +624,7 @@ fn publish_ready(
     staged: &ReadyStagedContent,
     content: &NativePrincipalContentStore,
 ) -> StorageResult<ContentWriteOutcome> {
+    ensure_runtime_state_owner_admitted(&staged.owner)?;
     let (source, _) = open_generation_in(
         &area.inner.generations_directory,
         &staged.content_path(),
@@ -679,6 +683,7 @@ fn publish_ready_batch(
     owner: StateOwner,
     content: &NativePrincipalContentStore,
 ) -> StorageResult<ContentBatchWriteOutcome> {
+    ensure_runtime_state_owner_admitted(&owner)?;
     let outcome = if let Some((mut remaining, limit)) =
         content.quota_staging_bound(&owner).map_err(|error| {
             StorageError::Internal(format!("resolve staged content batch quota: {error}"))

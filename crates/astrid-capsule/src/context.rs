@@ -203,14 +203,7 @@ pub struct WorkspaceBranchService {
     store: astrid_storage::RuntimePrincipalStore,
     directory: astrid_storage::PrincipalDirectory,
     ownership: Option<Arc<astrid_storage::OwnershipStore>>,
-    branches: astrid_storage::WorkspaceBranchStore<
-        astrid_storage::StateOwner,
-        astrid_storage::engine::DurableEngine<
-            astrid_storage::StateOwner,
-            astrid_storage::Blake3ObjectIdentityV1,
-            astrid_storage::StateOwnerCodecV2,
-        >,
-    >,
+    branches: astrid_storage::RuntimeWorkspaceBranchStore,
     /// Serializes the check/lookup/begin/insert sequence. The separate async
     /// gate keeps the synchronous binding map lock out of await points while
     /// still ensuring concurrent capsule loads cannot create two branches.
@@ -362,14 +355,7 @@ impl WorkspaceBranchService {
     pub fn filesystem(
         &self,
         binding: WorkspaceBranchBinding,
-    ) -> astrid_storage::WorkspaceFilesystem<
-        astrid_storage::StateOwner,
-        astrid_storage::engine::DurableEngine<
-            astrid_storage::StateOwner,
-            astrid_storage::Blake3ObjectIdentityV1,
-            astrid_storage::StateOwnerCodecV2,
-        >,
-    > {
+    ) -> astrid_storage::RuntimeWorkspaceFilesystem {
         self.branches.filesystem(binding.owner, binding.branch)
     }
 

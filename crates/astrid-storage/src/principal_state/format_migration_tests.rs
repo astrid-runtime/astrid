@@ -17,7 +17,8 @@ use super::format_amendment::{
     store_metadata,
 };
 use super::{
-    Blake3ObjectIdentityV1, RuntimeEngine, StateOwnerCodecV1, StateOwnerCodecV2, StateOwnerV1,
+    Blake3ObjectIdentityV1, RuntimeEngine, RuntimeStateOwnerCodecV2, StateOwnerCodecV1,
+    StateOwnerV1,
 };
 use astrid_core::dirs::AstridHome;
 use astrid_core::identity::PrincipalUid;
@@ -74,7 +75,7 @@ pub(super) fn seed_current_directory_store(home: &AstridHome) {
     let engine = RuntimeEngine::open(
         &path,
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV2,
+        RuntimeStateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
     )
     .unwrap();
