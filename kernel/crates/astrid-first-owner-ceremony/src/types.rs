@@ -46,7 +46,7 @@ byte_key!(
 );
 byte_key!(
     RecoveryMemberId,
-    InvalidRecoveryPolicy,
+    InvalidRecoveryMemberKey,
     "A member key in a pre-enrolled threshold recovery policy."
 );
 byte_key!(
@@ -106,6 +106,8 @@ impl RecoveryPolicy {
         let mut values = [None; MAX_RECOVERY_MEMBERS];
         let mut index = 0;
         while index < members.len() {
+            ed25519_dalek::VerifyingKey::from_bytes(&members[index])
+                .map_err(|_| CeremonyError::InvalidRecoveryMemberKey)?;
             let member = RecoveryMemberId::try_from_bytes(members[index])?;
             if index != 0 {
                 let Some(previous) = values[index - 1] else {

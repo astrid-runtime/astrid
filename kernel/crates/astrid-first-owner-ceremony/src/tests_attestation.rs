@@ -4,8 +4,8 @@ use crate::test_support::{
     anchor_key, base_input, bytes, data_key, device_key, presence_key, sign_two, transcript,
 };
 use crate::transcript::{
-    MEMBER_COUNT_OFFSET, MEMBERS_OFFSET, RECOVERY_PRESENT_FLAG, THRESHOLD_OFFSET, TRANSCRIPT_LEN,
-    Transcript,
+    MEMBER_COUNT_OFFSET, RECOVERY_PRESENT_FLAG, RESERVED_LEN, RESERVED_OFFSET, THRESHOLD_OFFSET,
+    TRANSCRIPT_LEN, Transcript,
 };
 use crate::types::AnchorKey;
 use crate::types::{CeremonyNonce, MachineGeneration, RecoveryPolicy};
@@ -21,10 +21,13 @@ fn transcript_layout_is_fixed_and_canonical() {
     assert_eq!(canonical[THRESHOLD_OFFSET], 0);
     assert_eq!(canonical[MEMBER_COUNT_OFFSET], 0);
     assert!(
-        canonical[MEMBERS_OFFSET..MEMBERS_OFFSET + 256]
+        canonical[THRESHOLD_OFFSET..RESERVED_OFFSET]
             .iter()
             .all(|byte| *byte == 0)
     );
+    assert_eq!(RESERVED_OFFSET, 468);
+    assert_eq!(RESERVED_LEN, 8);
+    assert!(canonical[RESERVED_OFFSET..].iter().all(|byte| *byte == 0));
 }
 
 #[test]
@@ -96,7 +99,15 @@ fn recovery_policy_is_sorted_unique_and_thresholded() {
     );
     assert_eq!(
         RecoveryPolicy::try_new(&[[0; 32]], 1),
-        Err(CeremonyError::InvalidRecoveryPolicy)
+        Err(CeremonyError::InvalidRecoveryMemberKey)
+    );
+    assert_eq!(
+        RecoveryPolicy::try_new(&[[2; 32]], 1),
+        Err(CeremonyError::InvalidRecoveryMemberKey)
+    );
+    assert_eq!(
+        RecoveryPolicy::try_new(&[bytes(1), [2; 32]], 2),
+        Err(CeremonyError::InvalidRecoveryMemberKey)
     );
 }
 
@@ -137,13 +148,13 @@ fn invalid_or_ambiguous_identity_sets_fail_closed() {
     same_anchor.anchor_key = anchor_key(1);
     assert_eq!(
         Transcript::try_new(same_anchor),
-        Err(CeremonyError::AttestationInvalid)
+        Err(CeremonyError::AuthorityKeyAliasing)
     );
     let mut same_presence = base_input();
     same_presence.presence_key = presence_key(1);
     assert_eq!(
         Transcript::try_new(same_presence),
-        Err(CeremonyError::AttestationInvalid)
+        Err(CeremonyError::AuthorityKeyAliasing)
     );
 }
 

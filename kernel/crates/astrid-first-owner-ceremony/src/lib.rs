@@ -35,6 +35,8 @@ mod test_support;
 #[cfg(test)]
 mod tests_attestation;
 #[cfg(test)]
+mod tests_authority;
+#[cfg(test)]
 mod tests_cut_point;
 #[cfg(test)]
 mod tests_recovery;

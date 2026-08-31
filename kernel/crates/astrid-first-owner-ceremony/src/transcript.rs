@@ -9,7 +9,6 @@ use crate::types::{
 pub const MAGIC: &[u8; 8] = b"ASTRIDFO";
 pub const TRANSCRIPT_VERSION: u8 = 1;
 pub const RECOVERY_PRESENT_FLAG: u8 = 1;
-pub const TRANSCRIPT_LEN: usize = 8 + 1 + 1 + 8 + KEY_LEN + (KEY_LEN * 5) + 8 + 2 + (KEY_LEN * 8);
 
 const DEVICE_OFFSET: usize = 18 + KEY_LEN;
 const ANCHOR_OFFSET: usize = DEVICE_OFFSET + KEY_LEN;
@@ -19,6 +18,13 @@ const NONCE_OFFSET: usize = DATA_KEY_OFFSET + KEY_LEN;
 pub const THRESHOLD_OFFSET: usize = NONCE_OFFSET + KEY_LEN;
 pub const MEMBER_COUNT_OFFSET: usize = THRESHOLD_OFFSET + 1;
 pub const MEMBERS_OFFSET: usize = MEMBER_COUNT_OFFSET + 1;
+pub const RESERVED_OFFSET: usize = MEMBERS_OFFSET + KEY_LEN * crate::types::MAX_RECOVERY_MEMBERS;
+pub const RESERVED_LEN: usize = 8;
+pub const TRANSCRIPT_LEN: usize = RESERVED_OFFSET + RESERVED_LEN;
+
+// V1 keeps threshold/count/member slots zero and represents the exact policy
+// only through its commitment. The trailing bytes are reserved zero for a
+// versioned format extension; all padding is invariant.
 
 /// All fields bound by the candidate-device and anchor signatures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,15 +62,12 @@ impl Transcript {
             input.presence_key.as_bytes(),
             CeremonyError::InvalidPresenceKey,
         )?;
-        if input.owner_device_key
-            == DeviceKey::try_from_bytes(input.anchor_key.as_bytes())
-                .map_err(|_| CeremonyError::AttestationInvalid)?
-            || input.owner_device_key
-                == DeviceKey::try_from_bytes(input.presence_key.as_bytes())
-                    .map_err(|_| CeremonyError::AttestationInvalid)?
-        {
-            return Err(CeremonyError::AttestationInvalid);
-        }
+        ensure_authority_keys_disjoint(
+            input.owner_device_key.as_bytes(),
+            input.anchor_key.as_bytes(),
+            input.presence_key.as_bytes(),
+            input.recovery_policy,
+        )?;
 
         let recovery_commitment = input
             .recovery_policy
@@ -149,5 +152,29 @@ pub(crate) fn absent_recovery_commitment() -> [u8; KEY_LEN] {
 
 fn validate_key(bytes: [u8; KEY_LEN], error: CeremonyError) -> Result<(), CeremonyError> {
     ed25519_dalek::VerifyingKey::from_bytes(&bytes).map_err(|_| error)?;
+    Ok(())
+}
+
+fn ensure_authority_keys_disjoint(
+    owner: [u8; KEY_LEN],
+    anchor: [u8; KEY_LEN],
+    presence: [u8; KEY_LEN],
+    recovery: Option<RecoveryPolicy>,
+) -> Result<(), CeremonyError> {
+    if owner == anchor || owner == presence || anchor == presence {
+        return Err(CeremonyError::AuthorityKeyAliasing);
+    }
+
+    let mut index = 0;
+    while index < crate::types::MAX_RECOVERY_MEMBERS {
+        if let Some(member) = recovery.and_then(|policy| policy.member(index))
+            && (member.as_bytes() == owner
+                || member.as_bytes() == anchor
+                || member.as_bytes() == presence)
+        {
+            return Err(CeremonyError::AuthorityKeyAliasing);
+        }
+        index += 1;
+    }
     Ok(())
 }
