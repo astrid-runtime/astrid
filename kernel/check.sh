@@ -93,6 +93,7 @@ run_portability() {
     "astrid-system-generation|--no-default-features"
     "astrid-boot-selection|--no-default-features"
     "astrid-init-plan|"
+    "astrid-first-owner-ceremony|--no-default-features"
   )
 
   for target in "${targets[@]}"; do
@@ -131,7 +132,7 @@ case "$mode" in
 esac
 
 echo "== cargo fmt (kernel packages; vendored bootloader uses its own pinned toolchain) =="
-cargo fmt -p astrid-native-closure -p astrid-native-kernel -p astrid-boot-selection -p astrid-init-plan -p astrid-system-generation -p kimage -p ktest -- --check
+cargo fmt -p astrid-native-closure -p astrid-native-kernel -p astrid-boot-selection -p astrid-init-plan -p astrid-first-owner-ceremony -p astrid-system-generation -p kimage -p ktest -- --check
 
 echo "== stable cargo test -p astrid-native-closure --locked =="
 cargo test -p astrid-native-closure --locked
@@ -183,6 +184,18 @@ cargo check -p astrid-init-plan --target x86_64-unknown-none --locked
 
 echo "== stable cargo clippy -p astrid-init-plan --target x86_64-unknown-none =="
 cargo clippy -p astrid-init-plan --target x86_64-unknown-none --locked -- -D warnings
+
+echo "== stable cargo test -p astrid-first-owner-ceremony --locked =="
+cargo test -p astrid-first-owner-ceremony --locked
+
+echo "== stable cargo clippy -p astrid-first-owner-ceremony --all-targets --locked =="
+cargo clippy -p astrid-first-owner-ceremony --all-targets --locked -- -D warnings
+
+echo "== stable cargo check -p astrid-first-owner-ceremony --target x86_64-unknown-none (no default features) =="
+cargo check -p astrid-first-owner-ceremony --no-default-features --target x86_64-unknown-none --locked
+
+echo "== stable cargo clippy -p astrid-first-owner-ceremony --target x86_64-unknown-none (no default features) =="
+cargo clippy -p astrid-first-owner-ceremony --no-default-features --target x86_64-unknown-none --locked -- -D warnings
 
 echo "== stable cargo check -p astrid-native-closure --no-default-features (x86_64-unknown-none) =="
 cargo check -p astrid-native-closure --no-default-features --target x86_64-unknown-none --locked
