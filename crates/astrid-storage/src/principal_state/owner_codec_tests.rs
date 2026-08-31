@@ -384,3 +384,89 @@ fn forged_tag3_transaction_wal_recovery_fails_closed() {
     );
     assert_eq!(std::fs::read(&roots).unwrap(), Vec::<u8>::new());
 }
+
+#[test]
+fn forged_tag3_wal_with_missing_object_preserves_recovery_inputs() {
+    let source = tempfile::tempdir().unwrap();
+    let policy = || {
+        DurableEnginePolicy::new(
+            GroupCommitPolicy::immediate(),
+            RecoveryRetryPolicy::immediate(),
+            ObjectCacheConfig::<StateOwner>::disabled(),
+        )
+        .with_transaction_wal(TransactionWalPolicy::enabled(
+            NonZeroU64::new(u64::MAX).unwrap(),
+        ))
+    };
+    let commit = commit_record();
+    let commit_id = Blake3ObjectIdentityV1.identify(&commit);
+    let source_engine = DurableEngine::open_with_policy(
+        source.path(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+        policy(),
+    )
+    .unwrap();
+    source_engine
+        .commit(RootTransaction::new(
+            user_owner(),
+            None,
+            commit_id,
+            vec![(commit_id, commit.clone())],
+        ))
+        .unwrap();
+    drop(source_engine);
+
+    let empty = tempfile::tempdir().unwrap();
+    let empty_engine = DurableEngine::open_with_policy(
+        empty.path(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+        policy(),
+    )
+    .unwrap();
+    empty_engine.close().unwrap();
+
+    let candidate = tempfile::tempdir().unwrap();
+    for name in ["objects.arena", "objects.index", "roots.journal"] {
+        std::fs::copy(empty.path().join(name), candidate.path().join(name)).unwrap();
+    }
+    std::fs::copy(
+        source.path().join("transactions.wal"),
+        candidate.path().join("transactions.wal"),
+    )
+    .unwrap();
+
+    let inputs = [
+        "objects.arena",
+        "objects.index",
+        "roots.journal",
+        "transactions.wal",
+    ]
+    .map(|name| (name, file_bytes(&candidate.path().join(name))));
+    assert!(inputs.iter().any(|(_, bytes)| {
+        bytes
+            .windows(user_bytes().len())
+            .any(|window| window == user_bytes())
+    }));
+
+    let error = RuntimeEngine::open(
+        candidate.path(),
+        Blake3ObjectIdentityV1,
+        RuntimeStateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        DurableError::Corrupt {
+            detail: "WAL principal encoding is not canonical",
+            ..
+        }
+    ));
+    for (name, bytes) in inputs {
+        assert_eq!(file_bytes(&candidate.path().join(name)), bytes, "{name}");
+    }
+}

@@ -2,12 +2,19 @@
 
 use std::sync::Arc;
 
-use crate::engine::{DurableEnginePolicy, PrincipalCodec, RecoveryLimits, RootSnapshot};
+use crate::engine::durable::{
+    inspect_volume_root_history_without_repair, inspect_volume_wal_owners_without_repair,
+};
+use crate::engine::{
+    DurableEnginePolicy, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits, RootSnapshot,
+};
 use crate::error::{StorageError, StorageResult};
 use crate::volume::{AstridVolume, HostedFileVolume, VolumeRegion};
 use astrid_core::dirs::AstridHome;
 
-use super::{Blake3ObjectIdentityV1, RuntimeEngine, RuntimeStateOwnerCodecV2, StateOwner};
+use super::{
+    Blake3ObjectIdentityV1, RuntimeEngine, RuntimeStateOwnerCodecV2, StateOwner, StateOwnerCodecV2,
+};
 
 const CUTOVER_RECEIPT_REGION: &str = "system/migrations/directory-store-to-volume-v1";
 const MAX_CUTOVER_RECEIPT_BYTES: u64 = 256;
@@ -63,6 +70,7 @@ fn promote_legacy_volume(home: &AstridHome) -> StorageResult<Option<std::path::P
         ))),
         (true, false) => Ok(Some(canonical)),
         (false, true) => {
+            reject_runtime_forbidden_legacy_volume(&legacy)?;
             super::native_io::rename_private_entry(&legacy, &canonical)?;
             let legacy_parent = legacy.parent().ok_or_else(|| {
                 connection(format!(
@@ -76,6 +84,52 @@ fn promote_legacy_volume(home: &AstridHome) -> StorageResult<Option<std::path::P
         },
         (false, false) => Ok(None),
     }
+}
+
+/// Preflight the canonical owner grammar without weakening malformed handling.
+///
+/// A scan error is deliberately ignored: incompatible or damaged media keeps
+/// its current downstream failure behavior. A successfully decoded canonical
+/// User owner is rejected before the legacy path can disappear.
+fn reject_runtime_forbidden_legacy_volume(path: &std::path::Path) -> StorageResult<()> {
+    let volume = HostedFileVolume::open(path).map_err(|error| {
+        connection(format!(
+            "open legacy Astrid storage volume {}: {error}",
+            path.display()
+        ))
+    })?;
+    let volume: Arc<dyn AstridVolume> = volume;
+    let roots = inspect_volume_root_history_without_repair::<StateOwner, StateOwnerCodecV2>(
+        &volume,
+        Blake3ObjectIdentityV1.scheme(),
+        &StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    );
+    if let Ok(roots) = &roots
+        && roots
+            .keys()
+            .any(|owner| matches!(owner, StateOwner::User(_)))
+    {
+        return Err(connection(
+            "legacy Astrid storage volume contains an explicit user StateOwner; promotion is refused before durable recovery",
+        ));
+    }
+    let wal_owners = inspect_volume_wal_owners_without_repair::<StateOwner, _, _>(
+        &volume,
+        &Blake3ObjectIdentityV1,
+        &StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    );
+    if let Ok(wal_owners) = &wal_owners
+        && wal_owners
+            .iter()
+            .any(|owner| matches!(owner, StateOwner::User(_)))
+    {
+        return Err(connection(
+            "legacy Astrid storage volume contains a user-owned WAL transaction; promotion is refused before durable recovery",
+        ));
+    }
+    Ok(())
 }
 
 fn inspect_volume_entry(path: &std::path::Path) -> StorageResult<bool> {

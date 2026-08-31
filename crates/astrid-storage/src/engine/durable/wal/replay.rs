@@ -128,6 +128,39 @@ where
     Ok(committed)
 }
 
+/// Decode root owners from a WAL without consuming or repairing any bytes.
+pub(crate) fn wal_root_owners_without_repair<P, I, C>(
+    wal: &File,
+    identity: SharedIdentity<I>,
+    codec: &SharedPrincipalCodec<C>,
+    limits: RecoveryLimits,
+) -> Result<BTreeSet<P>, DurableError>
+where
+    P: Ord,
+    I: PersistentObjectIdentity,
+    C: PrincipalCodec<P>,
+{
+    let reader = wal
+        .try_clone()
+        .map_err(|source| io_error("clone ASTWAL2 owner probe reader", source))?;
+    let mut scanner =
+        WalScanner::new(reader, identity, codec.clone(), limits).map_err(durable_error)?;
+    let mut owners = BTreeSet::new();
+    while let Some(event) = scanner.next_event().map_err(durable_error)? {
+        let WalEvent::Root(root) = event else {
+            continue;
+        };
+        let principal = codec
+            .decode(root.transition().principal())
+            .ok_or(DurableError::InvalidPrincipal { offset: 0 })?;
+        if codec.encode(&principal) != root.transition().principal() {
+            return Err(DurableError::InvalidPrincipal { offset: 0 });
+        }
+        owners.insert(principal);
+    }
+    Ok(owners)
+}
+
 /// Replay an existing ASTWAL2 stream and return a writer resumed at its clean
 /// append boundary.
 ///

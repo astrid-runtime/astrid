@@ -5,7 +5,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::engine::{DurableEngine, DurableError, PrincipalCodec, RecoveryLimits};
+use crate::engine::durable::inspect_native_root_history_without_repair;
+use crate::engine::{
+    DurableEngine, DurableError, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
+};
 use astrid_core::dirs::AstridHome;
 use astrid_core::identity::PrincipalIdentity;
 use astrid_core::principal::PrincipalId;
@@ -15,7 +18,7 @@ use super::native_io::{atomic_write, rename_private_entry, sync_directory};
 use super::staging;
 use super::{
     Blake3ObjectIdentityV1, PrincipalDirectory, RuntimeEngine, RuntimeStateOwnerCodecV2,
-    RuntimeStore, StateOwner, StateOwnerResolver,
+    RuntimeStore, StateOwner, StateOwnerCodecV2, StateOwnerResolver,
 };
 use crate::error::{StorageError, StorageResult};
 use crate::identity::{IdentityStore, KvIdentityStore};
@@ -560,8 +563,33 @@ fn recover_missing_active_root(store: &Path) -> StorageResult<()> {
             "principal owner migration lost every root-journal candidate".to_owned(),
         ));
     };
+    reject_runtime_forbidden_root_candidate(&source)?;
     rename_private_entry(&source, &active)?;
     sync_directory(store)
+}
+
+/// Reject only a successfully decoded canonical User candidate before rename.
+///
+/// Invalid or incompatible journal bytes continue to the existing runtime
+/// recovery path, preserving today's generic corruption classification.
+fn reject_runtime_forbidden_root_candidate(path: &Path) -> StorageResult<()> {
+    let roots = inspect_native_root_history_without_repair::<StateOwner, StateOwnerCodecV2>(
+        path,
+        Blake3ObjectIdentityV1.scheme(),
+        &StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    );
+    if let Ok(roots) = &roots
+        && roots
+            .keys()
+            .any(|owner| matches!(owner, StateOwner::User(_)))
+    {
+        return Err(StorageError::Connection(format!(
+            "principal owner migration root candidate {} contains an explicit user StateOwner; promotion is refused",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn promote_root_snapshot(store: &Path) -> StorageResult<()> {
@@ -775,5 +803,62 @@ mod tests {
                 .to_string()
                 .contains("lost every root-journal candidate")
         );
+    }
+
+    #[test]
+    fn missing_active_user_candidates_are_rejected_before_rename() {
+        use crate::engine::RootTransaction;
+        use crate::storage_model::{ObjectClass, ObjectFormatVersion, ObjectKind, ObjectRecord};
+
+        let user_root_bytes = |destination: &Path| {
+            let fixture = tempfile::tempdir().unwrap();
+            let engine = DurableEngine::open(
+                fixture.path(),
+                Blake3ObjectIdentityV1,
+                StateOwnerCodecV2,
+                RecoveryLimits::process_addressable(),
+            )
+            .unwrap();
+            let commit = ObjectRecord::new(
+                ObjectKind::Commit,
+                ObjectFormatVersion::V1,
+                b"migration candidate user owner".to_vec(),
+                Vec::new(),
+                0,
+                ObjectClass::Metadata,
+            )
+            .unwrap();
+            let commit_id = Blake3ObjectIdentityV1.identify(&commit);
+            engine
+                .commit(RootTransaction::new(
+                    StateOwner::User(astrid_core::UserUid::from_bytes([23; 32])),
+                    None,
+                    commit_id,
+                    vec![(commit_id, commit)],
+                ))
+                .unwrap();
+            engine
+                .write_mapped_root_snapshot(destination, &StateOwnerCodecV2, |owner| Ok(*owner))
+                .unwrap();
+            engine.close().unwrap();
+            std::fs::read(destination).unwrap()
+        };
+
+        for candidate in [REPLACEMENT_ROOT_FILE, PREVIOUS_ROOT_FILE] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = directory.path();
+            let candidate_path = store.join(candidate);
+            let bytes = user_root_bytes(&candidate_path);
+
+            let error = recover_missing_active_root(store).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("explicit user StateOwner; promotion is refused"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&candidate_path).unwrap(), bytes);
+            assert!(!store.join(ROOT_FILE).exists());
+        }
     }
 }

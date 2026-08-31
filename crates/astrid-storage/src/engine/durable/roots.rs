@@ -7,7 +7,8 @@ use crate::storage_model::{ModelError, ObjectId, RootGeneration, RootState};
 use super::{
     ArenaLocation, DurableError, DurableIo, File, IdentityScheme, PersistentObjectIdentity,
     PrincipalCodec, ROOT_FILE, ROOT_MAGIC, RecoveryLimits, corrupt, materialize_closure,
-    preload_indexed_closures, recovery_closure_error, scan_frames, validate_commit_closure,
+    preload_indexed_closures, recovery_closure_error, scan_frames, scan_frames_readonly,
+    validate_commit_closure,
 };
 
 const SNAPSHOT_SENTINEL: u64 = u64::MAX;
@@ -27,6 +28,28 @@ where
 {
     let mut recovered = BTreeMap::<P, (RootState, u64)>::new();
     scan_frames(roots, ROOT_FILE, ROOT_MAGIC, limits, |offset, payload| {
+        let record = decode_root_journal_record(payload, scheme)
+            .map_err(|detail| corrupt(ROOT_FILE, offset, detail))?;
+        apply_root_journal_record(&mut recovered, codec, scheme, offset, payload, record)
+    })?;
+    Ok(recovered)
+}
+
+/// Decode root history without tail repair; promotion uses this only to
+/// recognize a canonical runtime-forbidden owner before changing any path.
+pub(super) fn probe_root_history_without_repair<P, C, R>(
+    roots: &mut R,
+    codec: &C,
+    scheme: IdentityScheme,
+    limits: RecoveryLimits,
+) -> Result<BTreeMap<P, (RootState, u64)>, DurableError>
+where
+    P: Ord,
+    C: PrincipalCodec<P>,
+    R: DurableIo,
+{
+    let mut recovered = BTreeMap::<P, (RootState, u64)>::new();
+    scan_frames_readonly(roots, ROOT_FILE, ROOT_MAGIC, limits, |offset, payload| {
         let record = decode_root_journal_record(payload, scheme)
             .map_err(|detail| corrupt(ROOT_FILE, offset, detail))?;
         apply_root_journal_record(&mut recovered, codec, scheme, offset, payload, record)

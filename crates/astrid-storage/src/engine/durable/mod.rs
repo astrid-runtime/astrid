@@ -856,7 +856,8 @@ use format::{
     PreparedFrame, append_frame, append_frames, append_prepared_frames, canonical_record_bytes,
     corrupt, decode_object_frame, encode_object_frame, ensure_payload_limit, io_error,
     read_indexed_object, read_indexed_object_with_payload, read_indexed_objects, recover_arena,
-    scan_frames, verify_indexed_location, verify_indexed_tail, visit_indexed_objects,
+    scan_frames, scan_frames_readonly, verify_indexed_location, verify_indexed_tail,
+    visit_indexed_objects,
 };
 #[cfg(test)]
 use format::{frame_checksum, last_batch_spans, open_rw};
@@ -865,8 +866,40 @@ use native_io::{
     create_private as create_private_file_capability, open_directory as open_directory_capability,
     open_rw as open_rw_capability, sync_directory as sync_store_directory_capability,
 };
+pub(crate) use recovery::inspect_native_root_history_without_repair;
+pub(crate) use recovery::inspect_volume_root_history_without_repair;
+pub(crate) fn inspect_volume_wal_owners_without_repair<P, I, C>(
+    volume: &Arc<dyn AstridVolume>,
+    identity: &I,
+    codec: &C,
+    limits: RecoveryLimits,
+) -> Result<BTreeSet<P>, DurableError>
+where
+    P: Ord,
+    I: PersistentObjectIdentity + Clone,
+    C: PrincipalCodec<P> + Clone,
+{
+    let region =
+        VolumeRegion::new(WAL_FILE).map_err(|source| io_error("validate WAL region", source))?;
+    if !volume
+        .region_exists(&region)
+        .map_err(|source| io_error("probe WAL region", source))?
+    {
+        return Ok(BTreeSet::new());
+    }
+    let wal = File::volume(Arc::clone(volume), WAL_FILE, false)?;
+    wal::wal_root_owners_without_repair(
+        &wal,
+        SharedIdentity::new(identity.clone()),
+        &SharedPrincipalCodec::new(codec.clone()),
+        limits,
+    )
+}
 use recovery::{RecoveryScope, recover_store, recover_volume};
-use roots::{encode_root_record, encode_root_snapshot, recover_root_history, recover_roots};
+use roots::{
+    encode_root_record, encode_root_snapshot, probe_root_history_without_repair,
+    recover_root_history, recover_roots,
+};
 use validation::{
     ClosureObjects, materialize_closure, preload_indexed_closures, recovery_closure_error,
     usage_from_closure, validate_commit_closure, validate_incremental_closure,

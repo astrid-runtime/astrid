@@ -1,12 +1,16 @@
 use crate::engine::DurableEnginePolicy;
+use crate::engine::RootTransaction;
+use crate::engine::{ObjectCacheConfig, TransactionWalPolicy};
 use crate::storage_model::{
     ObjectClass, ObjectFormatVersion, ObjectIdentity, ObjectKind, ObjectRecord,
 };
-use crate::volume::HostedFileVolume;
+use crate::volume::{AstridVolume, HostedFileVolume, VolumeRegion};
 
 use super::{
-    Blake3ObjectIdentityV1, RuntimeEngine, RuntimeStateOwnerCodecV2, open_runtime_principal_store,
+    Blake3ObjectIdentityV1, DurableEngine, RuntimeStateOwnerCodecV2, StateOwnerCodecV2,
+    open_runtime_principal_store,
 };
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use super::{KvQuotaResolver, RecoveryLimits, StateOwner};
@@ -24,7 +28,7 @@ fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
 fn seed_predecessor_volume(home: &AstridHome, records: &[ObjectRecord]) {
     let path = home.storage_volume_path();
     let volume = HostedFileVolume::open(&path).expect("seed volume");
-    let engine = RuntimeEngine::open_volume(
+    let engine = DurableEngine::open_volume(
         volume.clone(),
         Blake3ObjectIdentityV1,
         RuntimeStateOwnerCodecV2,
@@ -105,6 +109,126 @@ async fn existing_volume_with_only_an_unrecognized_spec_fails_closed() {
             .contains("missing its prior format-v1 specification"),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn legacy_user_volume_is_rejected_before_promotion() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    home.ensure().unwrap();
+    let canonical = home.storage_volume_path();
+    let volume = HostedFileVolume::open(&canonical).unwrap();
+    let engine = DurableEngine::open_volume(
+        volume.clone(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+        DurableEnginePolicy::default(),
+    )
+    .unwrap();
+    let commit = ObjectRecord::new(
+        ObjectKind::Commit,
+        ObjectFormatVersion::V1,
+        b"canonical user volume commit".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let commit_id = Blake3ObjectIdentityV1.identify(&commit);
+    engine
+        .commit(RootTransaction::new(
+            StateOwner::User(astrid_core::UserUid::from_bytes([17; 32])),
+            None,
+            commit_id,
+            vec![(commit_id, commit)],
+        ))
+        .unwrap();
+    super::volume_migration::write_cutover_receipt(volume.as_ref(), &[]).unwrap();
+    engine.close().unwrap();
+    drop(volume);
+
+    let legacy = home.legacy_storage_volume_path();
+    std::fs::rename(&canonical, &legacy).unwrap();
+    let legacy_before = std::fs::read(&legacy).unwrap();
+
+    let Err(error) = open_runtime_principal_store(&home, unlimited_quota()).await else {
+        panic!("legacy canonical User volume must fail before promotion");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("explicit user StateOwner; promotion is refused"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&legacy).unwrap(), legacy_before);
+    assert!(!canonical.exists());
+}
+
+#[tokio::test]
+async fn legacy_user_wal_is_rejected_before_promotion() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    home.ensure().unwrap();
+    let canonical = home.storage_volume_path();
+    let policy = DurableEnginePolicy::new(
+        crate::engine::GroupCommitPolicy::immediate(),
+        crate::engine::RecoveryRetryPolicy::immediate(),
+        ObjectCacheConfig::<StateOwner>::disabled(),
+    )
+    .with_transaction_wal(TransactionWalPolicy::enabled(
+        NonZeroU64::new(u64::MAX).unwrap(),
+    ));
+    let volume = HostedFileVolume::open(&canonical).unwrap();
+    let engine = DurableEngine::open_volume(
+        volume.clone(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+        policy,
+    )
+    .unwrap();
+    let commit = ObjectRecord::new(
+        ObjectKind::Commit,
+        ObjectFormatVersion::V1,
+        b"canonical user WAL volume commit".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let commit_id = Blake3ObjectIdentityV1.identify(&commit);
+    engine
+        .commit(RootTransaction::new(
+            StateOwner::User(astrid_core::UserUid::from_bytes([29; 32])),
+            None,
+            commit_id,
+            vec![(commit_id, commit)],
+        ))
+        .unwrap();
+    drop(engine);
+    drop(volume);
+
+    let volume = HostedFileVolume::open(&canonical).unwrap();
+    let roots = VolumeRegion::new("roots.journal").unwrap();
+    volume.set_region_len(&roots, 0).unwrap();
+    volume.sync().unwrap();
+    drop(volume);
+
+    let legacy = home.legacy_storage_volume_path();
+    std::fs::rename(&canonical, &legacy).unwrap();
+    let legacy_before = std::fs::read(&legacy).unwrap();
+    let Err(error) = open_runtime_principal_store(&home, unlimited_quota()).await else {
+        panic!("legacy canonical User WAL must fail before promotion");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("user-owned WAL transaction; promotion is refused"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&legacy).unwrap(), legacy_before);
+    assert!(!canonical.exists());
 }
 
 #[tokio::test]

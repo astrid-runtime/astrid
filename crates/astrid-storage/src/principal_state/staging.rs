@@ -37,6 +37,8 @@ mod migration;
 mod recovery;
 mod retirement;
 #[cfg(test)]
+mod runtime_owner_tests;
+#[cfg(test)]
 mod tests;
 mod writer;
 

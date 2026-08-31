@@ -256,6 +256,7 @@ pub(super) fn recover_arena<I: PersistentObjectIdentity, F: DurableIo>(
         ARENA_MAGIC,
         limits,
         protected_len,
+        true,
         |offset, payload| {
             let (id, record) = decode_object_frame(payload, scheme)
                 .map_err(|detail| corrupt(ARENA_FILE, offset, detail))?;
@@ -312,7 +313,18 @@ pub(super) fn scan_frames<F: DurableIo>(
     limits: RecoveryLimits,
     accept: impl FnMut(u64, &[u8]) -> Result<(), DurableError>,
 ) -> Result<(), DurableError> {
-    scan_frames_with_protected_prefix(file, file_name, magic, limits, 0, accept)
+    scan_frames_with_protected_prefix(file, file_name, magic, limits, 0, true, accept)
+}
+
+/// Scan complete published frames without repairing an unpublished tail.
+pub(super) fn scan_frames_readonly<F: DurableIo>(
+    file: &mut F,
+    file_name: &'static str,
+    magic: [u8; 8],
+    limits: RecoveryLimits,
+    accept: impl FnMut(u64, &[u8]) -> Result<(), DurableError>,
+) -> Result<(), DurableError> {
+    scan_frames_with_protected_prefix(file, file_name, magic, limits, 0, false, accept)
 }
 
 fn scan_frames_with_protected_prefix<F: DurableIo>(
@@ -321,6 +333,7 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
     magic: [u8; 8],
     limits: RecoveryLimits,
     protected_len: u64,
+    repair_tail: bool,
     mut accept: impl FnMut(u64, &[u8]) -> Result<(), DurableError>,
 ) -> Result<(), DurableError> {
     let file_len = validated_file_len(file, file_name, protected_len)?;
@@ -329,6 +342,7 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
         limits,
         protected_len,
         file_len,
+        repair_tail,
     };
     let mut offset = 0_u64;
     while offset < file_len {
@@ -343,7 +357,7 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
                     "published frame header is truncated",
                 ));
             }
-            truncate_tail(file, offset)?;
+            truncate_tail_if_repairing(file, repair_tail, offset)?;
             break;
         }
         file.seek(SeekFrom::Start(offset))
@@ -399,7 +413,7 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
                     "published frame payload is truncated",
                 ));
             }
-            truncate_tail(file, offset)?;
+            truncate_tail_if_repairing(file, repair_tail, offset)?;
             break;
         }
         let payload = read_frame_payload(file, payload_len)?;
@@ -418,6 +432,17 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
     }
     file.seek(SeekFrom::End(0))
         .map_err(|source| io_error("seek durable file tail", source))?;
+    Ok(())
+}
+
+fn truncate_tail_if_repairing<F: DurableIo>(
+    file: &mut F,
+    repair_tail: bool,
+    offset: u64,
+) -> Result<(), DurableError> {
+    if repair_tail {
+        truncate_tail(file, offset)?;
+    }
     Ok(())
 }
 
@@ -452,6 +477,7 @@ struct FrameScanPolicy {
     limits: RecoveryLimits,
     protected_len: u64,
     file_len: u64,
+    repair_tail: bool,
 }
 
 fn decode_frame_header(
@@ -504,6 +530,9 @@ fn truncate_unpublished_tail_or_fail<F: DurableIo>(
     known_interior: bool,
     error: DurableError,
 ) -> Result<(), DurableError> {
+    if !policy.repair_tail {
+        return Err(error);
+    }
     if offset < policy.protected_len
         || known_interior
         || valid_frame_follows(file, policy.magic, offset, policy.file_len, policy.limits)?

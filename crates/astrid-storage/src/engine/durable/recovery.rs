@@ -6,16 +6,55 @@ use super::{
     FaultInjector, FaultPoint, INDEX_FILE, IndexState, LIFECYCLE_CLOSED, LIFECYCLE_USABLE,
     MutexGuard, PersistentObjectIdentity, PrincipalCodec, ROOT_FILE, RecoveredStore,
     RecoveryLimits, Seek, SeekFrom, SharedIdentity, SharedPrincipalCodec, WAL_FILE, io, io_error,
-    open_rw_capability, recover_arena, recover_index, recover_interrupted_compaction,
-    recover_root_history, recover_roots, replace_index, replace_volume_index,
-    sync_store_directory_capability,
+    open_rw_capability, probe_root_history_without_repair, recover_arena, recover_index,
+    recover_interrupted_compaction, recover_root_history, recover_roots, replace_index,
+    replace_volume_index, sync_store_directory_capability,
 };
 use crate::volume::AstridVolume;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 type RecoveredWal<P, I, C> = (RecoveredStore<P>, Option<DurableWal<P, I, C>>);
 use std::path::Path;
 use std::sync::Arc;
+
+/// Read only the indexed root history from a volume, without tail repair.
+pub(crate) fn inspect_volume_root_history_without_repair<P, C>(
+    volume: &Arc<dyn AstridVolume>,
+    scheme: super::IdentityScheme,
+    codec: &C,
+    limits: RecoveryLimits,
+) -> Result<BTreeMap<P, (crate::storage_model::RootState, u64)>, DurableError>
+where
+    P: Ord,
+    C: PrincipalCodec<P>,
+{
+    let region = crate::volume::VolumeRegion::new(ROOT_FILE)
+        .map_err(|source| io_error("validate root-journal region", source))?;
+    if !volume
+        .region_exists(&region)
+        .map_err(|source| io_error("probe root-journal region", source))?
+    {
+        return Ok(BTreeMap::new());
+    }
+    let mut roots = super::File::volume(Arc::clone(volume), ROOT_FILE, false)?;
+    probe_root_history_without_repair(&mut roots, codec, scheme, limits)
+}
+
+/// Read a native root journal without repairing or changing its bytes.
+pub(crate) fn inspect_native_root_history_without_repair<P, C>(
+    path: &Path,
+    scheme: super::IdentityScheme,
+    codec: &C,
+    limits: RecoveryLimits,
+) -> Result<BTreeMap<P, (crate::storage_model::RootState, u64)>, DurableError>
+where
+    P: Ord,
+    C: PrincipalCodec<P>,
+{
+    let file = std::fs::File::open(path).map_err(|source| io_error("open root journal", source))?;
+    let mut roots = super::File::Native(file);
+    probe_root_history_without_repair(&mut roots, codec, scheme, limits)
+}
 
 #[derive(Default)]
 pub(super) struct RecoveryScope {

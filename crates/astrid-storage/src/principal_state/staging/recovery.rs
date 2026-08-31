@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
-use super::format::{StagingIntent, load_generation_footer_from_file};
+use super::format::{
+    StagingIntent, is_runtime_forbidden_user_owner, load_generation_footer_from_file,
+};
 use super::journal::{
     JournalRecord, StageKey, StageKey as JournalStageKey, append_records, flush_journal,
 };
@@ -196,8 +198,15 @@ fn recover_or_quarantine(
     let Ok(mut file) = context.generations.open_file(name) else {
         return move_and_mark(scan, name, context, "orphan");
     };
-    let Ok(footer) = load_generation_footer_from_file(&path, &mut file) else {
-        return move_and_mark(scan, name, context, "orphan");
+    let footer = match load_generation_footer_from_file(&path, &mut file) {
+        Ok(footer) => footer,
+        Err(error) if is_runtime_forbidden_user_owner(&error) => {
+            return Err(connection(format!(
+                "explicit user owner in staged generation {} is not runtime-admitted",
+                path.display()
+            )));
+        },
+        Err(_) => return move_and_mark(scan, name, context, "orphan"),
     };
     let intent = footer.intent;
     if StageKey::from_intent(&intent) != key {
