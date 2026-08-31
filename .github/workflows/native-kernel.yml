@@ -60,6 +60,10 @@ jobs:
           # CARGO_TARGET_DIR resolution path in check.sh.
           echo "CARGO_BUILD_TARGET_DIR=$target_root" >> "$GITHUB_ENV"
 
+      - name: Run locked bootloader build-script metadata tests
+        working-directory: kernel
+        run: cargo test --manifest-path tools/bootloader/Cargo.toml --no-default-features --locked --test build_script_metadata
+
       - name: Run supported split checks
         working-directory: kernel
         run: |
