@@ -63,6 +63,9 @@ pub fn init_idt() {
                 .set_handler_addr(addr(trap::isr_29));
             idt.security_exception.set_handler_addr(addr(trap::isr_30));
             idt[trap::VECTOR_TIMER].set_handler_addr(addr(trap::isr_32));
+            idt[trap::VECTOR_READINESS]
+                .set_handler_addr(addr(trap::isr_64))
+                .set_privilege_level(PrivilegeLevel::Ring3);
             idt[trap::VECTOR_IPC]
                 .set_handler_addr(addr(trap::isr_112))
                 .set_privilege_level(PrivilegeLevel::Ring3);

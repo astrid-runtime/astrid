@@ -246,8 +246,12 @@ pub(super) fn full_sequence() -> Vec<SequenceStep> {
     pattern.push(SequenceStep::One("domain.stop.armed"));
     pattern.push(SequenceStep::One(START_EVENT));
     pattern.push(SequenceStep::Many(GUEST_ENTRY_EVENTS));
+    pattern.push(SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[12]));
+    pattern.push(SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[13]));
+    pattern.push(SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[14]));
     pattern.push(SequenceStep::Many(RUNNING_STOP_TAIL_EVENTS));
     pattern.push(SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[11]));
+    pattern.push(SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[15]));
     pattern.push(SequenceStep::Pass(DOMAIN_REQUIRED_PASSES[7]));
     pattern.extend([
         SequenceStep::One("domain.harness"),

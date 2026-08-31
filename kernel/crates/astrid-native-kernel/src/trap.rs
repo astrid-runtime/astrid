@@ -22,6 +22,7 @@ const VECTOR_BREAKPOINT: u8 = 3;
 const VECTOR_PAGE_FAULT: u8 = 14;
 pub const VECTOR_TIMER: u8 = 32;
 pub const VECTOR_IPC: u8 = 112;
+pub const VECTOR_READINESS: u8 = 64;
 pub const VECTOR_SPURIOUS: u8 = 255;
 
 /// The one Rust trap handler. Mutations to `frame.rip` take effect on `iretq`.
@@ -171,5 +172,6 @@ isr_noerr!(isr_28, 28);
 isr_err!(isr_29, 29);
 isr_err!(isr_30, 30);
 isr_noerr!(isr_32, 32);
+isr_noerr!(isr_64, 64);
 isr_noerr!(isr_112, 112);
 isr_noerr!(isr_255, 255);

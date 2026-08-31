@@ -404,6 +404,9 @@ fn passing_serial_with(kernel: &str, sysgen: &str, kfloor: u64, sfloor: u64) -> 
     ev("\"ev\":\"domain.stop.armed\",\"id\":1,\"generation\":10".into());
     emit_start(&mut ev, 1, 10, 11);
     emit_context(&mut ev, 1, 10, 0);
+    emit_pass(&mut ev, super::DOMAIN_REQUIRED_PASSES[12]);
+    emit_pass(&mut ev, super::DOMAIN_REQUIRED_PASSES[13]);
+    emit_pass(&mut ev, super::DOMAIN_REQUIRED_PASSES[14]);
     ev("\"ev\":\"domain.control.returned\",\"id\":1,\"generation\":10,\"cpl\":3,\"terminal\":false".into());
     ev("\"ev\":\"domain.stop.request\",\"id\":1,\"generation\":10".into());
     ev("\"ev\":\"domain.stop.taken\",\"id\":1,\"generation\":10,\"source\":\"returned\",\"vector\":32,\"cpl\":0".into());
@@ -415,6 +418,7 @@ fn passing_serial_with(kernel: &str, sysgen: &str, kfloor: u64, sfloor: u64) -> 
     ev("\"ev\":\"domain.stop.current-inactive\",\"id\":1,\"generation\":10".into());
     ev("\"ev\":\"domain.stop.completed\",\"id\":1,\"generation\":10,\"ok\":true".into());
     emit_pass(&mut ev, super::DOMAIN_REQUIRED_PASSES[11]);
+    emit_pass(&mut ev, super::DOMAIN_REQUIRED_PASSES[15]);
     emit_pass(&mut ev, super::CLEAN_RESTART_GATE);
     ev("\"ev\":\"domain.harness\",\"outcome\":true".into());
     ev("\"ev\":\"halt\",\"outcome\":\"ok\"".into());
