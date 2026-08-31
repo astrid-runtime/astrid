@@ -6,6 +6,17 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")" && pwd)"
 cd "$root"
+# Shell command substitution strips trailing line-feed bytes. The supported
+# shell path contract therefore rejects target roots containing LF or CR before
+# any normalization command substitution can shorten them.
+reject_shell_unsafe_target_root() {
+  local path="$1"
+  if [[ "$path" == *$'\n'* || "$path" == *$'\r'* ]]; then
+    echo "check.sh: target directory contains newline; shell transport rejects newline-bearing roots" >&2
+    exit 1
+  fi
+}
+
 if [[ -z "${CARGO_TARGET_DIR:-}" ]]; then
   target_root="$(
     cargo metadata --no-deps --format-version 1 \
@@ -17,19 +28,25 @@ document = json.load(sys.stdin)
 target_directory = document.get("target_directory")
 if not isinstance(target_directory, str) or not target_directory:
     raise SystemExit("Cargo metadata omitted target_directory")
-print(target_directory)
+if "\n" in target_directory or "\r" in target_directory:
+    raise SystemExit(
+        "Cargo metadata target_directory contains newline; "
+        "shell transport rejects newline-bearing roots"
+    )
+sys.stdout.write(target_directory)
 '
   )"
 else
   target_root="$CARGO_TARGET_DIR"
 fi
+reject_shell_unsafe_target_root "$target_root"
 if [[ -z "$target_root" ]]; then
   echo "check.sh: unable to resolve Cargo target directory" >&2
   exit 1
 fi
 # Cargo preserves `..` components in relative override metadata output.
 # Normalize the selected root once before deriving any nested target paths.
-CARGO_TARGET_DIR="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$target_root")"
+CARGO_TARGET_DIR="$(python3 -c 'import os,sys; sys.stdout.write(os.path.abspath(sys.argv[1]))' "$target_root")"
 export CARGO_TARGET_DIR
 toolchain="${KTEST_TOOLCHAIN:-nightly-2026-07-21}"
 host="$CARGO_TARGET_DIR/kimage-host"

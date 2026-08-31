@@ -25,7 +25,8 @@ cleanup_owned_roots() {
     name="${path##*/}"
     case "$name" in
       astrid-cargo-configured.*|astrid-cargo-relative.*|astrid-cargo-absolute.*|\
-      astrid-cargo-escaped-backslash.*|astrid-cargo-escaped-quote.*)
+      astrid-cargo-escaped-backslash.*|astrid-cargo-escaped-quote.*|\
+      astrid-cargo-newline.*)
         ;;
       *)
         echo "target regression: refusing to clean unvalidated path $path" >&2
@@ -201,6 +202,52 @@ run_check_metadata_probe() {
   echo "target regression: check.sh metadata PASS (root=$target_root host=$host nested=$nested)"
 }
 
+run_newline_rejection_probe() {
+  local target_root="$1"
+  local output
+
+  echo "== shell transport rejects trailing-newline target root =="
+  if output="$(
+    env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR -u ASTRID_CARGO_TARGET_ROOT \
+      CARGO_BUILD_TARGET_DIR="$target_root" \
+      ./run.sh --target-layout-only 2>&1
+  )"; then
+    printf '%s\n' "$output"
+    echo "target regression: run.sh accepted a newline-bearing target root" >&2
+    exit 1
+  fi
+  printf '%s\n' "$output"
+  grep -Fq "shell transport rejects newline-bearing roots" <<< "$output" || {
+    echo "target regression: run.sh did not reject the metadata root before shortening" >&2
+    exit 1
+  }
+  if grep -Fq "ktest: target root=" <<< "$output"; then
+    echo "target regression: run.sh transported a silently shortened root" >&2
+    exit 1
+  fi
+
+  if output="$(
+    env -u CARGO_BUILD_TARGET_DIR -u ASTRID_CARGO_TARGET_ROOT \
+      CARGO_TARGET_DIR="$target_root" \
+      ./check.sh invalid 2>&1
+  )"; then
+    printf '%s\n' "$output"
+    echo "target regression: check.sh accepted a newline-bearing target root" >&2
+    exit 1
+  fi
+  printf '%s\n' "$output"
+  grep -Fq "shell transport rejects newline-bearing roots" <<< "$output" || {
+    echo "target regression: check.sh did not reject the explicit root before shortening" >&2
+    exit 1
+  }
+  if grep -Fq "check.sh: target root=" <<< "$output"; then
+    echo "target regression: check.sh transported a silently shortened root" >&2
+    exit 1
+  fi
+  assert_no_worktree_targets
+  echo "target regression: newline transport PASS (root rejected before command substitution)"
+}
+
 run_kimage_metadata_check() {
   local target_root="$1"
   local host="$target_root/kimage-host"
@@ -234,11 +281,18 @@ escaped_backslash_root="$(mktemp -d "$temp_parent/astrid-cargo-escaped-backslash
 owned_roots+=("$escaped_backslash_root")
 escaped_quote_root="$(mktemp -d "$temp_parent/astrid-cargo-escaped-quote.\"XXXXXX")"
 owned_roots+=("$escaped_quote_root")
+newline_root="$(mktemp -d "$temp_parent/astrid-cargo-newline.XXXXXX")"
+owned_roots+=("$newline_root")
+newline_root_with_suffix="${newline_root}"$'\n'
+owned_roots+=("$newline_root_with_suffix")
+mv -- "$newline_root" "$newline_root_with_suffix"
+newline_root="$newline_root_with_suffix"
 echo "configured_root=$configured_root"
 echo "relative_root=$relative_root"
 echo "absolute_root=$absolute_root"
 echo "escaped_backslash_root=$escaped_backslash_root"
 echo "escaped_quote_root=$escaped_quote_root"
+printf 'newline_root=%q\n' "$newline_root"
 
 run_layout_probe \
   "unset CARGO_TARGET_DIR with external Cargo target configuration" \
@@ -258,6 +312,7 @@ run_layout_probe \
 
 run_check_metadata_probe "$escaped_backslash_root"
 run_check_metadata_probe "$escaped_quote_root"
+run_newline_rejection_probe "$newline_root"
 
 run_check_relative "$relative_root"
 

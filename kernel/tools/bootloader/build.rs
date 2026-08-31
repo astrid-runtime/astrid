@@ -113,56 +113,49 @@ fn nested_target_dir(cargo: &str) -> Option<PathBuf> {
 }
 
 fn target_directory_from_metadata(metadata: &str) -> Option<String> {
-    let marker = b"\"target_directory\"";
-    let marker_start = metadata
-        .as_bytes()
-        .windows(marker.len())
-        .position(|window| window == marker)?;
-    let preceding = metadata.as_bytes()[..marker_start]
-        .iter()
-        .rev()
-        .find(|byte| !matches!(byte, b' ' | b'\n' | b'\r' | b'\t'));
-    if !matches!(preceding, Some(b'{') | Some(b',')) {
-        return None;
-    }
-    let mut value = &metadata[marker_start + marker.len()..];
-    value = value.trim_start();
-    value = value.strip_prefix(':')?.trim_start();
-    let (target_directory, remainder) = decode_json_string(value)?;
-    if target_directory.is_empty() {
-        return None;
-    }
-    match remainder.trim_start().as_bytes().first() {
-        Some(b',') | Some(b'}') => Some(target_directory),
-        _ => None,
-    }
+    // Parse the complete object so a nested package metadata key cannot be
+    // mistaken for Cargo's top-level target_directory. serde_json also
+    // decodes every valid JSON string escape, including Unicode escapes.
+    let document: serde_json::Value = serde_json::from_str(metadata).ok()?;
+    let target_directory = document.as_object()?.get("target_directory")?.as_str()?;
+    (!target_directory.is_empty()).then(|| target_directory.to_owned())
 }
 
-fn decode_json_string(input: &str) -> Option<(String, &str)> {
-    let mut chars = input.char_indices();
-    if chars.next()?.1 != '"' {
-        return None;
+#[cfg(test)]
+mod tests {
+    use super::target_directory_from_metadata;
+
+    #[test]
+    fn target_directory_ignores_nested_key_collisions() {
+        let metadata = r#"
+            {
+                "packages": [{"metadata": {"target_directory": "/nested"}}],
+                "target_directory": "/top-level"
+            }
+        "#;
+
+        assert_eq!(
+            target_directory_from_metadata(metadata).as_deref(),
+            Some("/top-level")
+        );
     }
-    let mut decoded = String::new();
-    while let Some((index, character)) = chars.next() {
-        match character {
-            '"' => return Some((decoded, &input[index + character.len_utf8()..])),
-            '\\' => match chars.next()?.1 {
-                '"' => decoded.push('"'),
-                '\\' => decoded.push('\\'),
-                '/' => decoded.push('/'),
-                'b' => decoded.push('\u{0008}'),
-                'f' => decoded.push('\u{000c}'),
-                'n' => decoded.push('\n'),
-                'r' => decoded.push('\r'),
-                't' => decoded.push('\t'),
-                _ => return None,
-            },
-            character if character.is_control() => return None,
-            character => decoded.push(character),
-        }
+
+    #[test]
+    fn target_directory_decodes_supported_json_escapes() {
+        let metadata = r#"{"target_directory":"/tmp/astrid\\cache\"quoted-\u03bb-\ud83d\ude80"}"#;
+
+        assert_eq!(
+            target_directory_from_metadata(metadata).as_deref(),
+            Some(r#"/tmp/astrid\cache"quoted-λ-🚀"#)
+        );
     }
-    None
+
+    #[test]
+    fn target_directory_requires_top_level_string() {
+        let metadata = r#"{"packages":[{"target_directory":"/nested"}]}"#;
+
+        assert_eq!(target_directory_from_metadata(metadata), None);
+    }
 }
 
 fn absolutize(path: PathBuf) -> PathBuf {
