@@ -1,7 +1,9 @@
 //! Selection coverage for known in-place format-1 RÚNATAL amendments.
 
 use crate::engine::{PrincipalCodec, RecoveryLimits};
-use crate::storage_model::{ObjectId, ObjectIdentity};
+use crate::storage_model::{
+    ObjectClass, ObjectFormatVersion, ObjectId, ObjectIdentity, ObjectKind, ObjectRecord,
+};
 
 use super::bootstrap;
 use super::format_amendment::{
@@ -10,11 +12,11 @@ use super::format_amendment::{
     PRE_FLEET_OWNER_FORMAT_SPEC_ID, PRE_GC_OUTBOX_FORMAT_SPEC_ID, PRE_KV_TRANSITION_FORMAT_SPEC_ID,
     PRE_MECHANICAL_AUDIT_FORMAT_SPEC_ID, PRE_PHYSICAL_CATALOGUE_FORMAT_SPEC_ID,
     PRE_RESERVED_REPRESENTATION_TAG_FORMAT_SPEC_ID, PRE_RUNATAL_NAMING_FORMAT_SPEC_ID,
-    PRE_SHA384_ATTESTATION_FORMAT_SPEC_ID, PRE_WORKSPACE_BRANCH_FORMAT_SPEC_ID,
-    STORE_METADATA_FILE, format_spec_record, legacy_store_metadata, pre_fleet_owner_store_metadata,
-    pre_representation_store_metadata, prepare_catalog_specification, prepare_destination,
-    prepare_format_specification, previous_store_metadata, representation_bootstrap_objects,
-    store_metadata,
+    PRE_SHA384_ATTESTATION_FORMAT_SPEC_ID, PRE_USER_OWNER_FORMAT_SPEC_ID,
+    PRE_WORKSPACE_BRANCH_FORMAT_SPEC_ID, STORE_METADATA_FILE, format_spec_record,
+    legacy_store_metadata, pre_fleet_owner_store_metadata, pre_representation_store_metadata,
+    prepare_catalog_specification, prepare_destination, prepare_format_specification,
+    previous_store_metadata, representation_bootstrap_objects, store_metadata,
 };
 use super::{
     Blake3ObjectIdentityV1, RuntimeEngine, RuntimeStateOwnerCodecV2, StateOwnerCodecV1,
@@ -147,6 +149,143 @@ fn assert_pre_fleet_owner_format_is_selected() {
             catalog_spec_was_declared: true,
         }
     );
+}
+
+fn pre_user_owner_format_spec_record() -> ObjectRecord {
+    let current = std::str::from_utf8(super::format_amendment::STORE_FORMAT_SPEC).unwrap();
+    let user_tag = "  03 <32-byte user UID>        user owner\n";
+    let user_grammar = "\nA user encoding is exactly 33 bytes: tag 03 followed by the 32-byte,\ndomain-separated BLAKE3 digest of its canonical user identity record. User\nownership is distinct from principal, fleet, and system ownership; readers\nMUST NOT reinterpret one owner domain as another. This is the prerelease wire\ngrammar, not authorization for active runtime durable storage: the active\nruntime admission and recovery barrier continues to reject user owners until\nan explicit authority activation changes that policy.\n";
+    let current_staging = "followed by its 32-byte FleetUid; a user is one byte value 3 followed by its\n32-byte UserUid. Runtime staging admission and recovery continue to reject the\nuser form. The name is non-empty UTF-8 containing no NUL and remains an opaque\ncontent name. The chunk profile must satisfy the section 7.2 grammar. The\nchecksum is BLAKE3 derive-key under the exact context \"astrid native content\nstaging intent v2\" over every preceding intent byte.";
+    let prior_staging = "followed by its 32-byte FleetUid. The name is non-empty UTF-8 containing no NUL\nand remains an opaque content name. The chunk profile must satisfy the section\n7.2 grammar. The checksum is BLAKE3 derive-key under the exact context \"astrid\nnative content staging intent v2\" over every preceding intent byte.";
+    for fragment in [user_tag, user_grammar, current_staging] {
+        assert_eq!(
+            current.matches(fragment).count(),
+            1,
+            "predecessor derivation fragment is not unique"
+        );
+    }
+    let predecessor = current
+        .replace(user_tag, "")
+        .replace(user_grammar, "")
+        .replace(current_staging, prior_staging);
+
+    let record = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        predecessor.into_bytes(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    assert_eq!(
+        Blake3ObjectIdentityV1.identify(&record),
+        PRE_USER_OWNER_FORMAT_SPEC_ID,
+    );
+    record
+}
+
+#[test]
+fn pre_user_owner_store_is_selected_and_amendment_is_idempotent() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    seed_current_directory_store(&home);
+    let store_path = home.principal_store_path();
+
+    let prior_spec = pre_user_owner_format_spec_record();
+    let current_spec = format_spec_record().unwrap();
+    let current_spec_id = Blake3ObjectIdentityV1.identify(&current_spec);
+    let catalog_spec = bootstrap::content_catalog_format_specification().unwrap();
+    let catalog_spec_id = Blake3ObjectIdentityV1.identify(&catalog_spec);
+    let current_metadata = store_metadata(current_spec_id, catalog_spec_id);
+    std::fs::write(
+        store_path.join(STORE_METADATA_FILE),
+        store_metadata(PRE_USER_OWNER_FORMAT_SPEC_ID, catalog_spec_id),
+    )
+    .unwrap();
+    let engine = RuntimeEngine::open(
+        &store_path,
+        Blake3ObjectIdentityV1,
+        RuntimeStateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    engine.persist_standalone_object(&prior_spec).unwrap();
+    engine.close().unwrap();
+    assert_eq!(
+        prepare_destination(&store_path, &current_metadata, catalog_spec_id).unwrap(),
+        DestinationFormat::PriorV1 {
+            format_spec: PRE_USER_OWNER_FORMAT_SPEC_ID,
+            catalog_spec_was_declared: true,
+        },
+    );
+
+    let engine = RuntimeEngine::open(
+        &store_path,
+        Blake3ObjectIdentityV1,
+        RuntimeStateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    prepare_format_specification(
+        &engine,
+        DestinationFormat::PriorV1 {
+            format_spec: PRE_USER_OWNER_FORMAT_SPEC_ID,
+            catalog_spec_was_declared: true,
+        },
+        &current_spec,
+        current_spec_id,
+    )
+    .unwrap();
+    prepare_catalog_specification(
+        &engine,
+        DestinationFormat::PriorV1 {
+            format_spec: PRE_USER_OWNER_FORMAT_SPEC_ID,
+            catalog_spec_was_declared: true,
+        },
+        &catalog_spec,
+        catalog_spec_id,
+    )
+    .unwrap();
+    std::fs::write(store_path.join(STORE_METADATA_FILE), &current_metadata).unwrap();
+    engine.close().unwrap();
+
+    for _ in 0..2 {
+        assert_eq!(
+            prepare_destination(&store_path, &current_metadata, catalog_spec_id).unwrap(),
+            DestinationFormat::Current,
+        );
+        let engine = RuntimeEngine::open(
+            &store_path,
+            Blake3ObjectIdentityV1,
+            RuntimeStateOwnerCodecV2,
+            RecoveryLimits::process_addressable(),
+        )
+        .unwrap();
+        prepare_format_specification(
+            &engine,
+            DestinationFormat::Current,
+            &current_spec,
+            current_spec_id,
+        )
+        .unwrap();
+        prepare_catalog_specification(
+            &engine,
+            DestinationFormat::Current,
+            &catalog_spec,
+            catalog_spec_id,
+        )
+        .unwrap();
+        assert_eq!(
+            engine.object(current_spec_id).unwrap(),
+            Some(current_spec.clone())
+        );
+        assert_eq!(
+            engine.object(catalog_spec_id).unwrap(),
+            Some(catalog_spec.clone()),
+        );
+        engine.close().unwrap();
+    }
 }
 
 fn assert_pre_representation_format_is_selected(prior: ObjectId) {
