@@ -67,6 +67,17 @@ fn resolve_http_limits() -> astrid_capsule::HttpLimits {
     )
 }
 
+/// Build the hook engine with Astrid's explicit guest-feature boundary.
+fn build_hook_engine() -> wasmtime::Engine {
+    let mut wt_config = wasmtime::Config::new();
+    wt_config
+        .wasm_component_model(true)
+        .wasm_gc(false)
+        .wasm_exceptions(false)
+        .epoch_interruption(true);
+    wasmtime::Engine::new(&wt_config).expect("failed to create wasmtime engine for hooks")
+}
+
 /// Handler for WASM components.
 ///
 /// Lazily compiles the WASM component on first invocation and caches the
@@ -98,12 +109,7 @@ impl WasmHandler {
     /// Create a new WASM handler.
     #[must_use]
     pub(crate) fn new(workspace_root: PathBuf) -> Self {
-        let mut wt_config = wasmtime::Config::new();
-        wt_config
-            .wasm_component_model(true)
-            .epoch_interruption(true);
-        let engine =
-            wasmtime::Engine::new(&wt_config).expect("failed to create wasmtime engine for hooks");
+        let engine = build_hook_engine();
 
         // Spawn epoch ticker so that epoch deadlines on Store actually fire.
         let epoch_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -438,6 +444,15 @@ mod tests {
     #[test]
     fn test_wasm_available() {
         assert!(WasmHandler::is_available());
+    }
+
+    #[test]
+    fn test_hook_engine_preserves_explicit_guest_feature_boundary() {
+        let features = build_hook_engine().get_wasm_features();
+
+        assert!(!features.contains(wasmtime::WasmFeatures::GC));
+        assert!(!features.contains(wasmtime::WasmFeatures::EXCEPTIONS));
+        assert!(features.contains(wasmtime::WasmFeatures::COMPONENT_MODEL));
     }
 
     #[test]
