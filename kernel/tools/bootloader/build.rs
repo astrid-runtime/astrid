@@ -108,12 +108,61 @@ fn nested_target_dir(cargo: &str) -> Option<PathBuf> {
     }
 
     let metadata = String::from_utf8(metadata.stdout).ok()?;
-    let target_marker = "\"target_directory\":\"";
-    let target_dir = metadata.split_once(target_marker)?.1.split_once('"')?.0;
-    if target_dir.is_empty() {
+    let target_dir = target_directory_from_metadata(&metadata)?;
+    Some(absolutize(PathBuf::from(target_dir)).join(NESTED_TARGET_DIR))
+}
+
+fn target_directory_from_metadata(metadata: &str) -> Option<String> {
+    let marker = b"\"target_directory\"";
+    let marker_start = metadata
+        .as_bytes()
+        .windows(marker.len())
+        .position(|window| window == marker)?;
+    let preceding = metadata.as_bytes()[..marker_start]
+        .iter()
+        .rev()
+        .find(|byte| !matches!(byte, b' ' | b'\n' | b'\r' | b'\t'));
+    if !matches!(preceding, Some(b'{') | Some(b',')) {
         return None;
     }
-    Some(absolutize(PathBuf::from(target_dir)).join(NESTED_TARGET_DIR))
+    let mut value = &metadata[marker_start + marker.len()..];
+    value = value.trim_start();
+    value = value.strip_prefix(':')?.trim_start();
+    let (target_directory, remainder) = decode_json_string(value)?;
+    if target_directory.is_empty() {
+        return None;
+    }
+    match remainder.trim_start().as_bytes().first() {
+        Some(b',') | Some(b'}') => Some(target_directory),
+        _ => None,
+    }
+}
+
+fn decode_json_string(input: &str) -> Option<(String, &str)> {
+    let mut chars = input.char_indices();
+    if chars.next()?.1 != '"' {
+        return None;
+    }
+    let mut decoded = String::new();
+    while let Some((index, character)) = chars.next() {
+        match character {
+            '"' => return Some((decoded, &input[index + character.len_utf8()..])),
+            '\\' => match chars.next()?.1 {
+                '"' => decoded.push('"'),
+                '\\' => decoded.push('\\'),
+                '/' => decoded.push('/'),
+                'b' => decoded.push('\u{0008}'),
+                'f' => decoded.push('\u{000c}'),
+                'n' => decoded.push('\n'),
+                'r' => decoded.push('\r'),
+                't' => decoded.push('\t'),
+                _ => return None,
+            },
+            character if character.is_control() => return None,
+            character => decoded.push(character),
+        }
+    }
+    None
 }
 
 fn absolutize(path: PathBuf) -> PathBuf {

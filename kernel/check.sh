@@ -9,7 +9,16 @@ cd "$root"
 if [[ -z "${CARGO_TARGET_DIR:-}" ]]; then
   target_root="$(
     cargo metadata --no-deps --format-version 1 \
-      | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p'
+      | python3 -c '
+import json
+import sys
+
+document = json.load(sys.stdin)
+target_directory = document.get("target_directory")
+if not isinstance(target_directory, str) or not target_directory:
+    raise SystemExit("Cargo metadata omitted target_directory")
+print(target_directory)
+'
   )"
 else
   target_root="$CARGO_TARGET_DIR"

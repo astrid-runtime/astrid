@@ -24,7 +24,8 @@ cleanup_owned_roots() {
     parent="${path%/*}"
     name="${path##*/}"
     case "$name" in
-      astrid-cargo-configured.*|astrid-cargo-relative.*|astrid-cargo-absolute.*)
+      astrid-cargo-configured.*|astrid-cargo-relative.*|astrid-cargo-absolute.*|\
+      astrid-cargo-escaped-backslash.*|astrid-cargo-escaped-quote.*)
         ;;
       *)
         echo "target regression: refusing to clean unvalidated path $path" >&2
@@ -172,6 +173,56 @@ run_check_relative() {
   echo "target regression: check.sh PASS (root=$target_root host=$host nested=$nested)"
 }
 
+run_check_metadata_probe() {
+  local target_root="$1"
+  local host="$target_root/kimage-host"
+  local nested="$target_root/bootloader-nested"
+  local output expected
+  expected="check.sh: target root=$target_root host=$host nested=$nested"
+
+  echo "== check.sh metadata JSON escape probe =="
+  if output="$(
+    env -u CARGO_TARGET_DIR -u ASTRID_CARGO_TARGET_ROOT \
+      CARGO_BUILD_TARGET_DIR="$target_root" \
+      ./check.sh invalid 2>&1
+  )"; then
+    printf '%s\n' "$output"
+    echo "target regression: check.sh metadata probe unexpectedly passed" >&2
+    exit 1
+  fi
+
+  printf '%s\n' "$output"
+  grep -Fqx "$expected" <<< "$output" || {
+    echo "target regression: check.sh did not decode the escaped root" >&2
+    echo "expected: $expected" >&2
+    exit 1
+  }
+  assert_no_worktree_targets
+  echo "target regression: check.sh metadata PASS (root=$target_root host=$host nested=$nested)"
+}
+
+run_kimage_metadata_check() {
+  local target_root="$1"
+  local host="$target_root/kimage-host"
+  local nested="$target_root/bootloader-nested"
+
+  echo "== kimage build.rs metadata JSON escape probe =="
+  env -u CARGO_TARGET_DIR -u ASTRID_BOOTLOADER_TARGET_DIR \
+    CARGO_BUILD_TARGET_DIR="$target_root" \
+    rustup run "$toolchain" cargo clippy -p kimage --all-targets --locked \
+      --target-dir "$host" -- -D warnings
+  assert_no_worktree_targets
+  [[ -d "$host" ]] || {
+    echo "target regression: missing metadata-probe host target $host" >&2
+    exit 1
+  }
+  [[ -d "$nested" ]] || {
+    echo "target regression: missing metadata-probe nested target $nested" >&2
+    exit 1
+  }
+  echo "target regression: build.rs metadata PASS (root=$target_root host=$host nested=$nested)"
+}
+
 assert_no_worktree_targets
 configured_root="$(mktemp -d "$temp_parent/astrid-cargo-configured.XXXXXX")"
 owned_roots+=("$configured_root")
@@ -179,9 +230,15 @@ relative_root="$(mktemp -d "$temp_parent/astrid-cargo-relative.XXXXXX")"
 owned_roots+=("$relative_root")
 absolute_root="$(mktemp -d "$temp_parent/astrid-cargo-absolute.XXXXXX")"
 owned_roots+=("$absolute_root")
+escaped_backslash_root="$(mktemp -d "$temp_parent/astrid-cargo-escaped-backslash.\XXXXXX")"
+owned_roots+=("$escaped_backslash_root")
+escaped_quote_root="$(mktemp -d "$temp_parent/astrid-cargo-escaped-quote.\"XXXXXX")"
+owned_roots+=("$escaped_quote_root")
 echo "configured_root=$configured_root"
 echo "relative_root=$relative_root"
 echo "absolute_root=$absolute_root"
+echo "escaped_backslash_root=$escaped_backslash_root"
+echo "escaped_quote_root=$escaped_quote_root"
 
 run_layout_probe \
   "unset CARGO_TARGET_DIR with external Cargo target configuration" \
@@ -192,6 +249,15 @@ run_layout_probe \
 run_layout_probe \
   "absolute explicit CARGO_TARGET_DIR preserved by run.sh" \
   "$absolute_root" absolute
+run_layout_probe \
+  "JSON escaped backslash target root decoded by run.sh" \
+  "$escaped_backslash_root" configured
+run_layout_probe \
+  "JSON escaped quote target root decoded by run.sh" \
+  "$escaped_quote_root" configured
+
+run_check_metadata_probe "$escaped_backslash_root"
+run_check_metadata_probe "$escaped_quote_root"
 
 run_check_relative "$relative_root"
 
@@ -200,5 +266,7 @@ run_check_relative "$relative_root"
 # addition to the lightweight run.sh/ktest layout probes above.
 run_kimage_check "configured shared-root kimage + nested UEFI" "$configured_root"
 run_kimage_check "explicit shared-root kimage + nested UEFI" "$absolute_root"
+run_kimage_metadata_check "$escaped_backslash_root"
+run_kimage_metadata_check "$escaped_quote_root"
 
 echo "target regression: PASS (run.sh/ktest layout and nested kimage; no kernel/target or tools/bootloader/target)"
