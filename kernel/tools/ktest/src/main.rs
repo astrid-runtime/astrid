@@ -7,7 +7,7 @@
 //! Determinism FAIL is reported and does not gate boot assertions.
 
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 
@@ -31,7 +31,7 @@ use ktest::events::{
     ExpectedClosures, RING0_REJECT_EXIT_CODE, assert_boot, assert_ring0_plan_mismatch, parse_events,
 };
 use ktest::firmware;
-use ktest::image::{KIMAGE_NIGHTLY, KimageInvocation};
+use ktest::image::{KIMAGE_NIGHTLY, KimageInvocation, TARGET_ROOT_ENV};
 use ktest::machine::{self, EXPECT_EXIT_CODE, QEMU_BIN, TAMPER_TIMEOUT, TIMEOUT};
 use wait_timeout::ChildExt;
 
@@ -39,10 +39,20 @@ fn main() -> Result<()> {
     let root = workspace_root()?;
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
 
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root.join("target"));
-    let kernel_target = target_dir.clone();
+    let target_root = resolve_target_root(&root, &cargo)?;
+    let kernel_target = target_root.clone();
+    let kimage = KimageInvocation::for_target_root(&target_root, tools_toolchain());
+    println!(
+        "ktest: target root={} kernel={} host={} nested={}",
+        target_root.display(),
+        kernel_target.display(),
+        kimage.host_target_dir.display(),
+        kimage.nested_target_dir.display()
+    );
+    if std::env::args().any(|arg| arg == "--target-layout-only") {
+        println!("ktest: target layout probe PASS");
+        return Ok(());
+    }
     println!("== building astrid-native-kernel (x86_64-unknown-none, release) ==");
     run_inherited(
         Command::new(&cargo)
@@ -66,17 +76,17 @@ fn main() -> Result<()> {
         bail!("kernel ELF not found at {}", kernel_elf.display());
     }
 
-    let out_dir = target_dir.join("kimage");
+    let out_dir = target_root.join("kimage");
     std::fs::create_dir_all(&out_dir).context("creating kimage output dir")?;
     let image_a = out_dir.join("astrid-native-kernel-a.img");
     let image_b = out_dir.join("astrid-native-kernel-b.img");
     let tampered_image = out_dir.join("astrid-native-kernel-tampered.img");
     let mismatched_plan_image = out_dir.join("astrid-native-kernel-mismatched-plan.img");
     println!("== building UEFI disk image (x2) ==");
-    build_image(&root, &kernel_elf, &image_a)?;
-    build_image(&root, &kernel_elf, &image_b)?;
-    build_tampered_image(&root, &kernel_elf, &tampered_image)?;
-    build_mismatched_plan_image(&root, &kernel_elf, &mismatched_plan_image)?;
+    build_image(&kimage, &root, &kernel_elf, &image_a)?;
+    build_image(&kimage, &root, &kernel_elf, &image_b)?;
+    build_tampered_image(&kimage, &root, &kernel_elf, &tampered_image)?;
+    build_mismatched_plan_image(&kimage, &root, &kernel_elf, &mismatched_plan_image)?;
 
     let determinism = compare_images(&image_a, &image_b)?;
     let (kernel_hex, sysgen_hex, kernel_image_hex, closure_table_hex) =
@@ -166,21 +176,106 @@ fn tools_toolchain() -> String {
     std::env::var("KTEST_TOOLCHAIN").unwrap_or_else(|_| KIMAGE_NIGHTLY.to_string())
 }
 
-fn build_image(root: &Path, kernel_elf: &Path, output: &Path) -> Result<()> {
-    let inv = KimageInvocation::new(root, tools_toolchain());
+/// Resolve the effective Cargo target root without changing Cargo's ordinary
+/// environment. `run.sh` supplies this value after `cargo metadata`; direct
+/// `cargo run -p ktest` invocations perform the same metadata query here.
+/// Explicit relative overrides are normalized against the process cwd, which
+/// is also the base Cargo uses for `CARGO_TARGET_DIR`.
+fn resolve_target_root(root: &Path, cargo: &str) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("resolving ktest invocation cwd")?;
+    if let Some(value) = std::env::var_os(TARGET_ROOT_ENV).filter(|value| !value.is_empty()) {
+        return Ok(absolutize_target_root(&cwd, PathBuf::from(value)));
+    }
+
+    let manifest = root.join("Cargo.toml");
+    let metadata = Command::new(cargo)
+        .current_dir(&cwd)
+        .args([
+            "metadata",
+            "--manifest-path",
+            manifest.to_string_lossy().as_ref(),
+            "--no-deps",
+            "--format-version",
+            "1",
+        ])
+        .output()
+        .with_context(|| format!("running {cargo} metadata"))?;
+    if metadata.status.success() {
+        let document: serde_json::Value = serde_json::from_slice(&metadata.stdout)
+            .context("parsing Cargo metadata while resolving target root")?;
+        let target_directory = document
+            .get("target_directory")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .context("Cargo metadata omitted target_directory")?;
+        return Ok(absolutize_target_root(
+            &cwd,
+            PathBuf::from(target_directory),
+        ));
+    }
+
+    if let Some(value) = std::env::var_os("CARGO_TARGET_DIR").filter(|value| !value.is_empty()) {
+        // Keep a useful fallback for wrappers that provide a cargo-compatible
+        // command but cannot answer `cargo metadata`.
+        return Ok(absolutize_target_root(&cwd, PathBuf::from(value)));
+    }
+
+    let stderr = String::from_utf8_lossy(&metadata.stderr);
+    bail!(
+        "cargo metadata failed while resolving target root (status={}): {}",
+        metadata.status,
+        stderr.trim()
+    )
+}
+
+fn absolutize_target_root(base: &Path, candidate: PathBuf) -> PathBuf {
+    let joined = if candidate.is_absolute() {
+        candidate
+    } else {
+        base.join(candidate)
+    };
+    let mut normalized = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {},
+            Component::ParentDir => {
+                normalized.pop();
+            },
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            },
+        }
+    }
+    normalized
+}
+
+fn build_image(
+    inv: &KimageInvocation,
+    root: &Path,
+    kernel_elf: &Path,
+    output: &Path,
+) -> Result<()> {
     run_inherited(&mut inv.command(root, kernel_elf, output), "kimage")
 }
 
-fn build_tampered_image(root: &Path, kernel_elf: &Path, output: &Path) -> Result<()> {
-    let inv = KimageInvocation::new(root, tools_toolchain());
+fn build_tampered_image(
+    inv: &KimageInvocation,
+    root: &Path,
+    kernel_elf: &Path,
+    output: &Path,
+) -> Result<()> {
     run_inherited(
         &mut inv.command_with_tampered_sysgen(root, kernel_elf, output),
         "kimage tampered system-generation descriptor",
     )
 }
 
-fn build_mismatched_plan_image(root: &Path, kernel_elf: &Path, output: &Path) -> Result<()> {
-    let inv = KimageInvocation::new(root, tools_toolchain());
+fn build_mismatched_plan_image(
+    inv: &KimageInvocation,
+    root: &Path,
+    kernel_elf: &Path,
+    output: &Path,
+) -> Result<()> {
     run_inherited(
         &mut inv.command_with_mismatched_sysgen_plan(root, kernel_elf, output),
         "kimage mismatched system-generation plan",
@@ -634,4 +729,21 @@ fn run_inherited(cmd: &mut Command, what: &str) -> Result<()> {
         bail!("{what} failed with status {status}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::absolutize_target_root;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn explicit_relative_target_root_is_normalized() {
+        assert_eq!(
+            absolutize_target_root(
+                Path::new("/worktree/kernel"),
+                PathBuf::from("../cargo-target/./native")
+            ),
+            Path::new("/worktree/cargo-target/native")
+        );
+    }
 }
