@@ -19,6 +19,9 @@ param(
     [int]$TeardownTimeoutSeconds = 30,
     [int]$HeartbeatSeconds = 30,
 
+    [ValidateSet("List", "Aggregate", "Exact")]
+    [string]$EmitLibTestArguments = "",
+
     [switch]$SelfTest
 )
 
@@ -55,168 +58,75 @@ function Get-LibTestArguments {
     }
 }
 
-function Assert-ArgumentSemantics {
-    param(
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Arguments,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Expected,
-        [Parameter(Mandatory = $true)][string]$Mode
-    )
-
-    $cargoSeparator = [string][char]45 + [char]45
-    if ($Arguments -contains $cargoSeparator) {
-        throw "$Mode libtest invocation contained the cargo separator"
-    }
-    if ($Arguments.Count -ne $Expected.Count) {
-        throw "$Mode libtest invocation length mismatch: expected $($Expected.Count), got $($Arguments.Count)"
-    }
-    for ($index = 0; $index -lt $Expected.Count; $index++) {
-        if ($Arguments[$index] -cne $Expected[$index]) {
-            throw "$Mode libtest invocation mismatch at argument $index"
-        }
-    }
-    Write-Host ("{0} libtest arguments: {1}" -f $Mode, ($Arguments -join " "))
+if ($EmitLibTestArguments) {
+    Get-LibTestArguments -Mode $EmitLibTestArguments -TestFilter $TestFilter -TestName "" |
+        ConvertTo-Json -Compress
+    exit 0
 }
 
-function Read-InvocationRecord {
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    $lines = @(Get-Content -LiteralPath $Path -ErrorAction Stop | Where-Object { $_ -like "ARG=*" })
-    if ($lines.Count -eq 0) {
-        throw "the self-test child did not record its arguments"
+function Invoke-BoundedScriptSelfTest {
+    $rows = @(Invoke-BoundedScript -Script {
+        [pscustomobject]@{ ProcessId = 42; Name = "synthetic-cim-row" }
+    } -Argument $null -TimeoutSeconds 5)
+    if ($rows.Count -ne 1 -or [int]$rows[0].ProcessId -ne 42) {
+        throw "the bounded PowerShell output self-test did not return the synthetic row"
     }
-    return @($lines | ForEach-Object { $_.Substring(4) })
-}
-
-function Get-CompletedTestNames {
-    param([Parameter(Mandatory = $true)][string]$StdoutPath)
-
-    if (-not (Test-Path -LiteralPath $StdoutPath -PathType Leaf)) {
-        return @()
-    }
-    $text = Get-Content -LiteralPath $StdoutPath -Raw
-    return @([System.Text.RegularExpressions.Regex]::Matches(
-        $text,
-        '(?m)^test\s+(?<name>.+?)\s+\.\.\.\s+(?:ok|FAILED|ignored)\s*(?:\r|$)'
-    ) | ForEach-Object { $_.Groups["name"].Value })
-}
-
-function New-SelfTestChild {
-    param(
-        [Parameter(Mandatory = $true)][string]$Directory,
-        [Parameter(Mandatory = $true)][string]$RecordPath
-    )
-
-    $path = Join-Path $Directory "storage-mount-selftest.cmd"
-    $lines = @(
-        "@echo off",
-        "setlocal enabledelayedexpansion",
-        "if exist `"$RecordPath`" del `"$RecordPath`" >nul 2>&1",
-        ":record",
-        "if `"%~1`"==`"`" goto :respond",
-        ">> `"$RecordPath`" echo ARG=%~1",
-        "shift",
-        "goto :record",
-        ":respond",
-        "if `"%SELFTEST_ARGUMENT_MODE%`"==`"List`" (",
-        "  echo storage_mount::first: test",
-        "  echo storage_mount::second: test",
-        "  exit /b 0",
-        ")",
-        "echo test storage_mount::first ... ok",
-        "echo test storage_mount::second ... ok",
-        "if `"%SELFTEST_ARGUMENT_MODE%`"==`"AggregateExit7`" exit /b 7",
-        "exit /b %SELFTEST_CHILD_EXIT%"
-    )
-    Set-Content -LiteralPath $path -Value $lines -Encoding Ascii
-    return $path
-}
-
-function Invoke-ArgumentSelfTest {
-    param(
-        [Parameter(Mandatory = $true)][string]$Provider,
-        [Parameter(Mandatory = $true)][string]$TestFilter,
-        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
-    )
-
-    $stage = Join-Path ([System.IO.Path]::GetTempPath()) (
-        "astrid-storage-harness-selftest-" + [System.IO.Path]::GetRandomFileName()
-    )
-    New-Item -ItemType Directory -Path $stage -Force | Out-Null
-    $recordPath = Join-Path $stage "arguments.txt"
-    $child = New-SelfTestChild -Directory $stage -RecordPath $recordPath
-    $selfProvider = Join-Path $stage (Split-Path -Leaf $Provider)
-    Copy-Item -LiteralPath $Provider -Destination $selfProvider
 
     try {
-        $listExpected = Get-LibTestArguments -Mode List -TestFilter $TestFilter -TestName ""
-        $aggregateExpected = Get-LibTestArguments -Mode Aggregate -TestFilter $TestFilter -TestName ""
-
-        $env:SELFTEST_ARGUMENT_MODE = "List"
-        $env:SELFTEST_CHILD_EXIT = "0"
-        $list = Start-TestProcess -Executable $child -Arguments $listExpected `
-            -WorkingDirectory $stage -LogDirectory $stage -Name "selftest-list"
-        if (-not (Wait-StreamingProcess -Process $list.Process -StdoutPath $list.StdoutPath `
-            -StderrPath $list.StderrPath -DisplayName "argument self-test list" `
-            -TimeoutSeconds $TimeoutSeconds -HeartbeatSeconds 1)) {
-            throw "the argument-semantics list child timed out"
+        $null = Invoke-BoundedScript -Script {
+            Write-Output "bounded-output-evidence"
+            Write-Error "synthetic bounded failure"
+        } -Argument $null -TimeoutSeconds 5
+    } catch {
+        if ($_.Exception.Data["Output"][0] -cne "bounded-output-evidence" -or
+            $_.Exception.Data["Error"][0].Exception.Message -cne "synthetic bounded failure") {
+            throw "the bounded PowerShell error evidence self-test lost output or error evidence"
         }
-        Assert-ArgumentSemantics -Arguments (Read-InvocationRecord -Path $recordPath) `
-            -Expected $listExpected -Mode "List"
-        if ($list.Process.ExitCode -ne 0) {
-            throw "the argument-semantics list child exited $($list.Process.ExitCode)"
-        }
-        $listNames = @(Get-Content -LiteralPath $list.StdoutPath | Where-Object { $_ -match ": test$" })
-        if ($listNames.Count -eq 0) {
-            throw "the argument-semantics list child returned an empty test list"
-        }
-        if (Get-CompletedTestNames -StdoutPath $list.StdoutPath) {
-            throw "list mode executed a test"
-        }
-
-        $env:SELFTEST_ARGUMENT_MODE = "Aggregate"
-        $aggregate = Start-TestProcess -Executable $child -Arguments $aggregateExpected `
-            -WorkingDirectory $stage -LogDirectory $stage -Name "selftest-aggregate"
-        if (-not (Wait-StreamingProcess -Process $aggregate.Process -StdoutPath $aggregate.StdoutPath `
-            -StderrPath $aggregate.StderrPath -DisplayName "argument self-test aggregate" `
-            -TimeoutSeconds $TimeoutSeconds -HeartbeatSeconds 1)) {
-            throw "the argument-semantics aggregate child timed out"
-        }
-        Assert-ArgumentSemantics -Arguments (Read-InvocationRecord -Path $recordPath) `
-            -Expected $aggregateExpected -Mode "Aggregate"
-        if ($aggregate.Process.ExitCode -ne 0) {
-            throw "the argument-semantics aggregate child exited $($aggregate.Process.ExitCode)"
-        }
-        $aggregateNames = @(Get-CompletedTestNames -StdoutPath $aggregate.StdoutPath | Sort-Object -Unique)
-        $expectedNames = @($listNames | ForEach-Object { ($_ -split ": test$")[0] } | Sort-Object -Unique)
-        if ($aggregateNames.Count -ne $expectedNames.Count) {
-            throw "aggregate test count differed from the pre-enumerated list"
-        }
-        for ($index = 0; $index -lt $expectedNames.Count; $index++) {
-            if ($aggregateNames[$index] -cne $expectedNames[$index]) {
-                throw "aggregate test set differed from the pre-enumerated list"
-            }
-        }
-
-        $env:SELFTEST_ARGUMENT_MODE = "AggregateExit7"
-        $exitSeven = Start-TestProcess -Executable $child -Arguments $aggregateExpected `
-            -WorkingDirectory $stage -LogDirectory $stage -Name "selftest-exit-seven"
-        if (-not (Wait-StreamingProcess -Process $exitSeven.Process -StdoutPath $exitSeven.StdoutPath `
-            -StderrPath $exitSeven.StderrPath -DisplayName "argument self-test exit seven" `
-            -TimeoutSeconds $TimeoutSeconds -HeartbeatSeconds 1)) {
-            throw "the injected exit-seven child timed out"
-        }
-        if ($exitSeven.Process.ExitCode -ne 7) {
-            throw "the injected aggregate exit code changed from 7 to $($exitSeven.Process.ExitCode)"
-        }
-
-        Write-Host "argument-semantics self-test passed"
-        Write-Host "self-test evidence=$stage"
-        Write-Host "self-test provider-identity=$selfProvider"
-        return $true
-    } finally {
-        Remove-Item Env:SELFTEST_ARGUMENT_MODE -ErrorAction SilentlyContinue
-        Remove-Item Env:SELFTEST_CHILD_EXIT -ErrorAction SilentlyContinue
+        Write-Host "bounded PowerShell output/error self-test passed"
+        return
     }
+    throw "the bounded PowerShell error self-test accepted a synthetic error"
+}
+
+function Invoke-GenerationSelfTest {
+    $rootTime = [DateTime]::SpecifyKind([DateTime]::UtcNow, [DateTimeKind]::Utc)
+    $rootPath = "C:\synthetic\exact-root.exe"
+    $providerPath = "C:\synthetic\astrid-storage-provider-winfsp.exe"
+    $rows = @(
+        [pscustomobject]@{ ProcessId = 100; ParentProcessId = 1; Name = "exact-root.exe"; ExecutablePath = $rootPath; CreationTimeUtc = $rootTime }
+        [pscustomobject]@{ ProcessId = 101; ParentProcessId = 100; Name = "owned-child.exe"; ExecutablePath = $rootPath; CreationTimeUtc = $rootTime }
+        [pscustomobject]@{ ProcessId = 102; ParentProcessId = 1; Name = "exact-root.exe"; ExecutablePath = "C:\other\same-name.exe"; CreationTimeUtc = $rootTime }
+    )
+    $owned = @(Select-OwnedProcessRows -Rows $rows -RootProcessId 100 -RootExecutable $rootPath `
+        -RootCreationTimeUtc $rootTime -StartedUtc $rootTime -Provider $providerPath)
+    if ($owned.Count -ne 2 -or (@($owned | ForEach-Object { $_.ProcessId }) -contains 102)) {
+        throw "the root-generation self-test did not select exactly the valid root and child"
+    }
+
+    $reused = @([pscustomobject]@{ ProcessId = 100; ParentProcessId = 1; Name = "exact-root.exe"; ExecutablePath = $rootPath; CreationTimeUtc = $rootTime.AddTicks(1) })
+    $rejected = $false
+    try {
+        $null = Select-OwnedProcessRows -Rows $reused -RootProcessId 100 -RootExecutable $rootPath `
+            -RootCreationTimeUtc $rootTime -StartedUtc $rootTime -Provider $providerPath
+    } catch { $rejected = $true }
+    if (-not $rejected) { throw "the root-generation self-test accepted a reused PID" }
+
+    $pathDrift = @([pscustomobject]@{ ProcessId = 100; ParentProcessId = 1; Name = "exact-root.exe"; ExecutablePath = "C:\drift\exact-root.exe"; CreationTimeUtc = $rootTime })
+    $rejected = $false
+    try {
+        $null = Select-OwnedProcessRows -Rows $pathDrift -RootProcessId 100 -RootExecutable $rootPath `
+            -RootCreationTimeUtc $rootTime -StartedUtc $rootTime -Provider $providerPath
+    } catch { $rejected = $true }
+    if (-not $rejected) { throw "the root-generation self-test accepted executable-path drift" }
+
+    $orphan = @([pscustomobject]@{ ProcessId = 103; ParentProcessId = 100; Name = "owned-child.exe"; ExecutablePath = $rootPath; CreationTimeUtc = $rootTime })
+    $rejected = $false
+    try {
+        $null = Select-OwnedProcessRows -Rows $orphan -RootProcessId 100 -RootExecutable $rootPath `
+            -RootCreationTimeUtc $rootTime -StartedUtc $rootTime -Provider $providerPath
+    } catch { $rejected = $true }
+    if (-not $rejected) { throw "the root-generation self-test selected a child from a missing root" }
+    Write-Host "exact root-generation teardown self-test passed"
 }
 
 function Wait-ForOutputFile {
@@ -377,17 +287,31 @@ function Invoke-BoundedScript {
     )
 
     $powerShell = [System.Management.Automation.PowerShell]::Create()
-    $output = [System.Management.Automation.PSDataCollection[psobject]]::new()
     try {
-        $null = $powerShell.AddScript($Script.ToString()).AddArgument($Argument)
-        $async = $powerShell.BeginInvoke($output)
+        $async = $powerShell.AddScript($Script.ToString()).AddArgument($Argument).BeginInvoke()
         $timeoutMilliseconds = [Math]::Max(1, $TimeoutSeconds * 1000)
         if (-not $async.AsyncWaitHandle.WaitOne($timeoutMilliseconds, $false)) {
             $stop = $powerShell.BeginStop($null, $null)
             $null = $stop.AsyncWaitHandle.WaitOne(2000, $false)
+            try { $powerShell.EndStop($stop) } catch {
+                Write-Host "bounded PowerShell stop failed: $($_.Exception.Message)"
+            }
             throw "bounded PowerShell operation exceeded $TimeoutSeconds seconds"
         }
-        $null = $powerShell.EndInvoke($async)
+        $completedOutput = $powerShell.EndInvoke($async)
+        $output = @($completedOutput)
+        $errors = @($powerShell.Streams.Error)
+        foreach ($record in $errors) {
+            Write-Host "bounded PowerShell error: $($record.Exception.Message)"
+        }
+        if ($errors.Count -gt 0) {
+            $failure = [System.InvalidOperationException]::new(
+                "bounded PowerShell emitted $($errors.Count) error(s)"
+            )
+            $failure.Data["Output"] = $output
+            $failure.Data["Error"] = $errors
+            throw $failure
+        }
         return @($output)
     } finally {
         $powerShell.Dispose()
@@ -465,13 +389,48 @@ function Test-SameWindowsPath {
     )
 }
 
+function Test-SameCreationTimeUtc {
+    param(
+        [Parameter(Mandatory = $true)][datetime]$Left,
+        [Parameter(Mandatory = $true)][datetime]$Right
+    )
+
+    $leftUtc = [DateTime]::SpecifyKind($Left.ToUniversalTime(), [DateTimeKind]::Utc)
+    $rightUtc = [DateTime]::SpecifyKind($Right.ToUniversalTime(), [DateTimeKind]::Utc)
+    return $leftUtc.Ticks -eq $rightUtc.Ticks
+}
+
+function Assert-RootProcessGeneration {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Rows,
+        [Parameter(Mandatory = $true)][int]$RootProcessId,
+        [Parameter(Mandatory = $true)][string]$RootExecutable,
+        [Parameter(Mandatory = $true)][datetime]$RootCreationTimeUtc
+    )
+
+    $rootRow = $Rows | Where-Object { [int]$_.ProcessId -eq $RootProcessId } |
+        Select-Object -First 1
+    if (-not $rootRow) {
+        throw "root process generation row was missing: pid=$RootProcessId"
+    }
+    if (-not (Test-SameWindowsPath -Left $rootRow.ExecutablePath -Right $RootExecutable)) {
+        throw "root process generation path differed: pid=$RootProcessId"
+    }
+    if (-not (Test-SameCreationTimeUtc -Left $rootRow.CreationTimeUtc -Right $RootCreationTimeUtc)) {
+        throw "root process creation time differed, indicating PID reuse: pid=$RootProcessId"
+    }
+    return $rootRow
+}
+
 function Select-OwnedProcessRows {
     param(
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Rows,
         [Parameter(Mandatory = $true)][int]$RootProcessId,
         [Parameter(Mandatory = $true)][string]$RootExecutable,
+        [Parameter(Mandatory = $true)][datetime]$RootCreationTimeUtc,
         [Parameter(Mandatory = $true)][datetime]$StartedUtc,
-        [Parameter(Mandatory = $true)][string]$Provider
+        [Parameter(Mandatory = $true)][string]$Provider,
+        [switch]$SurvivorAudit
     )
 
     $children = @{}
@@ -485,12 +444,17 @@ function Select-OwnedProcessRows {
 
     $ownedIds = @{}
     $stack = [System.Collections.Generic.Stack[int]]::new()
-    $rootRow = $Rows | Where-Object { [int]$_.ProcessId -eq $RootProcessId } | Select-Object -First 1
-    $rootIdentityValid = (-not $rootRow) -or (
-        (Test-SameWindowsPath -Left $rootRow.ExecutablePath -Right $RootExecutable) -and
-        $rootRow.CreationTimeUtc -ge $StartedUtc.AddSeconds(-2)
-    )
-    if ($rootIdentityValid) {
+    if ($SurvivorAudit) {
+        $rootRow = $Rows | Where-Object { [int]$_.ProcessId -eq $RootProcessId } |
+            Select-Object -First 1
+        if ($rootRow) {
+            $null = Assert-RootProcessGeneration -Rows $Rows -RootProcessId $RootProcessId `
+                -RootExecutable $RootExecutable -RootCreationTimeUtc $RootCreationTimeUtc
+            $stack.Push($RootProcessId)
+        }
+    } else {
+        $null = Assert-RootProcessGeneration -Rows $Rows -RootProcessId $RootProcessId `
+            -RootExecutable $RootExecutable -RootCreationTimeUtc $RootCreationTimeUtc
         $stack.Push($RootProcessId)
     }
     while ($stack.Count -gt 0) {
@@ -562,6 +526,8 @@ function Invoke-ScopedTeardown {
     param(
         [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
         [Parameter(Mandatory = $true)][datetime]$StartedUtc,
+        [Parameter(Mandatory = $true)][string]$RootExecutable,
+        [Parameter(Mandatory = $true)][datetime]$RootCreationTimeUtc,
         [Parameter(Mandatory = $true)][string]$Provider,
         [Parameter(Mandatory = $true)][string]$LogDirectory,
         [Parameter(Mandatory = $true)][int]$TimeoutSeconds
@@ -573,7 +539,8 @@ function Invoke-ScopedTeardown {
         $querySeconds = [Math]::Min(5, [Math]::Max(1, $remainingSeconds))
         $rows = @(Get-CimProcessRows -TimeoutSeconds $querySeconds)
         $initial = @(Select-OwnedProcessRows -Rows $rows -RootProcessId $Process.Id `
-            -RootExecutable $TestExecutable -StartedUtc $StartedUtc -Provider $Provider)
+            -RootExecutable $RootExecutable -RootCreationTimeUtc $RootCreationTimeUtc `
+            -StartedUtc $StartedUtc -Provider $Provider)
         Write-Host "owned process tree before termination:"
         Write-ProcessTreeSnapshot -Rows $initial
 
@@ -592,7 +559,8 @@ function Invoke-ScopedTeardown {
         $querySeconds = [Math]::Min(5, [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalSeconds))
         $rows = @(Get-CimProcessRows -TimeoutSeconds $querySeconds)
         $alive = @(Select-OwnedProcessRows -Rows $rows -RootProcessId $Process.Id `
-            -RootExecutable $TestExecutable -StartedUtc $StartedUtc -Provider $Provider)
+            -RootExecutable $RootExecutable -RootCreationTimeUtc $RootCreationTimeUtc `
+            -StartedUtc $StartedUtc -Provider $Provider -SurvivorAudit)
         if ($alive.Count -gt 0) {
             $ids = @($alive | ForEach-Object { [int]$_.ProcessId })
             $stopSeconds = [Math]::Min(2, [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalSeconds))
@@ -607,7 +575,8 @@ function Invoke-ScopedTeardown {
         $querySeconds = [Math]::Min(5, [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalSeconds))
         $rows = @(Get-CimProcessRows -TimeoutSeconds $querySeconds)
         $survivors = @(Select-OwnedProcessRows -Rows $rows -RootProcessId $Process.Id `
-            -RootExecutable $TestExecutable -StartedUtc $StartedUtc -Provider $Provider)
+            -RootExecutable $RootExecutable -RootCreationTimeUtc $RootCreationTimeUtc `
+            -StartedUtc $StartedUtc -Provider $Provider -SurvivorAudit)
         if ($survivors.Count -eq 0) {
             Write-Host "owned process tree after termination:"
             Write-ProcessTreeSnapshot -Rows $survivors
@@ -619,7 +588,8 @@ function Invoke-ScopedTeardown {
         $querySeconds = [Math]::Min(5, [Math]::Max(1, [int]($deadline - [DateTime]::UtcNow).TotalSeconds))
         $rows = @(Get-CimProcessRows -TimeoutSeconds $querySeconds)
         $survivors = @(Select-OwnedProcessRows -Rows $rows -RootProcessId $Process.Id `
-            -RootExecutable $TestExecutable -StartedUtc $StartedUtc -Provider $Provider)
+            -RootExecutable $RootExecutable -RootCreationTimeUtc $RootCreationTimeUtc `
+            -StartedUtc $StartedUtc -Provider $Provider -SurvivorAudit)
         Write-Host "owned process tree after termination:"
         Write-ProcessTreeSnapshot -Rows $survivors
         if ($survivors.Count -eq 0) {
@@ -663,6 +633,9 @@ function Start-TestProcess {
     return [pscustomobject]@{
         Process = $process
         StartedUtc = $process.StartTime.ToUniversalTime()
+        RootProcessId = $process.Id
+        RootExecutable = (Get-Item -LiteralPath $Executable).FullName
+        RootCreationTimeUtc = $process.StartTime.ToUniversalTime()
         StdoutPath = $stdoutPath
         StderrPath = $stderrPath
     }
@@ -737,16 +710,19 @@ function Get-TestList {
     if (-not $completed) {
         Write-CompleteOutput -StdoutPath $run.StdoutPath -StderrPath $run.StderrPath -Label "test-list"
         $null = Invoke-ScopedTeardown -Process $run.Process -StartedUtc $run.StartedUtc `
+            -RootExecutable $run.RootExecutable -RootCreationTimeUtc $run.RootCreationTimeUtc `
             -Provider $Provider -LogDirectory $LogDirectory -TimeoutSeconds $TeardownTimeoutSeconds
         throw "the storage_mount test-list process exceeded ${TimeoutSeconds} seconds"
     }
     Write-CompleteOutput -StdoutPath $run.StdoutPath -StderrPath $run.StderrPath -Label "test-list"
     if ($run.Process.ExitCode -ne 0) {
         $null = Invoke-ScopedTeardown -Process $run.Process -StartedUtc $run.StartedUtc `
+            -RootExecutable $run.RootExecutable -RootCreationTimeUtc $run.RootCreationTimeUtc `
             -Provider $Provider -LogDirectory $LogDirectory -TimeoutSeconds $TeardownTimeoutSeconds
         throw "the storage_mount test-list process failed with exit code $($run.Process.ExitCode)"
     }
     $teardown = Invoke-ScopedTeardown -Process $run.Process -StartedUtc $run.StartedUtc `
+        -RootExecutable $run.RootExecutable -RootCreationTimeUtc $run.RootCreationTimeUtc `
         -Provider $Provider -LogDirectory $LogDirectory -TimeoutSeconds $TeardownTimeoutSeconds
     if ($teardown.Failed) {
         Add-CleanupFailure -Message "the test-list owned tree was not proven dead"
@@ -798,10 +774,9 @@ if ((Get-FileHash -LiteralPath $providerItem.FullName -Algorithm SHA256).Hash -n
 }
 
 if ($SelfTest) {
-    $selfTestPassed = Invoke-ArgumentSelfTest -Provider $Provider `
-        -TestFilter $TestFilter -TimeoutSeconds $ListTimeoutSeconds
-    if ($selfTestPassed) { exit 0 }
-    exit 90
+    Invoke-BoundedScriptSelfTest
+    Invoke-GenerationSelfTest
+    exit 0
 }
 
 $logDirectory = Join-Path $stage "storage-mount-harness-logs"
@@ -868,7 +843,8 @@ try {
         ) -f $aggregateElapsedSeconds, $tests.Count
         Write-Host $message
         $teardown = Invoke-ScopedTeardown -Process $activeRun.Process `
-            -StartedUtc $activeRun.StartedUtc -Provider $Provider `
+            -StartedUtc $activeRun.StartedUtc -RootExecutable $activeRun.RootExecutable `
+            -RootCreationTimeUtc $activeRun.RootCreationTimeUtc -Provider $Provider `
             -LogDirectory $logDirectory -TimeoutSeconds $TeardownTimeoutSeconds
         $activeCleanupComplete = $true
         if ($teardown.Failed) {
@@ -879,7 +855,8 @@ try {
         }
     } else {
         $teardown = Invoke-ScopedTeardown -Process $activeRun.Process `
-            -StartedUtc $activeRun.StartedUtc -Provider $Provider `
+            -StartedUtc $activeRun.StartedUtc -RootExecutable $activeRun.RootExecutable `
+            -RootCreationTimeUtc $activeRun.RootCreationTimeUtc -Provider $Provider `
             -LogDirectory $logDirectory -TimeoutSeconds $TeardownTimeoutSeconds
         $activeCleanupComplete = $true
         if ($teardown.Failed) {
@@ -910,8 +887,9 @@ try {
                     -StderrPath $diagnostic.StderrPath -Label "diagnostic $test"
                 $diagnosticTeardown = Invoke-ScopedTeardown `
                     -Process $diagnostic.Process -StartedUtc $diagnostic.StartedUtc `
-                    -Provider $Provider -LogDirectory $logDirectory `
-                    -TimeoutSeconds $TeardownTimeoutSeconds
+                    -RootExecutable $diagnostic.RootExecutable -RootCreationTimeUtc `
+                    $diagnostic.RootCreationTimeUtc -Provider $Provider -LogDirectory `
+                    $logDirectory -TimeoutSeconds $TeardownTimeoutSeconds
                 if ($diagnosticTeardown.Failed) {
                     Add-CleanupFailure -Message "diagnostic teardown for $test did not prove all owned descendants dead"
                 }
@@ -924,7 +902,9 @@ try {
                 if ($diagnostic) {
                     try {
                         $null = Invoke-ScopedTeardown -Process $diagnostic.Process `
-                            -StartedUtc $diagnostic.StartedUtc -Provider $Provider `
+                            -StartedUtc $diagnostic.StartedUtc -RootExecutable `
+                            $diagnostic.RootExecutable -RootCreationTimeUtc `
+                            $diagnostic.RootCreationTimeUtc -Provider $Provider `
                             -LogDirectory $logDirectory -TimeoutSeconds $TeardownTimeoutSeconds
                     } catch {
                         Add-CleanupFailure -Message "diagnostic unwind teardown for $test failed: $($_.Exception.Message)"
@@ -963,7 +943,8 @@ try {
     if ($activeRun -and -not $activeCleanupComplete) {
         try {
             $teardown = Invoke-ScopedTeardown -Process $activeRun.Process `
-                -StartedUtc $activeRun.StartedUtc -Provider $Provider `
+                -StartedUtc $activeRun.StartedUtc -RootExecutable $activeRun.RootExecutable `
+                -RootCreationTimeUtc $activeRun.RootCreationTimeUtc -Provider $Provider `
                 -LogDirectory $logDirectory -TimeoutSeconds $TeardownTimeoutSeconds
             if ($teardown.Failed) {
                 Add-CleanupFailure -Message "unwind teardown did not prove all owned descendants dead"

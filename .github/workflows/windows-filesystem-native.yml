@@ -417,6 +417,84 @@ jobs:
             TeardownTimeoutSeconds = 30
             HeartbeatSeconds = 30
           }
+          $argumentStage = Join-Path $env:RUNNER_TEMP (
+            "astrid-storage-argument-selftest-" + [System.IO.Path]::GetRandomFileName()
+          )
+          New-Item -ItemType Directory -Path $argumentStage -Force | Out-Null
+          $argumentRecord = Join-Path $argumentStage "arguments.txt"
+          $argumentChild = Join-Path $argumentStage "storage-mount-selftest.cmd"
+          @(
+            "@echo off"
+            "if exist `"$argumentRecord`" del `"$argumentRecord`" >nul 2>&1"
+            ":record"
+            "if `"%~1`"==`"`" goto :respond"
+            ">> `"$argumentRecord`" echo ARG=%~1"
+            "shift"
+            "goto :record"
+            ":respond"
+            "if `"%SELFTEST_ARGUMENT_MODE%`"==`"List`" ("
+            "  echo storage_mount::first: test"
+            "  echo storage_mount::second: test"
+            "  exit /b 0"
+            ")"
+            "echo test storage_mount::first ... ok"
+            "echo test storage_mount::second ... ok"
+            "if `"%SELFTEST_ARGUMENT_MODE%`"==`"Exit7`" exit /b 7"
+            "exit /b %SELFTEST_CHILD_EXIT%"
+          ) | Set-Content -LiteralPath $argumentChild -Encoding Ascii
+
+          function Invoke-ArgumentChild {
+            param([string]$Mode, [array]$Expected, [int]$ChildExit)
+            $env:SELFTEST_ARGUMENT_MODE = $Mode
+            $env:SELFTEST_CHILD_EXIT = "$ChildExit"
+            $stdout = Join-Path $argumentStage "$Mode.stdout.log"
+            $stderr = Join-Path $argumentStage "$Mode.stderr.log"
+            Remove-Item -LiteralPath $argumentRecord, $stdout, $stderr -Force -ErrorAction SilentlyContinue
+            $process = Start-Process -FilePath $argumentChild -ArgumentList $Expected `
+              -WorkingDirectory $argumentStage -RedirectStandardOutput $stdout `
+              -RedirectStandardError $stderr -NoNewWindow -PassThru
+            if (-not $process.WaitForExit($ListTimeoutSeconds * 1000)) {
+              throw "the $Mode argument self-test child timed out"
+            }
+            $record = @(Get-Content -LiteralPath $argumentRecord | Where-Object { $_ -like "ARG=*" } |
+              ForEach-Object { $_.Substring(4) })
+            if ($record.Count -ne $Expected.Count) {
+              throw "the $Mode argument self-test record length differed"
+            }
+            for ($index = 0; $index -lt $Expected.Count; $index++) {
+              if ($record[$index] -cne $Expected[$index]) {
+                throw "the $Mode argument self-test differed at argument $index"
+              }
+            }
+            if ($process.ExitCode -ne $ChildExit) {
+              throw "the $Mode argument self-test exited $($process.ExitCode), expected $ChildExit"
+            }
+            return $stdout
+          }
+
+          $listArguments = @(& scripts/ci/run-windows-storage-mount.ps1 @harnessArguments `
+            -EmitLibTestArguments List | ConvertFrom-Json)
+          $listOutput = Invoke-ArgumentChild -Mode List -Expected $listArguments -ChildExit 0
+          $listNames = @(Get-Content -LiteralPath $listOutput | Where-Object { $_ -match ": test$" })
+          if ($listNames.Count -eq 0) { throw "the argument self-test list was empty" }
+          if ([regex]::Matches((Get-Content -LiteralPath $listOutput -Raw), '(?m)^test\s+.+\.\.\.\s+(?:ok|FAILED|ignored)')) {
+            throw "the argument self-test list executed a test"
+          }
+          $aggregateArguments = @(& scripts/ci/run-windows-storage-mount.ps1 @harnessArguments `
+            -EmitLibTestArguments Aggregate | ConvertFrom-Json)
+          $aggregateOutput = Invoke-ArgumentChild -Mode Aggregate -Expected $aggregateArguments -ChildExit 0
+          $aggregateNames = @([regex]::Matches(
+            (Get-Content -LiteralPath $aggregateOutput -Raw),
+            '(?m)^test\s+(?<name>.+?)\s+\.\.\.\s+(?:ok|FAILED|ignored)\s*(?:\r|$)'
+          ) | ForEach-Object { $_.Groups["name"].Value } | Sort-Object -Unique)
+          $expectedNames = @($listNames | ForEach-Object { ($_ -split ": test$")[0] } | Sort-Object -Unique)
+          if (($aggregateNames -join "`n") -cne ($expectedNames -join "`n")) {
+            throw "the aggregate argument self-test differed from the listed tests"
+          }
+          $null = Invoke-ArgumentChild -Mode Exit7 -Expected $aggregateArguments -ChildExit 7
+          Remove-Item Env:SELFTEST_ARGUMENT_MODE, Env:SELFTEST_CHILD_EXIT -ErrorAction SilentlyContinue
+          Write-Host "direct libtest argument self-test passed"
+
           & scripts/ci/run-windows-storage-mount.ps1 @harnessArguments -SelfTest
           $selfTestExit = $LASTEXITCODE
           if ($selfTestExit -ne 0) { exit $selfTestExit }
