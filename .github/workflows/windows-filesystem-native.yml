@@ -392,23 +392,37 @@ jobs:
           }
           $stagedProvider = Join-Path $stage (Split-Path -Leaf $provider)
           $stagedTestExecutable = Join-Path $stage (Split-Path -Leaf $testExecutable)
+          $sourceProviderHash = (Get-FileHash -LiteralPath $provider -Algorithm SHA256).Hash
           Copy-Item -LiteralPath $provider -Destination $stagedProvider
           Copy-Item -LiteralPath $testExecutable -Destination $stagedTestExecutable
+          $stagedProviderHash = (Get-FileHash -LiteralPath $stagedProvider -Algorithm SHA256).Hash
+          if ($stagedProviderHash -ne $sourceProviderHash) {
+            throw "the staged provider identity does not match the built provider"
+          }
+          $providerParent = (Get-Item -LiteralPath $stagedProvider).DirectoryName
+          $testParent = (Get-Item -LiteralPath $stagedTestExecutable).DirectoryName
+          if ($providerParent -ne $testParent) {
+            throw "the staged provider and test executable are not adjacent"
+          }
           Get-Item -LiteralPath $stagedProvider, $stagedTestExecutable |
             Select-Object FullName, Length
           $env:ASTRID_PROCESS_PROVIDER_TESTS = "1"
-          & scripts/ci/run-windows-storage-mount.ps1 `
-            -TestExecutable $stagedTestExecutable `
-            -Provider $stagedProvider `
-            -TestFilter storage_mount `
-            -AggregateTimeoutSeconds 600 `
-            -DiagnosticTimeoutSeconds 120 `
-            -ListTimeoutSeconds 60 `
-            -TeardownTimeoutSeconds 30 `
-            -HeartbeatSeconds 30
-          if ($LASTEXITCODE -ne 0) {
-            throw "the trusted process storage provider tests failed with exit code $LASTEXITCODE"
+          $harnessArguments = @{
+            TestExecutable = $stagedTestExecutable
+            Provider = $stagedProvider
+            TestFilter = "storage_mount"
+            AggregateTimeoutSeconds = 600
+            DiagnosticTimeoutSeconds = 120
+            ListTimeoutSeconds = 60
+            TeardownTimeoutSeconds = 30
+            HeartbeatSeconds = 30
           }
+          & scripts/ci/run-windows-storage-mount.ps1 @harnessArguments -SelfTest
+          $selfTestExit = $LASTEXITCODE
+          if ($selfTestExit -ne 0) { exit $selfTestExit }
+          & scripts/ci/run-windows-storage-mount.ps1 @harnessArguments
+          $harnessExit = $LASTEXITCODE
+          exit $harnessExit
 
       - name: Run the native WinFsp filesystem round trip
         if: matrix.target == 'x86_64-pc-windows-msvc'
