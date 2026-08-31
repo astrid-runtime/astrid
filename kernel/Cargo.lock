@@ -19,6 +19,9 @@ name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "astrid-boot-selection"
@@ -59,6 +62,7 @@ dependencies = [
  "raw-cpuid",
  "spin",
  "x86_64",
+ "zeroize",
 ]
 
 [[package]]
@@ -99,6 +103,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -465,6 +470,7 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "spin",
+ "zeroize",
 ]
 
 [[package]]

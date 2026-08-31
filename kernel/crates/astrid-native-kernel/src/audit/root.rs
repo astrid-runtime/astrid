@@ -9,6 +9,7 @@
 
 use blake3::Hasher;
 use spin::{Mutex, MutexGuard};
+use zeroize::Zeroize;
 
 use super::types::BootSessionId;
 
@@ -63,21 +64,37 @@ impl RootHasher {
     }
 }
 
+impl Drop for RootHasher {
+    fn drop(&mut self) {
+        self.0.get_mut().zeroize();
+    }
+}
+
 /// Reusable keyed BLAKE3 state owned by one kernel authentication context.
 /// The context is move-only and constructs this before any domain can run.
-pub(crate) struct TagHasher(Mutex<Hasher>);
+pub(crate) struct TagHasher {
+    boot: BootSessionId,
+    hasher: Mutex<Hasher>,
+}
 
 impl TagHasher {
-    pub(crate) fn new(verification_key: &[u8; ROOT_LEN]) -> Self {
-        Self(Mutex::new(Hasher::new_keyed(verification_key)))
+    pub(crate) fn new(boot: BootSessionId, verification_key: &[u8; ROOT_LEN]) -> Self {
+        Self {
+            boot,
+            hasher: Mutex::new(Hasher::new_keyed(verification_key)),
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Hasher> {
-        self.0.lock()
+        self.hasher.lock()
     }
 
     pub(crate) fn reset(&self) {
         self.lock().reset();
+    }
+
+    pub(crate) fn erase(&mut self) {
+        self.hasher.get_mut().zeroize();
     }
 
     pub(crate) fn checkpoint_tag(
@@ -88,6 +105,9 @@ impl TagHasher {
         relay_generation: u64,
         authority_id: u64,
     ) -> [u8; ROOT_LEN] {
+        if boot != self.boot {
+            return [0; ROOT_LEN];
+        }
         let mut hasher = self.lock();
         hasher.reset();
         hasher.update(CHECKPOINT_DOMAIN_TAG);
@@ -109,6 +129,9 @@ impl TagHasher {
         frame: &[u8],
         authority_id: u64,
     ) -> [u8; ROOT_LEN] {
+        if boot != self.boot {
+            return [0; ROOT_LEN];
+        }
         let mut hasher = self.lock();
         hasher.reset();
         hasher.update(ACK_DOMAIN_TAG);
@@ -127,6 +150,9 @@ impl TagHasher {
         boot: BootSessionId,
         authority_id: u64,
     ) -> [u8; ROOT_LEN] {
+        if boot != self.boot {
+            return [0; ROOT_LEN];
+        }
         let mut hasher = self.lock();
         hasher.reset();
         hasher.update(VERIFIER_HANDOFF_DOMAIN_TAG);
@@ -134,5 +160,11 @@ impl TagHasher {
         hasher.update(&boot.bytes());
         hasher.update(&authority_id.to_le_bytes());
         hasher.finalize().into()
+    }
+}
+
+impl Drop for TagHasher {
+    fn drop(&mut self) {
+        self.hasher.get_mut().zeroize();
     }
 }

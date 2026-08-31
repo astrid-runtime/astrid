@@ -20,7 +20,7 @@ pub(crate) struct AuditChain {
 }
 
 /// One successfully observed and retired public audit position.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AuditObservation {
     seq: u64,
     class: super::types::AuditClass,
@@ -203,8 +203,10 @@ impl AuditChain {
             .root_hasher
             .advance(self.root, self.boot, next, encoded);
 
-        // Relay capacity is checked before the verifier commits its fold, so
-        // neither side advances when flow control would strand a rooted event.
+        // Immediate-retire mode is exclusive. Any buffered/in-flight record
+        // means the caller must use the retained-evidence path; checking here
+        // prevents the verifier from advancing before the transaction fails.
+        self.relay.require_empty_for_immediate_retire()?;
         self.relay
             .can_publish(next, event.class().is_terminal_or_invalidation())?;
         let receipt = verifier

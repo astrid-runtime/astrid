@@ -5,6 +5,7 @@
 //! failure before audit authority or domain execution can exist.
 
 use raw_cpuid::CpuId;
+use zeroize::Zeroizing;
 
 use crate::audit::{BootSessionId, KernelSecretEntropy};
 
@@ -62,11 +63,11 @@ pub fn provision() -> Option<ProvisionedEntropy> {
     if !has_rdrand() {
         return None;
     }
-    let mut words = [0u64; REQUIRED_WORDS];
-    for word in &mut words {
+    let mut words = Zeroizing::new([0u64; REQUIRED_WORDS]);
+    for word in words.iter_mut() {
         *word = rdrand_word()?;
     }
-    provision_from_words(words)
+    provision_from_words(*words)
 }
 
 /// Public boot facade for the private audit-custody runtime. This keeps the
@@ -85,16 +86,17 @@ pub fn install(seed: ProvisionedEntropy) -> Result<ProvisionedAuditIdentity, Aud
 
 /// Pure provisioning boundary for tests and explicit byte layout review.
 fn provision_from_words(words: [u64; REQUIRED_WORDS]) -> Option<ProvisionedEntropy> {
-    let mut boot_bytes = [0u8; 16];
+    let words = Zeroizing::new(words);
+    let mut boot_bytes = Zeroizing::new([0u8; 16]);
     boot_bytes[..8].copy_from_slice(&words[0].to_le_bytes());
     boot_bytes[8..].copy_from_slice(&words[1].to_le_bytes());
-    let mut secret_bytes = [0u8; 32];
+    let mut secret_bytes = Zeroizing::new([0u8; 32]);
     for (output, input) in secret_bytes.chunks_exact_mut(8).zip(words[2..].iter()) {
         output.copy_from_slice(&input.to_le_bytes());
     }
     Some(ProvisionedEntropy {
-        boot: BootSessionId::new(boot_bytes)?,
-        secret: KernelSecretEntropy::new(secret_bytes)?,
+        boot: BootSessionId::new(*boot_bytes)?,
+        secret: KernelSecretEntropy::new(*secret_bytes)?,
     })
 }
 
@@ -152,7 +154,33 @@ mod tests {
 
     #[test]
     fn provisioned_custody_is_move_only() {
-        fn assert_move<T>() {}
-        assert_move::<ProvisionedEntropy>();
+        let seed = provision_from_words(words(0x1122334455667788)).unwrap();
+        let boot = seed.boot();
+        let secret = seed.secret();
+        assert_ne!(boot.bytes(), [0; 16]);
+        assert_ne!(secret_bytes(&secret), [0; 32]);
+
+        // A complete transfer is the only way to reach both custody fields:
+        // the helper consumes the seed rather than borrowing or cloning it.
+        fn consume(seed: ProvisionedEntropy) -> BootSessionId {
+            seed.boot()
+        }
+        let transferred = consume(ProvisionedEntropy { boot, secret });
+        assert_eq!(transferred, boot);
     }
+
+    #[test]
+    fn rejected_partial_draws_never_install_custody() {
+        let seed = provision_from_words(words(0x1122334455667788)).unwrap();
+        assert_ne!(seed.boot().bytes(), [0; 16]);
+        // The public surface offers no secret accessor before consumption;
+        // consume is the ownership transition into private custody.
+        let secret = seed.secret();
+        assert_ne!(secret_bytes(&secret), [0; 32]);
+    }
+}
+
+#[cfg(test)]
+fn secret_bytes(secret: &KernelSecretEntropy) -> [u8; 32] {
+    secret.test_bytes()
 }

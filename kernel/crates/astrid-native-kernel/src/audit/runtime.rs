@@ -7,6 +7,7 @@ use super::types::{AuditError, AuditEvent, BootSessionId, KernelSecretEntropy};
 #[cfg(not(test))]
 use crate::entropy::ProvisionedEntropy;
 use native_audit_verifier::{AuditVerifier, AuthContext};
+use zeroize::Zeroizing;
 
 /// A second install is refused even if the first runtime was thought missing.
 /// There is no reset or replacement path in production.
@@ -71,10 +72,11 @@ fn install_custody(
     let authority =
         super::AuditAuthority::mint(boot, secret).ok_or(AuditInstallError::CustodyRejected)?;
     let handoff = authority.verifier_handoff();
+    let anchor_key = Zeroizing::new(*authority.context().verification_key().bytes());
     let anchor = AuthContext::from_trusted_anchor(
         authority.context().authority_id(),
         authority.boot().bytes(),
-        *authority.context().verification_key().bytes(),
+        *anchor_key,
     )
     .map_err(|_| AuditInstallError::CustodyRejected)?;
     let chain = AuditChain::genesis_custodied(boot, authority)

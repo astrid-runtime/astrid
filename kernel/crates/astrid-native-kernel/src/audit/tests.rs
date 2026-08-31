@@ -345,6 +345,39 @@ fn sequence_overflow_fails_closed_without_commit() {
 }
 
 #[test]
+fn foreign_boot_checkpoint_cannot_use_live_context() {
+    let foreign_boot = BootSessionId::new([0x2A; 16]).unwrap();
+    assert_eq!(
+        AuditCheckpoint::seal(foreign_boot, 1, [3; 32], 1, authority().context()),
+        Err(AuditError::CheckpointMismatch)
+    );
+}
+
+#[test]
+fn immediate_retirement_rejects_retained_relay_evidence() {
+    let chain_boot = boot();
+    let mut chain = genesis_chain(chain_boot);
+    let mut host_verifier = verifier();
+
+    chain
+        .append(domain_event(AuditClass::DomainCreate))
+        .unwrap();
+    let before = (chain.seq(), *chain.root());
+    let verifier_before = (host_verifier.next_seq(), host_verifier.root());
+
+    assert_eq!(
+        chain.append_and_retire(domain_event(AuditClass::DomainAdmit), &mut host_verifier),
+        Err(AuditError::RelayMixedMode)
+    );
+    assert_eq!((chain.seq(), *chain.root()), before);
+    assert_eq!(chain.relay().redeliver().count(), 1);
+    assert_eq!(
+        (host_verifier.next_seq(), host_verifier.root()),
+        verifier_before
+    );
+}
+
+#[test]
 fn ack_requires_take_in_flight_and_matching_folded_root() {
     let chain_boot = boot();
     let mut chain = genesis_chain(chain_boot);

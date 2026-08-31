@@ -4,6 +4,7 @@
 use core::num::NonZeroU64;
 
 use blake3::Hasher;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::root;
 use crate::ipc::DomainToken;
@@ -79,11 +80,16 @@ impl KernelSecretEntropy {
     const fn bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_bytes(&self) -> [u8; 32] {
+        self.0
+    }
 }
 
 impl Drop for KernelSecretEntropy {
     fn drop(&mut self) {
-        self.0.fill(0);
+        self.0.zeroize();
     }
 }
 
@@ -113,7 +119,7 @@ impl VerificationKey {
 
 impl Drop for VerificationKey {
     fn drop(&mut self) {
-        self.0.fill(0);
+        self.0.zeroize();
     }
 }
 
@@ -135,6 +141,7 @@ impl core::fmt::Debug for VerificationKey {
 /// lifecycle remain named #1759 residuals, and no fixed production secret
 /// is introduced.
 pub(crate) struct CheckpointAuthContext {
+    boot: BootSessionId,
     authority_id: u64,
     verification_key: VerificationKey,
     tag_hasher: root::TagHasher,
@@ -147,7 +154,8 @@ impl CheckpointAuthContext {
         id_hasher.update(secret.bytes());
         id_hasher.update(&boot.bytes());
         id_hasher.update(AUTHORITY_ID_DOMAIN);
-        let id_digest: [u8; 32] = id_hasher.finalize().into();
+        let id_digest: Zeroizing<[u8; 32]> = Zeroizing::new(id_hasher.finalize().into());
+        id_hasher.zeroize();
         let mut authority_id = u64::from_le_bytes(id_digest[..8].try_into().unwrap());
         if authority_id == 0 {
             authority_id = 1;
@@ -159,9 +167,12 @@ impl CheckpointAuthContext {
         key_hasher.update(&boot.bytes());
         key_hasher.update(AUTHORITY_KEY_DOMAIN);
         key_hasher.update(&authority_id.to_le_bytes());
-        let verification_key = VerificationKey::new(key_hasher.finalize().into())?;
-        let tag_hasher = root::TagHasher::new(verification_key.bytes());
+        let key_digest: Zeroizing<[u8; 32]> = Zeroizing::new(key_hasher.finalize().into());
+        key_hasher.zeroize();
+        let verification_key = VerificationKey::new(*key_digest)?;
+        let tag_hasher = root::TagHasher::new(boot, verification_key.bytes());
         Some(Self {
+            boot,
             authority_id,
             verification_key,
             tag_hasher,
@@ -170,6 +181,10 @@ impl CheckpointAuthContext {
 
     pub(crate) const fn authority_id(&self) -> u64 {
         self.authority_id
+    }
+
+    pub(crate) const fn boot(&self) -> BootSessionId {
+        self.boot
     }
 
     pub(crate) const fn verification_key(&self) -> &VerificationKey {
@@ -183,6 +198,9 @@ impl CheckpointAuthContext {
         root: [u8; root::ROOT_LEN],
         relay_generation: u64,
     ) -> [u8; root::ROOT_LEN] {
+        if boot != self.boot {
+            return [0; root::ROOT_LEN];
+        }
         self.tag_hasher
             .checkpoint_tag(boot, seq, root, relay_generation, self.authority_id)
     }
@@ -195,6 +213,9 @@ impl CheckpointAuthContext {
         source_root: [u8; root::ROOT_LEN],
         frame: &[u8],
     ) -> [u8; root::ROOT_LEN] {
+        if boot != self.boot {
+            return [0; root::ROOT_LEN];
+        }
         self.tag_hasher.ack_tag(
             boot,
             relay_generation,
@@ -210,8 +231,8 @@ impl Drop for CheckpointAuthContext {
     fn drop(&mut self) {
         // VerificationKey also erases on drop; the explicit parent hook
         // keeps the custody invariant legible at the authority boundary.
-        self.tag_hasher.reset();
-        self.verification_key.0.fill(0);
+        self.tag_hasher.erase();
+        self.verification_key.0.zeroize();
     }
 }
 
@@ -734,6 +755,9 @@ impl AuditCheckpoint {
         relay_generation: u64,
         context: &CheckpointAuthContext,
     ) -> Result<Self, AuditError> {
+        if boot != context.boot() {
+            return Err(AuditError::CheckpointMismatch);
+        }
         if relay_generation == 0 || context.authority_id() == 0 {
             return Err(AuditError::MalformedFrame);
         }
@@ -751,7 +775,7 @@ impl AuditCheckpoint {
     }
 
     pub(crate) fn verify_tag(&self, context: &CheckpointAuthContext) -> bool {
-        if self.authority_id != context.authority_id() {
+        if self.boot != context.boot() || self.authority_id != context.authority_id() {
             return false;
         }
         context.checkpoint_tag(self.boot, self.seq, self.root, self.relay_generation) == self.tag
@@ -802,6 +826,7 @@ pub enum AuditError {
     RelayInvalidCursor,
     RelayStaleCursor,
     RelayNotInFlight,
+    RelayMixedMode,
     HandoffIncomplete,
     BatchCapacityExhausted,
 }
@@ -821,6 +846,7 @@ impl core::fmt::Display for AuditError {
             Self::RelayInvalidCursor => "relay cursor invalid",
             Self::RelayStaleCursor => "relay cursor stale",
             Self::RelayNotInFlight => "relay record is not in flight",
+            Self::RelayMixedMode => "immediate retirement cannot follow retained relay evidence",
             Self::HandoffIncomplete => "audit handoff is incomplete and requires resync",
             Self::BatchCapacityExhausted => "batch exceeds the static terminal reserve",
         };

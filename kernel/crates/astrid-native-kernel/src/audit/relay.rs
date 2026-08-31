@@ -127,6 +127,15 @@ impl AuditRelay {
         Ok(())
     }
 
+    /// Immediate-retire mode is exclusive of any retained evidence. Mixing it
+    /// with buffered/in-flight records would make cursor semantics ambiguous.
+    pub(super) fn require_empty_for_immediate_retire(&self) -> Result<(), AuditError> {
+        if self.outstanding != 0 {
+            return Err(AuditError::RelayMixedMode);
+        }
+        Ok(())
+    }
+
     /// Publishes one already-rooted record. Window overflow keeps the
     /// authoritative event rooted but downstream-invisible until a resync.
     pub(super) fn publish(

@@ -30,7 +30,7 @@ fn handoff() -> [u8; AUTHORITY_HANDOFF_BYTES] {
     bytes[..8].copy_from_slice(b"ASAUDCTX");
     bytes[8..16].copy_from_slice(&1u64.to_le_bytes());
     bytes[16..32].copy_from_slice(&BOOT);
-    let tag = TagHasher::new(&trusted_key()).verifier_handoff_tag(BOOT, 1);
+    let tag = TagHasher::new(BOOT, &trusted_key()).verifier_handoff_tag(BOOT, 1);
     bytes[32..].copy_from_slice(&tag);
     bytes
 }
@@ -576,7 +576,8 @@ fn structurally_valid_self_authenticated_handoff_is_rejected() {
     // Structurally valid: correct magic, the anchored identity, and a tag
     // an attacker computed under a self-chosen key.
     let mut forged = genuine;
-    let attacker_tag = TagHasher::new(&[0xB0; 32]).verifier_handoff_tag(BOOT, anchor.authority_id);
+    let attacker_tag =
+        TagHasher::new(BOOT, &[0xB0; 32]).verifier_handoff_tag(BOOT, anchor.authority_id);
     forged[32..].copy_from_slice(&attacker_tag);
     assert_eq!(
         anchor.bind_handoff(&forged),
