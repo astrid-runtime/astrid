@@ -91,6 +91,12 @@ const DOMAIN_OUTCOMES: &[(u64, u64, &str, u64, u64, &str, u64)] = &[
     (1, 10, "cancelled", 32, 0, "0x0", 3),
 ];
 const STOP_TAKEN: &[(u64, u64, u64, u64)] = &[(1, 10, 32, 0)];
+const READINESS_EVENT_NAMES: [&str; 4] = [
+    "readiness_reserved_cpl3_trap_accepted",
+    "readiness_receipt_bound_to_admission",
+    "readiness_receipt_observed_live",
+    "authenticated_readiness_receipt_exact_once_and_terminal_invalidated",
+];
 pub(crate) const HOSTILE_IPC_FAULT_ADDRESS: &str = "0x328000002000";
 const IPC_RECLAIMS: &[(u64, u64, u64, u64, u64)] = &[
     (2, 3, 1, 0, 0),
@@ -275,6 +281,45 @@ pub(super) fn domain_lifecycle_holds(events: &[Value]) -> bool {
             "generation",
             &[STOP_DOMAIN],
         );
+    let identity_position = |name: &str, identity: (u64, u64)| {
+        events.iter().position(|event| {
+            ev_name(event) == name
+                && u64_field(event, "id") == Some(identity.0)
+                && u64_field(event, "generation") == Some(identity.1)
+        })
+    };
+    let readiness_positions: Option<Vec<usize>> = READINESS_EVENT_NAMES
+        .into_iter()
+        .map(|name| {
+            events.iter().position(|event| {
+                ev_name(event) == "test.pass" && string_field(event, "name") == Some(name)
+            })
+        })
+        .collect();
+    let readiness_order_ok = readiness_positions.is_some_and(|positions| {
+        let start = identity_position("domain.start", STOP_DOMAIN);
+        let entered = identity_position("domain.entered", STOP_DOMAIN);
+        let returned = identity_position("domain.control.returned", STOP_DOMAIN);
+        let completed = identity_position("domain.stop.completed", STOP_DOMAIN);
+        let [trap, bound, observed, terminal] = positions[..] else {
+            return false;
+        };
+        start.is_some_and(|start| {
+            entered.is_some_and(|entered| {
+                returned.is_some_and(|returned| {
+                    completed.is_some_and(|completed| {
+                        start < entered
+                            && entered < trap
+                            && trap < bound
+                            && bound < observed
+                            && observed < returned
+                            && returned < completed
+                            && completed < terminal
+                    })
+                })
+            })
+        })
+    });
     let reclaims_ok = exact_pairs(
         events,
         "domain.reclaim",
@@ -419,6 +464,7 @@ pub(super) fn domain_lifecycle_holds(events: &[Value]) -> bool {
     );
     ok &= check("exact returned-stop consumption", stop_taken_ok);
     ok &= check("running-stop terminal completion order", stop_tail_ok);
+    ok &= check("reserved readiness CPL3 event order", readiness_order_ok);
     ok &= check("exact reclaim generations and accounting", reclaims_ok);
     ok &= check("restores accompany every reclaim", restores_ok);
     ok &= check("domain page-table audits", audits_ok);

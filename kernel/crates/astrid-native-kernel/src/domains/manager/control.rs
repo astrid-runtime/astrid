@@ -518,6 +518,9 @@ impl super::Manager {
             domain.control = control;
             returned
         };
+        if !self.invalidate_admitted_for_terminal(handle) {
+            return Err(ReturnedControlError::ReleaseFailed);
+        }
         let event = TrapContext {
             slot: handle.id().0,
             generation: handle.generation().0,

@@ -2,7 +2,6 @@
 
 use core::sync::atomic::Ordering;
 
-#[cfg(not(test))]
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 
 use spin::Mutex;
@@ -26,12 +25,13 @@ use super::types::{ComponentImage, PEER_PROBE};
 use crate::ipc;
 #[cfg(not(test))]
 use crate::memory::FRAME_SIZE;
-#[cfg(not(test))]
-use crate::serial;
 use astrid_system_generation::ContentId;
 
+#[cfg(not(test))]
+use crate::serial;
+
 #[cfg(test)]
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64};
+use core::sync::atomic::AtomicU8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrepareError {
     Bind(BindError),
@@ -229,7 +229,6 @@ pub static MANAGER: Mutex<Manager> = Mutex::new(Manager {
     last_identity: None,
 });
 
-#[cfg(not(test))]
 #[derive(Default)]
 pub struct Current {
     pub active: AtomicBool,
@@ -244,7 +243,6 @@ pub struct Current {
     pub stack_end: AtomicU64,
 }
 
-#[cfg(not(test))]
 pub static CURRENT: Current = Current {
     active: AtomicBool::new(false),
     slot: AtomicU64::new(0),
@@ -378,6 +376,7 @@ pub fn prepare(
             .ok_or(PrepareError::GenerationExhausted)?,
         None => 1,
     };
+    readiness::clear_slot(super::types::DomainId(slot as u64));
     let probe = PEER_PROBE + slot as u64 * FRAME_SIZE;
     let space = AddressSpace::new(image, probe).map_err(PrepareError::Paging)?;
     let needed = space.required_frames();
@@ -484,6 +483,9 @@ pub fn peer_is_prepared(handle: DomainHandle) -> bool {
 }
 
 mod control;
+mod readiness;
+#[cfg(test)]
+mod readiness_tests;
 mod start;
 #[cfg(test)]
 mod stop_tests;
@@ -587,6 +589,11 @@ pub fn generation_overflow_rejects_prepare(raw: &[u8], expected: ContentId) -> b
     });
     manager.slots[0] = None;
     rejected && unchanged && manager.used_frames == frames
+}
+
+#[cfg(not(test))]
+pub(in crate::domains) fn readiness_post_terminal_closed(handle: DomainHandle) -> bool {
+    readiness::observe_current(handle).is_none()
 }
 
 impl Manager {
@@ -921,12 +928,12 @@ impl Manager {
         self.release_slot_with_stop(handle, stop_requested.then_some(event))
     }
 
-    #[cfg(not(test))]
     fn cancel_prepared(&mut self, handle: DomainHandle) -> Result<(u64, u64), CancelError> {
         if CURRENT.active.load(Ordering::SeqCst) {
             return Err(CancelError::ActiveDomain);
         }
         let Some(domain) = self.valid_domain(handle) else {
+            #[cfg(not(test))]
             serial::ev_domain_cancel_rejected(
                 handle.id().0 + 1,
                 handle.generation().0,
@@ -938,6 +945,7 @@ impl Manager {
             return Err(CancelError::ActiveDomain);
         }
         if domain.state != DomainState::Prepared && domain.state != DomainState::Blocked {
+            #[cfg(not(test))]
             serial::ev_domain_cancel_rejected(
                 handle.id().0 + 1,
                 domain.generation,
@@ -948,29 +956,36 @@ impl Manager {
         let Some(space) = domain.space.as_ref() else {
             return Err(CancelError::NotPrepared);
         };
-        let source = space.source_root();
-        if KERNEL_CR3.get().is_none_or(|expected| *expected != source) || Cr3::read() != source {
+        if !readiness::cancel_context_matches(space) {
             return Err(CancelError::WrongCr3);
         }
         let generation = domain.generation;
         let blocked = domain.state == DomainState::Blocked;
+        if blocked && !self.invalidate_admitted_for_terminal(handle) {
+            return Err(CancelError::NotPrepared);
+        }
+        #[cfg(not(test))]
         serial::ev_domain_cancel_request(handle.id().0 + 1, generation);
         if blocked {
+            #[cfg(not(test))]
             serial::ev_ipc_wake(handle.id().0 + 1, generation, "cancelled");
             super::wait::mark_ipc_ready(handle, super::wait::BlockStatus::Cancelled);
         }
         let stats = self.release_slot(handle);
         if stats.exactly_once() {
-            serial::ev_domain_cancelled(handle.id().0 + 1, generation);
-            serial::ev_domain_outcome(
-                serial::DomainEventIdentity::new(handle.id().0 + 1, generation),
-                Outcome::Cancelled.name(),
-                0,
-                0,
-                0,
-                0,
-                0,
-            );
+            #[cfg(not(test))]
+            {
+                serial::ev_domain_cancelled(handle.id().0 + 1, generation);
+                serial::ev_domain_outcome(
+                    serial::DomainEventIdentity::new(handle.id().0 + 1, generation),
+                    Outcome::Cancelled.name(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
+            }
             Ok((stats.expected, stats.freed))
         } else {
             Err(CancelError::ReleaseFailed)

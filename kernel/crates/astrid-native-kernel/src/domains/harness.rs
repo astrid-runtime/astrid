@@ -32,6 +32,7 @@ const IPC_EXCHANGE_GATE: &str = "authenticated_domains_exchange_bounded_capabili
 const IPC_FAULT_GATE: &str = "peer_fault_wakes_blocked_recv_with_typed_status";
 const IPC_CANCEL_GATE: &str = "cancel_reclaims_blocked_ipc_exactly_once";
 const RUNNING_STOP_GATE: &str = "returned_control_stop_reclaims_exactly_once";
+const READINESS_GATE: &str = "authenticated_readiness_receipt_exact_once_and_terminal_invalidated";
 
 const PHASE_ENTRY: u64 = 0;
 const PHASE_INVALID_PREPARE: u64 = 1;
@@ -84,6 +85,7 @@ static IPC_EXCHANGE_OK: AtomicBool = AtomicBool::new(false);
 static IPC_FAULT_OK: AtomicBool = AtomicBool::new(false);
 static IPC_CANCEL_OK: AtomicBool = AtomicBool::new(false);
 static RUNNING_STOP_OK: AtomicBool = AtomicBool::new(false);
+static READINESS_OK: AtomicBool = AtomicBool::new(false);
 
 fn handle(storage: &AtomicU64) -> DomainHandle {
     let bits = storage.load(Ordering::SeqCst);
@@ -624,6 +626,11 @@ fn running_stop_done() -> ! {
     if !passed {
         fail("running_timer_stop_not_terminal");
     }
+    let terminal_closed = manager::readiness_post_terminal_closed(stop);
+    READINESS_OK.store(report(READINESS_GATE, terminal_closed), Ordering::SeqCst);
+    if !terminal_closed {
+        fail("terminal_readiness_was_observable");
+    }
     set_phase(PHASE_RUNNING_STOP_DONE);
     scheduler()
 }
@@ -633,7 +640,8 @@ fn finish() -> ! {
         && IPC_EXCHANGE_OK.load(Ordering::SeqCst)
         && IPC_FAULT_OK.load(Ordering::SeqCst)
         && IPC_CANCEL_OK.load(Ordering::SeqCst)
-        && RUNNING_STOP_OK.load(Ordering::SeqCst);
+        && RUNNING_STOP_OK.load(Ordering::SeqCst)
+        && READINESS_OK.load(Ordering::SeqCst);
     let pass = report(CLEAN_RESTART_GATE, CLEAN_RESTART_OK.load(Ordering::SeqCst)) && prior;
     serial::ev_domain_harness(pass);
     serial::ev_halt(pass);
