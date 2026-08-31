@@ -99,10 +99,12 @@ build (`undefined symbol: wcslen`). The ring-0 kernel stays on stable
 because bootloader 0.11 requires nightly `-Zbuild-std`. Use `./check.sh`
 for the supported split checks.
 
-kimage host artifacts go in `target/kimage-host`. Nested bootloader
-`cargo install` uses `target/bootloader-nested` via `CARGO_TARGET_DIR`.
-Those directories are distinct so the nested install cannot deadlock on
-the parent target lock.
+`check.sh` inherits Cargo's configured target directory instead of creating a
+target per worktree. kimage host artifacts go in `<cargo-target>/kimage-host`.
+Nested bootloader `cargo install` uses `<cargo-target>/bootloader-nested` via
+`CARGO_TARGET_DIR`. Those directories are distinct so the nested install cannot
+deadlock on the parent target lock. An explicit caller `CARGO_TARGET_DIR`
+remains supported when incompatible concurrent builds require isolation.
 
 ## What is asserted
 
@@ -168,8 +170,8 @@ remain untrusted advertisements.
   `cargo clippy -p ktest --all-targets --locked -- -D warnings`
 - stable `astrid-native-kernel` for `x86_64-unknown-none`:
   `cargo clippy -p astrid-native-kernel --target x86_64-unknown-none --locked -- -D warnings`
-- pinned nightly `kimage`: `rustup run nightly-2026-07-21 cargo clippy -p kimage --all-targets --locked --target-dir target/kimage-host -- -D warnings`
-  with `CARGO_TARGET_DIR=target/bootloader-nested` so nested
+- pinned nightly `kimage`: `rustup run nightly-2026-07-21 cargo clippy -p kimage --all-targets --locked --target-dir <cargo-target>/kimage-host -- -D warnings`
+  with `CARGO_TARGET_DIR=<cargo-target>/bootloader-nested` so nested
   `cargo install -Zbuild-std` cannot deadlock on the parent lock.
 
 `./run.sh` is the QEMU evidence. Sequential native emulator-image

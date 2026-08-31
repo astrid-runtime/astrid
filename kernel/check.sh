@@ -6,10 +6,20 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")" && pwd)"
 cd "$root"
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/target}"
+if [[ -z "${CARGO_TARGET_DIR:-}" ]]; then
+  CARGO_TARGET_DIR="$(
+    cargo metadata --no-deps --format-version 1 \
+      | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p'
+  )"
+fi
+if [[ -z "$CARGO_TARGET_DIR" ]]; then
+  echo "check.sh: unable to resolve Cargo target directory" >&2
+  exit 1
+fi
+export CARGO_TARGET_DIR
 toolchain="${KTEST_TOOLCHAIN:-nightly-2026-07-21}"
-host="$root/target/kimage-host"
-nested="$root/target/bootloader-nested"
+host="$CARGO_TARGET_DIR/kimage-host"
+nested="$CARGO_TARGET_DIR/bootloader-nested"
 
 mode="${1:-all}"
 if [[ $# -gt 1 ]]; then
