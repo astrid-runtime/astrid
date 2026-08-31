@@ -12,6 +12,8 @@ from runatal_v1_fastcdc import ASTRID_V1, cut, is_canonical_boundary
 from runatal_v1_fastcdc import validate_profile, verify_golden_vectors
 from runatal_v1_frames import frames, frames_bytes
 from runatal_v1_kv import validate_principal_kv
+from runatal_v1_owner import OwnerFormatError
+from runatal_v1_owner import principal_text as owner_principal_text
 from runatal_v1_physical import decode_store as decode_physical_store, identity_bytes
 from runatal_v1_sha384 import verify_cross_hash_attestations
 from runatal_v1_sketch import verify_bottom_k_sketches
@@ -750,15 +752,10 @@ def decode_root(payload):
 
 
 def principal_text(principal):
-    if principal == b"\0":
-        return "system"
-    if len(principal) == 33 and principal[:1] == b"\1":
-        return principal[1:].hex()
-    if len(principal) == 33 and principal[:1] == b"\2":
-        return f"fleet:{principal[1:].hex()}"
-    if len(principal) == 33 and principal[:1] == b"\3":
-        return f"user:{principal[1:].hex()}"
-    raise FormatError("invalid state-owner-v2 encoding")
+    try:
+        return owner_principal_text(principal)
+    except OwnerFormatError as error:
+        raise FormatError(str(error)) from error
 
 
 def parse_metadata(path):
