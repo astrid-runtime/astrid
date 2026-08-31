@@ -1,0 +1,62 @@
+//! Private fail-closed ceremony errors.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CeremonyError {
+    InvalidDeviceKey,
+    InvalidAnchorKey,
+    InvalidPresenceKey,
+    InvalidDataKeyId,
+    InvalidNonce,
+    InvalidGeneration,
+    InvalidRecoveryPolicy,
+    AttestationInvalid,
+    NotFresh,
+    NotAnchorPending,
+    NotGraphPending,
+    NotGraphEnrolled,
+    NotEnrolled,
+    TranscriptGeneration,
+    TranscriptDataKey,
+    TranscriptPolicy,
+    TranscriptAnchor,
+    TranscriptPresence,
+    OwnerUnchanged,
+    PolicyRequired,
+    PresenceInvalid,
+    OwnerAuthorizationInvalid,
+    RecoveryApprovalsInvalid,
+    ResetProofInvalid,
+    GenerationOverflow,
+}
+
+impl CeremonyError {
+    pub const fn as_reason(self) -> &'static str {
+        match self {
+            Self::InvalidDeviceKey => "invalid_device_key",
+            Self::InvalidAnchorKey => "invalid_anchor_key",
+            Self::InvalidPresenceKey => "invalid_presence_key",
+            Self::InvalidDataKeyId => "invalid_data_key_id",
+            Self::InvalidNonce => "invalid_nonce",
+            Self::InvalidGeneration => "invalid_generation",
+            Self::InvalidRecoveryPolicy => "invalid_recovery_policy",
+            Self::AttestationInvalid => "attestation_invalid",
+            Self::NotFresh => "not_fresh",
+            Self::NotAnchorPending => "not_anchor_pending",
+            Self::NotGraphPending => "not_graph_pending",
+            Self::NotGraphEnrolled => "not_graph_enrolled",
+            Self::NotEnrolled => "not_enrolled",
+            Self::TranscriptGeneration => "transcript_generation",
+            Self::TranscriptDataKey => "transcript_data_key",
+            Self::TranscriptPolicy => "transcript_policy",
+            Self::TranscriptAnchor => "transcript_anchor",
+            Self::TranscriptPresence => "transcript_presence",
+            Self::OwnerUnchanged => "owner_unchanged",
+            Self::PolicyRequired => "policy_required",
+            Self::PresenceInvalid => "presence_invalid",
+            Self::OwnerAuthorizationInvalid => "owner_authorization_invalid",
+            Self::RecoveryApprovalsInvalid => "recovery_approvals_invalid",
+            Self::ResetProofInvalid => "reset_proof_invalid",
+            Self::GenerationOverflow => "generation_overflow",
+        }
+    }
+}

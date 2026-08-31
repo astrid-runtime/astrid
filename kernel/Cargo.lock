@@ -31,6 +31,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "astrid-first-owner-ceremony"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "ed25519-dalek",
+]
+
+[[package]]
 name = "astrid-init-plan"
 version = "0.0.0"
 dependencies = [
