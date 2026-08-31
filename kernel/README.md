@@ -100,7 +100,9 @@ because bootloader 0.11 requires nightly `-Zbuild-std`. Use `./check.sh`
 for the supported split checks.
 
 `check.sh` and `run.sh` inherit Cargo's effective target directory instead of
-creating a target per worktree. `run.sh` resolves that directory with
+creating a target per worktree. `check.sh` normalizes the configured-unset,
+explicit-relative, or explicit-absolute root once before deriving the nested
+sibling paths. `run.sh` resolves that directory with
 `cargo metadata` (so an unset `CARGO_TARGET_DIR` still honors
 `build.target-dir`) and passes the absolute root to ktest through the internal
 `ASTRID_CARGO_TARGET_ROOT` variable. The kernel build uses that root directly;
@@ -185,7 +187,8 @@ remain untrusted advertisements.
 - target-layout regression: `./test-shared-cargo-target.sh` exercises the
   `run.sh` → ktest layout with an external configured root (`CARGO_TARGET_DIR`
   unset), a relative explicit override, and an absolute explicit override;
-  it then builds kimage/nested UEFI in owned temporary roots and rejects
+  it runs `check.sh x86` through the relative root and builds kimage/nested
+  UEFI in owned temporary roots and rejects
   `kernel/target` and `tools/bootloader/target` output. Its EXIT trap removes
   only those validated mktemp roots.
 

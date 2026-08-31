@@ -7,15 +7,20 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")" && pwd)"
 cd "$root"
 if [[ -z "${CARGO_TARGET_DIR:-}" ]]; then
-  CARGO_TARGET_DIR="$(
+  target_root="$(
     cargo metadata --no-deps --format-version 1 \
       | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p'
   )"
+else
+  target_root="$CARGO_TARGET_DIR"
 fi
-if [[ -z "$CARGO_TARGET_DIR" ]]; then
+if [[ -z "$target_root" ]]; then
   echo "check.sh: unable to resolve Cargo target directory" >&2
   exit 1
 fi
+# Cargo preserves `..` components in relative override metadata output.
+# Normalize the selected root once before deriving any nested target paths.
+CARGO_TARGET_DIR="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$target_root")"
 export CARGO_TARGET_DIR
 toolchain="${KTEST_TOOLCHAIN:-nightly-2026-07-21}"
 host="$CARGO_TARGET_DIR/kimage-host"

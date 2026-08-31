@@ -136,6 +136,42 @@ run_kimage_check() {
   echo "target regression: kimage PASS (host=$host nested=$nested)"
 }
 
+run_check_relative() {
+  local target_root="$1"
+  local host="$target_root/kimage-host"
+  local nested="$target_root/bootloader-nested"
+  local relative_override output expected
+  relative_override="$(relative_path "$root" "$target_root")"
+  expected="check.sh: target root=$target_root host=$host nested=$nested"
+
+  echo "== check.sh x86 with relative shared root =="
+  if ! output="$(
+    env -u CARGO_BUILD_TARGET_DIR \
+      CARGO_TARGET_DIR="$relative_override" \
+      ./check.sh x86 2>&1
+  )"; then
+    printf '%s\n' "$output"
+    echo "target regression: check.sh relative-root x86 failed" >&2
+    exit 1
+  fi
+
+  grep -Fqx "$expected" <<< "$output" || {
+    echo "target regression: check.sh did not normalize the relative root" >&2
+    echo "expected: $expected" >&2
+    exit 1
+  }
+  assert_no_worktree_targets
+  [[ -d "$host" ]] || {
+    echo "target regression: missing check.sh host target $host" >&2
+    exit 1
+  }
+  [[ -d "$nested" ]] || {
+    echo "target regression: missing check.sh nested target $nested" >&2
+    exit 1
+  }
+  echo "target regression: check.sh PASS (root=$target_root host=$host nested=$nested)"
+}
+
 assert_no_worktree_targets
 configured_root="$(mktemp -d "$temp_parent/astrid-cargo-configured.XXXXXX")"
 owned_roots+=("$configured_root")
@@ -156,6 +192,8 @@ run_layout_probe \
 run_layout_probe \
   "absolute explicit CARGO_TARGET_DIR preserved by run.sh" \
   "$absolute_root" absolute
+
+run_check_relative "$relative_root"
 
 # Build kimage once in the configured and explicit roots. This exercises the
 # parent host target, nested bootloader target, and build.rs handoff in
