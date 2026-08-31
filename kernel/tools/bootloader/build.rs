@@ -6,8 +6,17 @@ use std::process::Command;
 mod build_config;
 
 const BOOTLOADER_VERSION: &str = env!("CARGO_PKG_VERSION");
+const NESTED_TARGET_ENV: &str = "ASTRID_BOOTLOADER_TARGET_DIR";
+const NESTED_TARGET_DIR: &str = "bootloader-nested";
 
 fn main() {
+    // The nested cargo target is selected through an internal orchestration
+    // variable first, then the caller's explicit/configured target root. Cargo
+    // must rerun this build script whenever any of those inputs changes.
+    println!("cargo:rerun-if-env-changed={NESTED_TARGET_ENV}");
+    println!("cargo:rerun-if-env-changed=CARGO_TARGET_DIR");
+    println!("cargo:rerun-if-env-changed=CARGO_BUILD_TARGET_DIR");
+
     #[cfg(not(feature = "uefi"))]
     fn uefi_main() {}
     #[cfg(not(feature = "bios"))]
@@ -67,22 +76,121 @@ fn uefi_main() {
     );
 }
 
+/// Resolve the target directory for the nested UEFI cargo invocation.
+///
+/// `ktest` supplies the exact nested path through `ASTRID_BOOTLOADER_TARGET_DIR`
+/// while it runs the parent `kimage` build in a sibling target directory. A
+/// direct `cargo build -p kimage` has no such orchestration variable, so keep
+/// its parent target isolated by deriving a sibling `bootloader-nested`
+/// directory from the caller override or Cargo's configured target root.
+fn nested_target_dir(cargo: &str) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(NESTED_TARGET_ENV)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+    {
+        return Some(absolutize(path));
+    }
+
+    if let Some(path) = std::env::var_os("CARGO_TARGET_DIR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+    {
+        return Some(absolutize(path).join(NESTED_TARGET_DIR));
+    }
+
+    let metadata = Command::new(cargo)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .output()
+        .ok()?;
+    if !metadata.status.success() {
+        return None;
+    }
+
+    let metadata = String::from_utf8(metadata.stdout).ok()?;
+    let target_dir = target_directory_from_metadata(&metadata)?;
+    Some(absolutize(PathBuf::from(target_dir)).join(NESTED_TARGET_DIR))
+}
+
+fn target_directory_from_metadata(metadata: &str) -> Option<String> {
+    // Parse the complete object so a nested package metadata key cannot be
+    // mistaken for Cargo's top-level target_directory. serde_json also
+    // decodes every valid JSON string escape, including Unicode escapes.
+    let document: serde_json::Value = serde_json::from_str(metadata).ok()?;
+    let target_directory = document.as_object()?.get("target_directory")?.as_str()?;
+    (!target_directory.is_empty()).then(|| target_directory.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::target_directory_from_metadata;
+
+    #[test]
+    fn target_directory_ignores_nested_key_collisions() {
+        let metadata = r#"
+            {
+                "packages": [{"metadata": {"target_directory": "/nested"}}],
+                "target_directory": "/top-level"
+            }
+        "#;
+
+        assert_eq!(
+            target_directory_from_metadata(metadata).as_deref(),
+            Some("/top-level")
+        );
+    }
+
+    #[test]
+    fn target_directory_decodes_supported_json_escapes() {
+        let metadata = r#"{"target_directory":"/tmp/astrid\\cache\"quoted-\u03bb-\ud83d\ude80"}"#;
+
+        assert_eq!(
+            target_directory_from_metadata(metadata).as_deref(),
+            Some(r#"/tmp/astrid\cache"quoted-λ-🚀"#)
+        );
+    }
+
+    #[test]
+    fn target_directory_requires_top_level_string() {
+        let metadata = r#"{"packages":[{"target_directory":"/nested"}]}"#;
+
+        assert_eq!(target_directory_from_metadata(metadata), None);
+    }
+}
+
+fn absolutize(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
 #[cfg(not(docsrs_dummy_build))]
 #[cfg(feature = "uefi")]
 fn build_uefi_bootloader() -> PathBuf {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let mut cmd = Command::new(cargo);
+    let mut cmd = Command::new(&cargo);
     cmd.arg("install").arg("bootloader-x86_64-uefi");
     if Path::new("uefi").exists() {
         // local build
         cmd.arg("--path").arg("uefi");
         println!("cargo:rerun-if-changed=uefi");
         println!("cargo:rerun-if-changed=common");
-        cmd.arg("--target-dir").arg("target/uefi_target");
     } else {
         cmd.arg("--version").arg(BOOTLOADER_VERSION);
     }
+    let nested_target = nested_target_dir(&cargo).unwrap_or_else(|| {
+        panic!(
+            "unable to resolve nested UEFI target directory; set {NESTED_TARGET_ENV} or CARGO_TARGET_DIR"
+        )
+    });
+    cmd.arg("--target-dir").arg(&nested_target);
+    cmd.env("CARGO_TARGET_DIR", &nested_target);
+    cmd.env(NESTED_TARGET_ENV, &nested_target);
     cmd.arg("--locked");
     cmd.arg("--target").arg(build_config::NESTED_UEFI_TARGET);
     cmd.arg("-Zbuild-std=core")

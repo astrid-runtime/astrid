@@ -69,6 +69,9 @@ overflow-checks = true
 
 [build-dependencies]
 llvm-tools = "0.1.1"
+# build.rs parses Cargo metadata as JSON; serde_json is also a runtime
+# dependency above for serializing boot configuration.
+serde_json = "1.0.91"
 
 [package.metadata.docs.rs]
 rustc-args = ["--cfg", "docsrs_dummy_build"]
