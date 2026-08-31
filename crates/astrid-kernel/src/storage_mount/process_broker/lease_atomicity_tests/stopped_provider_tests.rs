@@ -953,6 +953,8 @@ impl Drop for AdoptedTestChild {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn historical_detached_pid_shell_holds_stderr_until_explicit_reap() {
+    use nix::sys::signal::Signal;
+    use nix::sys::wait::WaitStatus;
     use std::sync::atomic::Ordering;
 
     let subreaper = TestChildSubreaper::new();
@@ -1023,8 +1025,8 @@ async fn historical_detached_pid_shell_holds_stderr_until_explicit_reap() {
         .expect("subreaper adopted the historical descendant");
     assert!(
         matches!(
-            status.signal(),
-            Some(nix::sys::signal::Signal::SIGTERM | nix::sys::signal::Signal::SIGKILL)
+            status,
+            WaitStatus::Signaled(_, Signal::SIGTERM | Signal::SIGKILL, _)
         ),
         "the adopted descendant was explicitly signaled and reaped: {status:?}"
     );
