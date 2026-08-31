@@ -56,9 +56,29 @@ impl StorageMountLeaseState {
         }
     }
 
+    /// Wait for the production classifier's typed `JoinFailed` publication.
+    /// The boolean drain watch cannot distinguish a prior timeout from this.
+    #[cfg(all(test, any(unix, windows)))]
+    pub(crate) async fn wait_join_failure_classification_for_test(&self) {
+        let mut classified = self.join_failure_tx.subscribe();
+        while !matches!(*classified.borrow(), Some(DrainFailureKind::JoinFailed)) {
+            classified
+                .changed()
+                .await
+                .expect("join failure classification sender");
+        }
+    }
+
     #[cfg(any(unix, windows))]
     pub(crate) fn join_failure_is_published_for_test(&self) -> bool {
         *self.drain_failure_tx.subscribe().borrow()
+    }
+
+    #[cfg(all(test, any(unix, windows)))]
+    pub(super) fn record_join_failure_for_test(&self, failure: DrainFailureKind) {
+        if failure == DrainFailureKind::JoinFailed {
+            self.join_failure_tx.send_replace(Some(failure));
+        }
     }
 
     pub(crate) fn in_flight_mutations_for_test(&self) -> u64 {

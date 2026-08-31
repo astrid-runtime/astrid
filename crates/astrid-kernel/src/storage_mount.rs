@@ -140,6 +140,8 @@ pub(crate) struct StorageMountLeaseState {
     drain_failure: std::sync::Mutex<Option<DrainFailureKind>>,
     #[cfg(any(unix, windows))]
     drain_failure_tx: watch::Sender<bool>,
+    #[cfg(all(test, any(unix, windows)))]
+    join_failure_tx: watch::Sender<Option<DrainFailureKind>>,
     #[cfg(any(unix, windows))]
     drain_attempts: tokio::sync::Mutex<drain_state::DrainAttemptState>,
     #[cfg(all(test, any(unix, windows)))]
@@ -228,6 +230,8 @@ impl StorageMountLeaseState {
         if latch.is_none_or(|current| failure >= current) {
             *latch = Some(failure);
             self.drain_failure_tx.send_replace(true);
+            #[cfg(all(test, any(unix, windows)))]
+            self.record_join_failure_for_test(failure);
         }
     }
 
@@ -343,7 +347,6 @@ fn publish_issued_lease(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (listener_closed_tx, _) = watch::channel(false);
     #[cfg(any(unix, windows))]
-    #[cfg(any(unix, windows))]
     let (drain_failure_tx, _) = watch::channel(false);
     let cleanup_ledger_path = kernel
         .astrid_home
@@ -383,6 +386,8 @@ fn publish_issued_lease(
         drain_failure: std::sync::Mutex::new(None),
         #[cfg(any(unix, windows))]
         drain_failure_tx,
+        #[cfg(all(test, any(unix, windows)))]
+        join_failure_tx: watch::channel(None).0,
         #[cfg(any(unix, windows))]
         drain_attempts: tokio::sync::Mutex::new(drain_state::DrainAttemptState::default()),
         #[cfg(all(test, any(unix, windows)))]
