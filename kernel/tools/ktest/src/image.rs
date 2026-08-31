@@ -3,10 +3,10 @@
 //! bootloader 0.11's build.rs runs `cargo install bootloader-x86_64-uefi`
 //! and inherits `CARGO_TARGET_DIR`. If that directory is also the parent
 //! kimage target dir, parent and nested cargo deadlock on `.cargo-build-lock`.
-//! Parent uses `--target-dir` (not inherited). The exact nested path is also
+//! The runtime harness resolves one effective target root, then gives kimage
+//! two absolute sibling directories beneath it. The exact nested path is also
 //! passed through `ASTRID_BOOTLOADER_TARGET_DIR` so the vendored build script
-//! cannot fall back to a per-worktree target. Neither path is the shared
-//! `~/.cache/cargo-targets`; they are distinct siblings beneath it.
+//! cannot fall back to a per-worktree target.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,10 +16,13 @@ use std::process::Command;
 /// link `wcslen` on GitHub rolling nightly.
 pub const KIMAGE_NIGHTLY: &str = "nightly-2026-07-21";
 
+/// Internal absolute target root resolved by `run.sh`/`ktest`.
+pub const TARGET_ROOT_ENV: &str = "ASTRID_CARGO_TARGET_ROOT";
+
 /// Nightly host artifacts for the `kimage` binary and the `bootloader` crate.
-pub const HOST_TARGET_REL: &str = "target/kimage-host";
+pub const HOST_TARGET_REL: &str = "kimage-host";
 /// Target dir inherited by nested `cargo install -Zbuild-std`.
-pub const NESTED_TARGET_REL: &str = "target/bootloader-nested";
+pub const NESTED_TARGET_REL: &str = "bootloader-nested";
 /// Exact nested target path consumed by the vendored bootloader build script.
 pub const NESTED_TARGET_ENV: &str = "ASTRID_BOOTLOADER_TARGET_DIR";
 pub const ROOT_KEY_REL: &str = "tools/kimage/fixtures/root.key.hex";
@@ -34,11 +37,18 @@ pub struct KimageInvocation {
 }
 
 impl KimageInvocation {
-    pub fn new(root: &Path, toolchain: impl Into<String>) -> Self {
+    /// Construct an invocation under one already-resolved absolute Cargo
+    /// target root. Host and nested output are always distinct siblings.
+    pub fn for_target_root(target_root: &Path, toolchain: impl Into<String>) -> Self {
+        assert!(
+            target_root.is_absolute(),
+            "ktest target root must be absolute: {}",
+            target_root.display()
+        );
         Self {
             toolchain: toolchain.into(),
-            host_target_dir: root.join(HOST_TARGET_REL),
-            nested_target_dir: root.join(NESTED_TARGET_REL),
+            host_target_dir: target_root.join(HOST_TARGET_REL),
+            nested_target_dir: target_root.join(NESTED_TARGET_REL),
         }
     }
 
@@ -131,15 +141,29 @@ mod tests {
 
     #[test]
     fn nested_target_is_not_the_parent_host_target() {
-        let inv = KimageInvocation::new(Path::new("/ws"), "nightly");
+        let inv = KimageInvocation::for_target_root(Path::new("/ws/target"), "nightly");
         assert!(inv.isolates_nested_install());
         assert!(inv.host_target_dir.ends_with("target/kimage-host"));
         assert!(inv.nested_target_dir.ends_with("target/bootloader-nested"));
     }
 
     #[test]
+    fn shared_target_root_uses_exact_absolute_siblings() {
+        let inv = KimageInvocation::for_target_root(Path::new("/shared/cargo-target"), "nightly");
+        assert_eq!(
+            inv.host_target_dir,
+            Path::new("/shared/cargo-target/kimage-host")
+        );
+        assert_eq!(
+            inv.nested_target_dir,
+            Path::new("/shared/cargo-target/bootloader-nested")
+        );
+        assert!(inv.isolates_nested_install());
+    }
+
+    #[test]
     fn command_uses_flag_for_host_and_env_for_nested() {
-        let inv = KimageInvocation::new(Path::new("/ws"), "nightly");
+        let inv = KimageInvocation::for_target_root(Path::new("/ws/target"), "nightly");
         let cmd = inv.command(Path::new("/ws"), Path::new("/k.elf"), Path::new("/o.img"));
         let args: Vec<String> = cmd
             .get_args()

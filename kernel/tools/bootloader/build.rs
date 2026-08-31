@@ -10,6 +10,13 @@ const NESTED_TARGET_ENV: &str = "ASTRID_BOOTLOADER_TARGET_DIR";
 const NESTED_TARGET_DIR: &str = "bootloader-nested";
 
 fn main() {
+    // The nested cargo target is selected through an internal orchestration
+    // variable first, then the caller's explicit/configured target root. Cargo
+    // must rerun this build script whenever any of those inputs changes.
+    println!("cargo:rerun-if-env-changed={NESTED_TARGET_ENV}");
+    println!("cargo:rerun-if-env-changed=CARGO_TARGET_DIR");
+    println!("cargo:rerun-if-env-changed=CARGO_BUILD_TARGET_DIR");
+
     #[cfg(not(feature = "uefi"))]
     fn uefi_main() {}
     #[cfg(not(feature = "bios"))]
@@ -81,14 +88,14 @@ fn nested_target_dir(cargo: &str) -> Option<PathBuf> {
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
     {
-        return Some(path);
+        return Some(absolutize(path));
     }
 
     if let Some(path) = std::env::var_os("CARGO_TARGET_DIR")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
     {
-        return Some(path.join(NESTED_TARGET_DIR));
+        return Some(absolutize(path).join(NESTED_TARGET_DIR));
     }
 
     let metadata = Command::new(cargo)
@@ -106,7 +113,17 @@ fn nested_target_dir(cargo: &str) -> Option<PathBuf> {
     if target_dir.is_empty() {
         return None;
     }
-    Some(PathBuf::from(target_dir).join(NESTED_TARGET_DIR))
+    Some(absolutize(PathBuf::from(target_dir)).join(NESTED_TARGET_DIR))
+}
+
+fn absolutize(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
 }
 
 #[cfg(not(docsrs_dummy_build))]
@@ -131,6 +148,7 @@ fn build_uefi_bootloader() -> PathBuf {
     });
     cmd.arg("--target-dir").arg(&nested_target);
     cmd.env("CARGO_TARGET_DIR", &nested_target);
+    cmd.env(NESTED_TARGET_ENV, &nested_target);
     cmd.arg("--locked");
     cmd.arg("--target").arg(build_config::NESTED_UEFI_TARGET);
     cmd.arg("-Zbuild-std=core")

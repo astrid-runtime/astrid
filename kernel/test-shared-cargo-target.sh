@@ -1,14 +1,46 @@
 #!/usr/bin/env bash
-# Exercise the nested UEFI build against an external Cargo target root.
+# Exercise the run.sh -> ktest target handoff and the nested UEFI layout.
 #
-# This regression intentionally leaves CARGO_TARGET_DIR unset in the first
-# case. Cargo's build.target-dir override supplies the shared root, while the
-# parent kimage build and nested bootloader install use sibling directories.
+# Every target root below is an owned mktemp directory. The EXIT trap removes
+# only those exact directories after validating their parent/name; no shared
+# Cargo cache or pre-existing worktree output is ever touched.
 set -euo pipefail
 
-root="$(cd "$(dirname "$0")" && pwd)"
-toolchain="${KTEST_TOOLCHAIN:-nightly-2026-07-21}"
+root="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 cd "$root"
+toolchain="${KTEST_TOOLCHAIN:-nightly-2026-07-21}"
+temp_parent="${RUNNER_TEMP:-/tmp}"
+if [[ "$temp_parent" != /* || ! -d "$temp_parent" ]]; then
+  echo "target regression: RUNNER_TEMP must be an existing absolute directory" >&2
+  exit 1
+fi
+temp_parent="$(cd -- "$temp_parent" && pwd -P)"
+
+owned_roots=()
+cleanup_owned_roots() {
+  local path parent name
+  for path in "${owned_roots[@]}"; do
+    [[ -n "$path" ]] || continue
+    parent="${path%/*}"
+    name="${path##*/}"
+    case "$name" in
+      astrid-cargo-configured.*|astrid-cargo-relative.*|astrid-cargo-absolute.*)
+        ;;
+      *)
+        echo "target regression: refusing to clean unvalidated path $path" >&2
+        continue
+        ;;
+    esac
+    if [[ "$parent" != "$temp_parent" ]]; then
+      echo "target regression: refusing to clean foreign parent $path" >&2
+      continue
+    fi
+    if [[ -d "$path" && ! -L "$path" ]]; then
+      rm -rf -- "$path"
+    fi
+  done
+}
+trap cleanup_owned_roots EXIT
 
 assert_no_worktree_targets() {
   local worktree_target
@@ -20,38 +52,78 @@ assert_no_worktree_targets() {
   done
 }
 
-run_kimage_check() {
+relative_path() {
+  python3 - "$1" "$2" <<'PY'
+import os
+import sys
+
+print(os.path.relpath(sys.argv[2], sys.argv[1]))
+PY
+}
+
+run_layout_probe() {
   local label="$1"
   local target_root="$2"
   local mode="$3"
-  local host="$target_root/kimage-host"
-  local nested="$target_root/bootloader-nested"
+  local relative_override=""
+  local output
+  local expected="ktest: target root=$target_root kernel=$target_root host=$target_root/kimage-host nested=$target_root/bootloader-nested"
 
   echo "== $label =="
-  mkdir -p "$target_root"
   case "$mode" in
     configured)
-      # CARGO_BUILD_TARGET_DIR is Cargo's build.target-dir configuration
-      # override. Keep CARGO_TARGET_DIR genuinely unset for this case.
-      env -u CARGO_TARGET_DIR \
-        CARGO_BUILD_TARGET_DIR="$target_root" \
-        rustup run "$toolchain" cargo clippy -p kimage --all-targets --locked \
-          --target-dir "$host" -- -D warnings
+      if ! output="$(env -u CARGO_TARGET_DIR -u ASTRID_CARGO_TARGET_ROOT \
+        CARGO_BUILD_TARGET_DIR="$target_root" ./run.sh --target-layout-only 2>&1)"; then
+        printf '%s\n' "$output"
+        echo "target regression: run.sh configured-layout probe failed" >&2
+        exit 1
+      fi
       ;;
-    explicit)
-      # An explicit caller override remains the parent root; build.rs must
-      # derive the distinct nested sibling from it.
-      env -u CARGO_BUILD_TARGET_DIR \
-        CARGO_TARGET_DIR="$target_root" \
-        rustup run "$toolchain" cargo clippy -p kimage --all-targets --locked \
-          --target-dir "$host" -- -D warnings
+    relative)
+      relative_override="$(relative_path "$root" "$target_root")"
+      if ! output="$(env -u CARGO_BUILD_TARGET_DIR -u ASTRID_CARGO_TARGET_ROOT \
+        CARGO_TARGET_DIR="$relative_override" ./run.sh --target-layout-only 2>&1)"; then
+        printf '%s\n' "$output"
+        echo "target regression: run.sh relative-layout probe failed" >&2
+        exit 1
+      fi
+      ;;
+    absolute)
+      if ! output="$(env -u CARGO_BUILD_TARGET_DIR -u ASTRID_CARGO_TARGET_ROOT \
+        CARGO_TARGET_DIR="$target_root" ./run.sh --target-layout-only 2>&1)"; then
+        printf '%s\n' "$output"
+        echo "target regression: run.sh absolute-layout probe failed" >&2
+        exit 1
+      fi
       ;;
     *)
-      echo "unknown regression mode: $mode" >&2
+      echo "target regression: unknown layout mode $mode" >&2
       exit 2
       ;;
   esac
 
+  printf '%s\n' "$output"
+  grep -Fqx "$expected" <<< "$output" || {
+    echo "target regression: ktest did not report exact shared siblings" >&2
+    echo "expected: $expected" >&2
+    exit 1
+  }
+  assert_no_worktree_targets
+  echo "target regression: layout PASS (root=$target_root)"
+}
+
+run_kimage_check() {
+  local label="$1"
+  local target_root="$2"
+  local host="$target_root/kimage-host"
+  local nested="$target_root/bootloader-nested"
+
+  echo "== $label =="
+  env -u CARGO_BUILD_TARGET_DIR \
+    CARGO_TARGET_DIR="$target_root" \
+    ASTRID_BOOTLOADER_TARGET_DIR="$nested" \
+    rustup run "$toolchain" cargo clippy -p kimage --all-targets --locked \
+      --target-dir "$host" -- -D warnings
   assert_no_worktree_targets
   [[ -d "$host" ]] || {
     echo "target regression: missing host target $host" >&2
@@ -61,20 +133,34 @@ run_kimage_check() {
     echo "target regression: missing nested target $nested" >&2
     exit 1
   }
-  echo "target regression: PASS (host=$host nested=$nested)"
+  echo "target regression: kimage PASS (host=$host nested=$nested)"
 }
 
 assert_no_worktree_targets
-shared_root="$(mktemp -d "${RUNNER_TEMP:-/tmp}/astrid-cargo-shared.XXXXXX")"
-explicit_root="$(mktemp -d "${RUNNER_TEMP:-/tmp}/astrid-cargo-explicit.XXXXXX")"
-echo "shared_root=$shared_root"
-echo "explicit_root=$explicit_root"
+configured_root="$(mktemp -d "$temp_parent/astrid-cargo-configured.XXXXXX")"
+owned_roots+=("$configured_root")
+relative_root="$(mktemp -d "$temp_parent/astrid-cargo-relative.XXXXXX")"
+owned_roots+=("$relative_root")
+absolute_root="$(mktemp -d "$temp_parent/astrid-cargo-absolute.XXXXXX")"
+owned_roots+=("$absolute_root")
+echo "configured_root=$configured_root"
+echo "relative_root=$relative_root"
+echo "absolute_root=$absolute_root"
 
-run_kimage_check \
+run_layout_probe \
   "unset CARGO_TARGET_DIR with external Cargo target configuration" \
-  "$shared_root" configured
-run_kimage_check \
-  "explicit CARGO_TARGET_DIR remains an isolated parent root" \
-  "$explicit_root" explicit
+  "$configured_root" configured
+run_layout_probe \
+  "relative explicit CARGO_TARGET_DIR normalized by run.sh" \
+  "$relative_root" relative
+run_layout_probe \
+  "absolute explicit CARGO_TARGET_DIR preserved by run.sh" \
+  "$absolute_root" absolute
 
-echo "target regression: PASS (no kernel/target or tools/bootloader/target)"
+# Build kimage once in the configured and explicit roots. This exercises the
+# parent host target, nested bootloader target, and build.rs handoff in
+# addition to the lightweight run.sh/ktest layout probes above.
+run_kimage_check "configured shared-root kimage + nested UEFI" "$configured_root"
+run_kimage_check "explicit shared-root kimage + nested UEFI" "$absolute_root"
+
+echo "target regression: PASS (run.sh/ktest layout and nested kimage; no kernel/target or tools/bootloader/target)"

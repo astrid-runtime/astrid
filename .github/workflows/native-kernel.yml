@@ -126,6 +126,15 @@ jobs:
           toolchain: nightly-2026-07-21
           components: rust-src, clippy
 
+      - name: Configure external shared Cargo target
+        run: |
+          target_root="$RUNNER_TEMP/astrid-native-kernel-qemu-target"
+          mkdir -p "$target_root"
+          # Keep CARGO_TARGET_DIR unset so run.sh/ktest resolve Cargo's
+          # configured root and thread exact siblings through kernel/kimage.
+          echo "CARGO_BUILD_TARGET_DIR=$target_root" >> "$GITHUB_ENV"
+          echo "ASTRID_QEMU_TARGET_ROOT=$target_root" >> "$GITHUB_ENV"
+
       - name: Install QEMU and OVMF
         run: |
           sudo apt-get update
@@ -174,3 +183,12 @@ jobs:
           # No KVM, virtio/IOMMU, DMA, bare-metal, firmware-root, A/B, or first-owner claim.
           # DETERMINISM FAIL is reported by ktest and is not a boot-assertion gate.
           ./run.sh
+
+      - name: Assert QEMU shared-target layout
+        run: |
+          set -euo pipefail
+          test ! -e "$GITHUB_WORKSPACE/kernel/target"
+          test ! -e "$GITHUB_WORKSPACE/kernel/tools/bootloader/target"
+          test -d "$ASTRID_QEMU_TARGET_ROOT/kimage-host"
+          test -d "$ASTRID_QEMU_TARGET_ROOT/bootloader-nested"
+          echo "QEMU shared-target layout: PASS (root=$ASTRID_QEMU_TARGET_ROOT)"
