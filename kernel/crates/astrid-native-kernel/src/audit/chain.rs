@@ -9,6 +9,7 @@ use super::types::{
     AuditAuthority, AuditCheckpoint, AuditError, AuditEvent, BootSessionId, KernelSecretEntropy,
 };
 use core::mem::MaybeUninit;
+use native_audit_verifier::SpeculativeFold;
 pub(crate) struct AuditChain {
     boot: BootSessionId,
     authority: AuditAuthority,
@@ -241,18 +242,27 @@ impl AuditChain {
     }
 
     /// Roots and stages one event in chain-owned scratch, invokes the
-    /// independent verifier, and retires it before return. The callable keeps
-    /// the verifier out of this method's static type while the large frame
-    /// stays off the live IPC stack.
+    /// independent verifier, authenticates its receipt, and retires it before
+    /// return. The verifier transaction closes only after relay retirement
+    /// succeeds, so no post-fold failure can strand either cursor.
     #[inline(never)]
-    pub(crate) fn append_verified<F>(
+    pub(crate) fn append_verified(
         &mut self,
         event: &AuditEvent,
-        verify: &mut F,
-    ) -> Result<AuditObservation, AuditError>
-    where
-        F: FnMut(&[u8], &[u8; root::ROOT_LEN]) -> Result<[u8; root::ROOT_LEN], AuditError>,
-    {
+        verifier: &mut native_audit_verifier::AuditVerifier,
+    ) -> Result<AuditObservation, AuditError> {
+        self.prepare_verified(event)?;
+        let mut transaction = verifier.speculative();
+        let receipt = transaction
+            .fold(self.record_scratch.frame(), self.record_scratch.root)
+            .map_err(|_| AuditError::RootMismatch)?;
+        self.retire_verified(&mut transaction, receipt.ack_tag())
+    }
+
+    /// Stages and preflights a record without advancing the chain or opening
+    /// verifier state. This named seam lets the rollback test drive the exact
+    /// production preparation steps.
+    pub(super) fn prepare_verified(&mut self, event: &AuditEvent) -> Result<(), AuditError> {
         let next = self
             .seq
             .checked_add(1)
@@ -264,23 +274,44 @@ impl AuditChain {
         // prevents the verifier from advancing before the transaction fails.
         self.relay.require_empty_for_immediate_retire()?;
         self.relay
-            .can_publish(next, event.class().is_terminal_or_invalidation())?;
-        let receipt_tag = verify(self.record_scratch.frame(), &self.record_scratch.root)?;
+            .can_publish(next, event.class().is_terminal_or_invalidation())
+    }
+
+    pub(super) fn staged_frame(&self) -> &[u8] {
+        self.record_scratch.frame()
+    }
+
+    pub(super) fn staged_root(&self) -> &[u8; root::ROOT_LEN] {
+        &self.record_scratch.root
+    }
+
+    /// Authenticates the independent fold receipt at the relay and finishes
+    /// the verifier transaction only on success. Relay checks mutate nothing
+    /// on failure; explicit rollback restores the two verifier scalars.
+    pub(super) fn retire_verified(
+        &mut self,
+        transaction: &mut SpeculativeFold<'_>,
+        receipt_tag: [u8; root::ROOT_LEN],
+    ) -> Result<AuditObservation, AuditError> {
         let seq = self.record_scratch.seq;
         let root = self.record_scratch.root;
         let class = self.record_scratch.class;
-        self.relay.publish_retired(
+        let result = self.relay.publish_retired(
             seq,
             self.record_scratch.frame(),
             root,
             self.record_scratch.mandatory(),
             receipt_tag,
             self.authority.context(),
-        )?;
-
-        self.seq = seq;
-        self.root = root;
-        Ok(AuditObservation { seq, class, root })
+        );
+        if result.is_ok() {
+            transaction.commit();
+            self.seq = seq;
+            self.root = root;
+        } else {
+            transaction.rollback();
+        }
+        result.map(|()| AuditObservation { seq, class, root })
     }
 
     /// Kernel-authenticated checkpoint bound to the exact current state.

@@ -404,7 +404,62 @@ pub struct AuditVerifier {
     relay_generation: u64,
 }
 
+/// A fold whose scalar cursor advances remain uncommitted until the caller
+/// finishes it. This type owns no verification key and is deliberately
+/// move-only; dropping an open transaction restores its cursor.
+pub struct SpeculativeFold<'a> {
+    verifier: &'a mut AuditVerifier,
+    previous_next_seq: u64,
+    previous_root: [u8; 32],
+    finished: bool,
+}
+
+impl SpeculativeFold<'_> {
+    /// Independently folds the staged frame, but leaves the verifier cursor
+    /// open for transaction-level authentication by the kernel relay.
+    pub fn fold(
+        &mut self,
+        frame: &[u8],
+        claimed_root: [u8; 32],
+    ) -> Result<FoldReceipt, FoldFailure> {
+        self.verifier.fold(frame, claimed_root)
+    }
+
+    /// Retains a successful fold and its authenticated receipt.
+    pub fn commit(&mut self) {
+        self.finished = true;
+    }
+
+    /// Rejects a successful fold after downstream receipt authentication
+    /// failed. Only the two scalar cursor fields can move backward.
+    pub fn rollback(&mut self) {
+        self.verifier.next_seq = self.previous_next_seq;
+        self.verifier.root = self.previous_root;
+        self.finished = true;
+    }
+}
+
+impl Drop for SpeculativeFold<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.rollback();
+        }
+    }
+}
+
 impl AuditVerifier {
+    /// Opens an explicit verifier transaction. A successful fold advances
+    /// only `next_seq` and `root`; commit it only after the relay has
+    /// authenticated the returned receipt, otherwise roll it back.
+    pub fn speculative(&mut self) -> SpeculativeFold<'_> {
+        SpeculativeFold {
+            previous_next_seq: self.next_seq,
+            previous_root: self.root,
+            verifier: self,
+            finished: false,
+        }
+    }
+
     /// Starts from genesis only after binding the untrusted handoff against
     /// the trusted anchor for the same boot.
     pub fn genesis(

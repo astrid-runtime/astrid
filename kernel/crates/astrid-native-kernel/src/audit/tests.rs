@@ -365,17 +365,7 @@ fn immediate_retirement_rejects_retained_relay_evidence() {
     let before = (chain.seq(), *chain.root());
     let verifier_before = (host_verifier.next_seq(), host_verifier.root());
 
-    let folded = chain.append_verified(
-        &domain_event(AuditClass::DomainAdmit),
-        &mut |frame: &[u8], root: &[u8; 32]| {
-            let mut bad_root = *root;
-            bad_root[0] ^= 1;
-            host_verifier
-                .fold(frame, bad_root)
-                .map(|receipt| receipt.ack_tag())
-                .map_err(|_| AuditError::RootMismatch)
-        },
-    );
+    let folded = chain.append_verified(&domain_event(AuditClass::DomainAdmit), &mut host_verifier);
     assert_eq!(folded, Err(AuditError::RelayMixedMode));
     assert_eq!((chain.seq(), *chain.root()), before);
     assert_eq!(chain.relay().redeliver().count(), 1);
@@ -403,24 +393,61 @@ fn verified_staging_failure_leaves_chain_untouched() {
     let before = (chain.seq(), *chain.root());
     let verifier_before = (host_verifier.next_seq(), host_verifier.root());
 
-    let folded = chain.append_verified(
-        &domain_event(AuditClass::DomainAdmit),
-        &mut |frame: &[u8], root: &[u8; 32]| {
-            let mut bad_root = *root;
-            bad_root[0] ^= 1;
-            host_verifier
-                .fold(frame, bad_root)
-                .map(|receipt| receipt.ack_tag())
-                .map_err(|_| AuditError::RootMismatch)
-        },
+    chain
+        .prepare_verified(&domain_event(AuditClass::DomainAdmit))
+        .unwrap();
+    let mut transaction = host_verifier.speculative();
+    let folded = transaction.fold(chain.staged_frame(), [0x12; 32]);
+    assert_eq!(
+        folded,
+        Err(native_audit_verifier::FoldFailure::Invalid(
+            native_audit_verifier::InvalidReason::RootMismatch,
+        ))
     );
-    assert_eq!(folded, Err(AuditError::RootMismatch));
+    drop(transaction);
     assert_eq!((chain.seq(), *chain.root()), before);
     assert_eq!(chain.relay().redeliver().count(), 0);
     assert_eq!(
         (host_verifier.next_seq(), host_verifier.root()),
         verifier_before
     );
+}
+
+#[test]
+fn rejected_receipt_rolls_back_verifier_after_successful_fold() {
+    let chain_boot = boot();
+    let mut chain = genesis_chain(chain_boot);
+    let mut host_verifier = verifier();
+
+    let before = (chain.seq(), *chain.root());
+    let verifier_before = (host_verifier.next_seq(), host_verifier.root());
+    chain
+        .prepare_verified(&domain_event(AuditClass::DomainAdmit))
+        .unwrap();
+    let mut transaction = host_verifier.speculative();
+    let receipt = transaction
+        .fold(chain.staged_frame(), *chain.staged_root())
+        .unwrap();
+    let mut rejected_receipt = receipt.ack_tag();
+    rejected_receipt[0] ^= 1;
+
+    assert_eq!(
+        chain.retire_verified(&mut transaction, rejected_receipt),
+        Err(AuditError::RootMismatch)
+    );
+    drop(transaction);
+    assert_eq!((chain.seq(), *chain.root()), before);
+    assert_eq!(chain.relay().redeliver().count(), 0);
+    assert_eq!(
+        (host_verifier.next_seq(), host_verifier.root()),
+        verifier_before
+    );
+
+    let observation = chain
+        .append_verified(&domain_event(AuditClass::DomainAdmit), &mut host_verifier)
+        .unwrap();
+    assert_eq!(observation.seq(), 1);
+    assert_eq!(host_verifier.next_seq(), 2);
 }
 
 #[test]

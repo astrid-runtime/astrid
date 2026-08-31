@@ -105,18 +105,10 @@ pub(crate) fn install_for_test(
 #[inline(never)]
 pub(crate) fn record(event: &AuditEvent) -> Result<AuditObservation, AuditError> {
     let mut runtime = RUNTIME.lock();
-    let Some(runtime) = runtime.as_mut() else {
+    let Some(AuditRuntime { chain, verifier }) = runtime.as_mut() else {
         return Err(AuditError::MalformedFrame);
     };
-    runtime
-        .chain
-        .append_verified(event, &mut |frame: &[u8], root: &[u8; 32]| {
-            runtime
-                .verifier
-                .fold(frame, *root)
-                .map(|receipt| receipt.ack_tag())
-                .map_err(|_| AuditError::RootMismatch)
-        })
+    chain.append_verified(event, verifier)
 }
 
 pub(crate) fn identity() -> Option<AuditIdentity> {
