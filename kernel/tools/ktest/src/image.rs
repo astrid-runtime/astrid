@@ -3,8 +3,10 @@
 //! bootloader 0.11's build.rs runs `cargo install bootloader-x86_64-uefi`
 //! and inherits `CARGO_TARGET_DIR`. If that directory is also the parent
 //! kimage target dir, parent and nested cargo deadlock on `.cargo-build-lock`.
-//! Parent uses `--target-dir` (not inherited). Nested install uses a distinct
-//! `CARGO_TARGET_DIR`. Neither path is the shared `~/.cache/cargo-targets`.
+//! Parent uses `--target-dir` (not inherited). The exact nested path is also
+//! passed through `ASTRID_BOOTLOADER_TARGET_DIR` so the vendored build script
+//! cannot fall back to a per-worktree target. Neither path is the shared
+//! `~/.cache/cargo-targets`; they are distinct siblings beneath it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -18,6 +20,8 @@ pub const KIMAGE_NIGHTLY: &str = "nightly-2026-07-21";
 pub const HOST_TARGET_REL: &str = "target/kimage-host";
 /// Target dir inherited by nested `cargo install -Zbuild-std`.
 pub const NESTED_TARGET_REL: &str = "target/bootloader-nested";
+/// Exact nested target path consumed by the vendored bootloader build script.
+pub const NESTED_TARGET_ENV: &str = "ASTRID_BOOTLOADER_TARGET_DIR";
 pub const ROOT_KEY_REL: &str = "tools/kimage/fixtures/root.key.hex";
 pub const KERNEL_KEY_REL: &str = "tools/kimage/fixtures/kernel.key.hex";
 pub const SYSGEN_KEY_REL: &str = "tools/kimage/fixtures/sysgen.key.hex";
@@ -47,6 +51,7 @@ impl KimageInvocation {
         let mut cmd = Command::new("rustup");
         cmd.current_dir(root);
         cmd.env("CARGO_TARGET_DIR", &self.nested_target_dir);
+        cmd.env(NESTED_TARGET_ENV, &self.nested_target_dir);
         cmd.env_remove("CARGO_BUILD_TARGET_DIR");
         cmd.args([
             "run",
@@ -157,6 +162,7 @@ mod tests {
                 .any(|w| w == ["--sysgen-key", SYSGEN_KEY_REL])
         );
         let mut saw_nested = false;
+        let mut saw_bootloader_nested = false;
         let mut cleared_build_target = false;
         for (key, val) in cmd.get_envs() {
             let key = key.to_string_lossy();
@@ -169,12 +175,26 @@ mod tests {
                 );
                 saw_nested = true;
             }
+            if key == NESTED_TARGET_ENV {
+                let val = val.expect("nested target override must be set");
+                assert!(
+                    val.to_string_lossy().ends_with("target/bootloader-nested"),
+                    "{}",
+                    val.to_string_lossy()
+                );
+                assert_eq!(val, Path::new("/ws/target/bootloader-nested").as_os_str());
+                saw_bootloader_nested = true;
+            }
             if key == "CARGO_BUILD_TARGET_DIR" {
                 assert!(val.is_none(), "CARGO_BUILD_TARGET_DIR must be cleared");
                 cleared_build_target = true;
             }
         }
         assert!(saw_nested, "nested CARGO_TARGET_DIR missing");
+        assert!(
+            saw_bootloader_nested,
+            "nested bootloader target override missing"
+        );
         assert!(cleared_build_target, "CARGO_BUILD_TARGET_DIR not cleared");
         assert!(!args.contains(&"--tamper-handoff".to_string()));
 

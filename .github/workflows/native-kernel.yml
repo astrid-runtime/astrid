@@ -52,11 +52,23 @@ jobs:
           toolchain: nightly-2026-07-21
           components: rust-src, clippy
 
+      - name: Configure external shared Cargo target
+        run: |
+          target_root="$RUNNER_TEMP/astrid-native-kernel-target"
+          mkdir -p "$target_root"
+          # Cargo's build.target-dir override exercises the unset
+          # CARGO_TARGET_DIR resolution path in check.sh.
+          echo "CARGO_BUILD_TARGET_DIR=$target_root" >> "$GITHUB_ENV"
+
       - name: Run supported split checks
         working-directory: kernel
         run: |
           rustup show
           ./check.sh x86
+
+      - name: Run shared-target regression
+        working-directory: kernel
+        run: ./test-shared-cargo-target.sh
 
   semantic-portability:
     name: Compile-only semantic targets (AArch64 + RISC-V)

@@ -102,9 +102,13 @@ for the supported split checks.
 `check.sh` inherits Cargo's configured target directory instead of creating a
 target per worktree. kimage host artifacts go in `<cargo-target>/kimage-host`.
 Nested bootloader `cargo install` uses `<cargo-target>/bootloader-nested` via
-`CARGO_TARGET_DIR`. Those directories are distinct so the nested install cannot
-deadlock on the parent target lock. An explicit caller `CARGO_TARGET_DIR`
-remains supported when incompatible concurrent builds require isolation.
+`CARGO_TARGET_DIR` and the exact path is passed through
+`ASTRID_BOOTLOADER_TARGET_DIR`; the vendored build script never creates a
+`tools/bootloader/target` fallback. Those directories are distinct so the
+nested install cannot deadlock on the parent target lock. An explicit caller
+`CARGO_TARGET_DIR` remains supported when incompatible concurrent builds require
+isolation, and direct kimage builds derive the same nested sibling when the
+override is absent.
 
 ## What is asserted
 
@@ -173,6 +177,10 @@ remain untrusted advertisements.
 - pinned nightly `kimage`: `rustup run nightly-2026-07-21 cargo clippy -p kimage --all-targets --locked --target-dir <cargo-target>/kimage-host -- -D warnings`
   with `CARGO_TARGET_DIR=<cargo-target>/bootloader-nested` so nested
   `cargo install -Zbuild-std` cannot deadlock on the parent lock.
+- target-layout regression: `./test-shared-cargo-target.sh` exercises an
+  external Cargo target root with `CARGO_TARGET_DIR` unset and an explicit
+  caller override, then rejects `kernel/target` and
+  `tools/bootloader/target` output.
 
 `./run.sh` is the QEMU evidence. Sequential native emulator-image
 packaging determinism reports `PASS`.
@@ -182,7 +190,9 @@ packaging determinism reports `PASS`.
 The dedicated `.github/workflows/native-kernel.yml` workflow runs for pull
 requests targeting `os/universal`. It installs stable 1.95.0 plus
 `nightly-2026-07-21`, sets `KTEST_TOOLCHAIN` to that dated pin, and
-invokes `./check.sh` plus `./run.sh`. It does not install rolling
+configures an external shared Cargo target root while leaving
+`CARGO_TARGET_DIR` unset, then invokes `./check.sh` plus the target-layout
+regression and `./run.sh`. It does not install rolling
 `nightly`. Root `ci.yml` still targets `main` and does not ingest this
 nested workspace. Do not run `cargo clippy --workspace` here.
 The QEMU job reports `DETERMINISM: PASS` for sequential native

@@ -20,6 +20,7 @@ export CARGO_TARGET_DIR
 toolchain="${KTEST_TOOLCHAIN:-nightly-2026-07-21}"
 host="$CARGO_TARGET_DIR/kimage-host"
 nested="$CARGO_TARGET_DIR/bootloader-nested"
+echo "check.sh: target root=$CARGO_TARGET_DIR host=$host nested=$nested"
 
 mode="${1:-all}"
 if [[ $# -gt 1 ]]; then
@@ -163,8 +164,16 @@ cargo clippy -p astrid-native-kernel --target x86_64-unknown-none --locked -- -D
 
 echo "== nightly cargo clippy -p kimage (isolated target dirs, toolchain=$toolchain) =="
 env -u CARGO_BUILD_TARGET_DIR \
+  ASTRID_BOOTLOADER_TARGET_DIR="$nested" \
   CARGO_TARGET_DIR="$nested" \
   rustup run "$toolchain" cargo clippy -p kimage --all-targets --locked --target-dir "$host" -- -D warnings
+
+for worktree_target in "$root/target" "$root/tools/bootloader/target"; do
+  if [[ -e "$worktree_target" ]]; then
+    echo "check.sh: unexpected per-worktree target directory: $worktree_target" >&2
+    exit 1
+  fi
+done
 
 echo "check.sh: PASS (split checks only; not workspace clippy)"
 
