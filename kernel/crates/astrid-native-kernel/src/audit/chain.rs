@@ -8,8 +8,6 @@ use super::root;
 use super::types::{
     AuditAuthority, AuditCheckpoint, AuditError, AuditEvent, BootSessionId, KernelSecretEntropy,
 };
-use native_audit_verifier::AuditVerifier;
-
 pub(crate) struct AuditChain {
     boot: BootSessionId,
     authority: AuditAuthority,
@@ -17,6 +15,29 @@ pub(crate) struct AuditChain {
     seq: u64,
     root: [u8; root::ROOT_LEN],
     relay: AuditRelay,
+    record_scratch: RecordScratch,
+}
+
+/// Chain-owned canonical frame scratch. Keeping this in the static runtime
+/// (rather than in a large live-call frame) bounds the small IPC stack while
+/// retaining the single-authority mutation transition.
+#[derive(Clone, Copy)]
+struct RecordScratch {
+    encoded: [u8; MAX_FRAME_BYTES],
+    encoded_len: usize,
+    seq: u64,
+    root: [u8; root::ROOT_LEN],
+    class: super::types::AuditClass,
+}
+
+impl RecordScratch {
+    fn frame(&self) -> &[u8] {
+        &self.encoded[..self.encoded_len]
+    }
+
+    fn mandatory(&self) -> bool {
+        self.class.is_terminal_or_invalidation()
+    }
 }
 
 /// One successfully observed and retired public audit position.
@@ -66,6 +87,13 @@ impl AuditChain {
             seq: 0,
             root,
             relay: AuditRelay::new(boot),
+            record_scratch: RecordScratch {
+                encoded: [0; MAX_FRAME_BYTES],
+                encoded_len: 0,
+                seq: 0,
+                root: [0; root::ROOT_LEN],
+                class: super::types::AuditClass::DomainCreate,
+            },
         })
     }
 
@@ -98,6 +126,13 @@ impl AuditChain {
             seq: checkpoint.seq(),
             root: checkpoint.root(),
             relay,
+            record_scratch: RecordScratch {
+                encoded: [0; MAX_FRAME_BYTES],
+                encoded_len: 0,
+                seq: 0,
+                root: [0; root::ROOT_LEN],
+                class: super::types::AuditClass::DomainCreate,
+            },
         })
     }
 
@@ -123,6 +158,30 @@ impl AuditChain {
 
     pub fn relay_mut(&mut self) -> &mut AuditRelay {
         &mut self.relay
+    }
+
+    /// Encodes and roots the candidate in chain-owned scratch without moving
+    /// either authoritative cursor.
+    fn stage_record(
+        &mut self,
+        event: &AuditEvent,
+        next: u64,
+    ) -> Result<[u8; root::ROOT_LEN], AuditError> {
+        let prev_root = Some(self.root);
+        let frame = Frame::new(self.boot, next, event, prev_root)?;
+        let encoded_len = frame.encode(&mut self.record_scratch.encoded)?.len();
+        let next_root = self.root_hasher.advance(
+            self.root,
+            self.boot,
+            next,
+            &self.record_scratch.encoded[..encoded_len],
+        );
+
+        self.record_scratch.encoded_len = encoded_len;
+        self.record_scratch.seq = next;
+        self.record_scratch.root = next_root;
+        self.record_scratch.class = event.class();
+        Ok(next_root)
     }
 
     /// Acknowledges through the chain's kernel-owned authentication context;
@@ -156,13 +215,7 @@ impl AuditChain {
             .seq
             .checked_add(1)
             .ok_or(AuditError::SequenceOverflow)?;
-        let prev_root = Some(self.root);
-        let frame = Frame::new(self.boot, next, &event, prev_root)?;
-        let mut buf = [0; MAX_FRAME_BYTES];
-        let encoded = frame.encode(&mut buf)?;
-        let next_root = self
-            .root_hasher
-            .advance(self.root, self.boot, next, encoded);
+        let next_root = self.stage_record(&event, next)?;
 
         // The relay is mandatory for this first-slice mutation transition.
         // A reserve or window failure returns before either authoritative
@@ -171,7 +224,7 @@ impl AuditChain {
         // check before mutating a slot or cursor.
         self.relay.publish(
             next,
-            encoded,
+            self.record_scratch.frame(),
             next_root,
             event.class().is_terminal_or_invalidation(),
         )?;
@@ -183,25 +236,24 @@ impl AuditChain {
         Ok(next)
     }
 
-    /// Root, independently fold, and retire one event before any authoritative
-    /// chain cursor advances. A verifier fold failure therefore leaves chain
-    /// sequence and root untouched.
-    pub(crate) fn append_and_retire(
+    /// Roots and stages one event in chain-owned scratch, invokes the
+    /// independent verifier, and retires it before return. The callable keeps
+    /// the verifier out of this method's static type while the large frame
+    /// stays off the live IPC stack.
+    #[inline(never)]
+    pub(crate) fn append_verified<F>(
         &mut self,
         event: AuditEvent,
-        verifier: &mut AuditVerifier,
-    ) -> Result<AuditObservation, AuditError> {
+        verify: &mut F,
+    ) -> Result<AuditObservation, AuditError>
+    where
+        F: FnMut(&[u8], &[u8; root::ROOT_LEN]) -> Result<[u8; root::ROOT_LEN], AuditError>,
+    {
         let next = self
             .seq
             .checked_add(1)
             .ok_or(AuditError::SequenceOverflow)?;
-        let prev_root = Some(self.root);
-        let frame = Frame::new(self.boot, next, &event, prev_root)?;
-        let mut buf = [0; MAX_FRAME_BYTES];
-        let encoded = frame.encode(&mut buf)?;
-        let next_root = self
-            .root_hasher
-            .advance(self.root, self.boot, next, encoded);
+        self.stage_record(&event, next)?;
 
         // Immediate-retire mode is exclusive. Any buffered/in-flight record
         // means the caller must use the retained-evidence path; checking here
@@ -209,27 +261,22 @@ impl AuditChain {
         self.relay.require_empty_for_immediate_retire()?;
         self.relay
             .can_publish(next, event.class().is_terminal_or_invalidation())?;
-        let receipt = verifier
-            .fold(encoded, next_root)
-            .map_err(|_| AuditError::RootMismatch)?;
+        let receipt_tag = verify(self.record_scratch.frame(), &self.record_scratch.root)?;
+        let seq = self.record_scratch.seq;
+        let root = self.record_scratch.root;
+        let class = self.record_scratch.class;
         self.relay.publish_retired(
-            next,
-            encoded,
-            next_root,
-            event.class().is_terminal_or_invalidation(),
-            receipt.ack_tag(),
+            seq,
+            self.record_scratch.frame(),
+            root,
+            self.record_scratch.mandatory(),
+            receipt_tag,
             self.authority.context(),
         )?;
 
-        // The only mutations after independent verification are infallible
-        // cursor assignments already proven valid above.
-        self.seq = next;
-        self.root = next_root;
-        Ok(AuditObservation {
-            seq: next,
-            class: event.class(),
-            root: next_root,
-        })
+        self.seq = seq;
+        self.root = root;
+        Ok(AuditObservation { seq, class, root })
     }
 
     /// Kernel-authenticated checkpoint bound to the exact current state.

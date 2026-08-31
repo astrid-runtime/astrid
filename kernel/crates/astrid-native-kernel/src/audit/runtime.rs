@@ -102,6 +102,7 @@ pub(crate) fn install_for_test(
 }
 
 /// Records one event through the real verifier and retires it before return.
+#[inline(never)]
 pub(crate) fn record(event: AuditEvent) -> Result<AuditObservation, AuditError> {
     let mut runtime = RUNTIME.lock();
     let Some(runtime) = runtime.as_mut() else {
@@ -109,7 +110,13 @@ pub(crate) fn record(event: AuditEvent) -> Result<AuditObservation, AuditError> 
     };
     runtime
         .chain
-        .append_and_retire(event, &mut runtime.verifier)
+        .append_verified(event, &mut |frame: &[u8], root: &[u8; 32]| {
+            runtime
+                .verifier
+                .fold(frame, *root)
+                .map(|receipt| receipt.ack_tag())
+                .map_err(|_| AuditError::RootMismatch)
+        })
 }
 
 pub(crate) fn identity() -> Option<AuditIdentity> {

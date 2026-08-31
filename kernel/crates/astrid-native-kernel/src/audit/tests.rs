@@ -365,12 +365,58 @@ fn immediate_retirement_rejects_retained_relay_evidence() {
     let before = (chain.seq(), *chain.root());
     let verifier_before = (host_verifier.next_seq(), host_verifier.root());
 
-    assert_eq!(
-        chain.append_and_retire(domain_event(AuditClass::DomainAdmit), &mut host_verifier),
-        Err(AuditError::RelayMixedMode)
+    let folded = chain.append_verified(
+        domain_event(AuditClass::DomainAdmit),
+        &mut |frame: &[u8], root: &[u8; 32]| {
+            let mut bad_root = *root;
+            bad_root[0] ^= 1;
+            host_verifier
+                .fold(frame, bad_root)
+                .map(|receipt| receipt.ack_tag())
+                .map_err(|_| AuditError::RootMismatch)
+        },
     );
+    assert_eq!(folded, Err(AuditError::RelayMixedMode));
     assert_eq!((chain.seq(), *chain.root()), before);
     assert_eq!(chain.relay().redeliver().count(), 1);
+    assert_eq!(
+        (host_verifier.next_seq(), host_verifier.root()),
+        verifier_before
+    );
+}
+
+#[test]
+fn verified_staging_failure_leaves_chain_untouched() {
+    let chain_boot = boot();
+    let mut chain = genesis_chain(chain_boot);
+    let mut host_verifier = verifier();
+
+    chain
+        .append(domain_event(AuditClass::DomainCreate))
+        .unwrap();
+    chain.relay_mut().grant_credits(1).unwrap();
+    let first = chain.relay_mut().take().unwrap();
+    let first_receipt = host_verifier.fold(first.frame(), first.root()).unwrap();
+    chain
+        .ack(first.seq(), first.root(), first_receipt.ack_tag())
+        .unwrap();
+    let before = (chain.seq(), *chain.root());
+    let verifier_before = (host_verifier.next_seq(), host_verifier.root());
+
+    let folded = chain.append_verified(
+        domain_event(AuditClass::DomainAdmit),
+        &mut |frame: &[u8], root: &[u8; 32]| {
+            let mut bad_root = *root;
+            bad_root[0] ^= 1;
+            host_verifier
+                .fold(frame, bad_root)
+                .map(|receipt| receipt.ack_tag())
+                .map_err(|_| AuditError::RootMismatch)
+        },
+    );
+    assert_eq!(folded, Err(AuditError::RootMismatch));
+    assert_eq!((chain.seq(), *chain.root()), before);
+    assert_eq!(chain.relay().redeliver().count(), 0);
     assert_eq!(
         (host_verifier.next_seq(), host_verifier.root()),
         verifier_before
