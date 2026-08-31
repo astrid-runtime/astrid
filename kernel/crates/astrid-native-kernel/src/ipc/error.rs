@@ -10,6 +10,10 @@ pub enum IpcError {
     Faulted,
     Cancelled,
     Malformed,
+    AuditUnavailable,
+    AuditRejected,
+    AuditRelation,
+    AuditFold,
 }
 
 impl IpcError {
@@ -23,6 +27,10 @@ impl IpcError {
             Self::Faulted => 6,
             Self::Cancelled => 7,
             Self::Malformed => 8,
+            Self::AuditUnavailable => 9,
+            Self::AuditRejected => 10,
+            Self::AuditRelation => 11,
+            Self::AuditFold => 12,
         }
     }
 
@@ -36,6 +44,10 @@ impl IpcError {
             Self::Faulted => "faulted",
             Self::Cancelled => "cancelled",
             Self::Malformed => "malformed",
+            Self::AuditUnavailable => "audit_unavailable",
+            Self::AuditRejected => "audit_rejected",
+            Self::AuditRelation => "audit_relation",
+            Self::AuditFold => "audit_fold",
         }
     }
 }

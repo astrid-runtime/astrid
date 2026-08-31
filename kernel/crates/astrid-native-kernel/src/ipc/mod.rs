@@ -1,6 +1,9 @@
 //! Private fixed-capability endpoint IPC for native protection domains.
 
 mod abi;
+mod audit;
+#[cfg(test)]
+mod audit_tests;
 mod capability;
 mod copy;
 mod endpoint;
@@ -21,7 +24,7 @@ use crate::platform::{self, TrapFrame};
 
 use crate::relations::{
     CapabilityFacts, capability_installed, capability_removed, domain_registered, domain_released,
-    endpoint_created, endpoint_reclaimed,
+    endpoint_reclaimed,
 };
 #[cfg(test)]
 use crate::relations::{DeltaCursor, ProjectionEvidence, Snapshot};
@@ -286,6 +289,8 @@ fn unbind_members_without_capabilities(
 }
 
 pub fn prepare_domain(domain: DomainToken) {
+    #[cfg(test)]
+    crate::audit::reset_for_test();
     let mut state = IPC.lock();
     project(
         domain_registered(&mut state.relations, domain),
@@ -497,7 +502,13 @@ fn dispatch(
 }
 
 fn endpoint_create(domain: DomainToken) -> Result<(u64, u64), IpcError> {
+    if crate::audit::identity().is_none() {
+        return Err(IpcError::AuditUnavailable);
+    }
     let mut state = IPC.lock();
+    // A Copy of the bounded state is the transaction buffer. Every fallible
+    // projection and audit transition lands here first; `*state = staged` is
+    // the one infallible commit.
     let generation =
         ObjectGeneration::new(state.next_object_generation).ok_or(IpcError::NoSpace)?;
     let mut endpoint = Endpoint::new(generation);
@@ -513,32 +524,74 @@ fn endpoint_create(domain: DomainToken) -> Result<(u64, u64), IpcError> {
         .free_slot(domain)
         .ok_or(IpcError::NoSpace)?;
     let id = EndpointId::try_new(index)?;
-    state.capabilities[domain.slot().index()].install(
-        domain,
-        slot,
-        Capability {
-            endpoint: id,
-            rights: Rights::ALL,
-            generation,
-            parent: None,
-        },
-    )?;
-    state.objects[index] = Some(endpoint);
-    state.next_object_generation += 1;
-    project(
-        endpoint_created(
-            &mut state.relations,
-            domain,
-            CapabilityFacts::new(
-                u64::from(slot.get()),
-                generation.get(),
-                generation.get(),
-                Rights::ALL.bits(),
-            ),
-        ),
-        "endpoint_create",
+    let capability = Capability {
+        endpoint: id,
+        rights: Rights::ALL,
+        generation,
+        parent: None,
+    };
+    let mut scratch = audit::transaction_scratch();
+    *scratch = Some(*state);
+    let staged = scratch
+        .as_mut()
+        .expect("transaction scratch was just populated");
+    if staged.capabilities[domain.slot().index()]
+        .install(domain, slot, capability)
+        .is_err()
+    {
+        *scratch = None;
+        return Err(IpcError::NoSpace);
+    }
+    staged.objects[index] = Some(endpoint);
+    staged.next_object_generation += 1;
+    let facts = CapabilityFacts::new(
+        u64::from(slot.get()),
+        generation.get(),
+        generation.get(),
+        Rights::ALL.bits(),
     );
+    if audit::forced_failure_now() {
+        *scratch = None;
+        return Err(IpcError::AuditRejected);
+    }
+    if let Err(error) = audit::project_grant(staged, domain, facts) {
+        *scratch = None;
+        return Err(error);
+    }
+    let event = match audit::prepare_grant_event(staged, domain, slot, generation, Rights::ALL) {
+        Ok(event) => event,
+        Err(error) => {
+            *scratch = None;
+            return Err(error);
+        },
+    };
+    let observation = match audit::record_grant(event) {
+        Ok(observation) => observation,
+        Err(error) => {
+            *scratch = None;
+            return Err(error);
+        },
+    };
+    // Commit IPC objects, capability, relation projection, generation, and
+    // the already-retired audit observation as one lock-protected assignment.
+    *state = *scratch.as_ref().expect("stage remains until commit");
+    *scratch = None;
+    drop(scratch);
     project_relation_evidence(&mut state, domain);
+    drop(state);
+    #[cfg(not(test))]
+    if let Some(identity) = crate::audit::identity() {
+        crate::serial::ev_audit_observed(
+            &identity.boot().bytes(),
+            identity.authority_id(),
+            observation.seq(),
+            observation.class() as u16,
+            observation.root(),
+            true,
+        );
+    }
+    #[cfg(test)]
+    let _ = observation;
     Ok((0, u64::from(slot.get())))
 }
 

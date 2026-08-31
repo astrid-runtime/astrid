@@ -134,8 +134,29 @@ fn emit_relation(serial: Emit<'_>, id: u64, generation: u64, epoch: u64, rows: u
     ));
 }
 
-fn emit_ipc_park(serial: Emit<'_>, id: u64, generation: u64, epoch: u64, rows: usize) {
+fn emit_audit_observed(serial: Emit<'_>, seq: u64, root_digit: char) {
+    serial(format!(
+        "\"ev\":\"audit.observed\",\"boot\":\"{}\",\"authority_id\":1,\
+            \"audit_seq\":{seq},\"class\":17,\"root\":\"{}\",\"retired\":true",
+        "1".repeat(32),
+        root_digit.to_string().repeat(64)
+    ));
+}
+
+fn emit_ipc_park(
+    serial: Emit<'_>,
+    id: u64,
+    generation: u64,
+    epoch: u64,
+    rows: usize,
+    audit_seq: u64,
+) {
     emit_relation(serial, id, generation, epoch, rows);
+    emit_audit_observed(
+        serial,
+        audit_seq,
+        char::from_digit(u32::try_from(audit_seq).unwrap(), 10).unwrap(),
+    );
     emit_ipc_op(serial, id, generation, "endpoint_create", "ok");
     serial(format!(
         "\"ev\":\"ipc.park\",\"id\":{id},\"generation\":{generation}"
@@ -222,8 +243,20 @@ fn emit_ipc_server_peer_release(serial: Emit<'_>, id: u64, generation: u64) {
     ));
 }
 
-fn emit_ipc_cancel_guest(serial: Emit<'_>, id: u64, generation: u64, epoch: u64, rows: usize) {
+fn emit_ipc_cancel_guest(
+    serial: Emit<'_>,
+    id: u64,
+    generation: u64,
+    epoch: u64,
+    rows: usize,
+    audit_seq: u64,
+) {
     emit_relation(serial, id, generation, epoch, rows);
+    emit_audit_observed(
+        serial,
+        audit_seq,
+        char::from_digit(u32::try_from(audit_seq).unwrap(), 10).unwrap(),
+    );
     emit_ipc_op(serial, id, generation, "endpoint_create", "ok");
     emit_ipc_op(serial, id, generation, "cancel", "ok");
     emit_ipc_terminal(serial, id, generation, 0, "clean_exit", 3, "0x0", 7, 1, 1);
@@ -269,6 +302,10 @@ fn passing_serial_with(kernel: &str, sysgen: &str, kfloor: u64, sfloor: u64) -> 
         ev(format!("\"ev\":\"apic.timer.tick\",\"n\":{n}"));
     }
     ev("\"ev\":\"entropy.seeded\"".into());
+    ev(format!(
+        "\"ev\":\"audit.boot\",\"boot\":\"{}\",\"authority_id\":1",
+        "1".repeat(32)
+    ));
     ev("\"ev\":\"fault\",\"vector\":3,\"code\":0,\"rip\":\"0x10\"".into());
     emit_pass(&mut ev, REQUIRED_PASSES[0]);
     ev("\"ev\":\"fault\",\"vector\":14,\"code\":3,\"rip\":\"0x10\"".into());
@@ -344,7 +381,7 @@ fn passing_serial_with(kernel: &str, sysgen: &str, kfloor: u64, sfloor: u64) -> 
     emit_prepare(&mut ev, 1, 7, 6);
     emit_start(&mut ev, 1, 7, 6);
     emit_context(&mut ev, 1, 7, 0);
-    emit_ipc_park(&mut ev, 1, 7, 3, 3);
+    emit_ipc_park(&mut ev, 1, 7, 3, 3, 1);
     emit_prepare(&mut ev, 2, 3, 7);
     emit_start(&mut ev, 2, 3, 7);
     emit_context(&mut ev, 2, 3, 0);
@@ -363,6 +400,12 @@ fn passing_serial_with(kernel: &str, sysgen: &str, kfloor: u64, sfloor: u64) -> 
     {
         if index == 3 {
             emit_relation(&mut ev, 2, 3, 6, 6);
+            ev(format!(
+                "\"ev\":\"audit.observed\",\"boot\":\"{}\",\"authority_id\":1,\
+                \"audit_seq\":2,\"class\":17,\"root\":\"{}\",\"retired\":true",
+                "1".repeat(32),
+                "2".repeat(64)
+            ));
         }
         emit_ipc_op(&mut ev, 2, 3, op, status);
     }
@@ -375,7 +418,7 @@ fn passing_serial_with(kernel: &str, sysgen: &str, kfloor: u64, sfloor: u64) -> 
     emit_prepare(&mut ev, 1, 8, 6);
     emit_start(&mut ev, 1, 8, 6);
     emit_context(&mut ev, 1, 8, 0);
-    emit_ipc_park(&mut ev, 1, 8, 3, 3);
+    emit_ipc_park(&mut ev, 1, 8, 3, 3, 3);
     emit_prepare(&mut ev, 2, 4, 8);
     emit_start(&mut ev, 2, 4, 8);
     emit_context(&mut ev, 2, 4, 0);
@@ -397,7 +440,7 @@ fn passing_serial_with(kernel: &str, sysgen: &str, kfloor: u64, sfloor: u64) -> 
     emit_prepare(&mut ev, 1, 9, 10);
     emit_start(&mut ev, 1, 9, 10);
     emit_context(&mut ev, 1, 9, 0);
-    emit_ipc_cancel_guest(&mut ev, 1, 9, 3, 3);
+    emit_ipc_cancel_guest(&mut ev, 1, 9, 3, 3, 4);
     emit_pass(&mut ev, super::DOMAIN_REQUIRED_PASSES[10]);
     emit_prepare(&mut ev, 1, 9, 11);
     ev("\"ev\":\"domain.stop.staged\",\"id\":1,\"generation\":10,\"scenario\":11".into());
@@ -426,7 +469,7 @@ fn passing_serial_with(kernel: &str, sysgen: &str, kfloor: u64, sfloor: u64) -> 
 }
 
 fn assert_ok(serial: &str) -> bool {
-    assert_boot(&parse_events(serial), Some(33), 33, &expected())
+    assert_boot(&parse_events(serial), Some(37), 37, &expected())
 }
 
 #[test]
@@ -456,13 +499,51 @@ fn mixed_floors_on_bound_are_independent() {
         kernel_floor: 1,
         sysgen_floor: 2,
     };
-    assert!(assert_boot(&parse_events(&serial), Some(33), 33, &closures));
+    assert!(assert_boot(&parse_events(&serial), Some(37), 37, &closures));
 }
 
 #[test]
 fn collapsed_bound_floor_fails() {
     let serial = passing_serial().replace("\"kernel_floor\":1,\"sysgen_floor\":1", "\"floor\":1");
     assert!(!assert_ok(&serial));
+}
+
+#[test]
+fn audit_boot_and_retired_observation_contract_is_strict() {
+    let missing_lines: Vec<String> = passing_serial()
+        .lines()
+        .filter(|line| !line.contains("\"ev\":\"audit.observed\""))
+        .map(str::to_owned)
+        .collect();
+    let missing = missing_lines.join("\n") + "\n";
+    assert!(!assert_ok(&missing), "missing audit observation must fail");
+
+    let mutated_root = passing_serial().replace(
+        "\"root\":\"2222222222222222222222222222222222222222222222222222222222222222\"",
+        &format!("\"root\":\"{}\"", "g".repeat(64)),
+    );
+    assert!(!assert_ok(&mutated_root), "mutated audit root must fail");
+
+    let mutated_sequence = passing_serial().replacen("\"audit_seq\":1", "\"audit_seq\":2", 1);
+    assert!(!assert_ok(&mutated_sequence), "mutated audit seq must fail");
+
+    let mut lines: Vec<String> = passing_serial().lines().map(str::to_owned).collect();
+    let observation = lines
+        .iter()
+        .position(|line| line.contains("\"ev\":\"audit.observed\""))
+        .expect("fixture contains the observation");
+    lines.swap(observation, observation + 1);
+    let reordered = lines.join("\n") + "\n";
+    assert!(
+        !assert_ok(&reordered),
+        "reordered audit observation must fail"
+    );
+
+    let leaked = passing_serial().replace(
+        "\"ev\":\"audit.boot\",\"boot\"",
+        "\"ev\":\"audit.boot\",\"verification_key\":\"00\",\"boot\"",
+    );
+    assert!(!assert_ok(&leaked), "audit key material must fail");
 }
 
 #[test]
@@ -560,7 +641,7 @@ fn dual_closure_reject_or_mismatch_fails() {
         kernel_floor: 1,
         sysgen_floor: 1,
     };
-    assert!(!assert_boot(&events, Some(33), 33, &swapped));
+    assert!(!assert_boot(&events, Some(37), 37, &swapped));
     let rejected = passing_serial().replace("closure.bound", "closure.reject");
     assert!(!assert_ok(&rejected));
 }

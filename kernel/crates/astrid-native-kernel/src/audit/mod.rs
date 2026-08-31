@@ -10,6 +10,7 @@ mod chain;
 mod codec;
 mod relay;
 mod root;
+mod runtime;
 mod types;
 
 #[cfg(test)]
@@ -22,11 +23,17 @@ pub(crate) const CODEC_VERSION: u16 = 1;
 // Crate-visible re-exports stay ahead of the first production consumer, the
 // same dead-code-preserving posture as the landed relation projection.
 #[allow(unused_imports)]
-pub(crate) use chain::AuditChain;
+pub(crate) use chain::{AuditChain, AuditObservation};
 #[allow(unused_imports)]
 pub(crate) use codec::{Frame, MAX_FRAME_BYTES, decode, decode_checkpoint, encode_checkpoint};
 #[allow(unused_imports)]
 pub(crate) use relay::{AUDIT_RELAY_SLOTS, AuditRelay, RelayRecord};
+#[cfg(not(test))]
+pub(crate) use runtime::install;
+#[allow(unused_imports)]
+pub(crate) use runtime::{AuditIdentity, AuditInstallError, identity, record};
+#[cfg(test)]
+pub(crate) use runtime::{fill_relay_for_test, install_for_test, reset_for_test, state_for_test};
 #[allow(unused_imports)]
 pub(crate) use types::{
     AUDIT_CAP_OBJECT_POOL, AUDIT_CAP_SLOTS_PER_DOMAIN, AUDIT_DOMAIN_SLOTS, AUDIT_ENDPOINT_POOL,

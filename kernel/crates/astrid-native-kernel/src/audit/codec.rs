@@ -277,7 +277,7 @@ fn decode_capability_instance(
 /// kernel tag is the authentication; decoding always re-verifies it.
 pub(crate) fn encode_checkpoint<'out>(
     checkpoint: &AuditCheckpoint,
-    context: CheckpointAuthContext,
+    context: &CheckpointAuthContext,
     out: &'out mut [u8; CHECKPOINT_WIRE_BYTES],
 ) -> Result<&'out [u8], AuditError> {
     if checkpoint.authority_id() != context.authority_id() || !checkpoint.verify_tag(context) {
@@ -298,7 +298,7 @@ pub(crate) fn encode_checkpoint<'out>(
 
 pub(crate) fn decode_checkpoint(
     bytes: &[u8],
-    context: CheckpointAuthContext,
+    context: &CheckpointAuthContext,
 ) -> Result<AuditCheckpoint, AuditError> {
     let mut reader = Reader::new(bytes)?;
     let total = reader.u32()? as usize;

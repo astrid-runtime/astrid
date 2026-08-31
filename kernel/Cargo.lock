@@ -464,6 +464,7 @@ name = "native-audit-verifier"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "spin",
 ]
 
 [[package]]

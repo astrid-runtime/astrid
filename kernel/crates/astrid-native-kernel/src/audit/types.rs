@@ -96,7 +96,6 @@ impl core::fmt::Debug for KernelSecretEntropy {
 /// Typed authentication key derived from kernel-held entropy. Its bytes are
 /// exposed only to the modeled independently trusted anchor; they never
 /// enter a frame, checkpoint wire, or untrusted handoff.
-#[derive(Clone, Copy)]
 pub(crate) struct VerificationKey([u8; 32]);
 
 impl VerificationKey {
@@ -107,8 +106,14 @@ impl VerificationKey {
         Some(Self(bytes))
     }
 
-    pub(crate) const fn bytes(self) -> [u8; 32] {
-        self.0
+    pub(crate) const fn bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl Drop for VerificationKey {
+    fn drop(&mut self) {
+        self.0.fill(0);
     }
 }
 
@@ -129,10 +134,10 @@ impl core::fmt::Debug for VerificationKey {
 /// handoff carries none of it. Production anchor delivery and key
 /// lifecycle remain named #1759 residuals, and no fixed production secret
 /// is introduced.
-#[derive(Clone, Copy)]
 pub(crate) struct CheckpointAuthContext {
     authority_id: u64,
     verification_key: VerificationKey,
+    tag_hasher: root::TagHasher,
 }
 
 impl CheckpointAuthContext {
@@ -155,18 +160,58 @@ impl CheckpointAuthContext {
         key_hasher.update(AUTHORITY_KEY_DOMAIN);
         key_hasher.update(&authority_id.to_le_bytes());
         let verification_key = VerificationKey::new(key_hasher.finalize().into())?;
+        let tag_hasher = root::TagHasher::new(verification_key.bytes());
         Some(Self {
             authority_id,
             verification_key,
+            tag_hasher,
         })
     }
 
-    pub(crate) const fn authority_id(self) -> u64 {
+    pub(crate) const fn authority_id(&self) -> u64 {
         self.authority_id
     }
 
-    pub(crate) const fn verification_key(self) -> VerificationKey {
-        self.verification_key
+    pub(crate) const fn verification_key(&self) -> &VerificationKey {
+        &self.verification_key
+    }
+
+    pub(crate) fn checkpoint_tag(
+        &self,
+        boot: BootSessionId,
+        seq: u64,
+        root: [u8; root::ROOT_LEN],
+        relay_generation: u64,
+    ) -> [u8; root::ROOT_LEN] {
+        self.tag_hasher
+            .checkpoint_tag(boot, seq, root, relay_generation, self.authority_id)
+    }
+
+    pub(crate) fn ack_tag(
+        &self,
+        boot: BootSessionId,
+        relay_generation: u64,
+        seq: u64,
+        source_root: [u8; root::ROOT_LEN],
+        frame: &[u8],
+    ) -> [u8; root::ROOT_LEN] {
+        self.tag_hasher.ack_tag(
+            boot,
+            relay_generation,
+            seq,
+            source_root,
+            frame,
+            self.authority_id,
+        )
+    }
+}
+
+impl Drop for CheckpointAuthContext {
+    fn drop(&mut self) {
+        // VerificationKey also erases on drop; the explicit parent hook
+        // keeps the custody invariant legible at the authority boundary.
+        self.tag_hasher.reset();
+        self.verification_key.0.fill(0);
     }
 }
 
@@ -180,10 +225,15 @@ impl core::fmt::Debug for CheckpointAuthContext {
 /// is untrusted binding evidence: it names the authority and carries a
 /// keyed minting tag, never verification material, so it cannot
 /// authenticate itself.
-#[derive(Clone, Copy, Debug)]
 pub(crate) struct AuditAuthority {
     boot: BootSessionId,
     context: CheckpointAuthContext,
+}
+
+impl core::fmt::Debug for AuditAuthority {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("AuditAuthority(REDACTED)")
+    }
 }
 
 /// Fixed wire size of the untrusted verifier handoff binding: magic,
@@ -198,12 +248,12 @@ impl AuditAuthority {
         })
     }
 
-    pub const fn boot(self) -> BootSessionId {
+    pub const fn boot(&self) -> BootSessionId {
         self.boot
     }
 
-    pub(crate) const fn context(self) -> CheckpointAuthContext {
-        self.context
+    pub(crate) const fn context(&self) -> &CheckpointAuthContext {
+        &self.context
     }
 
     /// Untrusted binding evidence accepted by `native-audit-verifier`. It
@@ -211,16 +261,15 @@ impl AuditAuthority {
     /// the independently trusted kernel-origin anchor, so a caller-minted
     /// handoff cannot authenticate itself. The private first-slice layout
     /// carries no production lifecycle provisioning claim.
-    pub fn verifier_handoff(self) -> [u8; VERIFIER_HANDOFF_BYTES] {
+    pub fn verifier_handoff(&self) -> [u8; VERIFIER_HANDOFF_BYTES] {
         let mut handoff = [0; VERIFIER_HANDOFF_BYTES];
         handoff[..8].copy_from_slice(b"ASAUDCTX");
         handoff[8..16].copy_from_slice(&self.context.authority_id().to_le_bytes());
         handoff[16..32].copy_from_slice(&self.boot.bytes());
-        let tag = root::verifier_handoff_tag(
-            self.boot,
-            self.context.authority_id(),
-            &self.context.verification_key().bytes(),
-        );
+        let tag = self
+            .context
+            .tag_hasher
+            .verifier_handoff_tag(self.boot, self.context.authority_id());
         handoff[32..].copy_from_slice(&tag);
         handoff
     }
@@ -683,13 +732,13 @@ impl AuditCheckpoint {
         seq: u64,
         root: [u8; root::ROOT_LEN],
         relay_generation: u64,
-        context: CheckpointAuthContext,
+        context: &CheckpointAuthContext,
     ) -> Result<Self, AuditError> {
         if relay_generation == 0 || context.authority_id() == 0 {
             return Err(AuditError::MalformedFrame);
         }
         let codec_version = super::CODEC_VERSION;
-        let tag = root::checkpoint_tag(boot, seq, root, relay_generation, &context);
+        let tag = context.checkpoint_tag(boot, seq, root, relay_generation);
         Ok(Self {
             boot,
             seq,
@@ -701,17 +750,11 @@ impl AuditCheckpoint {
         })
     }
 
-    pub(crate) fn verify_tag(&self, context: CheckpointAuthContext) -> bool {
+    pub(crate) fn verify_tag(&self, context: &CheckpointAuthContext) -> bool {
         if self.authority_id != context.authority_id() {
             return false;
         }
-        root::checkpoint_tag(
-            self.boot,
-            self.seq,
-            self.root,
-            self.relay_generation,
-            &context,
-        ) == self.tag
+        context.checkpoint_tag(self.boot, self.seq, self.root, self.relay_generation) == self.tag
     }
 
     pub const fn boot(self) -> BootSessionId {

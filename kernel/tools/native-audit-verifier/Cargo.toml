@@ -13,3 +13,5 @@ bench = false
 # Same frozen pure backend as the kernel crates so digests cannot differ by
 # feature selection.
 blake3 = { version = "=1.8.5", default-features = false, features = ["pure"] }
+# Bounded native verifier hashing state stays out of the small domain stack.
+spin = "=0.9.9"

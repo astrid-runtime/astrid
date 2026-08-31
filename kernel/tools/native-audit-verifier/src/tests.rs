@@ -2,6 +2,7 @@
 
 use super::*;
 use blake3::Hasher;
+use std::{vec, vec::Vec};
 
 const BOOT: [u8; 16] = [7; 16];
 
@@ -17,6 +18,10 @@ fn context() -> AuthContext {
     AuthContext::from_trusted_anchor(1, BOOT, trusted_key()).unwrap()
 }
 
+fn genesis_root(boot: [u8; 16]) -> [u8; 32] {
+    RootHasher::new().genesis(boot)
+}
+
 /// Seals a genuine handoff for the test anchor. Only the byte layout is
 /// mirrored from the kernel; the tag comes from this crate's own keyed
 /// implementation, and kernel cross-checks bind the real layout.
@@ -25,7 +30,7 @@ fn handoff() -> [u8; AUTHORITY_HANDOFF_BYTES] {
     bytes[..8].copy_from_slice(b"ASAUDCTX");
     bytes[8..16].copy_from_slice(&1u64.to_le_bytes());
     bytes[16..32].copy_from_slice(&BOOT);
-    let tag = verifier_handoff_tag(BOOT, 1, &trusted_key());
+    let tag = TagHasher::new(&trusted_key()).verifier_handoff_tag(BOOT, 1);
     bytes[32..].copy_from_slice(&tag);
     bytes
 }
@@ -411,7 +416,9 @@ fn checkpoint_wire(
 }
 
 fn sealed_tag(boot: [u8; 16], seq: u64, root: [u8; 32], relay_generation: u64) -> [u8; 32] {
-    checkpoint_tag(boot, seq, root, relay_generation, &context())
+    context()
+        .tag_hasher
+        .checkpoint_tag(boot, seq, root, relay_generation, 1)
 }
 
 fn unkeyed_tag(boot: [u8; 16], seq: u64, root: [u8; 32], relay_generation: u64) -> [u8; 32] {
@@ -546,18 +553,18 @@ fn zero_boot_genesis_is_rejected() {
 
 #[test]
 fn trusted_anchor_rejects_zero_material() {
-    assert_eq!(
+    assert!(matches!(
         AuthContext::from_trusted_anchor(0, BOOT, trusted_key()),
         Err(VerifyFailure::Malformed)
-    );
-    assert_eq!(
+    ));
+    assert!(matches!(
         AuthContext::from_trusted_anchor(1, [0; 16], trusted_key()),
         Err(VerifyFailure::Malformed)
-    );
-    assert_eq!(
+    ));
+    assert!(matches!(
         AuthContext::from_trusted_anchor(1, BOOT, [0; 32]),
         Err(VerifyFailure::Malformed)
-    );
+    ));
 }
 
 #[test]
@@ -569,7 +576,7 @@ fn structurally_valid_self_authenticated_handoff_is_rejected() {
     // Structurally valid: correct magic, the anchored identity, and a tag
     // an attacker computed under a self-chosen key.
     let mut forged = genuine;
-    let attacker_tag = verifier_handoff_tag(BOOT, anchor.authority_id, &[0xB0; 32]);
+    let attacker_tag = TagHasher::new(&[0xB0; 32]).verifier_handoff_tag(BOOT, anchor.authority_id);
     forged[32..].copy_from_slice(&attacker_tag);
     assert_eq!(
         anchor.bind_handoff(&forged),
@@ -602,7 +609,9 @@ fn checkpoint_under_forged_context_is_rejected() {
     // Arbitrary attacker-chosen root and sequence sealed under an
     // attacker-chosen key reusing only the public identity fields.
     let forged = AuthContext::from_trusted_anchor(1, BOOT, [0xB0; 32]).unwrap();
-    let tag = checkpoint_tag(BOOT, 999, [0xAA; 32], 1, &forged);
+    let tag = forged
+        .tag_hasher
+        .checkpoint_tag(BOOT, 999, [0xAA; 32], 1, 1);
     let wire = checkpoint_wire(BOOT, 999, [0xAA; 32], 1, tag);
 
     assert_eq!(

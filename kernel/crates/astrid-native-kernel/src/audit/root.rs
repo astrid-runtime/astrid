@@ -8,8 +8,9 @@
 //! second encoding of the root.
 
 use blake3::Hasher;
+use spin::{Mutex, MutexGuard};
 
-use super::types::{BootSessionId, CheckpointAuthContext};
+use super::types::BootSessionId;
 
 pub(crate) const ROOT_LEN: usize = 32;
 
@@ -21,85 +22,117 @@ pub(crate) const ACK_DOMAIN_TAG: &[u8] = b"astrid.native-kernel.audit-ack.v1";
 pub(crate) const VERIFIER_HANDOFF_DOMAIN_TAG: &[u8] =
     b"astrid.native-kernel.audit-verifier-handoff.v1";
 
-pub(crate) fn genesis(boot: BootSessionId) -> [u8; ROOT_LEN] {
-    let mut hasher = Hasher::new();
-    hasher.update(GENESIS_DOMAIN_TAG);
-    hasher.update(&boot.bytes());
-    hasher.update(&super::CODEC_VERSION.to_le_bytes());
-    hasher.finalize().into()
+/// Reusable unkeyed BLAKE3 state owned by one live audit chain. Construction
+/// happens during boot custody provisioning, never on the syscall path.
+pub(crate) struct RootHasher(Mutex<Hasher>);
+
+impl RootHasher {
+    pub(crate) fn new() -> Self {
+        Self(Mutex::new(Hasher::new()))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Hasher> {
+        self.0.lock()
+    }
+
+    pub(crate) fn genesis(&self, boot: BootSessionId) -> [u8; ROOT_LEN] {
+        let mut hasher = self.lock();
+        hasher.update(GENESIS_DOMAIN_TAG);
+        hasher.update(&boot.bytes());
+        hasher.update(&super::CODEC_VERSION.to_le_bytes());
+        hasher.finalize().into()
+    }
+
+    pub(crate) fn advance(
+        &self,
+        previous_root: [u8; ROOT_LEN],
+        boot: BootSessionId,
+        seq: u64,
+        frame: &[u8],
+    ) -> [u8; ROOT_LEN] {
+        let mut hasher = self.lock();
+        hasher.reset();
+        hasher.update(ROOT_DOMAIN_TAG);
+        hasher.update(ROOT_ALGORITHM_ID);
+        hasher.update(&super::CODEC_VERSION.to_le_bytes());
+        hasher.update(&boot.bytes());
+        hasher.update(&seq.to_le_bytes());
+        hasher.update(&previous_root);
+        hasher.update(frame);
+        hasher.finalize().into()
+    }
 }
 
-pub(crate) fn advance(
-    previous_root: [u8; ROOT_LEN],
-    boot: BootSessionId,
-    seq: u64,
-    frame: &[u8],
-) -> [u8; ROOT_LEN] {
-    let mut hasher = Hasher::new();
-    hasher.update(ROOT_DOMAIN_TAG);
-    hasher.update(ROOT_ALGORITHM_ID);
-    hasher.update(&super::CODEC_VERSION.to_le_bytes());
-    hasher.update(&boot.bytes());
-    hasher.update(&seq.to_le_bytes());
-    hasher.update(&previous_root);
-    hasher.update(frame);
-    hasher.finalize().into()
-}
+/// Reusable keyed BLAKE3 state owned by one kernel authentication context.
+/// The context is move-only and constructs this before any domain can run.
+pub(crate) struct TagHasher(Mutex<Hasher>);
 
-pub(crate) fn checkpoint_tag(
-    boot: BootSessionId,
-    seq: u64,
-    root: [u8; ROOT_LEN],
-    relay_generation: u64,
-    context: &CheckpointAuthContext,
-) -> [u8; ROOT_LEN] {
-    let mut hasher = Hasher::new_keyed(&context.verification_key().bytes());
-    hasher.update(CHECKPOINT_DOMAIN_TAG);
-    hasher.update(&super::CODEC_VERSION.to_le_bytes());
-    hasher.update(&boot.bytes());
-    hasher.update(&seq.to_le_bytes());
-    hasher.update(&root);
-    hasher.update(&relay_generation.to_le_bytes());
-    hasher.update(&context.authority_id().to_le_bytes());
-    hasher.finalize().into()
-}
+impl TagHasher {
+    pub(crate) fn new(verification_key: &[u8; ROOT_LEN]) -> Self {
+        Self(Mutex::new(Hasher::new_keyed(verification_key)))
+    }
 
-/// Binds a verifier receipt to the exact canonical frame and source root it
-/// successfully folded. Relay acknowledgements consume this evidence; relay
-/// flow control still never becomes root authority.
-pub(crate) fn ack_tag(
-    boot: BootSessionId,
-    relay_generation: u64,
-    seq: u64,
-    source_root: [u8; ROOT_LEN],
-    frame: &[u8],
-    context: &CheckpointAuthContext,
-) -> [u8; ROOT_LEN] {
-    let mut hasher = Hasher::new_keyed(&context.verification_key().bytes());
-    hasher.update(ACK_DOMAIN_TAG);
-    hasher.update(&super::CODEC_VERSION.to_le_bytes());
-    hasher.update(&context.authority_id().to_le_bytes());
-    hasher.update(&boot.bytes());
-    hasher.update(&relay_generation.to_le_bytes());
-    hasher.update(&seq.to_le_bytes());
-    hasher.update(&source_root);
-    hasher.update(frame);
-    hasher.finalize().into()
-}
+    fn lock(&self) -> MutexGuard<'_, Hasher> {
+        self.0.lock()
+    }
 
-/// Keys the kernel minting tag bound into the untrusted verifier handoff.
-/// The verification key never travels inside the handoff; the tag is
-/// checkable only by a holder of the independently trusted kernel-origin
-/// anchor, so a caller-minted handoff cannot authenticate itself.
-pub(crate) fn verifier_handoff_tag(
-    boot: BootSessionId,
-    authority_id: u64,
-    verification_key: &[u8; ROOT_LEN],
-) -> [u8; ROOT_LEN] {
-    let mut hasher = Hasher::new_keyed(verification_key);
-    hasher.update(VERIFIER_HANDOFF_DOMAIN_TAG);
-    hasher.update(&super::CODEC_VERSION.to_le_bytes());
-    hasher.update(&boot.bytes());
-    hasher.update(&authority_id.to_le_bytes());
-    hasher.finalize().into()
+    pub(crate) fn reset(&self) {
+        self.lock().reset();
+    }
+
+    pub(crate) fn checkpoint_tag(
+        &self,
+        boot: BootSessionId,
+        seq: u64,
+        root: [u8; ROOT_LEN],
+        relay_generation: u64,
+        authority_id: u64,
+    ) -> [u8; ROOT_LEN] {
+        let mut hasher = self.lock();
+        hasher.reset();
+        hasher.update(CHECKPOINT_DOMAIN_TAG);
+        hasher.update(&super::CODEC_VERSION.to_le_bytes());
+        hasher.update(&boot.bytes());
+        hasher.update(&seq.to_le_bytes());
+        hasher.update(&root);
+        hasher.update(&relay_generation.to_le_bytes());
+        hasher.update(&authority_id.to_le_bytes());
+        hasher.finalize().into()
+    }
+
+    pub(crate) fn ack_tag(
+        &self,
+        boot: BootSessionId,
+        relay_generation: u64,
+        seq: u64,
+        source_root: [u8; ROOT_LEN],
+        frame: &[u8],
+        authority_id: u64,
+    ) -> [u8; ROOT_LEN] {
+        let mut hasher = self.lock();
+        hasher.reset();
+        hasher.update(ACK_DOMAIN_TAG);
+        hasher.update(&super::CODEC_VERSION.to_le_bytes());
+        hasher.update(&authority_id.to_le_bytes());
+        hasher.update(&boot.bytes());
+        hasher.update(&relay_generation.to_le_bytes());
+        hasher.update(&seq.to_le_bytes());
+        hasher.update(&source_root);
+        hasher.update(frame);
+        hasher.finalize().into()
+    }
+
+    pub(crate) fn verifier_handoff_tag(
+        &self,
+        boot: BootSessionId,
+        authority_id: u64,
+    ) -> [u8; ROOT_LEN] {
+        let mut hasher = self.lock();
+        hasher.reset();
+        hasher.update(VERIFIER_HANDOFF_DOMAIN_TAG);
+        hasher.update(&super::CODEC_VERSION.to_le_bytes());
+        hasher.update(&boot.bytes());
+        hasher.update(&authority_id.to_le_bytes());
+        hasher.finalize().into()
+    }
 }

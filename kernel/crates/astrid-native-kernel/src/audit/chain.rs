@@ -8,24 +8,63 @@ use super::root;
 use super::types::{
     AuditAuthority, AuditCheckpoint, AuditError, AuditEvent, BootSessionId, KernelSecretEntropy,
 };
+use native_audit_verifier::AuditVerifier;
 
 pub(crate) struct AuditChain {
     boot: BootSessionId,
     authority: AuditAuthority,
+    root_hasher: root::RootHasher,
     seq: u64,
     root: [u8; root::ROOT_LEN],
     relay: AuditRelay,
+}
+
+/// One successfully observed and retired public audit position.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AuditObservation {
+    seq: u64,
+    class: super::types::AuditClass,
+    root: [u8; root::ROOT_LEN],
+}
+
+impl AuditObservation {
+    pub(crate) const fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    pub(crate) const fn class(&self) -> super::types::AuditClass {
+        self.class
+    }
+
+    pub(crate) const fn root(&self) -> &[u8; root::ROOT_LEN] {
+        &self.root
+    }
 }
 
 impl AuditChain {
     /// Starts a new boot/session chain at the domain-separated genesis root.
     pub fn genesis(boot: BootSessionId, secret: KernelSecretEntropy) -> Result<Self, AuditError> {
         let authority = AuditAuthority::mint(boot, secret).ok_or(AuditError::MalformedFrame)?;
+        Self::genesis_custodied(boot, authority)
+    }
+
+    /// Starts from an already-minted authority so boot provisioning can create
+    /// exactly one signer custodian and one verifier-anchor custodian.
+    pub(crate) fn genesis_custodied(
+        boot: BootSessionId,
+        authority: AuditAuthority,
+    ) -> Result<Self, AuditError> {
+        if authority.boot() != boot {
+            return Err(AuditError::CheckpointMismatch);
+        }
+        let root_hasher = root::RootHasher::new();
+        let root = root_hasher.genesis(boot);
         Ok(Self {
             boot,
             authority,
+            root_hasher,
             seq: 0,
-            root: root::genesis(boot),
+            root,
             relay: AuditRelay::new(boot),
         })
     }
@@ -55,6 +94,7 @@ impl AuditChain {
         Ok(Self {
             boot: checkpoint.boot(),
             authority,
+            root_hasher: root::RootHasher::new(),
             seq: checkpoint.seq(),
             root: checkpoint.root(),
             relay,
@@ -65,8 +105,8 @@ impl AuditChain {
         self.boot
     }
 
-    pub(crate) const fn authority(&self) -> AuditAuthority {
-        self.authority
+    pub(crate) const fn authority(&self) -> &AuditAuthority {
+        &self.authority
     }
 
     pub const fn seq(&self) -> u64 {
@@ -120,7 +160,9 @@ impl AuditChain {
         let frame = Frame::new(self.boot, next, &event, prev_root)?;
         let mut buf = [0; MAX_FRAME_BYTES];
         let encoded = frame.encode(&mut buf)?;
-        let next_root = root::advance(self.root, self.boot, next, encoded);
+        let next_root = self
+            .root_hasher
+            .advance(self.root, self.boot, next, encoded);
 
         // The relay is mandatory for this first-slice mutation transition.
         // A reserve or window failure returns before either authoritative
@@ -139,6 +181,53 @@ impl AuditChain {
         self.seq = next;
         self.root = next_root;
         Ok(next)
+    }
+
+    /// Root, independently fold, and retire one event before any authoritative
+    /// chain cursor advances. A verifier fold failure therefore leaves chain
+    /// sequence and root untouched.
+    pub(crate) fn append_and_retire(
+        &mut self,
+        event: AuditEvent,
+        verifier: &mut AuditVerifier,
+    ) -> Result<AuditObservation, AuditError> {
+        let next = self
+            .seq
+            .checked_add(1)
+            .ok_or(AuditError::SequenceOverflow)?;
+        let prev_root = Some(self.root);
+        let frame = Frame::new(self.boot, next, &event, prev_root)?;
+        let mut buf = [0; MAX_FRAME_BYTES];
+        let encoded = frame.encode(&mut buf)?;
+        let next_root = self
+            .root_hasher
+            .advance(self.root, self.boot, next, encoded);
+
+        // Relay capacity is checked before the verifier commits its fold, so
+        // neither side advances when flow control would strand a rooted event.
+        self.relay
+            .can_publish(next, event.class().is_terminal_or_invalidation())?;
+        let receipt = verifier
+            .fold(encoded, next_root)
+            .map_err(|_| AuditError::RootMismatch)?;
+        self.relay.publish_retired(
+            next,
+            encoded,
+            next_root,
+            event.class().is_terminal_or_invalidation(),
+            receipt.ack_tag(),
+            self.authority.context(),
+        )?;
+
+        // The only mutations after independent verification are infallible
+        // cursor assignments already proven valid above.
+        self.seq = next;
+        self.root = next_root;
+        Ok(AuditObservation {
+            seq: next,
+            class: event.class(),
+            root: next_root,
+        })
     }
 
     /// Kernel-authenticated checkpoint bound to the exact current state.
