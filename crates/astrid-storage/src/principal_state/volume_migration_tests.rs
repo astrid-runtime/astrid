@@ -386,7 +386,13 @@ async fn promotes_released_volume_path_before_opening() {
     drop(reopened);
 
     assert!(canonical.is_file());
-    assert!(!legacy.exists());
+    // The no-replace promotion intentionally retains the locked source name.
+    // This prevents a raced replacement from ever being selected for unlink.
+    assert!(legacy.is_file());
+    assert_eq!(
+        std::fs::read(&canonical).unwrap(),
+        std::fs::read(&legacy).unwrap()
+    );
 }
 
 #[test]

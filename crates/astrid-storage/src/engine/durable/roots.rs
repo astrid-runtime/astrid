@@ -22,7 +22,7 @@ pub(super) fn recover_root_history<P, C, R>(
     limits: RecoveryLimits,
 ) -> Result<BTreeMap<P, (RootState, u64)>, DurableError>
 where
-    P: Ord,
+    P: Clone + Ord,
     C: PrincipalCodec<P>,
     R: DurableIo,
 {
@@ -54,17 +54,27 @@ pub(super) fn probe_root_history_without_repair<P, C, R>(
     limits: RecoveryLimits,
 ) -> Result<OwnerObservations<P>, DurableError>
 where
-    P: Ord,
+    P: Clone + Ord,
     C: PrincipalCodec<P>,
     R: DurableIo,
 {
     let mut owners = BTreeSet::<P>::new();
+    let mut semantic = BTreeMap::<P, (RootState, u64)>::new();
     let scan_error =
         scan_frames_observing(roots, ROOT_FILE, ROOT_MAGIC, limits, |offset, payload| {
             let record = decode_root_journal_record(payload, scheme)
                 .map_err(|detail| corrupt(ROOT_FILE, offset, detail))?;
             observe_principals(&mut owners, codec, offset, &record)?;
-            Ok(())
+            // Replay the real semantic state machine on a scratch snapshot so
+            // stale CAS, generation conflicts, duplicate snapshots, and other
+            // model failures remain evidence without stopping a later User.
+            let mut next = semantic.clone();
+            let result =
+                apply_root_journal_record(&mut next, codec, scheme, offset, payload, record);
+            if result.is_ok() {
+                semantic = next;
+            }
+            result
         })?;
     Ok(OwnerObservations { owners, scan_error })
 }
@@ -394,6 +404,13 @@ fn decode_root_journal_record(
             return Err("unknown root-journal extension record");
         }
         let count = reader.usize_len()?;
+        // Every entry contains at least an 8-byte principal length, a 1-byte
+        // principal, and a complete root state (8 + 2 + 2 + 4 + 32). Reject
+        // impossible counts before reserving entry storage.
+        let minimum_entry_bytes = 8 + 1 + (8 + 2 + 2 + 4 + 32);
+        if count > reader.remaining() / minimum_entry_bytes {
+            return Err("root snapshot count exceeds its encoded frame");
+        }
         let mut entries = Vec::new();
         entries
             .try_reserve_exact(count)

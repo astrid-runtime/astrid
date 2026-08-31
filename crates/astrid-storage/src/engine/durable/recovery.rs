@@ -1,6 +1,5 @@
 //! Authoritative startup and in-process recovery for the durable engine.
 
-#[cfg(test)]
 use super::wal::wal_root_owners_without_repair;
 use super::wal::{durable_error as wal_durable_error, recover_wal};
 use super::{
@@ -27,7 +26,6 @@ pub(crate) struct OwnerObservations<P> {
 }
 
 /// Read a native WAL without repairing or changing its bytes.
-#[cfg(test)]
 pub(crate) fn inspect_native_wal_owners_without_repair<P, C>(
     path: &Path,
     identity: crate::Blake3ObjectIdentityV1,
@@ -66,7 +64,7 @@ pub(crate) fn inspect_volume_root_history_without_repair<P, C>(
     limits: RecoveryLimits,
 ) -> Result<OwnerObservations<P>, DurableError>
 where
-    P: Ord,
+    P: Clone + Ord,
     C: PrincipalCodec<P>,
 {
     let region = crate::volume::VolumeRegion::new(ROOT_FILE)
@@ -99,7 +97,7 @@ pub(crate) fn inspect_native_root_history_without_repair<P, C>(
     limits: RecoveryLimits,
 ) -> Result<OwnerObservations<P>, DurableError>
 where
-    P: Ord,
+    P: Clone + Ord,
     C: PrincipalCodec<P>,
 {
     let file = std::fs::File::open(path).map_err(|source| io_error("open root journal", source))?;

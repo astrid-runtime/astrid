@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use super::format::{
-    StagingIntent, is_runtime_forbidden_user_owner, load_generation_footer_from_file,
+    GenerationOwnerScan, StagingIntent, inspect_generation_footer_owner,
+    is_runtime_forbidden_user_owner, load_generation_footer_from_file,
 };
 use super::journal::{
     JournalRecord, StageKey, StageKey as JournalStageKey, append_records, flush_journal,
@@ -60,25 +61,20 @@ pub(super) fn reject_runtime_forbidden_staging(
             }
             let mut file = directory.open_file(&name)?;
             let path = PathBuf::from(format!("staging generation {}", name.display()));
-            match load_generation_footer_from_file(&path, &mut file) {
-                Ok(footer)
-                    if matches!(
-                        footer.intent.owner,
-                        crate::principal_state::StateOwner::User(_)
-                    ) =>
-                {
+            match inspect_generation_footer_owner(&path, &mut file)? {
+                GenerationOwnerScan::User => {
                     return Err(connection(format!(
                         "explicit user owner in staged generation {} is not runtime-admitted",
                         name.display()
                     )));
                 },
-                Err(error) if is_runtime_forbidden_user_owner(&error) => {
+                GenerationOwnerScan::Admitted | GenerationOwnerScan::Terminal => {},
+                GenerationOwnerScan::Malformed(detail) => {
                     return Err(connection(format!(
-                        "explicit user owner in staged generation {} is not runtime-admitted",
+                        "staged generation {} owner preflight failed: {detail}",
                         name.display()
                     )));
                 },
-                Ok(_) | Err(_) => {},
             }
         }
     }

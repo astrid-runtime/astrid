@@ -147,6 +147,12 @@ pub(super) async fn apply_if_required(
         ))
     })?;
     let intent = store.join(MIGRATION_INTENT_FILE);
+    // Alias StateOwner V1 cannot contain the User domain introduced by V2.
+    // The V2 preflight runs for every successor-grammar store, including a
+    // healthy no-op open. Legacy migration uses its own frozen codec.
+    if !is_supported_alias_owner_metadata(&actual) {
+        super::recovery_preflight::directory_store_owners(&store)?;
+    }
     if actual == metadata && !intent.exists() {
         return Ok(());
     }
@@ -780,8 +786,17 @@ mod tests {
         let store = after_backup.path();
         std::fs::write(store.join(PREVIOUS_ROOT_FILE), b"old").unwrap();
         std::fs::write(store.join(REPLACEMENT_ROOT_FILE), b"new").unwrap();
-        recover_missing_active_root(store).unwrap();
-        assert_eq!(std::fs::read(store.join(ROOT_FILE)).unwrap(), b"new");
+        let error = recover_missing_active_root(store).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("could not prove complete coverage")
+        );
+        assert!(!store.join(ROOT_FILE).exists());
+        assert_eq!(
+            std::fs::read(store.join(REPLACEMENT_ROOT_FILE)).unwrap(),
+            b"new"
+        );
         assert_eq!(
             std::fs::read(store.join(PREVIOUS_ROOT_FILE)).unwrap(),
             b"old"
@@ -790,9 +805,17 @@ mod tests {
         let replacement_lost = tempfile::tempdir().unwrap();
         let store = replacement_lost.path();
         std::fs::write(store.join(PREVIOUS_ROOT_FILE), b"old").unwrap();
-        recover_missing_active_root(store).unwrap();
-        assert_eq!(std::fs::read(store.join(ROOT_FILE)).unwrap(), b"old");
-        assert!(!store.join(PREVIOUS_ROOT_FILE).exists());
+        let error = recover_missing_active_root(store).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("could not prove complete coverage")
+        );
+        assert!(!store.join(ROOT_FILE).exists());
+        assert_eq!(
+            std::fs::read(store.join(PREVIOUS_ROOT_FILE)).unwrap(),
+            b"old"
+        );
 
         let normal = tempfile::tempdir().unwrap();
         let store = normal.path();

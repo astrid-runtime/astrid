@@ -25,6 +25,7 @@ thread_local! {
 }
 
 mod indexed;
+mod observation;
 mod prepared;
 mod reader;
 
@@ -34,6 +35,7 @@ pub(super) use indexed::{
     read_indexed_object, read_indexed_object_with_payload, read_indexed_objects,
     visit_indexed_objects,
 };
+pub(super) use observation::scan_frames_observing;
 pub(super) use prepared::{PreparedFrame, append_prepared_frames};
 use reader::SliceReader;
 
@@ -316,112 +318,6 @@ pub(super) fn scan_frames<F: DurableIo>(
     scan_frames_with_protected_prefix(file, file_name, magic, limits, 0, true, accept)
 }
 
-/// Observe every recoverable frame without stopping at malformed evidence.
-///
-/// The first structural or model error is retained for fail-closed callers,
-/// but scanning resynchronizes on each valid frame candidate so a malformed
-/// prefix cannot hide a canonical owner in a later frame.
-pub(super) fn scan_frames_observing<F: DurableIo>(
-    file: &mut F,
-    file_name: &'static str,
-    magic: [u8; 8],
-    limits: RecoveryLimits,
-    mut accept: impl FnMut(u64, &[u8]) -> Result<(), DurableError>,
-) -> Result<Option<DurableError>, DurableError> {
-    let file_len = validated_file_len(file, file_name, 0)?;
-    let mut scan_error = None;
-    let mut offset = 0_u64;
-    let mut progress = 0_usize;
-    while offset < file_len {
-        progress = progress
-            .checked_add(1)
-            .ok_or(DurableError::EncodingOverflow)?;
-        let remaining = file_len
-            .checked_sub(offset)
-            .ok_or(DurableError::EncodingOverflow)?;
-        if remaining < FRAME_HEADER_LEN {
-            break;
-        }
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|source| io_error("seek durable frame observation", source))?;
-        let mut header = [0_u8; FRAME_HEADER_LEN_USIZE];
-        file.read_exact(&mut header)
-            .map_err(|source| io_error("read durable frame observation", source))?;
-        if header[..8] != magic {
-            offset = offset
-                .checked_add(1)
-                .ok_or(DurableError::EncodingOverflow)?;
-            continue;
-        }
-        let decoded = match decode_frame_header(file_name, offset, &header) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                scan_error.get_or_insert(error);
-                offset = offset
-                    .checked_add(1)
-                    .ok_or(DurableError::EncodingOverflow)?;
-                continue;
-            },
-        };
-        let frame_len = FRAME_HEADER_LEN
-            .checked_add(decoded.payload_len)
-            .ok_or(DurableError::EncodingOverflow)?;
-        if decoded.payload_len > limits.max_frame_bytes || frame_len > remaining {
-            scan_error.get_or_insert(if decoded.payload_len > limits.max_frame_bytes {
-                DurableError::FrameTooLarge {
-                    file: file_name,
-                    offset,
-                    declared: decoded.payload_len,
-                    limit: limits.max_frame_bytes,
-                }
-            } else {
-                corrupt(file_name, offset, "observed frame payload is truncated")
-            });
-            offset = match next_valid_frame_offset(
-                file,
-                magic,
-                offset
-                    .checked_add(1)
-                    .ok_or(DurableError::EncodingOverflow)?,
-                file_len,
-                limits,
-            )? {
-                Some(candidate) => candidate,
-                None => break,
-            };
-            continue;
-        }
-        let payload = read_frame_payload(file, decoded.payload_len)?;
-        if frame_checksum(magic, decoded.payload_len, &payload) != decoded.checksum {
-            scan_error.get_or_insert(corrupt(file_name, offset, "frame checksum mismatch"));
-            offset = match next_valid_frame_offset(
-                file,
-                magic,
-                offset
-                    .checked_add(1)
-                    .ok_or(DurableError::EncodingOverflow)?,
-                file_len,
-                limits,
-            )? {
-                Some(candidate) => candidate,
-                None => break,
-            };
-            continue;
-        }
-        if let Err(error) = accept(offset, &payload) {
-            scan_error.get_or_insert(error);
-            offset = offset
-                .checked_add(1)
-                .ok_or(DurableError::EncodingOverflow)?;
-            continue;
-        }
-        offset = offset
-            .checked_add(frame_len)
-            .ok_or(DurableError::EncodingOverflow)?;
-    }
-    Ok(scan_error)
-}
-
 fn scan_frames_with_protected_prefix<F: DurableIo>(
     file: &mut F,
     file_name: &'static str,
@@ -541,7 +437,7 @@ fn truncate_tail_if_repairing<F: DurableIo>(
     Ok(())
 }
 
-fn validated_file_len<F: DurableIo>(
+pub(super) fn validated_file_len<F: DurableIo>(
     file: &F,
     file_name: &'static str,
     protected_len: u64,
@@ -561,9 +457,9 @@ fn validated_file_len<F: DurableIo>(
 }
 
 #[derive(Clone, Copy)]
-struct DecodedFrameHeader {
-    payload_len: u64,
-    checksum: [u8; 32],
+pub(super) struct DecodedFrameHeader {
+    pub(super) payload_len: u64,
+    pub(super) checksum: [u8; 32],
 }
 
 #[derive(Clone, Copy)]
@@ -575,7 +471,7 @@ struct FrameScanPolicy {
     repair_tail: bool,
 }
 
-fn decode_frame_header(
+pub(super) fn decode_frame_header(
     file_name: &'static str,
     offset: u64,
     header: &[u8; FRAME_HEADER_LEN_USIZE],
@@ -603,7 +499,7 @@ fn decode_frame_header(
     })
 }
 
-fn read_frame_payload<F: DurableIo>(
+pub(super) fn read_frame_payload<F: DurableIo>(
     file: &mut F,
     payload_len: u64,
 ) -> Result<Vec<u8>, DurableError> {
@@ -647,7 +543,7 @@ fn valid_frame_follows<F: DurableIo>(
     Ok(next_valid_frame_offset(file, magic, invalid_offset, file_len, limits)?.is_some())
 }
 
-fn next_valid_frame_offset<F: DurableIo>(
+pub(super) fn next_valid_frame_offset<F: DurableIo>(
     file: &mut F,
     magic: [u8; 8],
     invalid_offset: u64,

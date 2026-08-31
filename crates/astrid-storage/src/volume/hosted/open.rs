@@ -93,6 +93,23 @@ pub(crate) struct HostedVolumeIdentity {
 }
 
 impl HostedVolumeIdentity {
+    #[cfg(windows)]
+    fn windows_file_identity(handle: std::os::windows::io::RawHandle) -> io::Result<Self> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: the caller owns a live Windows handle and `info` is writable.
+        #[allow(unsafe_code)]
+        if unsafe { GetFileInformationByHandle(handle, &raw mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            volume: u64::from(info.dwVolumeSerialNumber),
+            file: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        })
+    }
+
     fn from_file(file: &File) -> io::Result<Self> {
         let metadata = file.metadata()?;
         if !metadata.is_file() {
@@ -106,10 +123,10 @@ impl HostedVolumeIdentity {
                 volume: metadata.dev(),
                 file: metadata.ino(),
             }),
-            windows => Ok(Self {
-                volume: u64::from(metadata.volume_serial_number()),
-                file: metadata.file_id(),
-            }),
+            windows => {
+                use std::os::windows::io::AsRawHandle as _;
+                Self::windows_file_identity(file.as_raw_handle())
+            },
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "Astrid volume identity is unsupported on this platform",
@@ -130,10 +147,13 @@ impl HostedVolumeIdentity {
                 volume: metadata.dev(),
                 file: metadata.ino(),
             }),
-            windows => Ok(Self {
-                volume: u64::from(metadata.volume_serial_number()),
-                file: metadata.file_id(),
-            }),
+            windows => {
+                let file = open_file_without_following(path)?;
+                use std::os::windows::io::AsRawHandle as _;
+                let identity = Self::windows_file_identity(file.as_raw_handle())?;
+                drop(file);
+                Ok(identity)
+            },
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "Astrid volume identity is unsupported on this platform",
@@ -218,6 +238,7 @@ fn open_file_without_following(path: &Path) -> io::Result<File> {
     }
     #[cfg(windows)]
     {
+        use std::os::windows::fs::OpenOptionsExt as _;
         use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -327,34 +348,15 @@ fn open_artifact_proof(plan: &HostedArtifactPlan) -> io::Result<(Vec<HostedArtif
     Ok((existing, selected))
 }
 
-fn remove_same_artifact(path: &Path, identity: HostedVolumeIdentity) -> io::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-        Ok(_) => {
-            let current = HostedVolumeIdentity::from_path(path)?;
-            if current != identity {
-                return Err(io::Error::new(
-                    io::ErrorKind::StaleNetworkFileHandle,
-                    "Astrid volume reclaim artifact changed after its proof",
-                ));
-            }
-            std::fs::remove_file(path)
-        },
-    }
-}
-
-fn link_selected_volume(source: &HostedArtifact, destination: &Path) -> io::Result<()> {
+fn install_selected_volume(source: &HostedArtifact, destination: &Path) -> io::Result<()> {
     if source.role == HostedArtifactRole::Active {
         return Ok(());
     }
-    if std::fs::symlink_metadata(destination).is_ok() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "Astrid volume destination appeared while its proof was held",
-        ));
-    }
-    std::fs::rename(&source.path, destination)?;
+    // `hard_link` is an atomic no-replace namespace transition: it either
+    // creates the first destination name for the locked inode or fails with
+    // `AlreadyExists`. The source is intentionally retained so a raced or
+    // foreign inode can never be selected for unlink.
+    std::fs::hard_link(&source.path, destination)?;
     if let Some(parent) = destination.parent() {
         std::fs::File::open(parent)?.sync_all()?;
     }
@@ -366,10 +368,7 @@ fn link_selected_volume(source: &HostedArtifact, destination: &Path) -> io::Resu
             "promoted Astrid volume has a different identity",
         ));
     }
-    match std::fs::remove_file(&source.path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        result => result,
-    }
+    Ok(())
 }
 
 impl HostedFileVolume {
@@ -436,11 +435,7 @@ impl HostedFileVolume {
         }
         let selected = artifacts.swap_remove(selected_index);
         drop(proofs);
-        link_selected_volume(&selected, &plan.destination).map_err(map_error)?;
-        for artifact in artifacts.drain(..) {
-            drop(artifact.file);
-            remove_same_artifact(&artifact.path, artifact.identity).map_err(map_error)?;
-        }
+        install_selected_volume(&selected, &plan.destination).map_err(map_error)?;
         let mut selected = selected;
         let recovery = recover::recover_container(&mut selected.file).map_err(map_error)?;
         if selected.file.metadata().map_err(map_error)?.len() != recovery.valid_len

@@ -57,6 +57,7 @@ mod owner_codec_tests;
 mod owner_migration;
 #[cfg(test)]
 mod projection_name_tests;
+mod recovery_preflight;
 #[cfg(all(test, feature = "legacy-surrealkv"))]
 mod release_fixture_tests;
 mod runtime_tree;

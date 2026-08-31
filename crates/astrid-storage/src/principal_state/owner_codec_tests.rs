@@ -636,6 +636,57 @@ fn forged_tag3_root_recovery_fails_closed() {
 }
 
 #[test]
+fn directory_preflight_blocks_torn_recovery_before_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let commit = commit_record();
+    let commit_id = Blake3ObjectIdentityV1.identify(&commit);
+    let pure_engine = DurableEngine::open(
+        directory.path(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    pure_engine
+        .commit(RootTransaction::new(
+            user_owner(),
+            None,
+            commit_id,
+            vec![(commit_id, commit)],
+        ))
+        .unwrap();
+    pure_engine.close().unwrap();
+
+    std::fs::remove_file(directory.path().join("objects.index")).unwrap();
+    let arena = directory.path().join("objects.arena");
+    let mut arena_bytes = std::fs::read(&arena).unwrap();
+    arena_bytes.extend_from_slice(b"ASTOBJ1\0torn-recovery-tail");
+    std::fs::write(&arena, &arena_bytes).unwrap();
+    let inputs = [
+        "objects.arena",
+        "objects.index",
+        "roots.journal",
+        "transactions.wal",
+    ]
+    .map(|name| (name, file_bytes(&directory.path().join(name))));
+
+    let error = super::recovery_preflight::directory_store_owners(directory.path()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("explicit user StateOwner; recovery mutation is refused"),
+        "{error}"
+    );
+    for (name, bytes) in inputs {
+        assert_eq!(
+            file_bytes(&directory.path().join(name)),
+            bytes,
+            "{name} changed"
+        );
+    }
+}
+
+#[test]
 fn forged_tag3_snapshot_recovery_fails_closed() {
     let directory = tempfile::tempdir().unwrap();
     let commit = commit_record();

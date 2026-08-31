@@ -4,11 +4,11 @@ use std::marker::PhantomData;
 use super::super::{PersistentObjectIdentity, PrincipalCodec};
 
 use super::codec::{
-    PHYSICAL_HEADER_LEN, RecordHeader, WAL_MAGIC, checksum_valid, decode_begin_body,
-    decode_commit_body, decode_object_body, decode_object_storage_body, decode_physical_header,
-    decode_record_header, decode_root_body, digest_record, digest_record_with_flags,
-    logical_record_length, new_digest, record_body, validate_logical_body, validate_record_version,
-    wal_physical_limit,
+    PHYSICAL_HEADER_LEN, RecordHeader, WAL_MAGIC, checksum_valid, checksum_valid_streaming,
+    decode_begin_body, decode_commit_body, decode_object_body, decode_object_storage_body,
+    decode_physical_header, decode_record_header, decode_root_body, digest_record,
+    digest_record_with_flags, logical_record_length, new_digest, record_body,
+    validate_logical_body, validate_record_version, wal_physical_limit,
 };
 use super::types::{
     WalBeginDescriptor, WalCommitDescriptor, WalCount, WalError, WalEvent, WalLength, WalLimits,
@@ -194,6 +194,23 @@ where
             });
         }
         self.next_search_offset = payload_end;
+        self.reader
+            .seek(SeekFrom::Start(payload_start))
+            .map_err(|source| WalError::Io {
+                operation: "seek ASTWAL2 checksum payload",
+                source,
+            })?;
+        let valid = checksum_valid_streaming((&mut self.reader).take(payload_len.get()), physical)?;
+        if !valid {
+            self.offset = payload_end;
+            return self.bad_physical(record_offset);
+        }
+        self.reader
+            .seek(SeekFrom::Start(payload_start))
+            .map_err(|source| WalError::Io {
+                operation: "seek ASTWAL2 validated payload",
+                source,
+            })?;
         let payload_size = payload_len.as_usize()?;
         let mut payload = Vec::new();
         payload
@@ -202,9 +219,6 @@ where
         payload.resize(payload_size, 0);
         read_exact_payload(&mut self.reader, &mut payload, record_offset)?;
         self.offset = payload_end;
-        if !checksum_valid(physical, &payload) {
-            return self.bad_physical(record_offset);
-        }
         let record = decode_record_header(&payload, record_offset)?;
         validate_record_version(physical, record, record_offset)?;
         let body = record_body(&payload, record_offset)?;

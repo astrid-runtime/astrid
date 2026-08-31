@@ -868,7 +868,6 @@ use native_io::{
 };
 pub(crate) use recovery::OwnerObservations;
 pub(crate) use recovery::inspect_native_root_history_without_repair;
-#[cfg(test)]
 pub(crate) use recovery::inspect_native_wal_owners_without_repair;
 pub(crate) use recovery::inspect_volume_root_history_without_repair;
 pub(crate) fn inspect_volume_wal_owners_without_repair<P, I, C>(

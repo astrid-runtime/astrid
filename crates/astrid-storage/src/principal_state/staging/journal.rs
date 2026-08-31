@@ -11,7 +11,9 @@ use super::format::{
     StagingIntent, decode_intent, encode_intent, is_runtime_forbidden_user_intent_error,
 };
 use super::{StagedContentId, connection};
+use crate::engine::durable::PrincipalCodec;
 use crate::error::StorageResult;
+use crate::principal_state::StateOwnerCodecV2;
 use crate::principal_state::native_io::PrivateDirectory;
 
 pub(super) const JOURNAL_MAGIC: [u8; 8] = *b"ASTRSTG1";
@@ -73,7 +75,8 @@ pub(super) fn scan_runtime_forbidden_user_without_repair(
         scan_error: None,
     };
     let mut search = 0_u64;
-    while let Some(offset) = find_journal_magic(file, search, file_len)? {
+    let mut magic_scanner = JournalMagicScanner::new(file, file_len)?;
+    while let Some(offset) = magic_scanner.next(file, search)? {
         match decode_frame_without_repair(file, offset, file_len, false)? {
             JournalFrame::Skipped(frame_end) | JournalFrame::Frame(_, frame_end) => {
                 search = frame_end;
@@ -127,35 +130,85 @@ enum UnsupportedJournalFrame {
     Reserved,
 }
 
-#[allow(
-    clippy::arithmetic_side_effects,
-    reason = "read_len is checked to exceed the fixed magic width before the bounded advance"
-)]
-fn find_journal_magic(file: &mut File, start: u64, file_len: u64) -> io::Result<Option<u64>> {
-    let mut search = start;
-    while search < file_len {
-        let read_len = usize::try_from(
-            file_len
-                .saturating_sub(search)
+struct JournalMagicScanner {
+    file_len: u64,
+    loaded_start: u64,
+    loaded_end: u64,
+    scan_offset: u64,
+    buffer: Vec<u8>,
+}
+
+impl JournalMagicScanner {
+    fn new(file: &mut File, file_len: u64) -> io::Result<Self> {
+        let mut scanner = Self {
+            file_len,
+            loaded_start: 0,
+            loaded_end: 0,
+            scan_offset: 0,
+            buffer: vec![0_u8; JOURNAL_SCAN_WINDOW_BYTES],
+        };
+        scanner.refill(file)?;
+        Ok(scanner)
+    }
+
+    fn refill(&mut self, file: &mut File) -> io::Result<()> {
+        if self.loaded_end >= self.file_len {
+            return Ok(());
+        }
+        let read_start = self.loaded_end;
+        let wanted = usize::try_from(
+            self.file_len
+                .saturating_sub(read_start)
                 .min(JOURNAL_SCAN_WINDOW_BYTES as u64),
         )
         .map_err(|_| io::Error::other("staging journal scan window overflow"))?;
-        let mut window = vec![0_u8; read_len];
-        file.seek(SeekFrom::Start(search))?;
-        file.read_exact(&mut window)?;
-        if let Some(relative) = window
-            .windows(JOURNAL_MAGIC.len())
-            .position(|candidate| candidate == JOURNAL_MAGIC.as_slice())
-        {
-            return Ok(Some(search.saturating_add(relative as u64)));
-        }
-        search = if read_len > JOURNAL_MAGIC.len() {
-            search.saturating_add((read_len - JOURNAL_MAGIC.len() + 1) as u64)
-        } else {
-            break;
-        };
+        let read_end = read_start
+            .checked_add(wanted as u64)
+            .ok_or_else(|| io::Error::other("staging journal scan window overflow"))?;
+        file.seek(SeekFrom::Start(read_start))?;
+        file.read_exact(&mut self.buffer[..wanted])?;
+        self.loaded_start = read_start;
+        self.loaded_end = read_end;
+        self.scan_offset = self.scan_offset.max(read_start);
+        Ok(())
     }
-    Ok(None)
+
+    fn next(&mut self, file: &mut File, after: u64) -> io::Result<Option<u64>> {
+        self.scan_offset = self.scan_offset.max(after);
+        loop {
+            if self.scan_offset >= self.file_len {
+                return Ok(None);
+            }
+            while self
+                .scan_offset
+                .checked_add(JOURNAL_MAGIC.len() as u64)
+                .is_some_and(|end| end <= self.loaded_end)
+            {
+                let relative =
+                    usize::try_from(self.scan_offset.checked_sub(self.loaded_start).ok_or_else(
+                        || io::Error::other("staging journal scan cursor underflow"),
+                    )?)
+                    .map_err(|_| io::Error::other("staging journal scan cursor overflow"))?;
+                let end = relative
+                    .checked_add(JOURNAL_MAGIC.len())
+                    .ok_or_else(|| io::Error::other("staging journal scan cursor overflow"))?;
+                if self.buffer.get(relative..end) == Some(JOURNAL_MAGIC.as_slice()) {
+                    let candidate = self.scan_offset;
+                    self.scan_offset = candidate.saturating_add(1);
+                    return Ok(Some(candidate));
+                }
+                self.scan_offset = self.scan_offset.saturating_add(1);
+            }
+            if self.loaded_end >= self.file_len {
+                return Ok(None);
+            }
+            self.scan_offset = self.loaded_end.saturating_sub(
+                u64::try_from(JOURNAL_MAGIC.len().saturating_sub(1))
+                    .map_err(|_| io::Error::other("staging journal scan overlap overflow"))?,
+            );
+            self.refill(file)?;
+        }
+    }
 }
 
 fn verify_frame_checksum(
@@ -208,7 +261,11 @@ fn classify_sealed_owner_early(file: &mut File, frame_end: u64) -> JournalFrame 
     if file.read_exact(&mut owner).is_err() {
         return JournalFrame::Malformed(MalformedJournalFrame::Decode("staged owner is truncated"));
     }
-    if owner[0] == 3 {
+    if StateOwnerCodecV2.decode(&owner).is_none() {
+        JournalFrame::Malformed(MalformedJournalFrame::Decode(
+            "staged owner is not canonical StateOwner V2",
+        ))
+    } else if owner[0] == 3 {
         JournalFrame::User
     } else {
         JournalFrame::Skipped(frame_end)
@@ -547,9 +604,12 @@ fn valid_frame_follows(file: &mut File, invalid_offset: u64, file_len: u64) -> S
     let Some(start) = invalid_offset.checked_add(1) else {
         return Ok(false);
     };
-    let Some(candidate) = find_journal_magic(file, start, file_len)
-        .map_err(|error| connection(format!("seek staging recovery candidate: {error}")))?
-    else {
+    let mut scanner = JournalMagicScanner::new(file, file_len)
+        .map_err(|error| connection(format!("seek staging recovery candidate: {error}")))?;
+    let candidate = scanner
+        .next(file, start)
+        .map_err(|error| connection(format!("read staging recovery candidate: {error}")))?;
+    let Some(candidate) = candidate else {
         return Ok(false);
     };
     // This scan is a truncation barrier, not an acceptance path. A

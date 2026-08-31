@@ -300,6 +300,103 @@ pub(super) fn load_generation_footer_from_file(
     Ok(footer)
 }
 
+/// Classify a footer owner in fixed memory before trusting its declared size.
+pub(super) enum GenerationOwnerScan {
+    User,
+    Admitted,
+    Terminal,
+    Malformed(&'static str),
+}
+
+pub(super) fn inspect_generation_footer_owner(
+    path: &Path,
+    file: &mut std::fs::File,
+) -> StorageResult<GenerationOwnerScan> {
+    const EARLY_PREFIX_BYTES: usize = 16 + 2 + 8 + 16 + 8;
+    const OWNER_BYTES: usize = 33;
+    const MINIMUM_PAYLOAD_BYTES: u64 = (EARLY_PREFIX_BYTES + OWNER_BYTES + CHECKSUM_BYTES) as u64;
+    let metadata = file.metadata().map_err(|error| {
+        connection(format!(
+            "inspect staged generation handle {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(connection(format!(
+            "staged generation {} is not a regular file",
+            path.display()
+        )));
+    }
+    let physical_bytes = metadata.len();
+    let Some(trailer_offset) = physical_bytes.checked_sub(FOOTER_BYTES) else {
+        return Ok(GenerationOwnerScan::Terminal);
+    };
+    file.seek(SeekFrom::Start(trailer_offset))
+        .map_err(|error| connection(format!("seek staged generation footer: {error}")))?;
+    let mut trailer = [0_u8; FOOTER_BYTES_USIZE];
+    file.read_exact(&mut trailer)
+        .map_err(|error| connection(format!("read staged generation footer: {error}")))?;
+    if trailer[..16] != FOOTER_MAGIC[..] {
+        return Ok(GenerationOwnerScan::Malformed("footer magic mismatch"));
+    }
+    if u16::from_le_bytes([trailer[16], trailer[17]]) != FOOTER_VERSION {
+        return Ok(GenerationOwnerScan::Malformed(
+            "footer version is unsupported",
+        ));
+    }
+    if trailer[18..24] != [0; 6] {
+        return Ok(GenerationOwnerScan::Malformed(
+            "footer reserved bytes are non-zero",
+        ));
+    }
+    let payload_bytes = u64::from_le_bytes(
+        trailer[24..32]
+            .try_into()
+            .map_err(|_| connection("staged footer length width mismatch".to_owned()))?,
+    );
+    let payload_offset = trailer_offset.checked_sub(payload_bytes).ok_or_else(|| {
+        connection(format!(
+            "staged generation {} footer length exceeds the file",
+            path.display()
+        ))
+    })?;
+    if payload_bytes < MINIMUM_PAYLOAD_BYTES {
+        return Ok(GenerationOwnerScan::Malformed("staged intent is truncated"));
+    }
+    file.seek(SeekFrom::Start(payload_offset))
+        .map_err(|error| connection(format!("seek staged generation owner: {error}")))?;
+    let mut early = [0_u8; EARLY_PREFIX_BYTES];
+    file.read_exact(&mut early)
+        .map_err(|error| connection(format!("read staged generation owner prefix: {error}")))?;
+    if early[..16] != INTENT_MAGIC[..]
+        || u16::from_le_bytes([early[16], early[17]]) != INTENT_VERSION
+    {
+        return Ok(GenerationOwnerScan::Malformed(
+            "staged intent magic or version is invalid",
+        ));
+    }
+    let owner_len = u64::from_le_bytes(
+        early[42..50]
+            .try_into()
+            .expect("fixed-width staging owner length"),
+    );
+    if owner_len != OWNER_BYTES as u64 {
+        return Ok(GenerationOwnerScan::Malformed(
+            "staged owner has invalid length",
+        ));
+    }
+    let mut owner = [0_u8; OWNER_BYTES];
+    file.read_exact(&mut owner)
+        .map_err(|error| connection(format!("read staged generation owner: {error}")))?;
+    match StateOwnerCodecV2.decode(&owner) {
+        Some(crate::principal_state::StateOwner::User(_)) => Ok(GenerationOwnerScan::User),
+        Some(_) => Ok(GenerationOwnerScan::Admitted),
+        None => Ok(GenerationOwnerScan::Malformed(
+            "staged owner is not canonical StateOwner V2",
+        )),
+    }
+}
+
 /// Distinguish the reserved wire tag from malformed or torn staging bytes.
 pub(super) fn is_runtime_forbidden_user_owner(error: &StorageError) -> bool {
     error.to_string().contains(USER_OWNER_NOT_ADMITTED)
