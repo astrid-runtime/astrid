@@ -55,7 +55,7 @@ const DOMAIN_REQUIRED_PASSES: &[&str] = &[
     "authenticated_domains_exchange_bounded_capability_message",
     "peer_fault_wakes_blocked_recv_with_typed_status",
     "cancel_reclaims_blocked_ipc_exactly_once",
-    "running_timer_stop_cancels_and_reclaims_exactly_once",
+    "returned_control_stop_reclaims_exactly_once",
 ];
 
 const EXTRA_REQUIRED_PASSES: &[&str] = &[

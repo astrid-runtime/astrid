@@ -245,9 +245,21 @@ pub fn ev_stop_armed(id: u64, generation: u64) {
     ));
 }
 
+pub fn ev_control_returned(id: u64, generation: u64) {
+    emit(format_args!(
+        "\"ev\":\"domain.control.returned\",\"id\":{id},\"generation\":{generation},\"cpl\":3,\"terminal\":false"
+    ));
+}
+
+pub fn ev_stop_requested(id: u64, generation: u64) {
+    emit(format_args!(
+        "\"ev\":\"domain.stop.request\",\"id\":{id},\"generation\":{generation}"
+    ));
+}
+
 pub fn ev_stop_taken(id: u64, generation: u64, vector: u64) {
     emit(format_args!(
-        "\"ev\":\"domain.stop.taken\",\"id\":{id},\"generation\":{generation},\"source\":\"timer\",\"vector\":{vector},\"cpl\":3"
+        "\"ev\":\"domain.stop.taken\",\"id\":{id},\"generation\":{generation},\"source\":\"returned\",\"vector\":{vector},\"cpl\":0"
     ));
 }
 

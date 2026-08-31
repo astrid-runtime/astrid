@@ -11,6 +11,8 @@ use x86_64::registers::control::Cr3;
 #[cfg(not(test))]
 use super::super::stop::DomainStop;
 #[cfg(not(test))]
+use super::control::LeaseContext;
+#[cfg(not(test))]
 use super::{CURRENT, DomainState, MANAGER, PrepareError};
 #[cfg(not(test))]
 use crate::apic;
@@ -49,6 +51,25 @@ impl StartContext {
             quota_ticks,
             source,
         }
+    }
+}
+
+#[cfg(not(test))]
+impl StartContext {
+    const fn scenario(&self) -> Scenario {
+        self.scenario
+    }
+
+    const fn root(&self) -> u64 {
+        self.root
+    }
+
+    const fn user_stack(&self) -> u64 {
+        self.user_stack
+    }
+
+    const fn source(&self) -> u64 {
+        self.source
     }
 }
 
@@ -140,11 +161,27 @@ pub(in crate::domains) fn start_running(
         if let Some(error) = super::lifecycle_error() {
             return Err(error);
         }
+        let (_, current_flags) = Cr3::read();
+        let control = super::control::Control::admit(
+            handle,
+            manifest_identity,
+            component_id,
+            context.scenario(),
+            LeaseContext::new(
+                context.root(),
+                current_flags.bits(),
+                context.source(),
+                current_flags.bits(),
+                context.user_stack(),
+            ),
+        )
+        .map_err(|_| PrepareError::Bind(BindError::Malformed))?;
         let armed_stop = stop
             .into_armed(handle, manifest_identity, component_id, context.scenario)
             .map_err(|_| PrepareError::Bind(BindError::Malformed))?;
         domain.state = DomainState::Running;
         domain.stop = armed_stop;
+        domain.control = control;
         if context.scenario == crate::domains::types::Scenario::RunningStop {
             serial::ev_stop_armed(handle.id().0 + 1, handle.generation().0);
         }

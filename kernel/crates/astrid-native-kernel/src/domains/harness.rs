@@ -6,7 +6,7 @@ use astrid_system_generation::ContentId;
 use astrid_system_generation::emulator_fixture::EMULATOR_COMPONENT_LEN;
 
 use super::admission;
-use super::manager::{self, CancelError, DomainIdentity, PrepareError};
+use super::manager::{self, CancelError, DomainIdentity, DomainState, PrepareError};
 use super::stage;
 use super::stop;
 use super::types::{BindError, ComponentImage, DomainGeneration, DomainHandle, DomainId};
@@ -31,7 +31,7 @@ const RESTORE_GATE: &str = "exact_kernel_cr3_restore";
 const IPC_EXCHANGE_GATE: &str = "authenticated_domains_exchange_bounded_capability_message";
 const IPC_FAULT_GATE: &str = "peer_fault_wakes_blocked_recv_with_typed_status";
 const IPC_CANCEL_GATE: &str = "cancel_reclaims_blocked_ipc_exactly_once";
-const RUNNING_STOP_GATE: &str = "running_timer_stop_cancels_and_reclaims_exactly_once";
+const RUNNING_STOP_GATE: &str = "returned_control_stop_reclaims_exactly_once";
 
 const PHASE_ENTRY: u64 = 0;
 const PHASE_INVALID_PREPARE: u64 = 1;
@@ -560,12 +560,37 @@ fn completed_stop_is_current_guarded(stop: DomainHandle) -> bool {
 
 fn running_stop_done() -> ! {
     let stop = handle(&IPC_SERVER_HANDLE);
-    let passed = manager::is_stale(stop)
-        && manager::outstanding_frames() == 0
+    let expected = authenticated_component_id();
+    serial::ev_control_returned(stop.id().0 + 1, stop.generation().0);
+    let returned_ok = manager::outstanding_frames() > 0
+        && !manager::is_stale(stop)
+        && manager::staged_state(stop) == Ok(Some((DomainState::Running, Scenario::RunningStop)))
+        && !manager::CURRENT.active.load(Ordering::SeqCst)
+        && manager::CURRENT.root.load(Ordering::SeqCst) == 0
+        && manager::CURRENT.root_flags.load(Ordering::SeqCst) == 0
         && manager::kernel_cr3_restored();
+    if !returned_ok {
+        fail("running_control_return_was_not_quiescent");
+    }
+    let substituted_component = ContentId::from_payload(b"returned-control-substitution");
     let stale = DomainHandle::new(stop.id(), DomainGeneration(stop.generation().0 + 1));
     let foreign_slot = DomainHandle::new(DomainId((stop.id().0 + 1) % 2), stop.generation());
-    let substituted_component = ContentId::from_payload(b"running-stop-substitution");
+    let substitutions_rejected =
+        manager::request_returned_stop(stop, substituted_component, Scenario::RunningStop).is_err()
+            && manager::request_returned_stop(stop, expected, Scenario::Exit).is_err()
+            && manager::request_returned_stop(stale, expected, Scenario::RunningStop).is_err()
+            && manager::request_returned_stop(foreign_slot, expected, Scenario::RunningStop)
+                .is_err()
+            && manager::outstanding_frames() > 0
+            && !manager::is_stale(stop);
+    if !substitutions_rejected {
+        fail("returned_control_substitution_accepted");
+    }
+    let accepted = manager::request_returned_stop(stop, expected, Scenario::RunningStop).is_ok();
+    let passed = accepted
+        && manager::is_stale(stop)
+        && manager::outstanding_frames() == 0
+        && manager::kernel_cr3_restored();
     let suppression_ok = completed_stop_is_current_guarded(stop);
     let exact =
         stop::observe_completed_stop(stop, authenticated_component_id(), Scenario::RunningStop);
