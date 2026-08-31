@@ -2,12 +2,16 @@
 
 use spin::Mutex;
 
-use astrid_system_generation::{ContentId, ManifestIdentity};
+use astrid_system_generation::ContentId;
+#[cfg(not(test))]
+use astrid_system_generation::ManifestIdentity;
 #[cfg(not(test))]
 use core::sync::atomic::Ordering;
 
 #[cfg(not(test))]
 use super::super::admission;
+#[cfg(not(test))]
+use super::super::paging::AddressSpace;
 use super::super::types::{DomainHandle, DomainId, SLOT_CAPACITY, Scenario};
 #[cfg(not(test))]
 use super::CURRENT;
@@ -16,10 +20,55 @@ use super::DomainState;
 use super::MANAGER;
 #[cfg(not(test))]
 use x86_64::registers::control::Cr3;
+#[cfg(not(test))]
+use x86_64::structures::paging::{PhysFrame, Size4KiB};
 
 pub(super) const RESERVED_VECTOR: u8 = 64;
 
-pub(super) type DomainReadiness = Readiness<ManifestIdentity, ContentId>;
+#[cfg(not(test))]
+type HostReadinessIdentity = ManifestIdentity;
+#[cfg(test)]
+type HostReadinessIdentity = ();
+
+pub(super) type DomainReadiness = Readiness<HostReadinessIdentity, ContentId>;
+
+#[cfg(not(test))]
+pub(super) fn cancel_context_matches(space: &AddressSpace) -> bool {
+    let source: (PhysFrame<Size4KiB>, x86_64::registers::control::Cr3Flags) = space.source_root();
+    super::KERNEL_CR3
+        .get()
+        .is_some_and(|expected| *expected == source && Cr3::read() == source)
+}
+
+/// Host tests cannot inspect CR3; state, readiness, release, and all other
+/// cancel semantics remain in the real method.
+#[cfg(test)]
+pub(super) fn cancel_context_matches(_space: &()) -> bool {
+    true
+}
+
+impl super::Manager {
+    pub(super) fn invalidate_admitted_for_terminal(&self, handle: DomainHandle) -> bool {
+        let admitted_state = self
+            .slots
+            .get(handle.id().0 as usize)
+            .and_then(Option::as_ref)
+            .filter(|domain| domain.generation == handle.generation().0)
+            .map(|domain| domain.state);
+        matches!(
+            admitted_state,
+            Some(DomainState::Running | DomainState::Blocked)
+        ) && invalidate_for_terminal(handle)
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReadinessState {
+    Pending,
+    Ready,
+    Invalidated,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReadinessError {
@@ -195,6 +244,24 @@ where
     G: Copy + PartialEq,
     C: Copy + PartialEq,
 {
+    #[cfg(test)]
+    pub(super) const fn state(&self) -> ReadinessState {
+        match self {
+            Self::Pending(_, _) => ReadinessState::Pending,
+            Self::Ready(_, _, _) => ReadinessState::Ready,
+            Self::Invalidated(_, _) => ReadinessState::Invalidated,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) const fn handle(&self) -> Option<DomainHandle> {
+        match self {
+            Self::Pending(ticket, _) | Self::Ready(ticket, _, _) | Self::Invalidated(ticket, _) => {
+                Some(ticket.handle)
+            },
+        }
+    }
+
     pub(super) fn arm(
         handle: DomainHandle,
         manifest_identity: G,
@@ -304,7 +371,7 @@ pub(super) fn clear_slot(slot: DomainId) {
 
 pub(super) fn arm(
     handle: DomainHandle,
-    manifest_identity: ManifestIdentity,
+    manifest_identity: HostReadinessIdentity,
     component_id: ContentId,
     scenario: Scenario,
     lease: LeaseIdentity,
@@ -330,6 +397,46 @@ pub(super) fn arm(
 pub(super) fn invalidate_for_terminal(handle: DomainHandle) -> bool {
     let mut readiness = READINESS.lock();
     slot_readiness_mut(&mut readiness, handle).is_some_and(|record| record.invalidate(handle))
+}
+
+#[cfg(test)]
+pub(super) fn stored_state(handle: DomainHandle) -> Option<ReadinessState> {
+    let readiness = READINESS.lock();
+    let record = readiness
+        .get(handle.id().0 as usize)
+        .and_then(Option::as_ref)?;
+    let state = record.state();
+    (record.handle() == Some(handle)).then_some(state)
+}
+
+#[cfg(test)]
+pub(super) fn install_ready(
+    handle: DomainHandle,
+    manifest_identity: HostReadinessIdentity,
+    component_id: ContentId,
+    scenario: Scenario,
+    lease: LeaseIdentity,
+) -> Result<(), ReadinessError> {
+    let mut readiness = READINESS.lock();
+    let record =
+        slot_readiness_mut(&mut readiness, handle).ok_or(ReadinessError::HandleMismatch)?;
+    record
+        .signal(
+            handle,
+            manifest_identity,
+            component_id,
+            scenario,
+            DomainState::Running,
+            LiveContext::new(
+                3,
+                lease.root,
+                lease.root_flags,
+                lease.stack_end,
+                lease.source,
+                lease.source_flags,
+            ),
+        )
+        .map(|_| ())
 }
 
 fn pending_signal_context(handle: DomainHandle) -> Result<(ContentId, Scenario), ReadinessError> {
@@ -406,7 +513,7 @@ pub(super) fn signal_from_trap(
 #[cfg(not(test))]
 pub(super) fn observe_current(
     handle: DomainHandle,
-) -> Option<ReadinessReceipt<ManifestIdentity, ContentId>> {
+) -> Option<ReadinessReceipt<HostReadinessIdentity, ContentId>> {
     current_live(0).ok()?;
     let scenario = Scenario::try_from(CURRENT.scenario.load(Ordering::SeqCst)).ok()?;
     let (component_id, ready_scenario) = {

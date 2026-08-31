@@ -118,6 +118,9 @@ cargo check -p astrid-boot-selection --no-default-features --target x86_64-unkno
 echo "== stable cargo test -p astrid-system-generation --locked =="
 cargo test -p astrid-system-generation --locked
 
+echo "== stable cargo test -p astrid-system-generation --features emulator-fixture --locked =="
+cargo test -p astrid-system-generation --features emulator-fixture --locked
+
 echo "== stable cargo check -p astrid-system-generation --target x86_64-unknown-none (no default features) =="
 cargo check -p astrid-system-generation --target x86_64-unknown-none --no-default-features --locked
 

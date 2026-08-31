@@ -208,7 +208,7 @@ pub fn handle_domain_trap(frame: &mut TrapFrame, fault_address: u64) -> bool {
     }
     if vector == super::readiness::RESERVED_VECTOR {
         if scenario != Scenario::RunningStop.value() {
-            return true;
+            fail_terminal("readiness_foreign_scenario");
         }
         let handle = super::super::wait::current_handle();
         return match super::readiness::signal_from_trap(handle, frame.cs & 3) {
