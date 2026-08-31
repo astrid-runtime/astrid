@@ -719,49 +719,6 @@ fn diagnostics_launch(
 }
 
 #[cfg(unix)]
-async fn spawn_child_with_inherited_stderr(
-    scratch: &tempfile::TempDir,
-) -> (tokio::process::Child, u32) {
-    let pid_path = scratch.path().join("stderr-holder.pid");
-    let child = tokio::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg("sleep 30 2>&1 & echo $! > \"$1\"")
-        .arg("/bin/sh")
-        .arg(&pid_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn child with inherited stderr");
-    let pid = wait_for_reported_pid(&pid_path)
-        .await
-        .expect("child reported its stderr holder");
-    (child, pid)
-}
-
-#[cfg(unix)]
-async fn wait_for_reported_pid(pid_path: &std::path::Path) -> Result<u32, String> {
-    use std::io::Read as _;
-
-    let started = tokio::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(1);
-    loop {
-        if let Ok(mut file) = std::fs::File::open(pid_path) {
-            let mut contents = String::new();
-            file.read_to_string(&mut contents)
-                .map_err(|error| format!("read stderr-holder PID: {error}"))?;
-            if let Ok(pid) = contents.trim().parse::<u32>() {
-                return Ok(pid);
-            }
-        }
-        if started.elapsed() >= timeout {
-            return Err("child did not report a parseable stderr-holder PID".to_owned());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-}
-
-#[cfg(unix)]
 fn retained_cleanup_state(
     kernel: &Arc<crate::Kernel>,
     binding: &ProcessProjectionBinding,
@@ -802,27 +759,6 @@ fn retained_cleanup_state(
         mount_root,
         cleaned: false,
     }
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn stderr_pid_readiness_ignores_an_initially_empty_file() {
-    let scratch = tempfile::tempdir().expect("PID scratch");
-    let pid_path = scratch.path().join("stderr-holder.pid");
-    std::fs::write(&pid_path, b"").expect("create empty PID file");
-    let writer = tokio::spawn({
-        let pid_path = pid_path.clone();
-        async move {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            std::fs::write(&pid_path, b"123\n").expect("write stderr-holder PID");
-        }
-    });
-
-    let pid = wait_for_reported_pid(&pid_path)
-        .await
-        .expect("empty PID file is not ready content");
-    writer.await.expect("PID writer");
-    assert_eq!(pid, 123);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
