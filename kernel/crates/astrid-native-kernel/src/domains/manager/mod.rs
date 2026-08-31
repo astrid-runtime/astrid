@@ -378,6 +378,7 @@ pub fn prepare(
             .ok_or(PrepareError::GenerationExhausted)?,
         None => 1,
     };
+    readiness::clear_slot(super::types::DomainId(slot as u64));
     let probe = PEER_PROBE + slot as u64 * FRAME_SIZE;
     let space = AddressSpace::new(image, probe).map_err(PrepareError::Paging)?;
     let needed = space.required_frames();
@@ -484,6 +485,9 @@ pub fn peer_is_prepared(handle: DomainHandle) -> bool {
 }
 
 mod control;
+mod readiness;
+#[cfg(test)]
+mod readiness_tests;
 mod start;
 #[cfg(test)]
 mod stop_tests;
@@ -587,6 +591,11 @@ pub fn generation_overflow_rejects_prepare(raw: &[u8], expected: ContentId) -> b
     });
     manager.slots[0] = None;
     rejected && unchanged && manager.used_frames == frames
+}
+
+#[cfg(not(test))]
+pub(in crate::domains) fn readiness_post_terminal_closed(handle: DomainHandle) -> bool {
+    readiness::observe_current(handle).is_none()
 }
 
 impl Manager {
@@ -954,6 +963,10 @@ impl Manager {
         }
         let generation = domain.generation;
         let blocked = domain.state == DomainState::Blocked;
+        let admitted = blocked || domain.state == DomainState::Running;
+        if admitted && !readiness::invalidate_for_terminal(handle) {
+            return Err(CancelError::NotPrepared);
+        }
         serial::ev_domain_cancel_request(handle.id().0 + 1, generation);
         if blocked {
             serial::ev_ipc_wake(handle.id().0 + 1, generation, "cancelled");

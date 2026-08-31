@@ -56,6 +56,10 @@ const DOMAIN_REQUIRED_PASSES: &[&str] = &[
     "peer_fault_wakes_blocked_recv_with_typed_status",
     "cancel_reclaims_blocked_ipc_exactly_once",
     "returned_control_stop_reclaims_exactly_once",
+    "readiness_reserved_cpl3_trap_accepted",
+    "readiness_receipt_bound_to_admission",
+    "readiness_receipt_observed_live",
+    "authenticated_readiness_receipt_exact_once_and_terminal_invalidated",
 ];
 
 const EXTRA_REQUIRED_PASSES: &[&str] = &[

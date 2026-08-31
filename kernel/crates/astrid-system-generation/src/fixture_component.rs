@@ -17,7 +17,7 @@ const _: () = assert!(EMULATOR_COMPONENT_CODE_LEN < 4096);
 /// appended running-guest cancel routine.
 const MACHINE_CODE: [u8; EMULATOR_COMPONENT_CODE_LEN] = [
     0x83, 0xff, 0x05, 0x74, 0x40, 0x83, 0xff, 0x00, 0x74, 0x1f, 0x83, 0xff, 0x01, 0x74, 0x10, 0x83,
-    0xff, 0x02, 0x74, 0x05, 0x83, 0xff, 0x03, 0x74, 0x12, 0xf3, 0x90, 0xeb, 0xfc, 0x0f, 0x0b, 0x31,
+    0xff, 0x02, 0x74, 0x05, 0x83, 0xff, 0x03, 0x74, 0x12, 0xcd, 0x40, 0xf3, 0x90, 0xeb, 0xfc, 0x31,
     0xc0, 0x3e, 0x89, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0xcc, 0xcc, 0x48, 0xb8, 0x00, 0x00, 0x00,
     0x00, 0x80, 0x32, 0x00, 0x00, 0x48, 0x05, 0x00, 0x10, 0x00, 0x00, 0xc7, 0x00, 0x00, 0x00, 0x00,
     0x00, 0xcc, 0x31, 0xc0, 0xcc, 0x0f, 0x0b, 0x83, 0xff, 0x06, 0x74, 0x15, 0x83, 0xff, 0x09, 0x74,
@@ -78,6 +78,33 @@ pub fn emulator_components() -> ComponentSet {
     match ComponentSet::try_from_slice(&[emulator_component_id()]) {
         Ok(components) => components,
         Err(_) => panic!("the emulator fixture contains one valid component identity"),
+    }
+}
+
+#[cfg(test)]
+mod readiness_route_tests {
+    use super::*;
+
+    #[test]
+    fn running_stop_issues_one_reserved_cpl3_trap_then_resumes_pause() {
+        let component = emulator_component();
+        let route = &component[EMULATOR_COMPONENT_HEADER_LEN + 25..];
+        assert_eq!(&route[..6], &[0xcd, 0x40, 0xf3, 0x90, 0xeb, 0xfc]);
+        assert_eq!(u64::from_le_bytes(component[16..24].try_into().unwrap()), 0);
+        assert_eq!(
+            u64::from_le_bytes(component[24..32].try_into().unwrap()),
+            EMULATOR_COMPONENT_HEADER_LEN as u64
+        );
+        assert_eq!(
+            u32::from_le_bytes(component[32..36].try_into().unwrap()),
+            EMULATOR_COMPONENT_CODE_LEN as u32
+        );
+        assert_eq!(u32::from_le_bytes(component[36..40].try_into().unwrap()), 1);
+        assert_eq!(
+            u32::from_le_bytes(component[40..44].try_into().unwrap()),
+            16
+        );
+        assert_eq!(u32::from_le_bytes(component[44..48].try_into().unwrap()), 4);
     }
 }
 

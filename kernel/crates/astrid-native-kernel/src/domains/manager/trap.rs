@@ -10,6 +10,11 @@ use super::{
 use crate::trap::TrapFrame;
 use crate::{apic, gdt, ipc, serial};
 
+const READINESS_TRAP_GATE: &str = "readiness_reserved_cpl3_trap_accepted";
+const READINESS_BOUND_GATE: &str = "readiness_receipt_bound_to_admission";
+const READINESS_OBSERVED_GATE: &str = "readiness_receipt_observed_live";
+const READINESS_REPEAT_GATE: &str = "readiness_repeated_trap_rejected";
+
 fn guest_entry_state_ok(frame: &TrapFrame, scenario: u64) -> bool {
     let (fs, gs) = guest_segment_selectors();
     frame.rdi == scenario
@@ -201,6 +206,32 @@ pub fn handle_domain_trap(frame: &mut TrapFrame, fault_address: u64) -> bool {
     if ipc_cancel_guest_resume(frame).is_some() {
         return true;
     }
+    if vector == super::readiness::RESERVED_VECTOR {
+        if scenario != Scenario::RunningStop.value() {
+            return true;
+        }
+        let handle = super::super::wait::current_handle();
+        return match super::readiness::signal_from_trap(handle, frame.cs & 3) {
+            Ok(_) => {
+                serial::ev_test(READINESS_TRAP_GATE, true);
+                let observed_live = super::readiness::observe_current(handle).is_some();
+                serial::ev_test(READINESS_BOUND_GATE, observed_live);
+                serial::ev_test(READINESS_OBSERVED_GATE, observed_live);
+                if !observed_live {
+                    fail_terminal("readiness_receipt_not_live");
+                }
+                true
+            },
+            Err(
+                error @ (super::readiness::ReadinessError::AlreadySignaled
+                | super::readiness::ReadinessError::Invalidated),
+            ) => {
+                serial::ev_test(READINESS_REPEAT_GATE, true);
+                fail_terminal(error.as_reason())
+            },
+            Err(error) => fail_terminal(error.as_reason()),
+        };
+    }
     if vector == apic::TIMER_VECTOR && scenario == Scenario::RunningStop.value() {
         super::stage_returning_trap(frame).unwrap_or_else(|error| fail_terminal(error.as_reason()));
         apic::mask_timer();
@@ -219,6 +250,11 @@ pub fn handle_domain_trap(frame: &mut TrapFrame, fault_address: u64) -> bool {
     let Some(outcome) = terminal_outcome(frame, scenario, vector) else {
         return true;
     };
+    let readiness_invalidated =
+        super::readiness::invalidate_for_terminal(super::super::wait::current_handle());
+    if !readiness_invalidated {
+        fail_terminal("readiness_terminal_not_invalidated");
+    }
     if !super::super::stop::abort_for_terminal(super::super::wait::current_handle()) {
         fail_terminal("stop_terminal_conflict");
     }

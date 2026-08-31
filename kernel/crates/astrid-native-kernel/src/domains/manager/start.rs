@@ -179,6 +179,19 @@ pub(in crate::domains) fn start_running(
         let armed_stop = stop
             .into_armed(handle, manifest_identity, component_id, context.scenario)
             .map_err(|_| PrepareError::Bind(BindError::Malformed))?;
+        super::readiness::arm(
+            handle,
+            manifest_identity,
+            component_id,
+            context.scenario(),
+            super::readiness::LeaseIdentity::new(
+                context.root(),
+                current_flags.bits(),
+                context.source(),
+                current_flags.bits(),
+                context.user_stack(),
+            ),
+        )?;
         domain.state = DomainState::Running;
         domain.stop = armed_stop;
         domain.control = control;
