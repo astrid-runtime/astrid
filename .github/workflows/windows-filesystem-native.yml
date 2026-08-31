@@ -397,7 +397,15 @@ jobs:
           Get-Item -LiteralPath $stagedProvider, $stagedTestExecutable |
             Select-Object FullName, Length
           $env:ASTRID_PROCESS_PROVIDER_TESTS = "1"
-          & $stagedTestExecutable storage_mount -- --nocapture --test-threads=1
+          & scripts/ci/run-windows-storage-mount.ps1 `
+            -TestExecutable $stagedTestExecutable `
+            -Provider $stagedProvider `
+            -TestFilter storage_mount `
+            -AggregateTimeoutSeconds 600 `
+            -DiagnosticTimeoutSeconds 120 `
+            -ListTimeoutSeconds 60 `
+            -TeardownTimeoutSeconds 30 `
+            -HeartbeatSeconds 30
           if ($LASTEXITCODE -ne 0) {
             throw "the trusted process storage provider tests failed with exit code $LASTEXITCODE"
           }
