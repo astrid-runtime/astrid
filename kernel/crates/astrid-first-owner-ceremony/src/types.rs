@@ -106,8 +106,7 @@ impl RecoveryPolicy {
         let mut values = [None; MAX_RECOVERY_MEMBERS];
         let mut index = 0;
         while index < members.len() {
-            ed25519_dalek::VerifyingKey::from_bytes(&members[index])
-                .map_err(|_| CeremonyError::InvalidRecoveryMemberKey)?;
+            strict_verifying_key(members[index], CeremonyError::InvalidRecoveryMemberKey)?;
             let member = RecoveryMemberId::try_from_bytes(members[index])?;
             if index != 0 {
                 let Some(previous) = values[index - 1] else {
@@ -168,4 +167,15 @@ pub(crate) fn digest(domain: &[u8], parts: &[&[u8]]) -> [u8; KEY_LEN] {
         hasher.update(part);
     }
     *hasher.finalize().as_bytes()
+}
+
+pub(crate) fn strict_verifying_key(
+    bytes: [u8; KEY_LEN],
+    error: CeremonyError,
+) -> Result<(), CeremonyError> {
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&bytes).map_err(|_| error)?;
+    if key.is_weak() {
+        return Err(error);
+    }
+    Ok(())
 }

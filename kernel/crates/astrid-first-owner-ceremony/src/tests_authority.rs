@@ -3,7 +3,80 @@ use crate::error::CeremonyError;
 use crate::machine::{Authority, CeremonyPhase};
 use crate::test_support::{anchor_key, base_input, bytes, fresh_machine, presence_key, transcript};
 use crate::transcript::{Transcript, TranscriptInput};
-use crate::types::{DeviceKey, RecoveryPolicy};
+use crate::types::{AnchorKey, DeviceKey, PresenceKey, RecoveryPolicy};
+
+fn weak_identity() -> [u8; 32] {
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    identity
+}
+
+#[test]
+fn identity_encoding_is_weak_even_though_dalek_parses_it() {
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&weak_identity()).expect("parsed identity");
+    assert!(key.is_weak());
+}
+
+#[test]
+fn weak_small_order_members_are_rejected_before_policy_commitment() {
+    assert_eq!(
+        RecoveryPolicy::try_new(&[weak_identity()], 1),
+        Err(CeremonyError::InvalidRecoveryMemberKey)
+    );
+    assert_eq!(
+        RecoveryPolicy::try_new(&[bytes(101), weak_identity()], 2),
+        Err(CeremonyError::InvalidRecoveryMemberKey)
+    );
+}
+
+#[test]
+fn weak_authority_keys_are_rejected_before_transcript_or_state_acceptance() {
+    #[derive(Clone, Copy, Debug)]
+    enum WeakRole {
+        Owner,
+        Anchor,
+        Presence,
+    }
+
+    let cases = [
+        (WeakRole::Owner, CeremonyError::InvalidDeviceKey),
+        (WeakRole::Anchor, CeremonyError::InvalidAnchorKey),
+        (WeakRole::Presence, CeremonyError::InvalidPresenceKey),
+    ];
+    let policy = RecoveryPolicy::try_new(&[bytes(101), bytes(102)], 2).expect("valid policy");
+
+    for (role, expected) in cases {
+        let mut input = base_input();
+        input.recovery_policy = Some(policy);
+        match role {
+            WeakRole::Owner => {
+                input.owner_device_key =
+                    DeviceKey::try_from_bytes(weak_identity()).expect("non-zero weak bytes")
+            },
+            WeakRole::Anchor => {
+                input.anchor_key =
+                    AnchorKey::try_from_bytes(weak_identity()).expect("non-zero weak bytes")
+            },
+            WeakRole::Presence => {
+                input.presence_key =
+                    PresenceKey::try_from_bytes(weak_identity()).expect("non-zero weak bytes")
+            },
+        }
+
+        assert_eq!(Transcript::try_new(input), Err(expected));
+        let mut machine = fresh_machine();
+        assert_eq!(
+            machine.begin_anchor_pending(
+                input,
+                input.recovery_policy,
+                TwoPartyAttestation::new([0; 64], [0; 64])
+            ),
+            Err(expected)
+        );
+        assert_eq!(machine.phase(), CeremonyPhase::Fresh);
+        assert_eq!(machine.authority(), Authority::None);
+    }
+}
 
 fn input_with_member_alias(authority_seed: u8) -> TranscriptInput {
     let policy = RecoveryPolicy::try_new(&[bytes(authority_seed)], 1).expect("valid member key");

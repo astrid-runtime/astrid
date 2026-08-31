@@ -151,8 +151,7 @@ pub(crate) fn absent_recovery_commitment() -> [u8; KEY_LEN] {
 }
 
 fn validate_key(bytes: [u8; KEY_LEN], error: CeremonyError) -> Result<(), CeremonyError> {
-    ed25519_dalek::VerifyingKey::from_bytes(&bytes).map_err(|_| error)?;
-    Ok(())
+    crate::types::strict_verifying_key(bytes, error)
 }
 
 fn ensure_authority_keys_disjoint(
