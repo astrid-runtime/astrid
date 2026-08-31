@@ -773,6 +773,8 @@ async fn execute_operation(
     let retained_state = Arc::clone(&state);
     #[cfg(all(test, any(unix, windows)))]
     let blocking_worker_gate = state.blocking_worker_gate_for_test();
+    #[cfg(all(test, any(unix, windows)))]
+    let state_for_gate = Arc::clone(&retained_state);
     let (outcome_tx, outcome_rx) = oneshot::channel();
     state.blocking_jobs.lock().await.spawn(async move {
         // The guard moves with the retained job: cancelling the callback
@@ -786,7 +788,9 @@ async fn execute_operation(
         let result = tokio::task::spawn_blocking(move || {
             #[cfg(all(test, any(unix, windows)))]
             if let Some(gate) = blocking_worker_gate {
-                gate.run_worker();
+                gate.run_worker(move || {
+                    state_for_gate.record_drain_failure(BlockingJobDrain::JoinFailed);
+                });
             }
             match target {
                 StorageFilesystemTargetV1::OwnerRoot => {

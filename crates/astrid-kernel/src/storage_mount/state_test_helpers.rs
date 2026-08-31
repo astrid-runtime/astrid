@@ -56,6 +56,11 @@ impl StorageMountLeaseState {
         }
     }
 
+    #[cfg(any(unix, windows))]
+    pub(crate) fn join_failure_is_published_for_test(&self) -> bool {
+        *self.drain_failure_tx.subscribe().borrow()
+    }
+
     pub(crate) fn in_flight_mutations_for_test(&self) -> u64 {
         self.in_flight_mutations.load(Ordering::Acquire)
     }

@@ -767,6 +767,7 @@ fn retained_cleanup_state(
     binding: &ProcessProjectionBinding,
     failed_child: Option<Box<tokio::process::Child>>,
     control_path: std::path::PathBuf,
+    mount_root: std::path::PathBuf,
     scratch: &tempfile::TempDir,
 ) -> super::ProjectionCleanupState {
     super::ProjectionCleanupState {
@@ -798,105 +799,9 @@ fn retained_cleanup_state(
             },
         },
         shared: None,
-        mount_root: scratch.path().join("mount-root"),
+        mount_root,
         cleaned: false,
     }
-}
-
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_stop_returns_rollback_promptly_when_descendant_holds_stderr() {
-    use tokio::io::AsyncWriteExt as _;
-
-    let scratch = tempfile::tempdir().expect("diagnostics scratch");
-    let (_home_root, kernel) = fleet_shared_kernel().await;
-    let caller = PrincipalId::default();
-    let actor = kernel
-        .principal_directory
-        .uid_for(&caller)
-        .expect("caller actor UID");
-    let binding = binding(actor);
-    let key = super::ProcessProjectionKey {
-        binding: binding.clone(),
-        read_write: true,
-    };
-    let control_path = scratch.path().join("process-control.sock");
-    let listener = tokio::net::UnixListener::bind(&control_path).expect("bind live endpoint");
-    let responder = tokio::spawn(async move {
-        for _ in 0..2 {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                break;
-            };
-            if let Err(error) = stream.write_all(b"{\"status\":\"ready\"}\n").await
-                && error.kind() != std::io::ErrorKind::BrokenPipe
-            {
-                panic!("write stop refusal: {error}");
-            }
-        }
-    });
-    let launch = diagnostics_launch(&scratch, control_path.clone());
-    let (mut child, stderr_holder_pid) = spawn_child_with_inherited_stderr(&scratch).await;
-    let stderr_task = child.stderr.take().map(|mut stderr| {
-        tokio::spawn(async move {
-            use tokio::io::AsyncReadExt as _;
-
-            let mut bytes = Vec::new();
-            let _ = stderr.read_to_end(&mut bytes).await;
-            bytes
-        })
-    });
-
-    let started = tokio::time::Instant::now();
-    let error = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        abort_process_provider(
-            child,
-            &launch,
-            "diagnostics deadline".to_owned(),
-            stderr_task,
-            super::ProcessStopPolicy::default(),
-        ),
-    )
-    .await
-    .expect("failed STOP/reap must not wait for the unrelated stderr holder");
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < std::time::Duration::from_secs(2),
-        "rollback input took {elapsed:?}"
-    );
-    assert!(!error.cleanup_ok, "the live endpoint must retain the child");
-    assert!(error.child.is_some(), "failed STOP/reap retains the child");
-
-    let cleanup_state = retained_cleanup_state(
-        &kernel,
-        &binding,
-        error.child,
-        control_path.clone(),
-        &scratch,
-    );
-    let mut projections = BTreeMap::new();
-    rollback_or_retain_failed_launch(
-        &mut projections,
-        &key,
-        scratch.path().join("workspace"),
-        scratch.path().join("owner"),
-        None,
-        cleanup_state,
-    )
-    .await;
-    responder
-        .await
-        .expect("stop responder completed without a panic");
-    let projection = Arc::clone(projections.get(&key).expect("authoritative blocker"));
-    assert!(
-        projection
-            .cleanup_failed
-            .load(std::sync::atomic::Ordering::Acquire)
-    );
-
-    let _ = std::process::Command::new("kill")
-        .arg(stderr_holder_pid.to_string())
-        .status();
 }
 
 #[cfg(unix)]

@@ -24,5 +24,21 @@ pub(crate) fn remove_projection_root(path: &std::path::Path) -> std::io::Result<
             return Err(std::io::Error::from_raw_os_error(5));
         }
     }
-    std::fs::remove_dir_all(path)
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        // An absent exact UUID root is the absence proof required by the
+        // bounded retry; NotFound is not a reason to retain the blocker.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod tests {
+    #[test]
+    fn absent_projection_root_is_successful_absence_proof() {
+        let temporary = tempfile::tempdir().expect("temporary process-storage root");
+        let absent_root = temporary.path().join("absent-uuid");
+        super::remove_projection_root(&absent_root).expect("absence proves cleanup complete");
+    }
 }

@@ -273,6 +273,10 @@ async fn a_later_join_failure_upgrades_a_latched_drain_timeout() {
     gate.arm_panic_on_release();
     gate.release_workers();
     gate.wait_failed(1);
+    assert!(
+        state.join_failure_is_published_for_test(),
+        "the failed-worker wakeup must observe published JoinFailed state"
+    );
     let error = revoke(&kernel, &caller, lease.mount_id).await.unwrap_err();
     assert!(
         error.contains("retained filesystem worker join failed"),

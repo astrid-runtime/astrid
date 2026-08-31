@@ -66,6 +66,60 @@ async fn created_mount_root_failure_retains_and_admits_after_exact_retry() {
     assert!(sole_child_option(&process_root).is_none());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn absent_created_mount_root_retry_proves_exact_absence() {
+    if !process_provider_test_lane_enabled() {
+        println!("skipping absent created-root retry admission: provider unavailable");
+        return;
+    }
+    let test_id = 512_u64;
+    let (_temporary, kernel) = fleet_shared_kernel().await;
+    let caller = PrincipalId::default();
+    let broker = KernelProcessStorageMountBroker::new(Arc::downgrade(&kernel));
+    arm_mount_root_creation_failure_for_test(test_id);
+
+    let Err(failure) = PROCESS_MOUNT_TEST_ID
+        .scope(test_id, broker.mount(&caller))
+        .await
+    else {
+        panic!("the created mount-root fault must fail admission");
+    };
+    assert!(failure.contains("process storage path preparation failed"));
+
+    let process_root = kernel.astrid_home.run_dir().join("process-storage");
+    let stale_root = sole_child(&process_root);
+    assert_root_blocker(&broker, &kernel, &stale_root).await;
+    fail_next_root_removal_for_test(stale_root.clone());
+    std::fs::remove_dir_all(&stale_root).expect("remove the exact failed UUID root");
+    assert!(
+        !stale_root.exists(),
+        "the exact root must be absent before retry"
+    );
+
+    let Err(denied) = broker.mount(&caller).await else {
+        panic!("the failed retry must keep replacement denied until absence is sampled");
+    };
+    assert!(
+        denied.contains("requires administrative cleanup"),
+        "unexpected retained-root denial: {denied}"
+    );
+
+    let replacement = PROCESS_MOUNT_TEST_ID
+        .scope(test_id, broker.mount(&caller))
+        .await
+        .unwrap_or_else(|error| {
+            panic!("exact root absence must admit a fresh projection: {error}")
+        });
+    assert_ne!(
+        replacement.workspace_root.parent(),
+        Some(stale_root.as_path())
+    );
+    replacement.close_async().await;
+    assert!(broker.projections.lock().await.is_empty());
+    assert!(kernel.storage_mounts.is_empty());
+    assert!(sole_child_option(&process_root).is_none());
+}
+
 async fn assert_root_blocker(
     broker: &KernelProcessStorageMountBroker,
     kernel: &Arc<crate::Kernel>,

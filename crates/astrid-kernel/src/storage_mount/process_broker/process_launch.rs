@@ -135,17 +135,19 @@ fn selected_launch_failure(test_id: u64) -> Option<ProcessLaunchStage> {
 
 #[cfg(all(test, any(unix, windows)))]
 fn spawn_long_lived_test_provider() -> Result<tokio::process::Child, ProcessProviderLaunchError> {
+    // The child owns a pipe to this test process and has no independent
+    // timeout. Its lifetime ends only when rollback kills and reaps the exact
+    // retained `Child`, so rollback timing cannot race an arbitrary command
+    // duration.
     let mut command = if cfg!(unix) {
-        let mut command = tokio::process::Command::new("sleep");
-        command.arg("300");
-        command
+        tokio::process::Command::new("cat")
     } else {
-        let mut command = tokio::process::Command::new("ping");
-        command.args(["-n", "301", "127.0.0.1"]);
+        let mut command = tokio::process::Command::new("cmd");
+        command.args(["/C", "findstr", "x"]);
         command
     };
     command
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     command.spawn().map_err(|error| ProcessProviderLaunchError {
