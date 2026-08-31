@@ -99,10 +99,23 @@ build (`undefined symbol: wcslen`). The ring-0 kernel stays on stable
 because bootloader 0.11 requires nightly `-Zbuild-std`. Use `./check.sh`
 for the supported split checks.
 
-kimage host artifacts go in `target/kimage-host`. Nested bootloader
-`cargo install` uses `target/bootloader-nested` via `CARGO_TARGET_DIR`.
-Those directories are distinct so the nested install cannot deadlock on
-the parent target lock.
+`check.sh` and `run.sh` inherit Cargo's effective target directory instead of
+creating a target per worktree. `check.sh` normalizes the configured-unset,
+explicit-relative, or explicit-absolute root once before deriving the nested
+sibling paths. `run.sh` resolves that directory with
+`cargo metadata` (so an unset `CARGO_TARGET_DIR` still honors
+`build.target-dir`) and passes the absolute root to ktest through the internal
+`ASTRID_CARGO_TARGET_ROOT` variable. The kernel build uses that root directly;
+kimage host artifacts go in `<cargo-target>/kimage-host`, and nested bootloader
+`cargo install` uses the distinct `<cargo-target>/bootloader-nested` sibling.
+The exact nested path is passed through `ASTRID_BOOTLOADER_TARGET_DIR`; the
+vendored build script tracks target env changes and never creates a
+`tools/bootloader/target` fallback. Relative explicit overrides are normalized
+against the run's working directory before being handed to ktest. The distinct
+siblings prevent nested install from deadlocking on the parent target lock.
+Direct kimage builds derive the same nested sibling when the orchestration
+variable is absent. `./run.sh --target-layout-only` prints the resolved layout
+without building or booting, which is used by the target regression.
 
 ## What is asserted
 
@@ -168,9 +181,16 @@ remain untrusted advertisements.
   `cargo clippy -p ktest --all-targets --locked -- -D warnings`
 - stable `astrid-native-kernel` for `x86_64-unknown-none`:
   `cargo clippy -p astrid-native-kernel --target x86_64-unknown-none --locked -- -D warnings`
-- pinned nightly `kimage`: `rustup run nightly-2026-07-21 cargo clippy -p kimage --all-targets --locked --target-dir target/kimage-host -- -D warnings`
-  with `CARGO_TARGET_DIR=target/bootloader-nested` so nested
+- pinned nightly `kimage`: `rustup run nightly-2026-07-21 cargo clippy -p kimage --all-targets --locked --target-dir <cargo-target>/kimage-host -- -D warnings`
+  with `CARGO_TARGET_DIR=<cargo-target>/bootloader-nested` so nested
   `cargo install -Zbuild-std` cannot deadlock on the parent lock.
+- target-layout regression: `./test-shared-cargo-target.sh` exercises the
+  `run.sh` → ktest layout with an external configured root (`CARGO_TARGET_DIR`
+  unset), a relative explicit override, and an absolute explicit override;
+  it runs `check.sh x86` through the relative root and builds kimage/nested
+  UEFI in owned temporary roots and rejects
+  `kernel/target` and `tools/bootloader/target` output. Its EXIT trap removes
+  only those validated mktemp roots.
 
 `./run.sh` is the QEMU evidence. Sequential native emulator-image
 packaging determinism reports `PASS`.
@@ -180,7 +200,12 @@ packaging determinism reports `PASS`.
 The dedicated `.github/workflows/native-kernel.yml` workflow runs for pull
 requests targeting `os/universal`. It installs stable 1.95.0 plus
 `nightly-2026-07-21`, sets `KTEST_TOOLCHAIN` to that dated pin, and
-invokes `./check.sh` plus `./run.sh`. It does not install rolling
+configures an external shared Cargo target root while leaving
+`CARGO_TARGET_DIR` unset, then invokes `./check.sh` plus the target-layout
+regression and `./run.sh`. The QEMU job performs the same external-root
+configuration and asserts that its kernel, kimage host, and nested bootloader
+outputs are the exact shared siblings, with neither `kernel/target` nor
+`tools/bootloader/target` created. It does not install rolling
 `nightly`. Root `ci.yml` still targets `main` and does not ingest this
 nested workspace. Do not run `cargo clippy --workspace` here.
 The QEMU job reports `DETERMINISM: PASS` for sequential native

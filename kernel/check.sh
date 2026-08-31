@@ -6,10 +6,52 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")" && pwd)"
 cd "$root"
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/target}"
+# Shell command substitution strips trailing line-feed bytes. The supported
+# shell path contract therefore rejects target roots containing LF or CR before
+# any normalization command substitution can shorten them.
+reject_shell_unsafe_target_root() {
+  local path="$1"
+  if [[ "$path" == *$'\n'* || "$path" == *$'\r'* ]]; then
+    echo "check.sh: target directory contains newline; shell transport rejects newline-bearing roots" >&2
+    exit 1
+  fi
+}
+
+if [[ -z "${CARGO_TARGET_DIR:-}" ]]; then
+  target_root="$(
+    cargo metadata --no-deps --format-version 1 \
+      | python3 -c '
+import json
+import sys
+
+document = json.load(sys.stdin)
+target_directory = document.get("target_directory")
+if not isinstance(target_directory, str) or not target_directory:
+    raise SystemExit("Cargo metadata omitted target_directory")
+if "\n" in target_directory or "\r" in target_directory:
+    raise SystemExit(
+        "Cargo metadata target_directory contains newline; "
+        "shell transport rejects newline-bearing roots"
+    )
+sys.stdout.write(target_directory)
+'
+  )"
+else
+  target_root="$CARGO_TARGET_DIR"
+fi
+reject_shell_unsafe_target_root "$target_root"
+if [[ -z "$target_root" ]]; then
+  echo "check.sh: unable to resolve Cargo target directory" >&2
+  exit 1
+fi
+# Cargo preserves `..` components in relative override metadata output.
+# Normalize the selected root once before deriving any nested target paths.
+CARGO_TARGET_DIR="$(python3 -c 'import os,sys; sys.stdout.write(os.path.abspath(sys.argv[1]))' "$target_root")"
+export CARGO_TARGET_DIR
 toolchain="${KTEST_TOOLCHAIN:-nightly-2026-07-21}"
-host="$root/target/kimage-host"
-nested="$root/target/bootloader-nested"
+host="$CARGO_TARGET_DIR/kimage-host"
+nested="$CARGO_TARGET_DIR/bootloader-nested"
+echo "check.sh: target root=$CARGO_TARGET_DIR host=$host nested=$nested"
 
 mode="${1:-all}"
 if [[ $# -gt 1 ]]; then
@@ -153,8 +195,16 @@ cargo clippy -p astrid-native-kernel --target x86_64-unknown-none --locked -- -D
 
 echo "== nightly cargo clippy -p kimage (isolated target dirs, toolchain=$toolchain) =="
 env -u CARGO_BUILD_TARGET_DIR \
+  ASTRID_BOOTLOADER_TARGET_DIR="$nested" \
   CARGO_TARGET_DIR="$nested" \
   rustup run "$toolchain" cargo clippy -p kimage --all-targets --locked --target-dir "$host" -- -D warnings
+
+for worktree_target in "$root/target" "$root/tools/bootloader/target"; do
+  if [[ -e "$worktree_target" ]]; then
+    echo "check.sh: unexpected per-worktree target directory: $worktree_target" >&2
+    exit 1
+  fi
+done
 
 echo "check.sh: PASS (split checks only; not workspace clippy)"
 
