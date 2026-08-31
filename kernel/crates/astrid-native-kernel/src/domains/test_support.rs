@@ -1,6 +1,6 @@
 //! Host-test fixtures for the production domain authority state.
 
-use super::manager::{Domain, DomainState, MANAGER};
+use super::manager::{Domain, DomainControl, DomainState, MANAGER};
 use super::types::{DomainHandle, Scenario};
 
 pub(crate) fn reset() {
@@ -21,6 +21,7 @@ pub(crate) fn install_blocked(handle: DomainHandle) -> bool {
         space: None,
         ipc_enabled: true,
         stop: super::stop::DomainStop::inactive(),
+        control: DomainControl::inactive(),
     });
     true
 }

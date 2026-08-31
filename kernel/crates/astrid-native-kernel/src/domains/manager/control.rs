@@ -10,10 +10,12 @@ use x86_64::registers::control::Cr3;
 use super::super::types::Outcome;
 use super::super::types::{DomainHandle, Scenario};
 use super::TrapContext;
+#[cfg(not(test))]
 use super::{CURRENT, MANAGER};
 use crate::platform::TrapFrame;
 #[cfg(not(test))]
 use crate::serial;
+#[cfg(not(test))]
 use spin::Mutex;
 
 pub(in crate::domains) type HostManifestIdentity = astrid_system_generation::ManifestIdentity;
@@ -142,6 +144,10 @@ impl LeaseContext {
         self.root == root && self.root_flags == root_flags
     }
 
+    const fn matches_stack(self, stack_end: u64) -> bool {
+        self.stack_end == stack_end
+    }
+
     const fn matches_kernel(self, source: u64, source_flags: u64) -> bool {
         self.source == source && self.source_flags == source_flags
     }
@@ -183,6 +189,7 @@ impl PartialEq for ReturnedRun {
             && self.frame.vector == other.frame.vector
             && self.frame.rip == other.frame.rip
             && self.frame.cs == other.frame.cs
+            && self.frame.rsp == other.frame.rsp
     }
 }
 
@@ -254,6 +261,7 @@ where
         ticket.verify(handle, manifest_identity, component_id, scenario)?;
         if scenario != Scenario::RunningStop
             || !context.matches_current(trap.root, trap.root_flags)
+            || !context.matches_stack(trap.frame.rsp)
             || trap.frame.cs & 3 != 3
         {
             return Err(ControlError::ContextMismatch);
@@ -274,8 +282,14 @@ where
         scenario: Scenario,
         context_guard: ContextGuard,
     ) -> Result<(Self, ReturnedRun), ControlError> {
-        let Self::Returned(returned, ticket, context) = self else {
-            return Err(ControlError::AlreadyRequested);
+        let (returned, ticket, context) = match self {
+            Self::Returned(returned, ticket, context) => (returned, ticket, context),
+            Self::Admitted(_, _) | Self::Inactive => {
+                return Err(ControlError::NotReturned);
+            },
+            Self::StopRequested(_, _, _) => {
+                return Err(ControlError::AlreadyRequested);
+            },
         };
         ticket.verify(handle, manifest_identity, component_id, scenario)?;
         if scenario != Scenario::RunningStop

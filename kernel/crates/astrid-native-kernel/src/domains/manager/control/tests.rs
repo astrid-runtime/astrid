@@ -48,18 +48,28 @@ const fn frame(vector: u64) -> TrapFrame {
         rip: 0x2000,
         cs: 3,
         rflags: 0x202,
-        rsp: 0x4000,
+        rsp: 0xfeed_f000,
         ss: 0x1b,
     }
 }
 
 static TIMER_FRAME: TrapFrame = frame(32);
+const fn frame_with_stack(vector: u64, rsp: u64) -> TrapFrame {
+    let mut frame = frame(vector);
+    frame.rsp = rsp;
+    frame
+}
+static WRONG_STACK_FRAME: TrapFrame = frame_with_stack(32, 0xfeed_e000);
 
 fn snapshot(root: u64) -> TrapSnapshot<'static> {
+    snapshot_with_frame(root, &TIMER_FRAME)
+}
+
+fn snapshot_with_frame(root: u64, frame: &TrapFrame) -> TrapSnapshot<'_> {
     TrapSnapshot {
         root,
         root_flags: 0,
-        frame: &TIMER_FRAME,
+        frame,
     }
 }
 
@@ -162,11 +172,21 @@ fn admitted_lease_binds_exact_dispatch_identity() {
             snapshot(0xfeed_2000),
         )
         .err();
+    let wrong_stack = admitted(0, 4)
+        .return_at_trap(
+            handle(0, 4),
+            MANIFEST,
+            component(),
+            Scenario::RunningStop,
+            snapshot_with_frame(0xfeed_1000, &WRONG_STACK_FRAME),
+        )
+        .err();
     assert_eq!(wrong_handle, Some(ControlError::HandleMismatch));
     assert_eq!(wrong_manifest, Some(ControlError::ManifestMismatch));
     assert_eq!(wrong_component, Some(ControlError::ComponentMismatch));
     assert_eq!(wrong_scenario, Some(ControlError::ScenarioMismatch));
     assert_eq!(wrong_root, Some(ControlError::ContextMismatch));
+    assert_eq!(wrong_stack, Some(ControlError::ContextMismatch));
     assert_eq!(returned(0, 4), returned(0, 4));
 }
 
