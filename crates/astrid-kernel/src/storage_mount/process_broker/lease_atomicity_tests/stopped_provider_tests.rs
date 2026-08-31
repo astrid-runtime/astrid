@@ -957,7 +957,7 @@ async fn historical_detached_pid_shell_holds_stderr_until_explicit_reap() {
     use nix::sys::wait::WaitStatus;
     use std::sync::atomic::Ordering;
 
-    let subreaper = TestChildSubreaper::new();
+    let mut subreaper = TestChildSubreaper::new();
     let scratch = tempfile::tempdir().expect("historical fixture scratch");
     let pid_path = scratch.path().join("stderr-holder.pid");
     let mut shell = OwnedTestChild::new(
