@@ -896,7 +896,7 @@ where
     let mut wal = File::volume(Arc::clone(volume), WAL_FILE, false)?;
     wal::wal_root_owners_without_repair(
         &mut wal,
-        identity.scheme(),
+        identity,
         &SharedPrincipalCodec::new(codec.clone()),
         limits,
     )

@@ -483,3 +483,57 @@ fn rejects_symlink_legacy_volume_without_promoting() {
             .is_symlink()
     );
 }
+
+#[test]
+fn user_in_reclaim_artifact_is_never_promoted_or_deleted() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    home.ensure().unwrap();
+
+    let active_path = home.storage_volume_path();
+    let previous_path = std::path::PathBuf::from(format!("{}.previous", active_path.display()));
+    drop(HostedFileVolume::open(&active_path).unwrap());
+
+    let volume = HostedFileVolume::open(&previous_path).unwrap();
+    let engine = DurableEngine::open_volume(
+        volume.clone(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+        DurableEnginePolicy::default(),
+    )
+    .unwrap();
+    let commit = ObjectRecord::new(
+        ObjectKind::Commit,
+        ObjectFormatVersion::V1,
+        b"user reclaim artifact".to_vec(),
+        Vec::new(),
+        0,
+        ObjectClass::Metadata,
+    )
+    .unwrap();
+    let commit_id = Blake3ObjectIdentityV1.identify(&commit);
+    engine
+        .commit(RootTransaction::new(
+            StateOwner::User(astrid_core::UserUid::from_bytes([61; 32])),
+            None,
+            commit_id,
+            vec![(commit_id, commit)],
+        ))
+        .unwrap();
+    engine.close().unwrap();
+    drop(volume);
+
+    let active_before = std::fs::read(&active_path).unwrap();
+    let previous_before = std::fs::read(&previous_path).unwrap();
+    let error =
+        super::volume_migration::open_existing(&home, DurableEnginePolicy::default()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("explicit user StateOwner; mutation is refused"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&active_path).unwrap(), active_before);
+    assert_eq!(std::fs::read(&previous_path).unwrap(), previous_before);
+}

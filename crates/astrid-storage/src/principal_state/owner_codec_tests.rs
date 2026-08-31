@@ -123,6 +123,101 @@ fn owner_scan_finds_user_after_malformed_root_frame() {
 }
 
 #[test]
+fn root_semantic_malformed_only_fails_closed_without_user() {
+    let source = tempfile::tempdir().unwrap();
+    let engine = DurableEngine::open(
+        source.path(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    let commit = commit_record();
+    let commit_id = Blake3ObjectIdentityV1.identify(&commit);
+    engine
+        .commit(RootTransaction::new(
+            StateOwner::Principal(astrid_core::PrincipalUid::from_bytes([12; 32])),
+            None,
+            commit_id,
+            vec![(commit_id, commit)],
+        ))
+        .unwrap();
+    engine.close().unwrap();
+
+    let path = source.path().join("roots.journal");
+    corrupt_last_byte(&path);
+    let before = std::fs::read(&path).unwrap();
+    let observations = inspect_native_root_history_without_repair::<StateOwner, _>(
+        &path,
+        Blake3ObjectIdentityV1.scheme(),
+        &StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    assert!(observations.owners.is_empty());
+    assert!(observations.scan_error.is_some());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn root_user_wins_when_malformed_evidence_follows() {
+    let source = tempfile::tempdir().unwrap();
+    let engine = DurableEngine::open(
+        source.path(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    let commit = commit_record();
+    let commit_id = Blake3ObjectIdentityV1.identify(&commit);
+    engine
+        .commit(RootTransaction::new(
+            user_owner(),
+            None,
+            commit_id,
+            vec![(commit_id, commit)],
+        ))
+        .unwrap();
+    engine.close().unwrap();
+
+    let malformed_source = tempfile::tempdir().unwrap();
+    let malformed = DurableEngine::open(
+        malformed_source.path(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    let commit = commit_record();
+    let commit_id = Blake3ObjectIdentityV1.identify(&commit);
+    malformed
+        .commit(RootTransaction::new(
+            StateOwner::Principal(astrid_core::PrincipalUid::from_bytes([13; 32])),
+            None,
+            commit_id,
+            vec![(commit_id, commit)],
+        ))
+        .unwrap();
+    malformed.close().unwrap();
+
+    let path = source.path().join("roots.journal");
+    append_file(&malformed_source.path().join("roots.journal"), &path);
+    corrupt_last_byte(&path);
+    let before = std::fs::read(&path).unwrap();
+    let observations = inspect_native_root_history_without_repair::<StateOwner, _>(
+        &path,
+        Blake3ObjectIdentityV1.scheme(),
+        &StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    assert!(observations.owners.contains(&user_owner()));
+    assert!(observations.scan_error.is_some());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
 fn owner_scan_handles_ordinary_multiframe_root_journal() {
     let source = tempfile::tempdir().unwrap();
     let engine = DurableEngine::open(
@@ -266,7 +361,7 @@ fn owner_scan_finds_user_after_malformed_wal_frame() {
 
     let observations = inspect_native_wal_owners_without_repair::<StateOwner, _>(
         &candidate.path().join("transactions.wal"),
-        Blake3ObjectIdentityV1.scheme(),
+        Blake3ObjectIdentityV1,
         &StateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
     )

@@ -21,6 +21,11 @@ mod reclaim;
 mod recover;
 mod stream;
 
+pub(crate) use open::{HostedArtifactProof, HostedProof, HostedProofDecision, HostedProofPhase};
+
+#[cfg(test)]
+pub(crate) use open::HostedArtifactRole;
+
 const VOLUME_MAGIC: [u8; 8] = *b"ASTVOL1\0";
 const RECORD_MAGIC: [u8; 8] = *b"ASTREG1\0";
 const RECORD_FIXED_BYTES: usize = 8 + 8 + 8 + 1 + 2 + 8 + 8 + 32;

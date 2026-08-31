@@ -10,7 +10,10 @@ use super::format::{
     INTENT_MAGIC, INTENT_VERSION, USER_OWNER_NOT_ADMITTED, append_runtime_forbidden_user_footer,
     encode_fields, load_generation_footer_from_file,
 };
-use super::journal::{JOURNAL_HEADER_BYTES, JOURNAL_MAGIC, SEALED_RECORD, refresh_frame_checksum};
+use super::journal::{
+    JOURNAL_HEADER_BYTES, JOURNAL_MAGIC, SEALED_RECORD, refresh_frame_checksum,
+    scan_runtime_forbidden_user_without_repair,
+};
 use super::{
     JOURNAL_FILE, NativeContentStagingArea, QUARANTINE_DIRECTORY, StagedContentId,
     migrate_alias_owner_intents, sealed_generation_name,
@@ -223,4 +226,105 @@ fn current_user_intent_migration_fails_before_write_or_removal() {
     );
     assert_eq!(std::fs::read(&intent_path).unwrap(), bytes);
     assert!(entry.join(super::legacy::INTENT_FILE).exists());
+}
+
+#[test]
+fn staging_user_before_malformed_tail_wins_without_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let area = open_area(directory.path()).unwrap();
+    let mut staged = area
+        .begin(
+            principal_owner(),
+            ContentName::new("user-first.bin").unwrap(),
+            ChunkingProfile::ASTRID_V1,
+        )
+        .unwrap();
+    staged.write_all(b"user first").unwrap();
+    staged.seal().unwrap();
+    drop(area);
+
+    let journal = directory.path().join(JOURNAL_FILE);
+    let owner = StateOwnerCodecV2.encode(&user_owner());
+    let encoded_intent = encode_fields(
+        INTENT_MAGIC,
+        INTENT_VERSION,
+        97,
+        StagedContentId(Uuid::from_u128(97)),
+        &owner,
+        &ContentName::new("user.bin").unwrap(),
+        ChunkingProfile::ASTRID_V1,
+        0,
+        "astrid native content staging intent v2",
+        true,
+    )
+    .unwrap();
+    let mut frame = vec![0_u8; JOURNAL_HEADER_BYTES];
+    frame[..JOURNAL_MAGIC.len()].copy_from_slice(&JOURNAL_MAGIC);
+    frame[8..10].copy_from_slice(&1_u16.to_le_bytes());
+    frame[12..20].copy_from_slice(
+        &u64::try_from(encoded_intent.len() + 1)
+            .unwrap()
+            .to_le_bytes(),
+    );
+    frame.push(SEALED_RECORD);
+    frame.extend_from_slice(&encoded_intent);
+    refresh_frame_checksum(&mut frame).unwrap();
+
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap();
+        file.write_all(&frame).unwrap();
+        file.write_all(b"torn-after-user").unwrap();
+        file.sync_all().unwrap();
+    }
+    let before = std::fs::read(&journal).unwrap();
+
+    let error = open_area(directory.path()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("explicit user owner in staging journal"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&journal).unwrap(), before);
+}
+
+#[test]
+fn staging_preflight_handles_hostile_length_without_proportional_allocation() {
+    let mut journal = tempfile::tempfile().unwrap();
+    let mut frame = vec![0_u8; JOURNAL_HEADER_BYTES];
+    frame[..JOURNAL_MAGIC.len()].copy_from_slice(&JOURNAL_MAGIC);
+    frame[8..10].copy_from_slice(&1_u16.to_le_bytes());
+    frame[12..20].copy_from_slice(&u64::MAX.to_le_bytes());
+    journal.write_all(&frame).unwrap();
+    journal.seek(SeekFrom::Start(0)).unwrap();
+
+    let started = std::time::Instant::now();
+    let scan = scan_runtime_forbidden_user_without_repair(&mut journal).unwrap();
+    assert!(!scan.contains_user);
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}
+
+#[test]
+fn staging_preflight_streams_a_large_valid_name_without_failure() {
+    let name = "large-name.bin".repeat(64 * 1024);
+    let intent = super::format::StagingIntent {
+        sequence: 1,
+        id: StagedContentId(Uuid::from_u128(1)),
+        owner: principal_owner(),
+        name: ContentName::new(name).unwrap(),
+        profile: ChunkingProfile::ASTRID_V1,
+        logical_bytes: 0,
+    };
+    let frame =
+        super::journal::encoded_frame(&super::journal::JournalRecord::Sealed(intent)).unwrap();
+    let mut journal = tempfile::tempfile().unwrap();
+    journal.write_all(&frame).unwrap();
+    journal.seek(SeekFrom::Start(0)).unwrap();
+
+    let scan = scan_runtime_forbidden_user_without_repair(&mut journal).unwrap();
+    assert!(!scan.contains_user);
+    assert!(scan.scan_error.is_none());
 }

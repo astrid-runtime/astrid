@@ -12,24 +12,21 @@ use std::io::{BufWriter, Read, Seek, SeekFrom};
 
 use crate::storage_model::{ModelError, ObjectId, ObjectRecord, RootState};
 
-use super::codec::WAL_MAGIC;
 use super::codec::{
     PHYSICAL_HEADER_LEN, checksum_valid, decode_object_body, decode_object_storage_body,
-    decode_physical_header, decode_record_header, decode_root_body, record_body,
-    validate_logical_body, validate_record_version, wal_physical_limit,
+    decode_physical_header, decode_record_header, record_body, validate_logical_body,
+    validate_record_version, wal_physical_limit,
 };
 use super::scan::WalScanner;
-use super::types::{
-    WalEvent, WalObjectDescriptor, WalRecordKind, WalRootDescriptor, WalRootTransition,
-};
-use super::{WalLimits, durable_error};
+use super::types::{WalEvent, WalObjectDescriptor, WalRootDescriptor, WalRootTransition};
+use super::{WalError, WalLimits, durable_error};
 use crate::engine::durable::format::{append_frames, canonical_record_bytes, encode_object_frame};
 use crate::engine::durable::representations::RepresentationStore;
 use crate::engine::durable::roots::encode_root_record;
 use crate::engine::durable::validation::{ClosureObjects, validate_incremental_closure};
 use crate::engine::durable::{
-    ARENA_MAGIC, ArenaLocation, DurableError, IdentityScheme, PersistentObjectIdentity,
-    PrincipalCodec, ROOT_MAGIC, RecoveryLimits, SharedIdentity, SharedPrincipalCodec,
+    ARENA_MAGIC, ArenaLocation, DurableError, PersistentObjectIdentity, PrincipalCodec, ROOT_MAGIC,
+    RecoveryLimits, SharedIdentity, SharedPrincipalCodec,
 };
 
 /// One scanner-complete transaction retained until its commit marker is seen.
@@ -132,142 +129,63 @@ where
 }
 
 /// Decode root owners from a WAL without consuming or repairing any bytes.
-pub(crate) fn wal_root_owners_without_repair<P, C>(
+pub(crate) fn wal_root_owners_without_repair<P, I, C>(
     wal: &mut File,
-    scheme: IdentityScheme,
+    identity: &I,
     codec: &SharedPrincipalCodec<C>,
     limits: RecoveryLimits,
 ) -> Result<super::super::OwnerObservations<P>, DurableError>
 where
     P: Ord,
-    C: PrincipalCodec<P>,
+    I: PersistentObjectIdentity + Clone,
+    C: PrincipalCodec<P> + Clone,
 {
     let mut owners = BTreeSet::new();
-    let mut bytes = Vec::new();
-    wal.read_to_end(&mut bytes)
-        .map_err(|source| io_error("read ASTWAL2 owner probe", source))?;
-    let file_len = u64::try_from(bytes.len()).map_err(|_| DurableError::EncodingOverflow)?;
     let mut scan_error = None;
-    let mut offset = 0_u64;
-    while offset < file_len {
-        let cursor = usize::try_from(offset).map_err(|_| DurableError::EncodingOverflow)?;
-        if bytes.get(cursor..cursor.saturating_add(WAL_MAGIC.len())) != Some(WAL_MAGIC.as_slice()) {
-            offset = offset
-                .checked_add(1)
-                .ok_or(DurableError::EncodingOverflow)?;
-            continue;
-        }
-        let (next_cursor, owner, candidate_error) =
-            scan_wal_owner_candidate(&bytes, cursor, scheme, codec, limits)?;
-        if let Some(owner) = owner {
-            owners.insert(owner);
-        }
-        if let Some(error) = candidate_error {
-            scan_error.get_or_insert(error);
-        }
-        offset = u64::try_from(next_cursor).map_err(|_| DurableError::EncodingOverflow)?;
-    }
-    Ok(super::super::OwnerObservations { owners, scan_error })
-}
-
-/// Decode one canonical WAL root and return its admitted owner, if present.
-fn scan_wal_owner_candidate<P, C>(
-    bytes: &[u8],
-    cursor: usize,
-    scheme: IdentityScheme,
-    codec: &SharedPrincipalCodec<C>,
-    limits: RecoveryLimits,
-) -> Result<(usize, Option<P>, Option<DurableError>), DurableError>
-where
-    P: Ord,
-    C: PrincipalCodec<P>,
-{
-    let cursor_u64 = u64::try_from(cursor).map_err(|_| DurableError::EncodingOverflow)?;
-    let invalid = |detail: &'static str, cursor: usize| {
-        (
-            cursor.saturating_add(1),
-            None,
-            Some(durable_error(super::types::WalError::Corrupt {
-                offset: super::types::WalOffset::new(u64::try_from(cursor).unwrap_or_default()),
-                detail,
-            })),
-        )
-    };
-    let Some(header) = bytes.get(cursor..cursor.saturating_add(PHYSICAL_HEADER_LEN)) else {
-        return Ok((bytes.len(), None, None));
-    };
-    let header: &[u8; PHYSICAL_HEADER_LEN] = header
-        .try_into()
-        .map_err(|_| DurableError::EncodingOverflow)?;
-    let Ok(physical) = decode_physical_header(header, super::types::WalOffset::new(cursor_u64))
-    else {
-        let (next, owner, error) = invalid("WAL physical header is invalid", cursor);
-        return Ok((next, owner, error));
-    };
-    let payload_start = cursor
-        .checked_add(PHYSICAL_HEADER_LEN)
-        .ok_or(DurableError::EncodingOverflow)?;
-    let frame_end = payload_start
-        .checked_add(
-            usize::try_from(physical.payload_len.get())
-                .map_err(|_| DurableError::EncodingOverflow)?,
-        )
-        .ok_or(DurableError::EncodingOverflow)?;
-    let Some(payload) = bytes.get(payload_start..frame_end) else {
-        let (next, owner, error) = invalid("WAL frame extends past its region", cursor);
-        return Ok((next, owner, error));
-    };
-    if physical.payload_len.get() > wal_physical_limit(limits).length().get() {
-        let (next, owner, error) = invalid("WAL frame exceeds the recovery bound", cursor);
-        return Ok((next, owner, error));
-    }
-    if !checksum_valid(physical, payload) {
-        let (next, owner, error) = invalid("WAL checksum mismatch", cursor);
-        return Ok((next, owner, error));
-    }
-    let record = decode_record_header(payload, super::types::WalOffset::new(cursor_u64))
-        .map_err(durable_error)?;
-    if record.kind != WalRecordKind::Root {
-        return Ok((frame_end, None, None));
-    }
-    let owner = observe_wal_root(
-        payload,
-        scheme,
-        codec,
-        super::types::WalOffset::new(cursor_u64),
-    )?;
-    Ok((frame_end, owner, None))
-}
-
-/// Decode one canonical WAL root and return its admitted owner, if present.
-fn observe_wal_root<P, C>(
-    payload: &[u8],
-    scheme: IdentityScheme,
-    codec: &SharedPrincipalCodec<C>,
-    offset: super::types::WalOffset,
-) -> Result<Option<P>, DurableError>
-where
-    P: Ord,
-    C: PrincipalCodec<P>,
-{
-    let (transition, _) = decode_root_body(
-        &payload[super::codec::RECORD_HEADER_LEN..],
-        scheme,
-        codec,
-        offset,
+    let mut scanner = WalScanner::new(
+        wal.try_clone()
+            .map_err(|source| io_error("clone ASTWAL2 owner probe", source))?,
+        identity.clone(),
+        codec.clone(),
+        limits,
     )
     .map_err(durable_error)?;
-    let principal = codec
-        .decode(transition.principal())
-        .ok_or(DurableError::InvalidPrincipal {
-            offset: offset.get(),
-        })?;
-    if codec.encode(&principal) != transition.principal() {
-        return Err(DurableError::InvalidPrincipal {
-            offset: offset.get(),
-        });
+    loop {
+        match scanner.next_event() {
+            Ok(Some(WalEvent::Root(root))) => {
+                let transition = root.transition();
+                match codec.decode(transition.principal()) {
+                    Some(owner) if codec.encode(&owner) == transition.principal() => {
+                        owners.insert(owner);
+                    },
+                    _ => {
+                        scan_error.get_or_insert(DurableError::InvalidPrincipal {
+                            offset: root.offset().get(),
+                        });
+                    },
+                }
+            },
+            Ok(Some(WalEvent::Tail(tail))) => {
+                scan_error.get_or_insert(durable_error(WalError::Corrupt {
+                    offset: tail.offset,
+                    detail: "WAL ends in an incomplete or invalid tail",
+                }));
+                break;
+            },
+            Ok(Some(_)) => {},
+            Ok(None) => break,
+            Err(error) => {
+                scan_error.get_or_insert(durable_error(error));
+                match scanner.next_physical_candidate().map_err(durable_error)? {
+                    Some(candidate) => scanner
+                        .reset_after_malformed_evidence(candidate)
+                        .map_err(durable_error)?,
+                    None => break,
+                }
+            },
+        }
     }
-    Ok(Some(principal))
+    Ok(super::super::OwnerObservations { owners, scan_error })
 }
 
 /// Replay an existing ASTWAL2 stream and return a writer resumed at its clean

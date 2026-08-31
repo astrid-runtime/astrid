@@ -63,7 +63,7 @@ where
         scan_frames_observing(roots, ROOT_FILE, ROOT_MAGIC, limits, |offset, payload| {
             let record = decode_root_journal_record(payload, scheme)
                 .map_err(|detail| corrupt(ROOT_FILE, offset, detail))?;
-            observe_principals(&mut owners, codec, &record);
+            observe_principals(&mut owners, codec, offset, &record)?;
             Ok(())
         })?;
     Ok(OwnerObservations { owners, scan_error })
@@ -72,8 +72,10 @@ where
 fn observe_principals<P, C>(
     recovered: &mut BTreeSet<P>,
     codec: &C,
+    offset: u64,
     record: &DecodedRootJournalRecord,
-) where
+) -> Result<(), DurableError>
+where
     P: Ord,
     C: PrincipalCodec<P>,
 {
@@ -82,25 +84,38 @@ fn observe_principals<P, C>(
         DecodedRootJournalRecord::Snapshot(entries) => {
             let principals = entries.iter().map(|(principal, _)| principal);
             let principals: Vec<&Vec<u8>> = principals.collect();
-            return principals.into_iter().for_each(|principal| {
-                observe_principal_bytes(recovered, codec, principal);
-            });
+            for principal in principals {
+                observe_principal_bytes(recovered, codec, offset, principal)?;
+            }
+            return Ok(());
         },
     };
     for principal in candidates {
-        observe_principal_bytes(recovered, codec, principal);
+        observe_principal_bytes(recovered, codec, offset, principal)?;
     }
+    Ok(())
 }
 
-fn observe_principal_bytes<P, C>(recovered: &mut BTreeSet<P>, codec: &C, principal: &[u8])
+fn observe_principal_bytes<P, C>(
+    recovered: &mut BTreeSet<P>,
+    codec: &C,
+    offset: u64,
+    principal: &[u8],
+) -> Result<(), DurableError>
 where
     P: Ord,
     C: PrincipalCodec<P>,
 {
-    if let Some(owner) = codec.decode(principal)
-        && codec.encode(&owner) == principal
-    {
-        recovered.insert(owner);
+    match codec.decode(principal) {
+        Some(owner) if codec.encode(&owner) == principal => {
+            recovered.insert(owner);
+            Ok(())
+        },
+        _ => Err(corrupt(
+            ROOT_FILE,
+            offset,
+            "root principal is invalid or noncanonical",
+        )),
     }
 }
 

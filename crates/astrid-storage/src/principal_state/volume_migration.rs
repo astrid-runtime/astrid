@@ -11,6 +11,7 @@ use crate::engine::{
 };
 use crate::error::{StorageError, StorageResult};
 use crate::volume::{AstridVolume, HostedFileVolume, VolumeRegion};
+use crate::volume::{HostedArtifactProof, HostedProofDecision, HostedProofPhase};
 use astrid_core::dirs::AstridHome;
 
 use super::{
@@ -21,23 +22,40 @@ const CUTOVER_RECEIPT_REGION: &str = "system/migrations/directory-store-to-volum
 const MAX_CUTOVER_RECEIPT_BYTES: u64 = 256;
 
 pub(super) fn existing_volume_available(home: &AstridHome) -> StorageResult<bool> {
-    Ok(promote_legacy_volume(home)?.is_some())
+    let canonical = home.storage_volume_path();
+    let legacy = home.legacy_storage_volume_path();
+    let canonical_present = inspect_volume_entry(&canonical)?;
+    let legacy_present = inspect_volume_entry(&legacy)?;
+    if canonical_present && legacy_present {
+        return Err(connection(format!(
+            "Astrid storage has both canonical and legacy volumes: {} and {}",
+            canonical.display(),
+            legacy.display()
+        )));
+    }
+    Ok(canonical_present || legacy_present)
 }
 
 pub(super) fn open_existing(
     home: &AstridHome,
     policy: DurableEnginePolicy<StateOwner>,
 ) -> StorageResult<Option<(RuntimeEngine, String)>> {
-    let Some(path) = promote_legacy_volume(home)? else {
+    let canonical = home.storage_volume_path();
+    let legacy = home.legacy_storage_volume_path();
+    let canonical_present = inspect_volume_entry(&canonical)?;
+    let legacy_present = inspect_volume_entry(&legacy)?;
+    if canonical_present && legacy_present {
+        return Err(connection(format!(
+            "Astrid storage has both canonical and legacy volumes: {} and {}",
+            canonical.display(),
+            legacy.display()
+        )));
+    }
+    if !canonical_present && !legacy_present {
         return Ok(None);
-    };
-    reject_runtime_forbidden_legacy_volume(&path)?;
-    let volume = HostedFileVolume::open(&path).map_err(|error| {
-        connection(format!(
-            "open Astrid storage volume {}: {error}",
-            path.display()
-        ))
-    })?;
+    }
+    let source = legacy_present.then_some(legacy.clone());
+    let volume = open_proved_volume(&canonical, source.as_deref())?;
     let engine = RuntimeEngine::open_volume(
         volume.clone(),
         Blake3ObjectIdentityV1,
@@ -53,56 +71,10 @@ pub(super) fn open_existing(
     Ok(Some((engine, receipt)))
 }
 
-/// Resolve the canonical volume and promote the released legacy path once.
-///
-/// Promotion happens before recovery so the runtime-tree admission walk can
-/// exclude the canonical media file and cannot mistake the legacy file for
-/// ordinary content. Seeing both paths is ambiguous and fails closed.
-fn promote_legacy_volume(home: &AstridHome) -> StorageResult<Option<std::path::PathBuf>> {
-    let canonical = home.storage_volume_path();
-    let legacy = home.legacy_storage_volume_path();
-    let canonical_present = inspect_volume_entry(&canonical)?;
-    let legacy_present = inspect_volume_entry(&legacy)?;
-
-    match (canonical_present, legacy_present) {
-        (true, true) => Err(connection(format!(
-            "Astrid storage has both canonical and legacy volumes: {} and {}",
-            canonical.display(),
-            legacy.display()
-        ))),
-        (true, false) => Ok(Some(canonical)),
-        (false, true) => {
-            reject_runtime_forbidden_legacy_volume(&legacy)?;
-            super::native_io::rename_private_entry(&legacy, &canonical)?;
-            let legacy_parent = legacy.parent().ok_or_else(|| {
-                connection(format!(
-                    "legacy Astrid volume has no parent: {}",
-                    legacy.display()
-                ))
-            })?;
-            super::native_io::sync_directory(legacy_parent)?;
-            super::native_io::sync_directory(home.root())?;
-            Ok(Some(canonical))
-        },
-        (false, false) => Ok(None),
-    }
-}
-
-/// Read the accepted owner grammar without repairing any container evidence.
-///
-/// Canonical User evidence wins over malformed evidence. If no User is seen
-/// and either scan could not prove complete coverage, promotion/open fails
-/// closed before any mutating recovery.
-fn reject_runtime_forbidden_legacy_volume(path: &std::path::Path) -> StorageResult<()> {
-    let volume = HostedFileVolume::inspect_read_only(path).map_err(|error| {
-        connection(format!(
-            "inspect Astrid storage volume without repair {}: {error}",
-            path.display()
-        ))
-    })?;
+fn reject_volume_owners(volume: &Arc<dyn AstridVolume>) -> StorageResult<()> {
     let roots: OwnerObservations<StateOwner> =
         inspect_volume_root_history_without_repair::<StateOwner, StateOwnerCodecV2>(
-            &volume,
+            volume,
             Blake3ObjectIdentityV1.scheme(),
             &StateOwnerCodecV2,
             RecoveryLimits::process_addressable(),
@@ -113,7 +85,7 @@ fn reject_runtime_forbidden_legacy_volume(path: &std::path::Path) -> StorageResu
             ))
         })?;
     let wal_owners = inspect_volume_wal_owners_without_repair::<StateOwner, _, _>(
-        &volume,
+        volume,
         &Blake3ObjectIdentityV1,
         &StateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
@@ -147,6 +119,34 @@ fn reject_runtime_forbidden_legacy_volume(path: &std::path::Path) -> StorageResu
         )));
     }
     Ok(())
+}
+
+fn open_proved_volume(
+    destination: &std::path::Path,
+    legacy: Option<&std::path::Path>,
+) -> StorageResult<Arc<HostedFileVolume>> {
+    let map_error = |error| {
+        connection(format!(
+            "inspect Astrid storage volume without repair {}: {error}",
+            destination.display()
+        ))
+    };
+    let classify = |phase, artifacts: &[HostedArtifactProof]| {
+        for artifact in artifacts {
+            let volume: Arc<dyn AstridVolume> = artifact.volume();
+            if let Err(error) = reject_volume_owners(&volume) {
+                return Ok(HostedProofDecision::Reject(error));
+            }
+        }
+        match phase {
+            HostedProofPhase::Artifacts | HostedProofPhase::Selected => {},
+        }
+        Ok(HostedProofDecision::Accept)
+    };
+    match HostedFileVolume::open_with_owner_proof(destination, legacy, map_error, classify)? {
+        crate::volume::HostedProof::Accepted(volume) => Ok(volume),
+        crate::volume::HostedProof::Rejected(error) => Err(error),
+    }
 }
 
 fn inspect_volume_entry(path: &std::path::Path) -> StorageResult<bool> {

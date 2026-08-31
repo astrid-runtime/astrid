@@ -11,8 +11,8 @@ use super::format::{
     StagingIntent, is_runtime_forbidden_user_owner, load_generation_footer_from_file,
 };
 use super::journal::{
-    JournalRecord, StageKey, StageKey as JournalStageKey, append_records,
-    contains_runtime_forbidden_user_without_repair, flush_journal,
+    JournalRecord, StageKey, StageKey as JournalStageKey, append_records, flush_journal,
+    scan_runtime_forbidden_user_without_repair,
 };
 use super::retirement::{create_marker_in, remove_in as remove_generation_in};
 use super::{
@@ -36,15 +36,21 @@ pub(super) fn reject_runtime_forbidden_staging(
     generations: &PrivateDirectory,
     quarantine: &PrivateDirectory,
 ) -> StorageResult<()> {
-    if root.contains(Path::new(JOURNAL_FILE))?
-        && contains_runtime_forbidden_user_without_repair(
-            &mut root.open_file(Path::new(JOURNAL_FILE))?,
-        )
-        .map_err(|error| connection(format!("inspect staging journal without repair: {error}")))?
-    {
-        return Err(connection(
-            "explicit user owner in staging journal is not runtime-admitted".to_owned(),
-        ));
+    if root.contains(Path::new(JOURNAL_FILE))? {
+        let mut journal = root.open_file(Path::new(JOURNAL_FILE))?;
+        let scan = scan_runtime_forbidden_user_without_repair(&mut journal).map_err(|error| {
+            connection(format!("inspect staging journal without repair: {error}"))
+        })?;
+        if let Some(error) = scan.scan_error {
+            return Err(connection(format!(
+                "staging journal owner preflight could not prove complete coverage: {error}"
+            )));
+        }
+        if scan.contains_user {
+            return Err(connection(
+                "explicit user owner in staging journal is not runtime-admitted".to_owned(),
+            ));
+        }
     }
     for directory in [generations, quarantine] {
         for name in directory.entries()? {

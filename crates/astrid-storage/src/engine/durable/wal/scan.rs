@@ -56,6 +56,7 @@ pub(crate) struct WalScanner<R, I, C, P> {
     codec: C,
     limits: WalLimits,
     offset: u64,
+    next_search_offset: u64,
     last_sequence: Option<WalSequence>,
     active: Option<ActiveScan>,
     finished: bool,
@@ -122,6 +123,7 @@ where
             codec,
             limits,
             offset: 0,
+            next_search_offset: 1,
             last_sequence: None,
             active: None,
             finished: false,
@@ -136,6 +138,7 @@ where
             return Ok(None);
         }
         let record_offset = WalOffset::new(self.offset);
+        self.next_search_offset = self.offset.saturating_add(1);
         let mut header = [0_u8; PHYSICAL_HEADER_LEN];
         let header_bytes = read_prefix(&mut self.reader, &mut header)?;
         if header_bytes == 0 {
@@ -190,6 +193,7 @@ where
                 limit,
             });
         }
+        self.next_search_offset = payload_end;
         let payload_size = payload_len.as_usize()?;
         let mut payload = Vec::new();
         payload
@@ -563,6 +567,32 @@ where
         self.finished = true;
         None
     }
+
+    /// Restart owner observation at a physical frame candidate after malformed
+    /// evidence. Normal replay never uses this lossy mode.
+    pub(super) fn reset_after_malformed_evidence(
+        &mut self,
+        candidate: u64,
+    ) -> Result<(), WalError> {
+        self.reader
+            .seek(SeekFrom::Start(candidate))
+            .map_err(|source| WalError::Io {
+                operation: "seek ASTWAL2 owner resynchronization",
+                source,
+            })?;
+        self.offset = candidate;
+        self.next_search_offset = candidate.saturating_add(1);
+        self.last_sequence = None;
+        self.active = None;
+        self.finished = false;
+        self.resume_offset = None;
+        Ok(())
+    }
+
+    /// Find the next physical candidate after the current attempted frame.
+    pub(super) fn next_physical_candidate(&mut self) -> Result<Option<u64>, WalError> {
+        next_valid_physical_after(&mut self.reader, self.next_search_offset, self.limits)
+    }
 }
 
 fn read_prefix<R: Read>(reader: &mut R, destination: &mut [u8]) -> Result<usize, WalError> {
@@ -631,10 +661,22 @@ fn stream_len_at<R: Seek>(reader: &mut R, restore: u64) -> Result<u64, WalError>
     reason = "interior physical recovery must keep its bounded byte-stream state together"
 )]
 fn has_valid_physical_after<R: Read + Seek>(
-    mut reader: &mut R,
+    reader: &mut R,
     start: u64,
     limits: WalLimits,
 ) -> Result<bool, WalError> {
+    Ok(next_valid_physical_after(reader, start, limits)?.is_some())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "physical recovery keeps candidate seek, decode, and checksum state together"
+)]
+fn next_valid_physical_after<R: Read + Seek>(
+    mut reader: &mut R,
+    start: u64,
+    limits: WalLimits,
+) -> Result<Option<u64>, WalError> {
     let saved = reader.stream_position().map_err(|source| WalError::Io {
         operation: "save ASTWAL2 cursor",
         source,
@@ -701,7 +743,7 @@ fn has_valid_physical_after<R: Read + Seek>(
                     operation: "restore ASTWAL2 cursor",
                     source,
                 })?;
-            return Ok(true);
+            return Ok(Some(candidate));
         }
         if end > file_len {
             candidate = candidate.checked_add(1).ok_or(WalError::CountOverflow {
@@ -729,7 +771,7 @@ fn has_valid_physical_after<R: Read + Seek>(
                     operation: "restore ASTWAL2 cursor",
                     source,
                 })?;
-            return Ok(true);
+            return Ok(Some(candidate));
         }
         candidate = candidate.checked_add(1).ok_or(WalError::CountOverflow {
             field: "candidate offsets",
@@ -741,7 +783,7 @@ fn has_valid_physical_after<R: Read + Seek>(
             operation: "restore ASTWAL2 cursor",
             source,
         })?;
-    Ok(false)
+    Ok(None)
 }
 
 fn read_probe<R: Read>(

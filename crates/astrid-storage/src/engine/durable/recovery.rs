@@ -30,7 +30,7 @@ pub(crate) struct OwnerObservations<P> {
 #[cfg(test)]
 pub(crate) fn inspect_native_wal_owners_without_repair<P, C>(
     path: &Path,
-    scheme: super::IdentityScheme,
+    identity: crate::Blake3ObjectIdentityV1,
     codec: &C,
     limits: RecoveryLimits,
 ) -> Result<OwnerObservations<P>, DurableError>
@@ -43,7 +43,7 @@ where
     );
     wal_root_owners_without_repair(
         &mut wal,
-        scheme,
+        &identity,
         &super::SharedPrincipalCodec::new(codec.clone()),
         limits,
     )
