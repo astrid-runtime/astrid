@@ -132,6 +132,29 @@ fn genesis_fold_requires_boot_previous_root_and_source_root() {
 }
 
 #[test]
+fn open_fold_is_exactly_once_and_identity_bound() {
+    let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff()).unwrap();
+    let genesis = verifier.root();
+    let frame = body(BOOT, 1, 1, Object::None, 0, &[], Some(genesis));
+    let root = expected_root(genesis, 1, &frame);
+
+    // An explicit sequence mismatch fails before opening a folded state.
+    assert!(matches!(
+        verifier.open_fold(2, &frame, &root),
+        Err(FoldFailure::Incomplete(IncompleteReason::SequenceGap))
+    ));
+    assert_eq!((verifier.next_seq(), verifier.root()), (1, genesis));
+
+    let transaction = verifier.open_fold(1, &frame, &root).unwrap();
+    assert_eq!(transaction.receipt().seq(), 1);
+    assert_eq!(transaction.expected_seq(), 1);
+    assert_eq!(transaction.expected_root(), root);
+    transaction.finish(true);
+    assert_eq!(verifier.next_seq(), 2);
+    assert_eq!(verifier.root(), root);
+}
+
+#[test]
 fn tamper_without_a_valid_claimed_root_is_invalid() {
     let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff()).unwrap();
     let frame = body(BOOT, 1, 1, Object::None, 0, &[], Some(verifier.root()));

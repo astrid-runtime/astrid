@@ -9,7 +9,7 @@ use super::types::{
     AuditAuthority, AuditCheckpoint, AuditError, AuditEvent, BootSessionId, KernelSecretEntropy,
 };
 use core::mem::MaybeUninit;
-use native_audit_verifier::SpeculativeFold;
+use native_audit_verifier::FoldedFold;
 pub(crate) struct AuditChain {
     boot: BootSessionId,
     authority: AuditAuthority,
@@ -252,11 +252,14 @@ impl AuditChain {
         verifier: &mut native_audit_verifier::AuditVerifier,
     ) -> Result<AuditObservation, AuditError> {
         self.prepare_verified(event)?;
-        let mut transaction = verifier.speculative();
-        let receipt = transaction
-            .fold(self.record_scratch.frame(), self.record_scratch.root)
+        let transaction = verifier
+            .open_fold(
+                self.record_scratch.seq,
+                self.record_scratch.frame(),
+                &self.record_scratch.root,
+            )
             .map_err(|_| AuditError::RootMismatch)?;
-        self.retire_verified(&mut transaction, receipt.ack_tag())
+        self.retire_verified(transaction)
     }
 
     /// Stages and preflights a record without advancing the chain or opening
@@ -286,30 +289,36 @@ impl AuditChain {
     }
 
     /// Authenticates the independent fold receipt at the relay and finishes
-    /// the verifier transaction only on success. Relay checks mutate nothing
-    /// on failure; explicit rollback restores the two verifier scalars.
+    /// the transaction only on success. The transaction-bound receipt leaves
+    /// no caller-replaceable raw tag; a mismatched staged sequence/root fails
+    /// before relay mutation, and a mismatched frame fails receipt auth.
     pub(super) fn retire_verified(
         &mut self,
-        transaction: &mut SpeculativeFold<'_>,
-        receipt_tag: [u8; root::ROOT_LEN],
+        transaction: FoldedFold<'_>,
     ) -> Result<AuditObservation, AuditError> {
         let seq = self.record_scratch.seq;
         let root = self.record_scratch.root;
         let class = self.record_scratch.class;
+        if transaction.expected_seq() != seq
+            || transaction.expected_root() != root
+            || transaction.receipt().seq() != seq
+            || transaction.receipt().folded_root() != root
+        {
+            transaction.finish(false);
+            return Err(AuditError::RootMismatch);
+        }
         let result = self.relay.publish_retired(
             seq,
             self.record_scratch.frame(),
             root,
             self.record_scratch.mandatory(),
-            receipt_tag,
+            transaction.receipt_tag(),
             self.authority.context(),
         );
+        transaction.finish(result.is_ok());
         if result.is_ok() {
-            transaction.commit();
             self.seq = seq;
             self.root = root;
-        } else {
-            transaction.rollback();
         }
         result.map(|()| AuditObservation { seq, class, root })
     }

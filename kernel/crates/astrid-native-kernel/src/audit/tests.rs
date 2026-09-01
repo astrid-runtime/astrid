@@ -178,7 +178,6 @@ fn rejects_malformed_non_canonical_and_disclosing_inputs() {
         decode(&slack[..=valid.len]),
         Err(AuditError::MalformedFrame)
     ));
-
     let mut bad_class = FrameBuf::new(valid.as_slice());
     let class_index = 4 + 2 + 16 + 8;
     bad_class.bytes[class_index] = 0;
@@ -396,15 +395,14 @@ fn verified_staging_failure_leaves_chain_untouched() {
     chain
         .prepare_verified(&domain_event(AuditClass::DomainAdmit))
         .unwrap();
-    let mut transaction = host_verifier.speculative();
-    let folded = transaction.fold(chain.staged_frame(), [0x12; 32]);
-    assert_eq!(
+    let folded = host_verifier.open_fold(chain.seq() + 1, chain.staged_frame(), &[0x12; 32]);
+    assert!(matches!(
         folded,
         Err(native_audit_verifier::FoldFailure::Invalid(
             native_audit_verifier::InvalidReason::RootMismatch,
         ))
-    );
-    drop(transaction);
+    ));
+    drop(folded);
     assert_eq!((chain.seq(), *chain.root()), before);
     assert_eq!(chain.relay().redeliver().count(), 0);
     assert_eq!(
@@ -414,7 +412,28 @@ fn verified_staging_failure_leaves_chain_untouched() {
 }
 
 #[test]
-fn rejected_receipt_rolls_back_verifier_after_successful_fold() {
+fn transaction_receipt_commits_after_successful_relay_auth() {
+    let chain_boot = boot();
+    let mut chain = genesis_chain(chain_boot);
+    let mut host_verifier = verifier();
+
+    chain
+        .prepare_verified(&domain_event(AuditClass::DomainAdmit))
+        .unwrap();
+    let observation = chain
+        .retire_verified(
+            host_verifier
+                .open_fold(chain.seq() + 1, chain.staged_frame(), chain.staged_root())
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(observation.seq(), 1);
+    assert_eq!((chain.seq(), *chain.root()), (1, *observation.root()));
+    assert_eq!(host_verifier.next_seq(), 2);
+}
+
+#[test]
+fn transaction_receipt_cannot_retire_a_different_staged_frame() {
     let chain_boot = boot();
     let mut chain = genesis_chain(chain_boot);
     let mut host_verifier = verifier();
@@ -422,20 +441,22 @@ fn rejected_receipt_rolls_back_verifier_after_successful_fold() {
     let before = (chain.seq(), *chain.root());
     let verifier_before = (host_verifier.next_seq(), host_verifier.root());
     chain
+        .prepare_verified(&domain_event(AuditClass::DomainCreate))
+        .unwrap();
+    let transaction = host_verifier
+        .open_fold(chain.seq() + 1, chain.staged_frame(), chain.staged_root())
+        .unwrap();
+
+    // Re-stage a different frame at the same sequence/root. The old
+    // transaction receipt is still the only retirement input, but its keyed
+    // authentication no longer matches the staged bytes.
+    chain
         .prepare_verified(&domain_event(AuditClass::DomainAdmit))
         .unwrap();
-    let mut transaction = host_verifier.speculative();
-    let receipt = transaction
-        .fold(chain.staged_frame(), *chain.staged_root())
-        .unwrap();
-    let mut rejected_receipt = receipt.ack_tag();
-    rejected_receipt[0] ^= 1;
-
     assert_eq!(
-        chain.retire_verified(&mut transaction, rejected_receipt),
+        chain.retire_verified(transaction),
         Err(AuditError::RootMismatch)
     );
-    drop(transaction);
     assert_eq!((chain.seq(), *chain.root()), before);
     assert_eq!(chain.relay().redeliver().count(), 0);
     assert_eq!(
@@ -444,10 +465,9 @@ fn rejected_receipt_rolls_back_verifier_after_successful_fold() {
     );
 
     let observation = chain
-        .append_verified(&domain_event(AuditClass::DomainAdmit), &mut host_verifier)
+        .append_verified(&domain_event(AuditClass::DomainCreate), &mut host_verifier)
         .unwrap();
     assert_eq!(observation.seq(), 1);
-    assert_eq!(host_verifier.next_seq(), 2);
 }
 
 #[test]

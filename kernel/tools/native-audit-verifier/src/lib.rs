@@ -402,62 +402,125 @@ pub struct AuditVerifier {
     root_hasher: RootHasher,
     context: AuthContext,
     relay_generation: u64,
+    fold_transaction: Option<FoldTransaction>,
 }
 
-/// A fold whose scalar cursor advances remain uncommitted until the caller
-/// finishes it. This type owns no verification key and is deliberately
-/// move-only; dropping an open transaction restores its cursor.
-pub struct SpeculativeFold<'a> {
-    verifier: &'a mut AuditVerifier,
+struct FoldTransaction {
+    previous_next_seq: u64,
+    previous_root: [u8; 32],
+    receipt: FoldReceipt,
+}
+
+/// An opened, not-yet-folded verifier transaction. It exposes no close,
+/// commit, or rollback operation; folding consumes this state, and dropping
+/// an unfolded transaction restores the saved cursor.
+pub struct OpenFold<'a> {
+    verifier: Option<&'a mut AuditVerifier>,
     previous_next_seq: u64,
     previous_root: [u8; 32],
     finished: bool,
 }
 
-impl SpeculativeFold<'_> {
-    /// Independently folds the staged frame, but leaves the verifier cursor
-    /// open for transaction-level authentication by the kernel relay.
-    pub fn fold(
-        &mut self,
-        frame: &[u8],
-        claimed_root: [u8; 32],
-    ) -> Result<FoldReceipt, FoldFailure> {
-        self.verifier.fold(frame, claimed_root)
+impl Drop for OpenFold<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            if let Some(verifier) = self.verifier.as_mut() {
+                verifier.next_seq = self.previous_next_seq;
+                verifier.root = self.previous_root;
+            }
+            self.finished = true;
+        }
+    }
+}
+
+/// A completed, provisional fold. The caller receives this distinct state only
+/// after exactly one successful fold and must consume it to finish the
+/// verifier transaction. No raw receipt can create or replace this state.
+pub struct FoldedFold<'a> {
+    verifier: &'a mut AuditVerifier,
+    finished: bool,
+}
+
+impl FoldedFold<'_> {
+    /// The sole receipt minted by this transaction.
+    pub fn receipt(&self) -> &FoldReceipt {
+        &self
+            .verifier
+            .fold_transaction
+            .as_ref()
+            .expect("folded state retains its receipt")
+            .receipt
     }
 
-    /// Retains a successful fold and its authenticated receipt.
-    pub fn commit(&mut self) {
-        self.finished = true;
+    /// Exact chain sequence bound at the provisional fold.
+    pub fn expected_seq(&self) -> u64 {
+        self.receipt().seq()
     }
 
-    /// Rejects a successful fold after downstream receipt authentication
-    /// failed. Only the two scalar cursor fields can move backward.
-    pub fn rollback(&mut self) {
-        self.verifier.next_seq = self.previous_next_seq;
-        self.verifier.root = self.previous_root;
+    /// Exact source root bound at the provisional fold.
+    pub fn expected_root(&self) -> [u8; 32] {
+        self.receipt().folded_root()
+    }
+
+    /// Sole keyed acknowledgement tag for the exact folded frame.
+    pub fn receipt_tag(&self) -> [u8; 32] {
+        self.receipt().ack_tag()
+    }
+
+    /// Consumes the folded state. Relay authentication failure restores the
+    /// saved cursor; success retains it. There is no second finish.
+    pub fn finish(mut self, committed: bool) {
+        let transaction = self
+            .verifier
+            .fold_transaction
+            .as_ref()
+            .expect("folded state retains its receipt");
+        if !committed {
+            self.verifier.next_seq = transaction.previous_next_seq;
+            self.verifier.root = transaction.previous_root;
+        }
+        self.verifier.fold_transaction = None;
         self.finished = true;
     }
 }
 
-impl Drop for SpeculativeFold<'_> {
+impl Drop for FoldedFold<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            self.rollback();
+            if let Some(transaction) = self.verifier.fold_transaction.as_ref() {
+                self.verifier.next_seq = transaction.previous_next_seq;
+                self.verifier.root = transaction.previous_root;
+            }
+            self.verifier.fold_transaction = None;
+            self.finished = true;
         }
     }
 }
 
 impl AuditVerifier {
-    /// Opens an explicit verifier transaction. A successful fold advances
-    /// only `next_seq` and `root`; commit it only after the relay has
-    /// authenticated the returned receipt, otherwise roll it back.
-    pub fn speculative(&mut self) -> SpeculativeFold<'_> {
-        SpeculativeFold {
-            previous_next_seq: self.next_seq,
-            previous_root: self.root,
-            verifier: self,
+    /// Opens the first state of an exactly-once verifier transaction. This
+    /// state has no close/commit operation; folding consumes it.
+    pub fn speculative(&mut self) -> OpenFold<'_> {
+        let previous_next_seq = self.next_seq;
+        let previous_root = self.root;
+        OpenFold {
+            verifier: Some(self),
+            previous_next_seq,
+            previous_root,
             finished: false,
         }
+    }
+
+    /// Performs the sole fold against explicit staged sequence/root identity.
+    /// Failure consumes the open state and restores the cursor; success
+    /// returns a distinct transaction-bound folded state.
+    pub fn open_fold<'a>(
+        &'a mut self,
+        expected_seq: u64,
+        frame: &[u8],
+        expected_root: &[u8; 32],
+    ) -> Result<FoldedFold<'a>, FoldFailure> {
+        self.speculative().fold(expected_seq, frame, expected_root)
     }
 
     /// Starts from genesis only after binding the untrusted handoff against
@@ -483,6 +546,7 @@ impl AuditVerifier {
             root_hasher,
             context,
             relay_generation: 1,
+            fold_transaction: None,
         })
     }
 
@@ -506,6 +570,7 @@ impl AuditVerifier {
             root_hasher: RootHasher::new(),
             context,
             relay_generation: checkpoint.relay_generation,
+            fold_transaction: None,
         })
     }
 
@@ -618,5 +683,66 @@ impl Drop for AuditVerifier {
         // The field's own Drop performs the erase; this explicit hook documents
         // that destroying the fold state also destroys the verification anchor.
         self.context.erase();
+    }
+}
+
+impl<'a> OpenFold<'a> {
+    /// Performs the sole fold and consumes the open state. Failure restores
+    /// the saved cursor; success returns a transaction-bound folded state.
+    #[inline(always)]
+    pub fn fold(
+        mut self,
+        expected_seq: u64,
+        frame: &[u8],
+        expected_root: &[u8; 32],
+    ) -> Result<FoldedFold<'a>, FoldFailure> {
+        let verifier = self
+            .verifier
+            .as_mut()
+            .expect("open fold retains its verifier");
+        match verifier.next_seq.cmp(&expected_seq) {
+            core::cmp::Ordering::Less => {
+                self.rollback_without_fold();
+                return Err(FoldFailure::Incomplete(IncompleteReason::SequenceGap));
+            },
+            core::cmp::Ordering::Greater => {
+                self.rollback_without_fold();
+                return Err(FoldFailure::Invalid(InvalidReason::DuplicateOrReorder));
+            },
+            core::cmp::Ordering::Equal => {},
+        }
+
+        let verifier = self.verifier.as_mut().expect("verifier remains open");
+        match verifier.fold(frame, *expected_root) {
+            Ok(receipt) if receipt.seq() == expected_seq => {
+                let verifier = self.verifier.take().expect("verifier remains open");
+                self.finished = true;
+                verifier.fold_transaction = Some(FoldTransaction {
+                    previous_next_seq: self.previous_next_seq,
+                    previous_root: self.previous_root,
+                    receipt,
+                });
+                Ok(FoldedFold {
+                    verifier,
+                    finished: false,
+                })
+            },
+            Ok(_) => {
+                self.rollback_without_fold();
+                Err(FoldFailure::Invalid(InvalidReason::RootMismatch))
+            },
+            Err(error) => {
+                self.rollback_without_fold();
+                Err(error)
+            },
+        }
+    }
+
+    fn rollback_without_fold(&mut self) {
+        if let Some(verifier) = self.verifier.as_mut() {
+            verifier.next_seq = self.previous_next_seq;
+            verifier.root = self.previous_root;
+        }
+        self.finished = true;
     }
 }
