@@ -24,6 +24,7 @@ internal sealed class SelfTest
             JobProcessIdListLayout();
             BoundedProcessIdListQueries();
             PartialEnumerationNeverSatisfiesZero();
+            EmptyHeaderAndReturnLengthBoundaries();
             PrimaryCleanupFailurePreservation(root);
             ExecutableResolution(root);
             AssignmentBeforeExecution(root);
@@ -562,6 +563,74 @@ internal sealed class SelfTest
         }
 
         Console.WriteLine("[selftest] assigned=1/listed=0 was treated as truncation and retried without a false zero");
+    }
+
+    private static void EmptyHeaderAndReturnLengthBoundaries()
+    {
+        using var job = new SafeJobHandle();
+
+        bool EmptySuccess(SafeJobHandle queriedJob, IntPtr buffer, uint capacity, out uint returnLength, out int win32Error)
+        {
+            Marshal.WriteInt32(buffer, 0, 0);
+            Marshal.WriteInt32(buffer, sizeof(int), 0);
+            returnLength = 8;
+            win32Error = 0;
+            return true;
+        }
+
+        var empty = Program.ReadJobProcessIdsForSelfTest(job, EmptySuccess);
+        if (empty.Length != 0)
+        {
+            throw new ControllerException($"a complete empty header returned {empty.Length} IDs");
+        }
+
+        uint[]? shortIds = null;
+        bool ShortHeader(SafeJobHandle queriedJob, IntPtr buffer, uint capacity, out uint returnLength, out int win32Error)
+        {
+            Marshal.WriteInt32(buffer, 0, 0);
+            Marshal.WriteInt32(buffer, sizeof(int), 0);
+            returnLength = 7;
+            win32Error = 0;
+            return true;
+        }
+
+        try
+        {
+            shortIds = Program.ReadJobProcessIdsForSelfTest(job, ShortHeader);
+        }
+        catch (ControllerException)
+        {
+        }
+
+        if (shortIds is not null)
+        {
+            throw new ControllerException("a return shorter than the two-DWORD header was accepted");
+        }
+
+        uint[]? overCapacityIds = null;
+        bool OverCapacityHeader(SafeJobHandle queriedJob, IntPtr buffer, uint capacity, out uint returnLength, out int win32Error)
+        {
+            Marshal.WriteInt32(buffer, 0, 0);
+            Marshal.WriteInt32(buffer, sizeof(int), 0);
+            returnLength = capacity + 1;
+            win32Error = 0;
+            return true;
+        }
+
+        try
+        {
+            overCapacityIds = Program.ReadJobProcessIdsForSelfTest(job, OverCapacityHeader);
+        }
+        catch (ControllerException)
+        {
+        }
+
+        if (overCapacityIds is not null)
+        {
+            throw new ControllerException("a return length greater than buffer capacity was accepted");
+        }
+
+        Console.WriteLine("[selftest] empty returned headers were valid and short/over-capacity returns were rejected");
     }
 
     private static void PrimaryCleanupFailurePreservation(string root)

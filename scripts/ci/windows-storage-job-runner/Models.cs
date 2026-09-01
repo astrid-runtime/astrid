@@ -69,6 +69,7 @@ internal sealed class ControllerException : Exception
 
 internal static class JobProcessList
 {
+    internal const int MinimumReturnedHeaderLength = 8;
     internal const int ProcessIdListOffset = 8;
     internal const int MinimumStructureLength = 16;
     internal const int MaximumBufferLength = 16 * 1024 * 1024;
@@ -157,7 +158,7 @@ internal static class JobProcessList
         uint returnLength,
         out bool truncated)
     {
-        if (returnLength < MinimumStructureLength || returnLength > bufferCapacity)
+        if (returnLength < MinimumReturnedHeaderLength || returnLength > bufferCapacity)
         {
             throw new ControllerException(
                 $"Job Object process ID list return length is unverified: return={returnLength}, capacity={bufferCapacity}");
