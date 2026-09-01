@@ -111,6 +111,22 @@ impl CapsulePackageSnapshot {
     pub const fn generation(&self) -> CapsulePackageGeneration {
         self.generation
     }
+
+    /// Whether this snapshot exactly matches a catalog summary for `id`.
+    ///
+    /// This is the readback guard for callers that list summaries first and
+    /// must reject a concurrent package transition instead of mixing records
+    /// from two owner-root generations.
+    #[must_use]
+    pub fn matches_summary(&self, id: &str, summary: &CapsulePackageSummary) -> bool {
+        summary.id() == id
+            && digest(&self.package.archive) == summary.archive_digest()
+            && self.package.archive.len() as u64 == summary.archive_bytes()
+            && digest(&self.package.metadata) == summary.metadata_digest()
+            && self.package.metadata.len() as u64 == summary.metadata_bytes()
+            && digest(&self.package.authority) == summary.authority_digest()
+            && self.package.authority.len() as u64 == summary.authority_bytes()
+    }
 }
 
 /// Atomic install/remove expectation for one capsule identifier.
@@ -673,6 +689,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(first, retry);
+        let summary = &registry.list(&alice).unwrap()[0];
+        let snapshot = registry
+            .get_snapshot(&alice, summary.id())
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.matches_summary(summary.id(), summary));
+        let mut changed_summary = summary.clone();
+        changed_summary.archive_digest = [0; 32];
+        assert!(!snapshot.matches_summary(summary.id(), &changed_summary));
         assert_eq!(registry.get(&bob, "demo-cap").unwrap(), None);
         drop(registry);
         drop(store);

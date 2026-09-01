@@ -1,27 +1,23 @@
+//! Private principal-owned package read and discovery.
+
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use tracing::warn;
 
-use super::CapsuleVisibility;
+use super::AuthorizedRequest;
+use super::visibility::CapsuleVisibility;
 
 pub(super) fn durable_package_details(
     kernel: &crate::Kernel,
-    owner_uid: Option<astrid_core::identity::PrincipalUid>,
+    authorization: &AuthorizedRequest,
     capsule: &str,
 ) -> (Vec<String>, Option<String>, Option<String>) {
-    let Some(uid) = owner_uid else {
-        return (Vec::new(), None, None);
-    };
-    let Some(store) = kernel.principal_store.as_ref() else {
-        return (Vec::new(), None, None);
-    };
-    let Ok(id) = astrid_capsule_types::CapsuleId::new(capsule.to_owned()) else {
-        return (Vec::new(), None, None);
-    };
-    let owner = astrid_storage::StateOwner::Principal(uid);
-    let Ok(Some(package)) =
-        astrid_capsule_install::read_verified_durable_package_for_owner(store, &owner, id.as_str())
-    else {
+    let Ok(Some(package)) = read_durable_package(kernel, authorization, capsule) else {
+        warn!(
+            security_event = true,
+            capsule, "Durable package metadata denied or failed verification"
+        );
         return (Vec::new(), None, None);
     };
     let mut hashes: Vec<String> = package.metadata().wit_files.values().cloned().collect();
@@ -29,6 +25,23 @@ pub(super) fn durable_package_details(
     hashes.dedup();
     let update_source = verified_remote_update_source(package.metadata().source.as_deref());
     (hashes, package.metadata().wasm_hash.clone(), update_source)
+}
+
+fn read_durable_package(
+    kernel: &crate::Kernel,
+    authorization: &AuthorizedRequest,
+    capsule: &str,
+) -> anyhow::Result<Option<astrid_capsule_install::VerifiedDurableCapsulePackage>> {
+    let uid = authenticated_uid(kernel, authorization)?;
+    let store = Arc::new(
+        kernel
+            .principal_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("principal package store is unavailable"))?
+            .clone(),
+    );
+    astrid_capsule_install::read_durable_capsule_package(&store, uid, capsule)
+        .map(|introspection| Some(introspection.package))
 }
 
 fn verified_remote_update_source(source: Option<&str>) -> Option<String> {
@@ -39,61 +52,85 @@ fn verified_remote_update_source(source: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
-pub(super) async fn inventory_manifest_map(
+fn authenticated_uid(
     kernel: &crate::Kernel,
-    visibility: &CapsuleVisibility,
-) -> BTreeMap<String, astrid_capsule::manifest::CapsuleManifest> {
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    let mut paths = kernel.durable_principal_capsule_paths(&visibility.principal);
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    let mut paths = Vec::new();
-    paths.extend(crate::capsule_discovery_paths_for(
-        &kernel.astrid_home,
-        &kernel.workspace_root,
-        &visibility.principal,
-        &kernel.workspace_layout,
-    ));
-    let workspace_layout = kernel.workspace_layout.clone();
-    let workspace_root = kernel.workspace_root.clone();
-    let discovered = match tokio::task::spawn_blocking(move || {
-        astrid_capsule::discovery::discover_manifests_in_workspace(
-            Some(&paths),
-            Some(&workspace_root),
-            &workspace_layout,
+    authorization: &AuthorizedRequest,
+) -> anyhow::Result<astrid_core::identity::PrincipalUid> {
+    let identity = authorization
+        .authenticated_identity()
+        .map_err(|error| anyhow::anyhow!("authenticated principal identity required: {error}"))?;
+    identity
+        .confirm_live(kernel)
+        .map_err(|error| anyhow::anyhow!("authenticated principal is not live: {error}"))?;
+    Ok(identity.uid)
+}
+
+async fn durable_inventory(
+    kernel: &crate::Kernel,
+    authorization: &AuthorizedRequest,
+) -> anyhow::Result<Vec<astrid_capsule_install::VerifiedDurableCapsulePackage>> {
+    let uid = authenticated_uid(kernel, authorization)?;
+    let store = Arc::new(
+        kernel
+            .principal_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("principal package store is unavailable"))?
+            .clone(),
+    );
+    let packages = tokio::task::spawn_blocking(move || {
+        astrid_capsule_install::list_durable_capsule_packages(&Arc::clone(&store), uid).map(
+            |packages| {
+                packages
+                    .into_iter()
+                    .map(|package| package.package)
+                    .collect::<Vec<_>>()
+            },
         )
     })
     .await
-    {
+    .map_err(|error| anyhow::anyhow!("principal package inventory worker failed: {error}"))?
+    .map_err(|error| anyhow::anyhow!("verify principal package inventory: {error}"))?;
+    Ok(packages)
+}
+
+pub(super) async fn inventory_manifest_map(
+    kernel: &crate::Kernel,
+    authorization: &AuthorizedRequest,
+) -> BTreeMap<String, astrid_capsule::manifest::CapsuleManifest> {
+    let discovered = match durable_inventory(kernel, authorization).await {
         Ok(discovered) => discovered,
         Err(err) => {
-            warn!(error = %err, "Capsule inventory discovery task failed");
+            warn!(
+                security_event = true,
+                error = %err,
+                "Principal package inventory denied or failed verification"
+            );
             Vec::new()
         },
     };
 
+    let visibility = CapsuleVisibility::new(authorization);
     discovered
         .into_iter()
-        .filter_map(|(manifest, _)| {
-            let id = astrid_capsule::capsule::CapsuleId::new(manifest.package.name.clone()).ok()?;
-            visibility.allows(&id).then_some((id.to_string(), manifest))
+        .filter_map(|package| {
+            let id =
+                astrid_capsule::capsule::CapsuleId::new(package.manifest().package.name.clone())
+                    .ok()?;
+            visibility
+                .allows(&id)
+                .then_some((id.to_string(), package.manifest().clone()))
         })
         .collect()
 }
 
 pub(super) async fn visible_inventory_manifests(
     kernel: &crate::Kernel,
-    visibility: &CapsuleVisibility,
+    authorization: &AuthorizedRequest,
 ) -> Vec<astrid_capsule::manifest::CapsuleManifest> {
-    let mut manifests = inventory_manifest_map(kernel, visibility).await;
-    let registry = kernel.capsules.read().await;
-    for capsule in visibility.capsules(&registry) {
-        if visibility.allows(capsule.id()) {
-            manifests
-                .entry(capsule.id().to_string())
-                .or_insert_with(|| capsule.manifest().clone());
-        }
-    }
-    manifests.into_values().collect()
+    inventory_manifest_map(kernel, authorization)
+        .await
+        .into_values()
+        .collect()
 }
 
 #[cfg(test)]

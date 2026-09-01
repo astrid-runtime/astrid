@@ -1,6 +1,7 @@
 //! Tests for `kernel_router/mod.rs`. Split out to keep `mod.rs` under the
 //! 1000-line CI threshold. Included as a `tests` submodule of `kernel_router`.
 
+use super::visibility::CapsuleVisibility;
 use super::*;
 
 use astrid_capsule::capsule::{Capsule, CapsuleId, CapsuleState};
@@ -958,6 +959,17 @@ async fn list_capsules_uses_materialized_inventory_without_runtime_load() {
         },
     );
     write_inventory_manifest(&kernel, &caller, "installed-only", "installed-only-cmd");
+    let stale_host_source = kernel
+        .astrid_home
+        .run_dir()
+        .join("test-install-sources")
+        .join("host-only");
+    std::fs::create_dir_all(&stale_host_source).expect("create host-only source");
+    std::fs::write(
+        stale_host_source.join("Capsule.toml"),
+        "[package]\nname = \"host-only\"\nversion = \"0.0.1\"\n",
+    )
+    .expect("write uninstalled host source");
 
     let response = request_kernel(
         &kernel,
@@ -970,7 +982,11 @@ async fn list_capsules_uses_materialized_inventory_without_runtime_load() {
         panic!("expected materialized inventory list success, got {response:?}");
     };
     let capsules: Vec<String> = serde_json::from_value(value).expect("capsule list shape");
-    assert_eq!(capsules, ["installed-only"]);
+    assert_eq!(
+        capsules,
+        ["installed-only"],
+        "host paths cannot mint inventory"
+    );
     assert!(
         kernel.capsules.read().await.list_for(&caller).is_empty(),
         "listing materialized inventory must not synchronously load capsule runtimes"
@@ -1045,7 +1061,7 @@ async fn device_scope_attenuates_every_capsule_inventory_surface() {
     let (_dir, kernel) = kernel_with_inventory_capsules().await;
     let caller = PrincipalId::new("device-scoped-admin").expect("valid principal");
     seed_capsule_inventory_profile(&kernel, &caller, &["allowed"]).await;
-    let devices = seed_inventory_device_scopes(&kernel, &caller);
+    let devices = seed_inventory_device_scopes(&kernel, &caller).await;
 
     let global_capsules = &["allowed", "default-only"];
     let global_commands = &["allowed-cmd", "default-only-cmd"];
@@ -1123,7 +1139,7 @@ async fn device_scope_attenuates_every_capsule_inventory_surface() {
 async fn capsule_visibility_uses_the_authorized_device_scope_snapshot() {
     let (_dir, kernel) = kernel_with_inventory_capsules().await;
     let caller = PrincipalId::new("device-snapshot-admin").expect("valid principal");
-    let devices = seed_inventory_device_scopes(&kernel, &caller);
+    let devices = seed_inventory_device_scopes(&kernel, &caller).await;
     let authorization = authorize_request(
         &kernel,
         &caller,
@@ -1156,7 +1172,7 @@ async fn capsule_visibility_uses_the_authorized_device_scope_snapshot() {
 async fn device_scope_denials_do_not_expose_key_resolution() {
     let (_dir, kernel) = kernel_with_inventory_capsules().await;
     let caller = PrincipalId::new("device-denial-oracle").expect("valid principal");
-    let devices = seed_inventory_device_scopes(&kernel, &caller);
+    let devices = seed_inventory_device_scopes(&kernel, &caller).await;
     let required = "capsule:list";
 
     let scoped = authorize_request(
@@ -1203,7 +1219,7 @@ struct InventoryDeviceScopes {
     denied_global_list: String,
 }
 
-fn seed_inventory_device_scopes(
+async fn seed_inventory_device_scopes(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
 ) -> InventoryDeviceScopes {
@@ -1248,7 +1264,9 @@ fn seed_inventory_device_scopes(
     };
     profile.auth.methods.push(AuthMethod::Keypair);
     profile.auth.public_keys = vec![full, self_only, global_list, denied_global_list];
+    seed_admitted_principal(kernel, caller).await;
     seed_profile(kernel, caller, &profile);
+    seed_durable_inventory(kernel, caller, &["allowed", "default-only"]);
     devices
 }
 
@@ -1285,6 +1303,7 @@ async fn seed_capsule_inventory_profile(
             .collect(),
         ..Default::default()
     };
+    seed_admitted_principal(kernel, principal).await;
     seed_profile(kernel, principal, &profile);
     let mut reg = kernel.capsules.write().await;
     for capsule in capsules {
@@ -1301,6 +1320,25 @@ async fn seed_capsule_inventory_profile(
             )
             .expect("seed principal capsule runtime");
         }
+    }
+    seed_durable_inventory(kernel, principal, capsules);
+}
+
+async fn seed_admitted_principal(kernel: &Arc<crate::Kernel>, principal: &PrincipalId) {
+    if kernel.principal_directory.uid_for(principal).is_ok() {
+        return;
+    }
+    let key = *blake3::hash(principal.as_str().as_bytes()).as_bytes();
+    kernel
+        .identity_store
+        .create_principal(principal.clone(), key)
+        .await
+        .expect("seed admitted principal identity");
+}
+
+fn seed_durable_inventory(kernel: &Arc<crate::Kernel>, principal: &PrincipalId, capsules: &[&str]) {
+    for capsule in capsules {
+        write_inventory_manifest(kernel, principal, capsule, &format!("{capsule}-cmd"));
     }
 }
 
@@ -1328,6 +1366,13 @@ fn write_inventory_manifest(
             r#"[package]
 name = "{capsule}"
 version = "0.0.1"
+
+[[command]]
+name = "{command}"
+
+[subscribe."test/{capsule}"]
+wit = "opaque"
+handler = "handle"
 "#
         ),
     )
