@@ -29,12 +29,12 @@ pub(crate) struct RunArgs {
     /// Output format: `pretty` (default), `json`, or `stream-json`.
     #[arg(long, default_value = "pretty")]
     pub format: String,
-    /// Seconds to wait for the next active-run message. Overrides
-    /// `timeouts.run_idle_secs`; it is not a whole-request deadline.
+    /// Seconds to wait for the next active-run message. Overrides the
+    /// client configuration; it is not a whole-request deadline.
     #[arg(
         long = "idle-timeout-secs",
         value_name = "SECONDS",
-        value_parser = clap::value_parser!(u64).range(1..=headless::MAX_RUN_IDLE_TIMEOUT_SECS)
+        value_parser = clap::value_parser!(u64).range(1..=astrid_config::MAX_RUN_IDLE_TIMEOUT_SECS)
     )]
     pub idle_timeout_secs: Option<u64>,
 }
@@ -45,16 +45,15 @@ pub(crate) async fn run(args: RunArgs) -> Result<ExitCode> {
         "json" | "stream-json" => OutputFormat::Json,
         _ => OutputFormat::Pretty,
     };
-    let workspace_root = std::env::current_dir().ok();
-    let resolved = astrid_config::Config::load_with_layout(
-        workspace_root.as_deref(),
-        crate::workspace_layout::current(),
-    )
-    .context("failed to load configuration")?;
-    let idle_timeout_secs = resolve_idle_timeout_secs(
-        args.idle_timeout_secs,
-        resolved.config.timeouts.run_idle_secs,
-    );
+    let client_path = if args.idle_timeout_secs.is_none() {
+        astrid_config::client::production_client_config_path()
+            .context("failed to resolve client configuration")?
+    } else {
+        None
+    };
+    let idle_timeout_secs =
+        resolve_idle_timeout_secs(args.idle_timeout_secs, client_path.as_deref())
+            .context("failed to resolve client idle timeout")?;
     let idle_timeout = headless::idle_timeout(idle_timeout_secs)?;
 
     let code = headless::run_headless_with_timeout(
@@ -69,9 +68,12 @@ pub(crate) async fn run(args: RunArgs) -> Result<ExitCode> {
     Ok(ExitCode::from(code))
 }
 
-/// An explicit invocation wins; otherwise use the resolved operator config.
-fn resolve_idle_timeout_secs(explicit: Option<u64>, configured: u64) -> u64 {
-    explicit.unwrap_or(configured)
+/// An explicit invocation wins; otherwise load the isolated client file.
+fn resolve_idle_timeout_secs(
+    explicit: Option<u64>,
+    client_path: Option<&std::path::Path>,
+) -> Result<u64> {
+    astrid_config::client::resolve_run_idle_timeout(explicit, client_path).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -101,10 +103,11 @@ mod tests {
     }
 
     #[test]
-    fn explicit_idle_timeout_wins_over_resolved_config() {
-        assert_eq!(resolve_idle_timeout_secs(Some(300), 120), 300);
-        assert_eq!(resolve_idle_timeout_secs(None, 120), 120);
-        assert_eq!(resolve_idle_timeout_secs(None, 600), 600);
+    fn explicit_idle_timeout_bypasses_client_path_resolution() {
+        assert_eq!(
+            resolve_idle_timeout_secs(Some(300), Some(std::path::Path::new("/missing"))).unwrap(),
+            300
+        );
     }
 
     #[test]

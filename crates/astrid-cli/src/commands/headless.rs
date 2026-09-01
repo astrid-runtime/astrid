@@ -8,14 +8,16 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use thiserror::Error;
 
+use astrid_config::MAX_RUN_IDLE_TIMEOUT_SECS;
+
 use super::daemon;
 use crate::{formatter, socket_client, tui};
 
 /// The established headless timeout exit code.
 pub(crate) const TIMEOUT_EXIT_CODE: u8 = 53;
 const SUCCESS_EXIT_CODE: u8 = 0;
-/// A hard ceiling that permits long cold starts but rejects unbounded waits.
-pub(crate) const MAX_RUN_IDLE_TIMEOUT_SECS: u64 = 86_400;
+/// Best-effort budget for sends during collection cleanup and normal exit.
+const MESSAGE_SEND_BUDGET: Duration = Duration::from_secs(5);
 
 /// Why response collection stopped without a terminal response.
 #[derive(Debug, Error)]
@@ -47,10 +49,11 @@ pub(crate) fn idle_timeout(timeout_secs: u64) -> Result<Duration> {
 
 /// Source of daemon messages consumed by headless response collection.
 pub(crate) trait ResponseSource {
-    /// Read the next daemon message.
-    fn read_message(
+    /// Read the next daemon message or report timeout at the source boundary.
+    fn read_message_before(
         &mut self,
-    ) -> impl Future<Output = Result<Option<astrid_types::ipc::IpcMessage>>> + Send;
+        remaining: Duration,
+    ) -> impl Future<Output = ReadOutcome> + Send;
 
     /// Send a message to the daemon.
     fn send_message(
@@ -59,18 +62,26 @@ pub(crate) trait ResponseSource {
     ) -> impl Future<Output = Result<()>> + Send;
 }
 
+/// A deterministic read outcome used to apply the idle deadline at the source.
+pub(crate) enum ReadOutcome {
+    Message(Box<astrid_types::ipc::IpcMessage>),
+    Closed,
+    Timeout,
+    Error(anyhow::Error),
+}
+
 impl ResponseSource for socket_client::SocketClient {
-    fn read_message(
-        &mut self,
-    ) -> impl Future<Output = Result<Option<astrid_types::ipc::IpcMessage>>> + Send {
-        socket_client::SocketClient::read_message(self)
+    async fn read_message_before(&mut self, remaining: Duration) -> ReadOutcome {
+        match tokio::time::timeout(remaining, self.read_message()).await {
+            Ok(Ok(Some(message))) => ReadOutcome::Message(Box::new(message)),
+            Ok(Ok(None)) => ReadOutcome::Closed,
+            Ok(Err(error)) => ReadOutcome::Error(error),
+            Err(_) => ReadOutcome::Timeout,
+        }
     }
 
-    fn send_message(
-        &mut self,
-        message: astrid_types::ipc::IpcMessage,
-    ) -> impl Future<Output = Result<()>> + Send {
-        socket_client::SocketClient::send_message(self, message)
+    async fn send_message(&mut self, message: astrid_types::ipc::IpcMessage) -> Result<()> {
+        socket_client::SocketClient::send_message(self, message).await
     }
 }
 
@@ -257,7 +268,23 @@ pub(crate) async fn run_headless_with_timeout(
     Ok(SUCCESS_EXIT_CODE)
 }
 
+async fn send_message_bounded(
+    client: &mut impl ResponseSource,
+    message: astrid_types::ipc::IpcMessage,
+    budget: Duration,
+) {
+    let _ = tokio::time::timeout(budget, client.send_message(message)).await;
+}
+
 async fn send_disconnect(client: &mut impl ResponseSource, session_id: &astrid_core::SessionId) {
+    send_disconnect_with_budget(client, session_id, MESSAGE_SEND_BUDGET).await;
+}
+
+async fn send_disconnect_with_budget(
+    client: &mut impl ResponseSource,
+    session_id: &astrid_core::SessionId,
+    budget: Duration,
+) {
     let disconnect = astrid_types::ipc::IpcMessage::new(
         astrid_types::Topic::client_disconnect(),
         astrid_types::ipc::IpcPayload::Disconnect {
@@ -265,7 +292,7 @@ async fn send_disconnect(client: &mut impl ResponseSource, session_id: &astrid_c
         },
         session_id.0,
     );
-    let _ = client.send_message(disconnect).await;
+    send_message_bounded(client, disconnect, budget).await;
 }
 
 /// Ensure an idle timeout performs cleanup before its typed error propagates.
@@ -276,16 +303,36 @@ async fn collect_response_with_cleanup(
     auto_approve: bool,
     idle_timeout: Duration,
 ) -> std::result::Result<(String, Vec<serde_json::Value>), HeadlessError> {
+    collect_response_with_cleanup_budget(
+        client,
+        session_id,
+        format,
+        auto_approve,
+        idle_timeout,
+        MESSAGE_SEND_BUDGET,
+    )
+    .await
+}
+
+async fn collect_response_with_cleanup_budget(
+    client: &mut impl ResponseSource,
+    session_id: &astrid_core::SessionId,
+    format: formatter::OutputFormat,
+    auto_approve: bool,
+    idle_timeout: Duration,
+    send_budget: Duration,
+) -> std::result::Result<(String, Vec<serde_json::Value>), HeadlessError> {
     let collected = collect_response(client, session_id, format, auto_approve, idle_timeout).await;
     if let Err(HeadlessError::IdleTimeout { .. }) = &collected {
-        send_disconnect(client, session_id).await;
+        send_disconnect_with_budget(client, session_id, send_budget).await;
     }
     collected
 }
 
 /// Collect the streaming response from the daemon in headless mode.
 ///
-/// Returns `(response_text, tool_calls)`. Auto-denies any approval requests.
+/// Returns `(response_text, tool_calls)`. Auto-answers only approvals correlated
+/// to this run; same-principal frames from another run are left untouched.
 /// The deadline applies only to gaps between active-run messages.
 async fn collect_response(
     client: &mut impl ResponseSource,
@@ -305,13 +352,15 @@ async fn collect_response(
         if remaining.is_zero() {
             return Err(HeadlessError::IdleTimeout { timeout_secs });
         }
-        let message = match tokio::time::timeout(remaining, client.read_message()).await {
-            Ok(Ok(Some(msg))) => msg,
-            Ok(Ok(None)) => break,
-            Ok(Err(e)) => {
-                return Err(HeadlessError::Read(e.context("Failed to read from daemon")));
+        let message = match client.read_message_before(remaining).await {
+            ReadOutcome::Message(message) => message,
+            ReadOutcome::Closed => break,
+            ReadOutcome::Error(error) => {
+                return Err(HeadlessError::Read(
+                    error.context("Failed to read from daemon"),
+                ));
             },
-            Err(_) => return Err(HeadlessError::IdleTimeout { timeout_secs }),
+            ReadOutcome::Timeout => return Err(HeadlessError::IdleTimeout { timeout_secs }),
         };
 
         if !is_active_run_message(&message, session_id) {
@@ -372,7 +421,7 @@ async fn collect_response(
                 };
                 let topic = astrid_types::Topic::approval_response(request_id);
                 let msg = astrid_types::ipc::IpcMessage::new(topic, response, session_id.0);
-                client.send_message(msg).await?;
+                send_message_bounded(client, msg, MESSAGE_SEND_BUDGET).await;
             },
             _ => {},
         }
@@ -390,222 +439,20 @@ fn is_active_run_message(
         astrid_types::ipc::IpcPayload::AgentResponse {
             session_id: target, ..
         } => target == &session_id.0.to_string(),
+        astrid_types::ipc::IpcPayload::RawJson(value) => {
+            message.topic.as_str() == astrid_types::Topic::agent_stream_delta().as_str()
+                && value.get("session_id").and_then(serde_json::Value::as_str)
+                    == Some(session_id.0.to_string().as_str())
+        },
         astrid_types::ipc::IpcPayload::LlmStreamEvent { .. }
         | astrid_types::ipc::IpcPayload::ToolExecuteResult { .. }
-        | astrid_types::ipc::IpcPayload::ApprovalRequired { .. } => true,
+        | astrid_types::ipc::IpcPayload::ApprovalRequired { .. } => {
+            message.source_id == session_id.0
+        },
         _ => false,
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::VecDeque;
-    use std::future::pending;
-
-    use astrid_core::SessionId;
-    use astrid_types::Topic;
-    use astrid_types::ipc::{IpcMessage, IpcPayload};
-    use uuid::Uuid;
-
-    use super::*;
-
-    struct QueuedSource(VecDeque<Result<Option<IpcMessage>>>);
-
-    impl ResponseSource for QueuedSource {
-        async fn read_message(&mut self) -> Result<Option<IpcMessage>> {
-            match self.0.pop_front() {
-                Some(next) => next,
-                None => pending().await,
-            }
-        }
-
-        async fn send_message(&mut self, _message: IpcMessage) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    fn response(text: &str, is_final: bool, session_id: &SessionId) -> IpcMessage {
-        IpcMessage::new(
-            Topic::agent_response(),
-            IpcPayload::AgentResponse {
-                text: text.to_owned(),
-                is_final,
-                session_id: session_id.0.to_string(),
-            },
-            session_id.0,
-        )
-    }
-
-    struct DelayedResponses {
-        delay: Duration,
-        remaining: u8,
-        session_id: SessionId,
-    }
-
-    impl ResponseSource for DelayedResponses {
-        async fn read_message(&mut self) -> Result<Option<IpcMessage>> {
-            if self.remaining > 0 {
-                self.remaining = self.remaining.saturating_sub(1);
-                let delay = self.delay;
-                let session_id = self.session_id.clone();
-                tokio::time::sleep(delay).await;
-                Ok(Some(response("keepalive", false, &session_id)))
-            } else {
-                let session_id = self.session_id.clone();
-                Ok(Some(response("done", true, &session_id)))
-            }
-        }
-
-        async fn send_message(&mut self, _message: IpcMessage) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    struct ForeignThenLate {
-        delay: Duration,
-        session_id: SessionId,
-        sent_foreign: bool,
-    }
-
-    struct SilentSource {
-        sent_disconnect: bool,
-    }
-
-    impl ResponseSource for SilentSource {
-        async fn read_message(&mut self) -> Result<Option<IpcMessage>> {
-            pending().await
-        }
-
-        async fn send_message(&mut self, message: IpcMessage) -> Result<()> {
-            self.sent_disconnect = matches!(message.payload, IpcPayload::Disconnect { .. });
-            Ok(())
-        }
-    }
-
-    impl ResponseSource for ForeignThenLate {
-        async fn read_message(&mut self) -> Result<Option<IpcMessage>> {
-            if self.sent_foreign {
-                let delay = self.delay;
-                let session_id = self.session_id.clone();
-                tokio::time::sleep(delay).await;
-                Ok(Some(response("late", true, &session_id)))
-            } else {
-                self.sent_foreign = true;
-                let message = foreign_message(&self.session_id);
-                Ok(Some(message))
-            }
-        }
-
-        async fn send_message(&mut self, _message: IpcMessage) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    fn foreign_message(session_id: &SessionId) -> IpcMessage {
-        IpcMessage::new(
-            Topic::from_raw("registry.v1.active_model_changed"),
-            IpcPayload::RawJson(serde_json::json!({"model": "other"})),
-            session_id.0,
-        )
-    }
-
-    #[test]
-    fn idle_timeout_preserves_default_and_fails_closed() {
-        assert!(matches!(idle_timeout(120), Ok(timeout) if timeout == Duration::from_mins(2)));
-        assert!(idle_timeout(0).is_err());
-        assert!(idle_timeout(u64::MAX).is_err());
-        assert!(idle_timeout(86_401).is_err());
-    }
-
-    #[tokio::test]
-    async fn delayed_active_run_message_resets_the_idle_deadline() {
-        let session_id = SessionId::from_uuid(Uuid::new_v4());
-        let mut source = DelayedResponses {
-            delay: Duration::from_millis(5),
-            remaining: 2,
-            session_id: session_id.clone(),
-        };
-        let (text, _) = collect_response(
-            &mut source,
-            &session_id,
-            formatter::OutputFormat::Json,
-            false,
-            Duration::from_millis(7),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(text, "keepalivekeepalivedone");
-    }
-
-    #[tokio::test]
-    async fn missing_active_run_message_returns_timeout_without_process_exit() {
-        let session_id = SessionId::from_uuid(Uuid::new_v4());
-        let mut source = QueuedSource(VecDeque::new());
-        let error = collect_response(
-            &mut source,
-            &session_id,
-            formatter::OutputFormat::Json,
-            false,
-            Duration::from_millis(1),
-        )
-        .await
-        .unwrap_err();
-
-        assert!(matches!(error, HeadlessError::IdleTimeout { .. }));
-    }
-
-    #[tokio::test]
-    async fn foreign_message_does_not_reset_a_short_idle_deadline() {
-        let session_id = SessionId::from_uuid(Uuid::new_v4());
-        let mut source = ForeignThenLate {
-            delay: Duration::from_millis(10),
-            session_id: session_id.clone(),
-            sent_foreign: false,
-        };
-        let error = collect_response(
-            &mut source,
-            &session_id,
-            formatter::OutputFormat::Json,
-            false,
-            Duration::from_millis(7),
-        )
-        .await
-        .unwrap_err();
-
-        assert!(matches!(error, HeadlessError::IdleTimeout { .. }));
-    }
-
-    #[tokio::test]
-    async fn timeout_sends_disconnect_before_returning_the_typed_error() {
-        let session_id = SessionId::from_uuid(Uuid::new_v4());
-        let mut source = SilentSource {
-            sent_disconnect: false,
-        };
-        let error = collect_response_with_cleanup(
-            &mut source,
-            &session_id,
-            formatter::OutputFormat::Json,
-            false,
-            Duration::from_millis(1),
-        )
-        .await
-        .unwrap_err();
-
-        assert!(matches!(error, HeadlessError::IdleTimeout { .. }));
-        assert!(source.sent_disconnect);
-    }
-
-    #[test]
-    fn only_active_run_payloads_can_reset_the_timer() {
-        let session_id = SessionId::from_uuid(Uuid::new_v4());
-        assert!(is_active_run_message(
-            &response("active", false, &session_id),
-            &session_id
-        ));
-        assert!(!is_active_run_message(
-            &foreign_message(&session_id),
-            &session_id
-        ));
-    }
-}
+#[path = "headless_tests.rs"]
+mod tests;
