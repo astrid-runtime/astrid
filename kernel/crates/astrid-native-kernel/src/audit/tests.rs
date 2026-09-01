@@ -123,7 +123,7 @@ fn attacker_handoff_tag(boot: BootSessionId, authority_id: u64, key: &[u8; 32]) 
 
 static RUNTIME_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
-fn runtime_test_guard() -> spin::MutexGuard<'static, ()> {
+pub(super) fn runtime_test_guard() -> spin::MutexGuard<'static, ()> {
     RUNTIME_TEST_LOCK.lock()
 }
 
@@ -367,140 +367,6 @@ fn foreign_boot_checkpoint_cannot_use_live_context() {
         AuditCheckpoint::seal(foreign_boot, 1, [3; 32], 1, authority().context()),
         Err(AuditError::CheckpointMismatch)
     );
-}
-
-#[test]
-fn immediate_retirement_rejects_retained_relay_evidence() {
-    let chain_boot = boot();
-    let mut chain = genesis_chain(chain_boot);
-    let mut host_verifier = verifier();
-
-    chain
-        .append(domain_event(AuditClass::DomainCreate))
-        .unwrap();
-    let before = (chain.seq(), *chain.root());
-    let verifier_before = (host_verifier.next_seq(), host_verifier.root());
-
-    let folded = chain.append_verified(&domain_event(AuditClass::DomainAdmit), &mut host_verifier);
-    assert_eq!(folded, Err(AuditError::RelayMixedMode));
-    assert_eq!((chain.seq(), *chain.root()), before);
-    assert_eq!(chain.relay().redeliver().count(), 1);
-    assert_eq!(
-        (host_verifier.next_seq(), host_verifier.root()),
-        verifier_before
-    );
-}
-
-#[test]
-fn verified_staging_failure_leaves_chain_untouched() {
-    let chain_boot = boot();
-    let mut chain = genesis_chain(chain_boot);
-    let mut host_verifier = verifier();
-    let before = (chain.seq(), *chain.root());
-    let verifier_before = (host_verifier.next_seq(), host_verifier.root());
-
-    chain
-        .prepare_verified(&domain_event(AuditClass::DomainAdmit))
-        .unwrap();
-    let folded = host_verifier.open_fold(chain.seq() + 1, chain.staged_frame(), &[0x12; 32]);
-    assert!(matches!(
-        folded,
-        Err(native_audit_verifier::FoldFailure::Invalid(
-            native_audit_verifier::InvalidReason::RootMismatch,
-        ))
-    ));
-    drop(folded);
-    assert_eq!((chain.seq(), *chain.root()), before);
-    assert_eq!(chain.relay().redeliver().count(), 0);
-    assert_eq!(
-        (host_verifier.next_seq(), host_verifier.root()),
-        verifier_before
-    );
-}
-
-#[test]
-fn transaction_receipt_commits_after_successful_relay_auth() {
-    let chain_boot = boot();
-    let mut chain = genesis_chain(chain_boot);
-    let mut host_verifier = verifier();
-
-    chain
-        .prepare_verified(&domain_event(AuditClass::DomainAdmit))
-        .unwrap();
-    let observation = chain
-        .retire_verified(
-            host_verifier
-                .open_fold(chain.seq() + 1, chain.staged_frame(), chain.staged_root())
-                .unwrap(),
-        )
-        .unwrap();
-    assert_eq!(observation.seq(), 1);
-    assert_eq!((chain.seq(), *chain.root()), (1, *observation.root()));
-    assert_eq!(host_verifier.next_seq(), 2);
-}
-
-#[test]
-fn post_fold_relay_failure_does_not_retain_verifier_progress() {
-    let chain_boot = boot();
-    let mut chain = genesis_chain(chain_boot);
-    let mut host_verifier = verifier();
-
-    // Stage one event, fold it provisionally, then exercise the exact relay
-    // rejection that occurs when another authoritative append owns the cursor.
-    chain
-        .prepare_verified(&domain_event(AuditClass::DomainAdmit))
-        .unwrap();
-    let verifier_before = (host_verifier.next_seq(), host_verifier.root());
-    let transaction = host_verifier
-        .open_fold(chain.seq() + 1, chain.staged_frame(), chain.staged_root())
-        .unwrap();
-    chain.append(domain_event(AuditClass::DomainAdmit)).unwrap();
-
-    let folded = chain.retire_verified(transaction);
-    assert_eq!(folded, Err(AuditError::RelayInvalidCursor));
-    assert_eq!(
-        (host_verifier.next_seq(), host_verifier.root()),
-        verifier_before
-    );
-    assert_eq!(chain.relay().redeliver().count(), 1);
-}
-
-#[test]
-fn transaction_receipt_cannot_retire_a_different_staged_frame() {
-    let chain_boot = boot();
-    let mut chain = genesis_chain(chain_boot);
-    let mut host_verifier = verifier();
-
-    let before = (chain.seq(), *chain.root());
-    let verifier_before = (host_verifier.next_seq(), host_verifier.root());
-    chain
-        .prepare_verified(&domain_event(AuditClass::DomainCreate))
-        .unwrap();
-    let transaction = host_verifier
-        .open_fold(chain.seq() + 1, chain.staged_frame(), chain.staged_root())
-        .unwrap();
-
-    // Re-stage a different frame at the same sequence/root. The old
-    // transaction receipt is still the only retirement input, but its keyed
-    // authentication no longer matches the staged bytes.
-    chain
-        .prepare_verified(&domain_event(AuditClass::DomainAdmit))
-        .unwrap();
-    assert_eq!(
-        chain.retire_verified(transaction),
-        Err(AuditError::RootMismatch)
-    );
-    assert_eq!((chain.seq(), *chain.root()), before);
-    assert_eq!(chain.relay().redeliver().count(), 0);
-    assert_eq!(
-        (host_verifier.next_seq(), host_verifier.root()),
-        verifier_before
-    );
-
-    let observation = chain
-        .append_verified(&domain_event(AuditClass::DomainCreate), &mut host_verifier)
-        .unwrap();
-    assert_eq!(observation.seq(), 1);
 }
 
 #[test]

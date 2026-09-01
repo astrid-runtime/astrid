@@ -8,11 +8,14 @@
 
 mod chain;
 mod codec;
+mod live;
 mod relay;
 mod root;
 mod runtime;
 mod types;
 
+#[cfg(test)]
+mod live_tests;
 #[cfg(test)]
 mod tests;
 

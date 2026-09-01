@@ -22,7 +22,6 @@ pub mod wire;
 mod tests;
 
 use blake3::Hasher;
-use core::marker::PhantomData;
 use spin::Mutex;
 use zeroize::Zeroize;
 
@@ -403,215 +402,9 @@ pub struct AuditVerifier {
     root_hasher: RootHasher,
     context: AuthContext,
     relay_generation: u64,
-    next_commit_nonce: u64,
-    fold_transaction: Option<FoldTransaction>,
-}
-
-struct FoldTransaction {
-    nonce: u64,
-    previous_next_seq: u64,
-    previous_root: [u8; 32],
-    receipt: FoldReceipt,
-}
-
-/// Opaque, one-shot evidence minted while entering the live relay callback.
-/// There is deliberately no public constructor, wire form, or conversion from
-/// a receipt, checkpoint, or authentication context.
-pub struct RelayCommitTicket<'a> {
-    nonce: u64,
-    seq: u64,
-    folded_root: [u8; 32],
-    relay_generation: u64,
-    // Borrow branding scopes this ticket to one live commit call; the nonce
-    // and consuming state make any stale return an immediate API violation.
-    _verifier: PhantomData<&'a mut AuditVerifier>,
-}
-
-impl<'a> RelayCommitTicket<'a> {
-    fn new(nonce: u64, seq: u64, folded_root: [u8; 32], relay_generation: u64) -> Self {
-        Self {
-            nonce,
-            seq,
-            folded_root,
-            relay_generation,
-            _verifier: PhantomData,
-        }
-    }
-}
-
-impl RelayCommitTicket<'_> {
-    fn binds(&self, nonce: u64, seq: u64, folded_root: [u8; 32], relay_generation: u64) -> bool {
-        self.nonce == nonce
-            && self.seq == seq
-            && self.folded_root == folded_root
-            && self.relay_generation == relay_generation
-    }
-}
-
-/// An opened, not-yet-folded verifier transaction. It exposes no close,
-/// commit, or rollback operation; folding consumes this state, and dropping
-/// an unfolded transaction restores the saved cursor.
-pub struct OpenFold<'a> {
-    verifier: Option<&'a mut AuditVerifier>,
-    previous_next_seq: u64,
-    previous_root: [u8; 32],
-    finished: bool,
-}
-
-impl Drop for OpenFold<'_> {
-    fn drop(&mut self) {
-        if !self.finished {
-            if let Some(verifier) = self.verifier.as_mut() {
-                verifier.next_seq = self.previous_next_seq;
-                verifier.root = self.previous_root;
-            }
-            self.finished = true;
-        }
-    }
-}
-
-/// A completed, provisional fold. The caller receives this distinct state only
-/// after exactly one successful fold and must consume it to finish the
-/// verifier transaction. No raw receipt can create or replace this state.
-///
-/// ```compile_fail
-/// use native_audit_verifier::{FoldedFold, FoldReceipt};
-/// fn commit_with_public_wire(fold: FoldedFold<'_>) {
-///     fold.commit_after_relay(&[]);
-/// }
-/// fn substitute(receipt: FoldReceipt) -> FoldedFold<'static> {
-///     receipt.into()
-/// }
-/// ```
-pub struct FoldedFold<'a> {
-    verifier: &'a mut AuditVerifier,
-    finished: bool,
-}
-
-impl<'a> FoldedFold<'a> {
-    /// The sole receipt minted by this transaction.
-    pub fn receipt(&self) -> &FoldReceipt {
-        &self
-            .verifier
-            .fold_transaction
-            .as_ref()
-            .expect("folded state retains its receipt")
-            .receipt
-    }
-
-    /// Exact chain sequence bound at the provisional fold.
-    pub fn expected_seq(&self) -> u64 {
-        self.receipt().seq()
-    }
-
-    /// Exact source root bound at the provisional fold.
-    pub fn expected_root(&self) -> [u8; 32] {
-        self.receipt().folded_root()
-    }
-
-    /// Sole keyed acknowledgement tag for the exact folded frame.
-    pub fn receipt_tag(&self) -> [u8; 32] {
-        self.receipt().ack_tag()
-    }
-
-    /// Runs the authenticated relay callback with a non-public one-shot
-    /// ticket. The callback must return that exact ticket only after relay
-    /// receipt authentication succeeds; returning it commits the fold without
-    /// encoding, decoding, or accepting public checkpoint bytes. Relay failure
-    /// rolls the fold back. A stale ticket is an API-contract violation and
-    /// aborts rather than splitting relay and verifier custody.
-    pub fn commit_after_relay<'commit, E>(
-        mut self,
-        authenticate_relay: impl FnOnce(
-            RelayCommitTicket<'commit>,
-        ) -> Result<RelayCommitTicket<'commit>, E>,
-    ) -> Result<(), E> {
-        assert!(
-            self.verifier.fold_transaction.is_some(),
-            "folded state retains its receipt"
-        );
-        let (nonce, seq, root, relay_generation) = {
-            let transaction = self
-                .verifier
-                .fold_transaction
-                .as_ref()
-                .expect("folded state retains its receipt");
-            (
-                transaction.nonce,
-                transaction.receipt.seq(),
-                transaction.receipt.folded_root(),
-                self.verifier.relay_generation,
-            )
-        };
-        let ticket = RelayCommitTicket::new(nonce, seq, root, relay_generation);
-        match authenticate_relay(ticket) {
-            Ok(receipt) => {
-                assert!(
-                    receipt.binds(nonce, seq, root, relay_generation),
-                    "relay commit ticket is transaction-bound"
-                );
-                self.verifier.fold_transaction = None;
-                self.finished = true;
-                Ok(())
-            },
-            Err(error) => {
-                self.rollback_state();
-                Err(error)
-            },
-        }
-    }
-
-    /// Consumes the folded state and restores the saved cursor after relay
-    /// authentication failure.
-    pub fn rollback(mut self) {
-        self.rollback_state();
-    }
-
-    fn rollback_state(&mut self) {
-        if let Some(transaction) = self.verifier.fold_transaction.as_ref() {
-            self.verifier.next_seq = transaction.previous_next_seq;
-            self.verifier.root = transaction.previous_root;
-        }
-        self.verifier.fold_transaction = None;
-        self.finished = true;
-    }
-}
-
-impl Drop for FoldedFold<'_> {
-    fn drop(&mut self) {
-        if !self.finished {
-            self.rollback_state();
-            self.finished = true;
-        }
-    }
 }
 
 impl AuditVerifier {
-    /// Opens the first state of an exactly-once verifier transaction. This
-    /// state has no close/commit operation; folding consumes it.
-    pub fn speculative(&mut self) -> OpenFold<'_> {
-        let previous_next_seq = self.next_seq;
-        let previous_root = self.root;
-        OpenFold {
-            verifier: Some(self),
-            previous_next_seq,
-            previous_root,
-            finished: false,
-        }
-    }
-
-    /// Performs the sole fold against explicit staged sequence/root identity.
-    /// Failure consumes the open state and restores the cursor; success
-    /// returns a distinct transaction-bound folded state.
-    pub fn open_fold<'a>(
-        &'a mut self,
-        expected_seq: u64,
-        frame: &[u8],
-        expected_root: &[u8; 32],
-    ) -> Result<FoldedFold<'a>, FoldFailure> {
-        self.speculative().fold(expected_seq, frame, expected_root)
-    }
-
     /// Starts from genesis only after binding the untrusted handoff against
     /// the trusted anchor for the same boot.
     pub fn genesis(
@@ -635,8 +428,6 @@ impl AuditVerifier {
             root_hasher,
             context,
             relay_generation: 1,
-            next_commit_nonce: 1,
-            fold_transaction: None,
         })
     }
 
@@ -660,13 +451,10 @@ impl AuditVerifier {
             root_hasher: RootHasher::new(),
             context,
             relay_generation: checkpoint.relay_generation,
-            next_commit_nonce: 1,
-            fold_transaction: None,
         })
     }
 
-    /// Shared canonical fold engine. Immediate transactions and retained
-    /// evidence both use this, but only the former can create `FoldedFold`.
+    /// Shared canonical fold engine for retained evidence only.
     fn fold_frame(
         &mut self,
         frame: &[u8],
@@ -767,20 +555,20 @@ impl AuditVerifier {
         self.next_seq
     }
 
-    /// Converts this live verifier into the separately typed retained-evidence
-    /// verifier. A retained verifier cannot create or commit `FoldedFold`.
+    /// Converts the offline verifier into the separately typed
+    /// retained-evidence verifier. No path returns it to live custody.
     pub fn into_retained_evidence(self) -> RetainedAuditVerifier {
         RetainedAuditVerifier(self)
     }
 }
 
-/// Capability-typed retained-evidence verifier. It has no `open_fold` and no
-/// transaction commit, so it cannot impersonate the live relay-bound path.
+/// Capability-typed retained-evidence verifier. It has no transactional fold
+/// or commit, so it cannot impersonate the live relay-bound path.
 pub struct RetainedAuditVerifier(AuditVerifier);
 
 impl RetainedAuditVerifier {
     /// Folds one retained buffered handoff record for the existing ack/credit
-    /// path. The raw receipt cannot create `FoldedFold`.
+    /// path. The raw receipt has no live-transaction conversion.
     pub fn fold_retained_evidence(
         &mut self,
         frame: &[u8],
@@ -811,71 +599,5 @@ impl Drop for AuditVerifier {
         // The field's own Drop performs the erase; this explicit hook documents
         // that destroying the fold state also destroys the verification anchor.
         self.context.erase();
-    }
-}
-
-impl<'a> OpenFold<'a> {
-    /// Performs the sole fold and consumes the open state. Failure restores
-    /// the saved cursor; success returns a transaction-bound folded state.
-    #[inline(always)]
-    pub fn fold(
-        mut self,
-        expected_seq: u64,
-        frame: &[u8],
-        expected_root: &[u8; 32],
-    ) -> Result<FoldedFold<'a>, FoldFailure> {
-        let verifier = self
-            .verifier
-            .as_mut()
-            .expect("open fold retains its verifier");
-        match verifier.next_seq.cmp(&expected_seq) {
-            core::cmp::Ordering::Less => {
-                self.rollback_without_fold();
-                return Err(FoldFailure::Incomplete(IncompleteReason::SequenceGap));
-            },
-            core::cmp::Ordering::Greater => {
-                self.rollback_without_fold();
-                return Err(FoldFailure::Invalid(InvalidReason::DuplicateOrReorder));
-            },
-            core::cmp::Ordering::Equal => {},
-        }
-
-        let verifier = self.verifier.as_mut().expect("verifier remains open");
-        match verifier.fold_frame(frame, *expected_root) {
-            Ok(receipt) if receipt.seq() == expected_seq => {
-                let verifier = self.verifier.take().expect("verifier remains open");
-                self.finished = true;
-                let nonce = verifier.next_commit_nonce;
-                verifier.next_commit_nonce = nonce
-                    .checked_add(1)
-                    .expect("audit transaction nonce cannot overflow");
-                verifier.fold_transaction = Some(FoldTransaction {
-                    nonce,
-                    previous_next_seq: self.previous_next_seq,
-                    previous_root: self.previous_root,
-                    receipt,
-                });
-                Ok(FoldedFold {
-                    verifier,
-                    finished: false,
-                })
-            },
-            Ok(_) => {
-                self.rollback_without_fold();
-                Err(FoldFailure::Invalid(InvalidReason::RootMismatch))
-            },
-            Err(error) => {
-                self.rollback_without_fold();
-                Err(error)
-            },
-        }
-    }
-
-    fn rollback_without_fold(&mut self) {
-        if let Some(verifier) = self.verifier.as_mut() {
-            verifier.next_seq = self.previous_next_seq;
-            verifier.root = self.previous_root;
-        }
-        self.finished = true;
     }
 }

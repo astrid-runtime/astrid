@@ -22,16 +22,6 @@ fn genesis_root(boot: [u8; 16]) -> [u8; 32] {
     RootHasher::new().genesis(boot)
 }
 
-fn sealed_wire_for_transaction(expected_seq: u64, expected_root: [u8; 32]) -> Vec<u8> {
-    checkpoint_wire(
-        BOOT,
-        expected_seq,
-        expected_root,
-        1,
-        sealed_tag(BOOT, expected_seq, expected_root, 1),
-    )
-}
-
 /// Seals a genuine handoff for the test anchor. Only the byte layout is
 /// mirrored from the kernel; the tag comes from this crate's own keyed
 /// implementation, and kernel cross-checks bind the real layout.
@@ -153,83 +143,6 @@ fn genesis_fold_requires_boot_previous_root_and_source_root() {
         2
     );
     assert_eq!(verifier.root(), root2);
-}
-
-#[test]
-fn open_fold_is_exactly_once_and_identity_bound() {
-    let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff()).unwrap();
-    let genesis = verifier.root();
-    let frame = body(BOOT, 1, 1, Object::None, 0, &[], Some(genesis));
-    let root = expected_root(genesis, 1, &frame);
-
-    // An explicit sequence mismatch fails before opening a folded state.
-    assert!(matches!(
-        verifier.open_fold(2, &frame, &root),
-        Err(FoldFailure::Incomplete(IncompleteReason::SequenceGap))
-    ));
-    assert_eq!((verifier.next_seq(), verifier.root()), (1, genesis));
-
-    let transaction = verifier.open_fold(1, &frame, &root).unwrap();
-    assert_eq!(transaction.receipt().seq(), 1);
-    assert_eq!(transaction.expected_seq(), 1);
-    assert_eq!(transaction.expected_root(), root);
-    transaction
-        .commit_after_relay(|ticket| -> Result<RelayCommitTicket, VerifyFailure> { Ok(ticket) })
-        .unwrap();
-    assert_eq!(verifier.next_seq(), 2);
-    assert_eq!(verifier.root(), root);
-}
-
-#[test]
-fn relay_failure_rolls_back_and_does_not_consume_the_sequence() {
-    let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff()).unwrap();
-    let genesis = verifier.root();
-    let frame = body(BOOT, 1, 1, Object::None, 0, &[], Some(genesis));
-    let root = expected_root(genesis, 1, &frame);
-    let transaction = verifier.open_fold(1, &frame, &root).unwrap();
-
-    // Even a valid sealed public wire is outside the live commit seam: only
-    // returning the one-shot ticket from the authenticated relay callback can
-    // commit. A callback failure therefore restores the exact prior cursor.
-    let public_wire = sealed_wire_for_transaction(1, root);
-    assert!(verify_checkpoint(&public_wire, &context()).is_ok());
-    assert!(matches!(
-        transaction.commit_after_relay(|_| Err(VerifyFailure::CheckpointMismatch)),
-        Err(VerifyFailure::CheckpointMismatch)
-    ));
-    assert_eq!((verifier.next_seq(), verifier.root()), (1, genesis));
-
-    let transaction = verifier.open_fold(1, &frame, &root).unwrap();
-    transaction
-        .commit_after_relay(|ticket| -> Result<RelayCommitTicket, VerifyFailure> { Ok(ticket) })
-        .unwrap();
-    assert_eq!((verifier.next_seq(), verifier.root()), (2, root));
-}
-
-#[test]
-fn stale_commit_tickets_cannot_replace_a_fresh_relay_callback() {
-    let mut verifier = AuditVerifier::genesis(BOOT, context(), &handoff()).unwrap();
-    let genesis = verifier.root();
-    let frame = body(BOOT, 1, 1, Object::None, 0, &[], Some(genesis));
-    let root = expected_root(genesis, 1, &frame);
-    let transaction = verifier.open_fold(1, &frame, &root).unwrap();
-    let mut stale_ticket = None;
-    transaction
-        .commit_after_relay(|ticket| {
-            stale_ticket = Some(ticket);
-            Err(VerifyFailure::CheckpointMismatch)
-        })
-        .unwrap_err();
-    assert_eq!((verifier.next_seq(), verifier.root()), (1, genesis));
-
-    // The stale ticket has no constructor and no wire form. A fresh transaction
-    // can only commit by minting and returning its own callback ticket; the
-    // captured value cannot be injected into this commit call.
-    let transaction = verifier.open_fold(1, &frame, &root).unwrap();
-    transaction
-        .commit_after_relay(|ticket| -> Result<RelayCommitTicket, VerifyFailure> { Ok(ticket) })
-        .unwrap();
-    assert_eq!((verifier.next_seq(), verifier.root()), (2, root));
 }
 
 #[test]

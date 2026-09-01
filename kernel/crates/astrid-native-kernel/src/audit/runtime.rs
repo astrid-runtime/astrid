@@ -6,8 +6,6 @@ use super::chain::{AuditChain, AuditObservation};
 use super::types::{AuditError, AuditEvent, BootSessionId, KernelSecretEntropy};
 #[cfg(not(test))]
 use crate::entropy::ProvisionedEntropy;
-use native_audit_verifier::{AuditVerifier, AuthContext};
-use zeroize::Zeroizing;
 
 /// A second install is refused even if the first runtime was thought missing.
 /// There is no reset or replacement path in production.
@@ -47,7 +45,6 @@ impl AuditIdentity {
 
 struct AuditRuntime {
     chain: AuditChain,
-    verifier: AuditVerifier,
 }
 
 static RUNTIME: Mutex<Option<AuditRuntime>> = Mutex::new(None);
@@ -71,20 +68,9 @@ fn install_custody(
 
     let authority =
         super::AuditAuthority::mint(boot, secret).ok_or(AuditInstallError::CustodyRejected)?;
-    let handoff = authority.verifier_handoff();
-    let anchor_key = Zeroizing::new(*authority.context().verification_key().bytes());
-    let anchor = AuthContext::from_trusted_anchor(
-        authority.context().authority_id(),
-        authority.boot().bytes(),
-        *anchor_key,
-    )
-    .map_err(|_| AuditInstallError::CustodyRejected)?;
     let chain = AuditChain::genesis_custodied(boot, authority)
         .map_err(|_| AuditInstallError::CustodyRejected)?;
-    let verifier = AuditVerifier::genesis(boot.bytes(), anchor, &handoff)
-        .map_err(|_| AuditInstallError::CustodyRejected)?;
-
-    *runtime = Some(AuditRuntime { chain, verifier });
+    *runtime = Some(AuditRuntime { chain });
 
     let installed = runtime.as_ref().expect("runtime was just installed");
     Ok(AuditIdentity {
@@ -105,10 +91,10 @@ pub(crate) fn install_for_test(
 #[inline(never)]
 pub(crate) fn record(event: &AuditEvent) -> Result<AuditObservation, AuditError> {
     let mut runtime = RUNTIME.lock();
-    let Some(AuditRuntime { chain, verifier }) = runtime.as_mut() else {
+    let Some(runtime) = runtime.as_mut() else {
         return Err(AuditError::MalformedFrame);
     };
-    chain.append_verified(event, verifier)
+    runtime.chain.append_verified(event)
 }
 
 pub(crate) fn identity() -> Option<AuditIdentity> {

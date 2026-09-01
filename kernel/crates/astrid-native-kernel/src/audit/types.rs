@@ -225,6 +225,20 @@ impl CheckpointAuthContext {
             self.authority_id,
         )
     }
+
+    /// Creates the second live-verifier custody of the same trusted anchor.
+    /// This is the kernel-side injection channel modeled by the first slice:
+    /// it never crosses the untrusted handoff wire.
+    pub(crate) fn clone_for_live_verifier(&self) -> Option<Self> {
+        let verification_key = VerificationKey::new(*self.verification_key.bytes())?;
+        let verification_key_bytes = *verification_key.bytes();
+        Some(Self {
+            boot: self.boot,
+            authority_id: self.authority_id,
+            verification_key,
+            tag_hasher: root::TagHasher::new(self.boot, &verification_key_bytes),
+        })
+    }
 }
 
 impl Drop for CheckpointAuthContext {
@@ -293,6 +307,12 @@ impl AuditAuthority {
             .verifier_handoff_tag(self.boot, self.context.authority_id());
         handoff[32..].copy_from_slice(&tag);
         handoff
+    }
+
+    /// Kernel-private trusted anchor for the independent live-verifier
+    /// custodian. No retained host verifier is involved.
+    pub(crate) fn live_context(&self) -> Option<CheckpointAuthContext> {
+        self.context.clone_for_live_verifier()
     }
 }
 
@@ -816,6 +836,8 @@ impl AuditCheckpoint {
 pub enum AuditError {
     SequenceOverflow,
     RelayGenerationOverflow,
+    LiveInstanceOverflow,
+    LiveTransactionOverflow,
     PayloadTooLarge,
     EncodeOverflow,
     MalformedFrame,
@@ -836,6 +858,8 @@ impl core::fmt::Display for AuditError {
         let text = match self {
             Self::SequenceOverflow => "audit sequence overflow",
             Self::RelayGenerationOverflow => "relay generation overflow",
+            Self::LiveInstanceOverflow => "audit live verifier instance overflow",
+            Self::LiveTransactionOverflow => "audit live transaction overflow",
             Self::PayloadTooLarge => "payload exceeds the landed ceiling",
             Self::EncodeOverflow => "canonical frame exceeds the fixed bound",
             Self::MalformedFrame => "malformed canonical frame",

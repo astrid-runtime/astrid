@@ -3,13 +3,13 @@
 //! together, or fails before any state changes.
 
 use super::codec::{Frame, MAX_FRAME_BYTES};
+use super::live::LiveVerifier;
 use super::relay::AuditRelay;
 use super::root;
 use super::types::{
     AuditAuthority, AuditCheckpoint, AuditError, AuditEvent, BootSessionId, KernelSecretEntropy,
 };
 use core::mem::MaybeUninit;
-use native_audit_verifier::FoldedFold;
 pub(crate) struct AuditChain {
     boot: BootSessionId,
     authority: AuditAuthority,
@@ -17,6 +17,7 @@ pub(crate) struct AuditChain {
     seq: u64,
     root: [u8; root::ROOT_LEN],
     relay: AuditRelay,
+    live: LiveVerifier,
     record_scratch: RecordScratch,
     frame_scratch: MaybeUninit<Frame>,
 }
@@ -46,9 +47,9 @@ impl RecordScratch {
 /// One successfully observed and retired public audit position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AuditObservation {
-    seq: u64,
-    class: super::types::AuditClass,
-    root: [u8; root::ROOT_LEN],
+    pub(super) seq: u64,
+    pub(super) class: super::types::AuditClass,
+    pub(super) root: [u8; root::ROOT_LEN],
 }
 
 impl AuditObservation {
@@ -83,6 +84,7 @@ impl AuditChain {
         }
         let root_hasher = root::RootHasher::new();
         let root = root_hasher.genesis(boot);
+        let live = LiveVerifier::genesis(boot, &authority)?;
         Ok(Self {
             boot,
             authority,
@@ -90,6 +92,7 @@ impl AuditChain {
             seq: 0,
             root,
             relay: AuditRelay::new(boot),
+            live,
             record_scratch: RecordScratch {
                 encoded: [0; MAX_FRAME_BYTES],
                 encoded_len: 0,
@@ -123,6 +126,7 @@ impl AuditChain {
             .ok_or(AuditError::SequenceOverflow)?;
         let relay =
             AuditRelay::restore(checkpoint.boot(), checkpoint.relay_generation(), next_seq)?;
+        let live = LiveVerifier::restore(&checkpoint, &authority)?;
         Ok(Self {
             boot: checkpoint.boot(),
             authority,
@@ -130,6 +134,7 @@ impl AuditChain {
             seq: checkpoint.seq(),
             root: checkpoint.root(),
             relay,
+            live,
             record_scratch: RecordScratch {
                 encoded: [0; MAX_FRAME_BYTES],
                 encoded_len: 0,
@@ -241,93 +246,47 @@ impl AuditChain {
         Ok(next)
     }
 
-    /// Roots and stages one event in chain-owned scratch, invokes the
-    /// independent verifier, authenticates its receipt, and retires it before
-    /// return. The verifier transaction closes only after relay retirement
-    /// succeeds, so no post-fold failure can strand either cursor.
+    /// Roots and stages one event in chain-owned scratch, folds it through the
+    /// kernel-private live verifier, authenticates its receipt, and retires it
+    /// before return. The consuming transaction closes only after relay
+    /// retirement succeeds.
     #[inline(never)]
     pub(crate) fn append_verified(
         &mut self,
         event: &AuditEvent,
-        verifier: &mut native_audit_verifier::AuditVerifier,
     ) -> Result<AuditObservation, AuditError> {
-        self.prepare_verified(event)?;
-        let transaction = verifier
-            .open_fold(
-                self.record_scratch.seq,
-                self.record_scratch.frame(),
-                &self.record_scratch.root,
-            )
-            .map_err(|_| AuditError::RootMismatch)?;
-        self.retire_verified(transaction)
-    }
-
-    /// Stages and preflights a record without advancing the chain or opening
-    /// verifier state. This named seam lets the rollback test drive the exact
-    /// production preparation steps.
-    pub(super) fn prepare_verified(&mut self, event: &AuditEvent) -> Result<(), AuditError> {
         let next = self
             .seq
             .checked_add(1)
             .ok_or(AuditError::SequenceOverflow)?;
-        self.stage_record(event, next)?;
+        let next_root = self.stage_record(event, next)?;
 
         // Immediate-retire mode is exclusive. Any buffered/in-flight record
         // means the caller must use the retained-evidence path; checking here
         // prevents the verifier from advancing before the transaction fails.
         self.relay.require_empty_for_immediate_retire()?;
         self.relay
-            .can_publish(next, event.class().is_terminal_or_invalidation())
-    }
-
-    pub(super) fn staged_frame(&self) -> &[u8] {
-        self.record_scratch.frame()
-    }
-
-    pub(super) fn staged_root(&self) -> &[u8; root::ROOT_LEN] {
-        &self.record_scratch.root
-    }
-
-    /// Authenticates the independent fold receipt at the relay and finishes
-    /// the transaction only on success. The transaction-bound receipt leaves
-    /// no caller-replaceable raw tag; a mismatched staged sequence/root fails
-    /// before relay mutation, and a mismatched frame fails receipt auth.
-    pub(super) fn retire_verified(
-        &mut self,
-        transaction: FoldedFold<'_>,
-    ) -> Result<AuditObservation, AuditError> {
-        let seq = self.record_scratch.seq;
-        let root = self.record_scratch.root;
-        let class = self.record_scratch.class;
-        if transaction.expected_seq() != seq
-            || transaction.expected_root() != root
-            || transaction.receipt().seq() != seq
-            || transaction.receipt().folded_root() != root
-        {
-            transaction.rollback();
-            return Err(AuditError::RootMismatch);
-        }
-        let receipt_tag = transaction.receipt_tag();
-        let result = transaction.commit_after_relay(|ticket| {
-            self.relay
-                .publish_retired(
-                    seq,
-                    self.record_scratch.frame(),
-                    root,
-                    self.record_scratch.mandatory(),
-                    receipt_tag,
-                    self.authority.context(),
-                )
-                .map(|()| ticket)
-        });
-        match result {
-            Ok(()) => {
-                self.seq = seq;
-                self.root = root;
-                Ok(AuditObservation { seq, class, root })
-            },
-            Err(error) => Err(error),
-        }
+            .can_publish(next, event.class().is_terminal_or_invalidation())?;
+        let relay_generation = self.relay.generation();
+        let reservation = self.live.reserve(&self.authority, next)?;
+        let receipt_tag = self.authority.context().ack_tag(
+            self.boot,
+            relay_generation,
+            next,
+            next_root,
+            self.record_scratch.frame(),
+        );
+        let prepared = self.live.finish(
+            reservation,
+            self.record_scratch.frame(),
+            next_root,
+            event.class(),
+            receipt_tag,
+        )?;
+        let observation = prepared.commit(&mut self.relay, self.authority.context())?;
+        self.seq = observation.seq;
+        self.root = observation.root;
+        Ok(observation)
     }
 
     /// Kernel-authenticated checkpoint bound to the exact current state.

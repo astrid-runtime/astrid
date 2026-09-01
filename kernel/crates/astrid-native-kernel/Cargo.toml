@@ -35,9 +35,6 @@ astrid-system-generation = { path = "../astrid-system-generation", default-featu
 blake3 = { version = "=1.8.5", default-features = false, features = ["pure", "zeroize"] }
 # Exact-pinned volatile erasure for seed/key temporaries.
 zeroize = { version = "=1.9.0", default-features = false }
-# Native verifier is independently written but must be usable in-kernel for
-# direct, move-only custody of the live anchor.
-native-audit-verifier = { path = "../../tools/native-audit-verifier" }
 
 [dev-dependencies]
 # Private host verifier: kernel audit tests cross-check the canonical frames,
