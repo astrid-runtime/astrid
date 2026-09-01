@@ -254,9 +254,12 @@ timeout.
 
 The idle deadline applies only to gaps between messages belonging to the active
 run. Chat responses and `agent.v1.stream.delta` frames must carry the matching
-session; unattributed control frames cannot extend the run. Disconnect and
-approval sends use a bounded best-effort budget so a wedged socket cannot defer
-the established timeout result indefinitely.
+session; unattributed control frames cannot extend the run. Headless approval
+requests cannot be correlated in production, so they are ignored without an
+approval response and cannot extend the run. `--yes`, `--yolo`, and
+`--autonomous` are rejected before headless execution. Disconnect and approval
+sends use a bounded best-effort budget so a wedged socket cannot defer the
+established timeout result indefinitely.
 
 ## Sessions
 

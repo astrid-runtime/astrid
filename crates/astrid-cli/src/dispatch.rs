@@ -15,6 +15,7 @@ use crate::cli::{
     Cli, Commands, ConfigCommands, DistroCommands, McpCommands, SessionCommands, WitCommands,
 };
 use crate::commands;
+use crate::commands::headless;
 use crate::commands::stub::TrackingIssue;
 use crate::formatter::OutputFormat;
 use crate::theme::{self, print_banner};
@@ -43,6 +44,11 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
         commands::self_update::print_update_banner().await;
     }
 
+    let headless_route = cli.prompt.is_some()
+        || (cli.command.is_none() && !std::io::stdin().is_terminal())
+        || matches!(cli.command, Some(Commands::Run(_)));
+    ensure_headless_auto_approve_rejected(cli.auto_approve, headless_route)?;
+
     let output_format = match cli.format.as_str() {
         "json" => OutputFormat::Json,
         _ => OutputFormat::Pretty,
@@ -53,7 +59,6 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
         if cli.snapshot_tui {
             commands::headless::run_snapshot_tui(
                 prompt_text,
-                cli.auto_approve,
                 cli.session_name,
                 cli.tui_width,
                 cli.tui_height,
@@ -64,7 +69,6 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
         commands::headless::run_headless(
             prompt_text,
             output_format,
-            cli.auto_approve,
             cli.session_name,
             cli.print_session,
         )
@@ -81,7 +85,6 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
             commands::headless::run_headless(
                 stdin_text,
                 output_format,
-                cli.auto_approve,
                 cli.session_name,
                 cli.print_session,
             )
@@ -91,6 +94,13 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
     }
 
     dispatch_subcommand(cli.command, output_format).await
+}
+
+fn ensure_headless_auto_approve_rejected(auto_approve: bool, headless_route: bool) -> Result<()> {
+    if auto_approve && headless_route {
+        anyhow::bail!(headless::AUTO_APPROVE_UNSUPPORTED_MESSAGE);
+    }
+    Ok(())
 }
 
 fn should_check_for_update(cli: &Cli) -> bool {
@@ -604,6 +614,35 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    #[test]
+    fn headless_auto_approve_is_rejected_before_execution() {
+        let error = ensure_headless_auto_approve_rejected(true, true)
+            .expect_err("prompt automation must be rejected");
+        assert!(error.to_string().contains("unsupported"));
+        assert!(error.to_string().contains("correlated"));
+    }
+
+    #[test]
+    fn non_headless_auto_approve_is_not_rejected_by_the_headless_guard() {
+        ensure_headless_auto_approve_rejected(true, false).unwrap();
+    }
+
+    #[test]
+    fn root_auto_approve_before_the_run_subcommand_is_rejected() {
+        for flag in ["--yes", "--yolo", "--autonomous"] {
+            let cli = Cli::try_parse_from(["astrid", flag, "run", "hello"])
+                .expect("root-level automation parses before subcommand dispatch");
+            assert!(cli.auto_approve);
+            assert!(matches!(cli.command, Some(Commands::Run(_))));
+
+            let headless_route = cli.prompt.is_some()
+                || (cli.command.is_none() && !std::io::stdin().is_terminal())
+                || matches!(cli.command, Some(Commands::Run(_)));
+            ensure_headless_auto_approve_rejected(cli.auto_approve, headless_route)
+                .expect_err("run automation must be rejected");
+        }
+    }
 
     #[test]
     fn offline_commands_never_check_for_updates() {

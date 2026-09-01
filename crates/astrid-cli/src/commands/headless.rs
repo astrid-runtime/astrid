@@ -15,6 +15,8 @@ use crate::{formatter, socket_client, tui};
 
 /// The established headless timeout exit code.
 pub(crate) const TIMEOUT_EXIT_CODE: u8 = 53;
+pub(crate) const AUTO_APPROVE_UNSUPPORTED_MESSAGE: &str = "headless approval automation is unsupported: approvals cannot be \
+     correlated to this run; remove --yes, --yolo, or --autonomous";
 const SUCCESS_EXIT_CODE: u8 = 0;
 /// Best-effort budget for sends during collection cleanup and normal exit.
 const MESSAGE_SEND_BUDGET: Duration = Duration::from_secs(5);
@@ -113,7 +115,6 @@ fn resolve_session_arg(s: &str) -> (uuid::Uuid, bool) {
 /// ratatui's `TestBackend` and dumps each significant event as a text frame.
 pub(crate) async fn run_snapshot_tui(
     prompt: String,
-    auto_approve: bool,
     session_name: Option<String>,
     width: u16,
     height: u16,
@@ -142,7 +143,6 @@ pub(crate) async fn run_snapshot_tui(
         prompt: &prompt,
         width,
         height,
-        auto_approve,
     })
     .await
 }
@@ -159,7 +159,6 @@ pub(crate) async fn run_snapshot_tui(
 pub(crate) async fn run_headless(
     prompt: String,
     format: formatter::OutputFormat,
-    auto_approve: bool,
     session_name: Option<String>,
     print_session: bool,
 ) -> Result<()> {
@@ -167,7 +166,6 @@ pub(crate) async fn run_headless(
     let code = run_headless_with_timeout(
         prompt,
         format,
-        auto_approve,
         session_name,
         print_session,
         Duration::from_mins(2),
@@ -182,7 +180,6 @@ pub(crate) async fn run_headless(
 pub(crate) async fn run_headless_with_timeout(
     prompt: String,
     format: formatter::OutputFormat,
-    auto_approve: bool,
     session_name: Option<String>,
     print_session: bool,
     idle_timeout: Duration,
@@ -236,8 +233,7 @@ pub(crate) async fn run_headless_with_timeout(
     // Send the prompt and collect the streaming response
     crate::socket_client::send_input_as_active_agent(&mut client, full_prompt).await?;
     let collected =
-        collect_response_with_cleanup(&mut client, &session_id, format, auto_approve, idle_timeout)
-            .await;
+        collect_response_with_cleanup(&mut client, &session_id, format, idle_timeout).await;
     let (response_text, tool_calls) = match collected {
         Ok(collected) => collected,
         Err(HeadlessError::IdleTimeout { timeout_secs }) => {
@@ -300,14 +296,12 @@ async fn collect_response_with_cleanup(
     client: &mut impl ResponseSource,
     session_id: &astrid_core::SessionId,
     format: formatter::OutputFormat,
-    auto_approve: bool,
     idle_timeout: Duration,
 ) -> std::result::Result<(String, Vec<serde_json::Value>), HeadlessError> {
     collect_response_with_cleanup_budget(
         client,
         session_id,
         format,
-        auto_approve,
         idle_timeout,
         MESSAGE_SEND_BUDGET,
     )
@@ -318,11 +312,10 @@ async fn collect_response_with_cleanup_budget(
     client: &mut impl ResponseSource,
     session_id: &astrid_core::SessionId,
     format: formatter::OutputFormat,
-    auto_approve: bool,
     idle_timeout: Duration,
     send_budget: Duration,
 ) -> std::result::Result<(String, Vec<serde_json::Value>), HeadlessError> {
-    let collected = collect_response(client, session_id, format, auto_approve, idle_timeout).await;
+    let collected = collect_response(client, session_id, format, idle_timeout).await;
     if let Err(HeadlessError::IdleTimeout { .. }) = &collected {
         send_disconnect_with_budget(client, session_id, send_budget).await;
     }
@@ -331,14 +324,13 @@ async fn collect_response_with_cleanup_budget(
 
 /// Collect the streaming response from the daemon in headless mode.
 ///
-/// Returns `(response_text, tool_calls)`. Auto-answers only approvals correlated
-/// to this run; same-principal frames from another run are left untouched.
-/// The deadline applies only to gaps between active-run messages.
+/// Returns `(response_text, tool_calls)`. Approval requests are unsupported
+/// because production cannot prove they belong to this run; they are ignored
+/// without a response and do not reset the idle deadline.
 async fn collect_response(
     client: &mut impl ResponseSource,
     session_id: &astrid_core::SessionId,
     format: formatter::OutputFormat,
-    auto_approve: bool,
     idle_timeout: Duration,
 ) -> std::result::Result<(String, Vec<serde_json::Value>), HeadlessError> {
     let mut response_text = String::new();
@@ -399,30 +391,6 @@ async fn collect_response(
                     "is_error": result.is_error,
                 }));
             },
-            astrid_types::ipc::IpcPayload::ApprovalRequired {
-                request_id, action, ..
-            } => {
-                let decision = if auto_approve { "approve" } else { "deny" };
-                eprintln!(
-                    "[headless] Auto-{} approval for: {action}",
-                    if auto_approve { "approved" } else { "denied" }
-                );
-                let response = astrid_types::ipc::IpcPayload::ApprovalResponse {
-                    request_id: request_id.clone(),
-                    decision: decision.to_string(),
-                    reason: Some(
-                        if auto_approve {
-                            "headless --yes mode"
-                        } else {
-                            "headless mode"
-                        }
-                        .to_string(),
-                    ),
-                };
-                let topic = astrid_types::Topic::approval_response(request_id);
-                let msg = astrid_types::ipc::IpcMessage::new(topic, response, session_id.0);
-                send_message_bounded(client, msg, MESSAGE_SEND_BUDGET).await;
-            },
             _ => {},
         }
     }
@@ -435,6 +403,16 @@ fn is_active_run_message(
     message: &astrid_types::ipc::IpcMessage,
     session_id: &astrid_core::SessionId,
 ) -> bool {
+    // Approval requests are never active-run traffic. No run correlation is
+    // currently authenticated, so answering or resetting on one would cross a
+    // security boundary.
+    if matches!(
+        &message.payload,
+        astrid_types::ipc::IpcPayload::ApprovalRequired { .. }
+    ) {
+        return false;
+    }
+
     match &message.payload {
         astrid_types::ipc::IpcPayload::AgentResponse {
             session_id: target, ..
@@ -445,8 +423,7 @@ fn is_active_run_message(
                     == Some(session_id.0.to_string().as_str())
         },
         astrid_types::ipc::IpcPayload::LlmStreamEvent { .. }
-        | astrid_types::ipc::IpcPayload::ToolExecuteResult { .. }
-        | astrid_types::ipc::IpcPayload::ApprovalRequired { .. } => {
+        | astrid_types::ipc::IpcPayload::ToolExecuteResult { .. } => {
             message.source_id == session_id.0
         },
         _ => false,

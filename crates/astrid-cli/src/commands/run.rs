@@ -17,7 +17,8 @@ use crate::formatter::OutputFormat;
 pub(crate) struct RunArgs {
     /// The prompt to send.
     pub prompt: String,
-    /// Auto-approve every tool elicitation (alias `--yolo`).
+    /// Unsupported approval automation (aliases `--yolo` and `--autonomous`);
+    /// rejected before execution.
     #[arg(short = 'y', long = "yes", alias = "yolo", alias = "autonomous")]
     pub auto_approve: bool,
     /// Resume or create a named session for multi-turn scripting.
@@ -41,6 +42,10 @@ pub(crate) struct RunArgs {
 
 /// Top-level entry point for `astrid run`.
 pub(crate) async fn run(args: RunArgs) -> Result<ExitCode> {
+    if args.auto_approve {
+        anyhow::bail!(headless::AUTO_APPROVE_UNSUPPORTED_MESSAGE);
+    }
+
     let format = match args.format.as_str() {
         "json" | "stream-json" => OutputFormat::Json,
         _ => OutputFormat::Pretty,
@@ -59,7 +64,6 @@ pub(crate) async fn run(args: RunArgs) -> Result<ExitCode> {
     let code = headless::run_headless_with_timeout(
         args.prompt,
         format,
-        args.auto_approve,
         args.session_name,
         args.print_session,
         idle_timeout,
@@ -94,6 +98,18 @@ mod tests {
     #[test]
     fn run_idle_timeout_defaults_to_absent() {
         assert!(parse_run_args(&[]).idle_timeout_secs.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_auto_approve_is_rejected_before_execution() {
+        for flag in ["--yes", "--yolo", "--autonomous"] {
+            let error = run(parse_run_args(&[flag]))
+                .await
+                .expect_err("approval automation must be rejected");
+
+            assert!(error.to_string().contains("unsupported"));
+            assert!(error.to_string().contains("correlated"));
+        }
     }
 
     #[test]

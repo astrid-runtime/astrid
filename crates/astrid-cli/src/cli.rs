@@ -67,8 +67,8 @@ pub(crate) struct Cli {
     #[arg(short, long)]
     pub prompt: Option<String>,
 
-    /// Auto-approve all tool approval requests in headless mode (autonomous/yolo mode).
-    /// Without this flag, headless mode auto-denies approvals.
+    /// Unsupported approval automation in headless mode (aliases `--yolo` and
+    /// `--autonomous`); rejected before headless execution.
     #[arg(short = 'y', long = "yes", alias = "yolo", alias = "autonomous")]
     pub auto_approve: bool,
 
