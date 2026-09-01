@@ -191,7 +191,9 @@ impl CanonicalInstalledState {
 }
 
 fn canonical_owner_bytes(owner: OwnerId) -> PackageServiceResult<[u8; 36]> {
-    let mut encoded = [0_u8; OwnerId::ENCODED_LEN];
+    // Output scratch for the canonical encoder, not a nonce, key, or IV:
+    // `encode_canonical` overwrites every byte of an exactly sized buffer.
+    let mut encoded: [u8; OwnerId::ENCODED_LEN] = core::array::from_fn(|_| 0);
     owner
         .encode_canonical(&mut encoded)
         .map_err(|_| PackageServiceError::ZeroValue)?;
