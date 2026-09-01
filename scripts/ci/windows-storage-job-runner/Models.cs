@@ -103,6 +103,7 @@ internal static class JobProcessList
                     }
 
                     bufferLength = GetGrownCapacity(buffer, bufferLength, returnLength);
+                    continue;
                 }
 
                 if (win32Error != 234)
