@@ -86,6 +86,7 @@ struct GatewayState {
     shutdown_result: Mutex<Option<GatewayControlAck>>,
     shutdown_finished: Notify,
     shutdown_ack_sent: Notify,
+    stop_ack_waiters: AtomicUsize,
 }
 
 impl GatewayState {
@@ -107,6 +108,7 @@ impl GatewayState {
             shutdown_result: Mutex::new(None),
             shutdown_finished: Notify::new(),
             shutdown_ack_sent: Notify::new(),
+            stop_ack_waiters: AtomicUsize::new(0),
         }
     }
 
@@ -346,6 +348,52 @@ impl GatewayState {
             finished.await;
         }
     }
+
+    fn begin_stop_ack(&self) {
+        self.stop_ack_waiters.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn finish_stop_ack(&self) {
+        let remaining = self.stop_ack_waiters.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(remaining > 0, "shutdown ACK waiter count underflow");
+        if remaining == 1 {
+            // Unlike `notify_waiters`, `notify_one` retains a permit when the
+            // run loop has not yet registered. The waiter count, not the
+            // notification, is what prevents the first ACK from releasing run.
+            self.shutdown_ack_sent.notify_one();
+        }
+    }
+
+    async fn wait_for_stop_acks(&self) {
+        loop {
+            let delivered = self.shutdown_ack_sent.notified();
+            if self.stop_ack_waiters.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            delivered.await;
+        }
+    }
+}
+
+struct StartupLeaseGuard {
+    boot_token: String,
+    armed: bool,
+}
+
+impl StartupLeaseGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StartupLeaseGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) = remove_gateway_startup_lease(Some(&self.boot_token))
+        {
+            warn!(error = %error, "failed to remove MCP gateway startup lease");
+        }
+    }
 }
 
 struct ConnectionGuard {
@@ -395,6 +443,24 @@ pub(crate) async fn run(principal: Option<&str>) -> Result<ExitCode> {
     })?;
     let daemon_root = std::env::current_dir().context("failed to read MCP gateway cwd")?;
 
+    let boot_token = mint_boot_token();
+    let gateway_exe = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .context("failed to resolve MCP gateway executable identity")?;
+    let startup_lease = GatewayStartupLease {
+        version: 1,
+        principal: caller.to_string(),
+        boot_token: boot_token.clone(),
+        supervisor_pid: std::process::id(),
+        gateway_pid: Some(std::process::id()),
+        gateway_exe: Some(gateway_exe),
+    };
+    write_gateway_startup_lease(&startup_lease)?;
+    let mut lease_guard = StartupLeaseGuard {
+        boot_token: boot_token.clone(),
+        armed: true,
+    };
+
     // Gateway startup is the one place that may create the persistent daemon.
     // `mcp serve` remains the explicitly requested per-session/ephemeral path.
     crate::commands::daemon::ensure_persistent_daemon("mcp-gateway")
@@ -408,18 +474,9 @@ pub(crate) async fn run(principal: Option<&str>) -> Result<ExitCode> {
         hook_token.clone(),
     ));
     // Warm the authenticated principal selected by `ready`/`gateway` before
-    // accepting any attach registration.
+    // accepting any attach registration. The lease was published first so this
+    // slow, pre-listener generation remains authenticated-stop capable.
     state.client_for(&caller).await?;
-
-    let boot_token = mint_hook_token();
-    let startup_lease = GatewayStartupLease {
-        version: 1,
-        principal: caller.to_string(),
-        boot_token: boot_token.clone(),
-        supervisor_pid: std::process::id(),
-        gateway_pid: Some(std::process::id()),
-    };
-    write_gateway_startup_lease(&startup_lease)?;
     let socket_path = prepare_gateway_socket(&lifecycle).await?;
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("failed to bind MCP gateway at {}", socket_path.display()))?;
@@ -433,6 +490,7 @@ pub(crate) async fn run(principal: Option<&str>) -> Result<ExitCode> {
         hook_token,
     };
     write_gateway_ready(&ready)?;
+    lease_guard.disarm();
     info!(
         principal = %caller,
         socket = %socket_path.display(),
@@ -451,7 +509,6 @@ pub(crate) async fn run(principal: Option<&str>) -> Result<ExitCode> {
     .await;
 
     if control_stop {
-        let ack_sent = state.shutdown_ack_sent.notified();
         let ack = match (&accept_result, &cleanup_result) {
             (Ok(_), Ok(())) => {
                 GatewayControlAck::success(GatewayControlOperation::Stop, std::process::id())
@@ -463,9 +520,12 @@ pub(crate) async fn run(principal: Option<&str>) -> Result<ExitCode> {
             ),
         };
         state.finish_shutdown(ack).await;
-        timeout(crate::commands::daemon_control::GRACE, ack_sent)
-            .await
-            .context("shutdown stage gateway.final_ack_delivery")?;
+        timeout(
+            crate::commands::daemon_control::GRACE,
+            state.wait_for_stop_acks(),
+        )
+        .await
+        .context("shutdown stage gateway.final_ack_delivery")?;
     }
 
     combine_gateway_results(accept_result, cleanup_result)
@@ -483,9 +543,6 @@ fn combine_gateway_results(accept: Result<ExitCode>, cleanup: Result<()>) -> Res
 
 async fn accept_loop(listener: UnixListener, state: Arc<GatewayState>) -> Result<ExitCode> {
     loop {
-        if state.shutdown.is_cancelled() && state.shutdown_result.lock().await.is_some() {
-            return Ok(ExitCode::SUCCESS);
-        }
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted.context("MCP gateway listener failed")?;
@@ -501,13 +558,10 @@ async fn accept_loop(listener: UnixListener, state: Arc<GatewayState>) -> Result
                 });
             }
             () = state.shutdown.cancelled() => {
-                // Keep accepting until final shutdown state is published so
-                // every accepted stopper receives the same idempotent ACK.
-            },
-            () = state.shutdown_finished.notified() => {
-                if state.shutdown_result.lock().await.is_some() {
-                    return Ok(ExitCode::SUCCESS);
-                }
+                // Stop handing out new transports. `run` can now drain the
+                // connections already admitted, finish teardown, and publish
+                // the one final ACK without waiting for this loop.
+                return Ok(ExitCode::SUCCESS);
             },
         }
     }
@@ -699,12 +753,11 @@ where
             // Only an authenticated stop may release itself from the drain.
             // A forged stop remains counted until its rejection is delivered.
             drop(connection.take());
+            state.begin_stop_ack();
             state.shutdown.cancel();
             let ack = state.wait_for_shutdown().await;
             let result = write_control_ack(&mut writer, &ack).await;
-            // `notify_one` retains a permit if the run loop has not polled its
-            // waiter yet, closing the fast-ACK lost-wakeup race.
-            state.shutdown_ack_sent.notify_one();
+            state.finish_stop_ack();
             result
         },
     }
@@ -873,6 +926,10 @@ fn mint_hook_token() -> String {
         Uuid::new_v4().as_simple(),
         Uuid::new_v4().as_simple()
     )
+}
+
+fn mint_boot_token() -> String {
+    Uuid::new_v4().as_simple().to_string()
 }
 
 fn validate_workspace(value: &str) -> Result<PathBuf> {

@@ -56,6 +56,41 @@ fn attach_cap_is_bounded_per_principal_channel() {
     assert_eq!(MAX_ATTACHES, 16);
 }
 
+#[test]
+fn control_tokens_have_distinct_lifetimes_and_widths() {
+    let boot_token = mint_boot_token();
+    let hook_token = mint_hook_token();
+    assert_eq!(boot_token.len(), 32);
+    assert_eq!(hook_token.len(), 64);
+    assert_ne!(boot_token, hook_token);
+}
+
+#[tokio::test]
+async fn every_stopper_is_counted_until_its_ack_delivery_finishes() {
+    let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
+    let state = GatewayState::new(
+        PathBuf::from("/runtime-home"),
+        principal,
+        "gateway-token".into(),
+    );
+    state.begin_stop_ack();
+    state.begin_stop_ack();
+
+    let waiting = state.wait_for_stop_acks();
+    tokio::pin!(waiting);
+    tokio::task::yield_now().await;
+    state.finish_stop_ack();
+    tokio::time::timeout(std::time::Duration::from_millis(20), &mut waiting)
+        .await
+        .expect_err("the final stopper must not release the run loop early");
+
+    tokio::task::yield_now().await;
+    state.finish_stop_ack();
+    tokio::time::timeout(std::time::Duration::from_millis(1), &mut waiting)
+        .await
+        .expect("final ACK delivery must be bounded");
+}
+
 #[tokio::test]
 async fn attach_cap_rejects_the_seventeenth_live_session() {
     let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");

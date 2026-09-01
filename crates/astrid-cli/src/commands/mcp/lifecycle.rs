@@ -24,6 +24,10 @@ const GATEWAY_STARTUP_LEASE_NAME: &str = "mcp-gateway.starting";
 pub(crate) const GATEWAY_CONTROL_VERSION: u8 = 1;
 /// `ready` is a bounded hook probe, never a doctor or full capsule scan.
 pub(crate) const READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Broker warm-up is a legitimate pre-listener startup stage. This budget only
+/// applies while `ready` is waiting for a generation it spawned; control ACKs
+/// continue to use the shorter [`READY_TIMEOUT`].
+const SPAWNED_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const READY_POLL: Duration = Duration::from_millis(100);
 /// A control frame is a tiny owner-local message. This is a protocol/DoS
 /// ceiling, not an operator tuning knob.
@@ -64,6 +68,8 @@ pub(crate) struct GatewayStartupLease {
     pub supervisor_pid: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_exe: Option<PathBuf>,
 }
 
 /// An advisory lock held by one gateway for its entire lifetime.
@@ -155,6 +161,10 @@ pub(crate) fn read_gateway_startup_lease() -> Result<Option<GatewayStartupLease>
                 || lease.boot_token.len() != 32
                 || lease.supervisor_pid == 0
                 || lease.gateway_pid.is_some_and(|pid| pid == 0)
+                || lease
+                    .gateway_exe
+                    .as_ref()
+                    .is_none_or(|path| path.as_os_str().is_empty())
             {
                 anyhow::bail!("invalid MCP gateway startup lease at {}", path.display());
             }
@@ -390,7 +400,7 @@ pub(crate) async fn wait_for_gateway(principal: &PrincipalId, format: &str) -> R
     let format = ReadyFormat::parse(format)?;
     let socket = gateway_socket_path()?;
     let deadline = Instant::now()
-        .checked_add(READY_TIMEOUT)
+        .checked_add(SPAWNED_READY_TIMEOUT)
         .unwrap_or_else(Instant::now);
     let mut spawned = false;
     loop {
@@ -437,7 +447,7 @@ pub(crate) async fn wait_for_gateway(principal: &PrincipalId, format: &str) -> R
                 if Instant::now() >= deadline {
                     anyhow::bail!(
                         "MCP gateway startup supervisor remained active within {} seconds",
-                        READY_TIMEOUT.as_secs()
+                        SPAWNED_READY_TIMEOUT.as_secs()
                     );
                 }
                 tokio::time::sleep(READY_POLL).await;
@@ -454,34 +464,35 @@ pub(crate) async fn wait_for_gateway(principal: &PrincipalId, format: &str) -> R
                     anyhow::bail!(
                         "MCP gateway PID {} is still starting within {} seconds",
                         lease.supervisor_pid,
-                        READY_TIMEOUT.as_secs()
+                        SPAWNED_READY_TIMEOUT.as_secs()
                     );
                 }
                 tokio::time::sleep(READY_POLL).await;
                 continue;
             }
-            let lifecycle = try_acquire_gateway_lifecycle()?;
-            if lifecycle.is_some() {
+            let Some(lifecycle) = try_acquire_gateway_lifecycle()? else {
                 drop(supervisor);
                 if Instant::now() >= deadline {
                     anyhow::bail!(
                         "MCP gateway is starting but has not published readiness within {} seconds",
-                        READY_TIMEOUT.as_secs()
+                        SPAWNED_READY_TIMEOUT.as_secs()
                     );
                 }
                 tokio::time::sleep(READY_POLL).await;
                 continue;
-            }
-            clean_unowned_gateway_startup()
+            };
+            clean_unowned_gateway_startup(&lifecycle)
                 .await
                 .context("shutdown stage gateway.startup_cleanup")?;
             spawn_gateway(principal)?;
+            drop(lifecycle);
+            drop(supervisor);
             spawned = true;
         }
         if Instant::now() >= deadline {
             anyhow::bail!(
                 "MCP gateway did not become ready within {} seconds",
-                READY_TIMEOUT.as_secs()
+                SPAWNED_READY_TIMEOUT.as_secs()
             );
         }
         tokio::time::sleep(READY_POLL).await;
@@ -499,13 +510,17 @@ pub(crate) async fn stop_gateway() -> Result<()> {
         let deadline = Instant::now()
             .checked_add(READY_TIMEOUT)
             .unwrap_or_else(Instant::now);
-        while try_acquire_gateway_lifecycle()?.is_none()
-            || read_gateway_startup_lease()?.is_some_and(|lease| {
-                crate::commands::daemon_control::is_process_alive(lease.supervisor_pid)
-            })
-        {
+        while try_acquire_gateway_lifecycle()?.is_none() {
             if let Some(record) = read_gateway_ready()? {
                 return stop_ready_gateway(record, socket).await;
+            }
+            if let Some(lease) = read_gateway_startup_lease()?
+                && lease
+                    .gateway_pid
+                    .is_some_and(crate::commands::daemon_control::is_process_alive)
+            {
+                stop_startup_gateway(&lease).await?;
+                continue;
             }
             if Instant::now() >= deadline {
                 anyhow::bail!(
@@ -518,7 +533,7 @@ pub(crate) async fn stop_gateway() -> Result<()> {
         let lifecycle = try_acquire_gateway_lifecycle()?.ok_or_else(|| {
             anyhow::anyhow!("shutdown stage gateway.startup_stop: lifecycle changed")
         })?;
-        clean_unowned_gateway_startup()
+        clean_unowned_gateway_startup(&lifecycle)
             .await
             .context("shutdown stage gateway.stale_listener_cleanup")?;
         drop(lifecycle);
@@ -566,9 +581,35 @@ async fn stop_ready_gateway(record: GatewayReady, socket: PathBuf) -> Result<()>
     remove_dead_gateway_markers(&record).await
 }
 
-async fn clean_unowned_gateway_startup() -> Result<()> {
-    let lifecycle = try_acquire_gateway_lifecycle()?
-        .ok_or_else(|| anyhow::anyhow!("MCP gateway lifecycle remains held"))?;
+async fn stop_startup_gateway(lease: &GatewayStartupLease) -> Result<()> {
+    let Some(gateway_pid) = lease.gateway_pid else {
+        anyhow::bail!("shutdown stage gateway.startup_identity: lease has no gateway PID");
+    };
+    let Some(gateway_exe) = lease.gateway_exe.as_deref() else {
+        anyhow::bail!("shutdown stage gateway.startup_identity: lease has no executable");
+    };
+    let current = read_gateway_startup_lease()?.ok_or_else(|| {
+        anyhow::anyhow!("shutdown stage gateway.startup_identity: lease disappeared")
+    })?;
+    if current != *lease {
+        anyhow::bail!("shutdown stage gateway.startup_identity: startup generation changed");
+    }
+
+    let outcome =
+        crate::commands::daemon_control::terminate_known(gateway_pid, Some(gateway_exe)).await;
+    if !matches!(
+        outcome,
+        crate::commands::daemon_control::KillOutcome::TermExited
+            | crate::commands::daemon_control::KillOutcome::KilledExited
+    ) {
+        anyhow::bail!(
+            "shutdown stage gateway.startup_reap: starting gateway PID {gateway_pid} is {outcome:?}"
+        );
+    }
+    Ok(())
+}
+
+async fn clean_unowned_gateway_startup(lifecycle: &GatewayLifecycleLock) -> Result<()> {
     let socket = gateway_socket_path()?;
     match astrid_core::local_transport::connect_outcome(&socket)
         .await
@@ -584,7 +625,7 @@ async fn clean_unowned_gateway_startup() -> Result<()> {
         ),
     }
     remove_gateway_startup_lease(None).context("shutdown stage gateway.startup_cleanup")?;
-    drop(lifecycle);
+    let _ = lifecycle.file();
     Ok(())
 }
 
@@ -887,144 +928,5 @@ fn process_command(pid: u32) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use tokio::io::{AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
-
-    use super::*;
-
-    #[test]
-    fn gateway_lifecycle_admits_only_one_generation() {
-        let first = try_acquire_gateway_lifecycle()
-            .expect("lifecycle probe")
-            .expect("first generation owns the lifecycle");
-        assert!(
-            try_acquire_gateway_lifecycle()
-                .expect("lifecycle probe")
-                .is_none(),
-            "a successor must not bind while a generation lifecycle is held"
-        );
-        drop(first);
-        assert!(
-            try_acquire_gateway_lifecycle()
-                .expect("lifecycle probe")
-                .is_some(),
-            "releasing the lifecycle must permit the next generation"
-        );
-    }
-
-    #[test]
-    fn process_parser_preserves_command_after_pid_fields() {
-        let row = parse_process_row(" 123  1 /usr/local/bin/aos mcp serve --request-timeout 1d5m")
-            .expect("process row");
-        assert_eq!(row.pid, 123);
-        assert_eq!(row.ppid, 1);
-        assert!(is_long_mcp_serve(&row.command));
-    }
-
-    #[test]
-    fn gc_match_is_exact_about_timeout_and_verb() {
-        assert!(is_long_mcp_serve("aos mcp serve --request-timeout 1d5m"));
-        assert!(is_long_mcp_serve("aos mcp serve --request-timeout=1d5m"));
-        assert!(!is_long_mcp_serve("aos mcp serve --request-timeout 30s"));
-        assert!(!is_long_mcp_serve("aos mcp gateway --request-timeout 1d5m"));
-    }
-
-    #[test]
-    fn gc_reaps_orphaned_attach_but_never_python_frames() {
-        assert!(is_mcp_attach(
-            "/Users/me/.aos/runtime/bin/astrid --principal codex-code mcp attach --workspace /tmp/proj"
-        ));
-        assert!(is_mcp_attach("aos --principal codex-code mcp attach"));
-        assert!(!is_mcp_attach(
-            "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python -u /cache/unicity-aos/bin/aos-mcp-frame /runtime/bin/astrid --principal codex-code mcp attach --workspace /plugin"
-        ));
-        assert!(is_python_frame(
-            "Python -u /cache/bin/aos-mcp-frame astrid --principal codex-code mcp attach"
-        ));
-        assert!(!is_mcp_attach(
-            "node worker.js mcp attach --workspace /tmp/astrid"
-        ));
-        assert!(!is_mcp_attach("node /tmp/astrid worker.js mcp attach"));
-        assert!(is_mcp_attach(
-            "env ASTRID_SESSION_ID=thread-1 /opt/aos mcp attach --workspace /tmp/proj"
-        ));
-        assert!(!is_mcp_attach("astrid --principal codex-code mcp gateway"));
-        assert!(!is_mcp_attach("aos mcp serve --request-timeout 1d5m"));
-    }
-
-    #[test]
-    fn ready_record_is_stable_json_contract() {
-        let record = GatewayReady {
-            version: 1,
-            principal: "codex-code".into(),
-            pid: 42,
-            hook_token: "test-hook-token".into(),
-        };
-        let body = serde_json::to_string(&record).expect("record json");
-        assert_eq!(serde_json::from_str::<GatewayReady>(&body).unwrap(), record);
-        assert_eq!(ReadyFormat::parse("hook").unwrap(), ReadyFormat::Hook);
-    }
-
-    #[test]
-    fn ready_cleanup_cannot_remove_a_successor_record() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let path = temp.path().join(GATEWAY_READY_NAME);
-        let old = GatewayReady {
-            version: 1,
-            principal: "codex-code".into(),
-            pid: 41,
-            hook_token: "old-token".into(),
-        };
-        let successor = GatewayReady {
-            version: 1,
-            principal: "codex-code".into(),
-            pid: 42,
-            hook_token: "successor-token".into(),
-        };
-        std::fs::write(&path, serde_json::to_vec(&successor).unwrap()).unwrap();
-
-        let error = remove_gateway_ready_at(&path, &old)
-            .expect_err("old cleanup must not remove a successor marker");
-        assert!(error.to_string().contains("readiness changed"));
-        assert_eq!(
-            read_gateway_ready_at(&path).unwrap(),
-            Some(successor.clone())
-        );
-
-        remove_gateway_ready_at(&path, &successor).expect("successor removes its own marker");
-        assert!(!path.exists());
-    }
-
-    #[tokio::test]
-    async fn control_ack_is_bound_to_operation_pid_and_success() {
-        for ack in [
-            GatewayControlAck::success(GatewayControlOperation::Stop, 42),
-            GatewayControlAck::success(GatewayControlOperation::Health, 43),
-            GatewayControlAck::failure(GatewayControlOperation::Health, 42, "uplink unavailable"),
-        ] {
-            let (client, server) = UnixStream::pair().expect("stream pair");
-            let serving = tokio::spawn(async move {
-                let (read_half, mut write_half) = server.into_split();
-                let mut reader = BufReader::new(read_half);
-                let request = read_bounded_line(&mut reader).await.expect("request");
-                serde_json::from_slice::<GatewayControlRequest>(&request).expect("valid request");
-                write_half
-                    .write_all(&serde_json::to_vec(&ack).unwrap())
-                    .await
-                    .unwrap();
-                write_half.write_all(b"\n").await.unwrap();
-            });
-            let record = GatewayReady {
-                version: 1,
-                principal: "codex-code".into(),
-                pid: 42,
-                hook_token: "gateway-token".into(),
-            };
-            request_gateway_control(client, &record, GatewayControlOperation::Health)
-                .await
-                .expect_err("an unbound or unsuccessful ACK must fail");
-            serving.await.expect("fake server");
-        }
-    }
-}
+#[path = "lifecycle_tests.rs"]
+mod tests;

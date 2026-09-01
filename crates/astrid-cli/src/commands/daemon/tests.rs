@@ -13,6 +13,18 @@ fn fresh_home_boot_log_does_not_preinitialize_layout() {
     );
 }
 
+#[test]
+fn fresh_home_start_fence_lives_outside_the_layout() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("astrid-home");
+    let home = astrid_core::dirs::AstridHome::from_path(&root);
+    let fence = daemon_start_fence_path(&home);
+
+    assert!(fence.starts_with(std::env::temp_dir()));
+    assert!(!fence.starts_with(home.root()));
+    assert!(!root.exists());
+}
+
 #[tokio::test]
 async fn already_stopped_fresh_home_does_not_create_layout() {
     let temp = tempfile::tempdir().expect("temp dir");

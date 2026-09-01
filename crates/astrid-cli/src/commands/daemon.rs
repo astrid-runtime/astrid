@@ -432,7 +432,7 @@ fn start_clears_sentinels(action: StartAction) -> bool {
 /// that the same pathname is dead and race their children onto the singleton.
 pub(crate) async fn acquire_daemon_start_fence() -> Result<Arc<std::fs::File>> {
     let home = astrid_core::dirs::AstridHome::resolve().context("failed to resolve Astrid home")?;
-    let path = home.run_dir().join("system.start.lock");
+    let path = daemon_start_fence_path(&home);
     let file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -457,6 +457,14 @@ pub(crate) async fn acquire_daemon_start_fence() -> Result<Arc<std::fs::File>> {
     .context("daemon start fence task failed")?
     .map_err(|error| anyhow::anyhow!("failed to acquire daemon start fence: {error}"))?;
     Ok(Arc::new(file))
+}
+
+/// Keep the start fence outside the home until the kernel admits its layout.
+fn daemon_start_fence_path(home: &astrid_core::dirs::AstridHome) -> std::path::PathBuf {
+    let digest = blake3::hash(home.root().to_string_lossy().as_bytes());
+    std::env::temp_dir()
+        .join("astrid-start-fences")
+        .join(format!("{digest}.lock"))
 }
 
 /// Handle `astrid start`.
@@ -643,16 +651,36 @@ fn status_response(response: KernelResponse) -> Result<DaemonStatus> {
 /// `astrid start`/`restart` still see the recorded PID and give an actionable
 /// message instead of failing on the held lock with a raw DB error.
 pub(crate) async fn handle_stop() -> Result<()> {
+    // A pre-lease gateway may legitimately hold the start fence while it boots
+    // its daemon. Stop the gateway first so stop can reap it; then the fence
+    // linearizes the daemon phase against any other start/restart.
     let gateway = crate::commands::mcp::stop_gateway().await;
+    let start_fence = acquire_daemon_start_fence().await?;
     let daemon = stop_daemon().await;
+    drop(start_fence);
     let disposition = combine_stop_results(gateway, daemon)?;
+    print_stop_disposition(disposition);
+    Ok(())
+}
+
+pub(crate) async fn handle_gateway_stop() -> Result<()> {
+    crate::commands::mcp::stop_gateway().await
+}
+
+/// Stop only the daemon while the caller already owns the start fence.
+pub(crate) async fn handle_daemon_stop_locked() -> Result<()> {
+    let result = stop_daemon().await;
+    print_stop_disposition(result?);
+    Ok(())
+}
+
+fn print_stop_disposition(disposition: DaemonStopDisposition) {
     let message = match disposition {
         DaemonStopDisposition::AlreadyStopped => "Astrid runtime is stopped.",
         DaemonStopDisposition::Graceful => "Astrid runtime stopped.",
         DaemonStopDisposition::Forced => "Stopped the unresponsive Astrid runtime.",
     };
     println!("{}", theme::Theme::success(message));
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -89,7 +89,7 @@ pub(crate) async fn terminate_identity(identity: &DaemonIdentity, pid_path: &Pat
         && read_daemon_identity_from_contents(
             &std::fs::read_to_string(pid_path).unwrap_or_default(),
         )
-        .is_some_and(|current| current.boot_nonce.as_deref() != Some(expected.as_str()))
+        .is_none_or(|current| current.boot_nonce.as_deref() != Some(expected.as_str()))
     {
         return KillOutcome::Unverified(identity.pid);
     }
@@ -590,6 +590,40 @@ mod tests {
         std::fs::write(&path, format!("{me}")).unwrap();
         assert_eq!(terminate_orphan(&path).await, KillOutcome::Unverified(me));
         assert!(is_process_alive(me));
+    }
+
+    #[tokio::test]
+    async fn captured_nonce_fails_closed_when_current_pid_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("system.pid");
+        let identity = DaemonIdentity {
+            pid: std::process::id(),
+            exe: std::env::current_exe().ok(),
+            boot_nonce: Some("captured-generation".into()),
+        };
+
+        assert_eq!(
+            terminate_identity(&identity, &path).await,
+            KillOutcome::Unverified(identity.pid)
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_nonce_fails_closed_when_current_pid_file_is_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("system.pid");
+        std::fs::write(&path, b"not-a-daemon-generation\n").unwrap();
+        let identity = DaemonIdentity {
+            pid: std::process::id(),
+            exe: std::env::current_exe().ok(),
+            boot_nonce: Some("captured-generation".into()),
+        };
+
+        assert_eq!(
+            terminate_identity(&identity, &path).await,
+            KillOutcome::Unverified(identity.pid)
+        );
+        assert!(is_process_alive(std::process::id()));
     }
 
     #[test]

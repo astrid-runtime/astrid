@@ -19,8 +19,9 @@ use crate::theme::Theme;
 pub(crate) async fn run() -> Result<ExitCode> {
     // Own the recovery/start boundary across stop, stale-marker recovery, and
     // the replacement boot so a concurrent `start` cannot heal the same files.
+    daemon::handle_gateway_stop().await?;
     let start_fence = daemon::acquire_daemon_start_fence().await?;
-    daemon::handle_stop().await?;
+    daemon::handle_daemon_stop_locked().await?;
 
     // Wait until the socket file is gone — `handle_stop` returns as
     // soon as the daemon acknowledges the request, but the actual
