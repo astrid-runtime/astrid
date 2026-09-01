@@ -311,6 +311,15 @@ fn publish_root(
     Ok(())
 }
 
+fn reset_to_generation_zero(state: &mut ContainerState) -> io::Result<()> {
+    state.generation = 0;
+    state.root_base = u64::try_from(VOLUME_MAGIC.len())
+        .map_err(|_| io::Error::other("volume header length overflow"))?;
+    state.root_slot = RootSlot::First;
+    state.physical_tail = PhysicalTail::TruncateToValid;
+    Ok(())
+}
+
 fn install_image(state: &mut ContainerState, image: ContainerState) {
     let ContainerState {
         file,
@@ -525,6 +534,7 @@ pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
     replacement.try_lock_exclusive()?;
     let placeholder = std::mem::replace(&mut state.file, replacement);
     drop(placeholder);
+    reset_to_generation_zero(&mut state)?;
     state.sequence = rebuilt_sequence;
     state.valid_len = rebuilt_len;
     state.durable_len = rebuilt_len;

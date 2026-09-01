@@ -190,15 +190,21 @@ fn recovery_from_pointer(
         .footer_offset
         .checked_add(FOOTER_BYTES as u64)
         .ok_or_else(|| invalid_transition("volume root authority overflow"))?;
-    let Some(mut recovery) = recover_footer_at(file, pointer.footer_offset, authority_len, true)?
-    else {
-        return Ok(None);
+    let recovery = match recover_footer_at(file, pointer.footer_offset, authority_len, true) {
+        Ok(Some(recovery)) => recovery,
+        Ok(None) => return Ok(None),
+        // A checksummed root can name an unrecoverable generation. Treat
+        // framing/checksum rejection as "not selected" while retaining real
+        // I/O failures for the caller.
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => return Ok(None),
+        Err(error) => return Err(error),
     };
-    recovery.generation = pointer.generation;
-    recovery.root_base = pointer.root_base;
-    recovery.pointer_slot = pointer.slot;
-    recovery.authority_len = authority_len;
-    Ok(Some(recovery))
+    Ok(Some(Recovery {
+        generation: pointer.generation,
+        root_base: pointer.root_base,
+        pointer_slot: pointer.slot,
+        ..recovery
+    }))
 }
 
 fn recover_from_root(file: &mut File) -> io::Result<Option<Recovery>> {

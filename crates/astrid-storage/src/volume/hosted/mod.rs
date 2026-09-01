@@ -746,3 +746,6 @@ pub(crate) use stream::write_record_payloads;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod root_tests;
