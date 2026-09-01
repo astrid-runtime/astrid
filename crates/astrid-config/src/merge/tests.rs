@@ -999,6 +999,45 @@ fn test_daemon_ready_secs_can_increase() {
 }
 
 #[test]
+fn test_process_stop_timeouts_cannot_increase() {
+    let baseline: toml::Value = toml::from_str(
+        r"
+        [timeouts]
+        process_stop_ack_secs = 10
+        process_reap_grace_secs = 10
+        process_killed_reap_secs = 10
+    ",
+    )
+    .unwrap();
+
+    let workspace: toml::Value = toml::from_str(
+        r"
+        [timeouts]
+        process_stop_ack_secs = 61
+        process_reap_grace_secs = 61
+        process_killed_reap_secs = 61
+    ",
+    )
+    .unwrap();
+
+    let mut merged = baseline.clone();
+    deep_merge(&mut merged, &workspace);
+    enforce_restrictions(&mut merged, &baseline, &workspace);
+
+    for field in [
+        "process_stop_ack_secs",
+        "process_reap_grace_secs",
+        "process_killed_reap_secs",
+    ] {
+        assert_eq!(
+            merged["timeouts"][field].as_integer().unwrap(),
+            10,
+            "{field} is a tightening-only workspace control"
+        );
+    }
+}
+
+#[test]
 fn test_allow_http_hooks_cannot_enable() {
     let baseline: toml::Value = toml::from_str(
         r"

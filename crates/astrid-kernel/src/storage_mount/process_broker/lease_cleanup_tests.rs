@@ -10,26 +10,51 @@ use astrid_core::storage_provider::{
     StorageMountId, StorageProviderAccessV1, StorageProviderViewV1,
 };
 
-use super::revoke_projection_leases;
+use super::{
+    ProcessProjectionBinding, ProcessProjectionTarget, ProcessProjectionTargetSet,
+    ProjectionGeneration, ProjectionLeaseTarget, revoke_projection_leases,
+};
 use crate::storage_mount::{
     MountCleanupStage, MountOwnerScope, clear_cleanup_fault_for_test,
     inject_cleanup_fault_for_test, issue_lease, test_mount_admission,
 };
 
-async fn issue_named_lease(
+fn projection_binding(kernel: &crate::Kernel, caller: &PrincipalId) -> ProcessProjectionBinding {
+    let uid = kernel
+        .principal_directory
+        .uid_for(caller)
+        .expect("test caller storage identity");
+    let owner = astrid_storage::StateOwner::Principal(uid);
+    ProcessProjectionBinding::new(
+        owner,
+        uid,
+        ProjectionGeneration::capture().expect("test projection generation"),
+        ProcessProjectionTargetSet::branch(
+            owner,
+            uid,
+            astrid_core::WorkspaceUid::from_bytes([0xC1; 16]),
+            None,
+        )
+        .expect("valid target set"),
+    )
+    .expect("valid projection binding")
+}
+
+async fn issue_home_lease(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
-    view: StorageProviderViewV1,
     owner_scope: MountOwnerScope,
     mountpoint: std::path::PathBuf,
 ) -> astrid_core::storage_filesystem::StorageMountLeaseV1 {
     issue_lease(
         kernel,
         &test_mount_admission(kernel, caller, owner_scope),
-        view,
-        StorageFilesystemTargetV1::OwnerRoot,
+        StorageProviderViewV1::Principal(caller.clone()),
+        StorageFilesystemTargetV1::OwnerSubtree {
+            prefix: "home".to_owned(),
+        },
         StorageProviderAccessV1::ReadWrite,
-        "test-provider".to_owned(),
+        super::platform_process_provider_name().to_owned(),
         mountpoint,
     )
     .await
@@ -42,6 +67,16 @@ fn mapped(kernel: &crate::Kernel, mount_id: StorageMountId) -> bool {
 
 fn callback_endpoint_present(path: &Path) -> bool {
     astrid_core::local_transport::endpoint_is_present(path).expect("callback endpoint state")
+}
+
+fn home_target(
+    mount_id: StorageMountId,
+    target: &ProcessProjectionTarget,
+) -> ProjectionLeaseTarget {
+    ProjectionLeaseTarget {
+        mount_id,
+        target: target.clone(),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -60,27 +95,25 @@ async fn projection_cleanup_revokes_every_lease_on_fault(fault: MountCleanupStag
     let home = AstridHome::from_path(temporary.path().join(".astrid"));
     let kernel = Arc::new(crate::test_kernel_with_home(home).await);
     let caller = PrincipalId::default();
-    let branch = issue_named_lease(
+    let binding = projection_binding(&kernel, &caller);
+    let branch = issue_home_lease(
         &kernel,
         &caller,
-        StorageProviderViewV1::Principal(caller.clone()),
         MountOwnerScope::CallerOnly,
         temporary.path().join("branch-mount"),
     )
     .await;
-    let owner = issue_named_lease(
+    let owner = issue_home_lease(
         &kernel,
         &caller,
-        StorageProviderViewV1::Principal(caller.clone()),
         MountOwnerScope::CallerOnly,
         temporary.path().join("owner-mount"),
     )
     .await;
-    let shared = issue_named_lease(
+    let shared = issue_home_lease(
         &kernel,
         &caller,
-        StorageProviderViewV1::Admin,
-        MountOwnerScope::CrossOwnerWrite,
+        MountOwnerScope::CallerOnly,
         temporary.path().join("shared-mount"),
     )
     .await;
@@ -89,13 +122,16 @@ async fn projection_cleanup_revokes_every_lease_on_fault(fault: MountCleanupStag
     let shared_state = Arc::clone(kernel.storage_mounts.get(&shared.mount_id).unwrap().value());
     inject_cleanup_fault_for_test(&branch_state, fault);
 
+    let branch_target = home_target(branch.mount_id, &binding.targets.owner_home);
+    let owner_target = home_target(owner.mount_id, &binding.targets.owner_home);
+    let shared_target = home_target(shared.mount_id, &binding.targets.owner_home);
     assert!(
         !revoke_projection_leases(
             &kernel,
-            &caller,
-            branch.mount_id,
-            owner.mount_id,
-            Some(shared.mount_id),
+            &binding,
+            &branch_target,
+            &owner_target,
+            Some(&shared_target),
         )
         .await
     );
@@ -105,30 +141,48 @@ async fn projection_cleanup_revokes_every_lease_on_fault(fault: MountCleanupStag
     assert!(shared_state.is_revoked_for_test());
     match fault {
         MountCleanupStage::Callback => {
-            assert_eq!(callback_endpoint_present(&branch.callback_path), cfg!(unix));
+            #[cfg(unix)]
+            {
+                assert!(callback_endpoint_present(&branch.callback_path));
+                assert!(callback_endpoint_present(&owner.callback_path));
+                assert!(callback_endpoint_present(&shared.callback_path));
+            }
         },
+        // Drain timeout is a lifecycle admission boundary, not an injected
+        // resource-cleanup fault used by this fixture.
+        MountCleanupStage::Drain => unreachable!("cleanup fixtures never inject drain"),
         MountCleanupStage::Manifest => {
+            #[cfg(unix)]
+            {
+                assert!(!callback_endpoint_present(&branch.callback_path));
+                assert!(callback_endpoint_present(&owner.callback_path));
+                assert!(callback_endpoint_present(&shared.callback_path));
+            }
             assert!(!callback_endpoint_present(&branch.callback_path));
             assert!(branch.resource_path.join("lease.json").exists());
         },
         MountCleanupStage::Directory => {
+            #[cfg(unix)]
+            {
+                assert!(!callback_endpoint_present(&branch.callback_path));
+                assert!(callback_endpoint_present(&owner.callback_path));
+                assert!(callback_endpoint_present(&shared.callback_path));
+            }
             assert!(!callback_endpoint_present(&branch.callback_path));
             assert!(branch.resource_path.exists());
         },
     }
-    assert!(!mapped(&kernel, owner.mount_id));
-    assert!(!mapped(&kernel, shared.mount_id));
-    assert!(!callback_endpoint_present(&owner.callback_path));
-    assert!(!callback_endpoint_present(&shared.callback_path));
+    assert!(mapped(&kernel, owner.mount_id));
+    assert!(mapped(&kernel, shared.mount_id));
 
     clear_cleanup_fault_for_test(&branch_state);
     assert!(
         revoke_projection_leases(
             &kernel,
-            &caller,
-            branch.mount_id,
-            owner.mount_id,
-            Some(shared.mount_id),
+            &binding,
+            &branch_target,
+            &owner_target,
+            Some(&shared_target),
         )
         .await
     );

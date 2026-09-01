@@ -16,9 +16,9 @@ use astrid_storage::{AstridFilesystem, StateOwner, WorkspaceBranchStore};
 use serde_json::json;
 
 use super::StorageMountLeaseState;
-#[cfg(test)]
 use super::cleanup::MountCleanupStage;
 use super::cleanup::{MountCleanupError, cleanup_error, cleanup_resource_paths};
+use super::drain_state::{DrainFailureKind, DrainSettlement};
 use super::filesystem::{CallbackFilesystem, PrefixedFilesystem};
 use crate::Kernel;
 
@@ -318,10 +318,27 @@ pub(super) fn cleanup_unpublished(
         .map_err(|(stage, source)| cleanup_error(None, stage, source).to_string())
 }
 
-pub(super) fn cleanup_mapped_lease(
+pub(crate) fn cleanup_mapped_lease(
     kernel: &Kernel,
     state: &StorageMountLeaseState,
 ) -> Result<(), MountCleanupError> {
+    cleanup_mapped_lease_resources(state)?;
+    complete_cleanup_ledger(state)
+        .map_err(|(stage, source)| cleanup_error(Some(state.mount_id), stage, source))?;
+    kernel.storage_mounts.remove(&state.mount_id);
+    Ok(())
+}
+
+/// Remove one mapped lease's host resources without changing authority.
+///
+/// Issue-set rollback uses this two-phase form so one failed resource cannot
+/// strand the other members as unmapped authority.
+pub(crate) fn cleanup_mapped_lease_resources(
+    state: &StorageMountLeaseState,
+) -> Result<(), MountCleanupError> {
+    if cleanup_ledger_is_clean(state) {
+        return Ok(());
+    }
     let fault = {
         #[cfg(test)]
         {
@@ -334,11 +351,69 @@ pub(super) fn cleanup_mapped_lease(
     };
     cleanup_resource_paths(&state.resource_path, &state.callback_path, fault)
         .map_err(|(stage, source)| cleanup_error(Some(state.mount_id), stage, source))?;
-    kernel.storage_mounts.remove(&state.mount_id);
+    record_cleanup_ledger(state)
+        .map_err(|(stage, source)| cleanup_error(Some(state.mount_id), stage, source))?;
+    Ok(())
+}
+
+fn cleanup_ledger_is_clean(state: &StorageMountLeaseState) -> bool {
+    let expected = state.mount_id.to_string();
+    state.cleanup_ledger_path.is_file()
+        && std::fs::read(&state.cleanup_ledger_path).is_ok_and(|bytes| bytes == expected.as_bytes())
+}
+
+fn record_cleanup_ledger(
+    state: &StorageMountLeaseState,
+) -> Result<(), (MountCleanupStage, std::io::Error)> {
+    let parent = state.cleanup_ledger_path.parent().ok_or_else(|| {
+        (
+            MountCleanupStage::Manifest,
+            std::io::Error::other("cleanup ledger has no parent"),
+        )
+    })?;
+    astrid_core::platform_fs::ensure_private_directory(parent).map_err(|error| {
+        (
+            MountCleanupStage::Manifest,
+            std::io::Error::other(format!("create cleanup ledger directory: {error}")),
+        )
+    })?;
+    astrid_core::platform_fs::atomic_write_private_file(
+        &state.cleanup_ledger_path,
+        state.mount_id.to_string().as_bytes(),
+    )
+    .map_err(|error| {
+        (
+            MountCleanupStage::Manifest,
+            std::io::Error::other(format!("write cleanup ledger: {error}")),
+        )
+    })
+}
+
+pub(crate) fn complete_cleanup_ledger(
+    state: &StorageMountLeaseState,
+) -> Result<(), (MountCleanupStage, std::io::Error)> {
+    match std::fs::remove_file(&state.cleanup_ledger_path) {
+        Ok(()) => {},
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(error) => {
+            return Err((
+                MountCleanupStage::Manifest,
+                std::io::Error::other(format!("remove cleanup ledger: {error}")),
+            ));
+        },
+    }
+    if let Some(parent) = state.cleanup_ledger_path.parent() {
+        #[cfg(windows)]
+        {
+            let _ = std::fs::remove_file(parent.join(".astrid-private-write.lock"));
+        }
+        let _ = std::fs::remove_dir(parent);
+    }
     Ok(())
 }
 
 /// Revoke one mapped lease, including a revoked entry left after failed cleanup.
+#[cfg(test)]
 pub(crate) async fn revoke_lease(
     kernel: &Kernel,
     caller: &PrincipalId,
@@ -351,6 +426,73 @@ pub(crate) async fn revoke_lease(
         mount_id,
     )
     .await
+}
+
+/// Force-revoke one projection lease by its immutable requester UID.
+///
+/// Projection drain may run after capability retirement, where reconstructing
+/// a normal alias grant would fail. The caller must still own the exact UID
+/// bound when the lease was issued.
+#[cfg(test)]
+pub(crate) async fn force_revoke_projection_lease(
+    kernel: &Kernel,
+    requester_uid: PrincipalUid,
+    expected_owner: StateOwner,
+    expected_target: &StorageFilesystemTargetV1,
+    mount_id: StorageMountId,
+) -> bool {
+    let state = match mapped_owned_lease(kernel, requester_uid, false, mount_id) {
+        Ok(state) => state,
+        Err(_) if kernel.storage_mounts.get(&mount_id).is_none() => return true,
+        Err(_) => return false,
+    };
+    if state.owner != expected_owner
+        || state.target != *expected_target
+        || state.access != StorageProviderAccessV1::ReadWrite
+    {
+        return false;
+    }
+    state.revoked.store(true, Ordering::Release);
+    let _ = state.shutdown_tx.send(true);
+    if await_retained_drain(&state, true).await.is_err() {
+        return false;
+    }
+    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
+    let cleaned = cleanup_mapped_lease(kernel, &state).is_ok();
+    if cleaned {
+        state.complete_drain_retry();
+    }
+    cleaned
+}
+
+/// Revoke one projection lease without releasing its provider resources.
+///
+/// A retained provider teardown must make the lease unusable immediately, but
+/// cannot prove that the provider endpoint and mount root are gone. Keeping
+/// the revoked map entry lets the bounded retry use the exact provider and
+/// lease again; the mutation fence drains already admitted writers.
+pub(crate) async fn force_fence_projection_lease(
+    kernel: &Kernel,
+    requester_uid: PrincipalUid,
+    expected_owner: StateOwner,
+    expected_target: &StorageFilesystemTargetV1,
+    mount_id: StorageMountId,
+) -> bool {
+    let Ok(state) = mapped_owned_lease(kernel, requester_uid, false, mount_id) else {
+        return kernel.storage_mounts.get(&mount_id).is_none();
+    };
+    if state.owner != expected_owner
+        || state.target != *expected_target
+        || state.access != StorageProviderAccessV1::ReadWrite
+    {
+        return false;
+    }
+    state.revoked.store(true, Ordering::Release);
+    // This is fence-only: retained teardown deliberately leaves the callback
+    // listener and its platform endpoint in place. Actual cleanup and force
+    // revoke own listener shutdown.
+    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
+    true
 }
 
 /// Revoke using a UID-bound grant. Alias equality is never ownership.
@@ -367,6 +509,47 @@ pub(crate) async fn revoke_from_grant(
         mount_id,
     )?;
     force_revoke_lease(kernel, &state).await
+}
+
+async fn force_revoke_lease(kernel: &Kernel, state: &StorageMountLeaseState) -> Result<(), String> {
+    state.revoked.store(true, Ordering::Release);
+    let _ = state.shutdown_tx.send(true);
+    await_retained_drain(state, true).await?;
+    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
+    cleanup_mapped_lease(kernel, state).map_err(|error| error.to_string())
+}
+
+/// Wait outside the mutation fence for the listener's typed retained-work outcome.
+async fn await_retained_drain(
+    state: &StorageMountLeaseState,
+    _caller_requested_latch: bool,
+) -> Result<(), String> {
+    match state.await_listener_settlement().await {
+        DrainSettlement::Failure(failure) => Err(match failure {
+            DrainFailureKind::JoinFailed => cleanup_error(
+                Some(state.mount_id),
+                MountCleanupStage::Drain,
+                std::io::Error::other("retained filesystem worker join failed"),
+            )
+            .to_string(),
+            DrainFailureKind::TimedOut => drain_timeout_error(state).to_string(),
+        }),
+        DrainSettlement::Closed => Ok(()),
+    }
+}
+
+fn drain_timeout_error(state: &StorageMountLeaseState) -> MountCleanupError {
+    cleanup_error(
+        Some(state.mount_id),
+        MountCleanupStage::Drain,
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "retained filesystem jobs did not finish within {:?}",
+                state.drain_timeouts().accepted_task
+            ),
+        ),
+    )
 }
 
 pub(super) async fn revalidate_live_grant(
@@ -392,13 +575,8 @@ pub(crate) async fn revoke_all_leases_for_principal(
     revoke_visible(&mapped_leases_for_principal(kernel, principal, uid));
     let matched = mapped_leases_for_principal(kernel, principal, uid);
     revoke_visible(&matched);
-    // Listener shutdown must be acknowledged before cleanup. In particular,
-    // do not hold storage_mount_mutations while waiting: the listener's
-    // connection tasks may need that lock to finish their own shutdown path.
     for state in &matched {
-        if !state.wait_listener_closed().await {
-            return Err("storage mount callback listener did not shut down".to_owned());
-        }
+        await_retained_drain(state, true).await?;
     }
     let _mutation_guard = kernel.storage_mount_mutations.lock().await;
     let mut errors = Vec::new();
@@ -418,18 +596,6 @@ pub(crate) async fn revoke_all_leases_for_principal(
     } else {
         Err(errors.join("; "))
     }
-}
-
-async fn force_revoke_lease(kernel: &Kernel, state: &StorageMountLeaseState) -> Result<(), String> {
-    state.revoked.store(true, Ordering::Release);
-    let _ = state.shutdown_tx.send(true);
-    // The listener owns the platform endpoint. Wait outside the mutation
-    // fence so the listener can finish any in-flight connection bookkeeping.
-    if !state.wait_listener_closed().await {
-        return Err("storage mount callback listener did not shut down".to_owned());
-    }
-    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
-    cleanup_mapped_lease(kernel, state).map_err(|error| error.to_string())
 }
 
 pub(super) async fn expire_idle_mapped_lease(kernel: &Kernel, state: &StorageMountLeaseState) {
@@ -572,7 +738,9 @@ pub(crate) async fn lease_status_from_grant(
         grant.owner_scope().allows_foreign_read(),
         mount_id,
     )?;
-    state.renew();
+    if state.try_admit().is_none() {
+        return Err("storage mount lease is expired or revoked".to_owned());
+    }
     Ok(json!({
         "mount_id": state.mount_id,
         "view": state.view,
