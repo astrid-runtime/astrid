@@ -134,12 +134,9 @@ impl core::fmt::Debug for VerificationKey {
 /// identity alone is insufficient to reconstruct either its id or key. Its
 /// authority id is part of every checkpoint tag.
 ///
-/// The verification key stays kernel-side for the whole boot/session. It
-/// reaches the verifier only through an independently trusted kernel-origin
-/// channel that this unwired slice models by injection; the untrusted
-/// handoff carries none of it. Production anchor delivery and key
-/// lifecycle remain named #1759 residuals, and no fixed production secret
-/// is introduced.
+/// This context is the sole verification-key custodian. The live verifier
+/// borrows it only to mint a receipt; no live clone or second keyed context
+/// exists. The untrusted handoff and checkpoint wire carry none of the key.
 pub(crate) struct CheckpointAuthContext {
     boot: BootSessionId,
     authority_id: u64,
@@ -187,6 +184,7 @@ impl CheckpointAuthContext {
         self.boot
     }
 
+    #[cfg(test)]
     pub(crate) const fn verification_key(&self) -> &VerificationKey {
         &self.verification_key
     }
@@ -225,20 +223,6 @@ impl CheckpointAuthContext {
             self.authority_id,
         )
     }
-
-    /// Creates the second live-verifier custody of the same trusted anchor.
-    /// This is the kernel-side injection channel modeled by the first slice:
-    /// it never crosses the untrusted handoff wire.
-    pub(crate) fn clone_for_live_verifier(&self) -> Option<Self> {
-        let verification_key = VerificationKey::new(*self.verification_key.bytes())?;
-        let verification_key_bytes = *verification_key.bytes();
-        Some(Self {
-            boot: self.boot,
-            authority_id: self.authority_id,
-            verification_key,
-            tag_hasher: root::TagHasher::new(self.boot, &verification_key_bytes),
-        })
-    }
 }
 
 impl Drop for CheckpointAuthContext {
@@ -256,10 +240,11 @@ impl core::fmt::Debug for CheckpointAuthContext {
     }
 }
 
-/// Kernel-minted authority for one live boot/session. Its verifier handoff
-/// is untrusted binding evidence: it names the authority and carries a
-/// keyed minting tag, never verification material, so it cannot
-/// authenticate itself.
+/// Kernel-minted authority for one live boot/session. It is move-only and
+/// holds the only verification-key custodian. Its verifier handoff is
+/// untrusted binding evidence: it names the authority and carries a keyed
+/// minting tag, never verification material, so it cannot authenticate
+/// itself.
 pub(crate) struct AuditAuthority {
     boot: BootSessionId,
     context: CheckpointAuthContext,
@@ -307,12 +292,6 @@ impl AuditAuthority {
             .verifier_handoff_tag(self.boot, self.context.authority_id());
         handoff[32..].copy_from_slice(&tag);
         handoff
-    }
-
-    /// Kernel-private trusted anchor for the independent live-verifier
-    /// custodian. No retained host verifier is involved.
-    pub(crate) fn live_context(&self) -> Option<CheckpointAuthContext> {
-        self.context.clone_for_live_verifier()
     }
 }
 

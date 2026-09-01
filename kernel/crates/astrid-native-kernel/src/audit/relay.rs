@@ -92,28 +92,6 @@ impl AuditRelay {
         }
     }
 
-    /// Restores flow-control state from a trusted checkpoint without losing
-    /// its relay generation. Outstanding evidence is explicitly not carried
-    /// across the restart; a verifier restarts from this checkpoint.
-    pub(super) fn restore(
-        boot: BootSessionId,
-        generation: u64,
-        next_seq: u64,
-    ) -> Result<Self, AuditError> {
-        if generation == 0 {
-            return Err(AuditError::MalformedFrame);
-        }
-        Ok(Self {
-            boot,
-            generation,
-            next_seq,
-            oldest_seq: next_seq,
-            outstanding: 0,
-            credits: 0,
-            slots: [None; AUDIT_RELAY_SLOTS],
-        })
-    }
-
     pub(super) fn can_publish(&self, seq: u64, mandatory: bool) -> Result<(), AuditError> {
         if seq != self.next_seq {
             return Err(AuditError::RelayInvalidCursor);

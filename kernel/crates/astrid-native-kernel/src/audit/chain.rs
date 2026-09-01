@@ -10,6 +10,7 @@ use super::types::{
     AuditAuthority, AuditCheckpoint, AuditError, AuditEvent, BootSessionId, KernelSecretEntropy,
 };
 use core::mem::MaybeUninit;
+
 pub(crate) struct AuditChain {
     boot: BootSessionId,
     authority: AuditAuthority,
@@ -30,11 +31,19 @@ struct RecordScratch {
     encoded: [u8; MAX_FRAME_BYTES],
     encoded_len: usize,
     seq: u64,
-    root: [u8; root::ROOT_LEN],
     class: super::types::AuditClass,
 }
 
 impl RecordScratch {
+    const fn staged() -> Self {
+        Self {
+            encoded: [0; MAX_FRAME_BYTES],
+            encoded_len: 0,
+            seq: 0,
+            class: super::types::AuditClass::DomainCreate,
+        }
+    }
+
     fn frame(&self) -> &[u8] {
         &self.encoded[..self.encoded_len]
     }
@@ -73,8 +82,8 @@ impl AuditChain {
         Self::genesis_custodied(boot, authority)
     }
 
-    /// Starts from an already-minted authority so boot provisioning can create
-    /// exactly one signer custodian and one verifier-anchor custodian.
+    /// Starts from an already-minted authority. The live verifier derives the
+    /// chain's genesis root, so there is exactly one genesis-root authority.
     pub(crate) fn genesis_custodied(
         boot: BootSessionId,
         authority: AuditAuthority,
@@ -82,66 +91,17 @@ impl AuditChain {
         if authority.boot() != boot {
             return Err(AuditError::CheckpointMismatch);
         }
-        let root_hasher = root::RootHasher::new();
-        let root = root_hasher.genesis(boot);
         let live = LiveVerifier::genesis(boot, &authority)?;
+        let root = live.cursor().1;
         Ok(Self {
             boot,
             authority,
-            root_hasher,
+            root_hasher: root::RootHasher::new(),
             seq: 0,
             root,
             relay: AuditRelay::new(boot),
             live,
-            record_scratch: RecordScratch {
-                encoded: [0; MAX_FRAME_BYTES],
-                encoded_len: 0,
-                seq: 0,
-                root: [0; root::ROOT_LEN],
-                class: super::types::AuditClass::DomainCreate,
-            },
-            frame_scratch: MaybeUninit::uninit(),
-        })
-    }
-
-    /// Restores from a previously sealed trusted checkpoint. The checkpoint
-    /// itself binds boot/session, exact sequence, root, codec/version, and
-    /// relay generation; the relay generation is preserved rather than reset.
-    pub(crate) fn restore(
-        checkpoint: AuditCheckpoint,
-        authority: AuditAuthority,
-    ) -> Result<Self, AuditError> {
-        if checkpoint.boot() != authority.boot() {
-            return Err(AuditError::CheckpointMismatch);
-        }
-        if checkpoint.codec_version() != super::CODEC_VERSION
-            || !checkpoint.verify_tag(authority.context())
-            || checkpoint.relay_generation() == 0
-        {
-            return Err(AuditError::CheckpointMismatch);
-        }
-        let next_seq = checkpoint
-            .seq()
-            .checked_add(1)
-            .ok_or(AuditError::SequenceOverflow)?;
-        let relay =
-            AuditRelay::restore(checkpoint.boot(), checkpoint.relay_generation(), next_seq)?;
-        let live = LiveVerifier::restore(&checkpoint, &authority)?;
-        Ok(Self {
-            boot: checkpoint.boot(),
-            authority,
-            root_hasher: root::RootHasher::new(),
-            seq: checkpoint.seq(),
-            root: checkpoint.root(),
-            relay,
-            live,
-            record_scratch: RecordScratch {
-                encoded: [0; MAX_FRAME_BYTES],
-                encoded_len: 0,
-                seq: 0,
-                root: [0; root::ROOT_LEN],
-                class: super::types::AuditClass::DomainCreate,
-            },
+            record_scratch: RecordScratch::staged(),
             frame_scratch: MaybeUninit::uninit(),
         })
     }
@@ -170,32 +130,23 @@ impl AuditChain {
         &mut self.relay
     }
 
-    /// Encodes and roots the candidate in chain-owned scratch without moving
-    /// either authoritative cursor.
-    fn stage_record(
-        &mut self,
-        event: &AuditEvent,
-        next: u64,
-    ) -> Result<[u8; root::ROOT_LEN], AuditError> {
+    /// Encodes the candidate in chain-owned scratch without moving either
+    /// authoritative cursor. The live verifier owns the live-path root fold.
+    #[inline(never)]
+    fn stage_record(&mut self, event: &AuditEvent, next: u64) -> Result<(), AuditError> {
         let prev_root = Some(self.root);
         let frame = Frame::write_new(&mut self.frame_scratch, self.boot, next, event, prev_root)?;
         let encoded_len = frame.encode(&mut self.record_scratch.encoded)?.len();
-        let next_root = self.root_hasher.advance(
-            self.root,
-            self.boot,
-            next,
-            &self.record_scratch.encoded[..encoded_len],
-        );
 
         self.record_scratch.encoded_len = encoded_len;
         self.record_scratch.seq = next;
-        self.record_scratch.root = next_root;
         self.record_scratch.class = event.class();
-        Ok(next_root)
+        Ok(())
     }
 
     /// Acknowledges through the chain's kernel-owned authentication context;
-    /// callers can present only the verifier's successful-fold receipt.
+    /// callers can present only the retained verifier's successful-fold
+    /// receipt.
     pub fn ack(
         &mut self,
         seq: u64,
@@ -215,23 +166,23 @@ impl AuditChain {
             .resync(current_root, current_seq, self.authority.context())
     }
 
-    /// Appends one mandatory event as one atomic transition. All fallible
-    /// steps complete on temporaries before the single commit; a failure
-    /// leaves sequence, root, and relay untouched. Relay publication is
-    /// downstream evidence only: its overflow is an explicit handoff state
-    /// and can never omit or rewrite the already-rooted event.
+    /// Appends one event as one atomic retained-evidence transition. All
+    /// fallible steps complete before the single commit; a failure leaves
+    /// sequence, root, and relay untouched. Relay publication is downstream
+    /// evidence only and can never rewrite the already-rooted event.
     pub fn append(&mut self, event: AuditEvent) -> Result<u64, AuditError> {
         let next = self
             .seq
             .checked_add(1)
             .ok_or(AuditError::SequenceOverflow)?;
-        let next_root = self.stage_record(&event, next)?;
+        self.stage_record(&event, next)?;
+        let next_root =
+            self.root_hasher
+                .advance(self.root, self.boot, next, self.record_scratch.frame());
 
-        // The relay is mandatory for this first-slice mutation transition.
-        // A reserve or window failure returns before either authoritative
-        // cursor advances, so no rooted record is stranded outside the
-        // bounded handoff proof. The fallible relay publish performs every
-        // check before mutating a slot or cursor.
+        // The relay is mandatory for the retained-evidence mutation path.
+        // The fallible publish performs every check before mutating a slot or
+        // cursor, so no rooted record is stranded outside the bounded proof.
         self.relay.publish(
             next,
             self.record_scratch.frame(),
@@ -246,10 +197,9 @@ impl AuditChain {
         Ok(next)
     }
 
-    /// Roots and stages one event in chain-owned scratch, folds it through the
-    /// kernel-private live verifier, authenticates its receipt, and retires it
-    /// before return. The consuming transaction closes only after relay
-    /// retirement succeeds.
+    /// Stages one event in chain-owned scratch, folds the exact canonical
+    /// frame through the kernel-private live verifier, authenticates its
+    /// privately minted receipt, and retires it before return.
     #[inline(never)]
     pub(crate) fn append_verified(
         &mut self,
@@ -259,30 +209,26 @@ impl AuditChain {
             .seq
             .checked_add(1)
             .ok_or(AuditError::SequenceOverflow)?;
-        let next_root = self.stage_record(event, next)?;
+        self.stage_record(event, next)?;
 
-        // Immediate-retire mode is exclusive. Any buffered/in-flight record
-        // means the caller must use the retained-evidence path; checking here
-        // prevents the verifier from advancing before the transaction fails.
+        // Immediate-retire mode is exclusive of buffered/in-flight records.
+        // Checking here prevents live custody from advancing before the
+        // transaction can be handed to an empty relay.
         self.relay.require_empty_for_immediate_retire()?;
         self.relay
-            .can_publish(next, event.class().is_terminal_or_invalidation())?;
+            .can_publish(next, self.record_scratch.mandatory())?;
+
         let relay_generation = self.relay.generation();
         let reservation = self.live.reserve(&self.authority, next)?;
-        let receipt_tag = self.authority.context().ack_tag(
-            self.boot,
-            relay_generation,
-            next,
-            next_root,
-            self.record_scratch.frame(),
-        );
-        let prepared = self.live.finish(
-            reservation,
-            self.record_scratch.frame(),
-            next_root,
-            event.class(),
-            receipt_tag,
-        )?;
+        let prepared = {
+            // SAFETY: `stage_record` returned success immediately above, and
+            // `Frame::write_new` fully initialized the slot before encoding.
+            let decoded = unsafe { self.frame_scratch.assume_init_ref() };
+            let live = &mut self.live;
+            let frame = self.record_scratch.frame();
+            let context = self.authority.context();
+            live.finish(reservation, decoded, frame, relay_generation, context)?
+        };
         let observation = prepared.commit(&mut self.relay, self.authority.context())?;
         self.seq = observation.seq;
         self.root = observation.root;

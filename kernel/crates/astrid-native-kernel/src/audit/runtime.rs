@@ -1,4 +1,5 @@
-//! One boot-scoped custody set: chain signer and native verifier anchor.
+//! One boot-scoped custody set: the kernel audit authority and its private
+//! live verifier. The verification key has only the former as custodian.
 
 use spin::Mutex;
 
@@ -25,8 +26,8 @@ impl core::fmt::Display for AuditInstallError {
     }
 }
 
-/// Public custody identity only. The authority key and anchor stay inside the
-/// two runtime custodians and never implement Copy or Clone.
+/// Public custody identity only. The authority key stays inside its single
+/// runtime context custodian and never implements Copy or Clone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuditIdentity {
     boot: BootSessionId,

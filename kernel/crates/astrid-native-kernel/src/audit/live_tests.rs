@@ -1,6 +1,6 @@
 //! Fail-closed regressions for kernel-private live audit custody.
 
-use super::live::LiveVerifier;
+use super::live::{LiveVerifier, PreparedLive};
 use super::*;
 use crate::ipc::DomainToken;
 
@@ -36,27 +36,28 @@ fn event() -> AuditEvent {
 }
 
 struct FrameBuf {
+    decoded: Frame,
     bytes: [u8; MAX_FRAME_BYTES],
     len: usize,
 }
 
 impl FrameBuf {
-    fn first(chain_boot: BootSessionId) -> (Self, [u8; 32]) {
-        let genesis = root::RootHasher::new().genesis(chain_boot);
-        let frame = Frame::new(chain_boot, 1, &event(), Some(genesis)).unwrap();
+    fn first(chain_boot: BootSessionId, previous_root: [u8; 32]) -> Self {
+        let frame = Frame::new(chain_boot, 1, &event(), Some(previous_root)).unwrap();
         let mut bytes = [0; MAX_FRAME_BYTES];
         let encoded = frame.encode(&mut bytes).unwrap();
-        let claimed = root::RootHasher::new().advance(genesis, chain_boot, 1, &encoded);
-        let encoded_len = encoded.len();
+        let len = encoded.len();
         let mut stored = [0; MAX_FRAME_BYTES];
-        stored[..encoded_len].copy_from_slice(encoded);
-        (
-            Self {
-                bytes: stored,
-                len: encoded.len(),
-            },
-            claimed,
-        )
+        stored[..len].copy_from_slice(encoded);
+        Self {
+            decoded: frame,
+            bytes: stored,
+            len,
+        }
+    }
+
+    fn decoded(&self) -> &Frame {
+        &self.decoded
     }
 
     fn as_slice(&self) -> &[u8] {
@@ -64,45 +65,51 @@ impl FrameBuf {
     }
 }
 
-fn first_frame(chain_boot: BootSessionId) -> (FrameBuf, [u8; 32]) {
-    FrameBuf::first(chain_boot)
+fn genesis_root(chain_boot: BootSessionId) -> [u8; 32] {
+    root::RootHasher::new().genesis(chain_boot)
+}
+
+fn first_frame(chain_boot: BootSessionId) -> FrameBuf {
+    FrameBuf::first(chain_boot, genesis_root(chain_boot))
+}
+
+fn stale_first_frame(chain_boot: BootSessionId) -> FrameBuf {
+    FrameBuf::first(chain_boot, [0xAA; 32])
+}
+
+fn canonical_root(chain_boot: BootSessionId, frame: &FrameBuf) -> [u8; 32] {
+    root::RootHasher::new().advance(genesis_root(chain_boot), chain_boot, 1, frame.as_slice())
 }
 
 fn genesis_verifier() -> LiveVerifier {
     LiveVerifier::genesis(boot(), &authority()).unwrap()
 }
 
-fn prepared<'a>(
-    verifier: &'a mut LiveVerifier,
-    frame: &'a FrameBuf,
-    root: [u8; 32],
-) -> super::live::PreparedLive<'a> {
-    try_prepare(verifier, frame, root, 1).unwrap()
-}
-
 fn try_prepare<'a>(
     verifier: &'a mut LiveVerifier,
     frame: &'a FrameBuf,
-    root: [u8; 32],
+    authority: &AuditAuthority,
     expected_seq: u64,
-) -> Result<super::live::PreparedLive<'a>, AuditError> {
-    let reservation = verifier.reserve(&authority(), expected_seq)?;
-    let receipt_tag =
-        authority()
-            .context()
-            .ack_tag(boot(), 1, expected_seq, root, frame.as_slice());
+) -> Result<PreparedLive<'a>, AuditError> {
+    let reservation = verifier.reserve(authority, expected_seq)?;
     verifier.finish(
         reservation,
+        frame.decoded(),
         frame.as_slice(),
-        root,
-        AuditClass::DomainCreate,
-        receipt_tag,
+        1,
+        authority.context(),
     )
 }
 
-fn occupied_relay(frame: &FrameBuf, root: [u8; 32]) -> AuditRelay {
+fn prepare<'a>(verifier: &'a mut LiveVerifier, frame: &'a FrameBuf) -> PreparedLive<'a> {
+    try_prepare(verifier, frame, &authority(), 1).unwrap()
+}
+
+fn occupied_relay(frame: &FrameBuf, chain_root: [u8; 32]) -> AuditRelay {
     let mut relay = AuditRelay::new(boot());
-    relay.publish(1, frame.as_slice(), root, false).unwrap();
+    relay
+        .publish(1, frame.as_slice(), chain_root, false)
+        .unwrap();
     relay
 }
 
@@ -110,9 +117,13 @@ fn occupied_relay(frame: &FrameBuf, root: [u8; 32]) -> AuditRelay {
 fn live_record_folds_and_commits_after_relay_authentication() {
     let _guard = live_guard();
     let mut chain = AuditChain::genesis(boot(), secret()).unwrap();
+    assert_eq!(*chain.root(), genesis_root(boot()));
+
     let observation = chain.append_verified(&event()).unwrap();
+    let expected_root = canonical_root(boot(), &first_frame(boot()));
     assert_eq!(observation.seq(), 1);
-    assert_eq!(chain.seq(), 1);
+    assert_eq!(*observation.root(), expected_root);
+    assert_eq!((chain.seq(), *chain.root()), (1, expected_root));
     assert_eq!(chain.relay().redeliver().count(), 0);
 
     let mut wire = [0; native_audit_verifier::CHECKPOINT_WIRE_BYTES];
@@ -134,60 +145,79 @@ fn live_record_folds_and_commits_after_relay_authentication() {
 }
 
 #[test]
-fn early_late_cross_instance_and_root_rejections_are_fail_closed() {
+fn early_late_stale_and_cross_instance_rejections_are_fail_closed() {
     let _guard = live_guard();
-    let (frame_buf, root) = first_frame(boot());
+    let frame = first_frame(boot());
+    let stale_frame = stale_first_frame(boot());
     let mut verifier = genesis_verifier();
     let initial = verifier.cursor();
 
-    let early = try_prepare(&mut verifier, &frame_buf, root, 0);
+    let early = try_prepare(&mut verifier, &frame, &authority(), 0);
     assert!(matches!(early, Err(AuditError::CheckpointMismatch)));
-    assert_eq!(verifier.cursor(), initial);
 
-    let late = try_prepare(&mut verifier, &frame_buf, root, 2);
+    let late = try_prepare(&mut verifier, &frame, &authority(), 2);
     assert!(matches!(late, Err(AuditError::CheckpointMismatch)));
-    assert_eq!(verifier.cursor(), initial);
+
+    let stale = try_prepare(&mut verifier, &stale_frame, &authority(), 1);
+    assert!(matches!(stale, Err(AuditError::CheckpointMismatch)));
 
     let cross = verifier.reserve(&foreign_authority(), 1);
     assert!(matches!(cross, Err(AuditError::CheckpointMismatch)));
+
     assert_eq!(verifier.cursor(), initial);
+    // Failed preparation may burn only the monotonic reservation identity.
+    assert_eq!(verifier.transaction_id(), 2);
 }
 
 #[test]
-fn raw_tag_substitution_fails_without_moving_any_cursor() {
+fn committed_frame_cannot_be_replayed_by_private_custody() {
     let _guard = live_guard();
-    let (frame_buf, root) = first_frame(boot());
+    let frame = first_frame(boot());
     let mut verifier = genesis_verifier();
-    let initial = verifier.cursor();
-    let mut transaction = prepared(&mut verifier, &frame_buf, root);
-    transaction.set_raw_receipt_tag_for_test([0; 32]);
-
+    let transaction = prepare(&mut verifier, &frame);
     let mut relay = AuditRelay::new(boot());
-    assert_eq!(
-        transaction.commit(&mut relay, &authority().context()),
-        Err(AuditError::RootMismatch)
-    );
-    assert_eq!(verifier.cursor(), initial);
-    assert_eq!(relay.generation(), 1);
-    assert_eq!(relay.redeliver().count(), 0);
-
-    let transaction = prepared(&mut verifier, &frame_buf, root);
-    assert_eq!(transaction.transaction_id().get(), 3);
     let observation = transaction
         .commit(&mut relay, &authority().context())
         .unwrap();
     assert_eq!(observation.seq(), 1);
-    assert_eq!(verifier.cursor(), (2, root));
+
+    let replay = try_prepare(&mut verifier, &frame, &authority(), 1);
+    assert!(matches!(replay, Err(AuditError::CheckpointMismatch)));
+    assert_eq!(verifier.cursor(), (2, canonical_root(boot(), &frame)));
+}
+
+#[test]
+fn relay_independently_rejects_a_raw_substituted_tag() {
+    let _guard = live_guard();
+    let frame = first_frame(boot());
+    let chain_root = canonical_root(boot(), &frame);
+    let mut relay = AuditRelay::new(boot());
+    let authority = authority();
+    let context = authority.context();
+
+    assert_eq!(
+        relay.publish_retired(1, frame.as_slice(), chain_root, false, [0; 32], context),
+        Err(AuditError::RootMismatch)
+    );
+    assert_eq!(relay.generation(), 1);
+    assert_eq!(relay.redeliver().count(), 0);
+
+    let receipt = context.ack_tag(boot(), 1, 1, chain_root, frame.as_slice());
+    relay
+        .publish_retired(1, frame.as_slice(), chain_root, false, receipt, context)
+        .unwrap();
+    assert_eq!(relay.redeliver().count(), 0);
 }
 
 #[test]
 fn relay_cursor_rejection_leaves_verifier_and_relay_unchanged() {
     let _guard = live_guard();
-    let (frame_buf, root) = first_frame(boot());
+    let frame = first_frame(boot());
+    let chain_root = canonical_root(boot(), &frame);
     let mut verifier = genesis_verifier();
     let initial = verifier.cursor();
-    let transaction = prepared(&mut verifier, &frame_buf, root);
-    let mut relay = occupied_relay(&frame_buf, root);
+    let transaction = prepare(&mut verifier, &frame);
+    let mut relay = occupied_relay(&frame, chain_root);
     let relay_count = relay.redeliver().count();
 
     assert_eq!(
@@ -197,6 +227,14 @@ fn relay_cursor_rejection_leaves_verifier_and_relay_unchanged() {
     assert_eq!(verifier.cursor(), initial);
     assert_eq!(relay.generation(), 1);
     assert_eq!(relay.redeliver().count(), relay_count);
+
+    let transaction = prepare(&mut verifier, &frame);
+    assert_eq!(transaction.transaction_id().get(), 3);
+    let observation = transaction
+        .commit(&mut AuditRelay::new(boot()), &authority().context())
+        .unwrap();
+    assert_eq!(observation.seq(), 1);
+    assert_eq!(verifier.cursor(), (2, chain_root));
 }
 
 #[test]

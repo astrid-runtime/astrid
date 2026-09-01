@@ -2,19 +2,16 @@
 //!
 //! The host `native-audit-verifier` is retained/offline only. This verifier is
 //! the sole live authority, is owned by `AuditChain`, and commits only after
-//! relay authentication succeeds. Its post-relay tail deliberately contains
-//! assignments and the infallible observation return: there is no encode, tag
-//! check, allocation, checked operation, assert, or panic after the relay has
-//! accepted retirement.
+//! relay authentication succeeds. It owns the unkeyed canonical root state;
+//! the authority's verification key is never cloned into live custody.
 
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use super::codec::Frame;
 use super::relay::AuditRelay;
-use super::root;
-use super::types::{
-    AuditAuthority, AuditCheckpoint, AuditClass, AuditError, BootSessionId, CheckpointAuthContext,
-};
+use super::root::{self, RootHasher};
+use super::types::{AuditAuthority, AuditClass, AuditError, BootSessionId, CheckpointAuthContext};
 
 /// Process-scoped identity allocation. There is intentionally no reset or
 /// replacement entry point; test runtime reset changes custody, never this
@@ -63,18 +60,19 @@ impl AuthorityInstance {
     }
 }
 
-/// Kernel-private fold state for the immediately retired audit path. Move
-/// only by construction: cloning this custody would create a second live
-/// authority without a second anchor.
+/// Kernel-private fold state for the immediately retired audit path. The
+/// authority's keyed context is borrowed only while minting a receipt; this
+/// struct is therefore not a second verification-key custodian.
 pub(super) struct LiveVerifier {
     instance: AuthorityInstance,
     next_seq: u64,
     root: [u8; root::ROOT_LEN],
-    context: CheckpointAuthContext,
+    root_hasher: RootHasher,
     next_transaction_id: u64,
 }
 
-#[derive(Clone, Copy)]
+/// A one-shot reservation. There is deliberately no `Clone` or `Copy`: the
+/// consuming `finish` call is the only way to turn it into prepared custody.
 pub(super) struct LiveReservation {
     instance: AuthorityInstance,
     transaction_id: NonZeroU64,
@@ -104,31 +102,15 @@ impl LiveVerifier {
         if authority.boot() != boot {
             return Err(AuditError::CheckpointMismatch);
         }
-        let root = root::RootHasher::new().genesis(boot);
-        Self::new(boot, authority, root, 1)
-    }
-
-    pub(super) fn restore(
-        checkpoint: &AuditCheckpoint,
-        authority: &AuditAuthority,
-    ) -> Result<Self, AuditError> {
-        if checkpoint.boot() != authority.boot()
-            || checkpoint.codec_version() != super::CODEC_VERSION
-            || !checkpoint.verify_tag(authority.context())
-            || checkpoint.relay_generation() == 0
-        {
-            return Err(AuditError::CheckpointMismatch);
-        }
-        let next_seq = checkpoint
-            .seq()
-            .checked_add(1)
-            .ok_or(AuditError::SequenceOverflow)?;
-        Self::new(checkpoint.boot(), authority, checkpoint.root(), next_seq)
+        let root_hasher = RootHasher::new();
+        let root = root_hasher.genesis(boot);
+        Self::new(boot, authority, root_hasher, root, 1)
     }
 
     fn new(
         boot: BootSessionId,
         authority: &AuditAuthority,
+        root_hasher: RootHasher,
         root: [u8; root::ROOT_LEN],
         next_seq: u64,
     ) -> Result<Self, AuditError> {
@@ -144,9 +126,7 @@ impl LiveVerifier {
             instance,
             next_seq,
             root,
-            context: authority
-                .live_context()
-                .ok_or(AuditError::CheckpointMismatch)?,
+            root_hasher,
             next_transaction_id: 1,
         })
     }
@@ -169,6 +149,7 @@ impl LiveVerifier {
     /// A burned reservation is the only authoritative-live state changed by a
     /// rejection; the verifier cursor, chain cursor, and relay slots do not
     /// move.
+    #[inline(never)]
     fn reserve_transaction(&mut self) -> Result<NonZeroU64, AuditError> {
         let transaction_id = self
             .next_transaction_id
@@ -178,6 +159,7 @@ impl LiveVerifier {
         NonZeroU64::new(transaction_id).ok_or(AuditError::LiveTransactionOverflow)
     }
 
+    #[inline(never)]
     pub(super) fn reserve(
         &mut self,
         authority: &AuditAuthority,
@@ -201,19 +183,46 @@ impl LiveVerifier {
         })
     }
 
+    /// Derives the sole canonical rolling root and receipt candidate from this
+    /// verifier's authoritative previous root and the staged canonical frame.
+    /// `decoded` is chain scratch initialized by `stage_record`; `frame` is
+    /// its exact canonical encoding. Their embedded boot, sequence, and
+    /// previous root are checked so a stale byte string cannot fold as if it
+    /// were current.
+    #[inline(never)]
     pub(super) fn finish<'chain>(
         &'chain mut self,
         reservation: LiveReservation,
+        decoded: &Frame,
         frame: &'chain [u8],
-        root: [u8; root::ROOT_LEN],
-        class: AuditClass,
-        receipt_tag: [u8; root::ROOT_LEN],
+        relay_generation: u64,
+        context: &CheckpointAuthContext,
     ) -> Result<PreparedLive<'chain>, AuditError> {
         if reservation.instance != self.instance
             || reservation.transaction_id.get() != self.next_transaction_id
+            || context.boot() != self.instance.boot
+            || context.authority_id() != self.instance.authority_id
+            || relay_generation == 0
         {
             return Err(AuditError::CheckpointMismatch);
         }
+        if decoded.boot() != self.instance.boot
+            || decoded.seq() != self.next_seq
+            || decoded.prev_root() != Some(self.root)
+        {
+            return Err(AuditError::CheckpointMismatch);
+        }
+
+        let root = self
+            .root_hasher
+            .advance(self.root, self.instance.boot, self.next_seq, frame);
+        let receipt_tag = context.ack_tag(
+            self.instance.boot,
+            relay_generation,
+            self.next_seq,
+            root,
+            frame,
+        );
         let seq = self.next_seq;
         Ok(PreparedLive {
             verifier: self,
@@ -222,7 +231,7 @@ impl LiveVerifier {
             seq,
             next_seq: reservation.next_seq,
             root,
-            class,
+            class: decoded.class(),
             receipt_tag,
         })
     }
@@ -231,22 +240,20 @@ impl LiveVerifier {
 impl<'a> PreparedLive<'a> {
     /// Authentication and retirement are the only fallible mutation. Success
     /// leaves only assignment-shaped verifier and chain-tail commits.
+    #[inline(never)]
     pub(super) fn commit(
         self,
         relay: &mut AuditRelay,
         context: &CheckpointAuthContext,
     ) -> Result<super::chain::AuditObservation, AuditError> {
-        match relay.publish_retired(
+        relay.publish_retired(
             self.seq,
             self.frame,
             self.root,
             self.class.is_terminal_or_invalidation(),
             self.receipt_tag,
             context,
-        ) {
-            Ok(()) => {},
-            Err(error) => return Err(error),
-        }
+        )?;
 
         let verifier = self.verifier;
         verifier.next_seq = self.next_seq;
@@ -261,10 +268,5 @@ impl<'a> PreparedLive<'a> {
     #[cfg(test)]
     pub(super) fn transaction_id(&self) -> NonZeroU64 {
         self.transaction_id
-    }
-
-    #[cfg(test)]
-    pub(super) fn set_raw_receipt_tag_for_test(&mut self, tag: [u8; root::ROOT_LEN]) {
-        self.receipt_tag = tag;
     }
 }

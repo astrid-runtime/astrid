@@ -347,21 +347,7 @@ fn foreign_boot_and_missing_previous_root_are_invalid() {
 }
 
 #[test]
-fn sequence_overflow_fails_closed_without_commit() {
-    let chain_boot = boot();
-    let checkpoint =
-        AuditCheckpoint::seal(chain_boot, u64::MAX - 1, [9; 32], 1, authority().context()).unwrap();
-    let mut chain = AuditChain::restore(checkpoint, authority()).unwrap();
-    let before = (chain.seq(), *chain.root());
-    assert_eq!(
-        chain.append(domain_event(AuditClass::DomainCreate)),
-        Err(AuditError::SequenceOverflow)
-    );
-    assert_eq!((chain.seq(), *chain.root()), before);
-}
-
-#[test]
-fn foreign_boot_checkpoint_cannot_use_live_context() {
+fn foreign_boot_checkpoint_is_rejected() {
     let foreign_boot = BootSessionId::new([0x2A; 16]).unwrap();
     assert_eq!(
         AuditCheckpoint::seal(foreign_boot, 1, [3; 32], 1, authority().context()),
@@ -438,7 +424,7 @@ fn ack_before_take_does_not_retire_a_buffered_slot() {
 }
 
 #[test]
-fn restored_checkpoint_preserves_trusted_relay_generation() {
+fn resync_checkpoint_preserves_trusted_relay_generation() {
     let chain_boot = boot();
     let mut chain = genesis_chain(chain_boot);
     for _ in 0..AUDIT_RELAY_SLOTS {
@@ -449,12 +435,10 @@ fn restored_checkpoint_preserves_trusted_relay_generation() {
     let checkpoint = chain.resync().unwrap();
     assert_eq!(checkpoint.relay_generation(), 2);
 
-    let restored = AuditChain::restore(checkpoint, authority()).unwrap();
-    assert_eq!(restored.boot(), checkpoint.boot());
-    assert_eq!(restored.seq(), checkpoint.seq());
-    assert_eq!(*restored.root(), checkpoint.root());
-    assert_eq!(restored.relay().generation(), 2);
-    assert!(restored.relay().redeliver().next().is_none());
+    assert_eq!(checkpoint.boot(), chain.boot());
+    assert_eq!(checkpoint.seq(), chain.seq());
+    assert_eq!(checkpoint.root(), *chain.root());
+    assert_eq!(checkpoint.relay_generation(), chain.relay().generation());
 }
 
 #[test]
