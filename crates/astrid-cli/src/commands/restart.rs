@@ -17,6 +17,9 @@ use crate::theme::Theme;
 
 /// Entry point for `astrid restart`.
 pub(crate) async fn run() -> Result<ExitCode> {
+    // Own the recovery/start boundary across stop, stale-marker recovery, and
+    // the replacement boot so a concurrent `start` cannot heal the same files.
+    let start_fence = daemon::acquire_daemon_start_fence().await?;
     daemon::handle_stop().await?;
 
     // Wait until the socket file is gone — `handle_stop` returns as
@@ -85,5 +88,6 @@ pub(crate) async fn run() -> Result<ExitCode> {
     }
 
     daemon::spawn_persistent_daemon().await?;
+    drop(start_fence);
     Ok(ExitCode::SUCCESS)
 }

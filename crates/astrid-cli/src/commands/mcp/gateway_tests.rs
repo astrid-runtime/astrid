@@ -751,6 +751,70 @@ async fn shutdown_waits_for_precounted_connections() {
 }
 
 #[tokio::test]
+async fn concurrent_accepted_stoppers_receive_the_same_final_ack() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixListener;
+    use tokio::time::{Duration, timeout};
+
+    let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
+    let state = Arc::new(GatewayState::new(
+        PathBuf::from("/runtime-home"),
+        principal,
+        "gateway-token".into(),
+    ));
+    let socket = std::env::temp_dir().join(format!("astrid-1809-stop-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let listener = UnixListener::bind(&socket).expect("short-path gateway listener");
+    let accepting_state = Arc::clone(&state);
+    let accepting = tokio::spawn(async move { accept_loop(listener, accepting_state).await });
+
+    let request = serde_json::to_vec(&GatewayControlRequest {
+        version: GATEWAY_CONTROL_VERSION,
+        operation: GatewayControlOperation::Stop,
+        pid: std::process::id(),
+        hook_token: "gateway-token".into(),
+    })
+    .expect("control request");
+    let mut clients = Vec::new();
+    for _ in 0..2 {
+        let mut client = tokio::net::UnixStream::connect(&socket)
+            .await
+            .expect("connect stopper");
+        client
+            .write_all(&request)
+            .await
+            .expect("queue stop request");
+        client.write_all(b"\n").await.expect("terminate request");
+        clients.push(client);
+    }
+    tokio::task::yield_now().await;
+    state.shutdown.cancel();
+
+    state
+        .finish_shutdown(GatewayControlAck::success(
+            GatewayControlOperation::Stop,
+            std::process::id(),
+        ))
+        .await;
+    timeout(Duration::from_secs(1), accepting)
+        .await
+        .expect("accept loop drains all stoppers")
+        .expect("accept loop task")
+        .expect("normal accept exit");
+
+    let mut acks = Vec::new();
+    for mut client in clients {
+        let mut response = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut client, &mut response)
+            .await
+            .expect("control ACK");
+        acks.push(serde_json::from_slice::<GatewayControlAck>(&response).expect("valid ACK"));
+    }
+    assert!(acks.iter().all(|ack| ack.ok));
+    let _ = std::fs::remove_file(&socket);
+}
+
+#[tokio::test]
 async fn shutdown_rejects_late_attach_admission() {
     let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
     let state = GatewayState::new(

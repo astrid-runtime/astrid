@@ -30,8 +30,9 @@ use super::idle::{ATTACH_IDLE_EOF, IdleEof, is_idle};
 
 use super::lifecycle::{
     ATTACH_REGISTRATION_VERSION, AttachRegistration, GATEWAY_CONTROL_VERSION, GatewayControlAck,
-    GatewayControlOperation, GatewayControlRequest, GatewayReady, prepare_gateway_socket,
-    remove_gateway_ready, write_gateway_ready,
+    GatewayControlOperation, GatewayControlRequest, GatewayReady, GatewayStartupLease,
+    prepare_gateway_socket, remove_gateway_ready, remove_gateway_startup_lease,
+    try_acquire_gateway_lifecycle, write_gateway_ready, write_gateway_startup_lease,
 };
 use super::server::AstridMcpServer;
 
@@ -389,6 +390,9 @@ impl AttachReservation {
 /// Run the durable MCP gateway until it is terminated.
 pub(crate) async fn run(principal: Option<&str>) -> Result<ExitCode> {
     let caller = super::lifecycle::resolve_principal(principal)?;
+    let lifecycle = try_acquire_gateway_lifecycle()?.ok_or_else(|| {
+        anyhow::anyhow!("another MCP gateway startup or lifecycle is already active")
+    })?;
     let daemon_root = std::env::current_dir().context("failed to read MCP gateway cwd")?;
 
     // Gateway startup is the one place that may create the persistent daemon.
@@ -407,7 +411,16 @@ pub(crate) async fn run(principal: Option<&str>) -> Result<ExitCode> {
     // accepting any attach registration.
     state.client_for(&caller).await?;
 
-    let socket_path = prepare_gateway_socket().await?;
+    let boot_token = mint_hook_token();
+    let startup_lease = GatewayStartupLease {
+        version: 1,
+        principal: caller.to_string(),
+        boot_token: boot_token.clone(),
+        supervisor_pid: std::process::id(),
+        gateway_pid: Some(std::process::id()),
+    };
+    write_gateway_startup_lease(&startup_lease)?;
+    let socket_path = prepare_gateway_socket(&lifecycle).await?;
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("failed to bind MCP gateway at {}", socket_path.display()))?;
     set_socket_mode(&socket_path)?;
@@ -429,8 +442,13 @@ pub(crate) async fn run(principal: Option<&str>) -> Result<ExitCode> {
     let accept_result = accept_loop(listener, Arc::clone(&state)).await;
     let control_stop = state.shutdown.is_cancelled();
     state.shutdown.cancel();
-    let cleanup_result =
-        shutdown_gateway(&state, (!control_stop).then_some(&ready), &socket_path).await;
+    let cleanup_result = shutdown_gateway(
+        &state,
+        (!control_stop).then_some(&ready),
+        &socket_path,
+        &boot_token,
+    )
+    .await;
 
     if control_stop {
         let ack_sent = state.shutdown_ack_sent.notified();
@@ -465,8 +483,10 @@ fn combine_gateway_results(accept: Result<ExitCode>, cleanup: Result<()>) -> Res
 
 async fn accept_loop(listener: UnixListener, state: Arc<GatewayState>) -> Result<ExitCode> {
     loop {
+        if state.shutdown.is_cancelled() && state.shutdown_result.lock().await.is_some() {
+            return Ok(ExitCode::SUCCESS);
+        }
         tokio::select! {
-            () = state.shutdown.cancelled() => return Ok(ExitCode::SUCCESS),
             accepted = listener.accept() => {
                 let (stream, _) = accepted.context("MCP gateway listener failed")?;
                 let state = Arc::clone(&state);
@@ -480,6 +500,15 @@ async fn accept_loop(listener: UnixListener, state: Arc<GatewayState>) -> Result
                     }
                 });
             }
+            () = state.shutdown.cancelled() => {
+                // Keep accepting until final shutdown state is published so
+                // every accepted stopper receives the same idempotent ACK.
+            },
+            () = state.shutdown_finished.notified() => {
+                if state.shutdown_result.lock().await.is_some() {
+                    return Ok(ExitCode::SUCCESS);
+                }
+            },
         }
     }
 }
@@ -488,6 +517,7 @@ async fn shutdown_gateway(
     state: &Arc<GatewayState>,
     ready_to_remove: Option<&GatewayReady>,
     socket_path: &Path,
+    boot_token: &str,
 ) -> Result<()> {
     state.cancel_attach_slots().await;
     timeout(
@@ -538,6 +568,8 @@ async fn shutdown_gateway(
     if let Some(ready) = ready_to_remove {
         remove_gateway_ready(ready).context("shutdown stage gateway.ready_cleanup")?;
     }
+    remove_gateway_startup_lease(Some(boot_token))
+        .context("shutdown stage gateway.startup_cleanup")?;
     Ok(())
 }
 
@@ -555,9 +587,13 @@ async fn serve_connection(
 ) -> Result<()> {
     let (read_half, write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
-    let request = tokio::select! {
-        () = state.shutdown.cancelled() => return Ok(()),
-        request = read_gateway_request(&mut reader) => request?,
+    let request = if state.shutdown.is_cancelled() {
+        read_gateway_request(&mut reader).await?
+    } else {
+        tokio::select! {
+            () = state.shutdown.cancelled() => read_gateway_request(&mut reader).await?,
+            request = read_gateway_request(&mut reader) => request?,
+        }
     };
     match request {
         GatewayRequest::Control(request) => {

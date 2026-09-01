@@ -208,9 +208,13 @@ fn unconfirmed_termination_is_a_nonzero_outcome() {
 
 #[tokio::test]
 async fn acknowledged_shutdown_without_pid_is_unverified() {
-    let error = confirm_graceful_stop(None, Path::new("/tmp/absent-astrid.sock"))
-        .await
-        .expect_err("an ACK without a process identity cannot prove process exit");
+    let error = confirm_graceful_stop(
+        None,
+        Path::new("/tmp/absent-astrid.sock"),
+        Path::new("/tmp/absent-astrid.pid"),
+    )
+    .await
+    .expect_err("an ACK without a process identity cannot prove process exit");
     assert!(format!("{error:#}").contains("daemon.process_reap"));
 }
 

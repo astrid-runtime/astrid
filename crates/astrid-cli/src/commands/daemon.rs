@@ -1,6 +1,7 @@
 //! Daemon lifecycle commands: start, stop, status, and spawn helpers.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -19,6 +20,8 @@ use ready::{
     readiness_attempts, wait_for_ready,
 };
 use workspace_fingerprint::{expected_workspace_fingerprints, validate_daemon_workspace_metadata};
+
+const STATUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Build a hint string pointing the user to the daemon log directory.
 fn log_hint() -> String {
@@ -175,6 +178,18 @@ enum DaemonSpawnMode {
 }
 
 async fn ensure_daemon_inner(
+    label: &str,
+    announce: bool,
+    spawn_mode: DaemonSpawnMode,
+    workspace_root: Option<&Path>,
+) -> Result<()> {
+    let start_fence = acquire_daemon_start_fence().await?;
+    let result = ensure_daemon_inner_locked(label, announce, spawn_mode, workspace_root).await;
+    drop(start_fence);
+    result
+}
+
+async fn ensure_daemon_inner_locked(
     label: &str,
     announce: bool,
     spawn_mode: DaemonSpawnMode,
@@ -413,6 +428,37 @@ fn start_clears_sentinels(action: StartAction) -> bool {
     matches!(action, StartAction::HealAndSpawn)
 }
 
+/// Serialize stale healing and boot decisions so two starts cannot both decide
+/// that the same pathname is dead and race their children onto the singleton.
+pub(crate) async fn acquire_daemon_start_fence() -> Result<Arc<std::fs::File>> {
+    let home = astrid_core::dirs::AstridHome::resolve().context("failed to resolve Astrid home")?;
+    let path = home.run_dir().join("system.start.lock");
+    let file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path)?;
+        file.lock()?;
+        Ok(file)
+    })
+    .await
+    .context("daemon start fence task failed")?
+    .map_err(|error| anyhow::anyhow!("failed to acquire daemon start fence: {error}"))?;
+    Ok(Arc::new(file))
+}
+
 /// Handle `astrid start`.
 ///
 /// Fast path: a daemon answering on the socket is already running — do nothing.
@@ -435,6 +481,13 @@ fn start_clears_sentinels(action: StartAction) -> bool {
 /// This never removes a live daemon's socket or signals a live process — the
 /// only mutation happens when the recorded daemon is provably gone.
 pub(crate) async fn handle_start() -> Result<()> {
+    let start_fence = acquire_daemon_start_fence().await?;
+    let result = handle_start_locked().await;
+    drop(start_fence);
+    result
+}
+
+async fn handle_start_locked() -> Result<()> {
     let socket_path = socket_client::proxy_socket_path();
     let ready_path = socket_client::readiness_path();
     let pid_path = socket_client::pid_path();
@@ -494,8 +547,10 @@ pub(crate) async fn handle_start() -> Result<()> {
 pub(crate) async fn handle_status(output_format: OutputFormat) -> Result<()> {
     let socket_path = socket_client::proxy_socket_path();
     let endpoint_present = astrid_core::local_transport::endpoint_is_present(&socket_path)
-        .context("failed to inspect daemon endpoint")?;
-    match decide_status_action(endpoint_present, recorded_daemon_pid_is_alive()) {
+        .context("failed to inspect daemon endpoint")
+        .unwrap_or(false);
+    let recorded_alive = recorded_daemon_pid_is_alive();
+    match decide_status_action(endpoint_present, recorded_alive) {
         StatusAction::NotRunning => {
             print_status(output_format, None)?;
             return Ok(());
@@ -508,9 +563,20 @@ pub(crate) async fn handle_status(output_format: OutputFormat) -> Result<()> {
         StatusAction::QueryLiveSocket => {},
     }
 
-    let mut client = socket_client::connect_kernel_for_workspace(None)
-        .await
-        .context("Daemon socket exists but connection failed")?;
+    let connect = tokio::time::timeout(
+        STATUS_CONNECT_TIMEOUT,
+        socket_client::connect_kernel_for_workspace(None),
+    )
+    .await;
+    let Ok(Ok(mut client)) = connect else {
+        if recorded_alive {
+            anyhow::bail!(
+                "an Astrid daemon appears to be running but its uplink is unreachable; run `astrid restart`"
+            );
+        }
+        print_status(output_format, None)?;
+        return Ok(());
+    };
     let status = status_response(
         client
             .request(KernelRequest::GetStatus)
@@ -616,14 +682,14 @@ async fn stop_daemon() -> Result<DaemonStopDisposition> {
     // Capture the daemon's identity up front: it deletes its own PID file only
     // on a CLEAN exit, so reading it before shutdown is the only reliable way to
     // keep a handle for confirming exit / signalling a wedged shutdown.
-    let recorded = daemon_control::read_pid_file(&pid_path);
+    let recorded = daemon_control::read_daemon_identity(&pid_path);
     let socket_present = astrid_core::local_transport::endpoint_is_present(&socket_path)
         .context("failed to inspect daemon endpoint")?;
 
     // Genuinely nothing running: no socket AND no live recorded process.
     let recorded_alive = recorded
         .as_ref()
-        .is_some_and(|(pid, _)| daemon_control::is_process_alive(*pid));
+        .is_some_and(|identity| daemon_control::is_process_alive(identity.pid));
     if !socket_present && !recorded_alive {
         cleanup_daemon_runtime(&socket_path, &pid_path).await?;
         return Ok(DaemonStopDisposition::AlreadyStopped);
@@ -644,7 +710,7 @@ async fn stop_daemon() -> Result<DaemonStopDisposition> {
             KernelResponse::Success(_) => {
                 // ACK only — confirm the process actually exits before
                 // declaring success, and escalate if it wedged.
-                confirm_graceful_stop(recorded, &socket_path).await?
+                confirm_graceful_stop(recorded, &socket_path, &pid_path).await?
             },
             KernelResponse::Error(reason) => {
                 anyhow::bail!("shutdown stage daemon.shutdown_ack: rejected: {reason}")
@@ -663,8 +729,8 @@ async fn stop_daemon() -> Result<DaemonStopDisposition> {
     // signal the recorded PID (identity-gated) and clean up. Using the PID we
     // captured up front — not a re-read — closes the window where the daemon
     // deletes its own PID file mid-wedge.
-    let outcome = match &recorded {
-        Some((pid, exe)) => daemon_control::terminate_known(*pid, exe.as_deref()).await,
+    let outcome = match recorded.as_ref() {
+        Some(identity) => daemon_control::terminate_identity(identity, &pid_path).await,
         None => daemon_control::KillOutcome::NotRunning,
     };
     let disposition = confirm_kill_outcome(outcome)?;
@@ -678,17 +744,18 @@ async fn stop_daemon() -> Result<DaemonStopDisposition> {
 /// the lock, so escalate through the same identity-gated signal path as an
 /// unreachable orphan. Runtime files are cleaned only once the process is gone.
 async fn confirm_graceful_stop(
-    recorded: Option<(u32, Option<PathBuf>)>,
+    recorded: Option<daemon_control::DaemonIdentity>,
     socket_path: &Path,
+    pid_path: &Path,
 ) -> Result<DaemonStopDisposition> {
-    let Some((pid, exe)) = recorded else {
+    let Some(identity) = recorded else {
         anyhow::bail!(
             "shutdown stage daemon.process_reap: shutdown was acknowledged but no recorded PID exists, so process exit cannot be verified (listener: {})",
             socket_path.display()
         );
     };
 
-    if daemon_control::wait_for_exit(pid, daemon_control::GRACE).await {
+    if daemon_control::wait_for_exit(identity.pid, daemon_control::GRACE).await {
         return Ok(DaemonStopDisposition::Graceful);
     }
 
@@ -701,7 +768,7 @@ async fn confirm_graceful_stop(
              state-db lock is released."
         )
     );
-    let outcome = daemon_control::terminate_known(pid, exe.as_deref()).await;
+    let outcome = daemon_control::terminate_identity(&identity, pid_path).await;
     confirm_kill_outcome(outcome)
 }
 

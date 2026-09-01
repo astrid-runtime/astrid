@@ -337,12 +337,13 @@ pub fn write_pid_file() -> Result<(), std::io::Error> {
         .and_then(std::fs::canonicalize)
         .ok()
         .and_then(|p| p.to_str().map(str::to_owned));
+    let boot_nonce = uuid::Uuid::new_v4().as_simple().to_string();
 
     let write_result = (|| -> std::io::Result<()> {
         let mut file = opts.open(&tmp)?;
         match &exe_line {
-            Some(exe) => write!(file, "{}\n{}", std::process::id(), exe)?,
-            None => write!(file, "{}", std::process::id())?,
+            Some(exe) => write!(file, "{}\n{}\n{}", std::process::id(), exe, boot_nonce)?,
+            None => write!(file, "{}\n{}", std::process::id(), boot_nonce)?,
         }
         file.flush()?;
         file.sync_all()?;

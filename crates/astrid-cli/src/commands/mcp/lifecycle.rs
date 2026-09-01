@@ -17,6 +17,9 @@ pub(crate) const GATEWAY_SOCKET_NAME: &str = "mcp-gateway.sock";
 /// Readiness metadata is written only after the gateway has authenticated its
 /// broker uplink and bound the listener.
 pub(crate) const GATEWAY_READY_NAME: &str = "mcp-gateway.ready";
+const GATEWAY_LIFECYCLE_LOCK_NAME: &str = "mcp-gateway.lifecycle.lock";
+const GATEWAY_SUPERVISOR_LOCK_NAME: &str = "mcp-gateway.start.lock";
+const GATEWAY_STARTUP_LEASE_NAME: &str = "mcp-gateway.starting";
 /// Version of the owner-authenticated gateway control exchange.
 pub(crate) const GATEWAY_CONTROL_VERSION: u8 = 1;
 /// `ready` is a bounded hook probe, never a doctor or full capsule scan.
@@ -49,6 +52,150 @@ pub(crate) struct GatewayReady {
     pub principal: String,
     pub pid: u32,
     pub hook_token: String,
+}
+
+/// Identity for a gateway that has acquired its lifecycle lock but is not yet
+/// ready. The boot token binds cleanup to one attempted generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct GatewayStartupLease {
+    pub version: u8,
+    pub principal: String,
+    pub boot_token: String,
+    pub supervisor_pid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_pid: Option<u32>,
+}
+
+/// An advisory lock held by one gateway for its entire lifetime.
+#[derive(Debug)]
+pub(crate) struct GatewayLifecycleLock(std::fs::File);
+
+/// Serializes `mcp ready` spawn attempts without being owned by the gateway.
+#[derive(Debug)]
+pub(crate) struct GatewaySupervisorLock(std::fs::File);
+
+impl GatewayLifecycleLock {
+    pub(crate) const fn file(&self) -> &std::fs::File {
+        &self.0
+    }
+}
+
+impl GatewaySupervisorLock {
+    pub(crate) const fn file(&self) -> &std::fs::File {
+        &self.0
+    }
+}
+
+fn open_lock_file(path: &Path) -> Result<std::fs::File> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("MCP gateway lock path has no parent"))?;
+    ensure_private_dir(parent)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))
+}
+
+fn try_lock_file(file: std::fs::File, path: &Path) -> Result<Option<std::fs::File>> {
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(error).with_context(|| format!("failed to lock {}", path.display()))
+        },
+    }
+}
+
+pub(crate) fn gateway_lifecycle_path() -> Result<PathBuf> {
+    Ok(astrid_core::dirs::AstridHome::resolve()?
+        .run_dir()
+        .join(GATEWAY_LIFECYCLE_LOCK_NAME))
+}
+
+pub(crate) fn gateway_supervisor_path() -> Result<PathBuf> {
+    Ok(astrid_core::dirs::AstridHome::resolve()?
+        .run_dir()
+        .join(GATEWAY_SUPERVISOR_LOCK_NAME))
+}
+
+pub(crate) fn gateway_startup_lease_path() -> Result<PathBuf> {
+    Ok(astrid_core::dirs::AstridHome::resolve()?
+        .run_dir()
+        .join(GATEWAY_STARTUP_LEASE_NAME))
+}
+
+pub(crate) fn try_acquire_gateway_lifecycle() -> Result<Option<GatewayLifecycleLock>> {
+    let path = gateway_lifecycle_path()?;
+    let file = open_lock_file(&path)?;
+    Ok(try_lock_file(file, &path)?.map(GatewayLifecycleLock))
+}
+
+pub(crate) fn try_acquire_gateway_supervisor() -> Result<Option<GatewaySupervisorLock>> {
+    let path = gateway_supervisor_path()?;
+    let file = open_lock_file(&path)?;
+    Ok(try_lock_file(file, &path)?.map(GatewaySupervisorLock))
+}
+
+pub(crate) fn read_gateway_startup_lease() -> Result<Option<GatewayStartupLease>> {
+    let path = gateway_startup_lease_path()?;
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let lease: GatewayStartupLease = serde_json::from_slice(&bytes).with_context(|| {
+                format!("invalid MCP gateway startup lease at {}", path.display())
+            })?;
+            if lease.version != 1
+                || lease.principal.is_empty()
+                || lease.boot_token.len() != 32
+                || lease.supervisor_pid == 0
+                || lease.gateway_pid.is_some_and(|pid| pid == 0)
+            {
+                anyhow::bail!("invalid MCP gateway startup lease at {}", path.display());
+            }
+            Ok(Some(lease))
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+pub(crate) fn write_gateway_startup_lease(lease: &GatewayStartupLease) -> Result<()> {
+    let path = gateway_startup_lease_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("MCP gateway startup lease path has no parent"))?;
+    ensure_private_dir(parent)?;
+    let temp = path.with_extension(format!("starting.tmp.{}", std::process::id()));
+    let bytes = serde_json::to_vec(lease).context("failed to encode MCP gateway startup lease")?;
+    std::fs::write(&temp, bytes).with_context(|| format!("failed to write {}", temp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&temp, &path).with_context(|| format!("failed to publish {}", path.display()))
+}
+
+pub(crate) fn remove_gateway_startup_lease(boot_token: Option<&str>) -> Result<()> {
+    let path = gateway_startup_lease_path()?;
+    let lease = read_gateway_startup_lease()?;
+    if let Some(lease) = lease
+        && let Some(expected) = boot_token
+        && lease.boot_token != expected
+    {
+        anyhow::bail!("MCP gateway startup generation changed before cleanup");
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,7 +361,7 @@ pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
 }
 
 /// Bind-time cleanup and endpoint ownership check for a gateway listener.
-pub(crate) async fn prepare_gateway_socket() -> Result<PathBuf> {
+pub(crate) async fn prepare_gateway_socket(_lifecycle: &GatewayLifecycleLock) -> Result<PathBuf> {
     let path = gateway_socket_path()?;
     let parent = path
         .parent()
@@ -225,10 +372,9 @@ pub(crate) async fn prepare_gateway_socket() -> Result<PathBuf> {
         if UnixStream::connect(&path).await.is_ok() {
             anyhow::bail!("MCP gateway is already running at {}", path.display());
         }
-        // A failed connect means the pathname is stale or the old gateway is
-        // still between bind and accept. Removing it is safe because the
-        // listener itself is the ownership primitive; a concurrent bind below
-        // still wins with `AddrInUse` and is reported rather than clobbered.
+        // The lifecycle lock excludes every gateway generation. If the
+        // pathname survived a crash, this holder is now the only process that
+        // may remove and replace it.
         std::fs::remove_file(&path).with_context(|| {
             format!(
                 "failed to remove stale MCP gateway socket {}",
@@ -286,6 +432,49 @@ pub(crate) async fn wait_for_gateway(principal: &PrincipalId, format: &str) -> R
             }
         }
         if !spawned {
+            let supervisor = try_acquire_gateway_supervisor()?;
+            let Some(supervisor) = supervisor else {
+                if Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "MCP gateway startup supervisor remained active within {} seconds",
+                        READY_TIMEOUT.as_secs()
+                    );
+                }
+                tokio::time::sleep(READY_POLL).await;
+                continue;
+            };
+            if read_gateway_ready()?.is_some() {
+                continue;
+            }
+            if let Some(lease) = read_gateway_startup_lease()?
+                && crate::commands::daemon_control::is_process_alive(lease.supervisor_pid)
+            {
+                drop(supervisor);
+                if Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "MCP gateway PID {} is still starting within {} seconds",
+                        lease.supervisor_pid,
+                        READY_TIMEOUT.as_secs()
+                    );
+                }
+                tokio::time::sleep(READY_POLL).await;
+                continue;
+            }
+            let lifecycle = try_acquire_gateway_lifecycle()?;
+            if lifecycle.is_some() {
+                drop(supervisor);
+                if Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "MCP gateway is starting but has not published readiness within {} seconds",
+                        READY_TIMEOUT.as_secs()
+                    );
+                }
+                tokio::time::sleep(READY_POLL).await;
+                continue;
+            }
+            clean_unowned_gateway_startup()
+                .await
+                .context("shutdown stage gateway.startup_cleanup")?;
             spawn_gateway(principal)?;
             spawned = true;
         }
@@ -307,22 +496,38 @@ pub(crate) async fn wait_for_gateway(principal: &PrincipalId, format: &str) -> R
 pub(crate) async fn stop_gateway() -> Result<()> {
     let socket = gateway_socket_path()?;
     let Some(record) = read_gateway_ready()? else {
-        return match astrid_core::local_transport::connect_outcome(&socket)
-            .await
-            .context("shutdown stage gateway.listener_probe")?
+        let deadline = Instant::now()
+            .checked_add(READY_TIMEOUT)
+            .unwrap_or_else(Instant::now);
+        while try_acquire_gateway_lifecycle()?.is_none()
+            || read_gateway_startup_lease()?.is_some_and(|lease| {
+                crate::commands::daemon_control::is_process_alive(lease.supervisor_pid)
+            })
         {
-            astrid_core::local_transport::ConnectOutcome::Absent => Ok(()),
-            astrid_core::local_transport::ConnectOutcome::Stale => {
-                astrid_core::local_transport::remove_stale_endpoint(&socket)
-                    .context("shutdown stage gateway.stale_listener_cleanup")?;
-                Ok(())
-            },
-            astrid_core::local_transport::ConnectOutcome::Connected(_) => anyhow::bail!(
-                "shutdown stage gateway.authentication: live gateway has no readiness authority"
-            ),
-        };
+            if let Some(record) = read_gateway_ready()? {
+                return stop_ready_gateway(record, socket).await;
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "shutdown stage gateway.startup_stop: a starting gateway did not become stoppable within {} seconds",
+                    READY_TIMEOUT.as_secs()
+                );
+            }
+            tokio::time::sleep(READY_POLL).await;
+        }
+        let lifecycle = try_acquire_gateway_lifecycle()?.ok_or_else(|| {
+            anyhow::anyhow!("shutdown stage gateway.startup_stop: lifecycle changed")
+        })?;
+        clean_unowned_gateway_startup()
+            .await
+            .context("shutdown stage gateway.stale_listener_cleanup")?;
+        drop(lifecycle);
+        return Ok(());
     };
+    stop_ready_gateway(record, socket).await
+}
 
+async fn stop_ready_gateway(record: GatewayReady, socket: PathBuf) -> Result<()> {
     let stream = match astrid_core::local_transport::connect_outcome(&socket)
         .await
         .context("shutdown stage gateway.listener_probe")?
@@ -359,6 +564,28 @@ pub(crate) async fn stop_gateway() -> Result<()> {
         );
     }
     remove_dead_gateway_markers(&record).await
+}
+
+async fn clean_unowned_gateway_startup() -> Result<()> {
+    let lifecycle = try_acquire_gateway_lifecycle()?
+        .ok_or_else(|| anyhow::anyhow!("MCP gateway lifecycle remains held"))?;
+    let socket = gateway_socket_path()?;
+    match astrid_core::local_transport::connect_outcome(&socket)
+        .await
+        .context("shutdown stage gateway.listener_probe")?
+    {
+        astrid_core::local_transport::ConnectOutcome::Absent => {},
+        astrid_core::local_transport::ConnectOutcome::Stale => {
+            astrid_core::local_transport::remove_stale_endpoint(&socket)
+                .context("shutdown stage gateway.stale_listener_cleanup")?;
+        },
+        astrid_core::local_transport::ConnectOutcome::Connected(_) => anyhow::bail!(
+            "shutdown stage gateway.authentication: live gateway has no readiness authority"
+        ),
+    }
+    remove_gateway_startup_lease(None).context("shutdown stage gateway.startup_cleanup")?;
+    drop(lifecycle);
+    Ok(())
 }
 
 async fn request_gateway_control(
@@ -431,6 +658,12 @@ async fn remove_dead_gateway_markers(record: &GatewayReady) -> Result<()> {
             record.pid
         );
     }
+    let lifecycle = try_acquire_gateway_lifecycle()?;
+    let Some(lifecycle) = lifecycle else {
+        anyhow::bail!(
+            "shutdown stage gateway.lifecycle_fence: a successor gateway lifecycle remains active"
+        );
+    };
     let socket = gateway_socket_path()?;
     match astrid_core::local_transport::connect_outcome(&socket)
         .await
@@ -448,6 +681,8 @@ async fn remove_dead_gateway_markers(record: &GatewayReady) -> Result<()> {
         },
     }
     remove_gateway_ready(record).context("shutdown stage gateway.ready_cleanup")?;
+    remove_gateway_startup_lease(None).context("shutdown stage gateway.startup_cleanup")?;
+    drop(lifecycle);
     Ok(())
 }
 
@@ -657,6 +892,26 @@ mod tests {
     use tokio::net::UnixStream;
 
     use super::*;
+
+    #[test]
+    fn gateway_lifecycle_admits_only_one_generation() {
+        let first = try_acquire_gateway_lifecycle()
+            .expect("lifecycle probe")
+            .expect("first generation owns the lifecycle");
+        assert!(
+            try_acquire_gateway_lifecycle()
+                .expect("lifecycle probe")
+                .is_none(),
+            "a successor must not bind while a generation lifecycle is held"
+        );
+        drop(first);
+        assert!(
+            try_acquire_gateway_lifecycle()
+                .expect("lifecycle probe")
+                .is_some(),
+            "releasing the lifecycle must permit the next generation"
+        );
+    }
 
     #[test]
     fn process_parser_preserves_command_after_pid_fields() {
