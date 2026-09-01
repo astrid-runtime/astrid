@@ -293,6 +293,32 @@ jobs:
           cargo test --locked --target ${{ matrix.target }} -p astrid-core
           local_transport -- --nocapture --test-threads=1
 
+      - name: Build the Windows storage job runner
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          dotnet publish `
+            scripts/ci/windows-storage-job-runner/Astrid.WindowsStorageJobRunner.csproj `
+            -c Release -r win-x64 --self-contained false `
+            /p:UseSharedCompilation=false
+          $runner = Join-Path `
+            scripts/ci/windows-storage-job-runner/bin/Release/net8.0/win-x64/publish `
+            "astrid-windows-storage-job-runner.exe"
+          if (-not (Test-Path -LiteralPath $runner -PathType Leaf)) {
+            throw "the Windows storage job runner was not published: $runner"
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV `
+            -Value "ASTRID_WINDOWS_STORAGE_JOB_RUNNER=$runner"
+
+      - name: Run Windows storage job runner self-tests
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          & $env:ASTRID_WINDOWS_STORAGE_JOB_RUNNER selftest
+          if ($LASTEXITCODE -ne 0) {
+            throw "the Windows storage job runner self-tests failed with exit code $LASTEXITCODE"
+          }
+
       - name: Run storage callback transport tests in trusted staging
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
@@ -342,6 +368,7 @@ jobs:
           if (-not (Test-Path -LiteralPath $provider -PathType Leaf)) {
             throw "the exact Windows process storage provider was not built"
           }
+          $builtProviderHash = (Get-FileHash -LiteralPath $provider -Algorithm SHA256).Hash.ToLowerInvariant()
           $stage = Join-Path $env:RUNNER_TEMP ([System.IO.Path]::GetRandomFileName())
           New-Item -ItemType Directory -Path $stage | Out-Null
           $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -394,12 +421,32 @@ jobs:
           $stagedTestExecutable = Join-Path $stage (Split-Path -Leaf $testExecutable)
           Copy-Item -LiteralPath $provider -Destination $stagedProvider
           Copy-Item -LiteralPath $testExecutable -Destination $stagedTestExecutable
+          $stagedProviderHash = (Get-FileHash -LiteralPath $stagedProvider -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($stagedProviderHash -ne $builtProviderHash) {
+            throw "the staged Windows process storage provider changed: $builtProviderHash -> $stagedProviderHash"
+          }
+          $stagedProviderCanonical = (Get-Item -LiteralPath $stagedProvider).FullName
+          $stagedTestExecutableCanonical = (Get-Item -LiteralPath $stagedTestExecutable).FullName
           Get-Item -LiteralPath $stagedProvider, $stagedTestExecutable |
             Select-Object FullName, Length
           $env:ASTRID_PROCESS_PROVIDER_TESTS = "1"
-          & $stagedTestExecutable storage_mount -- --nocapture --test-threads=1
+          $jobLogs = Join-Path $env:RUNNER_TEMP `
+            "astrid-storage-job-logs-$([System.IO.Path]::GetRandomFileName())"
+          New-Item -ItemType Directory -Path $jobLogs | Out-Null
+          & $env:ASTRID_WINDOWS_STORAGE_JOB_RUNNER certify `
+            --test-executable $stagedTestExecutableCanonical `
+            --provider-canonical $stagedProviderCanonical `
+            --provider $stagedProviderCanonical `
+            --provider-sha256 $stagedProviderHash `
+            --working-directory $env:GITHUB_WORKSPACE `
+            --log-directory $jobLogs `
+            --list-timeout-seconds 180 `
+            --aggregate-timeout-seconds 1200 `
+            --diagnostic-timeout-seconds 180 `
+            --cleanup-timeout-seconds 30 `
+            --heartbeat-seconds 15
           if ($LASTEXITCODE -ne 0) {
-            throw "the trusted process storage provider tests failed with exit code $LASTEXITCODE"
+            throw "the job-owned trusted process storage certification failed with exit code $LASTEXITCODE"
           }
 
       - name: Run the native WinFsp filesystem round trip
