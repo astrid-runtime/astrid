@@ -264,14 +264,24 @@ fn unrecoverable_higher_generation_pointer_does_not_block_older_root() {
     let lower_generation = lower.generation;
     let lower_footer = lower.durable_len;
     let root_base = lower.root_base;
+    let sequence = lower
+        .sequence
+        .checked_add(1)
+        .expect("test sequence fits u64");
+    let commit_offset = file.metadata().unwrap().len();
+    // The helper produces a checksum-valid Commit record, while its payload
+    // is rejected by the snapshot decoder. The higher root therefore reaches
+    // the Err(InvalidData) path rather than the pre-existing Ok(None) path.
+    append_valid_record(
+        &path,
+        sequence,
+        Operation::Commit,
+        COMMIT_REGION.as_bytes(),
+        0,
+        b"bad",
+    );
     let fake_footer = file.metadata().unwrap().len();
-    recover::write_footer(
-        &mut file,
-        lower.last_commit_offset,
-        fake_footer,
-        lower.sequence,
-    )
-    .unwrap();
+    recover::write_footer(&mut file, commit_offset, fake_footer, sequence).unwrap();
     recover::write_root_pointer(
         &mut file,
         lower_generation
@@ -292,6 +302,10 @@ fn unrecoverable_higher_generation_pointer_does_not_block_older_root() {
     assert_eq!(selected.generation, lower_generation);
     assert!(selected.pointer_slot);
     assert_eq!(selected.durable_len, lower_footer);
+    assert_eq!(
+        selected.authority_len,
+        lower_footer + recover::FOOTER_BYTES as u64
+    );
 }
 
 #[test]
