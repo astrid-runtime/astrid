@@ -777,6 +777,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "astrid-package-service"
+version = "0.10.4"
+dependencies = [
+ "astrid-core",
+ "astrid-resource-types",
+ "blake3",
+ "ed25519-dalek",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "astrid-prelude"
 version = "0.10.4"
 dependencies = [
