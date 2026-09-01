@@ -39,6 +39,7 @@ fn append_file(source: &Path, destination: &Path) {
     let bytes = std::fs::read(source).unwrap();
     let mut file = std::fs::OpenOptions::new()
         .append(true)
+        .create(true)
         .open(destination)
         .unwrap();
     file.write_all(&bytes).unwrap();
@@ -48,6 +49,7 @@ fn append_bytes(bytes: &[u8], destination: &Path) {
     use std::io::Write as _;
     let mut file = std::fs::OpenOptions::new()
         .append(true)
+        .create(true)
         .open(destination)
         .unwrap();
     file.write_all(bytes).unwrap();
@@ -120,6 +122,52 @@ fn owner_scan_finds_user_after_malformed_root_frame() {
         std::fs::read(candidate.path().join("roots.journal")).unwrap(),
         before
     );
+}
+
+#[test]
+fn root_random_media_fails_closed_and_cannot_hide_later_user() {
+    let user_source = tempfile::tempdir().unwrap();
+    let user = DurableEngine::open(
+        user_source.path(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    let commit = commit_record();
+    let commit_id = Blake3ObjectIdentityV1.identify(&commit);
+    user.commit(RootTransaction::new(
+        user_owner(),
+        None,
+        commit_id,
+        vec![(commit_id, commit)],
+    ))
+    .unwrap();
+    user.close().unwrap();
+
+    let random_only = tempfile::tempdir().unwrap();
+    let path = random_only.path().join("roots.journal");
+    append_bytes(&[7, 2, 241, 99, 8, 76, 3, 31, 0, 44], &path);
+    let observations = inspect_native_root_history_without_repair::<StateOwner, _>(
+        &path,
+        Blake3ObjectIdentityV1.scheme(),
+        &StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    assert!(observations.owners.is_empty());
+    assert!(observations.scan_error.is_some());
+
+    append_file(&user_source.path().join("roots.journal"), &path);
+    let observations = inspect_native_root_history_without_repair::<StateOwner, _>(
+        &path,
+        Blake3ObjectIdentityV1.scheme(),
+        &StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .unwrap();
+    assert!(observations.owners.contains(&user_owner()));
+    assert!(observations.scan_error.is_some());
 }
 
 #[test]

@@ -5,6 +5,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock, Weak};
 
@@ -124,7 +126,6 @@ impl HostedVolumeIdentity {
                 file: metadata.ino(),
             }),
             windows => {
-                use std::os::windows::io::AsRawHandle as _;
                 Self::windows_file_identity(file.as_raw_handle())
             },
             _ => Err(io::Error::new(
@@ -149,7 +150,6 @@ impl HostedVolumeIdentity {
             }),
             windows => {
                 let file = open_file_without_following(path)?;
-                use std::os::windows::io::AsRawHandle as _;
                 let identity = Self::windows_file_identity(file.as_raw_handle())?;
                 drop(file);
                 Ok(identity)
@@ -239,10 +239,11 @@ fn open_file_without_following(path: &Path) -> io::Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt as _;
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
         use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
             FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
+        options.access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE);
         options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
@@ -308,23 +309,35 @@ fn artifact_paths(plan: &HostedArtifactPlan) -> [(HostedArtifactRole, &Path); 4]
 
 fn open_artifact_proof(plan: &HostedArtifactPlan) -> io::Result<(Vec<HostedArtifact>, usize)> {
     let mut existing = Vec::new();
+    let mut pending: Vec<(HostedArtifactRole, PathBuf)> = Vec::new();
     for (role, path) in artifact_paths(plan) {
         if role == HostedArtifactRole::Legacy && plan.legacy.is_none() {
             continue;
         }
         if std::fs::symlink_metadata(path).is_ok() {
-            existing.push(recover_locked_artifact(role, path.to_path_buf())?);
+            pending.push((role, path.to_path_buf()));
         }
     }
-    if plan.legacy.is_some()
-        && existing
-            .iter()
-            .any(|artifact| artifact.role != HostedArtifactRole::Legacy)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "Astrid storage has both a legacy volume and a recoverable canonical artifact",
-        ));
+    let legacy_identity = pending
+        .iter()
+        .find(|(role, _)| *role == HostedArtifactRole::Legacy)
+        .map(|(_, path)| HostedVolumeIdentity::from_path(path))
+        .transpose()?;
+    if let Some(legacy_identity) = legacy_identity {
+        pending.retain(|(role, path)| {
+            *role == HostedArtifactRole::Legacy
+                || HostedVolumeIdentity::from_path(path)
+                    .is_ok_and(|identity| identity != legacy_identity)
+        });
+        if pending.len() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Astrid storage has conflicting legacy and recoverable canonical artifacts",
+            ));
+        }
+    }
+    for (role, path) in pending {
+        existing.push(recover_locked_artifact(role, path)?);
     }
     let selected = existing
         .iter()
@@ -352,26 +365,166 @@ fn install_selected_volume(source: &HostedArtifact, destination: &Path) -> io::R
     if source.role == HostedArtifactRole::Active {
         return Ok(());
     }
-    // `hard_link` is an atomic no-replace namespace transition: it either
-    // creates the first destination name for the locked inode or fails with
-    // `AlreadyExists`. The source is intentionally retained so a raced or
-    // foreign inode can never be selected for unlink.
-    std::fs::hard_link(&source.path, destination)?;
-    if let Some(parent) = destination.parent() {
-        std::fs::File::open(parent)?.sync_all()?;
-    }
+    link_locked_source(source, destination)?;
     let promoted = HostedVolumeIdentity::from_path(destination)?;
     if promoted != source.identity {
-        let _ = std::fs::remove_file(destination);
         return Err(io::Error::new(
             io::ErrorKind::StaleNetworkFileHandle,
             "promoted Astrid volume has a different identity",
         ));
     }
+    sync_parent(destination)?;
     Ok(())
 }
 
+#[cfg(all(unix, target_os = "macos"))]
+fn link_locked_source(source: &HostedArtifact, destination: &Path) -> io::Result<()> {
+    let current = HostedVolumeIdentity::from_path(&source.path)?;
+    if current != source.identity {
+        return Err(io::Error::new(
+            io::ErrorKind::StaleNetworkFileHandle,
+            "source volume changed before its path-based promotion fallback",
+        ));
+    }
+    // macOS does not expose linkat AT_EMPTY_PATH. This compatibility fallback
+    // revalidates immediately before linking and never unlinks a mismatch.
+    std::fs::hard_link(&source.path, destination)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn link_locked_source(source: &HostedArtifact, destination: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let parent = destination.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "volume destination has no parent",
+        )
+    })?;
+    let file_name = destination.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "volume destination has no name",
+        )
+    })?;
+    let parent_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(parent)?;
+    let name = CString::new(file_name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid volume file name"))?;
+    // SAFETY: all descriptors remain live and both name buffers outlive the call.
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        libc::linkat(
+            source.file.as_raw_fd(),
+            c"".as_ptr(),
+            parent_file.as_raw_fd(),
+            name.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn link_locked_source(source: &HostedArtifact, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
+    };
+
+    let destination_name: Vec<u16> = destination.as_os_str().encode_wide().collect();
+    let name_words = destination_name.len();
+    let buffer_words = usize::checked_add(4, name_words.div_ceil(2))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename buffer is too large"))?;
+    let mut buffer = vec![0_u64; buffer_words];
+    let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: `information` points to the zeroed aligned allocation and all
+    // field writes remain inside its `4 + name_words.div_ceil(2)` u64 extent.
+    #[allow(unsafe_code)]
+    unsafe {
+        std::ptr::addr_of_mut!((*information).Anonymous.ReplaceIfExists).write(false);
+        std::ptr::addr_of_mut!((*information).RootDirectory).write(std::ptr::null_mut());
+        std::ptr::addr_of_mut!((*information).FileNameLength).write(
+            u32::try_from(name_words).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "volume destination path is too long",
+                )
+            })?,
+        );
+        let file_name = std::ptr::addr_of_mut!((*information).FileName).cast::<u16>();
+        std::ptr::copy_nonoverlapping(destination_name.as_ptr(), file_name, name_words);
+    }
+    // SAFETY: `source.file` owns the live source-handle opened with DELETE
+    // access, and `information` remains valid through the call.
+    #[allow(unsafe_code)]
+    if unsafe {
+        SetFileInformationByHandle(
+            source.file.as_raw_handle(),
+            FileRenameInfo,
+            information.cast(),
+            u32::try_from(buffer.len().saturating_mul(size_of::<u64>())).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "rename buffer overflow")
+            })?,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn link_locked_source(_source: &HostedArtifact, _destination: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "source-bound volume linking is unsupported",
+    ))
+}
+
+fn sync_parent(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "volume has no parent"))?;
+    File::open(parent)?.sync_all()
+}
+
 impl HostedFileVolume {
+    /// Refuse owner-proved reclaim if the namespace no longer names the locked
+    /// inode or an uninspected recovery sibling exists.
+    pub(super) fn verify_owner_proved_reclaim(&self) -> io::Result<()> {
+        if !self.owner_proved {
+            return Ok(());
+        }
+        let state = self.state.lock();
+        let path_identity = HostedVolumeIdentity::from_path(&self.path)?;
+        let handle_identity = HostedVolumeIdentity::from_file(&state.file)?;
+        if path_identity != handle_identity {
+            return Err(io::Error::new(
+                io::ErrorKind::StaleNetworkFileHandle,
+                "owner-proved Astrid volume path no longer names its locked inode",
+            ));
+        }
+        if std::fs::symlink_metadata(reclaim::temp_path(&self.path)).is_ok()
+            || std::fs::symlink_metadata(reclaim::previous_path(&self.path)).is_ok()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "owner-proved Astrid volume reclaim found uninspected recovery artifacts",
+            ));
+        }
+        Ok(())
+    }
+
     /// Open the authoritative artifact only after a caller-owned owner proof.
     ///
     /// # Errors
@@ -448,6 +601,8 @@ impl HostedFileVolume {
             selected.file.sync_all().map_err(map_error)?;
         }
         let footer_pending = !recovery.footer_present;
+        let selected_identity =
+            HostedVolumeIdentity::from_file(&selected.file).map_err(map_error)?;
         let mut state = ContainerState {
             file: selected.file,
             sequence: recovery.sequence,
@@ -462,16 +617,30 @@ impl HostedFileVolume {
         if footer_pending {
             HostedFileVolume::make_durable(&mut state).map_err(map_error)?;
         }
+        let returned_identity =
+            HostedVolumeIdentity::from_path(&plan.destination).map_err(map_error)?;
+        if returned_identity != selected_identity {
+            return Err(map_error(io::Error::new(
+                io::ErrorKind::StaleNetworkFileHandle,
+                "Astrid volume path changed before owner-proved return",
+            )));
+        }
         drop(legacy_guard);
         drop(canonical_guard);
         Ok(HostedProof::Accepted(Arc::new(Self {
             path: plan.destination,
             open_lock: canonical_lock,
+            owner_proved: true,
             state: Mutex::new(state),
         })))
     }
 
     /// Open or create one hosted Astrid volume container.
+    ///
+    /// This generic physical-container constructor intentionally retains its
+    /// established recovery behavior. It rearranges opaque volume bytes only;
+    /// runtime owner admission occurs through `open_with_owner_proof`, whose
+    /// accepted instance refuses uninspected artifact changes before reclaim.
     ///
     /// # Errors
     ///
@@ -555,6 +724,7 @@ impl HostedFileVolume {
         Ok(Arc::new(Self {
             path,
             open_lock,
+            owner_proved: false,
             state: Mutex::new(state),
         }))
     }

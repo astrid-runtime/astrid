@@ -86,7 +86,18 @@ pub(super) fn scan_runtime_forbidden_user_without_repair(
                 scan.scan_error = None;
                 return Ok(scan);
             },
-            JournalFrame::Malformed(_) | JournalFrame::Unsupported(_) => {
+            JournalFrame::Malformed(reason) => {
+                scan.scan_error.get_or_insert(io::Error::other(format!(
+                    "corrupt interior staging journal frame at {offset}: {}",
+                    reason.detail()
+                )));
+                search = offset.saturating_add(1);
+            },
+            JournalFrame::Unsupported(reason) => {
+                scan.scan_error.get_or_insert(io::Error::other(format!(
+                    "unsupported staging journal frame at {offset}: {}",
+                    reason.detail()
+                )));
                 search = offset.saturating_add(1);
             },
         }
@@ -126,8 +137,18 @@ impl MalformedJournalFrame {
 #[derive(Clone, Copy, Debug)]
 enum UnsupportedJournalFrame {
     Magic,
-    Version,
+    Version(u16),
     Reserved,
+}
+
+impl UnsupportedJournalFrame {
+    fn detail(self) -> String {
+        match self {
+            Self::Magic => "magic is unsupported".to_owned(),
+            Self::Version(version) => format!("version {version} is unsupported"),
+            Self::Reserved => "reserved header bytes are non-zero".to_owned(),
+        }
+    }
 }
 
 struct JournalMagicScanner {
@@ -155,7 +176,9 @@ impl JournalMagicScanner {
         if self.loaded_end >= self.file_len {
             return Ok(());
         }
-        let read_start = self.loaded_end;
+        let overlap = u64::try_from(JOURNAL_MAGIC.len().saturating_sub(1))
+            .map_err(|_| io::Error::other("staging journal scan overlap overflow"))?;
+        let read_start = self.loaded_end.saturating_sub(overlap);
         let wanted = usize::try_from(
             self.file_len
                 .saturating_sub(read_start)
@@ -169,7 +192,7 @@ impl JournalMagicScanner {
         file.read_exact(&mut self.buffer[..wanted])?;
         self.loaded_start = read_start;
         self.loaded_end = read_end;
-        self.scan_offset = self.scan_offset.max(read_start);
+        self.scan_offset = self.scan_offset.max(read_start).max(self.loaded_start);
         Ok(())
     }
 
@@ -242,16 +265,22 @@ fn verify_frame_checksum(
 }
 
 fn classify_sealed_owner_early(file: &mut File, frame_end: u64) -> JournalFrame {
-    let mut early = [0_u8; SEALED_EARLY_PREFIX_BYTES];
+    let mut tag = [0_u8; 1];
+    if file.read_exact(&mut tag).is_err() {
+        return JournalFrame::Malformed(MalformedJournalFrame::Decode(
+            "staged intent is truncated",
+        ));
+    }
+    if tag[0] != SEALED_RECORD {
+        return JournalFrame::Skipped(frame_end);
+    }
+    let mut early = [0_u8; SEALED_EARLY_PREFIX_BYTES - 1];
     if file.read_exact(&mut early).is_err() {
         return JournalFrame::Malformed(MalformedJournalFrame::Decode(
             "staged intent is truncated",
         ));
     }
-    if early[0] != SEALED_RECORD {
-        return JournalFrame::Skipped(frame_end);
-    }
-    let owner_len = u64::from_le_bytes(early[43..51].try_into().expect("fixed owner width"));
+    let owner_len = u64::from_le_bytes(early[42..50].try_into().expect("fixed owner width"));
     if owner_len != STATE_OWNER_V2_BYTES {
         return JournalFrame::Malformed(MalformedJournalFrame::Decode(
             "staged owner has invalid length",
@@ -315,8 +344,11 @@ fn decode_frame_without_repair(
     if header[..8] != JOURNAL_MAGIC {
         return Ok(JournalFrame::Unsupported(UnsupportedJournalFrame::Magic));
     }
-    if u16::from_le_bytes([header[8], header[9]]) != JOURNAL_VERSION {
-        return Ok(JournalFrame::Unsupported(UnsupportedJournalFrame::Version));
+    let version = u16::from_le_bytes([header[8], header[9]]);
+    if version != JOURNAL_VERSION {
+        return Ok(JournalFrame::Unsupported(UnsupportedJournalFrame::Version(
+            version,
+        )));
     }
     if header[10..12] != [0, 0] {
         return Ok(JournalFrame::Unsupported(UnsupportedJournalFrame::Reserved));
@@ -490,7 +522,7 @@ fn recover(file: &mut File, path: &Path) -> StorageResult<JournalRecovery> {
                         "unsupported staging journal magic at {offset}"
                     )));
                 },
-                UnsupportedJournalFrame::Version => {
+                UnsupportedJournalFrame::Version(_) => {
                     return Err(connection(format!(
                         "unsupported staging journal version at {offset}"
                     )));

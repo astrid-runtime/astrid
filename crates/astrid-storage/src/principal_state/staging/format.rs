@@ -390,7 +390,14 @@ pub(super) fn inspect_generation_footer_owner(
         .map_err(|error| connection(format!("read staged generation owner: {error}")))?;
     match StateOwnerCodecV2.decode(&owner) {
         Some(crate::principal_state::StateOwner::User(_)) => Ok(GenerationOwnerScan::User),
-        Some(_) => Ok(GenerationOwnerScan::Admitted),
+        Some(_) => match load_generation_footer_from_file(path, file) {
+            Ok(_) => Ok(GenerationOwnerScan::Admitted),
+            Err(error) if is_runtime_forbidden_user_owner(&error) => Ok(GenerationOwnerScan::User),
+            Err(error) => Err(connection(format!(
+                "staged generation {} footer could not prove full integrity: {error}",
+                path.display()
+            ))),
+        },
         None => Ok(GenerationOwnerScan::Malformed(
             "staged owner is not canonical StateOwner V2",
         )),

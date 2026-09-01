@@ -79,6 +79,7 @@ struct ContainerState {
 pub struct HostedFileVolume {
     path: PathBuf,
     open_lock: open::OpenReclaimLock,
+    owner_proved: bool,
     state: Mutex<ContainerState>,
 }
 

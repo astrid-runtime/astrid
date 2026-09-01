@@ -705,3 +705,33 @@ fn proof_blocks_writable_open_and_rejects_replacement_identity() {
 
     blocker.join().unwrap().unwrap();
 }
+
+#[test]
+fn owner_proved_reclaim_refuses_an_uninspected_sibling() {
+    let temporary = tempfile::tempdir().unwrap();
+    let active = temporary.path().join("active.volume");
+    let previous = reclaim::previous_path(&active);
+    drop(HostedFileVolume::open(&active).unwrap());
+    std::fs::copy(&active, &previous).unwrap();
+
+    let map_error = |error: io::Error| error;
+    let volume = match HostedFileVolume::open_with_owner_proof(
+        &active,
+        None,
+        map_error,
+        |_phase, _artifacts| Ok(HostedProofDecision::<io::Error>::Accept),
+    )
+    .unwrap()
+    {
+        HostedProof::Accepted(volume) => volume,
+        HostedProof::Rejected(error) => panic!("accepted proof rejected: {error}"),
+    };
+
+    let error = volume.reclaim().unwrap_err();
+    assert!(
+        error.to_string().contains("uninspected recovery"),
+        "{error}"
+    );
+    assert!(previous.is_file());
+    assert!(active.is_file());
+}

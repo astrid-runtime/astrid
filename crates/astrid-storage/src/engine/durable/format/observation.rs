@@ -49,6 +49,11 @@ pub(in crate::engine::durable) fn scan_frames_observing<F: DurableIo>(
         file.read_exact(&mut header)
             .map_err(|source| io_error("read durable frame observation", source))?;
         if header[..8] != magic {
+            scan_error.get_or_insert(corrupt(
+                file_name,
+                offset,
+                "observed frame magic does not match",
+            ));
             offset = offset
                 .checked_add(1)
                 .ok_or(DurableError::EncodingOverflow)?;

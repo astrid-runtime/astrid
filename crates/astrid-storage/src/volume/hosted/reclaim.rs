@@ -137,6 +137,7 @@ fn read_region(
 
 pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
     let _open_guard = volume.open_lock.lock();
+    volume.verify_owner_proved_reclaim()?;
     let mut state = volume.state.lock();
     let temporary = temp_path(&volume.path);
     let previous = previous_path(&volume.path);

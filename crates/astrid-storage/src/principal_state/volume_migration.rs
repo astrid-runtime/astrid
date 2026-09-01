@@ -175,12 +175,13 @@ pub(super) fn migrate_directory_store(
     let destination = home.storage_volume_path();
     let temporary = destination.with_extension("migrating");
     if temporary.exists() {
-        std::fs::remove_file(&temporary).map_err(|error| {
-            connection(format!(
-                "remove incomplete Astrid volume {}: {error}",
-                temporary.display()
-            ))
-        })?;
+        // Owner proof must precede any namespace change, including cleanup.
+        // A valid-but-unexpected artifact is retained and blocks cutover.
+        open_proved_volume(&temporary, None)?;
+        return Err(connection(format!(
+            "incomplete Astrid volume already exists: {}",
+            temporary.display()
+        )));
     }
 
     let volume = HostedFileVolume::open(&temporary).map_err(|error| {
@@ -220,12 +221,7 @@ pub(super) fn migrate_directory_store(
     super::native_io::rename_private_entry(&temporary, &destination)?;
     super::native_io::sync_directory(home.root())?;
 
-    let volume = HostedFileVolume::open(&destination).map_err(|error| {
-        connection(format!(
-            "reopen Astrid volume {}: {error}",
-            destination.display()
-        ))
-    })?;
+    let volume = open_proved_volume(&destination, None)?;
     let engine = RuntimeEngine::open_volume(
         volume.clone(),
         Blake3ObjectIdentityV1,
@@ -257,6 +253,7 @@ pub(super) fn retire_verified_directory_if_present(
             )));
         },
         Ok(_) => {
+            super::recovery_preflight::directory_store_owners(&path)?;
             let source = RuntimeEngine::open_with_policy(
                 &path,
                 Blake3ObjectIdentityV1,

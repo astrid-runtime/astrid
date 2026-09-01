@@ -4,11 +4,11 @@ use std::marker::PhantomData;
 use super::super::{PersistentObjectIdentity, PrincipalCodec};
 
 use super::codec::{
-    PHYSICAL_HEADER_LEN, RecordHeader, WAL_MAGIC, checksum_valid, checksum_valid_streaming,
-    decode_begin_body, decode_commit_body, decode_object_body, decode_object_storage_body,
-    decode_physical_header, decode_record_header, decode_root_body, digest_record,
-    digest_record_with_flags, logical_record_length, new_digest, record_body,
-    validate_logical_body, validate_record_version, wal_physical_limit,
+    PHYSICAL_HEADER_LEN, RecordHeader, WAL_MAGIC, checksum_valid_streaming, decode_begin_body,
+    decode_commit_body, decode_object_body, decode_object_storage_body, decode_physical_header,
+    decode_record_header, decode_root_body, digest_record, digest_record_with_flags,
+    logical_record_length, new_digest, record_body, validate_logical_body, validate_record_version,
+    wal_physical_limit,
 };
 use super::types::{
     WalBeginDescriptor, WalCommitDescriptor, WalCount, WalError, WalEvent, WalLength, WalLimits,
@@ -765,20 +765,7 @@ fn next_valid_physical_after<R: Read + Seek>(
             })?;
             continue;
         }
-        let Ok(payload_len) = physical.payload_len.as_usize() else {
-            candidate = candidate.checked_add(1).ok_or(WalError::CountOverflow {
-                field: "candidate offsets",
-            })?;
-            continue;
-        };
-        let mut payload = Vec::new();
-        payload
-            .try_reserve_exact(payload_len)
-            .map_err(|_| WalError::Encoding("WAL interior allocation failed"))?;
-        payload.resize(payload_len, 0);
-        if read_probe(&mut reader, &mut payload, "read ASTWAL2 interior payload")?
-            && checksum_valid(physical, &payload)
-        {
+        if checksum_valid_streaming((&mut reader).take(physical.payload_len.get()), physical)? {
             reader
                 .seek(SeekFrom::Start(saved))
                 .map_err(|source| WalError::Io {

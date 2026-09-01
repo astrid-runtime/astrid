@@ -138,6 +138,7 @@ pub(super) async fn apply_if_required(
     let store = home.principal_store_path();
     let metadata_path = store.join(STORE_METADATA_FILE);
     if !metadata_path.exists() {
+        super::recovery_preflight::directory_store_owners(&store)?;
         return Ok(());
     }
     let actual = std::fs::read(&metadata_path).map_err(|error| {

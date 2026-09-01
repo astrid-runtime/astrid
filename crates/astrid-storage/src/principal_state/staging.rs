@@ -32,6 +32,8 @@ use crate::error::{StorageError, StorageResult};
 mod format;
 mod group;
 mod journal;
+#[cfg(test)]
+mod journal_recovery_tests;
 mod legacy;
 mod migration;
 mod recovery;
