@@ -259,26 +259,8 @@ fn validate_timeouts(config: &Config) -> ConfigResult<()> {
         });
     }
 
-    if t.run_idle_secs == 0 {
-        return Err(ConfigError::ValidationError {
-            field: "timeouts.run_idle_secs".to_owned(),
-            message: "run_idle_secs must be greater than 0".to_owned(),
-        });
-    }
-
-    if t.run_idle_secs > MAX_RUN_IDLE_TIMEOUT_SECS {
-        return Err(ConfigError::ValidationError {
-            field: "timeouts.run_idle_secs".to_owned(),
-            message: format!("run_idle_secs must be at most {MAX_RUN_IDLE_TIMEOUT_SECS} seconds"),
-        });
-    }
-
     Ok(())
 }
-
-/// One day is enough for a slow cold start without letting a bad value turn
-/// an interactive command into an effectively unbounded wait.
-pub(crate) const MAX_RUN_IDLE_TIMEOUT_SECS: u64 = 86_400;
 
 fn validate_subagents(config: &Config) -> ConfigResult<()> {
     let s = &config.subagents;
@@ -583,20 +565,6 @@ mod tests {
     fn test_invalid_daemon_ready_timeout_zero() {
         let mut config = Config::default();
         config.timeouts.daemon_ready_secs = 0;
-        assert!(validate(&config).is_err());
-    }
-
-    #[test]
-    fn test_invalid_run_idle_timeout_zero() {
-        let mut config = Config::default();
-        config.timeouts.run_idle_secs = 0;
-        assert!(validate(&config).is_err());
-    }
-
-    #[test]
-    fn test_invalid_run_idle_timeout_above_ceiling() {
-        let mut config = Config::default();
-        config.timeouts.run_idle_secs = 86_401;
         assert!(validate(&config).is_err());
     }
 

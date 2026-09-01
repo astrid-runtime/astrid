@@ -371,7 +371,6 @@ mod tests {
         assert_eq!(config.model.max_tokens, 4096);
         assert!((config.budget.session_max_usd - 100.0).abs() < f64::EPSILON);
         assert_eq!(config.timeouts.request_secs, 120);
-        assert_eq!(config.timeouts.run_idle_secs, 120);
         assert_eq!(config.timeouts.daemon_ready_secs, 600);
     }
 

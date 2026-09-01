@@ -413,10 +413,6 @@ idle_secs = 3600  # 1 hour
 # Workspace config may raise this (not decrease-only like idle_secs).
 daemon_ready_secs = 600
 
-# How long `astrid run` waits between daemon messages for the active run
-# (seconds). This is an idle/no-message timeout, not a whole-request deadline.
-run_idle_secs = 120
-
 # ============================================================================
 # Session Management
 # ============================================================================
