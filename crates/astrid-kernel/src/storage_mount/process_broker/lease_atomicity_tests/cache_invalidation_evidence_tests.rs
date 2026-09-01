@@ -2,12 +2,75 @@
 
 use super::*;
 use super::{owned_finishers, provider_fixture};
-use crate::storage_mount::process_broker::lease_atomicity_tests::exact_fence_fixture;
+use crate::storage_mount::process_broker::lease_atomicity_tests::{
+    ExactFenceFixture, exact_fence_fixture,
+};
 use crate::storage_mount::process_broker::process_stop;
 use crate::storage_mount::process_broker::{
     PROCESS_MOUNT_TEST_ID, ProjectionLeaseTarget, retain_failed_launch_projection,
     retry_failed_projection,
 };
+
+fn retained_provider(
+    mount_id: astrid_core::storage_provider::StorageMountId,
+    target: ProcessProjectionTarget,
+    control_path: std::path::PathBuf,
+    stopped: bool,
+) -> ProjectionLeaseProvider {
+    ProjectionLeaseProvider {
+        running: RunningProvider {
+            child: None,
+            control_path,
+            token: "old-generation-token".to_owned(),
+            stopped,
+        },
+        lease: ProjectionLeaseTarget { mount_id, target },
+    }
+}
+
+struct RetainedRetryBlocker {
+    key: ProcessProjectionKey,
+    projection: Arc<CachedProcessProjection>,
+    projections: std::collections::BTreeMap<ProcessProjectionKey, Arc<CachedProcessProjection>>,
+}
+
+fn retained_retry_blocker(
+    fixture: &ExactFenceFixture,
+    branch: ProjectionLeaseProvider,
+    owner: ProjectionLeaseProvider,
+    mount_root: std::path::PathBuf,
+    workspace_mountpoint: std::path::PathBuf,
+    home_mountpoint: std::path::PathBuf,
+) -> RetainedRetryBlocker {
+    let key = ProcessProjectionKey {
+        binding: fixture.binding.clone(),
+        read_write: true,
+    };
+    let state = ProjectionCleanupState {
+        kernel: Arc::downgrade(&fixture.kernel),
+        stop_policy: crate::storage_mount::process_broker::ProcessStopPolicy::default(),
+        binding: fixture.binding.clone(),
+        branch,
+        owner,
+        shared: None,
+        mount_root,
+        cleaned: false,
+    };
+    let mut projections = std::collections::BTreeMap::new();
+    retain_failed_launch_projection(
+        &mut projections,
+        &key,
+        workspace_mountpoint,
+        home_mountpoint,
+        None,
+        state,
+    );
+    RetainedRetryBlocker {
+        projection: Arc::clone(projections.get(&key).expect("retained retry blocker")),
+        key,
+        projections,
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revoked_component_invalidates_cached_exact_set() {
@@ -213,7 +276,6 @@ async fn stopped_retry_evidence_never_synthesizes_an_acknowledgement() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn replacement_listener_cannot_override_retained_stop() {
     let fixture = exact_fence_fixture().await;
     let temporary = tempfile::tempdir().expect("replacement scratch root");
@@ -224,59 +286,30 @@ async fn replacement_listener_cannot_override_retained_stop() {
     let replacement_path = mount_root.join("replacement.sock");
     let replacement_listener =
         astrid_core::local_transport::bind(&replacement_path).expect("bind replacement listener");
-    let branch = ProjectionLeaseProvider {
-        running: RunningProvider {
-            child: None,
-            control_path: replacement_path,
-            token: "old-generation-token".to_owned(),
-            stopped: true,
-        },
-        lease: ProjectionLeaseTarget {
-            mount_id: branch_mount_id,
-            target: targets.workspace.clone(),
-        },
-    };
-    let owner = ProjectionLeaseProvider {
-        running: RunningProvider {
-            child: None,
-            control_path: mount_root.join("owner.sock"),
-            token: "old-generation-token".to_owned(),
-            stopped: true,
-        },
-        lease: ProjectionLeaseTarget {
-            mount_id: fixture.owner.mount_id,
-            target: targets.owner_home.clone(),
-        },
-    };
-    let key = ProcessProjectionKey {
-        binding: fixture.binding.clone(),
-        read_write: true,
-    };
-    let state = ProjectionCleanupState {
-        kernel: Arc::downgrade(&fixture.kernel),
-        stop_policy: crate::storage_mount::process_broker::ProcessStopPolicy::default(),
-        binding: fixture.binding.clone(),
-        branch,
-        owner,
-        shared: None,
-        mount_root: mount_root.clone(),
-        cleaned: false,
-    };
-    let mut projections = std::collections::BTreeMap::new();
-    retain_failed_launch_projection(
-        &mut projections,
-        &key,
+    let mut blocker = retained_retry_blocker(
+        &fixture,
+        retained_provider(
+            branch_mount_id,
+            targets.workspace.clone(),
+            replacement_path,
+            true,
+        ),
+        retained_provider(
+            fixture.owner.mount_id,
+            targets.owner_home.clone(),
+            mount_root.join("owner.sock"),
+            true,
+        ),
+        mount_root.clone(),
         temporary.path().join("workspace"),
         temporary.path().join("owner"),
-        None,
-        state,
     );
-    let projection = Arc::clone(projections.get(&key).expect("retained retry blocker"));
     crate::storage_mount::process_broker::fail_next_root_removal_for_test(mount_root.clone());
 
     let scope = process_stop::cleanup_evidence::scoped_with_label("replacement-listener", async {
         assert!(
-            !retry_failed_projection(&projection, &mut projections, &key).await,
+            !retry_failed_projection(&blocker.projection, &mut blocker.projections, &blocker.key)
+                .await,
             "the retained root blocker must remain authoritative"
         );
         process_stop::cleanup_evidence::current_scope_for_test()
@@ -334,59 +367,47 @@ async fn transient_probe_cannot_override_retained_stop() {
     let probe_listener = astrid_core::local_transport::bind(&probe_path).expect("bind probe");
     drop(probe_listener);
 
-    let branch = ProjectionLeaseProvider {
-        running: RunningProvider {
-            child: None,
-            control_path: probe_path,
-            token: "old-generation-token".to_owned(),
-            stopped: true,
-        },
-        lease: ProjectionLeaseTarget {
-            mount_id: fixture.branch.mount_id,
-            target: fixture.binding.targets.workspace.clone(),
-        },
-    };
-    let owner = ProjectionLeaseProvider {
-        running: RunningProvider {
-            child: None,
-            control_path: mount_root.join("transient-owner.sock"),
-            token: "old-generation-token".to_owned(),
-            stopped: true,
-        },
-        lease: ProjectionLeaseTarget {
-            mount_id: fixture.owner.mount_id,
-            target: fixture.binding.targets.owner_home.clone(),
-        },
-    };
-    let key = ProcessProjectionKey {
-        binding: fixture.binding.clone(),
-        read_write: true,
-    };
-    let state = ProjectionCleanupState {
-        kernel: Arc::downgrade(&fixture.kernel),
-        stop_policy: crate::storage_mount::process_broker::ProcessStopPolicy::default(),
-        binding: fixture.binding.clone(),
-        branch,
-        owner,
-        shared: None,
-        mount_root: mount_root.clone(),
-        cleaned: false,
-    };
-    let mut projections = std::collections::BTreeMap::new();
-    retain_failed_launch_projection(
-        &mut projections,
-        &key,
+    let mut blocker = retained_retry_blocker(
+        &fixture,
+        retained_provider(
+            fixture.branch.mount_id,
+            fixture.binding.targets.workspace.clone(),
+            probe_path,
+            false,
+        ),
+        retained_provider(
+            fixture.owner.mount_id,
+            fixture.binding.targets.owner_home.clone(),
+            mount_root.join("transient-owner.sock"),
+            true,
+        ),
+        mount_root.clone(),
         temporary.path().join("workspace"),
         temporary.path().join("owner"),
-        None,
-        state,
     );
-    let projection = Arc::clone(projections.get(&key).expect("retained retry blocker"));
     crate::storage_mount::process_broker::fail_next_root_removal_for_test(mount_root.clone());
 
-    assert!(
-        !retry_failed_projection(&projection, &mut projections, &key).await,
-        "a stale transient endpoint must not synthesize lease cleanup success"
+    let scope = process_stop::cleanup_evidence::scoped_with_label("transient-probe", async {
+        assert!(
+            !retry_failed_projection(&blocker.projection, &mut blocker.projections, &blocker.key)
+                .await,
+            "a stale transient endpoint must not synthesize lease cleanup success"
+        );
+        process_stop::cleanup_evidence::current_scope_for_test()
+            .expect("transient probe evidence scope")
+    })
+    .await;
+    assert_eq!(
+        process_stop::cleanup_evidence::take_for_test(scope),
+        vec![
+            cleanup_event(ProjectionCleanupStage::Binding, false),
+            provider_stop_outcome_event(
+                ProviderComponent::Branch,
+                fixture.branch.mount_id,
+                ProcessStopOutcome::ControlEndpoint,
+            )
+        ],
+        "an unmanaged stale endpoint must terminate cleanup at its first failure"
     );
     assert!(mount_root.exists());
 }
