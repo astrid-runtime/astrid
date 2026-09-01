@@ -27,6 +27,7 @@ internal static class Program
             return args switch
             {
                 ["selftest"] => SelfTest.Run(),
+                ["marker-child", var markerPath, var exitCodeText] => MarkerChild.Run(markerPath, exitCodeText),
                 ["certify", .. var certificationArgs] => Certify(ParseOptions(certificationArgs)),
                 _ => throw new ControllerException("expected 'selftest' or 'certify' with named options"),
             };
@@ -479,6 +480,7 @@ internal static class Program
             afterResume?.Invoke(job);
             result = WaitAndCleanUpAsync(
                 job,
+                thread,
                 process,
                 processId,
                 stdoutPath,
@@ -546,6 +548,7 @@ internal static class Program
 
     private static async Task<JobRunResult> WaitAndCleanUpAsync(
         SafeJobHandle job,
+        SafeWindowsHandle thread,
         SafeProcessHandle process,
         int processId,
         string stdoutPath,
@@ -581,6 +584,7 @@ internal static class Program
         var outcome = JobOutcome.ControllerFailed;
         var exitCode = 0u;
         bool cleanupComplete;
+        var rootHandlesReleased = false;
         var activeProcessIds = Array.Empty<uint>();
         var originalCause = string.Empty;
 
@@ -617,31 +621,47 @@ internal static class Program
                     throw new ControllerException(
                         $"TerminateJobObject failed after timeout: Win32 error {Marshal.GetLastWin32Error()}");
                 }
-            }
-            else
-            {
-                var descendantWait = Stopwatch.StartNew();
-                while (descendantWait.Elapsed < cleanupTimeout)
-                {
-                    activeProcessIds = GetJobProcessIds(job);
-                    if (activeProcessIds.Length == 0)
-                    {
-                        break;
-                    }
 
-                    Thread.Sleep(50);
+                if (!RootProcessCleanup.WaitForProcessExit(process, cleanupTimeout))
+                {
+                    throw new ControllerException(
+                        $"timed-out root process {processId} did not exit within the cleanup budget");
                 }
 
-                activeProcessIds = GetJobProcessIds(job);
-                if (activeProcessIds.Length != 0)
+                if (!NativeMethods.GetExitCodeProcess(process, out exitCode))
                 {
-                    originalCause = $"process {processId} exited while descendants remained active";
-                    outcome = JobOutcome.ControllerFailed;
-                    if (!NativeMethods.TerminateJobObject(job, ControllerFailureExitCode))
-                    {
-                        throw new ControllerException(
-                            $"TerminateJobObject failed for surviving descendants: Win32 error {Marshal.GetLastWin32Error()}");
-                    }
+                    throw new ControllerException(
+                        $"GetExitCodeProcess failed for timed-out process {processId}: Win32 error {Marshal.GetLastWin32Error()}");
+                }
+            }
+
+            rootHandlesReleased = RootProcessCleanup.ReleaseHandles(thread, process);
+            if (!rootHandlesReleased)
+            {
+                throw new ControllerException($"root thread/process handles were not released for process {processId}");
+            }
+
+            var descendantWait = Stopwatch.StartNew();
+            while (descendantWait.Elapsed < cleanupTimeout)
+            {
+                activeProcessIds = GetJobProcessIds(job);
+                if (activeProcessIds.Length == 0)
+                {
+                    break;
+                }
+
+                Thread.Sleep(50);
+            }
+
+            activeProcessIds = GetJobProcessIds(job);
+            if (activeProcessIds.Length != 0)
+            {
+                originalCause = $"process {processId} exited while descendants remained active";
+                outcome = JobOutcome.ControllerFailed;
+                if (!NativeMethods.TerminateJobObject(job, ControllerFailureExitCode))
+                {
+                    throw new ControllerException(
+                        $"TerminateJobObject failed for surviving descendants: Win32 error {Marshal.GetLastWin32Error()}");
                 }
             }
 
@@ -668,6 +688,7 @@ internal static class Program
             stdoutPath,
             stderrPath,
             processId,
+            rootHandlesReleased,
             stopwatch.Elapsed);
     }
 
@@ -703,34 +724,12 @@ internal static class Program
         try
         {
             _ = NativeMethods.TerminateProcess(process, ControllerFailureExitCode);
-            return WaitForProcessExit(process, cleanupTimeout);
+            return RootProcessCleanup.WaitForProcessExit(process, cleanupTimeout);
         }
         catch
         {
             return false;
         }
-    }
-
-    private static bool WaitForProcessExit(SafeProcessHandle process, TimeSpan cleanupTimeout)
-    {
-        var stopwatch = Stopwatch.StartNew();
-        do
-        {
-            var wait = NativeMethods.WaitForSingleObject(process, 50);
-            if (wait == NativeMethods.WaitObject0)
-            {
-                return true;
-            }
-
-            if (wait != NativeMethods.WaitTimeout)
-            {
-                throw new ControllerException(
-                    $"waiting for the unassigned process failed: Win32 error {Marshal.GetLastWin32Error()}");
-            }
-        }
-        while (stopwatch.Elapsed < cleanupTimeout);
-
-        return false;
     }
 
     private static bool WaitForActiveProcessZero(

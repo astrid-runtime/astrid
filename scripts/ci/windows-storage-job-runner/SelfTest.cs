@@ -11,6 +11,10 @@ internal sealed class SelfTest
     private static readonly string[] ListArguments = Program.BuildCanonicalListArgumentsForSelfTest();
     private static readonly string[] AggregateArguments = ["storage_mount", "--", "--nocapture", "--test-threads=1"];
 
+    private static string RunnerExecutable =>
+        Program.ResolveExecutableForSelfTest(Environment.ProcessPath
+            ?? throw new ControllerException("the selftest executable path is unavailable"));
+
     public static int Run()
     {
         var root = Directory.CreateTempSubdirectory("astrid-storage-job-selftest-").FullName;
@@ -22,6 +26,7 @@ internal sealed class SelfTest
             ThreeGenerationDescendantTermination(root);
             UnrelatedProcessSurvival(root);
             OutputAndExitCodePreservation(root);
+            HandleReleaseAndNonzeroExit(root);
             ForcedAssignmentFailure(root);
             BoundedTimeoutAndCleanup(root);
             FreshJobIsolation(root);
@@ -46,9 +51,10 @@ internal sealed class SelfTest
     private static void AssignmentBeforeExecution(string root)
     {
         var marker = Path.Combine(root, "assignment.marker");
+        var observedAfterResume = false;
         var result = RunCommand(
             root,
-            ["cmd.exe", "/d", "/c", $"echo ready> \"{marker}\""],
+            [RunnerExecutable, "marker-child", marker, "0"],
             15,
             afterAssignment: () =>
             {
@@ -56,9 +62,29 @@ internal sealed class SelfTest
                 {
                     throw new ControllerException("the suspended child executed before job assignment");
                 }
+            },
+            afterResume: _ =>
+            {
+                var deadline = DateTime.UtcNow.AddSeconds(2);
+                while (!File.Exists(marker) && DateTime.UtcNow < deadline)
+                {
+                    Thread.Sleep(20);
+                }
+
+                observedAfterResume = File.Exists(marker);
             });
         AssertOutcome(result, JobOutcome.Succeeded);
         AssertCleanup(result);
+        if (!observedAfterResume)
+        {
+            throw new ControllerException("the marker did not appear after resume");
+        }
+
+        if (!result.RootHandlesReleased)
+        {
+            throw new ControllerException("root handles were not released before job cleanup");
+        }
+
         if (!File.Exists(marker))
         {
             throw new ControllerException("the assignment-before-execution marker was lost");
@@ -132,12 +158,18 @@ internal sealed class SelfTest
 
     private static void OutputAndExitCodePreservation(string root)
     {
+        var marker = Path.Combine(root, "output.marker");
         var result = RunCommand(
             root,
-            ["cmd.exe", "/d", "/c", "echo stdout-marker & echo stderr-marker 1>&2 & exit /b 7"],
+            [RunnerExecutable, "marker-child", marker, "7"],
             15);
         AssertOutcome(result, JobOutcome.ChildFailed);
         AssertCleanup(result);
+        if (!result.RootHandlesReleased)
+        {
+            throw new ControllerException("root handles were released in the wrong order");
+        }
+
         if (result.ExitCode != 7)
         {
             throw new ControllerException($"injected child exit code changed: expected 7, got {result.ExitCode}");
@@ -145,13 +177,32 @@ internal sealed class SelfTest
 
         var stdout = File.ReadAllText(result.StdoutPath);
         var stderr = File.ReadAllText(result.StderrPath);
-        if (!stdout.Contains("stdout-marker", StringComparison.Ordinal) ||
-            !stderr.Contains("stderr-marker", StringComparison.Ordinal))
+        if (!stdout.Contains($"marker-created {marker}", StringComparison.Ordinal) ||
+            !stderr.Contains("marker-child-ready", StringComparison.Ordinal) ||
+            !File.Exists(marker))
         {
             throw new ControllerException("the durable child output files were incomplete");
         }
 
-        Console.WriteLine("[selftest] durable stdout/stderr and injected exit code 7 were preserved");
+        Console.WriteLine("[selftest] durable stdout/stderr and injected exit code 7 were preserved after handle release");
+    }
+
+    private static void HandleReleaseAndNonzeroExit(string root)
+    {
+        var marker = Path.Combine(root, "handle-release.marker");
+        var result = RunCommand(
+            root,
+            [RunnerExecutable, "marker-child", marker, "7"],
+            15);
+        AssertOutcome(result, JobOutcome.ChildFailed);
+        AssertCleanup(result);
+        if (result.ExitCode != 7 || !result.RootHandlesReleased || !File.Exists(marker))
+        {
+            throw new ControllerException(
+                $"exit/handle-release cleanup evidence was incomplete: exit={result.ExitCode}, handles={result.RootHandlesReleased}, marker={File.Exists(marker)}");
+        }
+
+        Console.WriteLine("[selftest] numeric exit 7 survived root handle release before ACTIVE_PROCESS_ZERO");
     }
 
     private static void ForcedAssignmentFailure(string root)
@@ -163,7 +214,7 @@ internal sealed class SelfTest
         {
             _ = Program.RunCommandForSelfTest(
                 root,
-                ["cmd.exe", "/d", "/c", $"echo ready> \"{marker}\""],
+                [RunnerExecutable, "marker-child", marker, "0"],
                 Path.Combine(root, $"{Guid.NewGuid():N}.stdout.log"),
                 Path.Combine(root, $"{Guid.NewGuid():N}.stderr.log"),
                 TimeSpan.FromSeconds(15),
