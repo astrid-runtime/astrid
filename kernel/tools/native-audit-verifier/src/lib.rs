@@ -22,6 +22,7 @@ pub mod wire;
 mod tests;
 
 use blake3::Hasher;
+use core::marker::PhantomData;
 use spin::Mutex;
 use zeroize::Zeroize;
 
@@ -402,13 +403,49 @@ pub struct AuditVerifier {
     root_hasher: RootHasher,
     context: AuthContext,
     relay_generation: u64,
+    next_commit_nonce: u64,
     fold_transaction: Option<FoldTransaction>,
 }
 
 struct FoldTransaction {
+    nonce: u64,
     previous_next_seq: u64,
     previous_root: [u8; 32],
     receipt: FoldReceipt,
+}
+
+/// Opaque, one-shot evidence minted while entering the live relay callback.
+/// There is deliberately no public constructor, wire form, or conversion from
+/// a receipt, checkpoint, or authentication context.
+pub struct RelayCommitTicket<'a> {
+    nonce: u64,
+    seq: u64,
+    folded_root: [u8; 32],
+    relay_generation: u64,
+    // Borrow branding scopes this ticket to one live commit call; the nonce
+    // and consuming state make any stale return an immediate API violation.
+    _verifier: PhantomData<&'a mut AuditVerifier>,
+}
+
+impl<'a> RelayCommitTicket<'a> {
+    fn new(nonce: u64, seq: u64, folded_root: [u8; 32], relay_generation: u64) -> Self {
+        Self {
+            nonce,
+            seq,
+            folded_root,
+            relay_generation,
+            _verifier: PhantomData,
+        }
+    }
+}
+
+impl RelayCommitTicket<'_> {
+    fn binds(&self, nonce: u64, seq: u64, folded_root: [u8; 32], relay_generation: u64) -> bool {
+        self.nonce == nonce
+            && self.seq == seq
+            && self.folded_root == folded_root
+            && self.relay_generation == relay_generation
+    }
 }
 
 /// An opened, not-yet-folded verifier transaction. It exposes no close,
@@ -439,8 +476,8 @@ impl Drop for OpenFold<'_> {
 ///
 /// ```compile_fail
 /// use native_audit_verifier::{FoldedFold, FoldReceipt};
-/// fn finish(fold: FoldedFold<'_>) {
-///     fold.finish(true);
+/// fn commit_with_public_wire(fold: FoldedFold<'_>) {
+///     fold.commit_after_relay(&[]);
 /// }
 /// fn substitute(receipt: FoldReceipt) -> FoldedFold<'static> {
 ///     receipt.into()
@@ -451,7 +488,7 @@ pub struct FoldedFold<'a> {
     finished: bool,
 }
 
-impl FoldedFold<'_> {
+impl<'a> FoldedFold<'a> {
     /// The sole receipt minted by this transaction.
     pub fn receipt(&self) -> &FoldReceipt {
         &self
@@ -477,23 +514,51 @@ impl FoldedFold<'_> {
         self.receipt().ack_tag()
     }
 
-    /// Commits only with a live-custody checkpoint capability minted after
-    /// successful relay receipt authentication. The verifier independently
-    /// checks the capability's sequence, root, boot, relay generation, and
-    /// keyed tag. Commit consumes this state; there is no retry.
-    pub fn commit_after_relay(mut self, capability: &[u8]) -> Result<(), VerifyFailure> {
+    /// Runs the authenticated relay callback with a non-public one-shot
+    /// ticket. The callback must return that exact ticket only after relay
+    /// receipt authentication succeeds; returning it commits the fold without
+    /// encoding, decoding, or accepting public checkpoint bytes. Relay failure
+    /// rolls the fold back. A stale ticket is an API-contract violation and
+    /// aborts rather than splitting relay and verifier custody.
+    pub fn commit_after_relay<'commit, E>(
+        mut self,
+        authenticate_relay: impl FnOnce(
+            RelayCommitTicket<'commit>,
+        ) -> Result<RelayCommitTicket<'commit>, E>,
+    ) -> Result<(), E> {
         assert!(
             self.verifier.fold_transaction.is_some(),
             "folded state retains its receipt"
         );
-        let result = self.verifier.accept_checkpoint(capability);
-        if result.is_ok() {
-            self.verifier.fold_transaction = None;
-            self.finished = true;
-        } else {
-            self.rollback_state();
+        let (nonce, seq, root, relay_generation) = {
+            let transaction = self
+                .verifier
+                .fold_transaction
+                .as_ref()
+                .expect("folded state retains its receipt");
+            (
+                transaction.nonce,
+                transaction.receipt.seq(),
+                transaction.receipt.folded_root(),
+                self.verifier.relay_generation,
+            )
+        };
+        let ticket = RelayCommitTicket::new(nonce, seq, root, relay_generation);
+        match authenticate_relay(ticket) {
+            Ok(receipt) => {
+                assert!(
+                    receipt.binds(nonce, seq, root, relay_generation),
+                    "relay commit ticket is transaction-bound"
+                );
+                self.verifier.fold_transaction = None;
+                self.finished = true;
+                Ok(())
+            },
+            Err(error) => {
+                self.rollback_state();
+                Err(error)
+            },
         }
-        result
     }
 
     /// Consumes the folded state and restores the saved cursor after relay
@@ -570,6 +635,7 @@ impl AuditVerifier {
             root_hasher,
             context,
             relay_generation: 1,
+            next_commit_nonce: 1,
             fold_transaction: None,
         })
     }
@@ -594,6 +660,7 @@ impl AuditVerifier {
             root_hasher: RootHasher::new(),
             context,
             relay_generation: checkpoint.relay_generation,
+            next_commit_nonce: 1,
             fold_transaction: None,
         })
     }
@@ -778,7 +845,12 @@ impl<'a> OpenFold<'a> {
             Ok(receipt) if receipt.seq() == expected_seq => {
                 let verifier = self.verifier.take().expect("verifier remains open");
                 self.finished = true;
+                let nonce = verifier.next_commit_nonce;
+                verifier.next_commit_nonce = nonce
+                    .checked_add(1)
+                    .expect("audit transaction nonce cannot overflow");
                 verifier.fold_transaction = Some(FoldTransaction {
+                    nonce,
                     previous_next_seq: self.previous_next_seq,
                     previous_root: self.previous_root,
                     receipt,

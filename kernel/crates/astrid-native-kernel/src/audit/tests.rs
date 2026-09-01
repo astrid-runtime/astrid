@@ -121,6 +121,12 @@ fn attacker_handoff_tag(boot: BootSessionId, authority_id: u64, key: &[u8; 32]) 
     hasher.finalize().into()
 }
 
+static RUNTIME_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+fn runtime_test_guard() -> spin::MutexGuard<'static, ()> {
+    RUNTIME_TEST_LOCK.lock()
+}
+
 #[test]
 fn roundtrip_and_injectivity() {
     let chain_boot = boot();
@@ -431,6 +437,32 @@ fn transaction_receipt_commits_after_successful_relay_auth() {
     assert_eq!(observation.seq(), 1);
     assert_eq!((chain.seq(), *chain.root()), (1, *observation.root()));
     assert_eq!(host_verifier.next_seq(), 2);
+}
+
+#[test]
+fn post_fold_relay_failure_does_not_retain_verifier_progress() {
+    let chain_boot = boot();
+    let mut chain = genesis_chain(chain_boot);
+    let mut host_verifier = verifier();
+
+    // Stage one event, fold it provisionally, then exercise the exact relay
+    // rejection that occurs when another authoritative append owns the cursor.
+    chain
+        .prepare_verified(&domain_event(AuditClass::DomainAdmit))
+        .unwrap();
+    let verifier_before = (host_verifier.next_seq(), host_verifier.root());
+    let transaction = host_verifier
+        .open_fold(chain.seq() + 1, chain.staged_frame(), chain.staged_root())
+        .unwrap();
+    chain.append(domain_event(AuditClass::DomainAdmit)).unwrap();
+
+    let folded = chain.retire_verified(transaction);
+    assert_eq!(folded, Err(AuditError::RelayInvalidCursor));
+    assert_eq!(
+        (host_verifier.next_seq(), host_verifier.root()),
+        verifier_before
+    );
+    assert_eq!(chain.relay().redeliver().count(), 1);
 }
 
 #[test]
@@ -1079,6 +1111,8 @@ fn batch_reserve_is_static_and_inside_the_window() {
 
 #[test]
 fn second_custody_install_cannot_replace_the_live_boot() {
+    let _ipc_runtime_guard = crate::ipc::test_support::test_lock();
+    let _runtime_guard = runtime_test_guard();
     crate::audit::reset_for_test();
     let replacement = crate::audit::install_for_test(
         BootSessionId::new([8; 16]).unwrap(),
