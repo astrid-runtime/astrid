@@ -123,6 +123,9 @@ jobs:
       - name: Build the kernel, CLI, and FSKit companion
         run: |
           set -euo pipefail
+          ASTRID_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          [[ -n "$ASTRID_VERSION" ]]
+          echo "ASTRID_VERSION=$ASTRID_VERSION" >> "$GITHUB_ENV"
           install -d -m 0700 \
             "$CERT_ROOT" "$CERT_BIN" "$ASTRID_HOME" \
             "$RELEASE_STAGE/macos" "$MOUNTPOINT_INITIAL" "$MOUNTPOINT_IGNORED_TEST"
@@ -137,6 +140,10 @@ jobs:
           install -m 0755 \
             "$CARGO_TARGET_DIR/release/astrid-storage-provider-fskit" \
             "$RELEASE_STAGE/astrid-storage-provider-fskit"
+          [[ "$("$CERT_BIN/astrid" --version)" == "astrid $ASTRID_VERSION" ]]
+          PROVIDER_SOURCE_VERSION=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -er '.packages[] | select(.name == "astrid-storage-provider-fskit") | .version')
+          [[ "$PROVIDER_SOURCE_VERSION" == "$ASTRID_VERSION" ]]
 
       - name: Build, sign, and notarize the FSKit app
         env:
@@ -160,7 +167,8 @@ jobs:
           install -m 0755 \
             scripts/validate-macos-fskit.sh \
             "$RELEASE_STAGE/macos/validate-macos-fskit.sh"
-          "$RELEASE_STAGE/macos/validate-macos-fskit.sh" "$RELEASE_STAGE/AstridFS.app"
+          ASTRID_FSKIT_EXPECTED_VERSION="$ASTRID_VERSION" \
+            "$RELEASE_STAGE/macos/validate-macos-fskit.sh" "$RELEASE_STAGE/AstridFS.app"
 
       - name: Install and activate the signed extension
         run: |
@@ -168,8 +176,32 @@ jobs:
           ASTRID_FSKIT_APP_DEST="$ASTRID_FSKIT_APP_DEST" \
           ASTRID_FSKIT_BIN_DIR="$ASTRID_FSKIT_BIN_DIR" \
             "$RELEASE_STAGE/macos/manage-macos-fskit.sh" install
-          "$RELEASE_STAGE/macos/manage-macos-fskit.sh" validate
+          ASTRID_FSKIT_EXPECTED_VERSION="$ASTRID_VERSION" \
+            "$RELEASE_STAGE/macos/manage-macos-fskit.sh" validate
+          open -gj "$ASTRID_FSKIT_APP_DEST"
+          for _ in {1..30}; do
+            /usr/bin/pluginkit -m -A -D -i org.astrid.runtime.fs.AppEx \
+              | grep -Fq 'org.astrid.runtime.fs.AppEx' && break
+            sleep 1
+          done
+          /usr/bin/pluginkit -m -A -D -i org.astrid.runtime.fs.AppEx \
+            | grep -Fq 'org.astrid.runtime.fs.AppEx'
+
+          # A discovered but ignored extension must fail closed with exact
+          # operator remediation; a containing app process is not election.
+          /usr/bin/pluginkit -e ignore -i org.astrid.runtime.fs.AppEx
+          if "$RELEASE_STAGE/macos/manage-macos-fskit.sh" status \
+            >"$CERT_ROOT/ignored-status.out" 2>"$CERT_ROOT/ignored-status.err"; then
+            echo "ignored FSKit extension unexpectedly passed lifecycle status" >&2
+            exit 1
+          fi
+          grep -Fq 'System Settings > General > Login Items & Extensions > File System Extensions' \
+            "$CERT_ROOT/ignored-status.err"
+
+          /usr/bin/pluginkit -e use -i org.astrid.runtime.fs.AppEx
           "$RELEASE_STAGE/macos/manage-macos-fskit.sh" enable
+          "$RELEASE_STAGE/macos/manage-macos-fskit.sh" status
+
           for _ in {1..30}; do
             pgrep -x AstridFS >/dev/null && break
             sleep 1
@@ -178,11 +210,33 @@ jobs:
             echo "AstridFS did not launch in the runner's GUI session" >&2
             exit 1
           }
+          APP_ASN=$(/usr/bin/lsappinfo find bundleid=org.astrid.runtime.fs)
+          APP_INFO=$(/usr/bin/lsappinfo info "$APP_ASN")
+          grep -Fq 'type="UIElement"' <<<"$APP_INFO"
+          ! grep -Fq 'type="Foreground"' <<<"$APP_INFO"
 
       - name: Exercise a real mount and the ignored native round-trip
         run: |
           set -euo pipefail
           "$CERT_BIN/astrid" --principal default start
+
+          if "$CERT_BIN/astrid" --principal default storage status "$MOUNTPOINT_INITIAL" \
+            >"$CERT_ROOT/pre-mount-status.out" 2>"$CERT_ROOT/pre-mount-status.err"; then
+            echo "storage status unexpectedly admitted an unmounted path" >&2
+            exit 1
+          fi
+
+          REQUEST_ID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+          PROVIDER_REQUEST=$(jq -cn \
+            --arg request_id "$REQUEST_ID" \
+            --arg mountpoint "$MOUNTPOINT_INITIAL" \
+            '{protocol_version: 1, request_id: $request_id, acting_principal_hint: "default", operation: {operation: "status", selector: {kind: "native-path", value: $mountpoint}}}')
+          PROVIDER_RESPONSE=$(printf '%s\n' "$PROVIDER_REQUEST" \
+            | "$CERT_BIN/astrid-storage-provider-fskit" --astrid-provider-stdio-v1)
+          jq -e \
+            --arg version "$ASTRID_VERSION" \
+            '.protocol_version == 1 and .provider.name == "astrid-storage-provider-fskit" and .provider.version == $version' \
+            <<<"$PROVIDER_RESPONSE" >/dev/null
 
           MOUNT_OUTPUT=$("$CERT_BIN/astrid" --principal default storage mount \
             --as default "$MOUNTPOINT_INITIAL")
@@ -191,14 +245,24 @@ jobs:
             | sed -nE 's/^mounted ([0-9a-f-]{36}) at .*/\1/p')
           [[ "$MOUNT_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
           [[ "$(stat -f %T "$MOUNTPOINT_INITIAL")" == astridfs ]]
+          STATUS_OUTPUT=$("$CERT_BIN/astrid" --principal default storage status "$MOUNTPOINT_INITIAL")
+          grep -Fq "mount $MOUNT_ID at $MOUNTPOINT_INITIAL: ReadWrite, dirty=false" <<<"$STATUS_OUTPUT"
 
           SENTINEL="native-fskit-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           printf '%s\n' "$SENTINEL" > "$MOUNTPOINT_INITIAL/certification.txt"
           mv "$MOUNTPOINT_INITIAL/certification.txt" "$MOUNTPOINT_INITIAL/certified.txt"
           [[ "$(cat "$MOUNTPOINT_INITIAL/certified.txt")" == "$SENTINEL" ]]
+          STATUS_OUTPUT=$("$CERT_BIN/astrid" --principal default storage status "$MOUNTPOINT_INITIAL")
+          grep -Fq "mount $MOUNT_ID at $MOUNTPOINT_INITIAL: ReadWrite, dirty=true" <<<"$STATUS_OUTPUT"
           "$CERT_BIN/astrid" --principal default storage sync "$MOUNTPOINT_INITIAL"
+          STATUS_OUTPUT=$("$CERT_BIN/astrid" --principal default storage status "$MOUNTPOINT_INITIAL")
+          grep -Fq "mount $MOUNT_ID at $MOUNTPOINT_INITIAL: ReadWrite, dirty=false" <<<"$STATUS_OUTPUT"
           rm "$MOUNTPOINT_INITIAL/certified.txt"
+          STATUS_OUTPUT=$("$CERT_BIN/astrid" --principal default storage status "$MOUNTPOINT_INITIAL")
+          grep -Fq "mount $MOUNT_ID at $MOUNTPOINT_INITIAL: ReadWrite, dirty=true" <<<"$STATUS_OUTPUT"
           "$CERT_BIN/astrid" --principal default storage sync "$MOUNTPOINT_INITIAL"
+          STATUS_OUTPUT=$("$CERT_BIN/astrid" --principal default storage status "$MOUNTPOINT_INITIAL")
+          grep -Fq "mount $MOUNT_ID at $MOUNTPOINT_INITIAL: ReadWrite, dirty=false" <<<"$STATUS_OUTPUT"
 
           RESOURCE="/private/tmp/astrid-mounts-$(id -u)/$MOUNT_ID"
           [[ -d "$RESOURCE" && -f "$RESOURCE/lease.json" && -S "$RESOURCE/control.sock" ]]
@@ -220,6 +284,11 @@ jobs:
 
           "$CERT_BIN/astrid" --principal default storage unmount "$MOUNTPOINT_INITIAL"
           [[ ! -e "$RESOURCE" ]]
+          if "$CERT_BIN/astrid" --principal default storage status "$MOUNTPOINT_INITIAL" \
+            >"$CERT_ROOT/post-unmount-status.out" 2>"$CERT_ROOT/post-unmount-status.err"; then
+            echo "storage status unexpectedly retained an unmounted path" >&2
+            exit 1
+          fi
           "$CERT_BIN/astrid" --principal default stop
 
       - name: Uninstall and clean the dedicated runner

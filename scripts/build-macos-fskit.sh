@@ -13,7 +13,13 @@ OUTPUT_ROOT="${ASTRID_FSKIT_OUTPUT_ROOT:-$PWD/target/macos-fskit}"
 CONFIGURATION="${ASTRID_FSKIT_CONFIGURATION:-Release}"
 SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
 BUILD_VERSION="$(git rev-list --count HEAD)"
+ASTRID_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
 ARCHS="${ASTRID_FSKIT_ARCHS:-$(uname -m)}"
+
+if [[ -z "$ASTRID_VERSION" ]]; then
+  echo "workspace Astrid version is missing" >&2
+  exit 1
+fi
 
 scripts/check-macos-fskit.sh
 mkdir -p "$OUTPUT_ROOT"
@@ -30,6 +36,7 @@ xcodebuild \
   CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY" \
   CODE_SIGN_STYLE=Manual \
   CURRENT_PROJECT_VERSION="$BUILD_VERSION" \
+  MARKETING_VERSION="$ASTRID_VERSION" \
   ARCHS="$ARCHS" \
   ONLY_ACTIVE_ARCH=NO \
   COMPILER_INDEX_STORE_ENABLE=NO \
@@ -52,8 +59,14 @@ APP_BINARY="$APP_PATH/Contents/MacOS/AstridFS"
 EXTENSION_BINARY="$EXTENSION_PATH/Contents/MacOS/AstridFSAppEx"
 APP_VERSION="$(plutil -extract CFBundleVersion raw -expect string "$APP_PATH/Contents/Info.plist")"
 EXTENSION_VERSION="$(plutil -extract CFBundleVersion raw -expect string "$EXTENSION_PATH/Contents/Info.plist")"
+APP_RELEASE_VERSION="$(plutil -extract CFBundleShortVersionString raw -expect string "$APP_PATH/Contents/Info.plist")"
+EXTENSION_RELEASE_VERSION="$(plutil -extract CFBundleShortVersionString raw -expect string "$EXTENSION_PATH/Contents/Info.plist")"
 if [[ "$APP_VERSION" != "$BUILD_VERSION" || "$EXTENSION_VERSION" != "$BUILD_VERSION" ]]; then
   echo "FSKit bundle versions do not match source revision" >&2
+  exit 1
+fi
+if [[ "$APP_RELEASE_VERSION" != "$ASTRID_VERSION" || "$EXTENSION_RELEASE_VERSION" != "$ASTRID_VERSION" ]]; then
+  echo "FSKit bundle release versions do not match Astrid $ASTRID_VERSION" >&2
   exit 1
 fi
 APP_ARCHITECTURES="$(lipo -archs "$APP_BINARY")"

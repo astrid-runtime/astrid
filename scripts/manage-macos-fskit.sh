@@ -31,6 +31,7 @@ fi
 SOURCE_APP="$RELEASE_ROOT/AstridFS.app"
 DESTINATION_APP="${ASTRID_FSKIT_APP_DEST:-/Applications/AstridFS.app}"
 VALIDATOR="$RELEASE_ROOT/scripts/validate-macos-fskit.sh"
+EXTENSION_IDENTIFIER=org.astrid.runtime.fs.AppEx
 if [[ ! -x "$VALIDATOR" ]]; then
   VALIDATOR="$MANAGER_DIR/validate-macos-fskit.sh"
 fi
@@ -41,6 +42,33 @@ validate_app() {
     exit 1
   }
   "$VALIDATOR" "$1"
+}
+
+extension_record() {
+  /usr/bin/pluginkit -m -A -D -v -i "$EXTENSION_IDENTIFIER"
+}
+
+extension_is_elected() {
+  local extension_path extension_version records matches
+  extension_path="$DESTINATION_APP/Contents/Extensions/AstridFSAppEx.appex"
+  extension_version="$(plutil -extract CFBundleShortVersionString raw -expect string "$extension_path/Contents/Info.plist")"
+  records="$(extension_record)" || return 1
+  matches="$(printf '%s\n' "$records" | /usr/bin/awk -F '\t' \
+    -v identifier="$EXTENSION_IDENTIFIER" \
+    -v version="$extension_version" \
+    -v path="$extension_path" \
+    '$1 == "+    " identifier "(" version ")" && $4 == path { count++ } END { print count + 0 }')"
+  [[ "$matches" -eq 1 ]]
+}
+
+require_extension_elected() {
+  if extension_is_elected; then
+    return 0
+  fi
+  echo "AstridFS is installed but macOS has not elected $EXTENSION_IDENTIFIER from $DESTINATION_APP." >&2
+  echo "Open System Settings > General > Login Items & Extensions > File System Extensions, enable AstridFS, then rerun this command." >&2
+  extension_record >&2 || true
+  return 1
 }
 
 companion_path() {
@@ -181,12 +209,20 @@ case "$COMMAND" in
     ;;
   enable)
     validate_app "$DESTINATION_APP"
-    open "$DESTINATION_APP"
-    echo "AstridFS launched. Enable AstridFS in System Settings when macOS prompts you."
+    open -gj "$DESTINATION_APP"
+    for _ in {1..30}; do
+      if extension_is_elected; then
+        echo "AstridFS is elected for CLI-controlled mounts."
+        exit 0
+      fi
+      sleep 1
+    done
+    require_extension_elected
     ;;
   status)
     validate_app "$DESTINATION_APP"
-    echo "AstridFS is installed, signed, and notarized at $DESTINATION_APP"
+    require_extension_elected
+    echo "AstridFS is installed, signed, notarized, and elected at $DESTINATION_APP"
     if /sbin/mount | grep -Fq astridfs; then
       /sbin/mount | grep -F astridfs
     else
