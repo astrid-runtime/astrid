@@ -148,6 +148,14 @@ pub(crate) mod cleanup_evidence {
                 >= lease_resources,
             "typed evidence must record every lease-resource cleanup: {events:?}"
         );
+        assert!(
+            events
+                .iter()
+                .filter(|event| matches!(event.stage, ProjectionCleanupStage::CleanupLedger { .. }))
+                .count()
+                >= lease_resources,
+            "typed evidence must record every cleanup ledger completion: {events:?}"
+        );
     }
 }
 
@@ -439,13 +447,15 @@ pub(crate) mod owned_test_tasks {
 
         pub(crate) async fn join(&self) -> T {
             let Some(handle) = self.take_handle() else {
-                panic!("owned test task cannot be joined twice");
+                assert!(!self.was_joined(), "owned test task cannot be joined twice");
+                panic!("owned test task join handle detached before settlement");
             };
-            let value = handle
-                .await
-                .expect("owned test task must finish without panicking");
-            self.joined.store(true, Ordering::Release);
-            value
+            OwnedJoin {
+                owner: self,
+                handle: Some(handle),
+                taken: true,
+            }
+            .await
         }
 
         pub(crate) fn was_cancelled(&self) -> bool {
@@ -464,6 +474,51 @@ pub(crate) mod owned_test_tasks {
         }
     }
 
+    impl<T> OwnedTask<T> {
+        fn restore_handle(&self, handle: tokio::task::JoinHandle<T>) {
+            *self
+                .handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+        }
+    }
+
+    struct OwnedJoin<'task, T> {
+        owner: &'task OwnedTask<T>,
+        handle: Option<tokio::task::JoinHandle<T>>,
+        taken: bool,
+    }
+
+    impl<T> Future for OwnedJoin<'_, T> {
+        type Output = T;
+
+        fn poll(
+            mut self: Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            let Some(handle) = self.handle.as_mut() else {
+                return std::task::Poll::Pending;
+            };
+            let outcome = std::task::ready!(<_ as Future>::poll(Pin::new(handle), context));
+            self.taken = false;
+            self.owner.joined.store(true, Ordering::Release);
+            match outcome {
+                Ok(value) => std::task::Poll::Ready(value),
+                Err(error) => panic!("owned test task failed while joining: {error}"),
+            }
+        }
+    }
+
+    impl<T> Drop for OwnedJoin<'_, T> {
+        fn drop(&mut self) {
+            if self.taken
+                && let Some(handle) = self.handle.take()
+            {
+                self.owner.restore_handle(handle);
+            }
+        }
+    }
+
     impl<T> Drop for OwnedTask<T> {
         fn drop(&mut self) {
             if let Some(handle) = self
@@ -478,36 +533,58 @@ pub(crate) mod owned_test_tasks {
     }
 
     pub(crate) trait OwnedTestTask: Send + Sync {
-        fn finish<'task>(&'task self) -> Pin<Box<dyn Future<Output = ()> + Send + 'task>>
+        fn finish<'task>(
+            &'task self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), OwnedTaskJoinFailure>> + Send + 'task>>
         where
             Self: 'task;
     }
 
     impl<T: Send + 'static> OwnedTestTask for OwnedTask<T> {
-        fn finish<'task>(&'task self) -> Pin<Box<dyn Future<Output = ()> + Send + 'task>>
+        fn finish<'task>(
+            &'task self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), OwnedTaskJoinFailure>> + Send + 'task>>
         where
             Self: 'task,
         {
             Box::pin(async move {
                 let Some(handle) = self.take_handle() else {
-                    return;
+                    return if self.was_joined() {
+                        Ok(())
+                    } else {
+                        Err(OwnedTaskJoinFailure::Detached)
+                    };
                 };
                 handle.abort();
-                match handle.await {
-                    Ok(_) => {},
+                let outcome = handle.await;
+                self.joined.store(true, Ordering::Release);
+                match outcome {
+                    Ok(_) => Ok(()),
                     Err(error) if error.is_cancelled() => {
                         self.cancelled.store(true, Ordering::Release);
+                        Ok(())
                     },
-                    Err(error) => panic!("owned test task failed while joining: {error}"),
+                    Err(error) => Err(OwnedTaskJoinFailure::Join(error.to_string())),
                 }
             })
         }
     }
 
-    pub(crate) async fn run_owned_test_body_catching<T, F, Fut>(
+    #[derive(Debug)]
+    pub(crate) enum OwnedTaskJoinFailure {
+        Detached,
+        Join(String),
+    }
+
+    pub(crate) struct OwnedBodyOutcome<T> {
+        pub(crate) outcome: Result<T, Box<dyn std::any::Any + Send>>,
+        pub(crate) cleanup_failures: Vec<(usize, OwnedTaskJoinFailure)>,
+    }
+
+    pub(crate) async fn run_owned_test_body_detailed<T, F, Fut>(
         tasks: &[Arc<dyn OwnedTestTask>],
         body: F,
-    ) -> Result<T, Box<dyn std::any::Any + Send>>
+    ) -> OwnedBodyOutcome<T>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = T> + 'static,
@@ -518,10 +595,16 @@ pub(crate) mod owned_test_tasks {
             spawn_blocking(move || catch_unwind(AssertUnwindSafe(|| runtime.block_on(body()))))
                 .await
                 .expect("owned test body worker");
-        for task in tasks {
-            task.finish().await;
+        let mut cleanup_failures = Vec::new();
+        for (index, task) in tasks.iter().enumerate() {
+            if let Err(failure) = task.finish().await {
+                cleanup_failures.push((index, failure));
+            }
         }
-        outcome
+        OwnedBodyOutcome {
+            outcome,
+            cleanup_failures,
+        }
     }
 
     pub(crate) async fn run_owned_test_body<T, F, Fut>(
@@ -533,42 +616,115 @@ pub(crate) mod owned_test_tasks {
         Fut: Future<Output = T> + 'static,
         T: Send + 'static,
     {
-        match run_owned_test_body_catching(tasks, body).await {
+        let result = run_owned_test_body_detailed(tasks, body).await;
+        let value = match result.outcome {
             Ok(value) => value,
             Err(payload) => resume_unwind(payload),
-        }
+        };
+        assert!(
+            result.cleanup_failures.is_empty(),
+            "owned test task cleanup failures: {:?}",
+            result.cleanup_failures
+        );
+        value
     }
 }
 
 #[cfg(test)]
 mod owned_task_tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
-    use super::owned_test_tasks::{OwnedTask, OwnedTestTask, run_owned_test_body_catching};
+    use super::owned_test_tasks::{
+        OwnedTask, OwnedTaskJoinFailure, OwnedTestTask, run_owned_test_body_detailed,
+    };
 
-    #[tokio::test]
-    async fn owned_tasks_join_on_success_and_cancel_after_body_unwind() {
+    fn assertion_payload(outcome: &Result<(), Box<dyn std::any::Any + Send>>) -> String {
+        let payload = &outcome.as_ref().expect_err("body panic");
+        payload
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .expect("string body panic payload")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_timeout_catches_panic_aborts_and_joins_owned_task() {
+        let never = Arc::new(OwnedTask::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        }));
+        let finishers = [Arc::clone(&never) as Arc<dyn OwnedTestTask>];
+        let body_task = Arc::clone(&never);
+
+        let outcome = run_owned_test_body_detailed(&finishers, move || async move {
+            panic!(
+                "{:?}",
+                tokio::time::timeout(Duration::from_millis(50), body_task.join()).await
+            )
+        })
+        .await;
+
+        assert!(assertion_payload(&outcome.outcome).contains("Err(Elapsed"));
+        assert!(outcome.cleanup_failures.is_empty());
+        assert!(never.was_cancelled());
+        assert!(never.was_joined());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn caught_body_assertion_panic_settles_every_owned_task() {
         let joined = Arc::new(OwnedTask::spawn(async { 1usize }));
         let cancelled = Arc::new(OwnedTask::spawn(async {
             loop {
                 tokio::task::yield_now().await;
             }
         }));
-        let finishers: [Arc<dyn OwnedTestTask>; 2] = [
+        let finishers = [
             Arc::clone(&joined) as Arc<dyn OwnedTestTask>,
             Arc::clone(&cancelled) as Arc<dyn OwnedTestTask>,
         ];
         let body_joined = Arc::clone(&joined);
 
-        let outcome = run_owned_test_body_catching(&finishers, move || async move {
+        let outcome = run_owned_test_body_detailed(&finishers, move || async move {
             assert_eq!(body_joined.join().await, 1);
             panic!("body assertion unwind");
         })
         .await;
 
-        assert!(outcome.is_err(), "the captured body panic must be visible");
+        assert_eq!(assertion_payload(&outcome.outcome), "body assertion unwind");
+        assert!(outcome.cleanup_failures.is_empty());
         assert!(joined.was_joined());
         assert!(cancelled.was_cancelled());
+        assert!(cancelled.was_joined());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn body_panic_remains_primary_when_owned_finisher_panics() {
+        let finisher = Arc::new(OwnedTask::spawn(async {
+            panic!("independent finisher unwind");
+        }));
+        let finishers = [Arc::clone(&finisher) as Arc<dyn OwnedTestTask>];
+
+        let outcome = run_owned_test_body_detailed(&finishers, move || async move {
+            tokio::task::yield_now().await;
+            panic!("distinct body assertion unwind");
+        })
+        .await;
+
+        assert_eq!(
+            assertion_payload(&outcome.outcome),
+            "distinct body assertion unwind"
+        );
+        assert_eq!(outcome.cleanup_failures.len(), 1);
+        assert!(
+            matches!(
+                &outcome.cleanup_failures[0].1,
+                OwnedTaskJoinFailure::Join(message) if message.contains("independent finisher unwind")
+            ),
+            "{:?}",
+            outcome.cleanup_failures
+        );
+        assert!(finisher.was_joined());
     }
 }
 

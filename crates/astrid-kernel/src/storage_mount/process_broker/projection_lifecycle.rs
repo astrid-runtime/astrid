@@ -27,6 +27,7 @@ use super::{
 };
 use crate::storage_mount::lifecycle::cleanup_mapped_lease_resources;
 use crate::storage_mount::lifecycle::{complete_cleanup_ledger, force_fence_projection_lease};
+use cleanup_evidence::ProjectionCleanupStage as Stage;
 
 use super::projection_root_removal::remove_projection_root;
 
@@ -123,10 +124,7 @@ async fn cleanup_projection(state: &mut ProjectionCleanupState) -> bool {
     // the provider handles in the state makes a later mount request retry the
     // same bounded operation instead of creating a second projection.
     let binding_valid = state.binding.validate().is_ok();
-    cleanup_evidence::record(
-        cleanup_evidence::ProjectionCleanupStage::Binding,
-        !binding_valid,
-    );
+    cleanup_evidence::record(Stage::Binding, !binding_valid);
     if !binding_valid {
         tracing::error!("process storage projection binding became invalid");
     }
@@ -165,18 +163,11 @@ async fn cleanup_projection(state: &mut ProjectionCleanupState) -> bool {
     }
     if let Err(error) = remove_projection_root(&state.mount_root) {
         tracing::error!(%error, "failed to remove process storage projection root");
-        cleanup_evidence::record(
-            cleanup_evidence::ProjectionCleanupStage::ProjectionRoot,
-            true,
-        );
+        cleanup_evidence::record(Stage::ProjectionRoot, true);
         return false;
     }
-    cleanup_evidence::record(
-        cleanup_evidence::ProjectionCleanupStage::ProjectionRoot,
-        false,
-    );
+    cleanup_evidence::record(Stage::ProjectionRoot, false);
     state.cleaned = true;
-    cleanup_evidence::record(cleanup_evidence::ProjectionCleanupStage::Complete, false);
     true
 }
 
@@ -236,8 +227,6 @@ async fn stop_running_provider(
     policy: ProcessStopPolicy,
     component: cleanup_evidence::ProviderComponent,
 ) -> bool {
-    use cleanup_evidence::ProjectionCleanupStage;
-
     if provider.stopped {
         return true;
     }
@@ -250,14 +239,14 @@ async fn stop_running_provider(
         )
         .await;
         cleanup_evidence::record(
-            ProjectionCleanupStage::ProviderStop { component, outcome },
+            Stage::ProviderStop { component, outcome },
             !matches!(outcome, ProcessStopOutcome::Stopped { .. }),
         );
         matches!(outcome, ProcessStopOutcome::Stopped { .. })
     } else {
         let stopped = unmanaged_provider_is_stopped(&provider.control_path).await;
         cleanup_evidence::record(
-            ProjectionCleanupStage::ProviderStop {
+            Stage::ProviderStop {
                 component,
                 outcome: if stopped {
                     ProcessStopOutcome::Stopped {
@@ -450,47 +439,34 @@ pub(crate) async fn cleanup_uncommitted_issue_lease_set(
     };
     fence_projection_states(&states, true);
     let listeners_closed = drain_projection_states(&states).await;
-    cleanup_evidence::record(
-        cleanup_evidence::ProjectionCleanupStage::ListenerSettlement,
-        !listeners_closed,
-    );
+    cleanup_evidence::record(Stage::ListenerSettlement, !listeners_closed);
     if !listeners_closed {
         return false;
     }
     let _mutation_guard = kernel.storage_mount_mutations.lock().await;
     for state in &states {
-        if let Err(error) = cleanup_mapped_lease_resources(state) {
-            cleanup_evidence::record(
-                cleanup_evidence::ProjectionCleanupStage::LeaseResources {
-                    mount_id: error.mount_id.unwrap_or(state.mount_id),
-                },
-                true,
-            );
-            return false;
-        }
+        let cleaned = cleanup_mapped_lease_resources(state).is_ok();
         cleanup_evidence::record(
-            cleanup_evidence::ProjectionCleanupStage::LeaseResources {
+            Stage::LeaseResources {
                 mount_id: state.mount_id,
             },
-            false,
+            !cleaned,
         );
+        if !cleaned {
+            return false;
+        }
     }
     for state in &states {
-        if let Err(_error) = complete_cleanup_ledger(state) {
-            cleanup_evidence::record(
-                cleanup_evidence::ProjectionCleanupStage::CleanupLedger {
-                    mount_id: state.mount_id,
-                },
-                true,
-            );
-            return false;
-        }
+        let completed = complete_cleanup_ledger(state).is_ok();
         cleanup_evidence::record(
-            cleanup_evidence::ProjectionCleanupStage::CleanupLedger {
+            Stage::CleanupLedger {
                 mount_id: state.mount_id,
             },
-            false,
+            !completed,
         );
+        if !completed {
+            return false;
+        }
     }
     for state in &states {
         state.complete_drain_retry();
@@ -513,6 +489,7 @@ pub(crate) async fn revoke_projection_leases(
     };
     fence_projection_states(&states, true);
     let listeners_closed = drain_projection_states(&states).await;
+    cleanup_evidence::record(Stage::ListenerSettlement, !listeners_closed);
     if !listeners_closed {
         tracing::error!(
             "failed to drain an authorized process storage projection listener before cleanup"
@@ -522,12 +499,26 @@ pub(crate) async fn revoke_projection_leases(
     // Resource removal and unmap are two phases. A resource fault therefore
     // leaves the complete exact set mapped as the bounded-retry authority.
     for state in &states {
-        if cleanup_mapped_lease_resources(state).is_err() {
+        let cleaned = cleanup_mapped_lease_resources(state).is_ok();
+        cleanup_evidence::record(
+            Stage::LeaseResources {
+                mount_id: state.mount_id,
+            },
+            !cleaned,
+        );
+        if !cleaned {
             return false;
         }
     }
     for state in &states {
-        if complete_cleanup_ledger(state).is_err() {
+        let completed = complete_cleanup_ledger(state).is_ok();
+        cleanup_evidence::record(
+            Stage::CleanupLedger {
+                mount_id: state.mount_id,
+            },
+            !completed,
+        );
+        if !completed {
             return false;
         }
     }
@@ -548,6 +539,7 @@ async fn fence_available_projection_leases(
     let (states, _, _) = exact_projection_lease_states(kernel, binding, component_mount_ids);
     fence_projection_states(&states, true);
     let listeners_closed = drain_projection_states(&states).await;
+    cleanup_evidence::record(Stage::ListenerSettlement, !listeners_closed);
     if !listeners_closed {
         tracing::error!(
             "failed to drain an authorized process storage projection listener before cleanup"
@@ -720,13 +712,14 @@ pub(crate) async fn retry_failed_projection(
     let removable = projections
         .get(key)
         .is_some_and(|current| Arc::ptr_eq(current, projection));
-    cleanup_evidence::record(
-        cleanup_evidence::ProjectionCleanupStage::CacheRemoval,
-        !removable,
-    );
     if removable {
         projections.remove(key);
     }
+    let removed = !projections
+        .get(key)
+        .is_some_and(|current| Arc::ptr_eq(current, projection));
+    cleanup_evidence::record(Stage::CacheRemoval, !removed);
+    cleanup_evidence::record(Stage::Complete, !removed);
     true
 }
 
@@ -771,6 +764,11 @@ pub(crate) async fn invalidate_unhealthy_projection(
     {
         projections.remove(key);
     }
+    let cache_removed = !projections
+        .get(key)
+        .is_some_and(|current| Arc::ptr_eq(current, projection));
+    cleanup_evidence::record(Stage::CacheRemoval, !cache_removed);
+    cleanup_evidence::record(Stage::Complete, !cache_removed);
     true
 }
 
