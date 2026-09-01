@@ -505,10 +505,14 @@ internal static class Program
                 throw;
             }
 
-            if (!TryTerminateAndAwait(job, process, cleanupTimeout))
+            var cleanupSucceeded = TryTerminateAndAwait(job, process, cleanupTimeout);
+            if (!cleanupSucceeded)
             {
-                throw new ControllerException(
-                    $"launch cleanup did not reach ACTIVE_PROCESS_ZERO; stdout={stdoutPath}; stderr={stderrPath}");
+                throw PreservePrimaryCleanupFailure(
+                    new ControllerException(
+                        "job cleanup did not reach ACTIVE_PROCESS_ZERO after the primary controller failure"),
+                    stdoutPath,
+                    stderrPath);
             }
 
             throw;
@@ -712,6 +716,17 @@ internal static class Program
         }
     }
 
+    internal static ControllerException PreservePrimaryCleanupFailure(
+        ControllerException primary,
+        string stdoutPath,
+        string stderrPath)
+    {
+        return new ControllerException(
+            $"primary cause preserved: {primary.Message}; separate cleanup failure: "
+            + $"cleanup did not reach ACTIVE_PROCESS_ZERO; stdout={stdoutPath}; stderr={stderrPath}",
+            primary);
+    }
+
     private static bool TerminateUnassignedProcessAndAwait(
         SafeProcessHandle? process,
         TimeSpan cleanupTimeout)
@@ -756,73 +771,24 @@ internal static class Program
 
     private static uint[] GetJobProcessIds(SafeJobHandle job)
     {
-        const int errorMoreData = 234;
-        const int headerLength = 2 * sizeof(int);
-        const int maximumAttempts = 8;
-        var bufferLength = (uint)headerLength;
+        return JobProcessList.ReadIds(job, QueryJobProcessIdsNative);
+    }
 
-        for (var attempt = 0; attempt < maximumAttempts; attempt++)
-        {
-            if (bufferLength < headerLength || bufferLength > int.MaxValue)
-            {
-                throw new ControllerException("the Job Object process ID list length is invalid");
-            }
-
-            var buffer = Marshal.AllocHGlobal((int)bufferLength);
-            try
-            {
-                if (NativeMethods.QueryInformationJobObject(
-                        job,
-                        NativeMethods.JobObjectBasicProcessIdList,
-                        buffer,
-                        bufferLength,
-                        out var returnLength))
-                {
-                    if (returnLength < headerLength)
-                    {
-                        throw new ControllerException("the Job Object process ID list return length is too short");
-                    }
-
-                    var assignedProcesses = Marshal.ReadInt32(buffer, 0);
-                    var processIdCount = Marshal.ReadInt32(buffer, sizeof(int));
-                    JobProcessList.ValidateCounts(assignedProcesses, processIdCount);
-                    var expectedLength = (long)headerLength + processIdCount * IntPtr.Size;
-                    if (returnLength < expectedLength)
-                    {
-                        throw new ControllerException(
-                            $"Job Object process ID list was truncated: return {returnLength}, expected {expectedLength}");
-                    }
-
-                    var processIds = new uint[processIdCount];
-                    for (var index = 0; index < processIdCount; index++)
-                    {
-                        processIds[index] = (uint)Marshal.ReadIntPtr(buffer, headerLength + index * IntPtr.Size);
-                    }
-
-                    return processIds;
-                }
-
-                var error = Marshal.GetLastWin32Error();
-                if (error != errorMoreData)
-                {
-                    throw new ControllerException($"QueryInformationJobObject failed: Win32 error {error}");
-                }
-
-                if (returnLength < headerLength || returnLength > int.MaxValue)
-                {
-                    throw new ControllerException(
-                        $"Job Object process ID list requires an invalid length: {returnLength}");
-                }
-
-                bufferLength = returnLength;
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(buffer);
-            }
-        }
-
-        throw new ControllerException("the Job Object process ID list did not stabilize");
+    private static bool QueryJobProcessIdsNative(
+        SafeJobHandle job,
+        IntPtr information,
+        uint length,
+        out uint returnLength,
+        out int win32Error)
+    {
+        var succeeded = NativeMethods.QueryInformationJobObject(
+            job,
+            NativeMethods.JobObjectBasicProcessIdList,
+            information,
+            length,
+            out returnLength);
+        win32Error = Marshal.GetLastWin32Error();
+        return succeeded;
     }
 
     internal static IReadOnlyList<string> ParseTestListForSelfTest(IEnumerable<string> lines) =>
@@ -834,6 +800,17 @@ internal static class Program
         AssertProvider(expectedPath, actualPath, expectedHash);
 
     internal static uint[] GetJobProcessIdsForSelfTest(SafeJobHandle job) => GetJobProcessIds(job);
+
+    internal static uint[] ReadJobProcessIdsForSelfTest(
+        SafeJobHandle job,
+        QueryJobProcessList query) =>
+        JobProcessList.ReadIds(job, query);
+
+    internal static bool TryTerminateAndAwaitForSelfTest(
+        SafeJobHandle job,
+        SafeProcessHandle? process,
+        TimeSpan cleanupTimeout) =>
+        TryTerminateAndAwait(job, process, cleanupTimeout);
 
     internal static JobRunResult RunCommandForSelfTest(
         string workingDirectory,

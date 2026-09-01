@@ -4,6 +4,13 @@ using Microsoft.Win32.SafeHandles;
 
 namespace Astrid.Ci.Windows;
 
+internal delegate bool QueryJobProcessList(
+    SafeJobHandle job,
+    IntPtr information,
+    uint length,
+    out uint returnLength,
+    out int win32Error);
+
 internal enum JobOutcome
 {
     Succeeded,
@@ -54,6 +61,120 @@ internal sealed class ControllerException : Exception
 
 internal static class JobProcessList
 {
+    internal const int ProcessIdListOffset = 16;
+    internal const int MinimumStructureLength = 24;
+    internal const int MaximumBufferLength = 16 * 1024 * 1024;
+
+    internal static uint[] ReadIds(SafeJobHandle job, QueryJobProcessList query)
+    {
+        const int maximumAttempts = 12;
+        var bufferLength = (uint)MinimumStructureLength;
+
+        for (var attempt = 0; attempt < maximumAttempts; attempt++)
+        {
+            if (bufferLength < MinimumStructureLength || bufferLength > MaximumBufferLength)
+            {
+                throw new ControllerException(
+                    $"Job Object process ID list capacity is invalid: {bufferLength}");
+            }
+
+            var buffer = Marshal.AllocHGlobal((int)bufferLength);
+            try
+            {
+                if (query(
+                        job,
+                        buffer,
+                        bufferLength,
+                        out var returnLength,
+                        out var win32Error))
+                {
+                    return ParseVerifiedList(buffer, bufferLength, returnLength);
+                }
+
+                if (win32Error != 234)
+                {
+                    throw new ControllerException(
+                        $"QueryInformationJobObject failed: Win32 error {win32Error}");
+                }
+
+                bufferLength = GetGrownCapacity(buffer, bufferLength, returnLength);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        throw new ControllerException("the Job Object process ID list did not stabilize");
+    }
+
+    private static uint GetGrownCapacity(IntPtr buffer, uint currentCapacity, uint returnedLength)
+    {
+        if (currentCapacity < ProcessIdListOffset)
+        {
+            throw new ControllerException("the Job Object process ID list header is too small");
+        }
+
+        var assignedProcesses = Marshal.ReadInt32(buffer, 0);
+        var processIdCount = Marshal.ReadInt32(buffer, sizeof(int));
+        ValidateCounts(assignedProcesses, processIdCount);
+        var requiredByCounts = RequiredLength(processIdCount);
+        var doubled = (long)currentCapacity * 2;
+        var desired = Math.Max(Math.Max(doubled, returnedLength), requiredByCounts);
+        if (desired > MaximumBufferLength)
+        {
+            throw new ControllerException(
+                $"Job Object process ID list exceeds bounded capacity: required {desired}, maximum {MaximumBufferLength}");
+        }
+
+        var nextCapacity = (uint)desired;
+        if (nextCapacity <= currentCapacity)
+        {
+            throw new ControllerException("the Job Object process ID list capacity did not grow after ERROR_MORE_DATA");
+        }
+
+        return nextCapacity;
+    }
+
+    private static uint[] ParseVerifiedList(IntPtr buffer, uint bufferCapacity, uint returnLength)
+    {
+        if (returnLength < MinimumStructureLength || returnLength > bufferCapacity)
+        {
+            throw new ControllerException(
+                $"Job Object process ID list return length is unverified: return={returnLength}, capacity={bufferCapacity}");
+        }
+
+        var assignedProcesses = Marshal.ReadInt32(buffer, 0);
+        var processIdCount = Marshal.ReadInt32(buffer, sizeof(int));
+        ValidateCounts(assignedProcesses, processIdCount);
+        var requiredLength = RequiredLength(processIdCount);
+        if (returnLength < requiredLength)
+        {
+            throw new ControllerException(
+                $"Job Object process ID list return length is insufficient: return={returnLength}, required={requiredLength}");
+        }
+
+        var processIds = new uint[processIdCount];
+        for (var index = 0; index < processIdCount; index++)
+        {
+            processIds[index] = (uint)Marshal.ReadIntPtr(buffer, ProcessIdListOffset + index * IntPtr.Size);
+        }
+
+        return processIds;
+    }
+
+    private static long RequiredLength(int processIdCount)
+    {
+        try
+        {
+            return checked(ProcessIdListOffset + (long)processIdCount * IntPtr.Size);
+        }
+        catch (OverflowException exception)
+        {
+            throw new ControllerException("the Job Object process ID list length overflows", exception);
+        }
+    }
+
     internal static void ValidateCounts(int assignedProcesses, int processIdCount)
     {
         if (assignedProcesses < 0 || processIdCount < 0 || processIdCount > assignedProcesses)

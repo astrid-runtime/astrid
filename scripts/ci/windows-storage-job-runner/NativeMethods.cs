@@ -58,6 +58,14 @@ internal static partial class NativeMethods
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    public struct BasicProcessIdList
+    {
+        public uint NumberOfAssignedProcesses;
+        public uint NumberOfProcessIdsInList;
+        public IntPtr ProcessIdList;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     public struct IoCounters
     {
         public ulong ReadOperationCount;

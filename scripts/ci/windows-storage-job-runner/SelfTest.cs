@@ -21,6 +21,9 @@ internal sealed class SelfTest
         try
         {
             StartupInfoLayout();
+            JobProcessIdListLayout();
+            BoundedProcessIdListQueries();
+            PrimaryCleanupFailurePreservation();
             ExecutableResolution(root);
             AssignmentBeforeExecution(root);
             ThreeGenerationDescendantTermination(root);
@@ -405,6 +408,132 @@ internal sealed class SelfTest
         }
 
         Console.WriteLine("[selftest] STARTUPINFOW x64 layout matched the official size and critical offsets");
+    }
+
+    private static void JobProcessIdListLayout()
+    {
+        if (!Environment.Is64BitProcess)
+        {
+            throw new ControllerException("the x64 Job Object process ID list layout requires a 64-bit process");
+        }
+
+#pragma warning disable CA1421
+        var actualSize = Marshal.SizeOf<NativeMethods.BasicProcessIdList>();
+        var assignedOffset = (int)Marshal.OffsetOf<NativeMethods.BasicProcessIdList>(
+            nameof(NativeMethods.BasicProcessIdList.NumberOfAssignedProcesses));
+        var listedOffset = (int)Marshal.OffsetOf<NativeMethods.BasicProcessIdList>(
+            nameof(NativeMethods.BasicProcessIdList.NumberOfProcessIdsInList));
+        var processIdListOffset = (int)Marshal.OffsetOf<NativeMethods.BasicProcessIdList>(
+            nameof(NativeMethods.BasicProcessIdList.ProcessIdList));
+#pragma warning restore CA1421
+
+        if (actualSize != JobProcessList.MinimumStructureLength ||
+            assignedOffset != 0 ||
+            listedOffset != sizeof(int) ||
+            processIdListOffset != JobProcessList.ProcessIdListOffset ||
+            IntPtr.Size != 8)
+        {
+            throw new ControllerException(
+                $"x64 Job Object process ID list layout changed: size={actualSize}, assigned={assignedOffset}, "
+                + $"listed={listedOffset}, list={processIdListOffset}, pointer={IntPtr.Size}");
+        }
+
+        Console.WriteLine("[selftest] x64 Job Object process ID list layout matched DWORD/header/padding ABI");
+    }
+
+    private static void BoundedProcessIdListQueries()
+    {
+        using var job = new SafeJobHandle();
+        var observedCapacities = new List<uint>();
+        var firstQuery = true;
+        uint[]? grownIds = null;
+
+        bool GrowQuery(SafeJobHandle queriedJob, IntPtr buffer, uint capacity, out uint returnLength, out int win32Error)
+        {
+            observedCapacities.Add(capacity);
+            if (firstQuery)
+            {
+                firstQuery = false;
+                Marshal.WriteInt32(buffer, 0, 3);
+                Marshal.WriteInt32(buffer, sizeof(int), 3);
+                returnLength = 0;
+                win32Error = 234;
+                return false;
+            }
+
+            Marshal.WriteInt32(buffer, 0, 3);
+            Marshal.WriteInt32(buffer, sizeof(int), 3);
+            Marshal.WriteIntPtr(buffer, JobProcessList.ProcessIdListOffset, new IntPtr(0x111));
+            Marshal.WriteIntPtr(buffer, JobProcessList.ProcessIdListOffset + IntPtr.Size, new IntPtr(0x222));
+            Marshal.WriteIntPtr(buffer, JobProcessList.ProcessIdListOffset + 2 * IntPtr.Size, new IntPtr(0x333));
+            returnLength = (uint)(JobProcessList.ProcessIdListOffset + 3 * IntPtr.Size);
+            win32Error = 0;
+            grownIds = [0x111, 0x222, 0x333];
+            return true;
+        }
+
+        var grown = Program.ReadJobProcessIdsForSelfTest(job, GrowQuery);
+        if (grownIds is null || !grown.SequenceEqual(grownIds) ||
+            observedCapacities is not [JobProcessList.MinimumStructureLength, 48])
+        {
+            throw new ControllerException(
+                $"bounded Job Object process ID growth failed: ids={string.Join(',', grown)}, capacities={string.Join(',', observedCapacities)}");
+        }
+
+        uint[]? rejectedIds = null;
+        bool MisleadingSuccess(SafeJobHandle queriedJob, IntPtr buffer, uint capacity, out uint returnLength, out int win32Error)
+        {
+            observedCapacities.Add(capacity);
+            Marshal.WriteInt32(buffer, 0, 3);
+            Marshal.WriteInt32(buffer, sizeof(int), 3);
+            returnLength = sizeof(int);
+            win32Error = 0;
+            return true;
+        }
+
+        try
+        {
+            rejectedIds = Program.ReadJobProcessIdsForSelfTest(job, MisleadingSuccess);
+        }
+        catch (ControllerException)
+        {
+        }
+
+        if (rejectedIds is not null)
+        {
+            throw new ControllerException("the insufficient return-length falsifier parsed unverified IDs");
+        }
+
+        Console.WriteLine("[selftest] x64 Job Object PID list grew monotonically and rejected misleading lengths");
+    }
+
+    private static void PrimaryCleanupFailurePreservation()
+    {
+        const string stdoutPath = "primary://stdout";
+        const string stderrPath = "primary://stderr";
+        using var failedCleanupJob = new SafeJobHandle();
+        var cleanupSucceeded = Program.TryTerminateAndAwaitForSelfTest(
+            failedCleanupJob,
+            null,
+            TimeSpan.FromMilliseconds(100));
+        if (cleanupSucceeded)
+        {
+            throw new ControllerException("the cleanup-failure falsifier did not exercise failed cleanup");
+        }
+
+        var primary = new ControllerException("primary enumeration sentinel");
+        var preserved = Program.PreservePrimaryCleanupFailure(primary, stdoutPath, stderrPath);
+        if (!ReferenceEquals(preserved.InnerException, primary) ||
+            !preserved.Message.Contains("primary cause preserved: primary enumeration sentinel", StringComparison.Ordinal) ||
+            !preserved.Message.Contains("separate cleanup failure", StringComparison.Ordinal) ||
+            !preserved.Message.Contains("ACTIVE_PROCESS_ZERO", StringComparison.Ordinal) ||
+            !preserved.Message.Contains(stdoutPath, StringComparison.Ordinal) ||
+            !preserved.Message.Contains(stderrPath, StringComparison.Ordinal))
+        {
+            throw new ControllerException("primary cleanup failure reporting lost the original cause or cleanup context");
+        }
+
+        Console.WriteLine("[selftest] primary enumeration errors retained cleanup failure as separate context");
     }
 
     private static void OutputTailCancellationAndFinalDrain(string root)
