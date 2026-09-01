@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use astrid_core::PrincipalId;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 /// The gateway endpoint is deliberately separate from the daemon's
@@ -16,9 +17,14 @@ pub(crate) const GATEWAY_SOCKET_NAME: &str = "mcp-gateway.sock";
 /// Readiness metadata is written only after the gateway has authenticated its
 /// broker uplink and bound the listener.
 pub(crate) const GATEWAY_READY_NAME: &str = "mcp-gateway.ready";
+/// Version of the owner-authenticated gateway control exchange.
+pub(crate) const GATEWAY_CONTROL_VERSION: u8 = 1;
 /// `ready` is a bounded hook probe, never a doctor or full capsule scan.
 pub(crate) const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const READY_POLL: Duration = Duration::from_millis(100);
+/// A control frame is a tiny owner-local message. This is a protocol/DoS
+/// ceiling, not an operator tuning knob.
+pub(crate) const MAX_CONTROL_BYTES: usize = 16 * 1024;
 
 /// Versioned preface sent by every short-lived `mcp attach` process before it
 /// starts speaking MCP. The gateway uses this host-owned context to preserve
@@ -45,6 +51,57 @@ pub(crate) struct GatewayReady {
     pub hook_token: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GatewayControlOperation {
+    Health,
+    Stop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct GatewayControlRequest {
+    pub version: u8,
+    pub operation: GatewayControlOperation,
+    pub pid: u32,
+    pub hook_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct GatewayControlAck {
+    pub version: u8,
+    pub operation: GatewayControlOperation,
+    pub pid: u32,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl GatewayControlAck {
+    pub(crate) const fn success(operation: GatewayControlOperation, pid: u32) -> Self {
+        Self {
+            version: GATEWAY_CONTROL_VERSION,
+            operation,
+            pid,
+            ok: true,
+            error: None,
+        }
+    }
+
+    pub(crate) fn failure(
+        operation: GatewayControlOperation,
+        pid: u32,
+        error: impl Into<String>,
+    ) -> Self {
+        Self {
+            version: GATEWAY_CONTROL_VERSION,
+            operation,
+            pid,
+            ok: false,
+            error: Some(error.into()),
+        }
+    }
+}
+
 /// Resolve a principal once at the command boundary.
 pub(crate) fn resolve_principal(requested: Option<&str>) -> Result<PrincipalId> {
     match requested {
@@ -63,7 +120,7 @@ pub(crate) fn gateway_socket_path() -> Result<PathBuf> {
 }
 
 /// Resolve the gateway readiness metadata path under the private Astrid home.
-fn gateway_ready_path() -> Result<PathBuf> {
+pub(crate) fn gateway_ready_path() -> Result<PathBuf> {
     Ok(astrid_core::dirs::AstridHome::resolve()?
         .run_dir()
         .join(GATEWAY_READY_NAME))
@@ -72,7 +129,11 @@ fn gateway_ready_path() -> Result<PathBuf> {
 /// Read and validate the gateway's atomically-written readiness record.
 pub(crate) fn read_gateway_ready() -> Result<Option<GatewayReady>> {
     let path = gateway_ready_path()?;
-    let body = match std::fs::read_to_string(&path) {
+    read_gateway_ready_at(&path)
+}
+
+fn read_gateway_ready_at(path: &Path) -> Result<Option<GatewayReady>> {
+    let body = match std::fs::read_to_string(path) {
         Ok(body) => body,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -118,10 +179,21 @@ pub(crate) fn write_gateway_ready(record: &GatewayReady) -> Result<()> {
     Ok(())
 }
 
-/// Remove this gateway's readiness marker during a clean shutdown.
-pub(crate) fn remove_gateway_ready() {
-    if let Ok(path) = gateway_ready_path() {
-        let _ = std::fs::remove_file(path);
+/// Remove this gateway's readiness marker without deleting a successor's.
+pub(crate) fn remove_gateway_ready(record: &GatewayReady) -> Result<()> {
+    let path = gateway_ready_path()?;
+    remove_gateway_ready_at(&path, record)
+}
+
+fn remove_gateway_ready_at(path: &Path, record: &GatewayReady) -> Result<()> {
+    match read_gateway_ready_at(path)? {
+        Some(current) if current == *record => std::fs::remove_file(path)
+            .with_context(|| format!("failed to remove {}", path.display())),
+        Some(_) => anyhow::bail!(
+            "MCP gateway readiness changed before cleanup at {}",
+            path.display()
+        ),
+        None => Ok(()),
     }
 }
 
@@ -187,9 +259,30 @@ pub(crate) async fn wait_for_gateway(principal: &PrincipalId, format: &str) -> R
                     principal
                 );
             }
-            if UnixStream::connect(&socket).await.is_ok() {
-                emit_ready(format, &record)?;
-                return Ok(ExitCode::SUCCESS);
+            match astrid_core::local_transport::connect_outcome(&socket)
+                .await
+                .context("failed to inspect MCP gateway endpoint")?
+            {
+                astrid_core::local_transport::ConnectOutcome::Connected(stream) => {
+                    request_gateway_control(stream, &record, GatewayControlOperation::Health)
+                        .await
+                        .context("MCP gateway cannot prove a recoverable daemon uplink")?;
+                    emit_ready(format, &record)?;
+                    return Ok(ExitCode::SUCCESS);
+                },
+                astrid_core::local_transport::ConnectOutcome::Absent
+                | astrid_core::local_transport::ConnectOutcome::Stale
+                    if crate::commands::daemon_control::is_process_alive(record.pid) =>
+                {
+                    anyhow::bail!(
+                        "MCP gateway PID {} is alive but its listener is unavailable",
+                        record.pid
+                    );
+                },
+                astrid_core::local_transport::ConnectOutcome::Absent
+                | astrid_core::local_transport::ConnectOutcome::Stale => {
+                    remove_dead_gateway_markers(&record).await?;
+                },
             }
         }
         if !spawned {
@@ -204,6 +297,158 @@ pub(crate) async fn wait_for_gateway(principal: &PrincipalId, format: &str) -> R
         }
         tokio::time::sleep(READY_POLL).await;
     }
+}
+
+/// Stop the persistent gateway through its owner-authenticated control path.
+///
+/// Success means the gateway returned its final teardown ACK, its recorded
+/// process exited, the listener is absent, and the exact readiness record is
+/// gone. Inconsistent or unowned state is left intact and reported.
+pub(crate) async fn stop_gateway() -> Result<()> {
+    let socket = gateway_socket_path()?;
+    let Some(record) = read_gateway_ready()? else {
+        return match astrid_core::local_transport::connect_outcome(&socket)
+            .await
+            .context("shutdown stage gateway.listener_probe")?
+        {
+            astrid_core::local_transport::ConnectOutcome::Absent => Ok(()),
+            astrid_core::local_transport::ConnectOutcome::Stale => {
+                astrid_core::local_transport::remove_stale_endpoint(&socket)
+                    .context("shutdown stage gateway.stale_listener_cleanup")?;
+                Ok(())
+            },
+            astrid_core::local_transport::ConnectOutcome::Connected(_) => anyhow::bail!(
+                "shutdown stage gateway.authentication: live gateway has no readiness authority"
+            ),
+        };
+    };
+
+    let stream = match astrid_core::local_transport::connect_outcome(&socket)
+        .await
+        .context("shutdown stage gateway.listener_probe")?
+    {
+        astrid_core::local_transport::ConnectOutcome::Connected(stream) => stream,
+        astrid_core::local_transport::ConnectOutcome::Absent
+        | astrid_core::local_transport::ConnectOutcome::Stale
+            if crate::commands::daemon_control::is_process_alive(record.pid) =>
+        {
+            anyhow::bail!(
+                "shutdown stage gateway.listener_absence: PID {} is alive without its authenticated listener",
+                record.pid
+            );
+        },
+        astrid_core::local_transport::ConnectOutcome::Absent
+        | astrid_core::local_transport::ConnectOutcome::Stale => {
+            remove_dead_gateway_markers(&record).await?;
+            return Ok(());
+        },
+    };
+
+    request_gateway_control(stream, &record, GatewayControlOperation::Stop)
+        .await
+        .context("shutdown stage gateway.final_ack")?;
+    if !crate::commands::daemon_control::wait_for_exit(
+        record.pid,
+        crate::commands::daemon_control::GRACE,
+    )
+    .await
+    {
+        anyhow::bail!(
+            "shutdown stage gateway.process_reap: authenticated gateway PID {} did not exit",
+            record.pid
+        );
+    }
+    remove_dead_gateway_markers(&record).await
+}
+
+async fn request_gateway_control(
+    stream: UnixStream,
+    record: &GatewayReady,
+    operation: GatewayControlOperation,
+) -> Result<GatewayControlAck> {
+    let request = GatewayControlRequest {
+        version: GATEWAY_CONTROL_VERSION,
+        operation,
+        pid: record.pid,
+        hook_token: record.hook_token.clone(),
+    };
+    let (read_half, mut write_half) = stream.into_split();
+    let bytes = serde_json::to_vec(&request).context("failed to encode MCP gateway control")?;
+    write_half
+        .write_all(&bytes)
+        .await
+        .context("failed to write MCP gateway control")?;
+    write_half
+        .write_all(b"\n")
+        .await
+        .context("failed to terminate MCP gateway control")?;
+    write_half
+        .flush()
+        .await
+        .context("failed to flush MCP gateway control")?;
+
+    let mut reader = BufReader::new(read_half);
+    let response = tokio::time::timeout(READY_TIMEOUT, read_bounded_line(&mut reader))
+        .await
+        .context("timed out waiting for MCP gateway control acknowledgement")??;
+    let ack: GatewayControlAck =
+        serde_json::from_slice(&response).context("invalid MCP gateway control acknowledgement")?;
+    if ack.version != GATEWAY_CONTROL_VERSION || ack.operation != operation || ack.pid != record.pid
+    {
+        anyhow::bail!("MCP gateway returned an unbound control acknowledgement");
+    }
+    if !ack.ok {
+        anyhow::bail!(
+            "MCP gateway rejected {operation:?}: {}",
+            ack.error.as_deref().unwrap_or("unknown gateway failure")
+        );
+    }
+    Ok(ack)
+}
+
+pub(crate) async fn read_bounded_line<R>(reader: &mut R) -> Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut line = Vec::new();
+    for _ in 0..=MAX_CONTROL_BYTES {
+        let byte = reader
+            .read_u8()
+            .await
+            .context("failed to read control frame")?;
+        if byte == b'\n' {
+            return Ok(line);
+        }
+        line.push(byte);
+    }
+    anyhow::bail!("MCP gateway control frame is missing or too large")
+}
+
+async fn remove_dead_gateway_markers(record: &GatewayReady) -> Result<()> {
+    if crate::commands::daemon_control::is_process_alive(record.pid) {
+        anyhow::bail!(
+            "shutdown stage gateway.process_reap: PID {} is still alive",
+            record.pid
+        );
+    }
+    let socket = gateway_socket_path()?;
+    match astrid_core::local_transport::connect_outcome(&socket)
+        .await
+        .context("shutdown stage gateway.listener_probe")?
+    {
+        astrid_core::local_transport::ConnectOutcome::Connected(_) => {
+            anyhow::bail!(
+                "shutdown stage gateway.listener_absence: a gateway is still accepting connections"
+            );
+        },
+        astrid_core::local_transport::ConnectOutcome::Absent => {},
+        astrid_core::local_transport::ConnectOutcome::Stale => {
+            astrid_core::local_transport::remove_stale_endpoint(&socket)
+                .context("shutdown stage gateway.listener_cleanup")?;
+        },
+    }
+    remove_gateway_ready(record).context("shutdown stage gateway.ready_cleanup")?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,10 +653,10 @@ fn process_command(pid: u32) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        GatewayReady, ReadyFormat, is_long_mcp_serve, is_mcp_attach, is_python_frame,
-        parse_process_row,
-    };
+    use tokio::io::{AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    use super::*;
 
     #[test]
     fn process_parser_preserves_command_after_pid_fields() {
@@ -464,5 +709,67 @@ mod tests {
         let body = serde_json::to_string(&record).expect("record json");
         assert_eq!(serde_json::from_str::<GatewayReady>(&body).unwrap(), record);
         assert_eq!(ReadyFormat::parse("hook").unwrap(), ReadyFormat::Hook);
+    }
+
+    #[test]
+    fn ready_cleanup_cannot_remove_a_successor_record() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join(GATEWAY_READY_NAME);
+        let old = GatewayReady {
+            version: 1,
+            principal: "codex-code".into(),
+            pid: 41,
+            hook_token: "old-token".into(),
+        };
+        let successor = GatewayReady {
+            version: 1,
+            principal: "codex-code".into(),
+            pid: 42,
+            hook_token: "successor-token".into(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&successor).unwrap()).unwrap();
+
+        let error = remove_gateway_ready_at(&path, &old)
+            .expect_err("old cleanup must not remove a successor marker");
+        assert!(error.to_string().contains("readiness changed"));
+        assert_eq!(
+            read_gateway_ready_at(&path).unwrap(),
+            Some(successor.clone())
+        );
+
+        remove_gateway_ready_at(&path, &successor).expect("successor removes its own marker");
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn control_ack_is_bound_to_operation_pid_and_success() {
+        for ack in [
+            GatewayControlAck::success(GatewayControlOperation::Stop, 42),
+            GatewayControlAck::success(GatewayControlOperation::Health, 43),
+            GatewayControlAck::failure(GatewayControlOperation::Health, 42, "uplink unavailable"),
+        ] {
+            let (client, server) = UnixStream::pair().expect("stream pair");
+            let serving = tokio::spawn(async move {
+                let (read_half, mut write_half) = server.into_split();
+                let mut reader = BufReader::new(read_half);
+                let request = read_bounded_line(&mut reader).await.expect("request");
+                serde_json::from_slice::<GatewayControlRequest>(&request).expect("valid request");
+                write_half
+                    .write_all(&serde_json::to_vec(&ack).unwrap())
+                    .await
+                    .unwrap();
+                write_half.write_all(b"\n").await.unwrap();
+            });
+            let record = GatewayReady {
+                version: 1,
+                principal: "codex-code".into(),
+                pid: 42,
+                hook_token: "gateway-token".into(),
+            };
+            request_gateway_control(client, &record, GatewayControlOperation::Health)
+                .await
+                .expect_err("an unbound or unsuccessful ACK must fail");
+            serving.await.expect("fake server");
+        }
     }
 }

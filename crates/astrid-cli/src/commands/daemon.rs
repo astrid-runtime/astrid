@@ -8,6 +8,7 @@ use astrid_core::kernel_api::{DaemonStatus, KernelRequest, KernelResponse};
 
 use crate::bootstrap::find_companion_binary;
 use crate::commands::daemon_control;
+use crate::formatter::OutputFormat;
 use crate::{socket_client, theme};
 
 mod ready;
@@ -490,13 +491,13 @@ pub(crate) async fn handle_start() -> Result<()> {
 }
 
 /// Handle `astrid status`.
-pub(crate) async fn handle_status() -> Result<()> {
+pub(crate) async fn handle_status(output_format: OutputFormat) -> Result<()> {
     let socket_path = socket_client::proxy_socket_path();
     let endpoint_present = astrid_core::local_transport::endpoint_is_present(&socket_path)
         .context("failed to inspect daemon endpoint")?;
     match decide_status_action(endpoint_present, recorded_daemon_pid_is_alive()) {
         StatusAction::NotRunning => {
-            println!("{}", theme::Theme::info("No Astrid daemon is running."));
+            print_status(output_format, None)?;
             return Ok(());
         },
         StatusAction::RunningButUnreachable => {
@@ -516,6 +517,21 @@ pub(crate) async fn handle_status() -> Result<()> {
             .await
             .context("Failed to query daemon status")?,
     )?;
+    print_status(output_format, Some(&status))?;
+    Ok(())
+}
+
+fn print_status(output_format: OutputFormat, status: Option<&DaemonStatus>) -> Result<()> {
+    if output_format == OutputFormat::Json {
+        let document = status_document(status);
+        println!("{}", serde_json::to_string(&document)?);
+        return Ok(());
+    }
+    let Some(status) = status else {
+        println!("{}", theme::Theme::info("No Astrid daemon is running."));
+        return Ok(());
+    };
+
     let uptime_display = format_uptime(status.uptime_secs);
     println!(
         "{}",
@@ -531,6 +547,13 @@ pub(crate) async fn handle_status() -> Result<()> {
         println!("    - {capsule}");
     }
     Ok(())
+}
+
+fn status_document(status: Option<&DaemonStatus>) -> serde_json::Value {
+    status.map_or_else(
+        || serde_json::json!({ "state": "stopped" }),
+        |status| serde_json::json!({ "state": "running", "daemon": status }),
+    )
 }
 
 fn status_response(response: KernelResponse) -> Result<DaemonStatus> {
@@ -554,6 +577,39 @@ fn status_response(response: KernelResponse) -> Result<DaemonStatus> {
 /// `astrid start`/`restart` still see the recorded PID and give an actionable
 /// message instead of failing on the held lock with a raw DB error.
 pub(crate) async fn handle_stop() -> Result<()> {
+    let gateway = crate::commands::mcp::stop_gateway().await;
+    let daemon = stop_daemon().await;
+    let disposition = combine_stop_results(gateway, daemon)?;
+    let message = match disposition {
+        DaemonStopDisposition::AlreadyStopped => "Astrid runtime is stopped.",
+        DaemonStopDisposition::Graceful => "Astrid runtime stopped.",
+        DaemonStopDisposition::Forced => "Stopped the unresponsive Astrid runtime.",
+    };
+    println!("{}", theme::Theme::success(message));
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonStopDisposition {
+    AlreadyStopped,
+    Graceful,
+    Forced,
+}
+
+fn combine_stop_results(
+    gateway: Result<()>,
+    daemon: Result<DaemonStopDisposition>,
+) -> Result<DaemonStopDisposition> {
+    match (gateway, daemon) {
+        (Ok(()), Ok(disposition)) => Ok(disposition),
+        (Err(primary), Ok(_)) | (Ok(()), Err(primary)) => Err(primary),
+        (Err(primary), Err(secondary)) => {
+            anyhow::bail!("{primary:#}; additional shutdown failure: {secondary:#}")
+        },
+    }
+}
+
+async fn stop_daemon() -> Result<DaemonStopDisposition> {
     let socket_path = socket_client::proxy_socket_path();
     let pid_path = socket_client::pid_path();
 
@@ -569,9 +625,8 @@ pub(crate) async fn handle_stop() -> Result<()> {
         .as_ref()
         .is_some_and(|(pid, _)| daemon_control::is_process_alive(*pid));
     if !socket_present && !recorded_alive {
-        println!("{}", theme::Theme::info("No Astrid daemon is running."));
-        let _ = std::fs::remove_file(&pid_path); // tidy a stale dead-PID file
-        return Ok(());
+        cleanup_daemon_runtime(&socket_path, &pid_path).await?;
+        return Ok(DaemonStopDisposition::AlreadyStopped);
     }
 
     // Graceful path: the socket is present and serviceable.
@@ -579,21 +634,27 @@ pub(crate) async fn handle_stop() -> Result<()> {
     // the recovery path when that daemon belongs to another project/layout.
     if socket_present && let Ok(client) = socket_client::connect_kernel_for_recovery().await {
         let mut client = client.with_timeout(Duration::from_secs(10));
-        match client
+        let response = client
             .request(KernelRequest::Shutdown {
                 reason: Some("astrid stop".to_string()),
             })
-            .await?
-        {
+            .await
+            .context("shutdown stage daemon.shutdown_ack")?;
+        let disposition = match response {
             KernelResponse::Success(_) => {
                 // ACK only — confirm the process actually exits before
                 // declaring success, and escalate if it wedged.
-                confirm_graceful_stop(recorded, &pid_path, &socket_path).await;
+                confirm_graceful_stop(recorded, &socket_path).await?
             },
-            KernelResponse::Error(reason) => anyhow::bail!("daemon rejected shutdown: {reason}"),
-            other => anyhow::bail!("unexpected response from daemon shutdown: {other:?}"),
-        }
-        return Ok(());
+            KernelResponse::Error(reason) => {
+                anyhow::bail!("shutdown stage daemon.shutdown_ack: rejected: {reason}")
+            },
+            other => {
+                anyhow::bail!("shutdown stage daemon.shutdown_ack: unexpected response: {other:?}")
+            },
+        };
+        cleanup_daemon_runtime(&socket_path, &pid_path).await?;
+        return Ok(disposition);
     }
 
     // Orphan path: the socket is present but unreachable (hung/half-dead
@@ -606,8 +667,9 @@ pub(crate) async fn handle_stop() -> Result<()> {
         Some((pid, exe)) => daemon_control::terminate_known(*pid, exe.as_deref()).await,
         None => daemon_control::KillOutcome::NotRunning,
     };
-    report_orphan_stop(outcome, socket_present, &pid_path, &socket_path);
-    Ok(())
+    let disposition = confirm_kill_outcome(outcome)?;
+    cleanup_daemon_runtime(&socket_path, &pid_path).await?;
+    Ok(disposition)
 }
 
 /// After a graceful shutdown ACK, confirm the daemon process actually exited —
@@ -617,26 +679,17 @@ pub(crate) async fn handle_stop() -> Result<()> {
 /// unreachable orphan. Runtime files are cleaned only once the process is gone.
 async fn confirm_graceful_stop(
     recorded: Option<(u32, Option<PathBuf>)>,
-    pid_path: &Path,
     socket_path: &Path,
-) {
+) -> Result<DaemonStopDisposition> {
     let Some((pid, exe)) = recorded else {
-        // Legacy pidless daemon (or an unresolved PID): we can't confirm exit,
-        // so trust the ACK. The daemon cleans up its own socket on a clean exit;
-        // remove the PID file best-effort in case one was left behind.
-        println!("{}", theme::Theme::success("Astrid daemon stopped."));
-        let _ = std::fs::remove_file(pid_path);
-        return;
+        anyhow::bail!(
+            "shutdown stage daemon.process_reap: shutdown was acknowledged but no recorded PID exists, so process exit cannot be verified (listener: {})",
+            socket_path.display()
+        );
     };
 
     if daemon_control::wait_for_exit(pid, daemon_control::GRACE).await {
-        // Confirmed gone — clear ALL runtime files. A clean daemon removes its
-        // own socket/readiness, but one that wedged briefly before finally
-        // exiting may not have, so remove them here too rather than leave a
-        // stale socket for the next `status`/`start` to trip on.
-        println!("{}", theme::Theme::success("Astrid daemon stopped."));
-        remove_runtime_files(pid_path, socket_path);
-        return;
+        return Ok(DaemonStopDisposition::Graceful);
     }
 
     // Acknowledged but still alive past the grace window → wedged mid-shutdown,
@@ -649,66 +702,116 @@ async fn confirm_graceful_stop(
         )
     );
     let outcome = daemon_control::terminate_known(pid, exe.as_deref()).await;
-    report_orphan_stop(outcome, true, pid_path, socket_path);
+    confirm_kill_outcome(outcome)
 }
 
-/// Report a signal-based stop outcome and clean up runtime files ONLY when the
-/// daemon is confirmed gone. When a kill can't confirm exit (`StillAlive` /
-/// `Unverified`), the socket/PID files are LEFT in place so `astrid start` /
-/// `astrid restart` still see the recorded PID and can print an actionable
-/// message rather than failing on the held lock with a raw DB error.
-fn report_orphan_stop(
-    outcome: daemon_control::KillOutcome,
-    socket_present: bool,
-    pid_path: &Path,
-    socket_path: &Path,
-) {
-    match &outcome {
-        daemon_control::KillOutcome::NotRunning => {
-            if socket_present {
-                println!("{}", theme::Theme::info("Cleaned up stale daemon socket."));
-            } else {
-                println!("{}", theme::Theme::info("No Astrid daemon is running."));
-            }
-        },
+fn confirm_kill_outcome(outcome: daemon_control::KillOutcome) -> Result<DaemonStopDisposition> {
+    match outcome {
+        daemon_control::KillOutcome::NotRunning => Ok(DaemonStopDisposition::AlreadyStopped),
         daemon_control::KillOutcome::TermExited | daemon_control::KillOutcome::KilledExited => {
-            println!(
-                "{}",
-                theme::Theme::success("Stopped an unresponsive Astrid daemon.")
-            );
+            Ok(DaemonStopDisposition::Forced)
         },
         daemon_control::KillOutcome::StillAlive => {
-            eprintln!(
-                "{}",
-                theme::Theme::error(
-                    "An unresponsive Astrid daemon did not exit even after SIGKILL; the \
-                     state-db lock may still be held. Inspect the process before retrying."
-                )
+            anyhow::bail!(
+                "shutdown stage daemon.process_reap: daemon did not exit after forced termination; the singleton lock may still be held"
             );
         },
         daemon_control::KillOutcome::Unverified(pid) => {
-            eprintln!(
-                "{}",
-                theme::Theme::warning(&format!(
-                    "A process (PID {pid}) holds the recorded daemon PID but I can't confirm \
-                     it's the Astrid daemon (possible PID reuse) — not killing it. If the daemon \
-                     is genuinely stuck, inspect PID {pid} and stop it manually."
-                ))
+            anyhow::bail!(
+                "shutdown stage daemon.process_identity: PID {pid} is live but cannot be verified as Astrid; no markers were removed"
             );
         },
     }
-    if stop_confirmed_gone(outcome) {
-        remove_runtime_files(pid_path, socket_path);
-    }
 }
 
-/// Remove the daemon's runtime files (socket, readiness, PID), best-effort.
-/// Called only once the daemon is confirmed gone — a dead daemon owns none of
-/// them, so clearing them leaves a clean slate for the next `start`.
-fn remove_runtime_files(pid_path: &Path, socket_path: &Path) {
-    let _ = astrid_core::local_transport::remove_endpoint(socket_path);
-    let _ = std::fs::remove_file(socket_client::readiness_path());
-    let _ = std::fs::remove_file(pid_path);
+/// Fence marker cleanup with the same singleton lock the daemon owns. Holding
+/// it through removal prevents a replacement daemon from publishing fresh
+/// markers between liveness proof and cleanup.
+async fn cleanup_daemon_runtime(socket_path: &Path, pid_path: &Path) -> Result<()> {
+    let home = astrid_core::dirs::AstridHome::resolve()
+        .context("shutdown stage daemon.home_resolution")?;
+    cleanup_daemon_runtime_for_home(&home, socket_path, pid_path).await
+}
+
+async fn cleanup_daemon_runtime_for_home(
+    home: &astrid_core::dirs::AstridHome,
+    socket_path: &Path,
+    pid_path: &Path,
+) -> Result<()> {
+    // An idempotent stop on a never-initialized home must not create the Astrid
+    // layout merely to prove that its absent runtime is absent.
+    if !home
+        .run_dir()
+        .try_exists()
+        .context("shutdown stage daemon.runtime_probe")?
+    {
+        return Ok(());
+    }
+    let lock_path = home.run_dir().join("system.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let lock = options.open(&lock_path).with_context(|| {
+        format!(
+            "shutdown stage daemon.singleton_lock: open {}",
+            lock_path.display()
+        )
+    })?;
+    lock.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => anyhow::anyhow!(
+            "shutdown stage daemon.singleton_lock: lock remains held at {}",
+            lock_path.display()
+        ),
+        std::fs::TryLockError::Error(error) => anyhow::anyhow!(
+            "shutdown stage daemon.singleton_lock: failed to acquire {}: {error}",
+            lock_path.display()
+        ),
+    })?;
+
+    match astrid_core::local_transport::connect_outcome(socket_path)
+        .await
+        .context("shutdown stage daemon.listener_probe")?
+    {
+        astrid_core::local_transport::ConnectOutcome::Connected(_) => {
+            anyhow::bail!(
+                "shutdown stage daemon.listener_absence: endpoint remains live at {}",
+                socket_path.display()
+            );
+        },
+        astrid_core::local_transport::ConnectOutcome::Stale => {
+            astrid_core::local_transport::remove_stale_endpoint(socket_path).with_context(
+                || {
+                    format!(
+                        "shutdown stage daemon.listener_cleanup: {}",
+                        socket_path.display()
+                    )
+                },
+            )?;
+        },
+        astrid_core::local_transport::ConnectOutcome::Absent => {},
+    }
+    astrid_core::local_transport::remove_endpoint(socket_path).with_context(|| {
+        format!(
+            "shutdown stage daemon.listener_cleanup: {}",
+            socket_path.display()
+        )
+    })?;
+    for path in [home.ready_path(), pid_path.to_path_buf(), home.token_path()] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("shutdown stage daemon.marker_cleanup: {}", path.display())
+                });
+            },
+        }
+    }
+    Ok(())
 }
 
 /// Whether a stop outcome CONFIRMS the daemon is gone — the only condition under
@@ -720,6 +823,7 @@ fn remove_runtime_files(pid_path: &Path, socket_path: &Path) {
 /// racing a fresh daemon onto a held lock (which surfaces as a raw "Database …
 /// is already locked" error). Pure over its input so the invariant is testable
 /// without a live daemon. Takes the `Copy` outcome by value (trivially small).
+#[cfg(test)]
 fn stop_confirmed_gone(outcome: daemon_control::KillOutcome) -> bool {
     matches!(
         outcome,
@@ -744,186 +848,5 @@ pub(crate) fn format_uptime(secs: u64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fresh_home_boot_log_does_not_preinitialize_layout() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().join("astrid-home");
-        let home = astrid_core::dirs::AstridHome::from_path(&root);
-
-        assert!(boot_log_stderr_for_home(&home).is_none());
-        assert!(
-            !root.exists(),
-            "boot-log capture must not create content before kernel admission"
-        );
-    }
-
-    #[test]
-    fn daemon_workspace_metadata_rejects_unknown_or_different_selection() {
-        let expected = vec!["a".repeat(64)];
-        assert!(validate_daemon_workspace_metadata("", &expected).is_err());
-        assert!(
-            validate_daemon_workspace_metadata(&format!("v1:{}", "b".repeat(64)), &expected)
-                .is_err()
-        );
-        validate_daemon_workspace_metadata(&format!("v1:{}\n", expected[0]), &expected).unwrap();
-    }
-
-    #[test]
-    fn explicit_workspace_selection_wins_over_current_directory() {
-        let current = std::env::current_dir().expect("current directory");
-        let explicit = tempfile::tempdir().expect("explicit workspace");
-        assert_ne!(explicit.path(), current);
-
-        let explicit_fingerprint = astrid_core::dirs::checked_workspace_selection_fingerprint(
-            explicit.path(),
-            crate::workspace_layout::current(),
-        )
-        .unwrap();
-        assert!(
-            expected_workspace_fingerprints(Some(explicit.path()))
-                .unwrap()
-                .contains(&explicit_fingerprint)
-        );
-        let current_fingerprint = astrid_core::dirs::checked_workspace_selection_fingerprint(
-            &current,
-            crate::workspace_layout::current(),
-        )
-        .unwrap();
-        assert!(
-            expected_workspace_fingerprints(None)
-                .unwrap()
-                .contains(&current_fingerprint)
-        );
-    }
-
-    #[test]
-    fn ephemeral_boot_passes_the_selected_workspace_to_the_daemon() {
-        use std::ffi::OsStr;
-
-        let command = ephemeral_daemon_command(
-            Path::new("/installed/astrid-daemon"),
-            Path::new("/selected/project"),
-        );
-        let args = command.get_args().collect::<Vec<_>>();
-
-        assert_eq!(
-            args,
-            vec![
-                OsStr::new("--ephemeral"),
-                OsStr::new("--workspace"),
-                OsStr::new("/selected/project"),
-            ]
-        );
-        assert_eq!(
-            command
-                .get_envs()
-                .find(|(name, _)| *name == OsStr::new("ASTRID_WORKSPACE_STATE_DIR"))
-                .and_then(|(_, value)| value),
-            Some(OsStr::new(
-                crate::workspace_layout::current().state_dir_name()
-            ))
-        );
-    }
-
-    /// REGRESSION (#1120): `astrid stop` must remove the socket/PID files ONLY
-    /// when the daemon is confirmed gone. Before the fix, stop reported success
-    /// and deleted the PID file on the shutdown ACK alone; a daemon that then
-    /// wedged mid-shutdown leaked the lock with no PID handle left, and the next
-    /// `start` died on it. `StillAlive`/`Unverified` must NOT trigger cleanup.
-    #[test]
-    fn stop_cleans_up_only_when_confirmed_gone() {
-        use daemon_control::KillOutcome;
-        assert!(stop_confirmed_gone(KillOutcome::NotRunning));
-        assert!(stop_confirmed_gone(KillOutcome::TermExited));
-        assert!(stop_confirmed_gone(KillOutcome::KilledExited));
-        // A process that may still hold the lock → keep the files so restart/
-        // start can find the recorded PID and act on it.
-        assert!(!stop_confirmed_gone(KillOutcome::StillAlive));
-        assert!(!stop_confirmed_gone(KillOutcome::Unverified(4242)));
-    }
-
-    /// A reachable daemon is already running — regardless of whether a recorded
-    /// PID looks alive, `start` must take the fast path and leave the live run
-    /// files untouched (never clear sentinels).
-    #[test]
-    fn start_reachable_daemon_is_already_running() {
-        assert_eq!(
-            decide_start_action(true, false),
-            StartAction::AlreadyRunning
-        );
-        assert_eq!(decide_start_action(true, true), StartAction::AlreadyRunning);
-        assert!(!start_clears_sentinels(StartAction::AlreadyRunning));
-    }
-
-    /// REGRESSION (daemon-detach self-heal): a crashed daemon leaves stale run
-    /// files with a DEAD recorded PID. On the next `astrid start` the socket is
-    /// unreachable and the PID is dead → clear ALL stale sentinels and spawn,
-    /// so the stale run-dir recovers transparently (not only on `restart`).
-    #[test]
-    fn start_unreachable_with_dead_pid_heals_and_spawns() {
-        let action = decide_start_action(false, false);
-        assert_eq!(action, StartAction::HealAndSpawn);
-        assert!(start_clears_sentinels(action));
-    }
-
-    /// SAFETY INVARIANT: a recorded daemon PID that is still alive but whose
-    /// socket is unreachable (a daemon mid-boot still binding its socket, mid-
-    /// shutdown, wedged, or a recycled PID) must NEVER be killed or have its
-    /// sentinels cleared by `start` — that would clobber a booting daemon or an
-    /// innocent process. `start` defers to `restart`, leaving every sentinel
-    /// intact.
-    #[test]
-    fn start_unreachable_with_live_pid_defers_and_leaves_sentinels() {
-        let action = decide_start_action(false, true);
-        assert_eq!(action, StartAction::RunningButUnreachable);
-        assert!(!start_clears_sentinels(action));
-    }
-
-    #[test]
-    fn ensure_unlinked_or_stale_sock_with_live_pid_refuses_second_boot() {
-        use astrid_core::local_transport::ConnectOutcome;
-        assert_eq!(
-            decide_ensure_action(&ConnectOutcome::Absent, true),
-            EnsureAction::RefuseSecondBoot
-        );
-        assert_eq!(
-            decide_ensure_action(&ConnectOutcome::Stale, true),
-            EnsureAction::RefuseSecondBoot
-        );
-        assert_eq!(
-            decide_ensure_action(&ConnectOutcome::Absent, false),
-            EnsureAction::Spawn
-        );
-        assert_eq!(
-            decide_ensure_action(&ConnectOutcome::Stale, false),
-            EnsureAction::CleanStaleAndSpawn
-        );
-    }
-
-    #[test]
-    fn status_unlinked_sock_with_live_pid_is_unreachable() {
-        assert_eq!(
-            decide_status_action(false, true),
-            StatusAction::RunningButUnreachable
-        );
-        assert_eq!(decide_status_action(false, false), StatusAction::NotRunning);
-        assert_eq!(
-            decide_status_action(true, true),
-            StatusAction::QueryLiveSocket
-        );
-    }
-
-    #[test]
-    fn status_error_is_not_reported_as_a_successful_status() {
-        let error = status_response(KernelResponse::Error("denied".into()))
-            .expect_err("kernel status errors must fail the command");
-        assert!(
-            error
-                .to_string()
-                .contains("daemon rejected status request: denied")
-        );
-    }
-}
+#[path = "daemon/tests.rs"]
+mod tests;

@@ -49,6 +49,7 @@ use std::time::Duration;
 use rmcp::service::{Peer, RoleServer};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -194,6 +195,7 @@ pub(super) async fn run_many(
     peers: Arc<Mutex<HashMap<String, Peer<RoleServer>>>>,
     principal: String,
     daemon_root: PathBuf,
+    shutdown: CancellationToken,
 ) {
     let caller = match astrid_core::PrincipalId::new(&principal) {
         Ok(c) => c,
@@ -203,20 +205,24 @@ pub(super) async fn run_many(
         },
     };
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let mut watch_client = match crate::socket_client::connect_for_workspace(
-        session,
-        caller,
-        Some(daemon_root.as_path()),
-    )
-    .await
-    {
+    let mut watch_client = match tokio::select! {
+        () = shutdown.cancelled() => return,
+        connected = crate::socket_client::connect_for_workspace(
+            session,
+            caller,
+            Some(daemon_root.as_path()),
+        ) => connected,
+    } {
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, "MCP gateway watcher: failed to open watch uplink");
             return;
         },
     };
-    let mut last_known = match enumerate_on(&mut watch_client, &principal).await {
+    let mut last_known = match tokio::select! {
+        () = shutdown.cancelled() => return,
+        enumerated = enumerate_on(&mut watch_client, &principal) => enumerated,
+    } {
         Ok(names) => names,
         Err(e) => {
             warn!(error = %e, "MCP gateway watcher: baseline seed failed");
@@ -225,7 +231,10 @@ pub(super) async fn run_many(
     };
 
     loop {
-        let frame = match watch_client.read_raw_frame().await {
+        let frame = match tokio::select! {
+            () = shutdown.cancelled() => return,
+            frame = watch_client.read_raw_frame() => frame,
+        } {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return,
             Err(e) => {

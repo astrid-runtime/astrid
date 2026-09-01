@@ -211,7 +211,7 @@ async fn dispatch_subcommand(
             Ok(ExitCode::SUCCESS)
         },
         Some(Commands::Status) => {
-            commands::daemon::handle_status().await?;
+            commands::daemon::handle_status(output_format).await?;
             Ok(ExitCode::SUCCESS)
         },
         Some(Commands::Stop) => {

@@ -82,6 +82,10 @@ mod lifecycle {
         anyhow::bail!("MCP gateway readiness is only supported on Unix hosts")
     }
 
+    pub(crate) async fn stop_gateway() -> Result<()> {
+        Ok(())
+    }
+
     pub(crate) fn gc() -> Result<ExitCode> {
         anyhow::bail!("MCP gateway cleanup is only supported on Unix hosts")
     }
@@ -101,7 +105,7 @@ pub(crate) use attach::run as attach;
 #[allow(unused_imports)]
 pub(crate) use gateway::run as gateway;
 #[allow(unused_imports)]
-pub(crate) use lifecycle::{gc, ready};
+pub(crate) use lifecycle::{gc, ready, stop_gateway};
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

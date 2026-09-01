@@ -9,15 +9,18 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rmcp::ServiceExt;
 use rmcp::service::{Peer, RoleServer};
-use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
+use serde::Deserialize;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -26,7 +29,8 @@ use uuid::Uuid;
 use super::idle::{ATTACH_IDLE_EOF, IdleEof, is_idle};
 
 use super::lifecycle::{
-    ATTACH_REGISTRATION_VERSION, AttachRegistration, GatewayReady, prepare_gateway_socket,
+    ATTACH_REGISTRATION_VERSION, AttachRegistration, GATEWAY_CONTROL_VERSION, GatewayControlAck,
+    GatewayControlOperation, GatewayControlRequest, GatewayReady, prepare_gateway_socket,
     remove_gateway_ready, write_gateway_ready,
 };
 use super::server::AstridMcpServer;
@@ -74,6 +78,13 @@ struct GatewayState {
     slots: Mutex<HashMap<String, AttachSlot>>,
     admission: Arc<Mutex<()>>,
     initialize: Mutex<()>,
+    shutdown: CancellationToken,
+    active_connections: AtomicUsize,
+    connections_drained: Notify,
+    watchers: Mutex<Vec<JoinHandle<()>>>,
+    shutdown_result: Mutex<Option<GatewayControlAck>>,
+    shutdown_finished: Notify,
+    shutdown_ack_sent: Notify,
 }
 
 impl GatewayState {
@@ -88,11 +99,21 @@ impl GatewayState {
             slots: Mutex::new(HashMap::new()),
             admission: Arc::new(Mutex::new(())),
             initialize: Mutex::new(()),
+            shutdown: CancellationToken::new(),
+            active_connections: AtomicUsize::new(0),
+            connections_drained: Notify::new(),
+            watchers: Mutex::new(Vec::new()),
+            shutdown_result: Mutex::new(None),
+            shutdown_finished: Notify::new(),
+            shutdown_ack_sent: Notify::new(),
         }
     }
 
     /// Get or establish the one daemon uplink for `principal`.
     async fn client_for(&self, principal: &astrid_core::PrincipalId) -> Result<Client> {
+        if self.shutdown.is_cancelled() {
+            anyhow::bail!("MCP gateway is shutting down");
+        }
         let key = principal.to_string();
         if let Some(client) = self.clients.lock().await.get(&key).cloned() {
             return Ok(client);
@@ -101,6 +122,9 @@ impl GatewayState {
         // Serialize first-use handshakes so two simultaneous attaches for a
         // new principal cannot create duplicate long-lived uplinks/watchers.
         let _initialize = self.initialize.lock().await;
+        if self.shutdown.is_cancelled() {
+            anyhow::bail!("MCP gateway is shutting down");
+        }
         if let Some(client) = self.clients.lock().await.get(&key).cloned() {
             return Ok(client);
         }
@@ -130,13 +154,35 @@ impl GatewayState {
             .lock()
             .await
             .insert(key.clone(), Arc::clone(&peers));
-        tokio::spawn(super::watch::run_many(
+        let watcher = tokio::spawn(super::watch::run_many(
             peers,
             key.clone(),
             self.daemon_root.clone(),
+            self.shutdown.clone(),
         ));
+        self.watchers.lock().await.push(watcher);
         info!(principal = %key, "MCP gateway opened persistent principal uplink");
         Ok(shared)
+    }
+
+    async fn verify_uplink(&self) -> Result<()> {
+        let client = self.client_for(&self.principal).await?;
+        let mut client = client.lock().await;
+        let principal = self.principal.clone();
+        crate::socket_client::reconnect_for_workspace(
+            &mut client,
+            principal.clone(),
+            Some(&self.daemon_root),
+            |connected| {
+                super::require_authenticated_unless_anonymous(
+                    &principal,
+                    connected.is_authenticated(),
+                )
+            },
+        )
+        .await
+        .context("failed to recover the persistent daemon uplink")?;
+        Ok(())
     }
 
     async fn peers_for(&self, principal: &str) -> Result<Peers> {
@@ -181,6 +227,9 @@ impl GatewayState {
         principal: &str,
     ) -> Result<AttachReservation> {
         let admission = Arc::clone(&self.admission).lock_owned().await;
+        if self.shutdown.is_cancelled() {
+            anyhow::bail!("MCP gateway is shutting down");
+        }
         self.replace_session(host_session_id).await?;
         let permit = self.acquire(principal).await?;
         Ok(AttachReservation { admission, permit })
@@ -257,6 +306,70 @@ impl GatewayState {
         tests::probe_finish_slot(&semaphore);
         done.notify_waiters();
     }
+
+    fn connection(self: &Arc<Self>) -> ConnectionGuard {
+        self.active_connections.fetch_add(1, Ordering::AcqRel);
+        ConnectionGuard {
+            state: Arc::clone(self),
+            active: true,
+        }
+    }
+
+    async fn wait_for_connections(&self) {
+        loop {
+            let drained = self.connections_drained.notified();
+            if self.active_connections.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            drained.await;
+        }
+    }
+
+    async fn cancel_attach_slots(&self) {
+        for slot in self.slots.lock().await.values() {
+            slot.cancel.cancel();
+        }
+    }
+
+    async fn finish_shutdown(&self, result: GatewayControlAck) {
+        *self.shutdown_result.lock().await = Some(result);
+        self.shutdown_finished.notify_waiters();
+    }
+
+    async fn wait_for_shutdown(&self) -> GatewayControlAck {
+        loop {
+            let finished = self.shutdown_finished.notified();
+            if let Some(result) = self.shutdown_result.lock().await.clone() {
+                return result;
+            }
+            finished.await;
+        }
+    }
+}
+
+struct ConnectionGuard {
+    state: Arc<GatewayState>,
+    active: bool,
+}
+
+impl ConnectionGuard {
+    fn release(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        let previous = self.state.active_connections.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "gateway connection count underflow");
+        if previous == 1 {
+            self.state.connections_drained.notify_waiters();
+        }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 impl AttachReservation {
@@ -313,31 +426,155 @@ pub(crate) async fn run(principal: Option<&str>) -> Result<ExitCode> {
         "MCP gateway ready"
     );
 
-    let result = accept_loop(listener, state).await;
-    remove_gateway_ready();
-    let _ = std::fs::remove_file(socket_path);
-    result
+    let accept_result = accept_loop(listener, Arc::clone(&state)).await;
+    let control_stop = state.shutdown.is_cancelled();
+    state.shutdown.cancel();
+    let cleanup_result =
+        shutdown_gateway(&state, (!control_stop).then_some(&ready), &socket_path).await;
+
+    if control_stop {
+        let ack_sent = state.shutdown_ack_sent.notified();
+        let ack = match (&accept_result, &cleanup_result) {
+            (Ok(_), Ok(())) => {
+                GatewayControlAck::success(GatewayControlOperation::Stop, std::process::id())
+            },
+            (Err(error), _) | (Ok(_), Err(error)) => GatewayControlAck::failure(
+                GatewayControlOperation::Stop,
+                std::process::id(),
+                format!("{error:#}"),
+            ),
+        };
+        state.finish_shutdown(ack).await;
+        timeout(crate::commands::daemon_control::GRACE, ack_sent)
+            .await
+            .context("shutdown stage gateway.final_ack_delivery")?;
+    }
+
+    combine_gateway_results(accept_result, cleanup_result)
+}
+
+fn combine_gateway_results(accept: Result<ExitCode>, cleanup: Result<()>) -> Result<ExitCode> {
+    match (accept, cleanup) {
+        (Ok(exit), Ok(())) => Ok(exit),
+        (Err(primary), Ok(())) | (Ok(_), Err(primary)) => Err(primary),
+        (Err(primary), Err(secondary)) => {
+            anyhow::bail!("{primary:#}; additional gateway cleanup failure: {secondary:#}")
+        },
+    }
 }
 
 async fn accept_loop(listener: UnixListener, state: Arc<GatewayState>) -> Result<ExitCode> {
     loop {
-        let (stream, _) = listener
-            .accept()
-            .await
-            .context("MCP gateway listener failed")?;
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            if let Err(error) = serve_attach(stream, state).await {
-                warn!(error = %error, "MCP gateway attach session ended with an error");
+        tokio::select! {
+            () = state.shutdown.cancelled() => return Ok(ExitCode::SUCCESS),
+            accepted = listener.accept() => {
+                let (stream, _) = accepted.context("MCP gateway listener failed")?;
+                let state = Arc::clone(&state);
+                // Count the connection before spawning its task. Otherwise a
+                // simultaneous stop can observe zero, finish cleanup, and let
+                // the not-yet-polled task start after teardown.
+                let connection = state.connection();
+                tokio::spawn(async move {
+                    if let Err(error) = serve_connection(stream, state, connection).await {
+                        warn!(error = %error, "MCP gateway connection ended with an error");
+                    }
+                });
             }
-        });
+        }
     }
 }
 
-async fn serve_attach(stream: UnixStream, state: Arc<GatewayState>) -> Result<()> {
+async fn shutdown_gateway(
+    state: &Arc<GatewayState>,
+    ready_to_remove: Option<&GatewayReady>,
+    socket_path: &Path,
+) -> Result<()> {
+    state.cancel_attach_slots().await;
+    timeout(
+        crate::commands::daemon_control::GRACE,
+        state.wait_for_connections(),
+    )
+    .await
+    .context("shutdown stage gateway.attach_drain: timed out")?;
+
+    let watchers = std::mem::take(&mut *state.watchers.lock().await);
+    let mut watcher_failure = None;
+    for mut watcher in watchers {
+        match timeout(crate::commands::daemon_control::GRACE, &mut watcher).await {
+            Ok(Ok(())) => {},
+            Ok(Err(error)) => {
+                watcher_failure.get_or_insert_with(|| {
+                    format!("shutdown stage gateway.uplink_teardown: {error}")
+                });
+            },
+            Err(_) => {
+                watcher.abort();
+                let _ = watcher.await;
+                watcher_failure.get_or_insert_with(|| {
+                    "shutdown stage gateway.uplink_teardown: timed out".to_string()
+                });
+            },
+        }
+    }
+
+    state.peers.lock().await.clear();
+    state.clients.lock().await.clear();
+    state.permits.lock().await.clear();
+    if !state.slots.lock().await.is_empty() {
+        anyhow::bail!("shutdown stage gateway.attach_slots: slots remained after teardown");
+    }
+    astrid_core::local_transport::remove_endpoint(socket_path).with_context(|| {
+        format!(
+            "shutdown stage gateway.listener_cleanup: {}",
+            socket_path.display()
+        )
+    })?;
+    if let Some(failure) = watcher_failure {
+        anyhow::bail!(failure);
+    }
+    // During an authenticated control stop, the caller removes the exact
+    // readiness record only after this process has exited. Natural/error
+    // shutdowns have no such caller, so the gateway cleans its own record.
+    if let Some(ready) = ready_to_remove {
+        remove_gateway_ready(ready).context("shutdown stage gateway.ready_cleanup")?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum GatewayRequest {
+    Control(GatewayControlRequest),
+    Attach(AttachRegistration),
+}
+
+async fn serve_connection(
+    stream: UnixStream,
+    state: Arc<GatewayState>,
+    connection: ConnectionGuard,
+) -> Result<()> {
     let (read_half, write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
-    let registration = read_registration(&mut reader).await?;
+    let request = tokio::select! {
+        () = state.shutdown.cancelled() => return Ok(()),
+        request = read_gateway_request(&mut reader) => request?,
+    };
+    match request {
+        GatewayRequest::Control(request) => {
+            serve_control(request, write_half, state, Some(connection)).await
+        },
+        GatewayRequest::Attach(registration) => {
+            serve_attach(registration, reader, write_half, state).await
+        },
+    }
+}
+
+async fn serve_attach(
+    registration: AttachRegistration,
+    reader: BufReader<tokio::io::ReadHalf<UnixStream>>,
+    write_half: tokio::io::WriteHalf<UnixStream>,
+    state: Arc<GatewayState>,
+) -> Result<()> {
     let principal = authenticate_registration(&registration, &state)?;
     let workspace = validate_workspace(&registration.workspace_abs)?;
     let principal_key = principal.to_string();
@@ -348,7 +585,9 @@ async fn serve_attach(stream: UnixStream, state: Arc<GatewayState>) -> Result<()
         .reserve_session(&host_session_id, &principal_key)
         .await?;
     let last_activity = Arc::new(StdMutex::new(Instant::now()));
-    let cancel = CancellationToken::new();
+    // A child token preserves per-session replacement while guaranteeing a
+    // session admitted concurrently with stop inherits global cancellation.
+    let cancel = state.shutdown.child_token();
     let done = Arc::new(Notify::new());
     let slot_id = Uuid::new_v4();
     let permit = reservation
@@ -383,6 +622,76 @@ async fn serve_attach(stream: UnixStream, state: Arc<GatewayState>) -> Result<()
         .finish_slot(&host_session_id, slot_id, permit, done)
         .await;
     result
+}
+
+async fn serve_control<W>(
+    request: GatewayControlRequest,
+    mut writer: W,
+    state: Arc<GatewayState>,
+    mut connection: Option<ConnectionGuard>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let pid = std::process::id();
+    let authenticated = request.version == GATEWAY_CONTROL_VERSION
+        && request.pid == pid
+        && request.hook_token == state.hook_token;
+    if !authenticated {
+        let ack = GatewayControlAck::failure(
+            request.operation,
+            pid,
+            "gateway control authority did not match this process",
+        );
+        write_control_ack(&mut writer, &ack).await?;
+        return Ok(());
+    }
+
+    match request.operation {
+        GatewayControlOperation::Health => {
+            let ack = match state.verify_uplink().await {
+                Ok(()) => GatewayControlAck::success(GatewayControlOperation::Health, pid),
+                Err(error) => GatewayControlAck::failure(
+                    GatewayControlOperation::Health,
+                    pid,
+                    format!("{error:#}"),
+                ),
+            };
+            write_control_ack(&mut writer, &ack).await
+        },
+        GatewayControlOperation::Stop => {
+            // Only an authenticated stop may release itself from the drain.
+            // A forged stop remains counted until its rejection is delivered.
+            drop(connection.take());
+            state.shutdown.cancel();
+            let ack = state.wait_for_shutdown().await;
+            let result = write_control_ack(&mut writer, &ack).await;
+            // `notify_one` retains a permit if the run loop has not polled its
+            // waiter yet, closing the fast-ACK lost-wakeup race.
+            state.shutdown_ack_sent.notify_one();
+            result
+        },
+    }
+}
+
+async fn write_control_ack<W>(writer: &mut W, ack: &GatewayControlAck) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let bytes =
+        serde_json::to_vec(ack).context("failed to encode gateway control acknowledgement")?;
+    writer
+        .write_all(&bytes)
+        .await
+        .context("failed to write gateway control acknowledgement")?;
+    writer
+        .write_all(b"\n")
+        .await
+        .context("failed to terminate gateway control acknowledgement")?;
+    writer
+        .shutdown()
+        .await
+        .context("failed to finish gateway control acknowledgement")
 }
 
 async fn run_attached_session<S, R>(
@@ -429,6 +738,25 @@ async fn read_registration_inner<R>(reader: &mut BufReader<R>) -> Result<AttachR
 where
     R: AsyncRead + Unpin,
 {
+    match read_gateway_request_inner(reader).await? {
+        GatewayRequest::Attach(registration) => Ok(registration),
+        GatewayRequest::Control(_) => anyhow::bail!("expected MCP attach registration"),
+    }
+}
+
+async fn read_gateway_request<R>(reader: &mut BufReader<R>) -> Result<GatewayRequest>
+where
+    R: AsyncRead + Unpin,
+{
+    timeout(REGISTRATION_TIMEOUT, read_gateway_request_inner(reader))
+        .await
+        .context("timed out reading MCP gateway registration")?
+}
+
+async fn read_gateway_request_inner<R>(reader: &mut BufReader<R>) -> Result<GatewayRequest>
+where
+    R: AsyncRead + Unpin,
+{
     let mut line = Vec::new();
     let mut terminated = false;
     for _ in 0..=MAX_REGISTRATION_BYTES {
@@ -445,8 +773,26 @@ where
     if !terminated {
         anyhow::bail!("MCP attach registration is missing or too large");
     }
-    let registration: AttachRegistration =
-        serde_json::from_slice(&line).context("MCP attach registration is not valid JSON")?;
+    let request: GatewayRequest =
+        serde_json::from_slice(&line).context("MCP gateway registration is not valid JSON")?;
+    match &request {
+        GatewayRequest::Control(control) => {
+            if control.version != GATEWAY_CONTROL_VERSION {
+                anyhow::bail!(
+                    "unsupported MCP gateway control version {}",
+                    control.version
+                );
+            }
+            if control.pid == 0 || control.hook_token.trim().is_empty() {
+                anyhow::bail!("MCP gateway control authority is incomplete");
+            }
+        },
+        GatewayRequest::Attach(registration) => validate_registration(registration)?,
+    }
+    Ok(request)
+}
+
+fn validate_registration(registration: &AttachRegistration) -> Result<()> {
     if registration.version != ATTACH_REGISTRATION_VERSION {
         anyhow::bail!(
             "unsupported MCP attach registration version {}",
@@ -464,7 +810,7 @@ where
         anyhow::bail!("MCP attach registration is missing hook_token");
     }
     validate_workspace(&registration.workspace_abs)?;
-    Ok(registration)
+    Ok(())
 }
 
 fn authenticate_registration(
