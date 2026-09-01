@@ -14,8 +14,7 @@ use super::process_stop::{ProcessStopOutcome, cleanup_evidence, stop_process_pro
 use super::{
     CachedProcessProjection, Kernel, ProcessProjectionBinding, ProcessProjectionKey,
     ProcessProjectionTarget, ProcessProjectionTargetSet, ProcessStopPolicy, ProjectionCleanup,
-    StorageMountId, StorageProviderAccessV1, generate_lease_token, local_transport,
-    platform_process_provider_name,
+    StorageMountId, StorageProviderAccessV1, generate_lease_token, platform_process_provider_name,
 };
 use crate::storage_mount::lifecycle::cleanup_mapped_lease_resources;
 use crate::storage_mount::lifecycle::{complete_cleanup_ledger, force_fence_projection_lease};
@@ -173,20 +172,37 @@ async fn stop_projection_providers(
     state: &mut ProjectionCleanupState,
     policy: ProcessStopPolicy,
 ) -> bool {
-    use cleanup_evidence::ProviderComponent;
+    use cleanup_evidence::{ProjectionCleanupStage as Stage, ProviderComponent};
 
-    for (provider, component) in [
-        (&mut state.branch, ProviderComponent::Branch),
-        (&mut state.owner, ProviderComponent::OwnerHome),
-    ] {
-        if !stop_running_provider(provider, policy, component).await {
+    let branch_stop = stop_running_provider(&mut state.branch, policy, ProviderComponent::Branch);
+    let owner_stop = stop_running_provider(&mut state.owner, policy, ProviderComponent::OwnerHome);
+    let shared = state.shared.as_mut();
+    let (branch_evidence, owner_evidence, shared_evidence) =
+        tokio::join!(branch_stop, owner_stop, async move {
+            match shared {
+                Some(shared) => Some(
+                    stop_running_provider(shared, policy, ProviderComponent::FleetShared).await,
+                ),
+                None => None,
+            }
+        });
+
+    for evidence in [Some(branch_evidence), Some(owner_evidence), shared_evidence] {
+        let Some((component, mount_id, outcome)) = evidence else {
+            continue;
+        };
+        let stopped = matches!(outcome, ProcessStopOutcome::Stopped { .. });
+        cleanup_evidence::record(
+            Stage::ProviderStop {
+                component,
+                mount_id,
+                outcome,
+            },
+            !stopped,
+        );
+        if !stopped {
             return false;
         }
-    }
-    if let Some(shared) = state.shared.as_mut()
-        && !stop_running_provider(shared, policy, ProviderComponent::FleetShared).await
-    {
-        return false;
     }
     true
 }
@@ -217,72 +233,41 @@ async fn stop_running_provider(
     provider: &mut ProjectionLeaseProvider,
     policy: ProcessStopPolicy,
     component: cleanup_evidence::ProviderComponent,
-) -> bool {
+) -> (
+    cleanup_evidence::ProviderComponent,
+    StorageMountId,
+    ProcessStopOutcome,
+) {
     let mount_id = provider.lease.mount_id;
     let provider = &mut provider.running;
     if provider.stopped {
-        // A prior cleanup may mark a provider stopped without retaining its
-        // STOP frame. Probe the bound endpoint again; retry state alone is
-        // never an acknowledgement.
-        return stop_unmanaged_provider(provider, mount_id, component).await;
+        // `stopped` is owned by this exact provider incarnation. It records
+        // only settlement, never a STOP frame, so it must stay distinct from
+        // an authenticated acknowledgement.
+        return (
+            component,
+            mount_id,
+            ProcessStopOutcome::Stopped {
+                acknowledged: false,
+            },
+        );
     }
-    let stopped = if let Some(child) = provider.child.as_mut() {
-        let outcome = stop_process_provider_outcome(
+    let outcome = if let Some(child) = provider.child.as_mut() {
+        stop_process_provider_outcome(
             child,
             provider.control_path.clone(),
             provider.token.clone(),
             policy,
         )
-        .await;
-        cleanup_evidence::record(
-            Stage::ProviderStop {
-                component,
-                mount_id,
-                outcome,
-            },
-            !matches!(outcome, ProcessStopOutcome::Stopped { .. }),
-        );
-        matches!(outcome, ProcessStopOutcome::Stopped { .. })
+        .await
     } else {
-        stop_unmanaged_provider(provider, mount_id, component).await
-    };
-    if stopped {
-        provider.stopped = true;
-    }
-    stopped
-}
-
-async fn stop_unmanaged_provider(
-    provider: &mut RunningProvider,
-    mount_id: StorageMountId,
-    component: cleanup_evidence::ProviderComponent,
-) -> bool {
-    let stopped = unmanaged_provider_is_stopped(&provider.control_path).await;
-    let outcome = if stopped {
-        ProcessStopOutcome::Stopped {
-            acknowledged: false,
-        }
-    } else {
+        // Without a retained child or prior settlement there is no exact
+        // generation to authenticate. Endpoint presence belongs to whatever
+        // currently owns the path, not to this provider.
         ProcessStopOutcome::ControlEndpoint
     };
-    cleanup_evidence::record(
-        Stage::ProviderStop {
-            component,
-            mount_id,
-            outcome,
-        },
-        !stopped,
-    );
-    stopped
-}
-
-async fn unmanaged_provider_is_stopped(control_path: &Path) -> bool {
-    match local_transport::connect_outcome(control_path).await {
-        Ok(local_transport::ConnectOutcome::Absent | local_transport::ConnectOutcome::Stale) => {
-            true
-        },
-        Ok(local_transport::ConnectOutcome::Connected(_)) | Err(_) => false,
-    }
+    provider.stopped = matches!(outcome, ProcessStopOutcome::Stopped { .. });
+    (component, mount_id, outcome)
 }
 
 pub(crate) fn retain_failed_launch_projection(
@@ -561,7 +546,9 @@ async fn fence_available_projection_leases(
     let (states, _, _) = exact_projection_lease_states(kernel, binding, component_mount_ids);
     fence_projection_states(&states, true);
     let listeners_closed = drain_projection_states(&states).await;
-    cleanup_evidence::record(Stage::ListenerSettlement, !listeners_closed);
+    // This pre-cleanup fence prepares the invalidated authority. The single
+    // ListenerSettlement event is emitted after Binding and provider stops by
+    // the bounded projection cleanup itself.
     if !listeners_closed {
         tracing::error!(
             "failed to drain an authorized process storage projection listener before cleanup"
@@ -931,25 +918,28 @@ pub(crate) fn projection_mount(
                 }
                 cleanup_projection.closing.store(true, Ordering::Release);
             }
-            let cleanup_ok = (cleanup_projection.cleanup)().await;
-            if !cleanup_ok {
-                cleanup_projection
-                    .cleanup_failed
-                    .store(true, Ordering::Release);
-                return;
-            }
-            let mut projections = projections.lock().await;
-            if projections
-                .get(&key)
-                .is_some_and(|current| Arc::ptr_eq(current, &cleanup_projection))
-            {
-                projections.remove(&key);
-            }
-            let removed = !projections
-                .get(&key)
-                .is_some_and(|current| Arc::ptr_eq(current, &cleanup_projection));
-            cleanup_evidence::record(Stage::CacheRemoval, !removed);
-            cleanup_evidence::record(Stage::Complete, !removed);
+            cleanup_evidence::scoped(Box::pin(async move {
+                let cleanup_ok = (cleanup_projection.cleanup)().await;
+                if !cleanup_ok {
+                    cleanup_projection
+                        .cleanup_failed
+                        .store(true, Ordering::Release);
+                    return;
+                }
+                let mut projections = projections.lock().await;
+                if projections
+                    .get(&key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &cleanup_projection))
+                {
+                    projections.remove(&key);
+                }
+                let removed = !projections
+                    .get(&key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &cleanup_projection));
+                cleanup_evidence::record(Stage::CacheRemoval, !removed);
+                cleanup_evidence::record(Stage::Complete, !removed);
+            }))
+            .await;
         })
     };
     let mut mount = astrid_capsule::context::ProcessStorageMount::new_async(

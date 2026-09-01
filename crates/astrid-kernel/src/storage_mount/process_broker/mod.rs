@@ -16,8 +16,6 @@ use mount_launch::{
     launch_projection_providers,
 };
 #[cfg(all(test, any(unix, windows)))]
-use process_launch::abort_process_provider;
-#[cfg(all(test, any(unix, windows)))]
 pub(crate) use process_launch::arm_launch_cleanup_failure;
 #[cfg(all(test, any(unix, windows)))]
 pub(crate) use process_launch::arm_launch_failure;
