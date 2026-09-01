@@ -9,7 +9,7 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
-## [0.11.0] - 2026-09-01
+## [2026.9.0] - 2026-09-01
 
 ### Fixed
 
@@ -33,12 +33,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   boundary before mutating a capsule target. Existing unsafe homes remain
   rejected. Unix install behavior is unchanged, and workspace targets continue
   to use their checked selection path. This is not a published Windows
-  runtime; 0.11.0 ships no Windows archive and Windows support remains parked
+  runtime; 2026.9.0 ships no Windows archive and Windows support remains parked
   for a later release. Closes #1366.
 - **Windows key persistence remains component-compile/test coverage.** The
   non-Unix parent-directory sync shim keeps the same fallible interface as the
   Unix implementation without failing the native ARM64 Clippy gate. It is not
-  an advertised 0.11.0 runtime product, and its runtime archive remains
+  an advertised 2026.9.0 runtime product, and its runtime archive remains
   parked for a later release. Closes #1361.
 - **Linux release binaries now run on glibc 2.34 enterprise hosts.** The
   x86_64 and ARM64 GNU artifacts are built in a pinned glibc 2.31 environment,
@@ -1907,8 +1907,8 @@ Breaking changes to note: `Capsule.toml` moves to `[publish]` / `[subscribe]` ta
 Initial tracked release. See the [repository history](https://github.com/astrid-runtime/astrid/commits/v0.2.0)
 for changes included in this version.
 
-[Unreleased]: https://github.com/astrid-runtime/astrid/compare/v0.11.0...HEAD
-[0.11.0]: https://github.com/astrid-runtime/astrid/compare/v0.10.4...v0.11.0
+[Unreleased]: https://github.com/astrid-runtime/astrid/compare/v2026.9.0...HEAD
+[2026.9.0]: https://github.com/astrid-runtime/astrid/compare/v0.10.4...v2026.9.0
 [0.10.4]: https://github.com/astrid-runtime/astrid/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/astrid-runtime/astrid/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/astrid-runtime/astrid/compare/v0.10.1...v0.10.2

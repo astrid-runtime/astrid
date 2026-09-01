@@ -34,7 +34,7 @@ have succeeded. Missing or duplicated assets, malformed evidence, identity or
 issuer mismatches, trust refresh failures, and checksum mismatches all fail
 closed.
 
-Astrid 0.11.0 publishes no Windows runtime archive or Windows extension.
+Astrid 2026.9.0 publishes no Windows runtime archive or Windows extension.
 Windows-aware updater code retains its fail-closed extension checks as
 component coverage, but Windows runtime publication is parked for a later
 release.

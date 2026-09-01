@@ -26,7 +26,7 @@ def fake_blake3(path: pathlib.Path) -> str:
 
 @contextmanager
 def enabled_windows_schema():
-    """Exercise the retained schema without enabling 0.11.0 publication."""
+    """Exercise the retained schema without enabling 2026.9.0 publication."""
     with mock.patch.object(release_manifest, "WINDOWS_TARGETS", (WINDOWS_TARGET,)):
         yield
 

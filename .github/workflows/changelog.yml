@@ -32,7 +32,7 @@ jobs:
 
       - name: Require a changelog fragment
         env:
-          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, '\n') }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
         run: |
           python3 scripts/changelog.py check \
             --base "${{ github.event.pull_request.base.sha }}" \

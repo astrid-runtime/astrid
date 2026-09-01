@@ -85,7 +85,7 @@ repeating its release identity. The mutable channel document remains at schema
 1 with exactly four targets, so older clients can keep following channel
 generations without encountering a new document shape.
 
-Windows runtime archives are not published in 0.11.0. Windows runtime
+Windows runtime archives are not published in 2026.9.0. Windows runtime
 publication is parked for a later release; this cut does not publish a
 `windows-release.toml`, Windows archive, Windows checksum entry, or associated
 signature evidence.

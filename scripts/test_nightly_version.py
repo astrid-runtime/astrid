@@ -67,7 +67,7 @@ class NightlyVersionTests(unittest.TestCase):
 
     def test_rejects_bad_train_and_commit(self) -> None:
         with self.assertRaisesRegex(ValueError, "release/nightly.toml"):
-            nightly_version.stage(self.root, f"0.11.0-nightly.20260717.g{COMMIT}")
+            nightly_version.stage(self.root, f"9.9.9-nightly.20260717.g{COMMIT}")
         with self.assertRaisesRegex(ValueError, "source commit"):
             nightly_version.derive("0.10.0", "20260717", "A" * 40)
 

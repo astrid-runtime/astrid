@@ -6,7 +6,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import changelog
-from changelog import check_pr, entry_from_fragment, extract_notes, fragment_body_errors, roll_changelog
+from changelog import (
+    check_pr,
+    entry_from_fragment,
+    extract_notes,
+    fragment_body_errors,
+    parse_labels,
+    roll_changelog,
+)
 
 
 SAMPLE = """# Changelog
@@ -31,6 +38,10 @@ SAMPLE = """# Changelog
 
 
 class CheckPrTests(unittest.TestCase):
+    def test_parse_labels_accepts_real_and_literal_newline_joins(self):
+        self.assertEqual(parse_labels("skip-changelog\nrelease"), ["skip-changelog", "release"])
+        self.assertEqual(parse_labels(r"skip-changelog\nrelease"), ["skip-changelog", "release"])
+
     def test_code_without_fragment_fails(self):
         errors = check_pr(
             labels=[],

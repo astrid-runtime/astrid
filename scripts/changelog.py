@@ -29,7 +29,9 @@ def is_code_path(path: str) -> bool:
 
 
 def parse_labels(raw: str) -> list[str]:
-    return [part.strip() for part in re.split(r"[\s,]+", raw) if part.strip()]
+    # GitHub's join expression renders a quoted '\n' as two literal characters.
+    normalized = raw.replace(r"\n", "\n")
+    return [part.strip() for part in re.split(r"[\s,]+", normalized) if part.strip()]
 
 
 def has_skip_changelog(labels: Iterable[str]) -> bool:
