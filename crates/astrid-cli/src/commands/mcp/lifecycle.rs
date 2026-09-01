@@ -27,7 +27,7 @@ pub(crate) const READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// Broker warm-up is a legitimate pre-listener startup stage. This budget only
 /// applies while `ready` is waiting for a generation it spawned; control ACKs
 /// continue to use the shorter [`READY_TIMEOUT`].
-const SPAWNED_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const SPAWNED_READY_TIMEOUT: Duration = Duration::from_mins(1);
 const READY_POLL: Duration = Duration::from_millis(100);
 /// A control frame is a tiny owner-local message. This is a protocol/DoS
 /// ceiling, not an operator tuning knob.
