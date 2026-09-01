@@ -775,6 +775,8 @@ pub struct TimeoutsSection {
     /// instead of SIGKILL. Unlike `idle_secs` / `approval_secs`, workspace
     /// config may raise this value.
     pub daemon_ready_secs: u64,
+    /// How long `astrid run` waits for the next message from the active run.
+    pub run_idle_secs: u64,
 }
 
 impl Default for TimeoutsSection {
@@ -789,6 +791,8 @@ impl Default for TimeoutsSection {
             // 10 minutes: layout-1 audit import on a multi-principal home
             // exceeds the old hardcoded 60s CLI killer.
             daemon_ready_secs: std::time::Duration::from_mins(10).as_secs(),
+            // Preserve the historical two-minute headless idle wait.
+            run_idle_secs: 120,
         }
     }
 }
