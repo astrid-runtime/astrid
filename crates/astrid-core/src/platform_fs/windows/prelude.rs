@@ -55,6 +55,4 @@ pub(super) use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 pub(super) use windows_sys::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
 pub(super) use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-pub(super) use super::super::{
-    AclAccess, AclInheritance, AclPrincipal, AclRule, acl_rules_are_private,
-};
+pub(super) use super::super::{AclAccess, AclInheritance, AclRule, acl_rules_are_private};

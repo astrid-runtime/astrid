@@ -31,6 +31,18 @@ fn winfsp_drive_root_is_passed_as_a_drive_designator() {
     );
 }
 
+#[tokio::test]
+async fn provider_runtime_refuses_nested_startup() {
+    let error = super::start_provider_runtime("WinFsp service runtime")
+        .expect_err("nested synchronous provider startup must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot start inside another Tokio runtime"),
+        "unexpected nested-runtime error: {error:#}"
+    );
+}
+
 #[test]
 fn native_winfsp_translates_filesystem_operations() {
     if std::env::var_os("ASTRID_WINFSP_NATIVE_TEST").is_none() {

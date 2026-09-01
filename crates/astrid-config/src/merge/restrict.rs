@@ -249,6 +249,19 @@ pub fn enforce_restrictions(
         &["timeouts", "idle_secs"],
         "timeouts.idle_secs",
     );
+    for field in [
+        "process_stop_ack_secs",
+        "process_reap_grace_secs",
+        "process_killed_reap_secs",
+    ] {
+        clamp_max_int(
+            merged,
+            baseline,
+            workspace_layer,
+            &["timeouts", field],
+            &format!("timeouts.{field}"),
+        );
+    }
 
     // hooks.allow_http_hooks: cannot enable (only disable).
     enforce_bool_only_false(

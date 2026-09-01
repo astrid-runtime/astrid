@@ -1,4 +1,5 @@
 use super::*;
+mod repeated_probe_tests;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use windows_sys::Win32::Security::WinAnonymousSid;
 use windows_sys::Win32::Storage::FileSystem::DELETE;

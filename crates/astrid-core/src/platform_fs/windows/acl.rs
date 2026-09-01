@@ -3,11 +3,14 @@
 #[path = "acl/ace.rs"]
 mod ace;
 
+use super::super::AclPrincipal;
 #[cfg(test)]
 use super::path::wide_path;
 use super::path::{OwnedHandle, wide_text};
 use super::prelude::*;
 use ace::{ValidatedAce, ValidatedAcl};
+#[cfg(test)]
+use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 
 pub(super) const DANGEROUS_PARENT_ACCESS: u32 = FILE_WRITE_DATA
     | FILE_APPEND_DATA
@@ -543,6 +546,57 @@ fn validate_private_acl_parts(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn assert_world_entry_is_the_only_untrusted_ace(path: &Path, world_mask: u32) {
+    let required = RequiredSids::get().unwrap();
+    let mut owner: PSID = null_mut();
+    let mut dacl: *mut ACL = null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    let mut wide = wide_path(path).unwrap();
+    // SAFETY: the path and out pointers are valid; the descriptor is owned
+    // by `allocation` for the duration of ACE parsing.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &raw mut owner,
+            null_mut(),
+            &raw mut dacl,
+            null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    assert_eq!(status, ERROR_SUCCESS);
+    let allocation = LocalAllocation(descriptor);
+    // SAFETY: the returned DACL lives inside the owned descriptor allocation.
+    let acl = unsafe { ValidatedAcl::from_raw(dacl, &allocation, "fixture").unwrap() };
+    let mut trusted_readers: usize = 0;
+    for index in 0..acl.ace_count() {
+        match acl.ace(index).unwrap() {
+            ValidatedAce::Allow { mask, sid, .. } => match required.classify(sid.as_ptr()) {
+                AclPrincipal::CurrentUser
+                | AclPrincipal::LocalSystem
+                | AclPrincipal::Administrators => {
+                    assert_ne!(mask & READ_CONTROL, 0);
+                    assert_ne!(mask & FILE_GENERIC_READ, 0);
+                    trusted_readers = trusted_readers
+                        .checked_add(1)
+                        .expect("three trusted-reader ACEs fit in usize");
+                },
+                AclPrincipal::Other => assert_eq!(mask, world_mask),
+            },
+            ValidatedAce::Deny { .. } | ValidatedAce::Unsupported { .. } => {
+                panic!("the DACL fixture must contain only allow ACEs");
+            },
+        }
+    }
+    assert_eq!(
+        trusted_readers, 3,
+        "current user, SYSTEM, and Administrators must retain read+READ_CONTROL"
+    );
 }
 
 fn private_acl_rule(required: &RequiredSids, ace: ValidatedAce<'_>, is_directory: bool) -> AclRule {

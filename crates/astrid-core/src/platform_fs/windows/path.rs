@@ -808,6 +808,21 @@ pub(in crate::platform_fs) fn validate_private_file(path: &Path) -> io::Result<(
     guard.verify_contract(BoundaryContract::ExactPrivateDirectory)
 }
 
+/// Validate a trusted executable against its own Windows DACL and parent chain.
+pub(in crate::platform_fs) fn validate_trusted_file(path: &Path) -> io::Result<()> {
+    validate_local_absolute_path(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "trusted file has no parent"))?;
+    let guard = TrustedPathGuard::capture(parent)?;
+    drop(super::io::open_guarded_regular_file(
+        &guard,
+        path,
+        super::io::FileContract::Trusted,
+    )?);
+    guard.verify()
+}
+
 pub(super) fn nearest_existing_ancestor(path: &Path) -> io::Result<PathBuf> {
     let mut current = path.to_path_buf();
     loop {

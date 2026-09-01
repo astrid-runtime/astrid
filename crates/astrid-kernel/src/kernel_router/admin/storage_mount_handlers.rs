@@ -510,7 +510,7 @@ mod tests {
             view: astrid_core::storage_provider::StorageProviderViewV1::Admin,
             access: astrid_core::storage_provider::StorageProviderAccessV1::ReadOnly,
             provider: "x".to_owned(),
-            mountpoint: std::path::PathBuf::from("/tmp/x"),
+            mountpoint: std::env::temp_dir().join("astrid-mount-variant"),
         };
         assert!(issue.requires_principal_identity());
         assert!(
