@@ -13,6 +13,7 @@ python3 scripts/test_check_static_elf.py
 python3 scripts/test_release_publication.py
 python3 scripts/test_release_draft_recovery.py
 python3 scripts/test_crate_publication.py
+bash scripts/test_publish_crates_io.sh
 python3 scripts/test_channel_metadata.py
 python3 scripts/test_channel_publication.py
 python3 scripts/test_nightly_version.py

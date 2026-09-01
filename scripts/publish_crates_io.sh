@@ -1,6 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+parse_wc_l_count() {
+  local count
+  local remainder
+
+  if ! read -r count remainder && [[ -z "$count" ]]; then
+    echo "wc -l produced no count" >&2
+    return 1
+  fi
+  if [[ -n "${remainder//[[:space:]]/}" ]]; then
+    echo "wc -l produced an invalid count: $count $remainder" >&2
+    return 1
+  fi
+  if [[ ! "$count" =~ ^[0-9]+$ ]]; then
+    echo "wc -l produced an invalid count: $count" >&2
+    return 1
+  fi
+  printf '%s\n' "$count"
+}
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
+
 if [[ $# -ne 2 ]]; then
   echo "usage: publish_crates_io.sh <version> <release-source-root>" >&2
   exit 2
@@ -31,7 +54,7 @@ fi
 python3 "$script_root/crate_publication.py" \
   --metadata "$work_root/cargo-metadata.json" \
   --version "$version" > "$work_root/crates.txt"
-crate_count=$(wc -l < "$work_root/crates.txt")
+crate_count=$(wc -l < "$work_root/crates.txt" | parse_wc_l_count)
 if [[ "$crate_count" != 29 ]]; then
   echo "expected 29 publishable workspace crates, found $crate_count" >&2
   exit 1
