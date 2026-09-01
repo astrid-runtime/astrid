@@ -16,8 +16,7 @@
 //! - `response_complete` — full LLM response rendered
 //! - `tool_call:<name>` — tool execution started
 //! - `tool_result:<id>` — tool execution completed
-//! - `approval_approved:<action>` — approval auto-approved
-//! - `approval_denied` — approval auto-denied
+//! - `approval_ignored:<action>` — approval received without a response
 //! - `state_change` — any other state transition
 //! - `timeout` / `disconnected` / `error` — terminal states
 
@@ -173,7 +172,6 @@ pub(crate) struct HeadlessConfig<'a> {
     pub prompt: &'a str,
     pub width: u16,
     pub height: u16,
-    pub auto_approve: bool,
 }
 
 /// Run a headless TUI session with frame snapshots.
@@ -265,45 +263,12 @@ pub(crate) async fn run(cfg: HeadlessConfig<'_>) -> anyhow::Result<()> {
                 snapshot(&mut terminal, &mut app, &tag);
             },
 
-            astrid_types::ipc::IpcPayload::ApprovalRequired {
-                request_id, action, ..
-            } => {
-                let request_id = request_id.clone();
-                let action = action.clone();
-
-                super::handle_daemon_event(&mut app, &message);
-                snapshot(&mut terminal, &mut app, &format!("approval:{action}"));
-
-                let (decision, reason) = if cfg.auto_approve {
-                    ("approve", "headless-tui auto-approve")
-                } else {
-                    ("deny", "headless-tui auto-deny")
-                };
-                cfg.client
-                    .send_message(astrid_types::ipc::IpcMessage::new(
-                        astrid_types::Topic::approval_response(&request_id),
-                        astrid_types::ipc::IpcPayload::ApprovalResponse {
-                            request_id: request_id.clone(),
-                            decision: decision.into(),
-                            reason: Some(reason.into()),
-                        },
-                        cfg.session_id.0,
-                    ))
-                    .await?;
-
-                app.pending_approvals.retain(|a| a.id != request_id);
-                if app.pending_approvals.is_empty() {
-                    app.state = UiState::Thinking {
-                        start_time: Instant::now(),
-                        dots: 0,
-                    };
-                }
-                let tag = if cfg.auto_approve {
-                    "approval_approved"
-                } else {
-                    "approval_denied"
-                };
-                snapshot(&mut terminal, &mut app, tag);
+            astrid_types::ipc::IpcPayload::ApprovalRequired { action, .. } => {
+                snapshot(
+                    &mut terminal,
+                    &mut app,
+                    &format!("approval_ignored:{action}"),
+                );
             },
 
             _ => {

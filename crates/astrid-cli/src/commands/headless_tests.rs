@@ -116,7 +116,6 @@ async fn active_run_messages_refresh_the_idle_boundary() {
         &mut source,
         &session_id,
         formatter::OutputFormat::Json,
-        false,
         Duration::from_millis(1),
     )
     .await
@@ -136,7 +135,6 @@ async fn session_raw_json_stream_delta_is_active_run_traffic() {
         &mut source,
         &session_id,
         formatter::OutputFormat::Json,
-        false,
         Duration::from_millis(1),
     )
     .await
@@ -153,7 +151,6 @@ async fn missing_active_run_message_returns_timeout_without_process_exit() {
         &mut source,
         &session_id,
         formatter::OutputFormat::Json,
-        false,
         Duration::from_millis(1),
     )
     .await
@@ -173,7 +170,6 @@ async fn foreign_frame_then_injected_timeout_returns_idle_timeout() {
         &mut source,
         &session_id,
         formatter::OutputFormat::Json,
-        false,
         Duration::from_millis(1),
     )
     .await
@@ -197,7 +193,6 @@ async fn foreign_same_principal_approval_is_ignored() {
         &mut source,
         &session_id,
         formatter::OutputFormat::Json,
-        true,
         Duration::from_millis(1),
     )
     .await
@@ -208,30 +203,26 @@ async fn foreign_same_principal_approval_is_ignored() {
 }
 
 #[tokio::test]
-async fn run_correlated_approval_is_answered() {
+async fn session_source_approval_is_also_ignored() {
     let session_id = SessionId::from_uuid(Uuid::new_v4());
     let mut source = DeterministicSource::new([
         ReadStep::Message(Box::new(approval_message(
             &session_id,
             "same-principal-alice",
         ))),
-        ReadStep::Message(Box::new(response("done", true, &session_id))),
+        ReadStep::Timeout,
     ]);
-    let (text, _) = collect_response(
+    let error = collect_response(
         &mut source,
         &session_id,
         formatter::OutputFormat::Json,
-        true,
         Duration::from_millis(1),
     )
     .await
-    .unwrap();
+    .unwrap_err();
 
-    assert_eq!(text, "done");
-    assert_eq!(source.sent.len(), 1);
-    assert!(
-        matches!(&source.sent[0].payload, IpcPayload::ApprovalResponse { decision, .. } if decision == "approve")
-    );
+    assert!(matches!(error, HeadlessError::IdleTimeout { .. }));
+    assert!(source.sent.is_empty());
 }
 
 #[tokio::test]
@@ -242,7 +233,6 @@ async fn timeout_cleanup_sends_disconnect_within_injected_budget() {
         &mut source,
         &session_id,
         formatter::OutputFormat::Json,
-        false,
         Duration::from_millis(1),
         Duration::ZERO,
     )
@@ -277,7 +267,6 @@ async fn wedged_cleanup_send_returns_the_injected_idle_timeout() {
         &mut source,
         &session_id,
         formatter::OutputFormat::Json,
-        false,
         Duration::from_millis(1),
         Duration::ZERO,
     )
@@ -328,7 +317,7 @@ fn only_session_correlated_payloads_can_reset_the_timer() {
         &stream_delta(&foreign_session, "foreign"),
         &session_id
     ));
-    assert!(is_active_run_message(
+    assert!(!is_active_run_message(
         &approval_message(&session_id, "same-principal-alice"),
         &session_id
     ));
