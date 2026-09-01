@@ -163,33 +163,14 @@ fn decode_root_pointer(
     }))
 }
 
-fn recover_from_root(file: &mut File) -> io::Result<Option<Recovery>> {
-    let physical_len = file.metadata()?.len();
-    let first = decode_root_pointer(file, false, physical_len)?;
-    let second = decode_root_pointer(file, true, physical_len)?;
-    let selected = [first, second]
-        .into_iter()
-        .flatten()
-        .max_by_key(|pointer| pointer.generation);
-    let Some(pointer) = selected else {
-        for slot_offset in [VOLUME_MAGIC.len(), ROOT_BYTES - ROOT_SLOT_BYTES] {
-            let marker_end = u64::try_from(slot_offset)
-                .ok()
-                .and_then(|offset| offset.checked_add(ROOT_MAGIC.len() as u64));
-            if marker_end.is_none_or(|end| physical_len < end) {
-                continue;
-            }
-            let mut marker = [0_u8; ROOT_MAGIC.len()];
-            read_exact_at(file, slot_offset as u64, &mut marker)?;
-            if marker == ROOT_MAGIC {
-                return Err(invalid_transition("invalid Astrid volume root pointer"));
-            }
-        }
-        return Ok(None);
-    };
+fn recovery_from_pointer(
+    file: &mut File,
+    pointer: RootPointer,
+    physical_len: u64,
+) -> io::Result<Option<Recovery>> {
     if pointer.footer_offset == 0 {
         if pointer.root_base != ROOT_BYTES as u64 || physical_len != ROOT_BYTES as u64 {
-            return Err(invalid_transition("invalid empty Astrid volume root"));
+            return Ok(None);
         }
         return Ok(Some(Recovery {
             generation: pointer.generation,
@@ -211,13 +192,44 @@ fn recover_from_root(file: &mut File) -> io::Result<Option<Recovery>> {
         .ok_or_else(|| invalid_transition("volume root authority overflow"))?;
     let Some(mut recovery) = recover_footer_at(file, pointer.footer_offset, authority_len, true)?
     else {
-        return Err(invalid_transition("invalid Astrid volume root footer"));
+        return Ok(None);
     };
     recovery.generation = pointer.generation;
     recovery.root_base = pointer.root_base;
     recovery.pointer_slot = pointer.slot;
     recovery.authority_len = authority_len;
     Ok(Some(recovery))
+}
+
+fn recover_from_root(file: &mut File) -> io::Result<Option<Recovery>> {
+    let physical_len = file.metadata()?.len();
+    let mut candidates = [
+        decode_root_pointer(file, false, physical_len)?,
+        decode_root_pointer(file, true, physical_len)?,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    candidates.sort_by_key(|pointer| std::cmp::Reverse(pointer.generation));
+    for pointer in candidates {
+        if let Some(recovery) = recovery_from_pointer(file, pointer, physical_len)? {
+            return Ok(Some(recovery));
+        }
+    }
+    for slot_offset in [VOLUME_MAGIC.len(), ROOT_BYTES - ROOT_SLOT_BYTES] {
+        let marker_end = u64::try_from(slot_offset)
+            .ok()
+            .and_then(|offset| offset.checked_add(ROOT_MAGIC.len() as u64));
+        if marker_end.is_none_or(|end| physical_len < end) {
+            continue;
+        }
+        let mut marker = [0_u8; ROOT_MAGIC.len()];
+        read_exact_at(file, slot_offset as u64, &mut marker)?;
+        if marker == ROOT_MAGIC {
+            return Err(invalid_transition("invalid Astrid volume root pointer"));
+        }
+    }
+    Ok(None)
 }
 
 pub(super) fn encode_region_snapshot(

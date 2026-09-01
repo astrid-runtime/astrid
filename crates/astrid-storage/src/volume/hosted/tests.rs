@@ -312,6 +312,76 @@ fn same_inode_reclaim_preserves_an_empty_volume() {
 }
 
 #[test]
+fn generation_root_recovers_after_uncommitted_tail() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let region = VolumeRegion::new("objects").unwrap();
+    let volume = seeded_volume(&path);
+    volume.reclaim_same_inode().unwrap();
+    let mut file = OpenOptions::new().read(true).open(&path).unwrap();
+    let selected = recover::recover_container(&mut file).unwrap();
+    drop(file);
+    assert!(selected.generation > 0);
+    let authority_len = selected.authority_len;
+
+    volume
+        .detach_after_uncommitted_write_for_test(&region, b"pending")
+        .unwrap();
+    drop(volume);
+    assert!(std::fs::metadata(&path).unwrap().len() > authority_len);
+
+    let reopened = HostedFileVolume::open(&path).unwrap();
+    assert_eq!(read_objects(&reopened), *b"small");
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), authority_len);
+}
+
+#[test]
+fn same_generation_stale_pointer_does_not_block_new_root() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let region = VolumeRegion::new("objects").unwrap();
+    let volume = seeded_volume(&path);
+    volume.reclaim_same_inode().unwrap();
+    let mut file = OpenOptions::new().read(true).open(&path).unwrap();
+    let selected = recover::recover_container(&mut file).unwrap();
+    let stale_footer = selected.durable_len;
+    let stale_root_base = selected.root_base;
+    drop(file);
+
+    volume.write_region_at(&region, 0, b"new").unwrap();
+    volume.sync().unwrap();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let selected = recover::recover_container(&mut file).unwrap();
+    let generation = selected.generation;
+    let root_base = selected.root_base;
+    assert!(selected.durable_len > stale_footer);
+
+    // Reproduce the crash point at which the first (slot-zero) copy names the
+    // new footer while its same-generation sibling still names the old one.
+    recover::write_root_pointer(&mut file, generation, stale_root_base, stale_footer, true)
+        .unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    volume.detach_for_test().unwrap();
+    drop(volume);
+
+    let reopened = HostedFileVolume::open(&path).unwrap();
+    let mut bytes = [0_u8; 3];
+    reopened.read_region_at(&region, 0, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"new");
+    assert!(
+        !recover::recover_container(&mut OpenOptions::new().read(true).open(&path).unwrap())
+            .unwrap()
+            .pointer_slot
+    );
+    assert_eq!(root_base, stale_root_base);
+}
+
+#[test]
 fn unflipped_replacement_image_leaves_the_old_generation_current() {
     let (temporary, snapshot) = snapshot_reclaim_at(ReclaimStage::ReplacementDurable);
     let physical_len = std::fs::metadata(&snapshot).unwrap().len();

@@ -136,13 +136,31 @@ impl HostedFileVolume {
         hasher.update(payload);
         let checksum = *hasher.finalize().as_bytes();
 
-        // A footer occupies the old valid-end until the next append. Truncate
-        // it before writing the next ASTREG1 record; valid_len excludes it.
+        // A footer occupies the old valid-end until the next append. A
+        // generation root still names that footer, so write after it until a
+        // new root makes the replacement authority durable. Generation-0
+        // recovery uses the EOF/header scan and retains its truncate-and-tail
+        // behavior.
         state.footer_pending = true;
-        if state.physical_tail == PhysicalTail::TruncateToValid {
-            state.file.set_len(state.valid_len)?;
-        }
-        state.file.seek(SeekFrom::Start(state.valid_len))?;
+        let preserve_footer = state.generation > 0
+            && state.durable_len != 0
+            && state.physical_tail == PhysicalTail::TruncateToValid;
+        let append_at = if state.physical_tail == PhysicalTail::TruncateToValid {
+            if preserve_footer && state.valid_len == state.durable_len {
+                state
+                    .durable_len
+                    .checked_add(u64::try_from(recover::FOOTER_BYTES).unwrap_or(u64::MAX))
+                    .ok_or_else(|| io::Error::other("volume footer offset overflow"))?
+            } else if preserve_footer {
+                state.valid_len
+            } else {
+                state.file.set_len(state.valid_len)?;
+                state.valid_len
+            }
+        } else {
+            state.valid_len
+        };
+        state.file.seek(SeekFrom::Start(append_at))?;
         state.file.write_all(&RECORD_MAGIC)?;
         state.file.write_all(&total_len.to_le_bytes())?;
         state.file.write_all(&next_sequence.to_le_bytes())?;
@@ -152,15 +170,13 @@ impl HostedFileVolume {
         state.file.write_all(&payload_len.to_le_bytes())?;
         state.file.write_all(&checksum)?;
         state.file.write_all(name)?;
-        let physical_payload = state
-            .valid_len
+        let physical_payload = append_at
             .checked_add(u64::try_from(RECORD_FIXED_BYTES).unwrap_or(u64::MAX))
             .and_then(|value| value.checked_add(u64::from(name_len)))
             .ok_or_else(|| io::Error::other("volume physical offset overflow"))?;
         state.file.write_all(payload)?;
         state.boundary_pending = false;
-        state.valid_len = state
-            .valid_len
+        state.valid_len = append_at
             .checked_add(total_len)
             .ok_or_else(|| io::Error::other("volume length overflow"))?;
         state.sequence = next_sequence;
@@ -234,6 +250,27 @@ impl HostedFileVolume {
     /// Returns an I/O, durability, or volume-generation error.
     pub fn reclaim_same_inode(&self) -> io::Result<()> {
         reclaim::reclaim_same_inode(self)
+    }
+
+    #[cfg(test)]
+    fn detach_after_uncommitted_write_for_test(
+        &self,
+        region: &VolumeRegion,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        self.write_region_at(region, 0, bytes)?;
+        let mut state = self.state.lock();
+        let old = std::mem::replace(&mut state.file, tempfile::tempfile()?);
+        fs2::FileExt::unlock(&old)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn detach_for_test(&self) -> io::Result<()> {
+        let mut state = self.state.lock();
+        let old = std::mem::replace(&mut state.file, tempfile::tempfile()?);
+        fs2::FileExt::unlock(&old)?;
+        Ok(())
     }
 }
 impl Drop for HostedFileVolume {
