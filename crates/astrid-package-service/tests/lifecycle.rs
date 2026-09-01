@@ -479,3 +479,25 @@ fn plan_digest_is_domain_separate_from_state_digest() {
     let plan_like = writer.finish::<3>("astrid.package.plan.v1");
     assert_ne!(state_like.as_bytes(), plan_like.as_bytes());
 }
+
+#[test]
+fn digest_writer_hashes_the_exact_length_delimited_field_stream() {
+    let mut writer = DigestWriter::new();
+    writer.tag(7);
+    writer.bytes(&[1, 2, 3]);
+    writer.u64(258);
+
+    let actual = writer.finish::<2>("astrid.package.writer.v1");
+    let mut fields = vec![7_u8];
+    fields.extend_from_slice(&3_u64.to_le_bytes());
+    fields.extend_from_slice(&[1, 2, 3]);
+    fields.extend_from_slice(&258_u64.to_le_bytes());
+
+    let mut expected_hasher = blake3::Hasher::new();
+    let domain = b"astrid.package.writer.v1";
+    expected_hasher.update(&(domain.len() as u64).to_le_bytes());
+    expected_hasher.update(domain);
+    expected_hasher.update(&(fields.len() as u64).to_le_bytes());
+    expected_hasher.update(&fields);
+    assert_eq!(actual.as_bytes(), expected_hasher.finalize().as_bytes());
+}

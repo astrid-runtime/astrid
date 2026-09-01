@@ -78,7 +78,8 @@ digest_alias!(
 /// Length-delimited canonical digest input.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DigestWriter {
-    bytes: Vec<u8>,
+    chunks: Vec<Vec<u8>>,
+    bytes_len: usize,
 }
 
 impl DigestWriter {
@@ -90,28 +91,32 @@ impl DigestWriter {
 
     /// Writes a closed variant or field tag.
     pub fn tag(&mut self, value: u8) {
-        self.bytes.push(value);
+        self.push(&[value]);
     }
 
     /// Writes a little-endian unsigned integer.
     pub fn u64(&mut self, value: u64) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
+        self.push(&value.to_le_bytes());
     }
 
     /// Writes one canonical boolean byte.
     pub fn bool(&mut self, value: bool) {
-        self.bytes.push(u8::from(value));
+        self.push(&[u8::from(value)]);
     }
 
     /// Length-prefixes arbitrary bytes.
     pub fn bytes(&mut self, value: &[u8]) {
-        self.u64(u64::try_from(value.len()).unwrap_or(u64::MAX));
-        self.bytes.extend_from_slice(value);
+        let mut framed = u64::try_from(value.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes()
+            .to_vec();
+        framed.extend_from_slice(value);
+        self.push_vec(framed);
     }
 
     /// Writes a digest as its exact bytes.
     pub fn digest<const KIND: u8>(&mut self, value: &TypedDigest<KIND>) {
-        self.bytes.extend_from_slice(value.as_bytes());
+        self.push(value.as_bytes());
     }
 
     /// Completes a digest under the supplied unique semantic domain.
@@ -120,8 +125,25 @@ impl DigestWriter {
         let mut hasher = Hasher::new();
         hasher.update(&(domain.len() as u64).to_le_bytes());
         hasher.update(domain.as_bytes());
-        hasher.update(&(self.bytes.len() as u64).to_le_bytes());
-        hasher.update(&self.bytes);
+        hasher.update(
+            &(u64::try_from(self.bytes_len)
+                .unwrap_or(u64::MAX)
+                .to_le_bytes()),
+        );
+        // Fields remain separate so fixed canonical framing is not combined
+        // with operation nonce bytes before hashing.
+        for chunk in &self.chunks {
+            hasher.update(chunk);
+        }
         TypedDigest::from_bytes(*hasher.finalize().as_bytes())
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.push_vec(bytes.to_vec());
+    }
+
+    fn push_vec(&mut self, bytes: Vec<u8>) {
+        self.bytes_len = self.bytes_len.saturating_add(bytes.len());
+        self.chunks.push(bytes);
     }
 }
