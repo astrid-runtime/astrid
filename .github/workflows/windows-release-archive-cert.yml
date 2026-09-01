@@ -1,0 +1,208 @@
+name: Windows release archive certification
+run-name: Windows x86_64 archive certification ${{ inputs.source_commit }}
+
+on:
+  workflow_call:
+    inputs:
+      source_commit:
+        description: Exact source commit whose release archive is being certified
+        required: true
+        type: string
+      version:
+        description: Release version bound into the archive name
+        required: true
+        type: string
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/windows-release-archive-cert.yml'
+      - 'scripts/test_windows_release_archive.ps1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release-archive-cert-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  windows-archive-cert:
+    name: Install, mount, and uninstall the release archive
+    runs-on: windows-2025
+    timeout-minutes: 60
+    outputs:
+      archive: ${{ steps.archive.outputs.name }}
+      archive_sha256: ${{ steps.archive.outputs.sha256 }}
+      source_commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Establish the throwaway certification boundary
+        shell: pwsh
+        run: |
+          $certRoot = Join-Path $env:RUNNER_TEMP "windows-archive-cert-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          "CERT_ROOT=$certRoot" | Add-Content -Encoding ascii -Path $env:GITHUB_ENV
+          "ASTRID_HOME=$(Join-Path $certRoot 'astrid-home')" | Add-Content -Encoding ascii -Path $env:GITHUB_ENV
+          "DIAGNOSTICS=$(Join-Path $certRoot 'diagnostics')" | Add-Content -Encoding ascii -Path $env:GITHUB_ENV
+
+      - name: Checkout the exact certification source
+        id: source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_commit || github.sha }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Bind the workflow to one clean source commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACTUAL=$(git rev-parse 'HEAD^{commit}')
+          EXPECTED="${{ inputs.source_commit || github.sha }}"
+          [[ "$ACTUAL" == "$EXPECTED" ]]
+          [[ "$ACTUAL" =~ ^[0-9a-f]{40}$ ]]
+          git diff --exit-code
+          git diff --cached --exit-code
+          echo "commit=$ACTUAL" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Download the exact release-built archive
+        if: github.event_name == 'workflow_call'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: binary-x86_64-pc-windows-msvc
+          path: downloaded-windows-archive
+
+      - name: Install Rust toolchain
+        if: github.event_name != 'workflow_call'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust artifacts
+        if: github.event_name != 'workflow_call'
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: windows-release-archive-cert-x86_64-pc-windows-msvc
+          cache-on-failure: true
+
+      - name: Install the pinned WinFsp build prerequisite
+        if: github.event_name != 'workflow_call'
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp-2.1.25156.msi'
+          Invoke-WebRequest `
+            -Uri 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi' `
+            -OutFile $msi
+          $hash = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash
+          if ($hash -ne '073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A') {
+            throw "WinFsp MSI digest mismatch: $hash"
+          }
+          $exitCode = (Start-Process -FilePath 'msiexec.exe' `
+            -ArgumentList @('/i', "`"$msi`"", 'ADDLOCAL=F.Developer', '/qn', '/norestart') `
+            -Wait -PassThru).ExitCode
+          if ($exitCode -ne 0 -and $exitCode -ne 3010) {
+            throw "WinFsp installation failed with exit code $exitCode"
+          }
+          $registry = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\WOW6432Node\WinFsp' -ErrorAction Stop
+          if ([string]::IsNullOrWhiteSpace($registry.InstallDir)) {
+            throw 'WinFsp installation did not publish InstallDir'
+          }
+          "WINFSP_MSI=$msi" | Add-Content -Encoding ascii -Path $env:GITHUB_ENV
+          "WINFSP_ROOT=$($registry.InstallDir)" | Add-Content -Encoding ascii -Path $env:GITHUB_ENV
+
+      - name: Produce a candidate release archive
+        if: github.event_name != 'workflow_call'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET=x86_64-pc-windows-msvc
+          VERSION=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          DIR="astrid-${VERSION}-${TARGET}"
+          BINARY_ROOT="target/${TARGET}/release"
+
+          cargo build --release --locked --target "$TARGET" -p astrid
+          cargo build --release --locked --target "$TARGET" -p astrid-storage-provider-winfsp
+
+          mkdir "$DIR"
+          cp "$BINARY_ROOT/astrid.exe" "$DIR/"
+          cp "$BINARY_ROOT/astrid-daemon.exe" "$DIR/"
+          cp "$BINARY_ROOT/astrid-build.exe" "$DIR/"
+          cp "$BINARY_ROOT/astrid-emit.exe" "$DIR/"
+          cp "$BINARY_ROOT/astrid-storage-provider-winfsp.exe" "$DIR/"
+          cp "$WINFSP_ROOT/bin/winfsp-x64.dll" "$DIR/"
+          cp "$WINFSP_MSI" "$DIR/winfsp-2.1.25156.msi"
+          cp scripts/install-windows.ps1 scripts/uninstall-windows.ps1 "$DIR/"
+          cp LICENSE* README.md "$DIR/" 2>/dev/null || true
+
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          python scripts/package_release_archive.py \
+            --root "$DIR" \
+            --output "${DIR}.tar.gz" \
+            --mtime "$SOURCE_DATE_EPOCH"
+          python scripts/validate_release_archive.py "${DIR}.tar.gz" --target "$TARGET"
+          echo "ASSET=${DIR}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Bind the exact archive bytes
+        id: archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $searchRoot = $env:GITHUB_WORKSPACE
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_call') {
+            $searchRoot = Join-Path $env:GITHUB_WORKSPACE 'downloaded-windows-archive'
+          }
+          $archives = @(Get-ChildItem -LiteralPath $searchRoot -File -Filter 'astrid-*-x86_64-pc-windows-msvc.tar.gz')
+          if ($archives.Count -ne 1) {
+            throw "expected exactly one Windows x86_64 archive, found $($archives.Count)"
+          }
+          $archive = $archives[0]
+          $sha256 = (Get-FileHash -LiteralPath $archive.FullName -Algorithm SHA256).Hash
+          "ARCHIVE_PATH=$($archive.FullName)" | Add-Content -Encoding ascii -Path $env:GITHUB_ENV
+          "name=$($archive.Name)" | Add-Content -Encoding ascii -Path $env:GITHUB_OUTPUT
+          "sha256=$sha256" | Add-Content -Encoding ascii -Path $env:GITHUB_OUTPUT
+          Write-Host "Certifying $($archive.Name)"
+          Write-Host "Archive SHA-256: $sha256"
+
+      - name: Validate and certify the extracted release bytes
+        shell: pwsh
+        run: |
+          python scripts/validate_release_archive.py "$env:ARCHIVE_PATH" --target x86_64-pc-windows-msvc
+          & scripts/test_windows_release_archive.ps1 `
+            -ArchivePath $env:ARCHIVE_PATH `
+            -ExpectedArchiveSha256 '${{ steps.archive.outputs.sha256 }}' `
+            -ExpectedSourceCommit '${{ steps.source.outputs.commit }}' `
+            -ExpectedVersion '${{ inputs.version }}'
+
+      - name: Upload certification diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-archive-cert-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.DIAGNOSTICS }}
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Remove the throwaway certification root
+        if: always()
+        shell: pwsh
+        run: |
+          $expectedPrefix = Join-Path $env:RUNNER_TEMP 'windows-archive-cert-'
+          if (-not $env:CERT_ROOT.StartsWith($expectedPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "refusing to remove unexpected certification root: $($env:CERT_ROOT)"
+          }
+          if (Test-Path -LiteralPath $env:CERT_ROOT) {
+            Remove-Item -LiteralPath $env:CERT_ROOT -Recurse -Force
+          }
