@@ -225,7 +225,22 @@ mcp_connect_secs = 10
 approval_secs = 300
 idle_secs = 3600
 daemon_ready_secs = 600
+run_idle_secs = 120
 ```
+
+`run_idle_secs` is the `astrid run` no-message idle timeout. The timer resets
+when a message belonging to the active run arrives; it is not a total deadline
+for the run. `--idle-timeout-secs` overrides this operator default for one
+invocation. Values must be between 1 and 86400 seconds.
+
+Capsule HTTP controls remain independent. `[http].default_timeout_secs` sets
+the buffered request default; a capsule request's `total-ms` sets that
+request's whole-response budget. `[http].header_deadline_secs` and
+`first-byte-ms` cover time to response headers, while
+`[http].stream_read_timeout_secs` and `between-bytes-ms` cover gaps between
+response bytes. Raise those only for HTTP transport behavior; raise
+`run_idle_secs` or use `--idle-timeout-secs` when the daemon is legitimately
+still working and has not sent the next run message.
 
 ## Sessions
 
