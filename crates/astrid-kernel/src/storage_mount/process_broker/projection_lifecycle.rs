@@ -10,11 +10,20 @@ use std::{
     },
 };
 
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) use super::process_stop::retain_gates::{
+    arm_retain_reference_gate, arm_retain_validation_gate,
+};
+#[cfg(all(test, any(unix, windows)))]
+use super::process_stop::retain_gates::{
+    pause_retain_reference_for_test, pause_retain_validation_for_test,
+};
+use super::process_stop::{ProcessStopOutcome, cleanup_evidence, stop_process_provider_outcome};
 use super::{
     CachedProcessProjection, Kernel, ProcessProjectionBinding, ProcessProjectionKey,
     ProcessProjectionTarget, ProcessProjectionTargetSet, ProcessStopPolicy, ProjectionCleanup,
     StorageMountId, StorageProviderAccessV1, generate_lease_token, local_transport,
-    platform_process_provider_name, stop_process_provider,
+    platform_process_provider_name,
 };
 use crate::storage_mount::lifecycle::cleanup_mapped_lease_resources;
 use crate::storage_mount::lifecycle::{complete_cleanup_ledger, force_fence_projection_lease};
@@ -106,6 +115,7 @@ async fn cleanup_projection(state: &mut ProjectionCleanupState) -> bool {
     if state.cleaned {
         return true;
     }
+    cleanup_evidence::begin();
 
     // Provider teardown is an authenticated async protocol: STOP, wait for
     // the service's unmount acknowledgement, then reap the child. A kill is
@@ -113,21 +123,16 @@ async fn cleanup_projection(state: &mut ProjectionCleanupState) -> bool {
     // the provider handles in the state makes a later mount request retry the
     // same bounded operation instead of creating a second projection.
     let binding_valid = state.binding.validate().is_ok();
+    cleanup_evidence::record(
+        cleanup_evidence::ProjectionCleanupStage::Binding,
+        !binding_valid,
+    );
     if !binding_valid {
         tracing::error!("process storage projection binding became invalid");
     }
     let policy = state.stop_policy;
     let (branch_stopped, owner_stopped, shared_stopped) = if binding_valid {
-        tokio::join!(
-            stop_running_provider(&mut state.branch.running, policy),
-            stop_running_provider(&mut state.owner.running, policy),
-            async {
-                match state.shared.as_mut() {
-                    Some(shared) => stop_running_provider(&mut shared.running, policy).await,
-                    None => true,
-                }
-            },
-        )
+        stop_projection_providers(state, policy).await
     } else {
         (false, false, false)
     };
@@ -160,10 +165,48 @@ async fn cleanup_projection(state: &mut ProjectionCleanupState) -> bool {
     }
     if let Err(error) = remove_projection_root(&state.mount_root) {
         tracing::error!(%error, "failed to remove process storage projection root");
+        cleanup_evidence::record(
+            cleanup_evidence::ProjectionCleanupStage::ProjectionRoot,
+            true,
+        );
         return false;
     }
+    cleanup_evidence::record(
+        cleanup_evidence::ProjectionCleanupStage::ProjectionRoot,
+        false,
+    );
     state.cleaned = true;
+    cleanup_evidence::record(cleanup_evidence::ProjectionCleanupStage::Complete, false);
     true
+}
+
+async fn stop_projection_providers(
+    state: &mut ProjectionCleanupState,
+    policy: ProcessStopPolicy,
+) -> (bool, bool, bool) {
+    use cleanup_evidence::ProviderComponent;
+
+    tokio::join!(
+        stop_running_provider(&mut state.branch.running, policy, ProviderComponent::Branch),
+        stop_running_provider(
+            &mut state.owner.running,
+            policy,
+            ProviderComponent::OwnerHome
+        ),
+        async {
+            match state.shared.as_mut() {
+                Some(shared) => {
+                    stop_running_provider(
+                        &mut shared.running,
+                        policy,
+                        ProviderComponent::FleetShared,
+                    )
+                    .await
+                },
+                None => true,
+            }
+        },
+    )
 }
 
 async fn fence_retained_projection(state: &mut ProjectionCleanupState) {
@@ -188,20 +231,45 @@ async fn fence_retained_projection(state: &mut ProjectionCleanupState) {
     }
 }
 
-async fn stop_running_provider(provider: &mut RunningProvider, policy: ProcessStopPolicy) -> bool {
+async fn stop_running_provider(
+    provider: &mut RunningProvider,
+    policy: ProcessStopPolicy,
+    component: cleanup_evidence::ProviderComponent,
+) -> bool {
+    use cleanup_evidence::ProjectionCleanupStage;
+
     if provider.stopped {
         return true;
     }
     let stopped = if let Some(child) = provider.child.as_mut() {
-        stop_process_provider(
+        let outcome = stop_process_provider_outcome(
             child,
             provider.control_path.clone(),
             provider.token.clone(),
             policy,
         )
-        .await
+        .await;
+        cleanup_evidence::record(
+            ProjectionCleanupStage::ProviderStop { component, outcome },
+            !matches!(outcome, ProcessStopOutcome::Stopped { .. }),
+        );
+        matches!(outcome, ProcessStopOutcome::Stopped { .. })
     } else {
-        unmanaged_provider_is_stopped(&provider.control_path).await
+        let stopped = unmanaged_provider_is_stopped(&provider.control_path).await;
+        cleanup_evidence::record(
+            ProjectionCleanupStage::ProviderStop {
+                component,
+                outcome: if stopped {
+                    ProcessStopOutcome::Stopped {
+                        acknowledged: false,
+                    }
+                } else {
+                    ProcessStopOutcome::ControlEndpoint
+                },
+            },
+            !stopped,
+        );
+        stopped
     };
     if stopped {
         provider.stopped = true;
@@ -382,19 +450,47 @@ pub(crate) async fn cleanup_uncommitted_issue_lease_set(
     };
     fence_projection_states(&states, true);
     let listeners_closed = drain_projection_states(&states).await;
+    cleanup_evidence::record(
+        cleanup_evidence::ProjectionCleanupStage::ListenerSettlement,
+        !listeners_closed,
+    );
     if !listeners_closed {
         return false;
     }
     let _mutation_guard = kernel.storage_mount_mutations.lock().await;
     for state in &states {
-        if cleanup_mapped_lease_resources(state).is_err() {
+        if let Err(error) = cleanup_mapped_lease_resources(state) {
+            cleanup_evidence::record(
+                cleanup_evidence::ProjectionCleanupStage::LeaseResources {
+                    mount_id: error.mount_id.unwrap_or(state.mount_id),
+                },
+                true,
+            );
             return false;
         }
+        cleanup_evidence::record(
+            cleanup_evidence::ProjectionCleanupStage::LeaseResources {
+                mount_id: state.mount_id,
+            },
+            false,
+        );
     }
     for state in &states {
-        if complete_cleanup_ledger(state).is_err() {
+        if let Err(_error) = complete_cleanup_ledger(state) {
+            cleanup_evidence::record(
+                cleanup_evidence::ProjectionCleanupStage::CleanupLedger {
+                    mount_id: state.mount_id,
+                },
+                true,
+            );
             return false;
         }
+        cleanup_evidence::record(
+            cleanup_evidence::ProjectionCleanupStage::CleanupLedger {
+                mount_id: state.mount_id,
+            },
+            false,
+        );
     }
     for state in &states {
         state.complete_drain_retry();
@@ -621,10 +717,14 @@ pub(crate) async fn retry_failed_projection(
         return false;
     }
     projection.cleanup_failed.store(false, Ordering::Release);
-    if projections
+    let removable = projections
         .get(key)
-        .is_some_and(|current| Arc::ptr_eq(current, projection))
-    {
+        .is_some_and(|current| Arc::ptr_eq(current, projection));
+    cleanup_evidence::record(
+        cleanup_evidence::ProjectionCleanupStage::CacheRemoval,
+        !removable,
+    );
+    if removable {
         projections.remove(key);
     }
     true
@@ -757,105 +857,6 @@ pub(crate) async fn retain_locked_projection(
             .into());
     }
     Ok(projection_mount(projection, cache, key))
-}
-
-#[cfg(all(test, any(unix, windows)))]
-#[derive(Default)]
-struct RetainValidationGate {
-    entered: Arc<tokio::sync::Notify>,
-    release: Arc<tokio::sync::Notify>,
-}
-
-#[cfg(all(test, any(unix, windows)))]
-static RETAIN_VALIDATION_GATE: std::sync::Mutex<Option<Arc<RetainValidationGate>>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(all(test, any(unix, windows)))]
-static RETAIN_REFERENCE_GATE: std::sync::Mutex<Option<Arc<RetainValidationGate>>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(all(test, any(unix, windows)))]
-pub(crate) struct RetainValidationGateGuard {
-    gate: Arc<RetainValidationGate>,
-}
-
-#[cfg(all(test, any(unix, windows)))]
-impl RetainValidationGateGuard {
-    pub(crate) fn entered(&self) -> Arc<tokio::sync::Notify> {
-        Arc::clone(&self.gate.entered)
-    }
-
-    pub(crate) fn release(&self) -> Arc<tokio::sync::Notify> {
-        Arc::clone(&self.gate.release)
-    }
-}
-
-#[cfg(all(test, any(unix, windows)))]
-impl Drop for RetainValidationGateGuard {
-    fn drop(&mut self) {
-        let mut installed = RETAIN_VALIDATION_GATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if installed
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &self.gate))
-        {
-            *installed = None;
-        }
-        let mut reference_gate = RETAIN_REFERENCE_GATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if reference_gate
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &self.gate))
-        {
-            *reference_gate = None;
-        }
-    }
-}
-
-#[cfg(all(test, any(unix, windows)))]
-pub(crate) fn arm_retain_validation_gate() -> RetainValidationGateGuard {
-    let gate = Arc::new(RetainValidationGate::default());
-    *RETAIN_VALIDATION_GATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&gate));
-    RetainValidationGateGuard { gate }
-}
-
-#[cfg(all(test, any(unix, windows)))]
-pub(crate) fn arm_retain_reference_gate() -> RetainValidationGateGuard {
-    let gate = Arc::new(RetainValidationGate::default());
-    *RETAIN_REFERENCE_GATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&gate));
-    RetainValidationGateGuard { gate }
-}
-
-#[cfg(all(test, any(unix, windows)))]
-async fn pause_retain_validation_for_test() {
-    let gate = RETAIN_VALIDATION_GATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .map(Arc::clone);
-    if let Some(gate) = gate {
-        gate.entered.notify_one();
-        gate.release.notified().await;
-    }
-}
-
-#[cfg(all(test, any(unix, windows)))]
-async fn pause_retain_reference_for_test() {
-    let gate = RETAIN_REFERENCE_GATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .map(Arc::clone);
-    if let Some(gate) = gate {
-        gate.entered.notify_one();
-        gate.release.notified().await;
-    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
