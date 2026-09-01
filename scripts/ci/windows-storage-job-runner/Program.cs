@@ -334,14 +334,16 @@ internal static class Program
         SafeProcessHandle? process = null;
         SafeWindowsHandle? thread = null;
         JobRunResult result;
+        var processAssignedToJob = false;
+        var directProcessCleanupComplete = false;
         try
         {
             var startup = default(NativeMethods.StartupInfoW);
-            startup.Size = (uint)sizeof(NativeMethods.StartupInfoW);
-            startup.Flags = NativeMethods.StartupUseStandardHandles;
-            startup.StandardOutput = stdoutHandle.DangerousGetHandle();
-            startup.StandardError = stderrHandle.DangerousGetHandle();
-            startup.StandardInput = IntPtr.Zero;
+            startup.cb = (uint)sizeof(NativeMethods.StartupInfoW);
+            startup.dwFlags = NativeMethods.StartupUseStandardHandles;
+            startup.hStdOutput = stdoutHandle.DangerousGetHandle();
+            startup.hStdError = stderrHandle.DangerousGetHandle();
+            startup.hStdInput = IntPtr.Zero;
 
             var commandLine = BuildCommandLine(executable, arguments);
             if (!NativeMethods.CreateProcessW(
@@ -365,10 +367,16 @@ internal static class Program
             var processId = rawProcessInformation.ProcessId;
             if (!NativeMethods.AssignProcessToJobObject(job, process))
             {
+                var assignmentError = Marshal.GetLastWin32Error();
+                var directCleanup = TerminateUnassignedProcessAndAwait(process, cleanupTimeout);
+                directProcessCleanupComplete = directCleanup;
                 throw new ControllerException(
-                    $"AssignProcessToJobObject failed for process {processId}: Win32 error {Marshal.GetLastWin32Error()}");
+                    $"AssignProcessToJobObject failed for process {processId}: Win32 error {assignmentError}; "
+                    + $"cleanup={(directCleanup ? "PROCESS_EXITED" : "INCOMPLETE")}; "
+                    + $"stdout={stdoutPath}; stderr={stderrPath}");
             }
 
+            processAssignedToJob = true;
             afterAssignment?.Invoke();
             var previousSuspendCount = NativeMethods.ResumeThread(thread);
             if (previousSuspendCount != 1)
@@ -399,6 +407,11 @@ internal static class Program
         }
         catch (ControllerException)
         {
+            if (!processAssignedToJob)
+            {
+                throw;
+            }
+
             if (!TryTerminateAndAwait(job, process, cleanupTimeout))
             {
                 throw new ControllerException(
@@ -471,8 +484,8 @@ internal static class Program
             }
         }, heartbeatToken);
 
-        var stdoutTail = TailOutput(stdoutPath, Console.Out, stdoutCounter);
-        var stderrTail = TailOutput(stderrPath, Console.Error, stderrCounter);
+        var stdoutTail = OutputTail.TailOutput(stdoutPath, Console.Out, stdoutCounter, heartbeatToken);
+        var stderrTail = OutputTail.TailOutput(stderrPath, Console.Error, stderrCounter, heartbeatToken);
         var stopwatch = Stopwatch.StartNew();
         var outcome = JobOutcome.ControllerFailed;
         var exitCode = 0u;
@@ -587,16 +600,46 @@ internal static class Program
         }
     }
 
-    private static async Task TailOutput(string path, TextWriter writer, StrongBox<long> bytes)
+    private static bool TerminateUnassignedProcessAndAwait(
+        SafeProcessHandle? process,
+        TimeSpan cleanupTimeout)
     {
-        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        using var reader = new StreamReader(stream, Encoding.UTF8, false, 4096, leaveOpen: false);
-        while (await reader.ReadLineAsync() is { } line)
+        if (process is null || process.IsInvalid)
         {
-            await writer.WriteLineAsync(line);
-            await writer.FlushAsync();
-            Interlocked.Add(ref bytes.Value, Encoding.UTF8.GetByteCount(line) + Environment.NewLine.Length);
+            return false;
         }
+
+        try
+        {
+            _ = NativeMethods.TerminateProcess(process, ControllerFailureExitCode);
+            return WaitForProcessExit(process, cleanupTimeout);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool WaitForProcessExit(SafeProcessHandle process, TimeSpan cleanupTimeout)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        do
+        {
+            var wait = NativeMethods.WaitForSingleObject(process, 50);
+            if (wait == NativeMethods.WaitObject0)
+            {
+                return true;
+            }
+
+            if (wait != NativeMethods.WaitTimeout)
+            {
+                throw new ControllerException(
+                    $"waiting for the unassigned process failed: Win32 error {Marshal.GetLastWin32Error()}");
+            }
+        }
+        while (stopwatch.Elapsed < cleanupTimeout);
+
+        return false;
     }
 
     private static bool WaitForActiveProcessZero(
@@ -702,6 +745,8 @@ internal static class Program
 
     internal static IReadOnlyList<string> ParseTestListForSelfTest(IEnumerable<string> lines) =>
         ParseTestList(lines);
+
+    internal static string[] BuildCanonicalListArgumentsForSelfTest() => BuildCanonicalListArguments();
 
     internal static void AssertProviderForSelfTest(string expectedPath, string actualPath, string expectedHash) =>
         AssertProvider(expectedPath, actualPath, expectedHash);
@@ -865,51 +910,4 @@ internal static class Program
     }
 
     private const string StorageTestFilter = "storage_mount";
-}
-
-internal enum JobOutcome
-{
-    Succeeded,
-    ChildFailed,
-    TimedOut,
-    ControllerFailed,
-}
-
-internal sealed record JobRunResult(
-    JobOutcome Outcome,
-    uint ExitCode,
-    string OriginalCause,
-    bool CleanupComplete,
-    uint[] ActiveProcessIds,
-    string StdoutPath,
-    string StderrPath,
-    int ProcessId,
-    TimeSpan Elapsed);
-
-internal sealed class CertificationOptions
-{
-    public string TestExecutable { get; set; } = string.Empty;
-    public string ProviderCanonical { get; set; } = string.Empty;
-    public string Provider { get; set; } = string.Empty;
-    public string ProviderSha256 { get; set; } = string.Empty;
-    public string WorkingDirectory { get; set; } = string.Empty;
-    public string LogDirectory { get; set; } = string.Empty;
-    public TimeSpan ListTimeout { get; set; }
-    public TimeSpan AggregateTimeout { get; set; }
-    public TimeSpan DiagnosticTimeout { get; set; }
-    public TimeSpan CleanupTimeout { get; set; }
-    public TimeSpan HeartbeatInterval { get; set; }
-}
-
-internal sealed class ControllerException : Exception
-{
-    public ControllerException(string message)
-        : base(message)
-    {
-    }
-
-    public ControllerException(string message, Exception innerException)
-        : base(message, innerException)
-    {
-    }
 }

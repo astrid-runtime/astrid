@@ -25,25 +25,27 @@ internal static partial class NativeMethods
         public uint InheritHandle;
     }
 
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    [StructLayout(LayoutKind.Sequential)]
     public struct StartupInfoW
     {
-        public uint Size;
-        public IntPtr Desktop;
-        public IntPtr Title;
-        public uint X;
-        public uint Y;
-        public uint Width;
-        public uint Height;
-        public uint CountChars;
-        public uint FillAttribute;
-        public uint Flags;
-        public ushort ShowWindow;
-        public ushort Reserved;
-        public IntPtr Reserved2;
-        public IntPtr StandardInput;
-        public IntPtr StandardOutput;
-        public IntPtr StandardError;
+        public uint cb;
+        public IntPtr lpReserved;
+        public IntPtr lpDesktop;
+        public IntPtr lpTitle;
+        public uint dwX;
+        public uint dwY;
+        public uint dwXSize;
+        public uint dwYSize;
+        public uint dwXCountChars;
+        public uint dwYCountChars;
+        public uint dwFillAttribute;
+        public uint dwFlags;
+        public ushort wShowWindow;
+        public ushort cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -133,6 +135,10 @@ internal static partial class NativeMethods
     [LibraryImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static partial bool TerminateJobObject(SafeJobHandle job, uint exitCode);
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool TerminateProcess(SafeProcessHandle process, uint exitCode);
 
     [LibraryImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

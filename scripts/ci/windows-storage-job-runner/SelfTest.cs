@@ -1,11 +1,12 @@
 using System.Diagnostics;
 using System.Security.Cryptography;
+using System.Runtime.InteropServices;
 
 namespace Astrid.Ci.Windows;
 
 internal sealed class SelfTest
 {
-    private static readonly string[] ListArguments = ["--list", "--format=terse", "storage_mount"];
+    private static readonly string[] ListArguments = Program.BuildCanonicalListArgumentsForSelfTest();
     private static readonly string[] AggregateArguments = ["storage_mount", "--", "--nocapture", "--test-threads=1"];
 
     public static int Run()
@@ -13,6 +14,7 @@ internal sealed class SelfTest
         var root = Directory.CreateTempSubdirectory("astrid-storage-job-selftest-").FullName;
         try
         {
+            StartupInfoLayout();
             AssignmentBeforeExecution(root);
             DescendantTermination(root);
             UnrelatedProcessSurvival(root);
@@ -176,7 +178,7 @@ internal sealed class SelfTest
             [
                 "@echo off",
                 "if /I \"%~1\" == \"--list\" (",
-                "  if /I \"%~2\" == \"--format\" if /I \"%~3\" == \"terse\" if \"%~4\" == \"storage_mount\" (",
+                "  if /I \"%~2\" == \"--format=terse\" if \"%~3\" == \"storage_mount\" (",
                 "    echo alpha: test",
                 "    echo beta: test",
                 "    exit /b 0",
@@ -227,6 +229,48 @@ internal sealed class SelfTest
         }
 
         Console.WriteLine("[selftest] list, aggregate, and exact diagnostic argument sets had the same test set");
+    }
+
+    private static void StartupInfoLayout()
+    {
+        const int expectedSize = 104;
+#pragma warning disable CA1421
+        var actualSize = Marshal.SizeOf<NativeMethods.StartupInfoW>();
+        var actualOffsets = new Dictionary<string, int>
+        {
+            [nameof(NativeMethods.StartupInfoW.dwFlags)] = (int)Marshal.OffsetOf<NativeMethods.StartupInfoW>(
+                nameof(NativeMethods.StartupInfoW.dwFlags)),
+            [nameof(NativeMethods.StartupInfoW.hStdInput)] = (int)Marshal.OffsetOf<NativeMethods.StartupInfoW>(
+                nameof(NativeMethods.StartupInfoW.hStdInput)),
+            [nameof(NativeMethods.StartupInfoW.hStdOutput)] = (int)Marshal.OffsetOf<NativeMethods.StartupInfoW>(
+                nameof(NativeMethods.StartupInfoW.hStdOutput)),
+            [nameof(NativeMethods.StartupInfoW.hStdError)] = (int)Marshal.OffsetOf<NativeMethods.StartupInfoW>(
+                nameof(NativeMethods.StartupInfoW.hStdError)),
+        };
+#pragma warning restore CA1421
+        var expectedOffsets = new Dictionary<string, int>
+        {
+            [nameof(NativeMethods.StartupInfoW.dwFlags)] = 60,
+            [nameof(NativeMethods.StartupInfoW.hStdInput)] = 80,
+            [nameof(NativeMethods.StartupInfoW.hStdOutput)] = 88,
+            [nameof(NativeMethods.StartupInfoW.hStdError)] = 96,
+        };
+
+        if (actualSize != expectedSize)
+        {
+            throw new ControllerException($"STARTUPINFOW size changed: expected {expectedSize}, got {actualSize}");
+        }
+
+        foreach (var field in expectedOffsets)
+        {
+            if (actualOffsets[field.Key] != field.Value)
+            {
+                throw new ControllerException(
+                    $"STARTUPINFOW {field.Key} offset changed: expected {field.Value}, got {actualOffsets[field.Key]}");
+            }
+        }
+
+        Console.WriteLine("[selftest] STARTUPINFOW x64 layout matched the official size and critical offsets");
     }
 
     private static void ProviderSubstitutionRejection(string root)
