@@ -37,6 +37,14 @@ fn artifact(tag: u8) -> ValidatedArtifact {
     .unwrap()
 }
 
+fn runtime_receipt() -> astrid_package_service::RuntimeReceiptDigest {
+    astrid_package_service::RuntimeReceiptDigest::from_bytes(bytes(30))
+}
+
+fn drain_receipt() -> astrid_package_service::RuntimeReceiptDigest {
+    astrid_package_service::RuntimeReceiptDigest::from_bytes(bytes(31))
+}
+
 fn context(
     operation: Operation,
     nonce_value: u8,
@@ -66,6 +74,8 @@ fn context(
         ),
         expiry: 100,
         nonce: Nonce::from_bytes([nonce_value; 32]).unwrap(),
+        runtime_receipt: runtime_receipt(),
+        drain_receipt: drain_receipt(),
     })
     .unwrap()
 }
@@ -73,8 +83,12 @@ fn context(
 fn signature(context: &OperationContext) -> [u8; 64] {
     let issuer = astrid_package_service::AuthorityIssuerIdentity::from_bytes(bytes(6)).unwrap();
     let key = SigningKey::from_bytes(&bytes(7));
-    key.sign(&AuthenticatedAuthority::signing_payload(issuer, context))
-        .to_bytes()
+    key.sign(&AuthenticatedAuthority::signing_payload(
+        AuthorityClass::ExplicitApproval,
+        issuer,
+        context,
+    ))
+    .to_bytes()
 }
 
 fn authority(context: &OperationContext) -> AuthenticatedAuthority {
@@ -94,7 +108,7 @@ fn authority(context: &OperationContext) -> AuthenticatedAuthority {
 fn model() -> PackageServiceModel {
     PackageServiceModel::new(JournalPolicy::new(
         NonZeroUsize::new(8).unwrap(),
-        NonZeroU64::new(2_048).unwrap(),
+        NonZeroU64::new(4_096).unwrap(),
     ))
 }
 
@@ -133,7 +147,11 @@ fn authority_does_not_replay_across_any_changed_bound_field() {
     let issuer = astrid_package_service::AuthorityIssuerIdentity::from_bytes(bytes(6)).unwrap();
     let key = SigningKey::from_bytes(&bytes(7));
     let old_signature = key
-        .sign(&AuthenticatedAuthority::signing_payload(issuer, &original))
+        .sign(&AuthenticatedAuthority::signing_payload(
+            AuthorityClass::ExplicitApproval,
+            issuer,
+            &original,
+        ))
         .to_bytes();
     assert!(
         AuthenticatedAuthority::verify(
@@ -258,6 +276,8 @@ fn owner_slots_are_isolated_and_budget_is_enforced() {
         ),
         expiry: 100,
         nonce: Nonce::from_bytes([3; 32]).unwrap(),
+        runtime_receipt: runtime_receipt(),
+        drain_receipt: drain_receipt(),
     })
     .unwrap();
     assert_eq!(
@@ -284,13 +304,7 @@ fn nonce_cannot_replay_after_terminal_commit_history() {
         .begin(installed, &authority(&installed), 10)
         .unwrap();
     state_model.begin_work(&nonce, 20).unwrap();
-    state_model
-        .commit(
-            &nonce,
-            astrid_package_service::RuntimeReceiptDigest::from_bytes(bytes(30)),
-            30,
-        )
-        .unwrap();
+    state_model.commit(&nonce, runtime_receipt(), 30).unwrap();
     let replay = context(
         Operation::Install,
         1,
@@ -338,6 +352,8 @@ fn stale_expected_state_is_rejected() {
         ),
         expiry: 100,
         nonce: Nonce::from_bytes([2; 32]).unwrap(),
+        runtime_receipt: runtime_receipt(),
+        drain_receipt: drain_receipt(),
     })
     .unwrap();
     assert_eq!(
@@ -360,7 +376,11 @@ fn signature_mutation_fails_closed() {
     let issuer = astrid_package_service::AuthorityIssuerIdentity::from_bytes(bytes(6)).unwrap();
     let key = SigningKey::from_bytes(&bytes(7));
     let mut signature = key
-        .sign(&AuthenticatedAuthority::signing_payload(issuer, &context))
+        .sign(&AuthenticatedAuthority::signing_payload(
+            AuthorityClass::ExplicitApproval,
+            issuer,
+            &context,
+        ))
         .to_bytes();
     signature[0] ^= 1;
     assert!(
@@ -373,5 +393,138 @@ fn signature_mutation_fails_closed() {
             10,
         )
         .is_err()
+    );
+}
+
+#[test]
+fn exact_zero_expected_state_is_rejected_as_absence_collision() {
+    assert_eq!(
+        OperationContext::new(OperationContextSpec {
+            caller: principal(1),
+            approver: principal(2),
+            target_owner: OwnerId::Principal(bytes(8)),
+            service: service_identity(3),
+            service_generation: NonZeroU64::new(7).unwrap(),
+            operation: Operation::Update,
+            package: identity(4),
+            artifact: artifact(1),
+            expected: ExpectedPackageState::Exact(astrid_package_service::StateDigest::from_bytes(
+                [0; 32]
+            )),
+            plan: LifecyclePlan::ReplacementDrain { deadline: 90 },
+            budget: ResourceBudget::new(
+                astrid_package_service::BudgetIdentity::from_bytes(bytes(5)).unwrap(),
+                NonZeroU64::new(256).unwrap(),
+            ),
+            expiry: 100,
+            nonce: Nonce::from_bytes([9; 32]).unwrap(),
+            runtime_receipt: runtime_receipt(),
+            drain_receipt: drain_receipt(),
+        })
+        .unwrap_err(),
+        astrid_package_service::PackageServiceError::ZeroValue
+    );
+}
+
+#[test]
+fn authority_class_is_bound_to_the_signed_decision() {
+    let context = context(
+        Operation::Install,
+        1,
+        artifact(1),
+        ExpectedPackageState::Absent,
+        OwnerId::Principal(bytes(8)),
+    );
+    let issuer = astrid_package_service::AuthorityIssuerIdentity::from_bytes(bytes(6)).unwrap();
+    let key = SigningKey::from_bytes(&bytes(7));
+    let signature = key
+        .sign(&AuthenticatedAuthority::signing_payload(
+            AuthorityClass::ExplicitApproval,
+            issuer,
+            &context,
+        ))
+        .to_bytes();
+    assert!(
+        AuthenticatedAuthority::verify(
+            &context,
+            AuthorityClass::ExplicitApproval,
+            issuer,
+            key.verifying_key().to_bytes(),
+            signature,
+            10,
+        )
+        .is_ok()
+    );
+    assert!(
+        AuthenticatedAuthority::verify(
+            &context,
+            AuthorityClass::OperatorPolicy,
+            issuer,
+            key.verifying_key().to_bytes(),
+            signature,
+            10,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn plan_operation_conflict_has_a_named_public_transition_failure() {
+    assert_eq!(
+        OperationContext::new(OperationContextSpec {
+            caller: principal(1),
+            approver: principal(2),
+            target_owner: OwnerId::Principal(bytes(8)),
+            service: service_identity(3),
+            service_generation: NonZeroU64::new(7).unwrap(),
+            operation: Operation::Install,
+            package: identity(4),
+            artifact: artifact(1),
+            expected: ExpectedPackageState::Absent,
+            plan: LifecyclePlan::ReplacementDrain { deadline: 90 },
+            budget: ResourceBudget::new(
+                astrid_package_service::BudgetIdentity::from_bytes(bytes(5)).unwrap(),
+                NonZeroU64::new(256).unwrap(),
+            ),
+            expiry: 100,
+            nonce: Nonce::from_bytes([10; 32]).unwrap(),
+            runtime_receipt: runtime_receipt(),
+            drain_receipt: drain_receipt(),
+        })
+        .unwrap_err(),
+        astrid_package_service::PackageServiceError::PlanConflict
+    );
+}
+
+#[test]
+fn terminal_replay_protection_expires_with_quota_eviction() {
+    let first_owner = OwnerId::Principal(bytes(8));
+    let second_owner = OwnerId::Principal(bytes(9));
+    let first = context(
+        Operation::Install,
+        1,
+        artifact(1),
+        ExpectedPackageState::Absent,
+        first_owner,
+    );
+    let second = context(
+        Operation::Install,
+        2,
+        artifact(1),
+        ExpectedPackageState::Absent,
+        second_owner,
+    );
+    let mut state_model = PackageServiceModel::new(JournalPolicy::new(
+        NonZeroUsize::new(1).unwrap(),
+        NonZeroU64::new(4_096).unwrap(),
+    ));
+    let nonce = state_model.begin(first, &authority(&first), 10).unwrap();
+    state_model.begin_work(&nonce, 20).unwrap();
+    state_model.commit(&nonce, runtime_receipt(), 30).unwrap();
+    state_model.begin(second, &authority(&second), 40).unwrap();
+    assert!(state_model.record(&nonce).is_none());
+    assert_eq!(
+        state_model.replay(&nonce).unwrap_err(),
+        astrid_package_service::PackageServiceError::RecordUnavailable
     );
 }

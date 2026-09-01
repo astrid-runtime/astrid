@@ -38,7 +38,11 @@ fn authority(context: &OperationContext) -> AuthenticatedAuthority {
     let issuer = AuthorityIssuerIdentity::from_bytes(bytes(30)).unwrap();
     let key = SigningKey::from_bytes(&bytes(31));
     let signature = key
-        .sign(&AuthenticatedAuthority::signing_payload(issuer, context))
+        .sign(&AuthenticatedAuthority::signing_payload(
+            AuthorityClass::ExplicitApproval,
+            issuer,
+            context,
+        ))
         .to_bytes();
     AuthenticatedAuthority::verify(
         context,
@@ -51,7 +55,27 @@ fn authority(context: &OperationContext) -> AuthenticatedAuthority {
     .unwrap()
 }
 
-#[allow(clippy::too_many_arguments)]
+fn alternate_authority(context: &OperationContext) -> AuthenticatedAuthority {
+    let issuer = AuthorityIssuerIdentity::from_bytes(bytes(32)).unwrap();
+    let key = SigningKey::from_bytes(&bytes(33));
+    let signature = key
+        .sign(&AuthenticatedAuthority::signing_payload(
+            AuthorityClass::ExplicitApproval,
+            issuer,
+            context,
+        ))
+        .to_bytes();
+    AuthenticatedAuthority::verify(
+        context,
+        AuthorityClass::ExplicitApproval,
+        issuer,
+        key.verifying_key().to_bytes(),
+        signature,
+        10,
+    )
+    .unwrap()
+}
+
 fn context(
     nonce: u8,
     operation: Operation,
@@ -60,7 +84,8 @@ fn context(
     deadline: u64,
 ) -> OperationContext {
     let plan = match operation {
-        Operation::Install | Operation::Activate | Operation::Deactivate => LifecyclePlan::Activate,
+        Operation::Install | Operation::Activate => LifecyclePlan::Activate,
+        Operation::Deactivate => LifecyclePlan::Deactivate,
         Operation::Update => LifecyclePlan::ReplacementDrain { deadline },
         Operation::Remove => LifecyclePlan::RemovalDrain { deadline },
     };
@@ -81,6 +106,8 @@ fn context(
         ),
         expiry: 100,
         nonce: Nonce::from_bytes([nonce; 32]).unwrap(),
+        runtime_receipt: RuntimeReceiptDigest::from_bytes(bytes(90)),
+        drain_receipt: RuntimeReceiptDigest::from_bytes(bytes(91)),
     })
     .unwrap()
 }
@@ -88,7 +115,7 @@ fn context(
 fn model(records: usize) -> PackageServiceModel {
     PackageServiceModel::new(JournalPolicy::new(
         NonZeroUsize::new(records).unwrap(),
-        NonZeroU64::new(4_096).unwrap(),
+        NonZeroU64::new(8_192).unwrap(),
     ))
 }
 
@@ -133,11 +160,8 @@ fn begin_update(
 }
 
 fn proof(nonce: u8, count: u8) -> DrainProof {
-    let mut receipt = [0_u8; 32];
-    receipt[0] = nonce;
-    receipt[1] = count;
-    receipt[2] = 8;
-    DrainProof::new(RuntimeReceiptDigest::from_bytes(receipt), 80)
+    let _ = (nonce, count);
+    DrainProof::new(RuntimeReceiptDigest::from_bytes(bytes(91)), 80)
 }
 
 fn owner_slot() -> astrid_package_service::PackageSlot {
@@ -160,7 +184,7 @@ fn full_lifecycle_and_reinstall_preserve_absent_then_monotonic_generations() {
     let (update, _) = begin_update(&mut state_model, 2, 2, installed_digest);
     state_model.prove_drain(&update, proof(2, 1), 80).unwrap();
     state_model
-        .commit(&update, RuntimeReceiptDigest::from_bytes(bytes(91)), 80)
+        .commit(&update, RuntimeReceiptDigest::from_bytes(bytes(90)), 80)
         .unwrap();
     let replacement = state_model.slot(&slot).unwrap().current().unwrap();
     assert_eq!(replacement.artifact(), &artifact(2));
@@ -180,7 +204,7 @@ fn full_lifecycle_and_reinstall_preserve_absent_then_monotonic_generations() {
     state_model
         .commit(
             &activate_nonce,
-            RuntimeReceiptDigest::from_bytes(bytes(92)),
+            RuntimeReceiptDigest::from_bytes(bytes(90)),
             30,
         )
         .unwrap();
@@ -208,7 +232,7 @@ fn full_lifecycle_and_reinstall_preserve_absent_then_monotonic_generations() {
     state_model
         .commit(
             &deactivate_nonce,
-            RuntimeReceiptDigest::from_bytes(bytes(93)),
+            RuntimeReceiptDigest::from_bytes(bytes(90)),
             30,
         )
         .unwrap();
@@ -229,7 +253,7 @@ fn full_lifecycle_and_reinstall_preserve_absent_then_monotonic_generations() {
     let receipt = state_model
         .commit(
             &remove_nonce,
-            RuntimeReceiptDigest::from_bytes(bytes(94)),
+            RuntimeReceiptDigest::from_bytes(bytes(90)),
             80,
         )
         .unwrap();
@@ -271,11 +295,12 @@ fn drain_expiry_after_zero_one_and_many_proofs_restores_exact_successor() {
                 .unwrap();
         }
         let boundary = u64::from(proof_count).saturating_add(1);
-        assert_eq!(state_model.expire(&update, 91).unwrap(), boundary);
+        let successor = boundary + 1;
+        assert_eq!(state_model.expire(&update, 91).unwrap(), successor);
         let restored = state_model.slot(&owner_slot()).unwrap().current().unwrap();
         assert_eq!(restored.artifact(), &artifact(1));
-        assert_eq!(restored.generation(), boundary);
-        assert_eq!(state_model.high_watermark(&owner_slot()), Some(boundary));
+        assert_eq!(restored.generation(), successor);
+        assert_eq!(state_model.high_watermark(&owner_slot()), Some(successor));
         assert_eq!(state_model.replay(&update), Ok(ReplayOutcome::Expired));
         assert!(
             state_model
@@ -284,7 +309,7 @@ fn drain_expiry_after_zero_one_and_many_proofs_restores_exact_successor() {
         );
         assert!(
             state_model
-                .commit(&update, RuntimeReceiptDigest::from_bytes(bytes(91)), 92)
+                .commit(&update, RuntimeReceiptDigest::from_bytes(bytes(90)), 92)
                 .is_err()
         );
     }
@@ -309,7 +334,7 @@ fn late_drain_proof_and_completion_fail_after_authoritative_deadline() {
     );
     assert_eq!(
         state_model
-            .commit(&update, RuntimeReceiptDigest::from_bytes(bytes(91)), 91)
+            .commit(&update, RuntimeReceiptDigest::from_bytes(bytes(90)), 91)
             .unwrap_err(),
         PackageServiceError::InvalidDrain
     );
@@ -335,8 +360,8 @@ fn unknown_remove_without_zero_lease_lineage_cannot_become_absent() {
     state_model.report_unknown(&nonce, 30).unwrap();
     let evidence = RecoveryEvidence::new(
         before_digest,
-        true,
-        RuntimeReceiptDigest::from_bytes(bytes(70)),
+        false,
+        RuntimeReceiptDigest::from_bytes(bytes(91)),
     );
     assert_eq!(
         state_model
@@ -345,7 +370,11 @@ fn unknown_remove_without_zero_lease_lineage_cannot_become_absent() {
         None
     );
     assert!(state_model.slot(&owner_slot()).unwrap().current().is_some());
-    assert_eq!(state_model.expire(&nonce, 91).unwrap(), 1);
+    assert_eq!(
+        state_model.record(&nonce).unwrap().status(),
+        JournalStatus::Expired
+    );
+    assert_eq!(state_model.replay(&nonce), Ok(ReplayOutcome::Expired));
 }
 
 #[test]
@@ -359,7 +388,7 @@ fn unknown_recovery_cannot_infer_success_from_mid_drain_observation() {
     let evidence = RecoveryEvidence::new(
         before_digest,
         false,
-        RuntimeReceiptDigest::from_bytes(bytes(70)),
+        RuntimeReceiptDigest::from_bytes(bytes(91)),
     );
     assert_eq!(
         state_model
@@ -369,13 +398,13 @@ fn unknown_recovery_cannot_infer_success_from_mid_drain_observation() {
     );
     assert_eq!(
         state_model.record(&update).unwrap().status(),
-        JournalStatus::Unknown
+        JournalStatus::Expired
     );
     assert!(state_model.slot(&owner_slot()).unwrap().current().is_some());
 }
 
 #[test]
-fn recorded_zero_lease_proof_completes_unknown_removal() {
+fn unknown_remove_recovery_terminates_after_recorded_proof() {
     let mut state_model = model(8);
     install(&mut state_model, 1, 1);
     let before = state_model.slot(&owner_slot()).unwrap().current().unwrap();
@@ -396,17 +425,22 @@ fn recorded_zero_lease_proof_completes_unknown_removal() {
     let evidence = RecoveryEvidence::new(
         before_digest,
         true,
-        RuntimeReceiptDigest::from_bytes(bytes(70)),
+        RuntimeReceiptDigest::from_bytes(bytes(91)),
     );
-    assert!(
+    assert_eq!(
         state_model
             .recover(&nonce, &authenticated, evidence, 40)
-            .unwrap()
-            .is_some()
+            .unwrap(),
+        None
     );
-    assert!(state_model.slot(&owner_slot()).unwrap().current().is_none());
+    assert!(state_model.slot(&owner_slot()).unwrap().current().is_some());
+    assert_eq!(
+        state_model.record(&nonce).unwrap().status(),
+        JournalStatus::Expired
+    );
+    assert_eq!(state_model.replay(&nonce), Ok(ReplayOutcome::Expired));
+    assert_eq!(state_model.high_watermark(&owner_slot()), Some(3));
 }
-
 #[test]
 fn cancel_before_drain_but_not_after_boundary() {
     let mut state_model = model(8);
@@ -490,6 +524,8 @@ fn explicit_unknown_is_retained_when_history_is_full() {
         ),
         expiry: 100,
         nonce: Nonce::from_bytes([3; 32]).unwrap(),
+        runtime_receipt: RuntimeReceiptDigest::from_bytes(bytes(90)),
+        drain_receipt: RuntimeReceiptDigest::from_bytes(bytes(91)),
     })
     .unwrap();
     assert_eq!(
@@ -516,6 +552,212 @@ fn terminal_replay_reports_expired_nonce() {
     let (update, _) = begin_update(&mut state_model, 2, 2, before);
     state_model.expire(&update, 91).unwrap();
     assert_eq!(state_model.replay(&update), Ok(ReplayOutcome::Expired));
+}
+
+#[test]
+fn fresh_install_budget_is_enforced_before_first_slot_admission() {
+    let mut state_model = model(8);
+    let context = OperationContext::new(OperationContextSpec {
+        caller: principal(1),
+        approver: principal(2),
+        target_owner: OwnerId::Principal(bytes(11)),
+        service: ServiceIdentity::from_bytes(bytes(12)).unwrap(),
+        service_generation: NonZeroU64::new(5).unwrap(),
+        operation: Operation::Install,
+        package: package(),
+        artifact: artifact(1),
+        expected: ExpectedPackageState::Absent,
+        plan: LifecyclePlan::Activate,
+        budget: astrid_package_service::ResourceBudget::new(
+            BudgetIdentity::from_bytes(bytes(13)).unwrap(),
+            NonZeroU64::new(64).unwrap(),
+        ),
+        expiry: 100,
+        nonce: Nonce::from_bytes([9; 32]).unwrap(),
+        runtime_receipt: RuntimeReceiptDigest::from_bytes(bytes(90)),
+        drain_receipt: RuntimeReceiptDigest::from_bytes(bytes(91)),
+    })
+    .unwrap();
+    assert_eq!(
+        state_model
+            .begin(context, &authority(&context), 10)
+            .unwrap_err(),
+        PackageServiceError::BudgetExceeded
+    );
+    assert!(state_model.record(context.nonce()).is_none());
+    assert!(state_model.slot(&owner_slot()).is_none());
+}
+
+#[test]
+fn stale_authority_admission_fails_without_durable_nonce() {
+    let mut state_model = model(8);
+    let context = context(
+        9,
+        Operation::Install,
+        artifact(1),
+        ExpectedPackageState::Absent,
+        0,
+    );
+    let authenticated = authority(&context);
+    assert_eq!(
+        state_model.begin(context, &authenticated, 100).unwrap_err(),
+        PackageServiceError::AuthorityExpired
+    );
+    assert!(state_model.record(context.nonce()).is_none());
+    assert!(state_model.slot(&owner_slot()).is_none());
+}
+
+#[test]
+fn admitted_authority_bounds_follow_on_cancel_and_recovery() {
+    let mut state_model = model(8);
+    install(&mut state_model, 1, 1);
+    let before = state_model
+        .slot(&owner_slot())
+        .unwrap()
+        .current()
+        .unwrap()
+        .digest();
+    let (update, admitted) = begin_update(&mut state_model, 2, 2, before);
+    let other = alternate_authority(state_model.record(&update).unwrap().context());
+    assert_eq!(
+        state_model.cancel(&update, &other, 30).unwrap_err(),
+        PackageServiceError::AuthorityMismatch
+    );
+    state_model.report_unknown(&update, 30).unwrap();
+    let evidence =
+        RecoveryEvidence::new(before, false, RuntimeReceiptDigest::from_bytes(bytes(91)));
+    assert_eq!(
+        state_model
+            .recover(&update, &other, evidence, 40)
+            .unwrap_err(),
+        PackageServiceError::AuthorityMismatch
+    );
+    assert_eq!(
+        state_model
+            .recover(&update, &admitted, evidence, 40)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        state_model.record(&update).unwrap().status(),
+        JournalStatus::Expired
+    );
+}
+
+#[test]
+fn drain_proofs_bind_exact_receipt_and_consult_proof_time() {
+    let mut state_model = model(8);
+    install(&mut state_model, 1, 1);
+    let before = state_model
+        .slot(&owner_slot())
+        .unwrap()
+        .current()
+        .unwrap()
+        .digest();
+    let (update, _) = begin_update(&mut state_model, 2, 2, before);
+    assert_eq!(
+        state_model
+            .prove_drain(
+                &update,
+                DrainProof::new(RuntimeReceiptDigest::from_bytes(bytes(92)), 80),
+                80
+            )
+            .unwrap_err(),
+        PackageServiceError::InvalidDrain
+    );
+    assert_eq!(
+        state_model
+            .prove_drain(
+                &update,
+                DrainProof::new(RuntimeReceiptDigest::from_bytes(bytes(91)), 90),
+                80
+            )
+            .unwrap_err(),
+        PackageServiceError::InvalidDrain
+    );
+    state_model.prove_drain(&update, proof(2, 1), 80).unwrap();
+    let receipt = state_model
+        .commit(&update, RuntimeReceiptDigest::from_bytes(bytes(90)), 80)
+        .unwrap();
+    assert_eq!(
+        receipt.runtime_receipt(),
+        &RuntimeReceiptDigest::from_bytes(bytes(90))
+    );
+}
+
+#[test]
+fn active_drain_expiry_restores_an_inactive_exact_successor() {
+    let mut state_model = model(8);
+    install(&mut state_model, 1, 1);
+    let installed = state_model.slot(&owner_slot()).unwrap().current().unwrap();
+    let activate = context(
+        2,
+        Operation::Activate,
+        artifact(1),
+        ExpectedPackageState::Exact(installed.digest()),
+        0,
+    );
+    let nonce = state_model
+        .begin(activate, &authority(&activate), 10)
+        .unwrap();
+    state_model.begin_work(&nonce, 20).unwrap();
+    state_model
+        .commit(&nonce, RuntimeReceiptDigest::from_bytes(bytes(90)), 30)
+        .unwrap();
+    let active = state_model.slot(&owner_slot()).unwrap().current().unwrap();
+    let active_digest = active.digest();
+    let (update, _) = begin_update(&mut state_model, 3, 2, active_digest);
+    state_model.prove_drain(&update, proof(3, 1), 80).unwrap();
+    assert_eq!(state_model.expire(&update, 91).unwrap(), 3);
+    let restored = state_model.slot(&owner_slot()).unwrap().current().unwrap();
+    assert_eq!(restored.artifact(), &artifact(1));
+    assert_eq!(restored.generation(), 3);
+    assert_eq!(
+        restored.lifecycle(),
+        astrid_package_service::LifecycleState::Inactive
+    );
+}
+
+#[test]
+fn old_state_recovery_restores_exact_successor_after_zero_one_and_many_proofs() {
+    for proof_count in [0_u8, 1, 3] {
+        let mut state_model = model(8);
+        install(&mut state_model, 1, 1);
+        let before = state_model
+            .slot(&owner_slot())
+            .unwrap()
+            .current()
+            .unwrap()
+            .digest();
+        let (update, admitted) = begin_update(&mut state_model, 2, 2, before);
+        for count in 0..proof_count {
+            state_model
+                .prove_drain(&update, proof(2, count), 80)
+                .unwrap();
+        }
+        state_model.report_unknown(&update, 30).unwrap();
+        let evidence = RecoveryEvidence::new(
+            before,
+            proof_count > 0,
+            RuntimeReceiptDigest::from_bytes(bytes(91)),
+        );
+        assert_eq!(
+            state_model
+                .recover(&update, &admitted, evidence, 40)
+                .unwrap(),
+            None
+        );
+        let boundary = u64::from(proof_count) + 2;
+        let restored = state_model.slot(&owner_slot()).unwrap().current().unwrap();
+        assert_eq!(restored.artifact(), &artifact(1));
+        assert_eq!(restored.generation(), boundary);
+        assert_eq!(
+            restored.lifecycle(),
+            astrid_package_service::LifecycleState::Inactive
+        );
+        assert_eq!(state_model.high_watermark(&owner_slot()), Some(boundary));
+        assert_eq!(state_model.replay(&update), Ok(ReplayOutcome::Expired));
+    }
 }
 
 #[test]

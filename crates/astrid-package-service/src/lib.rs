@@ -1,9 +1,9 @@
 //! Private registry-neutral package-service contract and pure state model.
 //!
-//! This crate deliberately contains no transport, package parsing, durable
-//! storage engine, daemon, kernel, installer, or Station authority. A host
-//! persists its canonical values; this model defines the transition and
-//! replay law applied to those values.
+//! This crate deliberately contains no transport, parsing, durable storage
+//! engine, execution wiring, or external authority mapping. A host persists
+//! its canonical values; this model defines the transition and replay law
+//! applied to those values.
 
 #![deny(unsafe_code)]
 #![deny(missing_docs)]

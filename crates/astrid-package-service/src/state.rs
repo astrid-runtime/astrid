@@ -4,7 +4,7 @@ use crate::context::{ExpectedPackageState, Operation};
 use crate::digest::{AuthorityDigest, DigestWriter, PlanDigest, ProvenanceDigest, StateDigest};
 use crate::error::{PackageServiceError, PackageServiceResult};
 use crate::identity::{Nonce, PROTOCOL_VERSION, PackageObject, ValidatedArtifact};
-use astrid_resource_types::OwnerId;
+use astrid_resource_types::{CanonicalEncode, OwnerId};
 use core::num::NonZeroU64;
 
 /// Runtime publication state of exact installed content.
@@ -70,6 +70,7 @@ impl CanonicalInstalledState {
         if owner == OwnerId::System || !authority.is_present() || plan.as_bytes() == &[0; 32] {
             return Err(PackageServiceError::ZeroValue);
         }
+        let owner_bytes = canonical_owner_bytes(owner)?;
         let mut value = Self {
             owner,
             package,
@@ -82,24 +83,14 @@ impl CanonicalInstalledState {
             digest: StateDigest::from_bytes([0; 32]),
         };
         let mut writer = DigestWriter::new();
-        value.write(&mut writer);
+        value.write(&mut writer, &owner_bytes);
         value.digest = writer.finish("astrid.package.state.v1");
         Ok(value)
     }
 
-    fn write(&self, writer: &mut DigestWriter) {
+    fn write(&self, writer: &mut DigestWriter, owner_bytes: &[u8; 36]) {
         writer.u64(u64::from(PROTOCOL_VERSION));
-        match self.owner {
-            OwnerId::System => writer.bytes(&[0_u8; 36]),
-            OwnerId::Principal(bytes) => {
-                writer.tag(1);
-                writer.bytes(&bytes);
-            },
-            OwnerId::Fleet(bytes) => {
-                writer.tag(2);
-                writer.bytes(&bytes);
-            },
-        }
+        writer.bytes(owner_bytes);
         writer.bytes(self.package.as_bytes());
         writer.bytes(self.artifact.artifact().as_bytes());
         writer.bytes(self.artifact.manifest().as_bytes());
@@ -177,6 +168,34 @@ impl CanonicalInstalledState {
             completing_nonce: self.completing_nonce,
         })
     }
+
+    pub(crate) fn restore_successor(&self, generation: NonZeroU64) -> PackageServiceResult<Self> {
+        Self::new(InstalledStateSpec {
+            lifecycle: LifecycleState::Inactive,
+            ..self.with_generation(generation)?.spec()
+        })
+    }
+
+    pub(crate) const fn spec(&self) -> InstalledStateSpec {
+        InstalledStateSpec {
+            owner: self.owner,
+            package: self.package,
+            artifact: self.artifact,
+            authority: self.authority,
+            lifecycle: self.lifecycle,
+            plan: self.plan,
+            generation: self.generation,
+            completing_nonce: self.completing_nonce,
+        }
+    }
+}
+
+fn canonical_owner_bytes(owner: OwnerId) -> PackageServiceResult<[u8; 36]> {
+    let mut encoded = [0_u8; OwnerId::ENCODED_LEN];
+    owner
+        .encode_canonical(&mut encoded)
+        .map_err(|_| PackageServiceError::ZeroValue)?;
+    Ok(encoded)
 }
 
 /// Exact prior content and monotonic boundary retained during a drain.
@@ -332,10 +351,17 @@ impl SlotRecord {
             return Err(PackageServiceError::InvalidDrain);
         };
         let boundary = lineage.boundary();
-        self.current = Some(lineage.base().with_generation(boundary)?);
-        self.high_watermark = boundary.get();
+        let successor = NonZeroU64::try_from(
+            boundary
+                .get()
+                .checked_add(1)
+                .ok_or(PackageServiceError::GenerationExhausted)?,
+        )
+        .map_err(|_| PackageServiceError::GenerationExhausted)?;
+        self.current = Some(lineage.base().restore_successor(successor)?);
+        self.high_watermark = successor.get();
         self.drain = None;
-        Ok(boundary)
+        Ok(successor)
     }
 
     pub(crate) fn matches_expected(&self, expected: &ExpectedPackageState) -> bool {

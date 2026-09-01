@@ -10,10 +10,12 @@ use crate::journal::{
 };
 use crate::state::{LifecycleState, PackageSlot, SlotRecord, valid_transition};
 use std::collections::{BTreeMap, VecDeque};
+use std::mem::size_of;
 use std::num::{NonZeroU64, NonZeroUsize};
 
-/// Fixed conservative durable-record accounting unit.
-const RECORD_BYTES: u64 = 256;
+/// Conservative per-record accounting for both durable maps plus node headroom.
+const RECORD_BYTES: u64 =
+    (size_of::<OperationRecord>() + size_of::<PackageSlot>() + size_of::<Nonce>() + 256) as u64;
 
 /// Bounded durable history policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,6 +83,10 @@ impl PackageServiceModel {
     /// # Errors
     /// Returns all authority, stale-state, binding, replay, and quota failures
     /// before inserting durable state.
+    ///
+    /// At-most-once detection is bounded by the retained receipt history.
+    /// Once a terminal record is quota-evicted, this model cannot recognize
+    /// its nonce again.
     pub fn begin(
         &mut self,
         context: OperationContext,
@@ -88,6 +94,9 @@ impl PackageServiceModel {
         now: u64,
     ) -> PackageServiceResult<Nonce> {
         authority.verify_context(context)?;
+        if now >= context.expiry() {
+            return Err(PackageServiceError::AuthorityExpired);
+        }
         let slot = PackageSlot::new(context.target_owner(), *context.package());
         if self.record_slots.contains_key(context.nonce()) {
             return Err(PackageServiceError::NonceReplay);
@@ -105,9 +114,7 @@ impl PackageServiceModel {
         if record.is_some_and(SlotRecord::draining) {
             return Err(PackageServiceError::InvalidDrain);
         }
-        if let Some(record) = record {
-            Self::validate_bindings(&context, record)?;
-        }
+        Self::validate_plan_bindings(&context, record)?;
         if self.record_slots.iter().any(|(nonce, owned)| {
             *owned == slot
                 && self
@@ -133,11 +140,11 @@ impl PackageServiceModel {
         Ok(nonce)
     }
 
-    fn validate_bindings(
+    fn validate_plan_bindings(
         context: &OperationContext,
-        record: &SlotRecord,
+        record: Option<&SlotRecord>,
     ) -> PackageServiceResult<()> {
-        let current = record.current();
+        let current = record.and_then(SlotRecord::current);
         match context.operation() {
             Operation::Install | Operation::Update => {
                 if context.artifact().artifact_size() > context.budget().maximum_artifact_bytes() {
@@ -299,6 +306,13 @@ impl PackageServiceModel {
     ) -> PackageServiceResult<()> {
         let context = self.context(nonce)?;
         authority.verify_context(context)?;
+        if self
+            .records
+            .get(nonce)
+            .is_some_and(|record| record.authority() != authority.digest())
+        {
+            return Err(PackageServiceError::AuthorityMismatch);
+        }
         if now >= context.expiry() {
             return Err(PackageServiceError::AuthorityExpired);
         }
@@ -364,6 +378,13 @@ impl PackageServiceModel {
     ) -> PackageServiceResult<Option<OperationReceipt>> {
         let context = self.context(nonce)?;
         authority.verify_context(context)?;
+        if self
+            .records
+            .get(nonce)
+            .is_some_and(|record| record.authority() != authority.digest())
+        {
+            return Err(PackageServiceError::AuthorityMismatch);
+        }
         let mut record = self
             .records
             .remove(nonce)
@@ -376,7 +397,9 @@ impl PackageServiceModel {
     /// Replays only durable terminal semantics.
     ///
     /// # Errors
-    /// Returns [`PackageServiceError::RecordUnavailable`] for an unknown nonce.
+    /// Returns [`PackageServiceError::RecordUnavailable`] for an unknown or
+    /// quota-evicted nonce. Replay protection lasts only as long as its
+    /// retained record.
     pub fn replay(&self, nonce: &Nonce) -> PackageServiceResult<ReplayOutcome> {
         self.records
             .get(nonce)

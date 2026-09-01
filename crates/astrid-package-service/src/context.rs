@@ -1,12 +1,14 @@
 //! Exact authority-bound operation contexts and lifecycle plans.
 
-use crate::digest::{BudgetDigest, ContextDigest, DigestWriter, PlanDigest, StateDigest};
+use crate::digest::{
+    BudgetDigest, ContextDigest, DigestWriter, PlanDigest, RuntimeReceiptDigest, StateDigest,
+};
 use crate::error::{PackageServiceError, PackageServiceResult};
 use crate::identity::{
     BudgetIdentity, Nonce, PROTOCOL_VERSION, PackageObject, ServiceIdentity, ValidatedArtifact,
 };
 use astrid_core::PrincipalUid;
-use astrid_resource_types::OwnerId;
+use astrid_resource_types::{CanonicalEncode, OwnerId};
 use core::num::NonZeroU64;
 
 /// Closed private package lifecycle operation vocabulary.
@@ -52,11 +54,13 @@ impl ExpectedPackageState {
     #[must_use]
     pub const fn digest(&self) -> StateDigest {
         match self {
-            Self::Absent => StateDigest::from_bytes([0; 32]),
+            Self::Absent => ABSENT_STATE_DIGEST,
             Self::Exact(digest) => *digest,
         }
     }
 }
+
+const ABSENT_STATE_DIGEST: StateDigest = StateDigest::from_bytes([0; 32]);
 
 /// Authoritative lifecycle plan bound by an operation context.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -175,6 +179,10 @@ pub struct OperationContextSpec {
     pub expiry: u64,
     /// Unique operation nonce.
     pub nonce: Nonce,
+    /// Exact runtime receipt admitted for a successful operation.
+    pub runtime_receipt: RuntimeReceiptDigest,
+    /// Exact runtime receipt admitted for zero-lease drain proof.
+    pub drain_receipt: RuntimeReceiptDigest,
 }
 
 /// Complete immutable input authenticated by an authority decision.
@@ -194,6 +202,8 @@ pub struct OperationContext {
     budget: ResourceBudget,
     expiry: u64,
     nonce: Nonce,
+    runtime_receipt: RuntimeReceiptDigest,
+    drain_receipt: RuntimeReceiptDigest,
     digest: ContextDigest,
 }
 
@@ -218,7 +228,10 @@ impl OperationContext {
             budget,
             expiry,
             nonce,
+            runtime_receipt,
+            drain_receipt,
         } = spec;
+        let target_owner_bytes = Self::owner_id_bytes(target_owner)?;
         if caller.as_bytes() == &[0; 32]
             || approver.as_bytes() == &[0; 32]
             || target_owner == OwnerId::System
@@ -241,19 +254,28 @@ impl OperationContext {
             budget,
             expiry,
             nonce,
+            runtime_receipt,
+            drain_receipt,
             digest: ContextDigest::from_bytes([0; 32]),
         };
+        if !runtime_receipt.is_present() || !drain_receipt.is_present() {
+            return Err(PackageServiceError::ZeroValue);
+        }
+        if matches!(expected, ExpectedPackageState::Exact(digest) if !digest.is_present()) {
+            return Err(PackageServiceError::ZeroValue);
+        }
+        Self::validate_plan(operation, &plan)?;
         let mut writer = DigestWriter::new();
-        value.write(&mut writer);
+        value.write(&mut writer, &target_owner_bytes);
         value.digest = writer.finish("astrid.package.context.v1");
         Ok(value)
     }
 
-    fn write(&self, writer: &mut DigestWriter) {
+    fn write(&self, writer: &mut DigestWriter, target_owner_bytes: &[u8; 36]) {
         writer.u64(u64::from(PROTOCOL_VERSION));
         writer.bytes(self.caller.as_bytes());
         writer.bytes(self.approver.as_bytes());
-        writer.bytes(&self.target_owner_id_bytes());
+        writer.bytes(target_owner_bytes);
         writer.bytes(self.service.as_bytes());
         writer.u64(self.service_generation.get());
         writer.tag(self.operation.tag());
@@ -268,28 +290,30 @@ impl OperationContext {
         writer.digest(&self.budget.digest());
         writer.u64(self.expiry);
         writer.bytes(self.nonce.as_bytes());
+        writer.digest(&self.runtime_receipt);
+        writer.digest(&self.drain_receipt);
     }
 
-    fn target_owner_id_bytes(&self) -> [u8; 36] {
-        match self.target_owner {
-            OwnerId::System => {
-                let mut bytes = [0_u8; 36];
-                bytes[3] = 1;
-                bytes
-            },
-            OwnerId::Principal(bytes) => {
-                let mut encoded = [0_u8; 36];
-                encoded[3] = 2;
-                encoded[4..].copy_from_slice(&bytes);
-                encoded
-            },
-            OwnerId::Fleet(bytes) => {
-                let mut encoded = [0_u8; 36];
-                encoded[3] = 3;
-                encoded[4..].copy_from_slice(&bytes);
-                encoded
-            },
+    fn validate_plan(operation: Operation, plan: &LifecyclePlan) -> PackageServiceResult<()> {
+        let authorized = match operation {
+            Operation::Install | Operation::Activate => matches!(plan, LifecyclePlan::Activate),
+            Operation::Deactivate => matches!(plan, LifecyclePlan::Deactivate),
+            Operation::Update => matches!(plan, LifecyclePlan::ReplacementDrain { .. }),
+            Operation::Remove => matches!(plan, LifecyclePlan::RemovalDrain { .. }),
+        };
+        if authorized {
+            Ok(())
+        } else {
+            Err(PackageServiceError::PlanConflict)
         }
+    }
+
+    fn owner_id_bytes(owner: OwnerId) -> PackageServiceResult<[u8; 36]> {
+        let mut encoded = [0_u8; OwnerId::ENCODED_LEN];
+        owner
+            .encode_canonical(&mut encoded)
+            .map_err(|_| PackageServiceError::ZeroValue)?;
+        Ok(encoded)
     }
 
     /// Returns the canonical digest signed by authority.
@@ -380,5 +404,17 @@ impl OperationContext {
     #[must_use]
     pub const fn nonce(&self) -> &Nonce {
         &self.nonce
+    }
+
+    /// Returns the exact runtime receipt required by a successful commit.
+    #[must_use]
+    pub const fn runtime_receipt(&self) -> &RuntimeReceiptDigest {
+        &self.runtime_receipt
+    }
+
+    /// Returns the exact runtime receipt required by every drain proof.
+    #[must_use]
+    pub const fn drain_receipt(&self) -> &RuntimeReceiptDigest {
+        &self.drain_receipt
     }
 }

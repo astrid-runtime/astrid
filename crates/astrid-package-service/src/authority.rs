@@ -28,6 +28,10 @@ pub struct AuthenticatedAuthority {
 impl AuthenticatedAuthority {
     /// Verifies an Ed25519 decision over the exact canonical context.
     ///
+    /// Mapping an issuer identity to a verifying key is an explicit external
+    /// admission invariant; this model verifies only the signed decision and
+    /// does not derive trust for any authority class.
+    ///
     /// # Errors
     /// Returns expiry, malformed-key, signature, or binding failures without
     /// producing an authority value.
@@ -45,7 +49,7 @@ impl AuthenticatedAuthority {
         let key = VerifyingKey::from_bytes(&verifying_key)
             .map_err(|_| PackageServiceError::InvalidAuthoritySignature)?;
         let signature = Signature::from_bytes(&signature);
-        let message = Self::message(issuer, context.digest());
+        let message = Self::message(class, issuer, context.digest());
         key.verify(&message, &signature)
             .map_err(|_| PackageServiceError::InvalidAuthoritySignature)?;
         let digest = Self::compute_digest(class, issuer, verifying_key, context.digest());
@@ -63,13 +67,25 @@ impl AuthenticatedAuthority {
     /// This public derivation lets an external or internal authority boundary
     /// sign the same canonical payload this model verifies.
     #[must_use]
-    pub fn signing_payload(issuer: AuthorityIssuerIdentity, context: &OperationContext) -> Vec<u8> {
-        Self::message(issuer, context.digest())
+    pub fn signing_payload(
+        class: AuthorityClass,
+        issuer: AuthorityIssuerIdentity,
+        context: &OperationContext,
+    ) -> Vec<u8> {
+        Self::message(class, issuer, context.digest())
     }
 
-    fn message(issuer: AuthorityIssuerIdentity, context: &ContextDigest) -> Vec<u8> {
+    fn message(
+        class: AuthorityClass,
+        issuer: AuthorityIssuerIdentity,
+        context: &ContextDigest,
+    ) -> Vec<u8> {
         let mut writer = DigestWriter::new();
         writer.tag(1);
+        writer.tag(match class {
+            AuthorityClass::ExplicitApproval => 1,
+            AuthorityClass::OperatorPolicy => 2,
+        });
         writer.bytes(issuer.as_bytes());
         writer.digest(context);
         let digest: TypedDigest<0> = writer.finish("astrid.package.authority-message.v1");

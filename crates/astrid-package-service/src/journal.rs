@@ -130,6 +130,18 @@ impl OperationReceipt {
     pub const fn generation(self) -> u64 {
         self.generation.get()
     }
+
+    /// Returns the exact runtime receipt that completed the operation.
+    #[must_use]
+    pub const fn runtime_receipt(&self) -> &RuntimeReceiptDigest {
+        &self.runtime_receipt
+    }
+
+    /// Returns the admitting authority digest bound to this receipt.
+    #[must_use]
+    pub const fn authority(&self) -> AuthorityDigest {
+        self.authority
+    }
 }
 
 /// Authoritative zero-lease drain proof.
@@ -147,6 +159,18 @@ impl DrainProof {
             runtime_receipt,
             proof_time,
         }
+    }
+
+    /// Returns the exact runtime receipt presented by the proof.
+    #[must_use]
+    pub const fn runtime_receipt(&self) -> &RuntimeReceiptDigest {
+        &self.runtime_receipt
+    }
+
+    /// Returns the instant claimed by the runtime proof.
+    #[must_use]
+    pub const fn proof_time(&self) -> u64 {
+        self.proof_time
     }
 }
 
@@ -298,7 +322,11 @@ impl OperationRecord {
             .plan()
             .drain_deadline()
             .ok_or(PackageServiceError::InvalidDrain)?;
-        if now > deadline || !proof.runtime_receipt.is_present() {
+        if now > deadline
+            || proof.proof_time > deadline
+            || proof.proof_time > now
+            || proof.runtime_receipt != *self.context.drain_receipt()
+        {
             return Err(PackageServiceError::InvalidDrain);
         }
         slot.drain_mut()
@@ -311,6 +339,19 @@ impl OperationRecord {
     pub(crate) fn report_unknown(&mut self, now: u64) -> PackageServiceResult<()> {
         if self.status != JournalStatus::Executing || now >= self.context.expiry() {
             return Err(PackageServiceError::RecordUnavailable);
+        }
+        if matches!(
+            self.context.operation(),
+            Operation::Update | Operation::Remove
+        ) {
+            let deadline = self
+                .context
+                .plan()
+                .drain_deadline()
+                .ok_or(PackageServiceError::InvalidDrain)?;
+            if now > deadline {
+                return Err(PackageServiceError::InvalidDrain);
+            }
         }
         self.status = JournalStatus::Unknown;
         Ok(())
@@ -354,7 +395,9 @@ impl OperationRecord {
         if self.status != JournalStatus::Executing || now >= self.context.expiry() {
             return Err(PackageServiceError::RecordUnavailable);
         }
-        if !runtime_receipt.is_present() || artifact != *self.context.artifact() {
+        if runtime_receipt != *self.context.runtime_receipt()
+            || artifact != *self.context.artifact()
+        {
             return Err(PackageServiceError::BindingMismatch);
         }
         let before = slot.current().map_or_else(
@@ -446,6 +489,27 @@ impl OperationRecord {
         if self.status != JournalStatus::Unknown {
             return Err(PackageServiceError::RecordUnavailable);
         }
+        let is_drain = self.context.plan().drain_deadline().is_some();
+        if is_drain {
+            if evidence.zero_leases_proved != (self.proofs > 0)
+                || evidence.runtime_receipt != *self.context.drain_receipt()
+            {
+                return Err(PackageServiceError::BindingMismatch);
+            }
+            if now
+                > self
+                    .context
+                    .plan()
+                    .drain_deadline()
+                    .ok_or(PackageServiceError::InvalidDrain)?
+            {
+                return Err(PackageServiceError::InvalidDrain);
+            }
+        } else if evidence.zero_leases_proved
+            || evidence.runtime_receipt != *self.context.runtime_receipt()
+        {
+            return Err(PackageServiceError::BindingMismatch);
+        }
         let base_digest = slot
             .drain()
             .map_or_else(
@@ -456,28 +520,18 @@ impl OperationRecord {
                 |lineage| Some(lineage.base().digest()),
             )
             .ok_or(PackageServiceError::RecordUnavailable)?;
-        if evidence.observed_state != base_digest || !evidence.runtime_receipt.is_present() {
+        if evidence.observed_state != base_digest {
             return Err(PackageServiceError::BindingMismatch);
         }
-        if self
-            .context
-            .plan()
-            .drain_deadline()
-            .is_some_and(|deadline| now > deadline)
-        {
-            return Err(PackageServiceError::InvalidDrain);
-        }
-        if !evidence.zero_leases_proved || self.proofs == 0 {
+
+        if is_drain {
+            slot.restore_boundary()?;
+            self.status = JournalStatus::Expired;
             return Ok(None);
         }
-        self.status = JournalStatus::Executing;
-        let receipt = self.commit(
-            slot,
-            *self.context.artifact(),
-            evidence.runtime_receipt,
-            now,
-        )?;
-        Ok(Some(receipt))
+
+        self.status = JournalStatus::Expired;
+        Ok(None)
     }
 
     pub(crate) fn replay(&self) -> PackageServiceResult<ReplayOutcome> {

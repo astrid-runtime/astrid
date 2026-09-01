@@ -21,6 +21,9 @@ pub enum PackageServiceError {
     #[error("authority does not bind the exact package-service context")]
     AuthorityMismatch,
     /// The operation nonce already has a durable record.
+    ///
+    /// Detection is bounded by receipt retention; an evicted nonce is no
+    /// longer known to this model.
     #[error("package-service nonce replay")]
     NonceReplay,
     /// The actual canonical state differed from the exact expected state.
@@ -35,6 +38,9 @@ pub enum PackageServiceError {
     /// The artifact exceeds the bound operation budget.
     #[error("package-service budget exceeded")]
     BudgetExceeded,
+    /// The lifecycle plan does not authorize the requested operation.
+    #[error("package-service lifecycle plan conflicts with the operation")]
+    PlanConflict,
     /// Retaining another intent would exceed bounded journal policy.
     #[error("package-service journal capacity exceeded")]
     JournalFull,
