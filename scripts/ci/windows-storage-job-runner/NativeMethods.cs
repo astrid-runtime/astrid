@@ -166,6 +166,23 @@ internal static partial class NativeMethods
         uint length,
         out uint returnLength);
 
+    internal static bool QueryJobProcessIdsNative(
+        SafeJobHandle job,
+        IntPtr information,
+        uint length,
+        out uint returnLength,
+        out int win32Error)
+    {
+        var succeeded = QueryInformationJobObject(
+            job,
+            JobObjectBasicProcessIdList,
+            information,
+            length,
+            out returnLength);
+        win32Error = Marshal.GetLastWin32Error();
+        return succeeded;
+    }
+
     [LibraryImport("kernel32.dll", SetLastError = true, EntryPoint = "CreateFileW", StringMarshalling = StringMarshalling.Utf16)]
     internal static partial SafeFileHandle CreateFileW(
         string fileName,

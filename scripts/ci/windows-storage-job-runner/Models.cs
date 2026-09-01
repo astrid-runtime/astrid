@@ -48,21 +48,29 @@ internal sealed class CertificationOptions
 
 internal sealed class ControllerException : Exception
 {
+    public Exception? CleanupFailure { get; }
+
     public ControllerException(string message)
         : base(message)
     {
     }
 
     public ControllerException(string message, Exception innerException)
+        : this(message, innerException, null)
+    {
+    }
+
+    public ControllerException(string message, Exception innerException, Exception? cleanupFailure)
         : base(message, innerException)
     {
+        CleanupFailure = cleanupFailure;
     }
 }
 
 internal static class JobProcessList
 {
-    internal const int ProcessIdListOffset = 16;
-    internal const int MinimumStructureLength = 24;
+    internal const int ProcessIdListOffset = 8;
+    internal const int MinimumStructureLength = 16;
     internal const int MaximumBufferLength = 16 * 1024 * 1024;
 
     internal static uint[] ReadIds(SafeJobHandle job, QueryJobProcessList query)
@@ -88,7 +96,13 @@ internal static class JobProcessList
                         out var returnLength,
                         out var win32Error))
                 {
-                    return ParseVerifiedList(buffer, bufferLength, returnLength);
+                    var processIds = ParseVerifiedList(buffer, bufferLength, returnLength, out var truncated);
+                    if (!truncated)
+                    {
+                        return processIds;
+                    }
+
+                    bufferLength = GetGrownCapacity(buffer, bufferLength, returnLength);
                 }
 
                 if (win32Error != 234)
@@ -110,7 +124,7 @@ internal static class JobProcessList
 
     private static uint GetGrownCapacity(IntPtr buffer, uint currentCapacity, uint returnedLength)
     {
-        if (currentCapacity < ProcessIdListOffset)
+        if (currentCapacity < MinimumStructureLength)
         {
             throw new ControllerException("the Job Object process ID list header is too small");
         }
@@ -118,9 +132,9 @@ internal static class JobProcessList
         var assignedProcesses = Marshal.ReadInt32(buffer, 0);
         var processIdCount = Marshal.ReadInt32(buffer, sizeof(int));
         ValidateCounts(assignedProcesses, processIdCount);
-        var requiredByCounts = RequiredLength(processIdCount);
+        var requiredByCounts = RequiredLength(assignedProcesses);
         var doubled = (long)currentCapacity * 2;
-        var desired = Math.Max(Math.Max(doubled, returnedLength), requiredByCounts);
+        var desired = Math.Max(Math.Max(doubled, (long)returnedLength), requiredByCounts);
         if (desired > MaximumBufferLength)
         {
             throw new ControllerException(
@@ -136,7 +150,11 @@ internal static class JobProcessList
         return nextCapacity;
     }
 
-    private static uint[] ParseVerifiedList(IntPtr buffer, uint bufferCapacity, uint returnLength)
+    private static uint[] ParseVerifiedList(
+        IntPtr buffer,
+        uint bufferCapacity,
+        uint returnLength,
+        out bool truncated)
     {
         if (returnLength < MinimumStructureLength || returnLength > bufferCapacity)
         {
@@ -160,6 +178,7 @@ internal static class JobProcessList
             processIds[index] = (uint)Marshal.ReadIntPtr(buffer, ProcessIdListOffset + index * IntPtr.Size);
         }
 
+        truncated = processIdCount < assignedProcesses;
         return processIds;
     }
 
@@ -244,5 +263,22 @@ internal static class RootProcessCleanup
         while (stopwatch.Elapsed < cleanupTimeout);
 
         return false;
+    }
+}
+
+internal static class ControllerErrors
+{
+    internal static ControllerException PreservePrimaryCleanupFailure(
+        ControllerException primary,
+        Exception? cleanupFailure,
+        string stdoutPath,
+        string stderrPath)
+    {
+        var cleanupDetail = cleanupFailure?.Message ?? "cleanup did not reach ACTIVE_PROCESS_ZERO";
+        return new ControllerException(
+            $"primary cause preserved: {primary.Message}; separate cleanup failure: {cleanupDetail}; "
+            + $"stdout={stdoutPath}; stderr={stderrPath}",
+            primary,
+            cleanupFailure);
     }
 }

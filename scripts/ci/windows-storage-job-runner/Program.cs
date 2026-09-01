@@ -416,7 +416,8 @@ internal static class Program
         TimeSpan heartbeatInterval,
         Action? afterAssignment,
         Action<SafeJobHandle>? afterResume,
-        bool forceAssignmentFailure = false)
+        bool forceAssignmentFailure = false,
+        Func<SafeJobHandle, SafeProcessHandle?, TimeSpan, Exception?>? cleanupFailureOverride = null)
     {
         executable = ResolveExecutable(executable);
         using var job = CreateKillOnCloseJob();
@@ -493,24 +494,35 @@ internal static class Program
         }
         catch (Exception exception) when (exception is not ControllerException)
         {
-            var cleanup = TryTerminateAndAwait(job, process, cleanupTimeout);
+            var cleanup = CleanupAfterFailure(
+                job,
+                process,
+                cleanupTimeout,
+                cleanupFailureOverride,
+                out var genericCleanupFailure);
             throw new ControllerException(
                 $"{exception.Message}; cleanup={(cleanup ? "ACTIVE_PROCESS_ZERO" : "incomplete")}; stdout={stdoutPath}; stderr={stderrPath}",
-                exception);
+                exception,
+                genericCleanupFailure);
         }
-        catch (ControllerException)
+        catch (ControllerException primary)
         {
             if (!processAssignedToJob)
             {
                 throw;
             }
 
-            var cleanupSucceeded = TryTerminateAndAwait(job, process, cleanupTimeout);
+            var cleanupSucceeded = CleanupAfterFailure(
+                job,
+                process,
+                cleanupTimeout,
+                cleanupFailureOverride,
+                out var cleanupFailure);
             if (!cleanupSucceeded)
             {
-                throw PreservePrimaryCleanupFailure(
-                    new ControllerException(
-                        "job cleanup did not reach ACTIVE_PROCESS_ZERO after the primary controller failure"),
+                throw ControllerErrors.PreservePrimaryCleanupFailure(
+                    primary,
+                    cleanupFailure,
                     stdoutPath,
                     stderrPath);
             }
@@ -699,8 +711,10 @@ internal static class Program
     private static bool TryTerminateAndAwait(
         SafeJobHandle job,
         SafeProcessHandle? process,
-        TimeSpan cleanupTimeout)
+        TimeSpan cleanupTimeout,
+        out Exception? cleanupFailure)
     {
+        cleanupFailure = null;
         try
         {
             if (process is not null && !process.IsInvalid)
@@ -708,23 +722,36 @@ internal static class Program
                 _ = NativeMethods.TerminateJobObject(job, ControllerFailureExitCode);
             }
 
-            return WaitForActiveProcessZero(job, cleanupTimeout, out _);
+            if (WaitForActiveProcessZero(job, cleanupTimeout, out var activeProcessIds))
+            {
+                return true;
+            }
+
+            cleanupFailure = new ControllerException(
+                $"cleanup timed out with {activeProcessIds.Length} active process IDs: {string.Join(',', activeProcessIds)}");
+            return false;
         }
-        catch
+        catch (Exception exception)
         {
+            cleanupFailure = exception;
             return false;
         }
     }
 
-    internal static ControllerException PreservePrimaryCleanupFailure(
-        ControllerException primary,
-        string stdoutPath,
-        string stderrPath)
+    private static bool CleanupAfterFailure(
+        SafeJobHandle job,
+        SafeProcessHandle? process,
+        TimeSpan cleanupTimeout,
+        Func<SafeJobHandle, SafeProcessHandle?, TimeSpan, Exception?>? cleanupFailureOverride,
+        out Exception? cleanupFailure)
     {
-        return new ControllerException(
-            $"primary cause preserved: {primary.Message}; separate cleanup failure: "
-            + $"cleanup did not reach ACTIVE_PROCESS_ZERO; stdout={stdoutPath}; stderr={stderrPath}",
-            primary);
+        if (cleanupFailureOverride is not null)
+        {
+            cleanupFailure = cleanupFailureOverride(job, process, cleanupTimeout);
+            return cleanupFailure is null;
+        }
+
+        return TryTerminateAndAwait(job, process, cleanupTimeout, out cleanupFailure);
     }
 
     private static bool TerminateUnassignedProcessAndAwait(
@@ -771,24 +798,7 @@ internal static class Program
 
     private static uint[] GetJobProcessIds(SafeJobHandle job)
     {
-        return JobProcessList.ReadIds(job, QueryJobProcessIdsNative);
-    }
-
-    private static bool QueryJobProcessIdsNative(
-        SafeJobHandle job,
-        IntPtr information,
-        uint length,
-        out uint returnLength,
-        out int win32Error)
-    {
-        var succeeded = NativeMethods.QueryInformationJobObject(
-            job,
-            NativeMethods.JobObjectBasicProcessIdList,
-            information,
-            length,
-            out returnLength);
-        win32Error = Marshal.GetLastWin32Error();
-        return succeeded;
+        return JobProcessList.ReadIds(job, NativeMethods.QueryJobProcessIdsNative);
     }
 
     internal static IReadOnlyList<string> ParseTestListForSelfTest(IEnumerable<string> lines) =>
@@ -806,12 +816,6 @@ internal static class Program
         QueryJobProcessList query) =>
         JobProcessList.ReadIds(job, query);
 
-    internal static bool TryTerminateAndAwaitForSelfTest(
-        SafeJobHandle job,
-        SafeProcessHandle? process,
-        TimeSpan cleanupTimeout) =>
-        TryTerminateAndAwait(job, process, cleanupTimeout);
-
     internal static JobRunResult RunCommandForSelfTest(
         string workingDirectory,
         IReadOnlyList<string> command,
@@ -822,7 +826,8 @@ internal static class Program
         TimeSpan heartbeatInterval,
         Action? afterAssignment,
         Action<SafeJobHandle>? afterResume,
-        bool forceAssignmentFailure = false)
+        bool forceAssignmentFailure = false,
+        Func<SafeJobHandle, SafeProcessHandle?, TimeSpan, Exception?>? cleanupFailureOverride = null)
     {
         var stdoutHandle = OpenInheritableWriteFile(stdoutPath);
         var stderrHandle = OpenInheritableWriteFile(stderrPath);
@@ -841,7 +846,8 @@ internal static class Program
                 heartbeatInterval,
                 afterAssignment,
                 afterResume,
-                forceAssignmentFailure);
+                forceAssignmentFailure,
+                cleanupFailureOverride);
         }
         finally
         {
