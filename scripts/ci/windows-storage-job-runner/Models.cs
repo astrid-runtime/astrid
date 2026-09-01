@@ -46,3 +46,15 @@ internal sealed class ControllerException : Exception
     {
     }
 }
+
+internal static class JobProcessList
+{
+    internal static void ValidateCounts(int assignedProcesses, int processIdCount)
+    {
+        if (assignedProcesses < 0 || processIdCount < 0 || processIdCount > assignedProcesses)
+        {
+            throw new ControllerException(
+                $"Job Object returned invalid process counts: assigned={assignedProcesses}, listed={processIdCount}");
+        }
+    }
+}

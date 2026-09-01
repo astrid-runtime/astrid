@@ -140,6 +140,15 @@ internal static partial class NativeMethods
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static partial bool TerminateProcess(SafeProcessHandle process, uint exitCode);
 
+    [LibraryImport("kernel32.dll", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
+    internal static partial uint SearchPathW(
+        IntPtr searchPath,
+        string fileName,
+        IntPtr extension,
+        uint bufferLength,
+        IntPtr buffer,
+        IntPtr filePart);
+
     [LibraryImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static partial bool QueryInformationJobObject(

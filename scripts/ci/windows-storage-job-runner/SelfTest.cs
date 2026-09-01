@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
+using System.Text;
 
 namespace Astrid.Ci.Windows;
 
@@ -15,13 +17,16 @@ internal sealed class SelfTest
         try
         {
             StartupInfoLayout();
+            ExecutableResolution(root);
             AssignmentBeforeExecution(root);
-            DescendantTermination(root);
+            ThreeGenerationDescendantTermination(root);
             UnrelatedProcessSurvival(root);
             OutputAndExitCodePreservation(root);
+            ForcedAssignmentFailure(root);
             BoundedTimeoutAndCleanup(root);
             FreshJobIsolation(root);
             ArgumentAndListSetParity(root);
+            OutputTailCancellationAndFinalDrain(root);
             ProviderSubstitutionRejection(root);
             Console.WriteLine("[selftest] all Windows storage job controls passed");
             return 0;
@@ -62,28 +67,36 @@ internal sealed class SelfTest
         Console.WriteLine("[selftest] assignment occurred before child execution");
     }
 
-    private static void DescendantTermination(string root)
+    private static void ThreeGenerationDescendantTermination(string root)
     {
+        uint[] observedProcessIds = [];
         var result = RunCommand(
             root,
-            ["cmd.exe", "/d", "/c", "ping.exe -n 30 127.0.0.1 > NUL"],
+            ["cmd.exe", "/d", "/c", "cmd.exe /d /c ping.exe -n 30 127.0.0.1 > NUL"],
             1,
             afterResume: job =>
             {
-                Thread.Sleep(500);
-                if (Program.GetJobProcessIdsForSelfTest(job).Length < 2)
+                Thread.Sleep(750);
+                observedProcessIds = Program.GetJobProcessIdsForSelfTest(job);
+                if (observedProcessIds.Distinct().Count() < 3)
                 {
-                    throw new ControllerException("the descendant control did not observe two active processes");
+                    throw new ControllerException(
+                        $"the descendant control observed only {observedProcessIds.Length} live processes");
                 }
             });
         AssertOutcome(result, JobOutcome.TimedOut);
         AssertCleanup(result);
+        if (!observedProcessIds.Contains((uint)result.ProcessId))
+        {
+            throw new ControllerException("the descendant control did not contain the assigned root process");
+        }
+
         if (result.OriginalCause.Length == 0)
         {
             throw new ControllerException("the descendant termination test did not record its original timeout cause");
         }
 
-        Console.WriteLine("[selftest] job termination killed the child tree and observed ACTIVE_PROCESS_ZERO");
+        Console.WriteLine("[selftest] teardown killed three generations and observed ACTIVE_PROCESS_ZERO");
     }
 
     private static void UnrelatedProcessSurvival(string root)
@@ -139,6 +152,56 @@ internal sealed class SelfTest
         }
 
         Console.WriteLine("[selftest] durable stdout/stderr and injected exit code 7 were preserved");
+    }
+
+    private static void ForcedAssignmentFailure(string root)
+    {
+        var marker = Path.Combine(root, "forced-assignment.marker");
+        var stopwatch = Stopwatch.StartNew();
+        ControllerException? failure = null;
+        try
+        {
+            _ = Program.RunCommandForSelfTest(
+                root,
+                ["cmd.exe", "/d", "/c", $"echo ready> \"{marker}\""],
+                Path.Combine(root, $"{Guid.NewGuid():N}.stdout.log"),
+                Path.Combine(root, $"{Guid.NewGuid():N}.stderr.log"),
+                TimeSpan.FromSeconds(15),
+                TimeSpan.FromSeconds(10),
+                TimeSpan.FromSeconds(1),
+                afterAssignment: null,
+                afterResume: null,
+                forceAssignmentFailure: true);
+        }
+        catch (ControllerException exception)
+        {
+            failure = exception;
+        }
+
+        stopwatch.Stop();
+        if (failure is null)
+        {
+            throw new ControllerException("the forced assignment failure was accepted");
+        }
+
+        if (!failure.Message.Contains("AssignProcessToJobObject failed", StringComparison.Ordinal) ||
+            !failure.Message.Contains("forced-self-test", StringComparison.Ordinal) ||
+            !failure.Message.Contains("cleanup=PROCESS_EXITED", StringComparison.Ordinal))
+        {
+            throw new ControllerException($"forced assignment cleanup evidence was incomplete: {failure.Message}");
+        }
+
+        if (File.Exists(marker))
+        {
+            throw new ControllerException("the forced-assignment child executed before direct termination");
+        }
+
+        if (stopwatch.Elapsed > TimeSpan.FromSeconds(12))
+        {
+            throw new ControllerException($"forced assignment cleanup was unbounded: {stopwatch.Elapsed}");
+        }
+
+        Console.WriteLine("[selftest] forced assignment failure directly terminated the suspended root");
     }
 
     private static void BoundedTimeoutAndCleanup(string root)
@@ -231,6 +294,26 @@ internal sealed class SelfTest
         Console.WriteLine("[selftest] list, aggregate, and exact diagnostic argument sets had the same test set");
     }
 
+    private static void ExecutableResolution(string root)
+    {
+        var cmd = Program.ResolveExecutableForSelfTest("cmd.exe");
+        var canonicalCmd = Path.GetFullPath(cmd);
+        if (!Path.IsPathRooted(cmd) ||
+            !string.Equals(cmd, canonicalCmd, StringComparison.OrdinalIgnoreCase) ||
+            !File.Exists(cmd) ||
+            !string.Equals(Path.GetFileName(cmd), "cmd.exe", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ControllerException($"cmd.exe did not resolve to an existing canonical executable: {cmd}");
+        }
+
+        AssertControllerFailure(() => Program.ResolveExecutableForSelfTest(Path.Combine(root, "missing.exe")));
+        var tool = Path.Combine(root, "tool.cmd");
+        File.WriteAllText(tool, "@echo off\r\n");
+        var nonCanonical = Path.Combine(root, "subdir", "..", "tool.cmd");
+        AssertControllerFailure(() => Program.ResolveExecutableForSelfTest(nonCanonical));
+        Console.WriteLine($"[selftest] executable resolution accepted {cmd} and rejected missing/noncanonical paths");
+    }
+
     private static void StartupInfoLayout()
     {
         const int expectedSize = 104;
@@ -271,6 +354,68 @@ internal sealed class SelfTest
         }
 
         Console.WriteLine("[selftest] STARTUPINFOW x64 layout matched the official size and critical offsets");
+    }
+
+    private static void OutputTailCancellationAndFinalDrain(string root)
+    {
+        OutputTailCancellationAndFinalDrainAsync(root).GetAwaiter().GetResult();
+    }
+
+    private static async Task OutputTailCancellationAndFinalDrainAsync(string root)
+    {
+        var path = Path.Combine(root, "tail-drain.log");
+        File.WriteAllBytes(path, []);
+        using var cancellation = new CancellationTokenSource();
+        var bytes = new StrongBox<long>();
+        using var captured = new StringWriter();
+        var tail = OutputTail.TailOutput(path, captured, bytes, cancellation.Token);
+        var stopwatch = Stopwatch.StartNew();
+
+        using (var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+        {
+            await WriteTailProbeAsync(stream, "before-cancel\n");
+            var deadline = DateTime.UtcNow.AddSeconds(2);
+            while (Interlocked.Read(ref bytes.Value) == 0 && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(20);
+            }
+
+            if (Interlocked.Read(ref bytes.Value) == 0)
+            {
+                throw new ControllerException("the output tail did not observe bytes before cancellation");
+            }
+
+            await WriteTailProbeAsync(stream, "around-cancel");
+            cancellation.Cancel();
+            await Task.Delay(20);
+            await WriteTailProbeAsync(stream, "-final\n");
+        }
+
+        await tail;
+        stopwatch.Stop();
+        var durable = File.ReadAllText(path);
+        var rendered = captured.ToString();
+        if (!durable.Contains("before-cancel", StringComparison.Ordinal) ||
+            !durable.Contains("around-cancel", StringComparison.Ordinal) ||
+            !rendered.Contains("before-cancel", StringComparison.Ordinal) ||
+            !rendered.Contains("around-cancel", StringComparison.Ordinal))
+        {
+            throw new ControllerException($"output cancellation/drain lost bytes: durable={durable}; rendered={rendered}");
+        }
+
+        if (stopwatch.Elapsed > TimeSpan.FromSeconds(5))
+        {
+            throw new ControllerException($"output tail did not terminate boundedly: {stopwatch.Elapsed}");
+        }
+
+        Console.WriteLine("[selftest] output cancellation preserved buffered bytes and drained terminally");
+    }
+
+    private static async Task WriteTailProbeAsync(FileStream stream, string value)
+    {
+        var bytes = Encoding.UTF8.GetBytes(value);
+        await stream.WriteAsync(bytes);
+        await stream.FlushAsync();
     }
 
     private static void ProviderSubstitutionRejection(string root)

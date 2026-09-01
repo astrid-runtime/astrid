@@ -208,9 +208,16 @@ internal static class Program
 
     private static void ValidateCommonOptions(CertificationOptions options)
     {
-        if (!File.Exists(options.TestExecutable))
+        var testExecutable = Path.GetFullPath(options.TestExecutable);
+        if (!string.Equals(testExecutable, options.TestExecutable, StringComparison.OrdinalIgnoreCase))
         {
-            throw new ControllerException($"the libtest executable is not a file: {options.TestExecutable}");
+            throw new ControllerException(
+                $"the libtest executable is not canonical: expected {testExecutable}, got {options.TestExecutable}");
+        }
+
+        if (!File.Exists(testExecutable))
+        {
+            throw new ControllerException($"the libtest executable is not a file: {testExecutable}");
         }
 
         if (!Directory.Exists(options.WorkingDirectory))
@@ -255,6 +262,84 @@ internal static class Program
         return builder.ToString();
     }
 
+    internal static string ResolveExecutableForSelfTest(string executable) => ResolveExecutable(executable);
+
+    private static string ResolveExecutable(string executable)
+    {
+        if (string.IsNullOrWhiteSpace(executable))
+        {
+            throw new ControllerException("the executable path is empty");
+        }
+
+        if (Path.IsPathRooted(executable))
+        {
+            var canonical = Path.GetFullPath(executable);
+            if (!string.Equals(canonical, executable, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ControllerException(
+                    $"executable path is not canonical: expected {canonical}, got {executable}");
+            }
+
+            if (!File.Exists(canonical))
+            {
+                throw new ControllerException($"canonical executable is not a file: {canonical}");
+            }
+
+            return canonical;
+        }
+
+        const int maxSearchLength = 32768;
+        var requiredLength = NativeMethods.SearchPathW(
+            IntPtr.Zero,
+            executable,
+            IntPtr.Zero,
+            0,
+            IntPtr.Zero,
+            IntPtr.Zero);
+        if (requiredLength == 0)
+        {
+            throw new ControllerException(
+                $"could not resolve executable {executable}: Win32 error {Marshal.GetLastWin32Error()}");
+        }
+
+        var bufferLength = requiredLength + 1;
+        if (bufferLength > maxSearchLength)
+        {
+            throw new ControllerException($"resolved executable path is too long: {requiredLength}");
+        }
+
+        var buffer = Marshal.AllocHGlobal((int)bufferLength * sizeof(char));
+        try
+        {
+            var returnedLength = NativeMethods.SearchPathW(
+                IntPtr.Zero,
+                executable,
+                IntPtr.Zero,
+                bufferLength,
+                buffer,
+                IntPtr.Zero);
+            if (returnedLength == 0 || returnedLength >= bufferLength)
+            {
+                throw new ControllerException(
+                    $"searching for executable {executable} failed: Win32 error {Marshal.GetLastWin32Error()}");
+            }
+
+            var searched = Marshal.PtrToStringUni(buffer, (int)returnedLength)
+                ?? throw new ControllerException($"SearchPathW returned an invalid executable path for {executable}");
+            var canonical = Path.GetFullPath(searched);
+            if (!string.Equals(canonical, searched, StringComparison.OrdinalIgnoreCase) || !File.Exists(canonical))
+            {
+                throw new ControllerException($"SearchPathW did not return an existing canonical executable: {searched}");
+            }
+
+            return canonical;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
     private static JobRunResult RunJobProcess(
         string executable,
         IReadOnlyList<string> arguments,
@@ -286,7 +371,8 @@ internal static class Program
                 cleanupTimeout,
                 heartbeatInterval,
                 afterAssignment: null,
-                afterResume: null);
+                afterResume: null,
+                forceAssignmentFailure: false);
         }
         finally
         {
@@ -328,8 +414,10 @@ internal static class Program
         TimeSpan cleanupTimeout,
         TimeSpan heartbeatInterval,
         Action? afterAssignment,
-        Action<SafeJobHandle>? afterResume)
+        Action<SafeJobHandle>? afterResume,
+        bool forceAssignmentFailure = false)
     {
+        executable = ResolveExecutable(executable);
         using var job = CreateKillOnCloseJob();
         SafeProcessHandle? process = null;
         SafeWindowsHandle? thread = null;
@@ -365,13 +453,16 @@ internal static class Program
             process = new SafeProcessHandle(rawProcessInformation.Process, ownsHandle: true);
             thread = new SafeWindowsHandle(rawProcessInformation.Thread, ownsHandle: true);
             var processId = rawProcessInformation.ProcessId;
-            if (!NativeMethods.AssignProcessToJobObject(job, process))
+            var assignmentSucceeded = !forceAssignmentFailure && NativeMethods.AssignProcessToJobObject(job, process);
+            if (!assignmentSucceeded)
             {
-                var assignmentError = Marshal.GetLastWin32Error();
+                var assignmentFailure = forceAssignmentFailure
+                    ? "forced-self-test"
+                    : $"Win32 error {Marshal.GetLastWin32Error()}";
                 var directCleanup = TerminateUnassignedProcessAndAwait(process, cleanupTimeout);
                 directProcessCleanupComplete = directCleanup;
                 throw new ControllerException(
-                    $"AssignProcessToJobObject failed for process {processId}: Win32 error {assignmentError}; "
+                    $"AssignProcessToJobObject failed for process {processId}: {assignmentFailure}; "
                     + $"cleanup={(directCleanup ? "PROCESS_EXITED" : "INCOMPLETE")}; "
                     + $"stdout={stdoutPath}; stderr={stderrPath}");
             }
@@ -587,9 +678,9 @@ internal static class Program
     {
         try
         {
-            if (process is not null && !process.IsInvalid && !NativeMethods.TerminateJobObject(job, ControllerFailureExitCode))
+            if (process is not null && !process.IsInvalid)
             {
-                return false;
+                _ = NativeMethods.TerminateJobObject(job, ControllerFailureExitCode);
             }
 
             return WaitForActiveProcessZero(job, cleanupTimeout, out _);
@@ -667,80 +758,72 @@ internal static class Program
     private static uint[] GetJobProcessIds(SafeJobHandle job)
     {
         const int errorMoreData = 234;
-        if (NativeMethods.QueryInformationJobObject(
-                job,
-                NativeMethods.JobObjectBasicProcessIdList,
-                IntPtr.Zero,
-                0,
-                out _))
-        {
-            return [];
-        }
+        const int headerLength = 2 * sizeof(int);
+        const int maximumAttempts = 8;
+        var bufferLength = (uint)headerLength;
 
-        var error = Marshal.GetLastWin32Error();
-        if (error != errorMoreData)
+        for (var attempt = 0; attempt < maximumAttempts; attempt++)
         {
-            throw new ControllerException($"QueryInformationJobObject failed: Win32 error {error}");
-        }
-
-        var probe = Marshal.AllocHGlobal(2 * sizeof(int));
-        try
-        {
-            if (!NativeMethods.QueryInformationJobObject(
-                    job,
-                    NativeMethods.JobObjectBasicProcessIdList,
-                    probe,
-                    (uint)(2 * sizeof(int)),
-                    out _))
+            if (bufferLength < headerLength || bufferLength > int.MaxValue)
             {
-                throw new ControllerException(
-                    $"querying assigned job processes failed: Win32 error {Marshal.GetLastWin32Error()}");
+                throw new ControllerException("the Job Object process ID list length is invalid");
             }
 
-            var processIdCapacity = Marshal.ReadInt32(probe, sizeof(int));
-            if (processIdCapacity <= 0)
-            {
-                return [];
-            }
-
-            var bufferSize = 2 * sizeof(int) + processIdCapacity * IntPtr.Size;
-            var buffer = Marshal.AllocHGlobal(bufferSize);
+            var buffer = Marshal.AllocHGlobal((int)bufferLength);
             try
             {
-                if (!NativeMethods.QueryInformationJobObject(
+                if (NativeMethods.QueryInformationJobObject(
                         job,
                         NativeMethods.JobObjectBasicProcessIdList,
                         buffer,
-                        (uint)bufferSize,
-                        out _))
+                        bufferLength,
+                        out var returnLength))
+                {
+                    if (returnLength < headerLength)
+                    {
+                        throw new ControllerException("the Job Object process ID list return length is too short");
+                    }
+
+                    var assignedProcesses = Marshal.ReadInt32(buffer, 0);
+                    var processIdCount = Marshal.ReadInt32(buffer, sizeof(int));
+                    JobProcessList.ValidateCounts(assignedProcesses, processIdCount);
+                    var expectedLength = (long)headerLength + processIdCount * IntPtr.Size;
+                    if (returnLength < expectedLength)
+                    {
+                        throw new ControllerException(
+                            $"Job Object process ID list was truncated: return {returnLength}, expected {expectedLength}");
+                    }
+
+                    var processIds = new uint[processIdCount];
+                    for (var index = 0; index < processIdCount; index++)
+                    {
+                        processIds[index] = (uint)Marshal.ReadIntPtr(buffer, headerLength + index * IntPtr.Size);
+                    }
+
+                    return processIds;
+                }
+
+                var error = Marshal.GetLastWin32Error();
+                if (error != errorMoreData)
+                {
+                    throw new ControllerException($"QueryInformationJobObject failed: Win32 error {error}");
+                }
+
+                if (returnLength < headerLength || returnLength > int.MaxValue)
                 {
                     throw new ControllerException(
-                        $"querying active job process IDs failed: Win32 error {Marshal.GetLastWin32Error()}");
+                        $"Job Object process ID list requires an invalid length: {returnLength}");
                 }
 
-                var count = Marshal.ReadInt32(buffer, sizeof(int));
-                if (count < 0 || count > processIdCapacity)
-                {
-                    throw new ControllerException("the Job Object returned an invalid process ID count");
-                }
-
-                var processIds = new uint[count];
-                for (var index = 0; index < count; index++)
-                {
-                    processIds[index] = (uint)Marshal.ReadIntPtr(buffer, 2 * sizeof(int) + index * IntPtr.Size);
-                }
-
-                return processIds;
+                bufferLength = returnLength;
             }
             finally
             {
                 Marshal.FreeHGlobal(buffer);
             }
         }
-        finally
-        {
-            Marshal.FreeHGlobal(probe);
-        }
+
+        throw new ControllerException("the Job Object process ID list did not stabilize");
     }
 
     internal static IReadOnlyList<string> ParseTestListForSelfTest(IEnumerable<string> lines) =>
@@ -762,7 +845,8 @@ internal static class Program
         TimeSpan cleanupTimeout,
         TimeSpan heartbeatInterval,
         Action? afterAssignment,
-        Action<SafeJobHandle>? afterResume)
+        Action<SafeJobHandle>? afterResume,
+        bool forceAssignmentFailure = false)
     {
         var stdoutHandle = OpenInheritableWriteFile(stdoutPath);
         var stderrHandle = OpenInheritableWriteFile(stderrPath);
@@ -780,7 +864,8 @@ internal static class Program
                 cleanupTimeout,
                 heartbeatInterval,
                 afterAssignment,
-                afterResume);
+                afterResume,
+                forceAssignmentFailure);
         }
         finally
         {
