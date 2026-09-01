@@ -571,7 +571,7 @@ internal sealed class SelfTest
             Marshal.WriteInt32(buffer, 0, 1);
             Marshal.WriteInt32(buffer, sizeof(int), 1);
             Marshal.WriteIntPtr(buffer, 8, new IntPtr(0x123));
-            returnLength = 24;
+            returnLength = 16;
             win32Error = 0;
             finalIds = [0x123];
             return true;
