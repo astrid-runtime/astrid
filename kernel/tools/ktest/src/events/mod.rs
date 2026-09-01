@@ -31,6 +31,7 @@ const REQUIRED_ONCE: &[&str] = &[
     "paging.wx",
     "heap.ready",
     "kernel.cr3",
+    "audit.boot",
     "halt",
 ];
 
@@ -254,6 +255,66 @@ fn all_bools(events: &[Value], name: &str, field: &str, expected: bool) -> bool 
             .all(|event| bool_field(event, field) == Some(expected))
 }
 
+fn is_lower_hex(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn audit_custody_holds(events: &[Value]) -> bool {
+    let mut boots = named_events(events, "audit.boot");
+    let observed = named_events(events, "audit.observed");
+    if boots.len() != 1 || observed.len() != 4 {
+        return false;
+    }
+    let Some(boot) = boots.pop() else {
+        return false;
+    };
+    let boot_id = string_field(boot, "boot");
+    let authority_id = u64_field(boot, "authority_id");
+    let expected_sequences = [1, 2, 3, 4];
+    let mut roots = Vec::new();
+    let observations_ok = observed.iter().enumerate().all(|(index, observation)| {
+        let root = string_field(observation, "root")
+            .unwrap_or_default()
+            .to_owned();
+        let valid = string_field(observation, "boot") == boot_id
+            && u64_field(observation, "authority_id") == authority_id
+            && u64_field(observation, "audit_seq") == Some(expected_sequences[index])
+            && u64_field(observation, "class") == Some(17)
+            && bool_field(observation, "retired") == Some(true)
+            && is_lower_hex(&root, 64);
+        roots.push(root);
+        valid
+    });
+    let roots_distinct = roots.len() == 4
+        && roots[0] != roots[1]
+        && roots[0] != roots[2]
+        && roots[0] != roots[3]
+        && roots[1] != roots[2]
+        && roots[1] != roots[3]
+        && roots[2] != roots[3];
+    boot_id.is_some_and(|boot| is_lower_hex(boot, 32))
+        && authority_id.is_some_and(|authority| authority > 0)
+        && observations_ok
+        && roots_distinct
+}
+
+fn audit_has_no_key_material(events: &[Value]) -> bool {
+    const FORBIDDEN_FIELDS: &[&str] = &["key", "anchor", "secret", "verification_key"];
+    named_events(events, "audit.boot")
+        .into_iter()
+        .chain(named_events(events, "audit.observed"))
+        .all(|event| {
+            event.as_object().is_some_and(|fields| {
+                FORBIDDEN_FIELDS
+                    .iter()
+                    .all(|field| !fields.contains_key(*field))
+            })
+        })
+}
+
 /// Assert the executable ring-0 system-generation rejection contract.
 ///
 /// The image used by this assertion has a canonical, correctly signed
@@ -383,6 +444,14 @@ pub fn assert_boot(
         !any_test_fail(events),
     );
     ok &= self_tests_hold(events);
+    ok &= check(
+        "audit boot and retired observation",
+        audit_custody_holds(events),
+    );
+    ok &= check(
+        "audit events expose no key or anchor material",
+        audit_has_no_key_material(events),
+    );
     ok &= check("domain lifecycle evidence", domain_lifecycle_holds(events));
     let halt_ok = events.last().is_some_and(|e| {
         ev_name(e) == "halt" && e.get("outcome").and_then(Value::as_str) == Some("ok")

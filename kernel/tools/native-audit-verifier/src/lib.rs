@@ -11,12 +11,19 @@
 //! authority instance to that anchor, and no envelope may authenticate
 //! itself with material carried inside the same untrusted input.
 
+#![no_std]
+
+#[cfg(test)]
+extern crate std;
+
 pub mod wire;
 
 #[cfg(test)]
 mod tests;
 
 use blake3::Hasher;
+use spin::Mutex;
+use zeroize::Zeroize;
 
 /// Frozen canonical frame-codec version this verifier understands.
 pub const CODEC_VERSION: u16 = 1;
@@ -32,6 +39,129 @@ const GENESIS_DOMAIN_TAG: &[u8] = b"astrid.native-kernel.audit-genesis.v1";
 const CHECKPOINT_DOMAIN_TAG: &[u8] = b"astrid.native-kernel.audit-checkpoint.v1";
 const ACK_DOMAIN_TAG: &[u8] = b"astrid.native-kernel.audit-ack.v1";
 const VERIFIER_HANDOFF_DOMAIN_TAG: &[u8] = b"astrid.native-kernel.audit-verifier-handoff.v1";
+
+/// Reusable unkeyed fold state owned by one verifier session. It is created
+/// when the verifier authority is installed, never on the fold path.
+struct RootHasher(Mutex<Hasher>);
+
+impl RootHasher {
+    fn new() -> Self {
+        Self(Mutex::new(Hasher::new()))
+    }
+
+    fn genesis(&self, boot: [u8; 16]) -> [u8; 32] {
+        let mut hasher = self.0.lock();
+        hasher.update(GENESIS_DOMAIN_TAG);
+        hasher.update(&boot);
+        hasher.update(&CODEC_VERSION.to_le_bytes());
+        hasher.finalize().into()
+    }
+
+    fn advance(&self, previous_root: [u8; 32], boot: [u8; 16], seq: u64, frame: &[u8]) -> [u8; 32] {
+        let mut hasher = self.0.lock();
+        hasher.reset();
+        hasher.update(ROOT_DOMAIN_TAG);
+        hasher.update(ROOT_ALGORITHM_ID);
+        hasher.update(&CODEC_VERSION.to_le_bytes());
+        hasher.update(&boot);
+        hasher.update(&seq.to_le_bytes());
+        hasher.update(&previous_root);
+        hasher.update(frame);
+        hasher.finalize().into()
+    }
+}
+
+impl Drop for RootHasher {
+    fn drop(&mut self) {
+        self.0.get_mut().zeroize();
+    }
+}
+
+/// Reusable keyed state owned by one move-only verifier anchor.
+struct TagHasher {
+    boot: [u8; 16],
+    hasher: Mutex<Hasher>,
+}
+
+impl TagHasher {
+    fn new(boot: [u8; 16], verification_key: &[u8; 32]) -> Self {
+        Self {
+            boot,
+            hasher: Mutex::new(Hasher::new_keyed(verification_key)),
+        }
+    }
+
+    fn erase(&mut self) {
+        self.hasher.get_mut().zeroize();
+    }
+
+    fn checkpoint_tag(
+        &self,
+        boot: [u8; 16],
+        seq: u64,
+        root: [u8; 32],
+        relay_generation: u64,
+        authority_id: u64,
+    ) -> [u8; 32] {
+        if boot != self.boot {
+            return [0; 32];
+        }
+        let mut hasher = self.hasher.lock();
+        hasher.reset();
+        hasher.update(CHECKPOINT_DOMAIN_TAG);
+        hasher.update(&CODEC_VERSION.to_le_bytes());
+        hasher.update(&boot);
+        hasher.update(&seq.to_le_bytes());
+        hasher.update(&root);
+        hasher.update(&relay_generation.to_le_bytes());
+        hasher.update(&authority_id.to_le_bytes());
+        hasher.finalize().into()
+    }
+
+    fn ack_tag(
+        &self,
+        boot: [u8; 16],
+        relay_generation: u64,
+        seq: u64,
+        source_root: [u8; 32],
+        frame: &[u8],
+        authority_id: u64,
+    ) -> [u8; 32] {
+        if boot != self.boot {
+            return [0; 32];
+        }
+        let mut hasher = self.hasher.lock();
+        hasher.reset();
+        hasher.update(ACK_DOMAIN_TAG);
+        hasher.update(&CODEC_VERSION.to_le_bytes());
+        hasher.update(&authority_id.to_le_bytes());
+        hasher.update(&boot);
+        hasher.update(&relay_generation.to_le_bytes());
+        hasher.update(&seq.to_le_bytes());
+        hasher.update(&source_root);
+        hasher.update(frame);
+        hasher.finalize().into()
+    }
+
+    fn verifier_handoff_tag(&self, boot: [u8; 16], authority_id: u64) -> [u8; 32] {
+        if boot != self.boot {
+            return [0; 32];
+        }
+        let mut hasher = self.hasher.lock();
+        hasher.reset();
+        hasher.update(VERIFIER_HANDOFF_DOMAIN_TAG);
+        hasher.update(&CODEC_VERSION.to_le_bytes());
+        hasher.update(&boot);
+        hasher.update(&authority_id.to_le_bytes());
+        hasher.finalize().into()
+    }
+}
+
+impl Drop for TagHasher {
+    fn drop(&mut self) {
+        self.hasher.get_mut().zeroize();
+    }
+}
 
 /// Hard decode failure of one input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,11 +241,11 @@ pub struct CheckpointView {
 /// crate; there is deliberately no constructor from untrusted handoff
 /// bytes, because an envelope cannot authenticate itself with material
 /// carried inside it.
-#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct AuthContext {
     authority_id: u64,
     boot: [u8; 16],
     verification_key: [u8; 32],
+    tag_hasher: TagHasher,
 }
 
 impl AuthContext {
@@ -136,6 +266,7 @@ impl AuthContext {
             authority_id,
             boot,
             verification_key,
+            tag_hasher: TagHasher::new(boot, &verification_key),
         })
     }
 
@@ -159,16 +290,29 @@ impl AuthContext {
             .ok()
             .filter(|boot: &[u8; 16]| boot.iter().any(|byte| *byte != 0))
             .ok_or(VerifyFailure::Malformed)?;
-        if authority_id != self.authority_id || boot != self.boot {
+        if authority_id != self.authority_id() || boot != self.boot() {
             return Err(VerifyFailure::HandoffUnbound);
         }
         let tag: [u8; 32] = bytes[32..]
             .try_into()
             .map_err(|_| VerifyFailure::Malformed)?;
-        if verifier_handoff_tag(boot, authority_id, &self.verification_key) != tag {
+        if self.tag_hasher.verifier_handoff_tag(boot, authority_id) != tag {
             return Err(VerifyFailure::HandoffUnbound);
         }
         Ok(())
+    }
+
+    const fn authority_id(&self) -> u64 {
+        self.authority_id
+    }
+
+    const fn boot(&self) -> [u8; 16] {
+        self.boot
+    }
+
+    fn erase(&mut self) {
+        self.tag_hasher.erase();
+        self.verification_key.zeroize();
     }
 }
 
@@ -178,79 +322,10 @@ impl core::fmt::Debug for AuthContext {
     }
 }
 
-fn genesis_root(boot: [u8; 16]) -> [u8; 32] {
-    let mut hasher = Hasher::new();
-    hasher.update(GENESIS_DOMAIN_TAG);
-    hasher.update(&boot);
-    hasher.update(&CODEC_VERSION.to_le_bytes());
-    hasher.finalize().into()
-}
-
-fn advance(previous_root: [u8; 32], boot: [u8; 16], seq: u64, frame: &[u8]) -> [u8; 32] {
-    let mut hasher = Hasher::new();
-    hasher.update(ROOT_DOMAIN_TAG);
-    hasher.update(ROOT_ALGORITHM_ID);
-    hasher.update(&CODEC_VERSION.to_le_bytes());
-    hasher.update(&boot);
-    hasher.update(&seq.to_le_bytes());
-    hasher.update(&previous_root);
-    hasher.update(frame);
-    hasher.finalize().into()
-}
-
-fn checkpoint_tag(
-    boot: [u8; 16],
-    seq: u64,
-    root: [u8; 32],
-    relay_generation: u64,
-    context: &AuthContext,
-) -> [u8; 32] {
-    let mut hasher = Hasher::new_keyed(&context.verification_key);
-    hasher.update(CHECKPOINT_DOMAIN_TAG);
-    hasher.update(&CODEC_VERSION.to_le_bytes());
-    hasher.update(&boot);
-    hasher.update(&seq.to_le_bytes());
-    hasher.update(&root);
-    hasher.update(&relay_generation.to_le_bytes());
-    hasher.update(&context.authority_id.to_le_bytes());
-    hasher.finalize().into()
-}
-
-fn ack_tag(
-    boot: [u8; 16],
-    relay_generation: u64,
-    seq: u64,
-    source_root: [u8; 32],
-    frame: &[u8],
-    context: &AuthContext,
-) -> [u8; 32] {
-    let mut hasher = Hasher::new_keyed(&context.verification_key);
-    hasher.update(ACK_DOMAIN_TAG);
-    hasher.update(&CODEC_VERSION.to_le_bytes());
-    hasher.update(&context.authority_id.to_le_bytes());
-    hasher.update(&boot);
-    hasher.update(&relay_generation.to_le_bytes());
-    hasher.update(&seq.to_le_bytes());
-    hasher.update(&source_root);
-    hasher.update(frame);
-    hasher.finalize().into()
-}
-
-/// Keys the kernel minting tag bound into the untrusted verifier handoff.
-/// The verification key never travels inside the handoff; the tag is
-/// checkable only by a holder of the independently trusted kernel-origin
-/// anchor, so a caller-minted handoff cannot authenticate itself.
-fn verifier_handoff_tag(
-    boot: [u8; 16],
-    authority_id: u64,
-    verification_key: &[u8; 32],
-) -> [u8; 32] {
-    let mut hasher = Hasher::new_keyed(verification_key);
-    hasher.update(VERIFIER_HANDOFF_DOMAIN_TAG);
-    hasher.update(&CODEC_VERSION.to_le_bytes());
-    hasher.update(&boot);
-    hasher.update(&authority_id.to_le_bytes());
-    hasher.finalize().into()
+impl Drop for AuthContext {
+    fn drop(&mut self) {
+        self.erase();
+    }
 }
 
 /// Tag-verifies a canonical checkpoint wire form. A verifier-local cache
@@ -305,10 +380,14 @@ pub fn verify_checkpoint(
         authority_id,
         tag,
     };
-    if relay_generation == 0 || authority_id != context.authority_id || boot != context.boot {
+    if relay_generation == 0 || authority_id != context.authority_id() || boot != context.boot() {
         return Err(VerifyFailure::Malformed);
     }
-    if checkpoint_tag(boot, seq, root, relay_generation, context) != tag {
+    if context
+        .tag_hasher
+        .checkpoint_tag(boot, seq, root, relay_generation, context.authority_id())
+        != tag
+    {
         return Err(VerifyFailure::CheckpointMismatch);
     }
     Ok(view)
@@ -320,6 +399,7 @@ pub struct AuditVerifier {
     boot: [u8; 16],
     next_seq: u64,
     root: [u8; 32],
+    root_hasher: RootHasher,
     context: AuthContext,
     relay_generation: u64,
 }
@@ -335,14 +415,17 @@ impl AuditVerifier {
         if boot.iter().all(|byte| *byte == 0) {
             return Err(VerifyFailure::Malformed);
         }
-        if boot != context.boot {
+        if boot != context.boot() {
             return Err(VerifyFailure::Malformed);
         }
         context.bind_handoff(handoff)?;
+        let root_hasher = RootHasher::new();
+        let root = root_hasher.genesis(boot);
         Ok(Self {
             boot,
             next_seq: 1,
-            root: genesis_root(boot),
+            root,
+            root_hasher,
             context,
             relay_generation: 1,
         })
@@ -365,15 +448,14 @@ impl AuditVerifier {
             boot: checkpoint.boot,
             root: checkpoint.root,
             next_seq,
+            root_hasher: RootHasher::new(),
             context,
             relay_generation: checkpoint.relay_generation,
         })
     }
 
-    /// Folds one canonical frame whose source root claim has already been
-    /// checked by the caller's handoff record. Contiguity is enforced; a gap
-    /// is Incomplete and a duplicate or reorder is Invalid. Never skips.
-    pub fn fold(
+    /// Shared canonical fold engine for retained evidence only.
+    fn fold_frame(
         &mut self,
         frame: &[u8],
         claimed_root: [u8; 32],
@@ -400,20 +482,22 @@ impl AuditVerifier {
             .next_seq
             .checked_add(1)
             .ok_or(FoldFailure::SequenceOverflow)?;
-        let next_root = advance(self.root, self.boot, view.seq, frame);
+        let next_root = self
+            .root_hasher
+            .advance(self.root, self.boot, view.seq, frame);
         if claimed_root != next_root {
             return Err(FoldFailure::Invalid(InvalidReason::RootMismatch));
         }
         let receipt = FoldReceipt {
             seq: view.seq,
             folded_root: claimed_root,
-            ack_tag: ack_tag(
+            ack_tag: self.context.tag_hasher.ack_tag(
                 self.boot,
                 self.relay_generation,
                 view.seq,
                 claimed_root,
                 frame,
-                &self.context,
+                self.context.authority_id(),
             ),
         };
         self.root = next_root;
@@ -469,5 +553,51 @@ impl AuditVerifier {
 
     pub fn next_seq(&self) -> u64 {
         self.next_seq
+    }
+
+    /// Converts the offline verifier into the separately typed
+    /// retained-evidence verifier. No path returns it to live custody.
+    pub fn into_retained_evidence(self) -> RetainedAuditVerifier {
+        RetainedAuditVerifier(self)
+    }
+}
+
+/// Capability-typed retained-evidence verifier. It has no transactional fold
+/// or commit, so it cannot impersonate the live relay-bound path.
+pub struct RetainedAuditVerifier(AuditVerifier);
+
+impl RetainedAuditVerifier {
+    /// Folds one retained buffered handoff record for the existing ack/credit
+    /// path. The raw receipt has no live-transaction conversion.
+    pub fn fold_retained_evidence(
+        &mut self,
+        frame: &[u8],
+        claimed_root: [u8; 32],
+    ) -> Result<FoldReceipt, FoldFailure> {
+        self.0.fold_frame(frame, claimed_root)
+    }
+
+    pub fn root(&self) -> [u8; 32] {
+        self.0.root
+    }
+
+    pub fn next_seq(&self) -> u64 {
+        self.0.next_seq
+    }
+
+    pub fn accept_checkpoint(&self, wire: &[u8]) -> Result<(), VerifyFailure> {
+        self.0.accept_checkpoint(wire)
+    }
+
+    pub fn accept_resync_checkpoint(&mut self, wire: &[u8]) -> Result<(), VerifyFailure> {
+        self.0.accept_resync_checkpoint(wire)
+    }
+}
+
+impl Drop for AuditVerifier {
+    fn drop(&mut self) {
+        // The field's own Drop performs the erase; this explicit hook documents
+        // that destroying the fold state also destroys the verification anchor.
+        self.context.erase();
     }
 }

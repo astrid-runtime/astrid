@@ -1,6 +1,9 @@
 //! Private fixed-capability endpoint IPC for native protection domains.
 
 mod abi;
+mod audit;
+#[cfg(test)]
+mod audit_tests;
 mod capability;
 mod copy;
 mod endpoint;
@@ -21,7 +24,7 @@ use crate::platform::{self, TrapFrame};
 
 use crate::relations::{
     CapabilityFacts, capability_installed, capability_removed, domain_registered, domain_released,
-    endpoint_created, endpoint_reclaimed,
+    endpoint_reclaimed,
 };
 #[cfg(test)]
 use crate::relations::{DeltaCursor, ProjectionEvidence, Snapshot};
@@ -286,6 +289,8 @@ fn unbind_members_without_capabilities(
 }
 
 pub fn prepare_domain(domain: DomainToken) {
+    #[cfg(test)]
+    crate::audit::reset_for_test();
     let mut state = IPC.lock();
     project(
         domain_registered(&mut state.relations, domain),
@@ -497,49 +502,7 @@ fn dispatch(
 }
 
 fn endpoint_create(domain: DomainToken) -> Result<(u64, u64), IpcError> {
-    let mut state = IPC.lock();
-    let generation =
-        ObjectGeneration::new(state.next_object_generation).ok_or(IpcError::NoSpace)?;
-    let mut endpoint = Endpoint::new(generation);
-    if !endpoint.bind(domain) {
-        return Err(IpcError::Busy);
-    }
-    let index = state
-        .objects
-        .iter()
-        .position(|object| object.is_none())
-        .ok_or(IpcError::NoSpace)?;
-    let slot = state.capabilities[domain.slot().index()]
-        .free_slot(domain)
-        .ok_or(IpcError::NoSpace)?;
-    let id = EndpointId::try_new(index)?;
-    state.capabilities[domain.slot().index()].install(
-        domain,
-        slot,
-        Capability {
-            endpoint: id,
-            rights: Rights::ALL,
-            generation,
-            parent: None,
-        },
-    )?;
-    state.objects[index] = Some(endpoint);
-    state.next_object_generation += 1;
-    project(
-        endpoint_created(
-            &mut state.relations,
-            domain,
-            CapabilityFacts::new(
-                u64::from(slot.get()),
-                generation.get(),
-                generation.get(),
-                Rights::ALL.bits(),
-            ),
-        ),
-        "endpoint_create",
-    );
-    project_relation_evidence(&mut state, domain);
-    Ok((0, u64::from(slot.get())))
+    audit::endpoint_create(domain)
 }
 
 fn send(frame: &TrapFrame, domain: DomainToken) -> Result<(u64, u64), IpcError> {

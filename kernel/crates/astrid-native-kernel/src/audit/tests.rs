@@ -74,11 +74,11 @@ fn encode_frame(
 /// Models the independently trusted kernel-origin anchor channel: the
 /// kernel's live context is injected into the verifier directly, never
 /// through the untrusted handoff.
-fn anchor_of(live: AuditAuthority) -> native_audit_verifier::AuthContext {
+fn anchor_of(live: &AuditAuthority) -> native_audit_verifier::AuthContext {
     native_audit_verifier::AuthContext::from_trusted_anchor(
         live.context().authority_id(),
         live.boot().bytes(),
-        live.context().verification_key().bytes(),
+        *live.context().verification_key().bytes(),
     )
     .unwrap()
 }
@@ -88,7 +88,7 @@ fn foreign(boot_byte: u8) -> AuditAuthority {
 }
 
 fn host_context() -> native_audit_verifier::AuthContext {
-    anchor_of(authority())
+    anchor_of(&authority())
 }
 
 fn host_handoff() -> [u8; native_audit_verifier::AUTHORITY_HANDOFF_BYTES] {
@@ -100,14 +100,38 @@ fn verifier() -> native_audit_verifier::AuditVerifier {
         .unwrap()
 }
 
+fn retained_verifier() -> native_audit_verifier::RetainedAuditVerifier {
+    verifier().into_retained_evidence()
+}
+
 fn genesis_chain(chain_boot: BootSessionId) -> AuditChain {
     AuditChain::genesis(chain_boot, secret()).unwrap()
+}
+
+fn test_root_hasher() -> root::RootHasher {
+    root::RootHasher::new()
+}
+
+fn attacker_handoff_tag(boot: BootSessionId, authority_id: u64, key: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Hasher::new_keyed(key);
+    hasher.update(root::VERIFIER_HANDOFF_DOMAIN_TAG);
+    hasher.update(&super::CODEC_VERSION.to_le_bytes());
+    hasher.update(&boot.bytes());
+    hasher.update(&authority_id.to_le_bytes());
+    hasher.finalize().into()
+}
+
+static RUNTIME_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+pub(super) fn runtime_test_guard() -> spin::MutexGuard<'static, ()> {
+    RUNTIME_TEST_LOCK.lock()
 }
 
 #[test]
 fn roundtrip_and_injectivity() {
     let chain_boot = boot();
-    let genesis = root::genesis(chain_boot);
+    let root_hasher = test_root_hasher();
+    let genesis = root_hasher.genesis(chain_boot);
     let cases = [
         domain_event(AuditClass::DomainCreate),
         domain_event(AuditClass::IpcSend)
@@ -151,7 +175,9 @@ fn rejects_malformed_non_canonical_and_disclosing_inputs() {
     let event = domain_event(AuditClass::DomainAdmit)
         .with_object(capability_object(1, 0, 1, 1))
         .unwrap();
-    let valid = encode_frame(chain_boot, 1, &event, Some(root::genesis(chain_boot)));
+    let root_hasher = test_root_hasher();
+    let genesis = root_hasher.genesis(chain_boot);
+    let valid = encode_frame(chain_boot, 1, &event, Some(genesis));
 
     let truncated = &valid.as_slice()[..valid.len - 1];
     assert!(matches!(decode(truncated), Err(AuditError::MalformedFrame)));
@@ -162,7 +188,6 @@ fn rejects_malformed_non_canonical_and_disclosing_inputs() {
         decode(&slack[..=valid.len]),
         Err(AuditError::MalformedFrame)
     ));
-
     let mut bad_class = FrameBuf::new(valid.as_slice());
     let class_index = 4 + 2 + 16 + 8;
     bad_class.bytes[class_index] = 0;
@@ -179,7 +204,7 @@ fn rejects_malformed_non_canonical_and_disclosing_inputs() {
             subject(0, 1),
             DenialContext::new(DenialReason::StaleIdentity, [0; 8]),
         ),
-        Some(root::genesis(chain_boot)),
+        Some(genesis),
     );
     assert!(matches!(
         decode(denial.as_slice()),
@@ -199,7 +224,7 @@ fn rejects_malformed_non_canonical_and_disclosing_inputs() {
 fn append_folds_with_mandatory_source_root() {
     let chain_boot = boot();
     let mut chain = genesis_chain(chain_boot);
-    let mut host_verifier = verifier();
+    let mut host_verifier = verifier().into_retained_evidence();
 
     for expected_seq in 1u64..=5 {
         let class = match expected_seq {
@@ -217,7 +242,9 @@ fn append_folds_with_mandatory_source_root() {
 
         chain.relay_mut().grant_credits(1).unwrap();
         let record = chain.relay_mut().take().unwrap();
-        let receipt = host_verifier.fold(record.frame(), record.root()).unwrap();
+        let receipt = host_verifier
+            .fold_retained_evidence(record.frame(), record.root())
+            .unwrap();
         assert_eq!(receipt.seq(), seq);
         assert_eq!(host_verifier.root(), *chain.root());
     }
@@ -247,28 +274,32 @@ fn tamper_is_invalid_gap_is_incomplete_duplicate_is_invalid() {
         assert_eq!(count, 3);
     }
 
-    let mut host_verifier = verifier();
+    let mut host_verifier = verifier().into_retained_evidence();
     let mut tampered = FrameBuf::new(records[0].as_slice());
     let last = tampered.len - 1;
     tampered.bytes[last] ^= 0xFF;
     assert!(matches!(
-        host_verifier.fold(tampered.as_slice(), roots[0]),
+        host_verifier.fold_retained_evidence(tampered.as_slice(), roots[0]),
         Err(native_audit_verifier::FoldFailure::Invalid(_))
     ));
 
-    let mut host_verifier = verifier();
-    host_verifier.fold(records[0].as_slice(), roots[0]).unwrap();
+    let mut host_verifier = verifier().into_retained_evidence();
+    host_verifier
+        .fold_retained_evidence(records[0].as_slice(), roots[0])
+        .unwrap();
     assert!(matches!(
-        host_verifier.fold(records[2].as_slice(), roots[2]),
+        host_verifier.fold_retained_evidence(records[2].as_slice(), roots[2]),
         Err(native_audit_verifier::FoldFailure::Incomplete(
             native_audit_verifier::IncompleteReason::SequenceGap
         ))
     ));
 
-    let mut host_verifier = verifier();
-    host_verifier.fold(records[0].as_slice(), roots[0]).unwrap();
+    let mut host_verifier = verifier().into_retained_evidence();
+    host_verifier
+        .fold_retained_evidence(records[0].as_slice(), roots[0])
+        .unwrap();
     assert!(matches!(
-        host_verifier.fold(records[0].as_slice(), roots[0]),
+        host_verifier.fold_retained_evidence(records[0].as_slice(), roots[0]),
         Err(native_audit_verifier::FoldFailure::Invalid(
             native_audit_verifier::InvalidReason::DuplicateOrReorder
         ))
@@ -285,27 +316,30 @@ fn foreign_boot_and_missing_previous_root_are_invalid() {
     let foreign_authority = foreign(8);
     let mut foreign = native_audit_verifier::AuditVerifier::genesis(
         [8; 16],
-        anchor_of(foreign_authority),
+        anchor_of(&foreign_authority),
         &foreign_authority.verifier_handoff(),
     )
-    .unwrap();
+    .unwrap()
+    .into_retained_evidence();
     chain.relay_mut().grant_credits(1).unwrap();
     let record = chain.relay_mut().take().unwrap();
     assert!(matches!(
-        foreign.fold(record.frame(), record.root()),
+        foreign.fold_retained_evidence(record.frame(), record.root()),
         Err(native_audit_verifier::FoldFailure::Invalid(
             native_audit_verifier::InvalidReason::ForeignBoot
         ))
     ));
 
-    let mut host_verifier = verifier();
+    let mut host_verifier = verifier().into_retained_evidence();
     let event = domain_event(AuditClass::DomainCreate);
     let frame = Frame::new(chain_boot, 1, &event, None).unwrap();
     let mut buf = [0; MAX_FRAME_BYTES];
     let encoded = frame.encode(&mut buf).unwrap();
-    let expected = root::advance(root::genesis(chain_boot), chain_boot, 1, encoded);
+    let root_hasher = test_root_hasher();
+    let genesis = root_hasher.genesis(chain_boot);
+    let expected = root_hasher.advance(genesis, chain_boot, 1, encoded);
     assert!(matches!(
-        host_verifier.fold(encoded, expected),
+        host_verifier.fold_retained_evidence(encoded, expected),
         Err(native_audit_verifier::FoldFailure::Invalid(
             native_audit_verifier::InvalidReason::PreviousRootMismatch
         ))
@@ -313,24 +347,19 @@ fn foreign_boot_and_missing_previous_root_are_invalid() {
 }
 
 #[test]
-fn sequence_overflow_fails_closed_without_commit() {
-    let chain_boot = boot();
-    let checkpoint =
-        AuditCheckpoint::seal(chain_boot, u64::MAX - 1, [9; 32], 1, authority().context()).unwrap();
-    let mut chain = AuditChain::restore(checkpoint, authority()).unwrap();
-    let before = (chain.seq(), *chain.root());
+fn foreign_boot_checkpoint_is_rejected() {
+    let foreign_boot = BootSessionId::new([0x2A; 16]).unwrap();
     assert_eq!(
-        chain.append(domain_event(AuditClass::DomainCreate)),
-        Err(AuditError::SequenceOverflow)
+        AuditCheckpoint::seal(foreign_boot, 1, [3; 32], 1, authority().context()),
+        Err(AuditError::CheckpointMismatch)
     );
-    assert_eq!((chain.seq(), *chain.root()), before);
 }
 
 #[test]
 fn ack_requires_take_in_flight_and_matching_folded_root() {
     let chain_boot = boot();
     let mut chain = genesis_chain(chain_boot);
-    let mut host_verifier = verifier();
+    let mut host_verifier = retained_verifier();
     chain
         .append(domain_event(AuditClass::DomainCreate))
         .unwrap();
@@ -339,7 +368,9 @@ fn ack_requires_take_in_flight_and_matching_folded_root() {
     chain.relay_mut().grant_credits(1).unwrap();
     let first = chain.relay_mut().take().unwrap();
     assert_eq!(chain.relay().redeliver().count(), 2);
-    let first_receipt = host_verifier.fold(first.frame(), first.root()).unwrap();
+    let first_receipt = host_verifier
+        .fold_retained_evidence(first.frame(), first.root())
+        .unwrap();
     assert_eq!(
         chain.ack(first.seq(), first.root(), [0; 32]),
         Err(AuditError::RootMismatch)
@@ -362,7 +393,9 @@ fn ack_requires_take_in_flight_and_matching_folded_root() {
     );
     chain.relay_mut().grant_credits(1).unwrap();
     let second = chain.relay_mut().take().unwrap();
-    let second_receipt = host_verifier.fold(second.frame(), second.root()).unwrap();
+    let second_receipt = host_verifier
+        .fold_retained_evidence(second.frame(), second.root())
+        .unwrap();
     chain
         .ack(
             second.seq(),
@@ -391,7 +424,7 @@ fn ack_before_take_does_not_retire_a_buffered_slot() {
 }
 
 #[test]
-fn restored_checkpoint_preserves_trusted_relay_generation() {
+fn resync_checkpoint_preserves_trusted_relay_generation() {
     let chain_boot = boot();
     let mut chain = genesis_chain(chain_boot);
     for _ in 0..AUDIT_RELAY_SLOTS {
@@ -402,12 +435,10 @@ fn restored_checkpoint_preserves_trusted_relay_generation() {
     let checkpoint = chain.resync().unwrap();
     assert_eq!(checkpoint.relay_generation(), 2);
 
-    let restored = AuditChain::restore(checkpoint, authority()).unwrap();
-    assert_eq!(restored.boot(), checkpoint.boot());
-    assert_eq!(restored.seq(), checkpoint.seq());
-    assert_eq!(*restored.root(), checkpoint.root());
-    assert_eq!(restored.relay().generation(), 2);
-    assert!(restored.relay().redeliver().next().is_none());
+    assert_eq!(checkpoint.boot(), chain.boot());
+    assert_eq!(checkpoint.seq(), chain.seq());
+    assert_eq!(checkpoint.root(), *chain.root());
+    assert_eq!(checkpoint.relay_generation(), chain.relay().generation());
 }
 
 #[test]
@@ -474,19 +505,20 @@ fn verifier_sequence_overflow_is_atomic_and_repeatable() {
         host_context(),
         &host_handoff(),
     )
-    .unwrap();
+    .unwrap()
+    .into_retained_evidence();
     let before = (verifier.next_seq(), verifier.root());
     let event = domain_event(AuditClass::DomainCreate);
     let frame = Frame::new(boot(), u64::MAX, &event, Some([9; 32])).unwrap();
     let mut buf = [0; MAX_FRAME_BYTES];
     let encoded = frame.encode(&mut buf).unwrap();
-    let claimed = root::advance([9; 32], boot(), u64::MAX, encoded);
+    let claimed = test_root_hasher().advance([9; 32], boot(), u64::MAX, encoded);
     assert_eq!(
-        verifier.fold(encoded, claimed),
+        verifier.fold_retained_evidence(encoded, claimed),
         Err(native_audit_verifier::FoldFailure::SequenceOverflow)
     );
     assert_eq!(
-        verifier.fold(encoded, claimed),
+        verifier.fold_retained_evidence(encoded, claimed),
         Err(native_audit_verifier::FoldFailure::SequenceOverflow)
     );
     assert_eq!((verifier.next_seq(), verifier.root()), before);
@@ -500,10 +532,10 @@ fn explicitly_mismatched_previous_root_is_invalid() {
     let frame = Frame::new(chain_boot, 1, &event, Some(wrong_previous)).unwrap();
     let mut buf = [0; MAX_FRAME_BYTES];
     let encoded = frame.encode(&mut buf).unwrap();
-    let claimed = root::advance(wrong_previous, chain_boot, 1, encoded);
-    let mut host_verifier = verifier();
+    let claimed = test_root_hasher().advance(wrong_previous, chain_boot, 1, encoded);
+    let mut host_verifier = retained_verifier();
     assert!(matches!(
-        host_verifier.fold(encoded, claimed),
+        host_verifier.fold_retained_evidence(encoded, claimed),
         Err(native_audit_verifier::FoldFailure::Invalid(
             native_audit_verifier::InvalidReason::PreviousRootMismatch
         ))
@@ -520,7 +552,9 @@ fn kernel_and_verifier_reject_zero_relay_generation() {
     encode_checkpoint(&chain.checkpoint(), authority().context(), &mut wire).unwrap();
     let generation_offset = 4 + 2 + 16 + 8 + 32;
     wire[generation_offset..generation_offset + 8].copy_from_slice(&0u64.to_le_bytes());
-    let zero_tag = root::checkpoint_tag(chain_boot, seq, root, 0, &authority().context());
+    let zero_tag = authority()
+        .context()
+        .checkpoint_tag(chain_boot, seq, root, 0);
     let tag_offset = native_audit_verifier::CHECKPOINT_WIRE_BYTES - 32;
     wire[tag_offset..].copy_from_slice(&zero_tag);
 
@@ -557,14 +591,17 @@ fn resync_is_generation_bound_and_restores_flow() {
         host_context(),
         &host_handoff(),
     )
-    .unwrap();
+    .unwrap()
+    .into_retained_evidence();
     assert_eq!(host_verifier.root(), *chain.root());
 
     let seq = chain.append(domain_event(AuditClass::DomainEnter)).unwrap();
     chain.relay_mut().grant_credits(1).unwrap();
     let record = chain.relay_mut().take().unwrap();
     assert_eq!(record.seq(), seq);
-    let receipt = host_verifier.fold(record.frame(), record.root()).unwrap();
+    let receipt = host_verifier
+        .fold_retained_evidence(record.frame(), record.root())
+        .unwrap();
     assert_eq!(receipt.seq(), seq);
 }
 
@@ -635,11 +672,12 @@ fn foreign_or_arbitrary_context_cannot_authenticate_or_retire() {
     );
 
     let foreign_authority = foreign(8);
-    let foreign_context = anchor_of(foreign_authority);
+    let foreign_context = anchor_of(&foreign_authority);
+    let genesis_context = anchor_of(&foreign_authority);
     assert!(matches!(
         native_audit_verifier::AuditVerifier::genesis(
             chain_boot.bytes(),
-            foreign_context,
+            genesis_context,
             &foreign_authority.verifier_handoff()
         ),
         Err(native_audit_verifier::VerifyFailure::Malformed)
@@ -702,7 +740,7 @@ fn structurally_valid_self_authenticated_handoff_is_rejected() {
     forged[8..16].copy_from_slice(&live.context().authority_id().to_le_bytes());
     forged[16..32].copy_from_slice(&chain_boot.bytes());
     let attacker_tag =
-        root::verifier_handoff_tag(chain_boot, live.context().authority_id(), &attacker_key);
+        attacker_handoff_tag(chain_boot, live.context().authority_id(), &attacker_key);
     forged[32..].copy_from_slice(&attacker_tag);
 
     assert_eq!(
@@ -718,7 +756,7 @@ fn structurally_valid_self_authenticated_handoff_is_rejected() {
     let foreign_boot = foreign(9);
     let mut foreign = forged;
     foreign[16..32].copy_from_slice(&foreign_boot.boot().bytes());
-    let foreign_tag = root::verifier_handoff_tag(
+    let foreign_tag = attacker_handoff_tag(
         foreign_boot.boot(),
         live.context().authority_id(),
         &attacker_key,
@@ -736,6 +774,7 @@ fn observed_public_derivation_cannot_forge_binding_or_material() {
     let live = authority();
     let handoff = live.verifier_handoff();
     let genuine_anchor = host_context();
+    let genesis_anchor = host_context();
 
     // Reconstruct the rejected public-only derivation from exactly the
     // fields an observer can read out of the untrusted handoff.
@@ -748,11 +787,7 @@ fn observed_public_derivation_cannot_forge_binding_or_material() {
     let old_key: [u8; 32] = old_key_hasher.finalize().into();
 
     let mut forged_handoff = handoff;
-    forged_handoff[32..].copy_from_slice(&root::verifier_handoff_tag(
-        chain_boot,
-        observed_id,
-        &old_key,
-    ));
+    forged_handoff[32..].copy_from_slice(&attacker_handoff_tag(chain_boot, observed_id, &old_key));
     assert_eq!(
         genuine_anchor.bind_handoff(&forged_handoff),
         Err(native_audit_verifier::VerifyFailure::HandoffUnbound)
@@ -760,7 +795,7 @@ fn observed_public_derivation_cannot_forge_binding_or_material() {
     assert!(matches!(
         native_audit_verifier::AuditVerifier::genesis(
             chain_boot.bytes(),
-            genuine_anchor,
+            genesis_anchor,
             &forged_handoff
         ),
         Err(native_audit_verifier::VerifyFailure::HandoffUnbound)
@@ -880,11 +915,13 @@ fn forged_retirement_receipt_is_rejected() {
     chain
         .append(domain_event(AuditClass::DomainCreate))
         .unwrap();
-    let mut host_verifier = verifier();
+    let mut host_verifier = retained_verifier();
 
     chain.relay_mut().grant_credits(1).unwrap();
     let record = chain.relay_mut().take().unwrap();
-    let genuine = host_verifier.fold(record.frame(), record.root()).unwrap();
+    let genuine = host_verifier
+        .fold_retained_evidence(record.frame(), record.root())
+        .unwrap();
 
     // A receipt minted under an attacker-chosen key fails even with the
     // correct folded root, sequence, frame, and source root.
@@ -920,4 +957,19 @@ fn batch_reserve_is_static_and_inside_the_window() {
     // Statically re-proves the relay's own compile-time headroom invariant
     // from the test side, keeping the reserve story falsifiable here too.
     const { assert!(AUDIT_RELAY_SLOTS >= MAX_TERMINAL_RECORDS_PER_BATCH) }
+}
+
+#[test]
+fn second_custody_install_cannot_replace_the_live_boot() {
+    let _ipc_runtime_guard = crate::ipc::test_support::test_lock();
+    let _runtime_guard = runtime_test_guard();
+    crate::audit::reset_for_test();
+    let replacement = crate::audit::install_for_test(
+        BootSessionId::new([8; 16]).unwrap(),
+        KernelSecretEntropy::new([0x51; 32]).unwrap(),
+    );
+    assert_eq!(
+        replacement,
+        Err(crate::audit::AuditInstallError::AlreadyInstalled)
+    );
 }
