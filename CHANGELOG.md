@@ -9,293 +9,190 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
-### Fixed
-
-- **`astrid status` and `astrid mcp serve` no longer treat an unlinked
-  `system.sock` as a stopped daemon.** If the recorded PID is still alive,
-  status fails closed and MCP refuses to spawn a second kernel onto the
-  singleton lock. Run `astrid restart`. Closes #1572.
-- **Capsule restart budget now survives runtime generation replacement.**
-  Health-monitor restart trackers are keyed by generation-independent runtime
-  identity so a persistently failing run loop reaches the five-attempt cap
-  instead of resetting on every replacement. Refs #1541.
-- **macOS upgrade proof no longer treats every FSKit mount failure as an
-  allowed gap.** The FSKit provider emits a CLI-valid structured failure with
-  machine code `fskit-extension-unavailable` and keeps `FSKIT_EXTENSION_UNAVAILABLE`
-  in the sanitized message only for missing/disabled extension signals
-  (including mount status 72). Messages are stripped of control characters and
-  bounded to 4096 bytes so `astrid storage` can render them instead of rejecting
-  the provider as an invalid structured error. Generic mount, permission, lease,
-  and rollback failures stay `provider-operation` hard errors. Closes #1567.
-### Added
-
-- **A run-loop capsule serving a loopback TCP port can now handle connections
-  concurrently.** A `#[astrid::run]` capsule that declares a TCP `net_bind` and
-  no `host_process` may set `bind_workers = N` to run N worker Stores, each
-  executing `run()` against ONE shared bound listener — the OS accept queue
-  load-balances. Previously a single Store served every connection serially, so
-  a client fanning out parallel requests queued behind itself. Unix-only
-  `net_bind` stays at one worker (per-Store Wasmtime reps would collide in a
-  shared identity map). `N = 1` is unchanged behaviour: a second `bind_tcp` on
-  the same HostState is AddressInUse, identity maps are not cloned across
-  workers, and interceptors are held at one worker because N subscriptions
-  would double-process every event. Last slot drop evicts the shared listener
-  so the OS socket actually closes and quota tracks the live socket rather
-  than the binder slot; interceptor pool instances do not share that
-  registry. Closes #1231.
-
-### Changed
-
-- **Adversarial regression coverage now pins public runtime boundaries.**
-  Principal-owned IPC subscriptions, bounded seatbelt checks, event topic depth
-  and accessors, workspace-relative approval boundaries, and resource-pattern
-  semantics are each locked by dedicated regressions.
-
-- **Reviewed semver-compatible Rust dependencies were refreshed independently
-  of migration-sensitive upgrades.** Routine fixes and additive releases for
-  the async runtime, serialization, TLS, storage, CLI, matching, and platform
-  support stack are updated without changing rmcp, Wasmtime/WASM tooling,
-  TOML, base64, or other dependencies that require dedicated migration review.
-  Closes #1529.
-### Added
-
-- **Owner-scoped KV updates can now publish bounded conditional batches through
-  one durable root transition.** The native principal store adds governed hot
-  reads and a single-sync transaction WAL on the Astrid volume, serves published
-  state from a recovery-safe pending overlay, and folds canonical arena/root/index
-  state at explicit durability and maintenance boundaries. WAL bytes live in the
-  `transactions.wal` volume region rather than a host PathBuf. The KV hot cache
-  stays disabled until an embedding supplies a reserved or governed budget;
-  `KvReadCacheConfig::default()` retains nothing. Recovery still replays an
-  existing WAL when `TransactionWalPolicy` is later disabled. Existing backends
-  retain their explicit unsupported fallback, while canonical object/root formats,
-  quota accounting, and one-owner rejection remain unchanged. Closes #1561.
-  Public recovery/hot-cache surfaces added with this work: `ReadyKvRoot`,
-  `KvProjectionEngine::current_kv_root_if_ready`, and
-  `FaultPoint::AfterWalPublication`.
-
-- **Astrid storage now exposes authoritative principal, fleet, and system-owner
-  filesystem views without a host-directory projection.** Regular files remain
-  immutable content DAGs, directories live in the same owner catalog, and
-  acknowledged create, write, truncate, remove, rename, and sync operations
-  atomically publish through the typed store. Kernel-issued leases bind owner,
-  access, expiry, and a private callback secret. Native mounted views ship through
-  the macOS 26 FSKit app and lifecycle companion, Linux FUSE companion, and
-  Windows WinFsp companion. All three adapters use the same bounded V2 callback
-  contract while the kernel retains V1 decoding compatibility. Mounting exposes
-  an already-authorized owner root; it never provisions a user, principal, fleet,
-  store, or allocation. Refs #1391 and #1534.
-- **macOS storage mounts now ship as a complete governed release surface.**
-  The archive includes the signed Developer ID AstridFS app and FSKit
-  extension, the Rust companion, deterministic metadata, notarization and staple
-  validation, and install/update/enable/status/uninstall lifecycle tooling.
-  Mount resources and registries use current-owner `0700`/`0600` entries,
-  reject redirected paths, and refuse public or foreign mountpoints unless the
-  provider creates an owner-private governed entry.
-- **The authoritative principal store now opens through a path-free Astrid
-  volume contract.** Hosted systems keep all arena, root, index, cutover, and
-  GC-outbox regions in one locked `var/astrid.volume` container; bare-metal
-  storage can implement the same exact-offset and transactional contract over a
-  device without inheriting host-directory semantics. Volume metadata commits
-  atomically bind a compacted arena replacement to its ready audit receipt, and
-  recovery rejects interior corruption while retiring only incomplete tails.
-  The verified directory-backed store is now migration input and is deleted
-  after exact owner snapshots reopen from the volume.
-- **Astrid home layout version two now has a crash-resumable release upgrade
-  boundary and canonical fleet-served paths.** New homes create
-  `srv/fleets/{fleet_uid}/{shared,workspaces}` and durable migration records;
-  released layout-one homes keep their sentinel until the principal store and
-  ownership graph have migrated, adopt otherwise-unowned legacy principals
-  into the operator's home fleet, preserve principal and system files, retain
-  `var/state.db` read-only on Unix, and write layout `2` last. Canonical
-  content-bound intent/receipt records, exact sentinel admission, redirected
-  path rejection, and the separate fleet-aware owner codec fail closed. The new
-  `astrid storage mount|sync|status|unmount` grammar uses a versioned typed
-  exchange with a co-installed FSKit, libfuse, or WinFsp provider, including
-  capability validation and stable mount IDs, without provisioning storage.
-  Refs #1391.
-  boundary.** Released layout-one homes keep their sentinel until the principal
-  store and ownership graph have migrated, adopt otherwise-unowned legacy
-  principals into the operator's home fleet, and preserve private runtime
-  configuration. After the content-bound receipt and layout `2` sentinel are
-  durable, the verified `var/state.db` import source is deleted. No physical
-  `srv/fleets/...` or other served copy is created. Exact sentinel admission,
-  redirected-path rejection, and the separate fleet-aware owner codec fail
-  closed.
-
-### Changed
-
-- **Reviewed semver-compatible Rust dependencies were refreshed independently
-  of migration-sensitive upgrades.** Routine fixes and additive releases for
-  the async runtime, serialization, TLS, storage, CLI, matching, and platform
-  support stack are updated without changing rmcp, Wasmtime/WASM tooling,
-  TOML, base64, or other dependencies that require dedicated migration review.
-  Closes #1529.
+## [0.11.0] - 2026-09-01
 
 ### Fixed
 
-- **Host-process file injections are bounded.** Injection payload size and
-  count are capped so a guest cannot exhaust host memory through injection
-  volume.
-- **Approved capsule executables are pinned to approved content.** The
-  kernel-owned install receipt records the exact approved WASM hash and rejects
-  both pointer and content swaps after authority approval.
-- **Uplink authentication honors the keypair method gate.** A device key that
-  remains on disk cannot authenticate a principal after keypair authentication
-  is removed from the profile's active methods.
-- **WASM table growth and in-flight CPU fuel are now bounded.** Guests
-  cannot exceed advertised table-size or fuel budgets through table growth or
-  concurrent in-flight calls. Each invocation now reserves a divided share of the
-  per-principal window so nested prompt-pipeline calls coexist while total
-  in-flight reservations stay within the per-second budget. The per-principal
-  allowance is configurable as `quotas.max_in_flight_calls` (default 4, bounds
-  1-64); the fuel-share helper in `astrid-capsule-types` stays policy-free and
-  takes the allowance as a parameter.
-- **Storage group leadership recovers after a leader panic.** Surviving
-  members reclaim the group instead of leaving recovery permanently wedged
-  behind the departed leader.
-- **Failed MCP server connections clean up their child processes.** A failed
-  handshake awaits owned process-tree termination instead of leaking the
-  failed startup's descendants.
+- **Production compaction retention preserves every standalone bootstrap
+  object.** `RuntimePrincipalStore` now builds scheduler-facing retention from
+  one typed bootstrap registry, adds each registered object as a `System` root,
+  and verifies its presence before returning a policy for proof. The raw
+  durable engine remains policy-neutral, while native composition can no
+  longer silently collect the RÚNATAL specification and discover the damage
+  only when the store next opens. Closes #1408.
+- **Kernel management rate limits no longer cross authorization boundaries.**
+  Requests consume a principal-and-method-scoped action budget only after
+  principal and device-scope authorization succeeds. A restricted caller or
+  device can no longer exhaust another authorized caller's shutdown, reload,
+  install, or workspace-operation allowance; rate-limit rejections are audited
+  as failures, and expired principal buckets are retired. Closes #1378.
+- **Fresh Windows capsule installs provision private runtime and principal
+  homes.** Capsule signing and authority inspection now create and validate the
+  Astrid directory tree before generating the runtime identity, secure the new
+  key with an exact private file ACL, and provision the selected principal
+  boundary before mutating a capsule target. Existing unsafe homes remain
+  rejected. Unix install behavior is unchanged, and workspace targets continue
+  to use their checked selection path. Closes #1366.
+- **Windows builds retain the cross-platform key persistence contract.** The
+  non-Unix parent-directory sync shim keeps the same fallible interface as the
+  Unix implementation without failing the native ARM64 Clippy gate. Closes
+  #1361.
+- **Linux release binaries now run on glibc 2.34 enterprise hosts.** The
+  x86_64 and ARM64 GNU artifacts are built in a pinned glibc 2.31 environment,
+  and release publication rejects binaries whose ELF symbol requirements
+  exceed glibc 2.34. Closes #1322.
+- **Ephemeral daemons now shut down when their final client disconnects.**
+  Client leases, rather than loaded uplink capsules or a 30-second idle timer,
+  own ephemeral process liveness. The never-connected fallback starts only
+  after daemon readiness, and lease accounting bypasses the lossy broadcast
+  queue so an event storm cannot hide a live client. Persistent daemons retain
+  their explicit operator-controlled lifetime. Closes #1296.
+- **Capsule lifecycle hooks preserve the target principal.** Explicit-principal
+  installs now provision and scope lifecycle `home://`, KV, secrets, and IPC
+  identity to the authenticated install target instead of silently executing
+  the hook as the bootstrap `default` principal.
+- **Gateway env schemas now use the authenticated principal's capsule registry
+  or verified workspace.** Schema reads no longer fall back to `default`, so
+  non-default and workspace-only installs are configurable and a same-named
+  default capsule cannot supply the wrong field contract. Closes #1327.
+- **Secret commands now read manifests from the selected principal registry or
+  verified workspace.** Secret set, list, and delete no longer fall back to
+  `default`, while workspace-only capsule secrets retain their declared
+  classification and remain out of plaintext env configuration. Closes #1325.
+- **Per-agent CLI commands now inherit the global `--principal`.** A
+  command-local target such as `--agent` still wins, but omitting it uses the
+  process principal already resolved from the flag, environment, or active
+  context instead of re-reading and potentially selecting a different context.
+  Closes #1326.
+- **Capsule registry queries now honor `--principal`.** The `capsule list`,
+  `capsule tree`, and `capsule deps` commands pass the process-wide
+  authenticated principal into capsule discovery instead of falling back to
+  the bootstrap `default` principal, so diagnostics match the capsule view
+  that the daemon loads. Closes #1112.
+- **SVG URL sanitization uses the patched `ammonia` release.** The locked
+  transitive dependency is updated to 4.1.4 so crafted animation attributes
+  cannot preserve a `javascript:` URL and the workspace security audit no
+  longer accepts the vulnerable 4.1.3 release. Closes #1336.
+- **Stable crates publication installs its authenticated-hash prerequisite.**
+  The protected publisher installs the pinned `b3sum` binary before validating
+  the exact dev candidate, so BLAKE3 release metadata checks run before any
+  crates.io mutation instead of failing on a missing executable. Closes #1294.
+- **Channel promotion starts successfully after the stable crates workflow
+  split.** The reusable stable publisher now declares its optional named
+  crates.io secret while the protected release environment remains the actual
+  credential authority, so GitHub can validate dev, nightly, and stable
+  dispatches without broadly inheriting caller secrets. Closes #1292.
 
-- **SurrealKV now preserves memtable rotation and compaction durability through
-  its 0.21.3 fixes.** The update corrects atomic memtable rotation and fsyncs
-  post-compaction state so power loss cannot strand the newly compacted store.
-  Closes #1508.
+- Ignore unknown keys in principal profile TOML so extra quota fields from older
+  or unreleased binaries do not fail boot. `profile_version` remains the
+  breaking-change gate. Closes #1574
 
-- **WASM traps and host process spawning now coexist safely on macOS.** Astrid
-  uses Wasmtime's Unix signal trap handler on macOS instead of the default
-  Mach-port handler, which can abort embeddings that create child processes.
-  Other platforms and process-group lifecycle semantics are unchanged. Closes
-  #1502.
+- Coerce persisted quotas.max_cpu_fuel_per_sec = 0 to the documented default on load so existing homes boot. Zero remains invalid to save. Closes #1576
 
-- **The KV retirement regression now fails deterministically instead of
-  wedging the workspace suite.** Its admitted-effect boundary uses an exact
-  two-party rendezvous, observes the quiescence waiter's active-operation
-  sample directly, and bounds completion assertions, preserving the
-  quiescence invariant without scheduler races or lost test signals.
-  Closes #1498.
+- Layout-1 leftover `home/<alias>` directories and unmatched alias-stamped
+  capsule KV namespaces without a durable identity no longer fail store import
+  or layout-2 cutover. Empty non-default `.local/audit` directories are retired
+  instead of refusing cutover; non-empty leftovers are quarantined with bytes
+  preserved. Invalid names are quarantined. Released 0755 `.local/{kv,tokens,tmp}`
+  trees are tightened to 0700 on first cut-over; non-empty kv/tokens still fail
+  closed. `astrid start` waits for `timeouts.daemon_ready_secs` (default 600) and
+  does not SIGKILL a still-running first cutover. Workspace-match / `agent list`
+  does not reload that config after logging is live. Closes #1577
 
-- **Principal retirement no longer loses its final quiescence wakeup.** The
-  host-operation drain registers for notification before sampling the active
-  count, so an operation completing in that window cannot leave agent deletion
-  or capsule unload waiting forever. Closes #1497.
+- Filesystem parent checks no longer list the owner catalog. Directory existence uses `describe` or `prefix_exists`; a confirmed parent is cached so extra writes skip `list`, `list_prefix`, and per-file directory probes. Successful catalog commits retain the decoded header so N puts do not re-decode the principal graph. Hosted volume reads copy only overlapping extents, including tail reads. Closes #1581
 
-- **MCP teardown regression checks now distinguish terminated zombies from
-  executable descendants on macOS.** Process-tree shutdown remains strict for
-  live children while allowing the platform reaper to retain an already-dead
-  orphan briefly as a zombie. Closes #1495.
+- Relocated layout-1 homes no longer fail cutover on leftover capsule-authority receipts hashed from a previous absolute path. Unique leftovers are rebound onto the current native target and published into durable authority; remaining leftovers are quarantined with their original bytes, then removed from the live receipt directory. Closes #1583
 
-- **Runtime regression checks no longer race scheduler and principal readiness.** Watchdog fan-out now pauses between bounded batches instead of treating a cooperative yield as broadcast backpressure; process-group cancellation tests use explicit descendant gates; and crash-recovery probes wait for the target principal's capsule view after each daemon restart. Closes #1493.
+- Layout-1 home import publishes ordinary files as `ContiguousFile` physical payloads (raw blob plus File/ChunkTree identity) instead of `DirectCanonical` chunk frames in the hosted volume journal. Identical bytes share one blob. The volume representation catalogue is activated on Astrid volume media so ObjectId stays logical. Volume recovery rebuilds contiguous slice indexes from blob regions before validating principal-root closures. Closes #1584
 
-- **Lazy WASM pool growth no longer traps after the engine epoch advances.**
-  Component initialization now uses a finite rearming epoch policy instead of
-  an overflowing relative deadline, while deadline-bound interceptor calls
-  still restore trap behavior before guest execution. Closes #1477.
-- **Invocation-local capsule subscriptions are now scoped to the invoking
-  principal.** Concurrent principals waiting on the same static response topic
-  can no longer consume one another's replies. Persistent system fan-in and the
-  explicitly authorized audit firehose remain unscoped. Closes #1476.
-- **Audit persistence no longer serializes unrelated principals or rewrites a
-  growing session index for every action.** Appends retain strict signed-chain
-  ordering per `(session, principal)` while independent chains persist
-  concurrently. Session discovery now uses bounded append-only commit records,
-  preserves insertion order, reads legacy indexes, and recovers safely across
-  write failures and cancellation before or after durable publication. Closes
-  #1478.
-- **Principal-resident WASM run loops now enter `run` with their typed runtime owner's durable KV, home, secrets, env, profile, and host-call budgets.** Autonomous work no longer falls back to `default`, a first loader, or neutral state, and explicit system-resident loops remain authority-neutral. Closes #1224; refs #1197.
-- **Single-principal capsule provisioning no longer refreshes the full fleet's
-  tool inventory.** Agent creation, derivation, profile mutation, background
-  warm-up, and scoped readiness probes now describe and publish only the
-  affected principal view; genuinely global load and lifecycle changes retain
-  the existing all-principal refresh. Closes #1483.
+- Layout-1 cutover blindly moves the default audit tree into native AuditLog with batched writes and a payload digest. Historical signatures and chains are not recertified at cutover or boot. Closes #1587
 
-- **Executable capsule runtimes are now scoped to immutable principal authority rather than shared by content hash.** Identical verified WASM still reuses compiled Wasmtime artifacts, but each `PrincipalUid` receives separate Stores, component instances, guest memory/globals, run tasks, subscriptions, MCP/native processes, readiness, cancellation, and health generations. Explicit `SystemResident` services remain intentional singletons; principal routes admit only their owner plus kernel events by default; and stale dispatcher, health, source-lookup, and process-handle state cannot cross a replacement generation. Closes #1486.
+- Principal home is admitted to Astrid storage. Layout-2 packs that store unseen; POSIX volume/VFS only translates catalog names to files. Closes #1594
 
-- **Run-loop capsule tools now appear in `tools/list`.** A pool-less run-loop capsule's tool-describe path returned `NotSupported`, which was captured as a present-but-empty tool set, so the describe fan-out — which fires only on *absent* tools — never consulted the capsule's own `tool.v1.request.describe` responder. The load-time capture now distinguishes "couldn't capture" from "captured, empty" and leaves tools absent for pool-less capsules so the fan-out fires. Closes #1198.
-### Removed
+- Layout-1 audit MOVE copies stored KV bytes into native TreeKvStore. No JSON replay, no historical signature recertify. Closes #1596
 
-- **The unused SurrealDB query wrapper and its dormant dependency graph have
-  been removed from `astrid-storage`.** No workspace crate selected the `db`
-  feature, while resolving it retained unsupported `rkyv 0.7.46` and RSA
-  dependencies in `Cargo.lock`. Removing the unused surface eliminates both
-  RustSec exceptions and keeps the audit gate strict. The native principal
-  store and live legacy-SurrealKV migration reader are unchanged. Closes #1448.
-### Added
+- Layout-1 audit MOVE opens the Surreal source read-only. Writes fail. Closes #1598
 
-- **Semantic capability grants are exposed for consent surfaces.** Consent and
-  introspection consumers receive action, scope, and impact cards translated
-  from the raw manifest, with wildcard ports and ephemeral-port grants kept
-  explicit and malformed capability metadata failing closed.
+- Volume ingest no longer journals a full objects.index snapshot and representation catalogue on every file. POSIX rename reclaims those rewrites; ASTVOL2 is append-only, so N files were O(N^2) index plus per-file fsync. Flush keeps index deltas, home import publishes one catalogue CAS per batch, and the container fsyncs once. Closes #1600
 
-- **`astrid agent spawn` — atomic restricted throwaway session.** Creates a derived principal with no caller-selected capability grants from an explicit set of capsule installs, user-invocable capsules, capsule-scoped state namespaces, and outbound endpoints; omitted state and egress remain unavailable. Restricted-principal network and process policy is enforced at host-call time, the CLI provides the wall-clock watchdog and denies approval requests, and teardown reports any unreclaimed state instead of masking it. Part of #1217.
+- Layout-2 live upgrade no longer times out, mills the CPU, or rejects the AOS MCP plugin argv.
 
-### Changed
+  GetStatus and GetAgentReadiness success are not durable admin rows; denies
+  stay audited. Chain-head lookup is metadata + `audit:chain_heads`, not a
+  session scan. Allowed `stat`/`exists`/`readdir` are not signed FileRead
+  rows. Identical host-audit events collapse with an explicit `repeats=N`
+  stamp and never block tokio. A leftover `audit:chain_heads` key is healed
+  from metadata even when the stored bytes disagree or use a non-canonical
+  UUID encoding; missing metadata is reconstructed from the stored head.
+  Head CAS is capped at 8 attempts. Runtime object and KV read caches are
+  on by default. `astrid mcp serve` accepts `--workspace` /
+  `--request-timeout` from AOS host plugins and attaches the session to
+  that project even when the process cwd is the runtime home. Host-audit
+  collapse keys keep the principal and keep denials exact.
+  `audit.host_queue_capacity` now bounds unique pending keys; overflow
+  increments `queue_full` instead of growing an unbounded map.
+  `[rate_limits].capsule_reload_per_min` defaults to 14 (one first-party core-set live reload plus a same-minute retry). The Runtime E2E harness pins that knob so a 7-capsule install burst cannot hard-fail openai-compat on a silent 5/min ReloadCapsule cap.
+  Live capsule activation reads staged `[env]` from host control namespaces (`__env:` / `__secret:`), not guest KV, and `ReloadCapsule` surfaces the inner load error instead of a generic not-found string.
+  Environment writes now refresh only the addressed principal's loaded capsule, while newly assigned capsules receive staged non-secret install environment without copying secrets.
+  Install-time required secrets stage as Shared (`system:control:secret:{capsule}`) so a newly assigned principal can resolve the site `api_key` without copying secrets; `resolve_env` reads the principal control store first, then that Shared fallback. Guest KV still does not satisfy load. openai-compat Capsule.toml `temperature` default remains a capsule-repo residual unless CI loads an in-tree fixture.
+  Runtime E2E secret-list assertions accept the agent row plus an optional Shared site credential while retaining governed-storage and redaction checks.
 
-- **Core configuration parsing now uses one TOML 0.9 family.** `astrid-core`
-  joins the workspace TOML dependency instead of retaining 0.8 solely to
-  preserve an internal Rust error-type identity. Configuration schemas and
-  emitted documents are unchanged; readers now accept TOML 1.1 syntax and
-  include the 0.9 parser's malformed-integer panic fix. Closes #1526.
+  `astrid mcp serve` keeps the AOS product daemon (cwd / runtime home) when host plugins pass `--workspace` as the host project. Reconnect, session-guard, and hot-reload attach to that runtime-home daemon instead of requiring a second project-layout daemon.
 
-- **The unpublished storage model, content DAG, engine, and resource-authority
-  packages are now internal `astrid-storage` modules.** This preserves their
-  tested boundaries without creating four additional crates.io products,
-  restores the protected release planner to its expected 26-package graph,
-  and begins the broader consolidation toward publishing only `astrid` and
-  `astrid-types`. Refs #1480.
+  When the CLI's default `.astrid` layout runs from the AOS runtime home, daemon identity checks also accept the running daemon's `.aos` fingerprint; a different project root remains rejected.
 
-- **CLI parsing, completions, and executable discovery use current compatible
-  patches.** Updated clap/clap_complete and which-rs after reviewing their
-  help, derive, completion, and absolute-path lookup fixes. Astrid's command
-  grammar and MCP stdio resolution contract are unchanged. Closes #1522.
-- **Astrid now negotiates MCP 2026-07-28 in both directions while retaining
-  2025-11-25 compatibility.** The RMCP 3.1 upgrade adds modern
-  `server/discover` negotiation, MRTR-aware outbound tool calls, and native
-  MRTR approval, ingress-consent, and capsule-grant flows in `astrid mcp
-  serve`. Echoed request state is integrity-protected, principal/call-bound,
-  expiring, and single-use. Legacy peers retain the initialize handshake and
-  server-initiated elicitation. RMCP's stale-on-error response cache stays
-  disabled because Astrid owns tool inventory and capability invalidation.
-  Closes #1504.
+- Principal-home imports now use the canonical packed content arena, sharing
+  Chunk, ChunkTree, and File records with capsule content instead of creating
+  new volume loose-blob regions. Existing ASTVOL1 loose representations remain
+  readable for compatibility.
 
-- **Core Rust API compatibility reports now match Astrid's actual contract
-  boundary.** Semver and item-level diffs for every core workspace library,
-  including `astrid-types`, remain visible as advisory review evidence, while
-  tool, compiler, and workflow failures remain blocking. Capsule-facing Rust
-  types belong to `sdk-rust`; canonical WIT and wire behavior define runtime
-  compatibility. This prevents automation from forcing architecture
-  distortions merely to preserve implementation-detail APIs. Closes #1533;
-  part of #1480.
-- **Capsule source checks now parse Rust with Syn 3.** The checker preserves
-  tool discovery across free, trait, default-trait, and implementation methods,
-  while continuing to reject lookalike paths and non-literal tool names.
-  Closes #1512.
-- **Git-managed workspace detection now uses gix-discover 0.54.** Repository
-  roots, nested paths, and linked-worktree `.git` files keep direct-write Git
-  rollback semantics, while malformed and non-repositories remain on the
-  fail-safe copy-on-write overlay path. Closes #1518.
-- **Base64 encoding now uses `base64` 0.23's scalar implementation explicitly.**
-  Existing standard and URL-safe wire formats remain byte-for-byte compatible;
-  the release's new default-on unsafe SIMD backend is deliberately disabled at
-  the workspace boundary. Closes #1510.
-- **The capsule runtime now uses Wasmtime 47.0.3 and wasm-tools 0.256 with an
-  explicit guest-feature policy.** WebAssembly GC and exception handling stay
-  disabled instead of inheriting Wasmtime 47's new defaults, and the compiled
-  component cache uses a new ABI generation so Wasmtime 46 artifacts cannot be
-  reused. Closes #1506.
+- Delete the unreleased raw-blob representation writer and its named recipe,
+  profile, coverage, locator, and admission variants. Packed arena ingest is the
+  only content writer. Reserved wire tags fail closed as unknown.
 
-- **Rust API compatibility CI now enforces only Astrid's supported public Rust
-  contract.** Breaking changes to `astrid-types` remain merge-blocking unless
-  explicitly declared, while semver and item-level diffs for internal workspace
-  crates remain visible as advisory review evidence. This prevents automation
-  from forcing architecture distortions merely to preserve implementation-detail
-  APIs while retaining maintainer visibility into every change. Part of #1480.
+- Revert the #1611 on-open LooseBlob convert/retire path. That was not a
+  release format. Packed ingest from #1609 stays. LooseBlob writes still
+  need deletion (#1612).
 
-- **`agent delete` now reclaims the deleted principal's full runtime footprint.** Delete fences new token and allowance authority, unlinks authentication, removes the profile, retires live capsule views, purges every immutable-UID KV namespace (including orphaned capsules), and reclaims the home tree, signing key (`keys/{principal}.key`), and secrets (`secrets/{principal}/`). Reclamation fails closed: incomplete cleanup returns an error, retains a durable alias reservation, and is safe to retry without letting a replacement identity inherit residual authority or state. Successful responses retain an empty `cleanup_errors` array for wire compatibility. Shared runtimes remain available to other principals. Replaces the previous "reclamation is an ops concern" leave-behind, and drops the interim `--purge-home` flag. Part of #1217.
-### Fixed
+- The durable runtime tree is admitted into one system-owned ASTVOL1 catalog: every regular runtime file, including bootstrap binaries, keys, layout metadata, migration/staging records, locks, readiness/token/PID sentinels, WASM, capsules, logs, and WIT, is packed. Only the hosted `volume` path (and its compaction/recovery prefixes) and the live `run/system.sock` endpoint remain POSIX-owned; other special filesystem entries are skipped. Boot admission is receipt-bound and runs before capsules load. Released homes with the former `var/astrid.volume` path promote it to `volume` before opening. Closes #1616
+  Storage-backed capsule installs now publish WASM to the system-owned `bin/<hash>.wasm` catalog, and native loads, authority checks, and Distro.lock verification use those bytes rather than a POSIX blob.
 
-- **Component-level capsule capabilities are no longer silently dropped at the discovery seam.** `[[component]].capabilities` now merges into the root manifest via an exhaustive `CapabilitiesDef::merge_from` (destructure-guarded, so a newly added field cannot be forgotten), replacing a hand-enumerated merge that dropped `net_connect`/`uplink`/`kv`/`identity`/`allow_persistent`/`allow_prompt_injection`. Closes #1232.
+- The hidden `astrid hook` ingress now forwards the host event and optional
+  workspace in the authenticated envelope while preserving the tiny
+  connect/write/close emitter. Observation hooks default to a fire-and-forget
+  transport wait, policy hooks use a bounded wait, and transport failures stay
+  fail-open unless `ASTRID_CODEX_HOOK_FAIL_CLOSED=1` is set.
+
+  Add a persistent per-user MCP gateway with short-lived `mcp attach` stdio
+  proxies. Attach registrations carry the authenticated gateway principal,
+  host/session key, per-start hook token, and canonical host workspace; forged
+  principal registrations and half-open prefaces are rejected. One private
+  gateway socket keeps `cwd://` rooted at the host project. `mcp ready
+  --format hook` is a bounded gateway probe, `mcp gc` reaps orphaned
+  long-timeout `mcp serve` processes, and `mcp serve` remains the per-session
+  escape hatch. Closes #1618
+
+- WAL-disabled ASTVOL1 commits now publish a valid `objects.index` snapshot and deltas before the single container durability barrier, so a fresh volume backend can reopen without rebuilding the object arena. Root-closure recovery verifies indexed frames in coalesced positional spans without weakening checksum or identity checks. Closes #1635
+
+- Hosted volume opens now use a checksummed EOF footer and region-map snapshot commit to avoid hashing `Write` payloads during boot. Missing or damaged footers fall back to header-only recovery and are repaired durably. Closes #1639
+
+- The persistent MCP gateway now treats Codex `ASTRID_SESSION_ID` as a
+  replaceable attach key: a reconnect cancels the previous slot before
+  taking a new permit, with replacement admission serialized and stale
+  teardown unable to remove the new slot. Silent attach readers idle-EOF after two minutes
+  (a protocol DoS ceiling, not an astrid-config knob). At the 16-attach
+  cap the gateway LRU-evicts an idle slot and fail-fasts if every slot is
+  still active. `mcp gc` reaps orphaned `astrid`/`aos mcp attach`
+  processes whose parent is dead, and never signals Python
+  `aos-mcp-frame`; unrelated wrapper commands are ignored. `mcp serve`
+  remains the explicit per-session escape hatch. Replacement teardown now
+  cancels RMCP initialization and rejects a reconnect when the old slot does
+  not finish within its bounded teardown window. Closes #1677
+
+- Upgrade the direct `cap-std` dependency resolution to 4.0.3 to pick up the
+  upstream fix for trailing-slash symlink handling with `O_NOFOLLOW`. Existing
+  storage and VFS capability tests confirm that Astrid's current boundaries did
+  not reproduce the upstream exposure. Closes #1720
 
 ### Added
 
@@ -828,83 +725,152 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   improves eight-principal throughput from 123.2 to 870.3 strict commits per
   second without changing the acknowledgement boundary. Closes #1388.
 
+### Changed
+
+- **Core configuration parsing now uses one TOML 0.9 family.** `astrid-core`
+  joins the workspace TOML dependency instead of retaining 0.8 solely to
+  preserve an internal Rust error-type identity. Configuration schemas and
+  emitted documents are unchanged; readers now accept TOML 1.1 syntax and
+  include the 0.9 parser's malformed-integer panic fix. Closes #1526.
+
+- **The unpublished storage model, content DAG, engine, and resource-authority
+  packages are now internal `astrid-storage` modules.** This preserves their
+  tested boundaries without creating four additional crates.io products,
+  restores the protected release planner to its expected 26-package graph,
+  and begins the broader consolidation toward publishing only `astrid` and
+  `astrid-types`. Refs #1480.
+
+- **CLI parsing, completions, and executable discovery use current compatible
+  patches.** Updated clap/clap_complete and which-rs after reviewing their
+  help, derive, completion, and absolute-path lookup fixes. Astrid's command
+  grammar and MCP stdio resolution contract are unchanged. Closes #1522.
+- **Astrid now negotiates MCP 2026-07-28 in both directions while retaining
+  2025-11-25 compatibility.** The RMCP 3.1 upgrade adds modern
+  `server/discover` negotiation, MRTR-aware outbound tool calls, and native
+  MRTR approval, ingress-consent, and capsule-grant flows in `astrid mcp
+  serve`. Echoed request state is integrity-protected, principal/call-bound,
+  expiring, and single-use. Legacy peers retain the initialize handshake and
+  server-initiated elicitation. RMCP's stale-on-error response cache stays
+  disabled because Astrid owns tool inventory and capability invalidation.
+  Closes #1504.
+
+- **Core Rust API compatibility reports now match Astrid's actual contract
+  boundary.** Semver and item-level diffs for every core workspace library,
+  including `astrid-types`, remain visible as advisory review evidence, while
+  tool, compiler, and workflow failures remain blocking. Capsule-facing Rust
+  types belong to `sdk-rust`; canonical WIT and wire behavior define runtime
+  compatibility. This prevents automation from forcing architecture
+  distortions merely to preserve implementation-detail APIs. Closes #1533;
+  part of #1480.
+- **Capsule source checks now parse Rust with Syn 3.** The checker preserves
+  tool discovery across free, trait, default-trait, and implementation methods,
+  while continuing to reject lookalike paths and non-literal tool names.
+  Closes #1512.
+- **Git-managed workspace detection now uses gix-discover 0.54.** Repository
+  roots, nested paths, and linked-worktree `.git` files keep direct-write Git
+  rollback semantics, while malformed and non-repositories remain on the
+  fail-safe copy-on-write overlay path. Closes #1518.
+- **Base64 encoding now uses `base64` 0.23's scalar implementation explicitly.**
+  Existing standard and URL-safe wire formats remain byte-for-byte compatible;
+  the release's new default-on unsafe SIMD backend is deliberately disabled at
+  the workspace boundary. Closes #1510.
+- **The capsule runtime now uses Wasmtime 47.0.3 and wasm-tools 0.256 with an
+  explicit guest-feature policy.** WebAssembly GC and exception handling stay
+  disabled instead of inheriting Wasmtime 47's new defaults, and the compiled
+  component cache uses a new ABI generation so Wasmtime 46 artifacts cannot be
+  reused. Closes #1506.
+
+- **Rust API compatibility CI now enforces only Astrid's supported public Rust
+  contract.** Breaking changes to `astrid-types` remain merge-blocking unless
+  explicitly declared, while semver and item-level diffs for internal workspace
+  crates remain visible as advisory review evidence. This prevents automation
+  from forcing architecture distortions merely to preserve implementation-detail
+  APIs while retaining maintainer visibility into every change. Part of #1480.
+
+- **`agent delete` now reclaims the deleted principal's full runtime footprint.** Delete fences new token and allowance authority, unlinks authentication, removes the profile, retires live capsule views, purges every immutable-UID KV namespace (including orphaned capsules), and reclaims the home tree, signing key (`keys/{principal}.key`), and secrets (`secrets/{principal}/`). Reclamation fails closed: incomplete cleanup returns an error, retains a durable alias reservation, and is safe to retry without letting a replacement identity inherit residual authority or state. Successful responses retain an empty `cleanup_errors` array for wire compatibility. Shared runtimes remain available to other principals. Replaces the previous "reclamation is an ops concern" leave-behind, and drops the interim `--purge-home` flag. Part of #1217.
+
+- Hosted volume magic is ASTVOL1/ASTREG1 with checksum context astrid volume record v1. This is the first shipped container grammar. ASTVOL2 files fail closed. Closes #1603
+
+- Upgrade the workspace BLAKE3 resolution from 1.8.6 to 1.8.7, removing the
+  `arrayref` dependency from the resolved BLAKE3 edge. Representative hash, XOF,
+  keyed-hash, and derive-key outputs remain unchanged.
+
+  Closes #1721
+
+- Upgrade Syn to 3.0.4 after verifying the `astrid capsule check` source-scanning boundary.
+
+- Git-managed workspace detection now uses gix-discover 0.55. Discovery resolves
+  Unix symlinked workspaces through their physical ancestors, so direct-write
+  classification follows the repository the workspace targets instead of an
+  unrelated lexical parent.
+
+- The direct `lz4_flex` dependency used by persisted WAL storage is now
+  0.14.0, bringing the upstream 32-bit maximum-output fix and `std`/`alloc`
+  feature split. Existing ASTWAL2 compressed bytes produced by
+  0.12.2 decode unchanged, and new compression round-trips preserve canonical
+  object bytes. SurrealKV continues to use its separate transitive
+  `lz4_flex` 0.12.2 edge. Closes #1724
+
+- RMCP now uses 3.1.4, and MCP MRTR request-state signing keys are validated
+  before codec construction. Elicitation conversion follows the peer's property
+  order and accepts the RMCP `$schema` dialect field. Closes #1725
+
+- The workspace TOML requirement moves to `~1.1.4` and locks `toml
+  1.1.4+spec-1.1.0` without adopting `preserve_order`. Existing layered
+  config, capsule-manifest, and principal-identity compatibility is covered by
+  updated parse, merge, round-trip, datetime, and stable-text tests. The
+  transitive `toml 0.9` required by Wasmtime remains. Closes #1726
+
+- Constrain the workspace uuid dependency to the reviewed 1.25 patch line and resolve it to 1.25.0. Existing string-based serde output, deterministic v5 identities, v4 generation through rng-getrandom, and wasm feature wiring remain unchanged. Closes #1727
+
+- The WASM export pre-scan now uses wasmparser 0.257.1. Offset and range
+  types widened upstream, but the scanner reads only export names, kinds,
+  and function indices. On malformed input it conservatively assumes the
+  export exists, disabling timeout classification; native Wasmtime
+  compilation remains the admission and policy enforcement gate.
+
+- Pin `wat` to 1.257.1 so WAT test fixtures resolve to the reviewed release instead of drifting to newer compatible versions.
+
+- Principal-store content construction now uses FastCDC 5 for even revision-1 profiles while retaining an exact FastCDC 4 compatibility edge for legacy odd profiles. Default chunk boundaries and persisted file identities remain unchanged, and slice and streaming builders agree across both routes. Closes #1730
+
+- Upgraded direct MCP process ownership to process-wrap 10 through an Astrid-owned stdio transport that preserves process-tree teardown.
+
+- Upgrade the direct capsule-test `wasm-encoder` dependency to 0.257.1. The
+  generated component and core-module fixtures remain compatible with the
+  existing parser and Wasmtime runtime. Closes #1732
+
+- The direct `wit-parser` dependency moves from 0.256 to 0.257.1. The
+  `Resolve`-based schema output remains unchanged, `wit-component` shares the
+  matching 0.257.1 family, and Wasmtime retains its internal 0.254 parser.
+  Closes #1733
+
+- Updated component encoding to wit-component 0.257.1 and adapted the encoder
+  builder for its mutable-reference API while retaining validation. Its matching
+  wasm-tools family is confined to transitive implementation dependencies.
+
+- The Wasmtime runtime family is upgraded coherently to 48.0.1. Compiled
+  components are keyed to the Wasmtime 48 ABI and stale Wasmtime 47 cache
+  entries are rejected and recompiled. The capsule engine retains its explicit
+  guest-proposal policy, and the hook engine now disables GC and exceptions to
+  match it. Existing fuel, epoch, component-model, and network policy is retained.
+  Closes #1736
+
+### Removed
+
+- **The unused SurrealDB query wrapper and its dormant dependency graph have
+  been removed from `astrid-storage`.** No workspace crate selected the `db`
+  feature, while resolving it retained unsupported `rkyv 0.7.46` and RSA
+  dependencies in `Cargo.lock`. Removing the unused surface eliminates both
+  RustSec exceptions and keeps the audit gate strict. The native principal
+  store and live legacy-SurrealKV migration reader are unchanged. Closes #1448.
+
 ### Security
 
 - **Wasmtime is updated to 46.0.2 across the runtime.** The patched release
   addresses RUSTSEC-2026-0222 and RUSTSEC-2026-0223 while retaining the current
   Wasmtime 46 compatibility line. Closes #1429.
 
-### Fixed
-
-- **Production compaction retention preserves every standalone bootstrap
-  object.** `RuntimePrincipalStore` now builds scheduler-facing retention from
-  one typed bootstrap registry, adds each registered object as a `System` root,
-  and verifies its presence before returning a policy for proof. The raw
-  durable engine remains policy-neutral, while native composition can no
-  longer silently collect the RÚNATAL specification and discover the damage
-  only when the store next opens. Closes #1408.
-- **Kernel management rate limits no longer cross authorization boundaries.**
-  Requests consume a principal-and-method-scoped action budget only after
-  principal and device-scope authorization succeeds. A restricted caller or
-  device can no longer exhaust another authorized caller's shutdown, reload,
-  install, or workspace-operation allowance; rate-limit rejections are audited
-  as failures, and expired principal buckets are retired. Closes #1378.
-- **Fresh Windows capsule installs provision private runtime and principal
-  homes.** Capsule signing and authority inspection now create and validate the
-  Astrid directory tree before generating the runtime identity, secure the new
-  key with an exact private file ACL, and provision the selected principal
-  boundary before mutating a capsule target. Existing unsafe homes remain
-  rejected. Unix install behavior is unchanged, and workspace targets continue
-  to use their checked selection path. Closes #1366.
-- **Windows builds retain the cross-platform key persistence contract.** The
-  non-Unix parent-directory sync shim keeps the same fallible interface as the
-  Unix implementation without failing the native ARM64 Clippy gate. Closes
-  #1361.
-- **Linux release binaries now run on glibc 2.34 enterprise hosts.** The
-  x86_64 and ARM64 GNU artifacts are built in a pinned glibc 2.31 environment,
-  and release publication rejects binaries whose ELF symbol requirements
-  exceed glibc 2.34. Closes #1322.
-- **Ephemeral daemons now shut down when their final client disconnects.**
-  Client leases, rather than loaded uplink capsules or a 30-second idle timer,
-  own ephemeral process liveness. The never-connected fallback starts only
-  after daemon readiness, and lease accounting bypasses the lossy broadcast
-  queue so an event storm cannot hide a live client. Persistent daemons retain
-  their explicit operator-controlled lifetime. Closes #1296.
-- **Capsule lifecycle hooks preserve the target principal.** Explicit-principal
-  installs now provision and scope lifecycle `home://`, KV, secrets, and IPC
-  identity to the authenticated install target instead of silently executing
-  the hook as the bootstrap `default` principal.
-- **Gateway env schemas now use the authenticated principal's capsule registry
-  or verified workspace.** Schema reads no longer fall back to `default`, so
-  non-default and workspace-only installs are configurable and a same-named
-  default capsule cannot supply the wrong field contract. Closes #1327.
-- **Secret commands now read manifests from the selected principal registry or
-  verified workspace.** Secret set, list, and delete no longer fall back to
-  `default`, while workspace-only capsule secrets retain their declared
-  classification and remain out of plaintext env configuration. Closes #1325.
-- **Per-agent CLI commands now inherit the global `--principal`.** A
-  command-local target such as `--agent` still wins, but omitting it uses the
-  process principal already resolved from the flag, environment, or active
-  context instead of re-reading and potentially selecting a different context.
-  Closes #1326.
-- **Capsule registry queries now honor `--principal`.** The `capsule list`,
-  `capsule tree`, and `capsule deps` commands pass the process-wide
-  authenticated principal into capsule discovery instead of falling back to
-  the bootstrap `default` principal, so diagnostics match the capsule view
-  that the daemon loads. Closes #1112.
-- **SVG URL sanitization uses the patched `ammonia` release.** The locked
-  transitive dependency is updated to 4.1.4 so crafted animation attributes
-  cannot preserve a `javascript:` URL and the workspace security audit no
-  longer accepts the vulnerable 4.1.3 release. Closes #1336.
-- **Stable crates publication installs its authenticated-hash prerequisite.**
-  The protected publisher installs the pinned `b3sum` binary before validating
-  the exact dev candidate, so BLAKE3 release metadata checks run before any
-  crates.io mutation instead of failing on a missing executable. Closes #1294.
-- **Channel promotion starts successfully after the stable crates workflow
-  split.** The reusable stable publisher now declares its optional named
-  crates.io secret while the protected release environment remains the actual
-  credential authority, so GitHub can validate dev, nightly, and stable
-  dispatches without broadly inheriting caller secrets. Closes #1292.
+- Require global `env:write` for `Shared`-scope env/secret admin mutations, so a self-scoped agent cannot write host-wide `system:control:*` namespaces. `astrid secret delete` treats a Shared-scope permission denial as a skipped probe so a successful agent-scoped delete still completes.
 
 ## [0.10.4] - 2026-07-20
 
@@ -1938,7 +1904,8 @@ Breaking changes to note: `Capsule.toml` moves to `[publish]` / `[subscribe]` ta
 Initial tracked release. See the [repository history](https://github.com/astrid-runtime/astrid/commits/v0.2.0)
 for changes included in this version.
 
-[Unreleased]: https://github.com/astrid-runtime/astrid/compare/v0.10.4...HEAD
+[Unreleased]: https://github.com/astrid-runtime/astrid/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/astrid-runtime/astrid/compare/v0.10.4...v0.11.0
 [0.10.4]: https://github.com/astrid-runtime/astrid/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/astrid-runtime/astrid/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/astrid-runtime/astrid/compare/v0.10.1...v0.10.2

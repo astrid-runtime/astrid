@@ -62,7 +62,7 @@ exact tagged source commit receives a successful GitHub Actions check named
 with the signed extension enabled, the release workflow may publish its draft.
 Compilation, Xcode validation, signing, and notarization do not substitute for
 that check. Once the immutable canonical binary release is complete, the
-workflow publishes all 26
+workflow publishes all 29
 public workspace crates in dependency order and confirms each permanent
 crates.io checksum. Nightly releases are GitHub prereleases and never publish to
 crates.io. Stable and dev promotion require the canonical release workflow,
