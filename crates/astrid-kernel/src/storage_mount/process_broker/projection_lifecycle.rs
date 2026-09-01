@@ -10,14 +10,6 @@ use std::{
     },
 };
 
-#[cfg(all(test, any(unix, windows)))]
-pub(crate) use super::process_stop::retain_gates::{
-    arm_retain_reference_gate, arm_retain_validation_gate,
-};
-#[cfg(all(test, any(unix, windows)))]
-use super::process_stop::retain_gates::{
-    pause_retain_reference_for_test, pause_retain_validation_for_test,
-};
 use super::process_stop::{ProcessStopOutcome, cleanup_evidence, stop_process_provider_outcome};
 use super::{
     CachedProcessProjection, Kernel, ProcessProjectionBinding, ProcessProjectionKey,
@@ -30,6 +22,13 @@ use crate::storage_mount::lifecycle::{complete_cleanup_ledger, force_fence_proje
 use cleanup_evidence::ProjectionCleanupStage as Stage;
 
 use super::projection_root_removal::remove_projection_root;
+
+#[cfg(all(test, any(unix, windows)))]
+#[path = "projection_lifecycle_test_support.rs"]
+mod projection_lifecycle_test_support;
+
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) use projection_lifecycle_test_support::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ParentTokenSlot {
@@ -132,17 +131,13 @@ async fn cleanup_projection(state: &mut ProjectionCleanupState) -> bool {
         tracing::error!("process storage projection binding became invalid");
     }
     let policy = state.stop_policy;
-    let (branch_stopped, owner_stopped, shared_stopped) = if binding_valid {
+    let providers_stopped = if binding_valid {
         stop_projection_providers(state, policy).await
     } else {
-        (false, false, false)
+        false
     };
-    if !(binding_valid && branch_stopped && owner_stopped && shared_stopped) {
+    if !providers_stopped {
         tracing::error!(
-            binding_valid,
-            branch_stopped,
-            owner_stopped,
-            shared_stopped,
             "native process storage provider teardown failed; retaining private mount resources"
         );
         fence_retained_projection(state).await;
@@ -177,30 +172,23 @@ async fn cleanup_projection(state: &mut ProjectionCleanupState) -> bool {
 async fn stop_projection_providers(
     state: &mut ProjectionCleanupState,
     policy: ProcessStopPolicy,
-) -> (bool, bool, bool) {
+) -> bool {
     use cleanup_evidence::ProviderComponent;
 
-    tokio::join!(
-        stop_running_provider(&mut state.branch.running, policy, ProviderComponent::Branch),
-        stop_running_provider(
-            &mut state.owner.running,
-            policy,
-            ProviderComponent::OwnerHome
-        ),
-        async {
-            match state.shared.as_mut() {
-                Some(shared) => {
-                    stop_running_provider(
-                        &mut shared.running,
-                        policy,
-                        ProviderComponent::FleetShared,
-                    )
-                    .await
-                },
-                None => true,
-            }
-        },
-    )
+    for (provider, component) in [
+        (&mut state.branch, ProviderComponent::Branch),
+        (&mut state.owner, ProviderComponent::OwnerHome),
+    ] {
+        if !stop_running_provider(provider, policy, component).await {
+            return false;
+        }
+    }
+    if let Some(shared) = state.shared.as_mut()
+        && !stop_running_provider(shared, policy, ProviderComponent::FleetShared).await
+    {
+        return false;
+    }
+    true
 }
 
 async fn fence_retained_projection(state: &mut ProjectionCleanupState) {
@@ -226,19 +214,17 @@ async fn fence_retained_projection(state: &mut ProjectionCleanupState) {
 }
 
 async fn stop_running_provider(
-    provider: &mut RunningProvider,
+    provider: &mut ProjectionLeaseProvider,
     policy: ProcessStopPolicy,
     component: cleanup_evidence::ProviderComponent,
 ) -> bool {
+    let mount_id = provider.lease.mount_id;
+    let provider = &mut provider.running;
     if provider.stopped {
-        cleanup_evidence::record(
-            Stage::ProviderStop {
-                component,
-                outcome: ProcessStopOutcome::Stopped { acknowledged: true },
-            },
-            false,
-        );
-        return true;
+        // A prior cleanup may mark a provider stopped without retaining its
+        // STOP frame. Probe the bound endpoint again; retry state alone is
+        // never an acknowledgement.
+        return stop_unmanaged_provider(provider, mount_id, component).await;
     }
     let stopped = if let Some(child) = provider.child.as_mut() {
         let outcome = stop_process_provider_outcome(
@@ -249,30 +235,44 @@ async fn stop_running_provider(
         )
         .await;
         cleanup_evidence::record(
-            Stage::ProviderStop { component, outcome },
+            Stage::ProviderStop {
+                component,
+                mount_id,
+                outcome,
+            },
             !matches!(outcome, ProcessStopOutcome::Stopped { .. }),
         );
         matches!(outcome, ProcessStopOutcome::Stopped { .. })
     } else {
-        let stopped = unmanaged_provider_is_stopped(&provider.control_path).await;
-        cleanup_evidence::record(
-            Stage::ProviderStop {
-                component,
-                outcome: if stopped {
-                    ProcessStopOutcome::Stopped {
-                        acknowledged: false,
-                    }
-                } else {
-                    ProcessStopOutcome::ControlEndpoint
-                },
-            },
-            !stopped,
-        );
-        stopped
+        stop_unmanaged_provider(provider, mount_id, component).await
     };
     if stopped {
         provider.stopped = true;
     }
+    stopped
+}
+
+async fn stop_unmanaged_provider(
+    provider: &mut RunningProvider,
+    mount_id: StorageMountId,
+    component: cleanup_evidence::ProviderComponent,
+) -> bool {
+    let stopped = unmanaged_provider_is_stopped(&provider.control_path).await;
+    let outcome = if stopped {
+        ProcessStopOutcome::Stopped {
+            acknowledged: false,
+        }
+    } else {
+        ProcessStopOutcome::ControlEndpoint
+    };
+    cleanup_evidence::record(
+        Stage::ProviderStop {
+            component,
+            mount_id,
+            outcome,
+        },
+        !stopped,
+    );
     stopped
 }
 
@@ -828,17 +828,6 @@ async fn invalidate_unhealthy_projection_inner(
     true
 }
 
-#[cfg(all(test, any(unix, windows)))]
-pub(crate) async fn fence_projection_leases_for_test(
-    kernel: &Kernel,
-    binding: &ProcessProjectionBinding,
-    branch: &ProjectionLeaseTarget,
-    owner: &ProjectionLeaseTarget,
-    shared: Option<&ProjectionLeaseTarget>,
-) -> bool {
-    fence_projection_leases(kernel, binding, branch, owner, shared).await
-}
-
 pub(crate) fn retain_cached_projection(projection: &CachedProcessProjection) -> Result<(), String> {
     if projection.closing.load(Ordering::Acquire) {
         return Err("native process storage projection is closing".to_owned());
@@ -972,23 +961,6 @@ pub(crate) fn projection_mount(
     mount
 }
 
-#[cfg(all(test, any(unix, windows)))]
-pub(crate) async fn cached_projection_mount(
-    projection: Arc<CachedProcessProjection>,
-    projections: Arc<
-        tokio::sync::Mutex<
-            std::collections::BTreeMap<ProcessProjectionKey, Arc<CachedProcessProjection>>,
-        >,
-    >,
-    key: &ProcessProjectionKey,
-) -> Result<astrid_capsule::context::ProcessStorageMount, String> {
-    {
-        let _guard = projections.lock().await;
-        retain_cached_projection(&projection)?;
-    }
-    Ok(projection_mount(projection, projections, key.clone()))
-}
-
 pub(crate) struct ProjectionParentTokens {
     pub(crate) branch: String,
     pub(crate) owner_home: String,
@@ -1024,29 +996,4 @@ fn random_parent_token(slot: ParentTokenSlot) -> Result<String, String> {
     }
     let (token, _) = generate_lease_token()?;
     Ok(token)
-}
-
-#[cfg(all(test, any(unix, windows)))]
-static PARENT_TOKEN_FAILURE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-#[cfg(all(test, any(unix, windows)))]
-static PARENT_TOKEN_FAILURE_TEST_ID: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(all(test, any(unix, windows)))]
-fn inject_parent_token_failure(slot: ParentTokenSlot, current_test_id: u64) -> bool {
-    current_test_id == PARENT_TOKEN_FAILURE_TEST_ID.load(Ordering::Acquire)
-        && PARENT_TOKEN_FAILURE
-            .compare_exchange(slot as u8, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        && {
-            PARENT_TOKEN_FAILURE_TEST_ID.store(0, Ordering::Release);
-            true
-        }
-}
-
-#[cfg(all(test, any(unix, windows)))]
-pub(crate) fn arm_parent_token_failure(slot: ParentTokenSlot, test_id: u64) {
-    PARENT_TOKEN_FAILURE.store(slot as u8, Ordering::Release);
-    PARENT_TOKEN_FAILURE_TEST_ID.store(test_id, Ordering::Release);
 }

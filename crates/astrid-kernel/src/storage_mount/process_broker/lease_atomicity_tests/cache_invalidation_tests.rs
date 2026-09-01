@@ -7,16 +7,23 @@ use crate::storage_mount::process_broker::process_stop::cache_test_support::{
     CachedMount, assert_replacement_after_unhealthy_hit_for_fresh_execution, bounded_phase,
     successful_fleet_mount, successful_fleet_mount_for_fresh_execution, uuid_mount_root,
 };
-use crate::storage_mount::process_broker::process_stop::cleanup_evidence::{
-    CleanupEvidenceScope, ProjectionCleanupEvent as CleanupEvent, ProjectionCleanupStage,
-};
 use crate::storage_mount::process_broker::process_stop::owned_test_tasks::{
     OwnedTask, OwnedTestTask, run_owned_test_body,
+};
+use crate::storage_mount::process_broker::process_stop::{
+    ProcessStopOutcome,
+    cleanup_evidence::{
+        CleanupEvidenceScope, ProjectionCleanupEvent as CleanupEvent, ProjectionCleanupStage,
+        ProviderComponent,
+    },
 };
 use astrid_capsule::context::ProcessStorageMountBroker as _;
 use astrid_core::{PrincipalId, storage_provider::StorageMountId};
 
-use super::{KernelProcessStorageMountBroker, ProcessProjectionKey, fleet_shared_kernel};
+use super::{
+    KernelProcessStorageMountBroker, ProcessProjectionKey, ProjectionCleanupState,
+    ProjectionLeaseProvider, RunningProvider, fleet_shared_kernel,
+};
 use crate::storage_mount::process_broker::{
     CachedProcessProjection, ProcessProjectionTarget, ProjectionCleanup, RetainedIssuePaths,
     arm_retain_reference_gate, arm_retain_validation_gate, cleanup_uncommitted_issue_lease_set,
@@ -250,13 +257,27 @@ fn cleanup_event(stage: ProjectionCleanupStage, failed: bool) -> CleanupEvent {
 
 fn provider_stop_event(
     component: crate::storage_mount::process_broker::process_stop::cleanup_evidence::ProviderComponent,
+    mount_id: StorageMountId,
+) -> CleanupEvent {
+    provider_stop_outcome_event(
+        component,
+        mount_id,
+        ProcessStopOutcome::Stopped { acknowledged: true },
+    )
+}
+
+fn provider_stop_outcome_event(
+    component: crate::storage_mount::process_broker::process_stop::cleanup_evidence::ProviderComponent,
+    mount_id: StorageMountId,
+    outcome: ProcessStopOutcome,
 ) -> CleanupEvent {
     cleanup_event(
         ProjectionCleanupStage::ProviderStop {
             component,
-            outcome: super::super::process_stop::ProcessStopOutcome::Stopped { acknowledged: true },
+            mount_id,
+            outcome,
         },
-        false,
+        !matches!(outcome, ProcessStopOutcome::Stopped { .. }),
     )
 }
 
@@ -293,9 +314,9 @@ fn expected_successful_projection_evidence(
     };
     [
         cleanup_event(ProjectionCleanupStage::Binding, false),
-        provider_stop_event(ProviderComponent::Branch),
-        provider_stop_event(ProviderComponent::OwnerHome),
-        provider_stop_event(ProviderComponent::FleetShared),
+        provider_stop_event(ProviderComponent::Branch, *branch),
+        provider_stop_event(ProviderComponent::OwnerHome, *owner),
+        provider_stop_event(ProviderComponent::FleetShared, *shared),
         cleanup_event(ProjectionCleanupStage::ListenerSettlement, false),
         resource_event(*branch, false),
         resource_event(*owner, false),
@@ -452,12 +473,24 @@ async fn revocation_cannot_interleave_validation_and_cached_reference() {
     let mount_broker = broker.clone();
     let mount_caller = caller.clone();
     let mount_task = Arc::new(OwnedTask::spawn(async move {
-        super::PROCESS_MOUNT_TEST_ID
-            .scope(
-                super::super::process_stop::cache_test_support::fresh_process_mount_test_id(),
-                mount_broker.mount(&mount_caller),
-            )
-            .await
+        super::super::process_stop::cleanup_evidence::scoped_with_label(
+            "stale-invalidation-exact-scope",
+            async move {
+                let replacement_mount = super::PROCESS_MOUNT_TEST_ID
+                    .scope(
+                        super::super::process_stop::cache_test_support::fresh_process_mount_test_id(
+                        ),
+                        mount_broker.mount(&mount_caller),
+                    )
+                    .await
+                    .expect("validated unhealthy mount replacement");
+                let evidence_scope =
+                    super::super::process_stop::cleanup_evidence::current_scope_for_test()
+                        .expect("stale invalidation evidence scope");
+                (evidence_scope, replacement_mount)
+            },
+        )
+        .await
     }));
     bounded_phase("validation gate entry", gate.entered().notified()).await;
 
@@ -491,8 +524,8 @@ async fn revocation_cannot_interleave_validation_and_cached_reference() {
     let stale_component_mount_ids = stale.projection.component_mount_ids.clone();
     let finishers = owned_finishers![mount_task, revocation];
     run_owned_test_body(&finishers, move || async move {
-        let replacement_mount =
-            join_mount(&mount_task, "validated unhealthy mount replacement").await;
+        let (stale_evidence_scope, replacement_mount) =
+            bounded_phase("validated unhealthy mount replacement", mount_task.join()).await;
         join_revocation(&revocation, "authorized component revocation").await;
         assert_ne!(replacement_mount.workspace_root, stale.mount.workspace_root);
         assert_eq!(
@@ -500,17 +533,97 @@ async fn revocation_cannot_interleave_validation_and_cached_reference() {
             1,
             "the stale projection must not gain a reference after revocation"
         );
+        assert_eq!(
+            super::super::process_stop::cleanup_evidence::take_for_test(stale_evidence_scope),
+            expected_successful_projection_evidence(&stale_component_mount_ids),
+            "stale invalidation evidence must be consumed before replacement cleanup"
+        );
 
         close_mount("replacement provider close", replacement_mount).await;
         close_mount("stale provider close", stale.mount).await;
         assert!(body_kernel.storage_mounts.is_empty());
         assert!(body_broker.projections.lock().await.is_empty());
-        assert_eq!(
-            super::super::process_stop::cleanup_evidence::take_latest_for_test(),
-            expected_successful_projection_evidence(&stale_component_mount_ids)
-        );
     })
     .await;
+}
+
+#[tokio::test]
+async fn stopped_retry_evidence_never_synthesizes_an_acknowledgement() {
+    let fixture = super::exact_fence_fixture().await;
+    let branch_mount_id = fixture.branch.mount_id;
+    let owner_mount_id = fixture.owner.mount_id;
+    let targets = &fixture.binding.targets;
+    let absent_control = fixture.kernel.astrid_home.run_dir().join("absent.sock");
+    let running = |mount_id: StorageMountId| ProjectionLeaseProvider {
+        running: RunningProvider {
+            child: None,
+            control_path: absent_control.clone(),
+            token: "retry-token".to_owned(),
+            stopped: true,
+        },
+        lease: super::ProjectionLeaseTarget {
+            mount_id,
+            target: targets.workspace.clone(),
+        },
+    };
+    let key = ProcessProjectionKey {
+        binding: fixture.binding.clone(),
+        read_write: true,
+    };
+    let state = ProjectionCleanupState {
+        kernel: Arc::downgrade(&fixture.kernel),
+        stop_policy: crate::storage_mount::process_broker::ProcessStopPolicy::default(),
+        binding: fixture.binding.clone(),
+        branch: running(branch_mount_id),
+        owner: running(owner_mount_id),
+        shared: None,
+        mount_root: fixture.kernel.astrid_home.run_dir(),
+        cleaned: false,
+    };
+    let mut projections = std::collections::BTreeMap::new();
+    super::retain_failed_launch_projection(
+        &mut projections,
+        &key,
+        fixture.kernel.astrid_home.run_dir().join("workspace"),
+        fixture.kernel.astrid_home.run_dir().join("owner"),
+        None,
+        state,
+    );
+    let projection = Arc::clone(projections.get(&key).expect("retained retry blocker"));
+
+    let scope = super::super::process_stop::cleanup_evidence::scoped_with_label(
+        "stopped-retry-evidence",
+        async {
+            assert!(
+                !super::retry_failed_projection(&projection, &mut projections, &key).await,
+                "absent production lease state must keep the retry blocked"
+            );
+            super::super::process_stop::cleanup_evidence::current_scope_for_test()
+                .expect("retry evidence scope")
+        },
+    )
+    .await;
+    let events = super::super::process_stop::cleanup_evidence::take_for_test(scope);
+    assert_eq!(
+        events,
+        vec![
+            cleanup_event(ProjectionCleanupStage::Binding, false),
+            provider_stop_outcome_event(
+                ProviderComponent::Branch,
+                branch_mount_id,
+                ProcessStopOutcome::Stopped {
+                    acknowledged: false
+                },
+            ),
+            provider_stop_outcome_event(
+                ProviderComponent::OwnerHome,
+                owner_mount_id,
+                ProcessStopOutcome::Stopped {
+                    acknowledged: false
+                },
+            ),
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
