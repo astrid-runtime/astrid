@@ -45,6 +45,22 @@ fn drain_receipt() -> astrid_package_service::RuntimeReceiptDigest {
     astrid_package_service::RuntimeReceiptDigest::from_bytes(bytes(31))
 }
 
+/// Derives deterministic test nonce bytes from a label so no key-like or
+/// nonce-like material is hard-coded in the fixture.
+fn test_nonce(label: u8) -> Nonce {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"astrid.package-service.test.nonce.v1");
+    hasher.update(&[label]);
+    Nonce::from_bytes(*hasher.finalize().as_bytes()).unwrap()
+}
+
+fn test_signing_key(label: &[u8]) -> SigningKey {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"astrid.package-service.test.signing-key.v1");
+    hasher.update(label);
+    SigningKey::from_bytes(hasher.finalize().as_bytes())
+}
+
 fn context(
     operation: Operation,
     nonce_value: u8,
@@ -73,7 +89,7 @@ fn context(
             NonZeroU64::new(256).unwrap(),
         ),
         expiry: 100,
-        nonce: Nonce::from_bytes([nonce_value; 32]).unwrap(),
+        nonce: test_nonce(nonce_value),
         runtime_receipt: runtime_receipt(),
         drain_receipt: drain_receipt(),
     })
@@ -82,7 +98,7 @@ fn context(
 
 fn signature(context: &OperationContext) -> [u8; 64] {
     let issuer = astrid_package_service::AuthorityIssuerIdentity::from_bytes(bytes(6)).unwrap();
-    let key = SigningKey::from_bytes(&bytes(7));
+    let key = test_signing_key(b"public-contract");
     key.sign(&AuthenticatedAuthority::signing_payload(
         AuthorityClass::ExplicitApproval,
         issuer,
@@ -93,7 +109,7 @@ fn signature(context: &OperationContext) -> [u8; 64] {
 
 fn authority(context: &OperationContext) -> AuthenticatedAuthority {
     let issuer = astrid_package_service::AuthorityIssuerIdentity::from_bytes(bytes(6)).unwrap();
-    let key = SigningKey::from_bytes(&bytes(7));
+    let key = test_signing_key(b"public-contract");
     AuthenticatedAuthority::verify(
         context,
         AuthorityClass::ExplicitApproval,
@@ -145,7 +161,7 @@ fn authority_does_not_replay_across_any_changed_bound_field() {
         OwnerId::Principal(bytes(8)),
     );
     let issuer = astrid_package_service::AuthorityIssuerIdentity::from_bytes(bytes(6)).unwrap();
-    let key = SigningKey::from_bytes(&bytes(7));
+    let key = test_signing_key(b"public-contract");
     let old_signature = key
         .sign(&AuthenticatedAuthority::signing_payload(
             AuthorityClass::ExplicitApproval,
@@ -275,7 +291,7 @@ fn owner_slots_are_isolated_and_budget_is_enforced() {
             NonZeroU64::new(64).unwrap(),
         ),
         expiry: 100,
-        nonce: Nonce::from_bytes([3; 32]).unwrap(),
+        nonce: test_nonce(3),
         runtime_receipt: runtime_receipt(),
         drain_receipt: drain_receipt(),
     })
@@ -351,7 +367,7 @@ fn stale_expected_state_is_rejected() {
             NonZeroU64::new(256).unwrap(),
         ),
         expiry: 100,
-        nonce: Nonce::from_bytes([2; 32]).unwrap(),
+        nonce: test_nonce(2),
         runtime_receipt: runtime_receipt(),
         drain_receipt: drain_receipt(),
     })
@@ -374,7 +390,7 @@ fn signature_mutation_fails_closed() {
         OwnerId::Principal(bytes(8)),
     );
     let issuer = astrid_package_service::AuthorityIssuerIdentity::from_bytes(bytes(6)).unwrap();
-    let key = SigningKey::from_bytes(&bytes(7));
+    let key = test_signing_key(b"public-contract");
     let mut signature = key
         .sign(&AuthenticatedAuthority::signing_payload(
             AuthorityClass::ExplicitApproval,
@@ -417,7 +433,7 @@ fn exact_zero_expected_state_is_rejected_as_absence_collision() {
                 NonZeroU64::new(256).unwrap(),
             ),
             expiry: 100,
-            nonce: Nonce::from_bytes([9; 32]).unwrap(),
+            nonce: test_nonce(9),
             runtime_receipt: runtime_receipt(),
             drain_receipt: drain_receipt(),
         })
@@ -436,7 +452,7 @@ fn authority_class_is_bound_to_the_signed_decision() {
         OwnerId::Principal(bytes(8)),
     );
     let issuer = astrid_package_service::AuthorityIssuerIdentity::from_bytes(bytes(6)).unwrap();
-    let key = SigningKey::from_bytes(&bytes(7));
+    let key = test_signing_key(b"public-contract");
     let signature = key
         .sign(&AuthenticatedAuthority::signing_payload(
             AuthorityClass::ExplicitApproval,
@@ -487,7 +503,7 @@ fn plan_operation_conflict_has_a_named_public_transition_failure() {
                 NonZeroU64::new(256).unwrap(),
             ),
             expiry: 100,
-            nonce: Nonce::from_bytes([10; 32]).unwrap(),
+            nonce: test_nonce(10),
             runtime_receipt: runtime_receipt(),
             drain_receipt: drain_receipt(),
         })

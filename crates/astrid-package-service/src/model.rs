@@ -115,6 +115,7 @@ impl PackageServiceModel {
             return Err(PackageServiceError::InvalidDrain);
         }
         Self::validate_plan_bindings(&context, record)?;
+        Self::preflight_generation(record, context.operation())?;
         if self.record_slots.iter().any(|(nonce, owned)| {
             *owned == slot
                 && self
@@ -175,6 +176,35 @@ impl PackageServiceModel {
             },
         }
         Ok(())
+    }
+
+    /// Rejects operations whose terminal generation could never be assigned.
+    ///
+    /// Install, Update, and Remove all need at least one generation above the
+    /// current boundary, so admitting them at an exhausted boundary would
+    /// fence the slot behind a permanently unresolved record.
+    fn preflight_generation(
+        record: Option<&SlotRecord>,
+        operation: Operation,
+    ) -> PackageServiceResult<()> {
+        match operation {
+            Operation::Install => {
+                if let Some(record) = record {
+                    record.next_generation()?;
+                }
+                Ok(())
+            },
+            Operation::Update | Operation::Remove => {
+                let current = record
+                    .and_then(SlotRecord::current)
+                    .ok_or(PackageServiceError::InvalidTransition)?;
+                if current.generation_value().get() == u64::MAX {
+                    return Err(PackageServiceError::GenerationExhausted);
+                }
+                Ok(())
+            },
+            Operation::Activate | Operation::Deactivate => Ok(()),
+        }
     }
 
     fn reserve_history(&mut self) -> PackageServiceResult<()> {
@@ -271,7 +301,7 @@ impl PackageServiceModel {
         now: u64,
     ) -> PackageServiceResult<()> {
         let context = self.context(nonce)?;
-        if now > context.expiry() {
+        if now >= context.expiry() {
             return Err(PackageServiceError::AuthorityExpired);
         }
         let mut record = self

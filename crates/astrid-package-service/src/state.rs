@@ -236,6 +236,12 @@ impl DrainLineage {
             .get()
             .checked_add(1)
             .ok_or(PackageServiceError::GenerationExhausted)?;
+        if raw == u64::MAX {
+            // Commit and restore both need one further generation beyond the
+            // boundary, so a proof must never push the boundary to the last
+            // usable generation.
+            return Err(PackageServiceError::GenerationExhausted);
+        }
         self.boundary =
             NonZeroU64::try_from(raw).map_err(|_| PackageServiceError::GenerationExhausted)?;
         self.zero_lease_proofs = self.zero_lease_proofs.saturating_add(1);
@@ -329,6 +335,10 @@ impl SlotRecord {
         let Some(current) = self.current else {
             return Err(PackageServiceError::InvalidTransition);
         };
+        if current.generation_value().get() == u64::MAX {
+            // Restoring or replacing this boundary needs generation + 1.
+            return Err(PackageServiceError::GenerationExhausted);
+        }
         let lineage = DrainLineage::new(&current, current.generation_value(), destination);
         self.drain = Some(lineage);
         Ok(lineage)
@@ -413,5 +423,69 @@ pub(crate) fn valid_transition(operation: Operation, installed: bool) -> bool {
         Operation::Update | Operation::Remove | Operation::Activate | Operation::Deactivate => {
             installed
         },
+    }
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+    use crate::identity::{ArtifactIdentity, ManifestIdentity};
+
+    fn installed_state(generation: NonZeroU64) -> PackageServiceResult<CanonicalInstalledState> {
+        CanonicalInstalledState::new(InstalledStateSpec {
+            owner: OwnerId::principal([7; 32]),
+            package: PackageObject::from_bytes([8; 32])?,
+            artifact: ValidatedArtifact::new(
+                ArtifactIdentity::from_bytes([9; 32])?,
+                ManifestIdentity::from_bytes([10; 32])?,
+                NonZeroU64::new(64).ok_or(PackageServiceError::ZeroValue)?,
+                [11; 32],
+            )?,
+            authority: AuthorityDigest::from_bytes([12; 32]),
+            lifecycle: LifecycleState::Inactive,
+            plan: PlanDigest::from_bytes([13; 32]),
+            generation,
+            completing_nonce: Nonce::from_bytes([14; 32])?,
+        })
+    }
+
+    #[test]
+    fn begin_drain_preflight_rejects_exhausted_generation() -> PackageServiceResult<()> {
+        let mut slot = SlotRecord::installed(installed_state(NonZeroU64::MAX)?)?;
+        assert!(matches!(
+            slot.begin_drain(DrainDestination::Replacement),
+            Err(PackageServiceError::GenerationExhausted)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn drain_proof_advance_refuses_the_last_usable_generation() -> PackageServiceResult<()> {
+        let headroom = NonZeroU64::new(u64::MAX - 1).ok_or(PackageServiceError::ZeroValue)?;
+        let mut slot = SlotRecord::installed(installed_state(headroom)?)?;
+        slot.begin_drain(DrainDestination::Removal)?;
+        let advanced = slot
+            .drain_mut()
+            .ok_or(PackageServiceError::InvalidDrain)?
+            .advance();
+        assert!(matches!(
+            advanced,
+            Err(PackageServiceError::GenerationExhausted)
+        ));
+        assert!(slot.drain().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn drain_advance_and_restore_stay_feasible_below_the_ceiling() -> PackageServiceResult<()> {
+        let headroom = NonZeroU64::new(u64::MAX - 2).ok_or(PackageServiceError::ZeroValue)?;
+        let mut slot = SlotRecord::installed(installed_state(headroom)?)?;
+        slot.begin_drain(DrainDestination::Replacement)?;
+        slot.drain_mut()
+            .ok_or(PackageServiceError::InvalidDrain)?
+            .advance()?;
+        let restored = slot.restore_boundary()?;
+        assert_eq!(restored.get(), u64::MAX);
+        Ok(())
     }
 }

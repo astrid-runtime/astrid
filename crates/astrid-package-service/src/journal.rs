@@ -278,6 +278,14 @@ impl OperationRecord {
         if self.status != JournalStatus::Intent || now >= self.context.expiry() {
             return Err(PackageServiceError::RecordUnavailable);
         }
+        if self
+            .context
+            .plan()
+            .drain_deadline()
+            .is_some_and(|deadline| now >= deadline)
+        {
+            return Err(PackageServiceError::InvalidDrain);
+        }
         self.status = JournalStatus::Executing;
         Ok(())
     }
@@ -322,6 +330,9 @@ impl OperationRecord {
             .plan()
             .drain_deadline()
             .ok_or(PackageServiceError::InvalidDrain)?;
+        if now >= self.context.expiry() {
+            return Err(PackageServiceError::AuthorityExpired);
+        }
         if now > deadline
             || proof.proof_time > deadline
             || proof.proof_time > now
@@ -366,23 +377,23 @@ impl OperationRecord {
     }
 
     pub(crate) fn expire(&mut self, slot: &mut SlotRecord, now: u64) -> PackageServiceResult<u64> {
-        if !matches!(
-            self.status,
-            JournalStatus::Executing | JournalStatus::Unknown
-        ) {
+        if !self.status.is_unresolved() {
             return Err(PackageServiceError::RecordUnavailable);
         }
-        let deadline = self
-            .context
-            .plan()
-            .drain_deadline()
-            .ok_or(PackageServiceError::InvalidDrain)?;
-        if now <= deadline {
-            return Err(PackageServiceError::InvalidDrain);
+        let deadline = self.context.plan().drain_deadline();
+        if now < self.context.expiry() {
+            match deadline {
+                Some(deadline) if now > deadline => {},
+                _ => return Err(PackageServiceError::RecordUnavailable),
+            }
         }
-        let boundary = slot.restore_boundary()?;
+        let restored = if slot.drain().is_some() {
+            Some(slot.restore_boundary()?)
+        } else {
+            None
+        };
         self.status = JournalStatus::Expired;
-        Ok(boundary.get())
+        Ok(restored.map_or_else(|| slot.high_watermark(), NonZeroU64::get))
     }
 
     pub(crate) fn commit(
@@ -395,6 +406,21 @@ impl OperationRecord {
         if self.status != JournalStatus::Executing || now >= self.context.expiry() {
             return Err(PackageServiceError::RecordUnavailable);
         }
+        if self
+            .context
+            .plan()
+            .drain_deadline()
+            .is_some_and(|deadline| now > deadline)
+        {
+            return Err(PackageServiceError::InvalidDrain);
+        }
+        if matches!(
+            self.context.operation(),
+            Operation::Install | Operation::Update
+        ) && artifact.artifact_size() > self.context.budget().maximum_artifact_bytes()
+        {
+            return Err(PackageServiceError::BudgetExceeded);
+        }
         if runtime_receipt != *self.context.runtime_receipt()
             || artifact != *self.context.artifact()
         {
@@ -404,22 +430,41 @@ impl OperationRecord {
             || ExpectedPackageState::Absent.digest(),
             crate::state::CanonicalInstalledState::digest,
         );
+        let (generation, after) = self.apply_commit_effect(slot, artifact)?;
+        let receipt = OperationReceipt::new(
+            &self.context,
+            before,
+            after,
+            generation,
+            runtime_receipt,
+            self.authority,
+        );
+        self.receipt = Some(receipt);
+        self.status = JournalStatus::Committed;
+        Ok(receipt)
+    }
+
+    /// Applies the committed state effect and reports the terminal generation.
+    fn apply_commit_effect(
+        &self,
+        slot: &mut SlotRecord,
+        artifact: ValidatedArtifact,
+    ) -> PackageServiceResult<(NonZeroU64, StateDigest)> {
         let operation = self.context.operation();
-        let generation;
-        let after;
         match operation {
             Operation::Install => {
-                generation = slot.next_generation()?;
+                let generation = slot.next_generation()?;
                 let state = self.context_state(artifact, generation)?;
-                after = state.digest();
+                let after = state.digest();
                 slot.set_state(&state);
+                Ok((generation, after))
             },
             Operation::Update => {
                 if self.proofs == 0 {
                     return Err(PackageServiceError::InvalidDrain);
                 }
                 let lineage = slot.drain().ok_or(PackageServiceError::InvalidDrain)?;
-                generation = NonZeroU64::try_from(
+                let generation = NonZeroU64::try_from(
                     lineage
                         .boundary()
                         .get()
@@ -428,14 +473,15 @@ impl OperationRecord {
                 )
                 .map_err(|_| PackageServiceError::GenerationExhausted)?;
                 let state = self.context_state(artifact, generation)?;
-                after = state.digest();
+                let after = state.digest();
                 slot.set_state(&state);
+                Ok((generation, after))
             },
             Operation::Activate | Operation::Deactivate => {
                 let current = slot
                     .current()
                     .ok_or(PackageServiceError::InvalidTransition)?;
-                generation = current.generation_value();
+                let generation = current.generation_value();
                 let lifecycle = if operation == Operation::Activate {
                     crate::state::LifecycleState::Active
                 } else {
@@ -452,32 +498,23 @@ impl OperationRecord {
                         generation,
                         completing_nonce: *self.context.nonce(),
                     })?;
-                after = state.digest();
+                let after = state.digest();
                 slot.set_state(&state);
+                Ok((generation, after))
             },
             Operation::Remove => {
                 if self.proofs == 0 {
                     return Err(PackageServiceError::InvalidDrain);
                 }
-                generation = slot
+                let generation = slot
                     .drain()
                     .ok_or(PackageServiceError::InvalidDrain)?
                     .boundary();
-                after = ExpectedPackageState::Absent.digest();
+                let after = ExpectedPackageState::Absent.digest();
                 slot.set_absent(generation);
+                Ok((generation, after))
             },
         }
-        let receipt = OperationReceipt::new(
-            &self.context,
-            before,
-            after,
-            generation,
-            runtime_receipt,
-            self.authority,
-        );
-        self.receipt = Some(receipt);
-        self.status = JournalStatus::Committed;
-        Ok(receipt)
     }
 
     pub(crate) fn recover(
@@ -510,24 +547,21 @@ impl OperationRecord {
         {
             return Err(PackageServiceError::BindingMismatch);
         }
-        let base_digest = slot
-            .drain()
-            .map_or_else(
-                || {
-                    slot.current()
-                        .map(crate::state::CanonicalInstalledState::digest)
-                },
-                |lineage| Some(lineage.base().digest()),
-            )
-            .ok_or(PackageServiceError::RecordUnavailable)?;
+        let base_digest = slot.drain().map_or_else(
+            || {
+                slot.current().map_or_else(
+                    || ExpectedPackageState::Absent.digest(),
+                    crate::state::CanonicalInstalledState::digest,
+                )
+            },
+            |lineage| lineage.base().digest(),
+        );
         if evidence.observed_state != base_digest {
             return Err(PackageServiceError::BindingMismatch);
         }
 
-        if is_drain {
+        if is_drain && slot.drain().is_some() {
             slot.restore_boundary()?;
-            self.status = JournalStatus::Expired;
-            return Ok(None);
         }
 
         self.status = JournalStatus::Expired;
