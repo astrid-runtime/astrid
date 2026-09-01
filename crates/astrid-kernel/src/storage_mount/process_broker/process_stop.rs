@@ -24,11 +24,12 @@ pub(crate) mod cleanup_evidence {
     #[cfg(test)]
     use std::{
         collections::BTreeMap,
-        sync::{LazyLock, Mutex},
+        sync::{
+            LazyLock, Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
     };
 
-    #[cfg(test)]
-    use super::super::PROCESS_MOUNT_TEST_ID;
     use super::ProcessStopOutcome;
     use astrid_core::storage_provider::StorageMountId;
 
@@ -66,12 +67,60 @@ pub(crate) mod cleanup_evidence {
     }
 
     #[cfg(test)]
-    static EVIDENCE: LazyLock<Mutex<BTreeMap<u64, Vec<ProjectionCleanupEvent>>>> =
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct CleanupEvidenceScope {
+        pub(crate) legacy_label: &'static str,
+        pub(crate) execution: u64,
+    }
+
+    #[cfg(test)]
+    type EvidenceLog = (&'static str, Vec<ProjectionCleanupEvent>);
+
+    #[cfg(test)]
+    static NEXT_EVIDENCE_EXECUTION: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(test)]
+    tokio::task_local! {
+        static CURRENT_EVIDENCE_SCOPE: CleanupEvidenceScope;
+    }
+
+    #[cfg(test)]
+    static EVIDENCE: LazyLock<Mutex<BTreeMap<u64, EvidenceLog>>> =
         LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
     #[cfg(test)]
-    fn current_test_id() -> Option<u64> {
-        PROCESS_MOUNT_TEST_ID.try_with(|test_id| *test_id).ok()
+    pub(crate) async fn scoped_with_label<T>(
+        legacy_label: &'static str,
+        future: impl std::future::Future<Output = T>,
+    ) -> T {
+        let execution = NEXT_EVIDENCE_EXECUTION.fetch_add(1, Ordering::Relaxed);
+        let scope = CleanupEvidenceScope {
+            legacy_label,
+            execution,
+        };
+        CURRENT_EVIDENCE_SCOPE
+            .scope(scope, async move {
+                EVIDENCE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(scope.execution, (legacy_label, Vec::new()));
+                future.await
+            })
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn scoped<T>(future: impl std::future::Future<Output = T>) -> T {
+        if CURRENT_EVIDENCE_SCOPE.try_with(|_| {}).is_ok() {
+            future.await
+        } else {
+            scoped_with_label("process-cleanup", future).await
+        }
+    }
+
+    #[cfg(not(test))]
+    pub(crate) async fn scoped<T>(future: impl std::future::Future<Output = T>) -> T {
+        future.await
     }
 
     #[cfg(not(test))]
@@ -79,11 +128,8 @@ pub(crate) mod cleanup_evidence {
 
     #[cfg(test)]
     pub(crate) fn begin() {
-        if let Some(test_id) = current_test_id()
-            && let Ok(mut evidence) = EVIDENCE.lock()
-        {
-            evidence.insert(test_id, Vec::new());
-        }
+        // The outer execution owns initialization. A nested cleanup must not
+        // discard earlier evidence collected by a retry or invalidation.
     }
 
     #[cfg(not(test))]
@@ -91,71 +137,41 @@ pub(crate) mod cleanup_evidence {
 
     #[cfg(test)]
     pub(crate) fn record(stage: ProjectionCleanupStage, failed: bool) {
-        if let Some(test_id) = current_test_id()
+        if let Ok(scope) = CURRENT_EVIDENCE_SCOPE.try_with(|scope| *scope)
             && let Ok(mut evidence) = EVIDENCE.lock()
         {
             evidence
-                .entry(test_id)
+                .entry(scope.execution)
                 .or_default()
+                .1
                 .push(ProjectionCleanupEvent { failed, stage });
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn take_for_test(test_id: u64) -> Vec<ProjectionCleanupEvent> {
+    pub(crate) fn take_for_test(scope: CleanupEvidenceScope) -> Vec<ProjectionCleanupEvent> {
         EVIDENCE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&test_id)
+            .remove(&scope.execution)
+            .filter(|(label, _)| *label == scope.legacy_label)
+            .map(|(_, events)| events)
             .unwrap_or_default()
     }
 
     #[cfg(test)]
-    pub(crate) fn assert_successful_for_test(test_id: u64, lease_resources: usize) {
-        let events = take_for_test(test_id);
-        assert!(
-            !events.iter().any(|event| event.failed),
-            "typed cleanup evidence must not name a failed stage: {events:?}"
-        );
-        assert!(
-            events.iter().any(|event| matches!(
-                event.stage,
-                ProjectionCleanupStage::ProviderStop { .. }
-            ) && !event.failed),
-            "typed evidence must record provider STOP/reap/endpoint settlement: {events:?}"
-        );
-        for stage in [
-            ProjectionCleanupStage::ListenerSettlement,
-            ProjectionCleanupStage::ProjectionRoot,
-            ProjectionCleanupStage::CacheRemoval,
-            ProjectionCleanupStage::Complete,
-        ] {
-            assert!(
-                events
-                    .iter()
-                    .any(|event| event.stage == stage && !event.failed),
-                "typed evidence is missing {stage:?}: {events:?}"
-            );
-        }
-        assert!(
-            events
-                .iter()
-                .filter(|event| matches!(
-                    event.stage,
-                    ProjectionCleanupStage::LeaseResources { .. }
-                ))
-                .count()
-                >= lease_resources,
-            "typed evidence must record every lease-resource cleanup: {events:?}"
-        );
-        assert!(
-            events
-                .iter()
-                .filter(|event| matches!(event.stage, ProjectionCleanupStage::CleanupLedger { .. }))
-                .count()
-                >= lease_resources,
-            "typed evidence must record every cleanup ledger completion: {events:?}"
-        );
+    pub(crate) fn take_latest_for_test() -> Vec<ProjectionCleanupEvent> {
+        EVIDENCE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_last()
+            .map(|(_, (_, events))| events)
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_scope_for_test() -> Option<CleanupEvidenceScope> {
+        CURRENT_EVIDENCE_SCOPE.try_with(|scope| *scope).ok()
     }
 }
 
@@ -730,7 +746,14 @@ mod owned_task_tests {
 
 #[cfg(test)]
 pub(crate) mod cache_test_support {
-    use std::{future::Future, sync::Arc, time::Duration};
+    use std::{
+        future::Future,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::Duration,
+    };
 
     use astrid_capsule::context::ProcessStorageMountBroker as _;
     use astrid_core::PrincipalId;
@@ -742,6 +765,12 @@ pub(crate) mod cache_test_support {
     pub(crate) struct CachedMount {
         pub(crate) mount: astrid_capsule::context::ProcessStorageMount,
         pub(crate) projection: Arc<CachedProcessProjection>,
+    }
+
+    static NEXT_PROCESS_MOUNT_EXECUTION: AtomicU64 = AtomicU64::new(1_000_000);
+
+    pub(crate) fn fresh_process_mount_test_id() -> u64 {
+        NEXT_PROCESS_MOUNT_EXECUTION.fetch_add(1, Ordering::Relaxed)
     }
 
     pub(crate) async fn bounded_phase<T>(
@@ -800,6 +829,14 @@ pub(crate) mod cache_test_support {
                 .all(|mount_id| kernel.storage_mounts.contains_key(mount_id))
         );
         CachedMount { mount, projection }
+    }
+
+    pub(crate) async fn successful_fleet_mount_for_fresh_execution(
+        kernel: &Arc<crate::Kernel>,
+        caller: &PrincipalId,
+        broker: &KernelProcessStorageMountBroker,
+    ) -> CachedMount {
+        successful_fleet_mount(kernel, caller, broker, fresh_process_mount_test_id()).await
     }
 
     pub(crate) async fn assert_replacement_after_unhealthy_hit(
@@ -874,6 +911,22 @@ pub(crate) mod cache_test_support {
             "the replacement must clean its complete new exact set"
         );
         assert!(broker.projections.lock().await.is_empty());
+    }
+
+    pub(crate) async fn assert_replacement_after_unhealthy_hit_for_fresh_execution(
+        kernel: &Arc<crate::Kernel>,
+        caller: &PrincipalId,
+        broker: &KernelProcessStorageMountBroker,
+        stale: CachedMount,
+    ) {
+        assert_replacement_after_unhealthy_hit(
+            kernel,
+            caller,
+            broker,
+            stale,
+            fresh_process_mount_test_id(),
+        )
+        .await;
     }
 }
 

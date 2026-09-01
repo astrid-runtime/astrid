@@ -4,11 +4,11 @@ use std::sync::{Arc, atomic::Ordering};
 
 use crate::storage_mount::process_broker::fail_next_root_removal_for_test;
 use crate::storage_mount::process_broker::process_stop::cache_test_support::{
-    CachedMount, assert_replacement_after_unhealthy_hit, bounded_phase, successful_fleet_mount,
-    uuid_mount_root,
+    CachedMount, assert_replacement_after_unhealthy_hit_for_fresh_execution, bounded_phase,
+    successful_fleet_mount, successful_fleet_mount_for_fresh_execution, uuid_mount_root,
 };
 use crate::storage_mount::process_broker::process_stop::cleanup_evidence::{
-    ProjectionCleanupEvent as CleanupEvent, ProjectionCleanupStage,
+    CleanupEvidenceScope, ProjectionCleanupEvent as CleanupEvent, ProjectionCleanupStage,
 };
 use crate::storage_mount::process_broker::process_stop::owned_test_tasks::{
     OwnedTask, OwnedTestTask, run_owned_test_body,
@@ -27,12 +27,22 @@ use crate::storage_mount::{MountOwnerScope, issue_lease, revoke_lease};
 #[path = "root_retry_tests.rs"]
 mod root_retry_tests;
 
+fn provider_test_executable(
+    directory: &std::path::Path,
+    name: &str,
+    exe_suffix: &str,
+) -> std::path::PathBuf {
+    directory.join(format!("{name}{exe_suffix}"))
+}
+
 fn provider_lane_is_ready(test_name: &str) -> bool {
     let provider = std::env::current_exe().ok().and_then(|test_binary| {
         test_binary.parent().map(|directory| {
-            directory
-                .join(super::super::platform_process_provider_name())
-                .with_extension(std::env::consts::EXE_SUFFIX)
+            provider_test_executable(
+                directory,
+                super::super::platform_process_provider_name(),
+                std::env::consts::EXE_SUFFIX,
+            )
         })
     });
     let ready = provider.is_some_and(|provider| {
@@ -43,6 +53,73 @@ fn provider_lane_is_ready(test_name: &str) -> bool {
         println!("skipping {test_name}: coinstalled provider is unavailable");
     }
     ready
+}
+
+#[test]
+fn provider_lane_executable_suffix_is_appended_exactly_once() {
+    let directory = std::path::Path::new("/test-binaries");
+    let windows = provider_test_executable(directory, "astrid-storage-provider-winfsp", ".exe");
+    assert_eq!(
+        windows.file_name(),
+        Some(std::ffi::OsStr::new("astrid-storage-provider-winfsp.exe"))
+    );
+    assert!(
+        !windows
+            .to_string_lossy()
+            .ends_with("astrid-storage-provider-winfsp..exe")
+    );
+
+    let current = provider_test_executable(
+        directory,
+        super::super::platform_process_provider_name(),
+        std::env::consts::EXE_SUFFIX,
+    );
+    let current_file_name = format!(
+        "{}{}",
+        super::super::platform_process_provider_name(),
+        std::env::consts::EXE_SUFFIX
+    );
+    assert_eq!(
+        current.file_name().and_then(std::ffi::OsStr::to_str),
+        Some(current_file_name.as_str())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identical_legacy_labels_use_distinct_evidence_executions() {
+    async fn probe(label: &'static str) -> CleanupEvidenceScope {
+        super::super::process_stop::cleanup_evidence::scoped_with_label(label, async {
+            super::super::process_stop::cleanup_evidence::record(
+                ProjectionCleanupStage::Binding,
+                true,
+            );
+            super::super::process_stop::cleanup_evidence::current_scope_for_test()
+                .expect("evidence execution")
+        })
+        .await
+    }
+
+    let left_task = tokio::spawn(probe("legacy-651"));
+    let right_task = tokio::spawn(probe("legacy-651"));
+    let (left, right) = tokio::join!(left_task, right_task);
+    let left = left.expect("left evidence probe");
+    let right = right.expect("right evidence probe");
+
+    assert_eq!(left.legacy_label, right.legacy_label);
+    assert_ne!(left.execution, right.execution);
+    assert_eq!(
+        super::super::process_stop::cleanup_evidence::take_for_test(left),
+        vec![cleanup_event(ProjectionCleanupStage::Binding, true)]
+    );
+    assert_eq!(
+        super::super::process_stop::cleanup_evidence::take_for_test(right),
+        vec![cleanup_event(ProjectionCleanupStage::Binding, true)],
+        "the first take must not consume the concurrently labeled execution"
+    );
+    assert!(
+        super::super::process_stop::cleanup_evidence::take_for_test(left).is_empty()
+            && super::super::process_stop::cleanup_evidence::take_for_test(right).is_empty()
+    );
 }
 
 macro_rules! owned_finishers {
@@ -171,6 +248,18 @@ fn cleanup_event(stage: ProjectionCleanupStage, failed: bool) -> CleanupEvent {
     CleanupEvent { failed, stage }
 }
 
+fn provider_stop_event(
+    component: crate::storage_mount::process_broker::process_stop::cleanup_evidence::ProviderComponent,
+) -> CleanupEvent {
+    cleanup_event(
+        ProjectionCleanupStage::ProviderStop {
+            component,
+            outcome: super::super::process_stop::ProcessStopOutcome::Stopped { acknowledged: true },
+        },
+        false,
+    )
+}
+
 fn resource_event(mount_id: StorageMountId, failed: bool) -> CleanupEvent {
     cleanup_event(ProjectionCleanupStage::LeaseResources { mount_id }, failed)
 }
@@ -194,6 +283,43 @@ fn cleanup_marker(
         .join(format!("{mount_id}.cleaned"))
 }
 
+fn expected_successful_projection_evidence(
+    component_mount_ids: &[StorageMountId],
+) -> Vec<CleanupEvent> {
+    use crate::storage_mount::process_broker::process_stop::cleanup_evidence::ProviderComponent;
+
+    let [branch, owner, shared] = component_mount_ids else {
+        panic!("fleet projection evidence requires exactly three components");
+    };
+    [
+        cleanup_event(ProjectionCleanupStage::Binding, false),
+        provider_stop_event(ProviderComponent::Branch),
+        provider_stop_event(ProviderComponent::OwnerHome),
+        provider_stop_event(ProviderComponent::FleetShared),
+        cleanup_event(ProjectionCleanupStage::ListenerSettlement, false),
+        resource_event(*branch, false),
+        resource_event(*owner, false),
+        resource_event(*shared, false),
+        cleanup_event(
+            ProjectionCleanupStage::CleanupLedger { mount_id: *branch },
+            false,
+        ),
+        cleanup_event(
+            ProjectionCleanupStage::CleanupLedger { mount_id: *owner },
+            false,
+        ),
+        cleanup_event(
+            ProjectionCleanupStage::CleanupLedger { mount_id: *shared },
+            false,
+        ),
+        cleanup_event(ProjectionCleanupStage::ProjectionRoot, false),
+        cleanup_event(ProjectionCleanupStage::CacheRemoval, false),
+        cleanup_event(ProjectionCleanupStage::Complete, false),
+    ]
+    .into_iter()
+    .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fresh_admission_has_exactly_one_guard_reference() {
     let (_temporary, kernel, caller, broker) =
@@ -202,7 +328,7 @@ async fn fresh_admission_has_exactly_one_guard_reference() {
     let CachedMount {
         mount: first,
         projection,
-    } = successful_fleet_mount(&kernel, &caller, &broker, 701).await;
+    } = successful_fleet_mount_for_fresh_execution(&kernel, &caller, &broker).await;
     let mount_root = first
         .workspace_root
         .parent()
@@ -222,7 +348,10 @@ async fn fresh_admission_has_exactly_one_guard_reference() {
     assert_eq!(projection.component_mount_ids.len(), 3);
 
     let reused = super::PROCESS_MOUNT_TEST_ID
-        .scope(702, broker.mount(&caller))
+        .scope(
+            super::super::process_stop::cache_test_support::fresh_process_mount_test_id(),
+            broker.mount(&caller),
+        )
         .await
         .expect("cached process projection while the first guard is held");
     assert_eq!(reused.workspace_root, first.workspace_root);
@@ -259,7 +388,7 @@ async fn fresh_admission_has_exactly_one_guard_reference() {
     let CachedMount {
         mount: remounted,
         projection: remounted_projection,
-    } = successful_fleet_mount(&kernel, &caller, &broker, 703).await;
+    } = successful_fleet_mount_for_fresh_execution(&kernel, &caller, &broker).await;
     assert!(!Arc::ptr_eq(&projection, &remounted_projection));
     assert_eq!(remounted_projection.refs.load(Ordering::Acquire), 1);
     remounted.close_async().await;
@@ -272,7 +401,7 @@ async fn fresh_admission_has_exactly_one_guard_reference() {
 async fn revoked_component_invalidates_cached_exact_set() {
     let (_temporary, kernel, caller, broker) =
         provider_fixture!("revoked_component_invalidates_cached_exact_set");
-    let stale = successful_fleet_mount(&kernel, &caller, &broker, 501).await;
+    let stale = successful_fleet_mount_for_fresh_execution(&kernel, &caller, &broker).await;
     let revoked_mount_id = stale.projection.component_mount_ids[1];
 
     revoke_lease(
@@ -285,14 +414,15 @@ async fn revoked_component_invalidates_cached_exact_set() {
     .expect("ordinary authorized revocation of one component");
     assert!(!kernel.storage_mounts.contains_key(&revoked_mount_id));
 
-    assert_replacement_after_unhealthy_hit(&kernel, &caller, &broker, stale, 502).await;
+    assert_replacement_after_unhealthy_hit_for_fresh_execution(&kernel, &caller, &broker, stale)
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expired_component_invalidates_cached_exact_set() {
     let (_temporary, kernel, caller, broker) =
         provider_fixture!("expired_component_invalidates_cached_exact_set");
-    let stale = successful_fleet_mount(&kernel, &caller, &broker, 503).await;
+    let stale = successful_fleet_mount_for_fresh_execution(&kernel, &caller, &broker).await;
     for mount_id in &stale.projection.component_mount_ids {
         kernel
             .storage_mounts
@@ -302,14 +432,15 @@ async fn expired_component_invalidates_cached_exact_set() {
             .store(0, Ordering::Release);
     }
 
-    assert_replacement_after_unhealthy_hit(&kernel, &caller, &broker, stale, 504).await;
+    assert_replacement_after_unhealthy_hit_for_fresh_execution(&kernel, &caller, &broker, stale)
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn revocation_cannot_interleave_validation_and_cached_reference() {
     let (_temporary, kernel, caller, broker) =
         provider_fixture!("revocation_cannot_interleave_validation_and_cached_reference");
-    let stale = successful_fleet_mount(&kernel, &caller, &broker, 601).await;
+    let stale = successful_fleet_mount_for_fresh_execution(&kernel, &caller, &broker).await;
     let owner_mount_id = stale.projection.component_mount_ids[1];
     let owner_state = kernel
         .storage_mounts
@@ -322,7 +453,10 @@ async fn revocation_cannot_interleave_validation_and_cached_reference() {
     let mount_caller = caller.clone();
     let mount_task = Arc::new(OwnedTask::spawn(async move {
         super::PROCESS_MOUNT_TEST_ID
-            .scope(602, mount_broker.mount(&mount_caller))
+            .scope(
+                super::super::process_stop::cache_test_support::fresh_process_mount_test_id(),
+                mount_broker.mount(&mount_caller),
+            )
             .await
     }));
     bounded_phase("validation gate entry", gate.entered().notified()).await;
@@ -354,6 +488,7 @@ async fn revocation_cannot_interleave_validation_and_cached_reference() {
 
     let body_kernel = Arc::clone(&kernel);
     let body_broker = broker.clone();
+    let stale_component_mount_ids = stale.projection.component_mount_ids.clone();
     let finishers = owned_finishers![mount_task, revocation];
     run_owned_test_body(&finishers, move || async move {
         let replacement_mount =
@@ -370,7 +505,10 @@ async fn revocation_cannot_interleave_validation_and_cached_reference() {
         close_mount("stale provider close", stale.mount).await;
         assert!(body_kernel.storage_mounts.is_empty());
         assert!(body_broker.projections.lock().await.is_empty());
-        super::super::process_stop::cleanup_evidence::assert_successful_for_test(602, 3);
+        assert_eq!(
+            super::super::process_stop::cleanup_evidence::take_latest_for_test(),
+            expected_successful_projection_evidence(&stale_component_mount_ids)
+        );
     })
     .await;
 }
@@ -379,14 +517,17 @@ async fn revocation_cannot_interleave_validation_and_cached_reference() {
 async fn expiry_cannot_interleave_validation_and_cached_reference() {
     let (_temporary, kernel, caller, broker) =
         provider_fixture!("expiry_cannot_interleave_validation_and_cached_reference");
-    let stale = successful_fleet_mount(&kernel, &caller, &broker, 611).await;
+    let stale = successful_fleet_mount_for_fresh_execution(&kernel, &caller, &broker).await;
 
     let gate = arm_retain_validation_gate();
     let mount_broker = broker.clone();
     let mount_caller = caller.clone();
     let mount_task = Arc::new(OwnedTask::spawn(async move {
         super::PROCESS_MOUNT_TEST_ID
-            .scope(612, mount_broker.mount(&mount_caller))
+            .scope(
+                super::super::process_stop::cache_test_support::fresh_process_mount_test_id(),
+                mount_broker.mount(&mount_caller),
+            )
             .await
     }));
     bounded_phase("expiry validation gate entry", gate.entered().notified()).await;
@@ -406,12 +547,11 @@ async fn expiry_cannot_interleave_validation_and_cached_reference() {
     let finishers = owned_finishers![mount_task];
     run_owned_test_body(&finishers, move || async move {
         let replacement_mount = join_mount(&mount_task, "validated expiry mount replacement").await;
-        assert_replacement_after_unhealthy_hit(
+        assert_replacement_after_unhealthy_hit_for_fresh_execution(
             &body_kernel,
             &body_caller,
             &body_broker,
             stale,
-            613,
         )
         .await;
         close_mount("validated expiry provider close", replacement_mount).await;
@@ -476,20 +616,24 @@ async fn invalidation_records_cache_removal_and_complete_success() {
     let replacement_cleanup: ProjectionCleanup = Arc::new(|| Box::pin(async { true }));
     let (_, _, mut projections) = exact_cached_projection(&fixture, ids, replacement_cleanup);
 
-    assert!(
-        super::PROCESS_MOUNT_TEST_ID
-            .scope(
-                652,
-                invalidate_unhealthy_projection(
-                    &fixture.kernel,
-                    &projection,
-                    &mut projections,
-                    &key
-                )
+    let scope = super::super::process_stop::cleanup_evidence::scoped_with_label(
+        "invalidation-cache-removal",
+        async {
+            let invalidated = invalidate_unhealthy_projection(
+                &fixture.kernel,
+                &projection,
+                &mut projections,
+                &key,
             )
-            .await
-    );
-    let events = super::super::process_stop::cleanup_evidence::take_for_test(652);
+            .await;
+            let scope = super::super::process_stop::cleanup_evidence::current_scope_for_test()
+                .expect("typed evidence execution");
+            (scope, invalidated)
+        },
+    )
+    .await;
+    assert!(scope.1);
+    let events = super::super::process_stop::cleanup_evidence::take_for_test(scope.0);
     assert_eq!(events.len(), 3);
     assert!(!events.iter().any(|event| event.failed));
     assert_eq!(events[1].stage, ProjectionCleanupStage::CacheRemoval);
@@ -509,14 +653,19 @@ async fn cleanup_evidence_names_first_lease_resource_failure() {
     let branch = lease_target(fixture.branch.mount_id, targets.workspace.clone());
     let owner = lease_target(owner_mount_id, targets.owner_home.clone());
 
-    super::PROCESS_MOUNT_TEST_ID
-        .scope(
-            651,
-            revoke_projection_leases(&fixture.kernel, &fixture.binding, &branch, &owner, None),
-        )
-        .await;
-
-    let events = super::super::process_stop::cleanup_evidence::take_for_test(651);
+    let scope = super::super::process_stop::cleanup_evidence::scoped_with_label(
+        "first-failure-evidence",
+        async {
+            assert!(
+                !revoke_projection_leases(&fixture.kernel, &fixture.binding, &branch, &owner, None)
+                    .await
+            );
+            super::super::process_stop::cleanup_evidence::current_scope_for_test()
+                .expect("typed evidence execution")
+        },
+    )
+    .await;
+    let events = super::super::process_stop::cleanup_evidence::take_for_test(scope);
     assert_eq!(
         events,
         vec![
@@ -768,7 +917,7 @@ async fn failed_issue_cleanup_retains_root_and_retry_authority() {
 async fn revocation_after_validation_before_reference_admits_replacement() {
     let (_temporary, kernel, caller, broker) =
         provider_fixture!("revocation_after_validation_before_reference_admits_replacement");
-    let stale = successful_fleet_mount(&kernel, &caller, &broker, 621).await;
+    let stale = successful_fleet_mount_for_fresh_execution(&kernel, &caller, &broker).await;
     let owner_mount_id = stale.projection.component_mount_ids[1];
     let owner_state = kernel
         .storage_mounts
@@ -782,7 +931,10 @@ async fn revocation_after_validation_before_reference_admits_replacement() {
     let mount_caller = caller.clone();
     let mount_task = Arc::new(OwnedTask::spawn(async move {
         super::PROCESS_MOUNT_TEST_ID
-            .scope(622, mount_broker.mount(&mount_caller))
+            .scope(
+                super::super::process_stop::cache_test_support::fresh_process_mount_test_id(),
+                mount_broker.mount(&mount_caller),
+            )
             .await
     }));
     bounded_phase(
@@ -825,12 +977,11 @@ async fn revocation_after_validation_before_reference_admits_replacement() {
     run_owned_test_body(&finishers, move || async move {
         let replacement_mount = join_mount(&mount_task, "post-validation mount replacement").await;
         join_revocation(&revocation, "post-validation revocation").await;
-        assert_replacement_after_unhealthy_hit(
+        assert_replacement_after_unhealthy_hit_for_fresh_execution(
             &body_kernel,
             &body_caller,
             &body_broker,
             stale,
-            623,
         )
         .await;
         close_mount("post-validation provider close", replacement_mount).await;
@@ -856,7 +1007,10 @@ async fn first_mount_revocation_between_validation_and_reference_admits_replacem
     let mount_caller = caller.clone();
     let mount_task = Arc::new(OwnedTask::spawn(async move {
         super::PROCESS_MOUNT_TEST_ID
-            .scope(631, mount_broker.mount(&mount_caller))
+            .scope(
+                super::super::process_stop::cache_test_support::fresh_process_mount_test_id(),
+                mount_broker.mount(&mount_caller),
+            )
             .await
     }));
 
@@ -934,7 +1088,10 @@ async fn first_mount_expiry_between_validation_and_reference_admits_replacement(
     let mount_caller = caller.clone();
     let mount_task = Arc::new(OwnedTask::spawn(async move {
         super::PROCESS_MOUNT_TEST_ID
-            .scope(641, mount_broker.mount(&mount_caller))
+            .scope(
+                super::super::process_stop::cache_test_support::fresh_process_mount_test_id(),
+                mount_broker.mount(&mount_caller),
+            )
             .await
     }));
     bounded_phase(

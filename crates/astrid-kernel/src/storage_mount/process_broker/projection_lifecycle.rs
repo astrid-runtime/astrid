@@ -73,8 +73,11 @@ pub(crate) struct ProjectionLeaseTarget {
 pub(crate) async fn cleanup_projection_state(
     cleanup_state: Arc<tokio::sync::Mutex<ProjectionCleanupState>>,
 ) -> bool {
-    let mut state = cleanup_state.lock().await;
-    cleanup_projection(&mut state).await
+    cleanup_evidence::scoped(Box::pin(async move {
+        let mut state = cleanup_state.lock().await;
+        cleanup_projection(&mut state).await
+    }))
+    .await
 }
 
 pub(crate) async fn rollback_or_retain_failed_launch(
@@ -89,7 +92,7 @@ pub(crate) async fn rollback_or_retain_failed_launch(
     cleanup_state: ProjectionCleanupState,
 ) {
     let mut cleanup_state = cleanup_state;
-    if cleanup_projection(&mut cleanup_state).await {
+    if cleanup_evidence::scoped(Box::pin(cleanup_projection(&mut cleanup_state))).await {
         return;
     }
 
@@ -228,6 +231,13 @@ async fn stop_running_provider(
     component: cleanup_evidence::ProviderComponent,
 ) -> bool {
     if provider.stopped {
+        cleanup_evidence::record(
+            Stage::ProviderStop {
+                component,
+                outcome: ProcessStopOutcome::Stopped { acknowledged: true },
+            },
+            false,
+        );
         return true;
     }
     let stopped = if let Some(child) = provider.child.as_mut() {
@@ -423,6 +433,18 @@ async fn drain_projection_states(states: &[Arc<super::StorageMountLeaseState>]) 
 }
 
 pub(crate) async fn cleanup_uncommitted_issue_lease_set(
+    kernel: &Kernel,
+    binding: &ProcessProjectionBinding,
+    branch: &ProjectionLeaseTarget,
+    owner: Option<&ProjectionLeaseTarget>,
+) -> bool {
+    cleanup_evidence::scoped(Box::pin(cleanup_uncommitted_issue_lease_set_inner(
+        kernel, binding, branch, owner,
+    )))
+    .await
+}
+
+async fn cleanup_uncommitted_issue_lease_set_inner(
     kernel: &Kernel,
     binding: &ProcessProjectionBinding,
     branch: &ProjectionLeaseTarget,
@@ -704,6 +726,22 @@ pub(crate) async fn retry_failed_projection(
     >,
     key: &ProcessProjectionKey,
 ) -> bool {
+    cleanup_evidence::scoped(Box::pin(retry_failed_projection_inner(
+        projection,
+        projections,
+        key,
+    )))
+    .await
+}
+
+async fn retry_failed_projection_inner(
+    projection: &Arc<CachedProcessProjection>,
+    projections: &mut std::collections::BTreeMap<
+        ProcessProjectionKey,
+        Arc<CachedProcessProjection>,
+    >,
+    key: &ProcessProjectionKey,
+) -> bool {
     if !(projection.cleanup)().await {
         projection.cleanup_failed.store(true, Ordering::Release);
         return false;
@@ -729,6 +767,24 @@ pub(crate) async fn retry_failed_projection(
 /// mount guard still owns a reference: external revocation means the cached
 /// provider pair is no longer a complete authority and must not be reused.
 pub(crate) async fn invalidate_unhealthy_projection(
+    kernel: &Kernel,
+    projection: &Arc<CachedProcessProjection>,
+    projections: &mut std::collections::BTreeMap<
+        ProcessProjectionKey,
+        Arc<CachedProcessProjection>,
+    >,
+    key: &ProcessProjectionKey,
+) -> bool {
+    cleanup_evidence::scoped(Box::pin(invalidate_unhealthy_projection_inner(
+        kernel,
+        projection,
+        projections,
+        key,
+    )))
+    .await
+}
+
+async fn invalidate_unhealthy_projection_inner(
     kernel: &Kernel,
     projection: &Arc<CachedProcessProjection>,
     projections: &mut std::collections::BTreeMap<
@@ -900,6 +956,11 @@ pub(crate) fn projection_mount(
             {
                 projections.remove(&key);
             }
+            let removed = !projections
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &cleanup_projection));
+            cleanup_evidence::record(Stage::CacheRemoval, !removed);
+            cleanup_evidence::record(Stage::Complete, !removed);
         })
     };
     let mut mount = astrid_capsule::context::ProcessStorageMount::new_async(
