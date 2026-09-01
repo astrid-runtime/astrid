@@ -16,7 +16,6 @@ use super::{
     ProcessProjectionBinding, ProcessProjectionKey, ProcessProjectionTargetSet,
     ProjectionGeneration, arm_parent_token_failure, arm_preparation_failure_for_test,
     blocked_projection_lease, retain_failed_launch_projection, retry_failed_projection,
-    rollback_or_retain_failed_launch,
 };
 
 mod cache_invalidation_tests;
@@ -32,7 +31,7 @@ pub(crate) use super::{
     arm_partial_issue_provider_error_for_test,
 };
 use super::{
-    abort_process_provider, arm_launch_cleanup_failure, arm_launch_failure,
+    arm_launch_cleanup_failure, arm_launch_failure,
     process_launch::{
         ProcessLaunchStage, published_provider_leases, release_launch_cleanup_failure,
         spawned_provider_pids,
