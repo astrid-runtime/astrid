@@ -9,8 +9,10 @@ use std::sync::{Mutex, OnceLock};
 
 use fs2::FileExt as _;
 
+use super::recover::FOOTER_BYTES;
 use super::{
-    ContainerState, HostedFileVolume, Operation, RegionState, VOLUME_MAGIC, overlay_extent,
+    ContainerState, HostedFileVolume, Operation, PhysicalTail, RegionState, RootSlot, VOLUME_MAGIC,
+    overlay_extent,
 };
 
 // Reclaim closes the old inode before swapping the active path. Tests pause
@@ -46,6 +48,50 @@ fn run_test_unlock_hook(path: &Path) {
 #[cfg(not(test))]
 #[inline]
 fn run_test_unlock_hook(_path: &Path) {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReclaimStage {
+    RootPublished,
+    ReplacementDurable,
+    FinalImageDurable,
+    FinalRootPublished,
+    Truncated,
+}
+
+#[cfg(test)]
+type StageHook = Box<dyn FnMut(ReclaimStage) -> io::Result<()> + Send>;
+
+#[cfg(test)]
+static STAGE_HOOK: std::sync::OnceLock<std::sync::Mutex<BTreeMap<PathBuf, StageHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(super) fn set_stage_hook(path: PathBuf, hook: StageHook) {
+    STAGE_HOOK
+        .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("hosted reclaim stage hook lock")
+        .insert(path, hook);
+}
+
+#[cfg(test)]
+fn run_stage(path: &Path, stage: ReclaimStage) -> io::Result<()> {
+    let mut hooks = STAGE_HOOK
+        .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("hosted reclaim stage hook lock");
+    if let Some(hook) = hooks.get_mut(path) {
+        hook(stage)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[allow(clippy::unnecessary_wraps)]
+#[inline]
+fn run_stage(_path: &Path, _stage: ReclaimStage) -> io::Result<()> {
+    Ok(())
+}
 
 pub(super) fn temp_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.compacting", path.display()))
@@ -135,6 +181,218 @@ fn read_region(
     Ok(())
 }
 
+fn finish_image(state: &mut ContainerState) -> io::Result<u64> {
+    let commit_region = super::VolumeRegion::new(super::COMMIT_REGION)?;
+    let snapshot = super::recover::encode_region_snapshot(&state.regions)?;
+    let commit_offset = state.valid_len;
+    HostedFileVolume::append(state, Operation::Commit, &commit_region, 0, &snapshot)?;
+    state.last_commit_offset = commit_offset;
+    state.durable_len = state.valid_len;
+    state.last_commit_has_snapshot = true;
+    state.boundary_pending = true;
+    super::recover::write_footer(
+        &mut state.file,
+        state.last_commit_offset,
+        state.durable_len,
+        state.sequence,
+    )?;
+    state.file.sync_all()?;
+    state
+        .durable_len
+        .checked_add(FOOTER_BYTES as u64)
+        .ok_or_else(|| io::Error::other("volume reclaim authority overflow"))
+}
+
+fn build_image(
+    source: &mut ContainerState,
+    start: u64,
+    generation: u64,
+    root_base: u64,
+    limit: u64,
+) -> io::Result<ContainerState> {
+    let mut rebuilt = ContainerState {
+        file: source.file.try_clone()?,
+        generation,
+        root_base,
+        root_slot: source.root_slot,
+        sequence: 0,
+        valid_len: start,
+        durable_len: start,
+        last_commit_offset: 0,
+        last_commit_has_snapshot: false,
+        boundary_pending: true,
+        footer_pending: false,
+        physical_tail: PhysicalTail::PreserveSelected,
+        regions: BTreeMap::new(),
+    };
+    let source_regions = source.regions.clone();
+    for (region, source_region) in &source_regions {
+        if rebuilt.valid_len > limit {
+            return Err(io::Error::other("volume reclaim replacement exceeds bound"));
+        }
+        HostedFileVolume::append(&mut rebuilt, Operation::Create, region, 0, &[])?;
+        rebuilt
+            .regions
+            .insert(region.clone(), RegionState::default());
+        let mut offset = 0_u64;
+        while offset < source_region.length {
+            let remaining = source_region
+                .length
+                .checked_sub(offset)
+                .ok_or_else(|| io::Error::other("volume reclaim source range underflow"))?;
+            let length = usize::try_from(remaining.min(64 * 1024))
+                .map_err(|_| io::Error::other("volume reclaim chunk length overflow"))?;
+            let mut bytes = vec![0_u8; length];
+            read_region(source, source_region, offset, &mut bytes)?;
+            let (physical, _) =
+                HostedFileVolume::append(&mut rebuilt, Operation::Write, region, offset, &bytes)?;
+            let end = offset
+                .checked_add(
+                    u64::try_from(length)
+                        .map_err(|_| io::Error::other("volume reclaim write length overflow"))?,
+                )
+                .ok_or_else(|| io::Error::other("volume reclaim write range overflow"))?;
+            let destination = rebuilt
+                .regions
+                .get_mut(region)
+                .ok_or_else(|| io::Error::other("rebuilt volume region disappeared"))?;
+            overlay_extent(&mut destination.extents, offset, end, physical);
+            destination.length = destination.length.max(end);
+            offset = end;
+        }
+    }
+    Ok(rebuilt)
+}
+
+fn publish_root(
+    path: &Path,
+    state: &mut ContainerState,
+    generation: u64,
+    root_base: u64,
+    footer_offset: u64,
+) -> io::Result<()> {
+    let first_slot = state.root_slot == RootSlot::Second;
+    super::recover::write_root_pointer(
+        &mut state.file,
+        generation,
+        root_base,
+        footer_offset,
+        first_slot,
+    )?;
+    state.file.sync_all()?;
+    state.generation = generation;
+    state.root_base = root_base;
+    state.root_slot = if first_slot {
+        RootSlot::Second
+    } else {
+        RootSlot::First
+    };
+    if root_base == super::ROOT_BYTES as u64 && generation > 1 {
+        run_stage(path, ReclaimStage::FinalRootPublished)?;
+    } else {
+        run_stage(path, ReclaimStage::RootPublished)?;
+    }
+    super::recover::write_root_pointer(
+        &mut state.file,
+        generation,
+        root_base,
+        footer_offset,
+        !first_slot,
+    )?;
+    state.file.sync_all()?;
+    state.root_slot = if first_slot {
+        RootSlot::First
+    } else {
+        RootSlot::Second
+    };
+    Ok(())
+}
+
+pub(super) fn reclaim_same_inode(volume: &HostedFileVolume) -> io::Result<()> {
+    let _open_guard = volume.open_lock.lock();
+    let mut state = volume.state.lock();
+    let path = volume.path.clone();
+    HostedFileVolume::make_durable(&mut state)?;
+    let physical_len = state.file.metadata()?.len();
+    let replacement_base = physical_len;
+    let replacement_generation = if state.generation == 0 {
+        1
+    } else {
+        state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("Astrid volume generation exhausted"))?
+    };
+    let mut replacement = build_image(
+        &mut state,
+        physical_len,
+        replacement_generation,
+        super::ROOT_BYTES as u64,
+        u64::MAX,
+    )?;
+    let replacement_end = finish_image(&mut replacement)?;
+    run_stage(&volume.path, ReclaimStage::ReplacementDurable)?;
+    publish_root(
+        &path,
+        &mut state,
+        replacement_generation,
+        super::ROOT_BYTES as u64,
+        replacement_end
+            .checked_sub(FOOTER_BYTES as u64)
+            .ok_or_else(|| io::Error::other("volume reclaim authority underflow"))?,
+    )?;
+    state.file = replacement.file;
+    state.sequence = replacement.sequence;
+    state.valid_len = replacement.valid_len;
+    state.durable_len = replacement.durable_len;
+    state.last_commit_offset = replacement.last_commit_offset;
+    state.last_commit_has_snapshot = replacement.last_commit_has_snapshot;
+    state.boundary_pending = replacement.boundary_pending;
+    state.footer_pending = replacement.footer_pending;
+    state.regions = replacement.regions;
+
+    let candidate_base = replacement_base;
+    let final_generation = state
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("Astrid volume generation exhausted"))?;
+    let mut finalized = build_image(
+        &mut state,
+        super::ROOT_BYTES as u64,
+        final_generation,
+        super::ROOT_BYTES as u64,
+        candidate_base,
+    )?;
+    let final_end = finish_image(&mut finalized)?;
+    if final_end > candidate_base {
+        return Err(io::Error::other("volume reclaim did not shrink the image"));
+    }
+    run_stage(&volume.path, ReclaimStage::FinalImageDurable)?;
+    publish_root(
+        &path,
+        &mut state,
+        final_generation,
+        super::ROOT_BYTES as u64,
+        final_end
+            .checked_sub(FOOTER_BYTES as u64)
+            .ok_or_else(|| io::Error::other("volume reclaim authority underflow"))?,
+    )?;
+    state.file = finalized.file;
+    state.sequence = finalized.sequence;
+    state.valid_len = finalized.valid_len;
+    state.durable_len = finalized.durable_len;
+    state.last_commit_offset = finalized.last_commit_offset;
+    state.last_commit_has_snapshot = finalized.last_commit_has_snapshot;
+    state.boundary_pending = finalized.boundary_pending;
+    state.footer_pending = finalized.footer_pending;
+    state.regions = finalized.regions;
+
+    state.file.set_len(final_end)?;
+    state.file.sync_all()?;
+    run_stage(&volume.path, ReclaimStage::Truncated)?;
+    Ok(())
+}
+
 pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
     let _open_guard = volume.open_lock.lock();
     let mut state = volume.state.lock();
@@ -149,6 +407,9 @@ pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
     let temporary_file = create_file(&temporary)?;
     let mut rebuilt = ContainerState {
         file: temporary_file,
+        generation: 0,
+        root_base: VOLUME_MAGIC.len() as u64,
+        root_slot: RootSlot::First,
         sequence: 0,
         valid_len: 0,
         durable_len: 0,
@@ -156,6 +417,7 @@ pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
         last_commit_has_snapshot: false,
         boundary_pending: false,
         footer_pending: true,
+        physical_tail: PhysicalTail::TruncateToValid,
         regions: BTreeMap::new(),
     };
     rebuilt.file.write_all(&VOLUME_MAGIC)?;

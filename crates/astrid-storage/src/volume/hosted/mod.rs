@@ -23,6 +23,9 @@ mod stream;
 
 const VOLUME_MAGIC: [u8; 8] = *b"ASTVOL1\0";
 const RECORD_MAGIC: [u8; 8] = *b"ASTREG1\0";
+const ROOT_MAGIC: [u8; 8] = *b"ASTROOT1";
+const ROOT_SLOT_BYTES: usize = 8 + 8 + 8 + 8 + 32;
+const ROOT_BYTES: usize = VOLUME_MAGIC.len() + 2 * ROOT_SLOT_BYTES;
 const RECORD_FIXED_BYTES: usize = 8 + 8 + 8 + 1 + 2 + 8 + 8 + 32;
 const MAX_METADATA_MUTATIONS: usize = 1_024;
 const METADATA_TRANSACTION_REGION: &str = "system/volume-metadata-transaction";
@@ -32,6 +35,18 @@ const COMMIT_REGION: &str = "system/volume-commit";
 struct Extent {
     logical_end: u64,
     physical_offset: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PhysicalTail {
+    TruncateToValid,
+    PreserveSelected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RootSlot {
+    First,
+    Second,
 }
 
 #[cfg(test)]
@@ -60,6 +75,9 @@ impl Clone for RegionState {
 #[derive(Debug)]
 struct ContainerState {
     file: File,
+    generation: u64,
+    root_base: u64,
+    root_slot: RootSlot,
     sequence: u64,
     valid_len: u64,
     durable_len: u64,
@@ -67,6 +85,7 @@ struct ContainerState {
     last_commit_has_snapshot: bool,
     boundary_pending: bool,
     footer_pending: bool,
+    physical_tail: PhysicalTail,
     regions: BTreeMap<VolumeRegion, RegionState>,
 }
 
@@ -120,7 +139,9 @@ impl HostedFileVolume {
         // A footer occupies the old valid-end until the next append. Truncate
         // it before writing the next ASTREG1 record; valid_len excludes it.
         state.footer_pending = true;
-        state.file.set_len(state.valid_len)?;
+        if state.physical_tail == PhysicalTail::TruncateToValid {
+            state.file.set_len(state.valid_len)?;
+        }
         state.file.seek(SeekFrom::Start(state.valid_len))?;
         state.file.write_all(&RECORD_MAGIC)?;
         state.file.write_all(&total_len.to_le_bytes())?;
@@ -179,9 +200,40 @@ impl HostedFileVolume {
             )?;
         }
         state.file.sync_all()?;
+        if state.generation > 0 {
+            recover::write_root_pointer(
+                &mut state.file,
+                state.generation,
+                state.root_base,
+                state.durable_len,
+                false,
+            )?;
+            state.file.sync_all()?;
+            recover::write_root_pointer(
+                &mut state.file,
+                state.generation,
+                state.root_base,
+                state.durable_len,
+                true,
+            )?;
+            state.file.sync_all()?;
+            state.root_slot = RootSlot::Second;
+        }
         state.boundary_pending = false;
         state.footer_pending = false;
         Ok(())
+    }
+
+    /// Publish a compact replacement through the inode-stable volume root.
+    ///
+    /// This is the prerelease same-inode shrink primitive. The released
+    /// [`AstridVolume::reclaim`] path remains the generic namespace swap.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O, durability, or volume-generation error.
+    pub fn reclaim_same_inode(&self) -> io::Result<()> {
+        reclaim::reclaim_same_inode(self)
     }
 }
 impl Drop for HostedFileVolume {

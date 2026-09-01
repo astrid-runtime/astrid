@@ -8,9 +8,9 @@ use std::io::{self, Seek, SeekFrom, Write};
 
 use super::{
     COMMIT_REGION, Extent, MAX_REGION_NAME_BYTES, METADATA_TRANSACTION_REGION, Operation,
-    RECORD_FIXED_BYTES, RECORD_MAGIC, RegionState, VOLUME_MAGIC, VolumeRegion,
-    apply_metadata_mutations, decode_metadata_mutations, invalid_transition, overlay_extent,
-    truncate_extents,
+    RECORD_FIXED_BYTES, RECORD_MAGIC, ROOT_BYTES, ROOT_MAGIC, ROOT_SLOT_BYTES, RegionState,
+    VOLUME_MAGIC, VolumeRegion, apply_metadata_mutations, decode_metadata_mutations,
+    invalid_transition, overlay_extent, truncate_extents,
 };
 
 const RECOVERY_BUFFER_BYTES: usize = 64 * 1024;
@@ -21,7 +21,7 @@ const MAX_METADATA_PAYLOAD_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_COMMIT_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
 const SNAPSHOT_MAGIC: [u8; 8] = *b"ASTMAP1\0";
 const FOOTER_MAGIC: [u8; 8] = *b"ASTFTR1\0";
-const FOOTER_BYTES: usize = FOOTER_MAGIC.len() + 8 + 8 + 8 + 32;
+pub(super) const FOOTER_BYTES: usize = FOOTER_MAGIC.len() + 8 + 8 + 8 + 32;
 
 #[cfg(test)]
 thread_local! {
@@ -40,6 +40,9 @@ pub(super) fn read_header_count() -> usize {
 
 #[derive(Debug)]
 pub(super) struct Recovery {
+    pub(super) generation: u64,
+    pub(super) root_base: u64,
+    pub(super) pointer_slot: bool,
     pub(super) regions: BTreeMap<VolumeRegion, RegionState>,
     pub(super) sequence: u64,
     pub(super) valid_len: u64,
@@ -47,6 +50,15 @@ pub(super) struct Recovery {
     pub(super) last_commit_offset: u64,
     pub(super) last_commit_has_snapshot: bool,
     pub(super) footer_present: bool,
+    pub(super) authority_len: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RootPointer {
+    pub(super) generation: u64,
+    pub(super) root_base: u64,
+    pub(super) footer_offset: u64,
+    pub(super) slot: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -62,11 +74,150 @@ struct RecordHeader {
 }
 
 pub(super) fn recover_container(file: &mut File) -> io::Result<Recovery> {
+    if let Some(recovery) = recover_from_root(file)? {
+        return Ok(recovery);
+    }
     if let Some(recovery) = recover_from_footer(file)? {
         return Ok(recovery);
     }
     advise_random_access(file);
     recover_from_headers(file)
+}
+
+pub(super) fn write_root_pointer(
+    file: &mut File,
+    generation: u64,
+    root_base: u64,
+    footer_offset: u64,
+    slot: bool,
+) -> io::Result<()> {
+    if generation == 0 || root_base == 0 {
+        return Err(invalid_transition("invalid volume root pointer"));
+    }
+    let mut encoded = Vec::with_capacity(ROOT_SLOT_BYTES);
+    encoded.extend_from_slice(&ROOT_MAGIC);
+    encoded.extend_from_slice(&generation.to_le_bytes());
+    encoded.extend_from_slice(&root_base.to_le_bytes());
+    encoded.extend_from_slice(&footer_offset.to_le_bytes());
+    let checksum = root_checksum(generation, root_base, footer_offset);
+    encoded.extend_from_slice(&checksum);
+    let offset = u64::try_from(if slot {
+        ROOT_BYTES - ROOT_SLOT_BYTES
+    } else {
+        VOLUME_MAGIC.len()
+    })
+    .map_err(|_| invalid_transition("volume root offset overflow"))?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(&encoded)
+}
+
+fn root_checksum(generation: u64, root_base: u64, footer_offset: u64) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key("astrid volume root v1");
+    hasher.update(&ROOT_MAGIC);
+    hasher.update(&generation.to_le_bytes());
+    hasher.update(&root_base.to_le_bytes());
+    hasher.update(&footer_offset.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn decode_root_pointer(
+    file: &File,
+    slot: bool,
+    physical_len: u64,
+) -> io::Result<Option<RootPointer>> {
+    let slot_offset = if slot {
+        ROOT_BYTES - ROOT_SLOT_BYTES
+    } else {
+        VOLUME_MAGIC.len()
+    };
+    if physical_len.saturating_sub(slot_offset as u64) < ROOT_SLOT_BYTES as u64 {
+        return Ok(None);
+    }
+    let mut encoded = [0_u8; ROOT_SLOT_BYTES];
+    read_exact_at(file, slot_offset as u64, &mut encoded)?;
+    if encoded[..ROOT_MAGIC.len()] != ROOT_MAGIC {
+        return Ok(None);
+    }
+    let generation = u64::from_le_bytes(read_array::<8>(&encoded[8..16])?);
+    let root_base = u64::from_le_bytes(read_array::<8>(&encoded[16..24])?);
+    let footer_offset = u64::from_le_bytes(read_array::<8>(&encoded[24..32])?);
+    let checksum = &encoded[32..ROOT_SLOT_BYTES];
+    if generation == 0
+        || root_base == 0
+        || checksum != root_checksum(generation, root_base, footer_offset).as_slice()
+    {
+        return Ok(None);
+    }
+    if footer_offset != 0
+        && footer_offset
+            .checked_add(FOOTER_BYTES as u64)
+            .is_none_or(|end| end > physical_len)
+    {
+        return Ok(None);
+    }
+    Ok(Some(RootPointer {
+        generation,
+        root_base,
+        footer_offset,
+        slot,
+    }))
+}
+
+fn recover_from_root(file: &mut File) -> io::Result<Option<Recovery>> {
+    let physical_len = file.metadata()?.len();
+    let first = decode_root_pointer(file, false, physical_len)?;
+    let second = decode_root_pointer(file, true, physical_len)?;
+    let selected = [first, second]
+        .into_iter()
+        .flatten()
+        .max_by_key(|pointer| pointer.generation);
+    let Some(pointer) = selected else {
+        for slot_offset in [VOLUME_MAGIC.len(), ROOT_BYTES - ROOT_SLOT_BYTES] {
+            let marker_end = u64::try_from(slot_offset)
+                .ok()
+                .and_then(|offset| offset.checked_add(ROOT_MAGIC.len() as u64));
+            if marker_end.is_none_or(|end| physical_len < end) {
+                continue;
+            }
+            let mut marker = [0_u8; ROOT_MAGIC.len()];
+            read_exact_at(file, slot_offset as u64, &mut marker)?;
+            if marker == ROOT_MAGIC {
+                return Err(invalid_transition("invalid Astrid volume root pointer"));
+            }
+        }
+        return Ok(None);
+    };
+    if pointer.footer_offset == 0 {
+        if pointer.root_base != ROOT_BYTES as u64 || physical_len != ROOT_BYTES as u64 {
+            return Err(invalid_transition("invalid empty Astrid volume root"));
+        }
+        return Ok(Some(Recovery {
+            generation: pointer.generation,
+            root_base: pointer.root_base,
+            pointer_slot: pointer.slot,
+            regions: BTreeMap::new(),
+            sequence: 0,
+            valid_len: ROOT_BYTES as u64,
+            durable_len: 0,
+            last_commit_offset: 0,
+            last_commit_has_snapshot: false,
+            footer_present: false,
+            authority_len: ROOT_BYTES as u64,
+        }));
+    }
+    let authority_len = pointer
+        .footer_offset
+        .checked_add(FOOTER_BYTES as u64)
+        .ok_or_else(|| invalid_transition("volume root authority overflow"))?;
+    let Some(mut recovery) = recover_footer_at(file, pointer.footer_offset, authority_len, true)?
+    else {
+        return Err(invalid_transition("invalid Astrid volume root footer"));
+    };
+    recovery.generation = pointer.generation;
+    recovery.root_base = pointer.root_base;
+    recovery.pointer_slot = pointer.slot;
+    recovery.authority_len = authority_len;
+    Ok(Some(recovery))
 }
 
 pub(super) fn encode_region_snapshot(
@@ -109,7 +260,9 @@ pub(super) fn write_footer(
         return Err(invalid_transition("volume footer has no commit"));
     }
     let checksum = footer_checksum(last_commit_offset, durable_len, sequence);
-    file.set_len(durable_len)?;
+    if file.metadata()?.len() < durable_len {
+        file.set_len(durable_len)?;
+    }
     file.seek(SeekFrom::Start(durable_len))?;
     file.write_all(&FOOTER_MAGIC)?;
     file.write_all(&last_commit_offset.to_le_bytes())?;
@@ -162,6 +315,9 @@ fn recover_footer_at(
     let regions = decode_region_snapshot(&payload, last_commit_offset)?;
     debug_assert_eq!(header.operation, Operation::Commit);
     Ok(Some(Recovery {
+        generation: 0,
+        root_base: VOLUME_MAGIC.len() as u64,
+        pointer_slot: false,
         regions,
         sequence,
         valid_len: durable_len,
@@ -169,6 +325,7 @@ fn recover_footer_at(
         last_commit_offset,
         last_commit_has_snapshot: true,
         footer_present,
+        authority_len: physical_len,
     }))
 }
 
@@ -249,6 +406,9 @@ fn recover_from_headers(file: &File) -> io::Result<Recovery> {
         }
     }
     Ok(Recovery {
+        generation: 0,
+        root_base: VOLUME_MAGIC.len() as u64,
+        pointer_slot: false,
         regions: committed_regions,
         sequence: committed_sequence,
         valid_len: committed_offset,
@@ -256,6 +416,7 @@ fn recover_from_headers(file: &File) -> io::Result<Recovery> {
         last_commit_offset,
         last_commit_has_snapshot: committed_has_snapshot,
         footer_present: false,
+        authority_len: committed_offset,
     })
 }
 

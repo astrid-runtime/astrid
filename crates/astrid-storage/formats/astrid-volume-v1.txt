@@ -28,6 +28,41 @@ Every following record is:
       75     N  canonical UTF-8 region name
     75+N     M  payload
 
+Generation-root images add a fixed dual-copy pointer immediately after the
+container magic and before the first record:
+
+  offset size field
+  0    8  copy 0 magic = 41 53 54 52 4f 4f 54 31 ("ASTROOT1", without NUL)
+  8    8  generation, unsigned little-endian and greater than zero
+ 16    8  canonical image base, unsigned little-endian
+ 24    8  offset of the selected EOF footer, unsigned little-endian
+ 32   32  pointer checksum
+ 64   64  copy 1, encoded exactly like copy 0
+
+Copy 0 starts at byte 8 and copy 1 starts at byte 72; the fixed root occupies
+bytes 8 through 135. The checksum is the 32-byte output of a BLAKE3
+derive-key hasher using context "astrid volume root v1" over this exact
+concatenation:
+
+  root_magic[8]
+  generation[8]
+  root_base[8]
+  footer_offset[8]
+
+Recovery decodes each independently checksummed copy and selects the higher
+valid generation. A torn or invalid copy is ignored. If either fixed slot
+contains the root magic but neither copy is valid, recovery fails closed. A
+file with no valid pointer and no root magic uses the generation-0 record and
+EOF-footer rules below. When a valid root is present, its named EOF footer is
+the only durability boundary; recovery must not substitute an EOF footer or
+header scan from a different generation.
+
+Same-inode publication constructs a complete replacement image and makes it
+durable before a root flip. A second relocation flip makes byte 136 the
+canonical image base. Physical truncation of the superseded image happens
+only after both root copies select the relocated generation and the container
+has been synced. Storage-capacity credit follows that truncation.
+
 Region names are relative, slash-separated UTF-8. They are non-empty, at most
 512 bytes, and reject empty components, dot components, dot-dot components,
 backslashes, control characters, leading slashes, and trailing slashes.

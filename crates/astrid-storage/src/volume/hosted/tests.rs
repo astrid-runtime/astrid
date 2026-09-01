@@ -1,4 +1,4 @@
-use super::reclaim::set_test_unlock_hook;
+use super::reclaim::{ReclaimStage, set_stage_hook, set_test_unlock_hook};
 use super::*;
 use crate::volume::VolumeFile;
 
@@ -77,35 +77,6 @@ fn hosted_volume_recovers_regions_without_host_directory_projection() {
     assert_eq!(volume.read_region_at(&region, 0, &mut bytes).unwrap(), 8);
     assert_eq!(&bytes, b"abXYef\0\0");
     assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
-}
-
-#[test]
-fn legacy_empty_commit_recovers_without_hashing_write_payloads() {
-    let temporary = tempfile::tempdir().unwrap();
-    let path = temporary.path().join("astrid.volume");
-    std::fs::write(&path, VOLUME_MAGIC).unwrap();
-    append_valid_record(&path, 1, Operation::Create, b"objects", 0, &[]);
-    append_valid_record(&path, 2, Operation::Write, b"objects", 0, b"legacy");
-    append_valid_record(
-        &path,
-        3,
-        Operation::Commit,
-        COMMIT_REGION.as_bytes(),
-        0,
-        &[],
-    );
-    let mut bytes = std::fs::read(&path).unwrap();
-    let create_length = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-    let write_offset = VOLUME_MAGIC.len() as u64 + create_length;
-    bytes[usize::try_from(write_offset).unwrap() + 43] ^= 0x80;
-    std::fs::write(&path, bytes).unwrap();
-
-    let volume = HostedFileVolume::open(&path).unwrap();
-    let mut recovered = [0_u8; 6];
-    volume
-        .read_region_at(&VolumeRegion::new("objects").unwrap(), 0, &mut recovered)
-        .unwrap();
-    assert_eq!(&recovered, b"legacy");
 }
 
 #[test]
@@ -210,6 +181,281 @@ fn reclaim_blocks_concurrent_open_during_unlock_swap_and_preserves_active_path()
     assert!(bytes.iter().all(|byte| *byte == 0xCD));
     assert!(!reclaim::temp_path(&path).exists());
     assert!(!reclaim::previous_path(&path).exists());
+}
+
+#[test]
+fn legacy_empty_commit_recovers_without_hashing_write_payloads() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    std::fs::write(&path, VOLUME_MAGIC).unwrap();
+    append_valid_record(&path, 1, Operation::Create, b"objects", 0, &[]);
+    append_valid_record(&path, 2, Operation::Write, b"objects", 0, b"legacy");
+    append_valid_record(
+        &path,
+        3,
+        Operation::Commit,
+        COMMIT_REGION.as_bytes(),
+        0,
+        &[],
+    );
+    let mut bytes = std::fs::read(&path).unwrap();
+    let create_length = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+    let write_offset = VOLUME_MAGIC.len() as u64 + create_length;
+    bytes[usize::try_from(write_offset).unwrap() + 43] ^= 0x80;
+    std::fs::write(&path, bytes).unwrap();
+
+    let volume = HostedFileVolume::open(&path).unwrap();
+    let mut recovered = [0_u8; 6];
+    volume
+        .read_region_at(&VolumeRegion::new("objects").unwrap(), 0, &mut recovered)
+        .unwrap();
+    assert_eq!(&recovered, b"legacy");
+}
+
+fn seeded_volume(path: &std::path::Path) -> Arc<HostedFileVolume> {
+    let volume = HostedFileVolume::open(path).unwrap();
+    let region = VolumeRegion::new("objects").unwrap();
+    volume.create_region(&region, true).unwrap();
+    volume
+        .write_region_at(&region, 0, &vec![0xAA; 256 * 1024])
+        .unwrap();
+    volume.write_region_at(&region, 0, b"small").unwrap();
+    volume.set_region_len(&region, 5).unwrap();
+    volume.sync().unwrap();
+    volume
+}
+
+fn snapshot_reclaim_at(stage: ReclaimStage) -> (tempfile::TempDir, std::path::PathBuf) {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let snapshot = temporary.path().join(format!(
+        "snapshot-{}",
+        match stage {
+            ReclaimStage::ReplacementDurable => "unflipped",
+            ReclaimStage::RootPublished => "replacement-root",
+            ReclaimStage::FinalImageDurable => "final-image",
+            ReclaimStage::FinalRootPublished => "final-root",
+            ReclaimStage::Truncated => "truncated",
+        }
+    ));
+    let volume = seeded_volume(&path);
+    let source = path.clone();
+    let target = snapshot.clone();
+    set_stage_hook(
+        path.clone(),
+        Box::new(move |seen| {
+            if seen == stage {
+                std::fs::copy(&source, &target)?;
+            }
+            Ok(())
+        }),
+    );
+    let reclaiming = Arc::clone(&volume);
+    let result = std::thread::spawn(move || reclaiming.reclaim_same_inode())
+        .join()
+        .unwrap();
+    result.unwrap();
+    assert!(snapshot.exists(), "reclaim did not reach {stage:?}");
+    (temporary, snapshot)
+}
+
+fn read_objects(volume: &HostedFileVolume) -> [u8; 5] {
+    let region = VolumeRegion::new("objects").unwrap();
+    let mut bytes = [0_u8; 5];
+    volume.read_region_at(&region, 0, &mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn inode_stable_reclaim_shrinks_the_selected_generation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let volume = seeded_volume(&path);
+    let before = std::fs::metadata(&path).unwrap().len();
+    volume.reclaim_same_inode().unwrap();
+    let after = std::fs::metadata(&path).unwrap().len();
+    assert!(after < before, "{before} did not shrink to {after}");
+    assert_eq!(read_objects(&volume), *b"small");
+    drop(volume);
+    let reopened = HostedFileVolume::open(&path).unwrap();
+    assert_eq!(read_objects(&reopened), *b"small");
+}
+
+#[test]
+fn unflipped_replacement_image_leaves_the_old_generation_current() {
+    let (temporary, snapshot) = snapshot_reclaim_at(ReclaimStage::ReplacementDurable);
+    let volume = HostedFileVolume::open(snapshot).unwrap();
+    assert_eq!(read_objects(&volume), *b"small");
+    drop(volume);
+    assert_eq!(temporary.path().read_dir().unwrap().count(), 2);
+}
+
+#[test]
+fn replacement_root_is_selected_before_the_final_image_exists() {
+    let (temporary, snapshot) = snapshot_reclaim_at(ReclaimStage::RootPublished);
+    let volume = HostedFileVolume::open(snapshot).unwrap();
+    assert_eq!(read_objects(&volume), *b"small");
+    drop(volume);
+    assert_eq!(temporary.path().read_dir().unwrap().count(), 2);
+}
+
+#[test]
+fn durable_final_image_is_ignored_until_its_root_is_selected() {
+    let (temporary, snapshot) = snapshot_reclaim_at(ReclaimStage::FinalImageDurable);
+    let volume = HostedFileVolume::open(snapshot).unwrap();
+    assert_eq!(read_objects(&volume), *b"small");
+    drop(volume);
+    assert_eq!(temporary.path().read_dir().unwrap().count(), 2);
+}
+
+#[test]
+fn selected_final_root_survives_until_truncate_completes() {
+    let (temporary, flipped) = snapshot_reclaim_at(ReclaimStage::FinalRootPublished);
+    let untruncated = std::fs::metadata(&flipped).unwrap().len();
+    let volume = HostedFileVolume::open(flipped).unwrap();
+    assert_eq!(read_objects(&volume), *b"small");
+    drop(volume);
+    let (complete_temporary, complete) = snapshot_reclaim_at(ReclaimStage::Truncated);
+    let truncated = std::fs::metadata(&complete).unwrap().len();
+    assert!(truncated < untruncated, "{untruncated} -> {truncated}");
+    assert_eq!(temporary.path().read_dir().unwrap().count(), 2);
+    assert_eq!(complete_temporary.path().read_dir().unwrap().count(), 2);
+}
+
+#[test]
+fn torn_root_candidates_are_not_admitted_as_authority() {
+    let (_temporary, snapshot) = snapshot_reclaim_at(ReclaimStage::Truncated);
+    let mut bytes = std::fs::read(&snapshot).unwrap();
+    // Damage the checksum in each fixed root copy. Neither byte sequence can
+    // masquerade as generation zero, and the EOF footer alone is no longer a
+    // root authority once a generation pointer has existed.
+    bytes[VOLUME_MAGIC.len() + ROOT_SLOT_BYTES - 1] ^= 0x80;
+    bytes[ROOT_BYTES - 1] ^= 0x80;
+    std::fs::write(&snapshot, bytes).unwrap();
+    let error = HostedFileVolume::open(snapshot).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(
+        error
+            .to_string()
+            .contains("invalid Astrid volume root pointer"),
+        "{error}"
+    );
+}
+
+#[test]
+fn higher_valid_root_generation_wins() {
+    let (_temporary, snapshot) = snapshot_reclaim_at(ReclaimStage::Truncated);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&snapshot)
+        .unwrap();
+    let footer_offset = file.metadata().unwrap().len() - recover::FOOTER_BYTES as u64;
+    recover::write_root_pointer(&mut file, 9, ROOT_BYTES as u64, footer_offset, false).unwrap();
+    recover::write_root_pointer(&mut file, 7, ROOT_BYTES as u64, footer_offset, true).unwrap();
+    file.sync_all().unwrap();
+    let volume = HostedFileVolume::open(snapshot).unwrap();
+    assert_eq!(read_objects(&volume), *b"small");
+}
+
+#[test]
+fn generation_zero_eof_footer_remains_recoverable_and_reclaimable() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    std::fs::write(&path, VOLUME_MAGIC).unwrap();
+    append_valid_record(&path, 1, Operation::Create, b"objects", 0, &[]);
+    append_valid_record(&path, 2, Operation::Write, b"objects", 0, b"small");
+    append_valid_record(
+        &path,
+        3,
+        Operation::Commit,
+        COMMIT_REGION.as_bytes(),
+        0,
+        &encode_region_snapshot_for_test(
+            VOLUME_MAGIC.len() as u64
+                + 2 * u64::try_from(RECORD_FIXED_BYTES + b"objects".len()).unwrap(),
+        ),
+    );
+    let durable_len = std::fs::metadata(&path).unwrap().len();
+    let snapshot = encode_region_snapshot_for_test(
+        VOLUME_MAGIC.len() as u64
+            + 2 * u64::try_from(RECORD_FIXED_BYTES + b"objects".len()).unwrap(),
+    );
+    let commit_length = RECORD_FIXED_BYTES + b"system/volume-commit".len() + snapshot.len();
+    let commit_offset = durable_len - u64::try_from(commit_length).unwrap();
+    {
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        recover::write_footer(&mut file, commit_offset, durable_len, 3).unwrap();
+        file.sync_all().unwrap();
+    }
+    let volume = HostedFileVolume::open(&path).unwrap();
+    assert_eq!(read_objects(&volume), *b"small");
+    drop(volume);
+    let reopened = HostedFileVolume::open(&path).unwrap();
+    assert_eq!(read_objects(&reopened), *b"small");
+}
+
+#[test]
+fn receipt_region_survives_all_same_inode_reclaim_stages() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let volume = seeded_volume(&path);
+    let receipt = VolumeRegion::new("system/gc-outbox/receipt.ready").unwrap();
+    volume.create_region(&receipt, true).unwrap();
+    volume.write_region_at(&receipt, 0, b"proof").unwrap();
+    volume.sync().unwrap();
+    volume.reclaim_same_inode().unwrap();
+    let mut proof = [0_u8; 5];
+    volume.read_region_at(&receipt, 0, &mut proof).unwrap();
+    assert_eq!(&proof, b"proof");
+    drop(volume);
+    let reopened = HostedFileVolume::open(&path).unwrap();
+    reopened.read_region_at(&receipt, 0, &mut proof).unwrap();
+    assert_eq!(&proof, b"proof");
+}
+
+#[test]
+fn physical_credit_waits_until_the_final_root_and_truncate() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let volume = seeded_volume(&path);
+    let before = std::fs::metadata(&path).unwrap().len();
+    let source = path.clone();
+    set_stage_hook(
+        path.clone(),
+        Box::new(move |stage| {
+            let current = std::fs::metadata(&source).unwrap().len();
+            match stage {
+                ReclaimStage::ReplacementDurable
+                | ReclaimStage::RootPublished
+                | ReclaimStage::FinalImageDurable
+                | ReclaimStage::FinalRootPublished => assert!(current >= before),
+                ReclaimStage::Truncated => assert!(current < before),
+            }
+            Ok(())
+        }),
+    );
+    volume.reclaim_same_inode().unwrap();
+    let available = volume.available_space().unwrap().expect("host capacity");
+    assert!(available > 0);
+}
+
+fn encode_region_snapshot_for_test(physical_offset: u64) -> Vec<u8> {
+    let mut regions = BTreeMap::new();
+    regions.insert(
+        VolumeRegion::new("objects").unwrap(),
+        RegionState {
+            length: 5,
+            extents: BTreeMap::from([(
+                0,
+                Extent {
+                    logical_end: 5,
+                    physical_offset,
+                },
+            )]),
+        },
+    );
+    recover::encode_region_snapshot(&regions).unwrap()
 }
 
 #[test]
