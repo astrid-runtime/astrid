@@ -2,7 +2,7 @@
 
 Status: active architecture workplan
 
-Last reviewed: 2026-07-18
+Last reviewed: 2026-09-01
 
 Baselines:
 
@@ -10,7 +10,7 @@ Baselines:
 - [Astrid Fleet Computer and Principal Views](astrid-fleet-computer.md)
 - [Astrid Tensor Logic Composition](astrid-tensor-logic-composition.md)
 - [Astrid Driver Domain Contract](astrid-driver-domain-contract.md)
-- [AOS Principal Linux Realm](https://github.com/unicity-aos/aos-ce/blob/main/docs/principal-linux-realm.md)
+- [AOS Principal Linux Realm](https://github.com/unicity-aos/aos-ce/blob/main/docs/principal-linux-realm.md) (accepted consumer contract; not implemented on current aos-ce `main`)
 
 ## 1. Answer and purpose
 
@@ -18,11 +18,11 @@ There is enough architecture to begin methodically. There is not enough evidence
 claim that the kernel, driver, composition, graphical application, or Tensor Logic
 designs are complete.
 
-The first executable OS artifact is now the principal-owned AOS Realm workbench in
-`unicity-aos/aos-ce`. Its nested-process seed is implemented, but it is not yet a
-Linux environment: persistence, process semantics, a shell, and a toolchain remain
-open. This workbench precedes the native kernel because it is useful on today's
-runtime and becomes a concrete compatibility workload for every later host.
+The native kernel track and the Linux Realm track are independent. Current
+`unicity-aos/aos-ce` `main` does not ship a Linux Realm workbench; the nested-process
+seed is not present on that tree. Linux Realm remains an optional confined consumer
+of Astrid, not a prerequisite for native-kernel work, and not an authority model.
+Hosted runtime results do not prove native-kernel behavior.
 
 The existing documents capture the intended system and its major deployment
 scenarios. This workplan converts them into dependency-ordered work with explicit
@@ -132,17 +132,19 @@ flowchart TB
     Models --> Tensor
 ```
 
-The realm, host-native graphics, and exact composition can proceed without waiting
-for the native kernel. Native graphics cannot. The realm remains an ordinary
-capsule on both today's daemon and a future native host; its Linux-shaped ABI does
-not become a ring-0 ABI.
+The Linux Realm track, host-native graphics, and exact composition can proceed
+without waiting for the native kernel. Native graphics cannot. When a Linux Realm
+capsule exists, it remains an ordinary capsule on both today's daemon and a future
+native host; its Linux-shaped ABI does not become a ring-0 ABI. That capsule is
+not implemented on current `unicity-aos/aos-ce` `main`.
 
 ## 5. Architecture covenant and traceability
 
 - [x] Record the native-kernel scope and explicit non-goals.
 - [x] Record the principal-owned Linux realm boundary, distribution direction, and
   relationship to current and future hosts.
-- [x] Implement the bounded nested-process seed without `host_process` authority.
+- [ ] Implement the bounded nested-process seed without `host_process` authority.
+  Current `unicity-aos/aos-ce` `main` does not contain this seed.
 - [x] Record the exact composition/Tensor Logic scope and preservation strategy.
 - [x] Record graphical game, host GPU, VM GPU, and bare-metal GPU scenarios.
 - [x] Separate device driver, platform authority, resource virtualizer, and
@@ -185,11 +187,12 @@ capsule behavior accidentally.
 
 ## 7. Principal-owned Linux realm
 
-- [x] Keep the capsule, private guest ABI, image recipe, and product integration in
-  the authoritative `unicity-aos/aos-ce` monorepo.
-- [x] Embed and run one signed core-WASM guest under fixed fuel, memory, descriptor,
+- [ ] Keep the capsule, private guest ABI, image recipe, and product integration in
+  the authoritative `unicity-aos/aos-ce` monorepo. Current `main` does not ship
+  that capsule.
+- [ ] Embed and run one signed core-WASM guest under fixed fuel, memory, descriptor,
   instance, table, and output limits.
-- [x] Package the outer component as an installable capsule with no host-process
+- [ ] Package the outer component as an installable capsule with no host-process
   grant and adversarial tests for malformed modules and boundary violations.
 - [x] Define a
   [principal-bound storage contract](astrid-principal-store.md) with generations,
@@ -479,21 +482,21 @@ recovery paths or silently broaden authority.
 
 The next bounded tranche is:
 
-1. preserve and review the bounded realm seed in `unicity-aos/aos-ce`;
+1. keep the native-kernel skeleton independent of Linux Realm; do not treat a
+   Realm prototype as native-kernel evidence;
 2. refine the executable principal-store model into an in-memory engine and run
    the documented crash traces;
-3. implement the immutable-base/private-overlay VFS and cross-principal tests;
-4. implement process, descriptor, pipe, spawn/exec, wait, and cancellation semantics;
-5. add the first small shell and an AOS Realm base-image recipe;
-6. compile, package, verify, and export one real Astrid capsule inside the realm;
-7. in parallel, accept the driver-domain contract and create the kernel charter,
-   threat model, composition fixtures, and first Alloy/TLA+ models;
-8. start the native-kernel skeleton only when its machine contract and adversarial
-   acceptance harness are frozen.
+3. start the native-kernel skeleton only when its machine contract and adversarial
+   acceptance harness are frozen;
+4. in parallel, keep Linux Realm an optional confined AOS consumer whose
+   production guest ISA, when implementable, is host `x86_64` then `arm64`;
+   RV64-in-WASM remains inventory/falsifier work;
+5. do not resume Linux Realm implementation from unmerged RISC-V drafts or
+   unreproducible artifacts.
 
-This ordering delivers a useful agent environment on the current runtime, then
-uses it as a real workload for the broader OS. It still requires executable models
-and counterexamples before large kernel and driver surfaces.
+Linux Realm filesystem, process, shell, and image work remains AOS-owned and is
+not the next native-kernel artifact. Executable models and counterexamples are
+still required before large kernel and driver surfaces.
 
 ## 20. Repository and issue strategy
 

@@ -16,6 +16,21 @@ under `/Applications`, and enable the extension in System Settings. The
 co-installed `astrid-storage-provider-fskit` Rust companion handles mount,
 status, sync, and unmount lifecycle requests from the CLI.
 
+The accepted operator contract is CLI-only:
+
+```text
+astrid storage mount
+astrid storage status
+astrid storage sync
+astrid storage unmount
+```
+
+`AstridFS.app` is a containing app required by macOS for the FSKit extension.
+It must not be an independent storage UI. Current `main` still creates a
+visible SwiftUI window, does not set `LSUIElement`, and has no successful
+Native FSKit mount certification. Treat this README's install/enable/status
+flow as developer tooling, not a hidden or certified product surface.
+
 The source-tree check is a syntax/typecheck and unsigned Xcode contract check;
 it does not claim that `astridfs` can be mounted:
 
