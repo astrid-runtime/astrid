@@ -51,6 +51,7 @@ fn run_test_unlock_hook(_path: &Path) {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ReclaimStage {
+    BoundImagePublished,
     RootPublished,
     ReplacementDurable,
     FinalImageDurable,
@@ -289,6 +290,8 @@ fn publish_root(
     };
     if root_base == super::ROOT_BYTES as u64 && generation > 1 {
         run_stage(path, ReclaimStage::FinalRootPublished)?;
+    } else if generation == 1 {
+        run_stage(path, ReclaimStage::BoundImagePublished)?;
     } else {
         run_stage(path, ReclaimStage::RootPublished)?;
     }
@@ -308,26 +311,80 @@ fn publish_root(
     Ok(())
 }
 
+fn install_image(state: &mut ContainerState, image: ContainerState) {
+    let ContainerState {
+        file,
+        sequence,
+        valid_len,
+        durable_len,
+        last_commit_offset,
+        last_commit_has_snapshot,
+        boundary_pending,
+        footer_pending,
+        regions,
+        ..
+    } = image;
+    state.file = file;
+    state.sequence = sequence;
+    state.valid_len = valid_len;
+    state.durable_len = durable_len;
+    state.last_commit_offset = last_commit_offset;
+    state.last_commit_has_snapshot = last_commit_has_snapshot;
+    state.boundary_pending = boundary_pending;
+    state.footer_pending = footer_pending;
+    state.regions = regions;
+}
+
+fn bind_generation_zero(
+    path: &Path,
+    state: &mut ContainerState,
+    physical_len: u64,
+) -> io::Result<()> {
+    if physical_len <= VOLUME_MAGIC.len() as u64 {
+        if state.regions.is_empty()
+            && state.valid_len == VOLUME_MAGIC.len() as u64
+            && state.last_commit_offset == 0
+        {
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "hosted volume is too small for inode-stable publication",
+        ));
+    }
+    let bound_base = physical_len;
+    let mut bound = build_image(state, bound_base, 1, bound_base, u64::MAX)?;
+    let bound_end = finish_image(&mut bound)?;
+    let bound_footer = bound_end
+        .checked_sub(FOOTER_BYTES as u64)
+        .ok_or_else(|| io::Error::other("volume bound authority underflow"))?;
+    publish_root(path, state, 1, bound_base, bound_footer)?;
+    install_image(state, bound);
+    Ok(())
+}
+
 pub(super) fn reclaim_same_inode(volume: &HostedFileVolume) -> io::Result<()> {
     let _open_guard = volume.open_lock.lock();
     let mut state = volume.state.lock();
     let path = volume.path.clone();
     HostedFileVolume::make_durable(&mut state)?;
     let physical_len = state.file.metadata()?.len();
-    let replacement_base = physical_len;
-    let replacement_generation = if state.generation == 0 {
-        1
-    } else {
-        state
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("Astrid volume generation exhausted"))?
-    };
+    if state.generation == 0 {
+        bind_generation_zero(&path, &mut state, physical_len)?;
+        if state.generation == 0 {
+            return Ok(());
+        }
+    }
+    let root_generation = state.generation;
+    let replacement_base = state.file.metadata()?.len();
+    let replacement_generation = root_generation
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("Astrid volume generation exhausted"))?;
     let mut replacement = build_image(
         &mut state,
-        physical_len,
+        replacement_base,
         replacement_generation,
-        super::ROOT_BYTES as u64,
+        replacement_base,
         u64::MAX,
     )?;
     let replacement_end = finish_image(&mut replacement)?;
@@ -336,20 +393,12 @@ pub(super) fn reclaim_same_inode(volume: &HostedFileVolume) -> io::Result<()> {
         &path,
         &mut state,
         replacement_generation,
-        super::ROOT_BYTES as u64,
+        replacement_base,
         replacement_end
             .checked_sub(FOOTER_BYTES as u64)
             .ok_or_else(|| io::Error::other("volume reclaim authority underflow"))?,
     )?;
-    state.file = replacement.file;
-    state.sequence = replacement.sequence;
-    state.valid_len = replacement.valid_len;
-    state.durable_len = replacement.durable_len;
-    state.last_commit_offset = replacement.last_commit_offset;
-    state.last_commit_has_snapshot = replacement.last_commit_has_snapshot;
-    state.boundary_pending = replacement.boundary_pending;
-    state.footer_pending = replacement.footer_pending;
-    state.regions = replacement.regions;
+    install_image(&mut state, replacement);
 
     let candidate_base = replacement_base;
     let final_generation = state
@@ -377,15 +426,7 @@ pub(super) fn reclaim_same_inode(volume: &HostedFileVolume) -> io::Result<()> {
             .checked_sub(FOOTER_BYTES as u64)
             .ok_or_else(|| io::Error::other("volume reclaim authority underflow"))?,
     )?;
-    state.file = finalized.file;
-    state.sequence = finalized.sequence;
-    state.valid_len = finalized.valid_len;
-    state.durable_len = finalized.durable_len;
-    state.last_commit_offset = finalized.last_commit_offset;
-    state.last_commit_has_snapshot = finalized.last_commit_has_snapshot;
-    state.boundary_pending = finalized.boundary_pending;
-    state.footer_pending = finalized.footer_pending;
-    state.regions = finalized.regions;
+    install_image(&mut state, finalized);
 
     state.file.set_len(final_end)?;
     state.file.sync_all()?;

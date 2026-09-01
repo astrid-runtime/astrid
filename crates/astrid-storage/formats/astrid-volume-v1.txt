@@ -49,19 +49,23 @@ concatenation:
   root_base[8]
   footer_offset[8]
 
-Recovery decodes each independently checksummed copy and selects the higher
-valid generation. A torn or invalid copy is ignored. If either fixed slot
-contains the root magic but neither copy is valid, recovery fails closed. A
-file with no valid pointer and no root magic uses the generation-0 record and
-EOF-footer rules below. When a valid root is present, its named EOF footer is
-the only durability boundary; recovery must not substitute an EOF footer or
-header scan from a different generation.
+root_base is the actual first byte of the selected image's record stream. For
+the relocated image it is byte 136; an intermediate bound or replacement image
+uses its real tail base. Recovery decodes each independently checksummed copy
+and selects the higher valid generation. A torn or invalid copy is ignored. If
+either fixed slot contains the root magic but neither copy is valid, recovery
+fails closed. A file with no valid pointer and no root magic uses the
+generation-0 record and EOF-footer rules below. When a valid root is present,
+its named EOF footer is the only durability boundary; recovery must not
+substitute an EOF footer or header scan from a different generation.
 
-Same-inode publication constructs a complete replacement image and makes it
-durable before a root flip. A second relocation flip makes byte 136 the
-canonical image base. Physical truncation of the superseded image happens
-only after both root copies select the relocated generation and the container
-has been synced. Storage-capacity credit follows that truncation.
+Same-inode publication first binds an already-durable generation-0 image with
+a complete copy and its own root flip before appending a replacement that
+changes physical EOF. Every later root flip likewise selects only a complete,
+synced image. A final relocation flip makes byte 136 the canonical image base.
+Physical truncation of the superseded image happens only after both root
+copies select the relocated generation and the container has been synced.
+Storage-capacity credit follows that truncation.
 
 Region names are relative, slash-separated UTF-8. They are non-empty, at most
 512 bytes, and reject empty components, dot components, dot-dot components,

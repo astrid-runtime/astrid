@@ -17,6 +17,12 @@ type SharedOpenReclaimLock = Mutex<()>;
 
 fn recover_volume_file(file: &mut File) -> io::Result<super::recover::Recovery> {
     let length = file.metadata()?.len();
+    if length > 0 && length < VOLUME_MAGIC.len() as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid Astrid volume header",
+        ));
+    }
     if length >= VOLUME_MAGIC.len() as u64 {
         let mut magic = [0_u8; VOLUME_MAGIC.len()];
         file.read_exact(&mut magic)?;

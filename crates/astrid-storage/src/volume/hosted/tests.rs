@@ -60,6 +60,20 @@ fn hosted_volume_rejects_astvol2_header() {
 }
 
 #[test]
+fn open_rejects_truncated_astvol1_header() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("astrid.volume");
+    std::fs::write(&path, b"ASTV").unwrap();
+    let error = HostedFileVolume::open(&path).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        error.to_string().contains("invalid Astrid volume header"),
+        "{error}"
+    );
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 4);
+}
+
+#[test]
 fn hosted_volume_recovers_regions_without_host_directory_projection() {
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("astrid.volume");
@@ -231,6 +245,7 @@ fn snapshot_reclaim_at(stage: ReclaimStage) -> (tempfile::TempDir, std::path::Pa
     let snapshot = temporary.path().join(format!(
         "snapshot-{}",
         match stage {
+            ReclaimStage::BoundImagePublished => "bound-root",
             ReclaimStage::ReplacementDurable => "unflipped",
             ReclaimStage::RootPublished => "replacement-root",
             ReclaimStage::FinalImageDurable => "final-image",
@@ -282,10 +297,42 @@ fn inode_stable_reclaim_shrinks_the_selected_generation() {
 }
 
 #[test]
+fn same_inode_reclaim_preserves_an_empty_volume() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let volume = HostedFileVolume::open(&path).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 8);
+    volume.reclaim_same_inode().unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 8);
+    assert_eq!(volume.list_regions("").unwrap(), Vec::new());
+    drop(volume);
+    let reopened = HostedFileVolume::open(&path).unwrap();
+    assert_eq!(reopened.list_regions("").unwrap(), Vec::new());
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 8);
+}
+
+#[test]
 fn unflipped_replacement_image_leaves_the_old_generation_current() {
     let (temporary, snapshot) = snapshot_reclaim_at(ReclaimStage::ReplacementDurable);
-    let volume = HostedFileVolume::open(snapshot).unwrap();
+    let physical_len = std::fs::metadata(&snapshot).unwrap().len();
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&snapshot)
+        .unwrap();
+    let recovery = recover::recover_container(&mut file).unwrap();
+    // Generation one is the durable copy of the pre-reclaim image. The
+    // replacement's footer is beyond that selected authority, so an EOF scan
+    // cannot silently promote it before its own root flip.
+    assert_eq!(recovery.generation, 1);
+    assert!(recovery.root_base < recovery.last_commit_offset);
+    assert!(physical_len > recovery.authority_len);
+    let volume = HostedFileVolume::open(&snapshot).unwrap();
     assert_eq!(read_objects(&volume), *b"small");
+    assert_eq!(
+        std::fs::metadata(&snapshot).unwrap().len(),
+        recovery.authority_len
+    );
     drop(volume);
     assert_eq!(temporary.path().read_dir().unwrap().count(), 2);
 }
@@ -427,6 +474,7 @@ fn physical_credit_waits_until_the_final_root_and_truncate() {
             let current = std::fs::metadata(&source).unwrap().len();
             match stage {
                 ReclaimStage::ReplacementDurable
+                | ReclaimStage::BoundImagePublished
                 | ReclaimStage::RootPublished
                 | ReclaimStage::FinalImageDurable
                 | ReclaimStage::FinalRootPublished => assert!(current >= before),
