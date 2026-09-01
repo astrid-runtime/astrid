@@ -28,6 +28,7 @@ internal static class Program
             {
                 ["selftest"] => SelfTest.Run(),
                 ["marker-child", var markerPath, var exitCodeText] => MarkerChild.Run(markerPath, exitCodeText),
+                ["parity-child", var receivedPath, .. var parityArguments] => ParityChild.Run(receivedPath, parityArguments),
                 ["certify", .. var certificationArgs] => Certify(ParseOptions(certificationArgs)),
                 _ => throw new ControllerException("expected 'selftest' or 'certify' with named options"),
             };

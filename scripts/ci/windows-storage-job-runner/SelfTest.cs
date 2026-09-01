@@ -18,6 +18,7 @@ internal sealed class SelfTest
     public static int Run()
     {
         var root = Directory.CreateTempSubdirectory("astrid-storage-job-selftest-").FullName;
+        var preserveEvidence = false;
         try
         {
             StartupInfoLayout();
@@ -25,6 +26,7 @@ internal sealed class SelfTest
             BoundedProcessIdListQueries();
             PartialEnumerationNeverSatisfiesZero();
             EmptyHeaderAndReturnLengthBoundaries();
+            OverlongSuccessfulReturnRejected();
             PrimaryCleanupFailurePreservation(root);
             ExecutableResolution(root);
             AssignmentBeforeExecution(root);
@@ -41,14 +43,22 @@ internal sealed class SelfTest
             Console.WriteLine("[selftest] all Windows storage job controls passed");
             return 0;
         }
+        catch
+        {
+            preserveEvidence = true;
+            throw;
+        }
         finally
         {
-            try
+            if (!preserveEvidence)
             {
-                Directory.Delete(root, recursive: true);
-            }
-            catch (IOException)
-            {
+                try
+                {
+                    Directory.Delete(root, recursive: true);
+                }
+                catch (IOException)
+                {
+                }
             }
         }
     }
@@ -291,63 +301,77 @@ internal sealed class SelfTest
 
     private static void ArgumentAndListSetParity(string root)
     {
-        var stub = Path.Combine(root, "libtest-parity.cmd");
-        File.WriteAllLines(
-            stub,
-            [
-                "@echo off",
-                "if /I \"%~1\" == \"--list\" (",
-                "  if /I \"%~2\" == \"--format=terse\" if \"%~3\" == \"storage_mount\" (",
-                "    echo alpha: test",
-                "    echo beta: test",
-                "    exit /b 0",
-                "  )",
-                "  exit /b 10",
-                ")",
-                "if \"%~1\" == \"storage_mount\" (",
-                "  if \"%~2\" == \"--\" if \"%~3\" == \"--nocapture\" if \"%~4\" == \"--test-threads=1\" (",
-                "    echo aggregate>> received.txt",
-                "    exit /b 0",
-                "  )",
-                "  exit /b 11",
-                ")",
-                "if \"%~1\" == \"alpha\" if \"%~2\" == \"--\" if \"%~3\" == \"--exact\" if \"%~4\" == \"--nocapture\" if \"%~5\" == \"--test-threads=1\" (",
-                "  echo alpha>> received.txt",
-                "  exit /b 0",
-                ")",
-                "if \"%~1\" == \"beta\" if \"%~2\" == \"--\" if \"%~3\" == \"--exact\" if \"%~4\" == \"--nocapture\" if \"%~5\" == \"--test-threads=1\" (",
-                "  echo beta>> received.txt",
-                "  exit /b 0",
-                ")",
-                "exit /b 12",
-            ]);
         var received = Path.Combine(root, "received.txt");
-        var listResult = RunCommand(root, ["cmd.exe", "/d", "/c", stub, .. ListArguments], 15);
-        AssertOutcome(listResult, JobOutcome.Succeeded);
+        var listResult = RunParityPhase(root, received, "--list", ListArguments);
         var names = Program.ParseTestListForSelfTest(File.ReadAllLines(listResult.StdoutPath));
         if (names is not ["alpha", "beta"] || File.Exists(received))
         {
-            throw new ControllerException("the list did not return the stable nonempty set without running tests");
+            throw DescribeParityFailure("--list", listResult, "the list did not return the stable nonempty set without running tests");
         }
 
-        var aggregate = RunCommand(root, ["cmd.exe", "/d", "/c", stub, .. AggregateArguments], 15);
-        AssertOutcome(aggregate, JobOutcome.Succeeded);
+        var aggregate = RunParityPhase(root, received, "aggregate", AggregateArguments);
         foreach (var name in names)
         {
-            var diagnostic = RunCommand(
-                root,
-                ["cmd.exe", "/d", "/c", stub, name, "--", "--exact", "--nocapture", "--test-threads=1"],
-                15);
-            AssertOutcome(diagnostic, JobOutcome.Succeeded);
+            RunParityPhase(root, received, $"diagnostic:{name}", [name, "--", "--exact", "--nocapture", "--test-threads=1"]);
         }
 
         var receivedSets = File.ReadAllLines(received);
         if (receivedSets is not ["aggregate", "alpha", "beta"])
         {
-            throw new ControllerException("canonical list, aggregate, and diagnostic argument sets diverged");
+            throw DescribeParityFailure("diagnostic", aggregate, $"canonical receipt diverged: {string.Join(", ", receivedSets)}");
         }
 
         Console.WriteLine("[selftest] list, aggregate, and exact diagnostic argument sets had the same test set");
+    }
+
+    private static JobRunResult RunParityPhase(
+        string root,
+        string receivedPath,
+        string phase,
+        IReadOnlyList<string> arguments)
+    {
+        var result = RunCommand(root, [RunnerExecutable, "parity-child", receivedPath, .. arguments], 15);
+        if (result.Outcome is not JobOutcome.Succeeded)
+        {
+            throw DescribeParityFailure(phase, result, $"expected child success, got {result.Outcome}");
+        }
+
+        if (!result.RootHandlesReleased)
+        {
+            throw DescribeParityFailure(phase, result, "root handles were not released");
+        }
+
+        return result;
+    }
+
+    private static ControllerException DescribeParityFailure(
+        string phase,
+        JobRunResult? result,
+        string reason)
+    {
+        if (result is null)
+        {
+            return new ControllerException($"parity phase {phase} failed before launch: {reason}");
+        }
+
+        var stdout = SafeEvidence(result.StdoutPath);
+        var stderr = SafeEvidence(result.StderrPath);
+        return new ControllerException(
+            $"parity phase {phase} failed: {reason}; child exit code={result.ExitCode}; "
+            + $"stdout path={result.StdoutPath}; stdout content=<<<{stdout}>>>; "
+            + $"stderr path={result.StderrPath}; stderr content=<<<{stderr}>>>");
+    }
+
+    private static string SafeEvidence(string path)
+    {
+        try
+        {
+            return File.ReadAllText(path);
+        }
+        catch (Exception exception)
+        {
+            return $"<unreadable: {exception.Message}>";
+        }
     }
 
     private static void ExecutableResolution(string root)
@@ -631,6 +655,37 @@ internal sealed class SelfTest
         }
 
         Console.WriteLine("[selftest] empty returned headers were valid and short/over-capacity returns were rejected");
+    }
+
+    private static void OverlongSuccessfulReturnRejected()
+    {
+        using var job = new SafeJobHandle();
+        uint[]? parsedIds = null;
+
+        bool OverlongSuccess(SafeJobHandle queriedJob, IntPtr buffer, uint capacity, out uint returnLength, out int win32Error)
+        {
+            Marshal.WriteInt32(buffer, 0, 1);
+            Marshal.WriteInt32(buffer, sizeof(int), 1);
+            Marshal.WriteIntPtr(buffer, 8, new IntPtr(0x123));
+            returnLength = 32;
+            win32Error = 0;
+            return true;
+        }
+
+        try
+        {
+            parsedIds = Program.ReadJobProcessIdsForSelfTest(job, OverlongSuccess);
+        }
+        catch (ControllerException)
+        {
+        }
+
+        if (parsedIds is not null)
+        {
+            throw new ControllerException("a successful nonempty overlong return was parsed");
+        }
+
+        Console.WriteLine("[selftest] successful nonempty list required exact count-derived return length");
     }
 
     private static void PrimaryCleanupFailurePreservation(string root)

@@ -174,6 +174,12 @@ internal static class JobProcessList
                 $"Job Object process ID list return length is insufficient: return={returnLength}, required={requiredLength}");
         }
 
+        if (processIdCount > 0 && returnLength != requiredLength)
+        {
+            throw new ControllerException(
+                $"Job Object process ID list return length is overlong: return={returnLength}, exact={requiredLength}");
+        }
+
         var processIds = new uint[processIdCount];
         for (var index = 0; index < processIdCount; index++)
         {
@@ -228,6 +234,48 @@ internal static class MarkerChild
         Console.Error.WriteLine("marker-child-ready");
         Console.Error.Flush();
         return requestedExitCode;
+    }
+}
+
+internal static class ParityChild
+{
+    internal static int Run(string receivedPathText, IReadOnlyList<string> arguments)
+    {
+        var receivedPath = Path.GetFullPath(receivedPathText);
+        if (!string.Equals(receivedPath, receivedPathText, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ControllerException($"parity received path is not canonical: expected {receivedPath}, got {receivedPathText}");
+        }
+
+        if (arguments is ["--list", "--format=terse", "storage_mount"])
+        {
+            Console.Out.WriteLine("alpha: test");
+            Console.Out.WriteLine("beta: test");
+            Console.Out.Flush();
+            return 0;
+        }
+
+        if (arguments is ["storage_mount", "--", "--nocapture", "--test-threads=1"])
+        {
+            Record(receivedPath, "aggregate");
+            return 0;
+        }
+
+        if (arguments is [var testName, "--", "--exact", "--nocapture", "--test-threads=1"] &&
+            testName is "alpha" or "beta")
+        {
+            Record(receivedPath, testName);
+            return 0;
+        }
+
+        return 10;
+    }
+
+    private static void Record(string receivedPath, string phase)
+    {
+        File.AppendAllText(receivedPath, $"{phase}{Environment.NewLine}");
+        Console.Out.WriteLine($"parity-recorded {phase}");
+        Console.Out.Flush();
     }
 }
 
