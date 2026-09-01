@@ -128,6 +128,7 @@ pub use paths::{
 };
 pub use principal_introspection::{
     DurableCapsuleIntrospection, list_durable_capsule_packages, read_durable_capsule_package,
+    read_durable_capsule_package_for_generation,
 };
 pub use storage::{
     LegacyCapsuleAuthorityReceipt, LegacyCapsuleMigrationReport, LegacyEnvSecretImportStatus,

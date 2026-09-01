@@ -22,9 +22,11 @@ astrid-crypto = { workspace = true }
 astrid-events = { workspace = true }
 astrid-storage = { workspace = true }
 astrid-types = { workspace = true }
+astrid-package-service = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true }
 flate2 = { workspace = true }
+hex = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
