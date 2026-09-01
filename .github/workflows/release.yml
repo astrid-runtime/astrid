@@ -87,10 +87,6 @@ jobs:
             os: macos-latest
             archive: tar.gz
             libc: native
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive: tar.gz
-            libc: native
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
@@ -211,28 +207,6 @@ jobs:
         if: matrix.libc == 'native'
         run: echo "BINARY_ROOT=target/${{ matrix.target }}/release" >> "$GITHUB_ENV"
 
-      - name: Build the Windows WinFsp provider
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: cargo build --release --target ${{ matrix.target }} -p astrid-storage-provider-winfsp --locked
-
-      - name: Stage the pinned Windows WinFsp runtime
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: pwsh
-        run: |
-          $msi = Join-Path $env:RUNNER_TEMP "winfsp-2.1.25156.msi"
-          Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi" -OutFile $msi
-          $hash = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash
-          if ($hash -ne "073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A") {
-            throw "WinFsp MSI digest mismatch: $hash"
-          }
-          $exitCode = (Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i", "`"$msi`"", "/qn", "/norestart") -Wait -PassThru).ExitCode
-          if ($exitCode -ne 0 -and $exitCode -ne 3010) {
-            throw "WinFsp installation failed with exit code $exitCode"
-          }
-          $installRoot = (Get-ItemProperty -Path "HKLM:\SOFTWARE\WOW6432Node\WinFsp").InstallDir
-          "WINFSP_MSI=$msi" | Add-Content -Encoding ascii -Path $env:GITHUB_ENV
-          "WINFSP_ROOT=$installRoot" | Add-Content -Encoding ascii -Path $env:GITHUB_ENV
-
       - name: Build Linux binaries against the glibc 2.31 baseline
         if: matrix.libc == 'gnu'
         env:
@@ -343,18 +317,10 @@ jobs:
           TARGET="${{ matrix.target }}"
           DIR="astrid-${VERSION}-${{ matrix.target }}"
           mkdir "$DIR"
-          EXE=""
-          if [[ "$TARGET" == x86_64-pc-windows-msvc ]]; then
-            EXE=".exe"
-            cp "$BINARY_ROOT/astrid-storage-provider-winfsp.exe" "$DIR/"
-            cp "$WINFSP_ROOT/bin/winfsp-x64.dll" "$DIR/"
-            cp "$WINFSP_MSI" "$DIR/winfsp-2.1.25156.msi"
-            cp scripts/install-windows.ps1 scripts/uninstall-windows.ps1 "$DIR/"
-          fi
-          cp "$BINARY_ROOT/astrid$EXE" "$DIR/"
-          cp "$BINARY_ROOT/astrid-daemon$EXE" "$DIR/"
-          cp "$BINARY_ROOT/astrid-build$EXE" "$DIR/"
-          cp "$BINARY_ROOT/astrid-emit$EXE" "$DIR/"
+          cp "$BINARY_ROOT/astrid" "$DIR/"
+          cp "$BINARY_ROOT/astrid-daemon" "$DIR/"
+          cp "$BINARY_ROOT/astrid-build" "$DIR/"
+          cp "$BINARY_ROOT/astrid-emit" "$DIR/"
           cp LICENSE* README.md "$DIR/" 2>/dev/null || true
           if [[ "$TARGET" == *-apple-darwin ]]; then
             cp "$BINARY_ROOT/astrid-storage-provider-fskit" "$DIR/"
@@ -506,14 +472,6 @@ jobs:
           astrid-*/macos/manage-macos-fskit.sh enable
           ```
 
-          **Windows pre-built archive (PowerShell):**
-          ```powershell
-          tar -xzf astrid-*-x86_64-pc-windows-msvc.tar.gz
-          $release = Get-ChildItem -Directory "astrid-*-x86_64-pc-windows-msvc" |
-            Select-Object -First 1
-          & (Join-Path $release.FullName "install-windows.ps1")
-          ```
-
           Astrid Runtime does not bundle a product distro. To compose it with a
           distro you trust, run:
           ```
@@ -587,15 +545,6 @@ jobs:
             --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
             --artifacts artifacts \
             --verify-artifacts
-          python3 scripts/windows_release_manifest.py generate \
-            --artifacts artifacts \
-            --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
-            --output "artifacts/astrid-${VERSION}-windows-release.toml"
-          python3 scripts/windows_release_manifest.py validate \
-            "artifacts/astrid-${VERSION}-windows-release.toml" \
-            --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
-            --artifacts artifacts \
-            --verify-artifacts
           {
             echo "VERSION=$VERSION"
             echo "SOURCE_COMMIT=$SOURCE_COMMIT"
@@ -633,7 +582,8 @@ jobs:
             artifacts/*.tar.gz
             artifacts/BLAKE3SUMS.txt
             artifacts/SHA256SUMS.txt
-            artifacts/astrid-*-release.toml
+            artifacts/astrid-${{ env.VERSION }}-release.toml
+            artifacts/astrid-${{ env.VERSION }}-musl-release.toml
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -643,7 +593,9 @@ jobs:
           COSIGN_YES: "true"
         run: |
           cd artifacts
-          for asset in *.tar.gz BLAKE3SUMS.txt SHA256SUMS.txt astrid-*-release.toml; do
+          for asset in *.tar.gz BLAKE3SUMS.txt SHA256SUMS.txt \
+            "astrid-${VERSION}-release.toml" \
+            "astrid-${VERSION}-musl-release.toml"; do
             cosign sign-blob --yes --bundle "${asset}.sigstore.json" "$asset"
           done
 

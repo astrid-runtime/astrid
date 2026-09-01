@@ -11,7 +11,6 @@ from pathlib import Path
 
 import release_manifest
 import musl_release_manifest
-import windows_release_manifest
 
 
 FIXED_PAYLOADS = ("BLAKE3SUMS.txt", "SHA256SUMS.txt")
@@ -72,7 +71,6 @@ def validate_release_assets(
     payloads = archives | set(FIXED_PAYLOADS) | {metadata_name}
     extension_contracts = (
         (musl_release_manifest, release_manifest.MUSL_TARGETS),
-        (windows_release_manifest, release_manifest.WINDOWS_TARGETS),
     )
     checksum_assets = set(
         release_manifest.read_checksums(

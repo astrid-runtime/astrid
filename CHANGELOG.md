@@ -26,17 +26,20 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   device can no longer exhaust another authorized caller's shutdown, reload,
   install, or workspace-operation allowance; rate-limit rejections are audited
   as failures, and expired principal buckets are retired. Closes #1378.
-- **Fresh Windows capsule installs provision private runtime and principal
-  homes.** Capsule signing and authority inspection now create and validate the
-  Astrid directory tree before generating the runtime identity, secure the new
-  key with an exact private file ACL, and provision the selected principal
+- **Windows capsule-home provisioning keeps component-level test coverage.**
+  Capsule signing and authority inspection now create and validate the Astrid
+  directory tree before generating the runtime identity, secure the new key
+  with an exact private file ACL, and provision the selected principal
   boundary before mutating a capsule target. Existing unsafe homes remain
   rejected. Unix install behavior is unchanged, and workspace targets continue
-  to use their checked selection path. Closes #1366.
-- **Windows builds retain the cross-platform key persistence contract.** The
+  to use their checked selection path. This is not a published Windows
+  runtime; 0.11.0 ships no Windows archive and Windows support remains parked
+  for a later release. Closes #1366.
+- **Windows key persistence remains component-compile/test coverage.** The
   non-Unix parent-directory sync shim keeps the same fallible interface as the
-  Unix implementation without failing the native ARM64 Clippy gate. Closes
-  #1361.
+  Unix implementation without failing the native ARM64 Clippy gate. It is not
+  an advertised 0.11.0 runtime product, and its runtime archive remains
+  parked for a later release. Closes #1361.
 - **Linux release binaries now run on glibc 2.34 enterprise hosts.** The
   x86_64 and ARM64 GNU artifacts are built in a pinned glibc 2.31 environment,
   and release publication rejects binaries whose ELF symbol requirements

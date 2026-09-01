@@ -7,6 +7,7 @@ import hashlib
 import pathlib
 import tempfile
 import unittest
+from contextlib import contextmanager
 from unittest import mock
 
 import release_manifest
@@ -16,10 +17,18 @@ import windows_release_manifest
 VERSION = "1.2.3"
 COMMIT = "a" * 40
 CONTRACTS_COMMIT = "b" * 40
+WINDOWS_TARGET = "x86_64-pc-windows-msvc"
 
 
 def fake_blake3(path: pathlib.Path) -> str:
     return hashlib.sha256(b"blake3:" + path.read_bytes()).hexdigest()
+
+
+@contextmanager
+def enabled_windows_schema():
+    """Exercise the retained schema without enabling 0.11.0 publication."""
+    with mock.patch.object(release_manifest, "WINDOWS_TARGETS", (WINDOWS_TARGET,)):
+        yield
 
 
 class WindowsReleaseManifestTests(unittest.TestCase):
@@ -49,26 +58,34 @@ class WindowsReleaseManifestTests(unittest.TestCase):
         self.legacy_path.write_text(release_manifest.render_manifest(legacy))
 
     def manifest(self) -> dict[str, object]:
-        with mock.patch.object(release_manifest, "blake3_file", side_effect=fake_blake3):
-            return windows_release_manifest.build_manifest(
-                self.artifacts, self.legacy_path
-            )
+        fixture = pathlib.Path(__file__).parent / "fixtures/windows-release-extension.toml"
+        manifest = windows_release_manifest.load_manifest(fixture)
+        manifest["legacy-release"]["metadata-blake3"] = fake_blake3(self.legacy_path)
+        return manifest
 
     def validate_bound(self, manifest: dict[str, object]) -> None:
-        windows_release_manifest.validate_manifest(
-            manifest,
-            legacy_manifest=release_manifest.load_manifest(self.legacy_path),
-            legacy_manifest_blake3=fake_blake3(self.legacy_path),
-        )
+        with enabled_windows_schema():
+            windows_release_manifest.validate_manifest(
+                manifest,
+                legacy_manifest=release_manifest.load_manifest(self.legacy_path),
+                legacy_manifest_blake3=fake_blake3(self.legacy_path),
+            )
+
+    def test_windows_runtime_targets_are_disabled_for_this_cut(self) -> None:
+        self.assertEqual(release_manifest.WINDOWS_TARGETS, ())
+        self.assertNotIn(WINDOWS_TARGET, release_manifest.EXTENSION_TARGETS)
+        with self.assertRaisesRegex(ValueError, "Windows release publication is disabled"):
+            windows_release_manifest.build_manifest(self.artifacts, self.legacy_path)
 
     def test_round_trip_is_deterministic_and_bound_to_legacy_release(self) -> None:
-        manifest = self.manifest()
-        rendered = windows_release_manifest.render_manifest(manifest)
-        path = self.artifacts / windows_release_manifest.metadata_name(VERSION)
-        path.write_text(rendered)
-        loaded = windows_release_manifest.load_manifest(path)
-        self.validate_bound(loaded)
-        self.assertEqual(windows_release_manifest.render_manifest(loaded), rendered)
+        with enabled_windows_schema():
+            manifest = self.manifest()
+            rendered = windows_release_manifest.render_manifest(manifest)
+            path = self.artifacts / windows_release_manifest.metadata_name(VERSION)
+            path.write_text(rendered)
+            loaded = windows_release_manifest.load_manifest(path)
+            self.validate_bound(loaded)
+            self.assertEqual(windows_release_manifest.render_manifest(loaded), rendered)
 
     def test_shared_python_rust_schema_fixture_is_accepted(self) -> None:
         fixture = pathlib.Path(__file__).parent / "fixtures/windows-release-extension.toml"
@@ -76,31 +93,34 @@ class WindowsReleaseManifestTests(unittest.TestCase):
         manifest["legacy-release"]["metadata-blake3"] = fake_blake3(self.legacy_path)
         self.validate_bound(manifest)
 
-    def test_accepts_only_the_windows_target(self) -> None:
+    def test_retained_schema_accepts_only_the_windows_target(self) -> None:
         manifest = self.manifest()
         self.assertEqual(
             [target["triple"] for target in manifest["targets"]],
-            ["x86_64-pc-windows-msvc"],
+            [WINDOWS_TARGET],
         )
         self.validate_bound(manifest)
 
-    def test_rejects_missing_duplicate_and_unexpected_targets(self) -> None:
+    def test_retained_schema_rejects_missing_duplicate_and_unexpected_targets(self) -> None:
         missing = self.manifest()
         missing["targets"].clear()
-        with self.assertRaisesRegex(ValueError, "exactly one"):
-            windows_release_manifest.validate_manifest(missing)
+        with enabled_windows_schema():
+            with self.assertRaisesRegex(ValueError, "exactly one"):
+                windows_release_manifest.validate_manifest(missing)
 
         duplicate = self.manifest()
         duplicate["targets"].append(copy.deepcopy(duplicate["targets"][0]))
-        with self.assertRaisesRegex(ValueError, "exactly one"):
-            windows_release_manifest.validate_manifest(duplicate)
+        with enabled_windows_schema():
+            with self.assertRaisesRegex(ValueError, "exactly one"):
+                windows_release_manifest.validate_manifest(duplicate)
 
         unexpected = self.manifest()
         unexpected["targets"][0]["triple"] = "x86_64-unknown-linux-gnu"
-        with self.assertRaisesRegex(ValueError, "target set"):
-            windows_release_manifest.validate_manifest(unexpected)
+        with enabled_windows_schema():
+            with self.assertRaisesRegex(ValueError, "target set"):
+                windows_release_manifest.validate_manifest(unexpected)
 
-    def test_rejects_release_identity_and_legacy_binding_mismatches(self) -> None:
+    def test_retained_schema_rejects_identity_and_binding_mismatches(self) -> None:
         for key, value in (
             ("source-commit", "c" * 40),
             (
@@ -119,11 +139,16 @@ class WindowsReleaseManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "bind"):
             self.validate_bound(manifest)
 
-    def test_rejects_partial_seven_archive_checksums(self) -> None:
+    def test_rejects_partial_six_archive_checksums(self) -> None:
         lines = (self.artifacts / "BLAKE3SUMS.txt").read_text().splitlines()
         (self.artifacts / "BLAKE3SUMS.txt").write_text("\n".join(lines[:-1]) + "\n")
-        with self.assertRaisesRegex(ValueError, "four fixed|all seven"):
-            self.manifest()
+        entries = release_manifest.read_checksums(
+            self.artifacts / "BLAKE3SUMS.txt", "BLAKE3"
+        )
+        with self.assertRaisesRegex(ValueError, "four fixed|both musl"):
+            release_manifest.validate_release_checksum_names(
+                entries, VERSION, "BLAKE3SUMS.txt"
+            )
 
 
 if __name__ == "__main__":

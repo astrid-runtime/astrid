@@ -13,13 +13,12 @@ exact platform archive:
 2. An immutable release manifest matching the pointer's BLAKE3 digest and
    signed by the exact release workflow at the selected tag.
 3. For a musl-compiled updater, an `astrid-<version>-musl-release.toml`
-   extension and bundle from that same immutable tag; for Windows, the
-   equivalent `astrid-<version>-windows-release.toml` extension and bundle.
-   Each extension must carry exactly its supported targets, match the
-   authenticated tag/source/workflow identity, and bind the exact legacy
-   manifest asset and BLAKE3 digest. GNU and macOS updaters continue using only
-   the unchanged four-target documents, which preserves compatibility with
-   already released clients.
+   extension and bundle from that same immutable tag. Each extension must
+   carry exactly its supported targets, match the authenticated
+   tag/source/workflow identity, and bind the exact legacy manifest asset and
+   BLAKE3 digest. GNU and macOS updaters continue using only the unchanged
+   four-target documents, which preserves compatibility with already released
+   clients.
 4. One archive asset with the canonical version and target name.
 5. One `<archive>.sigstore.json` bundle whose certificate identity is exactly
    Astrid's `release.yml` workflow at that version tag and whose issuer is
@@ -34,6 +33,11 @@ check. The archive is not written, extracted, or installed until both stages
 have succeeded. Missing or duplicated assets, malformed evidence, identity or
 issuer mismatches, trust refresh failures, and checksum mismatches all fail
 closed.
+
+Astrid 0.11.0 publishes no Windows runtime archive or Windows extension.
+Windows-aware updater code retains its fail-closed extension checks as
+component coverage, but Windows runtime publication is parked for a later
+release.
 
 Release publishing has a differential gate before the GitHub release is
 created. Cosign first verifies every generated asset against its bundle. The

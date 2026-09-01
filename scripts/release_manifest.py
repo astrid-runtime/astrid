@@ -26,8 +26,8 @@ MUSL_TARGETS = (
     "aarch64-unknown-linux-musl",
     "x86_64-unknown-linux-musl",
 )
-WINDOWS_TARGETS = ("x86_64-pc-windows-msvc",)
-EXTENSION_TARGETS = (*MUSL_TARGETS, *WINDOWS_TARGETS)
+WINDOWS_TARGETS = ()
+EXTENSION_TARGETS = (*MUSL_TARGETS,)
 ROOT_KEYS = {
     "schema-version",
     "kind",
@@ -118,7 +118,7 @@ def validate_release_checksum_names(entries: dict[str, str], version: str, label
     if set(entries) not in (legacy, combined):
         fail(
             f"{label} must contain exactly the four fixed release archives, "
-            "optionally plus all three extension archives"
+            "optionally plus both musl extension archives"
         )
 
 

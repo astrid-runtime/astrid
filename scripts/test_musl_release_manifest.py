@@ -134,7 +134,7 @@ class MuslReleaseManifestTests(unittest.TestCase):
     def test_rejects_partial_combined_checksums(self) -> None:
         lines = (self.artifacts / "BLAKE3SUMS.txt").read_text().splitlines()
         (self.artifacts / "BLAKE3SUMS.txt").write_text("\n".join(lines[:-1]) + "\n")
-        with self.assertRaisesRegex(ValueError, "four fixed|all seven"):
+        with self.assertRaisesRegex(ValueError, "four fixed|all six"):
             self.manifest()
 
     def test_validate_command_requires_and_checks_the_legacy_manifest(self) -> None:

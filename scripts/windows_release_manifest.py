@@ -53,6 +53,8 @@ def build_manifest(
     artifacts: pathlib.Path,
     legacy_manifest_path: pathlib.Path,
 ) -> dict[str, Any]:
+    if not release_manifest.WINDOWS_TARGETS:
+        fail("Windows release publication is disabled for this release")
     legacy = release_manifest.load_manifest(legacy_manifest_path)
     release_manifest.validate_manifest(legacy)
     version = legacy["version"]
@@ -77,7 +79,7 @@ def build_manifest(
         for target in (*release_manifest.TARGETS, *release_manifest.EXTENSION_TARGETS)
     }
     if set(blake3) != expected_all or set(sha256) != expected_all:
-        fail("Windows metadata requires checksums for exactly all seven release archives")
+        fail("Windows metadata requires checksums for exactly all six release archives")
 
     targets = []
     for target in release_manifest.WINDOWS_TARGETS:

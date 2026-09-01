@@ -14,15 +14,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import release_manifest
 import release_publication
 import musl_release_manifest
-import windows_release_manifest
 
 
 VERSION = "0.10.0"
 SOURCE_COMMIT = "a" * 40
 CONTRACTS_COMMIT = "b" * 40
+RELEASE_WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/release.yml"
 
 
 class ReleasePublicationTests(unittest.TestCase):
+    def test_release_workflow_omits_windows_runtime_publication(self) -> None:
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8").lower()
+        for forbidden in (
+            "x86_64-pc-windows-msvc",
+            "windows_release_manifest",
+            "windows-release.toml",
+            "winfsp",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, workflow)
+
     def fixture(self, root: Path) -> Path:
         for target in release_manifest.TARGETS:
             name = release_manifest.expected_asset(VERSION, target)
@@ -92,20 +103,6 @@ class ReleasePublicationTests(unittest.TestCase):
             asset = release_manifest.expected_asset(VERSION, target)
             (root / f"{asset}.sigstore.json").write_text("{}\n")
         (root / f"{musl_path.name}.sigstore.json").write_text("{}\n")
-        with mock.patch.object(
-            release_manifest,
-            "blake3_file",
-            side_effect=lambda path: hashlib.sha256(
-                b"blake3:" + path.read_bytes()
-            ).hexdigest(),
-        ):
-            windows = windows_release_manifest.build_manifest(root, legacy_path)
-        windows_path = root / windows_release_manifest.metadata_name(VERSION)
-        windows_path.write_text(windows_release_manifest.render_manifest(windows))
-        for target in release_manifest.WINDOWS_TARGETS:
-            asset = release_manifest.expected_asset(VERSION, target)
-            (root / f"{asset}.sigstore.json").write_text("{}\n")
-        (root / f"{windows_path.name}.sigstore.json").write_text("{}\n")
 
     def validate(self, root: Path) -> list[str]:
         with mock.patch.object(
@@ -131,7 +128,9 @@ class ReleasePublicationTests(unittest.TestCase):
             root = Path(temp)
             self.fixture(root)
             self.add_extensions(root)
-            self.assertEqual(len(self.validate(root)), 12)
+            payloads = self.validate(root)
+            self.assertEqual(len(payloads), 10)
+            self.assertEqual(len(list(root.iterdir())), 20)
 
     def test_rejects_every_partial_musl_extension_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -157,27 +156,32 @@ class ReleasePublicationTests(unittest.TestCase):
                         self.validate(root)
                     (root / name).write_bytes(saved)
 
-    def test_rejects_every_partial_windows_extension_inventory(self) -> None:
+    def test_rejects_any_windows_runtime_inventory(self) -> None:
+        windows_assets = [
+            f"astrid-{VERSION}-windows-release.toml",
+            f"astrid-{VERSION}-windows-release.toml.sigstore.json",
+            f"astrid-{VERSION}-x86_64-pc-windows-msvc.tar.gz",
+            f"astrid-{VERSION}-x86_64-pc-windows-msvc.tar.gz.sigstore.json",
+        ]
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             self.fixture(root)
             self.add_extensions(root)
-            windows_asset = release_manifest.expected_asset(
-                VERSION, release_manifest.WINDOWS_TARGETS[0]
-            )
-            removals = [
-                windows_release_manifest.metadata_name(VERSION),
-                f"{windows_release_manifest.metadata_name(VERSION)}.sigstore.json",
-                windows_asset,
-                f"{windows_asset}.sigstore.json",
-            ]
-            for name in removals:
+            for name in windows_assets:
                 with self.subTest(name=name):
-                    saved = (root / name).read_bytes()
-                    (root / name).unlink()
+                    (root / name).write_bytes(f"payload:{name}\n".encode())
                     with self.assertRaises((ValueError, OSError)):
                         self.validate(root)
-                    (root / name).write_bytes(saved)
+                    (root / name).unlink()
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.fixture(root)
+            self.add_extensions(root)
+            for name in windows_assets:
+                (root / name).write_bytes(f"payload:{name}\n".encode())
+            with self.assertRaisesRegex(ValueError, "asset set differs"):
+                self.validate(root)
 
     def test_rejects_musl_checksums_without_extension_assets(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

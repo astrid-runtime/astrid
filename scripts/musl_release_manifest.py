@@ -77,7 +77,7 @@ def build_manifest(
         for target in (*release_manifest.TARGETS, *release_manifest.EXTENSION_TARGETS)
     }
     if set(blake3) != expected_all or set(sha256) != expected_all:
-        fail("musl metadata requires checksums for exactly all seven release archives")
+        fail("musl metadata requires checksums for exactly all six release archives")
 
     targets = []
     for target in release_manifest.MUSL_TARGETS:

@@ -85,14 +85,10 @@ repeating its release identity. The mutable channel document remains at schema
 1 with exactly four targets, so older clients can keep following channel
 generations without encountering a new document shape.
 
-The first Windows archive is described by
-`astrid-<version>-windows-release.toml` rather than changing that frozen base.
-The immutable, tag-signed extension contains exactly
-`x86_64-pc-windows-msvc`, repeats the exact version, tag, source commit, and
-release-workflow identity, and binds the authenticated four-target manifest by
-canonical asset name and BLAKE3 digest. Released clients safely ignore this
-separate asset; Windows-aware clients authenticate it before selecting the
-Windows archive digest.
+Windows runtime archives are not published in 0.11.0. Windows runtime
+publication is parked for a later release; this cut does not publish a
+`windows-release.toml`, Windows archive, Windows checksum entry, or associated
+signature evidence.
 
 Each channel is hosted at the GitHub release tag `channel-<channel>` and exposes
 `channel.toml` plus `channel.toml.sigstore.json`. The pointer is signed only by:
@@ -139,7 +135,7 @@ The updater authenticates, in order:
 1. `channel.toml` against the exact promotion-workflow identity on `main`.
 2. The immutable release manifest against the exact release workflow at the
    selected version tag.
-3. On musl or Windows, the platform's canonical extension against the same
+3. On musl, the platform's canonical extension against the same
    tag-bound workflow, authenticated legacy release identity, and exact
    legacy-manifest digest.
 4. The selected archive against the same tag-bound release identity.
