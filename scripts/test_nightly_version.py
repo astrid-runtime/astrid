@@ -78,6 +78,53 @@ class NightlyVersionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "schema-version must be integer 1"):
             nightly_version.base_version(self.root)
 
+    def _use_2026_9_calver_fixture(self) -> None:
+        for relative_path in (
+            "Cargo.toml",
+            "Cargo.lock",
+            "crates/astrid-one/Cargo.toml",
+            "crates/astrid-two/Cargo.toml",
+        ):
+            path = self.root / relative_path
+            path.write_text(
+                path.read_text(encoding="utf-8").replace("0.9.4", "2026.9.0"),
+                encoding="utf-8",
+            )
+        (self.root / "release/nightly.toml").write_text(
+            'schema-version = 1\nbase-version = "2026.10.0"\n', encoding="utf-8"
+        )
+
+    def test_calver_stable_and_next_nightly_do_not_alias(self) -> None:
+        self._use_2026_9_calver_fixture()
+        stable = nightly_version.source_version(self.root)
+        base = nightly_version.base_version(self.root)
+        nightly = nightly_version.derive(base, "20260902", COMMIT)
+
+        self.assertEqual(stable, "2026.9.0")
+        self.assertEqual(base, "2026.10.0")
+        self.assertEqual(nightly, f"2026.10.0-nightly.20260902.g{COMMIT}")
+        self.assertIsNotNone(nightly_version.NIGHTLY.fullmatch(nightly))
+        self.assertNotEqual(stable, nightly)
+        self.assertNotIn(nightly, stable)
+
+    def test_stage_calver_nightly_updates_only_workspace_versions(self) -> None:
+        self._use_2026_9_calver_fixture()
+        stable = "2026.9.0"
+        nightly = nightly_version.derive(
+            nightly_version.base_version(self.root), "20260902", COMMIT
+        )
+
+        nightly_version.stage(self.root, nightly)
+
+        cargo = (self.root / "Cargo.toml").read_text(encoding="utf-8")
+        lock = (self.root / "Cargo.lock").read_text(encoding="utf-8")
+        self.assertEqual(cargo.count(nightly), 3)
+        self.assertEqual(lock.count(nightly), 3)
+        self.assertIn(f'name = "astrid"\nversion = "{nightly}"', lock)
+        self.assertIn(f'unrelated = "{stable}"', cargo)
+        self.assertIn(f'name = "external"\nversion = "{stable}"', lock)
+        self.assertNotEqual(stable, nightly)
+
     def test_rejects_externalized_workspace_lock_entry(self) -> None:
         lock = self.root / "Cargo.lock"
         lock.write_text(lock.read_text().replace('name = "astrid-one"\nversion = "0.9.4"', 'name = "astrid-one"\nversion = "0.9.4"\nsource = "registry+https://example.invalid"'), encoding="utf-8")

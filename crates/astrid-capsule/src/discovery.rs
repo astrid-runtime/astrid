@@ -773,12 +773,27 @@ version = "0.1.0"
 
     #[test]
     fn load_manifest_rejects_unsatisfied_astrid_version() {
-        let toml = "[package]\nname = \"test\"\nversion = \"0.1.0\"\nastrid-version = \">=99.0.0\"";
-        let err = load_from_toml(toml).unwrap_err();
+        let runtime = env!("CARGO_PKG_VERSION");
+        let next_major = runtime
+            .split_once('.')
+            .expect("runtime version has a major component")
+            .0
+            .parse::<u64>()
+            .expect("runtime major is numeric")
+            + 1;
+        let constraint = format!(">={next_major}.0.0");
+        let toml = format!(
+            "[package]\nname = \"test\"\nversion = \"0.1.0\"\nastrid-version = \"{constraint}\""
+        );
+        let err = load_from_toml(&toml).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("astrid-version") && msg.contains("99.0.0"),
+            msg.contains("astrid-version") && msg.contains(&constraint),
             "expected astrid-version rejection, got: {msg}"
+        );
+        assert!(
+            msg.contains(runtime),
+            "rejection must name the installed runtime, got: {msg}"
         );
     }
 
