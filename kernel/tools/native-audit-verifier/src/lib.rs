@@ -436,6 +436,16 @@ impl Drop for OpenFold<'_> {
 /// A completed, provisional fold. The caller receives this distinct state only
 /// after exactly one successful fold and must consume it to finish the
 /// verifier transaction. No raw receipt can create or replace this state.
+///
+/// ```compile_fail
+/// use native_audit_verifier::{FoldedFold, FoldReceipt};
+/// fn finish(fold: FoldedFold<'_>) {
+///     fold.finish(true);
+/// }
+/// fn substitute(receipt: FoldReceipt) -> FoldedFold<'static> {
+///     receipt.into()
+/// }
+/// ```
 pub struct FoldedFold<'a> {
     verifier: &'a mut AuditVerifier,
     finished: bool,
@@ -467,15 +477,33 @@ impl FoldedFold<'_> {
         self.receipt().ack_tag()
     }
 
-    /// Consumes the folded state. Relay authentication failure restores the
-    /// saved cursor; success retains it. There is no second finish.
-    pub fn finish(mut self, committed: bool) {
-        let transaction = self
-            .verifier
-            .fold_transaction
-            .as_ref()
-            .expect("folded state retains its receipt");
-        if !committed {
+    /// Commits only with a live-custody checkpoint capability minted after
+    /// successful relay receipt authentication. The verifier independently
+    /// checks the capability's sequence, root, boot, relay generation, and
+    /// keyed tag. Commit consumes this state; there is no retry.
+    pub fn commit_after_relay(mut self, capability: &[u8]) -> Result<(), VerifyFailure> {
+        assert!(
+            self.verifier.fold_transaction.is_some(),
+            "folded state retains its receipt"
+        );
+        let result = self.verifier.accept_checkpoint(capability);
+        if result.is_ok() {
+            self.verifier.fold_transaction = None;
+            self.finished = true;
+        } else {
+            self.rollback_state();
+        }
+        result
+    }
+
+    /// Consumes the folded state and restores the saved cursor after relay
+    /// authentication failure.
+    pub fn rollback(mut self) {
+        self.rollback_state();
+    }
+
+    fn rollback_state(&mut self) {
+        if let Some(transaction) = self.verifier.fold_transaction.as_ref() {
             self.verifier.next_seq = transaction.previous_next_seq;
             self.verifier.root = transaction.previous_root;
         }
@@ -487,11 +515,7 @@ impl FoldedFold<'_> {
 impl Drop for FoldedFold<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            if let Some(transaction) = self.verifier.fold_transaction.as_ref() {
-                self.verifier.next_seq = transaction.previous_next_seq;
-                self.verifier.root = transaction.previous_root;
-            }
-            self.verifier.fold_transaction = None;
+            self.rollback_state();
             self.finished = true;
         }
     }
@@ -574,10 +598,9 @@ impl AuditVerifier {
         })
     }
 
-    /// Folds one canonical frame whose source root claim has already been
-    /// checked by the caller's handoff record. Contiguity is enforced; a gap
-    /// is Incomplete and a duplicate or reorder is Invalid. Never skips.
-    pub fn fold(
+    /// Shared canonical fold engine. Immediate transactions and retained
+    /// evidence both use this, but only the former can create `FoldedFold`.
+    fn fold_frame(
         &mut self,
         frame: &[u8],
         claimed_root: [u8; 32],
@@ -676,6 +699,44 @@ impl AuditVerifier {
     pub fn next_seq(&self) -> u64 {
         self.next_seq
     }
+
+    /// Converts this live verifier into the separately typed retained-evidence
+    /// verifier. A retained verifier cannot create or commit `FoldedFold`.
+    pub fn into_retained_evidence(self) -> RetainedAuditVerifier {
+        RetainedAuditVerifier(self)
+    }
+}
+
+/// Capability-typed retained-evidence verifier. It has no `open_fold` and no
+/// transaction commit, so it cannot impersonate the live relay-bound path.
+pub struct RetainedAuditVerifier(AuditVerifier);
+
+impl RetainedAuditVerifier {
+    /// Folds one retained buffered handoff record for the existing ack/credit
+    /// path. The raw receipt cannot create `FoldedFold`.
+    pub fn fold_retained_evidence(
+        &mut self,
+        frame: &[u8],
+        claimed_root: [u8; 32],
+    ) -> Result<FoldReceipt, FoldFailure> {
+        self.0.fold_frame(frame, claimed_root)
+    }
+
+    pub fn root(&self) -> [u8; 32] {
+        self.0.root
+    }
+
+    pub fn next_seq(&self) -> u64 {
+        self.0.next_seq
+    }
+
+    pub fn accept_checkpoint(&self, wire: &[u8]) -> Result<(), VerifyFailure> {
+        self.0.accept_checkpoint(wire)
+    }
+
+    pub fn accept_resync_checkpoint(&mut self, wire: &[u8]) -> Result<(), VerifyFailure> {
+        self.0.accept_resync_checkpoint(wire)
+    }
 }
 
 impl Drop for AuditVerifier {
@@ -713,7 +774,7 @@ impl<'a> OpenFold<'a> {
         }
 
         let verifier = self.verifier.as_mut().expect("verifier remains open");
-        match verifier.fold(frame, *expected_root) {
+        match verifier.fold_frame(frame, *expected_root) {
             Ok(receipt) if receipt.seq() == expected_seq => {
                 let verifier = self.verifier.take().expect("verifier remains open");
                 self.finished = true;

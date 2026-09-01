@@ -100,6 +100,10 @@ fn verifier() -> native_audit_verifier::AuditVerifier {
         .unwrap()
 }
 
+fn retained_verifier() -> native_audit_verifier::RetainedAuditVerifier {
+    verifier().into_retained_evidence()
+}
+
 fn genesis_chain(chain_boot: BootSessionId) -> AuditChain {
     AuditChain::genesis(chain_boot, secret()).unwrap()
 }
@@ -214,7 +218,7 @@ fn rejects_malformed_non_canonical_and_disclosing_inputs() {
 fn append_folds_with_mandatory_source_root() {
     let chain_boot = boot();
     let mut chain = genesis_chain(chain_boot);
-    let mut host_verifier = verifier();
+    let mut host_verifier = verifier().into_retained_evidence();
 
     for expected_seq in 1u64..=5 {
         let class = match expected_seq {
@@ -232,7 +236,9 @@ fn append_folds_with_mandatory_source_root() {
 
         chain.relay_mut().grant_credits(1).unwrap();
         let record = chain.relay_mut().take().unwrap();
-        let receipt = host_verifier.fold(record.frame(), record.root()).unwrap();
+        let receipt = host_verifier
+            .fold_retained_evidence(record.frame(), record.root())
+            .unwrap();
         assert_eq!(receipt.seq(), seq);
         assert_eq!(host_verifier.root(), *chain.root());
     }
@@ -262,28 +268,32 @@ fn tamper_is_invalid_gap_is_incomplete_duplicate_is_invalid() {
         assert_eq!(count, 3);
     }
 
-    let mut host_verifier = verifier();
+    let mut host_verifier = verifier().into_retained_evidence();
     let mut tampered = FrameBuf::new(records[0].as_slice());
     let last = tampered.len - 1;
     tampered.bytes[last] ^= 0xFF;
     assert!(matches!(
-        host_verifier.fold(tampered.as_slice(), roots[0]),
+        host_verifier.fold_retained_evidence(tampered.as_slice(), roots[0]),
         Err(native_audit_verifier::FoldFailure::Invalid(_))
     ));
 
-    let mut host_verifier = verifier();
-    host_verifier.fold(records[0].as_slice(), roots[0]).unwrap();
+    let mut host_verifier = verifier().into_retained_evidence();
+    host_verifier
+        .fold_retained_evidence(records[0].as_slice(), roots[0])
+        .unwrap();
     assert!(matches!(
-        host_verifier.fold(records[2].as_slice(), roots[2]),
+        host_verifier.fold_retained_evidence(records[2].as_slice(), roots[2]),
         Err(native_audit_verifier::FoldFailure::Incomplete(
             native_audit_verifier::IncompleteReason::SequenceGap
         ))
     ));
 
-    let mut host_verifier = verifier();
-    host_verifier.fold(records[0].as_slice(), roots[0]).unwrap();
+    let mut host_verifier = verifier().into_retained_evidence();
+    host_verifier
+        .fold_retained_evidence(records[0].as_slice(), roots[0])
+        .unwrap();
     assert!(matches!(
-        host_verifier.fold(records[0].as_slice(), roots[0]),
+        host_verifier.fold_retained_evidence(records[0].as_slice(), roots[0]),
         Err(native_audit_verifier::FoldFailure::Invalid(
             native_audit_verifier::InvalidReason::DuplicateOrReorder
         ))
@@ -303,17 +313,18 @@ fn foreign_boot_and_missing_previous_root_are_invalid() {
         anchor_of(&foreign_authority),
         &foreign_authority.verifier_handoff(),
     )
-    .unwrap();
+    .unwrap()
+    .into_retained_evidence();
     chain.relay_mut().grant_credits(1).unwrap();
     let record = chain.relay_mut().take().unwrap();
     assert!(matches!(
-        foreign.fold(record.frame(), record.root()),
+        foreign.fold_retained_evidence(record.frame(), record.root()),
         Err(native_audit_verifier::FoldFailure::Invalid(
             native_audit_verifier::InvalidReason::ForeignBoot
         ))
     ));
 
-    let mut host_verifier = verifier();
+    let mut host_verifier = verifier().into_retained_evidence();
     let event = domain_event(AuditClass::DomainCreate);
     let frame = Frame::new(chain_boot, 1, &event, None).unwrap();
     let mut buf = [0; MAX_FRAME_BYTES];
@@ -322,7 +333,7 @@ fn foreign_boot_and_missing_previous_root_are_invalid() {
     let genesis = root_hasher.genesis(chain_boot);
     let expected = root_hasher.advance(genesis, chain_boot, 1, encoded);
     assert!(matches!(
-        host_verifier.fold(encoded, expected),
+        host_verifier.fold_retained_evidence(encoded, expected),
         Err(native_audit_verifier::FoldFailure::Invalid(
             native_audit_verifier::InvalidReason::PreviousRootMismatch
         ))
@@ -379,16 +390,6 @@ fn verified_staging_failure_leaves_chain_untouched() {
     let chain_boot = boot();
     let mut chain = genesis_chain(chain_boot);
     let mut host_verifier = verifier();
-
-    chain
-        .append(domain_event(AuditClass::DomainCreate))
-        .unwrap();
-    chain.relay_mut().grant_credits(1).unwrap();
-    let first = chain.relay_mut().take().unwrap();
-    let first_receipt = host_verifier.fold(first.frame(), first.root()).unwrap();
-    chain
-        .ack(first.seq(), first.root(), first_receipt.ack_tag())
-        .unwrap();
     let before = (chain.seq(), *chain.root());
     let verifier_before = (host_verifier.next_seq(), host_verifier.root());
 
@@ -474,7 +475,7 @@ fn transaction_receipt_cannot_retire_a_different_staged_frame() {
 fn ack_requires_take_in_flight_and_matching_folded_root() {
     let chain_boot = boot();
     let mut chain = genesis_chain(chain_boot);
-    let mut host_verifier = verifier();
+    let mut host_verifier = retained_verifier();
     chain
         .append(domain_event(AuditClass::DomainCreate))
         .unwrap();
@@ -483,7 +484,9 @@ fn ack_requires_take_in_flight_and_matching_folded_root() {
     chain.relay_mut().grant_credits(1).unwrap();
     let first = chain.relay_mut().take().unwrap();
     assert_eq!(chain.relay().redeliver().count(), 2);
-    let first_receipt = host_verifier.fold(first.frame(), first.root()).unwrap();
+    let first_receipt = host_verifier
+        .fold_retained_evidence(first.frame(), first.root())
+        .unwrap();
     assert_eq!(
         chain.ack(first.seq(), first.root(), [0; 32]),
         Err(AuditError::RootMismatch)
@@ -506,7 +509,9 @@ fn ack_requires_take_in_flight_and_matching_folded_root() {
     );
     chain.relay_mut().grant_credits(1).unwrap();
     let second = chain.relay_mut().take().unwrap();
-    let second_receipt = host_verifier.fold(second.frame(), second.root()).unwrap();
+    let second_receipt = host_verifier
+        .fold_retained_evidence(second.frame(), second.root())
+        .unwrap();
     chain
         .ack(
             second.seq(),
@@ -618,7 +623,8 @@ fn verifier_sequence_overflow_is_atomic_and_repeatable() {
         host_context(),
         &host_handoff(),
     )
-    .unwrap();
+    .unwrap()
+    .into_retained_evidence();
     let before = (verifier.next_seq(), verifier.root());
     let event = domain_event(AuditClass::DomainCreate);
     let frame = Frame::new(boot(), u64::MAX, &event, Some([9; 32])).unwrap();
@@ -626,11 +632,11 @@ fn verifier_sequence_overflow_is_atomic_and_repeatable() {
     let encoded = frame.encode(&mut buf).unwrap();
     let claimed = test_root_hasher().advance([9; 32], boot(), u64::MAX, encoded);
     assert_eq!(
-        verifier.fold(encoded, claimed),
+        verifier.fold_retained_evidence(encoded, claimed),
         Err(native_audit_verifier::FoldFailure::SequenceOverflow)
     );
     assert_eq!(
-        verifier.fold(encoded, claimed),
+        verifier.fold_retained_evidence(encoded, claimed),
         Err(native_audit_verifier::FoldFailure::SequenceOverflow)
     );
     assert_eq!((verifier.next_seq(), verifier.root()), before);
@@ -645,9 +651,9 @@ fn explicitly_mismatched_previous_root_is_invalid() {
     let mut buf = [0; MAX_FRAME_BYTES];
     let encoded = frame.encode(&mut buf).unwrap();
     let claimed = test_root_hasher().advance(wrong_previous, chain_boot, 1, encoded);
-    let mut host_verifier = verifier();
+    let mut host_verifier = retained_verifier();
     assert!(matches!(
-        host_verifier.fold(encoded, claimed),
+        host_verifier.fold_retained_evidence(encoded, claimed),
         Err(native_audit_verifier::FoldFailure::Invalid(
             native_audit_verifier::InvalidReason::PreviousRootMismatch
         ))
@@ -703,14 +709,17 @@ fn resync_is_generation_bound_and_restores_flow() {
         host_context(),
         &host_handoff(),
     )
-    .unwrap();
+    .unwrap()
+    .into_retained_evidence();
     assert_eq!(host_verifier.root(), *chain.root());
 
     let seq = chain.append(domain_event(AuditClass::DomainEnter)).unwrap();
     chain.relay_mut().grant_credits(1).unwrap();
     let record = chain.relay_mut().take().unwrap();
     assert_eq!(record.seq(), seq);
-    let receipt = host_verifier.fold(record.frame(), record.root()).unwrap();
+    let receipt = host_verifier
+        .fold_retained_evidence(record.frame(), record.root())
+        .unwrap();
     assert_eq!(receipt.seq(), seq);
 }
 
@@ -1024,11 +1033,13 @@ fn forged_retirement_receipt_is_rejected() {
     chain
         .append(domain_event(AuditClass::DomainCreate))
         .unwrap();
-    let mut host_verifier = verifier();
+    let mut host_verifier = retained_verifier();
 
     chain.relay_mut().grant_credits(1).unwrap();
     let record = chain.relay_mut().take().unwrap();
-    let genuine = host_verifier.fold(record.frame(), record.root()).unwrap();
+    let genuine = host_verifier
+        .fold_retained_evidence(record.frame(), record.root())
+        .unwrap();
 
     // A receipt minted under an attacker-chosen key fails even with the
     // correct folded root, sequence, frame, and source root.

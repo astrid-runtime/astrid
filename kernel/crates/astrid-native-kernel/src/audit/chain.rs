@@ -2,7 +2,7 @@
 //! frame, the checked `audit_seq` advance, and the rolling-root advance
 //! together, or fails before any state changes.
 
-use super::codec::{Frame, MAX_FRAME_BYTES};
+use super::codec::{Frame, MAX_FRAME_BYTES, encode_checkpoint};
 use super::relay::AuditRelay;
 use super::root;
 use super::types::{
@@ -304,7 +304,7 @@ impl AuditChain {
             || transaction.receipt().seq() != seq
             || transaction.receipt().folded_root() != root
         {
-            transaction.finish(false);
+            transaction.rollback();
             return Err(AuditError::RootMismatch);
         }
         let result = self.relay.publish_retired(
@@ -315,12 +315,24 @@ impl AuditChain {
             transaction.receipt_tag(),
             self.authority.context(),
         );
-        transaction.finish(result.is_ok());
-        if result.is_ok() {
-            self.seq = seq;
-            self.root = root;
+        match result {
+            Ok(()) => {
+                let capability = self.relay.checkpoint(root, seq, self.authority.context());
+                let mut capability_wire = [0; super::codec::CHECKPOINT_WIRE_BYTES];
+                let capability =
+                    encode_checkpoint(&capability, self.authority.context(), &mut capability_wire)?;
+                transaction
+                    .commit_after_relay(capability)
+                    .map_err(|_| AuditError::CheckpointMismatch)?;
+                self.seq = seq;
+                self.root = root;
+                Ok(AuditObservation { seq, class, root })
+            },
+            Err(error) => {
+                transaction.rollback();
+                Err(error)
+            },
         }
-        result.map(|()| AuditObservation { seq, class, root })
     }
 
     /// Kernel-authenticated checkpoint bound to the exact current state.
