@@ -279,6 +279,157 @@ internal static class ParityChild
     }
 }
 
+internal static class LibTestChild
+{
+    internal static readonly string[] TestNames =
+    [
+        "storage_mount::process_broker::lease_atomicity_tests::cache_invalidation_tests::alpha",
+        "storage_mount::process_broker::lease_atomicity_tests::cache_invalidation_tests::beta",
+    ];
+
+    internal static int Run(string journalPathText, IReadOnlyList<string> arguments)
+    {
+        var journalPath = Path.GetFullPath(journalPathText);
+        if (!string.Equals(journalPath, journalPathText, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ControllerException($"libtest journal path is not canonical: expected {journalPath}, got {journalPathText}");
+        }
+
+        var parsed = ParseArguments(arguments);
+        var stateDirectory = Path.GetDirectoryName(journalPath);
+        if (string.IsNullOrEmpty(stateDirectory))
+        {
+            throw new ControllerException("the libtest journal path has no directory");
+        }
+
+        Directory.CreateDirectory(stateDirectory);
+        var lockPath = Path.Combine(stateDirectory, "libtest-child.lock");
+        var activePath = Path.Combine(stateDirectory, "libtest-child.active");
+        var lockStream = new FileStream(
+            lockPath,
+            FileMode.OpenOrCreate,
+            FileAccess.ReadWrite,
+            FileShare.None);
+
+        try
+        {
+            if (File.Exists(activePath))
+            {
+                Console.Error.WriteLine("cache-invalidation tests overlap: another test is active");
+                return 10;
+            }
+
+            File.WriteAllText(activePath, $"{Environment.ProcessId};{parsed.Filter}");
+            foreach (var testName in parsed.SelectedTests)
+            {
+                var begin = $"{Environment.ProcessId};begin;{testName};{Stopwatch.GetTimestamp()}";
+                File.AppendAllText(journalPath, $"{begin}{Environment.NewLine}");
+                if (parsed.NoCapture)
+                {
+                    Console.Out.WriteLine($"running {testName}");
+                }
+
+                Thread.Sleep(25);
+                File.AppendAllText(journalPath, $"{begin.Replace(";begin;", ";end;")}{Environment.NewLine}");
+                if (parsed.NoCapture)
+                {
+                    Console.Out.WriteLine($"test {testName} ok");
+                }
+            }
+
+            File.Delete(activePath);
+            return 0;
+        }
+        catch (IOException)
+        {
+            Console.Error.WriteLine("cache-invalidation tests overlap: execution lock was already held");
+            return 10;
+        }
+        finally
+        {
+            lockStream.Dispose();
+        }
+    }
+
+    private static (bool NoCapture, string Filter, IReadOnlyList<string> SelectedTests) ParseArguments(
+        IReadOnlyList<string> arguments)
+    {
+        var noCapture = false;
+        var exact = false;
+        int? testThreads = null;
+        var filters = new List<string>();
+        var filtersStarted = false;
+
+        foreach (var argument in arguments)
+        {
+            if (argument == "--")
+            {
+                throw new ControllerException("cargo-style separator is not accepted by direct libtest execution");
+            }
+
+            if (argument.StartsWith('-'))
+            {
+                if (filtersStarted)
+                {
+                    throw new ControllerException($"libtest option follows positional filter: {argument}");
+                }
+
+                switch (argument)
+                {
+                    case "--nocapture" when noCapture:
+                    case "--exact" when exact:
+                        throw new ControllerException($"duplicate libtest option: {argument}");
+                    case "--nocapture":
+                        noCapture = true;
+                        break;
+                    case "--exact":
+                        exact = true;
+                        break;
+                    case "--test-threads=1" when testThreads.HasValue:
+                    case var _ when argument.StartsWith("--test-threads=", StringComparison.Ordinal):
+                        if (testThreads.HasValue)
+                        {
+                            throw new ControllerException("duplicate libtest option: --test-threads");
+                        }
+
+                        if (argument != "--test-threads=1")
+                        {
+                            throw new ControllerException(
+                                $"libtest maximum concurrency must be 1: {argument}");
+                        }
+
+                        testThreads = 1;
+                        break;
+                    default:
+                        throw new ControllerException($"unknown libtest option: {argument}");
+                }
+
+                continue;
+            }
+
+            filtersStarted = true;
+            filters.Add(argument);
+        }
+
+        if (!noCapture || testThreads != 1 || filters.Count != 1)
+        {
+            throw new ControllerException(
+                $"libtest arguments must require nocapture, one thread, and one filter: nocapture={noCapture}, threads={testThreads}, filters={filters.Count}");
+        }
+
+        var filter = filters[0];
+        var selectedTests = exact
+            ? TestNames.Where(name => string.Equals(name, filter, StringComparison.Ordinal)).ToArray()
+            : TestNames.Where(name => name.Contains(filter, StringComparison.OrdinalIgnoreCase)).ToArray();
+        if (selectedTests.Length == 0)
+        {
+            throw new ControllerException($"libtest filter selected no cache-invalidation tests: {filter}");
+        }
+
+        return (noCapture, filter, selectedTests);
+    }
+}
+
 internal static class RootProcessCleanup
 {
     internal static bool ReleaseHandles(SafeWindowsHandle thread, SafeProcessHandle process)

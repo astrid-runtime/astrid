@@ -9,7 +9,7 @@ namespace Astrid.Ci.Windows;
 internal sealed class SelfTest
 {
     private static readonly string[] ListArguments = Program.BuildCanonicalListArgumentsForSelfTest();
-    private static readonly string[] AggregateArguments = ["storage_mount", "--", "--nocapture", "--test-threads=1"];
+    private static readonly string[] AggregateArguments = Program.BuildCanonicalAggregateArgumentsForSelfTest();
 
     private static string RunnerExecutable =>
         Program.ResolveExecutableForSelfTest(Environment.ProcessPath
@@ -309,19 +309,54 @@ internal sealed class SelfTest
             throw DescribeParityFailure("--list", listResult, "the list did not return the stable nonempty set without running tests");
         }
 
-        var aggregate = RunParityPhase(root, received, "aggregate", AggregateArguments);
-        foreach (var name in names)
+        var journal = Path.Combine(root, "libtest-execution_journal.log");
+        var aggregate = RunLibTestPhase(root, journal, "aggregate", AggregateArguments);
+        ValidateSerialExecution(journal, LibTestChild.TestNames);
+        var aggregateOutput = SafeEvidence(aggregate.StdoutPath);
+        if (!aggregateOutput.Contains("running storage_mount::", StringComparison.Ordinal))
         {
-            RunParityPhase(root, received, $"diagnostic:{name}", [name, "--", "--exact", "--nocapture", "--test-threads=1"]);
+            throw DescribeParityFailure("aggregate", aggregate, "nocapture execution output was missing");
         }
 
-        var receivedSets = File.ReadAllLines(received);
-        if (receivedSets is not ["aggregate", "alpha", "beta"])
+        var oldShape = RunLibTestChild(
+            root,
+            journal,
+            ["storage_mount", "--", "--nocapture", "--test-threads=1"]);
+        if (oldShape.Outcome is not JobOutcome.ChildFailed ||
+            !SafeEvidence(oldShape.StderrPath).Contains("cargo-style separator", StringComparison.Ordinal))
         {
-            throw DescribeParityFailure("diagnostic", aggregate, $"canonical receipt diverged: {string.Join(", ", receivedSets)}");
+            throw DescribeParityFailure("aggregate", oldShape, "the current cargo-style separator shape was not rejected");
         }
 
-        Console.WriteLine("[selftest] list, aggregate, and exact diagnostic argument sets had the same test set");
+        foreach (var testName in LibTestChild.TestNames)
+        {
+            var diagnostic = RunLibTestPhase(
+                root,
+                journal,
+                $"diagnostic:{testName}",
+                Program.BuildCanonicalDiagnosticArgumentsForSelfTest(testName));
+            var diagnosticOutput = SafeEvidence(diagnostic.StdoutPath);
+            if (!diagnosticOutput.Contains($"running {testName}", StringComparison.Ordinal))
+            {
+                throw DescribeParityFailure($"diagnostic:{testName}", diagnostic, "exact selection output was missing");
+            }
+        }
+
+        var overlapState = Path.Combine(root, "overlap-state");
+        Directory.CreateDirectory(overlapState);
+        var activePath = Path.Combine(overlapState, "libtest-child.active");
+        File.WriteAllText(activePath, "0;simulated-overlap");
+        var overlap = RunLibTestChild(
+            overlapState,
+            Path.Combine(overlapState, "journal.log"),
+            AggregateArguments);
+        if (overlap.Outcome is not JobOutcome.ChildFailed ||
+            !SafeEvidence(overlap.StderrPath).Contains("cache-invalidation tests overlap", StringComparison.Ordinal))
+        {
+            throw DescribeParityFailure("aggregate", overlap, "an overlapping cache-invalidation execution was not rejected");
+        }
+
+        Console.WriteLine("[selftest] list parity and semantic libtest execution selected exact serial test sets");
     }
 
     private static JobRunResult RunParityPhase(
@@ -371,6 +406,76 @@ internal sealed class SelfTest
         catch (Exception exception)
         {
             return $"<unreadable: {exception.Message}>";
+        }
+    }
+
+    private static JobRunResult RunLibTestPhase(
+        string root,
+        string journalPath,
+        string phase,
+        IReadOnlyList<string> arguments)
+    {
+        var result = RunLibTestChild(root, journalPath, arguments);
+        if (result.Outcome is not JobOutcome.Succeeded)
+        {
+            throw DescribeParityFailure(phase, result, $"expected semantic child success, got {result.Outcome}");
+        }
+
+        if (!result.RootHandlesReleased)
+        {
+            throw DescribeParityFailure(phase, result, "semantic child root handles were not released");
+        }
+
+        return result;
+    }
+
+    private static JobRunResult RunLibTestChild(
+        string root,
+        string journalPath,
+        IReadOnlyList<string> arguments)
+    {
+        return RunCommand(root, [RunnerExecutable, "libtest-child", journalPath, .. arguments], 15);
+    }
+
+    private static void ValidateSerialExecution(string journalPath, IReadOnlyList<string> expectedTestNames)
+    {
+        var active = new HashSet<string>(StringComparer.Ordinal);
+        var began = new List<string>();
+        foreach (var line in File.ReadAllLines(journalPath))
+        {
+            var fields = line.Split(';', 4);
+            if (fields.Length != 4)
+            {
+                throw new ControllerException($"invalid semantic libtest event: {line}");
+            }
+
+            var testName = fields[2];
+            if (fields[1] == "begin")
+            {
+                if (!active.Add(testName))
+                {
+                    throw new ControllerException($"overlapping cache-invalidation test execution: {testName}");
+                }
+
+                began.Add(testName);
+            }
+            else if (fields[1] == "end")
+            {
+                if (!active.Remove(testName))
+                {
+                    throw new ControllerException($"semantic libtest end event without begin: {testName}");
+                }
+            }
+            else
+            {
+                throw new ControllerException($"unknown semantic libtest event: {line}");
+            }
+        }
+
+        if (active.Count != 0 || !began.SequenceEqual(expectedTestNames))
+        {
+            throw new ControllerException(
+                $"semantic serial execution diverged: active={string.Join(',', active)}, began={string.Join(',', began)}");
         }
     }
 

@@ -29,6 +29,7 @@ internal static class Program
                 ["selftest"] => SelfTest.Run(),
                 ["marker-child", var markerPath, var exitCodeText] => MarkerChild.Run(markerPath, exitCodeText),
                 ["parity-child", var receivedPath, .. var parityArguments] => ParityChild.Run(receivedPath, parityArguments),
+                ["libtest-child", var journalPath, .. var libtestArguments] => LibTestChild.Run(journalPath, libtestArguments),
                 ["certify", .. var certificationArgs] => Certify(ParseOptions(certificationArgs)),
                 _ => throw new ControllerException("expected 'selftest' or 'certify' with named options"),
             };
@@ -165,10 +166,10 @@ internal static class Program
         ["--list", "--format=terse", StorageTestFilter];
 
     private static string[] BuildCanonicalAggregateArguments() =>
-        [StorageTestFilter, "--", "--nocapture", "--test-threads=1"];
+        ["--nocapture", "--test-threads=1", StorageTestFilter];
 
     private static string[] BuildCanonicalDiagnosticArguments(string testName) =>
-        [testName, "--", "--exact", "--nocapture", "--test-threads=1"];
+        ["--exact", "--nocapture", "--test-threads=1", testName];
 
     private static List<string> ParseTestList(IEnumerable<string> lines)
     {
@@ -806,6 +807,11 @@ internal static class Program
         ParseTestList(lines);
 
     internal static string[] BuildCanonicalListArgumentsForSelfTest() => BuildCanonicalListArguments();
+
+    internal static string[] BuildCanonicalAggregateArgumentsForSelfTest() => BuildCanonicalAggregateArguments();
+
+    internal static string[] BuildCanonicalDiagnosticArgumentsForSelfTest(string testName) =>
+        BuildCanonicalDiagnosticArguments(testName);
 
     internal static void AssertProviderForSelfTest(string expectedPath, string actualPath, string expectedHash) =>
         AssertProvider(expectedPath, actualPath, expectedHash);
