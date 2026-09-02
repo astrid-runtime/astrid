@@ -144,7 +144,7 @@ Relevant flags:
 |------|--------|
 | `--yes` | Non-interactive: take group defaults, resolve variables from `--var` / `ASTRID_VAR_<KEY>` / manifest defaults, error if a required one is unset. |
 | `--offline` | Forbid all network. A non-local capsule source is a hard error. |
-| `--allow-unsigned` | For an ordinary third-party init or `.shuttle`, install a distro that ships no signature (see §5). Product `astrid distro apply` rejects it. |
+| `--allow-unsigned` | For an ordinary `.shuttle`, install a distro archive that ships no signature (see §5). Ordinary plain-TOML init does not consult this flag. Product `astrid distro apply` rejects it. |
 | `--accept-new-key` | Re-pin when a valid signature is under a key different from an existing pin. A missing pin fails closed on product Apply. |
 
 ## 5. Is signing optional?
@@ -154,10 +154,12 @@ Yes — layered, and fail-closed where it matters:
 - **Producing:** optional. No `[distro.signing]` / no `--key` → an
   unsigned distro. Local development (`astrid init --distro ./Distro.toml`) stays
   frictionless.
-- **Consuming ordinary artifacts:** fail-closed by default. A
-  sealed/remote artifact with no signature is **refused** unless the
+- **Consuming unsigned `.shuttle`:** fail-closed by default. An
+  ordinary `.shuttle` that ships no signature is **refused** unless the
   operator passes `--allow-unsigned`. Skipping signing never silently
-  weakens trust — it forces the consumer to opt into the risk.
+  weakens this path — it forces the consumer to opt into the risk.
+- **Plain `Distro.toml` init:** remains unsigned by design. It does not
+  consult `--allow-unsigned`.
 - **Product Apply:** signed-only. `--allow-unsigned` is rejected, and a
   signed artifact is installed only when its key already matches the
   operator-installed pin. Product Apply performs no TOFU.
