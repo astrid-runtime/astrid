@@ -174,16 +174,7 @@ pub(crate) async fn install_from_shuttle(
 }
 
 /// Decide whether an unsigned shuttle may proceed to the warning path.
-///
-/// The official-id gate comes first because `--allow-unsigned` is an
-/// escape for third-party development artifacts only.
 fn unsigned_shuttle_may_install(distro_id: &str, opts: &InitOpts) -> anyhow::Result<()> {
-    if trust::is_official_distro_id(distro_id) {
-        bail!(
-            "official distro '{distro_id}' cannot be installed from an unsigned .shuttle; \
-             --allow-unsigned is not accepted"
-        );
-    }
     if !opts.allow_unsigned {
         bail!(
             "shuttle for '{distro_id}' is unsigned (no [distro.signing] or Distro.sig) — \
@@ -337,13 +328,6 @@ fn report_trust(outcome: &trust::TrustOutcome) {
         trust::TrustAction::PinnedMatch => {
             format!("signature verified against pinned key {}", outcome.key_str)
         },
-        trust::TrustAction::OfficialPinned => {
-            format!("verified and pinned official key {}", outcome.key_str)
-        },
-        trust::TrustAction::ToFuTrusted => format!(
-            "trusting key {} on first use — verify it out of band",
-            outcome.key_str
-        ),
         trust::TrustAction::NewKeyAccepted => {
             format!(
                 "re-pinned to new key {} (--accept-new-key)",
@@ -533,21 +517,6 @@ mod tests {
         // against, so a missing manifest_hash is acceptable.
         let lock = lock_with_manifest_hash(None);
         assert!(check_manifest_binding("test", false, &lock, b"anything").is_ok());
-    }
-
-    #[test]
-    fn unsigned_official_shuttle_refuses_allow_unsigned() {
-        let opts = InitOpts {
-            allow_unsigned: true,
-            ..Default::default()
-        };
-
-        let err = unsigned_shuttle_may_install("unicity-ce", &opts).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("cannot be installed from an unsigned .shuttle"),
-            "got: {err}"
-        );
     }
 
     #[test]

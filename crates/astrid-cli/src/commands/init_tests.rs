@@ -178,7 +178,9 @@ fn distro_source_resolution_full_url() {
 
 use super::super::distro::manifest::{DistroCapsule, VariableDef};
 
-fn signed_source_fixture(dir: &std::path::Path) -> (std::path::PathBuf, Vec<u8>, String) {
+fn signed_source_fixture(
+    dir: &std::path::Path,
+) -> (std::path::PathBuf, Vec<u8>, String, astrid_crypto::KeyPair) {
     let keypair = astrid_crypto::KeyPair::generate();
     let pubkey = super::super::distro::sign::pubkey_to_wire(&keypair.export_public_key());
     let bytes = format!(
@@ -213,14 +215,22 @@ fn signed_source_fixture(dir: &std::path::Path) -> (std::path::PathBuf, Vec<u8>,
     )
     .unwrap();
     std::fs::write(dir.join("Distro.sig"), sig).unwrap();
-    (dir.join("Distro.toml"), bytes, manifest_hash)
+    (dir.join("Distro.toml"), bytes, manifest_hash, keypair)
+}
+
+fn seed_pin(home: &AstridHome, keypair: &astrid_crypto::KeyPair) {
+    let trust_dir = home.root().join("trust");
+    std::fs::create_dir_all(&trust_dir).unwrap();
+    let pubkey = super::super::distro::sign::pubkey_to_wire(&keypair.export_public_key());
+    std::fs::write(trust_dir.join("test.pub"), format!("{pubkey}\n")).unwrap();
 }
 
 #[test]
 fn product_source_prepares_signed_distro_toml_without_shuttle_suffix() {
     let dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(dir.path().join("home"));
-    let (source, bytes, expected_hash) = signed_source_fixture(dir.path());
+    let (source, bytes, expected_hash, keypair) = signed_source_fixture(dir.path());
+    seed_pin(&home, &keypair);
     let opts = InitOpts {
         require_signed: true,
         offline: true,
@@ -241,6 +251,64 @@ fn product_source_prepares_signed_distro_toml_without_shuttle_suffix() {
     assert_eq!(
         bundle.lock.manifest_hash.as_deref(),
         Some(expected_hash.as_str())
+    );
+}
+
+#[test]
+fn product_source_missing_pin_fails_closed_without_writing_a_pin() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path().join("home"));
+    let (source, _, _, _) = signed_source_fixture(dir.path());
+
+    for accept_new_key in [false, true] {
+        let opts = InitOpts {
+            require_signed: true,
+            offline: true,
+            accept_new_key,
+            ..Default::default()
+        };
+
+        let error = futures::executor::block_on(super::signed_source::prepare_distro_source(
+            source.to_str().unwrap(),
+            &opts,
+            &home,
+        ))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("no signing-key pin"),
+            "got: {error:#}"
+        );
+    }
+    assert!(!home.root().join("trust").join("test.pub").exists());
+}
+
+#[test]
+fn product_source_rotates_only_an_existing_differing_pin() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path().join("home"));
+    let (source, _, _, keypair) = signed_source_fixture(dir.path());
+    seed_pin(&home, &astrid_crypto::KeyPair::generate());
+    let opts = InitOpts {
+        require_signed: true,
+        offline: true,
+        accept_new_key: true,
+        ..Default::default()
+    };
+
+    futures::executor::block_on(super::signed_source::prepare_distro_source(
+        source.to_str().unwrap(),
+        &opts,
+        &home,
+    ))
+    .unwrap();
+
+    let rotated = std::fs::read_to_string(home.root().join("trust").join("test.pub")).unwrap();
+    assert_eq!(
+        rotated,
+        format!(
+            "{}\n",
+            super::super::distro::sign::pubkey_to_wire(&keypair.export_public_key())
+        )
     );
 }
 
@@ -270,38 +338,10 @@ fn product_source_rejects_unsigned_distro_toml_before_install_state() {
 }
 
 #[test]
-fn official_distro_rejects_unsigned_distro_toml() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path().join("home"));
-    std::fs::write(
-        dir.path().join("Distro.toml"),
-        "schema-version = 1\n\n[distro]\nid = \"unicity-ce\"\nname = \"Unicity CE\"\nversion = \"0.1.0\"\n\n\
-         [[capsule]]\nname = \"cli\"\nsource = \"@org/cli\"\nversion = \"0.1.0\"\nrole = \"uplink\"\n",
-    )
-    .unwrap();
-    let opts = InitOpts {
-        require_signed: false,
-        offline: true,
-        ..Default::default()
-    };
-
-    let error = futures::executor::block_on(super::signed_source::prepare_distro_source(
-        dir.path().join("Distro.toml").to_str().unwrap(),
-        &opts,
-        &home,
-    ))
-    .unwrap_err();
-    assert!(
-        error.to_string().contains("official distro 'unicity-ce'"),
-        "got: {error:#}"
-    );
-}
-
-#[test]
 fn product_source_rejects_tampered_distro_toml_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(dir.path().join("home"));
-    let (source, bytes, _) = signed_source_fixture(dir.path());
+    let (source, bytes, _, _) = signed_source_fixture(dir.path());
     let mut tampered = bytes.clone();
     tampered.extend_from_slice(b"\n# tampered after sealing\n");
     std::fs::write(&source, tampered).unwrap();
@@ -327,7 +367,7 @@ fn product_source_rejects_tampered_distro_toml_bytes() {
 fn product_source_rejects_tampered_signature() {
     let dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(dir.path().join("home"));
-    let (source, _, _) = signed_source_fixture(dir.path());
+    let (source, _, _, _) = signed_source_fixture(dir.path());
     std::fs::write(dir.path().join("Distro.sig"), "00").unwrap();
     let opts = InitOpts {
         require_signed: true,
@@ -348,7 +388,7 @@ fn product_source_rejects_tampered_signature() {
 fn signed_lock_cannot_add_undeclared_member() {
     let dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(dir.path().join("home"));
-    let (source, bytes, expected_hash) = signed_source_fixture(dir.path());
+    let (source, bytes, expected_hash, _) = signed_source_fixture(dir.path());
     let keypair = astrid_crypto::KeyPair::generate();
     let lock = super::super::distro::lock::DistroLock {
         schema_version: 1,
