@@ -35,6 +35,8 @@
 #![deny(clippy::unwrap_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+/// Pre-mount client configuration.
+pub mod client;
 /// Environment variable fallback resolution.
 pub mod env;
 /// Configuration error types.
@@ -51,6 +53,7 @@ pub mod types;
 pub mod validate;
 
 // Re-export primary types at the crate root.
+pub use client::{ClientConfig, MAX_RUN_IDLE_TIMEOUT_SECS};
 pub use error::{ConfigError, ConfigResult};
 pub use show::{ResolvedConfig, ShowFormat};
 pub use types::*;

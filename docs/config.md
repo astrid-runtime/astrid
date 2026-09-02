@@ -227,6 +227,40 @@ idle_secs = 3600
 daemon_ready_secs = 600
 ```
 
+Capsule HTTP controls remain independent. `[http].default_timeout_secs` sets
+the buffered request default; a capsule request's `total-ms` sets that
+request's whole-response budget. `[http].header_deadline_secs` and
+`first-byte-ms` cover time to response headers, while
+`[http].stream_read_timeout_secs` and `between-bytes-ms` cover gaps between
+response bytes.
+
+## Client Configuration
+
+`astrid run`'s no-message idle timeout is client behavior, not runtime policy.
+It loads from an isolated pre-mount TOML file and never parses the full runtime
+configuration. The canonical AOS location is
+`~/.aos/etc/astrid/client.toml`; set `ASTRID_CLIENT_CONFIG_PATH` to select a
+different absolute path. The path must be a current-user-owned, mode `0600`
+regular file with no redirects.
+
+```toml
+run_idle_secs = 120
+```
+
+The default remains 120 seconds and values must be between 1 and 86400
+seconds. `--idle-timeout-secs` has the highest precedence and bypasses client
+file parsing. Workspace and runtime configuration cannot set or raise this
+timeout.
+
+The idle deadline applies only to gaps between messages belonging to the active
+run. Chat responses and `agent.v1.stream.delta` frames must carry the matching
+session; unattributed control frames cannot extend the run. Headless approval
+requests cannot be correlated in production, so they are ignored without an
+approval response and cannot extend the run. `--yes`, `--yolo`, and
+`--autonomous` are rejected before headless execution. Disconnect and approval
+sends use a bounded best-effort budget so a wedged socket cannot defer the
+established timeout result indefinitely.
+
 ## Sessions
 
 Manage session persistence and limits.
