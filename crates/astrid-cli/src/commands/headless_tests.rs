@@ -190,6 +190,84 @@ async fn session_raw_json_stream_delta_is_active_run_traffic() {
 }
 
 #[tokio::test]
+async fn typed_stream_deltas_reconcile_with_remainder_terminal() {
+    let session_id = SessionId::from_uuid(Uuid::new_v4());
+    let mut source = DeterministicSource::new([
+        ReadStep::Message(Box::new(response_on_topic(
+            Topic::agent_stream_delta(),
+            "partial ",
+            false,
+            &session_id,
+        ))),
+        ReadStep::Message(Box::new(response_on_topic(
+            Topic::agent_stream_delta(),
+            "streamed",
+            false,
+            &session_id,
+        ))),
+        ReadStep::Message(Box::new(response(" remainder", true, &session_id))),
+    ]);
+    let (text, _) = collect_response(
+        &mut source,
+        &session_id,
+        formatter::OutputFormat::Json,
+        Duration::from_millis(1),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(text, "partial streamed remainder");
+}
+
+#[tokio::test]
+async fn typed_stream_deltas_reconcile_with_empty_remainder_terminal() {
+    let session_id = SessionId::from_uuid(Uuid::new_v4());
+    let mut source = DeterministicSource::new([
+        ReadStep::Message(Box::new(response_on_topic(
+            Topic::agent_stream_delta(),
+            "partial streamed",
+            false,
+            &session_id,
+        ))),
+        ReadStep::Message(Box::new(response("", true, &session_id))),
+    ]);
+    let (text, _) = collect_response(
+        &mut source,
+        &session_id,
+        formatter::OutputFormat::Json,
+        Duration::from_millis(1),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(text, "partial streamed");
+}
+
+#[tokio::test]
+async fn final_typed_delta_topic_frame_is_not_a_terminal() {
+    let session_id = SessionId::from_uuid(Uuid::new_v4());
+    let mut source = DeterministicSource::new([
+        ReadStep::Message(Box::new(response_on_topic(
+            Topic::agent_stream_delta(),
+            "injected terminal",
+            true,
+            &session_id,
+        ))),
+        ReadStep::Message(Box::new(response("done", true, &session_id))),
+    ]);
+    let (text, _) = collect_response(
+        &mut source,
+        &session_id,
+        formatter::OutputFormat::Json,
+        Duration::from_millis(1),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(text, "done");
+}
+
+#[tokio::test]
 async fn raw_json_terminal_response_surfaces_text_and_finalizes() {
     let session_id = SessionId::from_uuid(Uuid::new_v4());
     let mut source = DeterministicSource::new([
@@ -420,6 +498,19 @@ fn only_session_correlated_payloads_can_reset_the_timer() {
     ));
     assert!(is_active_run_message(
         &stream_delta(&session_id, "partial"),
+        &session_id
+    ));
+    assert!(is_active_run_message(
+        &response_on_topic(Topic::agent_stream_delta(), "delta", false, &session_id),
+        &session_id
+    ));
+    assert!(!is_active_run_message(
+        &response_on_topic(
+            Topic::agent_stream_delta(),
+            "final delta",
+            true,
+            &session_id
+        ),
         &session_id
     ));
     assert!(is_active_run_message(

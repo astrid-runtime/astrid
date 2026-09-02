@@ -428,10 +428,20 @@ fn is_active_run_message(
 
     match &message.payload {
         astrid_types::ipc::IpcPayload::AgentResponse {
-            session_id: target, ..
+            is_final,
+            session_id: target,
+            ..
         } => {
-            message.topic.as_str() == astrid_types::Topic::agent_response().as_str()
-                && target == &session_id.0.to_string()
+            if target != &session_id.0.to_string() {
+                return false;
+            }
+            if message.topic.as_str() == astrid_types::Topic::agent_response().as_str() {
+                return true;
+            }
+            // Typed deltas are active-run traffic only while non-final; a
+            // final frame on the delta topic is never a terminal.
+            message.topic.as_str() == astrid_types::Topic::agent_stream_delta().as_str()
+                && !is_final
         },
         astrid_types::ipc::IpcPayload::RawJson(value) => {
             if !raw_json_session_matches(value, session_id) {
