@@ -42,15 +42,33 @@ impl ResponseSource for DeterministicSource {
     }
 }
 
-fn response(text: &str, is_final: bool, session_id: &SessionId) -> IpcMessage {
+fn response_on_topic(
+    topic: Topic,
+    text: &str,
+    is_final: bool,
+    session_id: &SessionId,
+) -> IpcMessage {
     IpcMessage::new(
-        Topic::agent_response(),
+        topic,
         IpcPayload::AgentResponse {
             text: text.to_owned(),
             is_final,
             session_id: session_id.0.to_string(),
         },
         session_id.0,
+    )
+}
+
+fn response(text: &str, is_final: bool, session_id: &SessionId) -> IpcMessage {
+    response_on_topic(Topic::agent_response(), text, is_final, session_id)
+}
+
+fn spoofed_response(text: &str, is_final: bool, session_id: &SessionId) -> IpcMessage {
+    response_on_topic(
+        Topic::from_raw("astrid.v1.response.spoof"),
+        text,
+        is_final,
+        session_id,
     )
 }
 
@@ -141,6 +159,26 @@ async fn session_raw_json_stream_delta_is_active_run_traffic() {
     .unwrap();
 
     assert_eq!(text, "done");
+}
+
+#[tokio::test]
+async fn spoofed_typed_response_is_not_active_run_traffic() {
+    let session_id = SessionId::from_uuid(Uuid::new_v4());
+    let mut source = DeterministicSource::new([
+        ReadStep::Message(Box::new(spoofed_response("injected", true, &session_id))),
+        ReadStep::Timeout,
+    ]);
+    let error = collect_response(
+        &mut source,
+        &session_id,
+        formatter::OutputFormat::Json,
+        Duration::from_millis(1),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, HeadlessError::IdleTimeout { .. }));
+    assert!(source.sent.is_empty());
 }
 
 #[tokio::test]
@@ -307,6 +345,10 @@ fn only_session_correlated_payloads_can_reset_the_timer() {
 
     assert!(is_active_run_message(
         &response("active", false, &session_id),
+        &session_id
+    ));
+    assert!(!is_active_run_message(
+        &spoofed_response("injected", false, &session_id),
         &session_id
     ));
     assert!(is_active_run_message(

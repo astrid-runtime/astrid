@@ -43,7 +43,11 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
     let headless_route = cli.prompt.is_some()
         || (cli.command.is_none() && !std::io::stdin().is_terminal())
         || matches!(cli.command, Some(Commands::Run(_)));
-    ensure_headless_auto_approve_rejected(cli.auto_approve, headless_route)?;
+    let run_auto_approve = matches!(
+        &cli.command,
+        Some(Commands::Run(args)) if args.auto_approve
+    );
+    ensure_headless_auto_approve_rejected(cli.auto_approve || run_auto_approve, headless_route)?;
 
     if should_check_for_update(&cli) {
         commands::self_update::print_update_banner().await;

@@ -416,7 +416,10 @@ fn is_active_run_message(
     match &message.payload {
         astrid_types::ipc::IpcPayload::AgentResponse {
             session_id: target, ..
-        } => target == &session_id.0.to_string(),
+        } => {
+            message.topic.as_str() == astrid_types::Topic::agent_response().as_str()
+                && target == &session_id.0.to_string()
+        },
         astrid_types::ipc::IpcPayload::RawJson(value) => {
             message.topic.as_str() == astrid_types::Topic::agent_stream_delta().as_str()
                 && value.get("session_id").and_then(serde_json::Value::as_str)
