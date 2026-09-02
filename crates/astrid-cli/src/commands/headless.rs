@@ -373,6 +373,19 @@ async fn collect_response(
                     break;
                 }
             },
+            astrid_types::ipc::IpcPayload::RawJson(value)
+                if message.topic.as_str() == astrid_types::Topic::agent_response().as_str() =>
+            {
+                let text = raw_json_response_text(value).unwrap_or_default();
+                if format == formatter::OutputFormat::Pretty {
+                    print!("{text}");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+                response_text.push_str(text);
+                if raw_json_response_is_final(value) {
+                    break;
+                }
+            },
             astrid_types::ipc::IpcPayload::LlmStreamEvent {
                 event: astrid_types::llm::StreamEvent::ToolCallStart { id, name },
                 ..
@@ -421,9 +434,13 @@ fn is_active_run_message(
                 && target == &session_id.0.to_string()
         },
         astrid_types::ipc::IpcPayload::RawJson(value) => {
-            message.topic.as_str() == astrid_types::Topic::agent_stream_delta().as_str()
-                && value.get("session_id").and_then(serde_json::Value::as_str)
-                    == Some(session_id.0.to_string().as_str())
+            if !raw_json_session_matches(value, session_id) {
+                return false;
+            }
+            let topic = message.topic.as_str();
+            topic == astrid_types::Topic::agent_stream_delta().as_str()
+                || (topic == astrid_types::Topic::agent_response().as_str()
+                    && raw_json_response_is_final(value))
         },
         astrid_types::ipc::IpcPayload::LlmStreamEvent { .. }
         | astrid_types::ipc::IpcPayload::ToolExecuteResult { .. } => {
@@ -431,6 +448,27 @@ fn is_active_run_message(
         },
         _ => false,
     }
+}
+
+/// Cross-runtime producers may send the native chat wire shape instead of a
+/// typed `AgentResponse`; the raw fields mirror the typed response fields.
+fn raw_json_session_matches(
+    value: &serde_json::Value,
+    session_id: &astrid_core::SessionId,
+) -> bool {
+    value.get("session_id").and_then(serde_json::Value::as_str)
+        == Some(session_id.0.to_string().as_str())
+}
+
+fn raw_json_response_text(value: &serde_json::Value) -> Option<&str> {
+    value.get("text").and_then(serde_json::Value::as_str)
+}
+
+fn raw_json_response_is_final(value: &serde_json::Value) -> bool {
+    value
+        .get("is_final")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

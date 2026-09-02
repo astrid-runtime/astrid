@@ -63,11 +63,39 @@ fn response(text: &str, is_final: bool, session_id: &SessionId) -> IpcMessage {
     response_on_topic(Topic::agent_response(), text, is_final, session_id)
 }
 
+fn raw_json_on_topic(topic: Topic, value: serde_json::Value, session_id: &SessionId) -> IpcMessage {
+    IpcMessage::new(topic, IpcPayload::RawJson(value), session_id.0)
+}
+
+fn raw_json_response(text: &str, is_final: bool, session_id: &SessionId) -> IpcMessage {
+    raw_json_on_topic(
+        Topic::agent_response(),
+        serde_json::json!({
+            "session_id": session_id.0.to_string(),
+            "text": text,
+            "is_final": is_final,
+        }),
+        session_id,
+    )
+}
+
 fn spoofed_response(text: &str, is_final: bool, session_id: &SessionId) -> IpcMessage {
     response_on_topic(
         Topic::from_raw("astrid.v1.response.spoof"),
         text,
         is_final,
+        session_id,
+    )
+}
+
+fn spoofed_raw_json_response(session_id: &SessionId) -> IpcMessage {
+    raw_json_on_topic(
+        Topic::from_raw("astrid.v1.response.spoof"),
+        serde_json::json!({
+            "session_id": session_id.0.to_string(),
+            "text": "injected",
+            "is_final": true,
+        }),
         session_id,
     )
 }
@@ -162,10 +190,49 @@ async fn session_raw_json_stream_delta_is_active_run_traffic() {
 }
 
 #[tokio::test]
+async fn raw_json_terminal_response_surfaces_text_and_finalizes() {
+    let session_id = SessionId::from_uuid(Uuid::new_v4());
+    let mut source = DeterministicSource::new([
+        ReadStep::Message(Box::new(raw_json_response("hello", true, &session_id))),
+        ReadStep::Timeout,
+    ]);
+    let (text, _) = collect_response(
+        &mut source,
+        &session_id,
+        formatter::OutputFormat::Json,
+        Duration::from_millis(1),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(text, "hello");
+}
+
+#[tokio::test]
 async fn spoofed_typed_response_is_not_active_run_traffic() {
     let session_id = SessionId::from_uuid(Uuid::new_v4());
     let mut source = DeterministicSource::new([
         ReadStep::Message(Box::new(spoofed_response("injected", true, &session_id))),
+        ReadStep::Timeout,
+    ]);
+    let error = collect_response(
+        &mut source,
+        &session_id,
+        formatter::OutputFormat::Json,
+        Duration::from_millis(1),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, HeadlessError::IdleTimeout { .. }));
+    assert!(source.sent.is_empty());
+}
+
+#[tokio::test]
+async fn spoofed_raw_json_response_is_not_active_run_traffic() {
+    let session_id = SessionId::from_uuid(Uuid::new_v4());
+    let mut source = DeterministicSource::new([
+        ReadStep::Message(Box::new(spoofed_raw_json_response(&session_id))),
         ReadStep::Timeout,
     ]);
     let error = collect_response(
@@ -353,6 +420,18 @@ fn only_session_correlated_payloads_can_reset_the_timer() {
     ));
     assert!(is_active_run_message(
         &stream_delta(&session_id, "partial"),
+        &session_id
+    ));
+    assert!(is_active_run_message(
+        &raw_json_response("done", true, &session_id),
+        &session_id
+    ));
+    assert!(!is_active_run_message(
+        &raw_json_response("not terminal", false, &session_id),
+        &session_id
+    ));
+    assert!(!is_active_run_message(
+        &spoofed_raw_json_response(&session_id),
         &session_id
     ));
     assert!(!is_active_run_message(
