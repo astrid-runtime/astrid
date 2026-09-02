@@ -16,7 +16,7 @@ From highest to lowest priority:
 1. **Workspace** (`{workspace}/.astrid/config.toml`) - untrusted input, restricted
 2. **User** (`~/.astrid/config.toml`)
 3. **System** (`/etc/astrid/config.toml`)
-4. **Environment variables** (`ASTRID_*`, `ANTHROPIC_*`) - fallback only, applied to fields no config file set
+4. **Environment variables** (`ASTRID_*`) - fallback only, applied to fields no config file set
 5. **Embedded defaults** (`defaults.toml` compiled into the binary)
 
 ## Workspace restriction enforcement
@@ -27,22 +27,25 @@ After merging the workspace layer, a hard enforcement pass runs against the pre-
 - **Security can only tighten.** `require_signatures` can only become true; `approval_timeout_secs` can only decrease; `workspace.mode` and `escape_policy` can only move to a stricter level.
 - **Deny-lists can only grow.** Workspace can add to `workspace.never_allow` but cannot remove entries.
 - **Allow-lists cannot expand.** Workspace cannot add entries to `workspace.auto_allow_read` or `auto_allow_write`.
-- **API keys cannot be overridden.** `model.api_key` and `model.api_url` from workspace are reverted.
 - **Server injection blocked.** Workspace cannot add new MCP server definitions.
 
 Violations are logged and silently reverted. The agent never sees the hostile values.
 
 ## Variable expansion
 
-`${VAR}` references in workspace config are restricted to `ASTRID_*` and `ANTHROPIC_*` prefixes. `${AWS_SECRET_ACCESS_KEY}` is left unresolved. This prevents a workspace config from exfiltrating arbitrary environment variables into fields the agent can read.
+`${VAR}` references in workspace config are restricted to the `ASTRID_*` prefix. `${AWS_SECRET_ACCESS_KEY}` and provider credentials such as `ANTHROPIC_API_KEY` are left unresolved. This prevents a workspace config from exfiltrating arbitrary environment variables into fields the agent can read.
+
+## Model ownership
+
+Host configuration has no `[model]` section. Model selection and provider execution belong to principal-scoped capsules, their capsule `[env]` configuration, and the model registry. A legacy host `[model]` table fails loading with migration guidance instead of being ignored.
 
 ## Validation
 
-Post-merge validation checks: supported providers (`claude`, `openai`, `openai-compat`, `zai`, `unknown`), temperature range (0.0-1.0), token bounds (1-16M), budget invariants (per-action cannot exceed session), zero-value timeout guards, and valid enum strings.
+Post-merge validation checks: budget invariants (per-action cannot exceed session), zero-value timeout guards, and valid enum strings.
 
 ## Credential redaction
 
-`ModelConfig` has a custom `Serialize` that omits `api_key` and `api_url`. `Debug` replaces credential values with presence booleans. `ServerSection` redacts environment variable values. Credentials never appear in logs, config dumps, or serialized output.
+`ServerSection` redacts environment variable values. Credentials never appear in logs, config dumps, or serialized output.
 
 ## Field-level provenance
 
@@ -52,7 +55,7 @@ Post-merge validation checks: supported providers (`claude`, `openai`, `openai-c
 
 | Type | Role |
 |---|---|
-| `Config` | Root struct. 21 sections: model, runtime, security, budget, rate_limits, servers, audit, keys, workspace, git, hooks, logging, gateway, timeouts, sessions, subagents, retry, spark, uplinks, identity. |
+| `Config` | Root struct. 20 sections: runtime, security, budget, rate_limits, servers, audit, keys, workspace, git, hooks, logging, gateway, timeouts, sessions, subagents, retry, spark, uplinks, identity. |
 | `Config::load(workspace_root)` | Full precedence chain with restriction enforcement and validation. |
 | `Config::load_with_home(workspace_root, astrid_home)` | Explicit home override for tests and containers. |
 | `ResolvedConfig` | `Config` + `FieldSources` + list of loaded file paths. |

@@ -8,15 +8,15 @@ fn layered_values_preserve_datetime_and_stable_text() {
         [metadata]
         created = 1979-05-27T00:32:00-07:00
 
-        [model]
-        provider = "claude"
+        [runtime]
+        system_prompt = "base"
     "#,
     )
     .unwrap();
     let overlay: toml::Value = toml::from_str(
         r"
-        [model]
-        max_tokens = 8192
+        [runtime]
+        keep_recent_count = 3
     ",
     )
     .unwrap();
@@ -37,9 +37,9 @@ fn layered_values_preserve_datetime_and_stable_text() {
             "[metadata]\n",
             "created = 1979-05-27T00:32:00-07:00\n",
             "\n",
-            "[model]\n",
-            "max_tokens = 8192\n",
-            "provider = \"claude\"\n",
+            "[runtime]\n",
+            "keep_recent_count = 3\n",
+            "system_prompt = \"base\"\n",
         )
     );
 }
@@ -48,17 +48,17 @@ fn layered_values_preserve_datetime_and_stable_text() {
 fn test_deep_merge_scalars() {
     let mut base: toml::Value = toml::from_str(
         r#"
-        [model]
-        provider = "claude"
-        max_tokens = 4096
+        [runtime]
+        system_prompt = "base"
+        keep_recent_count = 10
     "#,
     )
     .unwrap();
 
     let overlay: toml::Value = toml::from_str(
         r"
-        [model]
-        max_tokens = 8192
+        [runtime]
+        keep_recent_count = 3
     ",
     )
     .unwrap();
@@ -66,25 +66,25 @@ fn test_deep_merge_scalars() {
     deep_merge(&mut base, &overlay);
 
     let table = base.as_table().unwrap();
-    let model = table["model"].as_table().unwrap();
-    assert_eq!(model["provider"].as_str().unwrap(), "claude");
-    assert_eq!(model["max_tokens"].as_integer().unwrap(), 8192);
+    let runtime = table["runtime"].as_table().unwrap();
+    assert_eq!(runtime["system_prompt"].as_str().unwrap(), "base");
+    assert_eq!(runtime["keep_recent_count"].as_integer().unwrap(), 3);
 }
 
 #[test]
 fn test_deep_merge_new_keys() {
     let mut base: toml::Value = toml::from_str(
         r#"
-        [model]
-        provider = "claude"
+        [runtime]
+        system_prompt = "base"
     "#,
     )
     .unwrap();
 
     let overlay: toml::Value = toml::from_str(
         r#"
-        [model]
-        api_key = "sk-test"
+        [logging]
+        level = "debug"
         [budget]
         session_max_usd = 50.0
     "#,
@@ -94,8 +94,8 @@ fn test_deep_merge_new_keys() {
     deep_merge(&mut base, &overlay);
 
     let table = base.as_table().unwrap();
-    let model = table["model"].as_table().unwrap();
-    assert_eq!(model["api_key"].as_str().unwrap(), "sk-test");
+    let logging = table["logging"].as_table().unwrap();
+    assert_eq!(logging["level"].as_str().unwrap(), "debug");
     assert!(table.contains_key("budget"));
 }
 
@@ -103,17 +103,17 @@ fn test_deep_merge_new_keys() {
 fn test_deep_merge_tracking() {
     let mut base: toml::Value = toml::from_str(
         r#"
-        [model]
-        provider = "claude"
-        max_tokens = 4096
+        [runtime]
+        system_prompt = "base"
+        keep_recent_count = 10
     "#,
     )
     .unwrap();
 
     let overlay: toml::Value = toml::from_str(
         r"
-        [model]
-        max_tokens = 8192
+        [runtime]
+        keep_recent_count = 3
     ",
     )
     .unwrap();
@@ -121,8 +121,11 @@ fn test_deep_merge_tracking() {
     let mut sources = FieldSources::new();
     deep_merge_tracking(&mut base, &overlay, "", &ConfigLayer::User, &mut sources);
 
-    assert_eq!(sources.get("model.max_tokens"), Some(&ConfigLayer::User));
-    assert!(!sources.contains_key("model.provider"));
+    assert_eq!(
+        sources.get("runtime.keep_recent_count"),
+        Some(&ConfigLayer::User)
+    );
+    assert!(!sources.contains_key("runtime.system_prompt"));
 }
 
 // ---- Original restriction tests ----
@@ -377,57 +380,6 @@ fn test_approval_timeout_cannot_increase() {
 }
 
 #[test]
-fn test_api_key_cannot_be_overridden_by_workspace() {
-    let baseline: toml::Value = toml::from_str(
-        r#"
-        [model]
-        api_key = "sk-real-key"
-    "#,
-    )
-    .unwrap();
-
-    let workspace: toml::Value = toml::from_str(
-        r#"
-        [model]
-        api_key = "sk-malicious-key"
-    "#,
-    )
-    .unwrap();
-
-    let mut merged = baseline.clone();
-    deep_merge(&mut merged, &workspace);
-    enforce_restrictions(&mut merged, &baseline, &workspace);
-
-    assert_eq!(merged["model"]["api_key"].as_str().unwrap(), "sk-real-key");
-}
-
-#[test]
-fn test_api_url_cannot_be_overridden_by_workspace() {
-    let baseline: toml::Value = toml::from_str(
-        r#"
-        [model]
-        provider = "claude"
-    "#,
-    )
-    .unwrap();
-
-    let workspace: toml::Value = toml::from_str(
-        r#"
-        [model]
-        api_url = "https://evil-proxy.com"
-    "#,
-    )
-    .unwrap();
-
-    let mut merged = baseline.clone();
-    deep_merge(&mut merged, &workspace);
-    enforce_restrictions(&mut merged, &baseline, &workspace);
-
-    // api_url should have been removed since baseline didn't have it.
-    assert!(merged["model"].as_table().unwrap().get("api_url").is_none());
-}
-
-#[test]
 fn test_capsule_local_egress_cannot_be_set_by_workspace() {
     // A widening SSRF-airlock exemption must be operator-only: a workspace
     // layer cannot introduce it.
@@ -499,7 +451,7 @@ fn test_capsule_local_egress_workspace_cannot_widen_operator_value() {
 
 #[test]
 fn test_uplinks_cannot_be_introduced_by_workspace() {
-    let baseline: toml::Value = toml::from_str("[model]\nprovider = \"unknown\"\n").unwrap();
+    let baseline: toml::Value = toml::from_str("[runtime]\nsystem_prompt = \"base\"\n").unwrap();
     let workspace: toml::Value = toml::from_str(
         r#"
         [[uplinks]]
@@ -1095,7 +1047,7 @@ fn test_allow_command_hooks_cannot_enable() {
 
 #[test]
 fn test_set_nested_no_panic_on_missing_table() {
-    let mut val: toml::Value = toml::from_str("[model]\nprovider = \"unknown\"").unwrap();
+    let mut val: toml::Value = toml::from_str("[runtime]\nsystem_prompt = \"base\"").unwrap();
     // This should not panic — the intermediate "nonexistent" table is missing.
     set_nested(
         &mut val,
@@ -1103,5 +1055,5 @@ fn test_set_nested_no_panic_on_missing_table() {
         toml::Value::Boolean(true),
     );
     // Value should be unchanged.
-    assert_eq!(val["model"]["provider"].as_str().unwrap(), "unknown");
+    assert_eq!(val["runtime"]["system_prompt"].as_str().unwrap(), "base");
 }

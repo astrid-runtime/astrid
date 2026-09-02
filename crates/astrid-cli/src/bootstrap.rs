@@ -15,6 +15,9 @@ use crate::formatter::OutputFormat;
 use crate::socket_client;
 use crate::theme;
 
+/// The host owns no model identity. Registry IPC owns the first real label.
+const INITIAL_TUI_MODEL_LABEL: &str = "";
+
 /// Ensure `~/.astrid/` exists without selecting product composition.
 #[allow(clippy::unused_async)]
 pub(crate) async fn ensure_global_config() -> Result<()> {
@@ -253,19 +256,17 @@ pub(crate) async fn run_or_connect(
         },
     };
 
-    let model_name = astrid_config::Config::load_with_layout(
-        workspace_root.as_deref(),
-        crate::workspace_layout::current(),
-    )
-    .ok()
-    .map_or_else(|| "unknown".to_string(), |r| r.config.model.model);
-
-    crate::commands::chat::run_chat(&mut client, &session_id, &model_name, format).await
+    crate::commands::chat::run_chat(&mut client, &session_id, INITIAL_TUI_MODEL_LABEL, format).await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::selected_workspace_root;
+    use super::{INITIAL_TUI_MODEL_LABEL, selected_workspace_root};
+
+    #[test]
+    fn interactive_tui_starts_without_a_host_model_label() {
+        assert_eq!(INITIAL_TUI_MODEL_LABEL, "");
+    }
 
     #[test]
     fn explicit_workspace_root_wins_over_current_directory() {

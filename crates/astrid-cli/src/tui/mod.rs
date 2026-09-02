@@ -4,6 +4,8 @@
 
 pub(crate) mod headless;
 mod input;
+#[cfg(test)]
+mod registry_label_tests;
 mod render;
 pub(crate) mod state;
 mod theme;

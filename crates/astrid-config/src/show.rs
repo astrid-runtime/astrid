@@ -193,7 +193,8 @@ mod tests {
 
         let output = resolved.show(ShowFormat::Toml, None).unwrap();
         assert!(output.contains("Resolved Astrid Configuration"));
-        assert!(output.contains("provider"));
+        assert!(output.contains("max_context_tokens"));
+        assert!(!output.contains("provider"));
     }
 
     #[test]
@@ -217,10 +218,9 @@ mod tests {
             loaded_files: Vec::new(),
         };
 
-        let output = resolved.show(ShowFormat::Toml, Some("model")).unwrap();
-        assert!(output.contains("unknown"));
-        // Should NOT contain budget or other sections.
-        assert!(!output.contains("session_max_usd"));
+        let result = resolved.show(ShowFormat::Toml, Some("model"));
+
+        assert!(result.is_err());
     }
 
     #[test]

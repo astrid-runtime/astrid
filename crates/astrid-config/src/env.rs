@@ -16,24 +16,8 @@ struct EnvMapping {
     field_path: &'static str,
 }
 
-/// All supported `ASTRID_*` and legacy `ANTHROPIC_*` env var mappings.
+/// All supported `ASTRID_*` env var mappings.
 const ENV_MAPPINGS: &[EnvMapping] = &[
-    EnvMapping {
-        var_name: "ASTRID_MODEL_PROVIDER",
-        field_path: "model.provider",
-    },
-    EnvMapping {
-        var_name: "ASTRID_MODEL_API_KEY",
-        field_path: "model.api_key",
-    },
-    EnvMapping {
-        var_name: "ASTRID_MODEL_API_URL",
-        field_path: "model.api_url",
-    },
-    EnvMapping {
-        var_name: "ASTRID_MODEL",
-        field_path: "model.model",
-    },
     EnvMapping {
         var_name: "ASTRID_LOG_LEVEL",
         field_path: "logging.level",
@@ -89,25 +73,6 @@ const ENV_MAPPINGS: &[EnvMapping] = &[
         var_name: "ASTRID_RATE_LIMITS_CAPSULE_RELOAD_PER_MIN",
         field_path: "rate_limits.capsule_reload_per_min",
     },
-    // Standard Anthropic SDK env vars.
-    EnvMapping {
-        var_name: "ANTHROPIC_API_KEY",
-        field_path: "model.api_key",
-    },
-    EnvMapping {
-        var_name: "ANTHROPIC_MODEL",
-        field_path: "model.model",
-    },
-    // Z.AI env var.
-    EnvMapping {
-        var_name: "ZAI_API_KEY",
-        field_path: "model.api_key",
-    },
-    // OpenAI env var.
-    EnvMapping {
-        var_name: "OPENAI_API_KEY",
-        field_path: "model.api_key",
-    },
 ];
 
 /// Apply environment variable fallbacks to fields that were **not** set by
@@ -144,7 +109,7 @@ pub fn apply_env_fallbacks<S: ::std::hash::BuildHasher>(
 }
 
 /// Resolve `${VAR}` references in the workspace layer, restricted to only
-/// `ASTRID_*` and `ANTHROPIC_*` prefixed environment variables.
+/// `ASTRID_*` prefixed environment variables.
 ///
 /// This prevents a malicious workspace config from exfiltrating sensitive
 /// env vars like `${AWS_SECRET_ACCESS_KEY}` into fields sent to the LLM.
@@ -154,7 +119,7 @@ pub fn resolve_env_references_restricted<S: ::std::hash::BuildHasher>(
 ) {
     let restricted: HashMap<String, String> = env_vars
         .iter()
-        .filter(|(k, _)| k.starts_with("ASTRID_") || k.starts_with("ANTHROPIC_"))
+        .filter(|(k, _)| k.starts_with("ASTRID_"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     resolve_env_references(val, &restricted);
@@ -274,14 +239,8 @@ fn set_field_from_string(root: &mut toml::Value, path: &str, val: &str) {
 /// based on the field path.
 fn coerce_to_toml_value(path: &str, val: &str) -> toml::Value {
     // Known float fields.
-    if matches!(
-        path,
-        "budget.session_max_usd"
-            | "budget.per_action_max_usd"
-            | "model.pricing.input_per_million"
-            | "model.pricing.output_per_million"
-            | "model.temperature"
-    ) && let Ok(f) = val.parse::<f64>()
+    if matches!(path, "budget.session_max_usd" | "budget.per_action_max_usd")
+        && let Ok(f) = val.parse::<f64>()
     {
         return toml::Value::Float(f);
     }
@@ -289,8 +248,7 @@ fn coerce_to_toml_value(path: &str, val: &str) -> toml::Value {
     // Known integer fields.
     if matches!(
         path,
-        "model.max_tokens"
-            | "security.approval_timeout_secs"
+        "security.approval_timeout_secs"
             | "budget.warn_at_percent"
             | "rate_limits.elicitation_per_server_per_min"
             | "rate_limits.max_pending_requests"
@@ -397,8 +355,8 @@ mod tests {
 
     #[test]
     fn test_coerce_integer() {
-        let v = coerce_to_toml_value("model.max_tokens", "8192");
-        assert_eq!(v.as_integer().unwrap(), 8192);
+        let v = coerce_to_toml_value("security.approval_timeout_secs", "300");
+        assert_eq!(v.as_integer().unwrap(), 300);
     }
 
     #[test]
@@ -409,19 +367,27 @@ mod tests {
 
     #[test]
     fn test_coerce_string_default() {
-        let v = coerce_to_toml_value("model.provider", "openai");
-        assert_eq!(v.as_str().unwrap(), "openai");
+        let v = coerce_to_toml_value("workspace.mode", "safe");
+        assert_eq!(v.as_str().unwrap(), "safe");
     }
 
     #[test]
-    fn test_legacy_anthropic_api_key() {
-        let mut merged: toml::Value = toml::from_str("[model]").unwrap();
+    fn test_provider_api_keys_are_not_host_fallbacks() {
+        let mut merged: toml::Value = toml::from_str("[logging]\nlevel = \"info\"").unwrap();
         let mut sources = FieldSources::new();
-        let env = make_env(&[("ANTHROPIC_API_KEY", "sk-ant-test")]);
+        let env = make_env(&[
+            ("ANTHROPIC_API_KEY", "sk-ant-test"),
+            ("OPENAI_API_KEY", "sk-openai-test"),
+            ("ASTRID_MODEL_PROVIDER", "claude"),
+            ("ASTRID_MODEL_API_KEY", "sk-astrid-test"),
+        ]);
 
-        apply_env_fallbacks(&mut merged, &mut sources, &env);
+        let count = apply_env_fallbacks(&mut merged, &mut sources, &env);
 
-        assert_eq!(merged["model"]["api_key"].as_str().unwrap(), "sk-ant-test");
+        assert_eq!(count, 0);
+        assert!(!merged.as_table().unwrap().contains_key("model"));
+        assert!(!sources.contains_key("model.api_key"));
+        assert!(!sources.contains_key("model.provider"));
     }
 
     // ---- Restricted ${VAR} resolution tests ----
@@ -443,26 +409,29 @@ description = "${HOME}""#,
     #[test]
     fn test_workspace_can_access_astrid_var() {
         let mut val: toml::Value = toml::from_str(
-            r#"[model]
-model = "${ASTRID_MODEL}""#,
+            r#"[runtime]
+            system_prompt = "${ASTRID_NOTE}""#,
         )
         .unwrap();
-        let env = make_env(&[("ASTRID_MODEL", "claude-opus-4-6")]);
+        let env = make_env(&[("ASTRID_NOTE", "hello")]);
         resolve_env_references_restricted(&mut val, &env);
 
-        assert_eq!(val["model"]["model"].as_str().unwrap(), "claude-opus-4-6");
+        assert_eq!(val["runtime"]["system_prompt"].as_str().unwrap(), "hello");
     }
 
     #[test]
-    fn test_workspace_can_access_anthropic_var() {
+    fn test_workspace_cannot_access_anthropic_var() {
         let mut val: toml::Value = toml::from_str(
-            r#"[model]
-api_key = "${ANTHROPIC_API_KEY}""#,
+            r#"[logging]
+            level = "${ANTHROPIC_API_KEY}""#,
         )
         .unwrap();
         let env = make_env(&[("ANTHROPIC_API_KEY", "sk-ant-test")]);
         resolve_env_references_restricted(&mut val, &env);
 
-        assert_eq!(val["model"]["api_key"].as_str().unwrap(), "sk-ant-test");
+        assert_eq!(
+            val["logging"]["level"].as_str().unwrap(),
+            "${ANTHROPIC_API_KEY}"
+        );
     }
 }

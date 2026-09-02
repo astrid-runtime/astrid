@@ -15,7 +15,6 @@ use crate::types::Config;
 ///
 /// Returns the first validation error found.
 pub fn validate(config: &Config) -> ConfigResult<()> {
-    validate_model(config)?;
     validate_budget(config)?;
     validate_workspace(config)?;
     validate_git(config)?;
@@ -27,59 +26,6 @@ pub fn validate(config: &Config) -> ConfigResult<()> {
     validate_retry(config)?;
     validate_audit(config)?;
     validate_rate_limits(config)?;
-    Ok(())
-}
-
-/// Maximum allowed `max_tokens` value (16 million).
-const MAX_TOKENS_UPPER_BOUND: usize = 16_000_000;
-
-fn validate_model(config: &Config) -> ConfigResult<()> {
-    let m = &config.model;
-
-    if !matches!(
-        m.provider.as_str(),
-        "claude" | "openai" | "openai-compat" | "zai" | "unknown"
-    ) {
-        return Err(ConfigError::ValidationError {
-            field: "model.provider".to_owned(),
-            message: format!(
-                "unsupported provider '{}'; expected one of: claude, openai, openai-compat, zai, unknown",
-                m.provider
-            ),
-        });
-    }
-
-    if !(0.0..=1.0).contains(&m.temperature) {
-        return Err(ConfigError::ValidationError {
-            field: "model.temperature".to_owned(),
-            message: format!(
-                "temperature {} is out of range; must be between 0.0 and 1.0",
-                m.temperature
-            ),
-        });
-    }
-
-    if m.max_tokens == 0 || m.max_tokens > MAX_TOKENS_UPPER_BOUND {
-        return Err(ConfigError::ValidationError {
-            field: "model.max_tokens".to_owned(),
-            message: format!("max_tokens must be between 1 and {MAX_TOKENS_UPPER_BOUND}"),
-        });
-    }
-
-    if !m.pricing.input_per_million.is_finite() || m.pricing.input_per_million <= 0.0 {
-        return Err(ConfigError::ValidationError {
-            field: "model.pricing.input_per_million".to_owned(),
-            message: "input_per_million must be a finite positive number".to_owned(),
-        });
-    }
-
-    if !m.pricing.output_per_million.is_finite() || m.pricing.output_per_million <= 0.0 {
-        return Err(ConfigError::ValidationError {
-            field: "model.pricing.output_per_million".to_owned(),
-            message: "output_per_million must be a finite positive number".to_owned(),
-        });
-    }
-
     Ok(())
 }
 
@@ -431,21 +377,6 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_provider() {
-        let mut config = Config::default();
-        config.model.provider = "grok".to_owned();
-        let err = validate(&config).unwrap_err();
-        assert!(matches!(err, ConfigError::ValidationError { .. }));
-    }
-
-    #[test]
-    fn test_invalid_temperature() {
-        let mut config = Config::default();
-        config.model.temperature = 1.5;
-        assert!(validate(&config).is_err());
-    }
-
-    #[test]
     fn test_invalid_budget() {
         let mut config = Config::default();
         config.budget.per_action_max_usd = 200.0;
@@ -583,27 +514,6 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_max_tokens() {
-        let mut config = Config::default();
-        config.model.max_tokens = 0;
-        assert!(validate(&config).is_err());
-    }
-
-    #[test]
-    fn test_negative_pricing() {
-        let mut config = Config::default();
-        config.model.pricing.input_per_million = -1.0;
-        assert!(validate(&config).is_err());
-    }
-
-    #[test]
-    fn test_zero_pricing_rejected() {
-        let mut config = Config::default();
-        config.model.pricing.input_per_million = 0.0;
-        assert!(validate(&config).is_err());
-    }
-
-    #[test]
     fn test_nan_budget_rejected() {
         let mut config = Config::default();
         config.budget.session_max_usd = f64::NAN;
@@ -625,23 +535,9 @@ mod tests {
     }
 
     #[test]
-    fn test_nan_pricing_rejected() {
-        let mut config = Config::default();
-        config.model.pricing.output_per_million = f64::NAN;
-        assert!(validate(&config).is_err());
-    }
-
-    #[test]
     fn test_budget_upper_bound() {
         let mut config = Config::default();
         config.budget.session_max_usd = 20_000.0;
-        assert!(validate(&config).is_err());
-    }
-
-    #[test]
-    fn test_max_tokens_upper_bound() {
-        let mut config = Config::default();
-        config.model.max_tokens = 100_000_000;
         assert!(validate(&config).is_err());
     }
 
