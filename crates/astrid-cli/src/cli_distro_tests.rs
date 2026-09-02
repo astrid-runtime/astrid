@@ -48,7 +48,10 @@ fn distro_help_lists_only_supported_sources_and_the_launcher_exception() {
     );
     assert_eq!(
         apply_name_help.as_deref(),
-        Some("Distro source (`@owner/repo`, URL, local Distro.toml, or .shuttle)")
+        Some(
+            "Signed Distro bundle containing `Distro.toml`, `Distro.lock`, \
+             `Distro.sig`, and capsule artifacts"
+        )
     );
 }
 

@@ -125,6 +125,7 @@ async fn dispatch_inner(
         | AdminRequestKind::EnvDelete { .. }
         | AdminRequestKind::DistroLockGet { .. }
         | AdminRequestKind::DistroLockSet { .. }
+        | AdminRequestKind::DistroSelfGrant
         | AdminRequestKind::GroupCreate { .. }
         | AdminRequestKind::GroupDelete { .. }
         | AdminRequestKind::GroupModify { .. }
@@ -205,6 +206,9 @@ async fn dispatch_policy(
             lock,
             expected_hash,
         } => super::distro_handlers::set(kernel, &principal, lock, expected_hash).await,
+        AdminRequestKind::DistroSelfGrant => {
+            super::distro_handlers::self_grant(kernel, caller).await
+        },
         AdminRequestKind::GroupCreate {
             name,
             capabilities,

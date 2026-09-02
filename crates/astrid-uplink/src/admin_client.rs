@@ -60,6 +60,7 @@ pub const fn topic_suffix(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::EnvDelete { .. } => "env.delete",
         AdminRequestKind::DistroLockGet { .. } => "distro.lock.get",
         AdminRequestKind::DistroLockSet { .. } => "distro.lock.set",
+        AdminRequestKind::DistroSelfGrant => "distro.self.grant",
         AdminRequestKind::GroupCreate { .. } => "group.create",
         AdminRequestKind::GroupDelete { .. } => "group.delete",
         AdminRequestKind::GroupModify { .. } => "group.modify",

@@ -17,6 +17,7 @@ use util::{
 };
 
 mod revision_1;
+mod revision_2;
 mod util;
 
 const ENTRY_DIGEST_DOMAIN: &[u8] = b"astrid-capability-entry\0";
@@ -119,6 +120,69 @@ const CAPABILITY_REGISTRY_REVISION_1_IDS: [&str; 51] = [
 pub const CAPABILITY_REGISTRY_REVISION_1: CapabilityRegistryRevision =
     CapabilityRegistryRevision::new(NonZeroU32::MIN);
 
+/// Exact capability IDs in capability-registry revision 2.
+///
+/// Revision 2 is the smallest expansion of the frozen revision-1 authority
+/// registry: it adds only the dedicated Distro self-grant operation.
+const CAPABILITY_REGISTRY_REVISION_2_IDS: [&str; 52] = [
+    "system:shutdown",
+    "system:status",
+    "capsule:install",
+    "self:capsule:install",
+    "capsule:reload",
+    "self:capsule:reload",
+    "capsule:remove",
+    "self:capsule:remove",
+    "self:workspace:promote",
+    "self:workspace:rollback",
+    "capsule:list",
+    "self:capsule:list",
+    "self:distro:grant",
+    "agent:create",
+    "agent:create:inherit",
+    "agent:create:clone",
+    "agent:delete",
+    "agent:enable",
+    "agent:disable",
+    "agent:modify",
+    "agent:list",
+    "self:agent:list",
+    "quota:set",
+    "self:quota:set",
+    "quota:get",
+    "self:quota:get",
+    "group:create",
+    "group:delete",
+    "group:modify",
+    "group:list",
+    "self:group:list",
+    "caps:grant",
+    "caps:revoke",
+    "caps:token:mint",
+    "caps:token:revoke",
+    "caps:token:list",
+    "invite:issue",
+    "invite:redeem",
+    "invite:list",
+    "invite:revoke",
+    "audit:read_all",
+    "self:approval:respond",
+    "self:auth:pair",
+    "self:auth:pair:admin",
+    "auth:pair:redeem",
+    "auth:pair",
+    "system:resources:unbounded",
+    "net_bind",
+    "uplink",
+    "capsule:access:any",
+    "authority:profile:manage",
+    "authority:repair",
+];
+
+/// Schema revision for the 52-ID authority registry.
+pub const CAPABILITY_REGISTRY_REVISION_2: CapabilityRegistryRevision =
+    CapabilityRegistryRevision::new(NonZeroU32::new(2).expect("non-zero"));
+
 #[derive(Clone, Copy)]
 struct RevisionSemantics {
     scope: CapabilityScope,
@@ -135,13 +199,42 @@ struct RevisionSemantics {
 /// any definition fails registry validation.
 pub fn capability_registry_revision_1() -> Result<CapabilityRegistryManifest, AuthorityRegistryError>
 {
-    let entries = CAPABILITY_REGISTRY_REVISION_1_IDS
-        .into_iter()
+    capability_registry(
+        CAPABILITY_REGISTRY_REVISION_1,
+        &CAPABILITY_REGISTRY_REVISION_1_IDS,
+    )
+}
+
+/// Build the content-addressed registry for the 52 fixed capability IDs.
+///
+/// # Errors
+///
+/// Returns an error if an ID lacks fixed semantics or display metadata, or if
+/// any definition fails registry validation.
+pub fn capability_registry_revision_2() -> Result<CapabilityRegistryManifest, AuthorityRegistryError>
+{
+    capability_registry(
+        CAPABILITY_REGISTRY_REVISION_2,
+        &CAPABILITY_REGISTRY_REVISION_2_IDS,
+    )
+}
+
+fn capability_registry(
+    revision: CapabilityRegistryRevision,
+    ids: &[&str],
+) -> Result<CapabilityRegistryManifest, AuthorityRegistryError> {
+    let entries = ids
+        .iter()
         .map(|id| {
             let semantics = revision_1_semantics(id).ok_or_else(|| {
                 AuthorityRegistryError::MissingRevisionDefinition { id: id.to_string() }
             })?;
-            let danger = revision_1::danger(id).ok_or_else(|| {
+            let danger = if revision == CAPABILITY_REGISTRY_REVISION_2 {
+                revision_2::danger(id)
+            } else {
+                revision_1::danger(id)
+            };
+            let danger = danger.ok_or_else(|| {
                 AuthorityRegistryError::MissingRevisionDisplayMetadata { id: id.to_string() }
             })?;
             RegisteredCapability::new(
@@ -156,7 +249,7 @@ pub fn capability_registry_revision_1() -> Result<CapabilityRegistryManifest, Au
         })
         .collect::<Result<Vec<_>, AuthorityRegistryError>>()?;
 
-    CapabilityRegistryManifest::new(CAPABILITY_REGISTRY_REVISION_1, entries)
+    CapabilityRegistryManifest::new(revision, entries)
 }
 
 fn revision_1_semantics(id: &str) -> Option<RevisionSemantics> {
@@ -188,6 +281,7 @@ fn revision_1_semantics(id: &str) -> Option<RevisionSemantics> {
         | "self:agent:list"
         | "self:group:list"
         | "self:quota:get"
+        | "self:distro:grant"
         | "self:approval:respond" => RevisionSemantics::new(Self_, &[Principal], true, false),
         "agent:create" | "agent:create:clone" | "agent:modify" => {
             RevisionSemantics::new(Global, &[Principal, Group, CapsulePackage], true, true)

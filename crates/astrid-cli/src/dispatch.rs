@@ -208,6 +208,7 @@ async fn dispatch_subcommand(
                     .transpose()?
                     .unwrap_or_else(crate::principal::current),
                 grant_capsules,
+                require_signed: false,
             };
             commands::init::run_init(&distro, &opts).await?;
             commands::self_update::ensure_path_setup()?;
@@ -495,6 +496,11 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
                     &[tracker_657()],
                 ));
             }
+            if allow_unsigned {
+                anyhow::bail!(
+                    "astrid distro apply requires a signed Distro; --allow-unsigned is not acceptance"
+                );
+            }
             let distro = non_empty_distro_source(name).ok_or_else(|| {
                 anyhow::anyhow!(
                     "astrid distro apply requires an explicit distro source: @owner/repo, URL, local Distro.toml, or .shuttle; Astrid Runtime does not choose a product distro"
@@ -508,10 +514,11 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
                 vars: commands::init::parse_cli_vars(&vars)?,
                 target_principal: crate::principal::current(),
                 // `distro apply` has no `--grant-capsules` surface; granting
-                // stays on `astrid init`. Capsules install without grants here.
                 grant_capsules: false,
+                require_signed: true,
             };
             commands::init::run_init(&distro, &opts).await?;
+            commands::init::apply_self_grant(&opts.target_principal).await?;
             Ok(ExitCode::SUCCESS)
         },
         DistroCommands::Show { agent } => {
@@ -858,5 +865,26 @@ mod tests {
                 "astrid distro apply requires an explicit distro source: @owner/repo, URL, local Distro.toml, or .shuttle; Astrid Runtime does not choose a product distro"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn distro_apply_rejects_unsigned_acceptance_before_install() {
+        let error = dispatch_distro(DistroCommands::Apply {
+            name: Some("/tmp/product.shuttle".into()),
+            agent: None,
+            yes: true,
+            offline: true,
+            allow_unsigned: true,
+            accept_new_key: false,
+            vars: Vec::new(),
+        })
+        .await
+        .expect_err("--allow-unsigned must not make Distro apply acceptance-capable");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--allow-unsigned is not acceptance")
+        );
     }
 }

@@ -539,7 +539,8 @@ pub(crate) enum SessionCommands {
 pub(crate) enum DistroCommands {
     /// Apply a distro to the active or specified agent.
     Apply {
-        /// Distro source (`@owner/repo`, URL, local Distro.toml, or .shuttle).
+        /// Signed Distro bundle containing `Distro.toml`, `Distro.lock`,
+        /// `Distro.sig`, and capsule artifacts.
         name: Option<String>,
         /// Target agent (defaults to active context).
         #[arg(short, long)]

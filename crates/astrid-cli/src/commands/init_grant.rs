@@ -41,6 +41,36 @@ pub(super) fn validate_grant_capsules(
     Ok(())
 }
 
+/// Complete the mandatory second Distro Apply stage for the authenticated
+/// caller. The kernel derives both target and member set from its admitted
+/// lock; no capsule names cross this boundary.
+pub(crate) async fn apply_self_grant(caller: &PrincipalId) -> anyhow::Result<()> {
+    eprintln!(
+        "{}",
+        Theme::info(&format!("Granting Distro capsule access to '{caller}'..."))
+    );
+    let mut client = crate::admin_client::connect_for_workspace_as(caller.clone())
+        .await
+        .context("Distro install committed, but connecting for the self grant failed")?;
+    let body = client
+        .request(AdminRequestKind::DistroSelfGrant)
+        .await
+        .context("Distro install committed, but the self-grant request failed")?;
+    match crate::admin_client::into_result(body)? {
+        AdminResponseBody::Success(_) => {
+            eprintln!(
+                "{}",
+                Theme::success("Distro apply and self grant completed.")
+            );
+            Ok(())
+        },
+        other => bail!(
+            "Distro install committed, but the self grant failed unexpectedly: {other:?}; \
+             the installed set is not invokable until a retry completes"
+        ),
+    }
+}
+
 /// What the post-install grant step should do, given the flag and how many
 /// capsules installed. Explicit requests always exercise the kernel grant
 /// path; the CLI never infers privilege from a principal name.

@@ -53,7 +53,12 @@ pub(crate) struct InitOpts {
     /// `init` installs capsules but attaches no grants and
     /// prints the manual `agent modify` command for discoverability.
     pub(crate) grant_capsules: bool,
+    /// Require the signed self-contained Distro artifact used by product
+    /// Apply. Ordinary `init` retains its legacy source support.
+    pub(crate) require_signed: bool,
 }
+
+pub(crate) use grant::apply_self_grant;
 
 /// Parse `--var KEY=VALUE` strings into a map.
 ///
@@ -72,6 +77,33 @@ pub(crate) fn parse_cli_vars(raw: &[String]) -> anyhow::Result<HashMap<String, S
     Ok(map)
 }
 
+/// Enforce source and trust gates before this flow can create runtime state.
+fn validate_install_source(
+    distro_source: &str,
+    opts: &InitOpts,
+    operator: &astrid_core::PrincipalId,
+    target: &astrid_core::PrincipalId,
+) -> anyhow::Result<bool> {
+    let shuttle_install = distro_source.ends_with(".shuttle");
+    if opts.require_signed && !shuttle_install {
+        bail!(
+            "astrid distro apply requires a signed .shuttle Distro bundle containing Distro.toml; \
+             an unsigned manifest is not accepted"
+        );
+    }
+    // `--grant-capsules` is not wired for `.shuttle`; fail rather than silently
+    // skip the requested grants and point at the legacy manual command.
+    if shuttle_install && opts.grant_capsules {
+        bail!(
+            "--grant-capsules is not supported for .shuttle installs yet — \
+             install first, then grant with `astrid --principal {operator} \
+             agent modify {target} \
+             --add-capsule <name>` for each installed capsule."
+        );
+    }
+    Ok(shuttle_install)
+}
+
 /// Run the init flow: workspace setup + distro-based capsule installation.
 pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Result<()> {
     let home = AstridHome::resolve()?;
@@ -83,19 +115,7 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // the flag can never be silently honoured without a distro.
     grant::validate_grant_capsules(opts.grant_capsules, !distro_source.is_empty())?;
 
-    let shuttle_install = distro_source.ends_with(".shuttle");
-    // Offline, signed, self-contained install path. `--grant-capsules` is not
-    // wired for `.shuttle` archives (the installed set isn't threaded back
-    // here); fail loud rather than silently skip the grant the operator asked
-    // for, pointing at the manual path.
-    if shuttle_install && opts.grant_capsules {
-        bail!(
-            "--grant-capsules is not supported for .shuttle installs yet — \
-             install first, then grant with `astrid --principal {operator} \
-             agent modify {target} \
-             --add-capsule <name>` for each installed capsule."
-        );
-    }
+    let shuttle_install = validate_install_source(distro_source, opts, &operator, &target)?;
 
     // The kernel must admit a fresh home and publish its migration ledger
     // before the CLI creates any v2 layout state. Init spans multiple admin

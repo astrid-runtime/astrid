@@ -216,6 +216,16 @@ denial = ["network or host-mutating paths are waived or dry-run only"]
 state = ["only temp distro lock/seal files are written"]
 evidence = ["distro transcript, seal artifact, and waiver reasons"]
 
+[scenarios.distro_self_grant]
+status = "mapped"
+surfaces = ["cli", "capability"]
+auth = ["ordinary agent principal, not default/admin wildcard authority"]
+success = ["signed Distro apply completes install/lock admission and the caller-scoped exact-lock capsule grant"]
+denial = ["missing, empty, unbound, unsigned, target-split, and concurrently changed Distro locks fail closed without granting"]
+state = ["kernel-owned lock and caller profile remain separately committed; failed grant leaves members non-invokable"]
+evidence = ["kernel lock-digest and self-grant regression artifacts"]
+remaining = ["full disposable-host invoke matrix needs a live signed product fixture"]
+
 [scenarios.distro_onboarding]
 status = "covered"
 surfaces = ["cli"]

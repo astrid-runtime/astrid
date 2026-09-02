@@ -28,6 +28,8 @@ mod audit_handlers;
 mod caps_tokens;
 mod distro_handlers;
 #[cfg(test)]
+mod distro_self_grant_tests;
+#[cfg(test)]
 mod enforcement_tests;
 mod group;
 pub(crate) mod handlers;
@@ -287,6 +289,7 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         // EnvList is self-scoped when the target is the caller; the target
         // arm above handles cross-principal admin reads.
         | AdminRequestKind::PairDeviceIssue { .. }
+        | AdminRequestKind::DistroSelfGrant
         | AdminRequestKind::StorageMountStatus { .. }
         | AdminRequestKind::StorageMountSync { .. }
         | AdminRequestKind::StorageMountRevoke { .. }
@@ -362,6 +365,7 @@ pub fn required_capability_for_admin_request(
         (AdminRequestKind::AgentModify { .. }, _) => "agent:modify",
         (AdminRequestKind::AgentList, AuthorityScope::Self_) => "self:agent:list",
         (AdminRequestKind::AgentList, AuthorityScope::Global) => "agent:list",
+        (AdminRequestKind::DistroSelfGrant, _) => "self:distro:grant",
         (AdminRequestKind::QuotaSet { .. }, AuthorityScope::Self_) => "self:quota:set",
         (AdminRequestKind::QuotaSet { .. }, AuthorityScope::Global) => "quota:set",
         (
@@ -523,6 +527,7 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::EnvDelete { .. } => "admin.env.delete",
         AdminRequestKind::DistroLockGet { .. } => "admin.distro.lock.get",
         AdminRequestKind::DistroLockSet { .. } => "admin.distro.lock.set",
+        AdminRequestKind::DistroSelfGrant => "admin.distro.self.grant",
         AdminRequestKind::GroupCreate { .. } => "admin.group.create",
         AdminRequestKind::GroupDelete { .. } => "admin.group.delete",
         AdminRequestKind::GroupModify { .. } => "admin.group.modify",
@@ -670,6 +675,7 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         AdminRequestKind::CapsTokenRevoke { .. }
         | AdminRequestKind::AgentCreate { .. }
         | AdminRequestKind::AgentList
+        | AdminRequestKind::DistroSelfGrant
         | AdminRequestKind::GroupCreate { .. }
         | AdminRequestKind::GroupDelete { .. }
         | AdminRequestKind::GroupModify { .. }
