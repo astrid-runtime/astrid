@@ -391,10 +391,18 @@ jobs:
           name: binary-${{ matrix.target }}
           path: ${{ env.ASSET }}
 
+  windows-release-archive-cert:
+    name: Windows x86_64 archive certification
+    needs: [classify, build]
+    uses: ./.github/workflows/windows-release-archive-cert.yml
+    with:
+      source_commit: ${{ needs.classify.outputs.source-commit }}
+      version: ${{ needs.classify.outputs.version }}
+
   # ── Create the GitHub release with all binaries ───────────────────
   github-release:
     name: GitHub Release
-    needs: [classify, build]
+    needs: [classify, build, windows-release-archive-cert]
     runs-on: ubuntu-latest
     environment: release
     permissions:
