@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use astrid_core::kernel_api::{AdminResponseBody, DistroProvenance};
 use astrid_core::principal::PrincipalId;
+use astrid_core::profile::{CapsuleGrant, PrincipalProfile};
 
 use crate::Kernel;
 
@@ -43,6 +44,7 @@ pub(super) async fn set(
     lock: DistroProvenance,
     expected_hash: Option<String>,
 ) -> AdminResponseBody {
+    let _guard = kernel.admin_write_lock.lock().await;
     if let Err(error) = validate(&lock) {
         return AdminResponseBody::Error(error);
     }
@@ -93,6 +95,101 @@ pub(super) async fn set(
     }
 }
 
+/// Grant the caller exactly its admitted Distro lock's capsule identities.
+///
+/// The caller is the only target and the kernel-owned lock is the only
+/// source of names. The digest is captured, then rechecked under the same
+/// admin write lock used by `DistroLockSet`, so a concurrent lock change
+/// cannot authorize a stale member set.
+pub(super) async fn self_grant(kernel: &Arc<Kernel>, caller: &PrincipalId) -> AdminResponseBody {
+    let observed = match load_lock(kernel, caller).await {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return AdminResponseBody::Error("no admitted Distro lock".to_owned()),
+        Err(error) => return AdminResponseBody::Error(error),
+    };
+    if let Err(error) = validate(&observed) {
+        return AdminResponseBody::Error(error);
+    }
+    if observed.capsules.is_empty() {
+        return AdminResponseBody::Error("admitted Distro lock has no capsules".to_owned());
+    }
+    let Some(manifest_hash) = observed.manifest_hash.as_ref() else {
+        return AdminResponseBody::Error(
+            "admitted Distro lock has no manifest_hash binding".to_owned(),
+        );
+    };
+    let observed_digest = match lock_digest(&observed) {
+        Ok(digest) => digest,
+        Err(error) => return AdminResponseBody::Error(error),
+    };
+    let capsule_names: Vec<String> = observed
+        .capsules
+        .iter()
+        .map(|capsule| capsule.name.clone())
+        .collect();
+
+    let _guard = kernel.admin_write_lock.lock().await;
+    let current = match load_lock(kernel, caller).await {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            return AdminResponseBody::Error("Distro lock was removed concurrently".to_owned());
+        },
+        Err(error) => return AdminResponseBody::Error(error),
+    };
+    let current_digest = match lock_digest(&current) {
+        Ok(digest) => digest,
+        Err(error) => return AdminResponseBody::Error(error),
+    };
+    if current_digest != observed_digest {
+        return AdminResponseBody::Error(
+            "Distro lock changed concurrently; retry with the fresh admitted lock".to_owned(),
+        );
+    }
+    if current.manifest_hash.as_ref() != Some(manifest_hash) {
+        return AdminResponseBody::Error(
+            "Distro manifest_hash changed concurrently; retry with the fresh admitted lock"
+                .to_owned(),
+        );
+    }
+
+    let profile_path = super::handlers::principal_profile_path(kernel, caller);
+    if let Err(error) = super::handlers::require_principal_exists(caller, &profile_path) {
+        return AdminResponseBody::Error(error);
+    }
+    let mut profile = match PrincipalProfile::load_from_path(&profile_path) {
+        Ok(profile) => profile,
+        Err(error) => {
+            return AdminResponseBody::Error(format!("load principal profile: {error}"));
+        },
+    };
+    let changed = match super::handlers::apply_set_delta::<CapsuleGrant>(
+        &mut profile.capsules,
+        &capsule_names,
+        &[],
+    ) {
+        Ok(changed) => changed,
+        Err(error) => {
+            return AdminResponseBody::Error(format!("capsule grant delta rejected: {error}"));
+        },
+    };
+    if changed {
+        if let Err(error) = profile.validate() {
+            return AdminResponseBody::Error(format!("principal profile rejected: {error}"));
+        }
+        if let Err(error) = profile.save_to_path(&profile_path) {
+            return AdminResponseBody::Error(format!("save principal profile: {error}"));
+        }
+    }
+    kernel.profile_cache.invalidate(caller);
+    AdminResponseBody::Success(serde_json::json!({
+        "principal": caller.as_str(),
+        "capsules": profile.capsules,
+        "manifest_hash": manifest_hash,
+        "lock_digest": observed_digest,
+        "changed": changed,
+    }))
+}
+
 fn principal_store(
     kernel: &Arc<Kernel>,
     principal: &PrincipalId,
@@ -108,6 +205,32 @@ fn principal_store(
     store
         .principal_control_kv(uid, "distro")
         .map_err(|error| format!("open principal distro control namespace: {error}"))
+}
+
+async fn load_lock(
+    kernel: &Arc<Kernel>,
+    principal: &PrincipalId,
+) -> Result<Option<DistroProvenance>, String> {
+    let store = principal_store(kernel, principal)?;
+    let value = store
+        .get(KEY)
+        .await
+        .map_err(|error| format!("read distro provenance: {error}"))?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.len() > MAX_BYTES {
+        return Err("distro provenance exceeds size limit".to_owned());
+    }
+    serde_json::from_slice(&value)
+        .map(Some)
+        .map_err(|error| format!("decode distro provenance: {error}"))
+}
+
+fn lock_digest(lock: &DistroProvenance) -> Result<String, String> {
+    serde_json::to_vec(lock)
+        .map(|encoded| digest(&encoded))
+        .map_err(|error| format!("encode distro provenance: {error}"))
 }
 
 fn validate(lock: &DistroProvenance) -> Result<(), String> {

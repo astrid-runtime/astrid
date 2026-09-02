@@ -90,6 +90,7 @@ fn identity_and_policy_variants(principal: &PrincipalId) -> Vec<AdminRequestKind
             },
             expected_hash: None,
         },
+        AdminRequestKind::DistroSelfGrant,
         AdminRequestKind::GroupCreate {
             name: "group".into(),
             capabilities: vec![],

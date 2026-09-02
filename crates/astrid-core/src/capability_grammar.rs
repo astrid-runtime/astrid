@@ -408,6 +408,14 @@ pub const CAPABILITY_CATALOG: &[CapabilityInfo] = {
             scope: Self_,
             danger: Safe,
         },
+        CapabilityInfo {
+            id: "self:distro:grant",
+            label: "Apply distro capsule grants (self)",
+            description: "Grant the caller the exact capsule set already admitted in its own signed Distro lock. Installation and authority granting remain separate operations.",
+            category: Capsule,
+            scope: Self_,
+            danger: Elevated,
+        },
         // ── Agents (principals) ──
         CapabilityInfo {
             id: "agent:create",
@@ -707,7 +715,7 @@ pub fn known_capabilities_list() -> &'static [&'static str] {
 /// in the same commit that adds a new capability so a kernel
 /// addition without updating the catalog fails the consuming
 /// crate's tests.
-pub const KNOWN_CAPABILITIES_COUNT: usize = 45;
+pub const KNOWN_CAPABILITIES_COUNT: usize = 46;
 
 const _: () = assert!(
     CAPABILITY_CATALOG.len() == KNOWN_CAPABILITIES_COUNT,

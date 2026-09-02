@@ -99,6 +99,23 @@ fn agent_list_maps_self_to_self_prefix() {
 }
 
 #[test]
+fn distro_self_grant_is_caller_scoped_and_dedicated() {
+    let req = AdminRequestKind::DistroSelfGrant;
+    for scope in [AuthorityScope::Self_, AuthorityScope::Global] {
+        assert_eq!(
+            required_capability_for_admin_request(&req, scope),
+            "self:distro:grant"
+        );
+        assert_eq!(
+            resolve_admin_scope(&req, &pid("caller")),
+            AuthorityScope::Self_
+        );
+    }
+    assert_eq!(admin_request_method(&req), "admin.distro.self.grant");
+    assert!(admin_target_principal(&req).is_none());
+}
+
+#[test]
 fn pair_issue_mapping_requires_admin_only_for_unattenuated_scopes() {
     for scope in [
         PairScopeArg::Full,

@@ -84,6 +84,12 @@ status = "covered"
 allow = ["regular agent can list its own effective capsule surface"]
 deny = ["regular agent cannot use self:list to enumerate hidden default-principal metadata"]
 
+[capabilities."self:distro:grant"]
+scenario = "distro_self_grant"
+status = "mapped"
+allow = ["ordinary agent applying its own signed Distro lock receives exactly that lock's capsule identities"]
+deny = ["caller with no lock, an empty lock, an unbound lock, or a concurrently changed lock receives no grants"]
+
 [capabilities."agent:create"]
 scenario = "principal_crud"
 status = "covered"

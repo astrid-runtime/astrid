@@ -38,6 +38,7 @@ use tracing::{info, warn};
 
 use crate::kernel_router::AuthorizedRequest;
 
+mod distro_dispatch;
 mod env_handlers;
 use super::inheritance::copy_modify_env;
 use env_handlers::{EnvSetRequest, env_delete, env_list, env_set};
@@ -102,6 +103,9 @@ async fn dispatch_inner(
     device_key_id: Option<&str>,
     req: AdminRequestKind,
 ) -> AdminResponseBody {
+    if let Some(response) = distro_dispatch::dispatch(kernel, caller, &req).await {
+        return response;
+    }
     match req {
         req @ AdminRequestKind::AgentCreate { .. } => agent_create_from_req(kernel, req).await,
         AdminRequestKind::AgentDelete { principal } => {
@@ -125,6 +129,7 @@ async fn dispatch_inner(
         | AdminRequestKind::EnvDelete { .. }
         | AdminRequestKind::DistroLockGet { .. }
         | AdminRequestKind::DistroLockSet { .. }
+        | AdminRequestKind::DistroSelfGrant
         | AdminRequestKind::GroupCreate { .. }
         | AdminRequestKind::GroupDelete { .. }
         | AdminRequestKind::GroupModify { .. }
@@ -197,14 +202,6 @@ async fn dispatch_policy(
             kind,
             scope,
         } => env_delete(kernel, principal, capsule, key, kind, scope).await,
-        AdminRequestKind::DistroLockGet { principal } => {
-            super::distro_handlers::get(kernel, &principal).await
-        },
-        AdminRequestKind::DistroLockSet {
-            principal,
-            lock,
-            expected_hash,
-        } => super::distro_handlers::set(kernel, &principal, lock, expected_hash).await,
         AdminRequestKind::GroupCreate {
             name,
             capabilities,

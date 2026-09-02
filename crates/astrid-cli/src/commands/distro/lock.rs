@@ -203,13 +203,26 @@ pub(crate) async fn write_lock_to_daemon(
     }
 }
 
-/// Check if a lockfile is fresh (name and version match the manifest).
-pub(crate) fn is_lock_fresh(lock: &DistroLock, manifest: &DistroManifest) -> bool {
-    lock.distro.id == manifest.distro.id && lock.distro.version == manifest.distro.version
+/// Check whether a lock is fresh for the exact authenticated manifest bytes.
+///
+/// A legacy unbound lock is deliberately stale so it can never satisfy the
+/// caller-only `DistroSelfGrant` admission gate.
+pub(crate) fn is_lock_fresh(
+    lock: &DistroLock,
+    manifest: &DistroManifest,
+    manifest_hash: &str,
+) -> bool {
+    lock.distro.id == manifest.distro.id
+        && lock.distro.version == manifest.distro.version
+        && lock.manifest_hash.as_deref() == Some(manifest_hash)
 }
 
 /// Create a new lockfile from resolved capsule data.
-pub(crate) fn create_lock(manifest: &DistroManifest, capsules: Vec<LockedCapsule>) -> DistroLock {
+pub(crate) fn create_lock(
+    manifest: &DistroManifest,
+    manifest_hash: &str,
+    capsules: Vec<LockedCapsule>,
+) -> DistroLock {
     DistroLock {
         schema_version: manifest.schema_version,
         distro: DistroLockMeta {
@@ -218,7 +231,7 @@ pub(crate) fn create_lock(manifest: &DistroManifest, capsules: Vec<LockedCapsule
             resolved_at: chrono::Utc::now().to_rfc3339(),
         },
         capsules,
-        manifest_hash: None,
+        manifest_hash: Some(manifest_hash.to_string()),
     }
 }
 
@@ -319,7 +332,7 @@ role = "uplink"
             capsules: vec![],
             manifest_hash: None,
         };
-        assert!(is_lock_fresh(&lock, &manifest));
+        assert!(!is_lock_fresh(&lock, &manifest, "blake3:manifest"));
     }
 
     #[test]
@@ -352,7 +365,35 @@ role = "uplink"
             capsules: vec![],
             manifest_hash: None,
         };
-        assert!(!is_lock_fresh(&lock, &manifest));
+        assert!(!is_lock_fresh(&lock, &manifest, "blake3:manifest"));
+    }
+
+    #[test]
+    fn lock_is_fresh_only_for_matching_manifest_bytes() {
+        let manifest = super::super::manifest::parse_manifest(
+            r#"
+schema-version = 1
+
+[distro]
+id = "test"
+name = "Test"
+version = "0.1.0"
+
+[[capsule]]
+name = "cli"
+source = "@org/cli"
+version = "0.1.0"
+role = "uplink"
+"#,
+        )
+        .unwrap();
+        let bytes = b"schema-version = 1\n";
+        let hash = manifest_hash(bytes);
+        let mut lock = create_lock(&manifest, &hash, Vec::new());
+        assert_eq!(lock.manifest_hash.as_deref(), Some(hash.as_str()));
+        assert!(is_lock_fresh(&lock, &manifest, &hash));
+        lock.manifest_hash = Some("blake3:tampered".into());
+        assert!(!is_lock_fresh(&lock, &manifest, &hash));
     }
 
     #[test]

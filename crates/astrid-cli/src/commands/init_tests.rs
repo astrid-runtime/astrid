@@ -10,6 +10,7 @@ fn batch_install_rejects_reported_identity_mismatch() {
     let err = validate_batch_install(
         &expected,
         "1.0.0",
+        None,
         super::super::capsule::install::BatchInstallOutcome {
             installed: vec![super::super::capsule::install::InstalledCapsuleOutcome {
                 id: astrid_capsule::capsule::CapsuleId::new("wrong-capsule").unwrap(),
@@ -30,6 +31,7 @@ fn batch_install_accepts_actual_version_hash_and_ref() {
     let verified = validate_batch_install(
         &expected,
         "1.0.0",
+        None,
         super::super::capsule::install::BatchInstallOutcome {
             installed: vec![super::super::capsule::install::InstalledCapsuleOutcome {
                 id: expected.clone(),
@@ -51,6 +53,7 @@ fn batch_install_rejects_multiple_reported_capsules() {
     let err = validate_batch_install(
         &expected,
         "1.0.0",
+        None,
         super::super::capsule::install::BatchInstallOutcome {
             installed: vec![
                 super::super::capsule::install::InstalledCapsuleOutcome {
@@ -77,6 +80,7 @@ fn batch_install_rejects_declared_version_mismatch() {
     let err = validate_batch_install(
         &expected,
         "1.0.0",
+        None,
         super::super::capsule::install::BatchInstallOutcome {
             installed: vec![super::super::capsule::install::InstalledCapsuleOutcome {
                 id: expected.clone(),
@@ -173,6 +177,189 @@ fn distro_source_resolution_full_url() {
 // ---- Part A: headless selection / variable resolution ----
 
 use super::super::distro::manifest::{DistroCapsule, VariableDef};
+
+fn signed_source_fixture(dir: &std::path::Path) -> (std::path::PathBuf, Vec<u8>, String) {
+    let keypair = astrid_crypto::KeyPair::generate();
+    let pubkey = super::super::distro::sign::pubkey_to_wire(&keypair.export_public_key());
+    let bytes = format!(
+        "schema-version = 1\n\n\
+         [distro]\nid = \"test\"\nname = \"Test\"\nversion = \"0.1.0\"\n\n\
+         [distro.signing]\npubkey = \"{pubkey}\"\n\n\
+         [[capsule]]\nname = \"cli\"\nsource = \"@org/cli\"\nversion = \"0.1.0\"\nrole = \"uplink\"\n"
+    )
+    .into_bytes();
+    let manifest_hash = manifest_hash(&bytes);
+    let lock = super::super::distro::lock::DistroLock {
+        schema_version: 1,
+        distro: super::super::distro::lock::DistroLockMeta {
+            id: "test".into(),
+            version: "0.1.0".into(),
+            resolved_at: "2026-01-01T00:00:00Z".into(),
+        },
+        capsules: vec![super::super::distro::lock::LockedCapsule {
+            name: "cli".into(),
+            version: "0.1.0".into(),
+            source: "@org/cli".into(),
+            hash: format!("blake3:{}", "a".repeat(64)),
+            resolved_ref: Some("v0.1.0".into()),
+        }],
+        manifest_hash: Some(manifest_hash.clone()),
+    };
+    let sig = super::super::distro::sign::sign_lock(&lock, &keypair).unwrap();
+    std::fs::write(dir.join("Distro.toml"), &bytes).unwrap();
+    std::fs::write(
+        dir.join("Distro.lock"),
+        toml::to_string_pretty(&lock).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(dir.join("Distro.sig"), sig).unwrap();
+    (dir.join("Distro.toml"), bytes, manifest_hash)
+}
+
+#[test]
+fn product_source_prepares_signed_distro_toml_without_shuttle_suffix() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path().join("home"));
+    let (source, bytes, expected_hash) = signed_source_fixture(dir.path());
+    let opts = InitOpts {
+        require_signed: true,
+        offline: true,
+        ..Default::default()
+    };
+
+    let prepared = futures::executor::block_on(super::signed_source::prepare_distro_source(
+        source.to_str().unwrap(),
+        &opts,
+        &home,
+    ))
+    .unwrap();
+    let super::PreparedDistro::Signed(bundle) = prepared else {
+        panic!("signed Distro.toml must use the source bundle path");
+    };
+    assert_eq!(bundle.manifest_hash, expected_hash);
+    assert_eq!(bundle.manifest_hash, manifest_hash(&bytes));
+    assert_eq!(
+        bundle.lock.manifest_hash.as_deref(),
+        Some(expected_hash.as_str())
+    );
+}
+
+#[test]
+fn product_source_rejects_unsigned_distro_toml_before_install_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path().join("home"));
+    std::fs::write(
+        dir.path().join("Distro.toml"),
+        "schema-version = 1\n\n[distro]\nid = \"test\"\nname = \"Test\"\nversion = \"0.1.0\"\n\n\
+         [[capsule]]\nname = \"cli\"\nsource = \"@org/cli\"\nversion = \"0.1.0\"\nrole = \"uplink\"\n",
+    )
+    .unwrap();
+    let opts = InitOpts {
+        require_signed: true,
+        offline: true,
+        ..Default::default()
+    };
+
+    let error = futures::executor::block_on(super::signed_source::prepare_distro_source(
+        dir.path().join("Distro.toml").to_str().unwrap(),
+        &opts,
+        &home,
+    ))
+    .unwrap_err();
+    assert!(error.to_string().contains("Distro.lock"), "got: {error:#}");
+}
+
+#[test]
+fn product_source_rejects_tampered_distro_toml_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path().join("home"));
+    let (source, bytes, _) = signed_source_fixture(dir.path());
+    let mut tampered = bytes.clone();
+    tampered.extend_from_slice(b"\n# tampered after sealing\n");
+    std::fs::write(&source, tampered).unwrap();
+    let opts = InitOpts {
+        require_signed: true,
+        offline: true,
+        ..Default::default()
+    };
+
+    let error = futures::executor::block_on(super::signed_source::prepare_distro_source(
+        source.to_str().unwrap(),
+        &opts,
+        &home,
+    ))
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("manifest_hash"),
+        "got: {error:#}"
+    );
+}
+
+#[test]
+fn product_source_rejects_tampered_signature() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path().join("home"));
+    let (source, _, _) = signed_source_fixture(dir.path());
+    std::fs::write(dir.path().join("Distro.sig"), "00").unwrap();
+    let opts = InitOpts {
+        require_signed: true,
+        offline: true,
+        ..Default::default()
+    };
+
+    let error = futures::executor::block_on(super::signed_source::prepare_distro_source(
+        source.to_str().unwrap(),
+        &opts,
+        &home,
+    ))
+    .unwrap_err();
+    assert!(error.to_string().contains("signature"));
+}
+
+#[test]
+fn signed_lock_cannot_add_undeclared_member() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path().join("home"));
+    let (source, bytes, expected_hash) = signed_source_fixture(dir.path());
+    let keypair = astrid_crypto::KeyPair::generate();
+    let lock = super::super::distro::lock::DistroLock {
+        schema_version: 1,
+        distro: super::super::distro::lock::DistroLockMeta {
+            id: "test".into(),
+            version: "0.1.0".into(),
+            resolved_at: "2026-01-01T00:00:00Z".into(),
+        },
+        capsules: vec![super::super::distro::lock::LockedCapsule {
+            name: "undeclared".into(),
+            version: "0.1.0".into(),
+            source: "@org/undeclared".into(),
+            hash: format!("blake3:{}", "a".repeat(64)),
+            resolved_ref: None,
+        }],
+        manifest_hash: Some(expected_hash),
+    };
+    let sig = super::super::distro::sign::sign_lock(&lock, &keypair).unwrap();
+    std::fs::write(
+        dir.path().join("Distro.lock"),
+        toml::to_string_pretty(&lock).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("Distro.sig"), sig).unwrap();
+    let opts = InitOpts {
+        require_signed: true,
+        offline: true,
+        ..Default::default()
+    };
+
+    let error = futures::executor::block_on(super::signed_source::prepare_distro_source(
+        source.to_str().unwrap(),
+        &opts,
+        &home,
+    ))
+    .unwrap_err();
+    assert!(error.to_string().contains("undeclared capsule"));
+    assert_eq!(super::manifest_hash(&bytes), lock.manifest_hash.unwrap());
+}
 
 fn cap(name: &str, group: Option<&str>, default: bool) -> DistroCapsule {
     DistroCapsule {
@@ -282,7 +469,7 @@ async fn offline_refuses_remote_capsule_source() {
     // A local Distro.toml with a remote @org/repo capsule must not
     // silently fetch under --offline.
     let selected = vec![cap("llm", None, false)]; // source "@org/llm"
-    let err = install_capsules(&selected, true, &astrid_core::PrincipalId::default())
+    let err = install_capsules(&selected, true, &astrid_core::PrincipalId::default(), None)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("--offline"), "got: {err}");
@@ -352,7 +539,14 @@ fn should_write_lock_gates_on_success() {
 fn partial_run_leaves_no_lock_for_retry() {
     let dir = tempfile::tempdir().unwrap();
     let lock_path = dir.path().join("distro.lock");
-    let lock = create_lock_from_parts(1, "example-distro", "1.0.0", Vec::new());
+    let lock = create_lock_from_parts(
+        1,
+        "example-distro",
+        "1.0.0",
+        "blake3:manifest-bytes",
+        Vec::new(),
+    );
+    assert_eq!(lock.manifest_hash.as_deref(), Some("blake3:manifest-bytes"));
 
     // Partial (3 of 5): no lock written, returns false.
     let wrote = persist_lock_if_earned(&lock_path, 5, 3, &lock).unwrap();

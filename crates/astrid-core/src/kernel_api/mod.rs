@@ -663,6 +663,13 @@ pub enum AdminRequestKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expected_hash: Option<String>,
     },
+    /// Grant the authenticated caller invoke access to exactly the capsule
+    /// set in that caller's kernel-admitted Distro lock.
+    ///
+    /// The request deliberately carries no principal or capsule list: the
+    /// caller is the only target and the admitted lock is the only source of
+    /// member identities.
+    DistroSelfGrant,
     /// Create a custom group, validated through the same rules the boot
     /// loader applies to `groups.toml`.
     GroupCreate {
