@@ -219,8 +219,14 @@ pub struct GatewayState {
     /// the same id, so a bearer minted *after* a re-pair (`iat` > the recorded
     /// epoch) authenticates again instead of being dead forever — and the map
     /// is not a permanent, unbounded deny-list.
-    /// Deliberately in-memory only: a restart re-derives correctness from the
-    /// (now key-less) profile, and the bearer's own expiry bounds the window.
+    /// A normal CAS publication or a successful MAX fallback is persisted in
+    /// the kernel-owned control KV before an HTTP revoke returns 204 and is
+    /// hydrated before the listener is exposed, so a restart preserves that
+    /// fail-closed fence. If both writes fail, the HTTP revoke returns an
+    /// error and only the current process retains an in-memory MAX; startup
+    /// aborts when KV is unavailable or corrupt, while a healthy empty KV
+    /// cannot reconstruct the lost fence. With `storage_kv = None`, this map
+    /// is intentionally non-durable and carries no restart guarantee.
     pub revoked_key_ids: Arc<RwLock<HashMap<String, u64>>>,
     /// Live audit-log handle backing `GET /api/sys/audit`. `Some`
     /// when the gateway is spawned by `astrid-daemon` (which holds
@@ -364,8 +370,10 @@ impl GatewayState {
     /// Hydrate principal and device revocation epochs from the authoritative
     /// kernel control KV before the HTTP listener is exposed. A legacy JSON
     /// index is imported exactly once when present and then retired after KV
-    /// receipt/read-back verification. Standalone route tests without a KV
-    /// remain usable only when no legacy file exists.
+    /// receipt/read-back verification. Any list/get error or malformed value
+    /// aborts startup before an unfenced listener can be exposed. Standalone
+    /// route tests without a KV remain usable only when no legacy file exists;
+    /// that no-KV mode is intentionally non-durable across restart.
     ///
     /// # Panics
     ///

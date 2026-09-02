@@ -533,7 +533,12 @@ pub async fn delete_principal_device(
         .await
         .map_err(daemon_internal)?;
     match resp {
-        AdminResponseBody::PairDeviceRevoked { .. } => Ok(StatusCode::NO_CONTENT),
+        AdminResponseBody::PairDeviceRevoked { key_id } => {
+            let epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs());
+            acknowledge_device_revocation(&state, &key_id, epoch).await
+        },
         // The kernel returns a bad-input error for an unknown key_id or a
         // missing principal — both surface to the client as 404.
         AdminResponseBody::Error(msg)
@@ -544,6 +549,34 @@ pub async fn delete_principal_device(
         AdminResponseBody::Error(msg) => Err(GatewayError::Forbidden { reason: msg }),
         other => Err(unexpected(other)),
     }
+}
+
+/// Complete the post-kernel acknowledgement for a successful
+/// [`AdminResponseBody::PairDeviceRevoked`] response.
+///
+/// The kernel has already removed the public key when this helper runs. The
+/// gateway only emits HTTP 204 after the same monotonic device fence is
+/// durably published and installed in its live map. Keeping this narrow step
+/// separate also lets persistence-failure tests exercise the HTTP boundary
+/// without fabricating a kernel admin client.
+pub async fn acknowledge_device_revocation(
+    state: &GatewayState,
+    key_id: &str,
+    epoch: u64,
+) -> GatewayResult<StatusCode> {
+    crate::revocations::apply_device_revocation(
+        &state.revoked_key_ids,
+        state.storage_kv.as_deref(),
+        key_id,
+        epoch,
+    )
+    .await
+    .map_err(|error| {
+        GatewayError::Internal(anyhow::anyhow!(
+            "persist device revocation fence for {key_id}: {error}"
+        ))
+    })?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
