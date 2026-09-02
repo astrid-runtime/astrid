@@ -16,13 +16,19 @@
 //! KV namespace [`REVOCATION_NAMESPACE`]. Updates use compare-and-swap/max
 //! semantics so concurrent gateway instances cannot move an epoch backwards.
 //! The old `etc/gateway-revocations.json` is accepted only as an explicit,
-//! one-time migration source and is removed after durable KV read-back.
+//! one-time migration source and is removed after durable KV read-back. A
+//! successful CAS, or a successful maximum-epoch fallback write after a CAS
+//! error, is restart-durable. If both writes fail, callers retain only a
+//! process-local maximum fence and must surface the persistence error; startup
+//! fails closed when KV is unavailable or corrupt, but an otherwise healthy
+//! empty KV cannot reconstruct that lost fence.
 //!
 //! Concurrency: writes are rare (admin deletes), reads are frequent
 //! (every authenticated request). Backed by `std::sync::RwLock`; the
 //! critical sections are non-`await`-blocking by construction.
 
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -146,8 +152,10 @@ pub async fn record_principal_max(
                 // unconditional maximum-epoch tombstone: this intentionally
                 // sacrifices alias reuse until operator repair, but it is
                 // monotonic under every concurrent writer and survives a
-                // restart. If the fallback write also fails, propagate the
-                // durability loss to the watcher as before.
+                // restart when this fallback write succeeds. If the fallback
+                // write also fails, no durable fence exists; propagate that
+                // loss so the caller can retain only a process-local fence and
+                // avoid claiming restart durability.
                 store
                     .set(REVOCATION_NAMESPACE, &key, encode_epoch(u64::MAX))
                     .await
@@ -164,6 +172,13 @@ pub async fn record_principal_max(
 
 /// Record the maximum device revocation epoch durably using the same CAS/max
 /// rule as principal revocations.
+///
+/// A successful CAS, or a successful maximum-epoch fallback write after a
+/// CAS error, leaves a fence that startup hydration can restore. The function
+/// still returns an error after any CAS error so the HTTP caller withholds
+/// `204`, even when the fallback tombstone succeeded. If both writes fail,
+/// there is no durable fence; the caller may install a process-local maximum,
+/// but a later healthy empty KV cannot reconstruct it.
 pub async fn record_device_max(
     store: &dyn KvStore,
     key_id: &str,
@@ -200,8 +215,11 @@ pub async fn record_device_max(
             Err(cas_error) => {
                 // Same fail-closed durability rule as principal deletion.
                 // MAX cannot be moved backward by a later CAS writer, so a
-                // persistence-path fault cannot resurrect this device bearer
-                // after restart.
+                // successful fallback write is restart-durable. If this set
+                // also fails, no durable fence exists; the caller still gets
+                // the error and can retain only an in-memory MAX for the
+                // current process. Hydration aborts while KV is unavailable or
+                // corrupt, while an empty healthy KV cannot recreate the key.
                 store
                     .set(REVOCATION_NAMESPACE, &key, encode_epoch(u64::MAX))
                     .await
@@ -210,10 +228,69 @@ pub async fn record_device_max(
                             "write device revocation {key_id}: CAS failed: {cas_error}; fail-closed tombstone failed: {fallback_error}"
                         )
                     })?;
-                return Ok(u64::MAX);
+                // The tombstone keeps every bearer fail-closed, but the
+                // caller must still observe the publication failure. In
+                // particular, the HTTP revoke path cannot acknowledge 204
+                // when its normal CAS durability path faulted.
+                return Err(anyhow::anyhow!(
+                    "write device revocation {key_id}: CAS failed: {cas_error}; fail-closed tombstone installed"
+                ));
             },
         }
     }
+}
+
+fn publish_device_epoch<S: BuildHasher>(
+    revoked_key_ids: &RwLock<HashMap<String, u64, S>>,
+    key_id: &str,
+    epoch: u64,
+) -> u64 {
+    let mut guard = revoked_key_ids
+        .write()
+        .expect("revoked-key-id map poisoned — fail-stop");
+    let previous = guard.get(key_id).copied().unwrap_or(0);
+    let published = previous.max(epoch);
+    if published > previous {
+        guard.insert(key_id.to_owned(), published);
+    }
+    published
+}
+
+/// Publish a device revocation fence for the HTTP edge.
+///
+/// Durable KV publication is completed before the in-memory map is updated,
+/// so a successful caller can expose HTTP 204 only after both the live gateway
+/// and a future restart have the same monotonic fence. If durable publication
+/// fails, an in-memory `u64::MAX` fence is still installed before the error is
+/// returned; callers must surface that error instead of acknowledging revoke.
+/// When CAS fails but the MAX fallback succeeds, the live MAX is also
+/// restart-durable. When both writes fail, only the current process has that
+/// MAX; a later start against unavailable or corrupt KV must abort hydration,
+/// while a healthy empty KV cannot reconstruct the fence. Without a KV backend
+/// (standalone operation), the requested epoch is intentionally in-memory-only
+/// and carries no restart durability claim; callers that need a degraded
+/// fail-closed fence can pass `u64::MAX` as the epoch.
+pub async fn apply_device_revocation<S: BuildHasher>(
+    revoked_key_ids: &RwLock<HashMap<String, u64, S>>,
+    storage: Option<&dyn KvStore>,
+    key_id: &str,
+    epoch: u64,
+) -> anyhow::Result<u64> {
+    if key_id.is_empty() || key_id.contains('/') {
+        anyhow::bail!("invalid device revocation key id");
+    }
+
+    let durable_epoch = match storage {
+        Some(store) => match record_device_max(store, key_id, epoch).await {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                publish_device_epoch(revoked_key_ids, key_id, u64::MAX);
+                return Err(error);
+            },
+        },
+        None => epoch,
+    };
+    Ok(publish_device_epoch(revoked_key_ids, key_id, durable_epoch))
 }
 
 /// Load all durable principal and device epochs from the fixed control
@@ -428,9 +505,11 @@ pub fn spawn_watcher(
                     Ok(epoch) => epoch,
                     Err(error) => {
                         // Preserve a fail-closed in-memory fence even when
-                        // both CAS and tombstone writes fail. A restart with
-                        // the same unavailable backend fails hydration rather
-                        // than exposing the listener without the fence.
+                        // both CAS and tombstone writes fail. A fresh start
+                        // against the same unavailable or corrupt backend
+                        // fails hydration rather than exposing the listener;
+                        // an empty healthy backend cannot reconstruct this
+                        // process-local fence.
                         tracing::error!(
                             error = %error,
                             principal = %principal,
@@ -475,10 +554,12 @@ pub fn spawn_watcher(
 /// bearer is rejected at the HTTP edge immediately (the kernel cap-gate already
 /// fails it closed — this is defense in depth on the bearer).
 ///
-/// Detached: terminates when the bus is dropped (daemon shutdown). In-memory
-/// only — a revoked key never needs to survive a restart because the profile
-/// it was removed from is the source of truth and the bearer's TTL bounds the
-/// window regardless.
+/// Detached: terminates when the bus is dropped (daemon shutdown). With a
+/// control KV, a successful CAS or MAX fallback is restored by startup
+/// hydration. If both writes fail, the helper reports an error after installing
+/// only a process-local MAX; startup aborts on unavailable/corrupt KV, while a
+/// healthy empty KV cannot reconstruct that fence. Without a control KV, the
+/// live watcher fence is intentionally non-durable.
 ///
 /// # Panics
 /// Panics if the `revoked_key_ids` `RwLock` is poisoned — same fail-stop
@@ -534,36 +615,32 @@ pub fn spawn_key_revocation_watcher(
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0, |d| d.as_secs())
                 });
-            let durable_epoch = if let Some(storage) = storage.as_deref() {
-                match record_device_max(storage, key_id, ts_epoch).await {
-                    Ok(epoch) => epoch,
-                    Err(error) => {
-                        tracing::error!(
-                            error = %error,
-                            key_id = %key_id,
-                            "device revocation KV write failed; running in degraded in-memory mode"
-                        );
-                        u64::MAX
-                    },
-                }
+            let requested_epoch = if storage.is_some() {
+                ts_epoch
             } else {
-                tracing::error!(
-                    key_id = %key_id,
-                    "device revocation storage is unavailable; running in degraded in-memory mode"
-                );
+                // Without a durable backend, preserve the watcher's historic
+                // fail-closed behavior rather than allowing a future bearer
+                // to pass the gateway after the kernel removed its key.
                 u64::MAX
             };
+            let durable_epoch = match apply_device_revocation(
+                &revoked_key_ids,
+                storage.as_deref(),
+                key_id,
+                requested_epoch,
+            )
+            .await
             {
-                let mut guard = revoked_key_ids
-                    .write()
-                    .expect("revoked-key-id map poisoned — fail-stop");
-                // Idempotent: a duplicate / replayed revoke event must not move
-                // the epoch backward (which could resurrect a dead bearer).
-                let prev = guard.get(key_id).copied().unwrap_or(0);
-                if durable_epoch > prev {
-                    guard.insert(key_id.to_string(), durable_epoch);
-                }
-            }
+                Ok(epoch) => epoch,
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        key_id = %key_id,
+                        "device revocation KV write failed; running with an in-memory fail-closed fence"
+                    );
+                    continue;
+                },
+            };
             tracing::info!(key_id = %key_id, revoked_at_epoch = durable_epoch, "device bearer revocation recorded");
         }
     });
