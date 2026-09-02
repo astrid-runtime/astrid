@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
 use super::reclaim::{ReclaimStage, set_stage_hook};
@@ -306,6 +306,66 @@ fn unrecoverable_higher_generation_pointer_does_not_block_older_root() {
         selected.authority_len,
         lower_footer + recover::FOOTER_BYTES as u64
     );
+}
+
+#[test]
+fn rooted_sync_preserves_a_single_copy_recovered_root() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let region = VolumeRegion::new("objects").unwrap();
+    let volume = seeded_volume(&path);
+    volume.reclaim_same_inode().unwrap();
+    volume.detach_for_test().unwrap();
+    drop(volume);
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let selected = recover::recover_container(&mut file).unwrap();
+    let authority_len = selected.authority_len;
+    assert!(selected.generation > 0);
+    assert!(!selected.pointer_slot);
+
+    let sibling_offset = u64::try_from(ROOT_BYTES.checked_sub(ROOT_SLOT_BYTES).unwrap()).unwrap();
+    file.seek(SeekFrom::Start(sibling_offset)).unwrap();
+    file.write_all(&[0; ROOT_SLOT_BYTES]).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let volume = HostedFileVolume::open(&path).unwrap();
+    super::set_root_write_interrupt(true);
+    volume.write_region_at(&region, 0, b"torn").unwrap();
+    let result = volume.sync();
+    super::set_root_write_interrupt(false);
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "interrupted after sibling root write"
+    );
+    volume.detach_for_test().unwrap();
+    drop(volume);
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let interrupted = recover::recover_container(&mut file).unwrap();
+    assert!(!interrupted.pointer_slot);
+    assert_eq!(interrupted.authority_len, authority_len);
+    drop(file);
+
+    let reopened = HostedFileVolume::open(&path).unwrap();
+    assert_eq!(read_objects(&reopened), *b"small");
+    reopened.write_region_at(&region, 0, b"final").unwrap();
+    reopened.sync().unwrap();
+    drop(reopened);
+
+    let reopened = HostedFileVolume::open(&path).unwrap();
+    let mut bytes = [0_u8; 5];
+    reopened.read_region_at(&region, 0, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"final");
 }
 
 #[test]

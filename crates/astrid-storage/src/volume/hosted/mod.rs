@@ -51,6 +51,16 @@ enum RootSlot {
 
 #[cfg(test)]
 thread_local! {
+    static ROOT_WRITE_INTERRUPT: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) fn set_root_write_interrupt(armed: bool) {
+    ROOT_WRITE_INTERRUPT.with(|interrupt| interrupt.set(armed));
+}
+
+#[cfg(test)]
+thread_local! {
     static REGION_STATE_CLONES: Cell<usize> = const { Cell::new(0) };
     static EXTENT_VISITS: Cell<usize> = const { Cell::new(0) };
 }
@@ -217,12 +227,29 @@ impl HostedFileVolume {
         }
         state.file.sync_all()?;
         if state.generation > 0 {
+            // Republish the sibling first: a tear while updating the selected
+            // slot still leaves one checksummed root naming either the old or
+            // the new authority.
+            let selected_slot = state.root_slot == RootSlot::Second;
             recover::write_root_pointer(
                 &mut state.file,
                 state.generation,
                 state.root_base,
                 state.durable_len,
-                false,
+                !selected_slot,
+            )?;
+            state.file.sync_all()?;
+            #[cfg(test)]
+            if ROOT_WRITE_INTERRUPT.with(Cell::get) {
+                ROOT_WRITE_INTERRUPT.with(|armed| armed.set(false));
+                return Err(io::Error::other("interrupted after sibling root write"));
+            }
+            recover::write_root_pointer(
+                &mut state.file,
+                state.generation,
+                state.root_base,
+                state.durable_len,
+                selected_slot,
             )?;
             state.file.sync_all()?;
             recover::write_root_pointer(
