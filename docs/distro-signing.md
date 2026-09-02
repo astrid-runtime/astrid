@@ -155,8 +155,10 @@ Yes — layered, and fail-closed where it matters:
   is **refused** unless the operator passes `--allow-unsigned`. Skipping
   signing never silently weakens trust — it forces the consumer to opt
   into the risk.
-- **Official distros:** effectively mandatory — once the key is in
-  `OFFICIAL_KEYS`, an unsigned build under that distro id is refused.
+- **Official distros:** effectively mandatory — official distro ids
+  accept only keys compiled into `OFFICIAL_KEYS`, and an unsigned build
+  under that id is refused. A non-official key claiming an official id
+  fails closed even with `--accept-new-key`.
 
 ## 6. The strong guarantee: vendor the `.shuttle`
 

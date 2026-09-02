@@ -42,9 +42,9 @@ use super::sign;
 /// compiled in so first contact pins it without a TOFU window.
 const OFFICIAL_KEYS: &[&str] = &["ed25519:utH537RuOuqKwjGx/pHIUAkKapyqPUhHpZIVDU6Q0FA="];
 
-/// Distro ids whose release artifacts must be signed. Keeping this
-/// separate from the signing keys lets the unsigned-source boundary
-/// reject identity spoofing before it can take the manual-install path.
+/// Distro ids whose release artifacts must be signed by an official key.
+/// Keeping this separate from the signing keys lets trust and the
+/// unsigned-source boundary reject identity spoofing before an install.
 const OFFICIAL_DISTRO_IDS: &[&str] = &["unicity-ce"];
 
 /// What the trust check decided.
@@ -137,6 +137,21 @@ fn classify_unpinned_key(key_str: &str) -> TrustAction {
         TrustAction::ToFuTrusted
     }
 }
+
+/// Official identity is bound to the compiled-in keys, not to TOFU.
+///
+/// This deliberately runs before the trust store is consulted so an
+/// unofficial key cannot become (or replace) an official id's pin, even
+/// with the operator override.
+fn ensure_official_id_key(distro_id: &str, key_str: &str) -> anyhow::Result<()> {
+    if is_official_distro_id(distro_id) && !is_official(key_str) {
+        bail!(
+            "official distro '{distro_id}' accepts only compiled-in official signing keys; \
+             refusing non-official key {key_str}"
+        );
+    }
+    Ok(())
+}
 /// Verify a sealed distro's signature and apply the trust policy.
 ///
 /// `manifest_pubkey` is the `[distro.signing].pubkey` declared in the
@@ -163,6 +178,8 @@ pub(crate) fn verify_and_pin(
     // a bad signature is fatal regardless of trust state. (Cases 1–5.)
     sign::verify_lock(lock, sig_hex, &pubkey)
         .context("distro signature is invalid — refusing to install")?;
+
+    ensure_official_id_key(distro_id, &key_str)?;
 
     let pinned = read_pinned(home, distro_id)?;
     let action = match pinned {
@@ -278,6 +295,37 @@ mod tests {
     fn official_release_id_is_signed_only() {
         assert!(is_official_distro_id("unicity-ce"));
         assert!(!is_official_distro_id("test"));
+    }
+
+    #[test]
+    fn official_id_rejects_unofficial_key_before_tofu() {
+        let (_dir, home) = home();
+        let kp = KeyPair::generate();
+        let mut lock = sample_lock();
+        lock.distro.id = "unicity-ce".into();
+        let sig = sign::sign_lock(&lock, &kp).unwrap();
+
+        // The valid signature and operator override must not let a rogue
+        // key claim the official id.
+        let err = verify_and_pin(
+            &home,
+            "unicity-ce",
+            &sign::pubkey_to_wire(&kp.export_public_key()),
+            &sig,
+            &lock,
+            true,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("accepts only compiled-in official signing keys"),
+            "got: {err}"
+        );
+        assert!(
+            read_pinned(&home, "unicity-ce").unwrap().is_none(),
+            "a failed official-id claim must not write a trust pin"
+        );
     }
 
     #[test]
