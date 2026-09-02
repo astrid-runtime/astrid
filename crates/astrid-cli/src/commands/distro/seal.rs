@@ -14,8 +14,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 
+use super::local_source::resolve_local_capsule_archive;
 use super::lock::{DistroLock, DistroLockMeta, LockedCapsule, manifest_hash};
-use super::manifest::{DistroManifest, parse_manifest};
+use super::manifest::{DistroCapsule, DistroManifest, parse_manifest};
 use super::shuttle::{self, ShuttleContent, ShuttleEntry};
 use super::sign;
 use crate::commands::capsule::install::resolve_capsule_to_file;
@@ -57,20 +58,9 @@ pub(crate) async fn run_seal(distro: &str, output: &Path, key: &Path) -> anyhow:
     for cap in &manifest.capsules {
         eprintln!("  resolving {} ({})", cap.name, cap.source);
         let dest = capsules_stage.join(format!("{}.capsule", cap.name));
-        // The ref recorded in the lock is the one resolution ACTUALLY
-        // returned (GitHub's release `tag_name`), never a guess derived
-        // from the manifest's declared fields — so a signed shuttle's
-        // lock attests the ref that was truly fetched. The `name` hint
-        // selects the right `<name>.capsule` when a source ships several.
-        let resolved_ref = resolve_capsule_to_file(
-            &cap.source,
-            (!cap.version.is_empty()).then_some(cap.version.as_str()),
-            cap.tag.as_deref(),
-            Some(&cap.name),
-            &dest,
-        )
-        .await
-        .with_context(|| format!("failed to resolve capsule {}", cap.name))?;
+        let resolved_ref = stage_capsule(cap, &manifest_path, &dest)
+            .await
+            .with_context(|| format!("failed to resolve capsule {}", cap.name))?;
 
         // Hash the staged file once for the lock. The capsule bytes are NOT
         // held in memory beyond this — `pack` streams the staged file in
@@ -86,7 +76,7 @@ pub(crate) async fn run_seal(distro: &str, output: &Path, key: &Path) -> anyhow:
             version: cap.version.clone(),
             source: cap.source.clone(),
             hash,
-            resolved_ref: Some(resolved_ref),
+            resolved_ref,
         });
         capsule_entries.push(ShuttleEntry {
             path: shuttle::capsule_member_path(&cap.name),
@@ -148,6 +138,39 @@ pub(crate) async fn run_seal(distro: &str, output: &Path, key: &Path) -> anyhow:
     Ok(())
 }
 
+/// Stage one manifest member, preferring authenticated local archives.
+async fn stage_capsule(
+    capsule: &DistroCapsule,
+    manifest_path: &Path,
+    dest: &Path,
+) -> anyhow::Result<Option<String>> {
+    if let Some(local_source) = resolve_local_capsule_archive(&capsule.source, Some(manifest_path))?
+    {
+        std::fs::copy(&local_source, dest).with_context(|| {
+            format!(
+                "failed to copy local capsule from {}",
+                local_source.display()
+            )
+        })?;
+        return Ok(None);
+    }
+
+    // The ref recorded in the lock is the one resolution ACTUALLY
+    // returned (GitHub's release `tag_name`), never a guess derived
+    // from the manifest's declared fields — so a signed shuttle's
+    // lock attests the ref that was truly fetched. The `name` hint
+    // selects the right `<name>.capsule` when a source ships several.
+    resolve_capsule_to_file(
+        &capsule.source,
+        (!capsule.version.is_empty()).then_some(capsule.version.as_str()),
+        capsule.tag.as_deref(),
+        Some(&capsule.name),
+        dest,
+    )
+    .await
+    .map(Some)
+}
+
 /// Resolve a seal `distro` argument to a `Distro.toml` path.
 fn resolve_manifest_path(distro: &str) -> anyhow::Result<PathBuf> {
     let p = Path::new(distro);
@@ -200,5 +223,88 @@ mod tests {
         std::fs::write(dir.path().join("Distro.toml"), "x").unwrap();
         let p = resolve_manifest_path(dir.path().to_str().unwrap()).unwrap();
         assert!(p.ends_with("Distro.toml"));
+    }
+
+    #[test]
+    fn seal_resolves_local_members_from_manifest_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+        let capsule_bytes = b"local capsule bytes".to_vec();
+        std::fs::create_dir_all(dir.path().join("capsules")).unwrap();
+        std::fs::write(dir.path().join("capsules/member.capsule"), &capsule_bytes).unwrap();
+
+        let keypair = astrid_crypto::KeyPair::generate();
+        let pubkey = sign::pubkey_to_wire(&keypair.export_public_key());
+        let manifest = format!(
+            "schema-version = 1\n\n\
+             [distro]\nid = \"local-test\"\nname = \"Local Test\"\nversion = \"0.1.0\"\n\n\
+             [distro.signing]\npubkey = \"{pubkey}\"\n\n\
+             [[capsule]]\nname = \"member\"\nsource = \"capsules/member.capsule\"\n\
+             version = \"1.0.0\"\nrole = \"uplink\"\n"
+        );
+        std::fs::write(dir.path().join("Distro.toml"), &manifest).unwrap();
+        let key = dir.path().join("fixture.key");
+        std::fs::write(&key, keypair.secret_key_bytes()).unwrap();
+
+        // The test process cwd is the package directory, not `dir`.
+        futures::executor::block_on(run_seal(
+            dir.path().join("Distro.toml").to_str().unwrap(),
+            &output_dir.path().join("local.shuttle"),
+            &key,
+        ))
+        .unwrap();
+
+        let mirror = tempfile::tempdir().unwrap();
+        shuttle::unpack(&output_dir.path().join("local.shuttle"), mirror.path()).unwrap();
+        let sealed_manifest = std::fs::read(mirror.path().join(shuttle::MANIFEST_NAME)).unwrap();
+        assert_eq!(sealed_manifest, manifest.into_bytes());
+        let lock: DistroLock = toml::from_str(
+            &std::fs::read_to_string(mirror.path().join(shuttle::LOCK_NAME)).unwrap(),
+        )
+        .unwrap();
+        let expected_hash = format!("blake3:{}", blake3::hash(&capsule_bytes).to_hex());
+        assert_eq!(lock.capsules[0].source, "capsules/member.capsule");
+        assert_eq!(lock.capsules[0].hash, expected_hash);
+        assert_eq!(lock.capsules[0].resolved_ref, None);
+        assert_eq!(
+            lock.manifest_hash.as_deref(),
+            Some(manifest_hash(&sealed_manifest).as_str())
+        );
+        let sig = std::fs::read_to_string(mirror.path().join(shuttle::SIG_NAME)).unwrap();
+        sign::verify_lock(&lock, &sig, &keypair.export_public_key()).unwrap();
+        let packed = std::fs::read(shuttle::capsule_mirror_path(mirror.path(), "member")).unwrap();
+        assert_eq!(packed, capsule_bytes);
+    }
+
+    #[test]
+    fn seal_fails_closed_when_relative_member_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let keypair = astrid_crypto::KeyPair::generate();
+        let pubkey = sign::pubkey_to_wire(&keypair.export_public_key());
+        std::fs::write(
+            dir.path().join("Distro.toml"),
+            format!(
+                "schema-version = 1\n\n\
+                 [distro]\nid = \"local-test\"\nname = \"Local Test\"\nversion = \"0.1.0\"\n\n\
+                 [distro.signing]\npubkey = \"{pubkey}\"\n\n\
+                 [[capsule]]\nname = \"member\"\nsource = \"capsules/member.capsule\"\n\
+                 version = \"1.0.0\"\nrole = \"uplink\"\n"
+            ),
+        )
+        .unwrap();
+        let key = dir.path().join("fixture.key");
+        std::fs::write(&key, keypair.secret_key_bytes()).unwrap();
+
+        let err = futures::executor::block_on(run_seal(
+            dir.path().join("Distro.toml").to_str().unwrap(),
+            &dir.path().join("missing.shuttle"),
+            &key,
+        ))
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("member.capsule"),
+            "got: {err:#}"
+        );
+        assert!(!dir.path().join("missing.shuttle").exists());
     }
 }

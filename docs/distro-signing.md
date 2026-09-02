@@ -103,6 +103,11 @@ compile), records the **actually-resolved** ref + BLAKE3 in the lock,
 signs the lock, and packs a deterministic archive (re-sealing identical
 inputs yields byte-identical output).
 
+Relative `capsules/<name>.capsule` sources resolve from the directory
+containing `Distro.toml`, so a manifest and its member archives can travel
+together. Local members have no Git ref to record; GitHub `@org/repo`
+sources continue to use released GitHub assets.
+
 Distros are **release-only**: a capsule pinned to `branch`/`rev` is
 rejected by `seal` — those require building from source. Pin a
 `version` or `tag`; for a bleeding-edge capsule, build it and use

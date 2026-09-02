@@ -183,7 +183,7 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     let selected = if let Some(bundle) = &signed_bundle {
         let staging = tempfile::tempdir().context("create signed capsule staging")?;
         let resolved =
-            signed_source::resolve_signed_capsules(&selected, &bundle.lock, staging.path()).await?;
+            signed_source::resolve_signed_capsules(&selected, bundle, staging.path()).await?;
         // Keep the verified artifacts alive through the install below.
         _capsule_staging = Some(staging);
         resolved
