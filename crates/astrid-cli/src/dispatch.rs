@@ -40,14 +40,14 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    if should_check_for_update(&cli) {
-        commands::self_update::print_update_banner().await;
-    }
-
     let headless_route = cli.prompt.is_some()
         || (cli.command.is_none() && !std::io::stdin().is_terminal())
         || matches!(cli.command, Some(Commands::Run(_)));
     ensure_headless_auto_approve_rejected(cli.auto_approve, headless_route)?;
+
+    if should_check_for_update(&cli) {
+        commands::self_update::print_update_banner().await;
+    }
 
     let output_format = match cli.format.as_str() {
         "json" => OutputFormat::Json,

@@ -1,11 +1,15 @@
-use std::fs::Permissions;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use tempfile::tempdir;
 
 use super::*;
 
+#[cfg(unix)]
+use std::fs::Permissions;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+#[cfg(unix)]
 fn write_private_client_config(path: &Path, contents: &str) {
     std::fs::write(path, contents).expect("write test client config");
     std::fs::set_permissions(path, Permissions::from_mode(0o600))
@@ -30,6 +34,7 @@ fn client_config_rejects_runtime_policy_and_bad_bounds() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn explicit_client_path_requires_absolute_private_file() {
     let root = tempdir().unwrap();
@@ -48,6 +53,7 @@ fn explicit_client_path_requires_absolute_private_file() {
     assert_eq!(load_run_idle_timeout(&absolute).unwrap(), 600);
 }
 
+#[cfg(unix)]
 #[test]
 fn explicit_client_path_rejects_symlink_and_permissive_file() {
     let root = tempdir().unwrap();
@@ -70,6 +76,7 @@ fn explicit_missing_path_fails_instead_of_falling_back() {
     assert!(load_run_idle_timeout(&missing).is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn canonical_default_is_selected_only_when_it_is_a_regular_file() {
     let root = tempdir().unwrap();
