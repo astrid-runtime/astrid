@@ -12,7 +12,10 @@
 //! // Load with full precedence chain (defaults → system → user → workspace → env).
 //! let resolved = Config::load(Some(std::path::Path::new("."))).unwrap();
 //! let config = resolved.config;
-//! println!("Using model: {}", config.model.model);
+//! println!(
+//!     "Max context tokens: {}",
+//!     config.runtime.max_context_tokens
+//! );
 //! ```
 //!
 //! # Configuration Precedence
@@ -22,7 +25,7 @@
 //! 1. **Workspace** (selected project state config) — can only *tighten* security
 //! 2. **User** (`~/.astrid/config.toml`)
 //! 3. **System** (`/etc/astrid/config.toml`)
-//! 4. **Environment variables** (`ASTRID_*`, `ANTHROPIC_*`) — fallback only
+//! 4. **Environment variables** (`ASTRID_*`) — fallback only
 //! 5. **Embedded defaults** (`defaults.toml` compiled into binary)
 //!
 //! Workspace file discovery accepts the runtime's validated

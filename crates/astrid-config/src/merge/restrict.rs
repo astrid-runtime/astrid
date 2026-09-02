@@ -126,24 +126,6 @@ pub fn enforce_restrictions(
         "workspace.auto_allow_write",
     );
 
-    // model.api_key: workspace cannot override.
-    block_workspace_override(
-        merged,
-        baseline,
-        workspace_layer,
-        &["model", "api_key"],
-        "model.api_key",
-    );
-
-    // model.api_url: workspace cannot override.
-    block_workspace_override(
-        merged,
-        baseline,
-        workspace_layer,
-        &["model", "api_url"],
-        "model.api_url",
-    );
-
     // hooks.allow_wasm_hooks: cannot enable (only disable).
     enforce_bool_only_false(
         merged,

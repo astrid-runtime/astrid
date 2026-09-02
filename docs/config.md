@@ -6,7 +6,7 @@ Astrid uses a layered configuration system powered by TOML. Configuration is loa
 2. **System Config** (`/etc/astrid/config.toml`)
 3. **User Config** (`~/.astrid/config.toml` or `$ASTRID_HOME/config.toml`)
 4. **Workspace Config** (`.astrid/config.toml` in the project root — can only **tighten** security, never loosen)
-5. **Environment Variables** (`ASTRID_*`, `ANTHROPIC_*` — fill in unset fields only, do not override)
+5. **Environment Variables** (`ASTRID_*` — fill in unset fields only, do not override)
 
 ## Connectors
 
@@ -48,34 +48,9 @@ method = "admin"
 
 ## Model
 
-Configure the LLM provider and model parameters.
+Host configuration has no model section. Model selection and provider execution are owned by principal-scoped capsules. Configure capsule-specific provider settings in that capsule's `[env]`, then select and discover models through the model registry.
 
-```toml
-[model]
-provider = "claude"
-model = "claude-sonnet-4-20250514"
-max_tokens = 4096
-temperature = 0.7
-# api_key = ""  # Optional: use env var ANTHROPIC_API_KEY instead
-# api_url = ""  # Optional: custom endpoint for proxies or local models
-# context_window = 200000  # Optional: override provider's context window size
-
-[model.pricing]
-input_per_million = 3.0
-output_per_million = 15.0
-```
-
-| Field | Type | Description |
-|---|---|---|
-| `provider` | string | The model provider (e.g., `"claude"`). |
-| `model` | string | The model identifier sent to the API. |
-| `max_tokens` | integer | Maximum tokens to generate per response. |
-| `temperature` | float | Sampling temperature (0.0 - 1.0). |
-| `api_key` | string | (Optional) API key. Prefer env var `ANTHROPIC_API_KEY`. |
-| `api_url` | string | (Optional) Base URL for proxies or alternative endpoints. |
-| `context_window` | integer | (Optional) Override the provider's default context window size. |
-| `pricing.input_per_million` | float | USD per million input tokens (for budget tracking). |
-| `pricing.output_per_million` | float | USD per million output tokens (for budget tracking). |
+Legacy host `[model]` configuration is rejected with migration guidance. It is not silently ignored, and provider credentials are never loaded into core host configuration.
 
 ## Runtime
 

@@ -102,10 +102,7 @@ pub(crate) fn show_paths() -> Result<()> {
     }
 
     println!("\nEnvironment variable fallbacks:");
-    println!("  ANTHROPIC_API_KEY  -> model.api_key");
-    println!("  ANTHROPIC_MODEL    -> model.model");
     println!("  ASTRID_LOG_LEVEL -> logging.level");
-    println!("  ASTRID_MODEL     -> model.model");
     println!("  ASTRID_WORKSPACE_MODE -> workspace.mode");
 
     Ok(())

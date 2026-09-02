@@ -8,7 +8,6 @@
 
 use std::collections::HashMap;
 
-use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -22,8 +21,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// LLM model selection and pricing.
-    pub model: ModelConfig,
     /// Runtime behaviour (context limits, summarisation).
     pub runtime: RuntimeSection,
     /// Signature requirements and approval timeout.
@@ -69,103 +66,6 @@ pub struct Config {
     pub uplinks: Vec<UplinkConfig>,
     /// Pre-configured platform identity links applied at every startup.
     pub identity: IdentitySection,
-}
-
-// ---------------------------------------------------------------------------
-// ModelConfig
-// ---------------------------------------------------------------------------
-
-/// LLM provider selection, endpoint, and token pricing.
-#[derive(Clone, Deserialize)]
-#[serde(default)]
-pub struct ModelConfig {
-    /// Provider identifier (e.g. `"claude"`, `"openai"`).
-    pub provider: String,
-    /// Model name sent to the provider API.
-    pub model: String,
-    /// API key. Prefer environment variables over storing this in a file.
-    #[serde(skip_serializing)]
-    pub api_key: Option<String>,
-    /// Base URL for the provider API (overrides the default endpoint).
-    #[serde(skip_serializing)]
-    pub api_url: Option<String>,
-    /// Maximum tokens to request per completion.
-    pub max_tokens: usize,
-    /// Sampling temperature.
-    pub temperature: f64,
-    /// Context window size in tokens. When set, overrides the provider's
-    /// built-in default for the model. Useful for OpenAI-compatible providers
-    /// where the model name is not recognized.
-    pub context_window: Option<usize>,
-    /// Token pricing used for budget tracking.
-    pub pricing: PricingConfig,
-}
-
-impl std::fmt::Debug for ModelConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ModelConfig")
-            .field("provider", &self.provider)
-            .field("model", &self.model)
-            .field("has_api_key", &self.api_key.is_some())
-            .field("has_api_url", &self.api_url.is_some())
-            .field("max_tokens", &self.max_tokens)
-            .field("temperature", &self.temperature)
-            .field("context_window", &self.context_window)
-            .field("pricing", &self.pricing)
-            .finish()
-    }
-}
-
-impl Serialize for ModelConfig {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("ModelConfig", 6)?;
-        state.serialize_field("provider", &self.provider)?;
-        state.serialize_field("model", &self.model)?;
-        // api_key and api_url are intentionally omitted.
-        state.serialize_field("max_tokens", &self.max_tokens)?;
-        state.serialize_field("temperature", &self.temperature)?;
-        state.serialize_field("context_window", &self.context_window)?;
-        state.serialize_field("pricing", &self.pricing)?;
-        state.end()
-    }
-}
-
-impl Default for ModelConfig {
-    fn default() -> Self {
-        Self {
-            provider: "unknown".to_owned(),
-            model: "unknown".to_owned(),
-            api_key: None,
-            api_url: None,
-            max_tokens: 4096,
-            temperature: 0.7,
-            context_window: None,
-            pricing: PricingConfig::default(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PricingConfig
-// ---------------------------------------------------------------------------
-
-/// Per-token pricing used to compute spend against budget limits.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PricingConfig {
-    /// USD cost per 1 million input tokens.
-    pub input_per_million: f64,
-    /// USD cost per 1 million output tokens.
-    pub output_per_million: f64,
-}
-
-impl Default for PricingConfig {
-    fn default() -> Self {
-        Self {
-            input_per_million: 3.0,
-            output_per_million: 15.0,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

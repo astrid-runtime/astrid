@@ -7,43 +7,8 @@
 # 1. Selected project config — can only tighten security
 # 2. User config (~/.astrid/config.toml)
 # 3. System config (/etc/astrid/config.toml)
-# 4. Environment variables (ASTRID_*, ANTHROPIC_*) — fallback only, not override
+# 4. Environment variables (ASTRID_*) — fallback only, not override
 # 5. This defaults file (embedded in binary)
-
-# ============================================================================
-# Model Configuration
-# ============================================================================
-# Controls which LLM provider and model to use, along with generation settings.
-
-[model]
-# LLM provider to use. Currently supported: "claude"
-provider = "unknown"
-
-# Model identifier. Examples:
-# - "claude-sonnet-4-20250514" (Claude Sonnet 4)
-# - "claude-opus-4-6" (Claude Opus 4.6)
-# - "claude-sonnet-4-5-20250929" (Claude Sonnet 4.5)
-model = "unknown"
-
-# API key for the provider. If not set here, will be read from:
-# - ANTHROPIC_API_KEY environment variable (for Claude)
-# - OPENAI_API_KEY environment variable (for OpenAI, future)
-# api_key = ""
-
-# Custom API endpoint URL. Leave empty to use provider's default.
-# Useful for proxies, local models, or alternative endpoints.
-# api_url = ""
-
-# Maximum tokens to generate per response
-max_tokens = 4096
-
-# Sampling temperature (0.0-1.0). Higher = more random, lower = more deterministic
-temperature = 0.7
-
-# Pricing information for budget tracking (USD per million tokens)
-[model.pricing]
-input_per_million = 3.0
-output_per_million = 15.0
 
 # ============================================================================
 # Runtime Configuration
