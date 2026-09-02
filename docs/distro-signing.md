@@ -116,8 +116,8 @@ Consumers install with `astrid init --distro ./example-distro-0.1.0.shuttle`.
 
 To let consumers pin your key on their very first install (no TOFU
 window), add the same `ed25519:<base64>` to the `OFFICIAL_KEYS` table in
-the `astrid` source and ship a new binary. Until then, even your own
-distro takes the TOFU path.
+the `astrid` source and ship a new binary; the current official key is
+`ed25519:utH537RuOuqKwjGx/pHIUAkKapyqPUhHpZIVDU6Q0FA=`.
 
 ## 4. Operator: installing a signed distro
 

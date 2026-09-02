@@ -38,12 +38,14 @@ use super::sign;
 /// without prompting on first use. Changing this set requires rebuilding
 /// the binary — that is the point: official trust is not runtime-mutable.
 ///
-/// DECISION: empty placeholder — the real official key(s) are not part
-/// of issue #964's spec. With this empty, official distros currently
-/// take the TOFU path like any third party until a key is added here.
-const OFFICIAL_KEYS: &[&str] = &[
-    // "ed25519:<base64>",
-];
+/// The release-authenticated AOS distribution key. Official trust is
+/// compiled in so first contact pins it without a TOFU window.
+const OFFICIAL_KEYS: &[&str] = &["ed25519:utH537RuOuqKwjGx/pHIUAkKapyqPUhHpZIVDU6Q0FA="];
+
+/// Distro ids whose release artifacts must be signed. Keeping this
+/// separate from the signing keys lets the unsigned-source boundary
+/// reject identity spoofing before it can take the manual-install path.
+const OFFICIAL_DISTRO_IDS: &[&str] = &["unicity-ce"];
 
 /// What the trust check decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +125,18 @@ fn is_official(key_str: &str) -> bool {
     OFFICIAL_KEYS.contains(&key_str)
 }
 
+/// Is this a release distro id that refuses the unsigned manual path?
+pub(crate) fn is_official_distro_id(distro_id: &str) -> bool {
+    OFFICIAL_DISTRO_IDS.contains(&distro_id)
+}
+
+fn classify_unpinned_key(key_str: &str) -> TrustAction {
+    if is_official(key_str) {
+        TrustAction::OfficialPinned
+    } else {
+        TrustAction::ToFuTrusted
+    }
+}
 /// Verify a sealed distro's signature and apply the trust policy.
 ///
 /// `manifest_pubkey` is the `[distro.signing].pubkey` declared in the
@@ -173,7 +187,7 @@ pub(crate) fn verify_and_pin(
         None => {
             // TOFU: pin and report.
             pin(home, distro_id, &key_str)?;
-            TrustAction::ToFuTrusted
+            classify_unpinned_key(&key_str)
         },
     };
 
@@ -250,6 +264,20 @@ mod tests {
             read_pinned(&home, "test").unwrap().unwrap(),
             kp.export_public_key()
         );
+    }
+
+    #[test]
+    fn official_key_is_pinned_not_tofu() {
+        assert_eq!(
+            classify_unpinned_key(OFFICIAL_KEYS[0]),
+            TrustAction::OfficialPinned
+        );
+    }
+
+    #[test]
+    fn official_release_id_is_signed_only() {
+        assert!(is_official_distro_id("unicity-ce"));
+        assert!(!is_official_distro_id("test"));
     }
 
     #[test]
