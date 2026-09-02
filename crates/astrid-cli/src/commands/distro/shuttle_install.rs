@@ -79,6 +79,7 @@ pub(crate) async fn install_from_shuttle(
     // 3. Trust gate. A sealed `.shuttle` is a remote-origin artifact:
     //    a missing signature is refused unless --allow-unsigned.
     let signer = if let (Some(signing), Some(sig_hex)) = (&manifest.distro.signing, &sig) {
+        let policy = trust_policy(opts);
         let outcome = trust::verify_and_pin(
             &home,
             &distro_id,
@@ -86,6 +87,7 @@ pub(crate) async fn install_from_shuttle(
             sig_hex,
             &lock,
             opts.accept_new_key,
+            policy,
         )?;
         report_trust(&outcome);
         Some(outcome.key_str)
@@ -182,6 +184,15 @@ fn unsigned_shuttle_may_install(distro_id: &str, opts: &InitOpts) -> anyhow::Res
         );
     }
     Ok(())
+}
+
+/// Product apply is pin-first; ordinary signed shuttles may first-pin.
+fn trust_policy(opts: &InitOpts) -> trust::TrustPolicy {
+    if opts.require_signed {
+        trust::TrustPolicy::RequireExistingPin
+    } else {
+        trust::TrustPolicy::TofuFirstPin
+    }
 }
 
 /// Install each selected capsule from the verified mirror and return
@@ -328,6 +339,10 @@ fn report_trust(outcome: &trust::TrustOutcome) {
         trust::TrustAction::PinnedMatch => {
             format!("signature verified against pinned key {}", outcome.key_str)
         },
+        trust::TrustAction::ToFuTrusted => format!(
+            "trusting key {} on first use — verify it out of band",
+            outcome.key_str
+        ),
         trust::TrustAction::NewKeyAccepted => {
             format!(
                 "re-pinned to new key {} (--accept-new-key)",
@@ -428,6 +443,107 @@ mod tests {
         assert!(sign::verify_lock(&lock, &sig, &kp.export_public_key()).is_ok());
         // Capsule-hash gate.
         assert!(verify_capsule_hashes(&mirror, &lock).is_ok());
+    }
+
+    fn signed_shuttle_trust_inputs(
+        dir: &Path,
+        shuttle_path: &Path,
+    ) -> (
+        tempfile::TempDir,
+        DistroLock,
+        String,
+        String,
+        std::path::PathBuf,
+    ) {
+        let mirror = dir.join("trust-mirror");
+        shuttle::unpack(shuttle_path, &mirror).unwrap();
+        let manifest = std::fs::read_to_string(mirror.join(shuttle::MANIFEST_NAME)).unwrap();
+        let manifest = parse_manifest(&manifest).unwrap();
+        let lock_text = std::fs::read_to_string(mirror.join(shuttle::LOCK_NAME)).unwrap();
+        let lock: DistroLock = toml::from_str(&lock_text).unwrap();
+        let sig = std::fs::read_to_string(mirror.join(shuttle::SIG_NAME)).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let astrid_home = AstridHome::from_path(home.path());
+        let pin_path = astrid_home
+            .root()
+            .join("trust")
+            .join(format!("{}.pub", manifest.distro.id));
+        (
+            home,
+            lock,
+            sig,
+            manifest.distro.signing.unwrap().pubkey,
+            pin_path,
+        )
+    }
+
+    #[test]
+    fn ordinary_signed_shuttle_pins_on_first_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shuttle_path, kp) = make_signed_shuttle(dir.path(), b"FAKE CAPSULE");
+        let (home, lock, sig, pubkey, pin_path) =
+            signed_shuttle_trust_inputs(dir.path(), &shuttle_path);
+        let opts = InitOpts {
+            require_signed: false,
+            ..Default::default()
+        };
+        let astrid_home = AstridHome::from_path(home.path());
+
+        let first = trust::verify_and_pin(
+            &astrid_home,
+            "test",
+            &pubkey,
+            &sig,
+            &lock,
+            false,
+            trust_policy(&opts),
+        )
+        .unwrap();
+        let second = trust::verify_and_pin(
+            &astrid_home,
+            "test",
+            &pubkey,
+            &sig,
+            &lock,
+            false,
+            trust_policy(&opts),
+        )
+        .unwrap();
+
+        assert_eq!(first.action, trust::TrustAction::ToFuTrusted);
+        assert_eq!(second.action, trust::TrustAction::PinnedMatch);
+        assert_eq!(
+            std::fs::read_to_string(&pin_path).unwrap(),
+            format!("{}\n", sign::pubkey_to_wire(&kp.export_public_key()))
+        );
+    }
+
+    #[test]
+    fn product_signed_shuttle_missing_pin_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shuttle_path, _) = make_signed_shuttle(dir.path(), b"FAKE CAPSULE");
+        let (home, lock, sig, pubkey, pin_path) =
+            signed_shuttle_trust_inputs(dir.path(), &shuttle_path);
+        let opts = InitOpts {
+            require_signed: true,
+            accept_new_key: true,
+            ..Default::default()
+        };
+        let astrid_home = AstridHome::from_path(home.path());
+
+        let error = trust::verify_and_pin(
+            &astrid_home,
+            "test",
+            &pubkey,
+            &sig,
+            &lock,
+            opts.accept_new_key,
+            trust_policy(&opts),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("no signing-key pin"));
+        assert!(!pin_path.exists());
     }
 
     #[test]

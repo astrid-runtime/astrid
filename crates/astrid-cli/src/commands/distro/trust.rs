@@ -1,8 +1,9 @@
 //! Distro signing-key trust store and verification policy.
 //!
-//! Trust is per-distro and pinned before use. The store lives at
-//! `~/.astrid/trust/<distro-id>.pub`, one file per distro, containing a
-//! single `ed25519:<base64>` line.
+//! Trust is per-distro. Product paths require the pin to exist before
+//! use; ordinary signed paths may create the first pin. The store lives
+//! at `$ASTRID_HOME/trust/<distro-id>.pub`, one file per distro,
+//! containing a single `ed25519:<base64>` line.
 //!
 //! ## Threat model
 //!
@@ -14,9 +15,10 @@
 //!   signature under a different key is a hard fail (defends against a
 //!   compromised-mirror swapping the maintainer key) unless the operator
 //!   explicitly opts in with `--accept-new-key`.
-//! - A **missing** pin is never created implicitly. This closes the
-//!   first-contact window: the operator installs the key out of band,
-//!   then installs the distro.
+//! - A **missing** pin fails closed on product paths. Ordinary signed
+//!   init and shuttle paths trust a valid first key on first use and
+//!   write the pin, while keeping the first-contact choice visible in
+//!   operator output.
 //!
 //! ## Not a chain of trust (yet)
 //!
@@ -38,9 +40,23 @@ use super::sign;
 pub(crate) enum TrustAction {
     /// Signature valid against the already-pinned key.
     PinnedMatch,
+    /// Ordinary signed path saw a valid key with no prior pin and wrote
+    /// the first pin.
+    ToFuTrusted,
     /// Signature valid but key differed from the pin; operator passed
     /// `--accept-new-key` → re-pinned.
     NewKeyAccepted,
+}
+
+/// Whether the verifier may create the first pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrustPolicy {
+    /// Product and other explicit signed paths fail closed when no pin
+    /// exists; the operator installs it out of band first.
+    RequireExistingPin,
+    /// Ordinary signed init and shuttle paths may trust and pin the
+    /// first valid key.
+    TofuFirstPin,
 }
 
 /// Outcome of a successful trust check.
@@ -121,6 +137,7 @@ pub(crate) fn verify_and_pin(
     sig_hex: &str,
     lock: &DistroLock,
     accept_new_key: bool,
+    policy: TrustPolicy,
 ) -> anyhow::Result<TrustOutcome> {
     let pubkey = sign::parse_pubkey(manifest_pubkey)?;
     let key_str = sign::pubkey_to_wire(&pubkey);
@@ -146,12 +163,16 @@ pub(crate) fn verify_and_pin(
             write_pin(home, distro_id, &key_str)?;
             TrustAction::NewKeyAccepted
         },
-        None => {
+        None if policy == TrustPolicy::RequireExistingPin => {
             bail!(
                 "distro '{distro_id}' has no signing-key pin at {} — install the operator-verified \
                  key before use; this path does not create a first-use pin",
                 trust_path(home, distro_id).display()
             );
+        },
+        None => {
+            write_pin(home, distro_id, &key_str)?;
+            TrustAction::ToFuTrusted
         },
     };
 
@@ -239,6 +260,7 @@ mod tests {
             &sig,
             &lock,
             false,
+            TrustPolicy::RequireExistingPin,
         )
         .unwrap();
 
@@ -250,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_pin_fails_closed_without_writing_a_pin() {
+    fn product_missing_pin_fails_closed_without_writing_a_pin() {
         let (_d, home) = home();
         let kp = KeyPair::generate();
         let lock = sample_lock();
@@ -264,6 +286,7 @@ mod tests {
                 &sig,
                 &lock,
                 accept_new_key,
+                TrustPolicy::RequireExistingPin,
             )
             .unwrap_err();
             assert!(err.to_string().contains("no signing-key pin"), "got: {err}");
@@ -288,6 +311,7 @@ mod tests {
             &sig2,
             &lock,
             false,
+            TrustPolicy::RequireExistingPin,
         )
         .unwrap_err();
         assert!(err.to_string().contains("pinned"), "got: {err}");
@@ -313,6 +337,7 @@ mod tests {
             &sig2,
             &lock,
             true,
+            TrustPolicy::RequireExistingPin,
         )
         .unwrap();
         assert_eq!(out.action, TrustAction::NewKeyAccepted);
@@ -339,6 +364,7 @@ mod tests {
             &sig,
             &tampered,
             true, // even with override
+            TrustPolicy::RequireExistingPin,
         )
         .unwrap_err();
         assert!(err.to_string().contains("invalid"), "got: {err}");
@@ -382,9 +408,35 @@ mod tests {
                 &sig,
                 &tampered,
                 true,
+                TrustPolicy::RequireExistingPin,
             )
             .unwrap_err();
             assert!(err.to_string().contains("invalid"), "got: {err}");
         }
+    }
+
+    #[test]
+    fn ordinary_missing_pin_performs_first_use_tofu() {
+        let (_d, home) = home();
+        let kp = KeyPair::generate();
+        let lock = sample_lock();
+        let sig = sign::sign_lock(&lock, &kp).unwrap();
+
+        let out = verify_and_pin(
+            &home,
+            "test",
+            &sign::pubkey_to_wire(&kp.export_public_key()),
+            &sig,
+            &lock,
+            false,
+            TrustPolicy::TofuFirstPin,
+        )
+        .unwrap();
+
+        assert_eq!(out.action, TrustAction::ToFuTrusted);
+        assert_eq!(
+            read_pinned(&home, "test").unwrap().unwrap(),
+            kp.export_public_key()
+        );
     }
 }

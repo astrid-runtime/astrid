@@ -39,18 +39,19 @@ identity makes repeated composition reproducible and reusable through Muninn.
 Private secrets and per-principal writable state are excluded from the shared
 image and remain separate principal-owned roots.
 
-## 2. Trust: pre-installed pins and rotation
+## 2. Trust: pins, first use, and rotation
 
-Trust is per-distro and lives at `~/.astrid/trust/<distro-id>.pub` (one
+Trust is per-distro and lives at `$ASTRID_HOME/trust/<distro-id>.pub` (one
 pinned `ed25519:<base64>` per distro id):
 
-- **Before first install** → install the operator-verified key at the
-  trust path. The verifier never creates a pin on first contact.
+- **Product `astrid distro apply`** → install the operator-verified key
+  at the trust path before use. A missing pin fails closed, even with
+  `--accept-new-key`.
+- **Ordinary signed init or `.shuttle`** → a valid key with no prior pin
+  is trusted on first use, written to the trust path, and reported.
 - **A later install signed by a *different* key** → hard fail. Re-pin
   only with `--accept-new-key`, and only if you trust the new key.
 - **An invalid signature** → hard fail, no override.
-- **A missing pin** → hard fail for every signed path, including product
-  `astrid distro apply`.
 
 This catches a *key swap* (attacker uses their own key). It does **not**
 catch *key theft* (attacker uses the real stolen key) — for that, see §6
@@ -115,9 +116,11 @@ Consumers install with `astrid init --distro ./example-distro-0.1.0.shuttle`.
 ### 3.5 Publish the trust pin
 
 Publish the exact `ed25519:<base64>` value through an out-of-band
-channel your operators trust. Before installing, each operator writes
-that one line to `~/.astrid/trust/<distro-id>.pub`. Do not mail the key
-through the same channel that serves the release.
+channel your operators trust. Product operators write that one line to
+`$ASTRID_HOME/trust/<distro-id>.pub` before install (`~/.astrid` is the
+default example). Ordinary signed installs can create this pin on first
+use. Do not mail the key through the same channel that serves the
+release.
 
 ## 4. Operator: installing a signed distro
 
@@ -142,7 +145,7 @@ Relevant flags:
 | `--yes` | Non-interactive: take group defaults, resolve variables from `--var` / `ASTRID_VAR_<KEY>` / manifest defaults, error if a required one is unset. |
 | `--offline` | Forbid all network. A non-local capsule source is a hard error. |
 | `--allow-unsigned` | For an ordinary third-party init or `.shuttle`, install a distro that ships no signature (see §5). Product `astrid distro apply` rejects it. |
-| `--accept-new-key` | Re-pin when a valid signature is under a key different from an existing pin. A missing pin still fails closed. |
+| `--accept-new-key` | Re-pin when a valid signature is under a key different from an existing pin. A missing pin fails closed on product Apply. |
 
 ## 5. Is signing optional?
 
@@ -157,7 +160,7 @@ Yes — layered, and fail-closed where it matters:
   weakens trust — it forces the consumer to opt into the risk.
 - **Product Apply:** signed-only. `--allow-unsigned` is rejected, and a
   signed artifact is installed only when its key already matches the
-  operator-installed pin. No signed path performs TOFU.
+  operator-installed pin. Product Apply performs no TOFU.
 
 ## 6. The strong guarantee: vendor the `.shuttle`
 

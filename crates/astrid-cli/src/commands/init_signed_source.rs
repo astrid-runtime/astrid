@@ -286,6 +286,7 @@ fn verify_signed_manifest(
         sig_hex,
         lock,
         accept_new_key,
+        trust::TrustPolicy::RequireExistingPin,
     )?;
     tracing::info!(
         distro = %manifest.distro.id,
