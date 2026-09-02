@@ -56,6 +56,41 @@ fn attach_cap_is_bounded_per_principal_channel() {
     assert_eq!(MAX_ATTACHES, 16);
 }
 
+#[test]
+fn control_tokens_have_distinct_lifetimes_and_widths() {
+    let boot_token = mint_boot_token();
+    let hook_token = mint_hook_token();
+    assert_eq!(boot_token.len(), 32);
+    assert_eq!(hook_token.len(), 64);
+    assert_ne!(boot_token, hook_token);
+}
+
+#[tokio::test]
+async fn every_stopper_is_counted_until_its_ack_delivery_finishes() {
+    let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
+    let state = GatewayState::new(
+        PathBuf::from("/runtime-home"),
+        principal,
+        "gateway-token".into(),
+    );
+    state.begin_stop_ack();
+    state.begin_stop_ack();
+
+    let waiting = state.wait_for_stop_acks();
+    tokio::pin!(waiting);
+    tokio::task::yield_now().await;
+    state.finish_stop_ack();
+    tokio::time::timeout(std::time::Duration::from_millis(20), &mut waiting)
+        .await
+        .expect_err("the final stopper must not release the run loop early");
+
+    tokio::task::yield_now().await;
+    state.finish_stop_ack();
+    tokio::time::timeout(std::time::Duration::from_millis(1), &mut waiting)
+        .await
+        .expect("final ACK delivery must be bounded");
+}
+
 #[tokio::test]
 async fn attach_cap_rejects_the_seventeenth_live_session() {
     let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
@@ -630,4 +665,215 @@ async fn acquire_does_not_evict_active_slots() {
     for cancel in cancels {
         cancel.cancel();
     }
+}
+
+#[tokio::test]
+async fn forged_gateway_stop_cannot_cancel_the_process() {
+    use tokio::io::AsyncReadExt;
+
+    let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
+    let state = Arc::new(GatewayState::new(
+        PathBuf::from("/runtime-home"),
+        principal,
+        "gateway-token".into(),
+    ));
+    let request = GatewayControlRequest {
+        version: GATEWAY_CONTROL_VERSION,
+        operation: GatewayControlOperation::Stop,
+        pid: std::process::id(),
+        hook_token: "forged-token".into(),
+    };
+    let (server, mut client) = tokio::io::duplex(4096);
+    let connection = state.connection();
+
+    serve_control(request, server, Arc::clone(&state), Some(connection))
+        .await
+        .expect("forged control receives a bounded rejection");
+    let mut response = Vec::new();
+    client
+        .read_to_end(&mut response)
+        .await
+        .expect("control ACK");
+    let ack: GatewayControlAck =
+        serde_json::from_slice(&response).expect("rejection is valid JSON");
+    assert!(!ack.ok);
+    assert!(!state.shutdown.is_cancelled());
+    assert_eq!(state.active_connections.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
+async fn authenticated_gateway_stop_waits_for_final_teardown_ack() {
+    use tokio::io::AsyncReadExt;
+    use tokio::time::{Duration, timeout};
+
+    let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
+    let state = Arc::new(GatewayState::new(
+        PathBuf::from("/runtime-home"),
+        principal,
+        "gateway-token".into(),
+    ));
+    let request = GatewayControlRequest {
+        version: GATEWAY_CONTROL_VERSION,
+        operation: GatewayControlOperation::Stop,
+        pid: std::process::id(),
+        hook_token: "gateway-token".into(),
+    };
+    let (server, mut client) = tokio::io::duplex(4096);
+    let serving_state = Arc::clone(&state);
+    let connection = state.connection();
+    let serving = tokio::spawn(async move {
+        serve_control(request, server, serving_state, Some(connection)).await
+    });
+
+    timeout(Duration::from_secs(1), state.shutdown.cancelled())
+        .await
+        .expect("authenticated stop must cancel the gateway");
+    assert_eq!(state.active_connections.load(Ordering::Acquire), 0);
+    assert!(
+        timeout(Duration::from_millis(20), client.read_u8())
+            .await
+            .is_err(),
+        "no success ACK may precede final teardown"
+    );
+
+    state
+        .finish_shutdown(GatewayControlAck::success(
+            GatewayControlOperation::Stop,
+            std::process::id(),
+        ))
+        .await;
+    let mut response = Vec::new();
+    client
+        .read_to_end(&mut response)
+        .await
+        .expect("control ACK");
+    serving
+        .await
+        .expect("control task")
+        .expect("authenticated control");
+    let ack: GatewayControlAck = serde_json::from_slice(&response).expect("valid ACK JSON");
+    assert!(ack.ok);
+    timeout(Duration::from_secs(1), state.shutdown_ack_sent.notified())
+        .await
+        .expect("ACK completion notification retains its permit");
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_precounted_connections() {
+    use tokio::time::{Duration, timeout};
+
+    let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
+    let state = Arc::new(GatewayState::new(
+        PathBuf::from("/runtime-home"),
+        principal,
+        "gateway-token".into(),
+    ));
+    let connection = state.connection();
+    let waiting_state = Arc::clone(&state);
+    let mut waiting = tokio::spawn(async move { waiting_state.wait_for_connections().await });
+
+    assert!(
+        timeout(Duration::from_millis(20), &mut waiting)
+            .await
+            .is_err(),
+        "shutdown must not race past an accepted, not-yet-polled connection"
+    );
+    drop(connection);
+    timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("connection drain")
+        .expect("connection waiter");
+}
+
+#[tokio::test]
+async fn concurrent_accepted_stoppers_receive_the_same_final_ack() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixListener;
+    use tokio::time::{Duration, timeout};
+
+    let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
+    let state = Arc::new(GatewayState::new(
+        PathBuf::from("/runtime-home"),
+        principal,
+        "gateway-token".into(),
+    ));
+    let socket = std::env::temp_dir().join(format!("astrid-1809-stop-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let listener = UnixListener::bind(&socket).expect("short-path gateway listener");
+    let accepting_state = Arc::clone(&state);
+    let accepting = tokio::spawn(async move { accept_loop(listener, accepting_state).await });
+
+    let request = serde_json::to_vec(&GatewayControlRequest {
+        version: GATEWAY_CONTROL_VERSION,
+        operation: GatewayControlOperation::Stop,
+        pid: std::process::id(),
+        hook_token: "gateway-token".into(),
+    })
+    .expect("control request");
+    let mut clients = Vec::new();
+    for _ in 0..2 {
+        let mut client = tokio::net::UnixStream::connect(&socket)
+            .await
+            .expect("connect stopper");
+        client
+            .write_all(&request)
+            .await
+            .expect("queue stop request");
+        client.write_all(b"\n").await.expect("terminate request");
+        clients.push(client);
+    }
+    tokio::task::yield_now().await;
+    state.shutdown.cancel();
+
+    state
+        .finish_shutdown(GatewayControlAck::success(
+            GatewayControlOperation::Stop,
+            std::process::id(),
+        ))
+        .await;
+    timeout(Duration::from_secs(1), accepting)
+        .await
+        .expect("accept loop drains all stoppers")
+        .expect("accept loop task")
+        .expect("normal accept exit");
+
+    let mut acks = Vec::new();
+    for mut client in clients {
+        let mut response = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut client, &mut response)
+            .await
+            .expect("control ACK");
+        acks.push(serde_json::from_slice::<GatewayControlAck>(&response).expect("valid ACK"));
+    }
+    assert!(acks.iter().all(|ack| ack.ok));
+    let _ = std::fs::remove_file(&socket);
+}
+
+#[tokio::test]
+async fn shutdown_rejects_late_attach_admission() {
+    let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
+    let state = GatewayState::new(
+        PathBuf::from("/runtime-home"),
+        principal,
+        "gateway-token".into(),
+    );
+    state.shutdown.cancel();
+
+    let Err(error) = state.reserve_session("thread-late", "codex-code").await else {
+        panic!("stop must close attach admission");
+    };
+    assert!(error.to_string().contains("shutting down"));
+}
+
+#[test]
+fn gateway_cleanup_failure_does_not_mask_accept_failure() {
+    let error = combine_gateway_results(
+        Err(anyhow::anyhow!("gateway.accept")),
+        Err(anyhow::anyhow!("gateway.listener_cleanup")),
+    )
+    .expect_err("both failures must be returned");
+    let message = format!("{error:#}");
+    assert!(message.starts_with("gateway.accept"));
+    assert!(message.contains("additional gateway cleanup failure"));
+    assert!(message.contains("gateway.listener_cleanup"));
 }

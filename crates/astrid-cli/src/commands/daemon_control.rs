@@ -54,6 +54,68 @@ pub(crate) fn read_pid_file(pid_path: &Path) -> Option<(u32, Option<PathBuf>)> {
     parse_pid_file(&contents)
 }
 
+/// A captured daemon generation. The nonce is minted and published while the
+/// singleton lock is held; PID and executable path alone do not own it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DaemonIdentity {
+    pub pid: u32,
+    pub exe: Option<PathBuf>,
+    pub boot_nonce: Option<String>,
+}
+
+pub(crate) fn read_daemon_identity(pid_path: &Path) -> Option<DaemonIdentity> {
+    let contents = std::fs::read_to_string(pid_path).ok()?;
+    let mut lines = contents.lines();
+    let pid = parse_pid(lines.next()?)?;
+    let exe = lines
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let boot_nonce = lines
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .map(str::to_owned);
+    Some(DaemonIdentity {
+        pid,
+        exe,
+        boot_nonce,
+    })
+}
+
+pub(crate) async fn terminate_identity(identity: &DaemonIdentity, pid_path: &Path) -> KillOutcome {
+    if let Some(expected) = &identity.boot_nonce
+        && read_daemon_identity_from_contents(
+            &std::fs::read_to_string(pid_path).unwrap_or_default(),
+        )
+        .is_none_or(|current| current.boot_nonce.as_deref() != Some(expected.as_str()))
+    {
+        return KillOutcome::Unverified(identity.pid);
+    }
+    terminate_known(identity.pid, identity.exe.as_deref()).await
+}
+
+fn read_daemon_identity_from_contents(contents: &str) -> Option<DaemonIdentity> {
+    let mut lines = contents.lines();
+    let pid = parse_pid(lines.next()?)?;
+    let exe = lines
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let boot_nonce = lines
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    Some(DaemonIdentity {
+        pid,
+        exe,
+        boot_nonce,
+    })
+}
+
 /// Parse the PID-file body: first line = PID (required), optional second line =
 /// the daemon's recorded executable path. Pure helper, split out for testing.
 pub(crate) fn parse_pid_file(contents: &str) -> Option<(u32, Option<PathBuf>)> {
@@ -255,10 +317,10 @@ pub(crate) enum KillOutcome {
 /// state db), so the function is self-contained and unit-testable against any
 /// PID.
 pub(crate) async fn terminate_orphan(pid_path: &Path) -> KillOutcome {
-    let Some((pid, recorded_exe)) = read_pid_file(pid_path) else {
+    let Some(identity) = read_daemon_identity(pid_path) else {
         return KillOutcome::NotRunning;
     };
-    terminate_known(pid, recorded_exe.as_deref()).await
+    terminate_identity(&identity, pid_path).await
 }
 
 /// Terminate a daemon whose PID and recorded exe are ALREADY in hand — the
@@ -376,6 +438,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("system.pid");
         assert_eq!(read_pid_file(&path), None);
+    }
+
+    #[test]
+    fn daemon_identity_binds_pid_exe_and_boot_nonce() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("system.pid");
+        std::fs::write(&path, "42\n/daemon\nnonce\n").unwrap();
+        assert_eq!(
+            read_daemon_identity(&path),
+            Some(DaemonIdentity {
+                pid: 42,
+                exe: Some(PathBuf::from("/daemon")),
+                boot_nonce: Some("nonce".into()),
+            })
+        );
     }
 
     #[test]
@@ -513,6 +590,40 @@ mod tests {
         std::fs::write(&path, format!("{me}")).unwrap();
         assert_eq!(terminate_orphan(&path).await, KillOutcome::Unverified(me));
         assert!(is_process_alive(me));
+    }
+
+    #[tokio::test]
+    async fn captured_nonce_fails_closed_when_current_pid_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("system.pid");
+        let identity = DaemonIdentity {
+            pid: std::process::id(),
+            exe: std::env::current_exe().ok(),
+            boot_nonce: Some("captured-generation".into()),
+        };
+
+        assert_eq!(
+            terminate_identity(&identity, &path).await,
+            KillOutcome::Unverified(identity.pid)
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_nonce_fails_closed_when_current_pid_file_is_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("system.pid");
+        std::fs::write(&path, b"not-a-daemon-generation\n").unwrap();
+        let identity = DaemonIdentity {
+            pid: std::process::id(),
+            exe: std::env::current_exe().ok(),
+            boot_nonce: Some("captured-generation".into()),
+        };
+
+        assert_eq!(
+            terminate_identity(&identity, &path).await,
+            KillOutcome::Unverified(identity.pid)
+        );
+        assert!(is_process_alive(std::process::id()));
     }
 
     #[test]
