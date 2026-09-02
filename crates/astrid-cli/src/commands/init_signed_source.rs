@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 use astrid_core::dirs::AstridHome;
 
-use super::super::distro::local_source::resolve_local_capsule_archive;
+use super::super::distro::local_source::{
+    normalize_authenticated_manifest_path, resolve_local_capsule_archive,
+};
 use super::super::distro::lock::{DistroLock, manifest_hash};
 use super::super::distro::manifest::{DistroCapsule, DistroManifest, parse_manifest};
 use super::super::distro::trust;
@@ -184,10 +186,17 @@ async fn fetch_signed_manifest(
     home: &AstridHome,
 ) -> anyhow::Result<SignedDistroBundle> {
     let source_path = PathBuf::from(source);
-    let local_manifest_path = source_path.is_file().then_some(source_path);
-    let (manifest_bytes, manifest) = fetch_manifest_bytes(source, offline).await?;
+    let local_manifest_path = source_path
+        .is_file()
+        .then(|| normalize_authenticated_manifest_path(&source_path))
+        .transpose()?;
+    let source = local_manifest_path
+        .as_deref()
+        .and_then(Path::to_str)
+        .map_or_else(|| source.to_owned(), str::to_owned);
+    let (manifest_bytes, manifest) = fetch_manifest_bytes(&source, offline).await?;
     let manifest_hash = manifest_hash(&manifest_bytes);
-    let lock_bytes = fetch_signed_member(source, offline, "Distro.lock").await?;
+    let lock_bytes = fetch_signed_member(&source, offline, "Distro.lock").await?;
     anyhow::ensure!(
         lock_bytes.len() <= 1024 * 1024,
         "Distro.lock exceeds 1 MB limit"
@@ -195,7 +204,7 @@ async fn fetch_signed_manifest(
     let lock_text = std::str::from_utf8(&lock_bytes).context("Distro.lock is not valid UTF-8")?;
     let lock: DistroLock =
         toml::from_str(lock_text).context("failed to parse signed Distro.lock")?;
-    let sig_bytes = fetch_signed_member(source, offline, "Distro.sig").await?;
+    let sig_bytes = fetch_signed_member(&source, offline, "Distro.sig").await?;
     anyhow::ensure!(
         sig_bytes.len() <= 64 * 1024,
         "Distro.sig exceeds size limit"

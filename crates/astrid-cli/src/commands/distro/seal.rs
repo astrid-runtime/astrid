@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 
+use super::local_source::normalize_authenticated_manifest_path;
 use super::local_source::resolve_local_capsule_archive;
 use super::lock::{DistroLock, DistroLockMeta, LockedCapsule, manifest_hash};
 use super::manifest::{DistroCapsule, DistroManifest, parse_manifest};
@@ -29,7 +30,7 @@ use crate::theme::Theme;
 /// file holding the 32 raw ed25519 secret-key bytes.
 pub(crate) async fn run_seal(distro: &str, output: &Path, key: &Path) -> anyhow::Result<()> {
     // 1. Load the manifest, keeping the verbatim bytes for hashing.
-    let manifest_path = resolve_manifest_path(distro)?;
+    let manifest_path = normalize_authenticated_manifest_path(&resolve_manifest_path(distro)?)?;
     let manifest_bytes = std::fs::read(&manifest_path)
         .with_context(|| format!("failed to read {}", manifest_path.display()))?;
     let manifest_text =
@@ -208,6 +209,40 @@ fn load_signing_key(path: &Path) -> anyhow::Result<astrid_crypto::KeyPair> {
 mod tests {
     use super::*;
 
+    struct CurrentDirGuard(PathBuf);
+
+    impl CurrentDirGuard {
+        fn set(path: &Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self(original)
+        }
+    }
+
+    fn run_bare_cwd_child(child_name: &str, marker: &str) {
+        let result_dir = tempfile::tempdir().unwrap();
+        let result_path = result_dir.path().join("result");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "--nocapture", child_name])
+            .env("ASTRID_BARE_CWD_TEST", "1")
+            .env("ASTRID_BARE_CWD_RESULT", &result_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(result_path).unwrap(), marker);
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).unwrap();
+        }
+    }
+
     #[test]
     fn load_signing_key_rejects_wrong_length() {
         let dir = tempfile::tempdir().unwrap();
@@ -226,7 +261,18 @@ mod tests {
     }
 
     #[test]
-    fn seal_resolves_local_members_from_manifest_parent() {
+    fn seal_resolves_local_members_from_bare_manifest_path_in_cwd() {
+        run_bare_cwd_child(
+            "commands::distro::seal::tests::seal_bare_manifest_path_child",
+            "BARE_MANIFEST_SEAL_OK",
+        );
+    }
+
+    #[test]
+    fn seal_bare_manifest_path_child() {
+        if std::env::var("ASTRID_BARE_CWD_TEST").as_deref() != Ok("1") {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let output_dir = tempfile::tempdir().unwrap();
         let capsule_bytes = b"local capsule bytes".to_vec();
@@ -246,9 +292,9 @@ mod tests {
         let key = dir.path().join("fixture.key");
         std::fs::write(&key, keypair.secret_key_bytes()).unwrap();
 
-        // The test process cwd is the package directory, not `dir`.
+        let _current_dir = CurrentDirGuard::set(dir.path());
         futures::executor::block_on(run_seal(
-            dir.path().join("Distro.toml").to_str().unwrap(),
+            "Distro.toml",
             &output_dir.path().join("local.shuttle"),
             &key,
         ))
@@ -274,6 +320,11 @@ mod tests {
         sign::verify_lock(&lock, &sig, &keypair.export_public_key()).unwrap();
         let packed = std::fs::read(shuttle::capsule_mirror_path(mirror.path(), "member")).unwrap();
         assert_eq!(packed, capsule_bytes);
+        std::fs::write(
+            std::env::var("ASTRID_BARE_CWD_RESULT").unwrap(),
+            "BARE_MANIFEST_SEAL_OK",
+        )
+        .unwrap();
     }
 
     #[test]

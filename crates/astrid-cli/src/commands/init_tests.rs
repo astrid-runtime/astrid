@@ -4,6 +4,40 @@
 
 use super::*;
 
+struct CurrentDirGuard(std::path::PathBuf);
+
+impl CurrentDirGuard {
+    fn set(path: &std::path::Path) -> Self {
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(path).unwrap();
+        Self(original)
+    }
+}
+
+impl Drop for CurrentDirGuard {
+    fn drop(&mut self) {
+        std::env::set_current_dir(&self.0).unwrap();
+    }
+}
+
+fn run_bare_cwd_child(child_name: &str, marker: &str) {
+    let result_dir = tempfile::tempdir().unwrap();
+    let result_path = result_dir.path().join("result");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "--nocapture", child_name])
+        .env("ASTRID_BARE_CWD_TEST", "1")
+        .env("ASTRID_BARE_CWD_RESULT", &result_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(result_path).unwrap(), marker);
+}
+
 #[test]
 fn batch_install_rejects_reported_identity_mismatch() {
     let expected = astrid_capsule::capsule::CapsuleId::new("expected-capsule").unwrap();
@@ -282,8 +316,21 @@ async fn prepared_local_signed_fixture(
     dir: &std::path::Path,
     capsule_bytes: &[u8],
 ) -> (super::signed_source::SignedDistroBundle, Vec<u8>, String) {
+    prepared_local_signed_fixture_with_source(
+        dir,
+        capsule_bytes,
+        dir.join("Distro.toml").to_str().unwrap(),
+    )
+    .await
+}
+
+async fn prepared_local_signed_fixture_with_source(
+    dir: &std::path::Path,
+    capsule_bytes: &[u8],
+    source: &str,
+) -> (super::signed_source::SignedDistroBundle, Vec<u8>, String) {
     let home = AstridHome::from_path(dir.join("home"));
-    let (source, bytes, expected_hash, keypair) = signed_local_source_fixture(dir, capsule_bytes);
+    let (_, bytes, expected_hash, keypair) = signed_local_source_fixture(dir, capsule_bytes);
     seed_distro_pin(&home, "local-test", &keypair);
     let opts = InitOpts {
         require_signed: true,
@@ -291,13 +338,66 @@ async fn prepared_local_signed_fixture(
         ..Default::default()
     };
     let super::PreparedDistro::Signed(bundle) =
-        super::signed_source::prepare_distro_source(source.to_str().unwrap(), &opts, &home)
+        super::signed_source::prepare_distro_source(source, &opts, &home)
             .await
             .unwrap()
     else {
         panic!("signed local Distro.toml must prepare a signed bundle");
     };
     (*bundle, bytes, expected_hash)
+}
+
+#[test]
+fn signed_apply_prepares_and_resolves_bare_manifest_path_in_cwd() {
+    run_bare_cwd_child(
+        "commands::init::tests::signed_apply_bare_manifest_path_child",
+        "BARE_MANIFEST_APPLY_OK",
+    );
+}
+
+#[test]
+fn signed_apply_bare_manifest_path_child() {
+    if std::env::var("ASTRID_BARE_CWD_TEST").as_deref() != Ok("1") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let capsule_bytes = b"local signed capsule".to_vec();
+
+    let _current_dir = CurrentDirGuard::set(dir.path());
+    let prepared = futures::executor::block_on(prepared_local_signed_fixture_with_source(
+        dir.path(),
+        &capsule_bytes,
+        "Distro.toml",
+    ));
+    let (bundle, bytes, expected_hash) = prepared;
+    assert_eq!(bundle.manifest_hash, expected_hash);
+    assert_eq!(bundle.manifest_hash, manifest_hash(&bytes));
+    assert_eq!(
+        bundle.manifest_path.as_deref(),
+        Some(
+            dir.path()
+                .canonicalize()
+                .unwrap()
+                .join("Distro.toml")
+                .as_path()
+        )
+    );
+
+    let staging = tempfile::tempdir().unwrap();
+    let resolved = futures::executor::block_on(super::signed_source::resolve_signed_capsules(
+        &bundle.manifest.capsules,
+        &bundle,
+        staging.path(),
+    ))
+    .unwrap();
+    let staged = staging.path().join("member.capsule");
+    assert_eq!(std::fs::read(&staged).unwrap(), capsule_bytes);
+    assert_eq!(resolved[0].source, staged.to_string_lossy());
+    std::fs::write(
+        std::env::var("ASTRID_BARE_CWD_RESULT").unwrap(),
+        "BARE_MANIFEST_APPLY_OK",
+    )
+    .unwrap();
 }
 
 #[test]

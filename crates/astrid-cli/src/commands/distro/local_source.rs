@@ -11,6 +11,26 @@ pub(crate) fn is_local_capsule_source(source: &str) -> bool {
     source.ends_with(".capsule") && !source.contains("://") && parse_github_source(source).is_none()
 }
 
+/// Root a local authenticated manifest in the caller's current directory.
+///
+/// A bare `Distro.toml` has an empty parent, so resolve the authenticated
+/// path once before any sibling or member resolution.
+pub(crate) fn normalize_authenticated_manifest_path(
+    manifest_path: &Path,
+) -> anyhow::Result<PathBuf> {
+    if manifest_path.is_absolute() {
+        return Ok(manifest_path.to_path_buf());
+    }
+
+    let current_dir = std::env::current_dir().with_context(|| {
+        format!(
+            "failed to resolve current directory for authenticated manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    Ok(current_dir.join(manifest_path))
+}
+
 /// Resolve a local `.capsule` member against the authenticated manifest.
 ///
 /// `Ok(None)` means the source belongs to the caller's remote resolver.
@@ -84,6 +104,14 @@ mod tests {
             .unwrap()
             .join("capsules/member.capsule");
         assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn normalizes_bare_manifest_path_to_current_directory() {
+        let current_dir = std::env::current_dir().unwrap();
+        let manifest_path =
+            normalize_authenticated_manifest_path(Path::new("Distro.toml")).unwrap();
+        assert_eq!(manifest_path, current_dir.join("Distro.toml"));
     }
 
     #[test]
