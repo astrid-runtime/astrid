@@ -49,8 +49,8 @@ fn distro_help_lists_only_supported_sources_and_the_launcher_exception() {
     assert_eq!(
         apply_name_help.as_deref(),
         Some(
-            "Signed Distro bundle containing `Distro.toml`, `Distro.lock`, \
-             `Distro.sig`, and capsule artifacts"
+            "Selected signed `Distro.toml` with its `Distro.lock` and `Distro.sig` \
+             sidecars, or a signed `.shuttle` package"
         )
     );
 }

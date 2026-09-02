@@ -518,7 +518,9 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
                 require_signed: true,
             };
             commands::init::run_init(&distro, &opts).await?;
-            commands::init::apply_self_grant(&opts.target_principal).await?;
+            if apply_self_grant_required(&distro) {
+                commands::init::apply_self_grant(&opts.target_principal).await?;
+            }
             Ok(ExitCode::SUCCESS)
         },
         DistroCommands::Show { agent } => {
@@ -561,6 +563,12 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         },
     }
+}
+
+/// Source-manifest apply completes with `DistroSelfGrant`; `.shuttle` remains a
+/// packaging/install vehicle and must never gain grant authority in this path.
+fn apply_self_grant_required(distro_source: &str) -> bool {
+    !distro_source.ends_with(".shuttle")
 }
 
 fn dispatch_wit(command: &WitCommands) -> Result<ExitCode> {
@@ -886,5 +894,11 @@ mod tests {
                 .to_string()
                 .contains("--allow-unsigned is not acceptance")
         );
+    }
+
+    #[test]
+    fn self_grant_follows_source_manifests_but_not_shuttle_packages() {
+        assert!(apply_self_grant_required("/tmp/product/Distro.toml"));
+        assert!(!apply_self_grant_required("/tmp/product.shuttle"));
     }
 }

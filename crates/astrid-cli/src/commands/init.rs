@@ -18,9 +18,15 @@ use super::distro::lock::{
     write_lock_to_daemon,
 };
 #[cfg(test)]
-use super::distro::lock::{load_lock, write_lock};
-use super::distro::manifest::{DistroCapsule, DistroManifest, parse_manifest};
+use super::distro::lock::{load_lock, manifest_hash, write_lock};
+use super::distro::manifest::DistroCapsule;
+use super::distro::manifest::DistroManifest;
 use crate::theme::Theme;
+
+#[path = "init_signed_source.rs"]
+mod signed_source;
+
+use signed_source::{PreparedDistro, prepare_distro_source, unpack_prepared};
 
 /// Options controlling the init / `distro apply` flow.
 ///
@@ -77,7 +83,7 @@ pub(crate) fn parse_cli_vars(raw: &[String]) -> anyhow::Result<HashMap<String, S
     Ok(map)
 }
 
-/// Enforce source and trust gates before this flow can create runtime state.
+/// Enforce source flags before this flow can create runtime state.
 fn validate_install_source(
     distro_source: &str,
     opts: &InitOpts,
@@ -85,12 +91,6 @@ fn validate_install_source(
     target: &astrid_core::PrincipalId,
 ) -> anyhow::Result<bool> {
     let shuttle_install = distro_source.ends_with(".shuttle");
-    if opts.require_signed && !shuttle_install {
-        bail!(
-            "astrid distro apply requires a signed .shuttle Distro bundle containing Distro.toml; \
-             an unsigned manifest is not accepted"
-        );
-    }
     // `--grant-capsules` is not wired for `.shuttle`; fail rather than silently
     // skip the requested grants and point at the legacy manual command.
     if shuttle_install && opts.grant_capsules {
@@ -115,7 +115,11 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // the flag can never be silently honoured without a distro.
     grant::validate_grant_capsules(opts.grant_capsules, !distro_source.is_empty())?;
 
-    let shuttle_install = validate_install_source(distro_source, opts, &operator, &target)?;
+    let prepared = {
+        let operator = operator.clone();
+        validate_install_source(distro_source, opts, &operator, &target)?;
+        prepare_distro_source(distro_source, opts, &home).await?
+    };
 
     // The kernel must admit a fresh home and publish its migration ledger
     // before the CLI creates any v2 layout state. Init spans multiple admin
@@ -128,7 +132,7 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
         grant::preflight_grants(&operator, &target).await?;
     }
 
-    if shuttle_install {
+    if matches!(prepared, PreparedDistro::Shuttle) {
         home.ensure()?;
         let _provisioning_lock = grant::ProvisioningLock::acquire(&home, &target)?;
         init_workspace()?;
@@ -143,9 +147,7 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // under the resolved principal's home, matching bootstrap's auto-init
     // freshness check (`should_auto_init`) so a scoped principal isn't
     // re-provisioned on every run.
-    // Fetch and parse the distro manifest. Network is forbidden under
-    // --offline unless the source resolves to a local file.
-    let manifest = fetch_and_parse_manifest(distro_source, opts.offline).await?;
+    let (manifest, expected_manifest_hash, signed_bundle) = unpack_prepared(prepared);
 
     // Enforce the distro's CLI-version floor BEFORE any prompting or install.
     // The manifest is fetched from the repo `main` tip, so a distro that bumps
@@ -153,30 +155,7 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // on an older CLI; fail fast with an actionable upgrade message instead.
     super::distro::validate::enforce_astrid_version(&manifest)?;
 
-    // Check lock freshness AFTER parsing manifest (need manifest to compare).
-    if let Some(existing_lock) = load_lock_from_daemon(&target).await?
-        && is_lock_fresh(&existing_lock, &manifest)
-        && let Some(installed) =
-            grant::validated_grant_set_for_reuse(&target, &existing_lock.capsules).await
-    {
-        eprintln!(
-            "{}",
-            Theme::info(&format!(
-                "{} is already installed (Distro.lock is up to date)",
-                manifest
-                    .distro
-                    .pretty_name
-                    .as_deref()
-                    .unwrap_or(&manifest.distro.name),
-            ))
-        );
-        // Idempotent grant path: a re-run with `--grant-capsules` on an
-        // already-installed principal still (re-)applies grants for the
-        // locked capsule set. `apply_set_delta` dedups kernel-side, so a
-        // principal that already holds them reports "no change" rather than
-        // erroring or duplicating — and this is also how a first run whose
-        // grant step failed (daemon was down) recovers on re-run.
-        grant::apply_or_hint_grants(&operator, &target, &installed, opts.grant_capsules).await?;
+    if reuse_fresh_lock(&manifest, &expected_manifest_hash, &operator, &target, opts).await? {
         return Ok(());
     }
 
@@ -200,6 +179,18 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     let schema_version = manifest.schema_version;
 
     let selected = select_capsules(manifest.capsules, opts.yes)?;
+    let _capsule_staging;
+    let selected = if let Some(bundle) = &signed_bundle {
+        let staging = tempfile::tempdir().context("create signed capsule staging")?;
+        let resolved =
+            signed_source::resolve_signed_capsules(&selected, &bundle.lock, staging.path()).await?;
+        // Keep the verified artifacts alive through the install below.
+        _capsule_staging = Some(staging);
+        resolved
+    } else {
+        _capsule_staging = None;
+        selected
+    };
 
     // Collect variables needed by selected capsules.
     let vars = collect_variables(&variables, &selected, opts.yes, &opts.vars)?;
@@ -214,7 +205,13 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // per capsule that actually installed — failures are reported and
     // dropped, so `locked.len()` is the true success count.
     let total = selected.len();
-    let locked = install_capsules(&selected, opts.offline, &target).await?;
+    let locked = install_capsules(
+        &selected,
+        opts.offline,
+        &target,
+        signed_bundle.as_ref().map(|bundle| &bundle.pinned_refs),
+    )
+    .await?;
     let succeeded = locked.len();
 
     // Provisioning honesty: a run where every selected install FAILED must
@@ -251,7 +248,13 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // a manifest-declared string the installer didn't land (security stance:
     // grants derive from what was installed, on explicit `--grant-capsules`).
     let installed_names: Vec<String> = locked.iter().map(|c| c.name.clone()).collect();
-    let lock = create_lock_from_parts(schema_version, &distro_id, &distro_version, locked);
+    let lock = create_lock_from_parts(
+        schema_version,
+        &distro_id,
+        &distro_version,
+        &expected_manifest_hash,
+        locked,
+    );
     let wrote_lock = persist_lock_if_earned_daemon(&target, total, succeeded, &lock).await?;
 
     eprintln!();
@@ -308,6 +311,38 @@ fn init_workspace() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Reuse a fresh, install-verified lock only after enforcing manifest binding.
+async fn reuse_fresh_lock(
+    manifest: &DistroManifest,
+    manifest_hash: &str,
+    operator: &astrid_core::PrincipalId,
+    target: &astrid_core::PrincipalId,
+    opts: &InitOpts,
+) -> anyhow::Result<bool> {
+    if let Some(existing_lock) = load_lock_from_daemon(target).await?
+        && is_lock_fresh(&existing_lock, manifest, manifest_hash)
+        && let Some(installed) =
+            grant::validated_grant_set_for_reuse(target, &existing_lock.capsules).await
+    {
+        eprintln!(
+            "{}",
+            Theme::info(&format!(
+                "{} is already installed (Distro.lock is up to date)",
+                manifest
+                    .distro
+                    .pretty_name
+                    .as_deref()
+                    .unwrap_or(&manifest.distro.name),
+            ))
+        );
+        // A fresh lock does not imply a successful historical grant. This is
+        // the lock-fresh retry path; self grant is idempotent and never widens.
+        grant::apply_or_hint_grants(operator, target, &installed, opts.grant_capsules).await?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Resolve an explicit remote distro source string to a URL.
 ///
 /// - `@org/repo` → `https://raw.githubusercontent.com/org/repo/main/Distro.toml`
@@ -315,7 +350,7 @@ fn init_workspace() -> anyhow::Result<()> {
 ///
 /// A bare name has no provenance and is rejected rather than being silently
 /// assigned to an organization by the neutral runtime.
-fn resolve_distro_url(source: &str) -> anyhow::Result<String> {
+pub(super) fn resolve_distro_url(source: &str) -> anyhow::Result<String> {
     if source.starts_with("http://") || source.starts_with("https://") {
         Ok(source.to_string())
     } else if let Some(repo_path) = source.strip_prefix('@') {
@@ -337,63 +372,6 @@ fn resolve_distro_url(source: &str) -> anyhow::Result<String> {
             "distro source '{source}' must use @owner/repo, a URL, a local Distro.toml path, or a .shuttle archive"
         )
     }
-}
-
-/// Resolve a distro source string to a manifest URL or path, then parse it.
-///
-/// When `offline` is set, only a local file is acceptable — any source
-/// that would require a network fetch is a hard error.
-async fn fetch_and_parse_manifest(source: &str, offline: bool) -> anyhow::Result<DistroManifest> {
-    // Local file path.
-    let path = std::path::Path::new(source);
-    if path.exists() && path.is_file() {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        return parse_manifest(&content);
-    }
-
-    if offline {
-        bail!(
-            "--offline: '{source}' is not a local file and network fetch is forbidden \
-             (use a Distro.toml path or a .shuttle archive)"
-        );
-    }
-
-    let url = resolve_distro_url(source)?;
-
-    eprintln!("Fetching distro manifest...");
-
-    let client = reqwest::Client::builder()
-        .user_agent("astrid-cli")
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .context("failed to fetch distro manifest")?;
-
-    if !response.status().is_success() {
-        bail!(
-            "failed to fetch distro manifest from {url} (HTTP {})",
-            response.status(),
-        );
-    }
-
-    // Stream response body with 1 MB limit to prevent abuse from untrusted URLs.
-    let mut bytes = Vec::new();
-    let mut response = response;
-    while let Some(chunk) = response.chunk().await? {
-        bytes.extend_from_slice(&chunk);
-        anyhow::ensure!(
-            bytes.len() <= 1024 * 1024,
-            "distro manifest exceeds 1 MB limit",
-        );
-    }
-    let content = std::str::from_utf8(&bytes).context("distro manifest contains invalid UTF-8")?;
-
-    parse_manifest(content)
 }
 
 /// Parse a comma-separated multi-select entry into a deduped, ordered list
@@ -675,6 +653,7 @@ fn create_lock_from_parts(
     schema_version: u32,
     distro_id: &str,
     distro_version: &str,
+    manifest_hash: &str,
     capsules: Vec<LockedCapsule>,
 ) -> DistroLock {
     DistroLock {
@@ -685,7 +664,7 @@ fn create_lock_from_parts(
             resolved_at: chrono::Utc::now().to_rfc3339(),
         },
         capsules,
-        manifest_hash: None,
+        manifest_hash: Some(manifest_hash.to_string()),
     }
 }
 
@@ -737,6 +716,7 @@ async fn install_capsules(
     selected: &[DistroCapsule],
     offline: bool,
     principal: &astrid_core::PrincipalId,
+    pinned_refs: Option<&HashMap<String, String>>,
 ) -> anyhow::Result<Vec<LockedCapsule>> {
     if offline {
         for cap in selected {
@@ -766,7 +746,13 @@ async fn install_capsules(
         pb.set_message(cap.name.clone());
 
         let expected = CapsuleId::new(cap.name.clone())?;
-        let refspec = super::capsule::install::RefSpec::from_capsule(cap);
+        let mut pinned_capsule = cap.clone();
+        if let Some(resolved_ref) = pinned_refs.and_then(|refs| refs.get(&cap.name)) {
+            pinned_capsule
+                .tag
+                .get_or_insert_with(|| resolved_ref.clone());
+        }
+        let refspec = super::capsule::install::RefSpec::from_capsule(&pinned_capsule);
         // The installer returns the ref it ACTUALLY resolved and fetched
         // (`Some` for GitHub sources, `None` for local paths). Record
         // that — never a guess derived from the manifest fields — so the
@@ -790,7 +776,9 @@ async fn install_capsules(
                 continue;
             },
         };
-        let verified = match validate_batch_install(&expected, &cap.version, outcome) {
+        let expected_ref = pinned_refs.and_then(|refs| refs.get(&cap.name).map(String::as_str));
+        let verified = match validate_batch_install(&expected, &cap.version, expected_ref, outcome)
+        {
             Ok(verified) => verified,
             Err(e) => {
                 eprintln!("\n  Failed to install {}: {e}", cap.name);
@@ -842,6 +830,7 @@ struct VerifiedBatchInstall {
 fn validate_batch_install(
     expected: &CapsuleId,
     declared_version: &str,
+    expected_ref: Option<&str>,
     outcome: super::capsule::install::BatchInstallOutcome,
 ) -> anyhow::Result<VerifiedBatchInstall> {
     if outcome.installed.len() != 1 {
@@ -870,6 +859,14 @@ fn validate_batch_install(
         bail!(
             "capsule '{expected}' release selector declared version {declared_version}, but the installed manifest reports {}",
             installed.version
+        );
+    }
+    if let Some(expected_ref) = expected_ref
+        && outcome.resolved_ref.as_deref() != Some(expected_ref)
+    {
+        bail!(
+            "capsule '{expected}' signed ref {expected_ref} did not match installed ref {:?}",
+            outcome.resolved_ref
         );
     }
     Ok(VerifiedBatchInstall {
