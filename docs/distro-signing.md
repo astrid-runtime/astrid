@@ -116,8 +116,8 @@ Consumers install with `astrid init --distro ./example-distro-0.1.0.shuttle`.
 
 To let consumers pin your key on their very first install (no TOFU
 window), add the same `ed25519:<base64>` to the `OFFICIAL_KEYS` table in
-the `astrid` source and ship a new binary. Until then, even your own
-distro takes the TOFU path.
+the `astrid` source and ship a new binary; the current official key is
+`ed25519:utH537RuOuqKwjGx/pHIUAkKapyqPUhHpZIVDU6Q0FA=`.
 
 ## 4. Operator: installing a signed distro
 
@@ -155,8 +155,10 @@ Yes — layered, and fail-closed where it matters:
   is **refused** unless the operator passes `--allow-unsigned`. Skipping
   signing never silently weakens trust — it forces the consumer to opt
   into the risk.
-- **Official distros:** effectively mandatory — once the key is in
-  `OFFICIAL_KEYS`, an unsigned build under that distro id is refused.
+- **Official distros:** effectively mandatory — official distro ids
+  accept only keys compiled into `OFFICIAL_KEYS`, and an unsigned build
+  under that id is refused. A non-official key claiming an official id
+  fails closed even with `--accept-new-key`.
 
 ## 6. The strong guarantee: vendor the `.shuttle`
 

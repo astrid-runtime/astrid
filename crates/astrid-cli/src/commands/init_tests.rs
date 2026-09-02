@@ -270,6 +270,34 @@ fn product_source_rejects_unsigned_distro_toml_before_install_state() {
 }
 
 #[test]
+fn official_distro_rejects_unsigned_distro_toml() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path().join("home"));
+    std::fs::write(
+        dir.path().join("Distro.toml"),
+        "schema-version = 1\n\n[distro]\nid = \"unicity-ce\"\nname = \"Unicity CE\"\nversion = \"0.1.0\"\n\n\
+         [[capsule]]\nname = \"cli\"\nsource = \"@org/cli\"\nversion = \"0.1.0\"\nrole = \"uplink\"\n",
+    )
+    .unwrap();
+    let opts = InitOpts {
+        require_signed: false,
+        offline: true,
+        ..Default::default()
+    };
+
+    let error = futures::executor::block_on(super::signed_source::prepare_distro_source(
+        dir.path().join("Distro.toml").to_str().unwrap(),
+        &opts,
+        &home,
+    ))
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("official distro 'unicity-ce'"),
+        "got: {error:#}"
+    );
+}
+
+#[test]
 fn product_source_rejects_tampered_distro_toml_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(dir.path().join("home"));

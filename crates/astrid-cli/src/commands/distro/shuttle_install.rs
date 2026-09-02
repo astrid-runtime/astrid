@@ -90,12 +90,7 @@ pub(crate) async fn install_from_shuttle(
         report_trust(&outcome);
         Some(outcome.key_str)
     } else {
-        if !opts.allow_unsigned {
-            bail!(
-                "shuttle for '{distro_id}' is unsigned (no [distro.signing] or Distro.sig) — \
-                 refusing. Re-run with --allow-unsigned to install anyway."
-            );
-        }
+        unsigned_shuttle_may_install(&distro_id, opts)?;
         eprintln!(
             "{}",
             Theme::warning(&format!(
@@ -175,6 +170,26 @@ pub(crate) async fn install_from_shuttle(
 
     eprintln!();
     eprintln!("{}", Theme::success("Offline installation complete."));
+    Ok(())
+}
+
+/// Decide whether an unsigned shuttle may proceed to the warning path.
+///
+/// The official-id gate comes first because `--allow-unsigned` is an
+/// escape for third-party development artifacts only.
+fn unsigned_shuttle_may_install(distro_id: &str, opts: &InitOpts) -> anyhow::Result<()> {
+    if trust::is_official_distro_id(distro_id) {
+        bail!(
+            "official distro '{distro_id}' cannot be installed from an unsigned .shuttle; \
+             --allow-unsigned is not accepted"
+        );
+    }
+    if !opts.allow_unsigned {
+        bail!(
+            "shuttle for '{distro_id}' is unsigned (no [distro.signing] or Distro.sig) — \
+             refusing. Re-run with --allow-unsigned to install anyway."
+        );
+    }
     Ok(())
 }
 
@@ -518,6 +533,21 @@ mod tests {
         // against, so a missing manifest_hash is acceptable.
         let lock = lock_with_manifest_hash(None);
         assert!(check_manifest_binding("test", false, &lock, b"anything").is_ok());
+    }
+
+    #[test]
+    fn unsigned_official_shuttle_refuses_allow_unsigned() {
+        let opts = InitOpts {
+            allow_unsigned: true,
+            ..Default::default()
+        };
+
+        let err = unsigned_shuttle_may_install("unicity-ce", &opts).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot be installed from an unsigned .shuttle"),
+            "got: {err}"
+        );
     }
 
     #[test]

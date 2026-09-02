@@ -65,6 +65,13 @@ pub(super) async fn prepare_distro_source(
         ));
     }
     let (manifest_bytes, manifest) = fetch_manifest_bytes(distro_source, opts.offline).await?;
+    if trust::is_official_distro_id(&manifest.distro.id) {
+        bail!(
+            "official distro '{}' cannot be installed from unsigned Distro.toml; \
+             use a signed release artifact",
+            manifest.distro.id
+        );
+    }
     Ok(PreparedDistro::Manifest {
         manifest,
         manifest_hash: manifest_hash(&manifest_bytes),

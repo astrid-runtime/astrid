@@ -38,12 +38,14 @@ use super::sign;
 /// without prompting on first use. Changing this set requires rebuilding
 /// the binary — that is the point: official trust is not runtime-mutable.
 ///
-/// DECISION: empty placeholder — the real official key(s) are not part
-/// of issue #964's spec. With this empty, official distros currently
-/// take the TOFU path like any third party until a key is added here.
-const OFFICIAL_KEYS: &[&str] = &[
-    // "ed25519:<base64>",
-];
+/// The release-authenticated AOS distribution key. Official trust is
+/// compiled in so first contact pins it without a TOFU window.
+const OFFICIAL_KEYS: &[&str] = &["ed25519:utH537RuOuqKwjGx/pHIUAkKapyqPUhHpZIVDU6Q0FA="];
+
+/// Distro ids whose release artifacts must be signed by an official key.
+/// Keeping this separate from the signing keys lets trust and the
+/// unsigned-source boundary reject identity spoofing before an install.
+const OFFICIAL_DISTRO_IDS: &[&str] = &["unicity-ce"];
 
 /// What the trust check decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +125,33 @@ fn is_official(key_str: &str) -> bool {
     OFFICIAL_KEYS.contains(&key_str)
 }
 
+/// Is this a release distro id that refuses the unsigned manual path?
+pub(crate) fn is_official_distro_id(distro_id: &str) -> bool {
+    OFFICIAL_DISTRO_IDS.contains(&distro_id)
+}
+
+fn classify_unpinned_key(key_str: &str) -> TrustAction {
+    if is_official(key_str) {
+        TrustAction::OfficialPinned
+    } else {
+        TrustAction::ToFuTrusted
+    }
+}
+
+/// Official identity is bound to the compiled-in keys, not to TOFU.
+///
+/// This deliberately runs before the trust store is consulted so an
+/// unofficial key cannot become (or replace) an official id's pin, even
+/// with the operator override.
+fn ensure_official_id_key(distro_id: &str, key_str: &str) -> anyhow::Result<()> {
+    if is_official_distro_id(distro_id) && !is_official(key_str) {
+        bail!(
+            "official distro '{distro_id}' accepts only compiled-in official signing keys; \
+             refusing non-official key {key_str}"
+        );
+    }
+    Ok(())
+}
 /// Verify a sealed distro's signature and apply the trust policy.
 ///
 /// `manifest_pubkey` is the `[distro.signing].pubkey` declared in the
@@ -150,6 +179,8 @@ pub(crate) fn verify_and_pin(
     sign::verify_lock(lock, sig_hex, &pubkey)
         .context("distro signature is invalid — refusing to install")?;
 
+    ensure_official_id_key(distro_id, &key_str)?;
+
     let pinned = read_pinned(home, distro_id)?;
     let action = match pinned {
         Some(pin_key) if pin_key == pubkey => TrustAction::PinnedMatch,
@@ -173,7 +204,7 @@ pub(crate) fn verify_and_pin(
         None => {
             // TOFU: pin and report.
             pin(home, distro_id, &key_str)?;
-            TrustAction::ToFuTrusted
+            classify_unpinned_key(&key_str)
         },
     };
 
@@ -249,6 +280,51 @@ mod tests {
         assert_eq!(
             read_pinned(&home, "test").unwrap().unwrap(),
             kp.export_public_key()
+        );
+    }
+
+    #[test]
+    fn official_key_is_pinned_not_tofu() {
+        assert_eq!(
+            classify_unpinned_key(OFFICIAL_KEYS[0]),
+            TrustAction::OfficialPinned
+        );
+    }
+
+    #[test]
+    fn official_release_id_is_signed_only() {
+        assert!(is_official_distro_id("unicity-ce"));
+        assert!(!is_official_distro_id("test"));
+    }
+
+    #[test]
+    fn official_id_rejects_unofficial_key_before_tofu() {
+        let (_dir, home) = home();
+        let kp = KeyPair::generate();
+        let mut lock = sample_lock();
+        lock.distro.id = "unicity-ce".into();
+        let sig = sign::sign_lock(&lock, &kp).unwrap();
+
+        // The valid signature and operator override must not let a rogue
+        // key claim the official id.
+        let err = verify_and_pin(
+            &home,
+            "unicity-ce",
+            &sign::pubkey_to_wire(&kp.export_public_key()),
+            &sig,
+            &lock,
+            true,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("accepts only compiled-in official signing keys"),
+            "got: {err}"
+        );
+        assert!(
+            read_pinned(&home, "unicity-ce").unwrap().is_none(),
+            "a failed official-id claim must not write a trust pin"
         );
     }
 
