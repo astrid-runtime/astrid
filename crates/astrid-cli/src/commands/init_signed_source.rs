@@ -61,17 +61,10 @@ pub(super) async fn prepare_distro_source(
     }
     if opts.require_signed {
         return Ok(PreparedDistro::Signed(
-            fetch_signed_manifest(distro_source, opts.offline, home).await?,
+            fetch_signed_manifest(distro_source, opts.offline, opts.accept_new_key, home).await?,
         ));
     }
     let (manifest_bytes, manifest) = fetch_manifest_bytes(distro_source, opts.offline).await?;
-    if trust::is_official_distro_id(&manifest.distro.id) {
-        bail!(
-            "official distro '{}' cannot be installed from unsigned Distro.toml; \
-             use a signed release artifact",
-            manifest.distro.id
-        );
-    }
     Ok(PreparedDistro::Manifest {
         manifest,
         manifest_hash: manifest_hash(&manifest_bytes),
@@ -177,6 +170,7 @@ fn parse_manifest_bytes(bytes: Vec<u8>) -> anyhow::Result<(Vec<u8>, DistroManife
 async fn fetch_signed_manifest(
     source: &str,
     offline: bool,
+    accept_new_key: bool,
     home: &AstridHome,
 ) -> anyhow::Result<SignedDistroBundle> {
     let (manifest_bytes, manifest) = fetch_manifest_bytes(source, offline).await?;
@@ -195,8 +189,14 @@ async fn fetch_signed_manifest(
         "Distro.sig exceeds size limit"
     );
     let sig_hex = std::str::from_utf8(&sig_bytes).context("Distro.sig is not valid UTF-8")?;
-    let pinned_refs =
-        verify_signed_manifest(home, &manifest, &manifest_hash, &lock, sig_hex, false)?;
+    let pinned_refs = verify_signed_manifest(
+        home,
+        &manifest,
+        &manifest_hash,
+        &lock,
+        sig_hex,
+        accept_new_key,
+    )?;
 
     Ok(SignedDistroBundle {
         manifest,
@@ -286,6 +286,7 @@ fn verify_signed_manifest(
         sig_hex,
         lock,
         accept_new_key,
+        trust::TrustPolicy::RequireExistingPin,
     )?;
     tracing::info!(
         distro = %manifest.distro.id,

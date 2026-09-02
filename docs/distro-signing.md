@@ -39,15 +39,16 @@ identity makes repeated composition reproducible and reusable through Muninn.
 Private secrets and per-principal writable state are excluded from the shared
 image and remain separate principal-owned roots.
 
-## 2. Trust: TOFU, pinning, official keys
+## 2. Trust: pins, first use, and rotation
 
-Trust is per-distro and lives at `~/.astrid/trust/<distro-id>.pub` (one
+Trust is per-distro and lives at `$ASTRID_HOME/trust/<distro-id>.pub` (one
 pinned `ed25519:<base64>` per distro id):
 
-- **First install of a third-party distro** → trust-on-first-use: the
-  key is pinned and reported so you can verify it out of band.
-- **Official distros** → their key is compiled into the `astrid` binary
-  (`OFFICIAL_KEYS`) and pins on first contact with no TOFU window.
+- **Product `astrid distro apply`** → install the operator-verified key
+  at the trust path before use. A missing pin fails closed, even with
+  `--accept-new-key`.
+- **Ordinary signed init or `.shuttle`** → a valid key with no prior pin
+  is trusted on first use, written to the trust path, and reported.
 - **A later install signed by a *different* key** → hard fail. Re-pin
   only with `--accept-new-key`, and only if you trust the new key.
 - **An invalid signature** → hard fail, no override.
@@ -112,12 +113,14 @@ rejected by `seal` — those require building from source. Pin a
 Attach the `.shuttle` to the GitHub release (or host it anywhere).
 Consumers install with `astrid init --distro ./example-distro-0.1.0.shuttle`.
 
-### 3.5 Make it an *official* key (first-contact pinning)
+### 3.5 Publish the trust pin
 
-To let consumers pin your key on their very first install (no TOFU
-window), add the same `ed25519:<base64>` to the `OFFICIAL_KEYS` table in
-the `astrid` source and ship a new binary; the current official key is
-`ed25519:utH537RuOuqKwjGx/pHIUAkKapyqPUhHpZIVDU6Q0FA=`.
+Publish the exact `ed25519:<base64>` value through an out-of-band
+channel your operators trust. Product operators write that one line to
+`$ASTRID_HOME/trust/<distro-id>.pub` before install (`~/.astrid` is the
+default example). Ordinary signed installs can create this pin on first
+use. Do not mail the key through the same channel that serves the
+release.
 
 ## 4. Operator: installing a signed distro
 
@@ -135,14 +138,14 @@ tampered, unsigned, or mismatched bundle installs nothing. Capsule
 installation itself is sequential and not transactional, so a failure
 partway through can leave earlier capsules installed.
 
-Relevant flags (also on `astrid distro apply`):
+Relevant flags:
 
 | Flag | Effect |
 |------|--------|
 | `--yes` | Non-interactive: take group defaults, resolve variables from `--var` / `ASTRID_VAR_<KEY>` / manifest defaults, error if a required one is unset. |
 | `--offline` | Forbid all network. A non-local capsule source is a hard error. |
-| `--allow-unsigned` | Install a distro that ships no signature (see §5). |
-| `--accept-new-key` | Re-pin when a valid signature is under a key different from the pinned one. |
+| `--allow-unsigned` | For an ordinary `.shuttle`, install a distro archive that ships no signature (see §5). Ordinary plain-TOML init does not consult this flag. Product `astrid distro apply` rejects it. |
+| `--accept-new-key` | Re-pin when a valid signature is under a key different from an existing pin. A missing pin fails closed on product Apply. |
 
 ## 5. Is signing optional?
 
@@ -151,14 +154,15 @@ Yes — layered, and fail-closed where it matters:
 - **Producing:** optional. No `[distro.signing]` / no `--key` → an
   unsigned distro. Local development (`astrid init --distro ./Distro.toml`) stays
   frictionless.
-- **Consuming:** fail-closed. A sealed/remote artifact with no signature
-  is **refused** unless the operator passes `--allow-unsigned`. Skipping
-  signing never silently weakens trust — it forces the consumer to opt
-  into the risk.
-- **Official distros:** effectively mandatory — official distro ids
-  accept only keys compiled into `OFFICIAL_KEYS`, and an unsigned build
-  under that id is refused. A non-official key claiming an official id
-  fails closed even with `--accept-new-key`.
+- **Consuming unsigned `.shuttle`:** fail-closed by default. An
+  ordinary `.shuttle` that ships no signature is **refused** unless the
+  operator passes `--allow-unsigned`. Skipping signing never silently
+  weakens this path — it forces the consumer to opt into the risk.
+- **Plain `Distro.toml` init:** remains unsigned by design. It does not
+  consult `--allow-unsigned`.
+- **Product Apply:** signed-only. `--allow-unsigned` is rejected, and a
+  signed artifact is installed only when its key already matches the
+  operator-installed pin. Product Apply performs no TOFU.
 
 ## 6. The strong guarantee: vendor the `.shuttle`
 
