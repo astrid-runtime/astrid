@@ -297,7 +297,7 @@ async fn prepared_local_signed_fixture(
     else {
         panic!("signed local Distro.toml must prepare a signed bundle");
     };
-    (bundle, bytes, expected_hash)
+    (*bundle, bytes, expected_hash)
 }
 
 #[test]
@@ -345,6 +345,7 @@ fn signed_apply_fails_closed_on_missing_relative_member() {
     assert!(!staging.path().join("member.capsule").exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn signed_apply_fails_closed_on_member_escape() {
     let dir = tempfile::tempdir().unwrap();

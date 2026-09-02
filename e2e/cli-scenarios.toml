@@ -536,9 +536,9 @@ reason = "Remote distro update requires network release state; CI covers local l
 [commands."distro seal"]
 scenario = "distro_lifecycle"
 status = "covered"
-mode = "bounded_failure"
+mode = "filesystem"
 principal = "local_cli"
-reason = "The current seal resolver only accepts GitHub-backed capsule sources; the harness asserts that local archive sources fail before any network fetch."
+reason = "The harness seals authenticated relative capsules/*.capsule members from the Distro.toml directory and asserts that absolute sources escaping that directory fail closed."
 
 [commands."init"]
 scenario = "distro_onboarding"

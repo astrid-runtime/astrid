@@ -30,10 +30,10 @@ pub(super) struct SignedDistroBundle {
 pub(super) enum PreparedDistro {
     Shuttle,
     Manifest {
-        manifest: DistroManifest,
+        manifest: Box<DistroManifest>,
         manifest_hash: String,
     },
-    Signed(SignedDistroBundle),
+    Signed(Box<SignedDistroBundle>),
 }
 
 /// Split an authenticated source into its install inputs.
@@ -45,10 +45,10 @@ pub(super) fn unpack_prepared(
         PreparedDistro::Manifest {
             manifest,
             manifest_hash,
-        } => (manifest, manifest_hash, None),
+        } => (*manifest, manifest_hash, None),
         PreparedDistro::Signed(bundle) => {
             let manifest = bundle.manifest.clone();
-            (manifest, bundle.manifest_hash.clone(), Some(bundle))
+            (manifest, bundle.manifest_hash.clone(), Some(*bundle))
         },
     }
 }
@@ -63,13 +63,13 @@ pub(super) async fn prepare_distro_source(
         return Ok(PreparedDistro::Shuttle);
     }
     if opts.require_signed {
-        return Ok(PreparedDistro::Signed(
+        return Ok(PreparedDistro::Signed(Box::new(
             fetch_signed_manifest(distro_source, opts.offline, opts.accept_new_key, home).await?,
-        ));
+        )));
     }
     let (manifest_bytes, manifest) = fetch_manifest_bytes(distro_source, opts.offline).await?;
     Ok(PreparedDistro::Manifest {
-        manifest,
+        manifest: Box::new(manifest),
         manifest_hash: manifest_hash(&manifest_bytes),
     })
 }
