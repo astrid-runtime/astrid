@@ -18,3 +18,4 @@ python3 scripts/test_channel_publication.py
 python3 scripts/test_nightly_version.py
 bash scripts/test_channel_workflow_contract.sh
 bash scripts/test_native_storage_certification_contract.sh
+bash scripts/test_ci_workflow_contract.sh

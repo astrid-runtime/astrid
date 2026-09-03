@@ -46,6 +46,7 @@ on:
       - 'scripts/channel_publication.py'
       - 'scripts/test_channel_publication.py'
       - 'scripts/test_channel_workflow_contract.sh'
+      - 'scripts/test_ci_workflow_contract.sh'
       - 'scripts/nightly_version.py'
       - 'scripts/test_nightly_version.py'
       - 'release/nightly.toml'
@@ -101,6 +102,7 @@ on:
       - 'scripts/channel_publication.py'
       - 'scripts/test_channel_publication.py'
       - 'scripts/test_channel_workflow_contract.sh'
+      - 'scripts/test_ci_workflow_contract.sh'
       - 'scripts/nightly_version.py'
       - 'scripts/test_nightly_version.py'
       - 'release/nightly.toml'
@@ -118,6 +120,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   linux-release-smoke:
