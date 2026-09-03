@@ -246,7 +246,7 @@ jobs:
             exit 1
           fi
 
-          REQUEST_ID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+          REQUEST_ID=$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')
           PROVIDER_REQUEST=$(jq -cn \
             --arg request_id "$REQUEST_ID" \
             --arg mountpoint "$MOUNTPOINT_INITIAL" \
