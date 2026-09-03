@@ -11,7 +11,7 @@ Related documents:
 - [Astrid Principal Store Runtime Realization](astrid-principal-store-runtime.md)
 - [Astrid Hosted Volume Format 1](../crates/astrid-storage/formats/astrid-volume-v1.txt)
 - [Astrid Native Component Kernel](astrid-native-kernel.md)
-- [AOS Principal Linux Realm](https://github.com/unicity-aos/aos-ce/blob/main/docs/principal-linux-realm.md), an optional Linux capsule consumer
+- [AOS Principal Linux Realm](https://github.com/unicity-aos/aos-ce/blob/main/docs/principal-linux-realm.md), an optional Linux capsule consumer (accepted contract; not implemented on current aos-ce `main`)
 
 ## 1. Product ruling
 

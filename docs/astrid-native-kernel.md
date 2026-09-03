@@ -2,9 +2,9 @@
 
 Status: exploratory architecture and execution plan
 
-Last reviewed: 2026-07-18
+Last reviewed: 2026-09-01
 
-Code baseline: Astrid Runtime `v0.10.1` (`4771bab3`)
+Code baseline: Astrid Runtime `v0.10.4` (`52d444fdd7ce2f5195fc23704175eb7ecf134b3b`)
 
 Decision state: scope an Astrid-owned kernel; implementation choices remain open
 
@@ -16,11 +16,11 @@ boundary is in the [Driver Domain Contract](astrid-driver-domain-contract.md).
 
 Build an actual Astrid kernel.
 
-Do not make that kernel a prerequisite for the first agent OS. The immediate
-workbench is the principal-owned `AOS Realm` capsule in `unicity-aos/aos-ce`: a
-Linux-shaped environment hosted by today's daemon and, later, unchanged by the
-native host. It gives the kernel programme a real workload while keeping Linux
-syscall emulation, filesystems, shells, compilers, and package policy out of ring 0.
+Do not make that kernel a prerequisite for the first agent OS, and do not make
+Linux Realm a prerequisite for the kernel. Linux Realm is a separate confined
+AOS consumer above the capsule boundary. Current `unicity-aos/aos-ce` `main`
+does not ship that capsule. Linux syscall emulation, filesystems, shells,
+compilers, and package policy stay out of ring 0 whether or not a Realm exists.
 
 The target is not Astrid statically linked into somebody else's library OS. It is
 an Astrid-owned capability microkernel that boots on hardware or a microVM, creates
@@ -1015,10 +1015,11 @@ security model while becoming operationally smaller and more local.
 
 ## 12. Recommended next native-kernel artifact
 
-The product-wide immediate implementation is the AOS Realm's principal-scoped
-durable VFS and process environment. Within the independent native-kernel track,
-the next implementation should be a bounded native-kernel skeleton, not a Hermit
-host:
+Linux Realm VFS and process work is not the next native-kernel artifact. It
+belongs to the separate Linux Realm track in `unicity-aos/aos-ce` and is not
+implemented on that repository's current `main`. Within the independent
+native-kernel track, the next implementation should be a bounded native-kernel
+skeleton, not a Hermit host:
 
 1. Add the isolated `native-kernel/` workspace with pinned toolchain, loader,
    x86-64 architecture crate, deterministic image builder, QEMU runner, and serial
