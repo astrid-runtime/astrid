@@ -113,14 +113,12 @@ on:
       - '.github/workflows/ci.yml'
       - '.github/workflows/native-storage-certification.yml'
       - '.github/workflows/release.yml'
-
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
