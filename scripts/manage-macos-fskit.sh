@@ -114,15 +114,19 @@ companion_target() {
 }
 
 validate_companion() {
-  local companion=$1 app_version provider_output provider_version
+  local companion=$1 app_version provider_output provider_version request_id
   /usr/bin/codesign --verify --strict --verbose=2 "$companion"
   provider_output="$(/usr/bin/codesign --display --verbose=4 "$companion" 2>&1)"
   grep -Fx "Identifier=$COMPANION_IDENTIFIER" <<<"$provider_output" >/dev/null
   grep -Fx "TeamIdentifier=$CODE_SIGN_TEAM" <<<"$provider_output" >/dev/null
   app_version="$(plutil -extract CFBundleShortVersionString raw -expect string \
     "$SOURCE_APP/Contents/Info.plist")"
+  request_id="$(/usr/bin/uuidgen)" || {
+    echo "unable to generate a request ID for the FSKit companion probe" >&2
+    return 1
+  }
   provider_output="$(printf '%s\n' \
-    '{"protocol_version":1,"request_id":"astrid-fskit-install-validation","acting_principal_hint":"default","operation":{"operation":"status","selector":{"kind":"native-path","value":"/"}}}' \
+    "{\"protocol_version\":1,\"request_id\":\"$request_id\",\"acting_principal_hint\":\"default\",\"operation\":{\"operation\":\"status\",\"selector\":{\"kind\":\"native-path\",\"value\":\"/\"}}}" \
     | "$companion" --astrid-provider-stdio-v1)" || {
     echo "the FSKit companion failed its provider identity probe" >&2
     return 1

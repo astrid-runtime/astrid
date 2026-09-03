@@ -84,10 +84,79 @@ PLIST
 /usr/bin/printf 'new-app\n' > "$RELEASE/AstridFS.app/version"
 /usr/bin/printf 'old-app\n' > "$DESTINATION/version"
 /bin/cat > "$TEST_ROOT/companion.c" <<'C'
+#include <ctype.h>
 #include <stdio.h>
+#include <string.h>
+
+static int is_hex(char value) {
+  return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f') ||
+         (value >= 'A' && value <= 'F');
+}
+
+static int parse_request_id(char *input, size_t capacity, char request_id[37]) {
+  const char *cursor;
+  const char *end;
+  size_t length;
+  size_t offset;
+
+  length = fread(input, 1, capacity - 1, stdin);
+  if (ferror(stdin) || length == capacity - 1) {
+    return 0;
+  }
+  input[length] = '\0';
+  end = input + length;
+
+  cursor = strstr(input, "\"request_id\"");
+  if (cursor == NULL) {
+    return 0;
+  }
+  cursor += strlen("\"request_id\"");
+  while (cursor < end && isspace((unsigned char)*cursor)) {
+    cursor++;
+  }
+  if (cursor >= end || *cursor++ != ':') {
+    return 0;
+  }
+  while (cursor < end && isspace((unsigned char)*cursor)) {
+    cursor++;
+  }
+  if (cursor >= end || *cursor++ != '\"') {
+    return 0;
+  }
+
+  offset = (size_t)(cursor - input);
+  if (offset > length || length - offset < 37) {
+    return 0;
+  }
+  for (size_t index = 0; index < 36; index++) {
+    const char value = cursor[index];
+    const int separator = index == 8 || index == 13 || index == 18 || index == 23;
+    if ((separator && value != '-') || (!separator && !is_hex(value))) {
+      return 0;
+    }
+  }
+  if (cursor[36] != '\"') {
+    return 0;
+  }
+
+  memcpy(request_id, cursor, 36);
+  request_id[36] = '\0';
+  return 1;
+}
 
 int main(void) {
-  (void)puts("{\"protocol_version\":1,\"provider\":{\"name\":\"astrid-storage-provider-fskit\",\"version\":\"1.2.3\"}}");
+  char input[4096];
+  char request_id[37];
+
+  if (!parse_request_id(input, sizeof(input), request_id)) {
+    (void)fputs("invalid request_id\n", stderr);
+    return 2;
+  }
+  if (printf(
+          "{\"protocol_version\":1,\"request_id\":\"%s\",\"provider\":{\"name\":\"astrid-storage-provider-fskit\",\"version\":\"1.2.3\"}}\n",
+          request_id) < 0) {
+    return 2;
+  }
   return 0;
 }
 C
@@ -95,6 +164,19 @@ C
 /usr/bin/codesign --force --identifier org.astrid.runtime.fs.storage-provider-fskit \
   --sign - "$AD_HOC_COMPANION"
 /usr/bin/codesign --verify --strict "$AD_HOC_COMPANION"
+if /usr/bin/printf '%s\n' \
+  '{"protocol_version":1,"request_id":"not-a-uuid","acting_principal_hint":"default","operation":{"operation":"status","selector":{"kind":"native-path","value":"/"}}}' \
+  | "$AD_HOC_COMPANION" --astrid-provider-stdio-v1 >"$FAILURE_LOG" 2>&1; then
+  echo "the companion harness unexpectedly accepted a non-UUID request ID" >&2
+  exit 1
+fi
+/usr/bin/printf '%s\n' \
+  '{"protocol_version":1,"request_id":"00000000-0000-4000-8000-000000000000","acting_principal_hint":"default","operation":{"operation":"status","selector":{"kind":"native-path","value":"/"}}}' \
+  | "$AD_HOC_COMPANION" --astrid-provider-stdio-v1 >"$FAILURE_LOG" 2>&1
+/usr/bin/grep -Fq '"request_id":"00000000-0000-4000-8000-000000000000"' "$FAILURE_LOG" || {
+  echo "the companion harness did not echo a valid request ID" >&2
+  exit 1
+}
 /usr/bin/printf 'old-companion\n' > "$TARGET"
 /bin/chmod 0755 "$TARGET"
 /usr/bin/printf 'old-companion\n' > "$RELEASE/astrid-storage-provider-fskit"
