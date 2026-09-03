@@ -17,6 +17,7 @@ APP_BINARY="$APP_PATH/Contents/MacOS/AstridFS"
 EXTENSION_BINARY="$EXTENSION_PATH/Contents/MacOS/AstridFSAppEx"
 APP_IDENTIFIER=org.astrid.runtime.fs
 EXTENSION_IDENTIFIER=org.astrid.runtime.fs.AppEx
+CODE_SIGN_TEAM=9BDSL5BJAP
 
 [[ -d "$APP_PATH" && -d "$EXTENSION_PATH" ]]
 [[ -f "$APP_PATH/Contents/Info.plist" && -f "$EXTENSION_PATH/Contents/Info.plist" ]]
@@ -38,6 +39,12 @@ fi
 
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 codesign --verify --deep --strict --verbose=2 "$EXTENSION_PATH"
+signature="$(codesign --display --verbose=4 "$APP_PATH" 2>&1)"
+grep -Fx "Identifier=$APP_IDENTIFIER" <<<"$signature" >/dev/null
+grep -Fx "TeamIdentifier=$CODE_SIGN_TEAM" <<<"$signature" >/dev/null
+signature="$(codesign --display --verbose=4 "$EXTENSION_PATH" 2>&1)"
+grep -Fx "Identifier=$EXTENSION_IDENTIFIER" <<<"$signature" >/dev/null
+grep -Fx "TeamIdentifier=$CODE_SIGN_TEAM" <<<"$signature" >/dev/null
 ENTITLEMENTS="$(codesign --display --entitlements - "$EXTENSION_PATH" 2>/dev/null)"
 grep -Fq "com.apple.developer.fskit.fsmodule" <<<"$ENTITLEMENTS"
 xcrun stapler validate "$APP_PATH"

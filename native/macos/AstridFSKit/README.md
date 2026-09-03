@@ -19,7 +19,9 @@ The app and extension require a valid Apple signature and the
 project (or supply it on the `xcodebuild` command line), install `AstridFS.app`
 under `/Applications`, and enable the extension in System Settings. The
 co-installed `astrid-storage-provider-fskit` Rust companion handles mount,
-status, sync, and unmount lifecycle requests from the CLI.
+status, sync, and unmount lifecycle requests from the CLI. Installation selects
+only the companion staged beside the app and requires its Developer ID
+signature and Astrid version to match.
 
 The source-tree check is a syntax/typecheck and unsigned Xcode contract check.
 It also rejects an ordinary window or menu-bar scene and requires the generated
@@ -53,9 +55,11 @@ macos/manage-macos-fskit.sh status
 ```
 
 `enable` and `status` fail unless `pluginkit` reports the exact installed
-extension identifier, app path, and release version as elected. When election
-is unavailable they name the exact System Settings pane instead of treating a
-running containing process as proof.
+extension identifier, app path, and displayed installed version as elected.
+When election is unavailable they name the exact System Settings pane instead
+of treating plugin discovery or a running containing process as proof. Process
+validation binds the executable path, PID, codesign identity, signing team, and
+installed Astrid version.
 
 To replace it with a newly downloaded and extracted release, run `update`. To
 remove it, first unmount every Astrid filesystem and run `uninstall`; the app is

@@ -932,6 +932,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "actual FSKit runtime: requires macOS 26, a signed enabled extension, and a live lease resource"]
     async fn actual_fskit_mount_and_unmount_round_trip() {
+        let expected_mount_id: StorageMountId = std::env::var("ASTRID_FSKIT_ACTUAL_MOUNT_ID")
+            .context("ASTRID_FSKIT_ACTUAL_MOUNT_ID must name the live mount identity")
+            .expect("live mount identity is available")
+            .parse()
+            .expect("live mount identity must be a UUID");
         let resource = PathBuf::from(
             std::env::var("ASTRID_FSKIT_ACTUAL_RESOURCE")
                 .expect("ASTRID_FSKIT_ACTUAL_RESOURCE must name a live lease resource"),
@@ -944,17 +949,23 @@ mod tests {
             .expect("ASTRID_FSKIT_ACTUAL_TOKEN must name the live lease bearer token");
         astrid_core::platform_fs::validate_private_directory(&resource)
             .expect("live lease resource must be private");
-        astrid_core::platform_fs::validate_private_file(&resource.join("lease.json"))
+        let manifest_path = resource.join("lease.json");
+        astrid_core::platform_fs::validate_private_file(&manifest_path)
             .expect("live lease manifest must be private");
-        let lease = StorageMountLeaseV1 {
-            mount_id: StorageMountId::new(),
-            view: astrid_core::storage_provider::StorageProviderViewV1::Admin,
-            access: astrid_core::storage_provider::StorageProviderAccessV1::ReadOnly,
-            callback_path: resource.join("control.sock"),
-            resource_path: resource,
-            lease_token: token,
-            expires_at_epoch_secs: u64::MAX,
-        };
+        let manifest_bytes = std::fs::read(&manifest_path)
+            .context("read the live lease manifest")
+            .expect("live lease manifest is readable");
+        let lease: StorageMountLeaseV1 = serde_json::from_slice(&manifest_bytes)
+            .context("decode the live lease manifest")
+            .expect("live lease manifest is valid");
+        assert_eq!(lease.mount_id, expected_mount_id, "stale mount identity");
+        assert_eq!(lease.resource_path, resource, "stale lease resource");
+        assert_eq!(lease.callback_path, resource.join("control.sock"));
+        assert_eq!(lease.lease_token, token, "stale lease callback token");
+        assert!(
+            !lease.callback_path.as_os_str().is_empty() && lease.callback_path.is_absolute(),
+            "the live callback endpoint must be absolute"
+        );
 
         native_mount(&lease, &mountpoint)
             .await

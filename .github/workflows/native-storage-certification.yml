@@ -9,7 +9,7 @@ on:
         required: true
         type: string
       runner_contract_acknowledged:
-        description: The runner is macOS 26+, GUI-logged-in, can write /Applications, and has pre-approved AstridFS
+        description: Dedicated signed-runner contract acknowledged; this is not runtime or Aqua-session proof
         required: true
         default: false
         type: boolean
@@ -78,28 +78,24 @@ jobs:
           CHECKED_OUT_SOURCE=$(git rev-parse 'HEAD^{commit}')
           [[ "$REQUESTED_SOURCE" == "$EVENT_SOURCE" ]]
           [[ "$CHECKED_OUT_SOURCE" == "$EVENT_SOURCE" ]]
+          git verify-commit "$REQUESTED_SOURCE^{commit}"
           git diff --exit-code
           git diff --cached --exit-code
 
       - name: Require the dedicated native runner
-        env:
-          ASTRID_FSKIT_CODE_SIGN_IDENTITY: ${{ secrets.ASTRID_FSKIT_CODE_SIGN_IDENTITY }}
-          ASTRID_FSKIT_DEVELOPMENT_TEAM: ${{ secrets.ASTRID_FSKIT_DEVELOPMENT_TEAM }}
-          ASTRID_FSKIT_NOTARY_PROFILE: ${{ secrets.ASTRID_FSKIT_NOTARY_PROFILE }}
         run: |
           set -euo pipefail
           [[ "$(uname -s)" == Darwin ]]
           [[ "$(sw_vers -productVersion | cut -d. -f1)" -ge 26 ]]
           [[ "$(id -u)" -ne 0 ]] || {
-            echo "FSKit certification must run in the pre-approved GUI user session" >&2
+            echo "FSKit certification must run as the dedicated non-root runner user" >&2
             exit 1
           }
           [[ -w "$(dirname "$ASTRID_FSKIT_APP_DEST")" ]] || {
             echo "the GUI runner cannot install into /Applications" >&2
             exit 1
           }
-          : "${ASTRID_FSKIT_DEVELOPMENT_TEAM:?missing signing-team environment secret}"
-          : "${ASTRID_FSKIT_NOTARY_PROFILE:?missing notary keychain-profile environment secret}"
+          [[ -d /Applications && ! -L /Applications ]]
           if /sbin/mount | grep -Fq astridfs; then
             echo "the dedicated runner has an unexpected active astridfs mount" >&2
             /sbin/mount | grep -F astridfs >&2
@@ -109,11 +105,11 @@ jobs:
             echo "the dedicated runner has an unexpected installed AstridFS app" >&2
             exit 1
           fi
-          if [[ -z "$ASTRID_FSKIT_CODE_SIGN_IDENTITY" ]]; then
-            ASTRID_FSKIT_CODE_SIGN_IDENTITY="Developer ID Application"
+          if /usr/bin/pgrep -x AstridFS >/dev/null; then
+            echo "the dedicated runner has an unexpected AstridFS process" >&2
+            /usr/bin/pgrep -ax AstridFS >&2 || true
+            exit 1
           fi
-          security find-identity -v -p codesigning \
-            | grep -F "$ASTRID_FSKIT_CODE_SIGN_IDENTITY" >/dev/null
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -121,11 +117,15 @@ jobs:
           toolchain: "1.95.0"
 
       - name: Build the kernel, CLI, and FSKit companion
+        env:
+          ASTRID_FSKIT_CODE_SIGN_IDENTITY: ${{ secrets.ASTRID_FSKIT_CODE_SIGN_IDENTITY }}
+          ASTRID_FSKIT_DEVELOPMENT_TEAM: ${{ secrets.ASTRID_FSKIT_DEVELOPMENT_TEAM }}
         run: |
           set -euo pipefail
           ASTRID_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
           [[ -n "$ASTRID_VERSION" ]]
           echo "ASTRID_VERSION=$ASTRID_VERSION" >> "$GITHUB_ENV"
+          echo "ASTRID_FSKIT_EXPECTED_VERSION=$ASTRID_VERSION" >> "$GITHUB_ENV"
           install -d -m 0700 \
             "$CERT_ROOT" "$CERT_BIN" "$ASTRID_HOME" \
             "$RELEASE_STAGE/macos" "$MOUNTPOINT_INITIAL" "$MOUNTPOINT_IGNORED_TEST"
@@ -137,13 +137,27 @@ jobs:
             -p astrid-storage-provider-fskit
           install -m 0755 "$CARGO_TARGET_DIR/release/astrid" "$CERT_BIN/astrid"
           install -m 0755 "$CARGO_TARGET_DIR/release/astrid-daemon" "$CERT_BIN/astrid-daemon"
-          install -m 0755 \
-            "$CARGO_TARGET_DIR/release/astrid-storage-provider-fskit" \
-            "$RELEASE_STAGE/astrid-storage-provider-fskit"
           [[ "$("$CERT_BIN/astrid" --version)" == "astrid $ASTRID_VERSION" ]]
           PROVIDER_SOURCE_VERSION=$(cargo metadata --locked --no-deps --format-version 1 \
             | jq -er '.packages[] | select(.name == "astrid-storage-provider-fskit") | .version')
           [[ "$PROVIDER_SOURCE_VERSION" == "$ASTRID_VERSION" ]]
+          if [[ -z "$ASTRID_FSKIT_CODE_SIGN_IDENTITY" ]]; then
+            ASTRID_FSKIT_CODE_SIGN_IDENTITY="Developer ID Application"
+            export ASTRID_FSKIT_CODE_SIGN_IDENTITY
+          fi
+          security find-identity -v -p codesigning \
+            | grep -F "$ASTRID_FSKIT_CODE_SIGN_IDENTITY" >/dev/null
+          COMPANION_BINARY="$CARGO_TARGET_DIR/release/astrid-storage-provider-fskit"
+          COMPANION_IDENTIFIER=org.astrid.runtime.fs.storage-provider-fskit
+          codesign --force --options runtime --timestamp \
+            --identifier "$COMPANION_IDENTIFIER" \
+            --sign "$ASTRID_FSKIT_CODE_SIGN_IDENTITY" "$COMPANION_BINARY"
+          codesign --verify --strict --verbose=2 "$COMPANION_BINARY"
+          COMPANION_SIGNATURE="$(codesign --display --verbose=4 "$COMPANION_BINARY" 2>&1)"
+          grep -Fx "Identifier=$COMPANION_IDENTIFIER" <<<"$COMPANION_SIGNATURE" >/dev/null
+          grep -Fx "TeamIdentifier=9BDSL5BJAP" <<<"$COMPANION_SIGNATURE" >/dev/null
+          install -m 0755 "$COMPANION_BINARY" \
+            "$RELEASE_STAGE/astrid-storage-provider-fskit"
 
       - name: Build, sign, and notarize the FSKit app
         env:
@@ -201,17 +215,23 @@ jobs:
           /usr/bin/pluginkit -e use -i org.astrid.runtime.fs.AppEx
           "$RELEASE_STAGE/macos/manage-macos-fskit.sh" enable
           "$RELEASE_STAGE/macos/manage-macos-fskit.sh" status
+          "$RELEASE_STAGE/macos/manage-macos-fskit.sh" check-process
 
           for _ in {1..30}; do
             pgrep -x AstridFS >/dev/null && break
             sleep 1
           done
           pgrep -x AstridFS >/dev/null || {
-            echo "AstridFS did not launch in the runner's GUI session" >&2
+            echo "the AstridFS process did not appear" >&2
             exit 1
           }
           APP_ASN=$(/usr/bin/lsappinfo find bundleid=org.astrid.runtime.fs)
           APP_INFO=$(/usr/bin/lsappinfo info "$APP_ASN")
+          APP_PID=$(sed -nE 's/.*pid = ([0-9]+).*/\1/p' <<<"$APP_INFO")
+          APP_EXECUTABLE=$(sed -nE 's/.*executable path="([^"]+)".*/\1/p' <<<"$APP_INFO")
+          [[ "$APP_PID" =~ ^[0-9]+$ ]]
+          [[ "$APP_EXECUTABLE" == "$ASTRID_FSKIT_APP_DEST/Contents/MacOS/AstridFS" ]]
+          pgrep -x AstridFS | grep -Fxq "$APP_PID"
           grep -Fq 'type="UIElement"' <<<"$APP_INFO"
           ! grep -Fq 'type="Foreground"' <<<"$APP_INFO"
 
@@ -275,6 +295,7 @@ jobs:
 
           ASTRID_FSKIT_ACTUAL_RESOURCE="$RESOURCE" \
           ASTRID_FSKIT_ACTUAL_MOUNTPOINT="$MOUNTPOINT_IGNORED_TEST" \
+          ASTRID_FSKIT_ACTUAL_MOUNT_ID="$MOUNT_ID" \
           ASTRID_FSKIT_ACTUAL_TOKEN="$LEASE_TOKEN" \
             cargo test --locked --release \
               -p astrid-storage-provider-fskit \

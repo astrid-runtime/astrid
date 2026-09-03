@@ -42,7 +42,16 @@ plutil -lint \
 
 APP_SOURCE=native/macos/AstridFSKit/AstridFS/AstridFSApp.swift
 PROJECT=native/macos/AstridFSKit/AstridFS.xcodeproj/project.pbxproj
+[[ ! -e native/macos/AstridFSKit/AstridFS/ContentView.swift ]]
 grep -Fq 'application.setActivationPolicy(.prohibited)' "$APP_SOURCE"
+if grep -Rq 'SwiftUI' native/macos/AstridFSKit/AstridFS; then
+  echo "the FSKit containing app must not use SwiftUI" >&2
+  exit 1
+fi
+if grep -RqE 'setActivationPolicy\(\.(regular|accessory)\)' native/macos/AstridFSKit/AstridFS; then
+  echo "the FSKit containing app must prohibit activation" >&2
+  exit 1
+fi
 if grep -RqE 'WindowGroup|MenuBarExtra|NSWindow|NSMenu' native/macos/AstridFSKit/AstridFS; then
   echo "the FSKit containing app must not define a window or menu-bar scene" >&2
   exit 1

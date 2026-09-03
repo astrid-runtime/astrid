@@ -15,6 +15,9 @@ SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
 BUILD_VERSION="$(git rev-list --count HEAD)"
 ASTRID_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
 ARCHS="${ASTRID_FSKIT_ARCHS:-$(uname -m)}"
+CODE_SIGN_TEAM=9BDSL5BJAP
+APP_IDENTIFIER=org.astrid.runtime.fs
+EXTENSION_IDENTIFIER=org.astrid.runtime.fs.AppEx
 
 if [[ -z "$ASTRID_VERSION" ]]; then
   echo "workspace Astrid version is missing" >&2
@@ -69,6 +72,14 @@ if [[ "$APP_RELEASE_VERSION" != "$ASTRID_VERSION" || "$EXTENSION_RELEASE_VERSION
   echo "FSKit bundle release versions do not match Astrid $ASTRID_VERSION" >&2
   exit 1
 fi
+display_identity() {
+  local path=$1 identifier=$2 signature
+  signature="$(codesign --display --verbose=4 "$path" 2>&1)"
+  grep -Fx "Identifier=$identifier" <<<"$signature" >/dev/null
+  grep -Fx "TeamIdentifier=$CODE_SIGN_TEAM" <<<"$signature" >/dev/null
+  grep -F "Authority=$CODE_SIGN_IDENTITY" <<<"$signature" >/dev/null
+  printf '%s\n' "$signature"
+}
 APP_ARCHITECTURES="$(lipo -archs "$APP_BINARY")"
 EXTENSION_ARCHITECTURES="$(lipo -archs "$EXTENSION_BINARY")"
 if [[ "$APP_ARCHITECTURES" != "$ARCHS" || "$EXTENSION_ARCHITECTURES" != "$ARCHS" ]]; then
@@ -78,6 +89,8 @@ fi
 
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 codesign --verify --deep --strict --verbose=2 "$EXTENSION_PATH"
+display_identity "$APP_PATH" "$APP_IDENTIFIER" >/dev/null
+display_identity "$EXTENSION_PATH" "$EXTENSION_IDENTIFIER" >/dev/null
 ENTITLEMENTS="$(codesign --display --entitlements - "$EXTENSION_PATH" 2>/dev/null || true)"
 if ! grep -Fq "com.apple.developer.fskit.fsmodule" <<<"$ENTITLEMENTS"; then
   echo "FSKit extension lacks the required fskit.fsmodule entitlement" >&2

@@ -7,53 +7,90 @@ if [[ "$(uname -s)" != Darwin ]]; then
 fi
 
 TEST_ROOT="$(mktemp -d)"
-trap 'rm -rf "$TEST_ROOT"' EXIT
 RELEASE="$TEST_ROOT/release"
 DESTINATION="$TEST_ROOT/Applications/AstridFS.app"
 BIN_DIR="$TEST_ROOT/bin"
 TARGET="$BIN_DIR/astrid-storage-provider-fskit"
+AD_HOC_COMPANION="$TEST_ROOT/ad-hoc-companion"
 FAILURE_LOG="$TEST_ROOT/companion-failure.log"
-/bin/mkdir -p "$RELEASE/macos" "$RELEASE/AstridFS.app" "$DESTINATION" "$BIN_DIR"
+/bin/mkdir -p \
+  "$RELEASE/macos" \
+  "$RELEASE/AstridFS.app/Contents" \
+  "$DESTINATION" \
+  "$BIN_DIR"
+
+trap '/bin/rm -rf "$TEST_ROOT"' EXIT
+
 /bin/cp scripts/manage-macos-fskit.sh "$RELEASE/macos/manage-macos-fskit.sh"
 /bin/chmod 0755 "$RELEASE/macos/manage-macos-fskit.sh"
+/bin/cat > "$RELEASE/AstridFS.app/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleShortVersionString</key>
+  <string>1.2.3</string>
+</dict>
+</plist>
+PLIST
+/usr/bin/plutil -lint "$RELEASE/AstridFS.app/Contents/Info.plist"
 /usr/bin/printf 'new-app\n' > "$RELEASE/AstridFS.app/version"
 /usr/bin/printf 'old-app\n' > "$DESTINATION/version"
-/usr/bin/printf 'new-companion\n' > "$RELEASE/astrid-storage-provider-fskit"
-/bin/chmod 0755 "$RELEASE/astrid-storage-provider-fskit"
+/bin/cat > "$TEST_ROOT/companion.c" <<'C'
+#include <stdio.h>
+
+int main(void) {
+  (void)puts("{\"protocol_version\":1,\"provider\":{\"name\":\"astrid-storage-provider-fskit\",\"version\":\"1.2.3\"}}");
+  return 0;
+}
+C
+/usr/bin/clang -O2 -o "$AD_HOC_COMPANION" "$TEST_ROOT/companion.c"
+/usr/bin/codesign --force --identifier org.astrid.runtime.fs.storage-provider-fskit \
+  --sign - "$AD_HOC_COMPANION"
+/usr/bin/codesign --verify --strict "$AD_HOC_COMPANION"
 /usr/bin/printf 'old-companion\n' > "$TARGET"
 /bin/chmod 0755 "$TARGET"
+/usr/bin/printf 'old-companion\n' > "$RELEASE/astrid-storage-provider-fskit"
+/bin/chmod 0755 "$RELEASE/astrid-storage-provider-fskit"
 
 /bin/cat > "$RELEASE/macos/validate-macos-fskit.sh" <<'VALIDATOR'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ -d "$1" && -f "$1/version" ]]
-if [[ "$1" == "$TEST_DESTINATION" && "${TEST_FAIL_COMPANION_ACTIVATION:-0}" == 1 ]]; then
-  /usr/bin/find "$(/usr/bin/dirname "$TEST_COMPANION_TARGET")" \
-    -path '*/.astrid-fskit.update.*/new' -delete
-fi
 VALIDATOR
 /bin/chmod 0755 "$RELEASE/macos/validate-macos-fskit.sh"
 
-if TEST_DESTINATION="$DESTINATION" \
-  TEST_COMPANION_TARGET="$TARGET" \
-  TEST_FAIL_COMPANION_ACTIVATION=1 \
-  ASTRID_FSKIT_APP_DEST="$DESTINATION" \
+assert_unchanged_installation() {
+  [[ "$(<"$DESTINATION/version")" == old-app ]]
+  [[ "$(<"$TARGET")" == old-companion ]]
+}
+
+refuse_update() {
+  local description=$1
+  if ASTRID_FSKIT_APP_DEST="$DESTINATION" \
+    ASTRID_FSKIT_BIN_DIR="$BIN_DIR" \
+    "$RELEASE/macos/manage-macos-fskit.sh" update >"$FAILURE_LOG" 2>&1; then
+    echo "$description unexpectedly passed lifecycle validation" >&2
+    exit 1
+  fi
+  assert_unchanged_installation
+}
+
+if ASTRID_FSKIT_APP_DEST="$DESTINATION" \
   ASTRID_FSKIT_BIN_DIR="$BIN_DIR" \
   "$RELEASE/macos/manage-macos-fskit.sh" update >"$FAILURE_LOG" 2>&1; then
-  echo "injected companion activation failure unexpectedly succeeded" >&2
+  echo "an unsigned companion unexpectedly passed lifecycle validation" >&2
   exit 1
 fi
-/usr/bin/grep -Fq "the previous app and companion were restored" "$FAILURE_LOG"
-[[ "$(<"$DESTINATION/version")" == old-app ]]
-[[ "$(<"$TARGET")" == old-companion ]]
-[[ -z "$(find "$TEST_ROOT" \( -name '.AstridFS.update.*' -o -name '.astrid-fskit.update.*' \) -print -quit)" ]]
+assert_unchanged_installation
 
-TEST_DESTINATION="$DESTINATION" \
-  TEST_COMPANION_TARGET="$TARGET" \
-  ASTRID_FSKIT_APP_DEST="$DESTINATION" \
-  ASTRID_FSKIT_BIN_DIR="$BIN_DIR" \
-  "$RELEASE/macos/manage-macos-fskit.sh" update
-[[ "$(<"$DESTINATION/version")" == new-app ]]
-[[ "$(<"$TARGET")" == new-companion ]]
-[[ -x "$TARGET" ]]
+/bin/cp "$AD_HOC_COMPANION" "$RELEASE/astrid-storage-provider-fskit"
+# The manager accepts only an Apple-issued 9BDSL5BJAP identity, so local
+# coverage stops at rejection; update/rollback proof remains runner-only.
+refuse_update "an ad-hoc companion without an Apple team identifier"
+
+/usr/bin/codesign --force --identifier org.astrid.wrong.companion \
+  --sign - "$RELEASE/astrid-storage-provider-fskit"
+refuse_update "a companion with the wrong identifier"
+
 [[ -z "$(find "$TEST_ROOT" \( -name '.AstridFS.update.*' -o -name '.astrid-fskit.update.*' \) -print -quit)" ]]
