@@ -53,19 +53,31 @@ extension_record() {
 }
 
 extension_is_elected() {
-  local extension_path records elected_record installed_short version_token
+  local extension_path records elected_record elected_info elected_path
+  local installed_short version_token expected_prefix
   extension_path="$DESTINATION_APP/Contents/Extensions/AstridFSAppEx.appex"
   records="$(extension_record)" || return 1
-  elected_record="$(printf '%s\n' "$records" | /usr/bin/awk -F '\t' \
-    -v path="$extension_path" \
-    '$4 == path && $1 ~ /^\+[[:space:]]+/ { print $1; count++ } END { exit count == 1 ? 0 : 1 }')" || return 1
-  case "$elected_record" in
-    "+    $EXTENSION_IDENTIFIER("*) ;;
+  elected_record="$(printf '%s\n' "$records" | /usr/bin/awk -F '\t' '
+    $1 ~ /^\+[[:space:]]*/ {
+      elected = $0
+      count++
+    }
+    END {
+      if (count != 1) {
+        exit 1
+      }
+      print elected
+    }')" || return 1
+  IFS=$'\t' read -r elected_info _ _ elected_path <<<"$elected_record"
+  [[ "$elected_path" == "$extension_path" ]] || return 1
+  expected_prefix="+    $EXTENSION_IDENTIFIER("
+  case "$elected_info" in
+    "$expected_prefix"*) ;;
     *) return 1 ;;
   esac
-  version_token="${elected_record#"+    $EXTENSION_IDENTIFIER("}"
+  version_token="${elected_info#"$expected_prefix"}"
   version_token="${version_token%)}"
-  [[ -n "$version_token" ]] || return 1
+  [[ "$version_token" != "$elected_info" && -n "$version_token" ]] || return 1
   installed_short="$(plutil -extract CFBundleShortVersionString raw -expect string \
     "$extension_path/Contents/Info.plist")"
   # PlugInKit's parenthetical binds to the extension's short version only.

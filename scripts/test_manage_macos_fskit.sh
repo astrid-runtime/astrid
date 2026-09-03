@@ -31,6 +31,10 @@ trap '/bin/rm -rf "$TEST_ROOT"' EXIT
 set -euo pipefail
 printf '+    org.astrid.runtime.fs.AppEx(%s)\tignored\tignored\t%s\n' \
   "${ASTRID_TEST_PLUGINKIT_VERSION:?}" "${ASTRID_TEST_PLUGINKIT_PATH:?}"
+if [[ -n "${ASTRID_TEST_PLUGINKIT_SECOND_PATH:-}" ]]; then
+  printf '+    org.astrid.runtime.fs.AppEx(%s)\tignored\tignored\t%s\n' \
+    "${ASTRID_TEST_PLUGINKIT_VERSION:?}" "$ASTRID_TEST_PLUGINKIT_SECOND_PATH"
+fi
 PLUGINKIT
 /bin/chmod 0755 "$FAKE_PLUGINKIT"
 /bin/cat > "$FAKE_PGREP" <<'PGREP'
@@ -113,6 +117,20 @@ if ASTRID_TEST_PLUGINKIT_VERSION=600 \
 fi
 /usr/bin/grep -Fq "has not elected" "$FAILURE_LOG" || {
   echo "build-version parenthetical refusal did not explain the election mismatch" >&2
+  exit 1
+}
+
+if ASTRID_TEST_PLUGINKIT_VERSION=1.0 \
+  ASTRID_TEST_PLUGINKIT_PATH="$DESTINATION/Contents/Extensions/AstridFSAppEx.appex" \
+  ASTRID_TEST_PLUGINKIT_SECOND_PATH="$TEST_ROOT/other/AstridFSAppEx.appex" \
+  ASTRID_FSKIT_APP_DEST="$DESTINATION" \
+  BASH_ENV="$BASH_ENV_FILE" \
+  "$RELEASE/macos/manage-macos-fskit.sh" status >"$FAILURE_LOG" 2>&1; then
+  echo "ambiguous duplicate PlugInKit election records unexpectedly passed validation" >&2
+  exit 1
+fi
+/usr/bin/grep -Fq "has not elected" "$FAILURE_LOG" || {
+  echo "duplicate PlugInKit election refusal did not explain the election mismatch" >&2
   exit 1
 }
 
