@@ -1,11 +1,14 @@
 //! Authenticate selected Distro sources before `init` mutates runtime state.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use astrid_core::dirs::AstridHome;
 
+use super::super::distro::local_source::{
+    normalize_authenticated_manifest_path, resolve_local_capsule_archive,
+};
 use super::super::distro::lock::{DistroLock, manifest_hash};
 use super::super::distro::manifest::{DistroCapsule, DistroManifest, parse_manifest};
 use super::super::distro::trust;
@@ -20,6 +23,8 @@ pub(super) struct SignedDistroBundle {
     pub(super) manifest_hash: String,
     /// Maintainer-resolved refs from the signed lock, keyed by capsule name.
     pub(super) pinned_refs: HashMap<String, String>,
+    /// The local manifest whose parent authenticates relative members.
+    pub(super) manifest_path: Option<PathBuf>,
 }
 
 /// A source after authentication and before runtime mutation.
@@ -27,10 +32,10 @@ pub(super) struct SignedDistroBundle {
 pub(super) enum PreparedDistro {
     Shuttle,
     Manifest {
-        manifest: DistroManifest,
+        manifest: Box<DistroManifest>,
         manifest_hash: String,
     },
-    Signed(SignedDistroBundle),
+    Signed(Box<SignedDistroBundle>),
 }
 
 /// Split an authenticated source into its install inputs.
@@ -42,10 +47,10 @@ pub(super) fn unpack_prepared(
         PreparedDistro::Manifest {
             manifest,
             manifest_hash,
-        } => (manifest, manifest_hash, None),
+        } => (*manifest, manifest_hash, None),
         PreparedDistro::Signed(bundle) => {
             let manifest = bundle.manifest.clone();
-            (manifest, bundle.manifest_hash.clone(), Some(bundle))
+            (manifest, bundle.manifest_hash.clone(), Some(*bundle))
         },
     }
 }
@@ -60,13 +65,13 @@ pub(super) async fn prepare_distro_source(
         return Ok(PreparedDistro::Shuttle);
     }
     if opts.require_signed {
-        return Ok(PreparedDistro::Signed(
+        return Ok(PreparedDistro::Signed(Box::new(
             fetch_signed_manifest(distro_source, opts.offline, opts.accept_new_key, home).await?,
-        ));
+        )));
     }
     let (manifest_bytes, manifest) = fetch_manifest_bytes(distro_source, opts.offline).await?;
     Ok(PreparedDistro::Manifest {
-        manifest,
+        manifest: Box::new(manifest),
         manifest_hash: manifest_hash(&manifest_bytes),
     })
 }
@@ -74,10 +79,11 @@ pub(super) async fn prepare_distro_source(
 /// Resolve each member to bytes and prove those bytes match the signed lock.
 pub(super) async fn resolve_signed_capsules(
     selected: &[DistroCapsule],
-    lock: &DistroLock,
+    bundle: &SignedDistroBundle,
     staging: &Path,
 ) -> anyhow::Result<Vec<DistroCapsule>> {
-    let signed_by_name: HashMap<&str, &super::super::distro::lock::LockedCapsule> = lock
+    let signed_by_name: HashMap<&str, &super::super::distro::lock::LockedCapsule> = bundle
+        .lock
         .capsules
         .iter()
         .map(|capsule| (capsule.name.as_str(), capsule))
@@ -92,9 +98,17 @@ pub(super) async fn resolve_signed_capsules(
             })?;
         let pinned_tag = signed.resolved_ref.as_deref().or(capsule.tag.as_deref());
         let archive_path = staging.join(format!("{}.capsule", capsule.name));
-        if is_local_capsule_archive(&capsule.source) {
-            std::fs::copy(&capsule.source, &archive_path)
-                .with_context(|| format!("copy signed capsule {}", capsule.name))?;
+        if let Some(local_source) =
+            resolve_local_capsule_archive(&capsule.source, bundle.manifest_path.as_deref())
+                .with_context(|| format!("resolve signed capsule {}", capsule.name))?
+        {
+            std::fs::copy(&local_source, &archive_path).with_context(|| {
+                format!(
+                    "copy signed capsule {} from {}",
+                    capsule.name,
+                    local_source.display()
+                )
+            })?;
         } else {
             if capsule.source.starts_with('.') || capsule.source.starts_with('/') {
                 bail!(
@@ -116,22 +130,20 @@ pub(super) async fn resolve_signed_capsules(
         let bytes = std::fs::read(&archive_path)
             .with_context(|| format!("read resolved capsule {}", capsule.name))?;
         let actual = manifest_hash(&bytes);
-        anyhow::ensure!(
-            signed.hash == actual,
-            "capsule '{}' hash mismatch: signed lock has {}, resolved artifact has {actual}",
-            capsule.name,
-            signed.hash
-        );
+        if signed.hash != actual {
+            std::fs::remove_file(&archive_path)
+                .with_context(|| format!("discard hash-mismatched capsule {}", capsule.name))?;
+            anyhow::bail!(
+                "capsule '{}' hash mismatch: signed lock has {}, resolved artifact has {actual}",
+                capsule.name,
+                signed.hash
+            );
+        }
         let mut member = capsule.clone();
         member.source = archive_path.to_string_lossy().into_owned();
         resolved.push(member);
     }
     Ok(resolved)
-}
-
-fn is_local_capsule_archive(source: &str) -> bool {
-    let path = Path::new(source);
-    path.is_file() && source.ends_with(".capsule")
 }
 
 /// Resolve a distro source to its exact bytes and parse those bytes once.
@@ -173,9 +185,18 @@ async fn fetch_signed_manifest(
     accept_new_key: bool,
     home: &AstridHome,
 ) -> anyhow::Result<SignedDistroBundle> {
-    let (manifest_bytes, manifest) = fetch_manifest_bytes(source, offline).await?;
+    let source_path = PathBuf::from(source);
+    let local_manifest_path = source_path
+        .is_file()
+        .then(|| normalize_authenticated_manifest_path(&source_path))
+        .transpose()?;
+    let source = local_manifest_path
+        .as_deref()
+        .and_then(Path::to_str)
+        .map_or_else(|| source.to_owned(), str::to_owned);
+    let (manifest_bytes, manifest) = fetch_manifest_bytes(&source, offline).await?;
     let manifest_hash = manifest_hash(&manifest_bytes);
-    let lock_bytes = fetch_signed_member(source, offline, "Distro.lock").await?;
+    let lock_bytes = fetch_signed_member(&source, offline, "Distro.lock").await?;
     anyhow::ensure!(
         lock_bytes.len() <= 1024 * 1024,
         "Distro.lock exceeds 1 MB limit"
@@ -183,7 +204,7 @@ async fn fetch_signed_manifest(
     let lock_text = std::str::from_utf8(&lock_bytes).context("Distro.lock is not valid UTF-8")?;
     let lock: DistroLock =
         toml::from_str(lock_text).context("failed to parse signed Distro.lock")?;
-    let sig_bytes = fetch_signed_member(source, offline, "Distro.sig").await?;
+    let sig_bytes = fetch_signed_member(&source, offline, "Distro.sig").await?;
     anyhow::ensure!(
         sig_bytes.len() <= 64 * 1024,
         "Distro.sig exceeds size limit"
@@ -203,6 +224,7 @@ async fn fetch_signed_manifest(
         lock,
         manifest_hash,
         pinned_refs,
+        manifest_path: local_manifest_path,
     })
 }
 

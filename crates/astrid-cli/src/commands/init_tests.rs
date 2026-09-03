@@ -4,6 +4,40 @@
 
 use super::*;
 
+struct CurrentDirGuard(std::path::PathBuf);
+
+impl CurrentDirGuard {
+    fn set(path: &std::path::Path) -> Self {
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(path).unwrap();
+        Self(original)
+    }
+}
+
+impl Drop for CurrentDirGuard {
+    fn drop(&mut self) {
+        std::env::set_current_dir(&self.0).unwrap();
+    }
+}
+
+fn run_bare_cwd_child(child_name: &str, marker: &str) {
+    let result_dir = tempfile::tempdir().unwrap();
+    let result_path = result_dir.path().join("result");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "--nocapture", child_name])
+        .env("ASTRID_BARE_CWD_TEST", "1")
+        .env("ASTRID_BARE_CWD_RESULT", &result_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(result_path).unwrap(), marker);
+}
+
 #[test]
 fn batch_install_rejects_reported_identity_mismatch() {
     let expected = astrid_capsule::capsule::CapsuleId::new("expected-capsule").unwrap();
@@ -218,11 +252,292 @@ fn signed_source_fixture(
     (dir.join("Distro.toml"), bytes, manifest_hash, keypair)
 }
 
-fn seed_pin(home: &AstridHome, keypair: &astrid_crypto::KeyPair) {
+fn seed_distro_pin(home: &AstridHome, distro_id: &str, keypair: &astrid_crypto::KeyPair) {
     let trust_dir = home.root().join("trust");
     std::fs::create_dir_all(&trust_dir).unwrap();
     let pubkey = super::super::distro::sign::pubkey_to_wire(&keypair.export_public_key());
-    std::fs::write(trust_dir.join("test.pub"), format!("{pubkey}\n")).unwrap();
+    std::fs::write(
+        trust_dir.join(format!("{distro_id}.pub")),
+        format!("{pubkey}\n"),
+    )
+    .unwrap();
+}
+
+fn seed_pin(home: &AstridHome, keypair: &astrid_crypto::KeyPair) {
+    seed_distro_pin(home, "test", keypair);
+}
+
+fn signed_local_source_fixture(
+    dir: &std::path::Path,
+    capsule_bytes: &[u8],
+) -> (std::path::PathBuf, Vec<u8>, String, astrid_crypto::KeyPair) {
+    std::fs::create_dir_all(dir.join("capsules")).unwrap();
+    std::fs::write(dir.join("capsules/member.capsule"), capsule_bytes).unwrap();
+    let keypair = astrid_crypto::KeyPair::generate();
+    let pubkey = super::super::distro::sign::pubkey_to_wire(&keypair.export_public_key());
+    let bytes = format!(
+        "schema-version = 1\n\n\
+         [distro]\nid = \"local-test\"\nname = \"Local Test\"\nversion = \"0.1.0\"\n\n\
+         [distro.signing]\npubkey = \"{pubkey}\"\n\n\
+         [[capsule]]\nname = \"member\"\nsource = \"capsules/member.capsule\"\n\
+         version = \"1.0.0\"\nrole = \"uplink\"\n"
+    )
+    .into_bytes();
+    let capsule_hash = format!("blake3:{}", blake3::hash(capsule_bytes).to_hex());
+    let manifest_hash = manifest_hash(&bytes);
+    let lock = super::super::distro::lock::DistroLock {
+        schema_version: 1,
+        distro: super::super::distro::lock::DistroLockMeta {
+            id: "local-test".into(),
+            version: "0.1.0".into(),
+            resolved_at: "2026-01-01T00:00:00Z".into(),
+        },
+        capsules: vec![super::super::distro::lock::LockedCapsule {
+            name: "member".into(),
+            version: "1.0.0".into(),
+            source: "capsules/member.capsule".into(),
+            hash: capsule_hash,
+            resolved_ref: None,
+        }],
+        manifest_hash: Some(manifest_hash.clone()),
+    };
+    let sig = super::super::distro::sign::sign_lock(&lock, &keypair).unwrap();
+    std::fs::write(dir.join("Distro.toml"), &bytes).unwrap();
+    std::fs::write(
+        dir.join("Distro.lock"),
+        toml::to_string_pretty(&lock).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(dir.join("Distro.sig"), sig).unwrap();
+    (dir.join("Distro.toml"), bytes, manifest_hash, keypair)
+}
+
+async fn prepared_local_signed_fixture(
+    dir: &std::path::Path,
+    capsule_bytes: &[u8],
+) -> (super::signed_source::SignedDistroBundle, Vec<u8>, String) {
+    prepared_local_signed_fixture_with_source(
+        dir,
+        capsule_bytes,
+        dir.join("Distro.toml").to_str().unwrap(),
+    )
+    .await
+}
+
+async fn prepared_local_signed_fixture_with_source(
+    dir: &std::path::Path,
+    capsule_bytes: &[u8],
+    source: &str,
+) -> (super::signed_source::SignedDistroBundle, Vec<u8>, String) {
+    let home = AstridHome::from_path(dir.join("home"));
+    let (_, bytes, expected_hash, keypair) = signed_local_source_fixture(dir, capsule_bytes);
+    seed_distro_pin(&home, "local-test", &keypair);
+    let opts = InitOpts {
+        require_signed: true,
+        offline: true,
+        ..Default::default()
+    };
+    let super::PreparedDistro::Signed(bundle) =
+        super::signed_source::prepare_distro_source(source, &opts, &home)
+            .await
+            .unwrap()
+    else {
+        panic!("signed local Distro.toml must prepare a signed bundle");
+    };
+    (*bundle, bytes, expected_hash)
+}
+
+#[test]
+fn signed_apply_prepares_and_resolves_bare_manifest_path_in_cwd() {
+    run_bare_cwd_child(
+        "commands::init::tests::signed_apply_bare_manifest_path_child",
+        "BARE_MANIFEST_APPLY_OK",
+    );
+}
+
+#[test]
+fn signed_apply_bare_manifest_path_child() {
+    if std::env::var("ASTRID_BARE_CWD_TEST").as_deref() != Ok("1") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let capsule_bytes = b"local signed capsule".to_vec();
+
+    let _current_dir = CurrentDirGuard::set(dir.path());
+    let prepared = futures::executor::block_on(prepared_local_signed_fixture_with_source(
+        dir.path(),
+        &capsule_bytes,
+        "Distro.toml",
+    ));
+    let (bundle, bytes, expected_hash) = prepared;
+    assert_eq!(bundle.manifest_hash, expected_hash);
+    assert_eq!(bundle.manifest_hash, manifest_hash(&bytes));
+    assert_eq!(
+        bundle.manifest_path.as_deref(),
+        Some(
+            dir.path()
+                .canonicalize()
+                .unwrap()
+                .join("Distro.toml")
+                .as_path()
+        )
+    );
+
+    let staging = tempfile::tempdir().unwrap();
+    let resolved = futures::executor::block_on(super::signed_source::resolve_signed_capsules(
+        &bundle.manifest.capsules,
+        &bundle,
+        staging.path(),
+    ))
+    .unwrap();
+    let staged = staging.path().join("member.capsule");
+    assert_eq!(std::fs::read(&staged).unwrap(), capsule_bytes);
+    assert_eq!(resolved[0].source, staged.to_string_lossy());
+    std::fs::write(
+        std::env::var("ASTRID_BARE_CWD_RESULT").unwrap(),
+        "BARE_MANIFEST_APPLY_OK",
+    )
+    .unwrap();
+}
+
+#[test]
+fn signed_apply_resolves_relative_member_from_manifest_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let capsule_bytes = b"local signed capsule".to_vec();
+    let (bundle, _, expected_hash) =
+        futures::executor::block_on(prepared_local_signed_fixture(dir.path(), &capsule_bytes));
+    assert_eq!(
+        bundle.manifest_path.as_deref(),
+        Some(dir.path().join("Distro.toml").as_path())
+    );
+
+    let staging = tempfile::tempdir().unwrap();
+    let resolved = futures::executor::block_on(super::signed_source::resolve_signed_capsules(
+        &bundle.manifest.capsules,
+        &bundle,
+        staging.path(),
+    ))
+    .unwrap();
+    let staged = staging.path().join("member.capsule");
+    assert_eq!(resolved[0].source, staged.to_string_lossy());
+    assert_eq!(std::fs::read(&staged).unwrap(), capsule_bytes);
+    assert_eq!(bundle.manifest_hash, expected_hash);
+}
+
+#[test]
+fn signed_apply_resolves_member_from_parent_manifest_path() {
+    run_bare_cwd_child(
+        "commands::init::tests::signed_apply_resolves_member_from_parent_manifest_path_child",
+        "PARENT_MANIFEST_APPLY_OK",
+    );
+}
+
+#[test]
+fn signed_apply_resolves_member_from_parent_manifest_path_child() {
+    if std::env::var("ASTRID_BARE_CWD_TEST").as_deref() != Ok("1") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = dir.path().join("bundle");
+    let cwd = dir.path().join("cwd");
+    let capsule_bytes = b"local signed capsule".to_vec();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let _current_dir = CurrentDirGuard::set(&cwd);
+    let (bundle_state, bytes, expected_hash) = futures::executor::block_on(
+        prepared_local_signed_fixture_with_source(&bundle, &capsule_bytes, "../bundle/Distro.toml"),
+    );
+    let expected_manifest_path = std::env::current_dir()
+        .unwrap()
+        .join("../bundle/Distro.toml");
+
+    assert_eq!(bundle_state.manifest_hash, expected_hash);
+    assert_eq!(bundle_state.manifest_hash, manifest_hash(&bytes));
+    assert_eq!(
+        bundle_state.manifest_path.as_deref(),
+        Some(expected_manifest_path.as_path())
+    );
+
+    let staging = tempfile::tempdir().unwrap();
+    let resolved = futures::executor::block_on(super::signed_source::resolve_signed_capsules(
+        &bundle_state.manifest.capsules,
+        &bundle_state,
+        staging.path(),
+    ))
+    .unwrap();
+    let staged = staging.path().join("member.capsule");
+    assert_eq!(std::fs::read(&staged).unwrap(), capsule_bytes);
+    assert_eq!(resolved[0].source, staged.to_string_lossy());
+    std::fs::write(
+        std::env::var("ASTRID_BARE_CWD_RESULT").unwrap(),
+        "PARENT_MANIFEST_APPLY_OK",
+    )
+    .unwrap();
+}
+
+#[test]
+fn signed_apply_fails_closed_on_missing_relative_member() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bundle, _, _) =
+        futures::executor::block_on(prepared_local_signed_fixture(dir.path(), b"member"));
+    std::fs::remove_file(dir.path().join("capsules/member.capsule")).unwrap();
+    let staging = tempfile::tempdir().unwrap();
+
+    let err = futures::executor::block_on(super::signed_source::resolve_signed_capsules(
+        &bundle.manifest.capsules,
+        &bundle,
+        staging.path(),
+    ))
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("member.capsule"),
+        "got: {err:#}"
+    );
+    assert!(!staging.path().join("member.capsule").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn signed_apply_fails_closed_on_member_escape() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bundle, _, _) =
+        futures::executor::block_on(prepared_local_signed_fixture(dir.path(), b"member"));
+    std::fs::remove_file(dir.path().join("capsules/member.capsule")).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("outside.capsule"), b"outside").unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("outside.capsule"),
+        dir.path().join("capsules/member.capsule"),
+    )
+    .unwrap();
+    let staging = tempfile::tempdir().unwrap();
+
+    let err = futures::executor::block_on(super::signed_source::resolve_signed_capsules(
+        &bundle.manifest.capsules,
+        &bundle,
+        staging.path(),
+    ))
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("escapes"), "got: {err:#}");
+    assert!(!staging.path().join("member.capsule").exists());
+}
+
+#[test]
+fn signed_apply_rejects_post_verification_substitution() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bundle, _, _) =
+        futures::executor::block_on(prepared_local_signed_fixture(dir.path(), b"member"));
+    std::fs::write(dir.path().join("capsules/member.capsule"), b"substituted").unwrap();
+    let staging = tempfile::tempdir().unwrap();
+
+    let err = futures::executor::block_on(super::signed_source::resolve_signed_capsules(
+        &bundle.manifest.capsules,
+        &bundle,
+        staging.path(),
+    ))
+    .unwrap_err();
+    assert!(err.to_string().contains("hash mismatch"), "got: {err}");
+    assert!(!staging.path().join("member.capsule").exists());
 }
 
 #[test]

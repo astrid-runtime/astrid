@@ -340,7 +340,8 @@ run_cli_distro_seal_smoke() {
   registry_version="$(capsule_archive_version "$registry_archive")"
   local distro_dir="$ARTIFACTS/cli-distro-seal"
   local key="$distro_dir/signing.key"
-  mkdir -p "$distro_dir"
+  mkdir -p "$distro_dir/capsules"
+  cp "$registry_archive" "$distro_dir/capsules/astrid-capsule-registry.capsule"
   cat > "$distro_dir/Distro.toml" <<EOF
 schema-version = 1
 
@@ -351,7 +352,7 @@ version = "0.1.0"
 
 [[capsule]]
 name = "astrid-capsule-registry"
-source = "$registry_archive"
+source = "capsules/astrid-capsule-registry.capsule"
 version = "$registry_version"
 role = "uplink"
 EOF
@@ -359,9 +360,29 @@ EOF
 import sys
 open(sys.argv[1], "wb").write(bytes(range(32)))
 PY
-  assert_cli_exit_contains "cli-distro-seal-local-source" 1 \
-    "seal can only resolve GitHub-backed capsule sources" \
+
+  assert_cli_exit_contains "cli-distro-seal-relative-source" 0 "Sealed" \
     distro seal "$distro_dir/Distro.toml" --output "$distro_dir/e2e.shuttle" --key "$key"
+
+  local escape_dir="$ARTIFACTS/cli-distro-seal-escape"
+  mkdir -p "$escape_dir"
+  cat > "$escape_dir/Distro.toml" <<EOF
+schema-version = 1
+
+[distro]
+id = "e2e-seal-escape"
+name = "E2E Seal Escape"
+version = "0.1.0"
+
+[[capsule]]
+name = "astrid-capsule-registry"
+source = "$registry_archive"
+version = "$registry_version"
+role = "uplink"
+EOF
+  assert_cli_exit_contains "cli-distro-seal-escape-source" 1 \
+    "escapes the authenticated Distro.toml directory" \
+    distro seal "$escape_dir/Distro.toml" --output "$escape_dir/e2e.shuttle" --key "$key"
 }
 
 run_cli_daemon_lifecycle_smoke() {
