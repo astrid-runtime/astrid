@@ -213,7 +213,7 @@ jobs:
           EXPECTED_VERSION=${EXPECTED_VERSION%-"$CERT_TRIPLE"}
           install -d -m 0700 \
             "$CERT_ROOT" "$CERT_BIN" "$ASTRID_HOME" \
-            "$MOUNTPOINT_INITIAL"
+            "$RELEASE_STAGE" "$MOUNTPOINT_INITIAL"
           chmod -N "$CERT_ROOT" "$CERT_BIN" "$ASTRID_HOME" \
             "$RELEASE_STAGE" "$MOUNTPOINT_INITIAL" 2>/dev/null || true
           tar -xzf "$ARCHIVE" -C "$RELEASE_STAGE"
