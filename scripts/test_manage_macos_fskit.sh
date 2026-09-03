@@ -13,15 +13,45 @@ BIN_DIR="$TEST_ROOT/bin"
 TARGET="$BIN_DIR/astrid-storage-provider-fskit"
 AD_HOC_COMPANION="$TEST_ROOT/ad-hoc-companion"
 FAILURE_LOG="$TEST_ROOT/companion-failure.log"
+FAKE_PLUGINKIT="$TEST_ROOT/pluginkit"
+FAKE_PGREP="$TEST_ROOT/pgrep"
+BASH_ENV_FILE="$TEST_ROOT/bash-env"
 /bin/mkdir -p \
   "$RELEASE/macos" \
   "$RELEASE/AstridFS.app/Contents" \
-  "$DESTINATION" \
+  "$DESTINATION/Contents/Extensions/AstridFSAppEx.appex/Contents" \
   "$BIN_DIR"
 
 trap '/bin/rm -rf "$TEST_ROOT"' EXIT
 
 /bin/cp scripts/manage-macos-fskit.sh "$RELEASE/macos/manage-macos-fskit.sh"
+/bin/chmod 0755 "$RELEASE/macos/manage-macos-fskit.sh"
+/bin/cat > "$FAKE_PLUGINKIT" <<'PLUGINKIT'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '+    org.astrid.runtime.fs.AppEx(%s)\tignored\tignored\t%s\n' \
+  "${ASTRID_TEST_PLUGINKIT_VERSION:?}" "${ASTRID_TEST_PLUGINKIT_PATH:?}"
+PLUGINKIT
+/bin/chmod 0755 "$FAKE_PLUGINKIT"
+/bin/cat > "$FAKE_PGREP" <<'PGREP'
+#!/usr/bin/env bash
+exit 1
+PGREP
+/bin/chmod 0755 "$FAKE_PGREP"
+/bin/cat > "$BASH_ENV_FILE" <<'BASH_ENV'
+open() { :; }
+sleep() { :; }
+BASH_ENV
+
+# Exercise the manager's real PlugInKit parser with a deterministic temporary
+# record. The command copy keeps all production paths intact while redirecting
+# only the host tools that would otherwise require a live FSKit installation.
+/usr/bin/sed \
+  -e "s|/usr/bin/pluginkit|$FAKE_PLUGINKIT|g" \
+  -e "s|/usr/bin/pgrep|$FAKE_PGREP|g" \
+  -e 's|for _ in {1..30}|for _ in {1..1}|' \
+  "$RELEASE/macos/manage-macos-fskit.sh" > "$TEST_ROOT/manage-macos-fskit.sh"
+/bin/mv "$TEST_ROOT/manage-macos-fskit.sh" "$RELEASE/macos/manage-macos-fskit.sh"
 /bin/chmod 0755 "$RELEASE/macos/manage-macos-fskit.sh"
 /bin/cat > "$RELEASE/AstridFS.app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -34,6 +64,19 @@ trap '/bin/rm -rf "$TEST_ROOT"' EXIT
 </plist>
 PLIST
 /usr/bin/plutil -lint "$RELEASE/AstridFS.app/Contents/Info.plist"
+/bin/cat > "$DESTINATION/Contents/Extensions/AstridFSAppEx.appex/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0</string>
+  <key>CFBundleVersion</key>
+  <string>600</string>
+</dict>
+</plist>
+PLIST
+/usr/bin/plutil -lint "$DESTINATION/Contents/Extensions/AstridFSAppEx.appex/Contents/Info.plist"
 /usr/bin/printf 'new-app\n' > "$RELEASE/AstridFS.app/version"
 /usr/bin/printf 'old-app\n' > "$DESTINATION/version"
 /bin/cat > "$TEST_ROOT/companion.c" <<'C'
@@ -59,6 +102,32 @@ set -euo pipefail
 [[ -d "$1" && -f "$1/version" ]]
 VALIDATOR
 /bin/chmod 0755 "$RELEASE/macos/validate-macos-fskit.sh"
+
+if ASTRID_TEST_PLUGINKIT_VERSION=600 \
+  ASTRID_TEST_PLUGINKIT_PATH="$DESTINATION/Contents/Extensions/AstridFSAppEx.appex" \
+  ASTRID_FSKIT_APP_DEST="$DESTINATION" \
+  BASH_ENV="$BASH_ENV_FILE" \
+  "$RELEASE/macos/manage-macos-fskit.sh" status >"$FAILURE_LOG" 2>&1; then
+  echo "a PlugInKit build-version parenthetical unexpectedly passed election validation" >&2
+  exit 1
+fi
+/usr/bin/grep -Fq "has not elected" "$FAILURE_LOG" || {
+  echo "build-version parenthetical refusal did not explain the election mismatch" >&2
+  exit 1
+}
+
+if ASTRID_TEST_PLUGINKIT_VERSION=1.0 \
+  ASTRID_TEST_PLUGINKIT_PATH="$DESTINATION/Contents/Extensions/AstridFSAppEx.appex" \
+  ASTRID_FSKIT_APP_DEST="$DESTINATION" \
+  BASH_ENV="$BASH_ENV_FILE" \
+  "$RELEASE/macos/manage-macos-fskit.sh" enable >"$FAILURE_LOG" 2>&1; then
+  echo "enable unexpectedly passed without a bound AstridFS process" >&2
+  exit 1
+fi
+/usr/bin/grep -Fq "AstridFS is not running at" "$FAILURE_LOG" || {
+  echo "enable without a bound process did not fail closed" >&2
+  exit 1
+}
 
 assert_unchanged_installation() {
   [[ "$(<"$DESTINATION/version")" == old-app ]]

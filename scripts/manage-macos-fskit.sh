@@ -53,7 +53,7 @@ extension_record() {
 }
 
 extension_is_elected() {
-  local extension_path records elected_record installed_build installed_short version_token
+  local extension_path records elected_record installed_short version_token
   extension_path="$DESTINATION_APP/Contents/Extensions/AstridFSAppEx.appex"
   records="$(extension_record)" || return 1
   elected_record="$(printf '%s\n' "$records" | /usr/bin/awk -F '\t' \
@@ -68,12 +68,8 @@ extension_is_elected() {
   [[ -n "$version_token" ]] || return 1
   installed_short="$(plutil -extract CFBundleShortVersionString raw -expect string \
     "$extension_path/Contents/Info.plist")"
-  installed_build="$(plutil -extract CFBundleVersion raw -expect string \
-    "$extension_path/Contents/Info.plist")"
-  # PlugInKit displays the plist value that identifies its record. Compare the
-  # observed parenthetical to both Astrid-controlled versions; never assume a
-  # key name from the display format.
-  [[ "$version_token" == "$installed_short" || "$version_token" == "$installed_build" ]]
+  # PlugInKit's parenthetical binds to the extension's short version only.
+  [[ "$version_token" == "$installed_short" ]]
 }
 
 require_extension_elected() {
@@ -284,6 +280,7 @@ case "$COMMAND" in
       sleep 1
     done
     require_extension_elected
+    check_app_processes
     ;;
   check-process)
     validate_app "$DESTINATION_APP"
