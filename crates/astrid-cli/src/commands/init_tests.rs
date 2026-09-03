@@ -425,6 +425,57 @@ fn signed_apply_resolves_relative_member_from_manifest_parent() {
 }
 
 #[test]
+fn signed_apply_resolves_member_from_parent_manifest_path() {
+    run_bare_cwd_child(
+        "commands::init::tests::signed_apply_resolves_member_from_parent_manifest_path_child",
+        "PARENT_MANIFEST_APPLY_OK",
+    );
+}
+
+#[test]
+fn signed_apply_resolves_member_from_parent_manifest_path_child() {
+    if std::env::var("ASTRID_BARE_CWD_TEST").as_deref() != Ok("1") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let bundle = dir.path().join("bundle");
+    let cwd = dir.path().join("cwd");
+    let capsule_bytes = b"local signed capsule".to_vec();
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let _current_dir = CurrentDirGuard::set(&cwd);
+    let (bundle_state, bytes, expected_hash) = futures::executor::block_on(
+        prepared_local_signed_fixture_with_source(&bundle, &capsule_bytes, "../bundle/Distro.toml"),
+    );
+    let expected_manifest_path = std::env::current_dir()
+        .unwrap()
+        .join("../bundle/Distro.toml");
+
+    assert_eq!(bundle_state.manifest_hash, expected_hash);
+    assert_eq!(bundle_state.manifest_hash, manifest_hash(&bytes));
+    assert_eq!(
+        bundle_state.manifest_path.as_deref(),
+        Some(expected_manifest_path.as_path())
+    );
+
+    let staging = tempfile::tempdir().unwrap();
+    let resolved = futures::executor::block_on(super::signed_source::resolve_signed_capsules(
+        &bundle_state.manifest.capsules,
+        &bundle_state,
+        staging.path(),
+    ))
+    .unwrap();
+    let staged = staging.path().join("member.capsule");
+    assert_eq!(std::fs::read(&staged).unwrap(), capsule_bytes);
+    assert_eq!(resolved[0].source, staged.to_string_lossy());
+    std::fs::write(
+        std::env::var("ASTRID_BARE_CWD_RESULT").unwrap(),
+        "PARENT_MANIFEST_APPLY_OK",
+    )
+    .unwrap();
+}
+
+#[test]
 fn signed_apply_fails_closed_on_missing_relative_member() {
     let dir = tempfile::tempdir().unwrap();
     let (bundle, _, _) =

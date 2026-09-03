@@ -358,4 +358,61 @@ mod tests {
         );
         assert!(!dir.path().join("missing.shuttle").exists());
     }
+
+    #[test]
+    fn seal_resolves_member_from_parent_manifest_path() {
+        run_bare_cwd_child(
+            "commands::distro::seal::tests::seal_resolves_member_from_parent_manifest_path_child",
+            "PARENT_MANIFEST_SEAL_OK",
+        );
+    }
+
+    #[test]
+    fn seal_resolves_member_from_parent_manifest_path_child() {
+        if std::env::var("ASTRID_BARE_CWD_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        let cwd = dir.path().join("cwd");
+        let capsule_bytes = b"local capsule bytes".to_vec();
+        std::fs::create_dir_all(bundle.join("capsules")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(bundle.join("capsules/member.capsule"), &capsule_bytes).unwrap();
+
+        let keypair = astrid_crypto::KeyPair::generate();
+        let pubkey = sign::pubkey_to_wire(&keypair.export_public_key());
+        let manifest = format!(
+            "schema-version = 1\n\n\
+             [distro]\nid = \"local-test\"\nname = \"Local Test\"\nversion = \"0.1.0\"\n\n\
+             [distro.signing]\npubkey = \"{pubkey}\"\n\n\
+             [[capsule]]\nname = \"member\"\nsource = \"capsules/member.capsule\"\n\
+             version = \"1.0.0\"\nrole = \"uplink\"\n"
+        );
+        std::fs::write(bundle.join("Distro.toml"), &manifest).unwrap();
+        let key = bundle.join("fixture.key");
+        std::fs::write(&key, keypair.secret_key_bytes()).unwrap();
+
+        let _current_dir = CurrentDirGuard::set(&cwd);
+        let output = dir.path().join("local.shuttle");
+        futures::executor::block_on(run_seal("../bundle/Distro.toml", &output, &key)).unwrap();
+
+        let mirror = tempfile::tempdir().unwrap();
+        shuttle::unpack(&output, mirror.path()).unwrap();
+        let sealed_manifest = std::fs::read(mirror.path().join(shuttle::MANIFEST_NAME)).unwrap();
+        assert_eq!(sealed_manifest, manifest.into_bytes());
+        let lock: DistroLock = toml::from_str(
+            &std::fs::read_to_string(mirror.path().join(shuttle::LOCK_NAME)).unwrap(),
+        )
+        .unwrap();
+        let expected_hash = format!("blake3:{}", blake3::hash(&capsule_bytes).to_hex());
+        assert_eq!(lock.capsules[0].hash, expected_hash);
+        let packed = std::fs::read(shuttle::capsule_mirror_path(mirror.path(), "member")).unwrap();
+        assert_eq!(packed, capsule_bytes);
+        std::fs::write(
+            std::env::var("ASTRID_BARE_CWD_RESULT").unwrap(),
+            "PARENT_MANIFEST_SEAL_OK",
+        )
+        .unwrap();
+    }
 }

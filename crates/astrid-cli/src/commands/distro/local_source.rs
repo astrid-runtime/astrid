@@ -5,6 +5,8 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, bail};
 use astrid_capsule_install::github_source::parse_github_source;
 
+use super::shuttle::MAX_MEMBER_BYTES;
+
 /// Whether a capsule source is resolved from the authenticated manifest's
 /// filesystem root rather than GitHub.
 pub(crate) fn is_local_capsule_source(source: &str) -> bool {
@@ -59,7 +61,7 @@ pub(crate) fn resolve_local_capsule_archive(
     } else {
         root.join(source_path)
     };
-    if candidate
+    if source_path
         .components()
         .any(|component| matches!(component, Component::ParentDir))
     {
@@ -79,6 +81,13 @@ pub(crate) fn resolve_local_capsule_archive(
         .with_context(|| format!("failed to stat local capsule source {source:?}"))?;
     if !metadata.is_file() {
         bail!("local capsule source {source:?} is not a regular file");
+    }
+    if metadata.len() > MAX_MEMBER_BYTES {
+        bail!(
+            "local capsule source {source:?} is {} bytes, exceeding the \
+             {MAX_MEMBER_BYTES}-byte member limit",
+            metadata.len()
+        );
     }
 
     Ok(Some(canonical_path))
@@ -136,6 +145,44 @@ mod tests {
 
         let err = resolve_local_capsule_archive("../outside.capsule", Some(&manifest)).unwrap_err();
         assert!(err.to_string().contains("escapes"));
+    }
+
+    #[test]
+    fn resolves_member_when_manifest_path_contains_parent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("cwd/../bundle/Distro.toml");
+        std::fs::create_dir_all(dir.path().join("cwd")).unwrap();
+        std::fs::create_dir_all(dir.path().join("bundle/capsules")).unwrap();
+        std::fs::write(&manifest, "schema-version = 1\n").unwrap();
+        std::fs::write(dir.path().join("bundle/capsules/member.capsule"), b"member").unwrap();
+
+        let resolved = resolve_local_capsule_archive("capsules/member.capsule", Some(&manifest))
+            .unwrap()
+            .unwrap();
+        let expected = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("bundle/capsules/member.capsule");
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn oversized_member_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("Distro.toml");
+        std::fs::create_dir_all(dir.path().join("capsules")).unwrap();
+        std::fs::write(&manifest, "schema-version = 1\n").unwrap();
+        let archive = dir.path().join("capsules/member.capsule");
+        let file = std::fs::File::create(&archive).unwrap();
+        file.set_len(MAX_MEMBER_BYTES + 1).unwrap();
+        drop(file);
+
+        let staging = tempfile::tempdir().unwrap();
+        let err =
+            resolve_local_capsule_archive("capsules/member.capsule", Some(&manifest)).unwrap_err();
+        assert!(err.to_string().contains("member limit"), "got: {err}");
+        assert!(!staging.path().join("member.capsule").exists());
     }
 
     #[cfg(unix)]

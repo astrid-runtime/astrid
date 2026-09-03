@@ -43,7 +43,7 @@ pub(crate) const CAPSULES_DIR: &str = "capsules";
 
 /// Upper bound on a single unpacked `.shuttle` member (50 MB), matching
 /// the capsule-download ceiling. Defends against decompression bombs.
-const MAX_MEMBER_BYTES: u64 = 50 * 1024 * 1024;
+pub(crate) const MAX_MEMBER_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Whether a member of `len` bytes is within the per-member size cap.
 ///
