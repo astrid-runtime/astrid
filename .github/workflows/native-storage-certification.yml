@@ -13,17 +13,26 @@ on:
         required: true
         default: false
         type: boolean
+  workflow_call:
+    inputs:
+      source_commit:
+        description: Exact 40-character source commit selected for this workflow run
+        required: true
+        type: string
+      runner_contract_acknowledged:
+        description: Dedicated signed-runner contract acknowledged; this is not runtime or Aqua-session proof
+        required: true
+        type: boolean
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: native-fskit-certification
   cancel-in-progress: false
 
 env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: "1"
   ASTRID_FSKIT_APP_DEST: /Applications/AstridFS.app
 
 jobs:
@@ -38,29 +47,26 @@ jobs:
         with:
           egress-policy: audit
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          submodules: recursive
-
       - name: Establish isolated certification paths
         run: |
           set -euo pipefail
           CERT_ROOT="$RUNNER_TEMP/astrid-fskit-cert-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           {
             echo "CERT_ROOT=$CERT_ROOT"
-            echo "CARGO_TARGET_DIR=$CERT_ROOT/cargo-target"
             echo "ASTRID_HOME=$CERT_ROOT/home"
             echo "CERT_BIN=$CERT_ROOT/bin"
+            echo "ASTRID_FSKIT_BIN_DIR=$CERT_ROOT/bin"
             echo "RELEASE_STAGE=$CERT_ROOT/release"
             echo "MOUNTPOINT_INITIAL=$CERT_ROOT/mount-initial"
-            echo "MOUNTPOINT_IGNORED_TEST=$CERT_ROOT/mount-ignored-test"
-            echo "ASTRID_FSKIT_OUTPUT_ROOT=$CERT_ROOT/macos-fskit"
-            echo "ASTRID_FSKIT_BIN_DIR=$CERT_ROOT/bin"
           } >> "$GITHUB_ENV"
 
-      - name: Bind certification to the check-run commit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Bind certification to protected-main source
         env:
           ACKNOWLEDGED: ${{ inputs.runner_contract_acknowledged }}
           REQUESTED_SOURCE: ${{ inputs.source_commit }}
@@ -74,13 +80,21 @@ jobs:
             echo "source_commit must be an exact lowercase 40-character commit" >&2
             exit 1
           }
-          EVENT_SOURCE=$(git rev-parse "${GITHUB_SHA}^{commit}")
-          CHECKED_OUT_SOURCE=$(git rev-parse 'HEAD^{commit}')
-          [[ "$REQUESTED_SOURCE" == "$EVENT_SOURCE" ]]
-          [[ "$CHECKED_OUT_SOURCE" == "$EVENT_SOURCE" ]]
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$REQUESTED_SOURCE" origin/main || {
+            echo "source_commit $REQUESTED_SOURCE is not an ancestor of protected origin/main" >&2
+            exit 1
+          }
+          [[ "$(git rev-parse "$REQUESTED_SOURCE^{commit}")" == "$REQUESTED_SOURCE" ]] || {
+            echo "source_commit must be the exact full commit SHA" >&2
+            exit 1
+          }
+          git checkout --detach --force "$REQUESTED_SOURCE"
+          [[ "$(git rev-parse 'HEAD^{commit}')" == "$REQUESTED_SOURCE" ]]
           git verify-commit "$REQUESTED_SOURCE^{commit}"
           git diff --exit-code
           git diff --cached --exit-code
+          echo "SOURCE_COMMIT=$REQUESTED_SOURCE" >> "$GITHUB_ENV"
 
       - name: Require the dedicated native runner
         run: |
@@ -111,87 +125,113 @@ jobs:
             exit 1
           fi
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        with:
-          toolchain: "1.95.0"
-
-      - name: Build the kernel, CLI, and FSKit companion
+      - name: Resolve the exact release build artifact
         env:
-          ASTRID_FSKIT_CODE_SIGN_IDENTITY: ${{ secrets.ASTRID_FSKIT_CODE_SIGN_IDENTITY }}
-          ASTRID_FSKIT_DEVELOPMENT_TEAM: ${{ secrets.ASTRID_FSKIT_DEVELOPMENT_TEAM }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          ASTRID_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
-          [[ -n "$ASTRID_VERSION" ]]
-          echo "ASTRID_VERSION=$ASTRID_VERSION" >> "$GITHUB_ENV"
-          echo "ASTRID_FSKIT_EXPECTED_VERSION=$ASTRID_VERSION" >> "$GITHUB_ENV"
+          case "$(uname -m)" in
+            arm64) CERT_TRIPLE=aarch64-apple-darwin ;;
+            x86_64) CERT_TRIPLE=x86_64-apple-darwin ;;
+            *)
+              echo "unsupported macOS runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          echo "CERT_TRIPLE=$CERT_TRIPLE" >> "$GITHUB_ENV"
+          if [[ "$GITHUB_EVENT_NAME" == workflow_call ]]; then
+            echo "CERT_ARTIFACT_SOURCE=same-run" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          RUN_ID=$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$SOURCE_COMMIT" \
+            --jq '[.workflow_runs[] |
+              select(.name == "Release" and .conclusion == "success")][0].id // empty')
+          [[ -n "$RUN_ID" ]] || {
+            echo "no successful Release workflow run exists for $SOURCE_COMMIT" >&2
+            exit 1
+          }
+          ARTIFACT_ID=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" \
+            --jq "[.artifacts[] | select(.name == \"binary-$CERT_TRIPLE\" and .expired == false)][0].id // empty")
+          [[ -n "$ARTIFACT_ID" ]] || {
+            echo "successful Release run $RUN_ID has no binary-$CERT_TRIPLE artifact for $SOURCE_COMMIT" >&2
+            exit 1
+          }
+          {
+            echo "CERT_ARTIFACT_SOURCE=release-run"
+            echo "CERT_ARTIFACT_ID=$ARTIFACT_ID"
+          } >> "$GITHUB_ENV"
+
+      - name: Download the same-run build artifact
+        if: env.CERT_ARTIFACT_SOURCE == 'same-run'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: binary-${{ env.CERT_TRIPLE }}
+          path: ${{ runner.temp }}/fskit-cert-artifact
+
+      - name: Download the released build artifact for the certified source
+        if: env.CERT_ARTIFACT_SOURCE == 'release-run'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-id: ${{ env.CERT_ARTIFACT_ID }}
+          path: ${{ runner.temp }}/fskit-cert-artifact
+          github-token: ${{ github.token }}
+
+      - name: Stage the exact release bytes
+        run: |
+          set -euo pipefail
+          DOWNLOAD_DIR="$RUNNER_TEMP/fskit-cert-artifact"
+          ARCHIVES=$(find "$DOWNLOAD_DIR" -maxdepth 1 -type f -name '*.tar.gz')
+          [[ "$(printf '%s\n' "$ARCHIVES" | grep -c .)" -eq 1 ]] || {
+            echo "the artifact must contain exactly one archive, got:" >&2
+            printf '%s\n' "$ARCHIVES" >&2
+            exit 1
+          }
+          ARCHIVE="$ARCHIVES"
+          EXPECTED_VERSION=$(basename "$ARCHIVE" .tar.gz)
+          EXPECTED_VERSION=${EXPECTED_VERSION#astrid-}
+          [[ -n "$EXPECTED_VERSION" && "$EXPECTED_VERSION" == *"-$CERT_TRIPLE" ]] || {
+            echo "the archive does not name $CERT_TRIPLE bytes: $ARCHIVE" >&2
+            exit 1
+          }
+          EXPECTED_VERSION=${EXPECTED_VERSION%-"$CERT_TRIPLE"}
           install -d -m 0700 \
             "$CERT_ROOT" "$CERT_BIN" "$ASTRID_HOME" \
-            "$RELEASE_STAGE/macos" "$MOUNTPOINT_INITIAL" "$MOUNTPOINT_IGNORED_TEST"
+            "$MOUNTPOINT_INITIAL"
           chmod -N "$CERT_ROOT" "$CERT_BIN" "$ASTRID_HOME" \
-            "$RELEASE_STAGE" "$RELEASE_STAGE/macos" \
-            "$MOUNTPOINT_INITIAL" "$MOUNTPOINT_IGNORED_TEST" 2>/dev/null || true
-          cargo build --locked --release \
-            -p astrid --bins \
-            -p astrid-storage-provider-fskit
-          install -m 0755 "$CARGO_TARGET_DIR/release/astrid" "$CERT_BIN/astrid"
-          install -m 0755 "$CARGO_TARGET_DIR/release/astrid-daemon" "$CERT_BIN/astrid-daemon"
-          [[ "$("$CERT_BIN/astrid" --version)" == "astrid $ASTRID_VERSION" ]]
-          PROVIDER_SOURCE_VERSION=$(cargo metadata --locked --no-deps --format-version 1 \
-            | jq -er '.packages[] | select(.name == "astrid-storage-provider-fskit") | .version')
-          [[ "$PROVIDER_SOURCE_VERSION" == "$ASTRID_VERSION" ]]
-          if [[ -z "$ASTRID_FSKIT_CODE_SIGN_IDENTITY" ]]; then
-            ASTRID_FSKIT_CODE_SIGN_IDENTITY="Developer ID Application"
-            export ASTRID_FSKIT_CODE_SIGN_IDENTITY
-          fi
-          security find-identity -v -p codesigning \
-            | grep -F "$ASTRID_FSKIT_CODE_SIGN_IDENTITY" >/dev/null
-          COMPANION_BINARY="$CARGO_TARGET_DIR/release/astrid-storage-provider-fskit"
-          COMPANION_IDENTIFIER=org.astrid.runtime.fs.storage-provider-fskit
-          codesign --force --options runtime --timestamp \
-            --identifier "$COMPANION_IDENTIFIER" \
-            --sign "$ASTRID_FSKIT_CODE_SIGN_IDENTITY" "$COMPANION_BINARY"
-          codesign --verify --strict --verbose=2 "$COMPANION_BINARY"
-          COMPANION_SIGNATURE="$(codesign --display --verbose=4 "$COMPANION_BINARY" 2>&1)"
-          grep -Fx "Identifier=$COMPANION_IDENTIFIER" <<<"$COMPANION_SIGNATURE" >/dev/null
-          grep -Fx "TeamIdentifier=9BDSL5BJAP" <<<"$COMPANION_SIGNATURE" >/dev/null
-          install -m 0755 "$COMPANION_BINARY" \
-            "$RELEASE_STAGE/astrid-storage-provider-fskit"
+            "$RELEASE_STAGE" "$MOUNTPOINT_INITIAL" 2>/dev/null || true
+          tar -xzf "$ARCHIVE" -C "$RELEASE_STAGE"
+          ARCHIVE_DIR="$RELEASE_STAGE/astrid-$EXPECTED_VERSION-$CERT_TRIPLE"
+          [[ -d "$ARCHIVE_DIR" ]]
+          [[ -x "$ARCHIVE_DIR/astrid" && -x "$ARCHIVE_DIR/astrid-daemon" \
+            && -x "$ARCHIVE_DIR/astrid-storage-provider-fskit" ]]
+          [[ -d "$ARCHIVE_DIR/AstridFS.app" ]]
+          [[ -x "$ARCHIVE_DIR/macos/manage-macos-fskit.sh" \
+            && -x "$ARCHIVE_DIR/macos/validate-macos-fskit.sh" ]]
+          install -m 0755 "$ARCHIVE_DIR/astrid" "$ARCHIVE_DIR/astrid-daemon" \
+            "$ARCHIVE_DIR/astrid-storage-provider-fskit" "$CERT_BIN/"
+          {
+            echo "CERT_ARCHIVE_DIR=$ARCHIVE_DIR"
+            echo "ASTRID_VERSION=$EXPECTED_VERSION"
+          } >> "$GITHUB_ENV"
 
-      - name: Build, sign, and notarize the FSKit app
+      - name: Validate the extracted release bundle
         env:
-          ASTRID_FSKIT_CODE_SIGN_IDENTITY: ${{ secrets.ASTRID_FSKIT_CODE_SIGN_IDENTITY }}
-          ASTRID_FSKIT_DEVELOPMENT_TEAM: ${{ secrets.ASTRID_FSKIT_DEVELOPMENT_TEAM }}
-          ASTRID_FSKIT_NOTARY_PROFILE: ${{ secrets.ASTRID_FSKIT_NOTARY_PROFILE }}
-          ASTRID_FSKIT_NOTARIZE: "1"
+          ASTRID_FSKIT_EXPECTED_VERSION: ${{ env.ASTRID_VERSION }}
         run: |
           set -euo pipefail
-          if [[ -z "$ASTRID_FSKIT_CODE_SIGN_IDENTITY" ]]; then
-            ASTRID_FSKIT_CODE_SIGN_IDENTITY="Developer ID Application"
-            export ASTRID_FSKIT_CODE_SIGN_IDENTITY
-          fi
-          scripts/build-macos-fskit.sh
-          APP_PATH="$ASTRID_FSKIT_OUTPUT_ROOT/DerivedData/Build/Products/Release/AstridFS.app"
-          [[ -d "$APP_PATH" ]]
-          ditto "$APP_PATH" "$RELEASE_STAGE/AstridFS.app"
-          install -m 0755 \
-            scripts/manage-macos-fskit.sh \
-            "$RELEASE_STAGE/macos/manage-macos-fskit.sh"
-          install -m 0755 \
-            scripts/validate-macos-fskit.sh \
-            "$RELEASE_STAGE/macos/validate-macos-fskit.sh"
-          ASTRID_FSKIT_EXPECTED_VERSION="$ASTRID_VERSION" \
-            "$RELEASE_STAGE/macos/validate-macos-fskit.sh" "$RELEASE_STAGE/AstridFS.app"
+          "$CERT_ARCHIVE_DIR/macos/validate-macos-fskit.sh" "$CERT_ARCHIVE_DIR/AstridFS.app"
+          [[ "$("$CERT_BIN/astrid" --version)" == "astrid $ASTRID_VERSION" ]]
 
       - name: Install and activate the signed extension
         run: |
           set -euo pipefail
           ASTRID_FSKIT_APP_DEST="$ASTRID_FSKIT_APP_DEST" \
           ASTRID_FSKIT_BIN_DIR="$ASTRID_FSKIT_BIN_DIR" \
-            "$RELEASE_STAGE/macos/manage-macos-fskit.sh" install
+            "$CERT_ARCHIVE_DIR/macos/manage-macos-fskit.sh" install
           ASTRID_FSKIT_EXPECTED_VERSION="$ASTRID_VERSION" \
-            "$RELEASE_STAGE/macos/manage-macos-fskit.sh" validate
+            "$CERT_ARCHIVE_DIR/macos/manage-macos-fskit.sh" validate
           open -gj "$ASTRID_FSKIT_APP_DEST"
           for _ in {1..30}; do
             /usr/bin/pluginkit -m -A -D -i org.astrid.runtime.fs.AppEx \
@@ -204,7 +244,7 @@ jobs:
           # A discovered but ignored extension must fail closed with exact
           # operator remediation; a containing app process is not election.
           /usr/bin/pluginkit -e ignore -i org.astrid.runtime.fs.AppEx
-          if "$RELEASE_STAGE/macos/manage-macos-fskit.sh" status \
+          if "$CERT_ARCHIVE_DIR/macos/manage-macos-fskit.sh" status \
             >"$CERT_ROOT/ignored-status.out" 2>"$CERT_ROOT/ignored-status.err"; then
             echo "ignored FSKit extension unexpectedly passed lifecycle status" >&2
             exit 1
@@ -213,9 +253,9 @@ jobs:
             "$CERT_ROOT/ignored-status.err"
 
           /usr/bin/pluginkit -e use -i org.astrid.runtime.fs.AppEx
-          "$RELEASE_STAGE/macos/manage-macos-fskit.sh" enable
-          "$RELEASE_STAGE/macos/manage-macos-fskit.sh" status
-          "$RELEASE_STAGE/macos/manage-macos-fskit.sh" check-process
+          "$CERT_ARCHIVE_DIR/macos/manage-macos-fskit.sh" enable
+          "$CERT_ARCHIVE_DIR/macos/manage-macos-fskit.sh" status
+          "$CERT_ARCHIVE_DIR/macos/manage-macos-fskit.sh" check-process
 
           for _ in {1..30}; do
             pgrep -x AstridFS >/dev/null && break
@@ -235,7 +275,7 @@ jobs:
           grep -Fq 'type="UIElement"' <<<"$APP_INFO"
           ! grep -Fq 'type="Foreground"' <<<"$APP_INFO"
 
-      - name: Exercise a real mount and the ignored native round-trip
+      - name: Exercise a real mount and the released native round-trip
         run: |
           set -euo pipefail
           "$CERT_BIN/astrid" --principal default start
@@ -293,16 +333,6 @@ jobs:
           /sbin/umount "$MOUNTPOINT_INITIAL"
           [[ "$(stat -f %T "$MOUNTPOINT_INITIAL")" != astridfs ]]
 
-          ASTRID_FSKIT_ACTUAL_RESOURCE="$RESOURCE" \
-          ASTRID_FSKIT_ACTUAL_MOUNTPOINT="$MOUNTPOINT_IGNORED_TEST" \
-          ASTRID_FSKIT_ACTUAL_MOUNT_ID="$MOUNT_ID" \
-          ASTRID_FSKIT_ACTUAL_TOKEN="$LEASE_TOKEN" \
-            cargo test --locked --release \
-              -p astrid-storage-provider-fskit \
-              tests::actual_fskit_mount_and_unmount_round_trip -- \
-              --ignored --exact --nocapture --test-threads=1
-          [[ "$(stat -f %T "$MOUNTPOINT_IGNORED_TEST")" != astridfs ]]
-
           "$CERT_BIN/astrid" --principal default storage unmount "$MOUNTPOINT_INITIAL"
           [[ ! -e "$RESOURCE" ]]
           if "$CERT_BIN/astrid" --principal default storage status "$MOUNTPOINT_INITIAL" \
@@ -317,21 +347,19 @@ jobs:
         run: |
           set +e
           cleanup_status=0
-          for mountpoint in "$MOUNTPOINT_IGNORED_TEST" "$MOUNTPOINT_INITIAL"; do
-            if [[ -d "$mountpoint" && "$(stat -f %T "$mountpoint" 2>/dev/null)" == astridfs ]]; then
-              /sbin/umount "$mountpoint" || cleanup_status=1
-            fi
-          done
+          if [[ -d "$MOUNTPOINT_INITIAL" && "$(stat -f %T "$MOUNTPOINT_INITIAL" 2>/dev/null)" == astridfs ]]; then
+            /sbin/umount "$MOUNTPOINT_INITIAL" || cleanup_status=1
+          fi
           if [[ -x "$CERT_BIN/astrid" ]]; then
             "$CERT_BIN/astrid" --principal default storage unmount "$MOUNTPOINT_INITIAL" \
               >/dev/null 2>&1 || true
             "$CERT_BIN/astrid" --principal default stop >/dev/null 2>&1 || true
           fi
           pkill -x AstridFS >/dev/null 2>&1 || true
-          if [[ -d "$ASTRID_FSKIT_APP_DEST" && -x "$RELEASE_STAGE/macos/manage-macos-fskit.sh" ]]; then
+          if [[ -d "$ASTRID_FSKIT_APP_DEST" && -x "$CERT_ARCHIVE_DIR/macos/manage-macos-fskit.sh" ]]; then
             ASTRID_FSKIT_APP_DEST="$ASTRID_FSKIT_APP_DEST" \
             ASTRID_FSKIT_BIN_DIR="$ASTRID_FSKIT_BIN_DIR" \
-              "$RELEASE_STAGE/macos/manage-macos-fskit.sh" uninstall \
+              "$CERT_ARCHIVE_DIR/macos/manage-macos-fskit.sh" uninstall \
               || cleanup_status=1
           fi
           case "$CERT_ROOT" in

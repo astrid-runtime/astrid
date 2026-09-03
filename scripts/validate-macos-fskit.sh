@@ -49,3 +49,22 @@ ENTITLEMENTS="$(codesign --display --entitlements - "$EXTENSION_PATH" 2>/dev/nul
 grep -Fq "com.apple.developer.fskit.fsmodule" <<<"$ENTITLEMENTS"
 xcrun stapler validate "$APP_PATH"
 spctl -a -vvv -t exec "$APP_PATH"
+
+COMPANION_PATH="$(dirname "$APP_PATH")/astrid-storage-provider-fskit"
+COMPANION_IDENTIFIER=org.astrid.runtime.fs.storage-provider-fskit
+if [[ -e "$COMPANION_PATH" ]]; then
+  [[ -f "$COMPANION_PATH" && -x "$COMPANION_PATH" ]]
+  codesign --verify --strict --verbose=2 "$COMPANION_PATH"
+  signature="$(codesign --display --verbose=4 "$COMPANION_PATH" 2>&1)"
+  grep -Fx "Identifier=$COMPANION_IDENTIFIER" <<<"$signature" >/dev/null
+  grep -Fx "TeamIdentifier=$CODE_SIGN_TEAM" <<<"$signature" >/dev/null
+  PROVIDER_OUTPUT="$(printf '%s\n' \
+    "{\"protocol_version\":1,\"request_id\":\"$(uuidgen)\",\"acting_principal_hint\":\"default\",\"operation\":{\"operation\":\"status\",\"selector\":{\"kind\":\"native-path\",\"value\":\"/\"}}}" \
+    | "$COMPANION_PATH" --astrid-provider-stdio-v1)"
+  PROVIDER_VERSION="$(sed -nE 's/.*"name":"astrid-storage-provider-fskit","version":"([^"]+)".*/\1/p' \
+    <<<"$PROVIDER_OUTPUT" | head -n 1)"
+  [[ -n "$PROVIDER_VERSION" && "$PROVIDER_VERSION" == "$APP_RELEASE_VERSION" ]] || {
+    echo "FSKit companion version '$PROVIDER_VERSION' does not match AstridFS $APP_RELEASE_VERSION" >&2
+    exit 1
+  }
+fi

@@ -207,6 +207,34 @@ jobs:
           scripts/build-macos-fskit.sh
           echo "ASTRID_FSKIT_APP=$PWD/target/macos-fskit/DerivedData/Build/Products/Release/AstridFS.app" >> "$GITHUB_ENV"
 
+      - name: Sign the macOS FSKit companion
+        if: contains(matrix.target, 'apple-darwin')
+        env:
+          ASTRID_MACOS_DEVELOPMENT_TEAM_ID: ${{ secrets.ASTRID_MACOS_DEVELOPMENT_TEAM_ID }}
+          MACOS_DEVELOPER_ID_IDENTITY: ${{ vars.ASTRID_MACOS_DEVELOPER_ID_IDENTITY }}
+        run: |
+          set -euo pipefail
+          COMPANION_TEAM=9BDSL5BJAP
+          COMPANION_IDENTIFIER=org.astrid.runtime.fs.storage-provider-fskit
+          COMPANION="$PWD/target/${{ matrix.target }}/release/astrid-storage-provider-fskit"
+          [[ -f "$COMPANION" && -x "$COMPANION" ]]
+          [[ -n "$ASTRID_MACOS_DEVELOPMENT_TEAM_ID" ]] || {
+            echo "ASTRID_MACOS_DEVELOPMENT_TEAM_ID is not configured for the FSKit companion" >&2
+            exit 1
+          }
+          [[ "$ASTRID_MACOS_DEVELOPMENT_TEAM_ID" == "$COMPANION_TEAM" ]] || {
+            echo "ASTRID_MACOS_DEVELOPMENT_TEAM_ID does not match the required team $COMPANION_TEAM" >&2
+            exit 1
+          }
+          IDENTITY="${MACOS_DEVELOPER_ID_IDENTITY:-Developer ID Application}"
+          codesign --force --options runtime --timestamp \
+            --identifier "$COMPANION_IDENTIFIER" \
+            --sign "$IDENTITY" "$COMPANION"
+          COMPANION_SIGNATURE="$(codesign --display --verbose=4 "$COMPANION" 2>&1)"
+          grep -Fx "Identifier=$COMPANION_IDENTIFIER" <<<"$COMPANION_SIGNATURE" >/dev/null
+          grep -Fx "TeamIdentifier=$COMPANION_TEAM" <<<"$COMPANION_SIGNATURE" >/dev/null
+          codesign --verify --strict --verbose=2 "$COMPANION"
+
       - name: Select native binary root
         if: matrix.libc == 'native'
         run: echo "BINARY_ROOT=target/${{ matrix.target }}/release" >> "$GITHUB_ENV"
@@ -374,6 +402,7 @@ jobs:
             rm -rf "$EXTRACTION"
             mkdir -p "$EXTRACTION"
             tar -xzf "${DIR}.tar.gz" -C "$EXTRACTION"
+            export ASTRID_FSKIT_EXPECTED_VERSION="$VERSION"
             scripts/validate-macos-fskit.sh "$EXTRACTION/$DIR/AstridFS.app"
           else
             if [[ "$TARGET" == *-unknown-linux-* ]]; then
@@ -391,10 +420,18 @@ jobs:
           name: binary-${{ matrix.target }}
           path: ${{ env.ASSET }}
 
+  fskit-certification:
+    name: Native storage certification gate
+    needs: [classify, build]
+    uses: ./.github/workflows/native-storage-certification.yml
+    with:
+      source_commit: ${{ needs.classify.outputs.source-commit }}
+      runner_contract_acknowledged: true
+
   # ── Create the GitHub release with all binaries ───────────────────
   github-release:
     name: GitHub Release
-    needs: [classify, build]
+    needs: [classify, build, fskit-certification]
     runs-on: ubuntu-latest
     environment: release
     permissions:
