@@ -13,6 +13,11 @@ on:
         required: true
         default: false
         type: boolean
+      consume_same_run_artifacts:
+        description: Leave false. Same-run artifacts exist only when Release calls this workflow.
+        required: false
+        default: false
+        type: boolean
   workflow_call:
     inputs:
       source_commit:
@@ -21,6 +26,10 @@ on:
         type: string
       runner_contract_acknowledged:
         description: Dedicated signed-runner contract acknowledged; this is not runtime or Aqua-session proof
+        required: true
+        type: boolean
+      consume_same_run_artifacts:
+        description: Download binary-<triple> from this calling Release run; do not inspect github.event_name
         required: true
         type: boolean
 
@@ -128,6 +137,7 @@ jobs:
       - name: Resolve the exact release build artifact
         env:
           GH_TOKEN: ${{ github.token }}
+          CONSUME_SAME_RUN: ${{ inputs.consume_same_run_artifacts }}
         run: |
           set -euo pipefail
           case "$(uname -m)" in
@@ -139,10 +149,15 @@ jobs:
               ;;
           esac
           echo "CERT_TRIPLE=$CERT_TRIPLE" >> "$GITHUB_ENV"
-          if [[ "$GITHUB_EVENT_NAME" == workflow_call ]]; then
+          # github.event_name is the caller event in a reusable workflow, not workflow_call.
+          if [[ "$CONSUME_SAME_RUN" == true ]]; then
             echo "CERT_ARTIFACT_SOURCE=same-run" >> "$GITHUB_ENV"
             exit 0
           fi
+          [[ "$GITHUB_REF" == refs/heads/main ]] || {
+            echo "standalone native FSKit certification may be dispatched only from protected main" >&2
+            exit 1
+          }
           RUN_ID=$(gh api --paginate \
             "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$SOURCE_COMMIT" \
             --jq '[.workflow_runs[] |

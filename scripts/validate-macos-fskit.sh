@@ -59,7 +59,7 @@ if [[ -e "$COMPANION_PATH" ]]; then
   grep -Fx "Identifier=$COMPANION_IDENTIFIER" <<<"$signature" >/dev/null
   grep -Fx "TeamIdentifier=$CODE_SIGN_TEAM" <<<"$signature" >/dev/null
   PROVIDER_OUTPUT="$(printf '%s\n' \
-    "{\"protocol_version\":1,\"request_id\":\"$(uuidgen)\",\"acting_principal_hint\":\"default\",\"operation\":{\"operation\":\"status\",\"selector\":{\"kind\":\"native-path\",\"value\":\"/\"}}}" \
+    "{\"protocol_version\":1,\"request_id\":\"$(/usr/bin/uuidgen)\",\"acting_principal_hint\":\"default\",\"operation\":{\"operation\":\"status\",\"selector\":{\"kind\":\"native-path\",\"value\":\"/\"}}}" \
     | "$COMPANION_PATH" --astrid-provider-stdio-v1)"
   PROVIDER_VERSION="$(sed -nE 's/.*"name":"astrid-storage-provider-fskit","version":"([^"]+)".*/\1/p' \
     <<<"$PROVIDER_OUTPUT" | head -n 1)"

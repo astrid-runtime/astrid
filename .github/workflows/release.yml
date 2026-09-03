@@ -421,12 +421,16 @@ jobs:
           path: ${{ env.ASSET }}
 
   fskit-certification:
-    name: Native storage certification gate
+    name: Native FSKit mount certification
     needs: [classify, build]
     uses: ./.github/workflows/native-storage-certification.yml
+    permissions:
+      contents: read
+      actions: read
     with:
       source_commit: ${{ needs.classify.outputs.source-commit }}
       runner_contract_acknowledged: true
+      consume_same_run_artifacts: true
 
   # ── Create the GitHub release with all binaries ───────────────────
   github-release:
@@ -848,7 +852,8 @@ jobs:
             --arg name "$CERTIFICATION_CHECK" \
             --arg source "$SOURCE_COMMIT" \
             '[.[] | .check_runs[] |
-              select(.name == $name and .head_sha == $source and
+              select((.name == $name or (.name | endswith(" / " + $name))) and
+                     .head_sha == $source and
                      .app.slug == "github-actions")] |
              sort_by(.started_at) | last |
              .status == "completed" and .conclusion == "success"' \
