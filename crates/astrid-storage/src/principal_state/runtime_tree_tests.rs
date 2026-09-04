@@ -490,6 +490,15 @@ async fn reopen_admits_surviving_projection_appended_after_last_pack() {
     std::fs::write(&config_path, b"allow=generation-2\n").unwrap();
     drop(running);
 
+    #[cfg(unix)]
+    let _socket = {
+        use std::os::unix::net::UnixListener;
+
+        let socket_path = home.root().join(SOCKET_PATH);
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        UnixListener::bind(socket_path).unwrap()
+    };
+
     let reopened = open_runtime_principal_store(&home, unlimited_quota())
         .await
         .unwrap();
@@ -553,6 +562,37 @@ async fn unadmitted_special_entry_fails_closed_before_restore() {
     let _socket = UnixListener::bind(home.root().join("ordinary.sock")).unwrap();
     let Err(error) = open_runtime_principal_store(&home, unlimited_quota()).await else {
         panic!("unadmitted special entry must fail before projection restore");
+    };
+    assert!(
+        error.to_string().contains("unadmitted special entry"),
+        "{error}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn special_inside_run_capsules_fails_closed_before_restore() {
+    use std::os::unix::net::UnixListener;
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    drop(store);
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    packer
+        .pack_and_retire_runtime_projection(&home)
+        .expect("pack volume-only stop state");
+    drop(packer);
+
+    let socket_path = home.root().join("run/capsules/example.sock");
+    std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+    let _socket = UnixListener::bind(&socket_path).unwrap();
+    let Err(error) = open_runtime_principal_store(&home, unlimited_quota()).await else {
+        panic!("special inside admitted durable namespace must fail before projection restore");
     };
     assert!(
         error.to_string().contains("unadmitted special entry"),

@@ -563,7 +563,7 @@ pub(super) fn reconcile_running_projection(
         return Ok(());
     }
 
-    if !validate_surviving_projection(home.root())? {
+    if !validate_surviving_projection(home.root(), home.root())? {
         return Ok(());
     }
     admit(store, home.root())?;
@@ -579,7 +579,7 @@ pub(super) fn reconcile_running_projection(
 /// Returns whether the tree contains a regular projection candidate. Excluded
 /// host endpoints and media paths remain outside authority and cannot make an
 /// otherwise volume-only home look like a surviving projection.
-fn validate_surviving_projection(directory: &Path) -> StorageResult<bool> {
+fn validate_surviving_projection(root: &Path, directory: &Path) -> StorageResult<bool> {
     let mut entries = std::fs::read_dir(directory)
         .map_err(|error| tree_error(directory, format!("read running projection: {error}")))?
         .collect::<Result<Vec<_>, _>>()
@@ -599,7 +599,7 @@ fn validate_surviving_projection(directory: &Path) -> StorageResult<bool> {
         }
 
         let relative = path
-            .strip_prefix(directory)
+            .strip_prefix(root)
             .map_err(|_| tree_error(&path, "projection entry escaped runtime root".to_owned()))?;
         let relative = relative
             .to_str()
@@ -608,7 +608,7 @@ fn validate_surviving_projection(directory: &Path) -> StorageResult<bool> {
             continue;
         }
         if metadata.is_dir() {
-            has_projection |= validate_surviving_projection(&path)?;
+            has_projection |= validate_surviving_projection(root, &path)?;
         } else if metadata.is_file() {
             has_projection = true;
         } else {

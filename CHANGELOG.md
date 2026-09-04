@@ -11,6 +11,8 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Runtime restart now ignores stale host endpoints while rejecting special
+  entries in durable namespaces.**
 - **Graceful daemon restarts no longer rewind newer running files to the last
   packed volume generation.** Shutdown publishes the live projection before
   durable stores close, and startup admits a valid surviving projection before
