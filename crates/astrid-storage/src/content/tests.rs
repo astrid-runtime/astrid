@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -20,8 +20,8 @@ use parking_lot::RwLock;
 
 use super::{
     BulkIngestPolicy, ContentChangeCache, ContentIngest, ContentName, ContentNameError,
-    ContentObservation, PrincipalContentError, PrincipalContentStore, SourceEpoch,
-    SourceFingerprint, SourceObservation, SourceScopeId, StableSourceId,
+    ContentObservation, PrepareDerivedBatchContent, PrincipalContentError, PrincipalContentStore,
+    SourceEpoch, SourceFingerprint, SourceObservation, SourceScopeId, StableSourceId,
 };
 use crate::StorageError;
 use crate::kv::{KvStore, TreeKvStore};
@@ -1685,5 +1685,56 @@ fn principal_content_error_preserves_nested_sources() {
             .unwrap()
             .downcast_ref::<StorageError>()
             .is_some()
+    );
+}
+
+struct FaultedDerivedContent;
+
+impl PrepareDerivedBatchContent for FaultedDerivedContent {
+    fn prepare(
+        &mut self,
+        entries: &BTreeMap<ContentName, crate::content::ContentDescriptor>,
+    ) -> Result<(ContentName, Vec<u8>), PrincipalContentError> {
+        let _ = entries.iter().next().expect("test supplies one entry");
+        Err(PrincipalContentError::InvalidGraph {
+            object: ObjectId::new([7; 32]),
+            detail: "injected before owner-root commit",
+        })
+    }
+}
+
+#[test]
+fn faulted_derived_content_commits_neither_input_nor_derivation() {
+    let store = PrincipalContentStore::from_engine(Arc::new(Engine::new(TestIdentity)));
+    let name = ContentName::new("faulted-input").unwrap();
+    store.put(&"alice".to_owned(), &name, b"original").unwrap();
+
+    let mut derived = FaultedDerivedContent;
+    let error = store
+        .replace_streaming_batch_removing_exact(
+            &"alice".to_owned(),
+            [ContentIngest::new(
+                name.clone(),
+                Cursor::new(b"updated".as_slice()),
+            )],
+            &[],
+            Some(&mut derived),
+        )
+        .expect_err("injected derivation fault must stop the root transaction");
+    assert!(
+        error
+            .to_string()
+            .contains("injected before owner-root commit"),
+        "{error}"
+    );
+    assert_eq!(
+        store.read(&"alice".to_owned(), &name).unwrap(),
+        Some(b"original".to_vec())
+    );
+    let receipt = ContentName::new("derived-receipt").unwrap();
+    assert_eq!(
+        store.read(&"alice".to_owned(), &receipt).unwrap(),
+        None,
+        "faulted derivation must not enter the catalog"
     );
 }

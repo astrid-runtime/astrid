@@ -5,7 +5,7 @@
 use std::fs::File;
 use std::io::Cursor;
 
-use crate::content::{ChunkingProfile, ContentIngest, ContentName};
+use crate::content::{ChunkingProfile, ContentIngest, ContentName, PrepareDerivedBatchContent};
 use crate::error::{StorageError, StorageResult};
 
 use super::{RuntimePrincipalStore, StateOwner};
@@ -79,11 +79,12 @@ impl RuntimePrincipalStore {
     /// This is the internal crash-recovery publication seam. Removals must not
     /// overlap ingests, so the caller states the obsolete projection names
     /// explicitly instead of deriving a prefix delete.
-    pub(crate) fn replace_contiguous_files_removing_exact(
+    pub(crate) fn replace_contiguous_files_removing_exact<'a>(
         &self,
         owner: StateOwner,
         files: impl IntoIterator<Item = PackedProjectionIngest>,
-        removals: &[ContentName],
+        removals: &'a [ContentName],
+        derived: Option<&'a mut dyn PrepareDerivedBatchContent>,
     ) -> StorageResult<()> {
         let mut ingests = Vec::new();
         for file in files {
@@ -115,7 +116,7 @@ impl RuntimePrincipalStore {
             };
         }
         self.content
-            .replace_streaming_batch_removing_exact(&owner, ingests, removals)
+            .replace_streaming_batch_removing_exact(&owner, ingests, removals, derived)
             .map(|_| ())
             .map_err(|error| StorageError::Internal(format!("replace packed home batch: {error}")))
     }

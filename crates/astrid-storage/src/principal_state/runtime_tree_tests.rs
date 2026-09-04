@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
 use super::*;
@@ -16,6 +17,47 @@ fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
             StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
         })
     })
+}
+
+fn write_active_identity_receipt(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+    name: &ContentName,
+    file: Option<&str>,
+) {
+    let descriptor = store
+        .content()
+        .describe(&StateOwner::System, name)
+        .unwrap()
+        .expect("receipt entry is durable");
+    let entry = if let Some(file) = file {
+        json!({
+            "name": name.as_str(),
+            "file": file,
+            "logical_bytes": descriptor.logical_bytes(),
+        })
+    } else {
+        json!({
+            "name": name.as_str(),
+            "logical_bytes": descriptor.logical_bytes(),
+        })
+    };
+    let receipt = json!({
+        "schema": 1,
+        "phase": "active",
+        "root": home.root().canonicalize().unwrap().into_os_string().into_string().unwrap(),
+        "entries": [entry],
+    });
+    let receipt_name = ContentName::new("run/.active-projection-v1.json").unwrap();
+    store
+        .content()
+        .put(
+            &StateOwner::System,
+            &receipt_name,
+            receipt.to_string().as_bytes(),
+        )
+        .unwrap();
+    store.content().flush().unwrap();
 }
 
 #[test]
@@ -505,8 +547,15 @@ async fn active_projection_publication_rotates_receipt_inventory() {
     let running = open_runtime_principal_store(&home, unlimited_quota())
         .await
         .unwrap();
+    let old_name = ContentName::new("etc/old.conf").unwrap();
+    let old_id = running
+        .content()
+        .describe(&StateOwner::System, &old_name)
+        .unwrap()
+        .expect("old generation is published")
+        .file();
     let new_path = home.root().join("etc/new.conf");
-    std::fs::write(&new_path, b"new-generation\n").unwrap();
+    std::fs::write(&new_path, b"new\n").unwrap();
     std::fs::remove_file(&old_path).unwrap();
     drop(running);
 
@@ -520,12 +569,23 @@ async fn active_projection_publication_rotates_receipt_inventory() {
     assert!(receipt.contains_inventory_name("etc/new.conf"));
     assert!(!receipt.contains_inventory_name("etc/old.conf"));
     let new_name = ContentName::new("etc/new.conf").unwrap();
+    let new_id = reopened
+        .content()
+        .describe(&StateOwner::System, &new_name)
+        .unwrap()
+        .expect("new generation is published")
+        .file();
+    assert_ne!(old_id, new_id, "same-size mutation reused file identity");
+    assert_eq!(
+        receipt.inventory_identity("etc/new.conf").unwrap(),
+        Some(new_id)
+    );
     assert_eq!(
         reopened
             .content()
             .read(&StateOwner::System, &new_name)
             .unwrap(),
-        Some(b"new-generation\n".to_vec())
+        Some(b"new\n".to_vec())
     );
 }
 
@@ -846,6 +906,62 @@ async fn unadmitted_special_entry_fails_closed_before_restore() {
     };
     assert!(
         error.to_string().contains("unadmitted special entry"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn active_receipt_missing_object_identity_fails_closed() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let config_path = home.root().join("etc/identity.conf");
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    std::fs::write(&config_path, b"identity").unwrap();
+    let config_name = ContentName::new("etc/identity.conf").unwrap();
+    running
+        .content()
+        .put(&StateOwner::System, &config_name, b"identity")
+        .unwrap();
+    write_active_identity_receipt(&home, &running, &config_name, None);
+    drop(running);
+
+    let Err(error) = open_runtime_principal_store(&home, unlimited_quota()).await else {
+        panic!("ACTIVE receipt without an object identity must fail closed");
+    };
+    assert!(
+        error.to_string().contains("missing field `file`"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn active_receipt_wrong_object_identity_fails_closed() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let config_path = home.root().join("etc/identity.conf");
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    std::fs::write(&config_path, b"identity").unwrap();
+    let config_name = ContentName::new("etc/identity.conf").unwrap();
+    running
+        .content()
+        .put(&StateOwner::System, &config_name, b"identity")
+        .unwrap();
+    write_active_identity_receipt(&home, &running, &config_name, Some(&"00".repeat(32)));
+    drop(running);
+
+    let Err(error) = open_runtime_principal_store(&home, unlimited_quota()).await else {
+        panic!("ACTIVE receipt with a wrong object identity must fail closed");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("active receipt does not match durable projection"),
         "{error}"
     );
 }

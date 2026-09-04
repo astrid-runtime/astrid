@@ -6,7 +6,8 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use crate::content::ContentName;
+use crate::content::{ContentName, PrepareDerivedBatchContent};
+use crate::engine::PrincipalProjectionError;
 use crate::error::{StorageError, StorageResult};
 use astrid_core::dirs::AstridHome;
 
@@ -540,7 +541,7 @@ fn active_projection_entries(
         .filter(|entry| !is_retired_legacy_projection(home, entry.name().as_str()))
         .map(|entry| ActiveProjectionEntry {
             name: entry.name().clone(),
-            file: Some(entry.file()),
+            file: entry.file(),
             logical_bytes: entry.logical_bytes(),
         })
         .collect())
@@ -564,7 +565,7 @@ fn rotate_active_receipt(
     entries: &[ActiveProjectionEntry],
 ) -> StorageResult<()> {
     let receipt = receipt_ingest(home, ReceiptPhase::Active, entries)?;
-    store.replace_contiguous_files_removing_exact(StateOwner::System, [receipt], &[])?;
+    store.replace_contiguous_files_removing_exact(StateOwner::System, [receipt], &[], None)?;
     store
         .content()
         .flush()
@@ -574,6 +575,47 @@ fn rotate_active_receipt(
 fn establish_active_receipt(home: &AstridHome, store: &RuntimePrincipalStore) -> StorageResult<()> {
     let entries = active_projection_entries(home, store)?;
     rotate_active_receipt(home, store, &entries)
+}
+
+struct ActiveReceiptDeriver {
+    home: AstridHome,
+    entries: Vec<(ContentName, u64)>,
+}
+
+impl PrepareDerivedBatchContent for ActiveReceiptDeriver {
+    fn prepare(
+        &mut self,
+        prepared: &std::collections::BTreeMap<ContentName, crate::content::ContentDescriptor>,
+    ) -> Result<(ContentName, Vec<u8>), crate::content::PrincipalContentError> {
+        let entries = self
+            .entries
+            .iter()
+            .map(|(name, logical_bytes)| {
+                let descriptor = prepared.get(name).ok_or_else(|| {
+                    PrincipalProjectionError::Engine(format!(
+                        "prepared runtime projection omitted {}",
+                        name.as_str()
+                    ))
+                })?;
+                if descriptor.logical_bytes() != *logical_bytes {
+                    return Err(PrincipalProjectionError::Engine(format!(
+                        "prepared runtime projection changed {}",
+                        name.as_str()
+                    )));
+                }
+                Ok(ActiveProjectionEntry {
+                    name: name.clone(),
+                    file: descriptor.file(),
+                    logical_bytes: *logical_bytes,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let bytes = active::encode(&self.home, ReceiptPhase::Active, &entries)
+            .map_err(|error| PrincipalProjectionError::Engine(error.to_string()))?;
+        let name = active::active_projection_name()
+            .map_err(|error| PrincipalProjectionError::Engine(error.to_string()))?;
+        Ok((name, bytes))
+    }
 }
 
 fn publish_active_projection(
@@ -595,13 +637,12 @@ fn publish_active_projection(
     let removals = active::removals(&receipt, &surviving)?;
     let receipt_entries = scanned
         .iter()
-        .map(|entry| ActiveProjectionEntry {
-            name: entry.name().clone(),
-            file: None,
-            logical_bytes: entry.logical_bytes(),
-        })
+        .map(|entry| (entry.name().clone(), entry.logical_bytes()))
         .collect::<Vec<_>>();
-    let receipt = receipt_ingest(home, ReceiptPhase::Active, &receipt_entries)?;
+    let mut derived = ActiveReceiptDeriver {
+        home: home.clone(),
+        entries: receipt_entries,
+    };
     let ingests = scanned.into_iter().map(|entry| {
         PackedProjectionIngest::File(ContiguousFileIngest::new(
             entry.name,
@@ -609,8 +650,12 @@ fn publish_active_projection(
             entry.logical_bytes,
         ))
     });
-    let ingests = std::iter::once(receipt).chain(ingests);
-    store.replace_contiguous_files_removing_exact(StateOwner::System, ingests, &removals)?;
+    store.replace_contiguous_files_removing_exact(
+        StateOwner::System,
+        ingests,
+        &removals,
+        Some(&mut derived),
+    )?;
     store
         .content()
         .flush()
@@ -631,7 +676,7 @@ fn transition_retiring_projection(
     }
     let entries = active_projection_entries(home, store)?;
     let receipt = receipt_ingest(home, ReceiptPhase::Retiring, &entries)?;
-    store.replace_contiguous_files_removing_exact(StateOwner::System, [receipt], &[])?;
+    store.replace_contiguous_files_removing_exact(StateOwner::System, [receipt], &[], None)?;
     store
         .content()
         .flush()

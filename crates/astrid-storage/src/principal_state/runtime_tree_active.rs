@@ -25,7 +25,7 @@ const MAX_RECEIPT_BYTES: u64 = 4 * 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ActiveProjectionEntry {
     pub(super) name: ContentName,
-    pub(super) file: Option<ObjectId>,
+    pub(super) file: ObjectId,
     pub(super) logical_bytes: u64,
 }
 
@@ -57,13 +57,33 @@ impl ActiveProjectionReceipt {
     pub(super) fn contains_inventory_name(&self, name: &str) -> bool {
         self.entries.iter().any(|entry| entry.name == name)
     }
+
+    #[cfg(test)]
+    pub(super) fn inventory_identity(&self, name: &str) -> StorageResult<Option<ObjectId>> {
+        let Some(entry) = self.entries.iter().find(|entry| entry.name == name) else {
+            return Ok(None);
+        };
+        let bytes = hex::decode(&entry.file).map_err(|error| {
+            tree_error(
+                Path::new(&entry.name),
+                format!("decode receipt object identity: {error}"),
+            )
+        })?;
+        let expected: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            tree_error(
+                Path::new(&entry.name),
+                "receipt object identity is not 32 bytes",
+            )
+        })?;
+        Ok(Some(ObjectId::new(expected)))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ActiveReceiptEntry {
     name: String,
-    file: Option<String>,
+    file: String,
     logical_bytes: u64,
 }
 
@@ -141,7 +161,7 @@ pub(super) fn read_relocatable(
         ));
     }
     for entry in &receipt.entries {
-        validate_receipt_entry(store, receipt.phase, entry)?;
+        validate_receipt_entry(store, entry)?;
     }
     Ok(Some(receipt))
 }
@@ -159,7 +179,7 @@ pub(super) fn encode(
             .iter()
             .map(|entry| ActiveReceiptEntry {
                 name: entry.name.as_str().to_owned(),
-                file: entry.file.map(|file| hex::encode(file.as_bytes())),
+                file: hex::encode(entry.file.as_bytes()),
                 logical_bytes: entry.logical_bytes,
             })
             .collect(),
@@ -211,7 +231,6 @@ pub(super) fn removals(
 
 fn validate_receipt_entry(
     store: &RuntimePrincipalStore,
-    phase: ReceiptPhase,
     entry: &ActiveReceiptEntry,
 ) -> StorageResult<()> {
     let name = ContentName::new(&entry.name).map_err(|error| {
@@ -231,33 +250,19 @@ fn validate_receipt_entry(
             )
         })?;
 
-    // ACTIVE is written from projected logical sizes in the same owner-root
-    // transaction, before immutable identities are available to this caller.
-    // RETIRING is written only after publication and is identity-bound.
-    let identity_matches = match (&phase, &entry.file) {
-        (ReceiptPhase::Active, _) => true,
-        (ReceiptPhase::Retiring, Some(file)) => {
-            let bytes = hex::decode(file).map_err(|error| {
-                tree_error(
-                    Path::new(&entry.name),
-                    format!("decode receipt object identity: {error}"),
-                )
-            })?;
-            let expected: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-                tree_error(
-                    Path::new(&entry.name),
-                    "receipt object identity is not 32 bytes",
-                )
-            })?;
-            actual.file().as_bytes() == &expected
-        },
-        (ReceiptPhase::Retiring, None) => {
-            return Err(tree_error(
-                Path::new(&entry.name),
-                "retiring receipt has no object identity",
-            ));
-        },
-    };
+    let bytes = hex::decode(&entry.file).map_err(|error| {
+        tree_error(
+            Path::new(&entry.name),
+            format!("decode receipt object identity: {error}"),
+        )
+    })?;
+    let expected: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        tree_error(
+            Path::new(&entry.name),
+            "receipt object identity is not 32 bytes",
+        )
+    })?;
+    let identity_matches = actual.file().as_bytes() == &expected;
     if !identity_matches
         || actual.logical_bytes() != entry.logical_bytes
         || is_excluded(&entry.name)

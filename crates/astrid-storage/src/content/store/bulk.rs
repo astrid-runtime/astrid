@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use crate::engine::{ProjectionObserver, ProjectionPhase};
 use parking_lot::Mutex;
 
+use super::projection::EngineIdentity;
 use super::projection::{
     BatchAdmission, DeferredAdmission, StagedObjectBatch, admit_object_batch_observed,
 };
@@ -23,11 +24,17 @@ use super::{
 use crate::content::{
     BulkIngestDiagnostics, BulkIngestPhaseDurations, BulkIngestPolicy, ChunkingProfile,
     ContentBatchEntry, ContentBatchExpectation, ContentBatchWriteOutcome, ContentChangeCache,
-    ContentIngest, ContentName, ContentObservation, PrincipalContentError, SourceObservation,
+    ContentIngest, ContentName, ContentObservation, PrepareDerivedBatchContent,
+    PrincipalContentError, SourceObservation,
 };
+use crate::content_dag::build_content;
 
 type PendingIngest<R> = (ContentName, (R, ChunkingProfile, Option<SourceObservation>));
 type OrderedIngests<R> = BTreeMap<ContentName, (R, ChunkingProfile, Option<SourceObservation>)>;
+type PreparedDerivedBatch = (
+    BTreeMap<ContentName, PreparedContent>,
+    BTreeMap<ObjectId, ObjectRecord>,
+);
 type PartitionedIngests<R> = (
     BTreeMap<ContentName, PreparedContent>,
     VecDeque<PendingIngest<R>>,
@@ -73,16 +80,28 @@ struct PreparedContent {
     observation: ContentObservation,
 }
 
-#[derive(Clone, Copy)]
 struct BatchPublicationContext<'a> {
     expectation: Option<&'a ContentBatchExpectation>,
     removals: &'a [ContentName],
+    derived: Option<&'a mut dyn PrepareDerivedBatchContent>,
 }
 
 fn publish_only() -> BatchPublicationContext<'static> {
     BatchPublicationContext {
         expectation: None,
         removals: &[],
+        derived: None,
+    }
+}
+
+fn removing_exact<'a>(
+    removals: &'a [ContentName],
+    derived: Option<&'a mut dyn PrepareDerivedBatchContent>,
+) -> BatchPublicationContext<'a> {
+    BatchPublicationContext {
+        expectation: None,
+        removals,
+        derived,
     }
 }
 
@@ -247,6 +266,7 @@ where
             BatchPublicationContext {
                 expectation: Some(expectation),
                 removals: &[],
+                derived: None,
             },
         )
         .map(|execution| execution.outcome)
@@ -314,11 +334,12 @@ where
     /// This is the internal runtime-tree publication seam. Removals are exact
     /// canonical names and never derive from a prefix, and no removal may also
     /// appear as an ingest.
-    pub(crate) fn replace_streaming_batch_removing_exact<R, I>(
+    pub(crate) fn replace_streaming_batch_removing_exact<'a, R, I>(
         &self,
         principal: &P,
         ingests: I,
-        removals: &[ContentName],
+        removals: &'a [ContentName],
+        derived: Option<&'a mut dyn PrepareDerivedBatchContent>,
     ) -> Result<ContentBatchWriteOutcome, PrincipalContentError>
     where
         R: Read + Send,
@@ -341,10 +362,7 @@ where
             BulkIngestPolicy::default(),
             None,
             false,
-            BatchPublicationContext {
-                expectation: None,
-                removals,
-            },
+            removing_exact(removals, derived),
         )
         .map(|execution| execution.outcome)
     }
@@ -699,12 +717,15 @@ where
     fn publish_batch(
         &self,
         principal: &P,
-        completed: &BTreeMap<ContentName, PreparedContent>,
+        source_completed: &BTreeMap<ContentName, PreparedContent>,
         staged_objects_inserted: u64,
         observer: Option<&Arc<BulkPhaseObserver>>,
         deferred_records: Option<&BTreeMap<ObjectId, ObjectRecord>>,
         publication: BatchPublicationContext<'_>,
     ) -> Result<ContentBatchWriteOutcome, PrincipalContentError> {
+        let (publication_completed, derived_records) =
+            self.prepare_derived_batch(source_completed, publication.derived)?;
+        let completed = &publication_completed;
         loop {
             let mut header = self.header(principal)?.as_ref().clone();
             self.check_batch_expectation(principal, &header, publication.expectation)?;
@@ -773,6 +794,9 @@ where
                     self.insert(&mut catalog_records, record.clone())?;
                 }
             }
+            for record in derived_records.values() {
+                self.insert(&mut catalog_records, record.clone())?;
+            }
             retain_final_catalog_records(catalog, &mut catalog_records);
             let transaction =
                 self.encode_transaction(principal.clone(), header.clone(), None, catalog_records)?;
@@ -798,6 +822,43 @@ where
                 Err(error) => return Err(error.into()),
             }
         }
+    }
+}
+
+impl<P, E> PrincipalContentStore<P, E>
+where
+    P: Clone + Ord + Send + Sync,
+    E: PrincipalProjectionEngine<P>,
+{
+    fn prepare_derived_batch(
+        &self,
+        source_completed: &BTreeMap<ContentName, PreparedContent>,
+        derived: Option<&mut dyn PrepareDerivedBatchContent>,
+    ) -> Result<PreparedDerivedBatch, PrincipalContentError> {
+        let Some(derived) = derived else {
+            return Ok((source_completed.clone(), BTreeMap::new()));
+        };
+        let descriptors = source_completed
+            .iter()
+            .map(|(name, prepared)| (name.clone(), prepared.verified.descriptor()))
+            .collect::<BTreeMap<_, _>>();
+        let (name, bytes) = derived.prepare(&descriptors)?;
+        let built = build_content(
+            &EngineIdentity::<P, E>::new(self.engine.as_ref()),
+            ChunkingProfile::ASTRID_V1,
+            &bytes,
+        )?;
+        let verified = built.verified_content();
+        let records = built.into_records().into_iter().collect();
+        let mut completed = source_completed.clone();
+        completed.insert(
+            name,
+            PreparedContent {
+                verified,
+                observation: ContentObservation::BytesObserved,
+            },
+        );
+        Ok((completed, records))
     }
 }
 
