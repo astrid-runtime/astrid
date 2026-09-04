@@ -1,10 +1,22 @@
 //! Rust capsule builder — compiles a Rust crate to `wasm32-wasip2` and packages it.
-
 use crate::archiver::{discover_opaque_assets, pack_capsule_archive};
 use anyhow::{Context, Result, bail};
+use cargo_metadata::{Message, PackageId};
 use std::fs;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use tracing::{info, warn};
+
+mod config;
+#[cfg(test)]
+use config::{
+    cargo_config_has_matching_target_rustflags_with_home,
+    cargo_config_rustflags_for_target_with_home,
+    cargo_config_target_and_rustflags_for_target_with_home,
+    cargo_config_target_and_rustflags_with_home, resolve_cargo_home,
+};
+use config::{cargo_config_rustflags_for_target, cargo_config_target_and_rustflags};
 
 /// Stub WIT package written when a capsule has no local `wit/` directory.
 /// Gives `push_dir` a main package to anchor on so deps can still be loaded.
@@ -24,16 +36,16 @@ const GETRANDOM_TARGET: &str = "wasm32-unknown-unknown";
 /// keep it in config for plain `cargo build` / `cargo test`, which don't run
 /// through this builder.
 const GETRANDOM_CUSTOM_CFG: &str = "--cfg=getrandom_backend=\"custom\"";
+const GETRANDOM_CARGO_CONFIG_TARGET: &str = "target.'cfg(all(target_arch = \"wasm32\", target_os = \"unknown\", target_env = \"\", target_pointer_width = \"32\", target_vendor = \"unknown\", target_family = \"wasm\"))'.rustflags=";
 
 /// Cargo's argument separator for `CARGO_ENCODED_RUSTFLAGS` (ASCII unit
-/// separator), used so individual flags may themselves contain spaces. A
-/// `&str` (not `char`) so it can be passed straight to `join` / `split`
-/// without allocating.
+/// separator). Keeping it as a string allows direct concatenation without an
+/// intermediate character allocation.
 const RUSTFLAGS_SEP: &str = "\u{1f}";
 
 /// Build a Rust capsule from a crate directory.
 ///
-/// 1. `cargo build --target wasm32-wasip2 --release`
+/// 1. `cargo build --release` using Cargo's resolved target/configuration
 /// 2. Extract capsule description via Extism (`astrid_export_schemas`)
 /// 3. Merge description into `Capsule.toml`
 /// 4. Pack into `.capsule` archive
@@ -42,11 +54,18 @@ pub(crate) fn build(dir: &Path, output: Option<&str>) -> Result<()> {
 
     verify_cargo_available()?;
 
-    let (meta, crate_name, package_version, wasm_name) = resolve_package_metadata(dir)?;
+    let (meta, crate_name, package_version, wasm_name, package_id) = resolve_package_metadata(dir)?;
 
-    compile_wasm(dir)?;
+    let compiled = compile_wasm(dir, &package_id, &wasm_name)?;
 
-    let wasm_path = locate_wasm_binary(dir, &meta, &wasm_name)?;
+    let wasm_path = locate_wasm_binary(&meta, &compiled.target, &wasm_name)?;
+    if wasm_path != compiled.path {
+        bail!(
+            "Cargo reported compiled WASM at {}, but the exact release artifact is {}",
+            compiled.path.display(),
+            wasm_path.display()
+        );
+    }
     let wasm_path = ensure_component(&wasm_path)?;
 
     let toml_content =
@@ -91,7 +110,7 @@ fn verify_cargo_available() -> Result<()> {
 /// Resolve package metadata for the crate in `dir`.
 fn resolve_package_metadata(
     dir: &Path,
-) -> Result<(cargo_metadata::Metadata, String, String, String)> {
+) -> Result<(cargo_metadata::Metadata, String, String, String, PackageId)> {
     // Resolve the full dependency graph (not no_deps) so we can locate
     // the astrid-sdk source directory for WIT file bundling.
     let meta = cargo_metadata::MetadataCommand::new()
@@ -116,173 +135,410 @@ fn resolve_package_metadata(
 
     let crate_name = package.name.to_string();
     let package_version = package.version.to_string();
-    let wasm_name = crate_name.replace('-', "_");
+    let wasm_name = resolve_wasm_output_name(package)?;
+    let package_id = package.id.clone();
 
-    Ok((meta, crate_name, package_version, wasm_name))
+    Ok((meta, crate_name, package_version, wasm_name, package_id))
 }
 
-/// Compile the capsule in release mode using whatever target the
-/// capsule's own `.cargo/config.toml` selects.
+/// Resolve the exact WASM file stem Cargo will use for the capsule.
+///
+/// Capsules are packaged from a single cdylib target. Cargo metadata reports
+/// the target's output name, which matters when a manifest gives the library
+/// an explicit name instead of using the package name. A package without a
+/// cdylib target cannot produce the artifact this builder packages, so it is
+/// rejected rather than guessing a same-named binary.
+fn resolve_wasm_output_name(package: &cargo_metadata::Package) -> Result<String> {
+    resolve_wasm_output_name_from_targets(
+        package
+            .targets
+            .iter()
+            .filter(|target| target.is_cdylib())
+            .map(|target| target.name.clone()),
+    )
+}
+
+fn resolve_wasm_output_name_from_targets<I>(output_names: I) -> Result<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let output_names: Vec<String> = output_names.into_iter().collect();
+    match output_names.as_slice() {
+        [] => bail!("Capsule has no cdylib target; refusing to guess a WASM artifact"),
+        [output_name] => validate_wasm_output_name(output_name),
+        _ => bail!(
+            "Capsule has {} cdylib targets; refusing to choose an ambiguous WASM artifact",
+            output_names.len()
+        ),
+    }
+}
+
+fn validate_wasm_output_name(output_name: &str) -> Result<String> {
+    let path = Path::new(output_name);
+    let is_single_normal_component =
+        output_name != "." && output_name != ".." && path.file_name() == Some(path.as_os_str());
+    if !is_single_normal_component {
+        bail!("Unsafe WASM artifact name: {output_name}");
+    }
+    Ok(output_name.to_owned())
+}
+
+/// Compile the capsule in release mode using whatever target Cargo resolves
+/// from its complete configuration hierarchy.
 ///
 /// The Astrid-canonical target is `wasm32-unknown-unknown` — zero
 /// `wasi:*` imports, every host call audited through the
 /// `astrid:*` SDK surface. Capsules may also target `wasm32-wasip2`
 /// during the migration window (the kernel still satisfies wasi:*
 /// for backwards compatibility), so this build step does NOT pass
-/// `--target`; it lets the capsule decide.
+/// `--target`; it lets Cargo's own config and environment precedence decide.
 ///
 /// When the capsule targets `wasm32-unknown-unknown` it additionally
-/// injects the getrandom custom-backend cfg (see
-/// [`encoded_rustflags_with_getrandom`]) so `astrid build` succeeds even
-/// when a capsule's `.cargo/config.toml` is missing
-/// `--cfg=getrandom_backend="custom"`. This is a safety net for the
+/// injects the getrandom custom-backend cfg through target-wide rustflags so
+/// `astrid build` succeeds even when a capsule's `.cargo/config.toml` is
+/// missing `--cfg=getrandom_backend="custom"`. This is a safety net for the
 /// canonical build tool, not a replacement: capsules still carry the flag
 /// in config so a plain `cargo build` / `cargo test` (which never runs
 /// through here) keeps linking `uuid` v4 / `HashMap`.
-fn compile_wasm(dir: &Path) -> Result<()> {
-    info!("   Compiling capsule (release)...");
+struct CompiledWasm {
+    target: String,
+    path: PathBuf,
+}
 
-    let (config_target, config_flags) = cargo_config_target_and_rustflags(dir);
+fn compile_wasm(dir: &Path, package_id: &PackageId, wasm_name: &str) -> Result<CompiledWasm> {
+    let (config_target, _) = cargo_config_target_and_rustflags(dir)?;
     // `CARGO_BUILD_TARGET` (if the caller set it) overrides the config-file
     // target, mirroring Cargo's own precedence.
-    let env_target = std::env::var("CARGO_BUILD_TARGET").ok();
-    let target = env_target.as_deref().or(config_target.as_deref());
-
-    let mut cmd = std::process::Command::new("cargo");
-    cmd.current_dir(dir).args(["build", "--release"]);
-
-    if let Some(encoded) = encoded_rustflags_with_getrandom(
+    let env_target = std::env::var("CARGO_BUILD_TARGET")
+        .ok()
+        .filter(|target| !target.trim().is_empty());
+    let target = resolve_build_target(config_target, env_target)?;
+    let (config_flags, has_matching_target_rustflags) = if inject_getrandom_for_target(&target) {
+        cargo_config_rustflags_for_target(dir, &target)?
+    } else {
+        (Vec::new(), false)
+    };
+    let rustflags = RustflagsEnvironment::from_process(&target);
+    compile_wasm_with_target(
+        dir,
+        package_id,
+        wasm_name,
         target,
         &config_flags,
-        std::env::var("CARGO_ENCODED_RUSTFLAGS").ok().as_deref(),
-        std::env::var("RUSTFLAGS").ok().as_deref(),
-    ) {
-        // Capsule targets `wasm32-unknown-unknown`, so guarantee the getrandom
-        // custom-backend cfg is present. Because host != wasm this is a
-        // cross-compile, so the flag reaches only the wasm artifacts — host
-        // build scripts / proc-macros are untouched. We set
-        // `CARGO_ENCODED_RUSTFLAGS` (and drop `RUSTFLAGS`, whose value we have
-        // already folded in) so the two sources can't both apply and so flags
-        // containing spaces survive.
-        cmd.env("CARGO_ENCODED_RUSTFLAGS", encoded);
-        cmd.env_remove("RUSTFLAGS");
+        has_matching_target_rustflags,
+        &rustflags,
+    )
+}
+
+fn compile_wasm_with_target(
+    dir: &Path,
+    package_id: &PackageId,
+    wasm_name: &str,
+    target: String,
+    config_flags: &[String],
+    has_matching_target_rustflags: bool,
+    rustflags: &RustflagsEnvironment,
+) -> Result<CompiledWasm> {
+    info!("   Compiling capsule (release)...");
+
+    // Cargo itself remains authoritative for the build. For the one target
+    // that needs Astrid's custom getrandom backend, append the cfg to the
+    // highest-precedence environment source or use a Cargo config override;
+    // both reach dependencies as well as the root cdylib.
+    let inject_getrandom_cfg = inject_getrandom_for_target(&target);
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(dir)
+        .args([
+            "build",
+            "--release",
+            "--message-format=json-render-diagnostics",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    rustflags.configure_command(&mut cmd, &target);
+    if inject_getrandom_cfg {
+        append_getrandom_rustflag(
+            &mut cmd,
+            &target,
+            has_matching_target_rustflags,
+            config_flags,
+            rustflags,
+        );
     }
 
-    let status = cmd.status().context("Failed to spawn cargo build")?;
+    let mut child = cmd.spawn().context("Failed to spawn cargo build")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("Cargo build did not expose machine-readable output")?;
+    let expected_filename = format!("{wasm_name}.wasm");
+    let mut artifacts = Vec::new();
+    for message in Message::parse_stream(BufReader::new(stdout)) {
+        let message = message.context("Failed to parse Cargo build output")?;
+        let Message::CompilerArtifact(artifact) = message else {
+            continue;
+        };
+        if artifact.package_id != *package_id
+            || !artifact.target.is_cdylib()
+            || artifact.profile.test
+        {
+            continue;
+        }
+        artifacts.extend(
+            artifact
+                .filenames
+                .into_iter()
+                .filter(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name == expected_filename)
+                })
+                .map(cargo_metadata::camino::Utf8PathBuf::into_std_path_buf),
+        );
+    }
+
+    let status = child.wait().context("Failed to wait for cargo build")?;
 
     if !status.success() {
         bail!(
             "Cargo build failed. Set `[build] target = \"wasm32-unknown-unknown\"` (Astrid-canonical) or `wasm32-wasip2` in `.cargo/config.toml` and install the matching `rustup target` component."
         );
     }
-    Ok(())
+
+    artifacts.sort();
+    artifacts.dedup();
+    match artifacts.as_slice() {
+        [path] => Ok(CompiledWasm {
+            target,
+            path: path.clone(),
+        }),
+        [] => bail!(
+            "Cargo completed without emitting the exact release cdylib artifact {expected_filename}"
+        ),
+        _ => bail!(
+            "Cargo emitted {} release cdylib artifacts named {expected_filename}; refusing to choose an ambiguous artifact",
+            artifacts.len()
+        ),
+    }
 }
 
-/// Read the build target and any author-declared `rustflags` from a capsule's
-/// local `.cargo/config.toml` (or the legacy `.cargo/config`).
-///
-/// Returns `(target, rustflags)`. `target` is the `[build] target` string if
-/// set. `rustflags` is the effective list Cargo would apply to the wasm
-/// target: `[target."wasm32-unknown-unknown"].rustflags` if present, otherwise
-/// `[build].rustflags`, otherwise empty. Cargo honours only one of those two
-/// sources (target-scoped wins), so we mirror that precedence rather than
-/// concatenating them. A `[build] target` written as an array (multi-target
-/// build) is intentionally ignored — we only auto-inject for a single, plain
-/// `wasm32-unknown-unknown` target.
-fn cargo_config_target_and_rustflags(dir: &Path) -> (Option<String>, Vec<String>) {
-    let Some(doc) = [".cargo/config.toml", ".cargo/config"]
-        .iter()
-        .map(|name| dir.join(name))
-        .find_map(|p| fs::read_to_string(p).ok())
-        .and_then(|s| s.parse::<toml_edit::DocumentMut>().ok())
-    else {
-        return (None, Vec::new());
-    };
-
-    let target = doc
-        .get("build")
-        .and_then(|b| b.get("target"))
-        .and_then(toml_edit::Item::as_str)
-        .map(str::to_owned);
-
-    // Cargo accepts `rustflags` as either an array of strings or a single
-    // space-separated string; handle both so a string-form value isn't
-    // silently dropped (which would let our env injection clobber it).
-    let read_flags = |item: Option<&toml_edit::Item>| -> Option<Vec<String>> {
-        item.and_then(|it| {
-            if let Some(arr) = it.as_array() {
-                Some(
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(str::to_owned))
-                        .collect(),
-                )
-            } else {
-                it.as_str()
-                    .map(|s| s.split_whitespace().map(str::to_owned).collect())
-            }
-        })
-    };
-
-    let target_scoped = doc
-        .get("target")
-        .and_then(|t| t.get(GETRANDOM_TARGET))
-        .and_then(|t| t.get("rustflags"));
-    let build_scoped = doc.get("build").and_then(|b| b.get("rustflags"));
-
-    let rustflags = read_flags(target_scoped)
-        .or_else(|| read_flags(build_scoped))
-        .unwrap_or_default();
-
-    (target, rustflags)
+fn inject_getrandom_for_target(target: &str) -> bool {
+    target == GETRANDOM_TARGET
 }
 
-/// Compute the `CARGO_ENCODED_RUSTFLAGS` value for a capsule build, injecting
-/// the getrandom custom-backend cfg when — and only when — the capsule targets
-/// `wasm32-unknown-unknown`. Returns `None` (leave the environment untouched)
-/// for any other target.
-///
-/// Flags are concatenated in order — inherited environment flags
-/// (`CARGO_ENCODED_RUSTFLAGS` takes precedence over `RUSTFLAGS`), then the
-/// capsule's own config `rustflags`, then the getrandom cfg. We deliberately
-/// *merge* rather than let the env override config (which is Cargo's real
-/// precedence): a build tool silently dropping a flag the author or developer
-/// set would be a nasty surprise. The only flags it can't see are ones set in
-/// a *parent* config (above the capsule dir); capsules keep their `rustflags`
-/// in their own `.cargo/config.toml`, so that's a non-issue in practice.
-///
-/// Only the getrandom cfg is de-duplicated. Inherited and config flags are
-/// kept verbatim: de-duping individual tokens would corrupt multi-token flags
-/// like `-C opt-level=3` followed by `-C debuginfo=2` (the second `-C` would
-/// be dropped, yielding invalid `rustc` input). Duplicate whole flags are
-/// harmless to `rustc`.
-fn encoded_rustflags_with_getrandom(
-    target: Option<&str>,
+/// Append the custom getrandom cfg without replacing any effective Cargo
+/// rustflags. Cargo's precedence is encoded-rustflags env, plain rustflags env,
+/// target-specific rustflags env, matching target config, then build
+/// rustflags. We modify only the first effective environment source. When
+/// config-derived flags are effective (including when `CARGO_BUILD_RUSTFLAGS`
+/// is shadowed by matching target entries), a Cargo config override preserves
+/// Cargo's own hierarchy and reaches every dependency.
+fn append_getrandom_rustflag(
+    cmd: &mut Command,
+    target: &str,
+    has_matching_target_rustflags: bool,
     config_flags: &[String],
-    inherited_encoded: Option<&str>,
-    inherited_plain: Option<&str>,
-) -> Option<String> {
-    if target != Some(GETRANDOM_TARGET) {
+    rustflags: &RustflagsEnvironment,
+) {
+    let Some((key, value)) = getrandom_rustflags_override(
+        target,
+        config_flags,
+        rustflags.encoded.as_deref(),
+        rustflags.plain.as_deref(),
+        rustflags.target_specific.as_deref(),
+        rustflags.build.as_deref(),
+    ) else {
+        return;
+    };
+    if rustflags.encoded.is_none()
+        && rustflags.plain.is_none()
+        && rustflags.target_specific.is_none()
+        && (rustflags.build.is_none() || has_matching_target_rustflags)
+    {
+        if has_matching_target_rustflags {
+            // Let Cargo merge all matching target triples and cfg expressions,
+            // ancestor arrays, and its own config precedence before adding
+            // ours. Matching target entries already shadow build rustflags;
+            // preserving them here avoids changing that precedence.
+            let config = cargo_config_with_getrandom(&[]);
+            cmd.args(["--config", config.as_str()]);
+        } else {
+            // A target-specific override shadows `[build].rustflags`, so
+            // carry the effective build flags into the override before adding
+            // the backend cfg. Otherwise the builder silently drops caller
+            // flags for every dependency and the root cdylib alike.
+            let config = cargo_config_with_getrandom(config_flags);
+            cmd.args(["--config", config.as_str()]);
+        }
+    } else {
+        cmd.env(key, value);
+    }
+}
+
+fn cargo_config_with_getrandom(config_flags: &[String]) -> String {
+    let mut flags = toml_edit::Array::new();
+    for flag in config_flags {
+        flags.push(flag.as_str());
+    }
+    if !config_flags.iter().any(|flag| flag == GETRANDOM_CUSTOM_CFG) {
+        flags.push(GETRANDOM_CUSTOM_CFG);
+    }
+    format!("{GETRANDOM_CARGO_CONFIG_TARGET}{flags}")
+}
+
+#[derive(Default)]
+struct RustflagsEnvironment {
+    encoded: Option<String>,
+    plain: Option<String>,
+    target_specific: Option<String>,
+    build: Option<String>,
+}
+
+impl RustflagsEnvironment {
+    fn from_process(target: &str) -> Self {
+        let target_env_key = cargo_target_rustflags_env_key(target);
+        Self {
+            encoded: std::env::var("CARGO_ENCODED_RUSTFLAGS").ok(),
+            plain: std::env::var("RUSTFLAGS").ok(),
+            target_specific: std::env::var(target_env_key).ok(),
+            build: std::env::var("CARGO_BUILD_RUSTFLAGS").ok(),
+        }
+    }
+
+    fn configure_command(&self, cmd: &mut Command, target: &str) {
+        let target_env_key = cargo_target_rustflags_env_key(target);
+        configure_env(cmd, "CARGO_ENCODED_RUSTFLAGS", self.encoded.as_deref());
+        configure_env(cmd, "RUSTFLAGS", self.plain.as_deref());
+        configure_env(cmd, &target_env_key, self.target_specific.as_deref());
+        configure_env(cmd, "CARGO_BUILD_RUSTFLAGS", self.build.as_deref());
+    }
+}
+
+fn configure_env(cmd: &mut Command, key: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        cmd.env(key, value);
+    } else {
+        cmd.env_remove(key);
+    }
+}
+
+fn cargo_target_rustflags_env_key(target: &str) -> String {
+    let normalized = target
+        .chars()
+        .map(|character| match character {
+            '-' | '.' => '_',
+            character => character.to_ascii_uppercase(),
+        })
+        .collect::<String>();
+    format!("CARGO_TARGET_{normalized}_RUSTFLAGS")
+}
+
+fn getrandom_rustflags_override(
+    target: &str,
+    config_flags: &[String],
+    encoded: Option<&str>,
+    plain: Option<&str>,
+    target_specific: Option<&str>,
+    build_env: Option<&str>,
+) -> Option<(String, String)> {
+    if target != GETRANDOM_TARGET {
         return None;
     }
 
-    let mut flags: Vec<String> = if let Some(enc) = inherited_encoded {
-        enc.split(RUSTFLAGS_SEP)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect()
-    } else if let Some(plain) = inherited_plain {
-        plain.split_whitespace().map(str::to_owned).collect()
-    } else {
-        Vec::new()
-    };
-
-    flags.extend(config_flags.iter().cloned());
-
-    if !flags.iter().any(|f| f == GETRANDOM_CUSTOM_CFG) {
-        flags.push(GETRANDOM_CUSTOM_CFG.to_owned());
+    if let Some(encoded) = encoded {
+        let value = if encoded
+            .split(RUSTFLAGS_SEP)
+            .any(|flag| flag == GETRANDOM_CUSTOM_CFG)
+        {
+            encoded.to_owned()
+        } else {
+            let mut value = encoded.to_owned();
+            if !value.is_empty() {
+                value.push_str(RUSTFLAGS_SEP);
+            }
+            value.push_str(GETRANDOM_CUSTOM_CFG);
+            value
+        };
+        return Some(("CARGO_ENCODED_RUSTFLAGS".to_owned(), value));
+    }
+    if let Some(plain) = plain {
+        let value = if plain
+            .split_whitespace()
+            .any(|flag| flag == GETRANDOM_CUSTOM_CFG)
+        {
+            plain.to_owned()
+        } else {
+            let mut value = plain.to_owned();
+            if !value.is_empty() {
+                value.push(' ');
+            }
+            value.push_str(GETRANDOM_CUSTOM_CFG);
+            value
+        };
+        return Some(("RUSTFLAGS".to_owned(), value));
     }
 
-    Some(flags.join(RUSTFLAGS_SEP))
+    let key = cargo_target_rustflags_env_key(target);
+    if let Some(target_specific) = target_specific {
+        let value = if target_specific
+            .split_whitespace()
+            .any(|flag| flag == GETRANDOM_CUSTOM_CFG)
+        {
+            target_specific.to_owned()
+        } else {
+            let mut value = target_specific.to_owned();
+            if !value.is_empty() {
+                value.push(' ');
+            }
+            value.push_str(GETRANDOM_CUSTOM_CFG);
+            value
+        };
+        return Some((key, value));
+    }
+
+    if let Some(build_env) = build_env {
+        let value = if build_env
+            .split_whitespace()
+            .any(|flag| flag == GETRANDOM_CUSTOM_CFG)
+        {
+            build_env.to_owned()
+        } else {
+            let mut value = build_env.to_owned();
+            if !value.is_empty() {
+                value.push(' ');
+            }
+            value.push_str(GETRANDOM_CUSTOM_CFG);
+            value
+        };
+        return Some(("CARGO_BUILD_RUSTFLAGS".to_owned(), value));
+    }
+
+    if config_flags.iter().any(|flag| flag == GETRANDOM_CUSTOM_CFG) {
+        return Some((
+            "CARGO_ENCODED_RUSTFLAGS".to_owned(),
+            config_flags.join(RUSTFLAGS_SEP),
+        ));
+    }
+
+    let mut value = config_flags.join(RUSTFLAGS_SEP);
+    if !value.is_empty() {
+        value.push_str(RUSTFLAGS_SEP);
+    }
+    value.push_str(GETRANDOM_CUSTOM_CFG);
+    Some(("CARGO_ENCODED_RUSTFLAGS".to_owned(), value))
+}
+
+fn resolve_build_target(
+    config_target: Option<String>,
+    env_target: Option<String>,
+) -> Result<String> {
+    env_target
+        .or(config_target)
+        .filter(|target| !target.trim().is_empty())
+        .ok_or_else(|| {
+        anyhow::anyhow!(
+            "No Cargo build target selected. Set `[build] target = \"wasm32-unknown-unknown\"` (Astrid-canonical) or `wasm32-wasip2` in `.cargo/config.toml`, or set CARGO_BUILD_TARGET."
+        )
+    })
 }
 
 /// Wrap a core wasm module into a Component Model component if it isn't
@@ -310,7 +566,7 @@ fn ensure_component(wasm_path: &Path) -> Result<PathBuf> {
         .encode()
         .context("ComponentEncoder failed to emit a component")?;
     // Overwrite the original artifact path so the capsule's
-    // `Capsule.toml [[component]] file = "<crate>.wasm"` directive
+    // `Capsule.toml [[component]] file = "<packaged-basename>.wasm"` directive
     // continues to resolve. Using a `.component.wasm` sibling instead
     // would force every capsule manifest to track which target produced
     // the artifact — that's friction the toolchain should hide.
@@ -323,40 +579,77 @@ fn ensure_component(wasm_path: &Path) -> Result<PathBuf> {
     Ok(wasm_path.to_path_buf())
 }
 
-/// Locate the compiled WASM binary in the target directory. We don't
-/// know which target was used (the capsule's `.cargo/config.toml`
-/// decides), so probe the known guest targets in canonical-first order
-/// and accept the first one that exists. The capsule build wrapping
-/// step below treats `wasm32-unknown-unknown` outputs as core wasm
-/// modules that need to be wrapped into a component; `wasm32-wasip2`
-/// outputs are already components.
+/// Locate the compiled WASM binary in Cargo's resolved target directory.
+///
+/// The guest target is known from the same precedence used to invoke Cargo,
+/// and the artifact is the exact package cdylib built for the release
+/// profile. There is deliberately no recursive search or local-target
+/// fallback: probing other roots could select stale artifacts when a
+/// host-wide target root is configured.
 fn locate_wasm_binary(
-    dir: &Path,
     meta: &cargo_metadata::Metadata,
+    target: &str,
     wasm_name: &str,
 ) -> Result<PathBuf> {
-    const TARGETS: &[&str] = &["wasm32-unknown-unknown", "wasm32-wasip2"];
-    let local_target = dir.join("target");
-    let workspace_target = meta
-        .workspace_root
-        .clone()
-        .into_std_path_buf()
-        .join("target");
-    for target in TARGETS {
-        for root in &[&local_target, &workspace_target] {
-            let candidate = root
-                .join(target)
-                .join("release")
-                .join(format!("{wasm_name}.wasm"));
-            if candidate.exists() {
-                return Ok(candidate);
-            }
-        }
+    const PROFILE: &str = "release";
+    let target_root = meta.target_directory.as_std_path();
+    validate_wasm_output_name(wasm_name)?;
+
+    let candidate = target_root
+        .join(target)
+        .join(PROFILE)
+        .join(format!("{wasm_name}.wasm"));
+    let artifact_metadata = match fs::symlink_metadata(&candidate) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
+            "Could not locate compiled WASM binary at `target/{target}/{PROFILE}/{wasm_name}.wasm` under configured target directory {}",
+            target_root.display()
+        ),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to inspect compiled WASM binary {}",
+                    candidate.display()
+                )
+            });
+        },
+    };
+
+    if artifact_metadata.file_type().is_symlink() {
+        bail!("Compiled WASM binary is a symlink: {}", candidate.display());
     }
-    bail!(
-        "Could not locate compiled WASM binary under `target/{{wasm32-unknown-unknown,wasm32-wasip2}}/release/{wasm_name}.wasm` in {} or workspace root",
-        dir.display()
-    );
+    if !artifact_metadata.is_file() {
+        bail!(
+            "Compiled WASM binary is not a regular file: {}",
+            candidate.display()
+        );
+    }
+
+    // A regular artifact beneath a symlinked parent could still resolve
+    // outside the configured root. Canonicalize only for containment; return
+    // Cargo's path so callers retain the authoritative configured location,
+    // including when the target root itself is a legitimate symlink.
+    let resolved_target_root = fs::canonicalize(target_root).with_context(|| {
+        format!(
+            "Failed to resolve target directory {}",
+            target_root.display()
+        )
+    })?;
+    let resolved_candidate = fs::canonicalize(&candidate).with_context(|| {
+        format!(
+            "Failed to resolve compiled WASM binary {}",
+            candidate.display()
+        )
+    })?;
+    if !resolved_candidate.starts_with(&resolved_target_root) {
+        bail!(
+            "Compiled WASM binary {} escapes configured target directory {}",
+            candidate.display(),
+            target_root.display()
+        );
+    }
+
+    Ok(candidate)
 }
 
 /// Merge the developer's `Capsule.toml` with any extracted description.
@@ -368,6 +661,7 @@ fn build_manifest_content(
     wasm_name: &str,
 ) -> Result<String> {
     let capsule_description = extract_capsule_description(wasm_path);
+    let packaged_name = format!("{wasm_name}.wasm");
 
     let base_toml_path = dir.join("Capsule.toml");
     let mut toml_doc = if base_toml_path.exists() {
@@ -378,6 +672,8 @@ fn build_manifest_content(
     } else {
         create_default_manifest(crate_name, package_version, wasm_name)
     };
+
+    bind_manifest_to_packaged_wasm(&mut toml_doc, &packaged_name)?;
 
     if let Some(desc) = &capsule_description
         && let Some(pkg) = toml_doc.get_mut("package")
@@ -393,6 +689,70 @@ fn build_manifest_content(
     }
 
     Ok(toml_doc.to_string())
+}
+
+/// Bind the manifest's single WASM component to the one file the archiver
+/// writes. A hand-authored manifest can retain an old package-name filename
+/// after a `[lib] name = "..."` change; leaving that pointer untouched would
+/// produce an archive whose executable cannot be resolved at install time.
+///
+/// This builder emits exactly one cdylib, so multiple component tables are an
+/// unsafe ambiguity rather than an invitation to discard author-declared
+/// components. All other component fields (id, type, hash, links, and
+/// capabilities) remain untouched. If an author supplied both `file` and the
+/// legacy `entrypoint` alias, fail closed instead of choosing one silently.
+fn bind_manifest_to_packaged_wasm(
+    toml_doc: &mut toml_edit::DocumentMut,
+    packaged_name: &str,
+) -> Result<()> {
+    validate_wasm_output_name(packaged_name.strip_suffix(".wasm").unwrap_or(packaged_name))?;
+
+    let Some(component_item) = toml_doc.get_mut("component") else {
+        let mut component = toml_edit::Table::new();
+        let component_id = packaged_name.strip_suffix(".wasm").unwrap_or(packaged_name);
+        component.insert("id", toml_edit::value(component_id));
+        component.insert("file", toml_edit::value(packaged_name));
+        component.insert("type", toml_edit::value("executable"));
+        let mut components = toml_edit::ArrayOfTables::new();
+        components.push(component);
+        toml_doc.insert("component", toml_edit::Item::ArrayOfTables(components));
+        return Ok(());
+    };
+
+    let Some(components) = component_item.as_array_of_tables_mut() else {
+        bail!("Capsule.toml component must be an array of tables")
+    };
+    if components.len() != 1 {
+        bail!(
+            "Capsule.toml declares {} components, but this build packages exactly one cdylib",
+            components.len()
+        );
+    }
+    let component = components
+        .get_mut(0)
+        .context("Capsule.toml component array unexpectedly empty")?;
+    let has_file = component.get("file").is_some();
+    let has_entrypoint = component.get("entrypoint").is_some();
+    if has_file && has_entrypoint {
+        bail!(
+            "Capsule.toml component declares both `file` and `entrypoint`; refusing an ambiguous executable path"
+        );
+    }
+
+    let key = if has_file {
+        "file"
+    } else if has_entrypoint {
+        "entrypoint"
+    } else {
+        "file"
+    };
+    if let Some(item) = component.get(key)
+        && item.as_str().is_none()
+    {
+        bail!("Capsule.toml component `{key}` must be a string")
+    }
+    component.insert(key, toml_edit::value(packaged_name));
+    Ok(())
 }
 
 /// Resolve the output directory, creating it if necessary.
@@ -568,164 +928,5 @@ fn create_default_manifest(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn decode(encoded: &str) -> Vec<String> {
-        encoded.split(RUSTFLAGS_SEP).map(str::to_owned).collect()
-    }
-
-    #[test]
-    fn no_injection_for_non_wasm_target() {
-        assert_eq!(
-            encoded_rustflags_with_getrandom(Some("wasm32-wasip2"), &[], None, None),
-            None
-        );
-        assert_eq!(
-            encoded_rustflags_with_getrandom(None, &[], None, None),
-            None
-        );
-    }
-
-    #[test]
-    fn injects_cfg_when_capsule_declares_nothing() {
-        let encoded =
-            encoded_rustflags_with_getrandom(Some(GETRANDOM_TARGET), &[], None, None).unwrap();
-        assert_eq!(decode(&encoded), vec![GETRANDOM_CUSTOM_CFG.to_owned()]);
-    }
-
-    #[test]
-    fn does_not_duplicate_an_already_present_cfg() {
-        // The current per-capsule `.cargo/config.toml` case: the flag is
-        // already there, so injection must be a no-op (no double flag).
-        let config = vec![GETRANDOM_CUSTOM_CFG.to_owned()];
-        let encoded =
-            encoded_rustflags_with_getrandom(Some(GETRANDOM_TARGET), &config, None, None).unwrap();
-        assert_eq!(decode(&encoded), vec![GETRANDOM_CUSTOM_CFG.to_owned()]);
-    }
-
-    #[test]
-    fn preserves_other_config_rustflags() {
-        let config = vec!["-C".to_owned(), "target-feature=+simd128".to_owned()];
-        let encoded =
-            encoded_rustflags_with_getrandom(Some(GETRANDOM_TARGET), &config, None, None).unwrap();
-        assert_eq!(
-            decode(&encoded),
-            vec![
-                "-C".to_owned(),
-                "target-feature=+simd128".to_owned(),
-                GETRANDOM_CUSTOM_CFG.to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn preserves_repeated_flag_tokens() {
-        // Regression: de-duping individual tokens must NOT drop a repeated
-        // `-C`, which would fuse two separate flags into invalid rustc input
-        // (`-C opt-level=3` + `-C debuginfo=2` -> `-C opt-level=3 debuginfo=2`).
-        let config = vec![
-            "-C".to_owned(),
-            "opt-level=3".to_owned(),
-            "-C".to_owned(),
-            "debuginfo=2".to_owned(),
-        ];
-        let encoded =
-            encoded_rustflags_with_getrandom(Some(GETRANDOM_TARGET), &config, None, None).unwrap();
-        assert_eq!(
-            decode(&encoded),
-            vec![
-                "-C".to_owned(),
-                "opt-level=3".to_owned(),
-                "-C".to_owned(),
-                "debuginfo=2".to_owned(),
-                GETRANDOM_CUSTOM_CFG.to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn merges_inherited_plain_rustflags() {
-        let encoded = encoded_rustflags_with_getrandom(
-            Some(GETRANDOM_TARGET),
-            &[],
-            None,
-            Some("--cfg=foo -Cdebuginfo=2"),
-        )
-        .unwrap();
-        assert_eq!(
-            decode(&encoded),
-            vec![
-                "--cfg=foo".to_owned(),
-                "-Cdebuginfo=2".to_owned(),
-                GETRANDOM_CUSTOM_CFG.to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn encoded_env_takes_precedence_over_plain() {
-        // When both are set Cargo reads the encoded form; we must too.
-        let encoded = encoded_rustflags_with_getrandom(
-            Some(GETRANDOM_TARGET),
-            &[],
-            Some("--cfg=from_encoded"),
-            Some("--cfg=from_plain"),
-        )
-        .unwrap();
-        assert_eq!(
-            decode(&encoded),
-            vec![
-                "--cfg=from_encoded".to_owned(),
-                GETRANDOM_CUSTOM_CFG.to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn reads_target_and_rustflags_from_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let cargo_dir = dir.path().join(".cargo");
-        fs::create_dir_all(&cargo_dir).unwrap();
-        fs::write(
-            cargo_dir.join("config.toml"),
-            "[build]\n\
-             target = \"wasm32-unknown-unknown\"\n\n\
-             [target.wasm32-unknown-unknown]\n\
-             rustflags = [\"--cfg=getrandom_backend=\\\"custom\\\"\"]\n",
-        )
-        .unwrap();
-
-        let (target, flags) = cargo_config_target_and_rustflags(dir.path());
-        assert_eq!(target.as_deref(), Some(GETRANDOM_TARGET));
-        assert_eq!(flags, vec![GETRANDOM_CUSTOM_CFG.to_owned()]);
-    }
-
-    #[test]
-    fn reads_string_form_rustflags_from_config() {
-        // Cargo allows `rustflags` as a single space-separated string, not
-        // just an array — parse both forms.
-        let dir = tempfile::tempdir().unwrap();
-        let cargo_dir = dir.path().join(".cargo");
-        fs::create_dir_all(&cargo_dir).unwrap();
-        fs::write(
-            cargo_dir.join("config.toml"),
-            "[build]\n\
-             target = \"wasm32-unknown-unknown\"\n\
-             rustflags = \"-C opt-level=3\"\n",
-        )
-        .unwrap();
-
-        let (target, flags) = cargo_config_target_and_rustflags(dir.path());
-        assert_eq!(target.as_deref(), Some(GETRANDOM_TARGET));
-        assert_eq!(flags, vec!["-C".to_owned(), "opt-level=3".to_owned()]);
-    }
-
-    #[test]
-    fn missing_config_yields_no_target_or_flags() {
-        let dir = tempfile::tempdir().unwrap();
-        let (target, flags) = cargo_config_target_and_rustflags(dir.path());
-        assert_eq!(target, None);
-        assert!(flags.is_empty());
-    }
-}
+#[path = "rust_tests.rs"]
+mod tests;
