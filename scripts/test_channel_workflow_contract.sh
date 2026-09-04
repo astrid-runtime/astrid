@@ -453,6 +453,8 @@ api_branch_end = helper.find("else", api_branch_start)
 api_branch = helper[api_branch_start:api_branch_end]
 if 'export ASTRID_FSKIT_NOTARY_PROFILE="$NOTARY_PROFILE_NAME"' not in apple_branch:
     fail("Apple-ID credentials must select the keychain-profile path")
+if 'export ASTRID_FSKIT_NOTARY_KEYCHAIN="$SIGNING_KEYCHAIN"' not in apple_branch:
+    fail("Apple-ID credentials must bind submit to the ephemeral keychain path")
 if "ASTRID_FSKIT_NOTARY_PROFILE" in api_branch and (
     "unset ASTRID_FSKIT_NOTARY_PROFILE" not in api_branch
 ):
@@ -465,6 +467,19 @@ for api_variable in (
     environment_name, local_name = api_variable
     if f"local {local_name}=" not in helper:
         fail(f"helper API-key fallback is missing {environment_name}")
+
+build_helper_relpath = "scripts/build-macos-fskit.sh"
+build_helper = (repo_root / build_helper_relpath).read_text(encoding="utf-8")
+for fragment in (
+    'NOTARY_PROFILE="${ASTRID_FSKIT_NOTARY_PROFILE:-}"',
+    'NOTARY_KEYCHAIN="${ASTRID_FSKIT_NOTARY_KEYCHAIN:-}"',
+    'if [[ -z "$NOTARY_KEYCHAIN" ]]; then',
+    '"Apple-ID notary submission requires ASTRID_FSKIT_NOTARY_KEYCHAIN"',
+    '--keychain-profile "$NOTARY_PROFILE" \\',
+    '--keychain "$NOTARY_KEYCHAIN" --wait',
+):
+    if fragment not in build_helper:
+        fail(f"FSKit build script is missing {fragment}")
 
 for case_name, case_env in (
     (
@@ -538,12 +553,18 @@ set -euo pipefail
 {
   printf 'team=%s\\n' "${ASTRID_FSKIT_DEVELOPMENT_TEAM-unset}"
   printf 'profile=%s\\n' "${ASTRID_FSKIT_NOTARY_PROFILE-unset}"
+  printf 'notary-keychain=%s\\n' "${ASTRID_FSKIT_NOTARY_KEYCHAIN-unset}"
   if [[ -n "${ASTRID_FSKIT_NOTARY_KEY_PATH:-}" && -f "${ASTRID_FSKIT_NOTARY_KEY_PATH}" ]]; then
     printf 'key_file=present\\n'
   else
     printf 'key_file=%s\\n' "${ASTRID_FSKIT_NOTARY_KEY_PATH-unset}"
   fi
 } >> "$ASTRID_TEST_FIXTURE/build.log"
+if [[ -n "${ASTRID_FSKIT_NOTARY_PROFILE:-}" ]]; then
+  xcrun notarytool submit "$ASTRID_TEST_FIXTURE/notary.zip" \\
+    --keychain-profile "$ASTRID_FSKIT_NOTARY_PROFILE" \\
+    --keychain "$ASTRID_FSKIT_NOTARY_KEYCHAIN" --wait
+fi
 """,
     )
 
@@ -664,13 +685,58 @@ with tempfile.TemporaryDirectory() as temporary_directory:
         fail("Apple-ID path did not execute the build with the mapped FSKit team")
     if apple_build.get("profile") != "astrid-fskit":
         fail("Apple-ID path did not export the notary keychain profile")
+    if apple_build.get("notary-keychain") == "unset":
+        fail("Apple-ID path did not export the existing ephemeral keychain path")
     apple_xcrun = (fixture / "apple-id" / "xcrun.log").read_text(encoding="utf-8")
-    if "notarytool store-credentials astrid-fskit" not in apple_xcrun:
+    apple_xcrun_lines = apple_xcrun.splitlines()
+    store_lines = [
+        line
+        for line in apple_xcrun_lines
+        if line.startswith("notarytool store-credentials astrid-fskit ")
+    ]
+    submit_lines = [
+        line for line in apple_xcrun_lines if line.startswith("notarytool submit ")
+    ]
+    if len(store_lines) != 1 or "--keychain" not in store_lines[0]:
         fail("Apple-ID path did not execute notary profile storage")
+    if len(submit_lines) != 1:
+        fail("Apple-ID build did not execute notary profile submission")
+    store_args = store_lines[0].split(" ")
+    submit_args = submit_lines[0].split(" ")
+    store_keychain = store_args[store_args.index("--keychain") + 1]
+    if "--keychain-profile astrid-fskit" not in submit_lines[0]:
+        fail("Apple-ID submission did not use the stored keychain profile")
+    submit_keychain = submit_args[submit_args.index("--keychain") + 1]
+    if not store_keychain or submit_keychain != store_keychain:
+        fail("Apple-ID store and submit used different ephemeral keychain paths")
+    if submit_keychain != apple_build["notary-keychain"]:
+        fail("Apple-ID build received a different ephemeral keychain path")
     if behavior_values(fixture / "apple-id" / "behavior.log").get(
         "partition-password"
     ) != "TEST-KEYCHAIN-PASSWORD":
         fail("partition list did not receive the generated ephemeral keychain password")
+    apple_runner = fixture / "apple-id" / "runner"
+    if list(apple_runner.glob("*.keychain")):
+        fail("successful Apple-ID path left the ephemeral signing keychain")
+    apple_security_text = (
+        fixture / "apple-id" / "security-args.log"
+    ).read_text(encoding="utf-8")
+    apple_create_lines = [
+        line
+        for line in apple_security_text.splitlines()
+        if line.startswith("create-keychain ")
+    ]
+    apple_delete_lines = [
+        line
+        for line in apple_security_text.splitlines()
+        if line.startswith("delete-keychain ")
+    ]
+    if len(apple_create_lines) != 1 or len(apple_delete_lines) != 1:
+        fail("successful Apple-ID cleanup did not delete exactly one keychain")
+    if apple_create_lines[0].split(" ")[-1] != apple_delete_lines[0].split(" ")[-1]:
+        fail("successful Apple-ID cleanup deleted the wrong keychain path")
+    if apple_delete_lines[0].split(" ")[-1] != store_keychain:
+        fail("successful Apple-ID cleanup deleted a different notary keychain")
 
     api = run_signing_helper(fixture / "api-key", "api-key")
     if api.returncode != 0:
@@ -680,6 +746,8 @@ with tempfile.TemporaryDirectory() as temporary_directory:
         fail("API-key path did not execute the build with the mapped FSKit team")
     if api_build.get("profile") != "unset":
         fail("API-key path leaked or selected the Apple-ID profile")
+    if api_build.get("notary-keychain") != "unset":
+        fail("API-key path leaked the Apple-ID keychain path")
     if api_build.get("key_file") != "present":
         fail("API-key path did not write and pass the .p8 file")
     xcrun_log = fixture / "api-key" / "xcrun.log"

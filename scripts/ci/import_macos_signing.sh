@@ -76,6 +76,11 @@ prepare_notary_input() {
       return 1
     }
     export ASTRID_FSKIT_NOTARY_PROFILE="$NOTARY_PROFILE_NAME"
+    [[ -n "$SIGNING_KEYCHAIN" ]] || {
+      echo "Apple-ID notary submission requires the ephemeral signing keychain" >&2
+      return 1
+    }
+    export ASTRID_FSKIT_NOTARY_KEYCHAIN="$SIGNING_KEYCHAIN"
     NOTARY_MODE=apple-id
   elif [[ -n "$key_id" || -n "$issuer_id" || -n "$key" ]]; then
     [[ -n "$key_id" && -n "$issuer_id" && -n "$key" ]] || {
