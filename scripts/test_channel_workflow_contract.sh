@@ -523,7 +523,9 @@ def behavior_values(path: Path) -> dict[str, str]:
     return values
 
 
-def run_signing_helper(fixture: Path, mode: str) -> subprocess.CompletedProcess[str]:
+def run_signing_helper(
+    fixture: Path, mode: str, security_failure: str | None = None
+) -> subprocess.CompletedProcess[str]:
     scripts = fixture / "scripts"
     (scripts / "ci").mkdir(parents=True)
     (fixture / "runner").mkdir()
@@ -552,12 +554,27 @@ set -euo pipefail
         """#!/usr/bin/env bash
 set -euo pipefail
 fixture=${ASTRID_TEST_FIXTURE:?set ASTRID_TEST_FIXTURE}
+failure=${ASTRID_TEST_SECURITY_FAILURE:-}
 printf '%s\\n' "$*" >> "$fixture/security-args.log"
 case "$1" in
   list-keychains)
     if [[ "${2:-}" == "-d" ]]; then
       printf '%s\\n' "$fixture/original.keychain"
     fi
+    ;;
+  create-keychain)
+    if [[ "$failure" == create ]]; then
+      exit 91
+    fi
+    : > "${*: -1}"
+    ;;
+  unlock-keychain)
+    if [[ "$failure" == unlock ]]; then
+      exit 92
+    fi
+    ;;
+  delete-keychain)
+    rm -f "${*: -1}"
     ;;
   set-key-partition-list)
     [[ "${2:-}" == "-S" && "${4:-}" == "-k" ]] || exit 90
@@ -625,6 +642,9 @@ printf '%s\\n' Darwin
     else:
         fail(f"unknown signing helper test mode {mode}")
 
+    if security_failure is not None:
+        environment["ASTRID_TEST_SECURITY_FAILURE"] = security_failure
+
     return subprocess.run(
         [str(scripts / "ci" / "import_macos_signing.sh")],
         env=environment,
@@ -671,6 +691,44 @@ with tempfile.TemporaryDirectory() as temporary_directory:
         "partition-password"
     ) != "TEST-KEYCHAIN-PASSWORD":
         fail("API-key partition list did not receive the ephemeral keychain password")
+
+    unlock = run_signing_helper(
+        fixture / "unlock-fail", "apple-id", security_failure="unlock"
+    )
+    if unlock.returncode == 0:
+        fail("macOS signing helper did not fail when unlock-keychain failed")
+    unlock_runner = fixture / "unlock-fail" / "runner"
+    unlock_keychains = list(unlock_runner.glob("*.keychain"))
+    if unlock_keychains:
+        fail("unlock-keychain failure left the ephemeral signing keychain")
+    unlock_args = (fixture / "unlock-fail" / "security-args.log").read_text(
+        encoding="utf-8"
+    )
+    unlock_create_lines = [
+        line for line in unlock_args.splitlines() if line.startswith("create-keychain ")
+    ]
+    unlock_delete_lines = [
+        line for line in unlock_args.splitlines() if line.startswith("delete-keychain ")
+    ]
+    if len(unlock_create_lines) != 1 or len(unlock_delete_lines) != 1:
+        fail("unlock-keychain failure cleanup did not delete exactly one keychain")
+    if unlock_create_lines[0].split(" ")[-1] != unlock_delete_lines[0].split(" ")[-1]:
+        fail("unlock-keychain failure cleanup deleted the wrong keychain path")
+
+    create = run_signing_helper(
+        fixture / "create-fail", "apple-id", security_failure="create"
+    )
+    if create.returncode != 91:
+        fail("create-keychain failure did not preserve the original security failure")
+    if create.stdout or create.stderr:
+        fail("create-keychain failure produced unexpected cleanup output")
+    create_args = (fixture / "create-fail" / "security-args.log").read_text(
+        encoding="utf-8"
+    )
+    if "delete-keychain " in create_args:
+        fail("create-keychain failure cleanup attempted to delete a missing keychain")
+    if list((fixture / "create-fail" / "runner").glob("*.keychain")):
+        fail("create-keychain failure left a keychain-like file")
 
 print("macOS Developer ID import and Apple-ID notary profile contract: PASS")
 

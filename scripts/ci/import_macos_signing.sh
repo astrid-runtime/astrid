@@ -19,7 +19,9 @@ cleanup() {
     security list-keychains -s "${RESTORE_KEYCHAINS[@]}" >/dev/null 2>&1
   fi
   if [[ -n "$SIGNING_KEYCHAIN" ]]; then
-    security delete-keychain "$SIGNING_KEYCHAIN" >/dev/null 2>&1
+    if [[ -f "$SIGNING_KEYCHAIN" ]]; then
+      security delete-keychain "$SIGNING_KEYCHAIN" >/dev/null 2>&1
+    fi
   fi
   if [[ -n "$P12_PATH" ]]; then
     rm -f "$P12_PATH"
@@ -105,9 +107,9 @@ create_signing_keychain() {
     RESTORE_KEYCHAINS+=("$original_keychain")
   done < <(security list-keychains -d user | sed -e $'s/^[[:space:]]*//' -e 's/^"//' -e 's/"$//')
 
+  SIGNING_KEYCHAIN="$keychain_path"
   security create-keychain -p "$keychain_password" "$keychain_path"
   security unlock-keychain -p "$keychain_password" "$keychain_path"
-  SIGNING_KEYCHAIN="$keychain_path"
   security list-keychains -s "$SIGNING_KEYCHAIN" "${RESTORE_KEYCHAINS[@]}" >/dev/null
 }
 
