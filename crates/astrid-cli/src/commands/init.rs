@@ -128,16 +128,10 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
         grant::preflight_grants(&operator, &target).await?;
     }
 
+    let _provisioning_lock = ensure_init_workspace(&home, &target)?;
     if matches!(prepared, PreparedDistro::Shuttle) {
-        home.ensure()?;
-        let _provisioning_lock = grant::ProvisioningLock::acquire(&home, &target)?;
-        init_workspace()?;
         return run_init_from_shuttle(distro_source, opts).await;
     }
-
-    home.ensure()?;
-    let _provisioning_lock = grant::ProvisioningLock::acquire(&home, &target)?;
-    init_workspace()?;
 
     // Distro.lock is an outcome record, not a completion shortcut. Every
     // selected member is checked through the caller-scoped durable identity
@@ -212,12 +206,7 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // would otherwise see a version-matched lock and short-circuit. An empty
     // selection (nothing to install) is not a
     // failure.
-    if total > 0 && succeeded == 0 {
-        bail!(
-            "all {total} capsule install(s) failed — not writing Distro.lock. \
-             Fix the errors above and re-run `astrid init`."
-        );
-    }
+    reject_total_install_failure(total, succeeded)?;
 
     // Per-provider onboarding runs only on a FULL success — a partial run
     // isn't finalized, and its re-run will onboard once it converges. For
@@ -282,6 +271,16 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
 /// install each capsule offline from the mirror.
 async fn run_init_from_shuttle(source: &str, opts: &InitOpts) -> anyhow::Result<()> {
     super::distro::shuttle_install::install_from_shuttle(std::path::Path::new(source), opts).await
+}
+
+fn ensure_init_workspace(
+    home: &AstridHome,
+    target: &astrid_core::PrincipalId,
+) -> anyhow::Result<grant::ProvisioningLock> {
+    home.ensure()?;
+    let provisioning_lock = grant::ProvisioningLock::acquire(home, target)?;
+    init_workspace()?;
+    Ok(provisioning_lock)
 }
 
 /// Initialize the current directory as an Astrid workspace (if not already).
@@ -577,6 +576,16 @@ fn should_write_lock(total: usize, succeeded: usize) -> bool {
     total == 0 || succeeded == total
 }
 
+fn reject_total_install_failure(total: usize, succeeded: usize) -> anyhow::Result<()> {
+    if total > 0 && succeeded == 0 {
+        bail!(
+            "all {total} capsule install(s) failed — not writing Distro.lock. \
+             Fix the errors above and re-run `astrid init`."
+        );
+    }
+    Ok(())
+}
+
 /// Persist `lock` at `lock_path` iff the run earned it (see
 /// [`should_write_lock`]). Returns whether the lock was written, so the
 /// caller can pick the honest completion message. Kept as a small helper so
@@ -665,6 +674,37 @@ fn is_network_capsule_source(source: &str) -> bool {
     astrid_capsule_install::github_source::parse_github_source(source.trim()).is_some()
 }
 
+fn refuse_offline_network_sources(selected: &[DistroCapsule], offline: bool) -> anyhow::Result<()> {
+    if !offline {
+        return Ok(());
+    }
+    for cap in selected {
+        if is_network_capsule_source(&cap.source) {
+            bail!(
+                "--offline: capsule '{}' has a network/GitHub source '{}' — \
+                 refusing to fetch. Use a .shuttle archive for a self-contained \
+                 offline install.",
+                cap.name,
+                cap.source
+            );
+        }
+    }
+    Ok(())
+}
+
+fn report_batch_install_outcome(total: usize, failed: &[String]) {
+    if failed.is_empty() {
+        eprintln!("  Installed {total} capsule(s).");
+    } else {
+        eprintln!(
+            "  Installed {} capsule(s), {} failed: {}",
+            total.saturating_sub(failed.len()),
+            failed.len(),
+            failed.join(", "),
+        );
+    }
+}
+
 /// Install each selected capsule with a progress bar.
 ///
 /// Under `offline`, a capsule whose source is GitHub-backed is a hard
@@ -698,19 +738,7 @@ async fn install_capsules_with_resume(
     pinned_refs: Option<&HashMap<String, String>>,
 ) -> anyhow::Result<InstallCapsulesResult> {
     super::capsule::install_daemon::reset_batch_install_budget();
-    if offline {
-        for cap in selected {
-            if is_network_capsule_source(&cap.source) {
-                bail!(
-                    "--offline: capsule '{}' has a network/GitHub source '{}' — \
-                     refusing to fetch. Use a .shuttle archive for a self-contained \
-                     offline install.",
-                    cap.name,
-                    cap.source
-                );
-            }
-        }
-    }
+    refuse_offline_network_sources(selected, offline)?;
 
     let total = selected.len();
     let pb = ProgressBar::new(total as u64);
@@ -796,16 +824,7 @@ async fn install_capsules_with_resume(
 
     pb.finish_and_clear();
 
-    if failed.is_empty() {
-        eprintln!("  Installed {total} capsule(s).");
-    } else {
-        eprintln!(
-            "  Installed {} capsule(s), {} failed: {}",
-            total.saturating_sub(failed.len()),
-            failed.len(),
-            failed.join(", "),
-        );
-    }
+    report_batch_install_outcome(total, &failed);
 
     Ok(InstallCapsulesResult {
         locked,
