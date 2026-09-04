@@ -188,7 +188,11 @@ jobs:
       - name: Build, sign, and notarize AstridFS
         if: contains(matrix.target, 'apple-darwin')
         env:
-          ASTRID_FSKIT_DEVELOPMENT_TEAM: ${{ secrets.ASTRID_MACOS_DEVELOPMENT_TEAM_ID }}
+          ASTRID_MACOS_DEVELOPMENT_TEAM_ID: ${{ secrets.ASTRID_MACOS_DEVELOPMENT_TEAM_ID }}
+          ASTRID_MACOS_DEVELOPER_ID_P12: ${{ secrets.ASTRID_MACOS_DEVELOPER_ID_P12 }}
+          ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD }}
+          ASTRID_MACOS_NOTARY_APPLE_ID: ${{ secrets.ASTRID_MACOS_NOTARY_APPLE_ID }}
+          ASTRID_MACOS_NOTARY_APP_PASSWORD: ${{ secrets.ASTRID_MACOS_NOTARY_APP_PASSWORD }}
           ASTRID_FSKIT_CODE_SIGN_IDENTITY: ${{ vars.ASTRID_MACOS_DEVELOPER_ID_IDENTITY || 'Developer ID Application' }}
           ASTRID_FSKIT_ARCHS: ${{ matrix.target == 'x86_64-apple-darwin' && 'x86_64' || 'arm64' }}
           ASTRID_FSKIT_NOTARIZE: "1"
@@ -196,18 +200,15 @@ jobs:
           ASTRID_FSKIT_NOTARY_ISSUER_ID: ${{ secrets.ASTRID_MACOS_NOTARY_ISSUER_ID }}
           ASTRID_FSKIT_NOTARY_KEY: ${{ secrets.ASTRID_MACOS_NOTARY_KEY }}
         run: |
-          NOTARY_KEY_PATH="$RUNNER_TEMP/astrid-notary.p8"
-          printf '%s' "$ASTRID_FSKIT_NOTARY_KEY" > "$NOTARY_KEY_PATH"
-          chmod 0600 "$NOTARY_KEY_PATH"
-          export ASTRID_FSKIT_NOTARY_KEY_PATH="$NOTARY_KEY_PATH"
-          trap 'rm -f "$NOTARY_KEY_PATH"' EXIT
-          scripts/build-macos-fskit.sh
+          scripts/ci/import_macos_signing.sh
           echo "ASTRID_FSKIT_APP=$PWD/target/macos-fskit/DerivedData/Build/Products/Release/AstridFS.app" >> "$GITHUB_ENV"
 
       - name: Sign the macOS FSKit companion
         if: contains(matrix.target, 'apple-darwin')
         env:
           ASTRID_MACOS_DEVELOPMENT_TEAM_ID: ${{ secrets.ASTRID_MACOS_DEVELOPMENT_TEAM_ID }}
+          ASTRID_MACOS_DEVELOPER_ID_P12: ${{ secrets.ASTRID_MACOS_DEVELOPER_ID_P12 }}
+          ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD }}
           MACOS_DEVELOPER_ID_IDENTITY: ${{ vars.ASTRID_MACOS_DEVELOPER_ID_IDENTITY }}
         run: |
           set -euo pipefail
@@ -215,18 +216,11 @@ jobs:
           COMPANION_IDENTIFIER=org.astrid.runtime.fs.storage-provider-fskit
           COMPANION="$PWD/target/${{ matrix.target }}/release/astrid-storage-provider-fskit"
           [[ -f "$COMPANION" && -x "$COMPANION" ]]
-          [[ -n "$ASTRID_MACOS_DEVELOPMENT_TEAM_ID" ]] || {
-            echo "ASTRID_MACOS_DEVELOPMENT_TEAM_ID is not configured for the FSKit companion" >&2
-            exit 1
-          }
-          [[ "$ASTRID_MACOS_DEVELOPMENT_TEAM_ID" == "$COMPANION_TEAM" ]] || {
-            echo "ASTRID_MACOS_DEVELOPMENT_TEAM_ID does not match the required team $COMPANION_TEAM" >&2
-            exit 1
-          }
           IDENTITY="${MACOS_DEVELOPER_ID_IDENTITY:-Developer ID Application}"
-          codesign --force --options runtime --timestamp \
-            --identifier "$COMPANION_IDENTIFIER" \
-            --sign "$IDENTITY" "$COMPANION"
+          scripts/ci/import_macos_signing.sh --identity-only \
+            codesign --force --options runtime --timestamp \
+              --identifier "$COMPANION_IDENTIFIER" \
+              --sign "$IDENTITY" "$COMPANION"
           COMPANION_SIGNATURE="$(codesign --display --verbose=4 "$COMPANION" 2>&1)"
           grep -Fx "Identifier=$COMPANION_IDENTIFIER" <<<"$COMPANION_SIGNATURE" >/dev/null
           grep -Fx "TeamIdentifier=$COMPANION_TEAM" <<<"$COMPANION_SIGNATURE" >/dev/null

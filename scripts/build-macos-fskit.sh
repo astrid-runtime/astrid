@@ -18,6 +18,8 @@ ARCHS="${ASTRID_FSKIT_ARCHS:-$(uname -m)}"
 CODE_SIGN_TEAM=9BDSL5BJAP
 APP_IDENTIFIER=org.astrid.runtime.fs
 EXTENSION_IDENTIFIER=org.astrid.runtime.fs.AppEx
+NOTARY_PROFILE="${ASTRID_FSKIT_NOTARY_PROFILE:-}"
+NOTARY_KEYCHAIN="${ASTRID_FSKIT_NOTARY_KEYCHAIN:-}"
 
 if [[ -z "$ASTRID_VERSION" ]]; then
   echo "workspace Astrid version is missing" >&2
@@ -100,9 +102,14 @@ fi
 if [[ "${ASTRID_FSKIT_NOTARIZE:-0}" == 1 ]]; then
   NOTARY_ZIP="$OUTPUT_ROOT/AstridFS-notary.zip"
   ditto -c -k --keepParent "$APP_PATH" "$NOTARY_ZIP"
-  if [[ -n "${ASTRID_FSKIT_NOTARY_PROFILE:-}" ]]; then
+  if [[ -n "$NOTARY_PROFILE" ]]; then
+    if [[ -z "$NOTARY_KEYCHAIN" ]]; then
+      echo "Apple-ID notary submission requires ASTRID_FSKIT_NOTARY_KEYCHAIN" >&2
+      exit 1
+    fi
     xcrun notarytool submit "$NOTARY_ZIP" \
-      --keychain-profile "$ASTRID_FSKIT_NOTARY_PROFILE" --wait
+      --keychain-profile "$NOTARY_PROFILE" \
+      --keychain "$NOTARY_KEYCHAIN" --wait
   elif [[ -n "${ASTRID_FSKIT_NOTARY_KEY_PATH:-}" ]]; then
     : "${ASTRID_FSKIT_NOTARY_KEY_ID:?set ASTRID_FSKIT_NOTARY_KEY_ID}"
     : "${ASTRID_FSKIT_NOTARY_ISSUER_ID:?set ASTRID_FSKIT_NOTARY_ISSUER_ID}"
