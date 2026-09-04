@@ -506,6 +506,18 @@ pub(crate) async fn wait_for_gateway(principal: &PrincipalId, format: &str) -> R
 /// gone. Inconsistent or unowned state is left intact and reported.
 pub(crate) async fn stop_gateway() -> Result<()> {
     let socket = gateway_socket_path()?;
+    // A fresh or already-clean runtime has no gateway generation to lock.
+    // Acquiring the lifecycle lock here would create the transient root before
+    // admission, which is forbidden for the stopped durable layout.
+    if read_gateway_ready()?.is_none()
+        && read_gateway_startup_lease()?.is_none()
+        && matches!(
+            astrid_core::local_transport::connect_outcome(&socket).await?,
+            astrid_core::local_transport::ConnectOutcome::Absent
+        )
+    {
+        return Ok(());
+    }
     let Some(record) = read_gateway_ready()? else {
         let deadline = Instant::now()
             .checked_add(READY_TIMEOUT)

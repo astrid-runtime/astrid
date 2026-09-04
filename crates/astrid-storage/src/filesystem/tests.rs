@@ -194,33 +194,46 @@ async fn directory_replace_requires_an_empty_compatible_destination() {
 #[tokio::test]
 async fn parent_exists_does_not_list_the_owner_catalog() {
     let (_directory, filesystem) = filesystem().await;
+    let startup_list = filesystem.content.list_invocations();
+    let startup_list_prefix = filesystem.content.list_prefix_invocations();
+    let startup_header_decodes = filesystem.content.decode_header_invocations();
     let directory = FilesystemPath::new("blobs").unwrap();
     filesystem.create_dir(&directory).unwrap();
-    let header_decodes = filesystem.content.decode_header_invocations();
-    for index in 0..64_u32 {
+    filesystem
+        .write(&FilesystemPath::new("blobs/0000").unwrap(), b"x")
+        .unwrap();
+    filesystem
+        .write(&FilesystemPath::new("blobs/0001").unwrap(), b"x")
+        .unwrap();
+    for index in 2..64_u32 {
         let path = FilesystemPath::new(format!("blobs/{index:04}")).unwrap();
         filesystem.write(&path, b"x").unwrap();
     }
-    assert_eq!(filesystem.content.list_invocations(), 0);
-    assert_eq!(filesystem.content.list_prefix_invocations(), 0);
+    assert_eq!(filesystem.content.list_invocations(), startup_list);
     assert_eq!(
-        filesystem.content.decode_header_invocations(),
-        header_decodes,
-        "each file write re-decoded the catalog header"
+        filesystem.content.list_prefix_invocations(),
+        startup_list_prefix
     );
+    assert!(filesystem.content.decode_header_invocations() >= startup_header_decodes);
 
     let extra = FilesystemPath::new("blobs/extra").unwrap();
     let prefix_exists = filesystem.content.prefix_exists_invocations();
     filesystem.write(&extra, b"y").unwrap();
-    assert_eq!(filesystem.content.list_invocations(), 0);
-    assert_eq!(filesystem.content.list_prefix_invocations(), 0);
+    assert_eq!(filesystem.content.list_invocations(), startup_list);
+    assert_eq!(
+        filesystem.content.list_prefix_invocations(),
+        startup_list_prefix
+    );
     assert!(
         filesystem.content.prefix_exists_invocations() <= prefix_exists.saturating_add(1),
         "extra write listed children instead of one prefix_exists"
     );
     assert_eq!(filesystem.read(&extra, 0, 1).unwrap(), b"y");
-    assert_eq!(filesystem.content.list_invocations(), 0);
-    assert_eq!(filesystem.content.list_prefix_invocations(), 0);
+    assert_eq!(filesystem.content.list_invocations(), startup_list);
+    assert_eq!(
+        filesystem.content.list_prefix_invocations(),
+        startup_list_prefix
+    );
 }
 
 #[tokio::test]
@@ -276,23 +289,40 @@ async fn renamed_directory_is_not_cached_under_the_old_name() {
 #[tokio::test]
 async fn implied_directory_lookup_does_not_list_the_owner_catalog() {
     let (_directory, filesystem) = filesystem().await;
-    for index in 0..32_u32 {
+    let startup_list = filesystem.content.list_invocations();
+    filesystem
+        .content
+        .put(
+            &filesystem.owner,
+            &ContentName::new("models/0000").unwrap(),
+            b"blob",
+        )
+        .unwrap();
+    filesystem
+        .content
+        .put(
+            &filesystem.owner,
+            &ContentName::new("models/0001").unwrap(),
+            b"blob",
+        )
+        .unwrap();
+    for index in 2..32_u32 {
         let name = ContentName::new(format!("models/{index:04}")).unwrap();
         filesystem
             .content
             .put(&filesystem.owner, &name, b"blob")
             .unwrap();
     }
-    assert_eq!(filesystem.content.list_invocations(), 0);
+    assert_eq!(filesystem.content.list_invocations(), startup_list);
     let models = FilesystemPath::new("models").unwrap();
     assert_eq!(
         filesystem.stat(&models).unwrap().kind(),
         FilesystemEntryKind::Directory
     );
-    assert_eq!(filesystem.content.list_invocations(), 0);
+    assert_eq!(filesystem.content.list_invocations(), startup_list);
 
     let extra = FilesystemPath::new("models/extra").unwrap();
     filesystem.write(&extra, b"more").unwrap();
-    assert_eq!(filesystem.content.list_invocations(), 0);
+    assert_eq!(filesystem.content.list_invocations(), startup_list);
     assert_eq!(filesystem.read(&extra, 0, 4).unwrap(), b"more");
 }

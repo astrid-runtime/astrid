@@ -251,14 +251,6 @@ pub async fn run() -> Result<()> {
     // Done before `args.workspace` is consumed below.
     let runtime_limits = resolve_capsule_limits(&args, unified_cfg.as_ref());
 
-    // Operator-approved per-capsule local-egress allowlist (SSRF-airlock
-    // exemptions). Operator config only — the kernel hands each capsule its
-    // own slice at load time. Absent config = empty = no exemptions.
-    let local_egress = unified_cfg
-        .as_ref()
-        .map(|c| c.security.capsule_local_egress.clone())
-        .unwrap_or_default();
-
     // Operator ceilings for the astrid:http host (global; absent `[http]`
     // config = the host's historical constants). Forwarded to every capsule.
     let http_limits = resolve_http_limits(unified_cfg.as_ref());
@@ -266,12 +258,25 @@ pub async fn run() -> Result<()> {
         session_id.clone(),
         workspace_root,
         runtime_limits,
-        local_egress,
+        std::collections::HashMap::new(),
         http_limits,
         workspace_layout,
     )
     .await
     .map_err(|e| anyhow::anyhow!("Failed to boot Kernel: {e}"))?;
+
+    // Local egress is security policy at durable-root authority, so read it
+    // only after admission and bind it once before any capsule can load.
+    let admitted_config = astrid_config::Config::load_with_home_and_layout(
+        Some(&kernel.workspace_root),
+        astrid_home.root(),
+        kernel.workspace_layout(),
+    )
+    .map_err(|error| anyhow::anyhow!("Failed to load admitted-home boot policy: {error:#}"))?;
+    kernel
+        .bind_boot_local_egress(admitted_config.config.security.capsule_local_egress)
+        .map_err(|error| anyhow::anyhow!("Failed to bind boot policy: {error}"))?;
+
     if defer_logging {
         init_logging(&log_config);
     }

@@ -118,6 +118,52 @@ struct CapsuleViewLease {
     locks: Arc<DashMap<CapsuleViewKey, Weak<Mutex<()>>>>,
 }
 
+/// One immutable publication and the projection activated from it.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+struct BoundMaterialization {
+    snapshot: astrid_storage::CapsulePackageSnapshot,
+    runtime_dir: PathBuf,
+    manifest: astrid_capsule_types::manifest::CapsuleManifest,
+}
+
+/// Exact regular-file and real-directory shape of a durable projection.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[derive(Default)]
+struct ProjectionInventory {
+    files: std::collections::BTreeSet<String>,
+    directories: std::collections::BTreeSet<String>,
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn authenticated_ancestor_directories(relative: &str) -> impl Iterator<Item = String> + '_ {
+    let mut next = Path::new(relative).parent().map(ToOwned::to_owned);
+    std::iter::from_fn(move || {
+        let directory = next.take()?;
+        next = directory.parent().map(ToOwned::to_owned);
+        if directory.as_os_str().is_empty() {
+            return None;
+        }
+        Some(directory.to_string_lossy().into_owned())
+    })
+}
+
+#[cfg(all(unix, not(all(target_arch = "wasm32", target_os = "unknown"))))]
+fn open_projection_file_nofollow(path: &Path) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| anyhow::anyhow!("open projected file {}: {error}", path.display()))
+}
+
+#[cfg(all(not(unix), not(all(target_arch = "wasm32", target_os = "unknown"))))]
+fn open_projection_file_nofollow(path: &Path) -> anyhow::Result<std::fs::File> {
+    std::fs::File::open(path)
+        .map_err(|error| anyhow::anyhow!("open projected file {}: {error}", path.display()))
+}
+
 impl Drop for CapsuleViewLease {
     fn drop(&mut self) {
         self.locks.remove_if(&self.key, |_, stored| {
@@ -278,13 +324,14 @@ pub struct Kernel {
     /// `Copy` value — no resolution logic lives here. See
     /// [`CapsuleRuntimeLimits`](astrid_capsule_types::CapsuleRuntimeLimits).
     runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits,
-    /// Operator-approved per-capsule local-egress allowlist
+    /// Operator-approved per-capsule local-egress boot allowlist
     /// (`[security.capsule_local_egress]`), keyed by capsule id. Resolved
-    /// once from config by the daemon; the kernel only stores it and hands
-    /// each capsule its own slice at load time so the SSRF airlock can
-    /// exempt operator-sanctioned loopback/private endpoints. Empty = no
-    /// exemptions (fail-closed).
-    local_egress: std::collections::HashMap<String, Vec<String>>,
+    /// once after durable-root admission; the kernel only stores it and hands
+    /// each capsule its own slice at load time so the SSRF airlock can exempt
+    /// operator-sanctioned loopback/private endpoints. `None`/empty = no
+    /// exemptions (fail-closed). The snapshot is deliberately write-once:
+    /// capsule reloads never re-read operator policy.
+    local_egress: std::sync::RwLock<Option<std::collections::HashMap<String, Vec<String>>>>,
     /// Operator-declared capsule IDs permitted to run as explicit system
     /// singletons. Manifest fields can request uplink behavior but cannot grant
     /// this cross-principal authority themselves.
@@ -872,6 +919,32 @@ impl Kernel {
         .await
     }
 
+    /// Bind the process-lifetime local-egress boot snapshot before the first
+    /// capsule load.
+    ///
+    /// This is a boot-only seam: reloads reuse the bound snapshot and a second
+    /// bind fails, so operator revocation remains daemon-restart-bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a boot snapshot was already bound.
+    pub fn bind_boot_local_egress(
+        &self,
+        local_egress: std::collections::HashMap<String, Vec<String>>,
+    ) -> Result<(), std::io::Error> {
+        let mut snapshot = self
+            .local_egress
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if snapshot.is_some() {
+            return Err(std::io::Error::other(
+                "local-egress boot policy is already bound",
+            ));
+        }
+        *snapshot = Some(local_egress);
+        Ok(())
+    }
+
     /// Construct a kernel from injected resources and workspace layout.
     ///
     /// # Panics
@@ -1263,7 +1336,7 @@ impl Kernel {
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             compiled_wasm: astrid_capsule::engine::wasm::CompiledWasmCache::default(),
             runtime_limits,
-            local_egress,
+            local_egress: std::sync::RwLock::new(None),
             system_capsules: RwLock::new(std::collections::HashSet::new()),
             http_limits,
             full_reload_in_flight: AtomicBool::new(false),
@@ -1288,6 +1361,10 @@ impl Kernel {
             astrid_home: home,
             admin_write_lock: Mutex::new(()),
         });
+
+        if !local_egress.is_empty() {
+            kernel.bind_boot_local_egress(local_egress)?;
+        }
 
         #[cfg(not(target_family = "wasm"))]
         let _ = kernel.process_storage_mount_broker.set(Arc::new(
@@ -1411,10 +1488,10 @@ impl Kernel {
     /// Verify a path-only capsule cache against the durable package registry.
     ///
     /// The extracted directory is disposable projection state; its owner,
-    /// capsule id, and archive digest are accepted only when they exactly
-    /// match the authenticated immutable-UID registry snapshot. `false`
-    /// means this is an explicit workspace/project portal and must use its
-    /// separate installation receipt policy.
+    /// capsule id, archive digest, and every projected byte are accepted only
+    /// when they exactly match one authenticated immutable-UID snapshot.
+    /// `false` means this is an explicit workspace/project portal and must use
+    /// its separate installation receipt policy.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     fn verify_registry_materialization(
         &self,
@@ -1422,10 +1499,76 @@ impl Kernel {
         principal: &PrincipalId,
         manifest: &astrid_capsule_types::manifest::CapsuleManifest,
     ) -> anyhow::Result<bool> {
-        let cache_root = self.astrid_home.run_dir().join("capsules");
-        let Ok(relative) = dir.strip_prefix(&cache_root) else {
+        let Some(snapshot) = self.published_capsule_snapshot(principal, manifest)? else {
             return Ok(false);
         };
+        self.verify_published_materialization(dir, principal, manifest, &snapshot)?;
+        Ok(true)
+    }
+
+    /// Bind activation to one principal's currently published package.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn published_capsule_snapshot(
+        &self,
+        principal: &PrincipalId,
+        manifest: &astrid_capsule_types::manifest::CapsuleManifest,
+    ) -> anyhow::Result<Option<astrid_storage::CapsulePackageSnapshot>> {
+        let Some(store) = self.principal_store.as_ref() else {
+            return Ok(None);
+        };
+        let uid = self
+            .principal_directory
+            .uid_for(principal)
+            .map_err(|error| anyhow::anyhow!("resolve capsule cache owner UID: {error}"))?;
+        let owner = astrid_storage::StateOwner::Principal(uid);
+        let capsule_id = astrid_capsule_types::CapsuleId::new(manifest.package.name.clone())
+            .map_err(|error| anyhow::anyhow!("invalid durable capsule id: {error}"))?;
+        store
+            .capsules()
+            .get_snapshot(&owner, capsule_id.as_str())
+            .map_err(|error| anyhow::anyhow!("read durable capsule registry: {error}"))
+    }
+
+    /// Derive the only runtime projection path admitted by this snapshot.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn published_cache_target(
+        &self,
+        principal: &PrincipalId,
+        manifest: &astrid_capsule_types::manifest::CapsuleManifest,
+        snapshot: &astrid_storage::CapsulePackageSnapshot,
+    ) -> anyhow::Result<PathBuf> {
+        let uid = self
+            .principal_directory
+            .uid_for(principal)
+            .map_err(|error| anyhow::anyhow!("resolve capsule cache owner UID: {error}"))?;
+        let digest = blake3::hash(&snapshot.package().archive)
+            .to_hex()
+            .to_string();
+        astrid_capsule_install::resolve_cache_target_dir(
+            &self.astrid_home,
+            uid,
+            manifest.package.name.as_str(),
+            &digest,
+            false,
+            None,
+            &self.workspace_layout,
+        )
+        .map_err(|error| anyhow::anyhow!("resolve durable capsule cache target: {error}"))
+    }
+
+    /// Validate the disposable cache path against an exact owner snapshot.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn validate_published_cache_path(
+        &self,
+        dir: &Path,
+        principal: &PrincipalId,
+        manifest: &astrid_capsule_types::manifest::CapsuleManifest,
+        snapshot: &astrid_storage::CapsulePackageSnapshot,
+    ) -> anyhow::Result<()> {
+        let cache_root = self.astrid_home.run_dir().join("capsules");
+        let relative = dir.strip_prefix(&cache_root).map_err(|_| {
+            anyhow::anyhow!("capsule cache path is outside the durable registry cache")
+        })?;
         astrid_core::platform_fs::verify_no_redirects(dir)
             .map_err(|error| anyhow::anyhow!("capsule cache path is redirected: {error}"))?;
         let components: Vec<String> = relative
@@ -1447,53 +1590,109 @@ impl Kernel {
         if components[0] != uid.to_string() || components[1] != manifest.package.name {
             anyhow::bail!("capsule cache owner or id does not match authenticated registry scope");
         }
-        let capsule_id = astrid_capsule_types::CapsuleId::new(manifest.package.name.clone())
-            .map_err(|error| anyhow::anyhow!("invalid materialized capsule id: {error}"))?;
-        let store = self
-            .principal_store
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("durable capsule registry is unavailable"))?;
-        let owner = astrid_storage::StateOwner::Principal(uid);
-        let verified = astrid_capsule_install::read_verified_durable_package_for_owner(
-            store,
-            &owner,
-            capsule_id.as_str(),
-        )?
-        .ok_or_else(|| anyhow::anyhow!("materialized capsule is absent from durable registry"))?;
-        let digest = blake3::hash(verified.archive()).to_hex().to_string();
+        let digest = blake3::hash(&snapshot.package().archive)
+            .to_hex()
+            .to_string();
         if components[2] != digest {
             anyhow::bail!("materialized capsule digest does not match durable registry");
+        }
+        Ok(())
+    }
+
+    /// Verify every projected byte against one immutable package snapshot.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn verify_published_materialization(
+        &self,
+        dir: &Path,
+        principal: &PrincipalId,
+        manifest: &astrid_capsule_types::manifest::CapsuleManifest,
+        snapshot: &astrid_storage::CapsulePackageSnapshot,
+    ) -> anyhow::Result<()> {
+        self.validate_published_cache_path(dir, principal, manifest, snapshot)?;
+        let uid = self
+            .principal_directory
+            .uid_for(principal)
+            .map_err(|error| anyhow::anyhow!("resolve capsule cache owner UID: {error}"))?;
+        let verified = astrid_capsule_install::read_verified_durable_package_for_owner(
+            self.principal_store
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("durable capsule registry is unavailable"))?,
+            &astrid_storage::StateOwner::Principal(uid),
+            manifest.package.name.as_str(),
+        )?
+        .ok_or_else(|| anyhow::anyhow!("materialized capsule is absent from durable registry"))?;
+        if verified.snapshot() != snapshot {
+            anyhow::bail!("materialized capsule snapshot differs from the caller's publication");
         }
         if verified.manifest().package.name != manifest.package.name
             || verified.manifest().package.version != manifest.package.version
         {
             anyhow::bail!("materialized capsule manifest differs from durable registry");
         }
-        let manifest_bytes = std::fs::read(dir.join("Capsule.toml"))
-            .map_err(|error| anyhow::anyhow!("read materialized capsule manifest: {error}"))?;
+        let manifest_bytes = Self::read_projection_file_nofollow(&dir.join("Capsule.toml"))
+            .map_err(|error| anyhow::anyhow!("read materialized capsule manifest: {error:#}"))?;
         if manifest_bytes != verified.manifest_bytes() {
             anyhow::bail!("durable capsule manifest bytes do not match materialization");
         }
-        let metadata_bytes = std::fs::read(dir.join("meta.json"))
-            .map_err(|error| anyhow::anyhow!("read materialized capsule metadata: {error}"))?;
+        let metadata_bytes = Self::read_projection_file_nofollow(&dir.join("meta.json"))
+            .map_err(|error| anyhow::anyhow!("read materialized capsule metadata: {error:#}"))?;
         if metadata_bytes != verified.metadata_bytes() {
             anyhow::bail!("durable capsule metadata does not match materialization");
         }
-        for component in &verified.manifest().components {
-            if component.path.is_absolute() {
-                anyhow::bail!("materialized capsule component path is absolute");
-            }
-            let relative = component.path.to_str().ok_or_else(|| {
-                anyhow::anyhow!("materialized capsule component path is not UTF-8")
-            })?;
-            let Some(expected) = verified.archive_file(relative) else {
-                anyhow::bail!("materialized capsule component is absent from durable archive");
-            };
-            let materialized = std::fs::read(dir.join(relative)).map_err(|error| {
-                anyhow::anyhow!("read materialized capsule component {relative}: {error}")
-            })?;
-            if materialized != expected {
-                anyhow::bail!("materialized capsule component differs from durable archive");
+        let authority_bytes = Self::read_projection_file_nofollow(&dir.join("authority.json"))
+            .map_err(|error| anyhow::anyhow!("read materialized capsule authority: {error:#}"))?;
+        if authority_bytes != verified.snapshot().package().authority {
+            anyhow::bail!("durable capsule authority bytes do not match materialization");
+        }
+        let mut expected_files = verified
+            .archive_entries()
+            .map(|(path, bytes)| (path.to_owned(), bytes.to_vec()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        expected_files.insert(
+            "Capsule.toml".to_owned(),
+            verified.manifest_bytes().to_vec(),
+        );
+        expected_files.insert("meta.json".to_owned(), verified.metadata_bytes().to_vec());
+        expected_files.insert(
+            "authority.json".to_owned(),
+            verified.snapshot().package().authority.clone(),
+        );
+        let actual = Self::inventory_projection_files(dir)?;
+        if actual.files
+            != expected_files
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+        {
+            anyhow::bail!("materialized capsule file inventory differs from durable package");
+        }
+        let mut expected_directories = expected_files
+            .keys()
+            .flat_map(|relative| authenticated_ancestor_directories(relative))
+            .collect::<std::collections::BTreeSet<_>>();
+        let archive_directories = verified
+            .archive_directories()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        expected_directories.extend(archive_directories.iter().cloned());
+        expected_directories.extend(
+            archive_directories
+                .iter()
+                .map(String::as_str)
+                .flat_map(authenticated_ancestor_directories),
+        );
+        if actual.directories != expected_directories {
+            anyhow::bail!("materialized capsule directory inventory differs from durable package");
+        }
+        for (relative, expected) in &expected_files {
+            let materialized =
+                Self::read_projection_file_nofollow(&dir.join(relative)).map_err(|error| {
+                    anyhow::anyhow!("read materialized capsule member {relative}: {error}")
+                })?;
+            if materialized != *expected {
+                anyhow::bail!(
+                    "materialized capsule member {relative} differs from durable archive"
+                );
             }
         }
         let expansions = manifest
@@ -1502,7 +1701,197 @@ impl Kernel {
         if !expansions.is_empty() {
             anyhow::bail!("materialized capsule manifest exceeds durable authority approval");
         }
-        Ok(true)
+        Ok(())
+    }
+
+    /// Bind durable activation or authorize the explicit workspace portal.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn capture_bound_materialization(
+        &self,
+        dir: &Path,
+        principal: &PrincipalId,
+        manifest: &astrid_capsule_types::manifest::CapsuleManifest,
+        operation: &str,
+    ) -> anyhow::Result<Option<BoundMaterialization>> {
+        let snapshot = self.published_capsule_snapshot(principal, manifest)?;
+        if let Some(snapshot) = snapshot {
+            let runtime_dir = self.published_cache_target(principal, manifest, &snapshot)?;
+            let bound_manifest = self.repair_published_materialization(
+                &runtime_dir,
+                principal,
+                manifest,
+                &snapshot,
+            )?;
+            return Ok(Some(BoundMaterialization {
+                snapshot,
+                runtime_dir,
+                manifest: bound_manifest,
+            }));
+        }
+        if !self.verify_registry_materialization(dir, principal, manifest)? {
+            if self.principal_store.is_some()
+                && !dir.starts_with(self.workspace_selection.state_dir())
+            {
+                anyhow::bail!(
+                    "capsule {operation} '{}' is outside the explicit workspace portal and \
+                     has no durable registry authority",
+                    manifest.package.name
+                );
+            }
+            self.verify_installed_authority_for_runtime(dir, manifest).map_err(|error| {
+                anyhow::anyhow!(
+                    "capsule {operation} '{}' exceeds or cannot prove its installed authority: {error:#}",
+                    manifest.package.name
+                )
+            })?;
+        }
+        Ok(None)
+    }
+
+    /// Repair a stale or missing cache generation from one exact snapshot.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn ensure_published_materialization(
+        &self,
+        target: &Path,
+        principal: &PrincipalId,
+        manifest: &astrid_capsule_types::manifest::CapsuleManifest,
+        snapshot: &astrid_storage::CapsulePackageSnapshot,
+    ) -> anyhow::Result<astrid_capsule_types::manifest::CapsuleManifest> {
+        self.repair_published_materialization(target, principal, manifest, snapshot)
+    }
+
+    /// Replace a canonical stale projection without trusting the old manifest.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn repair_published_materialization(
+        &self,
+        target: &Path,
+        principal: &PrincipalId,
+        discovery_manifest: &astrid_capsule_types::manifest::CapsuleManifest,
+        snapshot: &astrid_storage::CapsulePackageSnapshot,
+    ) -> anyhow::Result<astrid_capsule_types::manifest::CapsuleManifest> {
+        self.validate_published_cache_path(target, principal, discovery_manifest, snapshot)?;
+        let target_metadata = match std::fs::symlink_metadata(target) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(anyhow::anyhow!("inspect capsule materialization: {error}")),
+        };
+        if let Some(metadata) = target_metadata {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                anyhow::bail!("capsule materialization target is redirected or not a directory");
+            }
+            if let Ok(bound_manifest) =
+                astrid_capsule::discovery::load_manifest(&target.join("Capsule.toml"))
+                && self
+                    .verify_published_materialization(target, principal, &bound_manifest, snapshot)
+                    .is_ok()
+            {
+                return Ok(bound_manifest);
+            }
+            astrid_core::platform_fs::verify_no_redirects(target).map_err(|error| {
+                anyhow::anyhow!("capsule materialization target is redirected: {error}")
+            })?;
+            std::fs::remove_dir_all(target).map_err(|error| {
+                anyhow::anyhow!("remove stale capsule materialization: {error}")
+            })?;
+        }
+        astrid_capsule_install::materialize_capsule_package(snapshot.package(), target)
+            .map_err(|error| anyhow::anyhow!("materialize durable capsule package: {error:#}"))?;
+        let bound_manifest = astrid_capsule::discovery::load_manifest(&target.join("Capsule.toml"))
+            .map_err(|error| anyhow::anyhow!(error))?;
+        self.verify_published_materialization(target, principal, &bound_manifest, snapshot)?;
+        Ok(bound_manifest)
+    }
+
+    /// Inventory a projection without traversing redirects or special files.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn inventory_projection_files(root: &Path) -> anyhow::Result<ProjectionInventory> {
+        fn walk(
+            root: &Path,
+            directory: &Path,
+            inventory: &mut ProjectionInventory,
+        ) -> anyhow::Result<()> {
+            for entry in std::fs::read_dir(directory).map_err(|error| {
+                anyhow::anyhow!("read capsule projection {}: {error}", directory.display())
+            })? {
+                let entry = entry
+                    .map_err(|error| anyhow::anyhow!("read capsule projection entry: {error}"))?;
+                let path = entry.path();
+                let relative = path.strip_prefix(root).map_err(|_| {
+                    anyhow::anyhow!("capsule projection escaped its root: {}", path.display())
+                })?;
+                let relative_text = relative.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("capsule projection path is not UTF-8: {}", path.display())
+                })?;
+                let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                    anyhow::anyhow!("inspect capsule projection {}: {error}", path.display())
+                })?;
+                let file_type = metadata.file_type();
+                if file_type.is_symlink() {
+                    anyhow::bail!(
+                        "capsule projection contains a symbolic link: {}",
+                        path.display()
+                    );
+                }
+                if file_type.is_dir() {
+                    inventory.directories.insert(relative_text.to_owned());
+                    walk(root, &path, inventory)?;
+                } else if file_type.is_file() {
+                    inventory.files.insert(relative_text.to_owned());
+                } else {
+                    anyhow::bail!(
+                        "capsule projection contains a special file: {}",
+                        path.display()
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        let mut inventory = ProjectionInventory::default();
+        walk(root, root, &mut inventory)?;
+        Ok(inventory)
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn read_projection_file_nofollow(path: &Path) -> anyhow::Result<Vec<u8>> {
+        use std::io::Read as _;
+
+        let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+            anyhow::anyhow!("inspect projected file {}: {error}", path.display())
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            anyhow::bail!(
+                "projected path is redirected or not a regular file: {}",
+                path.display()
+            );
+        }
+        let mut file = open_projection_file_nofollow(path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|error| anyhow::anyhow!("read projected file {}: {error}", path.display()))?;
+        if file.metadata()?.len() != metadata.len() || bytes.len() as u64 != metadata.len() {
+            anyhow::bail!("projected file changed while read: {}", path.display());
+        }
+        Ok(bytes)
+    }
+
+    /// Recheck the immutable publication after taking activation locks.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn confirm_published_materialization(
+        &self,
+        dir: &Path,
+        principal: &PrincipalId,
+        manifest: &astrid_capsule_types::manifest::CapsuleManifest,
+        snapshot: &astrid_storage::CapsulePackageSnapshot,
+    ) -> anyhow::Result<()> {
+        let current = self.published_capsule_snapshot(principal, manifest)?;
+        if current.as_ref() != Some(snapshot) {
+            anyhow::bail!(
+                "capsule '{}' changed while activation was in progress",
+                manifest.package.name
+            );
+        }
+        self.verify_published_materialization(dir, principal, manifest, snapshot)
     }
 
     /// Load a capsule into the Kernel from a directory containing a Capsule.toml
@@ -1520,33 +1909,32 @@ impl Kernel {
         let manifest_path = dir.join("Capsule.toml");
         let manifest = astrid_capsule::discovery::load_manifest(&manifest_path)
             .map_err(|e| anyhow::anyhow!(e))?;
-        if !self.verify_registry_materialization(&dir, principal, &manifest)? {
-            if self.principal_store.is_some()
-                && !dir.starts_with(self.workspace_selection.state_dir())
-            {
-                anyhow::bail!(
-                    "capsule '{}' is outside the explicit workspace portal and has no durable registry authority",
-                    manifest.package.name
-                );
-            }
-            self.verify_installed_authority_for_runtime(&dir, &manifest)
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "capsule '{}' exceeds or cannot prove its installed authority: {error:#}",
-                        manifest.package.name
-                    )
-                })?;
-        }
-        self.verify_workspace_component_paths(&dir, &manifest)?;
+        let bound = self.capture_bound_materialization(&dir, principal, &manifest, "load")?;
+        let runtime_dir = bound
+            .as_ref()
+            .map_or_else(|| dir.clone(), |bound| bound.runtime_dir.clone());
+        let manifest = bound
+            .as_ref()
+            .map_or_else(|| manifest, |bound| bound.manifest.clone());
+        let manifest_path = runtime_dir.join("Capsule.toml");
+        self.verify_workspace_component_paths(&runtime_dir, &manifest)?;
         let id = astrid_capsule_types::CapsuleId::from_static(&manifest.package.name);
         let _view_guard = self.lock_capsule_view(principal, &id).await;
         let _load_guard = self.capsule_load_lock.lock().await;
+        if let Some(bound) = bound.as_ref() {
+            self.confirm_published_materialization(
+                &runtime_dir,
+                principal,
+                &manifest,
+                &bound.snapshot,
+            )?;
+        }
         if *principal != PrincipalId::default()
             && self.capabilities.is_principal_retiring(principal).await
         {
             anyhow::bail!("cannot load capsule '{id}' for retiring principal '{principal}'");
         }
-        let wasm_hash = capsule_instance_hash(&manifest, &dir);
+        let wasm_hash = capsule_instance_hash(&manifest, &runtime_dir);
         // `capabilities.uplink` alone remains a principal-scoped daemon/host
         // grant unless the operator explicitly promotes it. A manifest that
         // actually provides an uplink must be operator-approved.
@@ -1558,7 +1946,7 @@ impl Kernel {
                 "system-resident capsule '{id}' cannot host principal-bearing stdio MCP servers"
             );
         }
-        self.verify_workspace_capsule_tree(&dir)?;
+        self.verify_workspace_capsule_tree(&runtime_dir)?;
 
         // Mutable runtimes are authority-scoped. A principal always receives a
         // fresh runtime for its immutable UID; only an explicitly classified
@@ -1602,7 +1990,7 @@ impl Kernel {
         let mut capsule = self
             .build_capsule_runtime(
                 manifest,
-                &dir,
+                &runtime_dir,
                 (!system_runtime).then_some(principal),
                 runtime_id.clone(),
             )
@@ -1788,7 +2176,15 @@ impl Kernel {
         // Hand this capsule its operator-approved local-egress allowlist (if
         // any) so the SSRF airlock can exempt sanctioned loopback/private
         // endpoints for it. Absent entry = empty = no exemptions.
-        .with_local_egress(self.local_egress.get(&capsule_name).cloned().unwrap_or_default())
+        .with_local_egress(
+            self.local_egress
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(|snapshot| snapshot.get(&capsule_name))
+                .cloned()
+                .unwrap_or_default(),
+        )
         // Hand the engine the signed per-action audit sink so sensitive
         // fs/net/process host calls (allowed, failed, OR denied) land on the
         // kernel's durable, hash-chained audit log — not just the
@@ -1821,23 +2217,27 @@ impl Kernel {
                 manifest.package.name
             );
         }
-        if !self.verify_registry_materialization(source_dir, principal, &manifest)? {
-            if self.principal_store.is_some()
-                && !source_dir.starts_with(self.workspace_selection.state_dir())
-            {
-                anyhow::bail!(
-                    "capsule replacement source is outside the explicit workspace portal and has no durable registry authority"
-                );
-            }
-            self.verify_installed_authority_for_runtime(source_dir, &manifest)?;
-        }
-        self.verify_workspace_component_paths(source_dir, &manifest)?;
+        let bound = self.capture_bound_materialization(
+            source_dir,
+            principal,
+            &manifest,
+            "replacement source",
+        )?;
+        let runtime_dir = bound.as_ref().map_or_else(
+            || source_dir.to_path_buf(),
+            |bound| bound.runtime_dir.clone(),
+        );
+        let manifest = bound
+            .as_ref()
+            .map_or_else(|| manifest, |bound| bound.manifest.clone());
+        let manifest_path = runtime_dir.join("Capsule.toml");
+        self.verify_workspace_component_paths(&runtime_dir, &manifest)?;
         if !manifest.mcp_servers.is_empty() {
             anyhow::bail!(
                 "live replacement of stdio MCP capsule '{id}' is not yet atomic; restart the daemon to activate these process changes"
             );
         }
-        let artifact = capsule_instance_hash(&manifest, source_dir);
+        let artifact = capsule_instance_hash(&manifest, &runtime_dir);
         let system_allowed = self.system_capsules.read().await.contains(id.as_str());
         let system_runtime = classify_runtime_residency(&manifest, id, system_allowed)?.is_system();
         if system_runtime && !manifest.mcp_servers.is_empty() {
@@ -1860,6 +2260,14 @@ impl Kernel {
                  running={expected_scope:?}, installed={actual_scope:?}"
             );
         }
+        if let Some(bound) = bound.as_ref() {
+            self.confirm_published_materialization(
+                &runtime_dir,
+                principal,
+                &manifest,
+                &bound.snapshot,
+            )?;
+        }
         let principal_uid = self.runtime_principal_uid(system_runtime, principal, id)?;
         let runtime_id =
             self.capsules
@@ -1869,7 +2277,7 @@ impl Kernel {
         let mut capsule = self
             .build_capsule_runtime(
                 manifest,
-                source_dir,
+                &runtime_dir,
                 (!system_runtime).then_some(principal),
                 runtime_id.clone(),
             )
@@ -2348,13 +2756,22 @@ impl Kernel {
                                         continue;
                                     },
                                 };
-                                if !target.exists()
-                                    && let Err(error) =
-                                        astrid_capsule_install::materialize_capsule_package(
-                                            snapshot.package(),
-                                            &target,
-                                        )
-                                {
+                                let manifest = astrid_capsule_install
+                                    ::read_verified_durable_package_for_owner(
+                                        store, &owner, &id,
+                                    )
+                                    .ok()
+                                    .flatten()
+                                    .map(|package| package.manifest().clone());
+                                let materialized = match manifest {
+                                    Some(manifest) => self.ensure_published_materialization(
+                                        &target, principal, &manifest, &snapshot,
+                                    ),
+                                    None => {
+                                        Err(anyhow::anyhow!("durable capsule package is malformed"))
+                                    },
+                                };
+                                if let Err(error) = materialized {
                                     tracing::warn!(
                                         %principal,
                                         capsule = %id,
@@ -3734,7 +4151,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         compiled_wasm: astrid_capsule::engine::wasm::CompiledWasmCache::default(),
         runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits::default(),
-        local_egress: std::collections::HashMap::new(),
+        local_egress: std::sync::RwLock::new(None),
         system_capsules: RwLock::new(std::collections::HashSet::new()),
         http_limits: astrid_capsule_types::HttpLimits::default(),
         full_reload_in_flight: AtomicBool::new(false),
@@ -5535,6 +5952,27 @@ mod tests {
     use astrid_capsule_types::manifest::CapsuleManifest;
 
     #[tokio::test]
+    async fn boot_local_egress_snapshot_is_write_once() {
+        let (_dir, home) = scratch_home();
+        let kernel = test_kernel_with_home(home).await;
+        let snapshot = std::collections::HashMap::from([(
+            "astrid-capsule-openai-compat".to_string(),
+            vec!["127.0.0.1:1234".to_string()],
+        )]);
+
+        kernel.bind_boot_local_egress(snapshot.clone()).unwrap();
+        assert_eq!(
+            kernel
+                .local_egress
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref(),
+            Some(&snapshot)
+        );
+        assert!(kernel.bind_boot_local_egress(snapshot).is_err());
+    }
+
+    #[tokio::test]
     async fn cli_root_bootstrap_recovers_a_durable_principal_without_its_link() {
         let (_dir, home) = scratch_home();
         seed_default_principal_admin_profile(&home).unwrap();
@@ -7208,6 +7646,7 @@ mod tests {
     async fn with_resources_aborts_when_legacy_profile_migration_fails() {
         let (_dir, home) = scratch_home();
         let resources = injected_kernel_resources(&home);
+        std::fs::create_dir_all(home.etc_dir()).expect("create running config parent");
         let default = astrid_core::PrincipalId::default();
         let legacy_path = home
             .principal_home(&default)
@@ -7236,6 +7675,7 @@ mod tests {
     async fn with_resources_aborts_when_default_key_seeding_fails() {
         let (_dir, home) = scratch_home();
         let resources = injected_kernel_resources(&home);
+        std::fs::create_dir_all(home.keys_dir()).expect("create running keys parent");
         std::fs::create_dir(home.keys_dir().join("default.key"))
             .expect("create deterministic key-write obstacle");
 

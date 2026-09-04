@@ -39,6 +39,7 @@ pub struct VerifiedDurableCapsulePackage {
     manifest: CapsuleManifest,
     manifest_bytes: Vec<u8>,
     archive_files: std::collections::BTreeMap<String, Vec<u8>>,
+    archive_directories: std::collections::BTreeSet<String>,
     metadata: CapsuleMeta,
     metadata_bytes: Vec<u8>,
     authority: InstalledAuthority,
@@ -101,6 +102,18 @@ impl VerifiedDurableCapsulePackage {
         self.archive_files.get(relative).map(Vec::as_slice)
     }
 
+    /// Iterate every verified archive member without exposing internal storage.
+    pub fn archive_entries(&self) -> impl Iterator<Item = (&str, &[u8])> + '_ {
+        self.archive_files
+            .iter()
+            .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+    }
+
+    /// Iterate authenticated archive directory names without exposing storage.
+    pub fn archive_directories(&self) -> impl Iterator<Item = &str> + '_ {
+        self.archive_directories.iter().map(String::as_str)
+    }
+
     /// Return the exact durable metadata bytes.
     #[must_use]
     pub fn metadata_bytes(&self) -> &[u8] {
@@ -148,7 +161,8 @@ pub fn read_verified_durable_package_for_owner(
     let package = snapshot.package();
     let verification = artifact::verify_archive_bytes(&package.archive)
         .with_context(|| format!("verify durable capsule archive {id}"))?;
-    let files = read_archive_files(&package.archive)?;
+    let inventory = read_archive_files(&package.archive)?;
+    let ArchiveInventory { files, directories } = inventory;
     let manifest_bytes = files
         .get("Capsule.toml")
         .cloned()
@@ -178,6 +192,7 @@ pub fn read_verified_durable_package_for_owner(
         manifest,
         manifest_bytes,
         archive_files: files,
+        archive_directories: directories,
         metadata,
         metadata_bytes,
         authority,
@@ -333,12 +348,16 @@ fn verify_package_identity(
     Ok(())
 }
 
-fn read_archive_files(
-    archive_bytes: &[u8],
-) -> anyhow::Result<std::collections::BTreeMap<String, Vec<u8>>> {
+struct ArchiveInventory {
+    files: std::collections::BTreeMap<String, Vec<u8>>,
+    directories: std::collections::BTreeSet<String>,
+}
+
+fn read_archive_files(archive_bytes: &[u8]) -> anyhow::Result<ArchiveInventory> {
     let decoder = flate2::read::GzDecoder::new(Cursor::new(archive_bytes));
     let mut archive = tar::Archive::new(decoder);
     let mut files = std::collections::BTreeMap::new();
+    let mut directories = std::collections::BTreeSet::new();
     for entry in archive.entries().context("read durable capsule archive")? {
         let mut entry = entry.context("read durable capsule archive entry")?;
         let path = entry.path().context("read durable capsule archive path")?;
@@ -352,26 +371,33 @@ fn read_archive_files(
         {
             bail!("durable capsule archive contains unsafe path");
         }
-        if entry.header().entry_type().is_dir() {
-            continue;
-        }
-        if !entry.header().entry_type().is_file() {
+
+        let entry_type = entry.header().entry_type();
+        if !entry_type.is_dir() && !entry_type.is_file() {
             bail!("durable capsule archive contains a link or special file");
         }
+
         let name = path
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("durable capsule archive path is not UTF-8"))?
             .replace('\\', "/");
-        if files.contains_key(&name) {
+        if files.contains_key(&name) || directories.contains(&name) {
             bail!("durable capsule archive contains duplicate path {name}");
         }
+        if entry_type.is_dir() {
+            if !directories.insert(name) {
+                bail!("durable capsule archive contains duplicate directory path");
+            }
+            continue;
+        }
+
         let mut bytes = Vec::new();
         entry
             .read_to_end(&mut bytes)
             .with_context(|| format!("read durable capsule archive file {name}"))?;
         files.insert(name, bytes);
     }
-    Ok(files)
+    Ok(ArchiveInventory { files, directories })
 }
 
 /// Publish one source directory into the target principal's durable registry.

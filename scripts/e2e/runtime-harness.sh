@@ -4,7 +4,7 @@ CORE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT_DIR="$CORE_DIR/scripts/e2e"
 CAPSULES_DIR="${ASTRID_E2E_CAPSULES_DIR:-$CORE_DIR/../capsules}"
 ASTRID_HOME_GENERATED=0; if [[ -n "${ASTRID_E2E_HOME:-}" ]]; then ASTRID_HOME="$ASTRID_E2E_HOME"; else ASTRID_HOME="$(mktemp -d "${TMPDIR:-/tmp}/astrid-runtime-e2e.XXXXXX")"; ASTRID_HOME_GENERATED=1; fi
-ARTIFACTS="$ASTRID_HOME/artifacts"
+ARTIFACTS="$(mktemp -d "${TMPDIR:-/tmp}/astrid-runtime-e2e-artifacts.XXXXXX")"
 REDACTED_UPLOAD="$ARTIFACTS/redacted-upload"
 GATEWAY_HOST="${ASTRID_E2E_GATEWAY_HOST:-127.0.0.1}"
 PYTHON="${PYTHON:-python3}"
@@ -31,19 +31,24 @@ LAST_HTTP_OUT=""
 REDACTION_SENTINELS=()
 . "$SCRIPT_DIR/runtime-process-helpers.sh"
 cleanup() {
-  local status=$?
+  local status=${ASTRID_E2E_CLEANUP_STATUS:-$?}
   trap - EXIT INT TERM
   terminate_pid "$DAEMON_PID"
   terminate_pid "$SECONDARY_DAEMON_PID"
   terminate_pid "$FAKE_PID"
+  if [[ "$status" -ne 0 && -d "$ASTRID_HOME/log" ]]; then mkdir -p "$ARTIFACTS/astrid-log" && cp -a "$ASTRID_HOME/log/." "$ARTIFACTS/astrid-log/" 2>/dev/null || true; fi
+  if [[ "$status" -ne 0 ]]; then
+    stage_redacted_upload || true
+  fi
+  if [[ "$status" -eq 0 && -d "$ARTIFACTS" ]]; then
+    rm -rf "$ARTIFACTS"
+  elif [[ -d "$ARTIFACTS" ]]; then
+    printf 'kept E2E artifacts=%s\n' "$ARTIFACTS"
+  fi
   if [[ -n "$SECONDARY_HOME" && -z "${ASTRID_E2E_KEEP_HOME:-}" && "$status" -eq 0 ]]; then
     rm -rf "$SECONDARY_HOME"
   elif [[ -n "$SECONDARY_HOME" ]]; then
     printf 'kept secondary ASTRID_HOME=%s\n' "$SECONDARY_HOME"
-  fi
-  if [[ "$status" -ne 0 && -d "$ASTRID_HOME/log" ]]; then mkdir -p "$ARTIFACTS/astrid-log" && cp -a "$ASTRID_HOME/log/." "$ARTIFACTS/astrid-log/" 2>/dev/null || true; fi
-  if [[ "$status" -ne 0 ]]; then
-    stage_redacted_upload || true
   fi
   if [[ -n "$POISON_HOME" && -z "${ASTRID_E2E_KEEP_HOME:-}" ]]; then
     rm -rf "$POISON_HOME"
@@ -58,6 +63,16 @@ cleanup() {
   return "$status"
 }
 trap cleanup EXIT INT TERM
+run_forced_failure_staging_regression() {
+  printf 'forced staging regression\n' > "$ARTIFACTS/cli-transcript.log"
+  if ASTRID_E2E_CLEANUP_STATUS=1 cleanup; then
+    return 1
+  fi
+  [[ -f "$REDACTED_UPLOAD/artifacts/cli-transcript.log" ]] || return 1
+  grep -q 'forced staging regression' \
+    "$REDACTED_UPLOAD/artifacts/cli-transcript.log" || return 1
+  printf '==> forced failure staged redacted artifacts successfully\n'
+}
 . "$SCRIPT_DIR/runtime-json-asserts.sh"
 . "$SCRIPT_DIR/runtime-storage-asserts.sh"
 . "$SCRIPT_DIR/runtime-gateway-smoke.sh"
@@ -88,6 +103,7 @@ run_cli() {
   rm -f "$stdout" "$stderr"
   return "$status"
 }
+. "$SCRIPT_DIR/runtime-distro-smoke.sh"
 run_principal_cli() {
   local principal=$1
   local stdout stderr status
@@ -325,6 +341,8 @@ redaction_check() {
 main() {
   export ASTRID_HOME
 
+  run_forced_failure_staging_regression; trap cleanup EXIT INT TERM
+
   note "building Astrid binaries"
   if [[ -z "${ASTRID_E2E_SKIP_BUILD:-}" ]]; then
     cargo build -p astrid --bins
@@ -350,11 +368,13 @@ main() {
   if [[ ! -d "$registry_source" ]]; then
     registry_source="$CAPSULES_DIR/astrid-capsule-registry"
   fi
-  run_cli capsule build "$registry_source" --output "$capsule_dist"
+  local signing_home="$ARTIFACTS/signing-home"
+  mkdir -p "$signing_home"
+  ASTRID_HOME="$signing_home" run_cli capsule build "$registry_source" --output "$capsule_dist"
   local registry_archive="$capsule_dist/astrid-capsule-registry.capsule"
   [[ -f "$registry_archive" ]] || fail "registry .capsule artifact was not built at $registry_archive"
   run_cli_offline_init_smoke "$registry_archive"
-  run_cli_distro_seal_smoke "$registry_archive"
+  run_cli_distro_seal_smoke "$registry_archive" "$ARTIFACTS/runtime-e2e.shuttle"
 
   note "starting fake OpenAI-compatible server"
   local fake_port_file="$ARTIFACTS/fake-openai.port"
@@ -371,6 +391,7 @@ main() {
   local fake_base_url="http://127.0.0.1:$fake_port"
   curl --connect-timeout 2 --max-time 5 -fsS "$fake_base_url/v1/models" >/dev/null
   note "writing gateway and local-egress config"
+  run_cli start
   cat > "$ASTRID_HOME/etc/gateway-http.toml" <<EOF
 enabled = true
 listen = "$GATEWAY_HOST:$GATEWAY_PORT"
@@ -663,6 +684,8 @@ PY
   run_gateway_quota_write_smoke "$user_principal" "$ops_principal" "$user_bearer" "$admin_bearer"
   run_admin_pair_device_cross_principal_smoke "$user_bearer" "$user_principal" \
     "$ops_principal" "$admin_bearer"
+
+  run_shared_model_baseline_smoke "$user_bearer"
 
   note "checking per-principal capsule env isolation"
   status="$(http_status POST /api/capsules/astrid-capsule-openai-compat/env/model "" \

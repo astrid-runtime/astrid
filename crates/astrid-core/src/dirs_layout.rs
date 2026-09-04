@@ -7,20 +7,25 @@ use std::io::Read as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
-
 use super::{AstridHome, LAYOUT_VERSION, LEGACY_LAYOUT_VERSION};
 
+#[path = "dirs_layout_records.rs"]
+mod records;
 #[path = "dirs_layout_retirement.rs"]
 mod retirement;
+use records::{
+    LayoutMigrationReceiptV1, LayoutMigrationRecordV1, LayoutRetirementV1,
+    admit_or_write_canonical, inventory_regular_file, inventory_tree, read_canonical_record,
+    verify_receipt_destination_authority, verify_receipt_destination_is_live_path,
+};
 use retirement::{
     retire_legacy_source_tree as retire_legacy_source_tree_impl,
-    validate_legacy_retirement_candidate, validate_legacy_surrealkv_entry,
+    validate_legacy_retirement_candidate,
 };
 
 const LAYOUT_MIGRATION_INTENT: &str = "layout-v1-to-v2.intent";
 const LAYOUT_MIGRATION_RECEIPT: &str = "layout-v1-to-v2.complete";
+const LAYOUT_MIGRATION_RETIREMENT: &str = "layout-v1-to-v2.retiring";
 const LAYOUT_MIGRATION_SCHEMA: u32 = 1;
 #[cfg(not(target_family = "wasm"))]
 const LAYOUT_MIGRATION_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
@@ -84,47 +89,14 @@ impl LayoutMigrationTarget {
             format!("blake3-derive-key-v1:{}", hasher.finalize().to_hex()),
         )
     }
-}
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct LayoutTreeIdentityV1 {
-    path_encoding: String,
-    physical_path_hex: String,
-    inventory_algorithm: String,
-    inventory_digest: String,
-    entries: u64,
-    bytes: u64,
-}
+    pub(super) fn store_format(&self) -> String {
+        self.store_format.clone()
+    }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct LayoutMigrationMaterialV1 {
-    migration: String,
-    from_layout: String,
-    to_layout: String,
-    source: LayoutTreeIdentityV1,
-    target_path_encoding: String,
-    target_physical_path_hex: String,
-    target_store_format: String,
-    binary_identity: String,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct LayoutMigrationRecordV1 {
-    schema: u32,
-    transaction_id: String,
-    material: LayoutMigrationMaterialV1,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct LayoutMigrationReceiptV1 {
-    schema: u32,
-    transaction_id: String,
-    intent: LayoutMigrationRecordV1,
-    destination: LayoutTreeIdentityV1,
+    pub(super) fn binary_identity(&self) -> String {
+        self.binary_identity.clone()
+    }
 }
 
 impl AstridHome {
@@ -134,19 +106,25 @@ impl AstridHome {
         self.var_dir().join("principal-store")
     }
 
-    /// Hosted Astrid volume; bare metal implements the same path-free contract.
+    /// Canonical Astrid-owned durable media.
     #[must_use]
     pub fn storage_volume_path(&self) -> PathBuf {
-        self.root().join("volume")
+        self.root().join("astrid.volume")
     }
 
-    /// Released pre-root-volume path accepted only during one-time promotion.
+    /// Released pre-root-volume paths accepted only during one-time promotion.
     ///
     /// New stores never use this path. Storage opening moves a regular file
     /// found here to [`Self::storage_volume_path`] before serving the home.
     #[must_use]
     pub fn legacy_storage_volume_path(&self) -> PathBuf {
         self.var_dir().join("astrid.volume")
+    }
+
+    /// Older hosted-volume path accepted only as a migration input.
+    #[must_use]
+    pub fn retired_root_storage_volume_path(&self) -> PathBuf {
+        self.root().join("volume")
     }
 
     /// Path to the canonical layout-version sentinel (`etc/layout-version`).
@@ -193,6 +171,7 @@ impl AstridHome {
         for path in [
             self.storage_volume_path(),
             self.legacy_storage_volume_path(),
+            self.retired_root_storage_volume_path(),
         ] {
             if std::fs::symlink_metadata(&path).is_ok() {
                 inventory_regular_file(&path)?;
@@ -253,6 +232,16 @@ impl AstridHome {
             false,
         )?;
         self.ensure_layout_v2_dirs()?;
+        let retirement = LayoutRetirementV1 {
+            schema: LAYOUT_MIGRATION_SCHEMA,
+            transaction_id: intent.transaction_id.clone(),
+            source: inventory_tree(&self.state_db_path())?,
+        };
+        admit_or_write_canonical(
+            &self.migrations_dir().join(LAYOUT_MIGRATION_RETIREMENT),
+            &retirement,
+            true,
+        )?;
         let receipt = LayoutMigrationReceiptV1 {
             schema: LAYOUT_MIGRATION_SCHEMA,
             transaction_id: intent.transaction_id.clone(),
@@ -358,8 +347,18 @@ impl AstridHome {
 
         let receipt: LayoutMigrationReceiptV1 = read_canonical_record(&receipt_path)?;
         let intent: LayoutMigrationRecordV1 = read_canonical_record(&intent_path)?;
+        let retirement_path = self.migrations_dir().join(LAYOUT_MIGRATION_RETIREMENT);
+        let retirement: Option<LayoutRetirementV1> = match read_canonical_record(&retirement_path) {
+            Ok(retirement) => Some(retirement),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
         if receipt.schema != LAYOUT_MIGRATION_SCHEMA
             || receipt.transaction_id != intent.transaction_id
+            || retirement.as_ref().is_some_and(|retirement| {
+                retirement.schema != LAYOUT_MIGRATION_SCHEMA
+                    || retirement.transaction_id != intent.transaction_id
+            })
             || receipt.intent != intent
             || !intent.has_recomputable_identity()
             || receipt.destination.physical_path_hex != intent.material.target_physical_path_hex
@@ -372,37 +371,35 @@ impl AstridHome {
                 ),
             ));
         }
+        verify_receipt_destination_authority(&receipt.destination)?;
 
         match std::fs::symlink_metadata(self.state_db_path()) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
             Ok(_) => {
-                // The destination identity proves that a still-present legacy
-                // source is retired only against the exact cutover result.
-                // Once that source is gone, the volume is live mutable state;
-                // comparing it with the historical receipt would reject every
-                // legitimate post-migration write on the next startup.
-                let destination = inventory_regular_file(&self.storage_volume_path())?;
-                if receipt.destination != destination {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "layout migration receipt does not match its destination: {}",
-                            receipt_path.display()
-                        ),
-                    ));
-                }
                 let source = inventory_tree(&self.state_db_path())?;
-                if source != receipt.intent.material.source {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "surviving legacy state differs from the verified migration source: {}",
-                            self.state_db_path().display()
-                        ),
-                    ));
+                let expected = retirement.map_or_else(
+                    || receipt.intent.material.source.clone(),
+                    |retirement| retirement.source,
+                );
+                if source == expected {
+                    // The volume is live mutable state. An exact surviving
+                    // retirement source proves this is the receipt's
+                    // interrupted retirement; post-cutover volume writes are
+                    // legitimate.
+                    retire_legacy_source_tree(&self.state_db_path())
+                } else {
+                    // A clean stop packs the live volume, so its cutover byte
+                    // identity is intentionally gone. Bind this restart to the
+                    // receipt's canonical destination path and its regular,
+                    // no-follow filesystem authority instead; the receipt itself
+                    // is restored only from the authenticated volume projection.
+                    verify_receipt_destination_is_live_path(
+                        &receipt.destination,
+                        &self.storage_volume_path(),
+                    )?;
+                    retire_legacy_source_tree(&self.state_db_path())
                 }
-                retire_legacy_source_tree(&self.state_db_path())
             },
         }
     }
@@ -410,34 +407,6 @@ impl AstridHome {
     fn ensure_private_dir(path: &Path) -> io::Result<()> {
         crate::platform_fs::ensure_private_directory(path)
     }
-}
-
-fn read_canonical_record<T>(path: &Path) -> io::Result<T>
-where
-    T: DeserializeOwned + PartialEq + Serialize,
-{
-    let actual = std::fs::read(path)?;
-    let parsed: T = serde_json::from_slice(&actual).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "invalid layout migration record {}: {error}",
-                path.display()
-            ),
-        )
-    })?;
-    let mut expected = serde_json::to_vec(&parsed).map_err(io::Error::other)?;
-    expected.push(b'\n');
-    if actual != expected {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "layout migration record is not canonical: {}",
-                path.display()
-            ),
-        ));
-    }
-    Ok(parsed)
 }
 
 fn verify_existing_ancestor(path: &Path) -> io::Result<()> {
@@ -478,84 +447,6 @@ fn path_entry_present(path: &Path) -> io::Result<bool> {
     }
 }
 
-impl LayoutMigrationRecordV1 {
-    fn has_recomputable_identity(&self) -> bool {
-        self.schema == LAYOUT_MIGRATION_SCHEMA
-            && self.transaction_id == layout_transaction_id(&self.material).unwrap_or_default()
-            && self.material.migration == "astrid-home-layout"
-            && self.material.from_layout == LEGACY_LAYOUT_VERSION
-            && self.material.to_layout == LAYOUT_VERSION
-            && self.material.source.path_encoding == "os-str-encoded-bytes-v1"
-            && self.material.source.inventory_algorithm == "blake3-derive-key-v1"
-            && self.material.target_path_encoding == "os-str-encoded-bytes-v1"
-    }
-
-    fn capture(home: &AstridHome, target: &LayoutMigrationTarget) -> io::Result<Self> {
-        let material = LayoutMigrationMaterialV1 {
-            migration: "astrid-home-layout".to_owned(),
-            from_layout: LEGACY_LAYOUT_VERSION.to_owned(),
-            to_layout: LAYOUT_VERSION.to_owned(),
-            source: inventory_tree(&home.state_db_path())?,
-            target_path_encoding: "os-str-encoded-bytes-v1".to_owned(),
-            target_physical_path_hex: physical_path_hex(&home.storage_volume_path())?,
-            target_store_format: target.store_format.clone(),
-            binary_identity: target.binary_identity.clone(),
-        };
-        Ok(Self {
-            schema: LAYOUT_MIGRATION_SCHEMA,
-            transaction_id: layout_transaction_id(&material)?,
-            material,
-        })
-    }
-}
-
-fn layout_transaction_id(material: &LayoutMigrationMaterialV1) -> io::Result<String> {
-    let material_bytes = serde_json::to_vec(material).map_err(io::Error::other)?;
-    Ok(hex::encode(blake3::derive_key(
-        "astrid home layout migration transaction v1",
-        &material_bytes,
-    )))
-}
-
-fn admit_or_write_canonical<T>(path: &Path, expected: &T, allow_create: bool) -> io::Result<()>
-where
-    T: DeserializeOwned + PartialEq + Serialize,
-{
-    let mut expected_bytes = serde_json::to_vec(expected).map_err(io::Error::other)?;
-    expected_bytes.push(b'\n');
-    match std::fs::read(path) {
-        Ok(actual) => {
-            let parsed: T = serde_json::from_slice(&actual).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "invalid layout migration record {}: {error}",
-                        path.display()
-                    ),
-                )
-            })?;
-            if parsed != *expected || actual != expected_bytes {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "layout migration record does not match this transaction: {}",
-                        path.display()
-                    ),
-                ));
-            }
-            Ok(())
-        },
-        Err(error) if error.kind() == io::ErrorKind::NotFound && allow_create => {
-            atomic_write(path, &expected_bytes)
-        },
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("layout migration intent is missing: {}", path.display()),
-        )),
-        Err(error) => Err(error),
-    }
-}
-
 #[cfg(windows)]
 fn reject_automatic_windows_layout_one() -> io::Result<()> {
     Err(io::Error::new(
@@ -571,211 +462,6 @@ fn reject_automatic_windows_layout_one() -> io::Result<()> {
 )]
 fn reject_automatic_windows_layout_one() -> io::Result<()> {
     Ok(())
-}
-
-fn inventory_tree(path: &Path) -> io::Result<LayoutTreeIdentityV1> {
-    let mut hasher = blake3::Hasher::new_derive_key("astrid layout source inventory v1");
-    let mut entries = 0_u64;
-    let mut bytes = 0_u64;
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            hasher.update(b"absent");
-        },
-        Err(error) => return Err(error),
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "layout migration source is redirected or not a directory: {}",
-                    path.display()
-                ),
-            ));
-        },
-        Ok(_) => {
-            crate::platform_fs::verify_no_redirects(path)?;
-            inventory_directory(path, path, &mut hasher, &mut entries, &mut bytes)?;
-        },
-    }
-    Ok(LayoutTreeIdentityV1 {
-        path_encoding: "os-str-encoded-bytes-v1".to_owned(),
-        physical_path_hex: physical_path_hex(path)?,
-        inventory_algorithm: "blake3-derive-key-v1".to_owned(),
-        inventory_digest: hasher.finalize().to_hex().to_string(),
-        entries,
-        bytes,
-    })
-}
-
-fn inventory_regular_file(path: &Path) -> io::Result<LayoutTreeIdentityV1> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "layout migration destination is redirected or not a regular file: {}",
-                path.display()
-            ),
-        ));
-    }
-    crate::platform_fs::verify_no_redirects(path)?;
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-
-        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let mut file = options.open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "layout migration destination changed type: {}",
-                path.display()
-            ),
-        ));
-    }
-    let mut hasher = blake3::Hasher::new_derive_key("astrid layout destination inventory v1");
-    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
-    let mut bytes = 0_u64;
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        bytes = bytes
-            .checked_add(read as u64)
-            .ok_or_else(|| io::Error::other("layout destination length overflow"))?;
-        hasher.update(&buffer[..read]);
-    }
-    if bytes != metadata.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "layout migration destination changed while inventoried: {}",
-                path.display()
-            ),
-        ));
-    }
-    Ok(LayoutTreeIdentityV1 {
-        path_encoding: "os-str-encoded-bytes-v1".to_owned(),
-        physical_path_hex: physical_path_hex(path)?,
-        inventory_algorithm: "blake3-derive-key-v1".to_owned(),
-        inventory_digest: hasher.finalize().to_hex().to_string(),
-        entries: 1,
-        bytes,
-    })
-}
-
-fn inventory_directory(
-    root: &Path,
-    directory: &Path,
-    hasher: &mut blake3::Hasher,
-    entries: &mut u64,
-    bytes: &mut u64,
-) -> io::Result<()> {
-    let mut children = std::fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
-    children.sort_by_key(std::fs::DirEntry::file_name);
-    for child in children {
-        let child_path = child.path();
-        let relative = child_path.strip_prefix(root).map_err(io::Error::other)?;
-        let relative_bytes = relative.as_os_str().as_encoded_bytes();
-        let metadata = std::fs::symlink_metadata(&child_path)?;
-        if metadata.file_type().is_symlink() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "layout migration source contains a redirect: {}",
-                    child_path.display()
-                ),
-            ));
-        }
-        validate_legacy_surrealkv_entry(relative, metadata.is_dir(), metadata.is_file())?;
-        *entries = entries
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("layout inventory entry count overflow"))?;
-        hash_inventory_field(hasher, b"path", relative_bytes);
-        if metadata.is_dir() {
-            hasher.update(b"directory");
-            inventory_directory(root, &child_path, hasher, entries, bytes)?;
-        } else if metadata.is_file() {
-            hasher.update(b"file");
-            hasher.update(&metadata.len().to_le_bytes());
-            let mut options = OpenOptions::new();
-            options.read(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt as _;
-
-                options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
-            }
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::OpenOptionsExt as _;
-                use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-
-                options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-            }
-            let mut file = options.open(&child_path)?;
-            if !file.metadata()?.is_file() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "layout migration source changed type: {}",
-                        child_path.display()
-                    ),
-                ));
-            }
-            let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
-            let mut file_bytes = 0_u64;
-            loop {
-                let read = file.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                *bytes = bytes
-                    .checked_add(read as u64)
-                    .ok_or_else(|| io::Error::other("layout inventory byte count overflow"))?;
-                file_bytes = file_bytes
-                    .checked_add(read as u64)
-                    .ok_or_else(|| io::Error::other("layout inventory file length overflow"))?;
-                hasher.update(&buffer[..read]);
-            }
-            if file_bytes != metadata.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "layout migration source changed while inventoried: {}",
-                        child_path.display()
-                    ),
-                ));
-            }
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "layout migration source contains a special file: {}",
-                    child_path.display()
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn hash_inventory_field(hasher: &mut blake3::Hasher, label: &[u8], value: &[u8]) {
-    hasher.update(&(label.len() as u64).to_le_bytes());
-    hasher.update(label);
-    hasher.update(&(value.len() as u64).to_le_bytes());
-    hasher.update(value);
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -807,21 +493,6 @@ fn ensure_migration_capacity(_target: &Path, _source_bytes: u64) -> io::Result<(
         io::ErrorKind::Unsupported,
         "layout migration capacity probing is unavailable in a WebAssembly guest",
     ))
-}
-
-fn physical_path_hex(path: &Path) -> io::Result<String> {
-    let absolute = if path.exists() {
-        std::fs::canonicalize(path)?
-    } else {
-        let parent = path
-            .parent()
-            .ok_or_else(|| io::Error::other("layout path has no parent"))?;
-        let name = path
-            .file_name()
-            .ok_or_else(|| io::Error::other("layout path has no name"))?;
-        std::fs::canonicalize(parent)?.join(name)
-    };
-    Ok(hex::encode(absolute.as_os_str().as_encoded_bytes()))
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {

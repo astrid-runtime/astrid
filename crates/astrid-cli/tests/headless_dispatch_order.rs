@@ -9,6 +9,7 @@ fn headless_auto_approve_is_rejected_before_the_update_notice() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
+    std::fs::create_dir_all(home.var_dir()).unwrap();
     std::fs::write(
         home.var_dir().join("update-check.json"),
         format!(
@@ -44,6 +45,7 @@ fn nested_run_auto_approve_is_rejected_before_the_update_notice() {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
+        std::fs::create_dir_all(home.var_dir()).unwrap();
         std::fs::write(
             home.var_dir().join("update-check.json"),
             format!(

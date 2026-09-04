@@ -265,6 +265,7 @@ async fn token_only_peer_is_anonymous_and_can_round_trip() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = AstridHome::from_path(temp.path().join("home"));
     home.ensure().expect("create Astrid home");
+    std::fs::create_dir_all(home.run_dir()).expect("create ephemeral runtime directory");
     let token = Arc::new(SessionToken::generate());
     token
         .write_to_file(&home.token_path())
@@ -361,6 +362,7 @@ async fn stalled_handshake_does_not_block_later_clients() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = AstridHome::from_path(temp.path().join("home"));
     home.ensure().expect("create Astrid home");
+    std::fs::create_dir_all(home.run_dir()).expect("create ephemeral runtime directory");
     let token = Arc::new(SessionToken::generate());
     token
         .write_to_file(&home.token_path())
@@ -410,6 +412,7 @@ async fn established_connections_release_handshake_capacity() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = AstridHome::from_path(temp.path().join("home"));
     home.ensure().expect("create Astrid home");
+    std::fs::create_dir_all(home.run_dir()).expect("create ephemeral runtime directory");
     let token = Arc::new(SessionToken::generate());
     token
         .write_to_file(&home.token_path())

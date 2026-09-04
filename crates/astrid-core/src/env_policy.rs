@@ -15,6 +15,7 @@ const BLOCKED_SPAWN_ENV: &[&str] = &[
     "HOME",
     "PATH",
     "ASTRID_HOME",
+    "ASTRID_RUN_DIR",
     // Library injection (Linux)
     "LD_PRELOAD",
     "LD_LIBRARY_PATH",
@@ -104,6 +105,7 @@ mod tests {
         assert!(is_blocked_spawn_env("HOME"));
         assert!(is_blocked_spawn_env("PATH"));
         assert!(is_blocked_spawn_env("ASTRID_HOME"));
+        assert!(is_blocked_spawn_env("ASTRID_RUN_DIR"));
         assert!(is_blocked_spawn_env("OPENSSL_CONF"));
         assert!(is_blocked_spawn_env("HTTP_PROXY"));
         assert!(is_blocked_spawn_env("HTTPS_PROXY"));

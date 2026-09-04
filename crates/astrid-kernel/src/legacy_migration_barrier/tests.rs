@@ -52,18 +52,14 @@ fn origin_is_captured_before_fresh_home_ensure() {
     let origin = capture_layout_origin(&home).expect("fresh origin");
     assert_eq!(origin, LayoutOrigin::Fresh);
     home.ensure().expect("initialize fresh home");
-    assert_eq!(
-        home.layout_version().expect("layout version").as_deref(),
-        Some("2")
-    );
-    // The origin remains Fresh even though ensure has now written v2. The
-    // native composition root carries this captured value through boot so it
-    // can write the explicit fresh-layout ledger instead of treating the home
-    // as a failed upgrade.
+    assert_eq!(home.layout_version().expect("layout version"), None);
+    // A fresh home stays sentinel-free through ensure. The captured value
+    // lets the native composition root write the explicit fresh-layout ledger
+    // instead of treating the home as a failed upgrade.
     assert_eq!(origin, LayoutOrigin::Fresh);
     assert_eq!(
-        capture_layout_origin(&home).expect("v2 origin"),
-        LayoutOrigin::ExistingV2
+        capture_layout_origin(&home).expect("fresh origin"),
+        LayoutOrigin::Fresh
     );
 }
 
@@ -486,6 +482,7 @@ async fn post_barrier_retirement_resumes_after_crash_and_rejects_reappeared_cow(
     make_private_dir(root.path());
     let home = AstridHome::from_path(root.path());
     home.ensure().expect("fresh home");
+    fs::create_dir_all(home.migrations_dir()).expect("migrations");
     let quota: std::sync::Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
         std::sync::Arc::new(|_: &astrid_storage::StateOwner| Ok(None));
     let store = astrid_storage::open_runtime_principal_store(&home, quota)
@@ -506,7 +503,6 @@ async fn post_barrier_retirement_resumes_after_crash_and_rejects_reappeared_cow(
     )
     .expect("ledger");
 
-    assert!(home.principal_store_path().is_dir());
     retire_post_barrier_sources(&home, &store).expect("first retirement");
     assert!(!home.principal_store_path().exists());
     assert!(!home.cow_dir().exists());

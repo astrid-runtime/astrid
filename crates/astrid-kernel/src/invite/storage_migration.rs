@@ -212,6 +212,7 @@ mod tests {
         let home = AstridHome::from_path(dir.path());
         home.ensure().unwrap();
         let path = InviteStore::path_for(&home);
+        std::fs::create_dir_all(home.etc_dir()).unwrap();
         let outside = dir.path().join("outside.toml");
         private_write(&outside, "schema_version = 1\n");
         std::os::unix::fs::symlink(&outside, &path).unwrap();

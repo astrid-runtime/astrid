@@ -258,6 +258,7 @@ mod tests {
         home.ensure().unwrap();
         let wasm = b"\0asm\x01\0\0\0kernel-admit".to_vec();
         let hash = blake3::hash(&wasm).to_hex().to_string();
+        fs::create_dir_all(home.bin_dir()).unwrap();
         let wasm_path = home.bin_dir().join(format!("{hash}.wasm"));
         fs::write(&wasm_path, &wasm).unwrap();
         let metadata_path = home.root().join("run/capsules/example/meta.json");
@@ -320,15 +321,6 @@ mod tests {
         for expected in [
             "etc/layout-version",
             "var/content-staging/intents.v1.log",
-            "var/principal-store/migration.complete",
-            "var/principal-store/objects.arena",
-            "var/principal-store/objects.index",
-            "var/principal-store/representations/CURRENT",
-            "var/principal-store/representations/generations/0000000000000001/metadata.arena",
-            "var/principal-store/representations/generations/0000000000000001/state.journal",
-            "var/principal-store/roots.journal",
-            "var/principal-store/store.lock",
-            "var/principal-store/store.meta",
             RECEIPT_RELATIVE_PATH,
         ] {
             assert!(
@@ -347,6 +339,7 @@ mod tests {
         home.ensure().unwrap();
         let wasm = b"\0asm\x01\0\0\0mutation-check".to_vec();
         let hash = blake3::hash(&wasm).to_hex().to_string();
+        fs::create_dir_all(home.bin_dir()).unwrap();
         let wasm_path = home.bin_dir().join(format!("{hash}.wasm"));
         fs::write(&wasm_path, &wasm).unwrap();
         let receipt_path = home.migrations_dir().join(RECEIPT_NAME);

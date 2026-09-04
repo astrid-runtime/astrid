@@ -7,14 +7,27 @@
 //! that verification succeeds, records a content-bound receipt, and then
 //! removes the retired source.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::engine::{
-    DurableEngine, DurableEnginePolicy, GroupCommitPolicy, IdentityScheme, ObjectCacheConfig,
-    ObjectCacheStats, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits,
-    RecoveryRetryPolicy,
+pub use crate::PrincipalDirectory;
+use crate::capsule_registry::CapsuleRegistry;
+use crate::content::{
+    ContentBatchWriteOutcome, ContentWriteOutcome, PrincipalContentStore, ProjectionNamePolicy,
+    plan_projection_names,
 };
+use crate::engine::{
+    DurableEngine, IdentityScheme, ObjectCacheStats, PersistentObjectIdentity, PrincipalCodec,
+};
+#[cfg(test)]
+use crate::engine::{ObjectCacheConfig, RecoveryLimits};
+use crate::error::{StorageError, StorageResult};
+#[cfg(test)]
+use crate::identity::{IdentityStore, KvIdentityStore};
+#[cfg(test)]
+use crate::kv::KvQuotaResolver;
+#[cfg(all(test, feature = "legacy-surrealkv"))]
+use crate::kv::SurrealKvStore;
+use crate::kv::{KvPrincipalResolver, KvStore, ScopedKvStore, TreeKvStore};
 use crate::storage_model::{
     ObjectClass, ObjectId, ObjectIdentity, ObjectRecord, PhysicalIdentity, ReferenceKind,
 };
@@ -23,41 +36,38 @@ use astrid_core::dirs::AstridHome;
 use astrid_core::identity::PrincipalUid;
 use astrid_core::kernel_api::{ProjectionNameDiagnostic, ProjectionNamePolicyPreset};
 use astrid_core::principal::PrincipalId;
-use parking_lot::Mutex;
-
-pub use crate::PrincipalDirectory;
-use crate::capsule_registry::CapsuleRegistry;
-use crate::content::{
-    CatalogValidation, ContentBatchWriteOutcome, ContentWriteOutcome, PrincipalContentStore,
-    ProjectionNamePolicy, plan_projection_names,
-};
-use crate::error::{StorageError, StorageResult};
-use crate::identity::{IdentityStore, KvIdentityStore};
-#[cfg(all(test, feature = "legacy-surrealkv"))]
-use crate::kv::SurrealKvStore;
-use crate::kv::{
-    KvPrincipalResolver, KvQuotaResolver, KvReadCacheConfig, KvStore, ScopedKvStore, TreeKvStore,
-};
-use std::num::NonZeroUsize;
 
 mod bootstrap;
 #[cfg(test)]
 mod compaction_tests;
+#[cfg(test)]
+mod content_staging_tests;
 mod contiguous_ingest;
 mod format_amendment;
 #[cfg(test)]
 mod format_amendment_tests;
 #[cfg(test)]
+mod format_identity_tests;
+#[cfg(test)]
 mod format_migration_tests;
+#[cfg(test)]
+mod hosted_volume_tests;
 mod migrations;
 mod native_io;
+#[cfg(test)]
+mod native_kv_scale_probe_tests;
 mod owner_migration;
 #[cfg(test)]
 mod projection_name_tests;
 #[cfg(all(test, feature = "legacy-surrealkv"))]
 mod release_fixture_tests;
+#[cfg(test)]
+mod runtime_tests;
 mod runtime_tree;
 mod staging;
+mod store_open;
+#[cfg(test)]
+mod store_open_volume_tests;
 mod volume_migration;
 
 /// Durable runtime format admitted before layout version two can commit.
@@ -70,15 +80,21 @@ use format_amendment::{
     DestinationFormat, PRE_DERIVATION_FORMAT_SPEC_ID, STORE_FORMAT_SPEC, legacy_store_metadata,
     object_id_hex, persist_format_specification,
 };
+#[cfg(test)]
 use format_amendment::{
-    PRE_DENSE_RADIX_FORMAT_SPEC_ID, STORE_METADATA_FILE, prepare_catalog_specification,
-    prepare_destination, prepare_format_specification, representation_bootstrap_objects,
-    store_metadata,
+    STORE_METADATA_FILE, prepare_catalog_specification, prepare_destination,
+    prepare_format_specification, store_metadata,
 };
 use native_io::atomic_write;
 pub use runtime_tree::RuntimeTreeEntry;
 pub use staging::{
     NativeContentStagingArea, ReadyStagedContent, StagedContentId, StagedContentWriter,
+};
+pub use store_open::open_runtime_principal_store_for_pack;
+pub use store_open::{
+    open_runtime_kv, open_runtime_kv_with_directory, open_runtime_principal_store,
+    open_runtime_principal_store_with_directory, open_runtime_principal_store_with_object_cache,
+    open_runtime_principal_store_with_policy,
 };
 
 /// Explicit owner of one durable state root.
@@ -517,6 +533,16 @@ impl RuntimePrincipalStore {
         runtime_tree::admit(self, runtime_root.as_ref())
     }
 
+    /// Pack running projection changes and retire every durable host sidecar.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if the running projection cannot be admitted,
+    /// flushed, or retired without following a redirect.
+    pub fn pack_and_retire_runtime_projection(&self, home: &AstridHome) -> StorageResult<()> {
+        runtime_tree::pack_and_retire_projection(home, self)
+    }
+
     /// Scan the native runtime tree without reading file payloads.
     ///
     /// The scan uses the exact exclusions and path validation applied by
@@ -653,297 +679,7 @@ impl RuntimePrincipalStore {
     }
 }
 
-/// Open every native projection over the authoritative principal store.
-///
-/// KV and named content share one object arena, principal-root CAS, and live
-/// quota resolver. The caller must already hold the kernel singleton lock.
-///
-/// # Errors
-///
-/// Returns a storage error if policy, metadata, migration, verification, or
-/// durable recovery fails.
-pub async fn open_runtime_principal_store(
-    home: &AstridHome,
-    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
-) -> StorageResult<RuntimePrincipalStore> {
-    open_runtime_principal_store_with_options(
-        home,
-        quota,
-        PrincipalDirectory::default(),
-        DurableEnginePolicy::default(),
-    )
-    .await
-}
-
-/// Open every native projection with an externally shared principal
-/// directory.
-///
-/// Native kernel composition uses this form so namespace resolution,
-/// identity lifecycle, and UID-to-alias quota policy share one mapping.
-///
-/// # Errors
-///
-/// Returns a storage error if policy, metadata, migration, verification, or
-/// durable recovery fails.
-pub async fn open_runtime_principal_store_with_directory(
-    home: &AstridHome,
-    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
-    principals: PrincipalDirectory,
-) -> StorageResult<RuntimePrincipalStore> {
-    open_runtime_principal_store_with_options(
-        home,
-        quota,
-        principals,
-        DurableEnginePolicy::default(),
-    )
-    .await
-}
-
-/// Open every native projection with an explicitly governed decoded-object
-/// cache.
-///
-/// The injected policy owns total and per-principal resident budgets. Cache
-/// misses, disabled policy, and eviction always fall back to verified arena
-/// reads.
-///
-/// # Errors
-///
-/// Returns the same errors as [`open_runtime_principal_store`].
-pub async fn open_runtime_principal_store_with_object_cache(
-    home: &AstridHome,
-    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
-    object_cache: ObjectCacheConfig<StateOwner>,
-) -> StorageResult<RuntimePrincipalStore> {
-    open_runtime_principal_store_with_options(
-        home,
-        quota,
-        PrincipalDirectory::default(),
-        DurableEnginePolicy::new(
-            GroupCommitPolicy::default(),
-            RecoveryRetryPolicy::default(),
-            object_cache,
-        ),
-    )
-    .await
-}
-
-/// Open every native projection with one complete operator-owned engine policy.
-///
-/// The policy controls durability batching, bounded in-process recovery, and
-/// disposable decoded-object memory. It does not alter the persistent format
-/// or principal quota semantics.
-///
-/// # Errors
-///
-/// Returns the same errors as [`open_runtime_principal_store`].
-pub async fn open_runtime_principal_store_with_policy(
-    home: &AstridHome,
-    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
-    principals: PrincipalDirectory,
-    policy: DurableEnginePolicy<StateOwner>,
-) -> StorageResult<RuntimePrincipalStore> {
-    open_runtime_principal_store_with_options(home, quota, principals, policy).await
-}
-
-async fn open_runtime_principal_store_with_options(
-    home: &AstridHome,
-    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
-    principals: PrincipalDirectory,
-    policy: DurableEnginePolicy<StateOwner>,
-) -> StorageResult<RuntimePrincipalStore> {
-    if volume_migration::existing_volume_available(home)? {
-        let (engine, receipt) =
-            volume_migration::open_existing(home, policy)?.ok_or_else(|| {
-                StorageError::Connection("Astrid volume disappeared while opening".to_owned())
-            })?;
-        return assemble_runtime_store(home, quota, principals, Arc::new(engine), receipt).await;
-    }
-    let store_path = home.principal_store_path();
-    let open_path = store_path.clone();
-    let format_spec = bootstrap::format_specification()?;
-    let format_spec_id = Blake3ObjectIdentityV1.identify(&format_spec);
-    let catalog_spec = bootstrap::content_catalog_format_specification()?;
-    let catalog_spec_id = Blake3ObjectIdentityV1.identify(&catalog_spec);
-    let metadata = store_metadata(format_spec_id, catalog_spec_id);
-    owner_migration::apply_if_required(home, &principals, &format_spec, &catalog_spec, &metadata)
-        .await?;
-    let metadata_for_open = metadata.clone();
-    let opened = tokio::task::spawn_blocking(move || {
-        let destination_format =
-            prepare_destination(&open_path, &metadata_for_open, catalog_spec_id)?;
-        let metadata_current = destination_format.metadata_is_current();
-        let engine = RuntimeEngine::open_with_policy(
-            &open_path,
-            Blake3ObjectIdentityV1,
-            StateOwnerCodecV2,
-            RecoveryLimits::process_addressable(),
-            DurableEnginePolicy::default(),
-        )
-        .map_err(|error| {
-            StorageError::Connection(format!("open durable principal store: {error}"))
-        })?;
-        prepare_format_specification(&engine, destination_format, &format_spec, format_spec_id)?;
-        prepare_catalog_specification(&engine, destination_format, &catalog_spec, catalog_spec_id)?;
-        let bootstrap_objects = representation_bootstrap_objects(format_spec_id, catalog_spec_id);
-        engine
-            .ensure_direct_representation_catalogue_compatible_with(
-                format_spec_id,
-                &[PRE_DENSE_RADIX_FORMAT_SPEC_ID],
-                &bootstrap_objects,
-            )
-            .map_err(|error| {
-                StorageError::Connection(format!(
-                    "activate direct representation catalogue: {error}"
-                ))
-            })?;
-        Ok((engine, metadata_current))
-    })
-    .await
-    .map_err(|error| {
-        StorageError::Connection(format!(
-            "durable principal-store open worker failed: {error}"
-        ))
-    })??;
-    let (engine, metadata_current) = opened;
-    let engine = Arc::new(engine);
-    let validated_catalogs = Arc::new(Mutex::new(BTreeMap::<StateOwner, CatalogValidation>::new()));
-
-    migrations::apply_required(home, &store_path, &engine, &validated_catalogs, &principals)
-        .await?;
-    if !metadata_current {
-        let metadata_path = store_path.join(STORE_METADATA_FILE);
-        tokio::task::spawn_blocking(move || atomic_write(&metadata_path, &metadata))
-            .await
-            .map_err(|error| {
-                StorageError::Connection(format!(
-                    "principal-store metadata migration worker failed: {error}"
-                ))
-            })??;
-    }
-
-    let (engine, receipt) = volume_migration::migrate_directory_store(home, engine, policy)?;
-    assemble_runtime_store(home, quota, principals, Arc::new(engine), receipt).await
-}
-
-async fn assemble_runtime_store(
-    home: &AstridHome,
-    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
-    principals: PrincipalDirectory,
-    engine: Arc<RuntimeEngine>,
-    directory_cutover_receipt: String,
-) -> StorageResult<RuntimePrincipalStore> {
-    let format_spec = bootstrap::format_specification()?;
-    let format_spec_id = engine.identify(&format_spec);
-    let catalog_spec = bootstrap::content_catalog_format_specification()?;
-    let catalog_spec_id = engine.identify(&catalog_spec);
-    let bootstrap_objects = representation_bootstrap_objects(format_spec_id, catalog_spec_id);
-    let catalogue_engine = Arc::clone(&engine);
-    tokio::task::spawn_blocking(move || {
-        catalogue_engine.ensure_direct_representation_catalogue_compatible_with(
-            format_spec_id,
-            &[PRE_DENSE_RADIX_FORMAT_SPEC_ID],
-            &bootstrap_objects,
-        )
-    })
-    .await
-    .map_err(|error| {
-        StorageError::Connection(format!(
-            "volume representation-catalogue worker failed: {error}"
-        ))
-    })?
-    .map_err(|error| {
-        StorageError::Connection(format!("activate volume representation catalogue: {error}"))
-    })?;
-    let validated_catalogs = Arc::new(Mutex::new(BTreeMap::<StateOwner, CatalogValidation>::new()));
-    let validated_kv = Arc::new(crate::kv::KvValidationCache::default());
-
-    let runtime_kv = Arc::new(
-        RuntimeStore::from_engine_with_quota_and_content_validation(
-            Arc::clone(&engine),
-            StateOwnerResolver::new(principals.clone()),
-            Arc::clone(&quota),
-            Arc::clone(&validated_kv),
-            Arc::clone(&validated_catalogs),
-        )
-        .with_read_cache(KvReadCacheConfig::bounded(
-            NonZeroUsize::new(256 * 1024 * 1024).expect("256 MiB"),
-            NonZeroUsize::new(64 * 1024 * 1024).expect("64 MiB"),
-            NonZeroUsize::new(4_096).expect("owner limit"),
-            NonZeroUsize::new(65_536).expect("entries per owner"),
-        )),
-    );
-    let kv: Arc<dyn KvStore> = runtime_kv.clone();
-    KvIdentityStore::with_principal_directory(
-        ScopedKvStore::new(Arc::clone(&kv), "system:identity")?,
-        principals.clone(),
-    )
-    .load_principal_directory()
-    .await
-    .map_err(|error| {
-        StorageError::Connection(format!(
-            "load principal identities before serving durable namespaces: {error}"
-        ))
-    })?;
-    let content = Arc::new(
-        NativePrincipalContentStore::from_engine_with_quota_and_validation(
-            Arc::clone(&engine),
-            quota,
-            validated_catalogs,
-            validated_kv,
-        ),
-    );
-    let staging = Arc::new(NativeContentStagingArea::open(home.content_staging_path())?);
-    Ok(RuntimePrincipalStore {
-        engine,
-        directory_cutover_receipt: Arc::from(directory_cutover_receipt),
-        runtime_kv,
-        kv,
-        content,
-        staging,
-        principals,
-    })
-}
-
-/// Open the native kernel's authoritative KV store.
-///
-/// The caller must already hold the kernel singleton lock. On first cutover,
-/// legacy state is imported and independently verified before the completion
-/// marker is made durable. A partial prior destination is quarantined rather
-/// than trusted or deleted.
-///
-/// # Errors
-///
-/// Returns a storage error if policy, metadata, migration, verification, or
-/// durable recovery fails.
-pub async fn open_runtime_kv(
-    home: &AstridHome,
-    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
-) -> StorageResult<Arc<dyn KvStore>> {
-    open_runtime_principal_store(home, quota)
-        .await
-        .map(|store| store.kv())
-}
-
-/// Open the native kernel KV projection with an externally shared principal
-/// directory.
-///
-/// # Errors
-///
-/// Returns a storage error if policy, metadata, migration, verification, or
-/// durable recovery fails.
-pub async fn open_runtime_kv_with_directory(
-    home: &AstridHome,
-    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
-    principals: PrincipalDirectory,
-) -> StorageResult<Arc<dyn KvStore>> {
-    open_runtime_principal_store_with_directory(home, quota, principals)
-        .await
-        .map(|store| store.kv())
-}
-
 #[cfg(test)]
 mod purge_tests;
-#[cfg(test)]
-mod runtime_tests;
 #[cfg(test)]
 mod volume_migration_tests;

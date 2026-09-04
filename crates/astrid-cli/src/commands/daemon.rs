@@ -12,8 +12,10 @@ use crate::commands::daemon_control;
 use crate::formatter::OutputFormat;
 use crate::{socket_client, theme};
 
+mod projection;
 mod ready;
 mod workspace_fingerprint;
+use projection::pack_stopped_projection;
 pub(crate) use ready::disown_if_still_running;
 use ready::{
     DAEMON_READY_POLL, ReadyWaitOutcome, configured_spawn_timeout_secs, default_daemon_ready_secs,
@@ -459,6 +461,15 @@ pub(crate) async fn acquire_daemon_start_fence() -> Result<Arc<std::fs::File>> {
     Ok(Arc::new(file))
 }
 
+/// Admit a disposable runtime override before lifecycle code can resolve or
+/// mutate any path under it.
+pub(crate) fn validate_runtime_admission() -> Result<()> {
+    let home = astrid_core::dirs::AstridHome::resolve()
+        .context("failed to resolve Astrid home for runtime admission")?;
+    home.validate_run_dir()
+        .context("failed to validate ASTRID_RUN_DIR")
+}
+
 /// Keep the start fence outside the home until the kernel admits its layout.
 fn daemon_start_fence_path(home: &astrid_core::dirs::AstridHome) -> std::path::PathBuf {
     let digest = blake3::hash(home.root().to_string_lossy().as_bytes());
@@ -489,6 +500,7 @@ fn daemon_start_fence_path(home: &astrid_core::dirs::AstridHome) -> std::path::P
 /// This never removes a live daemon's socket or signals a live process — the
 /// only mutation happens when the recorded daemon is provably gone.
 pub(crate) async fn handle_start() -> Result<()> {
+    validate_runtime_admission()?;
     let start_fence = acquire_daemon_start_fence().await?;
     let result = handle_start_locked().await;
     drop(start_fence);
@@ -553,6 +565,7 @@ async fn handle_start_locked() -> Result<()> {
 
 /// Handle `astrid status`.
 pub(crate) async fn handle_status(output_format: OutputFormat) -> Result<()> {
+    validate_runtime_admission()?;
     let socket_path = socket_client::proxy_socket_path();
     let endpoint_present = astrid_core::local_transport::endpoint_is_present(&socket_path)
         .context("failed to inspect daemon endpoint")
@@ -651,14 +664,21 @@ fn status_response(response: KernelResponse) -> Result<DaemonStatus> {
 /// `astrid start`/`restart` still see the recorded PID and give an actionable
 /// message instead of failing on the held lock with a raw DB error.
 pub(crate) async fn handle_stop() -> Result<()> {
+    validate_runtime_admission()?;
     // A pre-lease gateway may legitimately hold the start fence while it boots
     // its daemon. Stop the gateway first so stop can reap it; then the fence
     // linearizes the daemon phase against any other start/restart.
     let gateway = crate::commands::mcp::stop_gateway().await;
     let start_fence = acquire_daemon_start_fence().await?;
     let daemon = stop_daemon().await;
+    let projection = if daemon.is_ok() {
+        pack_stopped_projection().await
+    } else {
+        Ok(())
+    };
     drop(start_fence);
     let disposition = combine_stop_results(gateway, daemon)?;
+    projection?;
     print_stop_disposition(disposition);
     Ok(())
 }
@@ -670,6 +690,12 @@ pub(crate) async fn handle_gateway_stop() -> Result<()> {
 /// Stop only the daemon while the caller already owns the start fence.
 pub(crate) async fn handle_daemon_stop_locked() -> Result<()> {
     let result = stop_daemon().await;
+    let projection = if result.is_ok() {
+        pack_stopped_projection().await
+    } else {
+        Ok(())
+    };
+    projection?;
     print_stop_disposition(result?);
     Ok(())
 }
@@ -835,11 +861,18 @@ async fn cleanup_daemon_runtime_for_home(
 ) -> Result<()> {
     // An idempotent stop on a never-initialized home must not create the Astrid
     // layout merely to prove that its absent runtime is absent.
-    if !home
+    let durable_media_present = home
+        .storage_volume_path()
+        .try_exists()
+        .context("shutdown stage durable_media_probe")?;
+    let runtime_present = home
         .run_dir()
         .try_exists()
-        .context("shutdown stage daemon.runtime_probe")?
-    {
+        .context("shutdown stage daemon.runtime_probe")?;
+    if !durable_media_present && !runtime_present {
+        return Ok(());
+    }
+    if !runtime_present {
         return Ok(());
     }
     let lock_path = home.run_dir().join("system.lock");
@@ -906,7 +939,13 @@ async fn cleanup_daemon_runtime_for_home(
             },
         }
     }
-    Ok(())
+    drop(lock);
+    astrid_core::dirs::retire_legacy_source_tree(&home.run_dir()).with_context(|| {
+        format!(
+            "shutdown stage daemon.runtime_cleanup: {}",
+            home.run_dir().display()
+        )
+    })
 }
 
 /// Whether a stop outcome CONFIRMS the daemon is gone — the only condition under
