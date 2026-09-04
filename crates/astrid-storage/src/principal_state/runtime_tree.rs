@@ -15,11 +15,18 @@ use super::{ContiguousFileIngest, RuntimePrincipalStore, StateOwner};
 const VOLUME_PATH_PREFIX: &str = "volume";
 const SOCKET_PATH: &str = "run/system.sock";
 const CANONICAL_VOLUME: &str = "astrid.volume";
+const MIGRATING_VOLUME: &str = "astrid.migrating";
 const LEGACY_VAR_VOLUME: &str = "var/astrid.volume";
 const DIRECTORY_STORE_PREFIX: &str = "var/principal-store";
 const QUARANTINE_PREFIX: &str = "quarantine/principal-store";
 const TRANSIENT_PREFIX: &str = "run";
 const RUNTIME_KEY_PROJECTION: &str = "keys/runtime.key";
+const TRANSACTION_STAGING_PATHS: &[&str] = &[
+    "etc/.layout-version.next",
+    "var/migrations/.layout-v1-to-v2.intent.next",
+    "var/migrations/.layout-v1-to-v2.retiring.next",
+    "var/migrations/.layout-v1-to-v2.complete.next",
+];
 const HOST_EXECUTABLES: &[&str] = &["astrid", "astrid-daemon", "bin/astrid", "bin/astrid-daemon"];
 
 /// One regular file discovered in the native runtime tree.
@@ -216,14 +223,8 @@ fn is_excluded(relative: &str) -> bool {
         || is_path_or_descendant(relative, DIRECTORY_STORE_PREFIX)
         || HOST_EXECUTABLES.contains(&relative)
         || relative == SOCKET_PATH
-        || std::path::Path::new(relative)
-            .extension()
-            .is_some_and(|extension| {
-                matches!(
-                    extension.to_ascii_lowercase().to_str(),
-                    Some("next" | "migrating")
-                )
-            })
+        || relative == MIGRATING_VOLUME
+        || TRANSACTION_STAGING_PATHS.contains(&relative)
 }
 
 /// Replace durable host files with volume-backed running projections.
@@ -611,6 +612,30 @@ mod tests {
     }
 
     #[test]
+    fn excludes_only_named_transaction_paths() {
+        for path in [
+            MIGRATING_VOLUME,
+            "etc/.layout-version.next",
+            "var/migrations/.layout-v1-to-v2.intent.next",
+            "var/migrations/.layout-v1-to-v2.retiring.next",
+            "var/migrations/.layout-v1-to-v2.complete.next",
+        ] {
+            assert!(is_excluded(path), "transaction path was admitted: {path}");
+        }
+
+        for path in [
+            "etc/user.next",
+            "etc/user.migrating",
+            "var/user.next",
+            "var/user.migrating",
+            "astrid.migrating.previous",
+            "etc/.layout-version.next.old",
+        ] {
+            assert!(!is_excluded(path), "ordinary path was excluded: {path}");
+        }
+    }
+
+    #[test]
     fn allows_run_capsule_projections() {
         let normalized = normalize_relative_path("run/capsules/example/component.wasm");
         assert!(!is_excluded(&normalized));
@@ -921,5 +946,54 @@ mod tests {
             .pack_and_retire_runtime_projection(&home)
             .expect("retire restarted projection");
         assert_eq!(std::fs::read_dir(home.root()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn preserves_ordinary_suffix_files_across_clean_stop() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(home_dir.path());
+        let store = open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+
+        let next_path = home.root().join("etc/user.next");
+        let migrating_path = home.root().join("etc/user.migrating");
+        std::fs::create_dir_all(next_path.parent().unwrap()).unwrap();
+        std::fs::write(&next_path, b"queued-by-user").unwrap();
+        std::fs::write(&migrating_path, b"kept-by-user").unwrap();
+
+        drop(store);
+        let store = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+            .await
+            .unwrap();
+        store
+            .pack_and_retire_runtime_projection(&home)
+            .expect("pack ordinary suffix files");
+
+        let stopped = std::fs::read_dir(home.root())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(
+            stopped[0].file_name(),
+            std::ffi::OsStr::new(CANONICAL_VOLUME)
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                stopped[0].metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(store);
+
+        let reopened = open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&next_path).unwrap(), b"queued-by-user");
+        assert_eq!(std::fs::read(&migrating_path).unwrap(), b"kept-by-user");
+        drop(reopened);
     }
 }

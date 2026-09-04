@@ -357,25 +357,6 @@ main() {
 
   require_capsules
 
-  note "building .capsule artifact for lifecycle coverage"
-  local capsule_dist="$ARTIFACTS/capsule-dist"
-  mkdir -p "$capsule_dist"
-  # AOS keeps capsule sources in one Cargo workspace under `capsule-*`, while
-  # the harness's published/runtime IDs remain `astrid-capsule-*`. Prefer the
-  # canonical workspace member for Cargo resolution; historical independent
-  # checkout layouts continue through the legacy path.
-  local registry_source="$CAPSULES_DIR/capsule-registry"
-  if [[ ! -d "$registry_source" ]]; then
-    registry_source="$CAPSULES_DIR/astrid-capsule-registry"
-  fi
-  local signing_home="$ARTIFACTS/signing-home"
-  mkdir -p "$signing_home"
-  ASTRID_HOME="$signing_home" run_cli capsule build "$registry_source" --output "$capsule_dist"
-  local registry_archive="$capsule_dist/astrid-capsule-registry.capsule"
-  [[ -f "$registry_archive" ]] || fail "registry .capsule artifact was not built at $registry_archive"
-  run_cli_offline_init_smoke "$registry_archive"
-  run_cli_distro_seal_smoke "$registry_archive" "$ARTIFACTS/runtime-e2e.shuttle"
-
   note "starting fake OpenAI-compatible server"
   local fake_port_file="$ARTIFACTS/fake-openai.port"
   "$PYTHON" "$SCRIPT_DIR/fake-openai-compat.py" \
@@ -392,6 +373,24 @@ main() {
   curl --connect-timeout 2 --max-time 5 -fsS "$fake_base_url/v1/models" >/dev/null
   note "writing gateway and local-egress config"
   run_cli start
+
+  note "building runtime-signed .capsule artifact for lifecycle coverage"
+  local capsule_dist="$ARTIFACTS/capsule-dist"
+  mkdir -p "$capsule_dist"
+  # AOS keeps capsule sources in one Cargo workspace under `capsule-*`, while
+  # the harness's published/runtime IDs remain `astrid-capsule-*`. Prefer the
+  # canonical workspace member for Cargo resolution; historical independent
+  # checkout layouts continue through the legacy path.
+  local registry_source="$CAPSULES_DIR/capsule-registry"
+  if [[ ! -d "$registry_source" ]]; then
+    registry_source="$CAPSULES_DIR/astrid-capsule-registry"
+  fi
+  run_cli capsule build "$registry_source" --output "$capsule_dist"
+  local registry_archive="$capsule_dist/astrid-capsule-registry.capsule"
+  [[ -f "$registry_archive" ]] || fail "registry .capsule artifact was not built at $registry_archive"
+  run_cli_offline_init_smoke "$registry_archive"
+  run_cli_distro_seal_smoke "$registry_archive" "$ARTIFACTS/runtime-e2e.shuttle"
+
   cat > "$ASTRID_HOME/etc/gateway-http.toml" <<EOF
 enabled = true
 listen = "$GATEWAY_HOST:$GATEWAY_PORT"
