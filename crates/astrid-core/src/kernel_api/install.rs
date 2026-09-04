@@ -2,6 +2,58 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Immutable object generation for one durable installed-capsule package.
+///
+/// Each field is a lowercase BLAKE3 object identifier rendered as 64 hex
+/// characters. Keeping the token purpose-specific prevents callers from
+/// receiving package bytes or the storage map while still allowing a resume
+/// check to bind all three fixed package files to one owner-root snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstalledCapsuleGeneration {
+    /// Object identifier for the canonical archive bytes.
+    pub archive: String,
+    /// Object identifier for the install metadata bytes.
+    pub metadata: String,
+    /// Object identifier for the authority receipt bytes.
+    pub authority: String,
+}
+
+/// Caller-scoped identity of one complete durable capsule installation.
+///
+/// This response deliberately carries only the capsule identifier, its
+/// immutable package generation, the raw archive digest used by the registry,
+/// and (when present) the verified WASM content address. It is not a metadata
+/// or package-byte query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstalledCapsuleIdentity {
+    /// Canonical capsule identifier.
+    pub id: String,
+    /// Immutable package generation captured from one owner-root snapshot.
+    pub generation: InstalledCapsuleGeneration,
+    /// BLAKE3 digest of the canonical archive bytes.
+    pub archive_digest: String,
+    /// Raw lowercase BLAKE3 digest of the verified WASM component, when one
+    /// exists. This is absent for non-WASM capsules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wasm_hash: Option<String>,
+}
+
+/// Crash-safe caller-scoped proof that one capsule installation completed.
+///
+/// The receipt is stored under the authenticated principal's immutable UID;
+/// it deliberately carries no principal selector so it cannot be replayed
+/// across owners. A resume skip requires every field to match the fresh
+/// [`InstalledCapsuleIdentity`](super::KernelResponse) query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapsuleInstallResumeReceipt {
+    /// Canonical capsule identifier used as the control-store key.
+    pub id: String,
+    /// BLAKE3 digest of the canonical archive bytes.
+    pub archive_digest: String,
+    /// Immutable package generation captured by the install.
+    pub generation: InstalledCapsuleGeneration,
+}
+
 /// Host-owned projection selected by an env/secret admin request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum EnvStorageScope {

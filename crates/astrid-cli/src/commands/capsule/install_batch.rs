@@ -30,6 +30,9 @@ pub(crate) struct InstalledCapsuleOutcome {
     pub(crate) id: CapsuleId,
     pub(crate) version: String,
     pub(crate) wasm_hash: Option<String>,
+    /// Whether the durable package already matched and no install request was
+    /// sent. This lets init avoid treating a resume as a newly landed grant.
+    pub(crate) skipped: bool,
 }
 
 #[derive(Debug)]

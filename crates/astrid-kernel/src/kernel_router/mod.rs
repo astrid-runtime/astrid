@@ -7,11 +7,13 @@ mod device_scope;
 /// `astrid-capsule-install` library so the daemon and the CLI reach
 /// disk through the same code path.
 mod install;
+mod installed_identity;
 mod inventory;
 mod projection_names;
 mod rate_limit;
 /// Kernel-response publishing envelope + the long-request keepalive pinger.
 mod response;
+mod resume_receipt;
 mod visibility;
 
 pub(crate) use rate_limit::ManagementRateLimiter;
@@ -22,6 +24,10 @@ pub(crate) use response::{KeepalivePinger, publish_response, workspace_commit_re
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use KernelRequest::{
+    GetCapsuleInstallResumeReceipt as G, GetInstalledCapsuleIdentity as I,
+    PutCapsuleInstallResumeReceipt as P,
+};
 use astrid_audit::{AuditAction, AuditOutcome, AuthorizationProof};
 use astrid_capabilities::{CapabilityCheck, PermissionError};
 use astrid_core::groups::GroupConfig;
@@ -39,6 +45,7 @@ use connection_tracker::register_connection_tracker;
 use connection_tracker::{ConnectionSignal, connection_signal};
 use device_scope::resolve_device_scope;
 use inventory::{durable_package_details, visible_inventory_manifests};
+use resume_receipt::{get as rg, put as rp};
 use visibility::CapsuleVisibility;
 
 #[cfg(test)]
@@ -287,7 +294,6 @@ async fn handle_request(
         &caller,
         device_key_id.as_deref(),
     );
-
     let res = match req {
         KernelRequest::InstallCapsule {
             source,
@@ -317,6 +323,11 @@ async fn handle_request(
             )
             .await
         },
+        KernelRequest::GetInstalledCapsuleIdentity { id } => {
+            installed_identity::handle(kernel, &caller, &id)
+        },
+        G { id } => rg(kernel, &caller, &id).await,
+        P { receipt } => rp(kernel, &caller, receipt).await,
         KernelRequest::ApproveCapability {
             request_id,
             signature: _,
@@ -696,7 +707,8 @@ pub fn required_capability(req: &KernelRequest, scope: AuthorityScope) -> &'stat
         // `resolve_scope` always yields `Self_`; the `_` arm is for exhaustiveness.
         (KernelRequest::PromoteWorkspace { .. }, _) => "self:workspace:promote",
         (KernelRequest::RollbackWorkspace { .. }, _) => "self:workspace:rollback",
-        (KernelRequest::InstallCapsule { .. }, AuthorityScope::Self_) => "self:capsule:install",
+        (KernelRequest::InstallCapsule { .. }, AuthorityScope::Self_)
+        | (I { .. } | G { .. } | P { .. }, _) => "self:capsule:install",
         (KernelRequest::InstallCapsule { .. }, _) => "capsule:install",
         (
             KernelRequest::ListCapsules
@@ -741,6 +753,9 @@ pub fn kernel_request_method(req: &KernelRequest) -> &'static str {
         KernelRequest::PromoteWorkspace { .. } => "PromoteWorkspace",
         KernelRequest::RollbackWorkspace { .. } => "RollbackWorkspace",
         KernelRequest::InstallCapsule { .. } => "InstallCapsule",
+        KernelRequest::GetInstalledCapsuleIdentity { .. } => "GetInstalledCapsuleIdentity",
+        KernelRequest::GetCapsuleInstallResumeReceipt { .. } => "GetCapsuleInstallResumeReceipt",
+        KernelRequest::PutCapsuleInstallResumeReceipt { .. } => "PutCapsuleInstallResumeReceipt",
         KernelRequest::ApproveCapability { .. } => "ApproveCapability",
         KernelRequest::ListCapsules => "ListCapsules",
         KernelRequest::GetCommands => "GetCommands",

@@ -374,14 +374,46 @@ fn control_namespaces_require_admitted_immutable_uids() {
             .unwrap(),
         StateOwner::Principal(uid)
     );
+    for component in ["distro", "capsule-install-resume"] {
+        assert_eq!(
+            resolver
+                .resolve(&format!("principal-uid:{uid}:control:{component}"))
+                .unwrap(),
+            StateOwner::Principal(uid)
+        );
+    }
+    for component in [
+        "capsule-install-resumes",
+        "capsule-install",
+        "capsule-install-resume-x",
+        "x-capsule-install-resume",
+        "distro-x",
+    ] {
+        assert!(
+            resolver
+                .resolve(&format!("principal-uid:{uid}:control:{component}"))
+                .is_err(),
+            "unexpectedly admitted control component {component}"
+        );
+    }
     assert!(matches!(
         resolver.resolve("alice:control:env:runner"),
         Err(StorageError::InvalidKey(message))
             if message.contains("immutable principal-uid")
     ));
+    assert!(
+        resolver
+            .resolve("alice:control:capsule-install-resume")
+            .is_err()
+    );
     let unknown = PrincipalUid::from_bytes([0xa5; 32]);
     assert!(matches!(
         resolver.resolve(&format!("principal-uid:{unknown}:control:env:runner")),
+        Err(StorageError::InvalidKey(message))
+            if message.contains("not an admitted durable identity")
+    ));
+    assert!(matches!(
+        resolver.resolve(&format!("principal-uid:{unknown}:control:capsule-install-resume")),
         Err(StorageError::InvalidKey(message))
             if message.contains("not an admitted durable identity")
     ));

@@ -72,6 +72,7 @@ pub mod manifest_check;
 pub mod meta;
 pub mod paths;
 pub mod principal_introspection;
+pub mod source_digest;
 pub mod storage;
 pub mod wasm;
 pub mod wit;
@@ -132,6 +133,7 @@ pub use paths::{
 pub use principal_introspection::{
     DurableCapsuleIntrospection, list_durable_capsule_packages, read_durable_capsule_package,
 };
+pub use source_digest::archive_digest_for_source;
 pub use storage::{
     LegacyCapsuleAuthorityReceipt, LegacyCapsuleMigrationReport, LegacyEnvSecretImportStatus,
     VerifiedDurableCapsulePackage, canonical_capsule_archive, legacy_capsule_authority_status,

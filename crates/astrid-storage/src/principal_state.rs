@@ -289,10 +289,10 @@ impl KvPrincipalResolver<StateOwner> for StateOwnerResolver {
             if principal == "system" && matches!(control, "audit" | "invites" | "pair-tokens") {
                 return Ok(StateOwner::System);
             }
-            // The fixed distro control projection is principal-owned but has
-            // no capsule suffix. It is kept distinct from env/secret views
-            // so ordinary capsule code cannot address distro provenance.
-            if control == "distro" {
+            // Fixed principal control projections have no capsule suffix. They
+            // remain distinct from env/secret views so ordinary capsule code
+            // cannot address distro provenance or install-resume receipts.
+            if matches!(control, "distro" | "capsule-install-resume") {
                 let uid_text = principal.strip_prefix("principal-uid:").ok_or_else(|| {
                     StorageError::InvalidKey(
                         "principal distro namespace must use immutable principal-uid".to_owned(),

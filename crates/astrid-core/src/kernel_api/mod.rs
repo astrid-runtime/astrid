@@ -16,8 +16,9 @@ mod readiness;
 mod response_types;
 pub use agent::{AgentDeriveKernelRequest, AgentDeriveRequest};
 pub use install::{
-    CapsuleInstallAuthority, CapsuleInstallEnv, CapsuleInstallProvenance, EnvEntry,
-    EnvStorageScope, EnvValueKind,
+    CapsuleInstallAuthority, CapsuleInstallEnv, CapsuleInstallProvenance,
+    CapsuleInstallResumeReceipt, EnvEntry, EnvStorageScope, EnvValueKind,
+    InstalledCapsuleGeneration, InstalledCapsuleIdentity,
 };
 pub use projection_names::{
     PROJECTION_NAME_DIAGNOSTIC_METHOD, PROJECTION_NAME_DIAGNOSTIC_TOPIC,
@@ -73,6 +74,24 @@ pub enum KernelRequest {
         /// kernel's environment limits.
         #[serde(default)]
         env: Vec<CapsuleInstallEnv>,
+    },
+    /// Read the authenticated caller's complete durable package identity.
+    ///
+    /// The kernel resolves the owner from the authenticated request context;
+    /// this request never accepts a principal or target selector.
+    GetInstalledCapsuleIdentity {
+        /// Capsule identifier to inspect.
+        id: String,
+    },
+    /// Read the authenticated caller's durable capsule-install resume receipt.
+    GetCapsuleInstallResumeReceipt {
+        /// Capsule identifier used as the receipt key.
+        id: String,
+    },
+    /// Replace the authenticated caller's durable capsule-install resume receipt.
+    PutCapsuleInstallResumeReceipt {
+        /// Complete receipt to store under its capsule identifier.
+        receipt: CapsuleInstallResumeReceipt,
     },
     /// Request to approve a capability grant (usually following an `ApprovalNeeded` response).
     ApproveCapability {
@@ -156,6 +175,12 @@ pub enum KernelResponse {
     Commands(Vec<CommandInfo>),
     /// Metadata about loaded capsules.
     CapsuleMetadata(Vec<CapsuleMetadataEntry>),
+    /// Caller-scoped identity of one complete durable package, or `None` when
+    /// the identifier is not installed for the authenticated caller.
+    InstalledCapsuleIdentity(Option<InstalledCapsuleIdentity>),
+    /// Caller-scoped durable capsule-install resume receipt, or `None` when absent
+    /// or when the stored bytes are malformed and therefore not completion proof.
+    CapsuleInstallResumeReceipt(Option<CapsuleInstallResumeReceipt>),
     /// The request failed.
     Error(String),
     /// Daemon status information.

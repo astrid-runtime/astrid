@@ -2,7 +2,10 @@
 //! under the 1000-line CI threshold. Included as a `tests` submodule of
 //! `kernel_api`.
 
-use super::{CommandInfo, CommandKind, KernelResponse};
+use super::{
+    CapsuleInstallResumeReceipt, CommandInfo, CommandKind, InstalledCapsuleGeneration,
+    InstalledCapsuleIdentity, KernelRequest, KernelResponse,
+};
 
 #[test]
 fn kernel_response_working_serializes_as_status_working() {
@@ -62,4 +65,68 @@ fn command_info_default_kind_omitted_from_wire() {
     // Default kind is skipped so the wire shape is byte-compatible with
     // pre-field consumers.
     assert!(json.get("kind").is_none());
+}
+
+#[test]
+fn installed_identity_wire_is_purpose_specific_and_roundtrips() {
+    let identity = InstalledCapsuleIdentity {
+        id: "demo".into(),
+        generation: InstalledCapsuleGeneration {
+            archive: "a".repeat(64),
+            metadata: "b".repeat(64),
+            authority: "c".repeat(64),
+        },
+        archive_digest: "d".repeat(64),
+        wasm_hash: Some("e".repeat(64)),
+    };
+    let request = KernelRequest::GetInstalledCapsuleIdentity { id: "demo".into() };
+    let request_json = serde_json::to_value(&request).expect("request wire");
+    assert_eq!(request_json["method"], "GetInstalledCapsuleIdentity");
+    assert_eq!(request_json["params"]["id"], "demo");
+    assert!(request_json["params"].get("principal").is_none());
+
+    let response = KernelResponse::InstalledCapsuleIdentity(Some(identity.clone()));
+    let response_json = serde_json::to_value(&response).expect("response wire");
+    assert_eq!(response_json["status"], "InstalledCapsuleIdentity");
+    assert!(response_json["data"].get("archive").is_none());
+    let decoded: KernelResponse = serde_json::from_value(response_json).expect("response decode");
+    let KernelResponse::InstalledCapsuleIdentity(Some(decoded)) = decoded else {
+        panic!("identity response did not roundtrip");
+    };
+    assert_eq!(decoded, identity);
+    assert_eq!(
+        serde_json::to_value(KernelResponse::InstalledCapsuleIdentity(None)).expect("absence"),
+        serde_json::json!({"status":"InstalledCapsuleIdentity","data":null})
+    );
+}
+
+#[test]
+fn resume_receipt_wire_roundtrips_without_principal_selector() {
+    let receipt = CapsuleInstallResumeReceipt {
+        id: "demo".into(),
+        archive_digest: "d".repeat(64),
+        generation: InstalledCapsuleGeneration {
+            archive: "a".repeat(64),
+            metadata: "b".repeat(64),
+            authority: "c".repeat(64),
+        },
+    };
+    let request = KernelRequest::PutCapsuleInstallResumeReceipt {
+        receipt: receipt.clone(),
+    };
+    let request_json = serde_json::to_value(&request).expect("resume request wire");
+    assert_eq!(request_json["method"], "PutCapsuleInstallResumeReceipt");
+    assert_eq!(request_json["params"]["receipt"]["id"], "demo");
+    assert!(request_json["params"].get("principal").is_none());
+    assert!(request_json["params"]["receipt"].get("principal").is_none());
+
+    let response = KernelResponse::CapsuleInstallResumeReceipt(Some(receipt.clone()));
+    let response_json = serde_json::to_value(&response).expect("resume response wire");
+    assert_eq!(response_json["status"], "CapsuleInstallResumeReceipt");
+    assert!(response_json["data"].get("principal").is_none());
+    let decoded: KernelResponse = serde_json::from_value(response_json).expect("response decode");
+    assert!(matches!(
+        decoded,
+        KernelResponse::CapsuleInstallResumeReceipt(Some(found)) if found == receipt
+    ));
 }

@@ -169,6 +169,11 @@ impl KernelClientError {
 pub const fn topic_suffix(req: &KernelRequest) -> &'static str {
     match req {
         KernelRequest::InstallCapsule { .. } => "install_capsule",
+        KernelRequest::GetInstalledCapsuleIdentity { .. } => "installed_capsule_identity",
+        KernelRequest::GetCapsuleInstallResumeReceipt { .. } => "capsule_install_resume_receipt",
+        KernelRequest::PutCapsuleInstallResumeReceipt { .. } => {
+            "put_capsule_install_resume_receipt"
+        },
         KernelRequest::ApproveCapability { .. } => "approve_capability",
         KernelRequest::ListCapsules => "list_capsules",
         KernelRequest::ReloadCapsules => "reload_capsules",
@@ -481,6 +486,28 @@ mod tests {
         assert_eq!(topic_suffix(&KernelRequest::ListCapsules), "list_capsules");
         assert_eq!(topic_suffix(&KernelRequest::GetCommands), "get_commands");
         assert_eq!(topic_suffix(&KernelRequest::GetCapsuleMetadata), "metadata");
+        assert_eq!(
+            topic_suffix(&KernelRequest::GetInstalledCapsuleIdentity { id: "demo".into() }),
+            "installed_capsule_identity"
+        );
+        assert_eq!(
+            topic_suffix(&KernelRequest::GetCapsuleInstallResumeReceipt { id: "demo".into() }),
+            "capsule_install_resume_receipt"
+        );
+        assert_eq!(
+            topic_suffix(&KernelRequest::PutCapsuleInstallResumeReceipt {
+                receipt: astrid_core::kernel_api::CapsuleInstallResumeReceipt {
+                    id: "demo".into(),
+                    archive_digest: "a".repeat(64),
+                    generation: astrid_core::kernel_api::InstalledCapsuleGeneration {
+                        archive: "b".repeat(64),
+                        metadata: "c".repeat(64),
+                        authority: "d".repeat(64),
+                    },
+                },
+            }),
+            "put_capsule_install_resume_receipt"
+        );
         assert_eq!(
             topic_suffix(&KernelRequest::GetAgentReadiness),
             "agent_readiness"

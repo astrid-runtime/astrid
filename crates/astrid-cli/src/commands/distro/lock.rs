@@ -215,6 +215,14 @@ pub(crate) fn is_lock_fresh(
     lock.distro.id == manifest.distro.id
         && lock.distro.version == manifest.distro.version
         && lock.manifest_hash.as_deref() == Some(manifest_hash)
+        && lock.capsules.len() == manifest.capsules.len()
+        && manifest.capsules.iter().all(|declared| {
+            lock.capsules.iter().any(|locked| {
+                locked.name == declared.name
+                    && locked.version == declared.version
+                    && locked.source == declared.source
+            })
+        })
 }
 
 /// Create a new lockfile from resolved capsule data.
@@ -389,10 +397,59 @@ role = "uplink"
         .unwrap();
         let bytes = b"schema-version = 1\n";
         let hash = manifest_hash(bytes);
-        let mut lock = create_lock(&manifest, &hash, Vec::new());
+        let mut lock = create_lock(
+            &manifest,
+            &hash,
+            vec![LockedCapsule {
+                name: "cli".into(),
+                version: "0.1.0".into(),
+                source: "@org/cli".into(),
+                hash: String::new(),
+                resolved_ref: None,
+            }],
+        );
         assert_eq!(lock.manifest_hash.as_deref(), Some(hash.as_str()));
         assert!(is_lock_fresh(&lock, &manifest, &hash));
         lock.manifest_hash = Some("blake3:tampered".into());
+        assert!(!is_lock_fresh(&lock, &manifest, &hash));
+    }
+
+    #[test]
+    fn partial_lock_is_never_fresh_even_when_distro_hash_matches() {
+        let manifest = super::super::manifest::parse_manifest(
+            r#"
+schema-version = 1
+
+[distro]
+id = "test"
+name = "Test"
+version = "0.1.0"
+
+[[capsule]]
+name = "cli"
+source = "@org/cli"
+version = "0.1.0"
+role = "uplink"
+
+[[capsule]]
+name = "worker"
+source = "@org/worker"
+version = "0.1.0"
+"#,
+        )
+        .unwrap();
+        let hash = manifest_hash(b"manifest");
+        let lock = create_lock(
+            &manifest,
+            &hash,
+            vec![LockedCapsule {
+                name: "cli".into(),
+                version: "0.1.0".into(),
+                source: "@org/cli".into(),
+                hash: String::new(),
+                resolved_ref: None,
+            }],
+        );
         assert!(!is_lock_fresh(&lock, &manifest, &hash));
     }
 
