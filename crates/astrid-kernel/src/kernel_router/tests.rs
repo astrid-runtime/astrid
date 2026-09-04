@@ -189,6 +189,26 @@ fn rate_limit_for_request_returns_correct_limits() {
     assert_eq!(name, "GetInstalledCapsuleIdentity");
     assert_eq!(limit, None);
 
+    let (name, limit) = rate_limit_for_request(&KernelRequest::GetCapsuleInstallResumeReceipt {
+        id: "demo".into(),
+    });
+    assert_eq!(name, "GetCapsuleInstallResumeReceipt");
+    assert_eq!(limit, None);
+
+    let (name, limit) = rate_limit_for_request(&KernelRequest::PutCapsuleInstallResumeReceipt {
+        receipt: astrid_core::kernel_api::CapsuleInstallResumeReceipt {
+            id: "demo".into(),
+            archive_digest: "a".repeat(64),
+            generation: astrid_core::kernel_api::InstalledCapsuleGeneration {
+                archive: "b".repeat(64),
+                metadata: "c".repeat(64),
+                authority: "d".repeat(64),
+            },
+        },
+    });
+    assert_eq!(name, "PutCapsuleInstallResumeReceipt");
+    assert_eq!(limit, None);
+
     let (_, shutdown) = rate_limit_for_request(&KernelRequest::Shutdown { reason: None });
     assert_eq!(shutdown, Some(1));
 }
@@ -263,6 +283,30 @@ fn required_capability_mapping_per_variant_self_scope() {
     assert_eq!(
         required_capability(
             &KernelRequest::GetInstalledCapsuleIdentity { id: String::new() },
+            AuthorityScope::Self_,
+        ),
+        "self:capsule:install"
+    );
+    assert_eq!(
+        required_capability(
+            &KernelRequest::GetCapsuleInstallResumeReceipt { id: String::new() },
+            AuthorityScope::Self_,
+        ),
+        "self:capsule:install"
+    );
+    assert_eq!(
+        required_capability(
+            &KernelRequest::PutCapsuleInstallResumeReceipt {
+                receipt: astrid_core::kernel_api::CapsuleInstallResumeReceipt {
+                    id: String::new(),
+                    archive_digest: "a".repeat(64),
+                    generation: astrid_core::kernel_api::InstalledCapsuleGeneration {
+                        archive: "b".repeat(64),
+                        metadata: "c".repeat(64),
+                        authority: "d".repeat(64),
+                    },
+                },
+            },
             AuthorityScope::Self_,
         ),
         "self:capsule:install"

@@ -18,8 +18,8 @@ use astrid_capsule::manifest::CapsuleManifest;
 use astrid_core::PrincipalId;
 use astrid_core::kernel_api::{
     AdminRequestKind, AdminResponseBody, CapsuleInstallAuthority, CapsuleInstallEnv,
-    CapsuleInstallProvenance, EnvStorageScope, EnvValueKind, InstalledCapsuleGeneration,
-    InstalledCapsuleIdentity, KernelRequest, KernelResponse,
+    CapsuleInstallProvenance, CapsuleInstallResumeReceipt, EnvStorageScope, EnvValueKind,
+    InstalledCapsuleGeneration, InstalledCapsuleIdentity, KernelRequest, KernelResponse,
 };
 
 use super::install::ManualInstallOptions;
@@ -129,9 +129,9 @@ pub(crate) async fn install_local_via_daemon_for_target(
 }
 
 /// Install through the daemon after checking the authenticated caller's
-/// durable package identity. The optional generation is test/distro evidence;
-/// production callers accept any well-formed generation returned for the
-/// matching source digest.
+/// durable completion receipt. The optional generation is a test/distro
+/// consistency hint; production derives the expected generation exclusively
+/// from the caller-scoped receipt returned by the kernel.
 pub(crate) async fn install_local_via_daemon_for_target_with_generation(
     source: &str,
     vars: &[String],
@@ -160,20 +160,38 @@ pub(crate) async fn install_local_via_daemon_for_target_with_generation(
         // return its canonical install error.
         if let Ok(source_digest) =
             astrid_capsule_install::archive_digest_for_source(Path::new(source_path))
-            && let Ok(KernelResponse::InstalledCapsuleIdentity(Some(identity))) = client
-                .request(KernelRequest::GetInstalledCapsuleIdentity {
+        {
+            let receipt = match client
+                .request(KernelRequest::GetCapsuleInstallResumeReceipt {
                     id: capsule_id.to_string(),
                 })
                 .await
-            && let Some(outcome) = matching_skip_outcome(
-                &identity,
+            {
+                Ok(KernelResponse::CapsuleInstallResumeReceipt(receipt)) => receipt,
+                _ => None,
+            };
+            let receipt_generation = resume_generation_from_receipt(
+                receipt,
                 &capsule_id,
-                &manifest.package.version,
                 &source_digest,
                 expected_generation.as_ref(),
-            )
-        {
-            return Ok(outcome);
+            );
+            if let Some(receipt_generation) = receipt_generation
+                && let Ok(KernelResponse::InstalledCapsuleIdentity(Some(identity))) = client
+                    .request(KernelRequest::GetInstalledCapsuleIdentity {
+                        id: capsule_id.to_string(),
+                    })
+                    .await
+                && let Some(outcome) = matching_skip_outcome(
+                    &identity,
+                    &capsule_id,
+                    &manifest.package.version,
+                    &source_digest,
+                    Some(&receipt_generation),
+                )
+            {
+                return Ok(outcome);
+            }
         }
     }
     if super::install::BATCH_MODE.load(Ordering::Relaxed) && !reserve_batch_install_request() {
@@ -198,6 +216,12 @@ pub(crate) async fn install_local_via_daemon_for_target_with_generation(
         .await?;
     match response {
         KernelResponse::Success(output) => {
+            // A successful install is completion proof only after the kernel
+            // returns the fresh caller-scoped identity. Receipt persistence is
+            // best effort: a receipt outage must never turn an installed
+            // capsule into a reported failure. Cross-principal installs do not
+            // write a caller-owned receipt for the selected target.
+            persist_resume_receipt(&mut client, &caller, target, &capsule_id).await;
             if !values.is_empty() {
                 let mut admin = crate::admin_client::connect_as_active_agent().await?;
                 apply_values(&mut admin, target, capsule_id.as_str(), &values).await?;
@@ -223,6 +247,58 @@ pub(crate) async fn install_local_via_daemon_for_target_with_generation(
     }
 }
 
+fn resume_generation_from_receipt(
+    receipt: Option<CapsuleInstallResumeReceipt>,
+    expected_id: &CapsuleId,
+    source_digest: &str,
+    expected_generation_hint: Option<&InstalledCapsuleGeneration>,
+) -> Option<InstalledCapsuleGeneration> {
+    let receipt = receipt?;
+    if receipt.id != expected_id.as_str()
+        || !is_digest(source_digest)
+        || receipt.archive_digest != source_digest
+        || !is_generation_well_formed(&receipt.generation)
+        || expected_generation_hint.is_some_and(|hint| hint != &receipt.generation)
+    {
+        return None;
+    }
+    Some(receipt.generation)
+}
+
+async fn persist_resume_receipt(
+    client: &mut astrid_uplink::KernelClient,
+    caller: &PrincipalId,
+    target: &PrincipalId,
+    capsule_id: &CapsuleId,
+) {
+    if caller != target {
+        return;
+    }
+    let Ok(KernelResponse::InstalledCapsuleIdentity(Some(identity))) = client
+        .request(KernelRequest::GetInstalledCapsuleIdentity {
+            id: capsule_id.to_string(),
+        })
+        .await
+    else {
+        return;
+    };
+    if identity.id != capsule_id.as_str()
+        || !is_digest(&identity.archive_digest)
+        || !is_generation_well_formed(&identity.generation)
+    {
+        return;
+    }
+    let _ = client
+        .request(KernelRequest::PutCapsuleInstallResumeReceipt {
+            receipt: CapsuleInstallResumeReceipt {
+                id: identity.id,
+                archive_digest: identity.archive_digest,
+                generation: identity.generation,
+            },
+        })
+        .await;
+}
+
 fn resume_matches(
     identity: &InstalledCapsuleIdentity,
     expected_id: &CapsuleId,
@@ -234,7 +310,7 @@ fn resume_matches(
         && identity.archive_digest == source_digest
         && identity.wasm_hash.as_deref().is_some_and(is_digest)
         && is_generation_well_formed(&identity.generation)
-        && expected_generation.is_none_or(|expected| expected == &identity.generation)
+        && expected_generation.is_some_and(|expected| expected == &identity.generation)
 }
 
 fn matching_skip_outcome(
@@ -450,6 +526,35 @@ mod tests {
     }
 
     #[test]
+    fn matching_receipt_supplies_expected_generation() {
+        let id = CapsuleId::new("example").expect("id");
+        let generation = generation('a');
+        let digest = "b".repeat(64);
+        let receipt = CapsuleInstallResumeReceipt {
+            id: id.to_string(),
+            archive_digest: digest.clone(),
+            generation: generation.clone(),
+        };
+        assert_eq!(
+            resume_generation_from_receipt(Some(receipt), &id, &digest, None),
+            Some(generation)
+        );
+    }
+
+    #[test]
+    fn missing_or_mismatched_receipt_does_not_supply_generation() {
+        let id = CapsuleId::new("example").expect("id");
+        let digest = "b".repeat(64);
+        let receipt = CapsuleInstallResumeReceipt {
+            id: id.to_string(),
+            archive_digest: "c".repeat(64),
+            generation: generation('a'),
+        };
+        assert!(resume_generation_from_receipt(None, &id, &digest, None).is_none());
+        assert!(resume_generation_from_receipt(Some(receipt), &id, &digest, None).is_none());
+    }
+
+    #[test]
     fn matching_skip_carries_canonical_wasm_hash() {
         let id = CapsuleId::new("example").expect("id");
         let generation = generation('a');
@@ -491,6 +596,14 @@ mod tests {
             &digest,
             Some(&generation('c'))
         ));
+    }
+
+    #[test]
+    fn none_expected_generation_does_not_skip() {
+        let id = CapsuleId::new("example").expect("id");
+        let digest = "a".repeat(64);
+        let installed = identity(&digest, generation('b'));
+        assert!(!resume_matches(&installed, &id, &digest, None));
     }
 
     #[test]

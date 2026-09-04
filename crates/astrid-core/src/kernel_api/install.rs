@@ -38,6 +38,22 @@ pub struct InstalledCapsuleIdentity {
     pub wasm_hash: Option<String>,
 }
 
+/// Crash-safe caller-scoped proof that one capsule installation completed.
+///
+/// The receipt is stored under the authenticated principal's immutable UID;
+/// it deliberately carries no principal selector so it cannot be replayed
+/// across owners. A resume skip requires every field to match the fresh
+/// [`InstalledCapsuleIdentity`](super::KernelResponse) query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapsuleInstallResumeReceipt {
+    /// Canonical capsule identifier used as the control-store key.
+    pub id: String,
+    /// BLAKE3 digest of the canonical archive bytes.
+    pub archive_digest: String,
+    /// Immutable package generation captured by the install.
+    pub generation: InstalledCapsuleGeneration,
+}
+
 /// Host-owned projection selected by an env/secret admin request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum EnvStorageScope {
