@@ -7,6 +7,8 @@ NOTARY_PROFILE_NAME=astrid-fskit
 P12_PATH=
 P8_PATH=
 SIGNING_KEYCHAIN=
+KEYCHAIN_PASSWORD=
+NOTARY_MODE=
 RESTORE_KEYCHAINS=()
 
 cleanup() {
@@ -72,6 +74,7 @@ prepare_notary_input() {
       return 1
     }
     export ASTRID_FSKIT_NOTARY_PROFILE="$NOTARY_PROFILE_NAME"
+    NOTARY_MODE=apple-id
   elif [[ -n "$key_id" || -n "$issuer_id" || -n "$key" ]]; then
     [[ -n "$key_id" && -n "$issuer_id" && -n "$key" ]] || {
       echo "ASTRID_MACOS_NOTARY_KEY_ID, ASTRID_MACOS_NOTARY_ISSUER_ID, and ASTRID_MACOS_NOTARY_KEY are required together" >&2
@@ -82,6 +85,7 @@ prepare_notary_input() {
     printf '%s' "$key" >"$P8_PATH"
     chmod 0600 "$P8_PATH"
     export ASTRID_FSKIT_NOTARY_KEY_PATH="$P8_PATH"
+    NOTARY_MODE=api-key
   else
     echo "Apple-ID notary credentials or a complete App Store Connect API key are required" >&2
     return 1
@@ -94,6 +98,7 @@ create_signing_keychain() {
   local original_keychain
 
   keychain_password="$(openssl rand -hex 32)"
+  KEYCHAIN_PASSWORD="$keychain_password"
   keychain_path="$RUNNER_TEMP/astrid-signing-$$.keychain"
   while IFS= read -r original_keychain; do
     [[ -n "$original_keychain" ]] || continue
@@ -112,7 +117,7 @@ import_developer_id() {
     -P "$ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD" \
     -T /usr/bin/codesign
   security set-key-partition-list -S apple-tool:,apple: \
-    -k "$ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD" "$SIGNING_KEYCHAIN" >/dev/null
+    -k "$KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN" >/dev/null
   security find-identity -v -p codesigning "$SIGNING_KEYCHAIN" |
     grep -Eq '[[:space:]]1 valid identit(y|ies)'
   rm -f "$P12_PATH"
@@ -137,6 +142,7 @@ else
 fi
 
 require_team
+export ASTRID_FSKIT_DEVELOPMENT_TEAM="$ASTRID_MACOS_DEVELOPMENT_TEAM_ID"
 require_developer_id
 [[ "$(uname -s)" == Darwin ]] || {
   echo "Developer ID signing requires macOS" >&2
@@ -162,11 +168,16 @@ import_developer_id
 
 if [[ "$MODE" == notary-build ]]; then
   prepare_notary_input
-  xcrun notarytool store-credentials "$NOTARY_PROFILE_NAME" \
-    --keychain "$SIGNING_KEYCHAIN" \
-    --apple-id "$ASTRID_MACOS_NOTARY_APPLE_ID" \
-    --password "$ASTRID_MACOS_NOTARY_APP_PASSWORD" \
-    --team-id "$ASTRID_MACOS_DEVELOPMENT_TEAM_ID" >/dev/null
+  if [[ "$NOTARY_MODE" == apple-id ]]; then
+    xcrun notarytool store-credentials "$NOTARY_PROFILE_NAME" \
+      --keychain "$SIGNING_KEYCHAIN" \
+      --apple-id "$ASTRID_MACOS_NOTARY_APPLE_ID" \
+      --password "$ASTRID_MACOS_NOTARY_APP_PASSWORD" \
+      --team-id "$ASTRID_MACOS_DEVELOPMENT_TEAM_ID" >/dev/null
+  elif [[ "$NOTARY_MODE" != api-key ]]; then
+    echo "notary input did not select Apple-ID or the API-key fallback" >&2
+    exit 1
+  fi
   SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
   "$SCRIPT_ROOT/scripts/build-macos-fskit.sh"
 else

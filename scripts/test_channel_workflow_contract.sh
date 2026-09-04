@@ -123,8 +123,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -417,9 +419,12 @@ for fragment in (
     '[[ "$ASTRID_MACOS_DEVELOPMENT_TEAM_ID" == "$REQUIRED_TEAM_ID" ]] || {',
     '[[ -n "${ASTRID_MACOS_DEVELOPER_ID_P12:-}" ]] || {',
     '[[ -n "${ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD:-}" ]] || {',
+    'export ASTRID_FSKIT_DEVELOPMENT_TEAM="$ASTRID_MACOS_DEVELOPMENT_TEAM_ID"',
     'if [[ -n "$apple_id" || -n "$app_password" ]]; then',
     'export ASTRID_FSKIT_NOTARY_PROFILE="$NOTARY_PROFILE_NAME"',
     "unset ASTRID_FSKIT_NOTARY_PROFILE",
+    "NOTARY_MODE=api-key",
+    "KEYCHAIN_PASSWORD=\"$keychain_password\"",
     'P12_PATH="$RUNNER_TEMP/astrid-developer-id.p12.$$"',
     'P8_PATH="$RUNNER_TEMP/astrid-notary.p8.$$"',
     'chmod 0600 "$P12_PATH"',
@@ -427,6 +432,9 @@ for fragment in (
     "security create-keychain",
     'security import "$P12_PATH"',
     'security delete-keychain "$SIGNING_KEYCHAIN"',
+    '-k "$KEYCHAIN_PASSWORD"',
+    'if [[ "$NOTARY_MODE" == apple-id ]]; then',
+    'elif [[ "$NOTARY_MODE" != api-key ]]; then',
     'rm -f "$P12_PATH"',
     'rm -f "$P8_PATH"',
     "trap cleanup EXIT",
@@ -500,6 +508,170 @@ for case_name, case_env in (
     for sentinel in ("P12-SENTINEL", "PASSWORD-SENTINEL"):
         if sentinel in helper_output:
             fail(f"macOS signing helper leaked {sentinel} while testing {case_name}")
+
+def write_executable(path: Path, body: str) -> None:
+    path.write_text(body, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def behavior_values(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            values[key] = value
+    return values
+
+
+def run_signing_helper(fixture: Path, mode: str) -> subprocess.CompletedProcess[str]:
+    scripts = fixture / "scripts"
+    (scripts / "ci").mkdir(parents=True)
+    (fixture / "runner").mkdir()
+    shutil.copy2(helper_path, scripts / "ci" / "import_macos_signing.sh")
+
+    write_executable(
+        scripts / "build-macos-fskit.sh",
+        """#!/usr/bin/env bash
+set -euo pipefail
+{
+  printf 'team=%s\\n' "${ASTRID_FSKIT_DEVELOPMENT_TEAM-unset}"
+  printf 'profile=%s\\n' "${ASTRID_FSKIT_NOTARY_PROFILE-unset}"
+  if [[ -n "${ASTRID_FSKIT_NOTARY_KEY_PATH:-}" && -f "${ASTRID_FSKIT_NOTARY_KEY_PATH}" ]]; then
+    printf 'key_file=present\\n'
+  else
+    printf 'key_file=%s\\n' "${ASTRID_FSKIT_NOTARY_KEY_PATH-unset}"
+  fi
+} >> "$ASTRID_TEST_FIXTURE/build.log"
+""",
+    )
+
+    tool_bin = fixture / "bin"
+    tool_bin.mkdir()
+    write_executable(
+        tool_bin / "security",
+        """#!/usr/bin/env bash
+set -euo pipefail
+fixture=${ASTRID_TEST_FIXTURE:?set ASTRID_TEST_FIXTURE}
+printf '%s\\n' "$*" >> "$fixture/security-args.log"
+case "$1" in
+  list-keychains)
+    if [[ "${2:-}" == "-d" ]]; then
+      printf '%s\\n' "$fixture/original.keychain"
+    fi
+    ;;
+  set-key-partition-list)
+    [[ "${2:-}" == "-S" && "${4:-}" == "-k" ]] || exit 90
+    printf 'partition-password=%s\\n' "$5" >> "$fixture/behavior.log"
+    ;;
+  find-identity)
+    printf '%s\\n' '  1) ABC123 "Developer ID Application: Astrid (9BDSL5BJAP)"'
+    printf '%s\\n' '  1 valid identities'
+    ;;
+esac
+""",
+    )
+    write_executable(
+        tool_bin / "xcrun",
+        """#!/usr/bin/env bash
+set -euo pipefail
+fixture=${ASTRID_TEST_FIXTURE:?set ASTRID_TEST_FIXTURE}
+printf '%s\\n' "$*" >> "$fixture/xcrun.log"
+[[ "$1" == notarytool ]] || exit 90
+""",
+    )
+    write_executable(
+        tool_bin / "openssl",
+        """#!/usr/bin/env bash
+printf '%s\\n' TEST-KEYCHAIN-PASSWORD
+""",
+    )
+    write_executable(
+        tool_bin / "uname",
+        """#!/usr/bin/env bash
+printf '%s\\n' Darwin
+""",
+    )
+
+    environment = {
+        "PATH": f"{tool_bin}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}",
+        "HOME": os.environ.get("HOME", "/tmp"),
+        "ASTRID_TEST_FIXTURE": str(fixture),
+        "RUNNER_TEMP": str(fixture / "runner"),
+        "ASTRID_MACOS_DEVELOPMENT_TEAM_ID": "9BDSL5BJAP",
+        "ASTRID_MACOS_DEVELOPER_ID_P12": "cDEyLXRlc3QtaW5wdXQ=",
+        "ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD": "P12-FILE-PASSWORD",
+        "ASTRID_FSKIT_NOTARY_PROFILE": "external-profile",
+        "ASTRID_FSKIT_NOTARY_KEY_ID": "",
+        "ASTRID_FSKIT_NOTARY_ISSUER_ID": "",
+        "ASTRID_FSKIT_NOTARY_KEY": "",
+    }
+    if mode == "apple-id":
+        environment.update(
+            {
+                "ASTRID_MACOS_NOTARY_APPLE_ID": "notary-test@example.invalid",
+                "ASTRID_MACOS_NOTARY_APP_PASSWORD": "APP-PASSWORD-TEST",
+            }
+        )
+    elif mode == "api-key":
+        environment.update(
+            {
+                "ASTRID_MACOS_NOTARY_APPLE_ID": "",
+                "ASTRID_MACOS_NOTARY_APP_PASSWORD": "",
+                "ASTRID_FSKIT_NOTARY_KEY_ID": "TEST-KEY-ID",
+                "ASTRID_FSKIT_NOTARY_ISSUER_ID": "TEST-ISSUER-ID",
+                "ASTRID_FSKIT_NOTARY_KEY": "p8-test-input",
+            }
+        )
+    else:
+        fail(f"unknown signing helper test mode {mode}")
+
+    return subprocess.run(
+        [str(scripts / "ci" / "import_macos_signing.sh")],
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+with tempfile.TemporaryDirectory() as temporary_directory:
+    fixture = Path(temporary_directory)
+    apple = run_signing_helper(fixture / "apple-id", "apple-id")
+    if apple.returncode != 0:
+        fail(f"Apple-ID helper execution failed: {apple.stderr.strip()}")
+    apple_build = behavior_values(fixture / "apple-id" / "build.log")
+    if apple_build.get("team") != "9BDSL5BJAP":
+        fail("Apple-ID path did not execute the build with the mapped FSKit team")
+    if apple_build.get("profile") != "astrid-fskit":
+        fail("Apple-ID path did not export the notary keychain profile")
+    apple_xcrun = (fixture / "apple-id" / "xcrun.log").read_text(encoding="utf-8")
+    if "notarytool store-credentials astrid-fskit" not in apple_xcrun:
+        fail("Apple-ID path did not execute notary profile storage")
+    if behavior_values(fixture / "apple-id" / "behavior.log").get(
+        "partition-password"
+    ) != "TEST-KEYCHAIN-PASSWORD":
+        fail("partition list did not receive the generated ephemeral keychain password")
+
+    api = run_signing_helper(fixture / "api-key", "api-key")
+    if api.returncode != 0:
+        fail(f"API-key helper execution failed: {api.stderr.strip()}")
+    api_build = behavior_values(fixture / "api-key" / "build.log")
+    if api_build.get("team") != "9BDSL5BJAP":
+        fail("API-key path did not execute the build with the mapped FSKit team")
+    if api_build.get("profile") != "unset":
+        fail("API-key path leaked or selected the Apple-ID profile")
+    if api_build.get("key_file") != "present":
+        fail("API-key path did not write and pass the .p8 file")
+    xcrun_log = fixture / "api-key" / "xcrun.log"
+    if xcrun_log.exists() and "notarytool store-credentials" in xcrun_log.read_text(
+        encoding="utf-8"
+    ):
+        fail("API-key path executed Apple-ID profile storage")
+    if behavior_values(fixture / "api-key" / "behavior.log").get(
+        "partition-password"
+    ) != "TEST-KEYCHAIN-PASSWORD":
+        fail("API-key partition list did not receive the ephemeral keychain password")
+
 print("macOS Developer ID import and Apple-ID notary profile contract: PASS")
 
 fskit = job_block("fskit-certification")
