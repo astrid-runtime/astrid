@@ -362,12 +362,10 @@ fn append_getrandom_rustflag(
             let config = cargo_config_with_getrandom(&[]);
             cmd.args(["--config", config.as_str()]);
         } else {
-            // A target-specific override shadows `[build].rustflags`, so
-            // carry the effective build flags into the override before adding
-            // the backend cfg. Otherwise the builder silently drops caller
-            // flags for every dependency and the root cdylib alike.
-            let config = cargo_config_with_getrandom(config_flags);
-            cmd.args(["--config", config.as_str()]);
+            // With `build.target`, stable Cargo routes these flags to target
+            // units rather than host units. Encoded rustflags remain the
+            // highest-precedence source for the wasm dependency and cdylib.
+            cmd.env(key, value);
         }
     } else {
         cmd.env(key, value);

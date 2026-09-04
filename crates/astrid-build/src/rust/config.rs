@@ -435,6 +435,13 @@ pub(super) fn resolve_cargo_home(dir: &Path, home: PathBuf) -> PathBuf {
     if home.is_absolute() {
         home
     } else {
+        // `cargo_home_from_env` may receive a relative working directory.
+        // Anchor the result here so Cargo's loader cannot resolve it again.
+        let dir = if dir.is_absolute() {
+            dir.to_path_buf()
+        } else {
+            std::env::current_dir().map_or_else(|_| dir.to_path_buf(), |current| current.join(dir))
+        };
         dir.join(home)
     }
 }

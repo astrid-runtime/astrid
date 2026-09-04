@@ -2,6 +2,7 @@ use super::*;
 use serde_json::json;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[test]
 fn getrandom_injection_is_wasm_only() {
@@ -856,6 +857,42 @@ fn relative_cargo_home_is_resolved_from_child_current_dir() {
     let (target, _) =
         cargo_config_target_and_rustflags_with_home(&capsule, Some(relative_home)).unwrap();
     assert_eq!(target.as_deref(), Some(GETRANDOM_TARGET));
+}
+
+#[test]
+fn relative_cargo_home_env_is_resolved_from_relative_project_dir() {
+    const MODE_ENV: &str = "ASTRID_RELATIVE_CARGO_HOME_TEST";
+    const TEST_NAME: &str = "relative_cargo_home_env_is_resolved_from_relative_project_dir";
+
+    if std::env::var_os(MODE_ENV).is_some() {
+        let (target, _) = cargo_config_target_and_rustflags(Path::new("project")).unwrap();
+        assert_eq!(target.as_deref(), Some(GETRANDOM_TARGET));
+        return;
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let relative_home = Path::new("relative-cargo-home");
+    fs::create_dir_all(root.path().join("project").join(relative_home)).unwrap();
+    fs::write(
+        root.path()
+            .join("project")
+            .join(relative_home)
+            .join("config.toml"),
+        "[build]\ntarget = \"wasm32-unknown-unknown\"\n",
+    )
+    .unwrap();
+
+    // Environment state is process-global, so execute the normal env-backed
+    // loader in a child harness whose working directory is the project parent.
+    let status = Command::new(std::env::current_exe().unwrap())
+        .current_dir(root.path())
+        .env("CARGO_HOME", relative_home)
+        .env(MODE_ENV, "1")
+        .args(["--exact", TEST_NAME, "--nocapture"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(!root.path().join("project/project").exists());
 }
 
 #[test]
