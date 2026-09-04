@@ -1703,6 +1703,19 @@ impl PrepareDerivedBatchContent for FaultedDerivedContent {
     }
 }
 
+struct FixedDerivedContent {
+    name: ContentName,
+}
+
+impl PrepareDerivedBatchContent for FixedDerivedContent {
+    fn prepare(
+        &mut self,
+        _entries: &BTreeMap<ContentName, crate::content::ContentDescriptor>,
+    ) -> Result<(ContentName, Vec<u8>), PrincipalContentError> {
+        Ok((self.name.clone(), b"derived".to_vec()))
+    }
+}
+
 #[test]
 fn faulted_derived_content_commits_neither_input_nor_derivation() {
     let store = PrincipalContentStore::from_engine(Arc::new(Engine::new(TestIdentity)));
@@ -1736,5 +1749,91 @@ fn faulted_derived_content_commits_neither_input_nor_derivation() {
         store.read(&"alice".to_owned(), &receipt).unwrap(),
         None,
         "faulted derivation must not enter the catalog"
+    );
+}
+
+#[test]
+fn derived_name_colliding_with_input_publishes_neither() {
+    let store = PrincipalContentStore::from_engine(Arc::new(Engine::new(TestIdentity)));
+    let name = ContentName::new("colliding").unwrap();
+    store.put(&"alice".to_owned(), &name, b"original").unwrap();
+    let before = store
+        .engine()
+        .current_root(&"alice".to_owned())
+        .unwrap()
+        .expect("initial root");
+
+    let mut derived = FixedDerivedContent { name: name.clone() };
+    let error = store
+        .replace_streaming_batch_removing_exact(
+            &"alice".to_owned(),
+            [ContentIngest::new(
+                name.clone(),
+                Cursor::new(b"updated".as_slice()),
+            )],
+            &[],
+            Some(&mut derived),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        PrincipalContentError::DuplicateBatchName(value) if value == name
+    ));
+    assert_eq!(
+        store.engine().current_root(&"alice".to_owned()).unwrap(),
+        Some(before),
+    );
+    assert_eq!(
+        store.read(&"alice".to_owned(), &name).unwrap(),
+        Some(b"original".to_vec())
+    );
+}
+
+#[test]
+fn derived_name_colliding_with_removal_publishes_neither() {
+    let store = PrincipalContentStore::from_engine(Arc::new(Engine::new(TestIdentity)));
+    let source = ContentName::new("source-input").unwrap();
+    let removed = ContentName::new("removal-target").unwrap();
+    store
+        .put(&"alice".to_owned(), &source, b"source-original")
+        .unwrap();
+    store
+        .put(&"alice".to_owned(), &removed, b"removal-original")
+        .unwrap();
+    let before = store
+        .engine()
+        .current_root(&"alice".to_owned())
+        .unwrap()
+        .expect("initial root");
+
+    let mut derived = FixedDerivedContent {
+        name: removed.clone(),
+    };
+    let error = store
+        .replace_streaming_batch_removing_exact(
+            &"alice".to_owned(),
+            [ContentIngest::new(
+                source.clone(),
+                Cursor::new(b"source-updated".as_slice()),
+            )],
+            std::slice::from_ref(&removed),
+            Some(&mut derived),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        PrincipalContentError::DuplicateBatchName(value) if value == removed
+    ));
+    assert_eq!(
+        store.engine().current_root(&"alice".to_owned()).unwrap(),
+        Some(before),
+    );
+    assert_eq!(
+        store.read(&"alice".to_owned(), &source).unwrap(),
+        Some(b"source-original".to_vec())
+    );
+    assert_eq!(
+        store.read(&"alice".to_owned(), &removed).unwrap(),
+        Some(b"removal-original".to_vec())
     );
 }

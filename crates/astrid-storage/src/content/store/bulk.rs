@@ -723,8 +723,11 @@ where
         deferred_records: Option<&BTreeMap<ObjectId, ObjectRecord>>,
         publication: BatchPublicationContext<'_>,
     ) -> Result<ContentBatchWriteOutcome, PrincipalContentError> {
-        let (publication_completed, derived_records) =
-            self.prepare_derived_batch(source_completed, publication.derived)?;
+        let (publication_completed, derived_records) = self.prepare_derived_batch(
+            source_completed,
+            publication.removals,
+            publication.derived,
+        )?;
         let completed = &publication_completed;
         loop {
             let mut header = self.header(principal)?.as_ref().clone();
@@ -833,6 +836,7 @@ where
     fn prepare_derived_batch(
         &self,
         source_completed: &BTreeMap<ContentName, PreparedContent>,
+        removals: &[ContentName],
         derived: Option<&mut dyn PrepareDerivedBatchContent>,
     ) -> Result<PreparedDerivedBatch, PrincipalContentError> {
         let Some(derived) = derived else {
@@ -843,6 +847,9 @@ where
             .map(|(name, prepared)| (name.clone(), prepared.verified.descriptor()))
             .collect::<BTreeMap<_, _>>();
         let (name, bytes) = derived.prepare(&descriptors)?;
+        if source_completed.contains_key(&name) || removals.contains(&name) {
+            return Err(PrincipalContentError::DuplicateBatchName(name));
+        }
         let built = build_content(
             &EngineIdentity::<P, E>::new(self.engine.as_ref()),
             ChunkingProfile::ASTRID_V1,
