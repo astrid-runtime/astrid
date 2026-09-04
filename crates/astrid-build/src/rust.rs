@@ -44,9 +44,9 @@ pub(crate) fn build(dir: &Path, output: Option<&str>) -> Result<()> {
 
     let (meta, crate_name, package_version, wasm_name) = resolve_package_metadata(dir)?;
 
-    compile_wasm(dir)?;
+    let target = compile_wasm(dir)?;
 
-    let wasm_path = locate_wasm_binary(dir, &meta, &wasm_name)?;
+    let wasm_path = locate_wasm_binary(&meta, &target, &wasm_name)?;
     let wasm_path = ensure_component(&wasm_path)?;
 
     let toml_content =
@@ -116,9 +116,50 @@ fn resolve_package_metadata(
 
     let crate_name = package.name.to_string();
     let package_version = package.version.to_string();
-    let wasm_name = crate_name.replace('-', "_");
+    let wasm_name = resolve_wasm_output_name(package, &crate_name)?;
 
     Ok((meta, crate_name, package_version, wasm_name))
+}
+
+/// Resolve the exact WASM file stem Cargo will use for the capsule.
+///
+/// Capsules are packaged from a single cdylib target. Cargo metadata reports
+/// the target's output name, which matters when a manifest gives the library
+/// an explicit name instead of using the package name.
+fn resolve_wasm_output_name(package: &cargo_metadata::Package, fallback: &str) -> Result<String> {
+    resolve_wasm_output_name_from_targets(
+        package
+            .targets
+            .iter()
+            .filter(|target| target.is_cdylib())
+            .map(|target| target.name.clone()),
+        fallback,
+    )
+}
+
+fn resolve_wasm_output_name_from_targets<I>(output_names: I, fallback: &str) -> Result<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let output_names: Vec<String> = output_names.into_iter().collect();
+    match output_names.as_slice() {
+        [] => validate_wasm_output_name(fallback),
+        [output_name] => validate_wasm_output_name(output_name),
+        _ => bail!(
+            "Capsule has {} cdylib targets; refusing to choose an ambiguous WASM artifact",
+            output_names.len()
+        ),
+    }
+}
+
+fn validate_wasm_output_name(output_name: &str) -> Result<String> {
+    let path = Path::new(output_name);
+    let is_single_normal_component =
+        output_name != "." && output_name != ".." && path.file_name() == Some(path.as_os_str());
+    if !is_single_normal_component {
+        bail!("Unsafe WASM artifact name: {output_name}");
+    }
+    Ok(output_name.to_owned())
 }
 
 /// Compile the capsule in release mode using whatever target the
@@ -139,20 +180,20 @@ fn resolve_package_metadata(
 /// canonical build tool, not a replacement: capsules still carry the flag
 /// in config so a plain `cargo build` / `cargo test` (which never runs
 /// through here) keeps linking `uuid` v4 / `HashMap`.
-fn compile_wasm(dir: &Path) -> Result<()> {
+fn compile_wasm(dir: &Path) -> Result<String> {
     info!("   Compiling capsule (release)...");
 
     let (config_target, config_flags) = cargo_config_target_and_rustflags(dir);
     // `CARGO_BUILD_TARGET` (if the caller set it) overrides the config-file
     // target, mirroring Cargo's own precedence.
     let env_target = std::env::var("CARGO_BUILD_TARGET").ok();
-    let target = env_target.as_deref().or(config_target.as_deref());
+    let target = resolve_build_target(config_target, env_target)?;
 
     let mut cmd = std::process::Command::new("cargo");
     cmd.current_dir(dir).args(["build", "--release"]);
 
     if let Some(encoded) = encoded_rustflags_with_getrandom(
-        target,
+        Some(target.as_str()),
         &config_flags,
         std::env::var("CARGO_ENCODED_RUSTFLAGS").ok().as_deref(),
         std::env::var("RUSTFLAGS").ok().as_deref(),
@@ -175,7 +216,18 @@ fn compile_wasm(dir: &Path) -> Result<()> {
             "Cargo build failed. Set `[build] target = \"wasm32-unknown-unknown\"` (Astrid-canonical) or `wasm32-wasip2` in `.cargo/config.toml` and install the matching `rustup target` component."
         );
     }
-    Ok(())
+    Ok(target.clone())
+}
+
+fn resolve_build_target(
+    config_target: Option<String>,
+    env_target: Option<String>,
+) -> Result<String> {
+    env_target.or(config_target).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No Cargo build target selected. Set `[build] target = \"wasm32-unknown-unknown\"` (Astrid-canonical) or `wasm32-wasip2` in `.cargo/config.toml`, or set CARGO_BUILD_TARGET."
+        )
+    })
 }
 
 /// Read the build target and any author-declared `rustflags` from a capsule's
@@ -323,40 +375,77 @@ fn ensure_component(wasm_path: &Path) -> Result<PathBuf> {
     Ok(wasm_path.to_path_buf())
 }
 
-/// Locate the compiled WASM binary in the target directory. We don't
-/// know which target was used (the capsule's `.cargo/config.toml`
-/// decides), so probe the known guest targets in canonical-first order
-/// and accept the first one that exists. The capsule build wrapping
-/// step below treats `wasm32-unknown-unknown` outputs as core wasm
-/// modules that need to be wrapped into a component; `wasm32-wasip2`
-/// outputs are already components.
+/// Locate the compiled WASM binary in Cargo's resolved target directory.
+///
+/// The guest target is known from the same precedence used to invoke Cargo,
+/// and the artifact is the exact package cdylib built for the release
+/// profile. There is deliberately no recursive search or local-target
+/// fallback: probing other roots could select stale artifacts when a
+/// host-wide target root is configured.
 fn locate_wasm_binary(
-    dir: &Path,
     meta: &cargo_metadata::Metadata,
+    target: &str,
     wasm_name: &str,
 ) -> Result<PathBuf> {
-    const TARGETS: &[&str] = &["wasm32-unknown-unknown", "wasm32-wasip2"];
-    let local_target = dir.join("target");
-    let workspace_target = meta
-        .workspace_root
-        .clone()
-        .into_std_path_buf()
-        .join("target");
-    for target in TARGETS {
-        for root in &[&local_target, &workspace_target] {
-            let candidate = root
-                .join(target)
-                .join("release")
-                .join(format!("{wasm_name}.wasm"));
-            if candidate.exists() {
-                return Ok(candidate);
-            }
-        }
+    const PROFILE: &str = "release";
+    let target_root = meta.target_directory.as_std_path();
+    validate_wasm_output_name(wasm_name)?;
+
+    let candidate = target_root
+        .join(target)
+        .join(PROFILE)
+        .join(format!("{wasm_name}.wasm"));
+    let artifact_metadata = match fs::symlink_metadata(&candidate) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
+            "Could not locate compiled WASM binary at `target/{target}/{PROFILE}/{wasm_name}.wasm` under configured target directory {}",
+            target_root.display()
+        ),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to inspect compiled WASM binary {}",
+                    candidate.display()
+                )
+            });
+        },
+    };
+
+    if artifact_metadata.file_type().is_symlink() {
+        bail!("Compiled WASM binary is a symlink: {}", candidate.display());
     }
-    bail!(
-        "Could not locate compiled WASM binary under `target/{{wasm32-unknown-unknown,wasm32-wasip2}}/release/{wasm_name}.wasm` in {} or workspace root",
-        dir.display()
-    );
+    if !artifact_metadata.is_file() {
+        bail!(
+            "Compiled WASM binary is not a regular file: {}",
+            candidate.display()
+        );
+    }
+
+    // A regular artifact beneath a symlinked parent could still resolve
+    // outside the configured root. Canonicalize only for containment; return
+    // Cargo's path so callers retain the authoritative configured location,
+    // including when the target root itself is a legitimate symlink.
+    let resolved_target_root = fs::canonicalize(target_root).with_context(|| {
+        format!(
+            "Failed to resolve target directory {}",
+            target_root.display()
+        )
+    })?;
+    let resolved_candidate = fs::canonicalize(&candidate).with_context(|| {
+        format!(
+            "Failed to resolve compiled WASM binary {}",
+            candidate.display()
+        )
+    })?;
+    if !resolved_candidate.starts_with(&resolved_target_root) {
+        bail!(
+            "Compiled WASM binary {} escapes configured target directory {}",
+            candidate.display(),
+            target_root.display()
+        );
+    }
+
+    Ok(candidate)
 }
 
 /// Merge the developer's `Capsule.toml` with any extracted description.
@@ -570,6 +659,7 @@ fn create_default_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn decode(encoded: &str) -> Vec<String> {
         encoded.split(RUSTFLAGS_SEP).map(str::to_owned).collect()
@@ -727,5 +817,182 @@ mod tests {
         let (target, flags) = cargo_config_target_and_rustflags(dir.path());
         assert_eq!(target, None);
         assert!(flags.is_empty());
+    }
+
+    fn metadata_for(capsule_dir: &Path, target_directory: &Path) -> cargo_metadata::Metadata {
+        serde_json::from_value(json!({
+            "packages": [],
+            "workspace_members": [],
+            "resolve": null,
+            "workspace_root": capsule_dir,
+            "target_directory": target_directory,
+            "version": 15,
+        }))
+        .unwrap()
+    }
+
+    fn create_artifact(
+        target_root: &Path,
+        target: &str,
+        wasm_name: &str,
+    ) -> anyhow::Result<PathBuf> {
+        let artifact = target_root
+            .join(target)
+            .join("release")
+            .join(format!("{wasm_name}.wasm"));
+        fs::create_dir_all(artifact.parent().unwrap())?;
+        fs::write(&artifact, b"\0asm")?;
+        Ok(artifact)
+    }
+
+    #[test]
+    fn locates_exact_artifact_from_external_target_root() {
+        let capsule = tempfile::tempdir().unwrap();
+        let external_root = tempfile::tempdir().unwrap();
+        let expected =
+            create_artifact(external_root.path(), GETRANDOM_TARGET, "capsule_cli").unwrap();
+
+        create_artifact(
+            &capsule.path().join("target"),
+            GETRANDOM_TARGET,
+            "capsule_cli",
+        )
+        .unwrap();
+        create_artifact(
+            &capsule.path().join("workspace-target"),
+            GETRANDOM_TARGET,
+            "capsule_cli",
+        )
+        .unwrap();
+
+        let meta = metadata_for(capsule.path(), external_root.path());
+        let actual = locate_wasm_binary(&meta, GETRANDOM_TARGET, "capsule_cli").unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn selects_exact_cross_target_artifact() {
+        let capsule = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        create_artifact(target_root.path(), GETRANDOM_TARGET, "capsule").unwrap();
+        let expected = create_artifact(target_root.path(), "wasm32-wasip2", "capsule").unwrap();
+
+        let meta = metadata_for(capsule.path(), target_root.path());
+        let actual = locate_wasm_binary(&meta, "wasm32-wasip2", "capsule").unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn environment_target_overrides_capsule_config_target() {
+        let capsule = tempfile::tempdir().unwrap();
+        let cargo_dir = capsule.path().join(".cargo");
+        fs::create_dir_all(&cargo_dir).unwrap();
+        fs::write(
+            cargo_dir.join("config.toml"),
+            "[build]\ntarget = \"wasm32-unknown-unknown\"\n",
+        )
+        .unwrap();
+
+        let target = resolve_build_target(
+            Some("wasm32-unknown-unknown".to_owned()),
+            Some("wasm32-wasip2".to_owned()),
+        )
+        .unwrap();
+
+        assert_eq!(target, "wasm32-wasip2");
+    }
+
+    #[test]
+    fn missing_artifact_is_rejected_without_fallback() {
+        let capsule = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let meta = metadata_for(capsule.path(), target_root.path());
+
+        let error = locate_wasm_binary(&meta, GETRANDOM_TARGET, "missing_capsule").unwrap_err();
+
+        assert!(error.to_string().contains("Could not locate compiled WASM"));
+    }
+
+    #[test]
+    fn directory_artifact_is_rejected() {
+        let capsule = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(
+            target_root
+                .path()
+                .join(GETRANDOM_TARGET)
+                .join("release")
+                .join("capsule.wasm"),
+        )
+        .unwrap();
+        let meta = metadata_for(capsule.path(), target_root.path());
+
+        let error = locate_wasm_binary(&meta, GETRANDOM_TARGET, "capsule").unwrap_err();
+
+        assert!(error.to_string().contains("not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_artifact_is_rejected() {
+        let capsule = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let real_artifact =
+            create_artifact(target_root.path(), GETRANDOM_TARGET, "capsule").unwrap();
+        let release = target_root.path().join(GETRANDOM_TARGET).join("release");
+        let symlink = release.join("symlink.wasm");
+        std::os::unix::fs::symlink(real_artifact, &symlink).unwrap();
+        let meta = metadata_for(capsule.path(), target_root.path());
+
+        let error = locate_wasm_binary(&meta, GETRANDOM_TARGET, "symlink").unwrap_err();
+
+        assert!(error.to_string().contains("is a symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_escaping_target_root_is_rejected() {
+        let capsule = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        create_artifact(outside.path(), GETRANDOM_TARGET, "escaped").unwrap();
+        fs::create_dir_all(target_root.path().join(GETRANDOM_TARGET)).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join(GETRANDOM_TARGET).join("release"),
+            target_root.path().join(GETRANDOM_TARGET).join("release"),
+        )
+        .unwrap();
+        let meta = metadata_for(capsule.path(), target_root.path());
+
+        let error = locate_wasm_binary(&meta, GETRANDOM_TARGET, "escaped").unwrap_err();
+        let error_text = error.to_string();
+        assert!(error_text.contains("escapes configured target directory"));
+    }
+
+    #[test]
+    fn rejects_escaping_artifact_name() {
+        let error = validate_wasm_output_name("../stale.wasm").unwrap_err();
+        assert!(error.to_string().contains("Unsafe WASM artifact name"));
+    }
+
+    #[test]
+    fn uses_explicit_cdylib_output_name() {
+        let output_name =
+            resolve_wasm_output_name_from_targets(["custom_capsule".to_owned()], "package_name")
+                .unwrap();
+        assert_eq!(output_name, "custom_capsule");
+    }
+
+    #[test]
+    fn rejects_ambiguous_cdylib_outputs() {
+        let error = resolve_wasm_output_name_from_targets(
+            ["first".to_owned(), "second".to_owned()],
+            "package_name",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("ambiguous WASM artifact"));
     }
 }
