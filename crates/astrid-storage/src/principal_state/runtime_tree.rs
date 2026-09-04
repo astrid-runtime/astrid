@@ -274,6 +274,10 @@ pub(super) fn restore_projection(
             continue;
         };
         write_projection_file(home.root(), name, &bytes)?;
+        if is_staging_generation(name) {
+            let path = confined_projection_path(home.root(), name)?;
+            super::rebind_staging_generation(&path)?;
+        }
     }
     Ok(())
 }
@@ -578,6 +582,11 @@ fn write_projection_file(root: &Path, relative: &str, bytes: &[u8]) -> StorageRe
     Ok(())
 }
 
+fn is_staging_generation(name: &str) -> bool {
+    name.strip_prefix("var/content-staging/generations/")
+        .is_some_and(|name| name.ends_with(".sealed"))
+}
+
 fn retire_projection(home: &AstridHome) -> StorageResult<()> {
     let root = home.root();
     astrid_core::dirs::retire_projection_root(root)
@@ -769,6 +778,7 @@ fn tree_error(path: &Path, detail: impl std::fmt::Display) -> StorageError {
 pub(super) fn reconcile_running_projection(
     home: &AstridHome,
     store: &RuntimePrincipalStore,
+    allow_receiptless_bootstrap: bool,
 ) -> StorageResult<()> {
     let layout_version = home
         .layout_version()
@@ -782,7 +792,9 @@ pub(super) fn reconcile_running_projection(
     match receipt {
         None => {
             let scanned = scan(home.root())?;
-            if surviving && !is_bootstrap_surviving_projection(&scanned) {
+            if surviving
+                && (!allow_receiptless_bootstrap || !is_bootstrap_surviving_projection(&scanned))
+            {
                 let names = scanned
                     .iter()
                     .map(|entry| entry.name().as_str())
@@ -799,14 +811,14 @@ pub(super) fn reconcile_running_projection(
             // A portable active-volume copy is volume-authoritative. Host
             // bytes are neither admitted nor allowed beyond trusted bootstrap
             // sentinels; the copied receipt is simply rebound to the new root.
-            if receipt.phase() != ReceiptPhase::Active || !surviving {
+            if receipt.phase() != ReceiptPhase::Active {
                 return Err(tree_error(
                     home.root(),
                     "active projection receipt root does not match this durable root",
                 ));
             }
             let scanned = scan(home.root())?;
-            if !is_bootstrap_surviving_projection(&scanned) {
+            if surviving && !is_bootstrap_surviving_projection(&scanned) {
                 return Err(tree_error(
                     home.root(),
                     "relocated active receipt is permitted only for trusted bootstrap files",
@@ -816,10 +828,6 @@ pub(super) fn reconcile_running_projection(
         },
         Some(receipt) => match receipt.phase() {
             ReceiptPhase::Active => {
-                // `AstridHome::ensure` creates bootstrap sentinels before the
-                // volume is opened. Those host files alone are not a live
-                // projection; publishing them would CAS-delete the volume-only
-                // generation before it can be restored.
                 let scanned = scan(home.root())?;
                 if surviving && !is_bootstrap_surviving_projection(&scanned) {
                     publish_active_projection(home, store)?;

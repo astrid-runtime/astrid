@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::sync::Arc;
 
 use serde_json::json;
@@ -6,8 +7,12 @@ use sha2::{Digest as _, Sha256};
 
 use super::*;
 use crate::principal_state::open_runtime_principal_store_for_pack;
+use crate::principal_state::runtime_tests::test_owner;
 use crate::volume::{AstridVolume as _, HostedFileVolume};
-use crate::{AstridFilesystem, FilesystemPath, KvQuotaResolver, open_runtime_principal_store};
+use crate::{
+    AstridFilesystem, ChunkingProfile, FilesystemPath, KvQuotaResolver, ReadyStagedContent,
+    open_runtime_principal_store,
+};
 use astrid_core::dirs::AstridHome;
 
 fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
@@ -1418,4 +1423,155 @@ async fn pack_open_staging_journal_socket_sentinel_fails_closed() {
         "{message}"
     );
     assert!(intent.symlink_metadata().unwrap().file_type().is_socket());
+}
+
+async fn assert_existing_volume_bootstrap_fails_closed(relative: &str, host_bytes: &[u8]) {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let active_name = ContentName::new(ACTIVE_PROJECTION_NAME).unwrap();
+    assert!(
+        running
+            .content()
+            .delete(&StateOwner::System, &active_name)
+            .unwrap()
+    );
+    running.content().flush().unwrap();
+    drop(running);
+    std::fs::remove_dir_all(home.content_staging_path()).unwrap();
+
+    let path = home.root().join(relative);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, host_bytes).unwrap();
+    let Err(error) = open_runtime_principal_store(&home, unlimited_quota()).await else {
+        panic!("receipt-less bootstrap on an existing volume must fail closed");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("active projection receipt is missing"),
+        "{error}"
+    );
+
+    let inspector = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    assert!(
+        inspector
+            .content()
+            .describe(&StateOwner::System, &active_name)
+            .unwrap()
+            .is_none(),
+        "failed reopen must not mint ACTIVE"
+    );
+    let name = ContentName::new(relative).unwrap();
+    assert_ne!(
+        inspector
+            .content()
+            .read(&StateOwner::System, &name)
+            .unwrap(),
+        Some(host_bytes.to_vec()),
+        "host bootstrap bytes acquired volume authority"
+    );
+}
+
+#[tokio::test]
+async fn existing_volume_receiptless_bootstrap_sentinels_fail_closed() {
+    assert_existing_volume_bootstrap_fails_closed("etc/layout-version", b"rogue-layout").await;
+    assert_existing_volume_bootstrap_fails_closed("keys/runtime.key", b"rogue-runtime-key").await;
+}
+
+#[tokio::test]
+async fn first_open_allows_bootstrap_sentinels_before_volume_exists() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    home.ensure().unwrap();
+    let layout = home.layout_version_path();
+    let key = home.runtime_key_path();
+    std::fs::create_dir_all(layout.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+    std::fs::write(&layout, b"2").unwrap();
+    std::fs::write(&key, b"first-runtime-key").unwrap();
+    assert!(!home.storage_volume_path().exists());
+
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let layout_name = ContentName::new("etc/layout-version").unwrap();
+    let key_name = ContentName::new(RUNTIME_KEY_PROJECTION).unwrap();
+    assert_eq!(
+        store
+            .content()
+            .read(&StateOwner::System, &layout_name)
+            .unwrap(),
+        Some(b"2".to_vec())
+    );
+    assert_eq!(
+        store
+            .content()
+            .read(&StateOwner::System, &key_name)
+            .unwrap(),
+        Some(b"first-runtime-key".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn restore_rebinds_staging_journal_before_new_seal() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let first_owner = test_owner("restore-journal");
+    let first_name = ContentName::new("workspace/restore-first.txt").unwrap();
+    let second_name = ContentName::new("workspace/restore-second.txt").unwrap();
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let mut writer = running
+        .staging()
+        .begin(first_owner, first_name.clone(), ChunkingProfile::ASTRID_V1)
+        .unwrap();
+    writer.write_all(b"first pending record").unwrap();
+    writer.seal().unwrap();
+    let journal = home.root().join(STAGING_JOURNAL_PROJECTION);
+    drop(running);
+
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    packer
+        .pack_and_retire_runtime_projection(&home)
+        .expect("pack staged journal into the volume");
+    drop(packer);
+    assert!(!journal.exists());
+
+    let restored = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let ready = restored.staging().ready().unwrap();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].name(), &first_name);
+    let mut writer = restored
+        .staging()
+        .begin(first_owner, second_name.clone(), ChunkingProfile::ASTRID_V1)
+        .unwrap();
+    writer.write_all(b"second pending record").unwrap();
+    writer.seal().unwrap();
+    let ready = restored.staging().ready().unwrap();
+    assert_eq!(ready.len(), 2);
+    assert_eq!(ready[0].name(), &first_name);
+    assert_eq!(ready[1].name(), &second_name);
+    drop(restored);
+
+    let reopened = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let ready = reopened.staging().ready().unwrap();
+    assert_eq!(
+        ready
+            .iter()
+            .map(ReadyStagedContent::name)
+            .collect::<Vec<_>>(),
+        vec![&first_name, &second_name]
+    );
 }

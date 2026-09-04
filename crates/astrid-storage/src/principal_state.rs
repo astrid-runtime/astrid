@@ -7,7 +7,8 @@
 //! that verification succeeds, records a content-bound receipt, and then
 //! removes the retired source.
 
-use std::sync::Arc;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::{Arc, OnceLock};
 
 pub use crate::PrincipalDirectory;
 use crate::capsule_registry::CapsuleRegistry;
@@ -364,6 +365,71 @@ type RuntimeEngine = DurableEngine<StateOwner, Blake3ObjectIdentityV1, StateOwne
 type RuntimeStore =
     TreeKvStore<StateOwner, Blake3ObjectIdentityV1, StateOwnerResolver, RuntimeEngine>;
 
+pub(super) fn rebind_staging_generation(path: &std::path::Path) -> StorageResult<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| StorageError::Connection(format!("open staged generation: {error}")))?;
+    let identity = native_io::private_file_identity(&file)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|error| {
+        StorageError::Connection(format!(
+            "read staged generation {}: {error}",
+            path.display()
+        ))
+    })?;
+    if bytes.len() < 80 {
+        return Err(StorageError::Connection(format!(
+            "staged generation footer is truncated: {}",
+            path.display()
+        )));
+    }
+    let trailer_offset = bytes
+        .len()
+        .checked_sub(32)
+        .ok_or_else(|| StorageError::Connection("staged footer trailer is truncated".to_owned()))?;
+    let length_offset = bytes
+        .len()
+        .checked_sub(8)
+        .ok_or_else(|| StorageError::Connection("staged footer length is truncated".to_owned()))?;
+    let payload_len = usize::try_from(u64::from_le_bytes(
+        bytes[length_offset..]
+            .try_into()
+            .map_err(|_| StorageError::Connection("staged footer length is invalid".to_owned()))?,
+    ))
+    .map_err(|_| StorageError::Connection("staged footer length is not addressable".to_owned()))?;
+    let payload_offset = trailer_offset
+        .checked_sub(payload_len)
+        .ok_or_else(|| StorageError::Connection("staged footer length exceeds file".to_owned()))?;
+    if payload_len < 48 {
+        return Err(StorageError::Connection(
+            "staged footer binding is truncated".to_owned(),
+        ));
+    }
+    let identity_offset = trailer_offset.checked_sub(48).ok_or_else(|| {
+        StorageError::Connection("staged footer identity is truncated".to_owned())
+    })?;
+    let (volume, file_number) = identity.raw_parts();
+    let mut source_identity = [0_u8; 16];
+    source_identity[..8].copy_from_slice(&volume.to_le_bytes());
+    source_identity[8..].copy_from_slice(&file_number.to_le_bytes());
+    let mut hasher = blake3::Hasher::new_derive_key("astrid staged source binding v1");
+    hasher.update(&bytes[payload_offset..identity_offset]);
+    hasher.update(&source_identity);
+    let binding = hasher.finalize();
+    file.seek(SeekFrom::Start(identity_offset as u64))
+        .and_then(|_| file.write_all(&source_identity))
+        .and_then(|()| file.write_all(binding.as_bytes()))
+        .and_then(|()| file.sync_all())
+        .map_err(|error| {
+            StorageError::Connection(format!(
+                "rebind staged generation {}: {error}",
+                path.display()
+            ))
+        })
+}
+
 /// Native named-content projection sharing the authoritative principal arena.
 pub type NativePrincipalContentStore = PrincipalContentStore<
     StateOwner,
@@ -378,7 +444,7 @@ pub struct RuntimePrincipalStore {
     runtime_kv: Arc<RuntimeStore>,
     kv: Arc<dyn KvStore>,
     content: Arc<NativePrincipalContentStore>,
-    staging: Arc<NativeContentStagingArea>,
+    staging: Arc<OnceLock<Arc<NativeContentStagingArea>>>,
     principals: PrincipalDirectory,
 }
 
@@ -604,7 +670,15 @@ impl RuntimePrincipalStore {
     /// Clone the private native content-staging area.
     #[must_use]
     pub fn staging(&self) -> Arc<NativeContentStagingArea> {
-        Arc::clone(&self.staging)
+        self.staging_area()
+    }
+
+    fn staging_area(&self) -> Arc<NativeContentStagingArea> {
+        Arc::clone(
+            self.staging
+                .get()
+                .expect("runtime store staging area initialized before serving"),
+        )
     }
 
     /// Return file roots held by currently open immutable content handles.
@@ -689,7 +763,7 @@ impl RuntimePrincipalStore {
         &self,
         staged: ReadyStagedContent,
     ) -> StorageResult<ContentWriteOutcome> {
-        self.staging
+        self.staging_area()
             .publish(staged, Arc::clone(&self.content))
             .await
     }
@@ -704,7 +778,7 @@ impl RuntimePrincipalStore {
         &self,
         staged: Vec<ReadyStagedContent>,
     ) -> StorageResult<ContentBatchWriteOutcome> {
-        self.staging
+        self.staging_area()
             .publish_batch(staged, Arc::clone(&self.content))
             .await
     }

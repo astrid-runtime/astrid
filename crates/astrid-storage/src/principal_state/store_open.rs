@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 
@@ -80,6 +80,7 @@ pub async fn open_runtime_principal_store_for_pack(
             Arc::new(engine),
             receipt,
             false,
+            false,
         )
         .await?;
         quarantine_unrecognized_principal_store(home, &store)?;
@@ -92,6 +93,7 @@ pub async fn open_runtime_principal_store_for_pack(
         PrincipalDirectory::default(),
         Arc::new(engine),
         receipt,
+        false,
         false,
     )
     .await?;
@@ -180,8 +182,16 @@ async fn open_runtime_principal_store_with_options(
             volume_migration::open_existing(home, policy)?.ok_or_else(|| {
                 StorageError::Connection("Astrid volume disappeared while opening".to_owned())
             })?;
-        let store =
-            assemble_runtime_store(home, quota, principals, Arc::new(engine), receipt, true).await;
+        let store = assemble_runtime_store(
+            home,
+            quota,
+            principals,
+            Arc::new(engine),
+            receipt,
+            true,
+            false,
+        )
+        .await;
         let store = store?;
         quarantine_unrecognized_principal_store(home, &store)?;
         return Ok(store);
@@ -191,16 +201,32 @@ async fn open_runtime_principal_store_with_options(
         .map_err(|error| StorageError::Connection(error.to_string()))?;
     if layout_version.as_deref() != Some(astrid_core::dirs::LEGACY_LAYOUT_VERSION) {
         let (engine, receipt) = volume_migration::initialize_volume(home, policy)?;
-        let store =
-            assemble_runtime_store(home, quota, principals, Arc::new(engine), receipt, true).await;
+        let store = assemble_runtime_store(
+            home,
+            quota,
+            principals,
+            Arc::new(engine),
+            receipt,
+            true,
+            true,
+        )
+        .await;
         let store = store?;
         quarantine_unrecognized_principal_store(home, &store)?;
         return Ok(store);
     }
     if unrecognized_principal_store_present(home)? {
         let (engine, receipt) = volume_migration::initialize_volume(home, policy)?;
-        let store =
-            assemble_runtime_store(home, quota, principals, Arc::new(engine), receipt, true).await;
+        let store = assemble_runtime_store(
+            home,
+            quota,
+            principals,
+            Arc::new(engine),
+            receipt,
+            true,
+            true,
+        )
+        .await;
         let store = store?;
         super::runtime_tree::quarantine_principal_store(home, &store)?;
         return Ok(store);
@@ -269,7 +295,16 @@ async fn open_runtime_principal_store_with_options(
     }
 
     let (engine, receipt) = volume_migration::migrate_directory_store(home, engine, policy)?;
-    assemble_runtime_store(home, quota, principals, Arc::new(engine), receipt, true).await
+    assemble_runtime_store(
+        home,
+        quota,
+        principals,
+        Arc::new(engine),
+        receipt,
+        true,
+        true,
+    )
+    .await
 }
 
 fn quarantine_unrecognized_principal_store(
@@ -315,6 +350,7 @@ async fn assemble_runtime_store(
     engine: Arc<RuntimeEngine>,
     directory_cutover_receipt: String,
     restore_projection: bool,
+    allow_receiptless_bootstrap: bool,
 ) -> crate::principal_state::StorageResult<RuntimePrincipalStore> {
     let format_spec = bootstrap::format_specification()?;
     let format_spec_id = engine.identify(&format_spec);
@@ -376,19 +412,27 @@ async fn assemble_runtime_store(
             validated_kv,
         ),
     );
-    let staging = Arc::new(NativeContentStagingArea::open(home.content_staging_path())?);
+    let staging = Arc::new(OnceLock::new());
     let store = RuntimePrincipalStore {
         engine,
         directory_cutover_receipt: Arc::from(directory_cutover_receipt),
         runtime_kv,
         kv,
         content,
-        staging,
+        staging: Arc::clone(&staging),
         principals,
     };
     if restore_projection {
-        crate::principal_state::runtime_tree::reconcile_running_projection(home, &store)?;
+        crate::principal_state::runtime_tree::reconcile_running_projection(
+            home,
+            &store,
+            allow_receiptless_bootstrap,
+        )?;
     }
+    let staging_area = NativeContentStagingArea::open(home.content_staging_path())?;
+    staging.set(Arc::new(staging_area)).map_err(|_| {
+        StorageError::Internal("runtime store staging area initialized twice".to_owned())
+    })?;
     Ok(store)
 }
 
