@@ -10,7 +10,12 @@ use crate::content::ContentName;
 use crate::error::{StorageError, StorageResult};
 use astrid_core::dirs::AstridHome;
 
-use super::{ContiguousFileIngest, RuntimePrincipalStore, StateOwner};
+use super::{
+    ContiguousFileIngest, RuntimePrincipalStore, StateOwner,
+    runtime_tree_active::{ACTIVE_PROJECTION_NAME, ActiveProjectionEntry},
+};
+
+use super::runtime_tree_active as active;
 
 const VOLUME_PATH_PREFIX: &str = "volume";
 const SOCKET_PATH: &str = "run/system.sock";
@@ -214,8 +219,9 @@ fn is_path_or_descendant(relative: &str, prefix: &str) -> bool {
     relative == prefix || relative.starts_with(&format!("{prefix}/"))
 }
 
-fn is_excluded(relative: &str) -> bool {
+pub(super) fn is_excluded(relative: &str) -> bool {
     relative == CANONICAL_VOLUME
+        || relative == ACTIVE_PROJECTION_NAME
         || relative == LEGACY_VAR_VOLUME
         || is_path_or_descendant(relative, VOLUME_PATH_PREFIX)
         || (relative.starts_with(&format!("{TRANSIENT_PREFIX}/"))
@@ -482,12 +488,26 @@ pub(super) fn pack_and_retire_projection(
     home: &AstridHome,
     store: &RuntimePrincipalStore,
 ) -> StorageResult<()> {
-    admit(store, home.root())?;
-    store
-        .content()
-        .flush()
-        .map_err(|error| tree_error(home.root(), format!("flush volume projection: {error}")))?;
-    retire_projection(home)
+    if home
+        .layout_version()
+        .map_err(|error| tree_io_error(&error))?
+        .as_deref()
+        == Some(astrid_core::dirs::LEGACY_LAYOUT_VERSION)
+    {
+        return legacy_projection_pack(home, store);
+    }
+    if validate_surviving_projection(home.root(), home.root())? {
+        let receipt = active::read(home, store)?;
+        if receipt.is_none() {
+            return Err(tree_error(
+                home.root(),
+                "active projection receipt is missing for surviving host projection",
+            ));
+        }
+        publish_active_projection(home, store)?;
+    }
+    retire_projection(home)?;
+    active::clear(store, home).map(|_| ())
 }
 
 fn write_projection_file(root: &Path, relative: &str, bytes: &[u8]) -> StorageResult<()> {
@@ -503,40 +523,71 @@ fn write_projection_file(root: &Path, relative: &str, bytes: &[u8]) -> StorageRe
 
 fn retire_projection(home: &AstridHome) -> StorageResult<()> {
     let root = home.root();
-    let mut entries = std::fs::read_dir(root)
-        .map_err(|error| tree_error(root, format!("read durable root: {error}")))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| tree_error(root, format!("read durable root entry: {error}")))?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        let path = entry.path();
-        if entry.file_name() == std::ffi::OsStr::new(CANONICAL_VOLUME) {
-            continue;
-        }
-        let metadata = std::fs::symlink_metadata(&path)
-            .map_err(|error| tree_error(&path, format!("inspect projection: {error}")))?;
-        if metadata.file_type().is_symlink() {
-            return Err(tree_error(
-                &path,
-                "running projection contains a symbolic link".to_owned(),
-            ));
-        }
-        if metadata.is_dir() {
-            astrid_core::dirs::retire_legacy_source_tree(&path)
-                .map_err(|error| tree_error(&path, format!("retire projection: {error}")))?;
-        } else if metadata.is_file() {
-            std::fs::remove_file(&path)
-                .map_err(|error| tree_error(&path, format!("retire projection: {error}")))?;
-        } else {
-            return Err(tree_error(
-                &path,
-                "running projection contains a special file".to_owned(),
-            ));
-        }
-    }
-    super::native_io::sync_directory(root)
+    astrid_core::dirs::retire_projection_root(root)
+        .map_err(|error| tree_error(root, format!("retire projection: {error}")))
 }
 
+fn active_projection_entries(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+) -> StorageResult<Vec<ActiveProjectionEntry>> {
+    let entries = store
+        .content()
+        .list(&StateOwner::System)
+        .map_err(|error| tree_error(home.root(), format!("list active projection: {error}")))?;
+    Ok(entries
+        .into_iter()
+        .filter(|entry| !is_excluded(entry.name().as_str()))
+        .filter(|entry| !is_retired_legacy_projection(home, entry.name().as_str()))
+        .map(|entry| ActiveProjectionEntry {
+            name: entry.name().clone(),
+            file: entry.file(),
+            logical_bytes: entry.logical_bytes(),
+        })
+        .collect())
+}
+
+fn establish_active_receipt(home: &AstridHome, store: &RuntimePrincipalStore) -> StorageResult<()> {
+    let entries = active_projection_entries(home, store)?;
+    active::write(home, store, &entries)
+}
+
+fn publish_active_projection(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+) -> StorageResult<()> {
+    let receipt = active::read(home, store)?.ok_or_else(|| {
+        tree_error(
+            home.root(),
+            "active projection receipt is missing for host publication",
+        )
+    })?;
+    let scanned = scan(home.root())?;
+    let surviving = scanned
+        .iter()
+        .map(RuntimeTreeEntry::name)
+        .cloned()
+        .collect::<Vec<_>>();
+    let removals = active::removals(&receipt, &surviving)?;
+    let ingests = scanned
+        .into_iter()
+        .map(|entry| ContiguousFileIngest::new(entry.name, entry.source_path, entry.logical_bytes));
+    store.replace_contiguous_files_removing_exact(StateOwner::System, ingests, &removals)?;
+    store
+        .content()
+        .flush()
+        .map_err(|error| tree_error(home.root(), format!("flush active projection: {error}")))?;
+    establish_active_receipt(home, store)
+}
+
+fn legacy_projection_pack(home: &AstridHome, store: &RuntimePrincipalStore) -> StorageResult<()> {
+    admit(store, home.root())?;
+    store
+        .content()
+        .flush()
+        .map_err(|error| tree_error(home.root(), format!("flush volume projection: {error}")))?;
+    retire_projection(home)
+}
 fn tree_io_error(error: &std::io::Error) -> StorageError {
     StorageError::Connection(error.to_string())
 }
@@ -563,15 +614,43 @@ pub(super) fn reconcile_running_projection(
         return Ok(());
     }
 
-    if !validate_surviving_projection(home.root(), home.root())? {
-        return Ok(());
+    let surviving = validate_surviving_projection(home.root(), home.root())?;
+    if surviving {
+        let receipt = active::read(home, store)?;
+        if receipt.is_none() {
+            let scanned = scan(home.root())?;
+            if !is_bootstrap_surviving_projection(&scanned) {
+                let names = scanned
+                    .iter()
+                    .map(|entry| entry.name().as_str())
+                    .collect::<Vec<_>>();
+                return Err(tree_error(
+                    home.root(),
+                    format!(
+                        "active projection receipt is missing for surviving host projection: {names:?}"
+                    ),
+                ));
+            }
+            restore_projection(home, store, &store.content)?;
+            return establish_active_receipt(home, store);
+        }
+        publish_active_projection(home, store)?;
+    } else {
+        restore_projection(home, store, &store.content)?;
     }
-    admit(store, home.root())?;
-    store
-        .content()
-        .flush()
-        .map_err(|error| tree_error(home.root(), format!("flush running projection: {error}")))?;
-    restore_projection(home, store, &store.content)
+    establish_active_receipt(home, store)
+}
+
+fn is_bootstrap_surviving_projection(scanned: &[RuntimeTreeEntry]) -> bool {
+    !scanned.is_empty()
+        && scanned.iter().all(|entry| {
+            matches!(
+                entry.name().as_str(),
+                "etc/layout-version"
+                    | RUNTIME_KEY_PROJECTION
+                    | "var/content-staging/intents.v1.log"
+            )
+        })
 }
 
 /// Validate redirects and unadmitted specials before any destructive restore.
@@ -623,6 +702,21 @@ fn validate_surviving_projection(root: &Path, directory: &Path) -> StorageResult
 
 /// Publish the live running projection without retiring its host files.
 pub(super) fn publish_running_projection(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+) -> StorageResult<()> {
+    if home
+        .layout_version()
+        .map_err(|error| tree_io_error(&error))?
+        .as_deref()
+        == Some(astrid_core::dirs::LEGACY_LAYOUT_VERSION)
+    {
+        return legacy_projection_pack_publish_only(home, store);
+    }
+    publish_active_projection(home, store)
+}
+
+fn legacy_projection_pack_publish_only(
     home: &AstridHome,
     store: &RuntimePrincipalStore,
 ) -> StorageResult<()> {

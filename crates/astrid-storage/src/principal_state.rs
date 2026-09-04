@@ -64,6 +64,7 @@ mod release_fixture_tests;
 #[cfg(test)]
 mod runtime_tests;
 mod runtime_tree;
+mod runtime_tree_active;
 mod staging;
 mod store_open;
 #[cfg(test)]

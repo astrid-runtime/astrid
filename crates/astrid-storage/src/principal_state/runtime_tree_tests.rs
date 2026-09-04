@@ -161,7 +161,7 @@ async fn admits_runtime_tree_and_reopens_from_preclose_volume_copy() {
         .iter()
         .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
-    expected_names.push("var/content-staging/intents.v1.log".to_owned());
+    expected_names.push("run/.active-projection-v1.json".to_owned());
     expected_names.extend(["volume.compacting", "volume.previous"].map(str::to_owned));
     expected_names.sort();
     assert_eq!(names, expected_names);
@@ -174,6 +174,11 @@ async fn admits_runtime_tree_and_reopens_from_preclose_volume_copy() {
         copied_home.storage_volume_path(),
     )
     .unwrap();
+    let detached = open_runtime_principal_store_for_pack(&copied_home, unlimited_quota())
+        .await
+        .unwrap();
+    super::active::clear(&detached, &copied_home).unwrap();
+    drop(detached);
     let volume = HostedFileVolume::open(copied_home.storage_volume_path()).unwrap();
     assert!(
         volume
@@ -295,6 +300,15 @@ async fn packs_trust_projection_and_excludes_run_on_clean_stop() {
     let store = open_runtime_principal_store(&home, unlimited_quota())
         .await
         .unwrap();
+    let active_name = ContentName::new("run/.active-projection-v1.json").unwrap();
+    assert!(
+        store
+            .content()
+            .describe(&StateOwner::System, &active_name)
+            .unwrap()
+            .is_some(),
+        "startup must retain its active receipt"
+    );
     let trust = home.root().join("trust/test.pub");
     std::fs::create_dir_all(trust.parent().unwrap()).unwrap();
     std::fs::write(&trust, b"ed25519:test").unwrap();
@@ -309,6 +323,15 @@ async fn packs_trust_projection_and_excludes_run_on_clean_stop() {
     store
         .pack_and_retire_runtime_projection(&home)
         .expect("pack running projection");
+    let active_name = ContentName::new("run/.active-projection-v1.json").unwrap();
+    assert!(
+        store
+            .content()
+            .describe(&StateOwner::System, &active_name)
+            .unwrap()
+            .is_none(),
+        "clean stop retained active recovery state"
+    );
     assert!(!trust.exists());
     assert!(!home.run_dir().exists());
 
@@ -349,6 +372,131 @@ async fn packs_trust_projection_and_excludes_run_on_clean_stop() {
             0o600
         );
     }
+}
+
+#[tokio::test]
+async fn clean_stop_reconciles_deleted_runtime_file_and_does_not_resurrect_it() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let config_path = home.root().join("etc/user.conf");
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    std::fs::write(&config_path, b"user-config").unwrap();
+    drop(running);
+
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    packer
+        .pack_and_retire_runtime_projection(&home)
+        .expect("pack created file");
+    drop(packer);
+
+    let restarted = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&config_path).unwrap(), b"user-config");
+    drop(restarted);
+
+    std::fs::remove_file(&config_path).unwrap();
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    packer
+        .pack_and_retire_runtime_projection(&home)
+        .expect("atomically reconcile deleted file");
+    let config_name = ContentName::new("etc/user.conf").unwrap();
+    assert!(
+        packer
+            .content()
+            .describe(&StateOwner::System, &config_name)
+            .unwrap()
+            .is_none(),
+        "deleted durable name remained in catalog"
+    );
+    drop(packer);
+
+    let remaining = std::fs::read_dir(home.root())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        remaining
+            .iter()
+            .map(std::fs::DirEntry::file_name)
+            .collect::<Vec<_>>(),
+        [std::ffi::OsString::from("astrid.volume")]
+    );
+
+    let restarted = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    assert!(!config_path.exists(), "deleted file resurrected on restart");
+    drop(restarted);
+}
+
+#[tokio::test]
+async fn arbitrary_host_projection_without_active_receipt_fails_closed() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    drop(running);
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    packer
+        .pack_and_retire_runtime_projection(&home)
+        .expect("create clean stopped volume");
+    drop(packer);
+
+    let rogue = home.root().join("etc/user.conf");
+    std::fs::create_dir_all(rogue.parent().unwrap()).unwrap();
+    std::fs::write(&rogue, b"not a surviving projection").unwrap();
+    let Err(error) = open_runtime_principal_store(&home, unlimited_quota()).await else {
+        panic!("arbitrary preboot host file must not acquire catalog authority");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("active projection receipt is missing"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(&rogue).unwrap(),
+        b"not a surviving projection"
+    );
+}
+
+#[tokio::test]
+async fn active_receipt_never_materializes_and_malformed_receipt_fails_closed() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let receipt_path = home.root().join("run/.active-projection-v1.json");
+    assert!(!receipt_path.try_exists().unwrap());
+    let receipt_name = ContentName::new("run/.active-projection-v1.json").unwrap();
+    running
+        .content()
+        .put(&StateOwner::System, &receipt_name, b"{bad")
+        .unwrap();
+    drop(running);
+
+    let Err(error) = open_runtime_principal_store(&home, unlimited_quota()).await else {
+        panic!("malformed active receipt must fail closed");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("parse active projection receipt"),
+        "{error}"
+    );
+    assert!(!receipt_path.try_exists().unwrap());
 }
 
 #[tokio::test]
@@ -598,4 +746,35 @@ async fn special_inside_run_capsules_fails_closed_before_restore() {
         error.to_string().contains("unadmitted special entry"),
         "{error}"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stop_preflight_retains_regular_file_when_special_comes_later() {
+    use std::os::unix::net::UnixListener;
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let regular = home.root().join("regular");
+    std::fs::write(&regular, b"must survive failed retirement").unwrap();
+    let socket_path = home.root().join("run/other.sock");
+    std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+    let _socket = UnixListener::bind(&socket_path).unwrap();
+    drop(running);
+
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let Err(error) = packer.pack_and_retire_runtime_projection(&home) else {
+        panic!("root special must stop complete-root retirement");
+    };
+    assert!(error.to_string().contains("special entry"), "{error}");
+    assert_eq!(
+        std::fs::read(&regular).unwrap(),
+        b"must survive failed retirement"
+    );
+    assert!(socket_path.symlink_metadata().is_ok());
 }

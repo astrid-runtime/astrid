@@ -59,6 +59,41 @@ impl RuntimePrincipalStore {
             })?;
         Ok(())
     }
+
+    /// Publish packed files and remove exact obsolete names in one catalog
+    /// owner-root transition.
+    ///
+    /// This is the internal crash-recovery publication seam. Removals must not
+    /// overlap ingests, so the caller states the obsolete projection names
+    /// explicitly instead of deriving a prefix delete.
+    pub(crate) fn replace_contiguous_files_removing_exact(
+        &self,
+        owner: StateOwner,
+        files: impl IntoIterator<Item = ContiguousFileIngest>,
+        removals: &[ContentName],
+    ) -> StorageResult<()> {
+        let mut ingests = Vec::new();
+        for file in files {
+            let source = open_home_source(&file)?;
+            ingests.push(ContentIngest::new(file.name, source));
+        }
+        if ingests.is_empty() {
+            return if removals.is_empty() {
+                Ok(())
+            } else {
+                self.content
+                    .delete_batch(&owner, removals)
+                    .map(|_| ())
+                    .map_err(|error| {
+                        StorageError::Internal(format!("remove packed home names: {error}"))
+                    })
+            };
+        }
+        self.content
+            .replace_streaming_batch_removing_exact(&owner, ingests, removals)
+            .map(|_| ())
+            .map_err(|error| StorageError::Internal(format!("replace packed home batch: {error}")))
+    }
 }
 
 fn open_home_source(file: &ContiguousFileIngest) -> StorageResult<File> {

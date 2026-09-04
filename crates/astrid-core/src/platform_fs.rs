@@ -559,6 +559,15 @@ fn validate_private_file_unix(path: &Path) -> io::Result<()> {
             format!("private file is not owner-only: {}", path.display()),
         ));
     }
+    if metadata.st_nlink != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "private file has {} links; durable media must have exactly one",
+                metadata.st_nlink
+            ),
+        ));
+    }
     validate_no_extended_acl(path)?;
     Ok(())
 }

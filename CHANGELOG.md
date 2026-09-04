@@ -11,14 +11,6 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
-- **Runtime restart now ignores stale host endpoints while rejecting special
-  entries in durable namespaces.**
-- **Graceful daemon restarts no longer rewind newer running files to the last
-  packed volume generation.** Shutdown publishes the live projection before
-  durable stores close, and startup admits a valid surviving projection before
-  restoring it from the volume.
-- **A failed stop projection pack now keeps host sidecars and returns an error
-  instead of reporting the runtime as stopped.**
 - **`astrid status` and `astrid mcp serve` no longer treat an unlinked
   `system.sock` as a stopped daemon.** If the recorded PID is still alive,
   status fails closed and MCP refuses to spawn a second kernel onto the

@@ -374,3 +374,35 @@ async fn failed_stop_pack_returns_error_and_retains_host_sidecars() {
         "failed stop must not claim exact volume-only state"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cli_stop_preflight_retains_regular_file_when_special_comes_later() {
+    use std::os::unix::net::UnixListener;
+
+    let root = tempfile::tempdir().expect("temporary isolated root");
+    let home = astrid_core::dirs::AstridHome::from_path(root.path().join("astrid-home"));
+    let store = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .expect("open isolated running store");
+    let regular = home.root().join("regular");
+    std::fs::write(&regular, b"cli-side retirement input").expect("write regular file");
+    let socket_path = home.root().join("run/other.sock");
+    std::fs::create_dir_all(socket_path.parent().unwrap()).expect("create run directory");
+    let _socket = UnixListener::bind(&socket_path).expect("inject root special");
+    drop(store);
+
+    let error = projection::pack_stopped_projection_for_home(&home)
+        .await
+        .expect_err("CLI stop must preflight the complete projection root");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("durable_projection_pack") && message.contains("special entry"),
+        "unexpected CLI stop failure: {message}"
+    );
+    assert_eq!(
+        std::fs::read(&regular).unwrap(),
+        b"cli-side retirement input"
+    );
+    assert!(socket_path.symlink_metadata().is_ok());
+}

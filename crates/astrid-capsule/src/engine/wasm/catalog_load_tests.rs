@@ -40,21 +40,30 @@ async fn bound_load_refuses_host_wasm_when_catalog_entry_is_missing_or_tampered(
         )
         .expect("metadata");
 
-        // These host copies prove that a bound load cannot silently select a
-        // projection when the authoritative catalog is absent or corrupt.
-        std::fs::create_dir_all(home.bin_dir()).expect("bin directory");
-        std::fs::write(
-            home.bin_dir().join(format!("{expected_hash}.wasm")),
-            &component_bytes,
-        )
-        .expect("host projection");
-
         let store = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
             .await
             .expect("principal store");
+        let host_component = home.bin_dir().join(format!("{expected_hash}.wasm"));
+        std::fs::create_dir_all(host_component.parent().unwrap()).expect("bin directory");
+        std::fs::write(&host_component, &component_bytes).expect("host projection");
+        drop(store);
+
+        // An active run may legitimately create a new projected component.
+        // The regression starts from that recovered generation and then makes
+        // its catalog authority missing or corrupt, proving the host copy is
+        // still not selected.
+        let store = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .expect("recover active projection");
+        let name = astrid_storage::ContentName::new(format!("bin/{expected_hash}.wasm"))
+            .expect("catalog name");
+        if catalog_bytes.is_none() {
+            store
+                .content()
+                .delete(&StateOwner::System, &name)
+                .expect("remove catalog authority");
+        }
         if let Some(bytes) = catalog_bytes {
-            let name = astrid_storage::ContentName::new(format!("bin/{expected_hash}.wasm"))
-                .expect("catalog name");
             store
                 .content()
                 .put(&StateOwner::System, &name, bytes)

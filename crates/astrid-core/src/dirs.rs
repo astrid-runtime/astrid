@@ -46,6 +46,9 @@ pub const LEGACY_LAYOUT_VERSION: &str = "1";
 #[path = "dirs_layout.rs"]
 mod dirs_layout;
 pub use dirs_layout::{LayoutMigrationTarget, retire_legacy_source_tree};
+#[path = "dirs_projection_retirement.rs"]
+mod projection_retirement;
+pub use projection_retirement::retire_projection_root;
 #[path = "dirs_run_dir.rs"]
 mod run_dir;
 #[path = "dirs_workspace.rs"]

@@ -53,47 +53,10 @@ pub(super) fn retire_stopped_projection(home: &AstridHome) -> Result<()> {
     {
         return Ok(());
     }
-    let mut entries = std::fs::read_dir(root)
-        .with_context(|| format!("shutdown stage durable_root_read: {}", root.display()))?
-        .collect::<std::io::Result<Vec<_>>>()
-        .context("shutdown stage durable_root_entry")?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        let path = entry.path();
-        if entry.file_name() == std::ffi::OsStr::new("astrid.volume") {
-            continue;
-        }
-        let metadata = std::fs::symlink_metadata(&path).with_context(|| {
-            format!(
-                "shutdown stage durable_projection_probe: {}",
-                path.display()
-            )
-        })?;
-        anyhow::ensure!(
-            !metadata.file_type().is_symlink(),
-            "shutdown stage durable_projection_boundary: {} is redirected",
-            path.display()
-        );
-        if metadata.is_dir() {
-            astrid_core::dirs::retire_legacy_source_tree(&path).with_context(|| {
-                format!(
-                    "shutdown stage durable_projection_cleanup: {}",
-                    path.display()
-                )
-            })?;
-        } else if metadata.is_file() {
-            std::fs::remove_file(&path).with_context(|| {
-                format!(
-                    "shutdown stage durable_projection_cleanup: {}",
-                    path.display()
-                )
-            })?;
-        } else {
-            anyhow::bail!(
-                "shutdown stage durable_projection_boundary: {} is not a regular file or directory",
-                path.display()
-            );
-        }
-    }
-    Ok(())
+    astrid_core::dirs::retire_projection_root(root).with_context(|| {
+        format!(
+            "shutdown stage durable_projection_cleanup: {}",
+            root.display()
+        )
+    })
 }
