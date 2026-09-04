@@ -5,7 +5,7 @@
 //! remain package-manager owned. Discovery can use a mirror or mock, but the
 //! accepted Astrid workflow identities and issuer cannot be overridden.
 
-use std::io::{self, IsTerminal};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -20,10 +20,14 @@ use super::update_auth::{
 };
 use super::update_channel;
 
-#[path = "self_update_notice.rs"]
+#[path = "../self_update_notice.rs"]
 mod notice;
 pub(crate) use notice::print_update_banner;
 use notice::{handle_managed_channel, write_cache};
+
+mod path_setup;
+pub(crate) use path_setup::ensure_path_setup;
+use path_setup::is_in_path;
 
 /// Default Astrid release repository. Discovery overrides never widen the
 /// authenticated publisher identity.
@@ -36,30 +40,6 @@ const MAX_ARCHIVE_BYTES: usize = 100 * 1024 * 1024;
 const MAX_RELEASE_ASSETS: usize = 1_024;
 const MAX_BUNDLE_BYTES: usize = 256 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
-
-fn default_astrid_home_path() -> io::Result<PathBuf> {
-    #[cfg(windows)]
-    return astrid_core::platform_fs::default_astrid_home_root();
-
-    #[cfg(not(windows))]
-    {
-        let home = std::env::var_os("HOME").ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "HOME environment variable is not set",
-            )
-        })?;
-        Ok(PathBuf::from(home).join(".astrid"))
-    }
-}
-
-fn shell_profile_setup_wanted(astrid_home: Option<&Path>, default_home: Option<&Path>) -> bool {
-    let Some(home) = astrid_home else {
-        return true;
-    };
-
-    default_home.is_some_and(|default| home == default)
-}
 
 /// Return every executable managed by an authenticated target's update set.
 fn managed_binaries_for_target(target: &str) -> Vec<&'static str> {
@@ -109,12 +89,6 @@ fn resolve_repo(source: Option<&str>) -> anyhow::Result<(String, String)> {
         },
         None => Ok((DEFAULT_ORG.to_string(), DEFAULT_REPO.to_string())),
     }
-}
-
-/// The `~/.astrid/bin` directory where `astrid init` puts self-managed binaries.
-fn astrid_bin_dir() -> anyhow::Result<PathBuf> {
-    let home = astrid_core::dirs::AstridHome::resolve()?;
-    Ok(home.root().join("bin"))
 }
 
 /// Map the current platform to the GitHub release asset target triple.
@@ -827,173 +801,6 @@ const fn distro_refresh_action(has_lock: bool) -> DistroRefreshAction {
     }
 }
 
-// ── PATH setup helpers ──────────────────────────────────────────────────
-
-/// Check if a directory is already in the current PATH.
-fn is_in_path(dir: &Path) -> bool {
-    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|entry| entry == dir))
-}
-
-/// Detect the user's shell RC file.
-fn detect_shell_rc() -> Option<PathBuf> {
-    let home = directories::BaseDirs::new()?.home_dir().to_path_buf();
-    let shell = std::env::var("SHELL").unwrap_or_default();
-
-    if shell.ends_with("zsh") {
-        Some(home.join(".zshrc"))
-    } else if shell.ends_with("bash") {
-        // Prefer .bashrc on Linux, .bash_profile on macOS
-        let bashrc = home.join(".bashrc");
-        let profile = home.join(".bash_profile");
-        if cfg!(target_os = "macos") && profile.exists() {
-            Some(profile)
-        } else if bashrc.exists() {
-            Some(bashrc)
-        } else {
-            Some(home.join(".bashrc"))
-        }
-    } else if shell.ends_with("fish") {
-        Some(home.join(".config/fish/config.fish"))
-    } else {
-        // Fallback: try zshrc (macOS default), then bashrc
-        let zshrc = home.join(".zshrc");
-        if zshrc.exists() {
-            Some(zshrc)
-        } else {
-            Some(home.join(".bashrc"))
-        }
-    }
-}
-
-/// True only if the match starts on an active rc line, not a `#`-comment.
-fn match_is_commented(rc: &str, start: usize) -> bool {
-    let line_start = rc[..start].rfind('\n').map_or(0, |nl| nl.saturating_add(1));
-    rc[line_start..start].contains('#')
-}
-
-/// Whether an active rc entry already puts the whole bin dir on PATH.
-///
-/// Exact emitted blocks are authoritative; otherwise require whole-component
-/// bounds and never count comments, prefixes, or subdirectories. Ambiguity
-/// favors adding a duplicate rather than silently leaving Astrid off PATH.
-fn rc_configures_path(rc_contents: &str, bin_str: &str, export_line: &str) -> bool {
-    // Exact blocks count only when active; commented blocks are inert.
-    if let Some(start) = rc_contents.find(export_line)
-        && !match_is_commented(rc_contents, start)
-    {
-        return true;
-    }
-    if bin_str.is_empty() {
-        return false;
-    }
-
-    // PATH-list bounds reject prefix matches such as `.astrid/bin_backup`.
-    let is_lead = |c: char| matches!(c, ':' | '"' | '\'' | '=' | '(' | ' ' | '\t' | '\n' | '\r');
-    let is_trail = |c: char| matches!(c, ':' | '"' | '\'' | ')' | ' ' | '\t' | '\n' | '\r');
-
-    let mut from = 0;
-    while let Some(rel) = rc_contents[from..].find(bin_str) {
-        let start = from.saturating_add(rel);
-        let end = start.saturating_add(bin_str.len());
-
-        // Commented matches are inert; keep scanning.
-        if match_is_commented(rc_contents, start) {
-            from = end;
-            continue;
-        }
-
-        let lead_ok = start == 0
-            || rc_contents[..start]
-                .chars()
-                .next_back()
-                .is_some_and(is_lead);
-        let trail_ok =
-            end == rc_contents.len() || rc_contents[end..].chars().next().is_some_and(is_trail);
-        if lead_ok && trail_ok {
-            return true;
-        }
-        from = end;
-    }
-    false
-}
-
-/// Ensure the default-home binary is on PATH after `astrid init`.
-pub(crate) fn ensure_path_setup() -> anyhow::Result<()> {
-    let explicit_home = std::env::var_os("ASTRID_HOME").map(PathBuf::from);
-    let default_home = default_astrid_home_path().ok();
-    if !shell_profile_setup_wanted(explicit_home.as_deref(), default_home.as_deref()) {
-        return Ok(());
-    }
-
-    let bin_dir = astrid_bin_dir()?;
-    std::fs::create_dir_all(&bin_dir)?;
-
-    if is_in_path(&bin_dir) {
-        return Ok(());
-    }
-
-    let bin_str = bin_dir.to_string_lossy();
-    let Some(rc_file) = detect_shell_rc() else {
-        println!(
-            "{}",
-            Theme::warning(&format!("Add {bin_str} to your PATH manually."))
-        );
-        return Ok(());
-    };
-
-    let export_line = if rc_file.to_string_lossy().contains("fish") {
-        format!("fish_add_path {bin_str}")
-    } else {
-        format!("export PATH=\"{bin_str}:$PATH\"")
-    };
-
-    // Avoid appending a duplicate block on repeated init.
-    if let Ok(contents) = std::fs::read_to_string(&rc_file)
-        && rc_configures_path(&contents, &bin_str, &export_line)
-    {
-        return Ok(()); // Already configured, just not sourced yet
-    }
-
-    if std::io::stdin().is_terminal() {
-        eprint!(
-            "\n{bin_str} is not in your PATH. Add it to {}? [Y/n] ",
-            rc_file.display()
-        );
-        std::io::Write::flush(&mut std::io::stderr())?;
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let input = input.trim();
-        if !input.is_empty() && !input.eq_ignore_ascii_case("y") {
-            println!(
-                "{}",
-                Theme::dimmed(&format!("Skipped. Add manually: {export_line}"))
-            );
-            return Ok(());
-        }
-    }
-
-    // Append to RC file
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&rc_file)?;
-    std::io::Write::write_all(
-        &mut file,
-        format!("\n# Astrid OS\n{export_line}\n").as_bytes(),
-    )?;
-
-    println!(
-        "{}",
-        Theme::success(&format!("Added to {}", rc_file.display()))
-    );
-    println!(
-        "  Run: {} (or restart your terminal)",
-        Theme::dimmed(&format!("source {}", rc_file.display()))
-    );
-
-    Ok(())
-}
-
 #[cfg(test)]
-#[path = "self_update_tests.rs"]
+#[path = "../self_update_tests.rs"]
 mod tests;
