@@ -6,7 +6,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import changelog
-from changelog import check_pr, entry_from_fragment, extract_notes, fragment_body_errors, roll_changelog
+from changelog import (
+    check_pr,
+    entry_from_fragment,
+    extract_notes,
+    fragment_body_errors,
+    parse_labels,
+    roll_changelog,
+)
 
 
 SAMPLE = """# Changelog
@@ -31,6 +38,32 @@ SAMPLE = """# Changelog
 
 
 class CheckPrTests(unittest.TestCase):
+    def test_parse_labels_accepts_github_escaped_newline(self):
+        self.assertEqual(
+            parse_labels(r"skip-changelog\nlarge-file-ok"),
+            ["skip-changelog", "large-file-ok"],
+        )
+
+    def test_escaped_newline_does_not_create_partial_label_matches(self):
+        raw = r"not-skip-changelog\nlarge-file-ok"
+        self.assertEqual(parse_labels(raw), ["not-skip-changelog", "large-file-ok"])
+        errors = check_pr(
+            labels=parse_labels(raw),
+            changed_paths=["crates/astrid-kernel/src/lib.rs"],
+            added_paths=[],
+        )
+        self.assertTrue(errors)
+
+    def test_github_multilabel_payload_skips_changelog_check(self):
+        self.assertEqual(
+            check_pr(
+                labels=parse_labels(r"skip-changelog\nlarge-file-ok"),
+                changed_paths=["crates/astrid-kernel/src/lib.rs"],
+                added_paths=[],
+            ),
+            [],
+        )
+
     def test_code_without_fragment_fails(self):
         errors = check_pr(
             labels=[],
