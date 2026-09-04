@@ -308,7 +308,6 @@ fn resume_matches(
     identity.id == expected_id.as_str()
         && is_digest(source_digest)
         && identity.archive_digest == source_digest
-        && identity.wasm_hash.as_deref().is_some_and(is_digest)
         && is_generation_well_formed(&identity.generation)
         && expected_generation.is_some_and(|expected| expected == &identity.generation)
 }
@@ -569,13 +568,35 @@ mod tests {
     }
 
     #[test]
-    fn missing_wasm_hash_does_not_skip() {
+    fn matching_identity_skips_when_wasm_hash_absent() {
         let id = CapsuleId::new("example").expect("id");
         let generation = generation('a');
         let digest = "b".repeat(64);
+        let receipt = CapsuleInstallResumeReceipt {
+            id: id.to_string(),
+            archive_digest: digest.clone(),
+            generation: generation.clone(),
+        };
+        let expected_generation = resume_generation_from_receipt(Some(receipt), &id, &digest, None)
+            .expect("matching receipt should supply generation");
         let mut installed = identity(&digest, generation.clone());
         installed.wasm_hash = None;
-        assert!(!resume_matches(&installed, &id, &digest, Some(&generation)));
+        assert!(resume_matches(
+            &installed,
+            &id,
+            &digest,
+            Some(&expected_generation)
+        ));
+        let outcome = matching_skip_outcome(
+            &installed,
+            &id,
+            "1.0.0",
+            &digest,
+            Some(&expected_generation),
+        )
+        .expect("matching identity should produce a skip outcome");
+        assert!(outcome.skipped);
+        assert!(outcome.wasm_hash.is_none());
     }
 
     #[test]
