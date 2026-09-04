@@ -1391,6 +1391,7 @@ async fn pack_open_staging_journal_directory_sentinel_fails_closed() {
 #[cfg(unix)]
 #[tokio::test]
 async fn pack_open_staging_journal_socket_sentinel_fails_closed() {
+    use std::os::unix::fs::FileTypeExt as _;
     let home_dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(home_dir.path());
     let running = open_runtime_principal_store(&home, unlimited_quota())
@@ -1407,7 +1408,6 @@ async fn pack_open_staging_journal_socket_sentinel_fails_closed() {
 
     let intent = home.root().join(STAGING_JOURNAL_PROJECTION);
     std::fs::create_dir_all(intent.parent().unwrap()).unwrap();
-    use std::os::unix::fs::FileTypeExt as _;
     let _listener = std::os::unix::net::UnixListener::bind(&intent).unwrap();
     let Err(error) = open_runtime_principal_store_for_pack(&home, unlimited_quota()).await else {
         panic!("socket staging journal must not open for pack");

@@ -195,6 +195,16 @@ async fn published_v0104_home_imports_verifies_and_retires_legacy_store() {
         .await
         .unwrap();
 
+    // Kernel boot establishes ACTIVE, completes layout v2, then republishes
+    // host records written by that completion. Storage-only cutover follows
+    // the same sequence so pack-only stop can retire the live tree.
+    store
+        .establish_runtime_projection_receipt(&home)
+        .expect("establish ACTIVE after layout cutover");
+    store
+        .publish_runtime_projection(&home)
+        .expect("publish post-cutover host projection");
+
     drop(store);
     home.ensure().unwrap();
 
