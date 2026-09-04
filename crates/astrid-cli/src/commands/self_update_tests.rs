@@ -152,6 +152,30 @@ fn rc_path_guard_ignores_commented_exact_block() {
     assert!(rc_configures_path(&both_exact, bin, &export));
 }
 
+/// REGRESSION (#1183): an isolated runtime must not rewrite the account's
+/// shell startup file. These cases are pure, so no test reads or mutates the
+/// caller's rc or process environment.
+#[test]
+fn shell_profile_setup_follows_astrid_home_boundary() {
+    let default = Path::new("/home/jb/.astrid");
+    let isolated = Path::new("/tmp/astrid-issue-1183");
+
+    assert!(shell_profile_setup_wanted(None, Some(default)));
+    assert!(
+        shell_profile_setup_wanted(Some(default), Some(default)),
+        "the default home keeps the account-PATH setup behavior"
+    );
+    assert!(!shell_profile_setup_wanted(Some(isolated), Some(default)));
+    assert!(!shell_profile_setup_wanted(Some(isolated), None));
+}
+
+#[test]
+fn shell_profile_setup_skips_invalid_explicit_home() {
+    for invalid in ["", "relative/astrid", "/tmp/../astrid"] {
+        assert!(!shell_profile_setup_wanted(Some(Path::new(invalid)), None));
+    }
+}
+
 #[test]
 fn homebrew_path_is_detected() {
     assert!(is_homebrew_managed(Path::new(
