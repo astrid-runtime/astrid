@@ -6,6 +6,16 @@ on:
       - 'v[0-9]+.*'
       - '!v[0-9]+.*-nightly.*'
   workflow_dispatch:
+    inputs:
+      prepare_only:
+        description: Build Darwin binaries without certification or publication
+        required: false
+        default: false
+        type: boolean
+      source_commit:
+        description: Exact protected-main commit to build
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -28,6 +38,7 @@ jobs:
       nightly: ${{ steps.release.outputs.nightly }}
       version: ${{ steps.release.outputs.version }}
       source-commit: ${{ steps.release.outputs.source-commit }}
+      build-matrix: ${{ steps.release.outputs.build-matrix }}
     steps:
       - uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
@@ -42,28 +53,45 @@ jobs:
         id: release
         env:
           EVENT_NAME: ${{ github.event_name }}
+          PREPARE_ONLY: ${{ inputs.prepare_only }}
+          REQUESTED_SOURCE: ${{ inputs.source_commit }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          [[ "$GITHUB_REF" == refs/tags/v* ]]
-          VERSION="${GITHUB_REF_NAME#v}"
-          SOURCE_COMMIT=$(git rev-parse 'HEAD^{commit}')
-          if [[ "$EVENT_NAME" == push ]]; then
-            [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-            NIGHTLY=false
-          elif [[ "$EVENT_NAME" == workflow_dispatch ]]; then
-            NIGHTLY_DATE="${VERSION#*-nightly.}"
-            NIGHTLY_DATE="${NIGHTLY_DATE%%.g*}"
-            RUN_CREATED_AT=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .created_at)
-            python3 scripts/nightly_version.py validate-dispatch \
-              --date "$NIGHTLY_DATE" \
-              --created-at "$RUN_CREATED_AT"
-            EXPECTED=$(python3 scripts/nightly_version.py derive \
-              --date "$NIGHTLY_DATE" \
-              --source-commit "$SOURCE_COMMIT")
-            [[ "$VERSION" == "$EXPECTED" ]]
+          BUILD_MATRIX=$(python3 scripts/classify_release_build_matrix.py)
+          if [[ "$EVENT_NAME" == workflow_dispatch && "$PREPARE_ONLY" == true ]]; then
+            [[ "$GITHUB_REF" == refs/heads/main ]]
+            [[ "$REQUESTED_SOURCE" =~ ^[0-9a-f]{40}$ ]]
             git fetch --no-tags origin main
-            git merge-base --is-ancestor "$SOURCE_COMMIT" origin/main
-            NIGHTLY=true
+            git merge-base --is-ancestor "$REQUESTED_SOURCE" origin/main
+            git checkout --detach --force "$REQUESTED_SOURCE"
+            [[ "$(git rev-parse 'HEAD^{commit}')" == "$REQUESTED_SOURCE" ]]
+            VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+            SOURCE_COMMIT="$REQUESTED_SOURCE"
+            NIGHTLY=false
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            SOURCE_COMMIT=$(git rev-parse 'HEAD^{commit}')
+            if [[ "$EVENT_NAME" == push ]]; then
+              [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+              NIGHTLY=false
+            elif [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+              NIGHTLY_DATE="${VERSION#*-nightly.}"
+              NIGHTLY_DATE="${NIGHTLY_DATE%%.g*}"
+              RUN_CREATED_AT=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .created_at)
+              python3 scripts/nightly_version.py validate-dispatch \
+                --date "$NIGHTLY_DATE" \
+                --created-at "$RUN_CREATED_AT"
+              EXPECTED=$(python3 scripts/nightly_version.py derive \
+                --date "$NIGHTLY_DATE" \
+                --source-commit "$SOURCE_COMMIT")
+              [[ "$VERSION" == "$EXPECTED" ]]
+              git fetch --no-tags origin main
+              git merge-base --is-ancestor "$SOURCE_COMMIT" origin/main
+              NIGHTLY=true
+            else
+              echo "unsupported release event: $EVENT_NAME" >&2
+              exit 1
+            fi
           else
             echo "unsupported release event: $EVENT_NAME" >&2
             exit 1
@@ -72,6 +100,7 @@ jobs:
             echo "nightly=$NIGHTLY"
             echo "version=$VERSION"
             echo "source-commit=$SOURCE_COMMIT"
+            echo "build-matrix=$BUILD_MATRIX"
           } >> "$GITHUB_OUTPUT"
 
   # ── Build binaries for each platform ──────────────────────────────
@@ -81,40 +110,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            archive: tar.gz
-            libc: native
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive: tar.gz
-            libc: native
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            archive: tar.gz
-            libc: native
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            archive: tar.gz
-            libc: gnu
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            archive: tar.gz
-            libc: gnu
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            archive: tar.gz
-            libc: musl
-            platform: linux/amd64
-            image: docker.io/library/rust@sha256:e98196986adced5602f6e21c54babdbf2a8700400c7a78868324a3630e0c5d15
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-24.04-arm
-            archive: tar.gz
-            libc: musl
-            platform: linux/arm64
-            image: docker.io/library/rust@sha256:594694ee6b07747b63b5c265be2616b62e814180b66227e2c18c6ee85e4136be
+      matrix: ${{ fromJSON(needs.classify.outputs.build-matrix) }}
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
@@ -123,6 +119,7 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.classify.outputs.source-commit }}
           # astrid-capsule's build.rs stages WIT files from the
           # `wit/` submodule (astrid-runtime/wit) before bindgen
           # consumes them. Without recursive submodule checkout the
@@ -366,8 +363,9 @@ jobs:
 
       - name: Package binaries
         shell: bash
+        env:
+          VERSION: ${{ needs.classify.outputs.version }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
           TARGET="${{ matrix.target }}"
           DIR="astrid-${VERSION}-${{ matrix.target }}"
           mkdir "$DIR"
@@ -423,6 +421,7 @@ jobs:
   fskit-certification:
     name: Native FSKit mount certification
     needs: [classify, build]
+    if: ${{ !inputs.prepare_only }}
     uses: ./.github/workflows/native-storage-certification.yml
     permissions:
       contents: read
@@ -436,6 +435,7 @@ jobs:
   github-release:
     name: GitHub Release
     needs: [classify, build, fskit-certification]
+    if: ${{ !inputs.prepare_only }}
     runs-on: ubuntu-latest
     environment: release
     permissions:
