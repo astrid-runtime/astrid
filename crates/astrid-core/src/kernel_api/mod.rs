@@ -17,7 +17,7 @@ mod response_types;
 pub use agent::{AgentDeriveKernelRequest, AgentDeriveRequest};
 pub use install::{
     CapsuleInstallAuthority, CapsuleInstallEnv, CapsuleInstallProvenance, EnvEntry,
-    EnvStorageScope, EnvValueKind,
+    EnvStorageScope, EnvValueKind, InstalledCapsuleGeneration, InstalledCapsuleIdentity,
 };
 pub use projection_names::{
     PROJECTION_NAME_DIAGNOSTIC_METHOD, PROJECTION_NAME_DIAGNOSTIC_TOPIC,
@@ -73,6 +73,14 @@ pub enum KernelRequest {
         /// kernel's environment limits.
         #[serde(default)]
         env: Vec<CapsuleInstallEnv>,
+    },
+    /// Read the authenticated caller's complete durable package identity.
+    ///
+    /// The kernel resolves the owner from the authenticated request context;
+    /// this request never accepts a principal or target selector.
+    GetInstalledCapsuleIdentity {
+        /// Capsule identifier to inspect.
+        id: String,
     },
     /// Request to approve a capability grant (usually following an `ApprovalNeeded` response).
     ApproveCapability {
@@ -156,6 +164,9 @@ pub enum KernelResponse {
     Commands(Vec<CommandInfo>),
     /// Metadata about loaded capsules.
     CapsuleMetadata(Vec<CapsuleMetadataEntry>),
+    /// Caller-scoped identity of one complete durable package, or `None` when
+    /// the identifier is not installed for the authenticated caller.
+    InstalledCapsuleIdentity(Option<InstalledCapsuleIdentity>),
     /// The request failed.
     Error(String),
     /// Daemon status information.

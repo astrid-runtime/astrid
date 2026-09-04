@@ -169,6 +169,7 @@ impl KernelClientError {
 pub const fn topic_suffix(req: &KernelRequest) -> &'static str {
     match req {
         KernelRequest::InstallCapsule { .. } => "install_capsule",
+        KernelRequest::GetInstalledCapsuleIdentity { .. } => "installed_capsule_identity",
         KernelRequest::ApproveCapability { .. } => "approve_capability",
         KernelRequest::ListCapsules => "list_capsules",
         KernelRequest::ReloadCapsules => "reload_capsules",
@@ -481,6 +482,10 @@ mod tests {
         assert_eq!(topic_suffix(&KernelRequest::ListCapsules), "list_capsules");
         assert_eq!(topic_suffix(&KernelRequest::GetCommands), "get_commands");
         assert_eq!(topic_suffix(&KernelRequest::GetCapsuleMetadata), "metadata");
+        assert_eq!(
+            topic_suffix(&KernelRequest::GetInstalledCapsuleIdentity { id: "demo".into() }),
+            "installed_capsule_identity"
+        );
         assert_eq!(
             topic_suffix(&KernelRequest::GetAgentReadiness),
             "agent_readiness"

@@ -172,6 +172,7 @@ fn rate_limit_max(req: &KernelRequest, limits: &RateLimitsConfig) -> Option<u32>
         | KernelRequest::GetCommands
         | KernelRequest::GetCapsuleMetadata
         | KernelRequest::GetAgentReadiness
+        | KernelRequest::GetInstalledCapsuleIdentity { .. }
         | KernelRequest::GetStatus => None,
     }
 }

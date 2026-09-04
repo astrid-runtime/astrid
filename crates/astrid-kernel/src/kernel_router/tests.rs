@@ -184,6 +184,11 @@ fn rate_limit_for_request_returns_correct_limits() {
     assert_eq!(name, "ListCapsules");
     assert_eq!(limit, None);
 
+    let (name, limit) =
+        rate_limit_for_request(&KernelRequest::GetInstalledCapsuleIdentity { id: "demo".into() });
+    assert_eq!(name, "GetInstalledCapsuleIdentity");
+    assert_eq!(limit, None);
+
     let (_, shutdown) = rate_limit_for_request(&KernelRequest::Shutdown { reason: None });
     assert_eq!(shutdown, Some(1));
 }
@@ -254,6 +259,13 @@ fn required_capability_mapping_per_variant_self_scope() {
     assert_eq!(
         required_capability(&KernelRequest::GetAgentReadiness, AuthorityScope::Self_),
         "self:capsule:list"
+    );
+    assert_eq!(
+        required_capability(
+            &KernelRequest::GetInstalledCapsuleIdentity { id: String::new() },
+            AuthorityScope::Self_,
+        ),
+        "self:capsule:install"
     );
     assert_eq!(
         required_capability(

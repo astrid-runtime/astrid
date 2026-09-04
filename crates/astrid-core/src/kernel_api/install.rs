@@ -2,6 +2,37 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Immutable object generation for one durable installed-capsule package.
+///
+/// Each field is a lowercase BLAKE3 object identifier rendered as 64 hex
+/// characters. Keeping the token purpose-specific prevents callers from
+/// receiving package bytes or the storage map while still allowing a resume
+/// check to bind all three fixed package files to one owner-root snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstalledCapsuleGeneration {
+    /// Object identifier for the canonical archive bytes.
+    pub archive: String,
+    /// Object identifier for the install metadata bytes.
+    pub metadata: String,
+    /// Object identifier for the authority receipt bytes.
+    pub authority: String,
+}
+
+/// Caller-scoped identity of one complete durable capsule installation.
+///
+/// This response deliberately carries only the capsule identifier, its
+/// immutable package generation, and the raw archive digest used by the
+/// registry. It is not a metadata or package-byte query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstalledCapsuleIdentity {
+    /// Canonical capsule identifier.
+    pub id: String,
+    /// Immutable package generation captured from one owner-root snapshot.
+    pub generation: InstalledCapsuleGeneration,
+    /// BLAKE3 digest of the canonical archive bytes.
+    pub archive_digest: String,
+}
+
 /// Host-owned projection selected by an env/secret admin request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum EnvStorageScope {

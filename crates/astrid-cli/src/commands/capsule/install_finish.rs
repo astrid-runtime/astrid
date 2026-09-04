@@ -149,5 +149,6 @@ pub(super) fn finish_install(
         id: capsule_id,
         version: meta.version,
         wasm_hash: meta.wasm_hash,
+        skipped: false,
     })
 }

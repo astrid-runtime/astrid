@@ -19,6 +19,7 @@ pub(crate) fn all_kernel_request_variants() -> Vec<KernelRequest> {
             authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
             env: Vec::new(),
         },
+        KernelRequest::GetInstalledCapsuleIdentity { id: "x".into() },
         KernelRequest::ListCapsules,
         KernelRequest::GetCommands,
         KernelRequest::GetCapsuleMetadata,

@@ -13,14 +13,10 @@ use astrid_core::dirs::AstridHome;
 use astrid_core::kernel_api::{EnvStorageScope, EnvValueKind};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use super::distro::lock::{
-    DistroLock, DistroLockMeta, LockedCapsule, is_lock_fresh, load_lock_from_daemon,
-    write_lock_to_daemon,
-};
+use super::distro::lock::{DistroLock, DistroLockMeta, LockedCapsule, write_lock_to_daemon};
 #[cfg(test)]
 use super::distro::lock::{load_lock, manifest_hash, write_lock};
 use super::distro::manifest::DistroCapsule;
-use super::distro::manifest::DistroManifest;
 use crate::theme::Theme;
 
 #[path = "init_signed_source.rs"]
@@ -143,10 +139,9 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     let _provisioning_lock = grant::ProvisioningLock::acquire(&home, &target)?;
     init_workspace()?;
 
-    // Check lockfile — if fresh, we're already initialized. The lock lives
-    // under the resolved principal's home, matching bootstrap's auto-init
-    // freshness check (`should_auto_init`) so a scoped principal isn't
-    // re-provisioned on every run.
+    // Distro.lock is an outcome record, not a completion shortcut. Every
+    // selected member is checked through the caller-scoped durable identity
+    // query below, so a partial or stale lock can never suppress retries.
     let (manifest, expected_manifest_hash, signed_bundle) = unpack_prepared(prepared);
 
     // Enforce the distro's CLI-version floor BEFORE any prompting or install.
@@ -154,10 +149,6 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // its `[distro].astrid-version` would otherwise break onboarding mid-flight
     // on an older CLI; fail fast with an actionable upgrade message instead.
     super::distro::validate::enforce_astrid_version(&manifest)?;
-
-    if reuse_fresh_lock(&manifest, &expected_manifest_hash, &operator, &target, opts).await? {
-        return Ok(());
-    }
 
     // Display distro info.
     let display_name = manifest
@@ -200,25 +191,26 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // doesn't re-prompt for fields the distro already configured.
     write_env_files(&home, &target, &selected, &variables, &vars)?;
 
-    // Install each capsule with progress. `install_capsules` writes the
-    // capsule files under `principal`'s home and returns one LockedCapsule
-    // per capsule that actually installed — failures are reported and
-    // dropped, so `locked.len()` is the true success count.
+    // Install each capsule with progress. The helper returns one
+    // `LockedCapsule` per member that either installed or matched a complete
+    // durable package; failures are reported and dropped.
     let total = selected.len();
-    let locked = install_capsules(
+    let install_result = install_capsules_with_resume(
         &selected,
         opts.offline,
         &target,
         signed_bundle.as_ref().map(|bundle| &bundle.pinned_refs),
     )
     .await?;
+    let locked = install_result.locked;
+    let newly_installed_names = install_result.newly_installed_names;
     let succeeded = locked.len();
 
     // Provisioning honesty: a run where every selected install FAILED must
     // not claim success, must not persist a Distro.lock, and must exit
     // non-zero. Writing a lock here would wedge recovery — the next `init`
-    // would see a version-matched lock, pass the freshness gate above, and
-    // short-circuit. An empty selection (nothing to install) is not a
+    // would otherwise see a version-matched lock and short-circuit. An empty
+    // selection (nothing to install) is not a
     // failure.
     if total > 0 && succeeded == 0 {
         bail!(
@@ -240,14 +232,10 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
 
     // Persist Distro.lock iff the run earned it (full success or empty
     // selection). A partial run deliberately writes NO lock so a re-run
-    // actually retries the missing capsules instead of short-circuiting at
-    // the freshness gate (`is_lock_fresh` diffs only distro id+version, not
-    // the capsule set) — see `should_write_lock`.
-    // Capture the names that actually installed BEFORE `locked` is consumed
-    // into the lock — the grant set is EXACTLY this locally-resolved set, never
-    // a manifest-declared string the installer didn't land (security stance:
-    // grants derive from what was installed, on explicit `--grant-capsules`).
-    let installed_names: Vec<String> = locked.iter().map(|c| c.name.clone()).collect();
+    // actually retries the missing capsules instead of short-circuiting on a
+    // stale member set — see `should_write_lock`.
+    // The grant set is exactly the names that performed a new install. A
+    // durable resume has no grant side effect.
     let lock = create_lock_from_parts(
         schema_version,
         &distro_id,
@@ -264,8 +252,15 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
         // On a grant failure the capsules are already installed and the lock
         // is written; this returns Err so init exits non-zero with the exact
         // manual command to finish.
-        grant::apply_or_hint_grants(&operator, &target, &installed_names, opts.grant_capsules)
+        if !newly_installed_names.is_empty() {
+            grant::apply_or_hint_grants(
+                &operator,
+                &target,
+                &newly_installed_names,
+                opts.grant_capsules,
+            )
             .await?;
+        }
         eprintln!("  Run {} to start.", Theme::prompt("astrid"));
         Ok(())
     } else {
@@ -309,38 +304,6 @@ fn init_workspace() -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-/// Reuse a fresh, install-verified lock only after enforcing manifest binding.
-async fn reuse_fresh_lock(
-    manifest: &DistroManifest,
-    manifest_hash: &str,
-    operator: &astrid_core::PrincipalId,
-    target: &astrid_core::PrincipalId,
-    opts: &InitOpts,
-) -> anyhow::Result<bool> {
-    if let Some(existing_lock) = load_lock_from_daemon(target).await?
-        && is_lock_fresh(&existing_lock, manifest, manifest_hash)
-        && let Some(installed) =
-            grant::validated_grant_set_for_reuse(target, &existing_lock.capsules).await
-    {
-        eprintln!(
-            "{}",
-            Theme::info(&format!(
-                "{} is already installed (Distro.lock is up to date)",
-                manifest
-                    .distro
-                    .pretty_name
-                    .as_deref()
-                    .unwrap_or(&manifest.distro.name),
-            ))
-        );
-        // A fresh lock does not imply a successful historical grant. This is
-        // the lock-fresh retry path; self grant is idempotent and never widens.
-        grant::apply_or_hint_grants(operator, target, &installed, opts.grant_capsules).await?;
-        return Ok(true);
-    }
-    Ok(false)
 }
 
 /// Resolve an explicit remote distro source string to a URL.
@@ -604,13 +567,11 @@ fn collect_variables_headless(
 ///
 /// Only a FULL success (`succeeded == total`) or an empty selection
 /// (`total == 0`, nothing to install) writes a lock. A PARTIAL run writes
-/// NO lock, and this is the crux of the correctness contract: the freshness
-/// gate (`is_lock_fresh`) compares only the distro id + version, NOT which
-/// capsules landed. A partial lock would match on version, so the next
-/// `astrid init` would judge itself already provisioned and short-circuit —
-/// the capsules that failed would never retry. Because `install_capsule_batch`
-/// reinstalls idempotently, withholding the lock lets a re-run re-attempt
-/// every capsule and converge to a full success, which then writes the lock.
+/// NO lock. This keeps the outcome honest and ensures a retry still evaluates
+/// every member through the durable identity query instead of trusting a
+/// partial record. Because `install_capsule_batch` is idempotent, withholding
+/// the lock lets a re-run re-attempt missing capsules and converge to a full
+/// success, which then writes the lock.
 /// A wholly-failed run also writes no lock (and additionally bails non-zero).
 fn should_write_lock(total: usize, succeeded: usize) -> bool {
     total == 0 || succeeded == total
@@ -718,6 +679,25 @@ async fn install_capsules(
     principal: &astrid_core::PrincipalId,
     pinned_refs: Option<&HashMap<String, String>>,
 ) -> anyhow::Result<Vec<LockedCapsule>> {
+    Ok(
+        install_capsules_with_resume(selected, offline, principal, pinned_refs)
+            .await?
+            .locked,
+    )
+}
+
+struct InstallCapsulesResult {
+    locked: Vec<LockedCapsule>,
+    newly_installed_names: Vec<String>,
+}
+
+async fn install_capsules_with_resume(
+    selected: &[DistroCapsule],
+    offline: bool,
+    principal: &astrid_core::PrincipalId,
+    pinned_refs: Option<&HashMap<String, String>>,
+) -> anyhow::Result<InstallCapsulesResult> {
+    super::capsule::install_daemon::reset_batch_install_budget();
     if offline {
         for cap in selected {
             if is_network_capsule_source(&cap.source) {
@@ -741,8 +721,9 @@ async fn install_capsules(
     );
 
     let mut locked = Vec::with_capacity(total);
+    let mut newly_installed_names = Vec::new();
     let mut failed = Vec::new();
-    for cap in selected {
+    for (index, cap) in selected.iter().enumerate() {
         pb.set_message(cap.name.clone());
 
         let expected = CapsuleId::new(cap.name.clone())?;
@@ -770,6 +751,14 @@ async fn install_capsules(
         {
             Ok(outcome) => outcome,
             Err(e) => {
+                if super::capsule::install_daemon::batch_install_budget_exhausted(&e) {
+                    failed.extend(
+                        selected[index..]
+                            .iter()
+                            .map(|deferred| deferred.name.clone()),
+                    );
+                    break;
+                }
                 eprintln!("\n  Failed to install {}: {e}", cap.name);
                 failed.push(cap.name.clone());
                 pb.inc(1);
@@ -798,6 +787,9 @@ async fn install_capsules(
                 .unwrap_or_default(),
             resolved_ref: verified.resolved_ref,
         });
+        if !verified.skipped {
+            newly_installed_names.push(cap.name.clone());
+        }
 
         pb.inc(1);
     }
@@ -815,7 +807,10 @@ async fn install_capsules(
         );
     }
 
-    Ok(locked)
+    Ok(InstallCapsulesResult {
+        locked,
+        newly_installed_names,
+    })
 }
 
 #[derive(Debug)]
@@ -823,6 +818,7 @@ struct VerifiedBatchInstall {
     version: String,
     wasm_hash: Option<String>,
     resolved_ref: Option<String>,
+    skipped: bool,
 }
 
 /// Require the checked installer to report one exact identity and an actual
@@ -873,6 +869,7 @@ fn validate_batch_install(
         version: installed.version,
         wasm_hash: installed.wasm_hash,
         resolved_ref: outcome.resolved_ref,
+        skipped: installed.skipped,
     })
 }
 

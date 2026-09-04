@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, bail};
 use astrid_capsule::capsule::CapsuleId;
@@ -17,11 +18,37 @@ use astrid_capsule::manifest::CapsuleManifest;
 use astrid_core::PrincipalId;
 use astrid_core::kernel_api::{
     AdminRequestKind, AdminResponseBody, CapsuleInstallAuthority, CapsuleInstallEnv,
-    CapsuleInstallProvenance, EnvStorageScope, EnvValueKind, KernelRequest, KernelResponse,
+    CapsuleInstallProvenance, EnvStorageScope, EnvValueKind, InstalledCapsuleGeneration,
+    InstalledCapsuleIdentity, KernelRequest, KernelResponse,
 };
 
 use super::install::ManualInstallOptions;
 use super::install_batch::InstalledCapsuleOutcome;
+
+const MAX_BATCH_INSTALL_REQUESTS: usize = 10;
+static BATCH_INSTALL_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, thiserror::Error)]
+#[error("batch install pass reached the ten-request kernel budget")]
+pub(crate) struct BatchInstallBudgetExhausted;
+
+pub(crate) fn reset_batch_install_budget() {
+    BATCH_INSTALL_REQUESTS.store(0, Ordering::Relaxed);
+}
+
+pub(crate) fn batch_install_budget_exhausted(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<BatchInstallBudgetExhausted>()
+        .is_some()
+}
+
+fn reserve_batch_install_request() -> bool {
+    BATCH_INSTALL_REQUESTS
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            (count < MAX_BATCH_INSTALL_REQUESTS).then_some(count + 1)
+        })
+        .is_ok()
+}
 
 /// A validated operator value ready for the typed daemon API.
 #[derive(Debug, Clone)]
@@ -93,6 +120,24 @@ pub(crate) async fn install_local_via_daemon_for_target(
     provenance: Option<CapsuleInstallProvenance>,
     authority: CapsuleInstallAuthority,
 ) -> anyhow::Result<InstalledCapsuleOutcome> {
+    install_local_via_daemon_for_target_with_generation(
+        source, vars, target, provenance, authority, None,
+    )
+    .await
+}
+
+/// Install through the daemon after checking the authenticated caller's
+/// durable package identity. The optional generation is test/distro evidence;
+/// production callers accept any well-formed generation returned for the
+/// matching source digest.
+pub(crate) async fn install_local_via_daemon_for_target_with_generation(
+    source: &str,
+    vars: &[String],
+    target: &PrincipalId,
+    provenance: Option<CapsuleInstallProvenance>,
+    authority: CapsuleInstallAuthority,
+    expected_generation: Option<InstalledCapsuleGeneration>,
+) -> anyhow::Result<InstalledCapsuleOutcome> {
     crate::commands::daemon::ensure_persistent_daemon("capsule install")
         .await
         .context("capsule install could not ensure the runtime daemon")?;
@@ -101,6 +146,44 @@ pub(crate) async fn install_local_via_daemon_for_target(
     let values = validate_values(&manifest, vars)?;
 
     let mut client = crate::socket_client::connect_kernel_for_workspace(None).await?;
+    // A cross-principal install may be authorized, but the read-only query is
+    // deliberately bound to the authenticated caller and never to a request
+    // supplied target. Do not compare the caller's package with another owner.
+    let caller = crate::principal::current();
+    if resume_query_allowed(&caller, target) {
+        let source_path = source.strip_prefix("file://").unwrap_or(source);
+        // Digest calculation is only evidence for the skip decision. If the
+        // local source is unreadable or malformed, fail closed for resume but
+        // continue with the ordinary daemon install path so the kernel can
+        // return its canonical install error.
+        if let Ok(source_digest) =
+            astrid_capsule_install::archive_digest_for_source(Path::new(source_path))
+        {
+            if let Ok(KernelResponse::InstalledCapsuleIdentity(Some(identity))) = client
+                .request(KernelRequest::GetInstalledCapsuleIdentity {
+                    id: capsule_id.to_string(),
+                })
+                .await
+            {
+                if resume_matches(
+                    &identity,
+                    &capsule_id,
+                    &source_digest,
+                    expected_generation.as_ref(),
+                ) {
+                    return Ok(InstalledCapsuleOutcome {
+                        id: capsule_id,
+                        version: manifest.package.version,
+                        wasm_hash: None,
+                        skipped: true,
+                    });
+                }
+            }
+        }
+    }
+    if super::install::BATCH_MODE.load(Ordering::Relaxed) && !reserve_batch_install_request() {
+        return Err(BatchInstallBudgetExhausted.into());
+    }
     let response = client
         .request(KernelRequest::InstallCapsule {
             source: source.to_owned(),
@@ -137,11 +220,42 @@ pub(crate) async fn install_local_via_daemon_for_target(
                 id: capsule_id,
                 version,
                 wasm_hash,
+                skipped: false,
             })
         },
         KernelResponse::Error(message) => bail!("daemon rejected capsule install: {message}"),
         other => bail!("unexpected daemon response: {other:?}"),
     }
+}
+
+fn resume_matches(
+    identity: &InstalledCapsuleIdentity,
+    expected_id: &CapsuleId,
+    source_digest: &str,
+    expected_generation: Option<&InstalledCapsuleGeneration>,
+) -> bool {
+    identity.id == expected_id.as_str()
+        && is_digest(source_digest)
+        && identity.archive_digest == source_digest
+        && is_generation_well_formed(&identity.generation)
+        && expected_generation.is_none_or(|expected| expected == &identity.generation)
+}
+
+fn resume_query_allowed(caller: &PrincipalId, target: &PrincipalId) -> bool {
+    caller == target
+}
+
+fn is_generation_well_formed(generation: &InstalledCapsuleGeneration) -> bool {
+    is_digest(&generation.archive)
+        && is_digest(&generation.metadata)
+        && is_digest(&generation.authority)
+}
+
+fn is_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 async fn apply_values(
@@ -252,6 +366,23 @@ fn validate_values(
 mod tests {
     use super::*;
 
+    fn identity(digest: &str, generation: InstalledCapsuleGeneration) -> InstalledCapsuleIdentity {
+        InstalledCapsuleIdentity {
+            id: "example".into(),
+            generation,
+            archive_digest: digest.into(),
+        }
+    }
+
+    fn generation(seed: char) -> InstalledCapsuleGeneration {
+        let value = seed.to_string().repeat(64);
+        InstalledCapsuleGeneration {
+            archive: value.clone(),
+            metadata: value.clone(),
+            authority: value,
+        }
+    }
+
     fn manifest() -> CapsuleManifest {
         toml::from_str(
             r#"
@@ -284,5 +415,79 @@ mod tests {
     fn vars_reject_unknown_and_invalid_select_values() {
         assert!(validate_values(&manifest(), &["UNKNOWN=x".into()]).is_err());
         assert!(validate_values(&manifest(), &["MODEL=other".into()]).is_err());
+    }
+
+    #[test]
+    fn matching_durable_generation_skips_before_install_capsule() {
+        let id = CapsuleId::new("example").expect("id");
+        let generation = generation('a');
+        let digest = "b".repeat(64);
+        let installed = identity(&digest, generation.clone());
+        assert!(resume_matches(&installed, &id, &digest, Some(&generation)));
+    }
+
+    #[test]
+    fn archive_digest_mismatch_does_not_skip() {
+        let id = CapsuleId::new("example").expect("id");
+        let installed = identity(&"a".repeat(64), generation('b'));
+        assert!(!resume_matches(&installed, &id, &"c".repeat(64), None));
+    }
+
+    #[test]
+    fn generation_mismatch_does_not_skip() {
+        let id = CapsuleId::new("example").expect("id");
+        let digest = "a".repeat(64);
+        let installed = identity(&digest, generation('b'));
+        assert!(!resume_matches(
+            &installed,
+            &id,
+            &digest,
+            Some(&generation('c'))
+        ));
+    }
+
+    #[test]
+    fn malformed_generation_does_not_skip() {
+        let id = CapsuleId::new("example").expect("id");
+        let digest = "a".repeat(64);
+        let installed = identity(
+            &digest,
+            InstalledCapsuleGeneration {
+                archive: "not-a-digest".into(),
+                metadata: "b".repeat(64),
+                authority: "c".repeat(64),
+            },
+        );
+        assert!(!resume_matches(&installed, &id, &digest, None));
+    }
+
+    #[test]
+    fn principal_b_does_not_skip_from_principal_a_snapshot() {
+        let principal_a = PrincipalId::new("alice").expect("principal");
+        let principal_b = PrincipalId::new("bob").expect("principal");
+        assert!(!resume_query_allowed(&principal_b, &principal_a));
+    }
+
+    #[test]
+    fn twenty_two_member_distro_resumes_without_reissuing_completed() {
+        let mut completed = [false; 22];
+        let mut sent_per_pass = Vec::new();
+        for _ in 0..3 {
+            reset_batch_install_budget();
+            let mut sent = 0;
+            for member in &mut completed {
+                if *member {
+                    continue;
+                }
+                if !reserve_batch_install_request() {
+                    break;
+                }
+                *member = true;
+                sent += 1;
+            }
+            sent_per_pass.push(sent);
+        }
+        assert_eq!(sent_per_pass, [10, 10, 2]);
+        assert!(completed.into_iter().all(|done| done));
     }
 }

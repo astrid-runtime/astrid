@@ -7,6 +7,7 @@ mod device_scope;
 /// `astrid-capsule-install` library so the daemon and the CLI reach
 /// disk through the same code path.
 mod install;
+mod installed_identity;
 mod inventory;
 mod projection_names;
 mod rate_limit;
@@ -316,6 +317,9 @@ async fn handle_request(
                 },
             )
             .await
+        },
+        KernelRequest::GetInstalledCapsuleIdentity { id } => {
+            installed_identity::handle(kernel, &caller, &id)
         },
         KernelRequest::ApproveCapability {
             request_id,
@@ -698,6 +702,9 @@ pub fn required_capability(req: &KernelRequest, scope: AuthorityScope) -> &'stat
         (KernelRequest::RollbackWorkspace { .. }, _) => "self:workspace:rollback",
         (KernelRequest::InstallCapsule { .. }, AuthorityScope::Self_) => "self:capsule:install",
         (KernelRequest::InstallCapsule { .. }, _) => "capsule:install",
+        // Identity is a caller-scoped install read. It intentionally uses the
+        // install capability rather than the broader capsule:list surface.
+        (KernelRequest::GetInstalledCapsuleIdentity { .. }, _) => "self:capsule:install",
         (
             KernelRequest::ListCapsules
             | KernelRequest::GetCommands
@@ -741,6 +748,7 @@ pub fn kernel_request_method(req: &KernelRequest) -> &'static str {
         KernelRequest::PromoteWorkspace { .. } => "PromoteWorkspace",
         KernelRequest::RollbackWorkspace { .. } => "RollbackWorkspace",
         KernelRequest::InstallCapsule { .. } => "InstallCapsule",
+        KernelRequest::GetInstalledCapsuleIdentity { .. } => "GetInstalledCapsuleIdentity",
         KernelRequest::ApproveCapability { .. } => "ApproveCapability",
         KernelRequest::ListCapsules => "ListCapsules",
         KernelRequest::GetCommands => "GetCommands",
