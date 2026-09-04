@@ -21,8 +21,9 @@ pub struct InstalledCapsuleGeneration {
 /// Caller-scoped identity of one complete durable capsule installation.
 ///
 /// This response deliberately carries only the capsule identifier, its
-/// immutable package generation, and the raw archive digest used by the
-/// registry. It is not a metadata or package-byte query.
+/// immutable package generation, the raw archive digest used by the registry,
+/// and (when present) the verified WASM content address. It is not a metadata
+/// or package-byte query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstalledCapsuleIdentity {
     /// Canonical capsule identifier.
@@ -31,6 +32,10 @@ pub struct InstalledCapsuleIdentity {
     pub generation: InstalledCapsuleGeneration,
     /// BLAKE3 digest of the canonical archive bytes.
     pub archive_digest: String,
+    /// Raw lowercase BLAKE3 digest of the verified WASM component, when one
+    /// exists. This is absent for non-WASM capsules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wasm_hash: Option<String>,
 }
 
 /// Host-owned projection selected by an env/secret admin request.

@@ -77,6 +77,7 @@ fn installed_identity_wire_is_purpose_specific_and_roundtrips() {
             authority: "c".repeat(64),
         },
         archive_digest: "d".repeat(64),
+        wasm_hash: Some("e".repeat(64)),
     };
     let request = KernelRequest::GetInstalledCapsuleIdentity { id: "demo".into() };
     let request_json = serde_json::to_value(&request).expect("request wire");

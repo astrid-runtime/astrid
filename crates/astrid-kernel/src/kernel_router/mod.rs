@@ -700,11 +700,9 @@ pub fn required_capability(req: &KernelRequest, scope: AuthorityScope) -> &'stat
         // `resolve_scope` always yields `Self_`; the `_` arm is for exhaustiveness.
         (KernelRequest::PromoteWorkspace { .. }, _) => "self:workspace:promote",
         (KernelRequest::RollbackWorkspace { .. }, _) => "self:workspace:rollback",
-        (KernelRequest::InstallCapsule { .. }, AuthorityScope::Self_) => "self:capsule:install",
+        (KernelRequest::InstallCapsule { .. }, AuthorityScope::Self_)
+        | (KernelRequest::GetInstalledCapsuleIdentity { .. }, _) => "self:capsule:install",
         (KernelRequest::InstallCapsule { .. }, _) => "capsule:install",
-        // Identity is a caller-scoped install read. It intentionally uses the
-        // install capability rather than the broader capsule:list surface.
-        (KernelRequest::GetInstalledCapsuleIdentity { .. }, _) => "self:capsule:install",
         (
             KernelRequest::ListCapsules
             | KernelRequest::GetCommands

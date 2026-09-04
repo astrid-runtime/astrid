@@ -80,6 +80,7 @@ pub(super) fn handle(
         archive_digest: blake3::hash(&snapshot.package().archive)
             .to_hex()
             .to_string(),
+        wasm_hash: verified.metadata().wasm_hash.clone(),
     };
     KernelResponse::InstalledCapsuleIdentity(Some(identity))
 }

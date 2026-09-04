@@ -45,7 +45,9 @@ pub(crate) fn batch_install_budget_exhausted(error: &anyhow::Error) -> bool {
 fn reserve_batch_install_request() -> bool {
     BATCH_INSTALL_REQUESTS
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-            (count < MAX_BATCH_INSTALL_REQUESTS).then_some(count + 1)
+            (count < MAX_BATCH_INSTALL_REQUESTS)
+                .then(|| count.checked_add(1))
+                .flatten()
         })
         .is_ok()
 }
@@ -150,7 +152,7 @@ pub(crate) async fn install_local_via_daemon_for_target_with_generation(
     // deliberately bound to the authenticated caller and never to a request
     // supplied target. Do not compare the caller's package with another owner.
     let caller = crate::principal::current();
-    if resume_query_allowed(&caller, target) {
+    if resume_skip_allowed(&caller, target, &values) {
         let source_path = source.strip_prefix("file://").unwrap_or(source);
         // Digest calculation is only evidence for the skip decision. If the
         // local source is unreadable or malformed, fail closed for resume but
@@ -158,27 +160,20 @@ pub(crate) async fn install_local_via_daemon_for_target_with_generation(
         // return its canonical install error.
         if let Ok(source_digest) =
             astrid_capsule_install::archive_digest_for_source(Path::new(source_path))
-        {
-            if let Ok(KernelResponse::InstalledCapsuleIdentity(Some(identity))) = client
+            && let Ok(KernelResponse::InstalledCapsuleIdentity(Some(identity))) = client
                 .request(KernelRequest::GetInstalledCapsuleIdentity {
                     id: capsule_id.to_string(),
                 })
                 .await
-            {
-                if resume_matches(
-                    &identity,
-                    &capsule_id,
-                    &source_digest,
-                    expected_generation.as_ref(),
-                ) {
-                    return Ok(InstalledCapsuleOutcome {
-                        id: capsule_id,
-                        version: manifest.package.version,
-                        wasm_hash: None,
-                        skipped: true,
-                    });
-                }
-            }
+            && let Some(outcome) = matching_skip_outcome(
+                &identity,
+                &capsule_id,
+                &manifest.package.version,
+                &source_digest,
+                expected_generation.as_ref(),
+            )
+        {
+            return Ok(outcome);
         }
     }
     if super::install::BATCH_MODE.load(Ordering::Relaxed) && !reserve_batch_install_request() {
@@ -237,8 +232,35 @@ fn resume_matches(
     identity.id == expected_id.as_str()
         && is_digest(source_digest)
         && identity.archive_digest == source_digest
+        && identity.wasm_hash.as_deref().is_some_and(is_digest)
         && is_generation_well_formed(&identity.generation)
         && expected_generation.is_none_or(|expected| expected == &identity.generation)
+}
+
+fn matching_skip_outcome(
+    identity: &InstalledCapsuleIdentity,
+    expected_id: &CapsuleId,
+    version: &str,
+    source_digest: &str,
+    expected_generation: Option<&InstalledCapsuleGeneration>,
+) -> Option<InstalledCapsuleOutcome> {
+    if !resume_matches(identity, expected_id, source_digest, expected_generation) {
+        return None;
+    }
+    Some(InstalledCapsuleOutcome {
+        id: expected_id.clone(),
+        version: version.to_owned(),
+        wasm_hash: identity.wasm_hash.clone(),
+        skipped: true,
+    })
+}
+
+fn resume_skip_allowed(
+    caller: &PrincipalId,
+    target: &PrincipalId,
+    values: &[DaemonEnvValue],
+) -> bool {
+    values.is_empty() && resume_query_allowed(caller, target)
 }
 
 fn resume_query_allowed(caller: &PrincipalId, target: &PrincipalId) -> bool {
@@ -371,6 +393,7 @@ mod tests {
             id: "example".into(),
             generation,
             archive_digest: digest.into(),
+            wasm_hash: Some("e".repeat(64)),
         }
     }
 
@@ -427,6 +450,30 @@ mod tests {
     }
 
     #[test]
+    fn matching_skip_carries_canonical_wasm_hash() {
+        let id = CapsuleId::new("example").expect("id");
+        let generation = generation('a');
+        let digest = "b".repeat(64);
+        let installed = identity(&digest, generation.clone());
+        let outcome = matching_skip_outcome(&installed, &id, "1.0.0", &digest, Some(&generation))
+            .expect("matching identity should produce a skip outcome");
+        let expected_hash = "e".repeat(64);
+        assert!(outcome.skipped);
+        assert!(outcome.wasm_hash.as_deref().is_some_and(is_digest));
+        assert_eq!(outcome.wasm_hash.as_deref(), Some(expected_hash.as_str()));
+    }
+
+    #[test]
+    fn missing_wasm_hash_does_not_skip() {
+        let id = CapsuleId::new("example").expect("id");
+        let generation = generation('a');
+        let digest = "b".repeat(64);
+        let mut installed = identity(&digest, generation.clone());
+        installed.wasm_hash = None;
+        assert!(!resume_matches(&installed, &id, &digest, Some(&generation)));
+    }
+
+    #[test]
     fn archive_digest_mismatch_does_not_skip() {
         let id = CapsuleId::new("example").expect("id");
         let installed = identity(&"a".repeat(64), generation('b'));
@@ -466,6 +513,13 @@ mod tests {
         let principal_a = PrincipalId::new("alice").expect("principal");
         let principal_b = PrincipalId::new("bob").expect("principal");
         assert!(!resume_query_allowed(&principal_b, &principal_a));
+    }
+
+    #[test]
+    fn non_empty_values_do_not_attempt_resume_skip() {
+        let principal = PrincipalId::new("alice").expect("principal");
+        let values = validate_values(&manifest(), &["MODEL=small".into()]).expect("valid vars");
+        assert!(!resume_skip_allowed(&principal, &principal, &values));
     }
 
     #[test]
