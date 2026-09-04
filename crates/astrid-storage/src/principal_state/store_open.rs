@@ -387,7 +387,7 @@ async fn assemble_runtime_store(
         principals,
     };
     if restore_projection {
-        crate::principal_state::runtime_tree::restore_projection(home, &store, &store.content)?;
+        crate::principal_state::runtime_tree::reconcile_running_projection(home, &store)?;
     }
     Ok(store)
 }

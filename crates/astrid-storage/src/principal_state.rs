@@ -533,6 +533,20 @@ impl RuntimePrincipalStore {
         runtime_tree::admit(self, runtime_root.as_ref())
     }
 
+    /// Publish the live running projection while retaining host files.
+    ///
+    /// Graceful kernel shutdown calls this before its durable projections are
+    /// closed. Host retirement remains an explicit post-exit CLI stop duty so
+    /// the process can still read its projected files.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if the running projection cannot be admitted or
+    /// flushed without following a redirect.
+    pub fn publish_runtime_projection(&self, home: &AstridHome) -> StorageResult<()> {
+        runtime_tree::publish_running_projection(home, self)
+    }
+
     /// Pack running projection changes and retire every durable host sidecar.
     ///
     /// # Errors

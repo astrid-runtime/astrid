@@ -318,3 +318,59 @@ fn absent_daemon_has_typed_stopped_status() {
         serde_json::json!({ "state": "stopped" })
     );
 }
+
+fn unlimited_quota()
+-> std::sync::Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> {
+    std::sync::Arc::new(|owner: &astrid_storage::StateOwner| {
+        Ok(match owner {
+            astrid_storage::StateOwner::System => None,
+            astrid_storage::StateOwner::Principal(_) | astrid_storage::StateOwner::Fleet(_) => {
+                Some(u64::MAX)
+            },
+        })
+    })
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_stop_pack_returns_error_and_retains_host_sidecars() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().expect("temporary isolated root");
+    let home = astrid_core::dirs::AstridHome::from_path(root.path().join("astrid-home"));
+    let store = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .expect("open isolated running store");
+    let log_path = home.root().join("log/daemon.log");
+    let config_path = home.root().join("etc/authz.conf");
+    std::fs::create_dir_all(log_path.parent().unwrap()).expect("create log directory");
+    std::fs::write(&log_path, b"generation-1\ngeneration-2\n").expect("write appended log");
+    std::fs::write(&config_path, b"allow=generation-2\n").expect("write appended config");
+    drop(store);
+
+    let outside = tempfile::tempdir().expect("temporary redirect target");
+    let redirect = home.root().join("redirect");
+    symlink(outside.path(), &redirect).expect("inject admission failure");
+
+    let error = projection::pack_stopped_projection_for_home(&home)
+        .await
+        .expect_err("a failed projection pack cannot report a successful stop");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("durable_projection_pack") && message.contains("symbolic link"),
+        "unexpected stop failure: {message}"
+    );
+    assert!(redirect.symlink_metadata().is_ok(), "redirect was removed");
+    assert!(
+        log_path.try_exists().unwrap(),
+        "appended log sidecar was retired after failure"
+    );
+    assert!(
+        config_path.try_exists().unwrap(),
+        "appended config sidecar was retired after failure"
+    );
+    assert!(
+        std::fs::read_dir(home.root()).unwrap().count() > 1,
+        "failed stop must not claim exact volume-only state"
+    );
+}

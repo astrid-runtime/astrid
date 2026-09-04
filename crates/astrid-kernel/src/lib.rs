@@ -49,6 +49,8 @@ pub mod invite;
 /// (`wasm32-unknown-unknown`) profile.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod kernel_router;
+#[cfg(test)]
+mod kernel_shutdown_tests;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod legacy_migration_barrier;
 /// Persistent pair-device token store (issue #756).
@@ -3737,6 +3739,17 @@ impl Kernel {
         // release independent of drain time.
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         self.audit_sink.shutdown();
+        // Publish the final host projection while the durable engine is still
+        // open. CLI stop owns retirement only after the process has exited.
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(store) = self.principal_store.as_ref()
+            && let Err(error) = store.publish_runtime_projection(&self.astrid_home)
+        {
+            tracing::error!(
+                error = %format!("{error:#}"),
+                "failed to publish running projection during shutdown"
+            );
+        }
         if let Err(e) = self.kv.close().await {
             tracing::warn!(error = %e, "Failed to flush KV store during shutdown");
         }
