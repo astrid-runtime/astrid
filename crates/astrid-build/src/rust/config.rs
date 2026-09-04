@@ -22,14 +22,14 @@ pub(super) fn cargo_config_has_matching_target_rustflags_with_home(
     Ok(cargo_config_rustflags_for_target_with_home(dir, cargo_home, selected_target)?.1)
 }
 
-pub(super) fn cargo_config_rustflags_for_target(
-    dir: &Path,
-    selected_target: &str,
-) -> Result<(Vec<String>, bool)> {
-    let cargo_home = cargo_home_from_env(dir);
-    cargo_config_rustflags_for_target_with_home(dir, cargo_home.as_deref(), selected_target)
+#[derive(Debug, Default)]
+pub(super) struct EffectiveCargoRustflags {
+    pub(super) flags: Vec<String>,
+    pub(super) has_matching_target: bool,
+    pub(super) flags_are_array: bool,
 }
 
+#[cfg(test)]
 pub(super) fn cargo_config_rustflags_for_target_with_home(
     dir: &Path,
     cargo_home: Option<&Path>,
@@ -37,6 +37,19 @@ pub(super) fn cargo_config_rustflags_for_target_with_home(
 ) -> Result<(Vec<String>, bool)> {
     let config = load_cargo_config(dir, cargo_home, Some(selected_target))?;
     Ok((config.rustflags, config.has_matching_target_rustflags))
+}
+
+pub(super) fn cargo_config_effective_rustflags_for_target(
+    dir: &Path,
+    selected_target: &str,
+) -> Result<EffectiveCargoRustflags> {
+    let cargo_home = cargo_home_from_env(dir);
+    let config = load_cargo_config(dir, cargo_home.as_deref(), Some(selected_target))?;
+    Ok(EffectiveCargoRustflags {
+        flags: config.rustflags,
+        has_matching_target: config.has_matching_target_rustflags,
+        flags_are_array: config.rustflags_is_array,
+    })
 }
 
 pub(super) fn cargo_config_target_and_rustflags_with_home(
@@ -58,6 +71,7 @@ pub(super) fn cargo_config_target_and_rustflags_for_target_with_home(
 struct CargoConfig {
     target: Option<String>,
     rustflags: Vec<String>,
+    rustflags_is_array: bool,
     has_matching_target_rustflags: bool,
 }
 
@@ -90,13 +104,19 @@ fn load_cargo_config(
     let flags_target = selected_target.or(state.target.as_deref());
     let (target_flags, has_matching_target_rustflags) =
         matching_target_rustflags(flags_target, state.target_entries)?;
-    let rustflags = target_flags
-        .map(|flags| flags.flags)
-        .or_else(|| state.build_flags.map(|flags| flags.flags))
+    let effective_rustflags = match target_flags {
+        // An empty matching entry is still a matching entry, but it supplies no
+        // effective flags. Keep the caller's build-level flags and form.
+        Some(flags) if !flags.flags.is_empty() => Some(flags),
+        _ => state.build_flags,
+    };
+    let (rustflags, rustflags_is_array) = effective_rustflags
+        .map(|flags| (flags.flags, flags.is_array))
         .unwrap_or_default();
     Ok(CargoConfig {
         target: state.target,
         rustflags,
+        rustflags_is_array,
         has_matching_target_rustflags,
     })
 }

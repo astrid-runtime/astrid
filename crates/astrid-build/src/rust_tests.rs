@@ -199,9 +199,8 @@ fn build_config_rustflags_reach_path_dependency_with_getrandom_backend() {
     )
     .unwrap();
 
-    let (config_flags, has_matching_target_rustflags) =
-        cargo_config_rustflags_for_target_with_home(project.path(), None, GETRANDOM_TARGET)
-            .unwrap();
+    let config_rustflags =
+        cargo_config_effective_rustflags_for_target(project.path(), GETRANDOM_TARGET).unwrap();
 
     let (meta, _crate_name, _version, wasm_name, package_id) =
         resolve_package_metadata(project.path()).unwrap();
@@ -210,19 +209,19 @@ fn build_config_rustflags_reach_path_dependency_with_getrandom_backend() {
         &package_id,
         &wasm_name,
         GETRANDOM_TARGET.to_owned(),
-        &config_flags,
-        has_matching_target_rustflags,
+        &config_rustflags,
         &RustflagsEnvironment::default(),
     )
     .unwrap();
     assert_eq!(
-        config_flags,
+        config_rustflags.flags,
         vec![
             "--check-cfg=cfg(caller_cfg)".to_owned(),
             "--cfg=caller_cfg".to_owned(),
         ]
     );
-    assert!(!has_matching_target_rustflags);
+    assert!(!config_rustflags.has_matching_target);
+    assert!(config_rustflags.flags_are_array);
     assert_eq!(compiled.target, GETRANDOM_TARGET);
     let expected = locate_wasm_binary(&meta, GETRANDOM_TARGET, &wasm_name).unwrap();
     assert_eq!(compiled.path, expected);
@@ -510,9 +509,8 @@ fn include_only_rustflags_reach_path_dependency_with_getrandom_backend() {
     )
     .unwrap();
 
-    let (config_flags, has_matching_target_rustflags) =
-        cargo_config_rustflags_for_target_with_home(project.path(), None, GETRANDOM_TARGET)
-            .unwrap();
+    let config_rustflags =
+        cargo_config_effective_rustflags_for_target(project.path(), GETRANDOM_TARGET).unwrap();
 
     let (meta, _crate_name, _version, wasm_name, package_id) =
         resolve_package_metadata(project.path()).unwrap();
@@ -521,19 +519,19 @@ fn include_only_rustflags_reach_path_dependency_with_getrandom_backend() {
         &package_id,
         &wasm_name,
         GETRANDOM_TARGET.to_owned(),
-        &config_flags,
-        has_matching_target_rustflags,
+        &config_rustflags,
         &RustflagsEnvironment::default(),
     )
     .unwrap();
     assert_eq!(
-        config_flags,
+        config_rustflags.flags,
         vec![
             "--check-cfg=cfg(caller_cfg)".to_owned(),
             "--cfg=caller_cfg".to_owned(),
         ]
     );
-    assert!(!has_matching_target_rustflags);
+    assert!(!config_rustflags.has_matching_target);
+    assert!(config_rustflags.flags_are_array);
     assert_eq!(compiled.target, GETRANDOM_TARGET);
     let expected = locate_wasm_binary(&meta, GETRANDOM_TARGET, &wasm_name).unwrap();
     assert_eq!(compiled.path, expected);
@@ -594,8 +592,7 @@ fn build_env_and_getrandom_cfg_reach_dependency_without_target_flags() {
         &package_id,
         &wasm_name,
         GETRANDOM_TARGET.to_owned(),
-        &[],
-        false,
+        &EffectiveCargoRustflags::default(),
         &RustflagsEnvironment {
             build: Some("--check-cfg=cfg(caller_cfg) --cfg=caller_cfg".to_owned()),
             ..RustflagsEnvironment::default()
@@ -627,6 +624,102 @@ fn exact_target_rustflags_entry_is_detected_for_getrandom_merge() {
         )
         .unwrap()
     );
+}
+
+#[test]
+fn string_form_matching_target_rustflags_survive_getrandom_merge() {
+    if !rust_target_is_installed(GETRANDOM_TARGET) {
+        eprintln!(
+            "skipping string-form rustflags dependency build falsifier: {GETRANDOM_TARGET} target is not installed"
+        );
+        return;
+    }
+
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir_all(project.path().join(".cargo")).unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::create_dir_all(project.path().join("control-dep/src")).unwrap();
+    fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"string-rustflags-getrandom\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\ncontrol-dep = { path = \"control-dep\" }\ngetrandom = \"0.4\"\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("control-dep/Cargo.toml"),
+        "[package]\nname = \"control-dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("control-dep/src/lib.rs"),
+        "#[cfg(not(control_cfg))]\ncompile_error!(\"string rustflags were rejected before this dependency\");\n\npub fn assert_cfg() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join(".cargo/config.toml"),
+        "[build]\ntarget = \"wasm32-unknown-unknown\"\n\n[target.'cfg(all(target_arch = \"wasm32\", target_os = \"unknown\", target_env = \"\", target_pointer_width = \"32\", target_vendor = \"unknown\", target_family = \"wasm\"))']\nrustflags = \"--check-cfg=cfg(control_cfg) --cfg=control_cfg\"\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("src/lib.rs"),
+        "pub fn random() -> [u8; 1] {\n    control_dep::assert_cfg();\n    let mut out = [0; 1];\n    getrandom::fill(&mut out).unwrap();\n    out\n}\n\n#[unsafe(no_mangle)]\npub unsafe extern \"Rust\" fn __getrandom_v03_custom(_dest: *mut u8, _len: usize) -> Result<(), getrandom::Error> {\n    Err(getrandom::Error::UNSUPPORTED)\n}\n",
+    )
+    .unwrap();
+
+    let (meta, _crate_name, _version, wasm_name, package_id) =
+        resolve_package_metadata(project.path()).unwrap();
+    let compiled = compile_wasm(project.path(), &package_id, &wasm_name).unwrap();
+    assert_eq!(compiled.target, GETRANDOM_TARGET);
+    let expected = locate_wasm_binary(&meta, GETRANDOM_TARGET, &wasm_name).unwrap();
+    assert_eq!(compiled.path, expected);
+    assert!(compiled.path.is_file());
+}
+
+#[test]
+fn matching_empty_target_rustflags_preserve_build_config_for_dependencies() {
+    if !rust_target_is_installed(GETRANDOM_TARGET) {
+        eprintln!(
+            "skipping empty matching rustflags dependency build falsifier: {GETRANDOM_TARGET} target is not installed"
+        );
+        return;
+    }
+
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir_all(project.path().join(".cargo")).unwrap();
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::create_dir_all(project.path().join("control-dep/src")).unwrap();
+    fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"empty-target-rustflags\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\ncontrol-dep = { path = \"control-dep\" }\ngetrandom = \"0.4\"\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("control-dep/Cargo.toml"),
+        "[package]\nname = \"control-dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("control-dep/src/lib.rs"),
+        "#[cfg(not(caller_cfg))]\ncompile_error!(\"matching empty rustflags dropped [build] rustflags\");\n\npub fn assert_cfg() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join(".cargo/config.toml"),
+        "[build]\ntarget = \"wasm32-unknown-unknown\"\nrustflags = [\"--check-cfg=cfg(caller_cfg)\", \"--cfg=caller_cfg\"]\n\n[target.wasm32-unknown-unknown]\nrustflags = []\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("src/lib.rs"),
+        "pub fn random() -> [u8; 1] {\n    control_dep::assert_cfg();\n    let mut out = [0; 1];\n    getrandom::fill(&mut out).unwrap();\n    out\n}\n\n#[unsafe(no_mangle)]\npub unsafe extern \"Rust\" fn __getrandom_v03_custom(_dest: *mut u8, _len: usize) -> Result<(), getrandom::Error> {\n    Err(getrandom::Error::UNSUPPORTED)\n}\n",
+    )
+    .unwrap();
+
+    let (meta, _crate_name, _version, wasm_name, package_id) =
+        resolve_package_metadata(project.path()).unwrap();
+    let compiled = compile_wasm(project.path(), &package_id, &wasm_name).unwrap();
+    assert_eq!(compiled.target, GETRANDOM_TARGET);
+    let expected = locate_wasm_binary(&meta, GETRANDOM_TARGET, &wasm_name).unwrap();
+    assert_eq!(compiled.path, expected);
+    assert!(compiled.path.is_file());
 }
 
 #[test]

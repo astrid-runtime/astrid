@@ -9,6 +9,8 @@ use std::process::{Command, Stdio};
 use tracing::{info, warn};
 
 mod config;
+use config::EffectiveCargoRustflags;
+use config::{cargo_config_effective_rustflags_for_target, cargo_config_target_and_rustflags};
 #[cfg(test)]
 use config::{
     cargo_config_has_matching_target_rustflags_with_home,
@@ -16,7 +18,6 @@ use config::{
     cargo_config_target_and_rustflags_for_target_with_home,
     cargo_config_target_and_rustflags_with_home, resolve_cargo_home,
 };
-use config::{cargo_config_rustflags_for_target, cargo_config_target_and_rustflags};
 
 /// Stub WIT package written when a capsule has no local `wit/` directory.
 /// Gives `push_dir` a main package to anchor on so deps can still be loaded.
@@ -213,10 +214,10 @@ fn compile_wasm(dir: &Path, package_id: &PackageId, wasm_name: &str) -> Result<C
         .ok()
         .filter(|target| !target.trim().is_empty());
     let target = resolve_build_target(config_target, env_target)?;
-    let (config_flags, has_matching_target_rustflags) = if inject_getrandom_for_target(&target) {
-        cargo_config_rustflags_for_target(dir, &target)?
+    let config_rustflags = if inject_getrandom_for_target(&target) {
+        cargo_config_effective_rustflags_for_target(dir, &target)?
     } else {
-        (Vec::new(), false)
+        EffectiveCargoRustflags::default()
     };
     let rustflags = RustflagsEnvironment::from_process(&target);
     compile_wasm_with_target(
@@ -224,8 +225,7 @@ fn compile_wasm(dir: &Path, package_id: &PackageId, wasm_name: &str) -> Result<C
         package_id,
         wasm_name,
         target,
-        &config_flags,
-        has_matching_target_rustflags,
+        &config_rustflags,
         &rustflags,
     )
 }
@@ -235,8 +235,7 @@ fn compile_wasm_with_target(
     package_id: &PackageId,
     wasm_name: &str,
     target: String,
-    config_flags: &[String],
-    has_matching_target_rustflags: bool,
+    config_rustflags: &EffectiveCargoRustflags,
     rustflags: &RustflagsEnvironment,
 ) -> Result<CompiledWasm> {
     info!("   Compiling capsule (release)...");
@@ -257,13 +256,7 @@ fn compile_wasm_with_target(
         .stderr(Stdio::inherit());
     rustflags.configure_command(&mut cmd, &target);
     if inject_getrandom_cfg {
-        append_getrandom_rustflag(
-            &mut cmd,
-            &target,
-            has_matching_target_rustflags,
-            config_flags,
-            rustflags,
-        );
+        append_getrandom_rustflag(&mut cmd, &target, config_rustflags, rustflags);
     }
 
     let mut child = cmd.spawn().context("Failed to spawn cargo build")?;
@@ -335,13 +328,12 @@ fn inject_getrandom_for_target(target: &str) -> bool {
 fn append_getrandom_rustflag(
     cmd: &mut Command,
     target: &str,
-    has_matching_target_rustflags: bool,
-    config_flags: &[String],
+    config_rustflags: &EffectiveCargoRustflags,
     rustflags: &RustflagsEnvironment,
 ) {
     let Some((key, value)) = getrandom_rustflags_override(
         target,
-        config_flags,
+        &config_rustflags.flags,
         rustflags.encoded.as_deref(),
         rustflags.plain.as_deref(),
         rustflags.target_specific.as_deref(),
@@ -352,14 +344,19 @@ fn append_getrandom_rustflag(
     if rustflags.encoded.is_none()
         && rustflags.plain.is_none()
         && rustflags.target_specific.is_none()
-        && (rustflags.build.is_none() || has_matching_target_rustflags)
+        && (rustflags.build.is_none() || config_rustflags.has_matching_target)
     {
-        if has_matching_target_rustflags {
+        if config_rustflags.has_matching_target {
             // Let Cargo merge all matching target triples and cfg expressions,
             // ancestor arrays, and its own config precedence before adding
             // ours. Matching target entries already shadow build rustflags;
             // preserving them here avoids changing that precedence.
-            let config = cargo_config_with_getrandom(&[]);
+            // Reuse the effective caller representation so same-key string
+            // and array entries both remain valid TOML.
+            let config = cargo_config_with_getrandom(
+                &config_rustflags.flags,
+                config_rustflags.flags_are_array,
+            );
             cmd.args(["--config", config.as_str()]);
         } else {
             // With `build.target`, stable Cargo routes these flags to target
@@ -372,15 +369,30 @@ fn append_getrandom_rustflag(
     }
 }
 
-fn cargo_config_with_getrandom(config_flags: &[String]) -> String {
-    let mut flags = toml_edit::Array::new();
-    for flag in config_flags {
-        flags.push(flag.as_str());
-    }
-    if !config_flags.iter().any(|flag| flag == GETRANDOM_CUSTOM_CFG) {
-        flags.push(GETRANDOM_CUSTOM_CFG);
-    }
-    format!("{GETRANDOM_CARGO_CONFIG_TARGET}{flags}")
+fn cargo_config_with_getrandom(config_flags: &[String], flags_are_array: bool) -> String {
+    let value = if flags_are_array {
+        let mut flags = toml_edit::Array::new();
+        for flag in config_flags {
+            flags.push(flag.as_str());
+        }
+        if !config_flags.iter().any(|flag| flag == GETRANDOM_CUSTOM_CFG) {
+            flags.push(GETRANDOM_CUSTOM_CFG);
+        }
+        flags.to_string()
+    } else {
+        let mut flags = config_flags.join(" ");
+        if !flags
+            .split_whitespace()
+            .any(|flag| flag == GETRANDOM_CUSTOM_CFG)
+        {
+            if !flags.is_empty() {
+                flags.push(' ');
+            }
+            flags.push_str(GETRANDOM_CUSTOM_CFG);
+        }
+        toml_edit::Value::from(flags).to_string()
+    };
+    format!("{GETRANDOM_CARGO_CONFIG_TARGET}{value}")
 }
 
 #[derive(Default)]
