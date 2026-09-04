@@ -84,7 +84,10 @@ run_multi_home_smoke() {
 
   mkdir -p "$secondary_artifacts"
   multi_run_cli "$secondary_home" "$secondary_artifacts" start
-  multi_run_cli "$secondary_home" "$secondary_artifacts" stop
+  # Runtime configuration belongs to the mounted projection. Write it while
+  # Astrid is running and install capsules against that same public
+  # projection. A single later clean stop packs both runtime policy and the
+  # installed capsule set before the harness-owned restart.
   mkdir -p "$secondary_home/etc"
   cat > "$secondary_home/etc/gateway-http.toml" <<EOF
 enabled = true
@@ -138,6 +141,15 @@ EOF
   # Capsule installs auto-start a persistent daemon. Stop it before launching
   # the harness-owned process so cleanup cannot leave an untracked second home.
   multi_run_cli "$secondary_home" "$secondary_artifacts" stop
+  local stopped_entry
+  local stopped_extra=""
+  while IFS= read -r -d '' stopped_entry; do
+    if [[ "$(basename "$stopped_entry")" != "astrid.volume" ]]; then
+      stopped_extra+=" $stopped_entry"
+    fi
+  done < <(find "$secondary_home" -mindepth 1 -maxdepth 1 -print0)
+  [[ -z "$stopped_extra" ]] || fail "clean stop left stopped sidecars:$stopped_extra"
+  [[ -f "$secondary_home/astrid.volume" ]] || fail "clean stop did not leave canonical astrid.volume"
   env ASTRID_HOME="$secondary_home" HOME="$POISON_HOME" \
     "$CORE_DIR/target/debug/astrid-daemon" >> "$secondary_artifacts/daemon.log" 2>&1 &
   SECONDARY_DAEMON_PID=$!

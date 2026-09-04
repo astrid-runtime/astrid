@@ -6,13 +6,35 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use crate::content::ContentName;
+use crate::content::{ContentName, PrepareDerivedBatchContent};
+use crate::engine::PrincipalProjectionError;
 use crate::error::{StorageError, StorageResult};
+use astrid_core::dirs::AstridHome;
 
-use super::{ContiguousFileIngest, RuntimePrincipalStore, StateOwner};
+use super::{
+    ContiguousFileIngest, PackedProjectionIngest, RuntimePrincipalStore, StateOwner,
+    runtime_tree_active::{ACTIVE_PROJECTION_NAME, ActiveProjectionEntry, ReceiptPhase},
+};
+
+use super::runtime_tree_active as active;
 
 const VOLUME_PATH_PREFIX: &str = "volume";
 const SOCKET_PATH: &str = "run/system.sock";
+const CANONICAL_VOLUME: &str = "astrid.volume";
+const MIGRATING_VOLUME: &str = "astrid.migrating";
+const LEGACY_VAR_VOLUME: &str = "var/astrid.volume";
+const DIRECTORY_STORE_PREFIX: &str = "var/principal-store";
+const QUARANTINE_PREFIX: &str = "quarantine/principal-store";
+const TRANSIENT_PREFIX: &str = "run";
+const RUNTIME_KEY_PROJECTION: &str = "keys/runtime.key";
+const STAGING_JOURNAL_PROJECTION: &str = "var/content-staging/intents.v1.log";
+const TRANSACTION_STAGING_PATHS: &[&str] = &[
+    "etc/.layout-version.next",
+    "var/migrations/.layout-v1-to-v2.intent.next",
+    "var/migrations/.layout-v1-to-v2.retiring.next",
+    "var/migrations/.layout-v1-to-v2.complete.next",
+];
+const HOST_EXECUTABLES: &[&str] = &["astrid", "astrid-daemon", "bin/astrid", "bin/astrid-daemon"];
 
 /// One regular file discovered in the native runtime tree.
 ///
@@ -195,190 +217,784 @@ fn normalize_relative_path(relative: &str) -> String {
     relative.replace('\\', "/")
 }
 
-fn is_excluded(relative: &str) -> bool {
-    relative.starts_with(VOLUME_PATH_PREFIX) || relative == SOCKET_PATH
+fn is_path_or_descendant(relative: &str, prefix: &str) -> bool {
+    relative == prefix || relative.starts_with(&format!("{prefix}/"))
+}
+
+pub(super) fn is_excluded(relative: &str) -> bool {
+    relative == CANONICAL_VOLUME
+        || relative == ACTIVE_PROJECTION_NAME
+        || relative == LEGACY_VAR_VOLUME
+        || is_path_or_descendant(relative, VOLUME_PATH_PREFIX)
+        || (relative.starts_with(&format!("{TRANSIENT_PREFIX}/"))
+            && !is_path_or_descendant(relative, &format!("{TRANSIENT_PREFIX}/capsules")))
+        || is_path_or_descendant(relative, DIRECTORY_STORE_PREFIX)
+        || HOST_EXECUTABLES.contains(&relative)
+        || relative == SOCKET_PATH
+        || relative == MIGRATING_VOLUME
+        || TRANSACTION_STAGING_PATHS.contains(&relative)
+}
+
+/// Replace durable host files with volume-backed running projections.
+pub(super) fn restore_projection(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+    content: &super::NativePrincipalContentStore,
+) -> StorageResult<()> {
+    let layout_version = home
+        .layout_version()
+        .map_err(|error| tree_io_error(&error))?;
+    if layout_version.as_deref() == Some(astrid_core::dirs::LEGACY_LAYOUT_VERSION) {
+        return Ok(());
+    }
+    ingest_runtime_key(home, store)?;
+    seed_layout_version(home, store)?;
+    let entries = content
+        .list(&StateOwner::System)
+        .map_err(|error| tree_error(home.root(), format!("list volume projection: {error}")))?;
+    for entry in &entries {
+        let name = entry.name().as_str();
+        if is_excluded(name) || is_retired_legacy_projection(home, name) {
+            continue;
+        }
+        confined_projection_path(home.root(), name)?;
+    }
+    let mut written = Vec::new();
+    let result = (|| -> StorageResult<()> {
+        for entry in entries {
+            let name = entry.name().as_str();
+            if is_excluded(name) || is_retired_legacy_projection(home, name) {
+                continue;
+            }
+            let Some(bytes) = content
+                .read(&StateOwner::System, entry.name())
+                .map_err(|error| {
+                    tree_error(home.root(), format!("read projection {name}: {error}"))
+                })?
+            else {
+                continue;
+            };
+            let path = confined_projection_path(home.root(), name)?;
+            let previous = super::native_io::snapshot_private_file(&path)?;
+            written.push((path, previous));
+            write_projection_file(home.root(), name, &bytes)?;
+            if is_staging_generation(name) {
+                let path = confined_projection_path(home.root(), name)?;
+                super::rebind_staging_generation(&path)?;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let rollback_errors = super::native_io::rollback_private_files(written);
+        if !rollback_errors.is_empty() {
+            let retirement = match transition_retiring_projection(home, store) {
+                Ok(()) => "durable RETIRING receipt recorded".to_owned(),
+                Err(retirement) => format!("failed to force RETIRING receipt: {retirement}"),
+            };
+            return Err(tree_error(
+                home.root(),
+                format!(
+                    "restore failed: {error}; rollback failures: {rollback_errors:?}; {retirement}"
+                ),
+            ));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn is_retired_legacy_projection(home: &AstridHome, name: &str) -> bool {
+    [home.state_db_path(), home.cow_dir()]
+        .into_iter()
+        .filter_map(|path| {
+            path.strip_prefix(home.root())
+                .ok()
+                .and_then(|relative| relative.to_str())
+                .map(ToOwned::to_owned)
+        })
+        .any(|relative| normalize_relative_path(&relative) == name)
+}
+/// Admit an incomplete legacy-store tree as durable System-owned quarantine.
+///
+/// Residue is published only after its source bytes are read without
+/// following redirects. The host tree is removed only after the complete
+/// quarantine batch is flushed, so an interrupted quarantine fails closed
+/// with the source still present and retries under a fresh generation.
+pub(super) fn quarantine_principal_store(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+) -> StorageResult<()> {
+    let source = home.principal_store_path();
+    validate_legacy_retirement_candidate(&source)?;
+    let mut files = Vec::new();
+    collect_files(&source, &source, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let generation = next_quarantine_generation(store)?;
+    let mut ingests = Vec::with_capacity(files.len());
+    for (relative, path, metadata) in files {
+        let name = ContentName::new(format!("{QUARANTINE_PREFIX}/{generation}/{relative}"))
+            .map_err(|error| tree_error(&path, format!("validate quarantine name: {error}")))?;
+        ingests.push(ContiguousFileIngest::new(name, path, metadata.len()));
+    }
+    store.put_contiguous_files(StateOwner::System, ingests)?;
+    store
+        .content()
+        .flush()
+        .map_err(|error| tree_error(&source, format!("flush quarantine: {error}")))?;
+    astrid_core::dirs::retire_legacy_source_tree(&source)
+        .map_err(|error| tree_error(&source, format!("retire quarantine source: {error}")))
+}
+
+/// Refuse ingest before publication unless the source is a real same-device
+/// tree with no redirects or special entries.
+fn validate_legacy_retirement_candidate(source: &Path) -> StorageResult<()> {
+    let metadata = std::fs::symlink_metadata(source)
+        .map_err(|error| tree_error(source, format!("inspect retirement source: {error}")))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(tree_error(
+            source,
+            "retirement source is redirected or not a directory".to_owned(),
+        ));
+    }
+    let root_device = legacy_tree_device(&metadata);
+    validate_retirement_tree(source, root_device)
+}
+
+#[cfg(unix)]
+fn legacy_tree_device(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+
+    metadata.dev()
+}
+
+#[cfg(not(unix))]
+fn legacy_tree_device(_metadata: &std::fs::Metadata) -> u64 {
+    0
+}
+
+fn validate_retirement_tree(path: &Path, root_device: u64) -> StorageResult<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| tree_error(path, format!("inspect retirement source: {error}")))?;
+    if metadata.file_type().is_symlink() {
+        return Err(tree_error(
+            path,
+            "retirement source contains a symbolic link".to_owned(),
+        ));
+    }
+    if !metadata.is_dir() && !metadata.is_file() {
+        return Err(tree_error(
+            path,
+            "retirement source contains a special file".to_owned(),
+        ));
+    }
+    if legacy_tree_device(&metadata) != root_device {
+        return Err(tree_error(
+            path,
+            "retirement source crosses a filesystem boundary".to_owned(),
+        ));
+    }
+    astrid_core::platform_fs::verify_no_redirects(path)
+        .map_err(|error| tree_error(path, format!("validate retirement source: {error}")))?;
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(path)
+        .map_err(|error| tree_error(path, format!("read retirement source: {error}")))?
+    {
+        let child = entry
+            .map_err(|error| tree_error(path, format!("read retirement entry: {error}")))?
+            .path();
+        validate_retirement_tree(&child, root_device)?;
+    }
+    Ok(())
+}
+
+fn next_quarantine_generation(store: &RuntimePrincipalStore) -> StorageResult<u32> {
+    let names = store
+        .content()
+        .list_prefix(&StateOwner::System, QUARANTINE_PREFIX)
+        .map_err(|error| tree_error_home(QUARANTINE_PREFIX, error))?;
+    let mut next = 0_u32;
+    for entry in names {
+        let Some(relative) = entry.name().as_str().strip_prefix(QUARANTINE_PREFIX) else {
+            continue;
+        };
+        let Some(generation) = relative.trim_start_matches('/').split('/').next() else {
+            continue;
+        };
+        if let Ok(value) = generation.parse::<u32>() {
+            next = next.max(value.saturating_add(1));
+        }
+    }
+    Ok(next)
+}
+
+fn tree_error_home(path: &str, error: impl std::fmt::Display) -> StorageError {
+    StorageError::Connection(format!("runtime tree {path}: {error}"))
+}
+
+/// Preserve a pre-cutover runtime signing key across volume initialization.
+///
+/// A first open may discover an installed runtime key before a volume exists.
+/// The key must enter system-owned volume content before the durable-root
+/// cleanup, or later capsule verification sees a newly generated identity.
+fn ingest_runtime_key(home: &AstridHome, store: &RuntimePrincipalStore) -> StorageResult<()> {
+    let source = home.runtime_key_path();
+    let metadata = match std::fs::symlink_metadata(&source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(tree_error(&source, format!("inspect runtime key: {error}"))),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(tree_error(
+            &source,
+            "runtime key contains a symbolic link".to_owned(),
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(tree_error(
+            &source,
+            "runtime key is not a regular file".to_owned(),
+        ));
+    }
+
+    let name = ContentName::new(RUNTIME_KEY_PROJECTION.to_owned()).map_err(|error| {
+        tree_error(
+            &source,
+            format!("runtime key is not a valid content name: {error}"),
+        )
+    })?;
+    if store
+        .content()
+        .describe(&StateOwner::System, &name)
+        .map_err(|error| tree_error(&source, format!("inspect runtime key: {error}")))?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    store.put_contiguous_files(
+        StateOwner::System,
+        [ContiguousFileIngest::new(name, source, metadata.len())],
+    )
+}
+
+/// Materialize the compatibility sentinel from durable volume authority.
+fn seed_layout_version(home: &AstridHome, store: &RuntimePrincipalStore) -> StorageResult<()> {
+    let name = ContentName::new("etc/layout-version".to_owned())
+        .map_err(|error| tree_error(home.root(), format!("validate layout sentinel: {error}")))?;
+    if store
+        .content()
+        .describe(&StateOwner::System, &name)
+        .map_err(|error| tree_error(home.root(), format!("inspect layout sentinel: {error}")))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let staging = std::env::temp_dir().join(format!(
+        "astrid-layout-{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let result = (|| {
+        std::fs::write(&staging, astrid_core::dirs::LAYOUT_VERSION).map_err(|error| {
+            tree_error(
+                home.root(),
+                format!("write layout sentinel source: {error}"),
+            )
+        })?;
+        store.put_contiguous_files(
+            StateOwner::System,
+            [ContiguousFileIngest::new(
+                name,
+                &staging,
+                astrid_core::dirs::LAYOUT_VERSION.len() as u64,
+            )],
+        )
+    })();
+    let _ = std::fs::remove_file(&staging);
+    result
+}
+
+/// Publish current running projection changes, then retire their host files.
+pub(super) fn pack_and_retire_projection(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+) -> StorageResult<()> {
+    if home
+        .layout_version()
+        .map_err(|error| tree_io_error(&error))?
+        .as_deref()
+        == Some(astrid_core::dirs::LEGACY_LAYOUT_VERSION)
+    {
+        return legacy_projection_pack(home, store);
+    }
+    if validate_surviving_projection(home.root(), home.root())? {
+        let receipt = active::read(home, store)?;
+        match receipt {
+            Some(receipt) if receipt.phase() == ReceiptPhase::Active => {
+                publish_active_projection(home, store)?;
+            },
+            Some(receipt) => {
+                let scanned = scan(home.root())?;
+                validate_retiring_host_subset(home, &receipt, &scanned)?;
+            },
+            None => {
+                let scanned = scan(home.root())?;
+                if !scanned.is_empty() && !is_exactly_pack_open_staging_journal(&scanned) {
+                    let names = scanned
+                        .iter()
+                        .map(|entry| entry.name().as_str())
+                        .collect::<Vec<_>>();
+                    return Err(tree_error(
+                        home.root(),
+                        format!(
+                            "active projection receipt is missing for surviving host projection: {names:?}"
+                        ),
+                    ));
+                }
+            },
+        }
+    }
+    transition_retiring_projection(home, store)?;
+    retire_projection(home)?;
+    active::clear(store, home).map(|_| ())
+}
+
+fn confined_projection_path(root: &Path, relative: &str) -> StorageResult<PathBuf> {
+    let normalized = normalize_relative_path(relative);
+    let escaped = || {
+        tree_error(
+            root,
+            format!("projection name escaped runtime root: {relative}"),
+        )
+    };
+    if normalized.is_empty() || normalized.starts_with('/') || Path::new(relative).is_absolute() {
+        return Err(escaped());
+    }
+    let mut path = root.to_path_buf();
+    for segment in normalized.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(tree_error(
+                root,
+                format!("projection name has a non-normal path component: {relative}"),
+            ));
+        }
+        if segment.len() == 2 && segment.as_bytes()[1] == b':' {
+            return Err(escaped());
+        }
+        path.push(segment);
+    }
+    if !path.starts_with(root) {
+        return Err(escaped());
+    }
+    Ok(path)
+}
+
+fn write_projection_file(root: &Path, relative: &str, bytes: &[u8]) -> StorageResult<()> {
+    let path = confined_projection_path(root, relative)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| tree_error(&path, "projection path has no parent".to_owned()))?;
+    super::native_io::ensure_private_directory(parent)?;
+    astrid_core::platform_fs::atomic_write_private_file(&path, bytes)
+        .map_err(|error| tree_error(&path, format!("project volume-backed file: {error}")))?;
+    Ok(())
+}
+
+fn is_staging_generation(name: &str) -> bool {
+    name.strip_prefix("var/content-staging/generations/")
+        .is_some_and(|name| name.ends_with(".sealed"))
+}
+
+fn retire_projection(home: &AstridHome) -> StorageResult<()> {
+    let root = home.root();
+    astrid_core::dirs::retire_projection_root(root)
+        .map_err(|error| tree_error(root, format!("retire projection: {error}")))
+}
+
+fn active_projection_entries(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+) -> StorageResult<Vec<ActiveProjectionEntry>> {
+    let entries = store
+        .content()
+        .list(&StateOwner::System)
+        .map_err(|error| tree_error(home.root(), format!("list active projection: {error}")))?;
+    Ok(entries
+        .into_iter()
+        .filter(|entry| !is_excluded(entry.name().as_str()))
+        .filter(|entry| !is_retired_legacy_projection(home, entry.name().as_str()))
+        .map(|entry| ActiveProjectionEntry {
+            name: entry.name().clone(),
+            file: entry.file(),
+            logical_bytes: entry.logical_bytes(),
+        })
+        .collect())
+}
+
+fn receipt_ingest(
+    home: &AstridHome,
+    phase: ReceiptPhase,
+    entries: &[ActiveProjectionEntry],
+) -> StorageResult<PackedProjectionIngest> {
+    let bytes = active::encode(home, phase, entries)?;
+    Ok(PackedProjectionIngest::bytes(
+        active::active_projection_name()?,
+        bytes,
+    ))
+}
+
+fn rotate_active_receipt(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+    entries: &[ActiveProjectionEntry],
+) -> StorageResult<()> {
+    let receipt = receipt_ingest(home, ReceiptPhase::Active, entries)?;
+    store.replace_contiguous_files_removing_exact(StateOwner::System, [receipt], &[], None)?;
+    store
+        .content()
+        .flush()
+        .map_err(|error| tree_error(home.root(), format!("flush active receipt: {error}")))
+}
+
+pub(super) fn establish_active_receipt(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+) -> StorageResult<()> {
+    let entries = active_projection_entries(home, store)?;
+    rotate_active_receipt(home, store, &entries)
+}
+
+struct ActiveReceiptDeriver {
+    home: AstridHome,
+    entries: Vec<(ContentName, u64)>,
+}
+
+impl PrepareDerivedBatchContent for ActiveReceiptDeriver {
+    fn prepare(
+        &mut self,
+        prepared: &std::collections::BTreeMap<ContentName, crate::content::ContentDescriptor>,
+    ) -> Result<(ContentName, Vec<u8>), crate::content::PrincipalContentError> {
+        let entries = self
+            .entries
+            .iter()
+            .map(|(name, logical_bytes)| {
+                let descriptor = prepared.get(name).ok_or_else(|| {
+                    PrincipalProjectionError::Engine(format!(
+                        "prepared runtime projection omitted {}",
+                        name.as_str()
+                    ))
+                })?;
+                if descriptor.logical_bytes() != *logical_bytes {
+                    return Err(PrincipalProjectionError::Engine(format!(
+                        "prepared runtime projection changed {}",
+                        name.as_str()
+                    )));
+                }
+                Ok(ActiveProjectionEntry {
+                    name: name.clone(),
+                    file: descriptor.file(),
+                    logical_bytes: *logical_bytes,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let bytes = active::encode(&self.home, ReceiptPhase::Active, &entries)
+            .map_err(|error| PrincipalProjectionError::Engine(error.to_string()))?;
+        let name = active::active_projection_name()
+            .map_err(|error| PrincipalProjectionError::Engine(error.to_string()))?;
+        Ok((name, bytes))
+    }
+}
+
+fn publish_active_projection(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+) -> StorageResult<()> {
+    let receipt = active::read(home, store)?.ok_or_else(|| {
+        tree_error(
+            home.root(),
+            "active projection receipt is missing for host publication",
+        )
+    })?;
+    let scanned = scan(home.root())?;
+    let surviving = scanned
+        .iter()
+        .map(RuntimeTreeEntry::name)
+        .cloned()
+        .collect::<Vec<_>>();
+    let removals = active::removals(&receipt, &surviving)?;
+    let receipt_entries = scanned
+        .iter()
+        .map(|entry| (entry.name().clone(), entry.logical_bytes()))
+        .collect::<Vec<_>>();
+    let mut derived = ActiveReceiptDeriver {
+        home: home.clone(),
+        entries: receipt_entries,
+    };
+    let ingests = scanned.into_iter().map(|entry| {
+        PackedProjectionIngest::File(ContiguousFileIngest::new(
+            entry.name,
+            entry.source_path,
+            entry.logical_bytes,
+        ))
+    });
+    store.replace_contiguous_files_removing_exact(
+        StateOwner::System,
+        ingests,
+        &removals,
+        Some(&mut derived),
+    )?;
+    store
+        .content()
+        .flush()
+        .map_err(|error| tree_error(home.root(), format!("flush active projection: {error}")))?;
+    Ok(())
+}
+
+fn transition_retiring_projection(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+) -> StorageResult<()> {
+    let receipt = active::read(home, store)?;
+    let Some(receipt) = receipt else {
+        return Ok(());
+    };
+    if receipt.phase() == ReceiptPhase::Retiring {
+        return Ok(());
+    }
+    let entries = active_projection_entries(home, store)?;
+    let receipt = receipt_ingest(home, ReceiptPhase::Retiring, &entries)?;
+    store.replace_contiguous_files_removing_exact(StateOwner::System, [receipt], &[], None)?;
+    store
+        .content()
+        .flush()
+        .map_err(|error| tree_error(home.root(), format!("flush retiring receipt: {error}")))
+}
+
+fn legacy_projection_pack(home: &AstridHome, store: &RuntimePrincipalStore) -> StorageResult<()> {
+    admit(store, home.root())?;
+    store
+        .content()
+        .flush()
+        .map_err(|error| tree_error(home.root(), format!("flush volume projection: {error}")))?;
+    retire_projection(home)
+}
+fn tree_io_error(error: &std::io::Error) -> StorageError {
+    StorageError::Connection(error.to_string())
 }
 
 fn tree_error(path: &Path, detail: impl std::fmt::Display) -> StorageError {
     StorageError::Connection(format!("runtime tree {}: {detail}", path.display()))
 }
 
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
-
-    use sha2::{Digest as _, Sha256};
-
-    use super::*;
-    use crate::volume::{AstridVolume as _, HostedFileVolume};
-    use crate::{AstridFilesystem, FilesystemPath, KvQuotaResolver, open_runtime_principal_store};
-    use astrid_core::dirs::AstridHome;
-
-    fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
-        Arc::new(|owner: &StateOwner| {
-            Ok(match owner {
-                StateOwner::System => None,
-                StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
-            })
-        })
+/// Reconcile a surviving running projection before volume-backed restore.
+///
+/// A stopped CLI home has only the hosted volume. A daemon interrupted before
+/// post-exit retirement still owns its host projection, however, and that tree
+/// may contain generations newer than the last packed volume. Admit and flush
+/// it first so the subsequent projection restore mounts the newest admitted
+/// generation instead of rewinding the host tree.
+pub(super) fn reconcile_running_projection(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+    allow_receiptless_bootstrap: bool,
+) -> StorageResult<()> {
+    let layout_version = home
+        .layout_version()
+        .map_err(|error| tree_io_error(&error))?;
+    if layout_version.as_deref() == Some(astrid_core::dirs::LEGACY_LAYOUT_VERSION) {
+        return Ok(());
     }
 
-    #[test]
-    fn excludes_windows_separator_paths() {
-        for path in ["volume", "volume\\compacting", "run\\system.sock"] {
-            let normalized = normalize_relative_path(path);
-            assert!(is_excluded(&normalized), "path was not excluded: {path}");
-        }
-        assert_eq!(
-            normalize_relative_path("run\\system.ready"),
-            "run/system.ready"
-        );
+    let surviving = validate_surviving_projection(home.root(), home.root())?;
+    let receipt = active::read_relocatable(home, store)?;
+    match receipt {
+        None => {
+            let scanned = scan(home.root())?;
+            if surviving
+                && (!allow_receiptless_bootstrap || !is_bootstrap_surviving_projection(&scanned))
+            {
+                let names = scanned
+                    .iter()
+                    .map(|entry| entry.name().as_str())
+                    .collect::<Vec<_>>();
+                return Err(tree_error(
+                    home.root(),
+                    format!(
+                        "active projection receipt is missing for surviving host projection: {names:?}"
+                    ),
+                ));
+            }
+        },
+        Some(receipt) if !receipt.root_matches(home)? => {
+            // A portable active-volume copy is volume-authoritative. Host
+            // bytes are neither admitted nor allowed beyond trusted bootstrap
+            // sentinels; the copied receipt is simply rebound to the new root.
+            if receipt.phase() != ReceiptPhase::Active {
+                return Err(tree_error(
+                    home.root(),
+                    "active projection receipt root does not match this durable root",
+                ));
+            }
+            let scanned = scan(home.root())?;
+            if surviving && !is_bootstrap_surviving_projection(&scanned) {
+                return Err(tree_error(
+                    home.root(),
+                    "relocated active receipt is permitted only for trusted bootstrap files",
+                ));
+            }
+            restore_projection(home, store, &store.content)?;
+        },
+        Some(receipt) => match receipt.phase() {
+            ReceiptPhase::Active => {
+                let scanned = scan(home.root())?;
+                if surviving && !is_bootstrap_surviving_projection(&scanned) {
+                    publish_active_projection(home, store)?;
+                } else {
+                    restore_projection(home, store, &store.content)?;
+                }
+            },
+            ReceiptPhase::Retiring => {
+                let scanned = scan(home.root())?;
+                validate_retiring_host_subset(home, &receipt, &scanned)?;
+                restore_projection(home, store, &store.content)?;
+            },
+        },
     }
-
-    fn durable_files(wasm_hash: &str, wasm: &[u8], nested_wasm: &[u8]) -> Vec<(String, Vec<u8>)> {
-        vec![
-            (format!("bin/{wasm_hash}.wasm"), wasm.to_vec()),
-            (
-                "run/capsules/example/meta.json".to_owned(),
-                format!("{{\"wasm_hash\":\"{wasm_hash}\"}}").into_bytes(),
-            ),
-            (
-                "run/capsules/example/component.wasm".to_owned(),
-                nested_wasm.to_vec(),
-            ),
-            (
-                "wit/astrid-contracts.wit".to_owned(),
-                b"package astrid:contracts;".to_vec(),
-            ),
-            ("etc/layout-version".to_owned(), b"2".to_vec()),
-            ("keys/runtime.key".to_owned(), b"runtime-key".to_vec()),
-            ("run/system.lock".to_owned(), b"lock".to_vec()),
-            ("run/system.pid".to_owned(), b"pid".to_vec()),
-            ("run/system.ready".to_owned(), b"ready".to_vec()),
-            ("run/system.token".to_owned(), b"token".to_vec()),
-            ("var/content-staging/payload".to_owned(), b"staged".to_vec()),
-            ("var/config.json".to_owned(), b"{\"durable\":true}".to_vec()),
-            ("var/migrations/marker".to_owned(), b"migration".to_vec()),
-            ("var/principal-store/legacy".to_owned(), b"legacy".to_vec()),
-            ("bin/astrid".to_owned(), b"bootstrap".to_vec()),
-            ("bin/astrid-daemon".to_owned(), b"bootstrap-daemon".to_vec()),
-            ("astrid".to_owned(), b"root-bootstrap".to_vec()),
-            (
-                "astrid-daemon".to_owned(),
-                b"root-bootstrap-daemon".to_vec(),
-            ),
-        ]
+    if active::read_relocatable(home, store)?.is_some() {
+        establish_active_receipt(home, store)?;
+    } else {
+        restore_projection(home, store, &store.content)?;
+        establish_active_receipt(home, store)?;
     }
-
-    #[tokio::test]
-    async fn admits_runtime_tree_and_reopens_from_preclose_volume_copy() {
-        let source = tempfile::tempdir().unwrap();
-        let home_dir = tempfile::tempdir().unwrap();
-        let home = AstridHome::from_path(home_dir.path());
-        home.ensure().unwrap();
-        let wasm = b"\0asm\x01\0\0\0runtime-wasm-unique".to_vec();
-        let nested_wasm = b"\0asm\x01\0\0\0nested-wasm-unique".to_vec();
-        let wasm_hash = blake3::hash(&wasm).to_hex().to_string();
-        let durable = durable_files(&wasm_hash, &wasm, &nested_wasm);
-        for (relative, bytes) in &durable {
-            let path = source.path().join(relative);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, bytes).unwrap();
-        }
-        for relative in [
-            "volume",
-            "volume.compacting",
-            "volume.previous",
-            "run/system.sock",
-        ] {
-            let path = source.path().join(relative);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, b"host-only").unwrap();
-        }
-
-        let store = open_runtime_principal_store(&home, unlimited_quota())
-            .await
-            .unwrap();
-        store.admit_runtime_tree(source.path()).unwrap();
-
-        let names = store
-            .content()
-            .list(&StateOwner::System)
-            .unwrap()
-            .into_iter()
-            .map(|entry| entry.name().as_str().to_owned())
-            .collect::<Vec<_>>();
-        let mut expected_names = durable
-            .iter()
-            .map(|(name, _)| name.clone())
-            .collect::<Vec<_>>();
-        expected_names.sort();
-        assert_eq!(names, expected_names);
-
-        let copied_home_dir = tempfile::tempdir().unwrap();
-        let copied_home = AstridHome::from_path(copied_home_dir.path());
-        copied_home.ensure().unwrap();
-        std::fs::copy(
-            home.storage_volume_path(),
-            copied_home.storage_volume_path(),
-        )
-        .unwrap();
-        let volume = HostedFileVolume::open(copied_home.storage_volume_path()).unwrap();
-        assert!(
-            volume
-                .list_regions("representations/blobs/loose")
-                .unwrap()
-                .is_empty()
-        );
-        drop(volume);
-
-        let reopened = open_runtime_principal_store(&copied_home, unlimited_quota())
-            .await
-            .unwrap();
-        let filesystem = AstridFilesystem::new(reopened.content(), StateOwner::System);
-        let expected_count = durable.len();
-        let mut reconstructed = BTreeMap::new();
-        for (name, bytes) in durable {
-            let path = FilesystemPath::new(name).unwrap();
-            let entry = filesystem.stat(&path).unwrap();
-            let actual = filesystem.read(&path, 0, entry.logical_bytes()).unwrap();
-            let expected_digest = Sha256::digest(&bytes);
-            assert_eq!(Sha256::digest(&actual), expected_digest);
-            reconstructed.insert(path.as_str().to_owned(), actual);
-        }
-        assert_eq!(reconstructed.len(), expected_count);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rejects_redirects_before_publication() {
-        use std::os::unix::fs::symlink;
-
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        symlink(outside.path(), root.path().join("redirect")).unwrap();
-        let error = scan(root.path()).unwrap_err();
-        assert!(error.to_string().contains("symbolic link"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn skips_special_entries_without_failing_scan() {
-        use std::os::unix::net::UnixListener;
-
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("run")).unwrap();
-        std::fs::write(root.path().join("regular"), b"durable").unwrap();
-        let _socket = UnixListener::bind(root.path().join("run/other.sock")).unwrap();
-
-        let entries = scan(root.path()).unwrap();
-        assert_eq!(
-            entries
-                .iter()
-                .map(|entry| entry.name().as_str())
-                .collect::<Vec<_>>(),
-            ["regular"]
-        );
-    }
+    Ok(())
 }
+
+fn validate_retiring_host_subset(
+    home: &AstridHome,
+    receipt: &super::runtime_tree_active::ActiveProjectionReceipt,
+    scanned: &[RuntimeTreeEntry],
+) -> StorageResult<()> {
+    for entry in scanned {
+        if !receipt.contains_inventory_name(entry.name().as_str()) {
+            return Err(tree_error(
+                home.root(),
+                format!(
+                    "retiring projection contains unreceipted host file {}",
+                    entry.name().as_str()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_bootstrap_surviving_projection(scanned: &[RuntimeTreeEntry]) -> bool {
+    !scanned.is_empty()
+        && scanned.iter().all(|entry| {
+            matches!(
+                entry.name().as_str(),
+                "etc/layout-version" | RUNTIME_KEY_PROJECTION | STAGING_JOURNAL_PROJECTION
+            )
+        })
+}
+
+/// Pack-open materializes the staging journal before retirement can run.
+///
+/// That one enumerated regular file is not a surviving projection and must not
+/// be admitted without an ACTIVE receipt. Directories, symlinks, siblings,
+/// alternate spellings, and the broader bootstrap set keep fail-closed;
+/// redirects still fail in preflight.
+fn is_exactly_pack_open_staging_journal(scanned: &[RuntimeTreeEntry]) -> bool {
+    matches!(
+        scanned,
+        [entry] if entry.name().as_str() == STAGING_JOURNAL_PROJECTION
+    )
+}
+
+/// Validate redirects and unadmitted specials before any destructive restore.
+///
+/// Returns whether the tree contains a regular projection candidate. Excluded
+/// host endpoints and media paths remain outside authority and cannot make an
+/// otherwise volume-only home look like a surviving projection.
+fn validate_surviving_projection(root: &Path, directory: &Path) -> StorageResult<bool> {
+    let mut entries = std::fs::read_dir(directory)
+        .map_err(|error| tree_error(directory, format!("read running projection: {error}")))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| tree_error(directory, format!("read projection entry: {error}")))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+
+    let mut has_projection = false;
+    for entry in entries {
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| tree_error(&path, format!("inspect projection: {error}")))?;
+        if metadata.file_type().is_symlink() {
+            return Err(tree_error(
+                &path,
+                "running projection contains a symbolic link".to_owned(),
+            ));
+        }
+
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| tree_error(&path, "projection entry escaped runtime root".to_owned()))?;
+        let relative = relative
+            .to_str()
+            .ok_or_else(|| tree_error(&path, "projection path is not valid UTF-8".to_owned()))?;
+        let relative = normalize_relative_path(relative);
+        if is_excluded(relative.as_str()) {
+            continue;
+        }
+        if metadata.is_dir() {
+            if relative.as_str() == STAGING_JOURNAL_PROJECTION {
+                return Err(tree_error(
+                    &path,
+                    "pack-open staging journal is not a regular file".to_owned(),
+                ));
+            }
+            has_projection |= validate_surviving_projection(root, &path)?;
+        } else if metadata.is_file() {
+            has_projection = true;
+        } else {
+            return Err(tree_error(
+                &path,
+                "running projection contains an unadmitted special entry".to_owned(),
+            ));
+        }
+    }
+    Ok(has_projection)
+}
+
+/// Publish the live running projection without retiring its host files.
+pub(super) fn publish_running_projection(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+) -> StorageResult<()> {
+    if home
+        .layout_version()
+        .map_err(|error| tree_io_error(&error))?
+        .as_deref()
+        == Some(astrid_core::dirs::LEGACY_LAYOUT_VERSION)
+    {
+        return legacy_projection_pack_publish_only(home, store);
+    }
+    publish_active_projection(home, store)
+}
+
+fn legacy_projection_pack_publish_only(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+) -> StorageResult<()> {
+    admit(store, home.root())?;
+    store
+        .content()
+        .flush()
+        .map_err(|error| tree_error(home.root(), format!("flush running projection: {error}")))
+}
+
+#[cfg(test)]
+#[path = "runtime_tree_tests.rs"]
+mod tests;

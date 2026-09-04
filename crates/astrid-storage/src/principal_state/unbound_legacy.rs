@@ -343,6 +343,15 @@ mod tests {
         })
     }
 
+    fn seed_legacy_layout(home: &AstridHome) {
+        std::fs::create_dir_all(home.etc_dir()).unwrap();
+        std::fs::write(
+            home.layout_version_path(),
+            astrid_core::dirs::LEGACY_LAYOUT_VERSION,
+        )
+        .unwrap();
+    }
+
     fn write_admitted_profile(home: &AstridHome, alias: &PrincipalId, key: [u8; 32]) {
         let mut profile = PrincipalProfile::default();
         profile.auth.public_keys.push(DeviceKey::new(
@@ -360,6 +369,7 @@ mod tests {
     async fn leftover_alias_home_and_capsule_kv_import_without_prior_identity() {
         let directory = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(directory.path());
+        seed_legacy_layout(&home);
         let admitted = PrincipalId::new("default").unwrap();
         write_admitted_profile(&home, &admitted, [0x11; 32]);
         let leftover = PrincipalId::new("legacy-agent").unwrap();

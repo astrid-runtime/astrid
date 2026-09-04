@@ -595,6 +595,19 @@ impl ContentWriteOutcome {
     }
 }
 
+/// Internal callback that derives content after every source is prepared.
+pub(crate) trait PrepareDerivedBatchContent {
+    /// Return the derived name and bytes for inclusion in the same root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a content error before the owner-root transaction is committed.
+    fn prepare(
+        &mut self,
+        entries: &std::collections::BTreeMap<ContentName, ContentDescriptor>,
+    ) -> Result<(ContentName, Vec<u8>), PrincipalContentError>;
+}
+
 /// Failure to read or mutate principal-owned content.
 #[derive(Debug)]
 #[non_exhaustive]

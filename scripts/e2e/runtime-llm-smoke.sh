@@ -61,6 +61,37 @@ if found != expected_count:
 PY
 }
 
+set_openai_model_env() {
+  local bearer=$1
+  local value=$2
+  local out=$3
+  local status
+
+  status="$(http_status POST /api/capsules/astrid-capsule-openai-compat/env/model "$bearer" \
+    "{\"value\":\"$value\"}" "$out")"
+  assert_status "openai model env write ($value)" "$status" 204
+}
+
+run_shared_model_baseline_smoke() {
+  local bearer=$1
+  local status
+
+  note "checking fake-echo model catalog before scoped overrides"
+  status="$(http_status GET /api/models "$bearer" "" "$ARTIFACTS/shared-models.json")"
+  assert_status "shared model list" "$status" 200
+  json_assert_model_list_contains "$ARTIFACTS/shared-models.json" "openai-compat:fake-echo"
+  assert_model_list_count "$ARTIFACTS/shared-models.json" "openai-compat:fake-echo" 1
+  status="$(http_status PUT /api/models/active "$bearer" \
+    '{"id":"openai-compat:fake-echo"}' \
+    "$ARTIFACTS/shared-set-active-model.json")"
+  assert_status "shared set active model" "$status" 200
+  json_assert_model_id "$ARTIFACTS/shared-set-active-model.json" "openai-compat:fake-echo"
+  status="$(http_status GET /api/models "$bearer" "" "$ARTIFACTS/shared-models-after-active.json")"
+  assert_status "shared model list after active set" "$status" 200
+  json_assert_model_list_contains "$ARTIFACTS/shared-models-after-active.json" \
+    "openai-compat:fake-echo"
+}
+
 run_active_model_isolation_smoke() {
   local user_bearer=$1 ops_bearer=$2 user_principal=$3 ops_principal=$4
   local status deadline
@@ -68,8 +99,8 @@ run_active_model_isolation_smoke() {
   note "checking per-principal active model isolation"
   status="$(http_status GET /api/models "$user_bearer" "" "$ARTIFACTS/agent-models.json")"
   assert_status "agent model list" "$status" 200
-  json_assert_model_list_contains "$ARTIFACTS/agent-models.json" "openai-compat:fake-echo"
   json_assert_model_list_contains "$ARTIFACTS/agent-models.json" "openai-compat:fake-slow"
+  assert_model_list_count "$ARTIFACTS/agent-models.json" "openai-compat:fake-slow" 1
   status="$(http_status PUT /api/models/active "$user_bearer" \
     '{"id":"openai-compat:fake-slow"}' \
     "$ARTIFACTS/agent-set-active-model.json")"
@@ -109,7 +140,36 @@ run_active_model_isolation_smoke() {
     "$ARTIFACTS/agent-set-active-model-body-spoof.json")"
   assert_status "agent active model body spoof ignored" "$status" 200
   json_assert_model_id "$ARTIFACTS/agent-set-active-model-body-spoof.json" "openai-compat:fake-slow"
-  run_concurrent_model_write_smoke "$user_bearer" "$ops_bearer" "$user_principal" "$ops_principal"
+  run_scoped_concurrent_model_write_smoke "$user_bearer" "$ops_bearer"
+}
+
+run_scoped_concurrent_model_write_smoke() {
+  local user_bearer=$1 ops_bearer=$2
+  local user_status_file ops_status_file user_out ops_out user_pid ops_pid
+  local user_wait=0 ops_wait=0
+
+  note "checking concurrent scoped active model writes stay principal-isolated"
+  user_status_file="$ARTIFACTS/scoped-concurrent-model-user.status"
+  ops_status_file="$ARTIFACTS/scoped-concurrent-model-ops.status"
+  user_out="$ARTIFACTS/scoped-concurrent-model-user-set.json"
+  ops_out="$ARTIFACTS/scoped-concurrent-model-ops-set.json"
+
+  (http_status PUT /api/models/active "$user_bearer" \
+    '{"id":"openai-compat:fake-slow"}' "$user_out" > "$user_status_file") &
+  user_pid=$!
+  (http_status PUT /api/models/active "$ops_bearer" \
+    '{"id":"openai-compat:fake-toolish"}' "$ops_out" > "$ops_status_file") &
+  ops_pid=$!
+  wait "$user_pid" || user_wait=$?
+  wait "$ops_pid" || ops_wait=$?
+  [[ "$user_wait" -eq 0 ]] || fail "agent scoped concurrent active model request failed"
+  [[ "$ops_wait" -eq 0 ]] || fail "operator scoped concurrent active model request failed"
+  assert_model_write_status "agent scoped concurrent active model" \
+    "$user_status_file" "$user_out"
+  assert_model_write_status "operator scoped concurrent active model" \
+    "$ops_status_file" "$ops_out"
+  json_assert_model_id "$user_out" "openai-compat:fake-slow"
+  json_assert_model_id "$ops_out" "openai-compat:fake-toolish"
 }
 
 run_empty_model_catalog_smoke() {
@@ -232,39 +292,35 @@ run_llm_provider_smoke() {
   local principal=$2
   local models_file=$3
   local fake_base_url=$4
-  local status
+  local status target
 
   note "checking fake LLM provider failure handling"
-  json_assert_model_list_contains "$models_file" "openai-compat:fake-error"
-  json_assert_model_list_contains "$models_file" "openai-compat:fake-malformed"
-  json_assert_model_list_contains "$models_file" "openai-compat:fake-timeout"
-  assert_model_list_count "$models_file" "openai-compat:duplicate-name" 1
-
   run_empty_model_catalog_smoke "$fake_base_url"
 
-  status="$(http_status PUT /api/models/active "$bearer" \
-    '{"id":"openai-compat:fake-error"}' \
-    "$ARTIFACTS/agent-set-active-model-fake-error.json")"
-  assert_status "agent set fake-error active model" "$status" 200
-  json_assert_model_id "$ARTIFACTS/agent-set-active-model-fake-error.json" "openai-compat:fake-error"
-  assert_bounded_llm_error_surface "$principal" "openai-compat:fake-error" "fake-error" \
-    'fake upstream error\|502\|error'
+  for target in fake-error fake-malformed fake-timeout; do
+    set_openai_model_env "$bearer" "$target" \
+      "$ARTIFACTS/agent-openai-model-$target.json"
+    status="$(http_status GET /api/models "$bearer" "" \
+      "$ARTIFACTS/agent-models-$target.json")"
+    assert_status "agent $target model list" "$status" 200
+    json_assert_model_list_contains "$ARTIFACTS/agent-models-$target.json" \
+      "openai-compat:$target"
+    assert_model_list_count "$ARTIFACTS/agent-models-$target.json" \
+      "openai-compat:$target" 1
+    status="$(http_status PUT /api/models/active "$bearer" \
+      "{\"id\":\"openai-compat:$target\"}" \
+      "$ARTIFACTS/agent-set-active-model-$target.json")"
+    assert_status "agent set $target active model" "$status" 200
+    json_assert_model_id "$ARTIFACTS/agent-set-active-model-$target.json" \
+      "openai-compat:$target"
+    assert_bounded_llm_error_surface "$principal" "openai-compat:$target" "$target" \
+      'fake upstream error\|502\|malformed\|invalid\|json\|timeout\|timed out\|deadline\|error'
+  done
 
-  status="$(http_status PUT /api/models/active "$bearer" \
-    '{"id":"openai-compat:fake-malformed"}' \
-    "$ARTIFACTS/agent-set-active-model-fake-malformed.json")"
-  assert_status "agent set fake-malformed active model" "$status" 200
-  json_assert_model_id "$ARTIFACTS/agent-set-active-model-fake-malformed.json" "openai-compat:fake-malformed"
-  assert_bounded_llm_error_surface "$principal" "openai-compat:fake-malformed" "fake-malformed" \
-    'malformed\|invalid\|json\|error'
-
-  status="$(http_status PUT /api/models/active "$bearer" \
-    '{"id":"openai-compat:fake-timeout"}' \
-    "$ARTIFACTS/agent-set-active-model-fake-timeout.json")"
-  assert_status "agent set fake-timeout active model" "$status" 200
-  json_assert_model_id "$ARTIFACTS/agent-set-active-model-fake-timeout.json" "openai-compat:fake-timeout"
-  assert_bounded_llm_error_surface "$principal" "openai-compat:fake-timeout" "fake-timeout" \
-    'timeout\|timed out\|deadline\|error'
+  set_openai_model_env "$bearer" fake-slow "$ARTIFACTS/agent-openai-model-restore.json"
+  status="$(http_status GET /api/models "$bearer" "" "$models_file")"
+  assert_status "agent restored model list" "$status" 200
+  json_assert_model_list_contains "$models_file" "openai-compat:fake-slow"
 
   status="$(http_status PUT /api/models/active "$bearer" \
     '{"id":"openai-compat:fake-slow"}' \

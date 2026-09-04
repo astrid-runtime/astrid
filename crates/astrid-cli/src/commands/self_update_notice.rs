@@ -191,14 +191,13 @@ mod tests {
     }
 
     #[test]
-    fn update_notice_uses_the_admitted_layout() {
+    fn update_notice_does_not_treat_a_fresh_volume_only_root_as_admitted() {
         let root = tempfile::tempdir().unwrap();
         let home = astrid_core::dirs::AstridHome::from_path(root.path().join("astrid-home"));
         home.ensure().unwrap();
 
-        assert_eq!(
-            cache_path_for(&home).unwrap(),
-            home.var_dir().join("update-check.json")
-        );
+        let error = cache_path_for(&home).unwrap_err();
+        assert!(error.to_string().contains("initialized Astrid home"));
+        assert_eq!(std::fs::read_dir(home.root()).unwrap().count(), 0);
     }
 }

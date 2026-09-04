@@ -233,7 +233,10 @@ async fn dispatch_subcommand(
             commands::daemon::handle_stop().await?;
             Ok(ExitCode::SUCCESS)
         },
-        Some(Commands::Restart) => commands::restart::run().await,
+        Some(Commands::Restart) => {
+            commands::daemon::validate_runtime_admission()?;
+            commands::restart::run().await
+        },
         Some(Commands::Storage { command }) => commands::storage::run(command),
         Some(Commands::Logs(args)) => commands::logs::run(&args).await,
         Some(Commands::Ps(args)) => commands::ps::run(args).await,
@@ -465,6 +468,9 @@ async fn dispatch_capsule_remove(
 }
 
 async fn dispatch_mcp(command: McpCommands) -> Result<ExitCode> {
+    if !matches!(command, McpCommands::Gc) {
+        commands::daemon::validate_runtime_admission()?;
+    }
     match command {
         McpCommands::Serve {
             workspace,

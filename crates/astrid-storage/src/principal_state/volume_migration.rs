@@ -44,14 +44,14 @@ pub(super) fn open_existing(
     Ok(Some((engine, receipt)))
 }
 
-/// Resolve the canonical volume and promote the released legacy path once.
+/// Resolve the canonical volume and promote a released legacy path once.
 ///
 /// Promotion happens before recovery so the runtime-tree admission walk can
 /// exclude the canonical media file and cannot mistake the legacy file for
 /// ordinary content. Seeing both paths is ambiguous and fails closed.
 fn promote_legacy_volume(home: &AstridHome) -> StorageResult<Option<std::path::PathBuf>> {
     let canonical = home.storage_volume_path();
-    let legacy = home.legacy_storage_volume_path();
+    let legacy = legacy_volume_path(home)?;
     let canonical_present = inspect_volume_entry(&canonical)?;
     let legacy_present = inspect_volume_entry(&legacy)?;
 
@@ -76,6 +76,85 @@ fn promote_legacy_volume(home: &AstridHome) -> StorageResult<Option<std::path::P
         },
         (false, false) => Ok(None),
     }
+}
+
+/// Choose the older media path while refusing ambiguous simultaneous inputs.
+fn legacy_volume_path(home: &AstridHome) -> StorageResult<std::path::PathBuf> {
+    let var_path = home.legacy_storage_volume_path();
+    let root_path = home.retired_root_storage_volume_path();
+    let var_present = inspect_volume_entry(&var_path)?;
+    let root_present = inspect_volume_entry(&root_path)?;
+    if var_present && root_present {
+        return Err(connection(format!(
+            "Astrid storage has both released legacy volumes: {} and {}",
+            var_path.display(),
+            root_path.display()
+        )));
+    }
+    Ok(if root_present { root_path } else { var_path })
+}
+
+/// Create and verify a fresh empty durable volume.
+pub(super) fn initialize_volume(
+    home: &AstridHome,
+    policy: DurableEnginePolicy<StateOwner>,
+) -> StorageResult<(RuntimeEngine, String)> {
+    let destination = home.storage_volume_path();
+    let temporary = destination.with_extension("migrating");
+    if temporary.exists() {
+        return Err(connection(format!(
+            "incomplete Astrid volume already exists: {}",
+            temporary.display()
+        )));
+    }
+    let volume = HostedFileVolume::open(&temporary).map_err(|error| {
+        connection(format!(
+            "create fresh Astrid volume {}: {error}",
+            temporary.display()
+        ))
+    })?;
+    let engine = RuntimeEngine::open_volume(
+        volume.clone(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+        DurableEnginePolicy::default(),
+    )
+    .map_err(|error| connection(format!("open fresh Astrid volume: {error}")))?;
+    for bootstrap in super::bootstrap::RuntimeBootstrapObject::registered() {
+        let record = bootstrap.record()?;
+        engine
+            .persist_standalone_object(&record)
+            .map_err(|error| connection(format!("persist volume bootstrap object: {error}")))?;
+    }
+    engine
+        .flush()
+        .map_err(|error| connection(format!("flush fresh Astrid volume: {error}")))?;
+    write_cutover_receipt(volume.as_ref(), &[])?;
+    engine
+        .close()
+        .map_err(|error| connection(format!("close fresh Astrid volume: {error}")))?;
+    drop(engine);
+    drop(volume);
+
+    super::native_io::rename_private_entry(&temporary, &destination)?;
+    super::native_io::sync_directory(home.root())?;
+    let volume = HostedFileVolume::open(&destination).map_err(|error| {
+        connection(format!(
+            "reopen fresh Astrid volume {}: {error}",
+            destination.display()
+        ))
+    })?;
+    let engine = RuntimeEngine::open_volume(
+        volume.clone(),
+        Blake3ObjectIdentityV1,
+        StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+        policy,
+    )
+    .map_err(|error| connection(format!("open verified fresh Astrid volume: {error}")))?;
+    let receipt = require_cutover_receipt(volume.as_ref(), Some(&[]))?;
+    Ok((engine, receipt))
 }
 
 fn inspect_volume_entry(path: &std::path::Path) -> StorageResult<bool> {

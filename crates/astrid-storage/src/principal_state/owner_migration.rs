@@ -612,11 +612,21 @@ mod tests {
         })
     }
 
+    fn seed_legacy_layout(home: &AstridHome) {
+        std::fs::create_dir_all(home.etc_dir()).unwrap();
+        std::fs::write(
+            home.layout_version_path(),
+            astrid_core::dirs::LEGACY_LAYOUT_VERSION,
+        )
+        .unwrap();
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn alias_roots_migrate_without_changing_generation_or_commit() {
         let directory = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(directory.path());
+        seed_legacy_layout(&home);
         let alias = PrincipalId::new("Alice").unwrap();
         let initial_public_key = [0x42; 32];
         let mut profile = PrincipalProfile::default();

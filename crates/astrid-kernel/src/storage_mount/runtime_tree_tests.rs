@@ -24,14 +24,28 @@ fn assert_entry_kind(
     name: &str,
     kind: StorageFilesystemEntryKindV1,
 ) {
-    assert!(
-        entries
-            .iter()
-            .any(|entry| entry.name == name && entry.kind == kind)
-    );
+    if !entries
+        .iter()
+        .any(|entry| entry.name == name && entry.kind == kind)
+    {
+        panic!("missing {name:?} of kind {kind:?}; entries {entries:?}");
+    }
 }
 
 fn seed_packed_runtime_tree(home: &astrid_core::dirs::AstridHome) -> String {
+    for directory in [
+        home.bin_dir(),
+        home.run_dir().join("capsules/example"),
+        home.wit_dir(),
+        home.home_dir().join("default"),
+        home.log_dir(),
+        home.keys_dir(),
+        home.var_dir().join("migrations"),
+        home.var_dir().join("content-staging"),
+        home.var_dir().join("principal-store"),
+    ] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
     let wasm = b"\0asm\x01\0\0\0runtime-mount-test";
     let wasm_hash = blake3::hash(wasm).to_hex().to_string();
     std::fs::write(home.bin_dir().join(format!("{wasm_hash}.wasm")), wasm).unwrap();
@@ -95,9 +109,12 @@ async fn assert_root_entries(lease: &StorageMountLeaseV1) {
     for name in ["bin", "etc", "home", "keys", "log", "run", "var", "wit"] {
         assert_entry_kind(&root_entries, name, StorageFilesystemEntryKindV1::Directory);
     }
-    for name in ["astrid", "astrid-daemon"] {
-        assert_entry_kind(&root_entries, name, StorageFilesystemEntryKindV1::File);
-    }
+    assert!(!root_entries.iter().any(|entry| entry.name == "astrid"));
+    assert!(
+        !root_entries
+            .iter()
+            .any(|entry| entry.name == "astrid-daemon")
+    );
     assert!(!root_entries.iter().any(|entry| entry.name == "volume"));
 }
 
@@ -108,9 +125,12 @@ async fn assert_packed_files(lease: &StorageMountLeaseV1, wasm_hash: &str) {
         &format!("{wasm_hash}.wasm"),
         StorageFilesystemEntryKindV1::File,
     );
-    for name in ["astrid", "astrid-daemon"] {
-        assert_entry_kind(&bin_entries, name, StorageFilesystemEntryKindV1::File);
-    }
+    assert!(!bin_entries.iter().any(|entry| entry.name == "astrid"));
+    assert!(
+        !bin_entries
+            .iter()
+            .any(|entry| entry.name == "astrid-daemon")
+    );
 
     let run_entries = read_directory_entries(lease, "run").await;
     assert_entry_kind(
@@ -183,9 +203,10 @@ async fn assert_packed_files(lease: &StorageMountLeaseV1, wasm_hash: &str) {
 async fn assert_volume_and_socket_absent(lease: &StorageMountLeaseV1) {
     let run_entries = read_directory_entries(lease, "run").await;
     assert!(!run_entries.iter().any(|entry| entry.name == "system.sock"));
-    for sentinel in ["system.lock", "system.pid", "system.ready", "system.token"] {
-        assert_entry_kind(&run_entries, sentinel, StorageFilesystemEntryKindV1::File);
-    }
+    assert!(!run_entries.iter().any(|entry| entry.name == "system.lock"));
+    assert!(!run_entries.iter().any(|entry| entry.name == "system.pid"));
+    assert!(!run_entries.iter().any(|entry| entry.name == "system.ready"));
+    assert!(!run_entries.iter().any(|entry| entry.name == "system.token"));
 
     let etc_entries = read_directory_entries(lease, "etc").await;
     assert_entry_kind(
@@ -202,12 +223,7 @@ async fn assert_volume_and_socket_absent(lease: &StorageMountLeaseV1) {
     );
 
     let var_entries = read_directory_entries(lease, "var").await;
-    for name in [
-        "config.json",
-        "content-staging",
-        "migrations",
-        "principal-store",
-    ] {
+    for name in ["config.json", "content-staging", "migrations"] {
         let kind = if name == "config.json" {
             StorageFilesystemEntryKindV1::File
         } else {
@@ -215,12 +231,18 @@ async fn assert_volume_and_socket_absent(lease: &StorageMountLeaseV1) {
         };
         assert_entry_kind(&var_entries, name, kind);
     }
+    assert!(
+        !var_entries
+            .iter()
+            .any(|entry| entry.name == "principal-store")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_mount_projects_packed_runtime_tree_with_only_volume_and_socket_leftovers() {
     let temporary = tempfile::tempdir().unwrap();
     let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
+    home.ensure().unwrap();
     let kernel = crate::test_kernel_with_home(home.clone()).await;
     let store = kernel.principal_store.clone().unwrap();
 

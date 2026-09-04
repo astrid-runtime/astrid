@@ -25,6 +25,7 @@ async fn promotes_released_volume_path_before_opening() {
 
     let canonical = home.storage_volume_path();
     let legacy = home.legacy_storage_volume_path();
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
     std::fs::rename(&canonical, &legacy).unwrap();
     assert!(!canonical.exists());
     assert!(legacy.is_file());
@@ -45,6 +46,7 @@ fn rejects_conflicting_canonical_and_legacy_volume_paths() {
     home.ensure().unwrap();
 
     std::fs::write(home.storage_volume_path(), b"canonical").unwrap();
+    std::fs::create_dir_all(home.legacy_storage_volume_path().parent().unwrap()).unwrap();
     std::fs::write(home.legacy_storage_volume_path(), b"legacy").unwrap();
 
     let error = super::volume_migration::existing_volume_available(&home).unwrap_err();
@@ -76,6 +78,7 @@ fn rejects_non_regular_legacy_volume_without_promoting() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
     home.ensure().unwrap();
+    std::fs::create_dir_all(home.legacy_storage_volume_path().parent().unwrap()).unwrap();
     std::fs::create_dir(home.legacy_storage_volume_path()).unwrap();
 
     let error = super::volume_migration::existing_volume_available(&home).unwrap_err();
@@ -117,6 +120,7 @@ fn rejects_symlink_legacy_volume_without_promoting() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
     home.ensure().unwrap();
+    std::fs::create_dir_all(home.legacy_storage_volume_path().parent().unwrap()).unwrap();
     let target = directory.path().join("legacy-target");
     std::fs::write(&target, b"not a volume").unwrap();
     symlink(&target, home.legacy_storage_volume_path()).unwrap();

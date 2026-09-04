@@ -2,6 +2,7 @@
 
 #[cfg(not(target_family = "wasm"))]
 mod admission;
+mod publish;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Read;
@@ -16,14 +17,15 @@ use super::projection::{
     BatchAdmission, DeferredAdmission, StagedObjectBatch, admit_object_batch_observed,
 };
 use super::{
-    CatalogValue, EngineSink, ModelError, ObjectId, ObjectRecord, ObjectReference,
-    PrincipalContentStore, PrincipalProjectionEngine, PrincipalProjectionError, ReferenceKind,
-    VerifiedContent, build_content_streaming, insert, invalid, lookup, map_stream_error,
+    EngineSink, ObjectRecord, ObjectReference, PrincipalContentStore, PrincipalProjectionEngine,
+    PrincipalProjectionError, ReferenceKind, VerifiedContent, build_content_streaming,
+    map_stream_error,
 };
 use crate::content::{
     BulkIngestDiagnostics, BulkIngestPhaseDurations, BulkIngestPolicy, ChunkingProfile,
-    ContentBatchEntry, ContentBatchExpectation, ContentBatchWriteOutcome, ContentChangeCache,
-    ContentIngest, ContentName, ContentObservation, PrincipalContentError, SourceObservation,
+    ContentBatchExpectation, ContentBatchWriteOutcome, ContentChangeCache, ContentIngest,
+    ContentName, ContentObservation, PrepareDerivedBatchContent, PrincipalContentError,
+    SourceObservation,
 };
 
 type PendingIngest<R> = (ContentName, (R, ChunkingProfile, Option<SourceObservation>));
@@ -73,6 +75,31 @@ struct PreparedContent {
     observation: ContentObservation,
 }
 
+struct BatchPublicationContext<'a> {
+    expectation: Option<&'a ContentBatchExpectation>,
+    removals: &'a [ContentName],
+    derived: Option<&'a mut dyn PrepareDerivedBatchContent>,
+}
+
+fn publish_only() -> BatchPublicationContext<'static> {
+    BatchPublicationContext {
+        expectation: None,
+        removals: &[],
+        derived: None,
+    }
+}
+
+fn removing_exact<'a>(
+    removals: &'a [ContentName],
+    derived: Option<&'a mut dyn PrepareDerivedBatchContent>,
+) -> BatchPublicationContext<'a> {
+    BatchPublicationContext {
+        expectation: None,
+        removals,
+        derived,
+    }
+}
+
 impl<P, E> PrincipalContentStore<P, E>
 where
     P: Clone + Ord + Send + Sync,
@@ -108,7 +135,7 @@ where
             staged_objects_inserted,
             None,
             None,
-            None,
+            publish_only(),
         )
     }
 
@@ -139,7 +166,14 @@ where
         if completed.is_empty() {
             return Err(PrincipalContentError::EmptyBatch);
         }
-        self.publish_batch(principal, &completed, 0, None, Some(&records), None)
+        self.publish_batch(
+            principal,
+            &completed,
+            0,
+            None,
+            Some(&records),
+            publish_only(),
+        )
     }
 
     /// Stream and atomically publish several names under one principal root.
@@ -170,7 +204,7 @@ where
             BulkIngestPolicy::default(),
             None,
             false,
-            None,
+            publish_only(),
         )
         .map(|execution| execution.outcome)
     }
@@ -195,7 +229,7 @@ where
         R: Read + Send,
         I: IntoIterator<Item = ContentIngest<R>>,
     {
-        self.put_streaming_batch_internal(principal, ingests, policy, None, false, None)
+        self.put_streaming_batch_internal(principal, ingests, policy, None, false, publish_only())
             .map(|execution| execution.outcome)
     }
 
@@ -224,7 +258,11 @@ where
             BulkIngestPolicy::default(),
             None,
             false,
-            Some(expectation),
+            BatchPublicationContext {
+                expectation: Some(expectation),
+                removals: &[],
+                derived: None,
+            },
         )
         .map(|execution| execution.outcome)
     }
@@ -250,8 +288,15 @@ where
         R: Read + Send,
         I: IntoIterator<Item = ContentIngest<R>>,
     {
-        self.put_streaming_batch_internal(principal, ingests, policy, Some(cache), false, None)
-            .map(|execution| execution.outcome)
+        self.put_streaming_batch_internal(
+            principal,
+            ingests,
+            policy,
+            Some(cache),
+            false,
+            publish_only(),
+        )
+        .map(|execution| execution.outcome)
     }
 
     /// Stream a batch while collecting privileged operator diagnostics.
@@ -275,8 +320,46 @@ where
         R: Read + Send,
         I: IntoIterator<Item = ContentIngest<R>>,
     {
-        self.put_streaming_batch_internal(principal, ingests, policy, cache, true, None)
+        self.put_streaming_batch_internal(principal, ingests, policy, cache, true, publish_only())
             .map(|execution| (execution.outcome, execution.diagnostics))
+    }
+
+    /// Replace an exact catalog projection in the same owner-root transition.
+    ///
+    /// This is the internal runtime-tree publication seam. Removals are exact
+    /// canonical names and never derive from a prefix, and no removal may also
+    /// appear as an ingest.
+    pub(crate) fn replace_streaming_batch_removing_exact<'a, R, I>(
+        &self,
+        principal: &P,
+        ingests: I,
+        removals: &'a [ContentName],
+        derived: Option<&'a mut dyn PrepareDerivedBatchContent>,
+    ) -> Result<ContentBatchWriteOutcome, PrincipalContentError>
+    where
+        R: Read + Send,
+        I: IntoIterator<Item = ContentIngest<R>>,
+    {
+        let ordered = ordered_ingests(ingests)?;
+        validate_replacement_disjoint(&ordered, removals)?;
+        let ingests = ordered
+            .into_iter()
+            .map(|(name, (source, profile, observation))| {
+                let mut ingest = ContentIngest::with_profile(name, source, profile);
+                if let Some(observation) = observation {
+                    ingest = ingest.with_observation(observation);
+                }
+                ingest
+            });
+        self.put_streaming_batch_internal(
+            principal,
+            ingests,
+            BulkIngestPolicy::default(),
+            None,
+            false,
+            removing_exact(removals, derived),
+        )
+        .map(|execution| execution.outcome)
     }
 
     fn put_streaming_batch_internal<R, I>(
@@ -286,7 +369,7 @@ where
         policy: BulkIngestPolicy,
         cache: Option<&ContentChangeCache>,
         observe: bool,
-        expectation: Option<&ContentBatchExpectation>,
+        publication: BatchPublicationContext<'_>,
     ) -> Result<BulkExecution, PrincipalContentError>
     where
         R: Read + Send,
@@ -304,7 +387,7 @@ where
                 limit,
                 cache,
                 phase_observer.as_ref(),
-                expectation,
+                publication,
             );
         }
         self.put_streaming_batch_direct(
@@ -314,7 +397,7 @@ where
             policy,
             cache,
             phase_observer.as_ref(),
-            expectation,
+            publication,
         )
     }
 
@@ -327,14 +410,14 @@ where
         policy: BulkIngestPolicy,
         cache: Option<&ContentChangeCache>,
         phase_observer: Option<&Arc<BulkPhaseObserver>>,
-        expectation: Option<&ContentBatchExpectation>,
+        publication: BatchPublicationContext<'_>,
     ) -> Result<BulkExecution, PrincipalContentError>
     where
         R: Read + Send,
     {
         let pipeline_started = Instant::now();
         if pending.is_empty() {
-            return self.publish_cached_batch(principal, &completed, phase_observer, expectation);
+            return self.publish_cached_batch(principal, &completed, phase_observer, publication);
         }
         let worker_count = policy.worker_threads().get().min(pending.len());
         let (results, staged_objects_inserted, peak_pending_bytes, admission_elapsed) =
@@ -403,7 +486,7 @@ where
             objects_inserted,
             phase_observer,
             None,
-            expectation,
+            publication,
         )?;
         Ok(BulkExecution {
             outcome,
@@ -428,13 +511,13 @@ where
         limit: u64,
         cache: Option<&ContentChangeCache>,
         observer: Option<&Arc<BulkPhaseObserver>>,
-        expectation: Option<&ContentBatchExpectation>,
+        publication: BatchPublicationContext<'_>,
     ) -> Result<BulkExecution, PrincipalContentError>
     where
         R: Read + Send,
     {
         if pending.is_empty() {
-            return self.publish_cached_batch(principal, &completed, observer, expectation);
+            return self.publish_cached_batch(principal, &completed, observer, publication);
         }
 
         let pipeline_started = Instant::now();
@@ -493,7 +576,7 @@ where
             0,
             observer,
             Some(&records),
-            expectation,
+            publication,
         )?;
         if let Some(cache) = cache {
             for (observation, verified) in cache_updates {
@@ -518,10 +601,10 @@ where
         principal: &P,
         completed: &BTreeMap<ContentName, PreparedContent>,
         observer: Option<&Arc<BulkPhaseObserver>>,
-        expectation: Option<&ContentBatchExpectation>,
+        publication: BatchPublicationContext<'_>,
     ) -> Result<BulkExecution, PrincipalContentError> {
         let publication_started = Instant::now();
-        let outcome = self.publish_batch(principal, completed, 0, observer, None, expectation)?;
+        let outcome = self.publish_batch(principal, completed, 0, observer, None, publication)?;
         Ok(BulkExecution {
             outcome,
             diagnostics: BulkIngestDiagnostics::new(
@@ -596,104 +679,6 @@ where
         }
         Ok(true)
     }
-
-    fn publish_batch(
-        &self,
-        principal: &P,
-        completed: &BTreeMap<ContentName, PreparedContent>,
-        staged_objects_inserted: u64,
-        observer: Option<&Arc<BulkPhaseObserver>>,
-        deferred_records: Option<&BTreeMap<ObjectId, ObjectRecord>>,
-        expectation: Option<&ContentBatchExpectation>,
-    ) -> Result<ContentBatchWriteOutcome, PrincipalContentError> {
-        loop {
-            let mut header = self.header(principal)?.as_ref().clone();
-            self.check_batch_expectation(principal, &header, expectation)?;
-            let mut catalog_records = BTreeMap::new();
-            let mut changed = false;
-            for (name, prepared) in completed {
-                let descriptor = prepared.verified.descriptor();
-                let previous = lookup(header.catalog, name, &mut |object| {
-                    catalog_records
-                        .get(&object)
-                        .cloned()
-                        .map_or_else(|| self.load_required_for(principal, object), Ok)
-                })?;
-                if previous.is_some_and(|entry| entry.file == descriptor.file()) {
-                    continue;
-                }
-                let mutation = insert(
-                    header.catalog,
-                    name,
-                    CatalogValue {
-                        file: descriptor.file(),
-                        logical_bytes: descriptor.logical_bytes(),
-                    },
-                    &mut |object| {
-                        catalog_records
-                            .get(&object)
-                            .cloned()
-                            .map_or_else(|| self.load_required_for(principal, object), Ok)
-                    },
-                    &|record| self.engine.identify_object(record),
-                )?;
-                header.catalog = mutation.root;
-                for (_, record) in mutation.records {
-                    self.insert(&mut catalog_records, record)?;
-                }
-                changed = true;
-            }
-
-            if !changed {
-                let first = completed
-                    .values()
-                    .next()
-                    .ok_or(PrincipalContentError::EmptyBatch)?;
-                let root = header.root.ok_or_else(|| {
-                    invalid(
-                        first.verified.descriptor().file(),
-                        "unchanged batch exists without a principal root",
-                    )
-                })?;
-                for prepared in completed.values() {
-                    self.mark_verified(principal, prepared.verified);
-                }
-                return Ok(batch_outcome(completed, root, staged_objects_inserted));
-            }
-
-            self.enforce_quota(principal, &header)?;
-            let catalog = header.catalog;
-            if let Some(deferred_records) = deferred_records {
-                for record in deferred_records.values() {
-                    self.insert(&mut catalog_records, record.clone())?;
-                }
-            }
-            retain_final_catalog_records(catalog, &mut catalog_records);
-            let transaction =
-                self.encode_transaction(principal.clone(), header.clone(), None, catalog_records)?;
-            let commit = match observer {
-                Some(observer) => self.engine.commit_root_observed(
-                    transaction,
-                    Arc::clone(observer) as Arc<dyn ProjectionObserver>,
-                ),
-                None => self.engine.commit_root(transaction),
-            };
-            match commit {
-                Ok(outcome) => {
-                    self.finish_catalog_commit(principal, header, outcome.root());
-                    for prepared in completed.values() {
-                        self.mark_verified(principal, prepared.verified);
-                    }
-                    let objects_inserted = staged_objects_inserted
-                        .checked_add(outcome.objects_inserted())
-                        .ok_or(PrincipalContentError::AccountingOverflow)?;
-                    return Ok(batch_outcome(completed, outcome.root(), objects_inserted));
-                },
-                Err(PrincipalProjectionError::Model(ModelError::RootConflict { .. })) => {},
-                Err(error) => return Err(error.into()),
-            }
-        }
-    }
 }
 
 fn ordered_ingests<R, I>(ingests: I) -> Result<OrderedIngests<R>, PrincipalContentError>
@@ -716,6 +701,19 @@ where
     Ok(ordered)
 }
 
+fn validate_replacement_disjoint<R>(
+    ordered: &OrderedIngests<R>,
+    removals: &[ContentName],
+) -> Result<(), PrincipalContentError> {
+    let mut unique = BTreeSet::new();
+    for name in removals {
+        if ordered.contains_key(name) || !unique.insert(name) {
+            return Err(PrincipalContentError::DuplicateBatchName(name.clone()));
+        }
+    }
+    Ok(())
+}
+
 fn phase_durations(observer: Option<&BulkPhaseObserver>) -> BulkIngestPhaseDurations {
     let elapsed = |phase| observer.map_or(Duration::ZERO, |observer| observer.elapsed(phase));
     BulkIngestPhaseDurations {
@@ -728,33 +726,6 @@ fn phase_durations(observer: Option<&BulkPhaseObserver>) -> BulkIngestPhaseDurat
         root_publication: elapsed(ProjectionPhase::RootPublication),
         flush: elapsed(ProjectionPhase::Flush),
     }
-}
-
-fn retain_final_catalog_records(
-    catalog: Option<super::CatalogRoot>,
-    records: &mut BTreeMap<crate::storage_model::ObjectId, crate::storage_model::ObjectRecord>,
-) {
-    let mut reachable = BTreeSet::new();
-    let mut pending = catalog
-        .map(|root| root.object)
-        .into_iter()
-        .collect::<Vec<_>>();
-    while let Some(object) = pending.pop() {
-        if !reachable.insert(object) {
-            continue;
-        }
-        let Some(record) = records.get(&object) else {
-            continue;
-        };
-        pending.extend(
-            record
-                .references()
-                .iter()
-                .filter(|reference| reference.kind() == ReferenceKind::Owns)
-                .map(ObjectReference::target),
-        );
-    }
-    records.retain(|object, _| reachable.contains(object));
 }
 
 fn build_worker<P, E, R>(
@@ -858,22 +829,4 @@ where
         admission_elapsed,
         peak_pending_bytes: sink.peak_pending_bytes(),
     })
-}
-
-fn batch_outcome(
-    completed: &BTreeMap<ContentName, PreparedContent>,
-    root: crate::storage_model::RootState,
-    objects_inserted: u64,
-) -> ContentBatchWriteOutcome {
-    let entries = completed
-        .iter()
-        .map(|(name, prepared)| {
-            ContentBatchEntry::new(
-                name.clone(),
-                prepared.verified.descriptor(),
-                prepared.observation,
-            )
-        })
-        .collect();
-    ContentBatchWriteOutcome::new(entries, root, objects_inserted)
 }

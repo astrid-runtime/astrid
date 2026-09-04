@@ -2,7 +2,7 @@
 //!
 //! Trust is per-distro. Product paths require the pin to exist before
 //! use; ordinary signed paths may create the first pin. The store lives
-//! at `$ASTRID_HOME/trust/<distro-id>.pub`, one file per distro,
+//! as the mounted durable projection `$ASTRID_HOME/trust/<distro-id>.pub`,
 //! containing a single `ed25519:<base64>` line.
 //!
 //! ## Threat model
@@ -212,6 +212,18 @@ mod tests {
     fn home() -> (tempfile::TempDir, AstridHome) {
         let dir = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(dir.path());
+        std::fs::create_dir_all(home.root()).unwrap();
+        std::fs::write(home.storage_volume_path(), b"mounted-test-volume").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                home.storage_volume_path(),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(home.root().join("trust")).unwrap();
         (dir, home)
     }
 
