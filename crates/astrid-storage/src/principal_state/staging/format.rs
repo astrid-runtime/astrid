@@ -9,26 +9,30 @@ use uuid::Uuid;
 
 use super::{StagedContentId, connection};
 use crate::content::{ChunkingProfile, ContentName};
-use crate::error::StorageResult;
+use crate::error::{StorageError, StorageResult};
 use crate::principal_state::native_io::{
     PrivateFileIdentity, open_private_file, validate_private_regular_file,
 };
-use crate::principal_state::{StateOwner, StateOwnerCodecV2};
+use crate::principal_state::{
+    RuntimeStateOwnerCodecV2, StateOwner, StateOwnerCodecV2, ensure_runtime_state_owner_admitted,
+};
 
-const INTENT_MAGIC: &[u8; 16] = b"ASTRID-STAGE-V2\0";
-const INTENT_VERSION: u16 = 2;
+pub(super) const INTENT_MAGIC: &[u8; 16] = b"ASTRID-STAGE-V2\0";
+pub(super) const INTENT_VERSION: u16 = 2;
 const LEGACY_INTENT_MAGIC: &[u8; 16] = b"ASTRID-STAGE-V1\0";
 const LEGACY_INTENT_VERSION: u16 = 1;
 const CHECKSUM_BYTES: usize = 32;
-const FOOTER_MAGIC: &[u8; 16] = b"ASTRID-STAGE-F1\0";
-const FOOTER_VERSION: u16 = 1;
-const FOOTER_BYTES: u64 = 32;
+pub(super) const FOOTER_MAGIC: &[u8; 16] = b"ASTRID-STAGE-F1\0";
+pub(super) const FOOTER_VERSION: u16 = 1;
+pub(super) const FOOTER_BYTES: u64 = 32;
 const FOOTER_BYTES_USIZE: usize = 32;
 const SOURCE_IDENTITY_BYTES: u64 = 16;
 const SOURCE_BINDING_CHECKSUM_BYTES: u64 = 32;
 const FASTCDC_2020_ALGORITHM: u8 = 1;
 const FASTCDC_IMPLEMENTATION_REVISION: u16 = 1;
 const FASTCDC_NORMALIZATION: u8 = 1;
+pub(super) const USER_OWNER_NOT_ADMITTED: &str =
+    "user staged owner is not admitted by runtime owner codec V2";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct StagingIntent {
@@ -57,7 +61,8 @@ pub(super) struct LegacyStagingIntent {
 }
 
 pub(super) fn encode_intent(intent: &StagingIntent) -> StorageResult<Vec<u8>> {
-    let owner = StateOwnerCodecV2.encode(&intent.owner);
+    ensure_runtime_state_owner_admitted(&intent.owner)?;
+    let owner = RuntimeStateOwnerCodecV2.encode(&intent.owner);
     encode_fields(
         INTENT_MAGIC,
         INTENT_VERSION,
@@ -98,7 +103,7 @@ pub(super) fn encode_legacy_intent(intent: &LegacyStagingIntent) -> StorageResul
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_fields(
+pub(super) fn encode_fields(
     magic: &[u8; 16],
     version: u16,
     sequence: u64,
@@ -162,6 +167,36 @@ pub(super) fn append_generation_footer(
     source_identity: PrivateFileIdentity,
 ) -> StorageResult<()> {
     let encoded = encode_intent(intent)?;
+    append_footer_bytes(file, &encoded, source_identity)
+}
+
+#[cfg(test)]
+pub(super) fn append_runtime_forbidden_user_footer(
+    file: &mut std::fs::File,
+    intent: &StagingIntent,
+    source_identity: PrivateFileIdentity,
+) -> StorageResult<()> {
+    let owner = StateOwnerCodecV2.encode(&intent.owner);
+    let encoded = encode_fields(
+        INTENT_MAGIC,
+        INTENT_VERSION,
+        intent.sequence,
+        intent.id,
+        &owner,
+        &intent.name,
+        intent.profile,
+        intent.logical_bytes,
+        "astrid native content staging intent v2",
+        true,
+    )?;
+    append_footer_bytes(file, &encoded, source_identity)
+}
+
+fn append_footer_bytes(
+    file: &mut std::fs::File,
+    encoded: &[u8],
+    source_identity: PrivateFileIdentity,
+) -> StorageResult<()> {
     let payload_len = u64::try_from(encoded.len())
         .map_err(|_| connection("staged generation footer length overflow".to_owned()))?;
     let payload_len = payload_len
@@ -169,13 +204,13 @@ pub(super) fn append_generation_footer(
         .and_then(|length| length.checked_add(SOURCE_BINDING_CHECKSUM_BYTES))
         .ok_or_else(|| connection("staged generation footer length overflow".to_owned()))?;
     let source_identity = source_identity_bytes(source_identity);
-    let source_binding = source_binding_checksum(&encoded, &source_identity);
+    let source_binding = source_binding_checksum(encoded, &source_identity);
     let mut trailer = [0_u8; FOOTER_BYTES_USIZE];
     trailer[..FOOTER_MAGIC.len()].copy_from_slice(FOOTER_MAGIC);
     trailer[16..18].copy_from_slice(&FOOTER_VERSION.to_le_bytes());
     trailer[24..32].copy_from_slice(&payload_len.to_le_bytes());
     file.seek(SeekFrom::End(0))
-        .and_then(|_| file.write_all(&encoded))
+        .and_then(|_| file.write_all(encoded))
         .and_then(|()| file.write_all(&source_identity))
         .and_then(|()| file.write_all(&source_binding))
         .and_then(|()| file.write_all(&trailer))
@@ -265,6 +300,119 @@ pub(super) fn load_generation_footer_from_file(
     Ok(footer)
 }
 
+/// Classify a footer owner in fixed memory before trusting its declared size.
+pub(super) enum GenerationOwnerScan {
+    User,
+    Admitted,
+    Terminal,
+    Malformed(&'static str),
+}
+
+pub(super) fn inspect_generation_footer_owner(
+    path: &Path,
+    file: &mut std::fs::File,
+) -> StorageResult<GenerationOwnerScan> {
+    const EARLY_PREFIX_BYTES: usize = 16 + 2 + 8 + 16 + 8;
+    const OWNER_BYTES: usize = 33;
+    const MINIMUM_PAYLOAD_BYTES: u64 = (EARLY_PREFIX_BYTES + OWNER_BYTES + CHECKSUM_BYTES) as u64;
+    let metadata = file.metadata().map_err(|error| {
+        connection(format!(
+            "inspect staged generation handle {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(connection(format!(
+            "staged generation {} is not a regular file",
+            path.display()
+        )));
+    }
+    let physical_bytes = metadata.len();
+    let Some(trailer_offset) = physical_bytes.checked_sub(FOOTER_BYTES) else {
+        return Ok(GenerationOwnerScan::Terminal);
+    };
+    file.seek(SeekFrom::Start(trailer_offset))
+        .map_err(|error| connection(format!("seek staged generation footer: {error}")))?;
+    let mut trailer = [0_u8; FOOTER_BYTES_USIZE];
+    file.read_exact(&mut trailer)
+        .map_err(|error| connection(format!("read staged generation footer: {error}")))?;
+    if trailer[..16] != FOOTER_MAGIC[..] {
+        return Ok(GenerationOwnerScan::Malformed("footer magic mismatch"));
+    }
+    if u16::from_le_bytes([trailer[16], trailer[17]]) != FOOTER_VERSION {
+        return Ok(GenerationOwnerScan::Malformed(
+            "footer version is unsupported",
+        ));
+    }
+    if trailer[18..24] != [0; 6] {
+        return Ok(GenerationOwnerScan::Malformed(
+            "footer reserved bytes are non-zero",
+        ));
+    }
+    let payload_bytes = u64::from_le_bytes(
+        trailer[24..32]
+            .try_into()
+            .map_err(|_| connection("staged footer length width mismatch".to_owned()))?,
+    );
+    let payload_offset = trailer_offset.checked_sub(payload_bytes).ok_or_else(|| {
+        connection(format!(
+            "staged generation {} footer length exceeds the file",
+            path.display()
+        ))
+    })?;
+    if payload_bytes < MINIMUM_PAYLOAD_BYTES {
+        return Ok(GenerationOwnerScan::Malformed("staged intent is truncated"));
+    }
+    file.seek(SeekFrom::Start(payload_offset))
+        .map_err(|error| connection(format!("seek staged generation owner: {error}")))?;
+    let mut early = [0_u8; EARLY_PREFIX_BYTES];
+    file.read_exact(&mut early)
+        .map_err(|error| connection(format!("read staged generation owner prefix: {error}")))?;
+    if early[..16] != INTENT_MAGIC[..]
+        || u16::from_le_bytes([early[16], early[17]]) != INTENT_VERSION
+    {
+        return Ok(GenerationOwnerScan::Malformed(
+            "staged intent magic or version is invalid",
+        ));
+    }
+    let owner_len = u64::from_le_bytes(
+        early[42..50]
+            .try_into()
+            .expect("fixed-width staging owner length"),
+    );
+    if owner_len != OWNER_BYTES as u64 {
+        return Ok(GenerationOwnerScan::Malformed(
+            "staged owner has invalid length",
+        ));
+    }
+    let mut owner = [0_u8; OWNER_BYTES];
+    file.read_exact(&mut owner)
+        .map_err(|error| connection(format!("read staged generation owner: {error}")))?;
+    match StateOwnerCodecV2.decode(&owner) {
+        Some(crate::principal_state::StateOwner::User(_)) => Ok(GenerationOwnerScan::User),
+        Some(_) => match load_generation_footer_from_file(path, file) {
+            Ok(_) => Ok(GenerationOwnerScan::Admitted),
+            Err(error) if is_runtime_forbidden_user_owner(&error) => Ok(GenerationOwnerScan::User),
+            Err(error) => Err(connection(format!(
+                "staged generation {} footer could not prove full integrity: {error}",
+                path.display()
+            ))),
+        },
+        None => Ok(GenerationOwnerScan::Malformed(
+            "staged owner is not canonical StateOwner V2",
+        )),
+    }
+}
+
+/// Distinguish the reserved wire tag from malformed or torn staging bytes.
+pub(super) fn is_runtime_forbidden_user_owner(error: &StorageError) -> bool {
+    error.to_string().contains(USER_OWNER_NOT_ADMITTED)
+}
+
+pub(super) fn is_runtime_forbidden_user_intent_error(error: &'static str) -> bool {
+    error == USER_OWNER_NOT_ADMITTED
+}
+
 fn decode_generation_footer_payload(
     path: &Path,
     payload: &[u8],
@@ -310,7 +458,7 @@ fn decode_generation_footer_payload(
     })
 }
 
-fn source_identity_bytes(identity: PrivateFileIdentity) -> [u8; 16] {
+pub(super) fn source_identity_bytes(identity: PrivateFileIdentity) -> [u8; 16] {
     let (volume, file) = identity.raw_parts();
     let mut bytes = [0_u8; 16];
     bytes[..8].copy_from_slice(&volume.to_le_bytes());
@@ -318,7 +466,7 @@ fn source_identity_bytes(identity: PrivateFileIdentity) -> [u8; 16] {
     bytes
 }
 
-fn source_binding_checksum(encoded_intent: &[u8], identity: &[u8]) -> [u8; 32] {
+pub(super) fn source_binding_checksum(encoded_intent: &[u8], identity: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key("astrid staged source binding v1");
     hasher.update(encoded_intent);
     hasher.update(identity);
@@ -336,6 +484,9 @@ pub(super) fn decode_intent(bytes: &[u8]) -> Result<StagingIntent, &'static str>
     let owner = StateOwnerCodecV2
         .decode(&fields.owner)
         .ok_or("invalid staged owner")?;
+    if matches!(owner, StateOwner::User(_)) {
+        return Err(USER_OWNER_NOT_ADMITTED);
+    }
     Ok(StagingIntent {
         sequence: fields.sequence,
         id: fields.id,
@@ -513,5 +664,39 @@ impl<'a> Decoder<'a> {
 
     fn is_empty(&self) -> bool {
         self.position == self.bytes.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        INTENT_MAGIC, INTENT_VERSION, StagedContentId, USER_OWNER_NOT_ADMITTED, decode_intent,
+        encode_fields,
+    };
+    use crate::content::{ChunkingProfile, ContentName};
+    use uuid::Uuid;
+
+    #[test]
+    fn recovery_rejects_forged_user_owner_without_decoding() {
+        let mut owner = vec![3];
+        owner.extend_from_slice(&[11; 32]);
+        let bytes = encode_fields(
+            INTENT_MAGIC,
+            INTENT_VERSION,
+            7,
+            StagedContentId(Uuid::from_u128(11)),
+            &owner,
+            &ContentName::new("forged.bin").unwrap(),
+            ChunkingProfile::ASTRID_V1,
+            0,
+            "astrid native content staging intent v2",
+            true,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            decode_intent(&bytes).unwrap_err(),
+            USER_OWNER_NOT_ADMITTED
+        ));
     }
 }

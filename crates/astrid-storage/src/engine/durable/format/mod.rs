@@ -25,6 +25,7 @@ thread_local! {
 }
 
 mod indexed;
+mod observation;
 mod prepared;
 mod reader;
 
@@ -34,6 +35,7 @@ pub(super) use indexed::{
     read_indexed_object, read_indexed_object_with_payload, read_indexed_objects,
     visit_indexed_objects,
 };
+pub(super) use observation::scan_frames_observing;
 pub(super) use prepared::{PreparedFrame, append_prepared_frames};
 use reader::SliceReader;
 
@@ -256,6 +258,7 @@ pub(super) fn recover_arena<I: PersistentObjectIdentity, F: DurableIo>(
         ARENA_MAGIC,
         limits,
         protected_len,
+        true,
         |offset, payload| {
             let (id, record) = decode_object_frame(payload, scheme)
                 .map_err(|detail| corrupt(ARENA_FILE, offset, detail))?;
@@ -312,7 +315,7 @@ pub(super) fn scan_frames<F: DurableIo>(
     limits: RecoveryLimits,
     accept: impl FnMut(u64, &[u8]) -> Result<(), DurableError>,
 ) -> Result<(), DurableError> {
-    scan_frames_with_protected_prefix(file, file_name, magic, limits, 0, accept)
+    scan_frames_with_protected_prefix(file, file_name, magic, limits, 0, true, accept)
 }
 
 fn scan_frames_with_protected_prefix<F: DurableIo>(
@@ -321,6 +324,7 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
     magic: [u8; 8],
     limits: RecoveryLimits,
     protected_len: u64,
+    repair_tail: bool,
     mut accept: impl FnMut(u64, &[u8]) -> Result<(), DurableError>,
 ) -> Result<(), DurableError> {
     let file_len = validated_file_len(file, file_name, protected_len)?;
@@ -329,6 +333,7 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
         limits,
         protected_len,
         file_len,
+        repair_tail,
     };
     let mut offset = 0_u64;
     while offset < file_len {
@@ -343,7 +348,7 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
                     "published frame header is truncated",
                 ));
             }
-            truncate_tail(file, offset)?;
+            truncate_tail_if_repairing(file, repair_tail, offset)?;
             break;
         }
         file.seek(SeekFrom::Start(offset))
@@ -399,7 +404,7 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
                     "published frame payload is truncated",
                 ));
             }
-            truncate_tail(file, offset)?;
+            truncate_tail_if_repairing(file, repair_tail, offset)?;
             break;
         }
         let payload = read_frame_payload(file, payload_len)?;
@@ -421,7 +426,18 @@ fn scan_frames_with_protected_prefix<F: DurableIo>(
     Ok(())
 }
 
-fn validated_file_len<F: DurableIo>(
+fn truncate_tail_if_repairing<F: DurableIo>(
+    file: &mut F,
+    repair_tail: bool,
+    offset: u64,
+) -> Result<(), DurableError> {
+    if repair_tail {
+        truncate_tail(file, offset)?;
+    }
+    Ok(())
+}
+
+pub(super) fn validated_file_len<F: DurableIo>(
     file: &F,
     file_name: &'static str,
     protected_len: u64,
@@ -441,9 +457,9 @@ fn validated_file_len<F: DurableIo>(
 }
 
 #[derive(Clone, Copy)]
-struct DecodedFrameHeader {
-    payload_len: u64,
-    checksum: [u8; 32],
+pub(super) struct DecodedFrameHeader {
+    pub(super) payload_len: u64,
+    pub(super) checksum: [u8; 32],
 }
 
 #[derive(Clone, Copy)]
@@ -452,9 +468,10 @@ struct FrameScanPolicy {
     limits: RecoveryLimits,
     protected_len: u64,
     file_len: u64,
+    repair_tail: bool,
 }
 
-fn decode_frame_header(
+pub(super) fn decode_frame_header(
     file_name: &'static str,
     offset: u64,
     header: &[u8; FRAME_HEADER_LEN_USIZE],
@@ -482,7 +499,7 @@ fn decode_frame_header(
     })
 }
 
-fn read_frame_payload<F: DurableIo>(
+pub(super) fn read_frame_payload<F: DurableIo>(
     file: &mut F,
     payload_len: u64,
 ) -> Result<Vec<u8>, DurableError> {
@@ -504,6 +521,9 @@ fn truncate_unpublished_tail_or_fail<F: DurableIo>(
     known_interior: bool,
     error: DurableError,
 ) -> Result<(), DurableError> {
+    if !policy.repair_tail {
+        return Err(error);
+    }
     if offset < policy.protected_len
         || known_interior
         || valid_frame_follows(file, policy.magic, offset, policy.file_len, policy.limits)?
@@ -520,8 +540,18 @@ fn valid_frame_follows<F: DurableIo>(
     file_len: u64,
     limits: RecoveryLimits,
 ) -> Result<bool, DurableError> {
+    Ok(next_valid_frame_offset(file, magic, invalid_offset, file_len, limits)?.is_some())
+}
+
+pub(super) fn next_valid_frame_offset<F: DurableIo>(
+    file: &mut F,
+    magic: [u8; 8],
+    invalid_offset: u64,
+    file_len: u64,
+    limits: RecoveryLimits,
+) -> Result<Option<u64>, DurableError> {
     let Some(mut search_offset) = invalid_offset.checked_add(1) else {
-        return Ok(false);
+        return Ok(None);
     };
     let mut buffer = Vec::new();
     buffer
@@ -540,7 +570,7 @@ fn valid_frame_follows<F: DurableIo>(
             .read(&mut buffer[..wanted])
             .map_err(|source| io_error("read durable tail recovery scan", source))?;
         if read < magic.len() {
-            return Ok(false);
+            return Ok(None);
         }
         for relative in 0..=read.saturating_sub(magic.len()) {
             let candidate_end = relative
@@ -553,11 +583,11 @@ fn valid_frame_follows<F: DurableIo>(
                 .checked_add(u64::try_from(relative).map_err(|_| DurableError::EncodingOverflow)?)
                 .ok_or(DurableError::EncodingOverflow)?;
             if physical_frame_is_valid(file, magic, candidate, file_len, limits)? {
-                return Ok(true);
+                return Ok(Some(candidate));
             }
         }
         if read < wanted {
-            return Ok(false);
+            return Ok(None);
         }
         let overlap = magic.len().saturating_sub(1);
         search_offset = search_offset
@@ -567,7 +597,7 @@ fn valid_frame_follows<F: DurableIo>(
             )
             .ok_or(DurableError::EncodingOverflow)?;
     }
-    Ok(false)
+    Ok(None)
 }
 
 fn physical_frame_is_valid<F: DurableIo>(

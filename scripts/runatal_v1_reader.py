@@ -12,6 +12,8 @@ from runatal_v1_fastcdc import ASTRID_V1, cut, is_canonical_boundary
 from runatal_v1_fastcdc import validate_profile, verify_golden_vectors
 from runatal_v1_frames import frames, frames_bytes
 from runatal_v1_kv import validate_principal_kv
+from runatal_v1_owner import OwnerFormatError
+from runatal_v1_owner import principal_text as owner_principal_text
 from runatal_v1_physical import decode_store as decode_physical_store, identity_bytes
 from runatal_v1_sha384 import verify_cross_hash_attestations
 from runatal_v1_sketch import verify_bottom_k_sketches
@@ -46,7 +48,7 @@ REFERENCE_NAMES = ("Owns", "Evidence", "Lineage", "Derived")
 FORMAT_SPECIFICATION = (
     1,
     1,
-    bytes.fromhex("ac3e1ab1e82be24dae7cdef949698dd54d2407bc7f39fb30709dc36677eea61d"),
+    bytes.fromhex("9fd0397780f01a07f7a38b895c5f2836e9fc12d3ed81a5455dab3702b2d6f21c"),
 )
 CONTENT_CATALOG_SPECIFICATION = (
     1,
@@ -70,6 +72,7 @@ LEGACY_FORMAT_SPECIFICATIONS = {
         "82e46f53ba9bb2f52d6b942088d5965eaa17c2720e61ce842ed9d5e3c0d1219d",
         "900d1eface3294bc9e47369c0fcb64dca56ff334dfbc1288f349090e10c09e6f",
         "9d701dc87360e634b25b7b7f5d5e79315f9f27bcf4d50e09c2181e439b0c7d75",
+        "ac3e1ab1e82be24dae7cdef949698dd54d2407bc7f39fb30709dc36677eea61d",
         "58726b3c243c30ebc0941f656427520094a6bb10e7b2190be732b5a61300144d",
     )
 }
@@ -749,13 +752,10 @@ def decode_root(payload):
 
 
 def principal_text(principal):
-    if principal == b"\0":
-        return "system"
-    if len(principal) == 33 and principal[:1] == b"\1":
-        return principal[1:].hex()
-    if len(principal) == 33 and principal[:1] == b"\2":
-        return f"fleet:{principal[1:].hex()}"
-    raise FormatError("invalid state-owner-v2 encoding")
+    try:
+        return owner_principal_text(principal)
+    except OwnerFormatError as error:
+        raise FormatError(str(error)) from error
 
 
 def parse_metadata(path):

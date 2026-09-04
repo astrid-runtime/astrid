@@ -7,7 +7,8 @@ use crate::storage_model::{ModelError, ObjectId, RootGeneration, RootState};
 use super::{
     ArenaLocation, DurableError, DurableIo, File, IdentityScheme, PersistentObjectIdentity,
     PrincipalCodec, ROOT_FILE, ROOT_MAGIC, RecoveryLimits, corrupt, materialize_closure,
-    preload_indexed_closures, recovery_closure_error, scan_frames, validate_commit_closure,
+    preload_indexed_closures, recovery_closure_error, scan_frames, scan_frames_observing,
+    validate_commit_closure,
 };
 
 const SNAPSHOT_SENTINEL: u64 = u64::MAX;
@@ -21,7 +22,7 @@ pub(super) fn recover_root_history<P, C, R>(
     limits: RecoveryLimits,
 ) -> Result<BTreeMap<P, (RootState, u64)>, DurableError>
 where
-    P: Ord,
+    P: Clone + Ord,
     C: PrincipalCodec<P>,
     R: DurableIo,
 {
@@ -32,6 +33,100 @@ where
         apply_root_journal_record(&mut recovered, codec, scheme, offset, payload, record)
     })?;
     Ok(recovered)
+}
+
+/// Owners observed in a read-only scan, plus the first incomplete-scan error.
+///
+/// A later malformed frame does not erase an owner observed in an earlier or
+/// resynchronized frame. Complete coverage with no owner clears the scan.
+#[derive(Debug)]
+pub(super) struct OwnerObservations<P> {
+    pub(super) owners: BTreeSet<P>,
+    pub(super) scan_error: Option<DurableError>,
+}
+
+/// Decode root history without tail repair; promotion uses this only to
+/// recognize a canonical runtime-forbidden owner before changing any path.
+pub(super) fn probe_root_history_without_repair<P, C, R>(
+    roots: &mut R,
+    codec: &C,
+    scheme: IdentityScheme,
+    limits: RecoveryLimits,
+) -> Result<OwnerObservations<P>, DurableError>
+where
+    P: Clone + Ord,
+    C: PrincipalCodec<P>,
+    R: DurableIo,
+{
+    let mut owners = BTreeSet::<P>::new();
+    let mut semantic = BTreeMap::<P, (RootState, u64)>::new();
+    let scan_error =
+        scan_frames_observing(roots, ROOT_FILE, ROOT_MAGIC, limits, |offset, payload| {
+            let record = decode_root_journal_record(payload, scheme)
+                .map_err(|detail| corrupt(ROOT_FILE, offset, detail))?;
+            observe_principals(&mut owners, codec, offset, &record)?;
+            // Replay the real semantic state machine on a scratch snapshot so
+            // stale CAS, generation conflicts, duplicate snapshots, and other
+            // model failures remain evidence without stopping a later User.
+            let mut next = semantic.clone();
+            let result =
+                apply_root_journal_record(&mut next, codec, scheme, offset, payload, record);
+            if result.is_ok() {
+                semantic = next;
+            }
+            result
+        })?;
+    Ok(OwnerObservations { owners, scan_error })
+}
+
+fn observe_principals<P, C>(
+    recovered: &mut BTreeSet<P>,
+    codec: &C,
+    offset: u64,
+    record: &DecodedRootJournalRecord,
+) -> Result<(), DurableError>
+where
+    P: Ord,
+    C: PrincipalCodec<P>,
+{
+    let candidates = match record {
+        DecodedRootJournalRecord::Transition(record) => std::slice::from_ref(&record.principal),
+        DecodedRootJournalRecord::Snapshot(entries) => {
+            let principals = entries.iter().map(|(principal, _)| principal);
+            let principals: Vec<&Vec<u8>> = principals.collect();
+            for principal in principals {
+                observe_principal_bytes(recovered, codec, offset, principal)?;
+            }
+            return Ok(());
+        },
+    };
+    for principal in candidates {
+        observe_principal_bytes(recovered, codec, offset, principal)?;
+    }
+    Ok(())
+}
+
+fn observe_principal_bytes<P, C>(
+    recovered: &mut BTreeSet<P>,
+    codec: &C,
+    offset: u64,
+    principal: &[u8],
+) -> Result<(), DurableError>
+where
+    P: Ord,
+    C: PrincipalCodec<P>,
+{
+    match codec.decode(principal) {
+        Some(owner) if codec.encode(&owner) == principal => {
+            recovered.insert(owner);
+            Ok(())
+        },
+        _ => Err(corrupt(
+            ROOT_FILE,
+            offset,
+            "root principal is invalid or noncanonical",
+        )),
+    }
 }
 
 pub(super) fn recover_roots<P, I, C, R>(
@@ -309,6 +404,13 @@ fn decode_root_journal_record(
             return Err("unknown root-journal extension record");
         }
         let count = reader.usize_len()?;
+        // Every entry contains at least an 8-byte principal length, a 1-byte
+        // principal, and a complete root state (8 + 2 + 2 + 4 + 32). Reject
+        // impossible counts before reserving entry storage.
+        let minimum_entry_bytes = 8 + 1 + (8 + 2 + 2 + 4 + 32);
+        if count > reader.remaining() / minimum_entry_bytes {
+            return Err("root snapshot count exceeds its encoded frame");
+        }
         let mut entries = Vec::new();
         entries
             .try_reserve_exact(count)

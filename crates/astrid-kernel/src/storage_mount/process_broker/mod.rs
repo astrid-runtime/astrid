@@ -70,6 +70,19 @@ pub(crate) struct KernelProcessStorageMountBroker {
 }
 
 #[cfg(any(unix, windows))]
+fn process_workspace_view(
+    owner: &StateOwner,
+    principal: &PrincipalId,
+) -> Result<StorageProviderViewV1, String> {
+    match owner {
+        StateOwner::Principal(_) => Ok(StorageProviderViewV1::Principal(principal.clone())),
+        StateOwner::Fleet(uid) => Ok(StorageProviderViewV1::Fleet(*uid)),
+        StateOwner::System => Err("system workspace owner is not process-mountable".to_owned()),
+        StateOwner::User(_) => Err("user workspace owner is not process-mountable".to_owned()),
+    }
+}
+
+#[cfg(any(unix, windows))]
 impl KernelProcessStorageMountBroker {
     pub(crate) fn new(kernel: std::sync::Weak<Kernel>) -> Self {
         Self {
@@ -105,13 +118,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             .principal_directory
             .uid_for(principal)
             .map_err(|error| format!("resolve principal process projection identity: {error}"))?;
-        let branch_view = match binding.owner {
-            StateOwner::Principal(_) => StorageProviderViewV1::Principal(principal.clone()),
-            StateOwner::Fleet(uid) => StorageProviderViewV1::Fleet(uid),
-            StateOwner::System => {
-                return Err("system workspace owner is not process-mountable".to_owned());
-            },
-        };
+        let branch_view = process_workspace_view(&binding.owner, principal)?;
         let access = StorageProviderAccessV1::ReadWrite;
         let key = ProcessProjectionKey {
             principal_uid,
@@ -933,6 +940,14 @@ async fn ensure_fleet_shared(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn user_workspace_owner_is_denied_before_process_activation() {
+        let owner = StateOwner::User(astrid_core::UserUid::from_bytes([11; 32]));
+        let error = process_workspace_view(&owner, &PrincipalId::default())
+            .expect_err("user-owned workspace must not process-mount");
+        assert_eq!(error, "user workspace owner is not process-mountable");
+    }
 
     #[test]
     fn provider_binary_validation_rejects_group_or_world_writable_files() {

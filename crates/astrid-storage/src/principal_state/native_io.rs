@@ -49,10 +49,19 @@ pub(super) struct PrivateDirectory {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PrivateDirectoryIdentity {
+pub(super) struct PrivateDirectoryIdentity {
     volume: PrivateVolumeId,
     directory: PrivateFileId,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PrivateRenameIdentity {
+    File(PrivateFileIdentity),
+    Directory(PrivateDirectoryIdentity),
+}
+
+#[cfg(windows)]
+mod windows;
 
 impl PrivateDirectory {
     pub(super) fn open(path: &Path) -> StorageResult<Self> {
@@ -256,6 +265,17 @@ impl PrivateDirectory {
         }
     }
 
+    pub(super) fn entry_is_file(&self, name: &Path) -> StorageResult<bool> {
+        match self.directory.symlink_metadata(name) {
+            Ok(metadata) => Ok(metadata.is_file()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(connection(format!(
+                "inspect private entry {}: {error}",
+                self.path.join(name).display()
+            ))),
+        }
+    }
+
     pub(super) fn entries(&self) -> StorageResult<Vec<OsString>> {
         self.directory
             .read_dir(Path::new("."))
@@ -324,15 +344,22 @@ impl PrivateDirectory {
                 )));
             },
         }
-        rename_no_replace(&self.directory, source, &self.directory, destination).map_err(
-            |error| {
-                connection(format!(
-                    "rename private entry {} as {}: {error}",
-                    self.path.join(source).display(),
-                    self.path.join(destination).display()
-                ))
-            },
-        )?;
+        rename_no_replace(
+            &self.directory,
+            &self.path,
+            source,
+            &self.directory,
+            &self.path,
+            destination,
+            PrivateRenameIdentity::File(expected),
+        )
+        .map_err(|error| {
+            connection(format!(
+                "rename private entry {} as {}: {error}",
+                self.path.join(source).display(),
+                self.path.join(destination).display()
+            ))
+        })?;
         let destination_file = self.open_file(destination)?;
         if private_file_identity(&destination_file)? != expected {
             return Err(connection(format!(
@@ -365,9 +392,12 @@ impl PrivateDirectory {
         }
         rename_no_replace(
             &self.directory,
+            &self.path,
             source,
             &destination_directory.directory,
+            &destination_directory.path,
             destination,
+            PrivateRenameIdentity::File(expected),
         )
         .map_err(|error| {
             connection(format!(
@@ -401,9 +431,12 @@ impl PrivateDirectory {
         }
         rename_no_replace(
             &self.directory,
+            &self.path,
             source,
             &destination_directory.directory,
+            &destination_directory.path,
             destination,
+            PrivateRenameIdentity::Directory(source_directory.identity),
         )
         .map_err(|error| {
             connection(format!(
@@ -545,9 +578,12 @@ mod tests {
 #[cfg(target_os = "linux")]
 fn rename_no_replace(
     source_directory: &Dir,
+    _source_directory_path: &Path,
     source: &Path,
     destination_directory: &Dir,
+    _destination_directory_path: &Path,
     destination: &Path,
+    _expected: PrivateRenameIdentity,
 ) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::fd::AsRawFd as _;
@@ -580,9 +616,12 @@ fn rename_no_replace(
 #[cfg(target_os = "macos")]
 fn rename_no_replace(
     source_directory: &Dir,
+    _source_directory_path: &Path,
     source: &Path,
     destination_directory: &Dir,
+    _destination_directory_path: &Path,
     destination: &Path,
+    _expected: PrivateRenameIdentity,
 ) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::fd::AsRawFd as _;
@@ -613,26 +652,37 @@ fn rename_no_replace(
 
 #[cfg(windows)]
 fn rename_no_replace(
-    source_directory: &Dir,
+    _source_directory: &Dir,
+    source_directory_path: &Path,
     source: &Path,
-    destination_directory: &Dir,
+    _destination_directory: &Dir,
+    destination_directory_path: &Path,
     destination: &Path,
+    expected: PrivateRenameIdentity,
 ) -> std::io::Result<()> {
-    source_directory.rename(source, destination_directory, destination)
+    let source_path = source_directory_path.join(source);
+    let destination_path = destination_directory_path.join(destination);
+    rename_windows_no_replace(&source_path, &destination_path, expected)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn rename_no_replace(
     _source_directory: &Dir,
+    _source_directory_path: &Path,
     _source: &Path,
     _destination_directory: &Dir,
+    _destination_directory_path: &Path,
     _destination: &Path,
+    _expected: PrivateRenameIdentity,
 ) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "capability-relative exclusive rename is unsupported",
     ))
 }
+
+#[cfg(windows)]
+pub(in crate::principal_state) use windows::rename_windows_no_replace;
 
 pub(super) fn private_file_identity(file: &File) -> StorageResult<PrivateFileIdentity> {
     let metadata = file

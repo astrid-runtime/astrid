@@ -1,3 +1,5 @@
+use super::HostedArtifactRole;
+use super::open::set_test_proof_hook;
 use super::reclaim::set_test_unlock_hook;
 use super::*;
 use crate::volume::VolumeFile;
@@ -630,4 +632,106 @@ fn short_stream_write_does_not_publish_a_torn_record() {
     assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     assert_eq!(volume.region_len(&region).unwrap(), 0);
     assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+}
+
+#[test]
+fn proof_blocks_writable_open_and_rejects_replacement_identity() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let active = temporary.path().join("active.volume");
+    let replacement = temporary.path().join("replacement.volume");
+    for path in [&active, &replacement] {
+        drop(HostedFileVolume::open(path).unwrap());
+    }
+    let replacement_before = std::fs::read(&replacement).unwrap();
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    set_test_proof_hook(
+        active.clone(),
+        Box::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }),
+    );
+    let map_error = |error: io::Error| error;
+    let proof = std::thread::spawn({
+        let active = active.clone();
+        move || {
+            HostedFileVolume::open_with_owner_proof(active, None, map_error, |phase, artifacts| {
+                if phase == HostedProofPhase::Artifacts {
+                    assert!(
+                        artifacts
+                            .iter()
+                            .any(|artifact| artifact.role() == HostedArtifactRole::Active)
+                    );
+                    let _ = artifacts.first().map(HostedArtifactProof::identity);
+                }
+                Ok(HostedProofDecision::<io::Error>::Accept)
+            })
+        }
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("proof reached its locked observation boundary");
+
+    let blocker = std::thread::spawn({
+        let active = active.clone();
+        move || HostedFileVolume::open(&active)
+    });
+    assert!(
+        !blocker.is_finished(),
+        "writable open entered while the proof was alive"
+    );
+
+    std::fs::rename(&active, temporary.path().join("old.volume")).unwrap();
+    std::fs::copy(&replacement, &active).unwrap();
+    release_tx.send(()).unwrap();
+
+    let outcome = proof.join().unwrap();
+    #[allow(
+        clippy::match_same_arms,
+        reason = "the rejected and failed cases intentionally surface the same evidence"
+    )]
+    let error = match outcome {
+        Ok(HostedProof::Accepted(_)) => panic!("replacement identity was accepted"),
+        Ok(HostedProof::Rejected(error)) => error,
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("changed during its owner proof"));
+    assert_eq!(std::fs::read(&replacement).unwrap(), replacement_before);
+
+    blocker.join().unwrap().unwrap();
+}
+
+#[test]
+fn owner_proved_reclaim_refuses_an_uninspected_sibling() {
+    let temporary = tempfile::tempdir().unwrap();
+    let active = temporary.path().join("active.volume");
+    let previous = reclaim::previous_path(&active);
+    drop(HostedFileVolume::open(&active).unwrap());
+    std::fs::copy(&active, &previous).unwrap();
+
+    let map_error = |error: io::Error| error;
+    let volume = match HostedFileVolume::open_with_owner_proof(
+        &active,
+        None,
+        map_error,
+        |_phase, _artifacts| Ok(HostedProofDecision::<io::Error>::Accept),
+    )
+    .unwrap()
+    {
+        HostedProof::Accepted(volume) => volume,
+        HostedProof::Rejected(error) => panic!("accepted proof rejected: {error}"),
+    };
+
+    let error = volume.reclaim().unwrap_err();
+    assert!(
+        error.to_string().contains("uninspected recovery"),
+        "{error}"
+    );
+    assert!(previous.is_file());
+    assert!(active.is_file());
 }

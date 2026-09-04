@@ -19,7 +19,7 @@ use super::codec::{
 };
 use super::scan::WalScanner;
 use super::types::{WalEvent, WalObjectDescriptor, WalRootDescriptor, WalRootTransition};
-use super::{WalLimits, durable_error};
+use super::{WalError, WalLimits, durable_error};
 use crate::engine::durable::format::{append_frames, canonical_record_bytes, encode_object_frame};
 use crate::engine::durable::representations::RepresentationStore;
 use crate::engine::durable::roots::encode_root_record;
@@ -126,6 +126,66 @@ where
         }
     }
     Ok(committed)
+}
+
+/// Decode root owners from a WAL without consuming or repairing any bytes.
+pub(crate) fn wal_root_owners_without_repair<P, I, C>(
+    wal: &mut File,
+    identity: &I,
+    codec: &SharedPrincipalCodec<C>,
+    limits: RecoveryLimits,
+) -> Result<super::super::OwnerObservations<P>, DurableError>
+where
+    P: Ord,
+    I: PersistentObjectIdentity + Clone,
+    C: PrincipalCodec<P> + Clone,
+{
+    let mut owners = BTreeSet::new();
+    let mut scan_error = None;
+    let mut scanner = WalScanner::new(
+        wal.try_clone()
+            .map_err(|source| io_error("clone ASTWAL2 owner probe", source))?,
+        identity.clone(),
+        codec.clone(),
+        limits,
+    )
+    .map_err(durable_error)?;
+    loop {
+        match scanner.next_event() {
+            Ok(Some(WalEvent::Root(root))) => {
+                let transition = root.transition();
+                match codec.decode(transition.principal()) {
+                    Some(owner) if codec.encode(&owner) == transition.principal() => {
+                        owners.insert(owner);
+                    },
+                    _ => {
+                        scan_error.get_or_insert(DurableError::InvalidPrincipal {
+                            offset: root.offset().get(),
+                        });
+                    },
+                }
+            },
+            Ok(Some(WalEvent::Tail(tail))) => {
+                scan_error.get_or_insert(durable_error(WalError::Corrupt {
+                    offset: tail.offset,
+                    detail: "WAL ends in an incomplete or invalid tail",
+                }));
+                break;
+            },
+            Ok(Some(_)) => {},
+            Ok(None) => break,
+            Err(error) => {
+                scan_error.get_or_insert(durable_error(error));
+                match scanner.next_physical_candidate().map_err(durable_error)? {
+                    Some(candidate) => scanner
+                        .reset_after_malformed_evidence(candidate)
+                        .map_err(durable_error)?,
+                    None => break,
+                }
+            },
+        }
+    }
+    Ok(super::super::OwnerObservations { owners, scan_error })
 }
 
 /// Replay an existing ASTWAL2 stream and return a writer resumed at its clean

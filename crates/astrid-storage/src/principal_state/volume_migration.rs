@@ -2,37 +2,64 @@
 
 use std::sync::Arc;
 
-use crate::engine::{DurableEnginePolicy, PrincipalCodec, RecoveryLimits, RootSnapshot};
+use crate::engine::durable::{
+    OwnerObservations, inspect_volume_root_history_without_repair,
+    inspect_volume_wal_owners_without_repair,
+};
+use crate::engine::{
+    DurableEnginePolicy, PersistentObjectIdentity, PrincipalCodec, RecoveryLimits, RootSnapshot,
+};
 use crate::error::{StorageError, StorageResult};
 use crate::volume::{AstridVolume, HostedFileVolume, VolumeRegion};
+use crate::volume::{HostedArtifactProof, HostedProofDecision, HostedProofPhase};
 use astrid_core::dirs::AstridHome;
 
-use super::{Blake3ObjectIdentityV1, RuntimeEngine, StateOwner, StateOwnerCodecV2};
+use super::{
+    Blake3ObjectIdentityV1, RuntimeEngine, RuntimeStateOwnerCodecV2, StateOwner, StateOwnerCodecV2,
+};
 
 const CUTOVER_RECEIPT_REGION: &str = "system/migrations/directory-store-to-volume-v1";
 const MAX_CUTOVER_RECEIPT_BYTES: u64 = 256;
 
 pub(super) fn existing_volume_available(home: &AstridHome) -> StorageResult<bool> {
-    Ok(promote_legacy_volume(home)?.is_some())
+    let canonical = home.storage_volume_path();
+    let legacy = home.legacy_storage_volume_path();
+    let canonical_present = inspect_volume_entry(&canonical)?;
+    let legacy_present = inspect_volume_entry(&legacy)?;
+    if canonical_present && legacy_present {
+        return Err(connection(format!(
+            "Astrid storage has both canonical and legacy volumes: {} and {}",
+            canonical.display(),
+            legacy.display()
+        )));
+    }
+    Ok(canonical_present || legacy_present)
 }
 
 pub(super) fn open_existing(
     home: &AstridHome,
     policy: DurableEnginePolicy<StateOwner>,
 ) -> StorageResult<Option<(RuntimeEngine, String)>> {
-    let Some(path) = promote_legacy_volume(home)? else {
+    let canonical = home.storage_volume_path();
+    let legacy = home.legacy_storage_volume_path();
+    let canonical_present = inspect_volume_entry(&canonical)?;
+    let legacy_present = inspect_volume_entry(&legacy)?;
+    if canonical_present && legacy_present {
+        return Err(connection(format!(
+            "Astrid storage has both canonical and legacy volumes: {} and {}",
+            canonical.display(),
+            legacy.display()
+        )));
+    }
+    if !canonical_present && !legacy_present {
         return Ok(None);
-    };
-    let volume = HostedFileVolume::open(&path).map_err(|error| {
-        connection(format!(
-            "open Astrid storage volume {}: {error}",
-            path.display()
-        ))
-    })?;
+    }
+    let source = legacy_present.then_some(legacy.clone());
+    let volume = open_proved_volume(&canonical, source.as_deref())?;
     let engine = RuntimeEngine::open_volume(
         volume.clone(),
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV2,
+        RuntimeStateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
         policy,
     )
@@ -44,37 +71,81 @@ pub(super) fn open_existing(
     Ok(Some((engine, receipt)))
 }
 
-/// Resolve the canonical volume and promote the released legacy path once.
-///
-/// Promotion happens before recovery so the runtime-tree admission walk can
-/// exclude the canonical media file and cannot mistake the legacy file for
-/// ordinary content. Seeing both paths is ambiguous and fails closed.
-fn promote_legacy_volume(home: &AstridHome) -> StorageResult<Option<std::path::PathBuf>> {
-    let canonical = home.storage_volume_path();
-    let legacy = home.legacy_storage_volume_path();
-    let canonical_present = inspect_volume_entry(&canonical)?;
-    let legacy_present = inspect_volume_entry(&legacy)?;
+fn reject_volume_owners(volume: &Arc<dyn AstridVolume>) -> StorageResult<()> {
+    let roots: OwnerObservations<StateOwner> =
+        inspect_volume_root_history_without_repair::<StateOwner, StateOwnerCodecV2>(
+            volume,
+            Blake3ObjectIdentityV1.scheme(),
+            &StateOwnerCodecV2,
+            RecoveryLimits::process_addressable(),
+        )
+        .map_err(|error| {
+            connection(format!(
+                "Astrid storage volume root preflight failed: {error}"
+            ))
+        })?;
+    let wal_owners = inspect_volume_wal_owners_without_repair::<StateOwner, _, _>(
+        volume,
+        &Blake3ObjectIdentityV1,
+        &StateOwnerCodecV2,
+        RecoveryLimits::process_addressable(),
+    )
+    .map_err(|error| {
+        connection(format!(
+            "Astrid storage volume WAL preflight failed: {error}"
+        ))
+    })?;
+    if roots
+        .owners
+        .iter()
+        .any(|owner| matches!(owner, StateOwner::User(_)))
+    {
+        return Err(connection(
+            "Astrid storage volume contains an explicit user StateOwner; mutation is refused before durable recovery",
+        ));
+    }
+    if wal_owners
+        .owners
+        .iter()
+        .any(|owner| matches!(owner, StateOwner::User(_)))
+    {
+        return Err(connection(
+            "Astrid storage volume contains a user-owned WAL transaction; mutation is refused before durable recovery",
+        ));
+    }
+    if let Some(error) = roots.scan_error.or(wal_owners.scan_error) {
+        return Err(connection(format!(
+            "Astrid storage volume owner preflight could not prove complete coverage: {error}"
+        )));
+    }
+    Ok(())
+}
 
-    match (canonical_present, legacy_present) {
-        (true, true) => Err(connection(format!(
-            "Astrid storage has both canonical and legacy volumes: {} and {}",
-            canonical.display(),
-            legacy.display()
-        ))),
-        (true, false) => Ok(Some(canonical)),
-        (false, true) => {
-            super::native_io::rename_private_entry(&legacy, &canonical)?;
-            let legacy_parent = legacy.parent().ok_or_else(|| {
-                connection(format!(
-                    "legacy Astrid volume has no parent: {}",
-                    legacy.display()
-                ))
-            })?;
-            super::native_io::sync_directory(legacy_parent)?;
-            super::native_io::sync_directory(home.root())?;
-            Ok(Some(canonical))
-        },
-        (false, false) => Ok(None),
+fn open_proved_volume(
+    destination: &std::path::Path,
+    legacy: Option<&std::path::Path>,
+) -> StorageResult<Arc<HostedFileVolume>> {
+    let map_error = |error| {
+        connection(format!(
+            "inspect Astrid storage volume without repair {}: {error}",
+            destination.display()
+        ))
+    };
+    let classify = |phase, artifacts: &[HostedArtifactProof]| {
+        for artifact in artifacts {
+            let volume: Arc<dyn AstridVolume> = artifact.volume();
+            if let Err(error) = reject_volume_owners(&volume) {
+                return Ok(HostedProofDecision::Reject(error));
+            }
+        }
+        match phase {
+            HostedProofPhase::Artifacts | HostedProofPhase::Selected => {},
+        }
+        Ok(HostedProofDecision::Accept)
+    };
+    match HostedFileVolume::open_with_owner_proof(destination, legacy, map_error, classify)? {
+        crate::volume::HostedProof::Accepted(volume) => Ok(volume),
+        crate::volume::HostedProof::Rejected(error) => Err(error),
     }
 }
 
@@ -104,12 +175,13 @@ pub(super) fn migrate_directory_store(
     let destination = home.storage_volume_path();
     let temporary = destination.with_extension("migrating");
     if temporary.exists() {
-        std::fs::remove_file(&temporary).map_err(|error| {
-            connection(format!(
-                "remove incomplete Astrid volume {}: {error}",
-                temporary.display()
-            ))
-        })?;
+        // Owner proof must precede any namespace change, including cleanup.
+        // A valid-but-unexpected artifact is retained and blocks cutover.
+        open_proved_volume(&temporary, None)?;
+        return Err(connection(format!(
+            "incomplete Astrid volume already exists: {}",
+            temporary.display()
+        )));
     }
 
     let volume = HostedFileVolume::open(&temporary).map_err(|error| {
@@ -121,7 +193,7 @@ pub(super) fn migrate_directory_store(
     let migrated = RuntimeEngine::open_volume(
         volume.clone(),
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV2,
+        RuntimeStateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
         DurableEnginePolicy::default(),
     )
@@ -149,16 +221,11 @@ pub(super) fn migrate_directory_store(
     super::native_io::rename_private_entry(&temporary, &destination)?;
     super::native_io::sync_directory(home.root())?;
 
-    let volume = HostedFileVolume::open(&destination).map_err(|error| {
-        connection(format!(
-            "reopen Astrid volume {}: {error}",
-            destination.display()
-        ))
-    })?;
+    let volume = open_proved_volume(&destination, None)?;
     let engine = RuntimeEngine::open_volume(
         volume.clone(),
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV2,
+        RuntimeStateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
         policy,
     )
@@ -186,10 +253,11 @@ pub(super) fn retire_verified_directory_if_present(
             )));
         },
         Ok(_) => {
+            super::recovery_preflight::directory_store_owners(&path)?;
             let source = RuntimeEngine::open_with_policy(
                 &path,
                 Blake3ObjectIdentityV1,
-                StateOwnerCodecV2,
+                RuntimeStateOwnerCodecV2,
                 RecoveryLimits::process_addressable(),
                 DurableEnginePolicy::default(),
             )
@@ -250,7 +318,7 @@ fn verify_snapshots(
     Ok(())
 }
 
-fn write_cutover_receipt(
+pub(super) fn write_cutover_receipt(
     volume: &dyn AstridVolume,
     snapshots: &[(StateOwner, RootSnapshot)],
 ) -> StorageResult<()> {
@@ -333,7 +401,7 @@ fn cutover_receipt(snapshots: &[(StateOwner, RootSnapshot)]) -> String {
     let mut material = Vec::new();
     material.extend_from_slice(b"astrid-directory-store-to-volume-v1\0");
     for (owner, snapshot) in snapshots {
-        material.extend_from_slice(&StateOwnerCodecV2.encode(owner));
+        material.extend_from_slice(&RuntimeStateOwnerCodecV2.encode(owner));
         material.extend_from_slice(&snapshot.root().generation.get().to_le_bytes());
         material.extend_from_slice(snapshot.root().commit.as_bytes());
         for (id, _) in snapshot.records() {

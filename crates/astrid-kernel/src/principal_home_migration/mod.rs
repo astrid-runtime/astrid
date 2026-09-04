@@ -39,14 +39,7 @@ mod receipts;
 mod types;
 mod unbound;
 
-pub(super) type HomeFilesystem = AstridFilesystem<
-    StateOwner,
-    astrid_storage::engine::DurableEngine<
-        StateOwner,
-        astrid_storage::Blake3ObjectIdentityV1,
-        astrid_storage::StateOwnerCodecV2,
-    >,
->;
+pub(super) type HomeFilesystem = astrid_storage::RuntimeFilesystem;
 use paths::{
     append_relative, conflict_fs, conflict_path, destination_name, invalid_source,
     is_dedicated_path, logical_relative, receipt_path_for_display, receipt_uid_for_alias,
@@ -588,14 +581,7 @@ impl InventorySummary {
 }
 
 fn preflight_entry(
-    filesystem: &AstridFilesystem<
-        StateOwner,
-        astrid_storage::engine::DurableEngine<
-            StateOwner,
-            astrid_storage::Blake3ObjectIdentityV1,
-            astrid_storage::StateOwnerCodecV2,
-        >,
-    >,
+    filesystem: &HomeFilesystem,
     source_root: &Path,
     entry: &MigrationEntry,
 ) -> io::Result<()> {
@@ -682,17 +668,7 @@ fn preflight_entry(
     Ok(())
 }
 
-fn ensure_directory(
-    filesystem: &AstridFilesystem<
-        StateOwner,
-        astrid_storage::engine::DurableEngine<
-            StateOwner,
-            astrid_storage::Blake3ObjectIdentityV1,
-            astrid_storage::StateOwnerCodecV2,
-        >,
-    >,
-    destination: &FilesystemPath,
-) -> io::Result<()> {
+fn ensure_directory(filesystem: &HomeFilesystem, destination: &FilesystemPath) -> io::Result<()> {
     match filesystem.stat(destination) {
         Ok(existing) if existing.kind() == FilesystemEntryKind::Directory => Ok(()),
         Ok(_) => Err(conflict_fs(
@@ -774,14 +750,7 @@ fn verify_destinations(
 }
 
 fn verify_file_content(
-    filesystem: &AstridFilesystem<
-        StateOwner,
-        astrid_storage::engine::DurableEngine<
-            StateOwner,
-            astrid_storage::Blake3ObjectIdentityV1,
-            astrid_storage::StateOwnerCodecV2,
-        >,
-    >,
+    filesystem: &HomeFilesystem,
     destination: &FilesystemPath,
     expected: &MigrationEntry,
 ) -> io::Result<()> {

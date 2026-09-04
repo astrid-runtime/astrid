@@ -15,6 +15,9 @@ mod hosted;
 #[cfg(not(target_family = "wasm"))]
 pub use hosted::HostedFileVolume;
 
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use hosted::{HostedArtifactProof, HostedProof, HostedProofDecision, HostedProofPhase};
+
 #[cfg(all(test, not(target_family = "wasm")))]
 pub(crate) use hosted::write_record_payloads;
 

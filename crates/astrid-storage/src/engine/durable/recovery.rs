@@ -1,14 +1,15 @@
 //! Authoritative startup and in-process recovery for the durable engine.
 
+use super::wal::wal_root_owners_without_repair;
 use super::wal::{durable_error as wal_durable_error, recover_wal};
 use super::{
     ARENA_FILE, ArenaReader, DurableEngine, DurableError, DurableFiles, DurableInner, DurableWal,
     FaultInjector, FaultPoint, INDEX_FILE, IndexState, LIFECYCLE_CLOSED, LIFECYCLE_USABLE,
     MutexGuard, PersistentObjectIdentity, PrincipalCodec, ROOT_FILE, RecoveredStore,
     RecoveryLimits, Seek, SeekFrom, SharedIdentity, SharedPrincipalCodec, WAL_FILE, io, io_error,
-    open_rw_capability, recover_arena, recover_index, recover_interrupted_compaction,
-    recover_root_history, recover_roots, replace_index, replace_volume_index,
-    sync_store_directory_capability,
+    open_rw_capability, probe_root_history_without_repair, recover_arena, recover_index,
+    recover_interrupted_compaction, recover_root_history, recover_roots, replace_index,
+    replace_volume_index, sync_store_directory_capability,
 };
 use crate::volume::AstridVolume;
 use std::collections::BTreeSet;
@@ -16,6 +17,100 @@ use std::collections::BTreeSet;
 type RecoveredWal<P, I, C> = (RecoveredStore<P>, Option<DurableWal<P, I, C>>);
 use std::path::Path;
 use std::sync::Arc;
+
+/// Owners observed without repair, plus the first scan incompleteness error.
+#[derive(Debug)]
+pub(crate) struct OwnerObservations<P> {
+    pub(crate) owners: BTreeSet<P>,
+    pub(crate) scan_error: Option<DurableError>,
+}
+
+/// Read a native WAL without repairing or changing its bytes.
+pub(crate) fn inspect_native_wal_owners_without_repair<P, C>(
+    path: &Path,
+    identity: crate::Blake3ObjectIdentityV1,
+    codec: &C,
+    limits: RecoveryLimits,
+) -> Result<OwnerObservations<P>, DurableError>
+where
+    P: Ord,
+    C: PrincipalCodec<P> + Clone,
+{
+    let mut wal = super::File::Native(
+        std::fs::File::open(path).map_err(|source| io_error("open WAL", source))?,
+    );
+    wal_root_owners_without_repair(
+        &mut wal,
+        &identity,
+        &super::SharedPrincipalCodec::new(codec.clone()),
+        limits,
+    )
+}
+
+impl<P> OwnerObservations<P> {
+    pub(crate) fn incomplete(owners: BTreeSet<P>, error: DurableError) -> Self {
+        Self {
+            owners,
+            scan_error: Some(error),
+        }
+    }
+}
+
+/// Read only the indexed root history from a volume, without tail repair.
+pub(crate) fn inspect_volume_root_history_without_repair<P, C>(
+    volume: &Arc<dyn AstridVolume>,
+    scheme: super::IdentityScheme,
+    codec: &C,
+    limits: RecoveryLimits,
+) -> Result<OwnerObservations<P>, DurableError>
+where
+    P: Clone + Ord,
+    C: PrincipalCodec<P>,
+{
+    let region = crate::volume::VolumeRegion::new(ROOT_FILE)
+        .map_err(|source| io_error("validate root-journal region", source))?;
+    let exists = volume
+        .region_exists(&region)
+        .map_err(|source| io_error("probe root-journal region", source))?;
+    if !exists {
+        return Ok(OwnerObservations {
+            owners: BTreeSet::new(),
+            scan_error: None,
+        });
+    }
+    let mut roots = super::File::volume(Arc::clone(volume), ROOT_FILE, false)?;
+    let observations = probe_root_history_without_repair(&mut roots, codec, scheme, limits)?;
+    Ok(match observations.scan_error {
+        Some(error) => OwnerObservations::incomplete(observations.owners, error),
+        None => OwnerObservations {
+            owners: observations.owners,
+            scan_error: None,
+        },
+    })
+}
+
+/// Read a native root journal without repairing or changing its bytes.
+pub(crate) fn inspect_native_root_history_without_repair<P, C>(
+    path: &Path,
+    scheme: super::IdentityScheme,
+    codec: &C,
+    limits: RecoveryLimits,
+) -> Result<OwnerObservations<P>, DurableError>
+where
+    P: Clone + Ord,
+    C: PrincipalCodec<P>,
+{
+    let file = std::fs::File::open(path).map_err(|source| io_error("open root journal", source))?;
+    let mut roots = super::File::Native(file);
+    let observations = probe_root_history_without_repair(&mut roots, codec, scheme, limits)?;
+    Ok(match observations.scan_error {
+        Some(error) => OwnerObservations::incomplete(observations.owners, error),
+        None => OwnerObservations {
+            owners: observations.owners,
+            scan_error: None,
+        },
+    })
+}
 
 #[derive(Default)]
 pub(super) struct RecoveryScope {

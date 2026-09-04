@@ -21,6 +21,11 @@ mod reclaim;
 mod recover;
 mod stream;
 
+pub(crate) use open::{HostedArtifactProof, HostedProof, HostedProofDecision, HostedProofPhase};
+
+#[cfg(test)]
+pub(crate) use open::HostedArtifactRole;
+
 const VOLUME_MAGIC: [u8; 8] = *b"ASTVOL1\0";
 const RECORD_MAGIC: [u8; 8] = *b"ASTREG1\0";
 const RECORD_FIXED_BYTES: usize = 8 + 8 + 8 + 1 + 2 + 8 + 8 + 32;
@@ -74,7 +79,164 @@ struct ContainerState {
 pub struct HostedFileVolume {
     path: PathBuf,
     open_lock: open::OpenReclaimLock,
+    owner_proved: bool,
     state: Mutex<ContainerState>,
+}
+
+/// Read-only projection over an already-recovered hosted container.
+#[derive(Debug)]
+pub(crate) struct ReadOnlyHostedVolume {
+    file: File,
+    regions: BTreeMap<VolumeRegion, RegionState>,
+}
+
+fn read_region_state_at(
+    mut file: &File,
+    regions: &BTreeMap<VolumeRegion, RegionState>,
+    region: &VolumeRegion,
+    offset: u64,
+    buffer: &mut [u8],
+) -> io::Result<usize> {
+    let Some(region_state) = regions.get(region) else {
+        return Err(io::Error::new(io::ErrorKind::NotFound, region.as_str()));
+    };
+    if offset >= region_state.length || buffer.is_empty() {
+        return Ok(0);
+    }
+    let available = region_state.length.saturating_sub(offset);
+    let wanted = usize::try_from(available.min(buffer.len() as u64))
+        .map_err(|_| io::Error::other("volume read length overflow"))?;
+    let read_end = offset
+        .checked_add(wanted as u64)
+        .ok_or_else(|| io::Error::other("volume read range overflow"))?;
+    let overlaps = overlapping_extents(region_state, offset, read_end);
+    buffer[..wanted].fill(0);
+    for (start, extent) in overlaps {
+        let copy_start = start.max(offset);
+        let copy_end = extent.logical_end.min(read_end);
+        if copy_start >= copy_end {
+            continue;
+        }
+        let physical = extent
+            .physical_offset
+            .checked_add(copy_start.saturating_sub(start))
+            .ok_or_else(|| io::Error::other("volume extent offset overflow"))?;
+        let destination = usize::try_from(copy_start.saturating_sub(offset))
+            .map_err(|_| io::Error::other("volume destination offset overflow"))?;
+        let length = usize::try_from(copy_end.saturating_sub(copy_start))
+            .map_err(|_| io::Error::other("volume extent length overflow"))?;
+        file.seek(SeekFrom::Start(physical))?;
+        let destination_end = destination
+            .checked_add(length)
+            .ok_or_else(|| io::Error::other("volume destination range overflow"))?;
+        file.read_exact(&mut buffer[destination..destination_end])?;
+    }
+    Ok(wanted)
+}
+
+impl AstridVolume for ReadOnlyHostedVolume {
+    fn create_region(&self, _region: &VolumeRegion, _create_new: bool) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::ReadOnlyFilesystem,
+            "read-only Astrid volume preflight",
+        ))
+    }
+
+    fn region_exists(&self, region: &VolumeRegion) -> io::Result<bool> {
+        Ok(self.regions.contains_key(region))
+    }
+
+    fn region_len(&self, region: &VolumeRegion) -> io::Result<u64> {
+        self.regions
+            .get(region)
+            .map(|state| state.length)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, region.as_str()))
+    }
+
+    fn read_region_at(
+        &self,
+        region: &VolumeRegion,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> io::Result<usize> {
+        read_region_state_at(&self.file, &self.regions, region, offset, buffer)
+    }
+
+    fn write_region_from(
+        &self,
+        _region: &VolumeRegion,
+        _offset: u64,
+        _payload_len: u64,
+        _payload: &mut dyn Read,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::ReadOnlyFilesystem,
+            "read-only Astrid volume preflight",
+        ))
+    }
+
+    fn set_region_len(&self, _region: &VolumeRegion, _length: u64) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::ReadOnlyFilesystem,
+            "read-only Astrid volume preflight",
+        ))
+    }
+
+    fn remove_region(&self, _region: &VolumeRegion) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::ReadOnlyFilesystem,
+            "read-only Astrid volume preflight",
+        ))
+    }
+
+    fn rename_region(&self, _source: &VolumeRegion, _destination: &VolumeRegion) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::ReadOnlyFilesystem,
+            "read-only Astrid volume preflight",
+        ))
+    }
+
+    fn replace_region(
+        &self,
+        _source: &VolumeRegion,
+        _destination: &VolumeRegion,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::ReadOnlyFilesystem,
+            "read-only Astrid volume preflight",
+        ))
+    }
+
+    fn commit_metadata(&self, _mutations: &[VolumeMetadataMutation]) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::ReadOnlyFilesystem,
+            "read-only Astrid volume preflight",
+        ))
+    }
+
+    fn list_regions(&self, prefix: &str) -> io::Result<Vec<VolumeRegion>> {
+        Ok(self
+            .regions
+            .keys()
+            .filter(|region| region.as_str().starts_with(prefix))
+            .cloned()
+            .collect())
+    }
+
+    fn available_space(&self) -> io::Result<Option<u64>> {
+        Ok(None)
+    }
+
+    fn reclaim(&self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::ReadOnlyFilesystem,
+            "read-only Astrid volume preflight",
+        ))
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl fmt::Debug for HostedFileVolume {
@@ -229,46 +391,8 @@ impl AstridVolume for HostedFileVolume {
         offset: u64,
         buffer: &mut [u8],
     ) -> io::Result<usize> {
-        let mut state = self.state.lock();
-        let Some(region_state) = state.regions.get(region) else {
-            return Err(io::Error::new(io::ErrorKind::NotFound, region.as_str()));
-        };
-        if offset >= region_state.length || buffer.is_empty() {
-            return Ok(0);
-        }
-        let available = region_state.length.saturating_sub(offset);
-        let wanted = usize::try_from(available.min(buffer.len() as u64))
-            .map_err(|_| io::Error::other("volume read length overflow"))?;
-        let read_end = offset
-            .checked_add(wanted as u64)
-            .ok_or_else(|| io::Error::other("volume read range overflow"))?;
-        // Copy only extents that overlap the requested range. Cloning the whole
-        // region map on every read made catalog lookups quadratic in extents.
-        let overlaps = overlapping_extents(region_state, offset, read_end);
-        buffer[..wanted].fill(0);
-        for (start, extent) in overlaps {
-            let copy_start = start.max(offset);
-            let copy_end = extent.logical_end.min(read_end);
-            if copy_start >= copy_end {
-                continue;
-            }
-            let physical = extent
-                .physical_offset
-                .checked_add(copy_start.saturating_sub(start))
-                .ok_or_else(|| io::Error::other("volume extent offset overflow"))?;
-            let destination = usize::try_from(copy_start.saturating_sub(offset))
-                .map_err(|_| io::Error::other("volume destination offset overflow"))?;
-            let length = usize::try_from(copy_end.saturating_sub(copy_start))
-                .map_err(|_| io::Error::other("volume extent length overflow"))?;
-            state.file.seek(SeekFrom::Start(physical))?;
-            let destination_end = destination
-                .checked_add(length)
-                .ok_or_else(|| io::Error::other("volume destination range overflow"))?;
-            state
-                .file
-                .read_exact(&mut buffer[destination..destination_end])?;
-        }
-        Ok(wanted)
+        let state = self.state.lock();
+        read_region_state_at(&state.file, &state.regions, region, offset, buffer)
     }
 
     fn write_region_from(

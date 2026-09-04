@@ -2,21 +2,25 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use uuid::Uuid;
 
-use super::format::{StagingIntent, decode_intent, encode_intent};
+use super::format::{
+    StagingIntent, decode_intent, encode_intent, is_runtime_forbidden_user_intent_error,
+};
 use super::{StagedContentId, connection};
+use crate::engine::durable::PrincipalCodec;
 use crate::error::StorageResult;
+use crate::principal_state::StateOwnerCodecV2;
 use crate::principal_state::native_io::PrivateDirectory;
 
-const JOURNAL_MAGIC: [u8; 8] = *b"ASTRSTG1";
+pub(super) const JOURNAL_MAGIC: [u8; 8] = *b"ASTRSTG1";
 const JOURNAL_VERSION: u16 = 1;
-const JOURNAL_HEADER_BYTES: usize = 52;
+pub(super) const JOURNAL_HEADER_BYTES: usize = 52;
 const CHECKSUM_OFFSET: usize = 20;
-const SEALED_RECORD: u8 = 1;
+pub(super) const SEALED_RECORD: u8 = 1;
 const PUBLISHED_RECORD: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -44,6 +48,388 @@ pub(super) enum JournalRecord {
 pub(super) struct JournalRecovery {
     pub(super) pending: BTreeMap<StageKey, StagingIntent>,
     pub(super) completed: BTreeSet<StageKey>,
+}
+
+/// A mutation-free journal owner proof and its first incompleteness evidence.
+#[derive(Debug)]
+pub(super) struct JournalOwnerScan {
+    pub(super) contains_user: bool,
+    pub(super) scan_error: Option<io::Error>,
+}
+
+const JOURNAL_SCAN_WINDOW_BYTES: usize = 64 * 1024;
+const SEALED_EARLY_PREFIX_BYTES: usize = 1 + 16 + 2 + 8 + 16 + 8;
+const STATE_OWNER_V2_BYTES: u64 = 33;
+
+/// Inspect every byte-offset journal candidate without repairing any bytes.
+///
+/// Classification reads only the fixed early sealed-owner envelope. The name,
+/// profile, and checksummed remainder remain unbounded by this format and are
+/// streamed, so a large valid staging intent is never copied into scan memory.
+pub(super) fn scan_runtime_forbidden_user_without_repair(
+    file: &mut File,
+) -> io::Result<JournalOwnerScan> {
+    let file_len = file.metadata()?.len();
+    let mut scan = JournalOwnerScan {
+        contains_user: false,
+        scan_error: None,
+    };
+    let mut search = 0_u64;
+    let mut magic_scanner = JournalMagicScanner::new(file, file_len)?;
+    while let Some(offset) = magic_scanner.next(file, search)? {
+        match decode_frame_without_repair(file, offset, file_len, false)? {
+            JournalFrame::Skipped(frame_end) | JournalFrame::Frame(_, frame_end) => {
+                search = frame_end;
+            },
+            JournalFrame::User => {
+                scan.contains_user = true;
+                scan.scan_error = None;
+                return Ok(scan);
+            },
+            JournalFrame::Malformed(reason) => {
+                scan.scan_error.get_or_insert(io::Error::other(format!(
+                    "corrupt interior staging journal frame at {offset}: {}",
+                    reason.detail()
+                )));
+                search = offset.saturating_add(1);
+            },
+            JournalFrame::Unsupported(reason) => {
+                scan.scan_error.get_or_insert(io::Error::other(format!(
+                    "unsupported staging journal frame at {offset}: {}",
+                    reason.detail()
+                )));
+                search = offset.saturating_add(1);
+            },
+        }
+    }
+    Ok(scan)
+}
+
+enum JournalFrame {
+    Frame(JournalRecord, u64),
+    Skipped(u64),
+    Malformed(MalformedJournalFrame),
+    Unsupported(UnsupportedJournalFrame),
+    User,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MalformedJournalFrame {
+    TruncatedHeader,
+    LengthOverflow,
+    LengthExceedsFile,
+    ChecksumMismatch,
+    Decode(&'static str),
+}
+
+impl MalformedJournalFrame {
+    fn detail(self) -> &'static str {
+        match self {
+            Self::TruncatedHeader => "truncated staging journal header",
+            Self::LengthOverflow => "length overflows file",
+            Self::LengthExceedsFile => "length exceeds file",
+            Self::ChecksumMismatch => "checksum mismatch",
+            Self::Decode(detail) => detail,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum UnsupportedJournalFrame {
+    Magic,
+    Version(u16),
+    Reserved,
+}
+
+impl UnsupportedJournalFrame {
+    fn detail(self) -> String {
+        match self {
+            Self::Magic => "magic is unsupported".to_owned(),
+            Self::Version(version) => format!("version {version} is unsupported"),
+            Self::Reserved => "reserved header bytes are non-zero".to_owned(),
+        }
+    }
+}
+
+struct JournalMagicScanner {
+    file_len: u64,
+    loaded_start: u64,
+    loaded_end: u64,
+    scan_offset: u64,
+    buffer: Vec<u8>,
+}
+
+impl JournalMagicScanner {
+    fn new(file: &mut File, file_len: u64) -> io::Result<Self> {
+        let mut scanner = Self {
+            file_len,
+            loaded_start: 0,
+            loaded_end: 0,
+            scan_offset: 0,
+            buffer: vec![0_u8; JOURNAL_SCAN_WINDOW_BYTES],
+        };
+        scanner.refill(file)?;
+        Ok(scanner)
+    }
+
+    fn refill(&mut self, file: &mut File) -> io::Result<()> {
+        if self.loaded_end >= self.file_len {
+            return Ok(());
+        }
+        let overlap = u64::try_from(JOURNAL_MAGIC.len().saturating_sub(1))
+            .map_err(|_| io::Error::other("staging journal scan overlap overflow"))?;
+        let read_start = self.loaded_end.saturating_sub(overlap);
+        let wanted = usize::try_from(
+            self.file_len
+                .saturating_sub(read_start)
+                .min(JOURNAL_SCAN_WINDOW_BYTES as u64),
+        )
+        .map_err(|_| io::Error::other("staging journal scan window overflow"))?;
+        let read_end = read_start
+            .checked_add(wanted as u64)
+            .ok_or_else(|| io::Error::other("staging journal scan window overflow"))?;
+        file.seek(SeekFrom::Start(read_start))?;
+        file.read_exact(&mut self.buffer[..wanted])?;
+        self.loaded_start = read_start;
+        self.loaded_end = read_end;
+        self.scan_offset = self.scan_offset.max(read_start).max(self.loaded_start);
+        Ok(())
+    }
+
+    fn next(&mut self, file: &mut File, after: u64) -> io::Result<Option<u64>> {
+        self.scan_offset = self.scan_offset.max(after);
+        loop {
+            if self.scan_offset >= self.file_len {
+                return Ok(None);
+            }
+            while self
+                .scan_offset
+                .checked_add(JOURNAL_MAGIC.len() as u64)
+                .is_some_and(|end| end <= self.loaded_end)
+            {
+                let relative =
+                    usize::try_from(self.scan_offset.checked_sub(self.loaded_start).ok_or_else(
+                        || io::Error::other("staging journal scan cursor underflow"),
+                    )?)
+                    .map_err(|_| io::Error::other("staging journal scan cursor overflow"))?;
+                let end = relative
+                    .checked_add(JOURNAL_MAGIC.len())
+                    .ok_or_else(|| io::Error::other("staging journal scan cursor overflow"))?;
+                if self.buffer.get(relative..end) == Some(JOURNAL_MAGIC.as_slice()) {
+                    let candidate = self.scan_offset;
+                    self.scan_offset = candidate.saturating_add(1);
+                    return Ok(Some(candidate));
+                }
+                self.scan_offset = self.scan_offset.saturating_add(1);
+            }
+            if self.loaded_end >= self.file_len {
+                return Ok(None);
+            }
+            self.scan_offset = self.loaded_end.saturating_sub(
+                u64::try_from(JOURNAL_MAGIC.len().saturating_sub(1))
+                    .map_err(|_| io::Error::other("staging journal scan overlap overflow"))?,
+            );
+            self.refill(file)?;
+        }
+    }
+}
+
+fn verify_frame_checksum(
+    file: &mut File,
+    header: &[u8; JOURNAL_HEADER_BYTES],
+    payload_len: u64,
+) -> io::Result<bool> {
+    let expected: [u8; 32] = header[CHECKSUM_OFFSET..]
+        .try_into()
+        .map_err(|_| io::Error::other("staging journal checksum width mismatch"))?;
+    let mut hasher =
+        blake3::Hasher::new_derive_key("astrid native content staging journal frame v1");
+    hasher.update(&header[..CHECKSUM_OFFSET]);
+    let mut remaining = payload_len;
+    let mut chunk = vec![0_u8; 4096];
+    while remaining > 0 {
+        let wanted = usize::try_from(remaining.min(chunk.len() as u64))
+            .map_err(|_| io::Error::other("staging journal chunk overflow"))?;
+        file.read_exact(&mut chunk[..wanted])?;
+        hasher.update(&chunk[..wanted]);
+        remaining = remaining
+            .checked_sub(
+                u64::try_from(wanted)
+                    .map_err(|_| io::Error::other("staging journal chunk overflow"))?,
+            )
+            .ok_or_else(|| io::Error::other("staging journal chunk underflow"))?;
+    }
+    let digest = hasher.finalize();
+    let valid = *digest.as_bytes() == expected;
+    Ok(valid)
+}
+
+fn classify_sealed_owner_early(file: &mut File, frame_end: u64) -> JournalFrame {
+    let mut tag = [0_u8; 1];
+    if file.read_exact(&mut tag).is_err() {
+        return JournalFrame::Malformed(MalformedJournalFrame::Decode(
+            "staged intent is truncated",
+        ));
+    }
+    if tag[0] != SEALED_RECORD {
+        return JournalFrame::Skipped(frame_end);
+    }
+    let mut early = [0_u8; SEALED_EARLY_PREFIX_BYTES - 1];
+    if file.read_exact(&mut early).is_err() {
+        return JournalFrame::Malformed(MalformedJournalFrame::Decode(
+            "staged intent is truncated",
+        ));
+    }
+    let owner_len = u64::from_le_bytes(early[42..50].try_into().expect("fixed owner width"));
+    if owner_len != STATE_OWNER_V2_BYTES {
+        return JournalFrame::Malformed(MalformedJournalFrame::Decode(
+            "staged owner has invalid length",
+        ));
+    }
+    let mut owner = [0_u8; 33];
+    if file.read_exact(&mut owner).is_err() {
+        return JournalFrame::Malformed(MalformedJournalFrame::Decode("staged owner is truncated"));
+    }
+    if StateOwnerCodecV2.decode(&owner).is_none() {
+        JournalFrame::Malformed(MalformedJournalFrame::Decode(
+            "staged owner is not canonical StateOwner V2",
+        ))
+    } else if owner[0] == 3 {
+        JournalFrame::User
+    } else {
+        JournalFrame::Skipped(frame_end)
+    }
+}
+
+fn decode_frame_without_repair(
+    file: &mut File,
+    offset: u64,
+    file_len: u64,
+    decode_record: bool,
+) -> io::Result<JournalFrame> {
+    let remaining = file_len
+        .checked_sub(offset)
+        .ok_or_else(|| io::Error::other("staging journal scan length underflow"))?;
+    if remaining < JOURNAL_HEADER_BYTES as u64 {
+        return Ok(JournalFrame::Malformed(
+            MalformedJournalFrame::TruncatedHeader,
+        ));
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    let mut header = [0_u8; JOURNAL_HEADER_BYTES];
+    file.read_exact(&mut header)?;
+    let payload_len = u64::from_le_bytes(
+        header[12..20]
+            .try_into()
+            .map_err(|_| io::Error::other("invalid staging journal payload length"))?,
+    );
+    let Some(frame_end) = offset
+        .checked_add(JOURNAL_HEADER_BYTES as u64)
+        .and_then(|end| end.checked_add(payload_len))
+    else {
+        return Ok(JournalFrame::Malformed(
+            MalformedJournalFrame::LengthOverflow,
+        ));
+    };
+    if frame_end > file_len {
+        return Ok(JournalFrame::Malformed(
+            MalformedJournalFrame::LengthExceedsFile,
+        ));
+    }
+    if !verify_frame_checksum(file, &header, payload_len)? {
+        return Ok(JournalFrame::Malformed(
+            MalformedJournalFrame::ChecksumMismatch,
+        ));
+    }
+    if header[..8] != JOURNAL_MAGIC {
+        return Ok(JournalFrame::Unsupported(UnsupportedJournalFrame::Magic));
+    }
+    let version = u16::from_le_bytes([header[8], header[9]]);
+    if version != JOURNAL_VERSION {
+        return Ok(JournalFrame::Unsupported(UnsupportedJournalFrame::Version(
+            version,
+        )));
+    }
+    if header[10..12] != [0, 0] {
+        return Ok(JournalFrame::Unsupported(UnsupportedJournalFrame::Reserved));
+    }
+
+    if !decode_record {
+        file.seek(SeekFrom::Start(
+            offset
+                .checked_add(JOURNAL_HEADER_BYTES as u64)
+                .ok_or_else(|| io::Error::other("staging journal payload offset overflow"))?,
+        ))?;
+        return Ok(classify_sealed_owner_early(file, frame_end));
+    }
+
+    let payload_bytes = usize::try_from(payload_len)
+        .map_err(|_| io::Error::other("staging journal payload is not addressable"))?;
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(payload_bytes)
+        .map_err(|_| io::Error::other("staging journal scan allocation failed"))?;
+    payload.resize(payload_bytes, 0);
+    file.seek(SeekFrom::Start(
+        offset
+            .checked_add(JOURNAL_HEADER_BYTES as u64)
+            .ok_or_else(|| io::Error::other("staging journal payload offset overflow"))?,
+    ))?;
+    file.read_exact(&mut payload)?;
+    let Some((&tag, frame_payload)) = payload.split_first() else {
+        return Ok(JournalFrame::Malformed(MalformedJournalFrame::Decode(
+            "empty staging journal record",
+        )));
+    };
+    if tag != SEALED_RECORD && tag != PUBLISHED_RECORD {
+        return Ok(JournalFrame::Malformed(MalformedJournalFrame::Decode(
+            "unknown staging journal record kind",
+        )));
+    }
+    let payload = frame_payload;
+    if tag == SEALED_RECORD {
+        return match decode_intent(payload) {
+            Ok(intent) => Ok(JournalFrame::Frame(
+                JournalRecord::Sealed(intent),
+                frame_end,
+            )),
+            Err(error) if is_runtime_forbidden_user_intent_error(error) => Ok(JournalFrame::User),
+            Err(detail) => Ok(JournalFrame::Malformed(MalformedJournalFrame::Decode(
+                detail,
+            ))),
+        };
+    }
+    match decode_published_payload(payload) {
+        Some(key) => Ok(JournalFrame::Frame(
+            JournalRecord::Published(key),
+            frame_end,
+        )),
+        None => Ok(JournalFrame::Malformed(MalformedJournalFrame::Decode(
+            decode_published_detail(payload),
+        ))),
+    }
+}
+
+fn decode_published_detail(payload: &[u8]) -> &'static str {
+    if payload.len() < 8 {
+        "truncated staging publication sequence"
+    } else if payload.len() < 24 {
+        "truncated staging publication identifier"
+    } else {
+        "staging publication record has trailing bytes"
+    }
+}
+
+fn decode_published_payload(payload: &[u8]) -> Option<StageKey> {
+    let sequence = payload.get(..8)?.try_into().ok().map(u64::from_le_bytes)?;
+    let id: [u8; 16] = payload.get(8..24)?.try_into().ok()?;
+    if payload.len() != 24 {
+        return None;
+    }
+    Some(StageKey {
+        sequence,
+        id: StagedContentId(Uuid::from_bytes(id)),
+    })
 }
 
 pub(super) fn open_journal(
@@ -111,8 +497,47 @@ fn recover(file: &mut File, path: &Path) -> StorageResult<JournalRecovery> {
     let mut sequences = BTreeMap::new();
     let mut identifiers = BTreeMap::new();
     while offset < file_len {
-        let Some((record, frame_end)) = recover_frame(file, offset, file_len)? else {
-            break;
+        let frame = decode_frame_without_repair(file, offset, file_len, true).map_err(|error| {
+            connection(format!("inspect staging journal without repair: {error}"))
+        })?;
+        let (record, frame_end) = match frame {
+            JournalFrame::Frame(record, frame_end) => (record, frame_end),
+            JournalFrame::Skipped(_) => {
+                return Err(connection(
+                    "full staging recovery cannot skip a checksum-valid frame".to_owned(),
+                ));
+            },
+            JournalFrame::Malformed(malformed) => {
+                if let MalformedJournalFrame::Decode(detail) = malformed {
+                    return Err(connection(format!(
+                        "decode staging journal at {offset}: {detail}"
+                    )));
+                }
+                recover_invalid_tail(file, offset, file_len, malformed.detail())?;
+                break;
+            },
+            JournalFrame::Unsupported(unsupported) => match unsupported {
+                UnsupportedJournalFrame::Magic => {
+                    return Err(connection(format!(
+                        "unsupported staging journal magic at {offset}"
+                    )));
+                },
+                UnsupportedJournalFrame::Version(_) => {
+                    return Err(connection(format!(
+                        "unsupported staging journal version at {offset}"
+                    )));
+                },
+                UnsupportedJournalFrame::Reserved => {
+                    return Err(connection(format!(
+                        "staging journal reserved bytes are non-zero at {offset}"
+                    )));
+                },
+            },
+            JournalFrame::User => {
+                return Err(connection(
+                    "explicit user owner in staging journal is not runtime-admitted".to_owned(),
+                ));
+            },
         };
         apply_record(
             record,
@@ -128,90 +553,19 @@ fn recover(file: &mut File, path: &Path) -> StorageResult<JournalRecovery> {
     Ok(JournalRecovery { pending, completed })
 }
 
-fn recover_frame(
-    file: &mut File,
-    offset: u64,
-    file_len: u64,
-) -> StorageResult<Option<(JournalRecord, u64)>> {
-    let remaining = file_len
-        .checked_sub(offset)
-        .ok_or_else(|| connection("staging journal length underflow".to_owned()))?;
-    let header_bytes = u64::try_from(JOURNAL_HEADER_BYTES)
-        .map_err(|_| connection("staging journal header overflow".to_owned()))?;
-    if remaining < header_bytes {
-        truncate_tail(file, offset)?;
-        return Ok(None);
-    }
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|error| connection(format!("seek staging journal frame: {error}")))?;
-    let mut header = [0_u8; JOURNAL_HEADER_BYTES];
-    file.read_exact(&mut header)
-        .map_err(|error| connection(format!("read staging journal header: {error}")))?;
-    let payload_len = u64::from_le_bytes(
-        header[12..20]
-            .try_into()
-            .map_err(|_| connection("invalid staging journal payload length".to_owned()))?,
-    );
-    let Some(frame_end) = offset
-        .checked_add(header_bytes)
-        .and_then(|end| end.checked_add(payload_len))
-    else {
-        return recover_invalid_tail(file, offset, file_len, "length overflows file");
-    };
-    if frame_end > file_len {
-        return recover_invalid_tail(file, offset, file_len, "length exceeds file");
-    }
-    let payload_bytes = usize::try_from(payload_len)
-        .map_err(|_| connection("staging journal payload is not addressable".to_owned()))?;
-    let mut payload = Vec::new();
-    payload
-        .try_reserve_exact(payload_bytes)
-        .map_err(|_| connection("staging journal payload allocation failed".to_owned()))?;
-    payload.resize(payload_bytes, 0);
-    file.read_exact(&mut payload)
-        .map_err(|error| connection(format!("read staging journal payload: {error}")))?;
-    let expected: [u8; 32] = header[CHECKSUM_OFFSET..]
-        .try_into()
-        .map_err(|_| connection("staging journal checksum width mismatch".to_owned()))?;
-    if frame_checksum(&header, &payload) != expected {
-        return recover_invalid_tail(file, offset, file_len, "checksum mismatch");
-    }
-    // The checksum binds the physical header. A self-consistent unknown
-    // header is a newer or otherwise unsupported format, not a torn tail;
-    // fail without modifying it so an older binary cannot destroy it.
-    if header[..8] != JOURNAL_MAGIC {
-        return Err(connection(format!(
-            "unsupported staging journal magic at {offset}"
-        )));
-    }
-    if u16::from_le_bytes([header[8], header[9]]) != JOURNAL_VERSION {
-        return Err(connection(format!(
-            "unsupported staging journal version at {offset}"
-        )));
-    }
-    if header[10..12] != [0, 0] {
-        return Err(connection(format!(
-            "staging journal reserved bytes are non-zero at {offset}"
-        )));
-    }
-    let record = decode_record(&payload)
-        .map_err(|detail| connection(format!("decode staging journal at {offset}: {detail}")))?;
-    Ok(Some((record, frame_end)))
-}
-
 fn recover_invalid_tail(
     file: &mut File,
     offset: u64,
     file_len: u64,
     detail: &str,
-) -> StorageResult<Option<(JournalRecord, u64)>> {
+) -> StorageResult<()> {
     if valid_frame_follows(file, offset, file_len)? {
         return Err(connection(format!(
             "corrupt interior staging journal frame at {offset}: {detail}"
         )));
     }
     truncate_tail(file, offset)?;
-    Ok(None)
+    Ok(())
 }
 
 fn apply_record(
@@ -278,85 +632,30 @@ fn encode_record(record: &JournalRecord) -> StorageResult<Vec<u8>> {
     }
 }
 
-fn decode_record(bytes: &[u8]) -> Result<JournalRecord, &'static str> {
-    let Some((&tag, payload)) = bytes.split_first() else {
-        return Err("empty staging journal record");
-    };
-    match tag {
-        SEALED_RECORD => decode_intent(payload).map(JournalRecord::Sealed),
-        PUBLISHED_RECORD => {
-            let sequence = payload
-                .get(..8)
-                .ok_or("truncated staging publication record")?
-                .try_into()
-                .map(u64::from_le_bytes)
-                .map_err(|_| "invalid staging publication sequence")?;
-            let id: [u8; 16] = payload
-                .get(8..24)
-                .ok_or("truncated staging publication identifier")?
-                .try_into()
-                .map_err(|_| "invalid staging publication identifier")?;
-            if payload.len() != 24 {
-                return Err("staging publication record has trailing bytes");
-            }
-            Ok(JournalRecord::Published(StageKey {
-                sequence,
-                id: StagedContentId(Uuid::from_bytes(id)),
-            }))
-        },
-        _ => Err("unknown staging journal record kind"),
-    }
-}
-
 fn valid_frame_follows(file: &mut File, invalid_offset: u64, file_len: u64) -> StorageResult<bool> {
-    let Some(mut candidate) = invalid_offset.checked_add(1) else {
+    let Some(start) = invalid_offset.checked_add(1) else {
         return Ok(false);
     };
-    let header_len = u64::try_from(JOURNAL_HEADER_BYTES)
-        .map_err(|_| connection("staging journal header overflow".to_owned()))?;
-    while candidate
-        .checked_add(header_len)
-        .is_some_and(|end| end <= file_len)
+    let mut scanner = JournalMagicScanner::new(file, file_len)
+        .map_err(|error| connection(format!("seek staging recovery candidate: {error}")))?;
+    let candidate = scanner
+        .next(file, start)
+        .map_err(|error| connection(format!("read staging recovery candidate: {error}")))?;
+    let Some(candidate) = candidate else {
+        return Ok(false);
+    };
+    // This scan is a truncation barrier, not an acceptance path. A
+    // checksum-valid envelope proves that durable bytes follow the damaged
+    // frame even when this binary does not understand the envelope.
+    match decode_frame_without_repair(file, candidate, file_len, false)
+        .map_err(|error| connection(format!("read staging recovery candidate: {error}")))?
     {
-        file.seek(SeekFrom::Start(candidate))
-            .map_err(|error| connection(format!("seek staging recovery candidate: {error}")))?;
-        let mut header = [0_u8; JOURNAL_HEADER_BYTES];
-        file.read_exact(&mut header)
-            .map_err(|error| connection(format!("read staging recovery candidate: {error}")))?;
-        let payload_len = u64::from_le_bytes(
-            header[12..20]
-                .try_into()
-                .map_err(|_| connection("invalid staging recovery payload length".to_owned()))?,
-        );
-        let frame_end = candidate
-            .checked_add(header_len)
-            .and_then(|value| value.checked_add(payload_len));
-        if frame_end.is_some_and(|end| end <= file_len) {
-            let payload_bytes = usize::try_from(payload_len)
-                .map_err(|_| connection("staging journal payload is not addressable".to_owned()))?;
-            let mut payload = Vec::new();
-            payload
-                .try_reserve_exact(payload_bytes)
-                .map_err(|_| connection("staging journal payload allocation failed".to_owned()))?;
-            payload.resize(payload_bytes, 0);
-            file.read_exact(&mut payload)
-                .map_err(|error| connection(format!("read staging recovery payload: {error}")))?;
-            let expected: [u8; 32] = header[CHECKSUM_OFFSET..]
-                .try_into()
-                .map_err(|_| connection("staging journal checksum width mismatch".to_owned()))?;
-            // This scan is a truncation barrier, not an acceptance path. A
-            // checksum-valid envelope proves that durable bytes follow the
-            // damaged frame even when this binary does not understand the
-            // envelope's header or record version.
-            if frame_checksum(&header, &payload) == expected {
-                return Ok(true);
-            }
-        }
-        candidate = candidate
-            .checked_add(1)
-            .ok_or_else(|| connection("staging journal scan offset overflow".to_owned()))?;
+        JournalFrame::Frame(..)
+        | JournalFrame::Skipped(_)
+        | JournalFrame::User
+        | JournalFrame::Unsupported(_) => Ok(true),
+        JournalFrame::Malformed(_) => Ok(false),
     }
-    Ok(false)
 }
 
 fn truncate_tail(file: &mut File, valid_len: u64) -> StorageResult<()> {

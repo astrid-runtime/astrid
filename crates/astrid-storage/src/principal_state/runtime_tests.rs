@@ -4,6 +4,7 @@ use std::num::NonZeroU64;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::engine::PrincipalCodec;
 use crate::engine::{ObjectCacheCapacity, ObjectCacheController, RootTransaction};
 use crate::resources::ResidentMemoryAuthority;
 use crate::storage_model::{
@@ -15,6 +16,7 @@ use crate::{AstridFilesystem, FilesystemPath};
 #[cfg(feature = "legacy-surrealkv")]
 use astrid_core::profile::{DeviceKey, DeviceScope, PrincipalProfile};
 
+use super::RuntimeStateOwnerCodecV2;
 use super::*;
 use crate::content::{CONTENT_COMPONENT_LABEL, CatalogValue, LegacyCatalog, encode_legacy_catalog};
 use crate::{ChunkingProfile, ContentIngest, ContentName};
@@ -25,7 +27,7 @@ fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
     Arc::new(|owner: &StateOwner| {
         Ok(match owner {
             StateOwner::System => None,
-            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+            StateOwner::Principal(_) | StateOwner::Fleet(_) | StateOwner::User(_) => Some(u64::MAX),
         })
     })
 }
@@ -319,7 +321,7 @@ fn format_specification_has_a_tagged_metadata_identity() {
     assert!(record.references().is_empty());
     assert_eq!(
         object_id_hex(id),
-        "ac3e1ab1e82be24dae7cdef949698dd54d2407bc7f39fb30709dc36677eea61d"
+        "9fd0397780f01a07f7a38b895c5f2836e9fc12d3ed81a5455dab3702b2d6f21c"
     );
     assert_eq!(
         object_id_hex(catalog_id),
@@ -330,7 +332,7 @@ fn format_specification_has_a_tagged_metadata_identity() {
         "format=astrid-principal-store-v1\n\
          identity=blake3-object-identity-v1\n\
          identity-wire=tagged-identity-v1\n\
-         format-spec-object=1:1:32:ac3e1ab1e82be24dae7cdef949698dd54d2407bc7f39fb30709dc36677eea61d\n\
+         format-spec-object=1:1:32:9fd0397780f01a07f7a38b895c5f2836e9fc12d3ed81a5455dab3702b2d6f21c\n\
          content-catalog-spec-object=1:1:32:8f3999b066b666396259c4a92f9de7c5b8e67df9d38a69fb4fb824968b56ecdb\n\
          representations=authoritative-direct-v1\n\
          principal-codec=state-owner-v2\n\
@@ -346,7 +348,7 @@ fn pre_derivation_v1_runatal_upgrade_is_idempotent_and_preserves_history() {
     let engine = RuntimeEngine::open(
         &store_path,
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV2,
+        RuntimeStateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
     )
     .unwrap();
@@ -428,7 +430,7 @@ fn prior_metadata_that_declared_a_catalog_specification_requires_it() {
     let engine = RuntimeEngine::open(
         directory.path(),
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV2,
+        RuntimeStateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
     )
     .unwrap();
@@ -564,7 +566,7 @@ async fn changed_surviving_directory_store_is_rejected_by_post_barrier_retiremen
         RuntimeEngine::open(
             home.principal_store_path(),
             Blake3ObjectIdentityV1,
-            StateOwnerCodecV2,
+            RuntimeStateOwnerCodecV2,
             RecoveryLimits::process_addressable(),
         )
         .unwrap(),
@@ -679,7 +681,7 @@ fn install_legacy_catalog_fixtures(
         RuntimeEngine::open(
             home.principal_store_path(),
             Blake3ObjectIdentityV1,
-            StateOwnerCodecV2,
+            RuntimeStateOwnerCodecV2,
             RecoveryLimits::process_addressable(),
         )
         .unwrap(),
@@ -843,7 +845,7 @@ async fn flat_content_catalog_migration_resumes_and_is_idempotent() {
         RuntimeEngine::open(
             home.principal_store_path(),
             Blake3ObjectIdentityV1,
-            StateOwnerCodecV2,
+            RuntimeStateOwnerCodecV2,
             RecoveryLimits::process_addressable(),
         )
         .unwrap(),
@@ -1363,7 +1365,7 @@ async fn completed_store_does_not_self_heal_a_missing_runatal_object() {
         RuntimeEngine::open(
             &path,
             Blake3ObjectIdentityV1,
-            StateOwnerCodecV2,
+            RuntimeStateOwnerCodecV2,
             RecoveryLimits::process_addressable(),
         )
         .unwrap(),
@@ -1402,7 +1404,7 @@ async fn current_metadata_does_not_self_heal_a_missing_catalog_specification() {
     let engine = RuntimeEngine::open(
         &path,
         Blake3ObjectIdentityV1,
-        StateOwnerCodecV2,
+        RuntimeStateOwnerCodecV2,
         RecoveryLimits::process_addressable(),
     )
     .unwrap();
@@ -1582,7 +1584,7 @@ async fn live_quota_blocks_growth_but_allows_recovery_and_system_state() {
     let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
         Ok(match owner {
             StateOwner::System => None,
-            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(27),
+            StateOwner::Principal(_) | StateOwner::Fleet(_) | StateOwner::User(_) => Some(27),
         })
     });
     let store = open_runtime_principal_store(&home, quota).await.unwrap();
@@ -1627,7 +1629,7 @@ async fn rejected_streaming_writes_do_not_grow_the_physical_volume() {
     let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
         Ok(match owner {
             StateOwner::System => None,
-            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(27),
+            StateOwner::Principal(_) | StateOwner::Fleet(_) | StateOwner::User(_) => Some(27),
         })
     });
     let store = open_runtime_principal_store(&home, quota).await.unwrap();
@@ -1758,7 +1760,7 @@ async fn durable_point_update_has_height_bounded_write_amplification() {
         RuntimeEngine::open(
             directory.path(),
             Blake3ObjectIdentityV1,
-            StateOwnerCodecV2,
+            RuntimeStateOwnerCodecV2,
             limits,
         )
         .unwrap(),
@@ -1796,7 +1798,7 @@ async fn durable_point_update_has_height_bounded_write_amplification() {
         RuntimeEngine::open(
             directory.path(),
             Blake3ObjectIdentityV1,
-            StateOwnerCodecV2,
+            RuntimeStateOwnerCodecV2,
             limits,
         )
         .unwrap(),
@@ -1823,7 +1825,7 @@ async fn native_kv_group_commit_scale_probe() {
             RuntimeEngine::open(
                 directory.path(),
                 Blake3ObjectIdentityV1,
-                StateOwnerCodecV2,
+                RuntimeStateOwnerCodecV2,
                 RecoveryLimits::process_addressable(),
             )
             .unwrap(),

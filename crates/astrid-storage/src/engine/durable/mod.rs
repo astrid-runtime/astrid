@@ -251,6 +251,20 @@ pub trait PrincipalCodec<P>: Send + Sync {
 
     /// Decode and validate one principal identifier.
     fn decode(&self, bytes: &[u8]) -> Option<P>;
+
+    /// Check whether this durable wire grammar admits the principal.
+    ///
+    /// The default accepts every in-memory principal. Integration codecs use
+    /// this hook to reserve wire capacity without activating it as durable
+    /// runtime state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an admission error when the principal is reserved by this
+    /// active grammar.
+    fn admit_principal(&self, _principal: &P) -> Result<(), DurableError> {
+        Ok(())
+    }
 }
 
 /// Algorithm and construction version carried beside every durable identity.
@@ -326,6 +340,10 @@ where
 
     fn decode(&self, bytes: &[u8]) -> Option<P> {
         self.0.decode(bytes)
+    }
+
+    fn admit_principal(&self, principal: &P) -> Result<(), DurableError> {
+        self.0.admit_principal(principal)
     }
 }
 
@@ -408,6 +426,8 @@ pub enum DurableError {
         /// Root-journal frame containing the bytes.
         offset: u64,
     },
+    /// The in-memory principal is not admitted by the active wire grammar.
+    UnsupportedPrincipal,
     /// A structurally valid frame violates the portable state model during
     /// recovery.
     RecoveryModel {
@@ -475,6 +495,9 @@ impl fmt::Display for DurableError {
                     formatter,
                     "invalid principal bytes at root-journal byte {offset}"
                 )
+            },
+            Self::UnsupportedPrincipal => {
+                formatter.write_str("principal is not admitted by the durable owner codec")
             },
             Self::RecoveryModel {
                 file,
@@ -833,7 +856,8 @@ use format::{
     PreparedFrame, append_frame, append_frames, append_prepared_frames, canonical_record_bytes,
     corrupt, decode_object_frame, encode_object_frame, ensure_payload_limit, io_error,
     read_indexed_object, read_indexed_object_with_payload, read_indexed_objects, recover_arena,
-    scan_frames, verify_indexed_location, verify_indexed_tail, visit_indexed_objects,
+    scan_frames, scan_frames_observing, verify_indexed_location, verify_indexed_tail,
+    visit_indexed_objects,
 };
 #[cfg(test)]
 use format::{frame_checksum, last_batch_spans, open_rw};
@@ -842,8 +866,45 @@ use native_io::{
     create_private as create_private_file_capability, open_directory as open_directory_capability,
     open_rw as open_rw_capability, sync_directory as sync_store_directory_capability,
 };
+pub(crate) use recovery::OwnerObservations;
+pub(crate) use recovery::inspect_native_root_history_without_repair;
+pub(crate) use recovery::inspect_native_wal_owners_without_repair;
+pub(crate) use recovery::inspect_volume_root_history_without_repair;
+pub(crate) fn inspect_volume_wal_owners_without_repair<P, I, C>(
+    volume: &Arc<dyn AstridVolume>,
+    identity: &I,
+    codec: &C,
+    limits: RecoveryLimits,
+) -> Result<OwnerObservations<P>, DurableError>
+where
+    P: Ord,
+    I: PersistentObjectIdentity + Clone,
+    C: PrincipalCodec<P> + Clone,
+{
+    let region =
+        VolumeRegion::new(WAL_FILE).map_err(|source| io_error("validate WAL region", source))?;
+    if !volume
+        .region_exists(&region)
+        .map_err(|source| io_error("probe WAL region", source))?
+    {
+        return Ok(OwnerObservations {
+            owners: BTreeSet::new(),
+            scan_error: None,
+        });
+    }
+    let mut wal = File::volume(Arc::clone(volume), WAL_FILE, false)?;
+    wal::wal_root_owners_without_repair(
+        &mut wal,
+        identity,
+        &SharedPrincipalCodec::new(codec.clone()),
+        limits,
+    )
+}
 use recovery::{RecoveryScope, recover_store, recover_volume};
-use roots::{encode_root_record, encode_root_snapshot, recover_root_history, recover_roots};
+use roots::{
+    encode_root_record, encode_root_snapshot, probe_root_history_without_repair,
+    recover_root_history, recover_roots,
+};
 use validation::{
     ClosureObjects, materialize_closure, preload_indexed_closures, recovery_closure_error,
     usage_from_closure, validate_commit_closure, validate_incremental_closure,

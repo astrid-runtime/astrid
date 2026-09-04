@@ -27,7 +27,7 @@ use parking_lot::RwLock;
 #[cfg(any(test, feature = "crash-replay"))]
 pub mod crash_replay;
 #[cfg(not(target_family = "wasm"))]
-mod durable;
+pub(crate) mod durable;
 #[cfg(not(target_family = "wasm"))]
 mod durable_cache;
 mod kv;

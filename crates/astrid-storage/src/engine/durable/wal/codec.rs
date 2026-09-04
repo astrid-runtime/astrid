@@ -3,9 +3,10 @@ use super::super::roots::encode_root_record;
 use super::super::{IdentityScheme, PersistentObjectIdentity, PrincipalCodec};
 use crate::storage_model::{ObjectId, ObjectRecord, RootGeneration, RootState};
 use std::borrow::Cow;
+use std::io::Read;
 
 use super::types::{
-    WalBeginHints, WalCount, WalDigest, WalError, WalLength, WalLimits, WalOrdinal,
+    WalBeginHints, WalCount, WalDigest, WalError, WalLength, WalLimits, WalOffset, WalOrdinal,
     WalPhysicalLimit, WalRecordKind, WalRootTransition, WalSequence,
 };
 
@@ -191,6 +192,52 @@ pub(super) fn validate_record_version(
 /// Verify a payload checksum.
 pub(super) fn checksum_valid(header: PhysicalHeader, payload: &[u8]) -> bool {
     frame_checksum(WAL_MAGIC, header.payload_len.get(), payload) == header.checksum
+}
+
+/// Verify one physical checksum while reading its payload in fixed chunks.
+///
+/// The owner barrier uses this path so a hostile sparse declaration cannot
+/// force proportional allocation before its envelope is proven valid.
+pub(super) fn checksum_valid_streaming<R: Read>(
+    mut payload: R,
+    header: PhysicalHeader,
+) -> Result<bool, WalError> {
+    let mut hasher = blake3::Hasher::new_derive_key("astrid durable physical frame checksum v1");
+    hasher.update(&WAL_MAGIC);
+    hasher.update(&1_u16.to_le_bytes());
+    hasher.update(&header.payload_len.get().to_le_bytes());
+    let mut unread = header.payload_len.get();
+    let mut buffer = vec![0_u8; 65_536];
+    while unread != 0 {
+        let wanted = usize::try_from(unread.min(buffer.len() as u64))
+            .map_err(|_| WalError::Encoding("WAL payload chunk length overflow"))?;
+        let mut read = 0_usize;
+        while read < wanted {
+            let amount =
+                payload
+                    .read(&mut buffer[read..wanted])
+                    .map_err(|source| WalError::Io {
+                        operation: "read ASTWAL2 streaming payload",
+                        source,
+                    })?;
+            if amount == 0 {
+                return Err(WalError::Corrupt {
+                    offset: WalOffset::new(0),
+                    detail: "WAL payload ended unexpectedly",
+                });
+            }
+            read = read.checked_add(amount).ok_or(WalError::CountOverflow {
+                field: "payload bytes",
+            })?;
+        }
+        hasher.update(&buffer[..read]);
+        unread = unread
+            .checked_sub(read as u64)
+            .ok_or(WalError::CountOverflow {
+                field: "payload bytes",
+            })?;
+    }
+    Ok(*hasher.finalize().as_bytes() == header.checksum)
 }
 
 /// Parse the logical record header.

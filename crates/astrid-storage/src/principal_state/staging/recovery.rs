@@ -7,14 +7,18 @@ use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
-use super::format::{StagingIntent, load_generation_footer_from_file};
+use super::format::{
+    GenerationOwnerScan, StagingIntent, inspect_generation_footer_owner,
+    is_runtime_forbidden_user_owner, load_generation_footer_from_file,
+};
 use super::journal::{
     JournalRecord, StageKey, StageKey as JournalStageKey, append_records, flush_journal,
+    scan_runtime_forbidden_user_without_repair,
 };
 use super::retirement::{create_marker_in, remove_in as remove_generation_in};
 use super::{
-    JournalState, ReadyStagedContent, StagedContentId, StagingFaultInjector, StagingFaultPoint,
-    claim_generation_key, connection, open_generation_name,
+    JOURNAL_FILE, JournalState, ReadyStagedContent, StagedContentId, StagingFaultInjector,
+    StagingFaultPoint, claim_generation_key, connection, open_generation_name,
 };
 use crate::error::StorageResult;
 use crate::principal_state::native_io::{
@@ -25,6 +29,56 @@ struct RecoveryScan {
     recovered: Vec<StagingIntent>,
     completed_with_sealed: BTreeSet<StageKey>,
     namespace_changed: bool,
+}
+
+/// Prove a staging area contains no canonical User before any recovery write.
+pub(super) fn reject_runtime_forbidden_staging(
+    root: &PrivateDirectory,
+    generations: &PrivateDirectory,
+    quarantine: &PrivateDirectory,
+) -> StorageResult<()> {
+    if root.contains(Path::new(JOURNAL_FILE))? {
+        let mut journal = root.open_file(Path::new(JOURNAL_FILE))?;
+        let scan = scan_runtime_forbidden_user_without_repair(&mut journal).map_err(|error| {
+            connection(format!("inspect staging journal without repair: {error}"))
+        })?;
+        if let Some(error) = scan.scan_error {
+            return Err(connection(format!(
+                "staging journal owner preflight could not prove complete coverage: {error}"
+            )));
+        }
+        if scan.contains_user {
+            return Err(connection(
+                "explicit user owner in staging journal is not runtime-admitted".to_owned(),
+            ));
+        }
+    }
+    for directory in [generations, quarantine] {
+        for name in directory.entries()? {
+            let name = PathBuf::from(name);
+            if !directory.entry_is_file(&name)? {
+                continue;
+            }
+            let mut file = directory.open_file(&name)?;
+            let path = PathBuf::from(format!("staging generation {}", name.display()));
+            match inspect_generation_footer_owner(&path, &mut file)? {
+                GenerationOwnerScan::User => {
+                    return Err(connection(format!(
+                        "explicit user owner in staged generation {} is not runtime-admitted",
+                        name.display()
+                    )));
+                },
+                GenerationOwnerScan::Admitted | GenerationOwnerScan::Terminal => {},
+                GenerationOwnerScan::Malformed(detail) => {
+                    return Err(connection(format!(
+                        "staged generation {} owner preflight failed: {detail}",
+                        name.display()
+                    )));
+                },
+            }
+        }
+    }
+    Ok(())
 }
 
 struct RecoveryContext<'a> {
@@ -196,8 +250,15 @@ fn recover_or_quarantine(
     let Ok(mut file) = context.generations.open_file(name) else {
         return move_and_mark(scan, name, context, "orphan");
     };
-    let Ok(footer) = load_generation_footer_from_file(&path, &mut file) else {
-        return move_and_mark(scan, name, context, "orphan");
+    let footer = match load_generation_footer_from_file(&path, &mut file) {
+        Ok(footer) => footer,
+        Err(error) if is_runtime_forbidden_user_owner(&error) => {
+            return Err(connection(format!(
+                "explicit user owner in staged generation {} is not runtime-admitted",
+                path.display()
+            )));
+        },
+        Err(_) => return move_and_mark(scan, name, context, "orphan"),
     };
     let intent = footer.intent;
     if StageKey::from_intent(&intent) != key {

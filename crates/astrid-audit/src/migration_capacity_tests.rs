@@ -514,7 +514,9 @@ async fn local_blind_move_onto_volume() {
         std::sync::Arc::new(|owner: &StateOwner| {
             Ok(match owner {
                 StateOwner::System => None,
-                StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+                StateOwner::Principal(_) | StateOwner::Fleet(_) | StateOwner::User(_) => {
+                    Some(u64::MAX)
+                },
             })
         });
     let store = open_runtime_principal_store(&home, quota)
@@ -567,7 +569,9 @@ async fn local_blind_move_reopen_and_append() {
         std::sync::Arc::new(|owner: &StateOwner| {
             Ok(match owner {
                 StateOwner::System => None,
-                StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+                StateOwner::Principal(_) | StateOwner::Fleet(_) | StateOwner::User(_) => {
+                    Some(u64::MAX)
+                },
             })
         });
     let store = open_runtime_principal_store(&home, quota)

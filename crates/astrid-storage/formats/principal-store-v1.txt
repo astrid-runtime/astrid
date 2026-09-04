@@ -306,6 +306,7 @@ The state-owner-v2 principal codec is:
   00                           system owner
   01 <32-byte principal UID>   principal owner
   02 <32-byte fleet UID>       fleet owner
+  03 <32-byte user UID>        user owner
 
 The system encoding is exactly one byte. A principal encoding is exactly 33
 bytes: tag 01 followed by the 32-byte, domain-separated BLAKE3 digest of its
@@ -316,6 +317,14 @@ A fleet encoding is exactly 33 bytes: tag 02 followed by the 32-byte,
 domain-separated BLAKE3 digest of its canonical fleet identity record. Fleet
 ownership is distinct from principal and system ownership; readers MUST NOT
 reinterpret one owner domain as another.
+
+A user encoding is exactly 33 bytes: tag 03 followed by the 32-byte,
+domain-separated BLAKE3 digest of its canonical user identity record. User
+ownership is distinct from principal, fleet, and system ownership; readers
+MUST NOT reinterpret one owner domain as another. This is the prerelease wire
+grammar, not authorization for active runtime durable storage: the active
+runtime admission and recovery barrier continues to reject user owners until
+an explicit authority activation changes that policy.
 
 The fleet genesis identity record hashed by BLAKE3 derive-key context "astrid
 fleet uid v1" is exactly 64 bytes:
@@ -1407,10 +1416,12 @@ is the following exact bytes:
 
 The owner bytes use state-owner-v2: System is one zero byte; a principal is one
 byte value 1 followed by its 32-byte PrincipalUid; a fleet is one byte value 2
-followed by its 32-byte FleetUid. The name is non-empty UTF-8 containing no NUL
-and remains an opaque content name. The chunk profile must satisfy the section
-7.2 grammar. The checksum is BLAKE3 derive-key under the exact context "astrid
-native content staging intent v2" over every preceding intent byte.
+followed by its 32-byte FleetUid; a user is one byte value 3 followed by its
+32-byte UserUid. Runtime staging admission and recovery continue to reject the
+user form. The name is non-empty UTF-8 containing no NUL and remains an opaque
+content name. The chunk profile must satisfy the section 7.2 grammar. The
+checksum is BLAKE3 derive-key under the exact context "astrid native content
+staging intent v2" over every preceding intent byte.
 
 content.bin is flushed before the checksummed intent is atomically published.
 The ready-directory transition does not change the intent bytes. A version-1

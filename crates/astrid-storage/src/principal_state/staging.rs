@@ -25,17 +25,21 @@ use super::native_io::private_file_identity;
 use super::native_io::{
     PrivateDirectory, PrivateFileIdentity, create_private_file, ensure_private_directory,
 };
-use super::{NativePrincipalContentStore, StateOwner};
+use super::{NativePrincipalContentStore, StateOwner, ensure_runtime_state_owner_admitted};
 use crate::content::{ChunkingProfile, ContentBatchWriteOutcome, ContentName, ContentWriteOutcome};
 use crate::error::{StorageError, StorageResult};
 
 mod format;
 mod group;
 mod journal;
+#[cfg(test)]
+mod journal_recovery_tests;
 mod legacy;
 mod migration;
 mod recovery;
 mod retirement;
+#[cfg(test)]
+mod runtime_owner_tests;
 #[cfg(test)]
 mod tests;
 mod writer;
@@ -49,7 +53,10 @@ use journal::{
 };
 pub(super) use migration::migrate_alias_owner_intents;
 use migration::{MigrationDirectories, migrate_legacy};
-use recovery::{load_generation, open_generation_in, recover_generations, sealed_generation_name};
+use recovery::{
+    load_generation, open_generation_in, recover_generations, reject_runtime_forbidden_staging,
+    sealed_generation_name,
+};
 use retirement::{establish_in as establish_retired_generation, remove_in as remove_generation};
 pub use writer::StagedContentWriter;
 
@@ -217,6 +224,11 @@ impl NativeContentStagingArea {
         let root_directory = PrivateDirectory::open(&root)?;
         let generations_directory = PrivateDirectory::open(&generations)?;
         let quarantine_directory = PrivateDirectory::open(&quarantine)?;
+        reject_runtime_forbidden_staging(
+            &root_directory,
+            &generations_directory,
+            &quarantine_directory,
+        )?;
         let (journal_file, recovered) = open_journal(&root_directory, &root.join(JOURNAL_FILE))?;
         // Persist the journal and directory links before any seal can be
         // acknowledged through them.
@@ -314,6 +326,7 @@ impl NativeContentStagingArea {
         profile: ChunkingProfile,
         id: StagedContentId,
     ) -> StorageResult<StagedContentWriter> {
+        ensure_runtime_state_owner_admitted(&owner)?;
         let path = self.inner.generations.join(open_generation_name(id));
         let file = {
             let mut order = self.inner.seal_order.lock();
@@ -390,6 +403,7 @@ impl NativeContentStagingArea {
     ///
     /// Returns a storage or content-publication error. The staged bytes remain
     /// available whenever cleanup did not complete.
+    #[allow(private_interfaces)]
     pub async fn publish(
         &self,
         staged: ReadyStagedContent,
@@ -421,6 +435,7 @@ impl NativeContentStagingArea {
     ///
     /// Returns a staging or content-publication error while retaining every
     /// unacknowledged generation for idempotent retry.
+    #[allow(private_interfaces)]
     pub async fn publish_batch(
         &self,
         staged: Vec<ReadyStagedContent>,
@@ -621,6 +636,7 @@ fn publish_ready(
     staged: &ReadyStagedContent,
     content: &NativePrincipalContentStore,
 ) -> StorageResult<ContentWriteOutcome> {
+    ensure_runtime_state_owner_admitted(&staged.owner)?;
     let (source, _) = open_generation_in(
         &area.inner.generations_directory,
         &staged.content_path(),
@@ -679,6 +695,7 @@ fn publish_ready_batch(
     owner: StateOwner,
     content: &NativePrincipalContentStore,
 ) -> StorageResult<ContentBatchWriteOutcome> {
+    ensure_runtime_state_owner_admitted(&owner)?;
     let outcome = if let Some((mut remaining, limit)) =
         content.quota_staging_bound(&owner).map_err(|error| {
             StorageError::Internal(format!("resolve staged content batch quota: {error}"))
