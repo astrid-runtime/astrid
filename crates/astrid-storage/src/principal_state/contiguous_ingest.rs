@@ -3,8 +3,9 @@
 //! Files use the same canonical streaming arena path as capsule content.
 
 use std::fs::File;
+use std::io::Cursor;
 
-use crate::content::{ContentIngest, ContentName};
+use crate::content::{ChunkingProfile, ContentIngest, ContentName};
 use crate::error::{StorageError, StorageResult};
 
 use super::{RuntimePrincipalStore, StateOwner};
@@ -25,6 +26,18 @@ impl ContiguousFileIngest {
             path: path.into(),
             logical_bytes,
         }
+    }
+}
+
+/// Internal packed publication input accepted by the mixed atomic seam.
+pub(crate) enum PackedProjectionIngest {
+    File(ContiguousFileIngest),
+    Bytes { name: ContentName, bytes: Vec<u8> },
+}
+
+impl PackedProjectionIngest {
+    pub(crate) fn bytes(name: ContentName, bytes: Vec<u8>) -> Self {
+        Self::Bytes { name, bytes }
     }
 }
 
@@ -69,13 +82,25 @@ impl RuntimePrincipalStore {
     pub(crate) fn replace_contiguous_files_removing_exact(
         &self,
         owner: StateOwner,
-        files: impl IntoIterator<Item = ContiguousFileIngest>,
+        files: impl IntoIterator<Item = PackedProjectionIngest>,
         removals: &[ContentName],
     ) -> StorageResult<()> {
         let mut ingests = Vec::new();
         for file in files {
-            let source = open_home_source(&file)?;
-            ingests.push(ContentIngest::new(file.name, source));
+            let (name, source): (_, Box<dyn std::io::Read + Send>) = match file {
+                PackedProjectionIngest::File(file) => {
+                    let source = open_home_source(&file)?;
+                    (file.name, Box::new(source))
+                },
+                PackedProjectionIngest::Bytes { name, bytes } => {
+                    (name, Box::new(Cursor::new(bytes)))
+                },
+            };
+            ingests.push(ContentIngest::with_profile(
+                name,
+                source,
+                ChunkingProfile::ASTRID_V1,
+            ));
         }
         if ingests.is_empty() {
             return if removals.is_empty() {

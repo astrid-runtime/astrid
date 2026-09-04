@@ -76,6 +76,7 @@ pub const RUNTIME_STORE_FORMAT_ID: &str =
     "astrid-principal-store-v1;state-owner-v2;workspace-branch-v1";
 
 pub use contiguous_ingest::ContiguousFileIngest;
+pub(crate) use contiguous_ingest::PackedProjectionIngest;
 #[cfg(test)]
 use format_amendment::{
     DestinationFormat, PRE_DERIVATION_FORMAT_SPEC_ID, STORE_FORMAT_SPEC, legacy_store_metadata,

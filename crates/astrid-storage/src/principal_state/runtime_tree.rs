@@ -11,8 +11,8 @@ use crate::error::{StorageError, StorageResult};
 use astrid_core::dirs::AstridHome;
 
 use super::{
-    ContiguousFileIngest, RuntimePrincipalStore, StateOwner,
-    runtime_tree_active::{ACTIVE_PROJECTION_NAME, ActiveProjectionEntry},
+    ContiguousFileIngest, PackedProjectionIngest, RuntimePrincipalStore, StateOwner,
+    runtime_tree_active::{ACTIVE_PROJECTION_NAME, ActiveProjectionEntry, ReceiptPhase},
 };
 
 use super::runtime_tree_active as active;
@@ -498,14 +498,13 @@ pub(super) fn pack_and_retire_projection(
     }
     if validate_surviving_projection(home.root(), home.root())? {
         let receipt = active::read(home, store)?;
-        if receipt.is_none() {
-            return Err(tree_error(
-                home.root(),
-                "active projection receipt is missing for surviving host projection",
-            ));
+        if let Some(receipt) = receipt
+            && receipt.phase() == ReceiptPhase::Active
+        {
+            publish_active_projection(home, store)?;
         }
-        publish_active_projection(home, store)?;
     }
+    transition_retiring_projection(home, store)?;
     retire_projection(home)?;
     active::clear(store, home).map(|_| ())
 }
@@ -541,15 +540,40 @@ fn active_projection_entries(
         .filter(|entry| !is_retired_legacy_projection(home, entry.name().as_str()))
         .map(|entry| ActiveProjectionEntry {
             name: entry.name().clone(),
-            file: entry.file(),
+            file: Some(entry.file()),
             logical_bytes: entry.logical_bytes(),
         })
         .collect())
 }
 
+fn receipt_ingest(
+    home: &AstridHome,
+    phase: ReceiptPhase,
+    entries: &[ActiveProjectionEntry],
+) -> StorageResult<PackedProjectionIngest> {
+    let bytes = active::encode(home, phase, entries)?;
+    Ok(PackedProjectionIngest::bytes(
+        active::active_projection_name()?,
+        bytes,
+    ))
+}
+
+fn rotate_active_receipt(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+    entries: &[ActiveProjectionEntry],
+) -> StorageResult<()> {
+    let receipt = receipt_ingest(home, ReceiptPhase::Active, entries)?;
+    store.replace_contiguous_files_removing_exact(StateOwner::System, [receipt], &[])?;
+    store
+        .content()
+        .flush()
+        .map_err(|error| tree_error(home.root(), format!("flush active receipt: {error}")))
+}
+
 fn establish_active_receipt(home: &AstridHome, store: &RuntimePrincipalStore) -> StorageResult<()> {
     let entries = active_projection_entries(home, store)?;
-    active::write(home, store, &entries)
+    rotate_active_receipt(home, store, &entries)
 }
 
 fn publish_active_projection(
@@ -569,15 +593,49 @@ fn publish_active_projection(
         .cloned()
         .collect::<Vec<_>>();
     let removals = active::removals(&receipt, &surviving)?;
-    let ingests = scanned
-        .into_iter()
-        .map(|entry| ContiguousFileIngest::new(entry.name, entry.source_path, entry.logical_bytes));
+    let receipt_entries = scanned
+        .iter()
+        .map(|entry| ActiveProjectionEntry {
+            name: entry.name().clone(),
+            file: None,
+            logical_bytes: entry.logical_bytes(),
+        })
+        .collect::<Vec<_>>();
+    let receipt = receipt_ingest(home, ReceiptPhase::Active, &receipt_entries)?;
+    let ingests = scanned.into_iter().map(|entry| {
+        PackedProjectionIngest::File(ContiguousFileIngest::new(
+            entry.name,
+            entry.source_path,
+            entry.logical_bytes,
+        ))
+    });
+    let ingests = std::iter::once(receipt).chain(ingests);
     store.replace_contiguous_files_removing_exact(StateOwner::System, ingests, &removals)?;
     store
         .content()
         .flush()
         .map_err(|error| tree_error(home.root(), format!("flush active projection: {error}")))?;
-    establish_active_receipt(home, store)
+    Ok(())
+}
+
+fn transition_retiring_projection(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+) -> StorageResult<()> {
+    let receipt = active::read(home, store)?;
+    let Some(receipt) = receipt else {
+        return Ok(());
+    };
+    if receipt.phase() == ReceiptPhase::Retiring {
+        return Ok(());
+    }
+    let entries = active_projection_entries(home, store)?;
+    let receipt = receipt_ingest(home, ReceiptPhase::Retiring, &entries)?;
+    store.replace_contiguous_files_removing_exact(StateOwner::System, [receipt], &[])?;
+    store
+        .content()
+        .flush()
+        .map_err(|error| tree_error(home.root(), format!("flush retiring receipt: {error}")))
 }
 
 fn legacy_projection_pack(home: &AstridHome, store: &RuntimePrincipalStore) -> StorageResult<()> {
@@ -615,11 +673,11 @@ pub(super) fn reconcile_running_projection(
     }
 
     let surviving = validate_surviving_projection(home.root(), home.root())?;
-    if surviving {
-        let receipt = active::read(home, store)?;
-        if receipt.is_none() {
+    let receipt = active::read_relocatable(home, store)?;
+    match receipt {
+        None => {
             let scanned = scan(home.root())?;
-            if !is_bootstrap_surviving_projection(&scanned) {
+            if surviving && !is_bootstrap_surviving_projection(&scanned) {
                 let names = scanned
                     .iter()
                     .map(|entry| entry.name().as_str())
@@ -631,14 +689,67 @@ pub(super) fn reconcile_running_projection(
                     ),
                 ));
             }
+        },
+        Some(receipt) if !receipt.root_matches(home)? => {
+            // A portable active-volume copy is volume-authoritative. Host
+            // bytes are neither admitted nor allowed beyond trusted bootstrap
+            // sentinels; the copied receipt is simply rebound to the new root.
+            if receipt.phase() != ReceiptPhase::Active || !surviving {
+                return Err(tree_error(
+                    home.root(),
+                    "active projection receipt root does not match this durable root",
+                ));
+            }
+            let scanned = scan(home.root())?;
+            if !is_bootstrap_surviving_projection(&scanned) {
+                return Err(tree_error(
+                    home.root(),
+                    "relocated active receipt is permitted only for trusted bootstrap files",
+                ));
+            }
             restore_projection(home, store, &store.content)?;
-            return establish_active_receipt(home, store);
-        }
-        publish_active_projection(home, store)?;
+        },
+        Some(receipt) => match receipt.phase() {
+            ReceiptPhase::Active => {
+                if surviving {
+                    publish_active_projection(home, store)?;
+                } else {
+                    restore_projection(home, store, &store.content)?;
+                }
+            },
+            ReceiptPhase::Retiring => {
+                let scanned = scan(home.root())?;
+                validate_retiring_host_subset(home, &receipt, &scanned)?;
+                restore_projection(home, store, &store.content)?;
+            },
+        },
+    }
+    if active::read_relocatable(home, store)?.is_some() {
+        establish_active_receipt(home, store)?;
     } else {
         restore_projection(home, store, &store.content)?;
+        establish_active_receipt(home, store)?;
     }
-    establish_active_receipt(home, store)
+    Ok(())
+}
+
+fn validate_retiring_host_subset(
+    home: &AstridHome,
+    receipt: &super::runtime_tree_active::ActiveProjectionReceipt,
+    scanned: &[RuntimeTreeEntry],
+) -> StorageResult<()> {
+    for entry in scanned {
+        if !receipt.contains_inventory_name(entry.name().as_str()) {
+            return Err(tree_error(
+                home.root(),
+                format!(
+                    "retiring projection contains unreceipted host file {}",
+                    entry.name().as_str()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn is_bootstrap_surviving_projection(scanned: &[RuntimeTreeEntry]) -> bool {

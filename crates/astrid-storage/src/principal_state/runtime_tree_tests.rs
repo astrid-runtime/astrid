@@ -174,11 +174,12 @@ async fn admits_runtime_tree_and_reopens_from_preclose_volume_copy() {
         copied_home.storage_volume_path(),
     )
     .unwrap();
-    let detached = open_runtime_principal_store_for_pack(&copied_home, unlimited_quota())
-        .await
-        .unwrap();
-    super::active::clear(&detached, &copied_home).unwrap();
-    drop(detached);
+    let relocated_layout = copied_home.root().join("etc/layout-version");
+    let relocated_key = copied_home.root().join("keys/runtime.key");
+    std::fs::create_dir_all(relocated_layout.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(relocated_key.parent().unwrap()).unwrap();
+    std::fs::write(&relocated_layout, b"host-bootstrap-not-authority").unwrap();
+    std::fs::write(&relocated_key, b"host-key-not-authority").unwrap();
     let volume = HostedFileVolume::open(copied_home.storage_volume_path()).unwrap();
     assert!(
         volume
@@ -191,6 +192,16 @@ async fn admits_runtime_tree_and_reopens_from_preclose_volume_copy() {
     let reopened = open_runtime_principal_store(&copied_home, unlimited_quota())
         .await
         .unwrap();
+    assert_eq!(
+        std::fs::read(&relocated_layout).unwrap(),
+        b"2",
+        "bootstrap host bytes must not replace volume authority"
+    );
+    assert_eq!(
+        std::fs::read(&relocated_key).unwrap(),
+        b"runtime-key",
+        "bootstrap host bytes must not replace volume authority"
+    );
     let filesystem = AstridFilesystem::new(reopened.content(), StateOwner::System);
     let expected_count = durable.len();
     let mut reconstructed = BTreeMap::new();
@@ -469,6 +480,128 @@ async fn arbitrary_host_projection_without_active_receipt_fails_closed() {
         std::fs::read(&rogue).unwrap(),
         b"not a surviving projection"
     );
+}
+
+#[tokio::test]
+async fn active_projection_publication_rotates_receipt_inventory() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let old_path = home.root().join("etc/old.conf");
+    std::fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+    std::fs::write(&old_path, b"old\n").unwrap();
+    drop(running);
+
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    packer
+        .pack_and_retire_runtime_projection(&home)
+        .expect("pack old generation");
+    drop(packer);
+
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let new_path = home.root().join("etc/new.conf");
+    std::fs::write(&new_path, b"new-generation\n").unwrap();
+    std::fs::remove_file(&old_path).unwrap();
+    drop(running);
+
+    let reopened = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let receipt = super::super::runtime_tree::active::read(&home, &reopened)
+        .unwrap()
+        .expect("active receipt");
+    assert_eq!(receipt.phase(), super::ReceiptPhase::Active);
+    assert!(receipt.contains_inventory_name("etc/new.conf"));
+    assert!(!receipt.contains_inventory_name("etc/old.conf"));
+    let new_name = ContentName::new("etc/new.conf").unwrap();
+    assert_eq!(
+        reopened
+            .content()
+            .read(&StateOwner::System, &new_name)
+            .unwrap(),
+        Some(b"new-generation\n".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn relocated_volume_rejects_host_files_beyond_trusted_bootstrap() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let copy_dir = tempfile::tempdir().unwrap();
+    let copy_home = AstridHome::from_path(copy_dir.path());
+    copy_home.ensure().unwrap();
+    std::fs::copy(home.storage_volume_path(), copy_home.storage_volume_path()).unwrap();
+    drop(running);
+    let layout = copy_home.root().join("etc/layout-version");
+    std::fs::create_dir_all(layout.parent().unwrap()).unwrap();
+    std::fs::write(&layout, b"2").unwrap();
+    let rogue = copy_home.root().join("etc/user.conf");
+    std::fs::write(&rogue, b"arbitrary-not-authority").unwrap();
+
+    let Err(error) = open_runtime_principal_store(&copy_home, unlimited_quota()).await else {
+        panic!("relocated receipt must not admit arbitrary host files");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("relocated active receipt is permitted only"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&rogue).unwrap(), b"arbitrary-not-authority");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retiring_failure_restores_published_inventory_and_reactivates() {
+    use std::os::unix::net::UnixListener;
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let first = home.root().join("etc/retire-a.conf");
+    let second = home.root().join("etc/retire-b.conf");
+    std::fs::create_dir_all(first.parent().unwrap()).unwrap();
+    std::fs::write(&first, b"published-a\n").unwrap();
+    std::fs::write(&second, b"published-b\n").unwrap();
+    drop(running);
+
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let socket_path = home.root().join("run/other.sock");
+    std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+    let _socket = UnixListener::bind(&socket_path).unwrap();
+    let error = packer
+        .pack_and_retire_runtime_projection(&home)
+        .expect_err("complete preflight must reject the later special");
+    assert!(error.to_string().contains("special entry"), "{error}");
+    drop(packer);
+
+    // Simulate a mid-retire race after the RETIRING inventory is durable.
+    std::fs::remove_file(&first).unwrap();
+
+    let reopened = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let receipt = super::super::runtime_tree::active::read(&home, &reopened)
+        .unwrap()
+        .expect("restart must establish fresh ACTIVE authority");
+    assert_eq!(receipt.phase(), super::ReceiptPhase::Active);
+    assert!(receipt.contains_inventory_name("etc/retire-a.conf"));
+    assert!(receipt.contains_inventory_name("etc/retire-b.conf"));
+    assert_eq!(std::fs::read(&first).unwrap(), b"published-a\n");
+    assert_eq!(std::fs::read(&second).unwrap(), b"published-b\n");
 }
 
 #[tokio::test]
