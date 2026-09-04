@@ -325,6 +325,183 @@ require(
     "triple-named binary upload",
 )
 
+darwin_signing = step_block("build", "Build, sign, and notarize AstridFS")
+companion_signing = step_block("build", "Sign the macOS FSKit companion")
+for name, value in (
+    (
+        "ASTRID_MACOS_DEVELOPMENT_TEAM_ID",
+        "${{ secrets.ASTRID_MACOS_DEVELOPMENT_TEAM_ID }}",
+    ),
+    (
+        "ASTRID_MACOS_DEVELOPER_ID_P12",
+        "${{ secrets.ASTRID_MACOS_DEVELOPER_ID_P12 }}",
+    ),
+    (
+        "ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD",
+        "${{ secrets.ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD }}",
+    ),
+    (
+        "ASTRID_MACOS_NOTARY_APPLE_ID",
+        "${{ secrets.ASTRID_MACOS_NOTARY_APPLE_ID }}",
+    ),
+    (
+        "ASTRID_MACOS_NOTARY_APP_PASSWORD",
+        "${{ secrets.ASTRID_MACOS_NOTARY_APP_PASSWORD }}",
+    ),
+):
+    require(
+        rf"^\s*{re.escape(name)}: {re.escape(value)}\s*$",
+        darwin_signing,
+        f"Darwin signing input {name}",
+    )
+require(
+    r"^\s*ASTRID_FSKIT_CODE_SIGN_IDENTITY: \$\{\{ vars\.ASTRID_MACOS_DEVELOPER_ID_IDENTITY \|\| 'Developer ID Application' \}\}\s*$",
+    darwin_signing,
+    "optional Developer ID identity override",
+)
+require(
+    r'^\s*ASTRID_FSKIT_NOTARIZE: "1"\s*$',
+    darwin_signing,
+    "mandatory AstridFS notarization",
+)
+for secret, github_secret in (
+    ("ASTRID_FSKIT_NOTARY_KEY_ID", "ASTRID_MACOS_NOTARY_KEY_ID"),
+    ("ASTRID_FSKIT_NOTARY_ISSUER_ID", "ASTRID_MACOS_NOTARY_ISSUER_ID"),
+    ("ASTRID_FSKIT_NOTARY_KEY", "ASTRID_MACOS_NOTARY_KEY"),
+):
+    api_key_line = f"{secret}: ${{{{ secrets.{github_secret} }}}}"
+    require(
+        rf"^\s*{re.escape(api_key_line)}\s*$",
+        darwin_signing,
+        f"API-key notarization fallback input {secret}",
+    )
+if "scripts/ci/import_macos_signing.sh" not in darwin_signing:
+    fail("Darwin signing must invoke the named import helper")
+if "ASTRID_NOTARY_KEY_PATH=" in darwin_signing:
+    fail("Darwin signing must not reconstruct the API-key file inline")
+
+for name, value in (
+    (
+        "ASTRID_MACOS_DEVELOPMENT_TEAM_ID",
+        "${{ secrets.ASTRID_MACOS_DEVELOPMENT_TEAM_ID }}",
+    ),
+    (
+        "ASTRID_MACOS_DEVELOPER_ID_P12",
+        "${{ secrets.ASTRID_MACOS_DEVELOPER_ID_P12 }}",
+    ),
+    (
+        "ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD",
+        "${{ secrets.ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD }}",
+    ),
+    (
+        "MACOS_DEVELOPER_ID_IDENTITY",
+        "${{ vars.ASTRID_MACOS_DEVELOPER_ID_IDENTITY }}",
+    ),
+):
+    require(
+        rf"^\s*{re.escape(name)}: {re.escape(value)}\s*$",
+        companion_signing,
+        f"companion signing input {name}",
+    )
+if "scripts/ci/import_macos_signing.sh --identity-only" not in companion_signing:
+    fail("companion signing must consume the same imported Developer ID identity")
+if "notarytool" in companion_signing:
+    fail("companion signing must remain separate from notary submission")
+
+helper_relpath = "scripts/ci/import_macos_signing.sh"
+helper_path = repo_root / helper_relpath
+helper = helper_path.read_text(encoding="utf-8")
+for fragment in (
+    "REQUIRED_TEAM_ID=9BDSL5BJAP",
+    '[[ -n "${ASTRID_MACOS_DEVELOPMENT_TEAM_ID:-}" ]] || {',
+    '[[ "$ASTRID_MACOS_DEVELOPMENT_TEAM_ID" == "$REQUIRED_TEAM_ID" ]] || {',
+    '[[ -n "${ASTRID_MACOS_DEVELOPER_ID_P12:-}" ]] || {',
+    '[[ -n "${ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD:-}" ]] || {',
+    'if [[ -n "$apple_id" || -n "$app_password" ]]; then',
+    'export ASTRID_FSKIT_NOTARY_PROFILE="$NOTARY_PROFILE_NAME"',
+    "unset ASTRID_FSKIT_NOTARY_PROFILE",
+    'P12_PATH="$RUNNER_TEMP/astrid-developer-id.p12.$$"',
+    'P8_PATH="$RUNNER_TEMP/astrid-notary.p8.$$"',
+    'chmod 0600 "$P12_PATH"',
+    'chmod 0600 "$P8_PATH"',
+    "security create-keychain",
+    'security import "$P12_PATH"',
+    'security delete-keychain "$SIGNING_KEYCHAIN"',
+    'rm -f "$P12_PATH"',
+    'rm -f "$P8_PATH"',
+    "trap cleanup EXIT",
+):
+    if fragment not in helper:
+        fail(f"macOS signing helper is missing {fragment}")
+
+apple_branch_start = helper.find('if [[ -n "$apple_id" || -n "$app_password" ]]; then')
+api_branch_start = helper.find(
+    'elif [[ -n "$key_id" || -n "$issuer_id" || -n "$key" ]]; then'
+)
+if apple_branch_start < 0 or api_branch_start < 0 or apple_branch_start > api_branch_start:
+    fail("helper must prefer the Apple-ID profile over the API-key fallback")
+apple_branch = helper[apple_branch_start:api_branch_start]
+api_branch_end = helper.find("else", api_branch_start)
+api_branch = helper[api_branch_start:api_branch_end]
+if 'export ASTRID_FSKIT_NOTARY_PROFILE="$NOTARY_PROFILE_NAME"' not in apple_branch:
+    fail("Apple-ID credentials must select the keychain-profile path")
+if "ASTRID_FSKIT_NOTARY_PROFILE" in api_branch and (
+    "unset ASTRID_FSKIT_NOTARY_PROFILE" not in api_branch
+):
+    fail("API-key fallback must not take the Apple-ID profile path")
+for api_variable in (
+    ("ASTRID_FSKIT_NOTARY_KEY_ID", "key_id"),
+    ("ASTRID_FSKIT_NOTARY_ISSUER_ID", "issuer_id"),
+    ("ASTRID_FSKIT_NOTARY_KEY", "key"),
+):
+    environment_name, local_name = api_variable
+    if f"local {local_name}=" not in helper:
+        fail(f"helper API-key fallback is missing {environment_name}")
+
+for case_name, case_env in (
+    (
+        "missing team",
+        {
+            "ASTRID_MACOS_DEVELOPER_ID_P12": "P12-SENTINEL",
+            "ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD": "PASSWORD-SENTINEL",
+        },
+    ),
+    (
+        "wrong team",
+        {
+            "ASTRID_MACOS_DEVELOPMENT_TEAM_ID": "WRONGTEAM",
+            "ASTRID_MACOS_DEVELOPER_ID_P12": "P12-SENTINEL",
+            "ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD": "PASSWORD-SENTINEL",
+        },
+    ),
+    (
+        "missing Developer ID p12",
+        {
+            "ASTRID_MACOS_DEVELOPMENT_TEAM_ID": "9BDSL5BJAP",
+            "ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD": "PASSWORD-SENTINEL",
+        },
+    ),
+):
+    case_environment = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": os.environ.get("HOME", "/tmp"),
+    }
+    case_environment.update(case_env)
+    result = subprocess.run(
+        [str(helper_path)],
+        env=case_environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode == 0:
+        fail(f"macOS signing helper did not fail closed for {case_name}")
+    helper_output = result.stdout + result.stderr
+    for sentinel in ("P12-SENTINEL", "PASSWORD-SENTINEL"):
+        if sentinel in helper_output:
+            fail(f"macOS signing helper leaked {sentinel} while testing {case_name}")
+print("macOS Developer ID import and Apple-ID notary profile contract: PASS")
+
 fskit = job_block("fskit-certification")
 release = job_block("github-release")
 for name, block in (("fskit-certification", fskit), ("github-release", release)):
