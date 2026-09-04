@@ -27,6 +27,7 @@ const DIRECTORY_STORE_PREFIX: &str = "var/principal-store";
 const QUARANTINE_PREFIX: &str = "quarantine/principal-store";
 const TRANSIENT_PREFIX: &str = "run";
 const RUNTIME_KEY_PROJECTION: &str = "keys/runtime.key";
+const STAGING_JOURNAL_PROJECTION: &str = "var/content-staging/intents.v1.log";
 const TRANSACTION_STAGING_PATHS: &[&str] = &[
     "etc/.layout-version.next",
     "var/migrations/.layout-v1-to-v2.intent.next",
@@ -251,6 +252,13 @@ pub(super) fn restore_projection(
     let entries = content
         .list(&StateOwner::System)
         .map_err(|error| tree_error(home.root(), format!("list volume projection: {error}")))?;
+    for entry in &entries {
+        let name = entry.name().as_str();
+        if is_excluded(name) || is_retired_legacy_projection(home, name) {
+            continue;
+        }
+        confined_projection_path(home.root(), name)?;
+    }
     for entry in entries {
         let name = entry.name().as_str();
         if is_excluded(name) {
@@ -499,10 +507,29 @@ pub(super) fn pack_and_retire_projection(
     }
     if validate_surviving_projection(home.root(), home.root())? {
         let receipt = active::read(home, store)?;
-        if let Some(receipt) = receipt
-            && receipt.phase() == ReceiptPhase::Active
-        {
-            publish_active_projection(home, store)?;
+        match receipt {
+            Some(receipt) if receipt.phase() == ReceiptPhase::Active => {
+                publish_active_projection(home, store)?;
+            },
+            Some(receipt) => {
+                let scanned = scan(home.root())?;
+                validate_retiring_host_subset(home, &receipt, &scanned)?;
+            },
+            None => {
+                let scanned = scan(home.root())?;
+                if !scanned.is_empty() && !is_exactly_pack_open_staging_journal(&scanned) {
+                    let names = scanned
+                        .iter()
+                        .map(|entry| entry.name().as_str())
+                        .collect::<Vec<_>>();
+                    return Err(tree_error(
+                        home.root(),
+                        format!(
+                            "active projection receipt is missing for surviving host projection: {names:?}"
+                        ),
+                    ));
+                }
+            },
         }
     }
     transition_retiring_projection(home, store)?;
@@ -510,8 +537,38 @@ pub(super) fn pack_and_retire_projection(
     active::clear(store, home).map(|_| ())
 }
 
+fn confined_projection_path(root: &Path, relative: &str) -> StorageResult<PathBuf> {
+    let normalized = normalize_relative_path(relative);
+    let escaped = || {
+        tree_error(
+            root,
+            format!("projection name escaped runtime root: {relative}"),
+        )
+    };
+    if normalized.is_empty() || normalized.starts_with('/') || Path::new(relative).is_absolute() {
+        return Err(escaped());
+    }
+    let mut path = root.to_path_buf();
+    for segment in normalized.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(tree_error(
+                root,
+                format!("projection name has a non-normal path component: {relative}"),
+            ));
+        }
+        if segment.len() == 2 && segment.as_bytes()[1] == b':' {
+            return Err(escaped());
+        }
+        path.push(segment);
+    }
+    if !path.starts_with(root) {
+        return Err(escaped());
+    }
+    Ok(path)
+}
+
 fn write_projection_file(root: &Path, relative: &str, bytes: &[u8]) -> StorageResult<()> {
-    let path = root.join(relative);
+    let path = confined_projection_path(root, relative)?;
     let parent = path
         .parent()
         .ok_or_else(|| tree_error(&path, "projection path has no parent".to_owned()))?;
@@ -572,7 +629,10 @@ fn rotate_active_receipt(
         .map_err(|error| tree_error(home.root(), format!("flush active receipt: {error}")))
 }
 
-fn establish_active_receipt(home: &AstridHome, store: &RuntimePrincipalStore) -> StorageResult<()> {
+pub(super) fn establish_active_receipt(
+    home: &AstridHome,
+    store: &RuntimePrincipalStore,
+) -> StorageResult<()> {
     let entries = active_projection_entries(home, store)?;
     rotate_active_receipt(home, store, &entries)
 }
@@ -756,7 +816,12 @@ pub(super) fn reconcile_running_projection(
         },
         Some(receipt) => match receipt.phase() {
             ReceiptPhase::Active => {
-                if surviving {
+                // `AstridHome::ensure` creates bootstrap sentinels before the
+                // volume is opened. Those host files alone are not a live
+                // projection; publishing them would CAS-delete the volume-only
+                // generation before it can be restored.
+                let scanned = scan(home.root())?;
+                if surviving && !is_bootstrap_surviving_projection(&scanned) {
                     publish_active_projection(home, store)?;
                 } else {
                     restore_projection(home, store, &store.content)?;
@@ -802,11 +867,22 @@ fn is_bootstrap_surviving_projection(scanned: &[RuntimeTreeEntry]) -> bool {
         && scanned.iter().all(|entry| {
             matches!(
                 entry.name().as_str(),
-                "etc/layout-version"
-                    | RUNTIME_KEY_PROJECTION
-                    | "var/content-staging/intents.v1.log"
+                "etc/layout-version" | RUNTIME_KEY_PROJECTION | STAGING_JOURNAL_PROJECTION
             )
         })
+}
+
+/// Pack-open materializes the staging journal before retirement can run.
+///
+/// That one enumerated regular file is not a surviving projection and must not
+/// be admitted without an ACTIVE receipt. Directories, symlinks, siblings,
+/// alternate spellings, and the broader bootstrap set keep fail-closed;
+/// redirects still fail in preflight.
+fn is_exactly_pack_open_staging_journal(scanned: &[RuntimeTreeEntry]) -> bool {
+    matches!(
+        scanned,
+        [entry] if entry.name().as_str() == STAGING_JOURNAL_PROJECTION
+    )
 }
 
 /// Validate redirects and unadmitted specials before any destructive restore.
@@ -839,10 +915,17 @@ fn validate_surviving_projection(root: &Path, directory: &Path) -> StorageResult
         let relative = relative
             .to_str()
             .ok_or_else(|| tree_error(&path, "projection path is not valid UTF-8".to_owned()))?;
-        if is_excluded(normalize_relative_path(relative).as_str()) {
+        let relative = normalize_relative_path(relative);
+        if is_excluded(relative.as_str()) {
             continue;
         }
         if metadata.is_dir() {
+            if relative.as_str() == STAGING_JOURNAL_PROJECTION {
+                return Err(tree_error(
+                    &path,
+                    "pack-open staging journal is not a regular file".to_owned(),
+                ));
+            }
             has_projection |= validate_surviving_projection(root, &path)?;
         } else if metadata.is_file() {
             has_projection = true;

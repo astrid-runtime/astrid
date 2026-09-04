@@ -63,6 +63,71 @@ fn assert_fixture_identity() {
     );
 }
 
+fn unbounded_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
+    Arc::new(|owner: &StateOwner| {
+        Ok(match owner {
+            StateOwner::System => None,
+            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
+        })
+    })
+}
+
+async fn pack_home_to_volume_only(home: &AstridHome) {
+    let packer = crate::principal_state::open_runtime_principal_store_for_pack(
+        home,
+        Arc::new(|_: &StateOwner| Ok(None)),
+    )
+    .await
+    .unwrap();
+    packer
+        .pack_and_retire_runtime_projection(home)
+        .expect("pack post-cutover projection");
+    drop(packer);
+
+    let stopped = std::fs::read_dir(home.root())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(stopped.len(), 1);
+    assert_eq!(
+        stopped[0].file_name(),
+        std::ffi::OsStr::new("astrid.volume")
+    );
+}
+
+async fn assert_reopened_cutover_inventory(home: &AstridHome) {
+    let reopened = open_runtime_principal_store(home, Arc::new(|_: &StateOwner| Ok(None)))
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(home.layout_version_path())
+            .unwrap()
+            .trim(),
+        astrid_core::dirs::LAYOUT_VERSION
+    );
+    assert!(
+        home.migrations_dir()
+            .join("layout-v1-to-v2.complete")
+            .is_file()
+    );
+    assert!(
+        reopened
+            .kv()
+            .get("system:identity", "link/cli/local")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        reopened
+            .kv()
+            .get("system:identity", "post-cutover")
+            .await
+            .unwrap(),
+        Some(b"live-volume-write".to_vec())
+    );
+}
+
 #[tokio::test]
 async fn published_v0104_home_imports_verifies_and_retires_legacy_store() {
     assert_fixture_identity();
@@ -87,14 +152,9 @@ async fn published_v0104_home_imports_verifies_and_retires_legacy_store() {
     )
     .unwrap();
     home.begin_layout_v2_migration(&migration_target).unwrap();
-    let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|owner: &StateOwner| {
-        Ok(match owner {
-            StateOwner::System => None,
-            StateOwner::Principal(_) | StateOwner::Fleet(_) => Some(u64::MAX),
-        })
-    });
-
-    let store = open_runtime_principal_store(&home, quota).await.unwrap();
+    let store = open_runtime_principal_store(&home, unbounded_quota())
+        .await
+        .unwrap();
 
     assert!(
         store
@@ -137,25 +197,12 @@ async fn published_v0104_home_imports_verifies_and_retires_legacy_store() {
 
     drop(store);
     home.ensure().unwrap();
-    let reopened = open_runtime_principal_store(&home, Arc::new(|_: &StateOwner| Ok(None)))
-        .await
-        .unwrap();
-    assert!(
-        reopened
-            .kv()
-            .get("system:identity", "link/cli/local")
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert_eq!(
-        reopened
-            .kv()
-            .get("system:identity", "post-cutover")
-            .await
-            .unwrap(),
-        Some(b"live-volume-write".to_vec())
-    );
+
+    // A pre-repair stop could retire the post-cutover host records without
+    // ever packing them. The next boot then saw the stale layout-one intent
+    // and rejected the legitimate restart.
+    pack_home_to_volume_only(&home).await;
+    assert_reopened_cutover_inventory(&home).await;
 }
 
 #[test]

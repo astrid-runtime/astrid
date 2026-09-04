@@ -107,7 +107,10 @@ fn admit_blocking(home: &AstridHome, store: &RuntimePrincipalStore) -> io::Resul
     let bytes = serde_json::to_vec(&receipt).map_err(io::Error::other)?;
     astrid_core::platform_fs::ensure_private_directory(&home.migrations_dir())?;
     astrid_core::platform_fs::atomic_write_private_file(&receipt_path, &bytes)?;
-    admit_receipt(store, &receipt_path)
+    admit_receipt(store, &receipt_path)?;
+    store
+        .establish_runtime_projection_receipt(home)
+        .map_err(storage_error)
 }
 
 fn admit_receipt(store: &RuntimePrincipalStore, receipt_path: &Path) -> io::Result<()> {
@@ -256,6 +259,9 @@ mod tests {
         let home_dir = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(home_dir.path());
         home.ensure().unwrap();
+        let store = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
         let wasm = b"\0asm\x01\0\0\0kernel-admit".to_vec();
         let hash = blake3::hash(&wasm).to_hex().to_string();
         fs::create_dir_all(home.bin_dir()).unwrap();
@@ -264,10 +270,9 @@ mod tests {
         let metadata_path = home.root().join("run/capsules/example/meta.json");
         fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
         fs::write(&metadata_path, format!("{{\"wasm_hash\":\"{hash}\"}}")).unwrap();
-
-        let store = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
-            .await
-            .unwrap();
+        store
+            .publish_runtime_projection(&home)
+            .expect("admit restart fixture");
         admit(&home, &store).await.unwrap();
         let first_volume_size = fs::metadata(home.storage_volume_path()).unwrap().len();
         admit(&home, &store).await.unwrap();
@@ -337,15 +342,18 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(directory.path());
         home.ensure().unwrap();
+        let store = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
         let wasm = b"\0asm\x01\0\0\0mutation-check".to_vec();
         let hash = blake3::hash(&wasm).to_hex().to_string();
         fs::create_dir_all(home.bin_dir()).unwrap();
         let wasm_path = home.bin_dir().join(format!("{hash}.wasm"));
         fs::write(&wasm_path, &wasm).unwrap();
+        store
+            .publish_runtime_projection(&home)
+            .expect("admit mutation fixture");
         let receipt_path = home.migrations_dir().join(RECEIPT_NAME);
-        let store = astrid_storage::open_runtime_principal_store(&home, unlimited_quota())
-            .await
-            .unwrap();
 
         let mutation_path = wasm_path.clone();
         inject_source_mutation_once(

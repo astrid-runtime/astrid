@@ -744,6 +744,19 @@ mod tests {
     fn fresh_lock_rehashes_catalog_wasm_bytes_when_store_is_bound() {
         let dir = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(dir.path());
+        home.ensure().unwrap();
+        let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
+            Arc::new(|owner: &astrid_storage::StateOwner| {
+                Ok(match owner {
+                    astrid_storage::StateOwner::System => None,
+                    astrid_storage::StateOwner::Principal(_)
+                    | astrid_storage::StateOwner::Fleet(_) => Some(u64::MAX),
+                })
+            });
+        let store = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(astrid_storage::open_runtime_principal_store(&home, quota))
+            .unwrap();
         let target = PrincipalId::new("alice").unwrap();
         let install_dir = install::resolve_target_dir_for(&home, &target, "cli", false).unwrap();
         std::fs::create_dir_all(&install_dir).unwrap();
@@ -770,23 +783,17 @@ mod tests {
             hash: format!("blake3:{hash}"),
             resolved_ref: Some("v1.0.0".to_string()),
         }];
-        let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
-            Arc::new(|owner: &astrid_storage::StateOwner| {
-                Ok(match owner {
-                    astrid_storage::StateOwner::System => None,
-                    astrid_storage::StateOwner::Principal(_)
-                    | astrid_storage::StateOwner::Fleet(_) => Some(u64::MAX),
-                })
-            });
-        let store = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(astrid_storage::open_runtime_principal_store(&home, quota))
-            .unwrap();
         let name = astrid_storage::ContentName::new(format!("bin/{hash}.wasm")).unwrap();
         store
             .content()
             .put(&astrid_storage::StateOwner::System, &name, &wasm)
             .unwrap();
+        let staging_intent = home.content_staging_path().join("intents.v1.log");
+        std::fs::create_dir_all(staging_intent.parent().unwrap()).unwrap();
+        std::fs::write(&staging_intent, b"catalog fixture").unwrap();
+        store
+            .publish_runtime_projection(&home)
+            .expect("admit catalog fixture projection");
 
         assert_eq!(
             validate_locked_capsules_with_store(&home, &target, &locked, Some(&store)).unwrap(),

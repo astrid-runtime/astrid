@@ -549,6 +549,21 @@ impl RuntimePrincipalStore {
         runtime_tree::publish_running_projection(home, self)
     }
 
+    /// Re-establish the private ACTIVE projection inventory after boot writes.
+    ///
+    /// Boot components can author durable host files (for example migration
+    /// receipts) after the normal projection reconciliation. A catalog
+    /// mutation without a matching ACTIVE transition would otherwise leave
+    /// clean-stop receipt validation comparing a stale object identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the current projection cannot be
+    /// inventoried or its ACTIVE receipt cannot be published transactionally.
+    pub fn establish_runtime_projection_receipt(&self, home: &AstridHome) -> StorageResult<()> {
+        runtime_tree::establish_active_receipt(home, self)
+    }
+
     /// Pack running projection changes and retire every durable host sidecar.
     ///
     /// # Errors

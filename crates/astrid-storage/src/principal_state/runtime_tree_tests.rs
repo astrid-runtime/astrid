@@ -60,6 +60,26 @@ fn write_active_identity_receipt(
     store.content().flush().unwrap();
 }
 
+fn assert_stopped_volume_only(home: &AstridHome) {
+    let stopped = std::fs::read_dir(home.root())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(stopped.len(), 1);
+    assert_eq!(
+        stopped[0].file_name(),
+        std::ffi::OsStr::new(CANONICAL_VOLUME)
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            stopped[0].metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
 #[test]
 fn excludes_windows_separator_paths() {
     for path in ["volume", "volume\\compacting", "run\\system.sock"] {
@@ -762,24 +782,7 @@ async fn preserves_ordinary_suffix_files_across_clean_stop() {
     store
         .pack_and_retire_runtime_projection(&home)
         .expect("pack ordinary suffix files");
-
-    let stopped = std::fs::read_dir(home.root())
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    assert_eq!(stopped.len(), 1);
-    assert_eq!(
-        stopped[0].file_name(),
-        std::ffi::OsStr::new(CANONICAL_VOLUME)
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        assert_eq!(
-            stopped[0].metadata().unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-    }
+    assert_stopped_volume_only(&home);
     drop(store);
 
     let reopened = open_runtime_principal_store(&home, unlimited_quota())
@@ -788,6 +791,47 @@ async fn preserves_ordinary_suffix_files_across_clean_stop() {
     assert_eq!(std::fs::read(&next_path).unwrap(), b"queued-by-user");
     assert_eq!(std::fs::read(&migrating_path).unwrap(), b"kept-by-user");
     drop(reopened);
+}
+
+#[tokio::test]
+async fn missing_active_receipt_stop_retains_surviving_host_files() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let trust = home.root().join("trust/recovery.pub");
+    std::fs::create_dir_all(trust.parent().unwrap()).unwrap();
+    std::fs::write(&trust, b"ed25519:recovery").unwrap();
+
+    // Host publication without an ACTIVE rotation must not become a stop
+    // admission path. Missing receipt fails closed and retains host bytes.
+    let active_name = ContentName::new(ACTIVE_PROJECTION_NAME).unwrap();
+    assert!(
+        running
+            .content()
+            .delete(&StateOwner::System, &active_name)
+            .unwrap()
+    );
+    running.content().flush().unwrap();
+    drop(running);
+
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let Err(error) = packer.pack_and_retire_runtime_projection(&home) else {
+        panic!("missing ACTIVE receipt must not retire surviving host files");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("active projection receipt is missing"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(&trust).unwrap(),
+        b"ed25519:recovery".as_slice()
+    );
 }
 
 #[tokio::test]
@@ -1026,4 +1070,352 @@ async fn stop_preflight_retains_regular_file_when_special_comes_later() {
         b"must survive failed retirement"
     );
     assert!(socket_path.symlink_metadata().is_ok());
+}
+
+#[test]
+fn projection_restore_paths_stay_inside_runtime_root() {
+    let root = tempfile::tempdir().unwrap();
+    let sentinel = root.path().parent().unwrap().join(format!(
+        "astrid-1833-outside-{}",
+        root.path().file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::write(&sentinel, b"keep-me").unwrap();
+    let absolute = sentinel.to_str().expect("utf-8 sentinel path");
+    for name in [absolute, "/tmp/x", "../x", r"..\x", "foo/../../x"] {
+        let error = confined_projection_path(root.path(), name).expect_err(name);
+        let message = error.to_string();
+        assert!(
+            message.contains("escaped runtime root")
+                || message.contains("non-normal path component"),
+            "{name}: {message}"
+        );
+        assert!(
+            !root.path().join("x").exists(),
+            "{name} wrote inside the root"
+        );
+    }
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep-me");
+    let ok = confined_projection_path(root.path(), "etc/authz.conf").unwrap();
+    assert!(ok.starts_with(root.path()));
+    let _ = std::fs::remove_file(&sentinel);
+}
+
+#[tokio::test]
+async fn restore_rejects_absolute_and_traversal_catalog_names() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let sentinel = home_dir.path().parent().unwrap().join(format!(
+        "astrid-1833-restore-{}",
+        home_dir.path().file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::write(&sentinel, b"keep-me").unwrap();
+    let absolute = sentinel.to_str().expect("utf-8 sentinel path").to_owned();
+    for name in [
+        absolute,
+        "/tmp/x".to_owned(),
+        "../x".to_owned(),
+        r"..\x".to_owned(),
+    ] {
+        let content_name = ContentName::new(name.clone()).unwrap();
+        store
+            .content()
+            .put(&StateOwner::System, &content_name, b"escaped")
+            .unwrap();
+        store.content().flush().unwrap();
+        let error = restore_projection(&home, &store, store.content().as_ref())
+            .expect_err("escaped catalog name must not restore");
+        let message = error.to_string();
+        assert!(
+            message.contains("escaped runtime root")
+                || message.contains("non-normal path component"),
+            "{name}: {message}"
+        );
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep-me");
+        assert!(!home.root().join("x").exists());
+        assert!(
+            store
+                .content()
+                .delete(&StateOwner::System, &content_name)
+                .unwrap()
+        );
+        store.content().flush().unwrap();
+    }
+    let _ = std::fs::remove_file(&sentinel);
+}
+
+#[tokio::test]
+async fn retiring_stop_retains_unreceipted_host_file() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let receipted = home.root().join("etc/receipted.conf");
+    std::fs::create_dir_all(receipted.parent().unwrap()).unwrap();
+    std::fs::write(&receipted, b"receipted\n").unwrap();
+    running
+        .publish_runtime_projection(&home)
+        .expect("publish receipted projection");
+    let entries = active_projection_entries(&home, &running).unwrap();
+    let retiring = receipt_ingest(&home, ReceiptPhase::Retiring, &entries).unwrap();
+    running
+        .replace_contiguous_files_removing_exact(StateOwner::System, [retiring], &[], None)
+        .unwrap();
+    running.content().flush().unwrap();
+    let extra = home.root().join("etc/unreceipted.conf");
+    std::fs::write(&extra, b"do-not-delete\n").unwrap();
+    drop(running);
+
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let Err(error) = packer.pack_and_retire_runtime_projection(&home) else {
+        panic!("RETIRING stop must not delete unreceipted host files");
+    };
+    assert!(
+        error.to_string().contains("unreceipted host file"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&extra).unwrap(), b"do-not-delete\n");
+}
+
+#[tokio::test]
+async fn pack_open_staging_journal_without_receipt_retires_to_volume() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    drop(running);
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    packer
+        .pack_and_retire_runtime_projection(&home)
+        .expect("pack initial volume-only stop");
+    drop(packer);
+    assert_stopped_volume_only(&home);
+
+    let intent = home.root().join(STAGING_JOURNAL_PROJECTION);
+    std::fs::create_dir_all(intent.parent().unwrap()).unwrap();
+    std::fs::write(&intent, b"pack-open journal").unwrap();
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    packer
+        .pack_and_retire_runtime_projection(&home)
+        .expect("enumerated staging journal is not a receipt-less projection");
+    drop(packer);
+    assert_stopped_volume_only(&home);
+}
+
+#[tokio::test]
+async fn non_journal_bootstrap_file_without_receipt_fails_closed() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    drop(running);
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    packer
+        .pack_and_retire_runtime_projection(&home)
+        .expect("pack initial volume-only stop");
+    drop(packer);
+
+    let layout = home.root().join("etc/layout-version");
+    std::fs::create_dir_all(layout.parent().unwrap()).unwrap();
+    std::fs::write(&layout, b"2\n").unwrap();
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let Err(error) = packer.pack_and_retire_runtime_projection(&home) else {
+        panic!("non-journal bootstrap file must not be admitted without ACTIVE");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("active projection receipt is missing"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&layout).unwrap(), b"2\n");
+}
+
+#[tokio::test]
+async fn pack_open_staging_journal_sibling_file_fails_closed() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    drop(running);
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    packer
+        .pack_and_retire_runtime_projection(&home)
+        .expect("pack initial volume-only stop");
+    drop(packer);
+
+    let intent = home.root().join(STAGING_JOURNAL_PROJECTION);
+    let sibling = home.root().join("var/content-staging/sibling.log");
+    std::fs::create_dir_all(intent.parent().unwrap()).unwrap();
+    std::fs::write(&intent, b"pack-open journal").unwrap();
+    std::fs::write(&sibling, b"do-not-admit").unwrap();
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let Err(error) = packer.pack_and_retire_runtime_projection(&home) else {
+        panic!("journal sibling must not be admitted without ACTIVE");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("active projection receipt is missing"),
+        "{error}"
+    );
+    assert!(
+        intent.is_file(),
+        "pack-open must not delete the enumerated journal before failing closed"
+    );
+    assert_eq!(std::fs::read(&sibling).unwrap(), b"do-not-admit");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pack_open_staging_journal_sibling_symlink_fails_closed() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    drop(running);
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    packer
+        .pack_and_retire_runtime_projection(&home)
+        .expect("pack initial volume-only stop");
+    drop(packer);
+
+    let intent = home.root().join(STAGING_JOURNAL_PROJECTION);
+    let sibling = home.root().join("var/content-staging/link");
+    std::fs::create_dir_all(intent.parent().unwrap()).unwrap();
+    std::fs::write(&intent, b"pack-open journal").unwrap();
+    std::os::unix::fs::symlink(&intent, &sibling).unwrap();
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let Err(error) = packer.pack_and_retire_runtime_projection(&home) else {
+        panic!("journal sibling symlink must not be admitted without ACTIVE");
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("symbolic link")
+            || message.contains("active projection receipt is missing"),
+        "{message}"
+    );
+    assert!(
+        intent.is_file(),
+        "pack-open must not delete the enumerated journal before failing closed"
+    );
+    assert!(sibling.symlink_metadata().unwrap().file_type().is_symlink());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pack_open_staging_journal_symlink_sentinel_fails_closed() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    drop(running);
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    packer
+        .pack_and_retire_runtime_projection(&home)
+        .expect("pack initial volume-only stop");
+    drop(packer);
+
+    let intent = home.root().join(STAGING_JOURNAL_PROJECTION);
+    let target = home.root().join("astrid.volume");
+    std::fs::create_dir_all(intent.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, &intent).unwrap();
+    let Err(error) = open_runtime_principal_store_for_pack(&home, unlimited_quota()).await else {
+        panic!("symlink staging journal must not open for pack");
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("not a regular file") || message.contains("redirected"),
+        "{message}"
+    );
+    assert!(intent.symlink_metadata().unwrap().file_type().is_symlink());
+}
+
+#[tokio::test]
+async fn pack_open_staging_journal_directory_sentinel_fails_closed() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    drop(running);
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    packer
+        .pack_and_retire_runtime_projection(&home)
+        .expect("pack initial volume-only stop");
+    drop(packer);
+
+    let intent = home.root().join(STAGING_JOURNAL_PROJECTION);
+    std::fs::create_dir_all(&intent).unwrap();
+    let Err(error) = open_runtime_principal_store_for_pack(&home, unlimited_quota()).await else {
+        panic!("directory staging journal must not open for pack");
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("not a regular file") || message.contains("redirected"),
+        "{message}"
+    );
+    assert!(intent.is_dir());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pack_open_staging_journal_socket_sentinel_fails_closed() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    drop(running);
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    packer
+        .pack_and_retire_runtime_projection(&home)
+        .expect("pack initial volume-only stop");
+    drop(packer);
+
+    let intent = home.root().join(STAGING_JOURNAL_PROJECTION);
+    std::fs::create_dir_all(intent.parent().unwrap()).unwrap();
+    use std::os::unix::fs::FileTypeExt as _;
+    let _listener = std::os::unix::net::UnixListener::bind(&intent).unwrap();
+    let Err(error) = open_runtime_principal_store_for_pack(&home, unlimited_quota()).await else {
+        panic!("socket staging journal must not open for pack");
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("not a regular file") || message.contains("redirected"),
+        "{message}"
+    );
+    assert!(intent.symlink_metadata().unwrap().file_type().is_socket());
 }

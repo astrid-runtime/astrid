@@ -1270,6 +1270,13 @@ impl Kernel {
                     "Failed to commit Astrid home layout migration: {error}"
                 ))
             })?;
+
+            // Republish records written by layout completion while ACTIVE.
+            if let Some(store) = principal_store.as_ref() {
+                store
+                    .publish_runtime_projection(&home)
+                    .map_err(std::io::Error::other)?;
+            }
         }
 
         #[cfg(not(target_family = "wasm"))]
