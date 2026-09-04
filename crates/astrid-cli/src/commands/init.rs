@@ -692,19 +692,6 @@ fn refuse_offline_network_sources(selected: &[DistroCapsule], offline: bool) -> 
     Ok(())
 }
 
-fn report_batch_install_outcome(total: usize, failed: &[String]) {
-    if failed.is_empty() {
-        eprintln!("  Installed {total} capsule(s).");
-    } else {
-        eprintln!(
-            "  Installed {} capsule(s), {} failed: {}",
-            total.saturating_sub(failed.len()),
-            failed.len(),
-            failed.join(", "),
-        );
-    }
-}
-
 /// Install each selected capsule with a progress bar.
 ///
 /// Under `offline`, a capsule whose source is GitHub-backed is a hard
@@ -824,7 +811,16 @@ async fn install_capsules_with_resume(
 
     pb.finish_and_clear();
 
-    report_batch_install_outcome(total, &failed);
+    if failed.is_empty() {
+        eprintln!("  Installed {total} capsule(s).");
+    } else {
+        eprintln!(
+            "  Installed {} capsule(s), {} failed: {}",
+            total.saturating_sub(failed.len()),
+            failed.len(),
+            failed.join(", "),
+        );
+    }
 
     Ok(InstallCapsulesResult {
         locked,
