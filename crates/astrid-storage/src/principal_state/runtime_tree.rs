@@ -259,25 +259,47 @@ pub(super) fn restore_projection(
         }
         confined_projection_path(home.root(), name)?;
     }
-    for entry in entries {
-        let name = entry.name().as_str();
-        if is_excluded(name) {
-            continue;
-        }
-        if is_retired_legacy_projection(home, name) {
-            continue;
-        }
-        let Some(bytes) = content
-            .read(&StateOwner::System, entry.name())
-            .map_err(|error| tree_error(home.root(), format!("read projection {name}: {error}")))?
-        else {
-            continue;
-        };
-        write_projection_file(home.root(), name, &bytes)?;
-        if is_staging_generation(name) {
+    let mut written = Vec::new();
+    let result = (|| -> StorageResult<()> {
+        for entry in entries {
+            let name = entry.name().as_str();
+            if is_excluded(name) || is_retired_legacy_projection(home, name) {
+                continue;
+            }
+            let Some(bytes) = content
+                .read(&StateOwner::System, entry.name())
+                .map_err(|error| {
+                    tree_error(home.root(), format!("read projection {name}: {error}"))
+                })?
+            else {
+                continue;
+            };
             let path = confined_projection_path(home.root(), name)?;
-            super::rebind_staging_generation(&path)?;
+            let previous = super::native_io::snapshot_private_file(&path)?;
+            written.push((path, previous));
+            write_projection_file(home.root(), name, &bytes)?;
+            if is_staging_generation(name) {
+                let path = confined_projection_path(home.root(), name)?;
+                super::rebind_staging_generation(&path)?;
+            }
         }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let rollback_errors = super::native_io::rollback_private_files(written);
+        if !rollback_errors.is_empty() {
+            let retirement = match transition_retiring_projection(home, store) {
+                Ok(()) => "durable RETIRING receipt recorded".to_owned(),
+                Err(retirement) => format!("failed to force RETIRING receipt: {retirement}"),
+            };
+            return Err(tree_error(
+                home.root(),
+                format!(
+                    "restore failed: {error}; rollback failures: {rollback_errors:?}; {retirement}"
+                ),
+            ));
+        }
+        return Err(error);
     }
     Ok(())
 }
@@ -293,7 +315,6 @@ fn is_retired_legacy_projection(home: &AstridHome, name: &str) -> bool {
         })
         .any(|relative| normalize_relative_path(&relative) == name)
 }
-
 /// Admit an incomplete legacy-store tree as durable System-owned quarantine.
 ///
 /// Residue is published only after its source bytes are read without
@@ -832,10 +853,6 @@ pub(super) fn reconcile_running_projection(
                 if surviving && !is_bootstrap_surviving_projection(&scanned) {
                     publish_active_projection(home, store)?;
                 } else {
-                    // A restore can fail after writing one volume entry. Mark
-                    // the receipt RETIRING first so a retry restores from the
-                    // volume instead of adopting that partial host tree.
-                    transition_retiring_projection(home, store)?;
                     restore_projection(home, store, &store.content)?;
                 }
             },
