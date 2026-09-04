@@ -177,49 +177,85 @@ fn shell_profile_setup_skips_invalid_explicit_home() {
     }
 }
 
+#[cfg(unix)]
+const CHILD_MARKER: &str = "ASTRID_PATH_SETUP_SUBPROCESS";
+#[cfg(unix)]
+const CHILD_COMPLETION_VAR: &str = "ASTRID_PATH_SETUP_COMPLETION";
+#[cfg(unix)]
+const CHILD_COMPLETION_CONTENT: &[u8] = b"ensure_path_setup returned";
+
 /// Exercise the real mutating function in a child process so all process-wide
 /// application-home inputs can be pinned without altering the test runner.
 #[cfg(unix)]
 #[test]
 fn ensure_path_setup_explicit_nondefault_home_subprocess() {
-    const CHILD_MARKER: &str = "ASTRID_PATH_SETUP_SUBPROCESS";
-    const CHILD_COMPLETION_VAR: &str = "ASTRID_PATH_SETUP_COMPLETION";
-    const CHILD_COMPLETION_CONTENT: &[u8] = b"ensure_path_setup returned";
-    let module_path = module_path!();
-    let test_name = format!(
-        "{}::ensure_path_setup_explicit_nondefault_home_subprocess",
-        module_path.strip_prefix("astrid::").unwrap_or(module_path)
-    );
-
     if std::env::var_os(CHILD_MARKER).is_some() {
-        let home = PathBuf::from(std::env::var_os("HOME").expect("child HOME"));
-        let astrid_home =
-            PathBuf::from(std::env::var_os("ASTRID_HOME").expect("child ASTRID_HOME"));
-        assert!(
-            home.file_name().is_some_and(|name| name
-                .to_string_lossy()
-                .starts_with("astrid-path-setup-home-profile")),
-            "child must run against the isolated application home"
-        );
-        assert!(
-            astrid_home
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("astrid-path-setup-home")),
-            "child must run against the isolated application home"
-        );
-        assert!(
-            std::env::var("SHELL").is_ok_and(|shell| shell.ends_with("zsh")),
-            "child must select a disposable zsh profile"
-        );
-        ensure_path_setup().expect("explicit isolated home must not fail PATH setup");
-
-        let completion =
-            PathBuf::from(std::env::var_os(CHILD_COMPLETION_VAR).expect("completion path"));
-        std::fs::write(completion, CHILD_COMPLETION_CONTENT)
-            .expect("record child completion sentinel");
+        run_explicit_nondefault_home_child();
         return;
     }
+    run_explicit_nondefault_home_parent();
+}
 
+#[cfg(unix)]
+fn run_explicit_nondefault_home_child() {
+    let home = PathBuf::from(std::env::var_os("HOME").expect("child HOME"));
+    let astrid_home = PathBuf::from(std::env::var_os("ASTRID_HOME").expect("child ASTRID_HOME"));
+    assert!(
+        home.file_name().is_some_and(|name| name
+            .to_string_lossy()
+            .starts_with("astrid-path-setup-home-profile")),
+        "child must run against the isolated application home"
+    );
+    assert!(
+        astrid_home
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("astrid-path-setup-home")),
+        "child must run against the isolated application home"
+    );
+    assert!(
+        std::env::var("SHELL").is_ok_and(|shell| shell.ends_with("zsh")),
+        "child must select a disposable zsh profile"
+    );
+    ensure_path_setup().expect("explicit isolated home must not fail PATH setup");
+
+    let completion =
+        PathBuf::from(std::env::var_os(CHILD_COMPLETION_VAR).expect("completion path"));
+    std::fs::write(completion, CHILD_COMPLETION_CONTENT).expect("record child completion sentinel");
+}
+
+#[cfg(unix)]
+fn run_explicit_nondefault_home_parent() {
+    let (home, astrid_home) = create_isolated_path_setup_homes();
+    let profile = home.path().join(".zshrc");
+    let completion = home.path().join("child-returned");
+    let real_rc = directories::BaseDirs::new()
+        .expect("resolve caller BaseDirs")
+        .home_dir()
+        .join(".zshrc");
+    let before = read_real_rc_canary(&real_rc);
+
+    let output = spawn_explicit_nondefault_home_child(home.path(), astrid_home.path(), &completion);
+    assert_child_success(&output);
+
+    let child_completion = std::fs::read(&completion).unwrap_or_else(|error| {
+        panic!(
+            "child must return from ensure_path_setup: {error}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(child_completion.as_slice(), CHILD_COMPLETION_CONTENT);
+    assert_isolated_home_untouched(&astrid_home, &profile);
+
+    let after = read_real_rc_canary(&real_rc);
+    assert_eq!(
+        before, after,
+        "real account rc content and mtime must remain unchanged"
+    );
+}
+
+#[cfg(unix)]
+fn create_isolated_path_setup_homes() -> (tempfile::TempDir, tempfile::TempDir) {
     let home = tempfile::Builder::new()
         .prefix("astrid-path-setup-home-profile")
         .tempdir()
@@ -228,8 +264,30 @@ fn ensure_path_setup_explicit_nondefault_home_subprocess() {
         .prefix("astrid-path-setup-home")
         .tempdir()
         .expect("create isolated ASTRID_HOME");
-    let completion = home.path().join("child-returned");
+    (home, astrid_home)
+}
 
+#[cfg(unix)]
+fn read_real_rc_canary(real_rc: &Path) -> Option<(Vec<u8>, std::time::SystemTime)> {
+    std::fs::metadata(real_rc).ok().map(|metadata| {
+        (
+            std::fs::read(real_rc).expect("read rc canary"),
+            metadata.modified().expect("read rc mtime"),
+        )
+    })
+}
+
+#[cfg(unix)]
+fn spawn_explicit_nondefault_home_child(
+    home: &Path,
+    astrid_home: &Path,
+    completion: &Path,
+) -> std::process::Output {
+    let module_path = module_path!();
+    let test_name = format!(
+        "{}::ensure_path_setup_explicit_nondefault_home_subprocess",
+        module_path.strip_prefix("astrid::").unwrap_or(module_path)
+    );
     let harness = std::env::current_exe().expect("test executable");
     assert!(
         harness
@@ -241,66 +299,40 @@ fn ensure_path_setup_explicit_nondefault_home_subprocess() {
         "child must be the hashed libtest harness, not the CLI: {}",
         harness.display()
     );
-    let profile = home.path().join(".zshrc");
 
-    // Read-only canary: if the guard regresses, it should be obvious whether
-    // the real rc changed during the test rather than before it.
-    let real_rc = directories::BaseDirs::new()
-        .expect("resolve caller BaseDirs")
-        .home_dir()
-        .join(".zshrc");
-    let before = std::fs::metadata(&real_rc).ok().map(|metadata| {
-        (
-            std::fs::read(&real_rc).expect("read rc canary"),
-            metadata.modified().expect("read rc mtime"),
-        )
-    });
-
-    let output = std::process::Command::new(&harness)
+    std::process::Command::new(&harness)
         .args(["--exact", test_name.as_str(), "--nocapture"])
         .env_clear()
         .env(CHILD_MARKER, "1")
-        .env(CHILD_COMPLETION_VAR, &completion)
-        .env("HOME", home.path())
-        .env("ASTRID_HOME", astrid_home.path())
+        .env(CHILD_COMPLETION_VAR, completion)
+        .env("HOME", home)
+        .env("ASTRID_HOME", astrid_home)
         .env("SHELL", "/bin/zsh")
         .env("PATH", "/usr/bin:/bin")
-        .env("TMPDIR", home.path())
+        .env("TMPDIR", home)
         .env("RUST_TEST_THREADS", "1")
         .env("RUST_BACKTRACE", "1")
         .stdin(std::process::Stdio::null())
         .output()
-        .expect("spawn isolated PATH-setup child");
+        .expect("spawn isolated PATH-setup child")
+}
 
+#[cfg(unix)]
+fn assert_child_success(output: &std::process::Output) {
     assert!(
         output.status.success(),
         "isolated PATH-setup child failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let child_completion = std::fs::read(&completion).unwrap_or_else(|error| {
-        panic!(
-            "child must return from ensure_path_setup: {error}; filter={test_name}\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )
-    });
-    assert_eq!(child_completion.as_slice(), CHILD_COMPLETION_CONTENT);
+}
+
+#[cfg(unix)]
+fn assert_isolated_home_untouched(astrid_home: &tempfile::TempDir, profile: &Path) {
     assert!(!profile.exists(), "explicit isolated home must not edit rc");
     assert!(
         !astrid_home.path().join("bin").exists(),
         "explicit isolated home must not create its bin directory"
-    );
-
-    let after = std::fs::metadata(&real_rc).ok().map(|metadata| {
-        (
-            std::fs::read(&real_rc).expect("read rc canary"),
-            metadata.modified().expect("read rc mtime"),
-        )
-    });
-    assert_eq!(
-        before, after,
-        "real account rc content and mtime must remain unchanged"
     );
 }
 
