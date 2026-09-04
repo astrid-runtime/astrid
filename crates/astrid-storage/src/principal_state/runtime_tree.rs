@@ -832,6 +832,10 @@ pub(super) fn reconcile_running_projection(
                 if surviving && !is_bootstrap_surviving_projection(&scanned) {
                     publish_active_projection(home, store)?;
                 } else {
+                    // A restore can fail after writing one volume entry. Mark
+                    // the receipt RETIRING first so a retry restores from the
+                    // volume instead of adopting that partial host tree.
+                    transition_retiring_projection(home, store)?;
                     restore_projection(home, store, &store.content)?;
                 }
             },

@@ -366,11 +366,20 @@ type RuntimeStore =
     TreeKvStore<StateOwner, Blake3ObjectIdentityV1, StateOwnerResolver, RuntimeEngine>;
 
 pub(super) fn rebind_staging_generation(path: &std::path::Path) -> StorageResult<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|error| StorageError::Connection(format!("open staged generation: {error}")))?;
+    let parent = path.parent().ok_or_else(|| {
+        StorageError::Connection(format!(
+            "staged generation has no parent: {}",
+            path.display()
+        ))
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        StorageError::Connection(format!(
+            "staged generation has no file name: {}",
+            path.display()
+        ))
+    })?;
+    let directory = native_io::PrivateDirectory::open(parent)?;
+    let mut file = directory.open_file_rw(std::path::Path::new(name))?;
     let identity = native_io::private_file_identity(&file)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(|error| {

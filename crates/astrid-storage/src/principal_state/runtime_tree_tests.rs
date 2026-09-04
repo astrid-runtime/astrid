@@ -1151,6 +1151,28 @@ async fn restore_rejects_absolute_and_traversal_catalog_names() {
     let _ = std::fs::remove_file(&sentinel);
 }
 
+#[cfg(unix)]
+#[test]
+fn rebind_staging_generation_rejects_symlink_without_touching_target() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let generations = home_dir.path().join("var/content-staging/generations");
+    std::fs::create_dir_all(&generations).unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let external = external_dir.path().join("crafted.sealed");
+    let crafted = vec![0xa5_u8; 96];
+    std::fs::write(&external, &crafted).unwrap();
+    let projected = generations.join("x.sealed");
+    std::os::unix::fs::symlink(&external, &projected).unwrap();
+
+    let error = super::super::rebind_staging_generation(&projected)
+        .expect_err("redirected staged generation must be rejected");
+    assert!(
+        error.to_string().contains("redirected") || error.to_string().contains("symbolic link"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&external).unwrap(), crafted);
+}
+
 #[tokio::test]
 async fn retiring_stop_retains_unreceipted_host_file() {
     let home_dir = tempfile::tempdir().unwrap();
@@ -1185,6 +1207,72 @@ async fn retiring_stop_retains_unreceipted_host_file() {
         "{error}"
     );
     assert_eq!(std::fs::read(&extra).unwrap(), b"do-not-delete\n");
+}
+
+#[tokio::test]
+async fn failed_restore_keeps_later_volume_entries_and_never_adopts_partial_host_tree() {
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    let running = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    drop(running);
+
+    let packer = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let malformed = ContentName::new("var/content-staging/generations/x.sealed").unwrap();
+    let later = ContentName::new("var/content-staging/generations/z.sealed").unwrap();
+    packer
+        .content()
+        .put(&StateOwner::System, &malformed, &[0xa5_u8; 80])
+        .unwrap();
+    packer
+        .content()
+        .put(&StateOwner::System, &later, b"later-generation")
+        .unwrap();
+    packer.content().flush().unwrap();
+    packer.establish_runtime_projection_receipt(&home).unwrap();
+    drop(packer);
+    astrid_core::dirs::retire_projection_root(home.root()).unwrap();
+
+    let Err(first) = open_runtime_principal_store(&home, unlimited_quota()).await else {
+        panic!("malformed earlier generation must fail restore");
+    };
+    assert!(first.to_string().contains("staged footer"), "{first}");
+    assert!(
+        home.root()
+            .join("var/content-staging/generations/x.sealed")
+            .is_file()
+    );
+    assert!(
+        !home
+            .root()
+            .join("var/content-staging/generations/z.sealed")
+            .exists()
+    );
+
+    let Err(second) = open_runtime_principal_store(&home, unlimited_quota()).await else {
+        panic!("retry must restore, not adopt partial host state");
+    };
+    assert!(second.to_string().contains("staged footer"), "{second}");
+    assert!(
+        !home
+            .root()
+            .join("var/content-staging/generations/z.sealed")
+            .exists()
+    );
+
+    let inspector = open_runtime_principal_store_for_pack(&home, unlimited_quota())
+        .await
+        .unwrap();
+    assert_eq!(
+        inspector
+            .content()
+            .read(&StateOwner::System, &later)
+            .unwrap(),
+        Some(b"later-generation".to_vec())
+    );
 }
 
 #[tokio::test]

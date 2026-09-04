@@ -73,7 +73,7 @@ pub async fn open_runtime_principal_store_for_pack(
             volume_migration::open_existing(home, policy)?.ok_or_else(|| {
                 StorageError::Connection("Astrid volume disappeared while opening".to_owned())
             })?;
-        let store = assemble_runtime_store(
+        let store = assemble_volume_store(
             home,
             quota,
             PrincipalDirectory::default(),
@@ -87,7 +87,7 @@ pub async fn open_runtime_principal_store_for_pack(
         return Ok(store);
     }
     let (engine, receipt) = volume_migration::initialize_volume(home, policy)?;
-    let store = assemble_runtime_store(
+    let store = assemble_volume_store(
         home,
         quota,
         PrincipalDirectory::default(),
@@ -182,7 +182,7 @@ async fn open_runtime_principal_store_with_options(
             volume_migration::open_existing(home, policy)?.ok_or_else(|| {
                 StorageError::Connection("Astrid volume disappeared while opening".to_owned())
             })?;
-        let store = assemble_runtime_store(
+        let store = assemble_volume_store(
             home,
             quota,
             principals,
@@ -201,7 +201,7 @@ async fn open_runtime_principal_store_with_options(
         .map_err(|error| StorageError::Connection(error.to_string()))?;
     if layout_version.as_deref() != Some(astrid_core::dirs::LEGACY_LAYOUT_VERSION) {
         let (engine, receipt) = volume_migration::initialize_volume(home, policy)?;
-        let store = assemble_runtime_store(
+        let store = assemble_volume_store(
             home,
             quota,
             principals,
@@ -217,7 +217,7 @@ async fn open_runtime_principal_store_with_options(
     }
     if unrecognized_principal_store_present(home)? {
         let (engine, receipt) = volume_migration::initialize_volume(home, policy)?;
-        let store = assemble_runtime_store(
+        let store = assemble_volume_store(
             home,
             quota,
             principals,
@@ -231,6 +231,15 @@ async fn open_runtime_principal_store_with_options(
         super::runtime_tree::quarantine_principal_store(home, &store)?;
         return Ok(store);
     }
+    open_migrated_directory_store(home, quota, principals, policy).await
+}
+
+async fn open_migrated_directory_store(
+    home: &AstridHome,
+    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
+    principals: PrincipalDirectory,
+    policy: DurableEnginePolicy<StateOwner>,
+) -> crate::principal_state::StorageResult<RuntimePrincipalStore> {
     let store_path = home.principal_store_path();
     let open_path = store_path.clone();
     let format_spec = bootstrap::format_specification()?;
@@ -295,7 +304,7 @@ async fn open_runtime_principal_store_with_options(
     }
 
     let (engine, receipt) = volume_migration::migrate_directory_store(home, engine, policy)?;
-    assemble_runtime_store(
+    assemble_volume_store(
         home,
         quota,
         principals,
@@ -303,6 +312,27 @@ async fn open_runtime_principal_store_with_options(
         receipt,
         true,
         true,
+    )
+    .await
+}
+
+async fn assemble_volume_store(
+    home: &AstridHome,
+    quota: Arc<dyn KvQuotaResolver<StateOwner>>,
+    principals: PrincipalDirectory,
+    engine: Arc<RuntimeEngine>,
+    directory_cutover_receipt: String,
+    restore_projection: bool,
+    allow_receiptless_bootstrap: bool,
+) -> crate::principal_state::StorageResult<RuntimePrincipalStore> {
+    assemble_runtime_store(
+        home,
+        quota,
+        principals,
+        engine,
+        directory_cutover_receipt,
+        restore_projection,
+        allow_receiptless_bootstrap,
     )
     .await
 }

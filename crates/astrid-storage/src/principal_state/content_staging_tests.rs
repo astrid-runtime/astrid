@@ -1,3 +1,5 @@
+use std::io::{Seek as _, SeekFrom, Write as _};
+
 use super::runtime_tests::*;
 use super::store_open_volume_tests::install_legacy_catalog_fixtures;
 use super::*;
