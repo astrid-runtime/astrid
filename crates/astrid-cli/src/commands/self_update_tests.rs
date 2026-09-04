@@ -182,17 +182,29 @@ fn shell_profile_setup_skips_invalid_explicit_home() {
 #[cfg(unix)]
 #[test]
 fn ensure_path_setup_explicit_nondefault_home_subprocess() {
-    let child_marker = "ASTRID_PATH_SETUP_SUBPROCESS";
-    let test_name = concat!(
-        module_path!(),
-        "::ensure_path_setup_explicit_nondefault_home_subprocess"
+    const CHILD_MARKER: &str = "ASTRID_PATH_SETUP_SUBPROCESS";
+    const CHILD_COMPLETION_VAR: &str = "ASTRID_PATH_SETUP_COMPLETION";
+    const CHILD_COMPLETION_CONTENT: &[u8] = b"ensure_path_setup returned";
+    let module_path = module_path!();
+    let test_name = format!(
+        "{}::ensure_path_setup_explicit_nondefault_home_subprocess",
+        module_path.strip_prefix("astrid::").unwrap_or(module_path)
     );
 
-    if std::env::var_os(child_marker).is_some() {
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("child HOME"));
+        let astrid_home =
+            PathBuf::from(std::env::var_os("ASTRID_HOME").expect("child ASTRID_HOME"));
         assert!(
-            std::env::var("ASTRID_HOME")
-                .expect("child must have an explicit ASTRID_HOME")
-                .contains("astrid-path-setup-home"),
+            home.file_name().is_some_and(|name| name
+                .to_string_lossy()
+                .starts_with("astrid-path-setup-home-profile")),
+            "child must run against the isolated application home"
+        );
+        assert!(
+            astrid_home
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("astrid-path-setup-home")),
             "child must run against the isolated application home"
         );
         assert!(
@@ -200,11 +212,35 @@ fn ensure_path_setup_explicit_nondefault_home_subprocess() {
             "child must select a disposable zsh profile"
         );
         ensure_path_setup().expect("explicit isolated home must not fail PATH setup");
+
+        let completion =
+            PathBuf::from(std::env::var_os(CHILD_COMPLETION_VAR).expect("completion path"));
+        std::fs::write(completion, CHILD_COMPLETION_CONTENT)
+            .expect("record child completion sentinel");
         return;
     }
 
-    let home = tempfile::tempdir().expect("create isolated HOME");
-    let astrid_home = tempfile::tempdir().expect("create isolated ASTRID_HOME");
+    let home = tempfile::Builder::new()
+        .prefix("astrid-path-setup-home-profile")
+        .tempdir()
+        .expect("create isolated HOME");
+    let astrid_home = tempfile::Builder::new()
+        .prefix("astrid-path-setup-home")
+        .tempdir()
+        .expect("create isolated ASTRID_HOME");
+    let completion = home.path().join("child-returned");
+
+    let harness = std::env::current_exe().expect("test executable");
+    assert!(
+        harness
+            .parent()
+            .is_some_and(|parent| parent.ends_with("deps"))
+            && harness
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("astrid-")),
+        "child must be the hashed libtest harness, not the CLI: {}",
+        harness.display()
+    );
     let profile = home.path().join(".zshrc");
 
     // Read-only canary: if the guard regresses, it should be obvious whether
@@ -220,13 +256,18 @@ fn ensure_path_setup_explicit_nondefault_home_subprocess() {
         )
     });
 
-    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
-        .args(["--exact", test_name, "--nocapture"])
-        .env(child_marker, "1")
+    let output = std::process::Command::new(&harness)
+        .args(["--exact", test_name.as_str(), "--nocapture"])
+        .env_clear()
+        .env(CHILD_MARKER, "1")
+        .env(CHILD_COMPLETION_VAR, &completion)
         .env("HOME", home.path())
         .env("ASTRID_HOME", astrid_home.path())
         .env("SHELL", "/bin/zsh")
         .env("PATH", "/usr/bin:/bin")
+        .env("TMPDIR", home.path())
+        .env("RUST_TEST_THREADS", "1")
+        .env("RUST_BACKTRACE", "1")
         .stdin(std::process::Stdio::null())
         .output()
         .expect("spawn isolated PATH-setup child");
@@ -237,6 +278,14 @@ fn ensure_path_setup_explicit_nondefault_home_subprocess() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let child_completion = std::fs::read(&completion).unwrap_or_else(|error| {
+        panic!(
+            "child must return from ensure_path_setup: {error}; filter={test_name}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert_eq!(child_completion.as_slice(), CHILD_COMPLETION_CONTENT);
     assert!(!profile.exists(), "explicit isolated home must not edit rc");
     assert!(
         !astrid_home.path().join("bin").exists(),
