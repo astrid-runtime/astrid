@@ -123,6 +123,7 @@ mod control;
 mod filesystem;
 mod mountpoint;
 mod registry;
+mod rollback;
 mod service;
 
 const PROVIDER_NAME: &str = "astrid-storage-provider-fuse";
@@ -292,12 +293,10 @@ async fn rollback_mount_error(
     launch: &ServiceLaunch,
     control_path: &Path,
 ) -> anyhow::Error {
-    match rollback_unregistered_mount(client, launch, control_path).await {
-        Ok(()) => error,
-        Err(rollback_error) => anyhow::anyhow!(
-            "{error:#}; failed to fully roll back unregistered FUSE mount: {rollback_error:#}"
-        ),
-    }
+    rollback::preserve_launch_error(
+        error,
+        rollback_unregistered_mount(client, launch, control_path).await,
+    )
 }
 
 async fn rollback_unregistered_mount(
@@ -318,23 +317,17 @@ async fn rollback_unregistered_mount(
     {
         failures.push(format!("revoke mount lease: {error:#}"));
     }
-    match mountpoint::lazy_unmount(&launch.mountpoint) {
-        Ok(()) => {
-            if let Err(error) = cleanup_service_artifacts(
+    rollback::finish_cleanup(
+        failures,
+        mountpoint::lazy_unmount(&launch.mountpoint),
+        || {
+            cleanup_service_artifacts(
                 control_path,
                 &launch.mountpoint,
                 launch.auto_created_mountpoint,
-            ) {
-                failures.push(format!("remove service artifacts: {error:#}"));
-            }
+            )
         },
-        Err(error) => failures.push(format!("detach mountpoint: {error:#}")),
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        bail!("{}", failures.join("; "))
-    }
+    )
 }
 
 fn require_ready_control_response(
