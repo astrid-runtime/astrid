@@ -773,11 +773,11 @@ version = "0.1.0"
 
     #[test]
     fn load_manifest_rejects_unsatisfied_astrid_version() {
-        let toml = "[package]\nname = \"test\"\nversion = \"0.1.0\"\nastrid-version = \">=99.0.0\"";
+        let toml = "[package]\nname = \"test\"\nversion = \"0.1.0\"\nastrid-version = \"<0.0.0\"";
         let err = load_from_toml(toml).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("astrid-version") && msg.contains("99.0.0"),
+            msg.contains("astrid-version") && msg.contains("<0.0.0"),
             "expected astrid-version rejection, got: {msg}"
         );
     }
