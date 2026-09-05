@@ -238,7 +238,7 @@ fn inspected_user_install_uses_initialized_fresh_private_windows_home() {
 
 #[cfg(windows)]
 #[test]
-fn capsule_inspection_rejects_stopped_volume_without_sidecars() {
+fn fresh_private_windows_home_capsule_inspection_rejects_stopped_volume_without_sidecars() {
     let capsule_dir = tempfile::tempdir().unwrap();
     write_minimal_capsule(capsule_dir.path(), "stopped-volume-test", "1.0.0");
     let fresh = FreshWindowsHome::new();
