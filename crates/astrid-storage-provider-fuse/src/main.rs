@@ -511,9 +511,8 @@ async fn launch_service(launch: &ServiceLaunch, control_path: &Path) -> Result<C
     match startup {
         Ok(ready) => {
             tokio::spawn(async move {
-                let _ = child.wait().await;
+                let _ = tokio::join!(child.wait(), stderr_task);
             });
-            drop(stderr_task);
             Ok(ready)
         },
         Err(error) => {
