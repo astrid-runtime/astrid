@@ -20,8 +20,9 @@ use astrid_storage::RuntimePrincipalStore;
 use serde::{Deserialize, Serialize};
 
 use crate::paths::resolve_target_dir_for_in_workspace;
-
 mod leftover;
+#[cfg(windows)]
+mod runtime_identity;
 mod status;
 pub(crate) use leftover::{
     parse_legacy_authority_receipt, quarantine_legacy_authority_receipt,
@@ -848,8 +849,7 @@ fn inspect_manifest(
     workspace_layout: &WorkspaceLayout,
 ) -> anyhow::Result<InstallInspection> {
     #[cfg(windows)]
-    home.ensure()
-        .context("failed to provision private Astrid home for capsule inspection")?;
+    runtime_identity::prepare(home)?;
 
     let key_path = home.runtime_key_path();
     let keypair = astrid_crypto::load_or_generate_keypair(&key_path)
