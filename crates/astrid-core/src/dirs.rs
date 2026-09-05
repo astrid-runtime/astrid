@@ -3,9 +3,11 @@
 //! Two key directory structures:
 //!
 //! - [`AstridHome`]: Global durable root at `~/.astrid/` (or `$ASTRID_HOME`).
-//!   Stopped state is exactly the private `astrid.volume` media file. While a
-//!   daemon runs, volume-backed files are projected at their historical paths;
-//!   transients use `ASTRID_RUN_DIR` or a disposable runtime directory.
+//!   Stopped state is exactly the private `astrid.volume` media file. Before
+//!   that volume exists, capsule signing may leave only the private runtime-key
+//!   bootstrap that storage ingests on first open. While a daemon runs,
+//!   volume-backed files are projected at their historical paths; transients
+//!   use `ASTRID_RUN_DIR` or a disposable runtime directory.
 //!
 //! - [`WorkspaceDir`]: Selected per-project state directory.
 //!   Holds project configuration, capsules, hooks, and instructions.
@@ -245,6 +247,13 @@ pub struct AstridHome {
     root: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsentinelledRootState {
+    Empty,
+    RuntimeKeyBootstrap,
+    StoppedVolume,
+}
+
 impl AstridHome {
     /// Resolve the home directory.
     ///
@@ -315,10 +324,12 @@ impl AstridHome {
     /// Validate the durable root without creating a parallel state tree.
     ///
     /// Fresh initialization leaves only the private root for the storage layer
-    /// to fill with `astrid.volume`. Released homes retain their historical
-    /// directories and sentinel as one-time migration inputs until verified
-    /// cutover. Running projections are created later from mounted volume
-    /// state, never by this admission boundary.
+    /// to fill with `astrid.volume`. The sole pre-volume exception is the
+    /// private runtime-key bootstrap that storage ingests on first open.
+    /// Released homes retain their historical directories and sentinel as
+    /// one-time migration inputs until verified cutover. Running projections
+    /// are created later from mounted volume state, never by this admission
+    /// boundary.
     ///
     /// # Errors
     ///
@@ -371,7 +382,9 @@ impl AstridHome {
         }
 
         match existing_layout.as_deref() {
-            None => self.validate_fresh_root_entries()?,
+            None => {
+                self.validate_fresh_root_entries()?;
+            },
             Some(LEGACY_LAYOUT_VERSION) => {},
             Some(LAYOUT_VERSION) => {
                 // Before the singleton-owned migration barrier, v2 boot only
@@ -408,9 +421,62 @@ impl AstridHome {
         Ok(())
     }
 
-    fn validate_fresh_root_entries(&self) -> io::Result<()> {
+    /// Validate that this home may provision or reuse a runtime identity.
+    ///
+    /// A sentinel-free root containing only `astrid.volume` is the canonical
+    /// stopped representation. Creating `keys/runtime.key` beside that volume
+    /// would turn the stopped root into an inadmissible mixed state, so callers
+    /// must pass this read-only preflight before creating either sidecar.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported layouts, unsafe fresh-root entries, or
+    /// the stopped volume-only representation.
+    pub fn validate_runtime_identity_provisioning(&self) -> io::Result<()> {
+        match self.layout_version()?.as_deref() {
+            Some(LEGACY_LAYOUT_VERSION | LAYOUT_VERSION) => return Ok(()),
+            Some(version) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported Astrid home layout version {version:?}"),
+                ));
+            },
+            None => {},
+        }
+
+        match std::fs::symlink_metadata(self.root()) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Astrid home without a layout sentinel is redirected or not a directory: {}",
+                        self.root().display()
+                    ),
+                ));
+            },
+            Ok(_) => {},
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        crate::platform_fs::validate_private_directory(self.root())?;
+
+        if self.validate_fresh_root_entries()? == UnsentinelledRootState::StoppedVolume {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stopped Astrid durable root cannot provision runtime identity sidecars",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_fresh_root_entries(&self) -> io::Result<UnsentinelledRootState> {
         let mut entries = self.root().read_dir()?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(std::fs::DirEntry::file_name);
+        if entries.len() == 1 && entries[0].file_name() == std::ffi::OsStr::new("keys") {
+            self.validate_runtime_key_bootstrap(&entries[0].path())?;
+            return Ok(UnsentinelledRootState::RuntimeKeyBootstrap);
+        }
+        let mut state = UnsentinelledRootState::Empty;
         for entry in entries {
             let path = entry.path();
             if entry.file_name() != std::ffi::OsStr::new("astrid.volume") {
@@ -428,6 +494,27 @@ impl AstridHome {
                     io::ErrorKind::InvalidData,
                     format!(
                         "Astrid durable media is redirected or not a regular file: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            crate::platform_fs::validate_private_file(&path)?;
+            state = UnsentinelledRootState::StoppedVolume;
+        }
+        Ok(state)
+    }
+
+    fn validate_runtime_key_bootstrap(&self, keys_dir: &Path) -> io::Result<()> {
+        crate::platform_fs::validate_private_directory(keys_dir)?;
+        let mut entries = keys_dir.read_dir()?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            if path != self.runtime_key_path() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unadmitted entry in the fresh runtime-key bootstrap: {}",
                         path.display()
                     ),
                 ));

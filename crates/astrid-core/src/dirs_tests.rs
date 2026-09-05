@@ -218,6 +218,86 @@ fn test_astrid_home_ensure_idempotent() {
 }
 
 #[test]
+fn pre_volume_runtime_key_bootstrap_admits_repeated_ensure() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    home.ensure().unwrap();
+    crate::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
+
+    home.ensure().unwrap();
+    std::fs::write(home.runtime_key_path(), b"bootstrap-key").unwrap();
+    crate::platform_fs::restrict_private_file(&home.runtime_key_path()).unwrap();
+    home.ensure().unwrap();
+
+    assert!(!home.storage_volume_path().exists());
+    assert_eq!(
+        std::fs::read(home.runtime_key_path()).unwrap(),
+        b"bootstrap-key"
+    );
+}
+
+#[test]
+fn pre_volume_runtime_key_bootstrap_rejects_extra_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    home.ensure().unwrap();
+    crate::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
+    let extra = home.keys_dir().join("operator.pub");
+    std::fs::write(&extra, b"unadmitted").unwrap();
+    crate::platform_fs::restrict_private_file(&extra).unwrap();
+
+    let error = home.ensure().unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("fresh runtime-key bootstrap"));
+    assert_eq!(std::fs::read(extra).unwrap(), b"unadmitted");
+}
+
+#[test]
+fn stopped_volume_rejects_runtime_key_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    home.ensure().unwrap();
+    std::fs::write(home.storage_volume_path(), b"stopped-volume").unwrap();
+    crate::platform_fs::restrict_private_file(&home.storage_volume_path()).unwrap();
+    crate::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
+
+    let error = home.ensure().unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(home.storage_volume_path().exists());
+    assert!(home.keys_dir().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn pre_volume_runtime_key_bootstrap_rejects_unsafe_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    home.ensure().unwrap();
+    crate::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
+    std::fs::set_permissions(home.keys_dir(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        home.ensure().unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+
+    crate::platform_fs::ensure_private_directory(&home.keys_dir()).unwrap();
+    std::fs::write(home.runtime_key_path(), b"bootstrap-key").unwrap();
+    std::fs::set_permissions(
+        home.runtime_key_path(),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert_eq!(
+        home.ensure().unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+}
+
+#[test]
 fn test_fresh_home_restart_does_not_recreate_legacy_secret_dir() {
     let dir = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(test_home_root(&dir));

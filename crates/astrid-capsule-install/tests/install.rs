@@ -201,6 +201,8 @@ fn inspected_user_install_uses_initialized_fresh_private_windows_home() {
         &layout,
     )
     .expect("inspection should use the private runtime identity");
+    let runtime_identity = std::fs::read(home.runtime_key_path())
+        .expect("inspection should persist the private runtime identity");
     let decision = AuthorityDecision::ExplicitApproval {
         content_digest: inspection.content_digest,
     };
@@ -215,6 +217,15 @@ fn inspected_user_install_uses_initialized_fresh_private_windows_home() {
     )
     .expect("authorized install should scan and provision the private principal home");
 
+    assert_eq!(
+        std::fs::read(home.runtime_key_path()).unwrap(),
+        runtime_identity,
+        "the authorized reinspection must reuse the first runtime identity"
+    );
+    astrid_core::platform_fs::validate_private_directory(home.root()).unwrap();
+    astrid_core::platform_fs::validate_private_directory(&home.keys_dir()).unwrap();
+    astrid_core::platform_fs::validate_private_file(&home.runtime_key_path()).unwrap();
+
     assert!(output.target_dir.join("Capsule.toml").is_file());
     assert_eq!(
         durable_package(&storage, "fresh-inspected-home-test")
@@ -223,6 +234,62 @@ fn inspected_user_install_uses_initialized_fresh_private_windows_home() {
             .name,
         "fresh-inspected-home-test"
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn fresh_private_windows_home_capsule_inspection_rejects_stopped_volume_without_sidecars() {
+    let capsule_dir = tempfile::tempdir().unwrap();
+    write_minimal_capsule(capsule_dir.path(), "stopped-volume-test", "1.0.0");
+    let fresh = FreshWindowsHome::new();
+    let home = AstridHome::from_path(&fresh.path);
+    astrid_core::platform_fs::ensure_private_directory(home.root()).unwrap();
+    let volume_bytes = b"stopped-volume";
+    std::fs::write(home.storage_volume_path(), volume_bytes).unwrap();
+    astrid_core::platform_fs::restrict_private_file(&home.storage_volume_path()).unwrap();
+    let volume_before = std::fs::read(home.storage_volume_path()).unwrap();
+    let entries_before = home
+        .root()
+        .read_dir()
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+
+    let error = inspect_directory_for_principal_in_workspace(
+        capsule_dir.path(),
+        &home,
+        &PrincipalId::default(),
+        false,
+        None,
+        &WorkspaceLayout::default(),
+    )
+    .expect_err("capsule inspection must not revive a stopped durable root");
+
+    assert!(
+        error
+            .to_string()
+            .contains("runtime identity provisioning is not admitted"),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(
+        std::fs::read(home.storage_volume_path()).unwrap(),
+        volume_before
+    );
+    assert!(
+        !home.keys_dir().exists(),
+        "inspection must not create keys/"
+    );
+    assert!(
+        !home.runtime_key_path().exists(),
+        "inspection must not create runtime.key"
+    );
+    let entries_after = home
+        .root()
+        .read_dir()
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(entries_after, entries_before);
 }
 
 #[test]
