@@ -1,5 +1,6 @@
 //! Canonical records and content identities for home-layout migration.
 
+use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
@@ -219,8 +220,38 @@ pub(super) fn verify_receipt_destination_is_live_path(
 fn physical_path(destination: &LayoutTreeIdentityV1) -> io::Result<PathBuf> {
     let bytes = hex::decode(&destination.physical_path_hex)
         .map_err(|error| io::Error::other(format!("decode layout destination path: {error}")))?;
-    let os_bytes = <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(bytes);
-    Ok(PathBuf::from(os_bytes))
+    encoded_bytes_to_os_string(bytes).map(PathBuf::from)
+}
+
+#[cfg(unix)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the cross-platform receipt decoder has one fallible signature"
+)]
+pub(super) fn encoded_bytes_to_os_string(bytes: Vec<u8>) -> io::Result<OsString> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    // Unix receipts commit to the raw OsStr byte sequence, including paths
+    // that are not UTF-8. Decoding must therefore preserve every byte.
+    Ok(OsString::from_vec(bytes))
+}
+
+#[cfg(not(unix))]
+pub(super) fn encoded_bytes_to_os_string(bytes: Vec<u8>) -> io::Result<OsString> {
+    let text = String::from_utf8(bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("layout destination path is not portable UTF-8: {error}"),
+        )
+    })?;
+    let path = OsString::from(&text);
+    if path.as_encoded_bytes() != text.as_bytes() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "layout destination path cannot be represented losslessly on this platform",
+        ));
+    }
+    Ok(path)
 }
 
 pub(super) fn inventory_tree(path: &Path) -> io::Result<LayoutTreeIdentityV1> {

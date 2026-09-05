@@ -7,6 +7,37 @@ fn migration_target() -> LayoutMigrationTarget {
     LayoutMigrationTarget::new("test-store/3;state-owner-codec/2", "test-binary/1").unwrap()
 }
 
+#[test]
+fn receipt_path_decoder_round_trips_portable_bytes() {
+    let encoded = b"/tmp/astrid.volume".to_vec();
+
+    let decoded = dirs_layout::decode_layout_receipt_path_for_test(encoded.clone())
+        .expect("portable path bytes must decode");
+
+    assert_eq!(decoded.as_encoded_bytes(), encoded);
+}
+
+#[cfg(unix)]
+#[test]
+fn receipt_path_decoder_preserves_non_utf8_unix_bytes() {
+    let encoded = b"/tmp/astrid-\xff.volume".to_vec();
+
+    let decoded = dirs_layout::decode_layout_receipt_path_for_test(encoded.clone())
+        .expect("Unix path bytes must decode without normalization");
+
+    assert_eq!(decoded.as_encoded_bytes(), encoded);
+}
+
+#[cfg(not(unix))]
+#[test]
+fn receipt_path_decoder_rejects_nonportable_bytes() {
+    let error = dirs_layout::decode_layout_receipt_path_for_test(vec![0xff])
+        .expect_err("non-UTF-8 receipt bytes must fail closed");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("not portable UTF-8"));
+}
+
 #[cfg(not(windows))]
 fn write_released_legacy_store(home: &AstridHome, bytes: &[u8]) -> PathBuf {
     let manifest = home.state_db_path().join("manifest");
