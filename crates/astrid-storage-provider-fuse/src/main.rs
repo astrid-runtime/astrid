@@ -247,17 +247,16 @@ async fn mount(
     let ready = match startup {
         Ok(ready) => ready,
         Err(error) => {
-            rollback_unregistered_mount(client, &launch, &control_path).await;
-            return Err(error);
+            return Err(rollback_mount_error(error, client, &launch, &control_path).await);
         },
     };
     if ready.mount_id != lease.mount_id || ready.access != lease.access {
-        rollback_unregistered_mount(client, &launch, &control_path).await;
-        bail!("detached FUSE service returned a mismatched lease identity");
+        let error = anyhow::anyhow!("detached FUSE service returned a mismatched lease identity");
+        return Err(rollback_mount_error(error, client, &launch, &control_path).await);
     }
     if ready.pid == 0 {
-        rollback_unregistered_mount(client, &launch, &control_path).await;
-        bail!("detached FUSE service returned an invalid process identity");
+        let error = anyhow::anyhow!("detached FUSE service returned an invalid process identity");
+        return Err(rollback_mount_error(error, client, &launch, &control_path).await);
     }
     let control_ready = call_control(
         &control_path,
@@ -267,30 +266,19 @@ async fn mount(
     )
     .and_then(|response| require_ready_control_response(response, lease.access));
     if let Err(error) = control_ready {
-        rollback_unregistered_mount(client, &launch, &control_path).await;
-        return Err(error.context("detached FUSE service failed its readiness handshake"));
+        let error = error.context("detached FUSE service failed its readiness handshake");
+        return Err(rollback_mount_error(error, client, &launch, &control_path).await);
     }
     let record = registry::MountRecord {
         mount_id: lease.mount_id,
-        requested_by: launch.requested_by,
+        requested_by: launch.requested_by.clone(),
         mountpoint: mountpoint.clone(),
         access: lease.access,
         auto_created_mountpoint: auto_created,
         control_path: control_path.clone(),
     };
     if let Err(error) = registry::write_record(&record) {
-        rollback_unregistered_mount(
-            client,
-            &ServiceLaunch {
-                lease,
-                requested_by: record.requested_by.clone(),
-                mountpoint: mountpoint.clone(),
-                auto_created_mountpoint: auto_created,
-            },
-            &control_path,
-        )
-        .await;
-        return Err(error);
+        return Err(rollback_mount_error(error, client, &launch, &control_path).await);
     }
     Ok(StorageProviderSuccessV1::Mounted {
         mount_id: lease.mount_id,
@@ -298,23 +286,55 @@ async fn mount(
     })
 }
 
+async fn rollback_mount_error(
+    error: anyhow::Error,
+    client: &mut AdminClient,
+    launch: &ServiceLaunch,
+    control_path: &Path,
+) -> anyhow::Error {
+    match rollback_unregistered_mount(client, launch, control_path).await {
+        Ok(()) => error,
+        Err(rollback_error) => error.context(format!(
+            "failed to fully roll back unregistered FUSE mount: {rollback_error:#}"
+        )),
+    }
+}
+
 async fn rollback_unregistered_mount(
     client: &mut AdminClient,
     launch: &ServiceLaunch,
     control_path: &Path,
-) {
-    let _ = control_unmount(control_path, &launch.requested_by);
-    let _ = client
+) -> Result<()> {
+    let mut failures = Vec::new();
+    if let Err(error) = control_unmount(control_path, &launch.requested_by) {
+        failures.push(format!("control unmount: {error:#}"));
+    }
+    if let Err(error) = client
         .request(AdminRequestKind::StorageMountRevoke {
             mount_id: launch.lease.mount_id,
         })
-        .await;
-    let _ = mountpoint::lazy_unmount(&launch.mountpoint);
-    let _ = cleanup_service_artifacts(
-        control_path,
-        &launch.mountpoint,
-        launch.auto_created_mountpoint,
-    );
+        .await
+        .and_then(into_success)
+    {
+        failures.push(format!("revoke mount lease: {error:#}"));
+    }
+    match mountpoint::lazy_unmount(&launch.mountpoint) {
+        Ok(()) => {
+            if let Err(error) = cleanup_service_artifacts(
+                control_path,
+                &launch.mountpoint,
+                launch.auto_created_mountpoint,
+            ) {
+                failures.push(format!("remove service artifacts: {error:#}"));
+            }
+        },
+        Err(error) => failures.push(format!("detach mountpoint: {error:#}")),
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", failures.join("; "))
+    }
 }
 
 fn require_ready_control_response(
