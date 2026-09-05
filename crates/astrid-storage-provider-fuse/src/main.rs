@@ -294,9 +294,9 @@ async fn rollback_mount_error(
 ) -> anyhow::Error {
     match rollback_unregistered_mount(client, launch, control_path).await {
         Ok(()) => error,
-        Err(rollback_error) => error.context(format!(
-            "failed to fully roll back unregistered FUSE mount: {rollback_error:#}"
-        )),
+        Err(rollback_error) => anyhow::anyhow!(
+            "{error:#}; failed to fully roll back unregistered FUSE mount: {rollback_error:#}"
+        ),
     }
 }
 
