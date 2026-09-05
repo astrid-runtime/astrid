@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import stat
 import subprocess
 import sys
 import tarfile
@@ -17,6 +18,10 @@ workflow_path = repo / ".github/workflows/release.yml"
 script_path = repo / "scripts/certify_musl_release_archive.sh"
 workflow = workflow_path.read_text(encoding="utf-8")
 script = script_path.read_text(encoding="utf-8")
+setup_path = repo / "scripts/ci/setup_musl_certification.sh"
+setup = setup_path.read_text(encoding="utf-8")
+if not setup_path.stat().st_mode & stat.S_IXUSR:
+    fail("shared certification setup is not executable")
 
 
 def fail(message: str) -> None:
@@ -54,9 +59,15 @@ if not re.search(r"name: '?binary-\$\{\{ matrix\.target \}\}'?", cert):
     fail("certification does not download by its same-run artifact name")
 if re.search(r"artifact-ids|run-id", cert, flags=re.IGNORECASE):
     fail("certification must not consume a cross-run artifact")
-for forbidden in ("cargo", "rust-toolchain", "CARGO_TARGET_DIR"):
+if "dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8" not in cert:
+    fail("musl certification does not use the pinned release toolchain action")
+if 'toolchain: "1.95.0"' not in cert:
+    fail("musl certification does not pin Rust 1.95.0")
+if "scripts/ci/setup_musl_certification.sh" not in cert:
+    fail("musl certification does not use the shared certification setup")
+for forbidden in ("cargo build", "cargo check", "cargo test", "-p astrid", "CARGO_TARGET_DIR"):
     if forbidden.casefold() in cert.casefold():
-        fail(f"certification job contains forbidden build input {forbidden}")
+        fail(f"certification job contains forbidden product-build input {forbidden}")
 if "actions/checkout@" not in cert or "source-commit" not in cert:
     fail("certification does not check out the classified source")
 for fragment in (
@@ -65,9 +76,11 @@ for fragment in (
     "[[ -c /dev/fuse ]]",
     "command -v fusermount3",
     "chmod 0666 /dev/fuse",
+    'B3SUM_REQUIRED_VERSION="1.8.5"',
+    "cargo install b3sum --version 1.8.5 --locked",
 ):
-    if fragment not in cert:
-        fail(f"FUSE substrate setup is missing {fragment}")
+    if fragment not in setup:
+        fail(f"shared certification setup is missing {fragment}")
 if "certify_musl_release_archive.sh" not in cert:
     fail("certification does not invoke the named executable")
 
@@ -150,7 +163,10 @@ def archive_fixture(root: pathlib.Path, redirect: bool) -> pathlib.Path:
 
 
 def run_stage(root: pathlib.Path, archive: pathlib.Path, env: dict[str, str] | None = None):
-    environment = None if env is None else {**os_environ(), **env}
+    environment = {**os_environ(), **(env or {})}
+    injected_path = (env or {}).get("PATH")
+    certification_path = f"{b3sum_bin_dir}:{environment['PATH']}"
+    environment["PATH"] = certification_path if not injected_path else f"{injected_path}:{certification_path}"
     return subprocess.run(
         [
             str(script_path), "--architecture", "x86_64", "--target",
@@ -169,6 +185,19 @@ def os_environ() -> dict[str, str]:
 
     return dict(os.environ)
 
+
+provision = subprocess.run(
+    [str(setup_path), "--b3sum-only"],
+    env={name: value for name, value in os_environ().items() if name != "GITHUB_PATH"},
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+)
+if provision.returncode != 0:
+    fail(f"pinned b3sum setup failed: {provision.stdout}{provision.stderr}")
+b3sum_bin_dir = provision.stdout.strip()
+if not b3sum_bin_dir or not pathlib.Path(b3sum_bin_dir, "b3sum").is_file():
+    fail("pinned b3sum setup did not provide a binary directory")
 
 with tempfile.TemporaryDirectory() as temporary:
     root = pathlib.Path(temporary)
