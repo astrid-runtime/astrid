@@ -247,6 +247,13 @@ pub struct AstridHome {
     root: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsentinelledRootState {
+    Empty,
+    RuntimeKeyBootstrap,
+    StoppedVolume,
+}
+
 impl AstridHome {
     /// Resolve the home directory.
     ///
@@ -375,7 +382,9 @@ impl AstridHome {
         }
 
         match existing_layout.as_deref() {
-            None => self.validate_fresh_root_entries()?,
+            None => {
+                self.validate_fresh_root_entries()?;
+            },
             Some(LEGACY_LAYOUT_VERSION) => {},
             Some(LAYOUT_VERSION) => {
                 // Before the singleton-owned migration barrier, v2 boot only
@@ -412,12 +421,62 @@ impl AstridHome {
         Ok(())
     }
 
-    fn validate_fresh_root_entries(&self) -> io::Result<()> {
+    /// Validate that this home may provision or reuse a runtime identity.
+    ///
+    /// A sentinel-free root containing only `astrid.volume` is the canonical
+    /// stopped representation. Creating `keys/runtime.key` beside that volume
+    /// would turn the stopped root into an inadmissible mixed state, so callers
+    /// must pass this read-only preflight before creating either sidecar.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported layouts, unsafe fresh-root entries, or
+    /// the stopped volume-only representation.
+    pub fn validate_runtime_identity_provisioning(&self) -> io::Result<()> {
+        match self.layout_version()?.as_deref() {
+            Some(LEGACY_LAYOUT_VERSION | LAYOUT_VERSION) => return Ok(()),
+            Some(version) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported Astrid home layout version {version:?}"),
+                ));
+            },
+            None => {},
+        }
+
+        match std::fs::symlink_metadata(self.root()) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Astrid home without a layout sentinel is redirected or not a directory: {}",
+                        self.root().display()
+                    ),
+                ));
+            },
+            Ok(_) => {},
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        crate::platform_fs::validate_private_directory(self.root())?;
+
+        if self.validate_fresh_root_entries()? == UnsentinelledRootState::StoppedVolume {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stopped Astrid durable root cannot provision runtime identity sidecars",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_fresh_root_entries(&self) -> io::Result<UnsentinelledRootState> {
         let mut entries = self.root().read_dir()?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(std::fs::DirEntry::file_name);
         if entries.len() == 1 && entries[0].file_name() == std::ffi::OsStr::new("keys") {
-            return self.validate_runtime_key_bootstrap(&entries[0].path());
+            self.validate_runtime_key_bootstrap(&entries[0].path())?;
+            return Ok(UnsentinelledRootState::RuntimeKeyBootstrap);
         }
+        let mut state = UnsentinelledRootState::Empty;
         for entry in entries {
             let path = entry.path();
             if entry.file_name() != std::ffi::OsStr::new("astrid.volume") {
@@ -440,8 +499,9 @@ impl AstridHome {
                 ));
             }
             crate::platform_fs::validate_private_file(&path)?;
+            state = UnsentinelledRootState::StoppedVolume;
         }
-        Ok(())
+        Ok(state)
     }
 
     fn validate_runtime_key_bootstrap(&self, keys_dir: &Path) -> io::Result<()> {
