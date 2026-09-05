@@ -126,7 +126,9 @@ for forbidden in ("class " + "Blake3", "blake3" + "_bytes", "hashlib", "import h
         fail(f"homemade or Python hashing remains in cert executable: {forbidden}")
 if "sha256sum_bin=$(command -v sha256sum)" not in script:
     fail("system sha256sum is not the production digest authority")
-if '"request_id": "musl-release-certification"' in script:
+if "musl-release-certification" in script:
+    fail("failed-run request_id literal remains")
+if '"request_id": "musl-release-certification"' in script or '"request_id":"musl-release-certification"' in script:
     fail("literal non-UUID request_id remains")
 if "os.environ[\"REQUEST_ID\"]" not in script and "os.environ['REQUEST_ID']" not in script:
     fail("provider request_id is not taken from generated UUID environment")
