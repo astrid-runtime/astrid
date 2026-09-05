@@ -12,6 +12,14 @@ on:
         required: false
         default: false
         type: boolean
+      prepare_set:
+        description: Prepare-only build set
+        required: false
+        default: darwin
+        type: choice
+        options:
+          - darwin
+          - musl
       source_commit:
         description: Exact protected-main commit to build
         required: false
@@ -54,6 +62,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           PREPARE_ONLY: ${{ inputs.prepare_only }}
+          PREPARE_SET: ${{ inputs.prepare_set }}
           REQUESTED_SOURCE: ${{ inputs.source_commit }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -383,6 +392,42 @@ jobs:
           name: binary-${{ matrix.target }}
           path: ${{ env.ASSET }}
 
+  musl-certification:
+    name: Musl archive certification (${{ matrix.architecture }})
+    needs: [classify, build]
+    if: ${{ inputs.prepare_only == true && inputs.prepare_set == 'musl' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { architecture: x86_64, target: x86_64-unknown-linux-musl, runs-on: ubuntu-latest }
+          - { architecture: aarch64, target: aarch64-unknown-linux-musl, runs-on: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 30
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { ref: '${{ needs.classify.outputs.source-commit }}' }
+      - name: Install and require native FUSE support
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fuse3
+          if [[ ! -c /dev/fuse ]]; then
+            sudo modprobe fuse
+          fi
+          [[ -c /dev/fuse ]] || { echo "::error::hosted runner has no Linux FUSE device" >&2; exit 1; }
+          command -v fusermount3 >/dev/null || { echo "::error::hosted runner has no fusermount3" >&2; exit 1; }
+          sudo chmod 0666 /dev/fuse
+      - name: Download the packaged musl archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: 'binary-${{ matrix.target }}', path: '${{ runner.temp }}/musl-cert-artifact' }
+      - name: Certify the packaged musl archive
+        run: |
+          EXPECTED_VERSION='${{ needs.classify.outputs.version }}'
+          scripts/certify_musl_release_archive.sh --architecture "${{ matrix.architecture }}" --target "${{ matrix.target }}" --artifact-dir "$RUNNER_TEMP/musl-cert-artifact" --expected-version "$EXPECTED_VERSION"
   fskit-certification:
     name: Native FSKit mount certification
     needs: [classify, build]
