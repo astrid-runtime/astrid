@@ -1,6 +1,8 @@
 //! Versioned Astrid-home layout migration.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::io;
 use std::io::Read as _;
 #[cfg(unix)]
@@ -18,6 +20,13 @@ use records::{
     admit_or_write_canonical, inventory_regular_file, inventory_tree, read_canonical_record,
     verify_receipt_destination_authority, verify_receipt_destination_is_live_path,
 };
+
+#[cfg(test)]
+pub(super) fn decode_layout_receipt_path_for_test(
+    bytes: Vec<u8>,
+) -> io::Result<std::ffi::OsString> {
+    records::encoded_bytes_to_os_string(bytes)
+}
 use retirement::{
     retire_legacy_source_tree as retire_legacy_source_tree_impl,
     validate_legacy_retirement_candidate,
