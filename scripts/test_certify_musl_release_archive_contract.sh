@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import uuid
 
 
 repo = pathlib.Path(sys.argv[1])
@@ -97,6 +98,8 @@ for fragment in (
     "b3sum_digest",
     "tarfile.open",
     "ASTRID_HOME=",
+    "/usr/bin/uuidgen",
+    "uuid.UUID",
     "--principal default start",
     "--principal default status",
     "storage mount",
@@ -123,6 +126,26 @@ for forbidden in ("class " + "Blake3", "blake3" + "_bytes", "hashlib", "import h
         fail(f"homemade or Python hashing remains in cert executable: {forbidden}")
 if "sha256sum_bin=$(command -v sha256sum)" not in script:
     fail("system sha256sum is not the production digest authority")
+if "musl-release-certification" in script:
+    fail("failed-run request_id literal remains")
+if '"request_id": "musl-release-certification"' in script or '"request_id":"musl-release-certification"' in script:
+    fail("literal non-UUID request_id remains")
+if "os.environ[\"REQUEST_ID\"]" not in script and "os.environ['REQUEST_ID']" not in script:
+    fail("provider request_id is not taken from generated UUID environment")
+try:
+    uuid.UUID("musl-release-certification")
+except ValueError:
+    pass
+else:
+    fail("uuid decoder unexpectedly accepted the failed-run request_id literal")
+generated = subprocess.run(
+    ["/usr/bin/uuidgen"],
+    check=True,
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+).stdout.strip()
+uuid.UUID(generated)
 for rejected in ("apple", "windows", "fskit"):
     if rejected not in script:
         fail(f"cert executable does not reject {rejected} companions")
