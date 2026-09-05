@@ -594,8 +594,20 @@ mod tests {
         let fresh = FreshWindowsHome::new();
         let home = AstridHome::from_path(&fresh.path);
 
-        sign_archive_with_runtime_key_in_home(&archive, &home)
+        let first = sign_archive_with_runtime_key_in_home(&archive, &home)
             .expect("runtime signing should provision its private home");
+
+        home.ensure()
+            .expect("runtime signing bootstrap must remain admitted");
+        let second_archive = dir.path().join("second.capsule");
+        unsigned_archive(
+            &second_archive,
+            b"[package]\nname='second'\nversion='1.0.0'\n",
+            b"wasm",
+        );
+        let second = sign_archive_with_runtime_key_in_home(&second_archive, &home)
+            .expect("repeated runtime signing should reuse the admitted private key");
+        assert_eq!(second.signer, first.signer);
 
         for path in [home.root(), home.keys_dir().as_path()] {
             astrid_core::platform_fs::ensure_private_directory(path)

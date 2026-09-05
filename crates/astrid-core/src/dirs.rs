@@ -3,9 +3,11 @@
 //! Two key directory structures:
 //!
 //! - [`AstridHome`]: Global durable root at `~/.astrid/` (or `$ASTRID_HOME`).
-//!   Stopped state is exactly the private `astrid.volume` media file. While a
-//!   daemon runs, volume-backed files are projected at their historical paths;
-//!   transients use `ASTRID_RUN_DIR` or a disposable runtime directory.
+//!   Stopped state is exactly the private `astrid.volume` media file. Before
+//!   that volume exists, capsule signing may leave only the private runtime-key
+//!   bootstrap that storage ingests on first open. While a daemon runs,
+//!   volume-backed files are projected at their historical paths; transients
+//!   use `ASTRID_RUN_DIR` or a disposable runtime directory.
 //!
 //! - [`WorkspaceDir`]: Selected per-project state directory.
 //!   Holds project configuration, capsules, hooks, and instructions.
@@ -315,10 +317,12 @@ impl AstridHome {
     /// Validate the durable root without creating a parallel state tree.
     ///
     /// Fresh initialization leaves only the private root for the storage layer
-    /// to fill with `astrid.volume`. Released homes retain their historical
-    /// directories and sentinel as one-time migration inputs until verified
-    /// cutover. Running projections are created later from mounted volume
-    /// state, never by this admission boundary.
+    /// to fill with `astrid.volume`. The sole pre-volume exception is the
+    /// private runtime-key bootstrap that storage ingests on first open.
+    /// Released homes retain their historical directories and sentinel as
+    /// one-time migration inputs until verified cutover. Running projections
+    /// are created later from mounted volume state, never by this admission
+    /// boundary.
     ///
     /// # Errors
     ///
@@ -411,6 +415,9 @@ impl AstridHome {
     fn validate_fresh_root_entries(&self) -> io::Result<()> {
         let mut entries = self.root().read_dir()?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(std::fs::DirEntry::file_name);
+        if entries.len() == 1 && entries[0].file_name() == std::ffi::OsStr::new("keys") {
+            return self.validate_runtime_key_bootstrap(&entries[0].path());
+        }
         for entry in entries {
             let path = entry.path();
             if entry.file_name() != std::ffi::OsStr::new("astrid.volume") {
@@ -428,6 +435,26 @@ impl AstridHome {
                     io::ErrorKind::InvalidData,
                     format!(
                         "Astrid durable media is redirected or not a regular file: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            crate::platform_fs::validate_private_file(&path)?;
+        }
+        Ok(())
+    }
+
+    fn validate_runtime_key_bootstrap(&self, keys_dir: &Path) -> io::Result<()> {
+        crate::platform_fs::validate_private_directory(keys_dir)?;
+        let mut entries = keys_dir.read_dir()?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            if path != self.runtime_key_path() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unadmitted entry in the fresh runtime-key bootstrap: {}",
                         path.display()
                     ),
                 ));
