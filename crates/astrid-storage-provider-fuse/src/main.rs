@@ -269,6 +269,23 @@ async fn mount(
     if ready.pid == 0 {
         bail!("detached FUSE service returned an invalid process identity");
     }
+    let control_ready = call_control(
+        &control_path,
+        &ControlRequest::Status {
+            requested_by: launch.requested_by.clone(),
+        },
+    )
+    .and_then(|response| require_ready_control_response(response, lease.access));
+    if let Err(error) = control_ready {
+        let _ = control_unmount(&control_path, &launch.requested_by);
+        let _ = client
+            .request(AdminRequestKind::StorageMountRevoke {
+                mount_id: lease.mount_id,
+            })
+            .await;
+        cleanup_mountpoint(&mountpoint, auto_created)?;
+        return Err(error.context("detached FUSE service failed its readiness handshake"));
+    }
     let record = registry::MountRecord {
         mount_id: lease.mount_id,
         requested_by: launch.requested_by,
@@ -291,6 +308,24 @@ async fn mount(
         mount_id: lease.mount_id,
         mountpoint,
     })
+}
+
+fn require_ready_control_response(
+    response: ControlResponse,
+    expected_access: StorageProviderAccessV1,
+) -> Result<()> {
+    match response {
+        ControlResponse::Status { access } if access == expected_access => Ok(()),
+        ControlResponse::Status { access } => {
+            bail!("detached FUSE service readiness access {access:?} does not match its lease")
+        },
+        ControlResponse::Failure { code, message } => {
+            bail!("detached FUSE service readiness failed [{code}]: {message}")
+        },
+        ControlResponse::Done => {
+            bail!("detached FUSE service returned an incompatible readiness response")
+        },
+    }
 }
 
 async fn sync(
@@ -856,7 +891,10 @@ fn into_success(body: AdminResponseBody) -> Result<serde_json::Value> {
 
 #[cfg(test)]
 mod launcher_tests {
-    use super::require_service_running_after_handoff;
+    use super::{
+        ControlResponse, StorageProviderAccessV1, require_ready_control_response,
+        require_service_running_after_handoff,
+    };
     use anyhow::Result;
 
     #[tokio::test]
@@ -884,6 +922,31 @@ mod launcher_tests {
         child.kill().await?;
         let _ = child.wait().await?;
         Ok(())
+    }
+
+    #[test]
+    fn readiness_requires_a_matching_authenticated_status_response() {
+        require_ready_control_response(
+            ControlResponse::Status {
+                access: StorageProviderAccessV1::ReadWrite,
+            },
+            StorageProviderAccessV1::ReadWrite,
+        )
+        .expect("matching status must prove control readiness");
+
+        for response in [
+            ControlResponse::Status {
+                access: StorageProviderAccessV1::ReadOnly,
+            },
+            ControlResponse::Failure {
+                code: "not-ready".to_owned(),
+                message: "service rejected readiness".to_owned(),
+            },
+            ControlResponse::Done,
+        ] {
+            require_ready_control_response(response, StorageProviderAccessV1::ReadWrite)
+                .expect_err("non-matching control responses must fail closed");
+        }
     }
 }
 
