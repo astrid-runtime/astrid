@@ -9,6 +9,8 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+## [2026.9.0] - Unreleased
+
 ### Fixed
 
 - **`astrid status` and `astrid mcp serve` no longer treat an unlinked
@@ -1939,6 +1941,7 @@ Initial tracked release. See the [repository history](https://github.com/astrid-
 for changes included in this version.
 
 [Unreleased]: https://github.com/astrid-runtime/astrid/compare/v0.10.4...HEAD
+[2026.9.0]: https://github.com/astrid-runtime/astrid/compare/v0.10.4...HEAD
 [0.10.4]: https://github.com/astrid-runtime/astrid/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/astrid-runtime/astrid/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/astrid-runtime/astrid/compare/v0.10.1...v0.10.2

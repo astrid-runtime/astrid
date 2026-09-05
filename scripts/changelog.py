@@ -133,22 +133,24 @@ def _section_heading(line: str) -> str | None:
     return line[4:].strip()
 
 
-def parse_unreleased_sections(body: str) -> OrderedDict[str, str]:
-    sections: OrderedDict[str, str] = OrderedDict()
+def _parse_unreleased_chunks(body: str) -> list[tuple[str, str]]:
+    chunks: list[tuple[str, str]] = []
     current: str | None = None
-    chunks: list[str] = []
+    lines: list[str] = []
 
     def flush() -> None:
-        nonlocal current, chunks
+        nonlocal current, lines
         if current is None:
-            if "".join(chunks).strip():
+            if "".join(lines).strip():
                 raise ValueError(
                     "unreleased text before the first ### heading is not a Keep a Changelog section"
                 )
-            chunks = []
+            lines = []
             return
-        sections[current] = "".join(chunks)
-        chunks = []
+        body = "".join(lines)
+        if body.strip():
+            chunks.append((current, body))
+        lines = []
 
     for line in body.splitlines(keepends=True):
         heading = _section_heading(line.rstrip("\n"))
@@ -156,14 +158,26 @@ def parse_unreleased_sections(body: str) -> OrderedDict[str, str]:
             flush()
             current = heading
             continue
-        chunks.append(line)
+        lines.append(line)
     flush()
-    return sections
+    return chunks
 
 
-def render_sections(sections: OrderedDict[str, str]) -> str:
+def _append_entry(chunks: list[tuple[str, str]], heading: str, entry: str) -> None:
+    for index, (existing_heading, body) in enumerate(chunks):
+        if existing_heading != heading:
+            continue
+        if not body.strip():
+            chunks[index] = (heading, "\n" + entry)
+        else:
+            chunks[index] = (heading, body.rstrip() + "\n\n" + entry)
+        return
+    chunks.append((heading, "\n" + entry))
+
+
+def _render_unreleased_chunks(chunks: list[tuple[str, str]]) -> str:
     parts: list[str] = []
-    for heading, body in sections.items():
+    for heading, body in chunks:
         if not body.strip():
             continue
         parts.append(f"### {heading}\n")
@@ -174,6 +188,26 @@ def render_sections(sections: OrderedDict[str, str]) -> str:
         if not text.endswith("\n\n"):
             parts.append("\n")
     return "".join(parts)
+
+
+def _merge_unreleased_section_chunks(
+    bodies: Sequence[str], fragments: Sequence[tuple[Path, str, str]]
+) -> list[tuple[str, str]]:
+    chunks = [
+        chunk
+        for body in bodies
+        for chunk in _parse_unreleased_chunks(body)
+    ]
+    kind_rank = {kind: index for index, kind in enumerate(KINDS)}
+    for _path, kind, body in sorted(
+        fragments, key=lambda item: (kind_rank[item[1]], item[0].name)
+    ):
+        _append_entry(chunks, KIND_HEADING[kind], entry_from_fragment(body))
+    return chunks
+
+
+def render_sections(sections: OrderedDict[str, str]) -> str:
+    return _render_unreleased_chunks(list(sections.items()))
 
 
 def split_changelog(text: str) -> tuple[str, str, str]:
@@ -198,6 +232,26 @@ def split_changelog(text: str) -> tuple[str, str, str]:
     return preamble, unreleased, rest
 
 
+def _version_header_line(line: str, version: str) -> str | None:
+    match = re.fullmatch(rf"## \[{re.escape(version)}\] - (.+)", line.rstrip("\n"))
+    return match.group(1) if match else None
+
+
+def _split_header_body(
+    lines: list[str], header_at: int
+) -> tuple[list[str], list[str]]:
+    body_at = header_at + 1
+    end_at = next(
+        (
+            index
+            for index, line in enumerate(lines[body_at:], start=body_at)
+            if line.startswith(VERSION_HEADER_PREFIX)
+        ),
+        len(lines),
+    )
+    return lines[body_at:end_at], lines[end_at:]
+
+
 def load_fragments(changes_dir: Path) -> list[tuple[Path, str, str]]:
     loaded: list[tuple[Path, str, str]] = []
     for path in pending_fragment_paths(changes_dir):
@@ -211,20 +265,9 @@ def load_fragments(changes_dir: Path) -> list[tuple[Path, str, str]]:
 def merge_fragments(
     unreleased_body: str, fragments: Sequence[tuple[Path, str, str]]
 ) -> OrderedDict[str, str]:
-    sections = parse_unreleased_sections(unreleased_body)
-    kind_rank = {kind: index for index, kind in enumerate(KINDS)}
-    for _path, kind, body in sorted(
-        fragments, key=lambda item: (kind_rank[item[1]], item[0].name)
-    ):
-        heading = KIND_HEADING[kind]
-        entry = entry_from_fragment(body)
-        current = sections.get(heading, "")
-        if current.strip():
-            current = current.rstrip() + "\n\n" + entry
-        else:
-            current = "\n" + entry
-        sections[heading] = current if current.endswith("\n") else current + "\n"
-    return sections
+    return OrderedDict(
+        _merge_unreleased_section_chunks([unreleased_body], fragments)
+    )
 
 
 def roll_changelog(
@@ -235,6 +278,52 @@ def roll_changelog(
     fragments: Sequence[tuple[Path, str, str]],
 ) -> str:
     preamble, unreleased, rest = split_changelog(text)
+    rest_lines = rest.splitlines(keepends=True)
+    version_headers = [
+        (index, _version_header_line(line, version))
+        for index, line in enumerate(rest_lines)
+    ]
+    version_headers = [
+        (index, suffix) for index, suffix in version_headers if suffix is not None
+    ]
+    if len(version_headers) > 1:
+        suffixes = [suffix for _, suffix in version_headers]
+        if "Unreleased" in suffixes and any(
+            suffix != "Unreleased" for suffix in suffixes
+        ):
+            raise ValueError(
+                f"staged and dated [{version}] sections are ambiguous"
+            )
+        raise ValueError(f"duplicate [{version}] changelog headings")
+
+    if version_headers:
+        staged_at, suffix = version_headers[0]
+        if suffix != "Unreleased":
+            raise ValueError(
+                f"[{version}] is already dated; staged and dated sections are ambiguous"
+            )
+        staged_body, rest_after = _split_header_body(rest_lines, staged_at)
+        rendered = _render_unreleased_chunks(
+            _merge_unreleased_section_chunks(
+                [unreleased, "".join(staged_body)], fragments
+            )
+        )
+        rolled = preamble
+        if rolled and not rolled.endswith("\n"):
+            rolled += "\n"
+        rolled += f"{UNRELEASED_HEADER}\n\n"
+        rolled += f"## [{version}] - {date}\n"
+        if rendered:
+            rolled += "\n" + rendered
+            if not rolled.endswith("\n"):
+                rolled += "\n"
+            if not rolled.endswith("\n\n"):
+                rolled += "\n"
+        else:
+            rolled += "\n"
+        rolled += "".join(rest_after)
+        return rolled
+
     rendered = render_sections(merge_fragments(unreleased, fragments))
     rolled = preamble
     if rolled and not rolled.endswith("\n"):
