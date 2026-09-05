@@ -182,6 +182,12 @@ source_input = text[source_input_start:text.find("\n\npermissions:", source_inpu
 for value in ("required: false", "default: false", "type: boolean"):
     if value not in prepare_input:
         fail(f"prepare_only input is missing {value}")
+if "      prepare_set:\n" not in prepare_input:
+    fail("missing prepare_set workflow input")
+prepare_set = prepare_input[prepare_input.find("      prepare_set:\n"):]
+for value in ("required: false", "default: darwin", "type: choice", "          - darwin", "          - musl"):
+    if value not in prepare_set:
+        fail(f"prepare_set input is missing {value}")
 for value in ("required: false", "type: string"):
     if value not in source_input:
         fail(f"source_commit input is missing {value}")
@@ -231,29 +237,28 @@ if checkout_line < 0 or matrix_invocation_index < 0 or checkout_line > matrix_in
 matrix_program = classifier.read_text(encoding="utf-8")
 if "import os" not in matrix_program or "PREPARE_ONLY = os.environ.get(" not in matrix_program:
     fail("build matrix must read PREPARE_ONLY through the process environment")
+if "PREPARE_SET = os.environ.get(" not in matrix_program:
+    fail("build matrix must read PREPARE_SET through the process environment")
 for target in ("x86_64-apple-darwin", "aarch64-apple-darwin"):
     if f'"target": "{target}"' not in matrix_program:
         fail(f"classified build matrix is missing required Darwin target {target}")
 conditional_start = matrix_program.find('if PREPARE_ONLY != "true":')
 if conditional_start < 0:
     fail("missing prepare-only build matrix filter")
-non_darwin = matrix_program[conditional_start:]
 for target in (
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl",
 ):
-    if f'"target": "{target}"' not in non_darwin:
-        fail(f"classified build matrix does not preserve non-Darwin target {target} outside prepare-only")
+    if f'"target": "{target}"' not in matrix_program:
+        fail(f"classified build matrix does not preserve non-Darwin target {target}")
 
 expected_prepare_only = [
     {"target": "x86_64-apple-darwin", "os": "macos-latest", "archive": "tar.gz", "libc": "native"},
     {"target": "aarch64-apple-darwin", "os": "macos-latest", "archive": "tar.gz", "libc": "native"},
 ]
-expected_full = expected_prepare_only + [
-    {"target": "x86_64-unknown-linux-gnu", "os": "ubuntu-latest", "archive": "tar.gz", "libc": "gnu"},
-    {"target": "aarch64-unknown-linux-gnu", "os": "ubuntu-latest", "archive": "tar.gz", "libc": "gnu"},
+expected_musl_prepare_only = [
     {
         "target": "x86_64-unknown-linux-musl",
         "os": "ubuntu-latest",
@@ -271,36 +276,54 @@ expected_full = expected_prepare_only + [
         "image": "docker.io/library/rust@sha256:594694ee6b07747b63b5c265be2616b62e814180b66227e2c18c6ee85e4136be",
     },
 ]
-for case, prepare_only in (
-    ("true", "true"),
-    ("false", "false"),
-    ("empty", ""),
-    ("absent", None),
-):
-    case_env = os.environ.copy()
-    if prepare_only is None:
-        case_env.pop("PREPARE_ONLY", None)
-    else:
-        case_env["PREPARE_ONLY"] = prepare_only
-    result = subprocess.run(
-        [sys.executable, str(classifier)],
-        env=case_env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if result.returncode != 0:
-        fail(f"matrix classification failed for PREPARE_ONLY {case}: {result.stderr.strip()}")
-    try:
-        matrix = json.loads(result.stdout)
-    except json.JSONDecodeError as error:
-        fail(f"matrix classification emitted invalid JSON for PREPARE_ONLY {case}: {error}")
-    expected = expected_prepare_only if case == "true" else expected_full
-    if matrix != {"include": expected}:
-        fail(f"matrix classification has the wrong members for PREPARE_ONLY {case}")
-    if case == "true" and any(entry["os"] != "macos-latest" for entry in matrix["include"]):
-        fail("prepare-only matrix includes a non-Darwin runner")
-    print(f"prepare-only matrix {case}: {','.join(entry['target'] for entry in matrix['include'])}")
+expected_full = expected_prepare_only + [
+    {"target": "x86_64-unknown-linux-gnu", "os": "ubuntu-latest", "archive": "tar.gz", "libc": "gnu"},
+    {"target": "aarch64-unknown-linux-gnu", "os": "ubuntu-latest", "archive": "tar.gz", "libc": "gnu"},
+    *expected_musl_prepare_only,
+]
+for prepare_only in ("true", "false", "", None):
+    for prepare_set in ("darwin", "musl", "", None):
+        only_label = "absent" if prepare_only is None else (prepare_only or "empty")
+        set_label = "absent" if prepare_set is None else (prepare_set or "empty")
+        case = f"PREPARE_ONLY={only_label}/PREPARE_SET={set_label}"
+        case_env = os.environ.copy()
+        for name, value in (("PREPARE_ONLY", prepare_only), ("PREPARE_SET", prepare_set)):
+            if value is None:
+                case_env.pop(name, None)
+            else:
+                case_env[name] = value
+        result = subprocess.run(
+            [sys.executable, str(classifier)],
+            env=case_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        should_fail = prepare_set == "musl" and prepare_only != "true"
+        if should_fail:
+            if result.returncode == 0:
+                fail("musl prepare_set without prepare_only must fail closed")
+            print(f"{case}: fail-closed")
+            continue
+        if result.returncode != 0:
+            fail(f"matrix classification failed for {case}: {result.stderr.strip()}")
+        try:
+            matrix = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            fail(f"matrix classification emitted invalid JSON for {case}: {error}")
+        if prepare_only == "true" and prepare_set == "musl":
+            expected = expected_musl_prepare_only
+        elif prepare_only == "true":
+            expected = expected_prepare_only
+        else:
+            expected = expected_full
+        if matrix != {"include": expected}:
+            fail(f"matrix classification has the wrong members for {case}")
+        if prepare_only == "true" and prepare_set != "musl" and any(
+            entry["os"] != "macos-latest" for entry in matrix["include"]
+        ):
+            fail("Darwin prepare-only matrix includes a non-Darwin runner")
+        print(f"{case}: {','.join(entry['target'] for entry in matrix['include'])}")
 if 'matrix: ${{ fromJSON(needs.classify.outputs.build-matrix) }}' not in build:
     fail("build job does not consume the classified build matrix")
 require(
