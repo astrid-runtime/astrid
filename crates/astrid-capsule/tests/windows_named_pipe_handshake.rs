@@ -38,7 +38,10 @@ async fn native_windows_preread_replays_full_signed_handshake() {
     std::fs::write(&key_path, keypair.secret_key_bytes()).expect("write principal key");
 
     let token = SessionToken::generate();
-    std::fs::create_dir_all(home.run_dir()).expect("create run directory");
+    astrid_core::platform_fs::ensure_private_directory(&home.run_dir())
+        .expect("create private run directory");
+    astrid_core::platform_fs::validate_private_directory(&home.run_dir())
+        .expect("run directory must satisfy the private-access contract");
     token
         .write_to_file(&home.token_path())
         .expect("write session token");
