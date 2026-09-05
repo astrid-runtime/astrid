@@ -247,26 +247,16 @@ async fn mount(
     let ready = match startup {
         Ok(ready) => ready,
         Err(error) => {
-            let _ = client
-                .request(AdminRequestKind::StorageMountRevoke {
-                    mount_id: lease.mount_id,
-                })
-                .await;
-            cleanup_mountpoint(&mountpoint, auto_created)?;
+            rollback_unregistered_mount(client, &launch, &control_path).await;
             return Err(error);
         },
     };
     if ready.mount_id != lease.mount_id || ready.access != lease.access {
-        let _ = control_unmount(&control_path, &launch.requested_by);
-        let _ = client
-            .request(AdminRequestKind::StorageMountRevoke {
-                mount_id: lease.mount_id,
-            })
-            .await;
-        cleanup_mountpoint(&mountpoint, auto_created)?;
+        rollback_unregistered_mount(client, &launch, &control_path).await;
         bail!("detached FUSE service returned a mismatched lease identity");
     }
     if ready.pid == 0 {
+        rollback_unregistered_mount(client, &launch, &control_path).await;
         bail!("detached FUSE service returned an invalid process identity");
     }
     let control_ready = call_control(
@@ -277,13 +267,7 @@ async fn mount(
     )
     .and_then(|response| require_ready_control_response(response, lease.access));
     if let Err(error) = control_ready {
-        let _ = control_unmount(&control_path, &launch.requested_by);
-        let _ = client
-            .request(AdminRequestKind::StorageMountRevoke {
-                mount_id: lease.mount_id,
-            })
-            .await;
-        cleanup_mountpoint(&mountpoint, auto_created)?;
+        rollback_unregistered_mount(client, &launch, &control_path).await;
         return Err(error.context("detached FUSE service failed its readiness handshake"));
     }
     let record = registry::MountRecord {
@@ -295,19 +279,42 @@ async fn mount(
         control_path: control_path.clone(),
     };
     if let Err(error) = registry::write_record(&record) {
-        let _ = control_unmount(&control_path, &record.requested_by);
-        let _ = client
-            .request(AdminRequestKind::StorageMountRevoke {
-                mount_id: lease.mount_id,
-            })
-            .await;
-        cleanup_mountpoint(&mountpoint, auto_created)?;
+        rollback_unregistered_mount(
+            client,
+            &ServiceLaunch {
+                lease,
+                requested_by: record.requested_by.clone(),
+                mountpoint: mountpoint.clone(),
+                auto_created_mountpoint: auto_created,
+            },
+            &control_path,
+        )
+        .await;
         return Err(error);
     }
     Ok(StorageProviderSuccessV1::Mounted {
         mount_id: lease.mount_id,
         mountpoint,
     })
+}
+
+async fn rollback_unregistered_mount(
+    client: &mut AdminClient,
+    launch: &ServiceLaunch,
+    control_path: &Path,
+) {
+    let _ = control_unmount(control_path, &launch.requested_by);
+    let _ = client
+        .request(AdminRequestKind::StorageMountRevoke {
+            mount_id: launch.lease.mount_id,
+        })
+        .await;
+    let _ = mountpoint::lazy_unmount(&launch.mountpoint);
+    let _ = cleanup_service_artifacts(
+        control_path,
+        &launch.mountpoint,
+        launch.auto_created_mountpoint,
+    );
 }
 
 fn require_ready_control_response(
