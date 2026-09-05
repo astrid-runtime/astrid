@@ -201,6 +201,8 @@ fn inspected_user_install_uses_initialized_fresh_private_windows_home() {
         &layout,
     )
     .expect("inspection should use the private runtime identity");
+    let runtime_identity = std::fs::read(home.runtime_key_path())
+        .expect("inspection should persist the private runtime identity");
     let decision = AuthorityDecision::ExplicitApproval {
         content_digest: inspection.content_digest,
     };
@@ -214,6 +216,15 @@ fn inspected_user_install_uses_initialized_fresh_private_windows_home() {
         &layout,
     )
     .expect("authorized install should scan and provision the private principal home");
+
+    assert_eq!(
+        std::fs::read(home.runtime_key_path()).unwrap(),
+        runtime_identity,
+        "the authorized reinspection must reuse the first runtime identity"
+    );
+    astrid_core::platform_fs::validate_private_directory(home.root()).unwrap();
+    astrid_core::platform_fs::validate_private_directory(&home.keys_dir()).unwrap();
+    astrid_core::platform_fs::validate_private_file(&home.runtime_key_path()).unwrap();
 
     assert!(output.target_dir.join("Capsule.toml").is_file());
     assert_eq!(
