@@ -239,7 +239,6 @@ if conditional_start < 0:
     fail("missing prepare-only build matrix filter")
 non_darwin = matrix_program[conditional_start:]
 for target in (
-    "x86_64-pc-windows-msvc",
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
     "x86_64-unknown-linux-musl",
@@ -253,7 +252,6 @@ expected_prepare_only = [
     {"target": "aarch64-apple-darwin", "os": "macos-latest", "archive": "tar.gz", "libc": "native"},
 ]
 expected_full = expected_prepare_only + [
-    {"target": "x86_64-pc-windows-msvc", "os": "windows-latest", "archive": "tar.gz", "libc": "native"},
     {"target": "x86_64-unknown-linux-gnu", "os": "ubuntu-latest", "archive": "tar.gz", "libc": "gnu"},
     {"target": "aarch64-unknown-linux-gnu", "os": "ubuntu-latest", "archive": "tar.gz", "libc": "gnu"},
     {

@@ -12,7 +12,6 @@ include = [
 ]
 if PREPARE_ONLY != "true":
     include.extend([
-        {"target": "x86_64-pc-windows-msvc", "os": "windows-latest", "archive": "tar.gz", "libc": "native"},
         {"target": "x86_64-unknown-linux-gnu", "os": "ubuntu-latest", "archive": "tar.gz", "libc": "gnu"},
         {"target": "aarch64-unknown-linux-gnu", "os": "ubuntu-latest", "archive": "tar.gz", "libc": "gnu"},
         {"target": "x86_64-unknown-linux-musl", "os": "ubuntu-latest", "archive": "tar.gz", "libc": "musl", "platform": "linux/amd64", "image": "docker.io/library/rust@sha256:e98196986adced5602f6e21c54babdbf2a8700400c7a78868324a3630e0c5d15"},

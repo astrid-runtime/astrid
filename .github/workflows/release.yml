@@ -230,28 +230,6 @@ jobs:
         if: matrix.libc == 'native'
         run: echo "BINARY_ROOT=target/${{ matrix.target }}/release" >> "$GITHUB_ENV"
 
-      - name: Build the Windows WinFsp provider
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        run: cargo build --release --target ${{ matrix.target }} -p astrid-storage-provider-winfsp --locked
-
-      - name: Stage the pinned Windows WinFsp runtime
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: pwsh
-        run: |
-          $msi = Join-Path $env:RUNNER_TEMP "winfsp-2.1.25156.msi"
-          Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi" -OutFile $msi
-          $hash = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash
-          if ($hash -ne "073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A") {
-            throw "WinFsp MSI digest mismatch: $hash"
-          }
-          $exitCode = (Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i", "`"$msi`"", "/qn", "/norestart") -Wait -PassThru).ExitCode
-          if ($exitCode -ne 0 -and $exitCode -ne 3010) {
-            throw "WinFsp installation failed with exit code $exitCode"
-          }
-          $installRoot = (Get-ItemProperty -Path "HKLM:\SOFTWARE\WOW6432Node\WinFsp").InstallDir
-          "WINFSP_MSI=$msi" | Add-Content -Encoding ascii -Path $env:GITHUB_ENV
-          "WINFSP_ROOT=$installRoot" | Add-Content -Encoding ascii -Path $env:GITHUB_ENV
-
       - name: Build Linux binaries against the glibc 2.31 baseline
         if: matrix.libc == 'gnu'
         env:
@@ -364,13 +342,6 @@ jobs:
           DIR="astrid-${VERSION}-${{ matrix.target }}"
           mkdir "$DIR"
           EXE=""
-          if [[ "$TARGET" == x86_64-pc-windows-msvc ]]; then
-            EXE=".exe"
-            cp "$BINARY_ROOT/astrid-storage-provider-winfsp.exe" "$DIR/"
-            cp "$WINFSP_ROOT/bin/winfsp-x64.dll" "$DIR/"
-            cp "$WINFSP_MSI" "$DIR/winfsp-2.1.25156.msi"
-            cp scripts/install-windows.ps1 scripts/uninstall-windows.ps1 "$DIR/"
-          fi
           cp "$BINARY_ROOT/astrid$EXE" "$DIR/"
           cp "$BINARY_ROOT/astrid-daemon$EXE" "$DIR/"
           cp "$BINARY_ROOT/astrid-build$EXE" "$DIR/"
@@ -541,14 +512,6 @@ jobs:
           astrid-*/macos/manage-macos-fskit.sh enable
           ```
 
-          **Windows pre-built archive (PowerShell):**
-          ```powershell
-          tar -xzf astrid-*-x86_64-pc-windows-msvc.tar.gz
-          $release = Get-ChildItem -Directory "astrid-*-x86_64-pc-windows-msvc" |
-            Select-Object -First 1
-          & (Join-Path $release.FullName "install-windows.ps1")
-          ```
-
           Astrid Runtime does not bundle a product distro. To compose it with a
           distro you trust, run:
           ```
@@ -600,6 +563,13 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           CARGO_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)
           test "$VERSION" = "$CARGO_VERSION"
+          if compgen -G "artifacts/*x86_64-pc-windows-msvc*" >/dev/null || \
+            compgen -G "artifacts/astrid-*-windows-release.toml*" >/dev/null || \
+            grep -Eq 'x86_64-pc-windows-msvc' \
+              artifacts/BLAKE3SUMS.txt artifacts/SHA256SUMS.txt; then
+            echo "stable release rejects Windows archives and Windows metadata" >&2
+            exit 1
+          fi
           SOURCE_COMMIT=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
           CONTRACTS_COMMIT=$(git -C wit rev-parse HEAD)
           python3 scripts/release_manifest.py generate \
@@ -619,15 +589,6 @@ jobs:
             --output "artifacts/astrid-${VERSION}-musl-release.toml"
           python3 scripts/musl_release_manifest.py validate \
             "artifacts/astrid-${VERSION}-musl-release.toml" \
-            --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
-            --artifacts artifacts \
-            --verify-artifacts
-          python3 scripts/windows_release_manifest.py generate \
-            --artifacts artifacts \
-            --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
-            --output "artifacts/astrid-${VERSION}-windows-release.toml"
-          python3 scripts/windows_release_manifest.py validate \
-            "artifacts/astrid-${VERSION}-windows-release.toml" \
             --legacy-manifest "artifacts/astrid-${VERSION}-release.toml" \
             --artifacts artifacts \
             --verify-artifacts
