@@ -545,22 +545,29 @@ async fn launch_service(launch: &ServiceLaunch, control_path: &Path) -> Result<C
     let mut stderr_task = tokio::spawn(async move {
         let mut bytes = Vec::with_capacity(MAX_FUSE_STDERR_BYTES + 1);
         let mut buffer = [0_u8; 4096];
-        while let Ok(read) = stderr.read(&mut buffer).await {
+        loop {
+            let read = stderr.read(&mut buffer).await?;
             if read == 0 {
                 break;
             }
             let remaining = (MAX_FUSE_STDERR_BYTES + 1).saturating_sub(bytes.len());
             bytes.extend_from_slice(&buffer[..read.min(remaining)]);
         }
-        bytes
+        std::io::Result::Ok(bytes)
     });
     let startup = read_service_startup(&mut child, launch, control_path).await;
     match startup {
         Ok(ready) => {
             match tokio::time::timeout(Duration::from_secs(1), &mut stderr_task).await {
-                Ok(Ok(_)) => {
-                    drop(child);
-                    Ok(ready)
+                Ok(Ok(Ok(_))) => require_service_running_after_handoff(&mut child)
+                    .await
+                    .map(|()| ready),
+                Ok(Ok(Err(error))) => {
+                    let _ = child.kill().await;
+                    let status = child.wait().await;
+                    Err(anyhow::Error::new(error)
+                        .context("read detached FUSE stderr during sink handoff")
+                        .context(format!("detached FUSE service status: {status:?}")))
                 },
                 Ok(Err(error)) => {
                     let _ = child.kill().await;
@@ -581,8 +588,8 @@ async fn launch_service(launch: &ServiceLaunch, control_path: &Path) -> Result<C
             let _ = child.kill().await;
             let status = child.wait().await;
             let stderr = match stderr_task.await {
-                Ok(bytes) => bounded_stderr_snippet(&bytes),
-                Err(_) => String::new(),
+                Ok(Ok(bytes)) => bounded_stderr_snippet(&bytes),
+                Ok(Err(_)) | Err(_) => String::new(),
             };
             let status_context = format!("detached FUSE service status: {status:?}");
             if stderr.is_empty() {
@@ -590,6 +597,22 @@ async fn launch_service(launch: &ServiceLaunch, control_path: &Path) -> Result<C
             } else {
                 Err(error.context(format!("{status_context}; stderr: {stderr}")))
             }
+        },
+    }
+}
+
+async fn require_service_running_after_handoff(
+    child: &mut tokio::process::Child,
+) -> Result<()> {
+    match child.try_wait() {
+        Ok(None) => Ok(()),
+        Ok(Some(status)) => bail!("detached FUSE service exited after readiness: {status}"),
+        Err(error) => {
+            let _ = child.kill().await;
+            let status = child.wait().await;
+            Err(anyhow::Error::new(error)
+                .context("inspect detached FUSE service after stderr sink handoff")
+                .context(format!("detached FUSE service status: {status:?}")))
         },
     }
 }
@@ -828,6 +851,39 @@ fn into_success(body: AdminResponseBody) -> Result<serde_json::Value> {
             bail!("kernel refused storage lifecycle request: {error}")
         },
         _ => bail!("kernel returned an unexpected storage lifecycle response"),
+    }
+}
+
+#[cfg(test)]
+mod launcher_tests {
+    use super::require_service_running_after_handoff;
+    use anyhow::Result;
+
+    #[tokio::test]
+    async fn stderr_handoff_rejects_a_service_that_already_exited() -> Result<()> {
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()?;
+        let status = child.wait().await?;
+        assert!(status.success());
+
+        let error = require_service_running_after_handoff(&mut child)
+            .await
+            .expect_err("an exited service must not be registered as ready");
+        assert!(error.to_string().contains("exited after readiness"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stderr_handoff_accepts_a_service_that_is_still_running() -> Result<()> {
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .spawn()?;
+
+        require_service_running_after_handoff(&mut child).await?;
+        child.kill().await?;
+        let _ = child.wait().await?;
+        Ok(())
     }
 }
 
