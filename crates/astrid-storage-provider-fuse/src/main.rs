@@ -9,6 +9,38 @@ fn main() -> std::process::ExitCode {
     std::process::ExitCode::from(2)
 }
 
+#[cfg(any(target_os = "linux", test))]
+const MAX_FUSE_STDERR_CHARS: usize = 1024;
+
+#[cfg(any(target_os = "linux", test))]
+fn bounded_stderr_snippet(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_FUSE_STDERR_CHARS)
+        .collect()
+}
+
+#[cfg(test)]
+mod stderr_tests {
+    use super::{MAX_FUSE_STDERR_CHARS, bounded_stderr_snippet};
+
+    #[test]
+    fn bounded_stderr_snippet_is_lossy_control_free_and_secret_bounded() {
+        let secret = format!("lease-token={}", "a".repeat(MAX_FUSE_STDERR_CHARS));
+        let mut bytes = vec![0, 0xff, b'\n'];
+        bytes.extend_from_slice(secret.as_bytes());
+
+        let snippet = bounded_stderr_snippet(&bytes);
+
+        assert_eq!(snippet.chars().count(), MAX_FUSE_STDERR_CHARS);
+        assert!(snippet.starts_with('\u{fffd}'));
+        assert!(snippet.chars().all(|character| !character.is_control()));
+        assert!(!snippet.contains(&secret));
+        assert_ne!(snippet, String::from_utf8_lossy(&bytes));
+    }
+}
+
 #[cfg(target_os = "linux")]
 macro_rules! linux_only {
     ($($item:item)*) => {
@@ -454,21 +486,49 @@ async fn launch_service(launch: &ServiceLaunch, control_path: &Path) -> Result<C
         .arg(PUBLIC_SERVICE_ARGUMENT)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
     command.as_std_mut().process_group(0);
     let mut child = command.spawn()?;
+    let Some(mut stderr) = child.stderr.take() else {
+        let _ = child.kill().await;
+        let status = child.wait().await;
+        return Err(anyhow::anyhow!("FUSE service stderr is unavailable")
+            .context(format!("detached FUSE service status: {status:?}")));
+    };
+    let stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::with_capacity(MAX_FUSE_STDERR_CHARS + 1);
+        let mut buffer = [0_u8; 4096];
+        while let Ok(read) = stderr.read(&mut buffer).await {
+            if read == 0 {
+                break;
+            }
+            let remaining = (MAX_FUSE_STDERR_CHARS + 1).saturating_sub(bytes.len());
+            bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+        bytes
+    });
     let startup = read_service_startup(&mut child, launch, control_path).await;
     match startup {
         Ok(ready) => {
             tokio::spawn(async move {
                 let _ = child.wait().await;
             });
+            drop(stderr_task);
             Ok(ready)
         },
         Err(error) => {
             let _ = child.kill().await;
             let status = child.wait().await;
-            Err(error.context(format!("detached FUSE service status: {status:?}")))
+            let stderr = match stderr_task.await {
+                Ok(bytes) => bounded_stderr_snippet(&bytes),
+                Err(_) => String::new(),
+            };
+            let status_context = format!("detached FUSE service status: {status:?}");
+            if stderr.is_empty() {
+                Err(error.context(status_context))
+            } else {
+                Err(error.context(format!("{status_context}; stderr: {stderr}")))
+            }
         },
     }
 }
