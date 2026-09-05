@@ -10,34 +10,75 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(any(target_os = "linux", test))]
-const MAX_FUSE_STDERR_CHARS: usize = 1024;
+const MAX_FUSE_STDERR_BYTES: usize = 1024;
+
+#[cfg(any(target_os = "linux", test))]
+const MAX_PROVIDER_FAILURE_BYTES: usize = 4096;
+
+#[cfg(any(target_os = "linux", test))]
+fn bounded_utf8(input: impl Iterator<Item = char>, max_bytes: usize) -> String {
+    let mut bounded = String::with_capacity(max_bytes);
+    for character in input {
+        if bounded
+            .len()
+            .checked_add(character.len_utf8())
+            .is_none_or(|length| length > max_bytes)
+        {
+            break;
+        }
+        bounded.push(character);
+    }
+    bounded
+}
 
 #[cfg(any(target_os = "linux", test))]
 fn bounded_stderr_snippet(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes)
-        .chars()
-        .filter(|character| !character.is_control())
-        .take(MAX_FUSE_STDERR_CHARS)
-        .collect()
+    bounded_utf8(
+        String::from_utf8_lossy(bytes)
+            .chars()
+            .filter(|character| !character.is_control()),
+        MAX_FUSE_STDERR_BYTES,
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn bounded_failure_message(message: &str) -> String {
+    bounded_utf8(message.chars(), MAX_PROVIDER_FAILURE_BYTES)
 }
 
 #[cfg(test)]
 mod stderr_tests {
-    use super::{MAX_FUSE_STDERR_CHARS, bounded_stderr_snippet};
+    use super::{
+        MAX_FUSE_STDERR_BYTES, MAX_PROVIDER_FAILURE_BYTES, bounded_failure_message,
+        bounded_stderr_snippet,
+    };
 
     #[test]
     fn bounded_stderr_snippet_is_lossy_control_free_and_secret_bounded() {
-        let secret = format!("lease-token={}", "a".repeat(MAX_FUSE_STDERR_CHARS));
+        let secret = format!("lease-token={}", "a".repeat(MAX_FUSE_STDERR_BYTES));
         let mut bytes = vec![0, 0xff, b'\n'];
         bytes.extend_from_slice(secret.as_bytes());
 
         let snippet = bounded_stderr_snippet(&bytes);
 
-        assert_eq!(snippet.chars().count(), MAX_FUSE_STDERR_CHARS);
+        assert_eq!(snippet.len(), MAX_FUSE_STDERR_BYTES);
         assert!(snippet.starts_with('\u{fffd}'));
         assert!(snippet.chars().all(|character| !character.is_control()));
         assert!(!snippet.contains(&secret));
         assert_ne!(snippet, String::from_utf8_lossy(&bytes));
+    }
+
+    #[test]
+    fn bounded_messages_respect_protocol_byte_limits_for_multibyte_text() {
+        let multibyte = "😀".repeat(MAX_PROVIDER_FAILURE_BYTES);
+
+        let snippet = bounded_stderr_snippet(multibyte.as_bytes());
+        let failure = bounded_failure_message(&multibyte);
+
+        assert_eq!(snippet.len(), MAX_FUSE_STDERR_BYTES);
+        assert_eq!(failure.len(), MAX_PROVIDER_FAILURE_BYTES);
+        assert!(snippet.is_char_boundary(snippet.len()));
+        assert!(failure.is_char_boundary(failure.len()));
     }
 }
 
@@ -128,7 +169,7 @@ async fn run_stdio() -> Result<()> {
         Ok(success) => StorageProviderOutcomeV1::Success(success),
         Err(error) => StorageProviderOutcomeV1::Failure(StorageProviderFailureV1 {
             code: "provider-operation".to_owned(),
-            message: error.to_string().chars().take(4096).collect(),
+            message: bounded_failure_message(&error.to_string()),
         }),
     };
     let response = StorageProviderResponseV1 {
@@ -386,6 +427,12 @@ async fn run_public_service() -> Result<()> {
     stdout.write_all(&startup_bytes)?;
     stdout.write_all(b"\n")?;
     stdout.flush()?;
+    let stderr_sink = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .context("open detached FUSE stderr sink")?;
+    nix::unistd::dup2_stderr(&stderr_sink).context("hand off detached FUSE stderr sink")?;
+    drop(stderr_sink);
 
     let result = service_loop(&listener, &launch, &mut session).await;
     cleanup_service_artifacts(
@@ -473,7 +520,7 @@ async fn live_control_status(
 fn failure_response(code: &str, message: &str) -> ControlResponse {
     ControlResponse::Failure {
         code: code.to_owned(),
-        message: message.chars().take(4096).collect(),
+        message: bounded_failure_message(message),
     }
 }
 
@@ -495,14 +542,14 @@ async fn launch_service(launch: &ServiceLaunch, control_path: &Path) -> Result<C
         return Err(anyhow::anyhow!("FUSE service stderr is unavailable")
             .context(format!("detached FUSE service status: {status:?}")));
     };
-    let stderr_task = tokio::spawn(async move {
-        let mut bytes = Vec::with_capacity(MAX_FUSE_STDERR_CHARS + 1);
+    let mut stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::with_capacity(MAX_FUSE_STDERR_BYTES + 1);
         let mut buffer = [0_u8; 4096];
         while let Ok(read) = stderr.read(&mut buffer).await {
             if read == 0 {
                 break;
             }
-            let remaining = (MAX_FUSE_STDERR_CHARS + 1).saturating_sub(bytes.len());
+            let remaining = (MAX_FUSE_STDERR_BYTES + 1).saturating_sub(bytes.len());
             bytes.extend_from_slice(&buffer[..read.min(remaining)]);
         }
         bytes
@@ -510,10 +557,25 @@ async fn launch_service(launch: &ServiceLaunch, control_path: &Path) -> Result<C
     let startup = read_service_startup(&mut child, launch, control_path).await;
     match startup {
         Ok(ready) => {
-            tokio::spawn(async move {
-                let _ = tokio::join!(child.wait(), stderr_task);
-            });
-            Ok(ready)
+            match tokio::time::timeout(Duration::from_secs(1), &mut stderr_task).await {
+                Ok(Ok(_)) => {
+                    drop(child);
+                    Ok(ready)
+                },
+                Ok(Err(error)) => {
+                    let _ = child.kill().await;
+                    let status = child.wait().await;
+                    Err(anyhow::anyhow!("detached FUSE stderr drain failed: {error}")
+                        .context(format!("detached FUSE service status: {status:?}")))
+                },
+                Err(_) => {
+                    stderr_task.abort();
+                    let _ = child.kill().await;
+                    let status = child.wait().await;
+                    Err(anyhow::anyhow!("detached FUSE stderr sink handoff timed out")
+                        .context(format!("detached FUSE service status: {status:?}")))
+                },
+            }
         },
         Err(error) => {
             let _ = child.kill().await;
