@@ -252,11 +252,23 @@ python3 "$repo_root/scripts/check_static_elf.py" --architecture "$architecture" 
 timeout 180s "$bin/astrid" --principal default start
 timeout 30s "$bin/astrid" --principal default status
 
-request=$(python3 - <<-'PY'
+[[ -x /usr/bin/uuidgen ]] || fail "musl certification requires /usr/bin/uuidgen"
+request_id="$(/usr/bin/uuidgen)"
+if ! REQUEST_ID="$request_id" python3 - <<-'PY'
+import os
+import uuid
+
+uuid.UUID(os.environ["REQUEST_ID"])
+PY
+then
+  fail "provider request_id is not a UUID: $request_id"
+fi
+request=$(REQUEST_ID="$request_id" python3 - <<-'PY'
 import json
+import os
 print(json.dumps({
     "protocol_version": 1,
-    "request_id": "musl-release-certification",
+    "request_id": os.environ["REQUEST_ID"],
     "acting_principal_hint": "default",
     "operation": {
         "operation": "status",
