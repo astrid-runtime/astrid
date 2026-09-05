@@ -375,6 +375,31 @@ pub fn remove_pid_file() {
 mod tests {
     use super::*;
 
+    const LOCK_REACQUIRE_ATTEMPTS: usize = 100;
+
+    fn reacquire_singleton_lock_after_drop<F>(
+        mut acquire: F,
+    ) -> Result<std::fs::File, std::io::Error>
+    where
+        F: FnMut() -> Result<std::fs::File, std::io::Error>,
+    {
+        for _ in 0..LOCK_REACQUIRE_ATTEMPTS {
+            match acquire() {
+                Ok(lock) => return Ok(lock),
+                Err(error) if error.to_string().contains("already running") => {
+                    // A concurrent test may be between fork and exec and briefly
+                    // retain this CLOEXEC descriptor. Wait for that bounded OS
+                    // transition; never bypass a lock that remains held.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                },
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::other(
+            "lock remained held after the bounded fork/exec transition",
+        ))
+    }
+
     #[test]
     fn readiness_metadata_is_published_atomically() {
         let dir = tempfile::tempdir().unwrap();
@@ -438,23 +463,8 @@ mod tests {
 
         // Releasing the lock lets a fresh boot acquire it (no wedged restart).
         drop(first);
-        let mut second = None;
-        for _ in 0..100 {
-            match acquire_boot_singleton_lock(&home) {
-                Ok(lock) => {
-                    second = Some(lock);
-                    break;
-                },
-                Err(error) if error.to_string().contains("already running") => {
-                    // Another test may be between fork and exec and briefly
-                    // retain this CLOEXEC descriptor. Wait for that bounded OS
-                    // transition; never bypass a lock that remains held.
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                },
-                Err(error) => panic!("lock reacquisition failed unexpectedly: {error}"),
-            }
-        }
-        let _second = second.expect("lock remained held after the holder exited");
+        let _second = reacquire_singleton_lock_after_drop(|| acquire_boot_singleton_lock(&home))
+            .expect("lock remained held after the holder exited");
     }
 
     #[test]
@@ -468,7 +478,53 @@ mod tests {
         }
 
         // A fresh daemon can now acquire the same lock (no wedged restart).
-        let _second =
-            acquire_singleton_lock(&lock).expect("lock should be re-acquirable after release");
+        let _second = reacquire_singleton_lock_after_drop(|| acquire_singleton_lock(&lock))
+            .expect("lock should be re-acquirable after release");
+    }
+
+    #[test]
+    fn singleton_lock_reacquisition_retries_transient_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("system.lock");
+        let first = acquire_singleton_lock(&lock).expect("first acquisition succeeds");
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let releaser = std::thread::spawn(move || {
+            release_rx
+                .recv()
+                .expect("reacquisition must attempt while the first lock is held");
+            drop(first);
+        });
+
+        let mut attempted_while_held = false;
+        let _second = reacquire_singleton_lock_after_drop(|| {
+            let result = acquire_singleton_lock(&lock);
+            if !attempted_while_held {
+                attempted_while_held = true;
+                release_tx
+                    .send(())
+                    .expect("releaser thread should still be waiting");
+            }
+            result
+        })
+        .expect("lock should be re-acquirable after transient contention");
+        releaser
+            .join()
+            .expect("releaser thread should exit cleanly");
+        assert!(attempted_while_held);
+    }
+
+    #[test]
+    fn singleton_lock_reacquisition_fails_closed_on_non_contention() {
+        let mut attempts = 0;
+        let error = reacquire_singleton_lock_after_drop(|| {
+            attempts += 1;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "permission denied",
+            ))
+        })
+        .expect_err("non-contention errors must not be retried");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(attempts, 1);
     }
 }
