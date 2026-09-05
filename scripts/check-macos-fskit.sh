@@ -65,8 +65,6 @@ if [[ "${ASTRID_FSKIT_VALIDATE_PROJECT:-0}" == 1 ]]; then
   DERIVED_DATA="${ASTRID_FSKIT_DERIVED_DATA:-${RUNNER_TEMP:-/tmp}/astrid-fskit-derived}"
   ASTRID_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
   SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
-    CURRENT_PROJECT_VERSION="$(git rev-list --count HEAD)" \
-    MARKETING_VERSION="$ASTRID_VERSION" \
   xcodebuild \
     -project native/macos/AstridFSKit/AstridFS.xcodeproj \
     -scheme AstridFS \
@@ -75,6 +73,8 @@ if [[ "${ASTRID_FSKIT_VALIDATE_PROJECT:-0}" == 1 ]]; then
     ARCHS="$ARCHS" \
     ONLY_ACTIVE_ARCH=NO \
     CODE_SIGNING_ALLOWED=NO \
+    CURRENT_PROJECT_VERSION="$(git rev-list --count HEAD)" \
+    MARKETING_VERSION="$ASTRID_VERSION" \
     build
   APP="$DERIVED_DATA/Build/Products/Debug/AstridFS.app"
   EXTENSION="$APP/Contents/Extensions/AstridFSAppEx.appex"
