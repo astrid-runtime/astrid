@@ -27,7 +27,8 @@ MUSL_TARGETS = (
     "x86_64-unknown-linux-musl",
 )
 WINDOWS_TARGETS = ("x86_64-pc-windows-msvc",)
-EXTENSION_TARGETS = (*MUSL_TARGETS, *WINDOWS_TARGETS)
+EXTENSION_TARGETS = MUSL_TARGETS
+PARKED_WINDOWS_TARGETS = WINDOWS_TARGETS
 ROOT_KEYS = {
     "schema-version",
     "kind",
@@ -112,13 +113,15 @@ def expected_asset(version: str, target: str) -> str:
 
 
 def validate_release_checksum_names(entries: dict[str, str], version: str, label: str) -> None:
-    """Keep the fixed-platform manifest compatible with combined checksums."""
+    """Keep fixed and musl manifests compatible with parked combined checksums."""
     legacy = {expected_asset(version, target) for target in TARGETS}
-    combined = legacy | {expected_asset(version, target) for target in EXTENSION_TARGETS}
-    if set(entries) not in (legacy, combined):
+    musl = legacy | {expected_asset(version, target) for target in EXTENSION_TARGETS}
+    parked = musl | {expected_asset(version, target) for target in PARKED_WINDOWS_TARGETS}
+    if set(entries) not in (legacy, musl, parked):
         fail(
             f"{label} must contain exactly the four fixed release archives, "
-            "optionally plus all three extension archives"
+            "optionally plus both musl extension archives, or the parked "
+            "seven-archive Windows shape"
         )
 
 
