@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pathlib
+import re
 import tempfile
 import unittest
 
@@ -11,6 +12,8 @@ import nightly_version
 
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
 VERSION = f"0.10.0-nightly.20260717.g{COMMIT}"
+LIVE_BASE_VERSION = "2026.10.0"
+LIVE_SOURCE_VERSION = "2026.9.0"
 
 
 class NightlyVersionTests(unittest.TestCase):
@@ -83,6 +86,26 @@ class NightlyVersionTests(unittest.TestCase):
         lock.write_text(lock.read_text().replace('name = "astrid-one"\nversion = "0.9.4"', 'name = "astrid-one"\nversion = "0.9.4"\nsource = "registry+https://example.invalid"'), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "missing source-less"):
             nightly_version.stage(self.root, VERSION)
+
+    def test_rejects_stale_base_for_live_source_version(self) -> None:
+        (self.root / "release/nightly.toml").write_text(
+            'schema-version = 1\nbase-version = "0.11.0"\n', encoding="utf-8"
+        )
+        cargo = self.root / "Cargo.toml"
+        cargo.write_text(cargo.read_text().replace('version = "0.9.4"', f'version = "{LIVE_SOURCE_VERSION}"'), encoding="utf-8")
+        with self.assertRaisesRegex(
+            ValueError,
+            re.escape("nightly base-version must be newer than the workspace source version"),
+        ):
+            nightly_version.base_version(self.root)
+
+    def test_live_repository_does_not_alias_stable_source_version(self) -> None:
+        self.assertEqual(nightly_version.source_version(nightly_version.ROOT), LIVE_SOURCE_VERSION)
+        base = nightly_version.base_version(nightly_version.ROOT)
+        self.assertEqual(base, LIVE_BASE_VERSION)
+        identity = nightly_version.derive(base, "20260905", COMMIT)
+        self.assertEqual(identity, f"{LIVE_BASE_VERSION}-nightly.20260905.g{COMMIT}")
+        self.assertNotEqual(identity, LIVE_SOURCE_VERSION)
 
 
 if __name__ == "__main__":
