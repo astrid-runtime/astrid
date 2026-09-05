@@ -23,6 +23,9 @@ mod stream;
 
 const VOLUME_MAGIC: [u8; 8] = *b"ASTVOL1\0";
 const RECORD_MAGIC: [u8; 8] = *b"ASTREG1\0";
+const ROOT_MAGIC: [u8; 8] = *b"ASTROOT1";
+const ROOT_SLOT_BYTES: usize = 8 + 8 + 8 + 8 + 32;
+const ROOT_BYTES: usize = VOLUME_MAGIC.len() + 2 * ROOT_SLOT_BYTES;
 const RECORD_FIXED_BYTES: usize = 8 + 8 + 8 + 1 + 2 + 8 + 8 + 32;
 const MAX_METADATA_MUTATIONS: usize = 1_024;
 const METADATA_TRANSACTION_REGION: &str = "system/volume-metadata-transaction";
@@ -32,6 +35,28 @@ const COMMIT_REGION: &str = "system/volume-commit";
 struct Extent {
     logical_end: u64,
     physical_offset: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PhysicalTail {
+    TruncateToValid,
+    PreserveSelected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RootSlot {
+    First,
+    Second,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROOT_WRITE_INTERRUPT: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) fn set_root_write_interrupt(armed: bool) {
+    ROOT_WRITE_INTERRUPT.with(|interrupt| interrupt.set(armed));
 }
 
 #[cfg(test)]
@@ -60,6 +85,9 @@ impl Clone for RegionState {
 #[derive(Debug)]
 struct ContainerState {
     file: File,
+    generation: u64,
+    root_base: u64,
+    root_slot: RootSlot,
     sequence: u64,
     valid_len: u64,
     durable_len: u64,
@@ -67,6 +95,7 @@ struct ContainerState {
     last_commit_has_snapshot: bool,
     boundary_pending: bool,
     footer_pending: bool,
+    physical_tail: PhysicalTail,
     regions: BTreeMap<VolumeRegion, RegionState>,
 }
 
@@ -117,11 +146,31 @@ impl HostedFileVolume {
         hasher.update(payload);
         let checksum = *hasher.finalize().as_bytes();
 
-        // A footer occupies the old valid-end until the next append. Truncate
-        // it before writing the next ASTREG1 record; valid_len excludes it.
+        // A footer occupies the old valid-end until the next append. A
+        // generation root still names that footer, so write after it until a
+        // new root makes the replacement authority durable. Generation-0
+        // recovery uses the EOF/header scan and retains its truncate-and-tail
+        // behavior.
         state.footer_pending = true;
-        state.file.set_len(state.valid_len)?;
-        state.file.seek(SeekFrom::Start(state.valid_len))?;
+        let preserve_footer = state.generation > 0
+            && state.durable_len != 0
+            && state.physical_tail == PhysicalTail::TruncateToValid;
+        let append_at = if state.physical_tail == PhysicalTail::TruncateToValid {
+            if preserve_footer && state.valid_len == state.durable_len {
+                state
+                    .durable_len
+                    .checked_add(u64::try_from(recover::FOOTER_BYTES).unwrap_or(u64::MAX))
+                    .ok_or_else(|| io::Error::other("volume footer offset overflow"))?
+            } else if preserve_footer {
+                state.valid_len
+            } else {
+                state.file.set_len(state.valid_len)?;
+                state.valid_len
+            }
+        } else {
+            state.valid_len
+        };
+        state.file.seek(SeekFrom::Start(append_at))?;
         state.file.write_all(&RECORD_MAGIC)?;
         state.file.write_all(&total_len.to_le_bytes())?;
         state.file.write_all(&next_sequence.to_le_bytes())?;
@@ -131,15 +180,13 @@ impl HostedFileVolume {
         state.file.write_all(&payload_len.to_le_bytes())?;
         state.file.write_all(&checksum)?;
         state.file.write_all(name)?;
-        let physical_payload = state
-            .valid_len
+        let physical_payload = append_at
             .checked_add(u64::try_from(RECORD_FIXED_BYTES).unwrap_or(u64::MAX))
             .and_then(|value| value.checked_add(u64::from(name_len)))
             .ok_or_else(|| io::Error::other("volume physical offset overflow"))?;
         state.file.write_all(payload)?;
         state.boundary_pending = false;
-        state.valid_len = state
-            .valid_len
+        state.valid_len = append_at
             .checked_add(total_len)
             .ok_or_else(|| io::Error::other("volume length overflow"))?;
         state.sequence = next_sequence;
@@ -179,8 +226,77 @@ impl HostedFileVolume {
             )?;
         }
         state.file.sync_all()?;
+        if state.generation > 0 {
+            // Republish the sibling first: a tear while updating the selected
+            // slot still leaves one checksummed root naming either the old or
+            // the new authority.
+            let selected_slot = state.root_slot == RootSlot::Second;
+            recover::write_root_pointer(
+                &mut state.file,
+                state.generation,
+                state.root_base,
+                state.durable_len,
+                !selected_slot,
+            )?;
+            state.file.sync_all()?;
+            #[cfg(test)]
+            if ROOT_WRITE_INTERRUPT.with(Cell::get) {
+                ROOT_WRITE_INTERRUPT.with(|armed| armed.set(false));
+                return Err(io::Error::other("interrupted after sibling root write"));
+            }
+            recover::write_root_pointer(
+                &mut state.file,
+                state.generation,
+                state.root_base,
+                state.durable_len,
+                selected_slot,
+            )?;
+            state.file.sync_all()?;
+            recover::write_root_pointer(
+                &mut state.file,
+                state.generation,
+                state.root_base,
+                state.durable_len,
+                true,
+            )?;
+            state.file.sync_all()?;
+            state.root_slot = RootSlot::Second;
+        }
         state.boundary_pending = false;
         state.footer_pending = false;
+        Ok(())
+    }
+
+    /// Publish a compact replacement through the inode-stable volume root.
+    ///
+    /// This is the prerelease same-inode shrink primitive. The released
+    /// [`AstridVolume::reclaim`] path remains the generic namespace swap.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O, durability, or volume-generation error.
+    pub fn reclaim_same_inode(&self) -> io::Result<()> {
+        reclaim::reclaim_same_inode(self)
+    }
+
+    #[cfg(test)]
+    fn detach_after_uncommitted_write_for_test(
+        &self,
+        region: &VolumeRegion,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        self.write_region_at(region, 0, bytes)?;
+        let mut state = self.state.lock();
+        let old = std::mem::replace(&mut state.file, tempfile::tempfile()?);
+        fs2::FileExt::unlock(&old)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn detach_for_test(&self) -> io::Result<()> {
+        let mut state = self.state.lock();
+        let old = std::mem::replace(&mut state.file, tempfile::tempfile()?);
+        fs2::FileExt::unlock(&old)?;
         Ok(())
     }
 }
@@ -657,3 +773,6 @@ pub(crate) use stream::write_record_payloads;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod root_tests;

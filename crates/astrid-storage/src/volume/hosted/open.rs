@@ -1,7 +1,7 @@
 //! Serialized open and reclaim coordination for hosted volume containers.
 
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock, Weak};
@@ -9,9 +9,53 @@ use std::sync::{Arc, OnceLock, RwLock, Weak};
 use fs2::FileExt as _;
 use parking_lot::{Mutex, MutexGuard};
 
-use super::{ContainerState, HostedFileVolume, VOLUME_MAGIC, reclaim, recover};
+use super::{
+    ContainerState, HostedFileVolume, PhysicalTail, RootSlot, VOLUME_MAGIC, reclaim, recover,
+};
 
 type SharedOpenReclaimLock = Mutex<()>;
+
+fn recover_volume_file(file: &mut File) -> io::Result<super::recover::Recovery> {
+    let length = file.metadata()?.len();
+    if length > 0 && length < VOLUME_MAGIC.len() as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid Astrid volume header",
+        ));
+    }
+    if length >= VOLUME_MAGIC.len() as u64 {
+        let mut magic = [0_u8; VOLUME_MAGIC.len()];
+        file.read_exact(&mut magic)?;
+        if magic != VOLUME_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Astrid volume header",
+            ));
+        }
+    }
+    if length == 0 {
+        file.write_all(&VOLUME_MAGIC)?;
+        file.sync_all()?;
+    }
+    let recovery = recover::recover_container(file)?;
+    if recovery.generation > 0 || recovery.footer_present {
+        let physical_len = file.metadata()?.len();
+        if physical_len < recovery.authority_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Astrid volume root authority is truncated",
+            ));
+        }
+        if physical_len > recovery.authority_len {
+            file.set_len(recovery.authority_len)?;
+            file.sync_all()?;
+        }
+    } else if file.metadata()?.len() != recovery.valid_len {
+        file.set_len(recovery.valid_len)?;
+        file.sync_all()?;
+    }
+    Ok(recovery)
+}
 
 static OPEN_LOCKS: OnceLock<RwLock<BTreeMap<PathBuf, Weak<SharedOpenReclaimLock>>>> =
     OnceLock::new();
@@ -100,28 +144,17 @@ impl HostedFileVolume {
                 error
             }
         })?;
-        let length = file.metadata()?.len();
-        if length == 0 {
-            file.write_all(&VOLUME_MAGIC)?;
-            file.sync_all()?;
-        } else {
-            let mut magic = [0_u8; VOLUME_MAGIC.len()];
-            file.read_exact(&mut magic)?;
-            if magic != VOLUME_MAGIC {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid Astrid volume header",
-                ));
-            }
-        }
-        let recovery = recover::recover_container(&mut file)?;
-        if file.metadata()?.len() != recovery.valid_len && !recovery.footer_present {
-            file.set_len(recovery.valid_len)?;
-            file.sync_all()?;
-        }
+        let recovery = recover_volume_file(&mut file)?;
         let footer_pending = !recovery.footer_present;
         let mut state = ContainerState {
             file,
+            generation: recovery.generation,
+            root_base: recovery.root_base,
+            root_slot: if recovery.pointer_slot {
+                RootSlot::Second
+            } else {
+                RootSlot::First
+            },
             sequence: recovery.sequence,
             valid_len: recovery.valid_len,
             durable_len: recovery.durable_len,
@@ -129,12 +162,18 @@ impl HostedFileVolume {
             last_commit_has_snapshot: recovery.last_commit_has_snapshot,
             boundary_pending: false,
             footer_pending,
+            physical_tail: PhysicalTail::TruncateToValid,
             regions: recovery.regions,
         };
         if footer_pending {
             // A header-only recovery is immediately upgraded so the next boot
             // can use the footer even when no caller performs an explicit sync.
-            HostedFileVolume::make_durable(&mut state)?;
+            if recovery.generation > 0 {
+                state.footer_pending = false;
+                state.boundary_pending = false;
+            } else {
+                HostedFileVolume::make_durable(&mut state)?;
+            }
         }
         drop(swap_guard);
         Ok(Arc::new(Self {
