@@ -417,6 +417,12 @@ async fn run_public_service() -> Result<()> {
             return Err(error);
         },
     };
+    let stderr_sink = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .context("open detached FUSE stderr sink")?;
+    nix::unistd::dup2_stderr(&stderr_sink).context("hand off detached FUSE stderr sink")?;
+    drop(stderr_sink);
     let startup = ServiceStartup::Ready {
         mount_id: lease.mount_id,
         pid: std::process::id(),
@@ -427,12 +433,6 @@ async fn run_public_service() -> Result<()> {
     stdout.write_all(&startup_bytes)?;
     stdout.write_all(b"\n")?;
     stdout.flush()?;
-    let stderr_sink = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/null")
-        .context("open detached FUSE stderr sink")?;
-    nix::unistd::dup2_stderr(&stderr_sink).context("hand off detached FUSE stderr sink")?;
-    drop(stderr_sink);
 
     let result = service_loop(&listener, &launch, &mut session).await;
     cleanup_service_artifacts(
