@@ -4043,6 +4043,8 @@ fn seed_test_migration_ledger(home: &astrid_core::dirs::AstridHome) {
     };
     let mut bytes = serde_json::to_vec(&ledger).expect("test kernel: encode migration ledger");
     bytes.push(b'\n');
+    astrid_core::platform_fs::ensure_private_directory(&home.migrations_dir())
+        .expect("test kernel: create migration ledger directory");
     astrid_core::platform_fs::atomic_write_private_file(
         &home.migrations_dir().join("layout-v2-components.complete"),
         &bytes,
