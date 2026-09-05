@@ -129,6 +129,9 @@ fn sign_archive_with_runtime_key_in_home(
     #[cfg(windows)]
     home.ensure()
         .context("failed to provision private Astrid home for capsule signing")?;
+    #[cfg(windows)]
+    astrid_core::platform_fs::ensure_private_directory(&home.keys_dir())
+        .context("failed to provision private runtime-signing key directory")?;
 
     let key_path = home.runtime_key_path();
     let keypair = astrid_crypto::load_or_generate_keypair(&key_path)
