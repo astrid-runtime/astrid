@@ -40,6 +40,17 @@ plutil -lint \
   native/macos/AstridFSKit/AstridFSAppEx/AstridFSAppEx.entitlements \
   native/macos/AstridFSKit/AstridFS/AstridFS.entitlements
 
+# FSKit discovery requires a named personality, not just valid plist syntax.
+EXTENSION_INFO=native/macos/AstridFSKit/AstridFSAppEx/Info.plist
+[[ "$(plutil -extract EXAppExtensionAttributes.FSPersonalities.AstridFS.FSName raw -expect string "$EXTENSION_INFO")" == Astrid ]]
+
+METADATA_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/astrid-fskit-metadata.XXXXXX")"
+trap 'rm -f "$METADATA_TEST_DIR/metadata-tests"; rmdir "$METADATA_TEST_DIR"' EXIT
+swiftc -sdk "$SDK_PATH" -parse-as-library \
+  native/macos/AstridFSKit/AstridFSAppEx/AstridFSItem.swift \
+  scripts/test_macos_fskit_metadata.swift -o "$METADATA_TEST_DIR/metadata-tests"
+"$METADATA_TEST_DIR/metadata-tests"
+
 APP_SOURCE=native/macos/AstridFSKit/AstridFS/AstridFSApp.swift
 PROJECT=native/macos/AstridFSKit/AstridFS.xcodeproj/project.pbxproj
 [[ ! -e native/macos/AstridFSKit/AstridFS/ContentView.swift ]]

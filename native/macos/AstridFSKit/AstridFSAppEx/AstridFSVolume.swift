@@ -13,13 +13,15 @@ final class AstridFSVolume: FSVolume,
                             FSVolume.OpenCloseOperations {
     let client: AstridRPCClient
     let rootItem: AstridFSItem
+    let displayName: String
     private var itemCache: [String: AstridFSItem] = [:]
     private let itemCacheQueue = DispatchQueue(label: "org.astrid.runtime.fskit.items")
 
     init(client: AstridRPCClient) throws {
         self.client = client
+        self.displayName = try client.volumeInfo().volume_name
         self.rootItem = AstridFSItem(path: "", name: "", type: .directory, parent: nil)
-        super.init(volumeID: FSVolume.Identifier(uuid: UUID()), volumeName: FSFileName(string: "Astrid"))
+        super.init(volumeID: FSVolume.Identifier(uuid: UUID()), volumeName: FSFileName(string: displayName))
         self.itemCache[""] = rootItem
     }
 
@@ -41,7 +43,8 @@ final class AstridFSVolume: FSVolume,
     }
 
     func setVolumeName(_ name: FSFileName, replyHandler: @escaping (FSFileName?, (any Error)?) -> Void) {
-        replyHandler(FSFileName(string: "Astrid"), nil)
+        // Branding is operator config, not a Finder rename of the backend.
+        replyHandler(FSFileName(string: displayName), nil)
     }
 
     func preallocateSpace(

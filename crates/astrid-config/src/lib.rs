@@ -44,6 +44,8 @@ pub mod client;
 pub mod env;
 /// Configuration error types.
 pub mod error;
+/// Native filesystem presentation settings.
+pub mod filesystem;
 /// Configuration file discovery and loading.
 pub mod loader;
 /// Layered configuration merging with precedence.

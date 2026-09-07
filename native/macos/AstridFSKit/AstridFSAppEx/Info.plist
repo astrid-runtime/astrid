@@ -24,7 +24,13 @@
 		<key>FSMediaTypes</key>
 		<dict/>
 		<key>FSPersonalities</key>
-		<dict/>
+		<dict>
+			<key>AstridFS</key>
+			<dict>
+				<key>FSName</key>
+				<string>Astrid</string>
+			</dict>
+		</dict>
 		<key>FSRequiresSecurityScopedPathURLResources</key>
 		<true/>
 		<key>FSShortName</key>

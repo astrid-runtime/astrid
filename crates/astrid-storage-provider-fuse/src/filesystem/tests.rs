@@ -75,6 +75,7 @@ fn fake_operation(
     operation: StorageFilesystemOperationV1,
 ) -> Result<StorageFilesystemSuccessV1, StorageFilesystemFailureV1> {
     let result = match operation {
+        StorageFilesystemOperationV1::VolumeInfo => Err(failure_detail("unsupported", "fixture has no backing device")),
         StorageFilesystemOperationV1::Stat { path } => {
             if let Some(data) = state.files.get(&path) {
                 Ok(StorageFilesystemSuccessV1::Entry(entry(
@@ -203,6 +204,7 @@ fn failure_detail(code: &str, message: &str) -> StorageFilesystemFailureV1 {
 
 fn decode_operation(operation: StorageFilesystemOperationV2) -> StorageFilesystemOperationV1 {
     match operation {
+        StorageFilesystemOperationV2::VolumeInfo => StorageFilesystemOperationV1::VolumeInfo,
         StorageFilesystemOperationV2::Stat { path } => {
             StorageFilesystemOperationV1::Stat { path }
         },

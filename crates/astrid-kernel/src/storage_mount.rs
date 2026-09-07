@@ -38,7 +38,11 @@ use tokio::sync::watch;
 
 use crate::Kernel;
 
+mod admin_projection;
 mod filesystem;
+#[cfg(target_os = "macos")]
+use astrid_core::fskit_socket;
+mod volume_info;
 use filesystem::{CallbackFilesystem, PrefixedFilesystem, execute_blocking};
 #[cfg(any(unix, windows))]
 mod process_broker;
@@ -174,14 +178,20 @@ pub(crate) async fn issue_lease(
         .run_dir()
         .join("mounts")
         .join(mount_id.to_string());
-    astrid_core::platform_fs::ensure_private_directory(&resource_path)
-        .map_err(|error| format!("create private mount resource: {error}"))?;
     let (token, token_hash) = generate_lease_token()?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    let callback_path = if provider == "astrid-storage-provider-fskit" {
+        fskit_socket::callback_path(mount_id)?
+    } else {
+        resource_path.join("control.sock")
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
     let callback_path = resource_path.join("control.sock");
     #[cfg(not(unix))]
     let callback_path = resource_path.join("control.endpoint");
+    astrid_core::platform_fs::ensure_private_directory(&resource_path)
+        .map_err(|error| format!("create private mount resource: {error}"))?;
     let state = Arc::new(StorageMountLeaseState {
         mount_id,
         requested_by: caller,
@@ -605,6 +615,7 @@ fn decode_operation_v2(
     operation: StorageFilesystemOperationV2,
 ) -> io::Result<StorageFilesystemOperationV1> {
     Ok(match operation {
+        StorageFilesystemOperationV2::VolumeInfo => StorageFilesystemOperationV1::VolumeInfo,
         StorageFilesystemOperationV2::Stat { path } => StorageFilesystemOperationV1::Stat { path },
         StorageFilesystemOperationV2::ReadDirectory { path } => {
             StorageFilesystemOperationV1::ReadDirectory { path }
@@ -745,6 +756,9 @@ async fn execute_operation(
     state: &StorageMountLeaseState,
     operation: StorageFilesystemOperationV1,
 ) -> StorageFilesystemOutcomeV1 {
+    if matches!(&operation, StorageFilesystemOperationV1::VolumeInfo) {
+        return volume_info::read(kernel).await;
+    }
     let is_mutation = is_mutation(&operation);
     let is_sync = matches!(&operation, StorageFilesystemOperationV1::Sync);
     if is_mutation && state.access != StorageProviderAccessV1::ReadWrite {
@@ -769,10 +783,15 @@ async fn execute_operation(
     };
     let owner = state.owner;
     let target = state.target.clone();
+    let runtime_home = kernel.astrid_home.clone();
     let result = tokio::task::spawn_blocking(move || match target {
         StorageFilesystemTargetV1::OwnerRoot => {
             let filesystem = AstridFilesystem::new(store.content(), owner);
-            execute_blocking(&filesystem, operation)
+            if owner == StateOwner::System && is_mutation {
+                admin_projection::execute(&runtime_home, &store, operation)
+            } else {
+                execute_blocking(&filesystem, operation)
+            }
         },
         StorageFilesystemTargetV1::WorkspaceBranch { workspace } => {
             let branches = WorkspaceBranchStore::new(store.content());

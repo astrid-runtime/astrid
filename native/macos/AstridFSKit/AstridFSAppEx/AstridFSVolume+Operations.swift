@@ -6,12 +6,23 @@ See LICENSE.txt for the scaffold licensing information.
 import Darwin
 import Foundation
 import FSKit
+import OSLog
 
 extension AstridFSVolume: FSVolume.Operations {
     var volumeStatistics: FSStatFSResult {
         let result = FSStatFSResult(fileSystemTypeName: "astridfs")
-        result.blockSize = 4096
         result.ioSize = 4 * 1024 * 1024
+        do {
+            let info = try client.volumeInfo()
+            result.blockSize = Int(info.block_size)
+            result.totalBlocks = info.total_blocks
+            result.usedBlocks = info.total_blocks - min(info.total_blocks, info.free_blocks)
+            result.freeBlocks = info.free_blocks
+            result.availableBlocks = info.available_blocks
+        } catch {
+            // This FSKit getter has no error return. Do not invent capacity.
+            Logger.astridfs.error("Volume capacity query failed: \(String(describing: error), privacy: .public)")
+        }
         return result
     }
 
@@ -63,6 +74,13 @@ extension AstridFSVolume: FSVolume.Operations {
         wanted: FSItem.GetAttributesRequest?
     ) -> FSItem.Attributes {
         let result = FSItem.Attributes()
+        populateUnknownTimestamps(result, wanted: wanted)
+        // The mount root represents the hosted volume. Its dates come from
+        // that real file; do not invent creation dates for logical children.
+        if item.path.isEmpty, let info = try? client.volumeInfo() {
+            populateVolumeTimestamps(result, wanted: wanted,
+                created: info.created_secs, modified: info.modified_secs)
+        }
         if wanted?.isAttributeWanted(.uid) ?? true { result.uid = getuid() }
         if wanted?.isAttributeWanted(.gid) ?? true { result.gid = getgid() }
         if wanted?.isAttributeWanted(.mode) ?? true {
@@ -93,6 +111,7 @@ extension AstridFSVolume: FSVolume.Operations {
         do {
             if newAttributes.isValid(.size) {
                 try client.setLength(path: item.path, length: newAttributes.size)
+                newAttributes.consumedAttributes.insert(.size)
             }
             let entry = try client.stat(path: item.path)
             replyHandler(attributes(for: item, entry: entry, wanted: nil), nil)

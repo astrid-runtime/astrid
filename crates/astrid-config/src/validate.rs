@@ -15,6 +15,7 @@ use crate::types::Config;
 ///
 /// Returns the first validation error found.
 pub fn validate(config: &Config) -> ConfigResult<()> {
+    config.filesystem.validate()?;
     validate_budget(config)?;
     validate_workspace(config)?;
     validate_git(config)?;

@@ -29,11 +29,15 @@ final class AstridFileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
             return replyHandler(nil, POSIXError(.ENOTSUP))
         }
         guard urlResource.url.startAccessingSecurityScopedResource() else {
+            Logger.astridfs.error("Resource security-scope acquisition failed")
             return replyHandler(nil, POSIXError(.EACCES))
         }
+        Logger.astridfs.info("Resource security scope acquired; writable=\(urlResource.isWritable)")
         do {
             let client = try AstridRPCClient(resourcePath: urlResource.url.path)
+            Logger.astridfs.info("Resource lease decoded")
             _ = try client.stat(path: "")
+            Logger.astridfs.info("Resource root stat succeeded")
             resourcesLock.lock()
             let existing = resources[urlResource.url] != nil
             if !existing { resources[urlResource.url] = urlResource }
@@ -45,6 +49,8 @@ final class AstridFileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
             self.containerStatus = .ready
             replyHandler(try AstridFSVolume(client: client), nil)
         } catch {
+            let failure = error as NSError
+            Logger.astridfs.error("Resource load failed: \(failure.domain, privacy: .public) code=\(failure.code)")
             urlResource.url.stopAccessingSecurityScopedResource()
             replyHandler(nil, error)
         }
@@ -75,10 +81,18 @@ final class AstridFileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
         else {
             return replyHandler(nil, POSIXError(.ENODEV))
         }
-        let result = FSProbeResult.usable(
-            name: "Astrid",
-            containerID: FSContainerIdentifier(uuid: UUID())
-        )
-        replyHandler(result, nil)
+        guard urlResource.url.startAccessingSecurityScopedResource() else {
+            return replyHandler(nil, POSIXError(.EACCES))
+        }
+        defer { urlResource.url.stopAccessingSecurityScopedResource() }
+        do {
+            let info = try AstridRPCClient(resourcePath: urlResource.url.path).volumeInfo()
+            replyHandler(FSProbeResult.usable(
+                name: info.volume_name,
+                containerID: FSContainerIdentifier(uuid: UUID())
+            ), nil)
+        } catch {
+            replyHandler(nil, error)
+        }
     }
 }

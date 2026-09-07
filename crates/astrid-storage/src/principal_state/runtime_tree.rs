@@ -17,6 +17,8 @@ use super::{
 };
 
 use super::runtime_tree_active as active;
+mod projection;
+use projection::{confined_projection_path, write_projection_file};
 
 const VOLUME_PATH_PREFIX: &str = "volume";
 const SOCKET_PATH: &str = "run/system.sock";
@@ -257,13 +259,17 @@ pub(super) fn restore_projection(
         if is_excluded(name) || is_retired_legacy_projection(home, name) {
             continue;
         }
-        confined_projection_path(home.root(), name)?;
+        confined_projection_path(home.root(), name.strip_suffix('/').unwrap_or(name))?;
     }
     let mut written = Vec::new();
     let result = (|| -> StorageResult<()> {
         for entry in entries {
             let name = entry.name().as_str();
             if is_excluded(name) || is_retired_legacy_projection(home, name) {
+                continue;
+            }
+            if let Some(directory) = name.strip_suffix('/') {
+                projection::restore_directory(home.root(), directory, entry.logical_bytes())?;
                 continue;
             }
             let Some(bytes) = content
@@ -562,47 +568,6 @@ pub(super) fn pack_and_retire_projection(
     active::clear(store, home).map(|_| ())
 }
 
-fn confined_projection_path(root: &Path, relative: &str) -> StorageResult<PathBuf> {
-    let normalized = normalize_relative_path(relative);
-    let escaped = || {
-        tree_error(
-            root,
-            format!("projection name escaped runtime root: {relative}"),
-        )
-    };
-    if normalized.is_empty() || normalized.starts_with('/') || Path::new(relative).is_absolute() {
-        return Err(escaped());
-    }
-    let mut path = root.to_path_buf();
-    for segment in normalized.split('/') {
-        if segment.is_empty() || segment == "." || segment == ".." {
-            return Err(tree_error(
-                root,
-                format!("projection name has a non-normal path component: {relative}"),
-            ));
-        }
-        if segment.len() == 2 && segment.as_bytes()[1] == b':' {
-            return Err(escaped());
-        }
-        path.push(segment);
-    }
-    if !path.starts_with(root) {
-        return Err(escaped());
-    }
-    Ok(path)
-}
-
-fn write_projection_file(root: &Path, relative: &str, bytes: &[u8]) -> StorageResult<()> {
-    let path = confined_projection_path(root, relative)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| tree_error(&path, "projection path has no parent".to_owned()))?;
-    super::native_io::ensure_private_directory(parent)?;
-    astrid_core::platform_fs::atomic_write_private_file(&path, bytes)
-        .map_err(|error| tree_error(&path, format!("project volume-backed file: {error}")))?;
-    Ok(())
-}
-
 fn is_staging_generation(name: &str) -> bool {
     name.strip_prefix("var/content-staging/generations/")
         .is_some_and(|name| name.ends_with(".sealed"))
@@ -724,7 +689,8 @@ fn publish_active_projection(
         .map(RuntimeTreeEntry::name)
         .cloned()
         .collect::<Vec<_>>();
-    let removals = active::removals(&receipt, &surviving)?;
+    let mut removals = active::removals(&receipt, &surviving)?;
+    removals.retain(|name| !projection::surviving_directory(home.root(), name.as_str()));
     let receipt_entries = scanned
         .iter()
         .map(|entry| (entry.name().clone(), entry.logical_bytes()))

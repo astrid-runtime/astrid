@@ -31,6 +31,8 @@ pub mod local_transport;
 pub mod net;
 // Cross-crate filesystem plumbing. Public only because workspace crates are
 // separate Rust packages; this is not a supported external API.
+#[cfg(target_os = "macos")]
+pub mod fskit_socket;
 #[doc(hidden)]
 pub mod platform_fs;
 pub mod principal;
