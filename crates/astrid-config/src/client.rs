@@ -16,10 +16,16 @@ pub const DEFAULT_RUN_IDLE_TIMEOUT_SECS: u64 = 120;
 /// The only timeout ceiling shared by the client parser and CLI argument parser.
 pub const MAX_RUN_IDLE_TIMEOUT_SECS: u64 = 86_400;
 
+/// Historical admin response deadline when neither file nor environment sets it.
+pub const DEFAULT_ADMIN_TIMEOUT_SECS: u64 = 15;
+
+/// Bounded client wait; this does not change the daemon's operation budget.
+pub const MAX_ADMIN_TIMEOUT_SECS: u64 = 600;
+
 /// Explicit client-file override selected by the operator or launcher.
 const CLIENT_CONFIG_PATH_VAR: &str = "ASTRID_CLIENT_CONFIG_PATH";
 
-/// Bound the narrow file even though it can contain only one key.
+/// Bound the narrow client-only configuration file.
 const MAX_CLIENT_CONFIG_FILE_SIZE: u64 = 1024 * 1024;
 
 /// Pre-mount behavior for Astrid CLI clients.
@@ -28,12 +34,16 @@ const MAX_CLIENT_CONFIG_FILE_SIZE: u64 = 1024 * 1024;
 pub struct ClientConfig {
     /// Seconds `astrid run` may wait for its next active-run message.
     pub run_idle_secs: u64,
+    /// Admin response deadline. When absent, `ASTRID_ADMIN_TIMEOUT_SECS` is
+    /// a fallback, followed by the historical 15-second default.
+    pub admin_timeout_secs: Option<u64>,
 }
 
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             run_idle_secs: DEFAULT_RUN_IDLE_TIMEOUT_SECS,
+            admin_timeout_secs: None,
         }
     }
 }
@@ -150,7 +160,56 @@ pub fn load_client_config(path: &Path) -> ConfigResult<ClientConfig> {
             source: error,
         })?;
     validate_run_idle_secs(config.run_idle_secs)?;
+    if let Some(seconds) = config.admin_timeout_secs {
+        validate_admin_timeout_secs(seconds)?;
+    }
     Ok(config)
+}
+
+/// Resolve an admin response deadline from client configuration, then environment.
+///
+/// Invalid environment values retain the historical default. Explicit file values
+/// take precedence and fail validation rather than silently being ignored.
+/// Runtime configuration is never read, so this works before mounting storage.
+///
+/// # Errors
+/// Returns an error if the selected client file is missing, unsafe, or invalid.
+pub fn resolve_admin_timeout(
+    client_path: Option<&Path>,
+    environment: Option<&str>,
+) -> ConfigResult<u64> {
+    if let Some(path) = client_path
+        && let Some(seconds) = load_client_config(path)?.admin_timeout_secs
+    {
+        return Ok(seconds);
+    }
+    Ok(environment
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| (1..=MAX_ADMIN_TIMEOUT_SECS).contains(seconds))
+        .unwrap_or(DEFAULT_ADMIN_TIMEOUT_SECS))
+}
+
+/// Resolve the production admin deadline using the same pre-mount client file
+/// as `astrid run`, with `ASTRID_ADMIN_TIMEOUT_SECS` as a fallback.
+///
+/// # Errors
+/// See [`production_client_config_path`] and [`resolve_admin_timeout`].
+pub fn production_admin_timeout() -> ConfigResult<u64> {
+    let path = production_client_config_path()?;
+    resolve_admin_timeout(
+        path.as_deref(),
+        std::env::var("ASTRID_ADMIN_TIMEOUT_SECS").ok().as_deref(),
+    )
+}
+
+fn validate_admin_timeout_secs(seconds: u64) -> ConfigResult<()> {
+    if !(1..=MAX_ADMIN_TIMEOUT_SECS).contains(&seconds) {
+        return Err(ConfigError::ValidationError {
+            field: "admin_timeout_secs".to_owned(),
+            message: format!("must be between 1 and {MAX_ADMIN_TIMEOUT_SECS} seconds"),
+        });
+    }
+    Ok(())
 }
 
 /// Load the run idle timeout from one client file.

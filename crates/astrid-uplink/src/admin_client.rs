@@ -33,24 +33,6 @@ use uuid::Uuid;
 
 use crate::socket_client::SocketClient;
 
-/// Fallback timeout for the response read loop. Generous because admin
-/// writes can block on the kernel write lock.
-const DEFAULT_TIMEOUT_SECS: u64 = 15;
-
-/// Response timeout honoring `ASTRID_ADMIN_TIMEOUT_SECS`. Slower libc
-/// targets (musl) and heavily loaded kernels can exceed a fixed 15s on
-/// env writes; operators and CI may raise the ceiling without patching.
-fn admin_timeout() -> Duration {
-    admin_timeout_from_value(std::env::var("ASTRID_ADMIN_TIMEOUT_SECS").ok().as_deref())
-}
-
-fn admin_timeout_from_value(value: Option<&str>) -> Duration {
-    let configured = value
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|seconds| (1..=600).contains(seconds));
-    Duration::from_secs(configured.unwrap_or(DEFAULT_TIMEOUT_SECS))
-}
-
 /// Stable wire-name suffix for an [`AdminRequestKind`].
 ///
 /// Mirrors `admin_request_method` on the kernel side — the suffix is
@@ -130,8 +112,9 @@ impl AdminClient {
     ///
     /// # Errors
     /// Returns an error if the socket file is missing (no daemon),
-    /// connection fails, or the handshake is rejected.
+    /// connection fails, the handshake is rejected, or client configuration is invalid.
     pub async fn connect(caller: PrincipalId) -> Result<Self> {
+        let timeout = Duration::from_secs(astrid_config::client::production_admin_timeout()?);
         let session_id = astrid_core::SessionId::from_uuid(Uuid::new_v4());
         let inner = SocketClient::connect(session_id, caller.clone())
             .await
@@ -139,7 +122,7 @@ impl AdminClient {
         Ok(Self {
             inner,
             caller,
-            timeout: admin_timeout(),
+            timeout,
         })
     }
 
@@ -311,36 +294,6 @@ pub fn into_result(body: AdminResponseBody) -> Result<AdminResponseBody> {
 mod tests {
     use super::*;
     use astrid_core::PrincipalId;
-
-    #[test]
-    fn admin_timeout_accepts_configured_seconds_including_boundaries() {
-        for seconds in [1, 15, 60, 600] {
-            assert_eq!(
-                admin_timeout_from_value(Some(&seconds.to_string())),
-                Duration::from_secs(seconds)
-            );
-        }
-    }
-
-    #[test]
-    fn admin_timeout_defaults_for_missing_invalid_and_out_of_range_values() {
-        for value in [
-            None,
-            Some(""),
-            Some("0"),
-            Some("601"),
-            Some("-1"),
-            Some("1.5"),
-            Some("invalid"),
-            Some("18446744073709551616"),
-        ] {
-            assert_eq!(
-                admin_timeout_from_value(value),
-                Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-                "unexpected timeout for {value:?}"
-            );
-        }
-    }
 
     #[test]
     fn topic_suffixes_match_kernel_constants() {

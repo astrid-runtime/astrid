@@ -64,6 +64,26 @@ Post-merge validation checks: budget invariants (per-action cannot exceed sessio
 
 ## Development
 
+### Pre-mount client timeouts
+
+Client deadlines are separate from daemon/runtime policy and remain available
+when the runtime is stopped. The existing private client file is
+`~/.aos/etc/astrid/client.toml`, or an absolute path selected with
+`ASTRID_CLIENT_CONFIG_PATH`:
+
+```toml
+run_idle_secs = 120
+admin_timeout_secs = 60
+```
+
+`admin_timeout_secs` accepts 1–600 seconds. An explicit file value wins;
+`ASTRID_ADMIN_TIMEOUT_SECS` supplies a fallback when the key is absent, then
+the default is 15 seconds. Invalid environment values use the default; invalid
+file values report an error. Existing files containing only `run_idle_secs`
+continue to work. The uplink's explicit `with_timeout` API can override the
+resolved deadline. This changes how long the client waits, not the daemon's
+execution budget. The setting is not part of layered runtime `config show`.
+
 ```bash
 cargo test -p astrid-config
 ```

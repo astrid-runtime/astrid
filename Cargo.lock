@@ -947,6 +947,7 @@ name = "astrid-uplink"
 version = "2026.9.0"
 dependencies = [
  "anyhow",
+ "astrid-config",
  "astrid-core",
  "astrid-crypto",
  "astrid-events",
