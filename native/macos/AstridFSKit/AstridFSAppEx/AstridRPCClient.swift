@@ -5,6 +5,7 @@ See LICENSE.txt for the scaffold licensing information.
 
 import Darwin
 import Foundation
+import OSLog
 
 struct AstridLease: Decodable {
     let mount_id: String
@@ -139,7 +140,11 @@ final class AstridRPCClient {
 
     private func connectSocket() throws -> Int32 {
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard descriptor >= 0 else { throw currentPOSIXError() }
+        guard descriptor >= 0 else {
+            let error = currentPOSIXError()
+            Logger.astridfs.error("Callback socket creation failed errno=\(error.code.rawValue)")
+            throw error
+        }
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         let pathBytes = Array(socketPath.utf8CString)
@@ -162,6 +167,7 @@ final class AstridRPCClient {
         }
         guard result == 0 else {
             let error = currentPOSIXError()
+            Logger.astridfs.error("Callback socket connection failed errno=\(error.code.rawValue)")
             Darwin.close(descriptor)
             throw error
         }

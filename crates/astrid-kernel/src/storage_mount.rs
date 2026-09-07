@@ -39,6 +39,8 @@ use tokio::sync::watch;
 use crate::Kernel;
 
 mod filesystem;
+#[cfg(target_os = "macos")]
+mod fskit_socket;
 use filesystem::{CallbackFilesystem, PrefixedFilesystem, execute_blocking};
 #[cfg(any(unix, windows))]
 mod process_broker;
@@ -174,14 +176,20 @@ pub(crate) async fn issue_lease(
         .run_dir()
         .join("mounts")
         .join(mount_id.to_string());
-    astrid_core::platform_fs::ensure_private_directory(&resource_path)
-        .map_err(|error| format!("create private mount resource: {error}"))?;
     let (token, token_hash) = generate_lease_token()?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
+    let callback_path = if provider == "astrid-storage-provider-fskit" {
+        fskit_socket::callback_path(mount_id)?
+    } else {
+        resource_path.join("control.sock")
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
     let callback_path = resource_path.join("control.sock");
     #[cfg(not(unix))]
     let callback_path = resource_path.join("control.endpoint");
+    astrid_core::platform_fs::ensure_private_directory(&resource_path)
+        .map_err(|error| format!("create private mount resource: {error}"))?;
     let state = Arc::new(StorageMountLeaseState {
         mount_id,
         requested_by: caller,

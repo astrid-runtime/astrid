@@ -40,6 +40,10 @@ plutil -lint \
   native/macos/AstridFSKit/AstridFSAppEx/AstridFSAppEx.entitlements \
   native/macos/AstridFSKit/AstridFS/AstridFS.entitlements
 
+# FSKit discovery requires a named personality, not just valid plist syntax.
+EXTENSION_INFO=native/macos/AstridFSKit/AstridFSAppEx/Info.plist
+[[ "$(plutil -extract EXAppExtensionAttributes.FSPersonalities.AstridFS.FSName raw -expect string "$EXTENSION_INFO")" == Astrid ]]
+
 APP_SOURCE=native/macos/AstridFSKit/AstridFS/AstridFSApp.swift
 PROJECT=native/macos/AstridFSKit/AstridFS.xcodeproj/project.pbxproj
 [[ ! -e native/macos/AstridFSKit/AstridFS/ContentView.swift ]]
