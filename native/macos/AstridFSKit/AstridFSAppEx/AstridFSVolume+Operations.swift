@@ -16,6 +16,7 @@ extension AstridFSVolume: FSVolume.Operations {
             let info = try client.volumeInfo()
             result.blockSize = Int(info.block_size)
             result.totalBlocks = info.total_blocks
+            result.usedBlocks = info.total_blocks - min(info.total_blocks, info.free_blocks)
             result.freeBlocks = info.free_blocks
             result.availableBlocks = info.available_blocks
         } catch {
@@ -74,6 +75,12 @@ extension AstridFSVolume: FSVolume.Operations {
     ) -> FSItem.Attributes {
         let result = FSItem.Attributes()
         populateUnknownTimestamps(result, wanted: wanted)
+        // The mount root represents the hosted volume. Its dates come from
+        // that real file; do not invent creation dates for logical children.
+        if item.path.isEmpty, let info = try? client.volumeInfo() {
+            populateVolumeTimestamps(result, wanted: wanted,
+                created: info.created_secs, modified: info.modified_secs)
+        }
         if wanted?.isAttributeWanted(.uid) ?? true { result.uid = getuid() }
         if wanted?.isAttributeWanted(.gid) ?? true { result.gid = getgid() }
         if wanted?.isAttributeWanted(.mode) ?? true {

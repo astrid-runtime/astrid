@@ -45,3 +45,16 @@ func populateUnknownTimestamps(_ attributes: FSItem.Attributes, wanted: FSItem.G
     if wanted?.isAttributeWanted(.backupTime) ?? true { attributes.backupTime = unknown }
     if wanted?.isAttributeWanted(.addedTime) ?? true { attributes.addedTime = unknown }
 }
+
+func populateVolumeTimestamps(_ attributes: FSItem.Attributes,
+                              wanted: FSItem.GetAttributesRequest?,
+                              created: UInt64?, modified: UInt64?) {
+    if wanted?.isAttributeWanted(.birthTime) ?? true,
+       let seconds = created, let value = Int(exactly: seconds) {
+        attributes.birthTime = timespec(tv_sec: value, tv_nsec: 0)
+    }
+    if wanted?.isAttributeWanted(.modifyTime) ?? true,
+       let seconds = modified, let value = Int(exactly: seconds) {
+        attributes.modifyTime = timespec(tv_sec: value, tv_nsec: 0)
+    }
+}

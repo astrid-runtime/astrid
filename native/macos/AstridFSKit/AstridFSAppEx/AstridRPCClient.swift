@@ -26,6 +26,8 @@ struct AstridVolumeInfo: Decodable {
     let total_blocks: UInt64
     let free_blocks: UInt64
     let available_blocks: UInt64
+    let created_secs: UInt64?
+    let modified_secs: UInt64?
 }
 
 enum AstridRPCSuccess {
