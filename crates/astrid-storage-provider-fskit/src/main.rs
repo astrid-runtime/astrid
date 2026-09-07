@@ -960,7 +960,8 @@ mod tests {
             .expect("live lease manifest is valid");
         assert_eq!(lease.mount_id, expected_mount_id, "stale mount identity");
         assert_eq!(lease.resource_path, resource, "stale lease resource");
-        assert_eq!(lease.callback_path, resource.join("control.sock"));
+        astrid_core::fskit_socket::validate_callback_path(lease.mount_id, &lease.callback_path)
+            .expect("live callback must be the private managed container endpoint");
         assert_eq!(lease.lease_token, token, "stale lease callback token");
         assert!(
             !lease.callback_path.as_os_str().is_empty() && lease.callback_path.is_absolute(),

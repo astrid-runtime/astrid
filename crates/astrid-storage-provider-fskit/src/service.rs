@@ -153,8 +153,11 @@ fn validate_lease(lease: &astrid_core::storage_filesystem::StorageMountLeaseV1) 
     if !lease.resource_path.is_absolute() || !lease.callback_path.is_absolute() {
         bail!("FSKit lease paths must be absolute");
     }
-    let expected_callback = lease.resource_path.join("control.sock");
-    if lease.callback_path != expected_callback {
+    #[cfg(target_os = "macos")]
+    astrid_core::fskit_socket::validate_callback_path(lease.mount_id, &lease.callback_path)
+        .map_err(anyhow::Error::msg)?;
+    #[cfg(not(target_os = "macos"))]
+    if lease.callback_path != lease.resource_path.join("control.sock") {
         bail!("FSKit callback path is not the kernel lease endpoint");
     }
     platform_fs::validate_private_directory(&lease.resource_path)
@@ -416,6 +419,19 @@ fn validate_launch_parent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires an explicit disposable live FSKit lease manifest"]
+    fn live_managed_callback_lease_is_accepted() {
+        let path = std::env::var("ASTRID_FSKIT_TEST_LEASE_MANIFEST").expect("explicit QA manifest");
+        let bytes = std::fs::read(path).expect("read QA manifest");
+        let lease = serde_json::from_slice(&bytes).expect("decode QA lease");
+        validate_lease(&lease).expect("accept managed live callback");
+        let mut stale = lease.clone();
+        stale.callback_path = stale.resource_path.join("control.sock");
+        assert!(validate_lease(&stale).is_err());
+    }
 
     #[test]
     fn control_request_rejects_unknown_fields() {

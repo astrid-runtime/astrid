@@ -4,7 +4,7 @@
 //! resource directory (which can be on a different device). Available capacity
 //! is an observation, not a reservation; normal owner quotas still govern writes.
 
-use super::*;
+use super::{Kernel, StorageFilesystemOutcomeV1, StorageFilesystemSuccessV1, failure, io};
 
 pub(super) async fn read(kernel: &Kernel) -> StorageFilesystemOutcomeV1 {
     let home = kernel.astrid_home.clone();

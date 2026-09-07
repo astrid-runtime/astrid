@@ -41,7 +41,7 @@ use crate::Kernel;
 mod admin_projection;
 mod filesystem;
 #[cfg(target_os = "macos")]
-mod fskit_socket;
+use astrid_core::fskit_socket;
 mod volume_info;
 use filesystem::{CallbackFilesystem, PrefixedFilesystem, execute_blocking};
 #[cfg(any(unix, windows))]
