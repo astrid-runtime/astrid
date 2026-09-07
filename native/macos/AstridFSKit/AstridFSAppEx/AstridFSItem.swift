@@ -32,3 +32,16 @@ func stableInode(_ path: String) -> UInt64 {
 func joinedPath(_ parent: AstridFSItem, _ name: String) -> String {
     parent.path.isEmpty ? name : "\(parent.path)/\(name)"
 }
+
+func populateUnknownTimestamps(_ attributes: FSItem.Attributes, wanted: FSItem.GetAttributesRequest?) {
+    // The logical filesystem does not expose timestamps. Report a stable unknown
+    // value, rather than omitting requested fields: getattrlist then returns
+    // EINVAL and Finder cannot resolve an otherwise readable mounted directory.
+    let unknown = timespec(tv_sec: 0, tv_nsec: 0)
+    if wanted?.isAttributeWanted(.birthTime) ?? true { attributes.birthTime = unknown }
+    if wanted?.isAttributeWanted(.modifyTime) ?? true { attributes.modifyTime = unknown }
+    if wanted?.isAttributeWanted(.changeTime) ?? true { attributes.changeTime = unknown }
+    if wanted?.isAttributeWanted(.accessTime) ?? true { attributes.accessTime = unknown }
+    if wanted?.isAttributeWanted(.backupTime) ?? true { attributes.backupTime = unknown }
+    if wanted?.isAttributeWanted(.addedTime) ?? true { attributes.addedTime = unknown }
+}

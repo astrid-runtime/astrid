@@ -63,6 +63,7 @@ extension AstridFSVolume: FSVolume.Operations {
         wanted: FSItem.GetAttributesRequest?
     ) -> FSItem.Attributes {
         let result = FSItem.Attributes()
+        populateUnknownTimestamps(result, wanted: wanted)
         if wanted?.isAttributeWanted(.uid) ?? true { result.uid = getuid() }
         if wanted?.isAttributeWanted(.gid) ?? true { result.gid = getgid() }
         if wanted?.isAttributeWanted(.mode) ?? true {
