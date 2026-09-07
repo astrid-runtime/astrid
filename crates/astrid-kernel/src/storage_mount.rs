@@ -38,9 +38,11 @@ use tokio::sync::watch;
 
 use crate::Kernel;
 
+mod admin_projection;
 mod filesystem;
 #[cfg(target_os = "macos")]
 mod fskit_socket;
+mod volume_info;
 use filesystem::{CallbackFilesystem, PrefixedFilesystem, execute_blocking};
 #[cfg(any(unix, windows))]
 mod process_broker;
@@ -613,6 +615,7 @@ fn decode_operation_v2(
     operation: StorageFilesystemOperationV2,
 ) -> io::Result<StorageFilesystemOperationV1> {
     Ok(match operation {
+        StorageFilesystemOperationV2::VolumeInfo => StorageFilesystemOperationV1::VolumeInfo,
         StorageFilesystemOperationV2::Stat { path } => StorageFilesystemOperationV1::Stat { path },
         StorageFilesystemOperationV2::ReadDirectory { path } => {
             StorageFilesystemOperationV1::ReadDirectory { path }
@@ -753,6 +756,9 @@ async fn execute_operation(
     state: &StorageMountLeaseState,
     operation: StorageFilesystemOperationV1,
 ) -> StorageFilesystemOutcomeV1 {
+    if matches!(&operation, StorageFilesystemOperationV1::VolumeInfo) {
+        return volume_info::read(kernel).await;
+    }
     let is_mutation = is_mutation(&operation);
     let is_sync = matches!(&operation, StorageFilesystemOperationV1::Sync);
     if is_mutation && state.access != StorageProviderAccessV1::ReadWrite {
@@ -777,10 +783,15 @@ async fn execute_operation(
     };
     let owner = state.owner;
     let target = state.target.clone();
+    let runtime_home = kernel.astrid_home.clone();
     let result = tokio::task::spawn_blocking(move || match target {
         StorageFilesystemTargetV1::OwnerRoot => {
             let filesystem = AstridFilesystem::new(store.content(), owner);
-            execute_blocking(&filesystem, operation)
+            if owner == StateOwner::System && is_mutation {
+                admin_projection::execute(&runtime_home, &store, operation)
+            } else {
+                execute_blocking(&filesystem, operation)
+            }
         },
         StorageFilesystemTargetV1::WorkspaceBranch { workspace } => {
             let branches = WorkspaceBranchStore::new(store.content());

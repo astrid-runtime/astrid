@@ -101,6 +101,7 @@ impl CallbackClient {
 
 fn encode_operation(operation: StorageFilesystemOperationV1) -> StorageFilesystemOperationV2 {
     match operation {
+        StorageFilesystemOperationV1::VolumeInfo => StorageFilesystemOperationV2::VolumeInfo,
         StorageFilesystemOperationV1::Stat { path } => StorageFilesystemOperationV2::Stat { path },
         StorageFilesystemOperationV1::ReadDirectory { path } => {
             StorageFilesystemOperationV2::ReadDirectory { path }

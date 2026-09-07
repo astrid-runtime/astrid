@@ -6,12 +6,22 @@ See LICENSE.txt for the scaffold licensing information.
 import Darwin
 import Foundation
 import FSKit
+import OSLog
 
 extension AstridFSVolume: FSVolume.Operations {
     var volumeStatistics: FSStatFSResult {
         let result = FSStatFSResult(fileSystemTypeName: "astridfs")
-        result.blockSize = 4096
         result.ioSize = 4 * 1024 * 1024
+        do {
+            let info = try client.volumeInfo()
+            result.blockSize = Int(info.block_size)
+            result.totalBlocks = info.total_blocks
+            result.freeBlocks = info.free_blocks
+            result.availableBlocks = info.available_blocks
+        } catch {
+            // This FSKit getter has no error return. Do not invent capacity.
+            Logger.astridfs.error("Volume capacity query failed: \(String(describing: error), privacy: .public)")
+        }
         return result
     }
 
@@ -94,6 +104,7 @@ extension AstridFSVolume: FSVolume.Operations {
         do {
             if newAttributes.isValid(.size) {
                 try client.setLength(path: item.path, length: newAttributes.size)
+                newAttributes.consumedAttributes.insert(.size)
             }
             let entry = try client.stat(path: item.path)
             replyHandler(attributes(for: item, entry: entry, wanted: nil), nil)

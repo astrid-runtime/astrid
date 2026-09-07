@@ -247,6 +247,9 @@ pub(super) fn execute_blocking(
     operation: StorageFilesystemOperationV1,
 ) -> Result<StorageFilesystemSuccessV1, FilesystemError> {
     match operation {
+        StorageFilesystemOperationV1::VolumeInfo => Err(FilesystemError::Staging(
+            "volume info requires the hosted backing store".to_owned(),
+        )),
         StorageFilesystemOperationV1::Stat { path } => {
             let path = FilesystemPath::new(path)?;
             Ok(StorageFilesystemSuccessV1::Entry(entry(

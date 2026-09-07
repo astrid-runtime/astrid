@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Native filesystem presentation, independent of provider identity.
+    pub filesystem: crate::filesystem::FilesystemSection,
     /// Runtime behaviour (context limits, summarisation).
     pub runtime: RuntimeSection,
     /// Signature requirements and approval timeout.

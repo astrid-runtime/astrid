@@ -81,10 +81,18 @@ final class AstridFileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
         else {
             return replyHandler(nil, POSIXError(.ENODEV))
         }
-        let result = FSProbeResult.usable(
-            name: "Astrid",
-            containerID: FSContainerIdentifier(uuid: UUID())
-        )
-        replyHandler(result, nil)
+        guard urlResource.url.startAccessingSecurityScopedResource() else {
+            return replyHandler(nil, POSIXError(.EACCES))
+        }
+        defer { urlResource.url.stopAccessingSecurityScopedResource() }
+        do {
+            let info = try AstridRPCClient(resourcePath: urlResource.url.path).volumeInfo()
+            replyHandler(FSProbeResult.usable(
+                name: info.volume_name,
+                containerID: FSContainerIdentifier(uuid: UUID())
+            ), nil)
+        } catch {
+            replyHandler(nil, error)
+        }
     }
 }

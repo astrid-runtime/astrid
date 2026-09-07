@@ -20,6 +20,14 @@ struct AstridEntry: Decodable {
     let logical_bytes: UInt64
 }
 
+struct AstridVolumeInfo: Decodable {
+    let volume_name: String
+    let block_size: UInt64
+    let total_blocks: UInt64
+    let free_blocks: UInt64
+    let available_blocks: UInt64
+}
+
 enum AstridRPCSuccess {
     case done
     case entry(AstridEntry)
@@ -49,6 +57,15 @@ final class AstridRPCClient {
             throw POSIXError(.EIO)
         }
         return value
+    }
+
+    func volumeInfo() throws -> AstridVolumeInfo {
+        guard case let .data(bytes) = try call(["operation": "volume-info"]) else {
+            throw POSIXError(.EIO)
+        }
+        let info = try JSONDecoder().decode(AstridVolumeInfo.self, from: bytes)
+        guard info.block_size > 0, info.block_size <= UInt64(Int.max), !info.volume_name.isEmpty else { throw POSIXError(.EIO) }
+        return info
     }
 
     func readDirectory(path: String) throws -> [AstridEntry] {

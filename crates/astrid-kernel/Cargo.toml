@@ -64,6 +64,7 @@ uuid = { workspace = true }
 # out of the `wasm32-unknown-unknown` browser host profile, which supplies its
 # own execution engine, VFS, and install path.
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+cap-std = "4.0.3"
 astrid-capsule-install = { workspace = true }
 astrid-mcp = { workspace = true }
 astrid-vfs = { workspace = true }

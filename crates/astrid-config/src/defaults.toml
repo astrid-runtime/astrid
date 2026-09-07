@@ -15,6 +15,10 @@
 # ============================================================================
 # Controls the agent runtime behavior, context management, and system prompts.
 
+[filesystem]
+# Display label only; does not change provider identity or access control.
+volume_name = "Astrid"
+
 [runtime]
 # Maximum context window size in tokens (soft limit for summarization)
 max_context_tokens = 100000

@@ -223,6 +223,10 @@ pub struct StorageFilesystemEntryV1 {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case", tag = "operation")]
 pub enum StorageFilesystemOperationV1 {
+    /// Read volume presentation and current backing capacity as JSON Data.
+    /// The object contains `volume_name`, `block_size`, `total_blocks`, `free_blocks`,
+    /// and `available_blocks`. Capacity is physical, not a quota reservation.
+    VolumeInfo,
     /// Inspect a relative path. The empty string is the root.
     Stat {
         /// Canonical slash-separated relative path.
@@ -301,6 +305,9 @@ pub struct StorageFilesystemRequestV1 {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case", tag = "operation")]
 pub enum StorageFilesystemOperationV2 {
+    /// Read volume presentation and backing capacity as base64-encoded JSON Data.
+    /// Uses the same fields as the version-one `VolumeInfo` operation.
+    VolumeInfo,
     /// Inspect a relative path. The empty string is the root.
     Stat {
         /// Canonical slash-separated relative path.

@@ -206,6 +206,7 @@ fn decode_fake_operation(
     operation: StorageFilesystemOperationV2,
 ) -> Result<StorageFilesystemOperationV1, (String, String)> {
     Ok(match operation {
+        StorageFilesystemOperationV2::VolumeInfo => StorageFilesystemOperationV1::VolumeInfo,
         StorageFilesystemOperationV2::Stat { path } => StorageFilesystemOperationV1::Stat { path },
         StorageFilesystemOperationV2::ReadDirectory { path } => {
             StorageFilesystemOperationV1::ReadDirectory { path }
@@ -268,6 +269,10 @@ fn fake_apply(
         .lock()
         .map_err(|_| ("internal".to_owned(), "test state poisoned".to_owned()))?;
     match operation {
+        StorageFilesystemOperationV1::VolumeInfo => Err((
+            "unsupported".to_owned(),
+            "fixture has no backing device".to_owned(),
+        )),
         StorageFilesystemOperationV1::Stat { path } => {
             if path.is_empty() {
                 return Ok(StorageFilesystemSuccessV1::Entry(fake_entry(
