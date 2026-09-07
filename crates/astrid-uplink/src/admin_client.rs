@@ -33,10 +33,6 @@ use uuid::Uuid;
 
 use crate::socket_client::SocketClient;
 
-/// Default timeout for the response read loop. Generous because admin
-/// writes can block on the kernel write lock.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
-
 /// Stable wire-name suffix for an [`AdminRequestKind`].
 ///
 /// Mirrors `admin_request_method` on the kernel side — the suffix is
@@ -116,8 +112,9 @@ impl AdminClient {
     ///
     /// # Errors
     /// Returns an error if the socket file is missing (no daemon),
-    /// connection fails, or the handshake is rejected.
+    /// connection fails, the handshake is rejected, or client configuration is invalid.
     pub async fn connect(caller: PrincipalId) -> Result<Self> {
+        let timeout = Duration::from_secs(astrid_config::client::production_admin_timeout()?);
         let session_id = astrid_core::SessionId::from_uuid(Uuid::new_v4());
         let inner = SocketClient::connect(session_id, caller.clone())
             .await
@@ -125,7 +122,7 @@ impl AdminClient {
         Ok(Self {
             inner,
             caller,
-            timeout: DEFAULT_TIMEOUT,
+            timeout,
         })
     }
 

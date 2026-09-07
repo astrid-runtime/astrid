@@ -107,3 +107,66 @@ fn resolution_preserves_cli_precedence_and_absent_file_default() {
     );
     assert_eq!(resolve_run_idle_timeout(None, None).unwrap(), 120);
 }
+
+#[test]
+fn admin_timeout_environment_bounds_and_default() {
+    for seconds in [1, 15, 60, 600] {
+        assert_eq!(
+            resolve_admin_timeout(None, Some(&seconds.to_string())).unwrap(),
+            seconds
+        );
+    }
+    for value in [
+        None,
+        Some(""),
+        Some("0"),
+        Some("601"),
+        Some("-1"),
+        Some("1.5"),
+        Some("invalid"),
+        Some("18446744073709551616"),
+    ] {
+        assert_eq!(resolve_admin_timeout(None, value).unwrap(), 15, "{value:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn admin_timeout_file_precedes_environment_and_missing_key_falls_back() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("client.toml");
+    write_private_client_config(&path, "run_idle_secs = 45\nadmin_timeout_secs = 90\n");
+    assert_eq!(resolve_admin_timeout(Some(&path), Some("60")).unwrap(), 90);
+    assert_eq!(
+        resolve_admin_timeout(Some(&path), Some("invalid")).unwrap(),
+        90
+    );
+    assert_eq!(load_run_idle_timeout(&path).unwrap(), 45);
+    write_private_client_config(&path, "run_idle_secs = 45\n");
+    assert_eq!(resolve_admin_timeout(Some(&path), Some("60")).unwrap(), 60);
+    assert_eq!(resolve_admin_timeout(Some(&path), None).unwrap(), 15);
+}
+
+#[cfg(unix)]
+#[test]
+fn admin_timeout_invalid_file_is_not_masked_by_environment() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("client.toml");
+    assert!(resolve_admin_timeout(Some(&path), Some("60")).is_err());
+    for contents in [
+        "admin_timeout_secs = 0",
+        "admin_timeout_secs = 601",
+        "admin_timeout_secs = -1",
+        "admin_timeout_secs = '60'",
+    ] {
+        write_private_client_config(&path, contents);
+        assert!(
+            resolve_admin_timeout(Some(&path), Some("60")).is_err(),
+            "{contents}"
+        );
+    }
+    for seconds in [1, 600] {
+        write_private_client_config(&path, &format!("admin_timeout_secs = {seconds}"));
+        assert_eq!(resolve_admin_timeout(Some(&path), None).unwrap(), seconds);
+    }
+}
