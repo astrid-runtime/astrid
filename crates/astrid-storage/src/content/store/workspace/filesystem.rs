@@ -143,6 +143,20 @@ where
             .write(&self.owner, self.branch, &path.file_name()?, bytes)
     }
 
+    /// Atomically publish streamed bytes into this branch, preserving quota checks.
+    pub fn write_streaming<R: std::io::Read>(
+        &self,
+        path: &FilesystemPath,
+        source: R,
+    ) -> Result<(), WorkspaceBranchError> {
+        self.require_parent(path)?;
+        if self.directory_exists(path)? {
+            return Err(FilesystemError::IsDirectory(path.clone()).into());
+        }
+        self.branches
+            .write_streaming(&self.owner, self.branch, &path.file_name()?, source)
+    }
+
     /// Create an explicit empty directory marker.
     pub fn create_dir(&self, path: &FilesystemPath) -> Result<(), WorkspaceBranchError> {
         if path.as_str().is_empty() {
