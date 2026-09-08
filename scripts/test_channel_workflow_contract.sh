@@ -618,6 +618,14 @@ case "$1" in
   delete-keychain)
     rm -f "${*: -1}"
     ;;
+  import)
+    # Numbered temporary filenames cannot use security's extension inference.
+    [[ "${2:-}" == *.p12.* ]] || exit 93
+    [[ "${3:-}" == "-f" && "${4:-}" == pkcs12 ]] || {
+      echo 'security: SecKeychainItemImport: Unknown format in import.' >&2
+      exit 94
+    }
+    ;;
   set-key-partition-list)
     [[ "${2:-}" == "-S" && "${4:-}" == "-k" ]] || exit 90
     printf 'partition-password=%s\\n' "$5" >> "$fixture/behavior.log"
