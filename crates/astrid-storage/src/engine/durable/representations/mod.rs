@@ -104,6 +104,8 @@ pub(super) struct RepresentationStore {
     representations: CanonicalPhysicalMap,
     placement_entries: CanonicalPhysicalMap,
     persisted_map_nodes: BTreeSet<crate::storage_model::PhysicalMapNodeId>,
+    // Memoized durable descendant closures; discarded when the store is reopened.
+    complete_map_subtrees: BTreeSet<crate::storage_model::PhysicalMapNodeId>,
     direct_profile: RepresentationProfileId,
     reverse: BTreeMap<ObjectId, Vec<RepresentationRecordId>>,
 }
@@ -434,12 +436,14 @@ impl RepresentationStore {
             &self.representations,
             &self.persisted_map_nodes,
             &mut appended_map_nodes,
+            &mut self.complete_map_subtrees,
         )?;
         append_new_reachable_map_nodes(
             &mut metadata,
             &self.placement_entries,
             &self.persisted_map_nodes,
             &mut appended_map_nodes,
+            &mut self.complete_map_subtrees,
         )?;
         let (catalogue, placements, state) = self.next_authority()?;
         let state_id = state.identify(&Blake3PhysicalIdentity);
@@ -516,6 +520,7 @@ impl RepresentationStore {
                 map,
                 &self.persisted_map_nodes,
                 &mut appended_map_nodes,
+                &mut self.complete_map_subtrees,
             )?;
         }
         let (catalogue, placements, state) = self.next_authority()?;
@@ -844,6 +849,7 @@ impl RepresentationStore {
             representations,
             placement_entries,
             persisted_map_nodes: index.nodes.keys().copied().collect(),
+            complete_map_subtrees: BTreeSet::new(),
             direct_profile,
             reverse,
         })
