@@ -5,6 +5,40 @@ use astrid_core::PrincipalUid;
 use super::*;
 use crate::{KvQuotaResolver, StateOwner, open_runtime_principal_store};
 
+#[tokio::test]
+async fn canonical_append_uses_durable_proof_and_survives_reopen() {
+    let (directory, filesystem) = filesystem().await;
+    let path = FilesystemPath::new("append.bin").unwrap();
+    let initial = vec![19; 1024 * 1024];
+    let suffix = vec![23; 1024 * 1024];
+    filesystem.write(&path, &initial).unwrap();
+    assert!(
+        filesystem
+            .try_append(&path, initial.len() as u64, &suffix)
+            .unwrap()
+    );
+    assert!(
+        filesystem
+            .try_append(&path, initial.len() as u64, b"stale")
+            .is_err()
+    );
+    filesystem.sync().unwrap();
+    drop(filesystem);
+    let home = astrid_core::dirs::AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, Arc::new(|_: &StateOwner| Ok(Some(u64::MAX))))
+        .await
+        .unwrap();
+    let reopened = AstridFilesystem::new(
+        store.content(),
+        StateOwner::Principal(PrincipalUid::from_bytes([7; 32])),
+    );
+    let expected: Vec<_> = initial.into_iter().chain(suffix).collect();
+    assert_eq!(
+        reopened.read(&path, 0, expected.len() as u64).unwrap(),
+        expected
+    );
+}
+
 async fn filesystem() -> (
     tempfile::TempDir,
     AstridFilesystem<

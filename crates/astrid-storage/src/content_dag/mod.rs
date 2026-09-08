@@ -20,6 +20,8 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::fmt;
 
+mod append;
+pub(crate) use append::append_verified_content;
 mod boundary;
 mod build;
 mod read;

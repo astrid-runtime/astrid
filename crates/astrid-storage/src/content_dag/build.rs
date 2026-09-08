@@ -83,17 +83,46 @@ pub fn build_content<I: ObjectIdentity>(
     let mut chunks = Vec::new();
     let mut unique_chunks = BTreeSet::new();
 
+    append_chunks(
+        identity,
+        profile,
+        source,
+        source.len() <= profile.maximum_bytes() as usize,
+        &mut records,
+        &mut chunks,
+        &mut unique_chunks,
+    )?;
+
+    let chunk_count = u64::try_from(chunks.len()).map_err(|_| ContentError::LengthOverflow)?;
+    let content = build_tree(identity, &mut records, chunks)?;
+    let file = file_record(profile, logical_bytes, chunk_count, content)?;
+    let file = insert_record(identity, &mut records, file)?;
+    let descriptor = ContentDescriptor::new(file, logical_bytes, chunk_count, profile);
+    Ok(BuiltContent {
+        verified: VerifiedContent::new(OpenedContent::new(
+            descriptor,
+            content.map(|child| child.id),
+        )),
+        records: records.into_iter().collect(),
+        unique_chunks: u64::try_from(unique_chunks.len())
+            .map_err(|_| ContentError::LengthOverflow)?,
+    })
+}
+
+pub(super) fn append_chunks<I: ObjectIdentity>(
+    identity: &I,
+    profile: ChunkingProfile,
+    source: &[u8],
+    whole_small_file: bool,
+    records: &mut BTreeMap<ObjectId, ObjectRecord>,
+    chunks: &mut Vec<Child>,
+    unique_chunks: &mut BTreeSet<ObjectId>,
+) -> Result<(), ContentError> {
     if !source.is_empty() {
         let maximum =
             usize::try_from(profile.maximum_bytes()).map_err(|_| ContentError::LengthOverflow)?;
-        if source.len() <= maximum {
-            push_chunk(
-                identity,
-                &mut records,
-                &mut chunks,
-                &mut unique_chunks,
-                source,
-            )?;
+        if whole_small_file {
+            push_chunk(identity, records, chunks, unique_chunks, source)?;
         } else if profile.uses_legacy_fastcdc_v4() {
             let chunker = FastCDCV4::with_level_and_seed(
                 source,
@@ -113,13 +142,7 @@ pub fn build_content<I: ObjectIdentity>(
                 let bytes = source
                     .get(chunk.offset..end)
                     .ok_or(ContentError::LengthOverflow)?;
-                push_chunk(
-                    identity,
-                    &mut records,
-                    &mut chunks,
-                    &mut unique_chunks,
-                    bytes,
-                )?;
+                push_chunk(identity, records, chunks, unique_chunks, bytes)?;
             }
         } else {
             let chunker = FastCDC::with_level_and_seed(
@@ -140,31 +163,12 @@ pub fn build_content<I: ObjectIdentity>(
                 let bytes = source
                     .get(chunk.offset..end)
                     .ok_or(ContentError::LengthOverflow)?;
-                push_chunk(
-                    identity,
-                    &mut records,
-                    &mut chunks,
-                    &mut unique_chunks,
-                    bytes,
-                )?;
+                push_chunk(identity, records, chunks, unique_chunks, bytes)?;
             }
         }
     }
 
-    let chunk_count = u64::try_from(chunks.len()).map_err(|_| ContentError::LengthOverflow)?;
-    let content = build_tree(identity, &mut records, chunks)?;
-    let file = file_record(profile, logical_bytes, chunk_count, content)?;
-    let file = insert_record(identity, &mut records, file)?;
-    let descriptor = ContentDescriptor::new(file, logical_bytes, chunk_count, profile);
-    Ok(BuiltContent {
-        verified: VerifiedContent::new(OpenedContent::new(
-            descriptor,
-            content.map(|child| child.id),
-        )),
-        records: records.into_iter().collect(),
-        unique_chunks: u64::try_from(unique_chunks.len())
-            .map_err(|_| ContentError::LengthOverflow)?,
-    })
+    Ok(())
 }
 
 fn push_chunk<I: ObjectIdentity>(
@@ -185,7 +189,7 @@ fn push_chunk<I: ObjectIdentity>(
     Ok(())
 }
 
-fn build_tree<I: ObjectIdentity>(
+pub(super) fn build_tree<I: ObjectIdentity>(
     identity: &I,
     records: &mut BTreeMap<ObjectId, ObjectRecord>,
     mut level: Vec<Child>,
