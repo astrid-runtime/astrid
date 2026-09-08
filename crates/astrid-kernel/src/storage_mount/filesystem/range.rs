@@ -9,6 +9,13 @@ pub(super) fn replace(
     offset: u64,
     data: &[u8],
 ) -> Result<(), FilesystemError> {
+    // Gaps are currently materialized, not sparse. Bound generated zeros by the
+    // per-callback byte budget: a tiny resize must not hold the shared mutation
+    // lock while generating unbounded bytes. This is not a total file-size cap.
+    let zero_fill = offset.min(new_length).saturating_sub(old_length);
+    if zero_fill > STORAGE_FILESYSTEM_MAX_IO_BYTES {
+        return Err(FilesystemError::InvalidPath(path.as_str().to_owned()));
+    }
     // Publication happens only after the reader finishes, so reads still see the
     // original file. The mount callback serializes its mutations.
     filesystem.write_streaming(
@@ -90,6 +97,52 @@ impl<F: CallbackFilesystem> Read for Replacement<'_, F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mounted_materialized_gaps_reject_before_publication() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = astrid_core::dirs::AstridHome::from_path(temporary.path().join(".astrid"));
+        let kernel = crate::test_kernel_with_home(home).await;
+        let store = kernel.principal_store.clone().unwrap();
+        let fs = AstridFilesystem::new(
+            store.content(),
+            StateOwner::Principal(astrid_core::PrincipalUid::from_bytes([0xB9; 32])),
+        );
+        let path = FilesystemPath::new("gap.bin").unwrap();
+        fs.write(&path, b"seed").unwrap();
+        for length in [4 + STORAGE_FILESYSTEM_MAX_IO_BYTES + 1, i64::MAX as u64] {
+            for operation in [
+                StorageFilesystemOperationV1::SetLength {
+                    path: path.as_str().into(),
+                    length,
+                },
+                StorageFilesystemOperationV1::Write {
+                    path: path.as_str().into(),
+                    offset: length,
+                    data: vec![1],
+                },
+            ] {
+                assert!(matches!(
+                    execute_blocking(&fs, operation),
+                    Err(FilesystemError::InvalidPath(_))
+                ));
+                assert_eq!(fs.stat(&path).unwrap().logical_bytes(), 4);
+                assert_eq!(fs.read(&path, 0, 4).unwrap(), b"seed");
+            }
+        }
+        // Exact budget is allowed even when total length exceeds the ceiling.
+        for length in [4 + STORAGE_FILESYSTEM_MAX_IO_BYTES, 0] {
+            execute_blocking(
+                &fs,
+                StorageFilesystemOperationV1::SetLength {
+                    path: path.as_str().into(),
+                    length,
+                },
+            )
+            .unwrap();
+            assert_eq!(fs.stat(&path).unwrap().logical_bytes(), length);
+        }
+    }
 
     #[tokio::test]
     async fn mounted_large_file_range_writes_resize_and_sync() {
