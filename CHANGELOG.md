@@ -40,6 +40,8 @@ Historical release entries below are preserved.
   attachments. Run-loop capsule tools participate in discovery.
 - Capsule archives are reproducible for identical inputs; capsule builds honor
   Cargo's resolved target configuration.
+- Durable writes and journal recovery reuse verified immutable map subtrees
+  without weakening missing-descendant detection or crash recovery.
 - Updated to Wasmtime 48.0.1 and refreshed compatible dependencies. Older
   compiled Wasmtime caches are rebuilt.
 - Removed the unused SurrealDB wrapper. Provider execution belongs to capsules,
@@ -56,6 +58,8 @@ Historical release entries below are preserved.
   changes, and retirement waits for outstanding work.
 - macOS discovery, sandbox callback transport, Finder directory handling,
   volume metadata, and administrative configuration write-through.
+- Linux FUSE reports the configured volume name, backing-volume capacity,
+  and root timestamps instead of placeholder filesystem statistics.
 - Mounted files can exceed the 4 MiB callback payload limit without buffering
   the complete file.
 - Host-process injection limits, approved-executable identity, shared
