@@ -533,6 +533,50 @@ where
         })
     }
 
+    /// Publish streamed bytes after branch quota authorization.
+    ///
+    /// # Errors
+    ///
+    /// Returns source, content, quota, or branch publication errors.
+    pub fn write_streaming<R: std::io::Read>(
+        &self,
+        owner: &P,
+        id: WorkspaceUid,
+        name: &ContentName,
+        source: R,
+    ) -> Result<(), WorkspaceBranchError> {
+        // Defer admission until the existing branch transaction checks quota.
+        let profile = crate::content_dag::ChunkingProfile::ASTRID_V1;
+        let (verified, staged) =
+            if let Some((bound, limit)) = self.content.quota_staging_bound(owner)? {
+                self.content
+                    .stage_deferred_bounded(source, profile, bound, limit)?
+            } else {
+                self.content.stage_deferred(source, profile)?
+            };
+        let descriptor = verified.descriptor();
+        self.mutate_catalog(owner, id, None, |root, records| {
+            let mutation = super::insert(
+                root,
+                name,
+                super::CatalogValue {
+                    file: descriptor.file(),
+                    logical_bytes: descriptor.logical_bytes(),
+                },
+                &mut |object| self.content.load_required_for(owner, object),
+                &|record| self.content.engine.identify_object(record),
+            )?;
+            records.extend(
+                staged
+                    .iter()
+                    .cloned()
+                    .map(|record| (self.content.engine.identify_object(&record), record)),
+            );
+            records.extend(mutation.records);
+            Ok(mutation.root)
+        })
+    }
+
     /// Remove one named file from a branch.  Directory markers are treated as
     /// ordinary named values by this lower-level API; the filesystem wrapper
     /// enforces directory semantics.

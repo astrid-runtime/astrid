@@ -1,4 +1,7 @@
 use super::*;
+use std::io::Read;
+
+mod range;
 
 pub(super) trait CallbackFilesystem {
     fn stat(&self, path: &FilesystemPath) -> Result<FilesystemEntry, FilesystemError>;
@@ -10,6 +13,11 @@ pub(super) trait CallbackFilesystem {
         length: u64,
     ) -> Result<Vec<u8>, FilesystemError>;
     fn write(&self, path: &FilesystemPath, bytes: &[u8]) -> Result<(), FilesystemError>;
+    fn write_streaming(
+        &self,
+        path: &FilesystemPath,
+        source: impl Read,
+    ) -> Result<(), FilesystemError>;
     fn create_dir(&self, path: &FilesystemPath) -> Result<(), FilesystemError>;
     fn remove(&self, path: &FilesystemPath) -> Result<(), FilesystemError>;
     fn rename(
@@ -45,6 +53,14 @@ where
 
     fn write(&self, path: &FilesystemPath, bytes: &[u8]) -> Result<(), FilesystemError> {
         AstridFilesystem::write(self, path, bytes)
+    }
+
+    fn write_streaming(
+        &self,
+        path: &FilesystemPath,
+        source: impl Read,
+    ) -> Result<(), FilesystemError> {
+        AstridFilesystem::write_streaming(self, path, source)
     }
 
     fn create_dir(&self, path: &FilesystemPath) -> Result<(), FilesystemError> {
@@ -99,6 +115,15 @@ where
         self.write(path, bytes).map_err(map_workspace_error)
     }
 
+    fn write_streaming(
+        &self,
+        path: &FilesystemPath,
+        source: impl Read,
+    ) -> Result<(), FilesystemError> {
+        self.write_streaming(path, source)
+            .map_err(map_workspace_error)
+    }
+
     fn create_dir(&self, path: &FilesystemPath) -> Result<(), FilesystemError> {
         self.create_dir(path).map_err(map_workspace_error)
     }
@@ -150,6 +175,14 @@ where
 
     fn write(&self, path: &FilesystemPath, bytes: &[u8]) -> Result<(), FilesystemError> {
         OwnerSubtreeFilesystem::write(self, path, bytes)
+    }
+
+    fn write_streaming(
+        &self,
+        path: &FilesystemPath,
+        source: impl Read,
+    ) -> Result<(), FilesystemError> {
+        OwnerSubtreeFilesystem::write_streaming(self, path, source)
     }
 
     fn create_dir(&self, path: &FilesystemPath) -> Result<(), FilesystemError> {
@@ -219,6 +252,14 @@ impl<F: CallbackFilesystem> CallbackFilesystem for PrefixedFilesystem<F> {
         self.inner.write(&self.path(path)?, bytes)
     }
 
+    fn write_streaming(
+        &self,
+        path: &FilesystemPath,
+        source: impl Read,
+    ) -> Result<(), FilesystemError> {
+        self.inner.write_streaming(&self.path(path)?, source)
+    }
+
     fn create_dir(&self, path: &FilesystemPath) -> Result<(), FilesystemError> {
         self.inner.create_dir(&self.path(path)?)
     }
@@ -282,22 +323,15 @@ pub(super) fn execute_blocking(
             write_range(filesystem, path, offset, &data)
         },
         StorageFilesystemOperationV1::SetLength { path, length } => {
-            if length > STORAGE_FILESYSTEM_MAX_IO_BYTES {
+            if length > i64::MAX as u64 {
                 return Err(FilesystemError::InvalidPath(path));
             }
             let path = FilesystemPath::new(path)?;
             let current_length = require_file(filesystem, &path)?;
-            if current_length > STORAGE_FILESYSTEM_MAX_IO_BYTES {
-                return Err(FilesystemError::InvalidPath(path.as_str().to_owned()));
-            }
             if current_length == length {
                 return Ok(StorageFilesystemSuccessV1::Written(length));
             }
-            let mut bytes = filesystem.read(&path, 0, current_length)?;
-            let target = usize::try_from(length)
-                .map_err(|_| FilesystemError::InvalidPath(path.as_str().to_owned()))?;
-            bytes.resize(target, 0);
-            filesystem.write(&path, &bytes)?;
+            range::replace(filesystem, &path, current_length, length, length, &[])?;
             Ok(StorageFilesystemSuccessV1::Written(length))
         },
         StorageFilesystemOperationV1::Create { path, kind } => {
@@ -350,20 +384,17 @@ fn write_range(
     let end_offset = offset
         .checked_add(data_length)
         .ok_or_else(|| FilesystemError::InvalidPath(path.as_str().to_owned()))?;
-    if current_length.max(end_offset) > STORAGE_FILESYSTEM_MAX_IO_BYTES {
+    if current_length.max(end_offset) > i64::MAX as u64 {
         return Err(FilesystemError::InvalidPath(path.as_str().to_owned()));
     }
-    let mut bytes = filesystem.read(&path, 0, current_length)?;
-    let start = usize::try_from(offset)
-        .map_err(|_| FilesystemError::InvalidPath(path.as_str().to_owned()))?;
-    let end = start
-        .checked_add(data.len())
-        .ok_or_else(|| FilesystemError::InvalidPath(path.as_str().to_owned()))?;
-    if end > bytes.len() {
-        bytes.resize(end, 0);
-    }
-    bytes[start..end].copy_from_slice(data);
-    filesystem.write(&path, &bytes)?;
+    range::replace(
+        filesystem,
+        &path,
+        current_length,
+        current_length.max(end_offset),
+        offset,
+        data,
+    )?;
     Ok(StorageFilesystemSuccessV1::Written(
         current_length.max(end_offset),
     ))
