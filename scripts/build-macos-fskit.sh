@@ -40,6 +40,9 @@ xcodebuild \
   DEVELOPMENT_TEAM="$ASTRID_FSKIT_DEVELOPMENT_TEAM" \
   CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY" \
   CODE_SIGN_STYLE=Manual \
+  CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO \
+  ASTRID_FSKIT_APP_PROFILE="${ASTRID_FSKIT_APP_PROFILE:-}" \
+  ASTRID_FSKIT_EXTENSION_PROFILE="${ASTRID_FSKIT_EXTENSION_PROFILE:-}" \
   CURRENT_PROJECT_VERSION="$BUILD_VERSION" \
   MARKETING_VERSION="$ASTRID_VERSION" \
   ARCHS="$ARCHS" \
@@ -93,6 +96,10 @@ codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 codesign --verify --deep --strict --verbose=2 "$EXTENSION_PATH"
 display_identity "$APP_PATH" "$APP_IDENTIFIER" >/dev/null
 display_identity "$EXTENSION_PATH" "$EXTENSION_IDENTIFIER" >/dev/null
+for signed_bundle in "$APP_PATH" "$EXTENSION_PATH"; do
+  codesign --display --entitlements - --xml "$signed_bundle" 2>/dev/null |
+    python3 -c 'import plistlib, sys; e = plistlib.loads(sys.stdin.buffer.read()); sys.exit("distribution signature enables get-task-allow" if e.get("com.apple.security.get-task-allow", False) else 0)'
+done
 ENTITLEMENTS="$(codesign --display --entitlements - "$EXTENSION_PATH" 2>/dev/null || true)"
 if ! grep -Fq "com.apple.developer.fskit.fsmodule" <<<"$ENTITLEMENTS"; then
   echo "FSKit extension lacks the required fskit.fsmodule entitlement" >&2
