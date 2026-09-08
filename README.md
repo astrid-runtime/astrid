@@ -1,6 +1,6 @@
 # Astrid
 
-**A portable, capability-secure operating system for composable software.**
+**Software should compose without inheriting each other's authority.**
 
 [![CI](https://github.com/astrid-runtime/astrid/actions/workflows/ci.yml/badge.svg)](https://github.com/astrid-runtime/astrid/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/astrid-runtime/astrid/actions/workflows/codeql.yml/badge.svg)](https://github.com/astrid-runtime/astrid/actions/workflows/codeql.yml)
@@ -11,33 +11,56 @@
 
 ---
 
-Astrid treats a component the way an operating system treats a process. Every
-ability is a sealed WebAssembly **capsule**: it can be composed with other
-capsules, granted only explicit authority, and replaced without expanding its
-reach. Astrid is independent of any particular product, model provider, agent
-loop, user interface, or distribution.
+Astrid is an operating-system project for software built from WebAssembly
+**capsules**. Today it runs as a portable user-space runtime on macOS and Linux;
+the direction is a standalone operating system. This release is the hosted
+runtime, not a bootable OS image.
 
-The kernel underneath is small and deliberately dumb. It routes events,
-enforces capabilities, runs the sandbox, and records the audit trail; it holds
-no model, tool schema, or business logic. A jailbreak, poisoned tool, or plain
-bug still cannot read a file, reach a network, or spawn a process outside its
-grant. Authority is a capability the kernel enforces, not an instruction the
-model is trusted to follow.
+Run components in a sandbox, connect them through typed interfaces, and give
+each principal its own capabilities and durable state. Install, upgrade, and
+remove capsules while the runtime is running.
+
+Use it to build agent systems, tools, services, or your own distribution. Astrid
+does not choose a product, model provider, agent loop, or user interface for you.
+
+Agents make the problem urgent: a model can choose what to do, but that should
+not make the model the authority that permits it. Astrid separates those jobs.
+The same foundation serves software without an LLM—components can be replaced
+and composed without putting application policy into the kernel.
+
+- **Compose behavior:** capsules communicate through an event bus and versioned
+  interfaces; the kernel routes requests rather than owning application logic.
+- **Make authority explicit:** filesystem, network, process, and IPC access are
+  checked at runtime boundaries, not entrusted to prompts.
+- **Keep state portable:** content-addressed storage, deduplication, and recovery
+  back principal-owned data. Mount it through macOS FSKit or Linux FUSE.
+
+[Get started](#quick-start) · [Write a capsule](#write-a-capsule) ·
+[Read the Book](https://github.com/astrid-runtime/book) ·
+[Release notes](CHANGELOG.md)
 
 ## Quick start
 
+Install Astrid using one of the [options below](#install), then start an
+uncomposed runtime—no model account or distribution required:
+
 ```bash
-brew tap astrid-runtime/tap && brew install astrid
-astrid init --distro @yourorg/your-distro
+astrid --version
 astrid start
 astrid status
 astrid capsule list
+astrid stop
 ```
 
-Astrid Runtime does not select or bundle a product distro. Choose a distro you
-trust and pass its name, repository, local `Distro.toml`, or signed `.shuttle`
-archive explicitly with `--distro`. Operators running an uncomposed runtime can
-skip `init` and start the daemon directly.
+`status` reports the running daemon; a fresh uncomposed runtime has no product
+capsules. `stop` shuts it down and retires its working state into
+`astrid.volume`. Starting again restores the working projection.
+
+Next, [build your first capsule](#write-a-capsule), or choose a distribution you
+trust with `astrid init --distro <source>`. A distribution supplies the capsule
+composition and configuration; Astrid does not select one implicitly. See
+[initial setup](#initial-setup) for repository, local-manifest, and signed-bundle
+inputs.
 
 Start with [the Book](https://github.com/astrid-runtime/book) for the
 architecture or the [Contributor Handbook](https://github.com/astrid-runtime/handbook)
@@ -120,6 +143,26 @@ each layer against the source.
 
 ## Install
 
+**Release archives:**
+
+Download the archive for your machine from
+[GitHub Releases](https://github.com/astrid-runtime/astrid/releases). Keep its
+companion binaries and platform files together when extracting it; add the
+extracted directory to your `PATH`.
+
+The 2026.9.0 release targets are:
+
+| Platform | Architectures | Filesystem frontend |
+|---|---|---|
+| macOS | Apple Silicon, Intel | FSKit on macOS 26+; signed app and extension approval required |
+| Linux GNU | x86_64, ARM64 | FUSE |
+| Linux MUSL | x86_64, ARM64 | FUSE |
+
+Windows is tested in CI but is **not included in this release's archives**.
+For migration and platform limitations, read the
+[2026.9.0 upgrade notes](release/UPGRADING-2026.9.0.md). Versions now follow
+[year.month.patch](release/VERSIONING.md).
+
 **Homebrew (macOS and Linux):**
 
 ```bash
@@ -140,8 +183,9 @@ git clone https://github.com/astrid-runtime/astrid
 cd astrid && cargo build --release   # binary at ./target/release/astrid
 ```
 
-Astrid installs four binaries that work together. You only ever invoke `astrid`; it starts and
-manages the rest.
+The core tools are listed below. Platform release archives additionally include
+their filesystem provider and, on macOS, the signed AstridFS app and management
+scripts. A Cargo install is not a substitute for that signed macOS bundle.
 
 | Binary | Role |
 |---|---|
@@ -192,6 +236,34 @@ astrid ps        # loaded capsules and their lifecycle state
 astrid stop      # graceful shutdown
 astrid update    # authenticate, verify, and install the latest release
 ```
+
+An explicit `astrid start` is persistent. Automatically started MCP gateways
+and ephemeral daemons instead follow client-connection lifetime: quiet connected
+clients keep them alive, and they retire after the final client disconnects.
+
+### Mount durable state
+
+Once the platform filesystem frontend is installed and enabled, a principal can
+mount its view through the CLI:
+
+```bash
+astrid start
+mkdir -p /tmp/astrid-view
+astrid --principal default storage mount --as default /tmp/astrid-view
+astrid --principal default storage status /tmp/astrid-view
+astrid --principal default storage sync /tmp/astrid-view
+astrid --principal default storage unmount /tmp/astrid-view
+astrid stop
+```
+
+Use an empty mountpoint. Principal views and the administrative runtime view
+have different authority; mounting does not grant access to other principals.
+The files live in Astrid's storage, backed by the host filesystem—not in a new
+disk partition. Release binaries remain outside the runtime's mutable volume.
+
+macOS archives include `macos/manage-macos-fskit.sh` for app installation and
+enablement; follow its macOS permission guidance. Linux uses its FUSE frontend
+and host FUSE setup, without Apple's signing or extension-approval steps.
 
 ## Per-principal isolation
 
@@ -266,28 +338,23 @@ astrid capsule list --verbose              # installed capsules with capability 
 astrid capsule tree                        # imports/exports dependency graph
 ```
 
-## What's new in 0.9
+## What's new in 2026.9.0
 
-Five bodies of work plus a security-hardening pass. See [CHANGELOG.md](CHANGELOG.md) for the full
-list.
+- **Volume-backed state:** content-addressed data, deduplication, journal recovery,
+  and migration from the previous runtime layout.
+- **Native mounts:** macOS FSKit and Linux FUSE, with principal and administrative
+  views, configurable volume branding, and useful filesystem metadata.
+- **Linux MUSL archives:** x86_64 and ARM64, alongside GNU Linux and macOS.
+- **Resumable capsule installation:** verified durable identities and
+  principal-scoped completion tracking.
+- **Connection-owned MCP lifetime:** shared session-aware gateways, quiet-client
+  retention, and automatic retirement after the last client disconnects.
+- **Storage performance work:** bounded range writes, prefix-chunk reuse, and
+  verified subtree caching while retaining durability checks.
 
-- **Live capsule lifecycle.** Hot-load on install, hot-swap on upgrade, live-unload on remove, all
-  without a daemon restart.
-- **Per-principal isolation, hardened end-to-end.** Principal-view-aware capsule loading with
-  content-addressed artifact reuse, kernel-side tool-surface access enforcement, and per-device
-  capability scope threaded through the HTTP gateway.
-- **LLM provider and model binding.** Multi-provider onboarding with live model discovery, plus
-  gateway routes and `astrid models` / `astrid doctor` for per-principal model management and
-  loop-readiness checks.
-- **Conversation threads over the HTTP gateway.** List, fetch, update, delete, and full-text search
-  threads, plus a per-principal live conversation feed with cross-principal isolation enforced at the
-  bus.
-- **`astrid:http@1.1.0` and operator-configurable limits.** Per-request timeouts, redirect policy,
-  body caps, `https-only`, and subresource integrity; seven previously-hardcoded ceilings become
-  operator knobs.
-- **Security.** Local-egress consent (transport-origin marker, runtime elicitation, per-capsule and
-  per-principal grants), an SSRF airlock that closes IP-literal and redirect bypasses, and a hardened
-  supply-chain path (Sigstore attestation, CodeQL, pinned Action SHAs, least-privilege tokens).
+See the [full changelog](CHANGELOG.md),
+[upgrade notes](release/UPGRADING-2026.9.0.md), and
+[dependency inventory](release/DEPENDENCIES-2026.9.0.md) for the release details.
 
 ## Documentation
 

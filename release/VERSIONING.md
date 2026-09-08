@@ -1,6 +1,6 @@
 # Release versioning
 
-Starting with the September 2026 release, Astrid, AOS, and Oracle use
+Starting with the September 2026 release, Astrid uses
 `YEAR.MONTH.PATCH` (calendar year, calendar month, patch number), called
 CalSemVer here. The month is not zero-padded.
 
@@ -13,17 +13,12 @@ CalSemVer here. The month is not zero-padded.
   Document breaking changes and migrations in release notes; the year component
   is not a traditional SemVer compatibility-major guarantee.
 
-All three products target `2026.9.0` for this release. Git tags retain their
-existing repository conventions: Astrid and Oracle use `v2026.9.0`; AOS uses
-`2026.9.0`.
+Astrid targets `2026.9.0` for this release, with Git tag `v2026.9.0`.
+Downstream distributions and integrations own their version and tag policies.
 
-Previously published versions are immutable. AOS `2026.1.x` was not a
-calendar-month series; do not reinterpret it as January. Astrid `0.10.x` and
-Oracle `0.2.x` likewise retain their historical identities. The unreleased
-Oracle `0.3.0` preparation is superseded by `2026.9.0`, not an additional
-published release.
+Previously published versions are immutable. Astrid `0.10.x` retains its
+historical identity; do not reinterpret it as a calendar-month series.
 
 Changelogs describe the net user-facing change from the preceding published
 release. Fold repairs to unreleased implementations into the final behavior;
 keep historical published sections and consequential migration limitations.
-
