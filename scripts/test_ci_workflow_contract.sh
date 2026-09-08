@@ -37,16 +37,30 @@ unless concurrency["cancel-in-progress"] == expected_cancel
   fail("cancel-in-progress must be enabled only for first-attempt pull_request events")
 end
 
-# Keep this contract wired to both CI trigger classes. Parse the trigger map so
+# Keep this contract wired to filtered pushes and unconditional PRs. Parse so
 # comments or similarly named text cannot make an absent path entry pass.
 triggers = workflow["on"] || workflow[true]
 fail("missing workflow trigger map") unless triggers.is_a?(Hash)
-%w[push pull_request].each do |event_name|
+%w[push].each do |event_name|
   event = triggers.fetch(event_name) { fail("missing #{event_name} trigger") }
   paths = event.fetch("paths") { fail("missing #{event_name}.paths filter") }
   unless paths.is_a?(Array) && paths.count("scripts/test_ci_workflow_contract.sh") == 1
     fail("contract test must appear exactly once in #{event_name}.paths")
   end
+end
+
+# Required checks cannot depend on the base branch or changed file paths.
+# A YAML null pull_request value is the intended unconditional event.
+fail("missing pull_request trigger") unless triggers.key?("pull_request")
+fail("pull_request must be unconditional") unless triggers["pull_request"].nil?
+pr_checks_path = File.join(File.dirname(workflow_path), "pr-checks.yml")
+pr_checks = YAML.safe_load(File.read(pr_checks_path), aliases: false)
+pr_events = (pr_checks["on"] || pr_checks[true]).fetch("pull_request")
+fail("PR Checks must allow stacked bases") if pr_events.key?("branches") || pr_events.key?("branches-ignore")
+
+%w[ci.yml release.yml].each do |name|
+  text = File.read(File.join(File.dirname(workflow_path), name))
+  fail("#{name} must use shared GNU package setup") unless text.include?('bash scripts/ci/install_gnu_build_packages.sh "${packages[@]}"')
 end
 
 def group(workflow_name, event_name, pr_number, run_id, run_attempt)

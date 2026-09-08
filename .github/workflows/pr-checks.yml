@@ -2,7 +2,6 @@ name: PR Checks
 
 on:
   pull_request:
-    branches: [main]
     types: [opened, edited, reopened, labeled, unlabeled, synchronize]
 
 permissions:

@@ -261,8 +261,7 @@ jobs:
                 packages+=(gcc-aarch64-linux-gnu libc6-dev-arm64-cross)
                 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
               fi
-              apt-get update
-              apt-get install -y --no-install-recommends "${packages[@]}"
+              bash scripts/ci/install_gnu_build_packages.sh "${packages[@]}"
               git config --global --add safe.directory /workspace
               [[ "$(git rev-parse --short=12 HEAD)" == "$SOURCE_SHA" ]]
               cargo build \
