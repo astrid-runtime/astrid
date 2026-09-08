@@ -366,6 +366,7 @@ pub struct Kernel {
     capsule_view_locks: Arc<DashMap<CapsuleViewKey, Weak<Mutex<()>>>>,
     /// Ephemeral mode: shut down immediately when the last client disconnects.
     pub ephemeral: AtomicBool,
+    ephemeral_startup_pending: AtomicBool,
     /// Instant when the kernel was booted (for uptime calculation). Crate-
     /// private: the only reader is the router's uptime report, and keeping it
     /// out of the public surface leaves the facade free to swap the concrete
@@ -1354,6 +1355,7 @@ impl Kernel {
             capsule_load_lock: Mutex::new(()),
             capsule_view_locks: Arc::new(DashMap::new()),
             ephemeral: AtomicBool::new(false),
+            ephemeral_startup_pending: AtomicBool::new(false),
             boot_time: astrid_runtime::time::Instant::now(),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             session_token,
@@ -3431,8 +3433,8 @@ impl Kernel {
         self.ephemeral.store(val, Ordering::Relaxed);
     }
 
-    /// Arm the never-connected fallback after the daemon has published
-    /// readiness and clients are able to establish lifecycle leases.
+    /// Arm startup handoff grace after readiness, allowing brief preflight
+    /// connections before the host establishes its lasting lifecycle lease.
     pub fn arm_ephemeral_startup_fallback(self: &Arc<Self>) {
         drop(spawn_ephemeral_startup_fallback(
             Arc::clone(self),
@@ -3441,7 +3443,10 @@ impl Kernel {
     }
 
     fn request_ephemeral_shutdown_if_idle(&self) {
-        if !self.ephemeral.load(Ordering::Relaxed) || self.total_connection_count() != 0 {
+        if !self.ephemeral.load(Ordering::Relaxed)
+            || self.ephemeral_startup_pending.load(Ordering::Acquire)
+            || self.total_connection_count() != 0
+        {
             return;
         }
         tracing::info!("Last client disconnected, shutting down ephemeral kernel");
@@ -3958,6 +3963,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         capsule_load_lock: Mutex::new(()),
         capsule_view_locks: Arc::new(DashMap::new()),
         ephemeral: AtomicBool::new(false),
+        ephemeral_startup_pending: AtomicBool::new(false),
         boot_time: astrid_runtime::time::Instant::now(),
         shutdown_tx: tokio::sync::watch::channel(false).0,
         session_token: Arc::new(astrid_core::session_token::SessionToken::generate()),
@@ -4595,15 +4601,8 @@ fn spawn_idle_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHandle<()> {
     })
 }
 
-fn spawn_ephemeral_startup_fallback(
-    kernel: Arc<Kernel>,
-    grace: std::time::Duration,
-) -> astrid_runtime::JoinHandle<()> {
-    astrid_runtime::spawn(async move {
-        astrid_runtime::time::sleep(grace).await;
-        kernel.request_ephemeral_shutdown_if_idle();
-    })
-}
+mod ephemeral_startup;
+use ephemeral_startup::spawn_ephemeral_startup_fallback;
 
 /// Tracks restart attempts for a single capsule with exponential backoff.
 struct RestartTracker {
