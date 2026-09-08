@@ -197,6 +197,8 @@ jobs:
       - name: Build, sign, and notarize AstridFS
         if: contains(matrix.target, 'apple-darwin')
         env:
+          ASTRID_MACOS_APP_PROVISIONING_PROFILE: ${{ secrets.ASTRID_MACOS_APP_PROVISIONING_PROFILE }}
+          ASTRID_MACOS_EXTENSION_PROVISIONING_PROFILE: ${{ secrets.ASTRID_MACOS_EXTENSION_PROVISIONING_PROFILE }}
           ASTRID_MACOS_DEVELOPMENT_TEAM_ID: ${{ secrets.ASTRID_MACOS_DEVELOPMENT_TEAM_ID }}
           ASTRID_MACOS_DEVELOPER_ID_P12: ${{ secrets.ASTRID_MACOS_DEVELOPER_ID_P12 }}
           ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD }}
@@ -209,7 +211,7 @@ jobs:
           ASTRID_FSKIT_NOTARY_ISSUER_ID: ${{ secrets.ASTRID_MACOS_NOTARY_ISSUER_ID }}
           ASTRID_FSKIT_NOTARY_KEY: ${{ secrets.ASTRID_MACOS_NOTARY_KEY }}
         run: |
-          scripts/ci/import_macos_signing.sh
+          python3 scripts/ci/with_macos_profiles.py scripts/ci/import_macos_signing.sh
           echo "ASTRID_FSKIT_APP=$PWD/target/macos-fskit/DerivedData/Build/Products/Release/AstridFS.app" >> "$GITHUB_ENV"
 
       - name: Sign the macOS FSKit companion

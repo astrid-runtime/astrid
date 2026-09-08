@@ -22,3 +22,4 @@ bash scripts/test_native_storage_certification_contract.sh
 bash scripts/test_ci_workflow_contract.sh
 python3 scripts/test_gnu_build_packages.py
 python3 scripts/test_supervised_fskit.py
+python3 scripts/test_macos_profiles.py
