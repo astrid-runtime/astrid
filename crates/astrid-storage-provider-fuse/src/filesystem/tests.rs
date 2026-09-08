@@ -75,7 +75,13 @@ fn fake_operation(
     operation: StorageFilesystemOperationV1,
 ) -> Result<StorageFilesystemSuccessV1, StorageFilesystemFailureV1> {
     let result = match operation {
-        StorageFilesystemOperationV1::VolumeInfo => Err(failure_detail("unsupported", "fixture has no backing device")),
+        StorageFilesystemOperationV1::VolumeInfo => Ok(StorageFilesystemSuccessV1::Data(
+            serde_json::json!({
+                "volume_name": "AOS", "block_size": 4096,
+                "total_blocks": 100, "free_blocks": 80, "available_blocks": 70,
+                "created_secs": 1000, "modified_secs": 2000
+            }).to_string().into_bytes(),
+        )),
         StorageFilesystemOperationV1::Stat { path } => {
             if let Some(data) = state.files.get(&path) {
                 Ok(StorageFilesystemSuccessV1::Entry(entry(
@@ -485,13 +491,33 @@ fn linux_native_fuse_mount_supports_all_required_operations() {
     let mut fake = FakeFilesystem::default();
     fake.directories.insert(String::new());
     let (state, telemetry) = spawn_fake_callback(&callback_path, fake);
-    let mountpoint = temporary.path().join("native-mount");
+    let mountpoint = temporary.path().join("native mount");
     std::fs::create_dir(&mountpoint).unwrap();
     std::fs::set_permissions(&mountpoint, std::fs::Permissions::from_mode(0o700)).unwrap();
     let lease = test_lease(&callback_path, StorageProviderAccessV1::ReadWrite);
     let session = start_session(lease, &mountpoint).expect("mount real Linux FUSE filesystem");
 
     assert!(crate::mountpoint::mountinfo_contains(&mountpoint).unwrap());
+    let capacity = nix::sys::statvfs::statvfs(&mountpoint).unwrap();
+    assert_eq!(capacity.blocks(), 100);
+    assert_eq!(capacity.blocks_free(), 80);
+    assert_eq!(capacity.blocks_available(), 70);
+    assert_eq!(capacity.fragment_size(), 4096);
+    assert_eq!(
+        std::fs::metadata(&mountpoint).unwrap().modified().unwrap(),
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2000),
+    );
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+    assert!(mountinfo.lines().any(|line| {
+            line.as_bytes().split(|byte| *byte == b' ').nth(4).is_some_and(|field| {
+                crate::mountpoint::unescape_mountinfo(field) == mountpoint.to_str().unwrap().as_bytes()
+            })
+                && line.split_once(" - ").is_some_and(|(_, details)| {
+                    let mut fields = details.split_whitespace();
+                    matches!(fields.next(), Some("fuse" | "fuse.astrid"))
+                        && fields.next() == Some("AOS")
+                })
+    }), "configured source label missing from mountinfo: {mountinfo}");
     std::fs::write(mountpoint.join("hello.txt"), b"Astrid FUSE").unwrap();
     assert_eq!(
         std::fs::read(mountpoint.join("hello.txt")).unwrap(),

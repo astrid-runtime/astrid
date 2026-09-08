@@ -15,11 +15,14 @@ use astrid_core::storage_provider::StorageProviderAccessV1;
 use fuser::{
     Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
     MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request, Session, SessionACL,
+    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, Session, SessionACL,
 };
 
 use crate::callback::{CALLBACK_CHUNK_BYTES, CallbackClient, callback_errno};
 use crate::mountpoint::owner_ids;
+
+mod volume_info;
+use volume_info::VolumeInfo;
 
 // Astrid is the authority and may be changed through another principal view or
 // native client. Do not let the kernel serve stale lengths or bytes from an
@@ -36,13 +39,15 @@ pub(crate) fn start_session(
 ) -> Result<FuseBackgroundSession> {
     let access = lease.access;
     let filesystem = AstridFuseFilesystem::new(lease);
+    let info = VolumeInfo::read(&filesystem.callback)
+        .map_err(|error| anyhow::anyhow!("read FUSE volume metadata: {error:?}"))?;
     let mount_option = match access {
         StorageProviderAccessV1::ReadOnly => MountOption::RO,
         StorageProviderAccessV1::ReadWrite => MountOption::RW,
     };
     let mut config = Config::default();
     config.mount_options = vec![
-        MountOption::FSName("astrid".to_owned()),
+        MountOption::FSName(info.volume_name),
         MountOption::Subtype("astrid".to_owned()),
         mount_option,
         MountOption::DefaultPermissions,
@@ -114,7 +119,15 @@ impl AstridFuseFilesystem {
 
     fn attributes_for(&self, path: &str, ino: INodeNo) -> Result<FileAttr, Errno> {
         let entry = self.stat_path(path)?;
-        Ok(self.attributes(ino, &entry))
+        let mut attributes = self.attributes(ino, &entry);
+        if path.is_empty() {
+            let volume = VolumeInfo::read(&self.callback)?;
+            attributes.crtime = volume.created()?;
+            attributes.mtime = volume.modified()?;
+            attributes.ctime = attributes.mtime;
+            attributes.atime = attributes.mtime;
+        }
+        Ok(attributes)
     }
 
     fn attributes(&self, ino: INodeNo, entry: &StorageFilesystemEntryV1) -> FileAttr {
@@ -261,6 +274,24 @@ impl AstridFuseFilesystem {
 }
 
 impl Filesystem for AstridFuseFilesystem {
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        match VolumeInfo::read(&self.callback) {
+            Ok(info) => reply.statfs(
+                info.total_blocks,
+                info.free_blocks,
+                info.available_blocks,
+                // The callback does not expose inode accounting. Zero means
+                // unavailable; do not invent a fixed inode quota.
+                0,
+                0,
+                info.block_size,
+                255,
+                info.block_size,
+            ),
+            Err(error) => reply.error(error),
+        }
+    }
+
     fn open(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         reply.opened(FileHandle(0), FopenFlags::FOPEN_DIRECT_IO);
     }
