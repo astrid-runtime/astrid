@@ -36,12 +36,18 @@ Historical release entries below are preserved.
   completed installations resume without repeating daemon install requests.
 - Principal runtimes isolate guest memory, run tasks, subscriptions, processes,
   and lifecycle generations while sharing compiled code where appropriate.
-- MCP supports protocol 2026-07-28 and persistent session-scoped gateway
-  attachments. Run-loop capsule tools participate in discovery.
+- MCP supports protocol 2026-07-28 and shared, session-scoped gateway
+  attachments. Quiet connected sessions remain attached; automatic gateway
+  and daemon lifetime follows their connections. Run-loop capsule tools
+  participate in discovery.
 - Capsule archives are reproducible for identical inputs; capsule builds honor
   Cargo's resolved target configuration.
 - Durable writes and journal recovery reuse verified immutable map subtrees
   without weakening missing-descendant detection or crash recovery.
+- Mounted appends reuse verified prefix chunks, extent mutations scan only
+  affected ranges, and unchanged volumes avoid redundant device flushes.
+  Canonical content identity, quota checks, atomic publication, and failed-flush
+  retries are preserved; the volume format is unchanged.
 - Updated to Wasmtime 48.0.1 and refreshed compatible dependencies. Older
   compiled Wasmtime caches are rebuilt.
 - Removed the unused SurrealDB wrapper. Provider execution belongs to capsules,
