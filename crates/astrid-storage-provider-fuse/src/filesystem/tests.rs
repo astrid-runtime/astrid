@@ -491,7 +491,7 @@ fn linux_native_fuse_mount_supports_all_required_operations() {
     let mut fake = FakeFilesystem::default();
     fake.directories.insert(String::new());
     let (state, telemetry) = spawn_fake_callback(&callback_path, fake);
-    let mountpoint = temporary.path().join("native-mount");
+    let mountpoint = temporary.path().join("native mount");
     std::fs::create_dir(&mountpoint).unwrap();
     std::fs::set_permissions(&mountpoint, std::fs::Permissions::from_mode(0o700)).unwrap();
     let lease = test_lease(&callback_path, StorageProviderAccessV1::ReadWrite);
@@ -509,7 +509,9 @@ fn linux_native_fuse_mount_supports_all_required_operations() {
     );
     let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
     assert!(mountinfo.lines().any(|line| {
-            line.contains(mountpoint.to_str().unwrap())
+            line.as_bytes().split(|byte| *byte == b' ').nth(4).is_some_and(|field| {
+                crate::mountpoint::unescape_mountinfo(field) == mountpoint.to_str().unwrap().as_bytes()
+            })
                 && line.split_once(" - ").is_some_and(|(_, details)| {
                     let mut fields = details.split_whitespace();
                     matches!(fields.next(), Some("fuse" | "fuse.astrid"))

@@ -101,7 +101,7 @@ pub(crate) fn mountinfo_contains(mountpoint: &Path) -> Result<bool> {
         }))
 }
 
-fn unescape_mountinfo(value: &[u8]) -> Vec<u8> {
+pub(crate) fn unescape_mountinfo(value: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(value.len());
     let mut index = 0;
     while index < value.len() {
