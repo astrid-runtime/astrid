@@ -9,6 +9,7 @@ use std::path::Path;
 
 #[cfg(test)]
 use super::VOLUME_MAGIC;
+use super::recover::FOOTER_BYTES;
 use super::{
     ContainerState, HostedFileVolume, Operation, RECORD_FIXED_BYTES, RECORD_MAGIC, VolumeRegion,
     overlay_extent,
@@ -64,13 +65,39 @@ pub(super) fn append_from(
     if payload_len == 0 {
         return super::HostedFileVolume::append(state, operation, region, offset, &[]);
     }
-    let start = state.valid_len;
-    match append_from_inner(state, operation, region, offset, payload_len, payload) {
+    let preserve_footer = state.generation > 0
+        && state.durable_len != 0
+        && state.physical_tail == super::PhysicalTail::TruncateToValid;
+    let start = if preserve_footer && state.valid_len == state.durable_len {
+        state
+            .durable_len
+            .checked_add(u64::try_from(FOOTER_BYTES).unwrap_or(u64::MAX))
+            .ok_or_else(|| io::Error::other("volume footer offset overflow"))?
+    } else {
+        state.valid_len
+    };
+    let rollback_len = if state.physical_tail == super::PhysicalTail::PreserveSelected {
+        state
+            .file
+            .metadata()
+            .map_or(start, |metadata| metadata.len())
+    } else {
+        start
+    };
+    match append_from_inner(
+        state,
+        operation,
+        region,
+        offset,
+        payload_len,
+        payload,
+        start,
+    ) {
         Ok(result) => Ok(result),
         Err(error) => {
-            let _ = state.file.set_len(start);
-            let _ = state.file.seek(SeekFrom::Start(start));
-            if state.last_commit_offset != 0 && start == state.durable_len {
+            let _ = state.file.set_len(rollback_len);
+            let _ = state.file.seek(SeekFrom::Start(rollback_len));
+            if state.last_commit_offset != 0 && rollback_len == state.durable_len {
                 let _ = super::recover::write_footer(
                     &mut state.file,
                     state.last_commit_offset,
@@ -90,6 +117,7 @@ fn append_from_inner(
     offset: u64,
     payload_len: u64,
     payload: &mut dyn Read,
+    start: u64,
 ) -> io::Result<(u64, u64)> {
     let next_sequence = state
         .sequence
@@ -111,12 +139,14 @@ fn append_from_inner(
     hasher.update(&payload_len.to_le_bytes());
     hasher.update(name);
 
-    // The previous footer ends at `valid_len`; remove it before publishing a
-    // new record. A failed stream leaves footer_pending set so the next sync
-    // restores the prior durable footer.
+    // The previous footer ends at `valid_len` for generation-0 images. A
+    // generation root still names that footer, so place the streamed record
+    // after it and let the next root flip publish the new authority.
     state.footer_pending = true;
-    state.file.set_len(state.valid_len)?;
-    state.file.seek(SeekFrom::Start(state.valid_len))?;
+    if state.physical_tail == super::PhysicalTail::TruncateToValid {
+        state.file.set_len(start)?;
+    }
+    state.file.seek(SeekFrom::Start(start))?;
     state.file.write_all(&RECORD_MAGIC)?;
     state.file.write_all(&total_len.to_le_bytes())?;
     state.file.write_all(&next_sequence.to_le_bytes())?;
@@ -126,22 +156,19 @@ fn append_from_inner(
     state.file.write_all(&payload_len.to_le_bytes())?;
     state.file.write_all(&[0_u8; 32])?;
     state.file.write_all(name)?;
-    let physical_payload = state
-        .valid_len
+    let physical_payload = start
         .checked_add(u64::try_from(RECORD_FIXED_BYTES).unwrap_or(u64::MAX))
         .and_then(|value| value.checked_add(u64::from(name_len)))
         .ok_or_else(|| io::Error::other("volume physical offset overflow"))?;
     copy_and_hash(&mut state.file, payload, payload_len, &mut hasher)?;
     let checksum = *hasher.finalize().as_bytes();
-    let checksum_at = state
-        .valid_len
+    let checksum_at = start
         .checked_add(RECORD_CHECKSUM_OFFSET)
         .ok_or_else(|| io::Error::other("volume checksum offset overflow"))?;
     state.file.seek(SeekFrom::Start(checksum_at))?;
     state.file.write_all(&checksum)?;
     state.boundary_pending = false;
-    state.valid_len = state
-        .valid_len
+    state.valid_len = start
         .checked_add(total_len)
         .ok_or_else(|| io::Error::other("volume length overflow"))?;
     state.sequence = next_sequence;

@@ -6,7 +6,7 @@ fn append_valid_uncommitted_write(path: &std::path::Path, sequence: u64, payload
     append_valid_record(path, sequence, Operation::Write, b"objects", 0, payload);
 }
 
-fn append_valid_record(
+pub(super) fn append_valid_record(
     path: &std::path::Path,
     sequence: u64,
     operation: Operation,
@@ -60,6 +60,20 @@ fn hosted_volume_rejects_astvol2_header() {
 }
 
 #[test]
+fn open_rejects_truncated_astvol1_header() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("astrid.volume");
+    std::fs::write(&path, b"ASTV").unwrap();
+    let error = HostedFileVolume::open(&path).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        error.to_string().contains("invalid Astrid volume header"),
+        "{error}"
+    );
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 4);
+}
+
+#[test]
 fn hosted_volume_recovers_regions_without_host_directory_projection() {
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("astrid.volume");
@@ -77,35 +91,6 @@ fn hosted_volume_recovers_regions_without_host_directory_projection() {
     assert_eq!(volume.read_region_at(&region, 0, &mut bytes).unwrap(), 8);
     assert_eq!(&bytes, b"abXYef\0\0");
     assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
-}
-
-#[test]
-fn legacy_empty_commit_recovers_without_hashing_write_payloads() {
-    let temporary = tempfile::tempdir().unwrap();
-    let path = temporary.path().join("astrid.volume");
-    std::fs::write(&path, VOLUME_MAGIC).unwrap();
-    append_valid_record(&path, 1, Operation::Create, b"objects", 0, &[]);
-    append_valid_record(&path, 2, Operation::Write, b"objects", 0, b"legacy");
-    append_valid_record(
-        &path,
-        3,
-        Operation::Commit,
-        COMMIT_REGION.as_bytes(),
-        0,
-        &[],
-    );
-    let mut bytes = std::fs::read(&path).unwrap();
-    let create_length = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-    let write_offset = VOLUME_MAGIC.len() as u64 + create_length;
-    bytes[usize::try_from(write_offset).unwrap() + 43] ^= 0x80;
-    std::fs::write(&path, bytes).unwrap();
-
-    let volume = HostedFileVolume::open(&path).unwrap();
-    let mut recovered = [0_u8; 6];
-    volume
-        .read_region_at(&VolumeRegion::new("objects").unwrap(), 0, &mut recovered)
-        .unwrap();
-    assert_eq!(&recovered, b"legacy");
 }
 
 #[test]
@@ -210,6 +195,35 @@ fn reclaim_blocks_concurrent_open_during_unlock_swap_and_preserves_active_path()
     assert!(bytes.iter().all(|byte| *byte == 0xCD));
     assert!(!reclaim::temp_path(&path).exists());
     assert!(!reclaim::previous_path(&path).exists());
+}
+
+#[test]
+fn legacy_empty_commit_recovers_without_hashing_write_payloads() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    std::fs::write(&path, VOLUME_MAGIC).unwrap();
+    append_valid_record(&path, 1, Operation::Create, b"objects", 0, &[]);
+    append_valid_record(&path, 2, Operation::Write, b"objects", 0, b"legacy");
+    append_valid_record(
+        &path,
+        3,
+        Operation::Commit,
+        COMMIT_REGION.as_bytes(),
+        0,
+        &[],
+    );
+    let mut bytes = std::fs::read(&path).unwrap();
+    let create_length = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+    let write_offset = VOLUME_MAGIC.len() as u64 + create_length;
+    bytes[usize::try_from(write_offset).unwrap() + 43] ^= 0x80;
+    std::fs::write(&path, bytes).unwrap();
+
+    let volume = HostedFileVolume::open(&path).unwrap();
+    let mut recovered = [0_u8; 6];
+    volume
+        .read_region_at(&VolumeRegion::new("objects").unwrap(), 0, &mut recovered)
+        .unwrap();
+    assert_eq!(&recovered, b"legacy");
 }
 
 #[test]
