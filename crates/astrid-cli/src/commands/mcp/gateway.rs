@@ -410,7 +410,7 @@ impl ConnectionGuard {
         let previous = self.state.active_connections.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "gateway connection count underflow");
         if previous == 1 {
-            self.state.connections_drained.notify_waiters();
+            self.state.connections_drained.notify_one();
         }
     }
 }
@@ -568,6 +568,13 @@ async fn accept_loop(
     tokio::pin!(idle);
     loop {
         tokio::select! {
+            biased;
+            () = state.shutdown.cancelled() => return Ok(ExitCode::SUCCESS),
+            // Retain and consume the final disconnect before an expired timer.
+            () = state.connections_drained.notified() => {
+                idle.as_mut().reset(Instant::now().checked_add(idle_grace)
+                    .context("MCP idle deadline exceeds the clock range")?);
+            }
             accepted = listener.accept() => {
                 let (stream, _) = accepted.context("MCP gateway listener failed")?;
                 idle.as_mut().reset(Instant::now().checked_add(idle_grace)
@@ -583,10 +590,6 @@ async fn accept_loop(
                     }
                 });
             }
-            () = state.connections_drained.notified() => {
-                idle.as_mut().reset(Instant::now().checked_add(idle_grace)
-                    .context("MCP idle deadline exceeds the clock range")?);
-            }
             () = &mut idle => {
                 if state.active_connections.load(Ordering::Acquire) == 0 {
                     return Ok(ExitCode::SUCCESS);
@@ -595,12 +598,6 @@ async fn accept_loop(
                 idle.as_mut().reset(Instant::now().checked_add(idle_grace)
                     .context("MCP idle deadline exceeds the clock range")?);
             }
-            () = state.shutdown.cancelled() => {
-                // Stop handing out new transports. `run` can now drain the
-                // connections already admitted, finish teardown, and publish
-                // the one final ACK without waiting for this loop.
-                return Ok(ExitCode::SUCCESS);
-            },
         }
     }
 }

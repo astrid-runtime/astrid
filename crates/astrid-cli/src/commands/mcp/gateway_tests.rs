@@ -6,6 +6,23 @@ use tokio::time::Instant;
 use super::*;
 
 #[tokio::test]
+async fn final_disconnect_is_retained_between_accept_iterations() {
+    let state = Arc::new(GatewayState::new(
+        PathBuf::from("/runtime-home"),
+        astrid_core::PrincipalId::new("codex-code").expect("principal"),
+        "token".into(),
+    ));
+    let connection = state.connection();
+    drop(connection);
+    timeout(
+        Duration::from_millis(100),
+        state.connections_drained.notified(),
+    )
+    .await
+    .expect("final disconnect must survive without a registered waiter");
+}
+
+#[tokio::test]
 async fn gateway_idle_shutdown_waits_for_the_final_connection() {
     let directory = tempfile::tempdir().expect("socket directory");
     let listener = UnixListener::bind(directory.path().join("gateway.sock")).expect("listener");
