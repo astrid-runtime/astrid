@@ -68,6 +68,7 @@ pub(super) fn append_from(
     match append_from_inner(state, operation, region, offset, payload_len, payload) {
         Ok(result) => Ok(result),
         Err(error) => {
+            state.flush_state = super::FlushState::Required;
             let _ = state.file.set_len(start);
             let _ = state.file.seek(SeekFrom::Start(start));
             if state.last_commit_offset != 0 && start == state.durable_len {
@@ -114,6 +115,7 @@ fn append_from_inner(
     // The previous footer ends at `valid_len`; remove it before publishing a
     // new record. A failed stream leaves footer_pending set so the next sync
     // restores the prior durable footer.
+    state.flush_state = super::FlushState::Required;
     state.footer_pending = true;
     state.file.set_len(state.valid_len)?;
     state.file.seek(SeekFrom::Start(state.valid_len))?;

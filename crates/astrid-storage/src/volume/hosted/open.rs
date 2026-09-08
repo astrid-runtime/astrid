@@ -129,6 +129,7 @@ impl HostedFileVolume {
             last_commit_has_snapshot: recovery.last_commit_has_snapshot,
             boundary_pending: false,
             footer_pending,
+            flush_state: super::FlushState::Required,
             regions: recovery.regions,
         };
         if footer_pending {
