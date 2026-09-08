@@ -1,8 +1,10 @@
 # Changelog
 
-Notable user-facing changes compared with the preceding published release.
-Astrid uses [year.month.patch versions](release/VERSIONING.md) beginning with 2026.9.0.
-Historical release entries below are preserved.
+Notable changes to Astrid are recorded here.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
+2026.9.0. Entries describe net changes since the preceding published release.
 
 ## [Unreleased]
 
@@ -50,7 +52,12 @@ Historical release entries below are preserved.
   retries are preserved; the volume format is unchanged.
 - Updated to Wasmtime 48.0.1 and refreshed compatible dependencies. Older
   compiled Wasmtime caches are rebuilt.
-- Removed the unused SurrealDB wrapper. Provider execution belongs to capsules,
+- See the [upgrade notes and limitations](release/UPGRADING-2026.9.0.md)
+  before migrating from 0.10.4.
+
+### Removed
+
+- The unused SurrealDB wrapper. Provider execution belongs to capsules,
   not host-level LLM configuration.
 
 ### Fixed
@@ -71,25 +78,14 @@ Historical release entries below are preserved.
   and root timestamps instead of placeholder filesystem statistics.
 - Mounted files can exceed the 4 MiB callback payload limit without buffering
   the complete file.
+
+### Security
+
 - Host-process injection limits, approved-executable identity, shared
   environment authorization, uplink key-method enforcement, WASM resource
   limits, and durable device revocation.
 - Capsule provenance and Distro checks preserve signed identities; generic
   first-use trust remains distinct from product-pinned trust.
-
-### Upgrade notes and limitations
-
-- This release follows 0.10.4. Intermediate development versions and repairs to
-  unreleased implementations are consolidated rather than listed as releases.
-- Legacy host `[model]` settings must migrate to capsule-owned providers;
-  unsupported settings are rejected with guidance.
-- One resize or write may synthesize at most 4 MiB of zero-filled gap. Larger
-  sparse extensions are unsupported; contiguous file growth is not capped at
-  4 MiB.
-- Mounting requires the platform frontend and its permission setup. Windows
-  native checks do not establish a shipped Windows filesystem mount.
-- Performance is workload-dependent; no universal native-filesystem or
-  state-of-the-art performance claim is made.
 
 ## [0.10.4] - 2026-07-20
 
@@ -1123,7 +1119,7 @@ Breaking changes to note: `Capsule.toml` moves to `[publish]` / `[subscribe]` ta
 Initial tracked release. See the [repository history](https://github.com/astrid-runtime/astrid/commits/v0.2.0)
 for changes included in this version.
 
-[Unreleased]: https://github.com/astrid-runtime/astrid/compare/v0.10.4...HEAD
+[Unreleased]: https://github.com/astrid-runtime/astrid/compare/v2026.9.0...HEAD
 [2026.9.0]: https://github.com/astrid-runtime/astrid/compare/v0.10.4...HEAD
 [0.10.4]: https://github.com/astrid-runtime/astrid/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/astrid-runtime/astrid/compare/v0.10.2...v0.10.3
