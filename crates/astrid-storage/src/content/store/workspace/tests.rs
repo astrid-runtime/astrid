@@ -29,6 +29,53 @@ fn content_with_engine() -> (Arc<TestContent>, Arc<TestEngine>) {
 }
 
 #[test]
+fn workspace_streaming_preserves_base_and_failed_source_does_not_publish() {
+    use std::io::{self, Read};
+    struct Failing;
+    impl Read for Failing {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("injected source failure"))
+        }
+    }
+    let content = content();
+    let branches = WorkspaceBranchStore::new(Arc::clone(&content));
+    let owner = owner();
+    let name = ContentName::new("large").unwrap();
+    content.put(&owner, &name, b"base").unwrap();
+    let id = WorkspaceUid::from_bytes([83; 16]);
+    branches.begin_with_uid(&owner, id).unwrap();
+    let fs = branches.filesystem(owner, id);
+    let path = FilesystemPath::new("large").unwrap();
+    let size = 4 * 1024 * 1024 + 1;
+    fs.write_streaming(&path, io::repeat(0x5a).take(size))
+        .unwrap();
+    assert_eq!(fs.stat(&path).unwrap().logical_bytes(), size);
+    assert_eq!(fs.read(&path, size - 4, 4).unwrap(), [0x5a; 4]);
+    assert_eq!(content.read(&owner, &name).unwrap().unwrap(), b"base");
+    assert!(fs.write_streaming(&path, Failing).is_err());
+    assert_eq!(fs.stat(&path).unwrap().logical_bytes(), size);
+    assert_eq!(fs.read(&path, size - 4, 4).unwrap(), [0x5a; 4]);
+}
+
+#[test]
+fn workspace_streaming_refuses_quota_without_replacing_the_file() {
+    use std::io::Read;
+    let content = content_with_quota(64);
+    let branches = WorkspaceBranchStore::new(Arc::clone(&content));
+    let owner = owner();
+    let id = WorkspaceUid::from_bytes([84; 16]);
+    branches.begin_with_uid(&owner, id).unwrap();
+    let fs = branches.filesystem(owner, id);
+    let path = FilesystemPath::new("note").unwrap();
+    fs.write(&path, b"original").unwrap();
+    assert!(
+        fs.write_streaming(&path, std::io::repeat(0).take(65))
+            .is_err()
+    );
+    assert_eq!(fs.read(&path, 0, 8).unwrap(), b"original");
+}
+
+#[test]
 fn fork_shares_root_and_divergent_write_isolated() {
     let content = content();
     let branches = WorkspaceBranchStore::new(Arc::clone(&content));
