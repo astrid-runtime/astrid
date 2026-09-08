@@ -57,7 +57,10 @@ Historical release entries below are preserved.
 
 - Authoritative stop waits for the daemon and MCP gateway to exit and clears
   coordination state. Failed MCP launches clean up children; ephemeral daemons
-  shut down after their final client disconnects.
+  shut down after their final client disconnects. Cancelling the host that
+  started a shared gateway no longer disconnects its other attached hosts.
+  Explicit `astrid start` remains persistent; automatic host startup uses
+  connection-owned lifetime and retires the stopped projection.
 - Principal-specific discovery, configuration, secrets, and lifecycle hooks no
   longer fall back to another principal's state.
 - Restart budgets survive runtime replacement, lazy WASM pools handle epoch
