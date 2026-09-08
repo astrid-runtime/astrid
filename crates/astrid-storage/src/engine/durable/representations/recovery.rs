@@ -1,5 +1,8 @@
 //! Recovery and closed-world validation for physical representation authority.
 
+#[cfg(test)]
+mod tests;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::SeekFrom;
 
@@ -134,6 +137,9 @@ pub(super) fn recover_journal<F: DurableIo>(
     };
     validate_tail_budget(entries.len(), bytes.len(), checkpoint_end, current)?;
     let mut previous_state = None;
+    // Metadata is immutable for this replay. Only successfully checked closures
+    // may be reused across historical states; CAS and generation checks still run.
+    let mut complete_maps = BTreeSet::new();
     let entry_count = entries.len();
     for (position, (offset, entry)) in entries.into_iter().enumerate().skip(1) {
         let JournalEntry::StateCas {
@@ -151,7 +157,7 @@ pub(super) fn recover_journal<F: DurableIo>(
                 "representation journal CAS conflict",
             ));
         }
-        if !state_metadata_closure_complete(replacement, metadata)? {
+        if !state_metadata_closure_complete(replacement, metadata, &mut complete_maps)? {
             if position.checked_add(1) != Some(entry_count) {
                 return Err(DurableError::InvalidRepresentationState(
                     "interior representation journal state has an incomplete metadata closure",
@@ -187,6 +193,7 @@ pub(super) fn recover_journal<F: DurableIo>(
 fn state_metadata_closure_complete(
     state_id: RepresentationStateId,
     metadata: &MetadataIndex,
+    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
 ) -> Result<bool, DurableError> {
     let Some(state_bytes) = metadata
         .values
@@ -214,7 +221,7 @@ fn state_metadata_closure_complete(
         catalogue.representations_root(),
         placements.entries_root(),
     ] {
-        if !map_closure_complete(root, &metadata.nodes) {
+        if !map_closure_complete(root, &metadata.nodes, complete) {
             return Ok(false);
         }
     }
@@ -224,6 +231,7 @@ fn state_metadata_closure_complete(
 fn map_closure_complete(
     root: Option<crate::storage_model::PhysicalMapNodeId>,
     nodes: &BTreeMap<crate::storage_model::PhysicalMapNodeId, PhysicalMapNode>,
+    complete: &mut BTreeSet<crate::storage_model::PhysicalMapNodeId>,
 ) -> bool {
     let Some(root) = root else {
         return true;
@@ -231,7 +239,7 @@ fn map_closure_complete(
     let mut pending = vec![root];
     let mut visited = BTreeSet::new();
     while let Some(id) = pending.pop() {
-        if !visited.insert(id) {
+        if complete.contains(&id) || !visited.insert(id) {
             continue;
         }
         let Some(node) = nodes.get(&id) else {
@@ -245,6 +253,8 @@ fn map_closure_complete(
             PhysicalMapNode::Leaf { .. } | PhysicalMapNode::Page { .. } => {},
         }
     }
+    // Never remember a partial traversal that encountered a missing descendant.
+    complete.extend(visited);
     true
 }
 
