@@ -1,9 +1,8 @@
-//! Idle-EOF ceiling for gateway attach readers.
+//! Activity tracking for capacity-bound gateway admission.
 //!
-//! This is a protocol leak guard, not an operator config knob. Codex keeps a
-//! stdio child per conversation and does not always drop it when the thread
-//! ends; a reader without a deadline would pin a broker slot forever. Same
-//! class as `MAX_ATTACHES` and `REGISTRATION_TIMEOUT`.
+//! Silence is not EOF: a connected host can spend minutes thinking or waiting
+//! for user input. Track traffic for the existing capacity-pressure eviction
+//! policy, but close ordinary connections only when their transport closes.
 
 use std::io;
 use std::pin::Pin;
@@ -12,28 +11,24 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::time::{Instant, Sleep};
+use tokio::time::Instant;
 
-/// Production attach sockets that go silent are reaped after two minutes.
+/// Quiet slots become eviction candidates only when admission reaches its cap.
 #[cfg(not(test))]
-pub(crate) const ATTACH_IDLE_EOF: Duration = Duration::from_mins(2);
-/// Tests use a tight bound so idle-EOF is deterministic in milliseconds.
+pub(crate) const ATTACH_IDLE_THRESHOLD: Duration = Duration::from_mins(2);
+/// Tests exercise the same quiet period with a shorter bound.
 #[cfg(test)]
-pub(crate) const ATTACH_IDLE_EOF: Duration = Duration::from_millis(80);
+pub(crate) const ATTACH_IDLE_THRESHOLD: Duration = Duration::from_millis(80);
 
-pub(crate) struct IdleEof<R> {
+pub(crate) struct ActivityReader<R> {
     inner: R,
-    idle: Duration,
-    sleep: Pin<Box<Sleep>>,
     last_activity: Arc<Mutex<Instant>>,
 }
 
-impl<R> IdleEof<R> {
-    pub(crate) fn new(inner: R, idle: Duration, last_activity: Arc<Mutex<Instant>>) -> Self {
+impl<R> ActivityReader<R> {
+    pub(crate) fn new(inner: R, last_activity: Arc<Mutex<Instant>>) -> Self {
         Self {
             inner,
-            idle,
-            sleep: Box::pin(tokio::time::sleep(idle)),
             last_activity,
         }
     }
@@ -43,13 +38,10 @@ impl<R> IdleEof<R> {
         if let Ok(mut guard) = self.last_activity.lock() {
             *guard = now;
         }
-        self.sleep
-            .as_mut()
-            .reset(now.checked_add(self.idle).unwrap_or(now));
     }
 }
 
-impl<R: AsyncRead + Unpin> AsyncRead for IdleEof<R> {
+impl<R: AsyncRead + Unpin> AsyncRead for ActivityReader<R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -65,13 +57,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for IdleEof<R> {
                 Poll::Ready(Ok(()))
             },
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-            Poll::Pending => match this.sleep.as_mut().poll(cx) {
-                Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "MCP attach idle-EOF",
-                ))),
-                Poll::Pending => Poll::Pending,
-            },
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -85,42 +71,47 @@ pub(crate) fn is_idle(last_activity: &Mutex<Instant>, idle: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::time::Instant;
 
-    use super::{ATTACH_IDLE_EOF, IdleEof, is_idle};
+    use super::{ATTACH_IDLE_THRESHOLD, ActivityReader, is_idle};
 
     #[tokio::test]
-    async fn idle_reader_times_out_without_bytes() {
-        let (_peer, stream) = tokio::io::duplex(32);
+    async fn connected_reader_survives_quiet_period_then_accepts_request() {
+        let (mut peer, stream) = tokio::io::duplex(32);
         let last = Arc::new(Mutex::new(Instant::now()));
-        let mut reader = IdleEof::new(BufReader::new(stream), ATTACH_IDLE_EOF, last);
-        let started = Instant::now();
-        let error = reader
-            .read_u8()
+        let mut reader = ActivityReader::new(BufReader::new(stream), last);
+        assert!(
+            tokio::time::timeout(ATTACH_IDLE_THRESHOLD * 2, reader.read_u8())
+                .await
+                .is_err(),
+            "silence is not a client disconnect"
+        );
+        peer.write_u8(b'x')
             .await
-            .expect_err("silent attach must idle-EOF");
-        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        assert!(error.to_string().contains("idle-EOF"), "{error}");
-        assert!(started.elapsed() >= ATTACH_IDLE_EOF);
-        assert!(started.elapsed() < Duration::from_secs(2));
+            .expect("request after quiet period");
+        assert_eq!(reader.read_u8().await.expect("request byte"), b'x');
+        drop(peer);
+        assert_eq!(
+            reader.read_u8().await.expect_err("real EOF").kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
     }
 
     #[tokio::test]
-    async fn idle_reader_resets_after_traffic_and_survives_the_original_deadline() {
+    async fn traffic_refreshes_capacity_eviction_activity() {
         let (mut peer, stream) = tokio::io::duplex(32);
         let last = Arc::new(Mutex::new(Instant::now()));
-        let mut reader = IdleEof::new(BufReader::new(stream), ATTACH_IDLE_EOF, Arc::clone(&last));
+        let mut reader = ActivityReader::new(BufReader::new(stream), Arc::clone(&last));
         tokio::spawn(async move {
-            tokio::time::sleep(ATTACH_IDLE_EOF / 2).await;
+            tokio::time::sleep(ATTACH_IDLE_THRESHOLD / 2).await;
             peer.write_u8(b'x').await.expect("traffic");
-            tokio::time::sleep(ATTACH_IDLE_EOF * 7 / 8).await;
+            tokio::time::sleep(ATTACH_IDLE_THRESHOLD * 7 / 8).await;
             let _ = peer.write_u8(b'y').await;
         });
         assert_eq!(reader.read_u8().await.expect("byte"), b'x');
-        assert!(!is_idle(&last, ATTACH_IDLE_EOF));
+        assert!(!is_idle(&last, ATTACH_IDLE_THRESHOLD));
         assert_eq!(reader.read_u8().await.expect("reset byte"), b'y');
     }
 }
