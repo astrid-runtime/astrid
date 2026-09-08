@@ -510,6 +510,9 @@ pub(crate) async fn run(principal: Option<&str>) -> Result<ExitCode> {
 
     let accept_result = accept_loop(listener, Arc::clone(&state), idle_grace).await;
     let control_stop = state.shutdown.is_cancelled();
+    let daemon_pid =
+        crate::commands::daemon_control::read_pid_file(&crate::socket_client::pid_path())
+            .map(|(pid, _)| pid);
     state.shutdown.cancel();
     let cleanup_result = shutdown_gateway(
         &state,
@@ -539,7 +542,11 @@ pub(crate) async fn run(principal: Option<&str>) -> Result<ExitCode> {
         .context("shutdown stage gateway.final_ack_delivery")?;
     }
 
-    combine_gateway_results(accept_result, cleanup_result)
+    let result = combine_gateway_results(accept_result, cleanup_result);
+    if result.is_ok() && !control_stop {
+        crate::commands::daemon::retire_disconnected_projection(daemon_pid).await?;
+    }
+    result
 }
 
 fn combine_gateway_results(accept: Result<ExitCode>, cleanup: Result<()>) -> Result<ExitCode> {

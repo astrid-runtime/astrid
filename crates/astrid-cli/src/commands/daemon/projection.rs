@@ -5,6 +5,28 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use astrid_core::dirs::AstridHome;
 
+/// Finish natural MCP retirement without stopping an operator-owned daemon.
+/// Recheck under the startup fence so a replacement cannot race the pack.
+pub(crate) async fn retire_disconnected_projection(pid: Option<u32>) -> Result<()> {
+    let Some(pid) = pid else {
+        return Ok(());
+    };
+    if !crate::commands::daemon_control::wait_for_exit(pid, crate::commands::daemon_control::GRACE)
+        .await
+    {
+        return Ok(());
+    }
+    let _fence = super::acquire_daemon_start_fence().await?;
+    if super::recorded_daemon_pid_is_alive()
+        || astrid_core::local_transport::endpoint_is_present(
+            &crate::socket_client::proxy_socket_path(),
+        )?
+    {
+        return Ok(());
+    }
+    pack_stopped_projection().await
+}
+
 #[expect(
     clippy::unnecessary_wraps,
     reason = "the quota hook requires the storage projection's Result shape"
