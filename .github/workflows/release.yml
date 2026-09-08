@@ -427,14 +427,12 @@ jobs:
     name: Native FSKit mount certification
     needs: [classify, build]
     if: ${{ !inputs.prepare_only }}
-    uses: ./.github/workflows/native-storage-certification.yml
+    uses: ./.github/workflows/supervised-storage-certification.yml
     permissions:
       contents: read
       actions: read
     with:
       source_commit: ${{ needs.classify.outputs.source-commit }}
-      runner_contract_acknowledged: true
-      consume_same_run_artifacts: true
 
   # ── Create the GitHub release with all binaries ───────────────────
   github-release:
