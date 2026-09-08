@@ -11,7 +11,11 @@
 
 ---
 
-Astrid is a portable runtime for software built from WebAssembly **capsules**.
+Astrid is an operating-system project for software built from WebAssembly
+**capsules**. Today it runs as a portable user-space runtime on macOS and Linux;
+the direction is a standalone operating system. This release is the hosted
+runtime, not a bootable OS image.
+
 Run components in a sandbox, connect them through typed interfaces, and give
 each principal its own capabilities and durable state. Install, upgrade, and
 remove capsules while the runtime is running.
