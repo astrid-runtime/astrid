@@ -119,7 +119,9 @@ create_signing_keychain() {
 }
 
 import_developer_id() {
+  # The temporary filename ends in a PID, so format inference cannot use .p12.
   security import "$P12_PATH" \
+    -f pkcs12 \
     -k "$SIGNING_KEYCHAIN" \
     -P "$ASTRID_MACOS_DEVELOPER_ID_P12_PASSWORD" \
     -T /usr/bin/codesign
