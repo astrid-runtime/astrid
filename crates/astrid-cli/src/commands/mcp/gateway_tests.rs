@@ -583,7 +583,7 @@ async fn acquire_evicts_idle_lru_then_admits() {
     use tokio::time::Instant;
     use tokio_util::sync::CancellationToken;
 
-    use super::{ATTACH_IDLE_EOF, AttachSlot};
+    use super::{ATTACH_IDLE_THRESHOLD, AttachSlot};
     use uuid::Uuid;
 
     let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
@@ -597,7 +597,7 @@ async fn acquire_evicts_idle_lru_then_admits() {
         let cancel = CancellationToken::new();
         let done = Arc::new(Notify::new());
         let last = Instant::now()
-            .checked_sub(ATTACH_IDLE_EOF + std::time::Duration::from_millis(5))
+            .checked_sub(ATTACH_IDLE_THRESHOLD + std::time::Duration::from_millis(5))
             .expect("idle timestamp");
         state
             .install_slot(

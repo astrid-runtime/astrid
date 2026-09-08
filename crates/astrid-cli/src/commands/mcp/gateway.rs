@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use super::idle::{ATTACH_IDLE_EOF, IdleEof, is_idle};
+use super::idle::{ATTACH_IDLE_THRESHOLD, ActivityReader, is_idle};
 
 use super::lifecycle::{
     ATTACH_REGISTRATION_VERSION, AttachRegistration, GATEWAY_CONTROL_VERSION, GatewayControlAck,
@@ -259,7 +259,7 @@ impl GatewayState {
         let mut slots = self.slots.lock().await;
         let idle_key = slots
             .iter()
-            .filter(|(_, slot)| is_idle(&slot.last_activity, ATTACH_IDLE_EOF))
+            .filter(|(_, slot)| is_idle(&slot.last_activity, ATTACH_IDLE_THRESHOLD))
             .min_by_key(|(_, slot)| {
                 slot.last_activity
                     .lock()
@@ -692,7 +692,7 @@ async fn serve_attach(
             },
         )
         .await;
-    let reader = IdleEof::new(reader, ATTACH_IDLE_EOF, last_activity);
+    let reader = ActivityReader::new(reader, last_activity);
 
     info!(
         principal = %principal_key,
