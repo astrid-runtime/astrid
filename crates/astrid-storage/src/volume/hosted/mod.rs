@@ -57,6 +57,12 @@ impl Clone for RegionState {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum FlushState {
+    Required,
+    Confirmed,
+}
+
 #[derive(Debug)]
 struct ContainerState {
     file: File,
@@ -67,6 +73,9 @@ struct ContainerState {
     last_commit_has_snapshot: bool,
     boundary_pending: bool,
     footer_pending: bool,
+    // Process-local proof only: set after a successful full flush, cleared
+    // before any file mutation. A recovered footer is not this proof.
+    flush_state: FlushState,
     regions: BTreeMap<VolumeRegion, RegionState>,
 }
 
@@ -119,6 +128,7 @@ impl HostedFileVolume {
 
         // A footer occupies the old valid-end until the next append. Truncate
         // it before writing the next ASTREG1 record; valid_len excludes it.
+        state.flush_state = FlushState::Required;
         state.footer_pending = true;
         state.file.set_len(state.valid_len)?;
         state.file.seek(SeekFrom::Start(state.valid_len))?;
@@ -147,13 +157,24 @@ impl HostedFileVolume {
     }
 
     fn make_durable(state: &mut ContainerState) -> io::Result<()> {
+        Self::make_durable_with(state, File::sync_all)
+    }
+
+    fn make_durable_with(
+        state: &mut ContainerState,
+        flush: impl FnOnce(&File) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if state.flush_state == FlushState::Confirmed {
+            return Ok(());
+        }
         if state.last_commit_offset == 0
             && state.valid_len == VOLUME_MAGIC.len() as u64
             && state.regions.is_empty()
         {
             // Preserve the empty-container grammar: there is no commit to
             // point at until the first namespace mutation is durable.
-            state.file.sync_all()?;
+            flush(&state.file)?;
+            state.flush_state = FlushState::Confirmed;
             return Ok(());
         }
         if (state.valid_len != state.durable_len
@@ -178,9 +199,10 @@ impl HostedFileVolume {
                 state.sequence,
             )?;
         }
-        state.file.sync_all()?;
+        flush(&state.file)?;
         state.boundary_pending = false;
         state.footer_pending = false;
+        state.flush_state = FlushState::Confirmed;
         Ok(())
     }
 }
@@ -657,3 +679,6 @@ pub(crate) use stream::write_record_payloads;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod sync_tests;
