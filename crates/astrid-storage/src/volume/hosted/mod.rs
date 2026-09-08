@@ -38,6 +38,7 @@ struct Extent {
 thread_local! {
     static REGION_STATE_CLONES: Cell<usize> = const { Cell::new(0) };
     static EXTENT_VISITS: Cell<usize> = const { Cell::new(0) };
+    static MUTATION_EXTENT_VISITS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[derive(Debug, Default)]
@@ -617,8 +618,12 @@ fn overlay_extent(extents: &mut BTreeMap<u64, Extent>, start: u64, end: u64, phy
     if start >= end {
         return;
     }
+    // Extents never overlap, so only the predecessor can cross `start`.
+    // All earlier extents are irrelevant even when this is a pure append.
+    let first = mutation_start(extents, start);
     let overlapping = extents
-        .range(..end)
+        .range(first..end)
+        .inspect(|_| record_mutation_extent_visit())
         .filter(|(_, extent)| extent.logical_end > start)
         .map(|(offset, extent)| (*offset, *extent))
         .collect::<Vec<_>>();
@@ -655,8 +660,10 @@ fn overlay_extent(extents: &mut BTreeMap<u64, Extent>, start: u64, end: u64, phy
 }
 
 fn truncate_extents(extents: &mut BTreeMap<u64, Extent>, length: u64) {
+    let first = mutation_start(extents, length);
     let affected = extents
-        .range(..)
+        .range(first..)
+        .inspect(|_| record_mutation_extent_visit())
         .filter(|(start, extent)| **start >= length || extent.logical_end > length)
         .map(|(start, extent)| (*start, *extent))
         .collect::<Vec<_>>();
@@ -674,6 +681,19 @@ fn truncate_extents(extents: &mut BTreeMap<u64, Extent>, length: u64) {
     }
 }
 
+fn mutation_start(extents: &BTreeMap<u64, Extent>, offset: u64) -> u64 {
+    extents
+        .range(..=offset)
+        .next_back()
+        .and_then(|(start, extent)| (extent.logical_end > offset).then_some(*start))
+        .unwrap_or(offset)
+}
+
+fn record_mutation_extent_visit() {
+    #[cfg(test)]
+    MUTATION_EXTENT_VISITS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
 #[cfg(test)]
 pub(crate) use stream::write_record_payloads;
 
@@ -682,3 +702,6 @@ mod tests;
 
 #[cfg(test)]
 mod sync_tests;
+
+#[cfg(test)]
+mod extent_mutation_tests;
