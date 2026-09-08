@@ -1,7 +1,7 @@
 # Changelog
 
 Notable user-facing changes compared with the preceding published release.
-Astrid uses calendar-based versions beginning with 2026.9.0.
+Astrid uses [year.month.patch versions](release/VERSIONING.md) beginning with 2026.9.0.
 Historical release entries below are preserved.
 
 ## [Unreleased]
