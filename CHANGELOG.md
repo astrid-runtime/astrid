@@ -28,6 +28,10 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 - Pre-mount client configuration for run and administrative timeouts.
   `ASTRID_ADMIN_TIMEOUT_SECS` supplies the administrative fallback; explicit
   client configuration takes precedence.
+- Bounded conditional KV batches published through one durable root transition,
+  with journal recovery and opt-in governed read caching.
+- Durable human and fleet ownership identities, independent of principal names.
+- Foreground daemon logging to stderr through `ASTRID_DAEMON_LOG_TARGET=stderr`.
 
 ### Changed
 
@@ -41,7 +45,7 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 - MCP supports protocol 2026-07-28 and shared, session-scoped gateway
   attachments. Quiet connected sessions remain attached; automatic gateway
   and daemon lifetime follows their connections. Run-loop capsule tools
-  participate in discovery.
+  participate in discovery. RMCP is updated from 2.2.0 to 3.1.4.
 - Capsule archives are reproducible for identical inputs; capsule builds honor
   Cargo's resolved target configuration.
 - Durable writes and journal recovery reuse verified immutable map subtrees
@@ -50,8 +54,14 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
   affected ranges, and unchanged volumes avoid redundant device flushes.
   Canonical content identity, quota checks, atomic publication, and failed-flush
   retries are preserved; the volume format is unchanged.
-- Updated to Wasmtime 48.0.1 and refreshed compatible dependencies. Older
-  compiled Wasmtime caches are rebuilt.
+- The Astrid workspace and versioned runtime crates advance from 0.10.4 to
+  2026.9.0 using the documented calendar version convention.
+- Wasmtime advances from 46.0.1 to 48.0.1; older compiled caches are rebuilt.
+  Direct WASM tooling advances from the 0.253 family to 0.257.1, Syn from 2 to
+  3, TOML from 0.9 to 1.1, and Base64 from 0.22 to 0.23.
+- Tokio advances from 1.52.3 to 1.53.1, UUID from 1.23.4 to 1.25.0, and
+  SurrealKV from 0.21.2 to 0.21.3. The [complete dependency inventory](release/DEPENDENCIES-2026.9.0.md)
+  itemizes all lockfile version changes, additions, and removals since 0.10.4.
 - See the [upgrade notes and limitations](release/UPGRADING-2026.9.0.md)
   before migrating from 0.10.4.
 
@@ -78,6 +88,8 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
   and root timestamps instead of placeholder filesystem statistics.
 - Mounted files can exceed the 4 MiB callback payload limit without buffering
   the complete file.
+- Component-level capsule capabilities are merged completely during discovery,
+  rather than silently dropping network, identity, or persistence declarations.
 
 ### Security
 
