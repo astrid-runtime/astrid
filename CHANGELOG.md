@@ -72,6 +72,8 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ### Fixed
 
+- Release publication supports supervised, exact-archive macOS certification
+  through protected operator approval when a dedicated FSKit runner is absent.
 - Authoritative stop waits for the daemon and MCP gateway to exit and clears
   coordination state. Failed MCP launches clean up children; ephemeral daemons
   shut down after their final client disconnects. Cancelling the host that
