@@ -13,6 +13,14 @@ pub(super) trait CallbackFilesystem {
         length: u64,
     ) -> Result<Vec<u8>, FilesystemError>;
     fn write(&self, path: &FilesystemPath, bytes: &[u8]) -> Result<(), FilesystemError>;
+    fn try_append(
+        &self,
+        _path: &FilesystemPath,
+        _expected_length: u64,
+        _bytes: &[u8],
+    ) -> Result<bool, FilesystemError> {
+        Ok(false)
+    }
     fn write_streaming(
         &self,
         path: &FilesystemPath,
@@ -53,6 +61,15 @@ where
 
     fn write(&self, path: &FilesystemPath, bytes: &[u8]) -> Result<(), FilesystemError> {
         AstridFilesystem::write(self, path, bytes)
+    }
+
+    fn try_append(
+        &self,
+        path: &FilesystemPath,
+        expected_length: u64,
+        bytes: &[u8],
+    ) -> Result<bool, FilesystemError> {
+        AstridFilesystem::try_append(self, path, expected_length, bytes)
     }
 
     fn write_streaming(
@@ -177,6 +194,15 @@ where
         OwnerSubtreeFilesystem::write(self, path, bytes)
     }
 
+    fn try_append(
+        &self,
+        path: &FilesystemPath,
+        expected_length: u64,
+        bytes: &[u8],
+    ) -> Result<bool, FilesystemError> {
+        OwnerSubtreeFilesystem::try_append(self, path, expected_length, bytes)
+    }
+
     fn write_streaming(
         &self,
         path: &FilesystemPath,
@@ -231,6 +257,15 @@ impl<F> PrefixedFilesystem<F> {
 }
 
 impl<F: CallbackFilesystem> CallbackFilesystem for PrefixedFilesystem<F> {
+    fn try_append(
+        &self,
+        path: &FilesystemPath,
+        expected_length: u64,
+        bytes: &[u8],
+    ) -> Result<bool, FilesystemError> {
+        self.inner
+            .try_append(&self.path(path)?, expected_length, bytes)
+    }
     fn stat(&self, path: &FilesystemPath) -> Result<FilesystemEntry, FilesystemError> {
         self.inner.stat(&self.path(path)?)
     }
@@ -386,6 +421,9 @@ fn write_range(
         .ok_or_else(|| FilesystemError::InvalidPath(path.as_str().to_owned()))?;
     if current_length.max(end_offset) > i64::MAX as u64 {
         return Err(FilesystemError::InvalidPath(path.as_str().to_owned()));
+    }
+    if offset == current_length && filesystem.try_append(&path, current_length, data)? {
+        return Ok(StorageFilesystemSuccessV1::Written(end_offset));
     }
     range::replace(
         filesystem,

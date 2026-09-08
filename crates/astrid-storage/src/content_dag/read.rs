@@ -462,6 +462,6 @@ pub fn read_verified_content_range<S: ContentSource>(
     .map(|(bytes, _)| bytes)
 }
 
-mod traversal;
+pub(super) mod traversal;
 
 use traversal::{BoundaryMode, decode_file, load, read_decoded_range};

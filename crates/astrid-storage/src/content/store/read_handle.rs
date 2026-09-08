@@ -173,7 +173,7 @@ where
         Ok(bytes)
     }
 
-    fn verified(&self) -> Option<VerifiedContent> {
+    pub(super) fn verified(&self) -> Option<VerifiedContent> {
         self.engine
             .load_projection_cache(
                 &self.principal,
