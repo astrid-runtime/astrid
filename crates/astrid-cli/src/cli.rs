@@ -290,8 +290,12 @@ pub(crate) enum Commands {
     /// Garbage collect content-addressed stores (WIT, orphaned binaries).
     Gc(GcArgs),
 
-    /// Start the Astrid daemon in persistent mode (detached, no TUI)
-    Start,
+    /// Start the Astrid daemon (persistent unless --ephemeral is supplied)
+    Start {
+        /// Exit after the last client disconnects (for automatic host startup).
+        #[arg(long)]
+        ephemeral: bool,
+    },
 
     /// Show daemon status (PID, uptime, connected clients, loaded capsules)
     Status,
@@ -633,6 +637,21 @@ mod tests {
                 "{value:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn automatic_start_can_select_connection_owned_lifetime() {
+        let automatic =
+            Cli::try_parse_from(["astrid", "start", "--ephemeral"]).expect("automatic start");
+        assert!(matches!(
+            automatic.command,
+            Some(Commands::Start { ephemeral: true })
+        ));
+        let explicit = Cli::try_parse_from(["astrid", "start"]).expect("operator start");
+        assert!(matches!(
+            explicit.command,
+            Some(Commands::Start { ephemeral: false })
+        ));
     }
 
     /// An unrecognised root token (and everything after it, including

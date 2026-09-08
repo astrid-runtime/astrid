@@ -623,9 +623,8 @@ pub struct GatewaySection {
     /// Grace period (in seconds) for a clean shutdown before force-killing
     /// child processes.
     pub shutdown_timeout_secs: u64,
-    /// Legacy compatibility field. Ephemeral lifetime is connection-owned and
-    /// this value is ignored; it is omitted from serialized configuration.
-    #[serde(skip_serializing)]
+    /// MCP gateway grace period after its final host connection closes.
+    /// Open connections are never considered idle solely for lack of traffic.
     pub idle_shutdown_secs: u64,
     /// Interval (in seconds) between stale session cleanup sweeps.
     pub session_cleanup_interval_secs: u64,

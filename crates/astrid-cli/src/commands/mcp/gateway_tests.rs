@@ -5,6 +5,58 @@ use tokio::time::Instant;
 
 use super::*;
 
+#[tokio::test]
+async fn gateway_idle_shutdown_waits_for_the_final_connection() {
+    let directory = tempfile::tempdir().expect("socket directory");
+    let listener = UnixListener::bind(directory.path().join("gateway.sock")).expect("listener");
+    let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
+    let state = Arc::new(GatewayState::new(
+        directory.path().to_owned(),
+        principal,
+        "token".into(),
+    ));
+    let first = state.connection();
+    let second = state.connection();
+    let grace = Duration::from_millis(40);
+    let mut accepting = tokio::spawn(accept_loop(listener, state, grace));
+    assert!(
+        timeout(grace * 3, &mut accepting).await.is_err(),
+        "quiet clients keep gateway alive"
+    );
+    drop(first);
+    assert!(
+        timeout(grace * 3, &mut accepting).await.is_err(),
+        "remaining client still owns lifetime"
+    );
+    drop(second);
+    let exit = timeout(Duration::from_secs(2), accepting)
+        .await
+        .expect("idle gateway retires")
+        .expect("task")
+        .expect("accept loop");
+    assert_eq!(exit, ExitCode::SUCCESS);
+}
+
+#[tokio::test]
+async fn gateway_without_an_attachment_retires_after_startup_grace() {
+    let directory = tempfile::tempdir().expect("socket directory");
+    let listener = UnixListener::bind(directory.path().join("gateway.sock")).expect("listener");
+    let principal = astrid_core::PrincipalId::new("codex-code").expect("principal");
+    let state = Arc::new(GatewayState::new(
+        directory.path().to_owned(),
+        principal,
+        "token".into(),
+    ));
+    let exit = timeout(
+        Duration::from_secs(2),
+        accept_loop(listener, state, Duration::from_millis(40)),
+    )
+    .await
+    .expect("unused gateway retires")
+    .expect("accept loop");
+    assert_eq!(exit, ExitCode::SUCCESS);
+}
+
 thread_local! {
     static FINISH_SLOT_PROBE: std::cell::RefCell<Option<Arc<StdMutex<Option<bool>>>>> =
         const { std::cell::RefCell::new(None) };
@@ -801,7 +853,9 @@ async fn concurrent_accepted_stoppers_receive_the_same_final_ack() {
     let _ = std::fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket).expect("short-path gateway listener");
     let accepting_state = Arc::clone(&state);
-    let accepting = tokio::spawn(async move { accept_loop(listener, accepting_state).await });
+    let accepting = tokio::spawn(async move {
+        accept_loop(listener, accepting_state, Duration::from_secs(30)).await
+    });
 
     let request = serde_json::to_vec(&GatewayControlRequest {
         version: GATEWAY_CONTROL_VERSION,

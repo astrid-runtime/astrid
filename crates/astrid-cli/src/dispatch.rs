@@ -221,8 +221,12 @@ async fn dispatch_subcommand(
         Some(Commands::Gc(args)) => commands::gc::run(&args),
         Some(Commands::Config { command }) => dispatch_config(command),
         Some(Commands::Session { command }) => dispatch_session(command),
-        Some(Commands::Start) => {
-            commands::daemon::handle_start().await?;
+        Some(Commands::Start { ephemeral }) => {
+            if ephemeral {
+                commands::daemon::ensure_daemon("start").await?;
+            } else {
+                commands::daemon::handle_start().await?;
+            }
             Ok(ExitCode::SUCCESS)
         },
         Some(Commands::Status) => {
