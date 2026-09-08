@@ -47,6 +47,7 @@ on:
       - 'scripts/test_channel_publication.py'
       - 'scripts/test_channel_workflow_contract.sh'
       - 'scripts/test_ci_workflow_contract.sh'
+      - 'scripts/test_gnu_build_packages.py'
       - 'scripts/nightly_version.py'
       - 'scripts/test_nightly_version.py'
       - 'release/nightly.toml'
@@ -57,62 +58,8 @@ on:
       - '.github/workflows/ci.yml'
       - '.github/workflows/native-storage-certification.yml'
       - '.github/workflows/release.yml'
+  # Required build/test checks must also run for stacked and docs-only PRs.
   pull_request:
-    branches: [main]
-    paths:
-      - '**.rs'
-      - 'scripts/install-windows.ps1'
-      - 'scripts/uninstall-windows.ps1'
-      - 'scripts/windows_release_manifest.py'
-      - 'scripts/test_windows_release_manifest.py'
-      - 'scripts/release_manifest.py'
-      - 'scripts/test_release_manifest.py'
-      - 'scripts/musl_release_manifest.py'
-      - 'scripts/test_musl_release_manifest.py'
-      - 'scripts/package_release_archive.py'
-      - 'scripts/test_validate_release_archive.py'
-      - 'scripts/validate_release_archive.py'
-      - 'scripts/build-macos-fskit.sh'
-      - 'scripts/check-macos-fskit.sh'
-      - 'scripts/manage-macos-fskit.sh'
-      - 'scripts/test_manage_macos_fskit.sh'
-      - 'scripts/validate-macos-fskit.sh'
-      - 'scripts/validate_macos_release.py'
-      - 'scripts/test_macos_release_packaging.py'
-      - 'scripts/test_v0104_linux_upgrade.sh'
-      - 'scripts/test_v0104_macos_upgrade.sh'
-      - 'scripts/ci/**'
-      - 'scripts/fixtures/windows-release-extension.toml'
-      - 'scripts/check_glibc.py'
-      - 'scripts/test_check_glibc.py'
-      - 'scripts/check_dco.py'
-      - 'scripts/test_check_dco.py'
-      - 'scripts/changelog.py'
-      - 'scripts/test_changelog.py'
-      - 'scripts/check_static_elf.py'
-      - 'scripts/test_check_static_elf.py'
-      - 'scripts/release_publication.py'
-      - 'scripts/test_release_publication.py'
-      - 'scripts/release_draft_recovery.py'
-      - 'scripts/test_release_draft_recovery.py'
-      - 'scripts/crate_publication.py'
-      - 'scripts/test_crate_publication.py'
-      - 'scripts/channel_metadata.py'
-      - 'scripts/test_channel_metadata.py'
-      - 'scripts/channel_publication.py'
-      - 'scripts/test_channel_publication.py'
-      - 'scripts/test_channel_workflow_contract.sh'
-      - 'scripts/test_ci_workflow_contract.sh'
-      - 'scripts/nightly_version.py'
-      - 'scripts/test_nightly_version.py'
-      - 'release/nightly.toml'
-      - 'crates/astrid-storage-provider-fskit/**'
-      - 'native/macos/**'
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - '.github/workflows/ci.yml'
-      - '.github/workflows/native-storage-certification.yml'
-      - '.github/workflows/release.yml'
 permissions:
   contents: read
 
@@ -183,8 +130,7 @@ jobs:
                 packages+=(gcc-aarch64-linux-gnu libc6-dev-arm64-cross)
                 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
               fi
-              apt-get update
-              apt-get install -y --no-install-recommends "${packages[@]}"
+              bash scripts/ci/install_gnu_build_packages.sh "${packages[@]}"
               git config --global --add safe.directory /workspace
               [[ "$(git rev-parse --short=12 HEAD)" == "$SOURCE_SHA" ]]
               cargo build \
