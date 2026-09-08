@@ -16,6 +16,7 @@ mod projection;
 mod ready;
 mod workspace_fingerprint;
 use projection::pack_stopped_projection;
+pub(crate) use projection::retire_disconnected_projection;
 pub(crate) use ready::disown_if_still_running;
 use ready::{
     DAEMON_READY_POLL, ReadyWaitOutcome, configured_spawn_timeout_secs, default_daemon_ready_secs,

@@ -347,6 +347,10 @@ health_interval_secs = 30
 # Grace period in seconds for clean shutdown before force-kill
 shutdown_timeout_secs = 30
 
+# MCP gateway shutdown grace after the final host connection closes.
+# Connected hosts stay alive even when they are not sending tool requests.
+idle_shutdown_secs = 30
+
 # Interval (seconds) between stale session cleanup sweeps.
 session_cleanup_interval_secs = 60
 

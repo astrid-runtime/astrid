@@ -255,7 +255,10 @@ pub(crate) async fn serve(
         "astrid mcp serve: uplink established, starting MCP stdio transport"
     );
 
-    tokio::spawn(session_guard::run(caller.clone(), daemon_root.clone()));
+    let session_guard = tokio::spawn(session_guard::run(caller.clone(), daemon_root.clone()));
+    let daemon_pid =
+        crate::commands::daemon_control::read_pid_file(&crate::socket_client::pid_path())
+            .map(|(pid, _)| pid);
 
     let server = AstridMcpServer::new(
         Arc::new(Mutex::new(client)),
@@ -279,11 +282,11 @@ pub(crate) async fn serve(
     // uplink and push `tools/list_changed` to the connected client whenever
     // the broker's tool surface changes. The held
     // peer (cloned from the running service) is the only handle the
-    // background task needs; it never touches stdout. The task is detached —
+    // background task needs; it never touches stdout. The task is session-owned —
     // if the watch uplink dies, tool-list pushes simply stop, but the server
     // keeps serving `tools/list`/`tools/call` on demand.
     let peer = running.peer().clone();
-    tokio::spawn(watch::run(peer, caller.to_string(), daemon_root));
+    let watcher = tokio::spawn(watch::run(peer, caller.to_string(), daemon_root));
 
     // Race the normal stdin-EOF quit against parent-death. `waiting()` only
     // returns when the client closes stdin; an MCP client that DIES without
@@ -298,7 +301,7 @@ pub(crate) async fn serve(
     #[cfg(not(unix))]
     let parent_death_fut = std::future::pending::<()>();
 
-    tokio::select! {
+    let result = tokio::select! {
         biased;
         () = parent_death_fut => {
             info!("astrid mcp serve: launching session ended (reparented); closing MCP bridge");
@@ -307,11 +310,18 @@ pub(crate) async fn serve(
             Ok(ExitCode::SUCCESS)
         }
         quit = running.waiting() => {
-            let quit_reason = quit.context("MCP stdio transport terminated abnormally")?;
-            info!(?quit_reason, "astrid mcp serve: MCP transport closed");
-            Ok(ExitCode::SUCCESS)
+            quit.context("MCP stdio transport terminated abnormally").map(|quit_reason| {
+                info!(?quit_reason, "astrid mcp serve: MCP transport closed");
+                ExitCode::SUCCESS
+            })
         }
-    }
+    };
+    session_guard.abort();
+    watcher.abort();
+    let _ = session_guard.await;
+    let _ = watcher.await;
+    crate::commands::daemon::retire_disconnected_projection(daemon_pid).await?;
+    result
 }
 
 #[cfg(test)]

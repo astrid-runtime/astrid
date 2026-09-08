@@ -410,7 +410,7 @@ impl ConnectionGuard {
         let previous = self.state.active_connections.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "gateway connection count underflow");
         if previous == 1 {
-            self.state.connections_drained.notify_waiters();
+            self.state.connections_drained.notify_one();
         }
     }
 }
@@ -461,11 +461,22 @@ pub(crate) async fn run(principal: Option<&str>) -> Result<ExitCode> {
         armed: true,
     };
 
-    // Gateway startup is the one place that may create the persistent daemon.
-    // `mcp serve` remains the explicitly requested per-session/ephemeral path.
-    crate::commands::daemon::ensure_persistent_daemon("mcp-gateway")
+    // The gateway's authenticated uplinks keep an automatically started daemon
+    // alive. Releasing them after the final host disconnects lets it retire.
+    // An existing operator-started daemon retains its chosen lifetime.
+    crate::commands::daemon::ensure_daemon("mcp-gateway")
         .await
-        .context("failed to ensure persistent Astrid daemon for MCP gateway")?;
+        .context("failed to ensure Astrid daemon for MCP gateway")?;
+
+    let idle_grace = Duration::from_secs(
+        astrid_config::Config::load(Some(&daemon_root))?
+            .config
+            .gateway
+            .idle_shutdown_secs,
+    );
+    if idle_grace.is_zero() || Instant::now().checked_add(idle_grace).is_none() {
+        anyhow::bail!("gateway.idle_shutdown_secs must be positive and representable");
+    }
 
     let hook_token = mint_hook_token();
     let state = Arc::new(GatewayState::new(
@@ -497,8 +508,11 @@ pub(crate) async fn run(principal: Option<&str>) -> Result<ExitCode> {
         "MCP gateway ready"
     );
 
-    let accept_result = accept_loop(listener, Arc::clone(&state)).await;
+    let accept_result = accept_loop(listener, Arc::clone(&state), idle_grace).await;
     let control_stop = state.shutdown.is_cancelled();
+    let daemon_pid =
+        crate::commands::daemon_control::read_pid_file(&crate::socket_client::pid_path())
+            .map(|(pid, _)| pid);
     state.shutdown.cancel();
     let cleanup_result = shutdown_gateway(
         &state,
@@ -528,7 +542,11 @@ pub(crate) async fn run(principal: Option<&str>) -> Result<ExitCode> {
         .context("shutdown stage gateway.final_ack_delivery")?;
     }
 
-    combine_gateway_results(accept_result, cleanup_result)
+    let result = combine_gateway_results(accept_result, cleanup_result);
+    if result.is_ok() && !control_stop {
+        crate::commands::daemon::retire_disconnected_projection(daemon_pid).await?;
+    }
+    result
 }
 
 fn combine_gateway_results(accept: Result<ExitCode>, cleanup: Result<()>) -> Result<ExitCode> {
@@ -541,11 +559,26 @@ fn combine_gateway_results(accept: Result<ExitCode>, cleanup: Result<()>) -> Res
     }
 }
 
-async fn accept_loop(listener: UnixListener, state: Arc<GatewayState>) -> Result<ExitCode> {
+async fn accept_loop(
+    listener: UnixListener,
+    state: Arc<GatewayState>,
+    idle_grace: Duration,
+) -> Result<ExitCode> {
+    let idle = tokio::time::sleep(idle_grace);
+    tokio::pin!(idle);
     loop {
         tokio::select! {
+            biased;
+            () = state.shutdown.cancelled() => return Ok(ExitCode::SUCCESS),
+            // Retain and consume the final disconnect before an expired timer.
+            () = state.connections_drained.notified() => {
+                idle.as_mut().reset(Instant::now().checked_add(idle_grace)
+                    .context("MCP idle deadline exceeds the clock range")?);
+            }
             accepted = listener.accept() => {
                 let (stream, _) = accepted.context("MCP gateway listener failed")?;
+                idle.as_mut().reset(Instant::now().checked_add(idle_grace)
+                    .context("MCP idle deadline exceeds the clock range")?);
                 let state = Arc::clone(&state);
                 // Count the connection before spawning its task. Otherwise a
                 // simultaneous stop can observe zero, finish cleanup, and let
@@ -557,12 +590,14 @@ async fn accept_loop(listener: UnixListener, state: Arc<GatewayState>) -> Result
                     }
                 });
             }
-            () = state.shutdown.cancelled() => {
-                // Stop handing out new transports. `run` can now drain the
-                // connections already admitted, finish teardown, and publish
-                // the one final ACK without waiting for this loop.
-                return Ok(ExitCode::SUCCESS);
-            },
+            () = &mut idle => {
+                if state.active_connections.load(Ordering::Acquire) == 0 {
+                    return Ok(ExitCode::SUCCESS);
+                }
+                // A quiet but connected host is still using the gateway.
+                idle.as_mut().reset(Instant::now().checked_add(idle_grace)
+                    .context("MCP idle deadline exceeds the clock range")?);
+            }
         }
     }
 }
