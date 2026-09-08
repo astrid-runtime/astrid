@@ -1,5 +1,6 @@
 //! Shared MCP gateway endpoint, readiness, and orphan cleanup helpers.
 
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
@@ -772,6 +773,9 @@ fn spawn_gateway(principal: &PrincipalId) -> Result<()> {
     let executable =
         std::env::current_exe().context("failed to resolve the Astrid CLI executable")?;
     Command::new(executable)
+        // The gateway is shared: cancelling its first host's process group
+        // must not disconnect other hosts. Idle retirement remains in run().
+        .process_group(0)
         .arg("--principal")
         .arg(principal.to_string())
         .arg("mcp")

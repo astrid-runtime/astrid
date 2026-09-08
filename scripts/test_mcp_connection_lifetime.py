@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import selectors
+import signal
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,7 @@ env["ASTRID_HOME"] = str(root)
 clients = []
 persistent = os.environ.get("MCP_PROBE_PERSISTENT") == "1"
 direct = os.environ.get("MCP_PROBE_DIRECT") == "1"
+cancel_starter = os.environ.get("MCP_PROBE_CANCEL_STARTER") == "1"
 print("root", root, flush=True)
 
 def call(proc, number, method, params=None):
@@ -44,8 +46,9 @@ try:
         cwd=root, env=env, check=True, timeout=60)
     daemon_pid = int((root / "run/system.pid").read_text().splitlines()[0])
     if not direct:
-        subprocess.run([binary, "--principal", "anonymous", "mcp", "ready", "--format", "json"],
-            cwd=root, env=env, check=True, timeout=60, stdout=subprocess.DEVNULL)
+        starter = subprocess.Popen([binary, "--principal", "anonymous", "mcp", "ready", "--format", "json"],
+            cwd=root, env=env, start_new_session=True, stdout=subprocess.DEVNULL)
+        assert starter.wait(timeout=60) == 0
     for session in ("session-one", "session-two"):
         client_env = env | {"ASTRID_SESSION_ID": session, "ASTRID_HOST": "codex"}
         log = (root.parent / (root.name + "-" + session + ".log")).open("w")
@@ -57,6 +60,13 @@ try:
             "clientInfo": {"name": session, "version": "1"}})
         proc.stdin.write('{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
         proc.stdin.flush()
+    if cancel_starter and not direct:
+        # Model host cancellation of the initiating adapter's entire group.
+        # This is an owned test group, never the caller's process group.
+        try:
+            os.killpg(starter.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
     print("two sessions initialized; quiet interval begins", flush=True)
     time.sleep(float(os.environ.get("MCP_PROBE_QUIET_SECONDS", "125")))
     for proc in clients:
