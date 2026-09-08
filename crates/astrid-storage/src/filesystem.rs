@@ -328,6 +328,23 @@ where
         self.inner.write_streaming(&self.path(path)?, source)
     }
 
+    /// Attempt a canonical append relative to the fixed subtree root.
+    ///
+    /// Returns false without mutation when the cached proof is unavailable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a path, concurrent-change, quota, or storage error.
+    pub fn try_append(
+        &self,
+        path: &FilesystemPath,
+        expected_length: u64,
+        bytes: &[u8],
+    ) -> Result<bool, FilesystemError> {
+        self.inner
+            .try_append(&self.path(path)?, expected_length, bytes)
+    }
+
     /// Create a directory relative to the fixed subtree root.
     ///
     /// # Errors
@@ -544,6 +561,29 @@ where
             .put_streaming(&self.owner, &path.file_name()?, source)?;
         self.remember_directory(&path.parent());
         Ok(())
+    }
+
+    /// Attempt an append without rereading unchanged verified chunk payloads.
+    ///
+    /// Returns false without mutation when no canonical proof is cached; callers
+    /// must then use the ordinary validating write path. A changed source is an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns a path, concurrent-change, quota, or storage error.
+    pub fn try_append(
+        &self,
+        path: &FilesystemPath,
+        expected_length: u64,
+        bytes: &[u8],
+    ) -> Result<bool, FilesystemError> {
+        self.require_parent(path)?;
+        if self.directory_exists(path)? {
+            return Err(FilesystemError::IsDirectory(path.clone()));
+        }
+        Ok(self
+            .content
+            .try_append(&self.owner, &path.file_name()?, expected_length, bytes)?)
     }
 
     /// Create an explicit empty directory.

@@ -156,6 +156,7 @@ pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
         last_commit_has_snapshot: false,
         boundary_pending: false,
         footer_pending: true,
+        flush_state: super::FlushState::Required,
         regions: BTreeMap::new(),
     };
     rebuilt.file.write_all(&VOLUME_MAGIC)?;
@@ -206,6 +207,9 @@ pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
     // Close the old locked inode before replacement. Recovery of the sibling
     // artifacts handles a process crash between either rename.
     let placeholder = OpenOptions::new().read(true).write(true).open(&temporary)?;
+    // From here on the file handle may change even if reclaim returns an
+    // error. Never carry the previous inode's flush proof across that swap.
+    state.flush_state = super::FlushState::Required;
     let old_file = std::mem::replace(&mut state.file, placeholder);
     old_file.unlock()?;
     drop(old_file);

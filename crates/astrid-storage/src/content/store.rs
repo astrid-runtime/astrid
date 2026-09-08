@@ -385,10 +385,26 @@ where
         verified: VerifiedContent,
         staged_records: &[ObjectRecord],
     ) -> Result<ContentWriteOutcome, PrincipalContentError> {
+        self.publish_deferred_expected(principal, name, verified, staged_records, None)
+    }
+
+    fn publish_deferred_expected(
+        &self,
+        principal: &P,
+        name: &ContentName,
+        verified: VerifiedContent,
+        staged_records: &[ObjectRecord],
+        expected_file: Option<ObjectId>,
+    ) -> Result<ContentWriteOutcome, PrincipalContentError> {
         let descriptor = verified.descriptor();
         loop {
             let mut header = self.header(principal)?.as_ref().clone();
             let previous = self.catalog_lookup(principal, header.catalog, name)?;
+            if let Some(expected) = expected_file
+                && previous.is_none_or(|entry| entry.file != expected)
+            {
+                return Err(PrincipalContentError::BatchPreconditionFailed);
+            }
             if previous.is_some_and(|entry| entry.file == descriptor.file()) {
                 let root = header.root.ok_or_else(|| {
                     invalid(
@@ -938,6 +954,7 @@ where
     }
 }
 
+mod append;
 mod bulk;
 mod constructors;
 mod internals;
