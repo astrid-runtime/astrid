@@ -1,6 +1,6 @@
 # Astrid
 
-**Build composable software. Give every component explicit authority.**
+**Software should compose without inheriting each other's authority.**
 
 [![CI](https://github.com/astrid-runtime/astrid/actions/workflows/ci.yml/badge.svg)](https://github.com/astrid-runtime/astrid/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/astrid-runtime/astrid/actions/workflows/codeql.yml/badge.svg)](https://github.com/astrid-runtime/astrid/actions/workflows/codeql.yml)
@@ -22,6 +22,11 @@ remove capsules while the runtime is running.
 
 Use it to build agent systems, tools, services, or your own distribution. Astrid
 does not choose a product, model provider, agent loop, or user interface for you.
+
+Agents make the problem urgent: a model can choose what to do, but that should
+not make the model the authority that permits it. Astrid separates those jobs.
+The same foundation serves software without an LLM—components can be replaced
+and composed without putting application policy into the kernel.
 
 - **Compose behavior:** capsules communicate through an event bus and versioned
   interfaces; the kernel routes requests rather than owning application logic.
