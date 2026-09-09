@@ -15,6 +15,34 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 
+/// Run the daemon and finalize its durable home after all runtime tasks stop.
+///
+/// Both binary entry points use this path for API, signal, and idle shutdown.
+/// The lifecycle fence outlives the task runtime and the final volume pack.
+///
+/// # Errors
+/// Returns boot, shutdown, or durable-finalization errors without claiming a
+/// successful retirement. Failed boots retain their recovery evidence.
+pub fn run_to_completion() -> Result<()> {
+    // Help/version must not acquire ownership of a running installation.
+    let args = Args::parse();
+    let home = astrid_core::dirs::AstridHome::resolve()?;
+    let lifecycle = astrid_storage::principal_state::RuntimeLifecycleGuard::acquire(&home)?;
+    {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(run_with_args(args))?;
+        // Drop joins blocking work and cancels remaining async tasks before any
+        // projection file can be retired. No kernel handles cross this scope.
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(lifecycle.finish())?;
+    Ok(())
+}
+
 #[cfg(unix)]
 mod signal;
 
@@ -190,20 +218,23 @@ fn write_readiness_then_arm_ephemeral<T, E>(
 
 /// Run the Astrid daemon with the given arguments.
 ///
-/// This is the shared entry point used by both the standalone `astrid-daemon`
-/// binary and the `astrid` CLI's bundled daemon binary.
+/// Async service loop. Binary hosts use [`run_to_completion`] so task-runtime
+/// teardown and durable finalization are also completed before process exit.
 ///
 /// # Errors
 ///
 /// Returns an error if the kernel fails to boot, the native local uplink cannot
 /// claim its listener, or the readiness file cannot be written.
+pub async fn run() -> Result<()> {
+    run_with_args(Args::parse()).await
+}
+
 #[cfg(unix)]
 #[expect(
     clippy::too_many_lines,
     reason = "boot sequence: sequential config resolution + kernel/capsule setup that does not benefit from splitting"
 )]
-pub async fn run() -> Result<()> {
-    let args = Args::parse();
+async fn run_with_args(args: Args) -> Result<()> {
     let workspace_layout = match std::env::var("ASTRID_WORKSPACE_STATE_DIR") {
         Ok(value) => astrid_core::dirs::WorkspaceLayout::new(value)
             .context("invalid ASTRID_WORKSPACE_STATE_DIR")?,
@@ -469,7 +500,7 @@ pub async fn run() -> Result<()> {
     clippy::unused_async,
     reason = "the cross-platform daemon entry point remains async even when startup is unsupported"
 )]
-pub async fn run() -> Result<()> {
+async fn run_with_args(_args: Args) -> Result<()> {
     anyhow::bail!("native Astrid daemon startup is not yet supported on this platform")
 }
 

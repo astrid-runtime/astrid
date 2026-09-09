@@ -1,9 +1,19 @@
-//! CLI-side retirement of the volume-backed running projection.
-
-use std::sync::Arc;
+//! Recovery retirement after an already-dead daemon, using the shared finalizer.
 
 use anyhow::{Context, Result};
 use astrid_core::dirs::AstridHome;
+
+/// Refuse stale healing while a daemon is still retiring its host projection.
+/// The caller holds the CLI start fence; the daemon owns the lifecycle fence
+/// through runtime teardown, even after its socket/PID have disappeared.
+pub(super) fn ensure_finalization_finished() -> Result<()> {
+    let home = AstridHome::resolve()?;
+    drop(
+        astrid_storage::principal_state::RuntimeLifecycleGuard::acquire(&home)
+            .context("daemon is still finalizing; retry start after it exits")?,
+    );
+    Ok(())
+}
 
 /// Finish natural MCP retirement without stopping an operator-owned daemon.
 /// Recheck under the startup fence so a replacement cannot race the pack.
@@ -27,15 +37,6 @@ pub(crate) async fn retire_disconnected_projection(pid: Option<u32>) -> Result<(
     pack_stopped_projection().await
 }
 
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "the quota hook requires the storage projection's Result shape"
-)]
-fn unbounded(owner: &astrid_storage::StateOwner) -> astrid_storage::StorageResult<Option<u64>> {
-    let _ = owner;
-    Ok(None)
-}
-
 /// Reopen the stopped volume, publish the final projection, and retire hosts.
 pub(super) async fn pack_stopped_projection() -> Result<()> {
     let home =
@@ -53,32 +54,9 @@ pub(super) async fn pack_stopped_projection_for_home(home: &AstridHome) -> Resul
         return Ok(());
     }
 
-    let quota: Arc<dyn astrid_storage::KvQuotaResolver<astrid_storage::StateOwner>> =
-        Arc::new(unbounded);
-    let store = astrid_storage::principal_state::open_runtime_principal_store_for_pack(home, quota)
+    astrid_storage::principal_state::RuntimeLifecycleGuard::acquire(home)
+        .context("shutdown stage durable_projection_fence")?
+        .finish()
         .await
-        .context("shutdown stage durable_projection_open")?;
-    store
-        .pack_and_retire_runtime_projection(home)
-        .context("shutdown stage durable_projection_pack")?;
-    retire_stopped_projection(home)
-}
-
-/// Remove durable projections after the CLI-only post-exit pack.
-///
-/// The canonical media file is the only survivor.
-pub(super) fn retire_stopped_projection(home: &AstridHome) -> Result<()> {
-    let root = home.root();
-    if !root
-        .try_exists()
-        .context("shutdown stage durable_root_probe")?
-    {
-        return Ok(());
-    }
-    astrid_core::dirs::retire_projection_root(root).with_context(|| {
-        format!(
-            "shutdown stage durable_projection_cleanup: {}",
-            root.display()
-        )
-    })
+        .context("shutdown stage durable_projection_pack")
 }

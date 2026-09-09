@@ -628,7 +628,22 @@ pub(super) fn establish_active_receipt(
     home: &AstridHome,
     store: &RuntimePrincipalStore,
 ) -> StorageResult<()> {
-    let entries = active_projection_entries(home, store)?;
+    // ACTIVE records what was actually materialized, not everything owned by
+    // System. Capsule installs can add volume-only WASM while a host projection
+    // survives an idle exit. Claiming those names here would turn their host
+    // absence into a deletion on the next publication. RETIRING still records
+    // the complete durable inventory through active_projection_entries.
+    let projected = scan(home.root())?
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect::<std::collections::BTreeSet<_>>();
+    let entries = active_projection_entries(home, store)?
+        .into_iter()
+        .filter(|entry| {
+            projected.contains(&entry.name)
+                || projection::surviving_directory(home.root(), entry.name.as_str())
+        })
+        .collect::<Vec<_>>();
     rotate_active_receipt(home, store, &entries)
 }
 

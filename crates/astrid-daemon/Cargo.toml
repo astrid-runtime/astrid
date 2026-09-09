@@ -23,6 +23,7 @@ astrid-config = { workspace = true }
 astrid-core = { workspace = true }
 astrid-gateway = { workspace = true }
 astrid-kernel = { workspace = true }
+astrid-storage = { workspace = true }
 astrid-telemetry = { workspace = true, features = ["config"] }
 astrid-uplink = { workspace = true }
 clap = { workspace = true }

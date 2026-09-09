@@ -73,7 +73,7 @@ fn invalid(detail: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, format!("{VARIABLE} {detail}"))
 }
 
-fn physical_path(path: &Path) -> io::Result<PathBuf> {
+pub(super) fn physical_path(path: &Path) -> io::Result<PathBuf> {
     if let Ok(physical) = std::fs::canonicalize(path) {
         return Ok(physical);
     }

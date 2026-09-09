@@ -204,6 +204,12 @@ async fn ensure_daemon_inner_locked(
         .await
         .context("failed to probe daemon endpoint")?;
     let action = decide_ensure_action(&outcome, recorded_daemon_pid_is_alive());
+    if matches!(
+        action,
+        EnsureAction::CleanStaleAndSpawn | EnsureAction::Spawn
+    ) {
+        projection::ensure_finalization_finished()?;
+    }
     let needs_boot = match action {
         EnsureAction::UseExisting => {
             if let astrid_core::local_transport::ConnectOutcome::Connected(stream) = outcome {
@@ -553,6 +559,7 @@ async fn handle_start_locked() -> Result<()> {
             Ok(())
         },
         StartAction::HealAndSpawn => {
+            projection::ensure_finalization_finished()?;
             // Dead/absent recorded PID: a crashed daemon's stale run files. No
             // live process owns them, so clear ALL stale sentinels (socket,
             // readiness, PID) and spawn onto a clean run-dir.
