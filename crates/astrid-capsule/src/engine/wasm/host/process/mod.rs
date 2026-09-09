@@ -179,12 +179,15 @@ include!("host_ops_methods.rs");
 
 impl process::Host for HostState {
     fn spawn(&mut self, request: SpawnRequest) -> Result<ProcessResult, ErrorCode> {
+        let cmd_for_audit = request.cmd.clone();
         if request
             .stdin
             .as_ref()
             .is_some_and(|input| input.len() > MAX_SPAWN_STDIN_BYTES)
         {
-            return Err(ErrorCode::TooLarge);
+            let result: Result<ProcessResult, ErrorCode> = Err(ErrorCode::TooLarge);
+            audit_process(self, "astrid:process/host.spawn", &cmd_for_audit, &result);
+            return result;
         }
         let security = self.security.clone();
         let capsule_id = self.capsule_id.as_str().to_owned();
@@ -194,7 +197,6 @@ impl process::Host for HostState {
         let process_tracker = self.process_tracker.clone();
         let call_id = extract_call_id(self);
 
-        let cmd_for_audit = request.cmd.clone();
         let _env_for_audit = env_summary(&request.env);
 
         if !self.principal_process_allows(&request.cmd) {
