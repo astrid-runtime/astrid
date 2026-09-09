@@ -31,6 +31,7 @@ mod handle;
 mod inject;
 mod managed;
 mod persistent;
+mod synchronous;
 mod tracker;
 
 use std::collections::VecDeque;
@@ -178,6 +179,13 @@ include!("host_ops_methods.rs");
 
 impl process::Host for HostState {
     fn spawn(&mut self, request: SpawnRequest) -> Result<ProcessResult, ErrorCode> {
+        if request
+            .stdin
+            .as_ref()
+            .is_some_and(|input| input.len() > MAX_SPAWN_STDIN_BYTES)
+        {
+            return Err(ErrorCode::TooLarge);
+        }
         let security = self.security.clone();
         let capsule_id = self.capsule_id.as_str().to_owned();
         let handle = self.runtime_handle.clone();
@@ -298,6 +306,11 @@ impl process::Host for HostState {
         };
         sandboxed_cmd.stdout(Stdio::piped());
         sandboxed_cmd.stderr(Stdio::piped());
+        sandboxed_cmd.stdin(if request.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
 
         let child = match sandboxed_cmd.spawn() {
             Ok(child) => child,
@@ -321,10 +334,12 @@ impl process::Host for HostState {
 
         let output_result =
             util::bounded_block_on_cancellable(&handle, &semaphore, &cancel_token, async move {
-                tokio::task::spawn_blocking(move || child.wait_with_output())
-                    .await
-                    .map_err(std::io::Error::other)
-                    .and_then(|r| r)
+                tokio::task::spawn_blocking(move || {
+                    synchronous::wait_with_input(child, request.stdin)
+                })
+                .await
+                .map_err(std::io::Error::other)
+                .and_then(|r| r)
             });
 
         let result: Result<ProcessResult, ErrorCode> = match output_result {
