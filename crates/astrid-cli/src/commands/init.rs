@@ -10,7 +10,6 @@ use std::io::Write;
 use anyhow::{Context, bail};
 use astrid_capsule::capsule::CapsuleId;
 use astrid_core::dirs::AstridHome;
-use astrid_core::kernel_api::{EnvStorageScope, EnvValueKind};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use super::distro::lock::{DistroLock, DistroLockMeta, LockedCapsule, write_lock_to_daemon};
@@ -26,6 +25,8 @@ use signed_source::{PreparedDistro, prepare_distro_source, unpack_prepared};
 
 mod lifetime;
 pub(crate) use lifetime::ProvisioningLease;
+mod environment;
+pub(crate) use environment::write_env_files;
 
 /// Options controlling the init / `distro apply` flow.
 ///
@@ -885,48 +886,6 @@ fn validate_batch_install(
         resolved_ref: outcome.resolved_ref,
         skipped: installed.skipped,
     })
-}
-
-/// Persist distro variable templates through the daemon's typed env API.
-///
-/// Init may run before a capsule has been installed, so this deliberately
-/// does not require a capsule manifest to classify fields. Variable metadata
-/// from `Distro.toml` carries the secret bit; unresolved literal fields are
-/// ordinary text. The daemon remains the only writer for durable env state.
-pub(crate) fn write_env_files(
-    _home: &AstridHome,
-    principal: &astrid_core::PrincipalId,
-    selected: &[DistroCapsule],
-    variables: &HashMap<String, super::distro::manifest::VariableDef>,
-    vars: &HashMap<String, String>,
-) -> anyhow::Result<()> {
-    for cap in selected {
-        if cap.env.is_empty() {
-            continue;
-        }
-        for (key, template) in &cap.env {
-            let value = resolve_template(template, vars);
-            let kind = if extract_var_refs(template)
-                .iter()
-                .filter_map(|name| variables.get(*name))
-                .any(|definition| definition.secret)
-            {
-                EnvValueKind::Secret
-            } else {
-                EnvValueKind::Text
-            };
-            super::capsule::install_headless::set_env_entry(
-                principal,
-                &cap.name,
-                key,
-                &value,
-                kind,
-                EnvStorageScope::Agent,
-            )?;
-        }
-    }
-
-    Ok(())
 }
 
 /// Run per-provider env onboarding for selected `group = "llm"` capsules.
