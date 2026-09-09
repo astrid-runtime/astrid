@@ -97,6 +97,29 @@ mod tests {
             "fencing must not preempt fresh-home admission"
         );
         let original_path = home.lifecycle_lock_path().unwrap();
+        assert_eq!(
+            original_path.parent().unwrap().parent().unwrap(),
+            std::fs::canonicalize(parent.path()).unwrap(),
+            "control storage must be a stable sibling, not process temp storage"
+        );
+        let other_temp = tempfile::tempdir().unwrap();
+        let probe = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "principal_state::lifecycle::tests::different_temp_process_cannot_acquire_fence",
+                "--nocapture",
+            ])
+            .env("ASTRID_TEST_LIFECYCLE_ROOT", home.root())
+            .env("TMPDIR", other_temp.path())
+            .env("TMP", other_temp.path())
+            .env("TEMP", other_temp.path())
+            .output()
+            .unwrap();
+        assert!(
+            probe.status.success(),
+            "{}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
         let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|_: &StateOwner| Ok(None));
         let store = open_runtime_principal_store(&home, quota.clone())
             .await
@@ -147,5 +170,13 @@ mod tests {
         );
         assert!(home.root().join("redirect").symlink_metadata().is_ok());
         assert!(RuntimeLifecycleGuard::acquire(&home).is_ok());
+    }
+
+    #[test]
+    fn different_temp_process_cannot_acquire_fence() {
+        let Some(root) = std::env::var_os("ASTRID_TEST_LIFECYCLE_ROOT") else {
+            return;
+        };
+        assert!(RuntimeLifecycleGuard::acquire(&AstridHome::from_path(root)).is_err());
     }
 }

@@ -210,7 +210,7 @@ async fn dispatch_subcommand(
                 grant_capsules,
                 require_signed: false,
             };
-            commands::init::run_init(&distro, &opts).await?;
+            let _daemon_lease = commands::init::run_init(&distro, &opts).await?;
             commands::self_update::ensure_path_setup()?;
             Ok(ExitCode::SUCCESS)
         },
@@ -527,7 +527,7 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
                 grant_capsules: false,
                 require_signed: true,
             };
-            commands::init::run_init(&distro, &opts).await?;
+            let _daemon_lease = commands::init::run_init(&distro, &opts).await?;
             if apply_self_grant_required(&distro) {
                 commands::init::apply_self_grant(&opts.target_principal).await?;
             }
