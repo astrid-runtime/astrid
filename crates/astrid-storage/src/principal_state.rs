@@ -51,6 +51,8 @@ mod format_amendment_tests;
 mod format_identity_tests;
 #[cfg(test)]
 mod format_migration_tests;
+mod lifecycle;
+pub use lifecycle::RuntimeLifecycleGuard;
 #[cfg(test)]
 mod hosted_volume_tests;
 mod migrations;
@@ -613,8 +615,8 @@ impl RuntimePrincipalStore {
     /// Publish the live running projection while retaining host files.
     ///
     /// Graceful kernel shutdown calls this before its durable projections are
-    /// closed. Host retirement remains an explicit post-exit CLI stop duty so
-    /// the process can still read its projected files.
+    /// closed. The daemon host finalizes after its task runtime is dropped;
+    /// CLI recovery uses the same finalizer for an already-dead daemon.
     ///
     /// # Errors
     ///
@@ -630,6 +632,8 @@ impl RuntimePrincipalStore {
     /// receipts) after the normal projection reconciliation. A catalog
     /// mutation without a matching ACTIVE transition would otherwise leave
     /// clean-stop receipt validation comparing a stale object identity.
+    /// Volume-only content is not part of this host inventory until materialized;
+    /// its absence from the host must not authorize deleting durable content.
     ///
     /// # Errors
     ///

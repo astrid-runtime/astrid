@@ -3531,8 +3531,8 @@ impl Kernel {
         // release independent of drain time.
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         self.audit_sink.shutdown();
-        // Publish the final host projection while the durable engine is still
-        // open. CLI stop owns retirement only after the process has exited.
+        // Publish before closing the engine. Daemon-host retirement follows
+        // task teardown; CLI recovery uses that same finalizer after process exit.
         #[cfg(not(target_family = "wasm"))]
         if let Some(store) = self.principal_store.as_ref()
             && let Err(error) = store.publish_runtime_projection(&self.astrid_home)

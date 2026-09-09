@@ -1,6 +1,6 @@
 //! Bundled daemon binary — installed alongside `astrid` via `cargo install astrid`.
 //!
-//! Delegates to the shared `astrid_daemon::run()` library function. This is
+//! Delegates to the shared `astrid_daemon::run_to_completion()` lifecycle. This is
 //! identical to the standalone `astrid-daemon` binary but co-installed with
 //! the CLI so `find_companion_binary("astrid-daemon")` always finds it.
 
@@ -25,8 +25,5 @@ fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
     let _ = nix::unistd::setsid();
 
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(astrid_daemon::run())
+    astrid_daemon::run_to_completion()
 }

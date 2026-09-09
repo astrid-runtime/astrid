@@ -321,6 +321,28 @@ impl AstridHome {
         Self { root: root.into() }
     }
 
+    /// Stable control lock outside the disposable runtime projection.
+    ///
+    /// Unlike `run/system.lock`, this inode survives volume-only retirement.
+    /// Physical path resolution makes aliases of the same home share a fence.
+    /// The private sibling control directory is independent of process TMPDIR.
+    ///
+    /// # Errors
+    /// Returns an error if the existing ancestor cannot be resolved.
+    pub fn lifecycle_lock_path(&self) -> io::Result<PathBuf> {
+        let root = run_dir::physical_path(self.root())?;
+        let digest = blake3::hash(root.as_os_str().as_encoded_bytes());
+        let parent = root.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "runtime root has no control parent",
+            )
+        })?;
+        Ok(parent
+            .join(format!("astrid-lifecycle-{digest}"))
+            .join("runtime.lock"))
+    }
+
     /// Validate the durable root without creating a parallel state tree.
     ///
     /// Fresh initialization leaves only the private root for the storage layer

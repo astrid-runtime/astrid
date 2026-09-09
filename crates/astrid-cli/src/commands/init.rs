@@ -24,6 +24,9 @@ mod signed_source;
 
 use signed_source::{PreparedDistro, prepare_distro_source, unpack_prepared};
 
+mod lifetime;
+pub(crate) use lifetime::ProvisioningLease;
+
 /// Options controlling the init / `distro apply` flow.
 ///
 /// Carries the headless and trust flags so the interactive prompts can
@@ -100,8 +103,11 @@ fn validate_install_source(
     Ok(shuttle_install)
 }
 
-/// Run the init flow: workspace setup + distro-based capsule installation.
-pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Result<()> {
+/// Run initialization and return its daemon lease for post-install operations.
+pub(crate) async fn run_init(
+    distro_source: &str,
+    opts: &InitOpts,
+) -> anyhow::Result<ProvisioningLease> {
     let home = AstridHome::resolve()?;
     let operator = crate::principal::current();
     let target = opts.target_principal.clone();
@@ -117,12 +123,7 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
         prepare_distro_source(distro_source, opts, &home).await?
     };
 
-    // The kernel must admit a fresh home and publish its migration ledger
-    // before the CLI creates any v2 layout state. Init spans multiple admin
-    // connections, so its daemon must remain alive between those requests.
-    crate::commands::daemon::ensure_persistent_daemon("init")
-        .await
-        .context("init could not ensure the runtime daemon")?;
+    let daemon_lease = lifetime::retain_daemon().await?;
 
     if opts.grant_capsules {
         grant::preflight_grants(&operator, &target).await?;
@@ -130,7 +131,8 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
 
     let _provisioning_lock = ensure_init_workspace(&home, &target)?;
     if matches!(prepared, PreparedDistro::Shuttle) {
-        return run_init_from_shuttle(distro_source, opts).await;
+        run_init_from_shuttle(distro_source, opts).await?;
+        return Ok(daemon_lease);
     }
 
     // Distro.lock is an outcome record, not a completion shortcut. Every
@@ -248,7 +250,7 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
         );
         grant::apply_or_hint_grants(&operator, &target, &grant_names, opts.grant_capsules).await?;
         eprintln!("  Run {} to start.", Theme::prompt("astrid"));
-        Ok(())
+        Ok(daemon_lease)
     } else {
         // Partial provision (0 < succeeded < total): no lock was written, so
         // a re-run retries the rest. Exit NON-ZERO so automation and the

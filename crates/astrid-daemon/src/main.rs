@@ -1,6 +1,6 @@
 //! Standalone daemon binary entry point.
 //!
-//! Delegates to the shared `astrid_daemon::run()` library function.
+//! Delegates to the shared `astrid_daemon::run_to_completion()` lifecycle.
 
 /// Detach the daemon into its own session as the very first action — before the
 /// async runtime is built or any boot work runs.
@@ -19,8 +19,5 @@ fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
     let _ = nix::unistd::setsid();
 
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(astrid_daemon::run())
+    astrid_daemon::run_to_completion()
 }

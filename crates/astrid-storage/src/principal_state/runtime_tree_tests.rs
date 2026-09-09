@@ -24,6 +24,67 @@ fn unlimited_quota() -> Arc<dyn KvQuotaResolver<StateOwner>> {
     })
 }
 
+#[tokio::test]
+async fn surviving_projection_does_not_claim_volume_only_capsule_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let name = ContentName::new("bin/capsule.wasm").unwrap();
+    let bytes = b"durable capsule bytes";
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    std::fs::write(home.root().join("config.toml"), b"# running config\n").unwrap();
+    store
+        .content()
+        .put(&StateOwner::System, &name, bytes)
+        .unwrap();
+    assert!(!home.root().join(name.as_str()).exists());
+    // Idle shutdown publishes but leaves the running host projection behind.
+    store.publish_runtime_projection(&home).unwrap();
+    drop(store);
+
+    let reopened = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    // Kernel admission refreshes the receipt, then layout completion publishes.
+    reopened
+        .establish_runtime_projection_receipt(&home)
+        .unwrap();
+    reopened.publish_runtime_projection(&home).unwrap();
+    assert_eq!(
+        reopened.content().read(&StateOwner::System, &name).unwrap(),
+        Some(bytes.to_vec()),
+        "absence of a never-materialized file is not a host deletion"
+    );
+    assert!(
+        !active::read(&home, &reopened)
+            .unwrap()
+            .unwrap()
+            .contains_inventory_name(name.as_str())
+    );
+    reopened.pack_and_retire_runtime_projection(&home).unwrap();
+    drop(reopened);
+    assert_stopped_volume_only(&home);
+
+    let restored = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(home.root().join(name.as_str())).unwrap(),
+        bytes
+    );
+    // Once materialized, a real host deletion must still remove the catalog entry.
+    std::fs::remove_file(home.root().join(name.as_str())).unwrap();
+    restored.publish_runtime_projection(&home).unwrap();
+    assert!(
+        restored
+            .content()
+            .read(&StateOwner::System, &name)
+            .unwrap()
+            .is_none()
+    );
+}
+
 fn write_active_identity_receipt(
     home: &AstridHome,
     store: &RuntimePrincipalStore,

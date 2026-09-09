@@ -540,6 +540,7 @@ dependencies = [
  "astrid-core",
  "astrid-gateway",
  "astrid-kernel",
+ "astrid-storage",
  "astrid-telemetry",
  "astrid-uplink",
  "clap",
