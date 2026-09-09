@@ -123,6 +123,12 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     crate::commands::daemon::ensure_persistent_daemon("init")
         .await
         .context("init could not ensure the runtime daemon")?;
+    // An existing daemon can be ephemeral. Own a connection for the entire
+    // provisioning pass so gaps between admin requests cannot trigger retirement
+    // while this CLI still writes the running projection.
+    let _daemon_lease = crate::socket_client::connect_kernel_for_workspace(None)
+        .await
+        .context("init could not retain its runtime connection")?;
 
     if opts.grant_capsules {
         grant::preflight_grants(&operator, &target).await?;
