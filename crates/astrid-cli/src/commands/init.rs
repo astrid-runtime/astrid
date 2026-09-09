@@ -25,6 +25,7 @@ mod signed_source;
 use signed_source::{PreparedDistro, prepare_distro_source, unpack_prepared};
 
 mod lifetime;
+pub(crate) use lifetime::ProvisioningLease;
 
 /// Options controlling the init / `distro apply` flow.
 ///
@@ -106,7 +107,7 @@ fn validate_install_source(
 pub(crate) async fn run_init(
     distro_source: &str,
     opts: &InitOpts,
-) -> anyhow::Result<astrid_uplink::KernelClient> {
+) -> anyhow::Result<ProvisioningLease> {
     let home = AstridHome::resolve()?;
     let operator = crate::principal::current();
     let target = opts.target_principal.clone();
