@@ -20,6 +20,23 @@ use fs2::FileExt;
 
 use crate::theme::Theme;
 
+/// Called only after the complete selected set earned its durable lock.
+/// Explicit grants include verified resumed members; plain resume remains inert.
+pub(super) fn completed_grant_names(
+    explicit: bool,
+    completed: &[super::LockedCapsule],
+    newly_installed: &[String],
+) -> Vec<String> {
+    if explicit {
+        completed
+            .iter()
+            .map(|capsule| capsule.name.clone())
+            .collect()
+    } else {
+        newly_installed.to_vec()
+    }
+}
+
 /// Guard: `--grant-capsules` may only be honoured alongside a distro
 /// install, because the grant set is exactly the capsules that distro
 /// installs. `distro_present` is whether a non-empty distro source
@@ -525,6 +542,31 @@ mod tests {
     use super::*;
     use crate::commands::capsule::{install, meta};
     use crate::commands::init::LockedCapsule;
+
+    #[test]
+    fn explicit_grants_include_completed_batches_and_idempotent_resume() {
+        let completed: Vec<_> = (0..22)
+            .map(|i| LockedCapsule {
+                name: format!("capsule-{i}"),
+                version: "1.0.0".into(),
+                source: "local.capsule".into(),
+                hash: "verified".into(),
+                resolved_ref: None,
+            })
+            .collect();
+        let expected: Vec<_> = completed.iter().map(|cap| cap.name.clone()).collect();
+        let final_batch = expected[20..].to_vec();
+        assert_eq!(
+            completed_grant_names(true, &completed, &final_batch),
+            expected
+        );
+        assert_eq!(completed_grant_names(true, &completed, &[]), expected);
+        assert_eq!(
+            completed_grant_names(false, &completed, &final_batch),
+            final_batch
+        );
+        assert!(completed_grant_names(false, &completed, &[]).is_empty());
+    }
     use std::sync::Arc;
 
     /// (c) The flag is only meaningful with a distro to resolve the grant

@@ -223,8 +223,8 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // selection). A partial run deliberately writes NO lock so a re-run
     // actually retries the missing capsules instead of short-circuiting on a
     // stale member set — see `should_write_lock`.
-    // The grant set is exactly the names that performed a new install. A
-    // durable resume has no grant side effect.
+    // Plain resume has no grant side effect. An explicit grant request covers
+    // the complete verified set, including members completed in earlier batches.
     let lock = create_lock_from_parts(
         schema_version,
         &distro_id,
@@ -241,15 +241,12 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
         // On a grant failure the capsules are already installed and the lock
         // is written; this returns Err so init exits non-zero with the exact
         // manual command to finish.
-        if !newly_installed_names.is_empty() {
-            grant::apply_or_hint_grants(
-                &operator,
-                &target,
-                &newly_installed_names,
-                opts.grant_capsules,
-            )
-            .await?;
-        }
+        let grant_names = grant::completed_grant_names(
+            opts.grant_capsules,
+            &lock.capsules,
+            &newly_installed_names,
+        );
+        grant::apply_or_hint_grants(&operator, &target, &grant_names, opts.grant_capsules).await?;
         eprintln!("  Run {} to start.", Theme::prompt("astrid"));
         Ok(())
     } else {
