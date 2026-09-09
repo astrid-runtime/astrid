@@ -91,6 +91,12 @@ pub(crate) async fn terminate_identity(identity: &DaemonIdentity, pid_path: &Pat
         )
         .is_none_or(|current| current.boot_nonce.as_deref() != Some(expected.as_str()))
     {
+        // Clean shutdown retires markers before the process exits. A missing
+        // generation forbids signalling, but does not prove the PID is live.
+        // Wait without signalling; cleanup still takes the singleton fence.
+        if wait_for_exit(identity.pid, GRACE).await {
+            return KillOutcome::NotRunning;
+        }
         return KillOutcome::Unverified(identity.pid);
     }
     terminate_known(identity.pid, identity.exe.as_deref()).await
@@ -590,6 +596,29 @@ mod tests {
         std::fs::write(&path, format!("{me}")).unwrap();
         assert_eq!(terminate_orphan(&path).await, KillOutcome::Unverified(me));
         assert!(is_process_alive(me));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retired_generation_can_finish_exiting_without_being_signalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("system.pid");
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 0.05"])
+            .spawn()
+            .unwrap();
+        let identity = DaemonIdentity {
+            pid: child.id(),
+            exe: None,
+            boot_nonce: Some("retired-generation".into()),
+        };
+        // Reap concurrently: kill(pid, 0) can otherwise observe a zombie.
+        let reaper = std::thread::spawn(move || child.wait().unwrap());
+        assert_eq!(
+            terminate_identity(&identity, &path).await,
+            KillOutcome::NotRunning
+        );
+        assert!(reaper.join().unwrap().success(), "no signal may be sent");
     }
 
     #[tokio::test]
