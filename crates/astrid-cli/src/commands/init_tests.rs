@@ -821,6 +821,43 @@ fn cap_with_env(name: &str, key: &str, template: &str) -> DistroCapsule {
 }
 
 #[test]
+fn unset_optional_secret_requires_no_daemon_write() {
+    let dir = tempfile::tempdir().unwrap();
+    if std::env::var_os("ASTRID_TEST_OPTIONAL_SECRET").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "unset_optional_secret_requires_no_daemon_write",
+                "--nocapture",
+            ])
+            .env("ASTRID_TEST_OPTIONAL_SECRET", "1")
+            .env("ASTRID_HOME", dir.path().join("isolated-home"))
+            .env("ASTRID_RUN_DIR", dir.path().join("isolated-run"))
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let home = AstridHome::from_path(dir.path().join("unused-home"));
+    let variables = HashMap::from([("api_key".into(), var(true, Some("")))]);
+    let selected = vec![cap_with_env("llm", "api_key", "{{ api_key }}")];
+    let vars = HashMap::from([("api_key".into(), String::new())]);
+    write_env_files(
+        &home,
+        &astrid_core::PrincipalId::default(),
+        &selected,
+        &variables,
+        &vars,
+    )
+    .expect("an absent credential must not issue a secret write");
+    assert!(!dir.path().join("unused-home").exists());
+}
+
+#[test]
 fn headless_collect_uses_cli_var_override() {
     let mut variables = HashMap::new();
     variables.insert("api_key".to_string(), var(true, Some("from-default")));
