@@ -824,7 +824,7 @@ fn cap_with_env(name: &str, key: &str, template: &str) -> DistroCapsule {
 fn unset_optional_secret_requires_no_daemon_write() {
     let dir = tempfile::tempdir().unwrap();
     if std::env::var_os("ASTRID_TEST_OPTIONAL_SECRET").is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "unset_optional_secret_requires_no_daemon_write",
                 "--nocapture",
@@ -833,8 +833,20 @@ fn unset_optional_secret_requires_no_daemon_write() {
             .env("ASTRID_HOME", dir.path().join("isolated-home"))
             .env("ASTRID_RUN_DIR", dir.path().join("isolated-run"))
             .current_dir(dir.path())
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("absent optional secret attempted daemon access");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
         assert!(
             output.status.success(),
             "{}",
@@ -844,16 +856,26 @@ fn unset_optional_secret_requires_no_daemon_write() {
     }
     let home = AstridHome::from_path(dir.path().join("unused-home"));
     let variables = HashMap::from([("api_key".into(), var(true, Some("")))]);
-    let selected = vec![cap_with_env("llm", "api_key", "{{ api_key }}")];
-    let vars = HashMap::from([("api_key".into(), String::new())]);
-    write_env_files(
-        &home,
-        &astrid_core::PrincipalId::default(),
-        &selected,
-        &variables,
-        &vars,
-    )
-    .expect("an absent credential must not issue a secret write");
+    for template in [
+        "{{ api_key }}",
+        "Bearer {{ api_key }}",
+        "prefix-{{api_key}}-suffix",
+    ] {
+        for vars in [
+            HashMap::new(),
+            HashMap::from([("api_key".into(), String::new())]),
+        ] {
+            let selected = vec![cap_with_env("llm", "api_key", template)];
+            write_env_files(
+                &home,
+                &astrid_core::PrincipalId::default(),
+                &selected,
+                &variables,
+                &vars,
+            )
+            .expect("an absent credential must not issue a secret write");
+        }
+    }
     assert!(!dir.path().join("unused-home").exists());
 }
 

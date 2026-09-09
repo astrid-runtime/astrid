@@ -24,16 +24,24 @@ pub(crate) fn write_env_files(
 ) -> anyhow::Result<()> {
     for cap in selected {
         for (key, template) in &cap.env {
+            let references = extract_var_refs(template);
+            // Test the input, not the rendered text: `Bearer {{ key }}` is
+            // nonempty even when the optional key is absent. Interactive
+            // collection omits empty values while headless collection retains
+            // them. Neither form should overwrite an existing credential.
+            let unset_optional_secret = references.iter().any(|name| {
+                variables.get(*name).is_some_and(|definition| {
+                    definition.secret && definition.default.as_deref() == Some("")
+                }) && vars.get(*name).is_none_or(String::is_empty)
+            });
+            if unset_optional_secret {
+                continue;
+            }
             let value = resolve_template(template, vars);
-            let secret = extract_var_refs(template)
+            let secret = references
                 .iter()
                 .filter_map(|name| variables.get(*name))
                 .any(|definition| definition.secret);
-            // An unset optional credential is absence, not an empty secret.
-            // Reinitialization must not erase a previously configured key.
-            if secret && value.is_empty() {
-                continue;
-            }
             let kind = if secret {
                 EnvValueKind::Secret
             } else {
