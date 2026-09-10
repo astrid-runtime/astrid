@@ -53,12 +53,15 @@ principal = sys.argv[2]
 timeout_secs = float(sys.argv[3])
 out_path = Path(sys.argv[4])
 args = sys.argv[5:]
+# Structured output must not absorb update notices or other stderr diagnostics.
+json_output = any(a == "--format" and b == "json" for a, b in zip(args, args[1:]))
+stderr_path = out_path.with_name(out_path.name + ".stderr")
 
 try:
     proc = subprocess.run(
         [binary, "--principal", principal, *args],
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE if json_output else subprocess.STDOUT,
         text=True,
         timeout=timeout_secs,
         check=False,
@@ -68,9 +71,16 @@ except subprocess.TimeoutExpired as exc:
     if isinstance(stdout, bytes):
         stdout = stdout.decode("utf-8", errors="replace")
     out_path.write_text(stdout, encoding="utf-8")
+    if json_output:
+        stderr = exc.stderr or b""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        stderr_path.write_text(stderr, encoding="utf-8")
     raise SystemExit(124) from exc
 
 out_path.write_text(proc.stdout, encoding="utf-8")
+if json_output:
+    stderr_path.write_text(proc.stderr, encoding="utf-8")
 raise SystemExit(proc.returncode)
 PY
 }
