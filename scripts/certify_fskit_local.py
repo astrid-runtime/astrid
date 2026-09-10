@@ -20,6 +20,16 @@ import tempfile
 from supervised_fskit import CHECKS, TARGET, manifest, sha256
 
 
+def is_astridfs(mount, mount_table):
+    """Bind macOS mount output to the exact canonical mount, not a sibling."""
+    expected = str(mount.resolve())
+    for line in mount_table.splitlines():
+        match = re.fullmatch(r".+ on (.+) \(([^, )]+)(?:, [^\n]*)?\)", line)
+        if match and match[1] == expected and match[2] == "astridfs":
+            return True
+    return False
+
+
 def inventory(root):
     result = {}
     for path in sorted(root.rglob("*")):
@@ -115,7 +125,7 @@ def main():
         started = True
         cli("start")
         cli("storage", "mount", "--as", "default", str(mount))
-        if run("/usr/bin/stat", "-f", "%T", str(mount)).strip() != "astridfs":
+        if not is_astridfs(mount, run("/sbin/mount")):
             raise ValueError("mount is not astridfs")
         status(False)
         checks["mount"] = True
@@ -133,7 +143,7 @@ def main():
         status(False)
         checks["delete_sync"] = True
         cli("storage", "unmount", str(mount))
-        if run("/usr/bin/stat", "-f", "%T", str(mount)).strip() == "astridfs":
+        if is_astridfs(mount, run("/sbin/mount")):
             raise ValueError("filesystem remained mounted")
         checks["unmount"] = True
         cli("stop")
@@ -145,7 +155,7 @@ def main():
         if started:
             # Only this script's mount and runtime; never pkill or remove app.
             try:
-                if run("/usr/bin/stat", "-f", "%T", str(mount)).strip() == "astridfs":
+                if is_astridfs(mount, run("/sbin/mount")):
                     cli("storage", "unmount", str(mount))
             finally:
                 cli("stop")
