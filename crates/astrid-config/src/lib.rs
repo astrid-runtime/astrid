@@ -46,6 +46,8 @@ pub mod env;
 pub mod error;
 /// Native filesystem presentation settings.
 pub mod filesystem;
+/// Gateway and MCP listener configuration.
+pub mod gateway;
 /// Configuration file discovery and loading.
 pub mod loader;
 /// Layered configuration merging with precedence.

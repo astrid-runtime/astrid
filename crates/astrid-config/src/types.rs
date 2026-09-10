@@ -605,50 +605,7 @@ impl Default for LoggingSection {
 // GatewaySection
 // ---------------------------------------------------------------------------
 
-/// Gateway daemon configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct GatewaySection {
-    /// Directory for gateway runtime state (PID file, socket). `None` uses
-    /// the platform default (e.g. `$XDG_STATE_HOME/astrid`).
-    pub state_dir: Option<String>,
-    /// Path to a secrets file for credential management.
-    pub secrets_file: Option<String>,
-    /// Whether to watch configuration files and reload on change.
-    pub hot_reload: bool,
-    /// Whether to watch plugin directories and hot-reload on file changes.
-    pub watch_plugins: bool,
-    /// Interval (in seconds) between health checks for managed servers.
-    pub health_interval_secs: u64,
-    /// Grace period (in seconds) for a clean shutdown before force-killing
-    /// child processes.
-    pub shutdown_timeout_secs: u64,
-    /// MCP gateway grace period after its final host connection closes.
-    /// Open connections are never considered idle solely for lack of traffic.
-    pub idle_shutdown_secs: u64,
-    /// Interval (in seconds) between stale session cleanup sweeps.
-    pub session_cleanup_interval_secs: u64,
-    /// When `true`, `send_input` publishes a `user.prompt` IPC event to the
-    /// capsule pipeline instead of running the monolithic runtime turn.
-    /// Default: `false`. Use for testing the capsule pipeline.
-    pub use_capsule_pipeline: bool,
-}
-
-impl Default for GatewaySection {
-    fn default() -> Self {
-        Self {
-            state_dir: None,
-            secrets_file: None,
-            hot_reload: true,
-            watch_plugins: true,
-            health_interval_secs: 30,
-            shutdown_timeout_secs: 30,
-            idle_shutdown_secs: 30,
-            session_cleanup_interval_secs: 60,
-            use_capsule_pipeline: false,
-        }
-    }
-}
+pub use crate::gateway::GatewaySection;
 
 // ---------------------------------------------------------------------------
 // TimeoutsSection

@@ -37,6 +37,19 @@ pub(crate) enum McpCommands {
     },
     /// Run the persistent per-user MCP gateway.
     Gateway,
+    /// Serve authenticated Streamable HTTP at /mcp (loopback only).
+    /// The listener is explicitly operator-managed; stop it with Ctrl-C.
+    Http {
+        /// Override `gateway.mcp_http.listen` (127.0.0.1:8081 by default).
+        #[arg(long)]
+        listen: Option<std::net::SocketAddr>,
+        /// Private file containing a bearer token, never the token itself.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        /// Fixed project context for this endpoint; clients cannot override it.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
     /// Wait for the gateway without running doctor or installation flows.
     Ready {
         /// Output format: `hook`, `pretty`, or `json`.

@@ -73,6 +73,38 @@ const ENUMERATE_DEADLINE: Duration = Duration::from_secs(55);
 /// handlers. The function owns a freshly-connected [`SocketClient`] and
 /// drives it to EOF; it returns when the daemon closes the watch uplink.
 pub(super) async fn run(peer: Peer<RoleServer>, principal: String, daemon_root: PathBuf) {
+    run_with_sink(ChangeSink::Legacy(peer), principal, daemon_root).await;
+}
+
+/// The 2026 subscription is request-scoped on both stdio and HTTP. Cancelling
+/// it drops its watcher uplink; it never owns the shared broker connection.
+pub(super) async fn run_subscription(
+    context: rmcp::service::SubscriptionContext,
+    principal: String,
+    daemon_root: PathBuf,
+) {
+    tokio::select! {
+        () = context.cancelled() => {},
+        () = run_with_sink(ChangeSink::Subscription(context.sink().clone()), principal, daemon_root) => {},
+    }
+}
+
+enum ChangeSink {
+    Legacy(Peer<RoleServer>),
+    Subscription(rmcp::service::SubscriptionSink),
+}
+
+impl ChangeSink {
+    async fn notify(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Legacy(peer) => peer.notify_tool_list_changed().await?,
+            Self::Subscription(sink) => sink.notify_tool_list_changed().await?,
+        }
+        Ok(())
+    }
+}
+
+async fn run_with_sink(sink: ChangeSink, principal: String, daemon_root: PathBuf) {
     // The watch uplink's session id is ephemeral — it only keys this
     // transport's frames. Bind the connection to the SAME principal the
     // request handlers use: the native uplink binds that principal during the
@@ -174,7 +206,7 @@ pub(super) async fn run(peer: Peer<RoleServer>, principal: String, daemon_root: 
             continue;
         }
 
-        if let Err(e) = peer.notify_tool_list_changed().await {
+        if let Err(e) = sink.notify().await {
             // Peer channel closed -> the transport is gone; stop.
             warn!(error = %e, "MCP hot-reload watcher: notify failed (peer closed); stopping");
             return;

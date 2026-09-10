@@ -62,7 +62,9 @@ nix = { workspace = true }
 ratatui = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true, features = ["json", "stream"] }
-rmcp = { workspace = true }
+rmcp = { workspace = true, features = ["transport-streamable-http-server"] }
+axum = { workspace = true }
+subtle = { workspace = true }
 rustyline = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
