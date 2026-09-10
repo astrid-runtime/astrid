@@ -227,6 +227,39 @@ async fn audit_net_reports_bind_denied() {
 }
 
 #[tokio::test]
+async fn oversized_spawn_stdin_reports_one_failed_audit() {
+    use crate::engine::wasm::bindings::astrid::process1_1_0::host::{
+        ErrorCode, Host, SpawnRequest,
+    };
+    let (mut state, sink) = state_with_sink(tokio::runtime::Handle::current());
+    let result = state.spawn(SpawnRequest {
+        cmd: "must-not-execute".into(),
+        args: vec![],
+        stdin: Some(vec![0; 4 * 1024 * 1024 + 1]),
+        env: vec![],
+        cwd: None,
+        limits: None,
+        file_injections: vec![],
+        label: None,
+        keep_stdin_open: None,
+        overflow: None,
+        log_ring_bytes: None,
+        exit_retention_ms: None,
+        idle_timeout_ms: None,
+        max_lifetime_ms: None,
+    });
+    assert!(matches!(result, Err(ErrorCode::TooLarge)));
+    assert_eq!(
+        sink.snapshot(),
+        vec![(
+            PrincipalId::new("alice").unwrap(),
+            CapturedEvent::ProcessSpawn("must-not-execute".into()),
+            CapturedOutcome::Failed("ErrorCode::TooLarge".into()),
+        )]
+    );
+}
+
+#[tokio::test]
 async fn audit_process_reports_spawn() {
     let (state, sink) = state_with_sink(tokio::runtime::Handle::current());
     let alice = PrincipalId::new("alice").unwrap();
