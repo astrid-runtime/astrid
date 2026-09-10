@@ -8,6 +8,31 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ## [Unreleased]
 
+## [2026.9.1] - 2026-09-10
+
+### Fixed
+
+- Preserve installed capsule content across idle shutdown, explicit stop, and
+  restart. All graceful shutdown paths finalize the same durable projection;
+  capsule files held only in the volume are no longer mistaken for deletions.
+- Keep initialization connected through installation batches and final grants,
+  preventing idle retirement from interrupting first boot. Provisioning traffic
+  no longer fills the connection's unread broadcast queue.
+- Honor explicit `init --grant-capsules` for the complete verified distro after
+  a resumed install, including earlier batches. Plain resume does not grant
+  access implicitly.
+- Leave unset optional distro credentials absent during initialization instead of
+  attempting to store invalid empty secrets. Reinitialization preserves existing
+  credentials; nonempty secrets still use the daemon's typed secret API.
+
+- Allow a daemon that retired its generation markers during clean shutdown to
+  finish exiting before reporting an identity error. Process identity and
+  singleton-lock checks remain enforced.
+- Deliver capsule-supplied stdin to synchronous native subprocesses, close the
+  pipe after delivery, and drain output concurrently. Native request/response
+  adapters now receive their requests without full-pipe deadlocks.
+- Correct filesystem identification in the macOS legacy-upgrade mount test.
+
 ## [2026.9.0] - 2026-09-08
 
 ### Added
