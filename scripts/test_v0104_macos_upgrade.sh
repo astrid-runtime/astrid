@@ -728,7 +728,11 @@ attempt_mount_round_trip() {
   if [[ ${mount_status} -eq 0 ]]; then
     grep -Eq '^mounted [0-9a-f-]{36} at ' "${TEST_ROOT}/mount.log" \
       || fail "mount succeeded without a lease id"
-    [[ "$(stat -f %T "${MOUNTPOINT}")" == astridfs ]] \
+    # BSD stat's %T is a file-type marker ("/" for directories), not the
+    # filesystem name. Bind the kernel mount table to the canonical target.
+    local canonical_mountpoint
+    canonical_mountpoint="$(cd -- "${MOUNTPOINT}" && pwd -P)"
+    [[ "$(/sbin/mount)" == *" on ${canonical_mountpoint} (astridfs,"* ]] \
       || fail "mount succeeded but the mountpoint is not astridfs"
     printf 'upgrade-mount-probe\n' >"${MOUNTPOINT}/upgrade-mount-probe.txt"
     run_current storage sync "${MOUNTPOINT}"
