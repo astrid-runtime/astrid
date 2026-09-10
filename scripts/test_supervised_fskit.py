@@ -14,6 +14,22 @@ import certify_fskit_local as local
 
 
 class ApprovalTests(unittest.TestCase):
+    def test_local_mount_type_is_bound_to_exact_mount(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mount = Path(directory) / "mount with spaces"
+            mount.mkdir()
+            name = str(mount.resolve())
+            self.assertTrue(local.is_astridfs(mount, f"AOS on {name} (astridfs, local)"))
+            for table in (
+                f"AOS on {name}-other (astridfs, local)",
+                f"disk on {name} (apfs, local)",
+                f"AOS on {name} (astridfs-other, local)",
+                "/",
+                "",
+            ):
+                with self.subTest(table=table):
+                    self.assertFalse(local.is_astridfs(mount, table))
+
     def setUp(self):
         self.expected = {"schema": 1, "source_commit": "a" * 40, "run_id": "123",
                          "run_attempt": "2", "target": cert.TARGET,
