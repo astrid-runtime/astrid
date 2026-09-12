@@ -30,7 +30,9 @@ pub(crate) async fn run(
     workspace: Option<&Path>,
 ) -> Result<ExitCode> {
     let root = std::env::current_dir().context("read MCP runtime directory")?;
-    let config = astrid_config::Config::load(Some(&root))?.config;
+    let config =
+        astrid_config::Config::load_with_layout(Some(&root), crate::workspace_layout::current())?
+            .config;
     let settings = &config.gateway.mcp_http;
     let bind = listen.unwrap_or(settings.listen);
     validate_bind(bind)?;
