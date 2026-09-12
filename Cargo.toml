@@ -253,14 +253,14 @@ url = "2"
 # other OpenAPI generator. `axum_extras` plugs into axum's extractor
 # system so `#[utoipa::path]` annotations on handlers carry through.
 utoipa = { version = "5", features = ["axum_extras"] }
-uuid = { version = "~1.25.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
+uuid = { version = "~1.26.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
 walkdir = "2.5"
-wasm-encoder = "0.257.1"
-wat = "=1.257.1"
-wasmparser = "0.257.1"
+wasm-encoder = "0.258.0"
+wat = "=1.258.0"
+wasmparser = "0.258.0"
 windows-sys = "0.61"
-wit-component = "0.257.1"
-wit-parser = "0.257.1"
+wit-component = "0.258.0"
+wit-parser = "0.258.0"
 wasmtime = { version = "48.0.1", features = ["component-model", "cranelift"] }
 wasmtime-wasi = "48.0.1"
 unicode-normalization = "=0.1.25"
