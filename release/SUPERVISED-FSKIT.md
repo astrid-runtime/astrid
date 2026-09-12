@@ -55,10 +55,15 @@ writing a receipt; the hosted verifier requires the same identities. Older
 schema-1 receipts and mismatched runner hashes are rejected. These hashes bind
 the claimed runner; they are not independent execution attestation.
 
-The native dirty-state assertions remain strict. A desktop may issue background
-writes or synchronization between a filesystem operation and a CLI status query.
-If those assertions fail, retain the logs and investigate; do not infer corruption
-or automatically replace the required result with a different check.
+Native status must identify the expected read-write mount, but its dirty boolean
+is not a durability verdict. On 2026.9.2, traced FSKit sync callbacks completed
+between write/rename and status, legitimately reporting clean. Background metadata
+writes can conversely make a mount dirty after sync. The native journey therefore
+requires successful explicit sync, full stop/start and remount, exact retained
+contents, and another stop/start/remount proving deletion persists. Deterministic
+dirty-transition assertions remain in the kernel tests, where the operation
+ordering is controlled. This changes the native acceptance test prospectively;
+it does not validate the non-canonical historical 2026.9.2 receipt (see #1926).
 
 ```sh
 python3 scripts/certify_fskit_local.py \
@@ -69,8 +74,10 @@ python3 scripts/certify_fskit_local.py \
 
 The script hashes the archive, safely extracts it, compares every installed app
 file's bytes/mode, validates Apple trust and bound provider identity, then tests
-a fresh runtime: real `astridfs` mount, write/rename/read, dirty/sync status,
-delete/sync, unmount and stop leaving exactly `astrid.volume`. It never installs
+a fresh runtime: real `astridfs` mount, write/rename/read, explicit sync,
+write and deletion persistence across restarts, unmount and stop leaving exactly
+`astrid.volume`. Receipts explicitly require `write_persistence` and
+`delete_persistence`. It never installs
 or uninstalls an app, changes extension election, or kills foreign processes.
 It retains commands, checks and the PASS receipt in the printed `/tmp/fsc.*`
 evidence directory. Failure produces no PASS receipt. Preserve that directory.

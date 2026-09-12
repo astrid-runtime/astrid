@@ -181,45 +181,70 @@ print('parent completed', flush=True)
                     local.write_receipt(root, self.expected, dict.fromkeys(cert.CHECKS, True))
             self.assertFalse((root / "receipt.json").exists())
 
-    def test_post_write_clean_status_fails_without_receipt(self):
-        # Reproduce the disputed result through main(), not a replacement test.
+    def exercise_simulated_mount(self, fault=None, dirty="false"):
+        # The fake mount loses volatile files on stop and restores only synced
+        # bytes. Faults attack the actual canonical journey, not a test rewrite.
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            evidence = root / "evidence"
-            evidence.mkdir()
-            app = root / "AstridFS.app"
-            app.mkdir()
-            expected = root / "manifest.json"
-            expected.write_text(json.dumps(self.expected))
-            archive = root / self.expected["archive"]
-            commands = []
+            root = Path(directory).resolve()
+            home, mount = local.prepare_directories(root)
+            durable = {}
+            mounted = False
+            mounts = 0
+            checks = dict.fromkeys(cert.CHECKS, False)
 
-            def execute(command, *args, **kwargs):
-                commands.append(command)
-                if command == ("/sbin/mount",):
-                    return f"AOS on {(evidence / 'mount').resolve()} (astridfs, local)"
-                if "status" in command and "storage" in command:
-                    return "ReadWrite, dirty=false"
+            def execute(*command):
+                nonlocal durable, mounted, mounts
+                if command == ("start",):
+                    (home / "astrid.volume").touch()
+                elif command[:2] == ("storage", "mount"):
+                    mounted = True
+                    mounts += 1
+                    for name, value in durable.items():
+                        (mount / name).write_bytes(value)
+                    if mounts == 2 and fault == "lost-write":
+                        (mount / "renamed.txt").unlink()
+                    if mounts == 2 and fault == "corrupt-write":
+                        (mount / "renamed.txt").write_text("corrupted")
+                    if mounts == 3 and fault == "lost-delete":
+                        (mount / "renamed.txt").write_text("reappeared")
+                elif command[:2] == ("storage", "status"):
+                    return f"mount aaaa at {mount}: ReadWrite, dirty={dirty}"
+                elif command[:2] == ("storage", "sync"):
+                    if fault == "sync-failure":
+                        raise RuntimeError("sync failed")
+                    durable = {p.name: p.read_bytes() for p in mount.iterdir()}
+                elif command[:2] == ("storage", "unmount"):
+                    mounted = False
+                elif command == ("stop",):
+                    for path in mount.iterdir():
+                        path.unlink()
+                    if fault == "stop-residue":
+                        (home / "unexpected").touch()
                 return ""
 
-            with patch.object(sys, "argv", ["certify_fskit_local.py", str(archive), str(expected), "--app", str(app)]), \
-                 patch.object(local.platform, "system", return_value="Darwin"), \
-                 patch.object(local.platform, "machine", return_value="arm64"), \
-                 patch.object(local, "verify_runner_source"), \
-                 patch.object(local, "manifest", return_value=self.expected), \
-                 patch.object(local.tempfile, "mkdtemp", return_value=str(evidence)), \
-                 patch.object(local, "unpack", return_value=root / "stage"), \
-                 patch.object(local, "inventory", return_value={"test": "same"}), \
-                 patch.object(local, "run_logged", side_effect=execute):
-                with self.assertRaisesRegex(ValueError, "unexpected mount status"):
-                    local.main()
-            self.assertFalse((evidence / "receipt.json").exists())
-            checks = json.loads((evidence / "checks.json").read_text())
-            self.assertTrue(checks["mount"])
-            self.assertFalse(checks["write_rename_read"])
-            self.assertFalse(checks["sync"])
-            self.assertEqual(commands[-1][-1], "stop")
-            self.assertEqual(commands[-2][-3:-1], ("storage", "unmount"))
+            def table():
+                return f"AOS on {mount} (astridfs, local)" if mounted else ""
+
+            if fault:
+                with self.assertRaises((ValueError, RuntimeError, FileNotFoundError)):
+                    local.exercise_filesystem(execute, mount, home, table, checks)
+                self.assertFalse(checks["stop"])
+            else:
+                local.exercise_filesystem(execute, mount, home, table, checks)
+                self.assertEqual(mounts, 3)
+                for check in ("write_persistence", "delete_persistence", "sync", "stop", "unmount"):
+                    self.assertTrue(checks[check], check)
+                self.assertFalse(mounted)
+
+    def test_native_persistence_does_not_require_observable_dirty_interval(self):
+        for dirty in ("false", "true"):
+            with self.subTest(dirty=dirty):
+                self.exercise_simulated_mount(dirty=dirty)
+
+    def test_native_journey_rejects_persistence_and_sync_failures(self):
+        for fault in ("lost-write", "corrupt-write", "lost-delete", "sync-failure", "stop-residue"):
+            with self.subTest(fault=fault):
+                self.exercise_simulated_mount(fault=fault)
 
     def test_workflow_keeps_protected_gate_and_same_run_bytes(self):
         root = Path(__file__).resolve().parents[1]

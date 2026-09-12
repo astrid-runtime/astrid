@@ -124,6 +124,71 @@ def unpack(archive, destination):
     return destination / root_name
 
 
+def exercise_filesystem(cli, mount, home, mount_table, checks):
+    """Prove native persistence without assuming an observable dirty interval."""
+    started = False
+
+    def start_mount():
+        nonlocal started
+        started = True
+        cli("start")
+        cli("storage", "mount", "--as", "default", str(mount))
+        if not is_astridfs(mount, mount_table()):
+            raise ValueError("mount is not astridfs")
+        status = cli("storage", "status", str(mount)).strip()
+        pattern = rf"mount [0-9a-f-]+ at {re.escape(str(mount))}: ReadWrite, dirty=(true|false)"
+        if not re.fullmatch(pattern, status):
+            raise ValueError(f"unexpected mount status: {status}")
+
+    def stop_mount():
+        nonlocal started
+        cli("storage", "unmount", str(mount))
+        if is_astridfs(mount, mount_table()):
+            raise ValueError("filesystem remained mounted")
+        cli("stop")
+        started = False
+        if {path.name for path in home.iterdir()} != {"astrid.volume"}:
+            raise ValueError("stopped runtime is not exactly astrid.volume")
+
+    contents = "supervised FSKit round trip\n"
+    renamed = mount / "renamed.txt"
+    try:
+        start_mount()
+        checks["mount"] = True
+        (mount / "probe.txt").write_text(contents)
+        (mount / "probe.txt").rename(renamed)
+        if renamed.read_text() != contents:
+            raise ValueError("mounted read differs from write")
+        checks["write_rename_read"] = True
+        # FSKit may sync before a subsequent status query, or macOS may write
+        # metadata after sync. Neither snapshot proves durability; reopening does.
+        cli("storage", "sync", str(mount))
+        checks["sync"] = True
+        stop_mount()
+        start_mount()
+        if renamed.read_text() != contents:
+            raise ValueError("written data did not survive restart/remount")
+        checks["write_persistence"] = True
+        renamed.unlink()
+        cli("storage", "sync", str(mount))
+        checks["delete_sync"] = True
+        stop_mount()
+        start_mount()
+        if renamed.exists():
+            raise ValueError("deleted data reappeared after restart/remount")
+        checks["delete_persistence"] = True
+        stop_mount()
+        checks["unmount"] = True
+        checks["stop"] = True
+    finally:
+        if started:
+            try:
+                if is_astridfs(mount, mount_table()):
+                    cli("storage", "unmount", str(mount))
+            finally:
+                cli("stop")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path)
@@ -162,56 +227,14 @@ def main():
     def cli(*command):
         return run(binary, "--principal", "default", *command)
 
-    def status(dirty):
-        output = cli("storage", "status", str(mount))
-        if f"dirty={str(dirty).lower()}" not in output or "ReadWrite" not in output:
-            raise ValueError(f"unexpected mount status: {output}")
-
     run("/bin/bash", str(stage / "macos/validate-macos-fskit.sh"), str(stage / "AstridFS.app"))
     checks["apple_trust"] = True
     for command in ("validate", "status", "check-process"):
         run("/bin/bash", str(stage / "macos/manage-macos-fskit.sh"), command)
     checks["provider_identity"] = True
-    started = False
     try:
-        # Own this disposable home even if a partially successful start fails.
-        started = True
-        cli("start")
-        cli("storage", "mount", "--as", "default", str(mount))
-        if not is_astridfs(mount, run("/sbin/mount")):
-            raise ValueError("mount is not astridfs")
-        status(False)
-        checks["mount"] = True
-        (mount / "probe.txt").write_text("supervised FSKit round trip\n")
-        (mount / "probe.txt").rename(mount / "renamed.txt")
-        if (mount / "renamed.txt").read_text() != "supervised FSKit round trip\n":
-            raise ValueError("mounted read differs from write")
-        status(True)
-        checks["write_rename_read"] = True
-        cli("storage", "sync", str(mount))
-        status(False)
-        checks["sync"] = True
-        (mount / "renamed.txt").unlink()
-        cli("storage", "sync", str(mount))
-        status(False)
-        checks["delete_sync"] = True
-        cli("storage", "unmount", str(mount))
-        if is_astridfs(mount, run("/sbin/mount")):
-            raise ValueError("filesystem remained mounted")
-        checks["unmount"] = True
-        cli("stop")
-        started = False
-        if {path.name for path in home.iterdir()} != {"astrid.volume"}:
-            raise ValueError("stopped runtime is not exactly astrid.volume")
-        checks["stop"] = True
+        exercise_filesystem(cli, mount, home, lambda: run("/sbin/mount"), checks)
     finally:
-        if started:
-            # Only this script's mount and runtime; never pkill or remove app.
-            try:
-                if is_astridfs(mount, run("/sbin/mount")):
-                    cli("storage", "unmount", str(mount))
-            finally:
-                cli("stop")
         (root / "checks.json").write_text(json.dumps(checks, sort_keys=True))
     if inventory(stage / "AstridFS.app") != inventory(args.app):
         raise ValueError("installed app changed during certification")

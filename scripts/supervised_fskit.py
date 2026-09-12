@@ -16,6 +16,7 @@ import subprocess
 CHECKS = {
     "apple_trust", "installed_app_bytes", "provider_identity", "mount",
     "write_rename_read", "sync", "delete_sync", "unmount", "stop",
+    "write_persistence", "delete_persistence",
 }
 TARGET = "aarch64-apple-darwin"
 RUNNER_FILES = ("certify_fskit_local.py", "supervised_fskit.py")
