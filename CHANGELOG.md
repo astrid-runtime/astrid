@@ -8,6 +8,12 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ## [Unreleased]
 
+## [2026.9.2] - 2026-09-12
+
+### Added
+
+- Added an opt-in, bearer-authenticated loopback MCP Streamable HTTP endpoint using RMCP 3.2.0. It shares the stdio broker's principal, tool invocation, and consent handling, supports MCP 2026 stateless requests and tool-change subscriptions, and retains older-client session compatibility. Listener and token settings honor the selected workspace layout, including branded layouts.
+
 ## [2026.9.1] - 2026-09-10
 
 ### Fixed
@@ -1158,7 +1164,8 @@ Breaking changes to note: `Capsule.toml` moves to `[publish]` / `[subscribe]` ta
 Initial tracked release. See the [repository history](https://github.com/astrid-runtime/astrid/commits/v0.2.0)
 for changes included in this version.
 
-[Unreleased]: https://github.com/astrid-runtime/astrid/compare/v2026.9.1...HEAD
+[Unreleased]: https://github.com/astrid-runtime/astrid/compare/v2026.9.2...HEAD
+[2026.9.2]: https://github.com/astrid-runtime/astrid/compare/v2026.9.1...v2026.9.2
 [2026.9.1]: https://github.com/astrid-runtime/astrid/compare/v2026.9.0...v2026.9.1
 [2026.9.0]: https://github.com/astrid-runtime/astrid/compare/v0.10.4...v2026.9.0
 [0.10.4]: https://github.com/astrid-runtime/astrid/compare/v0.10.3...v0.10.4

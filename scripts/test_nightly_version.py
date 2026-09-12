@@ -13,7 +13,7 @@ import nightly_version
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
 VERSION = f"0.10.0-nightly.20260717.g{COMMIT}"
 LIVE_BASE_VERSION = "2026.10.0"
-LIVE_SOURCE_VERSION = "2026.9.1"
+LIVE_SOURCE_VERSION = "2026.9.2"
 
 
 class NightlyVersionTests(unittest.TestCase):

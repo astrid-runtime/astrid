@@ -36,7 +36,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2026.9.1"
+version = "2026.9.2"
 edition = "2024"
 authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
 license = "MIT OR Apache-2.0"
@@ -44,33 +44,33 @@ repository = "https://github.com/astrid-runtime/astrid"
 rust-version = "1.95"
 
 [workspace.dependencies]
-astrid-approval = { path = "crates/astrid-approval", version = "2026.9.1" }
-astrid-audit = { path = "crates/astrid-audit", version = "2026.9.1" }
-astrid-capabilities = { path = "crates/astrid-capabilities", version = "2026.9.1" }
-astrid-build = { path = "crates/astrid-build", version = "2026.9.1" }
-astrid-capsule = { path = "crates/astrid-capsule", version = "2026.9.1" }
-astrid-capsule-install = { path = "crates/astrid-capsule-install", version = "2026.9.1" }
-astrid-capsule-types = { path = "crates/astrid-capsule-types", version = "2026.9.1" }
-astrid-config = { path = "crates/astrid-config", version = "2026.9.1" }
-astrid-daemon = { path = "crates/astrid-daemon", version = "2026.9.1" }
-astrid-core = { path = "crates/astrid-core", version = "2026.9.1" }
-astrid-crypto = { path = "crates/astrid-crypto", version = "2026.9.1" }
-astrid-emit = { path = "crates/astrid-emit", version = "2026.9.1" }
-astrid-events = { path = "crates/astrid-events", version = "2026.9.1" }
-astrid-hooks = { path = "crates/astrid-hooks", version = "2026.9.1" }
-astrid-kernel = { path = "crates/astrid-kernel", version = "2026.9.1" }
-astrid-mcp = { path = "crates/astrid-mcp", version = "2026.9.1" }
-astrid-prelude = { path = "crates/astrid-prelude", version = "2026.9.1" }
-astrid-runtime = { path = "crates/astrid-runtime", version = "2026.9.1" }
-astrid-storage = { path = "crates/astrid-storage", version = "2026.9.1" }
-astrid-storage-provider-winfsp = { path = "crates/astrid-storage-provider-winfsp", version = "2026.9.1" }
-astrid-telemetry = { path = "crates/astrid-telemetry", version = "2026.9.1" }
+astrid-approval = { path = "crates/astrid-approval", version = "2026.9.2" }
+astrid-audit = { path = "crates/astrid-audit", version = "2026.9.2" }
+astrid-capabilities = { path = "crates/astrid-capabilities", version = "2026.9.2" }
+astrid-build = { path = "crates/astrid-build", version = "2026.9.2" }
+astrid-capsule = { path = "crates/astrid-capsule", version = "2026.9.2" }
+astrid-capsule-install = { path = "crates/astrid-capsule-install", version = "2026.9.2" }
+astrid-capsule-types = { path = "crates/astrid-capsule-types", version = "2026.9.2" }
+astrid-config = { path = "crates/astrid-config", version = "2026.9.2" }
+astrid-daemon = { path = "crates/astrid-daemon", version = "2026.9.2" }
+astrid-core = { path = "crates/astrid-core", version = "2026.9.2" }
+astrid-crypto = { path = "crates/astrid-crypto", version = "2026.9.2" }
+astrid-emit = { path = "crates/astrid-emit", version = "2026.9.2" }
+astrid-events = { path = "crates/astrid-events", version = "2026.9.2" }
+astrid-hooks = { path = "crates/astrid-hooks", version = "2026.9.2" }
+astrid-kernel = { path = "crates/astrid-kernel", version = "2026.9.2" }
+astrid-mcp = { path = "crates/astrid-mcp", version = "2026.9.2" }
+astrid-prelude = { path = "crates/astrid-prelude", version = "2026.9.2" }
+astrid-runtime = { path = "crates/astrid-runtime", version = "2026.9.2" }
+astrid-storage = { path = "crates/astrid-storage", version = "2026.9.2" }
+astrid-storage-provider-winfsp = { path = "crates/astrid-storage-provider-winfsp", version = "2026.9.2" }
+astrid-telemetry = { path = "crates/astrid-telemetry", version = "2026.9.2" }
 astrid-test = { path = "crates/astrid-test" }
-astrid-types = { path = "crates/astrid-types", version = "2026.9.1", features = ["clock"] }
-astrid-uplink = { path = "crates/astrid-uplink", version = "2026.9.1" }
-astrid-gateway = { path = "crates/astrid-gateway", version = "2026.9.1" }
-astrid-vfs = { path = "crates/astrid-vfs", version = "2026.9.1" }
-astrid-workspace = { path = "crates/astrid-workspace", version = "2026.9.1" }
+astrid-types = { path = "crates/astrid-types", version = "2026.9.2", features = ["clock"] }
+astrid-uplink = { path = "crates/astrid-uplink", version = "2026.9.2" }
+astrid-gateway = { path = "crates/astrid-gateway", version = "2026.9.2" }
+astrid-vfs = { path = "crates/astrid-vfs", version = "2026.9.2" }
+astrid-workspace = { path = "crates/astrid-workspace", version = "2026.9.2" }
 anyhow = "1.0"
 arboard = "3"
 arc-swap = "1.7"
@@ -196,7 +196,7 @@ rcgen = "0.14"
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 regex = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
-# Pinned to the 3.1.x patch range (~). RMCP releases breaking protocol and API
+# Pinned to the 3.2.x patch range (~). RMCP releases breaking protocol and API
 # changes in minor versions. Cargo.lock is committed, but the patch range also
 # prevents fresh resolution from silently adopting a future incompatible minor.
 # It still admits compatible bug and security fixes.
