@@ -8,12 +8,81 @@ import tempfile
 import io
 import tarfile
 import unittest
+from unittest.mock import patch
+import os
+import subprocess
+import sys
 
 import supervised_fskit as cert
 import certify_fskit_local as local
 
 
 class ApprovalTests(unittest.TestCase):
+    def test_private_directories_do_not_depend_on_umask(self):
+        with tempfile.TemporaryDirectory() as directory:
+            previous = os.umask(0o022)
+            try:
+                home, mount = local.prepare_directories(Path(directory))
+            finally:
+                os.umask(previous)
+            for path in (home, mount):
+                self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "POSIX inherited-descriptor regression")
+    def test_detached_stdout_does_not_hold_command_open(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            code = """import os, time
+pid = os.fork()
+if pid == 0:
+    time.sleep(1)
+    os._exit(0)
+print('parent completed', flush=True)
+"""
+            output = local.run_logged(
+                [sys.executable, "-c", code], os.environ.copy(), root / "log", timeout=0.5)
+            self.assertIn("parent completed", output)
+            self.assertIn("exit=0", (root / "log").read_text())
+
+    def test_failure_and_timeout_keep_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "log"
+            with self.assertRaises(RuntimeError):
+                local.run_logged([sys.executable, "-c", "print('failed'); exit(7)"],
+                                 os.environ.copy(), log)
+            self.assertIn("exit=7\nfailed", log.read_text())
+            with self.assertRaises(subprocess.TimeoutExpired):
+                local.run_logged([sys.executable, "-c",
+                                  "import time; print('waiting', flush=True); time.sleep(10)"],
+                                 os.environ.copy(), log, timeout=0.2)
+            self.assertIn("timeout=0.2\nwaiting", log.read_text())
+
+    def test_runner_source_rejects_edits_and_wrong_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scripts = Path(directory) / "scripts"
+            scripts.mkdir()
+            script = scripts / "certify_fskit_local.py"
+            helper = scripts / "supervised_fskit.py"
+            script.write_bytes(b"runner")
+            helper.write_bytes(b"helper")
+            source = "a" * 40
+            with patch.object(local.subprocess, "check_output",
+                              side_effect=[source, b"runner", b"helper"]):
+                local.verify_runner_source(source, script)
+            for changed in (script, helper):
+                original = changed.read_bytes()
+                changed.write_bytes(b"edited")
+                with patch.object(local.subprocess, "check_output",
+                                  side_effect=[source, b"runner", b"helper"]):
+                    with self.assertRaisesRegex(ValueError, "differs from release source"):
+                        local.verify_runner_source(source, script)
+                changed.write_bytes(original)
+            with patch.object(local.subprocess, "check_output", return_value="b" * 40):
+                with self.assertRaisesRegex(ValueError, "checkout differs"):
+                    local.verify_runner_source(source, script)
+            with self.assertRaisesRegex(ValueError, "must use"):
+                local.verify_runner_source(source, scripts / "copy.py")
+
     def test_local_mount_type_is_bound_to_exact_mount(self):
         with tempfile.TemporaryDirectory() as directory:
             mount = Path(directory) / "mount with spaces"

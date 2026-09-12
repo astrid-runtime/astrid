@@ -40,6 +40,20 @@ supervised operation and must be reported before proceeding.
 
 Run from the exact release source checkout, with Python 3.12 or newer:
 
+The runner checks that HEAD equals the release source and that both certification
+Python files match that commit, before execution and before emitting a receipt.
+Do not copy or edit a failing runner to obtain a PASS. A diagnostic run with
+different assertions is not the canonical certification; changes to acceptance
+criteria require review before they can authorize a future release.
+This is a local guard against accidental runner drift, not remote execution
+attestation: a protected approval is still the operator's statement, and the
+hosted receipt verifier cannot prove which program was executed on the Mac.
+
+The native dirty-state assertions remain strict. A desktop may issue background
+writes or synchronization between a filesystem operation and a CLI status query.
+If those assertions fail, retain the logs and investigate; do not infer corruption
+or automatically replace the required result with a different check.
+
 ```sh
 python3 scripts/certify_fskit_local.py \
   /absolute/archive-directory/astrid-2026.9.0-aarch64-apple-darwin.tar.gz \
