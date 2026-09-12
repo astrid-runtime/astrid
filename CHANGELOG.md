@@ -12,7 +12,7 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ### Added
 
-- Added an opt-in, bearer-authenticated loopback MCP Streamable HTTP endpoint using RMCP 3.2.0. It shares the stdio broker's principal, tool invocation, and consent handling, supports MCP 2026 stateless requests and tool-change subscriptions, and retains older-client session compatibility.
+- Added an opt-in, bearer-authenticated loopback MCP Streamable HTTP endpoint using RMCP 3.2.0. It shares the stdio broker's principal, tool invocation, and consent handling, supports MCP 2026 stateless requests and tool-change subscriptions, and retains older-client session compatibility. Listener and token settings honor the selected workspace layout, including branded layouts.
 
 ## [2026.9.1] - 2026-09-10
 
