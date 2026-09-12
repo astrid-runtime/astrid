@@ -76,3 +76,9 @@ options.
 Successful HTTP discovery and invocation do not prove that any particular host
 refreshes its model-visible catalog after a tool change. That remains a separate
 client integration test, not a promise of this transport.
+
+In the September 12 Codex desktop trial, existing HTTP tools were callable, but
+a newly installed tool did not enter the same conversation's catalog on the
+next turn, despite server notification emission and an updated `tools/list`.
+A new session or connection toggle is currently needed in that tested client.
+Changing from stdio to HTTP does not itself solve client catalog refresh.

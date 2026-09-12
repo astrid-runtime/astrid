@@ -495,6 +495,13 @@ status = "mapped"
 mode = "long_running"
 principal = "agent"
 
+[commands."mcp http"]
+scenario = "mcp_http_loopback_admission"
+status = "covered"
+mode = "bounded_failure"
+principal = "agent"
+reason = "Runtime CLI smoke executes public-bind refusal; scripts/test_mcp_http_live.py separately rehearses authenticated discovery and invocation against an installed broker."
+
 [commands."mcp gateway"]
 scenario = "mcp_bounded_smoke"
 status = "mapped"
