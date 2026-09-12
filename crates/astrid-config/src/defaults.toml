@@ -354,6 +354,12 @@ idle_shutdown_secs = 30
 # Interval (seconds) between stale session cleanup sweeps.
 session_cleanup_interval_secs = 60
 
+# Starts only with `astrid mcp http`; no listener is enabled automatically.
+[gateway.mcp_http]
+listen = "127.0.0.1:8081"
+# Private file containing a random bearer token (at least 32 bytes).
+# token_file = "/path/to/mcp-http.token"
+
 # ============================================================================
 # Timeout Configuration
 # ============================================================================

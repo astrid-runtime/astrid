@@ -320,6 +320,15 @@ state = ["MCP server process is terminated deterministically"]
 evidence = ["MCP transcript and process cleanup artifact"]
 remaining = ["persistent mcp attach, gateway, ready, and gc lifecycle paths are mapped but need a hosted gateway harness"]
 
+[scenarios.mcp_http_loopback_admission]
+status = "covered"
+surfaces = ["cli"]
+auth = ["agent"]
+success = ["public bind exits with the loopback diagnostic"]
+denial = ["mcp http --listen 0.0.0.0:0 is refused before broker access"]
+state = ["no HTTP listener is started"]
+evidence = ["cli-mcp-http-public-bind-denied.err and CLI transcript"]
+
 [scenarios.model_principal_isolation]
 status = "covered"
 surfaces = ["cli", "http", "capsule"]

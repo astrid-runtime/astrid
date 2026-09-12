@@ -446,6 +446,27 @@ fn next_grant_step(reply: &Value, grants_resolved: usize) -> GrantStep {
 }
 
 impl ServerHandler for AstridMcpServer {
+    fn accepted_subscription_filter(
+        &self,
+        requested: &rmcp::model::SubscriptionFilter,
+    ) -> Option<rmcp::model::SubscriptionFilter> {
+        (requested.tools_list_changed == Some(true)).then(|| {
+            rmcp::model::SubscriptionFilter::builder()
+                .tools_list_changed()
+                .build()
+        })
+    }
+
+    async fn listen(&self, context: rmcp::service::SubscriptionContext) -> Result<(), McpError> {
+        super::watch::run_subscription(
+            context,
+            self.principal.to_string(),
+            self.daemon_root.clone(),
+        )
+        .await;
+        Ok(())
+    }
+
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Borrowed(ASTRID_MCP_PROTOCOL_VERSIONS)
     }

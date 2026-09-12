@@ -259,6 +259,10 @@ PY
   run_cli_stdin_timeout "cli-chat-eof" 20 --format json chat
   grep -q "Goodbye" "$ARTIFACTS/cli-chat-eof.out" || fail "chat EOF path did not exit cleanly"
   run_cli_mcp_stdio_smoke "cli-mcp-serve-handshake" 20 --principal anonymous mcp serve
+  assert_principal_cli_failure "$user_principal" "cli-mcp-http-public-bind-denied" \
+    mcp http --listen 0.0.0.0:0
+  grep -Fq "MCP HTTP must bind to loopback" "$ARTIFACTS/cli-mcp-http-public-bind-denied.err" \
+    || fail "MCP HTTP public bind missed the loopback diagnostic"
   run_cli_daemon_lifecycle_smoke
 }
 

@@ -3,6 +3,38 @@ use super::{Cli, Commands, McpCommands};
 use clap::Parser;
 
 #[test]
+fn mcp_http_accepts_explicit_endpoint_credentials_and_workspace() {
+    let parsed = Cli::try_parse_from([
+        "astrid",
+        "--principal",
+        "codex-code",
+        "mcp",
+        "http",
+        "--listen",
+        "127.0.0.1:9000",
+        "--token-file",
+        "/tmp/token",
+        "--workspace",
+        "/tmp/project",
+    ])
+    .unwrap();
+    let Some(Commands::Mcp {
+        command:
+            McpCommands::Http {
+                listen,
+                token_file,
+                workspace,
+            },
+    }) = parsed.command
+    else {
+        panic!("expected MCP HTTP command");
+    };
+    assert_eq!(listen, Some("127.0.0.1:9000".parse().unwrap()));
+    assert_eq!(token_file.unwrap(), std::path::PathBuf::from("/tmp/token"));
+    assert_eq!(workspace.unwrap(), std::path::PathBuf::from("/tmp/project"));
+}
+
+#[test]
 fn mcp_serve_accepts_aos_host_plugin_flags() {
     let parsed = Cli::try_parse_from([
         "astrid",

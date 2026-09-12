@@ -69,6 +69,7 @@ mod gateway {
     }
 }
 mod grant;
+pub(crate) mod http;
 mod ingress;
 #[cfg(unix)]
 mod lifecycle;

@@ -484,6 +484,11 @@ async fn dispatch_mcp(command: McpCommands) -> Result<ExitCode> {
             commands::mcp::attach(None, workspace.as_deref()).await
         },
         McpCommands::Gateway => commands::mcp::gateway(None).await,
+        McpCommands::Http {
+            listen,
+            token_file,
+            workspace,
+        } => commands::mcp::http::run(listen, token_file.as_deref(), workspace.as_deref()).await,
         McpCommands::Ready { format } => commands::mcp::ready(None, &format).await,
         McpCommands::Gc => commands::mcp::gc(),
     }
