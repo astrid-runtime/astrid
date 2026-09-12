@@ -10,6 +10,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import subprocess
 
 
 CHECKS = {
@@ -17,6 +18,15 @@ CHECKS = {
     "write_rename_read", "sync", "delete_sync", "unmount", "stop",
 }
 TARGET = "aarch64-apple-darwin"
+RUNNER_FILES = ("certify_fskit_local.py", "supervised_fskit.py")
+
+
+def runner_identity(source):
+    """Hash canonical source, never a possibly edited working-tree runner."""
+    root = Path(__file__).resolve().parents[1]
+    return {name: hashlib.sha256(subprocess.check_output(
+        ["git", "-C", str(root), "show", f"{source}:scripts/{name}"])).hexdigest()
+        for name in RUNNER_FILES}
 
 
 def sha256(path):
@@ -37,12 +47,18 @@ def manifest(directory, source, run_id, attempt):
         raise ValueError("archive must be a regular file")
     if not re.fullmatch(r"astrid-[0-9][0-9A-Za-z.+-]*-aarch64-apple-darwin\.tar\.gz", archive.name):
         raise ValueError("unexpected Darwin archive name")
-    return {"schema": 1, "source_commit": source, "run_id": run_id,
+    return {"schema": 2, "source_commit": source, "run_id": run_id,
             "run_attempt": attempt, "target": TARGET, "archive": archive.name,
-            "archive_sha256": sha256(archive)}
+            "archive_sha256": sha256(archive), "runner_sha256": runner_identity(source)}
 
 
 def approved_receipt(expected, reviews):
+    identity = expected.get("runner_sha256")
+    if (type(expected.get("schema")) is not int or expected["schema"] != 2
+            or not isinstance(identity, dict) or set(identity) != set(RUNNER_FILES)
+            or not all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+                       for value in identity.values())):
+        raise ValueError("expected manifest lacks canonical runner identity")
     for review in reviews:
         if review.get("state") != "approved":
             continue

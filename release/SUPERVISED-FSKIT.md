@@ -49,6 +49,12 @@ This is a local guard against accidental runner drift, not remote execution
 attestation: a protected approval is still the operator's statement, and the
 hosted receipt verifier cannot prove which program was executed on the Mac.
 
+The schema-2 release-run manifest also hashes both Python files from the selected
+Git commit. The runner compares its own files with those identities before
+writing a receipt; the hosted verifier requires the same identities. Older
+schema-1 receipts and mismatched runner hashes are rejected. These hashes bind
+the claimed runner; they are not independent execution attestation.
+
 The native dirty-state assertions remain strict. A desktop may issue background
 writes or synchronization between a filesystem operation and a CLI status query.
 If those assertions fail, retain the logs and investigate; do not infer corruption
@@ -82,6 +88,13 @@ requires Joshua's `joshuajbouw` approval for environment `release`, with exact
 source, archive hash/name, target, run ID, run attempt, and all required checks
 literally `true`. Generic approval, missing checks, different bytes or a stale
 attempt fail. Do not manufacture a receipt from a planned test.
+
+When reporting any failure, put the canonical outcome first. Include the failing
+assertion and distinguish diagnostic results in the same user-facing answer.
+Never offer an edited runner's receipt for approval, fill missing checks by hand,
+or convert a diagnostic success into canonical PASS. Preserve failed logs and
+original receipts. If an invalid receipt has already been used, explicitly
+correct its record; do not delete the evidence or silently overwrite history.
 
 The hosted job uploads the accepted receipt to the same Release run and reports
 the named certification check. GitHub publication still depends on that check

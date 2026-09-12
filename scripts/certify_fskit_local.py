@@ -17,7 +17,7 @@ import subprocess
 import tarfile
 import tempfile
 
-from supervised_fskit import CHECKS, TARGET, manifest, sha256
+from supervised_fskit import CHECKS, RUNNER_FILES, TARGET, manifest, sha256
 
 
 def verify_runner_source(source_commit, script=None):
@@ -32,11 +32,24 @@ def verify_runner_source(source_commit, script=None):
         ["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
     if head != source_commit:
         raise ValueError("certification checkout differs from release source")
-    for name in ("certify_fskit_local.py", "supervised_fskit.py"):
+    for name in RUNNER_FILES:
         expected = subprocess.check_output(
             ["git", "-C", str(root), "show", f"{source_commit}:scripts/{name}"])
         if (script.parent / name).read_bytes() != expected:
             raise ValueError(f"certification script differs from release source: {name}")
+
+
+def write_receipt(root, expected, checks):
+    """Only the unchanged canonical runner with every check complete emits PASS."""
+    verify_runner_source(expected["source_commit"])
+    actual = {name: sha256(Path(__file__).resolve().parent / name) for name in RUNNER_FILES}
+    if actual != expected.get("runner_sha256"):
+        raise ValueError("runner differs from release-run manifest")
+    if set(checks) != CHECKS or not all(value is True for value in checks.values()):
+        raise ValueError("incomplete certification; no PASS receipt")
+    receipt = dict(expected, result="PASS", checks=checks)
+    (root / "receipt.json").write_text(json.dumps(receipt, sort_keys=True) + "\n")
+    print(json.dumps(receipt, sort_keys=True))
 
 
 def run_logged(command, env, log_path, timeout=90):
@@ -204,10 +217,7 @@ def main():
         raise ValueError("installed app changed during certification")
     if manifest(archive.parent, expected["source_commit"], expected["run_id"], expected["run_attempt"]) != expected:
         raise ValueError("archive changed during certification")
-    verify_runner_source(expected["source_commit"])
-    receipt = dict(expected, result="PASS", checks=checks)
-    (root / "receipt.json").write_text(json.dumps(receipt, sort_keys=True) + "\n")
-    print(json.dumps(receipt, sort_keys=True))
+    write_receipt(root, expected, checks)
 
 
 if __name__ == "__main__":
