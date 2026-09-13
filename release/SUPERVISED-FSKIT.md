@@ -40,6 +40,31 @@ supervised operation and must be reported before proceeding.
 
 Run from the exact release source checkout, with Python 3.12 or newer:
 
+The runner checks that HEAD equals the release source and that both certification
+Python files match that commit, before execution and before emitting a receipt.
+Do not copy or edit a failing runner to obtain a PASS. A diagnostic run with
+different assertions is not the canonical certification; changes to acceptance
+criteria require review before they can authorize a future release.
+This is a local guard against accidental runner drift, not remote execution
+attestation: a protected approval is still the operator's statement, and the
+hosted receipt verifier cannot prove which program was executed on the Mac.
+
+The schema-2 release-run manifest also hashes both Python files from the selected
+Git commit. The runner compares its own files with those identities before
+writing a receipt; the hosted verifier requires the same identities. Older
+schema-1 receipts and mismatched runner hashes are rejected. These hashes bind
+the claimed runner; they are not independent execution attestation.
+
+Native status must identify the expected read-write mount, but its dirty boolean
+is not a durability verdict. On 2026.9.2, traced FSKit sync callbacks completed
+between write/rename and status, legitimately reporting clean. Background metadata
+writes can conversely make a mount dirty after sync. The native journey therefore
+requires successful explicit sync, full stop/start and remount, exact retained
+contents, and another stop/start/remount proving deletion persists. Deterministic
+dirty-transition assertions remain in the kernel tests, where the operation
+ordering is controlled. This changes the native acceptance test prospectively;
+it does not validate the non-canonical historical 2026.9.2 receipt (see #1926).
+
 ```sh
 python3 scripts/certify_fskit_local.py \
   /absolute/archive-directory/astrid-2026.9.0-aarch64-apple-darwin.tar.gz \
@@ -49,8 +74,10 @@ python3 scripts/certify_fskit_local.py \
 
 The script hashes the archive, safely extracts it, compares every installed app
 file's bytes/mode, validates Apple trust and bound provider identity, then tests
-a fresh runtime: real `astridfs` mount, write/rename/read, dirty/sync status,
-delete/sync, unmount and stop leaving exactly `astrid.volume`. It never installs
+a fresh runtime: real `astridfs` mount, write/rename/read, explicit sync,
+write and deletion persistence across restarts, unmount and stop leaving exactly
+`astrid.volume`. Receipts explicitly require `write_persistence` and
+`delete_persistence`. It never installs
 or uninstalls an app, changes extension election, or kills foreign processes.
 It retains commands, checks and the PASS receipt in the printed `/tmp/fsc.*`
 evidence directory. Failure produces no PASS receipt. Preserve that directory.
@@ -68,6 +95,13 @@ requires Joshua's `joshuajbouw` approval for environment `release`, with exact
 source, archive hash/name, target, run ID, run attempt, and all required checks
 literally `true`. Generic approval, missing checks, different bytes or a stale
 attempt fail. Do not manufacture a receipt from a planned test.
+
+When reporting any failure, put the canonical outcome first. Include the failing
+assertion and distinguish diagnostic results in the same user-facing answer.
+Never offer an edited runner's receipt for approval, fill missing checks by hand,
+or convert a diagnostic success into canonical PASS. Preserve failed logs and
+original receipts. If an invalid receipt has already been used, explicitly
+correct its record; do not delete the evidence or silently overwrite history.
 
 The hosted job uploads the accepted receipt to the same Release run and reports
 the named certification check. GitHub publication still depends on that check

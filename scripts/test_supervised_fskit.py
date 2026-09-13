@@ -8,12 +8,81 @@ import tempfile
 import io
 import tarfile
 import unittest
+from unittest.mock import patch
+import os
+import subprocess
+import sys
 
 import supervised_fskit as cert
 import certify_fskit_local as local
 
 
 class ApprovalTests(unittest.TestCase):
+    def test_private_directories_do_not_depend_on_umask(self):
+        with tempfile.TemporaryDirectory() as directory:
+            previous = os.umask(0o022)
+            try:
+                home, mount = local.prepare_directories(Path(directory))
+            finally:
+                os.umask(previous)
+            for path in (home, mount):
+                self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "POSIX inherited-descriptor regression")
+    def test_detached_stdout_does_not_hold_command_open(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            code = """import os, time
+pid = os.fork()
+if pid == 0:
+    time.sleep(1)
+    os._exit(0)
+print('parent completed', flush=True)
+"""
+            output = local.run_logged(
+                [sys.executable, "-c", code], os.environ.copy(), root / "log", timeout=0.5)
+            self.assertIn("parent completed", output)
+            self.assertIn("exit=0", (root / "log").read_text())
+
+    def test_failure_and_timeout_keep_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "log"
+            with self.assertRaises(RuntimeError):
+                local.run_logged([sys.executable, "-c", "print('failed'); exit(7)"],
+                                 os.environ.copy(), log)
+            self.assertIn("exit=7\nfailed", log.read_text())
+            with self.assertRaises(subprocess.TimeoutExpired):
+                local.run_logged([sys.executable, "-c",
+                                  "import time; print('waiting', flush=True); time.sleep(10)"],
+                                 os.environ.copy(), log, timeout=0.2)
+            self.assertIn("timeout=0.2\nwaiting", log.read_text())
+
+    def test_runner_source_rejects_edits_and_wrong_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scripts = Path(directory) / "scripts"
+            scripts.mkdir()
+            script = scripts / "certify_fskit_local.py"
+            helper = scripts / "supervised_fskit.py"
+            script.write_bytes(b"runner")
+            helper.write_bytes(b"helper")
+            source = "a" * 40
+            with patch.object(local.subprocess, "check_output",
+                              side_effect=[source, b"runner", b"helper"]):
+                local.verify_runner_source(source, script)
+            for changed in (script, helper):
+                original = changed.read_bytes()
+                changed.write_bytes(b"edited")
+                with patch.object(local.subprocess, "check_output",
+                                  side_effect=[source, b"runner", b"helper"]):
+                    with self.assertRaisesRegex(ValueError, "differs from release source"):
+                        local.verify_runner_source(source, script)
+                changed.write_bytes(original)
+            with patch.object(local.subprocess, "check_output", return_value="b" * 40):
+                with self.assertRaisesRegex(ValueError, "checkout differs"):
+                    local.verify_runner_source(source, script)
+            with self.assertRaisesRegex(ValueError, "must use"):
+                local.verify_runner_source(source, scripts / "copy.py")
+
     def test_local_mount_type_is_bound_to_exact_mount(self):
         with tempfile.TemporaryDirectory() as directory:
             mount = Path(directory) / "mount with spaces"
@@ -31,10 +100,11 @@ class ApprovalTests(unittest.TestCase):
                     self.assertFalse(local.is_astridfs(mount, table))
 
     def setUp(self):
-        self.expected = {"schema": 1, "source_commit": "a" * 40, "run_id": "123",
+        self.expected = {"schema": 2, "source_commit": "a" * 40, "run_id": "123",
                          "run_attempt": "2", "target": cert.TARGET,
                          "archive": "astrid-2026.9.0-aarch64-apple-darwin.tar.gz",
-                         "archive_sha256": "b" * 64}
+                         "archive_sha256": "b" * 64,
+                         "runner_sha256": dict.fromkeys(cert.RUNNER_FILES, "c" * 64)}
         self.receipt = dict(self.expected, result="PASS", checks=dict.fromkeys(cert.CHECKS, True))
         self.review = {"state": "approved", "user": {"login": "joshuajbouw"},
                        "environments": [{"name": "release"}],
@@ -44,7 +114,7 @@ class ApprovalTests(unittest.TestCase):
         self.assertEqual(cert.approved_receipt(self.expected, [self.review]), self.receipt)
 
     def test_stale_or_different_identity(self):
-        for field in ("source_commit", "archive_sha256", "run_id", "run_attempt", "target", "archive"):
+        for field in ("source_commit", "archive_sha256", "run_id", "run_attempt", "target", "archive", "runner_sha256"):
             with self.subTest(field=field):
                 receipt = dict(self.receipt, **{field: "different"})
                 with self.assertRaises(ValueError):
@@ -67,7 +137,7 @@ class ApprovalTests(unittest.TestCase):
                 cert.approved_receipt(self.expected, [dict(self.review, **change)])
 
     def test_manifest_hashes_actual_archive(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, patch.object(cert, "runner_identity", return_value=self.expected["runner_sha256"]):
             path = Path(directory) / self.expected["archive"]
             path.write_bytes(b"first")
             first = cert.manifest(directory, "a" * 40, "123", "2")
@@ -77,6 +147,104 @@ class ApprovalTests(unittest.TestCase):
             (Path(directory) / "extra").write_text("unexpected")
             with self.assertRaises(ValueError):
                 cert.manifest(directory, "a" * 40, "123", "2")
+
+    def test_runner_identity_uses_committed_bytes(self):
+        with patch.object(cert.subprocess, "check_output", return_value=b"canonical") as read:
+            result = cert.runner_identity("a" * 40)
+        self.assertEqual(set(result), set(cert.RUNNER_FILES))
+        for call, name in zip(read.call_args_list, cert.RUNNER_FILES):
+            self.assertEqual(call.args[0][-2:], ["show", f"{'a' * 40}:scripts/{name}"])
+
+    def test_legacy_receipt_without_runner_identity_is_rejected(self):
+        legacy = dict(self.expected, schema=1)
+        legacy.pop("runner_sha256")
+        with self.assertRaisesRegex(ValueError, "runner identity"):
+            cert.approved_receipt(legacy, [self.review])
+
+    def test_incomplete_checks_never_write_a_pass(self):
+        for name in cert.CHECKS:
+            for value in (False, None, "true", 1):
+                with self.subTest(name=name, value=value), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    checks = dict.fromkeys(cert.CHECKS, True)
+                    checks[name] = value
+                    with patch.object(local, "verify_runner_source"), patch.object(local, "sha256", return_value="c" * 64):
+                        with self.assertRaisesRegex(ValueError, "incomplete"):
+                            local.write_receipt(root, self.expected, checks)
+                    self.assertFalse((root / "receipt.json").exists())
+
+    def test_changed_runner_never_writes_a_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(local, "verify_runner_source"), patch.object(local, "sha256", return_value="d" * 64):
+                with self.assertRaisesRegex(ValueError, "runner differs"):
+                    local.write_receipt(root, self.expected, dict.fromkeys(cert.CHECKS, True))
+            self.assertFalse((root / "receipt.json").exists())
+
+    def exercise_simulated_mount(self, fault=None, dirty="false"):
+        # The fake mount loses volatile files on stop and restores only synced
+        # bytes. Faults attack the actual canonical journey, not a test rewrite.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home, mount = local.prepare_directories(root)
+            durable = {}
+            mounted = False
+            mounts = 0
+            checks = dict.fromkeys(cert.CHECKS, False)
+
+            def execute(*command):
+                nonlocal durable, mounted, mounts
+                if command == ("start",):
+                    (home / "astrid.volume").touch()
+                elif command[:2] == ("storage", "mount"):
+                    mounted = True
+                    mounts += 1
+                    for name, value in durable.items():
+                        (mount / name).write_bytes(value)
+                    if mounts == 2 and fault == "lost-write":
+                        (mount / "renamed.txt").unlink()
+                    if mounts == 2 and fault == "corrupt-write":
+                        (mount / "renamed.txt").write_text("corrupted")
+                    if mounts == 3 and fault == "lost-delete":
+                        (mount / "renamed.txt").write_text("reappeared")
+                elif command[:2] == ("storage", "status"):
+                    return f"mount aaaa at {mount}: ReadWrite, dirty={dirty}"
+                elif command[:2] == ("storage", "sync"):
+                    if fault == "sync-failure":
+                        raise RuntimeError("sync failed")
+                    durable = {p.name: p.read_bytes() for p in mount.iterdir()}
+                elif command[:2] == ("storage", "unmount"):
+                    mounted = False
+                elif command == ("stop",):
+                    for path in mount.iterdir():
+                        path.unlink()
+                    if fault == "stop-residue":
+                        (home / "unexpected").touch()
+                return ""
+
+            def table():
+                return f"AOS on {mount} (astridfs, local)" if mounted else ""
+
+            if fault:
+                with self.assertRaises((ValueError, RuntimeError, FileNotFoundError)):
+                    local.exercise_filesystem(execute, mount, home, table, checks)
+                self.assertFalse(checks["stop"])
+            else:
+                local.exercise_filesystem(execute, mount, home, table, checks)
+                self.assertEqual(mounts, 3)
+                for check in ("write_persistence", "delete_persistence", "sync", "stop", "unmount"):
+                    self.assertTrue(checks[check], check)
+                self.assertFalse(mounted)
+
+    def test_native_persistence_does_not_require_observable_dirty_interval(self):
+        for dirty in ("false", "true"):
+            with self.subTest(dirty=dirty):
+                self.exercise_simulated_mount(dirty=dirty)
+
+    def test_native_journey_rejects_persistence_and_sync_failures(self):
+        for fault in ("lost-write", "corrupt-write", "lost-delete", "sync-failure", "stop-residue"):
+            with self.subTest(fault=fault):
+                self.exercise_simulated_mount(fault=fault)
 
     def test_workflow_keeps_protected_gate_and_same_run_bytes(self):
         root = Path(__file__).resolve().parents[1]
