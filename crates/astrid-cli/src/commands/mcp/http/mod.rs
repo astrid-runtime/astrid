@@ -5,11 +5,12 @@
 //! keys and one-time redemption across independent stateless requests.
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use astrid_config::gateway::{McpHttpOauthSection, McpHttpSection};
 use axum::{Router, middleware};
 use rmcp::ServerHandler;
 use rmcp::transport::streamable_http_server::{
@@ -20,8 +21,21 @@ use tokio_util::sync::CancellationToken;
 
 mod auth;
 mod handler;
+mod oauth;
 #[cfg(test)]
 mod tests;
+
+/// How this listener authenticates `/mcp` requests.
+#[derive(Clone)]
+enum AuthMode {
+    Token(Arc<auth::BearerToken>),
+    Oauth(oauth::ResourceServer),
+}
+
+enum AuthSource {
+    Token(PathBuf),
+    Oauth(McpHttpOauthSection),
+}
 
 /// Start an explicitly managed, authenticated loopback MCP listener.
 pub(crate) async fn run(
@@ -36,21 +50,17 @@ pub(crate) async fn run(
     let settings = &config.gateway.mcp_http;
     let bind = listen.unwrap_or(settings.listen);
     validate_bind(bind)?;
-    let token = auth::BearerToken::read(
-        token_file
-            .or(settings.token_file.as_deref())
-            .context("MCP HTTP requires --token-file or gateway.mcp_http.token_file")?,
-    )?;
     let principal = crate::principal::current();
     anyhow::ensure!(
         principal != astrid_core::PrincipalId::anonymous(),
         "MCP HTTP requires a named principal"
     );
+    let mode = prepare_auth(token_file, settings, principal.clone()).await?;
     let workspace = workspace
         .unwrap_or(&root)
         .canonicalize()
         .context("resolve MCP workspace")?;
-    // Bind and validate credentials before starting any runtime process.
+    // Bind after credentials/JWKS are validated and before starting any runtime process.
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .context("bind MCP HTTP listener")?;
@@ -81,7 +91,7 @@ pub(crate) async fn run(
                 root.clone(),
             ))
         },
-        token,
+        mode,
         address,
         shutdown.clone(),
     );
@@ -97,6 +107,38 @@ pub(crate) async fn run(
     result.map(|()| ExitCode::SUCCESS)
 }
 
+fn select_auth_source(token_file: Option<&Path>, settings: &McpHttpSection) -> Result<AuthSource> {
+    if token_file.is_some() && settings.oauth.is_some() {
+        anyhow::bail!("MCP HTTP --token-file cannot be combined with gateway.mcp_http.oauth");
+    }
+    match (
+        token_file.or(settings.token_file.as_deref()),
+        settings.oauth.as_ref(),
+    ) {
+        (Some(path), None) => Ok(AuthSource::Token(path.to_path_buf())),
+        (None, Some(oauth)) => Ok(AuthSource::Oauth(oauth.clone())),
+        (None, None) => anyhow::bail!(
+            "MCP HTTP requires --token-file, gateway.mcp_http.token_file, or gateway.mcp_http.oauth"
+        ),
+        (Some(_), Some(_)) => {
+            anyhow::bail!("MCP HTTP token_file and oauth are mutually exclusive")
+        },
+    }
+}
+
+async fn prepare_auth(
+    token_file: Option<&Path>,
+    settings: &McpHttpSection,
+    principal: astrid_core::PrincipalId,
+) -> Result<AuthMode> {
+    match select_auth_source(token_file, settings)? {
+        AuthSource::Token(path) => Ok(AuthMode::Token(Arc::new(auth::BearerToken::read(&path)?))),
+        AuthSource::Oauth(oauth) => Ok(AuthMode::Oauth(
+            oauth::ResourceServer::connect(oauth, principal).await?,
+        )),
+    }
+}
+
 fn validate_bind(address: SocketAddr) -> Result<()> {
     anyhow::ensure!(
         address.ip().is_loopback(),
@@ -105,9 +147,17 @@ fn validate_bind(address: SocketAddr) -> Result<()> {
     Ok(())
 }
 
+fn allowed_hosts(address: SocketAddr, mode: &AuthMode) -> Vec<String> {
+    let mut hosts = vec![address.to_string(), format!("localhost:{}", address.port())];
+    if let AuthMode::Oauth(server) = mode {
+        hosts.extend(server.resource_hosts());
+    }
+    hosts
+}
+
 fn router<S: ServerHandler + 'static>(
     factory: impl Fn() -> std::io::Result<S> + Send + Sync + 'static,
-    token: auth::BearerToken,
+    mode: AuthMode,
     address: SocketAddr,
     shutdown: CancellationToken,
 ) -> Router {
@@ -116,15 +166,24 @@ fn router<S: ServerHandler + 'static>(
     let mut config = StreamableHttpServerConfig::default();
     config.json_response = true;
     config.cancellation_token = shutdown;
-    config.allowed_hosts = vec![address.to_string(), format!("localhost:{}", address.port())];
+    config.allowed_hosts = allowed_hosts(address, &mode);
     let service =
         StreamableHttpService::new(factory, Arc::new(LocalSessionManager::default()), config);
-    Router::new()
-        .nest_service("/mcp", service)
-        .layer(middleware::from_fn_with_state(
-            Arc::new(token),
-            auth::authorize,
-        ))
+    let mcp = Router::new().nest(
+        "/mcp",
+        Router::new()
+            .fallback_service(service)
+            .layer(middleware::from_fn_with_state(
+                mode.clone(),
+                auth::authorize,
+            )),
+    );
+    match mode {
+        AuthMode::Oauth(server) => {
+            mcp.merge(oauth::ResourceServer::metadata_router().with_state(server))
+        },
+        AuthMode::Token(_) => mcp,
+    }
 }
 
 async fn shutdown_signal() {

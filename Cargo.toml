@@ -211,6 +211,10 @@ sha2 = "0.11"
 # exact-pinned: it sits on the self-update trust boundary, and its TUF support
 # refreshes the public-good trust root without invoking an external verifier.
 sigstore-verify = { version = "=0.11.0", default-features = false, features = ["rustls", "tuf"] }
+# Asymmetric JWT/JWKS validation for the MCP HTTP OAuth resource server.
+# Application code rejects `alg=none` and HMAC; this crate only verifies
+# asymmetric signatures from a configured JWKS document.
+jsonwebtoken = { version = "9.3", default-features = false, features = ["use_pem"] }
 subtle = "2"
 surrealkv = "0.21"
 syn = { version = "~3.0.4", features = ["full", "visit"] }
