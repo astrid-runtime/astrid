@@ -90,9 +90,15 @@ set the field:
 
 Astrid is the resource server, not an authorization server. It fetches JWKS
 over HTTPS before bind, then validates asymmetric JWTs (`alg=none` and HMAC
-are rejected). `iss` must match `issuer`, `aud` must contain `resource`,
+are rejected). Declared JWK `use`, `key_ops`, and `alg` values must permit the
+requested signature verification. Cached JWKS material older than five minutes
+is refreshed before token verification, with unknown-key refresh attempts
+rate-limited to prevent request amplification. `iss` must match `issuer`,
+`aud` must contain `resource`,
 `exp`/`nbf` use no leeway, required `scopes` must be present, and
-`principal_claim` must equal the process principal. `allowed_azp` is optional.
+`principal_claim` must equal the process principal. `scope` and `azp` cannot be
+used as the principal claim because they have separate authorization semantics.
+`allowed_azp` is optional.
 
 Unauthenticated RFC 9728 metadata is served at the canonical well-known URL for
 the configured resource path. For the example above, that is

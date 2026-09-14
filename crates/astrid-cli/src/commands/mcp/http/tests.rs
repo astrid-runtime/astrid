@@ -110,6 +110,10 @@ async fn protected_endpoint() -> Endpoint {
     serve(AuthMode::Oauth(oauth::test_server())).await
 }
 
+async fn protected_endpoint_for_resource(resource: &str) -> Endpoint {
+    serve(AuthMode::Oauth(oauth::test_server_with_resource(resource))).await
+}
+
 fn authenticate_header(response: &reqwest::Response) -> String {
     response
         .headers()
@@ -405,6 +409,38 @@ async fn oauth_metadata_is_unauthenticated_and_path_aware() {
             .unwrap();
         assert_eq!(response.status(), 404, "{path}");
     }
+}
+
+#[tokio::test]
+async fn oauth_metadata_preserves_query_trailing_slash_and_encoded_path() {
+    let cases = [
+        (
+            "https://mcp.example.com/mcp/?tenant=a",
+            "/.well-known/oauth-protected-resource/mcp/?tenant=a",
+        ),
+        (
+            "https://mcp.example.com/mcp%20api",
+            "/.well-known/oauth-protected-resource/mcp%20api",
+        ),
+    ];
+    for (resource, target) in cases {
+        let endpoint = protected_endpoint_for_resource(resource).await;
+        let response = reqwest::get(format!("{}{target}", endpoint.origin))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{target}");
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["resource"], resource);
+    }
+
+    let endpoint = protected_endpoint_for_resource("https://mcp.example.com/mcp/?tenant=a").await;
+    let response = reqwest::get(format!(
+        "{}/.well-known/oauth-protected-resource/mcp/",
+        endpoint.origin
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 404);
 }
 
 #[tokio::test]

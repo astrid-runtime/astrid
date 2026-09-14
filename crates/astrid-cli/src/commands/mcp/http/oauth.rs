@@ -10,12 +10,14 @@ use anyhow::{Context, Result};
 use astrid_config::gateway::McpHttpOauthSection;
 use astrid_core::PrincipalId;
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use jsonwebtoken::errors::ErrorKind;
-use jsonwebtoken::jwk::{AlgorithmParameters, Jwk, JwkSet};
+use jsonwebtoken::jwk::{
+    AlgorithmParameters, Jwk, JwkSet, KeyAlgorithm, KeyOperations, PublicKeyUse,
+};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -31,6 +33,10 @@ pub(super) enum OauthError {
     UnknownKey,
     /// Matched JWK is an octet/HMAC key.
     SymmetricKey,
+    /// Matched JWK metadata does not authorize signature verification.
+    KeyUsageDenied,
+    /// Matched JWK declares an algorithm different from the JWT header.
+    KeyAlgorithmMismatch,
     /// `exp` is in the past.
     Expired,
     /// `nbf` is in the future.
@@ -55,6 +61,7 @@ pub(super) struct ResourceServer {
     jwks: Arc<RwLock<JwkSet>>,
     client: Option<reqwest::Client>,
     refresh: Arc<tokio::sync::Mutex<Option<Instant>>>,
+    refreshed_at: Arc<RwLock<Instant>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +81,9 @@ struct AccessClaims {
 /// request flood while allowing key rotation to become visible promptly.
 const JWKS_REFRESH_BACKOFF: Duration = Duration::from_mins(1);
 
+/// Maximum lifetime of cached JWKS material before a mandatory refresh.
+const JWKS_CACHE_TTL: Duration = Duration::from_mins(5);
+
 impl ResourceServer {
     /// Fetch JWKS over HTTPS and fail closed before the listener binds.
     pub(super) async fn connect(
@@ -92,6 +102,7 @@ impl ResourceServer {
             jwks: Arc::new(RwLock::new(jwks)),
             client: Some(client),
             refresh: Arc::new(tokio::sync::Mutex::new(None)),
+            refreshed_at: Arc::new(RwLock::new(Instant::now())),
         })
     }
 
@@ -108,6 +119,7 @@ impl ResourceServer {
             jwks: Arc::new(RwLock::new(jwks)),
             client: None,
             refresh: Arc::new(tokio::sync::Mutex::new(None)),
+            refreshed_at: Arc::new(RwLock::new(Instant::now())),
         }
     }
 
@@ -117,6 +129,7 @@ impl ResourceServer {
         reject_hmac(header.alg)?;
         let kid = header.kid.as_deref().ok_or(OauthError::UnknownKey)?;
         let jwk = self.resolve_jwk(kid).await?;
+        validate_jwk_metadata(&jwk, header.alg)?;
         if matches!(jwk.algorithm, AlgorithmParameters::OctetKey(_)) {
             return Err(OauthError::SymmetricKey);
         }
@@ -183,6 +196,10 @@ impl ResourceServer {
         resource_path_suffix(&self.config.resource)
     }
 
+    fn metadata_path_and_query(&self) -> Option<String> {
+        protected_resource_metadata_path_and_query(&self.config.resource)
+    }
+
     fn authorize_claims(&self, claims: &AccessClaims) -> Result<(), OauthError> {
         self.check_principal(claims)?;
         self.check_scopes(claims)?;
@@ -237,6 +254,7 @@ impl ResourceServer {
     }
 
     async fn resolve_jwk(&self, kid: &str) -> Result<Jwk, OauthError> {
+        self.refresh_if_stale().await?;
         if let Some(jwk) = self.find_jwk(kid) {
             return Ok(jwk);
         }
@@ -249,6 +267,22 @@ impl ResourceServer {
         Err(OauthError::UnknownKey)
     }
 
+    async fn refresh_if_stale(&self) -> Result<(), OauthError> {
+        if self.cache_is_stale() && self.client.is_some() {
+            self.refresh_jwks().await?;
+            if self.cache_is_stale() {
+                return Err(OauthError::UnknownKey);
+            }
+        }
+        Ok(())
+    }
+
+    fn cache_is_stale(&self) -> bool {
+        self.refreshed_at.read().map_or(true, |refreshed_at| {
+            jwks_cache_is_stale(*refreshed_at, Instant::now())
+        })
+    }
+
     fn find_jwk(&self, kid: &str) -> Option<Jwk> {
         let guard = self.jwks.read().ok()?;
         guard.find(kid).cloned()
@@ -259,7 +293,7 @@ impl ResourceServer {
         let mut last_attempt = self.refresh.lock().await;
         let now = Instant::now();
         if !jwks_refresh_due(*last_attempt, now) {
-            return Err(OauthError::UnknownKey);
+            return Ok(());
         }
         *last_attempt = Some(now);
         let jwks = fetch_jwks(client, &self.config.jwks_url)
@@ -269,6 +303,11 @@ impl ResourceServer {
             return Err(OauthError::InvalidToken);
         };
         *guard = jwks;
+        drop(guard);
+        let Ok(mut refreshed_at) = self.refreshed_at.write() else {
+            return Err(OauthError::InvalidToken);
+        };
+        *refreshed_at = Instant::now();
         Ok(())
     }
 }
@@ -276,6 +315,10 @@ impl ResourceServer {
 fn jwks_refresh_due(last_attempt: Option<Instant>, now: Instant) -> bool {
     last_attempt
         .is_none_or(|attempt| now.saturating_duration_since(attempt) >= JWKS_REFRESH_BACKOFF)
+}
+
+fn jwks_cache_is_stale(refreshed_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(refreshed_at) >= JWKS_CACHE_TTL
 }
 
 async fn fetch_jwks(client: &reqwest::Client, url: &str) -> Result<JwkSet> {
@@ -297,6 +340,51 @@ async fn fetch_jwks(client: &reqwest::Client, url: &str) -> Result<JwkSet> {
     let jwks = response.json::<JwkSet>().await.context("parse JWKS")?;
     anyhow::ensure!(!jwks.keys.is_empty(), "JWKS contains no keys");
     Ok(jwks)
+}
+
+fn validate_jwk_metadata(jwk: &Jwk, algorithm: Algorithm) -> Result<(), OauthError> {
+    if jwk
+        .common
+        .public_key_use
+        .as_ref()
+        .is_some_and(|usage| !matches!(usage, PublicKeyUse::Signature))
+    {
+        return Err(OauthError::KeyUsageDenied);
+    }
+    if jwk
+        .common
+        .key_operations
+        .as_ref()
+        .is_some_and(|operations| !operations.contains(&KeyOperations::Verify))
+    {
+        return Err(OauthError::KeyUsageDenied);
+    }
+    if jwk
+        .common
+        .key_algorithm
+        .is_some_and(|declared| !key_algorithm_matches(declared, algorithm))
+    {
+        return Err(OauthError::KeyAlgorithmMismatch);
+    }
+    Ok(())
+}
+
+fn key_algorithm_matches(declared: KeyAlgorithm, actual: Algorithm) -> bool {
+    matches!(
+        (declared, actual),
+        (KeyAlgorithm::RS256, Algorithm::RS256)
+            | (KeyAlgorithm::RS384, Algorithm::RS384)
+            | (KeyAlgorithm::RS512, Algorithm::RS512)
+            | (KeyAlgorithm::PS256, Algorithm::PS256)
+            | (KeyAlgorithm::PS384, Algorithm::PS384)
+            | (KeyAlgorithm::PS512, Algorithm::PS512)
+            | (KeyAlgorithm::ES256, Algorithm::ES256)
+            | (KeyAlgorithm::ES384, Algorithm::ES384)
+            | (KeyAlgorithm::EdDSA, Algorithm::EdDSA)
+            | (KeyAlgorithm::HS256, Algorithm::HS256)
+            | (KeyAlgorithm::HS384, Algorithm::HS384)
+            | (KeyAlgorithm::HS512, Algorithm::HS512)
+    )
 }
 
 fn reject_hmac(alg: Algorithm) -> Result<(), OauthError> {
@@ -346,10 +434,15 @@ fn protected_resource_metadata_url(resource: &str) -> String {
         return resource.to_owned();
     };
     let origin = url.origin().ascii_serialization();
-    match resource_path_suffix(resource) {
+    let mut metadata = match resource_path_suffix(resource) {
         Some(suffix) => format!("{origin}/.well-known/oauth-protected-resource/{suffix}"),
         None => format!("{origin}/.well-known/oauth-protected-resource"),
+    };
+    if let Some(query) = url.query() {
+        metadata.push('?');
+        metadata.push_str(query);
     }
+    metadata
 }
 
 fn resource_hosts(resource: &str) -> Vec<String> {
@@ -373,7 +466,7 @@ fn resource_hosts(resource: &str) -> Vec<String> {
 
 fn resource_path_suffix(resource: &str) -> Option<String> {
     let url = url::Url::parse(resource).ok()?;
-    let path = url.path().trim_matches('/');
+    let path = url.path().strip_prefix('/').unwrap_or(url.path());
     if path.is_empty() {
         None
     } else {
@@ -381,20 +474,42 @@ fn resource_path_suffix(resource: &str) -> Option<String> {
     }
 }
 
-async fn protected_resource_metadata(State(server): State<ResourceServer>) -> Response {
-    match server.path_suffix() {
-        None => Json(server.metadata()).into_response(),
-        Some(_) => StatusCode::NOT_FOUND.into_response(),
+fn protected_resource_metadata_path_and_query(resource: &str) -> Option<String> {
+    let metadata = url::Url::parse(&protected_resource_metadata_url(resource)).ok()?;
+    let mut target = metadata.path().to_owned();
+    if let Some(query) = metadata.query() {
+        target.push('?');
+        target.push_str(query);
+    }
+    Some(target)
+}
+
+fn metadata_request_matches(server: &ResourceServer, uri: &axum::http::Uri) -> bool {
+    server.metadata_path_and_query().as_deref()
+        == uri
+            .path_and_query()
+            .map(axum::http::uri::PathAndQuery::as_str)
+}
+
+async fn protected_resource_metadata(
+    State(server): State<ResourceServer>,
+    uri: axum::http::Uri,
+) -> Response {
+    if server.path_suffix().is_none() && metadata_request_matches(&server, &uri) {
+        Json(server.metadata()).into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
     }
 }
 
 async fn path_aware_metadata(
     State(server): State<ResourceServer>,
-    Path(suffix): Path<String>,
+    uri: axum::http::Uri,
 ) -> Response {
-    match server.path_suffix() {
-        Some(expected) if expected == suffix => Json(server.metadata()).into_response(),
-        _ => StatusCode::NOT_FOUND.into_response(),
+    if server.path_suffix().is_some() && metadata_request_matches(&server, &uri) {
+        Json(server.metadata()).into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
     }
 }
 
@@ -437,6 +552,13 @@ pub(super) fn test_principal() -> PrincipalId {
 #[cfg(test)]
 pub(super) fn test_server() -> ResourceServer {
     ResourceServer::with_jwks(test_config(), test_principal(), test_jwks())
+}
+
+#[cfg(test)]
+pub(super) fn test_server_with_resource(resource: &str) -> ResourceServer {
+    let mut config = test_config();
+    config.resource = resource.to_owned();
+    ResourceServer::with_jwks(config, test_principal(), test_jwks())
 }
 
 #[cfg(test)]
@@ -521,6 +643,8 @@ fn invalid_token_cases() -> Vec<(&'static str, String, OauthError)> {
     expired["exp"] = json!(now.saturating_sub(10));
     let mut immature = valid_claims();
     immature["nbf"] = json!(now.saturating_add(120));
+    let mut malformed_nbf = valid_claims();
+    malformed_nbf["nbf"] = json!("not-a-number");
     let mut foreign = valid_claims();
     foreign["sub"] = json!("agent-2");
     let mut missing_scope = valid_claims();
@@ -530,6 +654,11 @@ fn invalid_token_cases() -> Vec<(&'static str, String, OauthError)> {
         ("aud", encode_rs256(&wrong_aud), OauthError::InvalidAudience),
         ("exp", encode_rs256(&expired), OauthError::Expired),
         ("nbf", encode_rs256(&immature), OauthError::Immature),
+        (
+            "malformed-nbf",
+            encode_rs256(&malformed_nbf),
+            OauthError::InvalidToken,
+        ),
         (
             "principal",
             encode_rs256(&foreign),
@@ -607,6 +736,50 @@ mod tests {
     }
 
     #[test]
+    fn jwks_cache_has_a_bounded_freshness_window() {
+        let now = Instant::now();
+        assert!(!jwks_cache_is_stale(now, now));
+        assert!(!jwks_cache_is_stale(
+            now.checked_sub(JWKS_CACHE_TTL.checked_sub(Duration::from_secs(1)).unwrap())
+                .unwrap(),
+            now
+        ));
+        assert!(jwks_cache_is_stale(
+            now.checked_sub(JWKS_CACHE_TTL).unwrap(),
+            now
+        ));
+    }
+
+    #[tokio::test]
+    async fn jwk_declared_usage_and_algorithm_are_enforced() {
+        let token = encode_rs256(&valid_claims());
+
+        let mut jwks = test_jwks();
+        jwks.keys[0].common.public_key_use = Some(PublicKeyUse::Encryption);
+        let server = ResourceServer::with_jwks(test_config(), test_principal(), jwks);
+        assert_eq!(
+            server.authenticate_token(&token).await,
+            Err(OauthError::KeyUsageDenied)
+        );
+
+        let mut jwks = test_jwks();
+        jwks.keys[0].common.key_operations = Some(vec![KeyOperations::Sign]);
+        let server = ResourceServer::with_jwks(test_config(), test_principal(), jwks);
+        assert_eq!(
+            server.authenticate_token(&token).await,
+            Err(OauthError::KeyUsageDenied)
+        );
+
+        let mut jwks = test_jwks();
+        jwks.keys[0].common.key_algorithm = Some(KeyAlgorithm::RS384);
+        let server = ResourceServer::with_jwks(test_config(), test_principal(), jwks);
+        assert_eq!(
+            server.authenticate_token(&token).await,
+            Err(OauthError::KeyAlgorithmMismatch)
+        );
+    }
+
+    #[test]
     fn metadata_url_and_host_preserve_resource_authority() {
         assert_eq!(
             protected_resource_metadata_url("https://mcp.example.com/mcp"),
@@ -615,6 +788,14 @@ mod tests {
         assert_eq!(
             protected_resource_metadata_url("https://[2001:db8::1]:8443/mcp"),
             "https://[2001:db8::1]:8443/.well-known/oauth-protected-resource/mcp"
+        );
+        assert_eq!(
+            protected_resource_metadata_url("https://mcp.example.com/mcp/?tenant=a"),
+            "https://mcp.example.com/.well-known/oauth-protected-resource/mcp/?tenant=a"
+        );
+        assert_eq!(
+            protected_resource_metadata_url("https://mcp.example.com/mcp%20api"),
+            "https://mcp.example.com/.well-known/oauth-protected-resource/mcp%20api"
         );
         assert_eq!(
             resource_hosts("https://[2001:db8::1]:8443/mcp"),

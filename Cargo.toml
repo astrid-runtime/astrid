@@ -214,7 +214,7 @@ sigstore-verify = { version = "=0.11.0", default-features = false, features = ["
 # Asymmetric JWT/JWKS validation for the MCP HTTP OAuth resource server.
 # Application code rejects `alg=none` and HMAC; this crate only verifies
 # asymmetric signatures from a configured JWKS document.
-jsonwebtoken = { version = "9.3", default-features = false, features = ["use_pem"] }
+jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 subtle = "2"
 surrealkv = "0.21"
 syn = { version = "~3.0.4", features = ["full", "visit"] }

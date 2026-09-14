@@ -391,10 +391,12 @@ fn validate_mcp_http(config: &Config) -> ConfigResult<()> {
             });
         }
     }
-    if oauth.principal_claim.is_empty() {
+    if oauth.principal_claim.is_empty() || matches!(oauth.principal_claim.as_str(), "scope" | "azp")
+    {
         return Err(ConfigError::ValidationError {
             field: "gateway.mcp_http.oauth.principal_claim".to_owned(),
-            message: "principal_claim must not be empty".to_owned(),
+            message: "principal_claim must not be empty or use the reserved scope/azp claims"
+                .to_owned(),
         });
     }
     if oauth.scopes.iter().any(|scope| {
@@ -644,6 +646,23 @@ mod tests {
                 assert_eq!(field, "gateway.mcp_http.oauth.principal_claim");
             },
             other => panic!("expected ValidationError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_mcp_http_oauth_reserved_principal_claim_rejected() {
+        for principal_claim in ["scope", "azp"] {
+            let mut config = Config::default();
+            config.gateway.mcp_http.oauth = Some(crate::gateway::McpHttpOauthSection {
+                resource: "https://mcp.example.com/mcp".to_owned(),
+                issuer: "https://issuer.example.com".to_owned(),
+                jwks_url: "https://issuer.example.com/jwks".to_owned(),
+                scopes: Vec::new(),
+                principal_claim: principal_claim.to_owned(),
+                allowed_azp: Vec::new(),
+            });
+            let err = validate(&config).unwrap_err();
+            assert!(err.to_string().contains("principal_claim"), "{err}");
         }
     }
 
