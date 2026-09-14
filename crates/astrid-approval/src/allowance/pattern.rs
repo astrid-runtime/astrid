@@ -226,8 +226,13 @@ impl AllowancePattern {
                     pattern,
                     permission: Permission::Execute,
                 },
-                SensitiveAction::ExecuteCommand { command, .. },
-            ) => workspace_root.is_some() && matches_file_glob(pattern, command),
+                SensitiveAction::ExecuteCommand { command, args },
+            ) => {
+                let full_cmd = full_command(command, args);
+                workspace_root.is_some()
+                    && !contains_shell_operators(&full_cmd)
+                    && matches_file_glob(pattern, &full_cmd)
+            },
 
             // CommandPattern matches ExecuteCommand by full command string
             // (command + args joined). This allows "git push *" to match
@@ -242,11 +247,7 @@ impl AllowancePattern {
                 Self::CommandPattern { command: pattern },
                 SensitiveAction::ExecuteCommand { command, args },
             ) => {
-                let full_cmd = if args.is_empty() {
-                    command.clone()
-                } else {
-                    format!("{command} {}", args.join(" "))
-                };
+                let full_cmd = full_command(command, args);
 
                 // Reject commands with shell operators - force explicit approval.
                 if contains_shell_operators(&full_cmd) {
@@ -362,6 +363,14 @@ fn contains_shell_operators(cmd: &str) -> bool {
         || cmd.contains('\n')
         || cmd.contains('>')
         || cmd.contains('<')
+}
+
+fn full_command(command: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        command.to_owned()
+    } else {
+        format!("{command} {}", args.join(" "))
+    }
 }
 
 /// Check if a file path matches a glob pattern, with path traversal protection.

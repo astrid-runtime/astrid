@@ -429,6 +429,34 @@ fn test_workspace_relative_execute_requires_workspace_and_matching_command() {
 }
 
 #[test]
+fn test_workspace_relative_execute_rejects_shell_operators() {
+    let pattern = AllowancePattern::WorkspaceRelative {
+        pattern: "cargo *".to_string(),
+        permission: Permission::Execute,
+    };
+    let workspace = Some(Path::new("/project"));
+
+    assert!(!pattern.matches(
+        &SensitiveAction::ExecuteCommand {
+            command: "cargo build & /tmp/payload".to_string(),
+            args: vec![],
+        },
+        workspace
+    ));
+    assert!(!pattern.matches(
+        &SensitiveAction::ExecuteCommand {
+            command: "cargo".to_string(),
+            args: vec![
+                "build".to_string(),
+                "&".to_string(),
+                "/tmp/payload".to_string()
+            ],
+        },
+        workspace
+    ));
+}
+
+#[test]
 fn test_workspace_relative_file_isolation_uses_supplied_root() {
     let pattern = AllowancePattern::WorkspaceRelative {
         pattern: "/project-b/**".to_string(),
