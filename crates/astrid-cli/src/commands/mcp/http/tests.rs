@@ -106,7 +106,7 @@ async fn endpoint() -> Endpoint {
     serve(AuthMode::Token(Arc::new(auth::test_token()))).await
 }
 
-async fn oauth_endpoint() -> Endpoint {
+async fn protected_endpoint() -> Endpoint {
     serve(AuthMode::Oauth(oauth::test_server())).await
 }
 
@@ -328,7 +328,7 @@ async fn token_mode_does_not_serve_protected_resource_metadata() {
 
 #[tokio::test]
 async fn oauth_valid_jwt_reaches_the_handler() {
-    let endpoint = oauth_endpoint().await;
+    let endpoint = protected_endpoint().await;
     let token = oauth::encode_rs256(&oauth::valid_claims());
     let response = request_with_bearer(&endpoint, "tools/list", token)
         .send()
@@ -340,7 +340,7 @@ async fn oauth_valid_jwt_reaches_the_handler() {
 
 #[tokio::test]
 async fn oauth_invalid_tokens_return_protected_resource_challenge() {
-    let endpoint = oauth_endpoint().await;
+    let endpoint = protected_endpoint().await;
     let server = oauth::test_server();
     for (name, token) in oauth::invalid_bearer_samples() {
         let response = request_with_bearer(&endpoint, "tools/list", token)
@@ -374,7 +374,7 @@ async fn oauth_invalid_tokens_return_protected_resource_challenge() {
 
 #[tokio::test]
 async fn oauth_metadata_is_unauthenticated_and_path_aware() {
-    let endpoint = oauth_endpoint().await;
+    let endpoint = protected_endpoint().await;
     let client = reqwest::Client::new();
     let path = "/.well-known/oauth-protected-resource/mcp";
     let response = client
@@ -409,7 +409,7 @@ async fn oauth_metadata_is_unauthenticated_and_path_aware() {
 
 #[tokio::test]
 async fn oauth_origin_is_rejected_before_jwt_validation() {
-    let endpoint = oauth_endpoint().await;
+    let endpoint = protected_endpoint().await;
     let token = oauth::encode_rs256(&oauth::valid_claims());
     let origin = request_with_bearer(&endpoint, "tools/list", token)
         .header("Origin", "https://mcp.example.com")

@@ -279,6 +279,15 @@ fn jwks_refresh_due(last_attempt: Option<Instant>, now: Instant) -> bool {
 }
 
 async fn fetch_jwks(client: &reqwest::Client, url: &str) -> Result<JwkSet> {
+    let url = reqwest::Url::parse(url).context("parse JWKS URL")?;
+    anyhow::ensure!(
+        url.scheme() == "https" && url.host().is_some(),
+        "JWKS URL must use HTTPS and include a host"
+    );
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "JWKS URL must not contain userinfo"
+    );
     let response = client.get(url).send().await.context("fetch JWKS")?;
     anyhow::ensure!(
         response.status().is_success(),
