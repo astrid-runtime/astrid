@@ -29,7 +29,7 @@ mod tests;
 #[derive(Clone)]
 enum AuthMode {
     Token(Arc<auth::BearerToken>),
-    Oauth(oauth::ResourceServer),
+    Oauth(Arc<oauth::ResourceServer>),
 }
 
 enum AuthSource {
@@ -133,9 +133,9 @@ async fn prepare_auth(
 ) -> Result<AuthMode> {
     match select_auth_source(token_file, settings)? {
         AuthSource::Token(path) => Ok(AuthMode::Token(Arc::new(auth::BearerToken::read(&path)?))),
-        AuthSource::Oauth(oauth) => Ok(AuthMode::Oauth(
+        AuthSource::Oauth(oauth) => Ok(AuthMode::Oauth(Arc::new(
             oauth::ResourceServer::connect(oauth, principal).await?,
-        )),
+        ))),
     }
 }
 

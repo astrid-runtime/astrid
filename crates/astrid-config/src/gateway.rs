@@ -94,10 +94,49 @@ pub struct McpHttpOauthSection {
     /// Optional authorized-party allowlist. Empty means `azp` is not checked.
     #[serde(default)]
     pub allowed_azp: Vec<String>,
+    /// Minimum delay between refreshes triggered by an unknown key ID.
+    #[serde(default = "default_jwks_refresh_backoff_secs")]
+    pub jwks_refresh_backoff_secs: u64,
+    /// Maximum age of cached JWKS material before a mandatory refresh.
+    #[serde(default = "default_jwks_cache_ttl_secs")]
+    pub jwks_cache_ttl_secs: u64,
+    /// Whole-request timeout for retrieving JWKS material.
+    #[serde(default = "default_jwks_timeout_secs")]
+    pub jwks_timeout_secs: u64,
+    /// Maximum decoded JWKS response body accepted from the issuer.
+    #[serde(default = "default_jwks_max_response_bytes")]
+    pub jwks_max_response_bytes: u64,
+}
+
+impl McpHttpOauthSection {
+    /// Hard ceiling for an operator-configured JWKS request timeout.
+    pub const MAX_JWKS_TIMEOUT_SECS: u64 = 300;
+    /// Hard ceiling for cached-key age.
+    pub const MAX_JWKS_CACHE_TTL_SECS: u64 = 86_400;
+    /// Hard ceiling for unknown-key refresh backoff.
+    pub const MAX_JWKS_REFRESH_BACKOFF_SECS: u64 = 3_600;
+    /// Hard allocation ceiling for a decoded JWKS response.
+    pub const MAX_JWKS_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 }
 
 fn default_principal_claim() -> String {
     "sub".to_owned()
+}
+
+const fn default_jwks_refresh_backoff_secs() -> u64 {
+    60
+}
+
+const fn default_jwks_cache_ttl_secs() -> u64 {
+    300
+}
+
+const fn default_jwks_timeout_secs() -> u64 {
+    10
+}
+
+const fn default_jwks_max_response_bytes() -> u64 {
+    1024 * 1024
 }
 
 /// True when `value` is an HTTPS URL with a host and without userinfo.
@@ -113,9 +152,18 @@ pub(crate) fn https_url_is_valid(value: &str) -> bool {
         && url.fragment().is_none()
 }
 
+/// True when `value` is a valid issuer URL. RFC 8414 issuers cannot contain a query.
+#[must_use]
+pub(crate) fn issuer_url_is_valid(value: &str) -> bool {
+    https_url_is_valid(value) && url::Url::parse(value).is_ok_and(|url| url.query().is_none())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{McpHttpOauthSection, https_url_is_valid};
+    use super::{
+        McpHttpOauthSection, default_jwks_cache_ttl_secs, default_jwks_max_response_bytes,
+        default_jwks_refresh_backoff_secs, default_jwks_timeout_secs, https_url_is_valid,
+    };
     use crate::Config;
     use crate::validate::validate;
 
@@ -127,6 +175,10 @@ mod tests {
             scopes: Vec::new(),
             principal_claim: "sub".to_owned(),
             allowed_azp: Vec::new(),
+            jwks_refresh_backoff_secs: default_jwks_refresh_backoff_secs(),
+            jwks_cache_ttl_secs: default_jwks_cache_ttl_secs(),
+            jwks_timeout_secs: default_jwks_timeout_secs(),
+            jwks_max_response_bytes: default_jwks_max_response_bytes(),
         }
     }
 
@@ -172,7 +224,46 @@ mod tests {
         assert_eq!(oauth.principal_claim, "sub");
         assert!(oauth.scopes.is_empty());
         assert!(oauth.allowed_azp.is_empty());
+        assert_eq!(oauth.jwks_refresh_backoff_secs, 60);
+        assert_eq!(oauth.jwks_cache_ttl_secs, 300);
+        assert_eq!(oauth.jwks_timeout_secs, 10);
+        assert_eq!(oauth.jwks_max_response_bytes, 1024 * 1024);
         assert!(validate(&decoded).is_ok());
+    }
+
+    #[test]
+    fn mcp_http_oauth_rejects_issuer_query() {
+        let mut config = Config::default();
+        config.gateway.mcp_http.oauth = Some(oauth_section(
+            "https://mcp.example.com/mcp",
+            "https://issuer.example.com/?tenant=other",
+            "https://issuer.example.com/jwks",
+        ));
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("oauth.issuer"), "{error}");
+    }
+
+    #[test]
+    fn mcp_http_oauth_rejects_unbounded_jwks_policy() {
+        let mut config = Config::default();
+        config.gateway.mcp_http.oauth = Some(oauth_section(
+            "https://mcp.example.com/mcp",
+            "https://issuer.example.com",
+            "https://issuer.example.com/jwks",
+        ));
+
+        let oauth = config.gateway.mcp_http.oauth.as_mut().unwrap();
+        oauth.jwks_timeout_secs = 0;
+        assert!(validate(&config).is_err());
+
+        let oauth = config.gateway.mcp_http.oauth.as_mut().unwrap();
+        oauth.jwks_timeout_secs = 10;
+        oauth.jwks_max_response_bytes = McpHttpOauthSection::MAX_JWKS_RESPONSE_BYTES + 1;
+        let error = validate(&config).unwrap_err();
+        assert!(
+            error.to_string().contains("jwks_max_response_bytes"),
+            "{error}"
+        );
     }
 
     #[test]

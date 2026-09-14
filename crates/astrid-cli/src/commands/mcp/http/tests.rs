@@ -107,11 +107,14 @@ async fn endpoint() -> Endpoint {
 }
 
 async fn protected_endpoint() -> Endpoint {
-    serve(AuthMode::Oauth(oauth::test_server())).await
+    serve(AuthMode::Oauth(Arc::new(oauth::test_server()))).await
 }
 
 async fn protected_endpoint_for_resource(resource: &str) -> Endpoint {
-    serve(AuthMode::Oauth(oauth::test_server_with_resource(resource))).await
+    serve(AuthMode::Oauth(Arc::new(oauth::test_server_with_resource(
+        resource,
+    ))))
+    .await
 }
 
 fn authenticate_header(response: &reqwest::Response) -> String {

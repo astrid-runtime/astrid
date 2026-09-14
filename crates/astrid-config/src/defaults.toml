@@ -359,6 +359,8 @@ session_cleanup_interval_secs = 60
 listen = "127.0.0.1:8081"
 # Private file containing a random bearer token (at least 32 bytes).
 # token_file = "/path/to/mcp-http.token"
+# OAuth deployments configure [gateway.mcp_http.oauth]. Its JWKS policy defaults
+# to refresh_backoff=60s, cache_ttl=300s, timeout=10s, and max_response=1 MiB.
 
 # ============================================================================
 # Timeout Configuration

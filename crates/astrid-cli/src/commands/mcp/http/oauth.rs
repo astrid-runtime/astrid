@@ -74,16 +74,6 @@ struct AccessClaims {
     rest: serde_json::Map<String, Value>,
 }
 
-/// Minimum interval between JWKS refresh attempts after an unknown key ID.
-///
-/// Initial JWKS retrieval still happens before bind. This backoff prevents an
-/// unauthenticated client from turning arbitrary `kid` values into an outbound
-/// request flood while allowing key rotation to become visible promptly.
-const JWKS_REFRESH_BACKOFF: Duration = Duration::from_mins(1);
-
-/// Maximum lifetime of cached JWKS material before a mandatory refresh.
-const JWKS_CACHE_TTL: Duration = Duration::from_mins(5);
-
 impl ResourceServer {
     /// Fetch JWKS over HTTPS and fail closed before the listener binds.
     pub(super) async fn connect(
@@ -92,10 +82,10 @@ impl ResourceServer {
     ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .https_only(true)
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(config.jwks_timeout_secs))
             .build()
             .context("build JWKS HTTPS client")?;
-        let jwks = fetch_jwks(&client, &config.jwks_url).await?;
+        let jwks = fetch_jwks(&client, &config.jwks_url, config.jwks_max_response_bytes).await?;
         Ok(Self {
             config,
             principal,
@@ -170,7 +160,7 @@ impl ResourceServer {
     }
 
     /// Unauthenticated RFC 9728 metadata routes. Call [`Router::with_state`].
-    pub(super) fn metadata_router() -> Router<Self> {
+    pub(super) fn metadata_router() -> Router<Arc<Self>> {
         Router::new()
             .route(
                 "/.well-known/oauth-protected-resource",
@@ -279,7 +269,11 @@ impl ResourceServer {
 
     fn cache_is_stale(&self) -> bool {
         self.refreshed_at.read().map_or(true, |refreshed_at| {
-            jwks_cache_is_stale(*refreshed_at, Instant::now())
+            jwks_cache_is_stale(
+                *refreshed_at,
+                Instant::now(),
+                Duration::from_secs(self.config.jwks_cache_ttl_secs),
+            )
         })
     }
 
@@ -292,13 +286,21 @@ impl ResourceServer {
         let client = self.client.as_ref().ok_or(OauthError::UnknownKey)?;
         let mut last_attempt = self.refresh.lock().await;
         let now = Instant::now();
-        if !jwks_refresh_due(*last_attempt, now) {
+        if !jwks_refresh_due(
+            *last_attempt,
+            now,
+            Duration::from_secs(self.config.jwks_refresh_backoff_secs),
+        ) {
             return Ok(());
         }
         *last_attempt = Some(now);
-        let jwks = fetch_jwks(client, &self.config.jwks_url)
-            .await
-            .map_err(|_| OauthError::UnknownKey)?;
+        let jwks = fetch_jwks(
+            client,
+            &self.config.jwks_url,
+            self.config.jwks_max_response_bytes,
+        )
+        .await
+        .map_err(|_| OauthError::UnknownKey)?;
         let Ok(mut guard) = self.jwks.write() else {
             return Err(OauthError::InvalidToken);
         };
@@ -312,16 +314,15 @@ impl ResourceServer {
     }
 }
 
-fn jwks_refresh_due(last_attempt: Option<Instant>, now: Instant) -> bool {
-    last_attempt
-        .is_none_or(|attempt| now.saturating_duration_since(attempt) >= JWKS_REFRESH_BACKOFF)
+fn jwks_refresh_due(last_attempt: Option<Instant>, now: Instant, backoff: Duration) -> bool {
+    last_attempt.is_none_or(|attempt| now.saturating_duration_since(attempt) >= backoff)
 }
 
-fn jwks_cache_is_stale(refreshed_at: Instant, now: Instant) -> bool {
-    now.saturating_duration_since(refreshed_at) >= JWKS_CACHE_TTL
+fn jwks_cache_is_stale(refreshed_at: Instant, now: Instant, cache_ttl: Duration) -> bool {
+    now.saturating_duration_since(refreshed_at) >= cache_ttl
 }
 
-async fn fetch_jwks(client: &reqwest::Client, url: &str) -> Result<JwkSet> {
+async fn fetch_jwks(client: &reqwest::Client, url: &str, max_bytes: u64) -> Result<JwkSet> {
     let url = reqwest::Url::parse(url).context("parse JWKS URL")?;
     anyhow::ensure!(
         url.scheme() == "https" && url.host().is_some(),
@@ -331,15 +332,40 @@ async fn fetch_jwks(client: &reqwest::Client, url: &str) -> Result<JwkSet> {
         url.username().is_empty() && url.password().is_none(),
         "JWKS URL must not contain userinfo"
     );
-    let response = client.get(url).send().await.context("fetch JWKS")?;
+    let mut response = client.get(url).send().await.context("fetch JWKS")?;
     anyhow::ensure!(
         response.status().is_success(),
         "JWKS HTTP {}",
         response.status()
     );
-    let jwks = response.json::<JwkSet>().await.context("parse JWKS")?;
+    if let Some(content_length) = response.content_length() {
+        anyhow::ensure!(
+            content_length <= max_bytes,
+            "JWKS response exceeds {max_bytes} bytes"
+        );
+    }
+    let limit = usize::try_from(max_bytes).context("JWKS response limit exceeds platform size")?;
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .and_then(|size| usize::try_from(size).ok())
+            .unwrap_or(0),
+    );
+    while let Some(chunk) = response.chunk().await.context("read JWKS response")? {
+        append_jwks_chunk(&mut body, &chunk, limit)?;
+    }
+    let jwks = serde_json::from_slice::<JwkSet>(&body).context("parse JWKS")?;
     anyhow::ensure!(!jwks.keys.is_empty(), "JWKS contains no keys");
     Ok(jwks)
+}
+
+fn append_jwks_chunk(body: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> Result<()> {
+    anyhow::ensure!(
+        chunk.len() <= max_bytes.saturating_sub(body.len()),
+        "JWKS response exceeds {max_bytes} bytes"
+    );
+    body.extend_from_slice(chunk);
+    Ok(())
 }
 
 fn validate_jwk_metadata(jwk: &Jwk, algorithm: Algorithm) -> Result<(), OauthError> {
@@ -492,7 +518,7 @@ fn metadata_request_matches(server: &ResourceServer, uri: &axum::http::Uri) -> b
 }
 
 async fn protected_resource_metadata(
-    State(server): State<ResourceServer>,
+    State(server): State<Arc<ResourceServer>>,
     uri: axum::http::Uri,
 ) -> Response {
     if server.path_suffix().is_none() && metadata_request_matches(&server, &uri) {
@@ -503,7 +529,7 @@ async fn protected_resource_metadata(
 }
 
 async fn path_aware_metadata(
-    State(server): State<ResourceServer>,
+    State(server): State<Arc<ResourceServer>>,
     uri: axum::http::Uri,
 ) -> Response {
     if server.path_suffix().is_some() && metadata_request_matches(&server, &uri) {
@@ -522,6 +548,10 @@ pub(super) fn test_config() -> McpHttpOauthSection {
         scopes: vec!["mcp".to_owned()],
         principal_claim: "sub".to_owned(),
         allowed_azp: Vec::new(),
+        jwks_refresh_backoff_secs: 60,
+        jwks_cache_ttl_secs: 300,
+        jwks_timeout_secs: 10,
+        jwks_max_response_bytes: 1024 * 1024,
     }
 }
 
@@ -726,28 +756,44 @@ mod tests {
     #[test]
     fn jwks_refresh_attempts_are_backed_off() {
         let now = Instant::now();
-        assert!(jwks_refresh_due(None, now));
-        assert!(!jwks_refresh_due(Some(now), now));
+        let backoff = Duration::from_mins(1);
+        assert!(jwks_refresh_due(None, now, backoff));
+        assert!(!jwks_refresh_due(Some(now), now, backoff));
         assert!(!jwks_refresh_due(
             now.checked_sub(Duration::from_secs(59)),
-            now
+            now,
+            backoff,
         ));
-        assert!(jwks_refresh_due(now.checked_sub(JWKS_REFRESH_BACKOFF), now));
+        assert!(jwks_refresh_due(now.checked_sub(backoff), now, backoff,));
     }
 
     #[test]
     fn jwks_cache_has_a_bounded_freshness_window() {
         let now = Instant::now();
-        assert!(!jwks_cache_is_stale(now, now));
+        let cache_ttl = Duration::from_mins(5);
+        assert!(!jwks_cache_is_stale(now, now, cache_ttl));
         assert!(!jwks_cache_is_stale(
-            now.checked_sub(JWKS_CACHE_TTL.checked_sub(Duration::from_secs(1)).unwrap())
+            now.checked_sub(cache_ttl.checked_sub(Duration::from_secs(1)).unwrap())
                 .unwrap(),
-            now
+            now,
+            cache_ttl,
         ));
         assert!(jwks_cache_is_stale(
-            now.checked_sub(JWKS_CACHE_TTL).unwrap(),
-            now
+            now.checked_sub(cache_ttl).unwrap(),
+            now,
+            cache_ttl,
         ));
+    }
+
+    #[test]
+    fn jwks_body_limit_rejects_oversized_chunks_without_extending() {
+        let mut body = b"1234".to_vec();
+        append_jwks_chunk(&mut body, b"5678", 8).unwrap();
+        assert_eq!(body, b"12345678");
+
+        let error = append_jwks_chunk(&mut body, b"9", 8).unwrap_err();
+        assert!(error.to_string().contains("exceeds 8 bytes"), "{error}");
+        assert_eq!(body, b"12345678");
     }
 
     #[tokio::test]

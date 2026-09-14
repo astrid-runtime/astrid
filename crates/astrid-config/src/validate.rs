@@ -379,9 +379,14 @@ fn validate_mcp_http(config: &Config) -> ConfigResult<()> {
             message: "token_file and oauth are mutually exclusive".to_owned(),
         });
     }
+    if !crate::gateway::issuer_url_is_valid(&oauth.issuer) {
+        return Err(ConfigError::ValidationError {
+            field: "gateway.mcp_http.oauth.issuer".to_owned(),
+            message: "must be an HTTPS URL with a host and without userinfo or a query".to_owned(),
+        });
+    }
     for (field, value) in [
         ("gateway.mcp_http.oauth.resource", oauth.resource.as_str()),
-        ("gateway.mcp_http.oauth.issuer", oauth.issuer.as_str()),
         ("gateway.mcp_http.oauth.jwks_url", oauth.jwks_url.as_str()),
     ] {
         if !crate::gateway::https_url_is_valid(value) {
@@ -415,6 +420,35 @@ fn validate_mcp_http(config: &Config) -> ConfigResult<()> {
             field: "gateway.mcp_http.oauth.allowed_azp".to_owned(),
             message: "allowed_azp entries must not be empty".to_owned(),
         });
+    }
+    for (field, value, maximum) in [
+        (
+            "gateway.mcp_http.oauth.jwks_refresh_backoff_secs",
+            oauth.jwks_refresh_backoff_secs,
+            crate::gateway::McpHttpOauthSection::MAX_JWKS_REFRESH_BACKOFF_SECS,
+        ),
+        (
+            "gateway.mcp_http.oauth.jwks_cache_ttl_secs",
+            oauth.jwks_cache_ttl_secs,
+            crate::gateway::McpHttpOauthSection::MAX_JWKS_CACHE_TTL_SECS,
+        ),
+        (
+            "gateway.mcp_http.oauth.jwks_timeout_secs",
+            oauth.jwks_timeout_secs,
+            crate::gateway::McpHttpOauthSection::MAX_JWKS_TIMEOUT_SECS,
+        ),
+        (
+            "gateway.mcp_http.oauth.jwks_max_response_bytes",
+            oauth.jwks_max_response_bytes,
+            crate::gateway::McpHttpOauthSection::MAX_JWKS_RESPONSE_BYTES,
+        ),
+    ] {
+        if value == 0 || value > maximum {
+            return Err(ConfigError::ValidationError {
+                field: field.to_owned(),
+                message: format!("must be between 1 and {maximum}"),
+            });
+        }
     }
     Ok(())
 }
@@ -639,6 +673,10 @@ mod tests {
             scopes: Vec::new(),
             principal_claim: String::new(),
             allowed_azp: Vec::new(),
+            jwks_refresh_backoff_secs: 60,
+            jwks_cache_ttl_secs: 300,
+            jwks_timeout_secs: 10,
+            jwks_max_response_bytes: 1024 * 1024,
         });
         let err = validate(&config).unwrap_err();
         match err {
@@ -660,6 +698,10 @@ mod tests {
                 scopes: Vec::new(),
                 principal_claim: principal_claim.to_owned(),
                 allowed_azp: Vec::new(),
+                jwks_refresh_backoff_secs: 60,
+                jwks_cache_ttl_secs: 300,
+                jwks_timeout_secs: 10,
+                jwks_max_response_bytes: 1024 * 1024,
             });
             let err = validate(&config).unwrap_err();
             assert!(err.to_string().contains("principal_claim"), "{err}");
@@ -676,6 +718,10 @@ mod tests {
             scopes: vec!["mcp read".to_owned()],
             principal_claim: "sub".to_owned(),
             allowed_azp: Vec::new(),
+            jwks_refresh_backoff_secs: 60,
+            jwks_cache_ttl_secs: 300,
+            jwks_timeout_secs: 10,
+            jwks_max_response_bytes: 1024 * 1024,
         });
         let err = validate(&config).unwrap_err();
         assert!(err.to_string().contains("oauth.scopes"), "{err}");
