@@ -65,6 +65,7 @@ reqwest = { workspace = true, features = ["json", "stream"] }
 rmcp = { workspace = true, features = ["transport-streamable-http-server"] }
 axum = { workspace = true }
 subtle = { workspace = true }
+jsonwebtoken = { workspace = true }
 rustyline = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }

@@ -58,6 +58,9 @@ pub struct McpHttpSection {
     pub listen: std::net::SocketAddr,
     /// Private bearer credential file; no unauthenticated default is provided.
     pub token_file: Option<std::path::PathBuf>,
+    /// OAuth 2.1 protected-resource validation. Mutually exclusive with [`Self::token_file`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<McpHttpOauthSection>,
 }
 
 impl Default for McpHttpSection {
@@ -65,19 +68,126 @@ impl Default for McpHttpSection {
         Self {
             listen: std::net::SocketAddr::from(([127, 0, 0, 1], 8081)),
             token_file: None,
+            oauth: None,
         }
     }
 }
 
+/// OAuth 2.1 protected-resource settings for `astrid mcp http`.
+///
+/// Missing `resource`, `issuer`, or `jwks_url` fails configuration parse.
+/// URLs must be HTTPS without userinfo. This is not an authorization server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpHttpOauthSection {
+    /// Canonical HTTPS resource identifier advertised in RFC 9728 metadata.
+    pub resource: String,
+    /// HTTPS authorization-server issuer; JWT `iss` must match exactly.
+    pub issuer: String,
+    /// HTTPS JWKS URL used to fetch asymmetric verification keys.
+    pub jwks_url: String,
+    /// Required token scopes. Empty means no scope constraint.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// JWT claim that must equal the process principal. Defaults to `sub`.
+    #[serde(default = "default_principal_claim")]
+    pub principal_claim: String,
+    /// Optional authorized-party allowlist. Empty means `azp` is not checked.
+    #[serde(default)]
+    pub allowed_azp: Vec<String>,
+    /// Minimum delay between refreshes triggered by an unknown key ID.
+    #[serde(default = "default_jwks_refresh_backoff_secs")]
+    pub jwks_refresh_backoff_secs: u64,
+    /// Maximum age of cached JWKS material before a mandatory refresh.
+    #[serde(default = "default_jwks_cache_ttl_secs")]
+    pub jwks_cache_ttl_secs: u64,
+    /// Whole-request timeout for retrieving JWKS material.
+    #[serde(default = "default_jwks_timeout_secs")]
+    pub jwks_timeout_secs: u64,
+    /// Maximum decoded JWKS response body accepted from the issuer.
+    #[serde(default = "default_jwks_max_response_bytes")]
+    pub jwks_max_response_bytes: u64,
+}
+
+impl McpHttpOauthSection {
+    /// Hard ceiling for an operator-configured JWKS request timeout.
+    pub const MAX_JWKS_TIMEOUT_SECS: u64 = 300;
+    /// Hard ceiling for cached-key age.
+    pub const MAX_JWKS_CACHE_TTL_SECS: u64 = 86_400;
+    /// Hard ceiling for unknown-key refresh backoff.
+    pub const MAX_JWKS_REFRESH_BACKOFF_SECS: u64 = 3_600;
+    /// Hard allocation ceiling for a decoded JWKS response.
+    pub const MAX_JWKS_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+}
+
+fn default_principal_claim() -> String {
+    "sub".to_owned()
+}
+
+const fn default_jwks_refresh_backoff_secs() -> u64 {
+    60
+}
+
+const fn default_jwks_cache_ttl_secs() -> u64 {
+    300
+}
+
+const fn default_jwks_timeout_secs() -> u64 {
+    10
+}
+
+const fn default_jwks_max_response_bytes() -> u64 {
+    1024 * 1024
+}
+
+/// True when `value` is an HTTPS URL with a host and without userinfo.
+#[must_use]
+pub(crate) fn https_url_is_valid(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none()
+}
+
+/// True when `value` is a valid issuer URL. RFC 8414 issuers cannot contain a query.
+#[must_use]
+pub(crate) fn issuer_url_is_valid(value: &str) -> bool {
+    https_url_is_valid(value) && url::Url::parse(value).is_ok_and(|url| url.query().is_none())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{
+        McpHttpOauthSection, default_jwks_cache_ttl_secs, default_jwks_max_response_bytes,
+        default_jwks_refresh_backoff_secs, default_jwks_timeout_secs, https_url_is_valid,
+    };
     use crate::Config;
+    use crate::validate::validate;
+
+    fn oauth_section(resource: &str, issuer: &str, jwks_url: &str) -> McpHttpOauthSection {
+        McpHttpOauthSection {
+            resource: resource.to_owned(),
+            issuer: issuer.to_owned(),
+            jwks_url: jwks_url.to_owned(),
+            scopes: Vec::new(),
+            principal_claim: "sub".to_owned(),
+            allowed_azp: Vec::new(),
+            jwks_refresh_backoff_secs: default_jwks_refresh_backoff_secs(),
+            jwks_cache_ttl_secs: default_jwks_cache_ttl_secs(),
+            jwks_timeout_secs: default_jwks_timeout_secs(),
+            jwks_max_response_bytes: default_jwks_max_response_bytes(),
+        }
+    }
 
     #[test]
     fn mcp_http_defaults_are_loopback_and_have_no_implicit_credential() {
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.gateway.mcp_http.listen.to_string(), "127.0.0.1:8081");
         assert!(config.gateway.mcp_http.token_file.is_none());
+        assert!(config.gateway.mcp_http.oauth.is_none());
     }
 
     #[test]
@@ -93,5 +203,112 @@ mod tests {
             decoded.gateway.mcp_http.token_file.unwrap(),
             std::path::PathBuf::from("/private/token")
         );
+        assert!(decoded.gateway.mcp_http.oauth.is_none());
+    }
+
+    #[test]
+    fn mcp_http_oauth_roundtrip_preserves_required_https_fields() {
+        let config: Config = toml::from_str(
+            "[gateway.mcp_http.oauth]\n\
+             resource = 'https://mcp.example.com/mcp'\n\
+             issuer = 'https://issuer.example.com'\n\
+             jwks_url = 'https://issuer.example.com/jwks'\n",
+        )
+        .unwrap();
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded: Config = toml::from_str(&encoded).unwrap();
+        let oauth = decoded.gateway.mcp_http.oauth.as_ref().unwrap();
+        assert_eq!(oauth.resource, "https://mcp.example.com/mcp");
+        assert_eq!(oauth.issuer, "https://issuer.example.com");
+        assert_eq!(oauth.jwks_url, "https://issuer.example.com/jwks");
+        assert_eq!(oauth.principal_claim, "sub");
+        assert!(oauth.scopes.is_empty());
+        assert!(oauth.allowed_azp.is_empty());
+        assert_eq!(oauth.jwks_refresh_backoff_secs, 60);
+        assert_eq!(oauth.jwks_cache_ttl_secs, 300);
+        assert_eq!(oauth.jwks_timeout_secs, 10);
+        assert_eq!(oauth.jwks_max_response_bytes, 1024 * 1024);
+        assert!(validate(&decoded).is_ok());
+    }
+
+    #[test]
+    fn mcp_http_oauth_rejects_issuer_query() {
+        let mut config = Config::default();
+        config.gateway.mcp_http.oauth = Some(oauth_section(
+            "https://mcp.example.com/mcp",
+            "https://issuer.example.com/?tenant=other",
+            "https://issuer.example.com/jwks",
+        ));
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("oauth.issuer"), "{error}");
+    }
+
+    #[test]
+    fn mcp_http_oauth_rejects_unbounded_jwks_policy() {
+        let mut config = Config::default();
+        config.gateway.mcp_http.oauth = Some(oauth_section(
+            "https://mcp.example.com/mcp",
+            "https://issuer.example.com",
+            "https://issuer.example.com/jwks",
+        ));
+
+        let oauth = config.gateway.mcp_http.oauth.as_mut().unwrap();
+        oauth.jwks_timeout_secs = 0;
+        assert!(validate(&config).is_err());
+
+        let oauth = config.gateway.mcp_http.oauth.as_mut().unwrap();
+        oauth.jwks_timeout_secs = 10;
+        oauth.jwks_max_response_bytes = McpHttpOauthSection::MAX_JWKS_RESPONSE_BYTES + 1;
+        let error = validate(&config).unwrap_err();
+        assert!(
+            error.to_string().contains("jwks_max_response_bytes"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn mcp_http_oauth_rejects_http_and_userinfo() {
+        assert!(!https_url_is_valid("http://mcp.example.com/mcp"));
+        assert!(!https_url_is_valid("https://user@mcp.example.com/mcp"));
+        assert!(!https_url_is_valid("https://mcp.example.com/mcp#fragment"));
+        assert!(!https_url_is_valid("https://mcp.example.com:bad/mcp"));
+        assert!(!https_url_is_valid("https://"));
+        assert!(https_url_is_valid("https://mcp.example.com/mcp"));
+        let mut config = Config::default();
+        config.gateway.mcp_http.oauth = Some(oauth_section(
+            "http://mcp.example.com/mcp",
+            "https://issuer.example.com",
+            "https://issuer.example.com/jwks",
+        ));
+        assert!(validate(&config).is_err());
+        config.gateway.mcp_http.oauth = Some(oauth_section(
+            "https://user@mcp.example.com/mcp",
+            "https://issuer.example.com",
+            "https://issuer.example.com/jwks",
+        ));
+        assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn mcp_http_token_file_and_oauth_are_mutually_exclusive() {
+        let mut config = Config::default();
+        config.gateway.mcp_http.token_file = Some(std::path::PathBuf::from("/private/token"));
+        config.gateway.mcp_http.oauth = Some(oauth_section(
+            "https://mcp.example.com/mcp",
+            "https://issuer.example.com",
+            "https://issuer.example.com/jwks",
+        ));
+        let err = validate(&config).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("token_file"), "{message}");
+        assert!(message.contains("oauth"), "{message}");
+    }
+
+    #[test]
+    fn mcp_http_oauth_requires_complete_table() {
+        let parsed = toml::from_str::<Config>(
+            "[gateway.mcp_http.oauth]\nresource = 'https://mcp.example.com/mcp'\n",
+        );
+        assert!(parsed.is_err());
     }
 }

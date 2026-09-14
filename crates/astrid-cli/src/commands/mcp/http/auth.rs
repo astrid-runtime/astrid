@@ -13,6 +13,10 @@ use axum::response::{IntoResponse, Response};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
+use super::{AuthMode, oauth};
+
+/// Private file-backed bearer credential.
+#[derive(Clone)]
 pub(super) struct BearerToken(Zeroizing<Vec<u8>>);
 
 impl BearerToken {
@@ -58,24 +62,27 @@ impl BearerToken {
         Ok(Self(bytes))
     }
 
-    fn accepts(&self, request: &Request) -> bool {
-        let mut headers = request.headers().get_all(header::AUTHORIZATION).iter();
-        let Some(value) = headers.next() else {
-            return false;
-        };
-        if headers.next().is_some() {
-            return false;
-        }
-        let bytes = value.as_bytes();
-        let Some(scheme) = bytes.get(..7) else {
-            return false;
-        };
-        scheme.eq_ignore_ascii_case(b"Bearer ") && bool::from(self.0.as_slice().ct_eq(&bytes[7..]))
+    fn accepts(&self, presented: &[u8]) -> bool {
+        bool::from(self.0.as_slice().ct_eq(presented))
     }
 }
 
+/// Return the single `Authorization: Bearer` value, or `None` if missing/duplicate.
+pub(super) fn bearer_value(request: &Request) -> Option<&[u8]> {
+    let mut headers = request.headers().get_all(header::AUTHORIZATION).iter();
+    let value = headers.next()?;
+    if headers.next().is_some() {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    let scheme = bytes.get(..7)?;
+    scheme
+        .eq_ignore_ascii_case(b"Bearer ")
+        .then_some(&bytes[7..])
+}
+
 pub(super) async fn authorize(
-    State(token): State<Arc<BearerToken>>,
+    State(mode): State<AuthMode>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -84,14 +91,52 @@ pub(super) async fn authorize(
     if request.headers().contains_key(header::ORIGIN) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if !token.accepts(&request) {
-        return (
+    match &mode {
+        AuthMode::Token(token) => authorize_token(token, request, next).await,
+        AuthMode::Oauth(server) => authorize_oauth(server, request, next).await,
+    }
+}
+
+async fn authorize_token(token: &Arc<BearerToken>, request: Request, next: Next) -> Response {
+    match bearer_value(&request) {
+        Some(presented) if token.accepts(presented) => next.run(request).await,
+        _ => (
             StatusCode::UNAUTHORIZED,
             [(header::WWW_AUTHENTICATE, "Bearer")],
         )
-            .into_response();
+            .into_response(),
     }
-    next.run(request).await
+}
+
+async fn authorize_oauth(server: &oauth::ResourceServer, request: Request, next: Next) -> Response {
+    let Some(presented) = bearer_value(&request).and_then(|value| std::str::from_utf8(value).ok())
+    else {
+        return oauth_unauthorized(server);
+    };
+    match server.authenticate_token(presented).await {
+        Ok(()) => next.run(request).await,
+        Err(oauth::OauthError::MissingScope) => (
+            StatusCode::FORBIDDEN,
+            [(
+                header::WWW_AUTHENTICATE,
+                server.insufficient_scope_challenge(),
+            )],
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, server.invalid_token_challenge())],
+        )
+            .into_response(),
+    }
+}
+
+fn oauth_unauthorized(server: &oauth::ResourceServer) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, server.challenge())],
+    )
+        .into_response()
 }
 
 #[cfg(test)]

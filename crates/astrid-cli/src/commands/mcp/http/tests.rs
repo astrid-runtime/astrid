@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rmcp::model::*;
@@ -63,6 +64,7 @@ impl ServerHandler for Probe {
 }
 
 struct Endpoint {
+    origin: String,
     url: String,
     probe: Arc<Probe>,
     task: tokio::task::JoinHandle<()>,
@@ -76,7 +78,7 @@ impl Drop for Endpoint {
     }
 }
 
-async fn endpoint() -> Endpoint {
+async fn serve(mode: AuthMode) -> Endpoint {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let probe = Arc::new(Probe::default());
@@ -84,7 +86,7 @@ async fn endpoint() -> Endpoint {
     let factory_probe = probe.clone();
     let app = router(
         move || Ok(factory_probe.clone()),
-        auth::test_token(),
+        mode,
         address,
         cancel.clone(),
     );
@@ -92,6 +94,7 @@ async fn endpoint() -> Endpoint {
         axum::serve(listener, app).await.unwrap();
     });
     Endpoint {
+        origin: format!("http://{address}"),
         url: format!("http://{address}/mcp"),
         probe,
         task,
@@ -99,7 +102,40 @@ async fn endpoint() -> Endpoint {
     }
 }
 
+async fn endpoint() -> Endpoint {
+    serve(AuthMode::Token(Arc::new(auth::test_token()))).await
+}
+
+async fn protected_endpoint() -> Endpoint {
+    serve(AuthMode::Oauth(Arc::new(oauth::test_server()))).await
+}
+
+async fn protected_endpoint_for_resource(resource: &str) -> Endpoint {
+    serve(AuthMode::Oauth(Arc::new(oauth::test_server_with_resource(
+        resource,
+    ))))
+    .await
+}
+
+fn authenticate_header(response: &reqwest::Response) -> String {
+    response
+        .headers()
+        .get("www-authenticate")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned()
+}
+
 fn request(endpoint: &Endpoint, method: &str) -> reqwest::RequestBuilder {
+    request_with_bearer(endpoint, method, "a".repeat(32))
+}
+
+fn request_with_bearer(
+    endpoint: &Endpoint,
+    method: &str,
+    token: impl AsRef<str>,
+) -> reqwest::RequestBuilder {
     let params = json!({"_meta": {
         "io.modelcontextprotocol/protocolVersion": "2026-07-28",
         "io.modelcontextprotocol/clientInfo": {"name":"test", "version":"1"},
@@ -115,7 +151,7 @@ fn request(endpoint: &Endpoint, method: &str) -> reqwest::RequestBuilder {
     }
     let request = reqwest::Client::new()
         .post(&endpoint.url)
-        .bearer_auth("a".repeat(32))
+        .bearer_auth(token.as_ref())
         .header("Accept", "application/json, text/event-stream")
         .header("MCP-Protocol-Version", "2026-07-28")
         .header("Mcp-Method", method)
@@ -253,4 +289,172 @@ fn credential_requires_a_private_regular_file() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     std::fs::write(&path, "short").unwrap();
     assert!(auth::BearerToken::read(&path).is_err());
+}
+
+#[test]
+fn http_auth_sources_are_exclusive_and_required() {
+    let mut settings = astrid_config::gateway::McpHttpSection::default();
+    assert!(select_auth_source(None, &settings).is_err());
+    settings.token_file = Some(std::path::PathBuf::from("/private/token"));
+    match select_auth_source(None, &settings).unwrap() {
+        AuthSource::Token(path) => assert_eq!(path, std::path::PathBuf::from("/private/token")),
+        AuthSource::Oauth(_) => panic!("expected token source"),
+    }
+    settings.oauth = Some(oauth::test_config());
+    assert!(select_auth_source(None, &settings).is_err());
+    settings.token_file = None;
+    assert!(matches!(
+        select_auth_source(None, &settings),
+        Ok(AuthSource::Oauth(_))
+    ));
+    assert!(select_auth_source(Some(std::path::Path::new("/cli-token")), &settings).is_err());
+}
+
+#[tokio::test]
+async fn token_mode_does_not_serve_protected_resource_metadata() {
+    let endpoint = endpoint().await;
+    let metadata = reqwest::Client::new()
+        .get(format!(
+            "{}/.well-known/oauth-protected-resource",
+            endpoint.origin
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(metadata.status(), 404);
+    let missing = reqwest::Client::new()
+        .post(&endpoint.url)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 401);
+    let challenge = authenticate_header(&missing);
+    assert_eq!(challenge, "Bearer");
+    assert!(!challenge.contains("resource_metadata"));
+}
+
+#[tokio::test]
+async fn oauth_valid_jwt_reaches_the_handler() {
+    let endpoint = protected_endpoint().await;
+    let token = oauth::encode_rs256(&oauth::valid_claims());
+    let response = request_with_bearer(&endpoint, "tools/list", token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(endpoint.probe.0.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn oauth_invalid_tokens_return_protected_resource_challenge() {
+    let endpoint = protected_endpoint().await;
+    let server = oauth::test_server();
+    for (name, token) in oauth::invalid_bearer_samples() {
+        let response = request_with_bearer(&endpoint, "tools/list", token)
+            .send()
+            .await
+            .unwrap();
+        if name == "scope" {
+            assert_eq!(response.status(), 403, "{name}");
+            assert_eq!(
+                authenticate_header(&response),
+                server.insufficient_scope_challenge(),
+                "{name}"
+            );
+        } else {
+            assert_eq!(response.status(), 401, "{name}");
+            assert_eq!(
+                authenticate_header(&response),
+                server.invalid_token_challenge(),
+                "{name}"
+            );
+        }
+    }
+    let missing = reqwest::Client::new()
+        .post(&endpoint.url)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 401);
+    assert_eq!(authenticate_header(&missing), server.challenge());
+}
+
+#[tokio::test]
+async fn oauth_metadata_is_unauthenticated_and_path_aware() {
+    let endpoint = protected_endpoint().await;
+    let client = reqwest::Client::new();
+    let path = "/.well-known/oauth-protected-resource/mcp";
+    let response = client
+        .get(format!("{}{path}", endpoint.origin))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{path}");
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["resource"], "https://mcp.example.com/mcp");
+    assert_eq!(
+        body["authorization_servers"],
+        json!(["https://issuer.example.com"])
+    );
+    assert_eq!(body["scopes_supported"], json!(["mcp"]));
+    assert_eq!(body["resource_name"], "Astrid MCP");
+    assert!(body.get("jwks_uri").is_none());
+    assert!(body.get("resource_signing_alg_values_supported").is_none());
+    for path in [
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/other",
+        "/not-metadata",
+    ] {
+        let response = client
+            .get(format!("{}{path}", endpoint.origin))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn oauth_metadata_preserves_query_trailing_slash_and_encoded_path() {
+    let cases = [
+        (
+            "https://mcp.example.com/mcp/?tenant=a",
+            "/.well-known/oauth-protected-resource/mcp/?tenant=a",
+        ),
+        (
+            "https://mcp.example.com/mcp%20api",
+            "/.well-known/oauth-protected-resource/mcp%20api",
+        ),
+    ];
+    for (resource, target) in cases {
+        let endpoint = protected_endpoint_for_resource(resource).await;
+        let response = reqwest::get(format!("{}{target}", endpoint.origin))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{target}");
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["resource"], resource);
+    }
+
+    let endpoint = protected_endpoint_for_resource("https://mcp.example.com/mcp/?tenant=a").await;
+    let response = reqwest::get(format!(
+        "{}/.well-known/oauth-protected-resource/mcp/",
+        endpoint.origin
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 404);
+}
+
+#[tokio::test]
+async fn oauth_origin_is_rejected_before_jwt_validation() {
+    let endpoint = protected_endpoint().await;
+    let token = oauth::encode_rs256(&oauth::valid_claims());
+    let origin = request_with_bearer(&endpoint, "tools/list", token)
+        .header("Origin", "https://mcp.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(origin.status(), 403);
+    assert_eq!(endpoint.probe.0.load(Ordering::Relaxed), 0);
 }

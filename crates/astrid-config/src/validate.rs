@@ -27,6 +27,7 @@ pub fn validate(config: &Config) -> ConfigResult<()> {
     validate_retry(config)?;
     validate_audit(config)?;
     validate_rate_limits(config)?;
+    validate_mcp_http(config)?;
     Ok(())
 }
 
@@ -367,6 +368,91 @@ fn validate_rate_limits(config: &Config) -> ConfigResult<()> {
     Ok(())
 }
 
+fn validate_mcp_http(config: &Config) -> ConfigResult<()> {
+    let http = &config.gateway.mcp_http;
+    let Some(oauth) = http.oauth.as_ref() else {
+        return Ok(());
+    };
+    if http.token_file.is_some() {
+        return Err(ConfigError::ValidationError {
+            field: "gateway.mcp_http.oauth".to_owned(),
+            message: "token_file and oauth are mutually exclusive".to_owned(),
+        });
+    }
+    if !crate::gateway::issuer_url_is_valid(&oauth.issuer) {
+        return Err(ConfigError::ValidationError {
+            field: "gateway.mcp_http.oauth.issuer".to_owned(),
+            message: "must be an HTTPS URL with a host and without userinfo or a query".to_owned(),
+        });
+    }
+    for (field, value) in [
+        ("gateway.mcp_http.oauth.resource", oauth.resource.as_str()),
+        ("gateway.mcp_http.oauth.jwks_url", oauth.jwks_url.as_str()),
+    ] {
+        if !crate::gateway::https_url_is_valid(value) {
+            return Err(ConfigError::ValidationError {
+                field: field.to_owned(),
+                message: "must be an HTTPS URL with a host and without userinfo".to_owned(),
+            });
+        }
+    }
+    if oauth.principal_claim.is_empty() || matches!(oauth.principal_claim.as_str(), "scope" | "azp")
+    {
+        return Err(ConfigError::ValidationError {
+            field: "gateway.mcp_http.oauth.principal_claim".to_owned(),
+            message: "principal_claim must not be empty or use the reserved scope/azp claims"
+                .to_owned(),
+        });
+    }
+    if oauth.scopes.iter().any(|scope| {
+        scope.is_empty()
+            || !scope.bytes().all(|byte| {
+                byte == b'!' || (b'#'..=b'[').contains(&byte) || (b']'..=b'~').contains(&byte)
+            })
+    }) {
+        return Err(ConfigError::ValidationError {
+            field: "gateway.mcp_http.oauth.scopes".to_owned(),
+            message: "each scope must be one valid OAuth scope token".to_owned(),
+        });
+    }
+    if oauth.allowed_azp.iter().any(String::is_empty) {
+        return Err(ConfigError::ValidationError {
+            field: "gateway.mcp_http.oauth.allowed_azp".to_owned(),
+            message: "allowed_azp entries must not be empty".to_owned(),
+        });
+    }
+    for (field, value, maximum) in [
+        (
+            "gateway.mcp_http.oauth.jwks_refresh_backoff_secs",
+            oauth.jwks_refresh_backoff_secs,
+            crate::gateway::McpHttpOauthSection::MAX_JWKS_REFRESH_BACKOFF_SECS,
+        ),
+        (
+            "gateway.mcp_http.oauth.jwks_cache_ttl_secs",
+            oauth.jwks_cache_ttl_secs,
+            crate::gateway::McpHttpOauthSection::MAX_JWKS_CACHE_TTL_SECS,
+        ),
+        (
+            "gateway.mcp_http.oauth.jwks_timeout_secs",
+            oauth.jwks_timeout_secs,
+            crate::gateway::McpHttpOauthSection::MAX_JWKS_TIMEOUT_SECS,
+        ),
+        (
+            "gateway.mcp_http.oauth.jwks_max_response_bytes",
+            oauth.jwks_max_response_bytes,
+            crate::gateway::McpHttpOauthSection::MAX_JWKS_RESPONSE_BYTES,
+        ),
+    ] {
+        if value == 0 || value > maximum {
+            return Err(ConfigError::ValidationError {
+                field: field.to_owned(),
+                message: format!("must be between 1 and {maximum}"),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,5 +661,75 @@ mod tests {
         config.rate_limits.capsule_reload_per_min =
             crate::types::RateLimitsConfig::MAX_CAPSULE_RELOAD_PER_MIN.saturating_add(1);
         assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_mcp_http_oauth_empty_principal_claim_rejected() {
+        let mut config = Config::default();
+        config.gateway.mcp_http.oauth = Some(crate::gateway::McpHttpOauthSection {
+            resource: "https://mcp.example.com/mcp".to_owned(),
+            issuer: "https://issuer.example.com".to_owned(),
+            jwks_url: "https://issuer.example.com/jwks".to_owned(),
+            scopes: Vec::new(),
+            principal_claim: String::new(),
+            allowed_azp: Vec::new(),
+            jwks_refresh_backoff_secs: 60,
+            jwks_cache_ttl_secs: 300,
+            jwks_timeout_secs: 10,
+            jwks_max_response_bytes: 1024 * 1024,
+        });
+        let err = validate(&config).unwrap_err();
+        match err {
+            ConfigError::ValidationError { field, .. } => {
+                assert_eq!(field, "gateway.mcp_http.oauth.principal_claim");
+            },
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_mcp_http_oauth_reserved_principal_claim_rejected() {
+        for principal_claim in ["scope", "azp"] {
+            let mut config = Config::default();
+            config.gateway.mcp_http.oauth = Some(crate::gateway::McpHttpOauthSection {
+                resource: "https://mcp.example.com/mcp".to_owned(),
+                issuer: "https://issuer.example.com".to_owned(),
+                jwks_url: "https://issuer.example.com/jwks".to_owned(),
+                scopes: Vec::new(),
+                principal_claim: principal_claim.to_owned(),
+                allowed_azp: Vec::new(),
+                jwks_refresh_backoff_secs: 60,
+                jwks_cache_ttl_secs: 300,
+                jwks_timeout_secs: 10,
+                jwks_max_response_bytes: 1024 * 1024,
+            });
+            let err = validate(&config).unwrap_err();
+            assert!(err.to_string().contains("principal_claim"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_mcp_http_oauth_rejects_invalid_scope_and_empty_azp() {
+        let mut config = Config::default();
+        config.gateway.mcp_http.oauth = Some(crate::gateway::McpHttpOauthSection {
+            resource: "https://mcp.example.com/mcp".to_owned(),
+            issuer: "https://issuer.example.com".to_owned(),
+            jwks_url: "https://issuer.example.com/jwks".to_owned(),
+            scopes: vec!["mcp read".to_owned()],
+            principal_claim: "sub".to_owned(),
+            allowed_azp: Vec::new(),
+            jwks_refresh_backoff_secs: 60,
+            jwks_cache_ttl_secs: 300,
+            jwks_timeout_secs: 10,
+            jwks_max_response_bytes: 1024 * 1024,
+        });
+        let err = validate(&config).unwrap_err();
+        assert!(err.to_string().contains("oauth.scopes"), "{err}");
+
+        let oauth = config.gateway.mcp_http.oauth.as_mut().unwrap();
+        oauth.scopes = vec!["mcp:read".to_owned()];
+        oauth.allowed_azp = vec![String::new()];
+        let err = validate(&config).unwrap_err();
+        assert!(err.to_string().contains("allowed_azp"), "{err}");
     }
 }

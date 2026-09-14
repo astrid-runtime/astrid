@@ -73,6 +73,22 @@ const ENV_MAPPINGS: &[EnvMapping] = &[
         var_name: "ASTRID_RATE_LIMITS_CAPSULE_RELOAD_PER_MIN",
         field_path: "rate_limits.capsule_reload_per_min",
     },
+    EnvMapping {
+        var_name: "ASTRID_GATEWAY_MCP_HTTP_OAUTH_RESOURCE",
+        field_path: "gateway.mcp_http.oauth.resource",
+    },
+    EnvMapping {
+        var_name: "ASTRID_GATEWAY_MCP_HTTP_OAUTH_ISSUER",
+        field_path: "gateway.mcp_http.oauth.issuer",
+    },
+    EnvMapping {
+        var_name: "ASTRID_GATEWAY_MCP_HTTP_OAUTH_JWKS_URL",
+        field_path: "gateway.mcp_http.oauth.jwks_url",
+    },
+    EnvMapping {
+        var_name: "ASTRID_GATEWAY_MCP_HTTP_OAUTH_PRINCIPAL_CLAIM",
+        field_path: "gateway.mcp_http.oauth.principal_claim",
+    },
 ];
 
 /// Apply environment variable fallbacks to fields that were **not** set by
@@ -369,6 +385,43 @@ mod tests {
     fn test_coerce_string_default() {
         let v = coerce_to_toml_value("workspace.mode", "safe");
         assert_eq!(v.as_str().unwrap(), "safe");
+    }
+
+    #[test]
+    fn test_mcp_http_oauth_env_fallbacks_apply_on_empty_table() {
+        let mut merged: toml::Value = toml::from_str("").unwrap();
+        let mut sources = FieldSources::new();
+        let env = make_env(&[
+            (
+                "ASTRID_GATEWAY_MCP_HTTP_OAUTH_RESOURCE",
+                "https://mcp.example.com/mcp",
+            ),
+            (
+                "ASTRID_GATEWAY_MCP_HTTP_OAUTH_ISSUER",
+                "https://issuer.example.com",
+            ),
+            (
+                "ASTRID_GATEWAY_MCP_HTTP_OAUTH_JWKS_URL",
+                "https://issuer.example.com/jwks",
+            ),
+            ("ASTRID_GATEWAY_MCP_HTTP_OAUTH_PRINCIPAL_CLAIM", "sub"),
+        ]);
+        let count = apply_env_fallbacks(&mut merged, &mut sources, &env);
+        assert_eq!(count, 4);
+        let oauth = &merged["gateway"]["mcp_http"]["oauth"];
+        assert_eq!(
+            oauth["resource"].as_str().unwrap(),
+            "https://mcp.example.com/mcp"
+        );
+        assert_eq!(
+            oauth["issuer"].as_str().unwrap(),
+            "https://issuer.example.com"
+        );
+        assert_eq!(
+            oauth["jwks_url"].as_str().unwrap(),
+            "https://issuer.example.com/jwks"
+        );
+        assert_eq!(oauth["principal_claim"].as_str().unwrap(), "sub");
     }
 
     #[test]
