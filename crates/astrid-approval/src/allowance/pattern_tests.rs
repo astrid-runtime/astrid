@@ -653,6 +653,20 @@ fn test_command_pattern_rejects_and_chain() {
 }
 
 #[test]
+fn test_command_pattern_rejects_background_chain() {
+    let pattern = AllowancePattern::CommandPattern {
+        command: "git status *".to_string(),
+    };
+    assert!(!pattern.matches(
+        &SensitiveAction::ExecuteCommand {
+            command: "git status & /tmp/payload".to_string(),
+            args: vec![],
+        },
+        None
+    ));
+}
+
+#[test]
 fn test_command_pattern_rejects_subshell() {
     let pattern = AllowancePattern::CommandPattern {
         command: "echo *".to_string(),
