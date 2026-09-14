@@ -2937,6 +2937,14 @@ impl Kernel {
         let capsules = {
             let reg = self.capsules.read().await;
             reg.cloned_values_with_principal()
+                .into_iter()
+                .map(|(principal, capsule)| {
+                    let source_id = reg
+                        .source_id_for(&principal, capsule.id())
+                        .map(|id| id.to_string());
+                    (principal, capsule, source_id)
+                })
+                .collect()
         };
 
         self.publish_capsules_loaded_snapshot(capsules, &PrincipalId::default())
@@ -2956,7 +2964,12 @@ impl Kernel {
             let reg = self.capsules.read().await;
             reg.cloned_values_for(principal)
                 .into_iter()
-                .map(|capsule| (principal.clone(), capsule))
+                .map(|capsule| {
+                    let source_id = reg
+                        .source_id_for(principal, capsule.id())
+                        .map(|id| id.to_string());
+                    (principal.clone(), capsule, source_id)
+                })
                 .collect()
         };
 
@@ -2966,14 +2979,18 @@ impl Kernel {
 
     async fn publish_capsules_loaded_snapshot(
         &self,
-        capsules: Vec<(PrincipalId, Arc<dyn astrid_capsule::capsule::Capsule>)>,
+        capsules: Vec<(
+            PrincipalId,
+            Arc<dyn astrid_capsule::capsule::Capsule>,
+            Option<String>,
+        )>,
         empty_principal: &PrincipalId,
     ) {
         let mut by_principal = std::collections::BTreeMap::<
             String,
-            Vec<(String, String, Option<serde_json::Value>)>,
+            Vec<(String, String, Option<String>, Option<serde_json::Value>)>,
         >::new();
-        for (principal, capsule) in &capsules {
+        for (principal, capsule, source_id) in &capsules {
             let name = capsule.id().to_string();
             let mut meta = capsule.source_dir().and_then(|source_dir| {
                 self.verify_workspace_capsule_tree(source_dir).ok()?;
@@ -3048,7 +3065,7 @@ impl Kernel {
             by_principal
                 .entry(principal.to_string())
                 .or_default()
-                .push((principal.to_string(), name, meta));
+                .push((principal.to_string(), name, source_id.clone(), meta));
         }
         if by_principal.is_empty() {
             by_principal.insert(empty_principal.to_string(), Vec::new());
