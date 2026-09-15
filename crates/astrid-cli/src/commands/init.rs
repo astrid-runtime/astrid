@@ -27,6 +27,7 @@ mod lifetime;
 pub(crate) use lifetime::ProvisioningLease;
 mod environment;
 pub(crate) use environment::write_env_files;
+mod onboarding;
 
 /// Options controlling the init / `distro apply` flow.
 ///
@@ -219,7 +220,7 @@ pub(crate) async fn run_init(
     // shared free-text `[variables]`. Shared values already written above
     // are preserved (the prompt skips set keys).
     if should_write_lock(total, succeeded) {
-        onboard_llm_providers(&home, &target, &selected);
+        onboarding::onboard_llm_providers(&home, &target, &selected).await;
     }
 
     // Persist Distro.lock iff the run earned it (full success or empty
@@ -738,7 +739,7 @@ async fn install_capsules_with_resume(
     let mut locked = Vec::with_capacity(total);
     let mut newly_installed_names = Vec::new();
     let mut failed = Vec::new();
-    for (index, cap) in selected.iter().enumerate() {
+    'capsules: for cap in selected {
         pb.set_message(cap.name.clone());
 
         let expected = CapsuleId::new(cap.name.clone())?;
@@ -755,30 +756,33 @@ async fn install_capsules_with_resume(
         // lock attests what was truly installed. `Some(&cap.name)` is the
         // name hint used to pick the right archive from a multi-asset
         // release.
-        let outcome = match super::capsule::install::install_capsule_batch(
-            &cap.source,
-            &expected,
-            false,
-            &refspec,
-            principal,
-        )
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                if super::capsule::install_daemon::batch_install_budget_exhausted(&e) {
-                    failed.extend(
-                        selected[index..]
-                            .iter()
-                            .map(|deferred| deferred.name.clone()),
-                    );
-                    break;
-                }
-                eprintln!("\n  Failed to install {}: {e}", cap.name);
-                failed.push(cap.name.clone());
-                pb.inc(1);
-                continue;
-            },
+        let outcome = loop {
+            match super::capsule::install::install_capsule_batch(
+                &cap.source,
+                &expected,
+                false,
+                &refspec,
+                principal,
+            )
+            .await
+            {
+                Ok(outcome) => break outcome,
+                Err(e) if super::capsule::install_daemon::batch_install_budget_exhausted(&e) => {
+                    pb.suspend(|| {
+                        eprintln!(
+                            "\n  Capsule install safety budget reached; continuing in 61 seconds..."
+                        );
+                    });
+                    tokio::time::sleep(super::capsule::install_daemon::BATCH_INSTALL_WINDOW).await;
+                    super::capsule::install_daemon::reset_batch_install_budget();
+                },
+                Err(e) => {
+                    eprintln!("\n  Failed to install {}: {e}", cap.name);
+                    failed.push(cap.name.clone());
+                    pb.inc(1);
+                    continue 'capsules;
+                },
+            }
         };
         let expected_ref = pinned_refs.and_then(|refs| refs.get(&cap.name).map(String::as_str));
         let verified = match validate_batch_install(&expected, &cap.version, expected_ref, outcome)
@@ -886,64 +890,6 @@ fn validate_batch_install(
         resolved_ref: outcome.resolved_ref,
         skipped: installed.skipped,
     })
-}
-
-/// Run per-provider env onboarding for selected `group = "llm"` capsules.
-///
-/// Non-llm capsules are configured entirely from the distro's shared
-/// `[variables]` (templated into env files before install). LLM providers,
-/// by contrast, own capsule-specific fields — credentials and a model that
-/// is best chosen from a live list — so each selected llm capsule runs its
-/// own `[env]` schema prompt here, after install (the manifest is on disk).
-///
-/// The prompt skips keys that already hold a non-empty value, so any
-/// `[variables]`-templated shared values survive. Dynamic `model` selects
-/// (declared via `options-from`) resolve their option list live at this
-/// point. A missing manifest or env error for one provider is reported and
-/// skipped — it never aborts the whole install.
-fn onboard_llm_providers(
-    home: &AstridHome,
-    principal: &astrid_core::PrincipalId,
-    selected: &[DistroCapsule],
-) {
-    for cap in selected {
-        if cap.group.as_deref() != Some("llm") {
-            continue;
-        }
-
-        let target_dir =
-            match astrid_capsule_install::resolve_target_dir_for(home, principal, &cap.name, false)
-            {
-                Ok(dir) => dir,
-                Err(e) => {
-                    eprintln!("  Skipping {} onboarding: {e}", cap.name);
-                    continue;
-                },
-            };
-        let manifest_path = target_dir.join("Capsule.toml");
-        let manifest = match astrid_capsule::discovery::load_manifest(&manifest_path) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("  Skipping {} onboarding (no manifest): {e}", cap.name);
-                continue;
-            },
-        };
-
-        if manifest.env.is_empty() {
-            continue;
-        }
-
-        eprintln!();
-        eprintln!("{}", Theme::header(&format!("Configure {}", cap.name)));
-        if let Err(e) = super::capsule::install_prompts::prompt_env_fields(
-            &manifest.env,
-            &cap.name,
-            &home.config_path(),
-            principal,
-        ) {
-            eprintln!("  Configuration for {} failed: {e}", cap.name);
-        }
-    }
 }
 
 /// `--grant-capsules` post-install grant logic, split out to keep this

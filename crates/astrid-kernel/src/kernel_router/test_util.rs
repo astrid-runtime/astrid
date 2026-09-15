@@ -35,6 +35,9 @@ pub(crate) fn all_kernel_request_variants() -> Vec<KernelRequest> {
         KernelRequest::ListCapsules,
         KernelRequest::GetCommands,
         KernelRequest::GetCapsuleMetadata,
+        KernelRequest::GetCapsuleMetadataForPrincipal {
+            target_principal: PrincipalId::default(),
+        },
         KernelRequest::GetAgentReadiness,
         KernelRequest::ApproveCapability {
             request_id: "r".into(),

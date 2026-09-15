@@ -805,6 +805,79 @@ fn owner_controlled_snapshot_accepts_historical_read_only_modes() {
     assert!(error.to_string().contains("group/world writable"));
 }
 
+#[cfg(unix)]
+#[test]
+fn legacy_cow_snapshot_and_retirement_accept_released_workspace_modes() {
+    let (_root, home) = test_home();
+    let merged = home.cow_dir().join("workspace").join("merged");
+    fs::create_dir_all(&merged).expect("released CoW directories");
+    fs::set_permissions(home.cow_dir(), fs::Permissions::from_mode(0o755))
+        .expect("released CoW root mode");
+    fs::set_permissions(
+        merged.parent().expect("workspace directory"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .expect("released workspace mode");
+    fs::set_permissions(&merged, fs::Permissions::from_mode(0o755)).expect("released merged mode");
+    let file = merged.join("file");
+    fs::write(&file, b"discardable workspace bytes").expect("released CoW file");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).expect("released CoW file mode");
+
+    assert!(snapshot_path(&home.cow_dir()).is_err());
+    let snapshot = snapshot_owner_controlled_path(&home.cow_dir())
+        .expect("released CoW modes remain eligible for digest-bound retirement");
+    assert!(snapshot.present);
+    assert_eq!(snapshot.entries, 3);
+    super::retirement::retire_owner_controlled_tree(&home.cow_dir(), &snapshot, &[])
+        .expect("retire released CoW modes against the same access contract");
+    assert!(!home.cow_dir().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_owner_controlled_snapshot_tightens_umask_0002_modes() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (_root, home) = test_home();
+    let state = home.state_db_path();
+    fs::create_dir_all(state.join("nested")).expect("legacy state tree");
+    fs::write(state.join("nested/record"), b"durable-state").expect("legacy state bytes");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o775)).expect("0775 root");
+    fs::set_permissions(state.join("nested"), fs::Permissions::from_mode(0o775))
+        .expect("0775 nested");
+    fs::set_permissions(
+        state.join("nested/record"),
+        fs::Permissions::from_mode(0o664),
+    )
+    .expect("0664 record");
+
+    let error = snapshot_owner_controlled_path(&state).expect_err("writable tree must fail");
+    assert!(error.to_string().contains("group/world writable"));
+
+    tighten_owner_controlled_path(&state).expect("tighten released modes");
+    snapshot_owner_controlled_path(&state).expect("snapshot tightened tree");
+    assert_eq!(
+        fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::metadata(state.join("nested"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::metadata(state.join("nested/record"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+}
+
 #[test]
 fn prefixed_distro_init_digest_still_binds_discard_proof() {
     let uid = PrincipalUid::from_bytes([0x44; 32]);

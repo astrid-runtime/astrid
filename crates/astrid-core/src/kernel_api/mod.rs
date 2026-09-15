@@ -9,12 +9,14 @@
 //! `wasm32-unknown-unknown` without dragging in the kernel).
 
 mod agent;
+mod capsule_metadata;
 mod impls;
 mod install;
 mod projection_names;
 mod readiness;
 mod response_types;
 pub use agent::{AgentDeriveKernelRequest, AgentDeriveRequest};
+pub use capsule_metadata::CapsuleEnvOptionsFromMetadata;
 pub use install::{
     CapsuleInstallAuthority, CapsuleInstallEnv, CapsuleInstallProvenance,
     CapsuleInstallResumeReceipt, EnvEntry, EnvStorageScope, EnvValueKind,
@@ -153,6 +155,14 @@ pub enum KernelRequest {
     /// Request metadata about loaded capsules (manifests, providers, interceptors).
     /// The kernel's equivalent of `/proc` — exposing process table info.
     GetCapsuleMetadata,
+    /// Request metadata for one explicitly selected principal.
+    ///
+    /// Selecting another principal requires global `capsule:list` authority;
+    /// the authenticated caller remains the audited actor.
+    GetCapsuleMetadataForPrincipal {
+        /// Principal whose durable and live capsule registry is inspected.
+        target_principal: PrincipalId,
+    },
     /// Request the daemon to shut down gracefully.
     Shutdown {
         /// Optional reason for shutdown.
@@ -316,6 +326,9 @@ pub struct CapsuleEnvMetadata {
     /// Optional input placeholder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placeholder: Option<String>,
+    /// Dynamic option-discovery metadata for select fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options_from: Option<CapsuleEnvOptionsFromMetadata>,
 }
 
 /// How a capsule-declared command is surfaced to operators.

@@ -44,12 +44,13 @@ use connection_tracker::register_connection_tracker;
 #[cfg(test)]
 use connection_tracker::{ConnectionSignal, connection_signal};
 use device_scope::resolve_device_scope;
-use inventory::{durable_package_details, visible_inventory_manifests};
+use inventory::visible_inventory_manifests;
 use resume_receipt::{get as rg, put as rp};
 use visibility::CapsuleVisibility;
 
 #[cfg(test)]
 mod capability_catalog_tests;
+mod capsule_metadata;
 #[cfg(test)]
 mod connection_tracker_tests;
 #[cfg(test)]
@@ -488,82 +489,10 @@ async fn handle_request(
             KernelResponse::Status(status)
         },
         KernelRequest::GetCapsuleMetadata => {
-            let visibility = CapsuleVisibility::new(&authorization);
-            let manifests = visible_inventory_manifests(kernel, &visibility).await;
-            let registry = kernel.capsules.read().await;
-            let owner_uid = kernel.principal_directory.uid_for(&caller).ok();
-            let mut entries = Vec::new();
-            for manifest in manifests {
-                let source_id =
-                    astrid_capsule::capsule::CapsuleId::new(manifest.package.name.clone())
-                        .ok()
-                        .and_then(|id| registry.source_id_for(&caller, &id));
-                let env = manifest
-                    .env
-                    .iter()
-                    .map(|(name, def)| {
-                        (
-                            name.clone(),
-                            astrid_events::kernel_api::CapsuleEnvMetadata {
-                                env_type: def.env_type.clone(),
-                                request: def.request.clone(),
-                                description: def.description.clone(),
-                                default: def.default.clone(),
-                                enum_values: def.enum_values.clone(),
-                                placeholder: def.placeholder.clone(),
-                            },
-                        )
-                    })
-                    .collect();
-                let (wit_hashes, wasm_hash, update_source) =
-                    durable_package_details(kernel, owner_uid, &manifest.package.name);
-                entries.push(astrid_events::kernel_api::CapsuleMetadataEntry {
-                    name: manifest.package.name.clone(),
-                    capabilities: serde_json::to_value(&manifest.capabilities)
-                        .unwrap_or(serde_json::Value::Null),
-                    version: manifest.package.version.clone(),
-                    description: manifest.package.description.clone(),
-                    interceptor_events: manifest
-                        .subscribes
-                        .iter()
-                        .filter(|(_, def)| def.handler.is_some())
-                        .map(|(topic, _)| topic.clone())
-                        .collect(),
-                    imports: manifest
-                        .imports
-                        .iter()
-                        .map(|(namespace, interfaces)| {
-                            (
-                                namespace.clone(),
-                                interfaces
-                                    .iter()
-                                    .map(|(name, def)| (name.clone(), def.version.to_string()))
-                                    .collect(),
-                            )
-                        })
-                        .collect(),
-                    exports: manifest
-                        .exports
-                        .iter()
-                        .map(|(namespace, interfaces)| {
-                            (
-                                namespace.clone(),
-                                interfaces
-                                    .iter()
-                                    .map(|(name, def)| (name.clone(), def.version.to_string()))
-                                    .collect(),
-                            )
-                        })
-                        .collect(),
-                    env,
-                    wit_hashes,
-                    wasm_hash,
-                    update_source,
-                    source_id,
-                    owner_uid,
-                });
-            }
-            KernelResponse::CapsuleMetadata(entries)
+            capsule_metadata::response(kernel, &authorization, None).await
+        },
+        KernelRequest::GetCapsuleMetadataForPrincipal { target_principal } => {
+            capsule_metadata::response(kernel, &authorization, Some(&target_principal)).await
         },
         KernelRequest::GetAgentReadiness => {
             let visibility = CapsuleVisibility::new(&authorization);
@@ -663,6 +592,11 @@ pub fn resolve_scope(req: &KernelRequest, caller: &PrincipalId) -> AuthorityScop
             target_principal: Some(target),
             ..
         } if target != caller => AuthorityScope::Global,
+        KernelRequest::GetCapsuleMetadataForPrincipal { target_principal }
+            if target_principal != caller =>
+        {
+            AuthorityScope::Global
+        },
         _ => AuthorityScope::Self_,
     }
 }
@@ -674,6 +608,11 @@ fn request_target_principal(req: &KernelRequest, caller: &PrincipalId) -> Option
             target_principal: Some(target),
             ..
         } if target != caller => Some(target.clone()),
+        KernelRequest::GetCapsuleMetadataForPrincipal { target_principal }
+            if target_principal != caller =>
+        {
+            Some(target_principal.clone())
+        },
         _ => None,
     }
 }
@@ -714,6 +653,7 @@ pub fn required_capability(req: &KernelRequest, scope: AuthorityScope) -> &'stat
             KernelRequest::ListCapsules
             | KernelRequest::GetCommands
             | KernelRequest::GetCapsuleMetadata
+            | KernelRequest::GetCapsuleMetadataForPrincipal { .. }
             | KernelRequest::GetAgentReadiness,
             AuthorityScope::Self_,
         ) => "self:capsule:list",
@@ -721,6 +661,7 @@ pub fn required_capability(req: &KernelRequest, scope: AuthorityScope) -> &'stat
             KernelRequest::ListCapsules
             | KernelRequest::GetCommands
             | KernelRequest::GetCapsuleMetadata
+            | KernelRequest::GetCapsuleMetadataForPrincipal { .. }
             | KernelRequest::GetAgentReadiness,
             _,
         ) => "capsule:list",
@@ -760,6 +701,7 @@ pub fn kernel_request_method(req: &KernelRequest) -> &'static str {
         KernelRequest::ListCapsules => "ListCapsules",
         KernelRequest::GetCommands => "GetCommands",
         KernelRequest::GetCapsuleMetadata => "GetCapsuleMetadata",
+        KernelRequest::GetCapsuleMetadataForPrincipal { .. } => "GetCapsuleMetadataForPrincipal",
         KernelRequest::GetAgentReadiness => "GetAgentReadiness",
         KernelRequest::Shutdown { .. } => "Shutdown",
         KernelRequest::GetStatus => "GetStatus",

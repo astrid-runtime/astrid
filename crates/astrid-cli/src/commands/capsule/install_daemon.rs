@@ -26,6 +26,7 @@ use super::install::ManualInstallOptions;
 use super::install_batch::InstalledCapsuleOutcome;
 
 const MAX_BATCH_INSTALL_REQUESTS: usize = 10;
+pub(crate) const BATCH_INSTALL_WINDOW: std::time::Duration = std::time::Duration::from_secs(61);
 static BATCH_INSTALL_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, thiserror::Error)]

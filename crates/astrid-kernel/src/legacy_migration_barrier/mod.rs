@@ -32,10 +32,13 @@ mod host_fs;
 mod ledger;
 mod legacy_audit;
 use legacy_audit::handle_non_default_audit_source;
+mod legacy_permissions;
+use legacy_permissions::tighten_owner_controlled_path;
 mod legacy_tmp;
 #[cfg(test)]
 pub(super) use legacy_tmp::tighten_legacy_dedicated_directories;
 mod proof;
+mod retirement;
 mod secret;
 mod source;
 #[cfg(unix)]
@@ -44,7 +47,6 @@ use env_import::import_env_and_secrets;
 #[cfg(test)]
 pub(crate) use hooks::inject_tmp_retirement_interruption_once;
 pub(crate) use hooks::interrupt_after_tmp_retirement_if_requested;
-use host_fs::retire_tree;
 use host_fs::{
     add_principal_scope_sources, add_source, collect_workspace_targets,
     ensure_legacy_secret_aliases, path_exists, read_bounded_file, require_layout_provenance,
@@ -60,6 +62,9 @@ use ledger::{
 };
 #[cfg(test)]
 use ledger::{MigrationComponent, canonical_json};
+use retirement::retire_owner_controlled_tree;
+#[cfg(test)]
+use retirement::retire_tree;
 
 #[cfg(test)]
 pub(crate) use secret::record_absent_legacy_secret_for_test;
@@ -195,9 +200,15 @@ pub(crate) async fn run(
         )
         .await?;
         legacy_tmp::tighten_legacy_dedicated_directories(home, directory)?;
+        // The released layout inherited the caller's umask for the secrets
+        // root itself. Child sources are normalized individually as they enter
+        // the migration manifest, but the root also survives until retirement
+        // and must satisfy the same strict-private contract.
+        legacy_permissions::tighten_private_path(&home.secrets_dir())?;
     }
 
     let bindings = directory.bindings();
+    tighten_legacy_owner_controlled_sources(home, &bindings)?;
     let snapshots = preflight_sources(home, store, &bindings)?;
 
     if matches!(layout_origin, LayoutOrigin::Fresh) {
@@ -228,6 +239,20 @@ pub(crate) async fn run(
     retire_post_barrier_sources(home, store)
 }
 
+fn tighten_legacy_owner_controlled_sources(
+    home: &AstridHome,
+    bindings: &[(PrincipalId, PrincipalUid)],
+) -> io::Result<()> {
+    tighten_owner_controlled_path(&home.state_db_path())?;
+    tighten_owner_controlled_path(&home.cow_dir())?;
+    for (alias, _) in bindings {
+        let principal = home.principal_home(alias);
+        tighten_owner_controlled_path(&principal.audit_dir())?;
+        tighten_owner_controlled_path(&principal.capsules_dir())?;
+    }
+    Ok(())
+}
+
 /// Retire sources whose deletion is authorized only by the complete global
 /// component ledger. Re-reading the canonical ledger makes crash re-entry use
 /// the same durable authorization as the first boot. `CoW` retirement is tied
@@ -249,7 +274,7 @@ fn retire_post_barrier_sources(home: &AstridHome, store: &RuntimePrincipalStore)
         .iter()
         .find(|component| component.name == "system:cow")
         .ok_or_else(|| io::Error::other("migration ledger has no CoW source identity"))?;
-    retire_tree(&home.cow_dir(), &cow.source, &[])?;
+    retire_owner_controlled_tree(&home.cow_dir(), &cow.source, &[])?;
     store
         .retire_verified_legacy_directory_store(home)
         .map_err(storage_io)
@@ -672,7 +697,15 @@ fn preflight_sources(
         "system:state-db".to_owned(),
         snapshot_owner_controlled_path(&home.state_db_path())?,
     );
-    add_source(&mut sources, "system:cow".to_owned(), home.cow_dir())?;
+    // Released workspace CoW trees were created with ordinary owner-controlled
+    // workspace modes (typically 0755 directories and 0644 files). They are
+    // disposable retirement sources, not secret state. Bind their exact bytes
+    // and ownership without requiring permissions the released runtime never
+    // established.
+    sources.insert(
+        "system:cow".to_owned(),
+        snapshot_owner_controlled_path(&home.cow_dir())?,
+    );
     add_source(
         &mut sources,
         "system:invites".to_owned(),

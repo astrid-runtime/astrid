@@ -67,6 +67,9 @@ fn all_requests() -> Vec<KernelRequest> {
         KernelRequest::ListCapsules,
         KernelRequest::GetCommands,
         KernelRequest::GetCapsuleMetadata,
+        KernelRequest::GetCapsuleMetadataForPrincipal {
+            target_principal: PrincipalId::default(),
+        },
         KernelRequest::ApproveCapability {
             request_id: "r".to_string(),
             signature: "s".to_string(),
@@ -366,6 +369,7 @@ fn admin_vs_agent_cross_tenant_matrix() {
             KernelRequest::Shutdown { .. }
             | KernelRequest::GetStatus
             | KernelRequest::ReloadCapsules
+            | KernelRequest::GetCapsuleMetadataForPrincipal { .. }
             | KernelRequest::InstallCapsule {
                 workspace: false,
                 target_principal: Some(_),
