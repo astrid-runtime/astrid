@@ -511,6 +511,14 @@ async fn handle_request(
                                 default: def.default.clone(),
                                 enum_values: def.enum_values.clone(),
                                 placeholder: def.placeholder.clone(),
+                                options_from: def.options_from.as_ref().map(|source| {
+                                    astrid_events::kernel_api::CapsuleEnvOptionsFromMetadata {
+                                        http: source.http.clone(),
+                                        bearer: source.bearer.clone(),
+                                        select: source.select.clone(),
+                                        after: source.after.clone(),
+                                    }
+                                }),
                             },
                         )
                     })
