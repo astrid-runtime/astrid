@@ -738,7 +738,7 @@ async fn install_capsules_with_resume(
     let mut locked = Vec::with_capacity(total);
     let mut newly_installed_names = Vec::new();
     let mut failed = Vec::new();
-    for (index, cap) in selected.iter().enumerate() {
+    'capsules: for cap in selected {
         pb.set_message(cap.name.clone());
 
         let expected = CapsuleId::new(cap.name.clone())?;
@@ -755,30 +755,33 @@ async fn install_capsules_with_resume(
         // lock attests what was truly installed. `Some(&cap.name)` is the
         // name hint used to pick the right archive from a multi-asset
         // release.
-        let outcome = match super::capsule::install::install_capsule_batch(
-            &cap.source,
-            &expected,
-            false,
-            &refspec,
-            principal,
-        )
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                if super::capsule::install_daemon::batch_install_budget_exhausted(&e) {
-                    failed.extend(
-                        selected[index..]
-                            .iter()
-                            .map(|deferred| deferred.name.clone()),
-                    );
-                    break;
-                }
-                eprintln!("\n  Failed to install {}: {e}", cap.name);
-                failed.push(cap.name.clone());
-                pb.inc(1);
-                continue;
-            },
+        let outcome = loop {
+            match super::capsule::install::install_capsule_batch(
+                &cap.source,
+                &expected,
+                false,
+                &refspec,
+                principal,
+            )
+            .await
+            {
+                Ok(outcome) => break outcome,
+                Err(e) if super::capsule::install_daemon::batch_install_budget_exhausted(&e) => {
+                    pb.suspend(|| {
+                        eprintln!(
+                            "\n  Capsule install safety budget reached; continuing in 61 seconds..."
+                        );
+                    });
+                    tokio::time::sleep(super::capsule::install_daemon::BATCH_INSTALL_WINDOW).await;
+                    super::capsule::install_daemon::reset_batch_install_budget();
+                },
+                Err(e) => {
+                    eprintln!("\n  Failed to install {}: {e}", cap.name);
+                    failed.push(cap.name.clone());
+                    pb.inc(1);
+                    continue 'capsules;
+                },
+            }
         };
         let expected_ref = pinned_refs.and_then(|refs| refs.get(&cap.name).map(String::as_str));
         let verified = match validate_batch_install(&expected, &cap.version, expected_ref, outcome)
