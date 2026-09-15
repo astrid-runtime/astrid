@@ -74,15 +74,31 @@ mod tests {
                 .expect("unbound stream lookup"),
             None
         );
+        assert_eq!(
+            request_context::Host::connection_owner(&mut state, Resource::new_borrow(rep))
+                .expect("unbound stream owner lookup"),
+            None
+        );
 
         let principal = astrid_core::PrincipalId::new("alice").expect("valid principal");
         state.bind_connection_principal(rep, principal, Some("device-alice".to_owned()));
+        let expected_owner = state
+            .connection_principals
+            .get(&rep)
+            .map(|identity| identity.request_owner.to_string())
+            .expect("bound connection owner");
 
         assert_eq!(
             request_context::Host::connection_principal(&mut state, Resource::new_borrow(rep))
                 .expect("bound stream lookup")
                 .as_deref(),
             Some("alice")
+        );
+        assert_eq!(
+            request_context::Host::connection_owner(&mut state, Resource::new_borrow(rep))
+                .expect("bound stream owner lookup")
+                .as_deref(),
+            Some(expected_owner.as_str())
         );
         assert!(
             request_context::Host::connection_principal(
@@ -91,6 +107,14 @@ mod tests {
             )
             .is_err(),
             "an unknown resource handle must fail closed"
+        );
+        assert!(
+            request_context::Host::connection_owner(
+                &mut state,
+                Resource::new_borrow(rep.wrapping_add(1))
+            )
+            .is_err(),
+            "an owner lookup for an unknown resource handle must fail closed"
         );
     }
 }

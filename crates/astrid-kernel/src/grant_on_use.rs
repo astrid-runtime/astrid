@@ -25,10 +25,13 @@
 //!   principal, missing profile, load/validate/save error, timeout, deny,
 //!   unknown decision) is a `warn!(security_event = true)` no-op — never a
 //!   panic, unwrap, or default-allow.
-//! - **Bounded resource use.** Each correlation is a short-lived per-request
-//!   task that self-expires at [`GRANT_RESPONSE_TIMEOUT`]; concurrent in-flight
-//!   requests are capped by a [`tokio::sync::Semaphore`] ([`MAX_INFLIGHT_GRANTS`]),
-//!   fail-closed dropping at cap. There is no unbounded shared correlation table.
+//! - **Bounded resource use.** One permanent ordered observer records requests
+//!   in a shared correlation table and consumes their responses from the same
+//!   event stream, preventing a fast response from racing waiter registration.
+//!   Each entry expires at [`GRANT_RESPONSE_TIMEOUT`]. Concurrent in-flight
+//!   requests and their durable-completion work share a
+//!   [`tokio::sync::Semaphore`] ([`MAX_INFLIGHT_GRANTS`]); new requests are
+//!   dropped fail-closed at capacity.
 
 use std::collections::HashMap;
 use std::sync::Arc;
