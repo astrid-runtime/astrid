@@ -217,6 +217,9 @@ pub fn verify_bearer(state: &GatewayState, raw: &str) -> Result<CallerContext, G
     let expires_at_epoch: u64 = expires_str
         .parse()
         .map_err(|_| GatewayError::Unauthorized)?;
+    if issued_str != issued_at_epoch.to_string() || expires_str != expires_at_epoch.to_string() {
+        return Err(GatewayError::Unauthorized);
+    }
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -459,6 +462,29 @@ mod tests {
         assert_eq!(
             scoped_caller.request_owner,
             request_owner_for_bearer(&scoped)
+        );
+    }
+
+    #[test]
+    fn legacy_bearer_with_non_canonical_numeric_claim_rejected() {
+        let state = test_state();
+        let principal = PrincipalId::new("alice").unwrap();
+        let raw = mint_legacy_bearer(&state.signing.signer, &principal, None);
+        let parts: Vec<&str> = raw.split('.').collect();
+        let issued = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .expect("issued claim decodes");
+        let issued = std::str::from_utf8(&issued).expect("issued claim utf8");
+        let tampered_issued =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("0{issued}"));
+        let tampered = format!(
+            "{}.{tampered_issued}.{}.{}",
+            parts[0], parts[2], parts[3]
+        );
+
+        assert!(
+            verify_bearer(&state, &tampered).is_err(),
+            "legacy numeric claims must use their canonical signed encoding"
         );
     }
 
