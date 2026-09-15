@@ -178,6 +178,9 @@ async fn approve_grants_capsule_end_to_end() {
     seed_profile(&home, "x", &[]);
 
     let rid = "rid-approve-1";
+    let mut completion = kernel
+        .event_bus
+        .subscribe_topic_as(Topic::grant_result(rid).as_str(), "grant_result_test");
     publish_grant_required(&kernel, rid, "x", "cap");
     settle().await;
     publish_response(&kernel, rid, "approve");
@@ -186,6 +189,30 @@ async fn approve_grants_capsule_end_to_end() {
         wait_for_grant(&home, "x", "cap").await,
         "APPROVE must grant `cap` to principal `x`"
     );
+
+    let completion = astrid_runtime::time::timeout(Duration::from_secs(2), completion.recv())
+        .await
+        .expect("grant result timeout")
+        .expect("grant result event");
+    let AstridEvent::Ipc { message, .. } = &*completion else {
+        panic!("grant result must be IPC");
+    };
+    assert_eq!(message.source_id, uuid::Uuid::nil());
+    assert_eq!(message.principal.as_deref(), Some("x"));
+    assert_eq!(message.request_owner, Some(test_request_owner()));
+    assert!(matches!(
+        &message.payload,
+        IpcPayload::GrantResult {
+            request_id,
+            request_owner,
+            principal,
+            capsule_id,
+            granted: true,
+        } if request_id == rid
+            && request_owner == &test_request_owner().to_string()
+            && principal == "x"
+            && capsule_id == "cap"
+    ));
 
     // The cache reflects the grant (it was invalidated on the grant path).
     let pid = PrincipalId::new("x").unwrap();

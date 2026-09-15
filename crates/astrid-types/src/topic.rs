@@ -94,6 +94,13 @@ impl Topic {
         Self(format!("astrid.v1.approval.response.{request_id}"))
     }
 
+    /// Grant completion acknowledgement for `request_id`:
+    /// `astrid.v1.grant.result.<request_id>`.
+    #[must_use]
+    pub fn grant_result(request_id: impl std::fmt::Display) -> Self {
+        Self(format!("astrid.v1.grant.result.{request_id}"))
+    }
+
     // --- audit family ----------------------------------------------------
 
     /// The cross-principal audit feed topic: `astrid.v1.audit.entry`.
@@ -304,6 +311,19 @@ mod tests {
         assert_eq!(
             Topic::approval_response(&rid).as_str(),
             "astrid.v1.approval.response.req-1"
+        );
+    }
+
+    #[test]
+    fn grant_result_string_accepts_string_and_uuid() {
+        let id = Uuid::nil();
+        assert_eq!(
+            Topic::grant_result(id).as_str(),
+            format!("astrid.v1.grant.result.{id}")
+        );
+        assert_eq!(
+            Topic::grant_result("req-1").as_str(),
+            "astrid.v1.grant.result.req-1"
         );
     }
 

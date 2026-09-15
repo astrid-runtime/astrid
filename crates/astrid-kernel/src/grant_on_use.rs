@@ -35,8 +35,8 @@ use std::time::Duration;
 
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::PrincipalProfile;
-use astrid_events::AstridEvent;
-use astrid_events::ipc::{IpcPayload, Topic};
+use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
+use astrid_events::{AstridEvent, EventMetadata};
 use tracing::{info, warn};
 
 use crate::Kernel;
@@ -180,7 +180,15 @@ pub(crate) fn spawn_grant_on_use_handler(kernel: Arc<Kernel>) -> astrid_runtime:
                 // The permit lives for the awaiter's whole lifetime, releasing
                 // the in-flight slot on drop (response, timeout, or panic).
                 let _permit = permit;
-                await_and_grant(&kernel, receiver, &principal, stamped_owner, &capsule_id).await;
+                await_and_grant(
+                    &kernel,
+                    receiver,
+                    &request_id,
+                    &principal,
+                    stamped_owner,
+                    &capsule_id,
+                )
+                .await;
             });
         }
     })
@@ -192,6 +200,7 @@ pub(crate) fn spawn_grant_on_use_handler(kernel: Arc<Kernel>) -> astrid_runtime:
 async fn await_and_grant(
     kernel: &Arc<Kernel>,
     mut receiver: astrid_events::EventReceiver,
+    request_id: &str,
     principal: &str,
     request_owner: astrid_events::ipc::RequestOwnerId,
     capsule_id: &str,
@@ -266,14 +275,28 @@ async fn await_and_grant(
         return;
     }
 
-    grant_capsule(kernel, principal, capsule_id).await;
+    let granted = grant_capsule(kernel, principal, capsule_id).await;
+    let payload = IpcPayload::GrantResult {
+        request_id: request_id.to_owned(),
+        request_owner: request_owner.to_string(),
+        principal: principal.to_owned(),
+        capsule_id: capsule_id.to_owned(),
+        granted,
+    };
+    let message = IpcMessage::new(Topic::grant_result(request_id), payload, uuid::Uuid::nil())
+        .with_principal(principal.to_owned())
+        .with_request_owner(request_owner);
+    let _ = kernel.event_bus.publish(AstridEvent::Ipc {
+        message,
+        metadata: EventMetadata::new("grant-on-use"),
+    });
 }
 
 /// Grant `capsule_id` to `principal`, reusing the #993 admin grant machinery
 /// (load → set-delta → validate → save → cache-invalidate) under the kernel's
 /// `admin_write_lock` so a concurrent `agent modify` cannot race the
 /// load-modify-save on the same profile. Fail-closed on every error.
-async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) {
+async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) -> bool {
     use crate::kernel_router::admin::handlers::{
         apply_set_delta, principal_profile_path, require_principal_exists,
     };
@@ -285,7 +308,7 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
             capsule = %capsule_id,
             "grant-on-use: invalid principal string; no grant (fail-closed)"
         );
-        return;
+        return false;
     };
 
     // Serialize with `agent modify` (#993) so the load-modify-save is atomic.
@@ -302,7 +325,7 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
             error = %msg,
             "grant-on-use: principal has no profile; no grant (fail-closed)"
         );
-        return;
+        return false;
     }
 
     let mut profile = match PrincipalProfile::load_from_path(&path) {
@@ -315,7 +338,7 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
                 error = %e,
                 "grant-on-use: profile load failed; no grant (fail-closed)"
             );
-            return;
+            return false;
         },
     };
 
@@ -333,13 +356,13 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
                 error = %e,
                 "grant-on-use: capsule grant rejected; no grant (fail-closed)"
             );
-            return;
+            return false;
         },
     };
     if !changed {
         // Already granted — idempotent. Invalidate to be safe; no save needed.
         kernel.profile_cache.invalidate(&pid);
-        return;
+        return true;
     }
 
     // Validate before saving: re-run the profile invariants (#993). On reject,
@@ -352,7 +375,7 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
             error = %e,
             "grant-on-use: profile rejected by validation; no grant (fail-closed)"
         );
-        return;
+        return false;
     }
     if let Err(e) = profile.save_to_path(&path) {
         warn!(
@@ -362,7 +385,7 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
             error = %e,
             "grant-on-use: profile save failed; no grant (fail-closed)"
         );
-        return;
+        return false;
     }
     kernel.profile_cache.invalidate(&pid);
 
@@ -372,6 +395,7 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
         capsule = %capsule_id,
         "grant-on-first-use: capsule granted via elicited consent"
     );
+    true
 }
 
 #[cfg(test)]

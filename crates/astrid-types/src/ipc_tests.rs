@@ -254,7 +254,7 @@ fn unknown_variant_serializes_as_type_unknown() {
 #[test]
 #[allow(clippy::too_many_lines, reason = "exhaustive variant table")]
 fn is_known_tag_covers_all_variants() {
-    const EXPECTED_VARIANT_COUNT: usize = 18;
+    const EXPECTED_VARIANT_COUNT: usize = 19;
 
     let representatives: Vec<IpcPayload> = vec![
         IpcPayload::RawJson(serde_json::json!({"key": "val"})),
@@ -285,6 +285,13 @@ fn is_known_tag_covers_all_variants() {
             request_owner: "owner-1".into(),
             principal: "alice".into(),
             capsule_id: "cap".into(),
+        },
+        IpcPayload::GrantResult {
+            request_id: "req-1".into(),
+            request_owner: "owner-1".into(),
+            principal: "alice".into(),
+            capsule_id: "cap".into(),
+            granted: true,
         },
         IpcPayload::OnboardingRequired {
             capsule_id: String::new(),
@@ -397,6 +404,23 @@ fn grant_required_roundtrips_with_tag() {
     let json = serde_json::to_value(&payload).unwrap();
     assert_eq!(json["type"].as_str(), Some("grant_required"));
     assert!(IpcPayload::is_known_tag("grant_required"));
+
+    let parsed: IpcPayload = serde_json::from_value(json).unwrap();
+    assert_eq!(parsed, payload);
+}
+
+#[test]
+fn grant_result_roundtrips_with_tag() {
+    let payload = IpcPayload::GrantResult {
+        request_id: "req-1".into(),
+        request_owner: "owner-1".into(),
+        principal: "alice".into(),
+        capsule_id: "secret-tool".into(),
+        granted: true,
+    };
+    let json = serde_json::to_value(&payload).unwrap();
+    assert_eq!(json["type"].as_str(), Some("grant_result"));
+    assert!(IpcPayload::is_known_tag("grant_result"));
 
     let parsed: IpcPayload = serde_json::from_value(json).unwrap();
     assert_eq!(parsed, payload);

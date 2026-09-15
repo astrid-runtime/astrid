@@ -334,6 +334,21 @@ pub enum IpcPayload {
         /// The capsule id the principal needs granted.
         capsule_id: String,
     },
+    /// Kernel acknowledgement emitted only after a grant-on-use decision has
+    /// finished applying (or definitively failed).
+    GrantResult {
+        /// Correlation id from the originating [`GrantRequired`](Self::GrantRequired).
+        request_id: String,
+        /// Host-minted connection owner that requested the grant.
+        request_owner: String,
+        /// Authenticated principal whose profile was evaluated.
+        principal: String,
+        /// Capsule whose grant was evaluated.
+        capsule_id: String,
+        /// Whether the capsule is durably granted and visible through the
+        /// invalidated profile cache.
+        granted: bool,
+    },
     /// A capsule needs environment variables to be provided by the user.
     OnboardingRequired {
         /// The ID of the capsule requiring onboarding.
@@ -450,6 +465,7 @@ impl IpcPayload {
                 | "approval_required"
                 | "approval_response"
                 | "grant_required"
+                | "grant_result"
                 | "onboarding_required"
                 | "llm_request"
                 | "llm_stream_event"

@@ -39,6 +39,7 @@ const ALLOWED_EGRESS_PREFIXES: &[&str] = &[
     "registry.v1.selection.",
     "session.v1.response.",
     "cli.v1.command.result.",
+    "astrid.v1.grant.result.",
 ];
 
 const SYSTEM_BROADCAST_EXACT: &[&str] = &["registry.v1.active_model_changed"];
