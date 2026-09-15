@@ -79,6 +79,7 @@ pub(crate) fn spawn_grant_on_use_handler(kernel: Arc<Kernel>) -> astrid_runtime:
     // unfiltered receiver is both cheaper and strictly ordered across the
     // request and per-request response topics we correlate here.
     let mut observer = kernel.event_bus.subscribe_as(OBSERVER_SUBSCRIBER);
+    let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_GRANTS));
 
     astrid_runtime::spawn(async move {
         let mut pending = HashMap::<String, PendingGrant>::new();
@@ -98,7 +99,7 @@ pub(crate) fn spawn_grant_on_use_handler(kernel: Arc<Kernel>) -> astrid_runtime:
                     let Some(event) = event else {
                         break;
                     };
-                    process_event(&kernel, &mut pending, &event);
+                    process_event(&kernel, &inflight, &mut pending, &event);
                 }
                 () = astrid_runtime::time::sleep(until_expiry), if !pending.is_empty() => {
                     expire_pending(&mut pending);
@@ -113,10 +114,13 @@ struct PendingGrant {
     request_owner: astrid_events::ipc::RequestOwnerId,
     capsule_id: String,
     deadline: astrid_runtime::time::Instant,
+    /// Keeps the flood-control slot through durable grant completion.
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 fn process_event(
     kernel: &Arc<Kernel>,
+    inflight: &Arc<tokio::sync::Semaphore>,
     pending: &mut HashMap<String, PendingGrant>,
     event: &AstridEvent,
 ) {
@@ -131,6 +135,7 @@ fn process_event(
             principal,
             capsule_id,
         } if message.topic == Topic::approval_request() => record_grant_request(
+            inflight,
             pending,
             message,
             request_id,
@@ -150,6 +155,7 @@ fn process_event(
 }
 
 fn record_grant_request(
+    inflight: &Arc<tokio::sync::Semaphore>,
     pending: &mut HashMap<String, PendingGrant>,
     message: &IpcMessage,
     request_id: &str,
@@ -188,16 +194,26 @@ fn record_grant_request(
         );
         return;
     }
-    if pending.len() >= MAX_INFLIGHT_GRANTS || pending.contains_key(request_id) {
+    if pending.contains_key(request_id) {
         warn!(
             security_event = true,
             %request_id,
             %principal,
             capsule = %capsule_id,
-            "grant-on-use capacity or duplicate request id; dropping"
+            "grant-on-use duplicate request id; dropping"
         );
         return;
     }
+    let Ok(permit) = Arc::clone(inflight).try_acquire_owned() else {
+        warn!(
+            security_event = true,
+            %request_id,
+            %principal,
+            capsule = %capsule_id,
+            "grant-on-use inflight cap reached; dropping"
+        );
+        return;
+    };
     let deadline = astrid_runtime::time::Instant::now()
         .checked_add(GRANT_RESPONSE_TIMEOUT)
         .unwrap_or_else(astrid_runtime::time::Instant::now);
@@ -208,6 +224,7 @@ fn record_grant_request(
             request_owner: stamped_owner,
             capsule_id: capsule_id.to_owned(),
             deadline,
+            _permit: permit,
         },
     );
 }
