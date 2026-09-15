@@ -1161,6 +1161,39 @@ async fn targeted_metadata_never_collapses_another_principals_registry() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn explicit_self_target_metadata_never_expands_to_global_inventory() {
+    let (_dir, kernel) = kernel_with_inventory_capsules().await;
+    let admin = PrincipalId::new("metadata-admin").expect("valid principal");
+    let carol = PrincipalId::new("carol").expect("valid principal");
+    seed_capsule_inventory_profile(&kernel, &admin, &["admin-provider"]).await;
+    seed_profile(
+        &kernel,
+        &admin,
+        &PrincipalProfile {
+            grants: vec!["*".to_string()],
+            capsules: vec!["admin-provider".to_string()],
+            ..Default::default()
+        },
+    );
+    seed_capsule_inventory_profile(&kernel, &carol, &["carol-provider"]).await;
+
+    let response = request_kernel(
+        &kernel,
+        &admin,
+        "admin_explicit_self_metadata",
+        KernelRequest::GetCapsuleMetadataForPrincipal {
+            target_principal: admin.clone(),
+        },
+    )
+    .await;
+    let KernelResponse::CapsuleMetadata(entries) = response else {
+        panic!("expected targeted metadata response, got {response:?}");
+    };
+    let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
+    assert_eq!(names, ["admin-provider"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn device_scope_attenuates_every_capsule_inventory_surface() {
     let (_dir, kernel) = kernel_with_inventory_capsules().await;
     let caller = PrincipalId::new("device-scoped-admin").expect("valid principal");

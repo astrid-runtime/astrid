@@ -33,7 +33,9 @@ impl CapsuleVisibility {
 
     pub(super) fn for_target(authorization: &AuthorizedRequest, target: &PrincipalId) -> Self {
         if target == &authorization.principal {
-            return Self::new(authorization);
+            let mut visibility = Self::new(authorization);
+            visibility.all_principals = false;
+            return visibility;
         }
         debug_assert!(authorization.capability_check().has("capsule:list"));
         Self {
