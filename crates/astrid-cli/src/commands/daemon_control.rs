@@ -161,6 +161,10 @@ pub(crate) fn is_process_alive(pid: u32) -> bool {
     if raw <= 0 {
         return false;
     }
+    #[cfg(target_os = "linux")]
+    if linux_process_is_reaped(pid) {
+        return false;
+    }
     let target = nix::unistd::Pid::from_raw(raw);
     // `kill(pid, 0)` succeeds when we may signal the process, and fails with
     // `EPERM` when the process exists but is owned by another user — both mean
@@ -170,6 +174,24 @@ pub(crate) fn is_process_alive(pid: u32) -> bool {
         nix::sys::signal::kill(target, None),
         Err(e) if e != nix::errno::Errno::EPERM
     )
+}
+
+/// Linux keeps an exited child in the process table as a zombie until its
+/// parent reaps it. `kill(pid, 0)` still succeeds for that entry even though it
+/// has released every lock and can never handle a signal. Container PID 1 is
+/// not necessarily an init/reaper, so treating that state as live makes a clean
+/// daemon shutdown time out and then fail its executable-identity check (a
+/// zombie has no `/proc/<pid>/exe`).
+#[cfg(target_os = "linux")]
+fn linux_process_is_reaped(pid: u32) -> bool {
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    status.lines().any(|line| {
+        line.strip_prefix("State:")
+            .and_then(|value| value.trim_start().as_bytes().first().copied())
+            .is_some_and(|state| matches!(state, b'Z' | b'X'))
+    })
 }
 
 #[cfg(not(unix))]
@@ -413,6 +435,24 @@ pub(crate) async fn wait_for_exit(pid: u32, budget: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exited_unreaped_child_is_not_alive() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !linux_process_is_reaped(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(linux_process_is_reaped(pid), "child never became a zombie");
+        assert!(!is_process_alive(pid), "zombie must count as exited");
+        child.wait().expect("reap child after assertion");
+    }
 
     #[test]
     fn parse_pid_accepts_plain_integer() {
