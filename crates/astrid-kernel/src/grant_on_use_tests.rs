@@ -142,6 +142,24 @@ async fn settle() {
     astrid_runtime::time::sleep(Duration::from_millis(100)).await;
 }
 
+/// A response published immediately after the request must not be lost before
+/// the handler creates correlation state. The ordered observer consumes both
+/// events in publication order without requiring an artificial settle delay.
+#[tokio::test]
+async fn immediate_response_after_request_is_not_lost() {
+    let (_dir, home, kernel) = fixture().await;
+    seed_profile(&home, "x", &[]);
+
+    let rid = "rid-immediate-response";
+    publish_grant_required(&kernel, rid, "x", "cap");
+    publish_response(&kernel, rid, "approve");
+
+    assert!(
+        wait_for_grant(&home, "x", "cap").await,
+        "the ordered correlation loop must retain an immediate response"
+    );
+}
+
 /// Assert the grant does NOT land within a bounded window — for deny / timeout /
 /// uncorrelated cases, where convergence to "no grant" is the post-condition.
 async fn assert_no_grant(home: &AstridHome, principal: &str, capsule: &str) {

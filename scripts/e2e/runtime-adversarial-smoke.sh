@@ -399,6 +399,14 @@ run_adversarial_capsule_smoke() {
     cat "$approval_out" >&2 2>/dev/null || true
     fail "owning native CLI did not finish after denying its approval request"
   fi
+  if [[ "$approval_rc" -eq 0 ]]; then
+    cat "$approval_out" >&2 2>/dev/null || true
+    fail "denied native approval unexpectedly allowed the capsule command"
+  fi
+  grep -Fq '"approved":false' "$approval_out" || {
+    cat "$approval_out" >&2 2>/dev/null || true
+    fail "denied native approval did not report approved=false"
+  }
   terminate_pid "$stream_pid"
 
   note "checking live runtime elicit responder principal isolation"
