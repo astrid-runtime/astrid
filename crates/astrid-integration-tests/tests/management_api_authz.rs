@@ -369,6 +369,7 @@ fn admin_vs_agent_cross_tenant_matrix() {
             KernelRequest::Shutdown { .. }
             | KernelRequest::GetStatus
             | KernelRequest::ReloadCapsules
+            | KernelRequest::GetCapsuleMetadataForPrincipal { .. }
             | KernelRequest::InstallCapsule {
                 workspace: false,
                 target_principal: Some(_),
