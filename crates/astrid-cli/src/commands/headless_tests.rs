@@ -124,6 +124,7 @@ fn approval_message(session_id: &SessionId, principal: &str) -> IpcMessage {
         Topic::approval_request(),
         IpcPayload::ApprovalRequired {
             request_id: "test-request".to_owned(),
+            request_owner: "test-owner".to_owned(),
             action: "run command".to_owned(),
             resource: "/tmp/example".to_owned(),
             reason: "test".to_owned(),

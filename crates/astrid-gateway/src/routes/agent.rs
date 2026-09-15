@@ -52,7 +52,7 @@ use std::time::Duration;
 
 use astrid_core::kernel_api::AgentLoopReadiness;
 use astrid_events::AstridEvent;
-use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
+use astrid_events::ipc::{IpcMessage, IpcPayload, RequestOwnerId, Topic};
 use astrid_types::ipc::IpcPayload as TypesIpcPayload;
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
@@ -280,6 +280,7 @@ pub async fn post_prompt(
     };
     let msg = IpcMessage::new(Topic::user_prompt(), payload, Uuid::nil())
         .with_principal(caller.principal.to_string())
+        .with_request_owner(caller.request_owner)
         // Host-stamp the transport origin: this prompt entered over the gateway
         // HTTP listener (a remote API caller, even with a valid bearer), NOT the
         // local Unix socket. It drives the SAME react/openai-compat egress path
@@ -375,10 +376,11 @@ pub async fn post_prompt(
 /// This is the standalone control-plane companion to `POST /api/agent/prompt`'s
 /// in-band elicit forwarding. Lifecycle hooks and other non-prompt capsule work
 /// can request human input without an agent prompt SSE connection being open, so
-/// clients need one authenticated request stream. Only requests stamped with the
-/// caller's verified principal are forwarded. Grant-on-use requests are
-/// forwarded only when kernel-originated (`source_id == nil`) so a capsule
-/// cannot spoof a grant prompt into a user's stream.
+/// clients need one authenticated request stream. Approval and grant prompts
+/// must match both the caller's verified principal and the opaque owner derived
+/// from that exact bearer session. Grant-on-use requests are also forwarded
+/// only when kernel-originated (`source_id == nil`) so a capsule cannot spoof a
+/// grant prompt into a user's stream.
 #[utoipa::path(
     get,
     path = "/api/agent/requests",
@@ -402,12 +404,23 @@ pub async fn get_requests(
     };
 
     let conn_route_uuid = Uuid::new_v4();
-    let subscribe = |topic: &'static str| {
-        bus.subscribe_topic_routed(conn_route_uuid, topic, "gateway", "gateway::agent_requests")
-    };
-    let mut approval_rx = subscribe("astrid.v1.approval");
-    let mut elicit_rx = subscribe("astrid.v1.elicit");
     let principal = caller.principal.to_string();
+    let request_owner = caller.request_owner;
+    let mut approval_rx = bus.subscribe_topic_routed_for_request_owner(
+        conn_route_uuid,
+        "astrid.v1.approval",
+        "gateway",
+        "gateway::agent_requests",
+        principal.clone(),
+        request_owner,
+    );
+    let mut elicit_rx = bus.subscribe_topic_routed_scoped(
+        conn_route_uuid,
+        "astrid.v1.elicit",
+        "gateway",
+        "gateway::agent_requests",
+        Some(Some(principal.clone())),
+    );
 
     let stream = async_stream::stream! {
         yield Ok::<Event, Infallible>(
@@ -420,13 +433,23 @@ pub async fn get_requests(
             tokio::select! {
                 event = approval_rx.recv(None) => {
                     let Some(event) = event else { break };
-                    if let Some(ev) = forward_control_request(&event, &principal, "approval") {
+                    if let Some(ev) = forward_control_request(
+                        &event,
+                        &principal,
+                        request_owner,
+                        "approval",
+                    ) {
                         yield Ok(ev);
                     }
                 }
                 event = elicit_rx.recv(None) => {
                     let Some(event) = event else { break };
-                    if let Some(ev) = forward_control_request(&event, &principal, "elicit") {
+                    if let Some(ev) = forward_control_request(
+                        &event,
+                        &principal,
+                        request_owner,
+                        "elicit",
+                    ) {
                         yield Ok(ev);
                     }
                 }
@@ -486,10 +509,10 @@ pub async fn post_elicit_response(
 ///
 /// Fire-and-forget: the gateway publishes the decision onto
 /// `astrid.v1.approval.response.{request_id}` and stamps it with the caller's
-/// verified principal. Capsule host waiters accept only same-principal replies,
-/// and grant-on-use captures the target from the kernel-origin request, so a
-/// caller who learns another principal's request id cannot answer, deny, cancel,
-/// or redirect it.
+/// verified principal plus the opaque owner derived from the verified bearer.
+/// Capsule host waiters require both values to match. Grant-on-use captures the
+/// target from the kernel-origin request, so a response cannot select another
+/// principal, request connection, or capsule.
 #[utoipa::path(
     post,
     path = "/api/agent/approval-response",
@@ -518,7 +541,7 @@ pub async fn post_approval_response(
     body.validate()
         .map_err(|m| GatewayError::BadRequest(m.to_string()))?;
 
-    publish_approval_response(&bus, caller.principal.as_str(), body);
+    publish_approval_response(&bus, caller.principal.as_str(), body, caller.request_owner);
 
     Ok(StatusCode::ACCEPTED)
 }
@@ -559,6 +582,7 @@ fn publish_approval_response(
     bus: &astrid_events::EventBus,
     principal: &str,
     body: ApprovalResponseRequest,
+    request_owner: RequestOwnerId,
 ) {
     let request_id = body.request_id;
     let payload = IpcPayload::ApprovalResponse {
@@ -567,7 +591,8 @@ fn publish_approval_response(
         reason: body.reason,
     };
     let msg = IpcMessage::new(Topic::approval_response(&request_id), payload, Uuid::nil())
-        .with_principal(principal);
+        .with_principal(principal)
+        .with_request_owner(request_owner);
     bus.publish(AstridEvent::Ipc {
         metadata: astrid_events::EventMetadata::new("gateway::agent.approval_response"),
         message: msg,
@@ -672,6 +697,7 @@ fn forward_event(
 fn forward_control_request(
     event: &Arc<AstridEvent>,
     principal: &str,
+    request_owner: RequestOwnerId,
     sse_name: &'static str,
 ) -> Option<Event> {
     let AstridEvent::Ipc { message, .. } = &**event else {
@@ -681,17 +707,35 @@ fn forward_control_request(
         return None;
     }
     let value = match &message.payload {
-        IpcPayload::ApprovalRequired { .. } | IpcPayload::ElicitRequest { .. } => {
+        IpcPayload::ApprovalRequired {
+            request_owner: payload_owner,
+            ..
+        } => {
+            if message.source_id != Uuid::nil()
+                || message.principal.as_deref() != Some(principal)
+                || message.request_owner != Some(request_owner)
+                || payload_owner != &request_owner.to_string()
+            {
+                return None;
+            }
+            serde_json::to_value(&message.payload).ok()?
+        },
+        IpcPayload::ElicitRequest { .. } => {
             if message.principal.as_deref() != Some(principal) {
                 return None;
             }
             serde_json::to_value(&message.payload).ok()?
         },
         IpcPayload::GrantRequired {
+            request_owner: payload_owner,
             principal: request_principal,
             ..
         } => {
-            if message.source_id != Uuid::nil() || request_principal != principal {
+            if message.source_id != Uuid::nil()
+                || request_principal != principal
+                || message.request_owner != Some(request_owner)
+                || payload_owner != &request_owner.to_string()
+            {
                 return None;
             }
             serde_json::to_value(&message.payload).ok()?

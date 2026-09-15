@@ -231,6 +231,7 @@ fn publish_inner(
     payload: String,
     principal_str: String,
     device_key_id: Option<&str>,
+    request_owner: Option<astrid_events::ipc::RequestOwnerId>,
     origin: astrid_events::ipc::MessageOrigin,
 ) -> Result<(), ErrorCode> {
     // View retirement is an authority fence, not merely a liveness hint. A
@@ -300,6 +301,9 @@ fn publish_inner(
     if let Some(id) = device_key_id {
         message = message.with_device_key_id(id);
     }
+    if let Some(owner) = request_owner {
+        message = message.with_request_owner(owner);
+    }
 
     state.event_bus.publish(AstridEvent::Ipc {
         metadata: EventMetadata::new("wasm_guest").with_session_id(state.capsule_uuid),
@@ -335,12 +339,17 @@ impl ipc::Host for HostState {
             .caller_context
             .as_ref()
             .and_then(|message| message.device_key_id.clone());
+        let request_owner = self
+            .caller_context
+            .as_ref()
+            .and_then(|message| message.request_owner);
         let result = publish_inner(
             self,
             topic,
             payload,
             principal_str,
             device_key_id.as_deref(),
+            request_owner,
             origin,
         );
         audit_ipc(
@@ -381,6 +390,7 @@ impl ipc::Host for HostState {
         // `None` for an unbound (unauthenticated) connection — the anonymous
         // stamp already fails closed on every capability check.
         let device_key_id = self.ingress_device_key_id.clone();
+        let request_owner = self.ingress_request_owner;
         // The transport origin is host-derived from the SAME in-flight
         // connection (recorded by the framed read that pulled this frame),
         // parallel to `ingress_principal` / `ingress_device_key_id`. A BOUND
@@ -399,6 +409,7 @@ impl ipc::Host for HostState {
             payload,
             effective,
             device_key_id.as_deref(),
+            request_owner,
             origin,
         );
         audit_ipc(

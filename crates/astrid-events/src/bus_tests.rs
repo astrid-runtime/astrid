@@ -721,6 +721,19 @@ fn ipc_evt(topic: &str, principal: Option<&str>) -> AstridEvent {
     }
 }
 
+fn ipc_evt_with_owner(
+    topic: &str,
+    principal: &str,
+    owner: crate::ipc::RequestOwnerId,
+) -> AstridEvent {
+    let mut event = ipc_evt(topic, Some(principal));
+    let AstridEvent::Ipc { message, .. } = &mut event else {
+        unreachable!("ipc_evt always returns IPC")
+    };
+    message.request_owner = Some(owner);
+    event
+}
+
 #[tokio::test]
 async fn routed_demux_no_broadcast_storm() {
     // 5 routed subs, each with a distinct capsule_uuid on the same
@@ -1043,6 +1056,29 @@ async fn cross_principal_audit_isolation_at_bus() {
             panic!("expected IPC event");
         }
     }
+}
+
+#[tokio::test]
+async fn request_owner_scope_rejects_peer_before_queue_admission() {
+    let bus = EventBus::new();
+    let owner = crate::ipc::RequestOwnerId::generate();
+    let peer = crate::ipc::RequestOwnerId::generate();
+    let mut sub = bus.subscribe_topic_routed_for_request_owner(
+        uuid::Uuid::new_v4(),
+        "astrid.v1.approval",
+        "gateway",
+        "test_sub",
+        "alice",
+        owner,
+    );
+
+    bus.publish(ipc_evt_with_owner("astrid.v1.approval", "alice", peer));
+    bus.publish(ipc_evt_with_owner("astrid.v1.approval", "bob", owner));
+    assert_eq!(sub.active_principals(), 0);
+
+    bus.publish(ipc_evt_with_owner("astrid.v1.approval", "alice", owner));
+    assert_eq!(sub.active_principals(), 1);
+    assert_eq!(sub.try_drain(MAX_SUBSCRIPTION_BUDGET_BYTES).len(), 1);
 }
 
 #[tokio::test]

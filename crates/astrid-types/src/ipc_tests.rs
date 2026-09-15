@@ -270,6 +270,7 @@ fn is_known_tag_covers_all_variants() {
         },
         IpcPayload::ApprovalRequired {
             request_id: "req-1".into(),
+            request_owner: "owner-1".into(),
             action: String::new(),
             resource: String::new(),
             reason: String::new(),
@@ -281,6 +282,7 @@ fn is_known_tag_covers_all_variants() {
         },
         IpcPayload::GrantRequired {
             request_id: "req-1".into(),
+            request_owner: "owner-1".into(),
             principal: "alice".into(),
             capsule_id: "cap".into(),
         },
@@ -388,6 +390,7 @@ fn is_known_tag_rejects_unknown_tags() {
 fn grant_required_roundtrips_with_tag() {
     let payload = IpcPayload::GrantRequired {
         request_id: "req-1".into(),
+        request_owner: "owner-1".into(),
         principal: "alice".into(),
         capsule_id: "secret-tool".into(),
     };
@@ -397,6 +400,13 @@ fn grant_required_roundtrips_with_tag() {
 
     let parsed: IpcPayload = serde_json::from_value(json).unwrap();
     assert_eq!(parsed, payload);
+}
+
+#[test]
+fn request_owner_display_parses_back_to_the_same_opaque_id() {
+    let owner = RequestOwnerId::generate();
+    assert_eq!(owner.to_string().parse::<RequestOwnerId>().unwrap(), owner);
+    assert!("not-a-uuid".parse::<RequestOwnerId>().is_err());
 }
 
 #[test]

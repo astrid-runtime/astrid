@@ -523,6 +523,9 @@ async fn publish_as_verified_principal_overrides_claimed_name() {
     state.ipc_subscribe_patterns = vec!["client.v1.*".to_string()];
     // The framed read recorded the connection's verified principal.
     state.ingress_principal = Some(astrid_core::PrincipalId::new("claude").unwrap());
+    let request_owner = astrid_events::ipc::RequestOwnerId::generate();
+    state.ingress_request_owner = Some(request_owner);
+    let mut bus_receiver = state.event_bus.subscribe_topic("client.v1.connect");
 
     let sub = IpcHost::subscribe(&mut state, "client.v1.connect".to_string())
         .expect("subscribe allowed by ACL");
@@ -540,6 +543,15 @@ async fn publish_as_verified_principal_overrides_claimed_name() {
         drained_principals(&mut state, &sub),
         vec!["claude".to_string()],
         "the verified principal must override the claimed name (no escalation)"
+    );
+    let event = bus_receiver.try_recv().expect("one published message");
+    let AstridEvent::Ipc { message, .. } = &*event else {
+        panic!("expected an Ipc event");
+    };
+    assert_eq!(
+        message.request_owner,
+        Some(request_owner),
+        "publish-as must carry the authenticated connection owner"
     );
 }
 
@@ -699,6 +711,28 @@ async fn publish_inherits_device_key_id_from_caller_context() {
 
     let (_principal, device_key_id) = first_device_key_id(&mut receiver);
     assert_eq!(device_key_id.as_deref(), Some("dev-abc123"));
+}
+
+#[tokio::test]
+async fn publish_inherits_authenticated_request_owner_from_caller_context() {
+    let rt = tokio::runtime::Handle::current();
+    let mut state = minimal_host_state(rt);
+    state.ipc_publish_patterns = vec!["capsule.v1.*".to_string()];
+    let owner = astrid_events::ipc::RequestOwnerId::generate();
+    state.caller_context = Some(
+        caller_with_origin(astrid_events::ipc::MessageOrigin::LocalSocket)
+            .with_request_owner(owner),
+    );
+
+    let mut receiver = state.event_bus.subscribe_topic("capsule.v1.ping");
+    IpcHost::publish(&mut state, "capsule.v1.ping".to_string(), "{}".to_string())
+        .expect("publish should succeed");
+
+    let event = receiver.try_recv().expect("one published message");
+    let AstridEvent::Ipc { message, .. } = &*event else {
+        panic!("expected an Ipc event");
+    };
+    assert_eq!(message.request_owner, Some(owner));
 }
 
 /// Pull the `origin` off the first published message.

@@ -271,11 +271,13 @@ impl EventDispatcher {
             let caller_device_key_id: Option<&str> = ipc_message
                 .as_deref()
                 .and_then(|m| m.device_key_id.as_deref());
+            let caller_request_owner = ipc_message.as_deref().and_then(|m| m.request_owner);
             let matches = find_matching_interceptors(
                 &self.registry,
                 &topic,
                 caller_principal,
                 caller_device_key_id,
+                caller_request_owner,
                 self.access_resolver.as_ref(),
                 &self.event_bus,
             )
@@ -782,6 +784,7 @@ async fn find_matching_interceptors(
     topic: &str,
     caller_principal: Option<&str>,
     caller_device_key_id: Option<&str>,
+    caller_request_owner: Option<astrid_events::ipc::RequestOwnerId>,
     access_resolver: Option<&CapsuleAccessResolver>,
     event_bus: &EventBus,
 ) -> Vec<(RuntimeId, Arc<dyn crate::capsule::Capsule>, String, u32)> {
@@ -870,7 +873,12 @@ async fn find_matching_interceptors(
                 let capsule_key = capsule.id().to_string();
                 if !grant_signalled.contains(&capsule_key) {
                     grant_signalled.push(capsule_key.clone());
-                    crate::access::emit_grant_required(event_bus, principal, capsule_key);
+                    crate::access::emit_grant_required(
+                        event_bus,
+                        principal,
+                        capsule_key,
+                        caller_request_owner,
+                    );
                 }
             }
             continue;

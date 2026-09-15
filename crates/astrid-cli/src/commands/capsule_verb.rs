@@ -1,6 +1,7 @@
 //! `astrid capsule <verb> [args...]` — dispatch a capsule-contributed CLI
 //! verb (`[[command]]` with `kind = "cli"`) to its providing capsule over
-//! IPC as a non-interactive one-shot.
+//! IPC as a bounded one-shot. Interactive callers may answer an approval on
+//! the owning connection; redirected callers deny approval requests.
 //!
 //! Flow:
 //! 1. **Daemon** — these verbs require the daemon; auto-start it if the
@@ -17,6 +18,7 @@
 //! The kernel does not interpret the run/result payloads — that contract
 //! is capsule-space (see [`astrid_core::kernel_api::CommandKind`]).
 
+use std::io::{IsTerminal, Write as _};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -249,6 +251,7 @@ async fn execute(provider: &str, verb: &str, args: &[String]) -> Result<ExitCode
         result_topic.as_str(),
         provider,
         caller.as_str(),
+        source_id,
         RESULT_TIMEOUT,
     )
     .await
@@ -285,6 +288,7 @@ async fn wait_for_command_result(
     result_topic: &str,
     provider: &str,
     principal: &str,
+    source_id: Uuid,
     timeout: Duration,
 ) -> Result<CommandWait> {
     let deadline = tokio::time::Instant::now()
@@ -310,12 +314,151 @@ async fn wait_for_command_result(
         if topic == Some(result_topic) {
             return Ok(CommandWait::Result(raw));
         }
+        if let Some((request_id, action, resource, reason)) = approval_request_fields(&raw) {
+            if let Some(outcome) = answer_capsule_approval(
+                client,
+                source_id,
+                ApprovalPrompt {
+                    request_id,
+                    action,
+                    resource,
+                    reason,
+                },
+                CommandWaitContext {
+                    result_topic,
+                    provider,
+                    principal,
+                    deadline,
+                },
+            )
+            .await?
+            {
+                return Ok(outcome);
+            }
+            continue;
+        }
         if topic == Some(CAPSULES_LOADED_TOPIC)
             && capsules_loaded_missing_provider(&raw, provider, principal)
         {
             return Ok(CommandWait::ProviderUnloaded);
         }
     }
+}
+
+fn approval_request_fields(raw: &serde_json::Value) -> Option<(&str, &str, &str, &str)> {
+    let payload = raw.get("payload")?;
+    if payload.get("type")?.as_str()? != "approval_required" {
+        return None;
+    }
+    Some((
+        payload.get("request_id")?.as_str()?,
+        payload.get("action")?.as_str()?,
+        payload.get("resource")?.as_str()?,
+        payload.get("reason")?.as_str()?,
+    ))
+}
+
+struct ApprovalPrompt<'a> {
+    request_id: &'a str,
+    action: &'a str,
+    resource: &'a str,
+    reason: &'a str,
+}
+
+struct CommandWaitContext<'a> {
+    result_topic: &'a str,
+    provider: &'a str,
+    principal: &'a str,
+    deadline: tokio::time::Instant,
+}
+
+async fn answer_capsule_approval(
+    client: &mut SocketClient,
+    source_id: Uuid,
+    prompt: ApprovalPrompt<'_>,
+    wait: CommandWaitContext<'_>,
+) -> Result<Option<CommandWait>> {
+    let (decision, response_reason) = if std::io::stdin().is_terminal() {
+        eprintln!(
+            "Approval required: {} on {} ({})",
+            prompt.action, prompt.resource, prompt.reason
+        );
+        eprint!("Approve this operation once? [y/N] ");
+        std::io::stderr().flush()?;
+
+        let (answer_tx, mut answer_rx) = tokio::sync::oneshot::channel();
+        let _input_thread = std::thread::spawn(move || {
+            let mut answer = String::new();
+            let answer = std::io::stdin().read_line(&mut answer).map(|_| answer);
+            let _ = answer_tx.send(answer);
+        });
+        let answer = loop {
+            let remaining = wait
+                .deadline
+                .saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("timed out waiting for capsule approval input");
+            }
+            tokio::select! {
+                answer = &mut answer_rx => {
+                    break answer
+                        .map_err(|_| anyhow::anyhow!("approval input channel closed"))??;
+                }
+                read = client.read_raw_frame() => {
+                    let Some(frame) = read? else {
+                        anyhow::bail!("daemon connection closed while awaiting approval input");
+                    };
+                    let Ok(raw) = serde_json::from_slice::<serde_json::Value>(&frame) else {
+                        continue;
+                    };
+                    let topic = raw.get("topic").and_then(serde_json::Value::as_str);
+                    if topic == Some(wait.result_topic) {
+                        return Ok(Some(CommandWait::Result(raw)));
+                    }
+                    if topic == Some(CAPSULES_LOADED_TOPIC)
+                        && capsules_loaded_missing_provider(&raw, wait.provider, wait.principal)
+                    {
+                        return Ok(Some(CommandWait::ProviderUnloaded));
+                    }
+                }
+                () = tokio::time::sleep(remaining) => {
+                    anyhow::bail!("timed out waiting for capsule approval input");
+                }
+            }
+        };
+        if is_affirmative(&answer) {
+            (
+                "approve",
+                Some("approved by capsule command operator".to_owned()),
+            )
+        } else {
+            (
+                "deny",
+                Some("denied by capsule command operator".to_owned()),
+            )
+        }
+    } else {
+        (
+            "deny",
+            Some("capsule command has no interactive approval terminal".to_owned()),
+        )
+    };
+    client
+        .send_message(astrid_types::ipc::IpcMessage::new(
+            astrid_types::Topic::approval_response(prompt.request_id),
+            astrid_types::ipc::IpcPayload::ApprovalResponse {
+                request_id: prompt.request_id.to_owned(),
+                decision: decision.to_owned(),
+                reason: response_reason,
+            },
+            source_id,
+        ))
+        .await?;
+    Ok(None)
+}
+
+fn is_affirmative(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 fn capsules_loaded_missing_provider(
@@ -636,5 +779,36 @@ mod tests {
             "astrid-capsule-adversarial",
             "alice"
         ));
+    }
+
+    #[test]
+    fn approval_request_fields_accept_only_complete_approval_prompts() {
+        let raw = serde_json::json!({
+            "payload": {
+                "type": "approval_required",
+                "request_id": "request-1",
+                "action": "run",
+                "resource": "command",
+                "reason": "operator consent"
+            }
+        });
+        assert_eq!(
+            approval_request_fields(&raw),
+            Some(("request-1", "run", "command", "operator consent"))
+        );
+
+        let incomplete = serde_json::json!({
+            "payload": { "type": "approval_required", "request_id": "request-1" }
+        });
+        assert!(approval_request_fields(&incomplete).is_none());
+    }
+
+    #[test]
+    fn capsule_approval_accepts_only_explicit_yes() {
+        assert!(is_affirmative("y"));
+        assert!(is_affirmative(" YES \n"));
+        assert!(!is_affirmative(""));
+        assert!(!is_affirmative("approve"));
+        assert!(!is_affirmative("no"));
     }
 }

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use astrid_core::dirs::AstridHome;
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::PrincipalProfile;
-use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
+use astrid_events::ipc::{IpcMessage, IpcPayload, RequestOwnerId, Topic};
 use astrid_events::{AstridEvent, EventMetadata};
 
 use super::is_approved;
@@ -55,14 +55,22 @@ fn on_disk_capsules(home: &AstridHome, principal: &str) -> Vec<String> {
         .capsules
 }
 
+fn test_request_owner() -> RequestOwnerId {
+    static OWNER: std::sync::OnceLock<RequestOwnerId> = std::sync::OnceLock::new();
+    *OWNER.get_or_init(RequestOwnerId::generate)
+}
+
 /// Publish a `GrantRequired` exactly as the dispatcher would.
 fn publish_grant_required(kernel: &Kernel, request_id: &str, principal: &str, capsule_id: &str) {
+    let request_owner = test_request_owner();
     let payload = IpcPayload::GrantRequired {
         request_id: request_id.to_string(),
+        request_owner: request_owner.to_string(),
         principal: principal.to_string(),
         capsule_id: capsule_id.to_string(),
     };
-    let message = IpcMessage::new(Topic::approval_request(), payload, uuid::Uuid::nil());
+    let message = IpcMessage::new(Topic::approval_request(), payload, uuid::Uuid::nil())
+        .with_request_owner(request_owner);
     kernel.event_bus.publish(AstridEvent::Ipc {
         message,
         metadata: EventMetadata::new("test-dispatcher"),
@@ -71,19 +79,36 @@ fn publish_grant_required(kernel: &Kernel, request_id: &str, principal: &str, ca
 
 /// Publish a consent response on the per-request response topic as a specific
 /// principal (the ACL-authorized path the broker/uplink uses).
-fn publish_response_as(kernel: &Kernel, request_id: &str, principal: &str, decision: &str) {
+fn publish_response_as_owner(
+    kernel: &Kernel,
+    request_id: &str,
+    principal: &str,
+    request_owner: RequestOwnerId,
+    decision: &str,
+) {
     let topic = Topic::approval_response(request_id);
     let payload = IpcPayload::ApprovalResponse {
         request_id: request_id.to_string(),
         decision: decision.to_string(),
         reason: None,
     };
-    let message =
-        IpcMessage::new(topic, payload, uuid::Uuid::nil()).with_principal(principal.to_string());
+    let message = IpcMessage::new(topic, payload, uuid::Uuid::nil())
+        .with_principal(principal.to_string())
+        .with_request_owner(request_owner);
     kernel.event_bus.publish(AstridEvent::Ipc {
         message,
         metadata: EventMetadata::new("test-broker"),
     });
+}
+
+fn publish_response_as(kernel: &Kernel, request_id: &str, principal: &str, decision: &str) {
+    publish_response_as_owner(
+        kernel,
+        request_id,
+        principal,
+        test_request_owner(),
+        decision,
+    );
 }
 
 /// Publish a consent response for the common principal used by most tests.
@@ -287,6 +312,21 @@ async fn cross_principal_response_does_not_grant() {
     assert_no_grant(&home, "x", "cap").await;
 }
 
+/// SECURITY: two sessions authenticated as the same principal remain distinct.
+/// A response from the wrong connection owner cannot grant the request.
+#[tokio::test]
+async fn same_principal_wrong_request_owner_does_not_grant() {
+    let (_dir, home, kernel) = fixture().await;
+    seed_profile(&home, "x", &[]);
+
+    let rid = "rid-cross-owner";
+    publish_grant_required(&kernel, rid, "x", "cap");
+    settle().await;
+    publish_response_as_owner(&kernel, rid, "x", RequestOwnerId::generate(), "approve");
+
+    assert_no_grant(&home, "x", "cap").await;
+}
+
 /// Test #5: SECURITY — the handler reacts ONLY to a correctly-topic'd
 /// `ApprovalResponse` on `astrid.v1.approval.response.<rid>`. A "response"
 /// delivered to a DIFFERENT topic, or a non-`ApprovalResponse` payload on the
@@ -362,6 +402,7 @@ async fn grant_required_from_non_kernel_source_does_not_grant() {
     // capsule's publish; the kernel dispatcher always uses nil.
     let payload = IpcPayload::GrantRequired {
         request_id: rid.to_string(),
+        request_owner: test_request_owner().to_string(),
         principal: "x".to_string(),
         capsule_id: "cap".to_string(),
     };

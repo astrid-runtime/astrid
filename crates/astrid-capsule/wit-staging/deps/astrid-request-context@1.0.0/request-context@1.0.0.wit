@@ -1,0 +1,19 @@
+/// Authenticated request context for host-local client connections.
+///
+/// This package exposes only an opaque comparison handle. The value is minted
+/// by the host when an authenticated local connection is accepted; it is not a
+/// credential, carries no authority by itself, and must never be accepted from
+/// guest payloads as proof of ownership.
+
+package astrid:request-context@1.0.0;
+
+interface host {
+    use astrid:net/host@1.0.0.{error-code, tcp-stream};
+
+    /// Return the opaque owner of an authenticated accepted local connection.
+    ///
+    /// `none` means the stream is outbound, remotely accepted, or was not
+    /// authenticated strongly enough to own interactive requests. Consumers
+    /// must fail closed for owner-scoped prompts when this is `none`.
+    connection-owner: func(connection: borrow<tcp-stream>) -> result<option<string>, error-code>;
+}

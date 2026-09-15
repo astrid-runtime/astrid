@@ -185,6 +185,7 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         share_tcp_listeners: false,
         ingress_principal: None,
         ingress_device_key_id: None,
+        ingress_request_owner: None,
         ingress_origin: None,
         recv_yielded: false,
         no_yield_windows: 0,

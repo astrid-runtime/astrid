@@ -247,7 +247,7 @@ impl EventBus {
             // drain nothing and immediately re-park. Unscoped routes
             // (`scope == None`) accept every publisher, so this is a pure
             // no-op for them and the push path is byte-identical to before.
-            if !entry.accepts(&principal) {
+            if !entry.accepts_event(&principal, event) {
                 continue;
             }
             entry.push_with_eviction(
@@ -379,6 +379,49 @@ impl EventBus {
             scope,
             RouteAdmissionGate::default(),
         )
+    }
+
+    /// Routed subscription restricted to one principal and authenticated
+    /// request owner at enqueue time.
+    ///
+    /// Events that differ in either dimension never enter the route's byte
+    /// budget and cannot evict traffic belonging to the authenticated session.
+    #[must_use]
+    pub fn subscribe_topic_routed_for_request_owner(
+        &self,
+        capsule_uuid: uuid::Uuid,
+        topic_pattern: impl Into<String>,
+        capsule_id_label: impl Into<String>,
+        subscriber: &'static str,
+        principal: impl Into<String>,
+        request_owner: crate::ipc::RequestOwnerId,
+    ) -> RoutedEventReceiver {
+        let topic_pattern = topic_pattern.into();
+        let route_key = RouteKey {
+            capsule_uuid,
+            topic_pattern: topic_pattern.clone(),
+            subscription_rep: self.next_subscription_rep.next(),
+        };
+        let entry = Arc::new(parking_lot::Mutex::new(
+            RouteEntry::new(
+                TopicMatcher::new(topic_pattern),
+                capsule_id_label.into(),
+                Some(Some(principal.into())),
+            )
+            .with_request_owner(request_owner),
+        ));
+        let notify = Arc::clone(&entry.lock().notify);
+        self.routes
+            .write()
+            .insert(route_key.clone(), Arc::clone(&entry));
+        RoutedEventReceiver {
+            route_key,
+            route_entry: entry,
+            notify,
+            routes: Arc::clone(&self.routes),
+            lagged_count: 0,
+            subscriber,
+        }
     }
 
     /// Routed subscription controlled by a runtime-generation publication gate.

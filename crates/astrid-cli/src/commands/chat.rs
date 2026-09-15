@@ -137,6 +137,7 @@ async fn drain_agent_response(
                 action,
                 resource,
                 reason,
+                ..
             } => {
                 formatter.flush_markdown();
                 auto_deny_approval(client, session_id, &request_id, &action, &resource, &reason)

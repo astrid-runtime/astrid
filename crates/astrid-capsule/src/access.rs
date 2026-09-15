@@ -114,10 +114,21 @@ pub(crate) fn emit_grant_required(
     event_bus: &astrid_events::EventBus,
     principal: &str,
     capsule_id: String,
+    request_owner: Option<astrid_events::ipc::RequestOwnerId>,
 ) {
+    let Some(request_owner) = request_owner else {
+        tracing::warn!(
+            security_event = true,
+            principal,
+            capsule_id,
+            "grant-on-use request has no authenticated owner; refusing to prompt"
+        );
+        return;
+    };
     let request_id = uuid::Uuid::new_v4().to_string();
     let payload = astrid_events::ipc::IpcPayload::GrantRequired {
         request_id,
+        request_owner: request_owner.to_string(),
         principal: principal.to_string(),
         capsule_id,
     };
@@ -126,7 +137,8 @@ pub(crate) fn emit_grant_required(
         payload,
         uuid::Uuid::nil(), // Kernel-originated; the grant handler requires nil source.
     )
-    .with_principal(principal.to_string());
+    .with_principal(principal.to_string())
+    .with_request_owner(request_owner);
     event_bus.publish(astrid_events::AstridEvent::Ipc {
         message,
         metadata: astrid_events::EventMetadata::new("dispatcher"),

@@ -7,6 +7,37 @@ use uuid::Uuid;
 
 use crate::topic::Topic;
 
+/// Opaque host-minted owner of one authenticated request connection.
+///
+/// The value is internal routing metadata, not a credential. It is minted by
+/// the host when a local connection authenticates and propagated through the
+/// event bus so interactive responses can be bound to that exact connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RequestOwnerId(Uuid);
+
+impl RequestOwnerId {
+    /// Mint a fresh request owner for an authenticated connection.
+    #[must_use]
+    pub fn generate() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl std::str::FromStr for RequestOwnerId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(value).map(Self)
+    }
+}
+
+impl std::fmt::Display for RequestOwnerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// Where a routed [`IpcMessage`] entered the system — the **transport
 /// origin** of the request, host-stamped at the listener ingress.
 ///
@@ -117,6 +148,15 @@ pub struct IpcMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_key_id: Option<String>,
 
+    /// Exact authenticated connection that owns this request, if any.
+    ///
+    /// Host-derived internal metadata. Guests cannot choose this value: host
+    /// publish paths inherit it from the in-flight caller or verified ingress
+    /// connection. Missing ownership is the fail-closed legacy case for
+    /// interactive approval routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_owner: Option<RequestOwnerId>,
+
     /// The transport origin this message entered the system on — see
     /// [`MessageOrigin`].
     ///
@@ -172,6 +212,7 @@ impl IpcMessage {
             seq: 0,
             principal: None,
             device_key_id: None,
+            request_owner: None,
             origin: MessageOrigin::System,
         }
     }
@@ -199,6 +240,13 @@ impl IpcMessage {
     #[must_use]
     pub fn with_device_key_id(mut self, id: impl Into<String>) -> Self {
         self.device_key_id = Some(id.into());
+        self
+    }
+
+    /// Set the host-minted owner of the originating authenticated request.
+    #[must_use]
+    pub fn with_request_owner(mut self, owner: RequestOwnerId) -> Self {
+        self.request_owner = Some(owner);
         self
     }
 
@@ -251,6 +299,8 @@ pub enum IpcPayload {
     ApprovalRequired {
         /// Opaque correlation ID.
         request_id: String,
+        /// Host-minted connection owner that may answer this request.
+        request_owner: String,
         /// The action being requested (e.g. "git push").
         action: String,
         /// The resource target (e.g. full command string).
@@ -277,6 +327,8 @@ pub enum IpcPayload {
         /// Unguessable correlation id (a UUID) the response is keyed on, used
         /// to build `astrid.v1.approval.response.<request_id>`.
         request_id: String,
+        /// Host-minted connection owner that may answer this request.
+        request_owner: String,
         /// The kernel-stamped caller principal that hit the access-gate miss.
         principal: String,
         /// The capsule id the principal needs granted.

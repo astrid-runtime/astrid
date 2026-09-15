@@ -62,8 +62,39 @@ start_daemon() {
 }
 
 stop_daemon() {
-  terminate_pid "$DAEMON_PID"
+  local pid=$DAEMON_PID
+  [[ -n "$pid" ]] || return 0
+
+  # This process was launched directly by the harness, so exercise its native
+  # signal-to-finalization path and wait beyond the daemon's eight-second hard
+  # deadline. The generic process reaper waits only five seconds and can kill
+  # the daemon while it is still packing the projection into astrid.volume.
+  kill "$pid" 2>/dev/null || true
+  for _ in {1..100}; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      local exit_status=0
+      wait "$pid" 2>/dev/null || exit_status=$?
+      DAEMON_PID=""
+      [[ "$exit_status" -eq 0 ]]
+      return
+    fi
+    sleep 0.1
+  done
+
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
   DAEMON_PID=""
+  return 1
+}
+
+cleanup_daemon_for_status() {
+  local status=$1
+  if [[ "$status" -eq 0 && -n "$DAEMON_PID" ]]; then
+    stop_daemon
+  else
+    terminate_pid "$DAEMON_PID"
+    DAEMON_PID=""
+  fi
 }
 
 wait_for_fake_port() {

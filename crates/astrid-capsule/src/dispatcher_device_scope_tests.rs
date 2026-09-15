@@ -189,6 +189,7 @@ async fn matching(
         topic,
         Some(principal),
         device_key_id,
+        Some(astrid_events::ipc::RequestOwnerId::generate()),
         resolver,
         bus,
     )

@@ -221,54 +221,6 @@ wait_for_sse_ready() {
   done
 }
 
-wait_for_approval_request_id() {
-  local path=$1
-  local deadline=$((SECONDS + 20))
-  local python_bin="${PYTHON:-python3}"
-  local request_id
-  until request_id="$("$python_bin" - "$path" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-if not path.exists():
-    raise SystemExit(1)
-
-text = path.read_text(encoding="utf-8", errors="replace")
-for block in text.split("\n\n"):
-    event = None
-    data_lines = []
-    for line in block.splitlines():
-        if line.startswith("event:"):
-            event = line.split(":", 1)[1].strip()
-        elif line.startswith("data:"):
-            data_lines.append(line.split(":", 1)[1].strip())
-    if event != "approval" or not data_lines:
-        continue
-    try:
-        payload = json.loads("\n".join(data_lines))
-    except json.JSONDecodeError:
-        continue
-    if payload.get("type") != "approval_required":
-        continue
-    if payload.get("action") != "runtime-e2e-approval":
-        continue
-    request_id = payload.get("request_id")
-    if request_id:
-        print(request_id)
-        raise SystemExit(0)
-raise SystemExit(1)
-PY
-  )"; do
-    if (( SECONDS >= deadline )); then
-      return 1
-    fi
-    sleep 0.1
-  done
-  printf '%s\n' "$request_id"
-}
-
 wait_for_elicit_request_id() {
   local path=$1
   local deadline=$((SECONDS + 20))
@@ -397,7 +349,7 @@ run_adversarial_capsule_smoke() {
   esac
   assert_no_adversarial_session_poison "$ARTIFACTS/adversarial-capsule-session-list.json"
 
-  note "checking live approval responder principal isolation"
+  note "checking native approval ownership is not leaked to an HTTP bearer session"
   local approval_sse="$ARTIFACTS/adversarial-approval-requests.sse"
   local approval_out="$ARTIFACTS/adversarial-approval-cli.txt"
   curl -sN --max-time 45 \
@@ -415,42 +367,39 @@ run_adversarial_capsule_smoke() {
     fail "approval request stream ready event did not carry caller principal"
   }
 
-  bounded_principal_cli "$user_principal" 20 "$approval_out" \
+  bounded_principal_cli_with_tty "$user_principal" 20 "$approval_out" \
     capsule run astrid-capsule-adversarial adversarial-approval &
   local cli_pid=$!
-  local approval_request_id
-  approval_request_id="$(wait_for_approval_request_id "$approval_sse")" || {
+  wait_for_cli_approval_prompt "$approval_out" || {
+    terminate_pid "$cli_pid"
+    terminate_pid "$stream_pid"
+    tail_daemon_diagnostics
+    fail "owning native CLI did not receive approval before the isolation check"
+  }
+  # The owner prompt proves publication. Give a broken peer stream a bounded
+  # chance to dequeue before asserting that ownership filtering kept it empty.
+  sleep 1
+  if grep -q '"type":"approval_required"' "$approval_sse"; then
     terminate_pid "$cli_pid"
     terminate_pid "$stream_pid"
     cat "$approval_sse" >&2 2>/dev/null || true
-    fail "approval request stream did not forward adversarial approval request"
-  }
-
-  status="$(http_status POST /api/agent/approval-response "$ops_bearer" \
-    "{\"request_id\":\"$approval_request_id\",\"decision\":\"approve\",\"reason\":\"wrong principal must not satisfy\"}" \
-    "$ARTIFACTS/adversarial-approval-wrong-principal.json")"
-  assert_status "wrong-principal approval response accepted but ignored by waiter" "$status" 202
-  sleep 0.5
+    fail "HTTP bearer session observed a native connection's approval request"
+  fi
   if ! kill -0 "$cli_pid" 2>/dev/null; then
     wait "$cli_pid" || true
     terminate_pid "$stream_pid"
     cat "$approval_out" >&2 2>/dev/null || true
-    fail "wrong-principal approval response satisfied the capsule approval waiter"
+    fail "native approval request did not remain pending without its owning responder"
   fi
-
-  status="$(http_status POST /api/agent/approval-response "$user_bearer" \
-    "{\"request_id\":\"$approval_request_id\",\"decision\":\"approve\",\"reason\":\"runtime e2e approve\"}" \
-    "$ARTIFACTS/adversarial-approval-user.json")"
-  assert_status "same-principal approval response accepted" "$status" 202
+  printf 'n\n' > "$approval_out.input"
   local approval_rc=0
   wait "$cli_pid" || approval_rc=$?
-  terminate_pid "$stream_pid"
-  if [[ "$approval_rc" -ne 0 ]]; then
+  if [[ "$approval_rc" -eq 124 ]]; then
+    terminate_pid "$stream_pid"
     cat "$approval_out" >&2 2>/dev/null || true
-    fail "adversarial approval command failed after same-principal response"
+    fail "owning native CLI did not finish after denying its approval request"
   fi
-  grep -q '"approved":true' "$approval_out" \
-    || fail "adversarial approval command did not report approved decision"
+  terminate_pid "$stream_pid"
 
   note "checking live runtime elicit responder principal isolation"
   local elicit_sse="$ARTIFACTS/adversarial-elicit-requests.sse"
@@ -508,69 +457,13 @@ run_adversarial_capsule_smoke() {
   grep -q "\"value\":\"$elicit_answer\"" "$elicit_out" \
     || fail "adversarial elicit command did not report same-principal answer"
 
-  note "checking live approval denial path"
-  local denial_sse="$ARTIFACTS/adversarial-approval-deny-requests.sse"
-  local denial_out="$ARTIFACTS/adversarial-approval-deny-cli.txt"
-  curl -sN --max-time 45 \
-    -H "Authorization: Bearer $user_bearer" \
-    "$GATEWAY/api/agent/requests" \
-    > "$denial_sse" 2>&1 &
-  local denial_stream_pid=$!
-  wait_for_sse_ready "$denial_sse" || {
-    terminate_pid "$denial_stream_pid"
-    cat "$denial_sse" >&2 2>/dev/null || true
-    fail "approval deny request stream did not become ready"
-  }
-  bounded_principal_cli "$user_principal" 20 "$denial_out" \
-    capsule run astrid-capsule-adversarial adversarial-approval &
-  local denial_cli_pid=$!
-  local denial_request_id
-  denial_request_id="$(wait_for_approval_request_id "$denial_sse")" || {
-    terminate_pid "$denial_cli_pid"
-    terminate_pid "$denial_stream_pid"
-    cat "$denial_sse" >&2 2>/dev/null || true
-    fail "approval deny request stream did not forward adversarial approval request"
-  }
-  status="$(http_status POST /api/agent/approval-response "$user_bearer" \
-    "{\"request_id\":\"$denial_request_id\",\"decision\":\"deny\",\"reason\":\"runtime e2e deny\"}" \
-    "$ARTIFACTS/adversarial-approval-deny-user.json")"
-  assert_status "same-principal approval denial response accepted" "$status" 202
-  local denial_rc=0
-  wait "$denial_cli_pid" || denial_rc=$?
-  terminate_pid "$denial_stream_pid"
-  if [[ "$denial_rc" -eq 0 ]]; then
-    cat "$denial_out" >&2 2>/dev/null || true
-    fail "adversarial approval command succeeded after same-principal deny"
-  fi
-  grep -q '"approved":false' "$denial_out" \
-    || fail "adversarial approval command did not report denied decision"
-
   note "checking live approval timeout path"
-  local timeout_sse="$ARTIFACTS/adversarial-approval-timeout-requests.sse"
   local timeout_out="$ARTIFACTS/adversarial-approval-timeout-cli.txt"
-  curl -sN --max-time 75 \
-    -H "Authorization: Bearer $user_bearer" \
-    "$GATEWAY/api/agent/requests" \
-    > "$timeout_sse" 2>&1 &
-  local timeout_stream_pid=$!
-  wait_for_sse_ready "$timeout_sse" || {
-    terminate_pid "$timeout_stream_pid"
-    cat "$timeout_sse" >&2 2>/dev/null || true
-    fail "approval timeout request stream did not become ready"
-  }
-  bounded_principal_cli "$user_principal" 75 "$timeout_out" \
+  bounded_principal_cli_with_tty "$user_principal" 75 "$timeout_out" \
     capsule run astrid-capsule-adversarial adversarial-approval &
   local timeout_cli_pid=$!
-  wait_for_approval_request_id "$timeout_sse" \
-    > "$ARTIFACTS/adversarial-approval-timeout-request-id.txt" || {
-    terminate_pid "$timeout_cli_pid"
-    terminate_pid "$timeout_stream_pid"
-    cat "$timeout_sse" >&2 2>/dev/null || true
-    fail "approval timeout request stream did not forward adversarial approval request"
-  }
   local timeout_rc=0
   wait "$timeout_cli_pid" || timeout_rc=$?
-  terminate_pid "$timeout_stream_pid"
   if [[ "$timeout_rc" -eq 0 ]]; then
     cat "$timeout_out" >&2 2>/dev/null || true
     fail "adversarial approval command succeeded without a response"

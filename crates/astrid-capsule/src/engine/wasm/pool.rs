@@ -475,6 +475,7 @@ fn clear_on_return(state: &mut HostState, reset_resources: bool) {
     // (issue #45/#852).
     state.ingress_principal = None;
     state.ingress_device_key_id = None;
+    state.ingress_request_owner = None;
     // The in-flight transport origin is the same per-frame state: a fresh lease
     // must never inherit a stale `LocalSocket`, or a later request on a
     // different (remote) connection could be mis-attributed as a local operator
@@ -669,6 +670,7 @@ mod tests {
             let mut state = minimal_host_state(rt.handle().clone());
             state.ingress_principal = Some(astrid_core::PrincipalId::default());
             state.ingress_device_key_id = Some("dev-abc".to_string());
+            state.ingress_request_owner = Some(astrid_events::ipc::RequestOwnerId::generate());
             state.ingress_origin = Some(astrid_events::ipc::MessageOrigin::LocalSocket);
 
             clear_on_return(&mut state, reset_resources);
@@ -679,6 +681,7 @@ mod tests {
             );
             assert_eq!(state.ingress_principal, None);
             assert_eq!(state.ingress_device_key_id, None);
+            assert_eq!(state.ingress_request_owner, None);
         }
     }
 

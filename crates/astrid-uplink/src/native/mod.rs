@@ -104,6 +104,7 @@ impl ConnectionRuntime {
         let egress = self.egress_registry.subscribe(
             identity.principal.to_string(),
             identity.device_key_id.clone(),
+            identity.request_owner,
         );
         serve_connection(
             stream,
@@ -259,7 +260,8 @@ fn publish_trusted_ingress(
     // Rebuild the envelope so every provenance field is host-derived. The
     // client controls only the allowlisted topic and payload.
     let mut trusted = IpcMessage::new(message.topic, message.payload, uuid::Uuid::nil())
-        .with_principal(principal);
+        .with_principal(principal)
+        .with_request_owner(identity.request_owner);
     trusted.device_key_id.clone_from(&identity.device_key_id);
     trusted.origin = if identity.is_principal_verified() {
         MessageOrigin::LocalSocket

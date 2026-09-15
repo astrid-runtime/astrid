@@ -99,6 +99,7 @@ pub(crate) fn spawn_grant_on_use_handler(kernel: Arc<Kernel>) -> astrid_runtime:
             };
             let IpcPayload::GrantRequired {
                 request_id,
+                request_owner,
                 principal,
                 capsule_id,
             } = &message.payload
@@ -123,6 +124,26 @@ pub(crate) fn spawn_grant_on_use_handler(kernel: Arc<Kernel>) -> astrid_runtime:
                     principal = %principal,
                     capsule = %capsule_id,
                     "grant-on-use: GrantRequired from non-kernel source; ignoring (fail-closed)"
+                );
+                continue;
+            }
+            let Some(stamped_owner) = message.request_owner else {
+                warn!(
+                    security_event = true,
+                    %request_id,
+                    principal = %principal,
+                    capsule = %capsule_id,
+                    "grant-on-use: unattributed request; ignoring (fail-closed)"
+                );
+                continue;
+            };
+            if request_owner != &stamped_owner.to_string() {
+                warn!(
+                    security_event = true,
+                    %request_id,
+                    principal = %principal,
+                    capsule = %capsule_id,
+                    "grant-on-use: payload owner differs from host metadata; ignoring"
                 );
                 continue;
             }
@@ -159,7 +180,7 @@ pub(crate) fn spawn_grant_on_use_handler(kernel: Arc<Kernel>) -> astrid_runtime:
                 // The permit lives for the awaiter's whole lifetime, releasing
                 // the in-flight slot on drop (response, timeout, or panic).
                 let _permit = permit;
-                await_and_grant(&kernel, receiver, &principal, &capsule_id).await;
+                await_and_grant(&kernel, receiver, &principal, stamped_owner, &capsule_id).await;
             });
         }
     })
@@ -172,6 +193,7 @@ async fn await_and_grant(
     kernel: &Arc<Kernel>,
     mut receiver: astrid_events::EventReceiver,
     principal: &str,
+    request_owner: astrid_events::ipc::RequestOwnerId,
     capsule_id: &str,
 ) {
     let deadline = astrid_runtime::time::Instant::now()
@@ -210,6 +232,18 @@ async fn await_and_grant(
                 got_principal = message.principal.as_deref().unwrap_or("<none>"),
                 capsule = %capsule_id,
                 "grant-on-use: rejected cross-principal approval response; continuing to wait"
+            );
+            continue;
+        }
+        if message.request_owner != Some(request_owner) {
+            let got_request_owner = message.request_owner.map(|owner| owner.to_string());
+            warn!(
+                security_event = true,
+                principal = %principal,
+                expected_request_owner = %request_owner,
+                got_request_owner = got_request_owner.as_deref().unwrap_or("<none>"),
+                capsule = %capsule_id,
+                "grant-on-use: rejected response from the wrong authenticated request owner"
             );
             continue;
         }
