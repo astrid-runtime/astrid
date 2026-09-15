@@ -637,6 +637,11 @@ fn connection_principal_registry_round_trip() {
     // Bind → reads back the same principal AND the authenticating device id is
     // stored alongside it as one unit (no desync).
     state.bind_connection_principal(rep, alice.clone(), Some("dev-alice".to_string()));
+    let alice_owner = state
+        .connection_principals
+        .get(&rep)
+        .map(|identity| identity.request_owner)
+        .expect("connection owner");
     assert_eq!(state.connection_principal(rep), Some(alice.clone()));
     assert_eq!(
         state
@@ -655,6 +660,15 @@ fn connection_principal_registry_round_trip() {
     // with no specific device (peer-cred path) carries `None`.
     let bob = astrid_core::PrincipalId::new("bob").expect("valid principal");
     state.bind_connection_principal(rep, bob.clone(), None);
+    let bob_owner = state
+        .connection_principals
+        .get(&rep)
+        .map(|identity| identity.request_owner)
+        .expect("connection owner");
+    assert_ne!(
+        alice_owner, bob_owner,
+        "each authenticated connection binding must receive a fresh owner"
+    );
     assert_eq!(state.connection_principal(rep), Some(bob));
     assert_eq!(
         state

@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
+use astrid_events::ipc::{IpcMessage, RequestOwnerId, Topic};
 use astrid_events::{AstridEvent, EventBus};
 
 use super::{CLIENT_EGRESS_CAPACITY, EVENT_SOURCE, MAX_PAYLOAD_BYTES, event_topic, routing};
@@ -12,6 +13,24 @@ const CLIENT_EGRESS_BYTE_BUDGET: usize = 4 * MAX_PAYLOAD_BYTES;
 struct QueuedEvent {
     event: Arc<AstridEvent>,
     bytes: usize,
+}
+
+fn request_owner_allows(message: &IpcMessage, client_owner: RequestOwnerId) -> bool {
+    if message.topic == Topic::approval_request() {
+        let expected_owner = client_owner.to_string();
+        return match &message.payload {
+            astrid_types::ipc::IpcPayload::ApprovalRequired { request_owner, .. }
+            | astrid_types::ipc::IpcPayload::GrantRequired { request_owner, .. } => {
+                message.source_id == uuid::Uuid::nil()
+                    && message.request_owner == Some(client_owner)
+                    && request_owner.as_str() == expected_owner.as_str()
+            },
+            _ => false,
+        };
+    }
+    message
+        .request_owner
+        .is_none_or(|owner| owner == client_owner)
 }
 
 #[derive(Default)]
@@ -40,6 +59,7 @@ pub(super) enum TryRecvError {
 struct ClientQueue {
     principal: String,
     device_key_id: Option<String>,
+    request_owner: RequestOwnerId,
     session: Arc<RwLock<Option<String>>>,
     queue: Arc<EgressQueue>,
 }
@@ -118,6 +138,9 @@ impl Registry {
                 if turn_key.is_some() && turn_owner != Some(*id) {
                     continue;
                 }
+                if !request_owner_allows(message, client.request_owner) {
+                    continue;
+                }
                 let session = client
                     .session
                     .read()
@@ -158,6 +181,7 @@ impl Registry {
         self: &Arc<Self>,
         principal: String,
         device_key_id: Option<String>,
+        request_owner: RequestOwnerId,
     ) -> Subscription {
         let id = uuid::Uuid::new_v4();
         let session = Arc::new(RwLock::new(None));
@@ -170,6 +194,7 @@ impl Registry {
                 ClientQueue {
                     principal: principal.clone(),
                     device_key_id,
+                    request_owner,
                     session: Arc::clone(&session),
                     queue: Arc::clone(&queue),
                 },
@@ -369,11 +394,128 @@ mod tests {
     }
 
     #[test]
+    fn request_owned_event_reaches_only_the_originating_connection() {
+        let bus = Arc::new(EventBus::new());
+        let registry = Registry::install(&bus);
+        let owner = RequestOwnerId::generate();
+        let other_owner = RequestOwnerId::generate();
+        let mut origin = registry.subscribe("alice".to_owned(), None, owner);
+        let mut peer = registry.subscribe("alice".to_owned(), None, other_owner);
+
+        bus.publish(AstridEvent::Ipc {
+            metadata: EventMetadata::new("test"),
+            message: IpcMessage::new(
+                Topic::from_raw("astrid.v1.approval"),
+                IpcPayload::ApprovalRequired {
+                    request_id: "request-1".to_owned(),
+                    request_owner: owner.to_string(),
+                    action: "run".to_owned(),
+                    resource: "command".to_owned(),
+                    reason: "test".to_owned(),
+                },
+                uuid::Uuid::nil(),
+            )
+            .with_principal("alice")
+            .with_request_owner(owner),
+        });
+
+        assert!(origin.try_recv().is_ok());
+        assert!(matches!(peer.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn ownerless_approval_reaches_no_native_connection() {
+        let bus = Arc::new(EventBus::new());
+        let registry = Registry::install(&bus);
+        let owner = RequestOwnerId::generate();
+        let mut client = registry.subscribe("alice".to_owned(), None, owner);
+
+        bus.publish(AstridEvent::Ipc {
+            metadata: EventMetadata::new("test"),
+            message: IpcMessage::new(
+                Topic::from_raw("astrid.v1.approval"),
+                IpcPayload::ApprovalRequired {
+                    request_id: "request-1".to_owned(),
+                    request_owner: owner.to_string(),
+                    action: "run".to_owned(),
+                    resource: "command".to_owned(),
+                    reason: "test".to_owned(),
+                },
+                uuid::Uuid::nil(),
+            )
+            .with_principal("alice"),
+        });
+
+        assert!(matches!(client.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn forged_or_internally_inconsistent_approval_reaches_no_native_connection() {
+        let bus = Arc::new(EventBus::new());
+        let registry = Registry::install(&bus);
+        let owner = RequestOwnerId::generate();
+        let mut client = registry.subscribe("alice".to_owned(), None, owner);
+
+        for (source_id, payload_owner) in [
+            (uuid::Uuid::new_v4(), owner.to_string()),
+            (uuid::Uuid::nil(), RequestOwnerId::generate().to_string()),
+        ] {
+            bus.publish(AstridEvent::Ipc {
+                metadata: EventMetadata::new("test"),
+                message: IpcMessage::new(
+                    Topic::from_raw("astrid.v1.approval"),
+                    IpcPayload::ApprovalRequired {
+                        request_id: "request-1".to_owned(),
+                        request_owner: payload_owner,
+                        action: "run".to_owned(),
+                        resource: "command".to_owned(),
+                        reason: "test".to_owned(),
+                    },
+                    source_id,
+                )
+                .with_principal("alice")
+                .with_request_owner(owner),
+            });
+        }
+
+        assert!(matches!(client.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn malformed_typed_approval_reaches_no_native_connection() {
+        let bus = Arc::new(EventBus::new());
+        let registry = Registry::install(&bus);
+        let owner = RequestOwnerId::generate();
+        let mut client = registry.subscribe("alice".to_owned(), None, owner);
+
+        bus.publish(AstridEvent::Ipc {
+            metadata: EventMetadata::new("test"),
+            message: IpcMessage::new(
+                Topic::approval_request(),
+                IpcPayload::Custom {
+                    data: serde_json::json!({
+                        "type": "approval_required",
+                        "request_id": "request-1",
+                        "action": "run",
+                        "resource": "command",
+                        "reason": "missing payload owner"
+                    }),
+                },
+                uuid::Uuid::nil(),
+            )
+            .with_principal("alice")
+            .with_request_owner(owner),
+        });
+
+        assert!(matches!(client.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
     fn one_turn_per_principal_session_until_terminal_publication() {
         let bus = Arc::new(EventBus::new());
         let registry = Registry::install(&bus);
-        let mut first = registry.subscribe("alice".to_owned(), None);
-        let mut second = registry.subscribe("alice".to_owned(), None);
+        let mut first = registry.subscribe("alice".to_owned(), None, RequestOwnerId::generate());
+        let mut second = registry.subscribe("alice".to_owned(), None, RequestOwnerId::generate());
 
         assert!(first.begin_turn("session-1"));
         assert!(!second.begin_turn("session-1"));
@@ -440,8 +582,8 @@ mod tests {
     fn dropping_turn_owner_releases_only_its_admission() {
         let bus = Arc::new(EventBus::new());
         let registry = Registry::install(&bus);
-        let first = registry.subscribe("alice".to_owned(), None);
-        let second = registry.subscribe("alice".to_owned(), None);
+        let first = registry.subscribe("alice".to_owned(), None, RequestOwnerId::generate());
+        let second = registry.subscribe("alice".to_owned(), None, RequestOwnerId::generate());
 
         assert!(first.begin_turn("session-1"));
         drop(first);

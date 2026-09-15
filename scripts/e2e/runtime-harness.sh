@@ -33,7 +33,7 @@ REDACTION_SENTINELS=()
 cleanup() {
   local status=${ASTRID_E2E_CLEANUP_STATUS:-$?}
   trap - EXIT INT TERM
-  terminate_pid "$DAEMON_PID"
+  cleanup_daemon_for_status "$status" || status=1
   terminate_pid "$SECONDARY_DAEMON_PID"
   terminate_pid "$FAKE_PID"
   if [[ "$status" -ne 0 && -d "$ASTRID_HOME/log" ]]; then mkdir -p "$ARTIFACTS/astrid-log" && cp -a "$ASTRID_HOME/log/." "$ARTIFACTS/astrid-log/" 2>/dev/null || true; fi

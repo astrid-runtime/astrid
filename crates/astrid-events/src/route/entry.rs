@@ -3,7 +3,6 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 // `web_time::Instant` = `std::time::Instant` on native; JS performance
 // clock on wasm32-unknown-unknown (std's panics there at runtime).
 use web_time::Instant;
@@ -12,6 +11,7 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::event::AstridEvent;
+use crate::ipc::RequestOwnerId;
 use crate::route::RouteAdmissionGate;
 use crate::route::matcher::{TopicMatcher, ipc_size_of, principal_class_label};
 
@@ -104,17 +104,6 @@ pub(crate) struct PrincipalQueue {
     pub(crate) deficit: usize,
 }
 
-impl PrincipalQueue {
-    fn new() -> Self {
-        Self {
-            queue: VecDeque::new(),
-            bytes: 0,
-            head_enqueued_at: None,
-            deficit: 0,
-        }
-    }
-}
-
 /// Route-side fan-out entry. One per `(capsule, topic_pattern, subscription)`.
 #[derive(Debug)]
 pub(crate) struct RouteEntry {
@@ -157,6 +146,11 @@ pub(crate) struct RouteEntry {
     /// truth, not the live bus feed. In-band drop-signalling / log
     /// reconciliation is a future (Phase 2) concern.
     scope: RouteAdmission,
+    /// Optional authenticated request owner required at enqueue.
+    ///
+    /// Same-principal peer traffic is rejected before it can consume this
+    /// route's byte budget.
+    request_owner: Option<RequestOwnerId>,
     /// Runtime-generation publication fence shared by all of its routes.
     gate: RouteAdmissionGate,
     /// Wakeup for `RoutedEventReceiver::recv`.
@@ -184,6 +178,7 @@ impl RouteEntry {
             total_bytes: 0,
             capsule_id_label,
             scope: scope.map_or(RouteAdmission::All, RouteAdmission::Exact),
+            request_owner: None,
             gate: RouteAdmissionGate::default(),
             notify: Arc::new(Notify::new()),
         }
@@ -202,6 +197,7 @@ impl RouteEntry {
             total_bytes: 0,
             capsule_id_label,
             scope: RouteAdmission::PrincipalOrSystem(principal),
+            request_owner: None,
             gate: RouteAdmissionGate::default(),
             notify: Arc::new(Notify::new()),
         }
@@ -209,6 +205,11 @@ impl RouteEntry {
 
     pub(crate) fn with_gate(mut self, gate: RouteAdmissionGate) -> Self {
         self.gate = gate;
+        self
+    }
+
+    pub(crate) fn with_request_owner(mut self, request_owner: RequestOwnerId) -> Self {
+        self.request_owner = Some(request_owner);
         self
     }
 
@@ -233,6 +234,20 @@ impl RouteEntry {
         }
     }
 
+    pub(crate) fn accepts_event(&self, publisher: &PrincipalKey, event: &AstridEvent) -> bool {
+        if !self.accepts(publisher) {
+            return false;
+        }
+        let Some(expected_owner) = self.request_owner else {
+            return true;
+        };
+        matches!(
+            event,
+            AstridEvent::Ipc { message, .. }
+                if message.request_owner == Some(expected_owner)
+        )
+    }
+
     /// Push an event into the route, applying oldest-head eviction under
     /// the global byte budget. Returns the number of evictions that
     /// happened to make room.
@@ -248,7 +263,7 @@ impl RouteEntry {
         // even if a future caller forgets the `accepts()` gate in
         // `dispatch_to_routes`. A scoped route's budget is therefore only
         // ever consumable by its own principal.
-        if !self.accepts(&principal) {
+        if !self.accepts_event(&principal, &event) {
             return 0;
         }
 
@@ -522,18 +537,6 @@ impl RouteEntry {
     /// Number of distinct active principal buckets.
     pub(crate) fn active_principals(&self) -> usize {
         self.fanout.len()
-    }
-}
-
-/// Monotonic subscription-rep allocator shared across `EventBus` clones.
-#[derive(Debug, Default)]
-pub(crate) struct SubscriptionRepAllocator(pub(crate) AtomicU64);
-
-impl SubscriptionRepAllocator {
-    pub(crate) fn next(&self) -> u64 {
-        // Skip zero so it can sentinel "unallocated" if a debug path needs.
-        let v = self.0.fetch_add(1, Ordering::Relaxed);
-        v.saturating_add(1)
     }
 }
 
@@ -988,13 +991,5 @@ mod tests {
             |ev| matches!(&**ev, AstridEvent::Ipc { message, .. } if message.topic == "t.oldest"),
         );
         assert!(!has_oldest, "the FIFO head (oldest) was the evicted event");
-    }
-
-    #[test]
-    fn alloc_increments_monotonically() {
-        let a = SubscriptionRepAllocator::default();
-        let n1 = a.next();
-        let n2 = a.next();
-        assert_eq!(n2, n1.saturating_add(1));
     }
 }

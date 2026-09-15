@@ -1,0 +1,25 @@
+/// Authenticated request context for host-local client connections.
+///
+/// This package exposes host-authenticated identity and an opaque ownership
+/// handle for accepted local connections. Neither value is sourced from guest
+/// payloads; the owner is not a credential and carries no authority by itself.
+
+package astrid:request-context@1.0.0;
+
+interface host {
+    use astrid:net/host@1.0.0.{error-code, tcp-stream};
+
+    /// Return the opaque owner of an authenticated accepted local connection.
+    ///
+    /// `none` means the stream is outbound, remotely accepted, or was not
+    /// authenticated strongly enough to own interactive requests. Consumers
+    /// must fail closed for owner-scoped prompts when this is `none`.
+    connection-owner: func(connection: borrow<tcp-stream>) -> result<option<string>, error-code>;
+
+    /// Return the principal authenticated for an accepted local connection.
+    ///
+    /// `none` means the stream is outbound, remotely accepted, or did not
+    /// complete principal authentication. A bridge must not substitute a
+    /// payload-supplied principal when this is `none`.
+    connection-principal: func(connection: borrow<tcp-stream>) -> result<option<string>, error-code>;
+}

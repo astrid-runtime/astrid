@@ -196,13 +196,26 @@ fn event_principal(event: &AstridEvent) -> Option<&str> {
     }
 }
 
-fn response_principal_matches(expected: &str, event: &AstridEvent) -> bool {
-    event_principal(event) == Some(expected)
+fn event_request_owner(event: &AstridEvent) -> Option<astrid_events::ipc::RequestOwnerId> {
+    match event {
+        AstridEvent::Ipc { message, .. } => message.request_owner,
+        _ => None,
+    }
+}
+
+fn response_identity_matches(
+    expected_principal: &str,
+    expected_owner: astrid_events::ipc::RequestOwnerId,
+    event: &AstridEvent,
+) -> bool {
+    event_principal(event) == Some(expected_principal)
+        && event_request_owner(event) == Some(expected_owner)
 }
 
 async fn await_matching_approval_response(
     receiver: &mut astrid_events::EventReceiver,
     expected_principal: &str,
+    expected_owner: astrid_events::ipc::RequestOwnerId,
     capsule_id: &str,
     request_id: &str,
     timeout: std::time::Duration,
@@ -216,10 +229,11 @@ async fn await_matching_approval_response(
         let Ok(Some(event)) = tokio::time::timeout(remaining, receiver.recv()).await else {
             return None;
         };
-        if response_principal_matches(expected_principal, &event) {
+        if response_identity_matches(expected_principal, expected_owner, &event) {
             return Some(event);
         }
         let got = event_principal(&event);
+        let got_owner = event_request_owner(&event).map(|owner| owner.to_string());
         tracing::warn!(
             target: "astrid.audit.approval",
             security_event = true,
@@ -227,7 +241,9 @@ async fn await_matching_approval_response(
             request_id = %request_id,
             expected_principal = %expected_principal,
             got_principal = got.unwrap_or("<none>"),
-            "approval: rejected cross-principal response; continuing to wait",
+            expected_request_owner = %expected_owner,
+            got_request_owner = got_owner.as_deref().unwrap_or("<none>"),
+            "approval: rejected response from the wrong principal or authenticated request owner",
         );
     }
 }
@@ -289,6 +305,22 @@ impl approval::Host for HostState {
         }
 
         // Slow path: publish ApprovalRequired and wait for response.
+        let Some(request_owner) = self
+            .caller_context
+            .as_ref()
+            .and_then(|message| message.request_owner)
+        else {
+            tracing::warn!(
+                target: "astrid.audit.approval",
+                security_event = true,
+                capsule_id = %capsule_id,
+                principal = %principal,
+                "approval request has no authenticated owner; denying"
+            );
+            return Ok(ApprovalResponse {
+                decision: ApprovalDecision::Denied,
+            });
+        };
         let request_id = Uuid::new_v4().to_string();
         let response_topic = Topic::approval_response(&request_id);
 
@@ -297,6 +329,7 @@ impl approval::Host for HostState {
 
         let request_payload = IpcPayload::ApprovalRequired {
             request_id: request_id.clone(),
+            request_owner: request_owner.to_string(),
             action: request.action.clone(),
             resource: request.target_resource.clone(),
             reason: format!("Capsule '{capsule_id}' requests approval"),
@@ -306,18 +339,22 @@ impl approval::Host for HostState {
             request_payload,
             Uuid::nil(), // Kernel-originated
         )
-        .with_principal(principal.to_string());
+        .with_principal(principal.to_string())
+        .with_request_owner(request_owner);
         event_bus.publish(AstridEvent::Ipc {
             message,
             metadata: astrid_events::EventMetadata::default(),
         });
 
-        tracing::debug!(
+        tracing::info!(
             plugin = %capsule_id,
+            %request_id,
+            "Approval request pending"
+        );
+        tracing::debug!(
             action = %request.action,
             resource = %request.target_resource,
-            %request_id,
-            "Published approval request, waiting for response"
+            "Approval request details"
         );
 
         // Block until response, timeout, or cancellation.
@@ -329,6 +366,7 @@ impl approval::Host for HostState {
                 await_matching_approval_response(
                     &mut receiver,
                     principal.as_str(),
+                    request_owner,
                     &capsule_id,
                     &request_id,
                     std::time::Duration::from_millis(MAX_APPROVAL_TIMEOUT_MS),

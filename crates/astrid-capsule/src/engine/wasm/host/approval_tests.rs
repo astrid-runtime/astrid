@@ -251,6 +251,7 @@ fn approve_once_does_not_create_allowance() {
 fn approval_response_event(
     request_id: &str,
     principal: Option<&str>,
+    request_owner: Option<astrid_events::ipc::RequestOwnerId>,
     decision: &str,
 ) -> AstridEvent {
     let topic = Topic::approval_response(request_id);
@@ -266,6 +267,9 @@ fn approval_response_event(
     if let Some(principal) = principal {
         message = message.with_principal(principal);
     }
+    if let Some(owner) = request_owner {
+        message = message.with_request_owner(owner);
+    }
     AstridEvent::Ipc {
         message,
         metadata: astrid_events::EventMetadata::default(),
@@ -273,36 +277,62 @@ fn approval_response_event(
 }
 
 #[test]
-fn approval_response_principal_match_is_exact() {
+fn approval_response_identity_match_is_exact() {
     let request_id = "approval-principal-match";
-    let same = approval_response_event(request_id, Some("agent-alice"), "approve");
-    let other = approval_response_event(request_id, Some("agent-bob"), "approve");
-    let none = approval_response_event(request_id, None, "approve");
+    let owner = astrid_events::ipc::RequestOwnerId::generate();
+    let other_owner = astrid_events::ipc::RequestOwnerId::generate();
+    let same = approval_response_event(request_id, Some("agent-alice"), Some(owner), "approve");
+    let other_principal =
+        approval_response_event(request_id, Some("agent-bob"), Some(owner), "approve");
+    let other_owner = approval_response_event(
+        request_id,
+        Some("agent-alice"),
+        Some(other_owner),
+        "approve",
+    );
+    let none = approval_response_event(request_id, Some("agent-alice"), None, "approve");
 
-    assert!(response_principal_matches("agent-alice", &same));
-    assert!(!response_principal_matches("agent-alice", &other));
-    assert!(!response_principal_matches("agent-alice", &none));
+    assert!(response_identity_matches("agent-alice", owner, &same));
+    assert!(!response_identity_matches(
+        "agent-alice",
+        owner,
+        &other_principal
+    ));
+    assert!(!response_identity_matches(
+        "agent-alice",
+        owner,
+        &other_owner
+    ));
+    assert!(!response_identity_matches("agent-alice", owner, &none));
 }
 
 fn publish_approval_reply(
     bus: &astrid_events::EventBus,
     request_id: &str,
     principal: Option<&str>,
+    request_owner: Option<astrid_events::ipc::RequestOwnerId>,
     decision: &str,
 ) {
-    bus.publish(approval_response_event(request_id, principal, decision));
+    bus.publish(approval_response_event(
+        request_id,
+        principal,
+        request_owner,
+        decision,
+    ));
 }
 
 #[tokio::test]
 async fn approval_wait_times_out_after_wrong_principal_reply() {
     let bus = astrid_events::EventBus::with_capacity(64);
     let request_id = "approval-wrong-principal-timeout";
+    let owner = astrid_events::ipc::RequestOwnerId::generate();
     let mut rx = bus.subscribe_topic(Topic::approval_response(request_id).as_str());
-    publish_approval_reply(&bus, request_id, Some("agent-bob"), "approve");
+    publish_approval_reply(&bus, request_id, Some("agent-bob"), Some(owner), "approve");
 
     let result = await_matching_approval_response(
         &mut rx,
         "agent-alice",
+        owner,
         "test",
         request_id,
         std::time::Duration::from_millis(100),
@@ -319,12 +349,19 @@ async fn approval_wait_times_out_after_wrong_principal_reply() {
 async fn approval_wait_mismatch_flood_does_not_extend_deadline() {
     let bus = astrid_events::EventBus::with_capacity(128);
     let request_id = "approval-mismatch-flood";
+    let owner = astrid_events::ipc::RequestOwnerId::generate();
     let mut rx = bus.subscribe_topic(Topic::approval_response(request_id).as_str());
 
     let pub_bus = bus.clone();
     let publisher = tokio::spawn(async move {
         for _ in 0..50 {
-            publish_approval_reply(&pub_bus, request_id, Some("agent-bob"), "approve");
+            publish_approval_reply(
+                &pub_bus,
+                request_id,
+                Some("agent-bob"),
+                Some(owner),
+                "approve",
+            );
             tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         }
     });
@@ -332,7 +369,8 @@ async fn approval_wait_mismatch_flood_does_not_extend_deadline() {
     let budget = std::time::Duration::from_millis(150);
     let start = std::time::Instant::now();
     let result =
-        await_matching_approval_response(&mut rx, "agent-alice", "test", request_id, budget).await;
+        await_matching_approval_response(&mut rx, "agent-alice", owner, "test", request_id, budget)
+            .await;
     let elapsed = start.elapsed();
 
     publisher.abort();
@@ -351,13 +389,29 @@ async fn approval_wait_mismatch_flood_does_not_extend_deadline() {
 async fn approval_wait_ignores_wrong_principal_then_accepts_matching_reply() {
     let bus = astrid_events::EventBus::with_capacity(64);
     let request_id = "approval-wrong-then-right";
+    let owner = astrid_events::ipc::RequestOwnerId::generate();
+    let wrong_owner = astrid_events::ipc::RequestOwnerId::generate();
     let mut rx = bus.subscribe_topic(Topic::approval_response(request_id).as_str());
-    publish_approval_reply(&bus, request_id, Some("agent-bob"), "approve");
-    publish_approval_reply(&bus, request_id, Some("agent-alice"), "approve");
+    publish_approval_reply(
+        &bus,
+        request_id,
+        Some("agent-alice"),
+        Some(wrong_owner),
+        "approve",
+    );
+    publish_approval_reply(&bus, request_id, Some("agent-bob"), Some(owner), "approve");
+    publish_approval_reply(
+        &bus,
+        request_id,
+        Some("agent-alice"),
+        Some(owner),
+        "approve",
+    );
 
     let event = await_matching_approval_response(
         &mut rx,
         "agent-alice",
+        owner,
         "test",
         request_id,
         std::time::Duration::from_secs(1),
@@ -365,7 +419,7 @@ async fn approval_wait_ignores_wrong_principal_then_accepts_matching_reply() {
     .await
     .expect("matching approval reply should be accepted");
 
-    assert!(response_principal_matches("agent-alice", &event));
+    assert!(response_identity_matches("agent-alice", owner, &event));
 }
 
 #[tokio::test]
@@ -373,10 +427,13 @@ async fn concurrent_approval_waiters_keep_correlation_and_principal_scopes() {
     let bus = astrid_events::EventBus::with_capacity(128);
     let mut rx_alice = bus.subscribe_topic(Topic::approval_response("approval-alice").as_str());
     let mut rx_bob = bus.subscribe_topic(Topic::approval_response("approval-bob").as_str());
+    let alice_owner = astrid_events::ipc::RequestOwnerId::generate();
+    let bob_owner = astrid_events::ipc::RequestOwnerId::generate();
 
     let alice = await_matching_approval_response(
         &mut rx_alice,
         "agent-alice",
+        alice_owner,
         "test",
         "approval-alice",
         std::time::Duration::from_secs(1),
@@ -384,22 +441,51 @@ async fn concurrent_approval_waiters_keep_correlation_and_principal_scopes() {
     let bob = await_matching_approval_response(
         &mut rx_bob,
         "agent-bob",
+        bob_owner,
         "test",
         "approval-bob",
         std::time::Duration::from_secs(1),
     );
 
-    publish_approval_reply(&bus, "approval-alice", Some("agent-bob"), "approve");
-    publish_approval_reply(&bus, "approval-bob", Some("agent-alice"), "approve");
-    publish_approval_reply(&bus, "approval-alice", Some("agent-alice"), "approve");
-    publish_approval_reply(&bus, "approval-bob", Some("agent-bob"), "deny");
+    publish_approval_reply(
+        &bus,
+        "approval-alice",
+        Some("agent-alice"),
+        Some(bob_owner),
+        "approve",
+    );
+    publish_approval_reply(
+        &bus,
+        "approval-bob",
+        Some("agent-bob"),
+        Some(alice_owner),
+        "approve",
+    );
+    publish_approval_reply(
+        &bus,
+        "approval-alice",
+        Some("agent-alice"),
+        Some(alice_owner),
+        "approve",
+    );
+    publish_approval_reply(
+        &bus,
+        "approval-bob",
+        Some("agent-bob"),
+        Some(bob_owner),
+        "deny",
+    );
 
     let (alice, bob) = tokio::join!(alice, bob);
     let alice = alice.expect("alice approval should resolve");
     let bob = bob.expect("bob approval should resolve");
 
-    assert!(response_principal_matches("agent-alice", &alice));
-    assert!(response_principal_matches("agent-bob", &bob));
+    assert!(response_identity_matches(
+        "agent-alice",
+        alice_owner,
+        &alice
+    ));
+    assert!(response_identity_matches("agent-bob", bob_owner, &bob));
 }
 
 fn approval_request(action: &str, resource: &str) -> ApprovalRequest {
@@ -409,7 +495,47 @@ fn approval_request(action: &str, resource: &str) -> ApprovalRequest {
     }
 }
 
-async fn await_approval_request(mut rx: astrid_events::EventReceiver) -> (String, Option<String>) {
+#[tokio::test]
+async fn request_approval_without_authenticated_owner_fails_closed() {
+    use crate::engine::wasm::test_fixtures::minimal_host_state;
+
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    let mut request_rx = state
+        .event_bus
+        .subscribe_topic(Topic::approval_request().as_str());
+
+    let response = <HostState as approval::Host>::request_approval(
+        &mut state,
+        approval_request("run", "run payment"),
+    )
+    .expect("unattributed approval should be denied, not trap");
+
+    assert_eq!(response.decision, ApprovalDecision::Denied);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), request_rx.recv())
+            .await
+            .is_err(),
+        "unattributed approval must not be broadcast"
+    );
+}
+
+fn install_request_owner(state: &mut HostState) -> astrid_events::ipc::RequestOwnerId {
+    let owner = astrid_events::ipc::RequestOwnerId::generate();
+    state.caller_context = Some(
+        IpcMessage::new(
+            Topic::from_raw("test.request"),
+            IpcPayload::RawJson(serde_json::Value::Null),
+            Uuid::nil(),
+        )
+        .with_principal("default")
+        .with_request_owner(owner),
+    );
+    owner
+}
+
+async fn await_approval_request(
+    mut rx: astrid_events::EventReceiver,
+) -> (String, Option<String>, astrid_events::ipc::RequestOwnerId) {
     let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
         .await
         .expect("approval request observed")
@@ -417,10 +543,19 @@ async fn await_approval_request(mut rx: astrid_events::EventReceiver) -> (String
     let AstridEvent::Ipc { message, .. } = &*event else {
         panic!("expected IPC approval request");
     };
-    let IpcPayload::ApprovalRequired { request_id, .. } = &message.payload else {
+    let IpcPayload::ApprovalRequired {
+        request_id,
+        request_owner,
+        ..
+    } = &message.payload
+    else {
         panic!("expected ApprovalRequired payload");
     };
-    (request_id.clone(), message.principal.clone())
+    let owner = message
+        .request_owner
+        .expect("request owner must be stamped");
+    assert_eq!(request_owner, &owner.to_string());
+    (request_id.clone(), message.principal.clone(), owner)
 }
 
 #[tokio::test]
@@ -428,6 +563,7 @@ async fn request_approval_stamps_principal_and_ignores_wrong_responder() {
     use crate::engine::wasm::test_fixtures::minimal_host_state;
 
     let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    let owner = install_request_owner(&mut state);
     let bus = state.event_bus.clone();
     let request_rx = bus.subscribe_topic(Topic::approval_request().as_str());
 
@@ -439,15 +575,23 @@ async fn request_approval_stamps_principal_and_ignores_wrong_responder() {
         (result, state)
     });
 
-    let (request_id, request_principal) = await_approval_request(request_rx).await;
+    let (request_id, request_principal, request_owner) = await_approval_request(request_rx).await;
+    assert_eq!(request_owner, owner);
     assert_eq!(
         request_principal.as_deref(),
         Some("default"),
         "approval request must be stamped with the originating principal"
     );
 
-    publish_approval_reply(&bus, &request_id, Some("agent-bob"), "approve");
-    publish_approval_reply(&bus, &request_id, Some("default"), "approve");
+    publish_approval_reply(
+        &bus,
+        &request_id,
+        Some("default"),
+        Some(astrid_events::ipc::RequestOwnerId::generate()),
+        "approve",
+    );
+    publish_approval_reply(&bus, &request_id, Some("agent-bob"), Some(owner), "approve");
+    publish_approval_reply(&bus, &request_id, Some("default"), Some(owner), "approve");
 
     let (result, _state) = approval_handle.await.expect("approval thread joined");
     let response = result.expect("matching approval response should be accepted");
@@ -459,6 +603,7 @@ async fn request_approval_accepts_same_principal_deny() {
     use crate::engine::wasm::test_fixtures::minimal_host_state;
 
     let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    let owner = install_request_owner(&mut state);
     let bus = state.event_bus.clone();
     let request_rx = bus.subscribe_topic(Topic::approval_request().as_str());
 
@@ -470,8 +615,15 @@ async fn request_approval_accepts_same_principal_deny() {
         (result, state)
     });
 
-    let (request_id, request_principal) = await_approval_request(request_rx).await;
-    publish_approval_reply(&bus, &request_id, request_principal.as_deref(), "deny");
+    let (request_id, request_principal, request_owner) = await_approval_request(request_rx).await;
+    assert_eq!(request_owner, owner);
+    publish_approval_reply(
+        &bus,
+        &request_id,
+        request_principal.as_deref(),
+        Some(owner),
+        "deny",
+    );
 
     let (result, _state) = approval_handle.await.expect("approval thread joined");
     let response = result.expect("matching deny response should be accepted");
@@ -483,6 +635,7 @@ async fn request_approval_cancel_token_unblocks_wait() {
     use crate::engine::wasm::test_fixtures::minimal_host_state;
 
     let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    install_request_owner(&mut state);
     let cancel = state.cancel_token.clone();
     let request_rx = state
         .event_bus
@@ -496,7 +649,7 @@ async fn request_approval_cancel_token_unblocks_wait() {
         (result, state)
     });
 
-    let (_request_id, request_principal) = await_approval_request(request_rx).await;
+    let (_request_id, request_principal, _request_owner) = await_approval_request(request_rx).await;
     assert_eq!(request_principal.as_deref(), Some("default"));
 
     let start = std::time::Instant::now();

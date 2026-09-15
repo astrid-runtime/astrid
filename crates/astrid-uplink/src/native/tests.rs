@@ -19,6 +19,29 @@ fn egress_event(principal: &str, payload_bytes: usize) -> AstridEvent {
 }
 
 #[test]
+fn native_wire_frame_preserves_request_owner() {
+    let owner = astrid_types::ipc::RequestOwnerId::generate();
+    let message = IpcMessage::new(
+        Topic::grant_result("request-1"),
+        IpcPayload::GrantResult {
+            request_id: "request-1".to_owned(),
+            request_owner: owner.to_string(),
+            principal: "alice".to_owned(),
+            capsule_id: "capsule".to_owned(),
+            granted: true,
+        },
+        Uuid::nil(),
+    )
+    .with_principal("alice")
+    .with_request_owner(owner);
+
+    let frame = message_frame(&message).expect("serialize native frame");
+    assert_eq!(frame["request_owner"], owner.to_string());
+    assert_eq!(frame["principal"], "alice");
+    assert_eq!(frame["payload"]["request_owner"], owner.to_string());
+}
+
+#[test]
 fn general_connection_limit_does_not_consume_the_admin_reserve() {
     let established = Arc::new(tokio::sync::Semaphore::new(1));
     let reserved = Arc::new(tokio::sync::Semaphore::new(1));
@@ -129,11 +152,14 @@ fn kernel_reserved_completion_uses_private_response_topic() {
 fn cancel_turn_is_forwarded_only_by_the_active_connection() {
     let bus = Arc::new(EventBus::new());
     let registry = egress::Registry::install(&bus);
-    let owner = registry.subscribe("alice".to_owned(), None);
-    let other = registry.subscribe("alice".to_owned(), None);
+    let owner_id = astrid_types::ipc::RequestOwnerId::generate();
+    let other_owner_id = astrid_types::ipc::RequestOwnerId::generate();
+    let owner = registry.subscribe("alice".to_owned(), None, owner_id);
+    let other = registry.subscribe("alice".to_owned(), None, other_owner_id);
     let identity = AuthenticatedIdentity {
         principal: PrincipalId::new("alice").expect("valid principal"),
         device_key_id: None,
+        request_owner: owner_id,
     };
     let mut inbound = bus.subscribe_topic(routing::CHAT_REQUEST_TOPIC);
     let prompt = |context| {
@@ -180,8 +206,16 @@ fn cancel_turn_is_forwarded_only_by_the_active_connection() {
 async fn egress_registry_preserves_full_payloads_and_isolates_principals() {
     let bus = Arc::new(EventBus::new());
     let registry = egress::Registry::install(&bus);
-    let mut alice_rx = registry.subscribe("alice".to_owned(), None);
-    let mut bob_rx = registry.subscribe("bob".to_owned(), None);
+    let mut alice_rx = registry.subscribe(
+        "alice".to_owned(),
+        None,
+        astrid_types::ipc::RequestOwnerId::generate(),
+    );
+    let mut bob_rx = registry.subscribe(
+        "bob".to_owned(),
+        None,
+        astrid_types::ipc::RequestOwnerId::generate(),
+    );
 
     // Publishing both events without yielding makes this a deterministic
     // regression for the former shared 1 MiB routed budget: Bob's event
@@ -220,7 +254,11 @@ async fn egress_registry_preserves_full_payloads_and_isolates_principals() {
 async fn unrelated_bus_burst_cannot_lag_client_egress() {
     let bus = Arc::new(EventBus::with_capacity(1));
     let registry = egress::Registry::install(&bus);
-    let mut egress_rx = registry.subscribe("alice".to_owned(), None);
+    let mut egress_rx = registry.subscribe(
+        "alice".to_owned(),
+        None,
+        astrid_types::ipc::RequestOwnerId::generate(),
+    );
 
     for _ in 0..2048 {
         let mut event = egress_event("alice", 1);
@@ -243,7 +281,11 @@ async fn unrelated_bus_burst_cannot_lag_client_egress() {
 async fn one_principal_burst_cannot_lag_another_principal() {
     let bus = Arc::new(EventBus::new());
     let registry = egress::Registry::install(&bus);
-    let mut bob_rx = registry.subscribe("bob".to_owned(), None);
+    let mut bob_rx = registry.subscribe(
+        "bob".to_owned(),
+        None,
+        astrid_types::ipc::RequestOwnerId::generate(),
+    );
 
     for _ in 0..=CLIENT_EGRESS_CAPACITY {
         bus.publish(egress_event("alice", 1));

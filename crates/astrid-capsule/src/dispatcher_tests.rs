@@ -181,10 +181,26 @@ fn publish_ipc_as(bus: &EventBus, topic: &str, principal: &str) {
         },
         uuid::Uuid::nil(),
     )
-    .with_principal(principal);
+    .with_principal(principal)
+    .with_request_owner(astrid_events::ipc::RequestOwnerId::generate());
     bus.publish(AstridEvent::Ipc {
         metadata: astrid_events::EventMetadata::new("test"),
         message: msg,
+    });
+}
+
+fn publish_ipc_as_unowned(bus: &EventBus, topic: &str, principal: &str) {
+    let message = astrid_events::ipc::IpcMessage::new(
+        Topic::from_raw(topic),
+        IpcPayload::Custom {
+            data: serde_json::json!({}),
+        },
+        uuid::Uuid::nil(),
+    )
+    .with_principal(principal);
+    bus.publish(AstridEvent::Ipc {
+        metadata: astrid_events::EventMetadata::new("test-unowned"),
+        message,
     });
 }
 
@@ -430,9 +446,16 @@ async fn find_matching_interceptors_sorts_by_priority() {
     let registry = Arc::new(RwLock::new(registry));
     let bus = EventBus::with_capacity(64);
 
-    let matches =
-        find_matching_interceptors(&registry, "test.event", Some("default"), None, None, &bus)
-            .await;
+    let matches = find_matching_interceptors(
+        &registry,
+        "test.event",
+        Some("default"),
+        None,
+        None,
+        None,
+        &bus,
+    )
+    .await;
     let names: Vec<&str> = matches
         .iter()
         .map(|(_, capsule, _, _)| capsule.id().as_str())
@@ -464,9 +487,16 @@ async fn find_matching_interceptors_tiebreaks_equal_priority_by_id() {
     let registry = Arc::new(RwLock::new(registry));
     let bus = EventBus::with_capacity(64);
 
-    let matches =
-        find_matching_interceptors(&registry, "test.event", Some("default"), None, None, &bus)
-            .await;
+    let matches = find_matching_interceptors(
+        &registry,
+        "test.event",
+        Some("default"),
+        None,
+        None,
+        None,
+        &bus,
+    )
+    .await;
     let names: Vec<&str> = matches
         .iter()
         .map(|(_, capsule, _, _)| capsule.id().as_str())
@@ -1184,7 +1214,7 @@ mod access_enforcement {
     /// timeout so a failing test does not hang. Returns the decoded tuple.
     async fn recv_grant_required(
         receiver: &mut astrid_events::EventReceiver,
-    ) -> Option<(String, String, String)> {
+    ) -> Option<(String, String, String, String)> {
         let deadline = std::time::Instant::now() + Duration::from_millis(500);
         while std::time::Instant::now() < deadline {
             let next = tokio::time::timeout(Duration::from_millis(200), receiver.recv()).await;
@@ -1192,11 +1222,26 @@ mod access_enforcement {
             if let AstridEvent::Ipc { message, .. } = &*event
                 && let IpcPayload::GrantRequired {
                     request_id,
+                    request_owner,
                     principal,
                     capsule_id,
+                    ..
                 } = &message.payload
             {
-                return Some((request_id.clone(), principal.clone(), capsule_id.clone()));
+                assert_eq!(
+                    message
+                        .request_owner
+                        .map(|owner| owner.to_string())
+                        .as_ref(),
+                    Some(request_owner),
+                    "payload owner must match host-stamped metadata"
+                );
+                return Some((
+                    request_id.clone(),
+                    request_owner.clone(),
+                    principal.clone(),
+                    capsule_id.clone(),
+                ));
             }
         }
         None
@@ -1223,8 +1268,9 @@ mod access_enforcement {
         publish_ipc_as(&bus, "tool.v1.execute.do_thing", "bob");
 
         let signal = recv_grant_required(&mut approval).await;
-        let (request_id, principal, capsule_id) =
+        let (request_id, request_owner, principal, capsule_id) =
             signal.expect("gate-miss must publish a GrantRequired signal");
+        assert!(!request_owner.is_empty());
         assert_eq!(principal, "bob", "grant target principal is the caller");
         assert_eq!(
             capsule_id, "secret-tool",
@@ -1233,6 +1279,28 @@ mod access_enforcement {
         assert!(
             uuid::Uuid::parse_str(&request_id).is_ok() && !request_id.is_empty(),
             "request_id must be a non-empty UUID, got {request_id:?}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn authenticated_principal_without_request_owner_gets_no_prompt() {
+        let (_dir, home, resolver) = resolver_fixture();
+        write_profile(&home, "bob", &agent_with_capsules(&[]));
+
+        let (_invoked, bus, handle) = spawn_with_capsule_in_views(
+            resolver,
+            "secret-tool",
+            "tool.v1.execute.do_thing",
+            &["bob"],
+        );
+        let mut approval = bus.subscribe_topic("astrid.v1.approval");
+        tokio::task::yield_now().await;
+        publish_ipc_as_unowned(&bus, "tool.v1.execute.do_thing", "bob");
+
+        assert!(
+            recv_grant_required(&mut approval).await.is_none(),
+            "legacy or unattributed requests must not broadcast an approval prompt"
         );
         handle.abort();
     }

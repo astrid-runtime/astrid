@@ -2750,6 +2750,7 @@ impl ExecutionEngine for WasmEngine {
                 // framed read.
                 ingress_principal: None,
                 ingress_device_key_id: None,
+                ingress_request_owner: None,
                 ingress_origin: None,
                 // Run-loop epoch-interrupt state. `recv_yielded` is set true by
                 // the ipc `recv` host fn each time the guest blocks on recv;
@@ -4077,6 +4078,7 @@ async fn build_lifecycle_host_state(
         // or authenticating device.
         ingress_principal: None,
         ingress_device_key_id: None,
+        ingress_request_owner: None,
         ingress_origin: None,
         // Lifecycle hooks are not run loops; the epoch-interrupt run-loop
         // state is inert here but initialised for completeness.

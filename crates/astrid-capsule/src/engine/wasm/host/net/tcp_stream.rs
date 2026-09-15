@@ -122,6 +122,7 @@ impl HostTcpStream for HostState {
                     );
                     self.ingress_principal = Some(identity.principal);
                     self.ingress_device_key_id = identity.device_key_id;
+                    self.ingress_request_owner = Some(identity.request_owner);
                     // A data frame off a kernel-BOUND (handshake-verified)
                     // connection is the positive local-operator signal: stamp
                     // the transport origin so a `publish-as` forward carries it
@@ -134,6 +135,7 @@ impl HostTcpStream for HostState {
                 None => {
                     self.ingress_principal = None;
                     self.ingress_device_key_id = None;
+                    self.ingress_request_owner = None;
                     // Cleared in LOCKSTEP so a stale local origin can never leak
                     // onto a later forward off a closed/pending/unbound read.
                     self.ingress_origin = None;

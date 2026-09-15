@@ -203,6 +203,9 @@ pub struct ConnectionIdentity {
     /// The `key_id` of the device key that verified the challenge, if the
     /// principal authenticated via the keypair challenge.
     pub device_key_id: Option<String>,
+    /// Opaque owner minted for this authenticated connection. Interactive
+    /// responses must carry this exact host-stamped value.
+    pub request_owner: astrid_events::ipc::RequestOwnerId,
 }
 
 /// Caller-supplied inputs for [`HostState::for_hook`].
@@ -714,6 +717,10 @@ pub struct HostState {
     /// effective capabilities. `None` for an unbound connection or a binding
     /// that carried no specific device.
     pub ingress_device_key_id: Option<String>,
+    /// Host-minted request owner for the source connection whose inbound frame
+    /// is currently in flight. Set and cleared with the other ingress identity
+    /// fields; `publish-as` propagates it without accepting a guest override.
+    pub ingress_request_owner: Option<astrid_events::ipc::RequestOwnerId>,
     /// The transport origin of the source connection whose inbound frame is
     /// currently in flight — the per-frame companion to
     /// [`ingress_principal`](Self::ingress_principal), feeding the host-stamped

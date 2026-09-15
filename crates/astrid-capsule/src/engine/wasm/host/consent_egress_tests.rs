@@ -22,11 +22,18 @@ use crate::engine::wasm::test_fixtures::minimal_host_state;
 /// Stamp `state.caller_context` with a message carrying `origin` and
 /// `principal`, so `effective_origin()` / `effective_principal()` reflect it —
 /// exactly what the dispatcher does per invocation.
-fn set_caller(state: &mut HostState, origin: MessageOrigin, principal: &str) {
+fn set_caller(
+    state: &mut HostState,
+    origin: MessageOrigin,
+    principal: &str,
+) -> astrid_events::ipc::RequestOwnerId {
+    let owner = astrid_events::ipc::RequestOwnerId::generate();
     let msg = IpcMessage::new(Topic::from_raw("t"), IpcPayload::Connect, uuid::Uuid::nil())
         .with_principal(principal)
+        .with_request_owner(owner)
         .with_origin(origin);
     state.caller_context = Some(msg);
+    owner
 }
 
 /// Spawn a one-shot responder: subscribe to `astrid.v1.approval`, wait for the
@@ -53,6 +60,9 @@ fn spawn_responder(bus: astrid_events::EventBus, decision: &'static str) {
             if let Some(principal) = message.principal.as_deref() {
                 response = response.with_principal(principal);
             }
+            if let Some(owner) = message.request_owner {
+                response = response.with_request_owner(owner);
+            }
             bus.publish(AstridEvent::Ipc {
                 message: response,
                 metadata: astrid_events::EventMetadata::default(),
@@ -68,6 +78,7 @@ fn publish_consent_reply(
     bus: &astrid_events::EventBus,
     request_id: &str,
     principal: Option<&str>,
+    request_owner: Option<astrid_events::ipc::RequestOwnerId>,
     decision: &str,
 ) {
     let payload = IpcPayload::ApprovalResponse {
@@ -82,6 +93,9 @@ fn publish_consent_reply(
     );
     if let Some(principal) = principal {
         message = message.with_principal(principal);
+    }
+    if let Some(owner) = request_owner {
+        message = message.with_request_owner(owner);
     }
     bus.publish(AstridEvent::Ipc {
         message,
@@ -287,9 +301,29 @@ async fn local_socket_consent_ignores_cross_principal_and_unstamped_responses() 
             let IpcPayload::ApprovalRequired { request_id, .. } = &message.payload else {
                 continue;
             };
-            publish_consent_reply(&bus, request_id, Some("bob"), "approve_session");
-            publish_consent_reply(&bus, request_id, None, "approve_session");
-            publish_consent_reply(&bus, request_id, Some("alice"), "approve_session");
+            let owner = message.request_owner.expect("request owner");
+            publish_consent_reply(
+                &bus,
+                request_id,
+                Some("bob"),
+                Some(owner),
+                "approve_session",
+            );
+            publish_consent_reply(
+                &bus,
+                request_id,
+                Some("alice"),
+                Some(astrid_events::ipc::RequestOwnerId::generate()),
+                "approve_session",
+            );
+            publish_consent_reply(&bus, request_id, None, Some(owner), "approve_session");
+            publish_consent_reply(
+                &bus,
+                request_id,
+                Some("alice"),
+                Some(owner),
+                "approve_session",
+            );
             return;
         }
     });
