@@ -477,10 +477,7 @@ mod tests {
         let issued = std::str::from_utf8(&issued).expect("issued claim utf8");
         let tampered_issued =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("0{issued}"));
-        let tampered = format!(
-            "{}.{tampered_issued}.{}.{}",
-            parts[0], parts[2], parts[3]
-        );
+        let tampered = format!("{}.{tampered_issued}.{}.{}", parts[0], parts[2], parts[3]);
 
         assert!(
             verify_bearer(&state, &tampered).is_err(),
