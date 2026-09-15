@@ -109,6 +109,15 @@ fn validate_released_entry(path: &Path, metadata: &fs::Metadata, device: u64) ->
                 ),
             ));
         }
+        if metadata.is_file() && metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "legacy source file has multiple hard links: {}",
+                    path.display()
+                ),
+            ));
+        }
         astrid_core::platform_fs::validate_no_extended_acl(path)?;
         validate_released_mode(path, metadata)?;
     }
@@ -229,6 +238,31 @@ mod tests {
             fs::metadata(&private).unwrap().permissions().mode() & 0o777,
             0o775,
             "validation failure must precede root permission repair"
+        );
+    }
+
+    #[test]
+    fn permission_repair_rejects_hard_links_before_mutating_shared_inode() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let outside = root.path().join("outside");
+        fs::write(&outside, b"shared").expect("outside file");
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o664)).expect("outside mode");
+        let source = root.path().join("state");
+        fs::create_dir(&source).expect("source tree");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o775)).expect("source mode");
+        fs::hard_link(&outside, source.join("linked")).expect("hard link");
+
+        let error = tighten_owner_controlled_path(&source).expect_err("hard link must fail closed");
+        assert!(error.to_string().contains("multiple hard links"), "{error}");
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+            0o775,
+            "validation must finish before the parent is repaired"
+        );
+        assert_eq!(
+            fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o664,
+            "the shared inode outside the migration tree must remain unchanged"
         );
     }
 }
