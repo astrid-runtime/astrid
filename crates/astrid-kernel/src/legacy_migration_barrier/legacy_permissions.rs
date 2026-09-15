@@ -45,18 +45,43 @@ pub(super) fn tighten_private_path(path: &Path) -> io::Result<()> {
     };
     astrid_core::platform_fs::verify_no_redirects(path)?;
     let device = device_id(&metadata);
+    validate_released_tree(path, device)?;
     tighten_private_entry(path, device)
 }
 
 fn tighten_private_entry(path: &Path, device: u64) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
+    validate_released_entry(path, &metadata, device)?;
+    if metadata.is_dir() {
+        astrid_core::platform_fs::ensure_private_directory(path)?;
+        for entry in fs::read_dir(path)? {
+            tighten_private_entry(&entry?.path(), device)?;
+        }
+    } else {
+        astrid_core::platform_fs::restrict_private_file(path)?;
+    }
+    Ok(())
+}
+
+fn validate_released_tree(path: &Path, device: u64) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    validate_released_entry(path, &metadata, device)?;
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            validate_released_tree(&entry?.path(), device)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_released_entry(path: &Path, metadata: &fs::Metadata, device: u64) -> io::Result<()> {
     if metadata.file_type().is_symlink() || (!metadata.is_dir() && !metadata.is_file()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("legacy source contains a special entry: {}", path.display()),
         ));
     }
-    if device_id(&metadata) != device {
+    if device_id(metadata) != device {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -85,15 +110,7 @@ fn tighten_private_entry(path: &Path, device: u64) -> io::Result<()> {
             ));
         }
         astrid_core::platform_fs::validate_no_extended_acl(path)?;
-        validate_released_mode(path, &metadata)?;
-    }
-    if metadata.is_dir() {
-        astrid_core::platform_fs::ensure_private_directory(path)?;
-        for entry in fs::read_dir(path)? {
-            tighten_private_entry(&entry?.path(), device)?;
-        }
-    } else {
-        astrid_core::platform_fs::restrict_private_file(path)?;
+        validate_released_mode(path, metadata)?;
     }
     Ok(())
 }
@@ -112,6 +129,7 @@ pub(super) fn tighten_owner_controlled_path(path: &Path) -> io::Result<()> {
     };
     astrid_core::platform_fs::verify_no_redirects(path)?;
     let device = device_id(&metadata);
+    validate_released_tree(path, device)?;
     tighten_owner_controlled_entry(path, device)
 }
 
@@ -195,46 +213,33 @@ mod tests {
         );
         assert_eq!(fs::read(&controlled).unwrap(), b"state");
     }
+
+    #[test]
+    fn permission_repair_validates_the_complete_tree_before_mutation() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let private = root.path().join("secrets");
+        fs::create_dir(&private).expect("private source");
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o775)).expect("0775 root");
+        let unsafe_child = private.join("unsafe");
+        fs::write(&unsafe_child, b"untrusted").expect("unsafe child");
+        fs::set_permissions(&unsafe_child, fs::Permissions::from_mode(0o666)).expect("0666 child");
+
+        tighten_private_path(&private).expect_err("nested 0666 mode must fail closed");
+        assert_eq!(
+            fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o775,
+            "validation failure must precede root permission repair"
+        );
+    }
 }
 
 fn tighten_owner_controlled_entry(path: &Path, device: u64) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || (!metadata.is_dir() && !metadata.is_file()) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("legacy source contains a special entry: {}", path.display()),
-        ));
-    }
-    if device_id(&metadata) != device {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "legacy source crosses a device boundary: {}",
-                path.display()
-            ),
-        ));
-    }
-    if active_mountpoint(path)? {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("legacy source is an active mount: {}", path.display()),
-        ));
-    }
+    validate_released_entry(path, &metadata, device)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        use std::os::unix::fs::PermissionsExt as _;
 
-        if metadata.uid() != nix::unistd::getuid().as_raw() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "legacy source entry is not owned by the current user: {}",
-                    path.display()
-                ),
-            ));
-        }
-        astrid_core::platform_fs::validate_no_extended_acl(path)?;
-        validate_released_mode(path, &metadata)?;
         let mode = metadata.permissions().mode();
         if mode & 0o022 != 0 {
             let mut permissions = metadata.permissions();
