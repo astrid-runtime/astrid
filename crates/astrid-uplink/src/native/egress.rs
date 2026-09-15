@@ -3,7 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
-use astrid_events::ipc::RequestOwnerId;
+use astrid_events::ipc::{IpcMessage, RequestOwnerId, Topic};
 use astrid_events::{AstridEvent, EventBus};
 
 use super::{CLIENT_EGRESS_CAPACITY, EVENT_SOURCE, MAX_PAYLOAD_BYTES, event_topic, routing};
@@ -13,6 +13,24 @@ const CLIENT_EGRESS_BYTE_BUDGET: usize = 4 * MAX_PAYLOAD_BYTES;
 struct QueuedEvent {
     event: Arc<AstridEvent>,
     bytes: usize,
+}
+
+fn request_owner_allows(message: &IpcMessage, client_owner: RequestOwnerId) -> bool {
+    if message.topic == Topic::approval_request() {
+        let expected_owner = client_owner.to_string();
+        return match &message.payload {
+            astrid_types::ipc::IpcPayload::ApprovalRequired { request_owner, .. }
+            | astrid_types::ipc::IpcPayload::GrantRequired { request_owner, .. } => {
+                message.source_id == uuid::Uuid::nil()
+                    && message.request_owner == Some(client_owner)
+                    && request_owner.as_str() == expected_owner.as_str()
+            },
+            _ => false,
+        };
+    }
+    message
+        .request_owner
+        .is_none_or(|owner| owner == client_owner)
 }
 
 #[derive(Default)]
@@ -120,22 +138,8 @@ impl Registry {
                 if turn_key.is_some() && turn_owner != Some(*id) {
                     continue;
                 }
-                match &message.payload {
-                    astrid_types::ipc::IpcPayload::ApprovalRequired { request_owner, .. }
-                    | astrid_types::ipc::IpcPayload::GrantRequired { request_owner, .. }
-                        if message.source_id != uuid::Uuid::nil()
-                            || message.request_owner != Some(client.request_owner)
-                            || request_owner != &client.request_owner.to_string() =>
-                    {
-                        continue;
-                    },
-                    _ if message
-                        .request_owner
-                        .is_some_and(|owner| owner != client.request_owner) =>
-                    {
-                        continue;
-                    },
-                    _ => {},
+                if !request_owner_allows(message, client.request_owner) {
+                    continue;
                 }
                 let session = client
                     .session
@@ -473,6 +477,35 @@ mod tests {
                 .with_request_owner(owner),
             });
         }
+
+        assert!(matches!(client.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn malformed_typed_approval_reaches_no_native_connection() {
+        let bus = Arc::new(EventBus::new());
+        let registry = Registry::install(&bus);
+        let owner = RequestOwnerId::generate();
+        let mut client = registry.subscribe("alice".to_owned(), None, owner);
+
+        bus.publish(AstridEvent::Ipc {
+            metadata: EventMetadata::new("test"),
+            message: IpcMessage::new(
+                Topic::approval_request(),
+                IpcPayload::Custom {
+                    data: serde_json::json!({
+                        "type": "approval_required",
+                        "request_id": "request-1",
+                        "action": "run",
+                        "resource": "command",
+                        "reason": "missing payload owner"
+                    }),
+                },
+                uuid::Uuid::nil(),
+            )
+            .with_principal("alice")
+            .with_request_owner(owner),
+        });
 
         assert!(matches!(client.try_recv(), Err(TryRecvError::Empty)));
     }

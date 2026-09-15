@@ -254,7 +254,7 @@ fn unknown_variant_serializes_as_type_unknown() {
 #[test]
 #[allow(clippy::too_many_lines, reason = "exhaustive variant table")]
 fn is_known_tag_covers_all_variants() {
-    const EXPECTED_VARIANT_COUNT: usize = 19;
+    const EXPECTED_VARIANT_COUNT: usize = 20;
 
     let representatives: Vec<IpcPayload> = vec![
         IpcPayload::RawJson(serde_json::json!({"key": "val"})),
@@ -336,6 +336,7 @@ fn is_known_tag_covers_all_variants() {
                 is_error: false,
             },
         },
+        IpcPayload::ToolCancelRequest { call_ids: vec![] },
         IpcPayload::SelectionRequired {
             request_id: String::new(),
             title: String::new(),

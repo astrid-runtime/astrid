@@ -290,11 +290,11 @@ async fn execute(provider: &str, verb: &str, args: &[String]) -> Result<ExitCode
                 );
                 return Ok(ExitCode::from(1));
             },
-            Err(_) => {
+            Err(error) => {
                 eprintln!(
                     "{}",
                     Theme::error(&format!(
-                        "Capsule '{provider}' did not respond within {RESULT_TIMEOUT_SECS}s."
+                        "Capsule '{provider}' command failed while awaiting its response: {error:#}"
                     ))
                 );
                 return Ok(ExitCode::from(1));

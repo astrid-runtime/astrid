@@ -239,6 +239,18 @@ fn handle_grant_response(
     let Some(entry) = pending.get(request_id) else {
         return;
     };
+    if entry.deadline <= astrid_runtime::time::Instant::now() {
+        let expired = pending
+            .remove(request_id)
+            .expect("expired pending grant disappeared after immutable lookup");
+        warn!(
+            security_event = true,
+            principal = %expired.principal,
+            capsule = %expired.capsule_id,
+            "grant-on-use: late consent response rejected after timeout"
+        );
+        return;
+    }
     if message.principal.as_deref() != Some(entry.principal.as_str()) {
         warn!(
             security_event = true,

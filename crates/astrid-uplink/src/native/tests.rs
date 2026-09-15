@@ -19,6 +19,29 @@ fn egress_event(principal: &str, payload_bytes: usize) -> AstridEvent {
 }
 
 #[test]
+fn native_wire_frame_preserves_request_owner() {
+    let owner = astrid_types::ipc::RequestOwnerId::generate();
+    let message = IpcMessage::new(
+        Topic::grant_result("request-1"),
+        IpcPayload::GrantResult {
+            request_id: "request-1".to_owned(),
+            request_owner: owner.to_string(),
+            principal: "alice".to_owned(),
+            capsule_id: "capsule".to_owned(),
+            granted: true,
+        },
+        Uuid::nil(),
+    )
+    .with_principal("alice")
+    .with_request_owner(owner);
+
+    let frame = message_frame(&message).expect("serialize native frame");
+    assert_eq!(frame["request_owner"], owner.to_string());
+    assert_eq!(frame["principal"], "alice");
+    assert_eq!(frame["payload"]["request_owner"], owner.to_string());
+}
+
+#[test]
 fn general_connection_limit_does_not_consume_the_admin_reserve() {
     let established = Arc::new(tokio::sync::Semaphore::new(1));
     let reserved = Arc::new(tokio::sync::Semaphore::new(1));

@@ -391,7 +391,8 @@ run_adversarial_capsule_smoke() {
     cat "$approval_out" >&2 2>/dev/null || true
     fail "native approval request did not remain pending without its owning responder"
   fi
-  printf 'n\n' > "$approval_out.input"
+  printf 'n\n' > "$approval_out.input.tmp"
+  mv "$approval_out.input.tmp" "$approval_out.input"
   local approval_rc=0
   wait "$cli_pid" || approval_rc=$?
   if [[ "$approval_rc" -eq 124 ]]; then
