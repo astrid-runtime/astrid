@@ -6,6 +6,28 @@ use std::path::Path;
 
 use super::host_fs::{active_mountpoint, device_id};
 
+#[cfg(unix)]
+fn validate_released_mode(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mode = metadata.permissions().mode() & 0o7777;
+    let supported = if metadata.is_dir() {
+        matches!(mode, 0o700 | 0o750 | 0o755 | 0o770 | 0o775)
+    } else {
+        matches!(mode, 0o600 | 0o640 | 0o644 | 0o660 | 0o664)
+    };
+    if !supported {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "legacy source entry has unsupported mode {mode:04o}: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Tighten one released strict-private migration source to `0700`/`0600`.
 ///
 /// Layout one created some security-sensitive sources through ordinary
@@ -63,6 +85,7 @@ fn tighten_private_entry(path: &Path, device: u64) -> io::Result<()> {
             ));
         }
         astrid_core::platform_fs::validate_no_extended_acl(path)?;
+        validate_released_mode(path, &metadata)?;
     }
     if metadata.is_dir() {
         astrid_core::platform_fs::ensure_private_directory(path)?;
@@ -142,6 +165,36 @@ mod tests {
         );
         assert_eq!(fs::read(&outside).unwrap(), b"outside");
     }
+
+    #[test]
+    fn permission_repair_rejects_world_writable_and_unexpected_modes() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let private = root.path().join("secrets");
+        fs::create_dir(&private).expect("private source");
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o777))
+            .expect("world-writable private source");
+
+        let error = tighten_private_path(&private).expect_err("0777 must fail closed");
+        assert!(
+            error.to_string().contains("unsupported mode 0777"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+
+        let controlled = root.path().join("state.db");
+        fs::write(&controlled, b"state").expect("owner-controlled source");
+        fs::set_permissions(&controlled, fs::Permissions::from_mode(0o611))
+            .expect("unexpected source mode");
+        let error = tighten_owner_controlled_path(&controlled).expect_err("0611 must fail closed");
+        assert!(
+            error.to_string().contains("unsupported mode 0611"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&controlled).unwrap(), b"state");
+    }
 }
 
 fn tighten_owner_controlled_entry(path: &Path, device: u64) -> io::Result<()> {
@@ -181,6 +234,7 @@ fn tighten_owner_controlled_entry(path: &Path, device: u64) -> io::Result<()> {
             ));
         }
         astrid_core::platform_fs::validate_no_extended_acl(path)?;
+        validate_released_mode(path, &metadata)?;
         let mode = metadata.permissions().mode();
         if mode & 0o022 != 0 {
             let mut permissions = metadata.permissions();
