@@ -166,6 +166,11 @@ fn rate_limit_max(req: &KernelRequest, limits: &RateLimitsConfig) -> Option<u32>
         | KernelRequest::RemoveCapsule { .. }
         | KernelRequest::PromoteWorkspace { .. }
         | KernelRequest::RollbackWorkspace { .. } => Some(limits.capsule_reload_per_min),
+        KernelRequest::BeginCapsuleInstallBatch { .. } => Some(2),
+        // Completion reopens and verifies every declared durable package. Four
+        // attempts leave room for transient client retries without exposing an
+        // unbounded 64-member verification loop on the management router.
+        KernelRequest::FinishCapsuleInstallBatch { .. } => Some(4),
         KernelRequest::InstallCapsule { .. } | KernelRequest::ApproveCapability { .. } => Some(10),
         KernelRequest::Shutdown { .. } => Some(1),
         KernelRequest::ListCapsules

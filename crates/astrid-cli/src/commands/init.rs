@@ -725,8 +725,11 @@ async fn install_capsules_with_resume(
     principal: &astrid_core::PrincipalId,
     pinned_refs: Option<&HashMap<String, String>>,
 ) -> anyhow::Result<InstallCapsulesResult> {
-    super::capsule::install_daemon::reset_batch_install_budget();
     refuse_offline_network_sources(selected, offline)?;
+    let batch_id = super::capsule::install::begin_verified_local_batch(selected, principal).await?;
+    if batch_id.is_none() {
+        super::capsule::install_daemon::reset_batch_install_budget();
+    }
 
     let total = selected.len();
     let pb = ProgressBar::new(total as u64);
@@ -763,6 +766,7 @@ async fn install_capsules_with_resume(
                 false,
                 &refspec,
                 principal,
+                batch_id,
             )
             .await
             {
@@ -814,6 +818,10 @@ async fn install_capsules_with_resume(
     }
 
     pb.finish_and_clear();
+
+    if failed.is_empty() {
+        super::capsule::install::finish_verified_local_batch(batch_id, principal).await?;
+    }
 
     if failed.is_empty() {
         eprintln!("  Installed {total} capsule(s).");

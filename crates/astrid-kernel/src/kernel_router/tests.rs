@@ -211,6 +211,29 @@ fn rate_limit_for_request_returns_correct_limits() {
 
     let (_, shutdown) = rate_limit_for_request(&KernelRequest::Shutdown { reason: None });
     assert_eq!(shutdown, Some(1));
+
+    let (_, begin) = rate_limit_for_request(&KernelRequest::BeginCapsuleInstallBatch {
+        target_principal: None,
+        members: Vec::new(),
+    });
+    assert_eq!(begin, Some(2));
+
+    let (_, install) = rate_limit_for_request(&KernelRequest::InstallCapsule {
+        source: "demo.capsule".into(),
+        workspace: false,
+        target_principal: None,
+        provenance: None,
+        authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
+        env: Vec::new(),
+        batch: None,
+    });
+    assert_eq!(install, Some(10), "ordinary installs retain their limit");
+
+    let (_, finish) = rate_limit_for_request(&KernelRequest::FinishCapsuleInstallBatch {
+        batch_id: astrid_core::kernel_api::CapsuleInstallBatchId::new(),
+        target_principal: None,
+    });
+    assert_eq!(finish, Some(4));
 }
 
 // ── Capability mapping (issue #670) ──────────────────────────────
@@ -259,6 +282,7 @@ fn required_capability_mapping_per_variant_self_scope() {
                 provenance: None,
                 authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
                 env: Vec::new(),
+                batch: None,
             },
             AuthorityScope::Self_
         ),
@@ -347,6 +371,7 @@ fn required_capability_mapping_global_scope() {
                 provenance: None,
                 authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
                 env: Vec::new(),
+                batch: None,
             },
             AuthorityScope::Global
         ),
@@ -402,6 +427,7 @@ fn resolve_scope_requires_global_authority_only_for_cross_principal_install() {
         provenance: None,
         authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
         env: Vec::new(),
+        batch: None,
     };
     assert_eq!(resolve_scope(&self_install, &caller), AuthorityScope::Self_);
     let cross_install = KernelRequest::InstallCapsule {
@@ -411,9 +437,23 @@ fn resolve_scope_requires_global_authority_only_for_cross_principal_install() {
         provenance: None,
         authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
         env: Vec::new(),
+        batch: None,
     };
     assert_eq!(
         resolve_scope(&cross_install, &caller),
+        AuthorityScope::Global
+    );
+    let cross_batch = KernelRequest::BeginCapsuleInstallBatch {
+        target_principal: Some(PrincipalId::new("bob").unwrap()),
+        members: Vec::new(),
+    };
+    assert_eq!(resolve_scope(&cross_batch, &caller), AuthorityScope::Global);
+    let cross_finish = KernelRequest::FinishCapsuleInstallBatch {
+        batch_id: astrid_core::kernel_api::CapsuleInstallBatchId::new(),
+        target_principal: Some(PrincipalId::new("bob").unwrap()),
+    };
+    assert_eq!(
+        resolve_scope(&cross_finish, &caller),
         AuthorityScope::Global
     );
     for req in [self_install, cross_install] {
@@ -495,6 +535,7 @@ fn resolve_scope_treats_workspace_capsule_install_as_self() {
                 provenance: None,
                 authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
                 env: Vec::new(),
+                batch: None,
             },
             &caller,
         ),

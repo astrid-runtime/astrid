@@ -63,6 +63,7 @@ fn all_requests() -> Vec<KernelRequest> {
             provenance: None,
             authority: CapsuleInstallAuthority::default(),
             env: Vec::new(),
+            batch: None,
         },
         KernelRequest::ListCapsules,
         KernelRequest::GetCommands,
@@ -140,6 +141,7 @@ fn agent_group_allows_self_scoped_capsule_surface() {
             provenance: None,
             authority: CapsuleInstallAuthority::default(),
             env: Vec::new(),
+            batch: None,
         },
         KernelRequest::ReloadCapsule {
             id: "astrid-capsule-registry".to_string(),
@@ -172,6 +174,7 @@ fn agent_group_allows_self_scoped_capsule_surface() {
                 provenance: None,
                 authority: CapsuleInstallAuthority::default(),
                 env: Vec::new(),
+                batch: None,
             }
         )
         .is_err(),
@@ -310,6 +313,7 @@ fn custom_group_capabilities_gate_admin_surface() {
             provenance: None,
             authority: CapsuleInstallAuthority::default(),
             env: Vec::new(),
+            batch: None,
         },
     )
     .unwrap();
@@ -327,7 +331,8 @@ fn custom_group_capabilities_gate_admin_surface() {
                 target_principal: None,
                 provenance: None,
                 authority: CapsuleInstallAuthority::default(),
-                env: Vec::new()
+                env: Vec::new(),
+                batch: None,
             }
         )
         .is_err()
@@ -344,6 +349,7 @@ fn custom_group_capabilities_gate_admin_surface() {
             provenance: None,
             authority: CapsuleInstallAuthority::default(),
             env: Vec::new(),
+            batch: None,
         },
     )
     .unwrap();
@@ -390,6 +396,7 @@ fn admin_vs_agent_cross_tenant_matrix() {
         provenance: None,
         authority: CapsuleInstallAuthority::default(),
         env: Vec::new(),
+        batch: None,
     };
     assert!(
         authorize(&agent, &groups, &agent_principal(), &cross_target_install,).is_err(),

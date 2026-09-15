@@ -20,10 +20,14 @@ use astrid_storage::RuntimePrincipalStore;
 use serde::{Deserialize, Serialize};
 
 use crate::paths::resolve_target_dir_for_in_workspace;
+mod archive_bytes;
 mod leftover;
 #[cfg(windows)]
 mod runtime_identity;
 mod status;
+pub use archive_bytes::{
+    inspect_archive_bytes_for_principal_in_workspace, read_archive_manifest_bytes,
+};
 pub(crate) use leftover::{
     parse_legacy_authority_receipt, quarantine_legacy_authority_receipt,
     rebind_relocated_legacy_authority_receipt, retire_unmatched_authority_receipt_file,
@@ -102,11 +106,7 @@ pub struct InstallInspection {
 /// performed by the artifact reader and manifest validation by discovery.
 pub fn read_archive_manifest(archive_path: &Path) -> anyhow::Result<CapsuleManifest> {
     let manifest_text = artifact::read_archive_text(archive_path, "Capsule.toml")?;
-    let staged = tempfile::tempdir().context("failed to stage capsule manifest")?;
-    let manifest_path = staged.path().join("Capsule.toml");
-    std::fs::write(&manifest_path, manifest_text)?;
-    astrid_capsule::discovery::load_manifest(&manifest_path)
-        .context("failed to validate capsule manifest")
+    archive_bytes::parse_archive_manifest(&manifest_text)
 }
 
 /// How a successfully-installed authority snapshot was accepted.

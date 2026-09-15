@@ -15,10 +15,12 @@ mod install;
 mod projection_names;
 mod readiness;
 mod response_types;
+mod status;
 pub use agent::{AgentDeriveKernelRequest, AgentDeriveRequest};
 pub use capsule_metadata::CapsuleEnvOptionsFromMetadata;
 pub use install::{
-    CapsuleInstallAuthority, CapsuleInstallEnv, CapsuleInstallProvenance,
+    CAPSULE_INSTALL_BATCH_PROTOCOL_V1, CapsuleInstallAuthority, CapsuleInstallBatchContext,
+    CapsuleInstallBatchId, CapsuleInstallBatchMember, CapsuleInstallEnv, CapsuleInstallProvenance,
     CapsuleInstallResumeReceipt, EnvEntry, EnvStorageScope, EnvValueKind,
     InstalledCapsuleGeneration, InstalledCapsuleIdentity,
 };
@@ -33,6 +35,7 @@ pub use response_types::{
     DistroCapsuleProvenance, DistroProvenance, GroupSummary, InviteIssued, InviteRedeemed,
     InviteSummary, PairTokenIssued, PairTokenRedeemed, ResourceUsage,
 };
+pub use status::{DaemonStatus, PrincipalConnectionCount};
 
 use crate::PrincipalId;
 use crate::profile::Quotas;
@@ -51,6 +54,14 @@ pub const SYSTEM_SESSION_UUID: &str = "00000000-0000-0000-0000-000000000000";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum KernelRequest {
+    /// Open a short lease for an exact set of local capsule archives.
+    BeginCapsuleInstallBatch {
+        /// Optional durable principal target. Absent means the caller.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_principal: Option<PrincipalId>,
+        /// Fixed capsule identities admitted by this lease.
+        members: Vec<CapsuleInstallBatchMember>,
+    },
     /// Request to install a capsule from a local or remote path.
     InstallCapsule {
         /// The path or URL to the `.capsule` archive.
@@ -76,6 +87,17 @@ pub enum KernelRequest {
         /// kernel's environment limits.
         #[serde(default)]
         env: Vec<CapsuleInstallEnv>,
+        /// Optional bounded request-frequency lease; never grants authority.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch: Option<CapsuleInstallBatchContext>,
+    },
+    /// Close a batch after every declared member is durably complete.
+    FinishCapsuleInstallBatch {
+        /// Kernel-issued lease identifier.
+        batch_id: CapsuleInstallBatchId,
+        /// Optional lease target; absent means the caller.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_principal: Option<PrincipalId>,
     },
     /// Read the authenticated caller's complete durable package identity.
     ///
@@ -191,6 +213,13 @@ pub enum KernelResponse {
     /// Caller-scoped durable capsule-install resume receipt, or `None` when absent
     /// or when the stored bytes are malformed and therefore not completion proof.
     CapsuleInstallResumeReceipt(Option<CapsuleInstallResumeReceipt>),
+    /// A bounded capsule-install batch lease was opened.
+    CapsuleInstallBatchStarted {
+        /// Kernel-issued lease identifier.
+        batch_id: CapsuleInstallBatchId,
+        /// Remaining lease lifetime at issue time.
+        expires_in_secs: u64,
+    },
     /// The request failed.
     Error(String),
     /// Daemon status information.
@@ -219,40 +248,6 @@ pub enum KernelResponse {
     /// A stray late `Working` that races out after the terminal response is
     /// harmless: the uplink skips it and returns the already-received terminal.
     Working,
-}
-
-/// Daemon runtime status information.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DaemonStatus {
-    /// Process ID of the daemon.
-    pub pid: u32,
-    /// Daemon uptime in seconds.
-    pub uptime_secs: u64,
-    /// Daemon version string.
-    pub version: String,
-    /// Whether the daemon is running in ephemeral mode.
-    pub ephemeral: bool,
-    /// Number of currently connected clients.
-    pub connected_clients: u32,
-    /// Per-principal breakdown of `connected_clients`. Each entry is
-    /// `(principal, count)`; the sum equals `connected_clients`. Empty
-    /// on daemons that don't yet expose per-principal connection
-    /// attribution (older builds, or when no clients are connected).
-    /// Used by `astrid who` to show who is actually on the daemon
-    /// rather than the bare count.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub connections_by_principal: Vec<PrincipalConnectionCount>,
-    /// Names of loaded capsules.
-    pub loaded_capsules: Vec<String>,
-}
-
-/// Per-principal connection count entry on [`DaemonStatus`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrincipalConnectionCount {
-    /// The principal (agent) holding the connections.
-    pub principal: String,
-    /// Number of active connections owned by this principal.
-    pub count: u32,
 }
 
 /// Metadata entry for a loaded capsule.
