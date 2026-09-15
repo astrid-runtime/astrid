@@ -28,9 +28,15 @@ fn env_def(field: CapsuleEnvMetadata) -> EnvDef {
     }
 }
 
-async fn installed_env_schemas() -> anyhow::Result<HashMap<String, HashMap<String, EnvDef>>> {
+async fn installed_env_schemas(
+    principal: &PrincipalId,
+) -> anyhow::Result<HashMap<String, HashMap<String, EnvDef>>> {
     let mut client = crate::socket_client::connect_kernel_for_workspace(None).await?;
-    let response = client.request(KernelRequest::GetCapsuleMetadata).await?;
+    let response = client
+        .request(KernelRequest::GetCapsuleMetadataForPrincipal {
+            target_principal: principal.clone(),
+        })
+        .await?;
     let entries = match response {
         KernelResponse::CapsuleMetadata(entries) => entries,
         KernelResponse::Error(error) => anyhow::bail!("daemon metadata lookup failed: {error}"),
@@ -58,7 +64,7 @@ pub(super) async fn onboard_llm_providers(
     principal: &PrincipalId,
     selected: &[DistroCapsule],
 ) {
-    let schemas = match installed_env_schemas().await {
+    let schemas = match installed_env_schemas(principal).await {
         Ok(schemas) => schemas,
         Err(error) => {
             eprintln!("  Skipping provider onboarding: {error}");

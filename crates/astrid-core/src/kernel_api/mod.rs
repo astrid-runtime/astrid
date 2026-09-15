@@ -155,6 +155,14 @@ pub enum KernelRequest {
     /// Request metadata about loaded capsules (manifests, providers, interceptors).
     /// The kernel's equivalent of `/proc` — exposing process table info.
     GetCapsuleMetadata,
+    /// Request metadata for one explicitly selected principal.
+    ///
+    /// Selecting another principal requires global `capsule:list` authority;
+    /// the authenticated caller remains the audited actor.
+    GetCapsuleMetadataForPrincipal {
+        /// Principal whose durable and live capsule registry is inspected.
+        target_principal: PrincipalId,
+    },
     /// Request the daemon to shut down gracefully.
     Shutdown {
         /// Optional reason for shutdown.

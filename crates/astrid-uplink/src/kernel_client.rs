@@ -184,6 +184,7 @@ pub const fn topic_suffix(req: &KernelRequest) -> &'static str {
         KernelRequest::RollbackWorkspace { .. } => "rollback_workspace",
         KernelRequest::GetCommands => "get_commands",
         KernelRequest::GetCapsuleMetadata => "metadata",
+        KernelRequest::GetCapsuleMetadataForPrincipal { .. } => "principal_metadata",
         KernelRequest::GetAgentReadiness => "agent_readiness",
         KernelRequest::Shutdown { .. } => "shutdown",
         KernelRequest::GetStatus => "status",
@@ -486,6 +487,12 @@ mod tests {
         assert_eq!(topic_suffix(&KernelRequest::ListCapsules), "list_capsules");
         assert_eq!(topic_suffix(&KernelRequest::GetCommands), "get_commands");
         assert_eq!(topic_suffix(&KernelRequest::GetCapsuleMetadata), "metadata");
+        assert_eq!(
+            topic_suffix(&KernelRequest::GetCapsuleMetadataForPrincipal {
+                target_principal: PrincipalId::new("bob").unwrap(),
+            }),
+            "principal_metadata"
+        );
         assert_eq!(
             topic_suffix(&KernelRequest::GetInstalledCapsuleIdentity { id: "demo".into() }),
             "installed_capsule_identity"

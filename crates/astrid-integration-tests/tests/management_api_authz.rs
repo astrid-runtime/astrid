@@ -67,6 +67,9 @@ fn all_requests() -> Vec<KernelRequest> {
         KernelRequest::ListCapsules,
         KernelRequest::GetCommands,
         KernelRequest::GetCapsuleMetadata,
+        KernelRequest::GetCapsuleMetadataForPrincipal {
+            target_principal: PrincipalId::default(),
+        },
         KernelRequest::ApproveCapability {
             request_id: "r".to_string(),
             signature: "s".to_string(),

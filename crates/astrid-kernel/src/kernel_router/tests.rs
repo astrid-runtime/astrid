@@ -374,7 +374,10 @@ fn required_capability_mapping_global_scope() {
 fn resolve_scope_defaults_to_self_for_caller_owned_lifecycle() {
     let caller = PrincipalId::new("alice").unwrap();
     for req in all_kernel_request_variants() {
-        if matches!(req, KernelRequest::ReloadCapsules) {
+        if matches!(
+            req,
+            KernelRequest::ReloadCapsules | KernelRequest::GetCapsuleMetadataForPrincipal { .. }
+        ) {
             continue;
         }
         assert_eq!(
@@ -431,6 +434,34 @@ fn resolve_scope_requires_global_authority_only_for_cross_principal_install() {
             "full-daemon lifecycle should be global for {req:?}"
         );
     }
+}
+
+#[test]
+fn cross_principal_metadata_requires_global_authority() {
+    let caller = PrincipalId::new("alice").unwrap();
+    let self_metadata = KernelRequest::GetCapsuleMetadataForPrincipal {
+        target_principal: caller.clone(),
+    };
+    assert_eq!(
+        resolve_scope(&self_metadata, &caller),
+        AuthorityScope::Self_
+    );
+
+    let cross_metadata = KernelRequest::GetCapsuleMetadataForPrincipal {
+        target_principal: PrincipalId::new("bob").unwrap(),
+    };
+    assert_eq!(
+        resolve_scope(&cross_metadata, &caller),
+        AuthorityScope::Global
+    );
+    assert_eq!(
+        request_target_principal(&cross_metadata, &caller),
+        Some(PrincipalId::new("bob").unwrap())
+    );
+    assert_eq!(
+        required_capability(&cross_metadata, AuthorityScope::Global),
+        "capsule:list"
+    );
 }
 
 #[test]
@@ -1094,6 +1125,39 @@ async fn capsule_visibility_precomputes_admin_and_capsule_grants() {
     assert!(global_lister_visibility.allows(&default_only));
     assert!(limited_visibility.allows(&allowed));
     assert!(!limited_visibility.allows(&default_only));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn targeted_metadata_never_collapses_another_principals_registry() {
+    let (_dir, kernel) = kernel_with_inventory_capsules().await;
+    let admin = PrincipalId::new("metadata-admin").expect("valid principal");
+    let bob = PrincipalId::new("bob").expect("valid principal");
+    let carol = PrincipalId::new("carol").expect("valid principal");
+    seed_profile(
+        &kernel,
+        &admin,
+        &PrincipalProfile {
+            grants: vec!["capsule:list".to_string()],
+            ..Default::default()
+        },
+    );
+    seed_capsule_inventory_profile(&kernel, &bob, &["bob-provider"]).await;
+    seed_capsule_inventory_profile(&kernel, &carol, &["carol-provider"]).await;
+
+    let response = request_kernel(
+        &kernel,
+        &admin,
+        "bob_targeted_metadata",
+        KernelRequest::GetCapsuleMetadataForPrincipal {
+            target_principal: bob,
+        },
+    )
+    .await;
+    let KernelResponse::CapsuleMetadata(entries) = response else {
+        panic!("expected targeted metadata response, got {response:?}");
+    };
+    let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
+    assert_eq!(names, ["bob-provider"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
