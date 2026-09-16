@@ -728,6 +728,52 @@ impl RuntimePrincipalStore {
             .map(|removed| removed != 0)
     }
 
+    /// Remove one capsule's guest KV namespace for an admitted principal.
+    ///
+    /// This is deliberately narrower than [`Self::purge_principal_kv`]: it
+    /// preserves every peer capsule and every other principal. Host-only env
+    /// and secret control namespaces are separate and remain the caller's
+    /// responsibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the principal or capsule namespace is
+    /// invalid, or when the authoritative mutation cannot be committed.
+    pub async fn purge_capsule_kv(
+        &self,
+        principal: &PrincipalId,
+        capsule: &str,
+    ) -> StorageResult<u64> {
+        let principal_uid = self.principals.uid_for(principal)?;
+        self.purge_capsule_kv_for_owner(principal_uid, principal, capsule)
+            .await
+    }
+
+    /// Remove one capsule's guest KV namespace from an immutable principal
+    /// owner without resolving the mutable alias again.
+    ///
+    /// `alias` is the namespace label captured with `principal`. Lifecycle
+    /// callers use this after pinning the alias-to-UID binding, so alias reuse
+    /// cannot redirect deletion into a replacement principal's owner root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the namespace is invalid or the
+    /// authoritative mutation cannot be committed.
+    pub async fn purge_capsule_kv_for_owner(
+        &self,
+        principal: PrincipalUid,
+        alias: &PrincipalId,
+        capsule: &str,
+    ) -> StorageResult<u64> {
+        self.runtime_kv
+            .clear_namespace_for_owner(
+                &StateOwner::Principal(principal),
+                &format!("{alias}:capsule:{capsule}"),
+            )
+            .await
+    }
+
     /// Inspect one owner's exact catalog names under a target-volume policy.
     ///
     /// This is a read-only diagnostic. It never mutates the principal root or

@@ -68,6 +68,27 @@ fn command_info_default_kind_omitted_from_wire() {
 }
 
 #[test]
+fn older_remove_capsule_request_defaults_to_state_preserving_removal() {
+    let request: KernelRequest = serde_json::from_value(serde_json::json!({
+        "method": "RemoveCapsule",
+        "params": {
+            "id": "codewall-protocol",
+            "force": false
+        }
+    }))
+    .expect("pre-purge remove request remains decodable");
+
+    assert!(matches!(
+        request,
+        KernelRequest::RemoveCapsule {
+            id,
+            force: false,
+            purge: false
+        } if id == "codewall-protocol"
+    ));
+}
+
+#[test]
 fn installed_identity_wire_is_purpose_specific_and_roundtrips() {
     let identity = InstalledCapsuleIdentity {
         id: "demo".into(),

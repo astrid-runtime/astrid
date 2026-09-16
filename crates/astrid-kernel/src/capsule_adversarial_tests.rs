@@ -531,6 +531,85 @@ async fn materialized_authority_bytes_are_exactly_verified() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn purged_removal_erases_only_the_callers_capsule_kv_and_is_retryable() {
+    let (_home_temp, home) = scratch_home();
+    let kernel = crate::test_kernel_with_home(home.clone()).await;
+    let principal = PrincipalId::default();
+    let _peer = seed_isolated_principal(&kernel, &home, "peer", [31; 32]).await;
+    let source = tempfile::tempdir().unwrap();
+    write_component_source(source.path(), "codewall-protocol", None);
+    publish_without_running_lifecycle(&kernel, &principal, source.path()).unwrap();
+
+    let store = kernel.principal_store.as_ref().unwrap();
+    for (namespace, value) in [
+        ("default:capsule:codewall-protocol", b"enrolment".as_slice()),
+        ("default:capsule:notes", b"keep-default".as_slice()),
+        ("peer:capsule:codewall-protocol", b"keep-peer".as_slice()),
+    ] {
+        store
+            .kv()
+            .set(namespace, "state", value.to_vec())
+            .await
+            .unwrap();
+    }
+
+    let id = CapsuleId::new("codewall-protocol").unwrap();
+    assert!(
+        kernel
+            .remove_one_capsule(&id, &principal, false)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .kv()
+            .get("default:capsule:codewall-protocol", "state")
+            .await
+            .unwrap(),
+        Some(b"enrolment".to_vec()),
+        "ordinary removal must preserve state for a later reinstall"
+    );
+
+    assert!(
+        kernel
+            .remove_one_capsule(&id, &principal, true)
+            .await
+            .unwrap(),
+        "purge must remain retryable after package removal"
+    );
+    assert!(
+        store
+            .kv()
+            .get("default:capsule:codewall-protocol", "state")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .kv()
+            .get("default:capsule:notes", "state")
+            .await
+            .unwrap(),
+        Some(b"keep-default".to_vec())
+    );
+    assert_eq!(
+        store
+            .kv()
+            .get("peer:capsule:codewall-protocol", "state")
+            .await
+            .unwrap(),
+        Some(b"keep-peer".to_vec())
+    );
+
+    assert!(
+        kernel
+            .durable_principal_capsule_paths(&principal)
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn materialized_wit_bytes_are_exactly_verified() {
     let (_home_temp, home) = scratch_home();
     let kernel = crate::test_kernel_with_home(home.clone()).await;

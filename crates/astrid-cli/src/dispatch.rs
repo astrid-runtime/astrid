@@ -445,6 +445,7 @@ async fn dispatch_capsule_remove(
         .request(astrid_core::kernel_api::KernelRequest::RemoveCapsule {
             id: name.clone(),
             force,
+            purge,
         })
         .await?
     {
