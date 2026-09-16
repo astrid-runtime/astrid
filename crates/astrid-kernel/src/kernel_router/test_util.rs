@@ -11,6 +11,10 @@ pub(crate) fn all_kernel_request_variants() -> Vec<KernelRequest> {
         KernelRequest::UnloadCapsule { id: "x".into() },
         KernelRequest::PromoteWorkspace { id: "x".into() },
         KernelRequest::RollbackWorkspace { id: "x".into() },
+        KernelRequest::BeginCapsuleInstallBatch {
+            target_principal: None,
+            members: Vec::new(),
+        },
         KernelRequest::InstallCapsule {
             source: "x".into(),
             workspace: false,
@@ -18,6 +22,11 @@ pub(crate) fn all_kernel_request_variants() -> Vec<KernelRequest> {
             provenance: None,
             authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
             env: Vec::new(),
+            batch: None,
+        },
+        KernelRequest::FinishCapsuleInstallBatch {
+            batch_id: astrid_core::kernel_api::CapsuleInstallBatchId::new(),
+            target_principal: None,
         },
         KernelRequest::GetInstalledCapsuleIdentity { id: "x".into() },
         KernelRequest::GetCapsuleInstallResumeReceipt { id: "x".into() },

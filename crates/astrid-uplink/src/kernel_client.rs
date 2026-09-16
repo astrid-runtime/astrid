@@ -168,7 +168,9 @@ impl KernelClientError {
 #[must_use]
 pub const fn topic_suffix(req: &KernelRequest) -> &'static str {
     match req {
+        KernelRequest::BeginCapsuleInstallBatch { .. } => "begin_capsule_install_batch",
         KernelRequest::InstallCapsule { .. } => "install_capsule",
+        KernelRequest::FinishCapsuleInstallBatch { .. } => "finish_capsule_install_batch",
         KernelRequest::GetInstalledCapsuleIdentity { .. } => "installed_capsule_identity",
         KernelRequest::GetCapsuleInstallResumeReceipt { .. } => "capsule_install_resume_receipt",
         KernelRequest::PutCapsuleInstallResumeReceipt { .. } => {

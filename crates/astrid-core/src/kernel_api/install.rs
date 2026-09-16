@@ -2,6 +2,60 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Highest capsule-install batch protocol revision supported by this build.
+pub const CAPSULE_INSTALL_BATCH_PROTOCOL_V1: u16 = 1;
+use uuid::Uuid;
+
+/// Opaque kernel-issued identifier for one bounded capsule-install batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CapsuleInstallBatchId(Uuid);
+
+impl CapsuleInstallBatchId {
+    /// Mint a fresh unpredictable batch identifier.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for CapsuleInstallBatchId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for CapsuleInstallBatchId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// One exact local archive admitted into a bounded install batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapsuleInstallBatchMember {
+    /// Canonical capsule identifier.
+    pub id: String,
+    /// Exact manifest version expected from the archive.
+    pub version: String,
+    /// Canonical `blake3:<64 lowercase hex>` digest of the archive bytes.
+    pub source_digest: String,
+    /// Canonical `blake3:<64 lowercase hex>` digest of the normalized archive
+    /// that must become the durable package.
+    pub archive_digest: String,
+    /// Exact compressed archive size.
+    pub source_bytes: u64,
+}
+
+/// Lease reference carried by one ordinary capsule install request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapsuleInstallBatchContext {
+    /// Kernel-issued lease identifier.
+    pub batch_id: CapsuleInstallBatchId,
+    /// Declared member this request attempts to install.
+    pub member_id: String,
+}
+
 /// Immutable object generation for one durable installed-capsule package.
 ///
 /// Each field is a lowercase BLAKE3 object identifier rendered as 64 hex
@@ -134,4 +188,22 @@ pub struct CapsuleInstallEnv {
     pub value: String,
     /// Secret or non-secret projection.
     pub kind: EnvValueKind,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::KernelRequest;
+
+    #[test]
+    fn install_request_without_batch_remains_decodable() {
+        let request: KernelRequest = serde_json::from_value(serde_json::json!({
+            "method": "InstallCapsule",
+            "params": { "source": "demo.capsule", "workspace": false }
+        }))
+        .expect("pre-batch request");
+        assert!(matches!(
+            request,
+            KernelRequest::InstallCapsule { batch: None, .. }
+        ));
+    }
 }

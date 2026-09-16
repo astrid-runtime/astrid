@@ -78,7 +78,8 @@ pub mod wasm;
 pub mod wit;
 
 pub use archive::{
-    unpack_and_install, unpack_and_install_authorized_for_principal_in_workspace,
+    unpack_and_install, unpack_and_install_authorized_bytes_for_principal_in_workspace,
+    unpack_and_install_authorized_for_principal_in_workspace,
     unpack_and_install_authorized_for_principal_with_layout,
     unpack_and_install_checked_authorized_for_principal_in_workspace,
     unpack_and_install_checked_authorized_for_principal_with_layout,
@@ -88,10 +89,12 @@ pub use archive::{
 };
 pub use authority::{
     ArtifactProvenance, AuthorityDecision, AuthoritySource, InstallInspection, InstalledAuthority,
-    LegacyAuthorityReceiptStatus, authorize_install, inspect_archive_for_principal_in_workspace,
+    LegacyAuthorityReceiptStatus, authorize_install,
+    inspect_archive_bytes_for_principal_in_workspace, inspect_archive_for_principal_in_workspace,
     inspect_archive_for_principal_with_layout, inspect_directory_for_principal_in_workspace,
-    inspect_directory_for_principal_with_layout, read_archive_manifest, read_installed_authority,
-    remove_installed_authority, verify_installed_authority,
+    inspect_directory_for_principal_with_layout, read_archive_manifest,
+    read_archive_manifest_bytes, read_installed_authority, remove_installed_authority,
+    verify_installed_authority,
 };
 pub use authority_store::verify_installed_authority_with_store;
 #[cfg(test)]
@@ -133,7 +136,7 @@ pub use paths::{
 pub use principal_introspection::{
     DurableCapsuleIntrospection, list_durable_capsule_packages, read_durable_capsule_package,
 };
-pub use source_digest::archive_digest_for_source;
+pub use source_digest::{archive_digest_for_source, source_digest_for_archive};
 pub use storage::{
     LegacyCapsuleAuthorityReceipt, LegacyCapsuleMigrationReport, LegacyEnvSecretImportStatus,
     VerifiedDurableCapsulePackage, canonical_capsule_archive, legacy_capsule_authority_status,

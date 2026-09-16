@@ -7,6 +7,7 @@
 //! tempdir or have the runtime read from a location of the
 //! attacker's choice.
 
+use std::io::{Cursor, Read};
 use std::path::Path;
 
 use anyhow::{Context, bail};
@@ -17,7 +18,7 @@ use astrid_core::PrincipalId;
 
 use crate::authority::{
     AuthorityDecision, InstalledAuthority, authorize_install,
-    inspect_archive_for_principal_in_workspace,
+    inspect_archive_bytes_for_principal_in_workspace, inspect_archive_for_principal_in_workspace,
 };
 use crate::local::{
     ExpectedCapsuleIdentity, InstallOptions, InstallOutput, InstallWorkspace,
@@ -242,6 +243,50 @@ pub fn unpack_and_install_authorized_for_principal_in_workspace(
     )
 }
 
+/// Install immutable capsule archive bytes after enforcing a digest-bound
+/// authority decision.
+///
+/// This variant keeps the caller-selected source pinned in memory through
+/// verification and archive extraction, so no pathname is reopened between
+/// the two stages.
+///
+/// # Errors
+///
+/// Returns an error for invalid provenance, an unaccepted artifact, unsafe
+/// archive content, or any ordinary installation failure.
+#[allow(clippy::too_many_arguments)]
+pub fn unpack_and_install_authorized_bytes_for_principal_in_workspace(
+    archive: &[u8],
+    home: &AstridHome,
+    options: InstallOptions,
+    target_principal: &PrincipalId,
+    workspace_root: Option<&Path>,
+    decision: &AuthorityDecision,
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<InstallOutput> {
+    let inspection = inspect_archive_bytes_for_principal_in_workspace(
+        archive,
+        home,
+        target_principal,
+        options.workspace,
+        workspace_root,
+        workspace_layout,
+    )?;
+    let authority = authorize_install(&inspection, decision)?;
+    unpack_and_install_reader_internal(
+        Cursor::new(archive),
+        home,
+        options,
+        target_principal,
+        InstallWorkspace {
+            root: workspace_root,
+            layout: workspace_layout,
+        },
+        None,
+        Some(authority),
+    )
+}
+
 /// Checked-identity variant of
 /// [`unpack_and_install_authorized_for_principal_with_layout`].
 ///
@@ -341,13 +386,32 @@ fn unpack_and_install_internal(
     expected: Option<ExpectedCapsuleIdentity<'_>>,
     installed_authority: Option<InstalledAuthority>,
 ) -> anyhow::Result<InstallOutput> {
+    let tar_gz = std::fs::File::open(archive_path)
+        .with_context(|| format!("Failed to open archive: {}", archive_path.display()))?;
+    unpack_and_install_reader_internal(
+        tar_gz,
+        home,
+        options,
+        target_principal,
+        workspace,
+        expected,
+        installed_authority,
+    )
+}
+
+fn unpack_and_install_reader_internal(
+    archive_reader: impl Read,
+    home: &AstridHome,
+    options: InstallOptions,
+    target_principal: &PrincipalId,
+    workspace: InstallWorkspace<'_>,
+    expected: Option<ExpectedCapsuleIdentity<'_>>,
+    installed_authority: Option<InstalledAuthority>,
+) -> anyhow::Result<InstallOutput> {
     let tmp_dir = tempfile::tempdir().context("failed to create temp dir for unpacking")?;
     let unpack_dir = tmp_dir.path();
 
-    let tar_gz = std::fs::File::open(archive_path)
-        .with_context(|| format!("Failed to open archive: {}", archive_path.display()))?;
-
-    let tar = flate2::read::GzDecoder::new(tar_gz);
+    let tar = flate2::read::GzDecoder::new(archive_reader);
     let mut archive = tar::Archive::new(tar);
 
     for entry in archive

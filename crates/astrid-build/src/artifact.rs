@@ -209,7 +209,21 @@ pub fn verify_directory(source_dir: &Path) -> anyhow::Result<ArtifactVerificatio
 pub fn read_archive_text(archive_path: &Path, requested: &str) -> anyhow::Result<String> {
     let file = File::open(archive_path)
         .with_context(|| format!("failed to open {}", archive_path.display()))?;
-    let mut archive = tar::Archive::new(GzDecoder::new(file));
+    read_archive_text_reader(file, requested)
+}
+
+/// Read one regular UTF-8 file from capsule archive bytes.
+///
+/// # Errors
+///
+/// Fails when the archive is malformed, contains duplicate matching entries,
+/// or the requested entry is absent or not UTF-8.
+pub fn read_archive_text_bytes(archive: &[u8], requested: &str) -> anyhow::Result<String> {
+    read_archive_text_reader(Cursor::new(archive), requested)
+}
+
+fn read_archive_text_reader(reader: impl Read, requested: &str) -> anyhow::Result<String> {
+    let mut archive = tar::Archive::new(GzDecoder::new(reader));
     let mut found = None;
     for entry in archive
         .entries()

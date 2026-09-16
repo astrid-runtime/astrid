@@ -17,9 +17,10 @@ use astrid_capsule::capsule::CapsuleId;
 use astrid_capsule::manifest::CapsuleManifest;
 use astrid_core::PrincipalId;
 use astrid_core::kernel_api::{
-    AdminRequestKind, AdminResponseBody, CapsuleInstallAuthority, CapsuleInstallEnv,
-    CapsuleInstallProvenance, CapsuleInstallResumeReceipt, EnvStorageScope, EnvValueKind,
-    InstalledCapsuleGeneration, InstalledCapsuleIdentity, KernelRequest, KernelResponse,
+    AdminRequestKind, AdminResponseBody, CapsuleInstallAuthority, CapsuleInstallBatchContext,
+    CapsuleInstallEnv, CapsuleInstallProvenance, CapsuleInstallResumeReceipt, EnvStorageScope,
+    EnvValueKind, InstalledCapsuleGeneration, InstalledCapsuleIdentity, KernelRequest,
+    KernelResponse,
 };
 
 use super::install::ManualInstallOptions;
@@ -67,15 +68,16 @@ struct DaemonEnvValue {
 pub(super) async fn install_local_via_daemon_outcome(
     source: &str,
     prompt: &ManualInstallOptions,
+    target: &PrincipalId,
     authority: CapsuleInstallAuthority,
+    batch: Option<CapsuleInstallBatchContext>,
 ) -> anyhow::Result<InstalledCapsuleOutcome> {
-    let principal = crate::principal::current();
     crate::commands::daemon::ensure_persistent_daemon("capsule install")
         .await
         .context("capsule install could not ensure the runtime daemon")?;
     let manifest = load_source_manifest(source)?;
     let capsule_id = CapsuleId::new(manifest.package.name.clone())?;
-    let existing_keys = list_existing_keys(&principal, capsule_id.as_str()).await?;
+    let existing_keys = list_existing_keys(target, capsule_id.as_str()).await?;
     let vars = if super::install::BATCH_MODE.load(std::sync::atomic::Ordering::Relaxed) {
         prompt
             .vars
@@ -92,7 +94,8 @@ pub(super) async fn install_local_via_daemon_outcome(
             &astrid_core::dirs::AstridHome::resolve()?.config_path(),
         )?
     };
-    install_local_via_daemon_for_target(source, &vars, &principal, None, authority).await
+    install_local_via_daemon_for_target_in_batch(source, &vars, target, None, authority, batch)
+        .await
 }
 
 async fn list_existing_keys(
@@ -123,8 +126,20 @@ pub(crate) async fn install_local_via_daemon_for_target(
     provenance: Option<CapsuleInstallProvenance>,
     authority: CapsuleInstallAuthority,
 ) -> anyhow::Result<InstalledCapsuleOutcome> {
+    install_local_via_daemon_for_target_in_batch(source, vars, target, provenance, authority, None)
+        .await
+}
+
+async fn install_local_via_daemon_for_target_in_batch(
+    source: &str,
+    vars: &[String],
+    target: &PrincipalId,
+    provenance: Option<CapsuleInstallProvenance>,
+    authority: CapsuleInstallAuthority,
+    batch: Option<CapsuleInstallBatchContext>,
+) -> anyhow::Result<InstalledCapsuleOutcome> {
     install_local_via_daemon_for_target_with_generation(
-        source, vars, target, provenance, authority, None,
+        source, vars, target, provenance, authority, None, batch,
     )
     .await
 }
@@ -140,6 +155,7 @@ pub(crate) async fn install_local_via_daemon_for_target_with_generation(
     provenance: Option<CapsuleInstallProvenance>,
     authority: CapsuleInstallAuthority,
     expected_generation: Option<InstalledCapsuleGeneration>,
+    batch: Option<CapsuleInstallBatchContext>,
 ) -> anyhow::Result<InstalledCapsuleOutcome> {
     crate::commands::daemon::ensure_persistent_daemon("capsule install")
         .await
@@ -195,7 +211,11 @@ pub(crate) async fn install_local_via_daemon_for_target_with_generation(
             }
         }
     }
-    if super::install::BATCH_MODE.load(Ordering::Relaxed) && !reserve_batch_install_request() {
+    let provenance = bind_batch_provenance(source, &capsule_id, provenance, batch.as_ref())?;
+    if batch.is_none()
+        && super::install::BATCH_MODE.load(Ordering::Relaxed)
+        && !reserve_batch_install_request()
+    {
         return Err(BatchInstallBudgetExhausted.into());
     }
     let response = client
@@ -213,6 +233,7 @@ pub(crate) async fn install_local_via_daemon_for_target_with_generation(
                     kind: value.kind,
                 })
                 .collect(),
+            batch,
         })
         .await?;
     match response {
@@ -246,6 +267,39 @@ pub(crate) async fn install_local_via_daemon_for_target_with_generation(
         KernelResponse::Error(message) => bail!("daemon rejected capsule install: {message}"),
         other => bail!("unexpected daemon response: {other:?}"),
     }
+}
+
+fn bind_batch_provenance(
+    source: &str,
+    capsule_id: &CapsuleId,
+    provenance: Option<CapsuleInstallProvenance>,
+    batch: Option<&CapsuleInstallBatchContext>,
+) -> anyhow::Result<Option<CapsuleInstallProvenance>> {
+    let Some(context) = batch else {
+        return Ok(provenance);
+    };
+    let source_path = source.strip_prefix("file://").unwrap_or(source);
+    let digest = format!(
+        "blake3:{}",
+        astrid_capsule_install::source_digest_for_archive(std::path::Path::new(source_path))
+            .with_context(|| format!("digest batch source {source_path}"))?
+    );
+    let mut provenance = provenance.unwrap_or(CapsuleInstallProvenance {
+        distro: None,
+        source_digest: None,
+    });
+    if let Some(existing) = provenance.source_digest.as_deref() {
+        anyhow::ensure!(
+            existing == digest,
+            "batch source digest conflicts with provenance"
+        );
+    }
+    anyhow::ensure!(
+        context.member_id == capsule_id.as_str(),
+        "batch context member does not match source capsule"
+    );
+    provenance.source_digest = Some(digest);
+    Ok(Some(provenance))
 }
 
 fn resume_generation_from_receipt(
@@ -658,25 +712,44 @@ mod tests {
     }
 
     #[test]
-    fn twenty_two_member_distro_resumes_without_reissuing_completed() {
-        let mut completed = [false; 22];
-        let mut sent_per_pass = Vec::new();
-        for _ in 0..3 {
-            reset_batch_install_budget();
-            let mut sent = 0;
-            for member in &mut completed {
-                if *member {
-                    continue;
-                }
-                if !reserve_batch_install_request() {
-                    break;
-                }
-                *member = true;
-                sent += 1;
-            }
-            sent_per_pass.push(sent);
-        }
-        assert_eq!(sent_per_pass, [10, 10, 2]);
-        assert!(completed.into_iter().all(|done| done));
+    fn batch_provenance_binds_exact_source_and_member() {
+        let package = tempfile::tempdir().expect("package");
+        std::fs::write(
+            package.path().join("Capsule.toml"),
+            b"[package]\nname='example'\nversion='1.0.0'\n",
+        )
+        .expect("manifest");
+        let source = tempfile::NamedTempFile::new().expect("source");
+        let archive = astrid_capsule_install::canonical_capsule_archive(package.path())
+            .expect("canonical archive");
+        std::fs::write(source.path(), archive).expect("archive bytes");
+        let id = CapsuleId::new("example").expect("capsule id");
+        let context = CapsuleInstallBatchContext {
+            batch_id: astrid_core::kernel_api::CapsuleInstallBatchId::new(),
+            member_id: id.to_string(),
+        };
+        let provenance =
+            bind_batch_provenance(source.path().to_str().unwrap(), &id, None, Some(&context))
+                .expect("batch provenance")
+                .expect("bound provenance");
+        assert_eq!(
+            provenance.source_digest,
+            Some(format!(
+                "blake3:{}",
+                astrid_capsule_install::source_digest_for_archive(source.path())
+                    .expect("source digest")
+            ))
+        );
+
+        let wrong = CapsuleInstallBatchContext {
+            member_id: "other".to_owned(),
+            ..context
+        };
+        assert!(
+            bind_batch_provenance(source.path().to_str().unwrap(), &id, None, Some(&wrong),)
+                .unwrap_err()
+                .to_string()
+                .contains("member does not match")
+        );
     }
 }
