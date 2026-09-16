@@ -13,6 +13,7 @@ use crate::engine::wasm::host_state::HostState;
 use astrid_approval::action::SensitiveAction;
 use astrid_approval::{Allowance, AllowanceId, AllowancePattern, AllowanceStore};
 use astrid_core::principal::PrincipalId;
+use astrid_core::profile::CommandApprovalLocation;
 use astrid_core::types::Timestamp;
 use astrid_crypto::KeyPair;
 use astrid_events::AstridEvent;
@@ -58,6 +59,85 @@ fn check_allowance(
     store
         .find_matching_and_consume(principal, &action, workspace_root)
         .is_some()
+}
+
+/// Reuse the saved command family with the same principal/workspace matching
+/// contract as an in-memory allowance. Do not import it into the session store:
+/// the profile cache remains the single source for durable approvals.
+fn check_persisted_allowance(
+    state: &HostState,
+    principal: &PrincipalId,
+    resource: &str,
+) -> Result<bool, ErrorCode> {
+    let Some(cache) = &state.profile_cache else {
+        return Ok(false);
+    };
+    let profile = cache.resolve(principal).map_err(|error| {
+        tracing::warn!(%error, "Cannot load durable action approvals");
+        ErrorCode::StoreUnavailable
+    })?;
+    if !profile.enabled {
+        return Ok(false);
+    }
+    let action = SensitiveAction::ExecuteCommand {
+        command: resource.to_owned(),
+        args: vec![],
+    };
+    Ok(profile.approvals.command_always.iter().any(|grant| {
+        if grant.location != approval_location(state) {
+            return false;
+        }
+        if let Some(workspace) = &grant.workspace_root
+            && std::path::Path::new(workspace) != state.workspace_root
+        {
+            return false;
+        }
+        let pattern = AllowancePattern::CommandPattern {
+            command: format!("{} *", escape_glob_metacharacters(&grant.command)),
+        };
+        pattern.matches(&action, Some(&state.workspace_root))
+    }))
+}
+
+fn approval_location(state: &HostState) -> CommandApprovalLocation {
+    use crate::engine::wasm::host_state::PrincipalMountLocation;
+    if state
+        .effective_workspace()
+        .is_some_and(|mount| matches!(mount.location, PrincipalMountLocation::AstridFilesystem))
+    {
+        CommandApprovalLocation::AstridWorkspace
+    } else {
+        CommandApprovalLocation::Hosted
+    }
+}
+
+/// An Always response is truthful only after its profile write succeeds.
+/// Failed persistence is an error, not a silently downgraded approval.
+fn persist_always(
+    state: &HostState,
+    principal: &PrincipalId,
+    action: &str,
+) -> Result<(), ErrorCode> {
+    let cache = state
+        .profile_cache
+        .as_ref()
+        .ok_or(ErrorCode::StoreUnavailable)?;
+    let persisted = match approval_location(state) {
+        CommandApprovalLocation::AstridWorkspace => {
+            cache.persist_astrid_command_always(principal, action)
+        },
+        CommandApprovalLocation::Hosted => {
+            let workspace = state
+                .workspace_root
+                .to_str()
+                .ok_or(ErrorCode::InvalidInput)?;
+            cache.persist_command_always(principal, action, Some(workspace))
+        },
+    };
+    persisted.map_err(|error| {
+        tracing::warn!(%error, "Cannot persist Always approval");
+        ErrorCode::StoreUnavailable
+    })
 }
 
 /// Sanitize a guest-supplied display field in place.
@@ -288,6 +368,12 @@ impl approval::Host for HostState {
 
         let ws_path = Some(workspace_root.as_path());
 
+        if check_persisted_allowance(self, &principal, &request.target_resource)? {
+            return Ok(ApprovalResponse {
+                decision: ApprovalDecision::Allowance,
+            });
+        }
+
         // Fast path: check existing allowances.
         if let Some(ref store) = allowance_store
             && check_allowance(store, &principal, &request.target_resource, ws_path)
@@ -383,6 +469,9 @@ impl approval::Host for HostState {
                         IpcPayload::ApprovalResponse {
                             decision, reason, ..
                         } => {
+                            if decision == "approve_always" {
+                                persist_always(self, &principal, &request.action)?;
+                            }
                             let typed = decision_from_str(decision);
                             let approved = matches!(
                                 typed,
@@ -391,8 +480,12 @@ impl approval::Host for HostState {
                                     | ApprovalDecision::ApprovedAlways
                             );
 
-                            // Create allowance for session/always decisions.
-                            if approved && let Some(ref store) = allowance_store {
+                            // Persistent choices were saved above; keep temporary
+                            // allowances in the session store only.
+                            if approved
+                                && decision != "approve_always"
+                                && let Some(ref store) = allowance_store
+                            {
                                 create_allowance_from_decision(
                                     store,
                                     &principal,

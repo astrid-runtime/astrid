@@ -1,5 +1,195 @@
 use super::*;
 
+fn persistent_test_state(home: &std::path::Path) -> HostState {
+    let mut state =
+        crate::engine::wasm::test_fixtures::minimal_host_state(tokio::runtime::Handle::current());
+    state.profile_cache = Some(std::sync::Arc::new(
+        crate::profile_cache::PrincipalProfileCache::with_home(
+            astrid_core::dirs::AstridHome::from_path(home),
+        ),
+    ));
+    state.workspace_root = home.join("workspace");
+    state
+}
+
+async fn answer_action_request(
+    mut state: HostState,
+    decision: &'static str,
+) -> Result<ApprovalResponse, ErrorCode> {
+    let bus = state.event_bus.clone();
+    let receiver = bus.subscribe_topic(Topic::approval_request().as_str());
+    let task = tokio::task::spawn_blocking(move || {
+        approval::Host::request_approval(
+            &mut state,
+            approval_request("git push", "git push origin main"),
+        )
+    });
+    let (id, principal) = await_approval_request(receiver).await;
+    publish_approval_reply(&bus, &id, principal.as_deref(), decision);
+    task.await.expect("host task")
+}
+
+#[tokio::test]
+async fn always_survives_fresh_host_cache_and_store() {
+    let home = tempfile::tempdir().unwrap();
+    let result = answer_action_request(persistent_test_state(home.path()), "approve_always")
+        .await
+        .unwrap();
+    assert_eq!(result.decision, ApprovalDecision::ApprovedAlways);
+
+    let mut fresh = persistent_test_state(home.path());
+    assert!(
+        check_persisted_allowance(&fresh, &PrincipalId::default(), "git push origin other")
+            .unwrap()
+    );
+    // A completely new host/cache/store must finish without an approval responder.
+    let response = tokio::task::spawn_blocking(move || {
+        approval::Host::request_approval(
+            &mut fresh,
+            approval_request("git push", "git push origin main"),
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.decision, ApprovalDecision::Allowance);
+
+    let mut other_workspace = persistent_test_state(home.path());
+    other_workspace.workspace_root = home.path().join("other");
+    assert!(
+        !check_persisted_allowance(
+            &other_workspace,
+            &PrincipalId::default(),
+            "git push origin main"
+        )
+        .unwrap()
+    );
+    let other = PrincipalId::new("other").unwrap();
+    let astrid_home = astrid_core::dirs::AstridHome::from_path(home.path());
+    astrid_core::profile::PrincipalProfile::default()
+        .save_to_path(&astrid_home.profile_path(&other))
+        .unwrap();
+    assert!(!check_persisted_allowance(&other_workspace, &other, "git push origin main").unwrap());
+    assert!(
+        !check_persisted_allowance(
+            &persistent_test_state(home.path()),
+            &PrincipalId::default(),
+            "git pull origin main"
+        )
+        .unwrap()
+    );
+}
+
+fn native_workspace_test_state(home: &std::path::Path) -> HostState {
+    use crate::engine::wasm::host_state::{PrincipalMount, PrincipalMountLocation};
+    let mut state = persistent_test_state(home);
+    state.workspace_root.clear();
+    state.workspace = Some(PrincipalMount {
+        location: PrincipalMountLocation::AstridFilesystem,
+        vfs: state.vfs.clone(),
+        handle: state.vfs_root_handle.clone(),
+    });
+    state
+}
+
+#[tokio::test]
+async fn native_workspace_always_persists_without_a_host_path() {
+    let home = tempfile::tempdir().unwrap();
+    let response =
+        answer_action_request(native_workspace_test_state(home.path()), "approve_always")
+            .await
+            .unwrap();
+    assert_eq!(response.decision, ApprovalDecision::ApprovedAlways);
+    let native = native_workspace_test_state(home.path());
+    assert!(
+        check_persisted_allowance(&native, &PrincipalId::default(), "git push origin main")
+            .unwrap()
+    );
+    let hosted = persistent_test_state(home.path());
+    assert!(
+        !check_persisted_allowance(&hosted, &PrincipalId::default(), "git push origin main")
+            .unwrap()
+    );
+    let mut empty_hosted = persistent_test_state(home.path());
+    empty_hosted.workspace_root.clear();
+    assert!(
+        !check_persisted_allowance(
+            &empty_hosted,
+            &PrincipalId::default(),
+            "git push origin main"
+        )
+        .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn hosted_approval_does_not_authorize_native_workspace() {
+    let home = tempfile::tempdir().unwrap();
+    answer_action_request(persistent_test_state(home.path()), "approve_always")
+        .await
+        .unwrap();
+    assert!(
+        !check_persisted_allowance(
+            &native_workspace_test_state(home.path()),
+            &PrincipalId::default(),
+            "git push origin main"
+        )
+        .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn once_and_session_are_not_saved_as_always() {
+    for decision in ["approve", "approve_session"] {
+        let home = tempfile::tempdir().unwrap();
+        answer_action_request(persistent_test_state(home.path()), decision)
+            .await
+            .unwrap();
+        assert!(
+            !check_persisted_allowance(
+                &persistent_test_state(home.path()),
+                &PrincipalId::default(),
+                "git push origin main"
+            )
+            .unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn always_without_persistence_never_reports_success() {
+    let state =
+        crate::engine::wasm::test_fixtures::minimal_host_state(tokio::runtime::Handle::current());
+    assert!(matches!(
+        answer_action_request(state, "approve_always").await,
+        Err(ErrorCode::StoreUnavailable)
+    ));
+}
+
+#[tokio::test]
+async fn failed_profile_write_never_reports_always() {
+    let home = tempfile::tempdir().unwrap();
+    let mut state = persistent_test_state(home.path());
+    let bus = state.event_bus.clone();
+    let receiver = bus.subscribe_topic(Topic::approval_request().as_str());
+    let task = tokio::task::spawn_blocking(move || {
+        approval::Host::request_approval(
+            &mut state,
+            approval_request("git push", "git push origin main"),
+        )
+    });
+    let (id, principal) = await_approval_request(receiver).await;
+    // Make the destination unwritable after the initial profile lookup and
+    // before the operator decision. This drives the real host failure path.
+    let root = astrid_core::dirs::AstridHome::from_path(home.path());
+    std::fs::create_dir_all(root.profile_path(&PrincipalId::default())).unwrap();
+    publish_approval_reply(&bus, &id, principal.as_deref(), "approve_always");
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(ErrorCode::StoreUnavailable)
+    ));
+}
+
 #[test]
 fn check_allowance_matches_command_pattern() {
     let store = AllowanceStore::new();
