@@ -15,9 +15,16 @@ use uuid::Uuid;
 /// Maximum timeout for interactive elicitation (120 seconds).
 const MAX_ELICIT_TIMEOUT_MS: u64 = 120_000;
 
+#[path = "elicit/private_secret.rs"]
+mod private_secret;
+
 /// Map the typed [`ElicitRequest`] into the `OnboardingField` schema
 /// used by the IPC layer and TUI.
 fn map_to_onboarding_field(req: &ElicitRequest) -> Result<OnboardingField, ErrorCode> {
+    // A secret or array default would be copied into the public request schema.
+    if matches!(req.kind, ElicitType::Secret | ElicitType::Array) && req.default_value.is_some() {
+        return Err(ErrorCode::InvalidInput);
+    }
     let field_type = match req.kind {
         ElicitType::Text => OnboardingFieldType::Text,
         ElicitType::Secret => OnboardingFieldType::Secret,
@@ -27,6 +34,13 @@ fn map_to_onboarding_field(req: &ElicitRequest) -> Result<OnboardingField, Error
                 .as_ref()
                 .filter(|o| !o.is_empty())
                 .ok_or(ErrorCode::InvalidInput)?;
+            if req
+                .default_value
+                .as_ref()
+                .is_some_and(|default| !options.iter().any(|option| option == default))
+            {
+                return Err(ErrorCode::InvalidInput);
+            }
             OnboardingFieldType::Enum(options.clone())
         },
         ElicitType::Array => OnboardingFieldType::Array,
@@ -51,13 +65,14 @@ fn map_to_onboarding_field(req: &ElicitRequest) -> Result<OnboardingField, Error
 }
 
 fn elicit_request_event(
+    topic: Topic,
     request_id: Uuid,
     capsule_id: String,
     field: OnboardingField,
     principal: String,
 ) -> AstridEvent {
     let message = IpcMessage::new(
-        Topic::elicit_request(),
+        topic,
         IpcPayload::ElicitRequest {
             request_id,
             capsule_id,
@@ -163,6 +178,11 @@ impl elicit::Host for HostState {
             .begin_host_operation()
             .map_err(|()| ErrorCode::Cancelled)?;
         let field = map_to_onboarding_field(&request)?;
+        if let Some(registry) = self.secret_elicits.clone()
+            && registry.routes_principal(&self.effective_principal())
+        {
+            return private_secret::collect(self, &request, field, registry);
+        }
         let request_id = Uuid::new_v4();
         let response_topic = Topic::elicit_response(request_id);
 
@@ -189,6 +209,7 @@ impl elicit::Host for HostState {
         // originating principal so request and reply principals are symmetric
         // (and the request is attributable in the audit trail).
         event_bus.publish(elicit_request_event(
+            Topic::elicit_request(),
             request_id,
             capsule_id.clone(),
             field,
@@ -474,6 +495,7 @@ mod tests {
         let request = make_elicit_request(ElicitType::Text, "name", "", None, None);
         let field = map_to_onboarding_field(&request).unwrap();
         let event = elicit_request_event(
+            Topic::elicit_request(),
             request_id,
             "test".to_owned(),
             field,

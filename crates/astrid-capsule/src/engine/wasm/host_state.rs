@@ -423,6 +423,8 @@ pub struct HostState {
     pub invocation_env_overlay: Option<HashMap<String, String>>,
     /// System Event Bus for IPC publish/subscribe.
     pub event_bus: astrid_events::EventBus,
+    /// Private secret replies; unset until an authenticated responder is bound.
+    pub secret_elicits: Option<Arc<crate::elicitation::PendingSecretElicits>>,
     /// Shared generation-publication fence for every routed subscription this
     /// Store creates. Prepared runtimes keep it staged until registry publish.
     pub route_admission_gate: astrid_events::RouteAdmissionGate,

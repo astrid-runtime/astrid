@@ -92,6 +92,7 @@ impl HostState {
             kv_backend,
             kv,
             event_bus,
+            secret_elicits: None,
             route_admission_gate: astrid_events::RouteAdmissionGate::default(),
             ipc_limiter: Arc::new(astrid_events::ipc::IpcRateLimiter::new()),
             config: HashMap::new(),

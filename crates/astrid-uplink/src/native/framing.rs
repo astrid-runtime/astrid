@@ -43,10 +43,10 @@ impl<R: AsyncRead + Unpin> FramedReader<R> {
                 })?;
                 if self.buffered.len() >= frame_len {
                     let message =
-                        serde_json::from_slice(&self.buffered[4..frame_len]).map_err(|error| {
+                        serde_json::from_slice(&self.buffered[4..frame_len]).map_err(|_| {
                             std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
-                                format!("invalid IPC message: {error}"),
+                                "invalid IPC message",
                             )
                         })?;
                     self.buffered.drain(..frame_len);
@@ -121,6 +121,29 @@ mod tests {
         assert_eq!(actual.topic, expected.topic);
         assert_eq!(actual.payload, expected.payload);
         assert_eq!(actual.source_id, expected.source_id);
+    }
+
+    #[tokio::test]
+    async fn malformed_payload_error_does_not_echo_submitted_input() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let message = IpcMessage::new(
+            Topic::from_raw("astrid.v1.private.elicit.reply"),
+            IpcPayload::Connect,
+            Uuid::nil(),
+        );
+        let mut frame = serde_json::to_value(message).unwrap();
+        frame["payload"] = serde_json::json!({
+            "type": "elicit_response", "request_id": Uuid::nil(),
+            "values": "synthetic-secret-in-invalid-array"
+        });
+        let bytes = serde_json::to_vec(&frame).unwrap();
+        writer
+            .write_all(&u32::try_from(bytes.len()).unwrap().to_be_bytes())
+            .await
+            .unwrap();
+        writer.write_all(&bytes).await.unwrap();
+        let error = FramedReader::new(reader).read_message().await.unwrap_err();
+        assert_eq!(error.to_string(), "invalid IPC message");
     }
 
     #[tokio::test]

@@ -17,6 +17,14 @@ pub fn enforce_restrictions(
     baseline: &toml::Value,
     workspace_layer: &toml::Value,
 ) {
+    // A project cannot select the device entrusted with human secret input.
+    block_workspace_override(
+        merged,
+        baseline,
+        workspace_layer,
+        &["native_input"],
+        "native_input",
+    );
     // Budget: can only decrease.
     clamp_max(
         merged,

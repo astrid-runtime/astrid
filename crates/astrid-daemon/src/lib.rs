@@ -15,6 +15,9 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
 
+/// Explicitly bound native secret responder; not enabled by default.
+pub mod native_input;
+
 /// Run the daemon and finalize its durable home after all runtime tasks stop.
 ///
 /// Both binary entry points use this path for API, signal, and idle shutdown.
@@ -304,6 +307,7 @@ async fn run_with_args(args: Args) -> Result<()> {
         kernel.workspace_layout(),
     )
     .map_err(|error| anyhow::anyhow!("Failed to load admitted-home boot policy: {error:#}"))?;
+    let private_inputs = native_input::configure(&kernel, &admitted_config.config)?;
     kernel
         .bind_boot_local_egress(admitted_config.config.security.capsule_local_egress)
         .map_err(|error| anyhow::anyhow!("Failed to bind boot policy: {error}"))?;
@@ -327,14 +331,17 @@ async fn run_with_args(args: Args) -> Result<()> {
     let native_listener = kernel
         .claim_native_uplink_listener()
         .ok_or_else(|| anyhow::anyhow!("native local uplink listener is unavailable"))?;
-    let native_uplink_task = astrid_uplink::native::NativeUplink {
+    let native_uplink = astrid_uplink::native::NativeUplink {
         listener: native_listener,
         session_token: std::sync::Arc::clone(&kernel.session_token),
         home: astrid_home.clone(),
         event_bus: std::sync::Arc::clone(&kernel.event_bus),
         shutdown: kernel.shutdown_tx.subscribe(),
-    }
-    .spawn();
+    };
+    let native_uplink_task = match private_inputs {
+        Some(responder) => native_uplink.spawn_with_private_elicits(responder),
+        None => native_uplink.spawn(),
+    };
 
     // In ephemeral mode, shut down immediately when the last client disconnects.
     if args.ephemeral {

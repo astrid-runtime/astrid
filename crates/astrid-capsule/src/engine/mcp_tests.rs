@@ -136,6 +136,7 @@ mod tests {
             #[cfg(not(target_family = "wasm"))]
             process_storage_mount_broker: None,
             event_bus: bus,
+            secret_elicits: None,
             kv,
             cli_socket_listener: None,
             capsule_registry: None,
@@ -213,6 +214,7 @@ mod tests {
             #[cfg(not(target_family = "wasm"))]
             process_storage_mount_broker: None,
             event_bus: bus,
+            secret_elicits: None,
             kv,
             cli_socket_listener: None,
             capsule_registry: None,
@@ -304,6 +306,7 @@ mod tests {
             #[cfg(not(target_family = "wasm"))]
             process_storage_mount_broker: None,
             event_bus: bus,
+            secret_elicits: None,
             kv,
             cli_socket_listener: None,
             capsule_registry: None,

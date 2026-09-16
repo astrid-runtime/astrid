@@ -1,0 +1,13 @@
+Reject secret defaults before publishing elicitation schemas. Add an opt-in
+private secret reply path that preserves invocation authority checks and stores
+the reply without a general event-bus response or capsule reload. Native
+responders are opt-in through operator-owned per-principal device bindings;
+unselected principals retain their transport. Device pairing remains separate.
+Add a direct authenticated local reply route that never falls back to the event
+bus, and keep submitted data out of malformed-frame diagnostics.
+Separate native-owned secret notifications from legacy elicitation requests so
+native and legacy clients do not both prompt for the same private wait.
+Support text, exact selections and lists on the same private route. Validate
+answers against the pending request before consuming it, distinguish empty
+ordinary input from cancellation, and recheck invocation authority after waiting.
+Recheck the live principal profile before accepting a private secret reply so a revoked or disabled device cannot answer a pending secret on an existing socket.
