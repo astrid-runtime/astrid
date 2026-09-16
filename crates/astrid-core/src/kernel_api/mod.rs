@@ -154,6 +154,12 @@ pub enum KernelRequest {
         /// Force removal even when dependency metadata is unavailable.
         #[serde(default)]
         force: bool,
+        /// Also erase this capsule's principal-scoped guest KV state.
+        ///
+        /// The request remains retryable after the package is gone so an
+        /// interrupted purge can finish without reinstalling the capsule.
+        #[serde(default)]
+        purge: bool,
     },
     /// Promote a capsule's OS-level copy-on-write workspace changes into the
     /// pristine workspace — the gate's "approve" (Fix #2). For a non-git

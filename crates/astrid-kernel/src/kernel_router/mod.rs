@@ -525,21 +525,23 @@ async fn handle_request(
                 Err(e) => KernelResponse::Error(format!("invalid capsule id '{id}': {e}")),
             }
         },
-        KernelRequest::RemoveCapsule { id, force: _ } => {
-            match astrid_capsule::capsule::CapsuleId::new(id.clone()) {
-                Ok(cap_id) => match kernel.remove_one_capsule(&cap_id, &caller).await {
-                    Ok(true) => KernelResponse::Success(
-                        serde_json::json!({"status": "removed", "capsule": id}),
-                    ),
-                    Ok(false) => KernelResponse::Error(format!(
-                        "capsule '{id}' is not installed for principal '{caller}'"
-                    )),
-                    Err(error) => {
-                        KernelResponse::Error(format!("remove of capsule '{id}' failed: {error}"))
-                    },
+        KernelRequest::RemoveCapsule {
+            id,
+            force: _,
+            purge,
+        } => match astrid_capsule::capsule::CapsuleId::new(id.clone()) {
+            Ok(cap_id) => match kernel.remove_one_capsule(&cap_id, &caller, purge).await {
+                Ok(true) => {
+                    KernelResponse::Success(serde_json::json!({"status": "removed", "capsule": id}))
                 },
-                Err(error) => KernelResponse::Error(format!("invalid capsule id '{id}': {error}")),
-            }
+                Ok(false) => KernelResponse::Error(format!(
+                    "capsule '{id}' is not installed for principal '{caller}'"
+                )),
+                Err(error) => {
+                    KernelResponse::Error(format!("remove of capsule '{id}' failed: {error}"))
+                },
+            },
+            Err(error) => KernelResponse::Error(format!("invalid capsule id '{id}': {error}")),
         },
         KernelRequest::PromoteWorkspace { id } => {
             workspace_commit_response(kernel, &caller, &id, true).await

@@ -430,7 +430,7 @@ pub(crate) enum CapsuleCommands {
         /// Force removal even if other capsules depend on it
         #[arg(long)]
         force: bool,
-        /// Also delete saved configuration (API keys, env vars)
+        /// Also delete saved configuration and secrets; principal installs also erase capsule KV
         #[arg(long)]
         purge: bool,
     },

@@ -73,3 +73,117 @@ async fn principal_kv_purge_removes_orphan_namespaces_without_touching_peers() {
         Some(b"bob".to_vec())
     );
 }
+
+#[tokio::test]
+async fn capsule_kv_purge_removes_only_the_selected_principal_capsule() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let alice = PrincipalId::new("alice").unwrap();
+    let bob = PrincipalId::new("bob").unwrap();
+    create_principal(&store, alice.as_str());
+    create_principal(&store, bob.as_str());
+
+    for (namespace, value) in [
+        ("alice:capsule:codewall-protocol", b"credential".as_slice()),
+        ("alice:capsule:notes", b"keep-alice".as_slice()),
+        ("bob:capsule:codewall-protocol", b"keep-bob".as_slice()),
+    ] {
+        store
+            .kv()
+            .set(namespace, "state", value.to_vec())
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        store
+            .purge_capsule_kv(&alice, "codewall-protocol")
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(
+        store
+            .kv()
+            .get("alice:capsule:codewall-protocol", "state")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .kv()
+            .get("alice:capsule:notes", "state")
+            .await
+            .unwrap(),
+        Some(b"keep-alice".to_vec())
+    );
+    assert_eq!(
+        store
+            .kv()
+            .get("bob:capsule:codewall-protocol", "state")
+            .await
+            .unwrap(),
+        Some(b"keep-bob".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn immutable_owner_purge_cannot_follow_a_reused_alias() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let alias = PrincipalId::new("alice").unwrap();
+    let renamed = PrincipalId::new("alice-retired").unwrap();
+    let original_uid = create_principal(&store, alias.as_str());
+    store
+        .kv()
+        .set(
+            "alice:capsule:codewall-protocol",
+            "state",
+            b"old enrolment".to_vec(),
+        )
+        .await
+        .unwrap();
+
+    store
+        .principal_directory()
+        .rename(original_uid, &alias, renamed)
+        .unwrap();
+    let replacement_uid = PrincipalUid::from_bytes([42; 32]);
+    store
+        .principal_directory()
+        .register(alias.clone(), replacement_uid)
+        .unwrap();
+    store
+        .kv()
+        .set(
+            "alice:capsule:codewall-protocol",
+            "state",
+            b"replacement enrolment".to_vec(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .purge_capsule_kv_for_owner(original_uid, &alias, "codewall-protocol")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .kv()
+            .get("alice:capsule:codewall-protocol", "state")
+            .await
+            .unwrap(),
+        Some(b"replacement enrolment".to_vec()),
+        "purging the retired UID must not follow the reused alias"
+    );
+}
