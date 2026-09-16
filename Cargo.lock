@@ -346,6 +346,7 @@ dependencies = [
  "anyhow",
  "astrid-core",
  "astrid-crypto",
+ "astrid-storage",
  "blake3",
  "cargo_metadata",
  "clap",
