@@ -19,11 +19,13 @@ use astrid_capsule_install::{
     inspect_directory_for_principal_with_layout, resolve_target_dir_for_with_layout,
 };
 use astrid_core::dirs::AstridHome;
+use astrid_core::kernel_api::{CapsuleInstallBatchContext, CapsuleInstallBatchId};
 
 use super::install_finish::{finish_install, run_with_elicit};
 
 pub(crate) use super::install_batch::{
-    BatchInstallOutcome, InstalledCapsuleOutcome, RefSpec, install_capsule_batch,
+    BatchInstallOutcome, InstalledCapsuleOutcome, RefSpec, begin_verified_local_batch,
+    finish_verified_local_batch, install_capsule_batch,
 };
 use super::install_github::{github_api_client, release_tag_url, resolve_github_ref};
 
@@ -38,6 +40,12 @@ struct ExpectedCapsule<'a> {
 }
 
 #[derive(Clone, Copy)]
+pub(super) struct ExpectedInstall<'a> {
+    pub(super) id: &'a CapsuleId,
+    pub(super) batch_id: Option<CapsuleInstallBatchId>,
+}
+
+#[derive(Clone, Copy)]
 struct InstallContext<'a> {
     workspace: bool,
     /// Route non-workspace installs through the authenticated daemon writer.
@@ -47,6 +55,17 @@ struct InstallContext<'a> {
     principal: &'a astrid_core::PrincipalId,
     expected: Option<ExpectedCapsule<'a>>,
     prompt: &'a ManualInstallOptions,
+    batch_id: Option<CapsuleInstallBatchId>,
+}
+
+fn batch_context(
+    batch_id: Option<CapsuleInstallBatchId>,
+    expected: Option<ExpectedCapsule<'_>>,
+) -> Option<CapsuleInstallBatchContext> {
+    Some(CapsuleInstallBatchContext {
+        batch_id: batch_id?,
+        member_id: expected?.id.to_string(),
+    })
 }
 
 /// Operator input policy for a manual capsule install.
@@ -152,8 +171,8 @@ pub(crate) async fn install_capsule_with_options(
         workspace,
         &RefSpec::default(),
         &principal,
-        None,
         &prompt,
+        None,
     )
     .await?;
     let installed_ids: Vec<String> = installed
@@ -180,8 +199,8 @@ pub(super) async fn install_capsule_inner(
     workspace: bool,
     refspec: &RefSpec,
     principal: &astrid_core::PrincipalId,
-    expected: Option<&CapsuleId>,
     prompt: &ManualInstallOptions,
+    expected_install: Option<ExpectedInstall<'_>>,
 ) -> anyhow::Result<(Vec<InstalledCapsuleOutcome>, Option<String>)> {
     let home = AstridHome::resolve()?;
 
@@ -193,81 +212,46 @@ pub(super) async fn install_capsule_inner(
         .clone()
         .or_else(|| suffix_version.map(str::to_string));
     let tag = refspec.tag.clone();
-    let expected = expected.map(|id| ExpectedCapsule {
-        id,
+    let expected = expected_install.map(|install| ExpectedCapsule {
+        id: install.id,
         version: version.as_deref(),
     });
+    let batch_id = expected_install.and_then(|install| install.batch_id);
+    let context = InstallContext {
+        workspace,
+        daemon: !workspace,
+        home: &home,
+        original_source: Some(base),
+        principal,
+        expected,
+        prompt,
+        batch_id,
+    };
 
     // 1. Explicit local path — record the path as the source so a
     //    later `astrid distro update` can re-resolve from it (it's the
     //    canonical reference for a locally-sourced capsule). No remote
     //    ref to resolve.
     if base.starts_with('.') || base.starts_with('/') {
-        let ids = install_from_local(
-            base,
-            workspace,
-            &home,
-            Some(base),
-            principal,
-            expected,
-            prompt,
-        )
-        .await?;
+        let ids = install_from_local(base, context).await?;
         return Ok((ids, None));
     }
 
     // 2. Namespace alias @org/repo → GitHub.
     if let Some(repo) = base.strip_prefix('@') {
         let url = format!("https://github.com/{repo}");
-        return install_from_github(
-            &url,
-            name_hint,
-            version.as_deref(),
-            tag.as_deref(),
-            InstallContext {
-                workspace,
-                daemon: !workspace,
-                home: &home,
-                original_source: Some(base),
-                principal,
-                expected,
-                prompt,
-            },
-        )
-        .await;
+        return install_from_github(&url, name_hint, version.as_deref(), tag.as_deref(), context)
+            .await;
     }
 
     // 3. Raw GitHub URL.
     if base.starts_with("github.com/") || base.starts_with("https://github.com/") {
-        return install_from_github(
-            base,
-            name_hint,
-            version.as_deref(),
-            tag.as_deref(),
-            InstallContext {
-                workspace,
-                daemon: !workspace,
-                home: &home,
-                original_source: Some(base),
-                principal,
-                expected,
-                prompt,
-            },
-        )
-        .await;
+        return install_from_github(base, name_hint, version.as_deref(), tag.as_deref(), context)
+            .await;
     }
 
     // 4. Fallback: assume local folder. No remote ref to resolve.
-    let ids = install_from_local(
-        base,
-        workspace,
-        &home,
-        Some(base),
-        principal,
-        expected,
-        prompt,
-    )
-    .await?;
+    let ids = install_from_local(base, context).await?;
     Ok((ids, None))
 }
 
@@ -493,6 +477,7 @@ async fn download_and_unpack(
                 .to_str()
                 .context("invalid downloaded archive path")?,
             context.prompt,
+            context.principal,
             daemon_install_authority(
                 download_path
                     .to_str()
@@ -500,6 +485,7 @@ async fn download_and_unpack(
                 context.principal,
                 context.prompt,
             )?,
+            batch_context(context.batch_id, context.expected),
         )
         .await;
     }
@@ -620,6 +606,7 @@ async fn clone_and_build(
                     .to_str()
                     .context("invalid built archive path")?,
                 context.prompt,
+                context.principal,
                 daemon_install_authority(
                     produced[idx]
                         .to_str()
@@ -627,6 +614,7 @@ async fn clone_and_build(
                     context.principal,
                     context.prompt,
                 )?,
+                batch_context(context.batch_id, context.expected),
             )
             .await;
         }
@@ -646,12 +634,7 @@ async fn clone_and_build(
 
 async fn install_from_local(
     source: &str,
-    workspace: bool,
-    home: &AstridHome,
-    original_source: Option<&str>,
-    principal: &astrid_core::PrincipalId,
-    expected: Option<ExpectedCapsule<'_>>,
-    prompt: &ManualInstallOptions,
+    context: InstallContext<'_>,
 ) -> anyhow::Result<Vec<InstalledCapsuleOutcome>> {
     let source_path = Path::new(source);
     if !source_path.exists() {
@@ -660,23 +643,25 @@ async fn install_from_local(
 
     // Unpack `.capsule` archive when source is a file.
     if source_path.is_file() && source.ends_with(".capsule") {
-        if !workspace {
+        if context.daemon {
             let installed = super::install_daemon::install_local_via_daemon_outcome(
                 source,
-                prompt,
-                daemon_install_authority(source, principal, prompt)?,
+                context.prompt,
+                context.principal,
+                daemon_install_authority(source, context.principal, context.prompt)?,
+                batch_context(context.batch_id, context.expected),
             )
             .await?;
             return Ok(vec![installed]);
         }
         return unpack_via_lib(
             source_path,
-            workspace,
-            home,
-            original_source,
-            principal,
-            expected,
-            prompt,
+            context.workspace,
+            context.home,
+            context.original_source,
+            context.principal,
+            context.expected,
+            context.prompt,
         )
         .map(|installed| vec![installed]);
     }
@@ -705,27 +690,29 @@ async fn install_from_local(
         for entry in std::fs::read_dir(&output_dir)? {
             let entry = entry?;
             if entry.path().extension().and_then(|s| s.to_str()) == Some("capsule") {
-                if !workspace {
+                if context.daemon {
                     let archive = entry.path();
                     let archive = archive
                         .to_str()
                         .context("built capsule archive path is not UTF-8")?;
                     let installed = super::install_daemon::install_local_via_daemon_outcome(
                         archive,
-                        prompt,
-                        daemon_install_authority(archive, principal, prompt)?,
+                        context.prompt,
+                        context.principal,
+                        daemon_install_authority(archive, context.principal, context.prompt)?,
+                        batch_context(context.batch_id, context.expected),
                     )
                     .await?;
                     return Ok(vec![installed]);
                 }
                 return unpack_via_lib(
                     &entry.path(),
-                    workspace,
-                    home,
-                    original_source,
-                    principal,
-                    expected,
-                    prompt,
+                    context.workspace,
+                    context.home,
+                    context.original_source,
+                    context.principal,
+                    context.expected,
+                    context.prompt,
                 )
                 .map(|installed| vec![installed]);
             }
@@ -733,11 +720,13 @@ async fn install_from_local(
         bail!("Failed to auto-build capsule from Cargo project.");
     }
 
-    if !workspace {
+    if context.daemon {
         let installed = super::install_daemon::install_local_via_daemon_outcome(
             source,
-            prompt,
-            daemon_install_authority(source, principal, prompt)?,
+            context.prompt,
+            context.principal,
+            daemon_install_authority(source, context.principal, context.prompt)?,
+            batch_context(context.batch_id, context.expected),
         )
         .await?;
         return Ok(vec![installed]);
@@ -745,12 +734,12 @@ async fn install_from_local(
 
     install_from_local_path_for_principal(
         source_path,
-        workspace,
-        home,
-        original_source,
-        principal,
-        expected,
-        prompt,
+        context.workspace,
+        context.home,
+        context.original_source,
+        context.principal,
+        context.expected,
+        context.prompt,
     )
     .map(|installed| vec![installed])
 }

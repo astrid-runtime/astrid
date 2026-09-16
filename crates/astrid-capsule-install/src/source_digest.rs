@@ -19,6 +19,35 @@ pub fn archive_digest_for_source(source: &Path) -> anyhow::Result<String> {
     Ok(blake3::hash(&archive).to_hex().to_string())
 }
 
+/// Compute the digest of the exact bytes supplied as a local archive source.
+///
+/// This is the identity used by install provenance before the verifier opens
+/// and normalizes the archive. It is intentionally distinct from
+/// [`archive_digest_for_source`], which identifies the durable canonical
+/// archive produced after verification.
+pub fn source_digest_for_archive(source: &Path) -> anyhow::Result<String> {
+    if !source.is_file() {
+        bail!(
+            "capsule source is not a regular archive file: {}",
+            source.display()
+        );
+    }
+    let mut file = fs::File::open(source)
+        .with_context(|| format!("open capsule archive source {}", source.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read capsule archive source {}", source.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 fn canonical_archive_for_source(source: &Path) -> anyhow::Result<Vec<u8>> {
     if source.is_dir() {
         return crate::storage::canonical_capsule_archive(source);
@@ -82,7 +111,7 @@ fn canonical_archive_for_source(source: &Path) -> anyhow::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::archive_digest_for_source;
+    use super::{archive_digest_for_source, source_digest_for_archive};
     use std::fs;
 
     #[test]
@@ -113,5 +142,16 @@ mod tests {
         fs::write(&archive_path, &archive).expect("archive file");
         let digest = archive_digest_for_source(&archive_path).expect("digest");
         assert_eq!(digest, blake3::hash(&archive).to_hex().to_string());
+    }
+
+    #[test]
+    fn source_digest_identifies_exact_archive_bytes() {
+        let source = tempfile::NamedTempFile::new().expect("source");
+        fs::write(source.path(), b"exact compressed bytes").expect("source bytes");
+        let digest = source_digest_for_archive(source.path()).expect("digest");
+        assert_eq!(
+            digest,
+            blake3::hash(b"exact compressed bytes").to_hex().to_string()
+        );
     }
 }

@@ -31,8 +31,8 @@ use astrid_capsule_install::{
     read_archive_manifest,
 };
 use astrid_core::kernel_api::{
-    CapsuleInstallAuthority, CapsuleInstallEnv, CapsuleInstallProvenance, EnvStorageScope,
-    EnvValueKind,
+    CapsuleInstallAuthority, CapsuleInstallBatchMember, CapsuleInstallEnv,
+    CapsuleInstallProvenance, EnvStorageScope, EnvValueKind,
 };
 use astrid_events::kernel_api::KernelResponse;
 use astrid_storage::{KvBatchCondition, KvBatchMutation, KvEntryKey, KvMutationBatch};
@@ -70,6 +70,7 @@ pub(super) struct InstallCapsuleRequest<'a> {
     pub(super) provenance: Option<&'a CapsuleInstallProvenance>,
     pub(super) authority: CapsuleInstallAuthority,
     pub(super) env: &'a [CapsuleInstallEnv],
+    pub(super) batch_member: Option<&'a CapsuleInstallBatchMember>,
 }
 
 pub(super) async fn handle_install_capsule(
@@ -84,6 +85,7 @@ pub(super) async fn handle_install_capsule(
         provenance,
         authority,
         env,
+        batch_member,
     } = request;
     if workspace {
         return KernelResponse::Error(
@@ -98,8 +100,24 @@ pub(super) async fn handle_install_capsule(
         Err(error) => return KernelResponse::Error(error),
     };
 
+    // Batch callers control the source pathname. Copy its one safely-opened
+    // file description into memory before any digest, manifest, authority,
+    // environment, or install work. Every later archive stage consumes these
+    // immutable bytes and never reopens a temporary pathname.
+    let batch_archive =
+        match super::install_batch_archive::prepare_batch_archive(&path, batch_member) {
+            Ok(archive) => archive,
+            Err(error) => return KernelResponse::Error(error),
+        };
+
     let target = requested_target.unwrap_or(caller);
-    if let Err(error) = validate_install_provenance(&path, provenance) {
+    if let Err(error) = validate_install_provenance(
+        &path,
+        batch_archive
+            .as_ref()
+            .map(|archive| archive.bytes.as_slice()),
+        provenance,
+    ) {
         return KernelResponse::Error(error);
     }
     // Resolve the immutable UID before any environment or package mutation.
@@ -113,7 +131,15 @@ pub(super) async fn handle_install_capsule(
         return KernelResponse::Error(error);
     }
 
-    let env_transaction = match stage_env_values(kernel, target, &path, env).await {
+    let env_transaction = match stage_env_values(
+        kernel,
+        target,
+        &path,
+        batch_archive.as_ref().map(|archive| &archive.manifest),
+        env,
+    )
+    .await
+    {
         Ok(transaction) => transaction,
         Err(error) => return KernelResponse::Error(error),
     };
@@ -123,22 +149,23 @@ pub(super) async fn handle_install_capsule(
         Err(e) => return KernelResponse::Error(format!("resolve AstridHome: {e}")),
     };
 
-    let options = InstallOptions {
-        workspace: false,
-        original_source: Some(source.to_string()),
-        skip_import_check: false,
-        // Kernel-side installs run unattended — no human to answer
-        // elicit() during the lifecycle hook. A capsule that depends
-        // on install-time elicit must be configured via env before
-        // being installed through this path.
-        lifecycle_bus: None,
-        storage: kernel.principal_store.clone().map(Arc::new),
-        provenance_distro: provenance.and_then(|value| value.distro.clone()),
-        provenance_source_digest: provenance.and_then(|value| value.source_digest.clone()),
-    };
+    let options = daemon_install_options(kernel, source, provenance);
 
-    let output = match run_authorized_install(kernel, target, path, home, options, authority).await
-    {
+    let install = match batch_archive {
+        Some(archive) => {
+            super::install_batch_archive::run_authorized_archive_install(
+                kernel,
+                target,
+                archive.bytes,
+                home,
+                options,
+                authority,
+            )
+            .await
+        },
+        None => run_authorized_install(kernel, target, path, home, options, authority).await,
+    };
+    let output = match install {
         Ok(output) => output,
         Err(error) => {
             if let Some(transaction) = env_transaction {
@@ -160,6 +187,24 @@ pub(super) async fn handle_install_capsule(
     }
 
     KernelResponse::Success(install_output_json(&output))
+}
+
+fn daemon_install_options(
+    kernel: &Arc<crate::Kernel>,
+    source: &str,
+    provenance: Option<&CapsuleInstallProvenance>,
+) -> InstallOptions {
+    InstallOptions {
+        workspace: false,
+        original_source: Some(source.to_string()),
+        skip_import_check: false,
+        // Kernel installs run unattended. Capsules needing install-time
+        // elicitation must receive configuration through the request env.
+        lifecycle_bus: None,
+        storage: kernel.principal_store.clone().map(Arc::new),
+        provenance_distro: provenance.and_then(|value| value.distro.clone()),
+        provenance_source_digest: provenance.and_then(|value| value.source_digest.clone()),
+    }
 }
 
 fn local_install_path(source: &str) -> Result<std::path::PathBuf, String> {
@@ -272,6 +317,7 @@ const MAX_SOURCE_DIGEST_BYTES: u64 = 64 * 1024 * 1024;
 /// callers cannot use a path or an arbitrary label as a digest.
 fn validate_install_provenance(
     source: &std::path::Path,
+    archive: Option<&[u8]>,
     provenance: Option<&CapsuleInstallProvenance>,
 ) -> Result<(), String> {
     let Some(provenance) = provenance else {
@@ -301,22 +347,33 @@ fn validate_install_provenance(
                 .to_owned(),
         );
     }
-    let metadata = std::fs::metadata(source)
-        .map_err(|error| format!("inspect provenance source {}: {error}", source.display()))?;
-    if !metadata.is_file() {
-        return Err(
-            "install provenance source_digest is supported only for a local capsule archive"
-                .to_owned(),
-        );
-    }
-    if metadata.len() > MAX_SOURCE_DIGEST_BYTES {
+    let bytes = if let Some(bytes) = archive {
+        std::borrow::Cow::Borrowed(bytes)
+    } else {
+        let metadata = std::fs::metadata(source)
+            .map_err(|error| format!("inspect provenance source {}: {error}", source.display()))?;
+        if !metadata.is_file() {
+            return Err(
+                "install provenance source_digest is supported only for a local capsule archive"
+                    .to_owned(),
+            );
+        }
+        if metadata.len() > MAX_SOURCE_DIGEST_BYTES {
+            return Err(format!(
+                "install provenance source exceeds {MAX_SOURCE_DIGEST_BYTES}-byte digest limit"
+            ));
+        }
+        std::borrow::Cow::Owned(
+            std::fs::read(source)
+                .map_err(|error| format!("read provenance source {}: {error}", source.display()))?,
+        )
+    };
+    if bytes.len() as u64 > MAX_SOURCE_DIGEST_BYTES {
         return Err(format!(
             "install provenance source exceeds {MAX_SOURCE_DIGEST_BYTES}-byte digest limit"
         ));
     }
-    let bytes = std::fs::read(source)
-        .map_err(|error| format!("read provenance source {}: {error}", source.display()))?;
-    let actual = format!("blake3:{}", blake3::hash(&bytes).to_hex());
+    let actual = format!("blake3:{}", blake3::hash(bytes.as_ref()).to_hex());
     if actual != expected {
         return Err(format!(
             "install provenance source_digest mismatch: expected {expected}, got {actual}"
@@ -329,24 +386,31 @@ async fn stage_env_values(
     kernel: &Arc<crate::Kernel>,
     caller: &astrid_core::principal::PrincipalId,
     source: &std::path::Path,
+    batch_manifest: Option<&astrid_capsule::manifest::CapsuleManifest>,
     values: &[CapsuleInstallEnv],
 ) -> Result<Option<EnvTransaction>, String> {
     if values.is_empty() {
         return Ok(None);
     }
-    let manifest = if source.is_dir() {
-        astrid_capsule::discovery::load_manifest(&source.join("Capsule.toml"))
-            .map_err(|error| format!("validate capsule manifest: {error}"))?
+    let loaded_manifest;
+    let manifest = if let Some(manifest) = batch_manifest {
+        manifest
     } else {
-        read_archive_manifest(source)
-            .map_err(|error| format!("validate capsule manifest: {error:#}"))?
+        loaded_manifest = if source.is_dir() {
+            astrid_capsule::discovery::load_manifest(&source.join("Capsule.toml"))
+                .map_err(|error| format!("validate capsule manifest: {error}"))?
+        } else {
+            read_archive_manifest(source)
+                .map_err(|error| format!("validate capsule manifest: {error:#}"))?
+        };
+        &loaded_manifest
     };
     let capsule = manifest.package.name.clone();
     let uid = kernel
         .principal_directory
         .uid_for(caller)
         .map_err(|error| format!("resolve durable principal UID: {error}"))?;
-    validate_env_values(&manifest, values)?;
+    validate_env_values(manifest, values)?;
 
     let mut snapshots = Vec::with_capacity(values.len());
     for value in values {
@@ -676,7 +740,7 @@ mod tests {
                 kind: EnvValueKind::Secret,
             },
         ];
-        let transaction = stage_env_values(&kernel, &principal, &source, &values)
+        let transaction = stage_env_values(&kernel, &principal, &source, None, &values)
             .await
             .unwrap()
             .unwrap();
@@ -771,7 +835,7 @@ mod tests {
                 kind: EnvValueKind::Secret,
             },
         ];
-        let transaction = stage_env_values(&kernel, &principal, &source, &values)
+        let transaction = stage_env_values(&kernel, &principal, &source, None, &values)
             .await
             .unwrap()
             .unwrap();
@@ -801,8 +865,30 @@ mod tests {
             distro: Some("sealed-distro".into()),
             source_digest: Some(format!("blake3:{}", blake3::hash(b"different").to_hex())),
         };
-        let error = validate_install_provenance(&source, Some(&provenance)).unwrap_err();
+        let error = validate_install_provenance(&source, None, Some(&provenance)).unwrap_err();
         assert!(error.contains("source_digest mismatch"), "{error}");
+    }
+
+    #[test]
+    fn batch_archive_snapshot_survives_source_path_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("fixture.capsule");
+        std::fs::write(&source, b"original-bytes").unwrap();
+        let member = CapsuleInstallBatchMember {
+            id: "fixture".to_owned(),
+            version: "1.0.0".to_owned(),
+            source_digest: format!("blake3:{}", blake3::hash(b"original-bytes").to_hex()),
+            archive_digest: format!("blake3:{}", "a".repeat(64)),
+            source_bytes: 14,
+        };
+
+        let snapshot =
+            super::super::install_batch_archive::snapshot_batch_archive(&source, &member)
+                .expect("immutable snapshot");
+        std::fs::write(&source, b"replaced-bytes").unwrap();
+
+        assert_eq!(snapshot, b"original-bytes");
+        assert_eq!(std::fs::read(source).unwrap(), b"replaced-bytes");
     }
 
     #[tokio::test]
@@ -850,7 +936,7 @@ mod tests {
                 kind: EnvValueKind::Secret,
             },
         ];
-        stage_env_values(&kernel, &principal, &source, &values)
+        stage_env_values(&kernel, &principal, &source, None, &values)
             .await
             .unwrap()
             .unwrap();
