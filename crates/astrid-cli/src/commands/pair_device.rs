@@ -15,9 +15,9 @@
 //! * `list` — show a principal's paired devices (`key_id` + scope + label).
 //! * `revoke` — remove one paired device by its `key_id`.
 //!
-//! Redemption is performed by the new device through the HTTP gateway
-//! (`POST /api/auth/pair-device/redeem`), not this CLI — the redeeming device
-//! holds the private key and receives its scoped session bearer there.
+//! Local redemption reads the bearer from stdin and registers only the supplied
+//! public key. Remote devices may use the HTTP gateway redemption endpoint.
+//! Neither route grants human-user delegation or selects a native responder.
 
 use std::process::ExitCode;
 
@@ -31,11 +31,16 @@ use crate::admin_client::{connect_as_active_agent, into_result};
 use crate::context;
 use crate::theme::Theme;
 
+mod redeem;
+
 #[derive(Subcommand, Debug, Clone)]
 pub(crate) enum PairDeviceCommand {
     /// Issue a pair-token tied to your own principal. Hand the token to the
     /// new device out-of-band; it redeems through the HTTP gateway.
     Issue(IssueArgs),
+    /// Register a device public key using a pairing token piped on stdin.
+    /// Does not generate keys, switch principals, or activate native input.
+    Redeem(redeem::RedeemArgs),
     /// List paired devices on a principal.
     List(ListArgs),
     /// Revoke a single paired device by its `key_id`.
@@ -97,6 +102,7 @@ pub(crate) struct RevokeArgs {
 pub(crate) async fn run(command: PairDeviceCommand) -> Result<ExitCode> {
     match command {
         PairDeviceCommand::Issue(args) => run_issue(args).await,
+        PairDeviceCommand::Redeem(args) => redeem::run(args).await,
         PairDeviceCommand::List(args) => run_list(args).await,
         PairDeviceCommand::Revoke(args) => run_revoke(args).await,
     }
