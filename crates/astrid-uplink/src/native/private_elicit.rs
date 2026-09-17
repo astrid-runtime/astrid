@@ -46,7 +46,7 @@ pub enum PrivateElicitRejection {
 
 /// Empty JSON strings cost two quotes plus a comma or bracket delimiter
 /// (`""` + `,`/`[`/`]`). Bound element count first so a million empty
-/// strings cannot force envelope serialization before the 1 MiB host IPC
+/// strings cannot force envelope serialization before the 1 `MiB` host IPC
 /// ceiling. This is a protocol/DoS guard derived from [`super::MAX_PAYLOAD_BYTES`],
 /// not an operator knob and not a second silent ceiling.
 const MAX_ELICIT_ARRAY_ITEMS: usize = super::MAX_PAYLOAD_BYTES / 3;
