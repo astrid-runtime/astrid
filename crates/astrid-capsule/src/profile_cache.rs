@@ -28,7 +28,7 @@ use std::sync::{Arc, RwLock};
 
 use astrid_core::dirs::AstridHome;
 use astrid_core::principal::PrincipalId;
-use astrid_core::profile::{PrincipalProfile, ProfileError, ProfileResult};
+use astrid_core::profile::{CommandAlwaysGrant, PrincipalProfile, ProfileError, ProfileResult};
 
 /// Lazy, process-lifetime cache of resolved [`PrincipalProfile`] values.
 ///
@@ -247,6 +247,139 @@ impl PrincipalProfileCache {
         Ok(())
     }
 
+    /// Persist an operator-consented command-family grant to `principal`'s
+    /// profile (`approvals.command_always`), then invalidate the cache so the
+    /// next resolve reloads it.
+    ///
+    /// This is the capability `approve_always` path: a command family the
+    /// operator chose to remember across daemon restarts. Matching stays
+    /// principal + workspace + the existing host glob `{escaped_command} *`
+    /// against `target_resource`. It is **not** capsule-keyed, not
+    /// exact-resource-only, and does not widen that prefix contract.
+    ///
+    /// Command equality is exact (unlike egress endpoints, which are
+    /// case-insensitive). `command` is trimmed before compare/store;
+    /// workspace bytes are preserved because whitespace can be part of a path.
+    ///
+    /// The load-modify-save runs under the same cache write lock as
+    /// [`Self::persist_egress`]. Both methods load the current profile from
+    /// disk while holding that lock, so these two methods cannot drop each
+    /// other's writes. Other profile writers do not share this lock.
+    ///
+    /// Host persist always supplies `Some(pristine hosted portal path)`, not
+    /// the process-local `CoW` merged path. This method does not invent a
+    /// `None`. `None` on the grant type is only the existing in-memory
+    /// unscoped [`astrid_approval::Allowance::workspace_root`] semantics
+    /// (matches any workspace); it is not a historical on-disk migration.
+    ///
+    /// Fail-closed and idempotent: the same trimmed command + workspace pair
+    /// is a no-op success. Empty command or empty present workspace returns
+    /// [`ProfileError::Invalid`] **before** taking the lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileError::Invalid`] if `command` is empty or a present
+    /// `workspace_root` is empty. Other [`ProfileError`] variants come from
+    /// load/validate/save. The caller must not report `ApprovedAlways` unless
+    /// this returns `Ok`.
+    pub fn persist_command_always(
+        &self,
+        principal: &PrincipalId,
+        command: &str,
+        workspace_root: Option<&str>,
+    ) -> ProfileResult<()> {
+        self.persist_command_at(
+            principal,
+            command,
+            workspace_root,
+            astrid_core::profile::CommandApprovalLocation::Hosted,
+        )
+    }
+
+    /// Remember a command in the principal's path-free workspace, not all workspaces.
+    ///
+    /// # Errors
+    /// Returns profile validation, load, or persistence failures.
+    pub fn persist_astrid_command_always(
+        &self,
+        principal: &PrincipalId,
+        command: &str,
+    ) -> ProfileResult<()> {
+        self.persist_command_at(
+            principal,
+            command,
+            None,
+            astrid_core::profile::CommandApprovalLocation::AstridWorkspace,
+        )
+    }
+
+    fn persist_command_at(
+        &self,
+        principal: &PrincipalId,
+        command: &str,
+        workspace_root: Option<&str>,
+        location: astrid_core::profile::CommandApprovalLocation,
+    ) -> ProfileResult<()> {
+        let command = command.trim();
+        if command.is_empty() {
+            return Err(ProfileError::Invalid(
+                "approvals.command_always.command must be non-empty".into(),
+            ));
+        }
+        let workspace_root = match workspace_root {
+            Some(workspace) => {
+                // Filesystem names may end in spaces. Do not change the scope.
+                if workspace.trim().is_empty() {
+                    return Err(ProfileError::Invalid(
+                        "approvals.command_always.workspace_root must be non-empty when set".into(),
+                    ));
+                }
+                Some(workspace)
+            },
+            None => None,
+        };
+
+        // Same lock tradeoff as `persist_egress`: hold the write lock across
+        // load + validate + fsync + rename. Accepted because approve_always is
+        // a rare operator-driven event, not the hot read path. Loading from
+        // disk under this lock is what keeps a concurrent persist_egress from
+        // being dropped by a stale full-profile save.
+        let mut guard = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let path = self.astrid_home.profile_path(principal);
+        // Approval cannot resurrect a principal removed while the prompt was open.
+        let mut profile = if principal == &PrincipalId::default() {
+            PrincipalProfile::load_from_path(&path)?
+        } else {
+            PrincipalProfile::load_required(&self.astrid_home, principal)?
+        };
+        if !profile.enabled {
+            return Err(ProfileError::Invalid("principal is disabled".into()));
+        }
+
+        let already = profile.approvals.command_always.iter().any(|grant| {
+            grant.command == command
+                && grant.location == location
+                && grant.workspace_root.as_deref() == workspace_root
+        });
+        if already {
+            guard.profiles.insert(principal.clone(), Arc::new(profile));
+            return Ok(());
+        }
+
+        profile.approvals.command_always.push(CommandAlwaysGrant {
+            command: command.to_string(),
+            location,
+            workspace_root: workspace_root.map(str::to_string),
+        });
+        profile.save_to_path(&path)?;
+        guard.invalidate(principal);
+        Ok(())
+    }
+
     /// Number of principals currently cached. Test-only introspection.
     #[cfg(test)]
     #[must_use]
@@ -296,6 +429,50 @@ mod tests {
 
     fn principal(name: &str) -> PrincipalId {
         PrincipalId::new(name).expect("valid principal")
+    }
+
+    fn command_fixture() -> (tempfile::TempDir, PrincipalProfileCache) {
+        let (dir, cache) = fixture();
+        for name in ["alice", "bob"] {
+            PrincipalProfile::default()
+                .save_to_path(&cache.astrid_home.profile_path(&principal(name)))
+                .expect("create test principal");
+        }
+        (dir, cache)
+    }
+
+    #[test]
+    fn command_approval_does_not_recreate_deleted_principal() {
+        let (_dir, cache) = command_fixture();
+        let p = principal("alice");
+        cache.resolve(&p).expect("prime cache");
+        let path = cache.astrid_home.profile_path(&p);
+        fs::remove_file(&path).expect("delete test profile");
+        assert!(
+            cache
+                .persist_command_always(&p, "git push", Some("/tmp"))
+                .is_err()
+        );
+        assert!(!path.exists(), "approval must not recreate the principal");
+    }
+
+    #[test]
+    fn command_approval_does_not_modify_disabled_principal() {
+        let (_dir, cache) = command_fixture();
+        let p = principal("alice");
+        let path = cache.astrid_home.profile_path(&p);
+        let profile = PrincipalProfile {
+            enabled: false,
+            ..PrincipalProfile::default()
+        };
+        profile.save_to_path(&path).expect("disable test principal");
+        let before = fs::read(&path).expect("profile bytes");
+        assert!(
+            cache
+                .persist_command_always(&p, "git push", Some("/tmp"))
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).expect("unchanged profile"), before);
     }
 
     fn write_profile(dir: &tempfile::TempDir, p: &PrincipalId, contents: &str) {
@@ -625,6 +802,184 @@ mod tests {
             profile.network.capsule_egress.get("react"),
             Some(&vec!["10.0.0.5:8080".to_string()]),
             "idempotent persist must not duplicate the entry"
+        );
+    }
+
+    #[test]
+    fn persist_command_always_appends_and_invalidates() {
+        let (dir, cache) = fixture();
+        let p = principal("alice");
+        write_profile(
+            &dir,
+            &p,
+            &format!(
+                "profile_version = {CURRENT_PROFILE_VERSION}\n\
+                 [network]\n\
+                 egress = [\"api.example.com:443\"]\n"
+            ),
+        );
+        let _ = cache.resolve(&p).expect("prime cache");
+        assert_eq!(cache.len(), 1);
+
+        cache
+            .persist_command_always(&p, "git push", Some("/tmp"))
+            .expect("persist command always");
+
+        assert_eq!(
+            cache.len(),
+            0,
+            "persist_command_always must invalidate the cache"
+        );
+
+        let reloaded = cache.resolve(&p).expect("reload");
+        assert_eq!(reloaded.network.egress, vec!["api.example.com:443"]);
+        assert_eq!(reloaded.approvals.command_always.len(), 1);
+        assert_eq!(reloaded.approvals.command_always[0].command, "git push");
+        assert_eq!(
+            reloaded.approvals.command_always[0]
+                .workspace_root
+                .as_deref(),
+            Some("/tmp")
+        );
+        assert!(
+            reloaded.network.capsule_egress.is_empty(),
+            "command-always persist must not touch capsule_egress"
+        );
+    }
+
+    #[test]
+    fn persist_command_always_is_idempotent_for_same_command_and_workspace() {
+        let (_dir, cache) = command_fixture();
+        let p = principal("bob");
+        let initial_generation = cache.generation_for(&p);
+        cache
+            .persist_command_always(&p, "git push", Some("/tmp"))
+            .expect("first persist");
+        let persisted_generation = cache.generation_for(&p);
+        assert_eq!(persisted_generation, initial_generation + 1);
+        cache
+            .persist_command_always(&p, "git push", Some("/tmp"))
+            .expect("idempotent persist");
+        assert_eq!(cache.generation_for(&p), persisted_generation);
+        assert_eq!(cache.len(), 1, "idempotent persist refreshes the cache");
+
+        let profile = cache.resolve(&p).expect("resolve refreshed profile");
+        assert_eq!(profile.approvals.command_always.len(), 1);
+        assert_eq!(profile.approvals.command_always[0].command, "git push");
+    }
+
+    #[test]
+    fn persist_command_always_isolates_workspace_and_principal() {
+        let (_dir, cache) = command_fixture();
+        let alice = principal("alice");
+        let bob = principal("bob");
+        cache
+            .persist_command_always(&alice, "git push", Some("/tmp"))
+            .expect("alice /tmp");
+        cache
+            .persist_command_always(&alice, "git push", Some("/other"))
+            .expect("alice /other");
+        cache
+            .persist_command_always(&bob, "git push", Some("/tmp"))
+            .expect("bob /tmp");
+
+        let alice_profile = cache.resolve(&alice).expect("alice");
+        let alice_workspaces: Vec<_> = alice_profile
+            .approvals
+            .command_always
+            .iter()
+            .map(|g| g.workspace_root.as_deref())
+            .collect();
+        assert_eq!(alice_workspaces, vec![Some("/tmp"), Some("/other")]);
+        assert!(
+            alice_profile
+                .approvals
+                .command_always
+                .iter()
+                .all(|g| g.command == "git push")
+        );
+
+        let bob_profile = cache.resolve(&bob).expect("bob");
+        assert_eq!(bob_profile.approvals.command_always.len(), 1);
+        assert_eq!(
+            bob_profile.approvals.command_always[0]
+                .workspace_root
+                .as_deref(),
+            Some("/tmp")
+        );
+    }
+
+    #[test]
+    fn persist_command_always_rejects_empty_command() {
+        let (_dir, cache) = fixture();
+        let p = principal("alice");
+        let err = cache
+            .persist_command_always(&p, "   ", Some("/tmp"))
+            .expect_err("empty command");
+        assert!(
+            matches!(&err, ProfileError::Invalid(msg) if msg.contains("command")),
+            "got {err:?}"
+        );
+        assert_eq!(cache.len(), 0, "invalid persist must not cache");
+    }
+
+    #[test]
+    fn persist_command_always_rejects_empty_workspace() {
+        let (_dir, cache) = fixture();
+        let p = principal("alice");
+        let err = cache
+            .persist_command_always(&p, "git push", Some("   "))
+            .expect_err("empty workspace");
+        assert!(
+            matches!(&err, ProfileError::Invalid(msg) if msg.contains("workspace_root")),
+            "got {err:?}"
+        );
+        assert_eq!(cache.len(), 0, "invalid persist must not cache");
+    }
+
+    #[test]
+    fn persist_command_always_preserves_workspace_bytes() {
+        let (_dir, cache) = command_fixture();
+        let p = principal("alice");
+        cache
+            .persist_command_always(&p, "  git push  ", Some(" /tmp "))
+            .expect("persist spaced workspace");
+        cache
+            .persist_command_always(&p, "git push", Some("/tmp"))
+            .expect("persist distinct workspace");
+        let profile = cache.resolve(&p).expect("resolve");
+        assert_eq!(profile.approvals.command_always.len(), 2);
+        assert_eq!(profile.approvals.command_always[0].command, "git push");
+        assert_eq!(
+            profile.approvals.command_always[0]
+                .workspace_root
+                .as_deref(),
+            Some(" /tmp ")
+        );
+    }
+
+    #[test]
+    fn persist_egress_then_command_always_keeps_both() {
+        let (_dir, cache) = fixture();
+        let p = principal("alice");
+        cache
+            .persist_egress(&p, "react", "127.0.0.1:1234")
+            .expect("persist egress");
+        cache
+            .persist_command_always(&p, "git push", Some("/tmp"))
+            .expect("persist command");
+        let profile = cache.resolve(&p).expect("resolve");
+        assert_eq!(
+            profile.network.capsule_egress.get("react"),
+            Some(&vec!["127.0.0.1:1234".to_string()])
+        );
+        assert_eq!(profile.approvals.command_always.len(), 1);
+        assert_eq!(profile.approvals.command_always[0].command, "git push");
+        assert_eq!(
+            profile.approvals.command_always[0]
+                .workspace_root
+                .as_deref(),
+            Some("/tmp")
         );
     }
 }

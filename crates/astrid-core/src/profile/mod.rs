@@ -207,6 +207,18 @@ pub struct PrincipalProfile {
     #[serde(default)]
     pub network: NetworkConfig,
 
+    /// Durable operator approvals for general command-family consent.
+    ///
+    /// Persistence target of capability `approve_always`: a command family the
+    /// operator chose to remember across daemon restarts for this principal,
+    /// optionally scoped to a workspace root. Not capsule-keyed — capability
+    /// matching stays principal + workspace + command family.
+    ///
+    /// `#[serde(default)]` so profiles written before this field existed still
+    /// load; absent/empty = no remembered command grants (fail-closed).
+    #[serde(default)]
+    pub approvals: ApprovalsConfig,
+
     /// Process-spawn policy.
     #[serde(default)]
     pub process: ProcessConfig,
@@ -313,6 +325,51 @@ pub struct NetworkConfig {
     /// endpoints (fail-closed).
     #[serde(default)]
     pub capsule_egress: std::collections::HashMap<String, Vec<String>>,
+}
+
+/// Durable general-action approvals for a principal.
+///
+/// Empty `command_always` means no remembered command-family grants
+/// (fail-closed). Additive: old profiles without this table still load.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ApprovalsConfig {
+    /// Operator-consented command families to remember across restarts.
+    ///
+    /// Each entry is principal-scoped and optionally workspace-scoped. Matching
+    /// reconstructs the existing host glob `{escaped_action} *` against the
+    /// request's `target_resource`; it does not capsule-scope and does not
+    /// widen that prefix contract.
+    #[serde(default)]
+    pub command_always: Vec<CommandAlwaysGrant>,
+}
+
+/// One remembered `approve_always` command-family grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandApprovalLocation {
+    /// Compatibility workspace backed by a host path.
+    #[default]
+    Hosted,
+    /// The authenticated principal's path-free Astrid workspace.
+    AstridWorkspace,
+}
+
+/// One remembered `approve_always` command-family grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandAlwaysGrant {
+    /// Sanitized command family used to build the host glob (`"{command} *"`).
+    pub command: String,
+    /// Native workspace authority is distinct from a missing hosted path.
+    #[serde(default)]
+    pub location: CommandApprovalLocation,
+    /// Hosted workspace identity this grant is bound to. For hosted portals
+    /// this is the pristine source path, not the process-local `CoW` merged
+    /// path. Hosted `approve_always` persist supplies `Some(pristine)` and
+    /// never `None`. `None` plus [`CommandApprovalLocation::AstridWorkspace`]
+    /// is the path-free native workspace, not an unscoped hosted grant.
+    /// When present the string must be non-empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
 }
 
 /// Process-spawn configuration for a principal.
@@ -433,6 +490,7 @@ impl Default for PrincipalProfile {
             capsules: Vec::new(),
             auth: AuthConfig::default(),
             network: NetworkConfig::default(),
+            approvals: ApprovalsConfig::default(),
             process: ProcessConfig::default(),
             quotas: Quotas::default(),
         }
@@ -484,6 +542,10 @@ mod tests {
         assert!(p.auth.methods.is_empty());
         assert!(p.auth.public_keys.is_empty());
         assert!(p.network.egress.is_empty(), "egress must fail-closed");
+        assert!(
+            p.approvals.command_always.is_empty(),
+            "command-always grants must default empty"
+        );
         assert!(p.process.allow.is_empty(), "process spawn must fail-closed");
         assert_eq!(p.quotas.max_memory_bytes, DEFAULT_MAX_MEMORY_BYTES);
         assert_eq!(p.quotas.max_timeout_secs, DEFAULT_MAX_TIMEOUT_SECS);
@@ -566,6 +628,7 @@ mod tests {
                 egress: vec!["api.example.com:443".into()],
                 capsule_egress: std::collections::HashMap::new(),
             },
+            approvals: ApprovalsConfig::default(),
             process: ProcessConfig {
                 allow: vec!["/usr/bin/env".into()],
             },

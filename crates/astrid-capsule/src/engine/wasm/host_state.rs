@@ -296,6 +296,11 @@ pub struct HostState {
     /// path) share one filesystem, and a spawned `cargo` sees the CoW writes.
     /// See `astrid_vfs::workspace_cow`.
     pub workspace_root: PathBuf,
+    /// Pristine hosted portal path for durable command grants.
+    /// Distinct from [`Self::workspace_root`] (runtime-effective merged/git
+    /// path used for FS confinement). `HostedPortal`: the source before `CoW`.
+    /// Git-managed: same as `workspace_root`. Astrid filesystem: empty.
+    pub hosted_workspace_root: PathBuf,
     /// Copy-on-write bookkeeping dirs (the overlayfs upper/work, or the pristine
     /// workspace under APFS) that the OS sandbox MUST mask from spawned
     /// children, so a child cannot write them directly and bypass the workspace
@@ -959,6 +964,7 @@ impl std::fmt::Debug for HostState {
         f.debug_struct("HostState")
             .field("capsule_id", &self.capsule_id)
             .field("workspace_root", &self.workspace_root)
+            .field("hosted_workspace_root", &self.hosted_workspace_root)
             .field("vfs_root_handle", &self.vfs_root_handle)
             .field("has_home", &self.home.is_some())
             .field("has_tmp", &self.tmp.is_some())

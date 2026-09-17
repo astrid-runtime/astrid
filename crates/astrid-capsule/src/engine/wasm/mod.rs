@@ -2617,6 +2617,7 @@ impl ExecutionEngine for WasmEngine {
             let tcp_listener_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let capsule_net_stream_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let st_route_admission_gate = self.route_admission_gate.clone();
+            let hosted_workspace_root = workspace_root.clone();
             let make_state: Arc<dyn Fn() -> HostState + Send + Sync> = Arc::new(move || HostState {
                 wasi_ctx: build_wasi_ctx(),
                 resource_table: wasmtime::component::ResourceTable::new(),
@@ -2646,6 +2647,8 @@ impl ExecutionEngine for WasmEngine {
                 // spawned processes AND the fs-host confinement root, so both
                 // see ONE filesystem (see the VFS-branch selection above).
                 workspace_root: effective_workspace_root.clone(),
+                // Durable command grants bind the pristine portal, not `CoW` merge.
+                hosted_workspace_root: hosted_workspace_root.clone(),
                 spawn_mask_paths: spawn_mask_paths.clone(),
                 vfs: Arc::clone(&workspace_vfs),
                 vfs_root_handle: root_handle.clone(),
@@ -3970,6 +3973,7 @@ async fn build_lifecycle_host_state(
         capsule_log: None,
         capsule_id: cfg.capsule_id.clone(),
         workspace_root: cfg.workspace_root.clone(),
+        hosted_workspace_root: cfg.workspace_root.clone(),
         // Lifecycle hooks run on a plain HostVfs with no CoW, so nothing to mask.
         spawn_mask_paths: Vec::new(),
         vfs: Arc::new(vfs),

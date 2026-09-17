@@ -1,8 +1,8 @@
 //! Host function implementation for plugin-level approval requests.
 //!
 //! Called by WASM guests via the `request_approval` trait method when a plugin
-//! needs human consent for a sensitive action. Checks the shared
-//! [`AllowanceStore`] first (instant path), then publishes an
+//! needs human consent for a sensitive action. Checks persisted always-grants,
+//! then the shared [`AllowanceStore`] (instant path), then publishes an
 //! [`ApprovalRequired`] IPC event and blocks until the frontend responds.
 
 use crate::engine::wasm::bindings::astrid::approval::host::{
@@ -13,6 +13,7 @@ use crate::engine::wasm::host_state::HostState;
 use astrid_approval::action::SensitiveAction;
 use astrid_approval::{Allowance, AllowanceId, AllowancePattern, AllowanceStore};
 use astrid_core::principal::PrincipalId;
+use astrid_core::profile::CommandApprovalLocation;
 use astrid_core::types::Timestamp;
 use astrid_crypto::KeyPair;
 use astrid_events::AstridEvent;
@@ -58,6 +59,104 @@ fn check_allowance(
     store
         .find_matching_and_consume(principal, &action, workspace_root)
         .is_some()
+}
+
+/// Reuse the saved command family with the same principal/workspace matching
+/// contract as an in-memory allowance. Do not import it into the session store:
+/// the profile cache remains the single source for durable approvals.
+fn check_persisted_allowance(
+    state: &HostState,
+    principal: &PrincipalId,
+    resource: &str,
+) -> Result<bool, ErrorCode> {
+    let Some(cache) = &state.profile_cache else {
+        return Ok(false);
+    };
+    let profile = cache.resolve(principal).map_err(|error| {
+        tracing::warn!(%error, "Cannot load durable action approvals");
+        ErrorCode::StoreUnavailable
+    })?;
+    if !profile.enabled {
+        return Ok(false);
+    }
+    let action = SensitiveAction::ExecuteCommand {
+        command: resource.to_owned(),
+        args: vec![],
+    };
+    let location = approval_location(state);
+    let hosted_identity = state.hosted_workspace_root.as_path();
+    if location == CommandApprovalLocation::Hosted
+        && (hosted_identity.as_os_str().is_empty() || hosted_identity.to_str().is_none())
+    {
+        return Ok(false);
+    }
+    Ok(profile.approvals.command_always.iter().any(|grant| {
+        if grant.location != location {
+            return false;
+        }
+        let workspace_ok = match (&grant.workspace_root, location) {
+            (Some(workspace), CommandApprovalLocation::Hosted) => {
+                std::path::Path::new(workspace) == hosted_identity
+            },
+            (None, CommandApprovalLocation::AstridWorkspace) => true,
+            _ => false,
+        };
+        if !workspace_ok {
+            return false;
+        }
+        let pattern = AllowancePattern::CommandPattern {
+            command: format!("{} *", escape_glob_metacharacters(&grant.command)),
+        };
+        pattern.matches(&action, Some(hosted_identity))
+    }))
+}
+
+/// Hosted durable grants bind the pristine portal path, never the `CoW` merged
+/// path used for FS confinement. Empty or non-UTF-8 identity cannot persist.
+fn hosted_workspace_identity(state: &HostState) -> Result<&str, ErrorCode> {
+    let path = state.hosted_workspace_root.as_path();
+    if path.as_os_str().is_empty() {
+        return Err(ErrorCode::InvalidInput);
+    }
+    path.to_str().ok_or(ErrorCode::InvalidInput)
+}
+
+fn approval_location(state: &HostState) -> CommandApprovalLocation {
+    use crate::engine::wasm::host_state::PrincipalMountLocation;
+    if state
+        .effective_workspace()
+        .is_some_and(|mount| matches!(mount.location, PrincipalMountLocation::AstridFilesystem))
+    {
+        CommandApprovalLocation::AstridWorkspace
+    } else {
+        CommandApprovalLocation::Hosted
+    }
+}
+
+/// An Always response is truthful only after its profile write succeeds.
+/// Failed persistence is an error, not a silently downgraded approval.
+fn persist_always(
+    state: &HostState,
+    principal: &PrincipalId,
+    action: &str,
+) -> Result<(), ErrorCode> {
+    let cache = state
+        .profile_cache
+        .as_ref()
+        .ok_or(ErrorCode::StoreUnavailable)?;
+    let persisted = match approval_location(state) {
+        CommandApprovalLocation::AstridWorkspace => {
+            cache.persist_astrid_command_always(principal, action)
+        },
+        CommandApprovalLocation::Hosted => {
+            let workspace = hosted_workspace_identity(state)?;
+            cache.persist_command_always(principal, action, Some(workspace))
+        },
+    };
+    persisted.map_err(|error| {
+        tracing::warn!(%error, "Cannot persist Always approval");
+        ErrorCode::StoreUnavailable
+    })
 }
 
 /// Sanitize a guest-supplied display field in place.
@@ -288,6 +387,12 @@ impl approval::Host for HostState {
 
         let ws_path = Some(workspace_root.as_path());
 
+        if check_persisted_allowance(self, &principal, &request.target_resource)? {
+            return Ok(ApprovalResponse {
+                decision: ApprovalDecision::Allowance,
+            });
+        }
+
         // Fast path: check existing allowances.
         if let Some(ref store) = allowance_store
             && check_allowance(store, &principal, &request.target_resource, ws_path)
@@ -383,6 +488,9 @@ impl approval::Host for HostState {
                         IpcPayload::ApprovalResponse {
                             decision, reason, ..
                         } => {
+                            if decision == "approve_always" {
+                                persist_always(self, &principal, &request.action)?;
+                            }
                             let typed = decision_from_str(decision);
                             let approved = matches!(
                                 typed,
@@ -391,8 +499,12 @@ impl approval::Host for HostState {
                                     | ApprovalDecision::ApprovedAlways
                             );
 
-                            // Create allowance for session/always decisions.
-                            if approved && let Some(ref store) = allowance_store {
+                            // Persistent choices were saved above; keep temporary
+                            // allowances in the session store only.
+                            if approved
+                                && decision != "approve_always"
+                                && let Some(ref store) = allowance_store
+                            {
                                 create_allowance_from_decision(
                                     store,
                                     &principal,
@@ -439,3 +551,7 @@ impl approval::Host for HostState {
 #[cfg(test)]
 #[path = "approval_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "approval_hosted_identity_tests.rs"]
+mod hosted_identity_tests;

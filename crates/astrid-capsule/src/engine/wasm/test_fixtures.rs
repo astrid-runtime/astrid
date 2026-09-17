@@ -111,6 +111,7 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         capsule_log: None,
         capsule_id: CapsuleId::from_static("test"),
         workspace_root: PathBuf::from("/tmp"),
+        hosted_workspace_root: PathBuf::from("/tmp"),
         spawn_mask_paths: Vec::new(),
         vfs: Arc::new(astrid_vfs::HostVfs::new()),
         vfs_root_handle: astrid_capabilities::DirHandle::new(),

@@ -7,7 +7,7 @@
 use crate::capability_grammar::validate_capability;
 
 use super::{
-    AuthConfig, BACKGROUND_PROCESSES_UPPER_BOUND, CURRENT_PROFILE_VERSION,
+    ApprovalsConfig, AuthConfig, BACKGROUND_PROCESSES_UPPER_BOUND, CURRENT_PROFILE_VERSION,
     DEFAULT_MAX_CPU_FUEL_PER_SEC, IN_FLIGHT_CALLS_UPPER_BOUND, NetworkConfig, PrincipalProfile,
     ProcessConfig, ProfileError, ProfileResult, Quotas, TIMEOUT_SECS_UPPER_BOUND,
 };
@@ -30,6 +30,7 @@ impl PrincipalProfile {
         self.auth.validate()?;
         self.typed_fields()?;
         self.network.validate()?;
+        self.approvals.validate()?;
         self.process.validate()?;
         Ok(())
     }
@@ -167,6 +168,39 @@ impl NetworkConfig {
                         "network.capsule_egress endpoints must be non-empty".into(),
                     ));
                 }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ApprovalsConfig {
+    /// Validate remembered command-always grants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileError::Invalid`] if a command is empty, or if a
+    /// present `workspace_root` is empty.
+    pub fn validate(&self) -> ProfileResult<()> {
+        for grant in &self.command_always {
+            if grant.location == super::CommandApprovalLocation::AstridWorkspace
+                && grant.workspace_root.is_some()
+            {
+                return Err(ProfileError::Invalid(
+                    "native command approval cannot carry a host path".into(),
+                ));
+            }
+            if grant.command.trim().is_empty() {
+                return Err(ProfileError::Invalid(
+                    "approvals.command_always.command must be non-empty".into(),
+                ));
+            }
+            if let Some(workspace) = &grant.workspace_root
+                && workspace.trim().is_empty()
+            {
+                return Err(ProfileError::Invalid(
+                    "approvals.command_always.workspace_root must be non-empty when set".into(),
+                ));
             }
         }
         Ok(())
@@ -510,6 +544,53 @@ mod tests {
         let mut p = PrincipalProfile::default();
         p.process.allow = vec![String::new()];
         assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_empty_command_always_command() {
+        let mut p = PrincipalProfile::default();
+        p.approvals
+            .command_always
+            .push(crate::profile::CommandAlwaysGrant {
+                command: "   ".into(),
+                location: super::super::CommandApprovalLocation::Hosted,
+                workspace_root: None,
+            });
+        let err = p.validate().unwrap_err();
+        match err {
+            ProfileError::Invalid(msg) => assert!(msg.contains("command"), "msg: {msg}"),
+            other => panic!("expected Invalid, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_empty_command_always_workspace_root() {
+        let mut p = PrincipalProfile::default();
+        p.approvals
+            .command_always
+            .push(crate::profile::CommandAlwaysGrant {
+                command: "git push".into(),
+                workspace_root: Some("   ".into()),
+                location: super::super::CommandApprovalLocation::Hosted,
+            });
+        let err = p.validate().unwrap_err();
+        match err {
+            ProfileError::Invalid(msg) => assert!(msg.contains("workspace_root"), "msg: {msg}"),
+            other => panic!("expected Invalid, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_command_always_with_workspace() {
+        let mut p = PrincipalProfile::default();
+        p.approvals
+            .command_always
+            .push(crate::profile::CommandAlwaysGrant {
+                command: "git push".into(),
+                workspace_root: Some("/tmp".into()),
+                location: super::super::CommandApprovalLocation::Hosted,
+            });
+        p.validate().expect("valid command-always grant");
     }
 
     // ── Version gate ──────────────────────────────────────────────────
