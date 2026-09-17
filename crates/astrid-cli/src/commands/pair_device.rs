@@ -4,20 +4,24 @@
 //! Unlike `astrid invite` (which mints a NEW principal), pair-device adds a
 //! new device's ed25519 key to an EXISTING principal's
 //! `AuthConfig.public_keys` under a capability [`scope`](DeviceScope). Each
-//! verb maps to an `AdminRequestKind::PairDevice*` variant and is dispatched
-//! as the operator's active agent:
+//! verb maps to an `AdminRequestKind::PairDevice*` variant:
 //!
 //! * `issue` — mint a pair-token tied to the caller's own principal. The
 //!   `--scope` / `--allow` / `--deny` flags pick the scope the redeemed device
 //!   authenticates under; the kernel validates the requested scope is a subset
 //!   of the issuer's authority (no escalation) and gates a full-scope mint on
-//!   `self:auth:pair:admin`.
+//!   `self:auth:pair:admin`. Dispatched as the operator's active agent.
 //! * `list` — show a principal's paired devices (`key_id` + scope + label).
-//! * `revoke` — remove one paired device by its `key_id`.
+//!   Dispatched as the operator's active agent.
+//! * `revoke` — remove one paired device by its `key_id`. Dispatched as the
+//!   operator's active agent.
+//! * `redeem` — read the bearer from stdin and register only the supplied
+//!   public key. Token-authenticated: connects as the default workspace
+//!   principal, matching invite redeem. Remote devices may use the HTTP
+//!   gateway redemption endpoint.
 //!
-//! Redemption is performed by the new device through the HTTP gateway
-//! (`POST /api/auth/pair-device/redeem`), not this CLI — the redeeming device
-//! holds the private key and receives its scoped session bearer there.
+//! Neither redeem route grants human-user delegation or selects a native
+//! responder.
 
 use std::process::ExitCode;
 
@@ -31,11 +35,17 @@ use crate::admin_client::{connect_as_active_agent, into_result};
 use crate::context;
 use crate::theme::Theme;
 
+mod redeem;
+
 #[derive(Subcommand, Debug, Clone)]
 pub(crate) enum PairDeviceCommand {
     /// Issue a pair-token tied to your own principal. Hand the token to the
-    /// new device out-of-band; it redeems through the HTTP gateway.
+    /// new device out-of-band. Redeem it locally with `pair-device redeem`
+    /// (token on stdin) or remotely through the HTTP gateway.
     Issue(IssueArgs),
+    /// Register a device public key using a pairing token piped on stdin.
+    /// Does not generate keys, switch principals, or activate native input.
+    Redeem(redeem::RedeemArgs),
     /// List paired devices on a principal.
     List(ListArgs),
     /// Revoke a single paired device by its `key_id`.
@@ -97,6 +107,7 @@ pub(crate) struct RevokeArgs {
 pub(crate) async fn run(command: PairDeviceCommand) -> Result<ExitCode> {
     match command {
         PairDeviceCommand::Issue(args) => run_issue(args).await,
+        PairDeviceCommand::Redeem(args) => redeem::run(args).await,
         PairDeviceCommand::List(args) => run_list(args).await,
         PairDeviceCommand::Revoke(args) => run_revoke(args).await,
     }
