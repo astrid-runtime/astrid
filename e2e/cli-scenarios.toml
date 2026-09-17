@@ -290,7 +290,7 @@ principal = "agent_and_admin"
 scenario = "pair_device_lifecycle"
 status = "covered"
 mode = "mutating"
-principal = "public_pair_token"
+principal = "local_cli"
 
 [commands."secret set"]
 scenario = "secret_redaction"
