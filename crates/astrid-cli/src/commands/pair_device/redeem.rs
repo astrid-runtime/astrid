@@ -4,13 +4,14 @@ use std::io::{IsTerminal, Read};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail, ensure};
+use astrid_core::PrincipalId;
 use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
 use astrid_core::profile::DevicePubkey;
 use astrid_crypto::PublicKeyFingerprint;
 use clap::Args;
 use zeroize::Zeroizing;
 
-use crate::admin_client::{connect_as_active_agent, into_result};
+use crate::admin_client::{connect_for_workspace_as, into_result};
 
 #[derive(Args, Debug, Clone)]
 pub(crate) struct RedeemArgs {
@@ -26,7 +27,10 @@ pub(super) async fn run(args: RedeemArgs) -> Result<ExitCode> {
     );
     let token = read_token(std::io::stdin().lock())?;
     let expected = PublicKeyFingerprint::from_ed25519_hex(args.public_key.as_str())?;
-    let mut client = connect_as_active_agent().await?;
+    // Pairing tokens are the auth, matching invite redeem. Do not bind the
+    // handshake to the CLI active agent: a stale or disabled process principal
+    // must still redeem a valid token.
+    let mut client = connect_for_workspace_as(PrincipalId::default()).await?;
     let response = client
         .request(AdminRequestKind::PairDeviceRedeem {
             token: token.to_string(),

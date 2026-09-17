@@ -54,4 +54,31 @@ token = open('pair-token.txt').read().strip()
 for name in ['paired.json', 'devices.json', 'replay.log', 'revoke.log', 'revoked.json']:
     assert token not in open(name).read(), f'token exposed in {name}'
 PY
-echo 'PASS: real key generation, token issuance/redemption, single-use refusal and revocation'
+# Token auth must not depend on the CLI process principal. Create a second
+# agent, disable it, then redeem a valid token while that disabled principal
+# is active. Default stays enabled so the workspace handshake can proceed.
+"$cli" agent create stale-active > create-stale.log 2>&1
+"$cli" agent disable stale-active > disable-stale.log 2>&1
+"$cli" keypair generate --name native-ui-stale --raw > public-key-stale.txt
+public_key_stale=$(<public-key-stale.txt)
+"$cli" pair-device issue --scope use-only --label native-ui-stale --raw > pair-token-stale.txt
+if ! ASTRID_PRINCIPAL=stale-active "$cli" pair-device redeem --public-key "$public_key_stale" \
+    < pair-token-stale.txt > paired-stale.json 2> redeem-stale.log; then
+    echo 'Pairing token was rejected while the active principal was disabled' >&2
+    cat redeem-stale.log >&2
+    exit 1
+fi
+"$cli" pair-device list --json > devices-stale.json
+python3 - <<'PY'
+import json
+paired = json.load(open('paired-stale.json'))
+devices = json.load(open('devices-stale.json'))
+assert paired['principal'] == 'default', paired
+matches = [device for device in devices if device['key_id'] == paired['key_id']]
+assert len(matches) == 1, devices
+assert matches[0]['label'] == 'native-ui-stale', matches
+token = open('pair-token-stale.txt').read().strip()
+for name in ['paired-stale.json', 'devices-stale.json', 'redeem-stale.log', 'create-stale.log', 'disable-stale.log']:
+    assert token not in open(name).read(), f'token exposed in {name}'
+PY
+echo 'PASS: real key generation, token issuance/redemption, single-use refusal, revocation, and disabled-active redeem'
