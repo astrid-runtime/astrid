@@ -29,7 +29,7 @@ pub(crate) fn reject_filtered_shuttle(
 /// Unknown, empty, and duplicate names fail closed. This does not fall back
 /// to headless full-distro selection.
 pub(crate) fn select_named_manifest_capsules(
-    capsules: Vec<DistroCapsule>,
+    capsules: &[DistroCapsule],
     names: &[String],
 ) -> anyhow::Result<Vec<DistroCapsule>> {
     if names.is_empty() {

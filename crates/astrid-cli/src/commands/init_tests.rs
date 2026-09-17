@@ -1030,11 +1030,9 @@ fn named_capsule(name: &str) -> DistroCapsule {
 
 #[test]
 fn select_named_manifest_capsules_keeps_only_requested_members() {
-    let selected = select_named_manifest_capsules(
-        vec![named_capsule("aos-mcp"), named_capsule("aos-skills")],
-        &["aos-skills".to_string()],
-    )
-    .expect("named member is in the signed manifest");
+    let capsules = [named_capsule("aos-mcp"), named_capsule("aos-skills")];
+    let selected = select_named_manifest_capsules(&capsules, &["aos-skills".to_string()])
+        .expect("named member is in the signed manifest");
     assert_eq!(
         selected
             .iter()
@@ -1046,8 +1044,8 @@ fn select_named_manifest_capsules_keeps_only_requested_members() {
 
 #[test]
 fn select_named_manifest_capsules_rejects_unknown_empty_and_duplicate_names() {
-    let capsules = vec![named_capsule("aos-mcp"), named_capsule("aos-skills")];
-    let unknown = select_named_manifest_capsules(capsules.clone(), &["missing".to_string()])
+    let capsules = [named_capsule("aos-mcp"), named_capsule("aos-skills")];
+    let unknown = select_named_manifest_capsules(&capsules, &["missing".to_string()])
         .expect_err("unknown names must not fall back to the full distro");
     assert!(
         unknown
@@ -1056,18 +1054,16 @@ fn select_named_manifest_capsules_rejects_unknown_empty_and_duplicate_names() {
         "got: {unknown:#}"
     );
 
-    let empty = select_named_manifest_capsules(capsules.clone(), &[String::new()])
+    let empty = select_named_manifest_capsules(&capsules, &[String::new()])
         .expect_err("empty names fail closed");
     assert!(
         empty.to_string().contains("non-empty capsule name"),
         "got: {empty:#}"
     );
 
-    let duplicate = select_named_manifest_capsules(
-        capsules.clone(),
-        &["aos-mcp".to_string(), "aos-mcp".to_string()],
-    )
-    .expect_err("duplicate names fail closed");
+    let duplicate =
+        select_named_manifest_capsules(&capsules, &["aos-mcp".to_string(), "aos-mcp".to_string()])
+            .expect_err("duplicate names fail closed");
     assert!(
         duplicate
             .to_string()
@@ -1075,7 +1071,7 @@ fn select_named_manifest_capsules_rejects_unknown_empty_and_duplicate_names() {
         "got: {duplicate:#}"
     );
 
-    let omitted = select_named_manifest_capsules(capsules, &[])
+    let omitted = select_named_manifest_capsules(&capsules, &[])
         .expect_err("omitted names must not select the full distro");
     assert!(
         omitted

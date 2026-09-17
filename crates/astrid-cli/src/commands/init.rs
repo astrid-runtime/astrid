@@ -15,20 +15,20 @@ use indicatif::{ProgressBar, ProgressStyle};
 use super::distro::lock::{DistroLock, DistroLockMeta, LockedCapsule, write_lock_to_daemon};
 #[cfg(test)]
 use super::distro::lock::{load_lock, manifest_hash, write_lock};
-use super::distro::manifest::DistroCapsule;
+use super::distro::manifest::{DistroCapsule, DistroManifest, VariableDef};
 use crate::theme::Theme;
 
 #[path = "init_signed_source.rs"]
 mod signed_source;
 
-use signed_source::{PreparedDistro, prepare_distro_source, unpack_prepared};
+use signed_source::{PreparedDistro, SignedDistroBundle, prepare_distro_source, unpack_prepared};
 
-#[path = "init_selected.rs"]
 mod selected;
+#[cfg(test)]
+pub(crate) use selected::require_named_members_present;
 use selected::{filtered_refresh_requested, require_installed_named_members};
 pub(crate) use selected::{
-    reject_filtered_partial_refresh, reject_filtered_shuttle, require_named_members_present,
-    select_named_manifest_capsules,
+    reject_filtered_partial_refresh, reject_filtered_shuttle, select_named_manifest_capsules,
 };
 
 mod lifetime;
@@ -162,28 +162,8 @@ pub(crate) async fn run_init(
     // on an older CLI; fail fast with an actionable upgrade message instead.
     super::distro::validate::enforce_astrid_version(&manifest)?;
 
-    // Display distro info.
-    let display_name = manifest
-        .distro
-        .pretty_name
-        .as_deref()
-        .unwrap_or(&manifest.distro.name);
     let filtered = filtered_refresh_requested(&opts.selected_capsules);
-    eprintln!(
-        "{}",
-        Theme::header(&format!(
-            "{} {display_name}",
-            if filtered {
-                "Refreshing selected members of"
-            } else {
-                "Installing"
-            }
-        ))
-    );
-    if let Some(ref desc) = manifest.distro.description {
-        eprintln!("  {desc}");
-    }
-    eprintln!();
+    announce_distro_install(&manifest, filtered);
 
     // Select providers (multi-select per group).
     // Extract fields we need before consuming capsules.
@@ -195,7 +175,7 @@ pub(crate) async fn run_init(
     // Named `--capsule` selection is resolved against the verified manifest
     // and never falls back to headless full-distro selection.
     let selected = if filtered {
-        select_named_manifest_capsules(manifest.capsules, &opts.selected_capsules)?
+        select_named_manifest_capsules(&manifest.capsules, &opts.selected_capsules)?
     } else {
         select_capsules(manifest.capsules, opts.yes)?
     };
@@ -219,21 +199,116 @@ pub(crate) async fn run_init(
     };
 
     if filtered {
-        let total = selected.len();
-        let install_result = install_capsules_with_resume(
+        return refresh_named_distro_members(
             &selected,
-            opts.offline,
+            opts,
             &target,
-            signed_bundle.as_ref().map(|bundle| &bundle.pinned_refs),
+            signed_bundle.as_ref(),
+            daemon_lease,
         )
-        .await?;
-        let succeeded = install_result.locked.len();
-        reject_total_install_failure(total, succeeded)?;
-        reject_filtered_partial_refresh(total, succeeded)?;
-        eprintln!();
-        eprintln!("{}", Theme::success("Selected Distro members refreshed."));
-        return Ok(daemon_lease);
+        .await;
     }
+
+    finalize_unfiltered_distro_install(
+        UnfilteredDistroInstall {
+            home: &home,
+            operator,
+            target,
+            opts,
+            variables,
+            selected,
+            signed_bundle,
+            schema_version,
+            distro_id,
+            distro_version,
+            expected_manifest_hash,
+        },
+        daemon_lease,
+    )
+    .await
+}
+
+/// Print the Distro Apply header before selection mutates the manifest.
+fn announce_distro_install(manifest: &DistroManifest, filtered: bool) {
+    let display_name = manifest
+        .distro
+        .pretty_name
+        .as_deref()
+        .unwrap_or(&manifest.distro.name);
+    eprintln!(
+        "{}",
+        Theme::header(&format!(
+            "{} {display_name}",
+            if filtered {
+                "Refreshing selected members of"
+            } else {
+                "Installing"
+            }
+        ))
+    );
+    if let Some(ref desc) = manifest.distro.description {
+        eprintln!("  {desc}");
+    }
+    eprintln!();
+}
+
+/// Refresh already-installed named members without rewriting env, lock, or grants.
+async fn refresh_named_distro_members(
+    selected: &[DistroCapsule],
+    opts: &InitOpts,
+    target: &astrid_core::PrincipalId,
+    signed_bundle: Option<&SignedDistroBundle>,
+    daemon_lease: ProvisioningLease,
+) -> anyhow::Result<ProvisioningLease> {
+    let total = selected.len();
+    let install_result = install_capsules_with_resume(
+        selected,
+        opts.offline,
+        target,
+        signed_bundle.map(|bundle| &bundle.pinned_refs),
+    )
+    .await?;
+    let succeeded = install_result.locked.len();
+    reject_total_install_failure(total, succeeded)?;
+    reject_filtered_partial_refresh(total, succeeded)?;
+    eprintln!();
+    eprintln!("{}", Theme::success("Selected Distro members refreshed."));
+    Ok(daemon_lease)
+}
+
+/// Inputs for the unfiltered Distro install after named selection returns.
+struct UnfilteredDistroInstall<'a> {
+    home: &'a AstridHome,
+    operator: astrid_core::PrincipalId,
+    target: astrid_core::PrincipalId,
+    opts: &'a InitOpts,
+    variables: HashMap<String, VariableDef>,
+    selected: Vec<DistroCapsule>,
+    signed_bundle: Option<SignedDistroBundle>,
+    schema_version: u32,
+    distro_id: String,
+    distro_version: String,
+    expected_manifest_hash: String,
+}
+
+/// Collect variables, persist env/lock/grants, and onboard the unfiltered set.
+async fn finalize_unfiltered_distro_install(
+    install: UnfilteredDistroInstall<'_>,
+    daemon_lease: ProvisioningLease,
+) -> anyhow::Result<ProvisioningLease> {
+    let UnfilteredDistroInstall {
+        home,
+        operator,
+        target,
+        opts,
+        variables,
+        selected,
+        signed_bundle,
+        schema_version,
+        distro_id,
+        distro_version,
+        expected_manifest_hash,
+    } = install;
 
     // Collect variables needed by selected capsules.
     let vars = collect_variables(&variables, &selected, opts.yes, &opts.vars)?;
@@ -241,7 +316,7 @@ pub(crate) async fn run_init(
     // Write per-capsule env files BEFORE installing capsules so that
     // install_capsule's onboarding check finds existing values and
     // doesn't re-prompt for fields the distro already configured.
-    write_env_files(&home, &target, &selected, &variables, &vars)?;
+    write_env_files(home, &target, &selected, &variables, &vars)?;
 
     // Install each capsule with progress. The helper returns one
     // `LockedCapsule` per member that either installed or matched a complete
@@ -274,7 +349,7 @@ pub(crate) async fn run_init(
     // shared free-text `[variables]`. Shared values already written above
     // are preserved (the prompt skips set keys).
     if should_write_lock(total, succeeded) {
-        onboarding::onboard_llm_providers(&home, &target, &selected).await;
+        onboarding::onboard_llm_providers(home, &target, &selected).await;
     }
 
     // Persist Distro.lock iff the run earned it (full success or empty

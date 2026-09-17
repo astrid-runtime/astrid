@@ -128,16 +128,15 @@ fn distro_apply_parses_repeated_capsule_flags() {
 
 #[test]
 fn distro_apply_rejects_empty_capsule_name() {
-    let err = match Cli::try_parse_from([
+    let Err(err) = Cli::try_parse_from([
         "astrid",
         "distro",
         "apply",
         "./Distro.toml",
         "--capsule",
         "",
-    ]) {
-        Ok(_) => panic!("empty --capsule names must fail at parse time"),
-        Err(err) => err,
+    ]) else {
+        panic!("empty --capsule names must fail at parse time");
     };
     let rendered = err.to_string();
     assert!(
