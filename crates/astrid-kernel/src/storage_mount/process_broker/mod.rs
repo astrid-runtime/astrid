@@ -8,29 +8,15 @@ use process_identity::parent_start_identity;
 mod process_stop;
 #[cfg(any(unix, windows))]
 use process_stop::stop_process_provider;
+#[cfg(any(unix, windows))]
+mod process_cleanup;
+#[cfg(any(unix, windows))]
+use process_cleanup::{ProjectionCleanupState, RunningProvider, cleanup_projection_state};
+#[cfg(all(test, any(unix, windows)))]
+mod process_cache_tests;
 
 pub(crate) type ProjectionCleanup =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync + 'static>;
-
-struct RunningProvider {
-    child: tokio::process::Child,
-    control_path: PathBuf,
-    token: String,
-    stopped: bool,
-}
-
-struct ProjectionCleanupState {
-    kernel: std::sync::Weak<Kernel>,
-    principal: PrincipalId,
-    branch: RunningProvider,
-    owner: RunningProvider,
-    shared: Option<RunningProvider>,
-    branch_id: StorageMountId,
-    owner_id: StorageMountId,
-    shared_id: Option<StorageMountId>,
-    mount_root: PathBuf,
-    cleaned: bool,
-}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ProcessProjectionKey {
@@ -99,7 +85,7 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
         // kernel-local lock through provider readiness prevents concurrent
         // capsules for one immutable UID from racing to create duplicate
         // provider pairs; subsequent callers take the cached fast path.
-        let mut projections = self.projections.lock().await;
+        let projections = self.projections.lock().await;
         let binding = service.bind(principal).await?;
         let principal_uid = kernel
             .principal_directory
@@ -119,30 +105,15 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             branch: binding.branch,
             read_write: matches!(access, StorageProviderAccessV1::ReadWrite),
         };
-        if let Some(projection) = projections.get(&key).cloned() {
-            let retried = if projection.cleanup_failed.load(Ordering::Acquire) {
-                // A failed last-close retains the projection in this cache so
-                // a later authenticated mount request can retry STOP/reap,
-                // lease revocation, and resource removal. Do not create a
-                // second provider pair while any prior resources remain.
-                if !retry_failed_projection(&projection, &self.projections, key).await {
-                    return Err(
-                        "native process storage projection requires administrative cleanup"
-                            .to_owned(),
-                    );
-                }
-                true
-            } else {
-                false
-            };
-            if !retried {
-                return retain_locked_projection(
-                    projection,
-                    projections,
-                    Arc::clone(&self.projections),
-                    key,
-                );
-            }
+        let (cached, mut projections) =
+            admit_cached_process_projection(&self.projections, projections, key).await?;
+        if let Some(projection) = cached {
+            return retain_locked_projection(
+                projection,
+                projections,
+                Arc::clone(&self.projections),
+                key,
+            );
         }
         // A durable branch is an authority target, not a host mount identity.
         // The random root identifies this one provider-service incarnation;
@@ -375,18 +346,21 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                 control_path: branch_control,
                 token: branch_launch.parent.token,
                 stopped: false,
+                mountpoint: branch_launch.mountpoint,
             },
             owner: RunningProvider {
                 child: owner_child,
                 control_path: owner_control,
                 token: owner_launch.parent.token,
                 stopped: false,
+                mountpoint: owner_launch.mountpoint,
             },
             shared: shared_child.take().map(|(child, launch)| RunningProvider {
                 child,
                 control_path: launch.control_path,
                 token: launch.parent.token,
                 stopped: false,
+                mountpoint: launch.mountpoint,
             }),
             branch_id: branch_lease.mount_id,
             owner_id: owner_lease.mount_id,
@@ -425,82 +399,6 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
 }
 
 #[cfg(any(unix, windows))]
-async fn cleanup_projection_state(
-    cleanup_state: Arc<tokio::sync::Mutex<ProjectionCleanupState>>,
-) -> bool {
-    let mut state = cleanup_state.lock().await;
-    if state.cleaned {
-        return true;
-    }
-
-    // Provider teardown is an authenticated async protocol: STOP, wait for
-    // the service's unmount acknowledgement, then reap the child. A kill is
-    // only the emergency fallback when a provider is wedged or gone; keeping
-    // the provider handles in the state makes a later mount request retry the
-    // same bounded operation instead of creating a second projection.
-    let branch_stopped = stop_running_provider(&mut state.branch).await;
-    let owner_stopped = stop_running_provider(&mut state.owner).await;
-    let shared_stopped = match state.shared.as_mut() {
-        Some(shared) => stop_running_provider(shared).await,
-        None => true,
-    };
-    if !branch_stopped || !owner_stopped || !shared_stopped {
-        tracing::error!(
-            branch_stopped,
-            owner_stopped,
-            shared_stopped,
-            "native process storage provider teardown failed; retaining private mount resources"
-        );
-        return false;
-    }
-    let Some(kernel) = state.kernel.upgrade() else {
-        tracing::error!("kernel shut down before process storage projection leases were revoked");
-        return false;
-    };
-    if revoke_lease(&kernel, &state.principal, true, state.branch_id)
-        .await
-        .is_err()
-        || revoke_lease(&kernel, &state.principal, true, state.owner_id)
-            .await
-            .is_err()
-    {
-        tracing::error!("failed to revoke process storage projection leases; retaining resources");
-        return false;
-    }
-    if let Some(shared_id) = state.shared_id
-        && revoke_lease(&kernel, &state.principal, true, shared_id)
-            .await
-            .is_err()
-    {
-        tracing::error!("failed to revoke Fleet shared projection lease");
-        return false;
-    }
-    if let Err(error) = std::fs::remove_dir_all(&state.mount_root) {
-        tracing::error!(%error, "failed to remove process storage projection root");
-        return false;
-    }
-    state.cleaned = true;
-    true
-}
-
-#[cfg(any(unix, windows))]
-async fn stop_running_provider(provider: &mut RunningProvider) -> bool {
-    if provider.stopped {
-        return true;
-    }
-    let stopped = stop_process_provider(
-        &mut provider.child,
-        provider.control_path.clone(),
-        provider.token.clone(),
-    )
-    .await;
-    if stopped {
-        provider.stopped = true;
-    }
-    stopped
-}
-
-#[cfg(any(unix, windows))]
 pub(crate) async fn retry_failed_projection(
     projection: &Arc<CachedProcessProjection>,
     projections: &Arc<
@@ -513,15 +411,66 @@ pub(crate) async fn retry_failed_projection(
     if !(projection.cleanup)().await {
         return false;
     }
-    projection.cleanup_failed.store(false, Ordering::Release);
     let mut projections = projections.lock().await;
     if projections
         .get(&key)
         .is_some_and(|current| Arc::ptr_eq(current, projection))
     {
         projections.remove(&key);
+        projection.cleanup_failed.store(false, Ordering::Release);
     }
     true
+}
+
+/// Drop the cache guard before retrying cleanup so this helper can re-lock.
+/// After a successful retry, re-acquire and retain any healthy pair another
+/// caller already inserted under the same key.
+#[cfg(any(unix, windows))]
+pub(crate) async fn admit_cached_process_projection<'cache>(
+    projections: &'cache Arc<
+        tokio::sync::Mutex<
+            std::collections::BTreeMap<ProcessProjectionKey, Arc<CachedProcessProjection>>,
+        >,
+    >,
+    guard: tokio::sync::MutexGuard<
+        'cache,
+        std::collections::BTreeMap<ProcessProjectionKey, Arc<CachedProcessProjection>>,
+    >,
+    key: ProcessProjectionKey,
+) -> Result<
+    (
+        Option<Arc<CachedProcessProjection>>,
+        tokio::sync::MutexGuard<
+            'cache,
+            std::collections::BTreeMap<ProcessProjectionKey, Arc<CachedProcessProjection>>,
+        >,
+    ),
+    String,
+> {
+    let Some(projection) = guard.get(&key).cloned() else {
+        return Ok((None, guard));
+    };
+    if !projection.cleanup_failed.load(Ordering::Acquire) {
+        return Ok((Some(projection), guard));
+    }
+    // A failed last-close retains the projection so a later authenticated
+    // mount can retry STOP/reap, lease revocation, and resource removal.
+    // Do not hold this mutex across that await, and do not create a second
+    // provider pair while any prior resources remain.
+    drop(guard);
+    if !retry_failed_projection(&projection, projections, key).await {
+        return Err("native process storage projection requires administrative cleanup".to_owned());
+    }
+    let guard = projections.lock().await;
+    if let Some(current) = guard.get(&key).cloned() {
+        if current.cleanup_failed.load(Ordering::Acquire) {
+            return Err(
+                "native process storage projection requires administrative cleanup".to_owned(),
+            );
+        }
+        return Ok((Some(current), guard));
+    }
+    Ok((None, guard))
 }
 
 #[cfg(any(unix, windows))]
