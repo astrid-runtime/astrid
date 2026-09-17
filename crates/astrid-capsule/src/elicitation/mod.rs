@@ -23,6 +23,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use astrid_core::principal::PrincipalId;
+use astrid_core::profile::DeviceKeyId;
 
 use crate::capsule::CapsuleId;
 
@@ -222,6 +223,7 @@ pub struct PendingSecretElicits {
     slots: Mutex<HashMap<SecretElicitId, Slot>>,
     capacity: usize,
     principals: Option<HashSet<PrincipalId>>,
+    devices: HashMap<PrincipalId, DeviceKeyId>,
 }
 
 struct Slot {
@@ -248,6 +250,7 @@ impl PendingSecretElicits {
             slots: Mutex::new(HashMap::new()),
             capacity: capacity.get(),
             principals: None,
+            devices: HashMap::new(),
         }
     }
 
@@ -260,6 +263,19 @@ impl PendingSecretElicits {
         }
     }
 
+    /// Restrict native routing to operator-selected principal/device bindings.
+    #[must_use]
+    pub fn for_bindings(
+        capacity: NonZeroUsize,
+        bindings: HashMap<PrincipalId, DeviceKeyId>,
+    ) -> Self {
+        Self {
+            principals: Some(bindings.keys().cloned().collect()),
+            devices: bindings,
+            ..Self::new(capacity)
+        }
+    }
+
     /// Whether this principal uses the private path. Other principals retain
     /// their existing transport; a disconnected native responder is not fallback.
     #[must_use]
@@ -267,6 +283,12 @@ impl PendingSecretElicits {
         self.principals
             .as_ref()
             .is_none_or(|principals| principals.contains(principal))
+    }
+
+    /// Configured responder device for a privately routed principal.
+    #[must_use]
+    pub fn bound_device(&self, principal: &PrincipalId) -> Option<&DeviceKeyId> {
+        self.devices.get(principal)
     }
 
     /// Open a secret slot and return the host-side waiter.

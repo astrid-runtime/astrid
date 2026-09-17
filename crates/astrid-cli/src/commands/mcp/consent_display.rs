@@ -13,8 +13,10 @@
 //! carries only `action` and `target-resource`; it has no reason field,
 //! and this module never treats a guest string as a reason claim.
 //!
-//! Routing tokens (`request_id`, `call_id`, ingress `source_id`) and grant
-//! targets are never placed in this map.
+//! Routing tokens (`request_id`, `call_id`, ingress `source_id`) are never
+//! placed in this map. Serialized `principal` and `capsule` on capsule-access
+//! payloads are display-only labels; authorization stays host-side and is
+//! not inferred from these fields.
 
 use rmcp::model::RequestMetaObject;
 use serde::Serialize;

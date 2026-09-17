@@ -222,3 +222,73 @@ async fn real_socket_rejects_token_only_secret_without_bus_publication() {
         .unwrap()
         .unwrap();
 }
+
+#[test]
+fn unstamped_private_request_reaches_same_principal_devices() {
+    let principal = "alice";
+    let bound = "0123456789abcdef";
+    let other = "fedcba9876543210";
+    let unstamped = IpcMessage::new(
+        Topic::private_elicit_request(),
+        IpcPayload::RawJson(serde_json::json!({})),
+        Uuid::nil(),
+    )
+    .with_principal(principal);
+    assert!(super::super::routing::should_deliver(
+        &unstamped,
+        principal,
+        Some(bound),
+        None,
+    ));
+    assert!(super::super::routing::should_deliver(
+        &unstamped,
+        principal,
+        Some(other),
+        None,
+    ));
+    let stamped = unstamped.with_device_key_id(bound);
+    assert!(super::super::routing::should_deliver(
+        &stamped,
+        principal,
+        Some(bound),
+        None,
+    ));
+    assert!(!super::super::routing::should_deliver(
+        &stamped,
+        principal,
+        Some(other),
+        None,
+    ));
+}
+
+#[test]
+fn oversized_empty_array_is_invalid_without_invoking_handler() {
+    let handler = Recorder::default();
+    let id = Uuid::new_v4();
+    let values = vec![String::new(); super::MAX_ELICIT_ARRAY_ITEMS + 1];
+    assert_eq!(
+        status(&respond(
+            &identity(true),
+            Some(&handler),
+            message(id, None, Some(values))
+        )),
+        "invalid"
+    );
+    assert!(handler.0.lock().unwrap().is_empty());
+}
+
+#[test]
+fn encoded_envelope_over_payload_ceiling_is_invalid() {
+    let handler = Recorder::default();
+    let id = Uuid::new_v4();
+    let value = "x".repeat(super::super::MAX_PAYLOAD_BYTES);
+    assert_eq!(
+        status(&respond(
+            &identity(true),
+            Some(&handler),
+            message(id, Some(&value), None)
+        )),
+        "invalid"
+    );
+    assert!(handler.0.lock().unwrap().is_empty());
+}

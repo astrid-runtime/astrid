@@ -65,14 +65,14 @@ fn live_handler(
         registry,
         native.identity.principal().clone(),
         native.device.key_id.clone(),
+        {
+            let cache = Arc::clone(&native.cache);
+            move |principal, device| {
+                astrid_kernel::native_input_device_is_live(&cache, principal, device)
+            }
+        },
     )
     .unwrap()
-    .with_live_device_check({
-        let cache = Arc::clone(&native.cache);
-        move |principal, device| {
-            astrid_kernel::native_input_device_is_live(&cache, principal, device)
-        }
-    })
 }
 
 fn secret_frame(request_id: Uuid) -> Vec<u8> {

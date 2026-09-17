@@ -44,14 +44,39 @@ pub enum PrivateElicitRejection {
     Invalid,
 }
 
-fn payload_too_large(value: Option<&str>, values: Option<&[String]>) -> bool {
-    value.is_some_and(|value| value.len() > super::MAX_PAYLOAD_BYTES)
-        || values.is_some_and(|items| {
+/// Empty JSON strings cost two quotes plus a comma or bracket delimiter
+/// (`""` + `,`/`[`/`]`). Bound element count first so a million empty
+/// strings cannot force envelope serialization before the 1 MiB host IPC
+/// ceiling. This is a protocol/DoS guard derived from [`super::MAX_PAYLOAD_BYTES`],
+/// not an operator knob and not a second silent ceiling.
+const MAX_ELICIT_ARRAY_ITEMS: usize = super::MAX_PAYLOAD_BYTES / 3;
+
+fn payload_too_large(payload: &IpcPayload) -> bool {
+    let IpcPayload::ElicitResponse { value, values, .. } = payload else {
+        return true;
+    };
+    if values
+        .as_ref()
+        .is_some_and(|items| items.len() > MAX_ELICIT_ARRAY_ITEMS)
+    {
+        return true;
+    }
+    if value
+        .as_deref()
+        .is_some_and(|value| value.len() > super::MAX_PAYLOAD_BYTES)
+        || values.as_ref().is_some_and(|items| {
             items
                 .iter()
                 .fold(0usize, |acc, item| acc.saturating_add(item.len()))
                 > super::MAX_PAYLOAD_BYTES
         })
+    {
+        return true;
+    }
+    match serde_json::to_vec(payload) {
+        Ok(bytes) => bytes.len() > super::MAX_PAYLOAD_BYTES,
+        Err(_) => true,
+    }
 }
 
 pub(super) fn respond(
@@ -65,18 +90,36 @@ pub(super) fn respond(
             value,
             values,
         } => {
-            let result = if value.is_some() && values.is_some()
-                || payload_too_large(value.as_deref(), values.as_deref())
-            {
-                Err(PrivateElicitRejection::Invalid)
-            } else if let Some(device) = identity.device_key_id.as_deref() {
-                handler.map_or(Err(PrivateElicitRejection::Unavailable), |handler| {
-                    handler.reply(&identity.principal, device, request_id, value, values)
-                })
+            if value.is_some() && values.is_some() {
+                (request_id, Err(PrivateElicitRejection::Invalid))
             } else {
-                Err(PrivateElicitRejection::Forbidden)
-            };
-            (request_id, result)
+                let payload = IpcPayload::ElicitResponse {
+                    request_id,
+                    value,
+                    values,
+                };
+                let result = if payload_too_large(&payload) {
+                    Err(PrivateElicitRejection::Invalid)
+                } else if let Some(device) = identity.device_key_id.as_deref() {
+                    match payload {
+                        IpcPayload::ElicitResponse { value, values, .. } => {
+                            handler.map_or(Err(PrivateElicitRejection::Unavailable), |handler| {
+                                handler.reply(
+                                    &identity.principal,
+                                    device,
+                                    request_id,
+                                    value,
+                                    values,
+                                )
+                            })
+                        },
+                        _ => Err(PrivateElicitRejection::Invalid),
+                    }
+                } else {
+                    Err(PrivateElicitRejection::Forbidden)
+                };
+                (request_id, result)
+            }
         },
         _ => (Uuid::nil(), Err(PrivateElicitRejection::Invalid)),
     };

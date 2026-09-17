@@ -20,13 +20,14 @@ type LiveDeviceCheck = Arc<dyn Fn(&PrincipalId, &str) -> bool + Send + Sync>;
 pub struct NativeSecretResponder {
     registry: Arc<PendingSecretElicits>,
     bindings: HashMap<PrincipalId, DeviceKeyId>,
-    device_is_live: Option<LiveDeviceCheck>,
+    device_is_live: LiveDeviceCheck,
 }
 
 impl NativeSecretResponder {
     /// Bind a device fingerprint already approved by the operator/runtime.
-    /// This constructor does not grant permissions, register device keys, or
-    /// attach live profile revalidation. Production boot attaches a live profile check.
+    /// Live profile revalidation is a constructor dependency so a revoked
+    /// device cannot skip the check. This does not grant permissions or
+    /// register device keys.
     ///
     /// # Errors
     /// Refuses a malformed fingerprint or the unauthenticated principal.
@@ -34,37 +35,37 @@ impl NativeSecretResponder {
         registry: Arc<PendingSecretElicits>,
         principal: PrincipalId,
         device_key_id: String,
+        device_is_live: impl Fn(&PrincipalId, &str) -> bool + Send + Sync + 'static,
     ) -> Result<Self, PrivateElicitRejection> {
         if principal == PrincipalId::anonymous() {
             return Err(PrivateElicitRejection::Forbidden);
         }
         let device =
             DeviceKeyId::new(device_key_id).map_err(|_| PrivateElicitRejection::Forbidden)?;
-        Ok(Self {
+        Ok(Self::from_bindings(
             registry,
-            bindings: [(principal, device)].into(),
-            device_is_live: None,
-        })
+            [(principal, device)].into(),
+            Arc::new(device_is_live),
+        ))
     }
 
-    /// Recheck the live principal profile after the boot binding matches.
-    #[must_use]
-    pub(crate) fn with_live_device_check(
-        mut self,
-        check: impl Fn(&PrincipalId, &str) -> bool + Send + Sync + 'static,
+    fn from_bindings(
+        registry: Arc<PendingSecretElicits>,
+        bindings: HashMap<PrincipalId, DeviceKeyId>,
+        device_is_live: LiveDeviceCheck,
     ) -> Self {
-        self.device_is_live = Some(Arc::new(check));
-        self
+        Self {
+            registry,
+            bindings,
+            device_is_live,
+        }
     }
 
     fn device_may_reply(&self, principal: &PrincipalId, device_key_id: &str) -> bool {
         self.bindings
             .get(principal)
             .is_some_and(|device| device.as_str() == device_key_id)
-            && self
-                .device_is_live
-                .as_ref()
-                .is_none_or(|check| check(principal, device_key_id))
+            && (self.device_is_live)(principal, device_key_id)
     }
 }
 
@@ -102,6 +103,7 @@ impl PrivateElicitResponder for NativeSecretResponder {
 ///
 /// # Errors
 /// Refuses malformed config, an invalid pending-request limit, or a second bind.
+#[cfg(unix)]
 pub(crate) fn configure(
     kernel: &Arc<astrid_kernel::Kernel>,
     config: &astrid_config::Config,
@@ -114,22 +116,35 @@ pub(crate) fn configure(
         .ok()
         .and_then(std::num::NonZeroUsize::new)
         .ok_or_else(|| anyhow::anyhow!("native input needs a positive pending-request limit"))?;
-    let registry = Arc::new(PendingSecretElicits::for_principals(
+    let registry = Arc::new(PendingSecretElicits::for_bindings(
         capacity,
-        bindings.keys().cloned().collect(),
+        bindings.clone(),
     ));
     kernel.bind_native_secret_inputs(Arc::clone(&registry))?;
     let kernel = Arc::clone(kernel);
-    Ok(Some(Arc::new(
-        NativeSecretResponder {
-            registry,
-            bindings,
-            device_is_live: None,
-        }
-        .with_live_device_check(move |principal, device_key_id| {
+    Ok(Some(Arc::new(NativeSecretResponder::from_bindings(
+        registry,
+        bindings,
+        Arc::new(move |principal, device_key_id| {
             kernel.native_input_device_is_live(principal, device_key_id)
         }),
-    )))
+    ))))
+}
+
+/// Native secret input routing is Unix-local. Empty bindings keep the
+/// legacy transport; a configured responder map fails closed here.
+///
+/// # Errors
+/// Refuses a non-empty responder map on this platform.
+#[cfg(not(unix))]
+pub(crate) fn configure(
+    _kernel: &Arc<astrid_kernel::Kernel>,
+    config: &astrid_config::Config,
+) -> anyhow::Result<Option<Arc<dyn PrivateElicitResponder>>> {
+    if config.native_input.bindings()?.is_empty() {
+        return Ok(None);
+    }
+    anyhow::bail!("native secret input routing is not supported on this platform")
 }
 
 #[cfg(test)]

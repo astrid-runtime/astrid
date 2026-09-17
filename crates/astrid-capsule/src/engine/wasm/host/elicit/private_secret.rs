@@ -17,8 +17,18 @@ pub(super) fn collect(
     field: OnboardingField,
     registry: Arc<PendingSecretElicits>,
 ) -> Result<ElicitResponse, ErrorCode> {
+    let principal = state.effective_principal();
+    // Stamp the operator-configured responder device, never the in-flight
+    // ingress connection. A private route without a bound device must not
+    // wait or publish, including to other devices of the same principal.
+    let Some(device) = registry.bound_device(&principal) else {
+        return Err(ErrorCode::Unknown(
+            "private secret input has no bound responder device".into(),
+        ));
+    };
+    let device_key_id = device.as_str().to_owned();
     let identity = SecretElicitIdentity::new(
-        state.effective_principal().clone(),
+        principal.clone(),
         state.capsule_id.clone(),
         SecretElicitKey::new(request.key.clone()).map_err(|_| ErrorCode::InvalidInput)?,
     );
@@ -30,7 +40,8 @@ pub(super) fn collect(
         waiter.id().as_uuid(),
         state.capsule_id.to_string(),
         field.clone(),
-        state.effective_principal().to_string(),
+        principal.to_string(),
+        Some(device_key_id),
     );
     let bus = state.event_bus.clone();
     let cancellation = state.effective_cancel_token();

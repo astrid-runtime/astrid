@@ -1,9 +1,11 @@
 //! Boot-only private-input composition; reloads reuse the same registry.
 
+#[cfg(not(target_family = "wasm"))]
 use astrid_capsule::elicitation::PendingSecretElicits;
 use astrid_capsule::profile_cache::PrincipalProfileCache;
 use astrid_core::PrincipalId;
 use astrid_core::profile::DeviceKeyId;
+#[cfg(not(target_family = "wasm"))]
 use std::sync::Arc;
 
 /// Recheck the live principal profile before a private secret reply.
@@ -32,6 +34,7 @@ impl crate::Kernel {
     ///
     /// # Errors
     /// A second binding is refused. Changing routing requires a daemon restart.
+    #[cfg(not(target_family = "wasm"))]
     pub fn bind_native_secret_inputs(
         &self,
         registry: Arc<PendingSecretElicits>,
@@ -64,6 +67,7 @@ mod tests {
     use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope};
     use astrid_crypto::KeyPair;
 
+    #[cfg(not(target_family = "wasm"))]
     #[tokio::test]
     async fn native_input_boot_binding_is_write_once() {
         let root = tempfile::tempdir().unwrap();

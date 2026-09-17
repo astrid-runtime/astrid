@@ -6,10 +6,15 @@ use astrid_events::AstridEvent;
 use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use uuid::Uuid;
 
+use astrid_core::profile::DeviceKeyId;
+
 use super::*;
 use crate::elicitation::{SecretElicitError, SecretElicitId};
 use crate::engine::wasm::bindings::astrid::elicit::host::{ElicitType, Host};
 use crate::engine::wasm::test_fixtures::{mem_secret_store, minimal_host_state};
+
+const BOUND_DEVICE: &str = "0123456789abcdef";
+const INGRESS_DEVICE: &str = "fedcba9876543210";
 
 fn request() -> ElicitRequest {
     ElicitRequest {
@@ -106,9 +111,13 @@ fn setup() -> (HostState, Arc<PendingSecretElicits>, SecretElicitIdentity) {
     let rt = tokio::runtime::Handle::current();
     let mut state = minimal_host_state(rt.clone());
     state.secret_store = mem_secret_store("capsule:private-test", rt);
-    let registry = Arc::new(PendingSecretElicits::for_principals(
+    let registry = Arc::new(PendingSecretElicits::for_bindings(
         NonZeroUsize::new(2).unwrap(),
-        [state.effective_principal()].into(),
+        [(
+            state.effective_principal(),
+            DeviceKeyId::new(BOUND_DEVICE.to_owned()).unwrap(),
+        )]
+        .into(),
     ));
     state.secret_elicits = Some(Arc::clone(&registry));
     let identity = SecretElicitIdentity::new(
@@ -438,6 +447,67 @@ async fn array_default_and_select_non_member_default_reject_before_notification(
     assert!(matches!(result, Err(ErrorCode::InvalidInput)));
     assert!(
         tokio::time::timeout(Duration::from_millis(20), requests.recv())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_collect_stamps_bound_device_not_ingress() {
+    let (mut state, registry, identity) = setup();
+    state.ingress_device_key_id = Some(INGRESS_DEVICE.into());
+    let bus = state.event_bus.clone();
+    let mut requests = bus.subscribe_topic(Topic::private_elicit_request().as_str());
+    let host = tokio::task::spawn_blocking(move || state.elicit(request()));
+    let event = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let AstridEvent::Ipc { message, .. } = &*event else {
+        panic!("expected IPC")
+    };
+    assert_eq!(message.device_key_id.as_deref(), Some(BOUND_DEVICE));
+    assert_ne!(message.device_key_id.as_deref(), Some(INGRESS_DEVICE));
+    let IpcPayload::ElicitRequest { request_id, .. } = &message.payload else {
+        panic!("expected schema")
+    };
+    let id = SecretElicitId::from_uuid(*request_id);
+    registry
+        .complete(id, &identity, "synthetic-private-value".into())
+        .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), host)
+            .await
+            .unwrap()
+            .unwrap(),
+        Ok(ElicitResponse::SecretStored)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_route_without_bound_device_fails_closed_before_wait() {
+    let (mut state, _, identity) = setup();
+    let registry = Arc::new(PendingSecretElicits::for_principals(
+        NonZeroUsize::MIN,
+        [identity.principal().clone()].into(),
+    ));
+    assert!(registry.routes_principal(identity.principal()));
+    assert!(registry.bound_device(identity.principal()).is_none());
+    state.secret_elicits = Some(registry);
+    let bus = state.event_bus.clone();
+    let mut native = bus.subscribe_topic(Topic::private_elicit_request().as_str());
+    let mut legacy = bus.subscribe_topic(Topic::elicit_request().as_str());
+    let result = tokio::task::spawn_blocking(move || state.elicit(request()))
+        .await
+        .unwrap();
+    assert!(matches!(result, Err(ErrorCode::Unknown(_))));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), native.recv())
+            .await
+            .is_err()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), legacy.recv())
             .await
             .is_err()
     );

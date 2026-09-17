@@ -29,6 +29,7 @@ async fn bound_device_delivers_to_original_waiter_and_late_reply_fails() {
         registry,
         identity.principal().clone(),
         "0123456789abcdef".into(),
+        |_, _| true,
     )
     .unwrap();
     for (principal, device) in [
@@ -82,6 +83,7 @@ async fn authorized_device_cannot_answer_another_principals_request() {
         registry.clone(),
         bob.principal().clone(),
         "0123456789abcdef".into(),
+        |_, _| true,
     )
     .unwrap();
     assert_eq!(
@@ -102,6 +104,7 @@ async fn empty_answer_does_not_consume_request_and_cancel_is_explicit() {
         registry,
         identity.principal().clone(),
         "0123456789abcdef".into(),
+        |_, _| true,
     )
     .unwrap();
     assert_eq!(
@@ -128,6 +131,7 @@ fn bound_responder(
         registry,
         identity.principal().clone(),
         "0123456789abcdef".into(),
+        |_, _| true,
     )
     .unwrap()
 }
@@ -232,12 +236,12 @@ async fn live_check_failure_does_not_consume_pending_secret() {
         registry,
         identity.principal().clone(),
         "0123456789abcdef".into(),
+        {
+            let live = Arc::clone(&live);
+            move |_, _| live.load(Ordering::SeqCst)
+        },
     )
-    .unwrap()
-    .with_live_device_check({
-        let live = Arc::clone(&live);
-        move |_, _| live.load(Ordering::SeqCst)
-    });
+    .unwrap();
     assert_eq!(
         responder.reply(
             identity.principal(),

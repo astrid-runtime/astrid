@@ -70,8 +70,9 @@ fn elicit_request_event(
     capsule_id: String,
     field: OnboardingField,
     principal: String,
+    device_key_id: Option<String>,
 ) -> AstridEvent {
-    let message = IpcMessage::new(
+    let mut message = IpcMessage::new(
         topic,
         IpcPayload::ElicitRequest {
             request_id,
@@ -81,6 +82,9 @@ fn elicit_request_event(
         Uuid::nil(), // Kernel-originated
     )
     .with_principal(principal);
+    if let Some(device_key_id) = device_key_id {
+        message = message.with_device_key_id(device_key_id);
+    }
     AstridEvent::Ipc {
         message,
         metadata: astrid_events::EventMetadata::default(),
@@ -214,6 +218,7 @@ impl elicit::Host for HostState {
             capsule_id.clone(),
             field,
             originating_principal.clone(),
+            None,
         ));
 
         tracing::debug!(
@@ -500,12 +505,14 @@ mod tests {
             "test".to_owned(),
             field,
             "agent-alice".to_owned(),
+            None,
         );
 
         assert_eq!(event_principal(&event), Some("agent-alice"));
         let AstridEvent::Ipc { message, .. } = event else {
             panic!("elicit request must be an IPC event");
         };
+        assert_eq!(message.device_key_id, None);
         assert!(matches!(
             message.payload,
             IpcPayload::ElicitRequest {
