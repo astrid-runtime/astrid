@@ -90,6 +90,10 @@ fn identity_and_policy_variants(principal: &PrincipalId) -> Vec<AdminRequestKind
             remove_capsules: vec![],
         },
         AdminRequestKind::AgentList,
+        AdminRequestKind::UserPrincipalList,
+        AdminRequestKind::UserPrincipalClaim {
+            principal: principal.clone(),
+        },
         AdminRequestKind::QuotaSet {
             principal: principal.clone(),
             quotas: Quotas::default(),

@@ -32,6 +32,7 @@ async fn fixture() -> (TempDir, Arc<Kernel>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = AstridHome::from_path(dir.path());
     let kernel = crate::test_kernel_with_home(home).await;
+    super::test_support::seed_operator(&kernel).await;
     (dir, kernel)
 }
 
@@ -41,7 +42,7 @@ fn pid(name: &str) -> PrincipalId {
 
 /// Create an agent principal with the given groups (no extra grants).
 async fn create_agent(kernel: &Arc<Kernel>, name: &str, groups: Vec<String>) {
-    handlers::dispatch(
+    super::test_support::dispatch_as_operator(
         kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentCreate {

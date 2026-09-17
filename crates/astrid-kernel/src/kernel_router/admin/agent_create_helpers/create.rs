@@ -1,464 +1,18 @@
-//! `admin.agent.create` provisioning + keypair-backfill helpers.
-//!
-//! Carved out of `handlers.rs` to keep that file under the per-file CI line
-//! cap. `agent_create` stays a thin dispatcher there; this module owns the
-//! heavy lifting:
-//!
-//! - [`provision_new_principal`] — build + register + provision a genuinely
-//!   new principal (no profile on disk).
-//! - [`backfill_keypair`] — surgically heal an EXISTING keyless principal by
-//!   adding only its missing ed25519 credential.
-//! - [`build_create_profile`] / [`mint_principal_keypair`] — shared by both.
-//!
-//! Everything here must run under the admin write lock held by the caller.
-
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
 use astrid_core::principal::PrincipalId;
-use astrid_core::profile::{
-    CapabilityPattern, CapsuleGrant, GroupName, NetworkConfig, PrincipalProfile,
-};
+use astrid_core::profile::{CapabilityPattern, GroupName, PrincipalProfile};
 use astrid_events::kernel_api::AdminResponseBody;
 use tracing::info;
 
-use super::handlers::{
+use super::super::handlers::{
     AGENT_IDENTITY_PLATFORM, err_bad_input, err_internal, err_profile, principal_profile_path,
     require_principal_exists, success_json,
 };
-
-/// Provision the explicit, restricted runtime shape used by `agent spawn`.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn provision_derived_principal(
-    kernel: &Arc<crate::Kernel>,
-    principal: PrincipalId,
-    profile_path: std::path::PathBuf,
-    source: PrincipalId,
-    load_capsules: Vec<String>,
-    allow_capsules: Vec<String>,
-    inherit_capsule_state: Vec<String>,
-    network_egress: Vec<String>,
-) -> AdminResponseBody {
-    if source == principal {
-        return err_bad_input("derived principal cannot use itself as its source".to_string());
-    }
-    if let Err(response) = ensure_derived_target_clean(kernel, &principal, &profile_path).await {
-        return response;
-    }
-    let source_path = principal_profile_path(kernel, &source);
-    if let Err(e) = require_principal_exists(&source, &source_path) {
-        return err_bad_input(format!("derive source rejected: {e}"));
-    }
-    if let Err(response) = validate_derived_capsules(
-        kernel,
-        &source,
-        &load_capsules,
-        &allow_capsules,
-        &inherit_capsule_state,
-    ) {
-        return response;
-    }
-    if let Err(response) = validate_derived_network(&network_egress) {
-        return response;
-    }
-
-    let response = provision_new_principal(
-        kernel,
-        principal.clone(),
-        profile_path.clone(),
-        vec![astrid_core::groups::BUILTIN_RESTRICTED.to_string()],
-        Vec::new(),
-        None,
-        None,
-        false,
-        false,
-    )
-    .await;
-    if !matches!(response, AdminResponseBody::Success(_)) {
-        return response;
-    }
-
-    let mut profile = match PrincipalProfile::load_from_path(&profile_path) {
-        Ok(profile) => profile,
-        Err(e) => {
-            return rollback_after_failure(kernel, &principal, err_profile(&principal, &e)).await;
-        },
-    };
-    profile.capsules = allow_capsules;
-    profile.network.egress = network_egress;
-    if let Err(e) = profile.validate() {
-        return rollback_after_failure(
-            kernel,
-            &principal,
-            err_bad_input(format!("derived profile rejected: {e}")),
-        )
-        .await;
-    }
-
-    if let Err(e) = materialize_cloned_capsule_installs(kernel, &source, &principal, &load_capsules)
-    {
-        return rollback_after_failure(
-            kernel,
-            &principal,
-            err_internal(format!("derived capsule materialization failed: {e}")),
-        )
-        .await;
-    }
-    if let Err(e) = profile.save_to_path(&profile_path) {
-        return rollback_after_failure(kernel, &principal, err_profile(&principal, &e)).await;
-    }
-    kernel.profile_cache.invalidate(&principal);
-    if let Err(e) = super::inheritance::inherit_selected_capsule_state(
-        kernel,
-        &source,
-        &principal,
-        &inherit_capsule_state,
-    )
-    .await
-    {
-        return rollback_after_failure(
-            kernel,
-            &principal,
-            err_internal(format!("derived state inheritance failed: {e}")),
-        )
-        .await;
-    }
-    finish_derived_principal(kernel, principal, source, load_capsules, profile).await
-}
-
-async fn finish_derived_principal(
-    kernel: &Arc<crate::Kernel>,
-    principal: PrincipalId,
-    source: PrincipalId,
-    load_capsules: Vec<String>,
-    profile: PrincipalProfile,
-) -> AdminResponseBody {
-    if let Err(error) = kernel
-        .ensure_principal_capsules_ready(&principal, &load_capsules)
-        .await
-    {
-        return rollback_after_failure(
-            kernel,
-            &principal,
-            err_internal(format!("derived capsule readiness failed: {error}")),
-        )
-        .await;
-    }
-    kernel.publish_capsules_loaded_for(&principal).await;
-    info!(%principal, %source, ?load_capsules, "Layer 6 agent.derive");
-    success_json(serde_json::json!({
-        "principal": principal.as_str(),
-        "source": source.as_str(),
-        "loaded_capsules": load_capsules,
-        "allowed_capsules": profile.capsules,
-        "network_egress": profile.network.egress,
-    }))
-}
-
-async fn ensure_derived_target_clean(
-    kernel: &Arc<crate::Kernel>,
-    principal: &PrincipalId,
-    profile_path: &Path,
-) -> Result<(), AdminResponseBody> {
-    let home = kernel
-        .astrid_home
-        .principal_home(principal)
-        .root()
-        .to_path_buf();
-    let key = kernel
-        .astrid_home
-        .keys_dir()
-        .join(format!("{principal}.key"));
-    // Legacy file-secret roots are only collision evidence during migration.
-    // Use no-follow metadata so a dangling or malicious symlink cannot make a
-    // released legacy source appear absent.
-    let secrets = kernel.astrid_home.secrets_dir().join(principal.as_str());
-    let identity = kernel
-        .identity_store
-        .resolve(AGENT_IDENTITY_PLATFORM, principal.as_str())
-        .await
-        .map_err(|e| err_internal(format!("identity store resolve failed: {e}")))?;
-    if identity.is_some()
-        || profile_path.exists()
-        || home.exists()
-        || key.exists()
-        || std::fs::symlink_metadata(&secrets).is_ok()
-    {
-        return Err(err_bad_input(format!(
-            "derived principal '{principal}' has residual identity or filesystem state"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_derived_capsules(
-    kernel: &crate::Kernel,
-    source: &PrincipalId,
-    load: &[String],
-    allowed: &[String],
-    inherited: &[String],
-) -> Result<(), AdminResponseBody> {
-    if load.is_empty() {
-        return Err(err_bad_input(
-            "at least one load_capsule is required".to_string(),
-        ));
-    }
-    let mut seen = HashSet::new();
-    for capsule in load {
-        if !seen.insert(capsule) {
-            return Err(err_bad_input(format!("duplicate load capsule '{capsule}'")));
-        }
-        CapsuleGrant::new(capsule)
-            .map_err(|e| err_bad_input(format!("load capsule rejected: {e}")))?;
-        validate_derived_capsule_install(kernel, source, capsule)?;
-    }
-    for (kind, capsules) in [("allow", allowed), ("state inheritance", inherited)] {
-        seen.clear();
-        for capsule in capsules {
-            if !seen.insert(capsule) {
-                return Err(err_bad_input(format!(
-                    "duplicate {kind} capsule '{capsule}'"
-                )));
-            }
-            if !load.contains(capsule) {
-                return Err(err_bad_input(format!(
-                    "capsule '{capsule}' must be loaded before it can be allowed or inherit state"
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_derived_capsule_install(
-    kernel: &crate::Kernel,
-    source: &PrincipalId,
-    capsule: &str,
-) -> Result<(), AdminResponseBody> {
-    let Some(store) = kernel.principal_store.as_ref() else {
-        return Err(err_internal(
-            "authoritative principal store is unavailable".to_owned(),
-        ));
-    };
-    let uid = kernel
-        .principal_directory
-        .uid_for(source)
-        .map_err(|error| err_bad_input(format!("resolve source principal UID: {error}")))?;
-    let owner = astrid_storage::StateOwner::Principal(uid);
-    let snapshot = store
-        .capsules()
-        .get_snapshot(&owner, capsule)
-        .map_err(|error| err_internal(format!("read source capsule package: {error}")))?
-        .ok_or_else(|| err_bad_input(format!("source capsule '{capsule}' is not installed")))?;
-    let temporary = tempfile::tempdir()
-        .map_err(|error| err_internal(format!("create source capsule inspection root: {error}")))?;
-    let source_install = temporary.path().join(capsule);
-    astrid_capsule_install::materialize_capsule_package(snapshot.package(), &source_install)
-        .map_err(|error| {
-            err_bad_input(format!("source capsule '{capsule}' is invalid: {error:#}"))
-        })?;
-    let manifest = astrid_capsule::discovery::load_manifest(&source_install.join("Capsule.toml"))
-        .map_err(|e| {
-        err_bad_input(format!(
-            "source capsule '{capsule}' has an invalid manifest: {e}"
-        ))
-    })?;
-    if manifest.package.name != capsule {
-        return Err(err_bad_input(format!(
-            "source capsule directory '{capsule}' contains manifest for '{}'",
-            manifest.package.name
-        )));
-    }
-    if !manifest.mcp_servers.is_empty() {
-        return Err(err_bad_input(format!(
-            "source capsule '{capsule}' declares a host MCP server; derived principals require WASM-only capsules"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_derived_network(egress: &[String]) -> Result<(), AdminResponseBody> {
-    NetworkConfig {
-        egress: egress.to_vec(),
-        ..NetworkConfig::default()
-    }
-    .validate()
-    .map_err(|e| err_bad_input(format!("derived network policy rejected: {e}")))?;
-    for endpoint in egress {
-        validate_derived_egress_endpoint(endpoint).map_err(err_bad_input)?;
-    }
-    Ok(())
-}
-
-fn validate_derived_egress_endpoint(endpoint: &str) -> Result<(), String> {
-    let Some((host, port)) = endpoint.rsplit_once(':') else {
-        return Err(format!(
-            "derived network endpoint '{endpoint}' must use host:port"
-        ));
-    };
-    if host.is_empty() || port.is_empty() {
-        return Err(format!(
-            "derived network endpoint '{endpoint}' must use a non-empty host and port"
-        ));
-    }
-    if port != "*" && port.parse::<u16>().is_err() {
-        return Err(format!(
-            "derived network endpoint '{endpoint}' has an invalid port"
-        ));
-    }
-    Ok(())
-}
-
-async fn rollback_after_failure(
-    kernel: &Arc<crate::Kernel>,
-    principal: &PrincipalId,
-    original: AdminResponseBody,
-) -> AdminResponseBody {
-    match rollback_derived_principal(kernel, principal).await {
-        Ok(()) => original,
-        Err(error) => err_internal(format!(
-            "derived principal provisioning failed and rollback could not complete: {error}"
-        )),
-    }
-}
-
-async fn rollback_derived_principal(
-    kernel: &Arc<crate::Kernel>,
-    principal: &PrincipalId,
-) -> Result<(), String> {
-    crate::legacy_migration_barrier::ensure_principal_delete_allowed(
-        &kernel.astrid_home,
-        principal,
-    )
-    .map_err(|error| format!("legacy migration barrier blocked rollback: {error}"))?;
-    ensure_legacy_secret_rollback_allowed(kernel, principal)?;
-    let pending = super::agent_delete::prepare_identity_removal(kernel, principal)
-        .await
-        .map_err(|response| format!("identity removal preparation returned {response:?}"))?;
-    kernel
-        .capabilities
-        .begin_principal_retirement(principal.clone())
-        .await;
-    kernel
-        .allowance_store
-        .begin_principal_retirement(principal)
-        .map_err(|error| format!("allowance retirement fence failed: {error}"))?;
-    kernel
-        .identity_store
-        .unlink(AGENT_IDENTITY_PLATFORM, principal.as_str())
-        .await
-        .map_err(|error| format!("identity unlink failed: {error}"))?;
-    let mut cleanup_errors = Vec::new();
-    if let Err(error) = kernel.unload_principal_capsules(principal).await {
-        cleanup_errors.push(format!("capsule retirement failed: {error}"));
-    }
-    let capsule_ids = pending
-        .principal_uid()
-        .and_then(|uid| kernel.principal_store.as_ref().map(|store| (store, uid)))
-        .map(|(store, uid)| {
-            store
-                .capsules()
-                .list(&astrid_storage::StateOwner::Principal(uid))
-                .map(|summaries| {
-                    summaries
-                        .into_iter()
-                        .map(|summary| summary.id().to_owned())
-                        .collect::<Vec<String>>()
-                })
-        })
-        .transpose()
-        .map_err(|error| format!("list durable capsule packages: {error}"))?
-        .unwrap_or_default();
-    for capsule in capsule_ids {
-        if let Err(error) = kernel
-            .kv
-            .clear_namespace(&format!("{principal}:capsule:{capsule}"))
-            .await
-        {
-            cleanup_errors.push(format!("KV namespace for capsule '{capsule}': {error}"));
-        }
-    }
-    collect_remove_file(
-        &principal_profile_path(kernel, principal),
-        "profile",
-        &mut cleanup_errors,
-    );
-    collect_remove_dir(
-        kernel.astrid_home.principal_home(principal).root(),
-        "principal home",
-        &mut cleanup_errors,
-    );
-    collect_remove_file(
-        &kernel
-            .astrid_home
-            .keys_dir()
-            .join(format!("{principal}.key")),
-        "principal key",
-        &mut cleanup_errors,
-    );
-    let legacy_secrets = kernel.astrid_home.secrets_dir().join(principal.as_str());
-    let secret_source_must_be_absent = match pending.principal_uid() {
-        Some(uid) => crate::legacy_migration_barrier::legacy_secret_source_must_be_absent(
-            &kernel.astrid_home,
-            uid,
-        )
-        .map_err(|error| format!("legacy secret migration provenance: {error}"))?,
-        None => false,
-    };
-    if let Err(error) = super::agent_delete::reclaim_legacy_secret_root(
-        &legacy_secrets,
-        secret_source_must_be_absent,
-    ) {
-        cleanup_errors.push(format!(
-            "principal secrets {}: {error}",
-            legacy_secrets.display()
-        ));
-    }
-    kernel.profile_cache.invalidate(principal);
-    if !cleanup_errors.is_empty() {
-        // Dropping `pending` intentionally retains its durable ownership
-        // reservation. The capability and allowance retirement fences also
-        // remain closed. A retry must finish reclamation before this alias can
-        // acquire fresh authority.
-        return Err(cleanup_errors.join("; "));
-    }
-    super::agent_delete::finish_identity_removal(kernel, principal, pending)
-        .await
-        .map_err(|response| format!("identity removal completion returned {response:?}"))
-}
-
-fn ensure_legacy_secret_rollback_allowed(
-    kernel: &crate::Kernel,
-    principal: &PrincipalId,
-) -> Result<(), String> {
-    if let Ok(uid) = kernel.principal_directory().uid_for(principal)
-        && let Err(error) = crate::legacy_migration_barrier::ensure_legacy_secret_deletion_allowed(
-            &kernel.astrid_home,
-            principal,
-            uid,
-        )
-    {
-        return Err(format!(
-            "legacy secret provenance blocked rollback: {error}"
-        ));
-    }
-    Ok(())
-}
-
-fn collect_remove_file(path: &Path, label: &str, errors: &mut Vec<String>) {
-    if let Err(error) = std::fs::remove_file(path)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        errors.push(format!("{label} {}: {error}", path.display()));
-    }
-}
-
-fn collect_remove_dir(path: &Path, label: &str, errors: &mut Vec<String>) {
-    if let Err(error) = super::agent_delete::reclaim_empty_dir(path) {
-        errors.push(format!("{label} {}: {error}", path.display()));
-    }
-}
+use super::rollback::{
+    remove_principal_key, rollback_created_identity, rollback_created_identity_unless_assigned,
+};
 
 /// Build, register, and provision a genuinely-new principal.
 ///
@@ -467,7 +21,7 @@ fn collect_remove_dir(path: &Path, label: &str, errors: &mut Vec<String>) {
 /// write lock held by the caller (the clone/inherit source is pinned across the
 /// reads here).
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn provision_new_principal(
+pub(crate) async fn provision_new_principal(
     kernel: &Arc<crate::Kernel>,
     principal: PrincipalId,
     profile_path: std::path::PathBuf,
@@ -477,6 +31,7 @@ pub(super) async fn provision_new_principal(
     clone_from: Option<PrincipalId>,
     allow_admin_clone: bool,
     warm_after_create: bool,
+    ownership: Option<&super::super::handlers::creation_authority::CreationAuthority>,
 ) -> AdminResponseBody {
     if let Err(error) = kernel
         .ownership_store
@@ -575,9 +130,15 @@ pub(super) async fn provision_new_principal(
     // home tree (those already succeeded; the confidentiality boundary holds
     // regardless). The source's existence was validated above.
     if let Some(source) = clone_from.as_ref().or(inherit_from.as_ref()) {
-        super::inheritance::inherit_from_principal(kernel, source, &principal).await;
+        super::super::inheritance::inherit_from_principal(kernel, source, &principal).await;
     }
 
+    if let Some(authority) = ownership
+        && let Err(response) = authority.assign(kernel, &principal).await
+    {
+        rollback_created_identity_unless_assigned(kernel, &principal, user.id, &profile_path).await;
+        return response;
+    }
     if warm_after_create {
         warm_created_principal(kernel, principal.clone());
     }
@@ -589,43 +150,6 @@ pub(super) async fn provision_new_principal(
     }))
 }
 
-async fn rollback_created_identity(
-    kernel: &crate::Kernel,
-    principal: &PrincipalId,
-    user_id: uuid::Uuid,
-    profile_path: &Path,
-    remove_home: bool,
-) {
-    let _ = kernel
-        .identity_store
-        .unlink(AGENT_IDENTITY_PLATFORM, principal.as_str())
-        .await;
-    let _ = kernel.identity_store.delete_user(user_id).await;
-    let _ = std::fs::remove_file(profile_path);
-    if remove_home {
-        if crate::legacy_migration_barrier::ensure_principal_delete_allowed(
-            &kernel.astrid_home,
-            principal,
-        )
-        .is_ok()
-        {
-            let _ = std::fs::remove_dir(kernel.astrid_home.principal_home(principal).root());
-        } else {
-            tracing::warn!(%principal, "preserving principal home during rollback because legacy migration is incomplete");
-        }
-    }
-    remove_principal_key(kernel, principal);
-}
-
-fn remove_principal_key(kernel: &crate::Kernel, principal: &PrincipalId) {
-    let _ = std::fs::remove_file(
-        kernel
-            .astrid_home
-            .keys_dir()
-            .join(format!("{principal}.key")),
-    );
-}
-
 fn warm_created_principal(kernel: &Arc<crate::Kernel>, principal: PrincipalId) {
     let kernel = Arc::clone(kernel);
     astrid_runtime::spawn(async move {
@@ -634,7 +158,7 @@ fn warm_created_principal(kernel: &Arc<crate::Kernel>, principal: PrincipalId) {
     });
 }
 
-fn materialize_cloned_capsule_installs(
+pub(super) fn materialize_cloned_capsule_installs(
     kernel: &crate::Kernel,
     source: &PrincipalId,
     target: &PrincipalId,
@@ -860,7 +384,7 @@ fn mint_principal_keypair(
 /// error rather than being silently ignored.
 ///
 /// Runs under the admin write lock held by the caller.
-pub(super) async fn backfill_keypair(
+pub(crate) async fn backfill_keypair(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
     profile_path: &Path,
@@ -953,26 +477,4 @@ pub(super) async fn backfill_keypair(
         "backfilled_keypair": true,
         "message": format!("backfilled missing keypair for existing principal {principal}"),
     }))
-}
-
-#[cfg(test)]
-mod rollback_cleanup_tests {
-    use super::*;
-
-    #[test]
-    fn cleanup_collectors_preserve_every_reclamation_error() {
-        let temp = tempfile::tempdir().unwrap();
-        let directory = temp.path().join("directory");
-        let file = temp.path().join("file");
-        std::fs::create_dir(&directory).unwrap();
-        std::fs::write(&file, b"state").unwrap();
-        let mut errors = Vec::new();
-
-        collect_remove_file(&directory, "profile", &mut errors);
-        collect_remove_dir(&file, "home", &mut errors);
-
-        assert_eq!(errors.len(), 2, "both independent failures must survive");
-        assert!(errors[0].contains("profile"));
-        assert!(errors[1].contains("home"));
-    }
 }

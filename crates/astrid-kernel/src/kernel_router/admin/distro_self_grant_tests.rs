@@ -12,6 +12,7 @@ async fn fixture() -> (TempDir, Arc<Kernel>) {
     let dir = tempfile::tempdir().unwrap();
     let kernel =
         crate::test_kernel_with_home(astrid_core::dirs::AstridHome::from_path(dir.path())).await;
+    super::test_support::seed_operator(&kernel).await;
     (dir, kernel)
 }
 
@@ -20,7 +21,7 @@ fn caller() -> PrincipalId {
 }
 
 async fn create_principal(kernel: &Arc<Kernel>, principal: &PrincipalId) {
-    let response = handlers::dispatch(
+    let response = super::test_support::dispatch_as_operator(
         kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentCreate {

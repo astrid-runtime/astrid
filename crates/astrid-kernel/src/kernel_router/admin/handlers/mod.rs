@@ -38,8 +38,10 @@ use tracing::{info, warn};
 
 use crate::kernel_router::AuthorizedRequest;
 
+pub(super) mod creation_authority;
 mod distro_dispatch;
 mod env_handlers;
+mod user_principals;
 use super::inheritance::copy_modify_env;
 use env_handlers::{EnvSetRequest, env_delete, env_list, env_set};
 
@@ -107,9 +109,21 @@ async fn dispatch_inner(
         return response;
     }
     match req {
-        req @ AdminRequestKind::AgentCreate { .. } => agent_create_from_req(kernel, req).await,
+        req @ AdminRequestKind::AgentCreate { .. } => {
+            creation_authority::create_from_req(kernel, caller, authorization, device_key_id, req)
+                .await
+        },
         AdminRequestKind::AgentDelete { principal } => {
-            super::agent_delete::agent_delete(kernel, principal).await
+            let authority = match super::agent_delete::DeletionAuthority::resolve(
+                kernel,
+                caller,
+                authorization,
+                device_key_id,
+            ) {
+                Ok(authority) => authority,
+                Err(response) => return response,
+            };
+            super::agent_delete::agent_delete(kernel, principal, authority.as_ref()).await
         },
         AdminRequestKind::AgentEnable { principal } => {
             agent_set_enabled(kernel, principal, true).await
@@ -118,6 +132,12 @@ async fn dispatch_inner(
             agent_set_enabled(kernel, principal, false).await
         },
         AdminRequestKind::AgentList => agent_list(kernel, caller, authorization, device_key_id),
+        AdminRequestKind::UserPrincipalList => {
+            user_principals::list(kernel, caller, authorization, device_key_id).await
+        },
+        AdminRequestKind::UserPrincipalClaim { principal } => {
+            user_principals::claim(kernel, caller, authorization, device_key_id, principal).await
+        },
         req @ AdminRequestKind::AgentModify { .. } => agent_modify_from_req(kernel, req).await,
         AdminRequestKind::QuotaSet { principal, quotas } => {
             super::quota::quota_set(kernel, principal, quotas).await
@@ -262,8 +282,26 @@ async fn dispatch_services(
             max_uses,
             metadata,
         } => {
-            super::invite_handlers::invite_issue(kernel, group, expires_secs, max_uses, metadata)
-                .await
+            let ownership = match super::invite_handlers::ownership::capture(
+                kernel,
+                caller,
+                authorization,
+                device_key_id,
+            )
+            .await
+            {
+                Ok(ownership) => ownership,
+                Err(response) => return response,
+            };
+            super::invite_handlers::invite_issue(
+                kernel,
+                group,
+                expires_secs,
+                max_uses,
+                metadata,
+                ownership,
+            )
+            .await
         },
         AdminRequestKind::InviteRedeem {
             token,
@@ -337,135 +375,6 @@ async fn pair_device_dispatch(
 }
 
 // ── Agent lifecycle ────────────────────────────────────────────────────
-
-/// Destructure an [`AdminRequestKind::AgentCreate`] and forward to
-/// [`agent_create`]. Split from the `dispatch` match arm to keep that
-/// router under the per-function line cap; the caller guarantees the
-/// variant, so the fallback is unreachable in practice.
-async fn agent_create_from_req(
-    kernel: &Arc<crate::Kernel>,
-    req: AdminRequestKind,
-) -> AdminResponseBody {
-    let AdminRequestKind::AgentCreate {
-        name,
-        groups,
-        grants,
-        inherit_from,
-        clone_from,
-        allow_admin_clone,
-    } = req
-    else {
-        return err_internal(
-            "agent_create_from_req received a non-AgentCreate variant".to_string(),
-        );
-    };
-    agent_create(
-        kernel,
-        name,
-        groups,
-        grants,
-        inherit_from,
-        clone_from,
-        allow_admin_clone,
-    )
-    .await
-}
-
-async fn agent_create(
-    kernel: &Arc<crate::Kernel>,
-    name: String,
-    groups: Vec<String>,
-    grants: Vec<String>,
-    inherit_from: Option<PrincipalId>,
-    clone_from: Option<PrincipalId>,
-    allow_admin_clone: bool,
-) -> AdminResponseBody {
-    let principal = match PrincipalId::new(name.clone()) {
-        Ok(p) => p,
-        Err(e) => return err_bad_input(format!("invalid principal name: {e}")),
-    };
-
-    // `default` (the bootstrap anchor) and `anonymous` (the no-capability
-    // identity stamped on unauthenticated connections, #45/#852) are reserved.
-    if let Some(reason) = principal.reserved_reason() {
-        return err_bad_input(format!("principal {name:?} is {reason}"));
-    }
-
-    // `clone_from` is a full replica: the source supplies groups, grants,
-    // revokes, network, process, quotas, AND the state copy. Mixing it with
-    // the profile-shaping inputs is ambiguous, so reject rather than silently
-    // pick a winner. The CLI also enforces this via clap `conflicts_with`; the
-    // kernel enforces it too — defense in depth against a hand-built request.
-    if clone_from.is_some() && (inherit_from.is_some() || !groups.is_empty() || !grants.is_empty())
-    {
-        return err_bad_input(
-            "clone_from is mutually exclusive with inherit_from, groups, and grants".to_string(),
-        );
-    }
-
-    // Acquire the admin write lock BEFORE validating the inheritance source.
-    // The source's existence is state this lock protects: every admin mutator
-    // (create/delete/...) takes it, so checking the source outside the lock
-    // would let a concurrent delete remove it between the existence check and
-    // the inheritance copy below (TOCTOU) — the creation would then silently
-    // produce an empty agent instead of inheriting. Holding the lock pins the
-    // source in place across the check-then-copy.
-    let _guard = kernel.admin_write_lock.lock().await;
-
-    // Self-inherit is meaningless (the source home tree does not exist yet),
-    // and a non-existent source must fail loudly rather than silently
-    // producing an empty agent the operator believes was provisioned.
-    if let Some(ref source) = inherit_from {
-        if *source == principal {
-            return err_bad_input(format!(
-                "inherit_from source {source} is the same as the new principal"
-            ));
-        }
-        let source_path = principal_profile_path(kernel, source);
-        if let Err(e) = require_principal_exists(source, &source_path) {
-            return err_bad_input(format!("inherit_from source rejected: {e}"));
-        }
-    }
-
-    let profile_path = principal_profile_path(kernel, &principal);
-
-    // Collision: a profile on disk means this principal already exists. Rather
-    // than unconditionally reject, defer to the keypair-backfill heal — a bare
-    // re-create of an existing KEYLESS (pre-#45/#852) principal surgically adds
-    // its missing keypair so `astrid-up`'s per-boot re-run auto-heals upgraders;
-    // an already-keyed principal (or any shaping input) still errors. See
-    // `agent_create_helpers::backfill_keypair` for the full rationale + invariants.
-    if profile_path.exists() {
-        // A backfill is not a re-create: any profile-shaping input (last arg)
-        // keeps the hard "already exists" error rather than being silently
-        // dropped.
-        return super::agent_create_helpers::backfill_keypair(
-            kernel,
-            &principal,
-            &profile_path,
-            clone_from.is_some()
-                || inherit_from.is_some()
-                || !groups.is_empty()
-                || !grants.is_empty(),
-        )
-        .await;
-    }
-
-    // A genuinely new principal: build its profile, mint its keypair, register
-    // its identity, and provision its home tree + state.
-    super::agent_create_helpers::provision_new_principal(
-        kernel,
-        principal,
-        profile_path,
-        groups,
-        grants,
-        inherit_from,
-        clone_from,
-        allow_admin_clone,
-        true,
-    )
-    .await
-}
 
 async fn agent_set_enabled(
     kernel: &Arc<crate::Kernel>,

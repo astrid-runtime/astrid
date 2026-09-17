@@ -587,6 +587,17 @@ pub enum AdminRequestKind {
     },
     /// List every agent principal with a profile on disk.
     AgentList,
+    /// List principals in the authenticated human's current fleets. Requires
+    /// an explicitly user-delegated device; never falls back to global listing.
+    /// Discovery does not grant acting or approval authority.
+    UserPrincipalList,
+    /// Assign one named unowned principal to the authenticated human's fleet.
+    /// Requires current user delegation and fleet management authority.
+    /// Never transfers an existing owner; key possession is not authority.
+    UserPrincipalClaim {
+        /// Admitted principal that currently has no fleet owner.
+        principal: PrincipalId,
+    },
     /// Partial-update an existing agent's group memberships. Built-in
     /// group names (`admin`, `agent`, `restricted`) and custom groups
     /// loaded from `groups.toml` are both accepted as identifiers;

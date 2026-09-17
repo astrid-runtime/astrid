@@ -23,6 +23,7 @@ async fn fixture() -> (TempDir, Arc<Kernel>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = AstridHome::from_path(dir.path());
     let kernel = crate::test_kernel_with_home(home).await;
+    super::test_support::seed_operator(&kernel).await;
     (dir, kernel)
 }
 
@@ -72,7 +73,7 @@ fn assert_error_contains(res: &AdminResponseBody, needle: &str) {
 async fn caps_grant_appends_and_invalidates_cache() {
     use astrid_capabilities::CapabilityCheck;
     let (_dir, kernel) = fixture().await;
-    handlers::dispatch(
+    super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -118,7 +119,7 @@ async fn caps_grant_does_not_clear_matching_revoke() {
     // Adversarial: pre-existing `self:*` revoke + caps.grant of a
     // matching cap → authz check still denies (revoke > grant).
     let (_dir, kernel) = fixture().await;
-    handlers::dispatch(
+    super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -166,7 +167,7 @@ async fn caps_grant_does_not_clear_matching_revoke() {
 #[tokio::test(flavor = "multi_thread")]
 async fn caps_revoke_of_unheld_capability_appends_preemptive() {
     let (_dir, kernel) = fixture().await;
-    handlers::dispatch(
+    super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -201,7 +202,7 @@ async fn caps_grant_is_idempotent_no_disk_growth_on_repeat() {
     // profile.toml — operator scripts that re-run their setup should
     // not see grants/revokes vectors grow unboundedly.
     let (_dir, kernel) = fixture().await;
-    handlers::dispatch(
+    super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -244,7 +245,7 @@ async fn caps_grant_is_idempotent_no_disk_growth_on_repeat() {
 #[tokio::test(flavor = "multi_thread")]
 async fn caps_revoke_is_idempotent_no_disk_growth_on_repeat() {
     let (_dir, kernel) = fixture().await;
-    handlers::dispatch(
+    super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -276,7 +277,7 @@ async fn caps_revoke_is_idempotent_no_disk_growth_on_repeat() {
 #[tokio::test(flavor = "multi_thread")]
 async fn caps_grant_rejects_invalid_capability_grammar() {
     let (_dir, kernel) = fixture().await;
-    handlers::dispatch(
+    super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -309,7 +310,7 @@ async fn caps_grant_universal_requires_unsafe_admin_acknowledgement() {
     // (`group create --caps "*"`) so an individual grant can't
     // silently promote a principal to universal admin.
     let (_dir, kernel) = fixture().await;
-    handlers::dispatch(
+    super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -386,7 +387,7 @@ async fn concurrent_caps_grants_serialized_by_admin_write_lock() {
     // Without the write lock they could interleave load/save and drop
     // one of the grants.
     let (_dir, kernel) = fixture().await;
-    handlers::dispatch(
+    super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {

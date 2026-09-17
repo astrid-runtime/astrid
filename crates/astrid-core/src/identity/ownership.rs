@@ -359,7 +359,9 @@ pub struct PrincipalOwnership {
     pub principal_uid: PrincipalUid,
     /// Sole fleet that owns the principal.
     pub fleet_uid: FleetUid,
-    /// Human authority that made the assignment.
+    /// Human assignment provenance. A capability-authorized derived principal
+    /// retains its creator's provenance; this is not proof of current human
+    /// authentication, membership, or permission.
     pub assigned_by: UserUid,
 }
 

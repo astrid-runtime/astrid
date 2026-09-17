@@ -99,6 +99,7 @@ pub use kv::{
 };
 pub use ownership::{
     FleetRecord, OwnershipError, OwnershipSnapshot, OwnershipStore, PrincipalDeletionGuard,
+    UnownedPrincipalDeferral, UnownedPrincipalReconciliation,
 };
 pub use principal_directory::PrincipalDirectory;
 #[cfg(feature = "keychain")]

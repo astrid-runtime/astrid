@@ -8,6 +8,11 @@ use astrid_core::principal::PrincipalId;
 use astrid_events::kernel_api::AdminResponseBody;
 use tracing::{info, warn};
 
+mod authority;
+#[cfg(test)]
+mod tests;
+pub(super) use authority::DeletionAuthority;
+
 use super::handlers::{
     AGENT_IDENTITY_PLATFORM, err_bad_input, err_internal, principal_profile_path, success_json,
 };
@@ -15,6 +20,7 @@ use super::handlers::{
 pub(super) async fn agent_delete(
     kernel: &Arc<crate::Kernel>,
     principal: PrincipalId,
+    authority: Option<&DeletionAuthority>,
 ) -> AdminResponseBody {
     if principal == PrincipalId::default() {
         return err_bad_input(
@@ -43,7 +49,8 @@ pub(super) async fn agent_delete(
             "principal deletion blocked by legacy secret provenance: {error}"
         ));
     }
-    let pending = match prepare_identity_removal(kernel, &principal).await {
+    let pending = match prepare_identity_removal_with_authority(kernel, &principal, authority).await
+    {
         Ok(pending) => pending,
         Err(response) => return response,
     };
@@ -128,6 +135,14 @@ pub(super) async fn prepare_identity_removal(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
 ) -> Result<PendingIdentityRemoval, AdminResponseBody> {
+    prepare_identity_removal_with_authority(kernel, principal, None).await
+}
+
+async fn prepare_identity_removal_with_authority(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    authority: Option<&DeletionAuthority>,
+) -> Result<PendingIdentityRemoval, AdminResponseBody> {
     let linked = kernel
         .identity_store
         .resolve(AGENT_IDENTITY_PLATFORM, principal.as_str())
@@ -156,11 +171,7 @@ pub(super) async fn prepare_identity_removal(
                 ))
             })?;
         if let Some(identity) = identity {
-            match kernel
-                .ownership_store
-                .guard_principal_deletion_for_alias(identity.uid, principal.clone())
-                .await
-            {
+            match DeletionAuthority::reserve(authority, kernel, identity.uid, principal).await {
                 Ok(guard) => (Some(identity.uid), Some(guard)),
                 Err(astrid_storage::OwnershipError::PrincipalAlreadyOwned { fleet, .. }) => {
                     return Err(err_bad_input(format!(
@@ -174,11 +185,11 @@ pub(super) async fn prepare_identity_removal(
                 },
             }
         } else {
-            let guard = recover_or_reserve_legacy_alias(kernel, principal).await?;
+            let guard = recover_or_reserve_legacy_alias(kernel, principal, authority).await?;
             (None, Some(guard))
         }
     } else {
-        let guard = recover_or_reserve_legacy_alias(kernel, principal).await?;
+        let guard = recover_or_reserve_legacy_alias(kernel, principal, authority).await?;
         (Some(guard.principal_uid()), Some(guard))
     };
 
@@ -192,10 +203,9 @@ pub(super) async fn prepare_identity_removal(
 async fn recover_or_reserve_legacy_alias(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
+    authority: Option<&DeletionAuthority>,
 ) -> Result<astrid_storage::PrincipalDeletionGuard, AdminResponseBody> {
-    if let Some(guard) = kernel
-        .ownership_store
-        .resume_principal_deletion_by_alias(principal)
+    if let Some(guard) = DeletionAuthority::resume(authority, kernel, principal)
         .await
         .map_err(|e| err_internal(format!("ownership store deletion recovery failed: {e}")))?
     {

@@ -182,6 +182,303 @@ async fn fleet_creation_atomically_bootstraps_its_owner() {
 }
 
 #[tokio::test]
+async fn explicit_device_user_binding_does_not_revive_after_membership_or_transfer() {
+    let (store, directory) = store();
+    let alice = user(301, 1);
+    let bob = user(302, 2);
+    let home = fleet(310, alice.uid);
+    let elsewhere = fleet(311, alice.uid);
+    let agent = principal(320, 3);
+    let unrelated = principal(321, 4);
+    for person in [&alice, &bob] {
+        store.create_user(person.clone()).await.unwrap();
+    }
+    for fleet in [&home, &elsewhere] {
+        store.create_fleet(fleet.clone()).await.unwrap();
+    }
+    for (alias, uid) in [("bound-agent", agent), ("unrelated-agent", unrelated)] {
+        admit_principal(&directory, alias, uid);
+        store
+            .assign_principal(PrincipalOwnership {
+                principal_uid: uid,
+                fleet_uid: home.uid,
+                assigned_by: alice.uid,
+            })
+            .await
+            .unwrap();
+    }
+    let key = [5; 32];
+    assert_eq!(
+        store.load().await.unwrap().user_for_device(agent, &key),
+        None
+    );
+    assert!(
+        store
+            .bind_user_device(agent, key, bob.uid, alice.uid)
+            .await
+            .is_err()
+    );
+    store
+        .set_membership(home.uid, bob.uid, FleetRole::Member, alice.uid)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .bind_user_device(agent, key, bob.uid, bob.uid)
+            .await
+            .is_err()
+    );
+    store
+        .bind_user_device(agent, key, bob.uid, alice.uid)
+        .await
+        .unwrap();
+    store
+        .bind_user_device(agent, key, bob.uid, alice.uid)
+        .await
+        .unwrap();
+    let snapshot = store.load().await.unwrap();
+    assert_eq!(snapshot.user_for_device(agent, &key), Some(bob.uid));
+    assert_eq!(snapshot.user_for_device(unrelated, &key), None);
+    assert_eq!(snapshot.user_for_device(agent, &[6; 32]), None);
+    assert!(
+        store
+            .bind_user_device(agent, key, alice.uid, alice.uid)
+            .await
+            .is_err()
+    );
+    let roundtrip: OwnershipSnapshot =
+        serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    roundtrip.validate(&directory).unwrap();
+    assert_eq!(roundtrip.user_for_device(agent, &key), Some(bob.uid));
+    store
+        .remove_member(home.uid, bob.uid, alice.uid)
+        .await
+        .unwrap();
+    store
+        .set_membership(home.uid, bob.uid, FleetRole::Member, alice.uid)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.load().await.unwrap().user_for_device(agent, &key),
+        None
+    );
+    assert_transfer_and_revocation_clear_binding(
+        &store,
+        agent,
+        home.uid,
+        elsewhere.uid,
+        alice.uid,
+        key,
+    )
+    .await;
+}
+
+async fn assert_transfer_and_revocation_clear_binding(
+    store: &OwnershipStore,
+    agent: PrincipalUid,
+    source: FleetUid,
+    destination: FleetUid,
+    owner: UserUid,
+    key: [u8; 32],
+) {
+    store
+        .bind_user_device(agent, key, owner, owner)
+        .await
+        .unwrap();
+    store
+        .transfer_principal(agent, source, destination, owner)
+        .await
+        .unwrap();
+    store
+        .transfer_principal(agent, destination, source, owner)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.load().await.unwrap().user_for_device(agent, &key),
+        None
+    );
+    store
+        .bind_user_device(agent, key, owner, owner)
+        .await
+        .unwrap();
+    store.revoke_user_device(agent, key, owner).await.unwrap();
+    assert_eq!(
+        store.load().await.unwrap().user_for_device(agent, &key),
+        None
+    );
+}
+
+#[tokio::test]
+async fn creation_assignment_uses_live_manager_and_never_transfers_existing_child() {
+    let (store, directory) = store();
+    let historical = user(201, 1);
+    let current = user(202, 2);
+    let owned = fleet(210, historical.uid);
+    let other = fleet(211, current.uid);
+    let creator = principal(220, 3);
+    let child = principal(221, 4);
+    for person in [&historical, &current] {
+        store.create_user(person.clone()).await.unwrap();
+    }
+    store.create_fleet(owned.clone()).await.unwrap();
+    store.create_fleet(other.clone()).await.unwrap();
+    admit_principal(&directory, "creator", creator);
+    admit_principal(&directory, "child", child);
+    assert!(
+        matches!(store.assign_created_principal(child, creator, current.uid).await,
+        Err(OwnershipError::PrincipalNotOwned(uid)) if uid == creator)
+    );
+    store
+        .assign_principal(PrincipalOwnership {
+            principal_uid: creator,
+            fleet_uid: owned.uid,
+            assigned_by: historical.uid,
+        })
+        .await
+        .unwrap();
+    store
+        .set_membership(owned.uid, current.uid, FleetRole::Owner, historical.uid)
+        .await
+        .unwrap();
+    store
+        .set_membership(owned.uid, historical.uid, FleetRole::Member, current.uid)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .assign_created_principal(child, creator, historical.uid)
+            .await,
+        Err(OwnershipError::NotFleetManager { .. })
+    ));
+    assert!(store.load().await.unwrap().principal_owner(child).is_none());
+    store
+        .assign_created_principal(child, creator, current.uid)
+        .await
+        .unwrap();
+    store
+        .assign_created_principal(child, creator, current.uid)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .load()
+            .await
+            .unwrap()
+            .principal_owner(child)
+            .unwrap()
+            .assigned_by,
+        current.uid
+    );
+    store
+        .transfer_principal(child, owned.uid, other.uid, current.uid)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .assign_created_principal(child, creator, current.uid)
+            .await,
+        Err(OwnershipError::PrincipalAlreadyOwned { .. })
+    ));
+    assert_eq!(
+        store
+            .load()
+            .await
+            .unwrap()
+            .principal_owner(child)
+            .unwrap()
+            .fleet_uid,
+        other.uid
+    );
+}
+
+#[tokio::test]
+async fn user_directory_tracks_membership_without_granting_other_fleets() {
+    let (store, directory) = store();
+    let alice = user(101, 1);
+    let bob = user(102, 2);
+    let alice_fleet = fleet(110, alice.uid);
+    let bob_fleet = fleet(111, bob.uid);
+    let alice_principal = principal(120, 3);
+    let bob_principal = principal(121, 4);
+    for person in [&alice, &bob] {
+        store.create_user(person.clone()).await.unwrap();
+    }
+    for (alias, uid, owned_fleet, owner) in [
+        ("alice-agent", alice_principal, &alice_fleet, alice.uid),
+        ("bob-agent", bob_principal, &bob_fleet, bob.uid),
+    ] {
+        admit_principal(&directory, alias, uid);
+        store.create_fleet(owned_fleet.clone()).await.unwrap();
+        store
+            .assign_principal(PrincipalOwnership {
+                principal_uid: uid,
+                fleet_uid: owned_fleet.uid,
+                assigned_by: owner,
+            })
+            .await
+            .unwrap();
+    }
+    let graph = store.load().await.unwrap();
+    assert_eq!(
+        graph
+            .principal_owners_for_user(alice.uid)
+            .map(|o| o.principal_uid)
+            .collect::<Vec<_>>(),
+        vec![alice_principal]
+    );
+    assert_eq!(
+        graph
+            .principal_owners_for_user(bob.uid)
+            .map(|o| o.principal_uid)
+            .collect::<Vec<_>>(),
+        vec![bob_principal]
+    );
+    assert_eq!(graph.principal_owners_for_user(user(999, 9).uid).count(), 0);
+
+    store
+        .set_membership(alice_fleet.uid, bob.uid, FleetRole::Member, alice.uid)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .load()
+            .await
+            .unwrap()
+            .principal_owners_for_user(bob.uid)
+            .count(),
+        2
+    );
+    store
+        .remove_member(alice_fleet.uid, bob.uid, alice.uid)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .load()
+            .await
+            .unwrap()
+            .principal_owners_for_user(bob.uid)
+            .map(|o| o.principal_uid)
+            .collect::<Vec<_>>(),
+        vec![bob_principal]
+    );
+
+    assert!(matches!(
+        store.guard_principal_deletion(alice_principal).await,
+        Err(OwnershipError::PrincipalAlreadyOwned { .. })
+    ));
+    assert_eq!(
+        store
+            .load()
+            .await
+            .unwrap()
+            .principal_owners_for_user(alice.uid)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn principal_cannot_be_silently_reassigned() {
     let (store, principals) = store();
     let owner = user(1, 1);

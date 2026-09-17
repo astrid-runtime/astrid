@@ -383,6 +383,15 @@ denial = ["not applicable for public metrics read"]
 state = ["metrics scrape is side-effect free"]
 evidence = ["metrics endpoint test and runtime metrics artifact"]
 
+[scenarios.ownership_claim]
+status = "covered"
+surfaces = ["cli"]
+auth = ["admin/default with current user delegation"]
+success = ["authorized caller claims an already-owned same-fleet principal idempotently"]
+denial = ["regular caller cannot claim another principal; missing identity is rejected"]
+state = ["same-fleet ownership assignment remains unchanged"]
+evidence = ["agent claim CLI transcript, --mine JSON owner_uid, and user denial artifact"]
+
 [scenarios.pair_device_lifecycle]
 status = "covered"
 surfaces = ["cli", "http", "capability"]

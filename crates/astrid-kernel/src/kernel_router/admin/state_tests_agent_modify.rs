@@ -30,6 +30,7 @@ async fn fixture() -> (TempDir, Arc<Kernel>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = AstridHome::from_path(dir.path());
     let kernel = crate::test_kernel_with_home(home).await;
+    super::test_support::seed_operator(&kernel).await;
     (dir, kernel)
 }
 
@@ -155,7 +156,7 @@ async fn agent_modify_adds_and_removes_groups_idempotently() {
     // F-B: agent.modify should partial-update group membership and
     // be idempotent — re-applying the same change is a no-op.
     let (_dir, kernel) = fixture().await;
-    handlers::dispatch(
+    super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -227,7 +228,7 @@ async fn agent_modify_adds_and_removes_groups_idempotently() {
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_modify_empty_delta_verifies_target_without_writing_profile() {
     let (_dir, kernel) = fixture().await;
-    handlers::dispatch(
+    super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -352,7 +353,7 @@ async fn agent_modify_rejects_unknown_principal() {
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_modify_rejects_invalid_remove_entries() {
     let (_dir, kernel) = fixture().await;
-    handlers::dispatch(
+    super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -402,7 +403,7 @@ async fn agent_modify_adds_and_removes_capsules_idempotently() {
     // the principal's profile (the set the dispatcher gates the
     // user-invocable tool surface against).
     let (_dir, kernel) = fixture().await;
-    handlers::dispatch(
+    super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -543,7 +544,7 @@ async fn assigning_capsule_copies_non_secret_install_env_only() {
         .unwrap();
 
     let principal = pid("assigned-agent");
-    let created = handlers::dispatch(
+    let created = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentCreate {

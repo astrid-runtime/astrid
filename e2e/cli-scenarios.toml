@@ -26,6 +26,12 @@ status = "covered"
 mode = "mutating"
 principal = "admin"
 
+[commands."agent claim"]
+scenario = "ownership_claim"
+status = "covered"
+mode = "mutating"
+principal = "admin"
+
 [commands."agent spawn"]
 scenario = "ephemeral_spawn"
 status = "mapped"

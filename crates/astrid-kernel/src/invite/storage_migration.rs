@@ -120,6 +120,7 @@ mod tests {
         let store = DurableInviteStore::new(Arc::clone(&backend)).unwrap();
         let token = "astrid_inv_test";
         let record = Invite {
+            ownership: None,
             token_hash: hash_token(token),
             group: "agent".to_owned(),
             remaining_uses: 1,
@@ -143,6 +144,7 @@ mod tests {
         let backend: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
         let store = DurableInviteStore::new(backend).unwrap();
         let record = Invite {
+            ownership: None,
             token_hash: hash_token("exact invite commit"),
             group: "agent".to_owned(),
             remaining_uses: 2,
@@ -184,6 +186,7 @@ mod tests {
         home.ensure().unwrap();
         let path = InviteStore::path_for(&home);
         let token = Invite {
+            ownership: None,
             token_hash: hash_token("legacy invite"),
             group: "agent".to_owned(),
             remaining_uses: 1,
