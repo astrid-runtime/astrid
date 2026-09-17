@@ -24,6 +24,17 @@ expect_principal_cli_success() {
   fi
 }
 
+expect_principal_cli_failure_containing() {
+  local principal=$1 label=$2 needle=$3
+  shift 3
+  expect_principal_cli_failure "$principal" "$label" "$@"
+  if ! grep -Fq -- "$needle" "$ARTIFACTS/$label.err" "$ARTIFACTS/$label.out"; then
+    cat "$ARTIFACTS/$label.out" >&2 || true
+    cat "$ARTIFACTS/$label.err" >&2 || true
+    fail "$label did not report: $needle"
+  fi
+}
+
 assert_principal_profile_absent() {
   local principal=$1
   local path="$ASTRID_HOME/etc/profiles/$principal.toml"
@@ -283,6 +294,30 @@ wait_for_sse_ready() {
       return 1
     fi
     sleep 0.1
+  done
+}
+
+# GET /api/models is a principal-scoped registry round-trip. The storage
+# fallback assert fails closed on the first non-200, so wait until the
+# caller's registry actually answers before checking governed model scope.
+wait_for_http_models_catalog() {
+  local bearer=$1
+  local label=$2
+  local out=$3
+  local deadline=$((SECONDS + 45))
+  local status
+  while true; do
+    status="$(http_status GET /api/models "$bearer" "" "$out")"
+    if [[ "$status" == 200 ]]; then
+      return
+    fi
+    if (( SECONDS >= deadline )); then
+      if [[ -f "$out" ]]; then
+        sed -n '1,80p' "$out" >&2 || true
+      fi
+      fail "$label model catalog not ready (last HTTP $status)"
+    fi
+    sleep 1
   done
 }
 
@@ -574,29 +609,53 @@ run_adversarial_principal_smoke() {
   local creator_principal
   creator_principal="$(json_field "$ARTIFACTS/creator-redeem.json" principal)"
 
-  expect_principal_cli_failure "$user_principal" adversarial-agent-create-denied \
+  # Regular invitees hold no agent:create. An invited creator can hold that
+  # cap without being a user-delegated device; principal creation still
+  # fail-closes on current user delegation. The only public user-bound
+  # identity is the local bootstrap default, whose admin `*` already includes
+  # create/inherit/clone, so allowed creates run as default rather than
+  # inventing a second bind API.
+  expect_principal_cli_failure_containing "$user_principal" adversarial-agent-create-denied \
+    "missing capability agent:create" \
     agent create e2e-regular-create-denied -y
   assert_principal_profile_absent e2e-regular-create-denied
 
-  expect_principal_cli_success "$creator_principal" adversarial-agent-create-plain \
+  expect_principal_cli_failure_containing "$creator_principal" adversarial-agent-create-unbound \
+    "principal creation requires a current user delegation" \
     agent create e2e-plain-created -y
-  [[ -f "$ASTRID_HOME/etc/profiles/e2e-plain-created.toml" ]] \
-    || fail "plain agent:create did not create e2e-plain-created profile"
+  assert_principal_profile_absent e2e-plain-created
 
-  expect_principal_cli_failure "$creator_principal" adversarial-agent-inherit-denied \
+  expect_principal_cli_failure_containing "$creator_principal" adversarial-agent-inherit-denied \
+    "missing capability agent:create:inherit" \
     agent create e2e-inherit-denied --inherit-from "$user_principal" -y
   assert_principal_profile_absent e2e-inherit-denied
 
   run_cli caps grant "$creator_principal" agent:create:inherit
-  expect_principal_cli_success "$creator_principal" adversarial-agent-inherit-allowed \
+  expect_principal_cli_failure_containing "$creator_principal" adversarial-agent-inherit-unbound \
+    "principal creation requires a current user delegation" \
     agent create e2e-inherited --inherit-from "$user_principal" -y
+  assert_principal_profile_absent e2e-inherited
 
-  expect_principal_cli_failure "$creator_principal" adversarial-agent-clone-denied \
+  expect_principal_cli_failure_containing "$creator_principal" adversarial-agent-clone-denied \
+    "missing capability agent:create:clone" \
     agent create e2e-clone-denied --clone "$user_principal" -y
   assert_principal_profile_absent e2e-clone-denied
 
   run_cli caps grant "$creator_principal" agent:create:clone
-  expect_principal_cli_success "$creator_principal" adversarial-agent-clone-allowed \
+  expect_principal_cli_failure_containing "$creator_principal" adversarial-agent-clone-unbound \
+    "principal creation requires a current user delegation" \
+    agent create e2e-cloned --clone "$user_principal" -y
+  assert_principal_profile_absent e2e-cloned
+
+  expect_principal_cli_success default adversarial-agent-create-plain \
+    agent create e2e-plain-created -y
+  [[ -f "$ASTRID_HOME/etc/profiles/e2e-plain-created.toml" ]] \
+    || fail "plain agent:create did not create e2e-plain-created profile"
+
+  expect_principal_cli_success default adversarial-agent-inherit-allowed \
+    agent create e2e-inherited --inherit-from "$user_principal" -y
+
+  expect_principal_cli_success default adversarial-agent-clone-allowed \
     agent create e2e-cloned --clone "$user_principal" -y
 
   json_assert_inheritance_and_clone_state "$ASTRID_HOME" "$user_principal" \
@@ -785,6 +844,13 @@ run_adversarial_principal_postcondition_smoke() {
 
   note "checking spoofed principal fields cannot mutate foreign env or quota state"
 
+  wait_for_http_models_catalog "$admin_bearer" "admin" \
+    "$ARTIFACTS/adversarial-env-model-default-warm.json"
+  wait_for_http_models_catalog "$user_bearer" "user" \
+    "$ARTIFACTS/adversarial-env-model-user-warm.json"
+  wait_for_http_models_catalog "$ops_bearer" "operator" \
+    "$ARTIFACTS/adversarial-env-model-ops-warm.json"
+
   status="$(http_status POST /api/capsules/astrid-capsule-openai-compat/env/base_url \
     "$user_bearer" \
     "{\"value\":\"$fake_base_url/empty-models\"}" \
@@ -796,6 +862,12 @@ run_adversarial_principal_postcondition_smoke() {
     "{\"value\":\"fake-spoof-query\",\"principal\":\"$ops_principal\"}" \
     "$ARTIFACTS/adversarial-env-query-body-spoof.json")"
   assert_status "agent env query and body principal spoof ignored" "$status" 204
+  wait_for_http_models_catalog "$admin_bearer" "admin-after-empty-models" \
+    "$ARTIFACTS/adversarial-env-model-default.json"
+  wait_for_http_models_catalog "$user_bearer" "user-after-empty-models" \
+    "$ARTIFACTS/adversarial-env-model-user.json"
+  wait_for_http_models_catalog "$ops_bearer" "operator-after-empty-models" \
+    "$ARTIFACTS/adversarial-env-model-ops.json"
   assert_user_only_model_fallback_in_storage astrid-capsule-openai-compat default \
     "$user_principal" "$ops_principal" "$admin_bearer" "$user_bearer" "$ops_bearer" \
     fake-spoof-query user-only
