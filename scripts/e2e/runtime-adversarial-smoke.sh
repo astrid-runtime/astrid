@@ -30,36 +30,85 @@ assert_principal_profile_absent() {
   [[ ! -e "$path" ]] || fail "denied principal create left profile behind: $path"
 }
 
-mint_admin_bearer() {
-  local token pubkey status
+bootstrap_device_pubkey() {
+  "$PYTHON" - "$ASTRID_HOME/etc/profiles/default.toml" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+match = re.search(r'(?m)^\s*pubkey\s*=\s*"([0-9a-fA-F]{64})"', text)
+if match is None:
+    raise SystemExit(f"missing bootstrap device pubkey in {sys.argv[1]}")
+print(match.group(1).lower())
+PY
+}
+
+mint_pair_device_bearer() {
+  local label=$1
+  local pubkey=$2
+  local redeem_out=$3
+  local token status
   token="$("$CORE_DIR/target/debug/astrid" --principal default pair-device issue \
     --scope full \
-    --label "runtime e2e admin adversarial device" \
+    --label "$label" \
     --expires-secs 120 \
     --raw 2>> "$ARTIFACTS/cli-transcript.log")"
   printf '$ astrid --principal default pair-device issue --scope full --label <e2e> --expires-secs 120 --raw\n<redacted pair token>\n' \
     >> "$ARTIFACTS/cli-transcript.log"
+  status="$(http_status POST /api/auth/pair-device/redeem "" \
+    "{\"token\":\"$token\",\"public_key\":\"$pubkey\"}" \
+    "$redeem_out")"
+  assert_status "$label pair-device redeem" "$status" 200
+  json_field "$redeem_out" session_token
+}
+
+mint_admin_bearer() {
+  local pubkey
   pubkey="$("$PYTHON" - <<'PY'
 import secrets
 print(secrets.token_hex(32))
 PY
 )"
-  status="$(http_status POST /api/auth/pair-device/redeem "" \
-    "{\"token\":\"$token\",\"public_key\":\"$pubkey\"}" \
-    "$ARTIFACTS/adversarial-admin-pair-redeem.json")"
-  assert_status "admin pair-device redeem for adversarial checks" "$status" 200
-  json_field "$ARTIFACTS/adversarial-admin-pair-redeem.json" session_token
+  mint_pair_device_bearer "runtime e2e admin adversarial device" "$pubkey" \
+    "$ARTIFACTS/adversarial-admin-pair-redeem.json"
+}
+
+mint_local_user_device_bearer() {
+  local pubkey
+  pubkey="$(bootstrap_device_pubkey)"
+  mint_pair_device_bearer "runtime e2e local user device" "$pubkey" \
+    "$ARTIFACTS/local-user-device-pair-redeem.json"
+}
+
+assert_unbound_invite_reason() {
+  local file=$1
+  "$PYTHON" - "$file" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+reason = data.get("reason")
+prefix = "authenticated device has no user delegation for principal "
+if not isinstance(reason, str) or not reason.startswith(prefix) or len(reason) <= len(prefix):
+    raise SystemExit(f"expected UserDeviceNotBound invite denial, got {data!r}")
+PY
 }
 
 mint_delegated_invite_issuer_bearer() {
-  local ops_bearer=$1 status admin_bearer
+  local ops_bearer=$1 status pair_only_bearer admin_bearer
   status="$(http_status POST /api/sys/invites "$ops_bearer" \
     '{"group":"agent","max_uses":1,"expires_secs":600}' \
     "$ARTIFACTS/operator-issued-invite.json")"
   assert_status "operator session invite issue denied" "$status" 403
   json_assert_field_equals "$ARTIFACTS/operator-issued-invite.json" reason \
     "invite issuance requires a user-delegated device"
-  admin_bearer="$(mint_admin_bearer)"
+  pair_only_bearer="$(mint_admin_bearer)"
+  status="$(http_status POST /api/sys/invites "$pair_only_bearer" \
+    '{"group":"agent","max_uses":1,"expires_secs":600}' \
+    "$ARTIFACTS/admin-issued-invite-unbound.json")"
+  assert_status "pair-only device invite issue denied" "$status" 403
+  assert_unbound_invite_reason "$ARTIFACTS/admin-issued-invite-unbound.json"
+  admin_bearer="$(mint_local_user_device_bearer)"
   status="$(http_status POST /api/sys/invites "$admin_bearer" \
     '{"group":"agent","max_uses":1,"expires_secs":600}' \
     "$ARTIFACTS/admin-issued-invite.json")"
@@ -554,7 +603,7 @@ run_adversarial_principal_smoke() {
     e2e-inherited e2e-cloned astrid-capsule-openai-compat "$user_secret"
 
   local admin_bearer status
-  admin_bearer="$(mint_admin_bearer)"
+  admin_bearer="$(mint_local_user_device_bearer)"
 
   note "checking regular principal cannot mutate foreign principal lifecycle"
   status="$(http_status PATCH /api/sys/principals/e2e-plain-created "$user_bearer" \
