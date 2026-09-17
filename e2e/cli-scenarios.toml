@@ -286,6 +286,12 @@ status = "covered"
 mode = "mutating"
 principal = "agent_and_admin"
 
+[commands."pair-device redeem"]
+scenario = "pair_device_lifecycle"
+status = "covered"
+mode = "mutating"
+principal = "public_pair_token"
+
 [commands."secret set"]
 scenario = "secret_redaction"
 status = "covered"

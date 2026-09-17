@@ -390,7 +390,7 @@ auth = ["self-scoped bearer or public pair token redeem"]
 success = ["principal issues/redeems/revokes a paired-device token for itself"]
 denial = ["operator without pair cap and reused/revoked tokens are rejected"]
 state = ["device key is added, bearer works, then revocation invalidates it"]
-evidence = ["pair-device HTTP artifacts and device list/revoke assertions"]
+evidence = ["pair-device CLI stdin redeem artifacts, HTTP pair-device artifacts, and device list/revoke assertions"]
 
 [scenarios.platform_identity_binding]
 status = "waived"

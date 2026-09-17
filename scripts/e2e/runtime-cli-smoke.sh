@@ -201,11 +201,18 @@ import secrets
 print(secrets.token_hex(32))
 PY
 )"
-  status="$(http_status POST /api/auth/pair-device/redeem "" \
-    "{\"token\":\"$pair_token\",\"public_key\":\"$pair_pubkey\"}" \
-    "$ARTIFACTS/cli-pair-device-redeem.json")"
-  assert_status "CLI-issued pair token redeem" "$status" 200
+  # pair-device redeem is a CLI leaf: token on stdin. HTTP redeem stays in the
+  # HTTP pair-device lifecycle and must not stand in for this command row.
+  printf '$ astrid pair-device redeem --public-key <hex> < <redacted pair token>\n' \
+    >> "$ARTIFACTS/cli-transcript.log"
+  if ! printf '%s\n' "$pair_token" | "$CORE_DIR/target/debug/astrid" pair-device redeem \
+    --public-key "$pair_pubkey" \
+    > "$ARTIFACTS/cli-pair-device-redeem.json" \
+    2>> "$ARTIFACTS/cli-transcript.log"; then
+    fail "CLI pair-device redeem from stdin failed"
+  fi
   pair_key_id="$(json_field "$ARTIFACTS/cli-pair-device-redeem.json" key_id)"
+  [[ -n "$pair_key_id" ]] || fail "CLI pair-device redeem missed key_id"
   run_cli pair-device list --agent default --json > "$ARTIFACTS/cli-pair-device-list.json"
   json_assert_pair_device_list "$ARTIFACTS/cli-pair-device-list.json" "$pair_key_id" present
   run_cli pair-device revoke "$pair_key_id" --agent default
