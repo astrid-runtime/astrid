@@ -209,6 +209,7 @@ async fn dispatch_subcommand(
                     .unwrap_or_else(crate::principal::current),
                 grant_capsules,
                 require_signed: false,
+                selected_capsules: Vec::new(),
             };
             let _daemon_lease = commands::init::run_init(&distro, &opts).await?;
             commands::self_update::ensure_path_setup()?;
@@ -505,6 +506,7 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
             allow_unsigned,
             accept_new_key,
             vars,
+            capsules,
         } => {
             if agent.is_some() {
                 return Ok(commands::stub::deferred(
@@ -522,6 +524,8 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
                     "astrid distro apply requires an explicit distro source: @owner/repo, URL, local Distro.toml, or .shuttle; Astrid Runtime does not choose a product distro"
                 )
             })?;
+            commands::init::reject_filtered_shuttle(&distro, &capsules)?;
+            let filtered = !capsules.is_empty();
             let opts = commands::init::InitOpts {
                 yes,
                 offline,
@@ -532,9 +536,10 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
                 // `distro apply` has no `--grant-capsules` surface; granting
                 grant_capsules: false,
                 require_signed: true,
+                selected_capsules: capsules,
             };
             let _daemon_lease = commands::init::run_init(&distro, &opts).await?;
-            if apply_self_grant_required(&distro) {
+            if !filtered && apply_self_grant_required(&distro) {
                 commands::init::apply_self_grant(&opts.target_principal).await?;
             }
             Ok(ExitCode::SUCCESS)
@@ -880,6 +885,7 @@ mod tests {
                 allow_unsigned: false,
                 accept_new_key: false,
                 vars: Vec::new(),
+                capsules: Vec::new(),
             })
             .await
             .expect_err("standalone distro apply must require a non-empty explicit distro");
@@ -901,6 +907,7 @@ mod tests {
             allow_unsigned: true,
             accept_new_key: false,
             vars: Vec::new(),
+            capsules: Vec::new(),
         })
         .await
         .expect_err("--allow-unsigned must not make Distro apply acceptance-capable");
@@ -916,5 +923,28 @@ mod tests {
     fn self_grant_follows_source_manifests_but_not_shuttle_packages() {
         assert!(apply_self_grant_required("/tmp/product/Distro.toml"));
         assert!(!apply_self_grant_required("/tmp/product.shuttle"));
+    }
+
+    #[tokio::test]
+    async fn distro_apply_rejects_filtered_shuttle_before_install() {
+        let error = dispatch_distro(DistroCommands::Apply {
+            name: Some("/tmp/product.shuttle".into()),
+            agent: None,
+            yes: true,
+            offline: true,
+            allow_unsigned: false,
+            accept_new_key: false,
+            vars: Vec::new(),
+            capsules: vec!["aos-mcp".into()],
+        })
+        .await
+        .expect_err("filtered apply must not use shuttle sources");
+
+        assert!(
+            error
+                .to_string()
+                .contains("not supported for .shuttle sources"),
+            "got: {error:#}"
+        );
     }
 }

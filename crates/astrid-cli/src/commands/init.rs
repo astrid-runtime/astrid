@@ -23,6 +23,14 @@ mod signed_source;
 
 use signed_source::{PreparedDistro, prepare_distro_source, unpack_prepared};
 
+#[path = "init_selected.rs"]
+mod selected;
+use selected::{filtered_refresh_requested, require_installed_named_members};
+pub(crate) use selected::{
+    reject_filtered_partial_refresh, reject_filtered_shuttle, require_named_members_present,
+    select_named_manifest_capsules,
+};
+
 mod lifetime;
 pub(crate) use lifetime::ProvisioningLease;
 mod environment;
@@ -63,6 +71,11 @@ pub(crate) struct InitOpts {
     /// Require the signed self-contained Distro artifact used by product
     /// Apply. Ordinary `init` retains its legacy source support.
     pub(crate) require_signed: bool,
+    /// Named signed-manifest members to refresh. Empty means unfiltered
+    /// `select_capsules` / headless full-set selection. Distro apply
+    /// `--capsule` is the only public constructor; ordinary `init` leaves
+    /// this empty.
+    pub(crate) selected_capsules: Vec<String>,
 }
 
 pub(crate) use grant::apply_self_grant;
@@ -126,6 +139,7 @@ pub(crate) async fn run_init(
     };
 
     let daemon_lease = lifetime::retain_daemon().await?;
+    reject_filtered_shuttle(distro_source, &opts.selected_capsules)?;
 
     if opts.grant_capsules {
         grant::preflight_grants(&operator, &target).await?;
@@ -154,7 +168,18 @@ pub(crate) async fn run_init(
         .pretty_name
         .as_deref()
         .unwrap_or(&manifest.distro.name);
-    eprintln!("{}", Theme::header(&format!("Installing {display_name}")));
+    let filtered = filtered_refresh_requested(&opts.selected_capsules);
+    eprintln!(
+        "{}",
+        Theme::header(&format!(
+            "{} {display_name}",
+            if filtered {
+                "Refreshing selected members of"
+            } else {
+                "Installing"
+            }
+        ))
+    );
     if let Some(ref desc) = manifest.distro.description {
         eprintln!("  {desc}");
     }
@@ -167,7 +192,16 @@ pub(crate) async fn run_init(
     let distro_version = manifest.distro.version;
     let schema_version = manifest.schema_version;
 
-    let selected = select_capsules(manifest.capsules, opts.yes)?;
+    // Named `--capsule` selection is resolved against the verified manifest
+    // and never falls back to headless full-distro selection.
+    let selected = if filtered {
+        select_named_manifest_capsules(manifest.capsules, &opts.selected_capsules)?
+    } else {
+        select_capsules(manifest.capsules, opts.yes)?
+    };
+    if filtered {
+        require_installed_named_members(&selected).await?;
+    }
     let _capsule_staging;
     let selected = if let Some(bundle) = &signed_bundle {
         let staging = tempfile::tempdir().context("create signed capsule staging")?;
@@ -177,9 +211,29 @@ pub(crate) async fn run_init(
         _capsule_staging = Some(staging);
         resolved
     } else {
+        if filtered {
+            bail!("distro apply --capsule requires a signed Distro");
+        }
         _capsule_staging = None;
         selected
     };
+
+    if filtered {
+        let total = selected.len();
+        let install_result = install_capsules_with_resume(
+            &selected,
+            opts.offline,
+            &target,
+            signed_bundle.as_ref().map(|bundle| &bundle.pinned_refs),
+        )
+        .await?;
+        let succeeded = install_result.locked.len();
+        reject_total_install_failure(total, succeeded)?;
+        reject_filtered_partial_refresh(total, succeeded)?;
+        eprintln!();
+        eprintln!("{}", Theme::success("Selected Distro members refreshed."));
+        return Ok(daemon_lease);
+    }
 
     // Collect variables needed by selected capsules.
     let vars = collect_variables(&variables, &selected, opts.yes, &opts.vars)?;
