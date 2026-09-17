@@ -21,6 +21,15 @@ run_cli_semantic_smoke() {
   if run_cli agent show e2e-cli-lifecycle --format json > "$ARTIFACTS/cli-agent-lifecycle-deleted.json"; then
     fail "deleted agent e2e-cli-lifecycle remained visible"
   fi
+  run_cli agent create e2e-cli-claim-owned -y
+  run_cli agent claim e2e-cli-claim-owned
+  run_cli agent list --mine --format json > "$ARTIFACTS/cli-agent-claim-mine.json"
+  json_assert_cli_agent_owned "$ARTIFACTS/cli-agent-claim-mine.json" e2e-cli-claim-owned
+  assert_principal_cli_failure "$user_principal" "cli-agent-claim-user-denied" agent claim e2e-cli-claim-owned
+  if run_cli agent claim e2e-cli-claim-missing; then
+    fail "claim of missing principal e2e-cli-claim-missing succeeded"
+  fi
+  run_cli agent delete e2e-cli-claim-owned -y
   run_cli caps grant "$ops_principal" caps:token:mint
   run_cli caps grant "$ops_principal" caps:token:list
   run_cli caps grant "$ops_principal" caps:token:revoke
@@ -665,6 +674,23 @@ if data.get("principal") != sys.argv[2]:
     raise SystemExit(f"unexpected principal: {data!r}")
 if data.get("enabled") is not want:
     raise SystemExit(f"unexpected enabled state: {data!r}")
+PY
+}
+
+json_assert_cli_agent_owned() {
+  local file=$1 principal=$2
+  "$PYTHON" - "$file" "$principal" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+want = sys.argv[2]
+entries = data if isinstance(data, list) else [data]
+found = next((entry for entry in entries if entry.get("principal") == want), None)
+if found is None:
+    raise SystemExit(f"missing principal {want!r}: {data!r}")
+if not found.get("owner_uid"):
+    raise SystemExit(f"principal {want!r} missing owner_uid: {found!r}")
 PY
 }
 
