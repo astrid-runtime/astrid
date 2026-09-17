@@ -362,11 +362,12 @@ pub struct CommandAlwaysGrant {
     /// Native workspace authority is distinct from a missing hosted path.
     #[serde(default)]
     pub location: CommandApprovalLocation,
-    /// Workspace root this grant is bound to. `None` is unscoped (matches any
-    /// workspace), matching in-memory `Allowance.workspace_root` semantics.
-    /// When present the string must be non-empty. Host `approve_always`
-    /// persist always supplies `Some(current workspace)`; it does not write
-    /// `None`.
+    /// Hosted workspace identity this grant is bound to. For hosted portals
+    /// this is the pristine source path, not the process-local `CoW` merged
+    /// path. Hosted `approve_always` persist supplies `Some(pristine)` and
+    /// never `None`. `None` plus [`CommandApprovalLocation::AstridWorkspace`]
+    /// is the path-free native workspace, not an unscoped hosted grant.
+    /// When present the string must be non-empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<String>,
 }

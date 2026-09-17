@@ -83,20 +83,42 @@ fn check_persisted_allowance(
         command: resource.to_owned(),
         args: vec![],
     };
+    let location = approval_location(state);
+    let hosted_identity = state.hosted_workspace_root.as_path();
+    if location == CommandApprovalLocation::Hosted
+        && (hosted_identity.as_os_str().is_empty() || hosted_identity.to_str().is_none())
+    {
+        return Ok(false);
+    }
     Ok(profile.approvals.command_always.iter().any(|grant| {
-        if grant.location != approval_location(state) {
+        if grant.location != location {
             return false;
         }
-        if let Some(workspace) = &grant.workspace_root
-            && std::path::Path::new(workspace) != state.workspace_root
-        {
+        let workspace_ok = match (&grant.workspace_root, location) {
+            (Some(workspace), CommandApprovalLocation::Hosted) => {
+                std::path::Path::new(workspace) == hosted_identity
+            },
+            (None, CommandApprovalLocation::AstridWorkspace) => true,
+            _ => false,
+        };
+        if !workspace_ok {
             return false;
         }
         let pattern = AllowancePattern::CommandPattern {
             command: format!("{} *", escape_glob_metacharacters(&grant.command)),
         };
-        pattern.matches(&action, Some(&state.workspace_root))
+        pattern.matches(&action, Some(hosted_identity))
     }))
+}
+
+/// Hosted durable grants bind the pristine portal path, never the `CoW` merged
+/// path used for FS confinement. Empty or non-UTF-8 identity cannot persist.
+fn hosted_workspace_identity(state: &HostState) -> Result<&str, ErrorCode> {
+    let path = state.hosted_workspace_root.as_path();
+    if path.as_os_str().is_empty() {
+        return Err(ErrorCode::InvalidInput);
+    }
+    path.to_str().ok_or(ErrorCode::InvalidInput)
 }
 
 fn approval_location(state: &HostState) -> CommandApprovalLocation {
@@ -127,10 +149,7 @@ fn persist_always(
             cache.persist_astrid_command_always(principal, action)
         },
         CommandApprovalLocation::Hosted => {
-            let workspace = state
-                .workspace_root
-                .to_str()
-                .ok_or(ErrorCode::InvalidInput)?;
+            let workspace = hosted_workspace_identity(state)?;
             cache.persist_command_always(principal, action, Some(workspace))
         },
     };
@@ -532,3 +551,7 @@ impl approval::Host for HostState {
 #[cfg(test)]
 #[path = "approval_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "approval_hosted_identity_tests.rs"]
+mod hosted_identity_tests;

@@ -1,6 +1,6 @@
 use super::*;
 
-fn persistent_test_state(home: &std::path::Path) -> HostState {
+pub(super) fn persistent_test_state(home: &std::path::Path) -> HostState {
     let mut state =
         crate::engine::wasm::test_fixtures::minimal_host_state(tokio::runtime::Handle::current());
     state.profile_cache = Some(std::sync::Arc::new(
@@ -9,10 +9,11 @@ fn persistent_test_state(home: &std::path::Path) -> HostState {
         ),
     ));
     state.workspace_root = home.join("workspace");
+    state.hosted_workspace_root = state.workspace_root.clone();
     state
 }
 
-async fn answer_action_request(
+pub(super) async fn answer_action_request(
     mut state: HostState,
     decision: &'static str,
 ) -> Result<ApprovalResponse, ErrorCode> {
@@ -56,6 +57,7 @@ async fn always_survives_fresh_host_cache_and_store() {
 
     let mut other_workspace = persistent_test_state(home.path());
     other_workspace.workspace_root = home.path().join("other");
+    other_workspace.hosted_workspace_root = other_workspace.workspace_root.clone();
     assert!(
         !check_persisted_allowance(
             &other_workspace,
@@ -80,10 +82,11 @@ async fn always_survives_fresh_host_cache_and_store() {
     );
 }
 
-fn native_workspace_test_state(home: &std::path::Path) -> HostState {
+pub(super) fn native_workspace_test_state(home: &std::path::Path) -> HostState {
     use crate::engine::wasm::host_state::{PrincipalMount, PrincipalMountLocation};
     let mut state = persistent_test_state(home);
     state.workspace_root.clear();
+    state.hosted_workspace_root.clear();
     state.workspace = Some(PrincipalMount {
         location: PrincipalMountLocation::AstridFilesystem,
         vfs: state.vfs.clone(),
@@ -112,6 +115,7 @@ async fn native_workspace_always_persists_without_a_host_path() {
     );
     let mut empty_hosted = persistent_test_state(home.path());
     empty_hosted.workspace_root.clear();
+    empty_hosted.hosted_workspace_root.clear();
     assert!(
         !check_persisted_allowance(
             &empty_hosted,
@@ -678,7 +682,7 @@ async fn concurrent_approval_waiters_keep_correlation_and_principal_scopes() {
     assert!(response_identity_matches("agent-bob", bob_owner, &bob));
 }
 
-fn approval_request(action: &str, resource: &str) -> ApprovalRequest {
+pub(super) fn approval_request(action: &str, resource: &str) -> ApprovalRequest {
     ApprovalRequest {
         action: action.to_string(),
         target_resource: resource.to_string(),

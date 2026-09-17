@@ -266,11 +266,11 @@ impl PrincipalProfileCache {
     /// disk while holding that lock, so these two methods cannot drop each
     /// other's writes. Other profile writers do not share this lock.
     ///
-    /// Host persist always supplies `Some(current workspace root)`. This
-    /// method does not invent a `None`. `None` on the grant type is only the
-    /// existing in-memory unscoped [`astrid_approval::Allowance::workspace_root`]
-    /// semantics (matches any workspace); it is not a historical on-disk
-    /// migration.
+    /// Host persist always supplies `Some(pristine hosted portal path)`, not
+    /// the process-local `CoW` merged path. This method does not invent a
+    /// `None`. `None` on the grant type is only the existing in-memory
+    /// unscoped [`astrid_approval::Allowance::workspace_root`] semantics
+    /// (matches any workspace); it is not a historical on-disk migration.
     ///
     /// Fail-closed and idempotent: the same trimmed command + workspace pair
     /// is a no-op success. Empty command or empty present workspace returns

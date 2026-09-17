@@ -1,8 +1,9 @@
 /// Human-in-the-loop approval for sensitive actions.
 ///
-/// Checks the AllowanceStore first (instant path for pre-approved
-/// patterns), then publishes an ApprovalRequired IPC event and blocks
-/// until the frontend user responds or the request times out (60s).
+/// Checks persisted principal-profile `approvals.command_always` and the
+/// session AllowanceStore first (instant path for pre-approved patterns),
+/// then publishes an ApprovalRequired IPC event and blocks until the
+/// frontend user responds or the request times out (60s).
 ///
 /// Note: a capsule-to-capsule `astrid-bus:approval@1.0.0` package
 /// exists in `interfaces/` for approval-event schemas on the IPC bus.
@@ -42,8 +43,8 @@ interface host {
         target-resource: string,
     }
 
-    /// Decision returned by the user (or by the AllowanceStore for a
-    /// pre-approved pattern).
+    /// Decision returned by the user (or by a persisted always-grant /
+    /// session AllowanceStore hit for a pre-approved pattern).
     enum approval-decision {
         /// Denied — capsule must not proceed.
         denied,
@@ -51,7 +52,8 @@ interface host {
         approved,
         /// Approved for the current session.
         approved-session,
-        /// Approved permanently (stored in the AllowanceStore).
+        /// Approved permanently (stored in the principal profile's
+        /// `approvals.command_always`).
         approved-always,
         /// Auto-approved via an existing allowance pattern.
         allowance,
@@ -68,6 +70,7 @@ interface host {
     /// Request human approval for a sensitive action.
     ///
     /// Audit: every approval call recorded — request, response, and
-    /// resolution path (AllowanceStore hit vs user prompt).
+    /// resolution path (profile always-grant, AllowanceStore hit, or
+    /// user prompt).
     request-approval: func(request: approval-request) -> result<approval-response, error-code>;
 }

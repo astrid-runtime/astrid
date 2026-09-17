@@ -63,6 +63,7 @@ impl HostState {
             invocation_kv: None,
             capsule_log: None,
             capsule_id,
+            hosted_workspace_root: workspace_root.clone(),
             workspace_root,
             // Hooks run a transient one-shot on a plain HostVfs with no CoW.
             spawn_mask_paths: Vec::new(),
