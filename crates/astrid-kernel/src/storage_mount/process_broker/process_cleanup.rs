@@ -213,18 +213,47 @@ async fn unmount_known_projection_path(mountpoint: &Path) -> Result<(), String> 
     #[cfg(target_os = "linux")]
     const UMOUNT: &str = "/bin/umount";
 
-    let status = tokio::process::Command::new(UMOUNT)
+    run_unmount_command(UMOUNT, mountpoint, UNMOUNT_CONFIRM_TIMEOUT).await
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn run_unmount_command(
+    program: impl AsRef<std::ffi::OsStr>,
+    mountpoint: &Path,
+    timeout: Duration,
+) -> Result<(), String> {
+    let mut child = tokio::process::Command::new(program)
         .arg(mountpoint)
-        .status()
-        .await
+        .kill_on_drop(true)
+        .spawn()
         .map_err(|error| format!("invoke native unmount {}: {error}", mountpoint.display()))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => Err(format!(
             "native unmount of {} failed with {status}",
             mountpoint.display()
-        ))
+        )),
+        Ok(Err(error)) => Err(format!(
+            "invoke native unmount {}: {error}",
+            mountpoint.display()
+        )),
+        Err(_) => {
+            let _ = child.start_kill();
+            match tokio::time::timeout(timeout, child.wait()).await {
+                Ok(Ok(_)) => Err(format!(
+                    "native unmount of {} timed out",
+                    mountpoint.display()
+                )),
+                Ok(Err(error)) => Err(format!(
+                    "invoke native unmount {}: {error}",
+                    mountpoint.display()
+                )),
+                Err(_) => Err(format!(
+                    "native unmount of {} timed out and did not reap",
+                    mountpoint.display()
+                )),
+            }
+        },
     }
 }
 
@@ -474,5 +503,50 @@ mod tests {
         revoke_lease_if_present(&kernel, &caller, true, owner_lease.mount_id)
             .await
             .unwrap();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn hung_unmount_command_times_out_and_reaps() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().expect("hung unmount fixture");
+        let script = temporary.path().join("hung-umount");
+        let pidfile = temporary.path().join("pid");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+                pidfile.display()
+            ),
+        )
+        .expect("hung unmount script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("executable hung unmount script");
+        let mountpoint = temporary.path().join("mnt");
+        let error = run_unmount_command(&script, &mountpoint, Duration::from_millis(200))
+            .await
+            .expect_err("hung unmount must time out");
+        assert!(
+            error.contains("timed out"),
+            "timeout error must name the native unmount: {error}"
+        );
+        assert!(
+            !error.contains("did not reap"),
+            "timed-out unmount must reap the owned subprocess: {error}"
+        );
+        if let Ok(pid_text) = std::fs::read_to_string(&pidfile) {
+            let pid = pid_text.trim();
+            if !pid.is_empty() {
+                let status = std::process::Command::new("/bin/kill")
+                    .args(["-0", pid])
+                    .status()
+                    .expect("probe hung unmount pid");
+                assert!(
+                    !status.success(),
+                    "hung unmount child must be reaped, pid={pid}"
+                );
+            }
+        }
     }
 }
