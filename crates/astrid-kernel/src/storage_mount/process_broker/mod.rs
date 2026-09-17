@@ -8,29 +8,13 @@ use process_identity::parent_start_identity;
 mod process_stop;
 #[cfg(any(unix, windows))]
 use process_stop::stop_process_provider;
+#[cfg(any(unix, windows))]
+mod process_cleanup;
+#[cfg(any(unix, windows))]
+use process_cleanup::{ProjectionCleanupState, RunningProvider, cleanup_projection_state};
 
 pub(crate) type ProjectionCleanup =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync + 'static>;
-
-struct RunningProvider {
-    child: tokio::process::Child,
-    control_path: PathBuf,
-    token: String,
-    stopped: bool,
-}
-
-struct ProjectionCleanupState {
-    kernel: std::sync::Weak<Kernel>,
-    principal: PrincipalId,
-    branch: RunningProvider,
-    owner: RunningProvider,
-    shared: Option<RunningProvider>,
-    branch_id: StorageMountId,
-    owner_id: StorageMountId,
-    shared_id: Option<StorageMountId>,
-    mount_root: PathBuf,
-    cleaned: bool,
-}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ProcessProjectionKey {
@@ -375,18 +359,21 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
                 control_path: branch_control,
                 token: branch_launch.parent.token,
                 stopped: false,
+                mountpoint: branch_launch.mountpoint,
             },
             owner: RunningProvider {
                 child: owner_child,
                 control_path: owner_control,
                 token: owner_launch.parent.token,
                 stopped: false,
+                mountpoint: owner_launch.mountpoint,
             },
             shared: shared_child.take().map(|(child, launch)| RunningProvider {
                 child,
                 control_path: launch.control_path,
                 token: launch.parent.token,
                 stopped: false,
+                mountpoint: launch.mountpoint,
             }),
             branch_id: branch_lease.mount_id,
             owner_id: owner_lease.mount_id,
@@ -422,82 +409,6 @@ impl astrid_capsule::context::ProcessStorageMountBroker for KernelProcessStorage
             key,
         ))
     }
-}
-
-#[cfg(any(unix, windows))]
-async fn cleanup_projection_state(
-    cleanup_state: Arc<tokio::sync::Mutex<ProjectionCleanupState>>,
-) -> bool {
-    let mut state = cleanup_state.lock().await;
-    if state.cleaned {
-        return true;
-    }
-
-    // Provider teardown is an authenticated async protocol: STOP, wait for
-    // the service's unmount acknowledgement, then reap the child. A kill is
-    // only the emergency fallback when a provider is wedged or gone; keeping
-    // the provider handles in the state makes a later mount request retry the
-    // same bounded operation instead of creating a second projection.
-    let branch_stopped = stop_running_provider(&mut state.branch).await;
-    let owner_stopped = stop_running_provider(&mut state.owner).await;
-    let shared_stopped = match state.shared.as_mut() {
-        Some(shared) => stop_running_provider(shared).await,
-        None => true,
-    };
-    if !branch_stopped || !owner_stopped || !shared_stopped {
-        tracing::error!(
-            branch_stopped,
-            owner_stopped,
-            shared_stopped,
-            "native process storage provider teardown failed; retaining private mount resources"
-        );
-        return false;
-    }
-    let Some(kernel) = state.kernel.upgrade() else {
-        tracing::error!("kernel shut down before process storage projection leases were revoked");
-        return false;
-    };
-    if revoke_lease(&kernel, &state.principal, true, state.branch_id)
-        .await
-        .is_err()
-        || revoke_lease(&kernel, &state.principal, true, state.owner_id)
-            .await
-            .is_err()
-    {
-        tracing::error!("failed to revoke process storage projection leases; retaining resources");
-        return false;
-    }
-    if let Some(shared_id) = state.shared_id
-        && revoke_lease(&kernel, &state.principal, true, shared_id)
-            .await
-            .is_err()
-    {
-        tracing::error!("failed to revoke Fleet shared projection lease");
-        return false;
-    }
-    if let Err(error) = std::fs::remove_dir_all(&state.mount_root) {
-        tracing::error!(%error, "failed to remove process storage projection root");
-        return false;
-    }
-    state.cleaned = true;
-    true
-}
-
-#[cfg(any(unix, windows))]
-async fn stop_running_provider(provider: &mut RunningProvider) -> bool {
-    if provider.stopped {
-        return true;
-    }
-    let stopped = stop_process_provider(
-        &mut provider.child,
-        provider.control_path.clone(),
-        provider.token.clone(),
-    )
-    .await;
-    if stopped {
-        provider.stopped = true;
-    }
-    stopped
 }
 
 #[cfg(any(unix, windows))]

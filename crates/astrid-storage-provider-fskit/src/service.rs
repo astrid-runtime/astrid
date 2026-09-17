@@ -23,6 +23,11 @@ const MAX_LAUNCH_BYTES: u64 = 64 * 1024;
 const MAX_CONTROL_BYTES: usize = 64 * 1024;
 const MAX_CALLBACK_BYTES: usize = 8 * 1024 * 1024;
 const SERVICE_POLL: Duration = Duration::from_secs(1);
+/// Confirm native unmount before advertising `Stopped`. Bounded to stay under
+/// the broker's 10s STOP acknowledgement timeout; not operator-configurable
+/// because it is a protocol liveness ceiling, not a host policy knob.
+const UNMOUNT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+const UNMOUNT_CONFIRM_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case", tag = "operation", deny_unknown_fields)]
@@ -273,15 +278,15 @@ async fn service_loop(
                     },
                     ControlRequest::Stop { token } if token == launch.parent.token => {
                         let response = match crate::native_unmount(&launch.mountpoint).await {
-                            Ok(()) => {
-                                *mounted = false;
-                                let _ = local_transport::remove_endpoint(&launch.control_path);
-                                ControlResponse::Stopped
+                            Ok(()) => match wait_until_unmounted(&launch.mountpoint).await {
+                                Ok(()) => {
+                                    *mounted = false;
+                                    let _ = local_transport::remove_endpoint(&launch.control_path);
+                                    ControlResponse::Stopped
+                                },
+                                Err(error) => unmount_failure(error),
                             },
-                            Err(error) => ControlResponse::Failure {
-                                code: "unmount".to_owned(),
-                                message: error.to_string().chars().take(4096).collect(),
-                            },
+                            Err(error) => unmount_failure(error),
                         };
                         (response, true)
                     },
@@ -303,6 +308,57 @@ async fn service_loop(
             },
         }
     }
+}
+
+fn confirm_unmount_state(still_active: bool, validated: Result<()>) -> Result<()> {
+    if still_active {
+        bail!("native mount is still active");
+    }
+    validated.context("unmounted mountpoint failed validation")?;
+    Ok(())
+}
+
+fn unmount_failure(error: impl std::fmt::Display) -> ControlResponse {
+    ControlResponse::Failure {
+        code: "unmount".to_owned(),
+        message: error.to_string().chars().take(4096).collect(),
+    }
+}
+
+async fn wait_until_unmounted_with<F>(
+    mut probe: F,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<()>
+where
+    F: FnMut() -> Result<(bool, Result<()>)>,
+{
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(tokio::time::Instant::now);
+    loop {
+        let (still_active, validated) = probe()?;
+        match confirm_unmount_state(still_active, validated) {
+            Ok(()) => return Ok(()),
+            Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
+            Err(_) => tokio::time::sleep(interval).await,
+        }
+    }
+}
+
+async fn wait_until_unmounted(mountpoint: &Path) -> Result<()> {
+    wait_until_unmounted_with(
+        || {
+            let still_active = crate::native_mount_is_active(mountpoint)?;
+            Ok((
+                still_active,
+                crate::validate_unmounted_mountpoint(mountpoint),
+            ))
+        },
+        UNMOUNT_CONFIRM_TIMEOUT,
+        UNMOUNT_CONFIRM_INTERVAL,
+    )
+    .await
 }
 
 async fn read_control(stream: &mut LocalStream) -> Result<ControlRequest> {
@@ -462,5 +518,69 @@ mod tests {
             token: "0123456789abcdef".to_owned(),
         };
         assert!(parent_is_alive(&parent));
+    }
+
+    #[test]
+    fn confirm_unmount_state_rejects_an_active_mount() {
+        let error =
+            confirm_unmount_state(true, Ok(())).expect_err("active mount must not report Stopped");
+        assert!(error.to_string().contains("still active"));
+    }
+
+    #[test]
+    fn confirm_unmount_state_accepts_inactive_empty_mountpoint() {
+        confirm_unmount_state(false, Ok(())).expect("inactive empty mountpoint");
+    }
+
+    #[test]
+    fn confirm_unmount_state_rejects_nonempty_unmounted_mountpoint() {
+        let error = confirm_unmount_state(false, Err(anyhow::anyhow!("mountpoint is not empty")))
+            .expect_err("nonempty unmounted mountpoint must fail closed");
+        let report = format!("{error:#}");
+        assert!(
+            report.contains("not empty"),
+            "validation source must remain visible: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unmount_wait_times_out_while_still_active() {
+        let error = wait_until_unmounted_with(
+            || Ok((true, Ok(()))),
+            Duration::from_millis(80),
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("active mount must time out");
+        assert!(error.to_string().contains("still active"));
+    }
+
+    #[tokio::test]
+    async fn unmount_wait_succeeds_once_inactive() {
+        let remaining = std::cell::Cell::new(2_u8);
+        wait_until_unmounted_with(
+            || {
+                let left = remaining.get();
+                remaining.set(left.saturating_sub(1));
+                Ok((left > 0, Ok(())))
+            },
+            Duration::from_millis(200),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect("inactive probe must pass");
+        assert_eq!(remaining.get(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn empty_private_directory_confirms_unmounted() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let mountpoint = root.path().join("mount");
+        astrid_core::platform_fs::ensure_private_directory(&mountpoint)
+            .expect("private mountpoint");
+        wait_until_unmounted(&mountpoint)
+            .await
+            .expect("empty private directory is not an astridfs mount");
     }
 }

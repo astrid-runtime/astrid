@@ -130,6 +130,11 @@ impl StorageMountLeaseState {
             && now_epoch_secs() <= self.expires_at_epoch_secs.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub(crate) fn mark_revoked_for_test(&self) {
+        self.revoked.store(true, Ordering::Release);
+    }
+
     fn renew(&self) {
         self.expires_at_epoch_secs.store(
             now_epoch_secs().saturating_add(LEASE_IDLE_TTL_SECS),
@@ -314,13 +319,47 @@ pub(crate) async fn revoke_lease(
     allow_cross_owner: bool,
     mount_id: StorageMountId,
 ) -> Result<(), String> {
-    let state = owned_lease(kernel, caller, allow_cross_owner, mount_id)?;
-    state.revoked.store(true, Ordering::Release);
-    let _ = state.shutdown_tx.send(true);
-    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
-    kernel.storage_mounts.remove(&mount_id);
-    cleanup_resource(&state.resource_path, &state.callback_path);
-    Ok(())
+    finish_revoke(
+        kernel,
+        owned_lease(kernel, caller, allow_cross_owner, mount_id)?,
+    )
+    .await
+}
+
+/// Revoke a projection lease if it is still recorded.
+///
+/// Missing leases succeed. A recorded lease that is expired or already marked
+/// revoked is still removed and cleaned. A live lease owned by another
+/// principal remains fail-closed.
+pub(crate) async fn revoke_lease_if_present(
+    kernel: &Kernel,
+    caller: &PrincipalId,
+    allow_cross_owner: bool,
+    mount_id: StorageMountId,
+) -> Result<(), String> {
+    match lookup_lease(kernel, caller, allow_cross_owner, mount_id)? {
+        None => Ok(()),
+        Some(state) => finish_revoke(kernel, state).await,
+    }
+}
+
+fn lookup_lease(
+    kernel: &Kernel,
+    caller: &PrincipalId,
+    allow_cross_owner: bool,
+    mount_id: StorageMountId,
+) -> Result<Option<Arc<StorageMountLeaseState>>, String> {
+    let Some(state) = kernel
+        .storage_mounts
+        .get(&mount_id)
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        return Ok(None);
+    };
+    if !state.is_owned_by(caller) && !allow_cross_owner {
+        return Err("storage mount lease belongs to another principal".to_owned());
+    }
+    Ok(Some(state))
 }
 
 fn owned_lease(
@@ -329,18 +368,21 @@ fn owned_lease(
     allow_cross_owner: bool,
     mount_id: StorageMountId,
 ) -> Result<Arc<StorageMountLeaseState>, String> {
-    let state = kernel
-        .storage_mounts
-        .get(&mount_id)
-        .map(|entry| Arc::clone(entry.value()))
+    let state = lookup_lease(kernel, caller, allow_cross_owner, mount_id)?
         .ok_or_else(|| format!("storage mount lease {mount_id} was not found"))?;
-    if !state.is_owned_by(caller) && !allow_cross_owner {
-        return Err("storage mount lease belongs to another principal".to_owned());
-    }
     if !state.is_live() {
         return Err("storage mount lease is expired or revoked".to_owned());
     }
     Ok(state)
+}
+
+async fn finish_revoke(kernel: &Kernel, state: Arc<StorageMountLeaseState>) -> Result<(), String> {
+    state.revoked.store(true, Ordering::Release);
+    let _ = state.shutdown_tx.send(true);
+    let _mutation_guard = kernel.storage_mount_mutations.lock().await;
+    kernel.storage_mounts.remove(&state.mount_id);
+    cleanup_resource(&state.resource_path, &state.callback_path);
+    Ok(())
 }
 
 async fn resolve_owner(
