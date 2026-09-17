@@ -34,6 +34,7 @@ fn identity(verified: bool) -> AuthenticatedIdentity {
     AuthenticatedIdentity {
         principal: PrincipalId::new("alice").unwrap(),
         device_key_id: verified.then(|| "verified-device".into()),
+        request_owner: astrid_types::ipc::RequestOwnerId::generate(),
     }
 }
 
