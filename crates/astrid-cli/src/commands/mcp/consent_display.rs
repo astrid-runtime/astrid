@@ -5,9 +5,10 @@
 //! clients that ignore unknown `_meta` still see the existing message plus
 //! interoperable form schema.
 //!
-//! Authority lives in `kind` and `choices`. Consumers MUST NOT infer
-//! capsule grant, capability approval, or ingress trust from form field
-//! names such as `grant`, `choice`, or `allow`.
+//! `kind` and `choices` describe presentation semantics, not authority.
+//! Authorization stays in the host-owned request/response path. Consumers
+//! MUST NOT infer capsule grants, capability approval, or ingress trust from
+//! this metadata or form field names such as `grant`, `choice`, or `allow`.
 //!
 //! `reason` is host-generated display text. Guest WIT `approval-request`
 //! carries only `action` and `target-resource`; it has no reason field,
