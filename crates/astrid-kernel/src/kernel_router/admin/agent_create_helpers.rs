@@ -28,18 +28,27 @@ use super::handlers::{
     require_principal_exists, success_json,
 };
 
+pub(super) struct DerivedPrincipalTarget {
+    pub(super) principal: PrincipalId,
+    pub(super) profile_path: std::path::PathBuf,
+    pub(super) ownership: astrid_storage::ownership::DerivedPrincipalOwnership,
+}
+
 /// Provision the explicit, restricted runtime shape used by `agent spawn`.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn provision_derived_principal(
     kernel: &Arc<crate::Kernel>,
-    principal: PrincipalId,
-    profile_path: std::path::PathBuf,
+    target: DerivedPrincipalTarget,
     source: PrincipalId,
     load_capsules: Vec<String>,
     allow_capsules: Vec<String>,
     inherit_capsule_state: Vec<String>,
     network_egress: Vec<String>,
 ) -> AdminResponseBody {
+    let DerivedPrincipalTarget {
+        principal,
+        profile_path,
+        ownership,
+    } = target;
     if source == principal {
         return err_bad_input("derived principal cannot use itself as its source".to_string());
     }
@@ -73,6 +82,7 @@ pub(super) async fn provision_derived_principal(
         None,
         false,
         false,
+        None,
     )
     .await;
     if !matches!(response, AdminResponseBody::Success(_)) {
@@ -124,7 +134,15 @@ pub(super) async fn provision_derived_principal(
         )
         .await;
     }
-    finish_derived_principal(kernel, principal, source, load_capsules, profile).await
+    finish_derived_principal(
+        kernel,
+        principal,
+        source,
+        load_capsules,
+        profile,
+        &ownership,
+    )
+    .await
 }
 
 async fn finish_derived_principal(
@@ -133,6 +151,7 @@ async fn finish_derived_principal(
     source: PrincipalId,
     load_capsules: Vec<String>,
     profile: PrincipalProfile,
+    ownership: &astrid_storage::ownership::DerivedPrincipalOwnership,
 ) -> AdminResponseBody {
     if let Err(error) = kernel
         .ensure_principal_capsules_ready(&principal, &load_capsules)
@@ -142,6 +161,25 @@ async fn finish_derived_principal(
             kernel,
             &principal,
             err_internal(format!("derived capsule readiness failed: {error}")),
+        )
+        .await;
+    }
+    let uid = match kernel.principal_directory.uid_for(&principal) {
+        Ok(uid) => uid,
+        Err(error) => {
+            return rollback_after_failure(kernel, &principal, err_internal(error.to_string()))
+                .await;
+        },
+    };
+    if let Err(error) = kernel
+        .ownership_store
+        .assign_derived_principal(uid, ownership)
+        .await
+    {
+        return rollback_after_failure(
+            kernel,
+            &principal,
+            err_internal(format!("spawn ownership assignment failed: {error}")),
         )
         .await;
     }
@@ -477,6 +515,7 @@ pub(super) async fn provision_new_principal(
     clone_from: Option<PrincipalId>,
     allow_admin_clone: bool,
     warm_after_create: bool,
+    ownership: Option<&super::handlers::creation_authority::CreationAuthority>,
 ) -> AdminResponseBody {
     if let Err(error) = kernel
         .ownership_store
@@ -578,6 +617,12 @@ pub(super) async fn provision_new_principal(
         super::inheritance::inherit_from_principal(kernel, source, &principal).await;
     }
 
+    if let Some(authority) = ownership
+        && let Err(response) = authority.assign(kernel, &principal).await
+    {
+        rollback_created_identity(kernel, &principal, user.id, &profile_path, true).await;
+        return response;
+    }
     if warm_after_create {
         warm_created_principal(kernel, principal.clone());
     }

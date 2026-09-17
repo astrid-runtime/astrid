@@ -38,6 +38,8 @@ mod invite_handlers;
 mod pair_device_handlers;
 #[cfg(test)]
 mod pair_device_tests;
+#[cfg(test)]
+mod principal_ownership;
 mod quota;
 #[cfg(test)]
 mod state_tests;
@@ -60,6 +62,8 @@ mod state_tests_group;
 #[cfg(test)]
 mod state_tests_usage;
 mod storage_mount_handlers;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;
 
@@ -285,6 +289,7 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         // `group:delete`, `group:modify`) and remain
         // `AuthorityScope::Global` below, so this widening is read-only.
         AdminRequestKind::AgentList
+        | AdminRequestKind::UserPrincipalList
         | AdminRequestKind::GroupList
         // EnvList is self-scoped when the target is the caller; the target
         // arm above handles cross-principal admin reads.
@@ -298,6 +303,7 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
             ..
         } => AuthorityScope::Self_,
         AdminRequestKind::AgentCreate { .. }
+        | AdminRequestKind::UserPrincipalClaim { .. }
         | AdminRequestKind::AgentDelete { .. }
         | AdminRequestKind::AgentEnable { .. }
         | AdminRequestKind::AgentDisable { .. }
@@ -358,12 +364,15 @@ pub fn required_capability_for_admin_request(
             },
             _,
         ) => "agent:create:inherit",
-        (AdminRequestKind::AgentCreate { .. }, _) => "agent:create",
+        (AdminRequestKind::AgentCreate { .. } | AdminRequestKind::UserPrincipalClaim { .. }, _) => {
+            "agent:create"
+        },
         (AdminRequestKind::AgentDelete { .. }, _) => "agent:delete",
         (AdminRequestKind::AgentEnable { .. }, _) => "agent:enable",
         (AdminRequestKind::AgentDisable { .. }, _) => "agent:disable",
         (AdminRequestKind::AgentModify { .. }, _) => "agent:modify",
-        (AdminRequestKind::AgentList, AuthorityScope::Self_) => "self:agent:list",
+        (AdminRequestKind::AgentList, AuthorityScope::Self_)
+        | (AdminRequestKind::UserPrincipalList, _) => "self:agent:list",
         (AdminRequestKind::AgentList, AuthorityScope::Global) => "agent:list",
         (AdminRequestKind::DistroSelfGrant, _) => "self:distro:grant",
         (AdminRequestKind::QuotaSet { .. }, AuthorityScope::Self_) => "self:quota:set",
@@ -519,6 +528,8 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::AgentDisable { .. } => "admin.agent.disable",
         AdminRequestKind::AgentModify { .. } => "admin.agent.modify",
         AdminRequestKind::AgentList => "admin.agent.list",
+        AdminRequestKind::UserPrincipalList => "admin.user.principals",
+        AdminRequestKind::UserPrincipalClaim { .. } => "admin.user.principal.claim",
         AdminRequestKind::QuotaSet { .. } => "admin.quota.set",
         AdminRequestKind::QuotaGet { .. } => "admin.quota.get",
         AdminRequestKind::UsageGet { .. } => "admin.usage.get",
@@ -656,6 +667,7 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         | AdminRequestKind::AgentEnable { principal }
         | AdminRequestKind::AgentDisable { principal }
         | AdminRequestKind::AgentModify { principal, .. }
+        | AdminRequestKind::UserPrincipalClaim { principal }
         | AdminRequestKind::QuotaSet { principal, .. }
         | AdminRequestKind::QuotaGet { principal }
         | AdminRequestKind::UsageGet { principal }
@@ -675,6 +687,7 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         AdminRequestKind::CapsTokenRevoke { .. }
         | AdminRequestKind::AgentCreate { .. }
         | AdminRequestKind::AgentList
+        | AdminRequestKind::UserPrincipalList
         | AdminRequestKind::DistroSelfGrant
         | AdminRequestKind::GroupCreate { .. }
         | AdminRequestKind::GroupDelete { .. }

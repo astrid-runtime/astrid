@@ -47,7 +47,7 @@ use caller::{MANAGEMENT_CALLER_REQUIRED, resolve_caller};
 use connection_tracker::register_connection_tracker;
 #[cfg(test)]
 use connection_tracker::{ConnectionSignal, connection_signal};
-use device_scope::resolve_device_scope;
+use device_scope::{resolve_device, resolve_device_scope};
 use inventory::visible_inventory_manifests;
 use resume_receipt::{get as rg, put as rp};
 use visibility::CapsuleVisibility;
@@ -689,6 +689,7 @@ struct AuthorizedRequest {
     profile: Arc<PrincipalProfile>,
     groups: Arc<GroupConfig>,
     device_scope: Option<DeviceScope>,
+    authenticated_public_key: Option<[u8; 32]>,
 }
 
 impl AuthorizedRequest {
@@ -752,7 +753,18 @@ fn authorize_request(
     }
     let groups = kernel.groups.load_full();
 
-    let device_scope = resolve_device_scope(profile.as_ref(), caller, device_key_id, required_cap)?;
+    let device = resolve_device(profile.as_ref(), caller, device_key_id, required_cap)?;
+    let device_scope = device.map(|device| device.scope.clone());
+    let authenticated_public_key = device
+        .map(|device| {
+            astrid_crypto::PublicKey::from_hex(&device.pubkey)
+                .map(Into::into)
+                .map_err(|_| PermissionError::DeviceScopeDenied {
+                    principal: caller.clone(),
+                    required: required_cap.to_owned(),
+                })
+        })
+        .transpose()?;
 
     let mut check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone());
     if let Some(scope) = &device_scope {
@@ -764,6 +776,7 @@ fn authorize_request(
         profile,
         groups,
         device_scope,
+        authenticated_public_key,
     })
 }
 

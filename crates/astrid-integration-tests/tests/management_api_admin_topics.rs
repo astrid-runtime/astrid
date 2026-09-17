@@ -90,6 +90,10 @@ fn all_admin_variants() -> Vec<AdminRequestKind> {
             remove_capsules: Vec::new(),
         },
         AdminRequestKind::AgentList,
+        AdminRequestKind::UserPrincipalList,
+        AdminRequestKind::UserPrincipalClaim {
+            principal: pid("target"),
+        },
         AdminRequestKind::QuotaSet {
             principal: pid("target"),
             quotas: Quotas::default(),

@@ -710,7 +710,6 @@ async fn private_callbacks_bind_authority_and_isolate_principal_and_fleet_views(
         &kernel.principal_directory,
         user,
         identity,
-        false,
     )
     .await
     .unwrap();
@@ -1007,7 +1006,6 @@ async fn synced_owner_mounts_reopen_without_cross_view_aliasing() {
         &kernel.principal_directory,
         user,
         identity,
-        false,
     )
     .await
     .unwrap();
@@ -1414,7 +1412,6 @@ async fn internal_workspace_branch_lease_fixes_branch_target() {
         &kernel.principal_directory,
         user,
         identity,
-        false,
     )
     .await
     .unwrap();

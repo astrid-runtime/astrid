@@ -17,6 +17,8 @@ use astrid_core::profile::{AuthConfig, AuthMethod, DeviceKey, DeviceScope, Princ
 use astrid_crypto::{IdentifierHash, PublicKeyFingerprint};
 use tracing::{info, warn};
 
+pub(super) mod ownership;
+
 use crate::invite::{self, DurableInviteStore, Invite, MAX_EXPIRY_SECS};
 
 /// Domain-separated BLAKE3 fingerprint of an Ed25519 public key. Surfaced as
@@ -43,6 +45,7 @@ pub(crate) async fn invite_issue(
     expires_secs: Option<u64>,
     max_uses: u32,
     metadata: Option<String>,
+    ownership: astrid_storage::ownership::CreationDelegation,
 ) -> AdminResponseBody {
     if max_uses == 0 {
         return err_bad_input("max_uses must be greater than 0".into());
@@ -84,6 +87,7 @@ pub(crate) async fn invite_issue(
     let token_hash = invite::hash_token(&token);
 
     let record = Invite {
+        ownership: Some(ownership),
         token_hash: token_hash.clone(),
         group: group.clone(),
         remaining_uses: max_uses,
@@ -151,6 +155,10 @@ pub(crate) async fn invite_redeem(
         return err_unauthorized("invite token invalid, expired, or already consumed".into());
     };
 
+    if let Err(response) = ownership::validate(kernel, chosen.ownership.as_ref()).await {
+        return response;
+    }
+
     // Mint the principal id. `display_name` is treated as a soft
     // suggestion: slugify and dedupe; on hard collision fall back to a
     // random tag so a malicious redeemer can't grief future redeemers
@@ -206,7 +214,14 @@ pub(crate) async fn invite_redeem(
     // definite commit loss, so only then is this attempt's exact UID rolled
     // back. A storage error leaves the provisioned identity in place because
     // the commit may have succeeded and deleting it could invalidate a winner.
-    match store.consume_if_unchanged(&chosen).await {
+    let uid = match kernel.principal_directory.uid_for(&principal) {
+        Ok(uid) => uid,
+        Err(error) => return err_internal(format!("enrolled principal UID unavailable: {error}")),
+    };
+    match store
+        .consume_with_ownership(&chosen, &kernel.ownership_store, uid)
+        .await
+    {
         Ok(true) => {},
         Ok(false) => {
             if let Err(error) = rollback_invited_principal(kernel, &principal, provisioned).await {
@@ -511,12 +526,14 @@ mod tests {
     }
 
     async fn issue_token(kernel: &Arc<crate::Kernel>) -> String {
+        let delegation = super::super::test_support::seed_operator(kernel).await;
         match invite_issue(
             kernel,
             "agent".into(),
             Some(300),
             1,
             Some("test invite".into()),
+            delegation,
         )
         .await
         {
@@ -529,6 +546,45 @@ mod tests {
     fn normalise_public_key_accepts_bare_hex() {
         let key = "a".repeat(64);
         assert_eq!(normalise_public_key(&key).unwrap(), key);
+    }
+
+    #[tokio::test]
+    async fn legacy_invite_without_owner_is_not_adopted_or_consumed() {
+        let (_dir, kernel) = fixture().await;
+        let token = invite::generate_token();
+        let record = Invite {
+            ownership: None,
+            token_hash: invite::hash_token(&token),
+            group: "agent".into(),
+            remaining_uses: 1,
+            expires_at_epoch: Some(invite::now_epoch().saturating_add(300)),
+            issued_at_epoch: invite::now_epoch(),
+            metadata: None,
+        };
+        let store = invite_store(&kernel).unwrap();
+        store
+            .ensure_legacy_import(&kernel.astrid_home)
+            .await
+            .unwrap();
+        assert!(store.issue(&record).await.unwrap());
+        let response = invite_redeem(
+            &kernel,
+            token,
+            "ab".repeat(32),
+            Some("legacy-enrollee".into()),
+        )
+        .await;
+        let AdminResponseBody::Error(message) = response else {
+            panic!("legacy invite accepted");
+        };
+        assert!(message.contains("create a new invitation"));
+        assert_eq!(
+            store.redeemable(&record.token_hash).await.unwrap(),
+            Some(record)
+        );
+        let principal = PrincipalId::new("legacy-enrollee").unwrap();
+        assert!(kernel.principal_directory.uid_for(&principal).is_err());
+        assert!(!kernel.astrid_home.profile_path(&principal).exists());
     }
 
     #[test]

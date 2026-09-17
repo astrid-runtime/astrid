@@ -20,7 +20,6 @@ use astrid_core::dirs::AstridHome;
 use astrid_core::groups::{BUILTIN_ADMIN, BUILTIN_AGENT, BUILTIN_RESTRICTED, GroupConfig};
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope, PrincipalProfile, Quotas};
-use astrid_core::{FleetGenesis, FleetIdentity, PrincipalOwnership, UserGenesis, UserIdentity};
 use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody, AgentSummary, GroupSummary};
 use astrid_storage::env::{get_env, principal_env_store, set_env};
 use tempfile::TempDir;
@@ -49,6 +48,7 @@ async fn fixture() -> (TempDir, Arc<Kernel>) {
         ))
         .expect("seed default admin profile");
     kernel.profile_cache.invalidate(&PrincipalId::default());
+    super::test_support::seed_operator(&kernel).await;
     (dir, kernel)
 }
 
@@ -216,7 +216,7 @@ async fn assert_agent_list_authorization_snapshot(
 async fn agent_create_writes_profile_and_links_identity() {
     let (_dir, kernel) = fixture().await;
 
-    let res = handlers::dispatch(
+    let res = super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -257,7 +257,7 @@ async fn agent_create_writes_profile_and_links_identity() {
 async fn agent_create_rejects_collision_with_existing_profile() {
     let (_dir, kernel) = fixture().await;
 
-    handlers::dispatch(
+    super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -272,7 +272,7 @@ async fn agent_create_rejects_collision_with_existing_profile() {
     .await;
 
     // Second create with the same name → rejected.
-    let res = handlers::dispatch(
+    let res = super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -291,7 +291,7 @@ async fn agent_create_rejects_collision_with_existing_profile() {
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_create_rejects_invalid_name() {
     let (_dir, kernel) = fixture().await;
-    let res = handlers::dispatch(
+    let res = super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -315,7 +315,7 @@ async fn agent_create_rejects_invalid_name() {
 async fn agent_create_rejects_reserved_names() {
     let (_dir, kernel) = fixture().await;
     for name in ["default", "anonymous"] {
-        let res = handlers::dispatch(
+        let res = super::test_support::dispatch_as_operator(
             &kernel,
             &astrid_core::PrincipalId::default(),
             AdminRequestKind::AgentCreate {
@@ -350,7 +350,7 @@ async fn agent_create_without_inherit_copies_nothing() {
     let default_env = principal_env_store(Arc::clone(&kernel.kv), default_uid, "openai").unwrap();
     set_env(&default_env, "BASE_URL", "x").await.unwrap();
 
-    let res = handlers::dispatch(
+    let res = super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -390,7 +390,7 @@ async fn agent_create_with_inherit_copies_from_source() {
     seed_loaded_capsule(&kernel, "openai").await;
 
     // Create the source principal first so its profile + home tree exist.
-    let res = handlers::dispatch(
+    let res = super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -411,7 +411,7 @@ async fn agent_create_with_inherit_copies_from_source() {
     set_env(&source_env, "BASE_URL", "src").await.unwrap();
 
     // Create the inheriting agent.
-    let res = handlers::dispatch(
+    let res = super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -449,7 +449,7 @@ async fn agent_create_with_inherit_copies_from_source() {
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_create_rejects_nonexistent_inherit_source() {
     let (_dir, kernel) = fixture().await;
-    let res = handlers::dispatch(
+    let res = super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -474,7 +474,7 @@ async fn agent_create_rejects_nonexistent_inherit_source() {
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_create_rejects_self_inherit() {
     let (_dir, kernel) = fixture().await;
-    let res = handlers::dispatch(
+    let res = super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -494,7 +494,7 @@ async fn agent_create_rejects_self_inherit() {
 async fn agent_create_does_not_recreate_legacy_home_tree() {
     let (_dir, kernel) = fixture().await;
 
-    let res = handlers::dispatch(
+    let res = super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -542,7 +542,7 @@ async fn agent_delete_removes_identity_profile_and_invalidates_cache() {
     let (_dir, kernel) = fixture().await;
 
     // Create, then resolve via cache so there's an entry to invalidate.
-    handlers::dispatch(
+    super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -559,7 +559,7 @@ async fn agent_delete_removes_identity_profile_and_invalidates_cache() {
     assert!(path.exists(), "profile.toml should be present pre-delete");
     let _warm = kernel.profile_cache.resolve(&pid("bob")).unwrap();
 
-    let res = handlers::dispatch(
+    let res = super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentDelete {
@@ -587,7 +587,7 @@ async fn agent_delete_removes_identity_profile_and_invalidates_cache() {
 async fn agent_delete_retry_clears_reservation_after_identity_was_removed() {
     let (_dir, kernel) = fixture().await;
     let principal = pid("recoverable-delete");
-    let created = handlers::dispatch(
+    let created = super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -616,13 +616,21 @@ async fn agent_delete_retry_clears_reservation_after_identity_was_removed() {
         .unwrap();
     let guard = kernel
         .ownership_store
-        .guard_principal_deletion_for_alias(identity.uid, principal.clone())
+        .guard_principal_deletion_for_device(
+            identity.uid,
+            principal.clone(),
+            kernel
+                .principal_directory
+                .uid_for(&PrincipalId::default())
+                .unwrap(),
+            &[0xab; 32],
+        )
         .await
         .unwrap();
     assert!(kernel.identity_store.delete_user(user.id).await.unwrap());
     drop(guard);
 
-    let retried = handlers::dispatch(
+    let retried = super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentDelete {
@@ -645,7 +653,7 @@ async fn agent_delete_retry_clears_reservation_after_identity_was_removed() {
 async fn agent_delete_rejects_a_fleet_owned_principal_without_partial_deletion() {
     let (_dir, kernel) = fixture().await;
     let principal = pid("owned-bob");
-    let created = handlers::dispatch(
+    let created = super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -672,37 +680,15 @@ async fn agent_delete_rejects_a_fleet_owned_principal_without_partial_deletion()
         .await
         .unwrap()
         .unwrap();
-    let owner = UserIdentity::from_genesis(UserGenesis::from_parts(
-        user.id,
-        user.created_at,
-        principal_identity.genesis.initial_public_key,
-    ))
-    .unwrap();
-    let fleet = FleetIdentity::from_genesis(FleetGenesis::from_parts(
-        user.id,
-        user.created_at,
-        owner.uid,
-    ))
-    .unwrap();
-    kernel
+    // Creation already assigned ownership; do not overwrite it to build the fixture.
+    let fleet_uid = kernel
         .ownership_store
-        .create_user(owner.clone())
+        .load()
         .await
-        .unwrap();
-    kernel
-        .ownership_store
-        .create_fleet(fleet.clone())
-        .await
-        .unwrap();
-    kernel
-        .ownership_store
-        .assign_principal(PrincipalOwnership {
-            principal_uid: principal_identity.uid,
-            fleet_uid: fleet.uid,
-            assigned_by: owner.uid,
-        })
-        .await
-        .unwrap();
+        .unwrap()
+        .principal_owner(principal_identity.uid)
+        .unwrap()
+        .fleet_uid;
 
     let profile_path = PrincipalProfile::path_for(&kernel.astrid_home, &principal);
     let deleted = handlers::dispatch(
@@ -742,7 +728,7 @@ async fn agent_delete_rejects_a_fleet_owned_principal_without_partial_deletion()
             .principal_owner(principal_identity.uid)
             .unwrap()
             .fleet_uid,
-        fleet.uid
+        fleet_uid
     );
 }
 
@@ -880,7 +866,7 @@ async fn caps_revoke_on_default_is_rejected() {
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_enable_toggle_and_cache_invalidation() {
     let (_dir, kernel) = fixture().await;
-    handlers::dispatch(
+    super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -929,7 +915,7 @@ async fn agent_enable_toggle_and_cache_invalidation() {
 async fn agent_list_returns_every_home_dir_principal() {
     let (_dir, kernel) = fixture().await;
     for name in ["alice", "bob"] {
-        handlers::dispatch(
+        super::test_support::dispatch_as_operator(
             &kernel,
             &astrid_core::PrincipalId::default(),
             AdminRequestKind::AgentCreate {
@@ -966,7 +952,7 @@ async fn agent_list_returns_every_home_dir_principal() {
 #[tokio::test(flavor = "multi_thread")]
 async fn quota_set_rejects_zero_memory() {
     let (_dir, kernel) = fixture().await;
-    handlers::dispatch(
+    super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -999,7 +985,7 @@ async fn quota_set_rejects_zero_memory() {
 #[tokio::test(flavor = "multi_thread")]
 async fn quota_set_updates_profile_and_invalidates_cache() {
     let (_dir, kernel) = fixture().await;
-    handlers::dispatch(
+    super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -1171,7 +1157,7 @@ async fn group_delete_reference_from_profile_does_not_elevate_privileges() {
     .await;
 
     // Create an agent with `ops` group membership.
-    handlers::dispatch(
+    super::test_support::dispatch_as_operator(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -1214,7 +1200,7 @@ async fn agent_list_filters_to_self_for_non_admin_caller() {
     // Two ordinary agents — empty groups default to the `agent` builtin,
     // which grants `self:*` / `self:agent:list` but NOT global `agent:list`.
     for name in ["alice", "bob"] {
-        let res = handlers::dispatch(
+        let res = super::test_support::dispatch_as_operator(
             &kernel,
             &PrincipalId::default(),
             AdminRequestKind::AgentCreate {
@@ -1266,7 +1252,7 @@ async fn agent_list_filters_to_self_for_non_admin_caller() {
 async fn agent_list_global_view_is_attenuated_by_device_scope() {
     let (_dir, kernel) = fixture().await;
     for name in ["alice", "bob"] {
-        let res = handlers::dispatch(
+        let res = super::test_support::dispatch_as_operator(
             &kernel,
             &PrincipalId::default(),
             AdminRequestKind::AgentCreate {

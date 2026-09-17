@@ -17,6 +17,7 @@ use clap::{Args, Subcommand};
 use colored::Colorize;
 use serde::Serialize;
 
+mod claim;
 mod spawn;
 
 use crate::admin_client::{AdminClient, into_result};
@@ -38,6 +39,8 @@ pub(crate) enum AgentCommand {
     Spawn(spawn::SpawnArgs),
     /// List agents on this host (and registered remotes when ready).
     List(ListArgs),
+    /// Assign a named unowned principal to the authenticated user's fleet.
+    Claim(claim::ClaimArgs),
     /// Show the active agent context.
     Current,
     /// Set the active agent context for subsequent commands.
@@ -157,6 +160,10 @@ pub(crate) struct CreateArgs {
 
 #[derive(Args, Debug, Clone)]
 pub(crate) struct ListArgs {
+    /// Show only principals in the authenticated user's fleets. Requires a
+    /// user-delegated device; does not grant permission to act as those agents.
+    #[arg(long)]
+    pub mine: bool,
     /// Show registered remote agents (deferred — see #656/#658).
     #[arg(long, hide = true)]
     pub remote: bool,
@@ -267,6 +274,7 @@ pub(crate) async fn run(cmd: AgentCommand) -> Result<ExitCode> {
         AgentCommand::Create(args) => run_create(args).await,
         AgentCommand::Spawn(args) => spawn::run(args).await,
         AgentCommand::List(args) => run_list(args).await,
+        AgentCommand::Claim(args) => claim::run(args).await,
         AgentCommand::Current => run_current(),
         AgentCommand::Switch(args) => run_switch(args).await,
         AgentCommand::Show(args) => run_show(args).await,
@@ -523,7 +531,12 @@ async fn run_list(args: ListArgs) -> Result<ExitCode> {
     let format = ValueFormat::parse(&args.format);
 
     let mut client = crate::admin_client::connect_as_active_agent().await?;
-    let body = client.request(AdminRequestKind::AgentList).await?;
+    let request = if args.mine {
+        AdminRequestKind::UserPrincipalList
+    } else {
+        AdminRequestKind::AgentList
+    };
+    let body = client.request(request).await?;
     let body = into_result(body)?;
 
     let mut agents = match body {

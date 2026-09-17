@@ -49,13 +49,50 @@ impl DurableInviteStore {
         &self,
         expected: &Invite,
     ) -> astrid_storage::StorageResult<bool> {
+        let Some((conditions, mutations)) = Self::consumption_batch(expected)? else {
+            return Ok(false);
+        };
+        self.apply(conditions, mutations).await
+    }
+
+    /// Commit token consumption and principal ownership in one backend batch.
+    /// The ownership store must use the same authoritative runtime KV backend.
+    ///
+    /// # Errors
+    /// Returns validation or potentially ambiguous storage errors; only a
+    /// definite false permits rollback of the new identity.
+    pub async fn consume_with_ownership(
+        &self,
+        expected: &Invite,
+        ownership: &astrid_storage::OwnershipStore,
+        principal: astrid_core::PrincipalUid,
+    ) -> Result<bool, astrid_storage::OwnershipError> {
+        let Some(delegation) = expected.ownership.as_ref() else {
+            return Ok(false);
+        };
+        let Some((conditions, mutations)) = Self::consumption_batch(expected)? else {
+            return Ok(false);
+        };
+        ownership
+            .commit_enrolled_principal(principal, delegation, conditions, mutations)
+            .await
+    }
+
+    fn consumption_batch(
+        expected: &Invite,
+    ) -> astrid_storage::StorageResult<
+        Option<(
+            Vec<astrid_storage::KvBatchCondition>,
+            Vec<astrid_storage::KvBatchMutation>,
+        )>,
+    > {
         let now = now_epoch();
         if expected.remaining_uses == 0
             || expected
                 .expires_at_epoch
                 .is_some_and(|expires| expires <= now)
         {
-            return Ok(false);
+            return Ok(None);
         }
         let key = Self::key(&expected.token_hash);
         let expected_value = Self::encode(expected)?;
@@ -71,13 +108,12 @@ impl DurableInviteStore {
                 value: Self::encode(&consumed)?,
             }
         };
-        self.apply(
+        Ok(Some((
             vec![astrid_storage::KvBatchCondition::ValueEquals {
                 key: astrid_storage::KvEntryKey::new(SYSTEM_KV_NAMESPACE, &key)?,
                 expected: Some(expected_value),
             }],
             vec![mutation],
-        )
-        .await
+        )))
     }
 }

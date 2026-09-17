@@ -576,13 +576,34 @@ async fn unbound_leftover_is_adopted_into_the_operator_fleet() {
         display_name: None,
         created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
     };
-    crate::bootstrap_cli_root_ownership(&ownership, &principals, root_user, root_identity, true)
+    crate::bootstrap_cli_root_ownership(&ownership, &principals, root_user, root_identity.clone())
         .await
-        .expect("adopt unowned principals");
+        .expect("bootstrap CLI root ownership");
     let graph = ownership.load().await.expect("ownership graph");
     let default_owner = graph.principal_owner(uid).expect("default owned");
-    let leftover_owner = graph.principal_owner(leftover_uid).expect("leftover owned");
+    let leftover_owner = graph
+        .principal_owner(leftover_uid)
+        .expect("leftover owned after bound local-operator upgrade")
+        .clone();
     assert_eq!(default_owner.fleet_uid, leftover_owner.fleet_uid);
+    let second = ownership
+        .reconcile_bound_local_operator_unowned_principals(
+            uid,
+            &root_identity.genesis.initial_public_key,
+        )
+        .await
+        .expect("idempotent leftover reconcile");
+    assert!(second.adopted().is_empty());
+    assert_eq!(
+        ownership
+            .load()
+            .await
+            .expect("ownership graph")
+            .principal_owner(leftover_uid)
+            .expect("leftover still owned")
+            .fleet_uid,
+        leftover_owner.fleet_uid
+    );
 }
 
 #[tokio::test]

@@ -22,13 +22,13 @@ use astrid_core::profile::{AuthConfig, AuthMethod, PrincipalProfile};
 use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody};
 use tempfile::TempDir;
 
-use super::handlers;
 use crate::Kernel;
 
 async fn fixture() -> (TempDir, Arc<Kernel>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = AstridHome::from_path(dir.path());
     let kernel = crate::test_kernel_with_home(home).await;
+    super::test_support::seed_operator(&kernel).await;
     (dir, kernel)
 }
 
@@ -96,14 +96,24 @@ async fn agent_create_existing_with_keypair_still_errors() {
     let (_dir, kernel) = fixture().await;
 
     assert_success(
-        &handlers::dispatch(&kernel, &PrincipalId::default(), bare_create("alice")).await,
+        &super::test_support::dispatch_as_operator(
+            &kernel,
+            &PrincipalId::default(),
+            bare_create("alice"),
+        )
+        .await,
     );
     let before = load(&kernel, "alice");
     assert_eq!(before.auth.methods, vec![AuthMethod::Keypair]);
     assert_eq!(before.auth.public_keys.len(), 1);
     let key_before = std::fs::read(key_path(&kernel, "alice")).expect("key file");
 
-    let res = handlers::dispatch(&kernel, &PrincipalId::default(), bare_create("alice")).await;
+    let res = super::test_support::dispatch_as_operator(
+        &kernel,
+        &PrincipalId::default(),
+        bare_create("alice"),
+    )
+    .await;
     assert_error_contains(&res, "already exists");
 
     // Keypair unchanged: same public key on the profile and same secret on disk.
@@ -122,7 +132,14 @@ async fn agent_create_keyless_backfills_keypair() {
     let (_dir, kernel) = fixture().await;
 
     // Create, then give it a distinctive group + grant, then strip the keypair.
-    assert_success(&handlers::dispatch(&kernel, &PrincipalId::default(), bare_create("bob")).await);
+    assert_success(
+        &super::test_support::dispatch_as_operator(
+            &kernel,
+            &PrincipalId::default(),
+            bare_create("bob"),
+        )
+        .await,
+    );
     {
         let mut p = load(&kernel, "bob");
         p.groups = vec![BUILTIN_RESTRICTED.to_string()];
@@ -140,7 +157,12 @@ async fn agent_create_keyless_backfills_keypair() {
     assert!(!key_path(&kernel, "bob").exists());
 
     // Bare re-create heals it.
-    let res = handlers::dispatch(&kernel, &PrincipalId::default(), bare_create("bob")).await;
+    let res = super::test_support::dispatch_as_operator(
+        &kernel,
+        &PrincipalId::default(),
+        bare_create("bob"),
+    )
+    .await;
     assert_success(&res);
     match &res {
         AdminResponseBody::Success(v) => {
@@ -184,16 +206,31 @@ async fn agent_create_keyless_backfills_keypair() {
 async fn agent_create_keyless_backfill_is_idempotent() {
     let (_dir, kernel) = fixture().await;
     assert_success(
-        &handlers::dispatch(&kernel, &PrincipalId::default(), bare_create("carol")).await,
+        &super::test_support::dispatch_as_operator(
+            &kernel,
+            &PrincipalId::default(),
+            bare_create("carol"),
+        )
+        .await,
     );
     make_keyless(&kernel, "carol");
 
     assert_success(
-        &handlers::dispatch(&kernel, &PrincipalId::default(), bare_create("carol")).await,
+        &super::test_support::dispatch_as_operator(
+            &kernel,
+            &PrincipalId::default(),
+            bare_create("carol"),
+        )
+        .await,
     );
     let key_after_first = std::fs::read(key_path(&kernel, "carol")).expect("key file");
 
-    let res = handlers::dispatch(&kernel, &PrincipalId::default(), bare_create("carol")).await;
+    let res = super::test_support::dispatch_as_operator(
+        &kernel,
+        &PrincipalId::default(),
+        bare_create("carol"),
+    )
+    .await;
     assert_error_contains(&res, "already exists");
     let key_after_second = std::fs::read(key_path(&kernel, "carol")).expect("key file");
     assert_eq!(
@@ -210,11 +247,16 @@ async fn agent_create_keyless_backfill_is_idempotent() {
 async fn agent_create_existing_with_shaping_input_still_errors() {
     let (_dir, kernel) = fixture().await;
     assert_success(
-        &handlers::dispatch(&kernel, &PrincipalId::default(), bare_create("dave")).await,
+        &super::test_support::dispatch_as_operator(
+            &kernel,
+            &PrincipalId::default(),
+            bare_create("dave"),
+        )
+        .await,
     );
     make_keyless(&kernel, "dave");
 
-    let res = handlers::dispatch(
+    let res = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentCreate {

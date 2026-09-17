@@ -58,6 +58,8 @@ pub mod kernel_router;
 mod kernel_shutdown_tests;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod legacy_migration_barrier;
+/// Deterministic CLI-root user/fleet bootstrap and unowned-principal upgrade.
+mod ownership_bootstrap;
 /// Persistent pair-device token store (issue #756).
 pub mod pair_token;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -77,6 +79,7 @@ pub mod socket;
 /// Authenticated native filesystem lease and callback service.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod storage_mount;
+pub(crate) use ownership_bootstrap::bootstrap_cli_root_ownership;
 
 use arc_swap::ArcSwap;
 use astrid_audit::AuditLog;
@@ -1181,11 +1184,11 @@ impl Kernel {
         // establishes identity through its own uplink instead.
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         {
-            let adopt_released_layout_principals = matches!(
+            if matches!(
                 layout_origin,
                 Some(legacy_migration_barrier::LayoutOrigin::Legacy)
-            );
-            if adopt_released_layout_principals && singleton_lock.is_none() {
+            ) && singleton_lock.is_none()
+            {
                 return Err(std::io::Error::other(
                     "layout-one migration requires the daemon singleton lock",
                 ));
@@ -1242,7 +1245,6 @@ impl Kernel {
                 &principal_directory,
                 root_user,
                 root_principal_identity,
-                adopt_released_layout_principals,
             )
             .await
             .map_err(|error| {
@@ -5221,58 +5223,6 @@ async fn bootstrap_cli_root_user(
     Ok((user, identity))
 }
 
-pub(crate) async fn bootstrap_cli_root_ownership(
-    store: &astrid_storage::OwnershipStore,
-    principal_directory: &astrid_storage::PrincipalDirectory,
-    root_user: astrid_core::AstridUserId,
-    root_principal_identity: astrid_core::PrincipalIdentity,
-    adopt_unowned_principals: bool,
-) -> Result<(), astrid_storage::OwnershipError> {
-    let user = astrid_core::UserIdentity::from_genesis(astrid_core::UserGenesis::from_parts(
-        root_user.id,
-        root_user.created_at,
-        root_principal_identity.genesis.initial_public_key,
-    ))?;
-    store.create_user(user.clone()).await?;
-
-    // Reuse the legacy root UUID and timestamp as deterministic fleet genesis
-    // inputs. User/fleet UID derivation is domain-separated, so their durable
-    // identifiers remain distinct while every boot derives the same records.
-    let fleet = astrid_core::FleetIdentity::from_genesis(astrid_core::FleetGenesis::from_parts(
-        root_user.id,
-        root_user.created_at,
-        user.uid,
-    ))?;
-    store.create_fleet(fleet.clone()).await?;
-
-    let principal_uid = principal_directory
-        .uid_for(&astrid_core::PrincipalId::default())
-        .map_err(astrid_storage::OwnershipError::Storage)?;
-    if store.load().await?.principal_owner(principal_uid).is_none() {
-        store
-            .assign_principal(astrid_core::PrincipalOwnership {
-                principal_uid,
-                fleet_uid: fleet.uid,
-                assigned_by: user.uid,
-            })
-            .await?;
-    }
-    if adopt_unowned_principals {
-        for (_, candidate) in principal_directory.bindings() {
-            if store.load().await?.principal_owner(candidate).is_none() {
-                store
-                    .assign_principal(astrid_core::PrincipalOwnership {
-                        principal_uid: candidate,
-                        fleet_uid: fleet.uid,
-                        assigned_by: user.uid,
-                    })
-                    .await?;
-            }
-        }
-    }
-    Ok(())
-}
-
 fn principal_initial_public_key(
     home: &astrid_core::dirs::AstridHome,
     principal: &astrid_core::PrincipalId,
@@ -5660,136 +5610,6 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             recovered_identity
-        );
-    }
-
-    #[tokio::test]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one ownership-bootstrap scenario must retain the same store across initial \
-                  adoption, idempotent replay, transfer, and non-legacy restart"
-    )]
-    async fn legacy_root_ownership_bootstrap_is_deterministic_and_idempotent() {
-        let backend: Arc<dyn astrid_storage::KvStore> =
-            Arc::new(astrid_storage::MemoryKvStore::new());
-        let directory = astrid_storage::PrincipalDirectory::default();
-        let ownership_store =
-            astrid_storage::OwnershipStore::new(backend, directory.clone()).unwrap();
-        let principal_identity = astrid_core::PrincipalIdentity::from_genesis(
-            astrid_core::PrincipalGenesis::from_parts(
-                uuid::Uuid::from_u128(2),
-                chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
-                [2; 32],
-            ),
-        )
-        .unwrap();
-        directory
-            .register(astrid_core::PrincipalId::default(), principal_identity.uid)
-            .unwrap();
-        let legacy_principal_identity = astrid_core::PrincipalIdentity::from_genesis(
-            astrid_core::PrincipalGenesis::from_parts(
-                uuid::Uuid::from_u128(4),
-                chrono::DateTime::from_timestamp(1_700_000_002, 0).unwrap(),
-                [4; 32],
-            ),
-        )
-        .unwrap();
-        directory
-            .register(
-                astrid_core::PrincipalId::new("legacy-agent").unwrap(),
-                legacy_principal_identity.uid,
-            )
-            .unwrap();
-        let root_user = astrid_core::AstridUserId {
-            id: uuid::Uuid::from_u128(1),
-            principal: astrid_core::PrincipalId::default(),
-            public_key: None,
-            display_name: None,
-            created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
-        };
-
-        bootstrap_cli_root_ownership(
-            &ownership_store,
-            &directory,
-            root_user.clone(),
-            principal_identity.clone(),
-            true,
-        )
-        .await
-        .unwrap();
-        let first = ownership_store.load().await.unwrap();
-        bootstrap_cli_root_ownership(
-            &ownership_store,
-            &directory,
-            root_user.clone(),
-            principal_identity.clone(),
-            true,
-        )
-        .await
-        .unwrap();
-        let second = ownership_store.load().await.unwrap();
-
-        assert_eq!(first, second);
-        let principal_owner = second.principal_owner(principal_identity.uid).unwrap();
-        let root_user_uid = principal_owner.assigned_by;
-        let initial_fleet_uid = principal_owner.fleet_uid;
-        let expected_user =
-            astrid_core::UserIdentity::from_genesis(astrid_core::UserGenesis::from_parts(
-                root_user.id,
-                root_user.created_at,
-                principal_identity.genesis.initial_public_key,
-            ))
-            .unwrap();
-        assert_eq!(root_user_uid, expected_user.uid);
-        assert_eq!(second.fleets().count(), 1);
-        assert!(second.fleet(principal_owner.fleet_uid).is_some());
-        assert_eq!(
-            second
-                .principal_owner(legacy_principal_identity.uid)
-                .unwrap()
-                .fleet_uid,
-            initial_fleet_uid
-        );
-
-        let destination =
-            astrid_core::FleetIdentity::from_genesis(astrid_core::FleetGenesis::from_parts(
-                uuid::Uuid::from_u128(3),
-                chrono::DateTime::from_timestamp(1_700_000_001, 0).unwrap(),
-                root_user_uid,
-            ))
-            .unwrap();
-        ownership_store
-            .create_fleet(destination.clone())
-            .await
-            .unwrap();
-        ownership_store
-            .transfer_principal(
-                principal_identity.uid,
-                initial_fleet_uid,
-                destination.uid,
-                root_user_uid,
-            )
-            .await
-            .unwrap();
-
-        bootstrap_cli_root_ownership(
-            &ownership_store,
-            &directory,
-            root_user,
-            principal_identity.clone(),
-            false,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            ownership_store
-                .load()
-                .await
-                .unwrap()
-                .principal_owner(principal_identity.uid)
-                .unwrap()
-                .fleet_uid,
-            destination.uid
         );
     }
 

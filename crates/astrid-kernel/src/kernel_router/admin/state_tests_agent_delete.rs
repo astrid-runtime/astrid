@@ -11,7 +11,6 @@ use astrid_core::{Permission, types::Timestamp};
 use astrid_crypto::KeyPair;
 use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody};
 
-use super::handlers;
 use crate::Kernel;
 
 async fn fixture() -> (tempfile::TempDir, Arc<Kernel>) {
@@ -28,6 +27,7 @@ async fn fixture() -> (tempfile::TempDir, Arc<Kernel>) {
         ))
         .expect("seed default admin profile");
     kernel.profile_cache.invalidate(&PrincipalId::default());
+    super::test_support::seed_operator(&kernel).await;
     (dir, kernel)
 }
 
@@ -50,7 +50,7 @@ fn seed_footprint(kernel: &Kernel, principal: &PrincipalId) -> (PathBuf, PathBuf
 }
 
 async fn create(kernel: &Arc<Kernel>, principal: &PrincipalId) {
-    let response = handlers::dispatch(
+    let response = super::test_support::dispatch_as_operator(
         kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -82,7 +82,7 @@ async fn agent_delete_reclaims_home_key_and_secrets_and_reports_them() {
         .await
         .unwrap();
 
-    let response = handlers::dispatch(
+    let response = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {
@@ -122,7 +122,7 @@ async fn agent_delete_closes_authz_before_reclaiming() {
         vec![BUILTIN_AGENT.to_string()]
     );
 
-    let response = handlers::dispatch(
+    let response = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {
@@ -162,7 +162,7 @@ async fn agent_delete_rejects_reappeared_legacy_secret_after_completed_ledger() 
     let secret = reappeared.join("api_key");
     std::fs::write(&secret, b"must-survive").expect("reappeared secret");
 
-    let retried = handlers::dispatch(
+    let retried = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {
@@ -244,7 +244,7 @@ async fn agent_delete_purges_every_token_and_allowance_scope() {
             .unwrap();
     }
 
-    let response = handlers::dispatch(
+    let response = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {
@@ -287,7 +287,7 @@ async fn failed_reclamation_keeps_alias_reserved_until_retry_succeeds() {
     let original_mode = std::fs::metadata(&homes).unwrap().permissions().mode();
     std::fs::set_permissions(&homes, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-    let failed = handlers::dispatch(
+    let failed = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {
@@ -296,7 +296,7 @@ async fn failed_reclamation_keeps_alias_reserved_until_retry_succeeds() {
     )
     .await;
     assert!(matches!(failed, AdminResponseBody::Error(_)));
-    let recreate = handlers::dispatch(
+    let recreate = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentCreate {
@@ -312,7 +312,7 @@ async fn failed_reclamation_keeps_alias_reserved_until_retry_succeeds() {
     assert!(matches!(recreate, AdminResponseBody::Error(_)));
 
     std::fs::set_permissions(&homes, std::fs::Permissions::from_mode(original_mode)).unwrap();
-    let retried = handlers::dispatch(
+    let retried = super::test_support::dispatch_as_operator(
         &kernel,
         &PrincipalId::default(),
         AdminRequestKind::AgentDelete {

@@ -75,6 +75,7 @@ async fn fixture() -> (tempfile::TempDir, Arc<Kernel>) {
         ))
         .unwrap();
     kernel.profile_cache.invalidate(&PrincipalId::default());
+    super::test_support::seed_operator(&kernel).await;
     (dir, kernel)
 }
 
@@ -159,6 +160,7 @@ async fn seed_source_state(kernel: &Kernel, source: &PrincipalId) {
 #[tokio::test(flavor = "multi_thread")]
 async fn derive_materializes_only_named_capsules_and_state() {
     let (_dir, kernel) = fixture().await;
+    let caller = separate_fleet_caller(&kernel).await;
     let source = PrincipalId::default();
     for capsule in ["harness", "provider", "unrelated"] {
         seed_capsule(&kernel, &source, capsule);
@@ -179,6 +181,7 @@ async fn derive_materializes_only_named_capsules_and_state() {
     }
     let response = super::agent_derive::agent_derive_from_req(
         &kernel,
+        &caller,
         AgentDeriveRequest {
             name: "triage".into(),
             source: source.clone(),
@@ -205,6 +208,7 @@ async fn derive_materializes_only_named_capsules_and_state() {
     assert_eq!(profile.network.egress, vec!["api.example.com:443"]);
 
     let derived_uid = kernel.principal_directory.uid_for(&derived).unwrap();
+    assert_spawn_ownership(&kernel, &caller, derived_uid).await;
     let owner = astrid_storage::StateOwner::Principal(derived_uid);
     let registry = kernel.principal_store.as_ref().unwrap().capsules();
     assert!(registry.get(&owner, "harness").unwrap().is_some());
@@ -242,11 +246,79 @@ async fn derive_materializes_only_named_capsules_and_state() {
     );
 }
 
+async fn separate_fleet_caller(kernel: &Arc<Kernel>) -> PrincipalId {
+    use astrid_events::kernel_api::AdminRequestKind;
+    let caller = PrincipalId::new("spawner").unwrap();
+    let result = super::test_support::dispatch_as_operator(
+        kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentCreate {
+            name: caller.to_string(),
+            groups: vec![BUILTIN_ADMIN.into()],
+            grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
+        },
+    )
+    .await;
+    assert!(
+        matches!(result, AdminResponseBody::Success(_)),
+        "{result:?}"
+    );
+    let uid = kernel.principal_directory.uid_for(&caller).unwrap();
+    let graph = kernel.ownership_store.load().await.unwrap();
+    let owner = graph.principal_owner(uid).unwrap();
+    let fleet = astrid_core::FleetIdentity::from_genesis(astrid_core::FleetGenesis::from_parts(
+        uuid::Uuid::from_u128(999),
+        chrono::DateTime::from_timestamp(1_700_000_002, 0).unwrap(),
+        owner.assigned_by,
+    ))
+    .unwrap();
+    kernel
+        .ownership_store
+        .create_fleet(fleet.clone())
+        .await
+        .unwrap();
+    kernel
+        .ownership_store
+        .transfer_principal(uid, owner.fleet_uid, fleet.uid, owner.assigned_by)
+        .await
+        .unwrap();
+    // Spawning is capability-authorized without any human-device delegation.
+    super::authorize_request(kernel, &caller, None, "agent:create:inherit").unwrap();
+    caller
+}
+
+async fn assert_spawn_ownership(
+    kernel: &Kernel,
+    caller: &PrincipalId,
+    child: astrid_core::PrincipalUid,
+) {
+    let graph = kernel.ownership_store.load().await.unwrap();
+    let caller_uid = kernel.principal_directory.uid_for(caller).unwrap();
+    let source_uid = kernel
+        .principal_directory
+        .uid_for(&PrincipalId::default())
+        .unwrap();
+    let child_owner = graph.principal_owner(child).unwrap();
+    assert_eq!(
+        child_owner.fleet_uid,
+        graph.principal_owner(caller_uid).unwrap().fleet_uid
+    );
+    assert_ne!(
+        child_owner.fleet_uid,
+        graph.principal_owner(source_uid).unwrap().fleet_uid
+    );
+    assert!(graph.user_for_device(child, &[0xab; 32]).is_none());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn derive_rejects_state_or_tool_capsules_outside_loaded_set() {
     let (_dir, kernel) = fixture().await;
     let response = super::agent_derive::agent_derive_from_req(
         &kernel,
+        &PrincipalId::default(),
         AgentDeriveRequest {
             name: "bad".into(),
             source: PrincipalId::default(),
@@ -332,7 +404,9 @@ async fn derive_rejects_invalid_shape_without_leaving_identity_artifacts() {
     ];
 
     for (name, request) in cases {
-        let response = super::agent_derive::agent_derive_from_req(&kernel, request).await;
+        let response =
+            super::agent_derive::agent_derive_from_req(&kernel, &PrincipalId::default(), request)
+                .await;
         assert!(matches!(response, AdminResponseBody::Error(_)));
         let principal = PrincipalId::new(name).unwrap();
         assert!(!PrincipalProfile::path_for(&kernel.astrid_home, &principal).exists());
@@ -347,8 +421,44 @@ async fn derive_rejects_invalid_shape_without_leaving_identity_artifacts() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn derive_rejects_unowned_caller_before_provisioning() {
+    let dir = tempfile::tempdir().unwrap();
+    let kernel = crate::test_kernel_with_home(AstridHome::from_path(dir.path())).await;
+    let before = kernel.ownership_store.load().await.unwrap();
+    let response = super::agent_derive::agent_derive_from_req(
+        &kernel,
+        &PrincipalId::default(),
+        AgentDeriveRequest {
+            name: "unowned-child".into(),
+            source: PrincipalId::default(),
+            load_capsules: Vec::new(),
+            allow_capsules: Vec::new(),
+            inherit_capsule_state: Vec::new(),
+            network_egress: Vec::new(),
+        },
+    )
+    .await;
+    let AdminResponseBody::Error(error) = response else {
+        panic!("an unowned caller must not provision a child")
+    };
+    assert!(error.contains("spawn ownership rejected"), "got: {error}");
+    let child = PrincipalId::new("unowned-child").unwrap();
+    assert!(kernel.principal_directory.uid_for(&child).is_err());
+    assert!(!PrincipalProfile::path_for(&kernel.astrid_home, &child).exists());
+    assert!(
+        !kernel
+            .astrid_home
+            .keys_dir()
+            .join("unowned-child.key")
+            .exists()
+    );
+    assert_eq!(before, kernel.ownership_store.load().await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn derive_rolls_back_when_required_capsule_cannot_load() {
     let (_dir, kernel) = fixture().await;
+    let ownership_before = kernel.ownership_store.load().await.unwrap();
     let source = PrincipalId::default();
     let install = kernel
         .astrid_home
@@ -373,6 +483,7 @@ file = "missing.wasm"
 
     let response = super::agent_derive::agent_derive_from_req(
         &kernel,
+        &PrincipalId::default(),
         AgentDeriveRequest {
             name: "broken-worker".into(),
             source,
@@ -387,6 +498,10 @@ file = "missing.wasm"
         panic!("broken required capsule must fail derivation")
     };
     assert!(error.contains("failed to load"), "got: {error}");
+    assert_eq!(
+        ownership_before,
+        kernel.ownership_store.load().await.unwrap()
+    );
 
     let principal = PrincipalId::new("broken-worker").unwrap();
     assert!(!PrincipalProfile::path_for(&kernel.astrid_home, &principal).exists());

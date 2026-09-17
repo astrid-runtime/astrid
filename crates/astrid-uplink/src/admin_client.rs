@@ -48,6 +48,8 @@ pub const fn topic_suffix(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::AgentDisable { .. } => "agent.disable",
         AdminRequestKind::AgentModify { .. } => "agent.modify",
         AdminRequestKind::AgentList => "agent.list",
+        AdminRequestKind::UserPrincipalList => "user.principals",
+        AdminRequestKind::UserPrincipalClaim { .. } => "user.principal.claim",
         AdminRequestKind::QuotaSet { .. } => "quota.set",
         AdminRequestKind::QuotaGet { .. } => "quota.get",
         AdminRequestKind::UsageGet { .. } => "usage.get",
@@ -309,6 +311,16 @@ mod tests {
             "agent.create"
         );
         assert_eq!(topic_suffix(&AdminRequestKind::AgentList), "agent.list");
+        assert_eq!(
+            topic_suffix(&AdminRequestKind::UserPrincipalList),
+            "user.principals"
+        );
+        assert_eq!(
+            topic_suffix(&AdminRequestKind::UserPrincipalClaim {
+                principal: PrincipalId::default(),
+            }),
+            "user.principal.claim"
+        );
         assert_eq!(topic_suffix(&AdminRequestKind::GroupList), "group.list");
         let p = PrincipalId::default();
         assert_eq!(
