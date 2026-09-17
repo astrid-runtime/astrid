@@ -257,13 +257,26 @@ fn event_principal(event: &AstridEvent) -> Option<&str> {
     }
 }
 
-fn response_principal_matches(expected: &str, event: &AstridEvent) -> bool {
-    event_principal(event) == Some(expected)
+fn event_request_owner(event: &AstridEvent) -> Option<astrid_events::ipc::RequestOwnerId> {
+    match event {
+        AstridEvent::Ipc { message, .. } => message.request_owner,
+        _ => None,
+    }
+}
+
+fn response_identity_matches(
+    expected_principal: &str,
+    expected_owner: astrid_events::ipc::RequestOwnerId,
+    event: &AstridEvent,
+) -> bool {
+    event_principal(event) == Some(expected_principal)
+        && event_request_owner(event) == Some(expected_owner)
 }
 
 async fn await_matching_consent_response(
     receiver: &mut astrid_events::EventReceiver,
     expected_principal: &str,
+    expected_owner: astrid_events::ipc::RequestOwnerId,
     capsule_id: &str,
     request_id: &str,
     timeout: std::time::Duration,
@@ -277,10 +290,11 @@ async fn await_matching_consent_response(
         let Ok(Some(event)) = tokio::time::timeout(remaining, receiver.recv()).await else {
             return None;
         };
-        if response_principal_matches(expected_principal, &event) {
+        if response_identity_matches(expected_principal, expected_owner, &event) {
             return Some(event);
         }
         let got = event_principal(&event);
+        let got_owner = event_request_owner(&event).map(|owner| owner.to_string());
         tracing::warn!(
             target: "astrid.audit.http",
             security_event = true,
@@ -288,7 +302,9 @@ async fn await_matching_consent_response(
             request_id = %request_id,
             expected_principal = %expected_principal,
             got_principal = got.unwrap_or("<none>"),
-            "local-egress consent: rejected cross-principal response; continuing to wait",
+            expected_request_owner = %expected_owner,
+            got_request_owner = got_owner.as_deref().unwrap_or("<none>"),
+            "local-egress consent: rejected response from the wrong principal or authenticated request owner",
         );
     }
 }
@@ -508,6 +524,20 @@ impl HostState {
         let blocking_semaphore = self.blocking_semaphore.clone();
         let capsule_id = self.capsule_id.to_string();
         let principal_name = principal.to_string();
+        let Some(request_owner) = self
+            .caller_context
+            .as_ref()
+            .and_then(|message| message.request_owner)
+        else {
+            tracing::warn!(
+                security_event = true,
+                capsule_id = %capsule_id,
+                %principal,
+                endpoint,
+                "local-egress consent has no authenticated request owner; denying"
+            );
+            return String::new();
+        };
 
         let request_id = Uuid::new_v4().to_string();
         // Shared approval response channel — see the "Response principal
@@ -519,6 +549,7 @@ impl HostState {
 
         let payload = IpcPayload::ApprovalRequired {
             request_id: request_id.clone(),
+            request_owner: request_owner.to_string(),
             action: "local-network-egress".to_string(),
             resource: endpoint.to_string(),
             reason: format!(
@@ -529,7 +560,8 @@ impl HostState {
         // Kernel-originated (nil source_id): the host is asking on the operator's
         // behalf, not a capsule forging an approval request.
         let message = IpcMessage::new(Topic::approval_request(), payload, Uuid::nil())
-            .with_principal(principal.to_string());
+            .with_principal(principal.to_string())
+            .with_request_owner(request_owner);
         event_bus.publish(AstridEvent::Ipc {
             message,
             metadata: astrid_events::EventMetadata::default(),
@@ -543,6 +575,7 @@ impl HostState {
                 await_matching_consent_response(
                     &mut receiver,
                     &principal_name,
+                    request_owner,
                     &capsule_id,
                     &request_id,
                     std::time::Duration::from_millis(CONSENT_TIMEOUT_MS),

@@ -36,6 +36,8 @@ pub(crate) mod kv;
 pub(crate) mod net;
 /// Process spawning and sandboxing.
 pub mod process;
+/// Authenticated request ownership for local connection routing.
+pub(crate) mod request_context;
 /// Sentinel `Pollable` / `InputStream` / `OutputStream` impls used as
 /// no-panic placeholders by resource methods whose full implementation
 /// is still pending (stream-half adapter + per-resource pollable

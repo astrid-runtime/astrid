@@ -25,18 +25,22 @@
 //!   principal, missing profile, load/validate/save error, timeout, deny,
 //!   unknown decision) is a `warn!(security_event = true)` no-op — never a
 //!   panic, unwrap, or default-allow.
-//! - **Bounded resource use.** Each correlation is a short-lived per-request
-//!   task that self-expires at [`GRANT_RESPONSE_TIMEOUT`]; concurrent in-flight
-//!   requests are capped by a [`tokio::sync::Semaphore`] ([`MAX_INFLIGHT_GRANTS`]),
-//!   fail-closed dropping at cap. There is no unbounded shared correlation table.
+//! - **Bounded resource use.** One permanent ordered observer records requests
+//!   in a shared correlation table and consumes their responses from the same
+//!   event stream, preventing a fast response from racing waiter registration.
+//!   Each entry expires at [`GRANT_RESPONSE_TIMEOUT`]. Concurrent in-flight
+//!   requests and their durable-completion work share a
+//!   [`tokio::sync::Semaphore`] ([`MAX_INFLIGHT_GRANTS`]); new requests are
+//!   dropped fail-closed at capacity.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::PrincipalProfile;
-use astrid_events::AstridEvent;
-use astrid_events::ipc::{IpcPayload, Topic};
+use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
+use astrid_events::{AstridEvent, EventMetadata};
 use tracing::{info, warn};
 
 use crate::Kernel;
@@ -55,14 +59,8 @@ const GRANT_RESPONSE_TIMEOUT: Duration = Duration::from_millis(GRANT_RESPONSE_TI
 /// `GrantRequired` is dropped fail-closed.
 const MAX_INFLIGHT_GRANTS: usize = 1024;
 
-/// Stable lag label for the permanent `astrid.v1.approval` observer.
+/// Stable lag label for the permanent ordered approval observer.
 const OBSERVER_SUBSCRIBER: &str = "grant_on_use_observer";
-
-/// Stable lag label for the short-lived per-request response awaiters. Kept
-/// distinct from [`OBSERVER_SUBSCRIBER`] so the many transient awaiter
-/// subscriptions are attributed to their own bucket and never skew the
-/// permanent observer's lag metric.
-const AWAITER_SUBSCRIBER: &str = "grant_on_use_awaiter";
 
 /// The approve set, replicated from `host/approval.rs::decision_from_str`.
 /// Anything else — explicit deny, unknown string, or empty — is NOT an approve.
@@ -72,174 +70,273 @@ fn is_approved(decision: &str) -> bool {
 
 /// Spawn the permanent grant-on-first-use consent handler.
 ///
-/// Subscribes ONCE (a permanent broadcast subscriber — counts toward
-/// `INTERNAL_SUBSCRIBER_COUNT`) to the literal topic `astrid.v1.approval`. For
-/// each observed [`IpcPayload::GrantRequired`], it captures the correlated
-/// `(principal, capsule_id)` by value and spawns a short-lived awaiter that
-/// subscribes to the per-request response topic, waits (bounded) for an
-/// [`IpcPayload::ApprovalResponse`], and grants on approve. The response's own
-/// fields are never read for the target.
+/// Subscribes once to the ordered event stream (counting toward
+/// `INTERNAL_SUBSCRIBER_COUNT`) and keeps a bounded correlation map. Recording
+/// both requests and responses from one receiver is important: a fast native
+/// responder can never publish before a per-request waiter exists, because the
+/// request event is necessarily consumed first from the same ordered stream.
 pub(crate) fn spawn_grant_on_use_handler(kernel: Arc<Kernel>) -> astrid_runtime::JoinHandle<()> {
-    // Subscribe to the exact topic synchronously, BEFORE returning, so this
-    // counts as the one permanent boot subscriber and never misses a signal
-    // published right after boot. The literal (non-wildcard) topic matches only
-    // `astrid.v1.approval`; per-request `astrid.v1.approval.response.<id>` is a
-    // different topic, caught only by the per-request subscription below.
-    let mut observer = kernel
-        .event_bus
-        .subscribe_topic_as(Topic::approval_request().as_str(), OBSERVER_SUBSCRIBER);
-
-    // Bound concurrent in-flight grants. Cheap to clone (Arc inside).
+    // Subscribe synchronously before returning so no request published after
+    // kernel construction can precede observer registration. EventReceiver's
+    // topic filters still consume the same broadcast stream, so a single
+    // unfiltered receiver is both cheaper and strictly ordered across the
+    // request and per-request response topics we correlate here.
+    let mut observer = kernel.event_bus.subscribe_as(OBSERVER_SUBSCRIBER);
     let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_GRANTS));
 
     astrid_runtime::spawn(async move {
-        while let Some(event) = observer.recv().await {
-            let AstridEvent::Ipc { message, .. } = &*event else {
-                continue;
-            };
-            let IpcPayload::GrantRequired {
-                request_id,
-                principal,
-                capsule_id,
-            } = &message.payload
-            else {
-                continue;
-            };
+        let mut pending = HashMap::<String, PendingGrant>::new();
+        loop {
+            let until_expiry = pending
+                .values()
+                .map(|entry| {
+                    entry
+                        .deadline
+                        .saturating_duration_since(astrid_runtime::time::Instant::now())
+                })
+                .min()
+                .unwrap_or(GRANT_RESPONSE_TIMEOUT);
 
-            // SECURITY: only honour a GrantRequired the KERNEL emitted. The
-            // dispatcher publishes it with a nil `source_id`; the host stamps
-            // every CAPSULE publish with the capsule's own (non-nil v5) UUID,
-            // which a capsule cannot override. Without this, a capsule holding
-            // `astrid.v1.approval` publish-ACL could craft a typed
-            // `GrantRequired` (`IpcPayload::from_json_value` parses a
-            // `{"type":"grant_required",...}` body into the typed variant) with
-            // an attacker-chosen `(principal, capsule_id)` grant target. Reject
-            // anything not kernel-originated.
-            if message.source_id != uuid::Uuid::nil() {
-                warn!(
-                    security_event = true,
-                    source = %message.source_id,
-                    request_id = %request_id,
-                    principal = %principal,
-                    capsule = %capsule_id,
-                    "grant-on-use: GrantRequired from non-kernel source; ignoring (fail-closed)"
-                );
-                continue;
+            tokio::select! {
+                event = observer.recv() => {
+                    let Some(event) = event else {
+                        break;
+                    };
+                    process_event(&kernel, &inflight, &mut pending, &event);
+                }
+                () = astrid_runtime::time::sleep(until_expiry), if !pending.is_empty() => {
+                    expire_pending(&mut pending);
+                }
             }
-
-            // SECURITY: capture the grant target from THIS observed signal
-            // (kernel-built from the authenticated caller). The awaiter reads
-            // only `decision` from the response — never a target.
-            let request_id = request_id.clone();
-            let principal = principal.clone();
-            let capsule_id = capsule_id.clone();
-
-            // Fail-closed flood control: acquire a permit BEFORE subscribing /
-            // spawning. At cap, drop the signal — never spawn unbounded tasks.
-            let Ok(permit) = Arc::clone(&inflight).try_acquire_owned() else {
-                warn!(
-                    security_event = true,
-                    %request_id,
-                    principal = %principal,
-                    capsule = %capsule_id,
-                    "grant-on-use inflight cap reached; dropping"
-                );
-                continue;
-            };
-
-            // Subscribe to the response topic BEFORE the await (and before the
-            // next observe-loop iteration) to avoid a publish/subscribe race.
-            let response_topic = Topic::approval_response(&request_id);
-            let receiver = kernel
-                .event_bus
-                .subscribe_topic_as(response_topic.as_str(), AWAITER_SUBSCRIBER);
-
-            let kernel = Arc::clone(&kernel);
-            astrid_runtime::spawn(async move {
-                // The permit lives for the awaiter's whole lifetime, releasing
-                // the in-flight slot on drop (response, timeout, or panic).
-                let _permit = permit;
-                await_and_grant(&kernel, receiver, &principal, &capsule_id).await;
-            });
         }
     })
 }
 
-/// Await a single consent response (bounded by [`GRANT_RESPONSE_TIMEOUT`]) and,
-/// on an approve, grant the *correlated* capsule. Every non-approve outcome
-/// (deny, unknown decision, timeout, channel closed) is a fail-closed no-op.
-async fn await_and_grant(
+struct PendingGrant {
+    principal: String,
+    request_owner: astrid_events::ipc::RequestOwnerId,
+    capsule_id: String,
+    deadline: astrid_runtime::time::Instant,
+    /// Keeps the flood-control slot through durable grant completion.
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+fn process_event(
     kernel: &Arc<Kernel>,
-    mut receiver: astrid_events::EventReceiver,
+    inflight: &Arc<tokio::sync::Semaphore>,
+    pending: &mut HashMap<String, PendingGrant>,
+    event: &AstridEvent,
+) {
+    let AstridEvent::Ipc { message, .. } = event else {
+        return;
+    };
+
+    match &message.payload {
+        IpcPayload::GrantRequired {
+            request_id,
+            request_owner,
+            principal,
+            capsule_id,
+        } if message.topic == Topic::approval_request() => record_grant_request(
+            inflight,
+            pending,
+            message,
+            request_id,
+            request_owner,
+            principal,
+            capsule_id,
+        ),
+        IpcPayload::ApprovalResponse {
+            request_id,
+            decision,
+            ..
+        } if message.topic == Topic::approval_response(request_id) => {
+            handle_grant_response(kernel, pending, message, request_id, decision);
+        },
+        _ => {},
+    }
+}
+
+fn record_grant_request(
+    inflight: &Arc<tokio::sync::Semaphore>,
+    pending: &mut HashMap<String, PendingGrant>,
+    message: &IpcMessage,
+    request_id: &str,
+    request_owner: &str,
     principal: &str,
     capsule_id: &str,
 ) {
+    if message.source_id != uuid::Uuid::nil() {
+        warn!(
+            security_event = true,
+            source = %message.source_id,
+            %request_id,
+            %principal,
+            capsule = %capsule_id,
+            "grant-on-use: GrantRequired from non-kernel source; ignoring (fail-closed)"
+        );
+        return;
+    }
+    let Some(stamped_owner) = message.request_owner else {
+        warn!(
+            security_event = true,
+            %request_id,
+            %principal,
+            capsule = %capsule_id,
+            "grant-on-use: unattributed request; ignoring (fail-closed)"
+        );
+        return;
+    };
+    if request_owner != stamped_owner.to_string() {
+        warn!(
+            security_event = true,
+            %request_id,
+            %principal,
+            capsule = %capsule_id,
+            "grant-on-use: payload owner differs from host metadata; ignoring"
+        );
+        return;
+    }
+    if pending.contains_key(request_id) {
+        warn!(
+            security_event = true,
+            %request_id,
+            %principal,
+            capsule = %capsule_id,
+            "grant-on-use duplicate request id; dropping"
+        );
+        return;
+    }
+    let Ok(permit) = Arc::clone(inflight).try_acquire_owned() else {
+        warn!(
+            security_event = true,
+            %request_id,
+            %principal,
+            capsule = %capsule_id,
+            "grant-on-use inflight cap reached; dropping"
+        );
+        return;
+    };
     let deadline = astrid_runtime::time::Instant::now()
         .checked_add(GRANT_RESPONSE_TIMEOUT)
         .unwrap_or_else(astrid_runtime::time::Instant::now);
-    let decision = loop {
-        let remaining = deadline.saturating_duration_since(astrid_runtime::time::Instant::now());
-        if remaining.is_zero() {
-            warn!(
-                security_event = true,
-                principal = %principal,
-                capsule = %capsule_id,
-                "grant-on-use: no consent response before timeout; no grant (fail-closed)"
-            );
-            return;
-        }
+    pending.insert(
+        request_id.to_owned(),
+        PendingGrant {
+            principal: principal.to_owned(),
+            request_owner: stamped_owner,
+            capsule_id: capsule_id.to_owned(),
+            deadline,
+            _permit: permit,
+        },
+    );
+}
 
-        let Ok(Some(event)) = astrid_runtime::time::timeout(remaining, receiver.recv()).await
-        else {
-            warn!(
-                security_event = true,
-                principal = %principal,
-                capsule = %capsule_id,
-                "grant-on-use: no consent response before timeout; no grant (fail-closed)"
-            );
-            return;
-        };
-
-        let AstridEvent::Ipc { message, .. } = &*event else {
-            continue;
-        };
-        if message.principal.as_deref() != Some(principal) {
-            warn!(
-                security_event = true,
-                expected_principal = %principal,
-                got_principal = message.principal.as_deref().unwrap_or("<none>"),
-                capsule = %capsule_id,
-                "grant-on-use: rejected cross-principal approval response; continuing to wait"
-            );
-            continue;
-        }
-        // SECURITY: read ONLY `decision`. The target is the already-captured
-        // (principal, capsule_id); the response carries no target to honour.
-        let IpcPayload::ApprovalResponse { decision, .. } = &message.payload else {
-            continue;
-        };
-        break decision.clone();
+fn handle_grant_response(
+    kernel: &Arc<Kernel>,
+    pending: &mut HashMap<String, PendingGrant>,
+    message: &IpcMessage,
+    request_id: &str,
+    decision: &str,
+) {
+    let Some(entry) = pending.get(request_id) else {
+        return;
     };
-
-    if !is_approved(&decision) {
+    if entry.deadline <= astrid_runtime::time::Instant::now() {
+        let expired = pending
+            .remove(request_id)
+            .expect("expired pending grant disappeared after immutable lookup");
         warn!(
             security_event = true,
-            principal = %principal,
-            capsule = %capsule_id,
-            decision = %decision,
+            principal = %expired.principal,
+            capsule = %expired.capsule_id,
+            "grant-on-use: late consent response rejected after timeout"
+        );
+        return;
+    }
+    if message.principal.as_deref() != Some(entry.principal.as_str()) {
+        warn!(
+            security_event = true,
+            expected_principal = %entry.principal,
+            got_principal = message.principal.as_deref().unwrap_or("<none>"),
+            capsule = %entry.capsule_id,
+            "grant-on-use: rejected cross-principal approval response"
+        );
+        return;
+    }
+    if message.request_owner != Some(entry.request_owner) {
+        let got_request_owner = message.request_owner.map(|owner| owner.to_string());
+        warn!(
+            security_event = true,
+            principal = %entry.principal,
+            expected_request_owner = %entry.request_owner,
+            got_request_owner = got_request_owner.as_deref().unwrap_or("<none>"),
+            capsule = %entry.capsule_id,
+            "grant-on-use: rejected response from the wrong authenticated request owner"
+        );
+        return;
+    }
+
+    let entry = pending
+        .remove(request_id)
+        .expect("pending grant disappeared after immutable lookup");
+    if !is_approved(decision) {
+        warn!(
+            security_event = true,
+            principal = %entry.principal,
+            capsule = %entry.capsule_id,
+            %decision,
             "grant-on-use: consent not approved; no grant (fail-closed)"
         );
         return;
     }
 
-    grant_capsule(kernel, principal, capsule_id).await;
+    let kernel = Arc::clone(kernel);
+    let request_id = request_id.to_owned();
+    astrid_runtime::spawn(async move {
+        complete_grant(&kernel, &request_id, entry).await;
+    });
+}
+
+fn expire_pending(pending: &mut HashMap<String, PendingGrant>) {
+    let now = astrid_runtime::time::Instant::now();
+    pending.retain(|_, entry| {
+        let keep = entry.deadline > now;
+        if !keep {
+            warn!(
+                security_event = true,
+                principal = %entry.principal,
+                capsule = %entry.capsule_id,
+                "grant-on-use: no consent response before timeout; no grant (fail-closed)"
+            );
+        }
+        keep
+    });
+}
+
+async fn complete_grant(kernel: &Arc<Kernel>, request_id: &str, entry: PendingGrant) {
+    let granted = grant_capsule(kernel, &entry.principal, &entry.capsule_id).await;
+    let payload = IpcPayload::GrantResult {
+        request_id: request_id.to_owned(),
+        request_owner: entry.request_owner.to_string(),
+        principal: entry.principal.clone(),
+        capsule_id: entry.capsule_id,
+        granted,
+    };
+    let message = IpcMessage::new(Topic::grant_result(request_id), payload, uuid::Uuid::nil())
+        .with_principal(entry.principal)
+        .with_request_owner(entry.request_owner);
+    let _ = kernel.event_bus.publish(AstridEvent::Ipc {
+        message,
+        metadata: EventMetadata::new("grant-on-use"),
+    });
 }
 
 /// Grant `capsule_id` to `principal`, reusing the #993 admin grant machinery
 /// (load → set-delta → validate → save → cache-invalidate) under the kernel's
 /// `admin_write_lock` so a concurrent `agent modify` cannot race the
 /// load-modify-save on the same profile. Fail-closed on every error.
-async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) {
+async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) -> bool {
     use crate::kernel_router::admin::handlers::{
         apply_set_delta, principal_profile_path, require_principal_exists,
     };
@@ -251,7 +348,7 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
             capsule = %capsule_id,
             "grant-on-use: invalid principal string; no grant (fail-closed)"
         );
-        return;
+        return false;
     };
 
     // Serialize with `agent modify` (#993) so the load-modify-save is atomic.
@@ -268,7 +365,7 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
             error = %msg,
             "grant-on-use: principal has no profile; no grant (fail-closed)"
         );
-        return;
+        return false;
     }
 
     let mut profile = match PrincipalProfile::load_from_path(&path) {
@@ -281,7 +378,7 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
                 error = %e,
                 "grant-on-use: profile load failed; no grant (fail-closed)"
             );
-            return;
+            return false;
         },
     };
 
@@ -299,13 +396,13 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
                 error = %e,
                 "grant-on-use: capsule grant rejected; no grant (fail-closed)"
             );
-            return;
+            return false;
         },
     };
     if !changed {
         // Already granted — idempotent. Invalidate to be safe; no save needed.
         kernel.profile_cache.invalidate(&pid);
-        return;
+        return true;
     }
 
     // Validate before saving: re-run the profile invariants (#993). On reject,
@@ -318,7 +415,7 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
             error = %e,
             "grant-on-use: profile rejected by validation; no grant (fail-closed)"
         );
-        return;
+        return false;
     }
     if let Err(e) = profile.save_to_path(&path) {
         warn!(
@@ -328,7 +425,7 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
             error = %e,
             "grant-on-use: profile save failed; no grant (fail-closed)"
         );
-        return;
+        return false;
     }
     kernel.profile_cache.invalidate(&pid);
 
@@ -338,6 +435,7 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
         capsule = %capsule_id,
         "grant-on-first-use: capsule granted via elicited consent"
     );
+    true
 }
 
 #[cfg(test)]

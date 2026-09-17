@@ -254,7 +254,7 @@ fn unknown_variant_serializes_as_type_unknown() {
 #[test]
 #[allow(clippy::too_many_lines, reason = "exhaustive variant table")]
 fn is_known_tag_covers_all_variants() {
-    const EXPECTED_VARIANT_COUNT: usize = 18;
+    const EXPECTED_VARIANT_COUNT: usize = 20;
 
     let representatives: Vec<IpcPayload> = vec![
         IpcPayload::RawJson(serde_json::json!({"key": "val"})),
@@ -270,6 +270,7 @@ fn is_known_tag_covers_all_variants() {
         },
         IpcPayload::ApprovalRequired {
             request_id: "req-1".into(),
+            request_owner: "owner-1".into(),
             action: String::new(),
             resource: String::new(),
             reason: String::new(),
@@ -281,8 +282,16 @@ fn is_known_tag_covers_all_variants() {
         },
         IpcPayload::GrantRequired {
             request_id: "req-1".into(),
+            request_owner: "owner-1".into(),
             principal: "alice".into(),
             capsule_id: "cap".into(),
+        },
+        IpcPayload::GrantResult {
+            request_id: "req-1".into(),
+            request_owner: "owner-1".into(),
+            principal: "alice".into(),
+            capsule_id: "cap".into(),
+            granted: true,
         },
         IpcPayload::OnboardingRequired {
             capsule_id: String::new(),
@@ -327,6 +336,7 @@ fn is_known_tag_covers_all_variants() {
                 is_error: false,
             },
         },
+        IpcPayload::ToolCancelRequest { call_ids: vec![] },
         IpcPayload::SelectionRequired {
             request_id: String::new(),
             title: String::new(),
@@ -388,6 +398,7 @@ fn is_known_tag_rejects_unknown_tags() {
 fn grant_required_roundtrips_with_tag() {
     let payload = IpcPayload::GrantRequired {
         request_id: "req-1".into(),
+        request_owner: "owner-1".into(),
         principal: "alice".into(),
         capsule_id: "secret-tool".into(),
     };
@@ -397,6 +408,30 @@ fn grant_required_roundtrips_with_tag() {
 
     let parsed: IpcPayload = serde_json::from_value(json).unwrap();
     assert_eq!(parsed, payload);
+}
+
+#[test]
+fn grant_result_roundtrips_with_tag() {
+    let payload = IpcPayload::GrantResult {
+        request_id: "req-1".into(),
+        request_owner: "owner-1".into(),
+        principal: "alice".into(),
+        capsule_id: "secret-tool".into(),
+        granted: true,
+    };
+    let json = serde_json::to_value(&payload).unwrap();
+    assert_eq!(json["type"].as_str(), Some("grant_result"));
+    assert!(IpcPayload::is_known_tag("grant_result"));
+
+    let parsed: IpcPayload = serde_json::from_value(json).unwrap();
+    assert_eq!(parsed, payload);
+}
+
+#[test]
+fn request_owner_display_parses_back_to_the_same_opaque_id() {
+    let owner = RequestOwnerId::generate();
+    assert_eq!(owner.to_string().parse::<RequestOwnerId>().unwrap(), owner);
+    assert!("not-a-uuid".parse::<RequestOwnerId>().is_err());
 }
 
 #[test]

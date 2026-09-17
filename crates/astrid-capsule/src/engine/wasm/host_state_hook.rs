@@ -157,6 +157,7 @@ impl HostState {
             // neither the ingress principal nor its device id / origin is set.
             ingress_principal: None,
             ingress_device_key_id: None,
+            ingress_request_owner: None,
             ingress_origin: None,
         }
     }

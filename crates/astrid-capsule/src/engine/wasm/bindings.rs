@@ -57,6 +57,7 @@ wasmtime::component::bindgen!({
             import astrid:ipc/host@1.0.0;
             import astrid:kv/host@1.0.0;
             import astrid:net/host@1.0.0;
+            import astrid:request-context/host@1.0.0;
             import astrid:http/host@1.0.0;
             import astrid:http/host@1.1.0;
             import astrid:sys/host@1.0.0;

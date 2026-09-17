@@ -92,6 +92,11 @@ async fn framed_read_records_then_clears_verified_ingress_principal() {
     // cap-gate can scope it.
     let claude = astrid_core::PrincipalId::new("claude").unwrap();
     state.bind_connection_principal(rep, claude.clone(), Some("dev-abc123".to_string()));
+    let request_owner = state
+        .connection_principals
+        .get(&rep)
+        .map(|identity| identity.request_owner)
+        .expect("request owner");
 
     // Peer sends one length-prefixed frame (4-byte BE length + payload).
     let payload = br#"{"topic":"client.v1.connect","payload":{}}"#;
@@ -120,6 +125,11 @@ async fn framed_read_records_then_clears_verified_ingress_principal() {
         "a data read must record the connection's authenticating device key_id"
     );
     assert_eq!(
+        state.ingress_request_owner,
+        Some(request_owner),
+        "a data read must record the authenticated connection owner"
+    );
+    assert_eq!(
         state.ingress_origin,
         Some(astrid_events::ipc::MessageOrigin::LocalSocket),
         "a data read on a kernel-BOUND connection must stamp LocalSocket origin"
@@ -140,6 +150,10 @@ async fn framed_read_records_then_clears_verified_ingress_principal() {
     assert_eq!(
         state.ingress_device_key_id, None,
         "a non-data read must clear the in-flight ingress device key_id"
+    );
+    assert_eq!(
+        state.ingress_request_owner, None,
+        "a non-data read must clear the in-flight request owner"
     );
     assert_eq!(
         state.ingress_origin, None,

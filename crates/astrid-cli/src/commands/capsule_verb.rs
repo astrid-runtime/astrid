@@ -1,6 +1,7 @@
 //! `astrid capsule <verb> [args...]` — dispatch a capsule-contributed CLI
 //! verb (`[[command]]` with `kind = "cli"`) to its providing capsule over
-//! IPC as a non-interactive one-shot.
+//! IPC as a bounded one-shot. Interactive callers may answer an approval on
+//! the owning connection; redirected callers deny approval requests.
 //!
 //! Flow:
 //! 1. **Daemon** — these verbs require the daemon; auto-start it if the
@@ -17,6 +18,7 @@
 //! The kernel does not interpret the run/result payloads — that contract
 //! is capsule-space (see [`astrid_core::kernel_api::CommandKind`]).
 
+use std::io::{IsTerminal, Write as _};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -33,6 +35,8 @@ use crate::theme::Theme;
 const RESULT_TIMEOUT_SECS: u64 = 70;
 const RESULT_TIMEOUT: Duration = Duration::from_secs(RESULT_TIMEOUT_SECS);
 const CAPSULES_LOADED_TOPIC: &str = "astrid.v1.capsules_loaded";
+const KERNEL_SOURCE_ID: &str = "00000000-0000-0000-0000-000000000000";
+const MAX_GRANT_RETRIES: usize = 1;
 
 /// Outcome of resolving a verb against the daemon's command registry.
 ///
@@ -230,53 +234,82 @@ async fn execute(provider: &str, verb: &str, args: &[String]) -> Result<ExitCode
     let run_topic = astrid_types::Topic::cli_command_run(provider);
     let result_topic = astrid_types::Topic::cli_command_result(&req_id);
 
-    let msg = astrid_types::ipc::IpcMessage::new(
-        run_topic,
-        astrid_types::ipc::IpcPayload::RawJson(body),
-        source_id,
-    )
-    .with_principal(caller.to_string());
-    if let Err(e) = client.send_message(msg).await {
-        eprintln!(
-            "{}",
-            Theme::error(&format!("Failed to send command to '{provider}': {e}"))
-        );
-        return Ok(ExitCode::from(1));
+    for grant_attempt in 0..=MAX_GRANT_RETRIES {
+        let msg = astrid_types::ipc::IpcMessage::new(
+            run_topic.clone(),
+            astrid_types::ipc::IpcPayload::RawJson(body.clone()),
+            source_id,
+        )
+        .with_principal(caller.to_string());
+        if let Err(e) = client.send_message(msg).await {
+            eprintln!(
+                "{}",
+                Theme::error(&format!("Failed to send command to '{provider}': {e}"))
+            );
+            return Ok(ExitCode::from(1));
+        }
+
+        match wait_for_command_result(
+            &mut client,
+            result_topic.as_str(),
+            provider,
+            caller.as_str(),
+            source_id,
+            RESULT_TIMEOUT,
+        )
+        .await
+        {
+            Ok(CommandWait::Result(raw)) => return Ok(render_result(provider, &raw)),
+            Ok(CommandWait::GrantApproved) if grant_attempt < MAX_GRANT_RETRIES => {},
+            Ok(CommandWait::GrantApproved) => {
+                eprintln!(
+                    "{}",
+                    Theme::error(
+                        "Capsule access remained ungranted after approval; refusing to retry again."
+                    )
+                );
+                return Ok(ExitCode::from(1));
+            },
+            Ok(CommandWait::GrantDenied) => {
+                eprintln!("{}", Theme::error("Capsule access was not approved."));
+                return Ok(ExitCode::from(1));
+            },
+            Ok(CommandWait::GrantFailed) => {
+                eprintln!(
+                    "{}",
+                    Theme::error("Capsule access could not be granted; command was not retried.")
+                );
+                return Ok(ExitCode::from(1));
+            },
+            Ok(CommandWait::ProviderUnloaded) => {
+                eprintln!(
+                    "{}",
+                    Theme::error(&format!(
+                        "Capsule '{provider}' unloaded before command completed; command cancelled."
+                    ))
+                );
+                return Ok(ExitCode::from(1));
+            },
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    Theme::error(&format!(
+                        "Capsule '{provider}' command failed while awaiting its response: {error:#}"
+                    ))
+                );
+                return Ok(ExitCode::from(1));
+            },
+        }
     }
 
-    match wait_for_command_result(
-        &mut client,
-        result_topic.as_str(),
-        provider,
-        caller.as_str(),
-        RESULT_TIMEOUT,
-    )
-    .await
-    {
-        Ok(CommandWait::Result(raw)) => Ok(render_result(provider, &raw)),
-        Ok(CommandWait::ProviderUnloaded) => {
-            eprintln!(
-                "{}",
-                Theme::error(&format!(
-                    "Capsule '{provider}' unloaded before command completed; command cancelled."
-                ))
-            );
-            Ok(ExitCode::from(1))
-        },
-        Err(_) => {
-            eprintln!(
-                "{}",
-                Theme::error(&format!(
-                    "Capsule '{provider}' did not respond within {RESULT_TIMEOUT_SECS}s."
-                ))
-            );
-            Ok(ExitCode::from(1))
-        },
-    }
+    unreachable!("bounded grant retry loop always returns")
 }
 
 enum CommandWait {
     Result(serde_json::Value),
+    GrantApproved,
+    GrantDenied,
+    GrantFailed,
     ProviderUnloaded,
 }
 
@@ -285,6 +318,7 @@ async fn wait_for_command_result(
     result_topic: &str,
     provider: &str,
     principal: &str,
+    source_id: Uuid,
     timeout: Duration,
 ) -> Result<CommandWait> {
     let deadline = tokio::time::Instant::now()
@@ -310,12 +344,234 @@ async fn wait_for_command_result(
         if topic == Some(result_topic) {
             return Ok(CommandWait::Result(raw));
         }
+        if let Some(prompt) = approval_request_prompt(&raw, principal) {
+            if let Some(outcome) = answer_capsule_approval(
+                client,
+                source_id,
+                prompt,
+                CommandWaitContext {
+                    result_topic,
+                    provider,
+                    principal,
+                    deadline,
+                },
+            )
+            .await?
+            {
+                return Ok(outcome);
+            }
+            continue;
+        }
         if topic == Some(CAPSULES_LOADED_TOPIC)
             && capsules_loaded_missing_provider(&raw, provider, principal)
         {
             return Ok(CommandWait::ProviderUnloaded);
         }
     }
+}
+
+fn approval_request_prompt<'a>(
+    raw: &'a serde_json::Value,
+    expected_principal: &str,
+) -> Option<ApprovalPrompt<'a>> {
+    let payload = raw.get("payload")?;
+    match payload.get("type")?.as_str()? {
+        "approval_required" => Some(ApprovalPrompt {
+            request_id: payload.get("request_id")?.as_str()?,
+            request_owner: payload
+                .get("request_owner")
+                .and_then(serde_json::Value::as_str),
+            action: payload.get("action")?.as_str()?,
+            resource: payload.get("resource")?.as_str()?,
+            reason: payload.get("reason")?.as_str()?,
+            grant: false,
+        }),
+        "grant_required" if payload.get("principal")?.as_str()? == expected_principal => {
+            Some(ApprovalPrompt {
+                request_id: payload.get("request_id")?.as_str()?,
+                request_owner: Some(payload.get("request_owner")?.as_str()?),
+                action: "grant capsule access",
+                resource: payload.get("capsule_id")?.as_str()?,
+                reason: "the current principal has not been granted this capsule",
+                grant: true,
+            })
+        },
+        _ => None,
+    }
+}
+
+struct ApprovalPrompt<'a> {
+    request_id: &'a str,
+    request_owner: Option<&'a str>,
+    action: &'a str,
+    resource: &'a str,
+    reason: &'a str,
+    grant: bool,
+}
+
+struct CommandWaitContext<'a> {
+    result_topic: &'a str,
+    provider: &'a str,
+    principal: &'a str,
+    deadline: tokio::time::Instant,
+}
+
+async fn answer_capsule_approval(
+    client: &mut SocketClient,
+    source_id: Uuid,
+    prompt: ApprovalPrompt<'_>,
+    wait: CommandWaitContext<'_>,
+) -> Result<Option<CommandWait>> {
+    let (decision, response_reason) = if std::io::stdin().is_terminal() {
+        eprintln!(
+            "Approval required: {} on {} ({})",
+            prompt.action, prompt.resource, prompt.reason
+        );
+        eprint!("Approve this operation once? [y/N] ");
+        std::io::stderr().flush()?;
+
+        let (answer_tx, mut answer_rx) = tokio::sync::oneshot::channel();
+        let _input_thread = std::thread::spawn(move || {
+            let mut answer = String::new();
+            let answer = std::io::stdin().read_line(&mut answer).map(|_| answer);
+            let _ = answer_tx.send(answer);
+        });
+        let answer = loop {
+            let remaining = wait
+                .deadline
+                .saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("timed out waiting for capsule approval input");
+            }
+            tokio::select! {
+                answer = &mut answer_rx => {
+                    break answer
+                        .map_err(|_| anyhow::anyhow!("approval input channel closed"))??;
+                }
+                read = client.read_raw_frame() => {
+                    let Some(frame) = read? else {
+                        anyhow::bail!("daemon connection closed while awaiting approval input");
+                    };
+                    let Ok(raw) = serde_json::from_slice::<serde_json::Value>(&frame) else {
+                        continue;
+                    };
+                    let topic = raw.get("topic").and_then(serde_json::Value::as_str);
+                    if topic == Some(wait.result_topic) {
+                        return Ok(Some(CommandWait::Result(raw)));
+                    }
+                    if topic == Some(CAPSULES_LOADED_TOPIC)
+                        && capsules_loaded_missing_provider(&raw, wait.provider, wait.principal)
+                    {
+                        return Ok(Some(CommandWait::ProviderUnloaded));
+                    }
+                }
+                () = tokio::time::sleep(remaining) => {
+                    anyhow::bail!("timed out waiting for capsule approval input");
+                }
+            }
+        };
+        if is_affirmative(&answer) {
+            (
+                "approve",
+                Some("approved by capsule command operator".to_owned()),
+            )
+        } else {
+            (
+                "deny",
+                Some("denied by capsule command operator".to_owned()),
+            )
+        }
+    } else {
+        (
+            "deny",
+            Some("capsule command has no interactive approval terminal".to_owned()),
+        )
+    };
+    client
+        .send_message(astrid_types::ipc::IpcMessage::new(
+            astrid_types::Topic::approval_response(prompt.request_id),
+            astrid_types::ipc::IpcPayload::ApprovalResponse {
+                request_id: prompt.request_id.to_owned(),
+                decision: decision.to_owned(),
+                reason: response_reason,
+            },
+            source_id,
+        ))
+        .await?;
+    if prompt.grant {
+        if decision != "approve" {
+            return Ok(Some(CommandWait::GrantDenied));
+        }
+        await_grant_result(client, &prompt, &wait).await.map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+async fn await_grant_result(
+    client: &mut SocketClient,
+    prompt: &ApprovalPrompt<'_>,
+    wait: &CommandWaitContext<'_>,
+) -> Result<CommandWait> {
+    loop {
+        let remaining = wait
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("timed out waiting for capsule grant result");
+        }
+        let frame = match tokio::time::timeout(remaining, client.read_raw_frame()).await {
+            Ok(Ok(Some(frame))) => frame,
+            Ok(Ok(None)) => anyhow::bail!("daemon connection closed before grant completed"),
+            Ok(Err(error)) => return Err(error),
+            Err(_) => anyhow::bail!("timed out waiting for capsule grant result"),
+        };
+        let Ok(raw) = serde_json::from_slice::<serde_json::Value>(&frame) else {
+            continue;
+        };
+        if raw.get("topic").and_then(serde_json::Value::as_str) == Some(wait.result_topic) {
+            return Ok(CommandWait::Result(raw));
+        }
+        if let Some(granted) = grant_result_matches(&raw, prompt, wait.principal) {
+            return Ok(if granted {
+                CommandWait::GrantApproved
+            } else {
+                CommandWait::GrantFailed
+            });
+        }
+        if raw.get("topic").and_then(serde_json::Value::as_str) == Some(CAPSULES_LOADED_TOPIC)
+            && capsules_loaded_missing_provider(&raw, wait.provider, wait.principal)
+        {
+            return Ok(CommandWait::ProviderUnloaded);
+        }
+    }
+}
+
+fn grant_result_matches(
+    raw: &serde_json::Value,
+    prompt: &ApprovalPrompt<'_>,
+    principal: &str,
+) -> Option<bool> {
+    let owner = prompt.request_owner?;
+    if raw.get("topic")?.as_str()? != astrid_types::Topic::grant_result(prompt.request_id).as_str()
+        || raw.get("source_id")?.as_str()? != KERNEL_SOURCE_ID
+        || raw.get("principal")?.as_str()? != principal
+        || raw.get("request_owner")?.as_str()? != owner
+    {
+        return None;
+    }
+    let payload = raw.get("payload")?;
+    (payload.get("type")?.as_str()? == "grant_result"
+        && payload.get("request_id")?.as_str()? == prompt.request_id
+        && payload.get("request_owner")?.as_str()? == owner
+        && payload.get("principal")?.as_str()? == principal
+        && payload.get("capsule_id")?.as_str()? == prompt.resource)
+        .then(|| payload.get("granted")?.as_bool())
+        .flatten()
+}
+
+fn is_affirmative(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 fn capsules_loaded_missing_provider(
@@ -636,5 +892,90 @@ mod tests {
             "astrid-capsule-adversarial",
             "alice"
         ));
+    }
+
+    #[test]
+    fn approval_request_prompt_accepts_complete_approval_and_grant_prompts() {
+        let raw = serde_json::json!({
+            "payload": {
+                "type": "approval_required",
+                "request_id": "request-1",
+                "action": "run",
+                "resource": "command",
+                "reason": "operator consent"
+            }
+        });
+        let prompt = approval_request_prompt(&raw, "alice").expect("approval prompt");
+        assert_eq!(prompt.request_id, "request-1");
+        assert_eq!(prompt.action, "run");
+        assert_eq!(prompt.resource, "command");
+        assert_eq!(prompt.reason, "operator consent");
+        assert!(!prompt.grant);
+
+        let grant = serde_json::json!({
+            "payload": {
+                "type": "grant_required",
+                "request_id": "grant-1",
+                "request_owner": "owner-1",
+                "principal": "alice",
+                "capsule_id": "capsule-tools"
+            }
+        });
+        let prompt = approval_request_prompt(&grant, "alice").expect("grant prompt");
+        assert_eq!(prompt.request_id, "grant-1");
+        assert_eq!(prompt.request_owner, Some("owner-1"));
+        assert_eq!(prompt.action, "grant capsule access");
+        assert_eq!(prompt.resource, "capsule-tools");
+        assert!(prompt.grant);
+        assert!(approval_request_prompt(&grant, "bob").is_none());
+
+        let incomplete = serde_json::json!({
+            "payload": { "type": "approval_required", "request_id": "request-1" }
+        });
+        assert!(approval_request_prompt(&incomplete, "alice").is_none());
+    }
+
+    #[test]
+    fn grant_result_requires_exact_kernel_correlation() {
+        let prompt = ApprovalPrompt {
+            request_id: "grant-1",
+            request_owner: Some("owner-1"),
+            action: "grant capsule access",
+            resource: "capsule-tools",
+            reason: "test",
+            grant: true,
+        };
+        let result = serde_json::json!({
+            "topic": "astrid.v1.grant.result.grant-1",
+            "source_id": KERNEL_SOURCE_ID,
+            "principal": "alice",
+            "request_owner": "owner-1",
+            "payload": {
+                "type": "grant_result",
+                "request_id": "grant-1",
+                "request_owner": "owner-1",
+                "principal": "alice",
+                "capsule_id": "capsule-tools",
+                "granted": true
+            }
+        });
+        assert_eq!(grant_result_matches(&result, &prompt, "alice"), Some(true));
+
+        let mut forged = result.clone();
+        forged["source_id"] = serde_json::Value::String(Uuid::new_v4().to_string());
+        assert_eq!(grant_result_matches(&forged, &prompt, "alice"), None);
+
+        let mut wrong_owner = result;
+        wrong_owner["request_owner"] = serde_json::Value::String("owner-2".to_owned());
+        assert_eq!(grant_result_matches(&wrong_owner, &prompt, "alice"), None);
+    }
+
+    #[test]
+    fn capsule_approval_accepts_only_explicit_yes() {
+        assert!(is_affirmative("y"));
+        assert!(is_affirmative(" YES \n"));
+        assert!(!is_affirmative(""));
+        assert!(!is_affirmative("approve"));
+        assert!(!is_affirmative("no"));
     }
 }

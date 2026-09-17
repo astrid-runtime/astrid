@@ -104,6 +104,7 @@ impl ConnectionRuntime {
         let egress = self.egress_registry.subscribe(
             identity.principal.to_string(),
             identity.device_key_id.clone(),
+            identity.request_owner,
         );
         serve_connection(
             stream,
@@ -259,7 +260,8 @@ fn publish_trusted_ingress(
     // Rebuild the envelope so every provenance field is host-derived. The
     // client controls only the allowlisted topic and payload.
     let mut trusted = IpcMessage::new(message.topic, message.payload, uuid::Uuid::nil())
-        .with_principal(principal);
+        .with_principal(principal)
+        .with_request_owner(identity.request_owner);
     trusted.device_key_id.clone_from(&identity.device_key_id);
     trusted.origin = if identity.is_principal_verified() {
         MessageOrigin::LocalSocket
@@ -513,6 +515,21 @@ fn validate_ingress(message: &IpcMessage) -> Result<(), &'static str> {
 }
 
 async fn write_message(writer: &mut LocalWriteHalf, message: &IpcMessage) -> std::io::Result<()> {
+    let frame = message_frame(message)?;
+    let bytes = serde_json::to_vec(&frame)
+        .map_err(|error| std::io::Error::other(format!("serialize IPC message: {error}")))?;
+    let len = u32::try_from(bytes.len())
+        .map_err(|_| std::io::Error::other("IPC message exceeds 4 GiB"))?;
+    tokio::time::timeout(WRITE_TIMEOUT, async {
+        writer.write_all(&len.to_be_bytes()).await?;
+        writer.write_all(&bytes).await?;
+        writer.flush().await
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "IPC write timed out"))?
+}
+
+fn message_frame(message: &IpcMessage) -> std::io::Result<serde_json::Value> {
     let payload_bytes = message
         .payload
         .to_guest_bytes()
@@ -533,17 +550,16 @@ async fn write_message(writer: &mut LocalWriteHalf, message: &IpcMessage) -> std
                 serde_json::Value::String(principal.clone()),
             );
     }
-    let bytes = serde_json::to_vec(&frame)
-        .map_err(|error| std::io::Error::other(format!("serialize IPC message: {error}")))?;
-    let len = u32::try_from(bytes.len())
-        .map_err(|_| std::io::Error::other("IPC message exceeds 4 GiB"))?;
-    tokio::time::timeout(WRITE_TIMEOUT, async {
-        writer.write_all(&len.to_be_bytes()).await?;
-        writer.write_all(&bytes).await?;
-        writer.flush().await
-    })
-    .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "IPC write timed out"))?
+    if let Some(request_owner) = message.request_owner {
+        frame
+            .as_object_mut()
+            .expect("wire frame is an object")
+            .insert(
+                "request_owner".to_owned(),
+                serde_json::Value::String(request_owner.to_string()),
+            );
+    }
+    Ok(frame)
 }
 
 fn publish_lifecycle(event_bus: &EventBus, topic: Topic, principal: &str, reason: Option<&str>) {

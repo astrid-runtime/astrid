@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use astrid_core::dirs::AstridHome;
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::PrincipalProfile;
-use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
+use astrid_events::ipc::{IpcMessage, IpcPayload, RequestOwnerId, Topic};
 use astrid_events::{AstridEvent, EventMetadata};
 
 use super::is_approved;
@@ -55,14 +55,22 @@ fn on_disk_capsules(home: &AstridHome, principal: &str) -> Vec<String> {
         .capsules
 }
 
+fn test_request_owner() -> RequestOwnerId {
+    static OWNER: std::sync::OnceLock<RequestOwnerId> = std::sync::OnceLock::new();
+    *OWNER.get_or_init(RequestOwnerId::generate)
+}
+
 /// Publish a `GrantRequired` exactly as the dispatcher would.
 fn publish_grant_required(kernel: &Kernel, request_id: &str, principal: &str, capsule_id: &str) {
+    let request_owner = test_request_owner();
     let payload = IpcPayload::GrantRequired {
         request_id: request_id.to_string(),
+        request_owner: request_owner.to_string(),
         principal: principal.to_string(),
         capsule_id: capsule_id.to_string(),
     };
-    let message = IpcMessage::new(Topic::approval_request(), payload, uuid::Uuid::nil());
+    let message = IpcMessage::new(Topic::approval_request(), payload, uuid::Uuid::nil())
+        .with_request_owner(request_owner);
     kernel.event_bus.publish(AstridEvent::Ipc {
         message,
         metadata: EventMetadata::new("test-dispatcher"),
@@ -71,19 +79,36 @@ fn publish_grant_required(kernel: &Kernel, request_id: &str, principal: &str, ca
 
 /// Publish a consent response on the per-request response topic as a specific
 /// principal (the ACL-authorized path the broker/uplink uses).
-fn publish_response_as(kernel: &Kernel, request_id: &str, principal: &str, decision: &str) {
+fn publish_response_as_owner(
+    kernel: &Kernel,
+    request_id: &str,
+    principal: &str,
+    request_owner: RequestOwnerId,
+    decision: &str,
+) {
     let topic = Topic::approval_response(request_id);
     let payload = IpcPayload::ApprovalResponse {
         request_id: request_id.to_string(),
         decision: decision.to_string(),
         reason: None,
     };
-    let message =
-        IpcMessage::new(topic, payload, uuid::Uuid::nil()).with_principal(principal.to_string());
+    let message = IpcMessage::new(topic, payload, uuid::Uuid::nil())
+        .with_principal(principal.to_string())
+        .with_request_owner(request_owner);
     kernel.event_bus.publish(AstridEvent::Ipc {
         message,
         metadata: EventMetadata::new("test-broker"),
     });
+}
+
+fn publish_response_as(kernel: &Kernel, request_id: &str, principal: &str, decision: &str) {
+    publish_response_as_owner(
+        kernel,
+        request_id,
+        principal,
+        test_request_owner(),
+        decision,
+    );
 }
 
 /// Publish a consent response for the common principal used by most tests.
@@ -115,6 +140,24 @@ async fn wait_for_grant(home: &AstridHome, principal: &str, capsule: &str) -> bo
 async fn settle() {
     tokio::task::yield_now().await;
     astrid_runtime::time::sleep(Duration::from_millis(100)).await;
+}
+
+/// A response published immediately after the request must not be lost before
+/// the handler creates correlation state. The ordered observer consumes both
+/// events in publication order without requiring an artificial settle delay.
+#[tokio::test]
+async fn immediate_response_after_request_is_not_lost() {
+    let (_dir, home, kernel) = fixture().await;
+    seed_profile(&home, "x", &[]);
+
+    let rid = "rid-immediate-response";
+    publish_grant_required(&kernel, rid, "x", "cap");
+    publish_response(&kernel, rid, "approve");
+
+    assert!(
+        wait_for_grant(&home, "x", "cap").await,
+        "the ordered correlation loop must retain an immediate response"
+    );
 }
 
 /// Assert the grant does NOT land within a bounded window — for deny / timeout /
@@ -153,6 +196,9 @@ async fn approve_grants_capsule_end_to_end() {
     seed_profile(&home, "x", &[]);
 
     let rid = "rid-approve-1";
+    let mut completion = kernel
+        .event_bus
+        .subscribe_topic_as(Topic::grant_result(rid).as_str(), "grant_result_test");
     publish_grant_required(&kernel, rid, "x", "cap");
     settle().await;
     publish_response(&kernel, rid, "approve");
@@ -161,6 +207,30 @@ async fn approve_grants_capsule_end_to_end() {
         wait_for_grant(&home, "x", "cap").await,
         "APPROVE must grant `cap` to principal `x`"
     );
+
+    let completion = astrid_runtime::time::timeout(Duration::from_secs(2), completion.recv())
+        .await
+        .expect("grant result timeout")
+        .expect("grant result event");
+    let AstridEvent::Ipc { message, .. } = &*completion else {
+        panic!("grant result must be IPC");
+    };
+    assert_eq!(message.source_id, uuid::Uuid::nil());
+    assert_eq!(message.principal.as_deref(), Some("x"));
+    assert_eq!(message.request_owner, Some(test_request_owner()));
+    assert!(matches!(
+        &message.payload,
+        IpcPayload::GrantResult {
+            request_id,
+            request_owner,
+            principal,
+            capsule_id,
+            granted: true,
+        } if request_id == rid
+            && request_owner == &test_request_owner().to_string()
+            && principal == "x"
+            && capsule_id == "cap"
+    ));
 
     // The cache reflects the grant (it was invalidated on the grant path).
     let pid = PrincipalId::new("x").unwrap();
@@ -287,6 +357,21 @@ async fn cross_principal_response_does_not_grant() {
     assert_no_grant(&home, "x", "cap").await;
 }
 
+/// SECURITY: two sessions authenticated as the same principal remain distinct.
+/// A response from the wrong connection owner cannot grant the request.
+#[tokio::test]
+async fn same_principal_wrong_request_owner_does_not_grant() {
+    let (_dir, home, kernel) = fixture().await;
+    seed_profile(&home, "x", &[]);
+
+    let rid = "rid-cross-owner";
+    publish_grant_required(&kernel, rid, "x", "cap");
+    settle().await;
+    publish_response_as_owner(&kernel, rid, "x", RequestOwnerId::generate(), "approve");
+
+    assert_no_grant(&home, "x", "cap").await;
+}
+
 /// Test #5: SECURITY — the handler reacts ONLY to a correctly-topic'd
 /// `ApprovalResponse` on `astrid.v1.approval.response.<rid>`. A "response"
 /// delivered to a DIFFERENT topic, or a non-`ApprovalResponse` payload on the
@@ -362,6 +447,7 @@ async fn grant_required_from_non_kernel_source_does_not_grant() {
     // capsule's publish; the kernel dispatcher always uses nil.
     let payload = IpcPayload::GrantRequired {
         request_id: rid.to_string(),
+        request_owner: test_request_owner().to_string(),
         principal: "x".to_string(),
         capsule_id: "cap".to_string(),
     };
