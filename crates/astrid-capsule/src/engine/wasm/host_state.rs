@@ -297,7 +297,6 @@ pub struct HostState {
     /// See `astrid_vfs::workspace_cow`.
     pub workspace_root: PathBuf,
     /// Pristine hosted portal path for durable command grants.
-    ///
     /// Distinct from [`Self::workspace_root`] (runtime-effective merged/git
     /// path used for FS confinement). `HostedPortal`: the source before `CoW`.
     /// Git-managed: same as `workspace_root`. Astrid filesystem: empty.

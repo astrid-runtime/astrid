@@ -17,6 +17,7 @@ pub(super) async fn answer_action_request(
     mut state: HostState,
     decision: &'static str,
 ) -> Result<ApprovalResponse, ErrorCode> {
+    let owner = install_request_owner(&mut state);
     let bus = state.event_bus.clone();
     let receiver = bus.subscribe_topic(Topic::approval_request().as_str());
     let task = tokio::task::spawn_blocking(move || {
@@ -25,8 +26,15 @@ pub(super) async fn answer_action_request(
             approval_request("git push", "git push origin main"),
         )
     });
-    let (id, principal) = await_approval_request(receiver).await;
-    publish_approval_reply(&bus, &id, principal.as_deref(), decision);
+    let (id, principal, request_owner) = await_approval_request(receiver).await;
+    assert_eq!(request_owner, owner);
+    publish_approval_reply(
+        &bus,
+        &id,
+        principal.as_deref(),
+        Some(request_owner),
+        decision,
+    );
     task.await.expect("host task")
 }
 
@@ -174,6 +182,7 @@ async fn always_without_persistence_never_reports_success() {
 async fn failed_profile_write_never_reports_always() {
     let home = tempfile::tempdir().unwrap();
     let mut state = persistent_test_state(home.path());
+    let owner = install_request_owner(&mut state);
     let bus = state.event_bus.clone();
     let receiver = bus.subscribe_topic(Topic::approval_request().as_str());
     let task = tokio::task::spawn_blocking(move || {
@@ -182,12 +191,19 @@ async fn failed_profile_write_never_reports_always() {
             approval_request("git push", "git push origin main"),
         )
     });
-    let (id, principal) = await_approval_request(receiver).await;
+    let (id, principal, request_owner) = await_approval_request(receiver).await;
+    assert_eq!(request_owner, owner);
     // Make the destination unwritable after the initial profile lookup and
     // before the operator decision. This drives the real host failure path.
     let root = astrid_core::dirs::AstridHome::from_path(home.path());
     std::fs::create_dir_all(root.profile_path(&PrincipalId::default())).unwrap();
-    publish_approval_reply(&bus, &id, principal.as_deref(), "approve_always");
+    publish_approval_reply(
+        &bus,
+        &id,
+        principal.as_deref(),
+        Some(request_owner),
+        "approve_always",
+    );
     assert!(matches!(
         task.await.unwrap(),
         Err(ErrorCode::StoreUnavailable)
@@ -713,7 +729,7 @@ async fn request_approval_without_authenticated_owner_fails_closed() {
     );
 }
 
-fn install_request_owner(state: &mut HostState) -> astrid_events::ipc::RequestOwnerId {
+pub(super) fn install_request_owner(state: &mut HostState) -> astrid_events::ipc::RequestOwnerId {
     let owner = astrid_events::ipc::RequestOwnerId::generate();
     state.caller_context = Some(
         IpcMessage::new(

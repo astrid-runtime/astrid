@@ -1,8 +1,8 @@
 //! Host function implementation for plugin-level approval requests.
 //!
 //! Called by WASM guests via the `request_approval` trait method when a plugin
-//! needs human consent for a sensitive action. Checks the shared
-//! [`AllowanceStore`] first (instant path), then publishes an
+//! needs human consent for a sensitive action. Checks persisted always-grants,
+//! then the shared [`AllowanceStore`] (instant path), then publishes an
 //! [`ApprovalRequired`] IPC event and blocks until the frontend responds.
 
 use crate::engine::wasm::bindings::astrid::approval::host::{
