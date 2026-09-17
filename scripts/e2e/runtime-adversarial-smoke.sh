@@ -51,6 +51,22 @@ PY
   json_field "$ARTIFACTS/adversarial-admin-pair-redeem.json" session_token
 }
 
+mint_delegated_invite_issuer_bearer() {
+  local ops_bearer=$1 status admin_bearer
+  status="$(http_status POST /api/sys/invites "$ops_bearer" \
+    '{"group":"agent","max_uses":1,"expires_secs":600}' \
+    "$ARTIFACTS/operator-issued-invite.json")"
+  assert_status "operator session invite issue denied" "$status" 403
+  json_assert_field_equals "$ARTIFACTS/operator-issued-invite.json" reason \
+    "invite issuance requires a user-delegated device"
+  admin_bearer="$(mint_admin_bearer)"
+  status="$(http_status POST /api/sys/invites "$admin_bearer" \
+    '{"group":"agent","max_uses":1,"expires_secs":600}' \
+    "$ARTIFACTS/admin-issued-invite.json")"
+  assert_status "delegated-device invite issue" "$status" 200
+  printf '%s\n' "$admin_bearer"
+}
+
 json_assert_inheritance_and_clone_state() {
   local home=$1
   local source=$2

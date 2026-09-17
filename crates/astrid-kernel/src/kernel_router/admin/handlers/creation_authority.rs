@@ -77,6 +77,34 @@ impl CreationAuthority {
                 err_bad_input(format!("principal ownership assignment failed: {error}"))
             })
     }
+
+    /// Keyless backfill may repair credentials, never mint into a foreign fleet.
+    async fn authorize_existing_target(
+        &self,
+        kernel: &Kernel,
+        principal: &PrincipalId,
+    ) -> Result<(), AdminResponseBody> {
+        let graph = kernel
+            .ownership_store
+            .load()
+            .await
+            .map_err(|error| err_internal(error.to_string()))?;
+        let Ok(target) = kernel.principal_directory.uid_for(principal) else {
+            return Ok(());
+        };
+        let Some(owner) = graph.principal_owner(target) else {
+            return Ok(());
+        };
+        let creator_fleet = graph
+            .principal_owner(self.creator)
+            .map(|owner| owner.fleet_uid);
+        if creator_fleet == Some(owner.fleet_uid) {
+            return Ok(());
+        }
+        Err(err_bad_input(
+            "cannot mint credentials for a principal owned by another fleet".to_owned(),
+        ))
+    }
 }
 
 /// Handle an [`AdminRequestKind::AgentCreate`]. Split from the dispatch match
@@ -150,8 +178,14 @@ async fn create_with_authority(
     if profile_path.exists() {
         // A backfill is not a re-create: any profile-shaping input (last arg)
         // keeps the hard "already exists" error rather than being silently
-        // dropped.
-        return super::super::agent_create_helpers::backfill_keypair(
+        // dropped. Foreign-fleet identities are not credential-repaired here.
+        if let Err(response) = authority
+            .authorize_existing_target(kernel, &principal)
+            .await
+        {
+            return response;
+        }
+        let response = super::super::agent_create_helpers::backfill_keypair(
             kernel,
             &principal,
             &profile_path,
@@ -161,6 +195,13 @@ async fn create_with_authority(
                 || !grants.is_empty(),
         )
         .await;
+        if matches!(response, AdminResponseBody::Error(_)) {
+            return response;
+        }
+        if let Err(response) = authority.assign(kernel, &principal).await {
+            return response;
+        }
+        return response;
     }
 
     // A genuinely new principal: build its profile, mint its keypair, register

@@ -103,6 +103,15 @@ fn bare_create(name: &str) -> AdminRequestKind {
     }
 }
 
+fn invite_issue() -> AdminRequestKind {
+    AdminRequestKind::InviteIssue {
+        group: "agent".into(),
+        expires_secs: Some(300),
+        max_uses: 1,
+        metadata: None,
+    }
+}
+
 fn assert_success(res: &AdminResponseBody) {
     if let AdminResponseBody::Error(msg) = res {
         panic!("expected success, got Error: {msg}");
@@ -625,6 +634,123 @@ async fn invitation_rejects_revocation_regrant_removed_key_and_expiry_before_pro
             "{scenario}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invite_issue_without_delegated_device_is_rejected() {
+    let (_dir, kernel) = fixture().await;
+    let issuer = user(1, 0x71);
+    let fleet = fleet_for(2, issuer.uid);
+    seed_user_and_fleet(&kernel, &issuer, &fleet).await;
+    assign(&kernel, &PrincipalId::default(), &fleet, issuer.uid).await;
+    let _device = delegate_device(&kernel, issuer.uid).await;
+
+    let response = handlers::dispatch(&kernel, &PrincipalId::default(), invite_issue()).await;
+    let AdminResponseBody::Error(error) = response else {
+        panic!("expected unauthorized invite issue, got {response:?}");
+    };
+    assert!(
+        error.contains("invite issuance requires a user-delegated device"),
+        "{error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invite_issue_with_delegated_device_returns_invite() {
+    let (_dir, kernel) = fixture().await;
+    let issuer = user(1, 0x72);
+    let fleet = fleet_for(2, issuer.uid);
+    seed_user_and_fleet(&kernel, &issuer, &fleet).await;
+    assign(&kernel, &PrincipalId::default(), &fleet, issuer.uid).await;
+    let device = delegate_device(&kernel, issuer.uid).await;
+
+    let response = handlers::dispatch_with_device(
+        &kernel,
+        &PrincipalId::default(),
+        Some(&device),
+        invite_issue(),
+    )
+    .await;
+    assert!(
+        matches!(response, AdminResponseBody::Invite(_)),
+        "{response:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keyless_backfill_rejects_foreign_fleet_credential_mint() {
+    let (_dir, kernel) = fixture().await;
+    let owner = user(1, 0x73);
+    let creator_fleet = fleet_for(2, owner.uid);
+    let foreign_fleet = fleet_for(3, owner.uid);
+    seed_user_and_fleet(&kernel, &owner, &creator_fleet).await;
+    kernel
+        .ownership_store
+        .create_fleet(foreign_fleet.clone())
+        .await
+        .expect("create foreign fleet");
+    assign(&kernel, &PrincipalId::default(), &creator_fleet, owner.uid).await;
+    let device = delegate_device(&kernel, owner.uid).await;
+
+    let principal = pid("foreign-keyless");
+    assert_success(
+        &handlers::dispatch_with_device(
+            &kernel,
+            &PrincipalId::default(),
+            Some(&device),
+            bare_create(principal.as_str()),
+        )
+        .await,
+    );
+    kernel
+        .ownership_store
+        .transfer_principal(
+            uid_for(&kernel, &principal),
+            creator_fleet.uid,
+            foreign_fleet.uid,
+            owner.uid,
+        )
+        .await
+        .expect("transfer target into another fleet");
+
+    let mut profile = PrincipalProfile::load_from_path(&PrincipalProfile::path_for(
+        &kernel.astrid_home,
+        &principal,
+    ))
+    .expect("load profile");
+    profile.auth = AuthConfig::default();
+    profile
+        .save_to_path(&PrincipalProfile::path_for(&kernel.astrid_home, &principal))
+        .expect("strip keypair");
+    let key_path = kernel
+        .astrid_home
+        .keys_dir()
+        .join(format!("{principal}.key"));
+    let _ = std::fs::remove_file(&key_path);
+    kernel.profile_cache.invalidate(&principal);
+
+    let response = handlers::dispatch_with_device(
+        &kernel,
+        &PrincipalId::default(),
+        Some(&device),
+        bare_create(principal.as_str()),
+    )
+    .await;
+    let AdminResponseBody::Error(error) = response else {
+        panic!("expected foreign-fleet backfill refusal, got {response:?}");
+    };
+    assert!(
+        error.contains("cannot mint credentials for a principal owned by another fleet"),
+        "{error}"
+    );
+    assert!(
+        !key_path.exists(),
+        "foreign-fleet backfill must not mint a new private key"
+    );
+    assert!(
+        PrincipalProfile::path_for(&kernel.astrid_home, &principal).exists(),
+        "refusal must leave the foreign principal's identity in place"
+    );
 }
 
 async fn demote_inviter(kernel: &Kernel, fleet: FleetUid, actor: UserUid) {

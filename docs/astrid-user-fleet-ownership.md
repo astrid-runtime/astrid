@@ -87,8 +87,10 @@ graph. After the deterministic CLI-root user and fleet exist, the durable
 the local operator. Unowned admitted leftovers are then adopted only when that
 bound local-operator device currently resolves to a manager of `default`'s
 fleet **and** the graph still contains exactly that user, exactly that fleet,
-and no assignment to any other fleet. Existing assignments, transfers,
-disabled identities, and deletion reservations are never moved or adopted.
+and no assignment to any other fleet. Existing assignments, transfers, and deletion reservations are never
+moved or adopted. Disabled is a profile flag, not a graph filter: an
+unowned admitted principal remains an adoption leftover even when
+`profile.enabled` is false.
 
 Released homes have no personal-versus-hosted marker. Extra users, extra
 fleets, or a foreign assignment make bulk adoption ambiguous; those leftovers

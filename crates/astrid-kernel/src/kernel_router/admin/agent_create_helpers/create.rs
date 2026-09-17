@@ -10,7 +10,9 @@ use super::super::handlers::{
     AGENT_IDENTITY_PLATFORM, err_bad_input, err_internal, err_profile, principal_profile_path,
     require_principal_exists, success_json,
 };
-use super::rollback::{remove_principal_key, rollback_created_identity};
+use super::rollback::{
+    remove_principal_key, rollback_created_identity, rollback_created_identity_unless_assigned,
+};
 
 /// Build, register, and provision a genuinely-new principal.
 ///
@@ -134,7 +136,7 @@ pub(crate) async fn provision_new_principal(
     if let Some(authority) = ownership
         && let Err(response) = authority.assign(kernel, &principal).await
     {
-        rollback_created_identity(kernel, &principal, user.id, &profile_path, true).await;
+        rollback_created_identity_unless_assigned(kernel, &principal, user.id, &profile_path).await;
         return response;
     }
     if warm_after_create {

@@ -484,10 +484,8 @@ EOF
   [[ "$ops_group" == "ops-team" ]] || fail "operator-1 redeemed into $ops_group, expected ops-team"
 
   local status
-  status="$(http_status POST /api/sys/invites "$ops_bearer" \
-    '{"group":"agent","max_uses":1,"expires_secs":600}' \
-    "$ARTIFACTS/operator-issued-invite.json")"
-  assert_status "operator invite issue" "$status" 200
+  local admin_bearer
+  admin_bearer="$(mint_delegated_invite_issuer_bearer "$ops_bearer")"
   status="$(http_status DELETE /api/sys/principals/default "$ops_bearer" "" \
     "$ARTIFACTS/operator-delete-default.json")"
   assert_status "operator delete default denied" "$status" 403
@@ -533,8 +531,6 @@ EOF
     status="$(http_status GET /api/capsules/astrid-capsule-cli/env "$bearer" "" "$ARTIFACTS/$label-default-only-env.json")"; assert_status "$label default-only capsule env hidden" "$status" 404
     status="$(http_status POST /api/capsules/astrid-capsule-cli/env/unused "$bearer" '{"value":"should-not-write"}' "$ARTIFACTS/$label-default-only-env-write.json")"; assert_status "$label default-only capsule env write hidden" "$status" 404
   done
-  local admin_bearer
-  admin_bearer="$(mint_admin_bearer)"
   status="$(http_status GET /api/capsules "$admin_bearer" "" "$ARTIFACTS/admin-capsules.json")"
   assert_status "admin global capsule list" "$status" 200
   json_assert_capsule_list_state "$ARTIFACTS/admin-capsules.json" astrid-capsule-cli present

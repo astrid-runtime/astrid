@@ -156,6 +156,33 @@ pub(super) fn collect_remove_dir(path: &Path, label: &str, errors: &mut Vec<Stri
     }
 }
 
+/// Roll back a freshly provisioned identity only when ownership assignment
+/// is confirmed absent. An unreadable graph or an existing assignment is
+/// treated as unconfirmed/committed: deleting identity would orphan a UID
+/// the graph already owns.
+pub(super) async fn rollback_created_identity_unless_assigned(
+    kernel: &crate::Kernel,
+    principal: &PrincipalId,
+    user_id: uuid::Uuid,
+    profile_path: &Path,
+) {
+    let assigned = match kernel.principal_directory.uid_for(principal) {
+        Ok(uid) => match kernel.ownership_store.load().await {
+            Ok(graph) => graph.principal_owner(uid).is_some(),
+            Err(_) => true,
+        },
+        Err(_) => false,
+    };
+    if assigned {
+        tracing::warn!(
+            %principal,
+            "preserving provisioned identity after ownership assignment error because assignment is present or unconfirmed"
+        );
+        return;
+    }
+    rollback_created_identity(kernel, principal, user_id, profile_path, true).await;
+}
+
 pub(super) async fn rollback_created_identity(
     kernel: &crate::Kernel,
     principal: &PrincipalId,
