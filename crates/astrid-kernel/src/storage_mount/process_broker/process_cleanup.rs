@@ -195,8 +195,14 @@ fn native_projection_mount_is_active(mountpoint: &Path) -> Result<bool, String> 
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = mountpoint;
-        Ok(false)
+        match std::fs::symlink_metadata(mountpoint) {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!(
+                "inspect projection mountpoint {}: {error}",
+                mountpoint.display()
+            )),
+        }
     }
 }
 
@@ -223,9 +229,9 @@ async fn unmount_known_projection_path(mountpoint: &Path) -> Result<(), String> 
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-async fn unmount_known_projection_path(mountpoint: &Path) -> Result<(), String> {
+fn unmount_known_projection_path(mountpoint: &Path) -> std::future::Ready<Result<(), String>> {
     let _ = mountpoint;
-    Ok(())
+    std::future::ready(Ok(()))
 }
 
 #[cfg(target_os = "linux")]
@@ -332,6 +338,15 @@ mod tests {
             .await
             .expect("ordinary empty directory must not be unmounted");
         assert!(empty.is_dir(), "host directory must remain");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_projection_inspect_fails_closed_on_invalid_path() {
+        let invalid = std::path::Path::new(r"C:\*");
+        let error = native_projection_mount_is_active(invalid)
+            .expect_err("invalid Windows path inspect must fail closed");
+        assert!(error.contains("inspect projection mountpoint"), "{error}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
