@@ -131,21 +131,5 @@ pub(crate) fn configure(
     ))))
 }
 
-/// Native secret input routing is Unix-local. Empty bindings keep the
-/// legacy transport; a configured responder map fails closed here.
-///
-/// # Errors
-/// Refuses a non-empty responder map on this platform.
-#[cfg(not(unix))]
-pub(crate) fn configure(
-    _kernel: &Arc<astrid_kernel::Kernel>,
-    config: &astrid_config::Config,
-) -> anyhow::Result<Option<Arc<dyn PrivateElicitResponder>>> {
-    if config.native_input.bindings()?.is_empty() {
-        return Ok(None);
-    }
-    anyhow::bail!("native secret input routing is not supported on this platform")
-}
-
 #[cfg(test)]
 mod tests;
