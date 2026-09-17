@@ -6,6 +6,7 @@
 mod egress;
 mod framing;
 mod handshake;
+pub mod private_elicit;
 mod routing;
 #[cfg(all(test, unix))]
 mod tests;
@@ -50,6 +51,7 @@ struct ConnectionAdmission {
 }
 
 struct ConnectionRuntime {
+    private_elicits: Option<Arc<dyn private_elicit::PrivateElicitResponder>>,
     session_token: Arc<SessionToken>,
     home: AstridHome,
     event_bus: Arc<EventBus>,
@@ -113,6 +115,7 @@ impl ConnectionRuntime {
             egress,
             shutdown,
             admission,
+            self.private_elicits.clone(),
         )
         .await;
     }
@@ -173,10 +176,23 @@ impl NativeUplink {
     /// requested or the listener becomes unusable.
     #[must_use]
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(self.run())
+        tokio::spawn(self.run(None))
     }
 
-    async fn run(mut self) {
+    /// Attach a runtime-owned private reply handler without changing legacy
+    /// bus ingress. The handler must enforce pending-request authority.
+    #[must_use]
+    pub fn spawn_with_private_elicits(
+        self,
+        handler: Arc<dyn private_elicit::PrivateElicitResponder>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(self.run(Some(handler)))
+    }
+
+    async fn run(
+        mut self,
+        private_elicits: Option<Arc<dyn private_elicit::PrivateElicitResponder>>,
+    ) {
         let handshake_permits = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
         let established_permits =
             Arc::new(tokio::sync::Semaphore::new(MAX_ESTABLISHED_CONNECTIONS));
@@ -185,6 +201,7 @@ impl NativeUplink {
         let egress_registry = egress::Registry::install(&self.event_bus);
         let (connection_shutdown_tx, connection_shutdown_rx) = tokio::sync::watch::channel(false);
         let runtime = Arc::new(ConnectionRuntime {
+            private_elicits,
             session_token: Arc::clone(&self.session_token),
             home: self.home.clone(),
             event_bus: Arc::clone(&self.event_bus),
@@ -342,6 +359,7 @@ async fn serve_connection(
     mut receiver: egress::Subscription,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     mut admission: ConnectionAdmission,
+    private_elicits: Option<Arc<dyn private_elicit::PrivateElicitResponder>>,
 ) {
     let principal = identity.principal.to_string();
     let (reader, mut writer) = local_transport::split(stream);
@@ -389,14 +407,15 @@ async fn serve_connection(
                         tracing::warn!(%principal, "reserved admin connection attempted multiple requests");
                         break;
                     }
-                    if let Err(reason) = process_inbound(
+                    if route_connection_message(
+                        &mut writer,
                         &event_bus,
                         &identity,
-                        &principal,
                         &receiver,
+                        private_elicits.as_deref(),
                         message,
-                    ) {
-                        tracing::warn!(security_event = true, %principal, %reason, "dropped local uplink message");
+                    ).await.is_err() {
+                        break;
                     }
                 },
                 Ok(None) => break,
@@ -443,6 +462,32 @@ async fn serve_connection(
         Some("socket closed"),
     );
     tracing::info!(%principal, "local client disconnected");
+}
+
+/// Private replies must be consumed before ordinary bus admission. Even an
+/// unsupported/expired reply gets a direct rejection, never an IPC fallback.
+async fn route_connection_message(
+    writer: &mut LocalWriteHalf,
+    event_bus: &EventBus,
+    identity: &AuthenticatedIdentity,
+    receiver: &egress::Subscription,
+    private_elicits: Option<&dyn private_elicit::PrivateElicitResponder>,
+    message: IpcMessage,
+) -> std::io::Result<()> {
+    if message.topic.as_str() == private_elicit::REPLY_TOPIC {
+        let result = private_elicit::respond(identity, private_elicits, message);
+        return write_message(writer, &result).await;
+    }
+    if let Err(reason) = process_inbound(
+        event_bus,
+        identity,
+        identity.principal.as_str(),
+        receiver,
+        message,
+    ) {
+        tracing::warn!(security_event = true, principal = %identity.principal, %reason, "dropped local uplink message");
+    }
+    Ok(())
 }
 
 async fn drain_outbound_on_shutdown(

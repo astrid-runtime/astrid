@@ -76,6 +76,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
+use super::consent_display::ConsentDisplay;
+
 /// Broker front door for the shim's elicited grant-on-use decision. Maps to
 /// `sage-mcp::SageMcp::handle_mcp_grant_respond`.
 pub(super) const GRANT_RESPOND_TOPIC: &str = "astrid.v1.request.mcp.grant.respond";
@@ -103,7 +105,7 @@ rmcp::elicit_safe!(GrantForm);
 /// derives the grant target from its own observed signal, never a body
 /// field), so they can never be used to forge a grant for a different
 /// capsule or principal.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct GrantRequest {
     /// Kernel-minted grant correlation id; echoed onto the respond body.
     request_id: String,
@@ -210,6 +212,14 @@ impl GrantRequest {
         p.push_str("\n\nGrant this capsule to the identity?");
         p
     }
+
+    /// Display-only consent metadata. Grant ids and targets stay off this map.
+    pub(super) fn consent_display(&self) -> ConsentDisplay {
+        ConsentDisplay::capsule_access()
+            .with_capsule(&self.capsule_id)
+            .with_principal(&self.principal)
+            .with_tool(&self.tool_name)
+    }
 }
 
 /// Map an elicited accept/decline onto the broker decision verb the respond
@@ -233,7 +243,13 @@ pub(super) async fn elicit_grant(peer: &Peer<RoleServer>, request: &GrantRequest
         return false;
     }
 
-    match super::form_elicitation::elicit::<GrantForm>(peer, request.prompt()).await {
+    match super::form_elicitation::elicit::<GrantForm>(
+        peer,
+        request.prompt(),
+        &request.consent_display(),
+    )
+    .await
+    {
         Ok(Some(form)) => {
             debug!(
                 grant = form.grant,

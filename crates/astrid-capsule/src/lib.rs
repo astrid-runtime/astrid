@@ -16,6 +16,7 @@ pub mod context;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod discovery;
 pub mod dispatcher;
+pub mod elicitation;
 pub mod engine;
 // The loader constructs the Wasmtime/process-backed engines, so it is
 // native-only. An alternate host wires its own engines into `CompositeCapsule`.

@@ -69,6 +69,13 @@ impl Topic {
         Self("astrid.v1.elicit".to_string())
     }
 
+    /// Native secret-input notification, separate from legacy MCP elicitation.
+    /// Carries a schema only; answers must use the authenticated private responder.
+    #[must_use]
+    pub fn private_elicit_request() -> Self {
+        Self("astrid.v1.private.elicit.request".to_string())
+    }
+
     /// The elicit response topic for `request_id`:
     /// `astrid.v1.elicit.response.<request_id>`.
     #[must_use]

@@ -14,15 +14,16 @@ use astrid_core::PrincipalId;
 use rand::RngExt;
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
-    CallToolResponse, ElicitRequest, ElicitRequestParams, ElicitResult, ElicitationAction,
-    InputRequest, InputRequiredResult, InputResponses, RequestStateCodec, SealOptions,
+    CallToolResponse, ElicitRequest, ElicitResult, ElicitationAction, InputRequest,
+    InputRequiredResult, InputResponses, RequestStateCodec, SealOptions,
 };
 use rmcp::service::ElicitationSafe;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::consent_display::ConsentDisplay;
 use super::elicit::{ApprovalChoice, ApprovalForm, ApprovalRequest};
-use super::form_elicitation::interoperable_schema;
+use super::form_elicitation::form_params;
 use super::grant::{GrantForm, GrantRequest};
 use super::ingress::IngressForm;
 
@@ -183,14 +184,11 @@ impl MrtrBridge {
             )
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
 
-        let schema = interoperable_schema::<T>().map_err(|error| {
-            McpError::internal_error(format!("failed to build consent schema: {error}"), None)
-        })?;
-        let request = ElicitRequest::new(ElicitRequestParams::FormElicitationParams {
-            meta: None,
-            message: prompt,
-            requested_schema: schema,
-        });
+        let params =
+            form_params::<T>(prompt, &consent_display_for(pending, tool)).map_err(|error| {
+                McpError::internal_error(format!("failed to build consent schema: {error}"), None)
+            })?;
+        let request = ElicitRequest::new(params);
         let mut requests = BTreeMap::new();
         requests.insert(INPUT_KEY.to_owned(), InputRequest::Elicitation(request));
         Ok(InputRequiredResult::new(Some(requests), Some(state)).into())
@@ -258,6 +256,14 @@ impl MrtrBridge {
             digest,
             committed: false,
         })
+    }
+}
+
+fn consent_display_for(pending: &PendingConsent, tool: &str) -> ConsentDisplay {
+    match pending {
+        PendingConsent::Ingress => ConsentDisplay::ingress().with_tool(tool),
+        PendingConsent::Grant { request, .. } => request.consent_display(),
+        PendingConsent::Approval { request } => request.consent_display(),
     }
 }
 
