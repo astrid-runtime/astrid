@@ -431,6 +431,7 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "wat",
+ "zeroize",
 ]
 
 [[package]]
@@ -543,15 +544,20 @@ dependencies = [
  "astrid-capsule-install",
  "astrid-config",
  "astrid-core",
+ "astrid-crypto",
+ "astrid-events",
  "astrid-gateway",
  "astrid-kernel",
  "astrid-storage",
  "astrid-telemetry",
+ "astrid-types",
  "astrid-uplink",
  "clap",
  "colored",
  "nix 0.31.3",
+ "serde_json",
  "signal-hook 0.4.4",
+ "tempfile",
  "tokio",
  "toml 1.1.4+spec-1.1.0",
  "tracing",

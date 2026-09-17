@@ -646,6 +646,9 @@ pub struct CapsuleContext {
     pub process_storage_mount_broker: Option<Arc<dyn ProcessStorageMountBroker>>,
     pub kv: ScopedKvStore,
     pub event_bus: Arc<EventBus>,
+    /// Private secret replies. Enable only with an authenticated responder.
+    /// Unset contexts retain the existing CLI/TUI elicitation transport.
+    pub secret_elicits: Option<Arc<crate::elicitation::PendingSecretElicits>>,
     pub cli_socket_listener: Option<UplinkListener>,
     /// Shared capsule registry for `hooks::trigger` fan-out.
     ///
@@ -728,6 +731,7 @@ impl CapsuleContext {
             process_storage_mount_broker: None,
             kv,
             event_bus,
+            secret_elicits: None,
             cli_socket_listener,
             capsule_registry: None,
             session_token: None,

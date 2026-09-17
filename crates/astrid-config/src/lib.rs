@@ -52,6 +52,8 @@ pub mod gateway;
 pub mod loader;
 /// Layered configuration merging with precedence.
 pub mod merge;
+/// Operator-selected native secret responders.
+pub mod native_input;
 /// Resolved configuration display and serialization.
 pub mod show;
 /// Configuration struct definitions.

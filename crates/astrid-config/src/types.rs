@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Operator-only principal to native responder device bindings; empty disables.
+    pub native_input: crate::native_input::NativeInputConfig,
     /// Native filesystem presentation, independent of provider identity.
     pub filesystem: crate::filesystem::FilesystemSection,
     /// Runtime behaviour (context limits, summarisation).

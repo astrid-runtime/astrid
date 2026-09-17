@@ -2573,6 +2573,7 @@ impl ExecutionEngine for WasmEngine {
             let st_system_runtime = system_runtime;
             let st_capsule_registry = ctx.capsule_registry.clone();
             let st_allowance_store = ctx.allowance_store.clone();
+            let st_secret_elicits = ctx.secret_elicits.clone();
             let st_identity_store = ctx.identity_store.clone();
             let st_profile_cache = ctx.profile_cache.clone();
             let st_audit_sink = ctx.audit_sink.clone();
@@ -2721,6 +2722,7 @@ impl ExecutionEngine for WasmEngine {
                     .unwrap_or_else(HostState::neutral_secret_store),
                 ready_tx: None,
                 blocking_semaphore: blocking_semaphore.clone(),
+                secret_elicits: st_secret_elicits.clone(),
                 io_semaphore: io_semaphore.clone(),
                 cancel_token: cancel_token_for_state.clone(),
                 principal_cancel_tokens: principal_cancel_tokens_for_state.clone(),
@@ -4043,6 +4045,7 @@ async fn build_lifecycle_host_state(
         secret_store: cfg.secret_store.clone(),
         ready_tx: None,
         blocking_semaphore: HostState::default_blocking_semaphore(),
+        secret_elicits: None,
         io_semaphore: HostState::default_io_semaphore(),
         cancel_token: tokio_util::sync::CancellationToken::new(),
         // Lifecycle hooks run a ONE-SHOT, single-principal instance: no

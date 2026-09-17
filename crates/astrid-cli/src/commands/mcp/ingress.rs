@@ -51,6 +51,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, warn};
 
+use super::consent_display::ConsentDisplay;
+
 /// Broker front door for the shim's elicited ingress-consent decision. Maps
 /// to `sage-mcp::SageMcp::handle_mcp_ingress_respond`.
 pub(super) const INGRESS_RESPOND_TOPIC: &str = "astrid.v1.request.mcp.ingress.respond";
@@ -132,6 +134,11 @@ impl IngressRequest {
         p.push_str("\n\nAllow Astrid tool calls from this session?");
         p
     }
+
+    /// Display-only consent metadata. Ingress `source_id` stays off this map.
+    pub(super) fn consent_display(&self) -> ConsentDisplay {
+        ConsentDisplay::ingress().with_tool(&self.tool_name)
+    }
 }
 
 /// Elicit the user's ingress-consent decision from `peer`.
@@ -145,7 +152,13 @@ pub(super) async fn elicit_consent(peer: &Peer<RoleServer>, request: &IngressReq
         return false;
     }
 
-    match super::form_elicitation::elicit::<IngressForm>(peer, request.prompt()).await {
+    match super::form_elicitation::elicit::<IngressForm>(
+        peer,
+        request.prompt(),
+        &request.consent_display(),
+    )
+    .await
+    {
         Ok(Some(form)) => {
             debug!(allow = form.allow, "MCP shim: ingress consent resolved");
             form.allow

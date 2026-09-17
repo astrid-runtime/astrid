@@ -58,6 +58,8 @@ pub mod kernel_router;
 mod kernel_shutdown_tests;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod legacy_migration_barrier;
+mod native_input;
+pub use native_input::native_input_device_is_live;
 /// Persistent pair-device token store (issue #756).
 pub mod pair_token;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -339,6 +341,8 @@ pub struct Kernel {
     /// exemptions (fail-closed). The snapshot is deliberately write-once:
     /// capsule reloads never re-read operator policy.
     local_egress: std::sync::RwLock<Option<std::collections::HashMap<String, Vec<String>>>>,
+    #[cfg(not(target_family = "wasm"))]
+    native_secret_inputs: OnceLock<Arc<astrid_capsule::elicitation::PendingSecretElicits>>,
     /// Operator-declared capsule IDs permitted to run as explicit system
     /// singletons. Manifest fields can request uplink behavior but cannot grant
     /// this cross-principal authority themselves.
@@ -1352,6 +1356,8 @@ impl Kernel {
             compiled_wasm: astrid_capsule::engine::wasm::CompiledWasmCache::default(),
             runtime_limits,
             local_egress: std::sync::RwLock::new(None),
+            #[cfg(not(target_family = "wasm"))]
+            native_secret_inputs: OnceLock::new(),
             system_capsules: RwLock::new(std::collections::HashSet::new()),
             http_limits,
             full_reload_in_flight: AtomicBool::new(false),
@@ -1984,6 +1990,10 @@ impl Kernel {
         // kernel's durable, hash-chained audit log — not just the
         // off-by-default observability tracing targets.
         .with_audit_sink(self.audit_sink.as_ref().clone());
+        #[cfg(not(target_family = "wasm"))]
+        {
+            ctx.secret_elicits = self.native_secret_inputs.get().cloned();
+        }
         if let Some(project_root) = explicit_workspace_portal_root(dir) {
             ctx = ctx.with_hosted_portal(project_root);
         }
@@ -3796,6 +3806,8 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         compiled_wasm: astrid_capsule::engine::wasm::CompiledWasmCache::default(),
         runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits::default(),
         local_egress: std::sync::RwLock::new(None),
+        #[cfg(not(target_family = "wasm"))]
+        native_secret_inputs: OnceLock::new(),
         system_capsules: RwLock::new(std::collections::HashSet::new()),
         http_limits: astrid_capsule_types::HttpLimits::default(),
         full_reload_in_flight: AtomicBool::new(false),

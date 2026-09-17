@@ -52,6 +52,7 @@ mod attach {
         anyhow::bail!("MCP gateway attach is only supported on Unix hosts")
     }
 }
+mod consent_display;
 mod elicit;
 mod form_elicitation;
 #[cfg(unix)]
