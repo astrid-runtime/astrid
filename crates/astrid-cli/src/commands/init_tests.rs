@@ -1012,3 +1012,101 @@ fn partial_run_leaves_no_lock_for_retry() {
         "full success must persist the lock"
     );
 }
+
+fn named_capsule(name: &str) -> DistroCapsule {
+    DistroCapsule {
+        name: name.to_string(),
+        source: format!("capsules/{name}.capsule"),
+        version: "1.0.0".to_string(),
+        tag: None,
+        branch: None,
+        rev: None,
+        default: true,
+        group: None,
+        role: None,
+        env: HashMap::new(),
+    }
+}
+
+#[test]
+fn select_named_manifest_capsules_keeps_only_requested_members() {
+    let capsules = [named_capsule("aos-mcp"), named_capsule("aos-skills")];
+    let selected = select_named_manifest_capsules(&capsules, &["aos-skills".to_string()])
+        .expect("named member is in the signed manifest");
+    assert_eq!(
+        selected
+            .iter()
+            .map(|capsule| capsule.name.as_str())
+            .collect::<Vec<_>>(),
+        ["aos-skills"]
+    );
+}
+
+#[test]
+fn select_named_manifest_capsules_rejects_unknown_empty_and_duplicate_names() {
+    let capsules = [named_capsule("aos-mcp"), named_capsule("aos-skills")];
+    let unknown = select_named_manifest_capsules(&capsules, &["missing".to_string()])
+        .expect_err("unknown names must not fall back to the full distro");
+    assert!(
+        unknown
+            .to_string()
+            .contains("is not a member of the signed Distro manifest"),
+        "got: {unknown:#}"
+    );
+
+    let empty = select_named_manifest_capsules(&capsules, &[String::new()])
+        .expect_err("empty names fail closed");
+    assert!(
+        empty.to_string().contains("non-empty capsule name"),
+        "got: {empty:#}"
+    );
+
+    let duplicate =
+        select_named_manifest_capsules(&capsules, &["aos-mcp".to_string(), "aos-mcp".to_string()])
+            .expect_err("duplicate names fail closed");
+    assert!(
+        duplicate
+            .to_string()
+            .contains("was specified more than once"),
+        "got: {duplicate:#}"
+    );
+
+    let omitted = select_named_manifest_capsules(&capsules, &[])
+        .expect_err("omitted names must not select the full distro");
+    assert!(
+        omitted
+            .to_string()
+            .contains("requires at least one capsule name"),
+        "got: {omitted:#}"
+    );
+}
+
+#[test]
+fn require_named_members_present_refuses_missing_targets_before_mutation() {
+    let selected = vec![named_capsule("aos-mcp"), named_capsule("aos-skills")];
+    require_named_members_present(&selected, |name| name == "aos-mcp")
+        .expect_err("missing installed members must refuse before refresh");
+    require_named_members_present(&selected, |_| true)
+        .expect("already-installed members may refresh");
+}
+
+#[test]
+fn reject_filtered_partial_refresh_is_nonzero_unless_every_member_completes() {
+    reject_filtered_partial_refresh(3, 2).expect_err("partial filtered refresh must fail");
+    reject_filtered_partial_refresh(0, 0).expect_err("empty filtered refresh must fail");
+    reject_filtered_partial_refresh(2, 2).expect("complete filtered refresh");
+}
+
+#[test]
+fn reject_filtered_shuttle_only_when_named_selection_is_requested() {
+    reject_filtered_shuttle("product.shuttle", &[]).expect("unfiltered shuttle remains valid");
+    reject_filtered_shuttle("Distro.toml", &["aos-mcp".to_string()])
+        .expect("named signed Distro refresh is allowed");
+    let err = reject_filtered_shuttle("product.shuttle", &["aos-mcp".to_string()])
+        .expect_err("named refresh cannot use shuttle sources");
+    assert!(
+        err.to_string()
+            .contains("not supported for .shuttle sources"),
+        "got: {err:#}"
+    );
+}

@@ -1,6 +1,6 @@
 use clap::{CommandFactory, Parser};
 
-use super::{Cli, Commands};
+use super::{Cli, Commands, DistroCommands};
 
 #[test]
 fn grant_capsules_allows_an_operator_enforced_distro() {
@@ -101,4 +101,46 @@ fn global_options_before_init_preserve_the_requested_distro() {
             ..
         }) if distro == "@example/other"
     ));
+}
+
+#[test]
+fn distro_apply_parses_repeated_capsule_flags() {
+    let cli = Cli::try_parse_from([
+        "astrid",
+        "distro",
+        "apply",
+        "./Distro.toml",
+        "--yes",
+        "--capsule",
+        "aos-mcp",
+        "--capsule",
+        "aos-skills",
+    ])
+    .expect("repeated --capsule should parse");
+
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Distro {
+            command: DistroCommands::Apply { ref capsules, yes: true, .. }
+        }) if capsules == &["aos-mcp".to_string(), "aos-skills".to_string()]
+    ));
+}
+
+#[test]
+fn distro_apply_rejects_empty_capsule_name() {
+    let Err(err) = Cli::try_parse_from([
+        "astrid",
+        "distro",
+        "apply",
+        "./Distro.toml",
+        "--capsule",
+        "",
+    ]) else {
+        panic!("empty --capsule names must fail at parse time");
+    };
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("capsule name must not be empty") || rendered.contains("invalid value"),
+        "got: {rendered}"
+    );
 }

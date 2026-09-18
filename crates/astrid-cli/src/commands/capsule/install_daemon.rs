@@ -69,6 +69,7 @@ pub(super) async fn install_local_via_daemon_outcome(
     prompt: &ManualInstallOptions,
     target: &PrincipalId,
     authority: CapsuleInstallAuthority,
+    expected_generation: Option<&InstalledCapsuleGeneration>,
     batch: Option<CapsuleInstallBatchContext>,
 ) -> anyhow::Result<InstalledCapsuleOutcome> {
     crate::commands::daemon::ensure_persistent_daemon("capsule install")
@@ -93,8 +94,16 @@ pub(super) async fn install_local_via_daemon_outcome(
             &astrid_core::dirs::AstridHome::resolve()?.config_path(),
         )?
     };
-    install_local_via_daemon_for_target_in_batch(source, &vars, target, None, authority, batch)
-        .await
+    install_local_via_daemon_for_target_in_batch(
+        source,
+        &vars,
+        target,
+        None,
+        authority,
+        expected_generation.cloned(),
+        batch,
+    )
+    .await
 }
 
 async fn list_existing_keys(
@@ -125,8 +134,10 @@ pub(crate) async fn install_local_via_daemon_for_target(
     provenance: Option<CapsuleInstallProvenance>,
     authority: CapsuleInstallAuthority,
 ) -> anyhow::Result<InstalledCapsuleOutcome> {
-    install_local_via_daemon_for_target_in_batch(source, vars, target, provenance, authority, None)
-        .await
+    install_local_via_daemon_for_target_in_batch(
+        source, vars, target, provenance, authority, None, None,
+    )
+    .await
 }
 
 async fn install_local_via_daemon_for_target_in_batch(
@@ -135,10 +146,17 @@ async fn install_local_via_daemon_for_target_in_batch(
     target: &PrincipalId,
     provenance: Option<CapsuleInstallProvenance>,
     authority: CapsuleInstallAuthority,
+    expected_generation: Option<InstalledCapsuleGeneration>,
     batch: Option<CapsuleInstallBatchContext>,
 ) -> anyhow::Result<InstalledCapsuleOutcome> {
     install_local_via_daemon_for_target_with_generation(
-        source, vars, target, provenance, authority, None, batch,
+        source,
+        vars,
+        target,
+        provenance,
+        authority,
+        expected_generation,
+        batch,
     )
     .await
 }
@@ -232,6 +250,7 @@ pub(crate) async fn install_local_via_daemon_for_target_with_generation(
                     kind: value.kind,
                 })
                 .collect(),
+            expected_generation,
             batch,
         })
         .await?;

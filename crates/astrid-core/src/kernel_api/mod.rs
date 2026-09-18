@@ -68,14 +68,10 @@ pub enum KernelRequest {
         source: String,
         /// True if this should be installed locally in the workspace.
         workspace: bool,
-        /// Optional durable principal target.  When absent, the
-        /// authenticated caller is the target.  Selecting another principal
-        /// requires the global capsule-install capability and is resolved to
-        /// that principal's immutable UID by the kernel.
+        /// Optional durable principal target. Absent means the caller; selecting another requires the global capsule-install capability.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_principal: Option<PrincipalId>,
-        /// Optional bounded distro/source provenance.  This is integrity
-        /// evidence only; it never widens install authority.
+        /// Bounded distro/source provenance; never widens install authority.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provenance: Option<CapsuleInstallProvenance>,
         /// Authenticated one-install authority decision. The kernel binds it
@@ -87,6 +83,9 @@ pub enum KernelRequest {
         /// kernel's environment limits.
         #[serde(default)]
         env: Vec<CapsuleInstallEnv>,
+        /// Observed package generation; filtered refresh fail-closes on mismatch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_generation: Option<InstalledCapsuleGeneration>,
         /// Optional bounded request-frequency lease; never grants authority.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         batch: Option<CapsuleInstallBatchContext>,

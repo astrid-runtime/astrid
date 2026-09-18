@@ -564,6 +564,10 @@ pub(crate) enum DistroCommands {
         /// Set a variable (repeatable): KEY=VALUE.
         #[arg(long = "var", value_name = "KEY=VALUE")]
         vars: Vec<String>,
+        /// Refresh already-installed named signed Distro members (repeatable).
+        /// Omitted: unfiltered apply of the signed Distro.
+        #[arg(long = "capsule", value_name = "NAME", value_parser = parse_distro_capsule_name)]
+        capsules: Vec<String>,
     },
     /// Show the currently-applied distro and its lockfile.
     Show {
@@ -591,6 +595,14 @@ pub(crate) enum DistroCommands {
         #[arg(short, long)]
         key: PathBuf,
     },
+}
+
+fn parse_distro_capsule_name(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        Err("capsule name must not be empty".to_owned())
+    } else {
+        Ok(value.to_owned())
+    }
 }
 
 #[cfg(test)]

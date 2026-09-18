@@ -45,6 +45,9 @@ pub struct CapsuleInstallBatchMember {
     pub archive_digest: String,
     /// Exact compressed archive size.
     pub source_bytes: u64,
+    /// Observed package generation; filtered refresh fail-closes on mismatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_generation: Option<InstalledCapsuleGeneration>,
 }
 
 /// Lease reference carried by one ordinary capsule install request.
@@ -203,7 +206,24 @@ mod tests {
         .expect("pre-batch request");
         assert!(matches!(
             request,
-            KernelRequest::InstallCapsule { batch: None, .. }
+            KernelRequest::InstallCapsule {
+                batch: None,
+                expected_generation: None,
+                ..
+            }
         ));
+    }
+
+    #[test]
+    fn batch_member_without_generation_decodes_as_none() {
+        let member: super::CapsuleInstallBatchMember = serde_json::from_value(serde_json::json!({
+            "id": "demo",
+            "version": "1.0.0",
+            "source_digest": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "archive_digest": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "source_bytes": 12
+        }))
+        .expect("pre-generation member");
+        assert_eq!(member.expected_generation, None);
     }
 }

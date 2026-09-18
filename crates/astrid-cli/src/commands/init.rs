@@ -15,19 +15,31 @@ use indicatif::{ProgressBar, ProgressStyle};
 use super::distro::lock::{DistroLock, DistroLockMeta, LockedCapsule, write_lock_to_daemon};
 #[cfg(test)]
 use super::distro::lock::{load_lock, manifest_hash, write_lock};
-use super::distro::manifest::DistroCapsule;
+use super::distro::manifest::{DistroCapsule, DistroManifest};
 use crate::theme::Theme;
+use astrid_core::kernel_api::{CapsuleInstallBatchId, InstalledCapsuleGeneration};
 
 #[path = "init_signed_source.rs"]
 mod signed_source;
 
-use signed_source::{PreparedDistro, prepare_distro_source, unpack_prepared};
+use signed_source::{PreparedDistro, SignedDistroBundle, prepare_distro_source, unpack_prepared};
+
+mod selected;
+#[cfg(test)]
+pub(crate) use selected::require_named_members_present;
+use selected::{filtered_refresh_requested, require_installed_named_members};
+pub(crate) use selected::{
+    reject_filtered_partial_refresh, reject_filtered_shuttle, require_named_generation,
+    select_named_manifest_capsules,
+};
 
 mod lifetime;
 pub(crate) use lifetime::ProvisioningLease;
 mod environment;
 pub(crate) use environment::write_env_files;
 mod onboarding;
+mod unfiltered;
+use unfiltered::{UnfilteredDistroInstall, finalize_unfiltered_distro_install};
 
 /// Options controlling the init / `distro apply` flow.
 ///
@@ -63,6 +75,11 @@ pub(crate) struct InitOpts {
     /// Require the signed self-contained Distro artifact used by product
     /// Apply. Ordinary `init` retains its legacy source support.
     pub(crate) require_signed: bool,
+    /// Named signed-manifest members to refresh. Empty means unfiltered
+    /// `select_capsules` / headless full-set selection. Distro apply
+    /// `--capsule` is the only public constructor; ordinary `init` leaves
+    /// this empty.
+    pub(crate) selected_capsules: Vec<String>,
 }
 
 pub(crate) use grant::apply_self_grant;
@@ -126,6 +143,7 @@ pub(crate) async fn run_init(
     };
 
     let daemon_lease = lifetime::retain_daemon().await?;
+    reject_filtered_shuttle(distro_source, &opts.selected_capsules)?;
 
     if opts.grant_capsules {
         grant::preflight_grants(&operator, &target).await?;
@@ -148,17 +166,8 @@ pub(crate) async fn run_init(
     // on an older CLI; fail fast with an actionable upgrade message instead.
     super::distro::validate::enforce_astrid_version(&manifest)?;
 
-    // Display distro info.
-    let display_name = manifest
-        .distro
-        .pretty_name
-        .as_deref()
-        .unwrap_or(&manifest.distro.name);
-    eprintln!("{}", Theme::header(&format!("Installing {display_name}")));
-    if let Some(ref desc) = manifest.distro.description {
-        eprintln!("  {desc}");
-    }
-    eprintln!();
+    let filtered = filtered_refresh_requested(&opts.selected_capsules);
+    announce_distro_install(&manifest, filtered);
 
     // Select providers (multi-select per group).
     // Extract fields we need before consuming capsules.
@@ -167,7 +176,18 @@ pub(crate) async fn run_init(
     let distro_version = manifest.distro.version;
     let schema_version = manifest.schema_version;
 
-    let selected = select_capsules(manifest.capsules, opts.yes)?;
+    // Named `--capsule` selection is resolved against the verified manifest
+    // and never falls back to headless full-distro selection.
+    let selected = if filtered {
+        select_named_manifest_capsules(&manifest.capsules, &opts.selected_capsules)?
+    } else {
+        select_capsules(manifest.capsules, opts.yes)?
+    };
+    let observed_generations = if filtered {
+        Some(require_installed_named_members(&selected).await?)
+    } else {
+        None
+    };
     let _capsule_staging;
     let selected = if let Some(bundle) = &signed_bundle {
         let staging = tempfile::tempdir().context("create signed capsule staging")?;
@@ -177,92 +197,95 @@ pub(crate) async fn run_init(
         _capsule_staging = Some(staging);
         resolved
     } else {
+        if filtered {
+            bail!("distro apply --capsule requires a signed Distro");
+        }
         _capsule_staging = None;
         selected
     };
 
-    // Collect variables needed by selected capsules.
-    let vars = collect_variables(&variables, &selected, opts.yes, &opts.vars)?;
+    if filtered {
+        let Some(observed) = observed_generations.as_ref() else {
+            bail!("filtered distro apply is missing observed installed generations");
+        };
+        return refresh_named_distro_members(
+            &selected,
+            opts,
+            &target,
+            signed_bundle.as_ref(),
+            daemon_lease,
+            observed,
+        )
+        .await;
+    }
 
-    // Write per-capsule env files BEFORE installing capsules so that
-    // install_capsule's onboarding check finds existing values and
-    // doesn't re-prompt for fields the distro already configured.
-    write_env_files(&home, &target, &selected, &variables, &vars)?;
+    finalize_unfiltered_distro_install(
+        UnfilteredDistroInstall {
+            home: &home,
+            operator,
+            target,
+            opts,
+            variables,
+            selected,
+            signed_bundle,
+            schema_version,
+            distro_id,
+            distro_version,
+            expected_manifest_hash,
+        },
+        daemon_lease,
+    )
+    .await
+}
 
-    // Install each capsule with progress. The helper returns one
-    // `LockedCapsule` per member that either installed or matched a complete
-    // durable package; failures are reported and dropped.
+/// Print the Distro Apply header before selection mutates the manifest.
+fn announce_distro_install(manifest: &DistroManifest, filtered: bool) {
+    let display_name = manifest
+        .distro
+        .pretty_name
+        .as_deref()
+        .unwrap_or(&manifest.distro.name);
+    eprintln!(
+        "{}",
+        Theme::header(&format!(
+            "{} {display_name}",
+            if filtered {
+                "Refreshing selected members of"
+            } else {
+                "Installing"
+            }
+        ))
+    );
+    if let Some(ref desc) = manifest.distro.description {
+        eprintln!("  {desc}");
+    }
+    eprintln!();
+}
+
+/// Refresh already-installed named members without rewriting env, lock, or grants.
+async fn refresh_named_distro_members(
+    selected: &[DistroCapsule],
+    opts: &InitOpts,
+    target: &astrid_core::PrincipalId,
+    signed_bundle: Option<&SignedDistroBundle>,
+    daemon_lease: ProvisioningLease,
+    observed: &HashMap<String, InstalledCapsuleGeneration>,
+) -> anyhow::Result<ProvisioningLease> {
     let total = selected.len();
     let install_result = install_capsules_with_resume(
-        &selected,
+        selected,
         opts.offline,
-        &target,
-        signed_bundle.as_ref().map(|bundle| &bundle.pinned_refs),
+        target,
+        signed_bundle.map(|bundle| &bundle.pinned_refs),
+        Some(observed),
     )
     .await?;
-    let locked = install_result.locked;
-    let newly_installed_names = install_result.newly_installed_names;
-    let succeeded = locked.len();
-
-    // Provisioning honesty: a run where every selected install FAILED must
-    // not claim success, must not persist a Distro.lock, and must exit
-    // non-zero. Writing a lock here would wedge recovery — the next `init`
-    // would otherwise see a version-matched lock and short-circuit. An empty
-    // selection (nothing to install) is not a
-    // failure.
+    let succeeded = install_result.locked.len();
     reject_total_install_failure(total, succeeded)?;
-
-    // Per-provider onboarding runs only on a FULL success — a partial run
-    // isn't finalized, and its re-run will onboard once it converges. For
-    // each selected llm-group capsule this runs its own `[env]` schema
-    // prompt so capsule-specific fields (api_key, base_url) and the dynamic
-    // `model` select resolve from the installed manifest — not just the
-    // shared free-text `[variables]`. Shared values already written above
-    // are preserved (the prompt skips set keys).
-    if should_write_lock(total, succeeded) {
-        onboarding::onboard_llm_providers(&home, &target, &selected).await;
-    }
-
-    // Persist Distro.lock iff the run earned it (full success or empty
-    // selection). A partial run deliberately writes NO lock so a re-run
-    // actually retries the missing capsules instead of short-circuiting on a
-    // stale member set — see `should_write_lock`.
-    // Plain resume has no grant side effect. An explicit grant request covers
-    // the complete verified set, including members completed in earlier batches.
-    let lock = create_lock_from_parts(
-        schema_version,
-        &distro_id,
-        &distro_version,
-        &expected_manifest_hash,
-        locked,
-    );
-    let wrote_lock = persist_lock_if_earned_daemon(&target, total, succeeded, &lock).await?;
-
+    reject_filtered_partial_refresh(total, succeeded)?;
     eprintln!();
-    if wrote_lock {
-        eprintln!("{}", Theme::success("Installation complete."));
-        // Apply capsule grants (opt-in) or print the discoverability hint.
-        // On a grant failure the capsules are already installed and the lock
-        // is written; this returns Err so init exits non-zero with the exact
-        // manual command to finish.
-        let grant_names = grant::completed_grant_names(
-            opts.grant_capsules,
-            &lock.capsules,
-            &newly_installed_names,
-        );
-        grant::apply_or_hint_grants(&operator, &target, &grant_names, opts.grant_capsules).await?;
-        eprintln!("  Run {} to start.", Theme::prompt("astrid"));
-        Ok(daemon_lease)
-    } else {
-        // Partial provision (0 < succeeded < total): no lock was written, so
-        // a re-run retries the rest. Exit NON-ZERO so automation and the
-        // in-conversation flow don't read a partial install as success —
-        // `astrid init` exits 0 IFF the distro is fully provisioned.
-        bail!(
-            "Installation incomplete: {succeeded}/{total} capsule(s) installed — \
-             re-run `astrid init` to retry the rest."
-        )
-    }
+    eprintln!("{}", Theme::success("Selected Distro members refreshed."));
+    Ok(daemon_lease)
 }
 
 /// Install a distro from a signed, self-contained `.shuttle` archive.
@@ -708,7 +731,7 @@ async fn install_capsules(
     pinned_refs: Option<&HashMap<String, String>>,
 ) -> anyhow::Result<Vec<LockedCapsule>> {
     Ok(
-        install_capsules_with_resume(selected, offline, principal, pinned_refs)
+        install_capsules_with_resume(selected, offline, principal, pinned_refs, None)
             .await?
             .locked,
     )
@@ -724,9 +747,11 @@ async fn install_capsules_with_resume(
     offline: bool,
     principal: &astrid_core::PrincipalId,
     pinned_refs: Option<&HashMap<String, String>>,
+    observed: Option<&HashMap<String, InstalledCapsuleGeneration>>,
 ) -> anyhow::Result<InstallCapsulesResult> {
     refuse_offline_network_sources(selected, offline)?;
-    let batch_id = super::capsule::install::begin_verified_local_batch(selected, principal).await?;
+    let batch_id =
+        super::capsule::install::begin_verified_local_batch(selected, principal, observed).await?;
     if batch_id.is_none() {
         super::capsule::install_daemon::reset_batch_install_budget();
     }
@@ -742,78 +767,31 @@ async fn install_capsules_with_resume(
     let mut locked = Vec::with_capacity(total);
     let mut newly_installed_names = Vec::new();
     let mut failed = Vec::new();
-    'capsules: for cap in selected {
+    for cap in selected {
         pb.set_message(cap.name.clone());
-
-        let expected = CapsuleId::new(cap.name.clone())?;
-        let mut pinned_capsule = cap.clone();
-        if let Some(resolved_ref) = pinned_refs.and_then(|refs| refs.get(&cap.name)) {
-            pinned_capsule
-                .tag
-                .get_or_insert_with(|| resolved_ref.clone());
-        }
-        let refspec = super::capsule::install::RefSpec::from_capsule(&pinned_capsule);
-        // The installer returns the ref it ACTUALLY resolved and fetched
-        // (`Some` for GitHub sources, `None` for local paths). Record
-        // that — never a guess derived from the manifest fields — so the
-        // lock attests what was truly installed. `Some(&cap.name)` is the
-        // name hint used to pick the right archive from a multi-asset
-        // release.
-        let outcome = loop {
-            match super::capsule::install::install_capsule_batch(
-                &cap.source,
-                &expected,
-                false,
-                &refspec,
-                principal,
-                batch_id,
-            )
+        match install_one_selected_capsule(cap, principal, pinned_refs, observed, batch_id, &pb)
             .await
-            {
-                Ok(outcome) => break outcome,
-                Err(e) if super::capsule::install_daemon::batch_install_budget_exhausted(&e) => {
-                    pb.suspend(|| {
-                        eprintln!(
-                            "\n  Capsule install safety budget reached; continuing in 61 seconds..."
-                        );
-                    });
-                    tokio::time::sleep(super::capsule::install_daemon::BATCH_INSTALL_WINDOW).await;
-                    super::capsule::install_daemon::reset_batch_install_budget();
-                },
-                Err(e) => {
-                    eprintln!("\n  Failed to install {}: {e}", cap.name);
-                    failed.push(cap.name.clone());
-                    pb.inc(1);
-                    continue 'capsules;
-                },
-            }
-        };
-        let expected_ref = pinned_refs.and_then(|refs| refs.get(&cap.name).map(String::as_str));
-        let verified = match validate_batch_install(&expected, &cap.version, expected_ref, outcome)
         {
-            Ok(verified) => verified,
-            Err(e) => {
-                eprintln!("\n  Failed to install {}: {e}", cap.name);
-                failed.push(cap.name.clone());
-                pb.inc(1);
-                continue;
+            Ok(verified) => {
+                locked.push(LockedCapsule {
+                    name: cap.name.clone(),
+                    version: verified.version,
+                    source: cap.source.clone(),
+                    hash: verified
+                        .wasm_hash
+                        .map(|h| format!("blake3:{h}"))
+                        .unwrap_or_default(),
+                    resolved_ref: verified.resolved_ref,
+                });
+                if !verified.skipped {
+                    newly_installed_names.push(cap.name.clone());
+                }
             },
-        };
-
-        locked.push(LockedCapsule {
-            name: cap.name.clone(),
-            version: verified.version,
-            source: cap.source.clone(),
-            hash: verified
-                .wasm_hash
-                .map(|h| format!("blake3:{h}"))
-                .unwrap_or_default(),
-            resolved_ref: verified.resolved_ref,
-        });
-        if !verified.skipped {
-            newly_installed_names.push(cap.name.clone());
+            Err(error) => {
+                eprintln!("\n  Failed to install {}: {error}", cap.name);
+                failed.push(cap.name.clone());
+            },
         }
-
         pb.inc(1);
     }
 
@@ -838,6 +816,57 @@ async fn install_capsules_with_resume(
         locked,
         newly_installed_names,
     })
+}
+
+async fn install_one_selected_capsule(
+    cap: &DistroCapsule,
+    principal: &astrid_core::PrincipalId,
+    pinned_refs: Option<&HashMap<String, String>>,
+    observed: Option<&HashMap<String, InstalledCapsuleGeneration>>,
+    batch_id: Option<CapsuleInstallBatchId>,
+    pb: &ProgressBar,
+) -> anyhow::Result<VerifiedBatchInstall> {
+    let expected = CapsuleId::new(cap.name.clone())?;
+    let mut pinned_capsule = cap.clone();
+    if let Some(resolved_ref) = pinned_refs.and_then(|refs| refs.get(&cap.name)) {
+        pinned_capsule
+            .tag
+            .get_or_insert_with(|| resolved_ref.clone());
+    }
+    let refspec = super::capsule::install::RefSpec::from_capsule(&pinned_capsule);
+    // The installer returns the ref it ACTUALLY resolved and fetched
+    // (`Some` for GitHub sources, `None` for local paths). Record
+    // that — never a guess derived from the manifest fields — so the
+    // lock attests what was truly installed.
+    let outcome = loop {
+        match super::capsule::install::install_capsule_batch(
+            &cap.source,
+            &expected,
+            false,
+            &refspec,
+            principal,
+            batch_id,
+            require_named_generation(&cap.name, observed)?,
+        )
+        .await
+        {
+            Ok(outcome) => break outcome,
+            Err(error)
+                if super::capsule::install_daemon::batch_install_budget_exhausted(&error) =>
+            {
+                pb.suspend(|| {
+                    eprintln!(
+                        "\n  Capsule install safety budget reached; continuing in 61 seconds..."
+                    );
+                });
+                tokio::time::sleep(super::capsule::install_daemon::BATCH_INSTALL_WINDOW).await;
+                super::capsule::install_daemon::reset_batch_install_budget();
+            },
+            Err(error) => return Err(error),
+        }
+    };
+    let expected_ref = pinned_refs.and_then(|refs| refs.get(&cap.name).map(String::as_str));
+    validate_batch_install(&expected, &cap.version, expected_ref, outcome)
 }
 
 #[derive(Debug)]

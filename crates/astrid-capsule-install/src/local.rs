@@ -143,6 +143,8 @@ pub struct InstallOptions {
     pub provenance_distro: Option<String>,
     /// Canonical source-artifact digest copied into durable metadata.
     pub provenance_source_digest: Option<String>,
+    /// Observed package generation; filtered refresh fail-closes on mismatch.
+    pub expected_package_generation: Option<astrid_storage::CapsulePackageGeneration>,
 }
 
 /// What an install produced.
@@ -856,6 +858,7 @@ pub(crate) fn install_from_local_path_internal(
             &target_dir,
             &meta,
             &installed_authority,
+            options.expected_package_generation,
         )
     {
         rollback(&target_dir, backup_dir.as_deref());
