@@ -1392,7 +1392,8 @@ impl Kernel {
             astrid_home: home,
             admin_write_lock: Mutex::new(()),
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-            materialization_repair_locks: Default::default(),
+            materialization_repair_locks:
+                capsule_materialization::MaterializationRepairLocks::default(),
         });
 
         if !local_egress.is_empty() {
@@ -3843,7 +3844,8 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         astrid_home: home,
         admin_write_lock: Mutex::new(()),
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        materialization_repair_locks: Default::default(),
+        materialization_repair_locks: capsule_materialization::MaterializationRepairLocks::default(
+        ),
     });
     #[cfg(not(target_family = "wasm"))]
     let _ = kernel.process_storage_mount_broker.set(Arc::new(
