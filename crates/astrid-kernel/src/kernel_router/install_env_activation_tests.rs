@@ -107,6 +107,7 @@ async fn install_applies_complete_env_before_one_activation() {
             provenance: None,
             authority: CapsuleInstallAuthority::Automatic,
             env: &env,
+            expected_generation: None,
             batch_member: None,
         },
     )
@@ -220,6 +221,7 @@ async fn failed_unsigned_install_rolls_back_staged_env_without_activation() {
             provenance: None,
             authority: CapsuleInstallAuthority::Automatic,
             env: &env,
+            expected_generation: None,
             batch_member: None,
         },
     )
