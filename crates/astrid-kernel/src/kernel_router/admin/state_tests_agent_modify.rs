@@ -664,3 +664,75 @@ async fn env_set_unloaded_capsule_accepts_sequential_writes() {
     .await;
     assert_success(&second);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_modify_projects_added_capsule_before_return() {
+    // #1972: after adding a published capsule, HTTP inventory must see
+    // Capsule.toml immediately. Do not call discovery helpers that
+    // lazily project, or the old race would still pass.
+    let (_dir, kernel) = fixture().await;
+    let capsule = "modify-visible";
+    publish_env_capsule(&kernel, capsule);
+
+    let principal = pid("modify-visible-agent");
+    let created = super::test_support::dispatch_as_operator(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentCreate {
+            name: principal.to_string(),
+            groups: vec![BUILTIN_AGENT.into()],
+            grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
+        },
+    )
+    .await;
+    assert_success(&created);
+
+    let assigned = handlers::dispatch(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentModify {
+            principal: principal.clone(),
+            add_groups: Vec::new(),
+            remove_groups: Vec::new(),
+            add_capsules: vec![capsule.into()],
+            remove_capsules: Vec::new(),
+        },
+    )
+    .await;
+    assert_success(&assigned);
+
+    let uid = kernel.principal_directory.uid_for(&principal).unwrap();
+    let snapshot = kernel
+        .principal_store
+        .as_ref()
+        .expect("principal store")
+        .capsules()
+        .get_snapshot(&astrid_storage::StateOwner::Principal(uid), capsule)
+        .unwrap()
+        .expect("copied snapshot");
+    let digest = blake3::hash(&snapshot.package().archive)
+        .to_hex()
+        .to_string();
+    let target = astrid_capsule_install::resolve_cache_target_dir(
+        &kernel.astrid_home,
+        uid,
+        capsule,
+        &digest,
+        false,
+        None,
+        kernel.workspace_layout(),
+    )
+    .expect("cache target");
+    let manifest_path = target.join("Capsule.toml");
+    assert!(
+        manifest_path.is_file(),
+        "agent.modify must project added capsules before returning; missing {}",
+        manifest_path.display()
+    );
+    let manifest =
+        astrid_capsule::discovery::load_manifest(&manifest_path).expect("load projected manifest");
+    assert_eq!(manifest.package.name, capsule);
+}

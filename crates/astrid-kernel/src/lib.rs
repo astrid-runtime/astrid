@@ -449,6 +449,13 @@ pub struct Kernel {
     /// cover reads. Tokio's `Mutex` is not poisonable — no
     /// `PoisonError::into_inner` dance required.
     pub(crate) admin_write_lock: Mutex<()>,
+    /// Serializes canonical projection repair for one owner/capsule/digest.
+    ///
+    /// Inventory, warmup, and `agent.modify` all repair through
+    /// [`Kernel::repair_published_materialization`]. This lock is the
+    /// common boundary those callers share; `admin_write_lock` does not.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    pub(crate) materialization_repair_locks: capsule_materialization::MaterializationRepairLocks,
 }
 
 /// Host resources injected into [`Kernel::with_resources`].
@@ -1384,6 +1391,9 @@ impl Kernel {
             groups,
             astrid_home: home,
             admin_write_lock: Mutex::new(()),
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            materialization_repair_locks:
+                capsule_materialization::MaterializationRepairLocks::default(),
         });
 
         if !local_egress.is_empty() {
@@ -3833,6 +3843,9 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         groups,
         astrid_home: home,
         admin_write_lock: Mutex::new(()),
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        materialization_repair_locks: capsule_materialization::MaterializationRepairLocks::default(
+        ),
     });
     #[cfg(not(target_family = "wasm"))]
     let _ = kernel.process_storage_mount_broker.set(Arc::new(
