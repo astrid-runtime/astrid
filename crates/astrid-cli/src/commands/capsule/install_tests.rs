@@ -76,12 +76,6 @@ fn manual_install_vars_reject_malformed_or_duplicate_keys() {
     );
 }
 
-#[test]
-fn daemon_owned_installs_do_not_repeat_live_activation() {
-    assert!(should_nudge_daemon_reload(true));
-    assert!(!should_nudge_daemon_reload(false));
-}
-
 // Source-string parsing (`strip_version_prefix`, `extract_github_org_repo`,
 // `parse_github_source`) now lives in `astrid_capsule_install::github_source`
 // and is tested there. Only the CLI-local `@version` suffix splitter stays

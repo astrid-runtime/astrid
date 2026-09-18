@@ -190,14 +190,10 @@ pub(crate) async fn install_capsule_with_options(
     // installed capsule has been activated. Nudging those ids again would
     // immediately hot-swap a just-created runtime and run its #[astrid::run]
     // loop twice (and used to replay it once per env field before #1976).
-    if should_nudge_daemon_reload(workspace) {
+    if workspace {
         super::live_load::nudge_daemon_reload(&installed_ids).await;
     }
     Ok(())
-}
-
-fn should_nudge_daemon_reload(workspace: bool) -> bool {
-    workspace
 }
 
 /// Install dispatch shared by the CLI and distro-batch paths.
