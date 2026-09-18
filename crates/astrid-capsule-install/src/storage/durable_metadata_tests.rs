@@ -189,3 +189,74 @@ fn archive_entries_enumerate_every_verified_member_with_exact_bytes() {
             .collect()
     );
 }
+
+#[test]
+fn expected_generation_cas_fail_closes_after_remove() {
+    let source = tempdir().unwrap();
+    fs::write(
+        source.path().join("Capsule.toml"),
+        b"[package]\nname='demo'\nversion='1.0.0'\n",
+    )
+    .unwrap();
+    let home_dir = tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(home_dir.path());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let store = runtime
+        .block_on(async {
+            astrid_storage::open_runtime_principal_store(
+                &home,
+                std::sync::Arc::new(|_: &StateOwner| Ok(None)),
+            )
+            .await
+        })
+        .unwrap();
+    let archive = canonical_capsule_archive(source.path()).unwrap();
+    let verification = artifact::verify_archive_bytes(&archive).unwrap();
+    let manifest_bytes = fs::read(source.path().join("Capsule.toml")).unwrap();
+    let manifest: CapsuleManifest =
+        toml::from_str(std::str::from_utf8(&manifest_bytes).unwrap()).unwrap();
+    let authority = InstalledAuthority {
+        schema_version: 1,
+        source: AuthoritySource::ExplicitApproval,
+        capsule_id: "demo".to_owned(),
+        version: "1.0.0".to_owned(),
+        content_digest: verification.content_digest().to_owned(),
+        manifest_digest: crate::authority::digest_manifest(&manifest_bytes),
+        signer: None,
+        signature: None,
+        approved_capabilities: manifest.capabilities,
+        wasm_hash_pinned: false,
+        approved_wasm_hash: None,
+    };
+    let package = CapsulePackage::new(
+        archive,
+        br#"{"version":"1.0.0","installed_at":"","updated_at":""}"#.to_vec(),
+        serde_json::to_vec(&authority).unwrap(),
+    );
+    let store = std::sync::Arc::new(store);
+    let uid = astrid_core::identity::PrincipalUid::from_bytes([7_u8; 32]);
+    let owner = StateOwner::Principal(uid);
+    publish_package_with_expected_generation(&store, uid, "demo", &package, None)
+        .expect("unconstrained absent install");
+    let generation = store
+        .capsules()
+        .get_snapshot(&owner, "demo")
+        .unwrap()
+        .expect("published snapshot")
+        .generation();
+    assert!(store.capsules().remove(&owner, "demo").unwrap());
+    let error =
+        publish_package_with_expected_generation(&store, uid, "demo", &package, Some(generation))
+            .expect_err("stale generation after remove");
+    assert!(
+        error
+            .to_string()
+            .contains("capsule package conflict for demo"),
+        "{error}"
+    );
+    publish_package_with_expected_generation(&store, uid, "demo", &package, None)
+        .expect("unconstrained reinstall after remove");
+}

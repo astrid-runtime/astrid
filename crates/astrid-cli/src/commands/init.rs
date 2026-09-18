@@ -17,6 +17,7 @@ use super::distro::lock::{DistroLock, DistroLockMeta, LockedCapsule, write_lock_
 use super::distro::lock::{load_lock, manifest_hash, write_lock};
 use super::distro::manifest::{DistroCapsule, DistroManifest};
 use crate::theme::Theme;
+use astrid_core::kernel_api::{CapsuleInstallBatchId, InstalledCapsuleGeneration};
 
 #[path = "init_signed_source.rs"]
 mod signed_source;
@@ -28,7 +29,8 @@ mod selected;
 pub(crate) use selected::require_named_members_present;
 use selected::{filtered_refresh_requested, require_installed_named_members};
 pub(crate) use selected::{
-    reject_filtered_partial_refresh, reject_filtered_shuttle, select_named_manifest_capsules,
+    reject_filtered_partial_refresh, reject_filtered_shuttle, require_named_generation,
+    select_named_manifest_capsules,
 };
 
 mod lifetime;
@@ -181,9 +183,11 @@ pub(crate) async fn run_init(
     } else {
         select_capsules(manifest.capsules, opts.yes)?
     };
-    if filtered {
-        require_installed_named_members(&selected).await?;
-    }
+    let observed_generations = if filtered {
+        Some(require_installed_named_members(&selected).await?)
+    } else {
+        None
+    };
     let _capsule_staging;
     let selected = if let Some(bundle) = &signed_bundle {
         let staging = tempfile::tempdir().context("create signed capsule staging")?;
@@ -201,12 +205,16 @@ pub(crate) async fn run_init(
     };
 
     if filtered {
+        let Some(observed) = observed_generations.as_ref() else {
+            bail!("filtered distro apply is missing observed installed generations");
+        };
         return refresh_named_distro_members(
             &selected,
             opts,
             &target,
             signed_bundle.as_ref(),
             daemon_lease,
+            observed,
         )
         .await;
     }
@@ -261,6 +269,7 @@ async fn refresh_named_distro_members(
     target: &astrid_core::PrincipalId,
     signed_bundle: Option<&SignedDistroBundle>,
     daemon_lease: ProvisioningLease,
+    observed: &HashMap<String, InstalledCapsuleGeneration>,
 ) -> anyhow::Result<ProvisioningLease> {
     let total = selected.len();
     let install_result = install_capsules_with_resume(
@@ -268,6 +277,7 @@ async fn refresh_named_distro_members(
         opts.offline,
         target,
         signed_bundle.map(|bundle| &bundle.pinned_refs),
+        Some(observed),
     )
     .await?;
     let succeeded = install_result.locked.len();
@@ -721,7 +731,7 @@ async fn install_capsules(
     pinned_refs: Option<&HashMap<String, String>>,
 ) -> anyhow::Result<Vec<LockedCapsule>> {
     Ok(
-        install_capsules_with_resume(selected, offline, principal, pinned_refs)
+        install_capsules_with_resume(selected, offline, principal, pinned_refs, None)
             .await?
             .locked,
     )
@@ -737,9 +747,11 @@ async fn install_capsules_with_resume(
     offline: bool,
     principal: &astrid_core::PrincipalId,
     pinned_refs: Option<&HashMap<String, String>>,
+    observed: Option<&HashMap<String, InstalledCapsuleGeneration>>,
 ) -> anyhow::Result<InstallCapsulesResult> {
     refuse_offline_network_sources(selected, offline)?;
-    let batch_id = super::capsule::install::begin_verified_local_batch(selected, principal).await?;
+    let batch_id =
+        super::capsule::install::begin_verified_local_batch(selected, principal, observed).await?;
     if batch_id.is_none() {
         super::capsule::install_daemon::reset_batch_install_budget();
     }
@@ -755,78 +767,31 @@ async fn install_capsules_with_resume(
     let mut locked = Vec::with_capacity(total);
     let mut newly_installed_names = Vec::new();
     let mut failed = Vec::new();
-    'capsules: for cap in selected {
+    for cap in selected {
         pb.set_message(cap.name.clone());
-
-        let expected = CapsuleId::new(cap.name.clone())?;
-        let mut pinned_capsule = cap.clone();
-        if let Some(resolved_ref) = pinned_refs.and_then(|refs| refs.get(&cap.name)) {
-            pinned_capsule
-                .tag
-                .get_or_insert_with(|| resolved_ref.clone());
-        }
-        let refspec = super::capsule::install::RefSpec::from_capsule(&pinned_capsule);
-        // The installer returns the ref it ACTUALLY resolved and fetched
-        // (`Some` for GitHub sources, `None` for local paths). Record
-        // that — never a guess derived from the manifest fields — so the
-        // lock attests what was truly installed. `Some(&cap.name)` is the
-        // name hint used to pick the right archive from a multi-asset
-        // release.
-        let outcome = loop {
-            match super::capsule::install::install_capsule_batch(
-                &cap.source,
-                &expected,
-                false,
-                &refspec,
-                principal,
-                batch_id,
-            )
+        match install_one_selected_capsule(cap, principal, pinned_refs, observed, batch_id, &pb)
             .await
-            {
-                Ok(outcome) => break outcome,
-                Err(e) if super::capsule::install_daemon::batch_install_budget_exhausted(&e) => {
-                    pb.suspend(|| {
-                        eprintln!(
-                            "\n  Capsule install safety budget reached; continuing in 61 seconds..."
-                        );
-                    });
-                    tokio::time::sleep(super::capsule::install_daemon::BATCH_INSTALL_WINDOW).await;
-                    super::capsule::install_daemon::reset_batch_install_budget();
-                },
-                Err(e) => {
-                    eprintln!("\n  Failed to install {}: {e}", cap.name);
-                    failed.push(cap.name.clone());
-                    pb.inc(1);
-                    continue 'capsules;
-                },
-            }
-        };
-        let expected_ref = pinned_refs.and_then(|refs| refs.get(&cap.name).map(String::as_str));
-        let verified = match validate_batch_install(&expected, &cap.version, expected_ref, outcome)
         {
-            Ok(verified) => verified,
-            Err(e) => {
-                eprintln!("\n  Failed to install {}: {e}", cap.name);
-                failed.push(cap.name.clone());
-                pb.inc(1);
-                continue;
+            Ok(verified) => {
+                locked.push(LockedCapsule {
+                    name: cap.name.clone(),
+                    version: verified.version,
+                    source: cap.source.clone(),
+                    hash: verified
+                        .wasm_hash
+                        .map(|h| format!("blake3:{h}"))
+                        .unwrap_or_default(),
+                    resolved_ref: verified.resolved_ref,
+                });
+                if !verified.skipped {
+                    newly_installed_names.push(cap.name.clone());
+                }
             },
-        };
-
-        locked.push(LockedCapsule {
-            name: cap.name.clone(),
-            version: verified.version,
-            source: cap.source.clone(),
-            hash: verified
-                .wasm_hash
-                .map(|h| format!("blake3:{h}"))
-                .unwrap_or_default(),
-            resolved_ref: verified.resolved_ref,
-        });
-        if !verified.skipped {
-            newly_installed_names.push(cap.name.clone());
+            Err(error) => {
+                eprintln!("\n  Failed to install {}: {error}", cap.name);
+                failed.push(cap.name.clone());
+            },
         }
-
         pb.inc(1);
     }
 
@@ -851,6 +816,57 @@ async fn install_capsules_with_resume(
         locked,
         newly_installed_names,
     })
+}
+
+async fn install_one_selected_capsule(
+    cap: &DistroCapsule,
+    principal: &astrid_core::PrincipalId,
+    pinned_refs: Option<&HashMap<String, String>>,
+    observed: Option<&HashMap<String, InstalledCapsuleGeneration>>,
+    batch_id: Option<CapsuleInstallBatchId>,
+    pb: &ProgressBar,
+) -> anyhow::Result<VerifiedBatchInstall> {
+    let expected = CapsuleId::new(cap.name.clone())?;
+    let mut pinned_capsule = cap.clone();
+    if let Some(resolved_ref) = pinned_refs.and_then(|refs| refs.get(&cap.name)) {
+        pinned_capsule
+            .tag
+            .get_or_insert_with(|| resolved_ref.clone());
+    }
+    let refspec = super::capsule::install::RefSpec::from_capsule(&pinned_capsule);
+    // The installer returns the ref it ACTUALLY resolved and fetched
+    // (`Some` for GitHub sources, `None` for local paths). Record
+    // that — never a guess derived from the manifest fields — so the
+    // lock attests what was truly installed.
+    let outcome = loop {
+        match super::capsule::install::install_capsule_batch(
+            &cap.source,
+            &expected,
+            false,
+            &refspec,
+            principal,
+            batch_id,
+            require_named_generation(&cap.name, observed)?,
+        )
+        .await
+        {
+            Ok(outcome) => break outcome,
+            Err(error)
+                if super::capsule::install_daemon::batch_install_budget_exhausted(&error) =>
+            {
+                pb.suspend(|| {
+                    eprintln!(
+                        "\n  Capsule install safety budget reached; continuing in 61 seconds..."
+                    );
+                });
+                tokio::time::sleep(super::capsule::install_daemon::BATCH_INSTALL_WINDOW).await;
+                super::capsule::install_daemon::reset_batch_install_budget();
+            },
+            Err(error) => return Err(error),
+        }
+    };
+    let expected_ref = pinned_refs.and_then(|refs| refs.get(&cap.name).map(String::as_str));
+    validate_batch_install(&expected, &cap.version, expected_ref, outcome)
 }
 
 #[derive(Debug)]

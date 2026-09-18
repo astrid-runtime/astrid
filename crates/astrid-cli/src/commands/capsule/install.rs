@@ -19,7 +19,9 @@ use astrid_capsule_install::{
     inspect_directory_for_principal_with_layout, resolve_target_dir_for_with_layout,
 };
 use astrid_core::dirs::AstridHome;
-use astrid_core::kernel_api::{CapsuleInstallBatchContext, CapsuleInstallBatchId};
+use astrid_core::kernel_api::{
+    CapsuleInstallBatchContext, CapsuleInstallBatchId, InstalledCapsuleGeneration,
+};
 
 use super::install_finish::{finish_install, run_with_elicit};
 
@@ -43,6 +45,7 @@ struct ExpectedCapsule<'a> {
 pub(super) struct ExpectedInstall<'a> {
     pub(super) id: &'a CapsuleId,
     pub(super) batch_id: Option<CapsuleInstallBatchId>,
+    pub(super) expected_generation: Option<&'a InstalledCapsuleGeneration>,
 }
 
 #[derive(Clone, Copy)]
@@ -56,6 +59,7 @@ struct InstallContext<'a> {
     expected: Option<ExpectedCapsule<'a>>,
     prompt: &'a ManualInstallOptions,
     batch_id: Option<CapsuleInstallBatchId>,
+    expected_generation: Option<&'a InstalledCapsuleGeneration>,
 }
 
 fn batch_context(
@@ -217,6 +221,7 @@ pub(super) async fn install_capsule_inner(
         version: version.as_deref(),
     });
     let batch_id = expected_install.and_then(|install| install.batch_id);
+    let expected_generation = expected_install.and_then(|install| install.expected_generation);
     let context = InstallContext {
         workspace,
         daemon: !workspace,
@@ -226,6 +231,7 @@ pub(super) async fn install_capsule_inner(
         expected,
         prompt,
         batch_id,
+        expected_generation,
     };
 
     // 1. Explicit local path — record the path as the source so a
@@ -485,6 +491,7 @@ async fn download_and_unpack(
                 context.principal,
                 context.prompt,
             )?,
+            context.expected_generation,
             batch_context(context.batch_id, context.expected),
         )
         .await;
@@ -614,6 +621,7 @@ async fn clone_and_build(
                     context.principal,
                     context.prompt,
                 )?,
+                context.expected_generation,
                 batch_context(context.batch_id, context.expected),
             )
             .await;
@@ -632,6 +640,22 @@ async fn clone_and_build(
     bail!("astrid-build produced no .capsule archive.");
 }
 
+async fn install_archive_via_daemon(
+    source: &str,
+    context: InstallContext<'_>,
+) -> anyhow::Result<Vec<InstalledCapsuleOutcome>> {
+    let installed = super::install_daemon::install_local_via_daemon_outcome(
+        source,
+        context.prompt,
+        context.principal,
+        daemon_install_authority(source, context.principal, context.prompt)?,
+        context.expected_generation,
+        batch_context(context.batch_id, context.expected),
+    )
+    .await?;
+    Ok(vec![installed])
+}
+
 async fn install_from_local(
     source: &str,
     context: InstallContext<'_>,
@@ -644,15 +668,7 @@ async fn install_from_local(
     // Unpack `.capsule` archive when source is a file.
     if source_path.is_file() && source.ends_with(".capsule") {
         if context.daemon {
-            let installed = super::install_daemon::install_local_via_daemon_outcome(
-                source,
-                context.prompt,
-                context.principal,
-                daemon_install_authority(source, context.principal, context.prompt)?,
-                batch_context(context.batch_id, context.expected),
-            )
-            .await?;
-            return Ok(vec![installed]);
+            return install_archive_via_daemon(source, context).await;
         }
         return unpack_via_lib(
             source_path,
@@ -691,19 +707,12 @@ async fn install_from_local(
             let entry = entry?;
             if entry.path().extension().and_then(|s| s.to_str()) == Some("capsule") {
                 if context.daemon {
-                    let archive = entry.path();
-                    let archive = archive
+                    let archive = entry
+                        .path()
                         .to_str()
-                        .context("built capsule archive path is not UTF-8")?;
-                    let installed = super::install_daemon::install_local_via_daemon_outcome(
-                        archive,
-                        context.prompt,
-                        context.principal,
-                        daemon_install_authority(archive, context.principal, context.prompt)?,
-                        batch_context(context.batch_id, context.expected),
-                    )
-                    .await?;
-                    return Ok(vec![installed]);
+                        .context("built capsule archive path is not UTF-8")?
+                        .to_owned();
+                    return install_archive_via_daemon(&archive, context).await;
                 }
                 return unpack_via_lib(
                     &entry.path(),
@@ -721,15 +730,7 @@ async fn install_from_local(
     }
 
     if context.daemon {
-        let installed = super::install_daemon::install_local_via_daemon_outcome(
-            source,
-            context.prompt,
-            context.principal,
-            daemon_install_authority(source, context.principal, context.prompt)?,
-            batch_context(context.batch_id, context.expected),
-        )
-        .await?;
-        return Ok(vec![installed]);
+        return install_archive_via_daemon(source, context).await;
     }
 
     install_from_local_path_for_principal(
@@ -799,6 +800,7 @@ fn install_from_local_path_for_principal(
         storage: None,
         provenance_distro: None,
         provenance_source_digest: None,
+        expected_package_generation: None,
     };
     let output = run_with_elicit(opts, prompt, |opts, bus| {
         let opts = InstallOptions {
@@ -912,6 +914,7 @@ fn unpack_via_lib(
         storage: None,
         provenance_distro: None,
         provenance_source_digest: None,
+        expected_package_generation: None,
     };
     let output = run_with_elicit(opts, prompt, |opts, bus| {
         let opts = InstallOptions {

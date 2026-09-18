@@ -225,6 +225,7 @@ fn rate_limit_for_request_returns_correct_limits() {
         provenance: None,
         authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
         env: Vec::new(),
+        expected_generation: None,
         batch: None,
     });
     assert_eq!(install, Some(10), "ordinary installs retain their limit");
@@ -282,6 +283,7 @@ fn required_capability_mapping_per_variant_self_scope() {
                 provenance: None,
                 authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
                 env: Vec::new(),
+                expected_generation: None,
                 batch: None,
             },
             AuthorityScope::Self_
@@ -371,6 +373,7 @@ fn required_capability_mapping_global_scope() {
                 provenance: None,
                 authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
                 env: Vec::new(),
+                expected_generation: None,
                 batch: None,
             },
             AuthorityScope::Global
@@ -427,6 +430,7 @@ fn resolve_scope_requires_global_authority_only_for_cross_principal_install() {
         provenance: None,
         authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
         env: Vec::new(),
+        expected_generation: None,
         batch: None,
     };
     assert_eq!(resolve_scope(&self_install, &caller), AuthorityScope::Self_);
@@ -437,6 +441,7 @@ fn resolve_scope_requires_global_authority_only_for_cross_principal_install() {
         provenance: None,
         authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
         env: Vec::new(),
+        expected_generation: None,
         batch: None,
     };
     assert_eq!(
@@ -535,6 +540,7 @@ fn resolve_scope_treats_workspace_capsule_install_as_self() {
                 provenance: None,
                 authority: astrid_core::kernel_api::CapsuleInstallAuthority::default(),
                 env: Vec::new(),
+                expected_generation: None,
                 batch: None,
             },
             &caller,

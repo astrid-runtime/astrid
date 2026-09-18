@@ -1,11 +1,13 @@
 //! Distro-batch capsule installation contract.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
 use astrid_capsule::capsule::CapsuleId;
 use astrid_core::kernel_api::{
-    CapsuleInstallBatchId, CapsuleInstallBatchMember, KernelRequest, KernelResponse,
+    CapsuleInstallBatchId, CapsuleInstallBatchMember, InstalledCapsuleGeneration, KernelRequest,
+    KernelResponse,
 };
 
 /// Concrete git selector for a distro capsule install.
@@ -53,6 +55,7 @@ pub(crate) async fn install_capsule_batch(
     refspec: &RefSpec,
     principal: &astrid_core::PrincipalId,
     batch_id: Option<CapsuleInstallBatchId>,
+    expected_generation: Option<InstalledCapsuleGeneration>,
 ) -> anyhow::Result<BatchInstallOutcome> {
     anyhow::ensure!(
         refspec.version.is_some() || refspec.tag.is_some(),
@@ -70,6 +73,7 @@ pub(crate) async fn install_capsule_batch(
         Some(super::install::ExpectedInstall {
             id: expected,
             batch_id,
+            expected_generation: expected_generation.as_ref(),
         }),
     )
     .await;
@@ -86,6 +90,7 @@ pub(crate) async fn install_capsule_batch(
 pub(crate) async fn begin_verified_local_batch(
     selected: &[super::super::distro::manifest::DistroCapsule],
     principal: &astrid_core::PrincipalId,
+    observed: Option<&HashMap<String, InstalledCapsuleGeneration>>,
 ) -> anyhow::Result<Option<CapsuleInstallBatchId>> {
     if selected.is_empty() {
         return Ok(None);
@@ -102,7 +107,7 @@ pub(crate) async fn begin_verified_local_batch(
     let KernelResponse::Status(status) = client.request(KernelRequest::GetStatus).await? else {
         return Ok(None);
     };
-    let Some(members) = batch_members_for_status(&status, selected)? else {
+    let Some(members) = batch_members_for_status(&status, selected, observed)? else {
         return Ok(None);
     };
     match client
@@ -123,12 +128,22 @@ pub(crate) async fn begin_verified_local_batch(
 fn batch_members_for_status(
     status: &astrid_core::kernel_api::DaemonStatus,
     selected: &[super::super::distro::manifest::DistroCapsule],
+    observed: Option<&HashMap<String, InstalledCapsuleGeneration>>,
 ) -> anyhow::Result<Option<Vec<CapsuleInstallBatchMember>>> {
     if !supports_install_batch(status) {
         return Ok(None);
     }
     let mut members = Vec::with_capacity(selected.len());
     for capsule in selected {
+        let expected_generation = match observed {
+            Some(map) => Some(map.get(&capsule.name).cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "distro apply --capsule '{}' is missing an observed installed generation",
+                    capsule.name
+                )
+            })?),
+            None => None,
+        };
         let source = Path::new(&capsule.source);
         let source_bytes = source.metadata()?.len();
         let manifest = astrid_capsule_install::read_archive_manifest(source)?;
@@ -151,6 +166,7 @@ fn batch_members_for_status(
                 astrid_capsule_install::archive_digest_for_source(source)?
             ),
             source_bytes,
+            expected_generation,
         });
     }
     Ok(Some(members))
@@ -238,9 +254,44 @@ mod tests {
         }];
 
         assert!(
-            batch_members_for_status(&status("legacy"), &selected)
+            batch_members_for_status(&status("legacy"), &selected, None)
                 .expect("unsupported daemon fallback")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn filtered_batch_fail_closes_on_missing_observed_generation() {
+        let mut status = status("with-protocol");
+        status.capsule_install_batch_protocol =
+            Some(astrid_core::kernel_api::CAPSULE_INSTALL_BATCH_PROTOCOL_V1);
+        let selected = [super::super::super::distro::manifest::DistroCapsule {
+            name: "missing".to_owned(),
+            source: "unused.capsule".to_owned(),
+            version: "1.0.0".to_owned(),
+            tag: None,
+            branch: None,
+            rev: None,
+            default: false,
+            group: None,
+            role: None,
+            env: std::collections::HashMap::new(),
+        }];
+        let observed = HashMap::from([(
+            "other".to_owned(),
+            InstalledCapsuleGeneration {
+                archive: "aa".repeat(32),
+                metadata: "bb".repeat(32),
+                authority: "cc".repeat(32),
+            },
+        )]);
+        let error = batch_members_for_status(&status, &selected, Some(&observed))
+            .expect_err("missing generation");
+        assert!(
+            error
+                .to_string()
+                .contains("missing an observed installed generation"),
+            "{error}"
         );
     }
 }

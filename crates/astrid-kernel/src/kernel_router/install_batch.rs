@@ -401,6 +401,14 @@ fn validate_member(member: &CapsuleInstallBatchMember) -> Result<(), String> {
             member.id
         ));
     }
+    if let Some(generation) = &member.expected_generation {
+        super::install_generation::parse_installed_generation(generation).map_err(|error| {
+            format!(
+                "invalid capsule install batch member '{}': {error}",
+                member.id
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -480,6 +488,7 @@ mod tests {
             source_digest: format!("blake3:{}", "a".repeat(64)),
             archive_digest: format!("blake3:{}", "b".repeat(64)),
             source_bytes: bytes,
+            expected_generation: None,
         }
     }
 

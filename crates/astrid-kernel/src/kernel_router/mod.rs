@@ -9,6 +9,9 @@ mod device_scope;
 mod install;
 mod install_batch;
 mod install_batch_archive;
+mod install_generation;
+#[cfg(test)]
+mod install_generation_cas_tests;
 mod installed_identity;
 mod inventory;
 mod projection_names;
@@ -371,6 +374,7 @@ async fn handle_request(
             provenance,
             authority,
             env,
+            expected_generation,
             batch,
         } => {
             info!(
@@ -402,6 +406,7 @@ async fn handle_request(
                         provenance: provenance.as_ref(),
                         authority,
                         env: &env,
+                        expected_generation: expected_generation.as_ref(),
                         batch_member: batch_reservation
                             .as_ref()
                             .map(install_batch::InstallBatchReservation::member),

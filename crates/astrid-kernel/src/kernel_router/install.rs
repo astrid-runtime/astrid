@@ -32,7 +32,7 @@ use astrid_capsule_install::{
 };
 use astrid_core::kernel_api::{
     CapsuleInstallAuthority, CapsuleInstallBatchMember, CapsuleInstallEnv,
-    CapsuleInstallProvenance, EnvStorageScope, EnvValueKind,
+    CapsuleInstallProvenance, EnvStorageScope, EnvValueKind, InstalledCapsuleGeneration,
 };
 use astrid_events::kernel_api::KernelResponse;
 use astrid_storage::{KvBatchCondition, KvBatchMutation, KvEntryKey, KvMutationBatch};
@@ -70,6 +70,7 @@ pub(super) struct InstallCapsuleRequest<'a> {
     pub(super) provenance: Option<&'a CapsuleInstallProvenance>,
     pub(super) authority: CapsuleInstallAuthority,
     pub(super) env: &'a [CapsuleInstallEnv],
+    pub(super) expected_generation: Option<&'a InstalledCapsuleGeneration>,
     pub(super) batch_member: Option<&'a CapsuleInstallBatchMember>,
 }
 
@@ -77,6 +78,13 @@ pub(super) async fn handle_install_capsule(
     kernel: &Arc<crate::Kernel>,
     request: InstallCapsuleRequest<'_>,
 ) -> KernelResponse {
+    let expected_package_generation = match super::install_generation::expected_package_generation(
+        request.expected_generation,
+        request.batch_member,
+    ) {
+        Ok(generation) => generation,
+        Err(error) => return KernelResponse::Error(error),
+    };
     let InstallCapsuleRequest {
         caller,
         requested_target,
@@ -85,6 +93,7 @@ pub(super) async fn handle_install_capsule(
         provenance,
         authority,
         env,
+        expected_generation: _,
         batch_member,
     } = request;
     if workspace {
@@ -153,6 +162,7 @@ pub(super) async fn handle_install_capsule(
         provenance,
         authority,
         env_transaction,
+        expected_package_generation,
     )
     .await
     {
@@ -172,9 +182,10 @@ async fn install_and_activate(
     provenance: Option<&CapsuleInstallProvenance>,
     authority: CapsuleInstallAuthority,
     env_transaction: Option<EnvTransaction>,
+    expected_package_generation: Option<astrid_storage::CapsulePackageGeneration>,
 ) -> Result<InstallOutput, String> {
     let home = kernel.astrid_home.clone();
-    let options = daemon_install_options(kernel, source, provenance);
+    let options = daemon_install_options(kernel, source, provenance, expected_package_generation);
     let install = match batch_archive {
         Some(archive) => {
             super::install_batch_archive::run_authorized_archive_install(
@@ -216,6 +227,7 @@ fn daemon_install_options(
     kernel: &Arc<crate::Kernel>,
     source: &str,
     provenance: Option<&CapsuleInstallProvenance>,
+    expected_package_generation: Option<astrid_storage::CapsulePackageGeneration>,
 ) -> InstallOptions {
     InstallOptions {
         workspace: false,
@@ -227,6 +239,7 @@ fn daemon_install_options(
         storage: kernel.principal_store.clone().map(Arc::new),
         provenance_distro: provenance.and_then(|value| value.distro.clone()),
         provenance_source_digest: provenance.and_then(|value| value.source_digest.clone()),
+        expected_package_generation,
     }
 }
 
@@ -903,6 +916,7 @@ mod tests {
             source_digest: format!("blake3:{}", blake3::hash(b"original-bytes").to_hex()),
             archive_digest: format!("blake3:{}", "a".repeat(64)),
             source_bytes: 14,
+            expected_generation: None,
         };
 
         let snapshot =

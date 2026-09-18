@@ -63,6 +63,7 @@ fn all_requests() -> Vec<KernelRequest> {
             provenance: None,
             authority: CapsuleInstallAuthority::default(),
             env: Vec::new(),
+            expected_generation: None,
             batch: None,
         },
         KernelRequest::ListCapsules,
@@ -141,6 +142,7 @@ fn agent_group_allows_self_scoped_capsule_surface() {
             provenance: None,
             authority: CapsuleInstallAuthority::default(),
             env: Vec::new(),
+            expected_generation: None,
             batch: None,
         },
         KernelRequest::ReloadCapsule {
@@ -174,6 +176,7 @@ fn agent_group_allows_self_scoped_capsule_surface() {
                 provenance: None,
                 authority: CapsuleInstallAuthority::default(),
                 env: Vec::new(),
+                expected_generation: None,
                 batch: None,
             }
         )
@@ -313,6 +316,7 @@ fn custom_group_capabilities_gate_admin_surface() {
             provenance: None,
             authority: CapsuleInstallAuthority::default(),
             env: Vec::new(),
+            expected_generation: None,
             batch: None,
         },
     )
@@ -332,6 +336,7 @@ fn custom_group_capabilities_gate_admin_surface() {
                 provenance: None,
                 authority: CapsuleInstallAuthority::default(),
                 env: Vec::new(),
+                expected_generation: None,
                 batch: None,
             }
         )
@@ -349,6 +354,7 @@ fn custom_group_capabilities_gate_admin_surface() {
             provenance: None,
             authority: CapsuleInstallAuthority::default(),
             env: Vec::new(),
+            expected_generation: None,
             batch: None,
         },
     )
@@ -396,6 +402,7 @@ fn admin_vs_agent_cross_tenant_matrix() {
         provenance: None,
         authority: CapsuleInstallAuthority::default(),
         env: Vec::new(),
+        expected_generation: None,
         batch: None,
     };
     assert!(

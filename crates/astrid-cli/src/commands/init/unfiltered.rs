@@ -65,6 +65,7 @@ pub(super) async fn finalize_unfiltered_distro_install(
         opts.offline,
         &target,
         signed_bundle.as_ref().map(|bundle| &bundle.pinned_refs),
+        None,
     )
     .await?;
     let locked = install_result.locked;

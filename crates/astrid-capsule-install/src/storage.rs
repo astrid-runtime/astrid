@@ -17,7 +17,7 @@ use astrid_build::artifact::{self, ArtifactVerification};
 use astrid_capsule::manifest::CapsuleManifest;
 use astrid_core::PrincipalId;
 use astrid_storage::{
-    CapsuleInstallExpectation, CapsulePackage, CapsulePackageSnapshot, RuntimePrincipalStore,
+    CapsulePackage, CapsulePackageGeneration, CapsulePackageSnapshot, RuntimePrincipalStore,
     StateOwner,
 };
 use flate2::Compression;
@@ -414,6 +414,7 @@ pub fn publish_directory_package(
     target_dir: &Path,
     meta: &CapsuleMeta,
     authority: &InstalledAuthority,
+    expected_generation: Option<CapsulePackageGeneration>,
 ) -> anyhow::Result<()> {
     let uid = store
         .principal_directory()
@@ -449,11 +450,10 @@ pub fn publish_directory_package(
     let registry = store.capsules();
     let owner = StateOwner::Principal(uid);
     let id = authority_capsule_id(&authority)?;
-    let expected = registry
-        .get_snapshot(&owner, &id)?
-        .map_or(CapsuleInstallExpectation::Absent, |snapshot| {
-            CapsuleInstallExpectation::Generation(snapshot.generation())
-        });
+    let expected = expectation::install_expectation(
+        registry.get_snapshot(&owner, &id)?.as_ref(),
+        expected_generation,
+    );
     let package = CapsulePackage::new(archive, metadata, authority);
     let materialization = tempfile::Builder::new()
         .prefix(".capsule-materialization-")
@@ -498,13 +498,23 @@ pub fn publish_package(
     id: &str,
     package: &CapsulePackage,
 ) -> anyhow::Result<()> {
+    publish_package_with_expected_generation(store, uid, id, package, None)
+}
+
+/// Publish a package, fail-closing when `expected_generation` no longer matches.
+pub fn publish_package_with_expected_generation(
+    store: &Arc<RuntimePrincipalStore>,
+    uid: astrid_core::identity::PrincipalUid,
+    id: &str,
+    package: &CapsulePackage,
+    expected_generation: Option<CapsulePackageGeneration>,
+) -> anyhow::Result<()> {
     let owner = StateOwner::Principal(uid);
     let registry = store.capsules();
-    let expected = registry
-        .get_snapshot(&owner, id)?
-        .map_or(CapsuleInstallExpectation::Absent, |snapshot| {
-            CapsuleInstallExpectation::Generation(snapshot.generation())
-        });
+    let expected = expectation::install_expectation(
+        registry.get_snapshot(&owner, id)?.as_ref(),
+        expected_generation,
+    );
     registry.install(&owner, id, package, expected)?;
     read_verified_durable_package(store, uid, id)?
         .ok_or_else(|| anyhow::anyhow!("durable capsule {id} disappeared after publish"))?;
@@ -620,6 +630,7 @@ fn reject_symlink_ancestors(root: &Path, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+mod expectation;
 mod leftover;
 mod migration;
 
