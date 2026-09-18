@@ -183,12 +183,21 @@ pub(crate) async fn install_capsule_with_options(
         .iter()
         .map(|capsule| capsule.id.as_str().to_string())
         .collect();
-    // Live-load: if a daemon is running, hot-load (or upgrade) each just-installed
-    // capsule so it's usable without a restart. Best-effort and non-fatal — the
-    // on-disk install above already succeeded standalone. The `update` and TUI
-    // install paths route through here too, so they inherit live hot-swap.
-    super::live_load::nudge_daemon_reload(&installed_ids).await;
+    // Workspace installs write directly to the workspace registry, so they
+    // still need the optional daemon nudge to become visible immediately.
+    // Ordinary user installs already go through the authenticated daemon
+    // transaction, whose kernel response is returned only after the exact
+    // installed capsule has been activated. Nudging those ids again would
+    // immediately hot-swap a just-created runtime and run its #[astrid::run]
+    // loop twice (and used to replay it once per env field before #1976).
+    if should_nudge_daemon_reload(workspace) {
+        super::live_load::nudge_daemon_reload(&installed_ids).await;
+    }
     Ok(())
+}
+
+fn should_nudge_daemon_reload(workspace: bool) -> bool {
+    workspace
 }
 
 /// Install dispatch shared by the CLI and distro-batch paths.
