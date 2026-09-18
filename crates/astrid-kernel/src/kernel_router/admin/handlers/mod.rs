@@ -498,6 +498,15 @@ async fn agent_modify_from_req(
     if capsules_changed && let Err(e) = copy_modify_env(kernel, &principal, &add_capsules).await {
         return err_internal(e);
     }
+    // HTTP inventory discovers published cache directories, not store
+    // snapshots. Project added packages before returning so an immediate
+    // env write can see the capsule. WASM warmup stays asynchronous.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    if capsules_changed
+        && let Err(e) = kernel.project_added_capsule_publications(&principal, &add_capsules)
+    {
+        return err_internal(e);
+    }
     if let Err(e) = profile.save_to_path(&path) {
         return err_profile(&principal, &e);
     }

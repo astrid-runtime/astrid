@@ -208,6 +208,62 @@ impl Kernel {
         Ok(bound_manifest)
     }
 
+    /// Project added durable capsules before `agent.modify` returns.
+    ///
+    /// HTTP inventory discovers published cache directories, not store
+    /// snapshots. Names without a target snapshot stay grant-only.
+    /// WASM warmup remains asynchronous.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    pub(crate) fn project_added_capsule_publications(
+        &self,
+        principal: &astrid_core::principal::PrincipalId,
+        add_capsules: &[String],
+    ) -> Result<(), String> {
+        let Some(store) = self.principal_store.as_ref() else {
+            return Err("authoritative principal store is unavailable".to_owned());
+        };
+        let uid = self
+            .principal_directory
+            .uid_for(principal)
+            .map_err(|error| format!("resolve target principal UID: {error}"))?;
+        let owner = astrid_storage::StateOwner::Principal(uid);
+        for capsule in add_capsules {
+            let Some(snapshot) = store
+                .capsules()
+                .get_snapshot(&owner, capsule)
+                .map_err(|error| format!("read target capsule '{capsule}': {error}"))?
+            else {
+                continue;
+            };
+            let digest = blake3::hash(&snapshot.package().archive)
+                .to_hex()
+                .to_string();
+            let target = astrid_capsule_install::resolve_cache_target_dir(
+                &self.astrid_home,
+                uid,
+                capsule,
+                &digest,
+                false,
+                None,
+                &self.workspace_layout,
+            )
+            .map_err(|error| format!("resolve capsule '{capsule}' cache target: {error}"))?;
+            let package = astrid_capsule_install::read_verified_durable_package_for_owner(
+                store, &owner, capsule,
+            )
+            .map_err(|error| format!("read capsule '{capsule}' package: {error}"))?
+            .ok_or_else(|| format!("durable capsule '{capsule}' package is malformed"))?;
+            self.ensure_published_materialization(
+                &target,
+                principal,
+                package.manifest(),
+                &snapshot,
+            )
+            .map_err(|error| format!("project added capsule '{capsule}': {error:#}"))?;
+        }
+        Ok(())
+    }
+
     /// Recheck the immutable publication after taking activation locks.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) fn confirm_published_materialization(
