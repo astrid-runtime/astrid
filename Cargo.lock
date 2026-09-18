@@ -720,6 +720,7 @@ dependencies = [
  "arc-swap",
  "astrid-approval",
  "astrid-audit",
+ "astrid-build",
  "astrid-capabilities",
  "astrid-capsule",
  "astrid-capsule-install",

@@ -899,6 +899,8 @@ async fn record_admin_audit(kernel: &crate::Kernel, entry: AdminAuditEntry<'_>) 
 #[cfg(test)]
 mod get_status_audit_tests;
 #[cfg(test)]
+mod install_env_activation_tests;
+#[cfg(test)]
 mod reload_rate_limit_tests;
 #[cfg(test)]
 mod tests;
