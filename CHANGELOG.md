@@ -8,6 +8,108 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ## [Unreleased]
 
+## [2026.9.3] - 2026-09-18
+
+### Added
+
+- Add an OAuth 2.1 protected-resource mode for loopback MCP HTTP endpoints published through an HTTPS proxy.
+
+- Include each live capsule's kernel-stamped IPC source identity in capsule inventory events.
+
+- `astrid init` can install a verified local distro as one bounded kernel batch, avoiding per-minute pauses while preserving each capsule's ordinary authority, integrity, lifecycle, and durable-publication checks.
+
+- Reject secret defaults before publishing elicitation schemas. Add an opt-in
+  private secret reply path that preserves invocation authority checks and stores
+  the reply without a general event-bus response or capsule reload. Native
+  responders are opt-in through operator-owned per-principal device bindings;
+  unselected principals retain their transport. Device pairing remains separate.
+  Add a direct authenticated local reply route that never falls back to the event
+  bus, and keep submitted data out of malformed-frame diagnostics.
+  Separate native-owned secret notifications from legacy elicitation requests so
+  native and legacy clients do not both prompt for the same private wait.
+  Support text, exact selections and lists on the same private route. Validate
+  answers against the pending request before consuming it, distinguish empty
+  ordinary input from cancellation, and recheck invocation authority after waiting.
+  Recheck the live principal profile before accepting a private secret reply so a
+  revoked device or disabled principal cannot answer on an existing socket.
+  Stamp private secret notifications with the configured responder device so
+  other same-principal devices do not receive the prompt. Require a live
+  revocation check when constructing a native responder. Bound private array
+  answers by encoded size and element count derived from the host IPC ceiling.
+  Document consent principal and capsule fields as display-only labels.
+
+- Add local `pair-device redeem --public-key` with the single-use pairing token
+  read from stdin, allowing device enrollment through the existing pairing API
+  without editing principal profiles or exposing tokens in command arguments.
+  Local redeem authenticates with the pairing token, not the CLI active
+  principal, so a stale or disabled active agent still redeems a valid token.
+
+- Add a user-scoped ownership query for principal discovery. It filters assignments by current fleet membership without granting permission to act as a principal; callers must authenticate users and recheck authorization independently.
+
+  Add atomic first assignment from a creator's current fleet, checking current manager authority and refusing implicit transfers.
+
+  Add explicit device-to-user delegation storage scoped to a principal and fleet, revoked on membership removal or cross-fleet transfer. Authentication and client integration remain separate.
+
+  Bind newly issued invitations to explicit issuer ownership and commit token consumption together with principal assignment. Revocation, delegation replacement, issuer device removal and changed fleet authority reject enrollment; legacy invitations without ownership must be reissued. Enrolled devices do not inherit the issuer's human identity.
+
+  Allow fleet managers with authenticated delegated devices and deletion capability to delete owned principals. Ownership and device bindings retire atomically with the deletion reservation; interrupted cleanup retains the fleet boundary and rechecks current authority on retry.
+
+  Assign spawned principals to the authenticated creator's fleet under the existing spawn capability, independently of the template source. Reject stale creator ownership and do not copy human-device delegation or broaden the child's restricted capability profile.
+  Added `astrid agent list --mine` backed by authenticated server-side fleet
+  membership filtering. This does not grant acting authority and never falls
+  back to the administrator's global roster.
+
+  Auto-assign historical unowned principals only for the bound local-operator
+  device on the durable CLI root. Layout origin and a singleton graph are not
+  proof of human ownership; released homes have no personal-versus-hosted
+  marker. The bulk repair still refuses extra users, extra fleets, or foreign
+  assignments, and a missing local-operator binding defers leftovers. Discovery
+  list remains read-only.
+
+  Keep `astrid agent claim <name>` (`UserPrincipalClaim`) as the remainder
+  path that assigns one named unowned principal to the authenticated human's
+  current fleet. It reuses first assignment, requires current user delegation
+  and fleet management plus `agent:create`, is idempotent in the caller's fleet,
+  and never transfers an existing owner.
+
+### Fixed
+
+- Command allowances now require fresh approval when a command contains the shell background operator.
+
+- Bind interactive approval and grant responses to the authenticated connection that originated the request, preventing same-principal sessions from observing or answering each other's prompts.
+
+- Released legacy workspaces now migrate into `astrid.volume`, large capsule sets finish initialization without restarting setup, provider onboarding reads durable capsule metadata, and Linux shutdown recognizes exited zombie processes.
+
+- `astrid capsule remove --purge` now erases the selected capsule's principal-scoped KV state as well as its configuration and secrets, while preserving other capsules and principals and remaining retryable after an interrupted removal.
+
+- Capsule signing now provisions owner-only runtime key directories on Unix under the runtime lifecycle fence, so building the first capsule in a fresh Astrid home cannot make the next daemon start fail admission or race volume retirement into sidecars.
+
+- `astrid capsule show --agent` now limits capsule metadata to the selected principal instead of exposing the administrator's cross-principal inventory.
+
+- Invite issue now requires a user-delegated device on the issuing session. An unscoped operator bearer is rejected; a device-bound local admin bearer can still mint invitations.
+
+  Keyless principal backfill refuses to mint credentials for a principal already owned by another fleet. Same-fleet repair and first assignment of an unowned leftover remain available.
+
+  If ownership assignment fails after provisioning, identity is rolled back only when the graph does not already own the UID. An unreadable graph or an existing assignment preserves the provisioned identity so a committed ownership edge cannot be orphaned.
+
+  Released-home upgrade documentation now matches storage: disabled is a profile flag, not an adoption filter. Automatic leftovers still exclude only deletion reservations and existing ownership or transfers.
+
+- Process storage projections now confirm native unmount before revoking leases or deleting the private mount root. FSKit STOP waits until the mountpoint is no longer `astridfs` and is an empty private directory; a leftover mount is unmounted by the broker using only the known projection paths. The broker drops the projection cache lock before retrying a failed last-close cleanup, then re-locks so a later mount cannot deadlock on the same mutex or retain a pair that cleanup already removed. Native unmount of a known projection path is bounded: the owned umount subprocess is killed and reaped if it does not exit within the confirmation deadline. Lease revocation during projection teardown is idempotent when the lease is already gone or expired.
+
+- Named Distro Apply `--capsule` now refreshes already-installed signed members without rewriting Distro.lock, env, or grants. Unknown, empty, duplicate, and missing targets fail closed. Filtered refresh carries the observed installed generation through InstallCapsule and fail-closes if a concurrent remove or replacement changes that generation.
+
+- agent.modify now projects added published capsules before returning, so an immediate env write can see the capsule in inventory. Projection repair is serialized per owner/capsule/digest so inventory and warmup cannot clobber a concurrent repair, and blocking extract runs on spawn_blocking until that projection is visible.
+
+- Capsule install now leaves the complete environment in place before the one activation. The CLI no longer replays those values through per-field admin EnvSet after success, so a multi-field install no longer restarts the capsule once per field. A failed install still rolls back staged env and does not activate. A later explicit EnvSet still reloads exactly once. Homes that previously installed through the replay path may still hold leftover Agent-scoped secrets from those writes; this change does not purge them.
+
+- Avoid reloading a capsule immediately after the daemon has already activated it during install, so its background run loop starts only once.
+
+- Persist remembered command approvals before reporting success. Keep approvals scoped to the principal and hosted workspace identity (pristine portal path, not the process-local CoW merged path) across runtime restarts; preserve temporary once/session choices and reject failed persistence or approvals for deleted and disabled principals. Durable grants apply before the authenticated request-owner prompt and do not mint unscoped session allowances.
+
+### Security
+
+- Update the locked rustls version to address RUSTSEC-2026-0285.
+
 ## [2026.9.2] - 2026-09-12
 
 ### Added
@@ -1164,7 +1266,8 @@ Breaking changes to note: `Capsule.toml` moves to `[publish]` / `[subscribe]` ta
 Initial tracked release. See the [repository history](https://github.com/astrid-runtime/astrid/commits/v0.2.0)
 for changes included in this version.
 
-[Unreleased]: https://github.com/astrid-runtime/astrid/compare/v2026.9.2...HEAD
+[Unreleased]: https://github.com/astrid-runtime/astrid/compare/v2026.9.3...HEAD
+[2026.9.3]: https://github.com/astrid-runtime/astrid/compare/v2026.9.2...v2026.9.3
 [2026.9.2]: https://github.com/astrid-runtime/astrid/compare/v2026.9.1...v2026.9.2
 [2026.9.1]: https://github.com/astrid-runtime/astrid/compare/v2026.9.0...v2026.9.1
 [2026.9.0]: https://github.com/astrid-runtime/astrid/compare/v0.10.4...v2026.9.0
