@@ -95,7 +95,7 @@ async fn main() -> ExitCode {
         },
     }
 
-    match dispatch::dispatch(parsed).await {
+    match Box::pin(dispatch::dispatch(parsed)).await {
         Ok(code) => code,
         Err(e) => {
             if hook_invocation {
