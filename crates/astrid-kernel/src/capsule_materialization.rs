@@ -1,8 +1,108 @@
 //! Durable capsule publication binding and canonical projection repair.
 
 use std::path::Path;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use std::sync::{Arc, Mutex, Weak};
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use dashmap::DashMap;
 
 use super::{BoundMaterialization, Kernel, authenticated_ancestor_directories};
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MaterializationRepairKey {
+    uid: astrid_core::identity::PrincipalUid,
+    capsule: String,
+    digest: String,
+}
+
+/// Per owner/capsule/digest repair lock so inventory, warmup, and
+/// `agent.modify` cannot clobber one another's projection.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) struct MaterializationRepairLocks {
+    locks: Arc<DashMap<MaterializationRepairKey, Weak<Mutex<()>>>>,
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl Default for MaterializationRepairLocks {
+    fn default() -> Self {
+        Self {
+            locks: Arc::new(DashMap::new()),
+        }
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+struct MaterializationRepairLease {
+    key: MaterializationRepairKey,
+    lock: Weak<Mutex<()>>,
+    locks: Arc<DashMap<MaterializationRepairKey, Weak<Mutex<()>>>>,
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl Drop for MaterializationRepairLease {
+    fn drop(&mut self) {
+        self.locks.remove_if(&self.key, |_, stored| {
+            stored.ptr_eq(&self.lock) && stored.strong_count() == 0
+        });
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) struct MaterializationRepairGuard {
+    lock: Arc<Mutex<()>>,
+    _lease: MaterializationRepairLease,
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl MaterializationRepairGuard {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl MaterializationRepairLocks {
+    fn acquire(
+        &self,
+        uid: astrid_core::identity::PrincipalUid,
+        capsule: &str,
+        digest: &str,
+    ) -> MaterializationRepairGuard {
+        let key = MaterializationRepairKey {
+            uid,
+            capsule: capsule.to_owned(),
+            digest: digest.to_owned(),
+        };
+        let lock = match self.locks.entry(key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                if let Some(lock) = entry.get().upgrade() {
+                    lock
+                } else {
+                    let lock = Arc::new(Mutex::new(()));
+                    entry.insert(Arc::downgrade(&lock));
+                    lock
+                }
+            },
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let lock = Arc::new(Mutex::new(()));
+                entry.insert(Arc::downgrade(&lock));
+                lock
+            },
+        };
+        MaterializationRepairGuard {
+            lock: Arc::clone(&lock),
+            _lease: MaterializationRepairLease {
+                key,
+                lock: Arc::downgrade(&lock),
+                locks: Arc::clone(&self.locks),
+            },
+        }
+    }
+}
 
 impl Kernel {
     /// Verify every projected byte against one immutable package snapshot.
@@ -176,6 +276,19 @@ impl Kernel {
         snapshot: &astrid_storage::CapsulePackageSnapshot,
     ) -> anyhow::Result<astrid_capsule_types::manifest::CapsuleManifest> {
         self.validate_published_cache_path(target, principal, discovery_manifest, snapshot)?;
+        let uid = self
+            .principal_directory
+            .uid_for(principal)
+            .map_err(|error| anyhow::anyhow!("resolve capsule cache owner UID: {error}"))?;
+        let digest = blake3::hash(&snapshot.package().archive)
+            .to_hex()
+            .to_string();
+        let repair = self.materialization_repair_locks.acquire(
+            uid,
+            discovery_manifest.package.name.as_str(),
+            &digest,
+        );
+        let _repair_guard = repair.lock();
         let target_metadata = match std::fs::symlink_metadata(target) {
             Ok(metadata) => Some(metadata),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -283,3 +396,7 @@ impl Kernel {
         self.verify_published_materialization(dir, principal, manifest, snapshot)
     }
 }
+
+#[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
+#[path = "capsule_materialization_tests.rs"]
+mod tests;

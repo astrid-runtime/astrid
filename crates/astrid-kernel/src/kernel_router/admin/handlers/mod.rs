@@ -458,17 +458,8 @@ async fn agent_modify_from_req(
             Ok(changed) => changed,
             Err(e) => return err_bad_input(format!("group delta rejected: {e}")),
         };
-    if principal == PrincipalId::default()
-        && !profile
-            .groups
-            .iter()
-            .any(|group| group == astrid_core::groups::BUILTIN_ADMIN)
-    {
-        return err_bad_input(
-            "cannot remove the built-in `admin` group from the `default` principal — it is the \
-             single-tenant bootstrap anchor"
-                .to_string(),
-        );
+    if let Some(response) = reject_default_admin_group_removal(&principal, &profile) {
+        return response;
     }
     let capsules_changed = match apply_set_delta::<CapsuleGrant>(
         &mut profile.capsules,
@@ -503,7 +494,9 @@ async fn agent_modify_from_req(
     // env write can see the capsule. WASM warmup stays asynchronous.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     if capsules_changed
-        && let Err(e) = kernel.project_added_capsule_publications(&principal, &add_capsules)
+        && let Err(e) =
+            project_added_capsule_publications_before_return(kernel, &principal, &add_capsules)
+                .await
     {
         return err_internal(e);
     }
@@ -525,6 +518,41 @@ async fn agent_modify_from_req(
         "Layer 6 agent.modify"
     );
     modify_response(&principal, &profile, true)
+}
+
+fn reject_default_admin_group_removal(
+    principal: &PrincipalId,
+    profile: &PrincipalProfile,
+) -> Option<AdminResponseBody> {
+    if principal == &PrincipalId::default()
+        && !profile
+            .groups
+            .iter()
+            .any(|group| group == astrid_core::groups::BUILTIN_ADMIN)
+    {
+        return Some(err_bad_input(
+            "cannot remove the built-in `admin` group from the `default` principal — it is the \
+             single-tenant bootstrap anchor"
+                .to_string(),
+        ));
+    }
+    None
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+async fn project_added_capsule_publications_before_return(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    add_capsules: &[String],
+) -> Result<(), String> {
+    let kernel = Arc::clone(kernel);
+    let principal = principal.clone();
+    let add_capsules = add_capsules.to_vec();
+    tokio::task::spawn_blocking(move || {
+        kernel.project_added_capsule_publications(&principal, &add_capsules)
+    })
+    .await
+    .unwrap_or_else(|error| Err(format!("project added capsules: {error}")))
 }
 
 fn warm_principal_capsules(kernel: &Arc<crate::Kernel>, principal: PrincipalId) {
