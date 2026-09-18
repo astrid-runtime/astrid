@@ -144,13 +144,37 @@ pub(super) async fn handle_install_capsule(
         Err(error) => return KernelResponse::Error(error),
     };
 
-    let home = match astrid_core::dirs::AstridHome::resolve() {
-        Ok(h) => h,
-        Err(e) => return KernelResponse::Error(format!("resolve AstridHome: {e}")),
-    };
+    match install_and_activate(
+        kernel,
+        target,
+        source,
+        path,
+        batch_archive,
+        provenance,
+        authority,
+        env_transaction,
+    )
+    .await
+    {
+        Ok(output) => KernelResponse::Success(install_output_json(&output)),
+        Err(error) => KernelResponse::Error(error),
+    }
+}
 
+/// Install against the kernel-bound home, then activate once, rolling env back on failure.
+#[allow(clippy::too_many_arguments)]
+async fn install_and_activate(
+    kernel: &Arc<crate::Kernel>,
+    target: &astrid_core::principal::PrincipalId,
+    source: &str,
+    path: std::path::PathBuf,
+    batch_archive: Option<super::install_batch_archive::BatchArchive>,
+    provenance: Option<&CapsuleInstallProvenance>,
+    authority: CapsuleInstallAuthority,
+    env_transaction: Option<EnvTransaction>,
+) -> Result<InstallOutput, String> {
+    let home = kernel.astrid_home.clone();
     let options = daemon_install_options(kernel, source, provenance);
-
     let install = match batch_archive {
         Some(archive) => {
             super::install_batch_archive::run_authorized_archive_install(
@@ -171,7 +195,7 @@ pub(super) async fn handle_install_capsule(
             if let Some(transaction) = env_transaction {
                 transaction.rollback(kernel).await;
             }
-            return KernelResponse::Error(error);
+            return Err(error);
         },
     };
 
@@ -183,10 +207,9 @@ pub(super) async fn handle_install_capsule(
         if let Some(transaction) = env_transaction {
             transaction.rollback(kernel).await;
         }
-        return KernelResponse::Error(error);
+        return Err(error);
     }
-
-    KernelResponse::Success(install_output_json(&output))
+    Ok(output)
 }
 
 fn daemon_install_options(

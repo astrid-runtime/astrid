@@ -65,6 +65,8 @@ mod storage_mount_handlers;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
+pub(crate) use test_support::{dispatch_as_operator, seed_operator};
+#[cfg(test)]
 mod tests;
 
 use std::sync::Arc;

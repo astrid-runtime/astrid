@@ -3,10 +3,10 @@
 //! The CLI must not open the principal package store for a normal install:
 //! the running kernel is the sole durable writer.  This module validates
 //! `--var` against the source manifest and sends the values through the typed
-//! typed daemon install transaction.  Values are staged before the install
-//! lifecycle runs and written again after a successful install through the
-//! typed admin API so a lifecycle and the newly loaded runtime observe the
-//! same projection.
+//! daemon install transaction. The kernel stages the complete environment
+//! before the install lifecycle runs. Do not reapply those values through
+//! admin `EnvSet` after success: each `EnvSet` reloads the runtime and would
+//! restart the capsule once per field.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -18,9 +18,8 @@ use astrid_capsule::manifest::CapsuleManifest;
 use astrid_core::PrincipalId;
 use astrid_core::kernel_api::{
     AdminRequestKind, AdminResponseBody, CapsuleInstallAuthority, CapsuleInstallBatchContext,
-    CapsuleInstallEnv, CapsuleInstallProvenance, CapsuleInstallResumeReceipt, EnvStorageScope,
-    EnvValueKind, InstalledCapsuleGeneration, InstalledCapsuleIdentity, KernelRequest,
-    KernelResponse,
+    CapsuleInstallEnv, CapsuleInstallProvenance, CapsuleInstallResumeReceipt, EnvValueKind,
+    InstalledCapsuleGeneration, InstalledCapsuleIdentity, KernelRequest, KernelResponse,
 };
 
 use super::install::ManualInstallOptions;
@@ -244,10 +243,6 @@ pub(crate) async fn install_local_via_daemon_for_target_with_generation(
             // capsule into a reported failure. Cross-principal installs do not
             // write a caller-owned receipt for the selected target.
             persist_resume_receipt(&mut client, &caller, target, &capsule_id).await;
-            if !values.is_empty() {
-                let mut admin = crate::admin_client::connect_as_active_agent().await?;
-                apply_values(&mut admin, target, capsule_id.as_str(), &values).await?;
-            }
             let version = output
                 .get("installed_version")
                 .and_then(serde_json::Value::as_str)
@@ -408,41 +403,6 @@ fn is_digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-async fn apply_values(
-    client: &mut crate::admin_client::AdminClient,
-    principal: &PrincipalId,
-    capsule: &str,
-    values: &[DaemonEnvValue],
-) -> anyhow::Result<()> {
-    for value in values {
-        let response = if value.kind == EnvValueKind::Secret && value.value.is_empty() {
-            client
-                .request(AdminRequestKind::EnvDelete {
-                    principal: principal.clone(),
-                    capsule: capsule.to_owned(),
-                    key: value.key.clone(),
-                    kind: value.kind,
-                    scope: EnvStorageScope::Agent,
-                })
-                .await?
-        } else {
-            client
-                .request(AdminRequestKind::EnvSet {
-                    principal: principal.clone(),
-                    capsule: capsule.to_owned(),
-                    key: value.key.clone(),
-                    value: value.value.clone(),
-                    kind: value.kind,
-                    scope: EnvStorageScope::Agent,
-                    append: false,
-                })
-                .await?
-        };
-        crate::admin_client::into_result(response)?;
-    }
-    Ok(())
 }
 
 fn load_source_manifest(source: &str) -> anyhow::Result<CapsuleManifest> {
@@ -750,6 +710,21 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("member does not match")
+        );
+    }
+
+    #[test]
+    fn install_success_does_not_replay_env_through_admin() {
+        let source = include_str!("install_daemon.rs");
+        let replay = "apply_values".to_owned() + "(";
+        assert!(
+            !source.contains(&replay),
+            "post-success env replay must stay deleted"
+        );
+        let env_set = "AdminRequestKind::".to_owned() + "EnvSet";
+        assert!(
+            !source.contains(&env_set),
+            "install success must not issue per-field admin env writes"
         );
     }
 }

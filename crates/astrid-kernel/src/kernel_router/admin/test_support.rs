@@ -14,7 +14,7 @@ use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody};
 use crate::Kernel;
 use astrid_storage::ownership::CreationDelegation;
 
-pub(super) async fn seed_operator(kernel: &Kernel) -> CreationDelegation {
+pub(crate) async fn seed_operator(kernel: &Kernel) -> CreationDelegation {
     use astrid_core::profile::{DeviceKey, DeviceScope, PrincipalProfile};
     use astrid_core::{FleetGenesis, FleetIdentity, PrincipalOwnership, UserGenesis, UserIdentity};
     let caller = PrincipalId::default();
@@ -73,7 +73,7 @@ pub(super) async fn seed_operator(kernel: &Kernel) -> CreationDelegation {
         .unwrap()
 }
 
-pub(super) async fn dispatch_as_operator(
+pub(crate) async fn dispatch_as_operator(
     kernel: &Arc<Kernel>,
     caller: &PrincipalId,
     request: AdminRequestKind,
