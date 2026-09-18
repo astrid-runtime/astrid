@@ -1,8 +1,38 @@
 #!/usr/bin/env bash
 
+runtime_start_count() {
+  local capsule=$1
+  local pattern="Starting background WASM run loop capsule=$capsule"
+  find "$ASTRID_HOME/log" -type f -name '*.log' -exec \
+    grep -h -o -F "$pattern" {} + 2>/dev/null \
+    | awk 'END { print NR + 0 }' || true
+}
+
 install_adversarial_capsule_with_lifecycle_config() {
   local stdout="$ARTIFACTS/adversarial-install.out"
   local stderr="$ARTIFACTS/adversarial-install.err"
+  local unrelated_capsule=""
+  local capsule
+  for capsule in $CORE_CAPSULES; do
+    if [[ "$capsule" != "astrid-capsule-adversarial" ]]; then
+      unrelated_capsule="$capsule"
+      break
+    fi
+  done
+  local adversarial_starts_before
+  local unrelated_starts_before
+  adversarial_starts_before="$(runtime_start_count astrid-capsule-adversarial)"
+  unrelated_starts_before=0
+  if [[ -n "$unrelated_capsule" ]]; then
+    local status_before="$ARTIFACTS/lifecycle-status-before.txt"
+    if "$CORE_DIR/target/debug/astrid" status > "$status_before" 2>/dev/null \
+      && grep -q "^[[:space:]]*-[[:space:]]$unrelated_capsule$" "$status_before"; then
+      unrelated_starts_before="$(runtime_start_count "$unrelated_capsule")"
+    else
+      note "skipping unrelated restart assertion: '$unrelated_capsule' is not loaded"
+      unrelated_capsule=""
+    fi
+  fi
 
   note "checking typed lifecycle configuration during adversarial capsule install"
   printf '$ astrid capsule install e2e/fixtures/astrid-capsule-adversarial\n' \
@@ -17,6 +47,23 @@ install_adversarial_capsule_with_lifecycle_config() {
   fi
   grep -q 'runtime E2E lifecycle probe' "$stdout" "$stderr" \
     || fail "adversarial install did not surface declared lifecycle configuration prompt"
+
+  # A daemon-owned install activates the newly admitted capsule before its
+  # authenticated response returns. The CLI must not immediately reload that
+  # same id, which would run its #[astrid::run] loop twice. Keep one already
+  # loaded capsule in the count as a guard against broad reload churn too.
+  local adversarial_starts_after
+  local unrelated_starts_after
+  local adversarial_delta
+  adversarial_starts_after="$(runtime_start_count astrid-capsule-adversarial)"
+  adversarial_delta=$((adversarial_starts_after - adversarial_starts_before))
+  (( adversarial_delta == 1 )) \
+    || fail "adversarial install activated $adversarial_delta new times; expected one run-loop start"
+  if [[ -n "$unrelated_capsule" ]]; then
+    unrelated_starts_after="$(runtime_start_count "$unrelated_capsule")"
+    (( unrelated_starts_after == unrelated_starts_before )) \
+      || fail "$unrelated_capsule restarted during adversarial install"
+  fi
 
   # This regression proves a newly admitted nondefault principal receives a
   # UID-bound storage home during lifecycle execution. No alias-keyed native
