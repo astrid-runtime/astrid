@@ -54,19 +54,23 @@ def write_receipt(root, expected, checks):
 
 def run_logged(command, env, log_path, timeout=90):
     """Wait for the command, not pipe EOF held open by a detached daemon."""
-    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as output:
+    with (tempfile.TemporaryFile(mode="w+", encoding="utf-8") as output,
+          tempfile.TemporaryFile(mode="w+", encoding="utf-8") as diagnostics):
         try:
             result = subprocess.run(command, env=env, text=True, stdout=output,
-                                    stderr=subprocess.STDOUT, timeout=timeout, check=False)
+                                    stderr=diagnostics, timeout=timeout, check=False)
         except subprocess.TimeoutExpired:
             output.seek(0)
+            diagnostics.seek(0)
             with log_path.open("a") as log:
-                log.write(f"command={command!r}\ntimeout={timeout}\n{output.read()}\n")
+                log.write(f"command={command!r}\ntimeout={timeout}\n{output.read()}\nstderr:\n{diagnostics.read()}\n")
             raise
         output.seek(0)
         text = output.read()
+        diagnostics.seek(0)
+        errors = diagnostics.read()
     with log_path.open("a") as log:
-        log.write(f"command={command!r}\nexit={result.returncode}\n{text}\n")
+        log.write(f"command={command!r}\nexit={result.returncode}\n{text}\nstderr:\n{errors}\n")
     if result.returncode:
         raise RuntimeError(f"command failed ({result.returncode}): {command}; see {log_path}")
     return text

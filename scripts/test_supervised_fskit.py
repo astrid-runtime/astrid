@@ -18,6 +18,19 @@ import certify_fskit_local as local
 
 
 class ApprovalTests(unittest.TestCase):
+    def test_command_stdout_is_not_polluted_by_update_notice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "log"
+            status = "mount 123 at /test: ReadWrite, dirty=false"
+            notice = "Update available: v2026.9.3 → v2026.9.2"
+            output = local.run_logged(
+                [sys.executable, "-c",
+                 f"import sys; print({notice!r}, file=sys.stderr); print({status!r})"],
+                os.environ.copy(), log)
+            self.assertEqual(output, status + "\n")
+            self.assertIn(notice, log.read_text())
+            self.assertIn(status, log.read_text())
+
     def test_private_directories_do_not_depend_on_umask(self):
         with tempfile.TemporaryDirectory() as directory:
             previous = os.umask(0o022)
@@ -48,14 +61,16 @@ print('parent completed', flush=True)
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "log"
             with self.assertRaises(RuntimeError):
-                local.run_logged([sys.executable, "-c", "print('failed'); exit(7)"],
+                local.run_logged([sys.executable, "-c", "import sys; print('failed'); print('failure detail', file=sys.stderr); exit(7)"],
                                  os.environ.copy(), log)
             self.assertIn("exit=7\nfailed", log.read_text())
+            self.assertIn("stderr:\nfailure detail", log.read_text())
             with self.assertRaises(subprocess.TimeoutExpired):
                 local.run_logged([sys.executable, "-c",
-                                  "import time; print('waiting', flush=True); time.sleep(10)"],
+                                  "import sys, time; print('waiting', flush=True); print('timeout detail', file=sys.stderr, flush=True); time.sleep(10)"],
                                  os.environ.copy(), log, timeout=0.2)
             self.assertIn("timeout=0.2\nwaiting", log.read_text())
+            self.assertIn("stderr:\ntimeout detail", log.read_text())
 
     def test_runner_source_rejects_edits_and_wrong_checkout(self):
         with tempfile.TemporaryDirectory() as directory:
