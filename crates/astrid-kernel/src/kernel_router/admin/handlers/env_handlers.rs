@@ -136,6 +136,9 @@ pub(super) async fn env_set(kernel: &Arc<Kernel>, request: EnvSetRequest) -> Adm
     if let Err(error) = validate_env_value(kind, &value) {
         return AdminResponseBody::Error(error);
     }
+    // Queue ordinary writers before probing the install fence so concurrent
+    // defaults do not mistake one another for an unresolved install.
+    let _guard = kernel.admin_write_lock.lock().await;
     // Fail visibly rather than treating an install's staged value as durable.
     // Never wait here: activation can itself need an admin operation.
     let _install_guard = if only_if_absent {
@@ -148,7 +151,6 @@ pub(super) async fn env_set(kernel: &Arc<Kernel>, request: EnvSetRequest) -> Adm
     } else {
         None
     };
-    let _guard = kernel.admin_write_lock.lock().await;
     // Check both typed lookup scopes while holding the same lock as EnvSet
     // and EnvDelete. No operator write can slip between this check and commit.
     if only_if_absent {

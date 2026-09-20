@@ -4,6 +4,41 @@ use astrid_core::dirs::AstridHome;
 use astrid_core::kernel_api::AdminRequestKind;
 
 #[tokio::test]
+async fn concurrent_defaults_queue_instead_of_reporting_an_install() {
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
+    let (_dir, kernel) = fixture().await;
+    let guard = kernel.admin_write_lock.lock().await;
+    let mut first = std::pin::pin!(env_set(
+        &kernel,
+        request(
+            "model",
+            "first",
+            EnvValueKind::Text,
+            EnvStorageScope::Agent,
+            true
+        )
+    ));
+    let mut second = std::pin::pin!(env_set(
+        &kernel,
+        request(
+            "model",
+            "second",
+            EnvValueKind::Text,
+            EnvStorageScope::Agent,
+            true
+        )
+    ));
+    assert!(poll_fn(|cx| Poll::Ready(first.as_mut().poll(cx).is_pending())).await);
+    assert!(poll_fn(|cx| Poll::Ready(second.as_mut().poll(cx).is_pending())).await);
+    drop(guard);
+    let (first, second) = tokio::join!(first, second);
+    assert!(stored(first));
+    assert!(!stored(second));
+}
+
+#[tokio::test]
 async fn empty_secrets_are_rejected_by_both_write_modes() {
     let (_dir, kernel) = fixture().await;
     for conditional in [false, true] {
