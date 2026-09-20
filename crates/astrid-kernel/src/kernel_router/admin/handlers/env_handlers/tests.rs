@@ -4,6 +4,132 @@ use astrid_core::dirs::AstridHome;
 use astrid_core::kernel_api::AdminRequestKind;
 
 #[tokio::test]
+async fn failed_refresh_retries_without_overwriting_the_committed_default() {
+    let (_dir, kernel) = fixture().await;
+    let first = env_set_with_refresh(
+        &kernel,
+        request(
+            "retry",
+            "original",
+            EnvValueKind::Text,
+            EnvStorageScope::Agent,
+            true,
+        ),
+        async |kernel, _, _| {
+            assert!(kernel.admin_write_lock.try_lock().is_ok());
+            assert!(kernel.env_install_fence.try_read().is_ok());
+            Err("injected activation failure".into())
+        },
+    )
+    .await;
+    assert!(
+        matches!(first, AdminResponseBody::Error(error) if error == "injected activation failure")
+    );
+    assert_eq!(kernel.env_refresh_pending.len(), 1);
+    let called = std::sync::atomic::AtomicBool::new(false);
+    let retry = env_set_with_refresh(
+        &kernel,
+        request(
+            "retry",
+            "replacement",
+            EnvValueKind::Text,
+            EnvStorageScope::Agent,
+            true,
+        ),
+        async |kernel, principal, capsule| {
+            assert!(kernel.admin_write_lock.try_lock().is_ok());
+            assert!(kernel.env_install_fence.try_read().is_ok());
+            let store = env_scope(
+                kernel,
+                principal,
+                capsule,
+                EnvValueKind::Text,
+                EnvStorageScope::Agent,
+            )
+            .unwrap();
+            assert_eq!(
+                astrid_storage::env::get_env(&store, "retry")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("original")
+            );
+            called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .await;
+    default_success(retry);
+    assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(kernel.env_refresh_pending.is_empty());
+}
+
+#[tokio::test]
+async fn older_refresh_cannot_clear_a_newer_failed_write() {
+    let (_dir, kernel) = fixture().await;
+    let first = env_set_with_refresh(
+        &kernel,
+        request(
+            "generation",
+            "default",
+            EnvValueKind::Text,
+            EnvStorageScope::Agent,
+            true,
+        ),
+        async |kernel, _, _| {
+            let later = env_set_with_refresh(
+                kernel,
+                request(
+                    "generation",
+                    "operator",
+                    EnvValueKind::Text,
+                    EnvStorageScope::Agent,
+                    false,
+                ),
+                async |_, _, _| Err("newer refresh failed".into()),
+            )
+            .await;
+            assert!(matches!(later, AdminResponseBody::Error(_)));
+            Ok(())
+        },
+    )
+    .await;
+    default_success(first);
+    assert_eq!(kernel.env_refresh_pending.len(), 1);
+    let retry = env_set_with_refresh(
+        &kernel,
+        request(
+            "generation",
+            "unused",
+            EnvValueKind::Text,
+            EnvStorageScope::Agent,
+            true,
+        ),
+        async |kernel, principal, capsule| {
+            let store = env_scope(
+                kernel,
+                principal,
+                capsule,
+                EnvValueKind::Text,
+                EnvStorageScope::Agent,
+            )
+            .unwrap();
+            assert_eq!(
+                astrid_storage::env::get_env(&store, "generation")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("operator")
+            );
+            Ok(())
+        },
+    )
+    .await;
+    default_success(retry);
+    assert!(kernel.env_refresh_pending.is_empty());
+}
+
+#[tokio::test]
 async fn concurrent_defaults_queue_instead_of_reporting_an_install() {
     use std::future::{Future, poll_fn};
     use std::task::Poll;

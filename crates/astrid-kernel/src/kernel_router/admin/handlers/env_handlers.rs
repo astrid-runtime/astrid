@@ -120,6 +120,71 @@ fn validate_env_value(kind: EnvValueKind, value: &str) -> Result<(), String> {
 }
 
 pub(super) async fn env_set(kernel: &Arc<Kernel>, request: EnvSetRequest) -> AdminResponseBody {
+    env_set_with_refresh(kernel, request, reload_after_env_change).await
+}
+
+async fn env_set_with_refresh(
+    kernel: &Arc<Kernel>,
+    request: EnvSetRequest,
+    refresh: impl AsyncFnOnce(&Arc<Kernel>, &PrincipalId, &str) -> Result<(), String>,
+) -> AdminResponseBody {
+    if let Err(error) = validate_env_request(&request.capsule, &request.key, request.kind) {
+        return AdminResponseBody::Error(error);
+    }
+    if let Err(error) = validate_env_value(request.kind, &request.value) {
+        return AdminResponseBody::Error(error);
+    }
+    let capsule = match CapsuleId::new(request.capsule.clone()) {
+        Ok(id) => id,
+        Err(error) => return AdminResponseBody::Error(error.to_string()),
+    };
+    let refresh_key = (request.principal.clone(), capsule);
+    // Queue ordinary writers before probing the install fence so concurrent
+    // defaults do not mistake one another for an unresolved install.
+    let write_guard = kernel.admin_write_lock.lock().await;
+    // Fail visibly rather than treating an install's staged value as durable.
+    // Never wait here: activation can itself need an admin operation.
+    let install_guard = if request.only_if_absent {
+        match kernel.env_install_fence.try_write() {
+            Ok(guard) => Some(guard),
+            Err(_) => return AdminResponseBody::Error(
+                "capsule environment transaction in progress; retry initialization after the install completes".to_owned(),
+            ),
+        }
+    } else {
+        None
+    };
+    let ticket = match persist_env_value(kernel, &request).await {
+        Ok(true) => {
+            let ticket = Arc::new(());
+            kernel
+                .env_refresh_pending
+                .insert(refresh_key.clone(), Arc::clone(&ticket));
+            Some(ticket)
+        },
+        Ok(false) => kernel
+            .env_refresh_pending
+            .get(&refresh_key)
+            .map(|entry| Arc::clone(entry.value())),
+        Err(error) => return AdminResponseBody::Error(error),
+    };
+    // Activation may call mutating admin or install APIs. Neither guard may
+    // survive into it. A failed/cancelled refresh keeps its ticket for retry.
+    drop(install_guard);
+    drop(write_guard);
+    if let Some(ticket) = ticket {
+        if let Err(error) = refresh(kernel, &request.principal, &request.capsule).await {
+            return AdminResponseBody::Error(error);
+        }
+        kernel
+            .env_refresh_pending
+            .remove_if(&refresh_key, |_, current| Arc::ptr_eq(current, &ticket));
+    }
+    env_write_success(request.only_if_absent)
+}
+
+/// Called under the admin lock and (for defaults) the install fence.
+async fn persist_env_value(kernel: &Arc<Kernel>, request: &EnvSetRequest) -> Result<bool, String> {
     let EnvSetRequest {
         principal,
         capsule,
@@ -130,81 +195,39 @@ pub(super) async fn env_set(kernel: &Arc<Kernel>, request: EnvSetRequest) -> Adm
         append,
         only_if_absent,
     } = request;
-    if let Err(error) = validate_env_request(&capsule, &key, kind) {
-        return AdminResponseBody::Error(error);
+    if *only_if_absent && has_effective_value(kernel, principal, capsule, key, *kind).await? {
+        return Ok(false);
     }
-    if let Err(error) = validate_env_value(kind, &value) {
-        return AdminResponseBody::Error(error);
-    }
-    // Queue ordinary writers before probing the install fence so concurrent
-    // defaults do not mistake one another for an unresolved install.
-    let _guard = kernel.admin_write_lock.lock().await;
-    // Fail visibly rather than treating an install's staged value as durable.
-    // Never wait here: activation can itself need an admin operation.
-    let _install_guard = if only_if_absent {
-        match kernel.env_install_fence.try_write() {
-            Ok(guard) => Some(guard),
-            Err(_) => return AdminResponseBody::Error(
-                "capsule environment transaction in progress; retry initialization after the install completes".to_owned(),
-            ),
-        }
-    } else {
-        None
-    };
-    // Check both typed lookup scopes while holding the same lock as EnvSet
-    // and EnvDelete. No operator write can slip between this check and commit.
-    if only_if_absent {
-        match has_effective_value(kernel, &principal, &capsule, &key, kind).await {
-            Ok(true) => return env_write_success(only_if_absent),
-            Ok(false) => {},
-            Err(error) => return AdminResponseBody::Error(error),
-        }
-    }
-    let scope_store = match env_scope(kernel, &principal, &capsule, kind, scope) {
-        Ok(store) => store,
-        Err(error) => return AdminResponseBody::Error(error),
-    };
-    let result = match kind {
-        _ if only_if_absent => {
+    let scope_store = env_scope(kernel, principal, capsule, *kind, *scope)?;
+    match kind {
+        _ if *only_if_absent => {
             let storage_key = match kind {
-                EnvValueKind::Text => astrid_storage::env::env_key(&key),
+                EnvValueKind::Text => astrid_storage::env::env_key(key),
                 EnvValueKind::Secret => format!("{}{key}", astrid_storage::env::SECRET_KEY_PREFIX),
             };
-            match scope_store
-                .compare_and_swap(&storage_key, None, value.into_bytes())
+            scope_store
+                .compare_and_swap(&storage_key, None, value.as_bytes().to_vec())
                 .await
-            {
-                Ok(false) => {
-                    return env_write_success(only_if_absent);
-                },
-                Ok(true) => Ok(()),
-                Err(error) => Err(error.to_string()),
-            }
+                .map_err(|error| error.to_string())
         },
-        EnvValueKind::Text if append => astrid_storage::env::append_env(&scope_store, &key, &value)
+        EnvValueKind::Text if *append => astrid_storage::env::append_env(&scope_store, key, value)
             .await
+            .map(|()| true)
             .map_err(|error| error.to_string()),
-        EnvValueKind::Text => astrid_storage::env::set_env(&scope_store, &key, &value)
+        EnvValueKind::Text => astrid_storage::env::set_env(&scope_store, key, value)
             .await
+            .map(|()| true)
             .map_err(|error| error.to_string()),
         EnvValueKind::Secret => {
-            if append {
-                return AdminResponseBody::Error(
-                    "secret environment values cannot be appended".to_owned(),
-                );
+            if *append {
+                return Err("secret environment values cannot be appended".to_owned());
             }
             let store =
                 astrid_storage::KvSecretStore::new(scope_store, tokio::runtime::Handle::current());
-            astrid_storage::SecretStore::set(&store, &key, &value)
+            astrid_storage::SecretStore::set(&store, key, value)
+                .map(|()| true)
                 .map_err(|error| error.to_string())
         },
-    };
-    match result {
-        Ok(()) => match reload_after_env_change(kernel, &principal, &capsule).await {
-            Ok(()) => env_write_success(only_if_absent),
-            Err(error) => AdminResponseBody::Error(error),
-        },
-        Err(error) => AdminResponseBody::Error(error),
     }
 }
 
@@ -275,7 +298,7 @@ pub(super) async fn env_delete(
     if let Err(error) = validate_env_request(&capsule, &key, kind) {
         return AdminResponseBody::Error(error);
     }
-    let _guard = kernel.admin_write_lock.lock().await;
+    let write_guard = kernel.admin_write_lock.lock().await;
     let scope_store = match env_scope(kernel, &principal, &capsule, kind, scope) {
         Ok(store) => store,
         Err(error) => return AdminResponseBody::Error(error),
@@ -290,10 +313,26 @@ pub(super) async fn env_delete(
             astrid_storage::SecretStore::delete(&store, &key).map_err(|error| error.to_string())
         },
     };
-    match deleted {
-        Ok(deleted) => match reload_after_env_change(kernel, &principal, &capsule).await {
-            Ok(()) => AdminResponseBody::Success(serde_json::json!({"deleted": deleted})),
-            Err(error) => AdminResponseBody::Error(error),
+    let deleted = match deleted {
+        Ok(deleted) => deleted,
+        Err(error) => return AdminResponseBody::Error(error),
+    };
+    let id = match CapsuleId::new(capsule.clone()) {
+        Ok(id) => id,
+        Err(error) => return AdminResponseBody::Error(error.to_string()),
+    };
+    let refresh_key = (principal.clone(), id);
+    let ticket = Arc::new(());
+    kernel
+        .env_refresh_pending
+        .insert(refresh_key.clone(), Arc::clone(&ticket));
+    drop(write_guard);
+    match reload_after_env_change(kernel, &principal, &capsule).await {
+        Ok(()) => {
+            kernel
+                .env_refresh_pending
+                .remove_if(&refresh_key, |_, current| Arc::ptr_eq(current, &ticket));
+            AdminResponseBody::Success(serde_json::json!({"deleted": deleted}))
         },
         Err(error) => AdminResponseBody::Error(error),
     }
