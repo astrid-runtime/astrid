@@ -36,6 +36,7 @@ pub(crate) use selected::{
 mod lifetime;
 pub(crate) use lifetime::ProvisioningLease;
 mod environment;
+use environment::ResolvedVariables;
 pub(crate) use environment::write_env_files;
 mod onboarding;
 mod unfiltered;
@@ -479,7 +480,7 @@ pub(crate) fn collect_variables(
     selected: &[DistroCapsule],
     yes: bool,
     cli_vars: &HashMap<String, String>,
-) -> anyhow::Result<HashMap<String, String>> {
+) -> anyhow::Result<ResolvedVariables> {
     // Collect all variable references from selected capsules.
     let mut needed_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
     for cap in selected {
@@ -491,7 +492,7 @@ pub(crate) fn collect_variables(
     }
 
     if needed_vars.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(ResolvedVariables::default());
     }
 
     if yes {
@@ -501,13 +502,20 @@ pub(crate) fn collect_variables(
     }
 
     eprintln!("Configuration:");
-    let mut vars = HashMap::new();
+    let mut vars = ResolvedVariables::default();
 
     // Sort for deterministic prompt order.
     let mut sorted_vars: Vec<&str> = needed_vars.iter().map(String::as_str).collect();
     sorted_vars.sort_unstable();
 
     for var_name in sorted_vars {
+        // Explicit CLI input wins in interactive mode too. In particular,
+        // an empty non-secret override is a value, not acceptance of a default.
+        if let Some(value) = cli_vars.get(var_name) {
+            vars.explicit.insert(var_name.to_string());
+            vars.values.insert(var_name.to_string(), value.clone());
+            continue;
+        }
         let Some(def) = variables.get(var_name) else {
             continue;
         };
@@ -533,7 +541,10 @@ pub(crate) fn collect_variables(
         };
 
         if !value.is_empty() {
-            vars.insert(var_name.to_string(), value);
+            if !input.is_empty() {
+                vars.explicit.insert(var_name.to_string());
+            }
+            vars.values.insert(var_name.to_string(), value);
         }
     }
 
@@ -553,18 +564,22 @@ fn collect_variables_headless(
     needed_vars: &std::collections::HashSet<String>,
     cli_vars: &HashMap<String, String>,
     env_lookup: impl Fn(&str) -> Option<String>,
-) -> anyhow::Result<HashMap<String, String>> {
-    let mut vars = HashMap::new();
+) -> anyhow::Result<ResolvedVariables> {
+    let mut vars = ResolvedVariables::default();
     let mut sorted: Vec<&str> = needed_vars.iter().map(String::as_str).collect();
     sorted.sort_unstable();
 
     for var_name in sorted {
         let env_key = format!("ASTRID_VAR_{}", var_name.to_uppercase());
         let var_def = variables.get(var_name);
-        let value = cli_vars
+        let supplied = cli_vars
             .get(var_name)
             .cloned()
-            .or_else(|| env_lookup(&env_key))
+            .or_else(|| env_lookup(&env_key));
+        if supplied.is_some() {
+            vars.explicit.insert(var_name.to_string());
+        }
+        let value = supplied
             .or_else(|| var_def.and_then(|d| d.default.clone()))
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -580,7 +595,7 @@ fn collect_variables_headless(
             tracing::debug!(var = %var_name, value = %value, "resolved distro variable");
         }
 
-        vars.insert(var_name.to_string(), value);
+        vars.values.insert(var_name.to_string(), value);
     }
 
     Ok(vars)

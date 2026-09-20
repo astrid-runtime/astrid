@@ -54,6 +54,7 @@ pub const fn topic_suffix(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::QuotaGet { .. } => "quota.get",
         AdminRequestKind::UsageGet { .. } => "usage.get",
         AdminRequestKind::EnvSet { .. } => "env.set",
+        AdminRequestKind::EnvSetIfAbsent { .. } => "env.set_if_absent",
         AdminRequestKind::EnvList { .. } => "env.list",
         AdminRequestKind::EnvDelete { .. } => "env.delete",
         AdminRequestKind::DistroLockGet { .. } => "distro.lock.get",

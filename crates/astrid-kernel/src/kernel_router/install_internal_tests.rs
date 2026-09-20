@@ -2,6 +2,210 @@
 //! file stays under the source-size cap.
 use super::*;
 use astrid_core::PrincipalId;
+use std::fmt::Write as _;
+
+#[tokio::test]
+async fn overlapping_failed_installs_cannot_restore_another_staged_value() {
+    let root = tempfile::tempdir().unwrap();
+    let kernel =
+        crate::test_kernel_with_home(astrid_core::dirs::AstridHome::from_path(root.path())).await;
+    let principal = PrincipalId::default();
+    let uid = kernel.principal_directory.uid_for(&principal).unwrap();
+    let source = root.path().join("fixture");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("Capsule.toml"),
+        "[package]\nname = 'fixture'\nversion = '1.0.0'\n[env.PLAIN]\ntype = 'text'\n[env.SECRET]\ntype = 'secret'\n",
+    )
+    .unwrap();
+    for (key, kind, scope) in [
+        ("PLAIN", EnvValueKind::Text, EnvStorageScope::Agent),
+        ("SECRET", EnvValueKind::Secret, EnvStorageScope::Shared),
+    ] {
+        let mut values = [CapsuleInstallEnv {
+            key: key.into(),
+            value: "first-staged".into(),
+            kind,
+        }];
+        let first = stage_env_values(&kernel, &principal, &source, None, &values)
+            .await
+            .unwrap()
+            .unwrap();
+        values[0].value = "second-staged".into();
+        let overlap = stage_env_values(&kernel, &principal, &source, None, &values).await;
+        assert!(matches!(overlap, Err(error) if error.contains("retry the install")));
+        first.rollback(&kernel).await;
+        let second = stage_env_values(&kernel, &principal, &source, None, &values)
+            .await
+            .unwrap()
+            .unwrap();
+        second.rollback(&kernel).await;
+        assert_eq!(
+            kernel
+                .kv
+                .get(
+                    &env_namespace(uid, "fixture", kind, scope),
+                    &env_storage_key(&values[0])
+                )
+                .await
+                .unwrap(),
+            None,
+            "both failed installs must leave the original absence: {kind:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rollback_restores_other_keys_after_concurrent_set_and_delete() {
+    use crate::kernel_router::admin::{dispatch_as_operator, seed_operator};
+    use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
+    let root = tempfile::tempdir().unwrap();
+    let kernel =
+        crate::test_kernel_with_home(astrid_core::dirs::AstridHome::from_path(root.path())).await;
+    seed_operator(&kernel).await;
+    let principal = PrincipalId::default();
+    let uid = kernel.principal_directory.uid_for(&principal).unwrap();
+    for (kind, scope, type_name) in [
+        (EnvValueKind::Text, EnvStorageScope::Agent, "text"),
+        (EnvValueKind::Secret, EnvStorageScope::Shared, "secret"),
+    ] {
+        let source = root.path().join(type_name);
+        std::fs::create_dir_all(&source).unwrap();
+        let mut manifest = "[package]\nname = 'fixture'\nversion = '1.0.0'\n".to_owned();
+        let namespace = env_namespace(uid, "fixture", kind, scope);
+        let values: Vec<_> = ["EDITED", "DELETED", "RESTORED", "REMOVED"]
+            .into_iter()
+            .map(|key| {
+                writeln!(manifest, "[env.{key}]\ntype = '{type_name}'").unwrap();
+                CapsuleInstallEnv {
+                    key: key.into(),
+                    value: "staged".into(),
+                    kind,
+                }
+            })
+            .collect();
+        std::fs::write(source.join("Capsule.toml"), manifest).unwrap();
+        for value in &values[..3] {
+            kernel
+                .kv
+                .set(&namespace, &env_storage_key(value), b"original".to_vec())
+                .await
+                .unwrap();
+        }
+        let transaction = stage_env_values(&kernel, &principal, &source, None, &values)
+            .await
+            .unwrap()
+            .unwrap();
+        for request in [
+            AdminRequestKind::EnvSet {
+                principal: principal.clone(),
+                capsule: "fixture".into(),
+                key: "EDITED".into(),
+                value: "operator".into(),
+                kind,
+                scope,
+                append: false,
+            },
+            AdminRequestKind::EnvDelete {
+                principal: principal.clone(),
+                capsule: "fixture".into(),
+                key: "DELETED".into(),
+                kind,
+                scope,
+            },
+        ] {
+            assert!(matches!(
+                dispatch_as_operator(&kernel, &principal, request).await,
+                AdminResponseBody::Success(_)
+            ));
+        }
+        transaction.rollback(&kernel).await;
+        for (value, expected) in values.iter().zip([
+            Some(b"operator".to_vec()),
+            None,
+            Some(b"original".to_vec()),
+            None,
+        ]) {
+            assert_eq!(
+                kernel
+                    .kv
+                    .get(&namespace, &env_storage_key(value))
+                    .await
+                    .unwrap(),
+                expected,
+                "{kind:?}: {}",
+                value.key
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn conditional_defaults_retry_after_failed_install_rollback() {
+    use crate::kernel_router::admin::{dispatch_as_operator, seed_operator};
+    use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
+
+    let root = tempfile::tempdir().unwrap();
+    let kernel =
+        crate::test_kernel_with_home(astrid_core::dirs::AstridHome::from_path(root.path())).await;
+    seed_operator(&kernel).await;
+    let principal = PrincipalId::default();
+    let source = root.path().join("fixture");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("Capsule.toml"),
+        r#"
+        [package]
+        name = "fixture"
+        version = "1.0.0"
+        [env.PLAIN]
+        type = "text"
+        [env.SECRET]
+        type = "secret"
+    "#,
+    )
+    .unwrap();
+    for (key, kind) in [
+        ("PLAIN", EnvValueKind::Text),
+        ("SECRET", EnvValueKind::Secret),
+    ] {
+        let values = [CapsuleInstallEnv {
+            key: key.into(),
+            value: "temporary".into(),
+            kind,
+        }];
+        let transaction = stage_env_values(&kernel, &principal, &source, None, &values)
+            .await
+            .unwrap()
+            .unwrap();
+        let request = AdminRequestKind::EnvSetIfAbsent {
+            principal: principal.clone(),
+            capsule: "fixture".into(),
+            key: key.into(),
+            value: "default".into(),
+            kind,
+        };
+        let response = dispatch_as_operator(&kernel, &principal, request.clone()).await;
+        assert!(
+            matches!(response, AdminResponseBody::Error(error) if error.contains("retry initialization"))
+        );
+        transaction.rollback(&kernel).await;
+        let response = dispatch_as_operator(&kernel, &principal, request).await;
+        assert!(
+            matches!(response, AdminResponseBody::Success(value) if value == serde_json::json!({}))
+        );
+        let uid = kernel.principal_directory.uid_for(&principal).unwrap();
+        let namespace = env_namespace(uid, "fixture", kind, EnvStorageScope::Agent);
+        assert_eq!(
+            kernel
+                .kv
+                .get(&namespace, &env_storage_key(&values[0]))
+                .await
+                .unwrap(),
+            Some(b"default".to_vec())
+        );
+    }
+}
 
 #[tokio::test]
 async fn install_env_transaction_restores_existing_text_and_secret_values() {

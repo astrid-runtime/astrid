@@ -50,6 +50,7 @@ struct EnvTransaction {
     uid: astrid_core::identity::PrincipalUid,
     capsule: String,
     snapshots: Vec<EnvSnapshot>,
+    _default_fence: tokio::sync::OwnedRwLockWriteGuard<()>,
 }
 
 impl EnvTransaction {
@@ -448,6 +449,16 @@ async fn stage_env_values(
         .map_err(|error| format!("resolve durable principal UID: {error}"))?;
     validate_env_values(manifest, values)?;
 
+    // Keep defaults and other install transactions out through commit/rollback.
+    // Otherwise one rollback can restore another failed install's staged value.
+    // Never wait here: activation may itself request an install.
+    let default_fence = Arc::clone(&kernel.env_install_fence)
+        .try_write_owned()
+        .map_err(|_| "environment transaction in progress; retry the install".to_owned())?;
+    // Serialize shared/agent environment staging with admin default writes.
+    // Keep the lock only for the KV transaction, never capsule activation.
+    let _env_guard = kernel.admin_write_lock.lock().await;
+
     let mut snapshots = Vec::with_capacity(values.len());
     for value in values {
         // Install secrets are the site credential. Every assigned principal
@@ -510,6 +521,7 @@ async fn stage_env_values(
         uid,
         capsule,
         snapshots,
+        _default_fence: default_fence,
     }))
 }
 
@@ -650,17 +662,24 @@ async fn rollback_env_snapshot_group(
     capsule: &str,
     snapshots: Vec<EnvSnapshot>,
 ) {
-    match apply_env_snapshot_group(kernel, uid, capsule, &snapshots, true).await {
-        Ok(true) => {},
-        Ok(false) => tracing::warn!(
-            capsule = %capsule,
-            "environment rollback skipped after a concurrent value change"
-        ),
-        Err(error) => tracing::error!(
-            capsule = %capsule,
-            error = %error,
-            "failed to restore pre-install environment values atomically"
-        ),
+    // Staging is all-or-nothing, but rollback must preserve each later edit
+    // independently. One changed key must not strand unrelated staged values.
+    // Each single-key batch still atomically compares and restores its snapshot.
+    for snapshot in snapshots {
+        match apply_env_snapshot_group(kernel, uid, capsule, std::slice::from_ref(&snapshot), true)
+            .await
+        {
+            Ok(true) => {},
+            Ok(false) => tracing::warn!(
+                capsule = %capsule,
+                "environment rollback preserved a concurrently changed key"
+            ),
+            Err(error) => tracing::error!(
+                capsule = %capsule,
+                error = %error,
+                "failed to restore a pre-install environment value"
+            ),
+        }
     }
 }
 

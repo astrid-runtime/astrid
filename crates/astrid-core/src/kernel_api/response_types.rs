@@ -1,5 +1,39 @@
-use super::{DeviceKeyInfo, EnvEntry, PrincipalId, Quotas, StorageMountLeaseV1};
+use super::{EnvEntry, PrincipalId, Quotas, StorageMountLeaseV1};
 use serde::{Deserialize, Serialize};
+
+/// Per-device summary returned by [`super::AdminRequestKind::PairDeviceList`].
+///
+/// Carries only non-secret, fingerprint-level identity — the deterministic
+/// `key_id`, the operator label, the granted [`DeviceScope`](crate::DeviceScope),
+/// and the pairing timestamp. The raw ed25519 public key is **never** surfaced;
+/// the `key_id` (derived from the already-public pubkey) is the stable handle
+/// for listing and revocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceKeyInfo {
+    /// Deterministic per-device fingerprint handle.
+    pub key_id: String,
+    /// Operator/user-facing label captured at pairing time, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Capability attenuation scope the device authenticates under.
+    pub scope: crate::DeviceScope,
+    /// Unix epoch seconds when the device was paired (`0` for migrated
+    /// legacy keys that predate pairing-time recording).
+    pub created_at: i64,
+}
+
+/// Admin management API response wrapper carrying the echoed
+/// correlation ID and the typed response body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminKernelResponse {
+    /// Echoed `request_id` from the [`super::AdminKernelRequest`] this response
+    /// answers. `None` when the client did not provide one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// The typed response body — `tag = "status", content = "data"`.
+    #[serde(flatten)]
+    pub body: AdminResponseBody,
+}
 
 /// Durable provenance for one authenticated principal's distro installation.
 ///

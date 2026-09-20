@@ -449,6 +449,14 @@ pub struct Kernel {
     /// cover reads. Tokio's `Mutex` is not poisonable — no
     /// `PoisonError::into_inner` dance required.
     pub(crate) admin_write_lock: Mutex<()>,
+    /// Installs hold an exclusive guard until environment commit or rollback.
+    /// Installs and conditional defaults acquire without waiting, so neither
+    /// snapshots staged values as committed configuration nor deadlocks activation.
+    pub(crate) env_install_fence: Arc<tokio::sync::RwLock<()>>,
+    /// Durable env writes awaiting a live refresh. Process restart loads the
+    /// durable values afresh; tickets prevent an older refresh clearing a newer one.
+    pub(crate) env_refresh_pending:
+        DashMap<(PrincipalId, astrid_capsule_types::CapsuleId), Arc<()>>,
     /// Serializes canonical projection repair for one owner/capsule/digest.
     ///
     /// Inventory, warmup, and `agent.modify` all repair through
@@ -1391,6 +1399,8 @@ impl Kernel {
             groups,
             astrid_home: home,
             admin_write_lock: Mutex::new(()),
+            env_install_fence: Arc::new(tokio::sync::RwLock::new(())),
+            env_refresh_pending: DashMap::new(),
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             materialization_repair_locks:
                 capsule_materialization::MaterializationRepairLocks::default(),
@@ -3843,6 +3853,8 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         groups,
         astrid_home: home,
         admin_write_lock: Mutex::new(()),
+        env_install_fence: Arc::new(tokio::sync::RwLock::new(())),
+        env_refresh_pending: DashMap::new(),
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         materialization_repair_locks: capsule_materialization::MaterializationRepairLocks::default(
         ),

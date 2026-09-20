@@ -261,6 +261,7 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         | AdminRequestKind::QuotaSet { principal, .. }
         | AdminRequestKind::UsageGet { principal }
         | AdminRequestKind::EnvList { principal, .. }
+        | AdminRequestKind::EnvSetIfAbsent { principal, .. }
         | AdminRequestKind::DistroLockGet { principal }
         | AdminRequestKind::DistroLockSet { principal, .. }
         // Device management is self-scoped when the target IS the caller —
@@ -380,11 +381,15 @@ pub fn required_capability_for_admin_request(
         (AdminRequestKind::QuotaSet { .. }, AuthorityScope::Self_) => "self:quota:set",
         (AdminRequestKind::QuotaSet { .. }, AuthorityScope::Global) => "quota:set",
         (
-            AdminRequestKind::EnvSet { .. } | AdminRequestKind::EnvDelete { .. },
+            AdminRequestKind::EnvSet { .. }
+            | AdminRequestKind::EnvSetIfAbsent { .. }
+            | AdminRequestKind::EnvDelete { .. },
             AuthorityScope::Self_,
         ) => "self:env:write",
         (
-            AdminRequestKind::EnvSet { .. } | AdminRequestKind::EnvDelete { .. },
+            AdminRequestKind::EnvSet { .. }
+            | AdminRequestKind::EnvSetIfAbsent { .. }
+            | AdminRequestKind::EnvDelete { .. },
             AuthorityScope::Global,
         ) => "env:write",
         (AdminRequestKind::EnvList { .. }, AuthorityScope::Self_) => "self:env:read",
@@ -536,6 +541,7 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::QuotaGet { .. } => "admin.quota.get",
         AdminRequestKind::UsageGet { .. } => "admin.usage.get",
         AdminRequestKind::EnvSet { .. } => "admin.env.set",
+        AdminRequestKind::EnvSetIfAbsent { .. } => "admin.env.set_if_absent",
         AdminRequestKind::EnvList { .. } => "admin.env.list",
         AdminRequestKind::EnvDelete { .. } => "admin.env.delete",
         AdminRequestKind::DistroLockGet { .. } => "admin.distro.lock.get",
@@ -638,7 +644,7 @@ fn sanitize_admin_audit_params(req: &AdminRequestKind) -> Option<serde_json::Val
                 serde_json::Value::String(crate::pair_token::hash_token(token)),
             );
         },
-        AdminRequestKind::EnvSet { .. } => {
+        AdminRequestKind::EnvSet { .. } | AdminRequestKind::EnvSetIfAbsent { .. } => {
             params.remove("value");
             params.insert(
                 "value".to_string(),
@@ -674,6 +680,7 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         | AdminRequestKind::QuotaGet { principal }
         | AdminRequestKind::UsageGet { principal }
         | AdminRequestKind::EnvSet { principal, .. }
+        | AdminRequestKind::EnvSetIfAbsent { principal, .. }
         | AdminRequestKind::EnvList { principal, .. }
         | AdminRequestKind::EnvDelete { principal, .. }
         | AdminRequestKind::DistroLockGet { principal }
