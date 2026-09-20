@@ -2,6 +2,58 @@
 //! file stays under the source-size cap.
 use super::*;
 use astrid_core::PrincipalId;
+use std::fmt::Write as _;
+
+#[tokio::test]
+async fn overlapping_failed_installs_cannot_restore_another_staged_value() {
+    let root = tempfile::tempdir().unwrap();
+    let kernel =
+        crate::test_kernel_with_home(astrid_core::dirs::AstridHome::from_path(root.path())).await;
+    let principal = PrincipalId::default();
+    let uid = kernel.principal_directory.uid_for(&principal).unwrap();
+    let source = root.path().join("fixture");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("Capsule.toml"),
+        "[package]\nname = 'fixture'\nversion = '1.0.0'\n[env.PLAIN]\ntype = 'text'\n[env.SECRET]\ntype = 'secret'\n",
+    )
+    .unwrap();
+    for (key, kind, scope) in [
+        ("PLAIN", EnvValueKind::Text, EnvStorageScope::Agent),
+        ("SECRET", EnvValueKind::Secret, EnvStorageScope::Shared),
+    ] {
+        let mut values = [CapsuleInstallEnv {
+            key: key.into(),
+            value: "first-staged".into(),
+            kind,
+        }];
+        let first = stage_env_values(&kernel, &principal, &source, None, &values)
+            .await
+            .unwrap()
+            .unwrap();
+        values[0].value = "second-staged".into();
+        let overlap = stage_env_values(&kernel, &principal, &source, None, &values).await;
+        assert!(matches!(overlap, Err(error) if error.contains("retry the install")));
+        first.rollback(&kernel).await;
+        let second = stage_env_values(&kernel, &principal, &source, None, &values)
+            .await
+            .unwrap()
+            .unwrap();
+        second.rollback(&kernel).await;
+        assert_eq!(
+            kernel
+                .kv
+                .get(
+                    &env_namespace(uid, "fixture", kind, scope),
+                    &env_storage_key(&values[0])
+                )
+                .await
+                .unwrap(),
+            None,
+            "both failed installs must leave the original absence: {kind:?}"
+        );
+    }
+}
 
 #[tokio::test]
 async fn rollback_restores_other_keys_after_concurrent_set_and_delete() {
@@ -24,7 +76,7 @@ async fn rollback_restores_other_keys_after_concurrent_set_and_delete() {
         let values: Vec<_> = ["EDITED", "DELETED", "RESTORED", "REMOVED"]
             .into_iter()
             .map(|key| {
-                manifest.push_str(&format!("[env.{key}]\ntype = '{type_name}'\n"));
+                writeln!(manifest, "[env.{key}]\ntype = '{type_name}'").unwrap();
                 CapsuleInstallEnv {
                     key: key.into(),
                     value: "staged".into(),

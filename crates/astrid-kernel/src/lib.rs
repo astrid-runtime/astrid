@@ -449,9 +449,9 @@ pub struct Kernel {
     /// cover reads. Tokio's `Mutex` is not poisonable — no
     /// `PoisonError::into_inner` dance required.
     pub(crate) admin_write_lock: Mutex<()>,
-    /// Installs hold a shared guard until environment commit or rollback.
-    /// Conditional defaults take an exclusive guard without waiting, so they
-    /// never mistake staged values for committed configuration or deadlock activation.
+    /// Installs hold an exclusive guard until environment commit or rollback.
+    /// Installs and conditional defaults acquire without waiting, so neither
+    /// snapshots staged values as committed configuration nor deadlocks activation.
     pub(crate) env_install_fence: Arc<tokio::sync::RwLock<()>>,
     /// Durable env writes awaiting a live refresh. Process restart loads the
     /// durable values afresh; tickets prevent an older refresh clearing a newer one.

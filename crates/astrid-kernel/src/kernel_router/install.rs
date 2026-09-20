@@ -50,7 +50,7 @@ struct EnvTransaction {
     uid: astrid_core::identity::PrincipalUid,
     capsule: String,
     snapshots: Vec<EnvSnapshot>,
-    _default_fence: tokio::sync::OwnedRwLockReadGuard<()>,
+    _default_fence: tokio::sync::OwnedRwLockWriteGuard<()>,
 }
 
 impl EnvTransaction {
@@ -449,8 +449,12 @@ async fn stage_env_values(
         .map_err(|error| format!("resolve durable principal UID: {error}"))?;
     validate_env_values(manifest, values)?;
 
-    // Keep defaults out until this transaction commits or finishes rollback.
-    let default_fence = Arc::clone(&kernel.env_install_fence).read_owned().await;
+    // Keep defaults and other install transactions out through commit/rollback.
+    // Otherwise one rollback can restore another failed install's staged value.
+    // Never wait here: activation may itself request an install.
+    let default_fence = Arc::clone(&kernel.env_install_fence)
+        .try_write_owned()
+        .map_err(|_| "environment transaction in progress; retry the install".to_owned())?;
     // Serialize shared/agent environment staging with admin default writes.
     // Keep the lock only for the KV transaction, never capsule activation.
     let _env_guard = kernel.admin_write_lock.lock().await;
