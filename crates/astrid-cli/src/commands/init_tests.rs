@@ -814,6 +814,21 @@ fn var(secret: bool, default: Option<&str>) -> VariableDef {
     }
 }
 
+#[test]
+fn interactive_cli_overrides_are_explicit_including_empty_text() {
+    let variables = HashMap::from([("model".into(), var(false, Some("default")))]);
+    let selected = vec![cap_with_env("provider", "model", "{{ model }}")];
+    for value in ["custom", ""] {
+        let cli = HashMap::from([("model".into(), value.into())]);
+        let resolved = collect_variables(&variables, &selected, false, &cli).unwrap();
+        assert_eq!(
+            resolved.values.get("model").map(String::as_str),
+            Some(value)
+        );
+        assert!(resolved.explicit.contains("model"));
+    }
+}
+
 fn cap_with_env(name: &str, key: &str, template: &str) -> DistroCapsule {
     let mut c = cap(name, None, false);
     c.env.insert(key.to_string(), template.to_string());

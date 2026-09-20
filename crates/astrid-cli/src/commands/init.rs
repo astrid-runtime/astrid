@@ -509,6 +509,13 @@ pub(crate) fn collect_variables(
     sorted_vars.sort_unstable();
 
     for var_name in sorted_vars {
+        // Explicit CLI input wins in interactive mode too. In particular,
+        // an empty non-secret override is a value, not acceptance of a default.
+        if let Some(value) = cli_vars.get(var_name) {
+            vars.explicit.insert(var_name.to_string());
+            vars.values.insert(var_name.to_string(), value.clone());
+            continue;
+        }
         let Some(def) = variables.get(var_name) else {
             continue;
         };

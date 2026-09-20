@@ -658,17 +658,24 @@ async fn rollback_env_snapshot_group(
     capsule: &str,
     snapshots: Vec<EnvSnapshot>,
 ) {
-    match apply_env_snapshot_group(kernel, uid, capsule, &snapshots, true).await {
-        Ok(true) => {},
-        Ok(false) => tracing::warn!(
-            capsule = %capsule,
-            "environment rollback skipped after a concurrent value change"
-        ),
-        Err(error) => tracing::error!(
-            capsule = %capsule,
-            error = %error,
-            "failed to restore pre-install environment values atomically"
-        ),
+    // Staging is all-or-nothing, but rollback must preserve each later edit
+    // independently. One changed key must not strand unrelated staged values.
+    // Each single-key batch still atomically compares and restores its snapshot.
+    for snapshot in snapshots {
+        match apply_env_snapshot_group(kernel, uid, capsule, std::slice::from_ref(&snapshot), true)
+            .await
+        {
+            Ok(true) => {},
+            Ok(false) => tracing::warn!(
+                capsule = %capsule,
+                "environment rollback preserved a concurrently changed key"
+            ),
+            Err(error) => tracing::error!(
+                capsule = %capsule,
+                error = %error,
+                "failed to restore a pre-install environment value"
+            ),
+        }
     }
 }
 
