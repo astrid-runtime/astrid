@@ -871,7 +871,10 @@ fn unset_optional_secret_requires_no_daemon_write() {
                 &astrid_core::PrincipalId::default(),
                 &selected,
                 &variables,
-                &vars,
+                &ResolvedVariables {
+                    values: vars,
+                    ..Default::default()
+                },
             )
             .expect("an absent credential must not issue a secret write");
         }
@@ -888,7 +891,8 @@ fn headless_collect_uses_cli_var_override() {
     cli.insert("api_key".to_string(), "from-cli".to_string());
 
     let vars = collect_variables(&variables, &selected, true, &cli).unwrap();
-    assert_eq!(vars["api_key"], "from-cli");
+    assert_eq!(vars.values["api_key"], "from-cli");
+    assert!(vars.explicit.contains("api_key"));
 }
 
 #[test]
@@ -900,7 +904,8 @@ fn headless_collect_uses_env_then_default() {
 
     // No CLI var, no env → default.
     let vars = collect_variables_headless(&variables, &needed, &HashMap::new(), |_| None).unwrap();
-    assert_eq!(vars["base_url"], "https://default");
+    assert_eq!(vars.values["base_url"], "https://default");
+    assert!(vars.explicit.is_empty());
 
     // Env (ASTRID_VAR_BASE_URL) beats default — injected lookup, no
     // process-global state.
@@ -908,7 +913,8 @@ fn headless_collect_uses_env_then_default() {
         (k == "ASTRID_VAR_BASE_URL").then(|| "https://from-env".to_string())
     })
     .unwrap();
-    assert_eq!(vars["base_url"], "https://from-env");
+    assert_eq!(vars.values["base_url"], "https://from-env");
+    assert!(vars.explicit.contains("base_url"));
 }
 
 #[tokio::test]
@@ -947,8 +953,10 @@ fn headless_collect_errors_on_missing_required_var() {
     let mut needed = std::collections::HashSet::new();
     needed.insert("api_key".to_string());
 
-    let err =
-        collect_variables_headless(&variables, &needed, &HashMap::new(), |_| None).unwrap_err();
+    let Err(err) = collect_variables_headless(&variables, &needed, &HashMap::new(), |_| None)
+    else {
+        panic!("a missing required variable must fail");
+    };
     let msg = err.to_string();
     assert!(msg.contains("api_key"), "got: {msg}");
     assert!(msg.contains("ASTRID_VAR_API_KEY"), "got: {msg}");
