@@ -141,6 +141,22 @@ pub(super) async fn env_set(kernel: &Arc<Kernel>, request: EnvSetRequest) -> Adm
         Err(error) => return AdminResponseBody::Error(error),
     };
     let result = match kind {
+        _ if only_if_absent => {
+            let storage_key = match kind {
+                EnvValueKind::Text => astrid_storage::env::env_key(&key),
+                EnvValueKind::Secret => format!("{}{key}", astrid_storage::env::SECRET_KEY_PREFIX),
+            };
+            match scope_store
+                .compare_and_swap(&storage_key, None, value.into_bytes())
+                .await
+            {
+                Ok(false) => {
+                    return AdminResponseBody::Success(serde_json::json!({"stored": false}));
+                },
+                Ok(true) => Ok(()),
+                Err(error) => Err(error.to_string()),
+            }
+        },
         EnvValueKind::Text if append => astrid_storage::env::append_env(&scope_store, &key, &value)
             .await
             .map_err(|error| error.to_string()),
