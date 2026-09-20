@@ -8,6 +8,12 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ## [Unreleased]
 
+## [2026.9.4] - 2026-09-20
+
+### Fixed
+
+- Preserve existing capsule configuration when initialization reapplies distribution defaults. Defaults now fill missing keys without resetting operator choices; explicitly supplied values still override existing settings.
+
 ## [2026.9.3] - 2026-09-18
 
 ### Added
