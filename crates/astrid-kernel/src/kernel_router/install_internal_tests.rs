@@ -54,7 +54,9 @@ async fn conditional_defaults_retry_after_failed_install_rollback() {
         );
         transaction.rollback(&kernel).await;
         let response = dispatch_as_operator(&kernel, &principal, request).await;
-        assert!(matches!(response, AdminResponseBody::Success(value) if value["stored"] == true));
+        assert!(
+            matches!(response, AdminResponseBody::Success(value) if value == serde_json::json!({}))
+        );
         let uid = kernel.principal_directory.uid_for(&principal).unwrap();
         let namespace = env_namespace(uid, "fixture", kind, EnvStorageScope::Agent);
         assert_eq!(

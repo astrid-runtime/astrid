@@ -34,8 +34,23 @@ async fn concurrent_defaults_queue_instead_of_reporting_an_install() {
     assert!(poll_fn(|cx| Poll::Ready(second.as_mut().poll(cx).is_pending())).await);
     drop(guard);
     let (first, second) = tokio::join!(first, second);
-    assert!(stored(first));
-    assert!(!stored(second));
+    default_success(first);
+    default_success(second);
+    let store = env_scope(
+        &kernel,
+        &PrincipalId::default(),
+        "provider",
+        EnvValueKind::Text,
+        EnvStorageScope::Agent,
+    )
+    .unwrap();
+    assert_eq!(
+        astrid_storage::env::get_env(&store, "model")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("first")
+    );
 }
 
 #[tokio::test]
@@ -103,6 +118,13 @@ fn stored(response: AdminResponseBody) -> bool {
     }
 }
 
+fn default_success(response: AdminResponseBody) {
+    match response {
+        AdminResponseBody::Success(value) => assert_eq!(value, serde_json::json!({})),
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn defaults_preserve_same_kind_in_both_scopes_but_ignore_wrong_kind() {
     let (_dir, kernel) = fixture().await;
@@ -117,22 +139,43 @@ async fn defaults_preserve_same_kind_in_both_scopes_but_ignore_wrong_kind() {
                     )
                     .await
                 ));
-                assert_eq!(
-                    stored(
-                        env_set(
-                            &kernel,
-                            request(
-                                &key,
-                                "default",
-                                requested_kind,
-                                EnvStorageScope::Agent,
-                                true
-                            )
-                        )
-                        .await
-                    ),
-                    existing_kind != requested_kind
+                default_success(
+                    env_set(
+                        &kernel,
+                        request(
+                            &key,
+                            "default",
+                            requested_kind,
+                            EnvStorageScope::Agent,
+                            true,
+                        ),
+                    )
+                    .await,
                 );
+                let overlay = env_scope(
+                    &kernel,
+                    &PrincipalId::default(),
+                    "provider",
+                    requested_kind,
+                    EnvStorageScope::Agent,
+                )
+                .unwrap();
+                let actual = match requested_kind {
+                    EnvValueKind::Text => {
+                        astrid_storage::env::get_env(&overlay, &key).await.unwrap()
+                    },
+                    EnvValueKind::Secret => astrid_storage::env::get_secret(&overlay, &key)
+                        .await
+                        .unwrap(),
+                };
+                let expected = if existing_kind != requested_kind {
+                    Some("default")
+                } else if scope == EnvStorageScope::Agent {
+                    Some("operator")
+                } else {
+                    None
+                };
+                assert_eq!(actual.as_deref(), expected);
                 let original = env_scope(
                     &kernel,
                     &PrincipalId::default(),
@@ -182,7 +225,7 @@ async fn concurrent_default_and_explicit_write_always_preserve_operator_value() 
                 )
             ),
         );
-        stored(default);
+        default_success(default);
         assert!(stored(explicit));
         let store = env_scope(
             &kernel,

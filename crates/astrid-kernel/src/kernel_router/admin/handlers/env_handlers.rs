@@ -155,7 +155,7 @@ pub(super) async fn env_set(kernel: &Arc<Kernel>, request: EnvSetRequest) -> Adm
     // and EnvDelete. No operator write can slip between this check and commit.
     if only_if_absent {
         match has_effective_value(kernel, &principal, &capsule, &key, kind).await {
-            Ok(true) => return AdminResponseBody::Success(serde_json::json!({"stored": false})),
+            Ok(true) => return env_write_success(only_if_absent),
             Ok(false) => {},
             Err(error) => return AdminResponseBody::Error(error),
         }
@@ -175,7 +175,7 @@ pub(super) async fn env_set(kernel: &Arc<Kernel>, request: EnvSetRequest) -> Adm
                 .await
             {
                 Ok(false) => {
-                    return AdminResponseBody::Success(serde_json::json!({"stored": false}));
+                    return env_write_success(only_if_absent);
                 },
                 Ok(true) => Ok(()),
                 Err(error) => Err(error.to_string()),
@@ -201,11 +201,21 @@ pub(super) async fn env_set(kernel: &Arc<Kernel>, request: EnvSetRequest) -> Adm
     };
     match result {
         Ok(()) => match reload_after_env_change(kernel, &principal, &capsule).await {
-            Ok(()) => AdminResponseBody::Success(serde_json::json!({"stored": true})),
+            Ok(()) => env_write_success(only_if_absent),
             Err(error) => AdminResponseBody::Error(error),
         },
         Err(error) => AdminResponseBody::Error(error),
     }
+}
+
+fn env_write_success(only_if_absent: bool) -> AdminResponseBody {
+    // Default writers need no read authority. Do not reveal whether an
+    // agent or shared value existed through the conditional response.
+    AdminResponseBody::Success(if only_if_absent {
+        serde_json::json!({})
+    } else {
+        serde_json::json!({"stored": true})
+    })
 }
 
 /// Defaults always target the principal overlay and never replace shared state.
