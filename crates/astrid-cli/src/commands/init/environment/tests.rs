@@ -9,101 +9,44 @@ fn capsule(template: &str) -> DistroCapsule {
 }
 
 #[test]
-fn distro_defaults_preserve_existing_config_and_seed_missing_keys() {
-    for template in ["{{ model }}", "literal-default"] {
-        for already_set in [false, true] {
-            let vars = ResolvedVariables {
-                values: HashMap::from([("model".into(), "default-model".into())]),
-                ..Default::default()
-            };
-            let mut writes = Vec::new();
-            write_env_with(
-                &[capsule(template)],
-                &HashMap::new(),
-                &vars,
-                |_| {
-                    Ok(if already_set {
+fn distro_defaults_request_conditional_writes_but_explicit_input_overrides() {
+    for template in ["{{ model }}", "literal-default", "prefix-{{ model }}"] {
+        for explicit in [false, true] {
+            for value in ["default-model", ""] {
+                let vars = ResolvedVariables {
+                    values: HashMap::from([("model".into(), value.into())]),
+                    explicit: if explicit {
                         HashSet::from(["model".into()])
                     } else {
                         HashSet::new()
-                    })
-                },
-                |_, _, value, _| {
-                    writes.push(value.to_owned());
-                    Ok(())
-                },
-            )
-            .unwrap();
-            if already_set {
-                assert!(writes.is_empty(), "init must not reset an operator value");
-            } else {
-                assert_eq!(writes, [resolve_template(template, &vars.values)]);
+                    },
+                };
+                let mut writes = Vec::new();
+                write_env_with(
+                    &[capsule(template)],
+                    &HashMap::new(),
+                    &vars,
+                    |_, _, value, kind, overwrite| {
+                        writes.push((value.to_owned(), kind, overwrite));
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    writes,
+                    [(
+                        resolve_template(template, &vars.values),
+                        EnvValueKind::Text,
+                        explicit && template.contains("{{ model }}")
+                    )]
+                );
             }
         }
     }
 }
 
 #[test]
-fn explicit_variable_overrides_existing_config_even_if_equal_to_default() {
-    let vars = ResolvedVariables {
-        values: HashMap::from([("model".into(), "default-model".into())]),
-        explicit: HashSet::from(["model".into()]),
-    };
-    let mut writes = Vec::new();
-    write_env_with(
-        &[capsule("prefix-{{ model }}")],
-        &HashMap::new(),
-        &vars,
-        |_| Ok(HashSet::from(["model".into()])),
-        |_, _, value, _| {
-            writes.push(value.to_owned());
-            Ok(())
-        },
-    )
-    .unwrap();
-    assert_eq!(writes, ["prefix-default-model"]);
-}
-
-#[test]
-fn failed_existing_config_lookup_never_overwrites_with_defaults() {
-    let mut writes = 0;
-    let result = write_env_with(
-        &[capsule("literal-default")],
-        &HashMap::new(),
-        &ResolvedVariables::default(),
-        |_| anyhow::bail!("daemon unavailable"),
-        |_, _, _, _| {
-            writes += 1;
-            Ok(())
-        },
-    );
-    assert!(result.is_err());
-    assert_eq!(writes, 0);
-}
-
-#[test]
-fn explicit_empty_nonsecret_value_is_not_treated_as_missing() {
-    let vars = ResolvedVariables {
-        values: HashMap::from([("model".into(), String::new())]),
-        explicit: HashSet::from(["model".into()]),
-    };
-    let mut writes = Vec::new();
-    write_env_with(
-        &[capsule("{{ model }}")],
-        &HashMap::new(),
-        &vars,
-        |_| panic!("explicit input does not need a default lookup"),
-        |_, _, value, _| {
-            writes.push(value.to_owned());
-            Ok(())
-        },
-    )
-    .unwrap();
-    assert_eq!(writes, [""]);
-}
-
-#[test]
-fn optional_empty_secret_still_does_not_read_or_write_daemon_state() {
+fn optional_empty_secret_still_does_not_write() {
     let vars = ResolvedVariables {
         values: HashMap::from([("model".into(), String::new())]),
         explicit: HashSet::from(["model".into()]),
@@ -120,8 +63,24 @@ fn optional_empty_secret_still_does_not_read_or_write_daemon_state() {
         &[capsule("Bearer {{ model }}")],
         &variables,
         &vars,
-        |_| panic!("empty optional credential must not access daemon"),
-        |_, _, _, _| panic!("empty optional credential must not overwrite"),
+        |_, _, _, _, _| panic!("empty optional credential must not overwrite"),
     )
     .unwrap();
+}
+
+#[test]
+fn conditional_write_errors_propagate_without_unconditional_retry() {
+    let mut calls = 0;
+    let result = write_env_with(
+        &[capsule("literal-default")],
+        &HashMap::new(),
+        &ResolvedVariables::default(),
+        |_, _, _, _, explicit| {
+            assert!(!explicit);
+            calls += 1;
+            anyhow::bail!("unsupported operation");
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(calls, 1);
 }

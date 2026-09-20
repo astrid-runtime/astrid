@@ -145,6 +145,7 @@ async fn dispatch_inner(
         AdminRequestKind::QuotaGet { principal } => super::quota::quota_get(kernel, &principal),
         AdminRequestKind::UsageGet { principal } => super::quota::usage_get(kernel, &principal),
         req @ (AdminRequestKind::EnvSet { .. }
+        | AdminRequestKind::EnvSetIfAbsent { .. }
         | AdminRequestKind::EnvList { .. }
         | AdminRequestKind::EnvDelete { .. }
         | AdminRequestKind::DistroLockGet { .. }
@@ -208,10 +209,18 @@ async fn dispatch_policy(
                     kind,
                     scope,
                     append,
+                    only_if_absent: false,
                 },
             )
             .await
         },
+        AdminRequestKind::EnvSetIfAbsent {
+            principal,
+            capsule,
+            key,
+            value,
+            kind,
+        } => env_handlers::env_set_default(kernel, principal, capsule, key, value, kind).await,
         AdminRequestKind::EnvList { principal, capsule } => {
             env_list(kernel, principal, capsule).await
         },

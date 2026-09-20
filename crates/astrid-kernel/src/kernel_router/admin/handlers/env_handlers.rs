@@ -9,6 +9,9 @@ use crate::Kernel;
 const MAX_ENV_VALUE_BYTES: usize = 1 << 20;
 const MAX_SECRET_VALUE_BYTES: usize = 64 * 1024;
 
+#[cfg(test)]
+mod tests;
+
 pub(super) fn validate_env_request(
     capsule: &str,
     key: &str,
@@ -62,6 +65,7 @@ pub(super) struct EnvSetRequest {
     pub(super) kind: EnvValueKind,
     pub(super) scope: EnvStorageScope,
     pub(super) append: bool,
+    pub(super) only_if_absent: bool,
 }
 
 /// Refresh only the target principal's runtime after a durable env mutation.
@@ -110,6 +114,7 @@ pub(super) async fn env_set(kernel: &Arc<Kernel>, request: EnvSetRequest) -> Adm
         kind,
         scope,
         append,
+        only_if_absent,
     } = request;
     if let Err(error) = validate_env_request(&capsule, &key, kind) {
         return AdminResponseBody::Error(error);
@@ -122,6 +127,15 @@ pub(super) async fn env_set(kernel: &Arc<Kernel>, request: EnvSetRequest) -> Adm
         return AdminResponseBody::Error(format!("environment value exceeds {limit}-byte limit"));
     }
     let _guard = kernel.admin_write_lock.lock().await;
+    // Check both typed lookup scopes while holding the same lock as EnvSet
+    // and EnvDelete. No operator write can slip between this check and commit.
+    if only_if_absent {
+        match has_effective_value(kernel, &principal, &capsule, &key, kind).await {
+            Ok(true) => return AdminResponseBody::Success(serde_json::json!({"stored": false})),
+            Ok(false) => {},
+            Err(error) => return AdminResponseBody::Error(error),
+        }
+    }
     let scope_store = match env_scope(kernel, &principal, &capsule, kind, scope) {
         Ok(store) => store,
         Err(error) => return AdminResponseBody::Error(error),
@@ -152,6 +166,52 @@ pub(super) async fn env_set(kernel: &Arc<Kernel>, request: EnvSetRequest) -> Adm
         },
         Err(error) => AdminResponseBody::Error(error),
     }
+}
+
+/// Defaults always target the principal overlay and never replace shared state.
+pub(super) async fn env_set_default(
+    kernel: &Arc<Kernel>,
+    principal: PrincipalId,
+    capsule: String,
+    key: String,
+    value: String,
+    kind: EnvValueKind,
+) -> AdminResponseBody {
+    env_set(
+        kernel,
+        EnvSetRequest {
+            principal,
+            capsule,
+            key,
+            value,
+            kind,
+            scope: EnvStorageScope::Agent,
+            append: false,
+            only_if_absent: true,
+        },
+    )
+    .await
+}
+
+async fn has_effective_value(
+    kernel: &Arc<Kernel>,
+    principal: &PrincipalId,
+    capsule: &str,
+    key: &str,
+    kind: EnvValueKind,
+) -> Result<bool, String> {
+    for scope in [EnvStorageScope::Agent, EnvStorageScope::Shared] {
+        let store = env_scope(kernel, principal, capsule, kind, scope)?;
+        let value = match kind {
+            EnvValueKind::Text => astrid_storage::env::get_env(&store, key).await,
+            EnvValueKind::Secret => astrid_storage::env::get_secret(&store, key).await,
+        }
+        .map_err(|error| error.to_string())?;
+        if value.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(super) async fn env_delete(

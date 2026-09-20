@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
-use astrid_core::kernel_api::{EnvStorageScope, EnvValueKind};
+use astrid_core::kernel_api::{AdminRequestKind, EnvStorageScope, EnvValueKind};
 
 use super::super::distro::manifest::{DistroCapsule, VariableDef};
 use super::{extract_var_refs, resolve_template};
@@ -33,19 +33,31 @@ pub(crate) fn write_env_files(
         selected,
         variables,
         vars,
-        |capsule| {
-            super::super::capsule::install_headless::list_env_entries(principal, capsule)
-                .map(|entries| entries.into_iter().map(|entry| entry.key).collect())
-        },
-        |capsule, key, value, kind| {
-            super::super::capsule::install_headless::set_env_entry(
-                principal,
-                capsule,
-                key,
-                value,
-                kind,
-                EnvStorageScope::Agent,
-            )
+        |capsule, key, value, kind, explicit| {
+            let request = if explicit {
+                AdminRequestKind::EnvSet {
+                    principal: principal.clone(),
+                    capsule: capsule.into(),
+                    key: key.into(),
+                    value: value.into(),
+                    kind,
+                    scope: EnvStorageScope::Agent,
+                    append: false,
+                }
+            } else {
+                AdminRequestKind::EnvSetIfAbsent {
+                    principal: principal.clone(),
+                    capsule: capsule.into(),
+                    key: key.into(),
+                    value: value.into(),
+                    kind,
+                }
+            };
+            super::super::capsule::install_headless::admin_block_on(async {
+                let mut client = crate::admin_client::connect_as_active_agent().await?;
+                crate::admin_client::into_result(client.request(request).await?)?;
+                Ok(())
+            })
         },
     )
 }
@@ -54,11 +66,9 @@ fn write_env_with(
     selected: &[DistroCapsule],
     variables: &HashMap<String, VariableDef>,
     vars: &ResolvedVariables,
-    mut existing_keys: impl FnMut(&str) -> anyhow::Result<HashSet<String>>,
-    mut write: impl FnMut(&str, &str, &str, EnvValueKind) -> anyhow::Result<()>,
+    mut write: impl FnMut(&str, &str, &str, EnvValueKind, bool) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     for cap in selected {
-        let mut existing = None;
         for (key, template) in &cap.env {
             let references = extract_var_refs(template);
             // Test the input, not the rendered text: `Bearer {{ key }}` is
@@ -76,14 +86,7 @@ fn write_env_with(
             // A distro default is a first-install fallback, not permission to
             // reset operator configuration on upgrade or resume. Literal
             // templates also fill missing keys only. Explicit input still wins.
-            if !references.iter().any(|name| vars.explicit.contains(*name)) {
-                if existing.is_none() {
-                    existing = Some(existing_keys(&cap.name)?);
-                }
-                if existing.as_ref().is_some_and(|keys| keys.contains(key)) {
-                    continue;
-                }
-            }
+            let explicit = references.iter().any(|name| vars.explicit.contains(*name));
             let value = resolve_template(template, &vars.values);
             let secret = references
                 .iter()
@@ -94,7 +97,7 @@ fn write_env_with(
             } else {
                 EnvValueKind::Text
             };
-            write(&cap.name, key, &value, kind)?;
+            write(&cap.name, key, &value, kind, explicit)?;
         }
     }
     Ok(())

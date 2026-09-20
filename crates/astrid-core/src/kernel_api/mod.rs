@@ -31,9 +31,9 @@ pub use projection_names::{
 };
 pub use readiness::{AgentLoopReadiness, AgentReadinessProbe, CapsuleTopicProbe, MissingImport};
 pub use response_types::{
-    AdminResponseBody, AgentSummary, AuditHealth, AuditPruneResult, AuditStats,
-    DistroCapsuleProvenance, DistroProvenance, GroupSummary, InviteIssued, InviteRedeemed,
-    InviteSummary, PairTokenIssued, PairTokenRedeemed, ResourceUsage,
+    AdminKernelResponse, AdminResponseBody, AgentSummary, AuditHealth, AuditPruneResult,
+    AuditStats, DeviceKeyInfo, DistroCapsuleProvenance, DistroProvenance, GroupSummary,
+    InviteIssued, InviteRedeemed, InviteSummary, PairTokenIssued, PairTokenRedeemed, ResourceUsage,
 };
 pub use status::{DaemonStatus, PrincipalConnectionCount};
 
@@ -482,27 +482,6 @@ fn default_pair_scope() -> PairScopeArg {
     PairScopeArg::Full
 }
 
-/// Per-device summary returned by [`AdminRequestKind::PairDeviceList`].
-///
-/// Carries only non-secret, fingerprint-level identity — the deterministic
-/// `key_id`, the operator label, the granted [`DeviceScope`](crate::DeviceScope),
-/// and the pairing timestamp. The raw ed25519 public key is **never** surfaced;
-/// the `key_id` (derived from the already-public pubkey) is the stable handle
-/// for listing and revocation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceKeyInfo {
-    /// Deterministic per-device fingerprint handle.
-    pub key_id: String,
-    /// Operator/user-facing label captured at pairing time, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    /// Capability attenuation scope the device authenticates under.
-    pub scope: crate::DeviceScope,
-    /// Unix epoch seconds when the device was paired (`0` for migrated
-    /// legacy keys that predate pairing-time recording).
-    pub created_at: i64,
-}
-
 /// Typed admin request body — flattened into [`AdminKernelRequest`] on
 /// the wire as `{ "method": "...", "params": {...} }`.
 ///
@@ -672,6 +651,22 @@ pub enum AdminRequestKind {
         /// Secret values must never set this flag.
         #[serde(default)]
         append: bool,
+    },
+    /// Seed an agent value only when neither agent nor shared scope contains
+    /// the same typed key. Serialized with environment writes; requires write
+    /// authority, not permission to list configuration. Older kernels reject
+    /// this operation rather than silently overwriting a value.
+    EnvSetIfAbsent {
+        /// Target principal.
+        principal: PrincipalId,
+        /// Capsule id.
+        capsule: String,
+        /// Manifest field key.
+        key: String,
+        /// Default value, redacted from audit.
+        value: String,
+        /// Text or secret namespace.
+        kind: EnvValueKind,
     },
     /// List redacted keys in host-owned capsule projections.
     EnvList {
@@ -979,19 +974,6 @@ pub enum AdminRequestKind {
         /// Kernel-issued mount identity.
         mount_id: StorageMountId,
     },
-}
-
-/// Admin management API response wrapper carrying the echoed
-/// correlation ID and the typed response body.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AdminKernelResponse {
-    /// Echoed `request_id` from the [`AdminKernelRequest`] this response
-    /// answers. `None` when the client did not provide one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<String>,
-    /// The typed response body — `tag = "status", content = "data"`.
-    #[serde(flatten)]
-    pub body: AdminResponseBody,
 }
 
 #[cfg(test)]
