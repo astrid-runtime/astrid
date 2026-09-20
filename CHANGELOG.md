@@ -1272,7 +1272,8 @@ Breaking changes to note: `Capsule.toml` moves to `[publish]` / `[subscribe]` ta
 Initial tracked release. See the [repository history](https://github.com/astrid-runtime/astrid/commits/v0.2.0)
 for changes included in this version.
 
-[Unreleased]: https://github.com/astrid-runtime/astrid/compare/v2026.9.3...HEAD
+[Unreleased]: https://github.com/astrid-runtime/astrid/compare/v2026.9.4...HEAD
+[2026.9.4]: https://github.com/astrid-runtime/astrid/compare/v2026.9.3...v2026.9.4
 [2026.9.3]: https://github.com/astrid-runtime/astrid/compare/v2026.9.2...v2026.9.3
 [2026.9.2]: https://github.com/astrid-runtime/astrid/compare/v2026.9.1...v2026.9.2
 [2026.9.1]: https://github.com/astrid-runtime/astrid/compare/v2026.9.0...v2026.9.1
