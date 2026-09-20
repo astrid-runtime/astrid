@@ -14,7 +14,7 @@ CalSemVer here. The month is not zero-padded.
   Document breaking changes and migrations in release notes; the year component
   is not a traditional SemVer compatibility-major guarantee.
 
-Astrid targets `2026.9.3` for this release, with Git tag `v2026.9.3`.
+Astrid targets `2026.9.4` for this release, with Git tag `v2026.9.4`.
 Downstream distributions and integrations own their version and tag policies.
 
 Previously published versions are immutable. Astrid `0.10.x` retains its
