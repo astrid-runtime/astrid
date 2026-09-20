@@ -4,6 +4,71 @@ use super::*;
 use astrid_core::PrincipalId;
 
 #[tokio::test]
+async fn conditional_defaults_retry_after_failed_install_rollback() {
+    use crate::kernel_router::admin::{dispatch_as_operator, seed_operator};
+    use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
+
+    let root = tempfile::tempdir().unwrap();
+    let kernel =
+        crate::test_kernel_with_home(astrid_core::dirs::AstridHome::from_path(root.path())).await;
+    seed_operator(&kernel).await;
+    let principal = PrincipalId::default();
+    let source = root.path().join("fixture");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("Capsule.toml"),
+        r#"
+        [package]
+        name = "fixture"
+        version = "1.0.0"
+        [env.PLAIN]
+        type = "text"
+        [env.SECRET]
+        type = "secret"
+    "#,
+    )
+    .unwrap();
+    for (key, kind) in [
+        ("PLAIN", EnvValueKind::Text),
+        ("SECRET", EnvValueKind::Secret),
+    ] {
+        let values = [CapsuleInstallEnv {
+            key: key.into(),
+            value: "temporary".into(),
+            kind,
+        }];
+        let transaction = stage_env_values(&kernel, &principal, &source, None, &values)
+            .await
+            .unwrap()
+            .unwrap();
+        let request = AdminRequestKind::EnvSetIfAbsent {
+            principal: principal.clone(),
+            capsule: "fixture".into(),
+            key: key.into(),
+            value: "default".into(),
+            kind,
+        };
+        let response = dispatch_as_operator(&kernel, &principal, request.clone()).await;
+        assert!(
+            matches!(response, AdminResponseBody::Error(error) if error.contains("retry initialization"))
+        );
+        transaction.rollback(&kernel).await;
+        let response = dispatch_as_operator(&kernel, &principal, request).await;
+        assert!(matches!(response, AdminResponseBody::Success(value) if value["stored"] == true));
+        let uid = kernel.principal_directory.uid_for(&principal).unwrap();
+        let namespace = env_namespace(uid, "fixture", kind, EnvStorageScope::Agent);
+        assert_eq!(
+            kernel
+                .kv
+                .get(&namespace, &env_storage_key(&values[0]))
+                .await
+                .unwrap(),
+            Some(b"default".to_vec())
+        );
+    }
+}
+
+#[tokio::test]
 async fn install_env_transaction_restores_existing_text_and_secret_values() {
     let root = tempfile::tempdir().unwrap();
     let home = astrid_core::dirs::AstridHome::from_path(root.path());

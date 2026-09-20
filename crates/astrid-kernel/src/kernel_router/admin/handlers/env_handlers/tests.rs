@@ -3,6 +3,38 @@ use crate::kernel_router::admin;
 use astrid_core::dirs::AstridHome;
 use astrid_core::kernel_api::AdminRequestKind;
 
+#[tokio::test]
+async fn empty_secrets_are_rejected_by_both_write_modes() {
+    let (_dir, kernel) = fixture().await;
+    for conditional in [false, true] {
+        let response = env_set(
+            &kernel,
+            request(
+                "token",
+                "",
+                EnvValueKind::Secret,
+                EnvStorageScope::Agent,
+                conditional,
+            ),
+        )
+        .await;
+        assert!(
+            matches!(response, AdminResponseBody::Error(error) if error.contains("must not be empty"))
+        );
+        assert!(
+            !has_effective_value(
+                &kernel,
+                &PrincipalId::default(),
+                "provider",
+                "token",
+                EnvValueKind::Secret
+            )
+            .await
+            .unwrap()
+        );
+    }
+}
+
 async fn fixture() -> (tempfile::TempDir, Arc<Kernel>) {
     let dir = tempfile::tempdir().unwrap();
     let kernel = crate::test_kernel_with_home(AstridHome::from_path(dir.path())).await;

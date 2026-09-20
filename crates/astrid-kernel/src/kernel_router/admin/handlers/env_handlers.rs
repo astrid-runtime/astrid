@@ -105,6 +105,20 @@ async fn reload_after_env_change(
     }
 }
 
+fn validate_env_value(kind: EnvValueKind, value: &str) -> Result<(), String> {
+    let limit = match kind {
+        EnvValueKind::Text => MAX_ENV_VALUE_BYTES,
+        EnvValueKind::Secret => MAX_SECRET_VALUE_BYTES,
+    };
+    if value.len() > limit {
+        return Err(format!("environment value exceeds {limit}-byte limit"));
+    }
+    if kind == EnvValueKind::Secret && value.is_empty() {
+        return Err("secret value must not be empty".to_owned());
+    }
+    Ok(())
+}
+
 pub(super) async fn env_set(kernel: &Arc<Kernel>, request: EnvSetRequest) -> AdminResponseBody {
     let EnvSetRequest {
         principal,
@@ -119,13 +133,21 @@ pub(super) async fn env_set(kernel: &Arc<Kernel>, request: EnvSetRequest) -> Adm
     if let Err(error) = validate_env_request(&capsule, &key, kind) {
         return AdminResponseBody::Error(error);
     }
-    let limit = match kind {
-        EnvValueKind::Text => MAX_ENV_VALUE_BYTES,
-        EnvValueKind::Secret => MAX_SECRET_VALUE_BYTES,
-    };
-    if value.len() > limit {
-        return AdminResponseBody::Error(format!("environment value exceeds {limit}-byte limit"));
+    if let Err(error) = validate_env_value(kind, &value) {
+        return AdminResponseBody::Error(error);
     }
+    // Fail visibly rather than treating an install's staged value as durable.
+    // Never wait here: activation can itself need an admin operation.
+    let _install_guard = if only_if_absent {
+        match kernel.env_install_fence.try_write() {
+            Ok(guard) => Some(guard),
+            Err(_) => return AdminResponseBody::Error(
+                "capsule environment transaction in progress; retry initialization after the install completes".to_owned(),
+            ),
+        }
+    } else {
+        None
+    };
     let _guard = kernel.admin_write_lock.lock().await;
     // Check both typed lookup scopes while holding the same lock as EnvSet
     // and EnvDelete. No operator write can slip between this check and commit.
