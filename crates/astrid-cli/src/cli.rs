@@ -406,6 +406,12 @@ pub(crate) enum CapsuleCommands {
     Update {
         /// Capsule name to update (omit to update all)
         target: Option<String>,
+        /// Discover candidates without installing, granting, or starting a daemon.
+        #[arg(long, conflicts_with_all = ["workspace", "approve_untrusted"])]
+        check: bool,
+        /// Emit principal-scoped discovery metadata (requires --check).
+        #[arg(long, requires = "check")]
+        json: bool,
         /// Update workspace capsules instead of user-level
         #[arg(long)]
         workspace: bool,
