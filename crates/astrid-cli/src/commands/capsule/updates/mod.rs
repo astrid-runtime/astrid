@@ -36,6 +36,40 @@ enum Availability {
     Failed,
 }
 
+impl Availability {
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::Available => "update available",
+            Self::Current => "up to date",
+            Self::Ahead => "ahead of release",
+            Self::Unsupported => "manual review",
+            Self::Failed => "check failed",
+        }
+    }
+}
+
+async fn bounded_metadata(
+    request: impl std::future::Future<Output = anyhow::Result<KernelResponse>>,
+) -> anyhow::Result<KernelResponse> {
+    // Bound the complete authenticated connection, including both workspace
+    // checks: readiness can disappear between the initial probe and handshake.
+    tokio::time::timeout(std::time::Duration::from_secs(5), request)
+        .await
+        .context("Runtime discovery timed out; start the runtime and retry")?
+}
+
+fn text_item(item: &Item) -> String {
+    let candidate = item.candidate_version.as_deref().unwrap_or("unknown");
+    format!(
+        "{} {}: {} (candidate {}) — {}",
+        item.name,
+        item.installed_version,
+        item.availability.label(),
+        candidate,
+        item.message
+    )
+}
+
 fn repository(source: &str) -> Option<(String, String)> {
     let (base, _) = super::install::split_version_suffix(source);
     let (org, repo) = parse_github_source(base)?;
@@ -121,11 +155,17 @@ pub(crate) async fn check(target: Option<&str>, json: bool) -> anyhow::Result<Ex
     // This connects only to the existing authenticated workspace; unlike
     // install it never calls ensure_persistent_daemon.
     require_ready_metadata(&crate::socket_client::readiness_path())?;
-    let mut kernel = crate::socket_client::connect_kernel_for_workspace(None).await?;
-    let KernelResponse::CapsuleMetadata(entries) =
-        kernel.request(KernelRequest::GetCapsuleMetadata).await?
-    else {
-        bail!("Runtime refused capsule metadata discovery");
+    let response = bounded_metadata(async {
+        let mut kernel = crate::socket_client::connect_kernel_for_workspace(None).await?;
+        Ok(kernel.request(KernelRequest::GetCapsuleMetadata).await?)
+    })
+    .await?;
+    let entries = match response {
+        KernelResponse::CapsuleMetadata(entries) => entries,
+        KernelResponse::Error(message) => {
+            bail!("Runtime refused capsule metadata discovery: {message}")
+        },
+        _ => bail!("Unexpected runtime response to capsule metadata discovery"),
     };
     if target.is_some_and(|name| !entries.iter().any(|entry| entry.name == name)) {
         bail!("Requested capsule is not installed in this principal");
@@ -176,7 +216,7 @@ pub(crate) async fn check(target: Option<&str>, json: bool) -> anyhow::Result<Ex
         );
     } else {
         for item in inventory.items {
-            println!("{} {}: {}", item.name, item.installed_version, item.message);
+            println!("{}", text_item(&item));
         }
     }
     Ok(if failed {
@@ -202,6 +242,30 @@ fn require_ready_metadata(path: &std::path::Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn readiness_disappearing_during_connect_cannot_wait_for_startup() {
+        let result = bounded_metadata(std::future::pending()).await;
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn plain_output_names_status_and_candidate() {
+        let mut item = Item {
+            name: "alpha".into(),
+            installed_version: "1.0.0".into(),
+            candidate_version: Some("2.0.0".into()),
+            wasm_hash: None,
+            source: None,
+            availability: Availability::Available,
+            verification: "unverified",
+            message: "Review before installation".into(),
+        };
+        assert!(text_item(&item).contains("update available (candidate 2.0.0)"));
+        item.availability = Availability::Current;
+        assert!(text_item(&item).contains("up to date"));
+        item.availability = Availability::Ahead;
+        assert!(text_item(&item).contains("ahead of release"));
+    }
     #[test]
     fn stopped_runtime_is_reported_without_startup_wait() {
         let path =
