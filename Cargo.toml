@@ -200,7 +200,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # changes in minor versions. Cargo.lock is committed, but the patch range also
 # prevents fresh resolution from silently adopting a future incompatible minor.
 # It still admits compatible bug and security fixes.
-rmcp = { version = "~3.2.0", features = ["server", "client", "transport-io", "elicitation", "macros", "request-state", "schemars"] }
+rmcp = { version = "~3.4.0", features = ["server", "client", "transport-io", "elicitation", "macros", "request-state", "schemars"] }
 rustyline = { version = "18", features = ["derive"] }
 semver = "1"
 serde = { version = "1.0", features = ["derive"] }
@@ -214,7 +214,7 @@ sigstore-verify = { version = "=0.11.0", default-features = false, features = ["
 # Asymmetric JWT/JWKS validation for the MCP HTTP OAuth resource server.
 # Application code rejects `alg=none` and HMAC; this crate only verifies
 # asymmetric signatures from a configured JWKS document.
-jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+jsonwebtoken = { version = "11.1", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 subtle = "2"
 surrealkv = "0.21"
 syn = { version = "~3.0.4", features = ["full", "visit"] }
@@ -257,16 +257,16 @@ url = "2"
 # other OpenAPI generator. `axum_extras` plugs into axum's extractor
 # system so `#[utoipa::path]` annotations on handlers carry through.
 utoipa = { version = "5", features = ["axum_extras"] }
-uuid = { version = "~1.25.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
+uuid = { version = "~1.26.1", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
 walkdir = "2.5"
-wasm-encoder = "0.257.1"
-wat = "=1.257.1"
-wasmparser = "0.257.1"
+wasm-encoder = "0.259.0"
+wat = "=1.259.0"
+wasmparser = "0.259.0"
 windows-sys = "0.61"
-wit-component = "0.257.1"
-wit-parser = "0.257.1"
-wasmtime = { version = "48.0.1", features = ["component-model", "cranelift"] }
-wasmtime-wasi = "48.0.1"
+wit-component = "0.259.0"
+wit-parser = "0.259.0"
+wasmtime = { version = "49.0.0", features = ["component-model", "cranelift"] }
+wasmtime-wasi = "49.0.0"
 unicode-normalization = "=0.1.25"
 unicode-width = "0.2"
 which = "8"
