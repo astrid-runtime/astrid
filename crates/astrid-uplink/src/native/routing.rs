@@ -10,6 +10,29 @@ const CHAT_DELTA_TOPIC: &str = "agent.v1.stream.delta";
 const MAX_STREAM_SESSIONS: usize = 64;
 const MAX_STREAM_BYTES: usize = super::MAX_PAYLOAD_BYTES;
 
+const NATIVE_INGRESS: &[&str] = &[
+    "codewall.v1.audit.native.submit",
+    "codewall.v1.audit.native.confirm",
+    "codewall.v1.audit.native.binding",
+];
+
+pub(super) fn native_ingress(topic: &str) -> bool {
+    NATIVE_INGRESS.contains(&topic)
+}
+
+fn native_response(topic: &str) -> bool {
+    [
+        "codewall.v1.audit.native.ack.",
+        "codewall.v1.audit.native.binding.reply.",
+    ]
+    .iter()
+    .any(|prefix| {
+        topic
+            .strip_prefix(prefix)
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id))
+    })
+}
+
 const ALLOWED_INGRESS_EXACT: &[&str] = &["user.v1.prompt", "cli.v1.command.execute"];
 const ALLOWED_INGRESS_PREFIXES: &[&str] = &[
     "astrid.v1.request.",
@@ -50,14 +73,16 @@ pub(super) fn ingress_allowed(topic: &str) -> bool {
     {
         return false;
     }
-    ALLOWED_INGRESS_EXACT.contains(&topic)
+    native_ingress(topic)
+        || ALLOWED_INGRESS_EXACT.contains(&topic)
         || ALLOWED_INGRESS_PREFIXES
             .iter()
             .any(|prefix| topic.starts_with(prefix))
 }
 
 pub(super) fn egress_allowed(topic: &str) -> bool {
-    ALLOWED_EGRESS_EXACT.contains(&topic)
+    native_response(topic)
+        || ALLOWED_EGRESS_EXACT.contains(&topic)
         || ALLOWED_EGRESS_PREFIXES
             .iter()
             .any(|prefix| topic.starts_with(prefix))

@@ -15,9 +15,8 @@
 //! * `list` — show a principal's paired devices (`key_id` + scope + label).
 //! * `revoke` — remove one paired device by its `key_id`.
 //!
-//! Redemption is performed by the new device through the HTTP gateway
-//! (`POST /api/auth/pair-device/redeem`), not this CLI — the redeeming device
-//! holds the private key and receives its scoped session bearer there.
+//! Local redemption uses the same token-authenticated kernel operation as
+//! the HTTP gateway, without issuing an HTTP session bearer.
 
 use std::process::ExitCode;
 
@@ -36,10 +35,19 @@ pub(crate) enum PairDeviceCommand {
     /// Issue a pair-token tied to your own principal. Hand the token to the
     /// new device out-of-band; it redeems through the HTTP gateway.
     Issue(IssueArgs),
+    /// Redeem a token from stdin and register an existing public key.
+    Redeem(RedeemArgs),
     /// List paired devices on a principal.
     List(ListArgs),
     /// Revoke a single paired device by its `key_id`.
     Revoke(RevokeArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct RedeemArgs {
+    /// Hex ed25519 public key; private keys never enter this command.
+    #[arg(long)]
+    pub public_key: String,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -97,6 +105,7 @@ pub(crate) struct RevokeArgs {
 pub(crate) async fn run(command: PairDeviceCommand) -> Result<ExitCode> {
     match command {
         PairDeviceCommand::Issue(args) => run_issue(args).await,
+        PairDeviceCommand::Redeem(args) => run_redeem(args).await,
         PairDeviceCommand::List(args) => run_list(args).await,
         PairDeviceCommand::Revoke(args) => run_revoke(args).await,
     }
@@ -235,5 +244,32 @@ fn join_or_dash(patterns: &[String]) -> String {
         "-".to_string()
     } else {
         patterns.join(",")
+    }
+}
+
+async fn run_redeem(args: RedeemArgs) -> Result<ExitCode> {
+    use std::io::Read;
+    let mut token = String::new();
+    std::io::stdin()
+        .take(4097)
+        .read_to_string(&mut token)
+        .context("read pair token from stdin")?;
+    if token.len() > 4096 || token.trim().is_empty() {
+        anyhow::bail!("invalid pair token input");
+    }
+    let mut client = connect_as_active_agent().await?;
+    let response = client
+        .request(AdminRequestKind::PairDeviceRedeem {
+            token: token.trim().to_owned(),
+            public_key: args.public_key,
+        })
+        .await
+        .context("auth.pair.redeem request failed")?;
+    match into_result(response)? {
+        AdminResponseBody::PairTokenRedeemed(value) => {
+            println!("{}", serde_json::to_string(&value)?);
+            Ok(ExitCode::SUCCESS)
+        },
+        _ => anyhow::bail!("unexpected pair redemption response"),
     }
 }

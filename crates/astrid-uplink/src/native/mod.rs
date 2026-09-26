@@ -250,6 +250,17 @@ fn event_topic(event: &AstridEvent) -> Option<&str> {
     Some(message.topic.as_str())
 }
 
+/// Stable only on the three exact Codewall native audit ingress topics.
+/// All other socket messages retain the historical nil source. This adds no
+/// protected-key/host-attestation claim and leaves the guest WIT unchanged.
+fn native_source_id(principal: &str, device_key_id: &str) -> uuid::Uuid {
+    const NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(0xe276_24b7_3198_4d52_9607_871c_0b93_54be);
+    uuid::Uuid::new_v5(
+        &NAMESPACE,
+        format!("{principal}\0{device_key_id}").as_bytes(),
+    )
+}
+
 fn publish_trusted_ingress(
     event_bus: &EventBus,
     identity: &AuthenticatedIdentity,
@@ -258,8 +269,18 @@ fn publish_trusted_ingress(
 ) {
     // Rebuild the envelope so every provenance field is host-derived. The
     // client controls only the allowlisted topic and payload.
-    let mut trusted = IpcMessage::new(message.topic, message.payload, uuid::Uuid::nil())
-        .with_principal(principal);
+    let source = if routing::native_ingress(message.topic.as_str()) {
+        // Dedicated namespace. Principal and device ID are verified by the
+        // host handshake, never taken from the caller's envelope or body.
+        let Some(key) = identity.device_key_id.as_deref() else {
+            return;
+        };
+        native_source_id(principal, key)
+    } else {
+        uuid::Uuid::nil()
+    };
+    let mut trusted =
+        IpcMessage::new(message.topic, message.payload, source).with_principal(principal);
     trusted.device_key_id.clone_from(&identity.device_key_id);
     trusted.origin = if identity.is_principal_verified() {
         MessageOrigin::LocalSocket
@@ -318,6 +339,9 @@ fn process_inbound(
     message: IpcMessage,
 ) -> Result<(), &'static str> {
     validate_ingress(&message)?;
+    if routing::native_ingress(message.topic.as_str()) && !identity.is_principal_verified() {
+        return Err("native audit requires a registered principal key");
+    }
     if message.topic.as_str() == routing::CHAT_REQUEST_TOPIC {
         let session = routing::payload_session_id(&message.payload)
             .ok_or("chat request is missing a session ID")?;

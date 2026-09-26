@@ -454,3 +454,75 @@ async fn established_connections_release_handshake_capacity() {
         .expect("server shutdown timeout")
         .expect("server task");
 }
+
+#[test]
+fn native_audit_identity_is_host_derived_and_topic_scoped() {
+    let bus = Arc::new(EventBus::new());
+    let registry = egress::Registry::install(&bus);
+    let receiver = registry.subscribe("alice".into(), None);
+    let mut inbound = bus.subscribe_topic("codewall.v1.audit.native.submit");
+    let mut identity = AuthenticatedIdentity {
+        principal: PrincipalId::new("alice").unwrap(),
+        device_key_id: None,
+    };
+    let forged = || {
+        IpcMessage::new(
+            Topic::from_raw("codewall.v1.audit.native.submit"),
+            IpcPayload::RawJson(serde_json::json!({"source_id": "forged"})),
+            Uuid::new_v4(),
+        )
+        .with_principal("mallory")
+    };
+    assert!(process_inbound(&bus, &identity, "alice", &receiver, forged()).is_err());
+    assert!(inbound.try_recv().is_none());
+    identity.device_key_id = Some("bridge-device".into());
+    for _ in 0..2 {
+        process_inbound(&bus, &identity, "alice", &receiver, forged()).unwrap();
+        let event = inbound.try_recv().unwrap();
+        let AstridEvent::Ipc { message, .. } = &*event else {
+            panic!("IPC")
+        };
+        assert_eq!(
+            message.source_id,
+            native_source_id("alice", "bridge-device")
+        );
+        assert_eq!(message.principal.as_deref(), Some("alice"));
+        assert_eq!(message.origin, MessageOrigin::LocalSocket);
+    }
+    assert_ne!(
+        native_source_id("alice", "bridge-device"),
+        native_source_id("alice", "shared-key")
+    );
+    assert_ne!(
+        native_source_id("alice", "bridge-device"),
+        native_source_id("bob", "bridge-device")
+    );
+    let mut ordinary = bus.subscribe_topic("astrid.v1.request.test");
+    let mut message = forged();
+    message.topic = Topic::from_raw("astrid.v1.request.test");
+    process_inbound(&bus, &identity, "alice", &receiver, message).unwrap();
+    let event = ordinary.try_recv().unwrap();
+    let AstridEvent::Ipc { message, .. } = &*event else {
+        panic!("IPC")
+    };
+    assert_eq!(message.source_id, Uuid::nil());
+}
+
+#[test]
+fn native_audit_topic_rules_are_exact_and_ack_is_egress_only() {
+    for topic in ["submit", "confirm", "binding"] {
+        let topic = format!("codewall.v1.audit.native.{topic}");
+        assert!(routing::ingress_allowed(&topic));
+        assert!(!routing::ingress_allowed(&format!("{topic}.extra")));
+        assert!(!routing::egress_allowed(&topic));
+    }
+    for prefix in ["ack", "binding.reply"] {
+        let topic = format!("codewall.v1.audit.native.{prefix}.{}", Uuid::new_v4());
+        assert!(routing::egress_allowed(&topic));
+        assert!(!routing::ingress_allowed(&topic));
+        assert!(!routing::egress_allowed(&format!("{topic}.extra")));
+        assert!(!routing::egress_allowed(&format!(
+            "codewall.v1.audit.native.{prefix}.not-uuid"
+        )));
+    }
+}
