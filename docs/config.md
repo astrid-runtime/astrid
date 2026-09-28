@@ -140,6 +140,9 @@ Enabling v2 is one-way for a node. Once the registry exists:
 - `keys/audit.key` must be kept: the daemon refuses to boot if it is missing
   or replaced, since only the registered key can authorize its successor.
 
+If the configuration cannot be read, the daemon refuses to start rather than
+assume `v1`, unless the node is already on v2.
+
 Once v2 is enabled, going back to an Astrid release without v2 support is
 not supported: such a release cannot verify v2 entries and would append v1
 entries after them.

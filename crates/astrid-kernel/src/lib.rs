@@ -1251,11 +1251,10 @@ impl Kernel {
             // Audit entry format, read from the admitted home like other boot
             // policy and applied before anything can append. Nothing appends
             // during the migrate-only window above, so every new entry is in
-            // the selected format. A config that fails to load here is
-            // reported by the daemon; v1 (the default) applies meanwhile, and
-            // a store already on v2 stays on v2 regardless. The browser
-            // profile reads no host config; its host enables v2 on the audit
-            // log it injects (`AuditLog::enable_entry_v2`).
+            // the selected format. A configuration that cannot be read stops
+            // boot unless the store is already on v2 (which it never leaves).
+            // The browser profile reads no host config; its host enables v2
+            // on the audit log it injects (`AuditLog::enable_entry_v2`).
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             {
                 let entry_format = astrid_config::Config::load_with_layout(
@@ -1263,7 +1262,7 @@ impl Kernel {
                     &workspace_layout,
                 )
                 .map(|resolved| resolved.config.audit.entry_format)
-                .unwrap_or_default();
+                .map_err(|error| error.to_string());
                 audit_keys::apply_entry_format(
                     &audit_log,
                     &home.keys_dir(),

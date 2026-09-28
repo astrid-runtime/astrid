@@ -19,20 +19,24 @@ pub(crate) const AUDIT_KEY_FILE: &str = "audit.key";
 
 /// Switch `audit_log` to the configured entry format.
 ///
-/// Format v2 stays on once the store holds a key registry, whatever
-/// `configured` says: a v1 entry after a v2 entry would reopen a chain under
-/// the weaker format, so the audit log refuses v1 appends on such a store.
+/// `configured` is the operator's `audit.entry_format`, or why the
+/// configuration could not be read. Format v2 stays on once the store holds a
+/// key registry, whatever `configured` says: a v1 entry after a v2 entry would
+/// reopen a chain under the weaker format, so the audit log refuses v1
+/// appends on such a store.
 ///
 /// # Errors
 ///
-/// Fails when the key registry does not verify, when the audit key is
-/// missing although a registry exists, or when the audit key is not the
-/// registry's active audit key. The audit log cannot record verifiable
-/// entries in any of those states, so boot stops rather than continue.
+/// Fails when the configuration cannot be read and the store is not already
+/// on v2 (the operator may have chosen v2, so v1 is not assumed), when the key
+/// registry does not verify, when the audit key is missing although a
+/// registry exists, or when the audit key is not the registry's active audit
+/// key. The audit log cannot record entries in the intended, verifiable
+/// format in any of those states, so boot stops rather than continue.
 pub(crate) async fn apply_entry_format(
     audit_log: &AuditLog,
     keys_dir: &Path,
-    configured: AuditEntryFormat,
+    configured: Result<AuditEntryFormat, String>,
     runtime_key: &Arc<KeyPair>,
     principals: Arc<dyn PrincipalUidResolver>,
 ) -> std::io::Result<()> {
@@ -41,6 +45,25 @@ pub(crate) async fn apply_entry_format(
         .await
         .map_err(|error| std::io::Error::other(format!("audit key registry: {error}")))?
         .is_some();
+    let configured = match configured {
+        Ok(format) => format,
+        Err(reason) if registry_exists => {
+            tracing::warn!(
+                error = %reason,
+                "cannot read audit.entry_format; this node already writes audit format v2 and stays on it"
+            );
+            AuditEntryFormat::V2
+        },
+        Err(reason) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "cannot read audit.entry_format from the configuration ({reason}); \
+                     refusing to choose an audit entry format the operator did not select"
+                ),
+            ));
+        },
+    };
     if !registry_exists && configured == AuditEntryFormat::V1 {
         return Ok(());
     }
@@ -135,9 +158,15 @@ mod tests {
         let keys = home.path().join("keys");
         let runtime = Arc::new(KeyPair::generate());
         let log = AuditLog::in_memory(Arc::clone(&runtime));
-        apply_entry_format(&log, &keys, AuditEntryFormat::V1, &runtime, principals())
-            .await
-            .unwrap();
+        apply_entry_format(
+            &log,
+            &keys,
+            Ok(AuditEntryFormat::V1),
+            &runtime,
+            principals(),
+        )
+        .await
+        .unwrap();
         assert_eq!(log.entry_format(), Format::V1);
         assert!(!keys.join(AUDIT_KEY_FILE).exists());
     }
@@ -149,9 +178,15 @@ mod tests {
         let runtime = Arc::new(KeyPair::generate());
         let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
         let log = AuditLog::open_with_kv_store(Arc::clone(&store), Arc::clone(&runtime)).unwrap();
-        apply_entry_format(&log, &keys, AuditEntryFormat::V2, &runtime, principals())
-            .await
-            .unwrap();
+        apply_entry_format(
+            &log,
+            &keys,
+            Ok(AuditEntryFormat::V2),
+            &runtime,
+            principals(),
+        )
+        .await
+        .unwrap();
         assert_eq!(log.entry_format(), Format::V2);
         let key_path = keys.join(AUDIT_KEY_FILE);
         astrid_core::platform_fs::validate_private_file(&key_path).unwrap();
@@ -184,15 +219,27 @@ mod tests {
         {
             let log =
                 AuditLog::open_with_kv_store(Arc::clone(&store), Arc::clone(&runtime)).unwrap();
-            apply_entry_format(&log, &keys, AuditEntryFormat::V2, &runtime, principals())
-                .await
-                .unwrap();
+            apply_entry_format(
+                &log,
+                &keys,
+                Ok(AuditEntryFormat::V2),
+                &runtime,
+                principals(),
+            )
+            .await
+            .unwrap();
             append(&log, &session).await.unwrap();
         }
         let log = AuditLog::open_with_kv_store(Arc::clone(&store), Arc::clone(&runtime)).unwrap();
-        apply_entry_format(&log, &keys, AuditEntryFormat::V1, &runtime, principals())
-            .await
-            .unwrap();
+        apply_entry_format(
+            &log,
+            &keys,
+            Ok(AuditEntryFormat::V1),
+            &runtime,
+            principals(),
+        )
+        .await
+        .unwrap();
         assert_eq!(log.entry_format(), Format::V2);
         append(&log, &session).await.unwrap();
         assert!(log.verify_chain(&session).await.unwrap().valid);
@@ -205,9 +252,15 @@ mod tests {
         let runtime = Arc::new(KeyPair::generate());
         let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
         let log = AuditLog::open_with_kv_store(Arc::clone(&store), Arc::clone(&runtime)).unwrap();
-        apply_entry_format(&log, &keys, AuditEntryFormat::V2, &runtime, principals())
-            .await
-            .unwrap();
+        apply_entry_format(
+            &log,
+            &keys,
+            Ok(AuditEntryFormat::V2),
+            &runtime,
+            principals(),
+        )
+        .await
+        .unwrap();
         let key_path = keys.join(AUDIT_KEY_FILE);
 
         std::fs::remove_file(&key_path).unwrap();
@@ -216,7 +269,7 @@ mod tests {
         let error = apply_entry_format(
             &reopened,
             &keys,
-            AuditEntryFormat::V2,
+            Ok(AuditEntryFormat::V2),
             &runtime,
             principals(),
         )
@@ -231,7 +284,7 @@ mod tests {
         let error = apply_entry_format(
             &reopened,
             &keys,
-            AuditEntryFormat::V2,
+            Ok(AuditEntryFormat::V2),
             &runtime,
             principals(),
         )
@@ -242,5 +295,39 @@ mod tests {
             "{error}"
         );
         assert_eq!(reopened.entry_format(), Format::V1);
+    }
+    #[tokio::test]
+    async fn an_unreadable_configuration_stops_boot_unless_already_on_v2() {
+        let home = tempfile::tempdir().unwrap();
+        let keys = home.path().join("keys");
+        let runtime = Arc::new(KeyPair::generate());
+        let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+        let unreadable = || Err("parse error in config.toml".to_owned());
+
+        // Fresh store: the operator's choice is unknown, so no format is assumed.
+        let log = AuditLog::open_with_kv_store(Arc::clone(&store), Arc::clone(&runtime)).unwrap();
+        let error = apply_entry_format(&log, &keys, unreadable(), &runtime, principals())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("parse error"), "{error}");
+        assert!(!keys.join(AUDIT_KEY_FILE).exists());
+
+        // A store already on v2 keeps v2 whatever the configuration says.
+        apply_entry_format(
+            &log,
+            &keys,
+            Ok(AuditEntryFormat::V2),
+            &runtime,
+            principals(),
+        )
+        .await
+        .unwrap();
+        let reopened =
+            AuditLog::open_with_kv_store(Arc::clone(&store), Arc::clone(&runtime)).unwrap();
+        apply_entry_format(&reopened, &keys, unreadable(), &runtime, principals())
+            .await
+            .unwrap();
+        assert_eq!(reopened.entry_format(), Format::V2);
     }
 }
