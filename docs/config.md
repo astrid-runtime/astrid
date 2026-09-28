@@ -140,6 +140,10 @@ Enabling v2 is one-way for a node. Once the registry exists:
 - `keys/audit.key` must be kept: the daemon refuses to boot if it is missing
   or replaced, since only the registered key can authorize its successor.
 
+Once v2 is enabled, going back to an Astrid release without v2 support is
+not supported: such a release cannot verify v2 entries and would append v1
+entries after them.
+
 Only the operator's own configuration can set `entry_format`. A workspace
 `.astrid/config.toml` cannot. The daemon applies the setting at boot; an
 embedder that builds the kernel around its own audit log (such as the browser
