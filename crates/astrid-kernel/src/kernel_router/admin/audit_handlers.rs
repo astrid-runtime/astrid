@@ -339,12 +339,14 @@ async fn settled_prune_state(
 }
 
 /// Split an export cursor `"<next index>:<storage cursor>"` and check that
-/// the entry it resumes after still belongs to the requested chain.
+/// the storage cursor is a stored index key of an entry of the requested
+/// chain.
 ///
 /// The storage cursor is a session-index key `"<session>:<sequence>:<entry
-/// id>"` shared by every chain of the session, so a cursor taken from another
-/// principal's export would silently skip entries of this chain. The index
-/// is carried by the caller and is not authenticated; entry hashes and links
+/// id>"` shared by every chain of the session and compared lexically when
+/// paging, so a cursor taken from another principal's export, or one with an
+/// altered sequence, would silently skip entries of this chain. The index is
+/// carried by the caller and is not authenticated; entry hashes and links
 /// are what a verifier relies on.
 async fn resume_export_cursor(
     log: &AuditLog,
@@ -355,17 +357,16 @@ async fn resume_export_cursor(
     let malformed = || "malformed audit export cursor".to_owned();
     let (index, key) = cursor.split_once(':').ok_or_else(malformed)?;
     let index = index.parse::<u64>().map_err(|_| malformed())?;
-    let entry_id = key
-        .strip_prefix(&format!("{}:", session.0))
-        .and_then(|rest| rest.rsplit_once(':'))
-        .and_then(|(_, id)| uuid::Uuid::parse_str(id).ok())
-        .map(astrid_audit::AuditEntryId)
-        .ok_or_else(|| "audit export cursor does not belong to this session".to_owned())?;
+    if !key.starts_with(&format!("{}:", session.0)) {
+        return Err("audit export cursor does not belong to this session".to_owned());
+    }
     let entry = log
-        .get(&entry_id)
+        .chain_cursor_entry(key)
         .await
         .map_err(|error| error.to_string())?
-        .ok_or_else(|| "audit export cursor entry was pruned; restart from an index".to_owned())?;
+        .ok_or_else(|| {
+            "audit export cursor names no retained entry; restart from an index".to_owned()
+        })?;
     if &entry.session_id != session || entry.principal.as_ref() != principal {
         return Err("audit export cursor belongs to another chain".to_owned());
     }

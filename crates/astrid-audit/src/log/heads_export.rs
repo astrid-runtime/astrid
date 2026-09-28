@@ -173,6 +173,23 @@ impl AuditLog {
         }
     }
 
+    /// Read the entry a cursor returned by [`Self::chain_entries_page`]
+    /// names, or `None` when the cursor is not a stored session-index key:
+    /// it was altered, or a prune removed its entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backend cannot page chains or the entry
+    /// cannot be read.
+    pub async fn chain_cursor_entry(&self, cursor: &str) -> AuditResult<Option<AuditEntry>> {
+        let Some(storage) = self.storage.as_kv_audit_storage() else {
+            return Err(AuditError::UnsupportedOperation {
+                operation: "audit chain cursor lookup",
+            });
+        };
+        storage.indexed_entry(cursor).await
+    }
+
     /// Read up to `limit` retained entries of one chain in chain order.
     ///
     /// Every entry is returned with its durable cursor. Passing the last

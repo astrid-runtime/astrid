@@ -318,11 +318,19 @@ async fn export_rejects_unknown_chains_and_foreign_cursors() {
         .unwrap();
     let (_, alice_key) = alice_cursor.split_once(':').unwrap();
     let beyond_count = format!("3:{alice_key}");
+    // Keep the entry id but move the sequence past the rest of the chain.
+    let (prefix, entry_id) = alice_key.rsplit_once(':').unwrap();
+    let (session_key, sequence) = prefix.rsplit_once(':').unwrap();
+    let forged_sequence = format!(
+        "2:{session_key}:{:020}:{entry_id}",
+        sequence.parse::<u64>().unwrap() + 100
+    );
     for cursor in [
         "garbage",
         "1:00000000-0000-0000-0000-00000000abcd:x",
         bob_cursor.as_str(),
         beyond_count.as_str(),
+        forged_sequence.as_str(),
     ] {
         let response = export(
             &kernel,

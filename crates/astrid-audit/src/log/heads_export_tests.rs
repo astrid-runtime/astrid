@@ -282,3 +282,40 @@ async fn chain_entries_page_resumes_in_chain_order_for_one_principal() {
     assert_eq!(tail.len(), 1);
     assert!(tail[0].1.follows(exported.last().unwrap()));
 }
+
+#[tokio::test]
+async fn chain_cursor_entry_accepts_only_stored_index_keys() {
+    let log = AuditLog::in_memory(Arc::new(KeyPair::generate()));
+    let session = SessionId::new();
+    append(&log, &session, None, 4).await;
+    let page = log
+        .chain_entries_page(&session, None, None, 4)
+        .await
+        .unwrap();
+    let (first_key, first) = &page[0];
+    let (last_key, last) = &page[3];
+    assert_eq!(
+        log.chain_cursor_entry(last_key)
+            .await
+            .unwrap()
+            .map(|entry| entry.id),
+        Some(last.id.clone())
+    );
+
+    let (prefix, id) = last_key.rsplit_once(':').unwrap();
+    let (session_key, _) = prefix.rsplit_once(':').unwrap();
+    let altered = format!("{session_key}:{:020}:{id}", 999_u64);
+    assert!(log.chain_cursor_entry(&altered).await.unwrap().is_none());
+    assert!(log.chain_cursor_entry("garbage").await.unwrap().is_none());
+
+    log.prune_chain(&session, None, retain(2)).await.unwrap();
+    assert!(log.chain_cursor_entry(first_key).await.unwrap().is_none());
+    assert_eq!(
+        log.chain_cursor_entry(last_key)
+            .await
+            .unwrap()
+            .map(|entry| entry.id),
+        Some(last.id.clone())
+    );
+    assert_ne!(first.id, last.id);
+}
