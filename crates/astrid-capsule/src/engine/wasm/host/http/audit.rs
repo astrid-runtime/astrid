@@ -24,6 +24,9 @@
 //!   instance (a secret-typed config read) is replaced by [`REDACTED`] in the
 //!   path, the header values and the body.
 //!
+//! Secrets the host injects itself (see `credentials`) are committed in their
+//! placeholder form and only named on the entry.
+//!
 //! A verifier holding the request can recompute each commitment by applying
 //! the same redaction. The canonical header form is one `name:value\n` line
 //! per header, names lower-cased, sorted by name (duplicates keep their
@@ -342,6 +345,7 @@ impl HostState {
         headers: &HeaderMap,
         body: Option<&[u8]>,
         redirect_hop: u32,
+        injected_secrets: &[String],
     ) -> Option<Precommit> {
         let sink = self.audit_sink.clone()?;
         let redactor = Redactor::new(self.revealed_secrets.iter());
@@ -353,7 +357,7 @@ impl HostState {
             port: url.port_or_known_default().unwrap_or(0),
             commitment: RequestCommitment::compute(url, headers, body, &redactor),
             redirect_hop,
-            injected_secrets: Vec::new(),
+            injected_secrets: injected_secrets.to_vec(),
         })
     }
 }

@@ -18,9 +18,15 @@
 //! redirect hop is re-validated through the SAME airlock and `Authorization` /
 //! `Cookie` are stripped on a cross-origin hop. The host — never the capsule —
 //! owns DNS resolution and the connect path.
+//!
+//! Every wire request is recorded on the signed audit log before it is sent,
+//! and completed once its response is read (`audit.rs`). A capsule can name a
+//! manifest-declared secret in a header value (`{{secret:NAME}}`) and let the
+//! host inject it (`credentials.rs`), keeping the secret out of guest memory.
 
 mod audit;
 mod backend;
+mod credentials;
 mod options;
 // The SSRF host airlock. Private: every consumer is an `http` descendant that
 // reaches it via `super::ssrf`. (The redirect-default const it once exposed to
@@ -391,3 +397,7 @@ mod regression;
 #[cfg(test)]
 #[path = "audit_tests.rs"]
 mod audit_tests;
+
+#[cfg(test)]
+#[path = "credentials_tests.rs"]
+mod credentials_tests;

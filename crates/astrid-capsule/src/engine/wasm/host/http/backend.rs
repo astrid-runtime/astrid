@@ -20,6 +20,7 @@ use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
 
 use super::audit::{HttpExchange, error_text};
+use super::credentials::strip_injected;
 use super::options::{
     ResolvedOptions, check_scheme, same_origin, strip_credentials, verify_integrity,
 };
@@ -244,7 +245,7 @@ impl HostState {
             .ok_or(ErrorCode::InvalidRequest)?;
         let deny = |state: &Self, reason: &str| {
             if let Some(precommit) =
-                state.http_precommit(&parsed, method, headers, body, redirect_hop)
+                state.http_precommit(&parsed, method, headers, body, redirect_hop, &[])
             {
                 precommit.deny(reason);
             }
@@ -273,6 +274,17 @@ impl HostState {
         };
         let exempt = exempt_host.is_some();
 
+        // Host-side credential injection: `{{secret:NAME}}` placeholders in
+        // header values become the secret on the wire only. The audit
+        // commitment below is computed over the placeholder form.
+        let injected = match self.inject_credentials(headers) {
+            Ok(injected) => injected,
+            Err(error) => {
+                deny(self, &format!("credential injection refused: {error:?}"));
+                return Err(error.code());
+            },
+        };
+
         let tripped = Arc::new(AtomicBool::new(false));
         // Out-of-band DNS-miss flag: reqwest collapses a `dns_resolver` failure
         // into an opaque connect error, so the resolver flags a genuine
@@ -289,14 +301,24 @@ impl HostState {
             reqwest::redirect::Policy::none(),
         )?;
 
-        let mut request_builder = client.request(method.clone(), url).headers(headers.clone());
+        let mut request_builder = client
+            .request(method.clone(), url)
+            .headers(injected.headers);
         if let Some(b) = body {
             request_builder = request_builder.body(b.to_vec());
         }
 
         // Pre-commit: the request entry is durable before anything leaves
         // the host (DNS resolution included).
-        let mut exchange = match self.http_precommit(&parsed, method, headers, body, redirect_hop) {
+        let precommit = self.http_precommit(
+            &parsed,
+            method,
+            headers,
+            body,
+            redirect_hop,
+            &injected.names,
+        );
+        let mut exchange = match precommit {
             Some(precommit) => precommit.commit().await,
             None => HttpExchange::default(),
         };
@@ -410,9 +432,11 @@ impl HostState {
                 };
             // The redirect body is discarded unread; this hop is complete.
             wire.exchange.finish(false, HostAuditOutcome::Allowed);
-            // Strip credentials on a cross-origin hop.
+            // Strip credentials on a cross-origin hop, including every header
+            // that would carry a host-injected secret.
             if !same_origin(&current_url, &next_url) {
                 strip_credentials(&mut headers);
+                strip_injected(&mut headers);
             }
             // RFC 7231 method downgrade: 303 always → GET; 301/302
             // → GET except for GET/HEAD (de-facto browser behaviour
