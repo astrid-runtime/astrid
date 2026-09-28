@@ -425,6 +425,52 @@ async fn heads_sign_the_omitted_total_accumulated_across_prunes() {
     assert!(signed.windows(block.len()).any(|window| window == block));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn export_pages_span_several_storage_batches() {
+    let (_dir, kernel) = fixture().await;
+    let session = kernel.session_id.clone();
+    append(&kernel, &session, Some("grace"), 70).await;
+
+    let whole = export_page(&kernel, request(&session, "grace")).await;
+    assert_eq!((whole.entries.len(), whole.complete), (70, true));
+    for pair in whole.entries.windows(2) {
+        assert_eq!(pair[1].previous_hash_hex, pair[0].content_hash_hex);
+    }
+    for (limit, expected, complete) in [(64, 64, false), (70, 70, true)] {
+        let page = export_page(
+            &kernel,
+            AuditExportRequest {
+                limit: Some(limit),
+                ..request(&session, "grace")
+            },
+        )
+        .await;
+        assert_eq!(page.entries.len(), expected, "limit {limit}");
+        assert_eq!(page.complete, complete, "limit {limit}");
+    }
+    let first = export_page(
+        &kernel,
+        AuditExportRequest {
+            limit: Some(64),
+            ..request(&session, "grace")
+        },
+    )
+    .await;
+    let rest = export_page(
+        &kernel,
+        AuditExportRequest {
+            cursor: first.next_cursor,
+            ..request(&session, "grace")
+        },
+    )
+    .await;
+    assert_eq!(
+        (rest.from, rest.entries.len(), rest.complete),
+        (64, 6, true)
+    );
+    assert_eq!(rest.entries[0].id, whole.entries[64].id);
+}
+
 /// Append an entry whose action carries `padding` bytes of parameters.
 async fn append_padded(kernel: &Kernel, session: &SessionId, principal: &str, padding: usize) {
     kernel

@@ -37,8 +37,10 @@ const EXPORT_PAGE_BYTES: usize = 1024 * 1024;
 /// frame (twice the page budget). A larger entry fails the page with an
 /// error that names it.
 const EXPORT_ENTRY_MAX_BYTES: usize = EXPORT_PAGE_BYTES * 3 / 2;
-/// Entries read per storage page while skipping to a `from` index.
-const EXPORT_SKIP_PAGE: usize = 256;
+/// Entries read per storage call. A single entry can be nearly as large as
+/// the page budget, so this bounds what an export holds in memory while it
+/// skips to a `from` index or fills a page up to the byte budget.
+const EXPORT_READ_BATCH: usize = 32;
 /// Largest unpaged heads snapshot (roughly 600 bytes of JSON per chain).
 const HEADS_MAX_CHAINS: usize = 4_096;
 
@@ -161,7 +163,7 @@ async fn export_page(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "audit chain not found".to_owned())?;
-    let (from, mut after) = match cursor {
+    let (from, after) = match cursor {
         Some(cursor) => {
             let (index, key) = resume_export_cursor(log, &session, principal, &cursor).await?;
             if index > chain.count {
@@ -174,39 +176,11 @@ async fn export_page(
         },
         None => skip_to_index(log, &session, principal, from).await?,
     };
-    let read = log
-        .chain_entries_page(
-            &session,
-            principal,
-            after.as_deref(),
-            limit.saturating_add(1),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut complete = read.len() <= limit;
-    let mut entries = Vec::new();
-    let mut page_bytes = 0_usize;
-    for (key, entry) in read.into_iter().take(limit) {
-        let index = from.saturating_add(u64::try_from(entries.len()).unwrap_or(u64::MAX));
-        let exported = export_entry(index, &entry)?;
-        let size = serde_json::to_vec(&exported)
-            .map_err(|error| error.to_string())?
-            .len();
-        if !entries.is_empty() && page_bytes.saturating_add(size) > EXPORT_PAGE_BYTES {
-            complete = false;
-            break;
-        }
-        if size > EXPORT_ENTRY_MAX_BYTES {
-            return Err(format!(
-                "audit entry {} at index {index} exports as {size} bytes, above the \
-                 {EXPORT_ENTRY_MAX_BYTES}-byte limit",
-                exported.id
-            ));
-        }
-        page_bytes = page_bytes.saturating_add(size);
-        after = Some(key);
-        entries.push(exported);
-    }
+    let ExportedEntries {
+        entries,
+        after,
+        complete,
+    } = read_export_entries(log, &session, principal, from, after, limit).await?;
     let next_index = from.saturating_add(u64::try_from(entries.len()).unwrap_or(u64::MAX));
     let prune = settled_prune_state(log, &session, principal).await?;
     if prune.as_ref().map(|state| state.receipt_hash)
@@ -229,6 +203,83 @@ async fn export_page(
         prune_receipt_hash_hex: receipt.hash_hex,
         prune_receipt_signing_data_hex: receipt.signing_data_hex,
     })
+}
+
+/// The entries of one export page and where the next page resumes.
+struct ExportedEntries {
+    entries: Vec<AuditExportEntry>,
+    /// Storage cursor of the last exported entry, or the starting cursor
+    /// when the page is empty.
+    after: Option<String>,
+    /// Whether no further entry existed when the page was read.
+    complete: bool,
+}
+
+/// Read up to `limit` entries after `after`, numbered from `from`, stopping
+/// at the page byte budget.
+///
+/// Entries are read [`EXPORT_READ_BATCH`] at a time, one more than the page
+/// still needs when that fits, so reading stops as soon as the page is full
+/// and a following entry, if any, shows the page is not complete.
+async fn read_export_entries(
+    log: &AuditLog,
+    session: &SessionId,
+    principal: Option<&PrincipalId>,
+    from: u64,
+    mut after: Option<String>,
+    limit: usize,
+) -> Result<ExportedEntries, String> {
+    let mut entries = Vec::new();
+    let mut page_bytes = 0_usize;
+    loop {
+        let want = limit
+            .saturating_sub(entries.len())
+            .saturating_add(1)
+            .min(EXPORT_READ_BATCH);
+        let batch = log
+            .chain_entries_page(session, principal, after.as_deref(), want)
+            .await
+            .map_err(|error| error.to_string())?;
+        let exhausted = batch.len() < want;
+        for (key, entry) in batch {
+            if entries.len() == limit {
+                return Ok(ExportedEntries {
+                    entries,
+                    after,
+                    complete: false,
+                });
+            }
+            let index = from.saturating_add(u64::try_from(entries.len()).unwrap_or(u64::MAX));
+            let exported = export_entry(index, &entry)?;
+            let size = serde_json::to_vec(&exported)
+                .map_err(|error| error.to_string())?
+                .len();
+            if !entries.is_empty() && page_bytes.saturating_add(size) > EXPORT_PAGE_BYTES {
+                return Ok(ExportedEntries {
+                    entries,
+                    after,
+                    complete: false,
+                });
+            }
+            if size > EXPORT_ENTRY_MAX_BYTES {
+                return Err(format!(
+                    "audit entry {} at index {index} exports as {size} bytes, above the \
+                     {EXPORT_ENTRY_MAX_BYTES}-byte limit",
+                    exported.id
+                ));
+            }
+            page_bytes = page_bytes.saturating_add(size);
+            after = Some(key);
+            entries.push(exported);
+        }
+        if exhausted {
+            return Ok(ExportedEntries {
+                entries,
+                after,
+                complete: true,
+            });
+        }
+    }
 }
 
 /// A chain's latest prune receipt as an export page carries it.
@@ -335,7 +386,7 @@ async fn skip_to_index(
     while reached < from {
         let want = usize::try_from(from.saturating_sub(reached))
             .unwrap_or(usize::MAX)
-            .min(EXPORT_SKIP_PAGE);
+            .min(EXPORT_READ_BATCH);
         let page = log
             .chain_entries_page(session, principal, after.as_deref(), want)
             .await
