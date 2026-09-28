@@ -1071,6 +1071,7 @@ async fn blocked_principal_store_does_not_block_another_principal() {
         append_coordinator: Arc::new(Mutex::new(())),
         migration_capacity: None,
         destination_kv: None,
+        retention: retention_guard::RetentionControls::default(),
     });
     let session_id = SessionId::new();
 
@@ -1174,6 +1175,7 @@ async fn verification_uses_append_order_when_wall_clock_moves_backward() {
         append_coordinator: Arc::new(Mutex::new(())),
         migration_capacity: None,
         destination_kv: None,
+        retention: retention_guard::RetentionControls::default(),
     };
 
     let result = log.verify_chain(&session_id).await.unwrap();

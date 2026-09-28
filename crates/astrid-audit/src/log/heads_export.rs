@@ -152,6 +152,47 @@ impl AuditLog {
             .transpose()
     }
 
+    /// Read up to `limit` of one chain's prune receipts with generation at
+    /// least `from_generation`, oldest first.
+    ///
+    /// Every receipt is kept once it is installed. A chain pruned before
+    /// that history existed lacks its earlier generations; its installed
+    /// receipt is listed all the same.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backend keeps no receipt history or a
+    /// receipt cannot be read or decoded.
+    pub async fn prune_receipts(
+        &self,
+        session_id: &SessionId,
+        principal: Option<&PrincipalId>,
+        from_generation: u64,
+        limit: usize,
+    ) -> AuditResult<Vec<AuditChainPruneState>> {
+        let Some(storage) = self.storage.as_kv_audit_storage() else {
+            return Err(AuditError::UnsupportedOperation {
+                operation: "audit prune receipt history",
+            });
+        };
+        let mut receipts = storage
+            .receipt_history_page(session_id, principal, from_generation, limit)
+            .await?
+            .into_iter()
+            .map(decode_prune_state)
+            .collect::<AuditResult<Vec<_>>>()?;
+        if receipts.len() < limit
+            && let Some(installed) = self.prune_state(session_id, principal).await?
+            && installed.receipt.generation >= from_generation
+            && receipts
+                .last()
+                .is_none_or(|last| last.receipt.generation < installed.receipt.generation)
+        {
+            receipts.push(installed);
+        }
+        Ok(receipts)
+    }
+
     /// Whether a prune of one chain has started and not yet finished.
     ///
     /// A prune deletes entries only while it is in progress and installs a

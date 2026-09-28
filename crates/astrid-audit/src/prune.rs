@@ -259,6 +259,7 @@ async fn persist_prune(
 ) -> AuditResult<AuditPruneReceipt> {
     let encoded = serde_json::to_vec(receipt)
         .map_err(|error| AuditError::SerializationError(error.to_string()))?;
+    super::archive::archive_pruned(log, session_id, principal, receipt, &encoded).await?;
     // The backend advances a durable deletion plan by one bounded page. Keep
     // resuming that same plan until its signed receipt is published; a crash
     // or cancellation simply leaves the cursor for the next invocation.
@@ -326,6 +327,10 @@ pub(crate) async fn prune_chain_segment(
             }),
     };
     let (generation, prior_receipt_hash) = prior_receipt(log, session_id, principal).await?;
+    // Checked against the pruned total read after the prior receipt: see
+    // `retention_guard`.
+    log.check_prune_reach(session_id, principal, scan.omitted_count)
+        .await?;
     let receipt = AuditPruneReceipt {
         schema: 1,
         session: session_id.to_string(),

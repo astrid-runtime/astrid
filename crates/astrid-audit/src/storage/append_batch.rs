@@ -128,6 +128,9 @@ impl KvAuditStorage {
         entries: &[(&AuditEntry, Option<&AuditEntryId>)],
     ) -> AuditResult<Option<PreparedBatch>> {
         let (global_expected, global) = self.load_global_metadata().await?;
+        // Admission follows the hold as loaded; sealing a segment in this
+        // batch clears it only for later appends.
+        let hold = global.retention_hold.clone();
         let mut prepared = PreparedBatch::new(global_expected, global, entries.len());
         let mut seen_entries = HashSet::with_capacity(entries.len());
         for (entry, expected) in entries {
@@ -149,7 +152,12 @@ impl KvAuditStorage {
         if prepared.global.total_count > prepared.global.cap_entries
             || prepared.global.total_bytes > prepared.global.cap_bytes
         {
-            return Err(AuditError::RetentionCapReached);
+            let Some(hold) = hold else {
+                return Err(AuditError::RetentionCapReached);
+            };
+            // Keep unanchored history over the cap rather than drop it.
+            prepared.global.degraded = true;
+            prepared.global.last_error = Some(hold);
         }
         Ok(Some(prepared))
     }
@@ -452,6 +460,7 @@ fn update_global_metadata(
     if next.sealed {
         global.sealed_segments = global.sealed_segments.saturating_add(1);
         global.eligible_segments = global.eligible_segments.saturating_add(1);
+        global.retention_hold = None;
     }
 }
 

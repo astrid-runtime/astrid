@@ -71,9 +71,10 @@ mod storage;
 pub use entry::{ApprovalScope, AuditAction, AuditEntry, AuditOutcome, AuthorizationProof};
 pub use error::{AuditError, AuditResult};
 pub use log::{
-    AuditCapacityProvider, AuditChainHead, AuditChainPruneState, AuditChainStats, AuditGlobalStats,
-    AuditLog, AuditPruneReceipt, AuditRetentionPolicy, ChainIssue, ChainVerificationResult,
-    LegacyAuditImportReport,
+    AuditAnchorMarkResult, AuditAnchorWatermark, AuditArchiveWriter, AuditArchiver,
+    AuditCapacityProvider, AuditChainAnchorStatus, AuditChainHead, AuditChainPruneState,
+    AuditChainStats, AuditGlobalStats, AuditLog, AuditPruneReceipt, AuditRetentionPolicy,
+    ChainIssue, ChainVerificationResult, LegacyAuditImportReport,
 };
 
 // Re-export AuditEntryId from capabilities for convenience

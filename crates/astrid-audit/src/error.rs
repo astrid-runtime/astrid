@@ -13,6 +13,17 @@ pub enum AuditError {
     #[error("audit retention cap reached")]
     RetentionCapReached,
 
+    /// A prune would remove audit history that is not externally anchored:
+    /// entries at or past a chain's anchored watermark, or any entry of a
+    /// chain without one while anchoring is required.
+    #[error("audit prune would remove unanchored history: {0}")]
+    UnanchoredPrune(String),
+
+    /// An anchor mark does not match the chain it names, or would lower its
+    /// watermark.
+    #[error("audit anchor mark rejected: {0}")]
+    AnchorRejected(String),
+
     /// The selected backend does not expose a bounded operation.
     #[error("audit backend does not support {operation}")]
     UnsupportedOperation {

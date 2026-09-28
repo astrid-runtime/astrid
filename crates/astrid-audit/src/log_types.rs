@@ -22,6 +22,9 @@ pub struct AuditGlobalStats {
     pub degraded: bool,
     /// Most recent cap or metadata error, if degraded.
     pub last_error: Option<String>,
+    /// Set while the cap is exceeded because every prunable segment holds
+    /// history that is not anchored; says why.
+    pub retention_hold: Option<String>,
 }
 
 /// Result of chain verification.

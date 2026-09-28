@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
+mod anchor_marks;
 mod append;
 mod append_batch;
 pub(crate) mod blind_move;
@@ -27,7 +28,11 @@ mod paging_principal;
 mod paging_session;
 mod prune_chain;
 mod prune_finish;
+mod receipt_history;
+mod retention_hold;
+mod sealed_segments;
 mod system;
+pub(crate) use anchor_marks::{AnchorMark, ChainPositions, MarkInstall};
 use global::GlobalMetadata;
 #[cfg(test)]
 pub(crate) use global::GlobalMetadata as TestGlobalMetadata;
@@ -36,6 +41,7 @@ use key_types::SessionSequence;
 use metadata::ChainMetadata;
 #[cfg(test)]
 pub(crate) use metadata::ChainMetadata as TestChainMetadata;
+pub(crate) use sealed_segments::{SegmentChain, segment_chain};
 use system::AuditSystemNamespace;
 #[async_trait]
 pub(crate) trait AuditStorage: Send + Sync {
@@ -758,6 +764,8 @@ impl AuditStorage for KvAuditStorage {
         let (expected, mut metadata) = self.load_global_metadata().await?;
         metadata.cap_entries = entries;
         metadata.cap_bytes = bytes;
+        // New caps get a fresh attempt at pruning before any hold applies.
+        metadata.retention_hold = None;
         metadata.degraded = metadata.total_count > entries || metadata.total_bytes > bytes;
         metadata.last_error = metadata.degraded.then(|| {
             "system audit retention cap is below current usage; prune sealed segments".to_owned()
@@ -777,12 +785,7 @@ impl AuditStorage for KvAuditStorage {
     async fn oldest_sealed_segment(
         &self,
     ) -> AuditResult<Option<(SessionId, Option<astrid_core::PrincipalId>, ChainMetadata)>> {
-        let keys = self
-            .store
-            .list_keys_with_prefix_page(NS_SEGMENT_INDEX, "", None, 1)
-            .await
-            .map_err(|error| AuditError::StorageError(error.to_string()))?;
-        let Some(index_key) = keys.into_iter().next() else {
+        let Some(index_key) = self.sealed_segment_keys(None, 1).await?.into_iter().next() else {
             return Ok(None);
         };
         let descriptor = self
@@ -795,24 +798,8 @@ impl AuditStorage for KvAuditStorage {
             })?;
         let metadata: ChainMetadata = serde_json::from_slice(&descriptor)
             .map_err(|error| AuditError::SerializationError(error.to_string()))?;
-        let (_, chain_with_segment) = index_key.split_once(':').ok_or_else(|| {
-            AuditError::StorageError("invalid audit segment index key".to_owned())
-        })?;
-        let (chain, _) = chain_with_segment.rsplit_once(':').ok_or_else(|| {
-            AuditError::StorageError("invalid audit segment index key".to_owned())
-        })?;
-        let (session, principal) = chain
-            .split_once(':')
-            .map_or((chain, None), |(session, principal)| {
-                (session, Some(principal))
-            });
-        let session = uuid::Uuid::parse_str(session)
-            .map_err(|error| AuditError::StorageError(error.to_string()))?;
-        let principal = principal
-            .map(astrid_core::PrincipalId::new)
-            .transpose()
-            .map_err(|error| AuditError::StorageError(error.to_string()))?;
-        Ok(Some((SessionId::from_uuid(session), principal, metadata)))
+        let chain = segment_chain(&index_key)?;
+        Ok(Some((chain.session, chain.principal, metadata)))
     }
 
     async fn prune_chain(
