@@ -38,6 +38,8 @@
 #![deny(clippy::unwrap_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+/// Audit log settings, including anchor-aware retention.
+pub mod audit;
 /// Pre-mount client configuration.
 pub mod client;
 /// Environment variable fallback resolution.

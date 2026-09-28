@@ -206,6 +206,18 @@ host_queue_capacity = 4096
 # probes still persist. Set true to record every allowed probe.
 host_path_probes = false
 
+# Anchor-aware retention. A chain that an anchoring service has marked with
+# `audit.anchor_mark` is never pruned past its anchored watermark. These keys
+# are operator-only: a workspace config cannot change them.
+[audit.retention]
+# Refuse to prune chains that have no anchored watermark. At the global cap,
+# entries are then kept over the cap and `astrid audit stats` reports
+# degraded, instead of deleting unanchored history.
+require_anchor = false
+# Absolute directory that receives every pruned segment (signed receipt plus
+# the removed entries, one JSON line each) before deletion.
+# archive_dir = "/var/lib/astrid/audit-archive"
+
 # ============================================================================
 # Cryptographic Keys
 # ============================================================================

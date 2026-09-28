@@ -450,6 +450,46 @@ fn test_capsule_local_egress_workspace_cannot_widen_operator_value() {
 }
 
 #[test]
+fn test_audit_retention_is_operator_only() {
+    // A project layer must not turn off anchor-before-prune or point the
+    // archive of pruned audit history somewhere else.
+    let baseline: toml::Value = toml::from_str(
+        r#"
+        [audit]
+        host_batch_max = 64
+        [audit.retention]
+        require_anchor = true
+        archive_dir = "/srv/audit-archive"
+    "#,
+    )
+    .unwrap();
+    let workspace: toml::Value = toml::from_str(
+        r#"
+        [audit]
+        host_batch_max = 32
+        [audit.retention]
+        require_anchor = false
+        archive_dir = "/tmp/elsewhere"
+    "#,
+    )
+    .unwrap();
+
+    let mut merged = baseline.clone();
+    deep_merge(&mut merged, &workspace);
+    enforce_restrictions(&mut merged, &baseline, &workspace);
+    assert_eq!(merged["audit"]["retention"], baseline["audit"]["retention"]);
+    // Other audit keys still layer as before.
+    assert_eq!(merged["audit"]["host_batch_max"].as_integer(), Some(32));
+
+    // Without an operator value, the workspace's is removed.
+    let bare: toml::Value = toml::from_str("[audit]\nhost_batch_max = 64\n").unwrap();
+    let mut merged = bare.clone();
+    deep_merge(&mut merged, &workspace);
+    enforce_restrictions(&mut merged, &bare, &workspace);
+    assert!(merged["audit"].get("retention").is_none());
+}
+
+#[test]
 fn test_uplinks_cannot_be_introduced_by_workspace() {
     let baseline: toml::Value = toml::from_str("[runtime]\nsystem_prompt = \"base\"\n").unwrap();
     let workspace: toml::Value = toml::from_str(

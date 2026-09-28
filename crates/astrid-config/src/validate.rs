@@ -345,6 +345,14 @@ fn validate_audit(config: &Config) -> ConfigResult<()> {
             ),
         });
     }
+    if let Some(dir) = &audit.retention.archive_dir
+        && !std::path::Path::new(dir).is_absolute()
+    {
+        return Err(ConfigError::ValidationError {
+            field: "audit.retention.archive_dir".to_owned(),
+            message: format!("archive_dir {dir:?} must be an absolute path"),
+        });
+    }
     Ok(())
 }
 
@@ -469,6 +477,22 @@ mod tests {
         let mut config = Config::default();
         config.budget.per_action_max_usd = 200.0;
         assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_audit_archive_dir_must_be_absolute() {
+        let mut config = Config::default();
+        config.audit.retention.archive_dir = Some("relative/archive".to_owned());
+        let err = validate(&config).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::ValidationError { field, .. }
+                if field == "audit.retention.archive_dir"
+        ));
+        let absolute = std::env::temp_dir().join("audit-archive");
+        config.audit.retention.archive_dir = Some(absolute.to_string_lossy().into_owned());
+        config.audit.retention.require_anchor = true;
+        assert!(validate(&config).is_ok());
     }
 
     #[test]
