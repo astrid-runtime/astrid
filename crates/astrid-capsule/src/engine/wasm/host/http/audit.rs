@@ -10,8 +10,8 @@
 //! 2. a completion, enqueued once the response body has been read or the
 //!    exchange ended early.
 //!
-//! A request refused by the egress or security gate is recorded as a denied
-//! pre-commit instead.
+//! A request refused by the scheme check or the egress or security gate is
+//! recorded as a denied pre-commit instead.
 //!
 //! Content never reaches the log. The request is committed by BLAKE3 hashes
 //! of its path and query, its capsule-supplied headers and its body, each

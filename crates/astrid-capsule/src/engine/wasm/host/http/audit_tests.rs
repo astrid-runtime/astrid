@@ -564,3 +564,26 @@ async fn gate_denied_request_is_recorded_as_denied() {
         "{records:?}"
     );
 }
+
+/// A request refused by the caller's https-only option is recorded as denied
+/// and never sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn https_only_refusal_is_recorded_as_denied() {
+    let sink = Arc::new(HttpSink::default());
+    let mut state = audited_state(9, &sink);
+    let limits = state.http_limits;
+    let mut opts = super::options::ResolvedOptions::v10_defaults(&limits);
+    opts.https_only = true;
+    let result = state
+        .http_request_backend(
+            post("http://api.example.com/v1/chat".to_owned(), "{}", &[]),
+            opts,
+        )
+        .await;
+    assert!(matches!(result, Err(super::ErrorCode::SchemeDenied)));
+    let records = sink.records();
+    assert!(
+        matches!(records.as_slice(), [Recorded::Denied { reason }] if reason == "scheme denied"),
+        "{records:?}"
+    );
+}

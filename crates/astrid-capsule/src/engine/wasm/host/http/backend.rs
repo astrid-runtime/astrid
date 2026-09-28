@@ -223,8 +223,8 @@ impl HostState {
     /// streaming paths. The egress decision is re-evaluated per hop, so a
     /// redirect to a different host re-runs the full airlock.
     ///
-    /// A hop refused by the egress or security gate is recorded as a denied
-    /// HTTP request. A hop that passes is pre-committed to the audit log —
+    /// A hop refused by the scheme check or the egress or security gate is
+    /// recorded as a denied HTTP request. A hop that passes is pre-committed to the audit log —
     /// the host waits for the durable append — before it is sent; the
     /// returned [`WireResponse`] carries the open exchange.
     async fn send_one_hop(
@@ -236,7 +236,17 @@ impl HostState {
         opts: &ResolvedOptions,
         redirect_hop: u32,
     ) -> Result<WireResponse, ErrorCode> {
-        check_scheme(url, opts.https_only)?;
+        if let Err(error) = check_scheme(url, opts.https_only) {
+            // A refused scheme is a refused request: record it like the other
+            // refusals whenever the URL parses at all.
+            if let Ok(parsed) = reqwest::Url::parse(url)
+                && let Some(precommit) =
+                    self.http_precommit(&parsed, method, headers, body, redirect_hop, &[])
+            {
+                precommit.deny("scheme denied");
+            }
+            return Err(error);
+        }
 
         let parsed = reqwest::Url::parse(url).map_err(|_| ErrorCode::InvalidRequest)?;
         let host = parsed.host_str().ok_or(ErrorCode::InvalidRequest)?;
