@@ -1,8 +1,11 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use astrid_core::SessionId;
 use astrid_crypto::{ContentHash, KeyPair};
 use async_trait::async_trait;
+use tokio::sync::Notify;
 
 use crate::entry::{AuditAction, AuditEntry, AuditOutcome, AuthorizationProof};
 use crate::error::{AuditError, AuditResult};
@@ -229,4 +232,65 @@ async fn receipt_installed_before_history_existed_is_listed_and_kept() {
         .map(|bytes| serde_json::from_slice(bytes).unwrap())
         .collect();
     assert_eq!(recorded, vec![first, second]);
+}
+
+/// Holds the first archive open until released; later ones pass through.
+#[derive(Default)]
+struct HoldFirstArchiver {
+    inner: MemoryArchiver,
+    begun: AtomicUsize,
+    entered: Notify,
+    release: Notify,
+}
+
+#[async_trait]
+impl AuditArchiver for HoldFirstArchiver {
+    async fn begin(
+        &self,
+        receipt: &AuditPruneReceipt,
+        receipt_bytes: &[u8],
+    ) -> AuditResult<Box<dyn AuditArchiveWriter>> {
+        if self.begun.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.begin(receipt, receipt_bytes).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_prunes_of_a_chain_archive_one_at_a_time() {
+    let log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+    let session = SessionId::new();
+    append(&log, &session, 10).await;
+    let archiver = Arc::new(HoldFirstArchiver::default());
+    log.set_prune_archiver(Some(Arc::clone(&archiver) as Arc<dyn AuditArchiver>));
+    let prune = |entries| {
+        let log = Arc::clone(&log);
+        let session = session.clone();
+        tokio::spawn(async move { log.prune_chain(&session, None, retain(entries)).await })
+    };
+
+    // The first prune has signed generation 0 and is archiving it.
+    let first = prune(2);
+    archiver.entered.notified().await;
+    // A second prune of the chain would sign generation 0 too. It must not
+    // archive until the first has installed its plan.
+    let second = prune(5);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(archiver.begun.load(Ordering::SeqCst), 1);
+    archiver.release.notify_one();
+
+    let first = first.await.unwrap().unwrap();
+    let second = second.await.unwrap().unwrap();
+    assert_eq!(first.generation, 0);
+    assert_eq!(first.omitted_count, 8);
+    assert_eq!(second.generation, 1);
+    assert_eq!(second.omitted_count, 0);
+    // Only the installed generation-0 receipt was archived; the second prune
+    // removed nothing.
+    let committed = archiver.inner.committed.lock().unwrap().clone();
+    assert_eq!(committed.len(), 1);
+    assert_eq!(committed[0].0, serde_json::to_vec(&first).unwrap());
+    assert_eq!(committed[0].1.len(), 8);
 }

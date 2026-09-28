@@ -7,6 +7,8 @@ impl AuditLog {
         &self,
         policy: AuditRetentionPolicy,
     ) -> AuditResult<Option<AuditPruneReceipt>> {
+        // Held from selection on, so the segment chosen is still there.
+        let _prunes = prune::lock_prunes().await;
         let Some(selected) = self.select_prunable_segment(policy).await? else {
             return Ok(None);
         };

@@ -13,6 +13,20 @@ use crate::log::AuditLog;
 const MAX_RETENTION_RING: usize = 8192;
 const MAX_RESUME_PAGES: usize = 16_384;
 
+/// Serializes prunes, from choosing what to remove until the deletion plan is
+/// installed. Two prunes of one chain read the same prior receipt and sign
+/// receipts of the same generation; without this, both could archive before
+/// either installs its plan, and the archive of the one that is not installed
+/// could replace the archive of the one that is. Taken after an append's
+/// chain lock (the cap prunes inside an append) and before
+/// `DURABLE_APPEND_LOCK`.
+static PRUNE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Hold [`PRUNE_LOCK`] for one prune.
+pub(crate) async fn lock_prunes() -> tokio::sync::MutexGuard<'static, ()> {
+    PRUNE_LOCK.lock().await
+}
+
 /// Operator-selected bounded retention for one audit chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuditRetentionPolicy {
@@ -290,9 +304,11 @@ pub(crate) async fn prune_chain(
     principal: Option<&PrincipalId>,
     policy: AuditRetentionPolicy,
 ) -> AuditResult<AuditPruneReceipt> {
+    let _prunes = lock_prunes().await;
     prune_chain_segment(log, session_id, principal, policy, None).await
 }
 
+/// Callers hold [`lock_prunes`].
 pub(crate) async fn prune_chain_segment(
     log: &AuditLog,
     session_id: &SessionId,
