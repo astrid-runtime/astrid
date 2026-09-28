@@ -9,6 +9,7 @@ use astrid_core::{Permission, SessionId, Timestamp, TokenId};
 use astrid_crypto::{ContentHash, KeyPair, PublicKey, Signature};
 use serde::{Deserialize, Serialize};
 
+use crate::entry_v2::{self, EntryV2Seal};
 use crate::error::{AuditError, AuditResult};
 
 /// A single audit log entry.
@@ -32,10 +33,27 @@ pub struct AuditEntry {
     pub outcome: AuditOutcome,
     /// Hash of the previous entry (chain linking).
     pub previous_hash: ContentHash,
-    /// Runtime public key that signed this entry.
+    /// Public key that signed this entry: the runtime key for format v1, the
+    /// audit key for format v2. A v2 verifier accepts it only when the key
+    /// registry lists it (see [`crate::entry_v2`]).
     pub runtime_key: PublicKey,
     /// Signature over entry contents.
     pub signature: Signature,
+    /// Format-v2 data; `None` for a format-v1 entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v2: Option<EntryV2Seal>,
+}
+
+/// Signed layout of an audit entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuditEntryFormat {
+    /// The original layout: signs JSON of the action and authorization, one
+    /// outcome bit and whole-second time, verified against the embedded key.
+    #[default]
+    V1,
+    /// Canonical CBOR body, every field signed, verified against the key
+    /// registry. See [`crate::entry_v2`].
+    V2,
 }
 
 impl AuditEntry {
@@ -59,6 +77,17 @@ impl AuditEntry {
             previous_hash,
             runtime_key,
             signature: Signature::from_bytes([0u8; 64]), // Placeholder
+            v2: None,
+        }
+    }
+
+    /// The signed layout of this entry.
+    #[must_use]
+    pub fn format(&self) -> AuditEntryFormat {
+        if self.v2.is_some() {
+            AuditEntryFormat::V2
+        } else {
+            AuditEntryFormat::V1
         }
     }
 
@@ -119,8 +148,18 @@ impl AuditEntry {
     }
 
     /// Get the data used for signing.
+    ///
+    /// For format v2 this is `dCBOR(["astrid.audit.sig.v2", "entry",
+    /// entry_hash])`; for format v1 it is the legacy concatenation.
     #[must_use]
     pub fn signing_data(&self) -> Vec<u8> {
+        match &self.v2 {
+            Some(seal) => entry_v2::signing_input(&self.v2_entry_hash(seal)),
+            None => self.v1_signing_data(),
+        }
+    }
+
+    fn v1_signing_data(&self) -> Vec<u8> {
         let mut data = Vec::new();
         data.extend_from_slice(self.id.0.as_bytes());
         data.extend_from_slice(&self.timestamp.0.timestamp().to_le_bytes());
@@ -157,12 +196,23 @@ impl AuditEntry {
     }
 
     /// Compute the content hash of this entry.
+    ///
+    /// Format v1: BLAKE3 of the signing data. Format v2: SHA-256 of the
+    /// canonical body (the v2 `entry_hash`). Chain links, chain heads and
+    /// archive receipts use this hash for either format.
     #[must_use]
     pub fn content_hash(&self) -> ContentHash {
-        ContentHash::hash(&self.signing_data())
+        match &self.v2 {
+            Some(seal) => ContentHash::from_bytes(self.v2_entry_hash(seal)),
+            None => ContentHash::hash(&self.v1_signing_data()),
+        }
     }
 
-    /// Verify the entry's signature.
+    /// Verify the entry's signature against the key embedded in the entry.
+    ///
+    /// Format v2 uses strict Ed25519 verification. This does not establish
+    /// that the key is authorized to sign audit entries; a v2 verifier checks
+    /// that against the key registry ([`crate::ChainVerifier`]).
     ///
     /// # Errors
     ///
@@ -170,11 +220,15 @@ impl AuditEntry {
     /// the entry contents.
     pub fn verify_signature(&self) -> AuditResult<()> {
         let signing_data = self.signing_data();
-        self.runtime_key
-            .verify(&signing_data, &self.signature)
-            .map_err(|_| AuditError::InvalidSignature {
-                entry_id: self.id.to_string(),
-            })
+        let verified = if self.v2.is_some() {
+            self.runtime_key
+                .verify_strict(&signing_data, &self.signature)
+        } else {
+            self.runtime_key.verify(&signing_data, &self.signature)
+        };
+        verified.map_err(|_| AuditError::InvalidSignature {
+            entry_id: self.id.to_string(),
+        })
     }
 
     /// Check if this entry follows another (chain linking).

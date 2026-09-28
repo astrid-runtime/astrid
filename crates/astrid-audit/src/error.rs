@@ -57,6 +57,26 @@ pub enum AuditError {
     /// Crypto error.
     #[error("crypto error: {0}")]
     CryptoError(#[from] astrid_crypto::CryptoError),
+
+    /// The key registry is missing, malformed, or refuses a change.
+    #[error("audit key registry: {0}")]
+    KeyRegistry(String),
+
+    /// The configured audit key is not the registry's active audit key.
+    #[error("audit key {key} is not the active audit key of the key registry")]
+    KeyNotRegistered {
+        /// Hex of the refused public key.
+        key: String,
+    },
+
+    /// A format-v1 append was refused because the log has moved to format v2.
+    #[error(
+        "audit log is closed to format-v1 entries ({reason}); enable entry format v2 to append"
+    )]
+    V1Closed {
+        /// Why v1 is closed: a v2 chain head or a key registry in the store.
+        reason: &'static str,
+    },
 }
 
 /// Result type for audit operations.

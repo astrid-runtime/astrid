@@ -126,6 +126,9 @@ fs2 = "0.4"
 futures = "0.3"
 globset = "0.4"
 hex = "0.4"
+# HMAC-SHA256 derives the per-field salts of v2 audit entries. 0.13 pairs with
+# sha2 0.11 (digest 0.11) and is already in the lock through other crates.
+hmac = "0.13"
 ignore = "0.4"
 indicatif = "0.18"
 insta = { version = "1.40", features = ["yaml", "json"] }

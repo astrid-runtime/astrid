@@ -113,7 +113,7 @@ impl AuditPruneReceipt {
         }
     }
 
-    fn signing_bytes(&self) -> AuditResult<Vec<u8>> {
+    pub(crate) fn signing_bytes(&self) -> AuditResult<Vec<u8>> {
         serde_json::to_vec(&self.unsigned())
             .map_err(|error| AuditError::SerializationError(error.to_string()))
     }
@@ -316,6 +316,9 @@ pub(crate) async fn prune_chain_segment(
             }),
     };
     let (generation, prior_receipt_hash) = prior_receipt(log, session_id, principal).await?;
+    // Format v2 signs receipts with the audit key, so a verifier can check
+    // the receipt key against the key registry like any v2 signature.
+    let signer = log.archive_signing_key();
     let receipt = AuditPruneReceipt {
         schema: 1,
         session: session_id.to_string(),
@@ -334,13 +337,12 @@ pub(crate) async fn prune_chain_segment(
         prior_receipt_hash,
         segment: selected_segment.0,
         seal_ordinal: selected_segment.1,
-        public_key: log.runtime_public_key(),
+        public_key: signer.export_public_key(),
         signature: Signature::from_bytes([0; 64]),
     };
     let mut receipt = receipt;
     let bytes = receipt.signing_bytes()?;
-    let signature = log.sign_archive_receipt(&bytes);
-    receipt.signature = signature;
+    receipt.signature = signer.sign(&bytes);
     persist_prune(log, session_id, principal, &receipt).await
 }
 

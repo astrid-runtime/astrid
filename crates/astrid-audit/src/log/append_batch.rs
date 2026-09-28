@@ -3,7 +3,8 @@
 use super::prune::AuditRetentionPolicy;
 use super::{
     AuditAction, AuditEntry, AuditEntryId, AuditError, AuditLog, AuditOutcome, AuditResult,
-    AuthorizationProof, ChainHead, ChainKey, DEFAULT_AUTO_RETENTION_ENTRIES, HeadState,
+    AuthorizationProof, ChainHead, ChainKey, DEFAULT_AUTO_RETENTION_ENTRIES, EntryRequest,
+    HeadState,
 };
 use astrid_core::{PrincipalId, SessionId};
 use std::collections::HashMap;
@@ -111,23 +112,18 @@ impl AuditLog {
                 heads.insert(chain_key.clone(), handle.lock().await.clone());
             }
             let previous = heads.get(&chain_key).and_then(Option::as_ref);
-            let (expected, previous_hash) = self.previous_hash_locked(&chain_key, previous).await?;
-            let entry = AuditEntry::create_with_principal(
-                session_id.clone(),
-                principal.clone(),
-                action.clone(),
-                authorization.clone(),
-                outcome.clone(),
-                previous_hash,
-                &self.runtime_key,
-            );
-            heads.insert(
-                chain_key,
-                Some(HeadState {
-                    id: entry.id.clone(),
-                    hash: entry.content_hash(),
-                }),
-            );
+            let (expected, previous_hash, previous_v2) =
+                self.previous_hash_locked(&chain_key, previous).await?;
+            let request = EntryRequest {
+                session_id: session_id.clone(),
+                principal: Some(principal.clone()),
+                actor: None,
+                action: action.clone(),
+                authorization: authorization.clone(),
+                outcome: outcome.clone(),
+            };
+            let entry = self.sign_entry(request, previous_hash, previous_v2).await?;
+            heads.insert(chain_key, Some(HeadState::of(&entry)));
             signed.push((index, entry, expected));
         }
         Ok(SignedBatch {

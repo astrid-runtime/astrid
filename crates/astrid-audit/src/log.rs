@@ -29,7 +29,7 @@ pub trait AuditCapacityProvider: Send + Sync {
     /// Returns a provider or media-capacity error.
     fn available_bytes(&self) -> AuditResult<Option<u64>>;
 }
-use tracing::{debug, error, warn};
+use tracing::debug;
 #[path = "log_types.rs"]
 mod types;
 pub use types::{AuditGlobalStats, ChainIssue, ChainVerificationResult};
@@ -44,6 +44,8 @@ mod import_legacy;
 mod migration;
 #[path = "log/prune_oldest.rs"]
 mod prune_oldest_impl;
+#[path = "log/v2.rs"]
+mod v2;
 #[path = "log/verify_chain.rs"]
 mod verify_chain_impl;
 #[path = "log/verify_legacy_chain.rs"]
@@ -52,6 +54,8 @@ use migration::{
     LegacyAuditReceipt, digest_legacy_source, estimated_migration_bytes,
     validate_legacy_source_path,
 };
+use v2::{EntryRequest, V2Position, V2Signer};
+pub use v2::{EntryV2Config, PrincipalUidResolver};
 #[cfg(test)]
 #[path = "builder.rs"]
 mod builder;
@@ -110,7 +114,22 @@ struct ChainKey {
 struct HeadState {
     id: AuditEntryId,
     hash: ContentHash,
+    v2: Option<V2Position>,
 }
+
+impl HeadState {
+    fn of(entry: &AuditEntry) -> Self {
+        Self {
+            id: entry.id.clone(),
+            hash: entry.content_hash(),
+            v2: V2Position::of(entry),
+        }
+    }
+}
+
+/// The durable head a new entry is signed against: its id (the storage CAS
+/// expectation), its hash and its v2 chain position.
+type ResolvedHead = (Option<AuditEntryId>, ContentHash, Option<V2Position>);
 
 type ChainHead = Arc<Mutex<Option<HeadState>>>;
 /// Automatic cap enforcement retains the active segment; the selected oldest
@@ -143,8 +162,33 @@ pub struct AuditLog {
     migration_capacity: Option<Arc<dyn AuditCapacityProvider>>,
     /// Original KV handle so cutover can freshly reopen the destination.
     destination_kv: Option<Arc<dyn KvStore>>,
+    /// Format-v2 signer; `None` while the log writes format v1.
+    entry_v2: std::sync::RwLock<Option<Arc<V2Signer>>>,
+    /// Whether the store held a key registry when v1 was last checked.
+    v1_closed: tokio::sync::OnceCell<bool>,
+    /// Serializes key-registry changes (enable, rotate).
+    registry_lock: Mutex<()>,
 }
 impl AuditLog {
+    fn from_parts(
+        storage: Box<dyn AuditStorage>,
+        runtime_key: Arc<KeyPair>,
+        migration_capacity: Option<Arc<dyn AuditCapacityProvider>>,
+        destination_kv: Option<Arc<dyn KvStore>>,
+    ) -> Self {
+        Self {
+            storage,
+            runtime_key,
+            chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
+            append_coordinator: Arc::new(Mutex::new(())),
+            migration_capacity,
+            destination_kv,
+            entry_v2: std::sync::RwLock::new(None),
+            v1_closed: tokio::sync::OnceCell::new(),
+            registry_lock: Mutex::new(()),
+        }
+    }
+
     /// Open a legacy native audit source for migration only.
     ///
     /// The key is stored behind an [`Arc`]: callers may pass an owned
@@ -162,14 +206,12 @@ impl AuditLog {
         runtime_key: impl Into<Arc<KeyPair>>,
     ) -> AuditResult<Self> {
         let storage = KvAuditStorage::open_legacy_source_writable(path)?;
-        Ok(Self {
-            storage: Box::new(storage),
-            runtime_key: runtime_key.into(),
-            chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
-            append_coordinator: Arc::new(Mutex::new(())),
-            migration_capacity: None,
-            destination_kv: None,
-        })
+        Ok(Self::from_parts(
+            Box::new(storage),
+            runtime_key.into(),
+            None,
+            None,
+        ))
     }
 
     /// Open an audit log over the kernel-owned system storage projection.
@@ -209,14 +251,12 @@ impl AuditLog {
     ) -> AuditResult<Self> {
         let destination_kv = Arc::clone(&store);
         let storage = KvAuditStorage::from_kv_store(store)?;
-        Ok(Self {
-            storage: Box::new(storage),
-            runtime_key: runtime_key.into(),
-            chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
-            append_coordinator: Arc::new(Mutex::new(())),
+        Ok(Self::from_parts(
+            Box::new(storage),
+            runtime_key.into(),
             migration_capacity,
-            destination_kv: Some(destination_kv),
-        })
+            Some(destination_kv),
+        ))
     }
 
     pub(crate) fn storage(&self) -> &dyn AuditStorage {
@@ -229,15 +269,12 @@ impl AuditLog {
     /// opener remains test-only and is not part of the production API.
     #[must_use]
     pub fn in_memory(runtime_key: impl Into<Arc<KeyPair>>) -> Self {
-        let storage = KvAuditStorage::in_memory();
-        Self {
-            storage: Box::new(storage),
-            runtime_key: runtime_key.into(),
-            chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
-            append_coordinator: Arc::new(Mutex::new(())),
-            migration_capacity: None,
-            destination_kv: None,
-        }
+        Self::from_parts(
+            Box::new(KvAuditStorage::in_memory()),
+            runtime_key.into(),
+            None,
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -254,14 +291,7 @@ impl AuditLog {
         storage: Box<dyn AuditStorage>,
         runtime_key: impl Into<Arc<KeyPair>>,
     ) -> Self {
-        Self {
-            storage,
-            runtime_key: runtime_key.into(),
-            chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
-            append_coordinator: Arc::new(Mutex::new(())),
-            migration_capacity: None,
-            destination_kv: None,
-        }
+        Self::from_parts(storage, runtime_key.into(), None, None)
     }
 
     /// Blind-move a legacy `SurrealKV` audit directory into native [`AuditLog`].
@@ -359,8 +389,15 @@ impl AuditLog {
         authorization: AuthorizationProof,
         outcome: AuditOutcome,
     ) -> AuditResult<AuditEntryId> {
-        self.append_inner(session_id, None, action, authorization, outcome)
-            .await
+        self.append_inner(EntryRequest {
+            session_id,
+            principal: None,
+            actor: None,
+            action,
+            authorization,
+            outcome,
+        })
+        .await
     }
 
     /// Append a new audit entry tagged with the acting principal.
@@ -380,8 +417,44 @@ impl AuditLog {
         authorization: AuthorizationProof,
         outcome: AuditOutcome,
     ) -> AuditResult<AuditEntryId> {
-        self.append_inner(session_id, Some(principal), action, authorization, outcome)
-            .await
+        self.append_inner(EntryRequest {
+            session_id,
+            principal: Some(principal),
+            actor: None,
+            action,
+            authorization,
+            outcome,
+        })
+        .await
+    }
+
+    /// Append a new audit entry recording the capsule that performed it.
+    ///
+    /// Format v2 signs the actor (capsule id and module hash); format v1 has
+    /// no actor field and records the entry without it. `principal` is `None`
+    /// for the system chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entry cannot be stored or the chain head cannot be updated.
+    pub async fn append_with_actor(
+        &self,
+        session_id: SessionId,
+        principal: Option<astrid_core::PrincipalId>,
+        actor: crate::entry_v2::AuditActor,
+        action: AuditAction,
+        authorization: AuthorizationProof,
+        outcome: AuditOutcome,
+    ) -> AuditResult<AuditEntryId> {
+        self.append_inner(EntryRequest {
+            session_id,
+            principal,
+            actor: Some(actor),
+            action,
+            authorization,
+            outcome,
+        })
+        .await
     }
 
     /// Append a bounded group of principal-stamped entries in queue order.
@@ -509,10 +582,6 @@ impl AuditLog {
         prune::prune_chain(self, session_id, principal, policy).await
     }
 
-    pub(crate) fn sign_archive_receipt(&self, bytes: &[u8]) -> astrid_crypto::Signature {
-        self.runtime_key.sign(bytes)
-    }
-
     /// Shared implementation for `append` and `append_with_principal`.
     ///
     /// # Locking contract
@@ -532,17 +601,10 @@ impl AuditLog {
     /// Signing happens inside the per-chain lock. That serialization is
     /// intentional: a hash chain is inherently ordered. Independent chains use
     /// independent locks and may persist concurrently.
-    async fn append_inner(
-        &self,
-        session_id: SessionId,
-        principal: Option<astrid_core::PrincipalId>,
-        action: AuditAction,
-        authorization: AuthorizationProof,
-        outcome: AuditOutcome,
-    ) -> AuditResult<AuditEntryId> {
+    async fn append_inner(&self, request: EntryRequest) -> AuditResult<AuditEntryId> {
         let chain_key = ChainKey {
-            session_id: session_id.clone(),
-            principal: principal.clone(),
+            session_id: request.session_id.clone(),
+            principal: request.principal.clone(),
         };
 
         // Hold the lock across read-prev-hash -> create+sign -> store ->
@@ -572,34 +634,15 @@ impl AuditLog {
                     "audit head CAS exhausted after {MAX_HEAD_CAS_ATTEMPTS} attempts"
                 )));
             }
-            let (expected_head, previous_hash) =
+            let (expected_head, previous_hash, previous_v2) =
                 self.previous_hash_locked(&chain_key, head.as_ref()).await?;
 
-            // Create and sign the entry. session_id is moved into create,
-            // chain_key retains the clone for the cache update below.
-            let entry = if let Some(p) = principal.clone() {
-                AuditEntry::create_with_principal(
-                    session_id.clone(),
-                    p,
-                    action.clone(),
-                    authorization.clone(),
-                    outcome.clone(),
-                    previous_hash,
-                    &self.runtime_key,
-                )
-            } else {
-                AuditEntry::create(
-                    session_id.clone(),
-                    action.clone(),
-                    authorization.clone(),
-                    outcome.clone(),
-                    previous_hash,
-                    &self.runtime_key,
-                )
-            };
-
+            // Create and sign the entry in the log's current format.
+            let entry = self
+                .sign_entry(request.clone(), previous_hash, previous_v2)
+                .await?;
             let entry_id = entry.id.clone();
-            let entry_hash = entry.content_hash();
+            let head_state = HeadState::of(&entry);
 
             debug!(
                 entry_id = %entry_id,
@@ -638,10 +681,7 @@ impl AuditLog {
                 Err(error) => return Err(error),
             };
             if append_results.first().copied().unwrap_or(false) {
-                *head = Some(HeadState {
-                    id: entry_id.clone(),
-                    hash: entry_hash,
-                });
+                *head = Some(head_state);
                 return Ok(entry_id);
             }
             // Another durable writer advanced this chain between the cache miss
@@ -659,10 +699,10 @@ impl AuditLog {
         &self,
         chain_key: &ChainKey,
         head: Option<&HeadState>,
-    ) -> AuditResult<(Option<AuditEntryId>, ContentHash)> {
+    ) -> AuditResult<ResolvedHead> {
         // Check the in-memory head cache first.
         if let Some(state) = head {
-            return Ok((Some(state.id.clone()), state.hash));
+            return Ok((Some(state.id.clone()), state.hash, state.v2));
         }
 
         // Fall back to storage (first append after a restart / cache miss).
@@ -672,11 +712,11 @@ impl AuditLog {
             .await?
             && let Some(entry) = self.storage.get(&head_id).await?
         {
-            return Ok((Some(head_id), entry.content_hash()));
+            return Ok((Some(head_id), entry.content_hash(), V2Position::of(&entry)));
         }
 
         // Genesis - no previous entry for this chain.
-        Ok((None, ContentHash::zero()))
+        Ok((None, ContentHash::zero(), None))
     }
 
     /// Get an entry by ID.
@@ -731,88 +771,8 @@ impl AuditLog {
         session_id: &SessionId,
         principal: Option<&astrid_core::PrincipalId>,
     ) -> AuditResult<ChainVerificationResult> {
-        let entries = self.get_principal_entries(session_id, principal).await?;
-
-        if entries.is_empty() {
-            return Ok(ChainVerificationResult {
-                valid: true,
-                entries_verified: 0,
-                issues: Vec::new(),
-            });
-        }
-
-        let mut issues = Vec::new();
-        let mut entries_verified: usize = 0;
-
-        // Storage order is the durable append order. Wall-clock timestamps are
-        // signed evidence, not an ordering primitive: clocks can move backward.
-        let sorted = entries;
-
-        if !self
-            .verify_archive_anchor(
-                &sorted[0].session_id,
-                sorted[0].principal.as_ref(),
-                &sorted[0].previous_hash,
-            )
-            .await?
-        {
-            issues.push(ChainIssue::InvalidGenesis {
-                entry_id: sorted[0].id.clone(),
-            });
-        }
-
-        for entry in &sorted {
-            if let Err(e) = entry.verify_signature() {
-                error!(entry_id = %entry.id, error = %e, "Invalid signature");
-                issues.push(ChainIssue::InvalidSignature {
-                    entry_id: entry.id.clone(),
-                });
-            }
-            entries_verified = entries_verified.saturating_add(1);
-        }
-
-        for i in 1..sorted.len() {
-            #[expect(clippy::arithmetic_side_effects)]
-            let prev = &sorted[i - 1];
-            let curr = &sorted[i];
-            if !curr.follows(prev) {
-                warn!(current = %curr.id, previous = %prev.id, "Chain link broken");
-                issues.push(ChainIssue::BrokenLink {
-                    entry_id: curr.id.clone(),
-                    expected_previous: prev.content_hash(),
-                    actual_previous: curr.previous_hash,
-                });
-            }
-        }
-
-        Ok(ChainVerificationResult {
-            valid: issues.is_empty(),
-            entries_verified,
-            issues,
-        })
-    }
-
-    async fn verify_archive_anchor(
-        &self,
-        session_id: &SessionId,
-        principal: Option<&astrid_core::PrincipalId>,
-        previous_hash: &ContentHash,
-    ) -> AuditResult<bool> {
-        if previous_hash.is_zero() {
-            return Ok(true);
-        }
-        let Some(raw) = self.storage.prune_receipt(session_id, principal).await? else {
-            return Ok(false);
-        };
-        let receipt: AuditPruneReceipt = serde_json::from_slice(&raw)
-            .map_err(|error| AuditError::SerializationError(error.to_string()))?;
-        let expected_principal = principal.map(ToString::to_string);
-        if receipt.session != session_id.to_string()
-            || receipt.principal.as_deref() != expected_principal.as_deref()
-        {
-            return Ok(false);
-        }
-        prune::verify_anchor(&receipt, previous_hash)
+        self.verify_principal_chain_impl(session_id, principal)
+            .await
     }
 
     /// Get entries for a specific principal within a session.
@@ -921,3 +881,6 @@ mod prune_tests;
 #[cfg(test)]
 #[path = "log_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "log/v2_tests.rs"]
+mod v2_tests;
