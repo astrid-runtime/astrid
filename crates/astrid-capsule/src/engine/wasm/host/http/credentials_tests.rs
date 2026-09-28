@@ -85,6 +85,39 @@ fn blank_secret_omits_the_header() {
 }
 
 #[test]
+fn a_blank_secret_does_not_hide_a_later_placeholder() {
+    for (value, error) in [
+        (
+            "{{secret:api_key}} {{secret:other}}",
+            InjectError::Undeclared("other".to_owned()),
+        ),
+        (
+            "{{secret:api_key}} {{secret:bad name}}",
+            InjectError::Malformed,
+        ),
+        ("{{secret:api_key}} {{secret:org", InjectError::Malformed),
+    ] {
+        assert_eq!(
+            substitute_headers(
+                &template(&[("Authorization", value)]),
+                resolver(&[("api_key", ""), ("org", "org-42")])
+            )
+            .err(),
+            Some(error),
+            "{value}"
+        );
+    }
+    // A header omitted for a blank secret names none of its secrets.
+    let injected = substitute_headers(
+        &template(&[("X-Pair", "{{secret:org}}:{{secret:api_key}}")]),
+        resolver(&[("api_key", " "), ("org", "org-42")]),
+    )
+    .expect("injects");
+    assert!(injected.headers.get("x-pair").is_none());
+    assert!(injected.names.is_empty());
+}
+
+#[test]
 fn malformed_undeclared_and_unsendable_values_are_refused() {
     for value in [
         "Bearer {{secret:api_key",

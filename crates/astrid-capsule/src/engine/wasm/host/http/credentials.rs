@@ -120,13 +120,16 @@ pub(super) fn substitute_headers(
 }
 
 /// Replace every placeholder in one header value. `None` when a named secret
-/// is unset or blank.
+/// is unset or blank. Every placeholder is parsed and resolved first, so a
+/// blank secret never hides a malformed or undeclared one after it.
 fn substitute(
     value: &[u8],
     resolve: &mut impl FnMut(&str) -> Result<Zeroizing<String>, InjectError>,
     names: &mut Vec<String>,
 ) -> Result<Option<Zeroizing<Vec<u8>>>, InjectError> {
     let mut out = Zeroizing::new(Vec::with_capacity(value.len()));
+    let mut used: Vec<&str> = Vec::new();
+    let mut blank = false;
     let mut rest = value;
     while let Some(start) = find(rest, OPEN) {
         out.extend_from_slice(&rest[..start]);
@@ -142,14 +145,20 @@ fn substitute(
         }
         let secret = resolve(name)?;
         let secret = secret.trim();
-        if secret.is_empty() {
-            return Ok(None);
-        }
-        if !names.iter().any(|known| known == name) {
-            names.push(name.to_owned());
+        blank |= secret.is_empty();
+        if !used.contains(&name) {
+            used.push(name);
         }
         out.extend_from_slice(secret.as_bytes());
         rest = &after_open[end.saturating_add(CLOSE.len())..];
+    }
+    if blank {
+        return Ok(None);
+    }
+    for name in used {
+        if !names.iter().any(|known| known == name) {
+            names.push(name.to_owned());
+        }
     }
     out.extend_from_slice(rest);
     Ok(Some(out))
