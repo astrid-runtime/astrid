@@ -38,6 +38,9 @@ mod prune;
 pub use prune::{AuditPruneReceipt, AuditRetentionPolicy};
 #[path = "log/append_batch.rs"]
 mod append_batch;
+#[path = "log/heads_export.rs"]
+mod heads_export;
+pub use heads_export::{AuditChainHead, AuditChainPruneState};
 #[path = "log/import_legacy.rs"]
 mod import_legacy;
 #[path = "migration.rs"]

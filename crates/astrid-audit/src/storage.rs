@@ -15,6 +15,7 @@ pub(crate) mod blind_move;
 mod census;
 mod frozen;
 mod global;
+mod heads_page;
 mod helpers;
 mod key_types;
 mod metadata;

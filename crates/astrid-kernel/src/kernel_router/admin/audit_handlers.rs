@@ -1,16 +1,311 @@
-//! Operator-only audit accounting, retention, and ingestion-health handlers.
+//! Operator-only audit accounting, retention, ingestion-health and anchoring
+//! handlers.
 //!
-//! These handlers never open a native audit directory and never expose entry
-//! payloads. They operate on the kernel's system-owned [`AuditLog`] handle and
-//! return bounded metadata or a signed archive-receipt summary.
+//! These handlers never open a native audit directory. They operate on the
+//! kernel's system-owned [`AuditLog`] handle and return bounded metadata, a
+//! signed archive-receipt summary, a runtime-key-signed chain-head snapshot,
+//! or one bounded page of a chain's raw signed entries for external anchoring.
 
 use std::sync::Arc;
 
-use astrid_audit::{AuditAction, AuditLog, AuditOutcome, AuditRetentionPolicy, AuthorizationProof};
-use astrid_core::SessionId;
-use astrid_core::kernel_api::{AdminResponseBody, AuditHealth, AuditPruneResult, AuditStats};
+use astrid_audit::{
+    AuditAction, AuditChainHead, AuditEntry, AuditLog, AuditOutcome, AuditRetentionPolicy,
+    AuthorizationProof,
+};
+use astrid_core::kernel_api::{
+    AUDIT_OMITTED_TOTAL_UNKNOWN, AdminRequestKind, AdminResponseBody, AuditExportEntry,
+    AuditExportPage, AuditExportRequest, AuditHeadsChain, AuditHeadsPrune, AuditHeadsSnapshot,
+    AuditHealth, AuditPruneResult, AuditStats,
+};
+use astrid_core::{PrincipalId, SessionId, Timestamp};
+use astrid_crypto::ContentHash;
 
 use crate::Kernel;
+
+/// Default entries per `audit.export` page.
+const EXPORT_DEFAULT_LIMIT: u32 = 500;
+/// Hard cap on entries per `audit.export` page.
+const EXPORT_MAX_LIMIT: u32 = 1_000;
+/// Budget in bytes for the serialized entries of one export page. Admin
+/// responses cross the event bus and the native uplink, whose per-client
+/// egress queue holds four times this budget, so a page ends early when its
+/// entries are large.
+const EXPORT_PAGE_BYTES: usize = 1024 * 1024;
+/// Entries read per storage page while skipping to a `from` index.
+const EXPORT_SKIP_PAGE: usize = 256;
+/// Largest unpaged heads snapshot (roughly 600 bytes of JSON per chain).
+const HEADS_MAX_CHAINS: usize = 4_096;
+
+/// Whether an authorized admin request skips the generic success audit row.
+///
+/// The anchoring service polls `audit.heads` and `audit.export` every few
+/// seconds. A success row per poll would grow the log being anchored by tens
+/// of thousands of entries a day. Denied requests are still recorded before
+/// dispatch, and an authorized request whose handler fails (an unknown
+/// chain, a rejected cursor, a storage error) is recorded after it.
+pub(super) fn omit_success_admin_audit(request: &AdminRequestKind) -> bool {
+    matches!(
+        request,
+        AdminRequestKind::AuditHeads | AdminRequestKind::AuditExport(_)
+    )
+}
+
+/// Return a runtime-key-signed snapshot of every audit chain head.
+///
+/// The runtime Ed25519 key signs the raw bytes of
+/// [`AuditHeadsSnapshot::signed_bytes_v1`] directly, with no pre-hash.
+pub(super) async fn heads(kernel: &Arc<Kernel>) -> AdminResponseBody {
+    let records = match kernel.audit_log.heads_snapshot().await {
+        Ok(records) => records,
+        Err(error) => {
+            return AdminResponseBody::Error(format!("audit heads unavailable: {error}"));
+        },
+    };
+    if records.len() > HEADS_MAX_CHAINS {
+        return AdminResponseBody::Error(format!(
+            "audit heads: {} chains exceed the unpaged snapshot limit of {HEADS_MAX_CHAINS}",
+            records.len()
+        ));
+    }
+    let mut chains: Vec<AuditHeadsChain> = records.iter().map(heads_chain).collect();
+    chains.sort_by(|left, right| chain_order(left).cmp(&chain_order(right)));
+    let snapshot_time_ns = Timestamp::now()
+        .0
+        .timestamp_nanos_opt()
+        .and_then(|nanos| u64::try_from(nanos).ok())
+        .unwrap_or(0);
+    let mut snapshot = AuditHeadsSnapshot {
+        signed_bytes_hex: String::new(),
+        signature_hex: String::new(),
+        runtime_public_key_hex: kernel.runtime_key.export_public_key().to_hex(),
+        snapshot_time_ns,
+        chains,
+    };
+    let signed_bytes = match snapshot.signed_bytes_v1() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return AdminResponseBody::Error(format!("audit heads encoding failed: {error}"));
+        },
+    };
+    snapshot.signature_hex = kernel.runtime_key.sign(&signed_bytes).to_hex();
+    snapshot.signed_bytes_hex = hex::encode(&signed_bytes);
+    AdminResponseBody::AuditHeads(Box::new(snapshot))
+}
+
+fn chain_order(chain: &AuditHeadsChain) -> (&str, Option<&str>) {
+    (
+        chain.session.as_str(),
+        chain.principal.as_ref().map(PrincipalId::as_str),
+    )
+}
+
+fn heads_chain(record: &AuditChainHead) -> AuditHeadsChain {
+    AuditHeadsChain {
+        session: record.session_id.0.to_string(),
+        principal: record.principal.clone(),
+        count: record.count,
+        omitted_total: record.omitted_total.unwrap_or(AUDIT_OMITTED_TOTAL_UNKNOWN),
+        head_hash_hex: record.head_hash.to_hex(),
+        head_id: record.head.as_ref().map(|id| id.0.to_string()),
+        last_timestamp: record.last_timestamp.map(rfc3339),
+        prune: record.prune.as_ref().map(|state| AuditHeadsPrune {
+            generation: state.receipt.generation,
+            omitted_count: state.receipt.omitted_count,
+            omitted_terminal_hash_hex: state.receipt.omitted_terminal_hash.clone(),
+            receipt_hash_hex: state.receipt_hash.to_hex(),
+        }),
+    }
+}
+
+fn rfc3339(timestamp: Timestamp) -> String {
+    timestamp
+        .0
+        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+}
+
+/// Return one bounded page of a chain's raw signed entries in chain order.
+pub(super) async fn export(kernel: &Arc<Kernel>, request: AuditExportRequest) -> AdminResponseBody {
+    match export_page(kernel.audit_log.as_ref(), request).await {
+        Ok(page) => AdminResponseBody::AuditExport(Box::new(page)),
+        Err(error) => AdminResponseBody::Error(format!("audit export failed: {error}")),
+    }
+}
+
+async fn export_page(
+    log: &AuditLog,
+    request: AuditExportRequest,
+) -> Result<AuditExportPage, String> {
+    let AuditExportRequest {
+        session,
+        principal,
+        from,
+        cursor,
+        limit,
+    } = request;
+    let principal = principal.as_ref();
+    let limit = usize::try_from(
+        limit
+            .unwrap_or(EXPORT_DEFAULT_LIMIT)
+            .clamp(1, EXPORT_MAX_LIMIT),
+    )
+    .map_err(|error| error.to_string())?;
+    let chain = log
+        .chain_stats(&session, principal)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "audit chain not found".to_owned())?;
+    let (from, mut after) = match cursor {
+        Some(cursor) => {
+            let (index, key) = resume_export_cursor(log, &session, principal, &cursor).await?;
+            if index > chain.count {
+                return Err(
+                    "audit export cursor is past the retained chain; restart from an index"
+                        .to_owned(),
+                );
+            }
+            (index, Some(key))
+        },
+        None => skip_to_index(log, &session, principal, from).await?,
+    };
+    let read = log
+        .chain_entries_page(
+            &session,
+            principal,
+            after.as_deref(),
+            limit.saturating_add(1),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut complete = read.len() <= limit;
+    let mut entries = Vec::new();
+    let mut page_bytes = 0_usize;
+    for (key, entry) in read.into_iter().take(limit) {
+        let index = from.saturating_add(u64::try_from(entries.len()).unwrap_or(u64::MAX));
+        let exported = export_entry(index, &entry)?;
+        let size = serde_json::to_vec(&exported)
+            .map_err(|error| error.to_string())?
+            .len();
+        if !entries.is_empty() && page_bytes.saturating_add(size) > EXPORT_PAGE_BYTES {
+            complete = false;
+            break;
+        }
+        page_bytes = page_bytes.saturating_add(size);
+        after = Some(key);
+        entries.push(exported);
+    }
+    let next_index = from.saturating_add(u64::try_from(entries.len()).unwrap_or(u64::MAX));
+    let prune = log
+        .prune_state(&session, principal)
+        .await
+        .map_err(|error| error.to_string())?;
+    let (prune_receipt, prune_receipt_hash_hex, prune_receipt_signing_data_hex) = match prune {
+        Some(state) => (
+            Some(serde_json::from_slice(&state.stored_bytes).map_err(|error| error.to_string())?),
+            Some(state.receipt_hash.to_hex()),
+            Some(hex::encode(
+                state
+                    .receipt
+                    .signing_data()
+                    .map_err(|error| error.to_string())?,
+            )),
+        ),
+        None => (None, None, None),
+    };
+    Ok(AuditExportPage {
+        session: session.0.to_string(),
+        principal: principal.cloned(),
+        from,
+        entries,
+        next_index,
+        next_cursor: after.map(|key| format!("{next_index}:{key}")),
+        complete,
+        chain_count: chain.count,
+        chain_head_hash_hex: chain.head_hash.to_hex(),
+        prune_receipt,
+        prune_receipt_hash_hex,
+        prune_receipt_signing_data_hex,
+    })
+}
+
+/// Split an export cursor `"<next index>:<storage cursor>"` and check that
+/// the entry it resumes after still belongs to the requested chain.
+///
+/// The storage cursor is a session-index key `"<session>:<sequence>:<entry
+/// id>"` shared by every chain of the session, so a cursor taken from another
+/// principal's export would silently skip entries of this chain. The index
+/// is carried by the caller and is not authenticated; entry hashes and links
+/// are what a verifier relies on.
+async fn resume_export_cursor(
+    log: &AuditLog,
+    session: &SessionId,
+    principal: Option<&PrincipalId>,
+    cursor: &str,
+) -> Result<(u64, String), String> {
+    let malformed = || "malformed audit export cursor".to_owned();
+    let (index, key) = cursor.split_once(':').ok_or_else(malformed)?;
+    let index = index.parse::<u64>().map_err(|_| malformed())?;
+    let entry_id = key
+        .strip_prefix(&format!("{}:", session.0))
+        .and_then(|rest| rest.rsplit_once(':'))
+        .and_then(|(_, id)| uuid::Uuid::parse_str(id).ok())
+        .map(astrid_audit::AuditEntryId)
+        .ok_or_else(|| "audit export cursor does not belong to this session".to_owned())?;
+    let entry = log
+        .get(&entry_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "audit export cursor entry was pruned; restart from an index".to_owned())?;
+    if &entry.session_id != session || entry.principal.as_ref() != principal {
+        return Err("audit export cursor belongs to another chain".to_owned());
+    }
+    Ok((index, key.to_owned()))
+}
+
+/// Walk the chain to retained index `from` and return the reached index with
+/// the storage cursor of the entry before it. A chain shorter than `from`
+/// stops at its end.
+async fn skip_to_index(
+    log: &AuditLog,
+    session: &SessionId,
+    principal: Option<&PrincipalId>,
+    from: u64,
+) -> Result<(u64, Option<String>), String> {
+    let mut reached = 0_u64;
+    let mut after: Option<String> = None;
+    while reached < from {
+        let want = usize::try_from(from.saturating_sub(reached))
+            .unwrap_or(usize::MAX)
+            .min(EXPORT_SKIP_PAGE);
+        let page = log
+            .chain_entries_page(session, principal, after.as_deref(), want)
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some((last, _)) = page.last() else {
+            break;
+        };
+        after = Some(last.clone());
+        reached = reached.saturating_add(u64::try_from(page.len()).unwrap_or(u64::MAX));
+        if page.len() < want {
+            break;
+        }
+    }
+    Ok((reached, after))
+}
+
+fn export_entry(index: u64, entry: &AuditEntry) -> Result<AuditExportEntry, String> {
+    let signing_data = entry.signing_data();
+    Ok(AuditExportEntry {
+        index,
+        id: entry.id.0.to_string(),
+        timestamp: rfc3339(entry.timestamp),
+        previous_hash_hex: entry.previous_hash.to_hex(),
+        content_hash_hex: ContentHash::hash(&signing_data).to_hex(),
+        signature_hex: entry.signature.to_hex(),
+        public_key_hex: entry.runtime_key.to_hex(),
+        signing_data_hex: hex::encode(&signing_data),
+        entry: serde_json::to_value(entry).map_err(|error| error.to_string())?,
+    })
+}
 
 /// Return O(1) system-wide audit accounting and retention state.
 pub(super) async fn stats(kernel: &Arc<Kernel>) -> AdminResponseBody {

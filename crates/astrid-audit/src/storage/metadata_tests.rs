@@ -32,6 +32,7 @@ fn count_prune_accumulates_each_generation_once() {
         (metadata.omitted_total, metadata.omitted_generation),
         (Some(12), Some(2))
     );
+    assert_eq!(metadata.resolved_omitted_total(None, true), Some(12));
 }
 
 #[test]
@@ -54,6 +55,7 @@ fn count_prune_derives_the_base_of_uncounted_metadata_from_the_receipt() {
     third.count_prune(receipt(3, 1), Some(receipt(2, 2)));
     assert_eq!(third.omitted_total, Some(OMITTED_TOTAL_UNKNOWN));
     assert_eq!(third.omitted_generation, Some(3));
+    assert_eq!(third.resolved_omitted_total(None, false), None);
 
     // Generation 1 finalized again after an older binary had already
     // installed its receipt: generation 0's count is gone.
@@ -71,6 +73,31 @@ fn count_prune_marks_a_skipped_generation_unknown() {
     let mut uncounted_first = counted(0, None);
     uncounted_first.count_prune(receipt(1, 1), Some(receipt(0, 3)));
     assert_eq!(uncounted_first.omitted_total, Some(OMITTED_TOTAL_UNKNOWN));
+}
+
+#[test]
+fn resolved_omitted_total_derives_uncounted_metadata_from_the_latest_receipt() {
+    let uncounted = ChainMetadata::default();
+    assert_eq!(uncounted.resolved_omitted_total(None, false), Some(0));
+    assert_eq!(
+        uncounted.resolved_omitted_total(Some(receipt(0, 4)), false),
+        Some(4)
+    );
+    assert_eq!(
+        uncounted.resolved_omitted_total(Some(receipt(1, 4)), false),
+        None
+    );
+    // An interrupted finalization may have lowered `count` uncounted.
+    assert_eq!(uncounted.resolved_omitted_total(None, true), None);
+    assert_eq!(
+        uncounted.resolved_omitted_total(Some(receipt(0, 4)), true),
+        None
+    );
+    // A counted total is authoritative.
+    assert_eq!(
+        counted(9, Some(1)).resolved_omitted_total(Some(receipt(1, 2)), true),
+        Some(9)
+    );
 }
 
 #[test]

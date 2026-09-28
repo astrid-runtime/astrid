@@ -102,6 +102,35 @@ impl ChainMetadata {
         self.omitted_total = Some(before.saturating_add(pruned.omitted_count));
         self.omitted_generation = Some(pruned.generation);
     }
+
+    /// Entries removed from the front of the chain by pruning, or `None`
+    /// when that total cannot be known.
+    ///
+    /// `latest` is the chain's installed prune receipt. `prune_finishing` is
+    /// whether a prune plan has finished deleting but is still pending, in
+    /// which case an interrupted finalization may already have lowered
+    /// `count` without recording the total. Both matter only while
+    /// `omitted_total` is `None`.
+    pub(crate) fn resolved_omitted_total(
+        &self,
+        latest: Option<PruneGeneration>,
+        prune_finishing: bool,
+    ) -> Option<u64> {
+        let total = match (self.omitted_total, latest) {
+            (Some(total), _) => total,
+            (None, _) if prune_finishing => OMITTED_TOTAL_UNKNOWN,
+            (None, None) => 0,
+            (
+                None,
+                Some(PruneGeneration {
+                    generation: 0,
+                    omitted_count,
+                }),
+            ) => omitted_count,
+            (None, Some(_)) => OMITTED_TOTAL_UNKNOWN,
+        };
+        (total != OMITTED_TOTAL_UNKNOWN).then_some(total)
+    }
 }
 
 /// Entries omitted before prune `generation` of a chain that has not counted

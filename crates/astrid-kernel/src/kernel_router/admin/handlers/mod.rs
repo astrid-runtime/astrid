@@ -176,7 +176,9 @@ async fn dispatch_inner(
         | AdminRequestKind::StorageMountRevoke { .. }
         | AdminRequestKind::AuditStats
         | AdminRequestKind::AuditPrune { .. }
-        | AdminRequestKind::AuditHealth) => {
+        | AdminRequestKind::AuditHealth
+        | AdminRequestKind::AuditHeads
+        | AdminRequestKind::AuditExport(_)) => {
             dispatch_services(kernel, caller, authorization, device_key_id, req).await
         },
     }
@@ -339,6 +341,10 @@ async fn dispatch_services(
             retain_bytes,
         } => super::audit_handlers::prune(kernel, retain_entries, retain_bytes).await,
         AdminRequestKind::AuditHealth => super::audit_handlers::health(kernel),
+        AdminRequestKind::AuditHeads => super::audit_handlers::heads(kernel).await,
+        AdminRequestKind::AuditExport(request) => {
+            super::audit_handlers::export(kernel, request).await
+        },
         _ => AdminResponseBody::Error("not a service request".to_owned()),
     }
 }

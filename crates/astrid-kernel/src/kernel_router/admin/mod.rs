@@ -14,7 +14,9 @@
 //! # Audit trail
 //!
 //! Every admin topic — allow or deny — appends an
-//! [`AuditAction::AdminRequest`] entry. `method` is the wire name
+//! [`AuditAction::AdminRequest`] entry, except a successful `audit.heads`
+//! or `audit.export` read, which would grow the log being anchored with
+//! every poll. `method` is the wire name
 //! (`"admin.agent.create"`, etc.); `target_principal` is `Some` for
 //! variants that operate on another principal and `None` otherwise.
 //! `params` captures the full request payload (capabilities granted,
@@ -41,6 +43,7 @@ mod pair_device_tests;
 #[cfg(test)]
 mod principal_ownership;
 mod quota;
+mod request_authorization;
 #[cfg(test)]
 mod state_tests;
 #[cfg(test)]
@@ -53,6 +56,8 @@ mod state_tests_agent_delete;
 mod state_tests_agent_derive;
 #[cfg(test)]
 mod state_tests_agent_modify;
+#[cfg(test)]
+mod state_tests_audit;
 #[cfg(test)]
 mod state_tests_caps;
 #[cfg(test)]
@@ -83,6 +88,9 @@ use super::caller::{CallerResolutionError, MANAGEMENT_CALLER_REQUIRED};
 use super::{
     AdminAuditEntry, AuthorityScope, authorize_request, publish_response, record_admin_audit,
     resolve_caller, resolve_device_key_id,
+};
+use request_authorization::{
+    AdminAuthorizationContext, authorize_admin_request, record_admin_request_failure,
 };
 
 /// Admin IPC input topic prefix.
@@ -327,6 +335,8 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         | AdminRequestKind::AuditStats
         | AdminRequestKind::AuditPrune { .. }
         | AdminRequestKind::AuditHealth
+        | AdminRequestKind::AuditHeads
+        | AdminRequestKind::AuditExport(_)
         | AdminRequestKind::StorageMountIssue {
             view: astrid_core::storage_provider::StorageProviderViewV1::Admin,
             ..
@@ -463,6 +473,8 @@ pub fn required_capability_for_admin_request(
         (AdminRequestKind::AuditStats, _) => "audit:stats",
         (AdminRequestKind::AuditPrune { .. }, _) => "audit:prune",
         (AdminRequestKind::AuditHealth, _) => "audit:health",
+        (AdminRequestKind::AuditHeads, _) => "audit:heads",
+        (AdminRequestKind::AuditExport(_), _) => "audit:export",
         (
             request @ (AdminRequestKind::StorageMountIssue { .. }
             | AdminRequestKind::StorageMountStatus { .. }
@@ -567,6 +579,8 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::AuditStats => "admin.audit.stats",
         AdminRequestKind::AuditPrune { .. } => "admin.audit.prune",
         AdminRequestKind::AuditHealth => "admin.audit.health",
+        AdminRequestKind::AuditHeads => "admin.audit.heads",
+        AdminRequestKind::AuditExport(_) => "admin.audit.export",
         AdminRequestKind::StorageMountIssue { .. } => "admin.storage.mount.issue",
         AdminRequestKind::StorageMountStatus { .. } => "admin.storage.mount.status",
         AdminRequestKind::StorageMountSync { .. } => "admin.storage.mount.sync",
@@ -711,6 +725,8 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         | AdminRequestKind::AuditStats
         | AdminRequestKind::AuditPrune { .. }
         | AdminRequestKind::AuditHealth
+        | AdminRequestKind::AuditHeads
+        | AdminRequestKind::AuditExport(_)
         | AdminRequestKind::StorageMountIssue { .. }
         | AdminRequestKind::StorageMountStatus { .. }
         | AdminRequestKind::StorageMountSync { .. }
@@ -780,134 +796,6 @@ async fn handle_redeem_admin_request(
     );
 }
 
-struct AdminAuthorizationContext<'a> {
-    caller: &'a PrincipalId,
-    device_key_id: Option<&'a str>,
-    kind: &'a AdminRequestKind,
-    method: &'static str,
-    required_cap: &'static str,
-    target_principal: Option<&'a PrincipalId>,
-    audit_params: Option<&'a serde_json::Value>,
-}
-
-fn allowed_admin_authorization(context: &AdminAuthorizationContext<'_>) -> AuthorizationProof {
-    AuthorizationProof::System {
-        reason: format!(
-            "policy allow: {} holds {}",
-            context.caller, context.required_cap
-        ),
-    }
-}
-
-async fn record_admin_authorization_failure(
-    kernel: &Arc<crate::Kernel>,
-    context: &AdminAuthorizationContext<'_>,
-    error: &str,
-) {
-    warn!(
-        security_event = true,
-        method = context.method,
-        principal = %context.caller,
-        required = context.required_cap,
-        error,
-        "Permission check denied admin request"
-    );
-    record_admin_audit(
-        kernel,
-        AdminAuditEntry {
-            caller: context.caller,
-            method: context.method,
-            required_cap: context.required_cap,
-            device_key_id: context.device_key_id,
-            target_principal: context.target_principal.cloned(),
-            params: context.audit_params.cloned(),
-            authorization: AuthorizationProof::Denied {
-                reason: error.to_string(),
-            },
-            outcome: AuditOutcome::failure(error),
-        },
-    )
-    .await;
-}
-
-async fn record_admin_bad_input_failure(
-    kernel: &Arc<crate::Kernel>,
-    context: &AdminAuthorizationContext<'_>,
-    error: &str,
-) {
-    record_admin_audit(
-        kernel,
-        AdminAuditEntry {
-            caller: context.caller,
-            method: context.method,
-            required_cap: context.required_cap,
-            device_key_id: context.device_key_id,
-            target_principal: context.target_principal.cloned(),
-            params: context.audit_params.cloned(),
-            authorization: allowed_admin_authorization(context),
-            outcome: AuditOutcome::failure(error),
-        },
-    )
-    .await;
-}
-
-async fn authorize_admin_request(
-    kernel: &Arc<crate::Kernel>,
-    context: &AdminAuthorizationContext<'_>,
-) -> Result<super::AuthorizedRequest, String> {
-    let authorization = match authorize_request(
-        kernel,
-        context.caller,
-        context.device_key_id,
-        context.required_cap,
-    ) {
-        Ok(authorization) => authorization,
-        Err(error) => {
-            let error = error.to_string();
-            record_admin_authorization_failure(kernel, context, &error).await;
-            return Err(error);
-        },
-    };
-
-    let preflight = if let AdminRequestKind::PairDeviceIssue {
-        expires_secs,
-        scope,
-        ..
-    } = context.kind
-    {
-        pair_device_handlers::preflight_pair_device_issue(&authorization, *expires_secs, scope)
-    } else {
-        Ok(())
-    };
-    match preflight {
-        Ok(()) => {},
-        Err(pair_device_handlers::PairIssuePreflightError::BadInput(error)) => {
-            record_admin_bad_input_failure(kernel, context, &error).await;
-            return Err(error);
-        },
-        Err(pair_device_handlers::PairIssuePreflightError::Unauthorized(error)) => {
-            record_admin_authorization_failure(kernel, context, &error).await;
-            return Err(error);
-        },
-    }
-
-    record_admin_audit(
-        kernel,
-        AdminAuditEntry {
-            caller: context.caller,
-            method: context.method,
-            required_cap: context.required_cap,
-            device_key_id: context.device_key_id,
-            target_principal: context.target_principal.cloned(),
-            params: context.audit_params.cloned(),
-            authorization: allowed_admin_authorization(context),
-            outcome: AuditOutcome::success(),
-        },
-    )
-    .await;
-    Ok(authorization)
-}
-
 async fn handle_admin_request(
     kernel: &Arc<crate::Kernel>,
     topic: Topic,
@@ -948,13 +836,12 @@ async fn handle_admin_request(
     let context = AdminAuthorizationContext {
         caller: &caller,
         device_key_id: device_key_id.as_deref(),
-        kind: &req.kind,
         method,
         required_cap,
         target_principal: target.as_ref(),
         audit_params: audit_params.as_ref(),
     };
-    let authorization = match authorize_admin_request(kernel, &context).await {
+    let authorization = match authorize_admin_request(kernel, &context, &req.kind).await {
         Ok(authorization) => authorization,
         Err(error) => {
             publish_response(
@@ -968,7 +855,11 @@ async fn handle_admin_request(
         },
     };
 
+    let success_row_skipped = audit_handlers::omit_success_admin_audit(&req.kind);
     let body = handlers::dispatch_authorized(kernel, &authorization, req.kind).await;
+    if success_row_skipped && let AdminResponseBody::Error(error) = &body {
+        record_admin_request_failure(kernel, &context, error).await;
+    }
     publish_response(
         kernel,
         response_topic,

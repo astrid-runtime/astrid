@@ -118,6 +118,16 @@ impl AuditPruneReceipt {
             .map_err(|error| AuditError::SerializationError(error.to_string()))
     }
 
+    /// Exact bytes the receipt signature covers: the `serde_json` encoding of
+    /// every field except `signature`, in declaration order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the receipt cannot be serialized.
+    pub fn signing_data(&self) -> AuditResult<Vec<u8>> {
+        self.signing_bytes()
+    }
+
     pub(crate) fn verify(&self) -> AuditResult<()> {
         if self.schema != 1 {
             return Err(AuditError::StorageError(

@@ -5,10 +5,12 @@
 
 use std::process::ExitCode;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use astrid_core::kernel_api::{
-    AdminRequestKind, AdminResponseBody, AuditHealth, AuditPruneResult, AuditStats,
+    AdminRequestKind, AdminResponseBody, AuditExportPage, AuditExportRequest, AuditHeadsSnapshot,
+    AuditHealth, AuditPruneResult, AuditStats,
 };
+use astrid_core::{PrincipalId, SessionId};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
@@ -24,6 +26,10 @@ pub(crate) enum AuditCommand {
     Prune(AuditPruneArgs),
     /// Show bounded ingestion queue and writer health.
     Health(AuditHealthArgs),
+    /// Print a runtime-key-signed snapshot of every audit chain head.
+    Heads(AuditHeadsArgs),
+    /// Print one page of a chain's raw signed entries, in chain order.
+    Export(AuditExportArgs),
 }
 
 /// Top-level `audit` arguments.
@@ -63,6 +69,37 @@ pub(crate) struct AuditHealthArgs {
     pub format: String,
 }
 
+/// `audit heads` output options.
+#[derive(Args, Debug, Clone)]
+pub(crate) struct AuditHeadsArgs {
+    /// Output format: pretty (default), json, yaml, or toml.
+    #[arg(long, default_value = "pretty")]
+    pub format: String,
+}
+
+/// `audit export` options.
+#[derive(Args, Debug, Clone)]
+pub(crate) struct AuditExportArgs {
+    /// Session UUID of the chain, or `system` for the daemon session.
+    #[arg(long, value_name = "ID")]
+    pub session: String,
+    /// Principal alias whose chain to export. Omit for the system chain.
+    #[arg(long = "agent", value_name = "ALIAS")]
+    pub principal: Option<String>,
+    /// Zero-based retained index to start at. Ignored with `--cursor`.
+    #[arg(long, default_value_t = 0, value_name = "INDEX")]
+    pub from: u64,
+    /// Resume after a page: the `next_cursor` of an earlier export.
+    #[arg(long, value_name = "CURSOR")]
+    pub cursor: Option<String>,
+    /// Maximum entries in the page (kernel default 500, capped at 1000).
+    #[arg(long, value_name = "N")]
+    pub limit: Option<u32>,
+    /// Output format: pretty (default), json, yaml, or toml.
+    #[arg(long, default_value = "pretty")]
+    pub format: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct AuditStatsOutput {
     stats: AuditStats,
@@ -75,6 +112,8 @@ pub(crate) async fn run(args: &AuditArgs) -> Result<ExitCode> {
         AuditCommand::Stats(args) => run_stats(args).await,
         AuditCommand::Prune(args) => run_prune(args).await,
         AuditCommand::Health(args) => run_health(args).await,
+        AuditCommand::Heads(args) => run_heads(args).await,
+        AuditCommand::Export(args) => run_export(args).await,
     }
 }
 
@@ -148,6 +187,107 @@ async fn run_health(args: &AuditHealthArgs) -> Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
+}
+
+async fn run_heads(args: &AuditHeadsArgs) -> Result<ExitCode> {
+    let mut client = connect_as_active_agent().await?;
+    let body = into_result(client.request(AdminRequestKind::AuditHeads).await?)?;
+    let AdminResponseBody::AuditHeads(snapshot) = body else {
+        bail!("unexpected response from kernel: {body:?}");
+    };
+    let format = ValueFormat::parse(&args.format);
+    if format.is_pretty() {
+        print_heads_pretty(&snapshot);
+    } else {
+        emit_structured(&snapshot, format)?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn run_export(args: &AuditExportArgs) -> Result<ExitCode> {
+    let request = AuditExportRequest {
+        session: parse_session(&args.session)?,
+        principal: args
+            .principal
+            .as_deref()
+            .map(PrincipalId::new)
+            .transpose()
+            .context("invalid --agent")?,
+        from: args.from,
+        cursor: args.cursor.clone(),
+        limit: args.limit,
+    };
+    let mut client = connect_as_active_agent().await?;
+    let body = into_result(
+        client
+            .request(AdminRequestKind::AuditExport(request))
+            .await?,
+    )?;
+    let AdminResponseBody::AuditExport(page) = body else {
+        bail!("unexpected response from kernel: {body:?}");
+    };
+    let format = ValueFormat::parse(&args.format);
+    if format.is_pretty() {
+        print_export_pretty(&page);
+    } else {
+        emit_structured(&page, format)?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Accept `system`, a bare UUID, or the `session:<uuid>` display form.
+fn parse_session(raw: &str) -> Result<SessionId> {
+    if raw == "system" {
+        return Ok(SessionId::SYSTEM);
+    }
+    let uuid = raw.strip_prefix("session:").unwrap_or(raw);
+    uuid::Uuid::parse_str(uuid)
+        .map(SessionId::from_uuid)
+        .with_context(|| format!("invalid --session {raw:?}: expected a UUID or `system`"))
+}
+
+fn print_heads_pretty(snapshot: &AuditHeadsSnapshot) {
+    println!("Audit heads ({} chains)", snapshot.chains.len());
+    println!("  snapshot ns:      {}", snapshot.snapshot_time_ns);
+    println!("  runtime key:      {}", snapshot.runtime_public_key_hex);
+    for chain in &snapshot.chains {
+        let principal = chain
+            .principal
+            .as_ref()
+            .map_or("(system)", PrincipalId::as_str);
+        let omitted = chain
+            .known_omitted_total()
+            .map_or_else(|| "unknown".to_owned(), |total| total.to_string());
+        println!(
+            "  {} {principal}: count {} omitted {omitted} head {}",
+            chain.session, chain.count, chain.head_hash_hex
+        );
+    }
+}
+
+fn print_export_pretty(page: &AuditExportPage) {
+    let principal = page
+        .principal
+        .as_ref()
+        .map_or("(system)", PrincipalId::as_str);
+    println!("Audit export {} {principal}", page.session);
+    for entry in &page.entries {
+        let action = entry.entry["action"]["type"].as_str().unwrap_or("?");
+        println!(
+            "  #{} {} {} {action} hash {}",
+            entry.index, entry.id, entry.timestamp, entry.content_hash_hex
+        );
+    }
+    println!(
+        "  entries {}..{} of {} retained{}",
+        page.from,
+        page.next_index,
+        page.chain_count,
+        if page.complete { " (complete)" } else { "" }
+    );
+    if let Some(cursor) = &page.next_cursor {
+        println!("  next cursor:      {cursor}");
+    }
 }
 
 fn print_stats_pretty(stats: &AuditStats, health: &AuditHealth) {
