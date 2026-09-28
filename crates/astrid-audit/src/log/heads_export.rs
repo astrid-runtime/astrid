@@ -152,6 +152,27 @@ impl AuditLog {
             .transpose()
     }
 
+    /// Whether a prune of one chain has started and not yet finished.
+    ///
+    /// A prune deletes entries only while it is in progress and installs a
+    /// new receipt when it finishes. A reader that finds no prune in progress
+    /// and then the same receipt, both before and after a series of reads,
+    /// read no state that a prune changed in between.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the prune state cannot be read.
+    pub async fn prune_in_progress(
+        &self,
+        session_id: &SessionId,
+        principal: Option<&PrincipalId>,
+    ) -> AuditResult<bool> {
+        match self.storage.as_kv_audit_storage() {
+            Some(storage) => storage.prune_plan_pending(session_id, principal).await,
+            None => Ok(false),
+        }
+    }
+
     /// Read up to `limit` retained entries of one chain in chain order.
     ///
     /// Every entry is returned with its durable cursor. Passing the last

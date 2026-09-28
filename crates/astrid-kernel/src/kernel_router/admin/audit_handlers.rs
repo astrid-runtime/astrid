@@ -9,8 +9,8 @@
 use std::sync::Arc;
 
 use astrid_audit::{
-    AuditAction, AuditChainHead, AuditEntry, AuditLog, AuditOutcome, AuditRetentionPolicy,
-    AuthorizationProof,
+    AuditAction, AuditChainHead, AuditChainPruneState, AuditEntry, AuditLog, AuditOutcome,
+    AuditRetentionPolicy, AuthorizationProof,
 };
 use astrid_core::kernel_api::{
     AUDIT_OMITTED_TOTAL_UNKNOWN, AdminRequestKind, AdminResponseBody, AuditExportEntry,
@@ -31,6 +31,12 @@ const EXPORT_MAX_LIMIT: u32 = 1_000;
 /// egress queue holds four times this budget, so a page ends early when its
 /// entries are large.
 const EXPORT_PAGE_BYTES: usize = 1024 * 1024;
+/// Largest serialized entry an export page returns. An entry above the page
+/// budget is returned alone so the chain can be read past it, up to this
+/// ceiling, which leaves room for the page envelope inside one native uplink
+/// frame (twice the page budget). A larger entry fails the page with an
+/// error that names it.
+const EXPORT_ENTRY_MAX_BYTES: usize = EXPORT_PAGE_BYTES * 3 / 2;
 /// Entries read per storage page while skipping to a `from` index.
 const EXPORT_SKIP_PAGE: usize = 256;
 /// Largest unpaged heads snapshot (roughly 600 bytes of JSON per chain).
@@ -149,6 +155,7 @@ async fn export_page(
             .clamp(1, EXPORT_MAX_LIMIT),
     )
     .map_err(|error| error.to_string())?;
+    let prune_before = settled_prune_state(log, &session, principal).await?;
     let chain = log
         .chain_stats(&session, principal)
         .await
@@ -189,28 +196,25 @@ async fn export_page(
             complete = false;
             break;
         }
+        if size > EXPORT_ENTRY_MAX_BYTES {
+            return Err(format!(
+                "audit entry {} at index {index} exports as {size} bytes, above the \
+                 {EXPORT_ENTRY_MAX_BYTES}-byte limit",
+                exported.id
+            ));
+        }
         page_bytes = page_bytes.saturating_add(size);
         after = Some(key);
         entries.push(exported);
     }
     let next_index = from.saturating_add(u64::try_from(entries.len()).unwrap_or(u64::MAX));
-    let prune = log
-        .prune_state(&session, principal)
-        .await
-        .map_err(|error| error.to_string())?;
-    let (prune_receipt, prune_receipt_hash_hex, prune_receipt_signing_data_hex) = match prune {
-        Some(state) => (
-            Some(serde_json::from_slice(&state.stored_bytes).map_err(|error| error.to_string())?),
-            Some(state.receipt_hash.to_hex()),
-            Some(hex::encode(
-                state
-                    .receipt
-                    .signing_data()
-                    .map_err(|error| error.to_string())?,
-            )),
-        ),
-        None => (None, None, None),
-    };
+    let prune = settled_prune_state(log, &session, principal).await?;
+    if prune.as_ref().map(|state| state.receipt_hash)
+        != prune_before.as_ref().map(|state| state.receipt_hash)
+    {
+        return Err("audit chain was pruned during the export; retry".to_owned());
+    }
+    let receipt = ExportedReceipt::new(prune)?;
     Ok(AuditExportPage {
         session: session.0.to_string(),
         principal: principal.cloned(),
@@ -221,10 +225,66 @@ async fn export_page(
         complete,
         chain_count: chain.count,
         chain_head_hash_hex: chain.head_hash.to_hex(),
-        prune_receipt,
-        prune_receipt_hash_hex,
-        prune_receipt_signing_data_hex,
+        prune_receipt: receipt.receipt,
+        prune_receipt_hash_hex: receipt.hash_hex,
+        prune_receipt_signing_data_hex: receipt.signing_data_hex,
     })
+}
+
+/// A chain's latest prune receipt as an export page carries it.
+#[derive(Default)]
+struct ExportedReceipt {
+    /// The receipt as stored.
+    receipt: Option<serde_json::Value>,
+    /// Hex BLAKE3 of the stored receipt bytes.
+    hash_hex: Option<String>,
+    /// Hex of the bytes the receipt signature covers.
+    signing_data_hex: Option<String>,
+}
+
+impl ExportedReceipt {
+    fn new(prune: Option<AuditChainPruneState>) -> Result<Self, String> {
+        let Some(state) = prune else {
+            return Ok(Self::default());
+        };
+        let signing_data = state
+            .receipt
+            .signing_data()
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            receipt: Some(
+                serde_json::from_slice(&state.stored_bytes).map_err(|error| error.to_string())?,
+            ),
+            hash_hex: Some(state.receipt_hash.to_hex()),
+            signing_data_hex: Some(hex::encode(signing_data)),
+        })
+    }
+}
+
+/// Read a chain's latest prune receipt, failing while a prune is in progress.
+///
+/// A prune deletes entries only while it is in progress and installs a new
+/// receipt when it finishes. The export reads this before and after its
+/// metadata, cursor and entry reads and requires the same receipt, so a page
+/// never mixes states from before and after a prune. The in-progress check
+/// precedes the receipt read, so a prune that starts between the two cannot
+/// have deleted an entry the page already read. An interrupted prune stays
+/// in progress until the next prune of the chain resumes and finishes it.
+async fn settled_prune_state(
+    log: &AuditLog,
+    session: &SessionId,
+    principal: Option<&PrincipalId>,
+) -> Result<Option<AuditChainPruneState>, String> {
+    if log
+        .prune_in_progress(session, principal)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Err("audit chain has a prune in progress; retry once it finishes".to_owned());
+    }
+    log.prune_state(session, principal)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Split an export cursor `"<next index>:<storage cursor>"` and check that

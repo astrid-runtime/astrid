@@ -221,6 +221,28 @@ async fn uncounted_total_is_unknown_while_a_finished_prune_is_pending() {
 }
 
 #[tokio::test]
+async fn prune_in_progress_tracks_a_pending_prune_plan() {
+    let log = AuditLog::in_memory(Arc::new(KeyPair::generate()));
+    let session = SessionId::new();
+    let alice = pid("alice");
+    append(&log, &session, Some("alice"), 4).await;
+    assert!(!log.prune_in_progress(&session, Some(&alice)).await.unwrap());
+    log.prune_chain(&session, Some(&alice), retain(2))
+        .await
+        .unwrap();
+    assert!(!log.prune_in_progress(&session, Some(&alice)).await.unwrap());
+
+    log.storage()
+        .as_kv_audit_storage()
+        .unwrap()
+        .test_stage_finished_prune_plan(&session, Some(&alice), Vec::new())
+        .await
+        .unwrap();
+    assert!(log.prune_in_progress(&session, Some(&alice)).await.unwrap());
+    assert!(!log.prune_in_progress(&session, None).await.unwrap());
+}
+
+#[tokio::test]
 async fn chain_entries_page_resumes_in_chain_order_for_one_principal() {
     let log = AuditLog::in_memory(Arc::new(KeyPair::generate()));
     let session = SessionId::new();

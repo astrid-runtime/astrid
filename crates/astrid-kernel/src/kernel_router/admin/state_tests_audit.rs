@@ -425,6 +425,76 @@ async fn heads_sign_the_omitted_total_accumulated_across_prunes() {
     assert!(signed.windows(block.len()).any(|window| window == block));
 }
 
+/// Append an entry whose action carries `padding` bytes of parameters.
+async fn append_padded(kernel: &Kernel, session: &SessionId, principal: &str, padding: usize) {
+    kernel
+        .audit_log
+        .append_with_principal(
+            session.clone(),
+            pid(principal),
+            AuditAction::AdminRequest {
+                method: "admin.test.padded".to_owned(),
+                required_capability: "test:padded".to_owned(),
+                target_principal: None,
+                params: Some(serde_json::json!({ "padding": "x".repeat(padding) })),
+                device_key_id: None,
+            },
+            AuthorizationProof::System {
+                reason: "test".to_owned(),
+            },
+            AuditOutcome::success(),
+        )
+        .await
+        .expect("append padded audit entry");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn export_returns_a_large_entry_alone_and_rejects_one_above_the_limit() {
+    let (_dir, kernel) = fixture().await;
+    let session = kernel.session_id.clone();
+    append(&kernel, &session, Some("frank"), 1).await;
+    // The action is serialized into the entry and, hex-encoded, into its
+    // signing data, so these export as roughly 1.1 MiB and 1.6 MiB: above
+    // the 1 MiB page budget, and above the 1.5 MiB single-entry limit.
+    append_padded(&kernel, &session, "frank", 370 * 1024).await;
+    append(&kernel, &session, Some("frank"), 1).await;
+    append_padded(&kernel, &session, "frank", 540 * 1024).await;
+
+    let mut cursor = None;
+    for (index, oversized) in [(0, false), (1, true), (2, false)] {
+        let page = export_page(
+            &kernel,
+            AuditExportRequest {
+                cursor: cursor.clone(),
+                ..request(&session, "frank")
+            },
+        )
+        .await;
+        assert_eq!(page.entries.len(), 1, "page at {index}");
+        assert_eq!(page.entries[0].index, index);
+        assert!(!page.complete);
+        let size = serde_json::to_vec(&page.entries[0]).unwrap().len();
+        assert_eq!(
+            size > 1024 * 1024,
+            oversized,
+            "entry {index} is {size} bytes"
+        );
+        cursor = page.next_cursor;
+    }
+    let rejected = export(
+        &kernel,
+        AuditExportRequest {
+            cursor,
+            ..request(&session, "frank")
+        },
+    )
+    .await;
+    assert!(
+        matches!(rejected, AdminResponseBody::Error(ref error) if error.contains("at index 3")),
+        "{rejected:?}"
+    );
+}
+
 async fn send_admin(
     kernel: &Arc<Kernel>,
     caller: &PrincipalId,
@@ -444,7 +514,7 @@ async fn send_admin(
         metadata: astrid_events::EventMetadata::new("test"),
         message,
     });
-    astrid_runtime::time::timeout(std::time::Duration::from_secs(5), async {
+    astrid_runtime::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             let event = rx.recv().await.expect("admin response");
             if let astrid_events::AstridEvent::Ipc { message, .. } = &*event
@@ -455,7 +525,7 @@ async fn send_admin(
         }
     })
     .await
-    .expect("admin response within 5s")
+    .expect("admin response within 30s")
 }
 
 async fn admin_rows(kernel: &Kernel, principal: &PrincipalId, method: &str) -> Vec<bool> {

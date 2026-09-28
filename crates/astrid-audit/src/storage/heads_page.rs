@@ -3,7 +3,7 @@
 use super::metadata::PruneGeneration;
 use super::{
     AuditError, AuditResult, ChainMetadata, DURABLE_APPEND_LOCK, KvAuditStorage, NS_CHAIN_METADATA,
-    NS_PRUNE_PLANS, NS_PRUNE_RECEIPTS, PrunePlan,
+    NS_PRUNE_PLANS, NS_PRUNE_RECEIPTS, PrunePlan, chain_head_key,
 };
 use astrid_core::{PrincipalId, SessionId};
 
@@ -102,6 +102,19 @@ impl KvAuditStorage {
             records,
             next_after,
         })
+    }
+
+    /// Whether the chain has a prune plan: a prune has started and not yet
+    /// finished. Entries are deleted only while a plan exists.
+    pub(crate) async fn prune_plan_pending(
+        &self,
+        session_id: &SessionId,
+        principal: Option<&PrincipalId>,
+    ) -> AuditResult<bool> {
+        self.store
+            .exists(NS_PRUNE_PLANS, &chain_head_key(session_id, principal))
+            .await
+            .map_err(|error| AuditError::StorageError(error.to_string()))
     }
 
     /// Whether the chain has a prune plan that finished deleting entries but
