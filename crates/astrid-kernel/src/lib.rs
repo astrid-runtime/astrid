@@ -12,7 +12,7 @@
 //! the Extism sandbox, and route IPC bytes between them.
 
 /// Audit entry format selection and the audit signing key.
-#[cfg(unix)]
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod audit_keys;
 #[cfg(all(test, unix))]
 #[path = "audit_retirement_tests.rs"]
@@ -1253,8 +1253,10 @@ impl Kernel {
             // during the migrate-only window above, so every new entry is in
             // the selected format. A config that fails to load here is
             // reported by the daemon; v1 (the default) applies meanwhile, and
-            // a store already on v2 stays on v2 regardless.
-            #[cfg(unix)]
+            // a store already on v2 stays on v2 regardless. The browser
+            // profile reads no host config; its host enables v2 on the audit
+            // log it injects (`AuditLog::enable_entry_v2`).
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             {
                 let entry_format = astrid_config::Config::load_with_layout(
                     Some(&workspace_root),

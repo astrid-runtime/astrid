@@ -141,7 +141,9 @@ Enabling v2 is one-way for a node. Once the registry exists:
   or replaced, since only the registered key can authorize its successor.
 
 Only the operator's own configuration can set `entry_format`. A workspace
-`.astrid/config.toml` cannot.
+`.astrid/config.toml` cannot. The daemon applies the setting at boot; an
+embedder that builds the kernel around its own audit log (such as the browser
+profile) enables v2 with `AuditLog::enable_entry_v2`.
 
 ## Keys
 
