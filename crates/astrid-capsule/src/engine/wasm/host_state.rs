@@ -455,6 +455,9 @@ pub struct HostState {
     /// first and falls through to host-wide regardless of where the
     /// operator stored the value.
     pub secret_env: std::collections::HashSet<String>,
+    /// Secret values `get_config` handed to this instance, kept host-side so
+    /// the HTTP audit redacts them from request commitments.
+    pub revealed_secrets: crate::engine::wasm::host::http::RevealedSecrets,
     /// Legacy secret-root context retained for migration compatibility.
     /// Runtime secret lookup never reads this path; released homes must be
     /// imported explicitly with [`astrid_storage::env::import_legacy_scope`].

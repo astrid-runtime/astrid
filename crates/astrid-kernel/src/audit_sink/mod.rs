@@ -18,7 +18,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use astrid_audit::{AuditAction, AuditLog, AuditOutcome, AuthorizationProof, CapsuleActor};
-use astrid_capsule::{HostAuditActor, HostAuditEvent, HostAuditOutcome, HostAuditSink};
+use astrid_capsule::{
+    HostAuditActor, HostAuditEvent, HostAuditOutcome, HostAuditReceipt, HostAuditSink,
+};
 use astrid_config::types::AuditConfig;
 use astrid_core::{PrincipalId, SessionId};
 use astrid_crypto::ContentHash;
@@ -562,6 +564,12 @@ pub struct KernelAuditSink {
     /// `None` on the kernel's own handle; set on the per-capsule handles the
     /// engine obtains through [`HostAuditSink::attributed`].
     actor: Option<Arc<CapsuleActor>>,
+    /// The audit log, for records that must be durable before the host call
+    /// proceeds ([`HostAuditSink::commit`]).
+    audit_log: Arc<AuditLog>,
+    /// Per-principal HTTP request numbers for this kernel run, shared by
+    /// every handle so the sequence spans all capsules of a principal.
+    http_sequences: Arc<Mutex<HashMap<PrincipalId, u64>>>,
 }
 
 impl KernelAuditSink {
@@ -582,9 +590,11 @@ impl KernelAuditSink {
         let audit_log = audit_log.into();
         Self {
             session_id: session_id.into(),
-            queue: AuditQueue::new(audit_log, policy),
+            queue: AuditQueue::new(Arc::clone(&audit_log), policy),
             policy,
             actor: None,
+            audit_log,
+            http_sequences: Arc::default(),
         }
     }
 
@@ -645,6 +655,10 @@ impl KernelAuditSink {
                 local_addr: truncate_guest_str(local_addr),
                 peer_addr: truncate_guest_str(peer_addr),
                 actor,
+            },
+            HostAuditEvent::HttpRequest(request) => coverage::http_request_action(&request, actor),
+            HostAuditEvent::HttpResponse(response) => {
+                coverage::http_response_action(&response, actor)
             },
         }
     }
@@ -714,7 +728,8 @@ impl HostAuditSink for KernelAuditSink {
             self.queue.omit_path_probe();
             return;
         }
-        let action = Self::to_action(event, self.actor.as_deref().cloned());
+        let mut action = Self::to_action(event, self.actor.as_deref().cloned());
+        self.stamp_http_sequence(principal, &mut action);
         self.record_action(principal, action, outcome);
     }
 
@@ -724,9 +739,19 @@ impl HostAuditSink for KernelAuditSink {
             ..self.clone()
         }))
     }
+
+    fn commit<'a>(
+        &'a self,
+        principal: &'a PrincipalId,
+        event: HostAuditEvent<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HostAuditReceipt> + Send + 'a>> {
+        Box::pin(self.commit_direct(principal, event))
+    }
 }
 
 #[cfg(test)]
 mod attribution_tests;
+#[cfg(test)]
+mod http_tests;
 #[cfg(test)]
 mod tests;

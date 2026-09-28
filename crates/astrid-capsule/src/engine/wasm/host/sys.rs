@@ -31,6 +31,9 @@ impl sys::Host for HostState {
         // principal scope followed by the host/system scope.
         if self.secret_env.contains(&key) {
             let value = resolve_secret(self, &key);
+            // Remember the value host-side so outbound HTTP audit
+            // commitments can redact it (see `host::http::audit`).
+            self.revealed_secrets.note(&value);
             return Ok(if value.is_empty() { None } else { Some(value) });
         }
 

@@ -1,6 +1,6 @@
 //! Bounded asynchronous host-audit sink: the seam by which sensitive per-action
-//! host calls (fs read/write/delete, net connect/bind, process spawn)
-//! reach the kernel's durable, signed, hash-chained audit log.
+//! host calls (fs read/write/delete, net connect/bind, process spawn, HTTP
+//! exchanges) reach the kernel's durable, signed, hash-chained audit log.
 //!
 //! # Why a sink trait rather than a direct append
 //!
@@ -21,10 +21,16 @@
 //! visible as degraded health. Per-action audit deliberately does NOT route
 //! over the event bus: the bus is broadcast-with-lag-drop, and a droppable
 //! record is not a provable one. The chain append remains the system of record.
+//!
+//! The exception is an effect whose record must precede it. The HTTP host
+//! awaits [`HostAuditSink::commit`] for every outbound request, so the request
+//! entry is durable before the request leaves the host.
 
 mod coverage;
 
-pub use coverage::{HostAuditActor, attribute_sink};
+pub use coverage::{
+    HostAuditActor, HostAuditReceipt, HostHttpRequest, HostHttpResponse, attribute_sink,
+};
 
 /// A sensitive host-call action being reported to the audit sink.
 ///
@@ -85,6 +91,10 @@ pub enum HostAuditEvent<'a> {
         /// Host-observed remote peer endpoint.
         peer_addr: &'a str,
     },
+    /// A kernel-mediated HTTP request about to be sent (or refused).
+    HttpRequest(HostHttpRequest<'a>),
+    /// Completion of a kernel-mediated HTTP request.
+    HttpResponse(HostHttpResponse<'a>),
 }
 
 /// The outcome of a sensitive host call, as seen at the host-fn seam.
@@ -140,5 +150,21 @@ pub trait HostAuditSink: Send + Sync {
     fn attributed(&self, actor: HostAuditActor) -> Option<std::sync::Arc<dyn HostAuditSink>> {
         let _ = actor;
         None
+    }
+
+    /// Append one allowed record and wait until it is durable.
+    ///
+    /// For effects whose audit entry must precede the effect: the HTTP host
+    /// awaits this before a request leaves the host. A failed append must not
+    /// fail the caller; it returns a receipt without an `entry_id` and is
+    /// surfaced through the implementation's health. The default enqueues the
+    /// record through [`record`](Self::record) and returns an empty receipt.
+    fn commit<'a>(
+        &'a self,
+        principal: &'a astrid_core::PrincipalId,
+        event: HostAuditEvent<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HostAuditReceipt> + Send + 'a>> {
+        self.record(principal, event, HostAuditOutcome::Allowed);
+        Box::pin(std::future::ready(HostAuditReceipt::default()))
     }
 }

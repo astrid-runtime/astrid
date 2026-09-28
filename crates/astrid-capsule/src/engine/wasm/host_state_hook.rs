@@ -99,6 +99,7 @@ impl HostState {
             ipc_limiter: Arc::new(astrid_events::ipc::IpcRateLimiter::new()),
             config: HashMap::new(),
             secret_env: std::collections::HashSet::new(),
+            revealed_secrets: crate::engine::wasm::host::http::RevealedSecrets::default(),
             file_secret_root: None,
             ipc_publish_patterns: vec!["hook.v1.result.*".into()],
             ipc_subscribe_patterns: Vec::new(),

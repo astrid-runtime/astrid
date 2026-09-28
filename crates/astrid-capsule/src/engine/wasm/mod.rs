@@ -2705,6 +2705,7 @@ impl ExecutionEngine for WasmEngine {
                 ipc_limiter: Arc::clone(&ipc_limiter),
                 config: wasm_config.clone(),
                 secret_env: secret_env_set.clone(),
+                revealed_secrets: crate::engine::wasm::host::http::RevealedSecrets::default(),
                 // Kept only for explicit legacy-migration fixtures; runtime
                 // secret resolution never consults a native path.
                 file_secret_root: None,
@@ -4024,6 +4025,7 @@ async fn build_lifecycle_host_state(
         ipc_limiter: Arc::new(astrid_events::ipc::IpcRateLimiter::new()),
         config: cfg.config.clone(),
         secret_env,
+        revealed_secrets: crate::engine::wasm::host::http::RevealedSecrets::default(),
         file_secret_root,
         ipc_publish_patterns: Vec::new(),
         ipc_subscribe_patterns: Vec::new(),

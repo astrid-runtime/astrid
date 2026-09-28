@@ -19,6 +19,7 @@
 //! `Cookie` are stripped on a cross-origin hop. The host — never the capsule —
 //! owns DNS resolution and the connect path.
 
+mod audit;
 mod backend;
 mod options;
 // The SSRF host airlock. Private: every consumer is an `http` descendant that
@@ -78,6 +79,7 @@ use crate::engine::wasm::bindings::astrid::io::streams::{InputStream, OutputStre
 use crate::engine::wasm::host_state::HostState;
 use wasmtime_wasi::p2::DynPollable;
 
+pub use audit::RevealedSecrets;
 pub use backend::ActiveHttpStream;
 use backend::{stream_close, stream_drop, stream_headers, stream_read_chunk, stream_status};
 use options::ResolvedOptions;
@@ -385,3 +387,7 @@ mod tests;
 #[cfg(test)]
 #[path = "regression.rs"]
 mod regression;
+
+#[cfg(test)]
+#[path = "audit_tests.rs"]
+mod audit_tests;
