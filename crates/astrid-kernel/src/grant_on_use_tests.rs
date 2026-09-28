@@ -542,8 +542,8 @@ async fn drained_entries(
     }
 }
 
-/// The grant-on-use prompt, the decision and the applied capsule grant are
-/// on the principal's audit chain, linked by the request id.
+/// The grant-on-use decision and the applied capsule grant are on the
+/// principal's audit chain; the decision carries the prompt's request id.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn approve_is_audited_as_request_decision_and_grant() {
     use astrid_audit::{ApprovalScope, AuditAction};
@@ -557,19 +557,15 @@ async fn approve_is_audited_as_request_decision_and_grant() {
     publish_response(&kernel, rid, "approve");
     assert!(wait_for_grant(&home, "x", "cap").await);
 
-    // The prompt and the decision go through the host-audit queue; the grant
-    // change is appended after the grant result is published.
-    let entries = drained_entries(&kernel, "x", 2, |entries| {
+    // The decision goes through the host-audit queue; the grant change is
+    // appended after the grant result is published. (The prompt itself is
+    // committed by the dispatcher, which this test bypasses.)
+    let entries = drained_entries(&kernel, "x", 1, |entries| {
         entries
             .iter()
             .any(|e| matches!(e.action, AuditAction::CapabilityChanged { .. }))
     })
     .await;
-    assert!(entries.iter().any(|e| matches!(
-        &e.action,
-        AuditAction::ApprovalRequested { request_id: Some(id), action_type, resource, .. }
-            if id == rid && action_type == "capsule-grant" && resource == "cap"
-    )));
     assert!(entries.iter().any(|e| matches!(
         &e.action,
         AuditAction::ApprovalGranted { request_id: Some(id), scope: ApprovalScope::Always, via: Some(via), .. }
@@ -596,7 +592,7 @@ async fn deny_is_audited_without_a_grant() {
     publish_response(&kernel, rid, "deny");
     assert_no_grant(&home, "x", "cap").await;
 
-    let entries = drained_entries(&kernel, "x", 2, |_| true).await;
+    let entries = drained_entries(&kernel, "x", 1, |_| true).await;
     assert!(entries.iter().any(|e| matches!(
         &e.action,
         AuditAction::ApprovalDenied { request_id: Some(id), reason: Some(reason), .. }

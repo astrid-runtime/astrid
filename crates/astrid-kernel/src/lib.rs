@@ -1458,6 +1458,11 @@ impl Kernel {
             Arc::clone(&kernel.profile_cache),
             Arc::clone(&kernel.groups),
         );
+        // Grant-on-use prompts are committed to the audit log before they
+        // are published.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let access_resolver =
+            access_resolver.with_audit_sink(Arc::new(kernel.audit_sink.as_ref().clone()));
         let dispatcher = astrid_capsule::dispatcher::EventDispatcher::new(
             Arc::clone(&kernel.capsules),
             Arc::clone(&kernel.event_bus),

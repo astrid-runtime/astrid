@@ -65,8 +65,9 @@ const MAX_INFLIGHT_GRANTS: usize = 1024;
 /// Stable lag label for the permanent ordered approval observer.
 const OBSERVER_SUBSCRIBER: &str = "grant_on_use_observer";
 
-/// Approval action name recorded for a grant-on-use prompt.
-const GRANT_ACTION: &str = "capsule-grant";
+/// Approval action name recorded for a grant-on-use decision; the dispatcher
+/// records the prompt under the same name.
+const GRANT_ACTION: &str = astrid_capsule::access::GRANT_APPROVAL_ACTION;
 
 /// The approve set, replicated from `host/approval.rs::decision_from_str`.
 /// Anything else — explicit deny, unknown string, or empty — is NOT an approve.
@@ -144,7 +145,6 @@ fn process_event(
             principal,
             capsule_id,
         } if message.topic == Topic::approval_request() => record_grant_request(
-            kernel,
             inflight,
             pending,
             message,
@@ -164,8 +164,8 @@ fn process_event(
     }
 }
 
-/// Record a grant-on-use approval request or decision on the audit log. The
-/// request and its decision share the dispatcher-minted `request_id`.
+/// Record a grant-on-use decision on the audit log. The dispatcher committed
+/// the prompt under the same `request_id` before publishing it.
 fn audit_grant(
     kernel: &Kernel,
     principal: &str,
@@ -196,9 +196,7 @@ fn audit_grant_decision(
     audit_grant(kernel, &entry.principal, decision, outcome);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn record_grant_request(
-    kernel: &Kernel,
     inflight: &Arc<tokio::sync::Semaphore>,
     pending: &mut HashMap<String, PendingGrant>,
     message: &IpcMessage,
@@ -270,16 +268,6 @@ fn record_grant_request(
             deadline,
             _permit: permit,
         },
-    );
-    audit_grant(
-        kernel,
-        principal,
-        HostAuditEvent::ApprovalRequested {
-            request_id,
-            action: GRANT_ACTION,
-            resource: capsule_id,
-        },
-        HostAuditOutcome::Allowed,
     );
 }
 

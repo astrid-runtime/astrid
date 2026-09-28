@@ -866,25 +866,31 @@ async fn find_matching_interceptors(
                 .as_ref()
                 .is_some_and(|access| access.is_capsule_allowed(capsule.id()))
         {
-            // Valid resolved callers receive one signal for this matching capsule.
-            if resolved_access.is_some()
-                && let Some(principal) = caller_principal
-            {
+            // Valid resolved callers receive one signal for this matching
+            // capsule, published after the registry lock is released.
+            if resolved_access.is_some() && caller_principal.is_some() {
                 let capsule_key = capsule.id().to_string();
                 if !grant_signalled.contains(&capsule_key) {
-                    grant_signalled.push(capsule_key.clone());
-                    crate::access::emit_grant_required(
-                        event_bus,
-                        principal,
-                        capsule_key,
-                        caller_request_owner,
-                    );
+                    grant_signalled.push(capsule_key);
                 }
             }
             continue;
         }
         for (action, priority) in capsule_matches {
             matches.push((runtime_id.clone(), Arc::clone(&capsule), action, priority));
+        }
+    }
+    drop(registry);
+    if let Some(principal) = caller_principal {
+        for capsule_key in grant_signalled {
+            crate::access::emit_grant_required(
+                event_bus,
+                access_resolver,
+                principal,
+                capsule_key,
+                caller_request_owner,
+            )
+            .await;
         }
     }
     // Sort by priority (lower fires first), then by capsule id and action as a
