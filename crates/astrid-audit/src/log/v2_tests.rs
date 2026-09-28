@@ -427,3 +427,52 @@ async fn prune_receipts_are_signed_by_the_audit_key_and_forgeries_fail() {
             .any(|issue| matches!(issue, ChainIssue::InvalidGenesis { .. }))
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_single_and_batch_appends_keep_one_gapless_sequence() {
+    let log = Arc::new(AuditLog::in_memory(runtime()));
+    log.enable_entry_v2(config(&key(1))).await.unwrap();
+    let session = SessionId::new();
+    let mut tasks = Vec::new();
+    for task in 0..8 {
+        let log = Arc::clone(&log);
+        let session = session.clone();
+        tasks.push(tokio::spawn(async move {
+            for index in 0..4 {
+                if (task ^ index) & 1 == 0 {
+                    record(&log, &session, Some(&alice()), 1).await;
+                } else {
+                    let batch = vec![
+                        (
+                            session.clone(),
+                            alice(),
+                            AuditAction::ConfigReloaded,
+                            AuthorizationProof::System {
+                                reason: "batch".into(),
+                            },
+                            AuditOutcome::success(),
+                        );
+                        2
+                    ];
+                    assert!(
+                        log.append_batch_with_principal(batch)
+                            .await
+                            .iter()
+                            .all(Result::is_ok)
+                    );
+                }
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    let chain = log
+        .get_principal_entries(&session, Some(&alice()))
+        .await
+        .unwrap();
+    let expected: Vec<Option<u64>> = (1..=48).map(Some).collect();
+    assert_eq!(seqs(&chain), expected);
+    let result = log.verify_chain(&session).await.unwrap();
+    assert!(result.valid, "{:?}", result.issues);
+}
