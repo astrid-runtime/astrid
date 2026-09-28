@@ -216,6 +216,7 @@ async fn run_export(args: &AuditExportArgs) -> Result<ExitCode> {
         from: args.from,
         cursor: args.cursor.clone(),
         limit: args.limit,
+        receipts_from: None,
     };
     let mut client = connect_as_active_agent().await?;
     let body = into_result(

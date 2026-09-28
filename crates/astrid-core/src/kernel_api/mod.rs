@@ -9,6 +9,7 @@
 //! `wasm32-unknown-unknown` without dragging in the kernel).
 
 mod agent;
+mod audit_anchor;
 mod audit_export;
 mod capsule_metadata;
 mod impls;
@@ -18,9 +19,14 @@ mod readiness;
 mod response_types;
 mod status;
 pub use agent::{AgentDeriveKernelRequest, AgentDeriveRequest};
+pub use audit_anchor::{
+    AUDIT_ANCHOR_MARK_MAX_CHAINS, AuditAnchorChainStatus, AuditAnchorEvidence,
+    AuditAnchorMarkChain, AuditAnchorMarkOutcome, AuditAnchorMarkRequest, AuditAnchorMarkResult,
+    AuditAnchorMarkStatus, AuditAnchorStatusReport,
+};
 pub use audit_export::{
     AUDIT_HEADS_DOMAIN_V1, AUDIT_OMITTED_TOTAL_UNKNOWN, AuditExportEntry, AuditExportPage,
-    AuditExportRequest, AuditHeadsChain, AuditHeadsPrune, AuditHeadsSnapshot,
+    AuditExportReceipt, AuditExportRequest, AuditHeadsChain, AuditHeadsPrune, AuditHeadsSnapshot,
 };
 pub use capsule_metadata::CapsuleEnvOptionsFromMetadata;
 pub use install::{
@@ -955,6 +961,10 @@ pub enum AdminRequestKind {
     AuditHeads,
     /// One page of a chain's raw signed audit entries. Read-only.
     AuditExport(AuditExportRequest),
+    /// Record how far chains are externally anchored; see `audit_anchor`.
+    AuditAnchorMark(AuditAnchorMarkRequest),
+    /// Every chain's anchored watermark and the retention state. Read-only.
+    AuditAnchorStatus,
     /// Issue an authenticated native filesystem lease. The handler resolves
     /// the selected view to a typed store owner and starts a private callback
     /// endpoint; the provider never receives a general daemon session token.

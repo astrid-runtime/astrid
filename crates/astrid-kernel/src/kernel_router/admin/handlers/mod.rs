@@ -178,7 +178,9 @@ async fn dispatch_inner(
         | AdminRequestKind::AuditPrune { .. }
         | AdminRequestKind::AuditHealth
         | AdminRequestKind::AuditHeads
-        | AdminRequestKind::AuditExport(_)) => {
+        | AdminRequestKind::AuditExport(_)
+        | AdminRequestKind::AuditAnchorMark(_)
+        | AdminRequestKind::AuditAnchorStatus) => {
             dispatch_services(kernel, caller, authorization, device_key_id, req).await
         },
     }
@@ -344,6 +346,12 @@ async fn dispatch_services(
         AdminRequestKind::AuditHeads => super::audit_handlers::heads(kernel).await,
         AdminRequestKind::AuditExport(request) => {
             super::audit_handlers::export(kernel, request).await
+        },
+        AdminRequestKind::AuditAnchorMark(request) => {
+            super::audit_anchor_handlers::anchor_mark(kernel, request).await
+        },
+        AdminRequestKind::AuditAnchorStatus => {
+            super::audit_anchor_handlers::anchor_status(kernel).await
         },
         _ => AdminResponseBody::Error("not a service request".to_owned()),
     }
