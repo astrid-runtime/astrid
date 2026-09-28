@@ -130,7 +130,11 @@ When the daemon first boots with `v2`, it:
    key as the capability, build and v1-audit key.
 
 Existing v1 entries are kept unchanged. The next entry of each chain starts
-a v2 chain linked to the last v1 entry.
+a v2 chain linked to the last v1 entry. From then on, verification also
+requires v1 entries to be signed by the registered v1-audit key (the runtime
+key at enablement), so a v1 chain re-signed under another key is reported. v1
+entries signed by an earlier runtime key, for example one replaced before v2
+was enabled, are reported the same way.
 
 Enabling v2 is one-way for a node. Once the registry exists:
 

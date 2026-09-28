@@ -143,8 +143,33 @@ async fn v1_history_stays_as_it_is_and_links_into_the_v2_chain() {
     let result = log.verify_chain(&session).await.unwrap();
     assert!(result.valid, "{:?}", result.issues);
     let registry = log.key_registry().await.unwrap().unwrap();
-    let strict = ChainVerifier::new(Some(&registry)).require_registered_v1_keys(true);
-    assert!(strict.verify(&chain, ChainStart::Genesis).valid);
+    let verified = ChainVerifier::new(Some(&registry)).verify(&chain, ChainStart::Genesis);
+    assert!(verified.valid, "{:?}", verified.issues);
+}
+
+#[tokio::test]
+async fn a_v1_chain_under_an_unregistered_key_fails_once_the_registry_exists() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let session = SessionId::new();
+    // A dormant v1 chain signed by some other key, e.g. rewritten by someone
+    // who can write the store. v1 verification alone accepts it.
+    let rogue = AuditLog::open_with_kv_store(Arc::clone(&store), key(0x55)).unwrap();
+    record(&rogue, &session, Some(&alice()), 2).await;
+    assert!(rogue.verify_chain(&session).await.unwrap().valid);
+
+    let log = AuditLog::open_with_kv_store(Arc::clone(&store), runtime()).unwrap();
+    log.enable_entry_v2(config(&key(1))).await.unwrap();
+    let result = log.verify_chain(&session).await.unwrap();
+    assert_eq!(
+        result
+            .issues
+            .iter()
+            .filter(|issue| matches!(issue, ChainIssue::UnregisteredKey { .. }))
+            .count(),
+        2,
+        "{:?}",
+        result.issues
+    );
 }
 
 #[tokio::test]

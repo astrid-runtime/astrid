@@ -233,11 +233,28 @@ fn v1_history_links_into_a_v2_chain_and_v1_cannot_follow() {
         issues(&registry, &chain)
     );
 
-    // The v1 prefix verifies under the stricter registered-key rule too.
-    let strict = ChainVerifier::new(Some(&registry)).require_registered_v1_keys(true);
-    assert!(strict.verify(&chain, ChainStart::Genesis).valid);
+    // With a registry, v1 entries must be signed by the registered v1 key:
+    // a v1 chain rewritten under another key no longer verifies. Without a
+    // registry, or with the check turned off, v1 keeps its embedded-key rule.
     let foreign_v1 = v1_entries(&key(0x55), 1);
-    assert!(!strict.verify(&foreign_v1, ChainStart::Genesis).valid);
+    let found = issues(&registry, &foreign_v1);
+    assert!(
+        found
+            .iter()
+            .any(|issue| matches!(issue, ChainIssue::UnregisteredKey { .. })),
+        "{found:?}"
+    );
+    assert!(
+        ChainVerifier::new(Some(&registry))
+            .require_registered_v1_keys(false)
+            .verify(&foreign_v1, ChainStart::Genesis)
+            .valid
+    );
+    assert!(
+        ChainVerifier::new(None)
+            .verify(&foreign_v1, ChainStart::Genesis)
+            .valid
+    );
 
     // A v2 chain opening after v1 must start at 1.
     let mut late = chain.clone();

@@ -26,11 +26,13 @@ pub enum ChainStart<'a> {
 /// linking to the hash of its predecessor. The key embedded in an entry is
 /// only a selector; it is never trusted on its own.
 ///
-/// Format-v1 entries are checked as before (signature under the embedded
-/// key, hash link), unless
-/// [`require_registered_v1_keys`](Self::require_registered_v1_keys) also
-/// requires that key to be registered as [`KeyRole::AuditV1`]. A v1 entry
-/// after a v2 entry is always an issue: v2 closes the chain to v1.
+/// Format-v1 entries are checked for their signature and hash link as
+/// before. With a registry, their embedded key must also be registered as
+/// [`KeyRole::AuditV1`] (the key that signed the node's v1 history), so a v1
+/// chain rewritten under some other key no longer passes;
+/// [`require_registered_v1_keys`](Self::require_registered_v1_keys) turns
+/// that off. A v1 entry after a v2 entry is always an issue: v2 closes the
+/// chain to v1.
 #[derive(Clone, Copy, Debug)]
 pub struct ChainVerifier<'a> {
     registry: Option<&'a KeyRegistry>,
@@ -39,17 +41,21 @@ pub struct ChainVerifier<'a> {
 
 impl<'a> ChainVerifier<'a> {
     /// A verifier over `registry`. Without a registry every v2 entry is
-    /// reported as signed by an unregistered key.
+    /// reported as signed by an unregistered key and v1 entries are verified
+    /// against their embedded key; with one, v1 entries must also be signed
+    /// by a registered [`KeyRole::AuditV1`] key.
     #[must_use]
     pub const fn new(registry: Option<&'a KeyRegistry>) -> Self {
         Self {
             registry,
-            registered_v1_keys: false,
+            registered_v1_keys: registry.is_some(),
         }
     }
 
-    /// Also require each v1 entry's embedded key to be registered as
-    /// [`KeyRole::AuditV1`].
+    /// Whether each v1 entry's embedded key must be registered as
+    /// [`KeyRole::AuditV1`]. On by default when a registry is given; turning
+    /// it off verifies v1 entries against their embedded key alone, as format
+    /// v1 did.
     #[must_use]
     pub const fn require_registered_v1_keys(mut self, required: bool) -> Self {
         self.registered_v1_keys = required;

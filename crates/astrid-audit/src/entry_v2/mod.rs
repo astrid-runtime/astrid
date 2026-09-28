@@ -223,6 +223,9 @@
 //!    more than the predecessor's when both are in the same chain and 1
 //!    otherwise, and `key_epoch` not to decrease.
 //! 4. Reject a v1 entry that follows a v2 entry.
+//! 5. Require each v1 entry's embedded key to hold the audit-v1 role, so a v1
+//!    chain re-signed under another key no longer passes (a verifier may turn
+//!    this off to check v1 entries the way format v1 did).
 //!
 //! The first retained entry of a pruned chain links to a signed archive
 //! receipt. Under v2 the audit key signs receipts and the receipt carries the
@@ -239,7 +242,10 @@
 //! ([`AuditLog::enable_entry_v2`](crate::AuditLog::enable_entry_v2)) creates
 //! the key registry on first use. From then on:
 //!
-//! - existing v1 entries stay exactly as they are and verify as before;
+//! - existing v1 entries stay exactly as they are; their signatures and links
+//!   verify as before, and their signing key must now be the registered v1
+//!   key, which the kernel records as the runtime key at enablement (v1
+//!   entries signed by an earlier runtime key are reported as unregistered);
 //! - the next entry of each storage chain opens a v2 chain with `seq = 1`
 //!   whose `prev` is the content hash of the chain's last v1 entry, so the
 //!   v1 history stays hash-linked into the v2 chain and is never re-signed;
