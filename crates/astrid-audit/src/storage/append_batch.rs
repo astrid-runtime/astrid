@@ -565,6 +565,7 @@ mod tests {
             principal.clone(),
             AuditAction::FileRead {
                 path: "/a".to_owned(),
+                actor: None,
             },
             AuthorizationProof::System {
                 reason: "test".to_owned(),
@@ -597,6 +598,7 @@ mod tests {
             principal.clone(),
             AuditAction::FileRead {
                 path: "/b".to_owned(),
+                actor: None,
             },
             AuthorizationProof::System {
                 reason: "test".to_owned(),
@@ -635,6 +637,7 @@ mod tests {
             principal.clone(),
             AuditAction::FileRead {
                 path: path.to_owned(),
+                actor: None,
             },
             AuthorizationProof::System {
                 reason: "test".to_owned(),

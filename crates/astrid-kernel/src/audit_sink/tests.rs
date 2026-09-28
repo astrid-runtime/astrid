@@ -95,36 +95,37 @@ async fn records_each_event_kind_onto_the_signed_chain() {
 
     assert!(entries.iter().any(|e| matches!(
         (&e.action, &e.outcome),
-        (AuditAction::FileRead { path }, AuditOutcome::Success { .. }) if path == "/w/r"
+        (AuditAction::FileRead { path, .. }, AuditOutcome::Success { .. }) if path == "/w/r"
     )));
     assert!(entries.iter().any(|e| matches!(
         (&e.action, &e.outcome),
-        (AuditAction::FileWrite { path, content_hash }, AuditOutcome::Failure { .. })
+        (AuditAction::FileWrite { path, content_hash, .. }, AuditOutcome::Failure { .. })
             if path == "/w/w" && *content_hash == ContentHash::zero()
     )));
     assert!(entries.iter().any(|e| matches!(
         &e.action,
-        AuditAction::FileDelete { path } if path == "/w/d"
+        AuditAction::FileDelete { path, .. } if path == "/w/d"
     )));
     assert!(entries.iter().any(|e| matches!(
         &e.action,
-        AuditAction::NetConnect { host, port } if host == "example.com" && *port == 443
+        AuditAction::NetConnect { host, port, .. } if host == "example.com" && *port == 443
     )));
     assert!(entries.iter().any(|e| matches!(
         &e.action,
-        AuditAction::NetBind { addr } if addr == "127.0.0.1:0"
+        AuditAction::NetBind { addr, .. } if addr == "127.0.0.1:0"
     )));
     assert!(entries.iter().any(|e| matches!(
         &e.action,
         AuditAction::NetAccept {
             local_addr,
             peer_addr,
+            ..
         } if local_addr == "127.0.0.1:8788" && peer_addr == "127.0.0.1:49152"
     )));
     assert!(entries.iter().any(|e| matches!(
         (&e.action, &e.authorization, &e.outcome),
         (
-            AuditAction::ProcessSpawn { command },
+            AuditAction::ProcessSpawn { command, .. },
             AuthorizationProof::Denied { .. },
             AuditOutcome::Failure { .. }
         ) if command == "ls"
@@ -175,8 +176,8 @@ async fn oversized_guest_strings_are_truncated_at_the_sink() {
 
     for e in &entries {
         let stored = match &e.action {
-            AuditAction::ProcessSpawn { command } => command,
-            AuditAction::FileRead { path } => path,
+            AuditAction::ProcessSpawn { command, .. } => command,
+            AuditAction::FileRead { path, .. } => path,
             other => panic!("unexpected action: {other:?}"),
         };
         assert!(
@@ -342,7 +343,7 @@ async fn allowed_path_probes_are_omitted_denied_probes_persist() {
     assert!(matches!(
         (&entries[0].action, &entries[0].authorization),
         (
-            AuditAction::FileRead { path },
+            AuditAction::FileRead { path, .. },
             AuthorizationProof::Denied { .. }
         ) if path == "/etc/shadow"
     ));
@@ -432,7 +433,7 @@ async fn collapse_keeps_principals_and_exact_denials() {
     let denied_paths: Vec<_> = entries
         .iter()
         .filter_map(|e| match (&e.action, &e.authorization) {
-            (AuditAction::FileRead { path }, AuthorizationProof::Denied { .. }) => {
+            (AuditAction::FileRead { path, .. }, AuthorizationProof::Denied { .. }) => {
                 Some(path.as_str())
             },
             _ => None,

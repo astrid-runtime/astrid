@@ -510,6 +510,7 @@ async fn test_get_principal_entries_filters_correctly() {
         alice.clone(),
         AuditAction::FileRead {
             path: "a.txt".into(),
+            actor: None,
         },
         AuthorizationProof::NotRequired { reason: "t".into() },
         AuditOutcome::success(),
@@ -529,6 +530,7 @@ async fn test_get_principal_entries_filters_correctly() {
         alice.clone(),
         AuditAction::FileRead {
             path: "b.txt".into(),
+            actor: None,
         },
         AuthorizationProof::NotRequired { reason: "t".into() },
         AuditOutcome::success(),
@@ -573,6 +575,7 @@ async fn test_mixed_session_verify_chain_passes() {
         alice.clone(),
         AuditAction::FileRead {
             path: "a.txt".into(),
+            actor: None,
         },
         AuthorizationProof::NotRequired { reason: "t".into() },
         AuditOutcome::success(),
@@ -592,6 +595,7 @@ async fn test_mixed_session_verify_chain_passes() {
         alice.clone(),
         AuditAction::FileRead {
             path: "b.txt".into(),
+            actor: None,
         },
         AuthorizationProof::NotRequired { reason: "t".into() },
         AuditOutcome::success(),
@@ -647,6 +651,7 @@ async fn test_concurrent_same_chain_appends_do_not_fork() {
                         principal.clone(),
                         AuditAction::FileRead {
                             path: format!("t{t}-{i}.txt"),
+                            actor: None,
                         },
                         AuthorizationProof::NotRequired {
                             reason: "race".into(),
@@ -1083,6 +1088,7 @@ async fn blocked_principal_store_does_not_block_another_principal() {
                 alice,
                 AuditAction::FileRead {
                     path: "alice.txt".into(),
+                    actor: None,
                 },
                 AuthorizationProof::NotRequired {
                     reason: "independent chain test".into(),
@@ -1103,6 +1109,7 @@ async fn blocked_principal_store_does_not_block_another_principal() {
                 bob,
                 AuditAction::FileRead {
                     path: "bob.txt".into(),
+                    actor: None,
                 },
                 AuthorizationProof::NotRequired {
                     reason: "independent chain test".into(),

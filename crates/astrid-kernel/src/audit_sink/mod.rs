@@ -603,25 +603,31 @@ impl KernelAuditSink {
             HostAuditEvent::FileRead { path } | HostAuditEvent::FileProbe { path } => {
                 AuditAction::FileRead {
                     path: truncate_guest_str(path),
+                    actor: None,
                 }
             },
             HostAuditEvent::FileWrite { path } => AuditAction::FileWrite {
                 path: truncate_guest_str(path),
                 // Content hash not captured at the per-action seam yet.
                 content_hash: ContentHash::zero(),
+                actor: None,
             },
             HostAuditEvent::FileDelete { path } => AuditAction::FileDelete {
                 path: truncate_guest_str(path),
+                actor: None,
             },
             HostAuditEvent::NetConnect { host, port } => AuditAction::NetConnect {
                 host: truncate_guest_str(host),
                 port,
+                actor: None,
             },
             HostAuditEvent::NetBind { addr } => AuditAction::NetBind {
                 addr: truncate_guest_str(addr),
+                actor: None,
             },
             HostAuditEvent::ProcessSpawn { command } => AuditAction::ProcessSpawn {
                 command: truncate_guest_str(command),
+                actor: None,
             },
             HostAuditEvent::NetAccept {
                 local_addr,
@@ -629,6 +635,7 @@ impl KernelAuditSink {
             } => AuditAction::NetAccept {
                 local_addr: truncate_guest_str(local_addr),
                 peer_addr: truncate_guest_str(peer_addr),
+                actor: None,
             },
         }
     }
