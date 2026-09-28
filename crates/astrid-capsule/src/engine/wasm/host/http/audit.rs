@@ -99,16 +99,13 @@ const PROVIDER_REQUEST_ID_HEADERS: &[&str] = &[
 /// Longest provider request id value kept (bytes); longer values are cut.
 const MAX_REQUEST_ID_LEN: usize = 128;
 
-/// Shortest secret value redacted by value. Shorter values are too likely to
-/// occur by chance to be removed from content without corrupting it.
-const MIN_REDACTED_SECRET_LEN: usize = 4;
-
-/// Most distinct secret values one host state remembers for redaction.
-const MAX_REVEALED_SECRETS: usize = 32;
-
 /// Secret values the host handed to this capsule instance, remembered so the
 /// HTTP audit can redact them from request commitments. Values are zeroized
 /// on drop and never printed.
+///
+/// Every distinct non-empty value is kept: dropping one would let it reach a
+/// commitment unredacted. The set is not guest-growable — values come only
+/// from the operator's secret store for the manifest's declared secret keys.
 #[derive(Clone, Default)]
 pub struct RevealedSecrets {
     values: Vec<Zeroizing<String>>,
@@ -117,16 +114,13 @@ pub struct RevealedSecrets {
 impl RevealedSecrets {
     /// Remember a secret value handed to the guest.
     pub(crate) fn note(&mut self, value: &str) {
-        if value.len() < MIN_REDACTED_SECRET_LEN
-            || self.values.len() >= MAX_REVEALED_SECRETS
-            || self.values.iter().any(|known| known.as_str() == value)
-        {
+        if value.is_empty() || self.values.iter().any(|known| known.as_str() == value) {
             return;
         }
         self.values.push(Zeroizing::new(value.to_owned()));
     }
 
-    fn iter(&self) -> impl Iterator<Item = &str> {
+    pub(super) fn iter(&self) -> impl Iterator<Item = &str> {
         self.values.iter().map(|value| value.as_str())
     }
 }
@@ -138,55 +132,67 @@ impl std::fmt::Debug for RevealedSecrets {
 }
 
 /// Replaces known secret values in request content.
+///
+/// One left-to-right pass: at each position the longest secret that starts
+/// there is replaced by [`REDACTED`] and the scan resumes after it. Text the
+/// replacement produces is never rescanned, so the result is a deterministic
+/// function of the input and the secret set.
 pub(super) struct Redactor<'a> {
-    /// Longest first, so a secret containing another is replaced whole.
-    secrets: Vec<&'a str>,
+    /// Longest first, so the longest match at a position wins.
+    secrets: Vec<&'a [u8]>,
+    /// Whether any secret starts with the byte, to skip positions cheaply.
+    first_bytes: [bool; 256],
 }
 
 impl<'a> Redactor<'a> {
     pub(super) fn new(secrets: impl Iterator<Item = &'a str>) -> Self {
-        let mut secrets: Vec<&str> = secrets
-            .filter(|s| s.len() >= MIN_REDACTED_SECRET_LEN)
+        let mut secrets: Vec<&[u8]> = secrets
+            .map(str::as_bytes)
+            .filter(|s| !s.is_empty())
             .collect();
         secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
         secrets.dedup();
-        Self { secrets }
+        let mut first_bytes = [false; 256];
+        for secret in &secrets {
+            first_bytes[usize::from(secret[0])] = true;
+        }
+        Self {
+            secrets,
+            first_bytes,
+        }
     }
 
     /// Replace every occurrence of every known secret with [`REDACTED`].
     pub(super) fn redact<'b>(&self, input: &'b [u8]) -> Cow<'b, [u8]> {
-        let mut out = Cow::Borrowed(input);
-        for secret in &self.secrets {
-            if let Some(replaced) = replace_all(&out, secret.as_bytes(), REDACTED.as_bytes()) {
-                out = Cow::Owned(replaced);
-            }
+        let mut out: Option<Vec<u8>> = None;
+        let mut copied = 0;
+        let mut at = 0;
+        while at < input.len() {
+            let found = self.first_bytes[usize::from(input[at])]
+                .then(|| {
+                    self.secrets
+                        .iter()
+                        .find(|secret| input[at..].starts_with(secret))
+                })
+                .flatten();
+            let Some(secret) = found else {
+                at = at.saturating_add(1);
+                continue;
+            };
+            let buffer = out.get_or_insert_with(|| Vec::with_capacity(input.len()));
+            buffer.extend_from_slice(&input[copied..at]);
+            buffer.extend_from_slice(REDACTED.as_bytes());
+            at = at.saturating_add(secret.len());
+            copied = at;
         }
-        out
+        match out {
+            None => Cow::Borrowed(input),
+            Some(mut buffer) => {
+                buffer.extend_from_slice(&input[copied..]);
+                Cow::Owned(buffer)
+            },
+        }
     }
-}
-
-/// Replace every non-overlapping occurrence of `needle`; `None` when there is
-/// none.
-fn replace_all(haystack: &[u8], needle: &[u8], with: &[u8]) -> Option<Vec<u8>> {
-    let first = find(haystack, needle)?;
-    let mut out = Vec::with_capacity(haystack.len());
-    let mut rest = haystack;
-    let mut next = Some(first);
-    while let Some(at) = next {
-        out.extend_from_slice(&rest[..at]);
-        out.extend_from_slice(with);
-        rest = &rest[at.saturating_add(needle.len())..];
-        next = find(rest, needle);
-    }
-    out.extend_from_slice(rest);
-    Some(out)
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// BLAKE3 commitments to one outbound request.

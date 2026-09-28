@@ -98,6 +98,43 @@ fn revealed_secret_values_are_redacted_everywhere() {
     ));
 }
 
+/// Short secrets and any number of distinct secrets are all redacted: a value
+/// left out would reach the commitment in the clear, where a low-entropy one
+/// could be recovered by hashing candidates.
+#[test]
+fn every_revealed_secret_is_redacted_regardless_of_length_or_count() {
+    let mut revealed = super::audit::RevealedSecrets::default();
+    let many: Vec<String> = (0..40).map(|i| format!("secret-{i:02}")).collect();
+    for value in &many {
+        revealed.note(value);
+    }
+    revealed.note("k9z");
+    let body = format!("pin=k9z&last={}&first={}", many[39], many[0]);
+
+    let redactor = super::audit::Redactor::new(revealed_values(&revealed));
+    let redacted = redactor.redact(body.as_bytes());
+    assert_eq!(
+        redacted.as_ref(),
+        format!("pin={REDACTED}&last={REDACTED}&first={REDACTED}").as_bytes()
+    );
+}
+
+/// At each position the longest secret wins and replaced text is not
+/// rescanned, so the redacted form is a deterministic function of the input.
+#[test]
+fn redaction_is_a_single_longest_match_pass() {
+    let secrets = ["abc", "abcdef", "D]x"];
+    let redactor = Redactor::new(secrets.iter().copied());
+    assert_eq!(
+        redactor.redact(b"xabcdefabcx").as_ref(),
+        format!("x{REDACTED}{REDACTED}x").as_bytes()
+    );
+}
+
+fn revealed_values(revealed: &super::audit::RevealedSecrets) -> impl Iterator<Item = &str> {
+    revealed.iter()
+}
+
 /// The commitment is the plain BLAKE3 of the redacted forms, so a verifier
 /// holding the request can recompute it.
 #[test]
