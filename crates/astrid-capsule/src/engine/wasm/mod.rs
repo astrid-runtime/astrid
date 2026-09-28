@@ -2576,7 +2576,18 @@ impl ExecutionEngine for WasmEngine {
             let st_secret_elicits = ctx.secret_elicits.clone();
             let st_identity_store = ctx.identity_store.clone();
             let st_profile_cache = ctx.profile_cache.clone();
-            let st_audit_sink = ctx.audit_sink.clone();
+            // Bind the host-audit sink to this capsule's verified code
+            // identity so every host-call entry names the capsule and wasm
+            // hash that acted.
+            let st_audit_sink = ctx.audit_sink.as_ref().map(|sink| {
+                crate::audit_sink::attribute_sink(
+                    sink,
+                    crate::audit_sink::HostAuditActor {
+                        capsule_id: manifest.package.name.clone(),
+                        wasm_hash: astrid_crypto::ContentHash::from_hex(&actual_hash).ok(),
+                    },
+                )
+            });
             let st_owner_home = owner_vfs.home.clone();
             let st_owner_tmp = owner_vfs.tmp.clone();
             let st_principal_directory = ctx.principal_directory.clone();
@@ -4093,8 +4104,17 @@ async fn build_lifecycle_host_state(
         no_yield_windows: 0,
         // Per-action audit sink (fs/net/process). The install/upgrade path
         // may thread the kernel sink in; `None` for the standalone install
-        // CLI, which has no audit log in scope.
-        audit_sink: cfg.audit_sink.clone(),
+        // CLI, which has no audit log in scope. Bound to the hook's code
+        // identity like the runtime sink.
+        audit_sink: cfg.audit_sink.as_ref().map(|sink| {
+            crate::audit_sink::attribute_sink(
+                sink,
+                crate::audit_sink::HostAuditActor {
+                    capsule_id: cfg.capsule_id.as_str().to_owned(),
+                    wasm_hash: Some(astrid_crypto::ContentHash::hash(&cfg.wasm_bytes)),
+                },
+            )
+        }),
     })
 }
 

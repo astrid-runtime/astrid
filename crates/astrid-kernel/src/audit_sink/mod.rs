@@ -17,12 +17,14 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use astrid_audit::{AuditAction, AuditLog, AuditOutcome, AuthorizationProof};
-use astrid_capsule::{HostAuditEvent, HostAuditOutcome, HostAuditSink};
+use astrid_audit::{AuditAction, AuditLog, AuditOutcome, AuthorizationProof, CapsuleActor};
+use astrid_capsule::{HostAuditActor, HostAuditEvent, HostAuditOutcome, HostAuditSink};
 use astrid_config::types::AuditConfig;
 use astrid_core::{PrincipalId, SessionId};
 use astrid_crypto::ContentHash;
 use tracing::warn;
+
+mod coverage;
 
 /// Authorization reason stamped on an allowed or failed manifest-gated host
 /// call — the capsule's declared manifest allowlist is what authorized the
@@ -106,11 +108,14 @@ impl AuditWork {
                     self.session_id, self.principal, self.action
                 );
             }
+            // Fold per capsule as well, so a folded row never attributes one
+            // capsule's calls to another.
             return format!(
-                "{kind}|{}|{:?}|{}",
+                "{kind}|{}|{:?}|{}|{:?}",
                 outcome_class(&self.outcome),
                 self.session_id,
-                self.principal
+                self.principal,
+                coverage::action_actor(&self.action)
             );
         }
         format!(
@@ -553,6 +558,10 @@ pub struct KernelAuditSink {
     /// Bounded writer queue. Producers never block on a full queue.
     queue: Arc<AuditQueue>,
     policy: HostAuditPolicy,
+    /// Capsule code identity stamped on every entry this handle writes.
+    /// `None` on the kernel's own handle; set on the per-capsule handles the
+    /// engine obtains through [`HostAuditSink::attributed`].
+    actor: Option<Arc<CapsuleActor>>,
 }
 
 impl KernelAuditSink {
@@ -575,6 +584,7 @@ impl KernelAuditSink {
             session_id: session_id.into(),
             queue: AuditQueue::new(audit_log, policy),
             policy,
+            actor: None,
         }
     }
 
@@ -589,13 +599,13 @@ impl KernelAuditSink {
         self.queue.shutdown();
     }
 
-    /// Map a neutral host event onto the internal audit action.
+    /// Map a neutral host event onto the internal audit action, stamped with
+    /// `actor`.
     ///
-    /// `FileWrite` content hashing is not captured at this per-action seam
-    /// yet (the host fn reports the path, not the written bytes); a
-    /// zero hash is recorded as a documented placeholder pending a
-    /// content-addressed follow-up.
-    fn to_action(event: HostAuditEvent<'_>) -> AuditAction {
+    /// `FileWrite` carries the BLAKE3 of the written bytes when the host call
+    /// wrote content; a directory creation or a write denied before content
+    /// was accepted records the zero hash.
+    fn to_action(event: HostAuditEvent<'_>, actor: Option<CapsuleActor>) -> AuditAction {
         // Every guest-controlled string is bounded here (see
         // `truncate_guest_str` / `MAX_AUDIT_STR_BYTES`) before it is signed and
         // persisted, closing the disk/CPU amplification path.
@@ -603,31 +613,30 @@ impl KernelAuditSink {
             HostAuditEvent::FileRead { path } | HostAuditEvent::FileProbe { path } => {
                 AuditAction::FileRead {
                     path: truncate_guest_str(path),
-                    actor: None,
+                    actor,
                 }
             },
-            HostAuditEvent::FileWrite { path } => AuditAction::FileWrite {
+            HostAuditEvent::FileWrite { path, content_hash } => AuditAction::FileWrite {
                 path: truncate_guest_str(path),
-                // Content hash not captured at the per-action seam yet.
-                content_hash: ContentHash::zero(),
-                actor: None,
+                content_hash: content_hash.unwrap_or_else(ContentHash::zero),
+                actor,
             },
             HostAuditEvent::FileDelete { path } => AuditAction::FileDelete {
                 path: truncate_guest_str(path),
-                actor: None,
+                actor,
             },
             HostAuditEvent::NetConnect { host, port } => AuditAction::NetConnect {
                 host: truncate_guest_str(host),
                 port,
-                actor: None,
+                actor,
             },
             HostAuditEvent::NetBind { addr } => AuditAction::NetBind {
                 addr: truncate_guest_str(addr),
-                actor: None,
+                actor,
             },
             HostAuditEvent::ProcessSpawn { command } => AuditAction::ProcessSpawn {
                 command: truncate_guest_str(command),
-                actor: None,
+                actor,
             },
             HostAuditEvent::NetAccept {
                 local_addr,
@@ -635,7 +644,7 @@ impl KernelAuditSink {
             } => AuditAction::NetAccept {
                 local_addr: truncate_guest_str(local_addr),
                 peer_addr: truncate_guest_str(peer_addr),
-                actor: None,
+                actor,
             },
         }
     }
@@ -705,10 +714,19 @@ impl HostAuditSink for KernelAuditSink {
             self.queue.omit_path_probe();
             return;
         }
-        let action = Self::to_action(event);
+        let action = Self::to_action(event, self.actor.as_deref().cloned());
         self.record_action(principal, action, outcome);
+    }
+
+    fn attributed(&self, actor: HostAuditActor) -> Option<Arc<dyn HostAuditSink>> {
+        Some(Arc::new(Self {
+            actor: Some(Arc::new(coverage::to_capsule_actor(&actor))),
+            ..self.clone()
+        }))
     }
 }
 
+#[cfg(test)]
+mod attribution_tests;
 #[cfg(test)]
 mod tests;

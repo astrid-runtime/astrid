@@ -22,6 +22,10 @@
 //! over the event bus: the bus is broadcast-with-lag-drop, and a droppable
 //! record is not a provable one. The chain append remains the system of record.
 
+mod coverage;
+
+pub use coverage::{HostAuditActor, attribute_sink};
+
 /// A sensitive host-call action being reported to the audit sink.
 ///
 /// Variants borrow their string payloads from the host fn's own stack —
@@ -48,6 +52,9 @@ pub enum HostAuditEvent<'a> {
     FileWrite {
         /// The path that was written.
         path: &'a str,
+        /// BLAKE3 of the bytes written. `None` for a directory creation or a
+        /// write denied before any content was accepted.
+        content_hash: Option<astrid_crypto::ContentHash>,
     },
     /// A filesystem removal (unlink or directory removal).
     FileDelete {
@@ -123,4 +130,15 @@ pub trait HostAuditSink: Send + Sync {
         event: HostAuditEvent<'_>,
         outcome: HostAuditOutcome<'_>,
     );
+
+    /// Return a sink that stamps `actor` on every record it writes, or `None`
+    /// when this implementation does not attribute records.
+    ///
+    /// The engine calls this once per capsule load with the identity it
+    /// verified, and hands the returned sink to that capsule's host state, so
+    /// the attribution is host-owned and a guest cannot choose it.
+    fn attributed(&self, actor: HostAuditActor) -> Option<std::sync::Arc<dyn HostAuditSink>> {
+        let _ = actor;
+        None
+    }
 }

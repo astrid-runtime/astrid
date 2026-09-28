@@ -19,7 +19,7 @@ use crate::engine::wasm::test_fixtures::minimal_host_state;
 enum CapturedEvent {
     FileRead(String),
     FileProbe(String),
-    FileWrite(String),
+    FileWrite(String, Option<astrid_crypto::ContentHash>),
     FileDelete(String),
     NetConnect(String, u16),
     NetBind(String),
@@ -32,7 +32,9 @@ impl CapturedEvent {
         match event {
             HostAuditEvent::FileRead { path } => Self::FileRead(path.to_owned()),
             HostAuditEvent::FileProbe { path } => Self::FileProbe(path.to_owned()),
-            HostAuditEvent::FileWrite { path } => Self::FileWrite(path.to_owned()),
+            HostAuditEvent::FileWrite { path, content_hash } => {
+                Self::FileWrite(path.to_owned(), content_hash)
+            },
             HostAuditEvent::FileDelete { path } => Self::FileDelete(path.to_owned()),
             HostAuditEvent::NetConnect { host, port } => Self::NetConnect(host.to_owned(), port),
             HostAuditEvent::NetBind { addr } => Self::NetBind(addr.to_owned()),
@@ -123,7 +125,7 @@ async fn audit_fs_reports_read_write_delete() {
         records[1],
         (
             alice.clone(),
-            CapturedEvent::FileWrite("/w/w".into()),
+            CapturedEvent::FileWrite("/w/w".into(), None),
             CapturedOutcome::Allowed
         )
     );
@@ -389,4 +391,65 @@ async fn connect_tcp_denial_lands_on_the_chain() {
         "gate-denied connect must report Denied, got {:?}",
         records[0].2
     );
+}
+
+/// `write-file` reports the BLAKE3 of the bytes it wrote, so the signed
+/// `FileWrite` entry commits to the content and not only the path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_file_reports_the_content_hash() {
+    use crate::engine::wasm::bindings::astrid::fs::host::Host as _;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    let (mut state, sink) = state_with_sink(tokio::runtime::Handle::current());
+    let vfs = astrid_vfs::HostVfs::new();
+    let handle = astrid_capabilities::DirHandle::new();
+    vfs.register_dir(handle.clone(), root.clone())
+        .await
+        .expect("register workspace");
+    let vfs: Arc<dyn astrid_vfs::Vfs> = Arc::new(vfs);
+    state.workspace = Some(crate::engine::wasm::host_state::PrincipalMount {
+        location: crate::engine::wasm::host_state::PrincipalMountLocation::Native(root.clone()),
+        vfs: Arc::clone(&vfs),
+        handle: handle.clone(),
+    });
+    state.vfs = vfs;
+    state.vfs_root_handle = handle;
+    state.workspace_root.clone_from(&root);
+    state.hosted_workspace_root.clone_from(&root);
+    state.invocation_profile_authorized = true;
+
+    let result = tokio::task::spawn_blocking(move || {
+        let result = state.write_file("note.txt".into(), b"hello".to_vec());
+        (state, result)
+    })
+    .await
+    .expect("join");
+    result.1.expect("write succeeds");
+
+    let records = sink.snapshot();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let CapturedEvent::FileWrite(path, content_hash) = &records[0].1 else {
+        panic!("unexpected event {:?}", records[0].1);
+    };
+    assert!(path.ends_with("note.txt"), "{path}");
+    assert_eq!(
+        *content_hash,
+        Some(astrid_crypto::ContentHash::hash(b"hello"))
+    );
+}
+
+/// A sink without attribution support is handed back unchanged, so engines
+/// can bind every sink the same way.
+#[test]
+fn attribute_sink_falls_back_to_the_unattributed_sink() {
+    let sink: Arc<dyn HostAuditSink> = Arc::new(RecordingSink::default());
+    let bound = crate::audit_sink::attribute_sink(
+        &sink,
+        crate::audit_sink::HostAuditActor {
+            capsule_id: "fetcher".into(),
+            wasm_hash: None,
+        },
+    );
+    assert!(Arc::ptr_eq(&sink, &bound));
 }

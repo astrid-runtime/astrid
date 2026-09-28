@@ -30,7 +30,10 @@ fn record_event_kinds(sink: &KernelAuditSink, principal: &PrincipalId) {
     );
     sink.record(
         principal,
-        HostAuditEvent::FileWrite { path: "/w/w" },
+        HostAuditEvent::FileWrite {
+            path: "/w/w",
+            content_hash: None,
+        },
         HostAuditOutcome::Failed("disk full"),
     );
     sink.record(

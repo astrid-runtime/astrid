@@ -50,6 +50,18 @@ pub(crate) fn audit_fs<T, E: std::fmt::Debug>(
     path: &str,
     result: &Result<T, E>,
 ) {
+    audit_fs_content(state, op, path, None, result);
+}
+
+/// [`audit_fs`] for a write that carried content: `content_hash` is the BLAKE3
+/// of the bytes written and is recorded on the `FileWrite` entry.
+pub(crate) fn audit_fs_content<T, E: std::fmt::Debug>(
+    state: &HostState,
+    op: &str,
+    path: &str,
+    content_hash: Option<astrid_crypto::ContentHash>,
+    result: &Result<T, E>,
+) {
     let capsule_id = state.capsule_id.as_str();
     let principal = state.effective_principal();
     match result {
@@ -75,7 +87,7 @@ pub(crate) fn audit_fs<T, E: std::fmt::Debug>(
     let Some(sink) = state.audit_sink.as_ref() else {
         return;
     };
-    let Some(event) = fs_event_for_op(op, path) else {
+    let Some(event) = fs_event_for_op(op, path, content_hash) else {
         return;
     };
     let err_buf;
@@ -92,7 +104,11 @@ pub(crate) fn audit_fs<T, E: std::fmt::Debug>(
 /// Map a path-based fs op string to its typed audit event class. Returns
 /// `None` for ops with no clear fs-effect mapping (handle-based ops, no-op
 /// stubs) so the sink is skipped rather than fed a guessed variant.
-fn fs_event_for_op<'a>(op: &str, path: &'a str) -> Option<HostAuditEvent<'a>> {
+fn fs_event_for_op<'a>(
+    op: &str,
+    path: &'a str,
+    content_hash: Option<astrid_crypto::ContentHash>,
+) -> Option<HostAuditEvent<'a>> {
     // `op` is a fully-qualified WIT path (`astrid:fs/host.read-file`) or a
     // bare verb in tests (`read-file`); match on the trailing verb so both
     // forms classify identically.
@@ -103,7 +119,7 @@ fn fs_event_for_op<'a>(op: &str, path: &'a str) -> Option<HostAuditEvent<'a>> {
             Some(HostAuditEvent::FileProbe { path })
         },
         "write-file" | "fs-mkdir" | "mkdir" | "fs-mkdir-all" => {
-            Some(HostAuditEvent::FileWrite { path })
+            Some(HostAuditEvent::FileWrite { path, content_hash })
         },
         "fs-unlink" | "unlink" | "remove" | "remove-dir" => {
             Some(HostAuditEvent::FileDelete { path })
@@ -283,7 +299,10 @@ fn gate_write_path(
         if let Err(reason) = check {
             let path = gate_path;
             let event = match kind {
-                WriteKind::Write => HostAuditEvent::FileWrite { path },
+                WriteKind::Write => HostAuditEvent::FileWrite {
+                    path,
+                    content_hash: None,
+                },
                 WriteKind::Delete => HostAuditEvent::FileDelete { path },
             };
             record_fs_denied(state, event, &reason);
@@ -632,10 +651,11 @@ impl fs::Host for HostState {
                 close_result
             })
             .map_err(map_vfs_err);
-        audit_fs(
+        audit_fs_content(
             self,
             "astrid:fs/host.write-file",
             &resolved.gate_path,
+            Some(astrid_crypto::ContentHash::hash(&content)),
             &result,
         );
         result
