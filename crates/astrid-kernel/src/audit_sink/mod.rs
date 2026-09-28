@@ -570,6 +570,9 @@ pub struct KernelAuditSink {
     /// Per-principal HTTP request numbers for this kernel run, shared by
     /// every handle so the sequence spans all capsules of a principal.
     http_sequences: Arc<Mutex<HashMap<PrincipalId, u64>>>,
+    /// Identifier of this kernel run, recorded with every HTTP entry. The
+    /// sequences restart with each run, so a verifier checks for gaps per run.
+    run_id: Arc<str>,
 }
 
 impl KernelAuditSink {
@@ -595,6 +598,7 @@ impl KernelAuditSink {
             actor: None,
             audit_log,
             http_sequences: Arc::default(),
+            run_id: Arc::from(uuid::Uuid::new_v4().to_string()),
         }
     }
 

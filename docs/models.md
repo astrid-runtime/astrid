@@ -285,9 +285,10 @@ BLAKE3 hashes. The `http_response` entry records the status, provider request
 ids such as `x-request-id`, and a BLAKE3 hash of the response body as the host
 read it. The log never stores request or response content.
 
-`sequence` is numbered per principal within one daemon run, and every request
-takes a number, including requests the airlock refuses. A request that was sent
-without appearing in the log therefore leaves a gap in the numbering.
+`sequence` is numbered per principal within one daemon run, identified by the
+entry's `run_id`, and every request takes a number, including requests the
+airlock refuses. A request that was sent without appearing in the log therefore
+leaves a gap in the numbering of its run.
 
 Credentials are redacted before hashing. The redacted values are:
 

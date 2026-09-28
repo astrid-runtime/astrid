@@ -87,6 +87,7 @@ async fn precommit_is_durable_on_return_and_numbered_per_principal() {
     assert_eq!(entry.principal.as_ref(), Some(&alice));
     let AuditAction::HttpRequest {
         sequence,
+        ref run_id,
         ref method,
         ref host,
         port,
@@ -102,6 +103,7 @@ async fn precommit_is_durable_on_return_and_numbered_per_principal() {
         (1, "POST", "api.example.com", 443, 2)
     );
     assert_eq!(actor.as_ref().map(|a| a.capsule_id.as_str()), Some("llm"));
+    assert!(!run_id.is_empty(), "the kernel run is recorded");
     assert!(matches!(entry.outcome, AuditOutcome::Success { .. }));
     kernel_sink.shutdown();
 }
@@ -144,6 +146,18 @@ async fn denial_takes_a_number_and_completion_links_to_its_request() {
     kernel_sink.shutdown();
 
     let entries = log.get_session_entries(&session).await.expect("entries");
+    let run_ids: std::collections::HashSet<_> = entries
+        .iter()
+        .filter_map(|e| match &e.action {
+            AuditAction::HttpRequest { run_id, .. } | AuditAction::HttpResponse { run_id, .. } => {
+                Some(run_id.clone())
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(run_ids.len(), 1, "one kernel run: {run_ids:?}");
+    assert!(!run_ids.iter().next().expect("run id").is_empty());
+
     let denied = entries
         .iter()
         .find_map(|e| match (&e.action, &e.authorization) {

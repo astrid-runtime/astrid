@@ -206,6 +206,7 @@ fn coverage_fields_are_signed() {
         SessionId::new(),
         AuditAction::HttpRequest {
             sequence: 1,
+            run_id: "run".to_string(),
             method: "POST".to_string(),
             host: "api.example.com".to_string(),
             port: 443,
@@ -241,6 +242,7 @@ fn new_actions_round_trip_and_describe() {
     let actions = [
         AuditAction::HttpResponse {
             sequence: 7,
+            run_id: "run".to_string(),
             request_entry_id: Some(AuditEntryId::new()),
             status: Some(200),
             body_hash: Some(ContentHash::hash(b"resp")),

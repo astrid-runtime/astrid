@@ -574,10 +574,13 @@ pub enum AuditAction {
     /// redacted. The completion is an [`HttpResponse`](Self::HttpResponse)
     /// entry with the same `sequence`.
     HttpRequest {
-        /// Kernel-assigned request number, per principal and kernel session,
-        /// starting at 1. Every `HttpRequest` entry takes the next number, so
-        /// a gap means an entry is missing.
+        /// Kernel-assigned request number, per principal and kernel run
+        /// (`run_id`), starting at 1. Every `HttpRequest` entry takes the next
+        /// number, so a gap within a run means an entry is missing.
         sequence: u64,
+        /// Identifier of the kernel run that assigned `sequence`. A daemon
+        /// restart starts a new run whose numbering restarts at 1.
+        run_id: String,
         /// HTTP method.
         method: String,
         /// Destination host from the request URL.
@@ -612,6 +615,8 @@ pub enum AuditAction {
     HttpResponse {
         /// `sequence` of the matching [`HttpRequest`](Self::HttpRequest).
         sequence: u64,
+        /// `run_id` of the matching [`HttpRequest`](Self::HttpRequest).
+        run_id: String,
         /// Entry id of the matching [`HttpRequest`](Self::HttpRequest), when
         /// its append succeeded.
         #[serde(default, skip_serializing_if = "Option::is_none")]

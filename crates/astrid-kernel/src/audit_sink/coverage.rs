@@ -162,13 +162,15 @@ pub(super) fn approval_decision_action(
     }
 }
 
-/// Map an HTTP pre-commit. The sink stamps the sequence afterwards.
+/// Map an HTTP pre-commit. The sink stamps the sequence and run id
+/// afterwards.
 pub(super) fn http_request_action(
     request: &HostHttpRequest<'_>,
     actor: Option<CapsuleActor>,
 ) -> AuditAction {
     AuditAction::HttpRequest {
         sequence: 0,
+        run_id: String::new(),
         method: truncate_to(request.method, MAX_NAME_BYTES),
         host: truncate_guest_str(request.host),
         port: request.port,
@@ -194,6 +196,7 @@ pub(super) fn http_response_action(
 ) -> AuditAction {
     AuditAction::HttpResponse {
         sequence: response.request.sequence.unwrap_or(0),
+        run_id: String::new(),
         request_entry_id: response.request.entry_id.clone(),
         status: response.status,
         body_hash: response.body_hash,
@@ -224,19 +227,29 @@ impl KernelAuditSink {
         *next
     }
 
-    /// Stamp the next sequence number on an HTTP request action. Every
-    /// `HttpRequest` entry — committed or denied — takes one, so a gap in a
-    /// principal's sequence means an entry is missing.
+    /// Stamp this kernel run's id on HTTP actions, and the next sequence
+    /// number on an HTTP request. Every `HttpRequest` entry — committed or
+    /// denied — takes one, so a gap in a principal's sequence within a run
+    /// means an entry is missing.
     pub(super) fn stamp_http_sequence(
         &self,
         principal: &PrincipalId,
         action: &mut AuditAction,
     ) -> Option<u64> {
-        if let AuditAction::HttpRequest { sequence, .. } = action {
-            *sequence = self.next_http_sequence(principal);
-            return Some(*sequence);
+        match action {
+            AuditAction::HttpRequest {
+                sequence, run_id, ..
+            } => {
+                *run_id = self.run_id.to_string();
+                *sequence = self.next_http_sequence(principal);
+                Some(*sequence)
+            },
+            AuditAction::HttpResponse { run_id, .. } => {
+                *run_id = self.run_id.to_string();
+                None
+            },
+            _ => None,
         }
-        None
     }
 
     /// Append one allowed record and wait for the durable append.
