@@ -100,6 +100,17 @@ pub fn enforce_restrictions(
         "security.capsule_local_egress",
     );
 
+    // audit.entry_format: operator-only. Enabling audit format v2 is one-way
+    // for a node (it creates the audit key registry and closes v1), so an
+    // untrusted project config must not be able to switch it on.
+    block_workspace_override(
+        merged,
+        baseline,
+        workspace_layer,
+        &["audit", "entry_format"],
+        "audit.entry_format",
+    );
+
     // http: operator-only host HTTP ceilings (timeouts, redirect/stream caps,
     // buffered-body limit). These are widening controls — a workspace/project
     // layer raising any of them would let untrusted project config relax the

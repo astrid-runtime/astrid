@@ -205,6 +205,13 @@ host_queue_capacity = 4096
 # Allowed stat/exists/readdir are not signed FileRead rows. Denied path
 # probes still persist. Set true to record every allowed probe.
 host_path_probes = false
+# Signed layout of new audit entries: "v1" (default) or "v2". v2 signs a
+# canonical CBOR body covering every field with keys/audit.key and verifies
+# entries against a cross-signed key registry. Enabling v2 is one-way for a
+# node: existing v1 entries stay as they are, and once the registry exists
+# the daemon keeps writing v2 even if this is set back to "v1". Only the
+# operator's global config can set it; a workspace config cannot.
+entry_format = "v1"
 
 # ============================================================================
 # Cryptographic Keys

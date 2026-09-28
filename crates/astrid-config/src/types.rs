@@ -401,6 +401,10 @@ impl Default for ServerSection {
 // AuditConfig
 // ---------------------------------------------------------------------------
 
+#[path = "audit_format.rs"]
+mod audit_format;
+pub use audit_format::AuditEntryFormat;
+
 /// Audit log storage settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -425,6 +429,8 @@ pub struct AuditConfig {
     /// events, and aos-fs issues thousands per second. Denied probes still
     /// persist as FileRead-Denied.
     pub host_path_probes: bool,
+    /// Signed layout of new audit entries. See [`AuditEntryFormat`].
+    pub entry_format: AuditEntryFormat,
 }
 
 impl Default for AuditConfig {
@@ -436,6 +442,7 @@ impl Default for AuditConfig {
             host_batch_max: 128,
             host_queue_capacity: 4096,
             host_path_probes: false,
+            entry_format: AuditEntryFormat::V1,
         }
     }
 }

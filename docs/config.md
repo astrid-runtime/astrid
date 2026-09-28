@@ -109,7 +109,39 @@ Configure audit log storage.
 [audit]
 # path = "~/.local/share/astrid/audit.db"  # Optional: omit for in-memory only
 max_size_mb = 100
+entry_format = "v1"  # "v1" (default) or "v2"
 ```
+
+`entry_format` selects the signed layout of new audit entries.
+
+- `v1` keeps the original layout: signed by the runtime key and verified
+  against the key embedded in each entry.
+- `v2` signs a canonical CBOR body that covers every field. The body
+  includes a per-chain sequence number, nanosecond time, the full outcome,
+  and salted commitments to text fields. v2 entries are signed by a separate
+  audit key, `keys/audit.key`, and verified against a cross-signed key
+  registry kept in the audit store. The byte-level format is specified in the
+  `astrid_audit::entry_v2` crate documentation.
+
+When the daemon first boots with `v2`, it:
+
+1. creates `keys/audit.key`;
+2. writes the key registry, which binds the audit key and records the runtime
+   key as the capability, build and v1-audit key.
+
+Existing v1 entries are kept unchanged. The next entry of each chain starts
+a v2 chain linked to the last v1 entry.
+
+Enabling v2 is one-way for a node. Once the registry exists:
+
+- the daemon keeps writing v2 even if `entry_format` is set back to `v1`,
+  because a v1 entry after a v2 entry would reopen a chain under the weaker
+  format;
+- `keys/audit.key` must be kept: the daemon refuses to boot if it is missing
+  or replaced, since only the registered key can authorize its successor.
+
+Only the operator's own configuration can set `entry_format`. A workspace
+`.astrid/config.toml` cannot.
 
 ## Keys
 

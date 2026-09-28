@@ -11,6 +11,9 @@
 //! is to instantiate `astrid_events::EventBus`, load `.capsule` files into
 //! the Extism sandbox, and route IPC bytes between them.
 
+/// Audit entry format selection and the audit signing key.
+#[cfg(unix)]
+mod audit_keys;
 #[cfg(all(test, unix))]
 #[path = "audit_retirement_tests.rs"]
 mod audit_retirement_tests;
@@ -1243,6 +1246,30 @@ impl Kernel {
             #[cfg(not(target_family = "wasm"))]
             if let Some(store) = principal_store.as_ref() {
                 runtime_tree_admit::admit(&home, store).await?;
+            }
+
+            // Audit entry format, read from the admitted home like other boot
+            // policy and applied before anything can append. Nothing appends
+            // during the migrate-only window above, so every new entry is in
+            // the selected format. A config that fails to load here is
+            // reported by the daemon; v1 (the default) applies meanwhile, and
+            // a store already on v2 stays on v2 regardless.
+            #[cfg(unix)]
+            {
+                let entry_format = astrid_config::Config::load_with_layout(
+                    Some(&workspace_root),
+                    &workspace_layout,
+                )
+                .map(|resolved| resolved.config.audit.entry_format)
+                .unwrap_or_default();
+                audit_keys::apply_entry_format(
+                    &audit_log,
+                    &home.keys_dir(),
+                    entry_format,
+                    &runtime_key,
+                    Arc::new(principal_directory.clone()),
+                )
+                .await?;
             }
 
             // The released profile, when present, is now represented by the
