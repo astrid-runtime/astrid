@@ -52,6 +52,9 @@ mod catalog_load_tests;
 mod content_source;
 pub mod host;
 pub mod host_state;
+#[cfg(test)]
+#[path = "lifecycle_audit_tests.rs"]
+mod lifecycle_audit_tests;
 pub mod limits;
 mod pool;
 mod storage_vfs;
@@ -1702,7 +1705,10 @@ struct CompiledWasmArtifact {
     _epoch_ticker: EpochTickerGuard,
 }
 
-const COMPILED_ENGINE_ABI: &str = "astrid-wasmtime48-component-abi-v1";
+/// Identity of the wasmtime engine configuration and linked host ABI that
+/// compiled capsule code is built for. Part of the compiled-code cache key,
+/// and recorded as the engine profile of loaded capsules.
+pub const COMPILED_ENGINE_ABI: &str = "astrid-wasmtime48-component-abi-v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CompiledArtifactKey(String);

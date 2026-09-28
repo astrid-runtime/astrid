@@ -221,6 +221,7 @@ async fn install_and_activate(
         }
         return Err(error);
     }
+    crate::capsule_audit::record_capsule_installed(kernel, target, &output).await;
     Ok(output)
 }
 
@@ -241,6 +242,9 @@ fn daemon_install_options(
         provenance_distro: provenance.and_then(|value| value.distro.clone()),
         provenance_source_digest: provenance.and_then(|value| value.source_digest.clone()),
         expected_package_generation,
+        // Install and upgrade hooks record their host calls (file writes,
+        // network, HTTP) on the signed audit log like a running capsule.
+        audit_sink: Some(Arc::new(kernel.audit_sink.as_ref().clone())),
     }
 }
 

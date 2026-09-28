@@ -98,24 +98,27 @@ async fn append(
         reason: reason.to_owned(),
     };
     let session = kernel.session_id.clone();
+    // Boxed so the admin handlers that await this do not carry the append's
+    // state machine inline.
     let result = match principal {
         Some(principal) => {
-            kernel
-                .audit_log
-                .append_with_principal(
-                    session,
-                    principal.clone(),
-                    action,
-                    authorization,
-                    AuditOutcome::success(),
-                )
-                .await
+            Box::pin(kernel.audit_log.append_with_principal(
+                session,
+                principal.clone(),
+                action,
+                authorization,
+                AuditOutcome::success(),
+            ))
+            .await
         },
         None => {
-            kernel
-                .audit_log
-                .append(session, action, authorization, AuditOutcome::success())
-                .await
+            Box::pin(kernel.audit_log.append(
+                session,
+                action,
+                authorization,
+                AuditOutcome::success(),
+            ))
+            .await
         },
     };
     if let Err(error) = result {
