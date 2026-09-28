@@ -439,7 +439,7 @@ impl approval::Host for HostState {
         let request_id = Uuid::new_v4().to_string();
         let response_topic = Topic::approval_response(&request_id);
         // Durable before the prompt is published.
-        audit.requested(self, &request_id);
+        audit.requested(&request_id);
 
         // Subscribe BEFORE publishing to prevent a race.
         let mut receiver = event_bus.subscribe_topic(response_topic.as_str());

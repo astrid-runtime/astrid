@@ -190,7 +190,27 @@ enum Recorded {
         complete: bool,
         request_ids: Vec<(String, String)>,
         failed: bool,
+        /// Written through the durable `commit` path, not the queue.
+        durable: bool,
     },
+}
+
+fn response_record(
+    response: &crate::audit_sink::HostHttpResponse<'_>,
+    outcome: HostAuditOutcome<'_>,
+    durable: bool,
+) -> Recorded {
+    Recorded::Response {
+        sequence: response.request.sequence,
+        entry_id: response.request.entry_id.clone(),
+        status: response.status,
+        body_hash: response.body_hash,
+        body_len: response.body_len,
+        complete: response.complete,
+        request_ids: response.provider_request_ids.to_vec(),
+        failed: !matches!(outcome, HostAuditOutcome::Allowed),
+        durable,
+    }
 }
 
 /// Test sink: numbers pre-commits, holds each pre-commit open for a while
@@ -221,15 +241,8 @@ impl HostAuditSink for HttpSink {
                     reason: reason.to_owned(),
                 }
             },
-            (HostAuditEvent::HttpResponse(response), outcome) => Recorded::Response {
-                sequence: response.request.sequence,
-                entry_id: response.request.entry_id.clone(),
-                status: response.status,
-                body_hash: response.body_hash,
-                body_len: response.body_len,
-                complete: response.complete,
-                request_ids: response.provider_request_ids.to_vec(),
-                failed: !matches!(outcome, HostAuditOutcome::Allowed),
+            (HostAuditEvent::HttpResponse(response), outcome) => {
+                response_record(&response, outcome, false)
             },
             _ => return,
         };
@@ -240,7 +253,15 @@ impl HostAuditSink for HttpSink {
         &'a self,
         _principal: &'a PrincipalId,
         event: HostAuditEvent<'a>,
+        outcome: HostAuditOutcome<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HostAuditReceipt> + Send + 'a>> {
+        if let HostAuditEvent::HttpResponse(response) = event {
+            self.records
+                .lock()
+                .unwrap()
+                .push(response_record(&response, outcome, true));
+            return Box::pin(std::future::ready(HostAuditReceipt::default()));
+        }
         let HostAuditEvent::HttpRequest(request) = event else {
             return Box::pin(std::future::ready(HostAuditReceipt::default()));
         };
@@ -382,10 +403,12 @@ async fn buffered_request_is_precommitted_then_completed() {
         complete,
         ref request_ids,
         failed,
+        durable,
     } = records[1]
     else {
         panic!("second record must be the completion: {records:?}");
     };
+    assert!(durable, "completions use the durable path");
     assert_eq!(response_sequence, Some(sequence));
     assert!(entry_id.is_some());
     assert_eq!(status, Some(200));
@@ -440,6 +463,7 @@ async fn streamed_response_is_hashed_as_it_is_read() {
                 body_len,
                 complete,
                 request_ids,
+                durable: true,
                 ..
             } => Some((*body_hash, *body_len, *complete, request_ids.clone())),
             _ => None,
@@ -486,20 +510,28 @@ async fn stream_dropped_early_is_completed_incomplete() {
     super::backend::stream_drop(&mut state, stream.rep());
     let _ = server.await;
 
-    let records = sink.records();
-    let completions: Vec<_> = records
-        .iter()
-        .filter_map(|r| match r {
-            Recorded::Response {
-                body_len,
-                complete,
-                failed,
-                ..
-            } => Some((*body_len, *complete, *failed)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(completions, vec![(0, false, false)]);
+    // A drop is synchronous, so the durable append runs as a task.
+    let completions = loop {
+        let completions: Vec<_> = sink
+            .records()
+            .iter()
+            .filter_map(|r| match r {
+                Recorded::Response {
+                    body_len,
+                    complete,
+                    failed,
+                    durable,
+                    ..
+                } => Some((*body_len, *complete, *failed, *durable)),
+                _ => None,
+            })
+            .collect();
+        if !completions.is_empty() {
+            break completions;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(completions, vec![(0, false, false, true)]);
 }
 
 // ── Failures and denials ──────────────────────────────────────────────────
@@ -535,6 +567,7 @@ async fn transport_failure_completes_the_exchange() {
                 body_hash: None,
                 complete: false,
                 failed: true,
+                durable: true,
                 ..
             }
         ),

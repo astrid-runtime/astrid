@@ -252,7 +252,7 @@ impl KernelAuditSink {
         }
     }
 
-    /// Append one allowed record and wait for the durable append.
+    /// Append one record and wait for the durable append.
     ///
     /// A failed append does not fail the host call: it is logged and reported
     /// as a receipt without an entry id. The sequence number stays consumed,
@@ -261,10 +261,11 @@ impl KernelAuditSink {
         &self,
         principal: &PrincipalId,
         event: HostAuditEvent<'_>,
+        outcome: HostAuditOutcome<'_>,
     ) -> HostAuditReceipt {
         let mut action = Self::to_action(event, self.actor.as_deref().cloned());
         let sequence = self.stamp_http_sequence(principal, &mut action);
-        let (authorization, outcome) = Self::to_proof_outcome(HostAuditOutcome::Allowed);
+        let (authorization, outcome) = Self::to_proof_outcome(outcome);
         let authorization = self::authorization(&action, authorization);
         let result = self
             .audit_log
@@ -283,7 +284,7 @@ impl KernelAuditSink {
                     security_event = true,
                     %principal,
                     %error,
-                    "Failed to append pre-commit audit entry; continuing"
+                    "Failed to append durable audit entry; continuing"
                 );
                 None
             },

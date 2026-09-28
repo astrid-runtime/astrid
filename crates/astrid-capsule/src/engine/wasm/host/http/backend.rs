@@ -350,7 +350,9 @@ impl HostState {
         let response = match sent {
             Ok(response) => response,
             Err(error) => {
-                exchange.finish(false, HostAuditOutcome::Failed(&error_text(&error)));
+                exchange
+                    .finish(false, HostAuditOutcome::Failed(&error_text(&error)))
+                    .await;
                 return Err(error);
             },
         };
@@ -436,12 +438,13 @@ impl HostState {
                     Ok(None) => return Ok((wire, redirect_count, current_url)),
                     Err(error) => {
                         wire.exchange
-                            .finish(false, HostAuditOutcome::Failed(&error_text(&error)));
+                            .finish(false, HostAuditOutcome::Failed(&error_text(&error)))
+                            .await;
                         return Err(error);
                     },
                 };
             // The redirect body is discarded unread; this hop is complete.
-            wire.exchange.finish(false, HostAuditOutcome::Allowed);
+            wire.exchange.finish(false, HostAuditOutcome::Allowed).await;
             // Strip credentials on a cross-origin hop, including every header
             // that would carry a host-injected secret.
             if !same_origin(&current_url, &next_url) {
@@ -555,17 +558,21 @@ impl HostState {
         exchange.begin_body();
         exchange.digest(&body);
         if let Some(error) = read_error {
-            exchange.finish(false, HostAuditOutcome::Failed(&error_text(&error)));
+            exchange
+                .finish(false, HostAuditOutcome::Failed(&error_text(&error)))
+                .await;
             return Err(error);
         }
 
         if let Some(integrity) = &opts.integrity
             && let Err(error) = verify_integrity(integrity, &body)
         {
-            exchange.finish(true, HostAuditOutcome::Failed(&error_text(&error)));
+            exchange
+                .finish(true, HostAuditOutcome::Failed(&error_text(&error)))
+                .await;
             return Err(error);
         }
-        exchange.finish(true, HostAuditOutcome::Allowed);
+        exchange.finish(true, HostAuditOutcome::Allowed).await;
 
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         // wire-bytes is best-effort: content-length when the server sent it,
@@ -760,17 +767,13 @@ pub(super) async fn stream_read_chunk(
     // guest may read again.
     let bytes_result: Result<Vec<u8>, ErrorCode> = match result {
         None => {
-            with_exchange(&audit, |exchange| {
-                exchange.finish(false, HostAuditOutcome::Failed("cancelled"));
-            });
+            complete_stream(&audit, false, HostAuditOutcome::Failed("cancelled")).await;
             Ok(Vec::new())
         },
         Some(Err(_)) => Err(ErrorCode::Timeout),
         Some(Ok(Err(e))) => {
             let error = map_reqwest_err(&e);
-            with_exchange(&audit, |exchange| {
-                exchange.finish(false, HostAuditOutcome::Failed(&error_text(&error)));
-            });
+            complete_stream(&audit, false, HostAuditOutcome::Failed(&error_text(&error))).await;
             Err(error)
         },
         Some(Ok(Ok(Some(bytes)))) => {
@@ -778,9 +781,7 @@ pub(super) async fn stream_read_chunk(
             Ok(bytes.to_vec())
         },
         Some(Ok(Ok(None))) => {
-            with_exchange(&audit, |exchange| {
-                exchange.finish(true, HostAuditOutcome::Allowed);
-            });
+            complete_stream(&audit, true, HostAuditOutcome::Allowed).await;
             Ok(Vec::new())
         },
     };
@@ -823,8 +824,24 @@ fn with_exchange(audit: &std::sync::Mutex<HttpExchange>, f: impl FnOnce(&mut Htt
 /// terminator), so the completion is successful but marked incomplete.
 fn close_stream_exchange(stream: &ActiveHttpStream) {
     with_exchange(&stream.audit, |exchange| {
-        exchange.finish(false, HostAuditOutcome::Allowed);
+        exchange.finish_detached(false, HostAuditOutcome::Allowed);
     });
+}
+
+/// Complete a stream's audit exchange and wait until the record is durable.
+/// The lock is held only to take the record.
+async fn complete_stream(
+    audit: &std::sync::Mutex<HttpExchange>,
+    complete: bool,
+    outcome: HostAuditOutcome<'_>,
+) {
+    let completion = audit
+        .lock()
+        .ok()
+        .and_then(|mut exchange| exchange.take_completion(complete, outcome));
+    if let Some(completion) = completion {
+        completion.commit().await;
+    }
 }
 
 pub(super) fn stream_close(state: &mut HostState, rep: u32) -> Result<(), ErrorCode> {

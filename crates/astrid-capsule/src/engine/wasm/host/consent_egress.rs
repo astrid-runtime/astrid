@@ -564,7 +564,7 @@ impl HostState {
 
         let request_id = Uuid::new_v4().to_string();
         // Durable before the prompt is published.
-        audit.requested(self, &request_id);
+        audit.requested(&request_id);
         // Shared approval response channel — see the "Response principal
         // isolation" note above for the same-principal response check that
         // makes this safe without a separate egress namespace.

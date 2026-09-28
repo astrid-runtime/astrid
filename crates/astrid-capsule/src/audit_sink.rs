@@ -179,19 +179,21 @@ pub trait HostAuditSink: Send + Sync {
         None
     }
 
-    /// Append one allowed record and wait until it is durable.
+    /// Append one record and wait until it is durable.
     ///
-    /// For effects whose audit entry must precede the effect: the HTTP host
-    /// awaits this before a request leaves the host. A failed append must not
-    /// fail the caller; it returns a receipt without an `entry_id` and is
-    /// surfaced through the implementation's health. The default enqueues the
-    /// record through [`record`](Self::record) and returns an empty receipt.
+    /// For records that must not be lost to queue pressure or must precede
+    /// an effect: the HTTP host awaits this before a request leaves the host
+    /// and for the request's completion. A failed append must not fail the
+    /// caller; it returns a receipt without an `entry_id` and is logged. The
+    /// default enqueues the record through [`record`](Self::record) and
+    /// returns an empty receipt.
     fn commit<'a>(
         &'a self,
         principal: &'a astrid_core::PrincipalId,
         event: HostAuditEvent<'a>,
+        outcome: HostAuditOutcome<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HostAuditReceipt> + Send + 'a>> {
-        self.record(principal, event, HostAuditOutcome::Allowed);
+        self.record(principal, event, outcome);
         Box::pin(std::future::ready(HostAuditReceipt::default()))
     }
 }

@@ -87,6 +87,7 @@ async fn approval_request_and_decisions_are_linked() {
                 action: "git push",
                 resource: "git push origin main",
             },
+            HostAuditOutcome::Allowed,
         )
         .await;
     let decision = |scope, via| {

@@ -677,11 +677,18 @@ impl crate::audit_sink::HostAuditSink for ConsentSink {
 
     fn commit<'a>(
         &'a self,
-        _principal: &'a PrincipalId,
+        principal: &'a PrincipalId,
         event: crate::audit_sink::HostAuditEvent<'a>,
+        outcome: crate::audit_sink::HostAuditOutcome<'a>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = crate::audit_sink::HostAuditReceipt> + Send + 'a>,
     > {
+        if let crate::audit_sink::HostAuditEvent::ApprovalDecided(_) = event {
+            self.record(principal, event, outcome);
+            return Box::pin(std::future::ready(
+                crate::audit_sink::HostAuditReceipt::default(),
+            ));
+        }
         if let crate::audit_sink::HostAuditEvent::ApprovalRequested {
             request_id, action, ..
         } = event

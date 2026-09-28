@@ -766,8 +766,9 @@ impl HostAuditSink for KernelAuditSink {
         &'a self,
         principal: &'a PrincipalId,
         event: HostAuditEvent<'a>,
+        outcome: HostAuditOutcome<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HostAuditReceipt> + Send + 'a>> {
-        Box::pin(self.commit_direct(principal, event))
+        Box::pin(self.commit_direct(principal, event, outcome))
     }
 }
 

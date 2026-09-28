@@ -59,18 +59,21 @@ async fn precommit_is_durable_on_return_and_numbered_per_principal() {
         .commit(
             &alice,
             HostAuditEvent::HttpRequest(request("api.example.com")),
+            HostAuditOutcome::Allowed,
         )
         .await;
     let second = fetcher
         .commit(
             &alice,
             HostAuditEvent::HttpRequest(request("api.example.com")),
+            HostAuditOutcome::Allowed,
         )
         .await;
     let other = kernel_sink
         .commit(
             &bob,
             HostAuditEvent::HttpRequest(request("api.example.com")),
+            HostAuditOutcome::Allowed,
         )
         .await;
     assert_eq!(
@@ -121,6 +124,7 @@ async fn denial_takes_a_number_and_completion_links_to_its_request() {
         .commit(
             &alice,
             HostAuditEvent::HttpRequest(request("api.example.com")),
+            HostAuditOutcome::Allowed,
         )
         .await;
     kernel_sink.record(
@@ -197,4 +201,63 @@ async fn denial_takes_a_number_and_completion_links_to_its_request() {
     assert_eq!(completion.4.len(), 8, "provider ids are capped");
     assert!(completion.4.iter().all(|id| id.value.len() <= 128));
     assert!(log.verify_chain(&session).await.expect("verify").valid);
+}
+
+/// A completion written through `commit` is durable on return, keeps its
+/// failure outcome, and carries the run id of its request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn committed_completion_is_durable_with_its_outcome() {
+    let log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+    let session = SessionId::from_uuid(uuid::Uuid::from_u128(0x0b03));
+    let kernel_sink = sink(&log, &session);
+    let alice = PrincipalId::new("alice").expect("principal");
+
+    let request = kernel_sink
+        .commit(
+            &alice,
+            HostAuditEvent::HttpRequest(request("api.example.com")),
+            HostAuditOutcome::Allowed,
+        )
+        .await;
+    let completion = kernel_sink
+        .commit(
+            &alice,
+            HostAuditEvent::HttpResponse(HostHttpResponse {
+                request: &request,
+                status: None,
+                body_hash: None,
+                body_len: 0,
+                complete: false,
+                provider_request_ids: &[],
+            }),
+            HostAuditOutcome::Failed("ConnectionError"),
+        )
+        .await;
+
+    let read = |id: &Option<astrid_audit::AuditEntryId>| {
+        let log = Arc::clone(&log);
+        let id = id.clone().expect("appended");
+        async move { log.get(&id).await.expect("read").expect("present") }
+    };
+    let request_entry = read(&request.entry_id).await;
+    let completion_entry = read(&completion.entry_id).await;
+    let run_of = |action: &AuditAction| match action {
+        AuditAction::HttpRequest { run_id, .. } | AuditAction::HttpResponse { run_id, .. } => {
+            run_id.clone()
+        },
+        other => panic!("unexpected action {other:?}"),
+    };
+    assert_eq!(
+        run_of(&request_entry.action),
+        run_of(&completion_entry.action)
+    );
+    assert!(matches!(
+        completion_entry.action,
+        AuditAction::HttpResponse { sequence: 1, .. }
+    ));
+    assert!(matches!(
+        &completion_entry.outcome,
+        AuditOutcome::Failure { error } if error == "ConnectionError"
+    ));
+    kernel_sink.shutdown();
 }

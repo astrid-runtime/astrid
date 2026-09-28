@@ -19,6 +19,23 @@ struct Decision {
     scope: Option<HostApprovalScope>,
     via: String,
     denied: bool,
+    /// Appended through the durable `commit` path.
+    durable: bool,
+}
+
+fn decision_record(
+    decision: &crate::audit_sink::HostApprovalDecision<'_>,
+    outcome: HostAuditOutcome<'_>,
+    durable: bool,
+) -> Decision {
+    Decision {
+        request_id: decision.request_id.map(str::to_owned),
+        request_entry_id: decision.request.and_then(|r| r.entry_id.clone()),
+        scope: decision.scope,
+        via: decision.via.to_owned(),
+        denied: matches!(outcome, HostAuditOutcome::Denied(_)),
+        durable,
+    }
 }
 
 /// Records approval prompts (committed) and decisions (queued).
@@ -36,13 +53,10 @@ impl HostAuditSink for ApprovalSink {
         outcome: HostAuditOutcome<'_>,
     ) {
         if let HostAuditEvent::ApprovalDecided(decision) = event {
-            self.decisions.lock().unwrap().push(Decision {
-                request_id: decision.request_id.map(str::to_owned),
-                request_entry_id: decision.request.and_then(|r| r.entry_id.clone()),
-                scope: decision.scope,
-                via: decision.via.to_owned(),
-                denied: matches!(outcome, HostAuditOutcome::Denied(_)),
-            });
+            self.decisions
+                .lock()
+                .unwrap()
+                .push(decision_record(&decision, outcome, false));
         }
     }
 
@@ -50,8 +64,16 @@ impl HostAuditSink for ApprovalSink {
         &'a self,
         _principal: &'a PrincipalId,
         event: HostAuditEvent<'a>,
+        outcome: HostAuditOutcome<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HostAuditReceipt> + Send + 'a>> {
         let receipt = match event {
+            HostAuditEvent::ApprovalDecided(decision) => {
+                self.decisions
+                    .lock()
+                    .unwrap()
+                    .push(decision_record(&decision, outcome, true));
+                HostAuditReceipt::default()
+            },
             HostAuditEvent::ApprovalRequested { request_id, .. } => {
                 let entry_id = AuditEntryId::new();
                 self.requests
@@ -101,6 +123,7 @@ async fn user_decisions_are_linked_to_their_prompt() {
                 scope,
                 via: "user".to_owned(),
                 denied: scope.is_none(),
+                durable: true,
             }],
             "{reply}"
         );
@@ -165,6 +188,10 @@ async fn missing_request_owner_is_a_recorded_denial() {
     assert_eq!(decisions.len(), 1);
     assert_eq!(decisions[0].via, "no_request_owner");
     assert!(decisions[0].denied && decisions[0].request_id.is_none());
+    assert!(
+        !decisions[0].durable,
+        "no prompt, so the decision is queued"
+    );
 }
 
 /// A remembered `approve_always` answers later checks without a prompt; the

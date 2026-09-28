@@ -177,6 +177,7 @@ impl HostAuditSink for CommitSink {
         &'a self,
         _principal: &'a PrincipalId,
         event: HostAuditEvent<'a>,
+        _outcome: HostAuditOutcome<'a>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HostAuditReceipt> + Send + 'a>> {
         if let HostAuditEvent::HttpRequest(request) = event {
             self.commits
