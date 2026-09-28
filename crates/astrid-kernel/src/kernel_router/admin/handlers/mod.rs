@@ -457,6 +457,7 @@ async fn agent_modify_from_req(
         Ok(p) => p,
         Err(e) => return err_profile(&principal, &e),
     };
+    let (groups_before, capsules_before) = (profile.groups.clone(), profile.capsules.clone());
 
     // Capsule grants mirror the group mechanism EXACTLY via the shared
     // `apply_set_delta`: idempotent remove-then-add, set-based change
@@ -513,6 +514,22 @@ async fn agent_modify_from_req(
         return err_profile(&principal, &e);
     }
     kernel.profile_cache.invalidate(&principal);
+    for (kind, before, after) in [
+        ("group", &groups_before, &profile.groups),
+        ("capsule", &capsules_before, &profile.capsules),
+    ] {
+        let change = crate::grant_audit::set_diff(before, after);
+        let reason = crate::grant_audit::ADMIN_REQUEST_REASON;
+        crate::grant_audit::record_grant_change(
+            kernel,
+            &principal,
+            kind,
+            change,
+            "admin.agent.modify",
+            reason,
+        )
+        .await;
+    }
     if capsules_changed {
         warm_principal_capsules(kernel, principal.clone());
     }
@@ -888,6 +905,7 @@ async fn mutate_caps(
         CapsMutation::Grant { .. } => &mut profile.grants,
         CapsMutation::Revoke => &mut profile.revokes,
     };
+    let mut added = Vec::new();
     for cap in &capabilities {
         if !target.iter().any(|existing| existing.as_str() == cap) {
             let pattern = match CapabilityPattern::new(cap.clone()) {
@@ -895,6 +913,7 @@ async fn mutate_caps(
                 Err(e) => return err_bad_input(format!("capability {cap:?} rejected: {e}")),
             };
             target.push(pattern.into());
+            added.push(cap.clone());
         }
     }
 
@@ -902,6 +921,13 @@ async fn mutate_caps(
         return err_profile(principal, &e);
     }
     kernel.profile_cache.invalidate(principal);
+    let (change, via) = match which {
+        CapsMutation::Grant { .. } => ((added, Vec::new()), "admin.caps.grant"),
+        CapsMutation::Revoke => ((Vec::new(), added), "admin.caps.revoke"),
+    };
+    let reason = crate::grant_audit::ADMIN_REQUEST_REASON;
+    crate::grant_audit::record_grant_change(kernel, principal, "capability", change, via, reason)
+        .await;
     success_json(serde_json::json!({
         "principal": principal.as_str(),
         "capabilities": capabilities,

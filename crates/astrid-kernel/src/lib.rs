@@ -39,6 +39,8 @@ mod capsules_loaded_tests;
 #[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
 #[path = "catalog_authority_tests.rs"]
 mod catalog_authority_tests;
+/// Audit entries for applied capability and grant changes.
+mod grant_audit;
 /// Grant-on-first-use consent handler (issue #998).
 ///
 /// Native-only: reuses the management-API admin grant machinery

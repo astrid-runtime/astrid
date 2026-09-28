@@ -162,6 +162,7 @@ pub(super) async fn self_grant(kernel: &Arc<Kernel>, caller: &PrincipalId) -> Ad
             return AdminResponseBody::Error(format!("load principal profile: {error}"));
         },
     };
+    let capsules_before = profile.capsules.clone();
     let changed = match super::handlers::apply_set_delta::<CapsuleGrant>(
         &mut profile.capsules,
         &capsule_names,
@@ -179,6 +180,15 @@ pub(super) async fn self_grant(kernel: &Arc<Kernel>, caller: &PrincipalId) -> Ad
         if let Err(error) = profile.save_to_path(&profile_path) {
             return AdminResponseBody::Error(format!("save principal profile: {error}"));
         }
+        crate::grant_audit::record_grant_change(
+            kernel,
+            caller,
+            "capsule",
+            crate::grant_audit::set_diff(&capsules_before, &profile.capsules),
+            "admin.distro.self_grant",
+            crate::grant_audit::ADMIN_REQUEST_REASON,
+        )
+        .await;
     }
     kernel.profile_cache.invalidate(caller);
     AdminResponseBody::Success(serde_json::json!({
