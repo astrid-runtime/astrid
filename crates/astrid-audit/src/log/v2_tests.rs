@@ -476,3 +476,71 @@ async fn concurrent_single_and_batch_appends_keep_one_gapless_sequence() {
     let result = log.verify_chain(&session).await.unwrap();
     assert!(result.valid, "{:?}", result.issues);
 }
+
+#[tokio::test]
+async fn a_retired_audit_key_cannot_anchor_a_suffix_written_after_its_retirement() {
+    let log = AuditLog::in_memory(runtime());
+    let old = key(1);
+    let new = key(0x11);
+    log.enable_entry_v2(config(&old)).await.unwrap();
+    let session = SessionId::new();
+    record(&log, &session, None, 3).await;
+    log.rotate_audit_key(Arc::clone(&new)).await.unwrap();
+    record(&log, &session, None, 3).await;
+    let receipt = log
+        .prune_chain(
+            &session,
+            None,
+            AuditRetentionPolicy {
+                retain_entries: 2,
+                retain_bytes: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.public_key, new.export_public_key());
+    assert_eq!(receipt.key_epoch, Some(1));
+    let result = log.verify_chain(&session).await.unwrap();
+    assert!(result.valid, "{:?}", result.issues);
+
+    // The retired key forges a self-consistent receipt, naming the epoch in
+    // which it was current and then the current epoch; both are rejected
+    // because the retained suffix was signed at epoch 1.
+    let kv = log.storage().as_kv_audit_storage().unwrap().kv_store();
+    for epoch in [0, 1] {
+        let mut forged = receipt.clone();
+        forged.public_key = old.export_public_key();
+        forged.key_epoch = Some(epoch);
+        forged.signature = old.sign(&forged.signing_bytes().unwrap());
+        assert!(forged.verify().is_ok());
+        kv.set(
+            "audit:prune_receipts",
+            &session.0.to_string(),
+            serde_json::to_vec(&forged).unwrap(),
+        )
+        .await
+        .unwrap();
+        let result = log.verify_chain(&session).await.unwrap();
+        assert!(
+            result
+                .issues
+                .iter()
+                .any(|issue| matches!(issue, ChainIssue::InvalidGenesis { .. })),
+            "epoch {epoch}: {:?}",
+            result.issues
+        );
+    }
+
+    // A v2 receipt without a key epoch is not accepted either.
+    let mut unepoched = receipt;
+    unepoched.key_epoch = None;
+    unepoched.signature = new.sign(&unepoched.signing_bytes().unwrap());
+    kv.set(
+        "audit:prune_receipts",
+        &session.0.to_string(),
+        serde_json::to_vec(&unepoched).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(!log.verify_chain(&session).await.unwrap().valid);
+}

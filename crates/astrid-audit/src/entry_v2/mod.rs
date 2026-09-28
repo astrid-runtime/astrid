@@ -220,8 +220,10 @@
 //! 4. Reject a v1 entry that follows a v2 entry.
 //!
 //! The first retained entry of a pruned chain links to a signed archive
-//! receipt; for a v2 entry the receipt's key must have been registered for
-//! the audit role. A verifier that holds only the canonical bodies and
+//! receipt. Under v2 the audit key signs receipts and the receipt carries the
+//! signer's `key_epoch`; for a v2 first entry the receipt's `key_epoch` must be
+//! no earlier than the entry's, and its key must hold the audit role in that
+//! state. A verifier that holds only the canonical bodies and
 //! signatures uses [`EntryV2Header::decode`] and [`verify_entry_v2_body`]
 //! instead of recomputing from stored fields.
 //!

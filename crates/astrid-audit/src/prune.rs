@@ -63,6 +63,12 @@ pub struct AuditPruneReceipt {
     pub seal_ordinal: Option<u64>,
     /// Public key that signed this receipt.
     pub public_key: PublicKey,
+    /// Key-registry epoch the signer was taken from, when the log writes
+    /// entry format v2. A verifier requires the signer to hold the audit role
+    /// in that state. Absent (and not signed) on format-v1 receipts, so their
+    /// signed bytes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_epoch: Option<u64>,
     /// Signature over all receipt fields except this signature.
     pub signature: Signature,
 }
@@ -87,6 +93,8 @@ struct UnsignedReceipt<'a> {
     segment: &'a Option<u64>,
     seal_ordinal: &'a Option<u64>,
     public_key: PublicKey,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_epoch: Option<u64>,
 }
 
 impl AuditPruneReceipt {
@@ -110,6 +118,7 @@ impl AuditPruneReceipt {
             segment: &self.segment,
             seal_ordinal: &self.seal_ordinal,
             public_key: self.public_key,
+            key_epoch: self.key_epoch,
         }
     }
 
@@ -316,9 +325,10 @@ pub(crate) async fn prune_chain_segment(
             }),
     };
     let (generation, prior_receipt_hash) = prior_receipt(log, session_id, principal).await?;
-    // Format v2 signs receipts with the audit key, so a verifier can check
-    // the receipt key against the key registry like any v2 signature.
-    let signer = log.archive_signing_key();
+    // Format v2 signs receipts with the audit key and names the registry
+    // epoch, so a verifier checks the receipt key against the key registry
+    // like any v2 signature.
+    let (signer, key_epoch) = log.archive_signer();
     let receipt = AuditPruneReceipt {
         schema: 1,
         session: session_id.to_string(),
@@ -338,6 +348,7 @@ pub(crate) async fn prune_chain_segment(
         segment: selected_segment.0,
         seal_ordinal: selected_segment.1,
         public_key: signer.export_public_key(),
+        key_epoch,
         signature: Signature::from_bytes([0; 64]),
     };
     let mut receipt = receipt;

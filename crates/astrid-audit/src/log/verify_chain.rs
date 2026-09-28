@@ -180,8 +180,11 @@ impl AuditLog {
 
     /// Whether the first stored entry of a chain is anchored: its previous
     /// hash is zero, or a signed archive receipt for this chain names it.
-    /// For a format-v2 entry the receipt must be signed by a key the registry
-    /// registered for the audit role.
+    ///
+    /// For a format-v2 entry the receipt must name a key epoch no earlier
+    /// than the entry's (a receipt is written after the entries it keeps) at
+    /// which its key held the audit role. A retired key therefore cannot
+    /// anchor a suffix that starts after its retirement.
     async fn verify_archive_anchor(
         &self,
         first: &AuditEntry,
@@ -206,12 +209,16 @@ impl AuditLog {
         {
             return Ok(false);
         }
-        if first.v2.is_some()
-            && !registry.is_some_and(|registry| {
-                registry.was_registered(KeyRole::Audit, &receipt.public_key)
-            })
-        {
-            return Ok(false);
+        if let Some(seal) = &first.v2 {
+            let registered = receipt.key_epoch.is_some_and(|epoch| {
+                epoch >= seal.key_epoch
+                    && registry.is_some_and(|registry| {
+                        registry.is_active(KeyRole::Audit, &receipt.public_key, epoch)
+                    })
+            });
+            if !registered {
+                return Ok(false);
+            }
         }
         prune::verify_anchor(&receipt, &first.previous_hash)
     }

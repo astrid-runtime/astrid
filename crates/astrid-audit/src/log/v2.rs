@@ -103,7 +103,7 @@ impl AuditLog {
     /// the runtime key under format v1.
     #[must_use]
     pub fn signing_public_key(&self) -> PublicKey {
-        self.archive_signing_key().export_public_key()
+        self.archive_signer().0.export_public_key()
     }
 
     /// The verified key registry of this store, if format v2 was ever enabled
@@ -227,12 +227,13 @@ impl AuditLog {
             .clone()
     }
 
-    /// The key that signs archive receipts: the audit key under format v2,
-    /// the runtime key otherwise.
-    pub(crate) fn archive_signing_key(&self) -> Arc<KeyPair> {
+    /// The key that signs archive receipts and the registry epoch it holds
+    /// the audit role in: the audit key under format v2, the runtime key
+    /// (without an epoch) otherwise.
+    pub(crate) fn archive_signer(&self) -> (Arc<KeyPair>, Option<u64>) {
         self.v2_signer().map_or_else(
-            || Arc::clone(&self.runtime_key),
-            |signer| Arc::clone(&signer.key),
+            || (Arc::clone(&self.runtime_key), None),
+            |signer| (Arc::clone(&signer.key), Some(signer.registry.head_seq())),
         )
     }
 
