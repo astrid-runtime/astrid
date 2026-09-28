@@ -267,35 +267,48 @@ impl AuditLog {
             .await
     }
 
-    /// Whether this store refuses v1 appends because it holds a registry.
-    /// Checked once: only [`Self::enable_entry_v2`] creates a registry, and
-    /// that also switches this log to v2.
-    async fn v1_closed_by_registry(&self) -> AuditResult<bool> {
-        self.v1_closed
-            .get_or_try_init(|| async {
-                Ok::<_, AuditError>(!self.storage.key_registry_records().await?.is_empty())
-            })
-            .await
-            .copied()
+    /// Whether storage refused `entries` only because this log's signing state
+    /// advanced after they were signed (v2 enabled, or the audit key rotated,
+    /// in this log), so signing them again succeeds. A refusal caused by
+    /// another writer of the store, whose new key this log does not hold, is
+    /// final. Only a single-entry append re-signs: its commit is all or
+    /// nothing.
+    pub(crate) fn can_resign<'a>(
+        &self,
+        error: &AuditError,
+        entries: impl IntoIterator<Item = &'a AuditEntry>,
+    ) -> bool {
+        if !matches!(
+            error,
+            AuditError::V1Closed { .. } | AuditError::StaleAuditKey { .. }
+        ) {
+            return false;
+        }
+        let Some(signer) = self.v2_signer() else {
+            return false;
+        };
+        entries.into_iter().all(|entry| {
+            entry
+                .v2
+                .as_ref()
+                .is_none_or(|seal| seal.key_epoch < signer.registry.head_seq())
+        })
     }
 
     /// Create and sign the next entry of a chain whose head hash is
     /// `previous_hash` and whose head v2 position is `previous`.
-    pub(crate) async fn sign_entry(
+    pub(crate) fn sign_entry(
         &self,
         request: EntryRequest,
         previous_hash: ContentHash,
         previous: Option<V2Position>,
     ) -> AuditResult<AuditEntry> {
         let Some(signer) = self.v2_signer() else {
+            // Storage refuses a v1 commit once the store holds a key registry;
+            // a v2 chain head is refused here already.
             if previous.is_some() {
                 return Err(AuditError::V1Closed {
                     reason: "the chain head is a format-v2 entry",
-                });
-            }
-            if self.v1_closed_by_registry().await? {
-                return Err(AuditError::V1Closed {
-                    reason: "the store holds a format-v2 key registry",
                 });
             }
             return Ok(sign_v1(request, previous_hash, &self.runtime_key));

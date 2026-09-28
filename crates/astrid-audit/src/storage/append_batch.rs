@@ -100,6 +100,8 @@ impl KvAuditStorage {
         }
         let _guard = DURABLE_APPEND_LOCK.lock().await;
         self.recover_append_intents().await?;
+        self.check_registry_state(entries.iter().map(|(entry, _)| *entry))
+            .await?;
         let Some(prepared) = self.prepare_batch(entries).await? else {
             return Ok(vec![false; entries.len()]);
         };

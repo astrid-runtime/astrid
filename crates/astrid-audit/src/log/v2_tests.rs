@@ -544,3 +544,101 @@ async fn a_retired_audit_key_cannot_anchor_a_suffix_written_after_its_retirement
     .unwrap();
     assert!(!log.verify_chain(&session).await.unwrap().valid);
 }
+
+fn request(session: &SessionId, principal: Option<PrincipalId>) -> EntryRequest {
+    EntryRequest {
+        session_id: session.clone(),
+        principal,
+        actor: None,
+        action: AuditAction::ConfigReloaded,
+        authorization: AuthorizationProof::System {
+            reason: "test".into(),
+        },
+        outcome: AuditOutcome::success(),
+    }
+}
+
+#[tokio::test]
+async fn a_second_opener_enabling_v2_closes_v1_for_the_first() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let session = SessionId::new();
+    let first = AuditLog::open_with_kv_store(Arc::clone(&store), runtime()).unwrap();
+    record(&first, &session, Some(&alice()), 1).await;
+
+    let second = AuditLog::open_with_kv_store(Arc::clone(&store), runtime()).unwrap();
+    second.enable_entry_v2(config(&key(1))).await.unwrap();
+
+    // Neither the existing v1 chain nor a new chain accepts v1 any more.
+    for principal in [Some(alice()), None] {
+        let error = first
+            .append_inner(request(&session, principal))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AuditError::V1Closed { .. }), "{error}");
+    }
+    record(&second, &session, Some(&alice()), 1).await;
+    let chain = first
+        .get_principal_entries(&session, Some(&alice()))
+        .await
+        .unwrap();
+    assert_eq!(seqs(&chain), [None, Some(1)]);
+    assert!(second.verify_chain(&session).await.unwrap().valid);
+}
+
+#[tokio::test]
+async fn an_entry_signed_before_a_rotation_cannot_commit_after_it() {
+    let log = AuditLog::in_memory(runtime());
+    let old = key(1);
+    let new = key(0x11);
+    log.enable_entry_v2(config(&old)).await.unwrap();
+    let session = SessionId::new();
+    let stale = log
+        .sign_entry(request(&session, None), ContentHash::zero(), None)
+        .unwrap();
+    assert_eq!(stale.v2.as_ref().unwrap().key_epoch, 0);
+    log.rotate_audit_key(Arc::clone(&new)).await.unwrap();
+
+    let error = log
+        .storage()
+        .append_batch_if_heads(&[(&stale, None)])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AuditError::StaleAuditKey { key_epoch: 0 }),
+        "{error}"
+    );
+    // This log holds the new key, so an append re-signs instead of failing.
+    assert!(log.can_resign(&error, [&stale]));
+    record(&log, &session, None, 1).await;
+    let chain = log.get_principal_entries(&session, None).await.unwrap();
+    assert_eq!(chain.len(), 1);
+    let seal = chain[0].v2.as_ref().unwrap();
+    assert_eq!((seal.seq, seal.key_epoch), (1, 1));
+    assert_eq!(chain[0].runtime_key, new.export_public_key());
+}
+
+#[tokio::test]
+async fn a_writer_left_behind_by_another_openers_rotation_fails_closed() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let session = SessionId::new();
+    let old = key(1);
+    let behind = AuditLog::open_with_kv_store(Arc::clone(&store), runtime()).unwrap();
+    behind.enable_entry_v2(config(&old)).await.unwrap();
+    record(&behind, &session, None, 1).await;
+
+    let rotating = AuditLog::open_with_kv_store(Arc::clone(&store), runtime()).unwrap();
+    rotating.enable_entry_v2(config(&old)).await.unwrap();
+    rotating.rotate_audit_key(key(0x11)).await.unwrap();
+
+    // The retired key cannot extend the chain at its old epoch.
+    let error = behind
+        .append_inner(request(&session, None))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AuditError::StaleAuditKey { key_epoch: 0 }),
+        "{error}"
+    );
+    assert_eq!(behind.count().await.unwrap(), 1);
+    assert!(rotating.verify_chain(&session).await.unwrap().valid);
+}

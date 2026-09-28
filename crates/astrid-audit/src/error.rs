@@ -69,6 +69,17 @@ pub enum AuditError {
         key: String,
     },
 
+    /// A format-v2 entry was signed at a key epoch the stored key registry
+    /// has moved past (the audit key was rotated after it was signed).
+    #[error(
+        "audit entry signed at key epoch {key_epoch}, but the key registry has moved past it; \
+         the audit key was rotated, reopen the audit log with the current key"
+    )]
+    StaleAuditKey {
+        /// The epoch the refused entry was signed at.
+        key_epoch: u64,
+    },
+
     /// A format-v1 append was refused because the log has moved to format v2.
     #[error(
         "audit log is closed to format-v1 entries ({reason}); enable entry format v2 to append"

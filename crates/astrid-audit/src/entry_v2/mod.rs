@@ -205,6 +205,11 @@
 //! does not exceed the latest record, and `key_epoch` never decreases along a
 //! chain. An entry signed by a retired key therefore fails unless it names an
 //! epoch in which that key was current and its chain has not moved past it.
+//! Astrid itself never writes such an entry: an append commits only if its
+//! `key_epoch` is still the latest registry record, checked under the same
+//! lock that registry writes take. Bounding what a leaked retired key can
+//! sign outside Astrid needs an external anchor of the chain heads at
+//! rotation.
 //!
 //! # Verification
 //!

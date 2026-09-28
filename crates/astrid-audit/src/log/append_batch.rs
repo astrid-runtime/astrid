@@ -72,6 +72,9 @@ impl AuditLog {
                         Err(error) => return batch_error(entries.len(), &error),
                     }
                 },
+                // A registry refusal (v1 closed, stale audit key) is final
+                // here: the per-entry fallback may already have committed part
+                // of the batch, so signing it again could duplicate entries.
                 Err(error) => {
                     self.invalidate_batch_heads(&handles).await;
                     return batch_error(entries.len(), &error);
@@ -122,7 +125,7 @@ impl AuditLog {
                 authorization: authorization.clone(),
                 outcome: outcome.clone(),
             };
-            let entry = self.sign_entry(request, previous_hash, previous_v2).await?;
+            let entry = self.sign_entry(request, previous_hash, previous_v2)?;
             heads.insert(chain_key, Some(HeadState::of(&entry)));
             signed.push((index, entry, expected));
         }

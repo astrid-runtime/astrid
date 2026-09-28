@@ -164,8 +164,6 @@ pub struct AuditLog {
     destination_kv: Option<Arc<dyn KvStore>>,
     /// Format-v2 signer; `None` while the log writes format v1.
     entry_v2: std::sync::RwLock<Option<Arc<V2Signer>>>,
-    /// Whether the store held a key registry when v1 was last checked.
-    v1_closed: tokio::sync::OnceCell<bool>,
     /// Serializes key-registry changes (enable, rotate).
     registry_lock: Mutex<()>,
 }
@@ -184,7 +182,6 @@ impl AuditLog {
             migration_capacity,
             destination_kv,
             entry_v2: std::sync::RwLock::new(None),
-            v1_closed: tokio::sync::OnceCell::new(),
             registry_lock: Mutex::new(()),
         }
     }
@@ -638,9 +635,7 @@ impl AuditLog {
                 self.previous_hash_locked(&chain_key, head.as_ref()).await?;
 
             // Create and sign the entry in the log's current format.
-            let entry = self
-                .sign_entry(request.clone(), previous_hash, previous_v2)
-                .await?;
+            let entry = self.sign_entry(request.clone(), previous_hash, previous_v2)?;
             let entry_id = entry.id.clone();
             let head_state = HeadState::of(&entry);
 
@@ -678,6 +673,7 @@ impl AuditLog {
                         "audit retention cap reached with no eligible sealed segment".to_owned(),
                     ));
                 },
+                Err(error) if self.can_resign(&error, [&entry]) => continue,
                 Err(error) => return Err(error),
             };
             if append_results.first().copied().unwrap_or(false) {
