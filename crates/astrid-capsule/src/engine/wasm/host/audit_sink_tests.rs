@@ -25,7 +25,8 @@ enum CapturedEvent {
     NetBind(String),
     NetAccept(String, String),
     ProcessSpawn(String),
-    Http,
+    /// Events with their own dedicated tests.
+    Other,
 }
 
 impl CapturedEvent {
@@ -44,7 +45,11 @@ impl CapturedEvent {
                 local_addr,
                 peer_addr,
             } => Self::NetAccept(local_addr.to_owned(), peer_addr.to_owned()),
-            HostAuditEvent::HttpRequest(_) | HostAuditEvent::HttpResponse(_) => Self::Http,
+            HostAuditEvent::HttpRequest(_)
+            | HostAuditEvent::HttpResponse(_)
+            | HostAuditEvent::ToolCall { .. }
+            | HostAuditEvent::ApprovalRequested { .. }
+            | HostAuditEvent::ApprovalDecided(_) => Self::Other,
         }
     }
 }

@@ -660,6 +660,23 @@ impl KernelAuditSink {
             HostAuditEvent::HttpResponse(response) => {
                 coverage::http_response_action(&response, actor)
             },
+            HostAuditEvent::ToolCall {
+                capsule_id,
+                tool,
+                call_id,
+                args_hash,
+                result_hash,
+            } => {
+                coverage::tool_call_action(capsule_id, tool, call_id, args_hash, result_hash, actor)
+            },
+            HostAuditEvent::ApprovalRequested {
+                request_id,
+                action,
+                resource,
+            } => coverage::approval_requested_action(request_id, action, resource, actor),
+            HostAuditEvent::ApprovalDecided(decision) => {
+                coverage::approval_decision_action(&decision, actor)
+            },
         }
     }
 
@@ -670,6 +687,7 @@ impl KernelAuditSink {
         outcome: HostAuditOutcome<'_>,
     ) {
         let (proof, audit_outcome) = Self::to_proof_outcome(outcome);
+        let proof = coverage::authorization(&action, proof);
         let work = Box::new(AuditWork {
             session_id: self.session_id.clone(),
             principal: principal.clone(),
@@ -755,3 +773,5 @@ mod attribution_tests;
 mod http_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tool_approval_tests;

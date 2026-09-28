@@ -2706,6 +2706,7 @@ impl ExecutionEngine for WasmEngine {
                 config: wasm_config.clone(),
                 secret_env: secret_env_set.clone(),
                 revealed_secrets: crate::engine::wasm::host::http::RevealedSecrets::default(),
+                tool_result: None,
                 // Kept only for explicit legacy-migration fixtures; runtime
                 // secret resolution never consults a native path.
                 file_secret_root: None,
@@ -3669,6 +3670,9 @@ impl ExecutionEngine for WasmEngine {
         // busy), distinct from a slow guest call.
         let pool_wait_ms = checkout_start.elapsed().as_millis() as u64;
         let typed_instance = checkout.instance();
+        // Armed below when this invocation is a tool call; records one
+        // `ToolCall` audit entry when the invocation ends (or is cancelled).
+        let tool_audit;
         let result: CapsuleResult<HookTriggerResult> = {
             let s = checkout.store_mut();
             // ── Phase 1: SET ──────────────────────────────────────
@@ -3742,6 +3746,12 @@ impl ExecutionEngine for WasmEngine {
                     .and_then(|p| astrid_core::PrincipalId::new(p).ok());
 
                 install_principal_overlays(state, invocation_principal.as_ref()).await;
+                state.tool_result = None;
+                tool_audit = crate::engine::wasm::host::tool_audit::ToolCallAudit::arm(
+                    state,
+                    caller,
+                    &invoking_principal,
+                );
             }
 
             // ── Phase 2: CALL ─────────────────────────────────────
@@ -3793,6 +3803,11 @@ impl ExecutionEngine for WasmEngine {
         // conservative amount, so cancellation cannot reclaim budget that an
         // in-flight guest may already have spent.
         fuel_reservation.settle(fuel_used, std::time::Instant::now());
+        if let Some(audit) = tool_audit {
+            let captured = checkout.store_mut().data_mut().tool_result.take();
+            let error = result.as_ref().err().map(ToString::to_string);
+            audit.finish(captured, error.as_deref());
+        }
         // Drop the lease: Phase 3 CLEAR runs and the instance returns to the
         // pool, so a parallel invocation can lease it with clean state.
         drop(checkout);
@@ -4026,6 +4041,7 @@ async fn build_lifecycle_host_state(
         config: cfg.config.clone(),
         secret_env,
         revealed_secrets: crate::engine::wasm::host::http::RevealedSecrets::default(),
+        tool_result: None,
         file_secret_root,
         ipc_publish_patterns: Vec::new(),
         ipc_subscribe_patterns: Vec::new(),

@@ -29,7 +29,8 @@
 mod coverage;
 
 pub use coverage::{
-    HostAuditActor, HostAuditReceipt, HostHttpRequest, HostHttpResponse, attribute_sink,
+    HostApprovalDecision, HostApprovalScope, HostAuditActor, HostAuditReceipt, HostHttpRequest,
+    HostHttpResponse, attribute_sink,
 };
 
 /// A sensitive host-call action being reported to the audit sink.
@@ -95,6 +96,32 @@ pub enum HostAuditEvent<'a> {
     HttpRequest(HostHttpRequest<'a>),
     /// Completion of a kernel-mediated HTTP request.
     HttpResponse(HostHttpResponse<'a>),
+    /// A tool invocation delivered to a tool capsule, with the result it
+    /// published during the invocation (if any).
+    ToolCall {
+        /// Capsule that ran the tool.
+        capsule_id: &'a str,
+        /// Tool name, taken from the request topic.
+        tool: &'a str,
+        /// Caller-supplied call id (correlation hint only).
+        call_id: Option<&'a str>,
+        /// BLAKE3 of the JSON-encoded arguments.
+        args_hash: astrid_crypto::ContentHash,
+        /// BLAKE3 of the result content the tool published.
+        result_hash: Option<astrid_crypto::ContentHash>,
+    },
+    /// An approval prompt about to be published to the user.
+    ApprovalRequested {
+        /// Host-minted request id.
+        request_id: &'a str,
+        /// Action being approved.
+        action: &'a str,
+        /// Resource the action targets.
+        resource: &'a str,
+    },
+    /// The decision for an approval check. Report a denial with
+    /// [`HostAuditOutcome::Denied`].
+    ApprovalDecided(HostApprovalDecision<'a>),
 }
 
 /// The outcome of a sensitive host call, as seen at the host-fn seam.

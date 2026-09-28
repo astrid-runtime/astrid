@@ -1,16 +1,19 @@
 //! Mapping helpers for the audit-coverage records: the capsule actor stamped
-//! on host-call entries, HTTP exchange records, the per-principal HTTP
-//! request sequence, and records that must be durable before the host call
-//! proceeds.
+//! on host-call entries, HTTP exchange, tool-call and approval records, the
+//! per-principal HTTP request sequence, and records that must be durable
+//! before the host call proceeds.
 
 use std::sync::PoisonError;
 
-use astrid_audit::{AuditAction, CapsuleActor, ProviderRequestId};
+use astrid_audit::{
+    ApprovalScope, AuditAction, AuthorizationProof, CapsuleActor, ProviderRequestId,
+};
 use astrid_capsule::{
-    HostAuditActor, HostAuditEvent, HostAuditOutcome, HostAuditReceipt, HostHttpRequest,
-    HostHttpResponse,
+    HostApprovalDecision, HostApprovalScope, HostAuditActor, HostAuditEvent, HostAuditOutcome,
+    HostAuditReceipt, HostHttpRequest, HostHttpResponse,
 };
 use astrid_core::PrincipalId;
+use astrid_crypto::ContentHash;
 use tracing::warn;
 
 use super::{KernelAuditSink, truncate_guest_str};
@@ -23,6 +26,15 @@ const MAX_PROVIDER_REQUEST_ID_BYTES: usize = 128;
 const MAX_INJECTED_SECRET_NAMES: usize = 16;
 /// Longest header or secret name kept (bytes).
 const MAX_NAME_BYTES: usize = 64;
+/// Longest tool call id or approval request id kept (bytes).
+const MAX_ID_BYTES: usize = 128;
+
+/// Authorization reason on a tool invocation the kernel dispatched to a tool
+/// capsule under the caller's grants.
+const TOOL_DISPATCH_REASON: &str = "kernel-dispatched tool invocation";
+
+/// Authorization reason on approval requests and decisions.
+const APPROVAL_GATE_REASON: &str = "approval gate";
 
 /// Truncate `s` to at most `cap` bytes on a UTF-8 char boundary.
 fn truncate_to(s: &str, cap: usize) -> String {
@@ -55,8 +67,98 @@ pub(super) fn action_actor(action: &AuditAction) -> Option<&CapsuleActor> {
         | AuditAction::NetAccept { actor, .. }
         | AuditAction::ProcessSpawn { actor, .. }
         | AuditAction::HttpRequest { actor, .. }
-        | AuditAction::HttpResponse { actor, .. } => actor.as_ref(),
+        | AuditAction::HttpResponse { actor, .. }
+        | AuditAction::CapsuleToolCall { actor, .. }
+        | AuditAction::ApprovalRequested { actor, .. }
+        | AuditAction::ApprovalGranted { actor, .. }
+        | AuditAction::ApprovalDenied { actor, .. } => actor.as_ref(),
         _ => None,
+    }
+}
+
+/// Replace the manifest-gate reason on an allowed or failed tool-call or
+/// approval record with what actually authorized it. Denials are unchanged.
+pub(super) fn authorization(action: &AuditAction, proof: AuthorizationProof) -> AuthorizationProof {
+    let reason = match action {
+        AuditAction::CapsuleToolCall { .. } => TOOL_DISPATCH_REASON,
+        AuditAction::ApprovalRequested { .. }
+        | AuditAction::ApprovalGranted { .. }
+        | AuditAction::ApprovalDenied { .. } => APPROVAL_GATE_REASON,
+        _ => return proof,
+    };
+    match proof {
+        AuthorizationProof::System { .. } => AuthorizationProof::System {
+            reason: reason.to_owned(),
+        },
+        other => other,
+    }
+}
+
+/// Map a tool invocation record.
+pub(super) fn tool_call_action(
+    capsule_id: &str,
+    tool: &str,
+    call_id: Option<&str>,
+    args_hash: ContentHash,
+    result_hash: Option<ContentHash>,
+    actor: Option<CapsuleActor>,
+) -> AuditAction {
+    AuditAction::CapsuleToolCall {
+        capsule_id: truncate_guest_str(capsule_id),
+        tool: truncate_guest_str(tool),
+        args_hash,
+        call_id: call_id.map(|id| truncate_to(id, MAX_ID_BYTES)),
+        result_hash,
+        actor,
+    }
+}
+
+/// Map an approval prompt record.
+pub(super) fn approval_requested_action(
+    request_id: &str,
+    action: &str,
+    resource: &str,
+    actor: Option<CapsuleActor>,
+) -> AuditAction {
+    AuditAction::ApprovalRequested {
+        action_type: truncate_guest_str(action),
+        resource: truncate_guest_str(resource),
+        request_id: Some(truncate_to(request_id, MAX_ID_BYTES)),
+        actor,
+    }
+}
+
+/// Map an approval decision onto `ApprovalGranted` or `ApprovalDenied`. A
+/// denial's `reason` names how it was reached; the outcome carries the text.
+pub(super) fn approval_decision_action(
+    decision: &HostApprovalDecision<'_>,
+    actor: Option<CapsuleActor>,
+) -> AuditAction {
+    let request_id = decision.request_id.map(|id| truncate_to(id, MAX_ID_BYTES));
+    let request_entry_id = decision
+        .request
+        .and_then(|receipt| receipt.entry_id.clone());
+    match decision.scope {
+        Some(scope) => AuditAction::ApprovalGranted {
+            action: truncate_guest_str(decision.action),
+            resource: Some(truncate_guest_str(decision.resource)),
+            scope: match scope {
+                HostApprovalScope::Once => ApprovalScope::Once,
+                HostApprovalScope::Session => ApprovalScope::Session,
+                HostApprovalScope::Always => ApprovalScope::Always,
+            },
+            request_id,
+            request_entry_id,
+            via: Some(truncate_to(decision.via, MAX_NAME_BYTES)),
+            actor,
+        },
+        None => AuditAction::ApprovalDenied {
+            action: truncate_guest_str(decision.action),
+            reason: Some(truncate_to(decision.via, MAX_NAME_BYTES)),
+            request_id,
+            request_entry_id,
+            actor,
+        },
     }
 }
 
@@ -150,6 +252,7 @@ impl KernelAuditSink {
         let mut action = Self::to_action(event, self.actor.as_deref().cloned());
         let sequence = self.stamp_http_sequence(principal, &mut action);
         let (authorization, outcome) = Self::to_proof_outcome(HostAuditOutcome::Allowed);
+        let authorization = self::authorization(&action, authorization);
         let result = self
             .audit_log
             .append_with_principal(

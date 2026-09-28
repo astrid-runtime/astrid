@@ -100,6 +100,7 @@ impl HostState {
             config: HashMap::new(),
             secret_env: std::collections::HashSet::new(),
             revealed_secrets: crate::engine::wasm::host::http::RevealedSecrets::default(),
+            tool_result: None,
             file_secret_root: None,
             ipc_publish_patterns: vec!["hook.v1.result.*".into()],
             ipc_subscribe_patterns: Vec::new(),

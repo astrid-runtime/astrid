@@ -458,6 +458,8 @@ pub struct HostState {
     /// Secret values `get_config` handed to this instance, kept host-side so
     /// the HTTP audit redacts them from request commitments.
     pub revealed_secrets: crate::engine::wasm::host::http::RevealedSecrets,
+    /// Tool result published during the current invocation, for its audit.
+    pub tool_result: Option<crate::engine::wasm::host::tool_audit::ToolResultCapture>,
     /// Legacy secret-root context retained for migration compatibility.
     /// Runtime secret lookup never reads this path; released homes must be
     /// imported explicitly with [`astrid_storage::env::import_legacy_scope`].

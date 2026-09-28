@@ -516,7 +516,7 @@ fn approval_response_identity_match_is_exact() {
     assert!(!response_identity_matches("agent-alice", owner, &none));
 }
 
-fn publish_approval_reply(
+pub(super) fn publish_approval_reply(
     bus: &astrid_events::EventBus,
     request_id: &str,
     principal: Option<&str>,

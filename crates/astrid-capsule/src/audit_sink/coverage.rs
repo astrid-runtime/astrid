@@ -1,5 +1,6 @@
 //! Types for the audit-coverage records a host call reports: the code
-//! identity a sink stamps on its records, and HTTP exchange commitments.
+//! identity a sink stamps on its records, HTTP exchange commitments, and
+//! approval decisions.
 
 use std::sync::Arc;
 
@@ -80,4 +81,35 @@ pub struct HostAuditReceipt {
     /// Id of the durable audit entry. `None` when the append failed or the
     /// sink does not append durably.
     pub entry_id: Option<astrid_capabilities::AuditEntryId>,
+}
+
+/// How long an approval grant lasts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostApprovalScope {
+    /// This request only.
+    Once,
+    /// The rest of the session.
+    Session,
+    /// Persisted across sessions.
+    Always,
+}
+
+/// The decision for one approval check.
+#[derive(Debug, Clone, Copy)]
+pub struct HostApprovalDecision<'a> {
+    /// Id of the prompt this decision answers; `None` when no prompt was
+    /// issued (an existing grant decided).
+    pub request_id: Option<&'a str>,
+    /// Receipt of the matching [`HostAuditEvent::ApprovalRequested`](super::HostAuditEvent::ApprovalRequested)
+    /// record.
+    pub request: Option<&'a HostAuditReceipt>,
+    /// Action being approved.
+    pub action: &'a str,
+    /// Resource the action targets.
+    pub resource: &'a str,
+    /// Scope of a grant; `None` for a denial.
+    pub scope: Option<HostApprovalScope>,
+    /// How the decision was reached (for example `user`, `session_grant`,
+    /// `remembered_consent`, `timeout`).
+    pub via: &'a str,
 }
