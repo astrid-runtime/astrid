@@ -181,10 +181,19 @@ impl AuditLog {
     /// Whether the first stored entry of a chain is anchored: its previous
     /// hash is zero, or a signed archive receipt for this chain names it.
     ///
-    /// For a format-v2 entry the receipt must name a key epoch no earlier
-    /// than the entry's (a receipt is written after the entries it keeps) at
-    /// which its key held the audit role. A retired key therefore cannot
-    /// anchor a suffix that starts after its retirement.
+    /// Once the store has a key registry, the receipt's key must be one it
+    /// lists, like the keys of the entries themselves:
+    ///
+    /// - a receipt written before v2 was enabled carries no key epoch and must
+    ///   be signed by the registered v1-audit key;
+    /// - a receipt written under v2 must name a key epoch at which its key
+    ///   held the audit role, and for a v2 first entry that epoch must be no
+    ///   earlier than the entry's (a receipt is written after the entries it
+    ///   keeps), so a retired key cannot anchor a suffix that starts after
+    ///   its retirement.
+    ///
+    /// Without a registry, receipts are checked under their embedded key, as
+    /// format v1 did.
     async fn verify_archive_anchor(
         &self,
         first: &AuditEntry,
@@ -209,17 +218,30 @@ impl AuditLog {
         {
             return Ok(false);
         }
-        if let Some(seal) = &first.v2 {
-            let registered = receipt.key_epoch.is_some_and(|epoch| {
-                epoch >= seal.key_epoch
-                    && registry.is_some_and(|registry| {
-                        registry.is_active(KeyRole::Audit, &receipt.public_key, epoch)
-                    })
-            });
-            if !registered {
-                return Ok(false);
-            }
+        if !receipt_key_registered(&receipt, first, registry) {
+            return Ok(false);
         }
         prune::verify_anchor(&receipt, &first.previous_hash)
+    }
+}
+
+/// Whether `receipt` is signed by a key the registry lists for it; see
+/// `AuditLog::verify_archive_anchor`.
+fn receipt_key_registered(
+    receipt: &AuditPruneReceipt,
+    first: &AuditEntry,
+    registry: Option<&KeyRegistry>,
+) -> bool {
+    let Some(registry) = registry else {
+        return first.v2.is_none();
+    };
+    let key = &receipt.public_key;
+    match (receipt.key_epoch, &first.v2) {
+        (Some(epoch), Some(seal)) => {
+            epoch >= seal.key_epoch && registry.is_active(KeyRole::Audit, key, epoch)
+        },
+        (Some(epoch), None) => registry.is_active(KeyRole::Audit, key, epoch),
+        (None, Some(_)) => false,
+        (None, None) => registry.was_registered(KeyRole::AuditV1, key),
     }
 }

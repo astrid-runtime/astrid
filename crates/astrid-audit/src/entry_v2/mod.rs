@@ -191,9 +191,10 @@
 //!
 //! The first retained entry of a pruned chain links to a signed archive
 //! receipt. Under v2 the audit key signs receipts and the receipt carries the
-//! signer's `key_epoch`; for a v2 first entry the receipt's `key_epoch` must be
-//! no earlier than the entry's, and its key must hold the audit role in that
-//! state. A verifier that holds only the canonical bodies and
+//! signer's `key_epoch`: its key must hold the audit role in that state, and
+//! for a v2 first entry the epoch must be no earlier than the entry's. A
+//! receipt written before v2 (no epoch) anchors only a v1 first entry and must
+//! be signed by the registered audit-v1 key. A verifier that holds only the canonical bodies and
 //! signatures uses [`EntryV2Header::decode`] and [`verify_entry_v2_body`]
 //! instead of recomputing from stored fields.
 //!

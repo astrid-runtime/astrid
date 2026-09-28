@@ -667,3 +667,59 @@ async fn a_writer_left_behind_by_another_openers_rotation_fails_closed() {
     assert_eq!(behind.count().await.unwrap(), 1);
     assert!(rotating.verify_chain(&session).await.unwrap().valid);
 }
+
+#[tokio::test]
+async fn receipts_anchoring_a_retained_v1_prefix_need_a_registered_key() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let session = SessionId::new();
+    let retain = |retain_entries| AuditRetentionPolicy {
+        retain_entries,
+        retain_bytes: None,
+    };
+    // v1 history pruned before v2: the receipt is signed by the runtime key
+    // and carries no key epoch.
+    let before = AuditLog::open_with_kv_store(Arc::clone(&store), runtime()).unwrap();
+    record(&before, &session, None, 5).await;
+    let receipt = before.prune_chain(&session, None, retain(3)).await.unwrap();
+    assert_eq!(receipt.key_epoch, None);
+
+    let log = AuditLog::open_with_kv_store(Arc::clone(&store), runtime()).unwrap();
+    log.enable_entry_v2(config(&key(1))).await.unwrap();
+    let result = log.verify_chain(&session).await.unwrap();
+    assert!(result.valid, "{:?}", result.issues);
+
+    // The same receipt re-signed by an unregistered key no longer anchors.
+    let rogue = key(0x55);
+    let mut forged = receipt;
+    forged.public_key = rogue.export_public_key();
+    forged.signature = rogue.sign(&forged.signing_bytes().unwrap());
+    let kv = log.storage().as_kv_audit_storage().unwrap().kv_store();
+    kv.set(
+        "audit:prune_receipts",
+        &session.0.to_string(),
+        serde_json::to_vec(&forged).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        log.verify_chain(&session)
+            .await
+            .unwrap()
+            .issues
+            .iter()
+            .any(|issue| matches!(issue, ChainIssue::InvalidGenesis { .. }))
+    );
+
+    // A prune under v2 that still keeps a v1 entry first is signed by the
+    // audit key at the current epoch and anchors it.
+    record(&log, &session, None, 2).await;
+    let receipt = log.prune_chain(&session, None, retain(4)).await.unwrap();
+    assert_eq!(receipt.key_epoch, Some(0));
+    let chain = log.get_principal_entries(&session, None).await.unwrap();
+    assert!(
+        chain[0].v2.is_none(),
+        "the first retained entry is still v1"
+    );
+    let result = log.verify_chain(&session).await.unwrap();
+    assert!(result.valid, "{:?}", result.issues);
+}
