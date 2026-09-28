@@ -290,6 +290,12 @@ entry's `run_id`, and every request takes a number, including requests the
 airlock refuses. A request that was sent without appearing in the log therefore
 leaves a gap in the numbering of its run.
 
+Recording is best-effort, like the rest of the audit log: if the
+`http_request` entry cannot be written, the request is still sent, the failure
+is logged as a security event, and the missing entry shows as such a gap. The
+same holds for an approval prompt whose `approval_requested` entry cannot be
+written.
+
 Credentials are redacted before hashing. The redacted values are:
 
 - credential headers (`Authorization`, `Cookie`, `X-Api-Key`, `api-key`,
