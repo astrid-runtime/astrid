@@ -556,6 +556,8 @@ fn advance_chain(
             } else {
                 prior.seal_ordinal
             },
+            omitted_total: prior.omitted_total,
+            omitted_generation: prior.omitted_generation,
         },
     }
 }

@@ -1,3 +1,4 @@
+use super::metadata::PruneGeneration;
 use super::{
     AuditError, AuditResult, AuditStorage, GlobalMetadata, KvAuditStorage, NS_GLOBAL_METADATA,
     NS_PRUNE_PLANS, NS_PRUNE_RECEIPTS, NS_SEGMENT_INDEX, PrunePlan, helpers::chain_head_key,
@@ -8,9 +9,9 @@ use astrid_core::{PrincipalId, SessionId};
 use astrid_storage::{KvBatchCondition, KvBatchMutation, KvEntryKey, KvMutationBatch};
 
 struct ReceiptAccounting {
-    omitted_count: u64,
     omitted_bytes: u64,
     retained_head: Option<AuditEntryId>,
+    pruned: PruneGeneration,
 }
 
 impl ReceiptAccounting {
@@ -25,9 +26,9 @@ impl ReceiptAccounting {
             .map_err(|error| AuditError::StorageError(error.to_string()))?
             .map(AuditEntryId);
         Ok(Self {
-            omitted_count: count_field(&value, "omitted_count"),
             omitted_bytes: count_field(&value, "omitted_bytes"),
             retained_head,
+            pruned: PruneGeneration::from_value(&value)?,
         })
     }
 }
@@ -92,6 +93,20 @@ impl KvAuditStorage {
             return Ok(());
         };
         let planned_head_still_current = metadata.head == accounting.retained_head;
+        // The receipt still installed is the previous generation's, or this
+        // plan's own when an earlier finalization got past installing it.
+        let installed = if metadata.omitted_total.is_none() {
+            self.prune_receipt(session_id, principal)
+                .await?
+                .as_deref()
+                .map(PruneGeneration::parse)
+                .transpose()?
+        } else {
+            None
+        };
+        // Raise the omitted total in the same compare-and-swap that lowers
+        // the retained count, so readers never see one without the other.
+        metadata.count_prune(accounting.pruned, installed);
         metadata.count = retained_count;
         metadata.bytes = retained_bytes;
         metadata.head = retained_head;
@@ -140,7 +155,9 @@ impl KvAuditStorage {
         accounting: &ReceiptAccounting,
     ) -> AuditResult<GlobalAccountingWrite> {
         let (expected_global, mut global) = self.load_global_metadata().await?;
-        global.total_count = global.total_count.saturating_sub(accounting.omitted_count);
+        global.total_count = global
+            .total_count
+            .saturating_sub(accounting.pruned.omitted_count);
         global.total_bytes = global.total_bytes.saturating_sub(accounting.omitted_bytes);
         if plan.segment_key.is_some() && !plan.segment_accounted {
             global.sealed_segments = global.sealed_segments.saturating_sub(1);
