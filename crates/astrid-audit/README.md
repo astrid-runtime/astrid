@@ -41,7 +41,7 @@ Format v2 (`entry_v2`, off by default) replaces that with:
   - nanosecond time;
   - acting capsule;
   - action, authorization and full outcome;
-- salted commitments for text and caller-supplied hashes, so one field can be
+- a salted commitment for every field value, so one field can be
   disclosed without the others;
 - SHA-256 entry hashes and Ed25519 signatures checked with strict
   verification, made by a dedicated audit key;

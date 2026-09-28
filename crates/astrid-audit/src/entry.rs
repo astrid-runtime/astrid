@@ -154,7 +154,7 @@ impl AuditEntry {
     #[must_use]
     pub fn signing_data(&self) -> Vec<u8> {
         match &self.v2 {
-            Some(seal) => entry_v2::signing_input(&self.v2_entry_hash(seal)),
+            Some(seal) => entry_v2::signing_input(&self.v2_hash_or_unencodable(seal)),
             None => self.v1_signing_data(),
         }
     }
@@ -203,7 +203,7 @@ impl AuditEntry {
     #[must_use]
     pub fn content_hash(&self) -> ContentHash {
         match &self.v2 {
-            Some(seal) => ContentHash::from_bytes(self.v2_entry_hash(seal)),
+            Some(seal) => ContentHash::from_bytes(self.v2_hash_or_unencodable(seal)),
             None => ContentHash::hash(&self.v1_signing_data()),
         }
     }

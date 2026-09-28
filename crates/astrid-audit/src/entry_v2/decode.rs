@@ -8,22 +8,13 @@ use super::cbor::Cbor;
 use super::registry::{KeyRegistry, KeyRole};
 use crate::error::{AuditError, AuditResult};
 
-/// A field of a decoded section.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DecodedField {
-    /// A salted commitment.
-    Committed([u8; 32]),
-    /// A public value, as its deterministic CBOR encoding.
-    Public(Vec<u8>),
-}
-
 /// A decoded `[kind, FieldMap]` section.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodedSection {
-    /// The kind code.
-    pub kind: u64,
-    /// Fields in ascending key order.
-    pub fields: Vec<(u64, DecodedField)>,
+    /// The variant tag.
+    pub kind: String,
+    /// Each field's name and salted commitment, in encoded order.
+    pub fields: Vec<(String, [u8; 32])>,
 }
 
 /// Every element of a v2 entry body, decoded from its canonical bytes.
@@ -93,15 +84,6 @@ fn text(item: &Cbor, what: &str) -> AuditResult<String> {
     }
 }
 
-/// `Public = uint / bstr / [* Public]`.
-fn is_public(item: &Cbor) -> bool {
-    match item {
-        Cbor::Uint(_) | Cbor::Bytes(_) => true,
-        Cbor::Array(items) => items.iter().all(is_public),
-        _ => false,
-    }
-}
-
 fn section(item: &Cbor, what: &str) -> AuditResult<DecodedSection> {
     let Cbor::Array(parts) = item else {
         return Err(malformed(what));
@@ -109,21 +91,12 @@ fn section(item: &Cbor, what: &str) -> AuditResult<DecodedSection> {
     let [kind, Cbor::Map(entries)] = parts.as_slice() else {
         return Err(malformed(what));
     };
-    let mut fields = Vec::with_capacity(entries.len());
-    for (key, value) in entries {
-        let key = uint(key, what)?;
-        let Cbor::Array(value) = value else {
-            return Err(malformed(what));
-        };
-        let field = match value.as_slice() {
-            [Cbor::Uint(0), commitment] => DecodedField::Committed(fixed(commitment, what)?),
-            [Cbor::Uint(1), public] if is_public(public) => DecodedField::Public(public.encode()),
-            _ => return Err(malformed(what)),
-        };
-        fields.push((key, field));
-    }
+    let fields = entries
+        .iter()
+        .map(|(name, commitment)| Ok((text(name, what)?, fixed(commitment, what)?)))
+        .collect::<AuditResult<Vec<_>>>()?;
     Ok(DecodedSection {
-        kind: uint(kind, what)?,
+        kind: text(kind, what)?,
         fields,
     })
 }

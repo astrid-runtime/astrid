@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use super::*;
 use crate::entry::ApprovalScope;
-use crate::entry_v2::fields::action_section;
+use crate::entry_v2::fields::{action_section, section_of};
 use crate::entry_v2::json::to_cbor;
 use astrid_core::{Permission, TokenId};
 
@@ -349,7 +349,7 @@ fn body_with(
     entry.action = action;
     entry.authorization = authorization;
     entry.outcome = outcome;
-    entry.v2_body().unwrap()
+    entry.v2_body().unwrap().unwrap()
 }
 
 /// Apply every single-field edit to `original` and require each edit that
@@ -406,11 +406,11 @@ fn every_action_authorization_and_outcome_field_changes_the_body() {
 }
 
 #[test]
-fn every_action_variant_has_its_own_kind() {
+fn every_action_variant_has_a_distinct_kind() {
     let actions = sample_actions();
-    let mut kinds: Vec<u64> = actions
+    let mut kinds: Vec<String> = actions
         .iter()
-        .map(|action| action_section(action).kind)
+        .map(|action| action_section(action).unwrap().kind)
         .collect();
     assert_eq!(
         kinds.len(),
@@ -419,7 +419,54 @@ fn every_action_variant_has_its_own_kind() {
     );
     kinds.sort_unstable();
     kinds.dedup();
-    assert_eq!(kinds, (1..=31).collect::<Vec<u64>>());
+    assert_eq!(kinds.len(), 31);
+    assert!(kinds.contains(&"file_write".to_owned()));
+}
+
+/// A variant added later, with a nested struct, is encoded by the same rule
+/// without any change to the encoder or the specification.
+#[test]
+fn sections_follow_the_serde_form_of_any_variant() {
+    #[derive(serde::Serialize)]
+    struct Summary {
+        count: u64,
+        first_ns: u64,
+    }
+    #[derive(serde::Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum Future {
+        HostCallRun {
+            summary: Summary,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            note: Option<String>,
+        },
+    }
+    let section = section_of(
+        &Future::HostCallRun {
+            summary: Summary {
+                count: 3,
+                first_ns: 7,
+            },
+            note: None,
+        },
+        "type",
+        "action",
+    )
+    .unwrap();
+    assert_eq!(section.kind, "host_call_run");
+    let names: Vec<&str> = section
+        .fields
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(names, ["summary"]);
+    assert_eq!(
+        hex::encode(section.fields[0].1.encode()),
+        // {"count": 3, "first_ns": 7}
+        "a265636f756e74036866697273745f6e7307"
+    );
+    // A value whose serde form is not a tagged object cannot be encoded.
+    assert!(section_of(&42_u64, "type", "action").is_err());
 }
 
 #[test]
@@ -461,6 +508,7 @@ fn salts_differ_per_field_and_per_entry() {
     let entry = kat_entry(&registry);
     let salts: Vec<[u8; 16]> = entry
         .v2_field_disclosures()
+        .unwrap()
         .iter()
         .map(|disclosure| disclosure.salt)
         .collect();
@@ -492,8 +540,8 @@ fn salts_differ_per_field_and_per_entry() {
     )
     .unwrap();
     assert_ne!(
-        first.v2_field_disclosures()[0].commitment,
-        second.v2_field_disclosures()[0].commitment,
+        first.v2_field_disclosures().unwrap()[0].commitment,
+        second.v2_field_disclosures().unwrap()[0].commitment,
         "the same low-entropy value must not produce a guessable commitment"
     );
 }

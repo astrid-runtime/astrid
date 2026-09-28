@@ -152,6 +152,12 @@ impl<'a> ChainVerifier<'a> {
                 reason: "sequence numbers start at 1".to_owned(),
             });
         }
+        if let Err(error) = entry.v2_entry_hash(seal) {
+            issues.push(ChainIssue::MalformedEntry {
+                entry_id: entry_id(),
+                reason: error.to_string(),
+            });
+        }
         match self.registry {
             None => issues.push(ChainIssue::UnregisteredKey {
                 entry_id: entry_id(),

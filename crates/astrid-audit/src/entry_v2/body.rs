@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::cbor::Cbor;
-use super::fields::{FieldValue, Section, action_section, authorization_section, outcome_section};
+use super::fields::{Section, action_section, authorization_section, outcome_section};
 use super::serde_hex;
 use crate::entry::{AuditAction, AuditEntry, AuditOutcome, AuthorizationProof};
 use crate::error::{AuditError, AuditResult};
@@ -33,10 +33,10 @@ pub const SECTION_AUTHORIZATION: u64 = 10;
 /// Body element (and commitment section) holding the outcome.
 pub const SECTION_OUTCOME: u64 = 11;
 
-/// Field commitment discriminator in a `FieldMap` value.
-const FIELD_COMMITTED: u64 = 0;
-/// Public field discriminator in a `FieldMap` value.
-const FIELD_PUBLIC: u64 = 1;
+/// Hash reported for a v2 entry whose body cannot be encoded. Such an entry
+/// is never signed ([`AuditEntry::create_v2`] refuses it), so no signature or
+/// link can match this value.
+const UNENCODABLE_TAG: &[u8] = b"astrid.audit.entry.v2: body cannot be encoded";
 
 /// The code that performed an audited action, when the kernel knows it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,8 +83,8 @@ pub struct EntryV2Seal {
 pub struct FieldDisclosure {
     /// Body element holding the field: 9, 10 or 11.
     pub section: u64,
-    /// Field key inside that section.
-    pub key: u64,
+    /// Field name inside that section.
+    pub name: String,
     /// The field salt.
     pub salt: [u8; 16],
     /// Deterministic CBOR encoding of the committed value.
@@ -172,13 +172,13 @@ pub fn derive_chain_id(
     )
 }
 
-/// Derive the salt of field `key` in `section` from an entry's salt key.
+/// Derive the salt of field `name` in `section` from an entry's salt key.
 #[must_use]
-pub fn field_salt(salt_key: &[u8; 32], section: u64, key: u64) -> [u8; 16] {
+pub fn field_salt(salt_key: &[u8; 32], section: u64, name: &str) -> [u8; 16] {
     let message = Cbor::Array(vec![
         Cbor::text(SALT_TAG),
         Cbor::Uint(section),
-        Cbor::Uint(key),
+        Cbor::text(name),
     ])
     .encode();
     let mac = hmac_sha256(salt_key, &message);
@@ -191,7 +191,7 @@ fn commitment(
     chain_id: &[u8; 32],
     seq: u64,
     section: u64,
-    key: u64,
+    name: &str,
     salt: &[u8; 16],
     value: Cbor,
 ) -> [u8; 32] {
@@ -201,7 +201,7 @@ fn commitment(
             Cbor::bytes(chain_id.to_vec()),
             Cbor::Uint(seq),
             Cbor::Uint(section),
-            Cbor::Uint(key),
+            Cbor::text(name),
             Cbor::bytes(salt.to_vec()),
             value,
         ])
@@ -211,7 +211,7 @@ fn commitment(
 
 /// Check that `disclosure` opens a commitment of the entry at (`chain_id`,
 /// `seq`). The caller must also check that the commitment is the one carried
-/// at `[section][1][key]` of the signed body.
+/// at `[section][1][name]` of the signed body.
 #[must_use]
 pub fn verify_field_disclosure(
     chain_id: &[u8; 32],
@@ -225,51 +225,42 @@ pub fn verify_field_disclosure(
         chain_id,
         seq,
         disclosure.section,
-        disclosure.key,
+        &disclosure.name,
         &disclosure.salt,
         value,
     ) == disclosure.commitment
 }
 
 /// Sections 9, 10 and 11 of `entry`, before commitments.
-fn sections(entry: &AuditEntry) -> [(u64, Section); 3] {
-    [
-        (SECTION_ACTION, action_section(&entry.action)),
+fn sections(entry: &AuditEntry) -> AuditResult<[(u64, Section); 3]> {
+    Ok([
+        (SECTION_ACTION, action_section(&entry.action)?),
         (
             SECTION_AUTHORIZATION,
-            authorization_section(&entry.authorization),
+            authorization_section(&entry.authorization)?,
         ),
-        (SECTION_OUTCOME, outcome_section(&entry.outcome)),
-    ]
+        (SECTION_OUTCOME, outcome_section(&entry.outcome)?),
+    ])
 }
 
 fn section_item(index: u64, section: Section, seal: &EntryV2Seal) -> Cbor {
     let fields = section
         .fields
         .into_iter()
-        .map(|(key, value)| {
-            let value = match value {
-                FieldValue::Committed(value) => {
-                    let salt = field_salt(&seal.salt_key, index, key);
-                    let commitment = commitment(&seal.chain_id, seal.seq, index, key, &salt, value);
-                    Cbor::Array(vec![
-                        Cbor::Uint(FIELD_COMMITTED),
-                        Cbor::bytes(commitment.to_vec()),
-                    ])
-                },
-                FieldValue::Public(value) => Cbor::Array(vec![Cbor::Uint(FIELD_PUBLIC), value]),
-            };
-            (Cbor::Uint(key), value)
+        .map(|(name, value)| {
+            let salt = field_salt(&seal.salt_key, index, &name);
+            let commitment = commitment(&seal.chain_id, seal.seq, index, &name, &salt, value);
+            (Cbor::Text(name), Cbor::bytes(commitment.to_vec()))
         })
         .collect();
-    Cbor::Array(vec![Cbor::Uint(section.kind), Cbor::Map(fields)])
+    Cbor::Array(vec![Cbor::Text(section.kind), Cbor::Map(fields)])
 }
 
 /// The body array of `entry`.
-fn body_item(entry: &AuditEntry, seal: &EntryV2Seal) -> Cbor {
+fn body_item(entry: &AuditEntry, seal: &EntryV2Seal) -> AuditResult<Cbor> {
     let [action, authorization, outcome] =
-        sections(entry).map(|(index, section)| section_item(index, section, seal));
-    Cbor::Array(vec![
+        sections(entry)?.map(|(index, section)| section_item(index, section, seal));
+    Ok(Cbor::Array(vec![
         Cbor::text(ENTRY_TAG),
         Cbor::bytes(seal.chain_id.to_vec()),
         Cbor::Uint(seal.seq),
@@ -298,12 +289,12 @@ fn body_item(entry: &AuditEntry, seal: &EntryV2Seal) -> Cbor {
             Cbor::Uint(seal.key_epoch),
             Cbor::bytes(entry.runtime_key.as_bytes().to_vec()),
         ]),
-    ])
+    ]))
 }
 
 /// Deterministic CBOR bytes of the signed body.
-pub(crate) fn body_bytes(entry: &AuditEntry, seal: &EntryV2Seal) -> Vec<u8> {
-    body_item(entry, seal).encode()
+pub(crate) fn body_bytes(entry: &AuditEntry, seal: &EntryV2Seal) -> AuditResult<Vec<u8>> {
+    body_item(entry, seal).map(|item| item.encode())
 }
 
 /// The bytes Ed25519 signs for an entry with hash `entry_hash`.
@@ -317,24 +308,30 @@ pub fn signing_input(entry_hash: &[u8; 32]) -> Vec<u8> {
     .encode()
 }
 
-fn disclosures(entry: &AuditEntry, seal: &EntryV2Seal) -> Vec<FieldDisclosure> {
+fn disclosures(entry: &AuditEntry, seal: &EntryV2Seal) -> AuditResult<Vec<FieldDisclosure>> {
     let mut disclosures = Vec::new();
-    for (index, section) in sections(entry) {
-        for (key, value) in section.fields {
-            if let FieldValue::Committed(value) = value {
-                let salt = field_salt(&seal.salt_key, index, key);
-                let encoded = value.encode();
-                disclosures.push(FieldDisclosure {
-                    section: index,
-                    key,
-                    salt,
-                    value: encoded,
-                    commitment: commitment(&seal.chain_id, seal.seq, index, key, &salt, value),
-                });
-            }
+    for (index, section) in sections(entry)? {
+        for (name, value) in section.fields {
+            let salt = field_salt(&seal.salt_key, index, &name);
+            let encoded = value.encode();
+            let commitment = commitment(&seal.chain_id, seal.seq, index, &name, &salt, value);
+            disclosures.push(FieldDisclosure {
+                section: index,
+                name,
+                salt,
+                value: encoded,
+                commitment,
+            });
         }
     }
-    disclosures
+    // The body's key order: section, then the dCBOR order of the name.
+    disclosures.sort_by_cached_key(|disclosure| {
+        (
+            disclosure.section,
+            Cbor::text(disclosure.name.as_str()).encode(),
+        )
+    });
+    Ok(disclosures)
 }
 
 impl AuditEntry {
@@ -342,26 +339,42 @@ impl AuditEntry {
     ///
     /// SHA-256 of these bytes is the entry's
     /// [`content_hash`](Self::content_hash).
-    #[must_use]
-    pub fn v2_body(&self) -> Option<Vec<u8>> {
-        self.v2.as_ref().map(|seal| body_bytes(self, seal))
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a section cannot be taken from its serde form;
+    /// such an entry is never signed.
+    pub fn v2_body(&self) -> AuditResult<Option<Vec<u8>>> {
+        self.v2
+            .as_ref()
+            .map(|seal| body_bytes(self, seal))
+            .transpose()
     }
 
     /// Openings of every committed field of a format-v2 entry.
     ///
     /// Hand a single disclosure to a third party to reveal one field; the
     /// others stay hidden. Empty for v1 entries.
-    #[must_use]
-    pub fn v2_field_disclosures(&self) -> Vec<FieldDisclosure> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a section cannot be taken from its serde form.
+    pub fn v2_field_disclosures(&self) -> AuditResult<Vec<FieldDisclosure>> {
         self.v2
             .as_ref()
-            .map(|seal| disclosures(self, seal))
-            .unwrap_or_default()
+            .map_or_else(|| Ok(Vec::new()), |seal| disclosures(self, seal))
     }
 
     /// SHA-256 of the v2 body.
-    pub(crate) fn v2_entry_hash(&self, seal: &EntryV2Seal) -> [u8; 32] {
-        sha256(&body_bytes(self, seal))
+    pub(crate) fn v2_entry_hash(&self, seal: &EntryV2Seal) -> AuditResult<[u8; 32]> {
+        body_bytes(self, seal).map(|body| sha256(&body))
+    }
+
+    /// SHA-256 of the v2 body, or a value no signature or link can match
+    /// when the body cannot be encoded.
+    pub(crate) fn v2_hash_or_unencodable(&self, seal: &EntryV2Seal) -> [u8; 32] {
+        self.v2_entry_hash(seal)
+            .unwrap_or_else(|_| sha256(UNENCODABLE_TAG))
     }
 
     /// Create and sign a new v2 entry at the current time.
@@ -415,7 +428,12 @@ impl AuditEntry {
                 salt_key,
             }),
         };
-        entry.signature = signer.sign(&entry.signing_data());
+        let seal = entry
+            .v2
+            .as_ref()
+            .ok_or_else(|| AuditError::SerializationError("a v2 entry lost its seal".to_owned()))?;
+        let hash = entry.v2_entry_hash(seal)?;
+        entry.signature = signer.sign(&signing_input(&hash));
         Ok(entry)
     }
 }

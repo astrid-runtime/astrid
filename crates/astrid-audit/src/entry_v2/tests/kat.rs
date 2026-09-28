@@ -6,8 +6,8 @@
 
 use super::*;
 use crate::entry_v2::{
-    DecodedField, EntryV2Header, SECTION_ACTION, SECTION_AUTHORIZATION, SECTION_OUTCOME,
-    signing_input, verify_entry_v2_body, verify_field_disclosure,
+    EntryV2Header, SECTION_ACTION, SECTION_AUTHORIZATION, SECTION_OUTCOME, signing_input,
+    verify_entry_v2_body, verify_field_disclosure,
 };
 
 const KAT_AUDIT_PUBLIC: &str = "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c";
@@ -37,48 +37,59 @@ const KAT_BODY: &[&str] = &[
     "3582a52d155000112233445566778899aabbccddeeff50010203040506070809",
     "0a0b0c0d0e0f1082582007070707070707070707070707070707070707070707",
     "0707070707070707070765616c6963658266616f732d66735820080808080808",
-    "08080808080808080808080808080808080808080808080808088209a2018200",
-    "5820875e7f9306a5ae92cac15bc6a90967cc178deb57aeec9feecb350f72453e",
-    "9e4a0282005820ceb2db5d2f6834ebded8c4b74dff91195f308f758ae2a40417",
-    "0c93360d12e5288205a101820058200fc322752b8a1a72247922571253aa74b4",
-    "2645248742cf0915cb496a2a0ddf2d8201a10182005820944d87f5b22ebd49a5",
-    "809e224ee25e0463217ef4ba1cf3013f2808e9c538628c820058208a88e3dd74",
-    "09f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "0808080808080808080808080808080808080808080808080808826a66696c65",
+    "5f7772697465a264706174685820667206c8f1d0a10df01f886c473418cd3397",
+    "4f3d67b19d7ca2a242273665e4016c636f6e74656e745f686173685820715d8d",
+    "185919a9d9d1861cea95d501fd45d91378de6937e3a6b96f777a4753cb826673",
+    "797374656da166726561736f6e58203e9f1d3bf578a2c001fa91701bf583711b",
+    "2737d300649d498bb753586951a87e82676661696c757265a1656572726f7258",
+    "2043a56020b3f9bdc2e31434da239a723c7c0dc19c284586e23b66c2d5ac50e2",
+    "90820058208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf37488",
+    "01b40f6f5c",
 ];
-const KAT_ENTRY_HASH: &str = "d2d1781063370a7b0d95098f98a8f9ec82f2083448bbc23a55d677942d40e35b";
-const KAT_SIGNATURE: &str = "fb9e2166af75320997a583c63950451cc244d32cf623ed51e660fa20337035e2\
-                             0c11c13ac3a87253f67fe92a9e32f1198ceabb35dc0f837a042b2ccc42d9f002";
-/// `(section, key, salt, value, commitment)` of each committed field.
-const KAT_DISCLOSURES: [(u64, u64, &str, &str, &str); 4] = [
+const KAT_ENTRY_HASH: &str = "c1b3fc3e9b0ac43f52d8f9cbc8156c9c3dafbc1a2b5354d901d63b1d8e6a7d1d";
+const KAT_SIGNATURE: &str = "3d4003e5bb035238faa0a9fe73569af19569b9e33e8dcb16a230422e69928fff\
+                             81aae511da20372b3c11b1eb03955599323ad88b6ca1e426debf40dda966190e";
+/// `(section, name, salt, value, commitment)` of each committed field, in
+/// body order.
+const KAT_DISCLOSURES: [(u64, &str, &str, &str, &str); 4] = [
     (
         9,
-        1,
-        "505f4fe84229b4ece2fd174bea25c0c4",
+        "path",
+        "afa77b89ac10bcf6c2fdbe913b2d4112",
         "752f686f6d652f616c6963652f6e6f7465732e747874",
-        "875e7f9306a5ae92cac15bc6a90967cc178deb57aeec9feecb350f72453e9e4a",
+        "667206c8f1d0a10df01f886c473418cd33974f3d67b19d7ca2a242273665e401",
     ),
     (
         9,
-        2,
-        "403e57796b153c9a66bb36df0ce6db25",
-        "58200a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
-        "ceb2db5d2f6834ebded8c4b74dff91195f308f758ae2a404170c93360d12e528",
+        "content_hash",
+        "165eb4b4eb1d90dc5cf685aff63ab6eb",
+        concat!(
+            "7840",
+            "30613061306130613061306130613061306130613061306130613061306130613061",
+            "306130613061306130613061306130613061306130613061306130613061",
+        ),
+        "715d8d185919a9d9d1861cea95d501fd45d91378de6937e3a6b96f777a4753cb",
     ),
     (
         10,
-        1,
-        "cebf2148dcb80c652b45a4acecd13abd",
+        "reason",
+        "4c0c9735dee25688858940a554006641",
         "78186d616e69666573742d676174656420686f73742063616c6c",
-        "0fc322752b8a1a72247922571253aa74b42645248742cf0915cb496a2a0ddf2d",
+        "3e9f1d3bf578a2c001fa91701bf583711b2737d300649d498bb753586951a87e",
     ),
     (
         11,
-        1,
-        "89222369d907ce33b72cf6a4ed6a24d9",
+        "error",
+        "b75d5c8e07b9ca6bc6e11c98f848c871",
         "696469736b2066756c6c",
-        "944d87f5b22ebd49a5809e224ee25e0463217ef4ba1cf3013f2808e9c538628c",
+        "43a56020b3f9bdc2e31434da239a723c7c0dc19c284586e23b66c2d5ac50e290",
     ),
 ];
+
+fn kat_body(entry: &AuditEntry) -> Vec<u8> {
+    entry.v2_body().unwrap().unwrap()
+}
 
 #[test]
 fn registry_genesis_matches_known_answer() {
@@ -102,7 +113,7 @@ fn entry_matches_known_answer() {
     let entry = kat_entry(&registry);
     let seal = entry.v2.as_ref().unwrap();
     assert_eq!(hex::encode(seal.chain_id), KAT_CHAIN_ID);
-    assert_eq!(hex::encode(entry.v2_body().unwrap()), KAT_BODY.concat());
+    assert_eq!(hex::encode(kat_body(&entry)), KAT_BODY.concat());
     assert_eq!(entry.content_hash().to_hex(), KAT_ENTRY_HASH);
     assert_eq!(entry.signature.to_hex(), KAT_SIGNATURE);
     assert_eq!(
@@ -119,7 +130,7 @@ fn entry_survives_a_json_round_trip_unchanged() {
     let stored = serde_json::to_vec(&entry).unwrap();
     let reloaded: AuditEntry = serde_json::from_slice(&stored).unwrap();
     assert_eq!(reloaded.content_hash().to_hex(), KAT_ENTRY_HASH);
-    assert_eq!(hex::encode(reloaded.v2_body().unwrap()), KAT_BODY.concat());
+    assert_eq!(hex::encode(kat_body(&reloaded)), KAT_BODY.concat());
     let result = crate::ChainVerifier::new(Some(&registry))
         .verify(std::slice::from_ref(&reloaded), crate::ChainStart::Genesis);
     assert!(result.valid, "{:?}", result.issues);
@@ -130,13 +141,13 @@ fn disclosures_match_known_answer_and_open_their_commitments() {
     let registry = kat_registry();
     let entry = kat_entry(&registry);
     let seal = entry.v2.as_ref().unwrap();
-    let disclosures = entry.v2_field_disclosures();
+    let disclosures = entry.v2_field_disclosures().unwrap();
     assert_eq!(disclosures.len(), KAT_DISCLOSURES.len());
-    for (disclosure, (section, key, salt, value, commitment)) in
+    for (disclosure, (section, name, salt, value, commitment)) in
         disclosures.iter().zip(KAT_DISCLOSURES)
     {
         assert_eq!(disclosure.section, section);
-        assert_eq!(disclosure.key, key);
+        assert_eq!(disclosure.name, name);
         assert_eq!(hex::encode(disclosure.salt), salt);
         assert_eq!(hex::encode(&disclosure.value), value);
         assert_eq!(hex::encode(disclosure.commitment), commitment);
@@ -148,6 +159,9 @@ fn disclosures_match_known_answer_and_open_their_commitments() {
         let mut wrong = disclosure.clone();
         wrong.value = crate::entry_v2::cbor::Cbor::text("something else").encode();
         assert!(!verify_field_disclosure(&seal.chain_id, seal.seq, &wrong));
+        let mut renamed = disclosure.clone();
+        renamed.name.push('x');
+        assert!(!verify_field_disclosure(&seal.chain_id, seal.seq, &renamed));
     }
 }
 
@@ -169,25 +183,27 @@ fn redacted_body_decodes_and_verifies_against_the_registry() {
     assert_eq!(header.actor, Some(("aos-fs".to_owned(), Some([8; 32]))));
     assert_eq!(header.key_epoch, 0);
     assert_eq!(header.signer, key(1).export_public_key());
-    assert_eq!(header.action.kind, 9);
-    assert_eq!(header.authorization.kind, 5);
-    assert_eq!(header.outcome.kind, 1);
-    let commitments: Vec<(u64, u64, String)> = [
+    assert_eq!(header.action.kind, "file_write");
+    assert_eq!(header.authorization.kind, "system");
+    assert_eq!(header.outcome.kind, "failure");
+    let commitments: Vec<(u64, String, String)> = [
         (SECTION_ACTION, &header.action),
         (SECTION_AUTHORIZATION, &header.authorization),
         (SECTION_OUTCOME, &header.outcome),
     ]
     .into_iter()
     .flat_map(|(section, decoded)| {
-        decoded.fields.iter().map(move |(key, field)| match field {
-            DecodedField::Committed(commitment) => (section, *key, hex::encode(commitment)),
-            DecodedField::Public(_) => panic!("the KAT entry has no public fields"),
-        })
+        decoded
+            .fields
+            .iter()
+            .map(move |(name, commitment)| (section, name.clone(), hex::encode(commitment)))
     })
     .collect();
-    let expected: Vec<(u64, u64, String)> = KAT_DISCLOSURES
+    let expected: Vec<(u64, String, String)> = KAT_DISCLOSURES
         .iter()
-        .map(|(section, key, _, _, commitment)| (*section, *key, (*commitment).to_owned()))
+        .map(|(section, name, _, _, commitment)| {
+            (*section, (*name).to_owned(), (*commitment).to_owned())
+        })
         .collect();
     assert_eq!(commitments, expected);
 }
@@ -209,7 +225,7 @@ fn redacted_body_is_rejected_when_tampered_or_signed_by_an_unregistered_key() {
     let mut forged = entry.clone();
     forged.runtime_key = rogue.export_public_key();
     forged.signature = rogue.sign(&forged.signing_data());
-    let forged_body = forged.v2_body().unwrap();
+    let forged_body = kat_body(&forged);
     assert!(matches!(
         verify_entry_v2_body(&forged_body, &forged.signature, &registry),
         Err(crate::AuditError::KeyNotRegistered { .. })
@@ -227,7 +243,7 @@ fn a_body_with_sequence_zero_is_rejected() {
     let mut entry = kat_entry(&registry);
     entry.v2.as_mut().unwrap().seq = 0;
     entry.signature = key(1).sign(&entry.signing_data());
-    let body = entry.v2_body().unwrap();
+    let body = kat_body(&entry);
     assert!(EntryV2Header::decode(&body).is_err());
     assert!(verify_entry_v2_body(&body, &entry.signature, &registry).is_err());
 }

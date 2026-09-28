@@ -118,9 +118,9 @@ entry_format = "v1"  # "v1" (default) or "v2"
   against the key embedded in each entry.
 - `v2` signs a canonical CBOR body that covers every field. The body
   includes a per-chain sequence number, nanosecond time, the full outcome,
-  and salted commitments to text fields. v2 entries are signed by a separate
-  audit key, `keys/audit.key`, and verified against a cross-signed key
-  registry kept in the audit store. The byte-level format is specified in the
+  and salted commitments to every field value. v2 entries are signed by a
+  separate audit key, `keys/audit.key`, and verified against a cross-signed
+  key registry kept in the audit store. The byte-level format is specified in the
   `astrid_audit::entry_v2` crate documentation.
 
 When the daemon first boots with `v2`, it:
