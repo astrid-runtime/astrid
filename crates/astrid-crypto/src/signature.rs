@@ -97,6 +97,27 @@ impl Signature {
             .map_err(|_| CryptoError::SignatureVerificationFailed)
     }
 
+    /// Verify this signature with RFC 8032 strict verification.
+    ///
+    /// Unlike [`verify`](Self::verify), this rejects signatures whose `R`
+    /// component or public key is a small-order point and non-canonical
+    /// encodings, so a key holder cannot produce a signature that some
+    /// verifiers accept and others reject. New formats must use this.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the public key is invalid or verification fails.
+    pub fn verify_strict(&self, message: &[u8], public_key: &[u8; 32]) -> CryptoResult<()> {
+        let verifying_key = VerifyingKey::from_bytes(public_key)
+            .map_err(|e| CryptoError::InvalidPublicKey(e.to_string()))?;
+
+        let sig = DalekSignature::from_bytes(&self.0);
+
+        verifying_key
+            .verify_strict(message, &sig)
+            .map_err(|_| CryptoError::SignatureVerificationFailed)
+    }
+
     /// Convert to the underlying dalek signature type.
     #[must_use]
     pub fn to_dalek(&self) -> DalekSignature {
@@ -221,6 +242,31 @@ mod tests {
             sig.verify(message, other_keypair.public_key_bytes())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn strict_verification_accepts_valid_and_rejects_forgeries() {
+        let keypair = KeyPair::generate();
+        let message = b"strict message";
+        let sig = keypair.sign(message);
+        assert!(
+            sig.verify_strict(message, keypair.public_key_bytes())
+                .is_ok()
+        );
+        assert!(
+            sig.verify_strict(b"other message", keypair.public_key_bytes())
+                .is_err()
+        );
+
+        // The identity point is a small-order public key. `verify` would
+        // accept the all-identity signature (R = identity, S = 0) for any
+        // message under it; strict verification must not.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut forged = [0u8; 64];
+        forged[0] = 1;
+        let forged = Signature::from_bytes(forged);
+        assert!(forged.verify_strict(message, &identity).is_err());
     }
 
     #[test]

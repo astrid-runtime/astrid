@@ -50,5 +50,5 @@ pub use error::{CryptoError, CryptoResult};
 pub use hash::ContentHash;
 pub use identifier::{IdentifierHash, PublicKeyFingerprint};
 pub use key_storage::load_or_generate_keypair;
-pub use keypair::{KeyPair, PublicKey};
+pub use keypair::{KeyPair, PublicKey, random_bytes};
 pub use signature::Signature;
