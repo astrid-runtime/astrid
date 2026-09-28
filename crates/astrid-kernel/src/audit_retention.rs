@@ -50,7 +50,8 @@ pub(crate) fn apply_retention_config(audit_log: &AuditLog, config: &AuditRetenti
 /// receipt exactly as the log stores it; each further line is one removed
 /// entry as stored, in chain order. The file is written under a temporary
 /// name, synced, and renamed into place, and every directory is private to
-/// the daemon's user.
+/// the daemon's user. File operations run on the blocking thread pool, so a
+/// large archive or a slow disk does not stall the async runtime.
 pub(crate) struct FileArchiver {
     pub(crate) root: PathBuf,
 }
@@ -77,24 +78,30 @@ impl AuditArchiver for FileArchiver {
             },
             None => "system".to_owned(),
         };
-        let session_dir = self.root.join(session.to_string());
-        let directory = session_dir.join(chain);
-        for dir in [&self.root, &session_dir, &directory] {
-            astrid_core::platform_fs::ensure_private_directory(dir)
-                .map_err(|error| archive_error("directory", &error))?;
-        }
+        let root = self.root.clone();
         let name = format!("{:020}.jsonl", receipt.generation);
-        let temporary =
-            directory.join(format!(".{name}.{}.partial", uuid::Uuid::new_v4().simple()));
-        let mut writer = FileArchiveWriter {
-            file: Some(BufWriter::new(create_private(&temporary)?)),
-            destination: directory.join(name),
-            directory,
-            temporary,
-            committed: false,
-        };
-        writer.write_line(receipt_bytes)?;
-        Ok(Box::new(writer))
+        let mut first_line = receipt_bytes.to_vec();
+        first_line.push(b'\n');
+        blocking(move || {
+            let session_dir = root.join(session.to_string());
+            let directory = session_dir.join(chain);
+            for dir in [&root, &session_dir, &directory] {
+                astrid_core::platform_fs::ensure_private_directory(dir)
+                    .map_err(|error| archive_error("directory", &error))?;
+            }
+            let temporary =
+                directory.join(format!(".{name}.{}.partial", uuid::Uuid::new_v4().simple()));
+            let mut writer = FileArchiveWriter {
+                file: Some(BufWriter::new(create_private(&temporary)?)),
+                destination: directory.join(name),
+                directory,
+                temporary,
+                committed: false,
+            };
+            writer.write_bytes(&first_line)?;
+            Ok(Box::new(writer) as Box<dyn AuditArchiveWriter>)
+        })
+        .await
     }
 }
 
@@ -107,29 +114,17 @@ struct FileArchiveWriter {
 }
 
 impl FileArchiveWriter {
-    fn write_line(&mut self, bytes: &[u8]) -> AuditResult<()> {
-        let file = self
-            .file
+    fn write_bytes(&mut self, bytes: &[u8]) -> AuditResult<()> {
+        self.file
             .as_mut()
-            .ok_or_else(|| AuditError::StorageError("audit archive is closed".to_owned()))?;
-        file.write_all(bytes)
-            .and_then(|()| file.write_all(b"\n"))
+            .ok_or_else(|| AuditError::StorageError("audit archive is closed".to_owned()))?
+            .write_all(bytes)
             .map_err(|error| archive_error("write", &error))
     }
-}
 
-#[async_trait]
-impl AuditArchiveWriter for FileArchiveWriter {
-    async fn write(&mut self, entries: &[AuditEntry]) -> AuditResult<()> {
-        for entry in entries {
-            let bytes = serde_json::to_vec(entry)
-                .map_err(|error| AuditError::SerializationError(error.to_string()))?;
-            self.write_line(&bytes)?;
-        }
-        Ok(())
-    }
-
-    async fn commit(mut self: Box<Self>) -> AuditResult<()> {
+    /// Flush, sync and rename the archive into place, then sync its
+    /// directory.
+    fn commit_blocking(mut self) -> AuditResult<()> {
         let file = self
             .file
             .take()
@@ -153,6 +148,35 @@ impl AuditArchiveWriter for FileArchiveWriter {
     }
 }
 
+#[async_trait]
+impl AuditArchiveWriter for FileArchiveWriter {
+    async fn write(&mut self, entries: &[AuditEntry]) -> AuditResult<()> {
+        let mut lines = Vec::new();
+        for entry in entries {
+            serde_json::to_writer(&mut lines, entry)
+                .map_err(|error| AuditError::SerializationError(error.to_string()))?;
+            lines.push(b'\n');
+        }
+        let mut file = self
+            .file
+            .take()
+            .ok_or_else(|| AuditError::StorageError("audit archive is closed".to_owned()))?;
+        let (file, written) = astrid_runtime::spawn_blocking(move || {
+            let written = file.write_all(&lines);
+            (file, written)
+        })
+        .await
+        .map_err(|error| archive_error("write task", &error))?;
+        self.file = Some(file);
+        written.map_err(|error| archive_error("write", &error))
+    }
+
+    async fn commit(self: Box<Self>) -> AuditResult<()> {
+        let writer = *self;
+        blocking(move || writer.commit_blocking()).await
+    }
+}
+
 impl Drop for FileArchiveWriter {
     fn drop(&mut self) {
         if !self.committed {
@@ -160,6 +184,15 @@ impl Drop for FileArchiveWriter {
             let _ = std::fs::remove_file(&self.temporary);
         }
     }
+}
+
+/// Run file work on the blocking thread pool.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> AuditResult<T> + Send + 'static,
+) -> AuditResult<T> {
+    astrid_runtime::spawn_blocking(work)
+        .await
+        .map_err(|error| archive_error("task", &error))?
 }
 
 fn create_private(path: &Path) -> AuditResult<File> {
