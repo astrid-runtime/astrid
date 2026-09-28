@@ -202,9 +202,10 @@
 //! A key holds a role in registry states `from..until`: from the record that
 //! adds it up to, excluding, the record that retires it. A v2 entry is valid
 //! only if its signer holds the audit role in state `key_epoch`, `key_epoch`
-//! does not exceed the latest record, and `key_epoch` never decreases along a
-//! chain. An entry signed by a retired key therefore fails unless it names an
-//! epoch in which that key was current and its chain has not moved past it.
+//! does not exceed the latest record, and `key_epoch` never decreases along
+//! the storage chain, including where a new v2 chain opens. An entry signed by
+//! a retired key therefore fails unless it names an epoch in which that key
+//! was current and its storage chain has not moved past it.
 //! Astrid itself never writes such an entry: an append commits only if its
 //! `key_epoch` is still the latest registry record, checked under the same
 //! lock that registry writes take. Bounding what a leaked retired key can
@@ -220,8 +221,9 @@
 //!    `key_epoch`.
 //! 2. Recompute the chain id from the registry id, session and principal.
 //! 3. Require `prev` to be the storage predecessor's hash, `seq` to be one
-//!    more than the predecessor's when both are in the same chain and 1
-//!    otherwise, and `key_epoch` not to decrease.
+//!    more than the predecessor's when both are in the same chain (without
+//!    overflow) and 1 otherwise, `seq` never to be 0, and `key_epoch` not to
+//!    decrease from a v2 predecessor, whichever chain it belongs to.
 //! 4. Reject a v1 entry that follows a v2 entry.
 //! 5. Require each v1 entry's embedded key to hold the audit-v1 role, so a v1
 //!    chain re-signed under another key no longer passes (a verifier may turn

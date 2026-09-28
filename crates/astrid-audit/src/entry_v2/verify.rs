@@ -192,6 +192,16 @@ fn check_sequence(
     previous: Option<&AuditEntry>,
     issues: &mut Vec<ChainIssue>,
 ) {
+    // Entries of one storage chain are signed in storage order, each at the
+    // registry head of its time, so the key epoch never decreases along the
+    // storage chain, also where a new v2 chain opens.
+    if let Some(previous_seal) = previous.and_then(|previous| previous.v2.as_ref())
+        && seal.key_epoch < previous_seal.key_epoch
+    {
+        issues.push(ChainIssue::KeyEpochRegression {
+            entry_id: entry.id.clone(),
+        });
+    }
     let expected = match previous {
         // A first stored entry either opens its chain (zero previous hash,
         // sequence 1) or is anchored by an archive receipt, which the caller
@@ -200,12 +210,14 @@ fn check_sequence(
         None => None,
         Some(previous) => match &previous.v2 {
             Some(previous_seal) if previous_seal.chain_id == seal.chain_id => {
-                if seal.key_epoch < previous_seal.key_epoch {
-                    issues.push(ChainIssue::KeyEpochRegression {
+                let Some(next) = previous_seal.seq.checked_add(1) else {
+                    issues.push(ChainIssue::MalformedEntry {
                         entry_id: entry.id.clone(),
+                        reason: "sequence number overflows after its predecessor".to_owned(),
                     });
-                }
-                Some(previous_seal.seq.saturating_add(1))
+                    return;
+                };
+                Some(next)
             },
             // A v2 chain opens at 1 after a v1 entry or another v2 chain.
             _ => Some(1),

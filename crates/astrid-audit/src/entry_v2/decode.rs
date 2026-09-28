@@ -174,6 +174,9 @@ impl EntryV2Header {
         if *tag != Cbor::text(ENTRY_TAG) {
             return Err(malformed("unknown domain tag"));
         }
+        if *seq == Cbor::Uint(0) {
+            return Err(malformed("sequence numbers start at 1"));
+        }
         let Cbor::Array(principal) = principal else {
             return Err(malformed("principal"));
         };

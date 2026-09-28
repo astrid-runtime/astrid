@@ -220,3 +220,14 @@ fn redacted_body_is_rejected_when_tampered_or_signed_by_an_unregistered_key() {
     trailing.push(0);
     assert!(EntryV2Header::decode(&trailing).is_err());
 }
+
+#[test]
+fn a_body_with_sequence_zero_is_rejected() {
+    let registry = kat_registry();
+    let mut entry = kat_entry(&registry);
+    entry.v2.as_mut().unwrap().seq = 0;
+    entry.signature = key(1).sign(&entry.signing_data());
+    let body = entry.v2_body().unwrap();
+    assert!(EntryV2Header::decode(&body).is_err());
+    assert!(verify_entry_v2_body(&body, &entry.signature, &registry).is_err());
+}

@@ -326,14 +326,13 @@ impl AuditLog {
             principal_uid.as_ref(),
         );
         let key_epoch = signer.registry.head_seq();
+        if previous.is_some_and(|head| head.key_epoch > key_epoch) {
+            return Err(AuditError::KeyRegistry(
+                "the chain head names a newer key epoch than the loaded registry".to_owned(),
+            ));
+        }
         let seq = match previous {
             Some(head) if head.chain_id == chain_id => {
-                if head.key_epoch > key_epoch {
-                    return Err(AuditError::KeyRegistry(
-                        "the chain head names a newer key epoch than the loaded registry"
-                            .to_owned(),
-                    ));
-                }
                 head.seq.checked_add(1).ok_or_else(|| {
                     AuditError::StorageError("audit chain sequence exhausted".to_owned())
                 })?

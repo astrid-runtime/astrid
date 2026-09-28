@@ -310,3 +310,56 @@ fn a_detached_segment_checks_everything_but_its_first_link() {
     );
     assert!(!verifier.verify(&chain[2..], ChainStart::Genesis).valid);
 }
+
+#[test]
+fn the_key_epoch_cannot_regress_where_a_new_chain_opens() {
+    let mut registry = kat_registry();
+    let old = key(1);
+    let new = key(0x11);
+    let record = registry
+        .rotation_record(KeyRole::Audit, &old, &new, at(KAT_GENESIS_SECONDS, 1))
+        .unwrap();
+    registry.push(record).unwrap();
+    let head = signed_chain(&registry, &new, 1);
+    assert_eq!(head[0].v2.as_ref().unwrap().key_epoch, 1);
+
+    // The retired key opens a "new" chain (another principal UID) at its
+    // old epoch, linked to the current head.
+    let mut opening = draft(
+        &registry,
+        &kat_session(),
+        Some(alice()),
+        Some(astrid_core::identity::PrincipalUid::from_bytes([9; 32])),
+        AuditAction::FileRead { path: "/x".into() },
+    );
+    opening.previous_hash = head[0].content_hash();
+    opening.key_epoch = 0;
+    let forged = AuditEntry::create_v2(opening, &old).unwrap();
+    let mut chain = head;
+    chain.push(forged);
+    assert!(
+        issues(&registry, &chain)
+            .iter()
+            .any(|issue| matches!(issue, ChainIssue::KeyEpochRegression { .. }))
+    );
+}
+
+#[test]
+fn a_sequence_overflow_is_malformed_not_saturated() {
+    let registry = kat_registry();
+    let mut chain = signed_chain(&registry, &key(1), 2);
+    chain[0].v2.as_mut().unwrap().seq = u64::MAX;
+    chain[0] = resign(chain[0].clone(), &key(1));
+    chain[1].previous_hash = chain[0].content_hash();
+    chain[1].v2.as_mut().unwrap().seq = u64::MAX;
+    chain[1] = resign(chain[1].clone(), &key(1));
+    let found = ChainVerifier::new(Some(&registry)).verify(&chain, ChainStart::Detached);
+    assert!(
+        found
+            .issues
+            .iter()
+            .any(|issue| matches!(issue, ChainIssue::MalformedEntry { .. })),
+        "{:?}",
+        found.issues
+    );
+}
