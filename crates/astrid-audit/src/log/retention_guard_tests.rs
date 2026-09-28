@@ -134,9 +134,12 @@ async fn prune_oldest_skips_segments_that_are_not_anchored() {
     let log = AuditLog::in_memory(KeyPair::generate());
     log.set_require_anchor_before_prune(true);
     let first = SessionId::new();
+    let blocked = SessionId::new();
     let second = SessionId::new();
-    // Each chain seals one 1,024-entry segment; `first` seals first.
+    // Each chain seals 1,024-entry segments in this order; `blocked` seals
+    // two, so a refused chain's later segment sits between the others.
     append(&log, &first, 1_025).await;
+    append(&log, &blocked, 2_049).await;
     append(&log, &second, 1_025).await;
 
     let reason = refusal(log.prune_oldest(retain(1)).await);
@@ -146,6 +149,14 @@ async fn prune_oldest_skips_segments_that_are_not_anchored() {
     let receipt = log.prune_oldest(retain(1)).await.unwrap().unwrap();
     assert_eq!(receipt.session, second.to_string());
     assert_eq!(receipt.omitted_count, 1_024);
+    assert_eq!(
+        log.chain_stats(&blocked, None)
+            .await
+            .unwrap()
+            .unwrap()
+            .count,
+        2_049
+    );
     assert_eq!(
         log.chain_stats(&first, None).await.unwrap().unwrap().count,
         1_025

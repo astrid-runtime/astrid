@@ -35,11 +35,6 @@ use crate::storage::{KvAuditStorage, SegmentChain, segment_chain};
 
 /// Sealed-segment index keys read per page while choosing a segment.
 const SEGMENT_KEY_PAGE: usize = 256;
-/// Chains checked, and index keys scanned, before the choice gives up. A
-/// chain whose oldest segment cannot be pruned blocks its later segments
-/// too, so they are skipped without being read.
-const MAX_SEGMENT_CHAINS_CHECKED: usize = 64;
-const MAX_SEGMENT_KEYS_SCANNED: usize = 4_096;
 
 /// Operator retention controls, set once the kernel has read its config.
 #[derive(Default)]
@@ -203,6 +198,14 @@ impl AuditLog {
     ///
     /// `Ok(None)` means no sealed segment exists. When segments exist but
     /// none can be pruned, the refusal for the oldest one is returned.
+    ///
+    /// The whole index is read when nothing earlier can be pruned, so a
+    /// refusal means no sealed segment can be. That costs one page of keys
+    /// per 256 segments and a few reads per chain: a chain whose oldest
+    /// segment is refused has every later segment refused too, so those are
+    /// skipped without being read. With the retention hold set, appends at
+    /// the cap do not search again until a watermark advances, a prune
+    /// finishes, a segment is sealed or the caps change.
     pub(super) async fn select_prunable_segment(
         &self,
         policy: AuditRetentionPolicy,
@@ -212,25 +215,19 @@ impl AuditLog {
         };
         let mut blocked = HashSet::new();
         let mut refusal = None;
-        let (mut checked, mut scanned) = (0_usize, 0_usize);
         let mut after: Option<String> = None;
-        'pages: loop {
+        loop {
             let keys = storage
                 .sealed_segment_keys(after.as_deref(), SEGMENT_KEY_PAGE)
                 .await?;
             for key in &keys {
-                scanned = scanned.saturating_add(1);
                 let chain = segment_chain(key)?;
                 if blocked.contains(&chain.chain_key) {
                     continue;
                 }
-                if checked == MAX_SEGMENT_CHAINS_CHECKED || scanned > MAX_SEGMENT_KEYS_SCANNED {
-                    break 'pages;
-                }
                 let Some(segment) = storage.sealed_segment(key).await? else {
                     continue;
                 };
-                checked = checked.saturating_add(1);
                 match self
                     .segment_prune(storage, &chain, segment.segment_count, policy)
                     .await
