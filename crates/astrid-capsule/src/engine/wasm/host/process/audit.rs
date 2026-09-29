@@ -194,6 +194,21 @@ pub(crate) fn record_process_denied(state: &HostState, op: &str, command: &str, 
     }
 }
 
+/// Write-ahead admission of a spawn that passed every gate, before any
+/// spawn preparation (fail-closed `process_spawn` only). The kernel records a
+/// refusal itself; the guest sees a generic `unknown`.
+pub(crate) fn admit_spawn(
+    state: &HostState,
+    command: &str,
+) -> Result<(), crate::engine::wasm::bindings::astrid::process1_1_0::host::ErrorCode> {
+    crate::engine::wasm::host::util::admit_effect(state, HostAuditEvent::ProcessSpawn { command })
+        .map_err(|_| {
+            crate::engine::wasm::bindings::astrid::process1_1_0::host::ErrorCode::Unknown(
+                crate::engine::wasm::host::util::AUDIT_UNAVAILABLE.to_owned(),
+            )
+        })
+}
+
 /// Audit an id-keyed persistent-process op. Logs a short, non-reversible
 /// hash of the `process-id` — never the raw token, per the WIT ("never the
 /// raw id") — plus the op, principal, and capsule.

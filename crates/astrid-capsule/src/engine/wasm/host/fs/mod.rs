@@ -134,6 +134,13 @@ pub(crate) fn record_fs_denied(
     }
 }
 
+/// Write-ahead admission for a gated fs effect (fail-closed classes only).
+/// The kernel records a refusal itself; the guest sees a generic `unknown`.
+fn admit(state: &HostState, event: HostAuditEvent<'_>) -> Result<(), ErrorCode> {
+    util::admit_effect(state, event)
+        .map_err(|_| ErrorCode::Unknown(util::AUDIT_UNAVAILABLE.to_owned()))
+}
+
 /// Map a path-resolution error into an `ErrorCode`. Boundary escapes and
 /// missing principal mounts are flagged separately so the audit log can
 /// distinguish "user mistyped a path" from "tried to escape the VFS."
@@ -385,6 +392,12 @@ impl fs::Host for HostState {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
         let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Write)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        admit(
+            self,
+            HostAuditEvent::FileWrite {
+                path: &resolved.gate_path,
+            },
+        )?;
 
         // Strict-create semantics per `astrid:fs@1.0.0` (fs-mkdir
         // distinguished from fs-mkdir-all by failing when an
@@ -445,6 +458,12 @@ impl fs::Host for HostState {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
         let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Write)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        admit(
+            self,
+            HostAuditEvent::FileWrite {
+                path: &resolved.gate_path,
+            },
+        )?;
         let result =
             util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
                 vfs_path
@@ -520,6 +539,12 @@ impl fs::Host for HostState {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
         let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Delete)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        admit(
+            self,
+            HostAuditEvent::FileDelete {
+                path: &resolved.gate_path,
+            },
+        )?;
         let result =
             util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
                 vfs_path
@@ -544,6 +569,12 @@ impl fs::Host for HostState {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
         let _operation = gate_read_path(self, &resolved.gate_path)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        admit(
+            self,
+            HostAuditEvent::FileRead {
+                path: &resolved.gate_path,
+            },
+        )?;
         // Sentinel string used to encode the "too large at stat time"
         // case as a `PermissionDenied` payload so we can re-raise it
         // as `TooLarge` outside the async block. Keep the marker on a
@@ -615,6 +646,12 @@ impl fs::Host for HostState {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
         let _operation = gate_write_path(self, &resolved.gate_path, WriteKind::Write)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        admit(
+            self,
+            HostAuditEvent::FileWrite {
+                path: &resolved.gate_path,
+            },
+        )?;
         let result =
             util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
                 let handle = vfs_path

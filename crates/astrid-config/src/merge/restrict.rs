@@ -72,6 +72,16 @@ pub fn enforce_restrictions(
         "workspace.never_allow",
     );
 
+    // audit.host_fail_closed: union (a workspace may make more host-call
+    // classes fail closed, never fewer).
+    union_string_arrays(
+        merged,
+        baseline,
+        workspace_layer,
+        &["audit", "host_fail_closed"],
+        "audit.host_fail_closed",
+    );
+
     // security.require_signatures: can only become true.
     enforce_bool_only_true(
         merged,

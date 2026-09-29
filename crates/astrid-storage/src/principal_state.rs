@@ -288,7 +288,9 @@ impl StateOwnerResolver {
 impl KvPrincipalResolver<StateOwner> for StateOwnerResolver {
     fn resolve(&self, namespace: &str) -> StorageResult<StateOwner> {
         if let Some((principal, control)) = namespace.split_once(":control:") {
-            if principal == "system" && matches!(control, "audit" | "invites" | "pair-tokens") {
+            if principal == "system"
+                && matches!(control, "audit" | "audit-lane" | "invites" | "pair-tokens")
+            {
                 return Ok(StateOwner::System);
             }
             // Fixed principal control projections have no capsule suffix. They

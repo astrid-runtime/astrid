@@ -325,6 +325,35 @@ fn test_never_allow_union() {
 }
 
 #[test]
+fn test_host_fail_closed_classes_can_only_be_added() {
+    let baseline: toml::Value = toml::from_str(
+        r#"
+        [audit]
+        host_fail_closed = ["process_spawn"]
+    "#,
+    )
+    .unwrap();
+
+    // Workspace tries to drop process_spawn while adding file_delete.
+    let workspace: toml::Value = toml::from_str(
+        r#"
+        [audit]
+        host_fail_closed = ["file_delete"]
+    "#,
+    )
+    .unwrap();
+
+    let mut merged = baseline.clone();
+    deep_merge(&mut merged, &workspace);
+    enforce_restrictions(&mut merged, &baseline, &workspace);
+
+    let arr = merged["audit"]["host_fail_closed"].as_array().unwrap();
+    let strs: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+    assert!(strs.contains(&"process_spawn"));
+    assert!(strs.contains(&"file_delete"));
+}
+
+#[test]
 fn test_require_signatures_cannot_disable() {
     let baseline: toml::Value = toml::from_str(
         r"

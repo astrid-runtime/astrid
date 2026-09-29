@@ -8,6 +8,27 @@ use tokio_util::sync::CancellationToken;
 /// Maximum allowed length for a guest string or payload (10 MB).
 pub(crate) const MAX_GUEST_PAYLOAD_LEN: u64 = 10 * 1024 * 1024;
 
+/// Guest-facing error detail for a fail-closed host call whose audit entry
+/// could not be recorded. The kernel-side reason stays in the audit log.
+pub(crate) const AUDIT_UNAVAILABLE: &str = "audit unavailable";
+
+/// Admit a host call that passed its security gate, before its effect runs
+/// (see [`HostAuditSink::admit`](crate::audit_sink::HostAuditSink::admit)).
+///
+/// Returns `Err` only for a fail-closed class whose write-ahead entry could
+/// not be made durable; the caller must then fail the call without running
+/// the effect, mapping the error to its `unknown` code with
+/// [`AUDIT_UNAVAILABLE`].
+pub(crate) fn admit_effect(
+    state: &crate::engine::wasm::host_state::HostState,
+    event: crate::audit_sink::HostAuditEvent<'_>,
+) -> Result<(), crate::audit_sink::HostAuditRefusal> {
+    match state.audit_sink.as_ref() {
+        Some(sink) => sink.admit(&state.effective_principal(), event),
+        None => Ok(()),
+    }
+}
+
 /// Run an async future inside `block_in_place` / `block_on` with bounded
 /// concurrency. Acquires a permit from the host semaphore before executing,
 /// limiting concurrent blocking operations across all capsules.

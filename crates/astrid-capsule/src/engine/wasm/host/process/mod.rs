@@ -53,7 +53,7 @@ use context::{PreparedSpawnContext, prepare_spawn_context_with_roots};
 use managed::{ManagedProcess, attach_pipes, configure_piped, prepare_sandboxed_command};
 
 pub(crate) use audit::{
-    audit_process, audit_process_id, audit_process_injections, audit_spawn_result,
+    admit_spawn, audit_process, audit_process_id, audit_process_injections, audit_spawn_result,
     record_process_denied,
 };
 pub use persistent::PersistentProcessRegistry;
@@ -231,6 +231,7 @@ impl process::Host for HostState {
             return Err(ErrorCode::CapabilityDenied);
         }
 
+        admit_spawn(self, &cmd_for_audit)?;
         let process_mount =
             prepare_process_storage_mount(self, "astrid:process/host.spawn", request.cmd.as_str())?;
         let workspace_root = process_mount.as_ref().map_or_else(
@@ -456,6 +457,7 @@ impl process::Host for HostState {
             return Err(ErrorCode::Cancelled);
         }
 
+        admit_spawn(self, &cmd_for_audit)?;
         let process_mount = prepare_process_storage_mount(
             self,
             "astrid:process/host.spawn-background",
@@ -735,6 +737,7 @@ impl process::Host for HostState {
             return Err(ErrorCode::Cancelled);
         }
 
+        admit_spawn(self, &cmd_for_audit)?;
         let process_mount = prepare_process_storage_mount(
             self,
             "astrid:process/host.spawn-persistent",
