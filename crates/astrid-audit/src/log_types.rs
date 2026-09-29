@@ -40,6 +40,7 @@ pub struct ChainVerificationResult {
 
 /// An issue found during chain verification.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ChainIssue {
     /// First entry doesn't have zero previous hash.
     InvalidGenesis {
@@ -60,6 +61,45 @@ pub enum ChainIssue {
         /// Actual previous hash in entry.
         actual_previous: ContentHash,
     },
+    /// A format-v2 entry's sequence number does not follow its predecessor.
+    SequenceGap {
+        /// The entry out of sequence.
+        entry_id: AuditEntryId,
+        /// The sequence number the chain position requires.
+        expected: u64,
+        /// The signed sequence number.
+        actual: u64,
+    },
+    /// A format-v2 entry is signed by a key the key registry does not list
+    /// for the audit role at the entry's key epoch (or there is no registry),
+    /// or a format-v1 entry's key is not registered when that is required.
+    UnregisteredKey {
+        /// The entry.
+        entry_id: AuditEntryId,
+    },
+    /// A format-v2 entry's chain id does not match the registry, session and
+    /// principal it is derived from.
+    ChainIdMismatch {
+        /// The entry.
+        entry_id: AuditEntryId,
+    },
+    /// A format-v1 entry follows a format-v2 entry in the same chain.
+    FormatDowngrade {
+        /// The v1 entry.
+        entry_id: AuditEntryId,
+    },
+    /// A format-v2 entry names an older key epoch than its predecessor.
+    KeyEpochRegression {
+        /// The entry.
+        entry_id: AuditEntryId,
+    },
+    /// An entry cannot be interpreted under its format.
+    MalformedEntry {
+        /// The entry.
+        entry_id: AuditEntryId,
+        /// What is wrong.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for ChainIssue {
@@ -73,6 +113,35 @@ impl std::fmt::Display for ChainIssue {
             },
             Self::BrokenLink { entry_id, .. } => {
                 write!(formatter, "Broken chain link at {entry_id}")
+            },
+            Self::SequenceGap {
+                entry_id,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "Sequence gap at {entry_id}: expected {expected}, found {actual}"
+            ),
+            Self::UnregisteredKey { entry_id } => {
+                write!(
+                    formatter,
+                    "Entry {entry_id} is signed by an unregistered key"
+                )
+            },
+            Self::ChainIdMismatch { entry_id } => {
+                write!(formatter, "Chain id mismatch at {entry_id}")
+            },
+            Self::FormatDowngrade { entry_id } => {
+                write!(
+                    formatter,
+                    "Format-v1 entry {entry_id} follows a format-v2 entry"
+                )
+            },
+            Self::KeyEpochRegression { entry_id } => {
+                write!(formatter, "Key epoch regresses at {entry_id}")
+            },
+            Self::MalformedEntry { entry_id, reason } => {
+                write!(formatter, "Malformed entry {entry_id}: {reason}")
             },
         }
     }

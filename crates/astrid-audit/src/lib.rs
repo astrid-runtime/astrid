@@ -9,13 +9,24 @@
 //! # Security Model
 //!
 //! Every audit entry is:
-//! - Signed by the runtime's ed25519 key
+//! - Signed by an ed25519 key
 //! - Linked to the previous entry via content hash
 //! - Timestamped
 //! - Indexed by session
 //!
 //! The chain linking provides tamper evidence - any modification
 //! to historical entries breaks the chain and is detectable.
+//!
+//! # Entry formats
+//!
+//! Format v1 (the default) signs a mixed binary/JSON layout with the runtime
+//! key and is verified against the key embedded in each entry. Format v2
+//! ([`entry_v2`]) signs a canonical CBOR body covering every field with a
+//! dedicated audit key, carries a per-chain sequence number, and is verified
+//! against a cross-signed key registry, so a rewritten chain signed under
+//! some other key no longer verifies. [`AuditLog::enable_entry_v2`] switches
+//! a log to v2; v1 history stays as it is and is hash-linked into the v2
+//! chains that follow it.
 //!
 //! # Example
 //!
@@ -61,6 +72,7 @@
 #![deny(clippy::unwrap_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+pub mod entry_v2;
 pub mod host_call;
 pub mod prelude;
 
@@ -70,15 +82,19 @@ mod log;
 mod storage;
 
 pub use entry::{
-    ApprovalScope, AuditAction, AuditEntry, AuditOutcome, AuthorizationProof, CapsuleActor,
-    ProviderRequestId,
+    ApprovalScope, AuditAction, AuditEntry, AuditEntryFormat, AuditOutcome, AuthorizationProof,
+    CapsuleActor, ProviderRequestId,
+};
+pub use entry_v2::{
+    AuditActor, ChainStart, ChainVerifier, EntryV2Seal, KeyRegistry, KeyRegistryRecord, KeyRole,
 };
 pub use error::{AuditError, AuditResult};
 pub use log::{
     AuditAnchorMarkResult, AuditAnchorWatermark, AuditArchiveWriter, AuditArchiver,
     AuditCapacityProvider, AuditChainAnchorStatus, AuditChainHead, AuditChainPruneState,
     AuditChainStats, AuditGlobalStats, AuditLog, AuditPruneReceipt, AuditRetentionPolicy,
-    ChainIssue, ChainVerificationResult, LegacyAuditImportReport,
+    ChainIssue, ChainVerificationResult, EntryV2Config, LegacyAuditImportReport,
+    PrincipalUidResolver,
 };
 
 // Re-export AuditEntryId from capabilities for convenience

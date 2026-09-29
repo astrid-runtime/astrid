@@ -109,7 +109,52 @@ Configure audit log storage.
 [audit]
 # path = "~/.local/share/astrid/audit.db"  # Optional: omit for in-memory only
 max_size_mb = 100
+entry_format = "v1"  # "v1" (default) or "v2"
 ```
+
+`entry_format` selects the signed layout of new audit entries.
+
+- `v1` keeps the original layout: signed by the runtime key and verified
+  against the key embedded in each entry.
+- `v2` signs a canonical CBOR body that covers every field. The body
+  includes a per-chain sequence number, nanosecond time, the full outcome,
+  and salted commitments to every field value. v2 entries are signed by a
+  separate audit key, `keys/audit.key`, and verified against a cross-signed
+  key registry kept in the audit store. The byte-level format is specified in the
+  `astrid_audit::entry_v2` crate documentation.
+
+When the daemon first boots with `v2`, it:
+
+1. creates `keys/audit.key`;
+2. writes the key registry, which binds the audit key and records the runtime
+   key as the capability, build and v1-audit key.
+
+Existing v1 entries are kept unchanged. The next entry of each chain starts
+a v2 chain linked to the last v1 entry. From then on, verification also
+requires v1 entries to be signed by the registered v1-audit key (the runtime
+key at enablement), so a v1 chain re-signed under another key is reported. v1
+entries signed by an earlier runtime key, for example one replaced before v2
+was enabled, are reported the same way.
+
+Enabling v2 is one-way for a node. Once the registry exists:
+
+- the daemon keeps writing v2 even if `entry_format` is set back to `v1`,
+  because a v1 entry after a v2 entry would reopen a chain under the weaker
+  format;
+- `keys/audit.key` must be kept: the daemon refuses to boot if it is missing
+  or replaced, since only the registered key can authorize its successor.
+
+If the configuration cannot be read, the daemon refuses to start rather than
+assume `v1`, unless the node is already on v2.
+
+Once v2 is enabled, going back to an Astrid release without v2 support is
+not supported: such a release cannot verify v2 entries and would append v1
+entries after them.
+
+Only the operator's own configuration can set `entry_format`. A workspace
+`.astrid/config.toml` cannot. The daemon applies the setting at boot; an
+embedder that builds the kernel around its own audit log (such as the browser
+profile) enables v2 with `AuditLog::enable_entry_v2`.
 
 ## Keys
 

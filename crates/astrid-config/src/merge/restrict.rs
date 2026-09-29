@@ -120,6 +120,16 @@ pub fn enforce_restrictions(
         "audit.retention",
     );
 
+    // audit.entry_format: enabling v2 creates the key registry and closes v1.
+    // Only the operator may make this one-way transition.
+    block_workspace_override(
+        merged,
+        baseline,
+        workspace_layer,
+        &["audit", "entry_format"],
+        "audit.entry_format",
+    );
+
     // http: operator-only host HTTP ceilings (timeouts, redirect/stream caps,
     // buffered-body limit). These are widening controls — a workspace/project
     // layer raising any of them would let untrusted project config relax the
