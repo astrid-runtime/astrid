@@ -8,7 +8,10 @@
 //! checks the registry under that lock before it commits
 //! (`check_registry_state`). No writer of this store can therefore commit a
 //! format-v1 entry once a registry exists, or a v2 entry signed at an epoch
-//! the registry has moved past.
+//! the registry has moved past. A new prune plan is checked the same way
+//! against the key that signed its receipt (`check_receipt_signer`), so a
+//! stale log handle cannot delete entries under a receipt the registry no
+//! longer accepts.
 
 use super::{AuditError, AuditResult, DURABLE_APPEND_LOCK, KvAuditStorage, NS_KEY_REGISTRY};
 use crate::entry::AuditEntry;
@@ -59,6 +62,33 @@ impl KvAuditStorage {
             .exists(NS_KEY_REGISTRY, &record_key(seq))
             .await
             .map_err(|error| AuditError::StorageError(error.to_string()))
+    }
+
+    /// Refuse a new prune plan whose receipt was signed by a key the stored
+    /// registry does not accept now: a format-v1 receipt (runtime key, no
+    /// epoch) once any registry record exists, or a v2 receipt whose key
+    /// epoch is not the registry head. Callers hold the durable append lock.
+    pub(super) async fn check_receipt_signer(&self, key_epoch: Option<u64>) -> AuditResult<()> {
+        let Some(key_epoch) = key_epoch else {
+            if self.registry_record_exists(0).await? {
+                return Err(AuditError::V1Closed {
+                    reason: "the store holds a format-v2 key registry",
+                });
+            }
+            return Ok(());
+        };
+        if !self.registry_record_exists(key_epoch).await? {
+            return Err(AuditError::KeyRegistry(format!(
+                "audit prune receipt names key epoch {key_epoch}, which the registry does not hold"
+            )));
+        }
+        let next = key_epoch
+            .checked_add(1)
+            .ok_or_else(|| AuditError::StorageError("audit key epoch exhausted".to_owned()))?;
+        if self.registry_record_exists(next).await? {
+            return Err(AuditError::StaleAuditKey { key_epoch });
+        }
+        Ok(())
     }
 
     /// Refuse to commit `entries` against the stored key registry: a v1

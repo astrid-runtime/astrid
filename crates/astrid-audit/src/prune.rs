@@ -250,7 +250,7 @@ async fn prior_receipt(
     })
 }
 
-async fn persist_prune(
+pub(crate) async fn persist_prune(
     log: &AuditLog,
     session_id: &SessionId,
     principal: Option<&PrincipalId>,
@@ -292,6 +292,20 @@ pub(crate) async fn prune_chain(
 }
 
 pub(crate) async fn prune_chain_segment(
+    log: &AuditLog,
+    session_id: &SessionId,
+    principal: Option<&PrincipalId>,
+    policy: AuditRetentionPolicy,
+    selected_segment: Option<(u64, Option<u64>)>,
+) -> AuditResult<AuditPruneReceipt> {
+    let receipt = sign_prune_receipt(log, session_id, principal, policy, selected_segment).await?;
+    // Storage accepts the plan only if the receipt's signer is still the
+    // registry's audit key (see `KvAuditStorage::check_receipt_signer`).
+    persist_prune(log, session_id, principal, &receipt).await
+}
+
+/// Scan the chain and sign the receipt of the prune `policy` asks for.
+pub(crate) async fn sign_prune_receipt(
     log: &AuditLog,
     session_id: &SessionId,
     principal: Option<&PrincipalId>,
@@ -354,7 +368,7 @@ pub(crate) async fn prune_chain_segment(
     let mut receipt = receipt;
     let bytes = receipt.signing_bytes()?;
     receipt.signature = signer.sign(&bytes);
-    persist_prune(log, session_id, principal, &receipt).await
+    Ok(receipt)
 }
 
 pub(crate) fn verify_anchor(

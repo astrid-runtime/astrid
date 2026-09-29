@@ -723,3 +723,115 @@ async fn receipts_anchoring_a_retained_v1_prefix_need_a_registered_key() {
     let result = log.verify_chain(&session).await.unwrap();
     assert!(result.valid, "{:?}", result.issues);
 }
+
+fn keep(retain_entries: usize) -> AuditRetentionPolicy {
+    AuditRetentionPolicy {
+        retain_entries,
+        retain_bytes: None,
+    }
+}
+
+/// The system chain still holds `entries` entries, has no prune receipt, and
+/// verifies.
+async fn assert_unpruned(log: &AuditLog, session: &SessionId, entries: usize) {
+    let chain = log.get_principal_entries(session, None).await.unwrap();
+    assert_eq!(chain.len(), entries);
+    assert!(
+        log.storage()
+            .prune_receipt(session, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let result = log.verify_chain(session).await.unwrap();
+    assert!(result.valid, "{:?}", result.issues);
+}
+
+#[tokio::test]
+async fn a_handle_without_v2_cannot_prune_after_another_enables_it() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let session = SessionId::new();
+    let stale = AuditLog::open_with_kv_store(Arc::clone(&store), runtime()).unwrap();
+    let current = AuditLog::open_with_kv_store(Arc::clone(&store), runtime()).unwrap();
+    current.enable_entry_v2(config(&key(1))).await.unwrap();
+    record(&current, &session, None, 6).await;
+
+    // The first handle would sign the receipt with the runtime key and no
+    // epoch, which the registry no longer accepts: nothing is deleted.
+    let error = stale
+        .prune_chain(&session, None, keep(2))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AuditError::V1Closed { .. }), "{error}");
+    assert_unpruned(&current, &session, 6).await;
+
+    let receipt = current.prune_chain(&session, None, keep(2)).await.unwrap();
+    assert_eq!(receipt.key_epoch, Some(0));
+    let result = current.verify_chain(&session).await.unwrap();
+    assert!(result.valid, "{:?}", result.issues);
+}
+
+#[tokio::test]
+async fn a_handle_behind_a_rotation_cannot_prune() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let session = SessionId::new();
+    let old = key(1);
+    let behind = AuditLog::open_with_kv_store(Arc::clone(&store), runtime()).unwrap();
+    behind.enable_entry_v2(config(&old)).await.unwrap();
+    record(&behind, &session, None, 6).await;
+    let rotating = AuditLog::open_with_kv_store(Arc::clone(&store), runtime()).unwrap();
+    rotating.enable_entry_v2(config(&old)).await.unwrap();
+    rotating.rotate_audit_key(key(0x11)).await.unwrap();
+
+    // The retired epoch-0 key cannot sign a new prune.
+    let error = behind
+        .prune_chain(&session, None, keep(2))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AuditError::StaleAuditKey { key_epoch: 0 }),
+        "{error}"
+    );
+    assert_unpruned(&rotating, &session, 6).await;
+
+    let receipt = rotating.prune_chain(&session, None, keep(2)).await.unwrap();
+    assert_eq!(receipt.key_epoch, Some(1));
+    let result = rotating.verify_chain(&session).await.unwrap();
+    assert!(result.valid, "{:?}", result.issues);
+}
+
+#[tokio::test]
+async fn a_plan_accepted_before_a_rotation_still_finishes() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let session = SessionId::new();
+    let log = AuditLog::open_with_kv_store(Arc::clone(&store), runtime()).unwrap();
+    log.enable_entry_v2(config(&key(1))).await.unwrap();
+    record(&log, &session, None, 6).await;
+    let receipt = crate::log::prune::sign_prune_receipt(&log, &session, None, keep(2), None)
+        .await
+        .unwrap();
+    assert_eq!(receipt.key_epoch, Some(0));
+    log.storage()
+        .as_kv_audit_storage()
+        .unwrap()
+        .test_accept_prune_plan(
+            &session,
+            None,
+            usize::try_from(receipt.retained_count).unwrap(),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // The key rotates while the accepted plan is pending; the plan still
+    // finishes under the receipt it was accepted with.
+    log.rotate_audit_key(key(0x11)).await.unwrap();
+    let installed = crate::log::prune::persist_prune(&log, &session, None, &receipt)
+        .await
+        .unwrap();
+    assert_eq!(installed, receipt);
+    let chain = log.get_principal_entries(&session, None).await.unwrap();
+    assert_eq!(chain.len(), 2);
+    let result = log.verify_chain(&session).await.unwrap();
+    assert!(result.valid, "{:?}", result.issues);
+}

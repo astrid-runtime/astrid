@@ -6,6 +6,26 @@ use crate::error::{AuditError, AuditResult};
 use astrid_core::SessionId;
 
 impl KvAuditStorage {
+    /// Accept a prune plan as a prune does, without deleting anything yet.
+    pub(crate) async fn test_accept_prune_plan(
+        &self,
+        session_id: &SessionId,
+        principal: Option<&astrid_core::PrincipalId>,
+        keep_entries: usize,
+        receipt: Vec<u8>,
+    ) -> AuditResult<()> {
+        let _guard = super::DURABLE_APPEND_LOCK.lock().await;
+        self.load_or_create_prune_plan(
+            session_id,
+            principal,
+            &chain_head_key(session_id, principal),
+            keep_entries,
+            receipt,
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub(crate) async fn test_set_legacy_session_index(
         &self,
         session_id: &SessionId,

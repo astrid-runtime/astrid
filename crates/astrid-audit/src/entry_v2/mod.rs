@@ -168,9 +168,12 @@
 //! was current and its storage chain has not moved past it.
 //! Astrid itself never writes such an entry: an append commits only if its
 //! `key_epoch` is still the latest registry record, checked under the same
-//! lock that registry writes take. Bounding what a leaked retired key can
-//! sign outside Astrid needs an external anchor of the chain heads at
-//! rotation.
+//! lock that registry writes take. A prune is held to the same rule before
+//! it deletes anything: a new deletion plan is accepted only if its receipt's
+//! `key_epoch` is the latest record, or, for a receipt without an epoch, only
+//! while no registry exists. A plan accepted earlier still finishes after a
+//! rotation. Bounding what a leaked retired key can sign outside Astrid needs
+//! an external anchor of the chain heads at rotation.
 //!
 //! # Verification
 //!

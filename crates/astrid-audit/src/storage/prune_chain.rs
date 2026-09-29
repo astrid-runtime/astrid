@@ -10,6 +10,7 @@ struct ReceiptDetails {
     omitted_count: u64,
     segment: Option<u64>,
     seal_ordinal: Option<u64>,
+    key_epoch: Option<u64>,
 }
 
 impl ReceiptDetails {
@@ -29,6 +30,7 @@ impl ReceiptDetails {
             seal_ordinal: value
                 .get("seal_ordinal")
                 .and_then(serde_json::Value::as_u64),
+            key_epoch: value.get("key_epoch").and_then(serde_json::Value::as_u64),
         })
     }
 }
@@ -90,7 +92,7 @@ impl KvAuditStorage {
         }
     }
 
-    async fn load_or_create_prune_plan(
+    pub(super) async fn load_or_create_prune_plan(
         &self,
         session_id: &SessionId,
         principal: Option<&PrincipalId>,
@@ -110,6 +112,9 @@ impl KvAuditStorage {
 
         self.validate_receipt_generation(plan_key, &receipt).await?;
         let details = ReceiptDetails::parse(&receipt)?;
+        // Only a new plan is checked: an accepted plan finishes under the
+        // receipt it was accepted with, even after a later rotation.
+        self.check_receipt_signer(details.key_epoch).await?;
         let segment_key = self
             .find_pruned_segment(session_id, principal, &details)
             .await?;
