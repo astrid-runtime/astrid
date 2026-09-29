@@ -139,10 +139,12 @@ pub(super) async fn caps_token_mint(
     );
     let token_id = token.id.0.to_string();
     let expires_at = token.expires_at.map(|t| t.to_string());
+    let minted = token.clone();
 
     if let Err(e) = kernel.capabilities.add(token).await {
         return err_internal(format!("failed to store capability token: {e}"));
     }
+    crate::grant_audit::record_token_created(kernel, &minted).await;
 
     success_json(serde_json::json!({
         "token_id": token_id,
@@ -162,12 +164,28 @@ pub(super) async fn caps_token_revoke(
         Ok(u) => TokenId::from_uuid(u),
         Err(e) => return err_bad_input(format!("invalid token id {token_id:?}: {e}")),
     };
+    // The subject, when the token is still known, so the revocation is
+    // chained under the principal that lost the capability.
+    let subject = kernel
+        .capabilities
+        .get(&parsed)
+        .await
+        .ok()
+        .flatten()
+        .map(|token| token.principal);
     // `revoke` is idempotent: it writes the global revoked marker even for an
     // id with no live token (best-effort delete of the primary row). So an
     // error here is a genuine storage failure, not "unknown token".
     if let Err(e) = kernel.capabilities.revoke(&parsed).await {
         return err_internal(format!("failed to revoke token {token_id:?}: {e}"));
     }
+    crate::grant_audit::record_token_revoked(
+        kernel,
+        subject.as_ref(),
+        &parsed,
+        "admin.caps.token.revoke",
+    )
+    .await;
     success_json(serde_json::json!({
         "token_id": token_id,
         "revoked": true,

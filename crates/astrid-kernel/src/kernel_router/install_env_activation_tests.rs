@@ -13,7 +13,7 @@ use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody};
 use super::admin::{dispatch_as_operator, seed_operator};
 use super::install::{InstallCapsuleRequest, handle_install_capsule};
 
-fn write_runtime_signing_key(kernel: &crate::Kernel) {
+pub(super) fn write_runtime_signing_key(kernel: &crate::Kernel) {
     let path = kernel.astrid_home.runtime_key_path();
     std::fs::create_dir_all(kernel.astrid_home.keys_dir()).expect("keys directory");
     std::fs::write(&path, kernel.runtime_key.secret_key_bytes()).expect("runtime key bytes");

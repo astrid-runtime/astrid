@@ -31,6 +31,9 @@ impl sys::Host for HostState {
         // principal scope followed by the host/system scope.
         if self.secret_env.contains(&key) {
             let value = resolve_secret(self, &key);
+            // Remember the value host-side so outbound HTTP audit
+            // commitments can redact it (see `host::http::audit`).
+            self.revealed_secrets.note(&value);
             return Ok(if value.is_empty() { None } else { Some(value) });
         }
 
@@ -253,7 +256,7 @@ impl sys::Host for HostState {
 ///
 /// 1. Principal control scope for the effective principal.
 /// 2. Host/system control scope for the capsule.
-fn resolve_secret(state: &HostState, key: &str) -> String {
+pub(crate) fn resolve_secret(state: &HostState, key: &str) -> String {
     use astrid_storage::{KvSecretStore, ScopedKvStore, SecretStore};
 
     let capsule = state.capsule_id.as_str();

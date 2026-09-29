@@ -93,6 +93,7 @@ use astrid_events::AstridEvent;
 use astrid_events::ipc::{IpcMessage, IpcPayload, MessageOrigin, Topic};
 use uuid::Uuid;
 
+use crate::audit_sink::HostApprovalScope;
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
 use crate::profile_cache::PrincipalProfileCache;
@@ -102,6 +103,9 @@ use crate::security::net_connect_pattern_matches;
 /// Mirrors `host/approval.rs`'s `MAX_APPROVAL_TIMEOUT_MS` so every runtime
 /// consent shares one human-facing budget.
 const CONSENT_TIMEOUT_MS: u64 = 60_000;
+
+/// Approval action name of a local-egress consent prompt.
+const EGRESS_CONSENT_ACTION: &str = "local-network-egress";
 
 /// Build the per-principal, per-capsule network action this consent is about.
 /// The grant and the lookup must use the same shape so a cached grant
@@ -384,9 +388,17 @@ impl HostState {
         let capsule_id = self.capsule_id.to_string();
         let endpoint = format!("{host}:{port}");
 
+        let mut audit = super::approval_audit::ApprovalAudit::new(
+            self,
+            &principal,
+            EGRESS_CONSENT_ACTION,
+            &endpoint,
+        );
+
         // 2. EXISTING-GRANT FAST PATH. A prior consent for this principal +
         // capsule + endpoint short-circuits the prompt.
         if has_runtime_grant(&store, &principal, &capsule_id, host, port) {
+            audit.granted(HostApprovalScope::Session, "session_grant");
             return true;
         }
 
@@ -410,13 +422,15 @@ impl HostState {
                 endpoint = %endpoint,
                 "local-egress consent: honoring persisted approve_always grant (no prompt)"
             );
+            audit.granted(HostApprovalScope::Always, "remembered_consent");
             return true;
         }
 
         // 4. ELICIT. Publish `ApprovalRequired` and block for the response.
-        let decision = self.elicit_egress_consent(&principal, &endpoint);
+        let decision = self.elicit_egress_consent(&principal, &endpoint, &mut audit);
         match classify_decision(&decision) {
             Decision::Deny => {
+                audit.denied("user", "not approved");
                 tracing::info!(
                     security_event = true,
                     capsule_id = %self.capsule_id.as_str(),
@@ -437,6 +451,7 @@ impl HostState {
                     endpoint = %endpoint,
                     "local-egress consent: approved once"
                 );
+                audit.granted(HostApprovalScope::Once, "user");
                 true
             },
             Decision::Session => {
@@ -448,6 +463,7 @@ impl HostState {
                     endpoint = %endpoint,
                     "local-egress consent: approved for session"
                 );
+                audit.granted(HostApprovalScope::Session, "user");
                 true
             },
             Decision::Always => {
@@ -483,6 +499,7 @@ impl HostState {
                     endpoint = %endpoint,
                     "local-egress consent: approved always"
                 );
+                audit.granted(HostApprovalScope::Always, "user");
                 true
             },
         }
@@ -517,7 +534,12 @@ impl HostState {
     /// same principal. A surface with response-topic publish rights but the
     /// wrong principal can no longer satisfy another principal's consent prompt,
     /// and unstamped replies fail closed by timing out.
-    fn elicit_egress_consent(&self, principal: &PrincipalId, endpoint: &str) -> String {
+    fn elicit_egress_consent(
+        &self,
+        principal: &PrincipalId,
+        endpoint: &str,
+        audit: &mut super::approval_audit::ApprovalAudit,
+    ) -> String {
         let event_bus = self.event_bus.clone();
         let runtime_handle = self.runtime_handle.clone();
         let cancel_token = self.effective_cancel_token();
@@ -536,10 +558,13 @@ impl HostState {
                 endpoint,
                 "local-egress consent has no authenticated request owner; denying"
             );
+            audit.denied("no_request_owner", "no authenticated request owner");
             return String::new();
         };
 
         let request_id = Uuid::new_v4().to_string();
+        // Durable before the prompt is published.
+        audit.requested(&request_id);
         // Shared approval response channel — see the "Response principal
         // isolation" note above for the same-principal response check that
         // makes this safe without a separate egress namespace.
@@ -550,7 +575,7 @@ impl HostState {
         let payload = IpcPayload::ApprovalRequired {
             request_id: request_id.clone(),
             request_owner: request_owner.to_string(),
-            action: "local-network-egress".to_string(),
+            action: EGRESS_CONSENT_ACTION.to_string(),
             resource: endpoint.to_string(),
             reason: format!(
                 "Capsule '{capsule_id}' wants to reach the local endpoint \
@@ -590,12 +615,25 @@ impl HostState {
                 AstridEvent::Ipc { message, .. } => match &message.payload {
                     IpcPayload::ApprovalResponse { decision, .. } => decision.clone(),
                     // Unexpected payload on the response topic — treat as deny.
-                    _ => String::new(),
+                    _ => {
+                        audit.denied("error", "unexpected response payload");
+                        String::new()
+                    },
                 },
-                _ => String::new(),
+                _ => {
+                    audit.denied("error", "unexpected response event");
+                    String::new()
+                },
             },
             // Timeout or cancellation — deny (fail closed).
-            None => String::new(),
+            None => {
+                if cancel_token.is_cancelled() {
+                    audit.denied("cancelled", "invocation cancelled");
+                } else {
+                    audit.denied("timeout", "no response before the timeout");
+                }
+                String::new()
+            },
         }
     }
 }

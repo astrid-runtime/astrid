@@ -5,12 +5,19 @@
 //! and signed by the runtime.
 
 use astrid_capabilities::AuditEntryId;
-use astrid_core::{Permission, SessionId, Timestamp, TokenId};
+use astrid_core::{Permission, PrincipalId, SessionId, Timestamp, TokenId};
 use astrid_crypto::{ContentHash, KeyPair, PublicKey, Signature};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AuditError, AuditResult};
 use crate::host_call::HostCallSummary;
+
+mod coverage;
+mod describe;
+#[cfg(test)]
+mod tests;
+
+pub use coverage::{CapsuleActor, ProviderRequestId};
 
 /// A single audit log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +208,11 @@ pub enum AuditAction {
     },
 
     /// Capsule tool was called.
+    ///
+    /// The host records one entry per tool invocation it delivers to a tool
+    /// capsule: the arguments and the published result are committed by hash
+    /// only, and the outcome is a failure when the tool reported an error,
+    /// published no result, or trapped.
     CapsuleToolCall {
         /// Capsule ID.
         capsule_id: String,
@@ -208,6 +220,16 @@ pub enum AuditAction {
         tool: String,
         /// Hash of the arguments (not the args themselves for privacy).
         args_hash: ContentHash,
+        /// Caller-supplied correlation id of the call (for example the model's
+        /// tool-call id). Correlation hint only; it is not host-minted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        /// Hash of the result content the tool published, if it published one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result_hash: Option<ContentHash>,
+        /// Code identity of the capsule that ran the tool.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<CapsuleActor>,
     },
 
     /// MCP resource was read.
@@ -254,20 +276,32 @@ pub enum AuditAction {
     FileRead {
         /// File path.
         path: String,
+        /// Code identity of the capsule that made the host call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<CapsuleActor>,
     },
 
     /// File was written.
     FileWrite {
         /// File path.
         path: String,
-        /// Hash of the written content.
+        /// BLAKE3 hash of the written content. The zero hash means no content
+        /// bytes were involved: a directory creation, a write denied before
+        /// any content was accepted, or an entry written before content
+        /// hashing was recorded.
         content_hash: ContentHash,
+        /// Code identity of the capsule that made the host call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<CapsuleActor>,
     },
 
     /// File was deleted.
     FileDelete {
         /// File path.
         path: String,
+        /// Code identity of the capsule that made the host call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<CapsuleActor>,
     },
 
     /// Outbound network connection attempt by a capsule host call.
@@ -281,12 +315,18 @@ pub enum AuditAction {
         host: String,
         /// Destination port.
         port: u16,
+        /// Code identity of the capsule that made the host call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<CapsuleActor>,
     },
 
     /// Socket bind by a capsule host call (`astrid:net` bind).
     NetBind {
         /// Bind address.
         addr: String,
+        /// Code identity of the capsule that made the host call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<CapsuleActor>,
     },
 
     /// Child-process spawn by a capsule host call (`astrid:process` spawn).
@@ -296,6 +336,9 @@ pub enum AuditAction {
     ProcessSpawn {
         /// Command being executed.
         command: String,
+        /// Code identity of the capsule that made the host call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<CapsuleActor>,
     },
 
     /// Capability token was created.
@@ -319,11 +362,22 @@ pub enum AuditAction {
     },
 
     /// Approval was requested from the user.
+    ///
+    /// The matching decision is an [`ApprovalGranted`](Self::ApprovalGranted)
+    /// or [`ApprovalDenied`](Self::ApprovalDenied) entry carrying the same
+    /// `request_id` and, when this entry was durably appended first, its entry
+    /// id as `request_entry_id`.
     ApprovalRequested {
         /// Type of action being requested.
         action_type: String,
         /// Resource being accessed.
         resource: String,
+        /// Host-minted id of the approval request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        /// Code identity of the capsule that asked for approval.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<CapsuleActor>,
     },
 
     /// User granted approval.
@@ -334,6 +388,21 @@ pub enum AuditAction {
         resource: Option<String>,
         /// Scope of approval.
         scope: ApprovalScope,
+        /// Id of the approval request this decision answers. `None` when no
+        /// prompt was issued (an existing allowance satisfied the request).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        /// Entry id of the matching [`ApprovalRequested`](Self::ApprovalRequested)
+        /// entry, when it was durably appended before the decision.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_entry_id: Option<AuditEntryId>,
+        /// How the approval was obtained (for example `user`,
+        /// `session_allowance`, `remembered_consent`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        via: Option<String>,
+        /// Code identity of the capsule that asked for approval.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<CapsuleActor>,
     },
 
     /// User denied approval.
@@ -342,6 +411,16 @@ pub enum AuditAction {
         action: String,
         /// Reason given.
         reason: Option<String>,
+        /// Id of the approval request this decision answers, if one was issued.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        /// Entry id of the matching [`ApprovalRequested`](Self::ApprovalRequested)
+        /// entry, when it was durably appended before the decision.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_entry_id: Option<AuditEntryId>,
+        /// Code identity of the capsule that asked for approval.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<CapsuleActor>,
     },
 
     /// Session started.
@@ -471,13 +550,17 @@ pub enum AuditAction {
 
     /// Inbound TCP connection accepted by a capsule listener.
     ///
-    /// Kept at the end of this fieldless enum so adding the action does not
-    /// change the implicit discriminants of any existing public variant.
+    /// Appended after the variants that existed before it, so adding the
+    /// action did not change the implicit discriminants of any of them. Later
+    /// actions are appended after it for the same reason.
     NetAccept {
         /// Host-observed local listener endpoint.
         local_addr: String,
         /// Host-observed remote peer endpoint.
         peer_addr: String,
+        /// Code identity of the capsule that owns the listener.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<CapsuleActor>,
     },
 
     /// Consecutive capsule host calls of one principal, recorded as one
@@ -521,174 +604,143 @@ pub enum AuditAction {
         /// The action the call's outcome entry records.
         call: Box<AuditAction>,
     },
-}
-
-impl AuditAction {
-    /// Describe the MCP-prefixed actions (tool/capsule call, resource,
-    /// prompt, elicitation, sampling). Returns `None` for non-MCP actions so
-    /// [`description`](Self::description) can fall through. Factored out to
-    /// keep `description` under the function-length lint.
-    fn describe_mcp(&self) -> Option<String> {
-        let s = match self {
-            Self::McpToolCall { server, tool, .. } => {
-                format!("Called tool {server}:{tool}")
-            },
-            Self::CapsuleToolCall {
-                capsule_id, tool, ..
-            } => {
-                format!("Called capsule tool {capsule_id}:{tool}")
-            },
-            Self::McpResourceRead { server, uri } => {
-                format!("Read resource {server}:{uri}")
-            },
-            Self::McpPromptGet { server, name } => {
-                format!("Got prompt {server}:{name}")
-            },
-            Self::McpElicitation { request_id, schema } => {
-                format!("Elicitation {request_id} ({schema})")
-            },
-            Self::McpUrlElicitation {
-                interaction_type, ..
-            } => {
-                format!("URL elicitation ({interaction_type})")
-            },
-            Self::McpSampling { model, .. } => {
-                format!("Sampling request to {model}")
-            },
-            _ => return None,
-        };
-        Some(s)
-    }
-
-    /// Describe the host-audit lane records. Returns `None` for every other
-    /// action; kept apart from [`description`](Self::description) for the
-    /// same function-length reason as [`describe_mcp`](Self::describe_mcp).
-    fn describe_host_lane(&self) -> Option<String> {
-        let s = match self {
-            Self::HostCallRun { calls } => format!("Recorded {} host calls", calls.count),
-            Self::HostCallLoss { calls, reason } => {
-                format!("Lost {} host calls ({reason})", calls.count)
-            },
-            Self::HostCallGap { epoch, reason, .. } => {
-                format!("Host-audit gap after lane {epoch} ({reason})")
-            },
-            Self::HostCallAdmitted { call } => format!("Admitted: {}", call.description()),
-            _ => return None,
-        };
-        Some(s)
-    }
-
-    /// Get a human-readable description of the action.
+    /// Kernel-mediated HTTP request, recorded before it leaves the host.
     ///
-    /// MCP-prefixed actions are described by [`describe_mcp`](Self::describe_mcp);
-    /// everything else falls through to the match below. Split this way to stay
-    /// under the function-length lint.
-    #[must_use]
-    pub fn description(&self) -> String {
-        match self {
-            // MCP-prefixed actions: delegate to the dedicated helper. The
-            // helper returns `Some` for exactly these variants, so the
-            // fallback is never taken — it keeps the call total instead of
-            // panicking.
-            Self::McpToolCall { .. }
-            | Self::CapsuleToolCall { .. }
-            | Self::McpResourceRead { .. }
-            | Self::McpPromptGet { .. }
-            | Self::McpElicitation { .. }
-            | Self::McpUrlElicitation { .. }
-            | Self::McpSampling { .. } => self.describe_mcp().unwrap_or_default(),
-            Self::FileRead { path } => {
-                format!("Read file {path}")
-            },
-            Self::FileWrite { path, .. } => {
-                format!("Wrote file {path}")
-            },
-            Self::FileDelete { path } => {
-                format!("Deleted file {path}")
-            },
-            Self::NetConnect { host, port } => {
-                format!("Connected to {host}:{port}")
-            },
-            Self::NetBind { addr } => {
-                format!("Bound socket {addr}")
-            },
-            Self::NetAccept {
-                local_addr,
-                peer_addr,
-            } => {
-                format!("Accepted connection from {peer_addr} on {local_addr}")
-            },
-            Self::ProcessSpawn { command } => {
-                format!("Spawned process {command}")
-            },
-            Self::HostCallRun { .. }
-            | Self::HostCallLoss { .. }
-            | Self::HostCallGap { .. }
-            | Self::HostCallAdmitted { .. } => self.describe_host_lane().unwrap_or_default(),
-            Self::CapabilityCreated { resource, .. } => {
-                format!("Created capability for {resource}")
-            },
-            Self::CapabilityRevoked { token_id, .. } => {
-                format!("Revoked capability {token_id}")
-            },
-            Self::ApprovalRequested {
-                action_type,
-                resource,
-                ..
-            } => {
-                format!("Approval requested: {action_type} on {resource}")
-            },
-            Self::ApprovalGranted { action, .. } => {
-                format!("Approved: {action}")
-            },
-            Self::ApprovalDenied { action, .. } => {
-                format!("Denied: {action}")
-            },
-            Self::SessionStarted { platform, .. } => {
-                format!("Session started via {platform}")
-            },
-            Self::SessionEnded { reason, .. } => {
-                format!("Session ended: {reason}")
-            },
-            Self::ContextSummarized { evicted_count, .. } => {
-                format!("Summarized {evicted_count} messages")
-            },
-            Self::LlmRequest { model, .. } => {
-                format!("LLM request to {model}")
-            },
-            Self::ServerStarted { name, .. } => {
-                format!("Started server {name}")
-            },
-            Self::ServerStopped { name, .. } => {
-                format!("Stopped server {name}")
-            },
-            Self::ElicitationSent { server, .. } => {
-                format!("Elicitation from {server}")
-            },
-            Self::ElicitationReceived { action, .. } => {
-                format!("Elicitation response: {action}")
-            },
-            Self::SecurityViolation { violation_type, .. } => {
-                format!("Security violation: {violation_type}")
-            },
-            Self::SubAgentSpawned { description, .. } => {
-                format!("Spawned sub-agent: {description}")
-            },
-            Self::ConfigReloaded => "Configuration reloaded".to_string(),
-            Self::AdminRequest {
-                method,
-                required_capability,
-                target_principal,
-                params: _,
-                device_key_id: _,
-            } => match target_principal {
-                Some(target) => {
-                    format!("Admin {method} on {target} (capability {required_capability})")
-                },
-                None => format!("Admin {method} (capability {required_capability})"),
-            },
-        }
-    }
+    /// The capsule HTTP host appends this entry after the scheme, egress and
+    /// security-gate checks pass and before the request is sent, and waits
+    /// for the append, so every request the host sent has an entry that
+    /// precedes it on the chain. A request refused by those checks is recorded
+    /// with [`AuthorizationProof::Denied`]. Each redirect hop is a separate
+    /// request. Content is never stored: `path_hash`, `headers_hash` and
+    /// `body_hash` are BLAKE3 commitments computed after credentials are
+    /// redacted. The completion is an [`HttpResponse`](Self::HttpResponse)
+    /// entry with the same `sequence`.
+    HttpRequest {
+        /// Kernel-assigned request number, per principal and kernel run
+        /// (`run_id`), starting at 1. Every `HttpRequest` entry takes the next
+        /// number, so a gap within a run means an entry is missing.
+        sequence: u64,
+        /// Identifier of the kernel run that assigned `sequence`. A daemon
+        /// restart starts a new run whose numbering restarts at 1.
+        run_id: String,
+        /// HTTP method.
+        method: String,
+        /// Destination host from the request URL.
+        host: String,
+        /// Destination port.
+        port: u16,
+        /// BLAKE3 of the redacted path and query.
+        path_hash: ContentHash,
+        /// BLAKE3 of the redacted request headers in canonical form.
+        headers_hash: ContentHash,
+        /// BLAKE3 of the redacted request body (of empty input when there is
+        /// no body).
+        body_hash: ContentHash,
+        /// Length of the request body in bytes.
+        body_len: u64,
+        /// `0` for the capsule's request, `n` for the `n`-th redirect hop.
+        redirect_hop: u32,
+        /// Names of secrets the host injected into the request. The values are
+        /// never part of any commitment.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        injected_secrets: Vec<String>,
+        /// Code identity of the capsule that made the request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<CapsuleActor>,
+    },
+
+    /// Completion of a kernel-mediated HTTP request.
+    ///
+    /// Written when the response body has been delivered to the capsule (or
+    /// the exchange ended early). The body hash is computed incrementally over
+    /// the bytes in the order the host delivered them.
+    HttpResponse {
+        /// `sequence` of the matching [`HttpRequest`](Self::HttpRequest).
+        sequence: u64,
+        /// `run_id` of the matching [`HttpRequest`](Self::HttpRequest).
+        run_id: String,
+        /// Entry id of the matching [`HttpRequest`](Self::HttpRequest), when
+        /// its append succeeded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_entry_id: Option<AuditEntryId>,
+        /// Response status, when response headers were received.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
+        /// BLAKE3 of the response body bytes delivered to the capsule. `None`
+        /// when the body was not read (a followed redirect, or a transport
+        /// error before the response).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body_hash: Option<ContentHash>,
+        /// Number of body bytes covered by `body_hash`.
+        body_len: u64,
+        /// Whether the body was read to its end.
+        complete: bool,
+        /// Provider request ids from the response headers (for example
+        /// `x-request-id`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        provider_request_ids: Vec<ProviderRequestId>,
+        /// Code identity of the capsule that made the request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<CapsuleActor>,
+    },
+
+    /// A principal's authority changed: capability patterns, capsule grants
+    /// or group membership.
+    ///
+    /// Recorded after the change is applied, alongside the
+    /// [`AdminRequest`](Self::AdminRequest) entry that authorized it (if any).
+    /// Capability tokens use [`CapabilityCreated`](Self::CapabilityCreated)
+    /// and [`CapabilityRevoked`](Self::CapabilityRevoked) instead.
+    CapabilityChanged {
+        /// Principal whose authority changed.
+        target_principal: PrincipalId,
+        /// What changed: `capability`, `capsule` or `group`.
+        kind: String,
+        /// Items granted or added.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        granted: Vec<String>,
+        /// Items revoked or removed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        revoked: Vec<String>,
+        /// Mechanism that applied the change (for example `admin.caps.grant`
+        /// or `grant_on_use`).
+        via: String,
+    },
+
+    /// A capsule was installed.
+    CapsuleInstalled {
+        /// Capsule id.
+        capsule_id: String,
+        /// Capsule version.
+        version: String,
+        /// Principal the capsule was installed for.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_principal: Option<PrincipalId>,
+        /// BLAKE3 of the installed wasm component, if the capsule has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wasm_hash: Option<ContentHash>,
+        /// BLAKE3 of the exact installed `Capsule.toml` bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        manifest_hash: Option<ContentHash>,
+    },
+
+    /// A capsule runtime was loaded and activated.
+    CapsuleLoaded {
+        /// Capsule id.
+        capsule_id: String,
+        /// Capsule version.
+        version: String,
+        /// BLAKE3 of the verified wasm component, if the capsule has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wasm_hash: Option<ContentHash>,
+        /// BLAKE3 of the exact `Capsule.toml` bytes the runtime was built from.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        manifest_hash: Option<ContentHash>,
+        /// Identifier of the engine configuration the code was compiled for.
+        engine_profile: String,
+        /// Why the runtime was built: `load` or `replace`.
+        trigger: String,
+    },
 }
 
 /// How an action was authorized.
@@ -797,118 +849,5 @@ impl AuditOutcome {
         Self::Failure {
             error: error.into(),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use astrid_crypto::KeyPair;
-
-    fn test_keypair() -> KeyPair {
-        KeyPair::generate()
-    }
-
-    #[test]
-    fn test_entry_creation() {
-        let keypair = test_keypair();
-        let session_id = SessionId::new();
-
-        let entry = AuditEntry::create(
-            session_id,
-            AuditAction::SessionStarted {
-                user_id: keypair.key_id(),
-                platform: "cli".to_string(),
-            },
-            AuthorizationProof::System {
-                reason: "session start".to_string(),
-            },
-            AuditOutcome::success(),
-            ContentHash::zero(),
-            &keypair,
-        );
-
-        assert!(entry.verify_signature().is_ok());
-    }
-
-    #[test]
-    fn test_chain_linking() {
-        let keypair = test_keypair();
-        let session_id = SessionId::new();
-
-        let entry1 = AuditEntry::create(
-            session_id.clone(),
-            AuditAction::SessionStarted {
-                user_id: keypair.key_id(),
-                platform: "cli".to_string(),
-            },
-            AuthorizationProof::System {
-                reason: "session start".to_string(),
-            },
-            AuditOutcome::success(),
-            ContentHash::zero(),
-            &keypair,
-        );
-
-        let entry2 = AuditEntry::create(
-            session_id,
-            AuditAction::McpToolCall {
-                server: "test".to_string(),
-                tool: "tool".to_string(),
-                args_hash: ContentHash::hash(b"args"),
-            },
-            AuthorizationProof::NotRequired {
-                reason: "test".to_string(),
-            },
-            AuditOutcome::success(),
-            entry1.content_hash(),
-            &keypair,
-        );
-
-        assert!(entry2.follows(&entry1));
-        assert!(!entry1.follows(&entry2));
-    }
-
-    #[test]
-    fn test_signature_tampering() {
-        let keypair = test_keypair();
-        let session_id = SessionId::new();
-
-        let mut entry = AuditEntry::create(
-            session_id,
-            AuditAction::SessionStarted {
-                user_id: keypair.key_id(),
-                platform: "cli".to_string(),
-            },
-            AuthorizationProof::System {
-                reason: "session start".to_string(),
-            },
-            AuditOutcome::success(),
-            ContentHash::zero(),
-            &keypair,
-        );
-
-        // Valid signature
-        assert!(entry.verify_signature().is_ok());
-
-        // Tamper with the entry
-        entry.action = AuditAction::SessionEnded {
-            reason: "tampered".to_string(),
-            duration_secs: 0,
-        };
-
-        // Signature should now fail
-        assert!(entry.verify_signature().is_err());
-    }
-
-    #[test]
-    fn test_action_description() {
-        let action = AuditAction::McpToolCall {
-            server: "filesystem".to_string(),
-            tool: "read_file".to_string(),
-            args_hash: ContentHash::zero(),
-        };
-
-        assert!(action.description().contains("filesystem:read_file"));
     }
 }

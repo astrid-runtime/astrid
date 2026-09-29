@@ -5,6 +5,7 @@
 //! then the shared [`AllowanceStore`] (instant path), then publishes an
 //! [`ApprovalRequired`] IPC event and blocks until the frontend responds.
 
+use crate::audit_sink::HostApprovalScope;
 use crate::engine::wasm::bindings::astrid::approval::host::{
     self as approval, ApprovalDecision, ApprovalRequest, ApprovalResponse, ErrorCode,
 };
@@ -386,8 +387,15 @@ impl approval::Host for HostState {
         );
 
         let ws_path = Some(workspace_root.as_path());
+        let mut audit = super::approval_audit::ApprovalAudit::new(
+            self,
+            &principal,
+            &request.action,
+            &request.target_resource,
+        );
 
         if check_persisted_allowance(self, &principal, &request.target_resource)? {
+            audit.granted(HostApprovalScope::Always, "remembered_consent");
             return Ok(ApprovalResponse {
                 decision: ApprovalDecision::Allowance,
             });
@@ -403,6 +411,7 @@ impl approval::Host for HostState {
                 resource = %request.target_resource,
                 "Approval auto-granted via existing allowance"
             );
+            audit.granted(HostApprovalScope::Session, "session_allowance");
 
             return Ok(ApprovalResponse {
                 decision: ApprovalDecision::Allowance,
@@ -422,12 +431,15 @@ impl approval::Host for HostState {
                 principal = %principal,
                 "approval request has no authenticated owner; denying"
             );
+            audit.denied("no_request_owner", "no authenticated request owner");
             return Ok(ApprovalResponse {
                 decision: ApprovalDecision::Denied,
             });
         };
         let request_id = Uuid::new_v4().to_string();
         let response_topic = Topic::approval_response(&request_id);
+        // Durable before the prompt is published.
+        audit.requested(&request_id);
 
         // Subscribe BEFORE publishing to prevent a race.
         let mut receiver = event_bus.subscribe_topic(response_topic.as_str());
@@ -488,10 +500,26 @@ impl approval::Host for HostState {
                         IpcPayload::ApprovalResponse {
                             decision, reason, ..
                         } => {
-                            if decision == "approve_always" {
-                                persist_always(self, &principal, &request.action)?;
+                            if decision == "approve_always"
+                                && let Err(error) =
+                                    persist_always(self, &principal, &request.action)
+                            {
+                                audit.denied("user", "approve_always could not be persisted");
+                                return Err(error);
                             }
                             let typed = decision_from_str(decision);
+                            match typed {
+                                ApprovalDecision::Approved => {
+                                    audit.granted(HostApprovalScope::Once, "user");
+                                },
+                                ApprovalDecision::ApprovedSession => {
+                                    audit.granted(HostApprovalScope::Session, "user");
+                                },
+                                ApprovalDecision::ApprovedAlways => {
+                                    audit.granted(HostApprovalScope::Always, "user");
+                                },
+                                _ => audit.denied("user", "denied by user"),
+                            }
                             let approved = matches!(
                                 typed,
                                 ApprovalDecision::Approved
@@ -541,6 +569,11 @@ impl approval::Host for HostState {
                     action = %request.action,
                     "Approval request timed out or was cancelled"
                 );
+                if cancel_token.is_cancelled() {
+                    audit.denied("cancelled", "invocation cancelled");
+                } else {
+                    audit.denied("timeout", "no response before the timeout");
+                }
                 // Per WIT: timeout returns the typed `timeout` ErrorCode arm.
                 Err(ErrorCode::Timeout)
             },
@@ -555,3 +588,7 @@ mod tests;
 #[cfg(test)]
 #[path = "approval_hosted_identity_tests.rs"]
 mod hosted_identity_tests;
+
+#[cfg(test)]
+#[path = "approval_audit_tests.rs"]
+mod audit_tests;

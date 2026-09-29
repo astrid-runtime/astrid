@@ -1,6 +1,6 @@
 //! Bounded asynchronous host-audit sink: the seam by which sensitive per-action
-//! host calls (fs read/write/delete, net connect/bind, process spawn)
-//! reach the kernel's durable, signed, hash-chained audit log.
+//! host calls (fs read/write/delete, net connect/bind, process spawn, HTTP
+//! exchanges) reach the kernel's durable, signed, hash-chained audit log.
 //!
 //! # Why a sink trait rather than a direct append
 //!
@@ -30,6 +30,16 @@
 //! before the effect; the effect runs only once a write-ahead entry is
 //! durable.
 
+//! HTTP requests and completions can await a durable receipt through
+//! [`HostAuditSink::commit`]; append failures remain explicit in that receipt.
+
+mod coverage;
+
+pub use coverage::{
+    HostApprovalDecision, HostApprovalScope, HostAuditActor, HostAuditReceipt, HostHttpRequest,
+    HostHttpResponse, attribute_sink,
+};
+
 /// A sensitive host-call action being reported to the audit sink.
 ///
 /// Variants borrow their string payloads from the host fn's own stack —
@@ -56,6 +66,9 @@ pub enum HostAuditEvent<'a> {
     FileWrite {
         /// The path that was written.
         path: &'a str,
+        /// BLAKE3 of the bytes written. `None` for a directory creation or a
+        /// write denied before any content was accepted.
+        content_hash: Option<astrid_crypto::ContentHash>,
     },
     /// A filesystem removal (unlink or directory removal).
     FileDelete {
@@ -86,6 +99,36 @@ pub enum HostAuditEvent<'a> {
         /// Host-observed remote peer endpoint.
         peer_addr: &'a str,
     },
+    /// A kernel-mediated HTTP request about to be sent (or refused).
+    HttpRequest(HostHttpRequest<'a>),
+    /// Completion of a kernel-mediated HTTP request.
+    HttpResponse(HostHttpResponse<'a>),
+    /// A tool invocation delivered to a tool capsule, with the result it
+    /// published during the invocation (if any).
+    ToolCall {
+        /// Capsule that ran the tool.
+        capsule_id: &'a str,
+        /// Tool name, taken from the request topic.
+        tool: &'a str,
+        /// Caller-supplied call id (correlation hint only).
+        call_id: Option<&'a str>,
+        /// BLAKE3 of the JSON-encoded arguments.
+        args_hash: astrid_crypto::ContentHash,
+        /// BLAKE3 of the result content the tool published.
+        result_hash: Option<astrid_crypto::ContentHash>,
+    },
+    /// An approval prompt about to be published to the user.
+    ApprovalRequested {
+        /// Host-minted request id.
+        request_id: &'a str,
+        /// Action being approved.
+        action: &'a str,
+        /// Resource the action targets.
+        resource: &'a str,
+    },
+    /// The decision for an approval check. Report a denial with
+    /// [`HostAuditOutcome::Denied`].
+    ApprovalDecided(HostApprovalDecision<'a>),
 }
 
 /// The outcome of a sensitive host call, as seen at the host-fn seam.
@@ -157,6 +200,34 @@ pub trait HostAuditSink: Send + Sync {
     ) -> Result<(), HostAuditRefusal> {
         let _ = (principal, event);
         Ok(())
+    }
+    /// Return a sink that stamps `actor` on every record it writes, or `None`
+    /// when this implementation does not attribute records.
+    ///
+    /// The engine calls this once per capsule load with the identity it
+    /// verified, and hands the returned sink to that capsule's host state, so
+    /// the attribution is host-owned and a guest cannot choose it.
+    fn attributed(&self, actor: HostAuditActor) -> Option<std::sync::Arc<dyn HostAuditSink>> {
+        let _ = actor;
+        None
+    }
+
+    /// Append one record and wait until it is durable.
+    ///
+    /// For records that must not be lost to queue pressure or must precede
+    /// an effect: the HTTP host awaits this before a request leaves the host
+    /// and for the request's completion. A failed append must not fail the
+    /// caller; it returns a receipt without an `entry_id` and is logged. The
+    /// default enqueues the record through [`record`](Self::record) and
+    /// returns an empty receipt.
+    fn commit<'a>(
+        &'a self,
+        principal: &'a astrid_core::PrincipalId,
+        event: HostAuditEvent<'a>,
+        outcome: HostAuditOutcome<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HostAuditReceipt> + Send + 'a>> {
+        self.record(principal, event, outcome);
+        Box::pin(std::future::ready(HostAuditReceipt::default()))
     }
 }
 

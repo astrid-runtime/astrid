@@ -25,6 +25,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
+use astrid_capsule::HostAuditSink;
 use astrid_capsule::engine::wasm::host_state::LifecyclePhase;
 use astrid_capsule::manifest::CapsuleManifest;
 use astrid_core::PrincipalId;
@@ -97,7 +98,7 @@ pub fn run_lifecycle(
         None,
         phase,
         previous_version,
-        external_bus,
+        (external_bus, None),
     )
 }
 
@@ -120,6 +121,7 @@ pub fn run_lifecycle_for_principal(
     phase: LifecyclePhase,
     previous_version: Option<&str>,
     external_bus: Option<EventBus>,
+    audit_sink: Option<Arc<dyn HostAuditSink>>,
 ) -> anyhow::Result<()> {
     run_lifecycle_in_scope(
         target_dir,
@@ -131,7 +133,7 @@ pub fn run_lifecycle_for_principal(
         None,
         phase,
         previous_version,
-        external_bus,
+        (external_bus, audit_sink),
     )
 }
 
@@ -150,6 +152,7 @@ pub fn run_lifecycle_for_principal_with_storage(
     phase: LifecyclePhase,
     previous_version: Option<&str>,
     external_bus: Option<EventBus>,
+    audit_sink: Option<Arc<dyn HostAuditSink>>,
 ) -> anyhow::Result<()> {
     let directory = storage.principal_directory();
     let uid = directory
@@ -165,7 +168,7 @@ pub fn run_lifecycle_for_principal_with_storage(
         Some(storage.clone()),
         phase,
         previous_version,
-        external_bus,
+        (external_bus, audit_sink),
     )
 }
 
@@ -180,7 +183,7 @@ fn run_lifecycle_in_scope(
     principal_storage: Option<RuntimePrincipalStore>,
     phase: LifecyclePhase,
     previous_version: Option<&str>,
-    external_bus: Option<EventBus>,
+    (external_bus, audit_sink): (Option<EventBus>, Option<Arc<dyn HostAuditSink>>),
 ) -> anyhow::Result<()> {
     if principal_storage.is_none() && !manifest.env.is_empty() {
         anyhow::bail!(
@@ -272,9 +275,10 @@ fn run_lifecycle_in_scope(
         // global policy, so the global config layer is the right (and only)
         // source here; an absent section yields the host's historical constants.
         http_limits: resolve_http_limits(),
-        // The standalone install path has no kernel audit log in scope;
-        // sensitive lifecycle host calls fall back to observability tracing.
-        audit_sink: None,
+        // The daemon install path passes its signed audit sink; the engine
+        // binds it to the hook's code identity. The standalone install path
+        // has none and its host calls fall back to observability tracing.
+        audit_sink,
     };
 
     // `engine::wasm::run_lifecycle` is async — async wasmtime requires

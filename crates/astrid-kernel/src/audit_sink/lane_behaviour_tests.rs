@@ -83,9 +83,9 @@ async fn chain_order_equals_call_order_under_concurrency() {
         let paths: Vec<String> = entries
             .iter()
             .map(|entry| match &entry.action {
-                AuditAction::FileRead { path } => path.clone(),
+                AuditAction::FileRead { actor: None, path } => path.clone(),
                 AuditAction::HostCallRun { calls } => match &calls.tally[0].first {
-                    AuditAction::FileRead { path } => path.clone(),
+                    AuditAction::FileRead { actor: None, path } => path.clone(),
                     other => panic!("unexpected run sample {other:?}"),
                 },
                 other => panic!("unexpected action {other:?}"),
@@ -284,6 +284,7 @@ async fn refused_system_gap_is_retried_while_idle() {
     log.append(
         session.clone(),
         AuditAction::FileRead {
+            actor: None,
             path: "/fills-the-log".into(),
         },
         AuthorizationProof::System {
@@ -344,6 +345,7 @@ async fn failed_batch_is_retried_in_order_once_the_log_recovers() {
         session.clone(),
         p.clone(),
         AuditAction::FileRead {
+            actor: None,
             path: "/fills-the-log".into(),
         },
         AuthorizationProof::System {
@@ -383,7 +385,7 @@ async fn failed_batch_is_retried_in_order_once_the_log_recovers() {
         .expect("entries")
         .into_iter()
         .map(|entry| match entry.action {
-            AuditAction::FileRead { path } => path,
+            AuditAction::FileRead { actor: None, path } => path,
             other => panic!("unexpected action {other:?}"),
         })
         .collect();
@@ -636,8 +638,14 @@ async fn fail_closed_call_waits_for_a_durable_write_ahead_entry() {
         .expect("best-effort class");
     assert_eq!(log.count_session(&session).await.expect("count"), 0);
 
-    sink.admit(&p, HostAuditEvent::FileWrite { path: "/held" })
-        .expect("durable admission");
+    sink.admit(
+        &p,
+        HostAuditEvent::FileWrite {
+            content_hash: None,
+            path: "/held",
+        },
+    )
+    .expect("durable admission");
     let entries = log
         .get_principal_entries(&session, Some(&p))
         .await
@@ -647,7 +655,9 @@ async fn fail_closed_call_waits_for_a_durable_write_ahead_entry() {
         2,
         "the earlier call is written first: {entries:?}"
     );
-    assert!(matches!(&entries[0].action, AuditAction::FileRead { path } if path == "/before"));
+    assert!(
+        matches!(&entries[0].action, AuditAction::FileRead { actor: None, path } if path == "/before")
+    );
     assert!(matches!(
         &entries[1].action,
         AuditAction::HostCallAdmitted { call }
@@ -656,7 +666,10 @@ async fn fail_closed_call_waits_for_a_durable_write_ahead_entry() {
 
     sink.record(
         &p,
-        HostAuditEvent::FileWrite { path: "/held" },
+        HostAuditEvent::FileWrite {
+            content_hash: None,
+            path: "/held",
+        },
         HostAuditOutcome::Allowed,
     );
     sink.shutdown();
@@ -684,6 +697,7 @@ async fn fail_closed_call_is_refused_when_the_log_cannot_record_it() {
         session.clone(),
         p.clone(),
         AuditAction::FileRead {
+            actor: None,
             path: "/fills-the-log".into(),
         },
         AuthorizationProof::System {
@@ -756,7 +770,10 @@ fn fail_closed_classes_match_the_record_classes() {
     let policy = fail_closed_policy(&astrid_config::validate::HOST_AUDIT_FAIL_CLOSED_CLASSES);
     for event in [
         HostAuditEvent::FileRead { path: "/p" },
-        HostAuditEvent::FileWrite { path: "/p" },
+        HostAuditEvent::FileWrite {
+            content_hash: None,
+            path: "/p",
+        },
         HostAuditEvent::FileDelete { path: "/p" },
         HostAuditEvent::NetConnect { host: "h", port: 1 },
         HostAuditEvent::NetBind { addr: "a" },
@@ -765,5 +782,10 @@ fn fail_closed_classes_match_the_record_classes() {
         assert!(policy.fails_closed(&event), "{event:?}");
     }
     assert!(!policy.fails_closed(&HostAuditEvent::FileProbe { path: "/p" }));
-    assert!(!HostAuditPolicy::default().fails_closed(&HostAuditEvent::FileWrite { path: "/p" }));
+    assert!(
+        !HostAuditPolicy::default().fails_closed(&HostAuditEvent::FileWrite {
+            content_hash: None,
+            path: "/p"
+        })
+    );
 }

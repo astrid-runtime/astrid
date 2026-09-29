@@ -69,7 +69,10 @@ mod error;
 mod log;
 mod storage;
 
-pub use entry::{ApprovalScope, AuditAction, AuditEntry, AuditOutcome, AuthorizationProof};
+pub use entry::{
+    ApprovalScope, AuditAction, AuditEntry, AuditOutcome, AuthorizationProof, CapsuleActor,
+    ProviderRequestId,
+};
 pub use error::{AuditError, AuditResult};
 pub use log::{
     AuditAnchorMarkResult, AuditAnchorWatermark, AuditArchiveWriter, AuditArchiver,

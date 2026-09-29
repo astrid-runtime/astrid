@@ -828,4 +828,29 @@ async fn same_runtime_durable_upgrade_materializes_a_new_live_source() {
         std::fs::read(old_target.join("main.wasm")).unwrap(),
         old_wasm
     );
+
+    // Each generation's code identity is on the audit chain.
+    let loads: Vec<_> = kernel
+        .audit_log
+        .get_principal_entries(&kernel.session_id, Some(&principal))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|entry| match entry.action {
+            astrid_audit::AuditAction::CapsuleLoaded {
+                capsule_id,
+                wasm_hash,
+                trigger,
+                ..
+            } if capsule_id == "live-upgrade" => Some((trigger, wasm_hash.map(|h| h.to_hex()))),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        loads,
+        vec![
+            ("load".to_owned(), Some(old_hash)),
+            ("replace".to_owned(), Some(new_hash)),
+        ]
+    );
 }
