@@ -3,6 +3,10 @@ use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 
 use super::*;
 
+#[cfg(unix)]
+#[path = "cleanup_tests.rs"]
+mod cleanup_tests;
+
 #[path = "runtime_tree_tests.rs"]
 mod runtime_tree_tests;
 

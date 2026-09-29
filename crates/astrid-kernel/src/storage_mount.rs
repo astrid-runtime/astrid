@@ -968,9 +968,9 @@ fn cleanup_resource(resource_path: &Path, callback_path: &Path) {
     let _ = local_transport::remove_endpoint(callback_path);
     let _ = std::fs::remove_file(resource_path.join(LEASE_MANIFEST_NAME));
     let _ = std::fs::remove_dir(resource_path);
-    if let Some(root) = resource_path.parent() {
-        let _ = std::fs::remove_dir(root);
-    }
+    // The parent is shared across leases (and Unix daemon processes). Another
+    // creator may already hold it open before creating its UUID directory;
+    // unlinking the empty parent here would make that mkdirat fail with ENOENT.
 }
 
 #[cfg(all(test, any(unix, windows)))]
