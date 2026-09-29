@@ -94,6 +94,7 @@ impl AuditArchiver for FileArchiver {
             let mut writer = FileArchiveWriter {
                 file: Some(BufWriter::new(create_private(&temporary)?)),
                 destination: directory.join(name),
+                #[cfg(unix)]
                 directory,
                 temporary,
                 committed: false,
@@ -109,6 +110,7 @@ struct FileArchiveWriter {
     file: Option<BufWriter<File>>,
     temporary: PathBuf,
     destination: PathBuf,
+    #[cfg(unix)]
     directory: PathBuf,
     committed: bool,
 }
@@ -144,7 +146,9 @@ impl FileArchiveWriter {
         astrid_core::platform_fs::rename_with_write_through(&self.temporary, &self.destination)
             .map_err(|error| archive_error("rename", &error))?;
         self.committed = true;
-        sync_directory(&self.directory)
+        #[cfg(unix)]
+        sync_directory(&self.directory)?;
+        Ok(())
     }
 }
 
@@ -213,11 +217,6 @@ fn sync_directory(directory: &Path) -> AuditResult<()> {
     File::open(directory)
         .and_then(|handle| handle.sync_all())
         .map_err(|error| archive_error("sync directory", &error))
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_directory: &Path) -> AuditResult<()> {
-    Ok(())
 }
 
 fn archive_error(step: &str, error: &dyn std::fmt::Display) -> AuditError {
