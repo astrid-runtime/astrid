@@ -390,3 +390,108 @@ async fn connect_tcp_denial_lands_on_the_chain() {
         records[0].2
     );
 }
+
+/// Sink double for fail-closed admission: records `admit` calls and either
+/// admits or refuses them.
+struct AdmittingSink {
+    inner: RecordingSink,
+    admits: Mutex<Vec<CapturedEvent>>,
+    refuse: bool,
+}
+
+impl HostAuditSink for AdmittingSink {
+    fn record(
+        &self,
+        principal: &PrincipalId,
+        event: HostAuditEvent<'_>,
+        outcome: HostAuditOutcome<'_>,
+    ) {
+        self.inner.record(principal, event, outcome);
+    }
+
+    fn admit(
+        &self,
+        _principal: &PrincipalId,
+        event: HostAuditEvent<'_>,
+    ) -> Result<(), crate::audit_sink::HostAuditRefusal> {
+        self.admits
+            .lock()
+            .expect("admits mutex")
+            .push(CapturedEvent::from(event));
+        if self.refuse {
+            Err(crate::audit_sink::HostAuditRefusal::new("log unavailable"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn state_with_admitting_sink(refuse: bool) -> (HostState, Arc<AdmittingSink>) {
+    let sink = Arc::new(AdmittingSink {
+        inner: RecordingSink::default(),
+        admits: Mutex::new(Vec::new()),
+        refuse,
+    });
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    state.principal = PrincipalId::new("alice").expect("valid principal");
+    state.audit_sink = Some(sink.clone() as Arc<dyn HostAuditSink>);
+    (state, sink)
+}
+
+/// A gated connect asks for admission before it touches the network, and
+/// reports its outcome afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_tcp_is_admitted_before_the_effect() {
+    use crate::engine::wasm::bindings::astrid::net::host::Host as _;
+
+    let (mut state, sink) = state_with_admitting_sink(false);
+    // Loopback is refused by the egress airlock after admission, so no real
+    // connection is made.
+    let result = state.connect_tcp("127.0.0.1".to_string(), 9);
+    assert!(result.is_err(), "loopback connect is airlocked: {result:?}");
+    assert_eq!(
+        *sink.admits.lock().expect("admits"),
+        [CapturedEvent::NetConnect("127.0.0.1".into(), 9)]
+    );
+    let records = sink.inner.snapshot();
+    assert_eq!(records.len(), 1, "the outcome is still recorded");
+    assert!(matches!(records[0].2, CapturedOutcome::Failed(_)));
+}
+
+/// A refused admission fails the call before any effect, without leaking the
+/// kernel-side reason to the guest; the host fn records nothing itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_admission_fails_the_call_before_the_effect() {
+    use crate::engine::wasm::bindings::astrid::net::host::{ErrorCode, Host as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("addr").port();
+    let (mut state, sink) = state_with_admitting_sink(true);
+
+    let result = state.connect_tcp("127.0.0.1".to_string(), port);
+    assert!(
+        matches!(&result, Err(ErrorCode::Unknown(detail)) if detail == "audit unavailable"),
+        "{result:?}"
+    );
+    let bound = state.bind_tcp("127.0.0.1".to_string(), 0);
+    assert!(
+        matches!(&bound, Err(ErrorCode::Unknown(detail)) if detail == "audit unavailable"),
+        "{bound:?}"
+    );
+    assert_eq!(
+        *sink.admits.lock().expect("admits"),
+        [
+            CapturedEvent::NetConnect("127.0.0.1".into(), port),
+            CapturedEvent::NetBind("tcp:127.0.0.1:0".into()),
+        ]
+    );
+    assert!(
+        sink.inner.snapshot().is_empty(),
+        "the sink records a refusal itself"
+    );
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "no connection was attempted"
+    );
+}

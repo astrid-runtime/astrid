@@ -353,8 +353,34 @@ fn validate_audit(config: &Config) -> ConfigResult<()> {
             message: format!("archive_dir {dir:?} must be an absolute path"),
         });
     }
+    if let Some(class) = audit
+        .host_fail_closed
+        .iter()
+        .find(|class| !HOST_AUDIT_FAIL_CLOSED_CLASSES.contains(&class.as_str()))
+    {
+        return Err(ConfigError::ValidationError {
+            field: "audit.host_fail_closed".to_owned(),
+            message: format!(
+                "unsupported host-call class '{class}'; expected one of: {}",
+                HOST_AUDIT_FAIL_CLOSED_CLASSES.join(", ")
+            ),
+        });
+    }
     Ok(())
 }
+
+/// Host-call classes accepted by `audit.host_fail_closed`, spelled as the
+/// kernel's host-audit records spell them. `net_accept` is not listed: the
+/// remote peer has already connected when the host call sees it, so there is
+/// no effect left to hold back.
+pub const HOST_AUDIT_FAIL_CLOSED_CLASSES: [&str; 6] = [
+    "file_read",
+    "file_write",
+    "file_delete",
+    "net_connect",
+    "net_bind",
+    "process_spawn",
+];
 
 fn validate_rate_limits(config: &Config) -> ConfigResult<()> {
     let limits = &config.rate_limits;
@@ -470,6 +496,24 @@ mod tests {
     fn test_default_config_is_valid() {
         let config = Config::default();
         assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_host_fail_closed_accepts_known_classes_only() {
+        let mut config = Config::default();
+        config.audit.host_fail_closed = vec!["process_spawn".to_owned(), "file_delete".to_owned()];
+        assert!(validate(&config).is_ok());
+        config.audit.host_fail_closed.push("payments".to_owned());
+        let error = validate(&config).expect_err("unknown class");
+        assert!(
+            error.to_string().contains("audit.host_fail_closed"),
+            "{error}"
+        );
+        config.audit.host_fail_closed = vec!["net_accept".to_owned()];
+        assert!(
+            validate(&config).is_err(),
+            "net_accept has no effect to hold back"
+        );
     }
 
     #[test]

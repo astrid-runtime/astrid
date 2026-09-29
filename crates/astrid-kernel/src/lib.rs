@@ -1333,6 +1333,24 @@ impl Kernel {
         crate::audit_retention::apply_retention_config(&audit_log, &audit_config.retention);
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let host_audit_policy = crate::audit_sink::HostAuditPolicy::from(&audit_config);
+        // The host-audit lane keeps its marker (which lane run is open, and
+        // which chains it wrote to) beside the audit projection, so a run
+        // that stops without draining leaves a signed gap entry at the next
+        // boot.
+        #[cfg(not(target_family = "wasm"))]
+        let host_audit_marker = principal_store.as_ref().and_then(|store| {
+            store
+                .system_control_kv("audit-lane")
+                .inspect_err(|error| {
+                    tracing::warn!(%error, "host-audit lane marker unavailable; restart gaps will not be recorded");
+                })
+                .ok()
+        });
+        #[cfg(all(
+            target_family = "wasm",
+            not(all(target_arch = "wasm32", target_os = "unknown"))
+        ))]
+        let host_audit_marker: Option<astrid_storage::ScopedKvStore> = None;
 
         let kernel = Arc::new(Self {
             session_id: session_id.clone(),
@@ -1363,11 +1381,19 @@ impl Kernel {
             process_storage_mount_broker: OnceLock::new(),
             audit_log: Arc::clone(&audit_log),
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-            audit_sink: Arc::new(crate::audit_sink::KernelAuditSink::with_policy(
-                Arc::clone(&audit_log),
-                session_id.clone(),
-                host_audit_policy,
-            )),
+            audit_sink: Arc::new(match host_audit_marker {
+                Some(marker) => crate::audit_sink::KernelAuditSink::with_lane_marker(
+                    Arc::clone(&audit_log),
+                    session_id.clone(),
+                    host_audit_policy,
+                    marker,
+                ),
+                None => crate::audit_sink::KernelAuditSink::with_policy(
+                    Arc::clone(&audit_log),
+                    session_id.clone(),
+                    host_audit_policy,
+                ),
+            }),
             runtime_key,
             active_connections: DashMap::new(),
             fuel_ledger: astrid_capsule_types::FuelLedger::default(),

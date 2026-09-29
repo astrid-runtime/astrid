@@ -27,6 +27,11 @@ pub struct AuditConfig {
     /// events, and aos-fs issues thousands per second. Denied probes still
     /// persist as FileRead-Denied.
     pub host_path_probes: bool,
+    /// Host-call classes that fail closed: the effect runs only after a
+    /// write-ahead audit entry is durable, and the call fails if it cannot
+    /// be recorded. Classes: `file_read`, `file_write`, `file_delete`,
+    /// `net_connect`, `net_bind`, `process_spawn`.
+    pub host_fail_closed: Vec<String>,
     /// `[audit.retention]`: anchor-aware pruning and archiving.
     pub retention: AuditRetentionConfig,
 }
@@ -40,6 +45,7 @@ impl Default for AuditConfig {
             host_batch_max: 128,
             host_queue_capacity: 4096,
             host_path_probes: false,
+            host_fail_closed: Vec::new(),
             retention: AuditRetentionConfig::default(),
         }
     }

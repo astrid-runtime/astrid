@@ -205,6 +205,11 @@ host_queue_capacity = 4096
 # Allowed stat/exists/readdir are not signed FileRead rows. Denied path
 # probes still persist. Set true to record every allowed probe.
 host_path_probes = false
+# Host-call classes that fail closed. For these classes the effect runs only
+# after a write-ahead audit entry is durable; if it cannot be recorded, the
+# host call fails. Classes: file_read, file_write, file_delete, net_connect,
+# net_bind, process_spawn. Default: none (best-effort recording).
+host_fail_closed = []
 
 # Anchor-aware retention. A chain that an anchoring service has marked with
 # `audit.anchor_mark` is never pruned past its anchored watermark. These keys

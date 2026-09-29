@@ -422,6 +422,10 @@ fn control_namespaces_require_admitted_immutable_uids() {
         StateOwner::System
     );
     assert_eq!(
+        resolver.resolve("system:control:audit-lane").unwrap(),
+        StateOwner::System
+    );
+    assert_eq!(
         resolver.resolve("system:control:invites").unwrap(),
         StateOwner::System
     );
@@ -434,6 +438,20 @@ fn control_namespaces_require_admitted_immutable_uids() {
         Err(StorageError::InvalidKey(message))
             if message.contains("env or secret")
     ));
+}
+
+/// The host-audit lane keeps its marker in `system:control:audit-lane`; a
+/// runtime store must accept writes there and read them back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit_lane_control_projection_is_writable() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let lane = store.system_control_kv("audit-lane").unwrap();
+    lane.set("lane", b"marker".to_vec()).await.unwrap();
+    assert_eq!(lane.get("lane").await.unwrap(), Some(b"marker".to_vec()));
 }
 
 #[cfg(feature = "legacy-surrealkv")]
