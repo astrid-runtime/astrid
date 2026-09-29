@@ -1,6 +1,7 @@
 //! Audit log settings: `[audit]` and its operator-only `[audit.retention]`
 //! table.
 
+use crate::types::AuditEntryFormat;
 use serde::{Deserialize, Serialize};
 
 /// Audit log storage settings.
@@ -34,6 +35,8 @@ pub struct AuditConfig {
     pub host_fail_closed: Vec<String>,
     /// `[audit.retention]`: anchor-aware pruning and archiving.
     pub retention: AuditRetentionConfig,
+    /// Signed layout of new audit entries. See [`AuditEntryFormat`].
+    pub entry_format: AuditEntryFormat,
 }
 
 impl Default for AuditConfig {
@@ -47,6 +50,7 @@ impl Default for AuditConfig {
             host_path_probes: false,
             host_fail_closed: Vec::new(),
             retention: AuditRetentionConfig::default(),
+            entry_format: AuditEntryFormat::V1,
         }
     }
 }

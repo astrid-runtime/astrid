@@ -83,6 +83,7 @@ fn validate(directory: &Dir, path: &str) -> Result<(), FilesystemError> {
         "run",
         "var/principal-store",
         "keys/runtime.key",
+        "keys/audit.key",
     ];
     if path.is_empty()
         || protected.iter().any(|prefix| {

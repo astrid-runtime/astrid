@@ -72,6 +72,7 @@ impl KvAuditStorage {
         expected: Option<&AuditEntryId>,
     ) -> AuditResult<bool> {
         self.recover_append_intents().await?;
+        self.check_registry_state([entry]).await?;
         let Some(prepared) = self.prepare_append(entry, expected).await? else {
             return Ok(false);
         };

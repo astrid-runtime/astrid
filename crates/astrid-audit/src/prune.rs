@@ -77,6 +77,12 @@ pub struct AuditPruneReceipt {
     pub seal_ordinal: Option<u64>,
     /// Public key that signed this receipt.
     pub public_key: PublicKey,
+    /// Key-registry epoch the signer was taken from, when the log writes
+    /// entry format v2. A verifier requires the signer to hold the audit role
+    /// in that state. Absent (and not signed) on format-v1 receipts, so their
+    /// signed bytes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_epoch: Option<u64>,
     /// Signature over all receipt fields except this signature.
     pub signature: Signature,
 }
@@ -101,6 +107,8 @@ struct UnsignedReceipt<'a> {
     segment: &'a Option<u64>,
     seal_ordinal: &'a Option<u64>,
     public_key: PublicKey,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_epoch: Option<u64>,
 }
 
 impl AuditPruneReceipt {
@@ -124,10 +132,11 @@ impl AuditPruneReceipt {
             segment: &self.segment,
             seal_ordinal: &self.seal_ordinal,
             public_key: self.public_key,
+            key_epoch: self.key_epoch,
         }
     }
 
-    fn signing_bytes(&self) -> AuditResult<Vec<u8>> {
+    pub(crate) fn signing_bytes(&self) -> AuditResult<Vec<u8>> {
         serde_json::to_vec(&self.unsigned())
             .map_err(|error| AuditError::SerializationError(error.to_string()))
     }
@@ -265,7 +274,7 @@ async fn prior_receipt(
     })
 }
 
-async fn persist_prune(
+pub(crate) async fn persist_prune(
     log: &AuditLog,
     session_id: &SessionId,
     principal: Option<&PrincipalId>,
@@ -316,6 +325,20 @@ pub(crate) async fn prune_chain_segment(
     policy: AuditRetentionPolicy,
     selected_segment: Option<(u64, Option<u64>)>,
 ) -> AuditResult<AuditPruneReceipt> {
+    let receipt = sign_prune_receipt(log, session_id, principal, policy, selected_segment).await?;
+    // Storage accepts the plan only if the receipt's signer is still the
+    // registry's audit key (see `KvAuditStorage::check_receipt_signer`).
+    persist_prune(log, session_id, principal, &receipt).await
+}
+
+/// Scan the chain and sign the receipt of the prune `policy` asks for.
+pub(crate) async fn sign_prune_receipt(
+    log: &AuditLog,
+    session_id: &SessionId,
+    principal: Option<&PrincipalId>,
+    policy: AuditRetentionPolicy,
+    selected_segment: Option<(u64, Option<u64>)>,
+) -> AuditResult<AuditPruneReceipt> {
     if policy.retain_entries == 0 {
         return Err(AuditError::StorageError(
             "audit retention requires at least one retained entry".to_owned(),
@@ -347,6 +370,10 @@ pub(crate) async fn prune_chain_segment(
     // `retention_guard`.
     log.check_prune_reach(session_id, principal, scan.omitted_count)
         .await?;
+    // Format v2 signs receipts with the audit key and names the registry
+    // epoch, so a verifier checks the receipt key against the key registry
+    // like any v2 signature.
+    let (signer, key_epoch) = log.archive_signer();
     let receipt = AuditPruneReceipt {
         schema: 1,
         session: session_id.to_string(),
@@ -365,14 +392,14 @@ pub(crate) async fn prune_chain_segment(
         prior_receipt_hash,
         segment: selected_segment.0,
         seal_ordinal: selected_segment.1,
-        public_key: log.runtime_public_key(),
+        public_key: signer.export_public_key(),
+        key_epoch,
         signature: Signature::from_bytes([0; 64]),
     };
     let mut receipt = receipt;
     let bytes = receipt.signing_bytes()?;
-    let signature = log.sign_archive_receipt(&bytes);
-    receipt.signature = signature;
-    persist_prune(log, session_id, principal, &receipt).await
+    receipt.signature = signer.sign(&bytes);
+    Ok(receipt)
 }
 
 pub(crate) fn verify_anchor(

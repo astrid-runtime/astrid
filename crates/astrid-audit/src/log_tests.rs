@@ -1069,15 +1069,10 @@ async fn blocked_principal_store_does_not_block_another_principal() {
         entered: Arc::clone(&entered),
         release: Arc::clone(&release),
     };
-    let log = Arc::new(AuditLog {
-        storage: Box::new(storage),
-        runtime_key: Arc::new(KeyPair::generate()),
-        chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
-        append_coordinator: Arc::new(Mutex::new(())),
-        migration_capacity: None,
-        destination_kv: None,
-        retention: retention_guard::RetentionControls::default(),
-    });
+    let log = Arc::new(AuditLog::with_test_storage(
+        Box::new(storage),
+        Arc::new(KeyPair::generate()),
+    ));
     let session_id = SessionId::new();
 
     let alice_append = {
@@ -1175,15 +1170,7 @@ async fn verification_uses_append_order_when_wall_clock_moves_backward() {
     let storage = KvAuditStorage::in_memory();
     storage.store(&first).await.unwrap();
     storage.store(&second).await.unwrap();
-    let log = AuditLog {
-        storage: Box::new(storage),
-        runtime_key: keypair,
-        chain_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
-        append_coordinator: Arc::new(Mutex::new(())),
-        migration_capacity: None,
-        destination_kv: None,
-        retention: retention_guard::RetentionControls::default(),
-    };
+    let log = AuditLog::with_test_storage(Box::new(storage), keypair);
 
     let result = log.verify_chain(&session_id).await.unwrap();
     assert!(result.valid, "clock rollback must not reorder the chain");

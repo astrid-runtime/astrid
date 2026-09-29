@@ -12,6 +12,22 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::error::{CryptoError, CryptoResult};
 use crate::signature::Signature;
 
+/// Fill an array with bytes from the operating system CSPRNG.
+///
+/// Use this for secret, unpredictable values such as salts and nonces.
+///
+/// # Panics
+///
+/// Panics if the OS CSPRNG is unavailable, like [`KeyPair::generate`].
+#[must_use]
+pub fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut bytes = [0u8; N];
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS CSPRNG unavailable while generating random bytes");
+    bytes
+}
+
 /// An Ed25519 key pair with secure memory handling.
 ///
 /// The secret key is zeroized on drop to prevent leaking sensitive material.
@@ -224,6 +240,16 @@ impl PublicKey {
     pub fn verify(&self, message: &[u8], signature: &Signature) -> CryptoResult<()> {
         signature.verify(message, &self.0)
     }
+
+    /// Verify a signature against this public key with RFC 8032 strict
+    /// verification (see [`Signature::verify_strict`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::SignatureVerificationFailed`] if verification fails.
+    pub fn verify_strict(&self, message: &[u8], signature: &Signature) -> CryptoResult<()> {
+        signature.verify_strict(message, &self.0)
+    }
 }
 
 impl std::fmt::Debug for PublicKey {
@@ -278,6 +304,14 @@ impl AsRef<[u8]> for PublicKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn random_bytes_are_not_constant() {
+        let first: [u8; 32] = random_bytes();
+        let second: [u8; 32] = random_bytes();
+        assert_ne!(first, second);
+        assert_ne!(first, [0u8; 32]);
+    }
 
     #[test]
     fn test_keypair_generation() {

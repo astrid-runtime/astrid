@@ -403,6 +403,10 @@ impl Default for ServerSection {
 
 pub use crate::audit::{AuditConfig, AuditRetentionConfig};
 
+#[path = "audit_format.rs"]
+mod audit_format;
+pub use audit_format::AuditEntryFormat;
+
 // ---------------------------------------------------------------------------
 // KeysConfig
 // ---------------------------------------------------------------------------

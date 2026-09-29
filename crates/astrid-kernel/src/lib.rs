@@ -11,6 +11,9 @@
 //! is to instantiate `astrid_events::EventBus`, load `.capsule` files into
 //! the Extism sandbox, and route IPC bytes between them.
 
+/// Audit entry format selection and the audit signing key.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod audit_keys;
 /// Kernel implementation of the capsule per-action host-audit sink.
 ///
 /// Native-only: the [`HostAuditSink`](astrid_capsule::HostAuditSink) seam is
@@ -1252,6 +1255,31 @@ impl Kernel {
             #[cfg(not(target_family = "wasm"))]
             if let Some(store) = principal_store.as_ref() {
                 runtime_tree_admit::admit(&home, store).await?;
+            }
+
+            // Audit entry format, read from the admitted home like other boot
+            // policy and applied before anything can append. Nothing appends
+            // during the migrate-only window above, so every new entry is in
+            // the selected format. A configuration that cannot be read stops
+            // boot unless the store is already on v2 (which it never leaves).
+            // The browser profile reads no host config; its host enables v2
+            // on the audit log it injects (`AuditLog::enable_entry_v2`).
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            {
+                let entry_format = astrid_config::Config::load_with_layout(
+                    Some(&workspace_root),
+                    &workspace_layout,
+                )
+                .map(|resolved| resolved.config.audit.entry_format)
+                .map_err(|error| error.to_string());
+                audit_keys::apply_entry_format(
+                    &audit_log,
+                    &home.keys_dir(),
+                    entry_format,
+                    &runtime_key,
+                    Arc::new(principal_directory.clone()),
+                )
+                .await?;
             }
 
             // The released profile, when present, is now represented by the
