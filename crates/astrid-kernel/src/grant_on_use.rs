@@ -380,19 +380,26 @@ fn expire_pending(kernel: &Kernel, pending: &mut HashMap<String, PendingGrant>) 
 async fn complete_grant(kernel: &Arc<Kernel>, request_id: &str, entry: PendingGrant) {
     let applied = grant_capsule(kernel, &entry.principal, &entry.capsule_id).await;
     let granted = applied.is_some();
-    audit_grant_decision(
-        kernel,
-        &entry,
-        request_id,
-        Some(HostApprovalScope::Always),
-        "user",
-        if granted {
+    // The decision is durable before the result is published, as for other
+    // answered prompts: a shutdown right after the result cannot lose it, and
+    // the chain shows the approval before the grant it caused.
+    let principal = PrincipalId::new(&entry.principal).ok();
+    if let Some(principal) = &principal {
+        let decision = HostAuditEvent::ApprovalDecided(HostApprovalDecision {
+            request_id: Some(request_id),
+            request: None,
+            action: GRANT_ACTION,
+            resource: &entry.capsule_id,
+            scope: Some(HostApprovalScope::Always),
+            via: "user",
+        });
+        let outcome = if granted {
             HostAuditOutcome::Allowed
         } else {
             HostAuditOutcome::Failed("grant could not be applied")
-        },
-    );
-    let audit_principal = entry.principal.clone();
+        };
+        kernel.audit_sink.commit(principal, decision, outcome).await;
+    }
     let audit_capsule = entry.capsule_id.clone();
     let payload = IpcPayload::GrantResult {
         request_id: request_id.to_owned(),
@@ -409,9 +416,9 @@ async fn complete_grant(kernel: &Arc<Kernel>, request_id: &str, entry: PendingGr
         metadata: EventMetadata::new("grant-on-use"),
     });
     // The applied grant is appended after the result is published, keeping
-    // the durable append off the caller's path.
+    // that durable append off the caller's path.
     if applied == Some(true)
-        && let Ok(principal) = PrincipalId::new(&audit_principal)
+        && let Some(principal) = principal
     {
         crate::grant_audit::record_grant_change(
             kernel,

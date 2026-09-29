@@ -557,25 +557,34 @@ async fn approve_is_audited_as_request_decision_and_grant() {
     publish_response(&kernel, rid, "approve");
     assert!(wait_for_grant(&home, "x", "cap").await);
 
-    // The decision goes through the host-audit queue; the grant change is
-    // appended after the grant result is published. (The prompt itself is
-    // committed by the dispatcher, which this test bypasses.)
-    let entries = drained_entries(&kernel, "x", 1, |entries| {
+    // The decision is committed before the grant result is published, and
+    // the grant change appended after it. (The prompt itself is committed by
+    // the dispatcher, which this test bypasses.)
+    let entries = drained_entries(&kernel, "x", 0, |entries| {
         entries
             .iter()
             .any(|e| matches!(e.action, AuditAction::CapabilityChanged { .. }))
     })
     .await;
-    assert!(entries.iter().any(|e| matches!(
+    let decision = entries.iter().position(|e| matches!(
         &e.action,
         AuditAction::ApprovalGranted { request_id: Some(id), scope: ApprovalScope::Always, via: Some(via), .. }
             if id == rid && via == "user"
-    )));
-    assert!(entries.iter().any(|e| matches!(
-        &e.action,
-        AuditAction::CapabilityChanged { kind, granted, via, .. }
-            if kind == "capsule" && granted == &["cap".to_owned()] && via == "grant_on_use"
-    )));
+    ));
+    let grant = entries.iter().position(|e| {
+        matches!(
+            &e.action,
+            AuditAction::CapabilityChanged { kind, granted, via, .. }
+                if kind == "capsule" && granted == &["cap".to_owned()] && via == "grant_on_use"
+        )
+    });
+    let (Some(decision), Some(grant)) = (decision, grant) else {
+        panic!("decision {decision:?} and grant {grant:?} must both be recorded");
+    };
+    assert!(
+        decision < grant,
+        "the approval precedes the grant it caused"
+    );
 }
 
 /// A denied grant-on-use prompt records the denial and no grant.
