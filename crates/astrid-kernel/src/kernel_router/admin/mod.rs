@@ -66,6 +66,8 @@ mod state_tests_caps;
 #[cfg(test)]
 mod state_tests_caps_tokens;
 #[cfg(test)]
+mod state_tests_grant_audit;
+#[cfg(test)]
 mod state_tests_group;
 #[cfg(test)]
 mod state_tests_usage;

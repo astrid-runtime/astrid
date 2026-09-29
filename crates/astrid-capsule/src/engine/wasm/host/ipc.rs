@@ -284,6 +284,9 @@ fn publish_inner(
         Ok(data) => IpcPayload::from_json_value(data),
         Err(_) => return Err(ErrorCode::InvalidInput),
     };
+    // A tool capsule's result for the invocation in flight feeds its
+    // `ToolCall` audit record.
+    crate::engine::wasm::host::tool_audit::capture_tool_result(state, &topic, &ipc_payload);
 
     // Bindgen boundary IN: the guest supplies the topic as `string`; wrap it
     // explicitly (validation already ran above on the raw `&str`).

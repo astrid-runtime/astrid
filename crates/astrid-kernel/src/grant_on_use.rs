@@ -37,6 +37,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use astrid_capsule::{
+    HostApprovalDecision, HostApprovalScope, HostAuditEvent, HostAuditOutcome, HostAuditSink,
+};
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::PrincipalProfile;
 use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
@@ -61,6 +64,10 @@ const MAX_INFLIGHT_GRANTS: usize = 1024;
 
 /// Stable lag label for the permanent ordered approval observer.
 const OBSERVER_SUBSCRIBER: &str = "grant_on_use_observer";
+
+/// Approval action name recorded for a grant-on-use decision; the dispatcher
+/// records the prompt under the same name.
+const GRANT_ACTION: &str = astrid_capsule::access::GRANT_APPROVAL_ACTION;
 
 /// The approve set, replicated from `host/approval.rs::decision_from_str`.
 /// Anything else — explicit deny, unknown string, or empty — is NOT an approve.
@@ -105,7 +112,7 @@ pub(crate) fn spawn_grant_on_use_handler(kernel: Arc<Kernel>) -> astrid_runtime:
                     process_event(&kernel, &inflight, &mut pending, &event);
                 }
                 () = astrid_runtime::time::sleep(until_expiry), if !pending.is_empty() => {
-                    expire_pending(&mut pending);
+                    expire_pending(&kernel, &mut pending);
                 }
             }
         }
@@ -155,6 +162,38 @@ fn process_event(
         },
         _ => {},
     }
+}
+
+/// Record a grant-on-use decision on the audit log. The dispatcher committed
+/// the prompt under the same `request_id` before publishing it.
+fn audit_grant(
+    kernel: &Kernel,
+    principal: &str,
+    event: HostAuditEvent<'_>,
+    outcome: HostAuditOutcome<'_>,
+) {
+    if let Ok(principal) = PrincipalId::new(principal) {
+        kernel.audit_sink.record(&principal, event, outcome);
+    }
+}
+
+fn audit_grant_decision(
+    kernel: &Kernel,
+    entry: &PendingGrant,
+    request_id: &str,
+    scope: Option<HostApprovalScope>,
+    via: &str,
+    outcome: HostAuditOutcome<'_>,
+) {
+    let decision = HostAuditEvent::ApprovalDecided(HostApprovalDecision {
+        request_id: Some(request_id),
+        request: None,
+        action: GRANT_ACTION,
+        resource: &entry.capsule_id,
+        scope,
+        via,
+    });
+    audit_grant(kernel, &entry.principal, decision, outcome);
 }
 
 fn record_grant_request(
@@ -252,6 +291,14 @@ fn handle_grant_response(
             capsule = %expired.capsule_id,
             "grant-on-use: late consent response rejected after timeout"
         );
+        audit_grant_decision(
+            kernel,
+            &expired,
+            request_id,
+            None,
+            "timeout",
+            HostAuditOutcome::Denied("response arrived after the timeout"),
+        );
         return;
     }
     if message.principal.as_deref() != Some(entry.principal.as_str()) {
@@ -288,6 +335,14 @@ fn handle_grant_response(
             %decision,
             "grant-on-use: consent not approved; no grant (fail-closed)"
         );
+        audit_grant_decision(
+            kernel,
+            &entry,
+            request_id,
+            None,
+            "user",
+            HostAuditOutcome::Denied("denied by user"),
+        );
         return;
     }
 
@@ -298,9 +353,9 @@ fn handle_grant_response(
     });
 }
 
-fn expire_pending(pending: &mut HashMap<String, PendingGrant>) {
+fn expire_pending(kernel: &Kernel, pending: &mut HashMap<String, PendingGrant>) {
     let now = astrid_runtime::time::Instant::now();
-    pending.retain(|_, entry| {
+    pending.retain(|request_id, entry| {
         let keep = entry.deadline > now;
         if !keep {
             warn!(
@@ -309,13 +364,43 @@ fn expire_pending(pending: &mut HashMap<String, PendingGrant>) {
                 capsule = %entry.capsule_id,
                 "grant-on-use: no consent response before timeout; no grant (fail-closed)"
             );
+            audit_grant_decision(
+                kernel,
+                entry,
+                request_id,
+                None,
+                "timeout",
+                HostAuditOutcome::Denied("no response before the timeout"),
+            );
         }
         keep
     });
 }
 
 async fn complete_grant(kernel: &Arc<Kernel>, request_id: &str, entry: PendingGrant) {
-    let granted = grant_capsule(kernel, &entry.principal, &entry.capsule_id).await;
+    let applied = grant_capsule(kernel, &entry.principal, &entry.capsule_id).await;
+    let granted = applied.is_some();
+    // The decision is durable before the result is published, as for other
+    // answered prompts: a shutdown right after the result cannot lose it, and
+    // the chain shows the approval before the grant it caused.
+    let principal = PrincipalId::new(&entry.principal).ok();
+    if let Some(principal) = &principal {
+        let decision = HostAuditEvent::ApprovalDecided(HostApprovalDecision {
+            request_id: Some(request_id),
+            request: None,
+            action: GRANT_ACTION,
+            resource: &entry.capsule_id,
+            scope: Some(HostApprovalScope::Always),
+            via: "user",
+        });
+        let outcome = if granted {
+            HostAuditOutcome::Allowed
+        } else {
+            HostAuditOutcome::Failed("grant could not be applied")
+        };
+        kernel.audit_sink.commit(principal, decision, outcome).await;
+    }
+    let audit_capsule = entry.capsule_id.clone();
     let payload = IpcPayload::GrantResult {
         request_id: request_id.to_owned(),
         request_owner: entry.request_owner.to_string(),
@@ -330,13 +415,31 @@ async fn complete_grant(kernel: &Arc<Kernel>, request_id: &str, entry: PendingGr
         message,
         metadata: EventMetadata::new("grant-on-use"),
     });
+    // The applied grant is appended after the result is published, keeping
+    // that durable append off the caller's path.
+    if applied == Some(true)
+        && let Some(principal) = principal
+    {
+        crate::grant_audit::record_grant_change(
+            kernel,
+            &principal,
+            "capsule",
+            (vec![audit_capsule], Vec::new()),
+            "grant_on_use",
+            "grant-on-use approval",
+        )
+        .await;
+    }
 }
 
 /// Grant `capsule_id` to `principal`, reusing the #993 admin grant machinery
 /// (load → set-delta → validate → save → cache-invalidate) under the kernel's
 /// `admin_write_lock` so a concurrent `agent modify` cannot race the
 /// load-modify-save on the same profile. Fail-closed on every error.
-async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) -> bool {
+///
+/// `None` when no grant was made; `Some(changed)` when the capsule is granted,
+/// with `changed` false if it already was.
+async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) -> Option<bool> {
     use crate::kernel_router::admin::handlers::{
         apply_set_delta, principal_profile_path, require_principal_exists,
     };
@@ -348,7 +451,7 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
             capsule = %capsule_id,
             "grant-on-use: invalid principal string; no grant (fail-closed)"
         );
-        return false;
+        return None;
     };
 
     // Serialize with `agent modify` (#993) so the load-modify-save is atomic.
@@ -365,7 +468,7 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
             error = %msg,
             "grant-on-use: principal has no profile; no grant (fail-closed)"
         );
-        return false;
+        return None;
     }
 
     let mut profile = match PrincipalProfile::load_from_path(&path) {
@@ -378,7 +481,7 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
                 error = %e,
                 "grant-on-use: profile load failed; no grant (fail-closed)"
             );
-            return false;
+            return None;
         },
     };
 
@@ -396,13 +499,13 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
                 error = %e,
                 "grant-on-use: capsule grant rejected; no grant (fail-closed)"
             );
-            return false;
+            return None;
         },
     };
     if !changed {
         // Already granted — idempotent. Invalidate to be safe; no save needed.
         kernel.profile_cache.invalidate(&pid);
-        return true;
+        return Some(false);
     }
 
     // Validate before saving: re-run the profile invariants (#993). On reject,
@@ -415,7 +518,7 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
             error = %e,
             "grant-on-use: profile rejected by validation; no grant (fail-closed)"
         );
-        return false;
+        return None;
     }
     if let Err(e) = profile.save_to_path(&path) {
         warn!(
@@ -425,7 +528,7 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
             error = %e,
             "grant-on-use: profile save failed; no grant (fail-closed)"
         );
-        return false;
+        return None;
     }
     kernel.profile_cache.invalidate(&pid);
 
@@ -435,7 +538,7 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
         capsule = %capsule_id,
         "grant-on-first-use: capsule granted via elicited consent"
     );
-    true
+    Some(true)
 }
 
 #[cfg(test)]

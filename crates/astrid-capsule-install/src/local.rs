@@ -145,6 +145,9 @@ pub struct InstallOptions {
     pub provenance_source_digest: Option<String>,
     /// Observed package generation; filtered refresh fail-closes on mismatch.
     pub expected_package_generation: Option<astrid_storage::CapsulePackageGeneration>,
+    /// Host-audit sink for the lifecycle hook's host calls. The daemon passes
+    /// its signed audit sink; `None` leaves them on observability tracing.
+    pub audit_sink: Option<Arc<dyn astrid_capsule::HostAuditSink>>,
 }
 
 /// What an install produced.
@@ -794,6 +797,7 @@ pub(crate) fn install_from_local_path_internal(
                     phase.to_lifecycle(),
                     previous_version.as_deref(),
                     options.lifecycle_bus.clone(),
+                    options.audit_sink.clone(),
                 )
             },
             |storage| {
@@ -807,6 +811,7 @@ pub(crate) fn install_from_local_path_internal(
                     phase.to_lifecycle(),
                     previous_version.as_deref(),
                     options.lifecycle_bus.clone(),
+                    options.audit_sink.clone(),
                 )
             },
         );

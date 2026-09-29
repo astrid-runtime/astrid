@@ -509,3 +509,107 @@ async fn approve_already_granted_is_idempotent() {
         "an already-granted capsule must not be duplicated"
     );
 }
+
+/// Wait until the kernel audit sink has accepted `records` host records, drain
+/// it (its writer coalesces over seconds), then return the principal's audit
+/// chain once `done` holds. Bounded generously: the fixtures are slow under
+/// parallel load.
+async fn drained_entries(
+    kernel: &Kernel,
+    principal: &str,
+    records: u64,
+    done: impl Fn(&[astrid_audit::AuditEntry]) -> bool,
+) -> Vec<astrid_audit::AuditEntry> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(20))
+        .expect("deadline overflow");
+    while kernel.audit_sink.health().accepted < records && Instant::now() < deadline {
+        astrid_runtime::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The writer appends on its own runtime; do not block this one's worker.
+    tokio::task::block_in_place(|| kernel.audit_sink.shutdown());
+    let pid = PrincipalId::new(principal).expect("valid principal");
+    loop {
+        let entries = kernel
+            .audit_log
+            .get_principal_entries(&kernel.session_id, Some(&pid))
+            .await
+            .expect("principal entries");
+        if done(&entries) || Instant::now() >= deadline {
+            return entries;
+        }
+        astrid_runtime::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The grant-on-use decision and the applied capsule grant are on the
+/// principal's audit chain; the decision carries the prompt's request id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approve_is_audited_as_request_decision_and_grant() {
+    use astrid_audit::{ApprovalScope, AuditAction};
+
+    let (_dir, home, kernel) = fixture().await;
+    seed_profile(&home, "x", &[]);
+
+    let rid = "rid-audit-1";
+    publish_grant_required(&kernel, rid, "x", "cap");
+    settle().await;
+    publish_response(&kernel, rid, "approve");
+    assert!(wait_for_grant(&home, "x", "cap").await);
+
+    // The decision is committed before the grant result is published, and
+    // the grant change appended after it. (The prompt itself is committed by
+    // the dispatcher, which this test bypasses.)
+    let entries = drained_entries(&kernel, "x", 0, |entries| {
+        entries
+            .iter()
+            .any(|e| matches!(e.action, AuditAction::CapabilityChanged { .. }))
+    })
+    .await;
+    let decision = entries.iter().position(|e| matches!(
+        &e.action,
+        AuditAction::ApprovalGranted { request_id: Some(id), scope: ApprovalScope::Always, via: Some(via), .. }
+            if id == rid && via == "user"
+    ));
+    let grant = entries.iter().position(|e| {
+        matches!(
+            &e.action,
+            AuditAction::CapabilityChanged { kind, granted, via, .. }
+                if kind == "capsule" && granted == &["cap".to_owned()] && via == "grant_on_use"
+        )
+    });
+    let (Some(decision), Some(grant)) = (decision, grant) else {
+        panic!("decision {decision:?} and grant {grant:?} must both be recorded");
+    };
+    assert!(
+        decision < grant,
+        "the approval precedes the grant it caused"
+    );
+}
+
+/// A denied grant-on-use prompt records the denial and no grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deny_is_audited_without_a_grant() {
+    use astrid_audit::AuditAction;
+
+    let (_dir, home, kernel) = fixture().await;
+    seed_profile(&home, "x", &[]);
+
+    let rid = "rid-audit-deny";
+    publish_grant_required(&kernel, rid, "x", "cap");
+    settle().await;
+    publish_response(&kernel, rid, "deny");
+    assert_no_grant(&home, "x", "cap").await;
+
+    let entries = drained_entries(&kernel, "x", 1, |_| true).await;
+    assert!(entries.iter().any(|e| matches!(
+        &e.action,
+        AuditAction::ApprovalDenied { request_id: Some(id), reason: Some(reason), .. }
+            if id == rid && reason == "user"
+    )));
+    assert!(
+        !entries
+            .iter()
+            .any(|e| matches!(e.action, AuditAction::CapabilityChanged { .. }))
+    );
+}

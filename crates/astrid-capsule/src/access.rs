@@ -100,18 +100,24 @@ pub(crate) fn is_user_invocable_surface(topic: &str) -> bool {
     }
 }
 
+/// Approval action name recorded for a grant-on-use prompt.
+pub const GRANT_APPROVAL_ACTION: &str = "capsule-grant";
+
 /// Publish a grant-on-first-use [`astrid_events::ipc::IpcPayload::GrantRequired`]
 /// signal on `astrid.v1.approval` for an access-gate miss (#998), so a
 /// broker/shim can elicit consent and, on approve, the kernel grants the
 /// capsule. Co-located with the access gate it serves.
 ///
-/// Synchronous fire-and-forget: `event_bus.publish` never blocks, so the
-/// dispatch hot path takes no new lock or `.await`. The `request_id` is a fresh
+/// When the resolver carries an audit sink, an `ApprovalRequested` record for
+/// the prompt is committed (and awaited) before the prompt is published, so
+/// the prompt is on the audit log before anyone can answer it. The dispatcher
+/// calls this after releasing the registry lock. The `request_id` is a fresh
 /// unguessable UUID the broker keys the response on. The message carries a nil
 /// `source_id` (kernel-originated): the kernel's grant handler only honours
 /// nil-sourced `GrantRequired`, so this must stay kernel-published.
-pub(crate) fn emit_grant_required(
+pub(crate) async fn emit_grant_required(
     event_bus: &astrid_events::EventBus,
+    access_resolver: Option<&CapsuleAccessResolver>,
     principal: &str,
     capsule_id: String,
     request_owner: Option<astrid_events::ipc::RequestOwnerId>,
@@ -126,6 +132,20 @@ pub(crate) fn emit_grant_required(
         return;
     };
     let request_id = uuid::Uuid::new_v4().to_string();
+    if let Some(sink) = access_resolver.and_then(|resolver| resolver.audit_sink.as_ref())
+        && let Ok(principal_id) = PrincipalId::new(principal)
+    {
+        sink.commit(
+            &principal_id,
+            crate::audit_sink::HostAuditEvent::ApprovalRequested {
+                request_id: &request_id,
+                action: GRANT_APPROVAL_ACTION,
+                resource: &capsule_id,
+            },
+            crate::audit_sink::HostAuditOutcome::Allowed,
+        )
+        .await;
+    }
     let payload = astrid_events::ipc::IpcPayload::GrantRequired {
         request_id,
         request_owner: request_owner.to_string(),
@@ -159,6 +179,9 @@ pub struct CapsuleAccessResolver {
     /// Live group config. Read via a lock-free [`ArcSwap`] load so admin
     /// status reflects runtime group mutations without a restart.
     groups: Arc<ArcSwap<GroupConfig>>,
+    /// Audit sink the grant-on-use prompt is committed to before it is
+    /// published. `None` publishes the prompt without an audit record.
+    audit_sink: Option<Arc<dyn crate::audit_sink::HostAuditSink>>,
 }
 
 /// Immutable authority inputs for one dispatched event.
@@ -218,7 +241,15 @@ impl CapsuleAccessResolver {
         Self {
             profile_cache,
             groups,
+            audit_sink: None,
         }
+    }
+
+    /// Commit every grant-on-use prompt to `sink` before it is published.
+    #[must_use]
+    pub fn with_audit_sink(mut self, sink: Arc<dyn crate::audit_sink::HostAuditSink>) -> Self {
+        self.audit_sink = Some(sink);
+        self
     }
 
     /// Resolve one immutable authority snapshot for a dispatched event.
@@ -332,6 +363,10 @@ impl CapsuleAccessResolver {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "access_audit_tests.rs"]
+mod audit_tests;
 
 #[cfg(test)]
 mod tests {

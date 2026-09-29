@@ -270,6 +270,73 @@ is already `*` for openai-compat) or grant any other capability.
 Wildcard port: `"127.0.0.1:*"` exempts all ports on that host. Prefer listing
 exact ports to minimise exposure.
 
+### Provider requests on the audit log
+
+Every request a capsule sends through `astrid:http` is recorded on the signed
+audit log. The host appends an `http_request` entry after the airlock and
+security checks pass and waits for it to be written before the request leaves
+the host. When the response has been read, or the exchange ends early, an
+`http_response` entry follows. The two entries share a `sequence` number, and
+the response entry also carries the request entry's id.
+
+The `http_request` entry records the method, host, port and redirect hop. The
+path and query, the capsule's request headers and the body are recorded only as
+BLAKE3 hashes. The `http_response` entry records the status, provider request
+ids such as `x-request-id`, and a BLAKE3 hash of the response body as the host
+read it. The log never stores request or response content.
+
+`sequence` is numbered per principal within one daemon run, identified by the
+entry's `run_id`, and every request takes a number, including requests the
+airlock refuses. A request that was sent without appearing in the log therefore
+leaves a gap in the numbering of its run.
+
+Recording is best-effort, like the rest of the audit log: if the
+`http_request` entry cannot be written, the request is still sent, the failure
+is logged as a security event, and the missing entry shows as such a gap. The
+same holds for an approval prompt whose `approval_requested` entry cannot be
+written.
+
+Credentials are redacted before hashing. The redacted values are:
+
+- credential headers (`Authorization`, `Cookie`, `X-Api-Key`, `api-key`,
+  `x-goog-api-key` and similar);
+- credential query parameters (`key`, `api_key`, `access_token`, `token`,
+  `signature` and similar);
+- any secret value the host gave the capsule through a secret-typed config key.
+
+Each of them is replaced by `[REDACTED]`. A verifier who holds a request can
+apply the same redaction and recompute its hashes.
+
+### Host-injected provider credentials
+
+A provider capsule does not need to read its API key at all. It can name the
+secret in a request header, and the host fills in the value when it builds the
+request:
+
+```text
+Authorization: Bearer {{secret:api_key}}
+```
+
+For example, `capsule-openai-compat` currently reads `api_key` with
+`env::var("api_key")` and sets the header itself. To use injection instead, it
+sets the header to the template above and stops reading the key. The key then
+never enters guest memory, and the audit hashes cover the placeholder rather
+than the key.
+
+- `NAME` must be declared in the capsule's `Capsule.toml` as a secret-typed
+  `[env]` key (`type = "secret"`). Any other name refuses the request with
+  `capability-denied`. The value is looked up the same way as `get_config`:
+  the invoking principal's secret first, then the host-wide one.
+- Surrounding whitespace is trimmed from the value. If the secret is unset or
+  blank, the header is omitted, so a keyless local endpoint gets no
+  `Authorization` header, as it does today.
+- Placeholders are substituted only in header values. In the URL or the body
+  they are sent as written.
+- On a redirect to a different origin, every header that carries a placeholder
+  is dropped, along with `Authorization` and `Cookie`.
+- The `http_request` audit entry lists the names of the injected secrets, never
+  their values.
+
 ## Install-time onboarding
 
 `astrid init --distro <source>` (and `astrid distro apply <source>`) walks you

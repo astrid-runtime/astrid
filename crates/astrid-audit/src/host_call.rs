@@ -30,6 +30,11 @@
 //! process_spawn:           lp(command)
 //! ```
 //!
+//! Attributed calls and HTTP/tool/approval coverage records use the domain
+//! `astrid.audit.host-call.v2` and `lp(serde_json(action))` in place of class
+//! fields. This commits to the entire actor and coverage payload. Unattributed
+//! legacy calls retain their v1 encoding, so existing folds still verify.
+//!
 //! Strings are the values a single-call entry would store, i.e. after the
 //! kernel bounds guest-controlled strings.
 //!
@@ -220,6 +225,12 @@ pub fn host_call_class(action: &AuditAction) -> Option<&'static str> {
         AuditAction::NetBind { .. } => Some("net_bind"),
         AuditAction::NetAccept { .. } => Some("net_accept"),
         AuditAction::ProcessSpawn { .. } => Some("process_spawn"),
+        AuditAction::HttpRequest { .. } => Some("http_request"),
+        AuditAction::HttpResponse { .. } => Some("http_response"),
+        AuditAction::CapsuleToolCall { .. } => Some("tool_call"),
+        AuditAction::ApprovalRequested { .. } => Some("approval_requested"),
+        AuditAction::ApprovalGranted { .. } => Some("approval_granted"),
+        AuditAction::ApprovalDenied { .. } => Some("approval_denied"),
         _ => None,
     }
 }
@@ -230,30 +241,54 @@ pub fn host_call_class(action: &AuditAction) -> Option<&'static str> {
 pub fn host_call_digest(call: &HostCallRef<'_>) -> Option<ContentHash> {
     let class = host_call_class(call.action)?;
     let mut hasher = blake3::Hasher::new();
-    write_lp(&mut hasher, HOST_CALL_DIGEST_DOMAIN.as_bytes());
+    let legacy = match call.action {
+        AuditAction::FileRead { actor, .. }
+        | AuditAction::FileWrite { actor, .. }
+        | AuditAction::FileDelete { actor, .. }
+        | AuditAction::NetConnect { actor, .. }
+        | AuditAction::NetBind { actor, .. }
+        | AuditAction::NetAccept { actor, .. }
+        | AuditAction::ProcessSpawn { actor, .. } => actor.is_none(),
+        _ => false,
+    };
+    write_lp(
+        &mut hasher,
+        if legacy {
+            HOST_CALL_DIGEST_DOMAIN.as_bytes()
+        } else {
+            b"astrid.audit.host-call.v2"
+        },
+    );
     write_lp(&mut hasher, class.as_bytes());
-    match call.action {
-        AuditAction::FileRead { path } | AuditAction::FileDelete { path } => {
-            write_lp(&mut hasher, path.as_bytes());
-        },
-        AuditAction::FileWrite { path, content_hash } => {
-            write_lp(&mut hasher, path.as_bytes());
-            hasher.update(content_hash.as_bytes());
-        },
-        AuditAction::NetConnect { host, port } => {
-            write_lp(&mut hasher, host.as_bytes());
-            hasher.update(&port.to_be_bytes());
-        },
-        AuditAction::NetBind { addr } => write_lp(&mut hasher, addr.as_bytes()),
-        AuditAction::NetAccept {
-            local_addr,
-            peer_addr,
-        } => {
-            write_lp(&mut hasher, local_addr.as_bytes());
-            write_lp(&mut hasher, peer_addr.as_bytes());
-        },
-        AuditAction::ProcessSpawn { command } => write_lp(&mut hasher, command.as_bytes()),
-        _ => return None,
+    if legacy {
+        match call.action {
+            AuditAction::FileRead { path, .. } | AuditAction::FileDelete { path, .. } => {
+                write_lp(&mut hasher, path.as_bytes());
+            },
+            AuditAction::FileWrite {
+                path, content_hash, ..
+            } => {
+                write_lp(&mut hasher, path.as_bytes());
+                hasher.update(content_hash.as_bytes());
+            },
+            AuditAction::NetConnect { host, port, .. } => {
+                write_lp(&mut hasher, host.as_bytes());
+                hasher.update(&port.to_be_bytes());
+            },
+            AuditAction::NetBind { addr, .. } => write_lp(&mut hasher, addr.as_bytes()),
+            AuditAction::NetAccept {
+                local_addr,
+                peer_addr,
+                ..
+            } => {
+                write_lp(&mut hasher, local_addr.as_bytes());
+                write_lp(&mut hasher, peer_addr.as_bytes());
+            },
+            AuditAction::ProcessSpawn { command, .. } => write_lp(&mut hasher, command.as_bytes()),
+            _ => return None,
+        }
+    } else {
+        write_lp(&mut hasher, &serde_json::to_vec(call.action).ok()?);
     }
     hasher.update(&[call.outcome.code()]);
     write_lp(&mut hasher, call.detail.as_bytes());

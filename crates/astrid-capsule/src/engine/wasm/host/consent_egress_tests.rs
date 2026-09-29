@@ -649,3 +649,86 @@ async fn local_socket_existing_grant_short_circuits_without_eliciting() {
         .is_some();
     assert!(!elicited, "an existing grant must NOT publish a prompt");
 }
+
+// ── Audit records ────────────────────────────────────────────────────────
+
+/// Records committed consent prompts and the decisions for them.
+#[derive(Default)]
+struct ConsentSink {
+    prompts: std::sync::Mutex<Vec<String>>,
+    decisions: std::sync::Mutex<Vec<(Option<String>, bool, String)>>,
+}
+
+impl crate::audit_sink::HostAuditSink for ConsentSink {
+    fn record(
+        &self,
+        _principal: &PrincipalId,
+        event: crate::audit_sink::HostAuditEvent<'_>,
+        _outcome: crate::audit_sink::HostAuditOutcome<'_>,
+    ) {
+        if let crate::audit_sink::HostAuditEvent::ApprovalDecided(decision) = event {
+            self.decisions.lock().unwrap().push((
+                decision.request_id.map(str::to_owned),
+                decision.request.and_then(|r| r.entry_id.clone()).is_some(),
+                decision.via.to_owned(),
+            ));
+        }
+    }
+
+    fn commit<'a>(
+        &'a self,
+        principal: &'a PrincipalId,
+        event: crate::audit_sink::HostAuditEvent<'a>,
+        outcome: crate::audit_sink::HostAuditOutcome<'a>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::audit_sink::HostAuditReceipt> + Send + 'a>,
+    > {
+        if let crate::audit_sink::HostAuditEvent::ApprovalDecided(_) = event {
+            self.record(principal, event, outcome);
+            return Box::pin(std::future::ready(
+                crate::audit_sink::HostAuditReceipt::default(),
+            ));
+        }
+        if let crate::audit_sink::HostAuditEvent::ApprovalRequested {
+            request_id, action, ..
+        } = event
+        {
+            assert_eq!(action, EGRESS_CONSENT_ACTION);
+            self.prompts.lock().unwrap().push(request_id.to_owned());
+        }
+        Box::pin(std::future::ready(crate::audit_sink::HostAuditReceipt {
+            sequence: None,
+            entry_id: Some(astrid_capabilities::AuditEntryId::new()),
+        }))
+    }
+}
+
+/// A consent prompt is committed and its decision linked to it; a later
+/// request answered by the cached grant records the grant without a prompt.
+#[tokio::test(flavor = "multi_thread")]
+async fn consent_prompt_and_decisions_are_audited() {
+    let rt = tokio::runtime::Handle::current();
+    let mut state = minimal_host_state(rt);
+    let sink = Arc::new(ConsentSink::default());
+    state.audit_sink = Some(Arc::clone(&sink) as Arc<dyn crate::audit_sink::HostAuditSink>);
+    state.allowance_store = Some(Arc::new(AllowanceStore::new()));
+    set_caller(&mut state, MessageOrigin::LocalSocket, "alice");
+    spawn_responder(state.event_bus.clone(), "approve_session");
+
+    assert!(tokio::task::block_in_place(
+        || state.consent_local_egress("127.0.0.1", 1234)
+    ));
+    assert!(tokio::task::block_in_place(
+        || state.consent_local_egress("127.0.0.1", 1234)
+    ));
+
+    let prompts = sink.prompts.lock().unwrap().clone();
+    assert_eq!(prompts.len(), 1, "only the first request prompts");
+    assert_eq!(
+        sink.decisions.lock().unwrap().clone(),
+        vec![
+            (Some(prompts[0].clone()), true, "user".to_owned()),
+            (None, false, "session_grant".to_owned()),
+        ]
+    );
+}

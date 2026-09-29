@@ -52,6 +52,9 @@ mod catalog_load_tests;
 mod content_source;
 pub mod host;
 pub mod host_state;
+#[cfg(test)]
+#[path = "lifecycle_audit_tests.rs"]
+mod lifecycle_audit_tests;
 pub mod limits;
 mod pool;
 mod storage_vfs;
@@ -1702,7 +1705,10 @@ struct CompiledWasmArtifact {
     _epoch_ticker: EpochTickerGuard,
 }
 
-const COMPILED_ENGINE_ABI: &str = "astrid-wasmtime48-component-abi-v1";
+/// Identity of the wasmtime engine configuration and linked host ABI that
+/// compiled capsule code is built for. Part of the compiled-code cache key,
+/// and recorded as the engine profile of loaded capsules.
+pub const COMPILED_ENGINE_ABI: &str = "astrid-wasmtime48-component-abi-v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CompiledArtifactKey(String);
@@ -2576,7 +2582,18 @@ impl ExecutionEngine for WasmEngine {
             let st_secret_elicits = ctx.secret_elicits.clone();
             let st_identity_store = ctx.identity_store.clone();
             let st_profile_cache = ctx.profile_cache.clone();
-            let st_audit_sink = ctx.audit_sink.clone();
+            // Bind the host-audit sink to this capsule's verified code
+            // identity so every host-call entry names the capsule and wasm
+            // hash that acted.
+            let st_audit_sink = ctx.audit_sink.as_ref().map(|sink| {
+                crate::audit_sink::attribute_sink(
+                    sink,
+                    crate::audit_sink::HostAuditActor {
+                        capsule_id: manifest.package.name.clone(),
+                        wasm_hash: astrid_crypto::ContentHash::from_hex(&actual_hash).ok(),
+                    },
+                )
+            });
             let st_owner_home = owner_vfs.home.clone();
             let st_owner_tmp = owner_vfs.tmp.clone();
             let st_principal_directory = ctx.principal_directory.clone();
@@ -2694,6 +2711,8 @@ impl ExecutionEngine for WasmEngine {
                 ipc_limiter: Arc::clone(&ipc_limiter),
                 config: wasm_config.clone(),
                 secret_env: secret_env_set.clone(),
+                revealed_secrets: crate::engine::wasm::host::http::RevealedSecrets::default(),
+                tool_result: None,
                 // Kept only for explicit legacy-migration fixtures; runtime
                 // secret resolution never consults a native path.
                 file_secret_root: None,
@@ -3657,6 +3676,9 @@ impl ExecutionEngine for WasmEngine {
         // busy), distinct from a slow guest call.
         let pool_wait_ms = checkout_start.elapsed().as_millis() as u64;
         let typed_instance = checkout.instance();
+        // Armed below when this invocation is a tool call; records one
+        // `ToolCall` audit entry when the invocation ends (or is cancelled).
+        let tool_audit;
         let result: CapsuleResult<HookTriggerResult> = {
             let s = checkout.store_mut();
             // ── Phase 1: SET ──────────────────────────────────────
@@ -3730,6 +3752,12 @@ impl ExecutionEngine for WasmEngine {
                     .and_then(|p| astrid_core::PrincipalId::new(p).ok());
 
                 install_principal_overlays(state, invocation_principal.as_ref()).await;
+                state.tool_result = None;
+                tool_audit = crate::engine::wasm::host::tool_audit::ToolCallAudit::arm(
+                    state,
+                    caller,
+                    &invoking_principal,
+                );
             }
 
             // ── Phase 2: CALL ─────────────────────────────────────
@@ -3781,6 +3809,11 @@ impl ExecutionEngine for WasmEngine {
         // conservative amount, so cancellation cannot reclaim budget that an
         // in-flight guest may already have spent.
         fuel_reservation.settle(fuel_used, std::time::Instant::now());
+        if let Some(audit) = tool_audit {
+            let captured = checkout.store_mut().data_mut().tool_result.take();
+            let error = result.as_ref().err().map(ToString::to_string);
+            audit.finish(captured, error.as_deref());
+        }
         // Drop the lease: Phase 3 CLEAR runs and the instance returns to the
         // pool, so a parallel invocation can lease it with clean state.
         drop(checkout);
@@ -4013,6 +4046,8 @@ async fn build_lifecycle_host_state(
         ipc_limiter: Arc::new(astrid_events::ipc::IpcRateLimiter::new()),
         config: cfg.config.clone(),
         secret_env,
+        revealed_secrets: crate::engine::wasm::host::http::RevealedSecrets::default(),
+        tool_result: None,
         file_secret_root,
         ipc_publish_patterns: Vec::new(),
         ipc_subscribe_patterns: Vec::new(),
@@ -4093,8 +4128,17 @@ async fn build_lifecycle_host_state(
         no_yield_windows: 0,
         // Per-action audit sink (fs/net/process). The install/upgrade path
         // may thread the kernel sink in; `None` for the standalone install
-        // CLI, which has no audit log in scope.
-        audit_sink: cfg.audit_sink.clone(),
+        // CLI, which has no audit log in scope. Bound to the hook's code
+        // identity like the runtime sink.
+        audit_sink: cfg.audit_sink.as_ref().map(|sink| {
+            crate::audit_sink::attribute_sink(
+                sink,
+                crate::audit_sink::HostAuditActor {
+                    capsule_id: cfg.capsule_id.as_str().to_owned(),
+                    wasm_hash: Some(astrid_crypto::ContentHash::hash(&cfg.wasm_bytes)),
+                },
+            )
+        }),
     })
 }
 

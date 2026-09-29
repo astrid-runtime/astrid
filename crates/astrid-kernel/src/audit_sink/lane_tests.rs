@@ -8,9 +8,59 @@ fn bob() -> PrincipalId {
     PrincipalId::new("bob").expect("bob")
 }
 
+#[test]
+fn coverage_records_stay_individual_and_overflow_commits_to_their_payload() {
+    let now = Instant::now();
+    let time = Timestamp::now();
+    let a = alice();
+    let action = |id: &str| AuditAction::ApprovalRequested {
+        action_type: "connect".into(),
+        resource: "example.com".into(),
+        request_id: Some(id.into()),
+        actor: None,
+    };
+    let call = |id: &str| Call {
+        action: action(id),
+        outcome: HostCallOutcome::Ok,
+        detail: String::new(),
+        at: time,
+    };
+    let mut lanes = Lanes::new(2, false);
+    assert_eq!(lanes.push_call(&a, call("first"), now), Pushed::Queued);
+    assert_eq!(lanes.push_call(&a, call("first"), now), Pushed::Queued);
+    assert_eq!(lanes.push_call(&a, call("lost"), now), Pushed::Lost);
+    let slots = lanes.take(3, now);
+    assert_eq!(slots.len(), 3);
+    let session = SessionId::from_uuid(uuid::Uuid::from_u128(1));
+    for slot in &slots[..2] {
+        let (_, _, action, authorization, _) = slot.request(&session);
+        assert!(matches!(action, AuditAction::ApprovalRequested { .. }));
+        assert!(
+            matches!(authorization, AuthorizationProof::System { reason } if reason == "approval gate")
+        );
+    }
+    let (_, _, AuditAction::HostCallLoss { calls, .. }, _, _) = slots[2].request(&session) else {
+        panic!("overflow must be a signed loss record");
+    };
+    let lost = action("lost");
+    let original = HostCallRef {
+        action: &lost,
+        outcome: HostCallOutcome::Ok,
+        detail: "",
+        at: &time,
+    };
+    assert!(calls.matches_calls(&[original]));
+    let altered = action("different");
+    assert!(!calls.matches_calls(&[HostCallRef {
+        action: &altered,
+        ..original
+    }]));
+}
+
 fn read(path: &str, outcome: HostCallOutcome) -> Call {
     Call {
         action: AuditAction::FileRead {
+            actor: None,
             path: path.to_owned(),
         },
         outcome,
@@ -212,6 +262,7 @@ fn abandoned_admission_is_dropped_before_it_is_written() {
     assert!(lanes.push_admit(
         &a,
         AuditAction::ProcessSpawn {
+            actor: None,
             command: "rm".into()
         },
         Arc::clone(&ticket),
@@ -257,6 +308,7 @@ fn chain_with_a_waiting_admission_is_taken_first() {
     lanes.push_admit(
         &a,
         AuditAction::ProcessSpawn {
+            actor: None,
             command: "rm".into(),
         },
         Arc::new(AdmitTicket::new()),

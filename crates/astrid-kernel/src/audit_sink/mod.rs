@@ -29,14 +29,18 @@ mod lane;
 mod marker;
 mod writer;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use astrid_audit::host_call::{HOST_CALL_CLASSES, HostCallOutcome};
-use astrid_audit::{AuditAction, AuditLog};
-use astrid_capsule::{HostAuditEvent, HostAuditOutcome, HostAuditRefusal, HostAuditSink};
+use astrid_audit::{AuditAction, AuditLog, AuditOutcome, AuthorizationProof, CapsuleActor};
+use astrid_capsule::{
+    HostAuditActor, HostAuditEvent, HostAuditOutcome, HostAuditReceipt, HostAuditRefusal,
+    HostAuditSink,
+};
 use astrid_config::types::AuditConfig;
 use astrid_core::{PrincipalId, SessionId, Timestamp};
 use astrid_crypto::ContentHash;
@@ -45,6 +49,7 @@ use tracing::warn;
 
 use lane::{AdmitTicket, Call, Lanes, Lifecycle, Pushed};
 use writer::{HealthState, Shared, WriterConfig};
+mod coverage;
 
 /// Authorization reason stamped on an allowed or failed manifest-gated host
 /// call — the capsule's declared manifest allowlist is what authorized the
@@ -118,7 +123,12 @@ impl HostAuditPolicy {
             HostAuditEvent::NetBind { .. } => 4,
             HostAuditEvent::NetAccept { .. } => 5,
             HostAuditEvent::ProcessSpawn { .. } => 6,
-            HostAuditEvent::FileProbe { .. } => return false,
+            HostAuditEvent::FileProbe { .. }
+            | HostAuditEvent::HttpRequest(_)
+            | HostAuditEvent::HttpResponse(_)
+            | HostAuditEvent::ToolCall { .. }
+            | HostAuditEvent::ApprovalRequested { .. }
+            | HostAuditEvent::ApprovalDecided(_) => return false,
         };
         self.fail_closed & (1 << index) != 0
     }
@@ -303,9 +313,23 @@ fn wait_blocking<T>(wait: impl FnOnce() -> T) -> T {
 /// per kernel boot, bound to the kernel's single `session_id`.
 #[derive(Clone)]
 pub struct KernelAuditSink {
+    session_id: SessionId,
     /// Ordered lane and its writer. Producers never block on a full queue.
     queue: Arc<AuditQueue>,
     policy: HostAuditPolicy,
+    /// Capsule code identity stamped on every entry this handle writes.
+    /// `None` on the kernel's own handle; set on the per-capsule handles the
+    /// engine obtains through [`HostAuditSink::attributed`].
+    actor: Option<Arc<CapsuleActor>>,
+    /// The audit log, for records that must be durable before the host call
+    /// proceeds ([`HostAuditSink::commit`]).
+    audit_log: Arc<AuditLog>,
+    /// Per-principal HTTP request numbers for this kernel run, shared by
+    /// every handle so the sequence spans all capsules of a principal.
+    http_sequences: Arc<Mutex<HashMap<PrincipalId, u64>>>,
+    /// Identifier of this kernel run, recorded with every HTTP entry. The
+    /// sequences restart with each run, so a verifier checks for gaps per run.
+    run_id: Arc<str>,
 }
 
 impl KernelAuditSink {
@@ -350,8 +374,13 @@ impl KernelAuditSink {
         marker: Option<ScopedKvStore>,
     ) -> Self {
         Self {
-            queue: AuditQueue::new(audit_log, session_id, policy, marker),
+            session_id: session_id.clone(),
+            queue: AuditQueue::new(Arc::clone(&audit_log), session_id, policy, marker),
             policy,
+            actor: None,
+            audit_log,
+            http_sequences: Arc::default(),
+            run_id: Arc::from(uuid::Uuid::new_v4().to_string()),
         }
     }
 
@@ -367,13 +396,13 @@ impl KernelAuditSink {
         self.queue.shutdown();
     }
 
-    /// Map a neutral host event onto the internal audit action.
+    /// Map a neutral host event onto the internal audit action, stamped with
+    /// `actor`.
     ///
-    /// `FileWrite` content hashing is not captured at this per-action seam
-    /// yet (the host fn reports the path, not the written bytes); a
-    /// zero hash is recorded as a documented placeholder pending a
-    /// content-addressed follow-up.
-    fn to_action(event: HostAuditEvent<'_>) -> AuditAction {
+    /// `FileWrite` carries the BLAKE3 of the written bytes when the host call
+    /// wrote content; a directory creation or a write denied before content
+    /// was accepted records the zero hash.
+    fn to_action(event: HostAuditEvent<'_>, actor: Option<CapsuleActor>) -> AuditAction {
         // Every guest-controlled string is bounded here (see
         // `truncate_guest_str` / `MAX_AUDIT_STR_BYTES`) before it is signed and
         // persisted, closing the disk/CPU amplification path.
@@ -381,25 +410,30 @@ impl KernelAuditSink {
             HostAuditEvent::FileRead { path } | HostAuditEvent::FileProbe { path } => {
                 AuditAction::FileRead {
                     path: truncate_guest_str(path),
+                    actor,
                 }
             },
-            HostAuditEvent::FileWrite { path } => AuditAction::FileWrite {
+            HostAuditEvent::FileWrite { path, content_hash } => AuditAction::FileWrite {
                 path: truncate_guest_str(path),
-                // Content hash not captured at the per-action seam yet.
-                content_hash: ContentHash::zero(),
+                content_hash: content_hash.unwrap_or_else(ContentHash::zero),
+                actor,
             },
             HostAuditEvent::FileDelete { path } => AuditAction::FileDelete {
                 path: truncate_guest_str(path),
+                actor,
             },
             HostAuditEvent::NetConnect { host, port } => AuditAction::NetConnect {
                 host: truncate_guest_str(host),
                 port,
+                actor,
             },
             HostAuditEvent::NetBind { addr } => AuditAction::NetBind {
                 addr: truncate_guest_str(addr),
+                actor,
             },
             HostAuditEvent::ProcessSpawn { command } => AuditAction::ProcessSpawn {
                 command: truncate_guest_str(command),
+                actor,
             },
             HostAuditEvent::NetAccept {
                 local_addr,
@@ -407,6 +441,28 @@ impl KernelAuditSink {
             } => AuditAction::NetAccept {
                 local_addr: truncate_guest_str(local_addr),
                 peer_addr: truncate_guest_str(peer_addr),
+                actor,
+            },
+            HostAuditEvent::HttpRequest(request) => coverage::http_request_action(&request, actor),
+            HostAuditEvent::HttpResponse(response) => {
+                coverage::http_response_action(&response, actor)
+            },
+            HostAuditEvent::ToolCall {
+                capsule_id,
+                tool,
+                call_id,
+                args_hash,
+                result_hash,
+            } => {
+                coverage::tool_call_action(capsule_id, tool, call_id, args_hash, result_hash, actor)
+            },
+            HostAuditEvent::ApprovalRequested {
+                request_id,
+                action,
+                resource,
+            } => coverage::approval_requested_action(request_id, action, resource, actor),
+            HostAuditEvent::ApprovalDecided(decision) => {
+                coverage::approval_decision_action(&decision, actor)
             },
         }
     }
@@ -419,6 +475,29 @@ impl KernelAuditSink {
             HostAuditOutcome::Denied(reason) => {
                 (HostCallOutcome::Denied, truncate_guest_str(reason))
             },
+        }
+    }
+
+    fn to_proof_outcome(outcome: HostAuditOutcome<'_>) -> (AuthorizationProof, AuditOutcome) {
+        match outcome {
+            HostAuditOutcome::Allowed => (
+                AuthorizationProof::System {
+                    reason: MANIFEST_GATED_REASON.into(),
+                },
+                AuditOutcome::success(),
+            ),
+            HostAuditOutcome::Failed(error) => (
+                AuthorizationProof::System {
+                    reason: MANIFEST_GATED_REASON.into(),
+                },
+                AuditOutcome::failure(truncate_guest_str(error)),
+            ),
+            HostAuditOutcome::Denied(reason) => (
+                AuthorizationProof::Denied {
+                    reason: truncate_guest_str(reason),
+                },
+                AuditOutcome::failure(truncate_guest_str(reason)),
+            ),
         }
     }
 
@@ -462,11 +541,13 @@ impl KernelAuditSink {
                 .fetch_add(1, Ordering::Relaxed);
             return;
         }
+        let mut action = Self::to_action(event, self.actor.as_deref().cloned());
+        self.stamp_http_sequence(principal, &mut action);
         let (outcome, detail) = Self::classify(outcome);
         self.enqueue(
             principal,
             Call {
-                action: Self::to_action(event),
+                action,
                 outcome,
                 detail,
                 at,
@@ -516,7 +597,7 @@ impl HostAuditSink for KernelAuditSink {
         if !self.policy.fails_closed(&event) {
             return Ok(());
         }
-        let action = Self::to_action(event);
+        let action = Self::to_action(event, self.actor.as_deref().cloned());
         let Err(reason) = self.admit_durably(principal, action.clone()) else {
             return Ok(());
         };
@@ -541,7 +622,29 @@ impl HostAuditSink for KernelAuditSink {
         );
         Err(HostAuditRefusal::new(reason))
     }
+
+    fn attributed(&self, actor: HostAuditActor) -> Option<Arc<dyn HostAuditSink>> {
+        Some(Arc::new(Self {
+            actor: Some(Arc::new(coverage::to_capsule_actor(&actor))),
+            ..self.clone()
+        }))
+    }
+
+    fn commit<'a>(
+        &'a self,
+        principal: &'a PrincipalId,
+        event: HostAuditEvent<'a>,
+        outcome: HostAuditOutcome<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HostAuditReceipt> + Send + 'a>> {
+        Box::pin(self.commit_direct(principal, event, outcome))
+    }
 }
 
 #[cfg(test)]
+mod attribution_tests;
+#[cfg(test)]
+mod http_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tool_approval_tests;

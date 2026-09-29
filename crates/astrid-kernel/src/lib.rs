@@ -30,6 +30,9 @@ pub mod audit_sink;
 mod bus_monitor;
 #[cfg(test)]
 mod capsule_adversarial_tests;
+/// Audit entries binding capsule code identity at install and load.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod capsule_audit;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod capsule_materialization;
 mod capsule_removal;
@@ -42,6 +45,9 @@ mod capsules_loaded_tests;
 #[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
 #[path = "catalog_authority_tests.rs"]
 mod catalog_authority_tests;
+/// Audit entries for applied capability and grant changes.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod grant_audit;
 /// Grant-on-first-use consent handler (issue #998).
 ///
 /// Native-only: reuses the management-API admin grant machinery
@@ -1482,6 +1488,11 @@ impl Kernel {
             Arc::clone(&kernel.profile_cache),
             Arc::clone(&kernel.groups),
         );
+        // Grant-on-use prompts are committed to the audit log before they
+        // are published.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let access_resolver =
+            access_resolver.with_audit_sink(Arc::new(kernel.audit_sink.as_ref().clone()));
         let dispatcher = astrid_capsule::dispatcher::EventDispatcher::new(
             Arc::clone(&kernel.capsules),
             Arc::clone(&kernel.event_bus),
@@ -1893,6 +1904,8 @@ impl Kernel {
             return Ok(());
         }
 
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let identity = capsule_audit::CapsuleIdentity::of(candidate.as_ref());
         let owner = Some(principal.clone());
         if let Err(publication) =
             registry.try_register_reserved_runtime(candidate, runtime_id, principal, owner)
@@ -1910,6 +1923,9 @@ impl Kernel {
             capsule.resume_for(principal);
             capsule.publish();
         }
+        drop(registry);
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        capsule_audit::record_capsule_loaded(self, principal, identity, "load").await;
         Ok(())
     }
 
@@ -2205,6 +2221,7 @@ impl Kernel {
             .prepare_runtime_replacement(id, &source_dir, principal, current_runtime.key().scope())
             .await?;
 
+        let identity = capsule_audit::CapsuleIdentity::of(prepared.capsule.as_ref());
         let load_guard = self.capsule_load_lock.lock().await;
         if self.capabilities.is_principal_retiring(principal).await {
             drop(load_guard);
@@ -2273,6 +2290,7 @@ impl Kernel {
             (replaced.previous, replacement)
         };
         drop(load_guard);
+        capsule_audit::record_capsule_loaded(self, principal, identity, "replace").await;
 
         let outcome = unload_replaced_runtime(id, &mut previous).await;
         if let Err(error) = replacement

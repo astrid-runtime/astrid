@@ -23,7 +23,7 @@ use astrid_audit::host_call::{
     HostCallFold, HostCallOutcome, HostCallRef, HostCallSummary, HostCallTally, host_call_class,
     host_call_digest,
 };
-use astrid_audit::{AuditAction, AuditOutcome, AuthorizationProof};
+use astrid_audit::{AuditAction, AuditOutcome, AuthorizationProof, CapsuleActor};
 use astrid_core::{PrincipalId, SessionId, Timestamp};
 use astrid_crypto::ContentHash;
 
@@ -57,8 +57,21 @@ impl Call {
     }
 
     fn run_key(&self) -> RunKey {
+        // Coverage records carry their own identity and must remain individual.
+        if !matches!(
+            self.action,
+            AuditAction::FileRead { .. }
+                | AuditAction::FileWrite { .. }
+                | AuditAction::FileDelete { .. }
+                | AuditAction::NetConnect { .. }
+                | AuditAction::NetBind { .. }
+                | AuditAction::NetAccept { .. }
+                | AuditAction::ProcessSpawn { .. }
+        ) {
+            return RunKey::Individual;
+        }
         if self.outcome != HostCallOutcome::Denied {
-            return RunKey::Calls;
+            return RunKey::Calls(super::coverage::action_actor(&self.action).cloned());
         }
         let mut identity = serde_json::to_vec(&self.action).unwrap_or_default();
         identity.push(0);
@@ -68,10 +81,12 @@ impl Call {
 }
 
 /// Which calls may share a run.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) enum RunKey {
-    /// Allowed and failed calls of any class.
-    Calls,
+    /// Allowed and failed calls of any class from the same capsule.
+    Calls(Option<CapsuleActor>),
+    /// Coverage events cannot fold, even when their payloads match.
+    Individual,
     /// Denials with this action and reason.
     Denied(ContentHash),
 }
@@ -153,6 +168,7 @@ impl Summary {
                 AuditOutcome::failure(detail),
             ),
         };
+        let authorization = super::coverage::authorization(&tally.first, authorization);
         Some((tally.first.clone(), authorization, outcome))
     }
 }
@@ -303,7 +319,7 @@ impl Slot {
     /// The signed entry this slot becomes.
     pub(super) fn request(&self, session: &SessionId) -> AppendRequest {
         let (action, authorization, outcome) = match &self.kind {
-            SlotKind::Run { key, calls } => run_entry(*key, calls),
+            SlotKind::Run { key, calls } => run_entry(key, calls),
             SlotKind::Loss { calls } => (
                 AuditAction::HostCallLoss {
                     calls: calls.signed(),
@@ -338,7 +354,7 @@ impl Slot {
     }
 }
 
-fn run_entry(key: RunKey, calls: &Summary) -> (AuditAction, AuthorizationProof, AuditOutcome) {
+fn run_entry(key: &RunKey, calls: &Summary) -> (AuditAction, AuthorizationProof, AuditOutcome) {
     if calls.count() == 1
         && let Some(single) = calls.single()
     {
@@ -348,8 +364,10 @@ fn run_entry(key: RunKey, calls: &Summary) -> (AuditAction, AuthorizationProof, 
         calls: calls.signed(),
     };
     match key {
-        RunKey::Calls if calls.failed == 0 => (action, manifest_gated(), AuditOutcome::success()),
-        RunKey::Calls => (
+        RunKey::Calls(_) | RunKey::Individual if calls.failed == 0 => {
+            (action, manifest_gated(), AuditOutcome::success())
+        },
+        RunKey::Calls(_) | RunKey::Individual => (
             action,
             manifest_gated(),
             AuditOutcome::failure(format!(
@@ -521,7 +539,7 @@ impl Lanes {
             Some(SlotKind::Run {
                 key: tail_key,
                 calls,
-            }) if *tail_key == key => {
+            }) if key != RunKey::Individual && *tail_key == key => {
                 calls.push(call);
                 return Pushed::Folded;
             },

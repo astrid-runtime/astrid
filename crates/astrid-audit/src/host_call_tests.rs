@@ -10,6 +10,7 @@ fn at(secs: i64, nanos: u32) -> Timestamp {
 
 fn read(path: &str) -> AuditAction {
     AuditAction::FileRead {
+        actor: None,
         path: path.to_owned(),
     }
 }
@@ -59,6 +60,7 @@ fn call_digest_follows_the_documented_layout() {
 fn call_digest_binds_every_field() {
     let time = at(10, 0);
     let base_action = AuditAction::NetConnect {
+        actor: None,
         host: "example.com".to_owned(),
         port: 443,
     };
@@ -71,6 +73,7 @@ fn call_digest_binds_every_field() {
     let digest = host_call_digest(&base).expect("host call");
 
     let other_port = AuditAction::NetConnect {
+        actor: None,
         host: "example.com".to_owned(),
         port: 444,
     };
@@ -112,28 +115,56 @@ fn non_host_call_actions_have_no_digest() {
 }
 
 #[test]
+fn attributed_call_digest_binds_capsule_and_wasm_identity() {
+    let time = at(10, 0);
+    let digest = |capsule: &str, wasm: &[u8]| {
+        host_call_digest(&HostCallRef {
+            action: &AuditAction::FileRead {
+                path: "/w/a".into(),
+                actor: Some(crate::CapsuleActor {
+                    capsule_id: capsule.into(),
+                    wasm_hash: Some(ContentHash::hash(wasm)),
+                }),
+            },
+            outcome: HostCallOutcome::Ok,
+            detail: "",
+            at: &time,
+        })
+        .expect("attributed call")
+    };
+    assert_ne!(digest("one", b"a"), digest("two", b"a"));
+    assert_ne!(digest("one", b"a"), digest("one", b"b"));
+}
+
+#[test]
 fn every_host_call_class_is_listed() {
     let actions = [
         read("/p"),
         AuditAction::FileWrite {
+            actor: None,
             path: "/p".to_owned(),
             content_hash: ContentHash::zero(),
         },
         AuditAction::FileDelete {
+            actor: None,
             path: "/p".to_owned(),
         },
         AuditAction::NetConnect {
+            actor: None,
             host: "h".to_owned(),
             port: 1,
         },
         AuditAction::NetBind {
+            actor: None,
             addr: "a".to_owned(),
         },
         AuditAction::NetAccept {
+            actor: None,
             local_addr: "l".to_owned(),
             peer_addr: "p".to_owned(),
         },
         AuditAction::ProcessSpawn {
+            actor: None,
             command: "c".to_owned(),
         },
     ];
@@ -150,6 +181,7 @@ fn calls() -> Vec<(AuditAction, HostCallOutcome, &'static str, Timestamp)> {
         (read("/b"), HostCallOutcome::Failed, "NotFound", at(100, 2)),
         (
             AuditAction::ProcessSpawn {
+                actor: None,
                 command: "ls".to_owned(),
             },
             HostCallOutcome::Ok,

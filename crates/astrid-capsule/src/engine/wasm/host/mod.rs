@@ -9,6 +9,8 @@
 
 /// Capsule-level approval requests.
 pub(crate) mod approval;
+/// Audit records for approval checks.
+pub(crate) mod approval_audit;
 /// Producer-side tests for the per-action host-audit seam (the sink trait
 /// itself lives at [`crate::audit_sink`]).
 #[cfg(test)]
@@ -45,6 +47,8 @@ pub(crate) mod request_context;
 pub(crate) mod stubs;
 /// System configuration primitives.
 pub mod sys;
+/// Audit of tool invocations delivered to tool capsules.
+pub mod tool_audit;
 /// Uplink communications with host capabilities.
 pub(crate) mod uplink;
 /// Utility functions for WASM host implementations.

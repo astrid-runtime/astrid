@@ -48,7 +48,10 @@ fn record_event_kinds(sink: &KernelAuditSink, principal: &PrincipalId) {
     );
     sink.record(
         principal,
-        HostAuditEvent::FileWrite { path: "/w/w" },
+        HostAuditEvent::FileWrite {
+            path: "/w/w",
+            content_hash: None,
+        },
         HostAuditOutcome::Failed("disk full"),
     );
     sink.record(
@@ -134,23 +137,23 @@ async fn records_each_event_kind_onto_the_signed_chain() {
     );
     assert!(matches!(
         &run.tally[1].first,
-        AuditAction::FileWrite { path, content_hash }
+        AuditAction::FileWrite { actor: None, path, content_hash }
             if path == "/w/w" && *content_hash == ContentHash::zero()
     ));
     assert_eq!(run.tally[1].first_detail.as_deref(), Some("disk full"));
     assert!(matches!(
         &run.tally[3].first,
-        AuditAction::NetConnect { host, port } if host == "example.com" && *port == 443
+        AuditAction::NetConnect { actor: None, host, port } if host == "example.com" && *port == 443
     ));
     assert!(matches!(
         &run.tally[5].first,
-        AuditAction::NetAccept { local_addr, peer_addr }
+        AuditAction::NetAccept { actor: None, local_addr, peer_addr }
             if local_addr == "127.0.0.1:8788" && peer_addr == "127.0.0.1:49152"
     ));
     assert!(matches!(
         (&entries[1].action, &entries[1].authorization, &entries[1].outcome),
         (
-            AuditAction::ProcessSpawn { command },
+            AuditAction::ProcessSpawn { command, .. },
             AuthorizationProof::Denied { .. },
             AuditOutcome::Failure { .. }
         ) if command == "ls"
@@ -199,8 +202,8 @@ async fn oversized_guest_strings_are_truncated_at_the_sink() {
 
     for e in &entries {
         let stored = match &e.action {
-            AuditAction::ProcessSpawn { command } => command,
-            AuditAction::FileRead { path } => path,
+            AuditAction::ProcessSpawn { command, .. } => command,
+            AuditAction::FileRead { path, .. } => path,
             other => panic!("unexpected action: {other:?}"),
         };
         assert!(
@@ -367,7 +370,7 @@ async fn allowed_path_probes_are_omitted_denied_probes_persist() {
     assert!(matches!(
         (&entries[0].action, &entries[0].authorization),
         (
-            AuditAction::FileRead { path },
+            AuditAction::FileRead { path, .. },
             AuthorizationProof::Denied { .. }
         ) if path == "/etc/shadow"
     ));
@@ -415,7 +418,7 @@ async fn collapse_keeps_principals_and_exact_denials() {
     let denied_paths: Vec<_> = entries
         .iter()
         .filter_map(|e| match (&e.action, &e.authorization) {
-            (AuditAction::FileRead { path }, AuthorizationProof::Denied { .. }) => {
+            (AuditAction::FileRead { path, .. }, AuthorizationProof::Denied { .. }) => {
                 Some(path.as_str())
             },
             _ => None,
@@ -441,9 +444,13 @@ async fn coalesced_run_is_lossless() {
         let path = format!("/run/{index}");
         let (event, outcome, action, kind, detail) = if index % 5 == 4 {
             (
-                HostAuditEvent::FileWrite { path: &path },
+                HostAuditEvent::FileWrite {
+                    content_hash: None,
+                    path: &path,
+                },
                 HostAuditOutcome::Failed("disk full"),
                 AuditAction::FileWrite {
+                    actor: None,
                     path: path.clone(),
                     content_hash: ContentHash::zero(),
                 },
@@ -454,7 +461,10 @@ async fn coalesced_run_is_lossless() {
             (
                 HostAuditEvent::FileRead { path: &path },
                 HostAuditOutcome::Allowed,
-                AuditAction::FileRead { path: path.clone() },
+                AuditAction::FileRead {
+                    actor: None,
+                    path: path.clone(),
+                },
                 HostCallOutcome::Ok,
                 "",
             )
@@ -518,7 +528,7 @@ async fn queue_overflow_is_recorded_as_a_signed_loss_entry() {
             at,
         );
         if index >= 64 {
-            lost.push((AuditAction::FileRead { path }, at));
+            lost.push((AuditAction::FileRead { actor: None, path }, at));
         }
     }
     let health = sink.health();
@@ -530,7 +540,7 @@ async fn queue_overflow_is_recorded_as_a_signed_loss_entry() {
     assert_eq!(entries.len(), 65, "64 denials and one loss entry");
     for (index, entry) in entries[..64].iter().enumerate() {
         assert!(
-            matches!(&entry.action, AuditAction::FileRead { path } if *path == format!("/denied-{index}")),
+            matches!(&entry.action, AuditAction::FileRead { actor: None, path } if *path == format!("/denied-{index}")),
             "denials stay in call order: {:?}",
             entry.action
         );
