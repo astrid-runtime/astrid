@@ -166,6 +166,12 @@ impl KvAuditStorage {
         }
         global.degraded =
             global.total_count > global.cap_entries || global.total_bytes > global.cap_bytes;
+        // A finished prune changes what can be pruned next; the next append
+        // at the cap looks again before any hold applies.
+        global.retention_hold = None;
+        if !global.degraded {
+            global.last_error = None;
+        }
         let mut next_plan = plan.clone();
         next_plan.segment_accounted = true;
         let expected_plan = self
@@ -288,6 +294,13 @@ impl KvAuditStorage {
             .get(NS_PRUNE_RECEIPTS, &receipt_key)
             .await
             .map_err(|error| AuditError::StorageError(error.to_string()))?;
+        // Keep every generation. The receipt being replaced is recorded too,
+        // for chains whose earlier receipts predate the history.
+        if let Some(current) = current.as_deref() {
+            self.record_receipt_history(&receipt_key, current).await?;
+        }
+        self.record_receipt_history(&receipt_key, &plan.receipt)
+            .await?;
         if current.as_deref() != Some(plan.receipt.as_slice())
             && !self
                 .store

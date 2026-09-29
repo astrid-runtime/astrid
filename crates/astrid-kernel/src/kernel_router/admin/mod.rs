@@ -15,8 +15,8 @@
 //!
 //! Every admin topic — allow or deny — appends an
 //! [`AuditAction::AdminRequest`] entry, except a successful `audit.heads`
-//! or `audit.export` read, which would grow the log being anchored with
-//! every poll. `method` is the wire name
+//! or `audit.export` read or `audit.anchor_mark`, which would grow the log
+//! being anchored with every poll. `method` is the wire name
 //! (`"admin.agent.create"`, etc.); `target_principal` is `Some` for
 //! variants that operate on another principal and `None` otherwise.
 //! `params` captures the full request payload (capabilities granted,
@@ -26,6 +26,7 @@
 mod agent_create_helpers;
 mod agent_delete;
 mod agent_derive;
+mod audit_anchor_handlers;
 mod audit_handlers;
 mod caps_tokens;
 mod distro_handlers;
@@ -56,6 +57,8 @@ mod state_tests_agent_delete;
 mod state_tests_agent_derive;
 #[cfg(test)]
 mod state_tests_agent_modify;
+#[cfg(test)]
+mod state_tests_anchor;
 #[cfg(test)]
 mod state_tests_audit;
 #[cfg(test)]
@@ -337,6 +340,8 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         | AdminRequestKind::AuditHealth
         | AdminRequestKind::AuditHeads
         | AdminRequestKind::AuditExport(_)
+        | AdminRequestKind::AuditAnchorMark(_)
+        | AdminRequestKind::AuditAnchorStatus
         | AdminRequestKind::StorageMountIssue {
             view: astrid_core::storage_provider::StorageProviderViewV1::Admin,
             ..
@@ -358,6 +363,10 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
 /// unscoped `quota:set` / `caps:grant` forms. Group admin is always
 /// global — there is no "self" variant of `group:create`.
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per admin request: the complete capability table in one place"
+)]
 pub fn required_capability_for_admin_request(
     req: &AdminRequestKind,
     scope: AuthorityScope,
@@ -473,8 +482,9 @@ pub fn required_capability_for_admin_request(
         (AdminRequestKind::AuditStats, _) => "audit:stats",
         (AdminRequestKind::AuditPrune { .. }, _) => "audit:prune",
         (AdminRequestKind::AuditHealth, _) => "audit:health",
-        (AdminRequestKind::AuditHeads, _) => "audit:heads",
+        (AdminRequestKind::AuditHeads | AdminRequestKind::AuditAnchorStatus, _) => "audit:heads",
         (AdminRequestKind::AuditExport(_), _) => "audit:export",
+        (AdminRequestKind::AuditAnchorMark(_), _) => "audit:anchor",
         (
             request @ (AdminRequestKind::StorageMountIssue { .. }
             | AdminRequestKind::StorageMountStatus { .. }
@@ -581,6 +591,8 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::AuditHealth => "admin.audit.health",
         AdminRequestKind::AuditHeads => "admin.audit.heads",
         AdminRequestKind::AuditExport(_) => "admin.audit.export",
+        AdminRequestKind::AuditAnchorMark(_) => "admin.audit.anchor_mark",
+        AdminRequestKind::AuditAnchorStatus => "admin.audit.anchor_status",
         AdminRequestKind::StorageMountIssue { .. } => "admin.storage.mount.issue",
         AdminRequestKind::StorageMountStatus { .. } => "admin.storage.mount.status",
         AdminRequestKind::StorageMountSync { .. } => "admin.storage.mount.sync",
@@ -665,6 +677,12 @@ fn sanitize_admin_audit_params(req: &AdminRequestKind) -> Option<serde_json::Val
                 serde_json::Value::String("<redacted>".to_owned()),
             );
         },
+        // Up to thousands of chains: keep the row bounded. A rejection row's
+        // outcome names the chains that failed.
+        AdminRequestKind::AuditAnchorMark(request) => {
+            params.remove("chains");
+            params.insert("chain_count".to_string(), request.chains.len().into());
+        },
         _ => {},
     }
     Some(val)
@@ -727,6 +745,8 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         | AdminRequestKind::AuditHealth
         | AdminRequestKind::AuditHeads
         | AdminRequestKind::AuditExport(_)
+        | AdminRequestKind::AuditAnchorMark(_)
+        | AdminRequestKind::AuditAnchorStatus
         | AdminRequestKind::StorageMountIssue { .. }
         | AdminRequestKind::StorageMountStatus { .. }
         | AdminRequestKind::StorageMountSync { .. }
@@ -857,8 +877,8 @@ async fn handle_admin_request(
 
     let success_row_skipped = audit_handlers::omit_success_admin_audit(&req.kind);
     let body = handlers::dispatch_authorized(kernel, &authorization, req.kind).await;
-    if success_row_skipped && let AdminResponseBody::Error(error) = &body {
-        record_admin_request_failure(kernel, &context, error).await;
+    if success_row_skipped && let Some(error) = audit_handlers::skipped_row_failure(&body) {
+        record_admin_request_failure(kernel, &context, &error).await;
     }
     publish_response(
         kernel,

@@ -1,9 +1,8 @@
 //! Batched principal audit append implementation.
 
-use super::prune::AuditRetentionPolicy;
 use super::{
     AuditAction, AuditEntry, AuditEntryId, AuditError, AuditLog, AuditOutcome, AuditResult,
-    AuthorizationProof, ChainHead, ChainKey, DEFAULT_AUTO_RETENTION_ENTRIES, HeadState,
+    AuthorizationProof, ChainHead, ChainKey, HeadState,
 };
 use astrid_core::{PrincipalId, SessionId};
 use std::collections::HashMap;
@@ -60,7 +59,7 @@ impl AuditLog {
                 Ok(results) => results,
                 Err(AuditError::RetentionCapReached) => {
                     self.invalidate_batch_heads(&handles).await;
-                    match self.prune_for_batch_retry().await {
+                    match self.relieve_retention_cap().await {
                         Ok(true) => continue,
                         Ok(false) => {
                             return batch_error(
@@ -152,16 +151,6 @@ impl AuditLog {
                     .or_insert_with(|| Arc::new(Mutex::new(None))),
             )
         }))
-    }
-
-    async fn prune_for_batch_retry(&self) -> AuditResult<bool> {
-        Ok(self
-            .prune_oldest(AuditRetentionPolicy {
-                retain_entries: DEFAULT_AUTO_RETENTION_ENTRIES,
-                retain_bytes: None,
-            })
-            .await?
-            .is_some())
     }
 
     async fn invalidate_batch_heads(&self, handles: &HashMap<ChainKey, ChainHead>) {

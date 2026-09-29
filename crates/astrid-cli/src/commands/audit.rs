@@ -7,8 +7,8 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use astrid_core::kernel_api::{
-    AdminRequestKind, AdminResponseBody, AuditExportPage, AuditExportRequest, AuditHeadsSnapshot,
-    AuditHealth, AuditPruneResult, AuditStats,
+    AdminRequestKind, AdminResponseBody, AuditAnchorStatusReport, AuditExportPage,
+    AuditExportRequest, AuditHeadsSnapshot, AuditHealth, AuditPruneResult, AuditStats,
 };
 use astrid_core::{PrincipalId, SessionId};
 use clap::{Args, Subcommand};
@@ -30,6 +30,8 @@ pub(crate) enum AuditCommand {
     Heads(AuditHeadsArgs),
     /// Print one page of a chain's raw signed entries, in chain order.
     Export(AuditExportArgs),
+    /// Show how far each chain is externally anchored, and how far behind.
+    AnchorStatus(AuditAnchorStatusArgs),
 }
 
 /// Top-level `audit` arguments.
@@ -95,6 +97,17 @@ pub(crate) struct AuditExportArgs {
     /// Maximum entries in the page (kernel default 500, capped at 1000).
     #[arg(long, value_name = "N")]
     pub limit: Option<u32>,
+    /// Also print the chain's prune receipts from this generation on.
+    #[arg(long, value_name = "GENERATION")]
+    pub receipts_from: Option<u64>,
+    /// Output format: pretty (default), json, yaml, or toml.
+    #[arg(long, default_value = "pretty")]
+    pub format: String,
+}
+
+/// `audit anchor-status` output options.
+#[derive(Args, Debug, Clone)]
+pub(crate) struct AuditAnchorStatusArgs {
     /// Output format: pretty (default), json, yaml, or toml.
     #[arg(long, default_value = "pretty")]
     pub format: String,
@@ -114,6 +127,7 @@ pub(crate) async fn run(args: &AuditArgs) -> Result<ExitCode> {
         AuditCommand::Health(args) => run_health(args).await,
         AuditCommand::Heads(args) => run_heads(args).await,
         AuditCommand::Export(args) => run_export(args).await,
+        AuditCommand::AnchorStatus(args) => run_anchor_status(args).await,
     }
 }
 
@@ -149,14 +163,22 @@ async fn run_prune(args: &AuditPruneArgs) -> Result<ExitCode> {
         bail!("--retain-bytes must be greater than 0");
     }
     let mut client = connect_as_active_agent().await?;
-    let body = into_result(
-        client
-            .request(AdminRequestKind::AuditPrune {
-                retain_entries: args.retain_entries,
-                retain_bytes: args.retain_bytes,
-            })
-            .await?,
-    )?;
+    let body = client
+        .request(AdminRequestKind::AuditPrune {
+            retain_entries: args.retain_entries,
+            retain_bytes: args.retain_bytes,
+        })
+        .await?;
+    if let AdminResponseBody::Error(error) = &body
+        && error.starts_with("audit prune refused")
+    {
+        bail!(
+            "{error}\n\nNothing was pruned: the prune would remove audit history that is not \
+             externally anchored. Run `astrid audit anchor-status` to see how far each chain is \
+             anchored."
+        );
+    }
+    let body = into_result(body)?;
     let AdminResponseBody::AuditPruned(result) = body else {
         bail!("unexpected response from kernel: {body:?}");
     };
@@ -216,6 +238,7 @@ async fn run_export(args: &AuditExportArgs) -> Result<ExitCode> {
         from: args.from,
         cursor: args.cursor.clone(),
         limit: args.limit,
+        receipts_from: args.receipts_from,
     };
     let mut client = connect_as_active_agent().await?;
     let body = into_result(
@@ -233,6 +256,61 @@ async fn run_export(args: &AuditExportArgs) -> Result<ExitCode> {
         emit_structured(&page, format)?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+async fn run_anchor_status(args: &AuditAnchorStatusArgs) -> Result<ExitCode> {
+    let mut client = connect_as_active_agent().await?;
+    let body = into_result(client.request(AdminRequestKind::AuditAnchorStatus).await?)?;
+    let AdminResponseBody::AuditAnchorStatus(report) = body else {
+        bail!("unexpected response from kernel: {body:?}");
+    };
+    let held = report.retention_hold.is_some();
+    let format = ValueFormat::parse(&args.format);
+    if format.is_pretty() {
+        print_anchor_status_pretty(&report);
+    } else {
+        emit_structured(&report, format)?;
+    }
+    Ok(if held {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn print_anchor_status_pretty(report: &AuditAnchorStatusReport) {
+    println!("Audit anchoring ({} chains)", report.chains.len());
+    println!(
+        "  anchor before prune: {}",
+        if report.require_anchor_before_prune {
+            "required"
+        } else {
+            "only for anchored chains"
+        }
+    );
+    if let Some(hold) = &report.retention_hold {
+        println!("  retention:          held over the cap: {hold}");
+    }
+    for chain in &report.chains {
+        let principal = chain
+            .principal
+            .as_ref()
+            .map_or("(system)", PrincipalId::as_str);
+        let head = chain
+            .head_position()
+            .map_or_else(|| "unknown".to_owned(), |head| head.to_string());
+        let lag = chain
+            .lag()
+            .map_or_else(|| "unknown".to_owned(), |lag| lag.to_string());
+        match chain.anchored_position {
+            Some(anchored) => println!(
+                "  {} {principal}: head {head} anchored {anchored} lag {lag} at {}",
+                chain.session,
+                chain.anchored_at.as_deref().unwrap_or("?")
+            ),
+            None => println!("  {} {principal}: head {head} not anchored", chain.session),
+        }
+    }
 }
 
 /// Accept `system`, a bare UUID, or the `session:<uuid>` display form.
@@ -288,6 +366,15 @@ fn print_export_pretty(page: &AuditExportPage) {
     if let Some(cursor) = &page.next_cursor {
         println!("  next cursor:      {cursor}");
     }
+    for receipt in &page.prune_receipts {
+        println!(
+            "  receipt #{} omitted {} hash {}",
+            receipt.generation, receipt.receipt["omitted_count"], receipt.receipt_hash_hex
+        );
+    }
+    if let Some(next) = page.next_receipts_from {
+        println!("  more receipts from generation {next}");
+    }
 }
 
 fn print_stats_pretty(stats: &AuditStats, health: &AuditHealth) {
@@ -311,6 +398,11 @@ fn print_stats_pretty(stats: &AuditStats, health: &AuditHealth) {
             "healthy"
         }
     );
+    if let Some(hold) = &stats.retention_hold {
+        println!("  held over cap:   {hold}");
+    } else if let Some(error) = &stats.last_error {
+        println!("  last error:      {error}");
+    }
     print_health_pretty(health);
 }
 

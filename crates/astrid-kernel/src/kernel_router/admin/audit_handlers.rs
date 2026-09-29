@@ -9,13 +9,13 @@
 use std::sync::Arc;
 
 use astrid_audit::{
-    AuditAction, AuditChainHead, AuditChainPruneState, AuditEntry, AuditLog, AuditOutcome,
-    AuditRetentionPolicy, AuthorizationProof,
+    AuditAction, AuditChainHead, AuditChainPruneState, AuditEntry, AuditError, AuditLog,
+    AuditOutcome, AuditRetentionPolicy, AuthorizationProof,
 };
 use astrid_core::kernel_api::{
     AUDIT_OMITTED_TOTAL_UNKNOWN, AdminRequestKind, AdminResponseBody, AuditExportEntry,
-    AuditExportPage, AuditExportRequest, AuditHeadsChain, AuditHeadsPrune, AuditHeadsSnapshot,
-    AuditHealth, AuditPruneResult, AuditStats,
+    AuditExportPage, AuditExportReceipt, AuditExportRequest, AuditHeadsChain, AuditHeadsPrune,
+    AuditHeadsSnapshot, AuditHealth, AuditPruneResult, AuditStats,
 };
 use astrid_core::{PrincipalId, SessionId, Timestamp};
 use astrid_crypto::ContentHash;
@@ -43,19 +43,34 @@ const EXPORT_ENTRY_MAX_BYTES: usize = EXPORT_PAGE_BYTES * 3 / 2;
 const EXPORT_READ_BATCH: usize = 32;
 /// Largest unpaged heads snapshot (roughly 600 bytes of JSON per chain).
 const HEADS_MAX_CHAINS: usize = 4_096;
+/// Most prune receipts in one export page (each about 2,500 bytes).
+const EXPORT_MAX_RECEIPTS: usize = 32;
 
 /// Whether an authorized admin request skips the generic success audit row.
 ///
 /// The anchoring service polls `audit.heads` and `audit.export` every few
-/// seconds. A success row per poll would grow the log being anchored by tens
-/// of thousands of entries a day. Denied requests are still recorded before
-/// dispatch, and an authorized request whose handler fails (an unknown
-/// chain, a rejected cursor, a storage error) is recorded after it.
+/// seconds and marks what it anchored with `audit.anchor_mark`. A success
+/// row per call would grow the log being anchored by tens of thousands of
+/// entries a day, and each mark would leave a new unanchored entry behind.
+/// Denied requests are still recorded before dispatch, and an authorized
+/// request that fails (an unknown chain, a rejected cursor or mark, a
+/// storage error) is recorded after it; see [`skipped_row_failure`].
 pub(super) fn omit_success_admin_audit(request: &AdminRequestKind) -> bool {
     matches!(
         request,
-        AdminRequestKind::AuditHeads | AdminRequestKind::AuditExport(_)
+        AdminRequestKind::AuditHeads
+            | AdminRequestKind::AuditExport(_)
+            | AdminRequestKind::AuditAnchorMark(_)
     )
+}
+
+/// The failure to record for a request whose success row is skipped: the
+/// handler's error, or the chains an anchor mark rejected.
+pub(super) fn skipped_row_failure(body: &AdminResponseBody) -> Option<String> {
+    match body {
+        AdminResponseBody::Error(error) => Some(error.clone()),
+        other => super::audit_anchor_handlers::rejected_marks(other),
+    }
 }
 
 /// Return a runtime-key-signed snapshot of every audit chain head.
@@ -149,6 +164,7 @@ async fn export_page(
         from,
         cursor,
         limit,
+        receipts_from,
     } = request;
     let principal = principal.as_ref();
     let limit = usize::try_from(
@@ -182,6 +198,10 @@ async fn export_page(
         complete,
     } = read_export_entries(log, &session, principal, from, after, limit).await?;
     let next_index = from.saturating_add(u64::try_from(entries.len()).unwrap_or(u64::MAX));
+    let (prune_receipts, next_receipts_from) = match receipts_from {
+        Some(from_generation) => export_receipts(log, &session, principal, from_generation).await?,
+        None => (Vec::new(), None),
+    };
     let prune = settled_prune_state(log, &session, principal).await?;
     if prune.as_ref().map(|state| state.receipt_hash)
         != prune_before.as_ref().map(|state| state.receipt_hash)
@@ -202,7 +222,43 @@ async fn export_page(
         prune_receipt: receipt.receipt,
         prune_receipt_hash_hex: receipt.hash_hex,
         prune_receipt_signing_data_hex: receipt.signing_data_hex,
+        prune_receipts,
+        next_receipts_from,
     })
+}
+
+/// A bounded run of a chain's prune receipts from `from_generation` on, and
+/// the generation that continues it when the run is full.
+async fn export_receipts(
+    log: &AuditLog,
+    session: &SessionId,
+    principal: Option<&PrincipalId>,
+    from_generation: u64,
+) -> Result<(Vec<AuditExportReceipt>, Option<u64>), String> {
+    let states = log
+        .prune_receipts(session, principal, from_generation, EXPORT_MAX_RECEIPTS)
+        .await
+        .map_err(|error| error.to_string())?;
+    let next = if states.len() == EXPORT_MAX_RECEIPTS {
+        states
+            .last()
+            .map(|state| state.receipt.generation.saturating_add(1))
+    } else {
+        None
+    };
+    let receipts = states
+        .into_iter()
+        .map(|state| {
+            let exported = ExportedReceipt::new(Some(state.clone()))?;
+            Ok(AuditExportReceipt {
+                generation: state.receipt.generation,
+                receipt: exported.receipt.unwrap_or_default(),
+                receipt_hash_hex: exported.hash_hex.unwrap_or_default(),
+                signing_data_hex: exported.signing_data_hex.unwrap_or_default(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((receipts, next))
 }
 
 /// The entries of one export page and where the next page resumes.
@@ -432,6 +488,7 @@ pub(super) async fn stats(kernel: &Arc<Kernel>) -> AdminResponseBody {
             cap_bytes: stats.cap_bytes,
             degraded: stats.degraded,
             last_error: stats.last_error,
+            retention_hold: stats.retention_hold,
         }),
         Err(error) => AdminResponseBody::Error(format!("audit stats unavailable: {error}")),
     }
@@ -464,6 +521,9 @@ pub(super) async fn prune(
             return AdminResponseBody::Error(
                 "audit prune found no eligible sealed segment".to_owned(),
             );
+        },
+        Err(AuditError::UnanchoredPrune(reason)) => {
+            return AdminResponseBody::Error(format!("audit prune refused: {reason}"));
         },
         Err(error) => return AdminResponseBody::Error(format!("audit prune failed: {error}")),
     };

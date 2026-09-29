@@ -343,6 +343,14 @@ impl KvAuditStorage {
             || metadata.total_bytes.saturating_add(entry_bytes) > metadata.cap_bytes
         {
             metadata.degraded = true;
+            if let Some(hold) = &metadata.retention_hold {
+                // Keep unanchored history over the cap rather than drop it.
+                metadata.last_error = Some(hold.clone());
+                return Ok(GlobalState {
+                    expected_bytes,
+                    metadata,
+                });
+            }
             metadata.last_error =
                 Some("system audit retention cap reached; prune sealed segments".to_owned());
             let _ = self
@@ -575,6 +583,9 @@ fn account_global_append(
     if transition.next.sealed && !transition.prior_sealed {
         global.sealed_segments = global.sealed_segments.saturating_add(1);
         global.eligible_segments = global.eligible_segments.saturating_add(1);
+        // A new sealed segment may be prunable; the next append at the cap
+        // looks again.
+        global.retention_hold = None;
     }
     global.degraded =
         global.total_count > global.cap_entries || global.total_bytes > global.cap_bytes;

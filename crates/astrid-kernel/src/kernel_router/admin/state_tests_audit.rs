@@ -116,6 +116,7 @@ fn request(session: &SessionId, principal: &str) -> AuditExportRequest {
         from: 0,
         cursor: None,
         limit: None,
+        receipts_from: None,
     }
 }
 

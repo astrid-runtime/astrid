@@ -11,9 +11,6 @@
 //! is to instantiate `astrid_events::EventBus`, load `.capsule` files into
 //! the Extism sandbox, and route IPC bytes between them.
 
-#[cfg(all(test, unix))]
-#[path = "audit_retirement_tests.rs"]
-mod audit_retirement_tests;
 /// Kernel implementation of the capsule per-action host-audit sink.
 ///
 /// Native-only: the [`HostAuditSink`](astrid_capsule::HostAuditSink) seam is
@@ -21,6 +18,12 @@ mod audit_retirement_tests;
 /// (the WASM engine never runs on the browser profile). The sink is the last
 /// synchronous caller of the now-async audit log, so it carries a native-gated
 /// block-on bridge that must not exist on `wasm32-unknown-unknown`.
+/// Operator retention controls for the system audit log.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod audit_retention;
+#[cfg(all(test, unix))]
+#[path = "audit_retirement_tests.rs"]
+mod audit_retirement_tests;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod audit_sink;
 /// Passive event-bus storm diagnostics (publish-rate monitor).
@@ -1324,11 +1327,12 @@ impl Kernel {
         }
 
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let host_audit_policy =
-            astrid_config::Config::load_with_layout(Some(&workspace_root), &workspace_layout)
-                .ok()
-                .map(|resolved| crate::audit_sink::HostAuditPolicy::from(&resolved.config.audit))
-                .unwrap_or_default();
+        let audit_config =
+            crate::audit_retention::load_audit_config(&workspace_root, &workspace_layout);
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        crate::audit_retention::apply_retention_config(&audit_log, &audit_config.retention);
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let host_audit_policy = crate::audit_sink::HostAuditPolicy::from(&audit_config);
 
         let kernel = Arc::new(Self {
             session_id: session_id.clone(),

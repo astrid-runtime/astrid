@@ -36,8 +36,14 @@ pub use types::{AuditGlobalStats, ChainIssue, ChainVerificationResult};
 #[path = "prune.rs"]
 mod prune;
 pub use prune::{AuditPruneReceipt, AuditRetentionPolicy};
+#[path = "log/anchor.rs"]
+mod anchor;
+pub use anchor::{AuditAnchorMarkResult, AuditAnchorWatermark, AuditChainAnchorStatus};
 #[path = "log/append_batch.rs"]
 mod append_batch;
+#[path = "log/archive.rs"]
+mod archive;
+pub use archive::{AuditArchiveWriter, AuditArchiver};
 #[path = "log/heads_export.rs"]
 mod heads_export;
 pub use heads_export::{AuditChainHead, AuditChainPruneState};
@@ -47,6 +53,8 @@ mod import_legacy;
 mod migration;
 #[path = "log/prune_oldest.rs"]
 mod prune_oldest_impl;
+#[path = "log/retention_guard.rs"]
+mod retention_guard;
 #[path = "log/verify_chain.rs"]
 mod verify_chain_impl;
 #[path = "log/verify_legacy_chain.rs"]
@@ -146,6 +154,8 @@ pub struct AuditLog {
     migration_capacity: Option<Arc<dyn AuditCapacityProvider>>,
     /// Original KV handle so cutover can freshly reopen the destination.
     destination_kv: Option<Arc<dyn KvStore>>,
+    /// Operator retention controls: required anchoring and the archiver.
+    retention: retention_guard::RetentionControls,
 }
 impl AuditLog {
     /// Open a legacy native audit source for migration only.
@@ -172,6 +182,7 @@ impl AuditLog {
             append_coordinator: Arc::new(Mutex::new(())),
             migration_capacity: None,
             destination_kv: None,
+            retention: retention_guard::RetentionControls::default(),
         })
     }
 
@@ -219,6 +230,7 @@ impl AuditLog {
             append_coordinator: Arc::new(Mutex::new(())),
             migration_capacity,
             destination_kv: Some(destination_kv),
+            retention: retention_guard::RetentionControls::default(),
         })
     }
 
@@ -240,6 +252,7 @@ impl AuditLog {
             append_coordinator: Arc::new(Mutex::new(())),
             migration_capacity: None,
             destination_kv: None,
+            retention: retention_guard::RetentionControls::default(),
         }
     }
 
@@ -264,6 +277,7 @@ impl AuditLog {
             append_coordinator: Arc::new(Mutex::new(())),
             migration_capacity: None,
             destination_kv: None,
+            retention: retention_guard::RetentionControls::default(),
         }
     }
 
@@ -467,6 +481,7 @@ impl AuditLog {
             cap_bytes: metadata.cap_bytes,
             degraded: metadata.degraded,
             last_error: metadata.last_error,
+            retention_hold: metadata.retention_hold,
         })
     }
 
@@ -624,14 +639,7 @@ impl AuditLog {
                 Ok(results) => results,
                 Err(AuditError::RetentionCapReached) => {
                     *head = None;
-                    if self
-                        .prune_oldest(AuditRetentionPolicy {
-                            retain_entries: DEFAULT_AUTO_RETENTION_ENTRIES,
-                            retain_bytes: None,
-                        })
-                        .await?
-                        .is_some()
-                    {
+                    if self.relieve_retention_cap().await? {
                         continue;
                     }
                     return Err(AuditError::StorageError(

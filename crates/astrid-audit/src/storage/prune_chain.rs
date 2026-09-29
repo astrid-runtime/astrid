@@ -110,6 +110,8 @@ impl KvAuditStorage {
 
         self.validate_receipt_generation(plan_key, &receipt).await?;
         let details = ReceiptDetails::parse(&receipt)?;
+        self.check_plan_against_watermark(session_id, principal, details.omitted_count)
+            .await?;
         let segment_key = self
             .find_pruned_segment(session_id, principal, &details)
             .await?;

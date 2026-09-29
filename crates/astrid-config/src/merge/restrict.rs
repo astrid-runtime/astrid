@@ -100,6 +100,16 @@ pub fn enforce_restrictions(
         "security.capsule_local_egress",
     );
 
+    // audit.retention: operator-only. A project layer must not turn off
+    // anchor-before-prune or redirect where pruned audit history is written.
+    block_workspace_override(
+        merged,
+        baseline,
+        workspace_layer,
+        &["audit", "retention"],
+        "audit.retention",
+    );
+
     // http: operator-only host HTTP ceilings (timeouts, redirect/stream caps,
     // buffered-body limit). These are widening controls — a workspace/project
     // layer raising any of them would let untrusted project config relax the

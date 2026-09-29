@@ -394,6 +394,12 @@ status = "mapped"
 mode = "read"
 principal = "admin"
 
+[commands."audit anchor-status"]
+scenario = "audit_operator_controls"
+status = "mapped"
+mode = "read"
+principal = "admin"
+
 [commands."budget show"]
 scenario = "budget_core_transitional"
 status = "waived"

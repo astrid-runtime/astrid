@@ -82,6 +82,8 @@ pub const fn topic_suffix(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::AuditHealth => "audit.health",
         AdminRequestKind::AuditHeads => "audit.heads",
         AdminRequestKind::AuditExport(_) => "audit.export",
+        AdminRequestKind::AuditAnchorMark(_) => "audit.anchor_mark",
+        AdminRequestKind::AuditAnchorStatus => "audit.anchor_status",
         AdminRequestKind::StorageMountIssue { .. } => "storage.mount.issue",
         AdminRequestKind::StorageMountStatus { .. } => "storage.mount.status",
         AdminRequestKind::StorageMountSync { .. } => "storage.mount.sync",

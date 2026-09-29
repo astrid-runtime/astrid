@@ -38,6 +38,10 @@ pub struct AuditExportRequest {
     /// Maximum entries in the page. The kernel applies a default and a cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// Also return the chain's prune receipts from this generation on, in
+    /// [`AuditExportPage::prune_receipts`]. Omit for none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipts_from: Option<u64>,
 }
 
 /// Runtime-key-signed snapshot of every audit chain head.
@@ -210,6 +214,30 @@ pub struct AuditExportPage {
     pub prune_receipt_hash_hex: Option<String>,
     /// Hex of the bytes the prune receipt signature covers.
     pub prune_receipt_signing_data_hex: Option<String>,
+    /// With `receipts_from`: the chain's prune receipts from that generation
+    /// on, oldest first, a bounded number per page. Each links to the one
+    /// before by `prior_receipt_hash`; generations pruned before the runtime
+    /// kept every receipt are missing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prune_receipts: Vec<AuditExportReceipt>,
+    /// The `receipts_from` that continues the receipt list, when this page
+    /// holds the most receipts a page may.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_receipts_from: Option<u64>,
+}
+
+/// One signed prune receipt in [`AuditExportPage::prune_receipts`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditExportReceipt {
+    /// Receipt generation; 0 for the chain's first prune.
+    pub generation: u64,
+    /// The receipt as stored.
+    pub receipt: serde_json::Value,
+    /// Hex BLAKE3 of the stored receipt bytes: the next generation's
+    /// `prior_receipt_hash`.
+    pub receipt_hash_hex: String,
+    /// Hex of the bytes the receipt signature covers.
+    pub signing_data_hex: String,
 }
 
 /// One raw signed audit entry in an [`AuditExportPage`].
@@ -334,6 +362,7 @@ mod tests {
             from: 0,
             cursor: Some("3:cursor".to_owned()),
             limit: Some(10),
+            receipts_from: None,
         });
         let value = serde_json::to_value(AdminKernelRequest::from(export)).unwrap();
         assert_eq!(value["method"], "AuditExport");
@@ -350,5 +379,6 @@ mod tests {
         };
         assert_eq!(request.from, 0);
         assert!(request.principal.is_none() && request.cursor.is_none());
+        assert!(request.receipts_from.is_none());
     }
 }

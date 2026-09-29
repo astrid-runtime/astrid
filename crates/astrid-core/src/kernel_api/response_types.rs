@@ -129,6 +129,10 @@ pub enum AdminResponseBody {
     AuditHeads(Box<super::AuditHeadsSnapshot>),
     /// One page of a chain's raw signed audit entries.
     AuditExport(Box<super::AuditExportPage>),
+    /// Per-chain outcomes of `AuditAnchorMark`.
+    AuditAnchorMarked(Box<super::AuditAnchorMarkResult>),
+    /// Every chain's anchored watermark and the retention state.
+    AuditAnchorStatus(Box<super::AuditAnchorStatusReport>),
     /// Response for [`AdminRequestKind::StorageMountIssue`].
     StorageMountLease(Box<StorageMountLeaseV1>),
     /// The request failed.
@@ -158,6 +162,10 @@ pub struct AuditStats {
     /// Most recent retention/accounting error, when degraded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Set while the cap is exceeded because every prunable segment holds
+    /// history that is not anchored; says why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_hold: Option<String>,
 }
 
 /// Signed archive receipt summary returned after an audit prune operation.
