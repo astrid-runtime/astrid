@@ -3,14 +3,16 @@
 
 use std::sync::Arc;
 
+use astrid_audit::entry_v2::signing_input;
 use astrid_audit::{
-    AuditAction, AuditOutcome, AuditPruneReceipt, AuditRetentionPolicy, AuthorizationProof,
+    AuditAction, AuditEntry, AuditEntryFormat, AuditOutcome, AuditPruneReceipt,
+    AuditRetentionPolicy, AuthorizationProof, EntryV2Config, KeyRole,
 };
 use astrid_core::SessionId;
 use astrid_core::dirs::AstridHome;
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::PrincipalProfile;
-use astrid_crypto::{ContentHash, PublicKey, Signature};
+use astrid_crypto::{ContentHash, KeyPair, PublicKey, Signature};
 use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use astrid_events::kernel_api::{
     AUDIT_HEADS_DOMAIN_V1, AdminKernelRequest, AdminRequestKind, AdminResponseBody,
@@ -298,6 +300,70 @@ async fn export_pages_resume_and_entries_chain_and_verify() {
         entries.last().unwrap().content_hash_hex
     );
     assert!(tail.complete);
+}
+
+/// Under audit format v2 the exported content hash is the v2 entry hash, the
+/// value chain links and chain heads use, across the switch from v1.
+#[tokio::test(flavor = "multi_thread")]
+async fn export_reports_the_hash_that_links_a_chain_switched_to_v2() {
+    let (_dir, kernel) = fixture().await;
+    let session = kernel.session_id.clone();
+    append(&kernel, &session, Some("vera"), 2).await;
+    let audit_key = Arc::new(KeyPair::generate());
+    kernel
+        .audit_log
+        .enable_entry_v2(EntryV2Config {
+            audit_key: Arc::clone(&audit_key),
+            genesis_roles: vec![(KeyRole::AuditV1, Arc::clone(&kernel.runtime_key))],
+            principals: None,
+        })
+        .await
+        .expect("enable audit format v2");
+    append(&kernel, &session, Some("vera"), 3).await;
+
+    let page = export_page(&kernel, request(&session, "vera")).await;
+    assert!(page.complete);
+    assert_eq!(page.entries.len(), 5);
+    for (index, exported) in page.entries.iter().enumerate() {
+        let stored: AuditEntry = serde_json::from_value(exported.entry.clone()).unwrap();
+        assert_eq!(exported.content_hash_hex, stored.content_hash().to_hex());
+        let signing_data = hex::decode(&exported.signing_data_hex).unwrap();
+        assert!(verify_ed25519(
+            &exported.public_key_hex,
+            &exported.signature_hex,
+            &signing_data
+        ));
+        if index < 2 {
+            assert_eq!(stored.format(), AuditEntryFormat::V1);
+            assert_entry_verifies(exported);
+        } else {
+            assert_eq!(stored.format(), AuditEntryFormat::V2);
+            assert_eq!(
+                exported.public_key_hex,
+                audit_key.export_public_key().to_hex()
+            );
+            assert_eq!(
+                signing_data,
+                signing_input(stored.content_hash().as_bytes())
+            );
+            assert_ne!(
+                exported.content_hash_hex,
+                ContentHash::hash(&signing_data).to_hex()
+            );
+        }
+    }
+    for pair in page.entries.windows(2) {
+        assert_eq!(pair[1].previous_hash_hex, pair[0].content_hash_hex);
+    }
+    let head = &page.entries.last().unwrap().content_hash_hex;
+    assert_eq!(&page.chain_head_hash_hex, head);
+    let snapshot = heads(&kernel).await;
+    let vera = snapshot
+        .chains
+        .iter()
+        .find(|chain| chain.principal == Some(pid("vera")))
+        .unwrap();
+    assert_eq!(&vera.head_hash_hex, head);
 }
 
 #[tokio::test(flavor = "multi_thread")]

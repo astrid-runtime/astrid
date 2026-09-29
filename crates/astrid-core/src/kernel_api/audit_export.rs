@@ -77,13 +77,14 @@ pub struct AuditHeadsChain {
     /// [`AUDIT_OMITTED_TOTAL_UNKNOWN`]. A known total never decreases, so
     /// `omitted_total + count` counts every entry the chain has held.
     pub omitted_total: u64,
-    /// Hex BLAKE3 content hash of the head entry (what the next entry's
-    /// `previous_hash` links to), or 64 zeros for an empty chain.
+    /// Hex content hash of the head entry (what the next entry's
+    /// `previous_hash` links to), or 64 zeros for an empty chain. See
+    /// [`AuditExportEntry::content_hash_hex`] for how it is computed.
     pub head_hash_hex: String,
     /// Head entry id, if the chain has entries.
     pub head_id: Option<String>,
-    /// Stored RFC 3339 timestamp of the head entry. Entry signatures cover
-    /// whole seconds only.
+    /// Stored RFC 3339 timestamp of the head entry. A format-v1 entry
+    /// signature covers whole seconds only.
     pub last_timestamp: Option<String>,
     /// Latest prune receipt summary, if the chain was ever pruned. Not part
     /// of the signed bytes.
@@ -247,18 +248,23 @@ pub struct AuditExportEntry {
     pub index: u64,
     /// Entry id (UUID).
     pub id: String,
-    /// Stored RFC 3339 timestamp. The signature covers whole seconds only.
+    /// Stored RFC 3339 timestamp. A format-v1 signature covers whole
+    /// seconds only.
     pub timestamp: String,
     /// Hex hash of the previous entry; zeros for the genesis entry.
     pub previous_hash_hex: String,
-    /// Hex `BLAKE3(signing_data)`, the value the next entry's
-    /// `previous_hash` links to.
+    /// Hex content hash, the value the next entry's `previous_hash` links
+    /// to: `BLAKE3(signing_data)` for a format-v1 entry, and for a format-v2
+    /// entry (one whose stored form has a `v2` field) the SHA-256 entry hash
+    /// of its canonical body.
     pub content_hash_hex: String,
     /// Hex Ed25519 signature over `signing_data`.
     pub signature_hex: String,
     /// Hex Ed25519 public key embedded in the entry.
     pub public_key_hex: String,
-    /// Hex of the exact bytes that are signed and hashed.
+    /// Hex of the exact bytes the signature covers. For a format-v1 entry
+    /// these are also the bytes hashed into `content_hash_hex`; for a
+    /// format-v2 entry they are the signature wrapper of that hash.
     pub signing_data_hex: String,
     /// The entry as stored, including `previous_hash`, `runtime_key` and
     /// `signature`.
