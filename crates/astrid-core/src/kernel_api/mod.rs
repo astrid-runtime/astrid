@@ -9,6 +9,7 @@
 //! `wasm32-unknown-unknown` without dragging in the kernel).
 
 mod agent;
+mod audit_export;
 mod capsule_metadata;
 mod impls;
 mod install;
@@ -17,6 +18,10 @@ mod readiness;
 mod response_types;
 mod status;
 pub use agent::{AgentDeriveKernelRequest, AgentDeriveRequest};
+pub use audit_export::{
+    AUDIT_HEADS_DOMAIN_V1, AUDIT_OMITTED_TOTAL_UNKNOWN, AuditExportEntry, AuditExportPage,
+    AuditExportRequest, AuditHeadsChain, AuditHeadsPrune, AuditHeadsSnapshot,
+};
 pub use capsule_metadata::CapsuleEnvOptionsFromMetadata;
 pub use install::{
     CAPSULE_INSTALL_BATCH_PROTOCOL_V1, CapsuleInstallAuthority, CapsuleInstallBatchContext,
@@ -946,6 +951,10 @@ pub enum AdminRequestKind {
     },
     /// Read bounded ingestion queue health for the system audit writer.
     AuditHealth,
+    /// Runtime-key-signed snapshot of every audit chain head. Read-only.
+    AuditHeads,
+    /// One page of a chain's raw signed audit entries. Read-only.
+    AuditExport(AuditExportRequest),
     /// Issue an authenticated native filesystem lease. The handler resolves
     /// the selected view to a typed store owner and starts a private callback
     /// endpoint; the provider never receives a general daemon session token.

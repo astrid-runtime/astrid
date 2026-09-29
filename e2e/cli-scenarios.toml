@@ -382,6 +382,18 @@ status = "mapped"
 mode = "mutating"
 principal = "admin"
 
+[commands."audit heads"]
+scenario = "audit_operator_controls"
+status = "mapped"
+mode = "read"
+principal = "admin"
+
+[commands."audit export"]
+scenario = "audit_operator_controls"
+status = "mapped"
+mode = "read"
+principal = "admin"
+
 [commands."budget show"]
 scenario = "budget_core_transitional"
 status = "waived"

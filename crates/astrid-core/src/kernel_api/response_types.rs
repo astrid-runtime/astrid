@@ -125,6 +125,10 @@ pub enum AdminResponseBody {
     AuditPruned(Box<AuditPruneResult>),
     /// Bounded audit ingestion queue health.
     AuditHealth(AuditHealth),
+    /// Signed snapshot of every audit chain head.
+    AuditHeads(Box<super::AuditHeadsSnapshot>),
+    /// One page of a chain's raw signed audit entries.
+    AuditExport(Box<super::AuditExportPage>),
     /// Response for [`AdminRequestKind::StorageMountIssue`].
     StorageMountLease(Box<StorageMountLeaseV1>),
     /// The request failed.

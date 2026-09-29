@@ -115,6 +115,8 @@ fn assert_success(res: &AdminResponseBody) {
         | AdminResponseBody::AuditStats(_)
         | AdminResponseBody::AuditPruned(_)
         | AdminResponseBody::AuditHealth(_)
+        | AdminResponseBody::AuditHeads(_)
+        | AdminResponseBody::AuditExport(_)
         | AdminResponseBody::DistroLock(_)
         | AdminResponseBody::PairDeviceRevoked { .. } => {},
         AdminResponseBody::Error(msg) => panic!("expected success, got Error: {msg}"),

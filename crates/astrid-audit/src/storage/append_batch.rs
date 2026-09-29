@@ -433,6 +433,8 @@ fn next_chain_metadata(
         } else {
             prior.seal_ordinal
         },
+        omitted_total: prior.omitted_total,
+        omitted_generation: prior.omitted_generation,
     }
 }
 
