@@ -153,7 +153,7 @@ pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
         valid_len: 0,
         durable_len: 0,
         last_commit_offset: 0,
-        last_commit_has_snapshot: false,
+        last_snapshot_end: 0,
         boundary_pending: false,
         footer_pending: true,
         flush_state: super::FlushState::Required,
@@ -200,7 +200,7 @@ pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
     let rebuilt_sequence = rebuilt.sequence;
     let rebuilt_len = rebuilt.valid_len;
     let rebuilt_commit_offset = rebuilt.last_commit_offset;
-    let rebuilt_has_snapshot = rebuilt.last_commit_has_snapshot;
+    let rebuilt_snapshot_end = rebuilt.last_snapshot_end;
     rebuilt.file.sync_all()?;
     drop(rebuilt);
 
@@ -230,7 +230,7 @@ pub(super) fn reclaim(volume: &HostedFileVolume) -> io::Result<()> {
     state.valid_len = rebuilt_len;
     state.durable_len = rebuilt_len;
     state.last_commit_offset = rebuilt_commit_offset;
-    state.last_commit_has_snapshot = rebuilt_has_snapshot;
+    state.last_snapshot_end = rebuilt_snapshot_end;
     state.boundary_pending = false;
     state.footer_pending = false;
     state.regions = rebuilt_regions;
