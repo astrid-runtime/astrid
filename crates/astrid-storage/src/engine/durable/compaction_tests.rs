@@ -535,6 +535,63 @@ fn placement_before_binds_the_physical_arena_after_staging() {
 }
 
 #[test]
+fn interrupted_representation_rebase_finishes_metadata_reclamation() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = super::tests::open(directory.path());
+    let specification = evidence(b"physical-format");
+    let (specification, _) = engine.persist_standalone_object(&specification).unwrap();
+    engine
+        .ensure_direct_representation_catalogue(specification, &[specification])
+        .unwrap();
+    let (_, mut current) = two_versions(&engine);
+    for value in 0_u64..32 {
+        let (_, update) = transaction("alice", Some(current), &value.to_le_bytes());
+        current = engine.commit(update).unwrap().root();
+    }
+    let metadata = directory
+        .path()
+        .join("representations/generations/0000000000000001/metadata.arena");
+    let before = std::fs::metadata(metadata).unwrap().len();
+    let policy = evidence(b"retain-current-roots");
+    let authorization = plan(&engine, retention(&engine, &policy, []), policy);
+    drop(engine);
+    let interrupted = open_with_fault(
+        directory.path(),
+        FaultPoint::AfterCompactionRepresentationRebase,
+    );
+    assert!(matches!(
+        interrupted.compact(&authorization),
+        Err(DurableError::FaultInjected(
+            FaultPoint::AfterCompactionRepresentationRebase
+        ))
+    ));
+    drop(interrupted);
+    let recovered = super::tests::open(directory.path());
+    assert_eq!(recovered.root(&"alice".to_owned()).unwrap(), Some(current));
+    assert_eq!(recovered.pending_compaction_evidence().unwrap().len(), 1);
+    let generations = directory.path().join("representations/generations");
+    let paths = std::fs::read_dir(generations)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(paths.len(), 1);
+    assert_ne!(
+        paths[0].file_name().unwrap(),
+        "0000000000000001",
+        "recovery retired compaction intent without checkpointing"
+    );
+    assert!(
+        std::fs::metadata(paths[0].join("metadata.arena"))
+            .unwrap()
+            .len()
+            < before / 2
+    );
+    assert!(!directory.path().join(COMPACTION_INTENT_FILE).exists());
+    let (_, update) = transaction("alice", Some(current), b"after-checkpoint-recovery");
+    recovered.commit(update).unwrap();
+}
+
+#[test]
 fn every_named_compaction_crash_boundary_recovers_a_complete_authority_pair() {
     let points = [
         FaultPoint::AfterCompactionFilesFlush,
@@ -545,6 +602,7 @@ fn every_named_compaction_crash_boundary_recovers_a_complete_authority_pair() {
         FaultPoint::AfterCompactionRootsBackup,
         FaultPoint::AfterCompactionRootsPromote,
         FaultPoint::AfterCompactionDirectoryFlush,
+        FaultPoint::AfterCompactionRepresentationRebase,
         FaultPoint::AfterCompactionEvidenceReady,
         FaultPoint::BeforeCompactionIntentRemoval,
     ];
@@ -552,6 +610,12 @@ fn every_named_compaction_crash_boundary_recovers_a_complete_authority_pair() {
         let directory = tempfile::tempdir().unwrap();
         let engine = super::tests::open(directory.path());
         let (first, current) = two_versions(&engine);
+        let (specification, _) = engine
+            .persist_standalone_object(&evidence(b"physical-format"))
+            .unwrap();
+        engine
+            .ensure_direct_representation_catalogue(specification, &[specification])
+            .unwrap();
         let policy = evidence(b"retain-current-roots");
         let authorization = plan(&engine, retention(&engine, &policy, []), policy);
         drop(engine);

@@ -170,7 +170,10 @@ fn rebase_representation_authority<I: PersistentObjectIdentity>(
     let mut arena = open_rw_capability(store_root, Path::new(ARENA_FILE), false)?;
     let (index, _) = recover_arena(&mut arena, identity, limits, 0)?;
     representations.rebase_compacted_arena(&arena, &index, identity, limits)?;
-    Ok(())
+    // Recovery completes the same physical reclamation as the normal path
+    // before retiring the compaction intent. Repeated recovery is safe: the
+    // checkpoint preserves active authority and only removes older generations.
+    representations.checkpoint_native(store_root, limits)
 }
 
 fn validate_intent<I: PersistentObjectIdentity>(
