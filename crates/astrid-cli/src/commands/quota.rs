@@ -68,6 +68,9 @@ pub(crate) struct SetArgs {
     /// Maximum IPC throughput (e.g. `10MB/s`, `1MiB`).
     #[arg(long = "ipc-rate", value_name = "RATE")]
     pub ipc_rate: Option<String>,
+    /// Maximum CPU rate in wasmtime fuel units per second (e.g. `12G/s`).
+    #[arg(long = "cpu-rate", value_name = "RATE")]
+    pub cpu_rate: Option<String>,
     /// Maximum concurrent net/http streams (deferred — needs separate IPC).
     #[arg(long, value_name = "N", hide = true)]
     pub streams: Option<u32>,
@@ -274,12 +277,7 @@ async fn run_set(args: SetArgs) -> Result<ExitCode> {
         eprintln!("astrid: --streams quota needs a separate IPC topic that has not shipped.");
         return Ok(ExitCode::from(2));
     }
-    if args.memory.is_none()
-        && args.timeout.is_none()
-        && args.storage.is_none()
-        && args.processes.is_none()
-        && args.ipc_rate.is_none()
-    {
+    if !quota_set_flags_present(&args) {
         eprintln!("astrid: nothing to do (specify at least one quota flag)");
         return Ok(ExitCode::from(1));
     }
@@ -291,10 +289,32 @@ async fn run_set(args: SetArgs) -> Result<ExitCode> {
         })
         .await?;
     let body = into_result(body)?;
-    let mut quotas = match body {
+    let quotas = match body {
         AdminResponseBody::Quotas(q) => q,
         other => anyhow::bail!("unexpected response from kernel: {other:?}"),
     };
+    let quotas = apply_set_args(quotas, &args)?;
+    let body = client
+        .request(AdminRequestKind::QuotaSet {
+            principal: target.clone(),
+            quotas,
+        })
+        .await?;
+    let _ = into_result(body)?;
+    println!("Updated quotas for '{target}'.");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn quota_set_flags_present(args: &SetArgs) -> bool {
+    args.memory.is_some()
+        || args.timeout.is_some()
+        || args.storage.is_some()
+        || args.processes.is_some()
+        || args.ipc_rate.is_some()
+        || args.cpu_rate.is_some()
+}
+
+fn apply_set_args(mut quotas: Quotas, args: &SetArgs) -> Result<Quotas> {
     if let Some(s) = args.memory.as_deref() {
         quotas.max_memory_bytes = parse_bytes(s).context("invalid --memory")?;
     }
@@ -317,15 +337,110 @@ async fn run_set(args: SetArgs) -> Result<ExitCode> {
     if let Some(s) = args.ipc_rate.as_deref() {
         quotas.max_ipc_throughput_bytes = parse_bytes(s).context("invalid --ipc-rate")?;
     }
-    let body = client
-        .request(AdminRequestKind::QuotaSet {
-            principal: target.clone(),
-            quotas,
-        })
-        .await?;
-    let _ = into_result(body)?;
-    println!("Updated quotas for '{target}'.");
-    Ok(ExitCode::SUCCESS)
+    if let Some(s) = args.cpu_rate.as_deref() {
+        quotas.max_cpu_fuel_per_sec = parse_fuel_rate(s).context("invalid --cpu-rate")?;
+    }
+    Ok(quotas)
+}
+
+/// Parse a wasmtime-fuel rate. Accepts the decimal SI forms `quota show`
+/// prints (`12G/s`, `12.0G/s`, `500/s`) plus unsuffixed integers and
+/// suffix-without-`/s` spellings (`12G`, `12000000000`).
+///
+/// Unlike [`parse_bytes`], this is integer-exact: unknown suffixes, inexact
+/// fractions, zero, and overflow are errors. There is no `0` = unlimited
+/// sentinel — unbounded CPU is a capability.
+fn parse_fuel_rate(s: &str) -> Result<u64> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("empty fuel rate");
+    }
+    let body = strip_per_second_suffix(trimmed);
+    if body.bytes().any(|b| b.is_ascii_whitespace()) {
+        anyhow::bail!("fuel rate must not contain whitespace");
+    }
+    let split = body
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(body.len());
+    let (num_part, suffix) = body.split_at(split);
+    if num_part.is_empty() {
+        anyhow::bail!("missing fuel-rate number");
+    }
+    let multiplier = fuel_rate_multiplier(suffix)?;
+    let value = parse_exact_scaled_decimal(num_part, multiplier)?;
+    if value == 0 {
+        anyhow::bail!("cpu-rate must be greater than zero");
+    }
+    Ok(value)
+}
+
+fn strip_per_second_suffix(s: &str) -> &str {
+    s.strip_suffix("/s")
+        .or_else(|| s.strip_suffix("/S"))
+        .unwrap_or(s)
+}
+
+fn fuel_rate_multiplier(suffix: &str) -> Result<u64> {
+    match suffix.to_ascii_uppercase().as_str() {
+        "" => Ok(1),
+        "K" => Ok(1_000),
+        "M" => Ok(1_000_000),
+        "G" => Ok(1_000_000_000),
+        "T" => Ok(1_000_000_000_000),
+        other => anyhow::bail!("unknown fuel-rate suffix: {other}"),
+    }
+}
+
+fn parse_exact_scaled_decimal(num_part: &str, multiplier: u64) -> Result<u64> {
+    let (whole_str, frac_str) = match num_part.split_once('.') {
+        None => (num_part, None),
+        Some((whole, frac)) => {
+            if whole.is_empty() || frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+                anyhow::bail!("invalid fuel-rate number: {num_part}");
+            }
+            (whole, Some(frac))
+        },
+    };
+    if !whole_str.bytes().all(|b| b.is_ascii_digit()) {
+        anyhow::bail!("invalid fuel-rate number: {num_part}");
+    }
+    let whole: u64 = whole_str
+        .parse()
+        .with_context(|| format!("fuel-rate number out of range: {num_part}"))?;
+    let Some(frac) = frac_str else {
+        return whole
+            .checked_mul(multiplier)
+            .ok_or_else(|| anyhow::anyhow!("fuel-rate overflows u64"));
+    };
+    let frac_digits = u32::try_from(frac.len())
+        .map_err(|_| anyhow::anyhow!("fuel-rate has too many fractional digits"))?;
+    if frac_digits > 18 {
+        anyhow::bail!("fuel-rate has too many fractional digits");
+    }
+    let scale = 10u64
+        .checked_pow(frac_digits)
+        .ok_or_else(|| anyhow::anyhow!("fuel-rate fractional scale overflows"))?;
+    let frac_val: u64 = frac
+        .parse()
+        .with_context(|| format!("invalid fuel-rate fraction: {frac}"))?;
+    let whole_part = whole
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow::anyhow!("fuel-rate overflows u64"))?;
+    let frac_num = frac_val
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow::anyhow!("fuel-rate overflows u64"))?;
+    let remainder = frac_num
+        .checked_rem(scale)
+        .ok_or_else(|| anyhow::anyhow!("fuel-rate fractional scale is zero"))?;
+    if remainder != 0 {
+        anyhow::bail!("fuel-rate fraction does not map to a whole fuel count");
+    }
+    let frac_part = frac_num
+        .checked_div(scale)
+        .ok_or_else(|| anyhow::anyhow!("fuel-rate fractional scale is zero"))?;
+    whole_part
+        .checked_add(frac_part)
+        .ok_or_else(|| anyhow::anyhow!("fuel-rate overflows u64"))
 }
 
 // ── byte/duration parsers ──────────────────────────────────────────
@@ -654,5 +769,118 @@ mod tests {
             format_duration(Duration::from_secs(3 * 3600 + 5 * 60 + 7)),
             "3h05m07s"
         );
+    }
+
+    fn empty_set_args() -> SetArgs {
+        SetArgs {
+            agent: None,
+            group: None,
+            memory: None,
+            timeout: None,
+            storage: None,
+            processes: None,
+            ipc_rate: None,
+            streams: None,
+            cpu_rate: None,
+        }
+    }
+
+    fn distinct_quotas() -> Quotas {
+        Quotas {
+            max_memory_bytes: 11,
+            max_timeout_secs: 22,
+            max_ipc_throughput_bytes: 33,
+            max_background_processes: 3,
+            max_storage_bytes: 44,
+            max_cpu_fuel_per_sec: 55,
+            max_in_flight_calls: 2,
+        }
+    }
+
+    #[test]
+    fn parses_fuel_rate_show_forms_and_aliases() {
+        assert_eq!(parse_fuel_rate("12G/s").unwrap(), 12_000_000_000);
+        assert_eq!(parse_fuel_rate("12.0G/s").unwrap(), 12_000_000_000);
+        assert_eq!(parse_fuel_rate("12G").unwrap(), 12_000_000_000);
+        assert_eq!(parse_fuel_rate("12000000000").unwrap(), 12_000_000_000);
+        assert_eq!(parse_fuel_rate("1.5G").unwrap(), 1_500_000_000);
+        assert_eq!(parse_fuel_rate("1.25k").unwrap(), 1_250);
+        assert_eq!(parse_fuel_rate("500/s").unwrap(), 500);
+        assert_eq!(parse_fuel_rate(" 12G/S ").unwrap(), 12_000_000_000);
+    }
+
+    #[test]
+    fn rejects_invalid_and_overflowing_fuel_rates() {
+        for bad in [
+            "",
+            "   ",
+            "0",
+            "0G/s",
+            "32XYZ",
+            "12GB/s",
+            "12GiB",
+            "1e308",
+            "1E9",
+            "12B",
+            "-12G",
+            "+12G",
+            "12 G/s",
+            "1.1",
+            "18446744073709551616",
+            "18446745T",
+            ".",
+            "G",
+            "/s",
+        ] {
+            assert!(parse_fuel_rate(bad).is_err(), "expected error for {bad:?}");
+        }
+        assert_eq!(parse_fuel_rate("18446744073709551615").unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn cpu_rate_flag_is_required_to_leave_nothing_to_do() {
+        assert!(!quota_set_flags_present(&empty_set_args()));
+        let mut only_cpu = empty_set_args();
+        only_cpu.cpu_rate = Some("12G/s".into());
+        assert!(quota_set_flags_present(&only_cpu));
+        let mut only_memory = empty_set_args();
+        only_memory.memory = Some("64MB".into());
+        assert!(quota_set_flags_present(&only_memory));
+    }
+
+    #[test]
+    fn cpu_rate_patches_only_fuel_and_round_trips_quota_set() {
+        let original = distinct_quotas();
+        let mut args = empty_set_args();
+        args.agent = Some("claude-code".into());
+        args.cpu_rate = Some("12G/s".into());
+        let quotas = apply_set_args(original.clone(), &args).unwrap();
+        assert_eq!(quotas.max_cpu_fuel_per_sec, 12_000_000_000);
+        assert_eq!(quotas.max_memory_bytes, original.max_memory_bytes);
+        assert_eq!(quotas.max_timeout_secs, original.max_timeout_secs);
+        assert_eq!(
+            quotas.max_ipc_throughput_bytes,
+            original.max_ipc_throughput_bytes
+        );
+        assert_eq!(
+            quotas.max_background_processes,
+            original.max_background_processes
+        );
+        assert_eq!(quotas.max_storage_bytes, original.max_storage_bytes);
+        assert_eq!(quotas.max_in_flight_calls, original.max_in_flight_calls);
+
+        let request = AdminRequestKind::QuotaSet {
+            principal: PrincipalId::new("claude-code").unwrap(),
+            quotas: quotas.clone(),
+        };
+        match request {
+            AdminRequestKind::QuotaSet { principal, quotas } => {
+                assert_eq!(principal.as_str(), "claude-code");
+                assert_eq!(quotas.max_cpu_fuel_per_sec, 12_000_000_000);
+                assert_eq!(quotas.max_memory_bytes, 11);
+                assert_eq!(quotas.max_in_flight_calls, 2);
+            },
+            other => panic!("expected QuotaSet, got {other:?}"),
+        }
     }
 }
