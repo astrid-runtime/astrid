@@ -18,7 +18,6 @@ use astrid_core::kernel_api::{
     AuditHeadsSnapshot, AuditHealth, AuditPruneResult, AuditStats,
 };
 use astrid_core::{PrincipalId, SessionId, Timestamp};
-use astrid_crypto::ContentHash;
 
 use crate::Kernel;
 
@@ -467,7 +466,7 @@ fn export_entry(index: u64, entry: &AuditEntry) -> Result<AuditExportEntry, Stri
         id: entry.id.0.to_string(),
         timestamp: rfc3339(entry.timestamp),
         previous_hash_hex: entry.previous_hash.to_hex(),
-        content_hash_hex: ContentHash::hash(&signing_data).to_hex(),
+        content_hash_hex: entry.content_hash().to_hex(),
         signature_hex: entry.signature.to_hex(),
         public_key_hex: entry.runtime_key.to_hex(),
         signing_data_hex: hex::encode(&signing_data),
