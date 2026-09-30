@@ -150,6 +150,7 @@ where
                 &self.identity,
                 self.limits,
             )?;
+            representations.checkpoint_volume(volume, self.limits)?;
         }
         volume
             .sync()

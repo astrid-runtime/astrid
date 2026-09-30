@@ -115,28 +115,14 @@ pub(super) fn recover_journal<F: DurableIo>(
     let first = entries.first().map(|(_, entry)| *entry).ok_or(
         DurableError::InvalidRepresentationState("representation journal is empty"),
     )?;
-    let (mut active, mut generation) = match first {
-        JournalEntry::Checkpoint {
-            journal_generation,
-            active,
-            state_generation,
-            prior_journal_digest,
-        } if journal_generation == current.journal_generation
-            && journal_generation == FIRST_JOURNAL_GENERATION
-            && active.is_none()
-            && state_generation == 0
-            && prior_journal_digest.is_none() =>
-        {
-            (active, state_generation)
-        },
-        _ => {
-            return Err(DurableError::InvalidRepresentationState(
-                "representation journal begins with an invalid checkpoint",
-            ));
-        },
-    };
+    let (mut active, mut generation) = recover_checkpoint(first, current, metadata)?;
     validate_tail_budget(entries.len(), bytes.len(), checkpoint_end, current)?;
-    let mut previous_state = None;
+    let mut previous_state = active
+        .map(|id| {
+            RepresentationState::decode(metadata.value(MetadataKind::State, id.as_bytes())?)
+                .map_err(DurableError::from)
+        })
+        .transpose()?;
     // Metadata is immutable for this replay. Only successfully checked closures
     // may be reused across historical states; CAS and generation checks still run.
     let mut complete_maps = BTreeSet::new();
@@ -188,6 +174,54 @@ pub(super) fn recover_journal<F: DurableIo>(
     let state =
         RepresentationState::decode(metadata.value(MetadataKind::State, active.as_bytes())?)?;
     Ok((active, state))
+}
+
+fn recover_checkpoint(
+    first: JournalEntry,
+    current: CurrentPointer,
+    metadata: &MetadataIndex,
+) -> Result<(Option<RepresentationStateId>, u64), DurableError> {
+    match first {
+        JournalEntry::Checkpoint {
+            journal_generation,
+            active,
+            state_generation,
+            prior_journal_digest,
+        } if journal_generation == current.journal_generation
+            && journal_generation == FIRST_JOURNAL_GENERATION
+            && active.is_none()
+            && state_generation == 0
+            && prior_journal_digest.is_none() =>
+        {
+            Ok((active, state_generation))
+        },
+        JournalEntry::Checkpoint {
+            journal_generation,
+            active: Some(active),
+            state_generation,
+            prior_journal_digest: Some(_),
+        } if journal_generation == current.journal_generation
+            && journal_generation > FIRST_JOURNAL_GENERATION =>
+        {
+            if !state_metadata_closure_complete(active, metadata, &mut BTreeSet::new())? {
+                return Err(DurableError::InvalidRepresentationState(
+                    "representation checkpoint has an incomplete metadata closure",
+                ));
+            }
+            let state = RepresentationState::decode(
+                metadata.value(MetadataKind::State, active.as_bytes())?,
+            )?;
+            if state.generation() != state_generation {
+                return Err(DurableError::InvalidRepresentationState(
+                    "representation checkpoint state generation mismatch",
+                ));
+            }
+            Ok((Some(active), state_generation))
+        },
+        _ => Err(DurableError::InvalidRepresentationState(
+            "representation journal begins with an invalid checkpoint",
+        )),
+    }
 }
 
 fn state_metadata_closure_complete(

@@ -1,6 +1,196 @@
 use super::runtime_tests::*;
 use super::*;
 
+#[tokio::test]
+async fn compaction_reclaims_obsolete_representation_metadata_and_preserves_kv() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let mut store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    create_test_principal(&store, "alice").await;
+    for cycle in 0_u64..3 {
+        for value in 0_u64..128 {
+            store
+                .kv()
+                .set(
+                    "alice:capsule:shell",
+                    "heartbeat",
+                    (cycle * 128 + value).to_le_bytes().to_vec(),
+                )
+                .await
+                .unwrap();
+        }
+        let before = std::fs::metadata(home.storage_volume_path()).unwrap().len();
+        let policy = ObjectRecord::new(
+            ObjectKind::Evidence,
+            ObjectFormatVersion::V1,
+            b"metadata-compaction-regression".to_vec(),
+            Vec::new(),
+            0,
+            crate::storage_model::ObjectClass::Metadata,
+        )
+        .unwrap();
+        store
+            .compact_with_deterministic_proof(
+                crate::storage_model::ObjectId::new([0xD1; 32]),
+                policy,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let after = std::fs::metadata(home.storage_volume_path()).unwrap().len();
+        assert!(
+            after < before / 2,
+            "obsolete metadata retained: before={before}, after={after}"
+        );
+        store.engine.close().unwrap();
+        drop(store);
+        store = open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .kv()
+                .get("alice:capsule:shell", "heartbeat")
+                .await
+                .unwrap(),
+            Some((cycle * 128 + 127).to_le_bytes().to_vec())
+        );
+    }
+    store.engine.close().unwrap();
+}
+
+#[tokio::test]
+#[ignore = "sustained real principal KV diagnostic; run explicitly"]
+async fn repeated_principal_kv_writes_measure_volume_growth_and_recover() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let mut store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    create_test_principal(&store, "alice").await;
+    let path = home.storage_volume_path();
+    let baseline = std::fs::metadata(&path).unwrap().len();
+    let started = std::time::Instant::now();
+    for batch in 1_u64..=8 {
+        for index in 0_u64..250 {
+            let value = (batch * 250 + index).to_le_bytes().to_vec();
+            store
+                .kv()
+                .set("alice:capsule:shell", "heartbeat", value)
+                .await
+                .unwrap();
+        }
+        let expected = (batch * 250 + 249).to_le_bytes().to_vec();
+        store.engine.close().unwrap();
+        drop(store);
+        let metadata = std::fs::metadata(&path).unwrap();
+        // Fixture safety ceiling, not a claim about acceptable amplification.
+        assert!(metadata.len() < 256 * 1024 * 1024, "probe exceeded 256 MiB");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            eprintln!(
+                "principal_kv_writes={} elapsed_ms={} file_bytes={} allocated_bytes={} growth={}",
+                batch * 250,
+                started.elapsed().as_millis(),
+                metadata.len(),
+                metadata.blocks() * 512,
+                metadata.len() - baseline
+            );
+        }
+        store = open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .kv()
+                .get("alice:capsule:shell", "heartbeat")
+                .await
+                .unwrap(),
+            Some(expected)
+        );
+    }
+    let before_noop = std::fs::metadata(&path).unwrap().len();
+    repeat_unchanged_heartbeat(&store).await;
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        before_noop,
+        "unchanged KV writes grew volume"
+    );
+    let policy = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"growth-probe-retention".to_vec(),
+        Vec::new(),
+        0,
+        crate::storage_model::ObjectClass::Metadata,
+    )
+    .unwrap();
+    let report = store
+        .compact_with_deterministic_proof(
+            crate::storage_model::ObjectId::new([0xD0; 32]),
+            policy,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let after_compaction = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        after_compaction < before_noop / 2,
+        "obsolete representation history survived compaction"
+    );
+    eprintln!(
+        "principal_kv_compaction before={before_noop} after={after_compaction} objects_reclaimed={} arena_before={} arena_after={}",
+        report.objects_reclaimed(),
+        report.arena_bytes_before(),
+        report.arena_bytes_after()
+    );
+    store.engine.close().unwrap();
+    drop(store);
+    let reopened = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .kv()
+            .get("alice:capsule:shell", "heartbeat")
+            .await
+            .unwrap(),
+        Some(2249_u64.to_le_bytes().to_vec())
+    );
+    reopened.engine.close().unwrap();
+    drop(reopened);
+    report_retained_regions(&path);
+}
+
+async fn repeat_unchanged_heartbeat(store: &RuntimePrincipalStore) {
+    for _ in 0..1000 {
+        store
+            .kv()
+            .set(
+                "alice:capsule:shell",
+                "heartbeat",
+                2249_u64.to_le_bytes().to_vec(),
+            )
+            .await
+            .unwrap();
+    }
+}
+
+fn report_retained_regions(path: &std::path::Path) {
+    use crate::volume::{AstridVolume, HostedFileVolume};
+    let volume = HostedFileVolume::open(path).unwrap();
+    for region in volume.list_regions("").unwrap() {
+        eprintln!(
+            "retained_region={} logical_bytes={}",
+            region.as_str(),
+            volume.region_len(&region).unwrap()
+        );
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 #[tokio::test]
 async fn hosted_volume_retires_a_torn_tail_and_reopens_committed_roots() {
