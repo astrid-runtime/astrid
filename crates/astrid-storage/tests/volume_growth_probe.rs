@@ -1,52 +1,74 @@
-//! Bounded diagnostic: commit amplification, not a throughput benchmark.
+//! Public-API regression: a dirty overwrite+sync must not rewrite the extent map.
+//!
+//! This is not a throughput benchmark. It only falsifies checkpoint
+//! amplification on tiny overwrites.
 
 use astrid_storage::volume::{AstridVolume, HostedFileVolume, VolumeRegion};
 
 #[test]
-#[ignore = "bounded diagnostic; run explicitly with --ignored --nocapture"]
-fn measure_tiny_overwrite_commit_amplification() {
+fn tiny_overwrite_commits_do_not_rewrite_the_extent_map() {
     for extent_count in [128_u64, 4096] {
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join("astrid.volume");
         let region = VolumeRegion::new("objects").unwrap();
-        let volume = HostedFileVolume::open(&path).unwrap();
-        volume.create_region(&region, true).unwrap();
+        let writer = HostedFileVolume::open(&path).unwrap();
+        writer.create_region(&region, true).unwrap();
         for offset in 0..extent_count {
-            volume.write_region_at(&region, offset, &[42]).unwrap();
+            writer.write_region_at(&region, offset, &[42]).unwrap();
         }
-        volume.sync().unwrap();
+        writer.sync().unwrap();
         let baseline = std::fs::metadata(&path).unwrap().len();
+
         for _ in 0..32 {
-            volume.sync().unwrap();
+            writer.sync().unwrap();
         }
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), baseline);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            baseline,
+            "clean sync grew the container"
+        );
+
         for value in 0_u8..32 {
-            volume.write_region_at(&region, 0, &[value]).unwrap();
-            volume.sync().unwrap();
-            assert!(std::fs::metadata(&path).unwrap().len() < 16 * 1024 * 1024);
+            writer.write_region_at(&region, 0, &[value]).unwrap();
+            writer.sync().unwrap();
         }
         let after = std::fs::metadata(&path).unwrap().len();
-        assert_eq!(volume.region_len(&region).unwrap(), extent_count);
-        drop(volume);
-        let volume = HostedFileVolume::open(&path).unwrap();
-        let mut recovered = vec![0; usize::try_from(extent_count).unwrap()];
-        volume.read_region_at(&region, 0, &mut recovered).unwrap();
-        assert_eq!(recovered[0], 31);
-        assert!(recovered[1..].iter().all(|byte| *byte == 42));
-        volume.reclaim().unwrap();
-        let reclaimed = std::fs::metadata(&path).unwrap().len();
-        drop(volume);
-        let volume = HostedFileVolume::open(&path).unwrap();
-        let mut after_reclaim = vec![0; recovered.len()];
-        volume
-            .read_region_at(&region, 0, &mut after_reclaim)
-            .unwrap();
-        assert_eq!(after_reclaim, recovered);
+        let growth = after.checked_sub(baseline).unwrap();
+        let bytes_per_commit = growth / 32;
         eprintln!(
             "extents={extent_count} logical_bytes={extent_count} baseline={baseline} \
-             tiny_writes=32 growth={} bytes_per_commit={} reclaimed={reclaimed}",
-            after - baseline,
-            (after - baseline) / 32,
+             tiny_writes=32 growth={growth} bytes_per_commit={bytes_per_commit}"
         );
+        assert!(
+            bytes_per_commit < 512,
+            "extents={extent_count} bytes_per_commit={bytes_per_commit}: dirty commit rewrote the extent map"
+        );
+        assert_eq!(writer.region_len(&region).unwrap(), extent_count);
+
+        // Copy persisted bytes after the acknowledged dirty syncs, then recover
+        // that copy before Drop can flush the writer again.
+        let copy = temporary.path().join("after-dirty.volume");
+        std::fs::copy(&path, &copy).unwrap();
+        let recovered = HostedFileVolume::open(&copy).unwrap();
+        let mut recovered_bytes = vec![0; usize::try_from(extent_count).unwrap()];
+        recovered
+            .read_region_at(&region, 0, &mut recovered_bytes)
+            .unwrap();
+        assert_eq!(recovered_bytes[0], 31);
+        assert!(recovered_bytes[1..].iter().all(|byte| *byte == 42));
+        recovered.reclaim().unwrap();
+        let reclaimed = std::fs::metadata(&copy).unwrap().len();
+        let reclaimed_copy = temporary.path().join("after-reclaim.volume");
+        std::fs::copy(&copy, &reclaimed_copy).unwrap();
+        drop(recovered);
+        let after_reclaim = HostedFileVolume::open(&reclaimed_copy).unwrap();
+        let mut actual = vec![0; recovered_bytes.len()];
+        after_reclaim
+            .read_region_at(&region, 0, &mut actual)
+            .unwrap();
+        assert_eq!(actual, recovered_bytes);
+        eprintln!("extents={extent_count} reclaimed={reclaimed}");
+        drop(after_reclaim);
+        drop(writer);
     }
 }

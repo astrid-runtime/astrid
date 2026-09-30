@@ -15,13 +15,14 @@ use super::{
 
 const RECOVERY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_METADATA_PAYLOAD_BYTES: u64 = 2 * 1024 * 1024;
-// This is a format bound, not an operator knob: a commit must be bounded so
-// open can retain metadata while refusing unbounded allocations. 65k arena
-// extents are about 1.6 MiB before region names and framing.
-const MAX_COMMIT_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
+// This is a format bound, not an operator knob: a commit snapshot and the
+// unrecovered tail after that snapshot must be bounded so footer open can
+// refuse unbounded allocations and replay. 65k arena extents are about
+// 1.6 MiB before region names and framing.
+pub(super) const MAX_COMMIT_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
 const SNAPSHOT_MAGIC: [u8; 8] = *b"ASTMAP1\0";
 const FOOTER_MAGIC: [u8; 8] = *b"ASTFTR1\0";
-const FOOTER_BYTES: usize = FOOTER_MAGIC.len() + 8 + 8 + 8 + 32;
+pub(super) const FOOTER_BYTES: usize = FOOTER_MAGIC.len() + 8 + 8 + 8 + 32;
 
 #[cfg(test)]
 thread_local! {
@@ -45,7 +46,7 @@ pub(super) struct Recovery {
     pub(super) valid_len: u64,
     pub(super) durable_len: u64,
     pub(super) last_commit_offset: u64,
-    pub(super) last_commit_has_snapshot: bool,
+    pub(super) last_snapshot_end: u64,
     pub(super) footer_present: bool,
 }
 
@@ -155,19 +156,41 @@ fn recover_footer_at(
     {
         return Ok(None);
     }
-    let Some((header, payload)) = read_commit(file, last_commit_offset, durable_len, sequence)?
-    else {
+    let Some((header, payload)) = read_checkpoint(file, last_commit_offset, durable_len)? else {
         return Ok(None);
     };
-    let regions = decode_region_snapshot(&payload, last_commit_offset)?;
-    debug_assert_eq!(header.operation, Operation::Commit);
+    let mut regions = decode_region_snapshot(&payload, last_commit_offset)?;
+    let snapshot_end = last_commit_offset
+        .checked_add(header.total_len)
+        .ok_or_else(|| io::Error::other("volume checkpoint end overflow"))?;
+    if snapshot_end > durable_len {
+        return Err(invalid_transition(
+            "volume checkpoint extends past durable length",
+        ));
+    }
+    if snapshot_end == durable_len {
+        if header.sequence != sequence {
+            return Err(invalid_transition(
+                "volume footer sequence does not match checkpoint",
+            ));
+        }
+    } else {
+        replay_checkpoint_tail(
+            file,
+            &mut regions,
+            header.sequence,
+            snapshot_end,
+            durable_len,
+            sequence,
+        )?;
+    }
     Ok(Some(Recovery {
         regions,
         sequence,
         valid_len: durable_len,
         durable_len,
         last_commit_offset,
-        last_commit_has_snapshot: true,
+        last_snapshot_end: snapshot_end,
         footer_present,
     }))
 }
@@ -180,8 +203,8 @@ fn recover_from_headers(file: &File) -> io::Result<Recovery> {
     let mut committed_regions = BTreeMap::new();
     let mut committed_sequence = 0_u64;
     let mut committed_offset = offset;
-    let mut committed_has_snapshot = false;
     let mut last_commit_offset = 0_u64;
+    let mut last_snapshot_end = 0_u64;
     while offset < physical_len {
         if physical_len.saturating_sub(offset) >= FOOTER_MAGIC.len() as u64 {
             let mut marker = [0_u8; FOOTER_MAGIC.len()];
@@ -242,10 +265,12 @@ fn recover_from_headers(file: &File) -> io::Result<Recovery> {
             committed_regions = regions.clone();
             committed_sequence = sequence;
             committed_offset = offset;
-            committed_has_snapshot = payload.as_ref().is_some_and(|bytes| !bytes.is_empty());
-            last_commit_offset = offset
-                .checked_sub(header.total_len)
-                .ok_or_else(|| io::Error::other("volume commit offset underflow"))?;
+            if payload.as_ref().is_some_and(|bytes| !bytes.is_empty()) {
+                last_commit_offset = offset
+                    .checked_sub(header.total_len)
+                    .ok_or_else(|| io::Error::other("volume commit offset underflow"))?;
+                last_snapshot_end = offset;
+            }
         }
     }
     Ok(Recovery {
@@ -254,7 +279,7 @@ fn recover_from_headers(file: &File) -> io::Result<Recovery> {
         valid_len: committed_offset,
         durable_len: committed_offset,
         last_commit_offset,
-        last_commit_has_snapshot: committed_has_snapshot,
+        last_snapshot_end,
         footer_present: false,
     })
 }
@@ -469,11 +494,10 @@ fn verify_record_checksum(header: &RecordHeader, payload: &[u8]) -> io::Result<(
     Ok(())
 }
 
-fn read_commit(
+fn read_checkpoint(
     file: &File,
     offset: u64,
     durable_len: u64,
-    sequence: u64,
 ) -> io::Result<Option<(RecordHeader, Vec<u8>)>> {
     let Some(header) = read_header(file, offset, durable_len)? else {
         return Ok(None);
@@ -481,8 +505,6 @@ fn read_commit(
     if header.operation != Operation::Commit
         || header.name.as_str() != COMMIT_REGION
         || header.logical_offset != 0
-        || header.sequence != sequence
-        || header.total_len != durable_len.saturating_sub(offset)
     {
         return Ok(None);
     }
@@ -491,6 +513,92 @@ fn read_commit(
         return Ok(None);
     }
     Ok(Some((header, payload)))
+}
+
+fn replay_checkpoint_tail(
+    file: &File,
+    regions: &mut BTreeMap<VolumeRegion, RegionState>,
+    mut sequence: u64,
+    mut offset: u64,
+    durable_len: u64,
+    footer_sequence: u64,
+) -> io::Result<()> {
+    let tail = durable_len
+        .checked_sub(offset)
+        .ok_or_else(|| io::Error::other("volume checkpoint tail underflow"))?;
+    if tail > MAX_COMMIT_SNAPSHOT_BYTES {
+        return Err(invalid_transition(
+            "volume checkpoint tail exceeds format bound",
+        ));
+    }
+    let mut last_was_commit = false;
+    while offset < durable_len {
+        let remaining = durable_len.saturating_sub(offset);
+        if remaining < RECORD_FIXED_BYTES as u64 {
+            return Err(invalid_transition("truncated volume checkpoint tail"));
+        }
+        let Some(header) = read_header(file, offset, durable_len)? else {
+            return Err(invalid_transition("truncated volume checkpoint tail"));
+        };
+        if header.sequence != sequence.saturating_add(1) {
+            return Err(invalid_transition(
+                "Astrid volume record sequence is not contiguous",
+            ));
+        }
+        let record_end = offset
+            .checked_add(header.total_len)
+            .ok_or_else(|| io::Error::other("volume checkpoint tail overflow"))?;
+        if record_end > durable_len {
+            return Err(invalid_transition(
+                "volume checkpoint tail record overruns durable length",
+            ));
+        }
+        let payload = read_record_payload(file, &header)?;
+        if header.operation == Operation::Commit
+            && payload.as_ref().is_some_and(|bytes| !bytes.is_empty())
+        {
+            return Err(invalid_transition(
+                "volume checkpoint tail contains a later snapshot",
+            ));
+        }
+        apply_record(regions, &header, payload.as_deref())?;
+        sequence = header.sequence;
+        last_was_commit = header.operation == Operation::Commit;
+        offset = record_end;
+    }
+    if !last_was_commit {
+        return Err(invalid_transition(
+            "volume checkpoint tail does not end at a commit",
+        ));
+    }
+    if sequence != footer_sequence || offset != durable_len {
+        return Err(invalid_transition(
+            "volume footer sequence does not match recovered tail",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn legacy_reader_accepts_terminal_snapshot(
+    file: &File,
+    last_commit_offset: u64,
+    durable_len: u64,
+    sequence: u64,
+) -> io::Result<bool> {
+    let Some(header) = read_header(file, last_commit_offset, durable_len)? else {
+        return Ok(false);
+    };
+    if header.operation != Operation::Commit
+        || header.name.as_str() != COMMIT_REGION
+        || header.logical_offset != 0
+        || header.sequence != sequence
+        || header.total_len != durable_len.saturating_sub(last_commit_offset)
+    {
+        return Ok(false);
+    }
+    let payload = read_record_payload(file, &header)?.unwrap_or_default();
+    Ok(!payload.is_empty())
 }
 
 fn decode_region_snapshot(

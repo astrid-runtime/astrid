@@ -53,8 +53,11 @@ Operation codes are:
   6  replace an existing destination named by payload with an existing source
   7  commit a metadata transaction; region is exactly
       system/volume-metadata-transaction and logical_offset is zero
-   8  durable commit boundary; region is exactly system/volume-commit,
-      logical_offset is zero, and payload is empty
+   8  durable commit boundary; region is exactly system/volume-commit
+      and logical_offset is zero. Payload is empty, or an ASTMAP1
+      snapshot of the live extent map. Snapshot payload and the
+      unrecovered tail after the named snapshot are each at most 16 MiB.
+      That ceiling is a format bound, not an operator knob.
 
 A mutation record is recoverable data but is not a durability boundary by
 itself. Version one admits records only after the most recent operation-8
@@ -70,15 +73,26 @@ u16 source length and source bytes, then a u16 destination length and
 destination bytes. Count is 1 through 1024. All mutations validate and become
 visible as one record or none become visible.
 
-Recovery scans a contiguous sequence of records whose namespace transitions are
-valid, then exposes the state at the latest operation-8 boundary. A physically
-incomplete final record is truncated to that boundary. A damaged length cannot
-hide a later physically valid record; that is interior corruption and fails
-recovery. Write payload checksums are streamed with bounded memory. Non-write
+Recovery prefers a trailing ASTFTR1 footer when present. The footer names the
+most recent ASTMAP1 commit, the durable length, and the sequence of the last
+operation-8 record (empty or snapshot). Footer open reads that checkpoint, then
+replays a contiguous tail of at most 16 MiB that must end at a commit whose
+sequence matches the footer. A damaged footer falls back to a header scan. A
+corrupt or truncated record inside a claimed durable tail fails recovery.
+
+When no usable footer exists, recovery scans a contiguous sequence of records
+whose namespace transitions are valid, then exposes the state at the latest
+operation-8 boundary. A physically incomplete final record is truncated to that
+boundary. A damaged length cannot hide a later physically valid record; that is
+interior corruption and fails recovery. Write payload checksums are streamed
+with bounded memory. Commit snapshots are bounded to 16 MiB; other non-write
 payloads are bounded to 2 MiB before allocation.
 
 sync() appends operation 8 when mutations are pending and returns only after
-that boundary is durable. Graceful close performs the same boundary. A crash
-before the boundary can discard the uncommitted tail. HostedFileVolume holds an
-exclusive lock for the open lifetime. The engine close boundary releases that
-lock even when other references to the closed engine remain.
+that boundary is durable. A pending tail shorter than 16 MiB, including the
+empty commit record itself, uses an empty payload and leaves the named snapshot
+unchanged. A tail that would exceed 16 MiB writes a new ASTMAP1 snapshot.
+Graceful close performs the same boundary. A crash before the boundary can
+discard the uncommitted tail. HostedFileVolume holds an exclusive lock for the
+open lifetime. The engine close boundary releases that lock even when other
+references to the closed engine remain.

@@ -63,7 +63,8 @@ impl HostedFileVolume {
     /// Returns an error for a lock conflict, invalid header, interior corrupt
     /// framing, invalid region name, or host I/O failure. An incomplete final
     /// record is treated as an uncommitted tail and truncated. Once a footer
-    /// exists, recovery reads only the footer, one commit, and its snapshot.
+    /// exists, recovery reads the footer, the named snapshot commit, and a
+    /// bounded tail of later records ending at that footer sequence.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Arc<Self>> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -126,7 +127,7 @@ impl HostedFileVolume {
             valid_len: recovery.valid_len,
             durable_len: recovery.durable_len,
             last_commit_offset: recovery.last_commit_offset,
-            last_commit_has_snapshot: recovery.last_commit_has_snapshot,
+            last_snapshot_end: recovery.last_snapshot_end,
             boundary_pending: false,
             footer_pending,
             flush_state: super::FlushState::Required,

@@ -71,7 +71,7 @@ struct ContainerState {
     valid_len: u64,
     durable_len: u64,
     last_commit_offset: u64,
-    last_commit_has_snapshot: bool,
+    last_snapshot_end: u64,
     boundary_pending: bool,
     footer_pending: bool,
     // Process-local proof only: set after a successful full flush, cleared
@@ -178,17 +178,15 @@ impl HostedFileVolume {
             state.flush_state = FlushState::Confirmed;
             return Ok(());
         }
-        if (state.valid_len != state.durable_len
-            || state.last_commit_offset == 0
-            || !state.last_commit_has_snapshot)
-            && !state.boundary_pending
-        {
+        if Self::needs_commit(state) {
             let region = VolumeRegion::new(COMMIT_REGION)?;
-            let snapshot = recover::encode_region_snapshot(&state.regions)?;
-            let commit_offset = state.valid_len;
-            Self::append(state, Operation::Commit, &region, 0, &snapshot)?;
-            state.last_commit_offset = commit_offset;
-            state.last_commit_has_snapshot = true;
+            let payload = Self::commit_payload(state)?;
+            let commit_start = state.valid_len;
+            Self::append(state, Operation::Commit, &region, 0, &payload)?;
+            if !payload.is_empty() {
+                state.last_commit_offset = commit_start;
+                state.last_snapshot_end = state.valid_len;
+            }
             state.durable_len = state.valid_len;
             state.boundary_pending = true;
         }
@@ -205,6 +203,33 @@ impl HostedFileVolume {
         state.footer_pending = false;
         state.flush_state = FlushState::Confirmed;
         Ok(())
+    }
+
+    fn needs_commit(state: &ContainerState) -> bool {
+        !state.boundary_pending
+            && (state.valid_len != state.durable_len || state.last_snapshot_end == 0)
+    }
+
+    fn commit_payload(state: &ContainerState) -> io::Result<Vec<u8>> {
+        if state.last_snapshot_end != 0 {
+            let tail = state
+                .valid_len
+                .checked_sub(state.last_snapshot_end)
+                .ok_or_else(|| io::Error::other("volume snapshot tail underflow"))?;
+            let empty_commit = (RECORD_FIXED_BYTES as u64)
+                .checked_add(
+                    u64::try_from(COMMIT_REGION.len())
+                        .map_err(|_| io::Error::other("volume commit region length overflow"))?,
+                )
+                .ok_or_else(|| io::Error::other("volume empty commit length overflow"))?;
+            if tail
+                .checked_add(empty_commit)
+                .is_some_and(|end| end <= recover::MAX_COMMIT_SNAPSHOT_BYTES)
+            {
+                return Ok(Vec::new());
+            }
+        }
+        recover::encode_region_snapshot(&state.regions)
     }
 }
 impl Drop for HostedFileVolume {
@@ -702,6 +727,9 @@ mod tests;
 
 #[cfg(test)]
 mod sync_tests;
+
+#[cfg(test)]
+mod checkpoint_tests;
 
 #[cfg(test)]
 mod extent_mutation_tests;
