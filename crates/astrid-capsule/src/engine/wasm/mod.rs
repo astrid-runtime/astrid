@@ -53,6 +53,8 @@ mod content_source;
 pub mod host;
 pub mod host_state;
 #[cfg(test)]
+mod interruption_tests;
+#[cfg(test)]
 #[path = "lifecycle_audit_tests.rs"]
 mod lifecycle_audit_tests;
 pub mod limits;
@@ -3644,11 +3646,8 @@ impl ExecutionEngine for WasmEngine {
         // invocation on a *different* pooled Store can never observe this
         // invocation's `caller_context` between SET and CALL — the
         // cross-principal race that #813 collapsed the orchestration cliff
-        // onto. CLEAR (resetting every `invocation_*` field) and return-to-
-        // pool are handled by `PoolCheckout::drop` (see [`pool`]), which runs
-        // on every exit path — normal return, `?`, panic-unwind, and
-        // future-drop on caller cancellation — preserving the invariant that
-        // the next lease of this instance observes `caller_context = None`.
+        // onto. `PoolCheckout::drop` clears completed calls before reuse and
+        // discards interrupted guests, preserving host and guest isolation.
         //
         // SAFETY: each pooled Store is leased exclusively for the duration of
         // this call (the pool semaphore guarantees no two invocations share a
@@ -3660,28 +3659,29 @@ impl ExecutionEngine for WasmEngine {
         // — up to the pool size of invocations run concurrently on independent
         // Stores (issue #816). `instance` (a `Copy` handle) is taken before
         // borrowing the store mutably for the SET/CALL block; `PoolCheckout`
-        // clears the invocation state and returns the instance on drop.
+        // clears or discards the instance on drop.
         let checkout_start = std::time::Instant::now();
-        let mut checkout = pool.checkout().await.ok_or_else(|| {
-            // `checkout` returns `None` for any of: the capsule is unloading
-            // (semaphore closed), a lazy pool-grow instantiation failed, or a
-            // size-1 carve-out found no warm instance. The true cause is logged
-            // at the checkout site; keep the surfaced error generic rather than
-            // asserting "unloading", which misleads when the real cause was a
-            // transient grow failure on a fully-loaded capsule.
-            CapsuleError::NotSupported("no capsule instance available".into())
-        })?;
+        let Some(mut checkout) = pool.checkout().await else {
+            // A failed replacement must not skip the guard on the next request.
+            return Ok(crate::capsule::InterceptResult::Deny {
+                reason: "no capsule instance available".into(),
+            });
+        };
         // Time spent waiting for a free pooled instance — a rising
         // `pool_wait_ms` is the signal the pool is saturated (all instances
         // busy), distinct from a slow guest call.
         let pool_wait_ms = checkout_start.elapsed().as_millis() as u64;
         let typed_instance = checkout.instance();
+        let mut interruption_reason = None;
         // Armed below when this invocation is a tool call; records one
         // `ToolCall` audit entry when the invocation ends (or is cancelled).
         let tool_audit;
-        let result: CapsuleResult<HookTriggerResult> = {
+        {
             let s = checkout.store_mut();
             // ── Phase 1: SET ──────────────────────────────────────
+            //
+            // This phase is host-only. A cancellation here cannot poison the
+            // component instance, so the checkout remains reusable.
             let applied_profile: Arc<astrid_core::profile::PrincipalProfile> =
                 invocation_profile.clone().unwrap_or_else(|| {
                     Arc::new(astrid_core::profile::PrincipalProfile::default_ref().clone())
@@ -3759,40 +3759,54 @@ impl ExecutionEngine for WasmEngine {
                     &invoking_principal,
                 );
             }
+        }
 
-            // ── Phase 2: CALL ─────────────────────────────────────
-            //
-            // Cancellation safety: the `call_async` future below may be
-            // dropped by the dispatcher (e.g. tokio task abort). Dropping it
-            // drops `checkout`, whose `Drop` synchronously runs Phase 3 CLEAR
-            // *before* the wasm fiber is torn down and returns the instance to
-            // the pool, so the next lease observes `caller_context = None` and
-            // every `invocation_*` field cleared.
-            let typed_lookup = typed_instance
-                .get_typed_func::<(String, Vec<u8>), (HookTriggerResult,)>(
-                    &mut *s,
-                    "astrid-hook-trigger",
-                );
-            match typed_lookup {
-                Ok(func) => {
-                    let invocation_cancel = s.data().effective_cancel_token();
-                    tokio::select! {
-                        biased;
-                        () = invocation_cancel.cancelled() => Err(CapsuleError::WasmError(
+        // ── Phase 2: CALL ─────────────────────────────────────
+        //
+        // Typed-function lookup does not enter the guest. Keep the checkout
+        // reusable if the export is absent or this future is cancelled before
+        // the call begins.
+        let typed_lookup = {
+            let s = checkout.store_mut();
+            typed_instance.get_typed_func::<(String, Vec<u8>), (HookTriggerResult,)>(
+                &mut *s,
+                "astrid-hook-trigger",
+            )
+        };
+        let result: CapsuleResult<HookTriggerResult> = match typed_lookup {
+            Ok(func) => {
+                let invocation_cancel = checkout.store_mut().data().effective_cancel_token();
+                // From this point a trap, panic, or future-drop may leave
+                // Wasmtime's component-entry state non-reentrant. Drop must
+                // discard the Store unless the call returns successfully.
+                checkout.begin_call();
+                let s = checkout.store_mut();
+                tokio::select! {
+                    biased;
+                    () = invocation_cancel.cancelled() => {
+                        interruption_reason = Some("principal capsule view retired during invocation");
+                        Err(CapsuleError::WasmError(
                             "principal capsule view retired during invocation".to_string()
-                        )),
-                        called = func.call_async(
-                            &mut *s,
-                            (action.to_string(), payload.to_vec())
-                        ) => called.map(|(cr,)| cr).map_err(|e| {
-                            CapsuleError::WasmError(format!("astrid_hook_trigger failed: {e:?}"))
-                        }),
-                    }
-                },
-                Err(e) => Err(CapsuleError::UnsupportedEntryPoint(format!(
-                    "capsule does not export `astrid-hook-trigger`: {e}"
-                ))),
-            }
+                        ))
+                    },
+                    called = func.call_async(
+                        &mut *s,
+                        (action.to_string(), payload.to_vec())
+                    ) => called.map(|(cr,)| cr).map_err(|e| {
+                        interruption_reason = match e.downcast_ref::<wasmtime::Trap>() {
+                            Some(wasmtime::Trap::OutOfFuel) => Some("interceptor exhausted its fuel budget"),
+                            Some(wasmtime::Trap::Interrupt) => Some("interceptor exceeded its execution deadline"),
+                            // Panics and allocator failures can also trap:
+                            // no completed guest decision means no permission.
+                            _ => Some("interceptor execution failed"),
+                        };
+                        CapsuleError::WasmError(format!("astrid_hook_trigger failed: {e:?}"))
+                    }),
+                }
+            },
+            Err(e) => Err(CapsuleError::UnsupportedEntryPoint(format!(
+                "capsule does not export `astrid-hook-trigger`: {e}"
+            ))),
         };
         // Per-invocation CPU measurement: fuel counts DOWN from the seed, so
         // `seed - remaining` is the exact deterministic instruction count for
@@ -3814,8 +3828,9 @@ impl ExecutionEngine for WasmEngine {
             let error = result.as_ref().err().map(ToString::to_string);
             audit.finish(captured, error.as_deref());
         }
-        // Drop the lease: Phase 3 CLEAR runs and the instance returns to the
-        // pool, so a parallel invocation can lease it with clean state.
+        if result.is_ok() {
+            checkout.complete_call();
+        }
         drop(checkout);
 
         // ── Per-invocation diagnostic span (observability brick #1, #816) ──
@@ -3846,6 +3861,13 @@ impl ExecutionEngine for WasmEngine {
             "interceptor invocation"
         );
 
+        if let Some(reason) = interruption_reason {
+            // Like quota admission denial, interruption must halt an ordered
+            // chain; returning Err here would let the protected action proceed.
+            return Ok(crate::capsule::InterceptResult::Deny {
+                reason: reason.to_string(),
+            });
+        }
         result.map(|cr| {
             crate::capsule::InterceptResult::from_capsule_result(&cr.action, cr.data.as_deref())
         })
