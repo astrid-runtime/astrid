@@ -179,6 +179,9 @@ impl sys::Host for HostState {
         if cancelled {
             Err(ErrorCode::Cancelled)
         } else {
+            if duration_ns > 0 {
+                self.recv_yielded = true;
+            }
             Ok(())
         }
     }
@@ -404,6 +407,50 @@ mod retirement_secret_tests {
             sys::Host::get_config(&mut state, "API_KEY".to_string()),
             Err(ErrorCode::CapabilityDenied)
         ));
+    }
+}
+
+#[cfg(test)]
+mod sleep_watchdog_tests {
+    use super::*;
+    use crate::engine::wasm::test_fixtures::minimal_host_state;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_sleep_marks_progress() {
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        assert!(sys::Host::sleep_ns(&mut state, 1_000_000).is_ok());
+        assert!(state.recv_yielded);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zero_sleep_does_not_mark_or_erase_progress() {
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        assert!(sys::Host::sleep_ns(&mut state, 0).is_ok());
+        assert!(!state.recv_yielded);
+        state.recv_yielded = true;
+        assert!(sys::Host::sleep_ns(&mut state, 0).is_ok());
+        assert!(state.recv_yielded);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_sleep_does_not_mark_progress() {
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        assert!(matches!(
+            sys::Host::sleep_ns(&mut state, SLEEP_NS_CAP + 1),
+            Err(ErrorCode::TooLarge)
+        ));
+        assert!(!state.recv_yielded);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_sleep_does_not_mark_progress() {
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        state.cancel_token.cancel();
+        assert!(matches!(
+            sys::Host::sleep_ns(&mut state, SLEEP_NS_CAP),
+            Err(ErrorCode::Cancelled)
+        ));
+        assert!(!state.recv_yielded);
     }
 }
 

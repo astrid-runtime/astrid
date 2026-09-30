@@ -788,21 +788,21 @@ pub struct HostState {
     /// `bind_workers > 1` worker Stores. N=1 (and interceptor/lifecycle
     /// HostStates) keep the historical AddressInUse on a second bind.
     pub share_tcp_listeners: bool,
-    /// Bound run-loop CPU-bound signal: set `true` by the ipc `recv` host fn
-    /// each time the guest blocks on recv, read + cleared by the run-loop's
+    /// Bound run-loop CPU-bound signal: set by recv/accept or a completed
+    /// nonzero sleep, read + cleared by the run-loop's
     /// epoch-deadline callback once per window.
     ///
     /// This is the cooperative-yield signal that distinguishes a legitimate
-    /// recv/accept loop (sets it every iteration → never trapped) from a
+    /// recv/accept/sleep loop (sets it every iteration → never trapped) from a
     /// no-recv spinner (never sets it → interrupt-trapped after
     /// `MAX_NO_YIELD_WINDOWS`). Only the dedicated, mutex-guarded run-loop
     /// Store reads it; pooled/lifecycle Stores leave it inert. Single Store =
     /// single thread, so the callback and the host fn never race.
     pub recv_yielded: bool,
     /// Bound run-loop CPU-bound counter: consecutive epoch windows in which
-    /// the guest burned CPU without a single `recv` (`recv_yielded` stayed
+    /// the guest burned CPU without a cooperative wait (`recv_yielded` stayed
     /// false). The run-loop epoch callback increments it each no-recv window
-    /// and traps the guest once it reaches `MAX_NO_YIELD_WINDOWS`; a recv
+    /// and traps the guest once it reaches `MAX_NO_YIELD_WINDOWS`; a wait
     /// resets it to 0. Inert for pooled/lifecycle Stores.
     pub no_yield_windows: u32,
     /// Synchronous sink for sensitive per-action host calls (fs read/write/
