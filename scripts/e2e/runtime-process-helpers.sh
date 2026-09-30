@@ -64,6 +64,7 @@ start_daemon() {
 stop_daemon() {
   local pid=$DAEMON_PID
   [[ -n "$pid" ]] || return 0
+  local started=$SECONDS
 
   # This process was launched directly by the harness, so exercise its native
   # signal-to-finalization path and wait beyond the daemon's eight-second hard
@@ -75,15 +76,22 @@ stop_daemon() {
       local exit_status=0
       wait "$pid" 2>/dev/null || exit_status=$?
       DAEMON_PID=""
-      [[ "$exit_status" -eq 0 ]]
-      return
+      if [[ "$exit_status" -ne 0 ]]; then
+        printf 'daemon shutdown failed: pid=%s elapsed_seconds=%s exit_status=%s forced_kill=false\n' \
+          "$pid" "$((SECONDS - started))" "$exit_status" >&2
+        return 1
+      fi
+      return 0
     fi
     sleep 0.1
   done
 
   kill -KILL "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  local exit_status=0
+  wait "$pid" 2>/dev/null || exit_status=$?
   DAEMON_PID=""
+  printf 'daemon shutdown exceeded harness deadline: pid=%s elapsed_seconds=%s exit_status=%s forced_kill=true\n' \
+    "$pid" "$((SECONDS - started))" "$exit_status" >&2
   return 1
 }
 
