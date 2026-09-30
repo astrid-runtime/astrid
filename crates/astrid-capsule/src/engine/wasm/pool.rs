@@ -649,6 +649,43 @@ mod tests {
         assert!(!state.interceptor_active);
     }
 
+    /// Cancellation during host-only setup must return a healthy carve-out
+    /// Store without destroying resources that intentionally persist between
+    /// guest calls.
+    #[tokio::test]
+    async fn checkout_dropped_before_guest_entry_remains_reusable() {
+        let cancel = CancellationToken::new();
+        let mut pool = empty_pool(1, 1, &cancel).await;
+        pool.reset_resources_on_return = false;
+
+        let mut checkout = pool.checkout().await.expect("checkout");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let resource = checkout
+            .store_mut()
+            .data_mut()
+            .resource_table
+            .push(DropFlag(Arc::clone(&dropped)))
+            .expect("push test resource");
+        checkout.store_mut().data_mut().process_count_total = 1;
+
+        // Simulate cancellation before `begin_call`: no guest code ran.
+        drop(checkout);
+
+        assert!(!dropped.load(Ordering::SeqCst));
+        let mut next = pool.checkout().await.expect("returned checkout");
+        let state = next.store_mut().data_mut();
+        assert!(
+            state
+                .resource_table
+                .get::<DropFlag>(&Resource::<DropFlag>::new_borrow(resource.rep()))
+                .is_ok(),
+            "pre-entry cancellation must preserve carve-out resources"
+        );
+        assert_eq!(state.process_count_total, 1);
+        drop(next);
+        cancel.cancel();
+    }
+
     /// The in-flight transport origin is per-frame state: a pool return must
     /// clear `ingress_origin` (alongside `ingress_principal` /
     /// `ingress_device_key_id`) so a fresh lease never inherits a stale

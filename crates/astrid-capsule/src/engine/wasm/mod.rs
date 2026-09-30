@@ -3672,14 +3672,16 @@ impl ExecutionEngine for WasmEngine {
         // busy), distinct from a slow guest call.
         let pool_wait_ms = checkout_start.elapsed().as_millis() as u64;
         let typed_instance = checkout.instance();
-        checkout.begin_call();
         let mut interruption_reason = None;
         // Armed below when this invocation is a tool call; records one
         // `ToolCall` audit entry when the invocation ends (or is cancelled).
         let tool_audit;
-        let result: CapsuleResult<HookTriggerResult> = {
+        {
             let s = checkout.store_mut();
             // ── Phase 1: SET ──────────────────────────────────────
+            //
+            // This phase is host-only. A cancellation here cannot poison the
+            // component instance, so the checkout remains reusable.
             let applied_profile: Arc<astrid_core::profile::PrincipalProfile> =
                 invocation_profile.clone().unwrap_or_else(|| {
                     Arc::new(astrid_core::profile::PrincipalProfile::default_ref().clone())
@@ -3757,45 +3759,54 @@ impl ExecutionEngine for WasmEngine {
                     &invoking_principal,
                 );
             }
+        }
 
-            // ── Phase 2: CALL ─────────────────────────────────────
-            //
-            // A trap or cancelled future leaves this checkout non-reusable.
-            let typed_lookup = typed_instance
-                .get_typed_func::<(String, Vec<u8>), (HookTriggerResult,)>(
-                    &mut *s,
-                    "astrid-hook-trigger",
-                );
-            match typed_lookup {
-                Ok(func) => {
-                    let invocation_cancel = s.data().effective_cancel_token();
-                    tokio::select! {
-                        biased;
-                        () = invocation_cancel.cancelled() => {
-                            interruption_reason = Some("principal capsule view retired during invocation");
-                            Err(CapsuleError::WasmError(
-                                "principal capsule view retired during invocation".to_string()
-                            ))
-                        },
-                        called = func.call_async(
-                            &mut *s,
-                            (action.to_string(), payload.to_vec())
-                        ) => called.map(|(cr,)| cr).map_err(|e| {
-                            interruption_reason = match e.downcast_ref::<wasmtime::Trap>() {
-                                Some(wasmtime::Trap::OutOfFuel) => Some("interceptor exhausted its fuel budget"),
-                                Some(wasmtime::Trap::Interrupt) => Some("interceptor exceeded its execution deadline"),
-                                // Panics and allocator failures can also trap:
-                                // no completed guest decision means no permission.
-                                _ => Some("interceptor execution failed"),
-                            };
-                            CapsuleError::WasmError(format!("astrid_hook_trigger failed: {e:?}"))
-                        }),
-                    }
-                },
-                Err(e) => Err(CapsuleError::UnsupportedEntryPoint(format!(
-                    "capsule does not export `astrid-hook-trigger`: {e}"
-                ))),
-            }
+        // ── Phase 2: CALL ─────────────────────────────────────
+        //
+        // Typed-function lookup does not enter the guest. Keep the checkout
+        // reusable if the export is absent or this future is cancelled before
+        // the call begins.
+        let typed_lookup = {
+            let s = checkout.store_mut();
+            typed_instance.get_typed_func::<(String, Vec<u8>), (HookTriggerResult,)>(
+                &mut *s,
+                "astrid-hook-trigger",
+            )
+        };
+        let result: CapsuleResult<HookTriggerResult> = match typed_lookup {
+            Ok(func) => {
+                let invocation_cancel = checkout.store_mut().data().effective_cancel_token();
+                // From this point a trap, panic, or future-drop may leave
+                // Wasmtime's component-entry state non-reentrant. Drop must
+                // discard the Store unless the call returns successfully.
+                checkout.begin_call();
+                let s = checkout.store_mut();
+                tokio::select! {
+                    biased;
+                    () = invocation_cancel.cancelled() => {
+                        interruption_reason = Some("principal capsule view retired during invocation");
+                        Err(CapsuleError::WasmError(
+                            "principal capsule view retired during invocation".to_string()
+                        ))
+                    },
+                    called = func.call_async(
+                        &mut *s,
+                        (action.to_string(), payload.to_vec())
+                    ) => called.map(|(cr,)| cr).map_err(|e| {
+                        interruption_reason = match e.downcast_ref::<wasmtime::Trap>() {
+                            Some(wasmtime::Trap::OutOfFuel) => Some("interceptor exhausted its fuel budget"),
+                            Some(wasmtime::Trap::Interrupt) => Some("interceptor exceeded its execution deadline"),
+                            // Panics and allocator failures can also trap:
+                            // no completed guest decision means no permission.
+                            _ => Some("interceptor execution failed"),
+                        };
+                        CapsuleError::WasmError(format!("astrid_hook_trigger failed: {e:?}"))
+                    }),
+                }
+            },
+            Err(e) => Err(CapsuleError::UnsupportedEntryPoint(format!(
+                "capsule does not export `astrid-hook-trigger`: {e}"
+            ))),
         };
         // Per-invocation CPU measurement: fuel counts DOWN from the seed, so
         // `seed - remaining` is the exact deterministic instruction count for
