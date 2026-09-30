@@ -747,7 +747,7 @@ const WASM_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 ///
 /// One tick is [`EPOCH_TICK_INTERVAL`] (100 ms), so the default ~5 s window is
 /// `5000 / 100 = 50` ticks. Each window the bound run-loop's
-/// `epoch_deadline_callback` fires: a recv/accept loop (which set
+/// `epoch_deadline_callback` fires: a recv/accept/sleep loop (which set
 /// `recv_yielded` since the last window) is re-extended and cooperatively
 /// yields the tokio worker; a no-recv spinner accrues `no_yield_windows` and
 /// is interrupt-trapped once it reaches [`MAX_NO_YIELD_WINDOWS`]. The window
@@ -756,11 +756,11 @@ const WASM_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_RUN_LOOP_WINDOW_TICKS: u64 = 50;
 
 /// Number of consecutive windows a bound run-loop may burn CPU **without**
-/// calling `recv` (i.e. without setting `recv_yielded`) before its epoch
-/// callback returns [`UpdateDeadline::Interrupt`](wasmtime::UpdateDeadline) and
-/// traps the guest.
+/// cooperating through recv/accept or a completed nonzero sleep (setting
+/// `recv_yielded`) before its epoch callback returns
+/// [`UpdateDeadline::Interrupt`](wasmtime::UpdateDeadline) and traps the guest.
 ///
-/// A legitimate run loop calls `recv` every iteration, so it resets the
+/// A legitimate run loop waits through recv/accept or sleep, so it resets the
 /// counter every window and is never trapped. A pure `loop {}` (or any
 /// no-recv burner) never resets it and is interrupt-trapped after this many
 /// windows. With the default window (~5 s) this is a ~15 s grace before a
@@ -1155,11 +1155,11 @@ pub(crate) enum EpochAction {
 /// Called once per elapsed window with the run-loop's current
 /// `(recv_yielded, no_yield_windows)`:
 ///
-/// * If the guest called `recv` since the last window (`recv_yielded`), it is
-///   a legitimate recv/accept loop: clear the flag, reset the no-yield counter
-///   to 0, and **`Yield`** (cooperatively yield the worker + re-arm). Such a
-///   loop is never trapped.
-/// * Otherwise it burned the whole window without a single `recv`: increment
+/// * If the guest waited through recv/accept or completed a nonzero sleep
+///   since the last window (`recv_yielded`): clear the flag, reset the no-yield
+///   counter to 0, and **`Yield`** (cooperatively yield the worker + re-arm).
+///   Such a loop is never trapped.
+/// * Otherwise it burned the whole window without a cooperative wait: increment
 ///   `no_yield_windows`. Once it reaches `max` (`MAX_NO_YIELD_WINDOWS`),
 ///   **`Interrupt`** (trap the runaway); below `max`, still **`Yield`** — so
 ///   even a pure `loop {}` cooperatively yields the worker every window and can
@@ -1173,7 +1173,7 @@ pub(crate) fn epoch_decision(
     max: u32,
 ) -> (EpochAction, bool, u32) {
     if recv_yielded {
-        // Legit recv/accept loop: reset and keep running.
+        // Cooperative wait: reset and keep running.
         (EpochAction::Yield(window_ticks), false, 0)
     } else {
         let next = no_yield_windows.saturating_add(1);
@@ -1215,7 +1215,7 @@ pub(crate) const fn exempt_epoch_action(window_ticks: u64) -> EpochAction {
 /// is configured identically.
 ///
 /// BOUND run-loop (`window_ticks = Some`): the callback runs the pure
-/// [`epoch_decision`] each window — a recv/accept loop `Yield`s (never trapped),
+/// [`epoch_decision`] each window — a recv/accept/sleep loop `Yield`s (never trapped),
 /// a no-recv spinner accrues toward `Interrupt` after `MAX_NO_YIELD_WINDOWS` but
 /// still `Yield`s during the grace windows, so it can never starve the daemon.
 ///
@@ -2400,7 +2400,7 @@ impl ExecutionEngine for WasmEngine {
             // rebuild let the initial linear memory escape the cap). The CPU
             // bound is a wasmtime EPOCH deadline + interrupt callback on the
             // dedicated run-loop Store (see the run-loop Store setup below): a
-            // recv/accept loop sets `recv_yielded` and is re-armed every
+            // recv/accept/sleep loop sets `recv_yielded` and is re-armed every
             // window; a no-recv spinner is interrupt-trapped after
             // MAX_NO_YIELD_WINDOWS, and even a pure `loop {}` cooperatively
             // yields the tokio worker every window (UpdateDeadline::Yield) so it
@@ -2777,10 +2777,10 @@ impl ExecutionEngine for WasmEngine {
                 ingress_request_owner: None,
                 ingress_origin: None,
                 // Run-loop epoch-interrupt state. `recv_yielded` is set true by
-                // the ipc `recv` host fn each time the guest blocks on recv;
-                // the bound run-loop's epoch callback reads + clears it to
-                // distinguish a legit recv loop from a no-recv spinner.
-                // `no_yield_windows` counts consecutive windows with no recv.
+                // a cooperative recv/accept or completed nonzero sleep; the
+                // bound run-loop's epoch callback reads + clears it to
+                // distinguish a legitimate waiter from a spinner.
+                // `no_yield_windows` counts consecutive windows with no wait.
                 recv_yielded: false,
                 no_yield_windows: 0,
                 // Synchronous per-action audit sink (fs/net/process). Shared
@@ -6367,6 +6367,88 @@ mod epoch_integration_tests {
 
     fn unit_module(engine: &Engine, wat: &str) -> Module {
         Module::new(engine, wat).expect("valid wat module")
+    }
+
+    async fn sleep_watchdog_guest(
+        duration_ns: u64,
+        sleep_every_iteration: bool,
+    ) -> wasmtime::Result<()> {
+        use super::bindings::astrid::sys::host::Host;
+        use super::host_state::HostState;
+        use super::test_fixtures::minimal_host_state;
+
+        let engine = build_wasmtime_engine().expect("engine");
+        let module = unit_module(
+            &engine,
+            r#"(module
+                (import "host" "wait" (func $wait))
+                (func (export "run") (local $remaining i32)
+                    (local.set $remaining (i32.const 12))
+                    (loop $next
+                        (call $wait)
+                        (local.set $remaining (i32.sub (local.get $remaining) (i32.const 1)))
+                        (br_if $next (local.get $remaining)))))"#,
+        );
+        let mut store = Store::new(
+            &engine,
+            minimal_host_state(tokio::runtime::Handle::current()),
+        );
+        store.set_fuel(u64::MAX).unwrap();
+        super::configure_run_store(
+            &mut store,
+            &super::RunLoopBudget {
+                exempt: false,
+                bound_run_loop: true,
+                window_ticks: Some(1),
+                mem_bytes: super::WASM_MAX_MEMORY_BYTES,
+            },
+        );
+        let mut linker: Linker<HostState> = Linker::new(&engine);
+        let first = std::sync::atomic::AtomicBool::new(true);
+        linker
+            .func_wrap(
+                "host",
+                "wait",
+                move |mut caller: wasmtime::Caller<'_, HostState>| {
+                    if first.swap(false, Ordering::Relaxed) || sleep_every_iteration {
+                        caller
+                            .data_mut()
+                            .sleep_ns(duration_ns)
+                            .expect("sleep succeeds");
+                    }
+                    caller.engine().increment_epoch();
+                },
+            )
+            .unwrap();
+        let instance = linker.instantiate_async(&mut store, &module).await.unwrap();
+        instance
+            .get_typed_func::<(), ()>(&mut store, "run")
+            .unwrap()
+            .call_async(&mut store, ())
+            .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sleep_watchdog_completed_sleeps_survive_many_windows() {
+        sleep_watchdog_guest(1_000_000, true)
+            .await
+            .expect("sleeping guest must survive");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sleep_watchdog_zero_sleep_cannot_bypass_interrupt() {
+        let err = sleep_watchdog_guest(0, true)
+            .await
+            .expect_err("zero sleep is not progress");
+        assert_interrupt(&err);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sleep_watchdog_spin_after_sleep_still_interrupts() {
+        let err = sleep_watchdog_guest(1_000_000, false)
+            .await
+            .expect_err("progress must expire");
+        assert_interrupt(&err);
     }
 
     /// FIX 2 / DEFECT 3, the core guarantee: a PURE `loop {}` with no recv —
