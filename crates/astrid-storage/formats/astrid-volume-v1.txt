@@ -84,9 +84,11 @@ When no usable footer exists, recovery scans a contiguous sequence of records
 whose namespace transitions are valid, then exposes the state at the latest
 operation-8 boundary. A physically incomplete final record is truncated to that
 boundary. A damaged length cannot hide a later physically valid record; that is
-interior corruption and fails recovery. Write payload checksums are streamed
-with bounded memory. Commit snapshots are bounded to 16 MiB; other non-write
-payloads are bounded to 2 MiB before allocation.
+interior corruption and fails recovery. Bounded footer-tail replay streams
+write payload checksums with bounded memory. The legacy header-only fallback
+does not read or checksum write payloads; that path is not a data-integrity scrub.
+Commit snapshots are bounded to 16 MiB; other non-write payloads are bounded to
+2 MiB before allocation.
 
 sync() appends operation 8 when mutations are pending and returns only after
 that boundary is durable. A pending tail shorter than 16 MiB, including the

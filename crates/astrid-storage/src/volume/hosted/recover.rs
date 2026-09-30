@@ -473,7 +473,7 @@ fn read_record_payload(file: &File, header: &RecordHeader) -> io::Result<Option<
     Ok(Some(payload))
 }
 
-fn verify_record_checksum(header: &RecordHeader, payload: &[u8]) -> io::Result<()> {
+fn record_hasher(header: &RecordHeader) -> io::Result<blake3::Hasher> {
     let mut hasher = blake3::Hasher::new_derive_key("astrid volume record v1");
     hasher.update(&header.sequence.to_le_bytes());
     hasher.update(&[header.operation as u8]);
@@ -484,8 +484,38 @@ fn verify_record_checksum(header: &RecordHeader, payload: &[u8]) -> io::Result<(
     hasher.update(&header.logical_offset.to_le_bytes());
     hasher.update(&header.payload_len.to_le_bytes());
     hasher.update(name);
+    Ok(hasher)
+}
+
+fn verify_record_checksum(header: &RecordHeader, payload: &[u8]) -> io::Result<()> {
+    let mut hasher = record_hasher(header)?;
     hasher.update(payload);
-    if hasher.finalize().as_bytes() != &header.checksum {
+    check_record_hash(header, hasher.finalize())
+}
+
+fn verify_tail_write_checksum(
+    file: &File,
+    header: &RecordHeader,
+    buffer: &mut [u8],
+) -> io::Result<()> {
+    let mut hasher = record_hasher(header)?;
+    let mut remaining = header.payload_len;
+    let mut offset = header.payload_offset;
+    while remaining > 0 {
+        let length = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| invalid_transition("volume checksum read length overflow"))?;
+        read_exact_at(file, offset, &mut buffer[..length])?;
+        hasher.update(&buffer[..length]);
+        offset = offset
+            .checked_add(length as u64)
+            .ok_or_else(|| invalid_transition("volume checksum read offset overflow"))?;
+        remaining = remaining.strict_sub(length as u64);
+    }
+    check_record_hash(header, hasher.finalize())
+}
+
+fn check_record_hash(header: &RecordHeader, hash: blake3::Hash) -> io::Result<()> {
+    if hash.as_bytes() != &header.checksum {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Astrid volume record checksum mismatch",
@@ -532,6 +562,7 @@ fn replay_checkpoint_tail(
         ));
     }
     let mut last_was_commit = false;
+    let mut write_buffer = vec![0_u8; RECOVERY_BUFFER_BYTES];
     while offset < durable_len {
         let remaining = durable_len.saturating_sub(offset);
         if remaining < RECORD_FIXED_BYTES as u64 {
@@ -552,6 +583,12 @@ fn replay_checkpoint_tail(
             return Err(invalid_transition(
                 "volume checkpoint tail record overruns durable length",
             ));
+        }
+        // Unlike snapshot extents, these headers are newly interpreted state.
+        // Verify write bytes as well as metadata before trusting their offsets.
+        // The enclosing tail bound limits I/O; hashing uses a fixed-size buffer.
+        if header.operation == Operation::Write {
+            verify_tail_write_checksum(file, &header, &mut write_buffer)?;
         }
         let payload = read_record_payload(file, &header)?;
         if header.operation == Operation::Commit

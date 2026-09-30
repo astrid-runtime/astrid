@@ -371,3 +371,32 @@ fn failed_flush_retries_empty_commit_without_appending() {
     assert_eq!(state.last_commit_offset, snapshot_offset);
     assert_eq!(state.flush_state, FlushState::Confirmed);
 }
+
+#[test]
+fn sparse_tail_rejects_corrupt_write_header_checksum_and_payload() {
+    // Preserve valid framing: none of these flips damage the record magic or
+    // declared length. The write checksum must authenticate what replay trusts.
+    let payload_start = RECORD_FIXED_BYTES as u64 + "objects".len() as u64;
+    let payload = vec![0x5A; 64 * 1024 + 17];
+    for relative_offset in [27_u64, 43, payload_start, payload_start + 64 * 1024] {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("writer.volume");
+        let (volume, region) = open_objects(&path);
+        volume.create_region(&region, true).unwrap();
+        volume.write_region_at(&region, 0, b"base").unwrap();
+        volume.sync().unwrap();
+        let tail_start = volume.state.lock().last_snapshot_end;
+        volume.write_region_at(&region, 0, &payload).unwrap();
+        volume.sync().unwrap();
+        let copy = temporary.path().join("corrupt.volume");
+        std::fs::copy(&path, &copy).unwrap();
+        let mut bytes = std::fs::read(&copy).unwrap();
+        let offset = usize::try_from(tail_start + relative_offset).unwrap();
+        bytes[offset] ^= 1;
+        std::fs::write(&copy, bytes).unwrap();
+        let error =
+            HostedFileVolume::open(&copy).expect_err("corrupt durable write must not be accepted");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("checksum"), "{error}");
+    }
+}
