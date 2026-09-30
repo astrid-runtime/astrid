@@ -426,18 +426,23 @@ fn parse_exact_scaled_decimal(num_part: &str, multiplier: u64) -> Result<u64> {
     let whole_part = whole
         .checked_mul(multiplier)
         .ok_or_else(|| anyhow::anyhow!("fuel-rate overflows u64"))?;
-    let frac_num = frac_val
-        .checked_mul(multiplier)
+    // Widen before scale: frac*T can exceed u64 while frac*T/10^n still fits
+    // (e.g. 0.123456789T = 123_456_789_000).
+    let frac_num = u128::from(frac_val)
+        .checked_mul(u128::from(multiplier))
         .ok_or_else(|| anyhow::anyhow!("fuel-rate overflows u64"))?;
+    let scale128 = u128::from(scale);
     let remainder = frac_num
-        .checked_rem(scale)
+        .checked_rem(scale128)
         .ok_or_else(|| anyhow::anyhow!("fuel-rate fractional scale is zero"))?;
     if remainder != 0 {
         anyhow::bail!("fuel-rate fraction does not map to a whole fuel count");
     }
     let frac_part = frac_num
-        .checked_div(scale)
+        .checked_div(scale128)
         .ok_or_else(|| anyhow::anyhow!("fuel-rate fractional scale is zero"))?;
+    let frac_part =
+        u64::try_from(frac_part).map_err(|_| anyhow::anyhow!("fuel-rate overflows u64"))?;
     whole_part
         .checked_add(frac_part)
         .ok_or_else(|| anyhow::anyhow!("fuel-rate overflows u64"))
@@ -807,6 +812,9 @@ mod tests {
         assert_eq!(parse_fuel_rate("1.25k").unwrap(), 1_250);
         assert_eq!(parse_fuel_rate("500/s").unwrap(), 500);
         assert_eq!(parse_fuel_rate(" 12G/S ").unwrap(), 12_000_000_000);
+        // 0.123456789 * 10^12 is an exact integer, but frac*T overflows u64
+        // before division if the scaled product is not widened.
+        assert_eq!(parse_fuel_rate("0.123456789T").unwrap(), 123_456_789_000);
     }
 
     #[test]
@@ -849,11 +857,30 @@ mod tests {
     }
 
     #[test]
-    fn cpu_rate_patches_only_fuel_and_round_trips_quota_set() {
+    fn cpu_rate_parses_from_cli_and_patches_only_fuel() {
+        use clap::Parser as _;
+
+        use crate::cli::{Cli, Commands};
+
         let original = distinct_quotas();
-        let mut args = empty_set_args();
-        args.agent = Some("claude-code".into());
-        args.cpu_rate = Some("12G/s".into());
+        let cli = Cli::try_parse_from([
+            "astrid",
+            "quota",
+            "set",
+            "--agent",
+            "claude-code",
+            "--cpu-rate",
+            "12G/s",
+        ])
+        .expect("quota set --cpu-rate must parse");
+        let Some(Commands::Quota {
+            command: QuotaCommand::Set(args),
+        }) = cli.command
+        else {
+            panic!("expected quota set");
+        };
+        assert_eq!(args.agent.as_deref(), Some("claude-code"));
+        assert_eq!(args.cpu_rate.as_deref(), Some("12G/s"));
         let quotas = apply_set_args(original.clone(), &args).unwrap();
         assert_eq!(quotas.max_cpu_fuel_per_sec, 12_000_000_000);
         assert_eq!(quotas.max_memory_bytes, original.max_memory_bytes);
@@ -868,19 +895,5 @@ mod tests {
         );
         assert_eq!(quotas.max_storage_bytes, original.max_storage_bytes);
         assert_eq!(quotas.max_in_flight_calls, original.max_in_flight_calls);
-
-        let request = AdminRequestKind::QuotaSet {
-            principal: PrincipalId::new("claude-code").unwrap(),
-            quotas: quotas.clone(),
-        };
-        match request {
-            AdminRequestKind::QuotaSet { principal, quotas } => {
-                assert_eq!(principal.as_str(), "claude-code");
-                assert_eq!(quotas.max_cpu_fuel_per_sec, 12_000_000_000);
-                assert_eq!(quotas.max_memory_bytes, 11);
-                assert_eq!(quotas.max_in_flight_calls, 2);
-            },
-            other => panic!("expected QuotaSet, got {other:?}"),
-        }
     }
 }
