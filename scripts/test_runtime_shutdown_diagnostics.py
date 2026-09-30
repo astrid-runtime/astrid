@@ -36,19 +36,24 @@ exit "$status"
         result = self.run_stop("clean")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("pid= killed=false", result.stdout)
+        self.assertEqual(result.stderr, "")
 
     def test_nonzero_exit_is_reported_and_remains_failure(self):
         result = self.run_stop("nonzero")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("exit_status=7", result.stderr)
-        self.assertIn("forced_kill=false", result.stderr)
+        self.assertRegex(
+            result.stderr,
+            r"pid=12345 elapsed_seconds=\d+ exit_status=7 forced_kill=false",
+        )
         self.assertIn("pid= killed=false", result.stdout)
 
     def test_timeout_is_reported_and_remains_failure(self):
         result = self.run_stop("timeout")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("exit_status=137", result.stderr)
-        self.assertIn("forced_kill=true", result.stderr)
+        self.assertRegex(
+            result.stderr,
+            r"pid=12345 elapsed_seconds=\d+ exit_status=137 forced_kill=true",
+        )
         self.assertIn("pid= killed=true", result.stdout)
 
 
