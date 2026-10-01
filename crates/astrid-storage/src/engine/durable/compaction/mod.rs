@@ -753,17 +753,11 @@ where
             .sync_data()
             .map_err(|source| io_error("flush compacted object arena", source))?;
 
-        let roots = encoded_roots(&inner.roots_by_principal, &self.principal_codec)?;
-        let payload = encode_root_snapshot(self.identity.scheme(), &roots)?;
-        ensure_payload_limit(ROOT_FILE, 0, payload.len(), self.limits)?;
         let mut journal = super::create_private_file_capability(
             self.hosted_directory()?,
             Path::new(ROOTS_COMPACTING),
         )?;
-        append_frame(&mut journal, ROOT_MAGIC, &payload)?;
-        journal
-            .sync_data()
-            .map_err(|source| io_error("flush compacted root snapshot", source))?;
+        self.write_root_snapshot(&mut journal, &inner.roots_by_principal)?;
         sync_store_directory_capability(self.hosted_directory()?)?;
         validate_replacement(
             &mut arena,
@@ -773,6 +767,20 @@ where
             &self.identity,
             self.limits,
         )
+    }
+
+    fn write_root_snapshot(
+        &self,
+        journal: &mut impl super::DurableIo,
+        roots: &BTreeMap<P, RootState>,
+    ) -> Result<(), DurableError> {
+        let roots = encoded_roots(roots, &self.principal_codec)?;
+        let payload = encode_root_snapshot(self.identity.scheme(), &roots)?;
+        ensure_payload_limit(ROOT_FILE, 0, payload.len(), self.limits)?;
+        append_frame(journal, ROOT_MAGIC, &payload)?;
+        journal
+            .durable_sync_data()
+            .map_err(|source| io_error("flush compacted root snapshot", source))
     }
 
     fn promote_replacement_files(&self) -> Result<(), DurableError> {
