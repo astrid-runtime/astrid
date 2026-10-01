@@ -63,6 +63,78 @@ async fn compaction_reclaims_obsolete_representation_metadata_and_preserves_kv()
 
 #[tokio::test]
 #[ignore = "sustained real principal KV diagnostic; run explicitly"]
+async fn repeated_compaction_cycles_account_for_retained_growth() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let mut store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    create_test_principal(&store, "alice").await;
+    for cycle in 0_u64..10 {
+        let started = std::time::Instant::now();
+        for value in 0_u64..256 {
+            store
+                .kv()
+                .set(
+                    "alice:capsule:shell",
+                    "heartbeat",
+                    (cycle * 256 + value).to_le_bytes().to_vec(),
+                )
+                .await
+                .unwrap();
+        }
+        let write_ms = started.elapsed().as_millis();
+        let before = std::fs::metadata(home.storage_volume_path()).unwrap().len();
+        assert!(
+            before < 256 * 1024 * 1024,
+            "fixture exceeded safety ceiling"
+        );
+        let policy = ObjectRecord::new(
+            ObjectKind::Evidence,
+            ObjectFormatVersion::V1,
+            b"cycle-probe-retention".to_vec(),
+            Vec::new(),
+            0,
+            crate::storage_model::ObjectClass::Metadata,
+        )
+        .unwrap();
+        let compact_started = std::time::Instant::now();
+        store
+            .compact_with_deterministic_proof(
+                crate::storage_model::ObjectId::new([0xD2; 32]),
+                policy,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let compact_ms = compact_started.elapsed().as_millis();
+        // Do not acknowledge evidence without an independent durable sink merely
+        // to improve the measured footprint. Account for the retained outbox.
+        let pending = store.pending_compaction_evidence().unwrap().len();
+        let after = std::fs::metadata(home.storage_volume_path()).unwrap().len();
+        eprintln!(
+            "cycle={cycle} write_ms={write_ms} compact_ms={compact_ms} before={before} after={after} pending_receipts={pending}"
+        );
+        store.engine.close().unwrap();
+        drop(store);
+        report_retained_regions(&home.storage_volume_path());
+        store = open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .kv()
+                .get("alice:capsule:shell", "heartbeat")
+                .await
+                .unwrap(),
+            Some((cycle * 256 + 255).to_le_bytes().to_vec())
+        );
+    }
+    store.engine.close().unwrap();
+}
+
+#[tokio::test]
+#[ignore = "sustained real principal KV diagnostic; run explicitly"]
 async fn repeated_principal_kv_writes_measure_volume_growth_and_recover() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());

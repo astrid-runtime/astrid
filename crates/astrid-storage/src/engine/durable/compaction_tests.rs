@@ -566,6 +566,18 @@ fn assert_volume_compaction_recovers(point: FaultPoint, recover_in_process: bool
         .ensure_direct_representation_catalogue(specification, &[specification])
         .unwrap();
     let (_, current) = two_versions(&engine);
+    let (_, bob) = transaction("bob", None, b"other-principal");
+    let bob = engine.commit(bob).unwrap().root();
+    let root_bytes_before = engine
+        .lock_usable()
+        .unwrap()
+        .files
+        .as_ref()
+        .unwrap()
+        .roots
+        .metadata()
+        .unwrap()
+        .len();
     let policy = evidence(b"retain-current-roots");
     let authorization = plan(&engine, retention(&engine, &policy, []), policy);
     assert!(matches!(
@@ -620,6 +632,21 @@ fn assert_volume_compaction_recovers(point: FaultPoint, recover_in_process: bool
     )
     .unwrap();
     assert_eq!(recovered.root(&"alice".to_owned()).unwrap(), Some(current));
+    assert_eq!(recovered.root(&"bob".to_owned()).unwrap(), Some(bob));
+    assert!(
+        recovered
+            .lock_usable()
+            .unwrap()
+            .files
+            .as_ref()
+            .unwrap()
+            .roots
+            .metadata()
+            .unwrap()
+            .len()
+            < root_bytes_before,
+        "volume compaction retained obsolete root journal frames"
+    );
 }
 
 #[test]
