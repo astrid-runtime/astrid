@@ -21,6 +21,10 @@ use astrid_core::{PrincipalId, SessionId, Timestamp};
 
 use crate::Kernel;
 
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "audit_handlers/evidence_tests.rs"]
+mod evidence_tests;
+
 /// Default entries per `audit.export` page.
 const EXPORT_DEFAULT_LIMIT: u32 = 500;
 /// Hard cap on entries per `audit.export` page.
@@ -618,7 +622,13 @@ async fn deliver_compaction_evidence(
             return (reclaimed_bytes, true);
         },
     };
+    let evidence_pending = !pending.is_empty();
     for bundle in pending {
+        // Older retained bundles already have summaries. Do not duplicate them
+        // or attach this operation's counters to a different GC commit.
+        if bundle.commit_id() != report.gc_commit() {
+            continue;
+        }
         let records = [
             bundle.fact_snapshot(),
             bundle.retention_policy(),
@@ -676,12 +686,14 @@ async fn deliver_compaction_evidence(
             tracing::warn!("audit compaction receipt read-back failed verification");
             return (reclaimed_bytes, true);
         }
-        if let Err(error) = store.acknowledge_compaction_evidence(bundle.commit_id()) {
-            tracing::warn!(error = %error, "audit compaction receipt acknowledgement failed");
-            return (reclaimed_bytes, true);
-        }
+        // This signed summary commits to the evidence but cannot reconstruct
+        // its eight records. The outbox is their only complete durable copy;
+        // acknowledgement is valid only after a complete archive is persisted.
     }
-    (reclaimed_bytes, false)
+    if evidence_pending {
+        tracing::warn!("compaction evidence retained: complete archive delivery is pending");
+    }
+    (reclaimed_bytes, evidence_pending)
 }
 
 #[cfg(not(target_family = "wasm"))]
