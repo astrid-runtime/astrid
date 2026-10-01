@@ -185,6 +185,9 @@ impl RuntimePrincipalStore {
             })? {
                 kv.checkpoint_before_compaction(owner)?;
             }
+            // Checkpoints append new authoritative objects. The initial
+            // admission estimate is stale even without another writer.
+            ensure_compaction_headroom(&engine)?;
             let retention =
                 compaction_retention(&engine, operation_contract, policy_id, additional_roots)
                     .map_err(|error| {
@@ -283,5 +286,13 @@ mod tests {
     #[test]
     fn compaction_accepts_exact_headroom_boundary() {
         assert!(validate_compaction_headroom(64 * 1024 * 1024 + 7, 7).is_ok());
+    }
+
+    #[test]
+    fn checkpoint_growth_invalidates_preparation_headroom() {
+        let available = super::COMPACTION_HEADROOM_BYTES.strict_add(4096);
+        assert!(validate_compaction_headroom(available, 4096).is_ok());
+        // A checkpoint both consumes capacity and grows the replacement input.
+        assert!(validate_compaction_headroom(available.strict_sub(512), 4608).is_err());
     }
 }
