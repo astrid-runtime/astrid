@@ -372,6 +372,9 @@ where
     ) -> StorageResult<bool> {
         let base = self.header(owner.clone())?;
         let base_projection = projection_from_header(&base);
+        if base_projection.depth == 0 {
+            return Ok(false);
+        }
         if !force && !should_checkpoint(&base_projection) {
             return Ok(false);
         }
@@ -559,14 +562,21 @@ where
     }
 
     #[cfg(test)]
-    pub(super) fn delta_depth_for_test(&self, owner: P) -> StorageResult<u64> {
+    pub(crate) fn delta_depth_for_test(&self, owner: P) -> StorageResult<u64> {
         self.blocking_store()
             .header(owner)
             .map(|header| header.delta_depth)
     }
 
     #[cfg(test)]
-    pub(super) fn checkpoint_for_test(&self, owner: P) -> StorageResult<bool> {
+    pub(crate) fn checkpoint_for_test(&self, owner: P) -> StorageResult<bool> {
+        self.blocking_store().checkpoint_once(owner, true)
+    }
+
+    /// Collapse existing deltas before an explicitly requested physical GC.
+    /// Call on a blocking worker. A competing root publication may win; in that
+    /// case GC retains that root's closure rather than retrying without bound.
+    pub(crate) fn checkpoint_before_compaction(&self, owner: P) -> StorageResult<bool> {
         self.blocking_store().checkpoint_once(owner, true)
     }
 

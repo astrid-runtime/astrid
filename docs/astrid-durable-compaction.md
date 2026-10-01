@@ -117,6 +117,15 @@ positional handles must wire lease acquisition before they may use compaction.
 
 ## Replacement protocol
 
+Before the runtime captures compaction facts, it makes one checkpoint attempt
+for each existing owner with pending KV deltas. This uses the normal KV
+checkpoint/rebase transaction; it does not bypass root conflict detection or
+change logical values. Owners already at a checkpoint are skipped. A concurrent
+writer or checkpoint may win, in which case its current closure remains live
+and may limit reclamation. Explicitly retained older roots still retain their
+closures. This preparation does not enable periodic physical GC or change proof
+retention.
+
 The stable authority names are `objects.arena` and `roots.journal`. A
 compaction writes and verifies private replacements first:
 

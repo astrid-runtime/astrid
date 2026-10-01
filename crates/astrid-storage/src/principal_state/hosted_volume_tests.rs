@@ -2,25 +2,92 @@ use super::runtime_tests::*;
 use super::*;
 
 #[tokio::test]
+async fn explicit_compaction_checkpoints_small_kv_delta_chains() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    let alice = create_test_principal(&store, "alice").await;
+    for value in 0_u64..32 {
+        store
+            .kv()
+            .set("alice:capsule:test", "state", value.to_le_bytes().to_vec())
+            .await
+            .unwrap();
+    }
+    let owner = StateOwner::Principal(alice);
+    assert_eq!(store.runtime_kv.delta_depth_for_test(owner).unwrap(), 32);
+    let pinned = store.engine.root(&owner).unwrap().unwrap().commit;
+    let pinned_record = store.engine.object(pinned).unwrap().unwrap();
+    let policy = ObjectRecord::new(
+        ObjectKind::Evidence,
+        ObjectFormatVersion::V1,
+        b"explicit-checkpoint-regression".to_vec(),
+        Vec::new(),
+        0,
+        crate::storage_model::ObjectClass::Metadata,
+    )
+    .unwrap();
+    store
+        .compact_with_deterministic_proof(
+            crate::storage_model::ObjectId::new([0xD4; 32]),
+            policy,
+            vec![crate::engine::CompactionRetainedRoot::new(
+                crate::engine::CompactionRootKind::ExplicitPin,
+                pinned,
+            )],
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.runtime_kv.delta_depth_for_test(owner).unwrap(), 0);
+    store.engine.close().unwrap();
+    drop(store);
+    let reopened = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    assert_eq!(reopened.engine.object(pinned).unwrap(), Some(pinned_record));
+    assert_eq!(
+        reopened
+            .kv()
+            .get("alice:capsule:test", "state")
+            .await
+            .unwrap(),
+        Some(31_u64.to_le_bytes().to_vec())
+    );
+    reopened.engine.close().unwrap();
+}
+
+#[tokio::test]
 #[ignore = "changing JSON CAS footprint diagnostic; run explicitly, not a performance gate"]
 async fn changing_json_cas_survives_compaction_and_restart() {
+    changing_json_cas_probe(false).await;
+}
+
+#[tokio::test]
+#[ignore = "controlled checkpoint comparison, not production automatic maintenance"]
+async fn checkpointed_json_cas_survives_compaction_and_restart() {
+    changing_json_cas_probe(true).await;
+}
+
+async fn changing_json_cas_probe(checkpoint_first: bool) {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
     let mut store = open_runtime_principal_store(&home, unlimited_quota())
         .await
         .unwrap();
-    create_test_principal(&store, "alice").await;
+    let alice = create_test_principal(&store, "alice").await;
     let namespace = "alice:capsule:protocol";
     let mut expected: Option<Vec<u8>> = None;
     for cycle in 0_u64..10 {
         let mut latencies = Vec::new();
         for offset in 0_u64..256 {
-            let sequence = cycle * 256 + offset;
+            let sequence = cycle.strict_mul(256).strict_add(offset);
             // Synthetic changing state, not Codewall's wire schema or an
             // enrollment fixture. Keep live payload bounded while values change.
             let value = serde_json::to_vec(&serde_json::json!({
                 "sequence": sequence,
-                "last_sync_ms": sequence * 1000,
+                "last_sync_ms": sequence.strict_mul(1000),
                 "recent_ids": (sequence.saturating_sub(63)..=sequence)
                     .map(|id| format!("event-{id:016x}"))
                     .collect::<Vec<_>>(),
@@ -44,6 +111,16 @@ async fn changing_json_cas_survives_compaction_and_restart() {
             expected = Some(value);
         }
         latencies.sort_unstable();
+        let checkpoint_started = std::time::Instant::now();
+        if checkpoint_first {
+            assert!(
+                store
+                    .runtime_kv
+                    .checkpoint_for_test(StateOwner::Principal(alice))
+                    .unwrap()
+            );
+        }
+        let checkpoint_ms = checkpoint_started.elapsed().as_millis();
         let before = std::fs::metadata(home.storage_volume_path()).unwrap().len();
         assert!(before < 256 * 1024 * 1024, "diagnostic safety ceiling");
         let policy = ObjectRecord::new(
@@ -67,7 +144,7 @@ async fn changing_json_cas_survives_compaction_and_restart() {
         let compact_ms = started.elapsed().as_millis();
         let after = std::fs::metadata(home.storage_volume_path()).unwrap().len();
         let pending = store.pending_compaction_evidence().unwrap().len();
-        assert_eq!(pending, usize::try_from(cycle + 1).unwrap());
+        assert_eq!(pending, usize::try_from(cycle.strict_add(1)).unwrap());
         assert!(after < before, "compaction did not reclaim obsolete state");
         store.engine.close().unwrap();
         drop(store);
@@ -82,7 +159,7 @@ async fn changing_json_cas_survives_compaction_and_restart() {
         );
         assert_eq!(store.pending_compaction_evidence().unwrap().len(), pending);
         eprintln!(
-            "json_cas cycle={cycle} live_bytes={} before={before} after={after} pending={pending} p50_us={} p99_us={} compact_ms={compact_ms} reopen_ms={reopen_ms}",
+            "json_cas cycle={cycle} checkpoint_first={checkpoint_first} checkpoint_ms={checkpoint_ms} live_bytes={} before={before} after={after} pending={pending} p50_us={} p99_us={} compact_ms={compact_ms} reopen_ms={reopen_ms}",
             expected.as_ref().unwrap().len(),
             latencies[128],
             latencies[253],

@@ -171,11 +171,20 @@ impl RuntimePrincipalStore {
         ensure_compaction_headroom(&self.engine)?;
         let policy_id = RetentionPolicyId::new(self.engine.identify(&policy));
         let engine = Arc::clone(&self.engine);
+        let kv = Arc::clone(&self.runtime_kv);
         let mut additional_roots = additional_roots;
         additional_roots.extend(self.compaction_read_handle_roots().into_iter().map(
             |(_, object)| CompactionRetainedRoot::new(CompactionRootKind::ReadHandle, object),
         ));
         tokio::task::spawn_blocking(move || {
+            // A below-threshold delta chain still owns overwritten values.
+            // Publish equivalent checkpoint roots before capturing GC facts;
+            // never remove predecessor records from the live closure directly.
+            for (owner, _) in engine.roots().map_err(|error| {
+                StorageError::Connection(format!("enumerate KV compaction roots: {error}"))
+            })? {
+                kv.checkpoint_before_compaction(owner)?;
+            }
             let retention =
                 compaction_retention(&engine, operation_contract, policy_id, additional_roots)
                     .map_err(|error| {
