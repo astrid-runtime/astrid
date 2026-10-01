@@ -2,6 +2,82 @@ use super::runtime_tests::*;
 use super::*;
 
 #[tokio::test]
+async fn unchanged_and_rejected_cas_do_not_grow_the_hosted_volume() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    create_test_principal(&store, "alice").await;
+    let namespace = "alice:capsule:protocol";
+    let value = br#"{"enrolled":true,"sequence":7}"#.to_vec();
+    assert!(
+        store
+            .kv()
+            .compare_and_swap(namespace, "state", None, value.clone())
+            .await
+            .unwrap()
+    );
+    let baseline = std::fs::metadata(home.storage_volume_path()).unwrap().len();
+    for _ in 0..1_000 {
+        assert!(
+            store
+                .kv()
+                .compare_and_swap(namespace, "state", Some(&value), value.clone())
+                .await
+                .unwrap()
+        );
+        // The new bytes equal the current value, but an incorrect expectation
+        // must still fail. No-op detection cannot bypass the atomic comparison.
+        assert!(
+            !store
+                .kv()
+                .compare_and_swap(namespace, "state", Some(b"stale"), value.clone())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .kv()
+                .compare_and_swap(namespace, "state", None, value.clone())
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        std::fs::metadata(home.storage_volume_path()).unwrap().len(),
+        baseline
+    );
+    store.engine.close().unwrap();
+    drop(store);
+    let reopened = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.kv().get(namespace, "state").await.unwrap(),
+        Some(value.clone())
+    );
+    let updated = br#"{"enrolled":true,"sequence":8}"#.to_vec();
+    assert!(
+        reopened
+            .kv()
+            .compare_and_swap(namespace, "state", Some(&value), updated.clone())
+            .await
+            .unwrap()
+    );
+    reopened.engine.close().unwrap();
+    drop(reopened);
+    let final_store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    assert_eq!(
+        final_store.kv().get(namespace, "state").await.unwrap(),
+        Some(updated)
+    );
+    final_store.engine.close().unwrap();
+}
+
+#[tokio::test]
 async fn compaction_reclaims_obsolete_representation_metadata_and_preserves_kv() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
