@@ -457,6 +457,6 @@ fn print_prune_pretty(result: &AuditPruneResult) {
         result.physical_reclaimed_bytes
     );
     if result.physical_reclaim_pending {
-        println!("  physical status:   pending compaction");
+        println!("  maintenance:       compaction or evidence archive pending");
     }
 }
