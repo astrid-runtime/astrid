@@ -2,6 +2,98 @@ use super::runtime_tests::*;
 use super::*;
 
 #[tokio::test]
+#[ignore = "changing JSON CAS footprint diagnostic; run explicitly, not a performance gate"]
+async fn changing_json_cas_survives_compaction_and_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let mut store = open_runtime_principal_store(&home, unlimited_quota())
+        .await
+        .unwrap();
+    create_test_principal(&store, "alice").await;
+    let namespace = "alice:capsule:protocol";
+    let mut expected: Option<Vec<u8>> = None;
+    for cycle in 0_u64..10 {
+        let mut latencies = Vec::new();
+        for offset in 0_u64..256 {
+            let sequence = cycle * 256 + offset;
+            // Synthetic changing state, not Codewall's wire schema or an
+            // enrollment fixture. Keep live payload bounded while values change.
+            let value = serde_json::to_vec(&serde_json::json!({
+                "sequence": sequence,
+                "last_sync_ms": sequence * 1000,
+                "recent_ids": (sequence.saturating_sub(63)..=sequence)
+                    .map(|id| format!("event-{id:016x}"))
+                    .collect::<Vec<_>>(),
+                "stable_payload": "x".repeat(4096),
+            }))
+            .unwrap();
+            let started = std::time::Instant::now();
+            assert!(
+                store
+                    .kv()
+                    .compare_and_swap(
+                        namespace,
+                        "protocol/state",
+                        expected.as_deref(),
+                        value.clone(),
+                    )
+                    .await
+                    .unwrap()
+            );
+            latencies.push(started.elapsed().as_micros());
+            expected = Some(value);
+        }
+        latencies.sort_unstable();
+        let before = std::fs::metadata(home.storage_volume_path()).unwrap().len();
+        assert!(before < 256 * 1024 * 1024, "diagnostic safety ceiling");
+        let policy = ObjectRecord::new(
+            ObjectKind::Evidence,
+            ObjectFormatVersion::V1,
+            b"changing-json-diagnostic-retention".to_vec(),
+            Vec::new(),
+            0,
+            crate::storage_model::ObjectClass::Metadata,
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        store
+            .compact_with_deterministic_proof(
+                crate::storage_model::ObjectId::new([0xD3; 32]),
+                policy,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let compact_ms = started.elapsed().as_millis();
+        let after = std::fs::metadata(home.storage_volume_path()).unwrap().len();
+        let pending = store.pending_compaction_evidence().unwrap().len();
+        assert_eq!(pending, usize::try_from(cycle + 1).unwrap());
+        assert!(after < before, "compaction did not reclaim obsolete state");
+        store.engine.close().unwrap();
+        drop(store);
+        let started = std::time::Instant::now();
+        store = open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap();
+        let reopen_ms = started.elapsed().as_millis();
+        assert_eq!(
+            store.kv().get(namespace, "protocol/state").await.unwrap(),
+            expected
+        );
+        assert_eq!(store.pending_compaction_evidence().unwrap().len(), pending);
+        eprintln!(
+            "json_cas cycle={cycle} live_bytes={} before={before} after={after} pending={pending} p50_us={} p99_us={} compact_ms={compact_ms} reopen_ms={reopen_ms}",
+            expected.as_ref().unwrap().len(),
+            latencies[128],
+            latencies[253],
+        );
+    }
+    store.engine.close().unwrap();
+    drop(store);
+    report_retained_regions(&home.storage_volume_path());
+}
+
+#[tokio::test]
 async fn compaction_reclaims_obsolete_representation_metadata_and_preserves_kv() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
