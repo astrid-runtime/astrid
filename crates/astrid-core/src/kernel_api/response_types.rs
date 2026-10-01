@@ -200,7 +200,8 @@ pub struct AuditPruneResult {
     pub logical_reclaimed_bytes: u64,
     /// Physical bytes reclaimed by the storage engine compactor, if known.
     pub physical_reclaimed_bytes: u64,
-    /// Whether physical compaction is still pending or unavailable.
+    /// Whether physical compaction or its complete evidence archive is pending.
+    /// Reclaimed bytes can be nonzero while evidence delivery remains pending.
     pub physical_reclaim_pending: bool,
 }
 

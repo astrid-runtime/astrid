@@ -9,8 +9,7 @@
 use std::sync::Arc;
 
 use astrid_audit::{
-    AuditAction, AuditChainHead, AuditChainPruneState, AuditEntry, AuditError, AuditLog,
-    AuditOutcome, AuditRetentionPolicy, AuthorizationProof,
+    AuditChainHead, AuditChainPruneState, AuditEntry, AuditError, AuditLog, AuditRetentionPolicy,
 };
 use astrid_core::kernel_api::{
     AUDIT_OMITTED_TOTAL_UNKNOWN, AdminRequestKind, AdminResponseBody, AuditExportEntry,
@@ -20,6 +19,14 @@ use astrid_core::kernel_api::{
 use astrid_core::{PrincipalId, SessionId, Timestamp};
 
 use crate::Kernel;
+
+#[cfg(not(target_family = "wasm"))]
+#[path = "audit_handlers/evidence_delivery.rs"]
+mod evidence_delivery;
+
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "audit_handlers/evidence_tests.rs"]
+mod evidence_tests;
 
 /// Default entries per `audit.export` page.
 const EXPORT_DEFAULT_LIMIT: u32 = 500;
@@ -618,70 +625,22 @@ async fn deliver_compaction_evidence(
             return (reclaimed_bytes, true);
         },
     };
+    let evidence_pending = !pending.is_empty();
     for bundle in pending {
-        let records = [
-            bundle.fact_snapshot(),
-            bundle.retention_policy(),
-            bundle.tensor_logic_proof(),
-            bundle.plan(),
-            bundle.placement_before(),
-            bundle.placement_after(),
-            bundle.execution_measurements(),
-            bundle.commit(),
-        ];
-        let evidence_digest = bundle_digest(&records);
-        let expected_digest = evidence_digest.clone();
-        let params = serde_json::json!({
-            "gc_commit": bundle.commit_id().object_id().as_bytes().to_vec(),
-            "evidence_digest": evidence_digest,
-            "objects_reclaimed": report.objects_reclaimed(),
-            "arena_bytes_before": report.arena_bytes_before(),
-            "arena_bytes_after": report.arena_bytes_after(),
-        });
-        let event_id = match audit_log
-            .append(
-                session_id.clone(),
-                AuditAction::AdminRequest {
-                    method: "AuditPhysicalCompaction".to_owned(),
-                    required_capability: "audit:prune".to_owned(),
-                    target_principal: None,
-                    params: Some(params),
-                    device_key_id: None,
-                },
-                AuthorizationProof::System {
-                    reason: "audit prune physical compaction receipt".to_owned(),
-                },
-                AuditOutcome::success(),
-            )
-            .await
+        if let Err(error) =
+            evidence_delivery::record_summary(audit_log, store, session_id, &bundle, report).await
         {
-            Ok(id) => id,
-            Err(error) => {
-                tracing::warn!(error = %error, "audit compaction receipt persistence failed");
-                return (reclaimed_bytes, true);
-            },
-        };
-        let Some(persisted) = audit_log.get(&event_id).await.ok().flatten() else {
-            tracing::warn!("audit compaction receipt read-back is missing");
-            return (reclaimed_bytes, true);
-        };
-        let readback_ok = match &persisted.action {
-            AuditAction::AdminRequest {
-                params: Some(value),
-                ..
-            } => value.get("evidence_digest") == Some(&serde_json::json!(expected_digest)),
-            _ => false,
-        };
-        if persisted.verify_signature().is_err() || !readback_ok {
-            tracing::warn!("audit compaction receipt read-back failed verification");
+            tracing::warn!(error = %error, "audit compaction summary delivery is pending");
             return (reclaimed_bytes, true);
         }
-        if let Err(error) = store.acknowledge_compaction_evidence(bundle.commit_id()) {
-            tracing::warn!(error = %error, "audit compaction receipt acknowledgement failed");
-            return (reclaimed_bytes, true);
-        }
+        // This signed summary commits to the evidence but cannot reconstruct
+        // its eight records. The outbox is their only complete durable copy;
+        // acknowledgement is valid only after a complete archive is persisted.
     }
-    (reclaimed_bytes, false)
+    if evidence_pending {
+        tracing::warn!("compaction evidence retained: complete archive delivery is pending");
+    }
+    (reclaimed_bytes, evidence_pending)
 }
 
 #[cfg(not(target_family = "wasm"))]

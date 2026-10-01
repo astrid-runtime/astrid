@@ -177,16 +177,33 @@ fact snapshot, retention policy, Tensor Logic proof, plan, old placement, new
 placement, measurements, and commit receipt. A bundle is not delivery-visible
 while it is merely prepared. It becomes visible through
 `pending_compaction_evidence` only after the exact destination placement is
-durable. The kernel appends the bundle to the independent audit log and calls
-`acknowledge_compaction_evidence` only after that append is durable.
-Acknowledgement deletes the delivery copy, not evidence already anchored by
-the audit sink.
+durable.
+
+The current kernel delivery path appends a signed **summary**, containing the
+bundle digest and GC commit identity, to the audit log. It does not archive the
+eight complete records and therefore does **not** call
+`acknowledge_compaction_evidence`. The outbox retains the complete bundle across
+restart. Verified summary IDs are checkpointed per GC commit so later delivery
+attempts can reuse them; missing summaries are retried, without assigning a
+newer compaction's measurements to an older bundle. An interruption before the
+checkpoint can repeat a summary. The existing `physical_reclaim_pending` flag
+covers either compaction or complete-evidence archival still pending, even when
+the response reports reclaimed bytes.
+
+The required complete-delivery contract remains: durably archive all eight
+records before acknowledging the outbox copy. A digest or signed summary alone
+does not satisfy that contract. Acknowledgement may delete the delivery copy,
+not the independently retained evidence. No production complete-bundle archive
+sink is currently wired; `[audit.retention].archive_dir` archives pruned audit
+entries, not these bundles.
 
 The outbox is deliberately not the audit chain. It is a transactional delivery
-buffer inside the singleton store directory. Audit remains independently
-append-only so storage corruption cannot erase its own witness. No background
-scheduler may invoke destructive compaction until kernel composition drains
-this outbox and applies retry/backpressure policy.
+buffer inside the singleton store directory, not an independent archive.
+Independent evidence custody, retry/backpressure and bounded operational
+scheduling remain prerequisites for automatic destructive compaction. Retaining
+the outbox prevents evidence loss but does not bound its disk footprint. The
+current explicit audit-prune compaction path must not be mistaken for an
+unattended reclamation service.
 
 ### Physical-placement Evidence grammar
 
