@@ -85,13 +85,14 @@ impl RepresentationStore {
         Ok((recovered, current))
     }
 
-    pub(in crate::engine::durable) fn checkpoint_volume(
+    /// Prepare a private generation without changing CURRENT. Callers may rebase
+    /// this copy before publishing it with the arena in one metadata transaction.
+    pub(in crate::engine::durable) fn prepare_checkpoint_volume(
         &mut self,
         volume: &std::sync::Arc<dyn crate::volume::AstridVolume>,
         limits: RecoveryLimits,
-    ) -> Result<(), DurableError> {
+    ) -> Result<Self, DurableError> {
         use super::volume::{generation_region, remove_region_if_present};
-        use crate::volume::VolumeRegion;
         use std::sync::Arc;
 
         let next = generation_name(increment(self.journal_generation)?);
@@ -115,12 +116,32 @@ impl RepresentationStore {
                 "checkpoint pointer verification failed",
             ));
         }
+        Ok(replacement)
+    }
+
+    pub(in crate::engine::durable) fn checkpoint_volume_publication()
+    -> Result<crate::volume::VolumeMetadataMutation, DurableError> {
+        use crate::volume::{VolumeMetadataMutation, VolumeRegion};
+
         let from = VolumeRegion::new("representations/CURRENT.tmp")
             .map_err(|source| io_error("validate checkpoint temporary", source))?;
         let to = VolumeRegion::new("representations/CURRENT")
             .map_err(|source| io_error("validate checkpoint current", source))?;
+        Ok(VolumeMetadataMutation::Replace {
+            source: from,
+            destination: to,
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::durable) fn checkpoint_volume(
+        &mut self,
+        volume: &std::sync::Arc<dyn crate::volume::AstridVolume>,
+        limits: RecoveryLimits,
+    ) -> Result<(), DurableError> {
+        let replacement = self.prepare_checkpoint_volume(volume, limits)?;
         volume
-            .replace_region(&from, &to)
+            .commit_metadata(&[Self::checkpoint_volume_publication()?])
             .map_err(|source| io_error("publish checkpoint pointer", source))?;
         // Once the namespace changes, subsequent writes must use the new handles
         // even if the durability barrier reports an error. Keep old regions then.
@@ -128,6 +149,16 @@ impl RepresentationStore {
         volume
             .sync()
             .map_err(|source| io_error("flush checkpoint publication", source))?;
+        self.reclaim_checkpoint_volume(volume)
+    }
+
+    /// Only call after this generation and its matching arena are durable.
+    pub(in crate::engine::durable) fn reclaim_checkpoint_volume(
+        &self,
+        volume: &std::sync::Arc<dyn crate::volume::AstridVolume>,
+    ) -> Result<(), DurableError> {
+        use super::volume::remove_region_if_present;
+
         for region in volume
             .list_regions("representations/generations/")
             .map_err(|source| io_error("list obsolete checkpoint regions", source))?

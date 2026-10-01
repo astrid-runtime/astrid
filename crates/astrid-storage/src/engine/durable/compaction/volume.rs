@@ -130,27 +130,54 @@ where
         )?;
         outbox::prepare_volume(Arc::clone(volume), &bundle, &self.identity, self.limits)?;
 
+        // Never rebase the published generation against an unpublished arena.
+        // Stage a private copy, then publish its pointer, arena and GC evidence
+        // together. Every durable prefix consequently has matching placements.
+        let staged_representations = inner
+            .representations
+            .as_mut()
+            .map(|store| {
+                let mut staged = store.prepare_checkpoint_volume(volume, self.limits)?;
+                staged.rebase_compacted_arena(
+                    &arena,
+                    &replacement.index,
+                    &self.identity,
+                    self.limits,
+                )?;
+                // Discard the old placement closure copied for isolated rebasing.
+                // Both private generations remain unreachable until publication;
+                // reclamation below removes the intermediate one as well.
+                staged.prepare_checkpoint_volume(volume, self.limits)
+            })
+            .transpose()?;
+        self.fail_if(super::FaultPoint::AfterCompactionEvidencePrepare)?;
+        let representation_publication = staged_representations
+            .as_ref()
+            .map(|_| {
+                super::super::representations::RepresentationStore::checkpoint_volume_publication()
+            })
+            .transpose()?;
         drop(arena);
         let active = VolumeRegion::new(ARENA_FILE)
             .map_err(|source| io_error("validate active volume arena region", source))?;
+        // Publication may succeed even if its subsequent verification fails.
+        // Every error from here must reopen authority rather than leave old
+        // handles usable; compact() also marks files=None as recovery-required.
+        inner.files = None;
         outbox::commit_volume_replacement(
             Arc::clone(volume),
             temporary,
             active,
+            representation_publication,
             &bundle,
             &self.identity,
             self.limits,
         )?;
+        self.fail_if(super::FaultPoint::AfterCompactionArenaPromote)?;
+        inner.representations = staged_representations;
         self.install_volume_replacement(inner, replacement, Arc::clone(volume))?;
-        if let Some(representations) = inner.representations.as_mut() {
-            let files = live_files_mut(&mut inner.files)?;
-            representations.rebase_compacted_arena(
-                &files.arena,
-                &inner.index,
-                &self.identity,
-                self.limits,
-            )?;
-            representations.checkpoint_volume(volume, self.limits)?;
+        if let Some(representations) = inner.representations.as_ref() {
+            representations.reclaim_checkpoint_volume(volume)?;
         }
         volume
             .sync()
