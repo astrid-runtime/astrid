@@ -55,6 +55,7 @@ pub(super) fn commit_volume_replacement<I: PersistentObjectIdentity>(
     volume: Arc<dyn AstridVolume>,
     source: VolumeRegion,
     destination: VolumeRegion,
+    representation_publication: Option<VolumeMetadataMutation>,
     bundle: &CompactionEvidenceBundle,
     identity: &I,
     limits: RecoveryLimits,
@@ -62,17 +63,19 @@ pub(super) fn commit_volume_replacement<I: PersistentObjectIdentity>(
     let prepared = volume_bundle_region(bundle.commit_id(), PREPARED_SUFFIX)?;
     require_same_volume_bundle(Arc::clone(&volume), &prepared, bundle, identity, limits)?;
     let ready = volume_bundle_region(bundle.commit_id(), READY_SUFFIX)?;
+    let mut mutations = vec![
+        VolumeMetadataMutation::Replace {
+            source,
+            destination,
+        },
+        VolumeMetadataMutation::Rename {
+            source: prepared,
+            destination: ready.clone(),
+        },
+    ];
+    mutations.extend(representation_publication);
     volume
-        .commit_metadata(&[
-            VolumeMetadataMutation::Replace {
-                source,
-                destination,
-            },
-            VolumeMetadataMutation::Rename {
-                source: prepared,
-                destination: ready.clone(),
-            },
-        ])
+        .commit_metadata(&mutations)
         .map_err(|source| io_error("commit volume compaction transaction", source))?;
     volume
         .sync()

@@ -27,6 +27,7 @@ use format::{
 
 mod activation;
 mod authority;
+mod checkpoint;
 mod format;
 mod recovery;
 

@@ -567,6 +567,7 @@ where
                 self.limits,
             )?;
             self.fail_if(FaultPoint::AfterCompactionRepresentationRebase)?;
+            representations.checkpoint_native(self.hosted_directory()?, self.limits)?;
         }
         let arena_bytes_after = replacement.arena_len;
         self.install_replacement(inner, replacement)?;

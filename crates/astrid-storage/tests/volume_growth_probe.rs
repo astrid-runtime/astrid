@@ -6,6 +6,61 @@
 use astrid_storage::volume::{AstridVolume, HostedFileVolume, VolumeRegion};
 
 #[test]
+#[ignore = "sustained disk-write diagnostic; run explicitly"]
+fn sustained_overwrites_cross_checkpoint_boundaries() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("astrid.volume");
+    let region = VolumeRegion::new("objects").unwrap();
+    let writer = HostedFileVolume::open(&path).unwrap();
+    writer.create_region(&region, true).unwrap();
+    for offset in 0..4096 {
+        writer.write_region_at(&region, offset, &[42]).unwrap();
+    }
+    writer.sync().unwrap();
+    let baseline = std::fs::metadata(&path).unwrap().len();
+    let started = std::time::Instant::now();
+    for batch in 1_u64..=120 {
+        for _ in 0..1000 {
+            writer.write_region_at(&region, 0, &[17]).unwrap();
+            writer.sync().unwrap();
+        }
+        let metadata = std::fs::metadata(&path).unwrap();
+        let growth = metadata.len() - baseline;
+        // Stop a regressed implementation before it consumes the host disk.
+        assert!(
+            growth < batch * 1000 * 512,
+            "amplified growth: {growth} after {} commits",
+            batch * 1000
+        );
+        if batch % 20 == 0 {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                eprintln!(
+                    "commits={} elapsed_ms={} logical_bytes=4096 file_bytes={} allocated_bytes={} growth={growth}",
+                    batch * 1000,
+                    started.elapsed().as_millis(),
+                    metadata.len(),
+                    metadata.blocks() * 512
+                );
+            }
+            let copy = temporary.path().join(format!("recovery-{batch}.volume"));
+            std::fs::copy(&path, &copy).unwrap();
+            let recovered = HostedFileVolume::open(&copy).unwrap();
+            let mut bytes = vec![0; 4096];
+            recovered.read_region_at(&region, 0, &mut bytes).unwrap();
+            assert_eq!(bytes[0], 17);
+            assert!(bytes[1..].iter().all(|value| *value == 42));
+        }
+    }
+    let before_idle = std::fs::metadata(&path).unwrap().len();
+    for _ in 0..1000 {
+        writer.sync().unwrap();
+    }
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), before_idle);
+}
+
+#[test]
 fn tiny_overwrite_commits_do_not_rewrite_the_extent_map() {
     for extent_count in [128_u64, 4096] {
         let temporary = tempfile::tempdir().unwrap();
