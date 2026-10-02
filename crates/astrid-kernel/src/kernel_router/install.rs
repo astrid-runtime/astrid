@@ -430,9 +430,6 @@ async fn stage_env_values(
     batch_manifest: Option<&astrid_capsule::manifest::CapsuleManifest>,
     values: &[CapsuleInstallEnv],
 ) -> Result<Option<EnvTransaction>, String> {
-    if values.is_empty() {
-        return Ok(None);
-    }
     let loaded_manifest;
     let manifest = if let Some(manifest) = batch_manifest {
         manifest
@@ -453,7 +450,9 @@ async fn stage_env_values(
         .map_err(|error| format!("resolve durable principal UID: {error}"))?;
     validate_env_values(manifest, values)?;
 
-    // Keep defaults and other install transactions out through commit/rollback.
+    // Keep defaults, inherited grants and other installs out through commit/rollback,
+    // including installs with no environment changes. Package publication must not
+    // race a grant's absence check and inherited configuration copy.
     // Otherwise one rollback can restore another failed install's staged value.
     // Never wait here: activation may itself request an install.
     let default_fence = Arc::clone(&kernel.env_install_fence)
@@ -494,9 +493,6 @@ async fn stage_env_values(
             previous,
             staged,
         });
-    }
-    if snapshots.is_empty() {
-        return Ok(None);
     }
     let (agent, shared) = partition_env_snapshots(snapshots);
     if !apply_env_snapshot_group(kernel, uid, &capsule, &agent, false).await? {

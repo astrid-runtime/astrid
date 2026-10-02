@@ -599,6 +599,196 @@ async fn assigning_capsule_copies_non_secret_install_env_only() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn granting_existing_install_preserves_principal_environment() {
+    let (_dir, kernel) = fixture().await;
+    let capsule = "principal-configured";
+    publish_env_capsule(&kernel, capsule);
+    let principal = pid("configured-agent");
+    assert_success(
+        &super::test_support::dispatch_as_operator(
+            &kernel,
+            &PrincipalId::default(),
+            AdminRequestKind::AgentCreate {
+                name: principal.to_string(),
+                groups: vec![BUILTIN_AGENT.into()],
+                grants: Vec::new(),
+                inherit_from: None,
+                clone_from: None,
+                allow_admin_clone: false,
+            },
+        )
+        .await,
+    );
+    let source_uid = kernel
+        .principal_directory
+        .uid_for(&PrincipalId::default())
+        .unwrap();
+    let target_uid = kernel.principal_directory.uid_for(&principal).unwrap();
+    let store = kernel.principal_store.as_ref().unwrap();
+    let source_owner = astrid_storage::StateOwner::Principal(source_uid);
+    let target_owner = astrid_storage::StateOwner::Principal(target_uid);
+    let source = store
+        .capsules()
+        .get_snapshot(&source_owner, capsule)
+        .unwrap()
+        .unwrap();
+    let source_env = principal_env_store(Arc::clone(&kernel.kv), source_uid, capsule).unwrap();
+    let target_env = principal_env_store(Arc::clone(&kernel.kv), target_uid, capsule).unwrap();
+    set_env(&source_env, "default_only", "must-not-inherit")
+        .await
+        .unwrap();
+    // Pause an explicit install before publication. A concurrent grant must
+    // return without inheriting anything, then retry against the explicit install.
+    let install_fence = Arc::clone(&kernel.env_install_fence)
+        .try_write_owned()
+        .unwrap();
+    assert_grant_retries_during_install(&kernel, &principal, capsule).await;
+    assert!(
+        get_env(&target_env, "default_only")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .capsules()
+            .get_snapshot(&target_owner, capsule)
+            .unwrap()
+            .is_none()
+    );
+    // Model an explicit principal-scoped install before its visibility grant.
+    store
+        .capsules()
+        .install(
+            &target_owner,
+            capsule,
+            source.package(),
+            astrid_storage::CapsuleInstallExpectation::Absent,
+        )
+        .unwrap();
+    drop(install_fence);
+    set_env(&source_env, "temperature", "0.7").await.unwrap();
+    set_env(&source_env, "default_only", "must-not-inherit")
+        .await
+        .unwrap();
+    set_env(&target_env, "temperature", "0.2").await.unwrap();
+    for _ in 0..2 {
+        assert_success(
+            &handlers::dispatch(
+                &kernel,
+                &PrincipalId::default(),
+                AdminRequestKind::AgentModify {
+                    principal: principal.clone(),
+                    add_groups: Vec::new(),
+                    remove_groups: Vec::new(),
+                    add_capsules: vec![capsule.into()],
+                    remove_capsules: Vec::new(),
+                },
+            )
+            .await,
+        );
+        assert_eq!(
+            get_env(&target_env, "temperature")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("0.2")
+        );
+        assert!(
+            get_env(&target_env, "default_only")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+async fn assert_grant_retries_during_install(
+    kernel: &Arc<Kernel>,
+    principal: &PrincipalId,
+    capsule: &str,
+) {
+    let blocked = handlers::dispatch(
+        kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentModify {
+            principal: principal.clone(),
+            add_groups: Vec::new(),
+            remove_groups: Vec::new(),
+            add_capsules: vec![capsule.into()],
+            remove_capsules: Vec::new(),
+        },
+    )
+    .await;
+    assert_error_contains(&blocked, "retry the grant");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conflicting_inherited_environment_cannot_be_bypassed_by_retry() {
+    let (_dir, kernel) = fixture().await;
+    let capsule = "inherit-conflict";
+    publish_env_capsule(&kernel, capsule);
+    let principal = pid("inherit-conflict-agent");
+    assert_success(
+        &super::test_support::dispatch_as_operator(
+            &kernel,
+            &PrincipalId::default(),
+            AdminRequestKind::AgentCreate {
+                name: principal.to_string(),
+                groups: vec![BUILTIN_AGENT.into()],
+                grants: Vec::new(),
+                inherit_from: None,
+                clone_from: None,
+                allow_admin_clone: false,
+            },
+        )
+        .await,
+    );
+    let source_uid = kernel
+        .principal_directory
+        .uid_for(&PrincipalId::default())
+        .unwrap();
+    let target_uid = kernel.principal_directory.uid_for(&principal).unwrap();
+    let source_env = principal_env_store(Arc::clone(&kernel.kv), source_uid, capsule).unwrap();
+    let target_env = principal_env_store(Arc::clone(&kernel.kv), target_uid, capsule).unwrap();
+    set_env(&source_env, "temperature", "0.7").await.unwrap();
+    set_env(&target_env, "temperature", "0.2").await.unwrap();
+    for _ in 0..2 {
+        let result = handlers::dispatch(
+            &kernel,
+            &PrincipalId::default(),
+            AdminRequestKind::AgentModify {
+                principal: principal.clone(),
+                add_groups: Vec::new(),
+                remove_groups: Vec::new(),
+                add_capsules: vec![capsule.into()],
+                remove_capsules: Vec::new(),
+            },
+        )
+        .await;
+        assert_error_contains(&result, "already has a different value");
+        assert!(
+            kernel
+                .principal_store
+                .as_ref()
+                .unwrap()
+                .capsules()
+                .get_snapshot(&astrid_storage::StateOwner::Principal(target_uid), capsule)
+                .unwrap()
+                .is_none(),
+            "failed inheritance must not publish an install"
+        );
+        assert_eq!(
+            get_env(&target_env, "temperature")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("0.2")
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn env_set_unloaded_capsule_accepts_sequential_writes() {
     let (_dir, kernel) = fixture().await;
     let capsule = "sequential-env";

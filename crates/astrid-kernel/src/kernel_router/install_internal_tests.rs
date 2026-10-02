@@ -5,6 +5,45 @@ use astrid_core::PrincipalId;
 use std::fmt::Write as _;
 
 #[tokio::test]
+async fn installs_without_env_changes_keep_the_publication_fence() {
+    let root = tempfile::tempdir().unwrap();
+    let kernel =
+        crate::test_kernel_with_home(astrid_core::dirs::AstridHome::from_path(root.path())).await;
+    let principal = PrincipalId::default();
+    let source = root.path().join("fixture");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("Capsule.toml"),
+        "[package]\nname = 'fixture'\nversion = '1.0.0'\n[env.PLAIN]\ntype = 'text'\n",
+    )
+    .unwrap();
+    let values = [CapsuleInstallEnv {
+        key: "PLAIN".into(),
+        value: "unchanged".into(),
+        kind: EnvValueKind::Text,
+    }];
+    let first = stage_env_values(&kernel, &principal, &source, None, &values)
+        .await
+        .unwrap();
+    drop(first); // Successful publication keeps the staged value.
+    for values in [&[][..], values.as_slice()] {
+        let transaction = stage_env_values(&kernel, &principal, &source, None, values)
+            .await
+            .unwrap()
+            .expect("even a no-op environment must fence package publication");
+        assert!(transaction.snapshots.is_empty());
+        assert!(kernel.env_install_fence.try_write().is_err());
+        assert!(
+            stage_env_values(&kernel, &principal, &source, None, values)
+                .await
+                .is_err()
+        );
+        transaction.rollback(&kernel).await;
+        assert!(kernel.env_install_fence.try_write().is_ok());
+    }
+}
+
+#[tokio::test]
 async fn overlapping_failed_installs_cannot_restore_another_staged_value() {
     let root = tempfile::tempdir().unwrap();
     let kernel =
