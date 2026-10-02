@@ -1361,8 +1361,11 @@ impl Kernel {
         }
 
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let audit_config =
-            crate::audit_retention::load_audit_config(&workspace_root, &workspace_layout);
+        let audit_config = crate::audit_retention::load_audit_config(
+            &workspace_root,
+            home.root(),
+            &workspace_layout,
+        )?;
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         crate::audit_retention::apply_retention_config(&audit_log, &audit_config.retention);
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
