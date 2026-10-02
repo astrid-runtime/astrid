@@ -171,11 +171,26 @@ impl RuntimePrincipalStore {
         ensure_compaction_headroom(&self.engine)?;
         let policy_id = RetentionPolicyId::new(self.engine.identify(&policy));
         let engine = Arc::clone(&self.engine);
+        let kv = Arc::clone(&self.runtime_kv);
         let mut additional_roots = additional_roots;
         additional_roots.extend(self.compaction_read_handle_roots().into_iter().map(
             |(_, object)| CompactionRetainedRoot::new(CompactionRootKind::ReadHandle, object),
         ));
         tokio::task::spawn_blocking(move || {
+            // A below-threshold delta chain still owns overwritten values.
+            // Publish equivalent checkpoint roots before capturing GC facts;
+            // never remove predecessor records from the live closure directly.
+            prepare_with_headroom(
+                || ensure_compaction_headroom(&engine),
+                || {
+                    for (owner, _) in engine.roots().map_err(|error| {
+                        StorageError::Connection(format!("enumerate KV compaction roots: {error}"))
+                    })? {
+                        kv.checkpoint_before_compaction(owner)?;
+                    }
+                    Ok(())
+                },
+            )?;
             let retention =
                 compaction_retention(&engine, operation_contract, policy_id, additional_roots)
                     .map_err(|error| {
@@ -237,6 +252,18 @@ impl RuntimePrincipalStore {
 
 const COMPACTION_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
 
+fn prepare_with_headroom(
+    check: impl Fn() -> StorageResult<()>,
+    prepare: impl FnOnce() -> StorageResult<()>,
+) -> StorageResult<()> {
+    // Check again on the worker: queueing may have consumed time and capacity.
+    check()?;
+    prepare()?;
+    // Preparation appends authoritative objects and invalidates admission's
+    // capacity estimate. Failure here must prevent destructive GC from starting.
+    check()
+}
+
 fn ensure_compaction_headroom(engine: &RuntimeEngine) -> StorageResult<()> {
     let (available, arena_bytes) = engine
         .compaction_capacity()
@@ -274,5 +301,35 @@ mod tests {
     #[test]
     fn compaction_accepts_exact_headroom_boundary() {
         assert!(validate_compaction_headroom(64 * 1024 * 1024 + 7, 7).is_ok());
+    }
+
+    #[test]
+    fn checkpoint_growth_invalidates_preparation_headroom() {
+        let available = std::cell::Cell::new(super::COMPACTION_HEADROOM_BYTES.strict_add(4096));
+        let arena = std::cell::Cell::new(4096);
+        let checks = std::cell::Cell::new(0_u32);
+        let result = super::prepare_with_headroom(
+            || {
+                checks.set(checks.get().strict_add(1));
+                validate_compaction_headroom(available.get(), arena.get())
+            },
+            || {
+                assert_eq!(checks.get(), 1);
+                available.set(available.get().strict_sub(512));
+                arena.set(arena.get().strict_add(512));
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(checks.get(), 2);
+    }
+
+    #[test]
+    fn refused_headroom_does_not_start_checkpoint_preparation() {
+        let result = super::prepare_with_headroom(
+            || validate_compaction_headroom(0, 4096),
+            || panic!("preparation ran after failed admission"),
+        );
+        assert!(result.is_err());
     }
 }
