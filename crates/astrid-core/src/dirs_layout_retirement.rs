@@ -135,6 +135,31 @@ pub(super) fn delete_legacy_tree(path: &Path, root_device: u64) -> io::Result<()
     // Flush the directory's child removals before removing the directory
     // entry itself. The caller also flushes the containing `var/` directory.
     sync_directory(path)?;
+    remove_retired_directory(path)
+}
+
+fn remove_retired_directory(path: &Path) -> io::Result<()> {
+    let error = match std::fs::remove_dir(path) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => error,
+        Err(error) => return Err(error),
+    };
+    // Finder can recreate its metadata after the validated tree walk. Retry
+    // only that case; never sweep a newly published runtime generation. One
+    // retry also prevents a persistent writer from keeping stop in a loop.
+    crate::platform_fs::verify_no_redirects(path)?;
+    let entries = std::fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+    if entries.len() != 1 || entries[0].file_name() != ".DS_Store" {
+        return Err(error);
+    }
+    let metadata_path = entries[0].path();
+    let metadata = std::fs::symlink_metadata(&metadata_path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(error);
+    }
+    crate::platform_fs::verify_no_redirects(&metadata_path)?;
+    std::fs::remove_file(metadata_path)?;
+    sync_directory(path)?;
     std::fs::remove_dir(path)
 }
 
@@ -329,4 +354,58 @@ pub(super) fn sync_directory(path: &Path) -> io::Result<()> {
 #[allow(clippy::unnecessary_wraps)]
 pub(super) fn sync_directory(_path: &Path) -> io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod finder_tests {
+    use super::remove_retired_directory;
+
+    #[test]
+    fn finder_metadata_created_after_tree_walk_does_not_block_retirement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("run");
+        std::fs::create_dir(&directory).unwrap();
+        // Model Finder writing after delete_legacy_tree's directory iteration.
+        std::fs::write(directory.join(".DS_Store"), b"Finder metadata").unwrap();
+        remove_retired_directory(&directory).unwrap();
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn late_runtime_state_is_not_deleted_or_ignored() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("run");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join(".DS_Store"), b"Finder metadata").unwrap();
+        std::fs::write(directory.join("system.ready"), b"new generation").unwrap();
+        assert!(remove_retired_directory(&directory).is_err());
+        assert_eq!(
+            std::fs::read(directory.join("system.ready")).unwrap(),
+            b"new generation"
+        );
+        assert!(directory.join(".DS_Store").exists());
+    }
+
+    #[test]
+    fn directory_named_like_finder_metadata_is_not_ignored() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("run");
+        std::fs::create_dir_all(directory.join(".DS_Store")).unwrap();
+        assert!(remove_retired_directory(&directory).is_err());
+        assert!(directory.join(".DS_Store").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finder_metadata_symlink_is_not_followed_or_removed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("run");
+        std::fs::create_dir(&directory).unwrap();
+        let target = temporary.path().join("keep");
+        std::fs::write(&target, b"preserve").unwrap();
+        std::os::unix::fs::symlink(&target, directory.join(".DS_Store")).unwrap();
+        assert!(remove_retired_directory(&directory).is_err());
+        assert!(directory.join(".DS_Store").is_symlink());
+        assert_eq!(std::fs::read(target).unwrap(), b"preserve");
+    }
 }
