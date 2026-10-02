@@ -172,6 +172,29 @@ mod tests {
         assert!(RuntimeLifecycleGuard::acquire(&home).is_ok());
     }
 
+    #[tokio::test]
+    async fn finder_metadata_after_stop_does_not_leave_staging_on_repeated_finish() {
+        let parent = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(parent.path().join("runtime"));
+        let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|_: &StateOwner| Ok(None));
+        let store = open_runtime_principal_store(&home, quota).await.unwrap();
+        store.publish_runtime_projection(&home).unwrap();
+        drop(store);
+        RuntimeLifecycleGuard::acquire(&home)
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        std::fs::write(home.root().join(".DS_Store"), b"Finder metadata").unwrap();
+        RuntimeLifecycleGuard::acquire(&home)
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        assert!(!home.root().join("var").exists());
+        assert!(home.storage_volume_path().is_file());
+    }
+
     #[test]
     fn different_temp_process_cannot_acquire_fence() {
         let Some(root) = std::env::var_os("ASTRID_TEST_LIFECYCLE_ROOT") else {

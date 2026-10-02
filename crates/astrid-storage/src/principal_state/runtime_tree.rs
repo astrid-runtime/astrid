@@ -140,7 +140,7 @@ fn collect_files(
         // regular files that make up the runtime snapshot.
         if let Some(relative_text) = relative.to_str() {
             let relative_text = normalize_relative_path(relative_text);
-            if is_excluded(&relative_text) {
+            if is_excluded(&relative_text) || is_finder_metadata(&relative_text, &metadata) {
                 continue;
             }
             if metadata.is_dir() {
@@ -235,6 +235,13 @@ pub(super) fn is_excluded(relative: &str) -> bool {
         || relative == SOCKET_PATH
         || relative == MIGRATING_VOLUME
         || TRANSACTION_STAGING_PATHS.contains(&relative)
+}
+
+fn is_finder_metadata(relative: &str, metadata: &std::fs::Metadata) -> bool {
+    // Finder may write root presentation metadata after clean retirement.
+    // It conveys no runtime authority. Redirects are rejected before this
+    // check, and similarly named directories are not excluded.
+    relative == ".DS_Store" && metadata.is_file()
 }
 
 /// Replace durable host files with volume-backed running projections.
@@ -926,7 +933,7 @@ fn validate_surviving_projection(root: &Path, directory: &Path) -> StorageResult
             .to_str()
             .ok_or_else(|| tree_error(&path, "projection path is not valid UTF-8".to_owned()))?;
         let relative = normalize_relative_path(relative);
-        if is_excluded(relative.as_str()) {
+        if is_excluded(relative.as_str()) || is_finder_metadata(relative.as_str(), &metadata) {
             continue;
         }
         if metadata.is_dir() {
