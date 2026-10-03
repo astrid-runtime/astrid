@@ -4,6 +4,26 @@ use astrid_capsule::user_cpu::UserCpuAccounting;
 use astrid_storage::{OwnershipStore, PrincipalDirectory};
 use std::sync::Arc;
 
+pub(crate) async fn execution_throttle(
+    accounting: &UserCpuAccounting,
+    profiles: &astrid_capsule::profile_cache::PrincipalProfileCache,
+    groups: &arc_swap::ArcSwap<astrid_core::GroupConfig>,
+    principal: &astrid_core::PrincipalId,
+) -> Result<Option<astrid_capsule::user_cpu::throttle::ExecutionThrottle>, String> {
+    // Preserve setup-free installs and avoid imposing a new profile lookup
+    // on homes which have no configured user allowance.
+    if accounting.resolve(principal).await?.is_none() {
+        return Ok(None);
+    }
+    let profile = profiles
+        .resolve(principal)
+        .map_err(|error| error.to_string())?;
+    let groups = groups.load_full();
+    let rate =
+        astrid_capsule::engine::wasm::cpu_rate_budget(Some(&profile), Some(&groups), principal);
+    accounting.configured_throttle(principal, rate).await
+}
+
 #[cfg(test)]
 mod tests;
 

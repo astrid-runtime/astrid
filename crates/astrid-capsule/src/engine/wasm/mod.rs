@@ -60,6 +60,8 @@ mod interruption_tests;
 #[cfg(test)]
 #[path = "lifecycle_audit_tests.rs"]
 mod lifecycle_audit_tests;
+#[cfg(test)]
+mod lifecycle_cpu_tests;
 pub mod limits;
 mod pool;
 mod storage_vfs;
@@ -1071,7 +1073,7 @@ fn cpu_rate_deny(
 ///
 /// `0` means unlimited (the capability-driven exemption set). A bounded caller
 /// uses its profile quota, or the process default when no cache is configured.
-fn cpu_rate_budget(
+pub fn cpu_rate_budget(
     invocation_profile: Option<&astrid_core::profile::PrincipalProfile>,
     group_config: Option<&astrid_core::GroupConfig>,
     principal: &astrid_core::PrincipalId,
@@ -3950,8 +3952,8 @@ pub struct LifecycleConfig {
 ///
 /// Kept separate from [`LifecycleConfig`] so existing callers constructing that
 /// public config retain source compatibility. Lifecycle execution is a
-/// one-shot context: this carries identity and filesystem lookup roots, not a
-/// kernel profile, quota ledger, or persistent runtime accounting handle.
+/// one-shot context: identity, filesystem roots, and optional kernel-owned
+/// execution accounting. Standalone callers retain their existing defaults.
 #[derive(Clone)]
 pub struct LifecyclePrincipalContext {
     principal: astrid_core::PrincipalId,
@@ -3959,6 +3961,7 @@ pub struct LifecyclePrincipalContext {
     file_secret_root: Option<PathBuf>,
     principal_directory: astrid_storage::PrincipalDirectory,
     principal_store: Option<astrid_storage::RuntimePrincipalStore>,
+    execution_throttle: Option<crate::user_cpu::throttle::ExecutionThrottle>,
 }
 
 impl LifecyclePrincipalContext {
@@ -3972,7 +3975,19 @@ impl LifecyclePrincipalContext {
             file_secret_root: None,
             principal_directory: astrid_storage::PrincipalDirectory::default(),
             principal_store: None,
+            execution_throttle: None,
         }
+    }
+
+    /// Bind the kernel's existing shared user/principal ledger. Never create a
+    /// fresh allowance merely because this is an install or upgrade hook.
+    #[must_use]
+    pub fn with_execution_throttle(
+        mut self,
+        throttle: Option<crate::user_cpu::throttle::ExecutionThrottle>,
+    ) -> Self {
+        self.execution_throttle = throttle;
+        self
     }
 
     /// Supply the manifest-declared secret-typed env key set.
@@ -4016,6 +4031,7 @@ async fn build_lifecycle_host_state(
         file_secret_root,
         principal_directory,
         principal_store,
+        execution_throttle: _,
     } = context;
 
     let vfs = astrid_vfs::HostVfs::new();
@@ -4245,6 +4261,7 @@ pub async fn run_lifecycle_for_principal(
         return Ok(());
     }
 
+    let execution_throttle = context.execution_throttle.clone();
     let host_state =
         build_lifecycle_host_state(&cfg, phase, context, crate::MemoryLedger::default()).await?;
 
@@ -4257,13 +4274,17 @@ pub async fn run_lifecycle_for_principal(
     let deadline_ticks = LIFECYCLE_TIMEOUT_SECS * 10; // 100ms per tick
     store.set_epoch_deadline(deadline_ticks);
     // Fuel is engine-wide (consume_fuel), so a fresh Store starts at 0 fuel and
-    // would trap on the first instruction. Lifecycle hooks are operator-driven
-    // and human-interactive (elicit) — they are bounded by the generous epoch
-    // safety-net deadline above, NOT by a CPU rate — so fuel them to
-    // effectively-infinite. The epoch deadline remains the runaway guard.
+    // would trap on the first instruction. Keep a large measurement counter:
+    // configured lifecycle execution repays shared user debt through the same
+    // call-hook sampler as active capsules. The epoch safety-net still bounds
+    // runaway hooks, including unconfigured standalone callers.
     store.set_fuel(u64::MAX).map_err(|e| {
         CapsuleError::UnsupportedEntryPoint(format!("Failed to set lifecycle fuel: {e}"))
     })?;
+    let mut store =
+        accounted_store::AccountedStore::new(store, execution_throttle).map_err(|error| {
+            CapsuleError::ExecutionFailed(format!("bind lifecycle CPU accounting: {error}"))
+        })?;
     let _epoch_guard = spawn_epoch_ticker(&wt_engine);
 
     let mut linker: Linker<HostState> = Linker::new(&wt_engine);

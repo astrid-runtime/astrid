@@ -141,6 +141,17 @@ pub(super) async fn handle_install_capsule(
         return KernelResponse::Error(error);
     }
 
+    let lifecycle_cpu = match crate::user_resources::execution_throttle(
+        &kernel.user_cpu,
+        &kernel.profile_cache,
+        &kernel.groups,
+        target,
+    )
+    .await
+    {
+        Ok(throttle) => throttle,
+        Err(error) => return KernelResponse::Error(error),
+    };
     let env_transaction = match stage_env_values(
         kernel,
         target,
@@ -164,6 +175,7 @@ pub(super) async fn handle_install_capsule(
         authority,
         env_transaction,
         expected_package_generation,
+        lifecycle_cpu,
     )
     .await
     {
@@ -184,9 +196,16 @@ async fn install_and_activate(
     authority: CapsuleInstallAuthority,
     env_transaction: Option<EnvTransaction>,
     expected_package_generation: Option<astrid_storage::CapsulePackageGeneration>,
+    lifecycle_cpu: Option<astrid_capsule::user_cpu::throttle::ExecutionThrottle>,
 ) -> Result<InstallOutput, String> {
     let home = kernel.astrid_home.clone();
-    let options = daemon_install_options(kernel, source, provenance, expected_package_generation);
+    let options = daemon_install_options(
+        kernel,
+        source,
+        provenance,
+        expected_package_generation,
+        lifecycle_cpu,
+    );
     let install = match batch_archive {
         Some(archive) => {
             super::install_batch_archive::run_authorized_archive_install(
@@ -230,6 +249,7 @@ fn daemon_install_options(
     source: &str,
     provenance: Option<&CapsuleInstallProvenance>,
     expected_package_generation: Option<astrid_storage::CapsulePackageGeneration>,
+    lifecycle_cpu: Option<astrid_capsule::user_cpu::throttle::ExecutionThrottle>,
 ) -> InstallOptions {
     InstallOptions {
         workspace: false,
@@ -245,6 +265,7 @@ fn daemon_install_options(
         // Install and upgrade hooks record their host calls (file writes,
         // network, HTTP) on the signed audit log like a running capsule.
         audit_sink: Some(Arc::new(kernel.audit_sink.as_ref().clone())),
+        lifecycle_cpu,
     }
 }
 

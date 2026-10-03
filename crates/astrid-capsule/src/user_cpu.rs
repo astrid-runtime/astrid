@@ -118,6 +118,20 @@ impl UserCpuAccounting {
             self.resolve(principal).await?,
         ))
     }
+
+    /// Resolve a shared execution throttle only when this user's aggregate
+    /// budget is configured. Personal defaults retain their existing policy.
+    ///
+    /// # Errors
+    /// Configured accounting refuses missing or ambiguous attribution.
+    pub async fn configured_throttle(
+        &self,
+        principal: &PrincipalId,
+        principal_limit: u64,
+    ) -> Result<Option<throttle::ExecutionThrottle>, String> {
+        let throttle = self.execution_throttle(principal, principal_limit).await?;
+        Ok(throttle.has_user_limit().then_some(throttle))
+    }
 }
 
 impl UserCpuAllocation {

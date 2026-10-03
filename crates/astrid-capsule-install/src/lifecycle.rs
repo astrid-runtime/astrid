@@ -33,6 +33,49 @@ use astrid_core::dirs::AstridHome;
 use astrid_events::EventBus;
 use astrid_storage::RuntimePrincipalStore;
 
+#[derive(Default)]
+pub(crate) struct LifecycleServices {
+    pub(crate) event_bus: Option<EventBus>,
+    pub(crate) audit_sink: Option<Arc<dyn HostAuditSink>>,
+    pub(crate) cpu: Option<astrid_capsule::user_cpu::throttle::ExecutionThrottle>,
+}
+
+pub(crate) struct InstallLifecycle<'a> {
+    pub(crate) target_dir: &'a Path,
+    pub(crate) wasm_bytes: Vec<u8>,
+    pub(crate) manifest: &'a CapsuleManifest,
+    pub(crate) home: &'a AstridHome,
+    pub(crate) target_principal: &'a PrincipalId,
+    pub(crate) storage: Option<&'a RuntimePrincipalStore>,
+    pub(crate) phase: LifecyclePhase,
+    pub(crate) previous_version: Option<&'a str>,
+    pub(crate) services: LifecycleServices,
+}
+
+pub(crate) fn run_install_lifecycle(request: InstallLifecycle<'_>) -> anyhow::Result<()> {
+    let uid = request
+        .storage
+        .map(|storage| {
+            storage
+                .principal_directory()
+                .uid_for(request.target_principal)
+        })
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("resolve durable principal UID: {error}"))?;
+    run_lifecycle_in_scope(
+        request.target_dir,
+        request.wasm_bytes,
+        request.manifest,
+        Some(request.home),
+        request.target_principal,
+        uid,
+        request.storage.cloned(),
+        request.phase,
+        request.previous_version,
+        request.services,
+    )
+}
+
 /// Resolve operator `astrid:http` host policy from the global `[http]` config
 /// section into the typed [`HttpLimits`](astrid_capsule::HttpLimits) for the
 /// lifecycle hook's `HostState`. `[http]` is operator-only global policy, so the
@@ -98,7 +141,10 @@ pub fn run_lifecycle(
         None,
         phase,
         previous_version,
-        (external_bus, None),
+        LifecycleServices {
+            event_bus: external_bus,
+            ..LifecycleServices::default()
+        },
     )
 }
 
@@ -133,7 +179,11 @@ pub fn run_lifecycle_for_principal(
         None,
         phase,
         previous_version,
-        (external_bus, audit_sink),
+        LifecycleServices {
+            event_bus: external_bus,
+            audit_sink,
+            ..LifecycleServices::default()
+        },
     )
 }
 
@@ -168,7 +218,11 @@ pub fn run_lifecycle_for_principal_with_storage(
         Some(storage.clone()),
         phase,
         previous_version,
-        (external_bus, audit_sink),
+        LifecycleServices {
+            event_bus: external_bus,
+            audit_sink,
+            ..LifecycleServices::default()
+        },
     )
 }
 
@@ -183,8 +237,13 @@ fn run_lifecycle_in_scope(
     principal_storage: Option<RuntimePrincipalStore>,
     phase: LifecyclePhase,
     previous_version: Option<&str>,
-    (external_bus, audit_sink): (Option<EventBus>, Option<Arc<dyn HostAuditSink>>),
+    services: LifecycleServices,
 ) -> anyhow::Result<()> {
+    let LifecycleServices {
+        event_bus: external_bus,
+        audit_sink,
+        cpu,
+    } = services;
     if principal_storage.is_none() && !manifest.env.is_empty() {
         anyhow::bail!(
             "lifecycle manifest declares environment state but no durable principal UID binding was supplied"
@@ -253,7 +312,8 @@ fn run_lifecycle_in_scope(
         .collect();
     let principal_context =
         astrid_capsule::engine::wasm::LifecyclePrincipalContext::new(target_principal.clone())
-            .with_secret_env(secret_env);
+            .with_secret_env(secret_env)
+            .with_execution_throttle(cpu);
     let principal_context = if let Some(storage) = principal_storage {
         let directory = storage.principal_directory();
         principal_context.with_principal_storage(storage, directory)
@@ -284,22 +344,16 @@ fn run_lifecycle_in_scope(
     // `engine::wasm::run_lifecycle` is async — async wasmtime requires
     // it to `.await` instantiate_async / call_async. Drive the future
     // through the available runtime handle.
+    let execution = astrid_capsule::engine::wasm::run_lifecycle_for_principal(
+        cfg,
+        phase,
+        previous_version,
+        principal_context,
+    );
     let result = if let Some(rt) = &owned_rt {
-        rt.block_on(astrid_capsule::engine::wasm::run_lifecycle_for_principal(
-            cfg,
-            phase,
-            previous_version,
-            principal_context,
-        ))
+        rt.block_on(execution)
     } else {
-        tokio::task::block_in_place(|| {
-            handle.block_on(astrid_capsule::engine::wasm::run_lifecycle_for_principal(
-                cfg,
-                phase,
-                previous_version,
-                principal_context,
-            ))
-        })
+        tokio::task::block_in_place(|| handle.block_on(execution))
     };
 
     drop(event_bus);
