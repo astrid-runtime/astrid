@@ -383,7 +383,12 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
             target,
             workspace,
             approve_untrusted,
+            check,
+            json,
         } => {
+            if check {
+                return commands::capsule::updates::check(target.as_deref(), json).await;
+            }
             commands::capsule::install::update_capsule(
                 target.as_deref(),
                 workspace,

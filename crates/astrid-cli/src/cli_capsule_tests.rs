@@ -51,6 +51,8 @@ fn capsule_update_parses_one_shot_untrusted_approval() {
                 target: Some(ref target),
                 workspace: false,
                 approve_untrusted: true,
+                check: false,
+                json: false,
             },
         }) if target == "example"
     ));
