@@ -4,6 +4,8 @@ use astrid_capsule_types::fuel_ledger::{FuelRateLimiter, FuelReservation};
 use astrid_core::{PrincipalId, UserUid};
 use astrid_storage::{OwnershipStore, PrincipalDirectory};
 
+pub mod execution;
+
 #[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
 mod tests;
 use std::collections::BTreeMap;

@@ -3,6 +3,8 @@ use astrid_core::{
     FleetGenesis, FleetIdentity, PrincipalOwnership, PrincipalUid, UserGenesis, UserIdentity,
 };
 
+mod execution_tests;
+
 async fn accounting() -> UserCpuAccounting {
     let directory = PrincipalDirectory::default();
     let storage = Arc::new(
