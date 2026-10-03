@@ -6,7 +6,10 @@ use astrid_core::PrincipalId;
 
 use astrid_core::identity::PrincipalUid;
 use astrid_storage::env::{env_key, principal_capsule_namespace, principal_env_store, read_env};
-use astrid_storage::{KvBatchCondition, KvBatchMutation, KvEntryKey, KvMutationBatch};
+use astrid_storage::{
+    KvBatchCondition, KvBatchMutation, KvEntryKey, KvMutationBatch, KvStore,
+    MAX_KV_BATCH_OPERATIONS, MAX_KV_BATCH_PAYLOAD_BYTES,
+};
 
 pub(super) async fn materialize_added_capsule_installs(
     kernel: &Arc<crate::Kernel>,
@@ -89,7 +92,6 @@ async fn inherit_and_publish(
         .await
         .map_err(|error| error.to_string())?;
     let namespace = principal_capsule_namespace(target, capsule);
-    let mut conditions = Vec::new();
     let mut inserted = Vec::new();
     for (field, value) in values {
         let key = env_key(&field);
@@ -105,57 +107,117 @@ async fn inherit_and_publish(
             ));
         }
         let key = KvEntryKey::new(namespace.clone(), key).map_err(|error| error.to_string())?;
-        conditions.push(KvBatchCondition::ValueEquals {
-            key: key.clone(),
-            expected: previous.clone(),
-        });
         if previous.is_none() {
             inserted.push((key, value));
         }
     }
-    if !inserted.is_empty() {
-        let mutations: Vec<_> = inserted
-            .iter()
-            .map(|(key, value)| KvBatchMutation::Set {
+    let batches = inheritance_batches(inserted)?;
+    apply_inheritance(kernel.kv.as_ref(), &batches, publish).await
+}
+
+/// Partition by the storage contract, not by an independent environment cap.
+/// Construct every batch before writing so invalid individual entries cannot
+/// leave a partial copy. The caller's locks exclude control-namespace writers;
+/// guests cannot access this namespace, and the install stays unpublished until
+/// every batch succeeds. This is staged publication, not a multi-batch KV transaction.
+fn inheritance_batches(
+    entries: Vec<(KvEntryKey, Vec<u8>)>,
+) -> Result<Vec<KvMutationBatch>, String> {
+    let mut batches = Vec::new();
+    let mut conditions = Vec::new();
+    let mut mutations = Vec::new();
+    let mut payload = 0_usize;
+    for (key, value) in entries {
+        let entry = KvMutationBatch::new(
+            [KvBatchCondition::ValueEquals {
                 key: key.clone(),
-                value: value.clone(),
-            })
-            .collect();
-        let batch =
-            KvMutationBatch::new(conditions, mutations).map_err(|error| error.to_string())?;
-        if !kernel
-            .kv
-            .apply_batch(&batch)
-            .await
-            .map_err(|error| error.to_string())?
-            .applied
+                expected: None,
+            }],
+            [KvBatchMutation::Set { key, value }],
+        )
+        .map_err(|error| error.to_string())?;
+        if conditions
+            .len()
+            .strict_add(mutations.len())
+            .strict_add(entry.operation_count())
+            > MAX_KV_BATCH_OPERATIONS
+            || payload.strict_add(entry.payload_bytes()) > MAX_KV_BATCH_PAYLOAD_BYTES
         {
-            return Err(
-                "destination environment changed during inheritance; retry the grant".into(),
+            batches.push(
+                KvMutationBatch::new(
+                    std::mem::take(&mut conditions),
+                    std::mem::take(&mut mutations),
+                )
+                .map_err(|error| error.to_string())?,
             );
+            payload = 0;
         }
+        payload = payload.strict_add(entry.payload_bytes());
+        conditions.extend_from_slice(entry.conditions());
+        mutations.extend_from_slice(entry.mutations());
+    }
+    if !mutations.is_empty() {
+        batches
+            .push(KvMutationBatch::new(conditions, mutations).map_err(|error| error.to_string())?);
+    }
+    Ok(batches)
+}
+
+async fn apply_inheritance(
+    kv: &dyn KvStore,
+    batches: &[KvMutationBatch],
+    publish: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    for (index, batch) in batches.iter().enumerate() {
+        let result = match kv.apply_batch(batch).await {
+            Ok(outcome) if outcome.applied => continue,
+            Ok(_) => "destination environment changed during inheritance; retry the grant".into(),
+            Err(error) => format!("copy inherited environment: {error}"),
+        };
+        rollback_inheritance(kv, &batches[..index])
+            .await
+            .map_err(|rollback| format!("{result}; {rollback}"))?;
+        return Err(result);
     }
     if let Err(error) = publish() {
-        // Delete only bytes introduced by this attempt, never pre-existing or
-        // subsequently changed values. Surface rollback I/O failures explicitly.
-        for (key, value) in inserted {
-            let rollback = KvMutationBatch::new(
-                vec![KvBatchCondition::ValueEquals {
-                    key: key.clone(),
-                    expected: Some(value),
-                }],
-                vec![KvBatchMutation::Delete { key }],
-            )
-            .map_err(|rollback| format!("{error}; construct environment rollback: {rollback}"))?;
-            kernel
-                .kv
-                .apply_batch(&rollback)
-                .await
-                .map_err(|rollback| format!("{error}; environment rollback failed: {rollback}"))?;
-        }
+        rollback_inheritance(kv, batches)
+            .await
+            .map_err(|rollback| format!("{error}; {rollback}"))?;
         return Err(error);
     }
     Ok(())
+}
+
+async fn rollback_inheritance(kv: &dyn KvStore, batches: &[KvMutationBatch]) -> Result<(), String> {
+    // Delete only bytes introduced by successful batches, never pre-existing or
+    // subsequently changed values. Attempt every cleanup even if one fails.
+    let mut errors = Vec::new();
+    for batch in batches {
+        for mutation in batch.mutations() {
+            let KvBatchMutation::Set { key, value } = mutation else {
+                continue;
+            };
+            let rollback = KvMutationBatch::new(
+                vec![KvBatchCondition::ValueEquals {
+                    key: key.clone(),
+                    expected: Some(value.clone()),
+                }],
+                vec![KvBatchMutation::Delete { key: key.clone() }],
+            )
+            .map_err(|error| format!("construct environment rollback: {error}"))?;
+            if let Err(error) = kv.apply_batch(&rollback).await {
+                errors.push(error.to_string());
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "environment rollback failed: {}",
+            errors.join("; ")
+        ))
+    }
 }
 
 #[cfg(test)]

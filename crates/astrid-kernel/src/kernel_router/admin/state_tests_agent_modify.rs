@@ -529,6 +529,13 @@ async fn assigning_capsule_copies_non_secret_install_env_only() {
         .unwrap();
     let source_env = principal_env_store(Arc::clone(&kernel.kv), default_uid, capsule).unwrap();
     set_env(&source_env, "temperature", "0.7").await.unwrap();
+    // Inheritance must not impose the KV transaction's 512-field ceiling on
+    // environments populated by individually valid configuration writes.
+    for index in 0..512 {
+        set_env(&source_env, &format!("field_{index}"), "inherited")
+            .await
+            .unwrap();
+    }
     let source_secret =
         principal_secret_store(Arc::clone(&kernel.kv), default_uid, capsule).unwrap();
     source_secret
@@ -579,6 +586,13 @@ async fn assigning_capsule_copies_non_secret_install_env_only() {
 
     let target_uid = kernel.principal_directory.uid_for(&principal).unwrap();
     let target_env = principal_env_store(Arc::clone(&kernel.kv), target_uid, capsule).unwrap();
+    assert_eq!(
+        astrid_storage::env::read_env(&target_env)
+            .await
+            .unwrap()
+            .len(),
+        513
+    );
     assert_eq!(
         get_env(&target_env, "temperature")
             .await
