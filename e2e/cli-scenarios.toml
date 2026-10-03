@@ -220,6 +220,12 @@ status = "covered"
 mode = "mutating"
 principal = "admin"
 
+[commands."quota assign-user"]
+scenario = "quota_user_recovery"
+status = "mapped"
+mode = "mutating"
+principal = "admin"
+
 [commands."invite issue"]
 scenario = "invite_lifecycle"
 status = "covered"

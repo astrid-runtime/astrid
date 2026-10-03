@@ -474,6 +474,16 @@ denial = ["regular agent cannot read or write another principal's quota"]
 state = ["quota state is principal-scoped and does not cross homes"]
 evidence = ["quota CLI/HTTP artifacts and secondary-home isolation assertions"]
 
+[scenarios.quota_user_recovery]
+status = "mapped"
+surfaces = ["cli"]
+auth = ["global quota:set; self-scoped authority is insufficient"]
+success = ["operator assigns a missing accountable user; repeated same assignment is idempotent"]
+denial = ["regular principal cannot assign its own payer; existing payer cannot be replaced"]
+state = ["rejected assignment preserves the existing accountable user"]
+evidence = ["CLI denial transcripts and kernel assignment regression tests"]
+remaining = ["execute successful recovery and persistence through the authenticated CLI with discoverable user UID"]
+
 [scenarios.remote_agent_stub]
 status = "covered"
 surfaces = ["cli"]
