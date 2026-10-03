@@ -18,7 +18,10 @@ enum SetError {
         required: &'static str,
         reason: String,
     },
-    Failed(String),
+    Failed {
+        required: &'static str,
+        reason: String,
+    },
 }
 
 pub(in crate::kernel_router::admin) async fn quota_set(
@@ -33,11 +36,6 @@ pub(in crate::kernel_router::admin) async fn quota_set(
         principal: principal.clone(),
         quotas: quotas.clone(),
     });
-    let initial_cap = if caller == &principal {
-        "self:quota:set"
-    } else {
-        "quota:set"
-    };
     let result = apply(
         kernel,
         caller,
@@ -64,8 +62,8 @@ pub(in crate::kernel_router::admin) async fn quota_set(
             AuditOutcome::failure(&reason),
             err_bad_input(reason),
         ),
-        Err(SetError::Failed(reason)) => (
-            initial_cap,
+        Err(SetError::Failed { required, reason }) => (
+            required,
             AuthorizationProof::System {
                 reason: format!("quota request failed validation or persistence for {caller}"),
             },
@@ -98,17 +96,20 @@ async fn apply(
     principal: PrincipalId,
     quotas: Quotas,
 ) -> Result<&'static str, SetError> {
-    // Validate before taking the write lock — quick reject on bad input.
-    if let Err(e) = quotas.validate() {
-        return Err(SetError::Failed(format!("quotas rejected: {e}")));
-    }
-
-    let _guard = kernel.admin_write_lock.lock().await;
     let required = if caller == &principal {
         "self:quota:set"
     } else {
         "quota:set"
     };
+    // Validate before taking the write lock — quick reject on bad input.
+    if let Err(e) = quotas.validate() {
+        return Err(SetError::Failed {
+            required,
+            reason: format!("quotas rejected: {e}"),
+        });
+    }
+
+    let _guard = kernel.admin_write_lock.lock().await;
     let resolved;
     let authorization = if let Some(authorization) = authorization {
         authorization
@@ -133,14 +134,18 @@ async fn apply(
     }
     let path = principal_profile_path(kernel, &principal);
     if let Err(msg) = require_principal_exists(&principal, &path) {
-        return Err(SetError::Failed(msg));
+        return Err(SetError::Failed {
+            required,
+            reason: msg,
+        });
     }
     let mut profile = match PrincipalProfile::load_from_path(&path) {
         Ok(p) => p,
         Err(e) => {
-            return Err(SetError::Failed(format!(
-                "profile error for {principal}: {e}"
-            )));
+            return Err(SetError::Failed {
+                required,
+                reason: format!("profile error for {principal}: {e}"),
+            });
         },
     };
     // Self authority can attenuate an allocation, not mint resources. Compare
@@ -160,9 +165,10 @@ async fn apply(
     }
     profile.quotas = quotas;
     if let Err(e) = profile.save_to_path(&path) {
-        return Err(SetError::Failed(format!(
-            "profile error for {principal}: {e}"
-        )));
+        return Err(SetError::Failed {
+            required,
+            reason: format!("profile error for {principal}: {e}"),
+        });
     }
     kernel.profile_cache.invalidate(&principal);
     Ok(required)
