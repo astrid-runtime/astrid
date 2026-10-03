@@ -8,6 +8,146 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ## [Unreleased]
 
+## [2026.9.5] - Unreleased
+
+### Fixed
+
+- Treat completed nonzero capsule sleeps as cooperative run-loop progress, so
+  the CPU watchdog no longer interrupts legitimate retry and polling loops while
+  zero-duration sleeps and CPU-spinning loops remain bounded.
+
+  Closes #1974
+
+- Record capsule host calls on the audit chain in call order and account for
+  every call. Each principal's calls are appended in the order they were made;
+  consecutive calls share one signed entry that counts them, keeps the first
+  call of each class and outcome, gives the first and last call times, and
+  commits to every call through a hash fold defined in
+  `astrid_audit::host_call`. Calls that meet a full host-audit queue are no
+  longer dropped with only a health counter: they are counted in a signed loss
+  entry (`HostCallLoss`) at their place in the chain. When the daemon stops
+  without draining its queue, the next start writes a signed gap entry
+  (`HostCallGap`) into every chain the stopped run wrote to and into the
+  session's system chain.
+
+  Add `audit.host_fail_closed`, a list of host-call classes (`file_read`,
+  `file_write`, `file_delete`, `net_connect`, `net_bind`, `process_spawn`) whose
+  effect runs only after a write-ahead audit entry is durable. If the entry
+  cannot be recorded, the host call fails without running its effect and the
+  refusal is recorded as a denial. The default list is empty. A workspace
+  configuration can add classes but not remove them.
+
+  Closes #1999
+
+- Keep the shared native-mount resource directory alive when retiring a lease, preventing concurrent mount creation from failing with a missing-directory error.
+
+- Report the hash that chain links use for every exported audit entry. `audit.export` gave a format-v2 entry's `content_hash_hex` as BLAKE3 of its signing data, which for v2 is the signature wrapper of the entry hash, so an exported chain that had switched to v2 did not link to its entries or to its head in `audit.heads`. v2 entries now export their SHA-256 entry hash; v1 entries are unchanged.
+
+- Stop hosted volume dirty commits from rewriting the full extent map on every tiny overwrite.
+
+  Empty operation-8 records now cover the unrecovered tail until that tail, including the empty commit, would exceed the existing 16 MiB snapshot bound. Footer recovery replays the bounded tail from the named checkpoint.
+
+  This does not prove Jamie's 260 GB / 8 MB/s growth, reclaim already-grown history, or any throughput number. Old readers that reject a sparse footer still fall back to an unbounded header scan.
+
+  Closes #2014
+
+- Reclaim superseded physical representation metadata during storage compaction using verified, durably published checkpoints. Volume compaction publishes the compacted arena, matching metadata authority and GC receipt atomically so interrupted publication can reopen safely. Logical retention and active object identities remain unchanged. Stores compacted with the new checkpoint reader cannot be reopened by older readers limited to the initial representation journal generation.
+
+- Checkpoint the volume roots journal during compaction, reclaiming superseded root records while preserving current principal identities and generations. Publish the snapshot atomically with the compacted arena, representation authority and GC evidence, and recover interrupted compaction without mixing old and new roots.
+
+- Preserve complete physical-compaction evidence when audit delivery has persisted only a signed digest. Report archive delivery as pending instead of discarding the only complete bundle, and avoid repeating old summaries with a later compaction's counters.
+
+- Checkpoint pending key/value deltas before explicit durable compaction so overwritten values below the background checkpoint threshold can be reclaimed. Preserve concurrent updates, explicitly retained history, and complete compaction evidence. Closes #2025.
+
+### Added
+
+- Added read-only, principal-scoped capsule update discovery with `astrid capsule update --check --json`. Discovery distinguishes unavailable checks and unsupported publisher layouts from current versions, without installing capsules or granting permissions.
+
+- Add `--cpu-rate` to `astrid quota set` so operators can change one principal's
+  `max_cpu_fuel_per_sec` without replacing the rest of the quota block. The flag
+  accepts the same decimal SI forms `astrid quota show` prints (`12G/s`, `12.0G/s`)
+  and rejects zero, overflow, unknown suffixes, and inexact fractions. Other
+  quota fields are preserved by the existing get-modify-set round-trip, and
+  authorisation is unchanged (`quota:set` / `self:quota:set`).
+
+  Closes #1992
+
+- Add read-only `audit.heads` and `audit.export` admin methods for anchoring the
+  audit log outside the runtime. `astrid audit heads` reports every chain's
+  retained count, total pruned entries and head hash, signed by the runtime key
+  over a fixed length-prefixed encoding (`astrid.audit.heads.v1`) with no
+  pre-hash. `astrid audit export` pages one chain's stored entries with their
+  exact signing bytes, content hashes and signatures, together with the chain's
+  latest prune receipt, and returns a cursor that also resumes after later
+  appends. The methods require the `audit:heads` and `audit:export`
+  capabilities. Successful calls are not written to the audit log, so polling
+  does not grow it; denied calls are still recorded.
+
+  Chain metadata now counts the entries each prune removes, in the same update
+  that lowers the retained count. Chains pruned at most once before this release
+  report an exact total. A chain pruned more than once before it reports the
+  total as unknown, signed as `u64::MAX`.
+
+- Record the events that determine what an agent did on the signed audit log,
+  without changing the v1 entry format. Kernel-mediated HTTP requests are
+  pre-committed before they leave the host (method, host, redirect hop, BLAKE3
+  commitments to the path, headers and body with credentials redacted, and a
+  per-principal sequence number), and each is completed with the status,
+  provider request ids and a hash of the response body as it was read. Capsule
+  tool calls record hashes of their arguments and result. Approval prompts are
+  committed before they are shown, and every decision is linked to its prompt.
+  Capability tokens, principal grant changes and grant-on-use grants record
+  what was applied. Capsule installs and runtime loads bind the wasm hash,
+  manifest hash and engine profile. File, network, process and HTTP entries
+  name the capsule and wasm hash that acted, and file writes record the hash
+  of the written bytes. Install and upgrade hooks run by the daemon are
+  audited like running capsules.
+
+  A capsule can now name a manifest-declared secret in an HTTP header as
+  `{{secret:NAME}}`; the host injects the value so it never enters guest
+  memory or any audit commitment. See `docs/models.md`.
+
+  Closes #1998
+
+- Add audit entry format v2, off by default and enabled with `[audit] entry_format = "v2"`. A v2 entry is a deterministic CBOR body that signs every stored field: a chain id bound to the principal's durable UID, a per-chain sequence number, nanosecond time, the acting capsule when known, the action, the authorization, and the full outcome. Field values are salted commitments, so one field can be disclosed without the others. Entries are hashed with SHA-256 and signed with a dedicated audit key (`keys/audit.key`), and are verified against a cross-signed key registry instead of the key embedded in each entry. Existing v1 entries are kept unchanged, and the v2 chains that follow link to them. Once v2 is enabled, v1 appends are refused. The byte-level format, with a known-answer test, is documented in `astrid_audit::entry_v2`. Closes #2000.
+
+- Audit retention no longer deletes history that has not been anchored
+  externally. The new `audit.anchor_mark` admin method (capability
+  `audit:anchor`) lets an anchoring service record, for each chain, the position
+  through which it certified the log (`omitted_total + count` from
+  `audit.heads`) and that position's head hash, with the certification's
+  evidence. The kernel checks the hash against its own chain before accepting a
+  mark, and a chain's watermark never decreases. Successful marks are not
+  written to the audit log; rejected ones are.
+
+  Pruning, manual or automatic, never removes entries at or past a chain's
+  watermark: `astrid audit prune` skips to the oldest sealed segment that can go
+  and otherwise refuses with the reason. When the global cap is reached and
+  every candidate segment holds unanchored history, entries are kept over the
+  cap, `astrid audit stats` reports degraded with the reason, and an error is
+  logged, until a watermark advances. Chains without a watermark are pruned as
+  before unless `[audit.retention] require_anchor = true`. With
+  `[audit.retention] archive_dir`, each pruned segment is written there (signed
+  receipt plus the removed entries) before anything is deleted. Both keys are
+  operator-only.
+
+  Every prune receipt is now kept, not only the latest, and `audit.export`
+  returns them with `receipts_from` (`astrid audit export --receipts-from`), so
+  a verifier can connect retained entries to history it anchored earlier.
+  `astrid audit anchor-status` (`audit.anchor_status`, capability `audit:heads`)
+  shows each chain's watermark and how far anchoring lags.
+
+  Closes #2001
+
+### Security
+
+- Update Wasmtime and wasmtime-wasi from 48.0.1 to 48.0.3 to address RUSTSEC-2026-0314, RUSTSEC-2026-0315, and RUSTSEC-2026-0316.
+
+- Discard interrupted WASM interceptor instances and deny ordered execution when
+  the guest fails before producing a decision.
+
+  Closes #2009
+
 ## [2026.9.4] - 2026-09-20
 
 ### Fixed
