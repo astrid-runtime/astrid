@@ -90,6 +90,105 @@ async fn personal_legacy_graph_migrates_idempotently_and_survives_reload() {
 }
 
 #[tokio::test]
+async fn legacy_accountability_survives_volume_reopen_without_changing_capsule_state() {
+    use crate::{
+        IdentityStore, KvIdentityStore, ScopedKvStore, StateOwner,
+        open_runtime_principal_store_with_directory,
+    };
+
+    let (_, _, owner, fleet) = fixture().await;
+    let temp = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(temp.path());
+    let directory = PrincipalDirectory::default();
+    let quota =
+        || -> Arc<dyn crate::KvQuotaResolver<StateOwner>> { Arc::new(|_: &StateOwner| Ok(None)) };
+    let runtime = open_runtime_principal_store_with_directory(&home, quota(), directory.clone())
+        .await
+        .unwrap();
+    let kv = runtime.kv();
+    let identities = KvIdentityStore::with_principal_directory(
+        ScopedKvStore::new(Arc::clone(&kv), "system:identity").unwrap(),
+        directory.clone(),
+    );
+    let identity = identities
+        .create_principal(PrincipalId::default(), [3; 32])
+        .await
+        .unwrap();
+    let principal = identities
+        .get_principal_identity(identity.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .uid;
+    let store = OwnershipStore::new(Arc::clone(&kv), directory.clone()).unwrap();
+    store.create_user(owner.clone()).await.unwrap();
+    store.create_fleet(fleet.clone()).await.unwrap();
+    store
+        .assign_principal(PrincipalOwnership {
+            principal_uid: principal,
+            fleet_uid: fleet.uid,
+            assigned_by: owner.uid,
+        })
+        .await
+        .unwrap();
+    store
+        .bind_user_device(principal, [3; 32], owner.uid, owner.uid)
+        .await
+        .unwrap();
+    legacy_bytes(&store).await;
+    kv.set(
+        "default:capsule:upgrade-probe",
+        "state",
+        b"retained capsule state".to_vec(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store.load().await.unwrap().accountable_user(principal),
+        None
+    );
+    assert!(
+        store
+            .reconcile_local_accountable_users(principal, &[3; 32])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let migrated = store.load().await.unwrap();
+    assert_eq!(migrated.accountable_user(principal), Some(owner.uid));
+    drop(store);
+    drop(identities);
+    kv.close().await.unwrap();
+    drop(kv);
+    drop(runtime);
+
+    assert!(home.storage_volume_path().is_file());
+    let directory = PrincipalDirectory::default();
+    let reopened = open_runtime_principal_store_with_directory(&home, quota(), directory.clone())
+        .await
+        .unwrap();
+    let kv = reopened.kv();
+    let store = OwnershipStore::new(Arc::clone(&kv), directory).unwrap();
+    assert_eq!(store.load().await.unwrap(), migrated);
+    assert!(
+        store
+            .reconcile_local_accountable_users(principal, &[3; 32])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.load().await.unwrap(), migrated);
+    assert_eq!(
+        kv.get("default:capsule:upgrade-probe", "state")
+            .await
+            .unwrap(),
+        Some(b"retained capsule state".to_vec())
+    );
+    drop(store);
+    kv.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn ambiguous_or_revoked_local_identity_is_not_guessed() {
     let (store, principal, owner, _) = fixture().await;
     legacy_bytes(&store).await;
