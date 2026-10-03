@@ -29,10 +29,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use astrid_core::capability_grammar::validate_capability;
-use astrid_core::principal::PrincipalId;
-use astrid_core::profile::{
-    CapabilityPattern, CapsuleGrant, GroupName, PrincipalProfile, ProfileError,
-};
+use astrid_core::profile::{CapabilityPattern, CapsuleGrant, GroupName, PrincipalProfile};
+use astrid_core::{DeviceKeyId, principal::PrincipalId};
 use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody, AgentSummary};
 use tracing::{info, warn};
 
@@ -41,6 +39,8 @@ use crate::kernel_router::AuthorizedRequest;
 pub(super) mod creation_authority;
 mod distro_dispatch;
 mod env_handlers;
+mod responses;
+pub(super) use responses::{err_bad_input, err_internal, err_profile, success_json};
 mod user_principals;
 use super::inheritance::copy_modify_env;
 use env_handlers::{EnvSetRequest, env_delete, env_list, env_set};
@@ -81,7 +81,10 @@ pub(super) async fn dispatch_authorized(
         kernel,
         &authorization.principal,
         Some(authorization),
-        None,
+        authorization
+            .device_key_id
+            .as_ref()
+            .map(DeviceKeyId::as_str),
         req,
     )
     .await
@@ -140,7 +143,15 @@ async fn dispatch_inner(
         },
         req @ AdminRequestKind::AgentModify { .. } => agent_modify_from_req(kernel, req).await,
         AdminRequestKind::QuotaSet { principal, quotas } => {
-            super::quota::quota_set(kernel, principal, quotas).await
+            super::quota::quota_set(
+                kernel,
+                caller,
+                authorization,
+                device_key_id,
+                principal,
+                quotas,
+            )
+            .await
         },
         AdminRequestKind::QuotaGet { principal } => super::quota::quota_get(kernel, &principal),
         AdminRequestKind::UsageGet { principal } => super::quota::usage_get(kernel, &principal),
@@ -971,22 +982,4 @@ pub(crate) fn require_principal_exists(principal: &PrincipalId, path: &Path) -> 
             path.display()
         ))
     }
-}
-
-pub(super) fn err_bad_input(msg: String) -> AdminResponseBody {
-    warn!(error = %msg, "admin request rejected: bad input");
-    AdminResponseBody::Error(msg)
-}
-
-pub(super) fn err_internal(msg: String) -> AdminResponseBody {
-    warn!(error = %msg, "admin request failed: internal error");
-    AdminResponseBody::Error(msg)
-}
-
-pub(super) fn err_profile(principal: &PrincipalId, e: &ProfileError) -> AdminResponseBody {
-    err_internal(format!("profile error for {principal}: {e}"))
-}
-
-pub(super) fn success_json(val: serde_json::Value) -> AdminResponseBody {
-    AdminResponseBody::Success(val)
 }

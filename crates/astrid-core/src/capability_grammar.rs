@@ -501,7 +501,7 @@ pub const CAPABILITY_CATALOG: &[CapabilityInfo] = {
         CapabilityInfo {
             id: "self:quota:set",
             label: "Set own quotas",
-            description: "Self-scoped quota:set — typically only used to relax quotas the operator already permits.",
+            description: "Lower or retain own resource ceilings. Increasing an allocation requires quota:set.",
             category: Quota,
             scope: Self_,
             danger: Normal,

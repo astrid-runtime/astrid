@@ -54,12 +54,20 @@ run_gateway_quota_write_smoke() {
   json_assert_field_equals "$ARTIFACTS/http-quota-after-write.json" max_background_processes 5
   body="$(quota_request_body "$ARTIFACTS/http-quota-after-write.json" 6)"
   status="$(http_status PUT "/api/sys/principals/$user_principal/quotas" "$user_bearer" "$body" \
-    "$ARTIFACTS/http-quota-self-write.json")"
-  assert_status "agent quota self-write" "$status" 200
+    "$ARTIFACTS/http-quota-self-increase-denied.json")"
+  assert_status "agent quota self-increase denied" "$status" 403
   status="$(http_status GET "/api/sys/principals/$user_principal/quotas" "$user_bearer" "" \
-    "$ARTIFACTS/http-quota-after-self-write.json")"
-  assert_status "agent quota read after self-write" "$status" 200
-  json_assert_field_equals "$ARTIFACTS/http-quota-after-self-write.json" max_background_processes 6
+    "$ARTIFACTS/http-quota-after-self-increase.json")"
+  assert_status "agent quota read after refused increase" "$status" 200
+  json_assert_field_equals "$ARTIFACTS/http-quota-after-self-increase.json" max_background_processes 5
+  body="$(quota_request_body "$ARTIFACTS/http-quota-after-write.json" 4)"
+  status="$(http_status PUT "/api/sys/principals/$user_principal/quotas" "$user_bearer" "$body" \
+    "$ARTIFACTS/http-quota-self-reduction.json")"
+  assert_status "agent quota self-reduction" "$status" 200
+  status="$(http_status GET "/api/sys/principals/$user_principal/quotas" "$user_bearer" "" \
+    "$ARTIFACTS/http-quota-after-self-reduction.json")"
+  assert_status "agent quota read after reduction" "$status" 200
+  json_assert_field_equals "$ARTIFACTS/http-quota-after-self-reduction.json" max_background_processes 4
   status="$(http_status PUT "/api/sys/principals/$ops_principal/quotas" "$user_bearer" "$body" \
     "$ARTIFACTS/http-quota-cross-principal-write-denied.json")"
   assert_status "agent cross-principal quota write denied" "$status" 403
@@ -70,10 +78,30 @@ run_gateway_quota_write_smoke() {
   status="$(http_status GET "/api/sys/principals/$ops_principal/usage" "$user_bearer" "" \
     "$ARTIFACTS/http-usage-cross-principal-denied.json")"
   assert_status "agent cross-principal usage denied" "$status" 403
-  body="$(quota_request_body "$ARTIFACTS/http-quota-after-write.json" 4)"
+  body="$(quota_request_body "$ARTIFACTS/http-quota-after-write.json" 5)"
   status="$(http_status PUT "/api/sys/principals/$user_principal/quotas" "$admin_bearer" "$body" \
     "$ARTIFACTS/http-quota-restore.json")"
-  assert_status "admin quota restore" "$status" 200
+  assert_status "admin can raise reduced quota" "$status" 200
+  status="$(http_status GET "/api/sys/principals/$user_principal/quotas" "$user_bearer" "" \
+    "$ARTIFACTS/http-quota-after-admin-increase.json")"
+  assert_status "agent quota read after admin increase" "$status" 200
+  json_assert_field_equals "$ARTIFACTS/http-quota-after-admin-increase.json" max_background_processes 5
+  # Later CLI/restart checks share this fixture. Restore the captured allocation,
+  # not the intermediate value used to prove operator-only increases.
+  body="$(quota_request_body "$ARTIFACTS/http-quota-before-write.json")"
+  status="$(http_status PUT "/api/sys/principals/$user_principal/quotas" "$admin_bearer" "$body" \
+    "$ARTIFACTS/http-quota-restore-original.json")"
+  assert_status "restore original quota fixture" "$status" 200
+  status="$(http_status GET "/api/sys/principals/$user_principal/quotas" "$user_bearer" "" \
+    "$ARTIFACTS/http-quota-restored.json")"
+  assert_status "agent quota read after fixture restoration" "$status" 200
+  "$PYTHON" - "$ARTIFACTS/http-quota-before-write.json" "$ARTIFACTS/http-quota-restored.json" <<'PY'
+import json
+import sys
+
+before, after = [json.load(open(path, encoding="utf-8")) for path in sys.argv[1:]]
+assert after == before, (before, after)
+PY
 }
 
 json_assert_public_gateway_surface() {
@@ -174,13 +202,14 @@ PY
 }
 
 quota_request_body() {
-  local file=$1 processes=$2
+  local file=$1 processes=${2:-}
   "$PYTHON" - "$file" "$processes" <<'PY'
 import json
 import sys
 
 quotas = json.load(open(sys.argv[1], encoding="utf-8"))
-quotas["max_background_processes"] = int(sys.argv[2])
+if sys.argv[2]:
+    quotas["max_background_processes"] = int(sys.argv[2])
 print(json.dumps({"quotas": quotas}, separators=(",", ":")))
 PY
 }
