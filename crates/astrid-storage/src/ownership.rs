@@ -20,6 +20,7 @@ use crate::{KvStore, PrincipalDirectory, ScopedKvStore, StorageError};
 mod deletion;
 mod derived;
 mod provision;
+mod resources;
 pub use derived::DerivedPrincipalOwnership;
 mod upgrade;
 pub use upgrade::{UnownedPrincipalDeferral, UnownedPrincipalReconciliation};
@@ -67,6 +68,8 @@ pub struct OwnershipSnapshot {
     users: BTreeMap<UserUid, UserIdentity>,
     fleets: BTreeMap<FleetUid, FleetRecord>,
     principal_ownership: BTreeMap<PrincipalUid, PrincipalOwnership>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    accountable_users: BTreeMap<PrincipalUid, UserUid>,
     #[serde(default)]
     principal_deletions: BTreeMap<PrincipalUid, PrincipalDeletionReservation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -90,6 +93,7 @@ impl Default for OwnershipSnapshot {
             users: BTreeMap::new(),
             fleets: BTreeMap::new(),
             principal_ownership: BTreeMap::new(),
+            accountable_users: BTreeMap::new(),
             principal_deletions: BTreeMap::new(),
             user_bindings: Vec::new(),
             local_user_binding_initialized: false,
@@ -155,6 +159,7 @@ impl OwnershipSnapshot {
     }
 
     fn validate(&self, principals: &PrincipalDirectory) -> Result<(), OwnershipError> {
+        self.validate_accountable_users()?;
         self.validate_user_bindings(principals)?;
         if self.format_version != GRAPH_FORMAT_VERSION {
             return Err(OwnershipError::UnsupportedFormat(self.format_version));
@@ -518,6 +523,9 @@ impl OwnershipStore {
                 }),
                 None => {
                     graph
+                        .accountable_users
+                        .insert(ownership.principal_uid, ownership.assigned_by);
+                    graph
                         .principal_ownership
                         .insert(ownership.principal_uid, ownership.clone());
                     Ok(())
@@ -739,6 +747,11 @@ pub enum OwnershipError {
         /// Durable UID owned by the existing reservation.
         principal: PrincipalUid,
     },
+    /// An operator must explicitly resolve a legacy principal's resource owner.
+    #[error(
+        "principal {0} needs an explicit accountable user before spawning; assign resource ownership without recreating its home"
+    )]
+    AccountableUserRequired(PrincipalUid),
     /// Sustained concurrent writes prevented an atomic commit.
     #[error("ownership graph changed concurrently too many times")]
     ConcurrentModification,

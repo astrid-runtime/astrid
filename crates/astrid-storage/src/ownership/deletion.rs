@@ -297,6 +297,7 @@ impl OwnershipStore {
             // Ownership removal and retirement commit together. Retaining the
             // fleet on the reservation protects retries after identity removal.
             graph.principal_ownership.remove(&principal_uid);
+            graph.accountable_users.remove(&principal_uid);
             graph
                 .user_bindings
                 .retain(|binding| !binding.for_principal(principal_uid));

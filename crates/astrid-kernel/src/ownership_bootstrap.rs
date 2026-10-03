@@ -69,6 +69,16 @@ pub(crate) async fn bootstrap_cli_root_ownership(
             "reconciled unowned principals for the bound local operator"
         );
     }
+    let unresolved = store
+        .reconcile_local_accountable_users(
+            principal_uid,
+            &root_principal_identity.genesis.initial_public_key,
+        )
+        .await?;
+    if !unresolved.is_empty() {
+        tracing::warn!(principals = ?unresolved,
+            "legacy resource accountability needs explicit operator assignment; existing ownership preserved");
+    }
     Ok(())
 }
 

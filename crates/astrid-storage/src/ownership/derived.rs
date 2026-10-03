@@ -1,6 +1,6 @@
 //! Fleet inheritance for capability-authorized agent spawning.
 
-use astrid_core::{PrincipalOwnership, PrincipalUid};
+use astrid_core::{PrincipalOwnership, PrincipalUid, UserUid};
 
 use super::{OwnershipError, OwnershipStore};
 
@@ -14,6 +14,7 @@ mod tests;
 #[derive(Clone, Debug)]
 pub struct DerivedPrincipalOwnership {
     creator: PrincipalOwnership,
+    accountable_user: UserUid,
 }
 
 impl OwnershipStore {
@@ -36,7 +37,13 @@ impl OwnershipStore {
             .principal_owner(creator)
             .ok_or(OwnershipError::PrincipalNotOwned(creator))?
             .clone();
-        Ok(DerivedPrincipalOwnership { creator })
+        let accountable_user = graph.accountable_user(creator.principal_uid).ok_or(
+            OwnershipError::AccountableUserRequired(creator.principal_uid),
+        )?;
+        Ok(DerivedPrincipalOwnership {
+            creator,
+            accountable_user,
+        })
     }
 
     /// Assign a fresh child to the spawning caller's still-current fleet.
@@ -62,7 +69,9 @@ impl OwnershipStore {
                     return Err(OwnershipError::PrincipalNotFound(uid));
                 }
             }
-            if graph.principal_owner(creator) != Some(&ownership.creator) {
+            if graph.principal_owner(creator) != Some(&ownership.creator)
+                || graph.accountable_user(creator) != Some(ownership.accountable_user)
+            {
                 return Err(OwnershipError::IdentityConflict(
                     "spawn ownership",
                     creator.to_string(),
@@ -74,6 +83,9 @@ impl OwnershipStore {
                     fleet: owner.fleet_uid,
                 });
             }
+            graph
+                .accountable_users
+                .insert(child, ownership.accountable_user);
             graph.principal_ownership.insert(
                 child,
                 PrincipalOwnership {
