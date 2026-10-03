@@ -124,6 +124,48 @@ async fn production_quota_success_and_invalid_input_have_one_final_outcome() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn production_quota_save_failure_preserves_global_authority() {
+    use astrid_audit::{AuditAction, AuditOutcome};
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_dir, kernel, caller) = fixture(true).await;
+    let original = kernel
+        .profile_cache
+        .resolve(&caller)
+        .unwrap()
+        .quotas
+        .clone();
+    let mut raised = original.clone();
+    raised.max_cpu_fuel_per_sec += 1;
+    let path = principal_profile_path(&kernel, &caller);
+    let parent = path.parent().unwrap();
+    let permissions = std::fs::metadata(parent).unwrap().permissions();
+    // Loading and authorization still work, but atomic persistence cannot
+    // create its temporary sibling. Restore permissions before assertions.
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let row = production_row(&kernel, &caller, None, raised).await;
+    std::fs::set_permissions(parent, permissions).unwrap();
+    assert!(
+        matches!(row.outcome, AuditOutcome::Failure { .. }),
+        "{row:?}"
+    );
+    assert!(
+        matches!(&row.action, AuditAction::AdminRequest { required_capability, .. }
+        if required_capability == "quota:set"),
+        "{row:?}"
+    );
+    assert_eq!(
+        PrincipalProfile::load_from_path(&path).unwrap().quotas,
+        original
+    );
+    assert_eq!(
+        kernel.profile_cache.resolve(&caller).unwrap().quotas,
+        original
+    );
+}
+
 async fn fixture(admin: bool) -> (tempfile::TempDir, Arc<crate::Kernel>, PrincipalId) {
     let dir = tempfile::tempdir().unwrap();
     let kernel = crate::test_kernel_with_home(AstridHome::from_path(dir.path())).await;
