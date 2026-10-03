@@ -39,6 +39,35 @@ Fleet membership has three roles:
 
 Every fleet must retain at least one owner.
 
+## Resource accountability
+
+Fleet access and resource accountability are separate. Each newly assigned
+principal records an accountable `UserUid`; background children inherit that
+user from their creator without needing a human login. Fleet transfers and
+membership changes do not change who pays for execution. The historical
+`assigned_by` field records provenance, not a live billing decision.
+
+Older ownership graphs remain readable. Boot fills missing resource attribution
+only for the unambiguous, currently bound local operator described below. A
+shared installation with unresolved attribution needs an explicit operator
+decision, not a fresh home:
+
+```sh
+astrid quota assign-user --agent worker --user <user-uid>
+```
+
+This requires global `quota:set`, including when `worker` is the caller.
+A self-scoped device cannot borrow the principal's broader administrator grant.
+The command only resolves missing attribution: repeating the same assignment
+is safe, but replacing an existing accountable user is refused. It preserves
+fleet membership, principal identity, keys, profiles, and capsule state.
+
+The in-progress aggregate CPU mechanism measures Wasmtime guest fuel, not host
+CPU time or subprocess use. Personal installations have no new aggregate limit
+by default. Background enforcement is not yet complete; the presence of a
+resource configuration or attribution record alone does not prove an enforced
+aggregate execution ceiling.
+
 ## Persistence and recovery
 
 The ownership graph lives under the reserved `system:ownership` namespace. A

@@ -13,6 +13,8 @@ use astrid_core::principal::PrincipalId;
 use astrid_core::profile::{PrincipalProfile, Quotas};
 use astrid_events::kernel_api::{AdminResponseBody, ResourceUsage};
 
+pub(super) mod assign_user;
+
 #[cfg(test)]
 mod tests;
 

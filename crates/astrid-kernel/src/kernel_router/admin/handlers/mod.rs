@@ -151,6 +151,17 @@ async fn dispatch_inner(
             .await
         },
         AdminRequestKind::QuotaGet { principal } => super::quota::quota_get(kernel, &principal),
+        AdminRequestKind::QuotaAssignUser { principal, user } => {
+            super::quota::assign_user::assign(
+                kernel,
+                caller,
+                authorization,
+                device_key_id,
+                principal,
+                user,
+            )
+            .await
+        },
         AdminRequestKind::UsageGet { principal } => super::quota::usage_get(kernel, &principal),
         req @ (AdminRequestKind::EnvSet { .. }
         | AdminRequestKind::EnvSetIfAbsent { .. }

@@ -51,6 +51,7 @@ pub const fn topic_suffix(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::UserPrincipalList => "user.principals",
         AdminRequestKind::UserPrincipalClaim { .. } => "user.principal.claim",
         AdminRequestKind::QuotaSet { .. } => "quota.set",
+        AdminRequestKind::QuotaAssignUser { .. } => "quota.assign_user",
         AdminRequestKind::QuotaGet { .. } => "quota.get",
         AdminRequestKind::UsageGet { .. } => "usage.get",
         AdminRequestKind::EnvSet { .. } => "env.set",

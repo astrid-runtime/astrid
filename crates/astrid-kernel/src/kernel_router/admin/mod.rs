@@ -319,6 +319,7 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
             ..
         } => AuthorityScope::Self_,
         AdminRequestKind::AgentCreate { .. }
+        | AdminRequestKind::QuotaAssignUser { .. }
         | AdminRequestKind::UserPrincipalClaim { .. }
         | AdminRequestKind::AgentDelete { .. }
         | AdminRequestKind::AgentEnable { .. }
@@ -400,7 +401,8 @@ pub fn required_capability_for_admin_request(
         (AdminRequestKind::AgentList, AuthorityScope::Global) => "agent:list",
         (AdminRequestKind::DistroSelfGrant, _) => "self:distro:grant",
         (AdminRequestKind::QuotaSet { .. }, AuthorityScope::Self_) => "self:quota:set",
-        (AdminRequestKind::QuotaSet { .. }, AuthorityScope::Global) => "quota:set",
+        (AdminRequestKind::QuotaSet { .. }, AuthorityScope::Global)
+        | (AdminRequestKind::QuotaAssignUser { .. }, _) => "quota:set",
         (
             AdminRequestKind::EnvSet { .. }
             | AdminRequestKind::EnvSetIfAbsent { .. }
@@ -562,6 +564,7 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::UserPrincipalList => "admin.user.principals",
         AdminRequestKind::UserPrincipalClaim { .. } => "admin.user.principal.claim",
         AdminRequestKind::QuotaSet { .. } => "admin.quota.set",
+        AdminRequestKind::QuotaAssignUser { .. } => "admin.quota.assign_user",
         AdminRequestKind::QuotaGet { .. } => "admin.quota.get",
         AdminRequestKind::UsageGet { .. } => "admin.usage.get",
         AdminRequestKind::EnvSet { .. } => "admin.env.set",
@@ -710,6 +713,7 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         | AdminRequestKind::AgentDisable { principal }
         | AdminRequestKind::AgentModify { principal, .. }
         | AdminRequestKind::UserPrincipalClaim { principal }
+        | AdminRequestKind::QuotaAssignUser { principal, .. }
         | AdminRequestKind::QuotaSet { principal, .. }
         | AdminRequestKind::QuotaGet { principal }
         | AdminRequestKind::UsageGet { principal }

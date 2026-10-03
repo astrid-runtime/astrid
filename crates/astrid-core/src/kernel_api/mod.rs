@@ -620,8 +620,15 @@ pub enum AdminRequestKind {
         #[serde(default)]
         remove_capsules: Vec<String>,
     },
-    /// Replace the target principal's [`Quotas`] block. Values are
-    /// validated before the atomic profile write.
+    /// Resolve missing legacy resource attribution using operator authority.
+    /// Idempotent for the same user; never transfers an existing allocation.
+    QuotaAssignUser {
+        /// Existing principal with unresolved legacy resource accountability.
+        principal: PrincipalId,
+        /// Explicit accountable user. Fleet access alone cannot authorize this.
+        user: crate::UserUid,
+    },
+    /// Replace principal limits after capability and ceiling validation.
     QuotaSet {
         /// Principal whose quotas are being set.
         principal: PrincipalId,
