@@ -6,9 +6,8 @@ use astrid_core::{
 mod execution_tests;
 mod prepaid_guest_tests;
 mod throttle_tests;
-mod wasm_throttle_tests;
 
-async fn accounting() -> UserCpuAccounting {
+pub(crate) async fn accounting() -> UserCpuAccounting {
     let directory = PrincipalDirectory::default();
     let storage = Arc::new(
         OwnershipStore::new(

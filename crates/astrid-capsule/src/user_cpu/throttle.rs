@@ -19,6 +19,27 @@ pub struct ExecutionThrottle {
 }
 
 impl ExecutionThrottle {
+    /// Whether an operator configured an aggregate user limit. Unconfigured
+    /// personal runtimes retain their existing scheduler.
+    #[must_use]
+    pub(crate) fn has_user_limit(&self) -> bool {
+        self.user.is_some()
+    }
+
+    /// Sample approximately one hundred times per allowance. This is a
+    /// scheduling granularity, not a bound on a single guest operation.
+    #[must_use]
+    pub(crate) fn sampling_fuel(&self) -> u64 {
+        let limit = self
+            .principal_limit
+            .into_iter()
+            .chain(self.user.as_ref().map(|u| u.limit))
+            .map(NonZeroU64::get)
+            .min()
+            .unwrap_or(u64::MAX);
+        (limit / 100).max(1)
+    }
+
     pub(super) fn new(
         principal: PrincipalId,
         principal_limit: Option<NonZeroU64>,

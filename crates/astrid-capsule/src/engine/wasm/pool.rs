@@ -41,6 +41,7 @@ use tokio_util::sync::CancellationToken;
 use wasmtime::Store;
 use wasmtime::component::{Instance, InstancePre};
 
+use super::accounted_store::AccountedStore;
 use super::host_state::HostState;
 use crate::error::{CapsuleError, CapsuleResult};
 
@@ -55,7 +56,7 @@ const EVICT_INTERVAL: Duration = Duration::from_secs(30);
 /// into `store`'s resource table, so the two are bound together for the
 /// instance's lifetime.
 pub(super) struct PooledInstance {
-    pub(super) store: Store<HostState>,
+    pub(super) store: AccountedStore<HostState>,
     pub(super) instance: Instance,
 }
 
@@ -106,6 +107,7 @@ pub(super) struct InstanceBuilder {
     /// Fuel seed so `instantiate_async` (which runs guest component-init code)
     /// does not trap a fresh, zero-fuel Store on its first instruction.
     fuel_budget: u64,
+    throttle: Option<crate::user_cpu::throttle::ExecutionThrottle>,
 }
 
 impl InstanceBuilder {
@@ -122,7 +124,16 @@ impl InstanceBuilder {
             make_state,
             epoch_policy,
             fuel_budget,
+            throttle: None,
         }
+    }
+
+    pub(super) fn with_throttle(
+        mut self,
+        throttle: Option<crate::user_cpu::throttle::ExecutionThrottle>,
+    ) -> Self {
+        self.throttle = throttle;
+        self
     }
 
     /// Instantiate one fresh pooled instance. Identical to the eager warm-start
@@ -137,6 +148,9 @@ impl InstanceBuilder {
         // budget re-sets fuel afterwards.
         store.set_fuel(self.fuel_budget).map_err(|e| {
             CapsuleError::UnsupportedEntryPoint(format!("Failed to seed store fuel: {e}"))
+        })?;
+        let mut store = AccountedStore::new(store, self.throttle.clone()).map_err(|e| {
+            CapsuleError::ExecutionFailed(format!("Failed to initialize CPU accounting: {e}"))
         })?;
         let instance = self
             .instance_pre
@@ -389,7 +403,7 @@ impl PoolCheckout {
 
     /// Mutable access to the leased store for the SET phase and the guest
     /// call.
-    pub(super) fn store_mut(&mut self) -> &mut Store<HostState> {
+    pub(super) fn store_mut(&mut self) -> &mut AccountedStore<HostState> {
         &mut self.pooled.as_mut().expect("active checkout").store
     }
 }

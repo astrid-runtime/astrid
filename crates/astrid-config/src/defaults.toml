@@ -13,6 +13,16 @@
 # ============================================================================
 # Runtime Configuration
 # ============================================================================
+
+# Aggregate user execution budgets (operator-only; workspace overrides rejected).
+# Omitted limits preserve existing personal-install behavior. These meter WASM
+# guest fuel, not native host CPU time. Cooperative scheduling permits a
+# one-second burst; scheduling overshoot is repaid before further execution.
+# Changes apply on daemon restart.
+[resources]
+# default_user_cpu_fuel_per_sec = 2000000000
+# [resources.user_cpu_fuel_per_sec]
+# "<64-character canonical user UID>" = 4000000000
 # Controls the agent runtime behavior, context management, and system prompts.
 
 [filesystem]

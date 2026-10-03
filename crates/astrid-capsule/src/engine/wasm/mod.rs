@@ -43,6 +43,7 @@ impl WorkspaceMountResolver for WorkspaceBranchResolver {
     }
 }
 
+mod accounted_store;
 mod bind_workers;
 #[allow(unreachable_pub)]
 pub(crate) mod bindings;
@@ -50,6 +51,8 @@ pub(crate) mod bindings;
 #[path = "catalog_load_tests.rs"]
 mod catalog_load_tests;
 mod content_source;
+#[cfg(test)]
+mod fuel_scheduling_tests;
 pub mod host;
 pub mod host_state;
 #[cfg(test)]
@@ -316,6 +319,7 @@ pub struct WasmEngine {
     /// Fail-OPEN on the window math (non-poisoning `parking_lot` + saturating
     /// arithmetic); the orthogonal exemption decision fails CLOSED.
     fuel_rate: crate::FuelRateLimiter,
+    user_cpu: Option<Arc<crate::user_cpu::UserCpuAccounting>>,
     /// Live group config from [`CapsuleContext`].
     ///
     /// `invoke_interceptor` loads this for [`resolve_exemption`] so the CPU-rate
@@ -547,6 +551,7 @@ impl WasmEngine {
             fuel_ledger,
             memory_ledger,
             fuel_rate,
+            user_cpu: None,
             group_config: None,
             runtime_limits,
             http_limits,
@@ -2462,6 +2467,12 @@ impl ExecutionEngine for WasmEngine {
                 &ctx.principal,
                 has_run_export,
             );
+            let user_throttle = if !system_runtime && let Some(accounting) = &ctx.user_cpu {
+                let rate = cpu_rate_budget(owner_profile.as_deref(), load_group_config.as_ref().map(Arc::as_ref), &ctx.principal);
+                let throttle = accounting.execution_throttle(&ctx.principal, rate).await
+                    .map_err(CapsuleError::ExecutionFailed)?;
+                throttle.has_user_limit().then_some(throttle)
+            } else { None };
             // Memory cap captured by `make_state` (Copy usize). For a bound
             // run-loop this is the owner quota; pool_size is 1 for run-loop
             // capsules so the single Store `make_state` builds IS the run-loop
@@ -2860,7 +2871,7 @@ impl ExecutionEngine for WasmEngine {
                 Arc::clone(&make_state),
                 pool_epoch_policy,
                 INTERCEPTOR_FUEL_BUDGET,
-            );
+            ).with_throttle(user_throttle);
             // Run-loop capsules build one dedicated Store per worker (default 1);
             // pools build their `min_idle` warm set. `worker_count == 1` for
             // every non-eligible capsule, so this is `pool_min_idle` (today's
@@ -2895,7 +2906,7 @@ impl ExecutionEngine for WasmEngine {
             // All N share the bound listener via `shared_listeners` and each
             // blocks on `accept()` against the one OS accept queue.
             let mut run_stores: Vec<(
-                Arc<AsyncMutex<Store<HostState>>>,
+                Arc<AsyncMutex<accounted_store::AccountedStore<HostState>>>,
                 wasmtime::component::Instance,
             )> = Vec::new();
             if has_run {
@@ -2905,8 +2916,9 @@ impl ExecutionEngine for WasmEngine {
                 // was seeded to INTERCEPTOR_FUEL_BUDGET above for instantiation;
                 // the run loop is NOT fuel-bound, so re-seed it to
                 // effectively-infinite (a 0-fuel Store traps, and a run loop must
-                // never fuel-out). CPU is bounded by the epoch interrupt
-                // (`configure_run_store`), not fuel. For the single-worker
+                // never fuel-out). Configured user budgets account sampled
+                // fuel and wait without killing the guest. Otherwise retain
+                // the existing epoch policy (`configure_run_store`). For the single-worker
                 // default this drains exactly one instance — identical to the
                 // prior `pop()` path.
                 for mut pi in initial_instances.drain(..) {
@@ -2915,7 +2927,9 @@ impl ExecutionEngine for WasmEngine {
                             "Failed to set run-loop fuel: {e}"
                         ))
                     })?;
-                    configure_run_store(&mut pi.store, &run_budget);
+                    if !pi.store.configure_rate_epochs(1) {
+                        configure_run_store(&mut pi.store, &run_budget);
+                    }
                     run_stores.push((Arc::new(AsyncMutex::new(pi.store)), pi.instance));
                 }
             } else {
@@ -3256,6 +3270,7 @@ impl ExecutionEngine for WasmEngine {
         }
         self.inbound_rx = rx;
         self.profile_cache = ctx.profile_cache.clone();
+        self.user_cpu = ctx.user_cpu.clone();
         self.overlay_registry = ctx.overlay_registry.clone();
         self.owner_principal = Some(ctx.principal.clone());
         // Keep the OS-level CoW backend alive for promote/rollback and for
@@ -3573,24 +3588,35 @@ impl ExecutionEngine for WasmEngine {
         );
         let invocation_fuel_budget =
             crate::invocation_fuel_share(rate_budget, INTERCEPTOR_FUEL_BUDGET, max_in_flight);
-        let mut fuel_reservation = match self.fuel_rate.try_reserve(
-            &invoking_principal,
+        let invocation_throttle = if let Some(accounting) = &self.user_cpu {
+            match accounting
+                .execution_throttle(&invoking_principal, rate_budget)
+                .await
+            {
+                Ok(throttle) => throttle.has_user_limit().then_some(throttle),
+                Err(reason) => return Ok(crate::capsule::InterceptResult::Deny { reason }),
+            }
+        } else {
+            None
+        };
+        let execution_allocation = crate::user_cpu::execution::ExecutionAllocation::new(
+            invoking_principal.clone(),
             rate_budget,
-            invocation_fuel_budget,
-            now,
-        ) {
-            Some(reservation) => reservation,
-            None => {
-                let reason = format!(
-                    "principal '{invoking_principal}' exceeded in-flight CPU budget of {rate_budget} fuel/sec"
-                );
+            self.fuel_rate.clone(),
+            None,
+        );
+        let mut fuel_reservation = match execution_allocation.try_reserve(invocation_fuel_budget) {
+            Ok(reservation) => reservation,
+            Err(error) => {
                 tracing::warn!(
                     principal = %invoking_principal,
                     capsule = %self.manifest.package.name,
                     action,
                     "CPU-rate reservation exceeded; denying invocation"
                 );
-                return Ok(crate::capsule::InterceptResult::Deny { reason });
+                return Ok(crate::capsule::InterceptResult::Deny {
+                    reason: error.to_string(),
+                });
             },
         };
 
@@ -3698,16 +3724,18 @@ impl ExecutionEngine for WasmEngine {
                 s.set_epoch_deadline(deadline);
             }
 
-            // Per-invocation CPU: fuel is engine-wide, so re-seed the leased
-            // Store to a known budget before the call. This (a) bounds a
-            // runaway single interceptor call, and (b) makes
-            // `invocation_fuel_budget - get_fuel()` after the call the EXACT
-            // deterministic instruction count for THIS invocation, attributable
-            // to the invoking principal — independent of whatever the previous
-            // leaseholder of this pooled Store consumed. Errors only if fuel is
-            // disabled (it is not); on the impossible error we leave fuel as-is
-            // (fail-secure: a smaller budget traps sooner).
-            let _ = s.set_fuel(invocation_fuel_budget);
+            // Bind the authenticated caller before guest execution. Accounted
+            // stores separate the finite call allowance from a large fuel
+            // measurement counter, so a bulk operation cannot clamp away its
+            // overshoot. A failed bind denies the interceptor chain.
+            if let Err(error) = s
+                .bind_throttle(invocation_throttle)
+                .and_then(|()| s.set_fuel(invocation_fuel_budget))
+            {
+                return Ok(crate::capsule::InterceptResult::Deny {
+                    reason: format!("cannot bind invocation CPU accounting: {error}"),
+                });
+            }
 
             {
                 let state = s.data_mut();
@@ -3766,6 +3794,7 @@ impl ExecutionEngine for WasmEngine {
         // Typed-function lookup does not enter the guest. Keep the checkout
         // reusable if the export is absent or this future is cancelled before
         // the call begins.
+        let invocation_fuel_seed = checkout.store_mut().get_fuel().unwrap_or(0);
         let typed_lookup = {
             let s = checkout.store_mut();
             typed_instance.get_typed_func::<(String, Vec<u8>), (HookTriggerResult,)>(
@@ -3808,15 +3837,12 @@ impl ExecutionEngine for WasmEngine {
                 "capsule does not export `astrid-hook-trigger`: {e}"
             ))),
         };
-        // Per-invocation CPU measurement: fuel counts DOWN from the seed, so
-        // `seed - remaining` is the exact deterministic instruction count for
-        // this call. Read while `checkout` is still alive (the `s` borrow above
-        // has ended). Charge it to the invoking principal in the shared,
-        // cross-capsule fuel ledger (telemetry only — the run-loop CPU bound is
-        // ENFORCED by the epoch interrupt mechanism, not fuel; windowed
-        // deny/throttle on this aggregate is the deliberate follow-up).
+        // Measure from the actual counter seed, not the call allowance:
+        // accounted stores keep those separate to retain overshoot. This is
+        // Wasmtime fuel, not complete host CPU or an exact instruction count.
+        // The Store-owned meter independently charges the shared user debt.
         let fuel_after = checkout.store_mut().get_fuel().unwrap_or(0);
-        let fuel_used = invocation_fuel_budget.saturating_sub(fuel_after);
+        let fuel_used = invocation_fuel_seed.saturating_sub(fuel_after);
         self.fuel_ledger.charge(&invoking_principal, fuel_used);
         // Settle exact usage in the live window at completion. If the future is
         // dropped before this point, the reservation's Drop charges its full

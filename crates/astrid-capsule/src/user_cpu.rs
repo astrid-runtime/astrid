@@ -9,7 +9,7 @@ pub mod execution;
 pub mod throttle;
 
 #[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
-mod tests;
+pub(crate) mod tests;
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
