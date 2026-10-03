@@ -583,3 +583,13 @@ success = ["voucher command parses and reports bounded unsupported/runtime behav
 denial = ["invalid voucher id or missing authority is rejected"]
 state = ["no voucher state mutates unless feature is live"]
 evidence = ["CLI transcript and explicit TODO/waiver if still unsupported"]
+
+[scenarios.native_protection_capabilities]
+status = "mapped"
+surfaces = ["cli"]
+auth = ["authenticated management caller; self:capsule:list for self, capsule:list for another principal"]
+success = ["versioned daemon incarnation/context/UID response; approval requires verified nonlegacy receipt, pinned executable, matching principal runtime and manifest, and effective adapter capsule access"]
+denial = ["unauthorized cross-principal request is rejected and audited; missing, malformed, legacy, unpinned, stale, disabled, retired, or wrong-owner adapter cannot receive approval"]
+state = ["query leaves package, guest KV, principal grants and runtime views unchanged; caller remains audited actor"]
+evidence = ["kernel_router native_capabilities tests; native_capabilities CLI parser and uplink routing tests; kernel_api versioned wire tests"]
+remaining = ["Task 9: execute native-protection capabilities through a real authenticated daemon socket and qualify installer pre-grant acceptance"]

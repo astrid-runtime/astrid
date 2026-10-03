@@ -193,6 +193,13 @@ fn audit_ipc<T, E: std::fmt::Debug>(
 /// (the manifest declares intent; capabilities + install review are the
 /// boundary), not something the matcher enforces by forcing enumeration.
 fn check_subscribe_acl(state: &HostState, topic_pattern: &str) -> Result<(), ErrorCode> {
+    if state
+        .native_candidate
+        .as_ref()
+        .is_some_and(|candidate| !candidate.permits_topic(topic_pattern))
+    {
+        return Err(ErrorCode::CapabilityDenied);
+    }
     if state.ipc_subscribe_patterns.is_empty() {
         return Err(ErrorCode::CapabilityDenied);
     }
@@ -234,6 +241,11 @@ fn publish_inner(
     request_owner: Option<astrid_events::ipc::RequestOwnerId>,
     origin: astrid_events::ipc::MessageOrigin,
 ) -> Result<(), ErrorCode> {
+    if state.native_candidate.as_ref().is_some_and(|candidate| {
+        !candidate.permits_topic(&topic) || principal_str != state.principal.as_str()
+    }) {
+        return Err(ErrorCode::CapabilityDenied);
+    }
     // View retirement is an authority fence, not merely a liveness hint. A
     // guest invocation that raced unregister retains a cancelled per-principal
     // token and may no longer publish effects onto the bus.

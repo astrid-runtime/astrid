@@ -160,6 +160,10 @@ pub(crate) fn rate_limit_for_request_with_limits(
 /// Return the max-per-minute rate limit for a request type, if any.
 fn rate_limit_max(req: &KernelRequest, limits: &RateLimitsConfig) -> Option<u32> {
     match req {
+        KernelRequest::StageNativePairMember(_) => Some(1024),
+        KernelRequest::AbortNativePairUpgrade(_) | KernelRequest::GetNativePairUpgrade(_) => {
+            Some(30)
+        },
         KernelRequest::ReloadCapsules
         | KernelRequest::ReloadCapsule { .. }
         | KernelRequest::UnloadCapsule { .. }
@@ -170,7 +174,8 @@ fn rate_limit_max(req: &KernelRequest, limits: &RateLimitsConfig) -> Option<u32>
         // Completion reopens and verifies every declared durable package. Four
         // attempts leave room for transient client retries without exposing an
         // unbounded 64-member verification loop on the management router.
-        KernelRequest::FinishCapsuleInstallBatch { .. } => Some(4),
+        KernelRequest::BeginNativePairUpgrade(_)
+        | KernelRequest::FinishCapsuleInstallBatch { .. } => Some(4),
         KernelRequest::InstallCapsule { .. } | KernelRequest::ApproveCapability { .. } => Some(10),
         KernelRequest::Shutdown { .. } => Some(1),
         KernelRequest::ListCapsules
@@ -178,6 +183,7 @@ fn rate_limit_max(req: &KernelRequest, limits: &RateLimitsConfig) -> Option<u32>
         | KernelRequest::GetCapsuleMetadata
         | KernelRequest::GetCapsuleMetadataForPrincipal { .. }
         | KernelRequest::GetAgentReadiness
+        | KernelRequest::GetNativeProtectionCapabilities { .. }
         | KernelRequest::GetInstalledCapsuleIdentity { .. }
         | KernelRequest::GetCapsuleInstallResumeReceipt { .. }
         | KernelRequest::PutCapsuleInstallResumeReceipt { .. }

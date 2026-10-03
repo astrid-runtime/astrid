@@ -359,6 +359,9 @@ impl approval::Host for HostState {
         &mut self,
         mut request: ApprovalRequest,
     ) -> Result<ApprovalResponse, ErrorCode> {
+        if !self.native_external_effect_allowed() {
+            return Err(ErrorCode::StoreUnavailable);
+        }
         if !self.invocation_authority_active() {
             return Err(ErrorCode::StoreUnavailable);
         }

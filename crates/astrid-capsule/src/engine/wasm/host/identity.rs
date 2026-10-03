@@ -28,7 +28,7 @@ impl identity::Host for HostState {
         &mut self,
         request: IdentityResolveRequest,
     ) -> Result<IdentityResolveResponse, ErrorCode> {
-        if !self.invocation_authority_active() {
+        if !self.native_external_effect_allowed() || !self.invocation_authority_active() {
             return Err(ErrorCode::CapabilityDenied);
         }
         let identity_store = self
@@ -64,7 +64,7 @@ impl identity::Host for HostState {
     }
 
     fn identity_link(&mut self, request: IdentityLinkRequest) -> Result<(), ErrorCode> {
-        if !self.invocation_authority_active() {
+        if !self.native_external_effect_allowed() || !self.invocation_authority_active() {
             return Err(ErrorCode::CapabilityDenied);
         }
         let user_id =
@@ -99,7 +99,7 @@ impl identity::Host for HostState {
     }
 
     fn identity_unlink(&mut self, request: IdentityUnlinkRequest) -> Result<(), ErrorCode> {
-        if !self.invocation_authority_active() {
+        if !self.native_external_effect_allowed() || !self.invocation_authority_active() {
             return Err(ErrorCode::CapabilityDenied);
         }
         let identity_store = self
@@ -133,7 +133,7 @@ impl identity::Host for HostState {
         &mut self,
         request: IdentityCreateUserRequest,
     ) -> Result<IdentityCreateUserResponse, ErrorCode> {
-        if !self.invocation_authority_active() {
+        if !self.native_external_effect_allowed() || !self.invocation_authority_active() {
             return Err(ErrorCode::CapabilityDenied);
         }
         let identity_store = self
@@ -166,7 +166,7 @@ impl identity::Host for HostState {
         &mut self,
         astrid_user_id: String,
     ) -> Result<Vec<PlatformLink>, ErrorCode> {
-        if !self.invocation_authority_active() {
+        if !self.native_external_effect_allowed() || !self.invocation_authority_active() {
             return Err(ErrorCode::CapabilityDenied);
         }
         let user_id =

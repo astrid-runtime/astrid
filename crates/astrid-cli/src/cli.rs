@@ -214,6 +214,12 @@ pub(crate) enum Commands {
         command: CapsuleCommands,
     },
 
+    /// Inspect native protection prerequisites on the authenticated daemon.
+    NativeProtection {
+        #[command(subcommand)]
+        command: crate::commands::native_protection::NativeProtectionCommand,
+    },
+
     /// Expose Astrid capsule tools over the Model Context Protocol.
     Mcp {
         #[command(subcommand)]

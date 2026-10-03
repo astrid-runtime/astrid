@@ -26,6 +26,60 @@ fn create_principal(store: &RuntimePrincipalStore, alias: &str) -> PrincipalUid 
 }
 
 #[tokio::test]
+async fn native_candidate_owner_and_capsule_purges_join_fence() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(directory.path());
+    let store = Arc::new(
+        open_runtime_principal_store(&home, unlimited_quota())
+            .await
+            .unwrap(),
+    );
+    let uid = create_principal(&store, "alice");
+    let alias = PrincipalId::new("alice").unwrap();
+    for owner_purge in [false, true] {
+        store
+            .kv()
+            .set("alice:capsule:codewall-enforcer", "policy/active", vec![1])
+            .await
+            .unwrap();
+        let fence = store.native_policy_fence();
+        let guard = fence.lock().await;
+        let writer = Arc::clone(&store);
+        let alias = alias.clone();
+        let task = tokio::spawn(async move {
+            if owner_purge {
+                writer.purge_principal_kv(uid).await.map(|_| ())
+            } else {
+                writer
+                    .purge_capsule_kv_for_owner(uid, &alias, "codewall-enforcer")
+                    .await
+                    .map(|_| ())
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        assert_eq!(
+            store
+                .kv()
+                .get("alice:capsule:codewall-enforcer", "policy/active")
+                .await
+                .unwrap(),
+            Some(vec![1])
+        );
+        drop(guard);
+        task.await.unwrap().unwrap();
+        assert_eq!(
+            store
+                .kv()
+                .get("alice:capsule:codewall-enforcer", "policy/active")
+                .await
+                .unwrap(),
+            None
+        );
+    }
+}
+
+#[tokio::test]
 async fn principal_kv_purge_removes_orphan_namespaces_without_touching_peers() {
     let directory = tempfile::tempdir().unwrap();
     let home = AstridHome::from_path(directory.path());
@@ -50,7 +104,7 @@ async fn principal_kv_purge_removes_orphan_namespaces_without_touching_peers() {
         .await
         .unwrap();
 
-    assert!(store.purge_principal_kv(alice_uid).unwrap());
+    assert!(store.purge_principal_kv(alice_uid).await.unwrap());
 
     assert!(
         store

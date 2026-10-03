@@ -14,6 +14,7 @@ mod install_generation;
 mod install_generation_cas_tests;
 mod installed_identity;
 mod inventory;
+mod native_protection;
 mod projection_names;
 mod rate_limit;
 mod request_policy;
@@ -609,6 +610,23 @@ async fn handle_request(
         },
         KernelRequest::GetCapsuleMetadataForPrincipal { target_principal } => {
             capsule_metadata::response(kernel, &authorization, Some(&target_principal)).await
+        },
+        request @ (KernelRequest::BeginNativePairUpgrade(_)
+        | KernelRequest::StageNativePairMember(_)
+        | KernelRequest::AbortNativePairUpgrade(_)
+        | KernelRequest::GetNativePairUpgrade(_)) => {
+            native_protection::handle_native_pair(kernel, &caller, request).await
+        },
+        KernelRequest::GetNativeProtectionCapabilities { target_principal } => {
+            match kernel
+                .native_protection_capabilities(&target_principal)
+                .await
+            {
+                Ok(capabilities) => KernelResponse::NativeProtectionCapabilities(capabilities),
+                Err(_) => {
+                    KernelResponse::Error("native protection prerequisites unavailable".to_owned())
+                },
+            }
         },
         KernelRequest::GetAgentReadiness => {
             let visibility = CapsuleVisibility::new(&authorization);

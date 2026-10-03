@@ -3,7 +3,19 @@ use astrid_core::kernel_api::{AdminRequestKind, KernelRequest, PairScopeArg};
 use astrid_core::profile::Quotas;
 
 pub(crate) fn all_kernel_request_variants() -> Vec<KernelRequest> {
+    let reference = native_pair_reference();
     vec![
+        KernelRequest::BeginNativePairUpgrade(Box::new(native_pair_begin())),
+        KernelRequest::StageNativePairMember(astrid_core::kernel_api::StageNativePairMember {
+            lease: reference.clone(),
+            member_id: "codewall-enforcer".into(),
+            offset: 0,
+            total_bytes: 1,
+            chunk: vec![0],
+            final_chunk: true,
+        }),
+        KernelRequest::AbortNativePairUpgrade(reference.clone()),
+        KernelRequest::GetNativePairUpgrade(reference),
         KernelRequest::Shutdown { reason: None },
         KernelRequest::GetStatus,
         KernelRequest::ReloadCapsules,
@@ -49,6 +61,9 @@ pub(crate) fn all_kernel_request_variants() -> Vec<KernelRequest> {
             target_principal: PrincipalId::default(),
         },
         KernelRequest::GetAgentReadiness,
+        KernelRequest::GetNativeProtectionCapabilities {
+            target_principal: PrincipalId::default(),
+        },
         KernelRequest::ApproveCapability {
             request_id: "r".into(),
             signature: "s".into(),
@@ -195,4 +210,49 @@ fn credential_variants(principal: &PrincipalId) -> Vec<AdminRequestKind> {
             key_id: "key".into(),
         },
     ]
+}
+
+pub(crate) fn native_pair_reference() -> astrid_core::kernel_api::NativePairLeaseRefV1 {
+    astrid_core::kernel_api::NativePairLeaseRefV1 {
+        lease_id: uuid::Uuid::new_v4(),
+        target_principal: PrincipalId::new("alice").unwrap(),
+        principal_uid: astrid_core::identity::PrincipalUid::from_bytes([1; 32]),
+        daemon_incarnation: uuid::Uuid::new_v4(),
+    }
+}
+pub(crate) fn native_pair_begin() -> astrid_core::kernel_api::BeginNativePairUpgrade {
+    use astrid_core::kernel_api::*;
+    let reference = native_pair_reference();
+    let identity = |id: &str| InstalledCapsuleIdentity {
+        id: id.into(),
+        generation: InstalledCapsuleGeneration {
+            archive: "a".repeat(64),
+            metadata: "b".repeat(64),
+            authority: "c".repeat(64),
+        },
+        archive_digest: "d".repeat(64),
+        wasm_hash: Some("e".repeat(64)),
+    };
+    BeginNativePairUpgrade {
+        target_principal: reference.target_principal,
+        principal_uid: reference.principal_uid,
+        daemon_incarnation: reference.daemon_incarnation,
+        expected_old: NativePairIdentityV1 {
+            enforcer: identity("codewall-enforcer"),
+            protocol: identity("codewall-protocol"),
+            enforcer_source: uuid::Uuid::new_v4(),
+            protocol_source: uuid::Uuid::new_v4(),
+        },
+        members: ["codewall-enforcer", "codewall-protocol"].map(|id| NativePairMemberV1 {
+            id: id.into(),
+            source_digest: "a".repeat(64),
+            source_bytes: 1,
+            authority: CapsuleInstallAuthority::Automatic,
+            env: vec![],
+        }),
+        expires_at_unix_ms: 1,
+        nonce: uuid::Uuid::new_v4(),
+        installation_id: uuid::Uuid::new_v4(),
+        journal_id: uuid::Uuid::new_v4(),
+    }
 }

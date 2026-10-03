@@ -551,6 +551,19 @@ where
     ///
     /// Returns an authoritative recovery or graph-validation error.
     pub fn snapshot(&self, principal: &P) -> Result<Option<RootSnapshot>, DurableError> {
+        self.snapshot_bounded(principal, usize::MAX, u64::MAX)
+    }
+
+    /// Capture a closure with explicit visit and retained-byte limits.
+    ///
+    /// # Errors
+    /// Rejects oversized, missing, or invalid graph objects while traversing.
+    pub fn snapshot_bounded(
+        &self,
+        principal: &P,
+        max_objects: usize,
+        max_bytes: u64,
+    ) -> Result<Option<RootSnapshot>, DurableError> {
         let mut inner = self.lock_usable()?;
         let Some(root) = inner.roots_by_principal.get(principal).copied() else {
             return Ok(None);
@@ -562,7 +575,7 @@ where
             ..
         } = &mut *inner;
         let files = live_files_mut(files)?;
-        let records = materialize_closure(
+        let records = super::validation::materialize_closure_bounded(
             &mut ClosureObjects {
                 arena: &mut files.arena,
                 index,
@@ -572,6 +585,8 @@ where
                 limits: self.limits,
             },
             root.commit,
+            max_objects,
+            max_bytes,
         )?;
         Ok(Some(RootSnapshot { root, records }))
     }

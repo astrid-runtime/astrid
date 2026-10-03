@@ -404,7 +404,9 @@ fn resolve_scope_defaults_to_self_for_caller_owned_lifecycle() {
     for req in all_kernel_request_variants() {
         if matches!(
             req,
-            KernelRequest::ReloadCapsules | KernelRequest::GetCapsuleMetadataForPrincipal { .. }
+            KernelRequest::ReloadCapsules
+                | KernelRequest::GetCapsuleMetadataForPrincipal { .. }
+                | KernelRequest::GetNativeProtectionCapabilities { .. }
         ) {
             continue;
         }
@@ -1853,4 +1855,692 @@ async fn capsule_service_probe_accepts_only_one_compatible_interface_provider() 
         "ambiguous providers must fail closed"
     );
     assert!(probe.subscriber_source_ids(&service_key).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one authenticated self and cross-principal audit flow"
+)]
+async fn native_capabilities_scope_policy() {
+    let directory = tempfile::tempdir().unwrap();
+    let kernel =
+        crate::test_kernel_with_home(astrid_core::dirs::AstridHome::from_path(directory.path()))
+            .await;
+    let caller = PrincipalId::default();
+    let target = PrincipalId::new("native-target").unwrap();
+    kernel
+        .identity_store
+        .create_principal(target.clone(), [91; 32])
+        .await
+        .unwrap();
+    seed_profile(
+        &kernel,
+        &caller,
+        &PrincipalProfile {
+            grants: vec!["self:capsule:list".into()],
+            ..Default::default()
+        },
+    );
+    seed_profile(&kernel, &target, &PrincipalProfile::default());
+    let self_request = KernelRequest::GetNativeProtectionCapabilities {
+        target_principal: caller.clone(),
+    };
+    let other_request = KernelRequest::GetNativeProtectionCapabilities {
+        target_principal: target.clone(),
+    };
+    assert_eq!(resolve_scope(&self_request, &caller), AuthorityScope::Self_);
+    assert_eq!(
+        resolve_scope(&other_request, &caller),
+        AuthorityScope::Global
+    );
+    assert_eq!(
+        required_capability(&self_request, AuthorityScope::Self_),
+        "self:capsule:list"
+    );
+    assert_eq!(
+        required_capability(&other_request, AuthorityScope::Global),
+        "capsule:list"
+    );
+    let profile_path = PrincipalProfile::path_for(&kernel.astrid_home, &target);
+    let before = std::fs::read(&profile_path).unwrap();
+    kernel
+        .kv
+        .set("native-query-test", "stable", b"environment-value".to_vec())
+        .await
+        .unwrap();
+    drop(spawn_kernel_router(Arc::clone(&kernel)));
+    assert!(matches!(
+        request_kernel(&kernel, &caller, "native_self", self_request).await,
+        KernelResponse::NativeProtectionCapabilities(_)
+    ));
+    assert!(matches!(
+        request_kernel(&kernel, &caller, "native_denied", other_request.clone()).await,
+        KernelResponse::Error(_)
+    ));
+    seed_profile(
+        &kernel,
+        &caller,
+        &PrincipalProfile {
+            grants: vec!["capsule:list".into()],
+            ..Default::default()
+        },
+    );
+    let response = request_kernel(&kernel, &caller, "native_other", other_request).await;
+    let KernelResponse::NativeProtectionCapabilities(capabilities) = response else {
+        panic!("{response:?}")
+    };
+    assert_eq!(
+        capabilities.principal_uid,
+        kernel.principal_directory.uid_for(&target).unwrap()
+    );
+    assert_eq!(std::fs::read(&profile_path).unwrap(), before);
+    assert_eq!(
+        kernel.kv.get("native-query-test", "stable").await.unwrap(),
+        Some(b"environment-value".to_vec())
+    );
+    assert!(
+        kernel
+            .principal_store
+            .as_ref()
+            .unwrap()
+            .capsules()
+            .get_snapshot(
+                &astrid_storage::StateOwner::Principal(capabilities.principal_uid),
+                "aos-hook-adapter-oracle"
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(kernel.capsules.read().await.list_for(&target).is_empty());
+    let entries = kernel
+        .audit_log
+        .get_session_entries(&kernel.session_id)
+        .await
+        .unwrap();
+    let rows: Vec<_> = entries.iter().filter(|e| matches!(&e.action, AuditAction::AdminRequest { method, .. } if method == "GetNativeProtectionCapabilities")).collect();
+    assert_eq!(rows.len(), 3);
+    for row in &rows {
+        assert_eq!(row.principal.as_ref(), Some(&caller));
+    }
+    let AuditAction::AdminRequest {
+        target_principal, ..
+    } = &rows[2].action
+    else {
+        unreachable!()
+    };
+    assert_eq!(target_principal.as_ref(), Some(&target));
+}
+
+async fn seed_native_adapter(kernel: &Arc<crate::Kernel>) -> astrid_storage::CapsulePackage {
+    use astrid_capsule_install::{
+        AuthorityDecision, CapsuleMeta, authorize_install, canonical_capsule_archive,
+        inspect_directory_for_principal_in_workspace,
+    };
+    let source = tempfile::tempdir().unwrap();
+    let manifest_text = "[package]\nname = \"aos-hook-adapter-oracle\"\nversion = \"0.1.0\"\n[[component]]\nid = \"adapter\"\nfile = \"main.wasm\"\ntype = \"executable\"\n[publish]\n\"hook.v1.event.*\" = { wit = \"opaque\" }\n\"oracle.v1.hook.response.*\" = { wit = \"opaque\" }\n[subscribe]\n\"oracle.v1.hook.validated.codex\" = { wit = \"opaque\", handler = \"on_codex_hook\" }\n\"oracle.v1.hook.validated.claude\" = { wit = \"opaque\", handler = \"on_claude_hook\" }\n\"oracle.v1.hook.validated.grok\" = { wit = \"opaque\", handler = \"on_grok_hook\" }\n";
+    std::fs::write(source.path().join("Capsule.toml"), manifest_text).unwrap();
+    let wasm = b"\0asm\x01\0\0\0";
+    std::fs::write(source.path().join("main.wasm"), wasm).unwrap();
+    let inspection = inspect_directory_for_principal_in_workspace(
+        source.path(),
+        &kernel.astrid_home,
+        &PrincipalId::default(),
+        false,
+        None,
+        &astrid_core::dirs::WorkspaceLayout::default(),
+    )
+    .unwrap();
+    let mut authority = authorize_install(
+        &inspection,
+        &AuthorityDecision::ExplicitApproval {
+            content_digest: inspection.content_digest.clone(),
+        },
+    )
+    .unwrap();
+    authority.wasm_hash_pinned = true;
+    authority.approved_wasm_hash = Some(blake3::hash(wasm).to_hex().to_string());
+    let hash = blake3::hash(wasm).to_hex().to_string();
+    let metadata = CapsuleMeta {
+        version: "0.1.0".into(),
+        wasm_hash: Some(hash.clone()),
+        ..Default::default()
+    };
+    let package = astrid_storage::CapsulePackage::new(
+        canonical_capsule_archive(source.path()).unwrap(),
+        serde_json::to_vec(&metadata).unwrap(),
+        serde_json::to_vec(&authority).unwrap(),
+    );
+    let principal = PrincipalId::default();
+    let uid = kernel.principal_directory.uid_for(&principal).unwrap();
+    let store = kernel.principal_store.as_ref().unwrap();
+    store
+        .capsules()
+        .install(
+            &astrid_storage::StateOwner::Principal(uid),
+            "aos-hook-adapter-oracle",
+            &package,
+            astrid_storage::CapsuleInstallExpectation::Absent,
+        )
+        .unwrap();
+    store
+        .content()
+        .put(
+            &astrid_storage::StateOwner::System,
+            &astrid_storage::ContentName::new(format!("bin/{hash}.wasm")).unwrap(),
+            wasm,
+        )
+        .unwrap();
+    let manifest = toml::from_str(manifest_text).unwrap();
+    kernel
+        .capsules
+        .write()
+        .await
+        .register_principal_runtime(
+            Box::new(InventoryCapsule {
+                id: CapsuleId::new("aos-hook-adapter-oracle").unwrap(),
+                manifest,
+            }),
+            WasmHash::from_raw(hash),
+            &principal,
+            uid,
+        )
+        .unwrap();
+    package
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one durable adapter identity and denial lifecycle"
+)]
+async fn native_capabilities_bound_to_daemon_and_approved_adapter() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(directory.path());
+    let kernel = crate::test_kernel_with_home(home.clone()).await;
+    let principal = PrincipalId::default();
+    seed_profile(
+        &kernel,
+        &principal,
+        &PrincipalProfile {
+            capsules: vec!["aos-hook-adapter-oracle".into()],
+            ..Default::default()
+        },
+    );
+    assert!(
+        kernel
+            .native_protection_capabilities(&principal)
+            .await
+            .unwrap()
+            .adapter
+            .is_none()
+    );
+    kernel
+        .kv
+        .set(
+            "native-query-test",
+            "bridge-secret",
+            b"secret-value".to_vec(),
+        )
+        .await
+        .unwrap();
+    kernel
+        .kv
+        .set(
+            "native-query-test",
+            "enrollment",
+            b"enrollment-token".to_vec(),
+        )
+        .await
+        .unwrap();
+    kernel
+        .kv
+        .set(
+            "native-query-test",
+            "environment",
+            b"environment-value".to_vec(),
+        )
+        .await
+        .unwrap();
+    let package = seed_native_adapter(&kernel).await;
+    let cap = kernel
+        .native_protection_capabilities(&principal)
+        .await
+        .unwrap();
+    let second = kernel
+        .native_protection_capabilities(&principal)
+        .await
+        .unwrap();
+    assert_eq!(cap, second);
+    assert_eq!(cap.schema_version, 1);
+    assert_eq!(
+        cap.principal_uid,
+        kernel.principal_directory.uid_for(&principal).unwrap()
+    );
+    assert_eq!(cap.context_digest.len(), 64);
+    assert!(
+        cap.context_digest
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    );
+    let other_home = tempfile::tempdir().unwrap();
+    let other =
+        crate::test_kernel_with_home(astrid_core::dirs::AstridHome::from_path(other_home.path()))
+            .await;
+    let other_cap = other
+        .native_protection_capabilities(&principal)
+        .await
+        .unwrap();
+    assert_ne!(cap.daemon_incarnation, other_cap.daemon_incarnation);
+    assert_ne!(cap.context_digest, other_cap.context_digest);
+    assert!(cap.features.contains("interrupted_instance_recovery_v1"));
+    for name in [
+        "native_content_capture_v1",
+        "native_audit_before_reply_v1",
+        "native_pair_upgrade_v1",
+        "generation_env_v1",
+        "candidate_pair_endpoint_v1",
+        "detached_candidate_custody_v1",
+        "recoverable_pair_commit_v1",
+    ] {
+        assert!(!cap.features.contains(name));
+    }
+    let adapter = cap.adapter.as_ref().unwrap();
+    assert!(adapter.approved_for_native_hook);
+    assert_eq!(
+        adapter.source_id,
+        kernel
+            .capsules
+            .read()
+            .await
+            .source_id_for(
+                &principal,
+                &CapsuleId::new("aos-hook-adapter-oracle").unwrap()
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        adapter.identity.wasm_hash.as_deref(),
+        Some(blake3::hash(b"\0asm\x01\0\0\0").to_hex().as_str())
+    );
+    assert_eq!(adapter.authority_class, "explicit-approval");
+    let json = serde_json::to_string(&cap).unwrap();
+    for secret in ["secret-value", "enrollment-token", "environment-value"] {
+        assert!(!json.contains(secret));
+    }
+    seed_profile(&kernel, &principal, &PrincipalProfile::default());
+    assert!(
+        !kernel
+            .native_protection_capabilities(&principal)
+            .await
+            .unwrap()
+            .adapter
+            .unwrap()
+            .approved_for_native_hook
+    );
+    seed_profile(
+        &kernel,
+        &principal,
+        &PrincipalProfile {
+            grants: vec!["capsule:access:any".into()],
+            ..Default::default()
+        },
+    );
+    assert!(
+        kernel
+            .native_protection_capabilities(&principal)
+            .await
+            .unwrap()
+            .adapter
+            .unwrap()
+            .approved_for_native_hook
+    );
+    let uid = cap.principal_uid;
+    let store = kernel.principal_store.as_ref().unwrap();
+    let owner = astrid_storage::StateOwner::Principal(uid);
+    for receipt in [b"null".to_vec(), b"{malformed".to_vec()] {
+        let previous = store
+            .capsules()
+            .get_snapshot(&owner, "aos-hook-adapter-oracle")
+            .unwrap()
+            .unwrap();
+        let bad = astrid_storage::CapsulePackage::new(
+            package.archive.clone(),
+            package.metadata.clone(),
+            receipt,
+        );
+        store
+            .capsules()
+            .install(
+                &owner,
+                "aos-hook-adapter-oracle",
+                &bad,
+                astrid_storage::CapsuleInstallExpectation::Generation(previous.generation()),
+            )
+            .unwrap();
+        assert!(
+            kernel
+                .native_protection_capabilities(&principal)
+                .await
+                .unwrap()
+                .adapter
+                .is_none()
+        );
+    }
+    let previous = store
+        .capsules()
+        .get_snapshot(&owner, "aos-hook-adapter-oracle")
+        .unwrap()
+        .unwrap();
+    store
+        .capsules()
+        .install(
+            &owner,
+            "aos-hook-adapter-oracle",
+            &package,
+            astrid_storage::CapsuleInstallExpectation::Generation(previous.generation()),
+        )
+        .unwrap();
+    kernel
+        .capsules
+        .write()
+        .await
+        .unregister_for(
+            &principal,
+            &CapsuleId::new("aos-hook-adapter-oracle").unwrap(),
+        )
+        .unwrap();
+    let mut wrong = InventoryCapsule::new("aos-hook-adapter-oracle", "unused");
+    wrong.manifest = astrid_capsule_install::read_verified_durable_package_for_owner(
+        store,
+        &owner,
+        "aos-hook-adapter-oracle",
+    )
+    .unwrap()
+    .unwrap()
+    .manifest()
+    .clone();
+    kernel
+        .capsules
+        .write()
+        .await
+        .register_principal_runtime(
+            Box::new(wrong),
+            WasmHash::from_raw("a".repeat(64)),
+            &principal,
+            uid,
+        )
+        .unwrap();
+    assert!(
+        !kernel
+            .native_protection_capabilities(&principal)
+            .await
+            .unwrap()
+            .adapter
+            .unwrap()
+            .approved_for_native_hook
+    );
+    let valid_manifest = astrid_capsule_install::read_verified_durable_package_for_owner(
+        store,
+        &owner,
+        "aos-hook-adapter-oracle",
+    )
+    .unwrap()
+    .unwrap()
+    .manifest()
+    .clone();
+    let id = CapsuleId::new("aos-hook-adapter-oracle").unwrap();
+    let mut registry = kernel.capsules.write().await;
+    registry.unregister_for(&principal, &id).unwrap();
+    registry
+        .register_principal_runtime(
+            Box::new(InventoryCapsule {
+                id,
+                manifest: valid_manifest,
+            }),
+            WasmHash::from_raw(cap.adapter.unwrap().identity.wasm_hash.unwrap()),
+            &principal,
+            uid,
+        )
+        .unwrap();
+    drop(registry);
+    assert!(
+        kernel
+            .native_protection_capabilities(&principal)
+            .await
+            .unwrap()
+            .adapter
+            .unwrap()
+            .approved_for_native_hook
+    );
+    kernel
+        .capabilities
+        .begin_principal_retirement(principal.clone())
+        .await;
+    assert!(
+        !kernel
+            .native_protection_capabilities(&principal)
+            .await
+            .unwrap()
+            .adapter
+            .unwrap()
+            .approved_for_native_hook
+    );
+}
+
+#[test]
+fn native_capabilities_rate_mapping_is_read_only() {
+    let request = KernelRequest::GetNativeProtectionCapabilities {
+        target_principal: PrincipalId::default(),
+    };
+    assert_eq!(
+        rate_limit_for_request(&request),
+        ("GetNativeProtectionCapabilities", None)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "table exercises independent authority and live-runtime denial cases"
+)]
+async fn native_capabilities_reject_unpinned_legacy_and_mismatched_runtime() {
+    use astrid_capsule_install::authority::{AuthoritySource, InstalledAuthority};
+    for scenario in ["legacy", "unpinned", "manifest", "owner", "disabled"] {
+        let directory = tempfile::tempdir().unwrap();
+        let kernel = crate::test_kernel_with_home(astrid_core::dirs::AstridHome::from_path(
+            directory.path(),
+        ))
+        .await;
+        let principal = PrincipalId::default();
+        seed_profile(
+            &kernel,
+            &principal,
+            &PrincipalProfile {
+                capsules: vec!["aos-hook-adapter-oracle".into()],
+                ..Default::default()
+            },
+        );
+        let package = seed_native_adapter(&kernel).await;
+        assert!(
+            kernel
+                .native_protection_capabilities(&principal)
+                .await
+                .unwrap()
+                .adapter
+                .unwrap()
+                .approved_for_native_hook
+        );
+        let uid = kernel.principal_directory.uid_for(&principal).unwrap();
+        let owner = astrid_storage::StateOwner::Principal(uid);
+        let store = kernel.principal_store.as_ref().unwrap();
+        let id = CapsuleId::new("aos-hook-adapter-oracle").unwrap();
+        match scenario {
+            "legacy" | "unpinned" => {
+                let mut receipt: InstalledAuthority =
+                    serde_json::from_slice(&package.authority).unwrap();
+                if scenario == "legacy" {
+                    receipt.source = AuthoritySource::LegacyMigration;
+                } else {
+                    receipt.wasm_hash_pinned = false;
+                    receipt.approved_wasm_hash = None;
+                }
+                let previous = store
+                    .capsules()
+                    .get_snapshot(&owner, id.as_str())
+                    .unwrap()
+                    .unwrap();
+                let replacement = astrid_storage::CapsulePackage::new(
+                    package.archive,
+                    package.metadata,
+                    serde_json::to_vec(&receipt).unwrap(),
+                );
+                store
+                    .capsules()
+                    .install(
+                        &owner,
+                        id.as_str(),
+                        &replacement,
+                        astrid_storage::CapsuleInstallExpectation::Generation(
+                            previous.generation(),
+                        ),
+                    )
+                    .unwrap();
+            },
+            "manifest" | "owner" => {
+                let verified = astrid_capsule_install::read_verified_durable_package_for_owner(
+                    store,
+                    &owner,
+                    id.as_str(),
+                )
+                .unwrap()
+                .unwrap();
+                let mut manifest = verified.manifest().clone();
+                if scenario == "manifest" {
+                    manifest.publishes.remove("hook.v1.event.*");
+                }
+                let runtime_uid = if scenario == "owner" {
+                    astrid_core::PrincipalUid::from_bytes([99; 32])
+                } else {
+                    uid
+                };
+                let hash = verified.metadata().wasm_hash.clone().unwrap();
+                let mut registry = kernel.capsules.write().await;
+                registry.unregister_for(&principal, &id).unwrap();
+                registry
+                    .register_principal_runtime(
+                        Box::new(InventoryCapsule { id, manifest }),
+                        WasmHash::from_raw(hash),
+                        &principal,
+                        runtime_uid,
+                    )
+                    .unwrap();
+            },
+            "disabled" => seed_profile(
+                &kernel,
+                &principal,
+                &PrincipalProfile {
+                    enabled: false,
+                    capsules: vec!["aos-hook-adapter-oracle".into()],
+                    ..Default::default()
+                },
+            ),
+            _ => unreachable!(),
+        }
+        assert!(
+            !kernel
+                .native_protection_capabilities(&principal)
+                .await
+                .unwrap()
+                .adapter
+                .unwrap()
+                .approved_for_native_hook,
+            "{scenario} must fail closed"
+        );
+    }
+}
+
+#[test]
+fn native_pair_lease_scope_policy_uses_existing_install_authority() {
+    let self_caller = PrincipalId::new("alice").unwrap();
+    let other_caller = PrincipalId::new("bob").unwrap();
+    for request in all_kernel_request_variants().into_iter().filter(|request| {
+        matches!(
+            request,
+            KernelRequest::BeginNativePairUpgrade(_)
+                | KernelRequest::StageNativePairMember(_)
+                | KernelRequest::AbortNativePairUpgrade(_)
+                | KernelRequest::GetNativePairUpgrade(_)
+        )
+    }) {
+        assert_eq!(resolve_scope(&request, &self_caller), AuthorityScope::Self_);
+        assert_eq!(
+            resolve_scope(&request, &other_caller),
+            AuthorityScope::Global
+        );
+        assert_eq!(
+            required_capability(&request, AuthorityScope::Self_),
+            "self:capsule:install"
+        );
+        assert_eq!(
+            required_capability(&request, AuthorityScope::Global),
+            "capsule:install"
+        );
+        assert_eq!(
+            super::request_policy::request_target_principal(&request, &other_caller),
+            Some(self_caller.clone())
+        );
+        assert!(rate_limit_for_request(&request).1.is_some());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_pair_lease_router_rejects_cross_target_spoof() {
+    let directory = tempfile::tempdir().unwrap();
+    let kernel =
+        crate::test_kernel_with_home(astrid_core::dirs::AstridHome::from_path(directory.path()))
+            .await;
+    let caller = PrincipalId::default();
+    seed_profile(
+        &kernel,
+        &caller,
+        &PrincipalProfile {
+            grants: vec!["self:capsule:install".into()],
+            ..Default::default()
+        },
+    );
+    let mut reference = super::test_util::native_pair_reference();
+    reference.daemon_incarnation = kernel.native_protection_incarnation;
+    drop(spawn_kernel_router(Arc::clone(&kernel)));
+    let response = request_kernel(
+        &kernel,
+        &caller,
+        "pair_cross_target",
+        KernelRequest::AbortNativePairUpgrade(reference.clone()),
+    )
+    .await;
+    assert!(matches!(response, KernelResponse::Error(_)));
+    seed_profile(
+        &kernel,
+        &caller,
+        &PrincipalProfile {
+            grants: vec!["capsule:install".into()],
+            ..Default::default()
+        },
+    );
+    let response = request_kernel(
+        &kernel,
+        &caller,
+        "pair_unknown_target",
+        KernelRequest::GetNativePairUpgrade(reference.clone()),
+    )
+    .await;
+    assert!(matches!(response, KernelResponse::Error(_)));
+    assert!(
+        kernel
+            .principal_directory
+            .uid_for(&reference.target_principal)
+            .is_err(),
+        "lookup must not provision a target"
+    );
 }

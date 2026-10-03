@@ -32,6 +32,8 @@ mod durable;
 mod durable_cache;
 mod kv;
 mod muninn;
+#[cfg(not(target_family = "wasm"))]
+pub mod native_pair;
 mod projection;
 mod refinery;
 

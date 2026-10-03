@@ -254,7 +254,7 @@ pub(super) async fn finish_identity_removal(
         .await
         .map_err(|e| err_internal(format!("post-identity capability purge failed: {e}")))?;
     if let (Some(store), Some(uid)) = (&kernel.principal_store, principal_uid) {
-        store.purge_principal_kv(uid).map_err(|e| {
+        store.purge_principal_kv(uid).await.map_err(|e| {
             err_internal(format!("post-identity principal state purge failed: {e}"))
         })?;
     }
@@ -302,7 +302,7 @@ async fn retire_and_reclaim(
     // corrupt/missing installations. Legacy/test compositions without the
     // native store retain the prior best-effort namespace fallback.
     if let (Some(store), Some(uid)) = (&kernel.principal_store, principal_uid) {
-        if let Err(error) = store.purge_principal_kv(uid) {
+        if let Err(error) = store.purge_principal_kv(uid).await {
             authority_errors.push(format!("principal state: {error}"));
         }
     } else {

@@ -11,6 +11,9 @@ impl HostState {
         &self,
         principal: &astrid_core::PrincipalId,
     ) -> Option<HashMap<String, String>> {
+        if let Some(candidate) = &self.native_candidate {
+            return Some(candidate.env());
+        }
         let backend = self.kv_backend.clone();
         let capsule = self.capsule_id.to_string();
         let principal_uid = self.principal_directory.uid_for(principal).ok()?;
@@ -65,7 +68,11 @@ impl HostState {
         self.invocation_capsule_log = self.capsule_log.clone();
         self.invocation_profile = Some(owner_profile);
         self.invocation_profile_authorized = true;
-        self.invocation_env_overlay = owner_env;
+        self.invocation_env_overlay = self
+            .native_candidate
+            .as_ref()
+            .map(|candidate| candidate.env())
+            .or(owner_env);
         let owner = self.principal.clone();
         self.install_invocation_cancel_token(Some(&owner));
         Ok(())
@@ -369,6 +376,12 @@ impl HostState {
     /// rather than a per-message mount. `home://` is bound to the durable UID
     /// directory; only `/tmp` uses an ephemeral native scratch mount.
     fn install_recv_invocation_vfs(&mut self, principal: Option<&astrid_core::PrincipalId>) {
+        if self.native_candidate.is_some() {
+            self.invocation_home = self.home.clone();
+            self.invocation_workspace = self.workspace.clone();
+            self.invocation_tmp = self.tmp.clone();
+            return;
+        }
         let Some(principal) = principal else {
             self.invocation_home = None;
             self.invocation_workspace = None;

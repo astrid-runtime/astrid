@@ -188,6 +188,11 @@ pub const fn topic_suffix(req: &KernelRequest) -> &'static str {
         KernelRequest::GetCapsuleMetadata => "metadata",
         KernelRequest::GetCapsuleMetadataForPrincipal { .. } => "principal_metadata",
         KernelRequest::GetAgentReadiness => "agent_readiness",
+        KernelRequest::GetNativeProtectionCapabilities { .. } => "native_protection_capabilities",
+        KernelRequest::BeginNativePairUpgrade(_) => "begin_native_pair_upgrade",
+        KernelRequest::StageNativePairMember(_) => "stage_native_pair_member",
+        KernelRequest::AbortNativePairUpgrade(_) => "abort_native_pair_upgrade",
+        KernelRequest::GetNativePairUpgrade(_) => "get_native_pair_upgrade",
         KernelRequest::Shutdown { .. } => "shutdown",
         KernelRequest::GetStatus => "status",
     }
@@ -860,5 +865,37 @@ mod tests {
             "ConnectionLost must carry its ReadError source: {err:?}"
         );
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod native_capabilities_tests {
+    use super::*;
+
+    #[test]
+    fn native_capabilities_transport_preserves_authenticated_actor() {
+        let actor = PrincipalId::new("operator").unwrap();
+        let request = KernelRequest::GetNativeProtectionCapabilities {
+            target_principal: PrincipalId::new("protected").unwrap(),
+        };
+        let (message, response) =
+            build_request_message(&actor, Some("device-id"), &request).unwrap();
+        assert_eq!(message.principal.as_deref(), Some("operator"));
+        assert_eq!(message.device_key_id.as_deref(), Some("device-id"));
+        assert!(
+            message
+                .topic
+                .starts_with("astrid.v1.request.native_protection_capabilities.")
+        );
+        assert_eq!(
+            response.as_str(),
+            message
+                .topic
+                .replacen("astrid.v1.request.", "astrid.v1.response.", 1)
+        );
+        let IpcPayload::RawJson(json) = message.payload else {
+            panic!("wrong payload")
+        };
+        assert_eq!(json["params"]["target_principal"], "protected");
     }
 }

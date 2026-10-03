@@ -70,6 +70,7 @@ pub mod lifecycle;
 pub mod local;
 pub mod manifest_check;
 pub mod meta;
+pub mod native_pair;
 pub mod paths;
 pub mod principal_introspection;
 pub mod source_digest;

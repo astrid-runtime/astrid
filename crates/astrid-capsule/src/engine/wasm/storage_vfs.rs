@@ -23,15 +23,6 @@ use tokio::sync::{Mutex, RwLock};
 
 use astrid_vfs::{Vfs, VfsDirEntry, VfsError, VfsMetadata, VfsResult};
 
-type RuntimeFilesystem = AstridFilesystem<
-    StateOwner,
-    astrid_storage::engine::DurableEngine<
-        StateOwner,
-        astrid_storage::Blake3ObjectIdentityV1,
-        astrid_storage::StateOwnerCodecV2,
-    >,
->;
-
 type RuntimeWorkspaceFilesystem = astrid_storage::WorkspaceFilesystem<
     StateOwner,
     astrid_storage::engine::DurableEngine<
@@ -61,9 +52,17 @@ trait StorageBackend: Send + Sync {
     fn remove(&self, path: &FilesystemPath) -> Result<(), FilesystemError>;
 }
 
-struct OwnerBackend(RuntimeFilesystem);
+struct OwnerBackend<
+    E = astrid_storage::engine::DurableEngine<
+        StateOwner,
+        astrid_storage::Blake3ObjectIdentityV1,
+        astrid_storage::StateOwnerCodecV2,
+    >,
+>(AstridFilesystem<StateOwner, E>);
 
-impl StorageBackend for OwnerBackend {
+impl<E: astrid_storage::engine::PrincipalProjectionEngine<StateOwner> + Send + Sync + 'static>
+    StorageBackend for OwnerBackend<E>
+{
     fn stat(
         &self,
         path: &FilesystemPath,
@@ -157,6 +156,20 @@ pub(crate) struct AstridStorageVfs {
 }
 
 impl AstridStorageVfs {
+    /// Bind a private owner projection; never consult native paths.
+    pub(crate) fn detached(
+        content: Arc<astrid_storage::engine::native_pair::NativePairContent>,
+        owner: StateOwner,
+        prefix: &str,
+        root: DirHandle,
+    ) -> VfsResult<Self> {
+        let prefix = FilesystemPath::new(prefix.to_owned()).map_err(map_filesystem_error)?;
+        Self::with_prefix(
+            Box::new(OwnerBackend(AstridFilesystem::new(content, owner))),
+            prefix,
+            root,
+        )
+    }
     /// Bind one already-authorized owner to the durable content projection.
     #[cfg(test)]
     pub(crate) fn new(store: &RuntimePrincipalStore, owner: StateOwner, root: DirHandle) -> Self {

@@ -133,6 +133,7 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         principal_invocations: None,
         profile_cache: None,
         invocation_env_overlay: None,
+        native_candidate: None,
         kv,
         kv_backend,
         event_bus: astrid_events::EventBus::with_capacity(128),

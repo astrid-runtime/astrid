@@ -216,6 +216,9 @@ async fn dispatch_subcommand(
             Ok(ExitCode::SUCCESS)
         },
         Some(Commands::Capsule { command }) => dispatch_capsule(command).await,
+        Some(Commands::NativeProtection { command }) => {
+            commands::native_protection::run(command).await
+        },
         Some(Commands::Mcp { command }) => dispatch_mcp(command).await,
         Some(Commands::Distro { command }) => dispatch_distro(command).await,
         Some(Commands::Wit { command }) => dispatch_wit(&command),

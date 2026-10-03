@@ -456,12 +456,47 @@ pub struct RuntimePrincipalStore {
     directory_cutover_receipt: Arc<str>,
     runtime_kv: Arc<RuntimeStore>,
     kv: Arc<dyn KvStore>,
+    native_policy_fence: Arc<crate::kv::native_candidate::NativePolicyFence>,
     content: Arc<NativePrincipalContentStore>,
     staging: Arc<OnceLock<Arc<NativeContentStagingArea>>>,
     principals: PrincipalDirectory,
 }
 
 impl RuntimePrincipalStore {
+    /// Shared write fence for native policy and explicitly pinned dependencies.
+    #[must_use]
+    pub fn native_policy_fence(&self) -> Arc<crate::kv::native_candidate::NativePolicyFence> {
+        Arc::clone(&self.native_policy_fence)
+    }
+
+    /// Capture one admitted owner on a blocking worker. Caller holds the native fence.
+    ///
+    /// # Errors
+    /// Rejects unknown principals, oversized state, or inconsistent graph closure.
+    pub async fn native_candidate_snapshot(
+        &self,
+        uid: PrincipalUid,
+    ) -> StorageResult<Option<crate::engine::RootSnapshot>> {
+        if !self.principals.contains_uid(uid) {
+            return Err(StorageError::InvalidKey(
+                "native candidate UID is not admitted".into(),
+            ));
+        }
+        let engine = Arc::clone(&self.engine);
+        tokio::task::spawn_blocking(move || {
+            engine
+                .snapshot_bounded(
+                    &StateOwner::Principal(uid),
+                    crate::engine::native_pair::MAX_NATIVE_SNAPSHOT_OBJECTS,
+                    crate::engine::native_pair::MAX_NATIVE_SNAPSHOT_BYTES,
+                )
+                .map_err(|error| {
+                    StorageError::Internal(format!("native candidate snapshot: {error}"))
+                })
+        })
+        .await
+        .map_err(|_| StorageError::Internal("native snapshot worker failed".into()))?
+    }
     /// Retire the verified directory-store cutover source after the caller's
     /// global migration barrier is durable.
     ///
@@ -723,7 +758,8 @@ impl RuntimePrincipalStore {
     ///
     /// Returns a storage error if the principal's authoritative KV state cannot
     /// be read or the clearing mutation cannot be committed.
-    pub fn purge_principal_kv(&self, principal: PrincipalUid) -> StorageResult<bool> {
+    pub async fn purge_principal_kv(&self, principal: PrincipalUid) -> StorageResult<bool> {
+        let _guard = self.native_policy_fence.lock().await;
         let owner = StateOwner::Principal(principal);
         self.runtime_kv
             .clear_owner(&owner)
@@ -768,6 +804,11 @@ impl RuntimePrincipalStore {
         alias: &PrincipalId,
         capsule: &str,
     ) -> StorageResult<u64> {
+        let _guard = if capsule == "codewall-enforcer" {
+            Some(self.native_policy_fence.lock().await)
+        } else {
+            None
+        };
         self.runtime_kv
             .clear_namespace_for_owner(
                 &StateOwner::Principal(principal),
