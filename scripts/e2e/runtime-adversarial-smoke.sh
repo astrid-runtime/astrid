@@ -897,22 +897,25 @@ run_adversarial_principal_postcondition_smoke() {
   status="$(http_status GET "/api/sys/principals/$user_principal/quotas" "$user_bearer" "" \
     "$ARTIFACTS/adversarial-user-quota-before-spoof.json")"
   assert_status "agent quota read before spoof" "$status" 200
-  body="$(quota_request_body_with_principal "$ARTIFACTS/adversarial-user-quota-before-spoof.json" 7 "$ops_principal")"
+  # Use an allowed attenuation so a quota-escalation denial cannot hide a
+  # routing bug: the URL principal must win over both spoofed values.
+  body="$(quota_request_body_with_principal "$ARTIFACTS/adversarial-user-quota-before-spoof.json" 3 "$ops_principal")"
   status="$(http_status PUT "/api/sys/principals/$user_principal/quotas?principal=$ops_principal" \
     "$user_bearer" "$body" "$ARTIFACTS/adversarial-quota-query-body-spoof.json")"
   assert_status "agent quota query and body principal spoof only touches caller path" "$status" 200
   status="$(http_status GET "/api/sys/principals/$user_principal/quotas" "$user_bearer" "" \
     "$ARTIFACTS/adversarial-user-quota-after-spoof.json")"
   assert_status "agent quota read after spoof" "$status" 200
-  json_assert_field_equals "$ARTIFACTS/adversarial-user-quota-after-spoof.json" max_background_processes 7
+  json_assert_field_equals "$ARTIFACTS/adversarial-user-quota-after-spoof.json" max_background_processes 3
   status="$(http_status GET "/api/sys/principals/$ops_principal/quotas" "$admin_bearer" "" \
     "$ARTIFACTS/adversarial-ops-quota-after-spoof.json")"
   assert_status "operator quota read after spoof" "$status" 200
   json_assert_field_equals "$ARTIFACTS/adversarial-ops-quota-after-spoof.json" max_background_processes 8
-  body="$(quota_request_body "$ARTIFACTS/adversarial-user-quota-before-spoof.json" 4)"
-  status="$(http_status PUT "/api/sys/principals/$user_principal/quotas" "$user_bearer" "$body" \
+  body="$(quota_request_body "$ARTIFACTS/adversarial-user-quota-before-spoof.json" \
+    "$(json_field "$ARTIFACTS/adversarial-user-quota-before-spoof.json" max_background_processes)")"
+  status="$(http_status PUT "/api/sys/principals/$user_principal/quotas" "$admin_bearer" "$body" \
     "$ARTIFACTS/adversarial-user-quota-spoof-restore.json")"
-  assert_status "agent quota restore after spoof" "$status" 200
+  assert_status "admin quota restore after spoof" "$status" 200
   body="$(quota_request_body "$ARTIFACTS/adversarial-ops-quota-before-spoof.json" \
     "$(json_field "$ARTIFACTS/adversarial-ops-quota-before-spoof.json" max_background_processes)")"
   status="$(http_status PUT "/api/sys/principals/$ops_principal/quotas" "$admin_bearer" "$body" \

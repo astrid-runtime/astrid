@@ -138,6 +138,7 @@ mod tests {
             }),
             groups: std::sync::Arc::new(GroupConfig::builtin_only()),
             device_scope: None,
+            device_key_id: None,
             authenticated_public_key: None,
         };
         let status = dispatch(

@@ -8,39 +8,40 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
+use crate::kernel_router::{AuthorizedRequest, authorize_request};
 use astrid_core::principal::PrincipalId;
-use astrid_core::profile::PrincipalProfile;
+use astrid_core::profile::{PrincipalProfile, Quotas};
 use astrid_events::kernel_api::{AdminResponseBody, ResourceUsage};
 
+mod set;
+#[cfg(test)]
+mod tests;
+pub(super) use set::quota_set;
+
 use super::handlers::{
-    err_bad_input, err_profile, principal_profile_path, require_principal_exists, success_json,
+    err_bad_input, err_profile, principal_profile_path, require_principal_exists,
 };
 
-pub(super) async fn quota_set(
-    kernel: &Arc<crate::Kernel>,
-    principal: PrincipalId,
-    quotas: astrid_core::profile::Quotas,
-) -> AdminResponseBody {
-    // Validate before taking the write lock — quick reject on bad input.
-    if let Err(e) = quotas.validate() {
-        return err_bad_input(format!("quotas rejected: {e}"));
-    }
-
-    let _guard = kernel.admin_write_lock.lock().await;
-    let path = principal_profile_path(kernel, &principal);
-    if let Err(msg) = require_principal_exists(&principal, &path) {
-        return err_bad_input(msg);
-    }
-    let mut profile = match PrincipalProfile::load_from_path(&path) {
-        Ok(p) => p,
-        Err(e) => return err_profile(&principal, &e),
-    };
-    profile.quotas = quotas;
-    if let Err(e) = profile.save_to_path(&path) {
-        return err_profile(&principal, &e);
-    }
-    kernel.profile_cache.invalidate(&principal);
-    success_json(serde_json::json!({ "principal": principal.as_str() }))
+fn is_attenuation(requested: &Quotas, current: &Quotas) -> bool {
+    // Exhaustive destructuring makes a new quota dimension a compile-time
+    // obligation here rather than silently allowing self escalation.
+    let Quotas {
+        max_memory_bytes,
+        max_timeout_secs,
+        max_ipc_throughput_bytes,
+        max_background_processes,
+        max_storage_bytes,
+        max_cpu_fuel_per_sec,
+        max_in_flight_calls,
+    } = requested;
+    *max_memory_bytes <= current.max_memory_bytes
+        && *max_timeout_secs <= current.max_timeout_secs
+        && *max_ipc_throughput_bytes <= current.max_ipc_throughput_bytes
+        && *max_background_processes <= current.max_background_processes
+        && *max_storage_bytes <= current.max_storage_bytes
+        && *max_cpu_fuel_per_sec <= current.max_cpu_fuel_per_sec
+        && *max_in_flight_calls <= current.max_in_flight_calls
 }
 
 pub(super) fn quota_get(kernel: &Arc<crate::Kernel>, principal: &PrincipalId) -> AdminResponseBody {
