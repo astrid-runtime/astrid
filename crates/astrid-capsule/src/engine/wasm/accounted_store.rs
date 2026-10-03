@@ -9,7 +9,31 @@ use crate::user_cpu::throttle::ExecutionThrottle;
 use wasmtime::{AsContext, AsContextMut, Store, StoreContext, StoreContextMut};
 
 #[cfg(test)]
+mod run_loop_tests;
+#[cfg(test)]
 mod tests;
+
+impl AccountedStore<super::HostState> {
+    pub(super) fn configure_run_epochs(&mut self, budget: &super::RunLoopBudget) {
+        let window = budget.window_ticks;
+        let mut until_watchdog = window.unwrap_or(super::DEFAULT_RUN_LOOP_WINDOW_TICKS);
+        if !self.configure_metered_epochs(1, move |state| {
+            // Accounting samples are more frequent than watchdog windows.
+            // Do not turn three original windows into three sampling ticks.
+            until_watchdog = until_watchdog.saturating_sub(1);
+            if until_watchdog != 0 {
+                return false;
+            }
+            until_watchdog = window.unwrap_or(super::DEFAULT_RUN_LOOP_WINDOW_TICKS);
+            matches!(
+                super::run_epoch_action(state, window),
+                super::EpochAction::Interrupt
+            )
+        }) {
+            super::configure_run_store(self, budget);
+        }
+    }
+}
 
 #[derive(Clone)]
 struct Meter {
@@ -121,14 +145,26 @@ impl<T: Send + 'static> AccountedStore<T> {
 
     /// Return false for the unchanged personal scheduler. Configured user
     /// execution waits instead of discarding a long-running guest's state.
+    #[cfg(test)]
     pub(super) fn configure_rate_epochs(&mut self, ticks: u64) -> bool {
+        self.configure_metered_epochs(ticks, |_| false)
+    }
+
+    fn configure_metered_epochs(
+        &mut self,
+        ticks: u64,
+        mut interrupt: impl FnMut(&mut T) -> bool + Send + Sync + 'static,
+    ) -> bool {
         let Some(meter) = self.meter.clone() else {
             return false;
         };
         self.store.set_epoch_deadline(ticks);
-        self.store.epoch_deadline_callback(move |context| {
+        self.store.epoch_deadline_callback(move |mut context| {
             meter.observe(context.get_fuel()?)?;
             meter.check_allowance()?;
+            if interrupt(context.data_mut()) {
+                return Ok(wasmtime::UpdateDeadline::Interrupt);
+            }
             let throttle = meter.throttle.clone();
             Ok(wasmtime::UpdateDeadline::YieldCustom(
                 ticks,

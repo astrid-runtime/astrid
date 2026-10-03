@@ -1233,32 +1233,30 @@ pub(crate) const fn exempt_epoch_action(window_ticks: u64) -> EpochAction {
 /// worker every window. `UpdateDeadline::Yield` is async-legal because the run
 /// loop drives the guest via `call_async`.
 fn configure_run_store(store: &mut Store<HostState>, run_budget: &RunLoopBudget) {
-    if let Some(window_ticks) = run_budget.window_ticks {
-        store.set_epoch_deadline(window_ticks);
-        store.epoch_deadline_callback(move |mut store_ctx| {
-            let st = store_ctx.data_mut();
-            let (action, recv_yielded, no_yield_windows) = epoch_decision(
-                st.recv_yielded,
-                st.no_yield_windows,
-                window_ticks,
-                MAX_NO_YIELD_WINDOWS,
-            );
-            st.recv_yielded = recv_yielded;
-            st.no_yield_windows = no_yield_windows;
-            Ok(match action {
-                EpochAction::Yield(ticks) => wasmtime::UpdateDeadline::Yield(ticks),
-                EpochAction::Interrupt => wasmtime::UpdateDeadline::Interrupt,
-            })
-        });
+    let window = run_budget.window_ticks;
+    store.set_epoch_deadline(window.unwrap_or(DEFAULT_RUN_LOOP_WINDOW_TICKS));
+    store.epoch_deadline_callback(move |mut context| {
+        Ok(match run_epoch_action(context.data_mut(), window) {
+            EpochAction::Yield(ticks) => wasmtime::UpdateDeadline::Yield(ticks),
+            EpochAction::Interrupt => wasmtime::UpdateDeadline::Interrupt,
+        })
+    });
+}
+
+/// One watchdog policy for both personal and user-accounted run loops.
+fn run_epoch_action(state: &mut HostState, window: Option<u64>) -> EpochAction {
+    if let Some(window) = window {
+        let (action, recv_yielded, no_yield_windows) = epoch_decision(
+            state.recv_yielded,
+            state.no_yield_windows,
+            window,
+            MAX_NO_YIELD_WINDOWS,
+        );
+        state.recv_yielded = recv_yielded;
+        state.no_yield_windows = no_yield_windows;
+        action
     } else {
-        let window_ticks = DEFAULT_RUN_LOOP_WINDOW_TICKS;
-        store.set_epoch_deadline(window_ticks);
-        store.epoch_deadline_callback(move |_store_ctx| {
-            Ok(match exempt_epoch_action(window_ticks) {
-                EpochAction::Yield(ticks) => wasmtime::UpdateDeadline::Yield(ticks),
-                EpochAction::Interrupt => wasmtime::UpdateDeadline::Interrupt,
-            })
-        });
+        exempt_epoch_action(DEFAULT_RUN_LOOP_WINDOW_TICKS)
     }
 }
 
@@ -2919,8 +2917,8 @@ impl ExecutionEngine for WasmEngine {
                 // the run loop is NOT fuel-bound, so re-seed it to
                 // effectively-infinite (a 0-fuel Store traps, and a run loop must
                 // never fuel-out). Configured user budgets account sampled
-                // fuel and wait without killing the guest. Otherwise retain
-                // the existing epoch policy (`configure_run_store`). For the single-worker
+                // fuel and wait without resetting the guest. Both retain the
+                // existing runaway epoch policy. For the single-worker
                 // default this drains exactly one instance — identical to the
                 // prior `pop()` path.
                 for mut pi in initial_instances.drain(..) {
@@ -2929,9 +2927,7 @@ impl ExecutionEngine for WasmEngine {
                             "Failed to set run-loop fuel: {e}"
                         ))
                     })?;
-                    if !pi.store.configure_rate_epochs(1) {
-                        configure_run_store(&mut pi.store, &run_budget);
-                    }
+                    pi.store.configure_run_epochs(&run_budget);
                     run_stores.push((Arc::new(AsyncMutex::new(pi.store)), pi.instance));
                 }
             } else {
