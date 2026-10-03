@@ -141,7 +141,9 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ### Security
 
-- Update Wasmtime and wasmtime-wasi from 48.0.1 to 48.0.3 to address RUSTSEC-2026-0314, RUSTSEC-2026-0315, and RUSTSEC-2026-0316.
+- Use Wasmtime and wasmtime-wasi 48.0.5, addressing RUSTSEC-2026-0314,
+  RUSTSEC-2026-0315, RUSTSEC-2026-0316, and RUSTSEC-2026-0321 through
+  RUSTSEC-2026-0327.
 
 - Discard interrupted WASM interceptor instances and deny ordered execution when
   the guest fails before producing a decision.

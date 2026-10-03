@@ -15,6 +15,10 @@ or guarantee that an over-budget capsule can complete its work.
 
 ## Qualification
 
+Wasmtime and WASI use the patched 48.0.5 minimum for RustSec advisories
+RUSTSEC-2026-0321 through RUSTSEC-2026-0327. The release lockfile and the
+dependency audit must satisfy these patches; advisory exceptions are empty.
+
 Run `cargo test --locked -p astrid-capsule --lib
 engine::wasm::interruption_tests` on the release source, on Linux and macOS.
 The suite covers fuel, epoch expiry, cancellation, guest traps, single-slot
