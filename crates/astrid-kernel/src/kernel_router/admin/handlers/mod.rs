@@ -30,9 +30,7 @@ use std::sync::Arc;
 
 use astrid_core::capability_grammar::validate_capability;
 use astrid_core::principal::PrincipalId;
-use astrid_core::profile::{
-    CapabilityPattern, CapsuleGrant, GroupName, PrincipalProfile, ProfileError,
-};
+use astrid_core::profile::{CapabilityPattern, CapsuleGrant, GroupName, PrincipalProfile};
 use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody, AgentSummary};
 use tracing::{info, warn};
 
@@ -41,6 +39,8 @@ use crate::kernel_router::AuthorizedRequest;
 pub(super) mod creation_authority;
 mod distro_dispatch;
 mod env_handlers;
+mod responses;
+pub(super) use responses::{err_bad_input, err_internal, err_profile, success_json};
 mod user_principals;
 use super::inheritance::copy_modify_env;
 use env_handlers::{EnvSetRequest, env_delete, env_list, env_set};
@@ -990,22 +990,4 @@ pub(crate) fn require_principal_exists(principal: &PrincipalId, path: &Path) -> 
             path.display()
         ))
     }
-}
-
-pub(super) fn err_bad_input(msg: String) -> AdminResponseBody {
-    warn!(error = %msg, "admin request rejected: bad input");
-    AdminResponseBody::Error(msg)
-}
-
-pub(super) fn err_internal(msg: String) -> AdminResponseBody {
-    warn!(error = %msg, "admin request failed: internal error");
-    AdminResponseBody::Error(msg)
-}
-
-pub(super) fn err_profile(principal: &PrincipalId, e: &ProfileError) -> AdminResponseBody {
-    err_internal(format!("profile error for {principal}: {e}"))
-}
-
-pub(super) fn success_json(val: serde_json::Value) -> AdminResponseBody {
-    AdminResponseBody::Success(val)
 }
