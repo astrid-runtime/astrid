@@ -140,7 +140,15 @@ async fn dispatch_inner(
         },
         req @ AdminRequestKind::AgentModify { .. } => agent_modify_from_req(kernel, req).await,
         AdminRequestKind::QuotaSet { principal, quotas } => {
-            super::quota::quota_set(kernel, principal, quotas).await
+            super::quota::quota_set(
+                kernel,
+                caller,
+                authorization,
+                device_key_id,
+                principal,
+                quotas,
+            )
+            .await
         },
         AdminRequestKind::QuotaGet { principal } => super::quota::quota_get(kernel, &principal),
         AdminRequestKind::UsageGet { principal } => super::quota::usage_get(kernel, &principal),
