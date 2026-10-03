@@ -40,6 +40,19 @@ pub(super) struct Lease {
     pub(super) old: Option<super::OldPair>,
 }
 
+impl Lease {
+    /// Discard every private resource through one terminal transition.
+    fn abort(&mut self) {
+        self.state.phase = NativePairPhaseV1::Aborted;
+        self.buffers = Default::default();
+        self.verified = Default::default();
+        self.old = None;
+        for member in &mut self.request.members {
+            member.env.clear();
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct LeaseStore {
     pub(super) leases: HashMap<Uuid, Lease>,
@@ -189,13 +202,7 @@ impl LeaseStore {
         lease.completed[index] = true;
         let bytes = std::mem::take(&mut lease.buffers[index]);
         if blake3::hash(&bytes).to_hex().as_str() != member.source_digest {
-            lease.state.phase = NativePairPhaseV1::Aborted;
-            lease.buffers = Default::default();
-            lease.verified = Default::default();
-            lease.old = None;
-            for member in &mut lease.request.members {
-                member.env.clear();
-            }
+            lease.abort();
             bail!("native pair archive digest mismatch");
         }
         Ok(Some(bytes))
@@ -214,13 +221,7 @@ impl LeaseStore {
             ),
             "native pair lease cannot abort"
         );
-        lease.state.phase = NativePairPhaseV1::Aborted;
-        lease.buffers = Default::default();
-        lease.verified = Default::default();
-        lease.old = None;
-        for member in &mut lease.request.members {
-            member.env.clear();
-        }
+        lease.abort();
         Ok(lease.state.clone())
     }
 }
@@ -298,4 +299,95 @@ pub(super) fn validate_begin(
         "native pair wire frame too large"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod disposal_tests {
+    use super::*;
+    use crate::native_pair::{NativePairCoordinator, lease_tests::CoordinatorFixture};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_pair_lease_digest_and_explicit_abort_dispose_identical_state() {
+        let fixture = CoordinatorFixture::new().await;
+        let coordinator = NativePairCoordinator::new(&fixture.kernel);
+        for digest_failure in [false, true] {
+            let mut request = fixture.request.clone();
+            request.nonce = Uuid::new_v4();
+            let lease = coordinator.begin(&fixture.actor, request).await.unwrap();
+            coordinator
+                .stage_member(&fixture.actor, fixture.chunk(&lease, 0))
+                .await
+                .unwrap();
+            let mut partial = fixture.chunk(&lease, 1);
+            partial.chunk.truncate(1);
+            partial.final_chunk = false;
+            coordinator
+                .stage_member(&fixture.actor, partial)
+                .await
+                .unwrap();
+            let mut store = fixture.kernel.native_pair_leases.lock().await;
+            let staged = store
+                .get(
+                    &fixture.actor,
+                    lease.lease_id,
+                    crate::native_pair::now().unwrap(),
+                )
+                .unwrap();
+            assert_eq!(staged.buffers[1].len(), 1);
+            let verified = Arc::downgrade(staged.verified[0].as_ref().unwrap());
+            assert!(staged.old.is_some());
+            assert!(
+                staged
+                    .request
+                    .members
+                    .iter()
+                    .all(|member| !member.env.is_empty())
+            );
+            if digest_failure {
+                let mut last = fixture.chunk(&lease, 1);
+                last.offset = 1;
+                last.chunk.remove(0);
+                last.chunk[0] ^= 1;
+                let error = store
+                    .append(&fixture.actor, &last, crate::native_pair::now().unwrap())
+                    .unwrap_err();
+                assert_eq!(error.to_string(), "native pair archive digest mismatch");
+            } else {
+                store
+                    .abort(
+                        &fixture.actor,
+                        lease.lease_id,
+                        crate::native_pair::now().unwrap(),
+                    )
+                    .unwrap();
+            }
+            let aborted = store
+                .get(
+                    &fixture.actor,
+                    lease.lease_id,
+                    crate::native_pair::now().unwrap(),
+                )
+                .unwrap();
+            assert_eq!(aborted.state.phase, NativePairPhaseV1::Aborted);
+            assert!(
+                aborted
+                    .buffers
+                    .iter()
+                    .all(|buffer| buffer.is_empty() && buffer.capacity() == 0)
+            );
+            assert!(aborted.verified.iter().all(Option::is_none));
+            assert!(
+                verified.upgrade().is_none(),
+                "verified package ownership released"
+            );
+            assert!(aborted.old.is_none());
+            assert!(
+                aborted
+                    .request
+                    .members
+                    .iter()
+                    .all(|member| member.env.is_empty())
+            );
+        }
+    }
 }

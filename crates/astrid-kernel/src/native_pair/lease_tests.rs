@@ -273,7 +273,11 @@ async fn native_pair_lease_staging_preserves_packages_env_and_views() {
     }
     let mut wrong = request.clone();
     wrong.expected_old.enforcer.generation.authority = "f".repeat(64);
+    let before_rejection = LiveSnapshot::capture(&kernel, &actor).await;
     assert!(coordinator.begin(&actor, wrong).await.is_err());
+    before_rejection
+        .assert_unchanged(&kernel, &actor, "wrong-old-generation")
+        .await;
     let lease = coordinator.begin(&actor, request.clone()).await.unwrap();
     for (index, archive) in candidate_archives.iter().enumerate() {
         let chunk = StageNativePairMember {
@@ -478,4 +482,253 @@ fn native_pair_lease_resource_limit_and_abort_release() {
     }
     store.abort(&leases[0].0, leases[0].1, 1000).unwrap();
     assert!(store.begin(&actor(), request(), 1000).is_ok());
+}
+
+pub(super) struct CoordinatorFixture {
+    _directory: tempfile::TempDir,
+    pub(super) kernel: std::sync::Arc<crate::Kernel>,
+    pub(super) actor: NativePairActor,
+    pub(super) request: BeginNativePairUpgrade,
+    pub(super) archives: [Vec<u8>; 2],
+}
+impl CoordinatorFixture {
+    pub(super) async fn new() -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let kernel = crate::test_kernel_with_home(astrid_core::dirs::AstridHome::from_path(
+            directory.path(),
+        ))
+        .await;
+        let packages = installed_pair(&kernel).await;
+        let mut actor = actor();
+        actor.uid = kernel.principal_directory.uid_for(&actor.target).unwrap();
+        actor.caller_uid = actor.uid;
+        actor.incarnation = kernel.native_protection_incarnation;
+        let mut request = request();
+        request.principal_uid = actor.uid;
+        request.daemon_incarnation = actor.incarnation;
+        request.expected_old = super::NativePairCoordinator::new(&kernel)
+            .capture(&actor)
+            .await
+            .unwrap()
+            .identity;
+        request.expires_at_unix_ms = super::now().unwrap().checked_add(300_000).unwrap();
+        let archives = [packages[0].archive.clone(), packages[1].archive.clone()];
+        for (index, member) in request.members.iter_mut().enumerate() {
+            member.source_bytes = archives[index].len() as u64;
+            member.source_digest = blake3::hash(&archives[index]).to_hex().to_string();
+            member.env = vec![CapsuleInstallEnv {
+                key: "PIN".into(),
+                value: "proposed-pin".into(),
+                kind: EnvValueKind::Text,
+            }];
+            kernel
+                .kv
+                .set(
+                    &astrid_storage::env::principal_capsule_namespace(actor.uid, &member.id),
+                    &astrid_storage::env::env_key("PIN"),
+                    format!("old-{index}").into_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        Self {
+            _directory: directory,
+            kernel,
+            actor,
+            request,
+            archives,
+        }
+    }
+    pub(super) fn chunk(&self, lease: &NativePairLeaseV1, index: usize) -> StageNativePairMember {
+        StageNativePairMember {
+            lease: NativePairLeaseRefV1 {
+                lease_id: lease.lease_id,
+                target_principal: self.actor.target.clone(),
+                principal_uid: self.actor.uid,
+                daemon_incarnation: self.actor.incarnation,
+            },
+            member_id: self.request.members[index].id.clone(),
+            offset: 0,
+            total_bytes: self.archives[index].len() as u64,
+            chunk: self.archives[index].clone(),
+            final_chunk: true,
+        }
+    }
+}
+
+struct LiveSnapshot {
+    pair: super::OldPair,
+    env: [Option<Vec<u8>>; 2],
+}
+impl LiveSnapshot {
+    async fn capture(kernel: &crate::Kernel, actor: &NativePairActor) -> Self {
+        let pair = super::NativePairCoordinator::new(kernel)
+            .capture(actor)
+            .await
+            .unwrap();
+        let mut env = [None, None];
+        for (index, package) in pair.packages.iter().enumerate() {
+            env[index] = kernel
+                .kv
+                .get(
+                    &astrid_storage::env::principal_capsule_namespace(actor.uid, package.id()),
+                    &astrid_storage::env::env_key("PIN"),
+                )
+                .await
+                .unwrap();
+        }
+        Self { pair, env }
+    }
+    async fn assert_unchanged(&self, kernel: &crate::Kernel, actor: &NativePairActor, case: &str) {
+        let after = Self::capture(kernel, actor).await;
+        assert_eq!(
+            self.pair.identity, after.pair.identity,
+            "{case}: package identities/sources"
+        );
+        assert_eq!(
+            self.pair.runtimes, after.pair.runtimes,
+            "{case}: runtime views"
+        );
+        assert_eq!(self.env, after.env, "{case}: live environment");
+        for (old, new) in self.pair.packages.iter().zip(after.pair.packages.iter()) {
+            assert_eq!(
+                old.snapshot(),
+                new.snapshot(),
+                "{case}: package bytes and generations"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_pair_lease_begin_rejection_matrix_preserves_live_state() {
+    let fixture = CoordinatorFixture::new().await;
+    let coordinator = super::NativePairCoordinator::new(&fixture.kernel);
+    for case in [
+        "wrong-generation",
+        "wrong-incarnation",
+        "wrong-uid",
+        "expired",
+        "unknown-member",
+        "oversize",
+        "secret-env",
+        "duplicate-active",
+    ] {
+        let mut request = fixture.request.clone();
+        let active = if case == "duplicate-active" {
+            Some(
+                coordinator
+                    .begin(&fixture.actor, request.clone())
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        match case {
+            "wrong-generation" => {
+                request.expected_old.enforcer.generation.authority = "f".repeat(64);
+            },
+            "wrong-incarnation" => request.daemon_incarnation = Uuid::new_v4(),
+            "wrong-uid" => request.principal_uid = PrincipalUid::from_bytes([99; 32]),
+            "expired" => request.expires_at_unix_ms = super::now().unwrap(),
+            "unknown-member" => request.members[0].id = "other".into(),
+            "oversize" => request.members[0].source_bytes = MAX_ARCHIVE + 1,
+            "secret-env" => request.members[0].env[0].kind = EnvValueKind::Secret,
+            "duplicate-active" => {},
+            _ => unreachable!(),
+        }
+        let before = LiveSnapshot::capture(&fixture.kernel, &fixture.actor).await;
+        assert!(
+            coordinator.begin(&fixture.actor, request).await.is_err(),
+            "{case}"
+        );
+        before
+            .assert_unchanged(&fixture.kernel, &fixture.actor, case)
+            .await;
+        if let Some(active) = active {
+            coordinator
+                .abort(&fixture.actor, active.lease_id)
+                .await
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_pair_lease_stage_rejection_matrix_preserves_live_state() {
+    let fixture = CoordinatorFixture::new().await;
+    let coordinator = super::NativePairCoordinator::new(&fixture.kernel);
+    for case in [
+        "wrong-owner",
+        "wrong-incarnation",
+        "wrong-uid",
+        "expired",
+        "unknown-member",
+        "gap",
+        "overlap",
+        "oversized-chunk",
+        "wrong-total",
+        "wrong-final",
+        "digest",
+        "invalid-authority",
+    ] {
+        let mut request = fixture.request.clone();
+        request.nonce = Uuid::new_v4();
+        if case == "invalid-authority" {
+            request.members[0].authority = CapsuleInstallAuthority::Automatic;
+        }
+        let lease = coordinator.begin(&fixture.actor, request).await.unwrap();
+        let mut chunk = fixture.chunk(&lease, 0);
+        let mut actor = fixture.actor.clone();
+        match case {
+            "wrong-owner" => actor.caller_uid = PrincipalUid::from_bytes([99; 32]),
+            "wrong-incarnation" => actor.incarnation = Uuid::new_v4(),
+            "wrong-uid" => actor.uid = PrincipalUid::from_bytes([99; 32]),
+            "expired" => {
+                fixture
+                    .kernel
+                    .native_pair_leases
+                    .lock()
+                    .await
+                    .leases
+                    .get_mut(&lease.lease_id)
+                    .unwrap()
+                    .state
+                    .lease
+                    .expires_at_unix_ms = 0;
+            },
+            "unknown-member" => chunk.member_id = "other".into(),
+            "gap" => chunk.offset = 1,
+            "overlap" => {
+                let mut first = chunk.clone();
+                first.chunk.truncate(1);
+                first.final_chunk = false;
+                coordinator
+                    .stage_member(&fixture.actor, first)
+                    .await
+                    .unwrap();
+            },
+            "oversized-chunk" => chunk.chunk = vec![0; MAX_CHUNK + 1],
+            "wrong-total" => chunk.total_bytes += 1,
+            "wrong-final" => chunk.final_chunk = false,
+            "digest" => chunk.chunk[0] ^= 1,
+            "invalid-authority" => {},
+            _ => unreachable!(),
+        }
+        let before = LiveSnapshot::capture(&fixture.kernel, &fixture.actor).await;
+        assert!(
+            coordinator.stage_member(&actor, chunk).await.is_err(),
+            "{case}"
+        );
+        before
+            .assert_unchanged(&fixture.kernel, &fixture.actor, case)
+            .await;
+        if case != "expired" {
+            coordinator
+                .abort(&fixture.actor, lease.lease_id)
+                .await
+                .unwrap();
+        }
+    }
 }
