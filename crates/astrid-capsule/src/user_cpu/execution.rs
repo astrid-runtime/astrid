@@ -3,7 +3,11 @@
 use super::UserCpuAllocation;
 use astrid_capsule_types::fuel_ledger::{FuelRateLimiter, FuelReservation};
 use astrid_core::{PrincipalId, UserUid};
+#[cfg(test)]
+use std::future::{Future, poll_fn};
 use std::num::NonZeroU64;
+#[cfg(test)]
+use std::task::Poll;
 use web_time::Instant;
 
 /// Captured authority for one execution. The caller resolves principal
@@ -111,6 +115,43 @@ impl ExecutionAllocation {
             };
             astrid_runtime::time::sleep(delay).await;
         }
+    }
+
+    /// Test-only prototype: drive an execution whose individual polls are bounded by
+    /// `quantum`. Admission happens before polling, including the first poll.
+    ///
+    /// This conservatively charges the entire allowance for each poll, even
+    /// when a poll executes less work or waits on host I/O. It is not precise
+    /// consumed-fuel accounting. The caller must establish the poll bound;
+    /// Wasmtime's yield interval alone does NOT establish it for arbitrary
+    /// guest code. Do not use this with an uninstrumented guest.
+    ///
+    /// # Errors
+    /// Rejects an allowance that cannot fit within either configured window.
+    #[cfg(test)]
+    pub(crate) async fn run_prepaid<F: Future>(
+        &self,
+        quantum: NonZeroU64,
+        execution: F,
+    ) -> Result<F::Output, ExecutionDenied> {
+        let mut execution = std::pin::pin!(execution);
+        let mut admission = None;
+        poll_fn(|cx| {
+            let waiting =
+                admission.get_or_insert_with(|| Box::pin(self.reserve_when_available(quantum)));
+            let permit = match waiting.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(permit)) => permit,
+            };
+            admission = None;
+            let result = execution.as_mut().poll(cx);
+            // No refund: an externally supplied future may have executed the
+            // whole quantum before returning Pending or being cancelled.
+            drop(permit);
+            result.map(Ok)
+        })
+        .await
     }
 }
 
