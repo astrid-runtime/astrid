@@ -58,6 +58,7 @@ mod interruption_tests;
 #[path = "lifecycle_audit_tests.rs"]
 mod lifecycle_audit_tests;
 pub mod limits;
+pub mod native_candidate;
 mod pool;
 mod storage_vfs;
 #[cfg(test)]
@@ -1381,6 +1382,13 @@ async fn install_principal_overlays(
     state: &mut HostState,
     principal: Option<&astrid_core::PrincipalId>,
 ) {
+    if state.native_candidate.is_some() {
+        install_principal_overlays_sync(state, principal);
+        state.invocation_home = state.home.clone();
+        state.invocation_workspace = state.workspace.clone();
+        state.invocation_tmp = state.tmp.clone();
+        return;
+    }
     // KV + secret store + capsule log are installed synchronously (shared with
     // the recv path). `Ok(true)` means a real principal scope was installed;
     // `Ok(false)` / any clear means the neutral fail-closed floor is in effect,
@@ -1429,6 +1437,19 @@ fn install_principal_overlays_sync(
     state: &mut HostState,
     principal: Option<&astrid_core::PrincipalId>,
 ) -> bool {
+    if state.native_candidate.is_some() {
+        let allowed = principal.is_none_or(|principal| principal == &state.principal);
+        state.invocation_profile_authorized &= allowed;
+        state.invocation_kv = Some(if allowed {
+            state.kv.clone()
+        } else {
+            HostState::neutral_kv()
+        });
+        state.invocation_secret_store = Some(HostState::neutral_secret_store());
+        state.invocation_capsule_log = None;
+        state.install_invocation_cancel_token(principal);
+        return allowed;
+    }
     // The cancellation-token overlay follows the same lifecycle as the data
     // overlays below: installed for every present, parseable principal (lazily
     // minted as a child of the instance token) and cleared for principal-less
@@ -1958,6 +1979,22 @@ fn spawn_epoch_ticker_every(
 #[async_trait]
 impl ExecutionEngine for WasmEngine {
     async fn load(&mut self, ctx: &CapsuleContext) -> CapsuleResult<()> {
+        if ctx.native_candidate.as_ref().is_some_and(|candidate| {
+            !candidate.matches_runtime(&self.manifest.package.name, self.runtime_id.as_ref())
+        }) {
+            return Err(CapsuleError::UnsupportedEntryPoint(
+                "native candidate runtime identity mismatch".into(),
+            ));
+        }
+        // Rebuild the complete candidate context, so later builder calls cannot
+        // accidentally reintroduce live services, stores, directories or buses.
+        let detached_context = ctx
+            .native_candidate
+            .as_ref()
+            .map(|candidate| candidate.capsule_context())
+            .transpose()
+            .map_err(CapsuleError::UnsupportedEntryPoint)?;
+        let ctx = detached_context.as_ref().unwrap_or(ctx);
         info!(
             capsule = %self.manifest.package.name,
             "Loading WASM component (Component Model)"
@@ -1969,10 +2006,22 @@ impl ExecutionEngine for WasmEngine {
             )
         })?;
 
-        let expected_hash = content_source::read_expected_hash(&self._capsule_dir);
+        let expected_hash = if let Some(candidate) = &ctx.native_candidate {
+            Some(candidate.hash())
+        } else {
+            content_source::read_expected_hash(&self._capsule_dir)
+        };
         #[cfg(not(target_family = "wasm"))]
-        let catalog_bytes =
-            content_source::catalog_bytes(ctx.principal_store.as_ref(), expected_hash.as_deref());
+        let catalog_bytes = ctx
+            .native_candidate
+            .as_ref()
+            .map(|candidate| candidate.wasm())
+            .or_else(|| {
+                content_source::catalog_bytes(
+                    ctx.principal_store.as_ref(),
+                    expected_hash.as_deref(),
+                )
+            });
         #[cfg(target_family = "wasm")]
         let catalog_bytes = None;
         let wasm_source = if let Some(bytes) = catalog_bytes {
@@ -2020,8 +2069,11 @@ impl ExecutionEngine for WasmEngine {
         }
 
         let reserved_keys: Vec<String> = wasm_config.keys().cloned().collect();
-        let resolved_env =
-            super::resolve_env(&self.manifest, ctx, &reserved_keys, "wasm_engine").await?;
+        let resolved_env = if let Some(candidate) = &ctx.native_candidate {
+            candidate.env()
+        } else {
+            super::resolve_env(&self.manifest, ctx, &reserved_keys, "wasm_engine").await?
+        };
 
         for (key, val) in resolved_env {
             wasm_config.insert(key, serde_json::Value::String(val));
@@ -2144,7 +2196,7 @@ impl ExecutionEngine for WasmEngine {
 
             // BLAKE3 integrity verification. Fail-secure: no hash = no load.
             let actual_hash = blake3::hash(&wasm_bytes).to_hex().to_string();
-            match content_source::read_expected_hash(&capsule_dir_for_verify) {
+            match ctx.native_candidate.as_ref().map(|candidate| candidate.hash()).or_else(|| content_source::read_expected_hash(&capsule_dir_for_verify)) {
                 Some(expected_hash) if actual_hash == expected_hash => {
                     // Hash matches — verified.
                 },
@@ -2186,7 +2238,9 @@ impl ExecutionEngine for WasmEngine {
             // Detection is automatic (no config flag) via gitoxide work-tree
             // discovery (see `workspace_is_git_managed`).
             #[cfg(not(target_family = "wasm"))]
-            let owner_workspace_mount = if let Some(branches) = workspace_branches.as_ref()
+            let owner_workspace_mount = if let Some(candidate) = &ctx.native_candidate {
+                Some(candidate.mount("workspace").map_err(CapsuleError::UnsupportedEntryPoint)?)
+            } else if let Some(branches) = workspace_branches.as_ref()
                 && !system_runtime
             {
                 Some(
@@ -2203,7 +2257,7 @@ impl ExecutionEngine for WasmEngine {
             let root_handle = owner_workspace_mount
                 .as_ref()
                 .map_or_else(astrid_capabilities::DirHandle::new, |mount| mount.handle.clone());
-            let git_managed = workspace_branches.is_none() && workspace_is_git_managed(&workspace_root);
+            let git_managed = ctx.native_candidate.is_none() && workspace_branches.is_none() && workspace_is_git_managed(&workspace_root);
 
             // The workspace VFS, the OS-sandbox writable root, and the fs-host
             // path-confinement all resolve against ONE path: `effective_workspace_root`.
@@ -2434,6 +2488,8 @@ impl ExecutionEngine for WasmEngine {
             let owner_profile: Option<Arc<astrid_core::profile::PrincipalProfile>> =
                 if system_runtime {
                     None
+                } else if ctx.native_candidate.is_some() {
+                    Some(Arc::new(astrid_core::profile::PrincipalProfile::default()))
                 } else if typed_principal_run {
                     let cache = ctx.profile_cache.as_ref().ok_or_else(|| {
                         CapsuleError::ExecutionFailed(format!(
@@ -2505,7 +2561,12 @@ impl ExecutionEngine for WasmEngine {
             // autonomous `run()` can use KV/home/secrets before its first
             // recv. Explicit system runtimes retain the neutral deny-all
             // fallback and are never aliases for the default human principal.
-            let owner_vfs = if !system_runtime {
+            let owner_vfs = if let Some(candidate) = &ctx.native_candidate {
+                PrincipalVfsBundle {
+                    home: Some(candidate.mount("home").map_err(CapsuleError::UnsupportedEntryPoint)?),
+                    tmp: Some(candidate.mount("native-candidate-tmp").map_err(CapsuleError::UnsupportedEntryPoint)?),
+                }
+            } else if !system_runtime {
                 ctx.principal_store.as_ref().map_or_else(
                     || {
                         tracing::warn!(
@@ -2523,7 +2584,7 @@ impl ExecutionEngine for WasmEngine {
             let owner_uid = (!system_runtime)
                 .then(|| ctx.principal_directory.uid_for(&ctx.principal).ok())
                 .flatten();
-            let owner_secret_namespace = if system_runtime {
+            let owner_secret_namespace = if ctx.native_candidate.is_some() { None } else if system_runtime {
                 Some(astrid_storage::env::system_secret_namespace(capsule_id_val.as_str()))
             } else {
                 owner_uid.map(|uid| {
@@ -2543,7 +2604,7 @@ impl ExecutionEngine for WasmEngine {
                     tokio::runtime::Handle::current(),
                 ))
             });
-            let owner_capsule_log = (!system_runtime).then(|| {
+            let owner_capsule_log = (!system_runtime && ctx.native_candidate.is_none()).then(|| {
                 open_capsule_log(
                     &ctx.principal_directory,
                     &ctx.principal,
@@ -2578,6 +2639,7 @@ impl ExecutionEngine for WasmEngine {
             let persistent_registry = persistent_registry.clone();
             let memory_ledger = memory_ledger.clone();
             let st_principal = ctx.principal.clone();
+            let st_native_candidate = ctx.native_candidate.clone();
             let st_system_runtime = system_runtime;
             let st_capsule_registry = ctx.capsule_registry.clone();
             let st_allowance_store = ctx.allowance_store.clone();
@@ -2639,7 +2701,12 @@ impl ExecutionEngine for WasmEngine {
             let st_route_admission_gate = self.route_admission_gate.clone();
             let hosted_workspace_root = workspace_root.clone();
             let make_state: Arc<dyn Fn() -> HostState + Send + Sync> = Arc::new(move || HostState {
-                wasi_ctx: build_wasi_ctx(),
+                wasi_ctx: if st_native_candidate.is_some() {
+                    // Candidate diagnostics must not escape through inherited stderr.
+                    wasmtime_wasi::WasiCtxBuilder::new().build()
+                } else {
+                    build_wasi_ctx()
+                },
                 resource_table: wasmtime::component::ResourceTable::new(),
                 // Memory cap baked in BEFORE instantiation. For a bound
                 // run-loop (pool_size 1) this is the owner quota, enforced on
@@ -2704,6 +2771,7 @@ impl ExecutionEngine for WasmEngine {
                 principal_invocations: Some(Arc::clone(&principal_invocations_for_state)),
                 profile_cache: st_profile_cache.clone(),
                 invocation_env_overlay: None,
+                native_candidate: st_native_candidate.clone(),
                 // Concrete owner/system KV in production; neutral only in
                 // deliberately authority-free test/lifecycle contexts.
                 kv: st_owner_kv.clone().unwrap_or_else(HostState::neutral_kv),
@@ -3038,7 +3106,7 @@ impl ExecutionEngine for WasmEngine {
                 })?;
                 let runtime_id = principal_runtime_id.expect("typed principal run has runtime id");
                 let owner_uid = ctx.principal_directory.uid_for(&ctx.principal).ok();
-                let owner_env = match owner_uid {
+                let owner_env = if let Some(candidate) = &ctx.native_candidate { Some(candidate.env()) } else { match owner_uid {
                     Some(owner_uid) => {
                         load_invocation_env_overlay_from_backend(
                             kv_backend.clone(),
@@ -3048,7 +3116,7 @@ impl ExecutionEngine for WasmEngine {
                         .await
                     },
                     None => None,
-                };
+                }};
                 for (store_arc, _inst) in &run_stores {
                     let mut store = store_arc.lock().await;
                     store.data_mut().install_run_loop_owner_context(
@@ -3731,7 +3799,9 @@ impl ExecutionEngine for WasmEngine {
                 );
                 state.invocation_profile = invocation_profile.clone();
                 state.invocation_profile_authorized = true;
-                state.invocation_env_overlay =
+                state.invocation_env_overlay = if let Some(candidate) = &state.native_candidate {
+                    Some(candidate.env())
+                } else {
                     match state.principal_directory.uid_for(&invoking_principal) {
                         Ok(principal_uid) => {
                             load_invocation_env_overlay_from_backend(
@@ -3742,7 +3812,8 @@ impl ExecutionEngine for WasmEngine {
                             .await
                         },
                         Err(_) => None,
-                    };
+                    }
+                };
 
                 // Refine the invocation context. Principal runtimes reject peer
                 // callers before checkout; SystemResident runtimes may install
@@ -4054,6 +4125,7 @@ async fn build_lifecycle_host_state(
         // Lifecycle hooks don't run the per-principal recv loop; no cache needed.
         profile_cache: None,
         invocation_env_overlay: None,
+        native_candidate: None,
         // Lifecycle hooks (install/upgrade) run a ONE-SHOT, single-principal,
         // NON-shared instance: `cfg.kv` / `cfg.secret_store` are already scoped to
         // the specific principal the operator is installing for, no other

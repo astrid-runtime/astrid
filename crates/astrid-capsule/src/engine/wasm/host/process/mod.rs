@@ -179,6 +179,9 @@ include!("host_ops_methods.rs");
 
 impl process::Host for HostState {
     fn spawn(&mut self, request: SpawnRequest) -> Result<ProcessResult, ErrorCode> {
+        if !self.native_external_effect_allowed() {
+            return Err(ErrorCode::CapabilityDenied);
+        }
         let cmd_for_audit = request.cmd.clone();
         if request
             .stdin
@@ -388,6 +391,9 @@ impl process::Host for HostState {
         &mut self,
         request: SpawnRequest,
     ) -> Result<Resource<ProcessHandle>, ErrorCode> {
+        if !self.native_external_effect_allowed() {
+            return Err(ErrorCode::CapabilityDenied);
+        }
         let principal = self.effective_principal();
         let profile_cap = usize::try_from(self.effective_profile().quotas.max_background_processes)
             .unwrap_or(MAX_BACKGROUND_PROCESSES);
@@ -657,6 +663,9 @@ impl process::Host for HostState {
     // ================================================================
 
     fn spawn_persistent(&mut self, request: SpawnRequest) -> Result<String, ErrorCode> {
+        if !self.native_external_effect_allowed() {
+            return Err(ErrorCode::CapabilityDenied);
+        }
         let cmd_for_audit = request.cmd.clone();
         let handle = self.runtime_handle.clone();
         let semaphore = self.blocking_semaphore.clone();

@@ -439,6 +439,9 @@ where
 
 impl net::Host for HostState {
     fn bind_unix(&mut self) -> Result<Resource<UnixListener>, ErrorCode> {
+        if !self.native_external_effect_allowed() {
+            return Err(ErrorCode::CapabilityDenied);
+        }
         // Stable descriptor for the pre-provisioned CLI control socket — a
         // Unix-domain listener has no host:port, so this names the bind on
         // the audit chain.
@@ -479,6 +482,9 @@ impl net::Host for HostState {
     }
 
     fn bind_tcp(&mut self, host: String, port: u16) -> Result<Resource<TcpListener>, ErrorCode> {
+        if !self.native_external_effect_allowed() {
+            return Err(ErrorCode::CapabilityDenied);
+        }
         validate_host(&host)?;
         let bind_addr = format!("tcp:{host}:{port}");
 
@@ -708,6 +714,9 @@ impl net::Host for HostState {
     }
 
     fn connect_tcp(&mut self, host: String, port: u16) -> Result<Resource<TcpStream>, ErrorCode> {
+        if !self.native_external_effect_allowed() {
+            return Err(ErrorCode::CapabilityDenied);
+        }
         validate_host(&host)?;
 
         if !self.principal_egress_allows(&host, Some(port)) {
@@ -833,6 +842,9 @@ impl net::Host for HostState {
     }
 
     fn lookup_host(&mut self, host: String) -> Result<Vec<String>, ErrorCode> {
+        if !self.native_external_effect_allowed() {
+            return Err(ErrorCode::CapabilityDenied);
+        }
         validate_host(&host)?;
         if !self.principal_egress_allows(&host, None) {
             return Err(ErrorCode::CapabilityDenied);

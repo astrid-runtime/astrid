@@ -23,7 +23,10 @@ impl uplink::Host for HostState {
         platform: String,
         profile: UplinkProfile,
     ) -> Result<String, ErrorCode> {
-        if !self.invocation_authority_active() || !self.has_uplink_capability {
+        if !self.native_external_effect_allowed()
+            || !self.invocation_authority_active()
+            || !self.has_uplink_capability
+        {
             return Err(ErrorCode::CapabilityDenied);
         }
         let platform = platform.trim().to_ascii_lowercase();
@@ -78,7 +81,10 @@ impl uplink::Host for HostState {
         platform_user_id: String,
         content: String,
     ) -> Result<bool, ErrorCode> {
-        if !self.invocation_authority_active() || !self.has_uplink_capability {
+        if !self.native_external_effect_allowed()
+            || !self.invocation_authority_active()
+            || !self.has_uplink_capability
+        {
             return Err(ErrorCode::CapabilityDenied);
         }
         if uplink_id.len() > 64 {

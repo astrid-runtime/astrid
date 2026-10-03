@@ -617,6 +617,10 @@ fn register_live_group_config(snapshot: &Arc<GroupConfig>, live: &Arc<ArcSwap<Gr
 /// not be accidentally duplicated. Use `Arc<SessionToken>` for cheap sharing.
 /// Constructed via `new()` + builder methods (`with_session_token`, etc.).
 pub struct CapsuleContext {
+    /// Host-owned detached native candidate authority, when staging a pair.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    pub(crate) native_candidate:
+        Option<Arc<crate::engine::wasm::native_candidate::NativeCandidateHostContext>>,
     /// The principal this capsule is running on behalf of.
     pub principal: PrincipalId,
     pub workspace_root: PathBuf,
@@ -719,6 +723,8 @@ impl CapsuleContext {
     ) -> Self {
         Self {
             principal,
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            native_candidate: None,
             workspace_source: WorkspaceSource::HostedPortal(workspace_root.clone()),
             workspace_root,
             home_root,

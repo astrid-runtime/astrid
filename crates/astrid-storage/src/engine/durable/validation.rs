@@ -41,7 +41,17 @@ pub(super) fn materialize_closure<I: PersistentObjectIdentity, P: Ord>(
     source: &mut ClosureObjects<'_, I, P>,
     root: ObjectId,
 ) -> Result<Vec<(ObjectId, ObjectRecord)>, DurableError> {
+    materialize_closure_bounded(source, root, usize::MAX, u64::MAX)
+}
+
+pub(super) fn materialize_closure_bounded<I: PersistentObjectIdentity, P: Ord>(
+    source: &mut ClosureObjects<'_, I, P>,
+    root: ObjectId,
+    max_objects: usize,
+    max_bytes: u64,
+) -> Result<Vec<(ObjectId, ObjectRecord)>, DurableError> {
     let mut records = BTreeMap::new();
+    let mut retained = 0_u64;
     let mut marks = BTreeMap::<ObjectId, u8>::new();
     let mut stack = vec![(root, false)];
 
@@ -55,7 +65,29 @@ pub(super) fn materialize_closure<I: PersistentObjectIdentity, P: Ord>(
             Some(1) => return Err(ModelError::ObjectCycle(id).into()),
             Some(_) | None => {},
         }
+        if records.len() >= max_objects {
+            return Err(DurableError::InvalidRestore(
+                "snapshot object limit exceeded",
+            ));
+        }
+        // Check indexed payload before the decoder allocates it. Pending WAL
+        // records already reside in bounded live custody but are charged below.
+        if source
+            .index
+            .get(&id)
+            .is_some_and(|location| location.payload_len > max_bytes.saturating_sub(retained))
+        {
+            return Err(DurableError::InvalidRestore(
+                "snapshot frame exceeds remaining budget",
+            ));
+        }
         let record = source.load(id)?;
+        retained = retained
+            .checked_add(crate::engine::object_record_retained_bytes(&record) as u64)
+            .ok_or(DurableError::EncodingOverflow)?;
+        if retained > max_bytes {
+            return Err(DurableError::InvalidRestore("snapshot byte limit exceeded"));
+        }
         marks.insert(id, 1);
         stack.push((id, true));
         for child in record.owning_references().rev() {

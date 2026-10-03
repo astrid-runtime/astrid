@@ -38,6 +38,10 @@ pub(super) struct Lease {
     completed: [bool; 2],
     pub(super) verified: [Option<Arc<VerifiedNativePairMember>>; 2],
     pub(super) old: Option<super::OldPair>,
+    pub(super) snapshot: Option<Arc<super::snapshot::NativeCandidateSnapshot>>,
+    pub(super) host_contexts: Option<
+        [Arc<astrid_capsule::engine::wasm::native_candidate::NativeCandidateHostContext>; 2],
+    >,
 }
 
 impl Lease {
@@ -47,6 +51,8 @@ impl Lease {
         self.buffers = Default::default();
         self.verified = Default::default();
         self.old = None;
+        self.snapshot = None;
+        self.host_contexts = None;
         for member in &mut self.request.members {
             member.env.clear();
         }
@@ -129,6 +135,8 @@ impl LeaseStore {
                 completed: [false; 2],
                 verified: Default::default(),
                 old: None,
+                snapshot: None,
+                host_contexts: None,
             },
         );
         Ok(lease)

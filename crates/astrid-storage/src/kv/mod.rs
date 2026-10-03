@@ -29,6 +29,7 @@ mod batch;
 #[cfg(test)]
 mod batch_tests;
 mod memory;
+pub mod native_candidate;
 mod principal;
 mod scoped;
 #[cfg(feature = "legacy-surrealkv")]

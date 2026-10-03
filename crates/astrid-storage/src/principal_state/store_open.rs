@@ -422,7 +422,11 @@ async fn assemble_runtime_store(
             NonZeroUsize::new(65_536).expect("entries per owner"),
         )),
     );
-    let kv: Arc<dyn KvStore> = runtime_kv.clone();
+    let native_policy_fence = Arc::new(crate::kv::native_candidate::NativePolicyFence::default());
+    let kv: Arc<dyn KvStore> = Arc::new(crate::kv::native_candidate::NativePolicyKv::new(
+        runtime_kv.clone(),
+        Arc::clone(&native_policy_fence),
+    ));
     KvIdentityStore::with_principal_directory(
         ScopedKvStore::new(Arc::clone(&kv), "system:identity")?,
         principals.clone(),
@@ -448,6 +452,7 @@ async fn assemble_runtime_store(
         directory_cutover_receipt: Arc::from(directory_cutover_receipt),
         runtime_kv,
         kv,
+        native_policy_fence,
         content,
         staging: Arc::clone(&staging),
         principals,

@@ -2,6 +2,7 @@
 mod lease;
 #[cfg(test)]
 mod lease_tests;
+mod snapshot;
 
 use anyhow::{Context as _, ensure};
 use astrid_capsule::{
@@ -111,11 +112,71 @@ impl<'a> NativePairCoordinator<'a> {
         }
         self.check_live(&mut leases, actor, chunk.lease.lease_id)
             .await?;
+        let lease = leases.get(actor, chunk.lease.lease_id, now()?)?;
+        self.prepare_snapshot(actor, lease).await?;
+        self.check_live(&mut leases, actor, chunk.lease.lease_id)
+            .await?;
         Ok(leases
             .get(actor, chunk.lease.lease_id, now()?)?
             .state
             .lease
             .clone())
+    }
+
+    async fn prepare_snapshot(
+        &self,
+        actor: &NativePairActor,
+        lease: &mut lease::Lease,
+    ) -> anyhow::Result<()> {
+        if lease.verified.iter().all(Option::is_some) && lease.snapshot.is_none() {
+            let pair = &lease
+                .old
+                .as_ref()
+                .context("native pair pin absent")?
+                .identity;
+            let snapshot = snapshot::NativeCandidateSnapshot::capture(
+                self.kernel
+                    .principal_store
+                    .as_ref()
+                    .context("native pair storage absent")?,
+                &actor.target,
+                actor.uid,
+                pair,
+                &[
+                    Arc::clone(
+                        lease.verified[0]
+                            .as_ref()
+                            .context("native enforcer verification missing")?,
+                    ),
+                    Arc::clone(
+                        lease.verified[1]
+                            .as_ref()
+                            .context("native protocol verification missing")?,
+                    ),
+                ],
+            )
+            .await?;
+            let host_contexts = [
+                snapshot
+                    .detached_host_context(Arc::clone(
+                        lease.verified[0]
+                            .as_ref()
+                            .context("native member verification missing")?,
+                    ))
+                    .await?,
+                snapshot
+                    .detached_host_context(Arc::clone(
+                        lease.verified[1]
+                            .as_ref()
+                            .context("native member verification missing")?,
+                    ))
+                    .await?,
+            ];
+            lease.state.lease.policy_snapshot_digest = Some(snapshot.digest());
+            lease.snapshot = Some(Arc::new(snapshot));
+            lease.host_contexts = Some(host_contexts);
+        }
+        Ok(())
     }
     pub(crate) async fn abort(
         &self,

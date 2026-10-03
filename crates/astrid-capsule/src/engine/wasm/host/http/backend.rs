@@ -236,6 +236,9 @@ impl HostState {
         opts: &ResolvedOptions,
         redirect_hop: u32,
     ) -> Result<WireResponse, ErrorCode> {
+        if !self.native_external_effect_allowed() {
+            return Err(ErrorCode::CapabilityDenied);
+        }
         if let Err(error) = check_scheme(url, opts.https_only) {
             // A refused scheme is a refused request: record it like the other
             // refusals whenever the URL parses at all.

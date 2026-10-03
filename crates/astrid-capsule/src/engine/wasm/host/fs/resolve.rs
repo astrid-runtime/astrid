@@ -133,6 +133,28 @@ pub(super) struct ResolvedVfsPath {
 /// mounts (per-invocation > load-time) so cross-principal calls land in
 /// the right tree.
 pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<ResolvedPath, String> {
+    if state.native_candidate.is_some() {
+        let (relative, target, scheme) = if let Some(path) = raw_path.strip_prefix(HOME_SCHEME) {
+            (path, VfsTarget::Home, HOME_SCHEME)
+        } else if let Some(path) = raw_path.strip_prefix(TMP_PREFIX) {
+            (path, VfsTarget::Tmp, TMP_PREFIX)
+        } else if let Some(path) = raw_path
+            .strip_prefix(CWD_SCHEME)
+            .or_else(|| raw_path.strip_prefix(WORKSPACE_SCHEME))
+        {
+            (path, VfsTarget::Workspace, WORKSPACE_SCHEME)
+        } else {
+            return Err("native candidate requires a detached logical path".into());
+        };
+        let path = astrid_storage::FilesystemPath::new(relative.to_owned())
+            .map_err(|error| error.to_string())?;
+        return Ok(ResolvedPath {
+            gate_path: format!("{scheme}{}", path.as_str()),
+            physical: None,
+            relative: PathBuf::from(path.as_str()),
+            target,
+        });
+    }
     if let Some(stripped) = raw_path.strip_prefix(CWD_SCHEME) {
         if state.effective_workspace().is_some_and(|mount| {
             matches!(

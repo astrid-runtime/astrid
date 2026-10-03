@@ -247,6 +247,12 @@ async fn native_pair_lease_staging_preserves_packages_env_and_views() {
     actor.incarnation = kernel.native_protection_incarnation;
     let coordinator = NativePairCoordinator::new(&kernel);
     let old = coordinator.capture(&actor).await.unwrap();
+    super::snapshot::tests::seed(
+        kernel.kv.as_ref(),
+        &format!("{}:capsule:codewall-enforcer", actor.target),
+        1,
+    )
+    .await;
     let env_namespace =
         astrid_storage::env::principal_capsule_namespace(actor.uid, "codewall-enforcer");
     let env_key = astrid_storage::env::env_key("PIN");
@@ -313,7 +319,10 @@ async fn native_pair_lease_staging_preserves_packages_env_and_views() {
         "new-pin"
     );
     assert_eq!(staged.state.phase, NativePairPhaseV1::Staging);
-    assert!(staged.state.lease.policy_snapshot_digest.is_none());
+    assert!(staged.state.lease.policy_snapshot_digest.is_some());
+    assert!(staged.state.lease.candidate.is_none());
+    assert!(staged.snapshot.is_some());
+    assert!(staged.host_contexts.is_some());
     drop(leases);
     // A concurrent durable metadata publication invalidates the exact package CAS.
     let mut changed = packages[0].clone();

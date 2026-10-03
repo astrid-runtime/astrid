@@ -250,6 +250,8 @@ pub struct HookHostStateParams {
 /// Shared state accessible to all host functions via `Store<HostState>`.
 #[non_exhaustive]
 pub struct HostState {
+    /// Immutable candidate effect policy and frozen generation dependencies.
+    pub(crate) native_candidate: Option<Arc<super::native_candidate::NativeCandidateHostContext>>,
     /// WASI context for Component Model WASI imports (clocks, random, etc.).
     pub wasi_ctx: wasmtime_wasi::WasiCtx,
     /// Resource table for WASI resource types (streams, descriptors, etc.).

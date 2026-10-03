@@ -123,6 +123,7 @@ mod tests {
         let mem_kv = std::sync::Arc::new(astrid_storage::MemoryKvStore::new());
         let kv = astrid_storage::ScopedKvStore::new(mem_kv, "test").unwrap();
         let ctx = CapsuleContext {
+            native_candidate: None,
             principal: astrid_core::PrincipalId::default(),
             workspace_root: std::path::PathBuf::from("/"),
             workspace_source: crate::context::WorkspaceSource::HostedPortal(
@@ -201,6 +202,7 @@ mod tests {
         let mem_kv = std::sync::Arc::new(astrid_storage::MemoryKvStore::new());
         let kv = astrid_storage::ScopedKvStore::new(mem_kv, "test").unwrap();
         let ctx = CapsuleContext {
+            native_candidate: None,
             principal: astrid_core::PrincipalId::default(),
             workspace_root: std::path::PathBuf::from("/"),
             workspace_source: crate::context::WorkspaceSource::HostedPortal(
@@ -293,6 +295,7 @@ mod tests {
         let mem_kv = std::sync::Arc::new(astrid_storage::MemoryKvStore::new());
         let kv = astrid_storage::ScopedKvStore::new(mem_kv, "test").unwrap();
         let ctx = CapsuleContext {
+            native_candidate: None,
             principal: astrid_core::PrincipalId::default(),
             workspace_root: std::path::PathBuf::from("/"),
             workspace_source: crate::context::WorkspaceSource::HostedPortal(

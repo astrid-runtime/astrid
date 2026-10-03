@@ -178,6 +178,9 @@ impl elicit::Host for HostState {
     /// and publishes an `ElicitResponse` on the response topic.
     ///
     fn elicit(&mut self, request: ElicitRequest) -> Result<ElicitResponse, ErrorCode> {
+        if !self.native_external_effect_allowed() {
+            return Err(ErrorCode::Cancelled);
+        }
         let _operation = self
             .begin_host_operation()
             .map_err(|()| ErrorCode::Cancelled)?;

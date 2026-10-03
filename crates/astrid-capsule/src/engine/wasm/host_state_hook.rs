@@ -91,6 +91,7 @@ impl HostState {
             principal_invocations: None,
             profile_cache: None,
             invocation_env_overlay: None,
+            native_candidate: None,
             kv_backend,
             kv,
             event_bus,

@@ -25,6 +25,12 @@ impl sys::Host for HostState {
         let _operation = self
             .begin_host_operation()
             .map_err(|()| ErrorCode::CapabilityDenied)?;
+        if key == crate::engine::wasm::native_candidate::NATIVE_CANDIDATE_CONFIG {
+            return Ok(Some(self.native_candidate.is_some().to_string()));
+        }
+        if let Some(candidate) = &self.native_candidate {
+            return Ok(candidate.config(&key));
+        }
         // Manifest-declared secrets route through the host-only SecretStore
         // projections at invocation time, never through `self.config` or the
         // guest's ordinary KV namespace. Lookup precedence is the effective
@@ -71,6 +77,9 @@ impl sys::Host for HostState {
     }
 
     fn log(&mut self, level: LogLevel, message: String) {
+        if self.native_candidate.is_some() {
+            return;
+        }
         if !self.invocation_authority_active() {
             return;
         }
@@ -260,6 +269,9 @@ impl sys::Host for HostState {
 /// 1. Principal control scope for the effective principal.
 /// 2. Host/system control scope for the capsule.
 pub(crate) fn resolve_secret(state: &HostState, key: &str) -> String {
+    if state.native_candidate.is_some() {
+        return String::new();
+    }
     use astrid_storage::{KvSecretStore, ScopedKvStore, SecretStore};
 
     let capsule = state.capsule_id.as_str();

@@ -32,6 +32,28 @@ impl VerifiedNativePairMember {
     pub fn env(&self) -> &[CapsuleInstallEnv] {
         &self.env
     }
+    /// Read only the verified immutable executable, without extracting native files.
+    pub fn executable(&self) -> anyhow::Result<Vec<u8>> {
+        use std::io::Read;
+        let path = &self.manifest.components[0].path;
+        let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(&self.archive));
+        let mut archive = tar::Archive::new(decoder);
+        for entry in archive.entries()? {
+            let entry = entry?;
+            if entry.path()?.as_ref() == path {
+                let mut bytes = Vec::new();
+                entry.take(64 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+                ensure!(bytes.len() <= 64 * 1024 * 1024, "native executable limit");
+                ensure!(
+                    Some(blake3::hash(&bytes).to_hex().as_str())
+                        == self.authority.approved_wasm_hash.as_deref(),
+                    "native executable pin mismatch"
+                );
+                return Ok(bytes);
+            }
+        }
+        anyhow::bail!("native executable absent")
+    }
 }
 
 /// Verify and normalize a narrow native member without credentials or publication.
