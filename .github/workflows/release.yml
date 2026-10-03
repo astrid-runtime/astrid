@@ -113,9 +113,15 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   # ── Build binaries for each platform ──────────────────────────────
+  runtime-recovery:
+    needs: classify
+    uses: ./.github/workflows/runtime-recovery.yml
+    with:
+      source-commit: ${{ needs.classify.outputs.source-commit }}
+
   build:
     name: Build (${{ matrix.target }})
-    needs: classify
+    needs: [classify, runtime-recovery]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
