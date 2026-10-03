@@ -207,10 +207,26 @@ impl Drop for CapsuleViewGuard {
     }
 }
 
+fn native_protection_context(
+    home: &astrid_core::dirs::AstridHome,
+    selection: &WorkspaceSelection,
+) -> String {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"astrid-native-protection-context-v1\0");
+    hash.update(selection.fingerprint().as_bytes());
+    hash.update(b"\0");
+    hash.update(home.root().as_os_str().as_encoded_bytes());
+    hash.finalize().to_hex().to_string()
+}
+
 /// The core Operating System Kernel.
 pub struct Kernel {
     /// The unique identifier for this kernel session.
     pub session_id: SessionId,
+    /// Per-boot identity used by authenticated native protection queries.
+    native_protection_incarnation: uuid::Uuid,
+    /// Frozen home/workspace binding; computed once from boot-selected roots.
+    native_protection_context: String,
     /// The global IPC message bus.
     pub event_bus: Arc<EventBus>,
     /// The process manager (loaded WASM capsules).
@@ -1388,6 +1404,8 @@ impl Kernel {
 
         let kernel = Arc::new(Self {
             session_id: session_id.clone(),
+            native_protection_incarnation: uuid::Uuid::new_v4(),
+            native_protection_context: native_protection_context(&home, &workspace_selection),
             event_bus,
             capsules,
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -3861,6 +3879,11 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
 
     let kernel = Arc::new(Kernel {
         session_id: session_id.clone(),
+        native_protection_incarnation: uuid::Uuid::new_v4(),
+        native_protection_context: native_protection_context(
+            &home,
+            &test_workspace_selection(&home),
+        ),
         event_bus,
         capsules,
         mcp,

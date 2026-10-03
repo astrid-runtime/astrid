@@ -711,3 +711,9 @@ status = "waived"
 mode = "network"
 principal = "local_cli"
 reason = "Install path mutates the runner and depends on GitHub release state; CI covers check/dry-run shape only."
+
+[commands."native-protection capabilities"]
+scenario = "native_protection_capabilities"
+status = "mapped"
+mode = "read"
+principal = "admin_and_agent"

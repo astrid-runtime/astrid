@@ -33,7 +33,8 @@ pub use install::{
     CAPSULE_INSTALL_BATCH_PROTOCOL_V1, CapsuleInstallAuthority, CapsuleInstallBatchContext,
     CapsuleInstallBatchId, CapsuleInstallBatchMember, CapsuleInstallEnv, CapsuleInstallProvenance,
     CapsuleInstallResumeReceipt, EnvEntry, EnvStorageScope, EnvValueKind,
-    InstalledCapsuleGeneration, InstalledCapsuleIdentity,
+    InstalledCapsuleGeneration, InstalledCapsuleIdentity, NativeAdapterApprovalV1,
+    NativeProtectionCapabilitiesV1,
 };
 pub use projection_names::{
     PROJECTION_NAME_DIAGNOSTIC_METHOD, PROJECTION_NAME_DIAGNOSTIC_TOPIC,
@@ -211,6 +212,11 @@ pub enum KernelRequest {
     /// Request agent-loop readiness: whether the loaded capsule set can serve
     /// an agent chat turn. Read-only, name-agnostic — see [`AgentLoopReadiness`].
     GetAgentReadiness,
+    /// Read the selected daemon's native protection prerequisites for one principal.
+    GetNativeProtectionCapabilities {
+        /// Subject principal; the authenticated caller remains the audited actor.
+        target_principal: PrincipalId,
+    },
 }
 
 /// Management API responses from the core daemon.
@@ -226,6 +232,8 @@ pub enum KernelResponse {
     /// Caller-scoped identity of one complete durable package, or `None` when
     /// the identifier is not installed for the authenticated caller.
     InstalledCapsuleIdentity(Option<InstalledCapsuleIdentity>),
+    /// Selected daemon and principal-bound native prerequisites.
+    NativeProtectionCapabilities(NativeProtectionCapabilitiesV1),
     /// Caller-scoped durable capsule-install resume receipt, or `None` when absent
     /// or when the stored bytes are malformed and therefore not completion proof.
     CapsuleInstallResumeReceipt(Option<CapsuleInstallResumeReceipt>),

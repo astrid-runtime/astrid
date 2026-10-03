@@ -227,3 +227,65 @@ mod tests {
         assert_eq!(member.expected_generation, None);
     }
 }
+
+/// Versioned read-only prerequisites attested by the selected daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeProtectionCapabilitiesV1 {
+    /// Wire schema revision.
+    pub schema_version: u16,
+    /// Random identity minted once per kernel boot.
+    pub daemon_incarnation: Uuid,
+    /// Opaque BLAKE3 binding to the immutable selected workspace and home.
+    pub context_digest: String,
+    /// Durable identity of the queried principal.
+    pub principal_uid: crate::PrincipalUid,
+    /// Implemented and qualified protection features.
+    pub features: std::collections::BTreeSet<String>,
+    /// Verified installed adapter identity and current approval verdict.
+    pub adapter: Option<NativeAdapterApprovalV1>,
+}
+
+/// Installed authority and live identity of the Oracle native hook adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeAdapterApprovalV1 {
+    /// Verified complete durable package identity.
+    pub identity: InstalledCapsuleIdentity,
+    /// Actual source UUID of the loaded principal-scoped runtime.
+    pub source_id: Uuid,
+    /// Verified authority path (kebab-case).
+    pub authority_class: String,
+    /// Approved package content digest, as lowercase BLAKE3 hex.
+    pub authority_digest: String,
+    /// Current receipt, manifest, executable and principal grants agree.
+    pub approved_for_native_hook: bool,
+}
+
+#[cfg(test)]
+mod native_capabilities_tests {
+    use super::*;
+
+    #[test]
+    fn native_capabilities_wire_rejects_unknown_fields() {
+        let response = NativeProtectionCapabilitiesV1 {
+            schema_version: 1,
+            daemon_incarnation: Uuid::new_v4(),
+            context_digest: "a".repeat(64),
+            principal_uid: crate::PrincipalUid::from_bytes([7; 32]),
+            features: std::collections::BTreeSet::new(),
+            adapter: None,
+        };
+        let mut wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            serde_json::from_value::<NativeProtectionCapabilitiesV1>(wire.clone()).unwrap(),
+            response
+        );
+        wire["environment"] = serde_json::json!({"token": "secret-value"});
+        assert!(serde_json::from_value::<NativeProtectionCapabilitiesV1>(wire).is_err());
+        let mut adapter = serde_json::json!({"identity": {"id": "aos-hook-adapter-oracle", "generation": {"archive": "a".repeat(64), "metadata": "b".repeat(64), "authority": "c".repeat(64)}, "archive_digest": "a".repeat(64)}, "source_id": Uuid::new_v4(), "authority_class": "explicit-approval", "authority_digest": "d".repeat(64), "approved_for_native_hook": false});
+        assert!(serde_json::from_value::<NativeAdapterApprovalV1>(adapter.clone()).is_ok());
+        adapter["approved_by_caller"] = true.into();
+        assert!(serde_json::from_value::<NativeAdapterApprovalV1>(adapter).is_err());
+    }
+}

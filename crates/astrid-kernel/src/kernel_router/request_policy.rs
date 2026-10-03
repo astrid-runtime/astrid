@@ -34,6 +34,7 @@ pub fn resolve_scope(request: &KernelRequest, caller: &PrincipalId) -> Authority
             ..
         } if target != caller => AuthorityScope::Global,
         KernelRequest::GetCapsuleMetadataForPrincipal { target_principal }
+        | KernelRequest::GetNativeProtectionCapabilities { target_principal }
             if target_principal != caller =>
         {
             AuthorityScope::Global
@@ -61,6 +62,7 @@ pub(super) fn request_target_principal(
             ..
         } if target != caller => Some(target.clone()),
         KernelRequest::GetCapsuleMetadataForPrincipal { target_principal }
+        | KernelRequest::GetNativeProtectionCapabilities { target_principal }
             if target_principal != caller =>
         {
             Some(target_principal.clone())
@@ -109,7 +111,8 @@ pub fn required_capability(request: &KernelRequest, scope: AuthorityScope) -> &'
             | KernelRequest::GetCommands
             | KernelRequest::GetCapsuleMetadata
             | KernelRequest::GetCapsuleMetadataForPrincipal { .. }
-            | KernelRequest::GetAgentReadiness,
+            | KernelRequest::GetAgentReadiness
+            | KernelRequest::GetNativeProtectionCapabilities { .. },
             AuthorityScope::Self_,
         ) => "self:capsule:list",
         (
@@ -117,7 +120,8 @@ pub fn required_capability(request: &KernelRequest, scope: AuthorityScope) -> &'
             | KernelRequest::GetCommands
             | KernelRequest::GetCapsuleMetadata
             | KernelRequest::GetCapsuleMetadataForPrincipal { .. }
-            | KernelRequest::GetAgentReadiness,
+            | KernelRequest::GetAgentReadiness
+            | KernelRequest::GetNativeProtectionCapabilities { .. },
             _,
         ) => "capsule:list",
         (KernelRequest::ApproveCapability { .. }, _) => "self:approval:respond",
@@ -154,6 +158,7 @@ pub fn kernel_request_method(request: &KernelRequest) -> &'static str {
         KernelRequest::GetCapsuleMetadata => "GetCapsuleMetadata",
         KernelRequest::GetCapsuleMetadataForPrincipal { .. } => "GetCapsuleMetadataForPrincipal",
         KernelRequest::GetAgentReadiness => "GetAgentReadiness",
+        KernelRequest::GetNativeProtectionCapabilities { .. } => "GetNativeProtectionCapabilities",
         KernelRequest::Shutdown { .. } => "Shutdown",
         KernelRequest::GetStatus => "GetStatus",
     }

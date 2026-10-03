@@ -157,6 +157,7 @@ mod tests {
         "budget",
         "session",
         "capsule",
+        "native-protection",
         "mcp",
         "distro",
         "build",

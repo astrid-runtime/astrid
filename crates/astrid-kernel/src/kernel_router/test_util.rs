@@ -49,6 +49,9 @@ pub(crate) fn all_kernel_request_variants() -> Vec<KernelRequest> {
             target_principal: PrincipalId::default(),
         },
         KernelRequest::GetAgentReadiness,
+        KernelRequest::GetNativeProtectionCapabilities {
+            target_principal: PrincipalId::default(),
+        },
         KernelRequest::ApproveCapability {
             request_id: "r".into(),
             signature: "s".into(),
