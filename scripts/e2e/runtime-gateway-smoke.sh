@@ -82,6 +82,26 @@ run_gateway_quota_write_smoke() {
   status="$(http_status PUT "/api/sys/principals/$user_principal/quotas" "$admin_bearer" "$body" \
     "$ARTIFACTS/http-quota-restore.json")"
   assert_status "admin can raise reduced quota" "$status" 200
+  status="$(http_status GET "/api/sys/principals/$user_principal/quotas" "$user_bearer" "" \
+    "$ARTIFACTS/http-quota-after-admin-increase.json")"
+  assert_status "agent quota read after admin increase" "$status" 200
+  json_assert_field_equals "$ARTIFACTS/http-quota-after-admin-increase.json" max_background_processes 5
+  # Later CLI/restart checks share this fixture. Restore the captured allocation,
+  # not the intermediate value used to prove operator-only increases.
+  body="$(quota_request_body "$ARTIFACTS/http-quota-before-write.json")"
+  status="$(http_status PUT "/api/sys/principals/$user_principal/quotas" "$admin_bearer" "$body" \
+    "$ARTIFACTS/http-quota-restore-original.json")"
+  assert_status "restore original quota fixture" "$status" 200
+  status="$(http_status GET "/api/sys/principals/$user_principal/quotas" "$user_bearer" "" \
+    "$ARTIFACTS/http-quota-restored.json")"
+  assert_status "agent quota read after fixture restoration" "$status" 200
+  "$PYTHON" - "$ARTIFACTS/http-quota-before-write.json" "$ARTIFACTS/http-quota-restored.json" <<'PY'
+import json
+import sys
+
+before, after = [json.load(open(path, encoding="utf-8")) for path in sys.argv[1:]]
+assert after == before, (before, after)
+PY
 }
 
 json_assert_public_gateway_surface() {
@@ -182,13 +202,14 @@ PY
 }
 
 quota_request_body() {
-  local file=$1 processes=$2
+  local file=$1 processes=${2:-}
   "$PYTHON" - "$file" "$processes" <<'PY'
 import json
 import sys
 
 quotas = json.load(open(sys.argv[1], encoding="utf-8"))
-quotas["max_background_processes"] = int(sys.argv[2])
+if sys.argv[2]:
+    quotas["max_background_processes"] = int(sys.argv[2])
 print(json.dumps({"quotas": quotas}, separators=(",", ":")))
 PY
 }

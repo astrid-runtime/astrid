@@ -3,6 +3,7 @@ set -euo pipefail
 CORE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT_DIR="$CORE_DIR/scripts/e2e"
 CAPSULES_DIR="${ASTRID_E2E_CAPSULES_DIR:-$CORE_DIR/../capsules}"
+bash "$CORE_DIR/scripts/test-gateway-quota-fixture.sh"
 ASTRID_HOME_GENERATED=0; if [[ -n "${ASTRID_E2E_HOME:-}" ]]; then ASTRID_HOME="$ASTRID_E2E_HOME"; else ASTRID_HOME="$(mktemp -d "${TMPDIR:-/tmp}/astrid-runtime-e2e.XXXXXX")"; ASTRID_HOME_GENERATED=1; fi
 ARTIFACTS="$(mktemp -d "${TMPDIR:-/tmp}/astrid-runtime-e2e-artifacts.XXXXXX")"
 REDACTED_UPLOAD="$ARTIFACTS/redacted-upload"
