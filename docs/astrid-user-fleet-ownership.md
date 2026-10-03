@@ -62,11 +62,42 @@ The command only resolves missing attribution: repeating the same assignment
 is safe, but replacing an existing accountable user is refused. It preserves
 fleet membership, principal identity, keys, profiles, and capsule state.
 
-The in-progress aggregate CPU mechanism measures Wasmtime guest fuel, not host
-CPU time or subprocess use. Personal installations have no new aggregate limit
-by default. Background enforcement is not yet complete; the presence of a
-resource configuration or attribution record alone does not prove an enforced
-aggregate execution ceiling.
+Aggregate execution accounting measures Wasmtime guest fuel, not host CPU time,
+I/O, or subprocess use. Personal installations have no new aggregate limit by
+default; existing principal limits remain in effect.
+
+An operator can configure the runtime's `config.toml` while its projection is
+running, then stop and restart to apply the boot-bound policy:
+
+```toml
+[resources]
+default_user_cpu_fuel_per_sec = 100000000
+
+# Optional overrides use immutable UserUid values, not principal aliases.
+# [resources.user_cpu_fuel_per_sec]
+# "<user-uid>" = 200000000
+```
+
+The numbers above are examples, not recommended defaults or CPU percentages.
+Zero is invalid. Workspace configuration cannot add or replace these operator
+allocations. A configured installation refuses execution requiring attribution
+when the principal has no accountable user; use the explicit recovery command
+above instead of inferring a payer from fleet access.
+
+All charged principals share their user's rate ledger. It allows one second of
+initial credit and throttles cooperatively at Wasmtime scheduling boundaries.
+A guest operation may exceed the available credit before yielding; that excess
+remains debt and delays subsequent execution. Cancellation, a new invocation,
+or a new principal does not refund that debt. This is **not** a strict ceiling
+on instructions in every one-second interval. The ledger is runtime-local,
+not persistent billing across daemon restarts or multiple hosts.
+
+User accounting covers capsule initialization, background execution,
+authenticated invocations, and daemon-managed install/upgrade lifecycle hooks.
+Principal-level administrator exemptions do not waive a configured user rate.
+Kernel system-resident startup is distinct from user execution; authenticated
+calls are rebound to their caller. Native host work and subprocess CPU require
+separate OS-level accounting and are not covered by this fuel policy.
 
 ## Persistence and recovery
 
