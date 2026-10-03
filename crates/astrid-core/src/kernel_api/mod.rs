@@ -30,11 +30,13 @@ pub use audit_export::{
 };
 pub use capsule_metadata::CapsuleEnvOptionsFromMetadata;
 pub use install::{
-    CAPSULE_INSTALL_BATCH_PROTOCOL_V1, CapsuleInstallAuthority, CapsuleInstallBatchContext,
-    CapsuleInstallBatchId, CapsuleInstallBatchMember, CapsuleInstallEnv, CapsuleInstallProvenance,
-    CapsuleInstallResumeReceipt, EnvEntry, EnvStorageScope, EnvValueKind,
-    InstalledCapsuleGeneration, InstalledCapsuleIdentity, NativeAdapterApprovalV1,
-    NativeProtectionCapabilitiesV1,
+    BeginNativePairUpgrade, CAPSULE_INSTALL_BATCH_PROTOCOL_V1, CapsuleInstallAuthority,
+    CapsuleInstallBatchContext, CapsuleInstallBatchId, CapsuleInstallBatchMember,
+    CapsuleInstallEnv, CapsuleInstallProvenance, CapsuleInstallResumeReceipt, EnvEntry,
+    EnvStorageScope, EnvValueKind, InstalledCapsuleGeneration, InstalledCapsuleIdentity,
+    NativeAdapterApprovalV1, NativePairIdentityV1, NativePairLeaseRefV1, NativePairLeaseV1,
+    NativePairMemberV1, NativePairPhaseV1, NativePairStateV1, NativeProtectionCapabilitiesV1,
+    StageNativePairMember,
 };
 pub use projection_names::{
     PROJECTION_NAME_DIAGNOSTIC_METHOD, PROJECTION_NAME_DIAGNOSTIC_TOPIC,
@@ -66,6 +68,14 @@ pub const SYSTEM_SESSION_UUID: &str = "00000000-0000-0000-0000-000000000000";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum KernelRequest {
+    /// Begin a bounded unpublished native upgrade.
+    BeginNativePairUpgrade(Box<BeginNativePairUpgrade>),
+    /// Transfer and verify one contiguous member archive chunk.
+    StageNativePairMember(StageNativePairMember),
+    /// Discard unpublished staging.
+    AbortNativePairUpgrade(NativePairLeaseRefV1),
+    /// Read redacted upgrade status.
+    GetNativePairUpgrade(NativePairLeaseRefV1),
     /// Open a short lease for an exact set of local capsule archives.
     BeginCapsuleInstallBatch {
         /// Optional durable principal target. Absent means the caller.
@@ -223,6 +233,10 @@ pub enum KernelRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", content = "data")]
 pub enum KernelResponse {
+    /// Unpublished native pair lease.
+    NativePairLease(NativePairLeaseV1),
+    /// Redacted native pair transaction status.
+    NativePairState(NativePairStateV1),
     /// The request succeeded.
     Success(serde_json::Value),
     /// A list of available slash commands across all capsules.

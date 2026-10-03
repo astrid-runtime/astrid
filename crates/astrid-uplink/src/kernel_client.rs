@@ -189,6 +189,10 @@ pub const fn topic_suffix(req: &KernelRequest) -> &'static str {
         KernelRequest::GetCapsuleMetadataForPrincipal { .. } => "principal_metadata",
         KernelRequest::GetAgentReadiness => "agent_readiness",
         KernelRequest::GetNativeProtectionCapabilities { .. } => "native_protection_capabilities",
+        KernelRequest::BeginNativePairUpgrade(_) => "begin_native_pair_upgrade",
+        KernelRequest::StageNativePairMember(_) => "stage_native_pair_member",
+        KernelRequest::AbortNativePairUpgrade(_) => "abort_native_pair_upgrade",
+        KernelRequest::GetNativePairUpgrade(_) => "get_native_pair_upgrade",
         KernelRequest::Shutdown { .. } => "shutdown",
         KernelRequest::GetStatus => "status",
     }

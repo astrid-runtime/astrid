@@ -2459,3 +2459,88 @@ async fn native_capabilities_reject_unpinned_legacy_and_mismatched_runtime() {
         );
     }
 }
+
+#[test]
+fn native_pair_lease_scope_policy_uses_existing_install_authority() {
+    let self_caller = PrincipalId::new("alice").unwrap();
+    let other_caller = PrincipalId::new("bob").unwrap();
+    for request in all_kernel_request_variants().into_iter().filter(|request| {
+        matches!(
+            request,
+            KernelRequest::BeginNativePairUpgrade(_)
+                | KernelRequest::StageNativePairMember(_)
+                | KernelRequest::AbortNativePairUpgrade(_)
+                | KernelRequest::GetNativePairUpgrade(_)
+        )
+    }) {
+        assert_eq!(resolve_scope(&request, &self_caller), AuthorityScope::Self_);
+        assert_eq!(
+            resolve_scope(&request, &other_caller),
+            AuthorityScope::Global
+        );
+        assert_eq!(
+            required_capability(&request, AuthorityScope::Self_),
+            "self:capsule:install"
+        );
+        assert_eq!(
+            required_capability(&request, AuthorityScope::Global),
+            "capsule:install"
+        );
+        assert_eq!(
+            super::request_policy::request_target_principal(&request, &other_caller),
+            Some(self_caller.clone())
+        );
+        assert!(rate_limit_for_request(&request).1.is_some());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_pair_lease_router_rejects_cross_target_spoof() {
+    let directory = tempfile::tempdir().unwrap();
+    let kernel =
+        crate::test_kernel_with_home(astrid_core::dirs::AstridHome::from_path(directory.path()))
+            .await;
+    let caller = PrincipalId::default();
+    seed_profile(
+        &kernel,
+        &caller,
+        &PrincipalProfile {
+            grants: vec!["self:capsule:install".into()],
+            ..Default::default()
+        },
+    );
+    let mut reference = super::test_util::native_pair_reference();
+    reference.daemon_incarnation = kernel.native_protection_incarnation;
+    drop(spawn_kernel_router(Arc::clone(&kernel)));
+    let response = request_kernel(
+        &kernel,
+        &caller,
+        "pair_cross_target",
+        KernelRequest::AbortNativePairUpgrade(reference.clone()),
+    )
+    .await;
+    assert!(matches!(response, KernelResponse::Error(_)));
+    seed_profile(
+        &kernel,
+        &caller,
+        &PrincipalProfile {
+            grants: vec!["capsule:install".into()],
+            ..Default::default()
+        },
+    );
+    let response = request_kernel(
+        &kernel,
+        &caller,
+        "pair_unknown_target",
+        KernelRequest::GetNativePairUpgrade(reference.clone()),
+    )
+    .await;
+    assert!(matches!(response, KernelResponse::Error(_)));
+    assert!(
+        kernel
+            .principal_directory
+            .uid_for(&reference.target_principal)
+            .is_err(),
+        "lookup must not provision a target"
+    );
+}

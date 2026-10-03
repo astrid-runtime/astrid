@@ -289,3 +289,183 @@ mod native_capabilities_tests {
         assert!(serde_json::from_value::<NativeAdapterApprovalV1>(adapter).is_err());
     }
 }
+
+/// Exactly the protected principal's two installed native members.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativePairIdentityV1 {
+    /// Durable enforcer identity.
+    pub enforcer: InstalledCapsuleIdentity,
+    /// Durable protocol identity.
+    pub protocol: InstalledCapsuleIdentity,
+    /// Authenticated enforcer source.
+    pub enforcer_source: Uuid,
+    /// Authenticated protocol source.
+    pub protocol_source: Uuid,
+}
+
+/// One archive and its generation-scoped text environment.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativePairMemberV1 {
+    /// One of the two fixed Codewall capsule IDs.
+    pub id: String,
+    /// Raw lowercase BLAKE3 digest of the exact transferred archive.
+    pub source_digest: String,
+    /// Exact compressed byte count, at most 64 `MiB`.
+    pub source_bytes: u64,
+    /// Authenticated install decision, never an additional grant.
+    pub authority: CapsuleInstallAuthority,
+    /// Proposed text values; secret/shared writes are forbidden.
+    pub env: Vec<CapsuleInstallEnv>,
+}
+impl std::fmt::Debug for NativePairMemberV1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativePairMemberV1")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Begin an unpublished, bounded native pair lease.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BeginNativePairUpgrade {
+    /// Explicit target; authorization still comes from the authenticated caller.
+    pub target_principal: crate::PrincipalId,
+    /// Immutable target UID observed during preflight.
+    pub principal_uid: crate::identity::PrincipalUid,
+    /// Daemon selected during preflight.
+    pub daemon_incarnation: Uuid,
+    /// Exact old durable identities and sources.
+    pub expected_old: NativePairIdentityV1,
+    /// Both members, even if one is unchanged.
+    pub members: [NativePairMemberV1; 2],
+    /// Absolute deadline, at most 300 seconds in the future.
+    pub expires_at_unix_ms: u64,
+    /// Replay protection scoped to the authenticated caller.
+    pub nonce: Uuid,
+    /// Existing installation binding.
+    pub installation_id: Uuid,
+    /// Existing journal binding.
+    pub journal_id: Uuid,
+}
+
+/// Authenticated assertions used to access an existing lease.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativePairLeaseRefV1 {
+    /// Unpredictable daemon-issued lease ID.
+    pub lease_id: Uuid,
+    /// Target selector, checked against the lease after ordinary authorization.
+    pub target_principal: crate::PrincipalId,
+    /// Immutable target UID.
+    pub principal_uid: crate::identity::PrincipalUid,
+    /// Owning daemon incarnation.
+    pub daemon_incarnation: Uuid,
+}
+
+/// One contiguous bounded archive chunk.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StageNativePairMember {
+    /// Lease authority assertions.
+    pub lease: NativePairLeaseRefV1,
+    /// Fixed declared member ID.
+    pub member_id: String,
+    /// Expected next byte offset.
+    pub offset: u64,
+    /// Declared total archive size.
+    pub total_bytes: u64,
+    /// At most 256 `KiB`; serialized request plus envelope must fit 2 `MiB`.
+    pub chunk: Vec<u8>,
+    /// True exactly when this chunk completes the declared archive.
+    pub final_chunk: bool,
+}
+impl std::fmt::Debug for StageNativePairMember {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StageNativePairMember")
+            .field("lease", &self.lease)
+            .field("member_id", &self.member_id)
+            .field("offset", &self.offset)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Process-local unpublished upgrade lease; never an install authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativePairLeaseV1 {
+    /// Opaque lease identifier.
+    pub lease_id: Uuid,
+    /// Owning boot identity.
+    pub daemon_incarnation: Uuid,
+    /// Target owner.
+    pub principal_uid: crate::identity::PrincipalUid,
+    /// Absolute expiry.
+    pub expires_at_unix_ms: u64,
+    /// Pinned old pair.
+    pub old: NativePairIdentityV1,
+    /// Reserved candidate runtime identities, populated by candidate preparation.
+    pub candidate: Option<NativePairIdentityV1>,
+    /// Absent until a consistent policy snapshot is captured under its write fence.
+    pub policy_snapshot_digest: Option<String>,
+}
+
+/// Native transaction phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativePairPhaseV1 {
+    /// Private package transfer/verification; no policy snapshot promise.
+    Staging,
+    /// Fenced snapshot and candidate prepared.
+    Ready,
+    /// Durable commit in progress.
+    CommitIntent,
+    /// Pair committed.
+    Committed,
+    /// Old pair restored.
+    RolledBack,
+    /// Retained rollback generation retired.
+    Finalized,
+    /// Private staging discarded.
+    Aborted,
+}
+
+/// Redacted lease/transaction status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativePairStateV1 {
+    /// Lease binding and phase-dependent candidate/snapshot identity.
+    pub lease: NativePairLeaseV1,
+    /// Current phase.
+    pub phase: NativePairPhaseV1,
+}
+
+#[cfg(test)]
+mod native_pair_wire_tests {
+    use super::*;
+    #[test]
+    fn native_pair_lease_wire_rejects_unrecognized_authority_fields() {
+        let reference = NativePairLeaseRefV1 {
+            lease_id: Uuid::new_v4(),
+            target_principal: crate::PrincipalId::default(),
+            principal_uid: crate::identity::PrincipalUid::from_bytes([1; 32]),
+            daemon_incarnation: Uuid::new_v4(),
+        };
+        let mut wire = serde_json::to_value(reference).unwrap();
+        wire["enrollment_grant"] = serde_json::json!("never-accepted");
+        assert!(serde_json::from_value::<NativePairLeaseRefV1>(wire).is_err());
+        let member = NativePairMemberV1 {
+            id: "codewall-protocol".into(),
+            source_digest: "a".repeat(64),
+            source_bytes: 1,
+            authority: CapsuleInstallAuthority::Automatic,
+            env: vec![CapsuleInstallEnv {
+                key: "PIN".into(),
+                value: "private-value-marker".into(),
+                kind: EnvValueKind::Text,
+            }],
+        };
+        assert!(!format!("{member:?}").contains("private-value-marker"));
+    }
+}

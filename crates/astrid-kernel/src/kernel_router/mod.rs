@@ -611,6 +611,12 @@ async fn handle_request(
         KernelRequest::GetCapsuleMetadataForPrincipal { target_principal } => {
             capsule_metadata::response(kernel, &authorization, Some(&target_principal)).await
         },
+        request @ (KernelRequest::BeginNativePairUpgrade(_)
+        | KernelRequest::StageNativePairMember(_)
+        | KernelRequest::AbortNativePairUpgrade(_)
+        | KernelRequest::GetNativePairUpgrade(_)) => {
+            native_protection::handle_native_pair(kernel, &caller, request).await
+        },
         KernelRequest::GetNativeProtectionCapabilities { target_principal } => {
             match kernel
                 .native_protection_capabilities(&target_principal)

@@ -59,11 +59,23 @@ fn canonical_archive_for_source(source: &Path) -> anyhow::Result<Vec<u8>> {
         );
     }
 
-    let staging = tempfile::tempdir().context("create source digest staging directory")?;
     let file = fs::File::open(source)
         .with_context(|| format!("open capsule archive {}", source.display()))?;
-    let decoder = flate2::read::GzDecoder::new(file);
-    let mut archive = tar::Archive::new(decoder);
+    canonical_archive_from_reader(file, u64::MAX)
+}
+
+pub(crate) fn canonical_archive_from_reader(
+    source: impl Read,
+    expanded_limit: u64,
+) -> anyhow::Result<Vec<u8>> {
+    let staging = tempfile::tempdir().context("create source digest staging directory")?;
+    let decoder = flate2::read::GzDecoder::new(source);
+    let mut expanded = 0_u64;
+    let mut count = 0_u64;
+    // Bound raw decompression too: tar consumes GNU/PAX extension records
+    // internally before yielding an entry, so entry sizes alone are insufficient.
+    let budget = expanded_limit.saturating_add(4 * 1024 * 1024);
+    let mut archive = tar::Archive::new(decoder.take(budget));
     let mut names = BTreeSet::new();
     for entry in archive.entries().context("read capsule archive entries")? {
         let mut entry = entry.context("read capsule archive entry")?;
@@ -81,6 +93,13 @@ fn canonical_archive_for_source(source: &Path) -> anyhow::Result<Vec<u8>> {
             .replace('\\', "/");
         if !names.insert(name.clone()) {
             bail!("capsule archive contains duplicate path {name}");
+        }
+        count = count.saturating_add(1);
+        expanded = expanded
+            .checked_add(entry.size())
+            .ok_or_else(|| anyhow::anyhow!("archive size overflow"))?;
+        if expanded > expanded_limit || (expanded_limit != u64::MAX && count > 4096) {
+            bail!("archive expansion limit exceeded");
         }
         let entry_type = entry.header().entry_type();
         if !entry_type.is_dir() && !entry_type.is_file() {
@@ -105,6 +124,9 @@ fn canonical_archive_for_source(source: &Path) -> anyhow::Result<Vec<u8>> {
         entry
             .read_to_end(&mut sink)
             .with_context(|| format!("read capsule archive file {name}"))?;
+    }
+    if archive.into_inner().limit() == 0 {
+        bail!("archive decompression limit exceeded");
     }
     crate::storage::canonical_capsule_archive(staging.path())
 }

@@ -71,6 +71,8 @@ mod kernel_shutdown_tests;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod legacy_migration_barrier;
 mod native_input;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod native_pair;
 pub use native_input::native_input_device_is_live;
 /// Deterministic CLI-root user/fleet bootstrap and unowned-principal upgrade.
 mod ownership_bootstrap;
@@ -227,6 +229,8 @@ pub struct Kernel {
     native_protection_incarnation: uuid::Uuid,
     /// Frozen home/workspace binding; computed once from boot-selected roots.
     native_protection_context: String,
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    native_pair_leases: Mutex<native_pair::LeaseStore>,
     /// The global IPC message bus.
     pub event_bus: Arc<EventBus>,
     /// The process manager (loaded WASM capsules).
@@ -1405,6 +1409,8 @@ impl Kernel {
         let kernel = Arc::new(Self {
             session_id: session_id.clone(),
             native_protection_incarnation: uuid::Uuid::new_v4(),
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            native_pair_leases: Mutex::new(native_pair::LeaseStore::default()),
             native_protection_context: native_protection_context(&home, &workspace_selection),
             event_bus,
             capsules,
@@ -3880,6 +3886,8 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
     let kernel = Arc::new(Kernel {
         session_id: session_id.clone(),
         native_protection_incarnation: uuid::Uuid::new_v4(),
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        native_pair_leases: Mutex::new(native_pair::LeaseStore::default()),
         native_protection_context: native_protection_context(
             &home,
             &test_workspace_selection(&home),

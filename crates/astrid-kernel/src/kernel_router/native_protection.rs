@@ -142,3 +142,66 @@ fn hook_manifest_contract(manifest: &astrid_capsule::manifest::CapsuleManifest) 
                 })
         })
 }
+
+pub(super) async fn handle_native_pair(
+    kernel: &crate::Kernel,
+    caller: &PrincipalId,
+    request: astrid_core::kernel_api::KernelRequest,
+) -> astrid_core::kernel_api::KernelResponse {
+    use astrid_core::kernel_api::{KernelRequest as R, KernelResponse as S};
+    let (target, uid, incarnation) = match &request {
+        R::BeginNativePairUpgrade(request) => (
+            &request.target_principal,
+            request.principal_uid,
+            request.daemon_incarnation,
+        ),
+        R::StageNativePairMember(request) => (
+            &request.lease.target_principal,
+            request.lease.principal_uid,
+            request.lease.daemon_incarnation,
+        ),
+        R::AbortNativePairUpgrade(request) | R::GetNativePairUpgrade(request) => (
+            &request.target_principal,
+            request.principal_uid,
+            request.daemon_incarnation,
+        ),
+        _ => return S::Error("invalid native pair operation".into()),
+    };
+    let Ok(caller_uid) = kernel.principal_directory.uid_for(caller) else {
+        return S::Error("native pair caller unavailable".into());
+    };
+    if kernel.principal_directory.uid_for(target).ok() != Some(uid)
+        || incarnation != kernel.native_protection_incarnation
+    {
+        return S::Error("native pair principal or daemon mismatch".into());
+    }
+    // The router has already authenticated and authorized the existing install capability.
+    let actor = crate::native_pair::NativePairActor {
+        caller: caller.clone(),
+        caller_uid,
+        target: target.clone(),
+        uid,
+        incarnation,
+    };
+    let coordinator = crate::native_pair::NativePairCoordinator::new(kernel);
+    let result = match request {
+        R::BeginNativePairUpgrade(request) => coordinator
+            .begin(&actor, *request)
+            .await
+            .map(S::NativePairLease),
+        R::StageNativePairMember(request) => coordinator
+            .stage_member(&actor, request)
+            .await
+            .map(S::NativePairLease),
+        R::AbortNativePairUpgrade(request) => coordinator
+            .abort(&actor, request.lease_id)
+            .await
+            .map(S::NativePairState),
+        R::GetNativePairUpgrade(request) => coordinator
+            .status(&actor, request.lease_id)
+            .await
+            .map(S::NativePairState),
+        _ => unreachable!(),
+    };
+    result.unwrap_or_else(|_| S::Error("native pair request rejected".into()))
+}
