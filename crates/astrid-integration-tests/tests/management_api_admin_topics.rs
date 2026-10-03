@@ -350,6 +350,7 @@ fn admin_kernel_response_variants_serialize() {
     let agents = AdminKernelResponse::new(AdminResponseBody::AgentList(vec![AgentSummary {
         principal: pid("alice"),
         owner_uid: None,
+        accountable_user: None,
         enabled: true,
         groups: vec!["agent".into()],
         grants: Vec::new(),

@@ -53,8 +53,16 @@ shared installation with unresolved attribution needs an explicit operator
 decision, not a fresh home:
 
 ```sh
+astrid agent list --format json
 astrid quota assign-user --agent worker --user <user-uid>
 ```
+
+Authorized listings expose `accountable_user` as the immutable user UID;
+`owner_uid` is the principal UID and must not be used in its place. `--mine`
+lists only principals accessible to the authenticated user. An absent
+`accountable_user` means attribution is unresolved (or the server predates this
+field), not that the principal may spend another user's allowance. Select the
+intended existing user explicitly; do not infer it from fleet membership.
 
 This requires global `quota:set`, including when `worker` is the caller.
 A self-scoped device cannot borrow the principal's broader administrator grant.

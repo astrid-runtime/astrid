@@ -17,6 +17,21 @@ use super::handlers::{
     AGENT_IDENTITY_PLATFORM, err_bad_input, err_internal, principal_profile_path, success_json,
 };
 
+/// Resolve deletion authority at dispatch before touching principal state.
+pub(super) async fn dispatch(
+    kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
+    authorization: Option<&crate::kernel_router::AuthorizedRequest>,
+    device_key_id: Option<&str>,
+    principal: PrincipalId,
+) -> AdminResponseBody {
+    let authority = match DeletionAuthority::resolve(kernel, caller, authorization, device_key_id) {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    agent_delete(kernel, principal, authority.as_ref()).await
+}
+
 pub(super) async fn agent_delete(
     kernel: &Arc<crate::Kernel>,
     principal: PrincipalId,

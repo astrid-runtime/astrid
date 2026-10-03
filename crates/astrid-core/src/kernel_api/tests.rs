@@ -8,6 +8,24 @@ use super::{
 };
 
 #[test]
+fn agent_summary_preserves_legacy_wire_and_typed_accountable_user() {
+    let legacy = serde_json::json!({
+        "principal": "default", "enabled": true,
+        "groups": [], "grants": [], "revokes": []
+    });
+    let mut row: super::AgentSummary = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(row.accountable_user, None);
+    assert_eq!(serde_json::to_value(&row).unwrap(), legacy);
+    row.accountable_user = Some(crate::UserUid::from_bytes([7; 32]));
+    let encoded = serde_json::to_value(&row).unwrap();
+    assert_eq!(encoded["accountable_user"], "07".repeat(32));
+    assert_eq!(
+        serde_json::from_value::<super::AgentSummary>(encoded).unwrap(),
+        row
+    );
+}
+
+#[test]
 fn kernel_response_working_serializes_as_status_working() {
     // The keepalive variant is a unit variant on a `tag = "status",
     // content = "data"` enum with no `rename_all`, so it serializes as the

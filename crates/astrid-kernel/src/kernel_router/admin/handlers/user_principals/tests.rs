@@ -100,6 +100,21 @@ async fn discovery_filters_on_server_even_for_admin_and_rechecks_transfer_and_re
         .await
         .unwrap();
     assert_eq!(names(&kernel).await, ["default", "mine"]);
+    let roster = test_support::dispatch_as_operator(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentList,
+    )
+    .await;
+    let AdminResponseBody::AgentList(rows) = roster else {
+        panic!("{roster:?}");
+    };
+    let transferred = rows
+        .iter()
+        .find(|row| row.principal.as_str() == "other")
+        .unwrap();
+    assert_eq!(transferred.accountable_user, graph.accountable_user(other));
+    assert_ne!(transferred.accountable_user, Some(bob.uid));
     let no_device = handlers::dispatch(
         &kernel,
         &PrincipalId::default(),
