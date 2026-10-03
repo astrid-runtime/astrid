@@ -5,6 +5,7 @@ use astrid_core::{
 
 mod execution_tests;
 mod prepaid_guest_tests;
+mod throttle_tests;
 
 async fn accounting() -> UserCpuAccounting {
     let directory = PrincipalDirectory::default();

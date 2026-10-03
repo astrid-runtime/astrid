@@ -12,6 +12,7 @@
 pub mod capability_presentation;
 pub mod capsule;
 pub mod error;
+pub mod execution_rate;
 pub mod fuel_ledger;
 pub mod limits;
 pub mod manifest;

@@ -1,10 +1,12 @@
 //! Shared user execution accounting, independent of fleet access and human sessions.
 
+use astrid_capsule_types::execution_rate::ExecutionRate;
 use astrid_capsule_types::fuel_ledger::{FuelRateLimiter, FuelReservation};
 use astrid_core::{PrincipalId, UserUid};
 use astrid_storage::{OwnershipStore, PrincipalDirectory};
 
 pub mod execution;
+pub mod throttle;
 
 #[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
 mod tests;
@@ -19,6 +21,8 @@ pub struct UserCpuAccounting {
     default_limit: Option<NonZeroU64>,
     user_limits: BTreeMap<UserUid, NonZeroU64>,
     limiter: FuelRateLimiter<UserUid>,
+    principal_rate: ExecutionRate<PrincipalId>,
+    user_rate: ExecutionRate<UserUid>,
 }
 
 /// Allocation pinned for one execution. A principal-level exemption cannot
@@ -28,6 +32,7 @@ pub struct UserCpuAllocation {
     user: UserUid,
     limit: NonZeroU64,
     limiter: FuelRateLimiter<UserUid>,
+    rate: ExecutionRate<UserUid>,
 }
 
 /// An execution quantum which cannot fit within its configured allocation.
@@ -53,6 +58,8 @@ impl UserCpuAccounting {
             default_limit,
             user_limits,
             limiter: FuelRateLimiter::default(),
+            principal_rate: ExecutionRate::default(),
+            user_rate: ExecutionRate::default(),
         }
     }
 
@@ -89,7 +96,27 @@ impl UserCpuAccounting {
                 user,
                 limit,
                 limiter: self.limiter.clone(),
+                rate: self.user_rate.clone(),
             }))
+    }
+
+    /// Capture both accounting authorities for resumable cooperative execution.
+    /// A zero principal limit retains the existing exemption convention; it
+    /// never exempts the independently configured accountable user.
+    ///
+    /// # Errors
+    /// Configured user limits refuse missing or ambiguous attribution.
+    pub async fn execution_throttle(
+        &self,
+        principal: &PrincipalId,
+        principal_limit: u64,
+    ) -> Result<throttle::ExecutionThrottle, String> {
+        Ok(throttle::ExecutionThrottle::new(
+            principal.clone(),
+            NonZeroU64::new(principal_limit),
+            self.principal_rate.clone(),
+            self.resolve(principal).await?,
+        ))
     }
 }
 
