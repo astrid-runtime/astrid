@@ -129,7 +129,10 @@ pub(super) async fn authorize_admin_request(
     // Quota changes also require a locked comparison with the current allocation.
     // Their handler records the final result after that check and persistence.
     if audit_handlers::omit_success_admin_audit(kind)
-        || matches!(kind, AdminRequestKind::QuotaSet { .. })
+        || matches!(
+            kind,
+            AdminRequestKind::QuotaSet { .. } | AdminRequestKind::QuotaAssignUser { .. }
+        )
     {
         return Ok(authorization);
     }

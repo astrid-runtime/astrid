@@ -153,6 +153,7 @@ PY
   run_cli keypair delete e2e-cli-redeem-key --yes
 
   run_cli quota show --agent "$user_principal" --format json > "$ARTIFACTS/cli-quota-show-user.json"
+  run_cli quota users --format json > "$ARTIFACTS/cli-quota-users.json"
   json_assert_cli_quota "$ARTIFACTS/cli-quota-show-user.json" "$user_principal" 4
   # A syntactically valid but unrelated user cannot replace the payer, even
   # when the principal being changed is the authenticated caller itself.

@@ -567,6 +567,9 @@ pub enum AdminRequestKind {
         #[serde(default)]
         remove_capsules: Vec<String>,
     },
+    /// List existing user identities for explicit operator resource attribution.
+    /// Requires global quota administration, never ordinary principal discovery.
+    QuotaUserList,
     /// Resolve missing legacy resource attribution using operator authority.
     /// Idempotent for the same user; never transfers an existing allocation.
     QuotaAssignUser {

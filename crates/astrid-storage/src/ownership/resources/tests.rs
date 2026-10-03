@@ -295,6 +295,18 @@ async fn unresolved_parent_cannot_spawn_unaccountable_children() {
 }
 
 #[tokio::test]
+async fn unknown_accountable_user_is_input_error_not_graph_corruption() {
+    let (store, principal, owner, _) = fixture().await;
+    let before = store.load().await.unwrap();
+    let missing = UserUid::from_bytes([99; 32]);
+    assert!(
+        matches!(store.assign_accountable_user(principal, Some(owner.uid), missing).await,
+        Err(OwnershipError::UserNotFound(uid)) if uid == missing)
+    );
+    assert_eq!(store.load().await.unwrap(), before);
+}
+
+#[tokio::test]
 async fn reassignment_invalidates_captured_spawn_accountability() {
     let (store, principal, owner, _) = fixture().await;
     let child = PrincipalUid::from_bytes([7; 32]);

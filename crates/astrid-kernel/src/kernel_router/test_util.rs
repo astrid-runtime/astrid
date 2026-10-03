@@ -92,6 +92,7 @@ fn identity_and_policy_variants(principal: &PrincipalId) -> Vec<AdminRequestKind
         },
         AdminRequestKind::AgentList,
         AdminRequestKind::UserPrincipalList,
+        AdminRequestKind::QuotaUserList,
         AdminRequestKind::UserPrincipalClaim {
             principal: principal.clone(),
         },

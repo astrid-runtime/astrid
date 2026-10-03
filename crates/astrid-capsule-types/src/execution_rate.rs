@@ -21,6 +21,11 @@ mod tests;
 // scheduling slice into a free slice. This is a unit conversion, not a quota.
 const NANOS_PER_SECOND: i128 = 1_000_000_000;
 
+// Housekeeping only, not an execution/identity limit. Match FuelRateLimiter's
+// lazy scan policy so small ledgers avoid a full-map walk on the hot path.
+const PRUNE_THRESHOLD: usize = 1_000;
+const PRUNE_INTERVAL: Duration = Duration::from_mins(1);
+
 struct Balance {
     credit: i128,
     updated: Instant,
@@ -31,12 +36,14 @@ struct Balance {
 /// Clones share balances; constructing one per capsule would defeat aggregation.
 pub struct ExecutionRate<K> {
     balances: Arc<DashMap<K, Mutex<Balance>>>,
+    last_prune: Arc<Mutex<Instant>>,
 }
 
 impl<K> Clone for ExecutionRate<K> {
     fn clone(&self) -> Self {
         Self {
             balances: Arc::clone(&self.balances),
+            last_prune: Arc::clone(&self.last_prune),
         }
     }
 }
@@ -45,6 +52,7 @@ impl<K: Eq + Hash> Default for ExecutionRate<K> {
     fn default() -> Self {
         Self {
             balances: Arc::new(DashMap::new()),
+            last_prune: Arc::new(Mutex::new(Instant::now())),
         }
     }
 }
@@ -55,20 +63,54 @@ impl<K: Clone + Eq + Hash> ExecutionRate<K> {
     /// The rate is supplied by trusted operator policy, never by a guest.
     #[must_use]
     pub fn charge(&self, key: &K, rate: NonZeroU64, fuel: u64, now: Instant) -> Duration {
+        self.maybe_prune(key, now);
+        if fuel == 0 {
+            return self.delay(key, rate, now);
+        }
+        if let Some(entry) = self.balances.get(key) {
+            return entry.lock().charge(rate, fuel, now);
+        }
+        // Only insertion takes this lock. Match the scan's lock order
+        // (maintenance then shard), and preserve its clock across eviction.
+        let last_prune = self.last_prune.lock();
         let entry = self.balances.entry(key.clone()).or_insert_with(|| {
             Mutex::new(Balance {
                 credit: i128::from(rate.get()) * NANOS_PER_SECOND,
-                updated: now,
+                // A delayed sample may arrive after this identity was pruned.
+                // Do not restart its clock before the completed cleanup scan.
+                updated: now.max(*last_prune),
                 rate,
             })
         });
-        let mut balance = entry.lock();
-        balance.refresh(rate, now);
-        // Saturation fails closed: accumulated debt can never wrap into credit.
-        balance.credit = balance
-            .credit
-            .saturating_sub(i128::from(fuel) * NANOS_PER_SECOND);
-        balance.recheck_delay()
+        drop(last_prune);
+        entry.lock().charge(rate, fuel, now)
+    }
+
+    fn maybe_prune(&self, active: &K, now: Instant) {
+        if self.balances.len() <= PRUNE_THRESHOLD {
+            return;
+        }
+        let Some(mut last) = self.last_prune.try_lock() else {
+            return;
+        };
+        if now.saturating_duration_since(*last) < PRUNE_INTERVAL {
+            return;
+        }
+        *last = now;
+        // No map/cell guard is held by this caller. Retain serializes eviction
+        // with charge/delay via the shard guard; a detached balance cannot be
+        // charged after removal. Never erase debt or partially spent credit.
+        self.balances.retain(|key, cell| {
+            if key == active {
+                return true;
+            }
+            let Some(mut balance) = cell.try_lock() else {
+                return true;
+            };
+            let rate = balance.rate;
+            balance.refresh(rate, now);
+            balance.credit < i128::from(rate.get()) * NANOS_PER_SECOND
+        });
     }
 
     /// Recheck shared debt after waiting. Another principal may have charged
@@ -85,6 +127,15 @@ impl<K: Clone + Eq + Hash> ExecutionRate<K> {
 }
 
 impl Balance {
+    fn charge(&mut self, rate: NonZeroU64, fuel: u64, now: Instant) -> Duration {
+        self.refresh(rate, now);
+        // Saturation fails closed: accumulated debt can never wrap into credit.
+        self.credit = self
+            .credit
+            .saturating_sub(i128::from(fuel) * NANOS_PER_SECOND);
+        self.recheck_delay()
+    }
+
     fn refresh(&mut self, rate: NonZeroU64, now: Instant) {
         // A stale timestamp must not move the accounting clock backwards and
         // let a later caller earn the same time twice.

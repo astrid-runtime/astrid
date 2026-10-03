@@ -22,10 +22,13 @@ trap cleanup EXIT
 "$cli" start > start.log 2>&1
 "$cli" agent create recovery-child > create.log 2>&1
 "$cli" agent list --mine --format json > before.json
+"$cli" quota users --format json > users.json
 user=$(python3 - <<'PY'
 import json
 rows = {row['principal']: row for row in json.load(open('before.json'))}
 user = rows['default']['accountable_user']
+users = json.load(open('users.json'))
+assert len(users) == 1 and users[0]['uid'] == user, users
 assert rows['recovery-child']['accountable_user'] == user, rows
 assert len(user) == 64 and all(c in '0123456789abcdef' for c in user), user
 print(user)
@@ -38,6 +41,10 @@ if "$cli" --principal recovery-child quota assign-user --agent recovery-child --
   echo 'Child assigned its own resource user' >&2; exit 1
 fi
 grep -q 'missing capability quota:set' self-denied.log
+if "$cli" --principal recovery-child quota users --format json > roster-denied.log 2>&1; then
+  echo 'Child discovered the global user roster' >&2; exit 1
+fi
+grep -q 'missing capability quota:set' roster-denied.log
 if "$cli" quota assign-user --agent recovery-child --user "$(printf '%064d' 0)" > transfer-denied.log 2>&1; then
   echo 'Recovery command replaced the existing payer' >&2; exit 1
 fi

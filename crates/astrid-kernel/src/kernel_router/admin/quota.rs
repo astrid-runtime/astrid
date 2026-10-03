@@ -18,6 +18,7 @@ pub(super) mod assign_user;
 mod set;
 #[cfg(test)]
 mod tests;
+pub(super) mod users;
 pub(super) use set::quota_set;
 
 use super::handlers::{

@@ -320,6 +320,7 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         } => AuthorityScope::Self_,
         AdminRequestKind::AgentCreate { .. }
         | AdminRequestKind::QuotaAssignUser { .. }
+        | AdminRequestKind::QuotaUserList
         | AdminRequestKind::UserPrincipalClaim { .. }
         | AdminRequestKind::AgentDelete { .. }
         | AdminRequestKind::AgentEnable { .. }
@@ -402,7 +403,9 @@ pub fn required_capability_for_admin_request(
         (AdminRequestKind::DistroSelfGrant, _) => "self:distro:grant",
         (AdminRequestKind::QuotaSet { .. }, AuthorityScope::Self_) => "self:quota:set",
         (AdminRequestKind::QuotaSet { .. }, AuthorityScope::Global)
-        | (AdminRequestKind::QuotaAssignUser { .. }, _) => "quota:set",
+        | (AdminRequestKind::QuotaAssignUser { .. } | AdminRequestKind::QuotaUserList, _) => {
+            "quota:set"
+        },
         (
             AdminRequestKind::EnvSet { .. }
             | AdminRequestKind::EnvSetIfAbsent { .. }
@@ -564,6 +567,7 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::UserPrincipalList => "admin.user.principals",
         AdminRequestKind::UserPrincipalClaim { .. } => "admin.user.principal.claim",
         AdminRequestKind::QuotaSet { .. } => "admin.quota.set",
+        AdminRequestKind::QuotaUserList => "admin.quota.user_list",
         AdminRequestKind::QuotaAssignUser { .. } => "admin.quota.assign_user",
         AdminRequestKind::QuotaGet { .. } => "admin.quota.get",
         AdminRequestKind::UsageGet { .. } => "admin.usage.get",
@@ -732,6 +736,7 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         // `CapsTokenRevoke` carries a token id, not a principal — the token's
         // owner is recovered from the store, not the request body.
         AdminRequestKind::CapsTokenRevoke { .. }
+        | AdminRequestKind::QuotaUserList
         | AdminRequestKind::AgentCreate { .. }
         | AdminRequestKind::AgentList
         | AdminRequestKind::UserPrincipalList

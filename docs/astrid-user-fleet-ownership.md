@@ -54,6 +54,7 @@ decision, not a fresh home:
 
 ```sh
 astrid agent list --format json
+astrid quota users --format json
 astrid quota assign-user --agent worker --user <user-uid>
 ```
 
@@ -63,6 +64,10 @@ lists only principals accessible to the authenticated user. An absent
 `accountable_user` means attribution is unresolved (or the server predates this
 field), not that the principal may spend another user's allowance. Select the
 intended existing user explicitly; do not infer it from fleet membership.
+`quota users` lists existing user UIDs and their public genesis records, including
+identity UUID and initial public key, so the operator can identify the intended
+user even when no principal has an `accountable_user` yet. This is an
+operator-only recovery roster, not a tenant-visible directory.
 
 This requires global `quota:set`, including when `worker` is the caller.
 A self-scoped device cannot borrow the principal's broader administrator grant.

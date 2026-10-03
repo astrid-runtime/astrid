@@ -117,3 +117,52 @@ fn fractional_repayment_is_not_rounded_away() {
         Duration::from_nanos(1)
     );
 }
+
+#[test]
+fn zero_work_does_not_allocate_an_identity() {
+    let ledger = ExecutionRate::<u64>::default();
+    for key in 0..2_000 {
+        assert_eq!(
+            ledger.charge(&key, rate(100), 0, Instant::now()),
+            Duration::ZERO
+        );
+    }
+    assert!(ledger.balances.is_empty());
+}
+
+#[test]
+fn churn_reclaims_repaid_identities_but_preserves_debt_and_partial_credit() {
+    let ledger = ExecutionRate::<u64>::default();
+    let now = Instant::now();
+    for key in 0..2_000 {
+        let _ = ledger.charge(&key, rate(100), 100, now);
+    }
+    let later = now + Duration::from_mins(2);
+    let _ = ledger.charge(&2_001, rate(1), 1_000, now);
+    // Partial credit is not disposable: eviction would mint another burst.
+    let _ = ledger.charge(&2_002, rate(100), 50, later - Duration::from_millis(1));
+    let _ = ledger.charge(&2_003, rate(100), 1, later);
+    assert!(ledger.balances.len() < 10);
+    assert_eq!(ledger.delay(&2_001, rate(1), later), Duration::from_secs(1));
+    assert_eq!(
+        ledger.charge(&2_002, rate(100), 100, later),
+        Duration::from_millis(499)
+    );
+}
+
+#[test]
+fn stale_sample_after_eviction_cannot_mint_refill() {
+    let ledger = ExecutionRate::<u64>::default();
+    let now = Instant::now();
+    for key in 0..2_000 {
+        let _ = ledger.charge(&key, rate(100), 100, now);
+    }
+    let later = now + Duration::from_mins(2);
+    let _ = ledger.charge(&2_001, rate(100), 1, later);
+    assert!(!ledger.balances.contains_key(&0));
+    assert_eq!(
+        ledger.charge(&0, rate(100), 200, now),
+        Duration::from_secs(1)
+    );
+    assert_eq!(ledger.delay(&0, rate(100), later), Duration::from_secs(1));
+}

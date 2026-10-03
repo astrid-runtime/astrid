@@ -11,6 +11,8 @@ use wasmtime::{AsContext, AsContextMut, Store, StoreContext, StoreContextMut};
 #[cfg(test)]
 mod run_loop_tests;
 #[cfg(test)]
+mod sampling_tests;
+#[cfg(test)]
 mod tests;
 
 impl AccountedStore<super::HostState> {
@@ -114,6 +116,10 @@ impl<T: Send + 'static> AccountedStore<T> {
             };
             self.store
                 .fuel_async_yield_interval(Some(meter.throttle.sampling_fuel()))?;
+            // Wasmtime's out_of_gas Result libcall passes through call-hook
+            // entry/exit, including during component initialization. Its
+            // ReturningFromHost event waits on debt before guest reentry;
+            // this is not dependent on guest imports or epoch callbacks.
             self.store.call_hook_async(meter.clone());
             Some(meter)
         } else {

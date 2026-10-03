@@ -53,6 +53,14 @@ fn resource_assignment_is_global_even_for_self_and_uses_matching_wire_topic() {
     }
     assert_eq!(admin_target_principal(&req), Some(&caller));
     assert_eq!(admin_request_method(&req), "admin.quota.assign_user");
+    let list = AdminRequestKind::QuotaUserList;
+    assert_eq!(resolve_admin_scope(&list, &caller), AuthorityScope::Global);
+    assert_eq!(
+        required_capability_for_admin_request(&list, AuthorityScope::Self_),
+        "quota:set"
+    );
+    assert_eq!(admin_target_principal(&list), None);
+    assert_eq!(admin_request_method(&list), "admin.quota.user_list");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -91,6 +99,48 @@ async fn unknown_user_cannot_leave_partial_attribution() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn production_assignment_audits_the_final_result_once() {
+    use astrid_audit::{AuditAction, AuditOutcome};
+    use astrid_events::{ipc::Topic, kernel_api::AdminKernelRequest};
+    for valid in [false, true] {
+        let (_temp, kernel, user) = fixture().await;
+        let caller = PrincipalId::default();
+        let requested = if valid {
+            user
+        } else {
+            UserUid::from_bytes([9; 32])
+        };
+        super::super::super::handle_admin_request(
+            &kernel,
+            Topic::from_raw("astrid.v1.admin.quota.assign_user"),
+            caller.clone(),
+            None,
+            AdminKernelRequest {
+                request_id: Some("assign-audit".into()),
+                kind: request(requested),
+            },
+        )
+        .await;
+        let rows: Vec<_> = kernel
+            .audit_log
+            .get_principal_entries(&kernel.session_id, Some(&caller))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| {
+                matches!(&entry.action,
+                AuditAction::AdminRequest { method, .. } if method == "admin.quota.assign_user")
+            })
+            .collect();
+        assert_eq!(rows.len(), 1, "one final outcome, no speculative success");
+        assert_eq!(
+            matches!(rows[0].outcome, AuditOutcome::Success { .. }),
+            valid
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn self_scoped_admin_device_cannot_assign_its_resource_user() {
     let (_temp, kernel, user) = fixture().await;
     let caller = PrincipalId::default();
@@ -115,4 +165,41 @@ async fn self_scoped_admin_device_cannot_assign_its_resource_user() {
     let result = handlers::dispatch_authorized(&kernel, &authorization, request(user)).await;
     assert!(matches!(result, AdminResponseBody::Error(_)), "{result:?}");
     assert_eq!(kernel.ownership_store.load().await.unwrap(), before);
+    let roster =
+        handlers::dispatch_authorized(&kernel, &authorization, AdminRequestKind::QuotaUserList)
+            .await;
+    assert!(matches!(roster, AdminResponseBody::Error(_)), "{roster:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn operator_discovers_users_when_no_principal_has_attribution() {
+    let (_temp, kernel, user) = fixture().await;
+    let graph = kernel.ownership_store.load().await.unwrap();
+    let mut genesis = graph.user(user).unwrap().genesis.clone();
+    genesis.identity_id = uuid::Uuid::new_v4();
+    let other = astrid_core::UserIdentity::from_genesis(genesis).unwrap();
+    kernel
+        .ownership_store
+        .create_user(other.clone())
+        .await
+        .unwrap();
+    let before = kernel.ownership_store.load().await.unwrap();
+    let response = test_support::dispatch_as_operator(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::QuotaUserList,
+    )
+    .await;
+    let AdminResponseBody::Success(value) = response else {
+        panic!("{response:?}");
+    };
+    let users: Vec<astrid_core::UserIdentity> = serde_json::from_value(value).unwrap();
+    assert_eq!(users.len(), 2);
+    assert!(users.iter().any(|record| record.uid == user));
+    assert!(users.contains(&other));
+    assert_eq!(
+        kernel.ownership_store.load().await.unwrap(),
+        before,
+        "discovery cannot guess an owner"
+    );
 }

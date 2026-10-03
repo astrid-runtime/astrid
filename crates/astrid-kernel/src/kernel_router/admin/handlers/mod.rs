@@ -148,6 +148,9 @@ async fn dispatch_inner(
             .await
         },
         AdminRequestKind::QuotaGet { principal } => super::quota::quota_get(kernel, &principal),
+        AdminRequestKind::QuotaUserList => {
+            super::quota::users::list(kernel, caller, authorization, device_key_id).await
+        },
         AdminRequestKind::QuotaAssignUser { principal, user } => {
             super::quota::assign_user::assign(
                 kernel,

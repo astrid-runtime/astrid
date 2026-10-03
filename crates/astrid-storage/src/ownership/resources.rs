@@ -52,9 +52,7 @@ impl OwnershipStore {
                 return Err(OwnershipError::PrincipalNotOwned(principal));
             }
             if graph.user(user).is_none() {
-                return Err(OwnershipError::CorruptGraph(format!(
-                    "accountable user {user} is absent"
-                )));
+                return Err(OwnershipError::UserNotFound(user));
             }
             if graph.accountable_user(principal) != expected {
                 return Err(OwnershipError::IdentityConflict(
