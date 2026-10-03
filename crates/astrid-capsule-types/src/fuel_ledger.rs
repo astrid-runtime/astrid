@@ -38,6 +38,9 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(test)]
+mod wait_tests;
 use std::time::Duration;
 // `web_time::Instant` IS `std::time::Instant` on native targets (pure
 // re-export, same type identity for callers); on wasm32-unknown-unknown it
@@ -201,22 +204,22 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 /// stale, so a flood of ephemeral sub-agent principals cannot grow it without
 /// limit.
 #[derive(Clone)]
-pub struct FuelRateLimiter {
+pub struct FuelRateLimiter<K = PrincipalId> {
     /// Per-principal rolling window. Each cell guarded by a non-poisoning
     /// `parking_lot::Mutex`; distinct principals live on distinct DashMap
     /// shards and never contend.
-    inner: Arc<DashMap<PrincipalId, Mutex<FuelWindow>>>,
+    inner: Arc<DashMap<K, Mutex<FuelWindow>>>,
     /// Fuel already promised to in-flight calls but not yet settled. This is
     /// separate from the rolling window so a long pool wait cannot roll away an
     /// outstanding reservation and reopen a concurrency hole.
-    reserved: Arc<DashMap<PrincipalId, AtomicU64>>,
+    reserved: Arc<DashMap<K, AtomicU64>>,
     /// Timestamp of the last prune pass, throttling prunes to once per
     /// [`PRUNE_INTERVAL`]. `try_lock`'d, never blocked on, so a prune in flight
     /// never stalls a `record`.
     last_prune: Arc<Mutex<Instant>>,
 }
 
-impl Default for FuelRateLimiter {
+impl<K: Eq + std::hash::Hash> Default for FuelRateLimiter<K> {
     fn default() -> Self {
         Self {
             inner: Arc::new(DashMap::new()),
@@ -235,14 +238,14 @@ impl Default for FuelRateLimiter {
 /// an invocation is cancelled or panics before settling, `Drop` charges the
 /// full reserved amount. This deliberately errs toward throttling rather than
 /// allowing concurrent calls to multiply a rate budget.
-pub struct FuelReservation {
-    limiter: FuelRateLimiter,
-    principal: PrincipalId,
+pub struct FuelReservation<K: Clone + Eq + std::hash::Hash = PrincipalId> {
+    limiter: FuelRateLimiter<K>,
+    principal: K,
     amount: u64,
     settled: bool,
 }
 
-impl FuelReservation {
+impl<K: Clone + Eq + std::hash::Hash> FuelReservation<K> {
     /// Replace the conservative reservation with exact post-call fuel usage.
     ///
     /// Safe to call more than once; only the first call affects the window.
@@ -256,14 +259,26 @@ impl FuelReservation {
     }
 }
 
-impl Drop for FuelReservation {
+impl<K: Clone + Eq + std::hash::Hash> Drop for FuelReservation<K> {
     fn drop(&mut self) {
         let now = Instant::now();
         self.settle(self.amount, now);
     }
 }
 
-impl FuelRateLimiter {
+impl<K: Clone + Eq + std::hash::Hash> FuelRateLimiter<K> {
+    /// Delay until the current accounting window can replenish. This is a
+    /// retry hint, not an admission: outstanding reservations survive rollover
+    /// and another execution may acquire the new allowance first.
+    #[must_use]
+    pub fn replenishment_delay(&self, principal: &K, now: Instant) -> Duration {
+        let Some(cell) = self.inner.get(principal) else {
+            return Duration::ZERO;
+        };
+        let window = cell.lock();
+        WINDOW.saturating_sub(now.saturating_duration_since(window.window_start))
+    }
+
     /// Roll `window` forward if it is `>= 1s` stale relative to `now`, resetting
     /// the in-window fuel. Pure helper over a held cell guard.
     fn roll(window: &mut FuelWindow, now: Instant) {
@@ -287,12 +302,7 @@ impl FuelRateLimiter {
     /// `fuel_in_window > max_fuel_per_sec`. The comparison is strict: spending
     /// *exactly* the budget is allowed, only *exceeding* it denies.
     #[must_use]
-    pub fn over_budget(
-        &self,
-        principal: &PrincipalId,
-        max_fuel_per_sec: u64,
-        now: Instant,
-    ) -> bool {
+    pub fn over_budget(&self, principal: &K, max_fuel_per_sec: u64, now: Instant) -> bool {
         // 0 = unlimited. Never deny-all on a zero budget.
         if max_fuel_per_sec == 0 {
             return false;
@@ -305,7 +315,10 @@ impl FuelRateLimiter {
         let mut window = cell.lock();
         Self::roll(&mut window, now);
         let reserved = self.reserved_amount(principal);
-        window.fuel_in_window.saturating_add(reserved) > max_fuel_per_sec
+        window
+            .fuel_in_window
+            .checked_add(reserved)
+            .is_none_or(|total| total > max_fuel_per_sec)
     }
 
     /// Atomically admit and reserve `amount` fuel for one in-flight call.
@@ -322,11 +335,11 @@ impl FuelRateLimiter {
     #[must_use]
     pub fn try_reserve(
         &self,
-        principal: &PrincipalId,
+        principal: &K,
         max_fuel_per_sec: u64,
         amount: u64,
         now: Instant,
-    ) -> Option<FuelReservation> {
+    ) -> Option<FuelReservation<K>> {
         if max_fuel_per_sec == 0 {
             return Some(FuelReservation {
                 limiter: self.clone(),
@@ -345,12 +358,11 @@ impl FuelRateLimiter {
         let mut window = cell.lock();
         Self::roll(&mut window, now);
         let reserved = self.reserved_amount(principal);
-        if window
+        let total = window
             .fuel_in_window
-            .saturating_add(reserved)
-            .saturating_add(amount)
-            > max_fuel_per_sec
-        {
+            .checked_add(reserved)
+            .and_then(|total| total.checked_add(amount));
+        if total.is_none_or(|total| total > max_fuel_per_sec) {
             return None;
         }
 
@@ -374,7 +386,7 @@ impl FuelRateLimiter {
     /// window on first non-zero charge, rolls it, then `saturating_add`s the
     /// fuel (a runaway pins at `u64::MAX`, never wraps under budget). Finally
     /// runs the lazy prune so the map stays bounded.
-    pub fn record(&self, principal: &PrincipalId, fuel: u64, now: Instant) {
+    pub fn record(&self, principal: &K, fuel: u64, now: Instant) {
         if fuel == 0 {
             return;
         }
@@ -404,19 +416,13 @@ impl FuelRateLimiter {
         self.maybe_prune(now);
     }
 
-    fn reserved_amount(&self, principal: &PrincipalId) -> u64 {
+    fn reserved_amount(&self, principal: &K) -> u64 {
         self.reserved
             .get(principal)
             .map_or(0, |value| value.load(Ordering::Relaxed))
     }
 
-    fn settle_reserved(
-        &self,
-        principal: &PrincipalId,
-        amount: u64,
-        actual_fuel: u64,
-        now: Instant,
-    ) {
+    fn settle_reserved(&self, principal: &K, amount: u64, actual_fuel: u64, now: Instant) {
         {
             let cell = self.inner.entry(principal.clone()).or_insert_with(|| {
                 Mutex::new(FuelWindow {
