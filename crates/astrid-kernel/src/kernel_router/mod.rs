@@ -694,6 +694,7 @@ struct AuthorizedRequest {
     profile: Arc<PrincipalProfile>,
     groups: Arc<GroupConfig>,
     device_scope: Option<DeviceScope>,
+    device_key_id: Option<astrid_core::profile::DeviceKeyId>,
     authenticated_public_key: Option<[u8; 32]>,
 }
 
@@ -760,6 +761,13 @@ fn authorize_request(
 
     let device = resolve_device(profile.as_ref(), caller, device_key_id, required_cap)?;
     let device_scope = device.map(|device| device.scope.clone());
+    let authenticated_device_id = device
+        .map(|device| astrid_core::profile::DeviceKeyId::new(device.key_id.clone()))
+        .transpose()
+        .map_err(|_| PermissionError::DeviceScopeDenied {
+            principal: caller.clone(),
+            required: required_cap.to_owned(),
+        })?;
     let authenticated_public_key = device
         .map(|device| {
             astrid_crypto::PublicKey::from_hex(&device.pubkey)
@@ -781,6 +789,7 @@ fn authorize_request(
         profile,
         groups,
         device_scope,
+        device_key_id: authenticated_device_id,
         authenticated_public_key,
     })
 }
