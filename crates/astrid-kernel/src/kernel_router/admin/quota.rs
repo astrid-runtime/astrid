@@ -8,75 +8,21 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
 use crate::kernel_router::{AuthorizedRequest, authorize_request};
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::{PrincipalProfile, Quotas};
 use astrid_events::kernel_api::{AdminResponseBody, ResourceUsage};
 
 pub(super) mod assign_user;
-
+mod set;
 #[cfg(test)]
 mod tests;
+pub(super) use set::quota_set;
 
 use super::handlers::{
-    err_bad_input, err_profile, principal_profile_path, require_principal_exists, success_json,
+    err_bad_input, err_profile, principal_profile_path, require_principal_exists,
 };
-
-pub(super) async fn quota_set(
-    kernel: &Arc<crate::Kernel>,
-    caller: &PrincipalId,
-    authorization: Option<&AuthorizedRequest>,
-    device_key_id: Option<&str>,
-    principal: PrincipalId,
-    quotas: Quotas,
-) -> AdminResponseBody {
-    // Validate before taking the write lock — quick reject on bad input.
-    if let Err(e) = quotas.validate() {
-        return err_bad_input(format!("quotas rejected: {e}"));
-    }
-
-    let _guard = kernel.admin_write_lock.lock().await;
-    let required = if caller == &principal {
-        "self:quota:set"
-    } else {
-        "quota:set"
-    };
-    let resolved;
-    let authorization = if let Some(authorization) = authorization {
-        authorization
-    } else {
-        resolved = match authorize_request(kernel, caller, device_key_id, required) {
-            Ok(authorization) => authorization,
-            Err(error) => return err_bad_input(error.to_string()),
-        };
-        &resolved
-    };
-    let check = authorization.capability_check();
-    if let Err(error) = check.require(required) {
-        return err_bad_input(error.to_string());
-    }
-    let path = principal_profile_path(kernel, &principal);
-    if let Err(msg) = require_principal_exists(&principal, &path) {
-        return err_bad_input(msg);
-    }
-    let mut profile = match PrincipalProfile::load_from_path(&path) {
-        Ok(p) => p,
-        Err(e) => return err_profile(&principal, &e),
-    };
-    // Self authority can attenuate an allocation, not mint resources. Compare
-    // against the current durable allocation under the write lock, not the
-    // authorization snapshot: another request may already have lowered it.
-    // Global authority remains subject to the authenticating device's scope.
-    if !check.has("quota:set") && !is_attenuation(&quotas, &profile.quotas) {
-        return err_bad_input("increasing resource quotas requires quota:set".to_owned());
-    }
-    profile.quotas = quotas;
-    if let Err(e) = profile.save_to_path(&path) {
-        return err_profile(&principal, &e);
-    }
-    kernel.profile_cache.invalidate(&principal);
-    success_json(serde_json::json!({ "principal": principal.as_str() }))
-}
 
 fn is_attenuation(requested: &Quotas, current: &Quotas) -> bool {
     // Exhaustive destructuring makes a new quota dimension a compile-time

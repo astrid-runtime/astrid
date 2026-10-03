@@ -29,8 +29,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use astrid_core::capability_grammar::validate_capability;
-use astrid_core::principal::PrincipalId;
 use astrid_core::profile::{CapabilityPattern, CapsuleGrant, GroupName, PrincipalProfile};
+use astrid_core::{DeviceKeyId, principal::PrincipalId};
 use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody, AgentSummary};
 use tracing::{info, warn};
 
@@ -81,7 +81,10 @@ pub(super) async fn dispatch_authorized(
         kernel,
         &authorization.principal,
         Some(authorization),
-        None,
+        authorization
+            .device_key_id
+            .as_ref()
+            .map(DeviceKeyId::as_str),
         req,
     )
     .await

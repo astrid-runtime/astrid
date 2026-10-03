@@ -126,7 +126,11 @@ pub(super) async fn authorize_admin_request(
     }
     // Anchoring polls read the audit log itself. Denials above stay audited,
     // and the caller records the request if its handler fails.
-    if audit_handlers::omit_success_admin_audit(kind) {
+    // Quota changes also require a locked comparison with the current allocation.
+    // Their handler records the final result after that check and persistence.
+    if audit_handlers::omit_success_admin_audit(kind)
+        || matches!(kind, AdminRequestKind::QuotaSet { .. })
+    {
         return Ok(authorization);
     }
 
