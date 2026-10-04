@@ -4227,8 +4227,11 @@ pub async fn run_lifecycle(
 /// This additive principal-aware entry point preserves [`run_lifecycle`] as
 /// the default-principal compatibility wrapper while allowing install callers
 /// to keep lifecycle IPC and host identity in the same principal scope as the
-/// target installation. The lifecycle store meter remains finite but uses a
-/// throwaway ledger, not the kernel's persistent per-principal accounting.
+/// target installation. Kernel-managed callers supply the shared execution
+/// throttle through `context`, charging lifecycle fuel to the same principal
+/// and accountable-user budgets as active capsules. Standalone callers without
+/// that throttle do not participate in shared accounting. Both paths retain
+/// the lifecycle execution deadline.
 ///
 /// # Errors
 ///
