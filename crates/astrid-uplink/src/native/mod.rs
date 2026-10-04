@@ -7,6 +7,8 @@ mod egress;
 mod framing;
 mod handshake;
 pub mod private_elicit;
+#[cfg(all(test, unix))]
+mod rejection_tests;
 mod routing;
 #[cfg(all(test, unix))]
 mod tests;
@@ -478,6 +480,11 @@ async fn route_connection_message(
         let result = private_elicit::respond(identity, private_elicits, message);
         return write_message(writer, &result).await;
     }
+    let chat_session = (message.topic.as_str() == routing::CHAT_REQUEST_TOPIC).then(|| {
+        routing::payload_session_id(&message.payload)
+            .unwrap_or("default")
+            .to_owned()
+    });
     if let Err(reason) = process_inbound(
         event_bus,
         identity,
@@ -486,6 +493,40 @@ async fn route_connection_message(
         message,
     ) {
         tracing::warn!(security_event = true, principal = %identity.principal, %reason, "dropped local uplink message");
+        // Write only to the requesting socket. Publishing a final response on
+        // the bus would release the admitted turn's ownership, possibly on a
+        // different connection with this same principal and session.
+        let is_chat = chat_session.is_some();
+        let (topic, payload) = if let Some(session_id) = chat_session {
+            (
+                Topic::from_raw("agent.v1.response"),
+                IpcPayload::AgentResponse {
+                    text: format!("Request refused: {reason}"),
+                    is_final: true,
+                    session_id,
+                },
+            )
+        } else {
+            // Other request families have different response contracts. A
+            // reason followed by EOF is preferable to inventing a response
+            // shape their client might ignore and leave pending forever.
+            (
+                Topic::client_disconnect(),
+                IpcPayload::Disconnect {
+                    reason: Some(reason.to_owned()),
+                },
+            )
+        };
+        let response = IpcMessage::new(topic, payload, uuid::Uuid::nil())
+            .with_principal(identity.principal.as_str())
+            .with_request_owner(identity.request_owner);
+        write_message(writer, &response).await?;
+        if !is_chat {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                reason,
+            ));
+        }
     }
     Ok(())
 }
