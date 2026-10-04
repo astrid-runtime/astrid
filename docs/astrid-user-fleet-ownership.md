@@ -39,6 +39,79 @@ Fleet membership has three roles:
 
 Every fleet must retain at least one owner.
 
+## Resource accountability
+
+Fleet access and resource accountability are separate. Each newly assigned
+principal records an accountable `UserUid`; background children inherit that
+user from their creator without needing a human login. Fleet transfers and
+membership changes do not change who pays for execution. The historical
+`assigned_by` field records provenance, not a live billing decision.
+
+Older ownership graphs remain readable. Boot fills missing resource attribution
+only for the unambiguous, currently bound local operator described below. A
+shared installation with unresolved attribution needs an explicit operator
+decision, not a fresh home:
+
+```sh
+astrid agent list --format json
+astrid quota users --format json
+astrid quota assign-user --agent worker --user <user-uid>
+```
+
+Authorized listings expose `accountable_user` as the immutable user UID;
+`owner_uid` is the principal UID and must not be used in its place. `--mine`
+lists only principals accessible to the authenticated user. An absent
+`accountable_user` means attribution is unresolved (or the server predates this
+field), not that the principal may spend another user's allowance. Select the
+intended existing user explicitly; do not infer it from fleet membership.
+`quota users` lists existing user UIDs and their public genesis records, including
+identity UUID and initial public key, so the operator can identify the intended
+user even when no principal has an `accountable_user` yet. This is an
+operator-only recovery roster, not a tenant-visible directory.
+
+This requires global `quota:set`, including when `worker` is the caller.
+A self-scoped device cannot borrow the principal's broader administrator grant.
+The command only resolves missing attribution: repeating the same assignment
+is safe, but replacing an existing accountable user is refused. It preserves
+fleet membership, principal identity, keys, profiles, and capsule state.
+
+Aggregate execution accounting measures Wasmtime guest fuel, not host CPU time,
+I/O, or subprocess use. Personal installations have no new aggregate limit by
+default; existing principal limits remain in effect.
+
+An operator can configure the runtime's `config.toml` while its projection is
+running, then stop and restart to apply the boot-bound policy:
+
+```toml
+[resources]
+default_user_cpu_fuel_per_sec = 100000000
+
+# Optional overrides use immutable UserUid values, not principal aliases.
+# [resources.user_cpu_fuel_per_sec]
+# "<user-uid>" = 200000000
+```
+
+The numbers above are examples, not recommended defaults or CPU percentages.
+Zero is invalid. Workspace configuration cannot add or replace these operator
+allocations. A configured installation refuses execution requiring attribution
+when the principal has no accountable user; use the explicit recovery command
+above instead of inferring a payer from fleet access.
+
+All charged principals share their user's rate ledger. It allows one second of
+initial credit and throttles cooperatively at Wasmtime scheduling boundaries.
+A guest operation may exceed the available credit before yielding; that excess
+remains debt and delays subsequent execution. Cancellation, a new invocation,
+or a new principal does not refund that debt. This is **not** a strict ceiling
+on instructions in every one-second interval. The ledger is runtime-local,
+not persistent billing across daemon restarts or multiple hosts.
+
+User accounting covers capsule initialization, background execution,
+authenticated invocations, and daemon-managed install/upgrade lifecycle hooks.
+Principal-level administrator exemptions do not waive a configured user rate.
+Kernel system-resident startup is distinct from user execution; authenticated
+calls are rebound to their caller. Native host work and subprocess CPU require
+separate OS-level accounting and are not covered by this fuel policy.
+
 ## Persistence and recovery
 
 The ownership graph lives under the reserved `system:ownership` namespace. A

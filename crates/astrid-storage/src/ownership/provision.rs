@@ -82,6 +82,7 @@ impl OwnershipStore {
                 fleet: existing.fleet_uid,
             }),
             None => {
+                graph.accountable_users.insert(created, actor);
                 graph.principal_ownership.insert(
                     created,
                     PrincipalOwnership {

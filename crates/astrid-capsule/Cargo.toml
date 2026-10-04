@@ -52,6 +52,7 @@ url = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+web-time = "1.1.0"
 uuid = { workspace = true }
 zeroize = { workspace = true }
 
@@ -108,7 +109,7 @@ astrid-uplink = { workspace = true, features = ["test-support"] }
 # Test-only: build a synthetic `reqwest::Response` (via `reqwest::Response::from`)
 # for hermetic stream-quota tests, with no network.
 http = "1"
-wasm-encoder = { workspace = true }
+wasm-encoder = { workspace = true, features = ["wasmparser"] }
 wat = { workspace = true }
 
 [lints.rust]

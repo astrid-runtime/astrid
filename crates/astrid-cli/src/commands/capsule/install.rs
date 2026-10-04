@@ -807,6 +807,7 @@ fn install_from_local_path_for_principal(
         provenance_source_digest: None,
         expected_package_generation: None,
         audit_sink: None,
+        lifecycle_cpu: None,
     };
     let output = run_with_elicit(opts, prompt, |opts, bus| {
         let opts = InstallOptions {
@@ -922,6 +923,7 @@ fn unpack_via_lib(
         provenance_source_digest: None,
         expected_package_generation: None,
         audit_sink: None,
+        lifecycle_cpu: None,
     };
     let output = run_with_elicit(opts, prompt, |opts, bus| {
         let opts = InstallOptions {

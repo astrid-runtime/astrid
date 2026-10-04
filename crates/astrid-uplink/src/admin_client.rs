@@ -51,6 +51,8 @@ pub const fn topic_suffix(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::UserPrincipalList => "user.principals",
         AdminRequestKind::UserPrincipalClaim { .. } => "user.principal.claim",
         AdminRequestKind::QuotaSet { .. } => "quota.set",
+        AdminRequestKind::QuotaAssignUser { .. } => "quota.assign_user",
+        AdminRequestKind::QuotaUserList => "quota.user_list",
         AdminRequestKind::QuotaGet { .. } => "quota.get",
         AdminRequestKind::UsageGet { .. } => "usage.get",
         AdminRequestKind::EnvSet { .. } => "env.set",
@@ -327,6 +329,10 @@ mod tests {
             "user.principal.claim"
         );
         assert_eq!(topic_suffix(&AdminRequestKind::GroupList), "group.list");
+        assert_eq!(
+            topic_suffix(&AdminRequestKind::QuotaUserList),
+            "quota.user_list"
+        );
         let p = PrincipalId::default();
         assert_eq!(
             topic_suffix(&AdminRequestKind::QuotaGet { principal: p }),

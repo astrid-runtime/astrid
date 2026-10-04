@@ -282,6 +282,10 @@ pub struct AgentSummary {
     /// This is optional for compatibility with pre-UID profile fixtures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_uid: Option<crate::identity::PrincipalUid>,
+    /// User charged for execution, independent of fleet access or delegation.
+    /// Absent for old servers or principals requiring explicit attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accountable_user: Option<crate::UserUid>,
     /// Whether the principal is currently enabled (master switch).
     pub enabled: bool,
     /// Group memberships as written to `profile.toml`.

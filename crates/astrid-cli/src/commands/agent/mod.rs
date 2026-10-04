@@ -956,6 +956,7 @@ mod tests {
         let summary = AgentSummary {
             principal: PrincipalId::new("alice").unwrap(),
             owner_uid: None,
+            accountable_user: None,
             enabled: true,
             groups: vec!["agent".into()],
             grants: vec![],

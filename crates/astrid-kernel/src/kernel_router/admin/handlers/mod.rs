@@ -117,16 +117,8 @@ async fn dispatch_inner(
                 .await
         },
         AdminRequestKind::AgentDelete { principal } => {
-            let authority = match super::agent_delete::DeletionAuthority::resolve(
-                kernel,
-                caller,
-                authorization,
-                device_key_id,
-            ) {
-                Ok(authority) => authority,
-                Err(response) => return response,
-            };
-            super::agent_delete::agent_delete(kernel, principal, authority.as_ref()).await
+            super::agent_delete::dispatch(kernel, caller, authorization, device_key_id, principal)
+                .await
         },
         AdminRequestKind::AgentEnable { principal } => {
             agent_set_enabled(kernel, principal, true).await
@@ -134,7 +126,9 @@ async fn dispatch_inner(
         AdminRequestKind::AgentDisable { principal } => {
             agent_set_enabled(kernel, principal, false).await
         },
-        AdminRequestKind::AgentList => agent_list(kernel, caller, authorization, device_key_id),
+        AdminRequestKind::AgentList => {
+            agent_list(kernel, caller, authorization, device_key_id).await
+        },
         AdminRequestKind::UserPrincipalList => {
             user_principals::list(kernel, caller, authorization, device_key_id).await
         },
@@ -154,6 +148,20 @@ async fn dispatch_inner(
             .await
         },
         AdminRequestKind::QuotaGet { principal } => super::quota::quota_get(kernel, &principal),
+        AdminRequestKind::QuotaUserList => {
+            super::quota::users::list(kernel, caller, authorization, device_key_id).await
+        },
+        AdminRequestKind::QuotaAssignUser { principal, user } => {
+            super::quota::assign_user::assign(
+                kernel,
+                caller,
+                authorization,
+                device_key_id,
+                principal,
+                user,
+            )
+            .await
+        },
         AdminRequestKind::UsageGet { principal } => super::quota::usage_get(kernel, &principal),
         req @ (AdminRequestKind::EnvSet { .. }
         | AdminRequestKind::EnvSetIfAbsent { .. }
@@ -773,7 +781,7 @@ fn caller_has_global_agent_list(
     check.has("agent:list")
 }
 
-fn agent_list(
+async fn agent_list(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
     authorization: Option<&AuthorizedRequest>,
@@ -820,6 +828,7 @@ fn agent_list(
         };
         summaries.push(AgentSummary {
             owner_uid: kernel.principal_directory.uid_for(&principal).ok(),
+            accountable_user: None,
             principal,
             enabled: profile.enabled,
             groups: profile.groups.clone(),
@@ -847,7 +856,7 @@ fn agent_list(
         summaries.retain(|s| s.principal == *caller);
     }
 
-    AdminResponseBody::AgentList(summaries)
+    user_principals::with_accountability(kernel, AdminResponseBody::AgentList(summaries)).await
 }
 
 // ── Per-principal grants / revokes ─────────────────────────────────────

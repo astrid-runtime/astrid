@@ -17,6 +17,14 @@ pub fn enforce_restrictions(
     baseline: &toml::Value,
     workspace_layer: &toml::Value,
 ) {
+    // Workspaces cannot create or move the operator's resource allocations.
+    block_workspace_override(
+        merged,
+        baseline,
+        workspace_layer,
+        &["resources"],
+        "resources",
+    );
     // A project cannot select the device entrusted with human secret input.
     block_workspace_override(
         merged,

@@ -71,6 +71,8 @@ mod kernel_shutdown_tests;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod legacy_migration_barrier;
 mod native_input;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod user_resources;
 pub use native_input::native_input_device_is_live;
 /// Deterministic CLI-root user/fleet bootstrap and unowned-principal upgrade.
 mod ownership_bootstrap;
@@ -413,6 +415,8 @@ pub struct Kernel {
     identity_store: Arc<dyn astrid_storage::IdentityStore>,
     /// Durable human, fleet, and exclusive principal ownership graph.
     ownership_store: Arc<astrid_storage::OwnershipStore>,
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    user_cpu: Arc<astrid_capsule::user_cpu::UserCpuAccounting>,
     /// Live native filesystem leases, each fixed to one authenticated caller
     /// and one typed storage owner.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -1386,6 +1390,14 @@ impl Kernel {
         ))]
         let host_audit_marker: Option<astrid_storage::ScopedKvStore> = None;
 
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let user_cpu = user_resources::load(
+            Arc::clone(&ownership_store),
+            principal_directory.clone(),
+            &home,
+            &workspace_root,
+            &workspace_layout,
+        )?;
         let kernel = Arc::new(Self {
             session_id: session_id.clone(),
             event_bus,
@@ -1454,6 +1466,8 @@ impl Kernel {
             allowance_store,
             identity_store,
             ownership_store,
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            user_cpu,
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             storage_mounts: Arc::new(DashMap::new()),
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -2086,6 +2100,7 @@ impl Kernel {
         // kernel's durable, hash-chained audit log — not just the
         // off-by-default observability tracing targets.
         .with_audit_sink(self.audit_sink.as_ref().clone());
+        ctx.user_cpu = Some(Arc::clone(&self.user_cpu));
         #[cfg(not(target_family = "wasm"))]
         {
             ctx.secret_elicits = self.native_secret_inputs.get().cloned();
@@ -3883,7 +3898,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         workspace_branches: Some(Arc::new(
             astrid_capsule::context::WorkspaceBranchService::new_with_ownership(
                 principal_store,
-                principal_directory,
+                principal_directory.clone(),
                 Some(Arc::clone(&ownership_store)),
             ),
         )),
@@ -3920,6 +3935,13 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         token_path: home.token_path(),
         allowance_store,
         identity_store,
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        user_cpu: Arc::new(astrid_capsule::user_cpu::UserCpuAccounting::new(
+            Arc::clone(&ownership_store),
+            principal_directory.clone(),
+            None,
+            std::collections::BTreeMap::default(),
+        )),
         ownership_store,
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         storage_mounts: Arc::new(DashMap::new()),

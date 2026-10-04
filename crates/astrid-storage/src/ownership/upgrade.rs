@@ -155,6 +155,7 @@ impl OwnershipStore {
             ));
         }
         for principal_uid in &candidates {
+            graph.accountable_users.insert(*principal_uid, actor);
             graph.principal_ownership.insert(
                 *principal_uid,
                 PrincipalOwnership {
@@ -172,7 +173,7 @@ impl OwnershipStore {
     }
 }
 
-fn bound_local_operator(
+pub(super) fn bound_local_operator(
     graph: &OwnershipSnapshot,
     principal: PrincipalUid,
     public_key: &[u8; 32],

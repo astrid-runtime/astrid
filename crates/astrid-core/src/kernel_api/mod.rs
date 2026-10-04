@@ -14,6 +14,9 @@ mod audit_export;
 mod capsule_metadata;
 mod impls;
 mod install;
+mod pairing;
+pub use pairing::PairScopeArg;
+use pairing::default_pair_scope;
 mod projection_names;
 mod readiness;
 mod response_types;
@@ -437,62 +440,6 @@ pub struct AdminKernelRequest {
     pub kind: AdminRequestKind,
 }
 
-/// Requested capability scope for a [`AdminRequestKind::PairDeviceIssue`]
-/// token — what the redeemed device is allowed to do with the principal's
-/// authority.
-///
-/// The kernel resolves this against the ISSUER's *effective* capability set at
-/// issue time (no-escalation: a device can never confer more than the issuer
-/// holds, where the issuer's effective set is itself narrowed by the issuer's
-/// own authenticating device scope) and stamps the resolved
-/// [`DeviceScope`](crate::DeviceScope) onto the minted token, so the redeemed
-/// device is attenuated to exactly the granted scope on every transport.
-///
-/// On the wire it is an internally-tagged object: `{ "kind": "full" }`,
-/// `{ "kind": "preset", "name": "use-only" }`, or
-/// `{ "kind": "explicit", "allow": [...], "deny": [...] }`. The `scope` field
-/// on `PairDeviceIssue` defaults to [`PairScopeArg::Full`] when omitted, so
-/// pre-scope callers (and single-tenant admin flows) keep their existing
-/// behaviour — but minting a `Full` device additionally requires the issuer to
-/// hold `self:auth:pair:admin`, enforced by the authorization preamble and
-/// rechecked with the issuer's pinned policy snapshot before persistence.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum PairScopeArg {
-    /// Mint an unattenuated device — it acts with the principal's full
-    /// effective capability set. Requires the issuer to hold
-    /// `self:auth:pair:admin`. The default when `scope` is omitted (the
-    /// permissive default is still gated on the admin cap, so it does not
-    /// relax authority).
-    #[default]
-    Full,
-    /// Resolve a named scope preset (e.g. `"use-only"`) via
-    /// [`DeviceScope::preset`](crate::DeviceScope::preset). An unknown name is
-    /// rejected at issue time.
-    Preset {
-        /// The preset name.
-        name: String,
-    },
-    /// An explicit allow/deny capability scope. Every `allow` pattern must be
-    /// held by the issuer (subset check); `deny` patterns purely restrict.
-    Explicit {
-        /// Capability patterns the device may exercise.
-        #[serde(default)]
-        allow: Vec<String>,
-        /// Capability patterns the device is forbidden to exercise (deny wins).
-        #[serde(default)]
-        deny: Vec<String>,
-    },
-}
-
-/// Serde default for [`AdminRequestKind::PairDeviceIssue::scope`] — `Full`,
-/// for back-compat with callers that predate the `scope` field. A `Full` mint
-/// is independently gated on `self:auth:pair:admin`, so the permissive
-/// *default* does not relax the *authority* required to use it.
-fn default_pair_scope() -> PairScopeArg {
-    PairScopeArg::Full
-}
-
 /// Typed admin request body — flattened into [`AdminKernelRequest`] on
 /// the wire as `{ "method": "...", "params": {...} }`.
 ///
@@ -620,8 +567,18 @@ pub enum AdminRequestKind {
         #[serde(default)]
         remove_capsules: Vec<String>,
     },
-    /// Replace the target principal's [`Quotas`] block. Values are
-    /// validated before the atomic profile write.
+    /// List existing user identities for explicit operator resource attribution.
+    /// Requires global quota administration, never ordinary principal discovery.
+    QuotaUserList,
+    /// Resolve missing legacy resource attribution using operator authority.
+    /// Idempotent for the same user; never transfers an existing allocation.
+    QuotaAssignUser {
+        /// Existing principal with unresolved legacy resource accountability.
+        principal: PrincipalId,
+        /// Explicit accountable user. Fleet access alone cannot authorize this.
+        user: crate::UserUid,
+    },
+    /// Replace principal limits after capability and ceiling validation.
     QuotaSet {
         /// Principal whose quotas are being set.
         principal: PrincipalId,

@@ -24,12 +24,19 @@ use crate::admin_client::{AdminClient, into_result};
 use crate::context;
 use crate::value_formatter::{ValueFormat, emit_structured};
 
+mod assign_user;
+mod users;
+
 #[derive(Subcommand, Debug, Clone)]
 pub(crate) enum QuotaCommand {
     /// Show resource quotas (defaults to active context).
     Show(ShowArgs),
     /// Update one or more resource quotas.
     Set(SetArgs),
+    /// Resolve a legacy principal's resource user (operator only; no transfer).
+    AssignUser(assign_user::AssignUserArgs),
+    /// List user identities for resource attribution (operator only).
+    Users(users::UsersArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -81,6 +88,8 @@ pub(crate) async fn run(cmd: QuotaCommand) -> Result<ExitCode> {
     match cmd {
         QuotaCommand::Show(args) => run_show(args).await,
         QuotaCommand::Set(args) => run_set(args).await,
+        QuotaCommand::AssignUser(args) => assign_user::run(args).await,
+        QuotaCommand::Users(args) => users::run(args).await,
     }
 }
 

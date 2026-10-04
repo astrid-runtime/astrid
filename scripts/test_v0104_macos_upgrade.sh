@@ -175,7 +175,9 @@ run_old_capsule_build_bounded() {
     || fail "capsule build toolchain was not initialized"
   (
     cd -- "${WORKSPACE}"
-    run_with_timeout "${limit}" env ASTRID_HOME="${ASTRID_HOME}" HOME="${POISON_HOME}" \
+    # Isolate runtime state, not Cargo's shared host cache and configuration.
+    # Runtime-only calls below still use POISON_HOME to test home resolution.
+    run_with_timeout "${limit}" env ASTRID_HOME="${ASTRID_HOME}" \
       RUSTUP_HOME="${CAPSULE_RUSTUP_HOME}" "${OLD_BIN_DIR}/astrid" "$@"
   )
 }

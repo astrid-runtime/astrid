@@ -56,6 +56,7 @@ pub mod loader;
 pub mod merge;
 /// Operator-selected native secret responders.
 pub mod native_input;
+pub mod resources;
 /// Resolved configuration display and serialization.
 pub mod show;
 /// Configuration struct definitions.

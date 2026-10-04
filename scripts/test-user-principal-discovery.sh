@@ -85,6 +85,23 @@ hash_keys() {
     done > "$out"
 }
 
+assert_upgraded_identity() {
+    python3 - released-use-show.json upgraded-use-show.json before.json <<'PY'
+import json
+import sys
+
+old, upgraded, directory = [json.load(open(path)) for path in sys.argv[1:]]
+operator = next(row for row in directory if row["principal"] == "default")
+payer = upgraded.pop("accountable_user")
+assert isinstance(payer, str) and len(payer) == 64, payer
+int(payer, 16)
+assert payer == operator["accountable_user"], (payer, operator)
+# The additive payer field must not hide any change to the old identity,
+# permissions, enabled state, or other previously exposed fields.
+assert upgraded == old, (old, upgraded)
+PY
+}
+
 if [[ -n "$released" ]]; then
     stop_cli=$released
     "$released" --version > released-version.txt
@@ -102,9 +119,10 @@ if [[ -n "$released" ]]; then
     hash_keys principal-keys.after.sha256 default discovery-child discovery-peer
     cmp principal-keys.before.sha256 principal-keys.after.sha256
     use_child upgraded-use "$cli"
-    cmp released-use-show.json upgraded-use-show.json
     cmp released-use-quota.json upgraded-use-quota.json
+    cmp released-use-capsules.txt upgraded-use-capsules.txt
     "$cli" agent list --mine --format json > before.json
+    assert_upgraded_identity
     # Bound local-operator upgrade assigns packed leftovers at candidate start.
     # Named claim remains for deferred hosted/shared leftovers, not this path.
     assert_mine before.json default discovery-child discovery-peer
@@ -115,8 +133,9 @@ if [[ -n "$released" ]]; then
     "$cli" agent list --mine --format json > after.json
     cmp before.json after.json
     use_child upgraded-restart-use "$cli"
-    cmp released-use-show.json upgraded-restart-use-show.json
+    cmp upgraded-use-show.json upgraded-restart-use-show.json
     cmp released-use-quota.json upgraded-restart-use-quota.json
+    cmp released-use-capsules.txt upgraded-restart-use-capsules.txt
     echo 'PASS: packed released-to-candidate upgrade preserved keys/use and assigned leftover principals to the local operator without named claim'
 else
     "$cli" start > start.log 2>&1

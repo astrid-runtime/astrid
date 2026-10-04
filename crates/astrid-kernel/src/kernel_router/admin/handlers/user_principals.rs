@@ -11,6 +11,25 @@ use crate::{Kernel, kernel_router::AuthorizedRequest};
 #[cfg(test)]
 mod tests;
 
+/// Enrich only the rows already admitted by principal-list authorization.
+/// A storage failure must not masquerade as missing attribution.
+pub(super) async fn with_accountability(
+    kernel: &Arc<Kernel>,
+    response: AdminResponseBody,
+) -> AdminResponseBody {
+    let AdminResponseBody::AgentList(mut rows) = response else {
+        return response;
+    };
+    let graph = match kernel.ownership_store.load().await {
+        Ok(graph) => graph,
+        Err(error) => return err_internal(error.to_string()),
+    };
+    for row in &mut rows {
+        row.accountable_user = row.owner_uid.and_then(|uid| graph.accountable_user(uid));
+    }
+    AdminResponseBody::AgentList(rows)
+}
+
 pub(super) async fn list(
     kernel: &Arc<Kernel>,
     caller: &PrincipalId,
@@ -64,6 +83,7 @@ pub(super) async fn list(
         };
         summaries.push(AgentSummary {
             owner_uid: Some(uid),
+            accountable_user: graph.accountable_user(uid),
             principal,
             enabled: profile.enabled,
             groups: profile.groups.clone(),

@@ -153,7 +153,16 @@ PY
   run_cli keypair delete e2e-cli-redeem-key --yes
 
   run_cli quota show --agent "$user_principal" --format json > "$ARTIFACTS/cli-quota-show-user.json"
+  run_cli quota users --format json > "$ARTIFACTS/cli-quota-users.json"
   json_assert_cli_quota "$ARTIFACTS/cli-quota-show-user.json" "$user_principal" 4
+  # A syntactically valid but unrelated user cannot replace the payer, even
+  # when the principal being changed is the authenticated caller itself.
+  local unrelated_user
+  unrelated_user="$(printf '%064d' 0)"
+  assert_principal_cli_failure "$user_principal" "cli-quota-assign-self-denied" \
+    quota assign-user --agent "$user_principal" --user "$unrelated_user"
+  grep -q 'missing capability' "$ARTIFACTS/cli-quota-assign-self-denied.err" \
+    || fail "resource attribution failed for an unexpected reason"
   run_cli secret list --agent "$user_principal" --format json > "$ARTIFACTS/cli-secret-list-user.json"
   json_assert_secret_list_metadata "$ARTIFACTS/cli-secret-list-user.json" astrid-capsule-openai-compat api_key
   run_cli secret set e2e_cli_delete_marker e2e-value --agent "$user_principal" \

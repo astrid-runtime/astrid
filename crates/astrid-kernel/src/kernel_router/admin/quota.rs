@@ -14,9 +14,11 @@ use astrid_core::principal::PrincipalId;
 use astrid_core::profile::{PrincipalProfile, Quotas};
 use astrid_events::kernel_api::{AdminResponseBody, ResourceUsage};
 
+pub(super) mod assign_user;
 mod set;
 #[cfg(test)]
 mod tests;
+pub(super) mod users;
 pub(super) use set::quota_set;
 
 use super::handlers::{
