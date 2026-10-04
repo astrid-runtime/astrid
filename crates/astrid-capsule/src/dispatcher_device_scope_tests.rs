@@ -229,6 +229,50 @@ async fn recv_grant_required(receiver: &mut astrid_events::EventReceiver) -> (St
 }
 
 #[tokio::test]
+async fn cancelled_admission_does_not_prompt_for_an_unpublished_invocation() {
+    let fixture = resolver_fixture();
+    write_profile(&fixture.home, "alice", &PrincipalProfile::default());
+    let (capsule, invoked) = TestCapsule::new("secret-tool", &["tool.v1.execute.do_thing"]);
+    let registry = registry_for(capsule, &["alice"]);
+    let bus = Arc::new(EventBus::with_capacity(16));
+    let mut approval = bus.subscribe_topic("astrid.v1.approval");
+    let admitter: Arc<dyn astrid_events::EventDeliveryAdmitter> =
+        Arc::new(crate::dispatcher::admission::Admitter {
+            registry,
+            event_bus: Arc::downgrade(&bus),
+            queues: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            chain_locks: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            access_resolver: Some(fixture.resolver),
+            waits: crate::dispatcher::wait_graph::WaitGraph::default(),
+        });
+    assert!(bus.register_delivery_admitter(&admitter));
+    let event = AstridEvent::Ipc {
+        metadata: astrid_events::EventMetadata::new("test"),
+        message: astrid_events::ipc::IpcMessage::new(
+            Topic::from_raw("tool.v1.execute.do_thing"),
+            IpcPayload::RawJson(serde_json::json!({})),
+            uuid::Uuid::nil(),
+        )
+        .with_principal("alice")
+        .with_request_owner(astrid_events::ipc::RequestOwnerId::generate()),
+    };
+    let reservation = bus.reserve_publication(event.clone()).await.unwrap();
+    assert_no_grant_required(&mut approval).await;
+    drop(reservation);
+    assert_no_grant_required(&mut approval).await;
+    let reservation = bus.reserve_publication(event).await.unwrap();
+    reservation.publish().unwrap();
+    assert_eq!(
+        recv_grant_required(&mut approval).await,
+        ("alice".into(), "secret-tool".into())
+    );
+    assert!(
+        !invoked.load(Ordering::SeqCst),
+        "grant gating still prevents execution"
+    );
+}
+
+#[tokio::test]
 async fn inventory_visibility_and_execution_authority_are_separate() {
     let fixture = resolver_fixture();
     let full = device('a', DeviceScope::Full);

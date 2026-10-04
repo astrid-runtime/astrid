@@ -225,7 +225,7 @@ fn check_subscribe_acl(state: &HostState, topic_pattern: &str) -> Result<(), Err
 /// to `LocalSocket`. The freshly built `InternalIpcMessage` would otherwise
 /// reset origin to its `System` default, dropping the provenance the egress
 /// gate depends on.
-fn publish_inner(
+async fn publish_inner(
     state: &mut HostState,
     topic: String,
     payload: String,
@@ -284,9 +284,10 @@ fn publish_inner(
         Ok(data) => IpcPayload::from_json_value(data),
         Err(_) => return Err(ErrorCode::InvalidInput),
     };
-    // A tool capsule's result for the invocation in flight feeds its
-    // `ToolCall` audit record.
-    crate::engine::wasm::host::tool_audit::capture_tool_result(state, &topic, &ipc_payload);
+    // Prepare the bounded audit capture, but do not record a result unless
+    // publication commits. Admission can fail or be cancelled below.
+    let tool_result =
+        crate::engine::wasm::host::tool_audit::matching_tool_result(state, &topic, &ipc_payload);
 
     // Bindgen boundary IN: the guest supplies the topic as `string`; wrap it
     // explicitly (validation already ran above on the raw `&str`).
@@ -308,15 +309,40 @@ fn publish_inner(
         message = message.with_request_owner(owner);
     }
 
-    state.event_bus.publish(AstridEvent::Ipc {
+    let event = AstridEvent::Ipc {
         metadata: EventMetadata::new("wasm_guest").with_session_id(state.capsule_uuid),
         message,
-    });
+    };
+    let bus = state.event_bus.clone();
+    let cancel_token = state.effective_cancel_token();
+    let publication = util::bounded_await_cancellable(
+        &state.io_semaphore,
+        &cancel_token,
+        bus.reserve_publication(event),
+    )
+    .await
+    .ok_or(ErrorCode::CapabilityDenied)?
+    .map_err(|error| match error {
+        astrid_events::DeliveryAdmissionError::SelfDependency => ErrorCode::RateLimited,
+        astrid_events::DeliveryAdmissionError::InvalidEvent => ErrorCode::InvalidInput,
+        astrid_events::DeliveryAdmissionError::Closed => ErrorCode::CapabilityDenied,
+    })?;
+    // Retirement while waiting must not let the old invocation commit an
+    // effect after its view has been revoked. Dropping releases all permits.
+    if !state.invocation_authority_active() || cancel_token.is_cancelled() {
+        return Err(ErrorCode::CapabilityDenied);
+    }
+    publication
+        .publish()
+        .map_err(|_| ErrorCode::CapabilityDenied)?;
+    if let Some(result) = tool_result {
+        state.tool_result = Some(result);
+    }
     Ok(())
 }
 
 impl ipc::Host for HostState {
-    fn publish(&mut self, topic: String, payload: String) -> Result<(), ErrorCode> {
+    async fn publish(&mut self, topic: String, payload: String) -> Result<(), ErrorCode> {
         let principal_str = self
             .caller_context
             .as_ref()
@@ -354,7 +380,8 @@ impl ipc::Host for HostState {
             device_key_id.as_deref(),
             request_owner,
             origin,
-        );
+        )
+        .await;
         audit_ipc(
             self,
             "astrid:ipc/host.publish",
@@ -365,7 +392,7 @@ impl ipc::Host for HostState {
         result
     }
 
-    fn publish_as(
+    async fn publish_as(
         &mut self,
         topic: String,
         payload: String,
@@ -414,7 +441,8 @@ impl ipc::Host for HostState {
             device_key_id.as_deref(),
             request_owner,
             origin,
-        );
+        )
+        .await;
         audit_ipc(
             self,
             "astrid:ipc/host.publish-as",

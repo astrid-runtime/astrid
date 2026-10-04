@@ -5,7 +5,7 @@
 //! invocation and publishes a `ToolExecuteResult` on the request topic plus
 //! `.result` (or on `tool.v1.execute.result`) before it returns. The engine
 //! arms a [`ToolCallAudit`] for each such invocation, the IPC publish host fn
-//! captures the matching result ([`capture_tool_result`]), and the engine
+//! captures the matching result ([`matching_tool_result`]) after publication, and the engine
 //! records one `ToolCall` entry when the invocation ends: the tool, the call
 //! id, and BLAKE3 hashes of the arguments and of the published result. The
 //! outcome is a failure when the tool reported an error, published no
@@ -52,31 +52,33 @@ fn tool_request(message: &IpcMessage) -> Option<(&str, &str, &serde_json::Value)
     }
 }
 
-/// Capture `payload` as the result of the tool invocation in flight, if it is
+/// Identify `payload` as the result of the tool invocation in flight, if it is
 /// one: the caller is a tool request, `topic` is its result topic, and the
-/// call ids match. The first matching result wins.
-pub(crate) fn capture_tool_result(state: &mut HostState, topic: &str, payload: &IpcPayload) {
+/// call ids match. The caller must commit the capture only after publication.
+pub(crate) fn matching_tool_result(
+    state: &HostState,
+    topic: &str,
+    payload: &IpcPayload,
+) -> Option<ToolResultCapture> {
     if state.tool_result.is_some() {
-        return;
+        return None;
     }
-    let Some(caller) = state.caller_context.as_ref() else {
-        return;
-    };
-    let Some((_, request_call_id, _)) = tool_request(caller) else {
-        return;
-    };
+    let caller = state.caller_context.as_ref()?;
+    let (_, request_call_id, _) = tool_request(caller)?;
     let result_topic_matches = topic == SHARED_RESULT_TOPIC
         || topic
             .strip_suffix(RESULT_SUFFIX)
             .is_some_and(|base| base == caller.topic.as_str());
     let IpcPayload::ToolExecuteResult { call_id, result } = payload else {
-        return;
+        return None;
     };
     if result_topic_matches && call_id == request_call_id {
-        state.tool_result = Some(ToolResultCapture {
+        Some(ToolResultCapture {
             result_hash: ContentHash::hash(result.content.as_bytes()),
             is_error: result.is_error,
-        });
+        })
+    } else {
+        None
     }
 }
 
