@@ -6,12 +6,16 @@
 mod egress;
 mod framing;
 mod handshake;
+mod input;
 pub mod private_elicit;
+#[cfg(all(test, unix))]
+mod recovery_tests;
 #[cfg(all(test, unix))]
 mod rejection_tests;
 mod routing;
 #[cfg(all(test, unix))]
 mod tests;
+mod turn_correlation;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,6 +31,9 @@ use tokio::io::AsyncWriteExt;
 
 use framing::FramedReader;
 use handshake::AuthenticatedIdentity;
+#[cfg(test)]
+use input::input_chat_session;
+use input::{PendingInput, complete_pending, handle_connection_input, wait_pending};
 
 const MAX_PENDING_HANDSHAKES: usize = 8;
 const MAX_ESTABLISHED_CONNECTIONS: usize = 128;
@@ -40,6 +47,9 @@ const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 const CLIENT_EGRESS_CAPACITY: usize = 1024;
 const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+// Native cancellation must release a turn even if a live consumer has stopped
+// draining. This bounds best-effort forwarding, not ordinary input admission.
+const CANCEL_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const EVENT_SOURCE: &str = "native_local_uplink";
 
 struct ReservedResponse {
@@ -270,27 +280,35 @@ fn event_topic(event: &AstridEvent) -> Option<&str> {
     Some(message.topic.as_str())
 }
 
-fn publish_trusted_ingress(
+async fn publish_trusted_ingress(
     event_bus: &EventBus,
     identity: &AuthenticatedIdentity,
     principal: &str,
+    request_owner: astrid_types::ipc::RequestOwnerId,
     message: IpcMessage,
-) {
+) -> Result<(), &'static str> {
     // Rebuild the envelope so every provenance field is host-derived. The
     // client controls only the allowlisted topic and payload.
     let mut trusted = IpcMessage::new(message.topic, message.payload, uuid::Uuid::nil())
         .with_principal(principal)
-        .with_request_owner(identity.request_owner);
+        .with_request_owner(request_owner);
     trusted.device_key_id.clone_from(&identity.device_key_id);
     trusted.origin = if identity.is_principal_verified() {
         MessageOrigin::LocalSocket
     } else {
         MessageOrigin::System
     };
-    event_bus.publish(AstridEvent::Ipc {
-        metadata: EventMetadata::new(EVENT_SOURCE),
-        message: trusted,
-    });
+    let publication = event_bus
+        .reserve_publication(AstridEvent::Ipc {
+            metadata: EventMetadata::new(EVENT_SOURCE),
+            message: trusted,
+        })
+        .await
+        .map_err(|_| "runtime input delivery is unavailable")?;
+    publication
+        .publish()
+        .map_err(|_| "runtime input delivery is unavailable")?;
+    Ok(())
 }
 
 fn reserved_response_for(message: &IpcMessage) -> Option<ReservedResponse> {
@@ -331,7 +349,20 @@ fn reserved_response_matches(event: &AstridEvent, expected: &ReservedResponse) -
     )
 }
 
-fn process_inbound(
+struct UnpublishedTurn<'a> {
+    receiver: &'a egress::Subscription,
+    owner: Option<astrid_types::ipc::RequestOwnerId>,
+}
+
+impl Drop for UnpublishedTurn<'_> {
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner {
+            self.receiver.abandon_unpublished_turn(owner);
+        }
+    }
+}
+
+async fn process_inbound(
     event_bus: &EventBus,
     identity: &AuthenticatedIdentity,
     principal: &str,
@@ -339,6 +370,11 @@ fn process_inbound(
     message: IpcMessage,
 ) -> Result<(), &'static str> {
     validate_ingress(&message)?;
+    let mut cancelled_session = None;
+    let mut admitted = UnpublishedTurn {
+        receiver,
+        owner: None,
+    };
     if message.topic.as_str() == routing::CHAT_REQUEST_TOPIC {
         let session = routing::payload_session_id(&message.payload)
             .ok_or("chat request is missing a session ID")?;
@@ -346,11 +382,69 @@ fn process_inbound(
             if receiver.session().as_deref() != Some(session) {
                 return Err("cancellation does not match this connection's active session");
             }
+            cancelled_session = Some(session.to_owned());
         } else if !receiver.begin_turn(session) {
             return Err("this principal or connection already has an active turn");
+        } else {
+            admitted.owner = receiver.turn_owner();
         }
     }
-    publish_trusted_ingress(event_bus, identity, principal, message);
+    // Human replies retain the owner of their delivered request, not whichever
+    // chat happens to be active when the user responds.
+    let human_reply = receiver.claim_human_reply(&message)?;
+    // Only turn input inherits the current turn's authority.
+    // Independent management requests may finish after the chat turn ends;
+    // their replies must retain the connection owner throughout that interval.
+    let topic = message.topic.as_str();
+    let turn_scoped = topic == routing::CHAT_REQUEST_TOPIC;
+    let request_owner = if let Some(reply) = human_reply.as_ref() {
+        reply.owner
+    } else if turn_scoped {
+        receiver.turn_owner().unwrap_or(identity.request_owner)
+    } else {
+        identity.request_owner
+    };
+    let forwarding =
+        publish_trusted_ingress(event_bus, identity, principal, request_owner, message);
+    let forwarding = if cancelled_session.is_some() {
+        tokio::time::timeout(CANCEL_FORWARD_TIMEOUT, forwarding)
+            .await
+            .unwrap_or(Err("cancellation forwarding exceeded its capacity wait"))
+    } else {
+        forwarding.await
+    };
+    if cancelled_session.is_none() {
+        forwarding?;
+    } else if let Err(reason) = forwarding {
+        tracing::warn!(
+            reason,
+            "Cancellation forwarding failed; retiring native turn"
+        );
+    }
+    admitted.owner = None;
+    if let Some(reply) = human_reply {
+        reply.complete();
+    }
+    if let Some(session_id) = cancelled_session {
+        // Attempt forwarding first, but do not require an available consumer or
+        // a producer acknowledgement. The retired turn's owner fences delayed replies
+        // from a subsequent request on this same connection and conversation.
+        let terminal = IpcMessage::new(
+            Topic::from_raw("agent.v1.response"),
+            IpcPayload::AgentResponse {
+                text: "Request cancelled.".to_owned(),
+                is_final: true,
+                session_id,
+            },
+            uuid::Uuid::nil(),
+        )
+        .with_principal(principal)
+        .with_request_owner(request_owner);
+        event_bus.publish(AstridEvent::Ipc {
+            metadata: EventMetadata::new(EVENT_SOURCE),
+            message: terminal,
+        });
+    }
     Ok(())
 }
 
@@ -358,7 +452,7 @@ async fn serve_connection(
     stream: LocalStream,
     identity: AuthenticatedIdentity,
     event_bus: Arc<EventBus>,
-    mut receiver: egress::Subscription,
+    receiver: egress::Subscription,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     mut admission: ConnectionAdmission,
     private_elicits: Option<Arc<dyn private_elicit::PrivateElicitResponder>>,
@@ -371,12 +465,17 @@ async fn serve_connection(
     let reserved_deadline = tokio::time::Instant::now()
         .checked_add(RESERVED_ADMIN_LIFETIME)
         .unwrap_or_else(tokio::time::Instant::now);
-    if let Some(message) = admission.initial_message.take()
-        && let Err(reason) = process_inbound(&event_bus, &identity, &principal, &receiver, message)
-    {
-        tracing::warn!(security_event = true, %principal, %reason);
-        return;
-    }
+    let egress = receiver.egress_queue();
+    let mut pending = admission
+        .initial_message
+        .take()
+        .map(|message| PendingInput::new(&event_bus, &identity, &receiver, message));
+    // One separately bounded human reply can unblock an admitted request;
+    // it must not sit behind the ordinary input whose grant it answers.
+    let mut control: Option<PendingInput<'_>> = None;
+    // Cancellation must remain available while ordinary input and a human
+    // reply both wait. Exactly one independently polled, timeout-bounded slot.
+    let mut cancellation: Option<PendingInput<'_>> = None;
     publish_lifecycle(&event_bus, Topic::client_connect(), &principal, None);
     tracing::info!(%principal, authenticated = identity.is_principal_verified(), "local client connected");
 
@@ -396,10 +495,26 @@ async fn serve_connection(
                     // the acknowledgement the CLI is waiting for.
                     drain_outbound_on_shutdown(
                         &mut writer,
-                        &mut receiver,
+                        &egress,
                         &principal,
                         &mut stream_accumulators,
                     ).await;
+                    break;
+                }
+            },
+            result = wait_pending(&mut pending),
+                if pending.as_ref().is_some_and(|input| !input.starts_turn || cancellation.is_none()) => {
+                if complete_pending(&mut writer, &identity, &mut pending, result).await.is_err() {
+                    break;
+                }
+            },
+            result = wait_pending(&mut control), if control.is_some() => {
+                if complete_pending(&mut writer, &identity, &mut control, result).await.is_err() {
+                    break;
+                }
+            },
+            result = wait_pending(&mut cancellation), if cancellation.is_some() => {
+                if complete_pending(&mut writer, &identity, &mut cancellation, result).await.is_err() {
                     break;
                 }
             },
@@ -409,14 +524,10 @@ async fn serve_connection(
                         tracing::warn!(%principal, "reserved admin connection attempted multiple requests");
                         break;
                     }
-                    if route_connection_message(
-                        &mut writer,
-                        &event_bus,
-                        &identity,
-                        &receiver,
-                        private_elicits.as_deref(),
-                        message,
-                    ).await.is_err() {
+                    if handle_connection_input(&mut writer, &event_bus, &identity,
+                        &receiver, private_elicits.as_deref(), message,
+                        (&mut pending, &mut control, &mut cancellation)).await.is_err()
+                    {
                         break;
                     }
                 },
@@ -426,26 +537,11 @@ async fn serve_connection(
                     break;
                 },
             },
-            outbound = receiver.recv() => {
-                let event = match outbound {
-                    Ok(event) => event,
-                    Err(egress::RecvError::Lagged) => {
-                        tracing::error!(
-                            security_event = true,
-                            %principal,
-                            "closing lagged local uplink connection"
-                        );
-                        break;
-                    },
-                };
-                if let Err(error) = forward_outbound(
-                    &mut writer,
-                    &event,
-                    &mut stream_accumulators,
-                ).await {
-                    tracing::warn!(%principal, %error, "local uplink write failed");
+            outbound = egress.recv() => {
+                let Some(event) = forward_connection_egress(&mut writer, outbound,
+                    &principal, &mut stream_accumulators).await else {
                     break;
-                }
+                };
                 if admission
                     .reserved_response
                     .as_ref()
@@ -457,6 +553,9 @@ async fn serve_connection(
         }
     }
 
+    drop(pending); // Abandon any unpublished turn before disconnect notification.
+    drop(control);
+    drop(cancellation);
     publish_lifecycle(
         &event_bus,
         Topic::client_disconnect(),
@@ -466,8 +565,26 @@ async fn serve_connection(
     tracing::info!(%principal, "local client disconnected");
 }
 
+async fn forward_connection_egress(
+    writer: &mut LocalWriteHalf,
+    outbound: Result<Arc<AstridEvent>, egress::RecvError>,
+    principal: &str,
+    accumulators: &mut HashMap<String, Option<String>>,
+) -> Option<Arc<AstridEvent>> {
+    let Ok(event) = outbound else {
+        tracing::error!(security_event = true, %principal, "closing lagged local uplink connection");
+        return None;
+    };
+    if let Err(error) = forward_outbound(writer, &event, accumulators).await {
+        tracing::warn!(%principal, %error, "local uplink write failed");
+        return None;
+    }
+    Some(event)
+}
+
 /// Private replies must be consumed before ordinary bus admission. Even an
 /// unsupported/expired reply gets a direct rejection, never an IPC fallback.
+#[cfg(test)]
 async fn route_connection_message(
     writer: &mut LocalWriteHalf,
     event_bus: &EventBus,
@@ -480,60 +597,68 @@ async fn route_connection_message(
         let result = private_elicit::respond(identity, private_elicits, message);
         return write_message(writer, &result).await;
     }
-    let chat_session = (message.topic.as_str() == routing::CHAT_REQUEST_TOPIC).then(|| {
-        routing::payload_session_id(&message.payload)
-            .unwrap_or("default")
-            .to_owned()
-    });
+    let chat_session = input_chat_session(&message);
     if let Err(reason) = process_inbound(
         event_bus,
         identity,
         identity.principal.as_str(),
         receiver,
         message,
-    ) {
-        tracing::warn!(security_event = true, principal = %identity.principal, %reason, "dropped local uplink message");
-        // Write only to the requesting socket. Publishing a final response on
-        // the bus would release the admitted turn's ownership, possibly on a
-        // different connection with this same principal and session.
-        let is_chat = chat_session.is_some();
-        let (topic, payload) = if let Some(session_id) = chat_session {
-            (
-                Topic::from_raw("agent.v1.response"),
-                IpcPayload::AgentResponse {
-                    text: format!("Request refused: {reason}"),
-                    is_final: true,
-                    session_id,
-                },
-            )
-        } else {
-            // Other request families have different response contracts. A
-            // reason followed by EOF is preferable to inventing a response
-            // shape their client might ignore and leave pending forever.
-            (
-                Topic::client_disconnect(),
-                IpcPayload::Disconnect {
-                    reason: Some(reason.to_owned()),
-                },
-            )
-        };
-        let response = IpcMessage::new(topic, payload, uuid::Uuid::nil())
-            .with_principal(identity.principal.as_str())
-            .with_request_owner(identity.request_owner);
-        write_message(writer, &response).await?;
-        if !is_chat {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                reason,
-            ));
-        }
+    )
+    .await
+    {
+        return write_ingress_refusal(writer, identity, chat_session, reason).await;
+    }
+    Ok(())
+}
+
+async fn write_ingress_refusal(
+    writer: &mut LocalWriteHalf,
+    identity: &AuthenticatedIdentity,
+    chat_session: Option<String>,
+    reason: &'static str,
+) -> std::io::Result<()> {
+    tracing::warn!(security_event = true, principal = %identity.principal, %reason, "dropped local uplink message");
+    // Write only to the requesting socket. Publishing a final response on
+    // the bus would release the admitted turn's ownership, possibly on a
+    // different connection with this same principal and session.
+    let is_chat = chat_session.is_some();
+    let (topic, payload) = if let Some(session_id) = chat_session {
+        (
+            Topic::from_raw("agent.v1.response"),
+            IpcPayload::AgentResponse {
+                text: format!("Request refused: {reason}"),
+                is_final: true,
+                session_id,
+            },
+        )
+    } else {
+        // Other request families have different response contracts. A
+        // reason followed by EOF is preferable to inventing a response
+        // shape their client might ignore and leave pending forever.
+        (
+            Topic::client_disconnect(),
+            IpcPayload::Disconnect {
+                reason: Some(reason.to_owned()),
+            },
+        )
+    };
+    let response = IpcMessage::new(topic, payload, uuid::Uuid::nil())
+        .with_principal(identity.principal.as_str())
+        .with_request_owner(identity.request_owner);
+    write_message(writer, &response).await?;
+    if !is_chat {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            reason,
+        ));
     }
     Ok(())
 }
 
 async fn drain_outbound_on_shutdown(
     writer: &mut LocalWriteHalf,
-    receiver: &mut egress::Subscription,
+    receiver: &egress::EgressQueue,
     principal: &str,
     stream_accumulators: &mut HashMap<String, Option<String>>,
 ) {

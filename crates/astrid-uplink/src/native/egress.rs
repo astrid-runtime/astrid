@@ -36,13 +36,75 @@ fn request_owner_allows(message: &IpcMessage, client_owner: RequestOwnerId) -> b
 #[derive(Default)]
 struct QueueState {
     events: VecDeque<QueuedEvent>,
+    human_replies: HashMap<ReplyKey, RequestOwnerId>,
+    claimed_replies: std::collections::HashSet<ReplyKey>,
+    human_reply_bytes: usize,
     bytes: usize,
     overflowed: bool,
 }
 
-struct EgressQueue {
+#[derive(Clone, Hash, Eq, PartialEq)]
+pub(super) struct ReplyKey {
+    topic: Topic,
+    selection_id: Option<String>,
+}
+
+impl ReplyKey {
+    pub(super) fn from_reply(message: &IpcMessage) -> Self {
+        let selection_id = if message.topic.as_str().starts_with("registry.v1.selection.") {
+            match &message.payload {
+                astrid_types::ipc::IpcPayload::Custom { data }
+                | astrid_types::ipc::IpcPayload::RawJson(data) => data
+                    .get("request_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        Self {
+            topic: message.topic.clone(),
+            selection_id,
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        self.topic
+            .as_str()
+            .len()
+            .saturating_add(self.selection_id.as_ref().map_or(0, String::len))
+    }
+}
+
+pub(super) struct EgressQueue {
     state: Mutex<QueueState>,
     ready: tokio::sync::Notify,
+}
+
+fn connection_owned_elicitation(
+    event: &Arc<AstridEvent>,
+    owner: RequestOwnerId,
+) -> Arc<AstridEvent> {
+    let Some(message) = event_message(event) else {
+        return Arc::clone(event);
+    };
+    if message.request_owner.is_none()
+        && message.source_id.is_nil()
+        && message.topic == Topic::elicit_request()
+        && matches!(
+            message.payload,
+            astrid_types::ipc::IpcPayload::ElicitRequest { .. }
+        )
+    {
+        let mut delivered = (**event).clone();
+        if let AstridEvent::Ipc { message, .. } = &mut delivered {
+            message.request_owner = Some(owner);
+        }
+        Arc::new(delivered)
+    } else {
+        Arc::clone(event)
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -60,8 +122,39 @@ struct ClientQueue {
     principal: String,
     device_key_id: Option<String>,
     request_owner: RequestOwnerId,
-    session: Arc<RwLock<Option<String>>>,
+    session: Arc<RwLock<Option<ActiveTurn>>>,
     queue: Arc<EgressQueue>,
+}
+
+struct ActiveTurn {
+    session_id: String,
+    request_owner: RequestOwnerId,
+    correlation: Option<super::turn_correlation::ResponseCorrelation>,
+}
+
+impl ClientQueue {
+    fn owner_allows(
+        &self,
+        session: &mut Option<ActiveTurn>,
+        message: &IpcMessage,
+        chat: bool,
+        completed: bool,
+    ) -> bool {
+        if chat {
+            return session.as_mut().is_some_and(|turn| {
+                super::turn_correlation::owner_allows(
+                    message,
+                    turn.request_owner,
+                    &mut turn.correlation,
+                    completed,
+                )
+            });
+        }
+        request_owner_allows(message, self.request_owner)
+            || session
+                .as_ref()
+                .is_some_and(|turn| request_owner_allows(message, turn.request_owner))
+    }
 }
 
 /// Registry consulted synchronously while events are published.
@@ -78,8 +171,37 @@ pub(super) struct Subscription {
     id: uuid::Uuid,
     registry: Weak<Registry>,
     principal: String,
-    session: Arc<RwLock<Option<String>>>,
+    session: Arc<RwLock<Option<ActiveTurn>>>,
     queue: Arc<EgressQueue>,
+}
+
+pub(super) struct HumanReplyClaim<'a> {
+    receiver: &'a Subscription,
+    key: ReplyKey,
+    pub(super) owner: RequestOwnerId,
+    completed: bool,
+}
+
+impl HumanReplyClaim<'_> {
+    pub(super) fn complete(mut self) {
+        self.receiver.complete_human_reply(&self.key, self.owner);
+        self.completed = true;
+    }
+}
+
+impl Drop for HumanReplyClaim<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.receiver
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .claimed_replies
+            .remove(&self.key);
+    }
 }
 
 impl Registry {
@@ -134,28 +256,49 @@ impl Registry {
                 .clients
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut finished_owner = None;
             for (id, client) in clients.iter() {
                 if turn_key.is_some() && turn_owner != Some(*id) {
                     continue;
                 }
-                if !request_owner_allows(message, client.request_owner) {
-                    continue;
-                }
-                let session = client
+                let mut session = client
                     .session
-                    .read()
+                    .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if routing::should_deliver(
+                if !routing::should_deliver(
                     message,
                     &client.principal,
                     client.device_key_id.as_deref(),
-                    session.as_deref(),
+                    session.as_ref().map(|turn| turn.session_id.as_str()),
                 ) {
-                    client.queue.enqueue(Arc::clone(&event), event_bytes);
+                    continue;
+                }
+                let active_owner = session.as_ref().map(|turn| turn.request_owner);
+                // Ordinary chat frames require the host-stamped turn owner.
+                // Autonomous completion additionally needs a nonce bound by
+                // that owner and the same authenticated capsule producer.
+                let owner_allowed =
+                    client.owner_allows(&mut session, message, turn_key.is_some(), completed);
+                if !owner_allowed {
+                    continue;
+                }
+                // Legacy kernel elicitation has principal authority but
+                // no invocation owner. Bind its delivered copy to this
+                // authenticated connection, never to an unrelated chat.
+                let mut delivered = connection_owned_elicitation(&event, client.request_owner);
+                if turn_key.is_some()
+                    && message.request_owner.is_none()
+                    && let AstridEvent::Ipc { message, .. } = Arc::make_mut(&mut delivered)
+                {
+                    super::turn_correlation::bind_terminal(message, active_owner);
+                }
+                client.queue.enqueue(delivered, event_bytes);
+                if completed {
+                    finished_owner = Some(*id);
                 }
             }
             if completed
-                && let Some(owner) = turn_owner
+                && let Some(owner) = finished_owner
                 && let Some(client) = clients.get(&owner)
             {
                 *client
@@ -164,7 +307,7 @@ impl Registry {
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             }
             drop(clients);
-            if completed && let (Some(key), Some(owner)) = (turn_key, turn_owner) {
+            if completed && let (Some(key), Some(owner)) = (turn_key, finished_owner) {
                 let mut active = registry
                     .active_turns
                     .lock()
@@ -210,6 +353,116 @@ impl Registry {
 }
 
 impl Subscription {
+    pub(super) fn claim_human_reply(
+        &self,
+        message: &IpcMessage,
+    ) -> Result<Option<HumanReplyClaim<'_>>, &'static str> {
+        let Some(owner) = self.human_reply_owner(message)? else {
+            return Ok(None);
+        };
+        let key = ReplyKey::from_reply(message);
+        let mut state = self
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.overflowed
+            || state.human_replies.get(&key) != Some(&owner)
+            || !state.claimed_replies.insert(key.clone())
+        {
+            return Err("human reply is no longer available on this connection");
+        }
+        Ok(Some(HumanReplyClaim {
+            receiver: self,
+            key,
+            owner,
+            completed: false,
+        }))
+    }
+
+    pub(super) fn human_reply_owner(
+        &self,
+        message: &IpcMessage,
+    ) -> Result<Option<RequestOwnerId>, &'static str> {
+        use astrid_types::ipc::IpcPayload;
+        let topic = message.topic.as_str();
+        if topic.starts_with("registry.v1.selection.") {
+            let state = self
+                .queue
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let key = ReplyKey::from_reply(message);
+            let Some(owner) = state.human_replies.get(&key) else {
+                return if key.selection_id.is_some() {
+                    Err("selection reply does not match a request on this connection")
+                } else {
+                    Ok(None) // Standalone model-selection command.
+                };
+            };
+            if state.overflowed || state.claimed_replies.contains(&key) {
+                return Err("selection reply does not match the delivered request");
+            }
+            return Ok(Some(*owner));
+        }
+        if !topic.starts_with("astrid.v1.approval.response.")
+            && !topic.starts_with("astrid.v1.elicit.response.")
+        {
+            return Ok(None);
+        }
+        let expected = match &message.payload {
+            IpcPayload::ApprovalResponse { request_id, .. } => Topic::approval_response(request_id),
+            IpcPayload::ElicitResponse { request_id, .. } => Topic::elicit_response(*request_id),
+            _ => return Err("human reply requires a typed response"),
+        };
+        if expected != message.topic {
+            return Err("human reply request ID does not match its topic");
+        }
+        let state = self
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.overflowed {
+            return Err("human request delivery overflowed");
+        }
+        if state
+            .claimed_replies
+            .contains(&ReplyKey::from_reply(message))
+        {
+            return Err("human reply is already awaiting runtime delivery");
+        }
+        state
+            .human_replies
+            .get(&ReplyKey {
+                topic: expected,
+                selection_id: None,
+            })
+            .copied()
+            .map(Some)
+            .ok_or("human reply does not match a request on this connection")
+    }
+
+    pub(super) fn complete_human_reply(&self, key: &ReplyKey, owner: RequestOwnerId) {
+        let mut state = self
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .human_replies
+            .get(key)
+            .is_some_and(|existing| *existing == owner)
+            && state.human_replies.remove(key).is_some()
+        {
+            state.human_reply_bytes = state.human_reply_bytes.saturating_sub(key.bytes());
+            state.claimed_replies.remove(key);
+        }
+    }
+
+    pub(super) fn egress_queue(&self) -> Arc<EgressQueue> {
+        Arc::clone(&self.queue)
+    }
     pub(super) fn begin_turn(&self, session: &str) -> bool {
         let Some(registry) = self.registry.upgrade() else {
             return false;
@@ -234,7 +487,11 @@ impl Subscription {
             std::collections::hash_map::Entry::Occupied(_) => false,
         };
         if inserted {
-            *current = Some(session.to_owned());
+            *current = Some(ActiveTurn {
+                session_id: session.to_owned(),
+                request_owner: RequestOwnerId::generate(),
+                correlation: None,
+            });
         }
         inserted
     }
@@ -243,13 +500,50 @@ impl Subscription {
         self.session
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .as_ref()
+            .map(|turn| turn.session_id.clone())
     }
 
+    /// Roll back a turn whose input was never published. The captured owner
+    /// prevents a cancelled reservation from clearing a later turn.
+    pub(super) fn abandon_unpublished_turn(&self, owner: RequestOwnerId) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let mut current = self
+            .session
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current
+            .as_ref()
+            .is_some_and(|turn| turn.request_owner == owner)
+        {
+            let turn = current.take().expect("matched turn");
+            let mut active = registry
+                .active_turns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let key = (self.principal.clone(), turn.session_id);
+            if active.get(&key) == Some(&self.id) {
+                active.remove(&key);
+            }
+        }
+    }
+
+    pub(super) fn turn_owner(&self) -> Option<RequestOwnerId> {
+        self.session
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|turn| turn.request_owner)
+    }
+
+    #[cfg(test)]
     pub(super) async fn recv(&mut self) -> Result<Arc<AstridEvent>, RecvError> {
         self.queue.recv().await
     }
 
+    #[cfg(test)]
     pub(super) fn try_recv(&mut self) -> Result<Arc<AstridEvent>, TryRecvError> {
         self.queue.try_recv()
     }
@@ -271,18 +565,75 @@ impl EgressQueue {
         if state.overflowed {
             return;
         }
+        let human_reply = event_message(&event).and_then(|message| {
+            use astrid_types::ipc::IpcPayload;
+            let owner = message.request_owner?;
+            let mut selection_id = None;
+            let topic = match &message.payload {
+                IpcPayload::ApprovalRequired { request_id, .. }
+                | IpcPayload::GrantRequired { request_id, .. }
+                    if message.topic == Topic::approval_request() =>
+                {
+                    Topic::approval_response(request_id)
+                },
+                IpcPayload::ElicitRequest { request_id, .. }
+                    if message.topic == Topic::elicit_request() =>
+                {
+                    Topic::elicit_response(*request_id)
+                },
+                IpcPayload::SelectionRequired {
+                    request_id,
+                    callback_topic,
+                    ..
+                } if callback_topic
+                    .as_str()
+                    .starts_with("registry.v1.selection.") =>
+                {
+                    selection_id = Some(request_id.clone());
+                    callback_topic.clone()
+                },
+                _ => return None,
+            };
+            Some((
+                ReplyKey {
+                    topic,
+                    selection_id,
+                },
+                owner,
+            ))
+        });
+        let reply_overflow = human_reply.as_ref().is_some_and(|(topic, owner)| {
+            state
+                .human_replies
+                .get(topic)
+                .is_some_and(|existing| existing != owner)
+                || (!state.human_replies.contains_key(topic)
+                    && (state.human_replies.len() >= CLIENT_EGRESS_CAPACITY
+                        || topic.bytes()
+                            > CLIENT_EGRESS_BYTE_BUDGET.saturating_sub(state.human_reply_bytes)))
+        });
         if state.events.len() >= CLIENT_EGRESS_CAPACITY
             || bytes > CLIENT_EGRESS_BYTE_BUDGET.saturating_sub(state.bytes)
+            || reply_overflow
         {
             // Release retained frames immediately. The affected connection
             // observes Lagged and fail-closes; other clients have independent
             // queues and remain available.
             state.events.clear();
+            state.human_replies.clear();
+            state.claimed_replies.clear();
+            state.human_reply_bytes = 0;
             state.bytes = 0;
             state.overflowed = true;
             drop(state);
             self.ready.notify_one();
             return;
+        }
+        if let Some((topic, owner)) = human_reply {
+            if !state.human_replies.contains_key(&topic) {
+                state.human_reply_bytes = state.human_reply_bytes.saturating_add(topic.bytes());
+            }
+            state.human_replies.insert(topic, owner);
         }
         state.bytes = state.bytes.saturating_add(bytes);
         state.events.push_back(QueuedEvent { event, bytes });
@@ -290,7 +641,7 @@ impl EgressQueue {
         self.ready.notify_one();
     }
 
-    async fn recv(&self) -> Result<Arc<AstridEvent>, RecvError> {
+    pub(super) async fn recv(&self) -> Result<Arc<AstridEvent>, RecvError> {
         loop {
             // Register before inspecting state so a publisher cannot notify
             // between the empty check and this task beginning to wait.
@@ -312,7 +663,7 @@ impl EgressQueue {
         }
     }
 
-    fn try_recv(&self) -> Result<Arc<AstridEvent>, TryRecvError> {
+    pub(super) fn try_recv(&self) -> Result<Arc<AstridEvent>, TryRecvError> {
         let mut state = self
             .state
             .lock()
@@ -365,6 +716,39 @@ mod tests {
     use astrid_types::ipc::{IpcMessage, IpcPayload};
 
     use super::*;
+
+    #[test]
+    fn unanswered_human_requests_have_a_bounded_lifetime_on_the_connection() {
+        let queue = EgressQueue::new();
+        let owner = RequestOwnerId::generate();
+        for index in 0..=CLIENT_EGRESS_CAPACITY {
+            queue.enqueue(
+                Arc::new(AstridEvent::Ipc {
+                    metadata: EventMetadata::new("test"),
+                    message: IpcMessage::new(
+                        Topic::approval_request(),
+                        IpcPayload::GrantRequired {
+                            request_id: index.to_string(),
+                            request_owner: owner.to_string(),
+                            principal: "alice".to_owned(),
+                            capsule_id: "test".to_owned(),
+                        },
+                        uuid::Uuid::nil(),
+                    )
+                    .with_principal("alice")
+                    .with_request_owner(owner),
+                }),
+                1,
+            );
+            if index < CLIENT_EGRESS_CAPACITY {
+                assert!(queue.try_recv().is_ok());
+            }
+        }
+        assert_eq!(queue.try_recv().err(), Some(TryRecvError::Lagged));
+        let state = queue.state.lock().expect("state");
+        assert!(state.human_replies.is_empty());
+        assert_eq!(state.human_reply_bytes, 0);
+    }
 
     fn event() -> Arc<AstridEvent> {
         Arc::new(AstridEvent::Ipc {
@@ -532,7 +916,8 @@ mod tests {
                 },
                 uuid::Uuid::nil(),
             )
-            .with_principal("alice"),
+            .with_principal("alice")
+            .with_request_owner(first.turn_owner().expect("first turn owner")),
         });
 
         assert_eq!(first.session(), None);
@@ -550,7 +935,8 @@ mod tests {
                 },
                 uuid::Uuid::nil(),
             )
-            .with_principal("alice"),
+            .with_principal("alice")
+            .with_request_owner(second.turn_owner().expect("second turn owner")),
         });
         assert_eq!(second.session(), None);
         assert!(
@@ -569,7 +955,8 @@ mod tests {
                 })),
                 uuid::Uuid::nil(),
             )
-            .with_principal("alice"),
+            .with_principal("alice")
+            .with_request_owner(second.turn_owner().expect("new turn owner")),
         });
         assert!(matches!(first.try_recv(), Err(TryRecvError::Empty)));
         assert!(
