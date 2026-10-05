@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use astrid_capsule_install::{
     ArtifactProvenance, AuthorityDecision, InstallInspection,
     inspect_archive_for_principal_with_layout, inspect_directory_for_principal_with_layout,
@@ -79,11 +79,17 @@ pub(super) fn authority_decision(
     }
 }
 
-pub(super) fn daemon_install_authority(
+pub(super) async fn daemon_install_authority(
     source: &str,
     principal: &astrid_core::PrincipalId,
     prompt: &ManualInstallOptions,
 ) -> anyhow::Result<CapsuleInstallAuthority> {
+    // The stopped home stores its identity inside the volume. Restore the
+    // daemon-owned projection before inspection can load that identity; doing
+    // inspection first would generate a new key outside the stopped volume.
+    crate::commands::daemon::ensure_persistent_daemon("capsule install authority")
+        .await
+        .context("capsule authority inspection could not ensure the runtime daemon")?;
     let home = AstridHome::resolve()?;
     let path = Path::new(source.strip_prefix("file://").unwrap_or(source));
     let inspection = if path.is_file() {

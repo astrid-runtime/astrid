@@ -495,7 +495,8 @@ async fn download_and_unpack(
                     .context("invalid downloaded archive path")?,
                 context.principal,
                 context.prompt,
-            )?,
+            )
+            .await?,
             context.expected_generation,
             batch_context(context.batch_id, context.expected),
         )
@@ -625,7 +626,8 @@ async fn clone_and_build(
                         .context("invalid built archive path")?,
                     context.principal,
                     context.prompt,
-                )?,
+                )
+                .await?,
                 context.expected_generation,
                 batch_context(context.batch_id, context.expected),
             )
@@ -653,7 +655,7 @@ async fn install_archive_via_daemon(
         source,
         context.prompt,
         context.principal,
-        daemon_install_authority(source, context.principal, context.prompt)?,
+        daemon_install_authority(source, context.principal, context.prompt).await?,
         context.expected_generation,
         batch_context(context.batch_id, context.expected),
     )
