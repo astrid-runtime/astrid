@@ -449,6 +449,20 @@ async fn import_legacy_scoped_scope(
     legacy_secret_root: Option<std::path::PathBuf>,
     retire: bool,
 ) -> StorageResult<usize> {
+    // The migration barrier retries completed scopes after a later boot stage
+    // fails. Retired sources are absent; their original counts cannot be
+    // recomputed as zero and compared to the durable completion receipt.
+    if legacy_env_file.is_none()
+        && legacy_secret_root.is_none()
+        && let Some(receipt) = env_store.get(LEGACY_IMPORT_MARKER_KEY).await?
+    {
+        if valid_import_receipt(&receipt) {
+            return Ok(0);
+        }
+        return Err(StorageError::Internal(
+            "legacy import receipt is malformed".to_owned(),
+        ));
+    }
     let env_values = read_legacy_env(legacy_env_file.as_deref())?;
     let secret_values = read_legacy_secrets(legacy_secret_root.as_deref())?;
     check_import_conflicts(&env_store, &secret_scope, &env_values, &secret_values).await?;
@@ -478,4 +492,21 @@ async fn import_legacy_scoped_scope(
         retire_legacy_secrets(legacy_secret_root, &secret_values)?;
     }
     Ok(env_count.saturating_add(secret_count))
+}
+
+fn valid_import_receipt(receipt: &[u8]) -> bool {
+    let Ok(receipt) = std::str::from_utf8(receipt) else {
+        return false;
+    };
+    let Some(counts) = receipt.strip_prefix("legacy-import-v1 env=") else {
+        return false;
+    };
+    let Some((env, secrets)) = counts.split_once(" secrets=") else {
+        return false;
+    };
+    [env, secrets].into_iter().all(|count| {
+        !count.is_empty()
+            && count.bytes().all(|byte| byte.is_ascii_digit())
+            && count.parse::<usize>().is_ok()
+    })
 }
