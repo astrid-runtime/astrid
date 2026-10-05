@@ -53,6 +53,7 @@ mod projection_retirement;
 pub use projection_retirement::retire_projection_root;
 #[path = "dirs_run_dir.rs"]
 mod run_dir;
+mod stopped_key;
 #[path = "dirs_workspace.rs"]
 mod workspace_dir;
 pub use workspace_dir::WorkspaceDir;
@@ -252,6 +253,7 @@ enum UnsentinelledRootState {
     Empty,
     RuntimeKeyBootstrap,
     StoppedVolume,
+    StoppedKeyRecovery,
 }
 
 impl AstridHome {
@@ -482,7 +484,10 @@ impl AstridHome {
         }
         crate::platform_fs::validate_private_directory(self.root())?;
 
-        if self.validate_fresh_root_entries()? == UnsentinelledRootState::StoppedVolume {
+        if matches!(
+            self.validate_fresh_root_entries()?,
+            UnsentinelledRootState::StoppedVolume | UnsentinelledRootState::StoppedKeyRecovery
+        ) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "stopped Astrid durable root cannot provision runtime identity sidecars",
@@ -492,6 +497,9 @@ impl AstridHome {
     }
 
     fn validate_fresh_root_entries(&self) -> io::Result<UnsentinelledRootState> {
+        if self.requires_stopped_key_recovery()? {
+            return Ok(UnsentinelledRootState::StoppedKeyRecovery);
+        }
         let mut entries = self.root().read_dir()?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(std::fs::DirEntry::file_name);
         if entries.len() == 1 && entries[0].file_name() == std::ffi::OsStr::new("keys") {
@@ -524,6 +532,20 @@ impl AstridHome {
             state = UnsentinelledRootState::StoppedVolume;
         }
         Ok(state)
+    }
+
+    /// Recognize the precise replacement-key residue left by older installers.
+    ///
+    /// This is structural recognition, not admission of either file's bytes.
+    /// Storage must validate existing volume authority under the boot singleton
+    /// before preserving the sidecar and restoring the volume-owned key.
+    /// Identity provisioning remains forbidden for this stopped representation.
+    ///
+    /// # Errors
+    /// Returns an error for redirected, foreign-owned, writable or malformed
+    /// entries in the otherwise exact volume-and-runtime-key shape.
+    pub fn requires_stopped_key_recovery(&self) -> io::Result<bool> {
+        stopped_key::recognize(self)
     }
 
     fn validate_runtime_key_bootstrap(&self, keys_dir: &Path) -> io::Result<()> {

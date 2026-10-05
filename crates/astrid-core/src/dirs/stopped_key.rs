@@ -1,0 +1,66 @@
+//! Read-only recognition of a published stopped-install failure shape.
+
+use std::{fs, io};
+
+use super::AstridHome;
+
+pub(super) fn recognize(home: &AstridHome) -> io::Result<bool> {
+    if home.layout_version()?.is_some() {
+        return Ok(false);
+    }
+    let entries = match fs::read_dir(home.root()) {
+        Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if entries.len() != 2
+        || !entries
+            .iter()
+            .any(|entry| entry.file_name() == "astrid.volume")
+        || !entries.iter().any(|entry| entry.file_name() == "keys")
+    {
+        return Ok(false);
+    }
+    crate::platform_fs::validate_private_directory(home.root())?;
+    crate::platform_fs::validate_private_file(&home.storage_volume_path())?;
+    let keys = home.keys_dir();
+    crate::platform_fs::verify_no_redirects(&keys)?;
+    let metadata = fs::symlink_metadata(&keys)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(invalid(
+            "runtime-key recovery directory is redirected or not a directory",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Older key creation used the process umask (commonly 0755). Reading
+        // directory names confers no key authority; other users must never be
+        // able to replace its entries, and the key itself remains private.
+        if metadata.uid() != fs::metadata(home.root())?.uid() || metadata.mode() & 0o022 != 0 {
+            return Err(invalid(
+                "runtime-key recovery directory has unsafe ownership or access",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    crate::platform_fs::validate_private_directory(&keys)?;
+    let children = fs::read_dir(&keys)?.collect::<Result<Vec<_>, _>>()?;
+    if children.len() != 1 || children[0].file_name() != "runtime.key" {
+        return Ok(false);
+    }
+    crate::platform_fs::validate_private_file(&home.runtime_key_path())?;
+    if fs::symlink_metadata(home.runtime_key_path())?.len() != 32 {
+        return Err(invalid(
+            "runtime-key recovery sidecar must be a 32-byte signing key",
+        ));
+    }
+    Ok(true)
+}
+
+fn invalid(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests;

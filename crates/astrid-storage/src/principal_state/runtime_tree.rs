@@ -17,6 +17,9 @@ use super::{
 };
 
 use super::runtime_tree_active as active;
+mod key_recovery;
+#[cfg(test)]
+mod key_recovery_tests;
 mod projection;
 use projection::{confined_projection_path, write_projection_file};
 
@@ -789,6 +792,11 @@ pub(super) fn reconcile_running_projection(
         return Ok(());
     }
 
+    if !allow_receiptless_bootstrap && key_recovery::recover(home, store)? {
+        restore_projection(home, store, &store.content)?;
+        establish_active_receipt(home, store)?;
+        return Ok(());
+    }
     let surviving = validate_surviving_projection(home.root(), home.root())?;
     let receipt = active::read_relocatable(home, store)?;
     match receipt {
