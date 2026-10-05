@@ -29,6 +29,7 @@ mod activation;
 mod authority;
 mod checkpoint;
 mod format;
+mod index_validation;
 mod recovery;
 
 use activation::{append_new_reachable_map_nodes, build_initial_state, generation_name};
@@ -716,24 +717,7 @@ impl RepresentationStore {
         index: &BTreeMap<ObjectId, ArenaLocation>,
     ) -> Result<(), DurableError> {
         let direct = self.direct_arena_locations()?;
-        for object in self.reverse.keys() {
-            let location =
-                index
-                    .get(object)
-                    .copied()
-                    .ok_or(DurableError::InvalidRepresentationState(
-                        "direct representation names a missing logical object",
-                    ))?;
-            if !direct
-                .iter()
-                .any(|(covered, candidate)| *covered == *object && *candidate == location)
-            {
-                return Err(DurableError::InvalidRepresentationState(
-                    "generation-zero placement disagrees with the arena index",
-                ));
-            }
-        }
-        Ok(())
+        index_validation::validate(&direct, index)
     }
 
     fn direct_arena_locations(&self) -> Result<Vec<(ObjectId, ArenaLocation)>, DurableError> {
