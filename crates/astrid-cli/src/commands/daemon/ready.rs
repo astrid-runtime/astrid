@@ -17,8 +17,8 @@ pub(super) const DAEMON_READY_POLL: Duration = Duration::from_millis(DAEMON_READ
 /// a PID: the existing metadata and handshake checks still bind the workspace.
 pub(super) fn ensure_recorded_daemon_running() -> anyhow::Result<()> {
     anyhow::ensure!(
-        super::recorded_daemon_pid_is_alive(),
-        "Astrid daemon is not running; run `astrid start`"
+        super::daemon_control::recorded_process_matches(&astrid_uplink::socket_client::pid_path()),
+        "Astrid daemon is not running or its recorded process identity is stale; run `astrid start`"
     );
     Ok(())
 }
