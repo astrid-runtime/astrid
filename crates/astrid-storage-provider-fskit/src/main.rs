@@ -23,11 +23,15 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(any(test, target_os = "macos"))]
 mod mount_failure;
+#[cfg(target_os = "macos")]
+mod native_unmount;
 mod provider_failure;
 mod service;
 
 #[cfg(target_os = "macos")]
 use mount_failure::{classify_native_mount_failure, native_mount_failure_message};
+#[cfg(target_os = "macos")]
+pub(crate) use native_unmount::unmount as native_unmount;
 
 const PROVIDER_NAME: &str = "astrid-storage-provider-fskit";
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
@@ -569,19 +573,6 @@ pub(crate) fn native_mount(
     std::future::ready(Err(anyhow::anyhow!(
         "the FSKit provider is available only on macOS"
     )))
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) async fn native_unmount(mountpoint: &Path) -> Result<()> {
-    let status = tokio::process::Command::new("/sbin/umount")
-        .arg(mountpoint)
-        .status()
-        .await
-        .context("invoke macOS unmount")?;
-    if !status.success() {
-        bail!("macOS unmount failed with {status}");
-    }
-    Ok(())
 }
 
 #[cfg(target_os = "macos")]

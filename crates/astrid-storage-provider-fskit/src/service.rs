@@ -23,11 +23,12 @@ const MAX_LAUNCH_BYTES: u64 = 64 * 1024;
 const MAX_CONTROL_BYTES: usize = 64 * 1024;
 const MAX_CALLBACK_BYTES: usize = 8 * 1024 * 1024;
 const SERVICE_POLL: Duration = Duration::from_secs(1);
-/// Confirm native unmount before advertising `Stopped`. Bounded to stay under
-/// the broker's 10s STOP acknowledgement timeout; not operator-configurable
-/// because it is a protocol liveness ceiling, not a host policy knob.
-const UNMOUNT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
-const UNMOUNT_CONFIRM_INTERVAL: Duration = Duration::from_millis(50);
+/// Busy retries and native-state confirmation share this budget before
+/// advertising `Stopped`, below the broker's 10s STOP acknowledgement timeout.
+/// It is a protocol liveness ceiling, not an operator policy knob. An in-flight
+/// native syscall is not cancelled: a late unmount must not outlive its owner.
+pub(crate) const UNMOUNT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const UNMOUNT_CONFIRM_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case", tag = "operation", deny_unknown_fields)]
@@ -277,16 +278,20 @@ async fn service_loop(
                         (ControlResponse::Ready, false)
                     },
                     ControlRequest::Stop { token } if token == launch.parent.token => {
+                        let started = std::time::Instant::now();
                         let response = match crate::native_unmount(&launch.mountpoint).await {
-                            Ok(()) => match wait_until_unmounted(&launch.mountpoint).await {
+                            Ok(()) => match wait_until_unmounted(
+                                &launch.mountpoint,
+                                UNMOUNT_CONFIRM_TIMEOUT.saturating_sub(started.elapsed()),
+                            ).await {
                                 Ok(()) => {
                                     *mounted = false;
                                     let _ = local_transport::remove_endpoint(&launch.control_path);
                                     ControlResponse::Stopped
                                 },
-                                Err(error) => unmount_failure(error),
+                                Err(error) => unmount_failure(&error),
                             },
-                            Err(error) => unmount_failure(error),
+                            Err(error) => unmount_failure(&error),
                         };
                         (response, true)
                     },
@@ -318,10 +323,10 @@ fn confirm_unmount_state(still_active: bool, validated: Result<()>) -> Result<()
     Ok(())
 }
 
-fn unmount_failure(error: impl std::fmt::Display) -> ControlResponse {
+fn unmount_failure(error: &anyhow::Error) -> ControlResponse {
     ControlResponse::Failure {
         code: "unmount".to_owned(),
-        message: error.to_string().chars().take(4096).collect(),
+        message: crate::provider_failure::provider_failure(error).message,
     }
 }
 
@@ -341,12 +346,15 @@ where
         match confirm_unmount_state(still_active, validated) {
             Ok(()) => return Ok(()),
             Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
-            Err(_) => tokio::time::sleep(interval).await,
+            Err(_) => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                tokio::time::sleep(interval.min(remaining)).await;
+            },
         }
     }
 }
 
-async fn wait_until_unmounted(mountpoint: &Path) -> Result<()> {
+async fn wait_until_unmounted(mountpoint: &Path, timeout: Duration) -> Result<()> {
     wait_until_unmounted_with(
         || {
             let still_active = crate::native_mount_is_active(mountpoint)?;
@@ -355,7 +363,7 @@ async fn wait_until_unmounted(mountpoint: &Path) -> Result<()> {
                 crate::validate_unmounted_mountpoint(mountpoint),
             ))
         },
-        UNMOUNT_CONFIRM_TIMEOUT,
+        timeout,
         UNMOUNT_CONFIRM_INTERVAL,
     )
     .await
@@ -476,6 +484,19 @@ fn validate_launch_parent(
 mod tests {
     use super::*;
 
+    #[test]
+    fn unmount_control_failure_preserves_native_cause() {
+        let error = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ResourceBusy))
+            .context("unmount native filesystem /private/qa/mount");
+        let ControlResponse::Failure { code, message } = unmount_failure(&error) else {
+            panic!("failed unmount must remain a failure");
+        };
+        assert_eq!(code, "unmount");
+        assert!(message.contains("busy"), "{message}");
+        assert!(message.contains("/private/qa/mount"));
+        assert!(message.len() <= 4096);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "requires an explicit disposable live FSKit lease manifest"]
@@ -579,7 +600,7 @@ mod tests {
         let mountpoint = root.path().join("mount");
         astrid_core::platform_fs::ensure_private_directory(&mountpoint)
             .expect("private mountpoint");
-        wait_until_unmounted(&mountpoint)
+        wait_until_unmounted(&mountpoint, UNMOUNT_CONFIRM_TIMEOUT)
             .await
             .expect("empty private directory is not an astridfs mount");
     }
