@@ -31,7 +31,7 @@ use tokio::io::AsyncWriteExt;
 
 use framing::FramedReader;
 use handshake::AuthenticatedIdentity;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use input::input_chat_session;
 use input::{PendingInput, complete_pending, handle_connection_input, wait_pending};
 
@@ -584,7 +584,7 @@ async fn forward_connection_egress(
 
 /// Private replies must be consumed before ordinary bus admission. Even an
 /// unsupported/expired reply gets a direct rejection, never an IPC fallback.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn route_connection_message(
     writer: &mut LocalWriteHalf,
     event_bus: &EventBus,
