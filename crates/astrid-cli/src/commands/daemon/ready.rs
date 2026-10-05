@@ -12,6 +12,17 @@ use std::time::Duration;
 pub(super) const DAEMON_READY_POLL_MILLIS: u64 = 50;
 pub(super) const DAEMON_READY_POLL: Duration = Duration::from_millis(DAEMON_READY_POLL_MILLIS);
 
+/// Missing readiness can mean either booting or stopped; only a live recorded
+/// daemon can make progress. This does not authenticate a connection or signal
+/// a PID: the existing metadata and handshake checks still bind the workspace.
+pub(super) fn ensure_recorded_daemon_running() -> anyhow::Result<()> {
+    anyhow::ensure!(
+        super::recorded_daemon_pid_is_alive(),
+        "Astrid daemon is not running; run `astrid start`"
+    );
+    Ok(())
+}
+
 pub(super) const fn readiness_attempts(timeout_secs: u64, poll_millis: u64) -> u64 {
     match timeout_secs.checked_mul(1_000) {
         Some(timeout_millis) => timeout_millis.div_ceil(poll_millis),
