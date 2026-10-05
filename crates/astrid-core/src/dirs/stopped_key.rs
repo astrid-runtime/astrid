@@ -13,12 +13,15 @@ pub(super) fn recognize(home: &AstridHome) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    if entries.len() != 2
+    if !matches!(entries.len(), 2 | 3)
         || !entries
             .iter()
             .any(|entry| entry.file_name() == "astrid.volume")
         || !entries.iter().any(|entry| entry.file_name() == "keys")
     {
+        return Ok(false);
+    }
+    if entries.len() == 3 && !only_boot_singleton(home)? {
         return Ok(false);
     }
     crate::platform_fs::validate_private_directory(home.root())?;
@@ -55,6 +58,22 @@ pub(super) fn recognize(home: &AstridHome) -> io::Result<bool> {
             "runtime-key recovery sidecar must be a 32-byte signing key",
         ));
     }
+    Ok(true)
+}
+
+fn only_boot_singleton(home: &AstridHome) -> io::Result<bool> {
+    let run = home.root().join("run");
+    if !run.try_exists()? {
+        return Ok(false);
+    }
+    // Boot acquires this private singleton before storage restore. Accept
+    // only that ephemeral inode, not an arbitrary surviving run projection.
+    crate::platform_fs::validate_private_directory(&run)?;
+    let entries = fs::read_dir(&run)?.collect::<Result<Vec<_>, _>>()?;
+    if entries.len() != 1 || entries[0].file_name() != "system.lock" {
+        return Ok(false);
+    }
+    crate::platform_fs::validate_private_file(&run.join("system.lock"))?;
     Ok(true)
 }
 

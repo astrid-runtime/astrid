@@ -72,6 +72,12 @@ async fn stopped_volume_recovers_replacement_key_without_changing_identity() {
 
     home.ensure().expect("recognize stopped-key recovery shape");
     assert!(home.validate_runtime_identity_provisioning().is_err());
+    // The default daemon boot takes its singleton lock before opening storage.
+    // Its private lock directory is ephemeral, not a surviving projection.
+    let boot_run = home.root().join("run");
+    astrid_core::platform_fs::ensure_private_directory(&boot_run).unwrap();
+    astrid_core::platform_fs::atomic_write_private_file(&boot_run.join("system.lock"), b"")
+        .unwrap();
     let store = open_runtime_principal_store(&home, quota()).await.unwrap();
     assert_eq!(std::fs::read(home.runtime_key_path()).unwrap(), [7; 32]);
     let name = ContentName::new(format!(

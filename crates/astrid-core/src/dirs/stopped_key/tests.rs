@@ -32,6 +32,18 @@ fn malformed_key_lengths_remain_rejected_and_unchanged() {
     }
 }
 
+#[test]
+fn boot_singleton_is_allowed_but_other_run_state_is_not() {
+    let (_root, home) = fixture();
+    let run = home.root().join("run");
+    crate::platform_fs::ensure_private_directory(&run).unwrap();
+    assert!(!recognize(&home).unwrap());
+    crate::platform_fs::atomic_write_private_file(&run.join("system.lock"), b"").unwrap();
+    assert!(recognize(&home).unwrap());
+    crate::platform_fs::atomic_write_private_file(&run.join("system.ready"), b"ready").unwrap();
+    assert!(!recognize(&home).unwrap());
+}
+
 #[cfg(unix)]
 #[test]
 fn unsafe_access_and_redirects_remain_rejected() {
