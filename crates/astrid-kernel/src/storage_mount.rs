@@ -39,9 +39,9 @@ use tokio::sync::watch;
 use crate::Kernel;
 
 mod admin_projection;
-mod filesystem;
 #[cfg(target_os = "macos")]
-use astrid_core::fskit_socket;
+mod callback_resolver;
+mod filesystem;
 mod volume_info;
 use filesystem::{CallbackFilesystem, PrefixedFilesystem, execute_blocking};
 #[cfg(any(unix, windows))]
@@ -187,7 +187,7 @@ pub(crate) async fn issue_lease(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     #[cfg(target_os = "macos")]
     let callback_path = if provider == "astrid-storage-provider-fskit" {
-        fskit_socket::callback_path(mount_id)?
+        callback_resolver::resolve(mount_id).await?
     } else {
         resource_path.join("control.sock")
     };
