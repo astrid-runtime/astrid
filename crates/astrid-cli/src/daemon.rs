@@ -4,6 +4,12 @@
 //! identical to the standalone `astrid-daemon` binary but co-installed with
 //! the CLI so `find_companion_binary("astrid-daemon")` always finds it.
 
+// Keep the co-installed daemon's allocator in step with the standalone binary:
+// parallel Cranelift workers otherwise contend on MUSL's shared malloc lock.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Detach the daemon into its own session as the very first action — before the
 /// async runtime is built or any boot work runs.
 ///

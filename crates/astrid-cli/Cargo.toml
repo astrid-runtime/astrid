@@ -24,6 +24,9 @@ path = "src/build.rs"
 name = "astrid-emit"
 path = "src/emit.rs"
 
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { workspace = true }
+
 [dependencies]
 astrid-build = { workspace = true }
 astrid-emit = { workspace = true }
