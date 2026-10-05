@@ -258,6 +258,7 @@ pub(crate) async fn ensure_daemon_workspace_matches(workspace_root: Option<&Path
         match std::fs::read_to_string(&ready_path) {
             Ok(metadata) => return validate_daemon_workspace_metadata(&metadata, &expected),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ready::ensure_recorded_daemon_running()?;
                 tokio::time::sleep(DAEMON_READY_POLL).await;
             },
             Err(error) => {

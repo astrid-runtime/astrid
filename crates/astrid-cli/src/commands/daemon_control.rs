@@ -53,6 +53,16 @@ pub(crate) fn read_pid_file(pid_path: &Path) -> Option<(u32, Option<PathBuf>)> {
     parse_pid_file(&contents)
 }
 
+/// A recorded PID can become ready only while it still identifies the recorded
+/// executable. This is a non-signalling probe; reused or incomplete records
+/// must not justify waiting for an unrelated process to boot a daemon.
+pub(crate) fn recorded_process_matches(pid_path: &Path) -> bool {
+    read_pid_file(pid_path).is_some_and(|(pid, recorded_exe)| {
+        is_process_alive(pid)
+            && exe_matches(recorded_exe.as_deref(), exe_path_of_pid(pid).as_deref())
+    })
+}
+
 /// A captured daemon generation. The nonce is minted and published while the
 /// singleton lock is held; PID and executable path alone do not own it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -434,6 +444,22 @@ pub(crate) async fn wait_for_exit(pid: u32, budget: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn readiness_probe_requires_the_recorded_live_executable() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("system.pid");
+        assert!(!recorded_process_matches(&path));
+        let pid = std::process::id();
+        std::fs::write(&path, format!("{pid}\n")).unwrap();
+        assert!(!recorded_process_matches(&path));
+        std::fs::write(&path, format!("{pid}\n/nonexistent/astrid-daemon\n")).unwrap();
+        assert!(!recorded_process_matches(&path));
+        let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
+        std::fs::write(&path, format!("{pid}\n{}\n", exe.display())).unwrap();
+        assert!(recorded_process_matches(&path));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
