@@ -289,9 +289,9 @@ async fn service_loop(
                                     let _ = local_transport::remove_endpoint(&launch.control_path);
                                     ControlResponse::Stopped
                                 },
-                                Err(error) => unmount_failure(error),
+                                Err(error) => unmount_failure(&error),
                             },
-                            Err(error) => unmount_failure(error),
+                            Err(error) => unmount_failure(&error),
                         };
                         (response, true)
                     },
@@ -323,10 +323,10 @@ fn confirm_unmount_state(still_active: bool, validated: Result<()>) -> Result<()
     Ok(())
 }
 
-fn unmount_failure(error: impl std::fmt::Display) -> ControlResponse {
+fn unmount_failure(error: &anyhow::Error) -> ControlResponse {
     ControlResponse::Failure {
         code: "unmount".to_owned(),
-        message: error.to_string().chars().take(4096).collect(),
+        message: crate::provider_failure::provider_failure(error).message,
     }
 }
 
@@ -483,6 +483,19 @@ fn validate_launch_parent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unmount_control_failure_preserves_native_cause() {
+        let error = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ResourceBusy))
+            .context("unmount native filesystem /private/qa/mount");
+        let ControlResponse::Failure { code, message } = unmount_failure(&error) else {
+            panic!("failed unmount must remain a failure");
+        };
+        assert_eq!(code, "unmount");
+        assert!(message.contains("busy"), "{message}");
+        assert!(message.contains("/private/qa/mount"));
+        assert!(message.len() <= 4096);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
