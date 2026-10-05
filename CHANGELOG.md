@@ -8,6 +8,101 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ## [Unreleased]
 
+## [2026.10.0] - 2026-10-05
+
+### Added
+
+- Add accountable users for principals and optional shared user WASM fuel-rate
+  budgets across their principals. Accounting covers initialization, lifecycle
+  hooks, foreground calls and background execution. Unambiguous local ownership
+  migrates automatically; existing ownership is preserved, and personal installs
+  without configured budgets retain their scheduling behavior. These are
+  cooperative fuel-rate budgets with retained debt, not strict instantaneous
+  ceilings or limits on all host/subprocess CPU time.
+- Add `astrid quota set --cpu-rate` with decimal SI rate input while preserving
+  other quota fields and existing authorization.
+- Add principal-scoped capsule update discovery with
+  `astrid capsule update --check --json`. It distinguishes unavailable checks and
+  unsupported publisher layouts from current versions without installing or
+  granting anything.
+- Add signed `astrid audit heads` snapshots and paged `astrid audit export`,
+  including signing bytes, chain hashes, signatures and retained prune receipts.
+  Successful read-only queries do not append new audit entries.
+- Record kernel-mediated HTTP exchanges, capsule tool calls, approval prompts
+  and decisions, capability changes, capsule installation and runtime loads.
+  HTTP records commit before sending and complete with response commitments;
+  credentials are redacted. Manifest-declared secrets can be injected into HTTP
+  headers by the host without entering guest memory or audit commitments.
+- Add opt-in audit entry format v2 with deterministic CBOR, salted field
+  commitments, SHA-256 entry hashes and a dedicated audit key verified through a
+  cross-signed key registry. Existing v1 history remains unchanged; v2 chains
+  link to it, and enabling v2 refuses subsequent v1 appends.
+- Add external audit anchoring watermarks, anchor-status reporting and optional
+  archive-before-prune retention. With `require_anchor`, unanchored history is
+  retained even above the storage cap and reported as degraded rather than
+  silently deleted. Existing default retention remains available without that
+  operator setting.
+
+### Fixed
+
+- Bound hosted volume dirty-commit extent-map amplification and reclaim
+  superseded physical representation metadata and root records during
+  compaction. Atomic checkpoints preserve current identities, generations and
+  complete compaction evidence across interrupted publication. Explicit KV
+  compaction checkpoints pending deltas so overwritten values can be reclaimed.
+  Stores compacted with the new checkpoint reader cannot be reopened by older
+  readers limited to the initial representation-journal generation.
+- Avoid quadratic recovered-index validation while preserving missing-object
+  and placement-mismatch checks. Preserve the shared native-mount resource
+  directory when retiring a lease so concurrent mount creation can finish.
+- Resume legacy environment and secret migration after already-imported source
+  scopes have retired, preserving imported values and completion receipts.
+- Preserve principal-owned capsule configuration when granting access to an
+  existing installation. Inherited assignment and explicit installs are
+  serialized; configuration copying is bounded and failed publication rolls
+  back newly inherited values.
+- Restore the runtime before inspecting capsule signing identity when installing
+  into a stopped volume-only home. Inspection excludes concurrent stop, and an
+  authenticated connection keeps an ephemeral runtime alive through approval
+  and installation. CLI diagnostics remain on stderr instead of creating runtime
+  log sidecars before admission or during retirement.
+- Wait for acknowledged daemon shutdown and durable finalization before
+  identity-checked termination. Stopped principal discovery reports the required
+  start instead of waiting on missing readiness metadata.
+- Queue concurrent capsule invocations when CPU capacity is temporarily reserved
+  and wake them when capacity settles, preserving both principal and accountable
+  user limits. Concurrent tool discovery no longer silently loses providers.
+- Avoid MUSL daemon allocator contention during parallel capsule compilation
+  without reducing compiler parallelism or changing guest CPU budgets.
+- Treat completed nonzero capsule sleeps as cooperative watchdog progress while
+  keeping zero-duration sleeps and CPU-spinning loops bounded.
+- Preserve bounded, ordered IPC streaming delivery during provider bursts.
+  Publishers wait for capacity rather than silently dropping deltas or terminal
+  events; cancellation, shutdown and capsule retirement fence uncommitted work.
+- Recover abandoned native chat turns after cancellation and admit subsequent
+  input without letting delayed responses complete a newer turn. Preserve
+  management and human-reply ownership, return explicit local refusal responses,
+  and validate autonomous timeout completions against their bound turn owner.
+- Resolve `.` and `./file` as capsule storage-backed workspace paths while still
+  rejecting parent traversal.
+- Record host audit calls in order, with signed loss and shutdown-gap accounting.
+  Optional write-ahead audit classes deny an effect if its durable entry cannot
+  be recorded. Preserve complete physical-compaction evidence while archive
+  delivery is pending; exported v2 hashes now match the SHA-256 hashes used by
+  their chains, while v1 hashes remain unchanged.
+- Refresh linked-worktree build-provenance metrics when the selected commit
+  changes, including packed refs. Improve runtime shutdown failure diagnostics
+  and keep Windows named-pipe test helpers warning-free.
+
+### Security
+
+- Update Wasmtime and WASI to 48.0.4, incorporating the September and October
+  runtime security updates without changing the runtime major version.
+- Prevent self-scoped quota updates from increasing allocations without global
+  quota authority, including restricted-device and stale-allocation requests.
+- Discard interrupted WASM interceptor instances and deny ordered execution when
+  a guest fails before producing a decision.
+
 ## [2026.9.4] - 2026-09-20
 
 ### Fixed
