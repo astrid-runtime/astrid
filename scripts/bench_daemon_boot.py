@@ -14,8 +14,50 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import time
+
+
+def current_boot_records(text, started_at):
+    """Parse timestamped tracing events, not presentation-specific suffixes.
+
+    Stopped volumes restore historical logs at start, so offsets captured in the
+    stopped projection cannot exclude that history. Filter parsed event times.
+    Pretty-format location/span continuation lines are not independent events.
+    """
+    for raw in text.splitlines():
+        line = re.sub(r'\x1b\[[0-9;]*m', '', raw).strip()
+        if line.startswith('{'):
+            record = json.loads(line)
+            timestamp = record.get('timestamp')
+            fields = record.get('fields', {})
+            message = fields.get('message', '')
+            capsules = fields.get('capsules')
+        else:
+            match = re.match(r'(\d{4}-\d{2}-\d{2}T\S+)\s+(.*)', line)
+            if match is None:
+                continue
+            timestamp, message = match.groups()
+            count = re.search(r'\bcapsules\s*[=:]\s*(\d+)\b', message)
+            capsules = int(count.group(1)) if count else None
+        if timestamp is None:
+            raise ValueError('benchmark requires timestamped daemon events')
+        event_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        if event_time.tzinfo is None:
+            raise ValueError('benchmark requires timezone-qualified daemon events')
+        if event_time >= started_at:
+            yield message, capsules
+
+
+def assert_boot_inventory(text, started_at, expected):
+    records = list(current_boot_records(text, started_at))
+    ready = [(message, count) for message, count in records if 'Agent loop ready' in message]
+    assert any(count == expected for _, count in ready), ready
+    loaded = sum('Registered authority-scoped capsule runtime' in message
+                 for message, _ in records)
+    assert loaded == expected, loaded
+    return loaded
 
 
 def main():
@@ -43,7 +85,7 @@ def main():
         'available_cpus': os.cpu_count(), 'expected_capsules': args.capsules,
         'max_seconds': args.max_seconds, 'compiler_threads_override': None,
     }
-    stamp = datetime.now(timezone.utc).isoformat(timespec='microseconds').replace('+00:00', 'Z')
+    started_at = datetime.now(timezone.utc)
     timeout = args.max_seconds or 600
     try:
         start = time.monotonic()
@@ -57,14 +99,13 @@ def main():
         result.update(boot_seconds=time.monotonic() - start, start_exit=boot.returncode)
         assert boot.returncode == 0, start_log.read_text()
         logs = '\n'.join(line for path in (runtime / 'log').glob('*.log')
-                         for line in path.read_text().splitlines() if line[:27] >= stamp)
-        (workspace / 'boot-benchmark-current.log').write_text(logs + '\n')
-        ready = [line for line in logs.splitlines() if 'Agent loop ready' in line]
-        assert any(line.endswith(f'capsules={args.capsules}') for line in ready), ready
-        loaded = [line for line in logs.splitlines()
-                  if 'Registered authority-scoped capsule runtime' in line]
-        assert len(loaded) == args.capsules, len(loaded)
-        result['loaded_capsules'] = len(loaded)
+                         for line in path.read_text().splitlines())
+        (workspace / 'boot-benchmark-source.log').write_text(logs + '\n')
+        current = [{'message': message, 'capsules': count}
+                   for message, count in current_boot_records(logs, started_at)]
+        (workspace / 'boot-benchmark-current.log').write_text(
+            '\n'.join(json.dumps(record) for record in current) + '\n')
+        result['loaded_capsules'] = assert_boot_inventory(logs, started_at, args.capsules)
         if args.max_seconds is not None:
             assert result['boot_seconds'] <= args.max_seconds
     finally:
