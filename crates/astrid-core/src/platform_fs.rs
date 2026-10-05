@@ -9,6 +9,10 @@ use std::collections::HashSet;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(target_os = "macos")]
+#[path = "platform_fs/macos_acl.rs"]
+mod macos_acl;
+
 #[cfg(windows)]
 #[path = "platform_fs/windows.rs"]
 mod windows;
@@ -574,57 +578,12 @@ fn validate_private_file_unix(path: &Path) -> io::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn remove_extended_acl_macos(path: &Path) -> io::Result<()> {
-    let path = absolute_command_path(path)?;
-    let status = std::process::Command::new("/bin/chmod")
-        .arg("-N")
-        .arg(path)
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(
-            "failed to remove extended access-control list",
-        ))
-    }
+    macos_acl::remove(path)
 }
 
 #[cfg(target_os = "macos")]
 fn validate_no_extended_acl_macos(path: &Path) -> io::Result<()> {
-    let path = absolute_command_path(path)?;
-    let output = std::process::Command::new("/bin/ls")
-        .arg("-lde")
-        .arg(path)
-        .env("LC_ALL", "C")
-        .output()?;
-    if !output.status.success() {
-        return Err(io::Error::other(
-            "failed to inspect extended access-control list",
-        ));
-    }
-    let listing = String::from_utf8(output.stdout)
-        .map_err(|_| io::Error::other("access-control listing is not UTF-8"))?;
-    let has_acl_entry = listing.lines().skip(1).any(|line| {
-        line.trim_start()
-            .split_once(':')
-            .is_some_and(|(index, _)| index.parse::<usize>().is_ok())
-    });
-    if has_acl_entry {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "private path has an extended access-control list",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn absolute_command_path(path: &Path) -> io::Result<PathBuf> {
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
-    } else {
-        Ok(std::env::current_dir()?.join(path))
-    }
+    macos_acl::validate(path)
 }
 
 #[cfg(unix)]
