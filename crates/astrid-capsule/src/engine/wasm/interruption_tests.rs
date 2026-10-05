@@ -72,6 +72,57 @@ async fn engine(max: usize) -> WasmEngine {
     engine_with_pause(max, Arc::new(tokio::sync::Notify::new())).await
 }
 
+#[tokio::test]
+async fn admission_wait_spends_the_real_guest_invocation_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path().to_path_buf());
+    let principal = astrid_core::PrincipalId::default();
+    let mut profile = astrid_core::profile::PrincipalProfile::default();
+    profile.quotas.max_timeout_secs = 1;
+    profile.quotas.max_cpu_fuel_per_sec = 20_000_000_000;
+    profile.save(&home, &principal).unwrap();
+    let mut engine = engine(2).await;
+    engine.profile_cache = Some(Arc::new(
+        crate::profile_cache::PrincipalProfileCache::with_home(home),
+    ));
+    let mut occupied = engine
+        .fuel_rate
+        .try_reserve(
+            &principal,
+            20_000_000_000,
+            20_000_000_000,
+            std::time::Instant::now(),
+        )
+        .unwrap();
+    let ticking = engine.wasmtime_engine.clone().unwrap();
+    // Match production's independent epoch thread: a current-thread async
+    // ticker cannot interrupt a guest which has not yet yielded to its executor.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped = Arc::clone(&stop);
+    let ticker = std::thread::spawn(move || {
+        while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(super::EPOCH_TICK_INTERVAL);
+            ticking.increment_epoch();
+        }
+    });
+    let started = std::time::Instant::now();
+    let (result, ()) = tokio::join!(engine.invoke_interceptor("fuel", &[], None), async {
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        occupied.settle(0, std::time::Instant::now());
+    },);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    ticker.join().unwrap();
+    assert!(
+        matches!(result, Ok(InterceptResult::Deny { .. })),
+        "{result:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1400),
+        "queued admission must not grant another full guest deadline: {:?}",
+        started.elapsed()
+    );
+}
+
 async fn engine_with_pause(max: usize, entered: Arc<tokio::sync::Notify>) -> WasmEngine {
     let wasm = build_wasmtime_engine().expect("engine");
     let component = wasmtime::component::Component::new(&wasm, COMPONENT).expect("component");

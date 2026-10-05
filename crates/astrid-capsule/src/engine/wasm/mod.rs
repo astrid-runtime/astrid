@@ -3613,7 +3613,8 @@ impl ExecutionEngine for WasmEngine {
                 .map_or(astrid_core::profile::DEFAULT_MAX_TIMEOUT_SECS, |profile| {
                     profile.quotas.max_timeout_secs
                 }),
-        );
+        )
+        .saturating_sub(invoke_start.elapsed());
         let mut fuel_reservation = match execution_allocation
             .reserve_with_timeout(allowance, admission_timeout)
             .await
@@ -3726,14 +3727,18 @@ impl ExecutionEngine for WasmEngine {
                 });
 
             if !is_daemon {
-                let deadline = applied_profile.quotas.max_timeout_secs.saturating_mul(1000)
-                    / EPOCH_TICK_INTERVAL.as_millis() as u64;
+                // Admission and pool checkout spend the same invocation budget
+                // as guest execution; neither can grant a second full timeout.
+                let remaining =
+                    std::time::Duration::from_secs(applied_profile.quotas.max_timeout_secs)
+                        .saturating_sub(invoke_start.elapsed());
+                let deadline = remaining.as_millis() / EPOCH_TICK_INTERVAL.as_millis();
                 // Component initialization may have installed the exempt
                 // continue callback. A short-lived interceptor invocation is
                 // always deadline-bound, so restore Wasmtime's trapping policy
                 // before applying its caller-profile timeout.
                 s.epoch_deadline_trap();
-                s.set_epoch_deadline(deadline);
+                s.set_epoch_deadline(u64::try_from(deadline).unwrap_or(u64::MAX));
             }
 
             // Bind the authenticated caller before guest execution. Accounted

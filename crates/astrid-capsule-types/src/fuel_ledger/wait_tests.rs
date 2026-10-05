@@ -1,6 +1,43 @@
 use super::*;
 
 #[test]
+fn pruning_preserves_registered_waiters_and_their_settlement_notification() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    let limiter = FuelRateLimiter::default();
+    let owner = PrincipalId::new("waiting").unwrap();
+    let base = Instant::now();
+    let mut changed = std::pin::pin!(limiter.capacity_changed(&owner));
+    for index in 0..=PRUNE_THRESHOLD {
+        limiter.inner.insert(
+            PrincipalId::new(format!("stale-{index}")).unwrap(),
+            Mutex::new(FuelWindow {
+                window_start: base,
+                fuel_in_window: 0,
+                available: Arc::new(Event::new()),
+            }),
+        );
+    }
+    *limiter.last_prune.lock() = base;
+    limiter.maybe_prune(base + Duration::from_mins(2));
+    assert!(
+        limiter.inner.contains_key(&owner),
+        "registered waiter must retain its event"
+    );
+    assert_eq!(limiter.inner.len(), 1);
+    let mut held = limiter.try_reserve(&owner, 100, 100, base).unwrap();
+    held.settle(10, base);
+    assert_eq!(
+        changed
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(())
+    );
+    assert!(limiter.try_reserve(&owner, 100, 90, base).is_some());
+}
+
+#[test]
 fn settlement_after_registration_is_observed_before_listener_is_polled() {
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
