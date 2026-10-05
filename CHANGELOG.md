@@ -47,6 +47,9 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ### Fixed
 
+- Resolve the macOS FSKit callback container on a blocking worker so a stalled
+  filesystem permission request does not block unrelated async admin work.
+  Canonical-path and private-directory validation remain unchanged.
 - Bound hosted volume dirty-commit extent-map amplification and reclaim
   superseded physical representation metadata and root records during
   compaction. Atomic checkpoints preserve current identities, generations and
