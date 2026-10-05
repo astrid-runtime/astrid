@@ -14,7 +14,7 @@ use astrid_storage::storage_model::{ObjectId, ObjectIdentity, ObjectRecord};
 use astrid_storage::{
     Blake3ObjectIdentityV1, ChunkingProfile, ContentName, KvQuotaResolver,
     NativeContentStagingArea, NativePrincipalContentStore, ObjectCacheCapacity, ObjectCacheConfig,
-    ObjectCacheController, RuntimePrincipalStore, StateOwner, open_runtime_principal_store,
+    ObjectCacheController, RuntimePrincipalStore, StateOwner,
     open_runtime_principal_store_with_object_cache,
 };
 
@@ -290,6 +290,12 @@ async fn benchmark_runtime(
             source_digest,
         )?);
 
+        // A disabled benchmark must not silently retain decoded data after
+        // real reads. This also guards the provenance printed by the runner.
+        if config.object_cache_bytes.is_none() && store.object_cache_stats().resident_bytes != 0 {
+            return Err("disabled-cache benchmark retained decoded objects".into());
+        }
+
         drop(store);
         let started = Instant::now();
         let reopened = open_store(&home, config.object_cache_bytes).await?;
@@ -481,7 +487,8 @@ fn authoritative_store_bytes(home: &AstridHome) -> BenchResult<u64> {
 
 async fn benchmark_volume_authority_validation(home: &AstridHome) -> BenchResult<Duration> {
     let started = Instant::now();
-    let store = open_store(home, Some(0)).await?;
+    // Explicitly disable retention: the runtime default is a bounded cache.
+    let store = open_store(home, None).await?;
     let elapsed = started.elapsed();
     store.kv().close().await?;
     Ok(elapsed)
@@ -673,9 +680,13 @@ async fn open_store(
 ) -> BenchResult<RuntimePrincipalStore> {
     let quota: Arc<dyn KvQuotaResolver<StateOwner>> = Arc::new(|_: &StateOwner| Ok(None));
     let Some(bytes) = object_cache_bytes else {
-        return open_runtime_principal_store(home, quota)
-            .await
-            .map_err(Into::into);
+        return open_runtime_principal_store_with_object_cache(
+            home,
+            quota,
+            ObjectCacheConfig::disabled(),
+        )
+        .await
+        .map_err(Into::into);
     };
     let capacity = ObjectCacheCapacity::Bounded(
         NonZeroU64::new(bytes).ok_or("object cache budget must be greater than zero")?,
