@@ -13,7 +13,7 @@ pub(super) fn recognize(home: &AstridHome) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    if !matches!(entries.len(), 2 | 3)
+    if !matches!(entries.len(), 2..=4)
         || !entries
             .iter()
             .any(|entry| entry.file_name() == "astrid.volume")
@@ -21,8 +21,13 @@ pub(super) fn recognize(home: &AstridHome) -> io::Result<bool> {
     {
         return Ok(false);
     }
-    if entries.len() == 3 && !only_boot_singleton(home)? {
-        return Ok(false);
+    for entry in &entries {
+        match entry.file_name().to_str() {
+            Some("astrid.volume" | "keys") => {},
+            Some("run") if only_boot_singleton(home)? => {},
+            Some("etc") if only_sentinel_staging_directory(home)? => {},
+            _ => return Ok(false),
+        }
     }
     crate::platform_fs::validate_private_directory(home.root())?;
     crate::platform_fs::validate_private_file(&home.storage_volume_path())?;
@@ -48,6 +53,7 @@ pub(super) fn recognize(home: &AstridHome) -> io::Result<bool> {
     }
     #[cfg(not(unix))]
     crate::platform_fs::validate_private_directory(&keys)?;
+    crate::platform_fs::validate_no_extended_acl(&keys)?;
     let children = fs::read_dir(&keys)?.collect::<Result<Vec<_>, _>>()?;
     if children.len() != 1 || children[0].file_name() != "runtime.key" {
         return Ok(false);
@@ -61,13 +67,28 @@ pub(super) fn recognize(home: &AstridHome) -> io::Result<bool> {
     Ok(true)
 }
 
+fn only_sentinel_staging_directory(home: &AstridHome) -> io::Result<bool> {
+    // Atomic sentinel projection creates this parent first. Recognition does
+    // not authorize recovery: storage requires its same-root durable intent.
+    let etc = home.root().join("etc");
+    crate::platform_fs::validate_private_directory(&etc)?;
+    for entry in fs::read_dir(etc)? {
+        let entry = entry?;
+        if !crate::platform_fs::is_private_atomic_staging_name(&entry.file_name()) {
+            return Ok(false);
+        }
+        crate::platform_fs::validate_private_file(&entry.path())?;
+    }
+    Ok(true)
+}
+
 fn only_boot_singleton(home: &AstridHome) -> io::Result<bool> {
     let run = home.root().join("run");
     if !run.try_exists()? {
         return Ok(false);
     }
     // Boot acquires this private singleton before storage restore. Accept
-    // only that ephemeral inode, not an arbitrary surviving run projection.
+    // only that persistent lockfile, not an arbitrary surviving run projection.
     crate::platform_fs::validate_private_directory(&run)?;
     let entries = fs::read_dir(&run)?.collect::<Result<Vec<_>, _>>()?;
     if entries.len() != 1 || entries[0].file_name() != "system.lock" {

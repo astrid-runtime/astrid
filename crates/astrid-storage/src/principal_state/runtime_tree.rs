@@ -254,9 +254,12 @@ pub(super) fn restore_projection(
     }
     ingest_runtime_key(home, store)?;
     seed_layout_version(home, store)?;
-    let entries = content
+    let mut entries = content
         .list(&StateOwner::System)
         .map_err(|error| tree_error(home.root(), format!("list volume projection: {error}")))?;
+    // Make subsequent interrupted restores structurally recognizable before
+    // materializing other volume-owned directories or configuration files.
+    entries.sort_by_key(|entry| entry.name().as_str() != "etc/layout-version");
     for entry in &entries {
         let name = entry.name().as_str();
         if is_excluded(name) || is_retired_legacy_projection(home, name) {

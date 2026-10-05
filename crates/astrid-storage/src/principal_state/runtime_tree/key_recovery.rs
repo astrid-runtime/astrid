@@ -14,7 +14,14 @@ pub(super) fn recover(home: &AstridHome, store: &RuntimePrincipalStore) -> Stora
     {
         return Ok(false);
     }
-    if let Some(receipt) = active::read(home, store)?
+    let receipt = active::read(home, store)?;
+    if home.root().join("etc").exists() && receipt.is_none() {
+        return Err(tree_error(
+            home.root(),
+            "partial key recovery projection has no durable recovery intent",
+        ));
+    }
+    if let Some(receipt) = receipt
         && (receipt.phase() != ReceiptPhase::Retiring
             || !receipt.contains_inventory_name(RUNTIME_KEY_PROJECTION))
     {
@@ -99,6 +106,48 @@ pub(super) fn recover(home: &AstridHome, store: &RuntimePrincipalStore) -> Stora
         .content()
         .flush()
         .map_err(|error| tree_error(home.root(), error))?;
+    // Recovery starts from a clean-stop home without an ACTIVE receipt. Before
+    // restoring any host bytes, publish the existing RETIRING inventory for
+    // this root: partial projection is volume-authoritative, never new input.
+    // Reopening then follows the ordinary RETIRING reconciliation path.
+    record_recovery_intent(home, store)?;
+    discard_sentinel_staging(home)?;
     tracing::warn!("preserved stopped-install runtime-key residue; restoring volume identity");
     Ok(true)
+}
+
+fn discard_sentinel_staging(home: &AstridHome) -> StorageResult<()> {
+    let etc = home.root().join("etc");
+    if !etc.try_exists().map_err(|error| tree_error(&etc, error))? {
+        return Ok(());
+    }
+    let directory = PrivateDirectory::open(&etc)?;
+    for name in directory.entries()? {
+        if !astrid_core::platform_fs::is_private_atomic_staging_name(&name) {
+            return Err(tree_error(
+                &etc,
+                "unexpected sentinel recovery staging entry",
+            ));
+        }
+        astrid_core::platform_fs::validate_private_file(&etc.join(&name))
+            .map_err(|error| tree_error(&etc, error))?;
+        // Resolve and remove relative to the captured private directory. The
+        // same-root RETIRING receipt was checked before reaching this cleanup;
+        // incomplete staging bytes never enter the volume catalogue.
+        let file = directory.open_file(std::path::Path::new(&name))?;
+        directory.remove_file(std::path::Path::new(&name))?;
+        drop(file);
+    }
+    directory.sync()
+}
+
+fn record_recovery_intent(home: &AstridHome, store: &RuntimePrincipalStore) -> StorageResult<()> {
+    super::seed_layout_version(home, store)?;
+    let entries = super::active_projection_entries(home, store)?;
+    let intent = super::receipt_ingest(home, ReceiptPhase::Retiring, &entries)?;
+    store.replace_contiguous_files_removing_exact(StateOwner::System, [intent], &[], None)?;
+    store
+        .content()
+        .flush()
+        .map_err(|error| tree_error(home.root(), format!("flush key recovery intent: {error}")))
 }
