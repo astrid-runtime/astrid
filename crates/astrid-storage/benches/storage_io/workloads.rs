@@ -481,7 +481,8 @@ fn authoritative_store_bytes(home: &AstridHome) -> BenchResult<u64> {
 
 async fn benchmark_volume_authority_validation(home: &AstridHome) -> BenchResult<Duration> {
     let started = Instant::now();
-    let store = open_store(home, Some(0)).await?;
+    // Use the existing disabled-cache path: bounded cache budgets cannot be zero.
+    let store = open_store(home, None).await?;
     let elapsed = started.elapsed();
     store.kv().close().await?;
     Ok(elapsed)
