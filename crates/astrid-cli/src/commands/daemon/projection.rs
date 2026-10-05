@@ -1,7 +1,28 @@
-//! Recovery retirement after an already-dead daemon, using the shared finalizer.
+//! Projection inspection and retirement under the shared lifecycle fences.
 
 use anyhow::{Context, Result};
 use astrid_core::dirs::AstridHome;
+
+/// Restore the projection and inspect it without allowing a CLI stop between
+/// readiness and the read. Interactive approval must happen after this returns.
+pub(crate) async fn with_persistent_daemon_projection<T>(
+    label: &str,
+    inspect: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let fence = super::acquire_daemon_start_fence().await?;
+    super::ensure_daemon_inner_locked(label, true, super::DaemonSpawnMode::Persistent, None)
+        .await?;
+    inspect_while_fenced(fence, inspect)
+}
+
+fn inspect_while_fenced<T>(
+    fence: std::sync::Arc<std::fs::File>,
+    inspect: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let result = inspect();
+    drop(fence);
+    result
+}
 
 /// Refuse stale healing while a daemon is still retiring its host projection.
 /// The caller holds the CLI start fence; the daemon owns the lifecycle fence
@@ -60,3 +81,6 @@ pub(super) async fn pack_stopped_projection_for_home(home: &AstridHome) -> Resul
         .await
         .context("shutdown stage durable_projection_pack")
 }
+
+#[cfg(test)]
+mod tests;

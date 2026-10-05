@@ -85,30 +85,35 @@ pub(super) async fn daemon_install_authority(
     prompt: &ManualInstallOptions,
 ) -> anyhow::Result<CapsuleInstallAuthority> {
     // The stopped home stores its identity inside the volume. Restore the
-    // daemon-owned projection before inspection can load that identity; doing
-    // inspection first would generate a new key outside the stopped volume.
-    crate::commands::daemon::ensure_persistent_daemon("capsule install authority")
-        .await
-        .context("capsule authority inspection could not ensure the runtime daemon")?;
-    let home = AstridHome::resolve()?;
-    let path = Path::new(source.strip_prefix("file://").unwrap_or(source));
-    let inspection = if path.is_file() {
-        inspect_archive_for_principal_with_layout(
-            path,
-            &home,
-            principal,
-            false,
-            crate::workspace_layout::current(),
-        )?
-    } else {
-        inspect_directory_for_principal_with_layout(
-            path,
-            &home,
-            principal,
-            false,
-            crate::workspace_layout::current(),
-        )?
-    };
+    // daemon-owned projection and retain the start fence through inspection.
+    // Otherwise a concurrent stop could retire the key before inspection reads
+    // it, generating a replacement identity outside the stopped volume.
+    let inspection = crate::commands::daemon::with_persistent_daemon_projection(
+        "capsule install authority",
+        || {
+            let home = AstridHome::resolve()?;
+            let path = Path::new(source.strip_prefix("file://").unwrap_or(source));
+            if path.is_file() {
+                inspect_archive_for_principal_with_layout(
+                    path,
+                    &home,
+                    principal,
+                    false,
+                    crate::workspace_layout::current(),
+                )
+            } else {
+                inspect_directory_for_principal_with_layout(
+                    path,
+                    &home,
+                    principal,
+                    false,
+                    crate::workspace_layout::current(),
+                )
+            }
+        },
+    )
+    .await
+    .context("capsule authority inspection could not use the runtime projection")?;
     Ok(match authority_decision(&inspection, prompt)? {
         AuthorityDecision::Automatic => CapsuleInstallAuthority::Automatic,
         AuthorityDecision::ExplicitApproval { .. } => CapsuleInstallAuthority::ExplicitApproval,
