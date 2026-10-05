@@ -12,11 +12,12 @@ use crate::commands::daemon_control;
 use crate::formatter::OutputFormat;
 use crate::{socket_client, theme};
 
-mod projection;
+pub(crate) mod projection;
 mod ready;
 mod workspace_fingerprint;
 use projection::pack_stopped_projection;
 pub(crate) use projection::retire_disconnected_projection;
+pub(crate) use projection::with_persistent_daemon_projection;
 pub(crate) use ready::disown_if_still_running;
 use ready::{
     DAEMON_READY_POLL, ReadyWaitOutcome, configured_spawn_timeout_secs, default_daemon_ready_secs,
