@@ -47,6 +47,11 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ### Fixed
 
+- Recover stopped volumes affected by older capsule installers leaving a
+  replacement runtime-key sidecar. Preserve the replacement as system-owned
+  evidence and restore only the volume's existing identity. Durable recovery
+  intent allows interrupted projection to resume, including incomplete Unix
+  layout-sentinel staging; unsafe or unrelated leftovers remain rejected.
 - Resolve the macOS FSKit callback container on a blocking worker so a stalled
   filesystem permission request does not block unrelated async admin work.
   Canonical-path and private-directory validation remain unchanged.
