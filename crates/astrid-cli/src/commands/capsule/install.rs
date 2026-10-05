@@ -483,20 +483,21 @@ async fn download_and_unpack(
     }
     std::fs::write(&download_path, &bytes)?;
     if context.daemon {
+        let (authority, _lease) = daemon_install_authority(
+            download_path
+                .to_str()
+                .context("invalid downloaded archive path")?,
+            context.principal,
+            context.prompt,
+        )
+        .await?;
         return super::install_daemon::install_local_via_daemon_outcome(
             download_path
                 .to_str()
                 .context("invalid downloaded archive path")?,
             context.prompt,
             context.principal,
-            daemon_install_authority(
-                download_path
-                    .to_str()
-                    .context("invalid downloaded archive path")?,
-                context.principal,
-                context.prompt,
-            )
-            .await?,
+            authority,
             context.expected_generation,
             batch_context(context.batch_id, context.expected),
         )
@@ -614,20 +615,21 @@ async fn clone_and_build(
         .collect();
     if let Some(idx) = pick_capsule(&names, name_hint)? {
         if context.daemon {
+            let (authority, _lease) = daemon_install_authority(
+                produced[idx]
+                    .to_str()
+                    .context("invalid built archive path")?,
+                context.principal,
+                context.prompt,
+            )
+            .await?;
             return super::install_daemon::install_local_via_daemon_outcome(
                 produced[idx]
                     .to_str()
                     .context("invalid built archive path")?,
                 context.prompt,
                 context.principal,
-                daemon_install_authority(
-                    produced[idx]
-                        .to_str()
-                        .context("invalid built archive path")?,
-                    context.principal,
-                    context.prompt,
-                )
-                .await?,
+                authority,
                 context.expected_generation,
                 batch_context(context.batch_id, context.expected),
             )
@@ -651,11 +653,13 @@ async fn install_archive_via_daemon(
     source: &str,
     context: InstallContext<'_>,
 ) -> anyhow::Result<Vec<InstalledCapsuleOutcome>> {
+    let (authority, _lease) =
+        daemon_install_authority(source, context.principal, context.prompt).await?;
     let installed = super::install_daemon::install_local_via_daemon_outcome(
         source,
         context.prompt,
         context.principal,
-        daemon_install_authority(source, context.principal, context.prompt).await?,
+        authority,
         context.expected_generation,
         batch_context(context.batch_id, context.expected),
     )

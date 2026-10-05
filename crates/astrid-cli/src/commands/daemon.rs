@@ -12,7 +12,7 @@ use crate::commands::daemon_control;
 use crate::formatter::OutputFormat;
 use crate::{socket_client, theme};
 
-mod projection;
+pub(crate) mod projection;
 mod ready;
 mod workspace_fingerprint;
 use projection::pack_stopped_projection;

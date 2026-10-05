@@ -3,16 +3,40 @@
 use anyhow::{Context, Result};
 use astrid_core::dirs::AstridHome;
 
+mod lifetime;
+pub(crate) use lifetime::{DaemonLease, retain_ready_daemon};
+
 /// Restore the projection and inspect it without allowing a CLI stop between
 /// readiness and the read. Interactive approval must happen after this returns.
 pub(crate) async fn with_persistent_daemon_projection<T>(
     label: &str,
     inspect: impl FnOnce() -> Result<T>,
-) -> Result<T> {
+) -> Result<(T, DaemonLease)> {
     let fence = super::acquire_daemon_start_fence().await?;
+    // Retain an existing ephemeral daemon before ensure's probe disconnects.
+    // A CLI start fence excludes stop, not autonomous last-client retirement.
+    let probe =
+        astrid_core::local_transport::connect_outcome(&crate::socket_client::proxy_socket_path())
+            .await?;
+    let lease = if matches!(
+        probe,
+        astrid_core::local_transport::ConnectOutcome::Connected(_)
+    ) {
+        Some(retain_ready_daemon().await?)
+    } else {
+        None
+    };
     super::ensure_daemon_inner_locked(label, true, super::DaemonSpawnMode::Persistent, None)
         .await?;
-    inspect_while_fenced(fence, inspect)
+    let lease = match lease {
+        Some(lease) => lease,
+        None => retain_ready_daemon().await?,
+    };
+    drop(probe);
+    // Archive hashing is synchronous. Yield the runtime worker so the lease
+    // continues draining broadcasts even on a single-worker CLI runtime.
+    let result = tokio::task::block_in_place(|| inspect_while_fenced(fence, inspect));
+    Ok((result?, lease))
 }
 
 fn inspect_while_fenced<T>(

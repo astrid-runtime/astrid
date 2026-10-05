@@ -83,12 +83,15 @@ pub(super) async fn daemon_install_authority(
     source: &str,
     principal: &astrid_core::PrincipalId,
     prompt: &ManualInstallOptions,
-) -> anyhow::Result<CapsuleInstallAuthority> {
+) -> anyhow::Result<(
+    CapsuleInstallAuthority,
+    crate::commands::daemon::projection::DaemonLease,
+)> {
     // The stopped home stores its identity inside the volume. Restore the
     // daemon-owned projection and retain the start fence through inspection.
     // Otherwise a concurrent stop could retire the key before inspection reads
     // it, generating a replacement identity outside the stopped volume.
-    let inspection = crate::commands::daemon::with_persistent_daemon_projection(
+    let (inspection, lease) = crate::commands::daemon::with_persistent_daemon_projection(
         "capsule install authority",
         || {
             let home = AstridHome::resolve()?;
@@ -114,11 +117,15 @@ pub(super) async fn daemon_install_authority(
     )
     .await
     .context("capsule authority inspection could not use the runtime projection")?;
-    Ok(match authority_decision(&inspection, prompt)? {
+    // A human can leave this prompt unanswered indefinitely. Let the lease
+    // reader drain broadcasts even when the runtime has only one worker.
+    let decision = tokio::task::block_in_place(|| authority_decision(&inspection, prompt))?;
+    let authority = match decision {
         AuthorityDecision::Automatic => CapsuleInstallAuthority::Automatic,
         AuthorityDecision::ExplicitApproval { .. } => CapsuleInstallAuthority::ExplicitApproval,
         AuthorityDecision::OperatorDistribution { .. } => {
             CapsuleInstallAuthority::OperatorDistribution
         },
-    })
+    };
+    Ok((authority, lease))
 }
