@@ -161,6 +161,7 @@ signal-hook = "0.4"
 # capsules to record into the same recorder the gateway exports —
 # Prometheus integration is intended to go deep into Astrid, not stay
 # at the HTTP surface.
+mimalloc = "0.1.52"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # Pull-based process collector (`process_cpu_seconds_total`, resident

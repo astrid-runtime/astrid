@@ -47,6 +47,9 @@ uuid = { workspace = true }
 nix = { workspace = true }
 signal-hook = { workspace = true }
 
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { workspace = true }
+
 [dev-dependencies]
 astrid-crypto = { workspace = true }
 astrid-events = { workspace = true }

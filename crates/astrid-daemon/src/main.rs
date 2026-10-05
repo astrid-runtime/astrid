@@ -2,6 +2,14 @@
 //!
 //! Delegates to the shared `astrid_daemon::run_to_completion()` lifecycle.
 
+// Cranelift's parallel compilation allocates heavily on every worker. MUSL's
+// shared allocator lock can turn a cold capsule boot into minutes of futex
+// contention. Select a concurrent Rust allocator in the executable only;
+// embedders, other targets and guest resource accounting remain unchanged.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Detach the daemon into its own session as the very first action — before the
 /// async runtime is built or any boot work runs.
 ///
