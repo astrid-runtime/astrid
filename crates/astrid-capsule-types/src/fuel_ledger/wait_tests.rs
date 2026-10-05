@@ -1,6 +1,36 @@
 use super::*;
 
 #[test]
+fn settlement_after_registration_is_observed_before_listener_is_polled() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    let limiter = FuelRateLimiter::default();
+    let owner = PrincipalId::new("service").unwrap();
+    let mut held = limiter
+        .try_reserve(&owner, 100, 100, Instant::now())
+        .unwrap();
+    let mut changed = std::pin::pin!(limiter.capacity_changed(&owner));
+    assert!(
+        limiter
+            .try_reserve(&owner, 100, 1, Instant::now())
+            .is_none()
+    );
+    held.settle(10, Instant::now());
+    assert_eq!(
+        changed
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(())
+    );
+    assert!(
+        limiter
+            .try_reserve(&owner, 100, 90, Instant::now())
+            .is_some()
+    );
+}
+
+#[test]
 fn maximum_budget_cannot_wrap_admission_into_extra_capacity() {
     let limiter = FuelRateLimiter::default();
     let owner = PrincipalId::new("service").unwrap();

@@ -38,6 +38,9 @@ pub enum ExecutionDenied {
     /// This allowance cannot fit even in an empty window.
     #[error("execution allowance exceeds a configured CPU window")]
     AllowanceTooLarge,
+    /// No CPU reservation became available within the caller's deadline.
+    #[error("timed out waiting for CPU execution budget")]
+    TimedOut,
 }
 
 impl ExecutionAllocation {
@@ -82,6 +85,21 @@ impl ExecutionAllocation {
         Ok(ExecutionReservation { principal, user })
     }
 
+    /// Wait for a conservative invocation allowance within its configured
+    /// wall-clock budget. Cancellation while queued spends no CPU fuel.
+    ///
+    /// # Errors
+    /// Rejects an impossible allowance or an expired admission deadline.
+    pub async fn reserve_with_timeout(
+        &self,
+        fuel: NonZeroU64,
+        timeout: std::time::Duration,
+    ) -> Result<ExecutionReservation, ExecutionDenied> {
+        astrid_runtime::time::timeout(timeout, self.reserve_when_available(fuel))
+            .await
+            .map_err(|_| ExecutionDenied::TimedOut)?
+    }
+
     /// Wait without retaining either partial allowance or restarting a service.
     ///
     /// # Errors
@@ -100,6 +118,12 @@ impl ExecutionAllocation {
             return Err(ExecutionDenied::AllowanceTooLarge);
         }
         loop {
+            // Subscribe before admission to cover settlement during the check.
+            let principal_changed = self.principal_ledger.capacity_changed(&self.principal);
+            let user_changed = self
+                .user
+                .as_ref()
+                .map(|user| user.limiter.capacity_changed(&user.user));
             let denied = match self.try_reserve(fuel.get()) {
                 Ok(reservation) => return Ok(reservation),
                 Err(denied) => denied,
@@ -113,7 +137,20 @@ impl ExecutionAllocation {
                     .principal_ledger
                     .replenishment_delay(&self.principal, now),
             };
-            astrid_runtime::time::sleep(delay).await;
+            match (denied, user_changed) {
+                (ExecutionDenied::User, Some(changed)) => {
+                    tokio::select! {
+                        () = changed => {},
+                        () = astrid_runtime::time::sleep(delay) => {},
+                    }
+                },
+                _ => {
+                    tokio::select! {
+                        () = principal_changed => {},
+                        () = astrid_runtime::time::sleep(delay) => {},
+                    }
+                },
+            }
         }
     }
 

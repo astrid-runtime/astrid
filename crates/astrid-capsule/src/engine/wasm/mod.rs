@@ -3603,14 +3603,28 @@ impl ExecutionEngine for WasmEngine {
             self.fuel_rate.clone(),
             None,
         );
-        let mut fuel_reservation = match execution_allocation.try_reserve(invocation_fuel_budget) {
+        // invocation_fuel_share is positive: both its finite share floor and
+        // the unlimited interceptor ceiling are at least one fuel unit.
+        let allowance = std::num::NonZeroU64::new(invocation_fuel_budget)
+            .expect("invocation fuel share is positive");
+        let admission_timeout = std::time::Duration::from_secs(
+            invocation_profile
+                .as_deref()
+                .map_or(astrid_core::profile::DEFAULT_MAX_TIMEOUT_SECS, |profile| {
+                    profile.quotas.max_timeout_secs
+                }),
+        );
+        let mut fuel_reservation = match execution_allocation
+            .reserve_with_timeout(allowance, admission_timeout)
+            .await
+        {
             Ok(reservation) => reservation,
             Err(error) => {
                 tracing::warn!(
                     principal = %invoking_principal,
                     capsule = %self.manifest.package.name,
                     action,
-                    "CPU-rate reservation exceeded; denying invocation"
+                    "CPU-rate admission failed; denying invocation"
                 );
                 return Ok(crate::capsule::InterceptResult::Deny {
                     reason: error.to_string(),
