@@ -28,6 +28,8 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 - Add signed `astrid audit heads` snapshots and paged `astrid audit export`,
   including signing bytes, chain hashes, signatures and retained prune receipts.
   Successful read-only queries do not append new audit entries.
+  Chains pruned more than once before this release report their historical
+  pruned total as unknown (`u64::MAX`), rather than an invented exact count.
 - Record kernel-mediated HTTP exchanges, capsule tool calls, approval prompts
   and decisions, capability changes, capsule installation and runtime loads.
   HTTP records commit before sending and complete with response commitments;
@@ -52,6 +54,8 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
   compaction checkpoints pending deltas so overwritten values can be reclaimed.
   Stores compacted with the new checkpoint reader cannot be reopened by older
   readers limited to the initial representation-journal generation.
+  Older readers that reject sparse footers fall back to an unbounded header
+  scan; the bounded recovery path requires the updated reader.
 - Avoid quadratic recovered-index validation while preserving missing-object
   and placement-mismatch checks. Preserve the shared native-mount resource
   directory when retiring a lease so concurrent mount creation can finish.
@@ -1367,7 +1371,8 @@ Breaking changes to note: `Capsule.toml` moves to `[publish]` / `[subscribe]` ta
 Initial tracked release. See the [repository history](https://github.com/astrid-runtime/astrid/commits/v0.2.0)
 for changes included in this version.
 
-[Unreleased]: https://github.com/astrid-runtime/astrid/compare/v2026.9.4...HEAD
+[Unreleased]: https://github.com/astrid-runtime/astrid/compare/v2026.10.0...HEAD
+[2026.10.0]: https://github.com/astrid-runtime/astrid/compare/v2026.9.4...v2026.10.0
 [2026.9.4]: https://github.com/astrid-runtime/astrid/compare/v2026.9.3...v2026.9.4
 [2026.9.3]: https://github.com/astrid-runtime/astrid/compare/v2026.9.2...v2026.9.3
 [2026.9.2]: https://github.com/astrid-runtime/astrid/compare/v2026.9.1...v2026.9.2
