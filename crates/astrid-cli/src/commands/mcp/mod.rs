@@ -30,8 +30,8 @@
 //! The MCP transport owns stdout: only JSON-RPC frames may be written
 //! there. Every diagnostic in this module goes through `tracing` — never
 //! `println!`. `bootstrap::init_logging` forces the log target off stdout
-//! for `mcp serve` (to the log file, else stderr) regardless of operator
-//! config, so a stray diagnostic can never corrupt the protocol stream.
+//! to stderr regardless of operator config, so a stray diagnostic can never
+//! corrupt the protocol stream or materialize stopped-runtime sidecars.
 
 // The persistent gateway uses Unix-domain sockets. Keep those implementations
 // out of non-Unix builds while preserving the CLI command surface with an
