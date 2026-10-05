@@ -121,9 +121,13 @@ wasmtime::component::bindgen!({
         // the actual fix for the worker-pool exhaustion in issue #816.
         // Selector is function-level (per wasmtime-wasi-45's own bindgen):
         // `<iface>.[method]<resource>.<func>`, no version, dot-separated.
-        // Every other import stays synchronous — non-blocking host fns
-        // (publish/subscribe/kv/sys/...) gain nothing from async.
+        // Non-blocking imports (subscribe/kv/sys/...) stay synchronous.
+        // Publication and network waits use the async selectors below.
         "astrid:ipc/host.[method]subscription.recv": async,
+        // Publication may wait for bounded interceptor capacity. This changes
+        // host scheduling only; the guest WIT signatures remain unchanged.
+        "astrid:ipc/host.publish": async,
+        "astrid:ipc/host.publish-as": async,
         // The HTTP host fns that *wait on the network* are the second
         // worker-pin on the orchestration hot path: openai-compat opens an
         // LLM stream (`http-stream-start`), then loops `read-chunk` over the

@@ -20,6 +20,9 @@ use crate::manifest::{CapabilitiesDef, CapsuleManifest, PackageDef, SubscribeDef
 use astrid_events::ipc::IpcPayload;
 use astrid_events::ipc::Topic;
 
+#[path = "dispatcher/delivery_tests.rs"]
+mod delivery_tests;
+
 /// A minimal mock capsule for dispatch tests.
 #[derive(Clone)]
 struct MockCapsule {
@@ -37,6 +40,11 @@ struct MockCapsule {
     principal_log: Option<Arc<Mutex<Vec<String>>>>,
     /// Optional shared counter incremented on every invoke.
     invoke_counter: Option<Arc<AtomicUsize>>,
+    /// Ordered payloads observed by the real dispatcher consumer.
+    payload_log: Option<Arc<Mutex<Vec<Vec<u8>>>>>,
+    /// Hold one principal's consumer to exercise real bounded backpressure.
+    blocked_principal: Option<(String, Arc<tokio::sync::Semaphore>)>,
+    delivery_gate: astrid_events::RouteAdmissionGate,
 }
 
 impl MockCapsule {
@@ -108,6 +116,9 @@ impl MockCapsule {
             result_override: None,
             principal_log: None,
             invoke_counter: None,
+            payload_log: None,
+            blocked_principal: None,
+            delivery_gate: astrid_events::RouteAdmissionGate::published(),
         };
         (capsule, invoked)
     }
@@ -124,6 +135,12 @@ impl Capsule for MockCapsule {
     fn state(&self) -> CapsuleState {
         CapsuleState::Ready
     }
+    fn delivery_admission_gate(&self) -> Option<astrid_events::RouteAdmissionGate> {
+        Some(self.delivery_gate.clone())
+    }
+    fn retire(&self) {
+        self.delivery_gate.retire();
+    }
     async fn load(&mut self, _ctx: &CapsuleContext) -> CapsuleResult<()> {
         Ok(())
     }
@@ -133,10 +150,18 @@ impl Capsule for MockCapsule {
     async fn invoke_interceptor(
         &self,
         _action: &str,
-        _payload: &[u8],
+        payload: &[u8],
         caller: Option<&astrid_events::ipc::IpcMessage>,
     ) -> CapsuleResult<InterceptResult> {
         self.invoked.store(true, Ordering::SeqCst);
+        if let Some((principal, gate)) = &self.blocked_principal
+            && caller.and_then(|message| message.principal.as_deref()) == Some(principal)
+        {
+            gate.acquire().await.expect("test gate open").forget();
+        }
+        if let Some(log) = &self.payload_log {
+            log.lock().unwrap().push(payload.to_vec());
+        }
         if let Some(ref log) = self.invocation_log {
             log.lock().unwrap().push(self.id.to_string());
         }

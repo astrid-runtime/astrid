@@ -77,6 +77,10 @@ const SUBSCRIBER_UNTAGGED: &str = "untagged";
 pub struct EventBus {
     /// Sender for broadcasting events.
     sender: broadcast::Sender<Arc<AstridEvent>>,
+    /// Best-effort lane, excluding publications delivered through reservation.
+    unreserved_sender: broadcast::Sender<Arc<AstridEvent>>,
+    delivery_admitter: crate::admission::AdmitterSlot,
+    ordered_delivery: crate::ordered_delivery::OrderedSlot,
     /// Registry for synchronous subscribers.
     registry: Arc<SubscriberRegistry>,
     /// Channel capacity.
@@ -110,8 +114,12 @@ impl EventBus {
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         let (sender, _) = broadcast::channel(capacity);
+        let (unreserved_sender, _) = broadcast::channel(capacity);
         Self {
             sender,
+            unreserved_sender,
+            delivery_admitter: Arc::new(parking_lot::RwLock::new(None)),
+            ordered_delivery: Arc::new(parking_lot::Mutex::new(None)),
             registry: Arc::new(SubscriberRegistry::new()),
             capacity,
             ipc_seq: Arc::new(AtomicU64::new(1)),
@@ -142,7 +150,147 @@ impl EventBus {
     /// notifies all synchronous subscribers in the registry.
     ///
     /// Returns the number of async receivers that received the event.
-    pub fn publish(&self, mut event: AstridEvent) -> usize {
+    #[allow(clippy::must_use_candidate)] // Publication is the effect; counting receivers is optional.
+    pub fn publish(&self, event: AstridEvent) -> usize {
+        self.publish_reserved(event, None, None, Vec::new())
+    }
+
+    /// Reserve bounded correctness-critical delivery, without publishing yet.
+    /// No bus lock is held during the wait. Ordinary synchronous publication
+    /// remains available to lifecycle and management paths.
+    ///
+    /// # Errors
+    /// Returns the registered delivery lane's admission error if capacity
+    /// cannot be reserved, including a closed consumer or recursive dependency.
+    pub async fn reserve_publication(
+        &self,
+        event: AstridEvent,
+    ) -> Result<crate::ReservedPublication<'_>, crate::DeliveryAdmissionError> {
+        let admitter = match self.delivery_admitter.read().as_ref() {
+            Some(registered) => Some(
+                registered
+                    .upgrade()
+                    .ok_or(crate::DeliveryAdmissionError::Closed)?,
+            ),
+            None => None,
+        };
+        let delivery = match admitter {
+            Some(admitter) => Some(admitter.reserve(&event).await?),
+            None => None,
+        };
+        // Never hold inbox capacity while waiting for a consumer. Otherwise
+        // full consumer queues could strand their own publishers behind an
+        // inbox occupied by reservations waiting on those same consumers.
+        let sender = self.ordered_delivery.lock().clone();
+        let handoff = match sender {
+            Some(sender) => Some(crate::ordered_delivery::ReservedHandoff {
+                permit: sender
+                    .sender
+                    .clone()
+                    .reserve_owned()
+                    .await
+                    .map_err(|_| crate::DeliveryAdmissionError::Closed)?,
+                sender: sender.sender,
+            }),
+            None => None,
+        };
+        Ok(crate::ReservedPublication {
+            bus: self,
+            event,
+            delivery,
+            handoff,
+        })
+    }
+
+    /// Install the exclusive ordered dispatcher inbox before spawning it.
+    /// Its bound is the existing bus capacity, not an unbounded deferred queue.
+    ///
+    /// # Panics
+    /// Panics if an active dispatcher inbox is already installed.
+    #[must_use]
+    pub fn subscribe_ordered_delivery(&self) -> crate::OrderedDeliveryReceiver {
+        let _publication = self.publish_order.lock();
+        let mut slot = self.ordered_delivery.lock();
+        assert!(
+            slot.as_ref().is_none_or(|entry| entry.sender.is_closed()),
+            "one ordered dispatcher inbox per bus"
+        );
+        let (sender, receiver) = tokio::sync::mpsc::channel(self.capacity);
+        let lagged = Arc::new(AtomicU64::new(0));
+        *slot = Some(crate::ordered_delivery::OrderedSender {
+            sender,
+            lagged: lagged.clone(),
+        });
+        crate::OrderedDeliveryReceiver {
+            receiver,
+            lagged,
+            publish_order: Arc::clone(&self.publish_order),
+        }
+    }
+
+    /// Register the host's delivery lane. The owner must keep the admitter
+    /// alive; the bus holds only a weak reference to avoid ownership cycles.
+    /// Returns false if a live lane is already registered.
+    pub fn register_delivery_admitter(
+        &self,
+        admitter: &Arc<dyn crate::EventDeliveryAdmitter>,
+    ) -> bool {
+        let _publication = self.publish_order.lock();
+        let mut slot = self.delivery_admitter.write();
+        if slot.as_ref().and_then(std::sync::Weak::upgrade).is_some() {
+            return false;
+        }
+        *slot = Some(Arc::downgrade(admitter));
+        true
+    }
+
+    /// Subscribe to publications not already delivered by the reserved lane.
+    /// A consumer using this receiver must itself own the registered admitter,
+    /// otherwise it will miss reserved publications.
+    #[must_use]
+    pub fn subscribe_unreserved_as(&self, subscriber: &'static str) -> EventReceiver {
+        EventReceiver::new(self.unreserved_sender.subscribe(), None, subscriber)
+    }
+
+    pub(crate) fn commit_reserved(
+        &self,
+        publication: crate::ReservedPublication<'_>,
+    ) -> Result<usize, crate::DeliveryAdmissionError> {
+        let _guard = self.publish_order.lock();
+        // A reservation taken while the bus was unconfigured must not turn
+        // into an unreserved publication through a newly installed dispatcher.
+        if publication.delivery.is_none() && self.delivery_admitter.read().is_some() {
+            return Err(crate::DeliveryAdmissionError::Closed);
+        }
+        if publication.handoff.is_none() && self.ordered_delivery.lock().is_some() {
+            return Err(crate::DeliveryAdmissionError::Closed);
+        }
+        if publication
+            .handoff
+            .as_ref()
+            .is_some_and(|handoff| handoff.sender.is_closed())
+        {
+            return Err(crate::DeliveryAdmissionError::Closed);
+        }
+        let guards = publication
+            .delivery
+            .as_ref()
+            .map_or_else(|| Ok(Vec::new()), |delivery| delivery.commit_guards())?;
+        Ok(self.publish_reserved(
+            publication.event,
+            publication.delivery,
+            publication.handoff,
+            guards,
+        ))
+    }
+
+    pub(crate) fn publish_reserved(
+        &self,
+        mut event: AstridEvent,
+        delivery: Option<Box<dyn crate::ReservedEventDelivery>>,
+        handoff: Option<crate::ordered_delivery::ReservedHandoff>,
+        guards: Vec<crate::RouteCommitGuard>,
+    ) -> usize {
         // A lifecycle observer may control process lifetime. Keep sequence
         // assignment, transport publication, and synchronous observation in
         // one total order so a later disconnect can never overtake an earlier
@@ -158,6 +306,43 @@ impl EventBus {
             message.seq = self.ipc_seq.fetch_add(1, Ordering::Relaxed);
         }
         let event = Arc::new(event);
+        let ordinary = delivery.is_none();
+        let ordered = self.ordered_delivery.lock().clone();
+        let mut unreserved_count = if let Some(handoff) = handoff {
+            handoff.permit.send(crate::OrderedDelivery {
+                event: Arc::clone(&event),
+                reservation: delivery,
+            });
+            1
+        } else if let Some(ordered) = ordered {
+            if ordered
+                .sender
+                .try_send(crate::OrderedDelivery {
+                    event: Arc::clone(&event),
+                    reservation: delivery,
+                })
+                .is_err()
+            {
+                ordered.lagged.fetch_add(1, Ordering::Relaxed);
+                0
+            } else {
+                1
+            }
+        } else if let Some(delivery) = delivery {
+            delivery.deliver(&event);
+            0
+        } else {
+            self.unreserved_sender.send(Arc::clone(&event)).unwrap_or(0)
+        };
+        if ordinary && self.ordered_delivery.lock().is_some() {
+            unreserved_count = unreserved_count
+                .saturating_add(self.unreserved_sender.send(Arc::clone(&event)).unwrap_or(0));
+        }
+
+        // Capacity and generation fences now cover the committed enqueue.
+        // Release lifecycle locks before observers can retire a capsule or
+        // publish recursively; those callbacks must not deadlock this commit.
+        drop(guards);
 
         // Publish throughput by bounded event kind. `rate()` shows bus
         // load; paired with the per-subscriber lag counter it localises a
@@ -194,7 +379,7 @@ impl EventBus {
         // per-(capsule, topic, principal) delivery via the demux here.
         self.dispatch_to_routes(&event);
 
-        count
+        count.saturating_add(unreserved_count)
     }
 
     /// Iterate the routes table, fan out matching events into each
@@ -570,7 +755,14 @@ impl EventBus {
     pub fn subscriber_count(&self) -> usize {
         self.sender
             .receiver_count()
+            .saturating_add(self.unreserved_sender.receiver_count())
             .saturating_add(self.registry.len())
+            .saturating_add(usize::from(
+                self.ordered_delivery
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|entry| !entry.sender.is_closed()),
+            ))
     }
 
     /// Get the channel capacity.
@@ -594,6 +786,9 @@ impl Clone for EventBus {
         // every publisher holding any clone of the bus.
         Self {
             sender: self.sender.clone(),
+            unreserved_sender: self.unreserved_sender.clone(),
+            delivery_admitter: Arc::clone(&self.delivery_admitter),
+            ordered_delivery: Arc::clone(&self.ordered_delivery),
             registry: Arc::clone(&self.registry),
             capacity: self.capacity,
             ipc_seq: Arc::clone(&self.ipc_seq),

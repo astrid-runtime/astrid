@@ -85,7 +85,7 @@ fn tool_state() -> (HostState, Arc<ToolSink>, IpcMessage) {
     (state, sink, request)
 }
 
-fn publish_result(state: &mut HostState, topic: &str, call_id: &str, is_error: bool) {
+async fn publish_result(state: &mut HostState, topic: &str, call_id: &str, is_error: bool) {
     let payload = json!({
         "type": "tool_execute_result",
         "call_id": call_id,
@@ -93,6 +93,7 @@ fn publish_result(state: &mut HostState, topic: &str, call_id: &str, is_error: b
     });
     state
         .publish(topic.to_owned(), payload.to_string())
+        .await
         .expect("publish succeeds");
 }
 
@@ -100,11 +101,56 @@ fn args_hash() -> ContentHash {
     ContentHash::hash(&serde_json::to_vec(&arguments()).unwrap())
 }
 
+#[derive(Debug)]
+struct FailedDelivery(astrid_events::DeliveryAdmissionError);
+
+#[async_trait::async_trait]
+impl astrid_events::EventDeliveryAdmitter for FailedDelivery {
+    async fn reserve(
+        &self,
+        _: &astrid_events::AstridEvent,
+    ) -> Result<Box<dyn astrid_events::ReservedEventDelivery>, astrid_events::DeliveryAdmissionError>
+    {
+        Err(self.0)
+    }
+}
+
+#[tokio::test]
+async fn failed_publication_is_not_a_successful_tool_result() {
+    for failure in [
+        astrid_events::DeliveryAdmissionError::Closed,
+        astrid_events::DeliveryAdmissionError::SelfDependency,
+        astrid_events::DeliveryAdmissionError::InvalidEvent,
+    ] {
+        let (mut state, sink, request) = tool_state();
+        let admitter: Arc<dyn astrid_events::EventDeliveryAdmitter> =
+            Arc::new(FailedDelivery(failure));
+        assert!(state.event_bus.register_delivery_admitter(&admitter));
+        let audit =
+            ToolCallAudit::arm(&state, Some(&request), &PrincipalId::default()).expect("armed");
+        let payload = json!({
+            "type": "tool_execute_result", "call_id": "call-1",
+            "result": {"call_id": "call-1", "content": "3 results", "is_error": false},
+        });
+        assert!(
+            state
+                .publish("tool.v1.execute.search.result".into(), payload.to_string())
+                .await
+                .is_err()
+        );
+        audit.finish(state.tool_result.take(), None);
+        let records = sink.0.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].result_hash, None);
+        assert_eq!(records[0].failure.as_deref(), Some("no result published"));
+    }
+}
+
 #[tokio::test]
 async fn published_result_is_recorded_with_hashes() {
     let (mut state, sink, request) = tool_state();
     let audit = ToolCallAudit::arm(&state, Some(&request), &PrincipalId::default()).expect("armed");
-    publish_result(&mut state, "tool.v1.execute.search.result", "call-1", false);
+    publish_result(&mut state, "tool.v1.execute.search.result", "call-1", false).await;
     audit.finish(state.tool_result.take(), None);
 
     assert_eq!(
@@ -125,12 +171,12 @@ async fn tool_error_and_missing_result_are_failures() {
     // The tool reported an error.
     let (mut state, sink, request) = tool_state();
     let audit = ToolCallAudit::arm(&state, Some(&request), &PrincipalId::default()).expect("armed");
-    publish_result(&mut state, "tool.v1.execute.result", "call-1", true);
+    publish_result(&mut state, "tool.v1.execute.result", "call-1", true).await;
     audit.finish(state.tool_result.take(), None);
 
     // A result for another call does not count as this call's result.
     let audit = ToolCallAudit::arm(&state, Some(&request), &PrincipalId::default()).expect("armed");
-    publish_result(&mut state, "tool.v1.execute.search.result", "call-2", false);
+    publish_result(&mut state, "tool.v1.execute.search.result", "call-2", false).await;
     audit.finish(state.tool_result.take(), None);
 
     // The guest call failed.
