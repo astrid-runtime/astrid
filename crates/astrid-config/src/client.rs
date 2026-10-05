@@ -22,6 +22,12 @@ pub const DEFAULT_ADMIN_TIMEOUT_SECS: u64 = 15;
 /// Bounded client wait; this does not change the daemon's operation budget.
 pub const MAX_ADMIN_TIMEOUT_SECS: u64 = 600;
 
+/// Default client wait for acknowledged daemon shutdown, including volume packing.
+pub const DEFAULT_DAEMON_SHUTDOWN_TIMEOUT_SECS: u64 = std::time::Duration::from_mins(1).as_secs();
+
+/// Maximum operator-selected daemon finalization wait.
+pub const MAX_DAEMON_SHUTDOWN_TIMEOUT_SECS: u64 = std::time::Duration::from_mins(10).as_secs();
+
 /// Explicit client-file override selected by the operator or launcher.
 const CLIENT_CONFIG_PATH_VAR: &str = "ASTRID_CLIENT_CONFIG_PATH";
 
@@ -37,6 +43,9 @@ pub struct ClientConfig {
     /// Admin response deadline. When absent, `ASTRID_ADMIN_TIMEOUT_SECS` is
     /// a fallback, followed by the historical 15-second default.
     pub admin_timeout_secs: Option<u64>,
+    /// Wait for an acknowledged daemon shutdown to finish before attempting
+    /// identity-checked termination. Independent of the admin response deadline.
+    pub daemon_shutdown_secs: u64,
 }
 
 impl Default for ClientConfig {
@@ -44,6 +53,7 @@ impl Default for ClientConfig {
         Self {
             run_idle_secs: DEFAULT_RUN_IDLE_TIMEOUT_SECS,
             admin_timeout_secs: None,
+            daemon_shutdown_secs: DEFAULT_DAEMON_SHUTDOWN_TIMEOUT_SECS,
         }
     }
 }
@@ -160,6 +170,7 @@ pub fn load_client_config(path: &Path) -> ConfigResult<ClientConfig> {
             source: error,
         })?;
     validate_run_idle_secs(config.run_idle_secs)?;
+    validate_daemon_shutdown_secs(config.daemon_shutdown_secs)?;
     if let Some(seconds) = config.admin_timeout_secs {
         validate_admin_timeout_secs(seconds)?;
     }
@@ -200,6 +211,28 @@ pub fn production_admin_timeout() -> ConfigResult<u64> {
         path.as_deref(),
         std::env::var("ASTRID_ADMIN_TIMEOUT_SECS").ok().as_deref(),
     )
+}
+
+/// Resolve the bounded shutdown wait without opening the runtime volume.
+///
+/// # Errors
+/// Returns an error for an unsafe, malformed, or out-of-bounds client file.
+pub fn production_daemon_shutdown_timeout() -> ConfigResult<u64> {
+    let path = production_client_config_path()?;
+    Ok(match path {
+        Some(path) => load_client_config(&path)?.daemon_shutdown_secs,
+        None => DEFAULT_DAEMON_SHUTDOWN_TIMEOUT_SECS,
+    })
+}
+
+fn validate_daemon_shutdown_secs(seconds: u64) -> ConfigResult<()> {
+    if !(1..=MAX_DAEMON_SHUTDOWN_TIMEOUT_SECS).contains(&seconds) {
+        return Err(ConfigError::ValidationError {
+            field: "daemon_shutdown_secs".to_owned(),
+            message: format!("must be between 1 and {MAX_DAEMON_SHUTDOWN_TIMEOUT_SECS} seconds"),
+        });
+    }
+    Ok(())
 }
 
 fn validate_admin_timeout_secs(seconds: u64) -> ConfigResult<()> {

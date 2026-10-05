@@ -1,5 +1,38 @@
 use super::*;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn acknowledged_shutdown_waits_for_retired_generation_finalization() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    // Outlive both old three-second waits. With a retired generation marker,
+    // signalling is forbidden: the CLI must wait for clean process exit.
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "sleep 7"])
+        .spawn()
+        .expect("spawn finalizing process");
+    let identity = daemon_control::DaemonIdentity {
+        pid: child.id(),
+        exe: None,
+        boot_nonce: Some("retired-generation".to_owned()),
+    };
+    let reap = tokio::task::spawn_blocking(move || child.wait().expect("reap child"));
+    let result = confirm_graceful_stop(
+        Some(identity),
+        &temp.path().join("system.sock"),
+        &temp.path().join("system.pid"),
+        Duration::from_secs(astrid_config::client::DEFAULT_DAEMON_SHUTDOWN_TIMEOUT_SECS),
+    )
+    .await;
+    assert!(
+        reap.await.expect("reaper task").success(),
+        "child was signalled"
+    );
+    assert_eq!(
+        result.expect("wait for finalization"),
+        DaemonStopDisposition::Graceful
+    );
+}
+
 #[test]
 fn fresh_home_boot_log_does_not_preinitialize_layout() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -224,6 +257,7 @@ async fn acknowledged_shutdown_without_pid_is_unverified() {
         None,
         Path::new("/tmp/absent-astrid.sock"),
         Path::new("/tmp/absent-astrid.pid"),
+        Duration::from_secs(astrid_config::client::DEFAULT_DAEMON_SHUTDOWN_TIMEOUT_SECS),
     )
     .await
     .expect_err("an ACK without a process identity cannot prove process exit");

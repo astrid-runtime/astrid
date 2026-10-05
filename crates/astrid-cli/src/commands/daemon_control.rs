@@ -33,9 +33,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// How long to wait for a signalled daemon to exit before escalating /
-/// giving up. Kept just above the kernel's own graceful-shutdown budget so a
-/// daemon mid-shutdown gets a fair chance to release the lock cleanly.
+/// Wait after a termination signal. Acknowledged graceful finalization uses
+/// the separate pre-mount client shutdown budget, not this escalation window.
 pub(crate) const GRACE: Duration = Duration::from_secs(3);
 
 /// Poll interval while waiting for a signalled process to exit.
