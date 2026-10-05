@@ -10,7 +10,9 @@ mod retry;
 
 pub(crate) async fn unmount(mountpoint: &Path) -> Result<()> {
     let mountpoint = mountpoint.to_owned();
-    let deadline = Instant::now() + crate::service::UNMOUNT_CONFIRM_TIMEOUT;
+    let deadline = Instant::now()
+        .checked_add(crate::service::UNMOUNT_CONFIRM_TIMEOUT)
+        .context("native unmount deadline exceeds monotonic clock range")?;
     tokio::task::spawn_blocking(move || {
         retry::unmount_with(
             || {
