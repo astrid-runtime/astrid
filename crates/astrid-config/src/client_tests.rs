@@ -21,6 +21,27 @@ fn empty_client_config_uses_historical_default() {
     let config: ClientConfig = toml::from_str("").unwrap();
     assert_eq!(config.run_idle_secs, 120);
     assert_eq!(DEFAULT_RUN_IDLE_TIMEOUT_SECS, 120);
+    assert_eq!(config.daemon_shutdown_secs, 60);
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_shutdown_budget_is_bounded_and_independent_of_admin_deadline() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("client.toml");
+    for seconds in [1, 60, 600] {
+        write_private_client_config(
+            &path,
+            &format!("daemon_shutdown_secs = {seconds}\nadmin_timeout_secs = 5"),
+        );
+        let config = load_client_config(&path).unwrap();
+        assert_eq!(config.daemon_shutdown_secs, seconds);
+        assert_eq!(config.admin_timeout_secs, Some(5));
+    }
+    for invalid in ["0", "601", "-1", "'60'"] {
+        write_private_client_config(&path, &format!("daemon_shutdown_secs = {invalid}"));
+        assert!(load_client_config(&path).is_err());
+    }
 }
 
 #[test]

@@ -738,6 +738,8 @@ fn combine_stop_results(
 }
 
 async fn stop_daemon() -> Result<DaemonStopDisposition> {
+    let shutdown_budget =
+        Duration::from_secs(astrid_config::client::production_daemon_shutdown_timeout()?);
     let socket_path = socket_client::proxy_socket_path();
     let pid_path = socket_client::pid_path();
 
@@ -772,7 +774,7 @@ async fn stop_daemon() -> Result<DaemonStopDisposition> {
             KernelResponse::Success(_) => {
                 // ACK only — confirm the process actually exits before
                 // declaring success, and escalate if it wedged.
-                confirm_graceful_stop(recorded, &socket_path, &pid_path).await?
+                confirm_graceful_stop(recorded, &socket_path, &pid_path, shutdown_budget).await?
             },
             KernelResponse::Error(reason) => {
                 anyhow::bail!("shutdown stage daemon.shutdown_ack: rejected: {reason}")
@@ -809,6 +811,7 @@ async fn confirm_graceful_stop(
     recorded: Option<daemon_control::DaemonIdentity>,
     socket_path: &Path,
     pid_path: &Path,
+    shutdown_budget: Duration,
 ) -> Result<DaemonStopDisposition> {
     let Some(identity) = recorded else {
         anyhow::bail!(
@@ -817,12 +820,12 @@ async fn confirm_graceful_stop(
         );
     };
 
-    if daemon_control::wait_for_exit(identity.pid, daemon_control::GRACE).await {
+    if daemon_control::wait_for_exit(identity.pid, shutdown_budget).await {
         return Ok(DaemonStopDisposition::Graceful);
     }
 
-    // Acknowledged but still alive past the grace window → wedged mid-shutdown,
-    // still holding the lock. Escalate with a signal (identity-gated).
+    // Only escalate after the client finalization budget, not the short signal
+    // grace: retiring a large volume can outlive kernel/socket shutdown.
     eprintln!(
         "{}",
         theme::Theme::warning(

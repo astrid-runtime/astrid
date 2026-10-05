@@ -36,7 +36,7 @@ fn clean_stop_preserves_a_pin_created_in_the_mounted_projection() {
     let home = root.path().join("astrid-home");
     let run_dir = root.path().join("astrid-run");
     let client_config = root.path().join("client.toml");
-    std::fs::write(&client_config, "run_idle_secs = 120\n").unwrap();
+    write_client_config(&client_config);
 
     let shuttle = write_signed_shuttle(root.path(), "pin-survival");
     std::fs::create_dir_all(&run_dir).unwrap();
@@ -109,7 +109,12 @@ fn detached(command: &mut Command) -> &mut Command {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
+}
+
+fn write_client_config(path: &std::path::Path) {
+    astrid_core::platform_fs::atomic_write_private_file(path, b"run_idle_secs = 120\n")
+        .expect("create an owner-only client configuration");
 }
 
 fn assert_stopped_volume_only(home: &std::path::Path) {
@@ -195,7 +200,7 @@ fn run_dir_equal_to_home_fails_start_without_deleting_durable_media() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("astrid-home");
     let client_config = root.path().join("client.toml");
-    std::fs::write(&client_config, "run_idle_secs = 120\n").unwrap();
+    write_client_config(&client_config);
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(home.join("astrid.volume"), b"disposable-durable-media").unwrap();
     #[cfg(unix)]
@@ -229,7 +234,7 @@ fn run_dir_equal_to_home_fails_all_lifecycle_commands_without_stale_marker_mutat
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("astrid-home");
     let client_config = root.path().join("client.toml");
-    std::fs::write(&client_config, "run_idle_secs = 120\n").unwrap();
+    write_client_config(&client_config);
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(home.join("astrid.volume"), b"disposable-durable-media").unwrap();
     let run_dir = home.join("run");
@@ -276,7 +281,7 @@ fn external_run_dir_lifecycle_admits_valid_paths_but_rejects_overrides_early() {
     let home = root.path().join("astrid-home");
     let run_dir = root.path().join("astrid-run");
     let client_config = root.path().join("client.toml");
-    std::fs::write(&client_config, "run_idle_secs = 120\n").unwrap();
+    write_client_config(&client_config);
     std::fs::create_dir_all(&run_dir).unwrap();
 
     let started = detached(astrid(root.path(), &home, &run_dir, &client_config).arg("start"))
@@ -338,7 +343,7 @@ fn mcp_lifecycle_rejects_root_run_dir_before_stale_marker_mutation() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("astrid-home");
     let client_config = root.path().join("client.toml");
-    std::fs::write(&client_config, "run_idle_secs = 120\n").unwrap();
+    write_client_config(&client_config);
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(home.join("astrid.volume"), b"disposable-durable-media").unwrap();
     let run_dir = home.join("run");

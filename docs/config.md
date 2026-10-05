@@ -265,12 +265,19 @@ regular file with no redirects.
 
 ```toml
 run_idle_secs = 120
+daemon_shutdown_secs = 60
 ```
 
 The default remains 120 seconds and values must be between 1 and 86400
 seconds. `--idle-timeout-secs` has the highest precedence and bypasses client
 file parsing. Workspace and runtime configuration cannot set or raise this
 timeout.
+
+`daemon_shutdown_secs` bounds the wait after `astrid stop` or `astrid restart`
+receives a shutdown acknowledgement, including durable volume finalization.
+It defaults to 60 seconds and accepts 1–600 seconds. This is a client wait,
+not a daemon operation timeout or permission to kill an unverified process.
+The admin response timeout and identity-checked signal escalation remain separate.
 
 The idle deadline applies only to gaps between messages belonging to the active
 run. Chat responses and `agent.v1.stream.delta` frames must carry the matching
