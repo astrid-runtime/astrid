@@ -777,8 +777,8 @@ mod tests {
         assert_eq!(state.bytes, 0);
     }
 
-    #[test]
-    fn request_owned_event_reaches_only_the_originating_connection() {
+    #[tokio::test]
+    async fn request_owned_event_reaches_only_the_originating_connection() {
         let bus = Arc::new(EventBus::new());
         let registry = Registry::install(&bus);
         let owner = RequestOwnerId::generate();
@@ -803,7 +803,12 @@ mod tests {
             .with_request_owner(owner),
         });
 
-        assert!(origin.try_recv().is_ok());
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), origin.recv())
+            .await
+            .expect("originating connection receives its approval")
+            .expect("egress remains open");
+        let message = event_message(&delivered).expect("approval IPC");
+        assert_eq!(message.request_owner, Some(owner));
         assert!(matches!(peer.try_recv(), Err(TryRecvError::Empty)));
     }
 
