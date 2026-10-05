@@ -3700,7 +3700,25 @@ impl ExecutionEngine for WasmEngine {
         // borrowing the store mutably for the SET/CALL block; `PoolCheckout`
         // clears or discards the instance on drop.
         let checkout_start = std::time::Instant::now();
-        let Some(mut checkout) = pool.checkout().await else {
+        let remaining = std::time::Duration::from_secs(
+            invocation_profile
+                .as_deref()
+                .map_or(astrid_core::profile::DEFAULT_MAX_TIMEOUT_SECS, |profile| {
+                    profile.quotas.max_timeout_secs
+                }),
+        )
+        .saturating_sub(invoke_start.elapsed());
+        let checked_out = match astrid_runtime::time::timeout(remaining, pool.checkout()).await {
+            Ok(checkout) => checkout,
+            Err(_) => {
+                // No invocation guest ran; return unused admission capacity.
+                fuel_reservation.settle(0, std::time::Instant::now());
+                return Ok(crate::capsule::InterceptResult::Deny {
+                    reason: "invocation deadline expired waiting for capsule instance".into(),
+                });
+            },
+        };
+        let Some(mut checkout) = checked_out else {
             // A failed replacement must not skip the guard on the next request.
             return Ok(crate::capsule::InterceptResult::Deny {
                 reason: "no capsule instance available".into(),

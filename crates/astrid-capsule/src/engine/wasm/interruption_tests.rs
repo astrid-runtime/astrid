@@ -73,6 +73,37 @@ async fn engine(max: usize) -> WasmEngine {
 }
 
 #[tokio::test]
+async fn occupied_pool_cannot_outlive_the_invocation_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path().to_path_buf());
+    let principal = astrid_core::PrincipalId::default();
+    let mut profile = astrid_core::profile::PrincipalProfile::default();
+    profile.quotas.max_timeout_secs = 1;
+    profile.save(&home, &principal).unwrap();
+    let mut engine = engine(1).await;
+    engine.profile_cache = Some(Arc::new(
+        crate::profile_cache::PrincipalProfileCache::with_home(home),
+    ));
+    let held = engine.pool.as_ref().unwrap().checkout().await.unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        engine.invoke_interceptor("read", &[], None),
+    )
+    .await
+    .expect("occupied pool must deny within the one-second invocation deadline");
+    assert!(
+        matches!(result, Ok(InterceptResult::Deny { .. })),
+        "{result:?}"
+    );
+    drop(held);
+    let recovered = engine.invoke_interceptor("read", &[], None).await;
+    assert!(
+        matches!(recovered, Ok(InterceptResult::Continue(_))),
+        "{recovered:?}"
+    );
+}
+
+#[tokio::test]
 async fn admission_wait_spends_the_real_guest_invocation_deadline() {
     let dir = tempfile::tempdir().unwrap();
     let home = astrid_core::dirs::AstridHome::from_path(dir.path().to_path_buf());
