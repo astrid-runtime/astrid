@@ -49,6 +49,7 @@ use web_time::Instant;
 
 use astrid_core::PrincipalId;
 use dashmap::DashMap;
+use event_listener::{Event, EventListener};
 use parking_lot::Mutex;
 
 /// Fuel provisioned, and reserved, for one invocation under an active
@@ -160,6 +161,8 @@ struct FuelWindow {
     /// Fuel charged to this principal since `window_start`. Saturating, so a
     /// runaway burner pins at `u64::MAX` rather than wrapping back under budget.
     fuel_in_window: u64,
+    /// Reservation settlement may replenish capacity before window rollover.
+    available: Arc<Event>,
 }
 
 /// Length of the rate window. One second, matching the
@@ -267,6 +270,21 @@ impl<K: Clone + Eq + std::hash::Hash> Drop for FuelReservation<K> {
 }
 
 impl<K: Clone + Eq + std::hash::Hash> FuelRateLimiter<K> {
+    /// Register before checking admission, so settlement cannot be missed
+    /// between a failed reservation and suspension. Notification is only a
+    /// retry hint; the waiter must acquire capacity through `try_reserve`.
+    #[must_use]
+    pub fn capacity_changed(&self, principal: &K) -> EventListener {
+        let cell = self.inner.entry(principal.clone()).or_insert_with(|| {
+            Mutex::new(FuelWindow {
+                window_start: Instant::now(),
+                fuel_in_window: 0,
+                available: Arc::new(Event::new()),
+            })
+        });
+        cell.lock().available.listen()
+    }
+
     /// Delay until the current accounting window can replenish. This is a
     /// retry hint, not an admission: outstanding reservations survive rollover
     /// and another execution may acquire the new allowance first.
@@ -353,6 +371,7 @@ impl<K: Clone + Eq + std::hash::Hash> FuelRateLimiter<K> {
             Mutex::new(FuelWindow {
                 window_start: now,
                 fuel_in_window: 0,
+                available: Arc::new(Event::new()),
             })
         });
         let mut window = cell.lock();
@@ -407,6 +426,7 @@ impl<K: Clone + Eq + std::hash::Hash> FuelRateLimiter<K> {
                 Mutex::new(FuelWindow {
                     window_start: now,
                     fuel_in_window: 0,
+                    available: Arc::new(Event::new()),
                 })
             });
             let mut window = cell.lock();
@@ -423,11 +443,12 @@ impl<K: Clone + Eq + std::hash::Hash> FuelRateLimiter<K> {
     }
 
     fn settle_reserved(&self, principal: &K, amount: u64, actual_fuel: u64, now: Instant) {
-        {
+        let available = {
             let cell = self.inner.entry(principal.clone()).or_insert_with(|| {
                 Mutex::new(FuelWindow {
                     window_start: now,
                     fuel_in_window: 0,
+                    available: Arc::new(Event::new()),
                 })
             });
             let mut window = cell.lock();
@@ -440,7 +461,11 @@ impl<K: Clone + Eq + std::hash::Hash> FuelRateLimiter<K> {
                 });
             }
             window.fuel_in_window = window.fuel_in_window.saturating_add(actual_fuel);
-        }
+            Arc::clone(&window.available)
+        };
+        // Wake only this owner's waiters, after releasing the accounting lock.
+        // Every awakened caller rechecks both ceilings; notification grants none.
+        available.notify(usize::MAX);
         self.maybe_prune(now);
     }
 
@@ -468,11 +493,15 @@ impl<K: Clone + Eq + std::hash::Hash> FuelRateLimiter<K> {
         *last = now;
         self.reserved
             .retain(|_, value| value.load(Ordering::Relaxed) > 0);
-        self.inner.retain(|_, cell| {
+        self.inner.retain(|principal, cell| {
             // Keep any cell we cannot lock (a concurrent holder => live).
             // Keep any cell whose window is still fresh (< 1s stale).
             match cell.try_lock() {
-                Some(window) => now.saturating_duration_since(window.window_start) < WINDOW,
+                Some(window) => {
+                    now.saturating_duration_since(window.window_start) < WINDOW
+                        || window.available.total_listeners() > 0
+                        || self.reserved_amount(principal) > 0
+                },
                 None => true,
             }
         });
@@ -844,6 +873,7 @@ mod tests {
                 Mutex::new(FuelWindow {
                     window_start: base,
                     fuel_in_window: 1,
+                    available: Arc::new(Event::new()),
                 }),
             );
         }

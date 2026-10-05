@@ -3603,14 +3603,29 @@ impl ExecutionEngine for WasmEngine {
             self.fuel_rate.clone(),
             None,
         );
-        let mut fuel_reservation = match execution_allocation.try_reserve(invocation_fuel_budget) {
+        // invocation_fuel_share is positive: both its finite share floor and
+        // the unlimited interceptor ceiling are at least one fuel unit.
+        let allowance = std::num::NonZeroU64::new(invocation_fuel_budget)
+            .expect("invocation fuel share is positive");
+        let admission_timeout = std::time::Duration::from_secs(
+            invocation_profile
+                .as_deref()
+                .map_or(astrid_core::profile::DEFAULT_MAX_TIMEOUT_SECS, |profile| {
+                    profile.quotas.max_timeout_secs
+                }),
+        )
+        .saturating_sub(invoke_start.elapsed());
+        let mut fuel_reservation = match execution_allocation
+            .reserve_with_timeout(allowance, admission_timeout)
+            .await
+        {
             Ok(reservation) => reservation,
             Err(error) => {
                 tracing::warn!(
                     principal = %invoking_principal,
                     capsule = %self.manifest.package.name,
                     action,
-                    "CPU-rate reservation exceeded; denying invocation"
+                    "CPU-rate admission failed; denying invocation"
                 );
                 return Ok(crate::capsule::InterceptResult::Deny {
                     reason: error.to_string(),
@@ -3685,7 +3700,25 @@ impl ExecutionEngine for WasmEngine {
         // borrowing the store mutably for the SET/CALL block; `PoolCheckout`
         // clears or discards the instance on drop.
         let checkout_start = std::time::Instant::now();
-        let Some(mut checkout) = pool.checkout().await else {
+        let remaining = std::time::Duration::from_secs(
+            invocation_profile
+                .as_deref()
+                .map_or(astrid_core::profile::DEFAULT_MAX_TIMEOUT_SECS, |profile| {
+                    profile.quotas.max_timeout_secs
+                }),
+        )
+        .saturating_sub(invoke_start.elapsed());
+        let checked_out = match astrid_runtime::time::timeout(remaining, pool.checkout()).await {
+            Ok(checkout) => checkout,
+            Err(_) => {
+                // No invocation guest ran; return unused admission capacity.
+                fuel_reservation.settle(0, std::time::Instant::now());
+                return Ok(crate::capsule::InterceptResult::Deny {
+                    reason: "invocation deadline expired waiting for capsule instance".into(),
+                });
+            },
+        };
+        let Some(mut checkout) = checked_out else {
             // A failed replacement must not skip the guard on the next request.
             return Ok(crate::capsule::InterceptResult::Deny {
                 reason: "no capsule instance available".into(),
@@ -3712,14 +3745,18 @@ impl ExecutionEngine for WasmEngine {
                 });
 
             if !is_daemon {
-                let deadline = applied_profile.quotas.max_timeout_secs.saturating_mul(1000)
-                    / EPOCH_TICK_INTERVAL.as_millis() as u64;
+                // Admission and pool checkout spend the same invocation budget
+                // as guest execution; neither can grant a second full timeout.
+                let remaining =
+                    std::time::Duration::from_secs(applied_profile.quotas.max_timeout_secs)
+                        .saturating_sub(invoke_start.elapsed());
+                let deadline = remaining.as_millis() / EPOCH_TICK_INTERVAL.as_millis();
                 // Component initialization may have installed the exempt
                 // continue callback. A short-lived interceptor invocation is
                 // always deadline-bound, so restore Wasmtime's trapping policy
                 // before applying its caller-profile timeout.
                 s.epoch_deadline_trap();
-                s.set_epoch_deadline(deadline);
+                s.set_epoch_deadline(u64::try_from(deadline).unwrap_or(u64::MAX));
             }
 
             // Bind the authenticated caller before guest execution. Accounted
