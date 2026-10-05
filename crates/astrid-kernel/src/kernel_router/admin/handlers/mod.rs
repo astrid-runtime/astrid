@@ -36,13 +36,14 @@ use tracing::{info, warn};
 
 use crate::kernel_router::AuthorizedRequest;
 
+mod capsule_assignment;
 pub(super) mod creation_authority;
 mod distro_dispatch;
 mod env_handlers;
 mod responses;
 pub(super) use responses::{err_bad_input, err_internal, err_profile, success_json};
 mod user_principals;
-use super::inheritance::copy_modify_env;
+use capsule_assignment::materialize_added_capsule_installs;
 use env_handlers::{EnvSetRequest, env_delete, env_list, env_set};
 
 /// Platform label used by the identity store for agent principals
@@ -525,11 +526,8 @@ async fn agent_modify_from_req(
         return err_bad_input(format!("profile rejected: {e}"));
     }
     if capsules_changed
-        && let Err(e) = materialize_added_capsule_installs(kernel, &principal, &add_capsules)
+        && let Err(e) = materialize_added_capsule_installs(kernel, &principal, &add_capsules).await
     {
-        return err_bad_input(e);
-    }
-    if capsules_changed && let Err(e) = copy_modify_env(kernel, &principal, &add_capsules).await {
         return err_internal(e);
     }
     // HTTP inventory discovers published cache directories, not store
@@ -620,56 +618,6 @@ fn warm_principal_capsules(kernel: &Arc<crate::Kernel>, principal: PrincipalId) 
         kernel.ensure_principal_loaded(&principal).await;
         kernel.publish_capsules_loaded_for(&principal).await;
     });
-}
-
-fn materialize_added_capsule_installs(
-    kernel: &crate::Kernel,
-    principal: &PrincipalId,
-    add_capsules: &[String],
-) -> Result<(), String> {
-    let store = kernel
-        .principal_store
-        .as_ref()
-        .ok_or_else(|| "authoritative principal store is unavailable".to_owned())?;
-    let source_uid = kernel
-        .principal_directory
-        .uid_for(&PrincipalId::default())
-        .map_err(|error| format!("resolve default principal UID: {error}"))?;
-    let target_uid = kernel
-        .principal_directory
-        .uid_for(principal)
-        .map_err(|error| format!("resolve target principal UID: {error}"))?;
-    let source_owner = astrid_storage::StateOwner::Principal(source_uid);
-    let target_owner = astrid_storage::StateOwner::Principal(target_uid);
-    for capsule in add_capsules {
-        if store
-            .capsules()
-            .get_snapshot(&target_owner, capsule)
-            .map_err(|error| format!("read target capsule '{capsule}': {error}"))?
-            .is_some()
-        {
-            continue;
-        }
-        let Some(snapshot) = store
-            .capsules()
-            .get_snapshot(&source_owner, capsule)
-            .map_err(|error| format!("read default capsule '{capsule}': {error}"))?
-        else {
-            continue;
-        };
-        store
-            .capsules()
-            .install(
-                &target_owner,
-                capsule,
-                snapshot.package(),
-                astrid_storage::CapsuleInstallExpectation::Absent,
-            )
-            .map_err(|error| {
-                format!("copy durable capsule '{capsule}' for {principal}: {error}")
-            })?;
-    }
-    Ok(())
 }
 
 /// Build the `agent.modify` success body reporting the principal's
