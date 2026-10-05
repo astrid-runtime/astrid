@@ -35,6 +35,7 @@ async fn busy_prompt_returns_terminal_error_without_releasing_existing_turn() {
     let identity = identity();
     let mut receiver = registry.subscribe("alice".to_owned(), None, identity.request_owner);
     process_inbound(&bus, &identity, "alice", &receiver, prompt("original"))
+        .await
         .expect("first prompt admitted");
     let mut bus_responses = bus.subscribe_topic("agent.v1.response");
     let (server, peer) = LocalStream::pair().expect("socket pair");
@@ -91,13 +92,14 @@ async fn busy_prompt_returns_terminal_error_without_releasing_existing_turn() {
             Uuid::new_v4(),
         )
         .with_principal("alice")
-        .with_request_owner(identity.request_owner),
+        .with_request_owner(receiver.turn_owner().expect("original turn owner")),
     });
     assert!(
         receiver.try_recv().is_ok(),
         "original response still delivered"
     );
     process_inbound(&bus, &identity, "alice", &receiver, prompt("retry"))
+        .await
         .expect("next prompt admitted after original completes");
 }
 
@@ -108,6 +110,7 @@ async fn malformed_chat_and_foreign_cancel_return_terminal_reasons() {
     let identity = identity();
     let receiver = registry.subscribe("alice".to_owned(), None, identity.request_owner);
     process_inbound(&bus, &identity, "alice", &receiver, prompt("original"))
+        .await
         .expect("original turn");
     let missing_session = IpcMessage::new(
         Topic::from_raw(routing::CHAT_REQUEST_TOPIC),
@@ -202,6 +205,7 @@ async fn another_connection_receives_busy_error_but_cannot_finish_owner_turn() {
         &owner,
         prompt("same-session"),
     )
+    .await
     .expect("owner admitted");
     let (server, peer) = LocalStream::pair().expect("socket pair");
     let (_reader, mut writer) = local_transport::split(server);

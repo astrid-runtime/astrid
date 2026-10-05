@@ -970,6 +970,7 @@ dependencies = [
  "astrid-crypto",
  "astrid-events",
  "astrid-types",
+ "async-trait",
  "hex",
  "rand 0.10.2",
  "serde",

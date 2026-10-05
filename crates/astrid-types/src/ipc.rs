@@ -7,11 +7,12 @@ use uuid::Uuid;
 
 use crate::topic::Topic;
 
-/// Opaque host-minted owner of one authenticated request connection.
+/// Opaque host-minted owner of an authenticated request scope.
 ///
 /// The value is internal routing metadata, not a credential. It is minted by
-/// the host when a local connection authenticates and propagated through the
-/// event bus so interactive responses can be bound to that exact connection.
+/// the host when a local connection authenticates or begins a chat turn, and
+/// propagated through the event bus. A new turn has a distinct owner even on
+/// the same connection, so delayed responses cannot complete its successor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RequestOwnerId(Uuid);

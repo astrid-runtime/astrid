@@ -62,6 +62,17 @@ def fast_stream_units() -> list[str]:
     return [f"unit-{index:05d} " for index in range(FAST_STREAM_UNITS)]
 
 
+def holds_current_request(body: dict[str, Any]) -> bool:
+    # A cancelled prompt remains in conversation history. Holding that history
+    # would also stall the next turn and hide whether recovery actually works.
+    for message in reversed(body.get("messages", [])):
+        if message.get("role") == "user":
+            return "ASTRID_E2E_INFLIGHT_CRASH_" in json.dumps(
+                message.get("content", ""), sort_keys=True
+            )
+    return False
+
+
 class State:
     def __init__(self, log_path: Path) -> None:
         self.log_path = log_path
@@ -192,9 +203,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("cache-control", "no-cache")
         self.end_headers()
 
-        if "ASTRID_E2E_INFLIGHT_CRASH_" in json.dumps(
-            body.get("messages", []), sort_keys=True
-        ):
+        if holds_current_request(body):
             self.wfile.write(
                 b'data: {"id":"chatcmpl-fake","object":"chat.completion.chunk",'
                 b'"model":"fake-crash-hold","choices":[{"index":0,'
