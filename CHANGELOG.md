@@ -50,6 +50,10 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ### Fixed
 
+- Use the same runtime compatibility rules for capsule and distro manifests,
+  so dev release candidates can load capsules with satisfied stable minimum
+  versions while preserving explicit prerelease ordering and version bounds.
+
 - Recover stopped volumes affected by older capsule installers leaving a
   replacement runtime-key sidecar. Preserve the replacement as system-owned
   evidence and restore only the volume's existing identity. Durable recovery
