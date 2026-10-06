@@ -81,11 +81,7 @@ jobs:
           version = release_manifest.canonical_version(tag[1:])
           if tag != f"v{version}":
               raise SystemExit("release tag must be canonical v<semver>")
-          nightly = release_manifest.nightly_source_commit(version) is not None
-          if (channel == "nightly") != nightly:
-              raise SystemExit("nightly and canonical releases cannot cross channel classes")
-          if channel != "nightly" and ("-" in version or "+" in version):
-              raise SystemExit("stable and dev require canonical X.Y.Z releases")
+          release_manifest.validate_channel_version(channel, version)
           if not value.isascii() or not value.isdecimal() or value.startswith("0"):
               raise SystemExit("generation must be a canonical positive decimal integer")
           generation = int(value)
@@ -136,6 +132,9 @@ jobs:
           [[ "$SOURCE_COMMIT" == "$TAG_COMMIT" ]]
           EXPECTED_PRERELEASE=false
           EXPECTED_EVENT=push
+          if [[ "$CHANNEL" == dev && "$VERSION" == *-rc.* ]]; then
+            EXPECTED_PRERELEASE=true
+          fi
           if [[ "$CHANNEL" == nightly ]]; then
             EXPECTED_PRERELEASE=true
             EXPECTED_EVENT=workflow_dispatch

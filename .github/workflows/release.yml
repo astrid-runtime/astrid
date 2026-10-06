@@ -44,6 +44,7 @@ jobs:
       contents: read
     outputs:
       nightly: ${{ steps.release.outputs.nightly }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
       version: ${{ steps.release.outputs.version }}
       source-commit: ${{ steps.release.outputs.source-commit }}
       build-matrix: ${{ steps.release.outputs.build-matrix }}
@@ -81,7 +82,7 @@ jobs:
             VERSION="${GITHUB_REF_NAME#v}"
             SOURCE_COMMIT=$(git rev-parse 'HEAD^{commit}')
             if [[ "$EVENT_NAME" == push ]]; then
-              [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+              python3 scripts/release_candidate.py validate-tag --version "$VERSION"
               NIGHTLY=false
             elif [[ "$EVENT_NAME" == workflow_dispatch ]]; then
               NIGHTLY_DATE="${VERSION#*-nightly.}"
@@ -107,6 +108,7 @@ jobs:
           fi
           {
             echo "nightly=$NIGHTLY"
+            echo "prerelease=$([[ "$VERSION" == *-* ]] && echo true || echo false)"
             echo "version=$VERSION"
             echo "source-commit=$SOURCE_COMMIT"
             echo "build-matrix=$BUILD_MATRIX"
@@ -161,6 +163,9 @@ jobs:
       - name: Stage deterministic nightly version
         if: needs.classify.outputs.nightly == 'true'
         run: python3 scripts/nightly_version.py stage --version "${GITHUB_REF_NAME#v}"
+      - name: Stage release candidate version
+        if: needs.classify.outputs.prerelease == 'true' && needs.classify.outputs.nightly != 'true'
+        run: python3 scripts/release_candidate.py stage --version "${GITHUB_REF_NAME#v}"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -473,6 +478,9 @@ jobs:
       - name: Stage deterministic nightly version
         if: needs.classify.outputs.nightly == 'true'
         run: python3 scripts/nightly_version.py stage --version "${GITHUB_REF_NAME#v}"
+      - name: Stage release candidate version
+        if: needs.classify.outputs.prerelease == 'true' && needs.classify.outputs.nightly != 'true'
+        run: python3 scripts/release_candidate.py stage --version "${GITHUB_REF_NAME#v}"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -489,16 +497,11 @@ jobs:
           pattern: binary-*
           merge-multiple: true
 
-      # The whole notes document is assembled into a FILE and handed to the
-      # release action via `body_path`. An inline `body:` input reaches the
-      # action as an environment variable on its node process, and a large
-      # changelog section blows past the kernel's per-string env/arg ceiling
-      # (E2BIG, "Argument list too long") before the step can even start —
-      # exactly what killed the v0.9.0 release (#1105).
+      # Use body_path: inline notes can exceed the E2BIG environment limit (#1105).
       - name: Compose release notes
         env:
           GH_TOKEN: ${{ github.token }}
-          NIGHTLY: ${{ needs.classify.outputs.nightly }}
+          PRERELEASE: ${{ needs.classify.outputs.prerelease }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           NOTES=release-notes.md
@@ -506,7 +509,7 @@ jobs:
           # string, never a regex, so dots (or any metacharacter in a tag name)
           # cannot widen the match. Fragments must already be rolled into
           # CHANGELOG.md; this step refuses leftover files in changes/.
-          python3 scripts/changelog.py notes --version "$VERSION" --require-rolled > "$NOTES"
+          python3 scripts/changelog.py notes --version "${VERSION%%-rc.*}" --require-rolled > "$NOTES"
           if [ ! -s "$NOTES" ]; then
             echo "See [CHANGELOG.md](https://github.com/astrid-runtime/astrid/blob/${GITHUB_REF_NAME}/CHANGELOG.md) for details." > "$NOTES"
           fi
@@ -515,11 +518,11 @@ jobs:
           ## Install
           INSTALL
 
-          if [[ "$NIGHTLY" == true ]]; then
+          if [[ "$PRERELEASE" == true ]]; then
             cat >> "$NOTES" <<'INSTALL'
 
-          Nightly releases are available only as signed pre-built binaries and
-          through `astrid update --channel nightly`. They are not published to
+          Prereleases are available only as signed pre-built binaries and
+          through `astrid update --channel dev` (RCs) or `--channel nightly`. They are not published to
           crates.io or Homebrew.
           INSTALL
           else
@@ -641,7 +644,7 @@ jobs:
       - name: Detect an interrupted never-published draft
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.nightly }}
+          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.prerelease }}
         run: |
           RELEASES="$RUNNER_TEMP/releases-preflight.json"
           gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
@@ -686,7 +689,7 @@ jobs:
       - name: Select and authenticate the exact release candidate
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.nightly }}
+          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.prerelease }}
         run: |
           CANDIDATE="$GITHUB_WORKSPACE/artifacts"
           PAYLOADS="$RUNNER_TEMP/release-payloads.txt"
@@ -873,7 +876,7 @@ jobs:
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           draft: true
-          prerelease: ${{ needs.classify.outputs.nightly == 'true' }}
+          prerelease: ${{ needs.classify.outputs.prerelease == 'true' }}
           make_latest: false
           overwrite_files: false
           preserve_order: true
@@ -890,7 +893,7 @@ jobs:
         if: env.EXISTING_RELEASE != '1'
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.nightly }}
+          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.prerelease }}
         run: |
           RELEASES="$RUNNER_TEMP/releases-after-create.json"
           gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
@@ -903,7 +906,8 @@ jobs:
       - name: Reauthenticate and publish the exact immutable release
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.nightly }}
+          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.prerelease }}
+          NIGHTLY: ${{ needs.classify.outputs.nightly }}
           EXPECTED_SOURCE: ${{ needs.classify.outputs.source-commit }}
         run: |
           EXPECTED_LATEST=true
@@ -921,7 +925,7 @@ jobs:
           done
           [[ "$TAG_TYPE" == commit ]]
           [[ "$TAG_COMMIT" == "$EXPECTED_SOURCE" ]]
-          if [[ "$EXPECTED_PRERELEASE" == true ]]; then
+          if [[ "$NIGHTLY" == true ]]; then
             BASE_VERSION=$(python3 - <<'PY'
           import tomllib
           with open("release/nightly.toml", "rb") as file:

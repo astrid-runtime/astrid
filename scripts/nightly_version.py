@@ -106,6 +106,11 @@ def stage(root: Path, version: str) -> None:
     base = base_version(root)
     require(match.group("base") == base, "nightly version must derive from release/nightly.toml")
     real_date(match.group("date"))
+    stage_workspace_version(root, version)
+
+
+def stage_workspace_version(root: Path, version: str) -> None:
+    """Stage an already validated prerelease identity without changing external packages."""
     current = source_version(root)
 
     cargo_path = root / "Cargo.toml"

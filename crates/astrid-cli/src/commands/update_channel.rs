@@ -505,9 +505,13 @@ fn validate_pointer(
             nightly_commit.is_some() && version.build.is_empty(),
             "nightly channel must point to an exact nightly prerelease"
         ),
-        UpdateChannel::Stable | UpdateChannel::Dev => ensure!(
+        UpdateChannel::Stable => ensure!(
             version.pre.is_empty() && version.build.is_empty(),
-            "stable and dev channels must point to canonical releases"
+            "stable requires canonical releases"
+        ),
+        UpdateChannel::Dev => ensure!(
+            (version.pre.is_empty() || is_release_candidate(&version)) && version.build.is_empty(),
+            "dev requires canonical releases or X.Y.Z-rc.N"
         ),
     }
     ensure!(
@@ -541,6 +545,18 @@ fn validate_pointer(
     );
     validate_targets(&pointer.targets, &pointer.release.version)?;
     Ok(())
+}
+
+fn is_release_candidate(version: &semver::Version) -> bool {
+    version
+        .pre
+        .as_str()
+        .strip_prefix("rc.")
+        .is_some_and(|number| {
+            !number.starts_with('0')
+                && !number.is_empty()
+                && number.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 fn nightly_source_commit(version: &semver::Version) -> Option<&str> {

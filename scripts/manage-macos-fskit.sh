@@ -133,10 +133,14 @@ validate_companion() {
   }
   provider_version="$(sed -nE 's/.*"name":"astrid-storage-provider-fskit","version":"([^"]+)".*/\1/p' \
     <<<"$provider_output" | head -n 1)"
-  [[ "$provider_version" == "$app_version" ]] || {
+  [[ -n "$provider_version" && "${provider_version%%-*}" == "$app_version" ]] || {
     echo "FSKit companion version $provider_version does not match AstridFS $app_version" >&2
     return 1
   }
+  if [[ -n "${ASTRID_FSKIT_EXPECTED_VERSION:-}" && "$provider_version" != "$ASTRID_FSKIT_EXPECTED_VERSION" ]]; then
+    echo "FSKit companion version $provider_version does not match the exact expected runtime" >&2
+    return 1
+  fi
 }
 
 app_process_matches() {
@@ -153,7 +157,7 @@ app_process_matches() {
     "$DESTINATION_APP/Contents/Info.plist")"
   [[ -n "$installed_version" ]]
   if [[ -n "${ASTRID_FSKIT_EXPECTED_VERSION:-}" ]]; then
-    [[ "$installed_version" == "$ASTRID_FSKIT_EXPECTED_VERSION" ]]
+    [[ "$installed_version" == "${ASTRID_FSKIT_EXPECTED_VERSION%%-*}" ]]
   fi
 }
 

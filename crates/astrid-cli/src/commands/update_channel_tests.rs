@@ -214,6 +214,31 @@ fn all_channels_parse_with_strict_identity_and_expiry() {
 }
 
 #[test]
+fn release_candidates_are_dev_only() {
+    for version in ["1.2.3-rc.1", "1.2.3-rc.20"] {
+        let value = toml::to_string(&pointer(UpdateChannel::Dev, 1))
+            .unwrap()
+            .replace(VERSION, version);
+        assert!(parse_channel(value.as_bytes(), UpdateChannel::Dev, validation_time()).is_ok());
+        let stable = value.replace("channel = \"dev\"", "channel = \"stable\"");
+        assert!(
+            parse_channel(stable.as_bytes(), UpdateChannel::Stable, validation_time()).is_err()
+        );
+    }
+    for version in [
+        "1.2.3-rc.0",
+        "1.2.3-rc.01",
+        "1.2.3-beta.1",
+        "1.2.3-rc.1+build",
+    ] {
+        let value = toml::to_string(&pointer(UpdateChannel::Dev, 1))
+            .unwrap()
+            .replace(VERSION, version);
+        assert!(parse_channel(value.as_bytes(), UpdateChannel::Dev, validation_time()).is_err());
+    }
+}
+
+#[test]
 fn channel_release_classes_do_not_cross() {
     let mut nightly_as_dev = nightly_pointer(1);
     nightly_as_dev.channel = "dev".to_owned();

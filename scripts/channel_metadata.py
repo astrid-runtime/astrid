@@ -182,11 +182,7 @@ def validate_channel(
         string(release[key], f"channel release {key}")
     version = release_manifest.canonical_version(release["version"])
     nightly = release_manifest.nightly_source_commit(version) is not None
-    if channel == "nightly":
-        if not nightly:
-            fail("nightly channel must point to an exact nightly prerelease")
-    elif nightly or "-" in version or "+" in version:
-        fail("stable and dev channels must point to canonical releases")
+    release_manifest.validate_channel_version(channel, version)
     tag = release["tag"]
     if tag != f"v{version}":
         fail("channel release tag does not match its version")

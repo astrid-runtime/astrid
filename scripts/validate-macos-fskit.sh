@@ -32,7 +32,7 @@ APP_RELEASE_VERSION="$(plutil -extract CFBundleShortVersionString raw -expect st
 EXTENSION_RELEASE_VERSION="$(plutil -extract CFBundleShortVersionString raw -expect string "$EXTENSION_PATH/Contents/Info.plist")"
 [[ -n "$APP_VERSION" && "$APP_VERSION" == "$EXTENSION_VERSION" ]]
 [[ -n "$APP_RELEASE_VERSION" && "$APP_RELEASE_VERSION" == "$EXTENSION_RELEASE_VERSION" ]]
-if [[ -n "${ASTRID_FSKIT_EXPECTED_VERSION:-}" && "$APP_RELEASE_VERSION" != "$ASTRID_FSKIT_EXPECTED_VERSION" ]]; then
+if [[ -n "${ASTRID_FSKIT_EXPECTED_VERSION:-}" && "$APP_RELEASE_VERSION" != "${ASTRID_FSKIT_EXPECTED_VERSION%%-*}" ]]; then
   echo "AstridFS version $APP_RELEASE_VERSION does not match expected Astrid $ASTRID_FSKIT_EXPECTED_VERSION" >&2
   exit 1
 fi
@@ -63,8 +63,12 @@ if [[ -e "$COMPANION_PATH" ]]; then
     | "$COMPANION_PATH" --astrid-provider-stdio-v1)"
   PROVIDER_VERSION="$(sed -nE 's/.*"name":"astrid-storage-provider-fskit","version":"([^"]+)".*/\1/p' \
     <<<"$PROVIDER_OUTPUT" | head -n 1)"
-  [[ -n "$PROVIDER_VERSION" && "$PROVIDER_VERSION" == "$APP_RELEASE_VERSION" ]] || {
+  [[ -n "$PROVIDER_VERSION" && "${PROVIDER_VERSION%%-*}" == "$APP_RELEASE_VERSION" ]] || {
     echo "FSKit companion version '$PROVIDER_VERSION' does not match AstridFS $APP_RELEASE_VERSION" >&2
     exit 1
   }
+  if [[ -n "${ASTRID_FSKIT_EXPECTED_VERSION:-}" && "$PROVIDER_VERSION" != "$ASTRID_FSKIT_EXPECTED_VERSION" ]]; then
+    echo "FSKit companion version '$PROVIDER_VERSION' does not match the exact expected runtime" >&2
+    exit 1
+  fi
 fi
