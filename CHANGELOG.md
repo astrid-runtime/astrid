@@ -12,6 +12,9 @@ Version numbers follow [year.month.patch](release/VERSIONING.md) beginning with
 
 ### Added
 
+- Add numbered release candidates on the dev channel without consuming the
+  final stable tag. Candidates use binary installation; stable promotion
+  remains separate and rejects prereleases.
 - Add accountable users for principals and optional shared user WASM fuel-rate
   budgets across their principals. Accounting covers initialization, lifecycle
   hooks, foreground calls and background execution. Unambiguous local ownership
