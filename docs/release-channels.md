@@ -17,8 +17,16 @@ promotion does not rebuild, rename, or replace release archives. The build
 train and channel promotion remain separate operations. A merge to `main` is
 never itself a release or channel promotion.
 
-Stable and dev releases are deliberate canonical `X.Y.Z` tags. Nightly is a
-deterministic prerelease of the reviewed base version in `release/nightly.toml`:
+Stable releases are deliberate canonical `X.Y.Z` tags. Dev accepts those tags
+and numbered release candidates such as `v2026.10.0-rc.1`. RC numbers are positive
+integers without leading zeros; other prereleases and build metadata are refused.
+An RC is a GitHub prerelease, never selected as GitHub's latest stable release,
+and cannot be promoted to stable. Its workspace version is staged only in the
+build checkout; the RC base must equal the tagged source's workspace version.
+This leaves `v2026.10.0` available for the final release. Nightly is a
+deterministic prerelease. macOS bundles use the numeric base version required by
+Apple; their source revision build number and signed archive retain provenance.
+Nightly uses this identity:
 
 ```text
 X.Y.Z-nightly.YYYYMMDD.g<40-character-source-commit>
@@ -65,9 +73,15 @@ that check. Once the immutable canonical binary release is complete, the
 workflow publishes all 26
 public workspace crates in dependency order and confirms each permanent
 crates.io checksum. Nightly releases are GitHub prereleases and never publish to
-crates.io. Stable and dev promotion require the canonical release workflow,
-including crates.io publication, to have succeeded. Nightly promotion requires
+crates.io. Dev RCs are also binary prereleases: they do not publish stable crates
+or change stable. Stable crate publication remains a separate protected step.
+Dev promotion requires the exact tag-bound release workflow to succeed. Nightly promotion requires
 the exact scheduled tag-bound workflow to have succeeded.
+
+Clients released before dev RC support reject RC channel pointers. Their first
+upgrade needs an updated public installer; changing the signed pointer alone
+cannot update that client's validator. Installer compatibility must be verified
+before moving dev onto its first RC.
 
 ## Signed contract
 

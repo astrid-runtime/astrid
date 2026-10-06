@@ -81,6 +81,22 @@ def canonical_version(value: object) -> str:
     return value
 
 
+def is_release_candidate(version: str) -> bool:
+    return re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)-rc\.[1-9][0-9]*", version) is not None
+
+
+def validate_channel_version(channel: str, version: str) -> None:
+    canonical_version(version)
+    if channel == "nightly":
+        if nightly_source_commit(version) is None:
+            fail("nightly channel must point to an exact nightly prerelease")
+    elif channel not in ("stable", "dev"):
+        fail("unknown release channel")
+    elif "-" in version or "+" in version:
+        if channel != "dev" or not is_release_candidate(version):
+            fail("stable and dev require canonical releases; only dev permits X.Y.Z-rc.N")
+
+
 def nightly_source_commit(version: str) -> str | None:
     match = NIGHTLY.fullmatch(version)
     if match is None:

@@ -106,6 +106,25 @@ class ChannelMetadataTests(unittest.TestCase):
         channel_metadata.validate_channel(self.channel("dev"))
         channel_metadata.validate_channel(self.nightly_channel())
 
+    def test_dev_accepts_only_numbered_release_candidates(self) -> None:
+        data = self.channel("dev")
+        def retarget(version: str) -> None:
+            data["release"].update({
+                "version": version, "tag": f"v{version}",
+                "metadata-asset": f"astrid-{version}-release.toml",
+                "release-workflow-identity": f"https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v{version}",
+            })
+            for target in data["targets"]:
+                target["asset"] = f"astrid-{version}-{target['triple']}.tar.gz"
+                target["sigstore-bundle"] = f"{target['asset']}.sigstore.json"
+        for version in ("1.2.3-rc.1", "1.2.3-rc.20"):
+            retarget(version)
+            channel_metadata.validate_channel(data)
+        for version in ("1.2.3-rc.0", "1.2.3-rc.01", "1.2.3-beta.1", "1.2.3-rc.1+build"):
+            retarget(version)
+            with self.assertRaises(ValueError):
+                channel_metadata.validate_channel(data)
+
     def test_stable_rejects_prerelease_version(self) -> None:
         data = self.channel()
         data["release"]["version"] = "1.2.3-rc.1"
