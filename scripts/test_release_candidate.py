@@ -11,6 +11,42 @@ from test_nightly_version import NightlyVersionTests
 
 
 class ReleaseCandidateTests(NightlyVersionTests):
+    def test_shipped_macos_manager_accepts_bundle_base_but_binds_exact_runtime(self) -> None:
+        root = release_candidate.nightly_version.ROOT
+        manager = (root / "scripts/manage-macos-fskit.sh").read_text()
+        companion = manager.split("validate_companion() {", 1)[1].split("\napp_process_matches()", 1)[0]
+        process = manager.split("app_process_matches() {", 1)[1].split("\ncheck_app_processes()", 1)[0]
+        # Execute the shipped functions, replacing only host inspection tools;
+        # no app installation, signatures or real process identity are claimed.
+        companion = companion.replace("/usr/bin/codesign", "codesign")
+        process = process.replace("/bin/ps", "ps").replace("/usr/sbin/lsof", "lsof").replace("/usr/bin/codesign", "codesign")
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = os.path.join(temporary, "provider")
+            with open(provider, "w") as output:
+                output.write('#!/bin/sh\nprintf \'{"name":"astrid-storage-provider-fskit","version":"%s"}\\n\' "$TEST_PROVIDER_VERSION"\n')
+            os.chmod(provider, 0o700)
+            body = '''
+codesign() { printf 'Identifier=provider\\nTeamIdentifier=team\\nIdentifier=app\\n'; }
+plutil() { printf '%s\\n' "$TEST_BUNDLE_VERSION"; }
+ps() { printf '%s\\n' "$APP_EXECUTABLE"; }
+lsof() { printf 'n%s\\n' "$APP_EXECUTABLE"; }
+COMPANION_IDENTIFIER=provider CODE_SIGN_TEAM=team APP_IDENTIFIER=app
+SOURCE_APP=/fixture/source DESTINATION_APP=/fixture/destination APP_EXECUTABLE=/fixture/app
+'''
+            body += "validate_companion() {" + companion
+            body += "app_process_matches() {" + process
+            body += '\nvalidate_companion "$1" && app_process_matches 123\n'
+            for provider_version, bundle, expected, success in (
+                ("2026.10.0-rc.1", "2026.10.0", "2026.10.0-rc.1", True),
+                ("2026.10.0", "2026.10.0", "2026.10.0", True),
+                ("2026.10.0-rc.2", "2026.10.0", "2026.10.0-rc.1", False),
+                ("2026.9.4-rc.1", "2026.10.0", "2026.10.0-rc.1", False),
+            ):
+                with self.subTest(provider=provider_version, expected=expected):
+                    env = dict(os.environ, TEST_PROVIDER_VERSION=provider_version, TEST_BUNDLE_VERSION=bundle, ASTRID_FSKIT_EXPECTED_VERSION=expected)
+                    run = subprocess.run(["bash", "-euo", "pipefail", "-c", body, "manager-test", provider], env=env, capture_output=True, text=True)
+                    self.assertEqual(run.returncode == 0, success, run.stderr)
+
     def test_tag_push_executes_the_actual_workflow_classifier(self) -> None:
         root = release_candidate.nightly_version.ROOT
         workflow = (root / ".github/workflows/release.yml").read_text()

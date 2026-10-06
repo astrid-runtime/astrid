@@ -501,7 +501,7 @@ jobs:
       - name: Compose release notes
         env:
           GH_TOKEN: ${{ github.token }}
-          NIGHTLY: ${{ needs.classify.outputs.nightly }}
+          PRERELEASE: ${{ needs.classify.outputs.prerelease }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           NOTES=release-notes.md
@@ -518,11 +518,11 @@ jobs:
           ## Install
           INSTALL
 
-          if [[ "$NIGHTLY" == true ]]; then
+          if [[ "$PRERELEASE" == true ]]; then
             cat >> "$NOTES" <<'INSTALL'
 
-          Nightly releases are available only as signed pre-built binaries and
-          through `astrid update --channel nightly`. They are not published to
+          Prereleases are available only as signed pre-built binaries and
+          through `astrid update --channel dev` (RCs) or `--channel nightly`. They are not published to
           crates.io or Homebrew.
           INSTALL
           else
