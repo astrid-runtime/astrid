@@ -17,6 +17,7 @@ pub mod fuel_ledger;
 pub mod limits;
 pub mod manifest;
 pub mod memory_ledger;
+pub mod runtime_compatibility;
 
 pub use capsule::CapsuleId;
 pub use error::{CapsuleError, CapsuleResult};

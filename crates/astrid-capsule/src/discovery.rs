@@ -293,7 +293,7 @@ pub fn load_manifest(path: &Path) -> CapsuleResult<CapsuleManifest> {
             }
         })?;
 
-        if !req.matches(&runtime) {
+        if !astrid_capsule_types::runtime_compatibility::runtime_version_satisfied(&req, &runtime) {
             return Err(CapsuleError::ManifestParseError {
                 path: path.to_path_buf(),
                 message: format!(
