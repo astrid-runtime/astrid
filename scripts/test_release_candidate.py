@@ -11,6 +11,18 @@ from test_nightly_version import NightlyVersionTests
 
 
 class ReleaseCandidateTests(NightlyVersionTests):
+    def test_prerelease_install_notes_do_not_advertise_unpublished_crates(self) -> None:
+        workflow = (release_candidate.nightly_version.ROOT / ".github/workflows/release.yml").read_text()
+        condition = '          if [[ "$PRERELEASE" == true ]]; then'
+        branch = condition + workflow.split(condition, 1)[1].split("\n          fi", 1)[0] + "\n          fi"
+        branch = "\n".join(line[10:] for line in branch.splitlines())
+        for prerelease in ("true", "false"):
+            with self.subTest(prerelease=prerelease), tempfile.NamedTemporaryFile() as notes:
+                env = dict(os.environ, PRERELEASE=prerelease, NOTES=notes.name)
+                run = subprocess.run(["bash", "-euo", "pipefail", "-c", branch], env=env, capture_output=True, text=True)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual("cargo install astrid" in notes.read().decode(), prerelease == "false")
+
     def test_shipped_macos_manager_accepts_bundle_base_but_binds_exact_runtime(self) -> None:
         root = release_candidate.nightly_version.ROOT
         manager = (root / "scripts/manage-macos-fskit.sh").read_text()
