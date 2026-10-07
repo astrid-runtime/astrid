@@ -16,7 +16,7 @@ use crate::kv::{KvQuotaResolver, KvReadCacheConfig, KvStore, ScopedKvStore};
 use crate::principal_state::StorageResult as PrincipalStorageResult;
 use crate::principal_state::bootstrap;
 use crate::principal_state::format_amendment::{
-    PRE_DENSE_RADIX_FORMAT_SPEC_ID, STORE_METADATA_FILE, prepare_catalog_specification,
+    DIRECT_CATALOGUE_PREDECESSORS, STORE_METADATA_FILE, prepare_catalog_specification,
     prepare_destination, prepare_format_specification, representation_bootstrap_objects,
     store_metadata,
 };
@@ -270,7 +270,7 @@ async fn open_migrated_directory_store(
         engine
             .ensure_direct_representation_catalogue_compatible_with(
                 format_spec_id,
-                &[PRE_DENSE_RADIX_FORMAT_SPEC_ID],
+                DIRECT_CATALOGUE_PREDECESSORS,
                 &bootstrap_objects,
             )
             .map_err(|error| {
@@ -391,7 +391,7 @@ async fn assemble_runtime_store(
     tokio::task::spawn_blocking(move || {
         catalogue_engine.ensure_direct_representation_catalogue_compatible_with(
             format_spec_id,
-            &[PRE_DENSE_RADIX_FORMAT_SPEC_ID],
+            DIRECT_CATALOGUE_PREDECESSORS,
             &bootstrap_objects,
         )
     })

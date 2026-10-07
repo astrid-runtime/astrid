@@ -1,0 +1,1843 @@
+ASTRID PRINCIPAL STORE FORMAT 1
+================================
+
+Status: frozen archival specification
+Encoding: byte strings unless a field explicitly says UTF-8 or ASCII
+Integer encoding: unsigned little-endian unless explicitly marked big-endian
+Text encoding: UTF-8 without a terminating NUL
+Document line endings: LF
+
+This document is the byte-level recovery contract for Astrid principal stores.
+It is RÚNATAL: Recoverable Universal Notation for Astrid's Tagged Archival
+Layout. It is deliberately plain text and is itself stored as an immutable
+Evidence object. The tagged identity of that object is named by store.meta. No
+Astrid executable, Rust compiler, source repository, generated schema, or
+disposable index is required to decode the authoritative files.
+
+This specification describes format 1 only. A decoder MUST reject non-zero
+reserved fields, unknown physical frame versions, malformed lengths, trailing
+payload bytes, non-canonical records, identity mismatches, root compare-and-swap
+failures, and incomplete live root closures. It MAY preserve objects whose
+kind-scoped semantic schema it does not understand, because the outer object
+record is self-delimiting.
+
+
+1. STORE DIRECTORY
+==================
+
+Authoritative files:
+
+  store.meta       ASCII key=value metadata, one LF-terminated entry per line
+  objects.arena    immutable object frames
+  roots.journal    principal-root compare-and-swap frames
+  representations/CURRENT
+                   active physical-representation journal generation
+  representations/generations/<16 lowercase hexadecimal digits>/metadata.arena
+                   immutable physical metadata frames
+  representations/generations/<16 lowercase hexadecimal digits>/state.journal
+                   physical-state checkpoint and compare-and-swap frames
+
+The representation files are authoritative exactly when store.meta contains
+representations=authoritative-direct-v1. Arena-only predecessor stores omit
+that key and use the implicit direct-representation rule in section 12.9.
+Non-authoritative implementation files such as store.lock, indexes, caches,
+projection files, or migration markers are not needed to reconstruct data.
+
+The format-1 metadata entries are:
+
+  format=astrid-principal-store-v1
+  identity=blake3-object-identity-v1
+  identity-wire=tagged-identity-v1
+  format-spec-object=1:1:32:<64 lowercase hexadecimal digits>
+  content-catalog-spec-object=1:1:32:<64 lowercase hexadecimal digits>
+  representations=authoritative-direct-v1
+  principal-codec=principal-uid-v1
+  projection=kv-transition-bplus-v4
+
+The four colon-separated format-spec-object fields are identity algorithm,
+identity construction version, digest byte length, and digest bytes in
+lowercase hexadecimal. This is a textual representation of the TaggedIdentity
+grammar in section 3. The referenced object MUST be present in objects.arena,
+MUST have kind Evidence (10), object format 1, metadata class (1), logical
+bytes 0, no references, and canonical bytes exactly equal to this document.
+
+content-catalog-spec-object uses the same textual identity grammar. Its object
+MUST have the same Evidence shape and canonical bytes exactly equal to
+ASTRID CONTENT CATALOG FORMAT 2. That child specification defines the current
+canonical Directory tree. Directory version 1 in section 7.2 remains readable
+only for the recorded migration.
+
+
+2. COMMON PHYSICAL FRAME
+========================
+
+Every authoritative append-only or single-frame pointer file uses this frame
+unless its section explicitly says otherwise:
+
+  offset  size  field
+       0     8  magic
+       8     2  physical_frame_version = 1
+      10     2  reserved = 0
+      12     8  payload_length
+      20    32  checksum
+      52     N  payload, where N = payload_length
+
+The exact arena magic is the eight bytes:
+
+  41 53 54 4f 42 4a 31 00        ASCII "ASTOBJ1" followed by NUL
+
+The exact root-journal magic is:
+
+  41 53 54 52 4f 4f 54 00        ASCII "ASTROOT" followed by NUL
+
+The checksum is a 32-byte BLAKE3 derive-key digest. The exact derive-key context
+string, without quotes or a terminating NUL, is:
+
+  astrid durable physical frame checksum v1
+
+The material passed to the derived-key hasher is this exact concatenation:
+
+  magic[8]
+  physical_frame_version as u16 little-endian[2]
+  payload_length as u64 little-endian[8]
+  payload[payload_length]
+
+The reserved header bytes are not included. BLAKE3 "derive key" means the
+standard BLAKE3 DERIVE_KEY_CONTEXT operation over the context string followed
+by DERIVE_KEY_MATERIAL over the material, producing the first 32 output bytes.
+
+Recovery scans from byte zero. A physically incomplete final frame is an
+uncommitted tail and may be truncated. A final complete-looking frame with bad
+magic or checksum is also an uncommitted tail only when no later physically
+valid frame occurs in the file; it may be truncated. An invalid frame with a
+later physically valid frame is interior corruption and MUST fail recovery.
+Unsupported versions, non-zero reserved bytes, semantic payload errors, and
+identity errors are not torn-tail evidence and MUST fail recovery. After
+physical recovery, every selected root closure MUST still be complete.
+
+
+3. TAGGED IDENTITIES
+====================
+
+Every identity occurrence in both authoritative files uses:
+
+  size  field
+     2  algorithm, non-zero
+     2  construction_version, non-zero
+     4  digest_length, non-zero
+     N  digest, where N = digest_length
+
+The digest length is carried at every occurrence and is bounded by the
+containing physical frame. It is not intrinsically 32 bytes. In particular,
+the grammar carries digests of at least 48 bytes (384 bits) without a format
+change. That is the minimum reserved successor size: under the conservative
+quantum collision estimate of approximately 2^(n/3), 256 bits leaves roughly
+85 bits while 384 bits leaves roughly 128 bits. This is format capacity, not a
+claim that the current algorithm is deprecated.
+
+Registered format-1 identity schemes:
+
+  algorithm  construction  digest bytes  meaning
+          1             1            32  BLAKE3 object identity v1
+          1             2            32  BLAKE3 physical identity v1
+
+BLAKE3-256 remains construction 1. BLAKE3 is an XOF, so a registered successor
+may emit 48 bytes without changing primitive throughput materially, but it
+still receives a new construction tag and requires the re-root ceremony in
+section 10. Longer output is never silently reinterpreted as construction 1.
+
+Algorithm or construction zero is permanently invalid. A reader that does not
+implement a tagged scheme MUST preserve or reject it explicitly; it MUST NOT
+interpret its digest using another scheme. The format permits different tagged
+schemes in one store. Construction 1 records use only construction 1 targets;
+a future mixed-scheme object construction must define how complete target tags
+enter logical identity.
+
+
+4. OBJECT ARENA PAYLOAD
+=======================
+
+Each ASTOBJ1 physical payload is exactly:
+
+  TaggedIdentity object_id
+  u16            object_kind
+  u16            object_format_version, non-zero
+  u8             object_class
+  u64            logical_bytes
+  u64            canonical_bytes_length
+  u64            reference_count
+  u8[]           canonical_bytes[canonical_bytes_length]
+  Reference[]    references[reference_count]
+
+Each Reference is:
+
+  u64            label_length
+  u8[]           label[label_length]
+  TaggedIdentity target
+  u8             reference_kind
+
+There is no padding. The physical payload MUST end after the final reference.
+Reference labels are opaque bytes. References MUST be strictly increasing by
+unsigned bytewise lexicographic comparison of label. Empty labels are allowed
+by the outer object grammar. Duplicate labels are forbidden. A kind-scoped
+semantic grammar may impose stronger label rules.
+
+Stable object_class codes:
+
+  0  Data
+  1  Metadata
+
+Stable reference_kind codes:
+
+  0  Owns       target is required for reconstruction and default retention
+  1  Evidence   non-owning evidence relation
+  2  Lineage    non-owning history/fork/import relation
+  3  Derived    non-owning rebuildable representation
+
+Stable object_kind codes:
+
+   0  Chunk
+   1  ChunkTree
+   2  File
+   3  Symlink
+   4  Directory
+   5  KvLeaf
+   6  KvBranch
+   7  NamespaceMap
+   8  PrincipalState
+   9  Commit
+  10  Evidence
+  11  Derived
+  12  RuntimeSemanticProfile
+  13  DerivationInvocation
+  14  DerivationEvidence
+  15  GcPlanEvidence
+  16  GcCommitEvidence
+
+Only Owns references enter a principal's default reconstruction closure.
+Evidence, Lineage, and Derived targets survive only when independently rooted,
+pinned, or selected by an explicit archival policy. The RÚNATAL Evidence object
+is retained because store.meta names it, not because every principal owns it.
+
+
+5. BLAKE3 OBJECT IDENTITY CONSTRUCTION 1
+========================================
+
+For tagged identity (algorithm 1, construction 1), the object_id digest is the
+32-byte BLAKE3 derive-key digest of the decoded ObjectRecord. The exact
+derive-key context string, without quotes or a terminating NUL, is:
+
+  astrid principal store object identity v1
+
+The material is the exact concatenation below. Length fields in this identity
+construction are u128 little-endian even though physical framing uses u64.
+
+  object_kind as u16 little-endian[2]
+  object_format_version as u16 little-endian[2]
+  canonical_bytes_length as u128 little-endian[16]
+  canonical_bytes[canonical_bytes_length]
+  logical_bytes as u64 little-endian[8]
+  object_class as u8[1]
+  reference_count as u128 little-endian[16]
+
+  for each reference in physical order:
+      label_length as u128 little-endian[16]
+      label[label_length]
+      target digest bytes[32]
+      reference_kind as u8[1]
+
+Construction 1 requires every reference target to use algorithm 1,
+construction 1, and digest length 32. The target identity envelope is present
+in the physical object frame but only its 32 digest bytes occur in construction
+1 identity material. This restriction removes tag ambiguity from the legacy
+32-byte in-memory ObjectId while leaving the physical grammar ready for a
+successor construction.
+
+Recompute the digest after decoding and compare every byte to object_id.
+Repeated object IDs are legal only when the complete decoded ObjectRecord is
+equal. The same ID naming unequal records is a collision and MUST fail.
+
+
+6. ROOT JOURNAL PAYLOAD AND REPLAY
+==================================
+
+An ASTROOT physical payload is either a transition record or a root-snapshot
+record.
+
+A transition record is exactly:
+
+  u64            principal_length
+  u8[]           principal[principal_length]
+  u8             expected_tag
+  RootState?      expected, present only when expected_tag = 1
+  RootState       replacement
+
+RootState is:
+
+  u64            generation
+  TaggedIdentity commit
+
+expected_tag 0 means no expected root and carries no RootState. expected_tag 1
+means one expected RootState follows. Other values are invalid. The payload
+MUST end after replacement.
+
+A root-snapshot record is exactly:
+
+  u64            snapshot_sentinel = 18446744073709551615
+  u8             snapshot_record = 1
+  u64            root_count
+
+  repeated root_count times:
+      u64        principal_length
+      u8[]       principal[principal_length]
+      RootState  current
+
+Snapshot principals MUST be in strictly increasing unsigned bytewise
+lexicographic order. Duplicates, unknown snapshot_record values, and trailing
+bytes are invalid. A snapshot MUST be the first physical journal frame. Later
+transition frames replay against the snapshot exactly as they replay against
+prior transitions. The sentinel cannot collide with a valid transition:
+principal bytes of that declared length cannot fit inside the containing
+physical frame.
+
+The principal-uid-v1 principal codec is:
+
+  00                           system owner
+  01 <32-byte principal UID>   principal owner
+
+The system encoding is exactly one byte. A principal encoding is exactly 33
+bytes: tag 01 followed by the 32-byte, domain-separated BLAKE3 digest of its
+canonical genesis identity record. A display name, alias, current public key,
+or UUID text is never stored in the root journal.
+
+The principal genesis identity record hashed by BLAKE3 derive-key context
+"astrid principal uid v1" is exactly 68 bytes:
+
+  u16     genesis_format_version = 1
+  u16     initial_key_algorithm = 1        (Ed25519)
+  u32     initial_public_key_length = 32
+  u8[16]  identity UUID bytes
+  i64     creation Unix seconds
+  u32     creation nanoseconds
+  u8[32]  initial Ed25519 public key
+
+Integers are little-endian. creation_nanoseconds MUST be below 1000000000.
+The identity UUID and creation time are the values in the authoritative
+AstridUserId record. Current aliases and authentication keys reference this
+UID and may change without rewriting durable roots.
+
+Replay records in file order, maintaining a map principal -> RootState. A
+first-frame snapshot initializes that map with the encoded generations and
+commit identities. For each transition record:
+
+  1. actual is the current map value or absent.
+  2. expected MUST equal actual byte-for-byte.
+  3. If actual is absent, replacement.generation MUST equal 0.
+  4. Otherwise replacement.generation MUST equal actual.generation + 1
+     without u64 overflow.
+  5. Set the principal's current root to replacement.
+
+Any mismatch fails recovery. After replay, each current commit identity MUST
+exist, name object kind Commit, and have a complete finite acyclic closure over
+Owns references. The root journal is authoritative only after its physical
+frame is durable. Object frames must be durable before the root frame that
+names them.
+
+
+7. KIND-SCOPED CANONICAL GRAMMARS
+=================================
+
+The outer ObjectRecord in section 4 is sufficient to preserve every kind as an
+opaque typed object. The following schemas are the format-1 grammars needed to
+reconstruct the current KV and content projections. Any object carrying another
+kind/version pair remains opaque unless a later frozen specification defines
+it. In particular, format 1 does not assign a live schema to Symlink or
+Derived.
+
+All schemas below still obey the outer strict reference-label ordering rule.
+
+
+7.1 Production KV transitions and checkpoints, object format version 4
+-----------------------------------------------------------------------
+
+The visible KV map is an immutable B+-tree checkpoint followed by zero or more
+ordered transition records. A point mutation appends a transition; it does not
+rewrite fat pages. Maintenance folds accumulated transitions into a new
+B+-tree and resets the chain counters. Checkpointing is representation-only and
+MUST NOT change the reconstructed map or its accounting.
+
+Composite keys are:
+
+  namespace UTF-8, non-empty and containing no NUL
+  00
+  key UTF-8, non-empty and containing no NUL
+
+All key and bound comparisons are unsigned bytewise comparisons over the full
+composite key.
+
+KvLeaf used as a spilled value:
+
+  kind=5, version=4, class=Data, logical_bytes=0
+  canonical_bytes = exact value bytes, length strictly greater than 1024
+  references = empty
+
+KvLeaf used as a B+-tree leaf page:
+
+  kind=5, version=4, class=Metadata, logical_bytes=0
+  canonical_bytes:
+      u8[24] magic = "astrid-kv-bplus-leaf-v1" followed by 00
+      u16 entry_count, little-endian, in 1..=64
+      u64 subtree_entry_count
+      u64 subtree_logical_bytes
+      u64 subtree_quota_bytes
+      repeated entry_count times in strictly increasing key order:
+          u32 key_length
+          u8[key_length] composite_key
+          u64 value_length
+          u8 storage_tag
+          if storage_tag = 0:
+              u8[value_length] inline_value, value_length <= 1024
+          if storage_tag = 1:
+              no value bytes; value_length > 1024
+              required Owns reference label:
+                  "value/" || u16 entry_index big-endian
+              target is a version-4 Data KvLeaf of value_length bytes
+
+  Only spilled entries have value references. No other references are allowed.
+  The three subtree totals equal the decoded entries. Quota bytes are the sum
+  of composite-key lengths and value lengths.
+
+KvBranch used as a B+-tree internal page:
+
+  kind=6, version=4, class=Metadata, logical_bytes=0
+  canonical_bytes:
+      u8[26] magic = "astrid-kv-bplus-branch-v1" followed by 00
+      u16 level, little-endian, in 1..=16
+      u16 child_count, little-endian, in 2..=64
+      u64 subtree_entry_count
+      u64 subtree_logical_bytes
+      u64 subtree_quota_bytes
+      repeated child_count times in strictly increasing bound order:
+          u32 lower_bound_length
+          u8[lower_bound_length] lower_bound_composite_key
+          u64 child_entry_count, non-zero
+          u64 child_logical_bytes
+          u64 child_quota_bytes
+
+  references contain exactly one Owns reference per child:
+      "child/" || u16 child_index big-endian -> KvLeaf or KvBranch version 4
+
+  A child's recorded lower bound equals its decoded minimum key. Its recorded
+  totals equal its decoded totals. Every child has level parent_level - 1.
+  Adjacent child key ranges do not overlap. The parent totals equal the sum of
+  child totals. A page identity may occur only once in a checkpoint tree;
+  cycles and page reuse fail validation.
+
+The stable retained size of a page is:
+
+  29 + canonical_byte_length
+     + sum(41 + reference_label_length)
+
+A page with more than 4096 retained bytes is rejected whenever it can be split
+without violating structural population: leaf pages with more than one entry
+and branch pages with more than three children must fit. This is a canonical
+admission bound, not an operator storage or memory quota.
+
+NamespaceMap checkpoint:
+
+  kind=7, version=4, class=Metadata
+  canonical_bytes:
+      u8 tag = 0
+      u64 visible_entry_count
+      u64 visible_quota_bytes
+  logical_bytes = visible value-byte total
+  references = empty for an empty checkpoint, otherwise exactly:
+      Owns label "root" -> version-4 B+-tree page
+
+The declared entry, logical, and quota totals equal the decoded B+-tree totals.
+
+NamespaceMap transition:
+
+  kind=7, version=4, class=Metadata
+  canonical_bytes:
+      u8 tag = 1
+      u64 depth_since_checkpoint, non-zero
+      u64 delta_payload_bytes_since_checkpoint
+      u64 visible_entry_count
+      u64 visible_quota_bytes
+      u32 mutation_count, non-zero
+      repeated mutation_count times in strictly increasing key order:
+          u32 key_length
+          u8[key_length] composite_key
+          u8 operation_tag
+          if operation_tag = 0:
+              delete; no following value field
+          if operation_tag = 1:
+              u64 value_length, <= 1024
+              u8[value_length] inline_value
+          if operation_tag = 2:
+              u64 value_length, > 1024
+              required Owns reference label:
+                  "value/" || u32 mutation_index big-endian
+              target is a version-4 Data KvLeaf of value_length bytes
+
+  logical_bytes = visible value-byte total after applying this transition
+  references additionally contain at most:
+      Owns label "previous" -> preceding version-4 NamespaceMap
+
+No references other than the exact predecessor and spilled-value references
+are allowed. The first transition may omit "previous", which denotes the
+implicit empty checkpoint. For each transition, depth is predecessor depth + 1
+and delta_payload_bytes is the predecessor total plus the sum of key byte
+lengths and replacement value lengths in this transition; deletion contributes
+no value bytes. Applying mutations oldest-first MUST change every named key (a
+no-op is invalid) and MUST reproduce each transition's declared entry, logical,
+and quota totals exactly.
+
+A checkpoint builder may observe later transitions while constructing pages.
+It rebases that transition tail over the new checkpoint and publishes the
+result through the ordinary principal-root compare-and-swap. It never holds the
+principal mutation authority for the duration of the page build.
+
+PrincipalState:
+
+  kind=8, version=4, class=Metadata, logical_bytes=0
+  canonical_bytes = empty
+  references are owning component slots. Current reserved labels are:
+      Owns label "kv"      -> NamespaceMap version 4
+      Owns label "content" -> Directory version 1
+  Other component labels may be preserved as typed opaque owned subtrees.
+
+Commit:
+
+  kind=9, version=4, class=Metadata, logical_bytes=0
+  canonical_bytes = empty
+  required reference:
+      Owns label "state" -> PrincipalState version 4
+  optional reference:
+      Lineage label "parent" -> previous Commit
+  Other non-state typed references may be preserved. The parent is
+  identity-bearing but non-owning, so default reconstruction does not require
+  historical commits.
+
+7.1.1 Predecessor AVL representation, object format version 3
+--------------------------------------------------------------
+
+Version 3 is read only by the ordered migration and the independent recovery
+reader. No live operation writes it after the version-4 migration marker is
+durable.
+
+KvLeaf:
+
+  kind=5, version=3, class=Data, logical_bytes=0
+  canonical_bytes = the exact KV value bytes
+  references = empty
+
+KvBranch:
+
+  kind=6, version=3, class=Metadata, logical_bytes=0
+  canonical_bytes:
+      u32 height, non-zero
+      u64 subtree_logical_bytes
+      u64 subtree_quota_bytes
+      u64 value_length
+      u8[] composite_key, to end of canonical bytes
+
+  composite_key is:
+      namespace UTF-8, non-empty and containing no NUL
+      00
+      key UTF-8, non-empty and containing no NUL
+
+  references:
+      optional Owns label "left"  -> KvBranch version 3
+      optional Owns label "right" -> KvBranch version 3
+      required Owns label "value" -> KvLeaf version 3
+
+  No other references are allowed. The labels' bytewise sort order is left,
+  right, value. height is 1 + max(child heights), where absent children have
+  height 0. subtree_logical_bytes is left logical total + value_length + right
+  logical total. subtree_quota_bytes is left quota total + byte length of
+  composite_key + value_length + right quota total. value_length equals the
+  target KvLeaf canonical byte length. The tree is a binary search tree ordered
+  by unsigned bytewise composite_key and satisfies AVL balance.
+
+NamespaceMap:
+
+  kind=7, version=3, class=Metadata
+  canonical_bytes = u64 quota_bytes
+  logical_bytes = reconstructed sum of visible value lengths
+  references = empty for an empty tree, otherwise exactly:
+      Owns label "root" -> KvBranch version 3
+  quota_bytes equals the root branch subtree_quota_bytes, or zero when empty.
+
+PrincipalState:
+
+  kind=8, version=3, class=Metadata, logical_bytes=0
+  canonical_bytes = empty
+  references are owning component slots. Current reserved labels are:
+      Owns label "kv"      -> NamespaceMap version 3
+      Owns label "content" -> Directory version 1
+  Other component labels may be preserved as typed opaque owned subtrees.
+
+Commit:
+
+  kind=9, version=3, class=Metadata, logical_bytes=0
+  canonical_bytes = empty
+  required reference:
+      Owns label "state" -> PrincipalState version 3
+  optional reference:
+      Lineage label "parent" -> previous Commit
+  Other non-state typed references may be preserved. The parent is
+  identity-bearing but non-owning, so default reconstruction does not require
+  historical commits.
+
+
+7.2 Content DAG, object format version 1
+-----------------------------------------
+
+Chunk:
+
+  kind=0, version=1, class=Data, logical_bytes=0
+  canonical_bytes = exact chunk bytes
+  references = empty
+
+ChunkTree:
+
+  kind=1, version=1, class=Metadata, logical_bytes=0
+  canonical_bytes:
+      u16 child_count, range 1 through 128
+      u64 subtree_logical_bytes
+      u64 subtree_chunk_count
+      repeated child_count times:
+          u64 child_logical_bytes
+          u64 child_chunk_count
+
+  references: exactly child_count Owns references. Label i is the two-byte u16
+  index i in BIG-ENDIAN order, starting at zero. The target is a Chunk or
+  ChunkTree. Each child count and byte length is non-zero and child totals sum
+  to the subtree totals. Canonical construction groups an ordered chunk list
+  into consecutive groups of at most 128 at every level. Every non-final group
+  at a level is full. This uniquely fixes tree depth and grouping.
+
+File:
+
+  kind=2, version=1, class=Metadata, logical_bytes=0
+  canonical_bytes, exactly 40 bytes:
+      u8  chunking_algorithm = 1              FastCDC 2020
+      u16 implementation_revision = 1
+      u8  normalization = 1                   FastCDC Level1
+      u32 minimum_chunk_bytes
+      u32 average_chunk_bytes
+      u32 maximum_chunk_bytes
+      u64 gear_seed
+      u64 reconstructed_logical_bytes
+      u64 chunk_count
+
+  The ASTRID_V1 profile is minimum 16384, average 65536, maximum 262144,
+  seed 0, and fanout 128. minimum < average < maximum; average is a power of
+  two. The accepted parameter ranges are:
+
+      64       <= minimum_chunk_bytes <= 1048576
+      256      <= average_chunk_bytes <= 4194304
+      1024     <= maximum_chunk_bytes <= 16777216
+
+  Empty content has logical length 0, chunk count 0, and no references.
+  Non-empty content has exactly one Owns label "content" targeting a Chunk or
+  ChunkTree. Content at or below maximum_chunk_bytes has exactly one whole
+  Chunk; FastCDC is used only above that threshold. Every chunk is at most the
+  profile maximum. The effective minimum is
+  2 * floor(minimum_chunk_bytes / 2). Every non-final chunk is at least that
+  effective minimum; the final chunk may contain 1 through maximum bytes. For
+  multi-chunk content, applying the cut function to the final chunk alone MUST
+  consume its full length. One-chunk content remains governed by the
+  whole-object threshold and does not perform this final-suffix check.
+  Profile-bound products, and ChunkTree child byte and chunk-count totals, use
+  checked unsigned 64-bit arithmetic. Any overflow makes the object invalid.
+
+  Algorithm 1, implementation revision 1 is the following exact unsigned
+  64-bit FastCDC construction. All additions and left shifts wrap modulo 2^64.
+  Integer divisions round down. Odd minimum values are valid; minimum / 2
+  therefore starts at floor(minimum / 2).
+
+  Define the base gear table for byte b in 0 through 255 as:
+
+      digest  = MD5 of the 64-byte string whose every byte is b
+      GEAR[b] = digest bytes 0 through 7 interpreted as a big-endian u64
+
+  Define GEAR_LS[b] = GEAR[b] << 1. For gear_seed S, the tables used by the
+  cut function are:
+
+      gear[b]    = GEAR[b] XOR S
+      gear_ls[b] = GEAR_LS[b] XOR (S << 1)
+
+  MD5 is only a deterministic table generator here. It authenticates nothing.
+  The resulting chunks receive the BLAKE3 object identity from section 5.
+
+  The normalization mask table, indexed by bit count, is exactly:
+
+       0  0000000000000000       1  0000000000000000
+       2  0000000000000000       3  0000000000000000
+       4  0000000000000000       5  0000000001804110
+       6  0000000001803110       7  0000000018035100
+       8  0000001800035300       9  0000019000353000
+      10  0000590003530000      11  0000d90003530000
+      12  0000d90103530000      13  0000d90303530000
+      14  0000d90313530000      15  0000d90f03530000
+      16  0000d90303537000      17  0000d90703537000
+      18  0000d90707537000      19  0000d91707537000
+      20  0000d91747537000      21  0000d91767537000
+      22  0000d93767537000      23  0000d93777537000
+      24  0000d93777577000      25  0000db3777577000
+
+  For one chunk, let source be the unconsumed suffix. If source length is at
+  most minimum, consume it all. Otherwise:
+
+      remaining = min(source length, maximum)
+      center = min(average, remaining)
+      bits = exact base-2 logarithm of average
+      mask_s = MASKS[bits + normalization]
+      mask_l = MASKS[bits - normalization]
+      mask_s_ls = mask_s << 1
+      mask_l_ls = mask_l << 1
+      index = minimum / 2
+      fingerprint = 0
+
+  While index < center / 2:
+
+      at = index * 2
+      fingerprint = (fingerprint << 2) + gear_ls[source[at]]
+      if fingerprint AND mask_s_ls is zero, cut at at
+      fingerprint = fingerprint + gear[source[at + 1]]
+      if fingerprint AND mask_s is zero, cut at at + 1
+      index = index + 1
+
+  Continue without resetting fingerprint while index < remaining / 2:
+
+      at = index * 2
+      fingerprint = (fingerprint << 2) + gear_ls[source[at]]
+      if fingerprint AND mask_l_ls is zero, cut at at
+      fingerprint = fingerprint + gear[source[at + 1]]
+      if fingerprint AND mask_l is zero, cut at at + 1
+      index = index + 1
+
+  If no mask matches, cut at remaining. Restart fingerprint at zero for the
+  next unconsumed suffix. Repeat until the source is exhausted.
+
+  The independent format-1 golden source starts with u64 state
+  4d595df4d0f33173 hexadecimal. For each output byte:
+
+      state = state * 6364136223846793005 + 1442695040888963407 modulo 2^64
+      output byte = bits 37 through 44 of state
+
+  One MiB of this source under ASTRID_V1 has these chunk lengths:
+
+      94129, 73623, 28537, 107508, 87622, 224123,
+      45882, 98297, 40690, 69224, 121633, 57308
+
+  With only gear_seed changed to 7, the same source has:
+
+      38508, 66500, 109559, 79560, 87748, 95882, 86696, 53024,
+      87355, 46926, 103947, 22388, 92486, 69996, 8001
+
+  One MiB of zero bytes under ASTRID_V1 has four chunks of 262144 bytes. A
+  production implementation and an independent reader MUST reproduce all
+  three vectors byte-for-byte before admitting format-1 File objects.
+
+Directory content catalog:
+
+  kind=4, version=1, class=Metadata
+  canonical_bytes:
+      u64 quota_bytes
+      u32 entry_count
+      repeated entry_count times:
+          u64 visible_logical_bytes
+
+  references: exactly entry_count Owns references. Each label is one non-empty
+  UTF-8 content name containing no NUL; slash has no path meaning. Labels are
+  in unsigned bytewise order. Target is a File version 1. Entry i's visible
+  length is the corresponding u64 in canonical bytes. logical_bytes is the sum
+  of every entry length, including aliases. quota_bytes is logical_bytes plus
+  the UTF-8 byte length of every name.
+
+
+7.3 RÚNATAL store-format Evidence object
+-----------------------------------------
+
+The RÚNATAL object described in section 1 is:
+
+  kind=10, version=1, class=Metadata, logical_bytes=0
+  canonical_bytes = this complete document, from its first byte through its
+                    final LF
+  references = empty
+
+Other Evidence objects are kind-scoped application records and remain opaque
+unless their own frozen schema accompanies an export.
+
+
+7.4 Runtime semantic profile
+----------------------------
+
+RuntimeSemanticProfile is kind 12, version 1, class Metadata, logical_bytes 0.
+canonical_bytes is exactly one component-model-presence byte:
+
+  0  no component-model semantics reference
+  1  one component-model semantics reference is present
+
+Other values are invalid. The byte MUST agree with the presence of
+"01-component-model". Every reference has kind Owns. The required fixed
+references are:
+
+  "00-wasm-core"            WebAssembly core semantics contract
+  "02-float"                floating-point and NaN semantics contract
+  "03-threads"              thread and scheduling semantics contract
+  "04-resource-failure"     deterministic resource-failure contract
+
+The optional component-model semantics reference is:
+
+  "01-component-model"
+
+Enabled proposal contracts are a strictly ObjectId-ordered set. Reference i is:
+
+  "10-proposal/" || i as u64 big-endian || 00
+
+Proposal ordinals begin at zero with no gap. The target ObjectIds MUST be
+strictly increasing.
+
+Host-function semantic contracts are strictly ordered by their non-empty
+canonical function-name bytes. Their labels are:
+
+  "20-host-function/" || canonical function name
+
+No engine build identifier occurs in this object. A build identity belongs in
+execution evidence. Compatible builds name the same profile only after
+conformance to every semantics-visible contract above.
+
+
+7.5 Derivation invocation
+-------------------------
+
+DerivationInvocation is kind 13, version 1, class Metadata, logical_bytes 0.
+canonical_bytes is exactly two bytes. Byte 0 is the execution class:
+
+  0  Pure
+  1  SnapshotBound
+  2  Effectful
+  3  Nondeterministic
+
+Byte 1 is an optional-field presence mask:
+
+  bit 0  provenance snapshot reference is present
+  bit 1  deterministic seed reference is present
+
+All other bits MUST be zero. The mask MUST agree with the optional references.
+
+Required Owns references are:
+
+  "00-transform"                  exact capsule or executable closure
+  "01-transform-contract"         registered derivation contract
+  "02-canonical-parameters"       typed canonical parameter object
+  "03-runtime-semantic-profile"   kind-12 profile
+  "04-output-contract"            typed output contract
+
+Optional references are:
+
+  "05-provenance-snapshot"  Evidence  immutable observation snapshot
+  "06-deterministic-seed"   Owns      explicit seed material
+
+Input i uses an Evidence relation whose label is:
+
+  "10-input/" || i as u64 big-endian || 00 || non-empty semantic label
+
+Input ordinals begin at zero with no gap. Sequence order is identity-bearing.
+The Pure class forbids a provenance snapshot. SnapshotBound requires one.
+Effectful and Nondeterministic invocations are recordable but MUST NOT populate
+a reusable derivation index.
+
+
+7.6 Derivation evidence
+-----------------------
+
+DerivationEvidence is kind 14, version 1, class Metadata, logical_bytes 0.
+canonical_bytes is exactly two bytes. Byte 0 is the execution-class code from
+section 7.5. Byte 1 is a verifier-evidence presence byte:
+
+  0  no verifier/reference-execution evidence
+  1  one verifier/reference-execution reference is present
+
+Other values are invalid. The byte MUST agree with "08-verifier-evidence".
+
+The fixed references are:
+
+  "00-invocation"                  Owns      kind-13 invocation
+  "01-transform"                   Evidence  exact executed transform
+  "02-transform-contract"          Evidence  registered transform contract
+  "03-runtime-semantic-profile"    Evidence  kind-12 profile
+  "04-engine-build"                Evidence  actual executing engine build
+  "05-execution-measurements"      Evidence  canonical resource measurements
+  "06-authority-epoch"             Evidence  admission-policy epoch
+  "07-computation-sharing-domain"  Evidence  operator sharing domain
+  "08-verifier-evidence"           Evidence  optional verifier evidence
+
+Input i repeats the invocation input with an Evidence relation:
+
+  "10-input/" || i as u64 big-endian || 00 || non-empty semantic label
+
+Output i uses a Derived relation:
+
+  "20-output/" || i as u64 big-endian || 00 || non-empty semantic label
+
+Input and output ordinals each begin at zero with no gap. At least one output
+is required. Output references deliberately do not retain result bytes:
+evidence is a verified relation, while root and pin policy decides whether a
+result remains live. Admission MUST recompute the evidence identity, decode
+the owned invocation, verify every duplicated invocation field, reject a
+non-memoizable execution class, and prove every output's exact complete Owns
+closure before populating a reusable index.
+
+
+7.7 Garbage-collection plan evidence
+------------------------------------
+
+GcPlanEvidence is kind 15, version 1, class Metadata, logical_bytes 0, with
+empty canonical_bytes. Its fixed references are:
+
+  "00-fact-snapshot"       Owns      complete frozen relation/fence snapshot
+  "01-retention-policy"    Owns      history, pin, handle, erasure, and
+                                    quarantine policy
+  "02-tensor-logic-proof"  Owns      byte-stable auditor proof for this plan
+
+Owning these three records keeps the material needed to replay why deletion
+was believed safe. Tensor Logic remains an auditor: native liveness and
+publication fences authorize and enforce collection.
+
+Condemned object i uses a non-owning Evidence relation:
+
+  "10-condemned/" || i as u64 big-endian || 00
+
+The condemned set MUST be non-empty, its ordinals begin at zero with no gap,
+and its target ObjectIds MUST be strictly increasing. The non-owning relation
+records intent without retaining the bytes selected for deletion.
+
+
+7.8 Garbage-collection commit evidence
+--------------------------------------
+
+GcCommitEvidence is kind 16, version 1, class Metadata, logical_bytes 0, with
+empty canonical_bytes. Its references are:
+
+  "00-plan"                    Owns      exact kind-15 plan executed
+  "01-fact-snapshot"           Evidence  snapshot recomputed under commit fence
+  "02-placement-before"        Evidence  complete pre-collection placement set
+  "03-placement-after"         Evidence  complete durable successor placement
+  "04-execution-measurements"  Evidence  canonical resource measurements
+
+Before physical publication, the implementation MUST recompute the liveness
+fact snapshot while holding the native GC fence and compare it byte-for-byte
+with the snapshot owned by the plan. A mismatch fails the commit before any
+authoritative placement change. The receipt MUST recompute and match the plan
+ObjectId, and placement-before MUST differ from placement-after. Therefore a
+proof for one plan cannot be attached to a different deletion or a later fact
+snapshot.
+
+The v1 durable compactor represents each placement target as a generic kind-6
+Evidence object with version 1, Metadata class, logical_bytes 0, empty
+references, and these canonical_bytes:
+
+  "astrid-gc-placement-set-v1\0"
+  ObjectId operation_contract
+  u64 arena_bytes
+  u64 root_journal_bytes
+  u8[32] root_journal_digest
+  u64 object_count
+      repeated in ObjectId order:
+          ObjectId object
+          u64 arena_frame_offset
+          u64 arena_payload_length
+          u8[32] arena_frame_checksum
+  u64 root_count
+      repeated in canonical principal-byte order:
+          u64 principal_length
+          u8[principal_length] principal
+          u64 root_generation
+          ObjectId commit
+
+All integers are little-endian. ObjectId fields inside canonical_bytes use the
+current 32-byte logical digest; the containing Evidence identity remains
+algorithm-tagged wherever it occurs on persistent wire. root_journal_digest is
+BLAKE3 under derive-key string:
+
+  astrid gc placement root journal digest v1
+
+Arena offsets and physical-frame checksums bind every object frame and its
+ordering. The root-journal digest binds the journal bytes rather than only its
+decoded root map. Recovery after durable compaction intent MUST install the
+exact placement-after identity, not any other semantically valid arena/journal
+pair.
+
+The execution-measurements target is generic kind-6 Evidence with version 1,
+Metadata class, logical_bytes 0, empty references, and:
+
+  "astrid-gc-transition-measurements-v1\0"
+  u64 objects_before
+  u64 objects_after
+  u64 objects_reclaimed
+  u64 arena_bytes_before
+  u64 arena_bytes_after
+  u64 root_journal_bytes_before
+  u64 root_journal_bytes_after
+
+The GC delivery outbox is not an authority or archival format. Its ready bundle
+contains the eight canonical ObjectRecords required by the receipt: fact
+snapshot, retention policy, Tensor Logic proof, plan, placement-before,
+placement-after, execution measurements, and commit receipt. Long-term export
+materializes those records through the ordinary self-contained bundle grammar.
+
+
+7.9 SHA-384 closure-attestation evidence
+----------------------------------------
+
+Construction-1 ObjectIds remain BLAKE3-256. Periodic Refinery custody
+ceremonies bind an exact selected Owns closure to a construction-diverse
+SHA-384 tree without adding SHA-384 to ingest or ordinary reads. All records in
+this section are kind=10 Evidence, version=1, class=Metadata, logical_bytes=0.
+
+The canonical source ordering is ascending ObjectId digest bytes. Selected
+roots are non-empty and strictly ascending. The input object stream MUST equal
+the union of those roots' Owns closures: an omission, cycle, duplicate,
+reordering, or unrelated object fails before Evidence is emitted.
+
+The exact logical-record envelope hashed by this ceremony is:
+
+  u16  object_kind
+  u16  object_format_version
+  u8   object_class
+  u64  logical_bytes
+  u64  canonical_bytes_length
+  u8[] canonical_bytes
+  u64  reference_count
+  repeated reference_count times:
+      u64            label_length
+      u8[]           label
+      TaggedIdentity target
+      u8             reference_kind
+
+All integers are little-endian. The complete tagged source ObjectId precedes
+that envelope in the object witness. For current objects the tag is
+algorithm=1, construction=1, length=32.
+
+  object_digest =
+      SHA-384("astrid sha384 object witness v1\0"
+              || tagged_source_object_id
+              || logical_record_envelope)
+
+Leaf Evidence has canonical_bytes:
+
+  bytes "astrid-sha384-leaf-v1\0"
+  u16   entry_count, 1 through 128
+  bytes leaf_digest[48]
+  repeated entry_count times:
+      TaggedIdentity source_object_id
+      bytes          object_digest[48]
+
+It has one Evidence reference per entry. Label i is the bytes "source/"
+followed by i as a two-byte big-endian integer. Its target equals the encoded
+source_object_id. Entries are strictly ascending. Every leaf except the final
+leaf contains 128 entries.
+
+  leaf_digest =
+      SHA-384("astrid sha384 leaf v1\0"
+              || u16(entry_count)
+              || each(tagged_source_object_id || object_digest))
+
+Internal-node Evidence has canonical_bytes:
+
+  bytes "astrid-sha384-node-v1\0"
+  u16   level, 1 through 10
+  u16   child_count, 1 through 128
+  u64   subtree_object_count
+  bytes node_digest[48]
+  repeated child_count times:
+      u64   child_object_count
+      bytes child_digest[48]
+
+It has one Owns reference per child. Label i is the bytes "child/" followed by
+i as a two-byte big-endian integer. Children at one node have the same level.
+Consecutive nodes group at most 128 children; every non-final group at a level
+is full. A one-child internal node occurs only when promoting a final partial
+group beside an already-complete higher group.
+
+  node_digest =
+      SHA-384("astrid sha384 node v1\0"
+              || u16(level)
+              || u16(child_count)
+              || u64(subtree_object_count)
+              || each(u64(child_object_count) || child_digest))
+
+The ceremony Evidence has canonical_bytes:
+
+  bytes "astrid-sha384-attestation-v1\0"
+  u16   signature_algorithm = 1              Ed25519
+  u16   selected_root_count
+  u64   closure_object_count
+  u64   observed_placement_epoch
+  bytes tree_digest[48]
+  TaggedIdentity refinery_pass_descriptor
+  TaggedIdentity refinery_snapshot
+  repeated selected_root_count times:
+      TaggedIdentity selected_root
+  bytes ed25519_public_key[32]
+  bytes ed25519_signature[64]
+
+Its references, in order, are:
+
+  Evidence "00-pass-descriptor" -> refinery_pass_descriptor
+  Evidence "01-snapshot"        -> refinery_snapshot
+  Evidence "10-root/" || u16be(i) -> selected_root i
+  Owns     "20-tree"            -> root Evidence of the digest tree
+
+The Ed25519 signature covers this exact statement:
+
+  bytes "astrid sha384 attestation statement v1\0"
+  TaggedIdentity refinery_pass_descriptor
+  TaggedIdentity refinery_snapshot
+  u64            observed_placement_epoch
+  u16            selected_root_count
+  TaggedIdentity selected_roots[selected_root_count]
+  u64            closure_object_count
+  bytes          tree_digest[48]
+  u16            signature_algorithm = 1
+  bytes          ed25519_public_key[32]
+
+Admission recomputes every current ObjectId, each object digest, the canonical
+tree, and the ceremony signature. Authority registration for a pass descriptor
+and signing key is outside this grammar. A capsule may propose bytes but cannot
+declare itself an attestation authority.
+
+An optional export manifest is a deterministic view over the same records:
+selected roots, ordered object witnesses, tree Evidence, ceremony statement,
+public key, and signature. It does not run a second hashing pipeline. An export
+request that lacks the required Evidence reports a typed prerequisite.
+
+
+7.10 Bottom-k resemblance metadata
+----------------------------------
+
+Bottom-k records are advisory, reproducible metadata. They can propose a
+physical delta base but never establish content equivalence, authorize a read,
+or change the source File identity. Admission of any representation selected
+through a sketch reconstructs the bytes and verifies the logical ObjectId.
+
+The pass descriptor is kind=10 Evidence, version=1, class=Metadata,
+logical_bytes=0, with no references. Its canonical_bytes are:
+
+  bytes "astrid-bottom-k-descriptor-v1\0"
+  u16   construction = 1
+  u16   score_hash = 1                       BLAKE3 derive-key
+  u16   score_width = 1 or 2                 128 or 256 bits
+  u16   duplicate_treatment = 1              set semantics
+  u16   ordering = 1                         unsigned lexicographic bytes
+  u16   sample_size                          non-zero
+  u16   empty_input = 1                      empty sample
+  u16   small_input = 1                      all distinct scores
+  u16   profile_binding = 1                  exact FastCDC fields
+  u16   score_domain_length
+  bytes score_domain = "astrid bottom-k chunk score v1"
+
+The current production descriptor uses score_width=1 and sample_size=256.
+Refinery scheduling materializes it only for Files with more than one logical
+chunk. The grammar still defines empty and one-chunk results so every accepted
+descriptor has total deterministic semantics.
+
+For every distinct Chunk object in the source File's complete Owns closure:
+
+  score_full = BLAKE3-DERIVE-KEY(
+      context = "astrid bottom-k chunk score v1",
+      material = u64_le(chunk_byte_length) || chunk_canonical_bytes)
+
+score is the first 16 or 32 bytes of score_full according to score_width.
+Scores use set semantics, are sorted as unsigned byte strings, and retain the
+lowest min(sample_size, distinct_score_count) values. Input traversal order,
+batch boundaries, and repeated references therefore do not affect the result.
+
+The result is kind=11 Derived, version=1, class=Metadata, logical_bytes=0. Its
+canonical_bytes are:
+
+  bytes          "astrid-bottom-k-sketch-v1\0"
+  u16            construction = 1
+  u16            score_width
+  u16            sample_size
+  u16            retained_score_count
+  TaggedIdentity pass_descriptor
+  TaggedIdentity source_file
+  u32            profile_minimum_bytes
+  u32            profile_average_bytes
+  u32            profile_maximum_bytes
+  u64            profile_gear_seed
+  u64            source_logical_bytes
+  u64            source_logical_chunk_count
+  u64            source_unique_chunk_objects
+  bytes           retained_scores[retained_score_count][score_width / 8]
+
+It has exactly these non-owning references, in order:
+
+  Evidence "00-pass-descriptor" -> pass_descriptor
+  Evidence "01-source-file"     -> source_file
+
+The tagged identities in canonical_bytes must byte-equal the reference
+targets. The profile and source totals must equal the canonical File. A reader
+that understands this schema recomputes the complete score set from the File
+closure and rejects any mismatch, non-canonical ordering, duplicate score,
+trailing byte, missing source, or altered descriptor.
+
+
+8. RECONSTRUCTION PROCEDURE
+===========================
+
+An independent recovery implementation can reconstruct current state as
+follows:
+
+  1. Parse store.meta and obtain the tagged RÚNATAL and content-catalog
+     specification identities.
+  2. Scan objects.arena as physical frames. Check magic, version, reserved
+     bytes, length, and checksum. Decode each ObjectRecord, enforce strict
+     reference ordering, recompute construction-1 identities, and build a map
+     from complete tagged identity to record.
+  3. Verify that the RÚNATAL object named by store.meta equals this document
+     and the catalog-specification object equals its named child document.
+  4. Scan roots.journal, check every physical frame, decode canonical
+     principal-UID owners, and replay the compare-and-swap chain.
+  5. For each current root, recursively follow Owns references. Reject a
+     missing object, cycle, non-Commit root, or malformed understood schema.
+  6. Decode Commit -> PrincipalState. Decode the "kv" NamespaceMap as either
+     the version-4 transition/checkpoint projection or migration-only version-3
+     AVL tree into namespace/key/value entries. Decode the optional "content"
+     Directory catalog and each File content tree into named byte strings.
+  7. Preserve every unknown typed object and owned subtree even when it cannot
+     yet be projected into a human-visible representation.
+
+The object arena may contain valid unreachable history. It is not part of a
+current principal unless reached from the journal's selected root through Owns.
+
+
+9. CANONICAL ARCHIVAL UNIT
+==========================
+
+The durable unit of long-term survival is a deterministic export_closure
+bundle, not an arena's current physical placement. Such a bundle contains:
+
+  - this RÚNATAL Evidence object and its tagged identity;
+  - the selected tagged principal root;
+  - every object in the root's complete Owns closure;
+  - any explicitly selected evidence, lineage, or derived closures; and
+  - no dependency on offsets, indexes, caches, the live daemon, or the source
+    arena.
+
+Objects are emitted in ascending order of the byte tuple
+(algorithm, construction_version, digest_length, digest). Bundle admission
+checks physical framing, object identity, canonical form, and complete declared
+closure before publishing any destination root. The live engine is a mutable
+cache and placement mechanism for this immutable logical bundle.
+
+A separately versioned bundle envelope must carry its own selected-root and
+object-count fields. Until that envelope is frozen and implemented, the
+deterministically ordered semantic tuple above is the canonical content of an
+export; an arena or a copied store directory MUST NOT be represented as the
+portable archival format.
+
+
+10. IDENTITY MIGRATION CEREMONY
+===============================
+
+Before retiring an identity scheme, reconstruct and validate every retained
+closure under the old scheme while it remains trusted. Recompute objects
+bottom-up under the registered successor construction, rewriting every target
+identity before its parent, then publish successor-tagged roots. During the
+overlap, retain both root sets.
+
+The authorization input for that re-root is a pre-deprecation section 7.9
+ceremony whose exact selected roots and complete old closure verify under its
+registered Ed25519 authority. Recompute the section 7.9 logical-record
+envelopes while reading the old closure and require every recorded SHA-384
+object witness and the signed tree root to match before minting a successor
+identity. Evidence created only after the old algorithm's distrust date cannot
+authorize migration by itself.
+
+Record the old-to-new identity mapping in immutable Evidence records. A mapping
+record names its old object with a Lineage reference and its successor with an
+Evidence reference, and records both complete tagged identities in canonical
+bytes so either namespace remains unambiguous. Root and pin metadata retain the
+mapping Evidence closure. Complete at least one verified export, import, and
+independent-reader recovery under the successor before old roots may leave the
+live set. Retention policy, legal holds, and re-attestation policy may require
+the old namespace to remain archived after it stops serving reads.
+
+The mapping is immutable evidence, never an alias table: lookups under the old
+tag continue to mean the old bytes, and lookups under the successor tag mean
+the successor reconstruction. The ceremony, migration implementation identity,
+old and new selected roots, complete mapping closure, authority epoch, and
+cutover time are retained together. Re-attestation under a successor signature
+algorithm overlaps the old signature chain before either signing scheme is
+deprecated.
+
+This is a re-root, not an in-place reinterpretation. The same digest bytes under
+different tags are different identities. Never change store.meta to name a
+successor while leaving old bytes implicitly interpreted as the new algorithm.
+
+
+11. FORMAT AND POLICY BOUNDARIES
+================================
+
+This section classifies format-1 constants so an independent implementation
+can distinguish a durable decoding rule from an operator setting or disposable
+acceleration state.
+
+
+11.1 Semantic discriminants and reserved capacity
+--------------------------------------------------
+
+The following values are frozen semantic discriminants. Their numeric values
+are deliberately simple rather than performance-selected, but changing one
+changes the meaning of durable bytes:
+
+  - ObjectKind is u16 with the registered values in section 4.
+  - ObjectFormatVersion is a non-zero u16 scoped to one ObjectKind.
+  - ObjectClass is u8: Data=0, Metadata=1.
+  - ReferenceKind is u8: Owns=0, Evidence=1, Lineage=2, Derived=3.
+  - physical-frame version is u16 value 1; its following u16 is reserved zero.
+
+The widths reserve capacity and are not claims about present cardinality.
+Unknown discriminants fail an implementation that must interpret them.
+Self-delimiting outer records may be preserved by implementations that do not
+interpret an unknown kind-scoped schema.
+
+Reference labels have no independent format-1 byte ceiling. The object
+identity construction frames each label length as u128; an arena record frames
+it as u64; actual decoding is bounded by the containing frame and the process's
+addressable memory. Labels are opaque bytes and are strictly increasing by
+unsigned byte order. Runtime recovery allocation limits are deployment policy,
+not a smaller valid-wire grammar.
+
+The eight store.meta keys, their order, spelling, ASCII values, colon-separated
+tagged-identity grammar, and LF termination shown in section 1 are the frozen
+format-1 discovery record. A format amendment may name a new RÚNATAL object,
+but a decoder never silently assigns another meaning to an existing key or
+identity tag.
+
+The arena and root-journal magics, common frame layout, checksum construction,
+root transition and snapshot tags, principal codec tags, catalog and KV tags,
+canonical packing and ordering rules, and every domain-separation string are
+identity or recovery semantics. They are not operator tuning knobs.
+
+
+11.2 Evidence-selected behavior
+--------------------------------
+
+The following current behavior was selected with measured workload evidence
+and is semantic after selection:
+
+  - FastCDC 2020 revision 1, normalization 1, 16/64/256 KiB, seed zero;
+  - whole-object threshold 256 KiB and chunk-tree fanout 128;
+  - KV format-4 transitions with immutable checkpoints, inline values through
+    1024 bytes, a 4096 retained-byte page target, and at most 64 page entries;
+    and
+  - bottom-k format-1 128-bit scores with 256 retained distinct values.
+
+The KV maximum tree level of 16 is a deliberately generous structural guard,
+not a measured optimum. It is nevertheless part of the accepted format-4
+grammar; producing a deeper tree requires a successor kind-scoped version.
+
+
+11.3 Runtime policy is not decode semantics
+--------------------------------------------
+
+RecoveryLimits.max_frame_bytes limits one process allocation. The default is
+the largest payload representable by that process. A smaller configured value
+may reject an otherwise valid store on that deployment but does not make the
+wire invalid. Quotas, batching windows, durability policy, resident-memory
+budgets, scheduler rates, and concurrency limits are likewise operator policy
+unless an individual canonical object explicitly records one as evidence.
+
+
+11.4 Native publication staging intent
+---------------------------------------
+
+Native content staging is a crash-recovery surface, not an authoritative store
+file and not part of export_closure. A sealed version-2 intent named intent.v2
+is the following exact bytes:
+
+  u8[16] magic = "ASTRID-STAGE-V2" followed by NUL
+  u16    version = 2
+  u64    sequence
+  u8[16] staged_content_uuid
+  u64    owner_length
+  u8[]   owner[owner_length]
+  u64    name_length
+  u8[]   name[name_length]
+  u8     chunk_algorithm = 1
+  u16    chunk_implementation_revision = 1
+  u8     chunk_normalization = 1
+  u32    chunk_minimum_bytes
+  u32    chunk_average_bytes
+  u32    chunk_maximum_bytes
+  u64    chunk_gear_seed
+  u64    logical_bytes
+  u8[32] checksum
+
+The owner bytes use principal-uid-v1: System is one zero byte; a principal is
+one byte value 1 followed by its 32-byte PrincipalUid. The name is non-empty
+UTF-8 containing no NUL and remains an opaque content name. The chunk profile
+must satisfy the section 7.2 grammar. The checksum is BLAKE3 derive-key under
+the exact context "astrid native content staging intent v2" over every
+preceding intent byte.
+
+content.bin is flushed before the checksummed intent is atomically published.
+The ready-directory transition does not change the intent bytes. A version-1
+alias-owner intent remains migration input only; current writers never emit it.
+
+
+11.5 Local recovery and acceleration files
+-------------------------------------------
+
+The compaction intent uses common frame version 1 with magic "ASTCMP1" plus
+NUL. Its one payload is a canonical Evidence ObjectRecord whose canonical
+bytes are "astrid-gc-compaction-intent-v1" plus NUL and whose three non-owning
+Evidence references bind the operation contract, GcCommitEvidence, and exact
+successor placement. The GC delivery outbox uses common frame version 1 with
+magic "ASTGCO1" plus NUL and contains the eight canonical records described in
+section 7.8. These files exist to roll a local placement forward after a crash;
+the records, not the files or arena offsets, cross the archival boundary.
+
+objects.index uses magic "ASTIDX1" plus NUL. It is disposable acceleration
+state. A missing, stale, torn, or rejected index rebuilds from the authoritative
+arena and root journal; its encoding is outside format-1 archival authority.
+The same is true of locks, projection caches, and completed migration markers.
+
+
+12. PHYSICAL REPRESENTATION AUTHORITY
+=====================================
+
+Logical ObjectIds and principal roots identify canonical information. The
+physical representation authority identifies how those canonical ObjectRecord
+bytes are recovered. Changing a representation, replica, arena generation, or
+placement never changes a logical ObjectId or principal root.
+
+All identities in this section use TaggedIdentity algorithm 1, construction 2,
+and 32 digest bytes. A future registered construction may use a longer digest;
+the enclosing tagged grammar, not 32 bytes, is the durable width boundary.
+
+
+12.1 Physical identity constructions
+--------------------------------------
+
+PhysicalId(context, material) means BLAKE3 derive-key hashing under the exact
+UTF-8 context including its shown terminating NUL byte, producing 32 bytes.
+Format 1 registers:
+
+  BlobId:
+    context  "astrid-blob-identity-v1" followed by NUL
+    material profile:TaggedIdentity || encoded_length:u64 || encoded_bytes
+
+  RepresentationProfileId:
+    context  "astrid-representation-profile-v1" followed by NUL
+    material canonical RepresentationProfileV1 bytes
+
+  RepresentationRecordId:
+    context  "astrid-representation-record-v1" followed by NUL
+    material canonical RepresentationRecordV1 bytes
+
+  PhysicalMapNodeId:
+    context  "astrid-physical-map-node-v1" followed by NUL
+    material canonical legacy PhysicalMapNodeV1 bytes
+
+  PhysicalRadixMapNodeId:
+    context  "astrid-physical-radix-map-node-v1" followed by NUL
+    material canonical PhysicalRadixMapNodeV1 bytes
+
+  RepresentationCatalogueRootId:
+    context  "astrid-representation-catalogue-root-v1" followed by NUL
+    material canonical RepresentationCatalogueRootV1 bytes
+
+  PlacementSetId:
+    context  "astrid-placement-set-v1" followed by NUL
+    material canonical PlacementSetV1 bytes
+
+  RepresentationStateId:
+    context  "astrid-representation-state-v1" followed by NUL
+    material canonical RepresentationStateV1 bytes
+
+  RepresentationJournalDigest:
+    context  "astrid-representation-journal-bytes-v1" followed by NUL
+    material the exact common-frame bytes selected in section 12.8
+
+
+12.2 Profiles
+-------------
+
+RepresentationProfileV1 is:
+
+  u16  version = 1
+  u8   kind: direct-canonical=0, packed-canonical=1,
+             contiguous-file=2, transform=3
+  Option<TaggedObjectIdentity> decoder_or_generator
+  Option<TaggedObjectIdentity> transform_contract
+  Option<TaggedObjectIdentity> runtime_semantic_profile
+  u64  canonical_parameter_bytes
+  u8[] canonical_parameters
+  u64  immutable_dependency_count
+  ProfileDependencyV1[] immutable_dependencies
+  ReconstructionBoundsV1 reconstruction_bounds
+  TaggedObjectIdentity frozen_specification
+
+An Option is tag 0 for absent or tag 1 followed by its value. Other tags are
+invalid. A ProfileDependency is tag 0 plus TaggedObjectIdentity for a logical
+object, or tag 1 plus TaggedIdentity for a physical BlobId. Dependencies are
+strictly increasing by tag then digest bytes and contain no duplicate.
+
+ReconstructionBoundsV1 is:
+
+  u16 version = 1
+  u32 maximum_dependency_depth
+  u32 maximum_dependency_fanout
+  u64 maximum_encoded_bytes
+  u64 maximum_output_bytes
+  u64 maximum_fuel
+  u64 maximum_resident_bytes
+  u64 maximum_elapsed_micros
+
+Every bound is non-zero. A built-in profile has none of the three transform
+identities, empty parameters, and exactly one immutable dependency: its frozen
+specification. A transform profile has all three identities and includes them
+and the frozen specification in its canonical dependency set. Its complete
+dependency count does not exceed maximum_dependency_fanout.
+
+The format-1 implicit direct profile is kind 0, bounds depth 1, fanout 2,
+encoded/output/resident limits u64::MAX, fuel 1, elapsed microseconds 1, and
+the current RÚNATAL ObjectId as its frozen specification.
+
+
+12.3 Coverage, recipes, and representation records
+---------------------------------------------------
+
+CoverageV1 is one of:
+
+  tag 0, Exact:
+    TaggedObjectIdentity object
+    u64 canonical_record_bytes, non-zero
+
+  tag 1, CanonicalFileChunks:
+    TaggedObjectIdentity file
+    Option<TaggedObjectIdentity> content_root
+    u64 logical_bytes
+    u64 chunk_count
+    u8 chunk_algorithm = 1
+    u16 chunk_implementation_revision = 1
+    u8 chunk_normalization = 1
+    u32 minimum_bytes
+    u32 average_bytes
+    u32 maximum_bytes
+    u64 gear_seed
+
+CanonicalFileChunks uses the FastCDC constraints in section 7.2. An empty file
+has absent content_root and zero chunks. A non-empty file has both; exactly one
+chunk is required iff logical_bytes is no greater than maximum_bytes.
+
+RecipeV1 is one of:
+
+  tag 0, DirectCanonical: BlobId
+  tag 1, PackedSlice: BlobId || offset:u64 || non-zero length:u64
+  tag 2, ContiguousFile: BlobId
+  tag 3, Compressed: BlobId || Option<dictionary BlobId>
+  tag 4, Delta: patch BlobId || base TaggedObjectIdentity
+  tag 5, Generated: invocation TaggedObjectIdentity || output_ordinal:u32
+                    || evidence TaggedObjectIdentity
+
+RepresentationRecordV1 is:
+
+  u16 version = 1
+  TaggedIdentity profile
+  CoverageV1 coverage
+  RecipeV1 recipe
+  u64 dependency_count
+  DependencyV1[] dependencies
+  u64 canonical_output_bytes
+  u64 maximum_reconstruction_bytes
+  Option<TaggedObjectIdentity> verification_evidence
+
+A Dependency is tag 0 logical ObjectId, 1 physical BlobId, 2 representation,
+3 profile, 4 invocation ObjectId, or 5 evidence ObjectId, followed by its
+tagged identity. The encoded dependency sequence is strictly increasing and
+equals the sequence derived from profile, recipe, and evidence; a writer never
+supplies an independent dependency list. The reconstruction bound is at least
+the canonical output and does not exceed the profile bound.
+
+DirectCanonical requires Exact coverage, equal canonical/output/reconstruction
+lengths, no verification evidence, and dependencies on exactly its profile and
+blob. PackedCanonical likewise requires Exact coverage. ContiguousFile requires
+CanonicalFileChunks. Compressed, Delta, and Generated require a transform
+profile and verification evidence; Generated evidence equals recipe.evidence.
+
+
+12.4 Canonical physical maps and catalogue roots
+-------------------------------------------------
+
+Three maps use one immutable path-copy trie. Their domains are profiles=0,
+representations=1, and placements=2. Legacy roots use a binary Patricia trie.
+Its search key is a big-endian u32 value 40 followed by the key's complete
+40-byte TaggedIdentity envelope. Bits are read most-significant first. Legacy
+map nodes are:
+
+  Leaf:
+    u16 version = 1
+    u8  domain
+    u8  tag = 0
+    TaggedIdentity key
+    u64 value_bytes
+    u8[] canonical_value
+
+  Branch:
+    u16 version = 1
+    u8  domain
+    u8  tag = 1
+    u32 prefix_bits
+    u8[] prefix[ceil(prefix_bits / 8)]
+    PhysicalMapNodeId zero
+    PhysicalMapNodeId one
+    u64 subtree_entries
+
+An empty map has no root. A branch has two distinct children, at least two
+leaves, the longest common descendant prefix, and zero unused low bits in its
+final prefix byte. The next search-key bit selects zero or one. Node domain is
+inside its identity. Subtree counts are exact. Rebuilding from all reachable
+leaves produces byte-identical nodes and the identical root; cyclic, shared,
+missing, unary, non-longest-prefix, or alternative shapes are invalid.
+
+New roots use the dense nibble-radix construction. Routing reads the current
+32-byte digest from most-significant nibble to least-significant nibble; the
+algorithm/construction/length envelope remains in every page entry but is not
+part of the route because format 1 accepts only scheme 1/2/32. Nodes are:
+
+  Page:
+    u16 version = 2
+    u8  domain
+    u8  tag = 0
+    u8  entry_count = 1
+    (TaggedIdentity key, u64 value_bytes, u8[] canonical_value)[]
+
+  Radix:
+    u16 version = 2
+    u8  domain
+    u8  tag = 1
+    u8  prefix_nibbles, 0..63
+    u8[] prefix[ceil(prefix_nibbles / 2)]
+    u16 child_bitmap
+    PhysicalMapNodeId children[popcount(child_bitmap)]
+    u64 subtree_entries
+
+Each Page contains exactly one entry. A Radix has at least two children and
+stores children in increasing set-bit order. Its prefix is the longest common
+digest-nibble prefix of all descendants; an unused low nibble is zero. Each
+child contains exactly the keys selected by its bitmap nibble. Counts are
+exact. Rebuilding the reachable entries with the same construction reproduces
+the identical root. Mixed-construction, cyclic, shared, missing, unary,
+non-longest-prefix, overfull-page, and alternative shapes are invalid.
+
+Legacy and dense roots may coexist as historical metadata and both remain
+readable. One active map root selects exactly one construction. Migrating a
+map publishes a new physical root and state CAS; it never rewrites logical
+ObjectIds or principal roots.
+
+Map leaf key and value pairs are:
+
+  profile map:       RepresentationProfileId -> RepresentationProfileV1
+  representation map: RepresentationRecordId -> RepresentationRecordV1
+  placement map:     BlobId -> PlacementEntryV1
+
+Every leaf key is re-derived from its canonical value. Historical unreachable
+nodes may remain in metadata.arena and are not part of an active map.
+
+RepresentationCatalogueRootV1 is:
+
+  u16 version = 1
+  u64 generation
+  Option<PhysicalMapNodeId> profiles_root
+  u64 profile_count
+  Option<PhysicalMapNodeId> representations_root
+  u64 representation_count
+
+An absent root has count zero; a present root has non-zero count equal to its
+verified leaf count.
+
+
+12.5 Placement
+--------------
+
+PlacementEntryV1 is:
+
+  BlobId blob
+  RepresentationProfileId profile
+  u64 encoded_length
+  u64 replica_count
+  ReplicaV1[] replicas
+
+ReplicaV1 begins with storage_node:u32 and one locator:
+
+  tag 0 ArenaFrame:
+    u64 arena_generation
+    u64 offset
+    u64 payload_length, non-zero
+    u8[32] frame_checksum
+
+  tag 1 LooseBlob:
+    u64 namespace_generation
+
+  tag 2 PackFrame:
+    u64 pack_generation
+    u64 offset
+    u64 frame_length, greater than 52
+    u8[32] frame_checksum
+
+Replicas are non-empty, unique, and strictly increasing by storage_node,
+locator tag, then complete locator bytes. Storage node zero is the local store
+root. Arena generation zero names objects.arena. Its offset, payload length,
+and checksum equal the recovered logical arena frame; encoded_length instead
+equals the canonical ObjectRecord bytes after its leading object identity.
+
+PlacementSetV1 is:
+
+  u16 version = 1
+  u64 epoch
+  Option<PhysicalMapNodeId> entries_root
+  u64 blob_count
+  u64 replica_extent_count
+
+The root/count shape agrees, blob_count is the verified placement leaf count,
+and replica_extent_count is the checked sum of all replica counts.
+
+
+12.6 Metadata arena
+-------------------
+
+Each generation metadata.arena uses the common frame and magic bytes
+41 53 54 52 50 4d 31 00 ("ASTRPM1" plus NUL). Its payload is:
+
+  u8 kind
+  TaggedIdentity identity
+  u64 value_bytes
+  u8[] canonical_value
+
+Kinds are profile=0, representation=1, map-node=2, catalogue-root=3,
+placement-set=4, and representation-state=5. Recovery decodes and byte-exactly
+re-encodes each value, re-derives identity under its kind, and collapses exact
+duplicate frames. Unequal bytes under one kind and identity are corruption.
+
+
+12.7 Atomic representation state
+---------------------------------
+
+RepresentationStateV1 is:
+
+  u16 version = 1
+  u64 generation
+  Option<RepresentationStateId> previous
+  RepresentationCatalogueRootId catalogue
+  PlacementSetId placements
+
+Creation is generation 1 with no previous. Every later state is exactly the
+previous generation plus one and names the journal-active predecessor. When a
+catalogue or placement identity is reused, its generation or epoch is equal;
+when it changes, that scalar advances by exactly one.
+
+
+12.8 CURRENT and state-journal replay
+--------------------------------------
+
+representations/CURRENT contains exactly one common frame with magic
+41 53 54 43 55 52 31 00 ("ASTCUR1" plus NUL) and payload:
+
+  u64 journal_generation, non-zero
+  TaggedIdentity checkpoint_digest
+  u32 max_tail_frames, non-zero
+  u64 max_tail_bytes, non-zero
+
+The selected generation directory is its journal_generation rendered as
+exactly 16 lowercase hexadecimal digits. state.journal uses common-frame magic
+41 53 54 52 45 50 31 00 ("ASTREP1" plus NUL). Its payload is one of:
+
+  tag 0, StateCasV1:
+    u64 journal_generation
+    Option<RepresentationStateId> expected
+    RepresentationStateId replacement
+
+  tag 1, CheckpointV1:
+    u64 journal_generation
+    Option<RepresentationStateId> active
+    u64 state_generation
+    Option<TaggedIdentity> prior_journal_digest
+
+Generation one begins with a checkpoint having absent active, state generation
+zero, and absent prior digest. checkpoint_digest is the PhysicalId journal
+digest of that exact complete framed checkpoint. A CAS generation equals the
+directory generation, expected equals the replay-active identity, replacement
+exists in metadata, and its previous and generation fields advance the active
+state exactly once. A physical or checksum-invalid final frame follows the
+section 2 torn-tail rule. A semantically invalid frame, CAS conflict, or
+invalid root is corruption. A final, otherwise valid CAS whose replacement
+metadata closure is incomplete is an uncommitted cross-file tail: recovery
+truncates that CAS and retains the preceding complete state. The same condition
+before a later valid CAS is interior corruption. Frames and complete wrapper
+bytes after the checkpoint do not exceed CURRENT's recorded tail budgets.
+
+General metadata and referenced blob bytes flush before the state CAS flush.
+The built-in direct-arena path has a narrower recoverable fast path: object
+arena frames flush before root publication, while their deterministic direct
+metadata and CAS may share the operating system's still-volatile writeback.
+An acknowledged root therefore always has durable canonical ObjectRecord
+bytes, even when its explicit direct state must be reconstructed. Before the
+store becomes available, recovery discards any incomplete terminal direct CAS,
+identity-verifies the complete arena frames, and publishes one durable repair
+state. Alternate representations never use this exception, and retirement may
+not remove the last durable path until its replacement state is strictly
+flushed.
+
+CURRENT is replaced through exclusively created CURRENT.tmp, file flush,
+reopen and exact validation, atomic rename, and representation-directory
+flush. An incomplete activation with no CURRENT is not authoritative and is
+quarantined before retry. A stale temporary beside a valid CURRENT is likewise
+never a candidate.
+
+
+12.9 Activation and disposable indexes
+----------------------------------------
+
+An arena-only predecessor store has one implicit DirectCanonical
+representation for every verified non-bootstrap ObjectRecord. Activation
+persists the current RÚNATAL and content-catalog specifications as terminal
+bootstrap objects, constructs exact direct records and generation-zero arena
+placements for every other recovered object, writes and validates generation
+one, and publishes CURRENT. Only then does store.meta atomically acquire
+representations=authoritative-direct-v1. A crash before that final marker is
+resumed from valid CURRENT or from the still-authoritative arena; it never
+makes a partially described catalogue authoritative.
+
+A crash may persist complete arena frames before all or part of their
+representation-state transition. Before an activated store becomes available,
+the migration-locked repair path identity-verifies every such non-bootstrap
+frame, derives its exact direct record and locator, and durably publishes one
+successor state. Missing coverage is never treated as absence and no principal
+root is advanced by this repair. Reopening the repaired store performs no
+second transition.
+
+This direct-only activation does not retire or relocate arena bytes. Until
+representation leases and final-path liveness are enforced, compaction of an
+activated store fails before writing replacement files; it may not leave
+generation-zero placements naming rewritten offsets.
+
+ObjectId-to-representation reverse lookup, BlobId-to-location lookup pages,
+verified-object sets, decoded caches, and cost observations are disposable.
+A reverse-index miss scans the authoritative representation map before it may
+report absence. A corrupt positive is rejected and rebuilt. These indexes may
+change availability or speed only; they never fabricate identity, liveness,
+authorization, or accounting.
+
+
+END OF ASTRID PRINCIPAL STORE FORMAT 1
