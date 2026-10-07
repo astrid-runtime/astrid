@@ -594,6 +594,89 @@ fn test_layout_v1_completion_removes_verified_legacy_store() {
     assert!(!home.state_db_path().exists());
 }
 
+#[cfg(not(windows))]
+#[test]
+fn test_layout_migration_accepts_regular_finder_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
+    home.ensure().unwrap();
+    write_released_legacy_store(&home, b"legacy");
+    for relative in [".DS_Store", "manifest/.DS_Store"] {
+        std::fs::write(home.state_db_path().join(relative), b"Finder metadata").unwrap();
+    }
+
+    home.begin_layout_v2_migration(&migration_target()).unwrap();
+    write_test_storage_volume(&home, b"test-volume");
+    home.complete_layout_v2(&migration_target()).unwrap();
+    assert!(!home.state_db_path().exists());
+    home.complete_layout_v2(&migration_target()).unwrap();
+    assert_eq!(
+        std::fs::read(home.storage_volume_path()).unwrap(),
+        b"test-volume"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn test_layout_retirement_accepts_finder_metadata_added_after_cutover() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(test_home_root(&dir));
+    crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
+    std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
+    home.ensure().unwrap();
+    write_released_legacy_store(&home, b"legacy");
+    home.begin_layout_v2_migration(&migration_target()).unwrap();
+    write_test_storage_volume(&home, b"test-volume");
+    home.complete_layout_v2(&migration_target()).unwrap();
+    let receipt_path = home.migrations_dir().join("layout-v1-to-v2.complete");
+    let receipt = std::fs::read(&receipt_path).unwrap();
+
+    // Recreate an interrupted retirement, with Finder touching the tree
+    // after the durable cutover. The original receipt must remain unchanged.
+    write_released_legacy_store(&home, b"legacy");
+    std::fs::write(home.state_db_path().join(".DS_Store"), b"new metadata").unwrap();
+    home.ensure().unwrap();
+    home.complete_layout_v2(&migration_target()).unwrap();
+    assert!(!home.state_db_path().exists());
+    assert_eq!(std::fs::read(receipt_path).unwrap(), receipt);
+    assert_eq!(
+        std::fs::read(home.storage_volume_path()).unwrap(),
+        b"test-volume"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_layout_migration_rejects_redirected_or_directory_finder_metadata() {
+    for directory in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(test_home_root(&dir));
+        crate::platform_fs::ensure_private_directory(&home.etc_dir()).unwrap();
+        std::fs::write(home.layout_version_path(), LEGACY_LAYOUT_VERSION).unwrap();
+        home.ensure().unwrap();
+        let legacy = write_released_legacy_store(&home, b"preserve-me");
+        let metadata = home.state_db_path().join(".DS_Store");
+        if directory {
+            std::fs::create_dir(&metadata).unwrap();
+        } else {
+            std::fs::write(outside.path().join("keep"), b"outside").unwrap();
+            std::os::unix::fs::symlink(outside.path().join("keep"), &metadata).unwrap();
+        }
+        assert!(home.begin_layout_v2_migration(&migration_target()).is_err());
+        assert_eq!(std::fs::read(legacy).unwrap(), b"preserve-me");
+        assert!(!home.migrations_dir().exists());
+        if !directory {
+            assert_eq!(
+                std::fs::read(outside.path().join("keep")).unwrap(),
+                b"outside"
+            );
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn test_layout_v2_startup_defers_interrupted_legacy_retirement_to_kernel_barrier() {

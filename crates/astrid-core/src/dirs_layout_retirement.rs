@@ -145,6 +145,11 @@ pub(super) fn validate_legacy_surrealkv_entry(
 ) -> io::Result<()> {
     let components: Vec<_> = relative.components().collect();
     let valid = match components.as_slice() {
+        // Finder may touch the database root or an admitted store directory.
+        // Keep these regular files in the content inventory: this preserves
+        // existing receipt identities rather than silently changing the hash
+        // contract. Redirects and special entries are never metadata.
+        [name] | [_, name] if name.as_os_str() == ".DS_Store" => is_file,
         [entry] if entry.as_os_str() == "LOCK" => is_file,
         [entry]
             if matches!(
