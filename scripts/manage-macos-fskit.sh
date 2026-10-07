@@ -148,33 +148,34 @@ app_process_matches() {
   process_path="$(/bin/ps -p "$pid" -o comm=)" || return 1
   [[ "$process_path" == "$APP_EXECUTABLE" ]] || return 1
   loaded_path="$(/usr/sbin/lsof -p "$pid" -a -d txt -Fn \
-    | /usr/bin/sed -n 's/^n//p' | /usr/bin/head -n 1)"
+    | /usr/bin/sed -n 's/^n//p' | /usr/bin/head -n 1)" || return 1
   [[ "$loaded_path" == "$APP_EXECUTABLE" ]] || return 1
-  signature="$(/usr/bin/codesign --display --verbose=4 "$process_path" 2>&1)"
-  grep -Fx "Identifier=$APP_IDENTIFIER" <<<"$signature" >/dev/null
-  grep -Fx "TeamIdentifier=$CODE_SIGN_TEAM" <<<"$signature" >/dev/null
+  signature="$(/usr/bin/codesign --display --verbose=4 "$process_path" 2>&1)" || return 1
+  grep -Fx "Identifier=$APP_IDENTIFIER" <<<"$signature" >/dev/null || return 1
+  grep -Fx "TeamIdentifier=$CODE_SIGN_TEAM" <<<"$signature" >/dev/null || return 1
   installed_version="$(plutil -extract CFBundleShortVersionString raw -expect string \
-    "$DESTINATION_APP/Contents/Info.plist")"
-  [[ -n "$installed_version" ]]
+    "$DESTINATION_APP/Contents/Info.plist")" || return 1
+  [[ -n "$installed_version" ]] || return 1
   if [[ "$require_version" == 1 && -n "${ASTRID_FSKIT_EXPECTED_VERSION:-}" ]]; then
-    [[ "$installed_version" == "${ASTRID_FSKIT_EXPECTED_VERSION%%-*}" ]]
+    [[ "$installed_version" == "${ASTRID_FSKIT_EXPECTED_VERSION%%-*}" ]] || return 1
   fi
+  return 0
 }
 
 stop_app_before_replacement() {
   local pids pid started current_started attempts mount_records status
+  # Mounts can outlive the host app process. Inspect them even on cold install.
+  mount_records="$(/sbin/mount)" || return 1
+  if /usr/bin/grep -Fq astridfs <<<"$mount_records"; then
+    echo "Unmount Astrid filesystems before updating the running AstridFS app." >&2
+    return 1
+  fi
   if pids="$(/usr/bin/pgrep -x AstridFS)"; then
     :
   else
     status=$?
     [[ "$status" == 1 ]] && return 0
     echo "Cannot inspect running AstridFS processes; refusing replacement." >&2
-    return 1
-  fi
-  # Do not disrupt a mounted filesystem to complete an application update.
-  mount_records="$(/sbin/mount)" || return 1
-  if /usr/bin/grep -Fq astridfs <<<"$mount_records"; then
-    echo "Unmount Astrid filesystems before updating the running AstridFS app." >&2
     return 1
   fi
   # Validate every process before signalling any. The old installed version is

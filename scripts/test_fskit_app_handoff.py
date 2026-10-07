@@ -79,6 +79,12 @@ sleep() { :; }
         self.assertIn("Unmount", result.stderr)
         self.assertEqual(signals, "")
 
+    def test_active_mount_without_host_process_refuses(self):
+        result, signals = self.run_handoff(live=False, mounted=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unmount", result.stderr)
+        self.assertEqual(signals, "")
+
     def test_foreign_identity_refuses_before_signal(self):
         result, signals = self.run_handoff(foreign=True)
         self.assertNotEqual(result.returncode, 0)
@@ -117,6 +123,54 @@ sleep() { :; }
         result, signals = self.run_handoff(mount_error=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(signals, "")
+
+    def test_real_identity_helper_fails_closed_in_conditional_call(self):
+        source = MANAGER.read_text()
+        start = source.index("app_process_matches() {")
+        end = source.index("\n}\n", start) + 3
+        function = source[start:end]
+        for command, prefix in (("ps", "/bin/"), ("lsof", "/usr/sbin/"),
+                                ("codesign", "/usr/bin/")):
+            function = function.replace(prefix + command, command)
+        prelude = r'''
+set -euo pipefail
+APP_EXECUTABLE=/owned/AstridFS.app/Contents/MacOS/AstridFS
+DESTINATION_APP=/owned/AstridFS.app
+APP_IDENTIFIER=org.astrid.runtime.fs
+CODE_SIGN_TEAM=EXPECTED
+ASTRID_FSKIT_EXPECTED_VERSION=2026.10.0-rc.2
+ps() { printf '%s\n' "$APP_EXECUTABLE"; }
+lsof() {
+  [ "$CASE" != lsof-error ] || return 1
+  printf 'n%s\n' "$APP_EXECUTABLE"
+}
+codesign() {
+  [ "$CASE" != codesign-error ] || return 1
+  if [ "$CASE" = identifier ]; then echo Identifier=foreign;
+  else echo Identifier=org.astrid.runtime.fs; fi
+  if [ "$CASE" = team ]; then echo TeamIdentifier=FOREIGN;
+  else echo TeamIdentifier=EXPECTED; fi
+}
+plutil() {
+  [ "$CASE" != plist-error ] || return 1
+  [ "$CASE" != empty-version ] || return 0
+  if [ "$CASE" = old-version ]; then echo 2026.9.3;
+  else echo 2026.10.0; fi
+}
+'''
+        for case, require_version, expected in (
+                ("valid", 0, 0), ("valid", 1, 0),
+                ("old-version", 0, 0), ("old-version", 1, 1),
+                ("identifier", 0, 1), ("team", 0, 1),
+                ("codesign-error", 0, 1), ("lsof-error", 0, 1),
+                ("plist-error", 0, 1), ("empty-version", 0, 1)):
+            with self.subTest(case=case, require_version=require_version):
+                result = subprocess.run(
+                    ["/bin/bash", "-c", prelude + function +
+                     f"\napp_process_matches 123 {require_version} || exit 1\n"],
+                    env=dict(os.environ, CASE=case), capture_output=True,
+                    text=True, timeout=5)
+                self.assertEqual(result.returncode, expected, result.stderr)
 
 
 if __name__ == "__main__":
