@@ -48,10 +48,10 @@ use env_import::import_env_and_secrets;
 pub(crate) use hooks::inject_tmp_retirement_interruption_once;
 pub(crate) use hooks::interrupt_after_tmp_retirement_if_requested;
 use host_fs::{
-    add_principal_scope_sources, add_source, collect_workspace_targets,
+    add_log_source, add_principal_scope_sources, add_source, collect_workspace_targets,
     ensure_legacy_secret_aliases, path_exists, read_bounded_file, require_layout_provenance,
-    retire_empty_directory, snapshot_owner_controlled_path, snapshot_path, storage_io, sync_parent,
-    validate_source_path,
+    retire_empty_directory, snapshot_log_path, snapshot_owner_controlled_path, snapshot_path,
+    storage_io, sync_parent, validate_source_path,
 };
 #[cfg(not(unix))]
 use host_fs::{preflight_legacy_audit_sources, retire_legacy_audit_dir};
@@ -781,7 +781,7 @@ fn preflight_sources(
             format!("principal:{uid}:audit"),
             snapshot_owner_controlled_path(&home.principal_home(alias).audit_dir())?,
         );
-        add_source(
+        add_log_source(
             &mut sources,
             format!("principal:{uid}:logs"),
             home.principal_home(alias).log_dir(),
@@ -901,7 +901,11 @@ fn ensure_no_unretired_component_sources(
             ("secrets", home.secrets_dir().join(alias.as_str())),
         ] {
             if path_exists(&path)? {
-                let snapshot = snapshot_path(&path)?;
+                let snapshot = if name == "logs" {
+                    snapshot_log_path(&path)?
+                } else {
+                    snapshot_path(&path)?
+                };
                 if snapshot.entries != 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -979,5 +983,7 @@ fn ensure_no_unretired_component_sources(
     Ok(())
 }
 
+#[cfg(test)]
+mod log_tests;
 #[cfg(test)]
 mod tests;

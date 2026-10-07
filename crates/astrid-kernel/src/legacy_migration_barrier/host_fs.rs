@@ -32,6 +32,16 @@ pub(super) fn add_source(
     Ok(())
 }
 
+pub(super) fn add_log_source(
+    sources: &mut BTreeMap<String, SourceIdentity>,
+    name: String,
+    path: impl AsRef<Path>,
+) -> io::Result<()> {
+    super::legacy_permissions::tighten_private_path(path.as_ref())?;
+    sources.insert(name, snapshot_log_path(path.as_ref())?);
+    Ok(())
+}
+
 pub(super) fn add_principal_scope_sources(
     sources: &mut BTreeMap<String, SourceIdentity>,
     home: &AstridHome,
@@ -479,6 +489,13 @@ pub(super) fn snapshot_path(path: &Path) -> io::Result<SourceIdentity> {
     snapshot_path_with_access(path, SourceAccess::Private)
 }
 
+/// Operational logs are hashed with fixed-buffer reads, not decoded into
+/// memory. Keep the private-entry, count, redirect and device checks, but do
+/// not apply the generic component byte ceiling to accumulated log history.
+pub(super) fn snapshot_log_path(path: &Path) -> io::Result<SourceIdentity> {
+    snapshot_path_with_access(path, SourceAccess::PrivateLogs)
+}
+
 /// Snapshot a released non-secret tree without requiring permissions that the
 /// released binary never set. Historical database and capsule-package children
 /// were commonly `0755` directories and `0644` files. They remain admissible
@@ -491,6 +508,7 @@ pub(super) fn snapshot_owner_controlled_path(path: &Path) -> io::Result<SourceId
 #[derive(Clone, Copy)]
 enum SourceAccess {
     Private,
+    PrivateLogs,
     OwnerControlled,
 }
 
@@ -519,7 +537,7 @@ fn snapshot_path_with_access(path: &Path, access: SourceAccess) -> io::Result<So
         // cardinality here lets retirement bind a single-file source to the
         // exact preflight manifest as well.
         identity.entries = SourceCount::new(1);
-        read_regular_file(path, &mut hasher, &mut identity)?;
+        read_regular_file(path, access, &mut hasher, &mut identity)?;
     } else if metadata.is_dir() {
         snapshot_dir(path, path, device, access, &mut hasher, &mut identity)?;
     } else {
@@ -624,7 +642,7 @@ fn snapshot_dir(
             snapshot_dir(root, &path, device, access, hasher, identity)?;
         } else if metadata.is_file() {
             hasher.update(b"file");
-            read_regular_file(&path, hasher, identity)?;
+            read_regular_file(&path, access, hasher, identity)?;
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -641,7 +659,7 @@ fn validate_source_entry(
     access: SourceAccess,
 ) -> io::Result<()> {
     match access {
-        SourceAccess::Private => validate_private_entry(path, metadata),
+        SourceAccess::Private | SourceAccess::PrivateLogs => validate_private_entry(path, metadata),
         SourceAccess::OwnerControlled => validate_owner_controlled_entry(path, metadata),
     }
 }
@@ -686,6 +704,7 @@ fn validate_owner_controlled_entry(path: &Path, metadata: &fs::Metadata) -> io::
 
 fn read_regular_file(
     path: &Path,
+    access: SourceAccess,
     hasher: &mut blake3::Hasher,
     identity: &mut SourceInventory,
 ) -> io::Result<()> {
@@ -713,7 +732,7 @@ fn read_regular_file(
             .bytes
             .checked_add(read as u64)
             .ok_or_else(|| io::Error::other("legacy source byte limit exceeded"))?;
-        if identity.bytes.get() > MAX_BYTES {
+        if !matches!(access, SourceAccess::PrivateLogs) && identity.bytes.get() > MAX_BYTES {
             return Err(io::Error::other("legacy source byte limit exceeded"));
         }
         hasher.update(&buffer[..read]);
