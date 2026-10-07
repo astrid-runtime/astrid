@@ -37,7 +37,7 @@ use std::time::SystemTime;
 use anyhow::{Context, Result, bail};
 use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
-use astrid_crypto::PublicKeyFingerprint;
+use astrid_crypto::{PublicKey, PublicKeyFingerprint};
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use ed25519_dalek::SigningKey;
@@ -349,6 +349,15 @@ fn run_delete(args: &DeleteArgs) -> Result<ExitCode> {
         );
         return Ok(ExitCode::from(1));
     }
+    if paths.meta.exists() {
+        let meta = read_meta(&paths)?;
+        if let Some(bound) = meta.bound_principal {
+            let principal = PrincipalId::new(bound).context("invalid bound key principal")?;
+            let home = AstridHome::resolve()?;
+            let public = PublicKey::from_hex(&read_public(&paths.public_hex)?)?;
+            remove_activated_key(&home, &principal, &public)?;
+        }
+    }
     // Best-effort remove every component — a partially-corrupt store
     // (missing pub but present priv) should still let the operator
     // recover by deleting whatever exists.
@@ -376,17 +385,100 @@ pub(crate) fn load_public_key_hex(name: &str) -> Result<String> {
 }
 
 /// Record on a keypair's metadata that it has been bound to
-/// `principal` via a successful redeem. Best-effort: a failure here
-/// doesn't roll back the redeem itself, just warns.
-pub(crate) fn record_binding(name: &str, principal: &PrincipalId) -> Result<()> {
+/// `principal` via a successful redeem and activate the native credential.
+/// Never replace a different credential. Failure cannot roll back redemption,
+/// so the caller must report the consumed token and must not switch context.
+pub(crate) fn record_binding(
+    name: &str,
+    principal: &PrincipalId,
+    redeemed_key: &PublicKey,
+) -> Result<()> {
     validate_name(name)?;
     let paths = KeyPaths::new(name)?;
-    if !paths.meta.exists() {
-        return Ok(());
+    let home = AstridHome::resolve().context("resolve home for invited principal key")?;
+    record_binding_at(&paths, &home, principal, redeemed_key)
+}
+
+fn record_binding_at(
+    paths: &KeyPaths,
+    home: &AstridHome,
+    principal: &PrincipalId,
+    redeemed_key: &PublicKey,
+) -> Result<()> {
+    let mut meta = read_meta(paths)?;
+    if let Some(bound) = &meta.bound_principal
+        && bound != principal.as_str()
+    {
+        bail!("local key is already bound to principal {bound}");
     }
-    let mut meta = read_meta(&paths)?;
+    let secret =
+        zeroize::Zeroizing::new(fs::read(&paths.private).context("read invited signing key")?);
+    let key =
+        astrid_crypto::KeyPair::from_secret_key(&secret).context("decode invited signing key")?;
+    if key.export_public_key() != *redeemed_key {
+        bail!("local signing key does not match the public key redeemed by the daemon");
+    }
+    let destination = home.keys_dir().join(format!("{principal}.key"));
+    activate_invited_key(&destination, &secret)?;
     meta.bound_principal = Some(principal.to_string());
     write_meta(&paths.meta, &meta)?;
+    Ok(())
+}
+
+/// Publish complete secret bytes without replacing another device's credential.
+fn activate_invited_key(destination: &Path, secret: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let parent = destination
+        .parent()
+        .context("principal key has no parent")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .context("create private invited-key staging file")?;
+    temporary.write_all(secret)?;
+    temporary.as_file().sync_all()?;
+    match temporary.persist_noclobber(destination) {
+        Ok(_) => {
+            #[cfg(unix)]
+            fs::File::open(parent)?.sync_all()?;
+        },
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(destination)?;
+            if !metadata.file_type().is_file() {
+                bail!("existing principal signing key is not a regular file");
+            }
+            let existing = zeroize::Zeroizing::new(fs::read(destination)?);
+            if existing.as_slice() != secret {
+                bail!("principal already has a different local signing key; refusing replacement");
+            }
+        },
+        Err(error) => return Err(error.error).context("activate invited principal signing key"),
+    }
+    Ok(())
+}
+
+/// Removing a named local key must not leave its activated credential usable.
+fn remove_activated_key(
+    home: &AstridHome,
+    principal: &PrincipalId,
+    public: &PublicKey,
+) -> Result<()> {
+    let destination = home.keys_dir().join(format!("{principal}.key"));
+    let metadata = match fs::symlink_metadata(&destination) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("inspect activated credential"),
+    };
+    if !metadata.file_type().is_file() {
+        bail!("activated credential is not a regular file");
+    }
+    let secret = zeroize::Zeroizing::new(fs::read(&destination)?);
+    let key = astrid_crypto::KeyPair::from_secret_key(&secret)?;
+    if key.export_public_key() != *public {
+        bail!("activated credential changed; refusing to delete another key");
+    }
+    fs::remove_file(destination).context("remove activated credential")?;
+    #[cfg(unix)]
+    fs::File::open(home.keys_dir())?.sync_all()?;
     Ok(())
 }
 
@@ -638,6 +730,84 @@ fn encode_openssh_ed25519(pubkey: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invited_key_binding_activates_native_signing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(dir.path());
+        let local = home.keys_dir().join("local");
+        fs::create_dir_all(&local).unwrap();
+        let paths = KeyPaths {
+            private: local.join("invite.ed25519"),
+            public_hex: local.join("invite.pub.hex"),
+            meta: local.join("invite.meta.toml"),
+        };
+        let signing = SigningKey::from_bytes(&[23; 32]);
+        write_secret(&paths.private, &signing.to_bytes()).unwrap();
+        let public = hex::encode(signing.verifying_key().to_bytes());
+        write_public(&paths.public_hex, &public).unwrap();
+        write_meta(
+            &paths.meta,
+            &KeyMeta {
+                schema_version: META_SCHEMA_VERSION,
+                fingerprint: fingerprint_pubkey(&public).unwrap(),
+                created_at_epoch: 0,
+                backend: "file".to_owned(),
+                note: None,
+                bound_principal: None,
+            },
+        )
+        .unwrap();
+        let principal = PrincipalId::new("invited-client").unwrap();
+        let redeemed = PublicKey::from_hex(&public).unwrap();
+        let foreign = astrid_crypto::KeyPair::generate().export_public_key();
+        assert!(record_binding_at(&paths, &home, &principal, &foreign).is_err());
+        assert!(!home.keys_dir().join("invited-client.key").exists());
+        record_binding_at(&paths, &home, &principal, &redeemed).unwrap();
+        let activated = fs::read(home.keys_dir().join("invited-client.key")).unwrap();
+        assert_eq!(activated, signing.to_bytes());
+        record_binding_at(&paths, &home, &principal, &redeemed).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(home.keys_dir().join("invited-client.key"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let other = PrincipalId::new("different-client").unwrap();
+        assert!(record_binding_at(&paths, &home, &other, &redeemed).is_err());
+        assert!(!home.keys_dir().join("different-client.key").exists());
+        assert!(remove_activated_key(&home, &principal, &foreign).is_err());
+        assert!(home.keys_dir().join("invited-client.key").exists());
+        remove_activated_key(&home, &principal, &redeemed).unwrap();
+        assert!(!home.keys_dir().join("invited-client.key").exists());
+    }
+
+    #[test]
+    fn invited_key_activation_never_replaces_existing_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("principal.key");
+        fs::write(&destination, [11; 32]).unwrap();
+        assert!(activate_invited_key(&destination, &[12; 32]).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), [11; 32]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invited_key_activation_refuses_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.key");
+        let destination = dir.path().join("principal.key");
+        fs::write(&target, [11; 32]).unwrap();
+        std::os::unix::fs::symlink(&target, &destination).unwrap();
+        assert!(activate_invited_key(&destination, &[11; 32]).is_err());
+        assert_eq!(fs::read(target).unwrap(), [11; 32]);
+    }
 
     #[test]
     fn wire_format_is_ed25519_base64_and_parser_roundtrips() {

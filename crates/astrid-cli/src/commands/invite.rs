@@ -156,6 +156,14 @@ async fn run_redeem(args: RedeemArgs) -> Result<ExitCode> {
         (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
     };
 
+    let redeemed_local_key = keypair_name
+        .as_ref()
+        .map(|_| {
+            astrid_crypto::PublicKey::from_hex(&public_key_hex)
+                .context("decode local invitation public key")
+        })
+        .transpose()?;
+
     // Redemption is intentionally unauthenticated kernel-side — the
     // token IS the auth. A fresh-machine redeemer typically has no
     // `cli-context.toml` yet, so don't require an active-agent context
@@ -182,13 +190,16 @@ async fn run_redeem(args: RedeemArgs) -> Result<ExitCode> {
                 redeemed.group,
                 redeemed.public_key_fingerprint,
             );
-            // Best-effort: bind the keypair's meta.toml to the new
-            // principal so `astrid keypair list` shows the link.
-            // Failure here doesn't fail the redeem itself.
+            // Redemption already consumed the token. Do not switch into a
+            // principal whose local credential failed to activate.
             if let Some(name) = &keypair_name
-                && let Err(e) = crate::commands::keypair::record_binding(name, &redeemed.principal)
+                && let Some(key) = &redeemed_local_key
             {
-                tracing::warn!(name = %name, error = %e, "could not record keypair binding");
+                crate::commands::keypair::record_binding(name, &redeemed.principal, key)
+                    .with_context(|| format!(
+                        "invitation redeemed as {}, but local key activation failed; token is consumed",
+                        redeemed.principal
+                    ))?;
             }
             if args.switch {
                 crate::context::set_active_agent(&redeemed.principal)
